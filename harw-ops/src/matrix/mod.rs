@@ -363,14 +363,14 @@ fn resolve_known_scenario(name: &str, root: Option<&Path>) -> Result<ResolvedSce
         return load((*source).to_owned(), None);
     }
     for (_, source) in BUNDLED {
-        if let Ok(loaded) = load_scenario(source) {
-            if loaded.scenario.id() == name {
-                return Ok(ResolvedScenario {
-                    source: source.to_owned(),
-                    loaded,
-                    path: None,
-                });
-            }
+        if let Ok(loaded) = load_scenario(source)
+            && loaded.scenario.id() == name
+        {
+            return Ok(ResolvedScenario {
+                source: source.to_owned(),
+                loaded,
+                path: None,
+            });
         }
     }
     if let Some(root) = root {

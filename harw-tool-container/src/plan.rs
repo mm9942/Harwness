@@ -394,10 +394,10 @@ impl ContainerPlan {
             WORKSPACE_DST,
             profile.workspace_read_only(),
         )?];
-        if profile.allows_cache() {
-            if let Some(volume) = &config.cache_volume {
-                mounts.push(Mount::volume(volume, CACHE_DST, false)?);
-            }
+        if profile.allows_cache()
+            && let Some(volume) = &config.cache_volume
+        {
+            mounts.push(Mount::volume(volume, CACHE_DST, false)?);
         }
         for extra in &config.extra_mounts {
             if profile == Profile::Hermetic && !extra.read_only() {

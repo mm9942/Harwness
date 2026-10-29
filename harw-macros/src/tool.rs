@@ -25,26 +25,32 @@
 //!    andernfalls an `NetworkScope::allows("")` weitergereicht — ein
 //!    Fail-open-Risiko, falls diese Prüfung leere Eingaben permissiv behandelt.
 //!
-//! # Geplanter Activity-Metadaten-Anschluss
+//! # Activity-Metadaten und Skill-Bindung (PL-71, PL-97 M2)
 //!
-//! `docs/planning/71-semantic-activity-patterns/04-macro-metadata.md`
-//! beschreibt einen **noch nicht implementierten** Ausbau von `#[tool]` um
-//! deklarative, semantische Activity-Metadaten (z. B. Domain, Verb,
-//! Ressourcenfeld und beschreibende Effektklasse). Der Compiler-Makro-Pfad ist
-//! dafür ein sinnvoller Anschluss, weil Tool-Autoren dort bereits Name,
-//! Permission, Host-Bindung und Parallelitätszusage deklarieren.
-//!
+//! Die optionalen Schlüssel `activity(domain = "..", verb = "..",
+//! resource = "..", effect = "..")` und `skill = ".."` erzeugen die Consts
+//! `ACTIVITY: Option<::harw_tools::ActivityDescriptor>` und
+//! `SKILL: Option<&'static str>` am Wrapper (ohne die Schlüssel: `None`).
 //! Dabei gelten zwei harte Grenzen:
 //!
-//! 1. Activity-Metadaten sind beschreibend und dürfen niemals
-//!    `Permission`-/Approval-Prüfungen ersetzen oder erweitern.
-//! 2. Interne Activity-Metadaten sollen nicht ungeprüft in den model-facing
-//!    `ToolSpec` wandern; Provider-Schema und Harw-interne Semantik haben
-//!    unterschiedliche Konsumenten und Kompatibilitätsanforderungen.
+//! 1. Activity-Metadaten sind beschreibend und ersetzen oder erweitern
+//!    niemals `Permission`-/Approval-Prüfungen; der Prolog bleibt unverändert.
+//! 2. Nichts davon wandert in den model-facing `ToolSpec`: `spec()` wird
+//!    exakt wie ohne die Schlüssel erzeugt (Golden-Test in
+//!    `tests/tool_activity.rs`).
 //!
-//! Bis dieser Plan landet, kennt `ToolAttr` ausschließlich die unten
-//! dokumentierten heutigen Schlüssel.
+//! Der Descriptor wird über `::harw_tools::ActivityDescriptor::new(..)`
+//! gebaut (`harw-tools` re-exportiert `harw-activity`), damit `harw-tools`
+//! die einzige Pfadwurzel des generierten Codes bleibt und `harw-macros`
+//! keine Abhängigkeit auf `harw-activity` braucht.
+//!
+//! `resource` muss ein Feld des Args-Typs benennen. Das Attribut sieht nur den
+//! Typnamen, nicht dessen Felder; deshalb erzeugt die Expansion eine nie
+//! aufgerufene Prüffunktion in einem anonymen `const _`, die `&args.<feld>`
+//! referenziert. Fehlt das Feld, meldet rustc den Fehler (`no field ..`) an der
+//! Span des `resource`-Literals.
 
+use crate::permission_request::{allowed_permission_list, permission_variant_ident};
 use crate::schema::{doc_string, field_default, schema_for_type};
 use crate::util::pascal_case;
 use quote::{format_ident, quote};
@@ -203,33 +209,55 @@ fn tool_spec_impl(
     }
 }
 
-/// Erlaubte `permission = "..."`-Werte und die zugehörige Variante von
-/// `harw_authority::Permission` (re-exportiert als `::harw_tools::Permission`).
-///
-/// Die Tabelle ist bewusst die *einzige* Stelle, an der ein String auf eine
-/// Berechtigung abgebildet wird: ein unbekannter Wert wird abgelehnt statt
-/// stillschweigend auf eine andere Variante zu fallen.
-const PERMISSION_VALUES: &[(&str, &str)] = &[
-    ("read_workspace", "ReadWorkspace"),
-    ("write_workspace", "WriteWorkspace"),
-    ("execute_process", "ExecuteProcess"),
-    ("network_access", "NetworkAccess"),
-    ("read_secrets", "ReadSecrets"),
-    ("manage_plugins", "ManagePlugins"),
-    ("read_cargo_registry", "ReadCargoRegistry"),
-];
+// Die erlaubten `permission = "..."`-Werte stehen in genau einer Tabelle,
+// [`PERMISSION_VALUES`] (geteilt mit `permission_request!`): ein unbekannter
+// Wert wird abgelehnt statt stillschweigend auf eine andere Variante zu fallen.
 
 /// Der Permission-Wert, der Netzzugriff bedeutet; `host_from` ist nur in
 /// Kombination mit diesem Wert sinnvoll.
 const NETWORK_PERMISSION: &str = "network_access";
 
-// Kommaseparierte Liste der erlaubten Permission-Strings für Fehlermeldungen.
-fn allowed_permission_list() -> String {
-    PERMISSION_VALUES
+/// Erlaubte `effect = "..."`-Werte in `activity(...)` und die zugehörige
+/// Variante von `harw_activity::Effect` (re-exportiert als
+/// `::harw_tools::Effect`), in `Effect::ALL`-Reihenfolge. Die Schreibweise ist
+/// `Effect::as_str()`; der Test `effect_table_matches_the_activity_vocabulary`
+/// gleicht beides ab.
+const EFFECT_VALUES: &[(&str, &str)] = &[
+    ("observe", "Observe"),
+    ("mutate", "Mutate"),
+    ("execute", "Execute"),
+    ("communicate", "Communicate"),
+    ("create", "Create"),
+    ("delete", "Delete"),
+    ("control", "Control"),
+    ("other", "Other"),
+];
+
+// Kommaseparierte Liste der erlaubten Effect-Strings für Fehlermeldungen.
+fn allowed_effect_list() -> String {
+    EFFECT_VALUES
         .iter()
         .map(|(key, _)| format!("\"{key}\""))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Geparster `activity(...)`-Schlüssel des `#[tool(...)]`-Attributs.
+///
+/// Alle Werte sind bereits validiert: `domain`/`verb` sind Vokabular-Wörter
+/// (siehe [`vocabulary_word`]), `effect` ist ein Wert aus [`EFFECT_VALUES`],
+/// `resource` ein gültiger Feld-Bezeichner. Ob das Feld im Args-Typ existiert,
+/// prüft erst der generierte Code (siehe Moduldoku).
+#[derive(Debug)]
+struct ActivityAttr {
+    /// `domain = "..."`, z. B. `"filesystem"`.
+    domain: LitStr,
+    /// `verb = "..."`, z. B. `"read"`.
+    verb: LitStr,
+    /// `resource = "<feld>"` — optional.
+    resource: Option<LitStr>,
+    /// Bezeichner der `Effect`-Variante (Span des `effect`-Literals).
+    effect: Ident,
 }
 
 /// Geparste Argumente des `#[tool(...)]`-Attributs.
@@ -255,24 +283,35 @@ pub(crate) struct ToolAttr {
     /// die Spezifikation extern baut, statt sie aus `#[derive(Tool)]` des
     /// Args-Typs abzuleiten.
     schema_from: Option<syn::Path>,
+    /// `activity(...)` — beschreibende Activity-Metadaten (PL-71), nie Autorität.
+    activity: Option<ActivityAttr>,
+    /// `skill = "..."` — Name des gebündelten Skills, der dieses Tool erklärt.
+    skill: Option<LitStr>,
 }
 
 /// Liest den rohen `#[tool(...)]`-Attribut-Token-Stream in [`ToolAttr`] ein.
 ///
 /// # Unterstützte Schlüssel
 /// - `name = "..."`, `description = "..."` (unverändert zum bisherigen Verhalten)
-/// - `permission = "<wert>"` — einer der Schlüssel aus [`PERMISSION_VALUES`]
+/// - `permission = "<wert>"` — einer der Schlüssel aus
+///   [`crate::permission_request::PERMISSION_VALUES`]
 /// - `host_from = "<feldname>"`
 /// - `parallel_safe` als Flag oder `parallel_safe = true|false`
 /// - `state = <Typ>` — zustandsbehafteter Executor (siehe [`ToolAttr::state`])
 /// - `schema_from = <pfad>` — extern gebaute Spezifikation (siehe
 ///   [`ToolAttr::schema_from`])
+/// - `activity(domain = "..", verb = "..", resource = "..", effect = "..")` —
+///   `resource` optional, die übrigen drei Pflicht (siehe [`parse_activity`])
+/// - `skill = "<skill-name>"` — Kleinbuchstaben, Ziffern und `-`, höchstens
+///   64 Zeichen (dieselbe Regel wie `harw-catalog` für Skill-Namen)
 ///
 /// # Errors
 /// - unbekannter Attribut-Schlüssel,
 /// - unbekannter `permission`-Wert (Fehlermeldung listet die erlaubten Werte),
 /// - `host_from` ohne `permission = "network_access"` — der Host-Check ohne
-///   Netz-Berechtigung wäre eine halbe Prüfung und wird deshalb abgelehnt.
+///   Netz-Berechtigung wäre eine halbe Prüfung und wird deshalb abgelehnt,
+/// - doppeltes `activity(...)` oder `skill`, ungültiger `skill`-Name und alle
+///   Fehler aus [`parse_activity`].
 pub(crate) fn parse_tool_attr(attr: proc_macro2::TokenStream) -> syn::Result<ToolAttr> {
     let mut name: Option<String> = None;
     let mut description = String::new();
@@ -281,6 +320,8 @@ pub(crate) fn parse_tool_attr(attr: proc_macro2::TokenStream) -> syn::Result<Too
     let mut parallel_safe = false;
     let mut state: Option<Type> = None;
     let mut schema_from: Option<syn::Path> = None;
+    let mut activity: Option<ActivityAttr> = None;
+    let mut skill: Option<LitStr> = None;
 
     let attr_parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("name") {
@@ -320,10 +361,27 @@ pub(crate) fn parse_tool_attr(attr: proc_macro2::TokenStream) -> syn::Result<Too
             }
             schema_from = Some(meta.value()?.parse()?);
             Ok(())
+        } else if meta.path.is_ident("activity") {
+            if activity.is_some() {
+                return Err(meta.error(
+                    "duplicate `activity` key: a tool declares at most one activity descriptor",
+                ));
+            }
+            activity = Some(parse_activity(&meta)?);
+            Ok(())
+        } else if meta.path.is_ident("skill") {
+            if skill.is_some() {
+                return Err(meta.error("duplicate `skill` key"));
+            }
+            let lit: LitStr = meta.value()?.parse()?;
+            validate_skill_name(&lit)?;
+            skill = Some(lit);
+            Ok(())
         } else {
             Err(meta.error(
                 "unsupported `tool` attribute key (expected `name`, `description`, \
-                 `permission`, `host_from`, `parallel_safe`, `state`, or `schema_from`)",
+                 `permission`, `host_from`, `parallel_safe`, `state`, `schema_from`, \
+                 `activity`, or `skill`)",
             ))
         }
     });
@@ -352,7 +410,7 @@ pub(crate) fn parse_tool_attr(attr: proc_macro2::TokenStream) -> syn::Result<Too
             ));
         }
         // Feldname muss ein gültiger Bezeichner sein, sonst panickt `Ident::new`.
-        field_ident(lit)?;
+        field_ident(lit, "host_from")?;
     }
 
     Ok(ToolAttr {
@@ -363,7 +421,135 @@ pub(crate) fn parse_tool_attr(attr: proc_macro2::TokenStream) -> syn::Result<Too
         parallel_safe,
         state,
         schema_from,
+        activity,
+        skill,
     })
+}
+
+/// Liest den Inhalt von `activity(...)`.
+///
+/// Pflicht sind `domain`, `verb` und `effect`; `resource` ist optional. Jeder
+/// Schlüssel darf nur einmal vorkommen.
+///
+/// # Errors
+/// - unbekannter oder doppelter Schlüssel,
+/// - fehlender Pflichtschlüssel,
+/// - `domain`/`verb` kein Vokabular-Wort (siehe [`vocabulary_word`]),
+/// - unbekannter `effect`-Wert (Fehlermeldung listet die erlaubten Werte),
+/// - `resource` kein gültiger Feld-Bezeichner.
+fn parse_activity(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<ActivityAttr> {
+    let mut domain: Option<LitStr> = None;
+    let mut verb: Option<LitStr> = None;
+    let mut resource: Option<LitStr> = None;
+    let mut effect: Option<LitStr> = None;
+
+    meta.parse_nested_meta(|inner| {
+        let slot = if inner.path.is_ident("domain") {
+            &mut domain
+        } else if inner.path.is_ident("verb") {
+            &mut verb
+        } else if inner.path.is_ident("resource") {
+            &mut resource
+        } else if inner.path.is_ident("effect") {
+            &mut effect
+        } else {
+            return Err(inner.error(
+                "unsupported `activity` key (expected `domain`, `verb`, `resource`, or `effect`)",
+            ));
+        };
+        if slot.is_some() {
+            return Err(inner.error("duplicate key inside `activity(...)`"));
+        }
+        *slot = Some(inner.value()?.parse()?);
+        Ok(())
+    })?;
+
+    let missing = |key: &str| {
+        meta.error(format!(
+            "`activity(...)` requires `{key} = \"...\"` (required keys: `domain`, `verb`, \
+             `effect`; optional: `resource`)"
+        ))
+    };
+    let domain = domain.ok_or_else(|| missing("domain"))?;
+    let verb = verb.ok_or_else(|| missing("verb"))?;
+    let effect = effect.ok_or_else(|| missing("effect"))?;
+
+    vocabulary_word(&domain, "domain")?;
+    vocabulary_word(&verb, "verb")?;
+    let effect = effect_variant(&effect)?;
+    if let Some(lit) = resource.as_ref() {
+        field_ident(lit, "resource")?;
+    }
+
+    Ok(ActivityAttr {
+        domain,
+        verb,
+        resource,
+        effect,
+    })
+}
+
+/// Prüft ein `domain`-/`verb`-Wort: nicht leer, ASCII-Kleinbuchstabe am
+/// Anfang, danach Kleinbuchstaben, Ziffern, `_` oder `-`. Ein leeres oder
+/// verunglücktes Wort würde den Descriptor sonst still zu „unbekannt“ machen
+/// (`ActivityDescriptor::is_known`) oder neben dem Vokabular herlaufen.
+fn vocabulary_word(lit: &LitStr, key: &str) -> syn::Result<()> {
+    let value = lit.value();
+    let mut bytes = value.bytes();
+    let valid = bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        });
+    if valid {
+        return Ok(());
+    }
+    Err(syn::Error::new(
+        lit.span(),
+        format!(
+            "`{key} = \"{value}\"` is not a valid activity vocabulary word (expected a lowercase \
+             ASCII letter followed by lowercase letters, digits, `_` or `-`, e.g. \"filesystem\")"
+        ),
+    ))
+}
+
+/// Übersetzt einen `effect`-String in den Bezeichner der zugehörigen
+/// `Effect`-Variante (Span des Literals).
+fn effect_variant(lit: &LitStr) -> syn::Result<Ident> {
+    let value = lit.value();
+    EFFECT_VALUES
+        .iter()
+        .find(|(key, _)| *key == value)
+        .map(|(_, variant)| Ident::new(variant, lit.span()))
+        .ok_or_else(|| {
+            syn::Error::new(
+                lit.span(),
+                format!(
+                    "unknown activity `effect` value \"{value}\" (allowed: {})",
+                    allowed_effect_list()
+                ),
+            )
+        })
+}
+
+/// Prüft einen `skill = "..."`-Namen nach der Skill-Namensregel von
+/// `harw-catalog`: 1 bis 64 Zeichen aus Kleinbuchstaben, Ziffern und `-`.
+fn validate_skill_name(lit: &LitStr) -> syn::Result<()> {
+    let value = lit.value();
+    let valid = !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if valid {
+        return Ok(());
+    }
+    Err(syn::Error::new(
+        lit.span(),
+        format!(
+            "`skill = \"{value}\"` is not a valid skill name (1 to 64 lowercase ASCII letters, \
+             digits or `-`, e.g. \"fsread-tools\")"
+        ),
+    ))
 }
 
 /// Übersetzt einen `permission`-String in den Bezeichner der zugehörigen
@@ -371,30 +557,26 @@ pub(crate) fn parse_tool_attr(attr: proc_macro2::TokenStream) -> syn::Result<Too
 fn permission_variant(lit: &LitStr) -> syn::Result<Ident> {
     let value = lit.value();
 
-    if let Some((_, variant)) = PERMISSION_VALUES.iter().find(|(key, _)| *key == value) {
-        return Ok(Ident::new(variant, lit.span()));
-    }
-
-    // `read_cargo_registry` ist seit W1-18 eine echte `harw_authority::Permission`-
-    // Variante und wird oben regulär aufgelöst; die frühere Sonderdiagnose
-    // entfällt damit.
-    Err(syn::Error::new(
-        lit.span(),
-        format!(
-            "unknown `permission` value \"{value}\" (allowed: {})",
-            allowed_permission_list()
-        ),
-    ))
+    permission_variant_ident(&value, lit.span()).ok_or_else(|| {
+        syn::Error::new(
+            lit.span(),
+            format!(
+                "unknown `permission` value \"{value}\" (allowed: {})",
+                allowed_permission_list('"')
+            ),
+        )
+    })
 }
 
-/// Übersetzt einen `host_from`-String in einen Feld-Bezeichner mit der Span des
-/// Literals, damit Fehler auf das Attribut zeigen.
-fn field_ident(lit: &LitStr) -> syn::Result<Ident> {
+/// Übersetzt einen Feldnamen-String (`host_from`, `activity(resource)`) in
+/// einen Feld-Bezeichner mit der Span des Literals, damit Fehler auf das
+/// Attribut zeigen. `key` nennt den Schlüssel in der Fehlermeldung.
+fn field_ident(lit: &LitStr, key: &str) -> syn::Result<Ident> {
     let value = lit.value();
     let mut ident = syn::parse_str::<Ident>(&value).map_err(|_| {
         syn::Error::new(
             lit.span(),
-            format!("`host_from = \"{value}\"` is not a valid field identifier"),
+            format!("`{key} = \"{value}\"` is not a valid field identifier"),
         )
     })?;
     ident.set_span(lit.span());
@@ -478,6 +660,8 @@ pub(crate) fn expand_tool_fn(
         parallel_safe,
         state,
         schema_from,
+        activity,
+        skill,
     } = attr;
     let tool_name = name.unwrap_or_else(|| fn_name.clone());
 
@@ -512,7 +696,7 @@ pub(crate) fn expand_tool_fn(
     // einen leeren Hostnamen in die Scope-Prüfung zu geben.
     let host_prologue = match host_from.as_ref() {
         Some(lit) => {
-            let field = field_ident(lit)?;
+            let field = field_ident(lit, "host_from")?;
             let field_name = lit.value();
             quote! {
                 let __host = match ::harw_tools::host_from_url(&args.#field) {
@@ -537,6 +721,59 @@ pub(crate) fn expand_tool_fn(
             }
         }
         None => proc_macro2::TokenStream::new(),
+    };
+
+    // Activity-Descriptor (rein beschreibend) und, falls `resource` gesetzt
+    // ist, eine nie aufgerufene Prüffunktion: sie referenziert `&args.<feld>`,
+    // damit rustc ein fehlendes Feld an der Span des `resource`-Literals meldet.
+    // Beides berührt weder den Prolog noch `spec()`.
+    let (activity_const, resource_check) = match activity.as_ref() {
+        Some(ActivityAttr {
+            domain,
+            verb,
+            resource,
+            effect,
+        }) => {
+            let (resource_tokens, resource_check) = match resource.as_ref() {
+                Some(lit) => {
+                    let field = field_ident(lit, "resource")?;
+                    (
+                        quote! { ::core::option::Option::Some(#lit) },
+                        quote! {
+                            const _: () = {
+                                #[allow(dead_code)]
+                                fn __harw_activity_resource_is_an_args_field(args: &#args_type) {
+                                    let _ = &args.#field;
+                                }
+                            };
+                        },
+                    )
+                }
+                None => (
+                    quote! { ::core::option::Option::None },
+                    proc_macro2::TokenStream::new(),
+                ),
+            };
+            (
+                quote! {
+                    ::core::option::Option::Some(::harw_tools::ActivityDescriptor::new(
+                        #domain,
+                        #verb,
+                        #resource_tokens,
+                        ::harw_tools::Effect::#effect,
+                    ))
+                },
+                resource_check,
+            )
+        }
+        None => (
+            quote! { ::core::option::Option::None },
+            proc_macro2::TokenStream::new(),
+        ),
+    };
+    let skill_const = match skill.as_ref() {
+        Some(lit) => quote! { ::core::option::Option::Some(#lit) },
+        None => quote! { ::core::option::Option::None },
     };
 
     // Spezifikationsquelle: extern gebaut (`schema_from`) oder aus dem Args-Typ.
@@ -579,6 +816,8 @@ pub(crate) fn expand_tool_fn(
 
         #wrapper_decl
 
+        #resource_check
+
         impl #wrapper_ident {
             #wrapper_ctor
 
@@ -593,6 +832,15 @@ pub(crate) fn expand_tool_fn(
             /// keine Berechtigung im Makro-Prolog.
             pub const PERMISSION: ::core::option::Option<::harw_tools::Permission> =
                 #permission_const;
+            /// Descriptive activity metadata from `#[tool(activity(...))]`
+            /// (PL-71). It grants, implies or checks no permission and is not
+            /// part of [`Self::spec`]. `None` means unknown semantics: the
+            /// tool stays a standalone activity.
+            pub const ACTIVITY: ::core::option::Option<::harw_tools::ActivityDescriptor> =
+                #activity_const;
+            /// The bundled skill from `#[tool(skill = "...")]` that explains
+            /// this tool; `None` without a binding. Not part of [`Self::spec`].
+            pub const SKILL: ::core::option::Option<&'static str> = #skill_const;
 
             /// Die `ToolSpec` dieses Tools, abgeleitet aus dem Args-Struct.
             ///
@@ -634,6 +882,7 @@ pub(crate) fn expand_tool_fn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permission_request::PERMISSION_VALUES;
     use crate::test_support::{TestError, TestResult, ctx};
     use syn::DeriveInput;
 
@@ -825,6 +1074,232 @@ mod tests {
             message.contains("host_from") && message.contains("parallel_safe"),
             "message must list the supported keys, got: {message}"
         );
+        Ok(())
+    }
+
+    /// `manage_containers` ist die achte `Permission`-Variante (PL-97 §2.2:
+    /// fehlte bisher in der Tabelle) und muss auf `ManageContainers` abbilden.
+    #[test]
+    fn test_parse_tool_attr_accepts_manage_containers() -> TestResult {
+        let parsed = parse_tool_attr(quote! { permission = "manage_containers" }).map_err(ctx(
+            "manage_containers must resolve to a Permission variant",
+        ))?;
+        let permission = parsed
+            .permission
+            .as_ref()
+            .ok_or(TestError::Missing("permission must be present"))?;
+        assert_eq!(
+            permission_variant(permission)
+                .map_err(ctx("variant lookup must succeed"))?
+                .to_string(),
+            "ManageContainers"
+        );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // activity(...) und skill
+    // ---------------------------------------------------------------------
+
+    /// Die Effect-Tabelle ist genau das Vokabular von `harw_activity::Effect`
+    /// (über den `harw-tools`-Re-Export): gleiche Reihenfolge, Schreibweise
+    /// `Effect::as_str()`, Variantenname wie `Debug`.
+    #[test]
+    fn effect_table_matches_the_activity_vocabulary() {
+        assert_eq!(EFFECT_VALUES.len(), harw_tools::Effect::ALL.len());
+        for (effect, (key, variant)) in harw_tools::Effect::ALL.iter().zip(EFFECT_VALUES) {
+            assert_eq!(effect.as_str(), *key);
+            assert_eq!(harw_tools::Effect::from_name(key), Some(*effect));
+            assert_eq!(format!("{effect:?}"), *variant);
+        }
+    }
+
+    #[test]
+    fn test_parse_tool_attr_reads_activity_and_skill() -> TestResult {
+        let attr = parse_tool_attr(quote! {
+            name = "fs.read",
+            activity(domain = "filesystem", verb = "read", resource = "path", effect = "observe"),
+            skill = "fsread-tools",
+        })
+        .map_err(ctx("activity and skill must parse"))?;
+
+        let activity = attr
+            .activity
+            .as_ref()
+            .ok_or(TestError::Missing("activity must be present"))?;
+        assert_eq!(activity.domain.value(), "filesystem");
+        assert_eq!(activity.verb.value(), "read");
+        assert_eq!(
+            activity.resource.as_ref().map(LitStr::value).as_deref(),
+            Some("path")
+        );
+        assert_eq!(activity.effect.to_string(), "Observe");
+        assert_eq!(
+            attr.skill.as_ref().map(LitStr::value).as_deref(),
+            Some("fsread-tools")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_tool_attr_activity_resource_is_optional() -> TestResult {
+        let attr = parse_tool_attr(quote! {
+            activity(domain = "job", verb = "start", effect = "execute"),
+        })
+        .map_err(ctx("activity without resource must parse"))?;
+        let activity = attr
+            .activity
+            .as_ref()
+            .ok_or(TestError::Missing("activity"))?;
+        assert!(activity.resource.is_none());
+        assert_eq!(activity.effect.to_string(), "Execute");
+        Ok(())
+    }
+
+    /// Fehlerfälle von `activity(...)`/`skill` mit dem jeweils erwarteten
+    /// Bestandteil der Fehlermeldung.
+    #[test]
+    fn test_parse_tool_attr_rejects_invalid_activity_and_skill() -> TestResult {
+        let cases = [
+            (
+                quote! { activity(domain = "filesystem", verb = "read", effect = "observes") },
+                "unknown activity `effect` value \"observes\"",
+            ),
+            (
+                quote! {
+                    activity(domain = "filesystem", verb = "read", effect = "observe"),
+                    activity(domain = "filesystem", verb = "edit", effect = "mutate"),
+                },
+                "duplicate `activity` key",
+            ),
+            (
+                quote! { activity(domain = "filesystem", domain = "fs", verb = "read", effect = "observe") },
+                "duplicate key inside `activity(...)`",
+            ),
+            (
+                quote! { activity(domain = "filesystem", effect = "observe") },
+                "requires `verb",
+            ),
+            (
+                quote! { activity(domain = "filesystem", verb = "read") },
+                "requires `effect",
+            ),
+            (
+                quote! { activity(domain = "filesystem", verb = "read", effect = "observe", key = "path") },
+                "unsupported `activity` key",
+            ),
+            (
+                quote! { activity(domain = "", verb = "read", effect = "observe") },
+                "not a valid activity vocabulary word",
+            ),
+            (
+                quote! { activity(domain = "File System", verb = "read", effect = "observe") },
+                "not a valid activity vocabulary word",
+            ),
+            (
+                quote! { activity(domain = "filesystem", verb = "read", resource = "not a field", effect = "observe") },
+                "`resource = \"not a field\"` is not a valid field identifier",
+            ),
+            (quote! { activity = "filesystem.read" }, ""),
+            (
+                quote! { skill = "Fsread_Tools" },
+                "is not a valid skill name",
+            ),
+            (quote! { skill = "" }, "is not a valid skill name"),
+            (
+                quote! { skill = "fsread-tools", skill = "sys-tools" },
+                "duplicate `skill` key",
+            ),
+        ];
+        for (tokens, expected) in cases {
+            let Err(error) = parse_tool_attr(tokens.clone()) else {
+                return Err(TestError::Unexpected(format!(
+                    "`{tokens}` must be a macro diagnostic"
+                )));
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(expected),
+                "`{tokens}`: expected {expected:?} in {message:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Mit `activity(...)` und `skill` entstehen beide Consts samt Prüffunktion
+    /// für das `resource`-Feld; der Prolog und `spec()` bleiben unverändert.
+    #[test]
+    fn test_expand_tool_fn_emits_activity_skill_and_resource_check() -> TestResult {
+        let plain = expand_tool_fn(
+            sample_fn(),
+            parse_tool_attr(quote! { name = "http.fetch", permission = "read_workspace" })
+                .map_err(ctx("parses"))?,
+        )
+        .map_err(ctx("expands"))?
+        .to_string();
+        let annotated = expand_tool_fn(
+            sample_fn(),
+            parse_tool_attr(quote! {
+                name = "http.fetch",
+                permission = "read_workspace",
+                activity(domain = "network", verb = "fetch", resource = "url", effect = "communicate"),
+                skill = "web-tools",
+            })
+            .map_err(ctx("parses"))?,
+        )
+        .map_err(ctx("expands"))?
+        .to_string();
+
+        assert!(annotated.contains(
+            "ACTIVITY : :: core :: option :: Option < :: harw_tools :: ActivityDescriptor > = \
+             :: core :: option :: Option :: Some (:: harw_tools :: ActivityDescriptor :: new \
+             (\"network\" , \"fetch\" , :: core :: option :: Option :: Some (\"url\") , \
+             :: harw_tools :: Effect :: Communicate ,))"
+        ));
+        assert!(annotated.contains(
+            "SKILL : :: core :: option :: Option < & 'static str > = :: core :: option :: \
+             Option :: Some (\"web-tools\")"
+        ));
+        assert!(annotated.contains(
+            "fn __harw_activity_resource_is_an_args_field (args : & FetchPageArgs) { let _ = \
+             & args . url ; }"
+        ));
+        assert!(plain.contains(
+            "ACTIVITY : :: core :: option :: Option < :: harw_tools :: ActivityDescriptor > = \
+             :: core :: option :: Option :: None"
+        ));
+        assert!(plain.contains(
+            "SKILL : :: core :: option :: Option < & 'static str > = :: core :: option :: \
+             Option :: None"
+        ));
+        assert!(!plain.contains("__harw_activity_resource_is_an_args_field"));
+
+        // Prolog, Deserialisierung, Ausführung und `spec()` sind identisch.
+        let body = |expanded: &str| -> TestResult<String> {
+            let start = expanded
+                .find("pub fn spec ()")
+                .ok_or(TestError::Missing("spec()"))?;
+            Ok(expanded[start..].to_owned())
+        };
+        assert_eq!(body(&plain)?, body(&annotated)?);
+        Ok(())
+    }
+
+    /// Ohne `resource` gibt es keine Feldprüfung und `resource_field` ist `None`.
+    #[test]
+    fn test_expand_tool_fn_activity_without_resource_has_no_field_check() -> TestResult {
+        let expanded = expand_tool_fn(
+            sample_fn(),
+            parse_tool_attr(quote! { activity(domain = "job", verb = "list", effect = "observe") })
+                .map_err(ctx("parses"))?,
+        )
+        .map_err(ctx("expands"))?
+        .to_string();
+        assert!(expanded.contains(
+            "ActivityDescriptor :: new (\"job\" , \"list\" , :: core :: option :: Option :: \
+             None , :: harw_tools :: Effect :: Observe ,)"
+        ));
+        assert!(!expanded.contains("__harw_activity_resource_is_an_args_field"));
         Ok(())
     }
 

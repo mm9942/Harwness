@@ -299,13 +299,13 @@ fn from_impl(enum_name: &Ident, v: &VariantInfo) -> Option<proc_macro2::TokenStr
 /// ends in `Error`.
 fn result_alias(enum_name: &Ident) -> proc_macro2::TokenStream {
     let name = enum_name.to_string();
-    if let Some(prefix) = name.strip_suffix("Error") {
-        if !prefix.is_empty() {
-            let alias = Ident::new(&format!("{prefix}Result"), enum_name.span());
-            return quote! {
-                pub type #alias<T> = ::core::result::Result<T, #enum_name>;
-            };
-        }
+    if let Some(prefix) = name.strip_suffix("Error")
+        && !prefix.is_empty()
+    {
+        let alias = Ident::new(&format!("{prefix}Result"), enum_name.span());
+        return quote! {
+            pub type #alias<T> = ::core::result::Result<T, #enum_name>;
+        };
     }
     proc_macro2::TokenStream::new()
 }

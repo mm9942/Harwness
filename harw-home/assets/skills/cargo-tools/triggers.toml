@@ -1,0 +1,24 @@
+# When the `cargo-tools` skill is injected (PL-95 trigger manifest, format:
+# harw-catalog/src/skill_triggers.rs). Bundled by harw-home (PL-97 B4).
+#
+# Deliberately no `commands` (and no `error_codes`) yet: no profile registers
+# cargo.check/build/clippy/test/fmt_check/tree/doc/metadata so far (only
+# cargo.test_one, for test-engineer). A `cargo test` trigger on `shell.exec`
+# would point the model at tools its session does not have. The skill fires on
+# the first use of a cargo.* tool only. `commands` and the E0 error-code
+# triggers come with the cargo.* registration in Full (open, see
+# docs/planning/97-harw-dod-mission-control-chain/README.md, section 4 B4).
+when = "After a first typed cargo.* tool call (registered today: cargo.test_one): read its summarised Rust diagnostics instead of raw cargo output."
+
+[triggers]
+tools = [
+  "cargo.check",
+  "cargo.build",
+  "cargo.clippy",
+  "cargo.test",
+  "cargo.fmt_check",
+  "cargo.tree",
+  "cargo.doc",
+  "cargo.metadata",
+  "cargo.test_one",
+]

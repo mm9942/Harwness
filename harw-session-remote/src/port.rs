@@ -51,13 +51,13 @@ impl RemotePort {
     /// this helper only hands over what was actually observed.
     #[must_use]
     pub fn attach_with_resume(&self, params: AttachParams) -> AttachParams {
-        if params.from.is_none() {
-            if let Some(cursor) = self.connection.resume_cursor(&params.session_id) {
-                return AttachParams {
-                    from: Some(cursor),
-                    ..params
-                };
-            }
+        if params.from.is_none()
+            && let Some(cursor) = self.connection.resume_cursor(&params.session_id)
+        {
+            return AttachParams {
+                from: Some(cursor),
+                ..params
+            };
         }
         params
     }

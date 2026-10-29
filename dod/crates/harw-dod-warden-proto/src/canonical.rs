@@ -58,7 +58,7 @@ pub(crate) fn decode_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut out = [0u8; N];
-    for (slot, pair) in out.iter_mut().zip(raw.chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
         let high = lower_hex_nibble(pair[0])?;
         let low = lower_hex_nibble(pair[1])?;
         *slot = (high << 4) | low;

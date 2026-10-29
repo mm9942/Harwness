@@ -411,10 +411,10 @@ where
 fn load_ancestor_ignores(state: &mut WalkState<'_>, start_rel: &Path) {
     let mut ancestor = PathBuf::new();
     for component in start_rel.components() {
-        if let Ok(dir) = state.workspace.open_dir(&ancestor) {
-            if let Some(matcher) = load_ignore(&dir) {
-                state.ignores.push((ancestor.clone(), matcher));
-            }
+        if let Ok(dir) = state.workspace.open_dir(&ancestor)
+            && let Some(matcher) = load_ignore(&dir)
+        {
+            state.ignores.push((ancestor.clone(), matcher));
         }
         ancestor.push(component);
     }
@@ -703,14 +703,14 @@ mod tests {
                         io_error.get_or_insert(err);
                     }
                 }
-                if entry.entry_type == EntryType::File {
-                    if let Ok(file) = open_file_in(entry.dir, entry.name) {
-                        match read_bounded(&file, 1024) {
-                            Ok(Some(bytes)) => read_outside |= bytes == b"TOPSECRET",
-                            Ok(None) => {}
-                            Err(err) => {
-                                io_error.get_or_insert(err);
-                            }
+                if entry.entry_type == EntryType::File
+                    && let Ok(file) = open_file_in(entry.dir, entry.name)
+                {
+                    match read_bounded(&file, 1024) {
+                        Ok(Some(bytes)) => read_outside |= bytes == b"TOPSECRET",
+                        Ok(None) => {}
+                        Err(err) => {
+                            io_error.get_or_insert(err);
                         }
                     }
                 }

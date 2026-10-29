@@ -248,17 +248,17 @@ fn worktree_entry(
 ) -> Result<Option<SnapEntry>, String> {
     let describe =
         |error: &dyn std::fmt::Display| format!("{}: {error}", String::from_utf8_lossy(path));
-    if let Some(entry) = cached {
-        if entry.skip_worktree || entry.assume_valid || type_bits(entry.mode) == 0o160_000 {
-            // Gitlinks, Sparse-Checkout und assume-valid: dem Index glauben.
-            let present =
-                type_bits(entry.mode) != 0o160_000 || ctx.repo.scope.lstat(&rel_of(path)).is_ok();
-            return Ok(present.then_some(SnapEntry {
-                mode: entry.mode,
-                oid: entry.oid,
-                origin: Origin::Odb,
-            }));
-        }
+    if let Some(entry) = cached
+        && (entry.skip_worktree || entry.assume_valid || type_bits(entry.mode) == 0o160_000)
+    {
+        // Gitlinks, Sparse-Checkout und assume-valid: dem Index glauben.
+        let present =
+            type_bits(entry.mode) != 0o160_000 || ctx.repo.scope.lstat(&rel_of(path)).is_ok();
+        return Ok(present.then_some(SnapEntry {
+            mode: entry.mode,
+            oid: entry.oid,
+            origin: Origin::Odb,
+        }));
     }
     if Instant::now() > ctx.deadline {
         return Err("comparison with the working tree timed out".to_owned());
@@ -377,20 +377,20 @@ pub fn changes(old: &Snapshot, new: &Snapshot) -> Vec<Change> {
                 }
             }
             std::cmp::Ordering::Equal => {
-                if let (Some((path, x)), Some((_, y))) = (a.next(), b.next()) {
-                    if x.oid != y.oid || x.mode != y.mode {
-                        let kind = if type_bits(x.mode) == type_bits(y.mode) {
-                            ChangeKind::Modified
-                        } else {
-                            ChangeKind::TypeChange
-                        };
-                        out.push(Change {
-                            path: path.clone(),
-                            kind,
-                            old: Some(*x),
-                            new: Some(*y),
-                        });
-                    }
+                if let (Some((path, x)), Some((_, y))) = (a.next(), b.next())
+                    && (x.oid != y.oid || x.mode != y.mode)
+                {
+                    let kind = if type_bits(x.mode) == type_bits(y.mode) {
+                        ChangeKind::Modified
+                    } else {
+                        ChangeKind::TypeChange
+                    };
+                    out.push(Change {
+                        path: path.clone(),
+                        kind,
+                        old: Some(*x),
+                        new: Some(*y),
+                    });
                 }
             }
         }

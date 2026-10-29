@@ -1,14 +1,29 @@
 ---
 id: PL94-W01-ACTIVITY-RANKED-INLINE-CHAT
 title: "W01 — Activity-ranked live messages inside the main Ratatui chat"
-status: proposed
+status: PARTIALLY LANDED
 date: 2026-10-08
 parent: ../README.md
 ---
 
 # W01 — Dynamic inline live chat messages
 
-> DESIGN ONLY, NOT IMPLEMENTED. Repository evidence from mm9942/Harwness dev (2026-10-08). PL-94 PR #137 is a separate planning workstream from Harw's implementation PRs #135/#136.
+> **Status: PARTIALLY LANDED** (2026-10-29, PL-97 X1). M2a and M2c landed
+> as PL-97 C5 `654b2677` (`harw-tui/src/app/live_slots.rs`,
+> `chat_scroll.rs` identity anchor); M2b reuses the existing
+> `LiveActivityRanker` and the C2 `p` pin. M3+ (progress projections) is not
+> built. Acceptance tests 1–10 below map to `root_moves_between_slot_two_and_three_around_a_uia_turn` (1),
+> `three_concurrent_runs_show_two_cells_and_one_more_row` (2),
+> `reasoning_spam_cannot_outrank_a_milestone` and `pending_question_outranks_a_chatty_active_run` (3),
+> `canonical_cells_and_export_are_unchanged_by_the_projection` (4),
+> `scroll_up_freezes_order_keeps_top_cell_and_counts_new_activity` (5),
+> `pin_keeps_the_selected_run_in_front_with_a_marker` (6),
+> `terminal_run_leaves_live_ranking_after_terminal_display_ms` (7),
+> `live_cells_show_only_their_own_block_without_duplicates` (8),
+> `finished_run_returns_to_its_home_and_stale_events_do_not_revive_it` (9),
+> `short_terminals_get_one_bounded_live_cell` (10), all in
+> `app/live_slots.rs`. The original planning text follows (evidence from
+> `dev`, 2026-10-08).
 
 ## Operator intent
 
@@ -77,7 +92,7 @@ A manually selected/pinned agent overrides automatic presentation ranking until 
 
 No new runtime scheduler or agent-context pool. Preserve background-by-default and do not write into Harw-owned PL-90 code files concurrently.
 
-## 5. Acceptance tests, all currently NOT RUN
+## 5. Acceptance tests (originally NOT RUN; test names in the status block above)
 
 1. One background root: idle #2, new user message moves it to #3, current UIA reply retains foreground, final answer restores root #2. No run restart or identity change.
 2. Three distinct background orchestrators: meaningful recent task activity can promote a different run into lead; older root remains reachable; no effect on actual job execution order.

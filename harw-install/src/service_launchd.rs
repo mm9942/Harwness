@@ -213,6 +213,51 @@ impl ServiceManager for LaunchdServiceManager {
         }
         remove_files_if_present(&[path])
     }
+
+    fn start(&self, name: &str) -> Result<(), ServiceError> {
+        self.control(name, "start")
+    }
+
+    fn stop(&self, name: &str) -> Result<(), ServiceError> {
+        self.control(name, "stop")
+    }
+
+    fn restart(&self, name: &str) -> Result<(), ServiceError> {
+        self.control(name, "restart")
+    }
+}
+
+impl LaunchdServiceManager {
+    fn control(&self, name: &str, action: &str) -> Result<(), ServiceError> {
+        validate_agent_label(name)?;
+        let uid = Self::current_uid()?;
+        let query = Self::launchctl(&["list", name])?;
+        dispatch_lifecycle_after_query(
+            action,
+            uid,
+            name,
+            query.status.code(),
+            &String::from_utf8_lossy(&query.stderr),
+            || match action {
+                "start" | "restart" => Ok(Some(Self::plist_path(name)?)),
+                "stop" => Ok(None),
+                _ => Err(ServiceError::Unsupported {
+                    detail: format!("unknown launchd lifecycle action: {action}"),
+                }),
+            },
+            |args| {
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let out = Self::launchctl(&arg_refs)?;
+                if !out.status.success() {
+                    return Err(ServiceError::Command {
+                        command: format!("launchctl {}", args.join(" ")),
+                        detail: String::from_utf8_lossy(&out.stderr).into_owned(),
+                    });
+                }
+                Ok(())
+            },
+        )
+    }
 }
 
 /// Pfad des LaunchAgent-Plist `<home>/Library/LaunchAgents/<name>.plist` (rein).
@@ -233,6 +278,118 @@ fn plist_path_in(home: &Path, name: &str) -> PathBuf {
 /// - `name` (`&str`): Dienstname (= launchd-Label).
 fn bootout_args(uid: u32, name: &str) -> Vec<String> {
     vec!["bootout".to_owned(), format!("gui/{uid}/{name}")]
+}
+
+fn launchctl_start_args(uid: u32, name: &str, plist: PathBuf, loaded: bool) -> Vec<String> {
+    if loaded {
+        vec!["kickstart".to_owned(), format!("gui/{uid}/{name}")]
+    } else {
+        vec![
+            "bootstrap".to_owned(),
+            format!("gui/{uid}"),
+            plist.display().to_string(),
+        ]
+    }
+}
+
+fn launchctl_stop_args(uid: u32, name: &str) -> Vec<String> {
+    vec!["bootout".to_owned(), format!("gui/{uid}/{name}")]
+}
+
+fn launchctl_restart_args(uid: u32, name: &str, plist: PathBuf, loaded: bool) -> Vec<String> {
+    if loaded {
+        vec![
+            "kickstart".to_owned(),
+            "-k".to_owned(),
+            format!("gui/{uid}/{name}"),
+        ]
+    } else {
+        vec![
+            "bootstrap".to_owned(),
+            format!("gui/{uid}"),
+            plist.display().to_string(),
+        ]
+    }
+}
+
+fn validate_agent_label(name: &str) -> Result<(), ServiceError> {
+    if !valid_service_identifier(name) {
+        return Err(ServiceError::Unsupported {
+            detail: format!("invalid launchd agent label: {name:?}"),
+        });
+    }
+    Ok(())
+}
+
+fn valid_service_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'@' | b'-'))
+}
+
+fn dispatch_lifecycle_after_query(
+    action: &str,
+    uid: u32,
+    name: &str,
+    query_code: Option<i32>,
+    query_stderr: &str,
+    resolve_plist: impl FnOnce() -> Result<Option<PathBuf>, ServiceError>,
+    execute: impl FnOnce(&[String]) -> Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
+    let loaded = launchd_loaded_state(query_code, query_stderr, name)?;
+    let plist = resolve_plist()?;
+    dispatch_launchctl_action(action, uid, name, plist, loaded, execute)
+}
+
+fn launchd_loaded_state(code: Option<i32>, stderr: &str, name: &str) -> Result<bool, ServiceError> {
+    if code == Some(0) {
+        return Ok(true);
+    }
+    if is_not_loaded(code, stderr) {
+        return Ok(false);
+    }
+    Err(ServiceError::Command {
+        command: format!("launchctl list {name}"),
+        detail: format!("{} (exit code: {code:?})", stderr.trim()),
+    })
+}
+
+fn dispatch_launchctl_action(
+    action: &str,
+    uid: u32,
+    name: &str,
+    plist: Option<PathBuf>,
+    loaded: bool,
+    execute: impl FnOnce(&[String]) -> Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
+    let args = match (action, loaded) {
+        ("start", _) => launchctl_start_args(
+            uid,
+            name,
+            plist.ok_or_else(|| ServiceError::Unsupported {
+                detail: "LaunchAgent plist path is required to start".to_owned(),
+            })?,
+            loaded,
+        ),
+        ("stop", true) => launchctl_stop_args(uid, name),
+        ("stop", false) => return Ok(()),
+        ("restart", _) => launchctl_restart_args(
+            uid,
+            name,
+            plist.ok_or_else(|| ServiceError::Unsupported {
+                detail: "LaunchAgent plist path is required to restart".to_owned(),
+            })?,
+            loaded,
+        ),
+        _ => {
+            return Err(ServiceError::Unsupported {
+                detail: format!("unknown launchd lifecycle action: {action}"),
+            });
+        }
+    };
+    execute(&args)
 }
 
 /// Erkennt, ob ein fehlgeschlagenes `launchctl bootout` nur „nicht geladen"
@@ -451,6 +608,125 @@ mod tests {
             bootout_args(501, "com.harw.agent"),
             vec!["bootout".to_owned(), "gui/501/com.harw.agent".to_owned()]
         );
+    }
+
+    #[test]
+    fn test_lifecycle_args_target_user_gui_domain() {
+        assert_eq!(
+            launchctl_start_args(
+                501,
+                "com.harw.agent",
+                PathBuf::from("/Users/u/Library/LaunchAgents/com.harw.agent.plist"),
+                false
+            ),
+            vec![
+                "bootstrap",
+                "gui/501",
+                "/Users/u/Library/LaunchAgents/com.harw.agent.plist"
+            ]
+        );
+        assert_eq!(
+            launchctl_start_args(501, "com.harw.agent", PathBuf::from("/unused.plist"), true),
+            vec!["kickstart", "gui/501/com.harw.agent"]
+        );
+        assert_eq!(
+            launchctl_stop_args(501, "com.harw.agent"),
+            vec!["bootout", "gui/501/com.harw.agent"]
+        );
+        assert_eq!(
+            launchctl_restart_args(501, "com.harw.agent", PathBuf::from("/unused.plist"), true),
+            vec!["kickstart", "-k", "gui/501/com.harw.agent"]
+        );
+        assert_eq!(
+            launchctl_restart_args(
+                501,
+                "com.harw.agent",
+                PathBuf::from("/Users/u/Library/LaunchAgents/com.harw.agent.plist"),
+                false
+            ),
+            vec![
+                "bootstrap",
+                "gui/501",
+                "/Users/u/Library/LaunchAgents/com.harw.agent.plist"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_start_dispatches_kickstart_for_loaded_stopped_agent() -> TestResult {
+        let mut received = Vec::new();
+        dispatch_launchctl_action(
+            "start",
+            501,
+            "com.harw.agent",
+            Some(PathBuf::from(
+                "/Users/u/Library/LaunchAgents/com.harw.agent.plist",
+            )),
+            true,
+            |argv| {
+                received = argv.to_vec();
+                Ok(())
+            },
+        )
+        .map_err(ctx("dispatch launchctl start"))?;
+        assert_eq!(received, vec!["kickstart", "gui/501/com.harw.agent"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_launchctl_query_errors_abort_all_lifecycle_actions() -> TestResult {
+        for action in ["start", "stop", "restart"] {
+            let mut called = false;
+            let result = dispatch_lifecycle_after_query(
+                action,
+                501,
+                "com.harw.agent",
+                Some(1),
+                "Operation not permitted",
+                || Ok(None),
+                |_| {
+                    called = true;
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Err(ServiceError::Command { .. })));
+            assert!(!called, "{action} must not run after a failed load query");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_launchctl_query_recognises_only_explicit_not_loaded_results() {
+        assert!(matches!(
+            launchd_loaded_state(Some(0), "", "com.harw.agent"),
+            Ok(true)
+        ));
+        assert!(matches!(
+            launchd_loaded_state(Some(3), "No such process", "com.harw.agent"),
+            Ok(false)
+        ));
+        assert!(matches!(
+            launchd_loaded_state(Some(1), "Operation not permitted", "com.harw.agent"),
+            Err(ServiceError::Command { .. })
+        ));
+    }
+
+    #[test]
+    fn test_launchd_label_validation_rejects_option_and_control_injection() {
+        for label in [
+            "",
+            "-agent",
+            "foo/bar",
+            "foo\nbar",
+            "foo\u{1b}bar",
+            "foo\0bar",
+        ] {
+            assert!(matches!(
+                validate_agent_label(label),
+                Err(ServiceError::Unsupported { .. })
+            ));
+        }
+        assert!(validate_agent_label("com.harw.agent_2").is_ok());
     }
 
     #[test]

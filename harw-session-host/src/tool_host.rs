@@ -617,10 +617,10 @@ impl ToolHost {
     /// foreign call's existence does not leak).
     pub(crate) fn cancel_call(&self, session: &SessionId, call_id: &ToolCallId, agent: &str) {
         let Ok(calls) = self.calls() else { return };
-        if let Some(call) = calls.get(&(session.clone(), call_id.clone())) {
-            if call.agent == agent {
-                call.cancel("cancelled by the caller");
-            }
+        if let Some(call) = calls.get(&(session.clone(), call_id.clone()))
+            && call.agent == agent
+        {
+            call.cancel("cancelled by the caller");
         }
     }
 
@@ -708,10 +708,10 @@ impl ToolHost {
                 params.tool_name
             ));
         }
-        if asks_human(entry.descriptor.approval) {
-            if let Err(reason) = self.approve(call, events).await {
-                return runtime_error(reason);
-            }
+        if asks_human(entry.descriptor.approval)
+            && let Err(reason) = self.approve(call, events).await
+        {
+            return runtime_error(reason);
         }
         let context = ToolExecutionContext::new(
             params.session_id.clone(),
@@ -831,29 +831,28 @@ pub fn check_arguments(schema: &JsonSchema, arguments: &Value) -> Result<(), Str
 }
 
 fn check_value(schema: &JsonSchema, value: &Value, path: &str) -> Result<(), String> {
-    if let Some(variants) = &schema.any_of {
-        if !variants
+    if let Some(variants) = &schema.any_of
+        && !variants
             .iter()
             .any(|variant| check_value(variant, value, path).is_ok())
-        {
-            return Err(format!("{path}: matches no allowed variant"));
-        }
+    {
+        return Err(format!("{path}: matches no allowed variant"));
     }
-    if let Some(kind) = &schema.schema_type {
-        if !type_matches(kind, value) {
-            return Err(format!("{path}: expected {}", type_name(kind)));
-        }
+    if let Some(kind) = &schema.schema_type
+        && !type_matches(kind, value)
+    {
+        return Err(format!("{path}: expected {}", type_name(kind)));
     }
-    if let Some(allowed) = &schema.enum_values {
-        if !allowed.contains(value) {
-            return Err(format!("{path}: value not allowed"));
-        }
+    if let Some(allowed) = &schema.enum_values
+        && !allowed.contains(value)
+    {
+        return Err(format!("{path}: value not allowed"));
     }
     if let Value::Object(map) = value {
-        if let Some(required) = &schema.required {
-            if let Some(missing) = required.iter().find(|name| !map.contains_key(*name)) {
-                return Err(format!("{path}.{missing}: required"));
-            }
+        if let Some(required) = &schema.required
+            && let Some(missing) = required.iter().find(|name| !map.contains_key(*name))
+        {
+            return Err(format!("{path}.{missing}: required"));
         }
         for (name, field) in map {
             let nested = format!("{path}.{name}");

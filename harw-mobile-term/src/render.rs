@@ -93,11 +93,11 @@ impl Printer {
                     }
                 }
                 Some((_, shown)) => {
-                    if let (EntryKind::Tool { name, state }, Some(old)) = (&entry.kind, *shown) {
-                        if old != *state {
-                            out.push(format!("* {name} {}", tool_word(*state)));
-                            *shown = Some(*state);
-                        }
+                    if let (EntryKind::Tool { name, state }, Some(old)) = (&entry.kind, *shown)
+                        && old != *state
+                    {
+                        out.push(format!("* {name} {}", tool_word(*state)));
+                        *shown = Some(*state);
                     }
                 }
             }

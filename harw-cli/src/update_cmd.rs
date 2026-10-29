@@ -8,7 +8,7 @@
 //! 2. **Release zuerst.** Gibt es eine neuere Release, lädt `harw update`
 //!    `harw-<tag>-<target>.tar.gz` und `SHA256SUMS`, prüft die Prüfsumme,
 //!    entpackt mit dem System-`tar` in ein Staging-Verzeichnis neben den
-//!    Binaries und ersetzt `harw`, `killer` und (falls enthalten)
+//!    Binaries und ersetzt `harw`, `killer`, `harw-job-exec` und (falls enthalten)
 //!    `harw-agent-runner` per `rename`. Die vorige Fassung bleibt als
 //!    `<name>.old` liegen.
 //! 3. **Sonst Quell-Update.** Ohne veröffentlichte Release baut
@@ -70,10 +70,13 @@ const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ASSET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Die Binaries eines Release-Tarballs; `true` = muss enthalten sein.
-/// `killer` braucht Linux-procfs und pidfd und fehlt in Android-Releases.
-const RELEASE_BINARIES: [(&str, bool); 3] = [
+/// `killer` braucht Linux-procfs und pidfd und fehlt in Android-Releases,
+/// ebenso das Job-Trampolin `harw-job-exec` (PL-97 E3), das neben `harw`
+/// liegen muss (`harw doctor` meldet ein fehlendes).
+const RELEASE_BINARIES: [(&str, bool); 4] = [
     ("harw", true),
     ("killer", cfg!(target_os = "linux")),
+    ("harw-job-exec", cfg!(target_os = "linux")),
     ("harw-agent-runner", false),
 ];
 
@@ -170,10 +173,10 @@ pub fn on_start(home_override: Option<PathBuf>) {
         return;
     };
     let checker = UpdateChecker::new(&home);
-    if let Ok(Some(info)) = checker.read() {
-        if let Some(notice) = update_notice(&info, CURRENT_VERSION) {
-            eprintln!("harw: {notice}");
-        }
+    if let Ok(Some(info)) = checker.read()
+        && let Some(notice) = update_notice(&info, CURRENT_VERSION)
+    {
+        eprintln!("harw: {notice}");
     }
     if !checker.is_stale(jiff::Timestamp::now(), DEFAULT_TTL_SECS) {
         return;

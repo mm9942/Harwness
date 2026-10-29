@@ -30,6 +30,7 @@ default = []
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
+harw-fsutil = { path = "../harw-fsutil" }
 harw-authority = { path = "../harw-authority" }
 harw-config = { path = "../harw-config" }
 harw-retention = { path = "../harw-retention" }
@@ -72,6 +73,8 @@ harw-tui = { path = "../harw-tui" }
 harw-memory = { path = "../harw-memory" }
 harw-types = { path = "../harw-types" }
 harw-extension-api = { path = "../harw-extension-api" }
+# Exact-source WorkDriver collection tool and retained execution context.
+harw-tools = { path = "../harw-tools" }
 harw-registry-defaults = { path = "../harw-registry-defaults" }
 harw-mcp-server = { path = "../harw-mcp-server" }
 harw-mcp-client = { path = "../harw-mcp-client" }
@@ -124,6 +127,14 @@ secrecy = "0.10.3"
 secrecy_08 = { package = "secrecy", version = "0.8" }
 serde_json = "1"
 harw-install = { path = "../harw-install" }
+# PL-97 D3: `harw dod …` (`src/dod_cmd.rs`) liest Harw-DoD über den lesenden
+# Client (Export, Health, Systemkonfiguration, `systemctl show`); die
+# Darstellung teilt es mit `/dod` (`harw_ops::dod`). Kein Pfad zu Warden oder
+# Eskalation (S1).
+harw-dod-client = { path = "../harw-dod-client" }
+# Zeitstempel der Harw-DoD-Exporte (`harw-dod-client` rechnet in
+# `time::OffsetDateTime`); Version wie dort gepinnt.
+time = "0.3.53"
 harw-model-catalog = { path = "../harw-model-catalog" }
 clap_complete = "4.6.7"
 harw-completions = { path = "../harw-completions", features = ["clap-args"] }
@@ -170,10 +181,10 @@ harw-session-ws = { path = "../harw-session-ws" }
 # `harw kill` einen Fehler (Exit-Code 2).
 [target.'cfg(target_os = "linux")'.dependencies]
 harw-killer = { path = "../harw-killer" }
-# Sandboxed verify for the work driver (`src/verify_sandbox.rs`): bwrap as the
-# fallback backend when no Landlock trampoline is found. Linux-only.
+# Sandboxed verify for the work driver (`src/verify_sandbox.rs`): the
+# Bubblewrap backends (feature `bwrap`) next to the Landlock trampoline.
+# Linux-only.
 harw-job-runtime = { path = "../harw-job-runtime", features = ["bwrap"] }
-harw-job-executor-bwrap = { path = "../harw-job-executor-bwrap" }
 
 [dev-dependencies]
 tempfile = "3"

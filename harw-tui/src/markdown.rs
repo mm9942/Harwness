@@ -596,14 +596,14 @@ fn parse_inline(chars: &[char], base: Style, theme: Theme, out: &mut Vec<Span<'s
                 }
             }
             '*' | '_' if next == Some(c) => {
-                if opens_emphasis(chars, i, 2) {
-                    if let Some(close) = find_double_close(chars, i + 2, c) {
-                        flush_plain(&mut buf, base, out);
-                        let style = base.add_modifier(Modifier::BOLD);
-                        parse_inline(&chars[i + 2..close], style, theme, out);
-                        i = close + 2;
-                        continue;
-                    }
+                if opens_emphasis(chars, i, 2)
+                    && let Some(close) = find_double_close(chars, i + 2, c)
+                {
+                    flush_plain(&mut buf, base, out);
+                    let style = base.add_modifier(Modifier::BOLD);
+                    parse_inline(&chars[i + 2..close], style, theme, out);
+                    i = close + 2;
+                    continue;
                 }
                 // Nicht geschlossen: beide Marker wörtlich übernehmen.
                 buf.push(c);
@@ -612,14 +612,14 @@ fn parse_inline(chars: &[char], base: Style, theme: Theme, out: &mut Vec<Span<'s
                 continue;
             }
             '*' | '_' => {
-                if opens_emphasis(chars, i, 1) {
-                    if let Some(close) = find_single_close(chars, i + 1, c) {
-                        flush_plain(&mut buf, base, out);
-                        let style = base.add_modifier(Modifier::ITALIC);
-                        parse_inline(&chars[i + 1..close], style, theme, out);
-                        i = close + 1;
-                        continue;
-                    }
+                if opens_emphasis(chars, i, 1)
+                    && let Some(close) = find_single_close(chars, i + 1, c)
+                {
+                    flush_plain(&mut buf, base, out);
+                    let style = base.add_modifier(Modifier::ITALIC);
+                    parse_inline(&chars[i + 1..close], style, theme, out);
+                    i = close + 1;
+                    continue;
                 }
             }
             '[' => {

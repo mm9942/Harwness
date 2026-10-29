@@ -114,6 +114,31 @@ impl DurableTranscripts {
             Err(error) => Err(error.into()),
         }
     }
+
+    /// Repair transcript tails for the finite set of persisted sessions the
+    /// caller selected during startup recovery.
+    ///
+    /// This deliberately does not enumerate transcript files: hosted-session
+    /// records define the recovery scope, and orphan transcripts are left
+    /// untouched. A lock contention or any other storage error aborts the
+    /// operation so callers cannot start with a known-unrepaired session.
+    pub fn repair_tails(
+        &self,
+        sessions: &[SessionId],
+    ) -> Result<Vec<(SessionId, TailRepair)>, HostError> {
+        sessions
+            .iter()
+            .map(|session| {
+                let outcome = self.repair_tail(session)?;
+                // Tail repair only addresses a non-newline-terminated final
+                // append. Validate every complete record too, so malformed
+                // JSONL remains a startup error instead of being hidden until
+                // the session is attached.
+                self.head(session)?;
+                Ok((session.clone(), outcome))
+            })
+            .collect()
+    }
 }
 
 impl TranscriptSource for DurableTranscripts {

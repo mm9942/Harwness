@@ -532,10 +532,10 @@ fn segments_match(pattern: &[GlobSegment], parts: &[&str]) -> bool {
                 for (index, part) in parts.iter().enumerate() {
                     if current.get(index).copied().unwrap_or(false) {
                         let part: Vec<char> = part.chars().collect();
-                        if segment_match(chars, &part) {
-                            if let Some(slot) = next.get_mut(index + 1) {
-                                *slot = true;
-                            }
+                        if segment_match(chars, &part)
+                            && let Some(slot) = next.get_mut(index + 1)
+                        {
+                            *slot = true;
                         }
                     }
                 }
@@ -790,11 +790,12 @@ impl TriggerIndex {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut candidates = |run: &str| {
             let candidate = run.to_lowercase();
-            if candidate.len() <= MAX_ERROR_CODE_CHARS * 4 && seen.insert(candidate.clone()) {
-                if let Some(rules) = self.error_codes.get(&candidate) {
-                    for (skill, key) in rules {
-                        add(skill, TriggerKind::ErrorCode, key);
-                    }
+            if candidate.len() <= MAX_ERROR_CODE_CHARS * 4
+                && seen.insert(candidate.clone())
+                && let Some(rules) = self.error_codes.get(&candidate)
+            {
+                for (skill, key) in rules {
+                    add(skill, TriggerKind::ErrorCode, key);
                 }
             }
         };

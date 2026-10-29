@@ -4,7 +4,10 @@
 //! `tokio::task::spawn_blocking`, damit ein langer Walk den (häufig
 //! `current_thread`-)Runtime des Harness nicht einfriert. Wird das Future
 //! verworfen (Turn-Abbruch), läuft die bereits gestartete Arbeit bis zu ihrer
-//! eigenen Deadline weiter; ihr Ergebnis wird verworfen.
+//! eigenen Deadline weiter; ihr Ergebnis wird verworfen. Jeder Aufrufer muss
+//! deshalb seinen ToolExecutionContext (inklusive Lifetime-Guard) in die
+//! Closure verschieben und bis zum Ende behalten. Das hält die vorhandene
+//! Lease, stoppt die Arbeit aber nicht und beweist keine Prozess-Quieszenz.
 
 use harw_tools::{ToolOutput, ToolsError};
 

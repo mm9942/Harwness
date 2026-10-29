@@ -111,10 +111,10 @@ impl FrameTap {
     /// Builds and sends a frame, but only while somebody is subscribed.
     pub(crate) fn emit_with(&self, frame: impl FnOnce() -> JobFrame) {
         let guard = self.sender.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(sender) = guard.as_ref() {
-            if sender.receiver_count() > 0 {
-                let _ = sender.send(frame());
-            }
+        if let Some(sender) = guard.as_ref()
+            && sender.receiver_count() > 0
+        {
+            let _ = sender.send(frame());
         }
     }
 

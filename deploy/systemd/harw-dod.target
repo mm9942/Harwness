@@ -10,7 +10,7 @@
 # needs an operator-chosen --scope-root first; enable it explicitly).
 
 [Unit]
-Description=HARW DoD observation
+Description=Harw-DoD observation
 Wants=harw-sentinel.service harw-probe-bpf.service
 After=harw-sentinel.service harw-probe-bpf.service
 

@@ -113,19 +113,19 @@ impl PermissionsSection {
     /// - eine `allow`- oder `deny`-Regel ein leeres `tool` hat;
     /// - `extra_roots` mehr als 8 Einträge hat, oder ein Eintrag relativ ist.
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(mode) = &self.default_mode {
-            if !ALLOWED_MODES.contains(&mode.as_str()) {
-                return Err(format!(
-                    "permissions.default_mode muss einer von {ALLOWED_MODES:?} sein, war {mode:?}"
-                ));
-            }
+        if let Some(mode) = &self.default_mode
+            && !ALLOWED_MODES.contains(&mode.as_str())
+        {
+            return Err(format!(
+                "permissions.default_mode muss einer von {ALLOWED_MODES:?} sein, war {mode:?}"
+            ));
         }
-        if let Some(secs) = self.approval_timeout_secs {
-            if !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&secs) {
-                return Err(format!(
-                    "permissions.approval_timeout_secs muss zwischen {MIN_TIMEOUT_SECS} und {MAX_TIMEOUT_SECS} liegen, war {secs}"
-                ));
-            }
+        if let Some(secs) = self.approval_timeout_secs
+            && !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&secs)
+        {
+            return Err(format!(
+                "permissions.approval_timeout_secs muss zwischen {MIN_TIMEOUT_SECS} und {MAX_TIMEOUT_SECS} liegen, war {secs}"
+            ));
         }
         if let Some(secs) = self.auto_classifier_timeout_secs
             && !(MIN_CLASSIFIER_TIMEOUT_SECS..=MAX_CLASSIFIER_TIMEOUT_SECS).contains(&secs)

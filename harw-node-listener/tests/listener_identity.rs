@@ -34,6 +34,15 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 struct IdleDriver;
 
 impl TurnDriver for IdleDriver {
+    // This test double performs no privileged runtime/tool effects.
+    fn prepare_execution(
+        &self,
+        _: &harw_types::SessionId,
+        _: harw_session_host::driver::ExecutionAdmission,
+    ) -> harw_session_host::driver::DriverFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn create_session(&self, _: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -271,10 +280,10 @@ async fn mapped_peer_upgrades_and_hello_grants_only_the_registry_ceiling() -> Te
         let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
             .await?
             .ok_or("closed")??;
-        if let Message::Text(text) = message {
-            if let WireMessage::Response(response) = serde_json::from_str(text.as_str())? {
-                break response;
-            }
+        if let Message::Text(text) = message
+            && let WireMessage::Response(response) = serde_json::from_str(text.as_str())?
+        {
+            break response;
         }
     };
     let ack: HelloAck = serde_json::from_value(response.result.ok_or("no hello result")?)?;

@@ -55,8 +55,14 @@
 //! # Public API boundary
 //! Only first-party types appear in this API (Job-Runtime-Doc §2.5).
 //!
+//! # Backend selection
+//! `harw_job::select_backend(&HostReport, &BackendPreferences)` (Linux)
+//! picks the strongest sandbox backend this host offers and records why
+//! (PL-97 E1).
+//!
 //! # Features
-//! - `bwrap`: the Bubblewrap sandbox backend (`LinuxSandboxBackend::Bwrap`).
+//! - `bwrap`: the Bubblewrap sandbox backends (`LinuxSandboxBackend::Bwrap`
+//!   and `LinuxSandboxBackend::BwrapTrampoline`).
 //! - `oci`: the container backend (`OciExecutor`, `OciConfig`) for Podman/Docker.
 
 #![forbid(unsafe_code)]
@@ -80,7 +86,12 @@ pub use harw_job_runtime::coordinator::{
 };
 #[cfg(target_os = "linux")]
 pub use harw_job_runtime::coordinator::{LinuxExecutor, LinuxExecutorOptions, LinuxSandboxBackend};
-pub use harw_job_runtime::host::{HostFacts, HostLandlock, HostReport};
+pub use harw_job_runtime::host::{
+    BackendKind, BackendPreferences, BackendRequest, ExecutableSource, HostFacts, HostLandlock,
+    HostReport, TRAMPOLINE_NAME, UnknownBackend, predicted_dimensions,
+};
+#[cfg(target_os = "linux")]
+pub use harw_job_runtime::host::{BackendSelection, select_backend};
 pub use harw_job_store::FsJobRecordStore;
 pub use harw_types::WorkId;
 

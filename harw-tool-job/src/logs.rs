@@ -284,10 +284,10 @@ pub fn read_log(path: &Path, query: &LogQuery) -> io::Result<LogSlice> {
             raw.pop();
         }
         let text = String::from_utf8_lossy(&raw);
-        if let Some(needle) = &query.grep {
-            if !text.contains(needle.as_str()) {
-                continue;
-            }
+        if let Some(needle) = &query.grep
+            && !text.contains(needle.as_str())
+        {
+            continue;
         }
         slice.matched_lines += 1;
         match keep_tail {

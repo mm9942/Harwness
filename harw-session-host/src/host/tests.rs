@@ -42,8 +42,11 @@ struct FakeDriver {
     approvals: Arc<MemoryApprovals>,
     turns: AtomicUsize,
     gate: Option<Arc<Notify>>,
+    create_gate: Option<Arc<Notify>>,
+    discarded: AtomicUsize,
     park: bool,
     settings: std::sync::Mutex<Vec<Setting>>,
+    admissions: std::sync::Mutex<Vec<crate::driver::ExecutionAdmission>>,
     /// Results returned (in order) instead of running a normal turn.
     failures: std::sync::Mutex<std::collections::VecDeque<Result<TurnOutcome, HostError>>>,
 }
@@ -55,8 +58,11 @@ impl FakeDriver {
             approvals,
             turns: AtomicUsize::new(0),
             gate: None,
+            create_gate: None,
+            discarded: AtomicUsize::new(0),
             park: false,
             settings: std::sync::Mutex::new(Vec::new()),
+            admissions: std::sync::Mutex::new(Vec::new()),
             failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
@@ -88,8 +94,31 @@ impl FakeDriver {
 use crate::replay::TranscriptSource as _;
 
 impl TurnDriver for FakeDriver {
+    fn prepare_execution(
+        &self,
+        _: &SessionId,
+        admission: crate::driver::ExecutionAdmission,
+    ) -> DriverFuture<'_, ()> {
+        let result = self
+            .admissions
+            .lock()
+            .map(|mut admissions| admissions.push(admission))
+            .map_err(|_| HostError::Driver("admission capture poisoned".into()));
+        Box::pin(async move { result })
+    }
+
+    fn discard_unpublished_session(&self, _: &SessionId) -> Result<(), HostError> {
+        self.discarded.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn create_session(&self, _: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            if let Some(gate) = &self.create_gate {
+                gate.notified().await;
+            }
+            Ok(())
+        })
     }
 
     fn run_turn(
@@ -969,4 +998,212 @@ fn sanitize_notice_strips_controls_and_bounds_length() {
     assert_eq!(sanitize_notice("   ", 50), "");
     let cut = sanitize_notice(&"é".repeat(10), 4);
     assert_eq!(cut, "éééé\u{2026}");
+}
+
+#[tokio::test]
+async fn execution_admission_survives_detach_but_not_creator_revocation() -> TestResult {
+    let fx = fixture()?;
+    let creator = local(501, PermissionTier::Operator);
+    let connection = connect(&fx.host, creator.clone()).await?;
+    let summary = connection.create(CreateParams::default()).await?;
+    let record = fx
+        .host
+        .inner
+        .records
+        .load(&summary.session_id)?
+        .ok_or("missing record")?;
+    let admitted = fx.driver.admissions.lock().map_err(|_| "poisoned")?;
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0].maximum_tier(), PermissionTier::Operator);
+    assert_eq!(admitted[0].approval_actor(), &creator.actor);
+    assert_eq!(
+        admitted[0]
+            .principal_with_ceiling(PermissionTier::Observer)
+            .tier(),
+        PermissionTier::Observer
+    );
+    drop(admitted);
+    drop(connection);
+    // Transport loss retains process-local authenticated authority.
+    assert!(fx.host.inner.execution_admission(&record)?.is_some());
+    fx.host.revoke_connection(creator.connection);
+    assert!(matches!(
+        fx.host.inner.execution_admission(&record),
+        Err(HostError::Denied(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_creator_ceiling_requires_reauthentication_after_restart() -> TestResult {
+    let fx = fixture()?;
+    let creator = local(502, PermissionTier::Operator);
+    let connection = connect(&fx.host, creator.clone()).await?;
+    let summary = connection.create(CreateParams::default()).await?;
+    let record = fx
+        .host
+        .inner
+        .records
+        .load(&summary.session_id)?
+        .ok_or("missing record")?;
+    drop(connection);
+    // Only durable metadata survives a new host process.
+    let restarted = SessionHost::open(
+        HostConfig::new(fx._dir.path().to_path_buf()),
+        Arc::clone(&fx.driver) as Arc<dyn TurnDriver>,
+        Arc::clone(&fx.driver.transcripts) as Arc<dyn crate::replay::TranscriptSource>,
+        Arc::clone(&fx.driver.approvals) as Arc<dyn crate::approvals::ApprovalBackend>,
+    )?;
+    assert!(matches!(
+        restarted.inner.execution_admission(&record),
+        Err(HostError::Denied(_))
+    ));
+    let foreign = connect(&restarted, local(503, PermissionTier::Owner)).await?;
+    assert!(restarted.inner.execution_admission(&record).is_err());
+    let fresh_creator = connect(&restarted, local(502, PermissionTier::Owner)).await?;
+    let admission = restarted
+        .inner
+        .execution_admission(&record)?
+        .ok_or("missing admission")?;
+    // Fresh authority may not exceed the persisted request.
+    assert_eq!(admission.maximum_tier(), PermissionTier::Operator);
+    drop((foreign, fresh_creator));
+    Ok(())
+}
+
+#[tokio::test]
+async fn freshly_authenticated_observer_creator_narrows_cached_operator_authority() -> TestResult {
+    let fx = fixture()?;
+    let operator = connect(&fx.host, local(504, PermissionTier::Operator)).await?;
+    let summary = operator.create(CreateParams::default()).await?;
+    let record = fx
+        .host
+        .inner
+        .records
+        .load(&summary.session_id)?
+        .ok_or("missing record")?;
+    drop(operator);
+    let downgraded = connect(&fx.host, local(504, PermissionTier::Observer)).await?;
+    let admission = fx
+        .host
+        .inner
+        .execution_admission(&record)?
+        .ok_or("missing admission")?;
+    assert_eq!(admission.maximum_tier(), PermissionTier::Observer);
+    drop(downgraded);
+    // Dropping the narrower credential may not restore the old cached tier.
+    let admission = fx
+        .host
+        .inner
+        .execution_admission(&record)?
+        .ok_or("missing admission")?;
+    assert_eq!(admission.maximum_tier(), PermissionTier::Observer);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_record_publication_discards_unpublished_creator_and_driver_state() -> TestResult {
+    let fx = fixture()?;
+    let connection = connect(&fx.host, local(505, PermissionTier::Operator)).await?;
+    let record_root = fx.host.inner.records.root();
+    let backup = fx._dir.path().join("record-backup");
+    std::fs::rename(record_root, &backup)?;
+    std::fs::write(record_root, b"block record directory")?;
+    assert!(connection.create(CreateParams::default()).await.is_err());
+    assert_eq!(fx.driver.discarded.load(Ordering::SeqCst), 1);
+    assert!(
+        fx.host
+            .inner
+            .execution_creators
+            .lock()
+            .map_err(|_| "poisoned")?
+            .is_empty()
+    );
+    assert!(fx.host.inner.all_slots().is_empty());
+    assert_eq!(fx.driver.turns.load(Ordering::SeqCst), 0);
+    std::fs::remove_file(record_root)?;
+    std::fs::rename(backup, record_root)?;
+    // Failure leaves no published session, and a new creation can proceed.
+    assert!(connection.list().await?.is_empty());
+    connection.create(CreateParams::default()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_create_future_rolls_back_unpublished_authority() -> TestResult {
+    let fx = fixture_with(|driver| driver.create_gate = Some(Arc::new(Notify::new())))?;
+    let connection = connect(&fx.host, local(506, PermissionTier::Operator)).await?;
+    let mut creation = connection.create(CreateParams::default());
+    std::future::poll_fn(|cx| {
+        assert!(creation.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert!(
+        !fx.host
+            .inner
+            .execution_creators
+            .lock()
+            .map_err(|_| "poisoned")?
+            .is_empty()
+    );
+    drop(creation);
+    assert_eq!(fx.driver.discarded.load(Ordering::SeqCst), 1);
+    assert!(
+        fx.host
+            .inner
+            .execution_creators
+            .lock()
+            .map_err(|_| "poisoned")?
+            .is_empty()
+    );
+    assert!(connection.list().await?.is_empty());
+    assert_eq!(fx.driver.turns.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_invalidation_expires_detached_device_facts_and_allows_fresh_narrower_auth()
+-> TestResult {
+    let fx = fixture()?;
+    let device = DeviceId::try_from_str("policy-device")?;
+    let mut identity = local(507, PermissionTier::Operator);
+    identity.device = Some(device.clone());
+    identity.authenticated_node = Some(harw_types::NodeId::try_from_str("policy-node")?);
+    let creator = connect(&fx.host, identity.clone()).await?;
+    let summary = creator.create(CreateParams::default()).await?;
+    let record = fx
+        .host
+        .inner
+        .records
+        .load(&summary.session_id)?
+        .ok_or("missing record")?;
+    drop(creator);
+    assert!(fx.host.authenticated_devices().contains(&device));
+    assert!(
+        fx.host
+            .authenticated_identities()
+            .iter()
+            .any(|entry| entry.connection == identity.connection)
+    );
+    fx.host.invalidate_device_policy(&device);
+    assert!(fx.host.inner.execution_admission(&record).is_err());
+    assert!(fx.host.connect(identity.clone()).is_err());
+    identity.connection = crate::identity::ConnectionId::next();
+    identity.principal = harw_types::Principal::trusted_ingress(
+        identity.principal.kind(),
+        identity.principal.id(),
+        identity.principal.surface(),
+        PermissionTier::Observer,
+    );
+    identity.caps = crate::identity::caps_for_tier(PermissionTier::Observer);
+    let fresh = connect(&fx.host, identity).await?;
+    let admission = fx
+        .host
+        .inner
+        .execution_admission(&record)?
+        .ok_or("missing admission")?;
+    assert_eq!(admission.maximum_tier(), PermissionTier::Observer);
+    drop(fresh);
+    Ok(())
 }

@@ -1,6 +1,8 @@
-# Relative logical destinations installed by dod/scripts/install.sh.
+# Relative logical destinations installed by dod/scripts/install.sh (Harw-DoD).
 # The manifest deliberately excludes /etc/harw-dod/config.toml and all state,
-# telemetry, and runtime files so upgrades/uninstall never remove operator data.
+# telemetry, and runtime files so upgrades/uninstall never remove operator data;
+# that includes the sentinel exports in /var/lib/harw-dod/export
+# (findings.jsonl, health.json), which tmpfiles/harw.conf creates.
 #
 # The systemd/, sysusers/ and tmpfiles/ entries are installed from the one
 # canonical deploy/ tree at the repository root (Crypto Masterplan v2 §22,

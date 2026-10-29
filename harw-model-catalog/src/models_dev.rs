@@ -392,10 +392,10 @@ fn apply_cache(cache: &ModelsDevCache, catalog: &mut [ProviderSpec]) {
         ) {
             continue;
         }
-        if let Some(models) = cache.models_for(&provider.id) {
-            if !models.is_empty() {
-                provider.models = models;
-            }
+        if let Some(models) = cache.models_for(&provider.id)
+            && !models.is_empty()
+        {
+            provider.models = models;
         }
     }
 }

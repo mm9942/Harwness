@@ -1,0 +1,5 @@
+error: unknown permission `root_access` in `permission_request!` (allowed: `read_workspace`, `write_workspace`, `execute_process`, `network_access`, `read_secrets`, `manage_plugins`, `read_cargo_registry`, `manage_containers`)
+ --> tests/compile_fail/45_permission_request_unknown_name.rs:4:69
+  |
+4 |     let _request = harw_macros::permission_request!(read_workspace, root_access);
+  |                                                                     ^^^^^^^^^^^

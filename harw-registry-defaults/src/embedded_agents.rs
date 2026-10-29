@@ -858,6 +858,7 @@ const ROOT_CEILING_SECTIONS: &[&str] = &[
     "legacy.v1",
     "delegation.targets",
     "continuation.instruction",
+    "skills.triggered",
 ];
 
 /// Sammelt die Kontextprogramme direkt unter `agents/context-programs/`.
@@ -2811,7 +2812,7 @@ mod tests {
     // ── Matrix-Game-Sitze (Runde 3, Welle E) ───────────────────────────────
 
     /// Die drei Matrix-Sitz-Rollen: organisatorisch `Worker`, admittieren
-    /// genau die lesenden Unterlagen-Werkzeuge (fünf lesende `fs.*` plus
+    /// genau die lesenden Unterlagen-Werkzeuge (sechs lesende `fs.*` plus
     /// `doc.read_pdf`, Runde 3 „Matrix-Unterlagen“) und verbieten Schreiben,
     /// Exec und Netz ausdrücklich; nicht pausierbar, ohne eigene Ebene
     /// darunter, mit höchstens 16 Werkzeugaufrufen und einem
@@ -2836,6 +2837,7 @@ mod tests {
                 .collect();
             let expected: std::collections::BTreeSet<&str> = [
                 "fs.read",
+                "fs.view_image",
                 "fs.list",
                 "fs.search",
                 "fs.glob",
@@ -2894,6 +2896,7 @@ mod tests {
             explorer.tool_surface().admitted(),
             [
                 "fs.read",
+                "fs.view_image",
                 "fs.list",
                 "fs.search",
                 "fs.glob",
@@ -2908,6 +2911,29 @@ mod tests {
                 "explore.projects",
                 "explore.relations",
                 "explore.find",
+                // PL-97 B4: lesende Kommando-Werkzeuge (PL-93), ohne `sys.*`.
+                "fsread.ls",
+                "fsread.stat",
+                "fsread.find",
+                "fsread.du",
+                "fsread.df",
+                "fsread.wc",
+                "fsread.head",
+                "fsread.tail",
+                "fsread.cat",
+                "fsread.file",
+                "fsread.tree",
+                "fsread.readlink",
+                "fsread.realpath",
+                "fsread.hash",
+                "fsread.diff",
+                "fsread.json",
+                "git.status",
+                "git.diff",
+                "git.log",
+                "git.show",
+                "git.branch",
+                "git.blame",
                 // Nutzerentscheidung: der Explorer durchsucht auch das Netz.
                 "web.search",
                 "web.fetch",

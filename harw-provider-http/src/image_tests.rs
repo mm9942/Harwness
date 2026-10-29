@@ -357,3 +357,80 @@ async fn a_model_without_image_input_is_sent_the_notice_over_http() -> TestResul
     server.join().map_err(join_error)??;
     Ok(())
 }
+
+#[test]
+fn model_opened_image_reaches_all_native_wire_formats_after_tool_result() -> TestResult {
+    let (media, bytes) = stored(b"tool-opened-image")?;
+    let mut request = request_with("inspect the workspace screenshot", vec![]);
+    let call = harw_types::ToolCallId::new();
+    request.history.push_tool_call(
+        call.clone(),
+        "fs.view_image",
+        serde_json::json!({"path":"shot.png"}),
+    );
+    request.history.push_tool_result(
+        call,
+        harw_protocol::ToolCallResult::success(
+            serde_json::to_value(harw_media::tool_image::ImageToolResult::ImageInspection {
+                media,
+                detail: Some(ImageDetail::High),
+            })
+            .map_err(ctx("descriptor"))?,
+        ),
+        1,
+    );
+    let chat = build_chat_body(&request, "gpt-4o");
+    let chat_messages = chat["messages"]
+        .as_array()
+        .ok_or(TestError::Missing("chat messages"))?;
+    let chat_image = chat_messages
+        .last()
+        .ok_or(TestError::Missing("chat image message"))?;
+    assert_eq!(chat_image["role"], "user");
+    assert_eq!(
+        decode(
+            chat_image["content"][0]["image_url"]["url"]
+                .as_str()
+                .unwrap_or_default()
+        )?,
+        bytes
+    );
+    assert_eq!(chat_image["content"][0]["image_url"]["detail"], "high");
+
+    let responses =
+        serde_json::to_value(build_request("gpt-5", &request)).map_err(ctx("responses"))?;
+    let inputs = responses["input"]
+        .as_array()
+        .ok_or(TestError::Missing("responses input"))?;
+    let response_image = inputs.last().ok_or(TestError::Missing("responses image"))?;
+    assert_eq!(response_image["content"][0]["type"], "input_image");
+    assert_eq!(
+        decode(
+            response_image["content"][0]["image_url"]
+                .as_str()
+                .unwrap_or_default()
+        )?,
+        bytes
+    );
+
+    let anthropic = anthropic::build_messages_body("claude-sonnet-5-5", 1024, &request);
+    let messages = anthropic["messages"]
+        .as_array()
+        .ok_or(TestError::Missing("anthropic messages"))?;
+    let blocks = messages
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten();
+    let block = blocks
+        .into_iter()
+        .find(|block| block["type"] == "image")
+        .ok_or(TestError::Missing("native anthropic image"))?;
+    assert_eq!(block["source"]["media_type"], "image/png");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(block["source"]["data"].as_str().unwrap_or_default())
+            .map_err(ctx("anthropic base64"))?,
+        bytes
+    );
+    Ok(())
+}

@@ -15,7 +15,7 @@
 # socket FIRST and only then restricts itself.
 
 [Unit]
-Description=HARW DoD eBPF observation probe (push-only)
+Description=Harw-DoD eBPF observation probe (push-only)
 Documentation=man:harw-probe-bpf(1)
 PartOf=harw-dod.target
 After=harw-sentinel.service

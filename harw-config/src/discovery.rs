@@ -243,34 +243,34 @@ impl ResolvedConfig {
     pub fn compute_diagnostics(&self) -> Vec<ConfigDiagnostic> {
         let mut diagnostics = Vec::new();
 
-        if let Some(provider) = &self.harness.default_provider {
-            if !self.providers.contains_key(provider) {
-                diagnostics.push(ConfigDiagnostic::new(
-                    "default_provider",
-                    "provider",
-                    provider,
-                ));
-            }
+        if let Some(provider) = &self.harness.default_provider
+            && !self.providers.contains_key(provider)
+        {
+            diagnostics.push(ConfigDiagnostic::new(
+                "default_provider",
+                "provider",
+                provider,
+            ));
         }
-        if let Some(model) = &self.harness.default_model {
-            if !self.models.contains_key(model) {
-                diagnostics.push(ConfigDiagnostic::new("default_model", "model", model));
-            }
+        if let Some(model) = &self.harness.default_model
+            && !self.models.contains_key(model)
+        {
+            diagnostics.push(ConfigDiagnostic::new("default_model", "model", model));
         }
-        if let Some(provider) = &self.harness.uia_provider {
-            if !self.providers.contains_key(provider) {
-                diagnostics.push(ConfigDiagnostic::new("uia_provider", "provider", provider));
-            }
+        if let Some(provider) = &self.harness.uia_provider
+            && !self.providers.contains_key(provider)
+        {
+            diagnostics.push(ConfigDiagnostic::new("uia_provider", "provider", provider));
         }
-        if let Some(model) = &self.harness.uia_model {
-            if !self.models.contains_key(model) {
-                diagnostics.push(ConfigDiagnostic::new("uia_model", "model", model));
-            }
+        if let Some(model) = &self.harness.uia_model
+            && !self.models.contains_key(model)
+        {
+            diagnostics.push(ConfigDiagnostic::new("uia_model", "model", model));
         }
-        if let Some(model) = &self.harness.uia_worker_model {
-            if !self.models.contains_key(model) {
-                diagnostics.push(ConfigDiagnostic::new("uia_worker_model", "model", model));
-            }
+        if let Some(model) = &self.harness.uia_worker_model
+            && !self.models.contains_key(model)
+        {
+            diagnostics.push(ConfigDiagnostic::new("uia_worker_model", "model", model));
         }
 
         for provider_name in sorted_keys(&self.providers) {
@@ -794,10 +794,10 @@ pub fn discover_config_with_restricted_and_project_settings(
         discover_channels(base, &mut resolved.channels)?;
     }
 
-    if let Some(repo) = restricted_repo {
-        if !layers.iter().any(|layer| layer == repo) {
-            apply_restricted_layer(repo, &mut resolved)?;
-        }
+    if let Some(repo) = restricted_repo
+        && !layers.iter().any(|layer| layer == repo)
+    {
+        apply_restricted_layer(repo, &mut resolved)?;
     }
 
     compose_legacy_provider_registry(&mut resolved);

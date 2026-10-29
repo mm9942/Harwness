@@ -74,10 +74,10 @@ fn describe(scope: &Scope, db: &UserDb, input: &str, follow: bool, long: bool) -
         "group": db.group_or_id(meta.gid),
         "mtime": meta.mtime.iso(),
     });
-    if meta.kind == Kind::Symlink {
-        if let Ok(target) = scope.read_link(&target_rel) {
-            value["link_target"] = json!(target.to_string_lossy());
-        }
+    if meta.kind == Kind::Symlink
+        && let Ok(target) = scope.read_link(&target_rel)
+    {
+        value["link_target"] = json!(target.to_string_lossy());
     }
     if follow && target_rel != rel {
         value["resolved_path"] = json!(target_rel.display());
@@ -130,7 +130,8 @@ pub fn run(root: &Path, args: &StatArgs) -> ToolOutput {
     name = "fsread.stat",
     description = "Shows file metadata like stat: type, size, permissions (octal and rwx), uid/gid with names, atime/mtime/ctime, inode, link count, blocks, device; follow=true is -L (only targets inside the workspace). Use when you need exact metadata of up to 64 paths instead of running stat. Returns JSON {results:[{path, ok, type, size, mode, owner, mtime, ...}], failed}. Symlinks are described, not followed, unless follow is set.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_stat(
     context: &ToolExecutionContext,

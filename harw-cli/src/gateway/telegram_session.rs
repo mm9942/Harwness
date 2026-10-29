@@ -208,11 +208,14 @@ impl<J> Scheduler<J> {
     }
 
     fn schedule(&mut self, key: &SessionKey) {
-        if let Some(lane) = self.lanes.get_mut(key) {
-            if !lane.running && !lane.blocked && !lane.scheduled && !lane.queue.is_empty() {
-                lane.scheduled = true;
-                self.ready.push_back(key.clone());
-            }
+        if let Some(lane) = self.lanes.get_mut(key)
+            && !lane.running
+            && !lane.blocked
+            && !lane.scheduled
+            && !lane.queue.is_empty()
+        {
+            lane.scheduled = true;
+            self.ready.push_back(key.clone());
         }
     }
 
@@ -557,6 +560,7 @@ fn telegram_turn_spec(
 fn telegram_turn_narrowing(workspace_root: &Path) -> RuntimeNarrowing {
     let profile = EntryKind::GatewayTelegram.profile();
     RuntimeNarrowing {
+        write_scope: harw_authority::FileWriteScope::workspace(),
         registry_profile: profile.registry_profile,
         identity: IdentityOverrides::default(),
         permissions: profile.permissions,

@@ -1,0 +1,9 @@
+# Re-delivered events (same or older ingest_seq, e.g. after a reconnect) are
+# refused and counted; the projection equals the one without duplicates.
+{"ingest_seq":1,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"started"}
+{"ingest_seq":2,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":3,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"started"}
+# reconnect: the client receives 2 and 3 again
+{"ingest_seq":2,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":3,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"started"}
+{"ingest_seq":4,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"finished","outcome":{"failed":{"class":"io"}}}

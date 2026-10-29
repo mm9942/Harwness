@@ -124,6 +124,9 @@ esac
 
 class MirrorBinaryInstallTests(unittest.TestCase):
     TAG = "v9.9.9"
+    # Release layout of scripts/package-release.sh; harw-job-exec (PL-97 E3)
+    # is last so older releases (without it) are BINARIES[:3].
+    BINARIES = ("harw", "killer", "harw-agent-runner", "harw-job-exec")
 
     def test_binary_flag_installs_mirror_release_on_x86_64(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -134,9 +137,20 @@ class MirrorBinaryInstallTests(unittest.TestCase):
             self.assertIn(f"{self.TAG}/harw-{self.TAG}-x86_64-unknown-linux-gnu.tar.gz", urls)
             self.assertNotIn("Harwness-main.zip", urls)
             self.assertNotIn("github.com", urls)
-            for binary in ("harw", "killer", "harw-agent-runner"):
+            for binary in self.BINARIES:
                 self.assertTrue((root / "home/.local/bin" / binary).is_file(), binary)
             self.assertIn("harw-test x86_64-unknown-linux-gnu", result.stdout)
+
+    def test_binary_flag_installs_an_older_release_without_the_trampoline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.publish(root, ["x86_64-unknown-linux-gnu"], with_trampoline=False)
+            result, _ = self.run_installer(root, "x86_64", "--binary")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for binary in self.BINARIES[:3]:
+                self.assertTrue((root / "home/.local/bin" / binary).is_file(), binary)
+            self.assertFalse((root / "home/.local/bin/harw-job-exec").exists())
+            self.assertIn("has no harw-job-exec", result.stdout + result.stderr)
 
     def test_binary_flag_selects_the_aarch64_tarball(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -284,7 +298,8 @@ class MirrorBinaryInstallTests(unittest.TestCase):
             self.assertIn("checksum", result.stderr)
             self.assertFalse((root / "home/.local/bin/harw").exists())
 
-    def publish(self, root, targets, source=False, manifest=False, runnable=True):
+    def publish(self, root, targets, source=False, manifest=False, runnable=True,
+                with_trampoline=True):
         """Writes the release.yml `mirror` layout for self.TAG below root/mirror.
 
         With manifest, the mirror names the tag only in version.json (written by
@@ -302,7 +317,7 @@ class MirrorBinaryInstallTests(unittest.TestCase):
                 directory = tarfile.TarInfo(name)
                 directory.type, directory.mode = tarfile.DIRTYPE, 0o755
                 tar.addfile(directory)
-                for binary in ("harw", "killer", "harw-agent-runner"):
+                for binary in self.BINARIES if with_trampoline else self.BINARIES[:3]:
                     body = (
                         '#!/bin/sh\n'
                         f'[ "$1" = --version ] && echo "harw-test {target}"\n'

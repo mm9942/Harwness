@@ -813,10 +813,10 @@ fn parse_response(
 /// - [`WebToolError::NotConfigured`]: der Client ließ sich nicht bauen.
 fn search_client(policy: &EgressPolicy) -> WebToolResult<reqwest::Client> {
     let digest = policy.digest();
-    if let Some((cached_digest, client)) = SEARCH_CLIENT.get() {
-        if *cached_digest == digest {
-            return Ok(client.clone());
-        }
+    if let Some((cached_digest, client)) = SEARCH_CLIENT.get()
+        && *cached_digest == digest
+    {
+        return Ok(client.clone());
     }
     let client = harw_egress::build_client(Arc::new(policy.clone())).map_err(|error| {
         tracing::error!(error = %error, "web.search.client_build_failed");
@@ -880,13 +880,13 @@ async fn send_plan(
         .to_owned();
     check_content_type(&raw_content_type, target.host())?;
 
-    if let Some(announced) = response.content_length() {
-        if announced > u64::try_from(limit).unwrap_or(u64::MAX) {
-            return Err(WebToolError::ResponseTooLarge {
-                limit,
-                host: target.host().to_owned(),
-            });
-        }
+    if let Some(announced) = response.content_length()
+        && announced > u64::try_from(limit).unwrap_or(u64::MAX)
+    {
+        return Err(WebToolError::ResponseTooLarge {
+            limit,
+            host: target.host().to_owned(),
+        });
     }
 
     let mut buffer: Vec<u8> = Vec::new();

@@ -19,8 +19,24 @@
 //! show_help = "F1"
 //! scroll_panel_up = "ctrl+up"
 //! scroll_panel_down = "ctrl+down"
+//! focus_jobs = "alt+j"
+//! focus_finished = "alt+f"
+//! toggle_live_detail = "alt+l"
 //! end_host_mode = []
 //! ```
+//!
+//! Mission Control (PL-97 C2): `focus_jobs` (Standard `Alt+J`) und
+//! `focus_finished` (`Alt+F`) fokussieren das Jobs- bzw.
+//! Finished/Failed-Fenster (ohne eigenes Fenster das Agenten-Panel),
+//! `toggle_live_detail` (`Alt+L`) öffnet/schließt die Detailansicht des
+//! Agenten, den das LIVE-Fenster zeigt. `Ctrl+J` bleibt der Zeilenumbruch.
+//! Diese drei Voreinstellungen kamen nach bestehenden Keybindings-Dateien
+//! hinzu ([`KeyAction::default_yields`]): belegt eine Datei einen ihrer
+//! Chords für eine andere Aktion (etwa `scroll_panel_down = "alt+j"`),
+//! gewinnt die Datei und die nicht genannte Mission-Aktion verliert nur
+//! diesen Chord — die Datei bleibt gültig. Mit leerem Composer gilt `Alt+F`
+//! als `focus_finished`; enthält der fokussierte Composer Text, bleibt
+//! `Alt+F` dort „Wort vorwärts“.
 //!
 //! `scroll_panel_up`/`scroll_panel_down` (Standard `Ctrl+↑`/`Ctrl+↓`)
 //! scrollen ohne Fokuswechsel: bei offenem Dialog (Freigabe, sudo,
@@ -32,8 +48,12 @@
 //! Fest (nicht umbelegbar) im fokussierten Agenten-Panel (`F4`): `↑`/`↓`,
 //! `k`/`j` und `w`/`s` wählen, `Bild↑`/`Bild↓` blättern, `Pos1`/`Ende`
 //! springen, `Enter` öffnet Details bzw. klappt die Sammelzeile der
-//! fertigen Agenten auf, `f` klappt sie auf/zu, `c` quittiert Fehlschläge.
-//! `w`/`s` gelten nur dort — im Composer bleiben es normale Buchstaben.
+//! fertigen Agenten auf, `f` klappt sie auf/zu, `c` quittiert Fehlschläge,
+//! `p` heftet den gewählten Agenten an das LIVE-Fenster (erneut: lösen).
+//! `w`/`s` gelten nur dort — im Composer bleiben es normale Buchstaben. Im
+//! fokussierten Jobs-Fenster wählen `↑`/`↓`/`k`/`j` (Bild↑↓, Pos1/Ende),
+//! `Enter` öffnet die Job-Details; im Finished/Failed-Fenster klappen
+//! `Enter`/`f` die Kategorien auf/zu, `c` quittiert Fehlschläge.
 //!
 //! Nicht genannte Aktionen behalten ihre Voreinstellung
 //! ([`KeyBindings::default`], identisch zur bisher fest verdrahteten
@@ -49,7 +69,8 @@
 //! einzelnes Zeichen (`ctrl++` ist `ctrl` + `+`). `shift+tab` wird wie
 //! `backtab` behandelt, weil Terminals diese Kombination so melden.
 //!
-//! Nicht umbelegbar sind bewusst: `Ctrl+C`/`Ctrl+D` (Notausstieg), `Esc`
+//! Nicht umbelegbar sind bewusst: `Ctrl+C`/`Ctrl+D` (Notausstieg; 2× `Ctrl+C`
+//! ist der feste Not-Aus, siehe `crate::hard_kill`), `Esc`
 //! (kontextabhängiges Schließen/Zurück), `Enter` samt `Shift/Alt+Enter`
 //! sowie Tasten innerhalb von Dialogen und Overlays.
 
@@ -121,11 +142,18 @@ pub(crate) enum KeyAction {
     /// Bildschirm vollständig neu zeichnen (Standard `Ctrl+L`), falls der
     /// Terminal-Emulator Zeichenbreiten anders zählt und Reste stehen bleiben.
     RedrawScreen,
+    /// Focus the Active Jobs window (default `Alt+J`; PL-97 C2).
+    FocusJobs,
+    /// Focus the Finished / Failed window (default `Alt+F`; PL-97 C2).
+    FocusFinished,
+    /// Open or close the detail view of the agent the LIVE window shows
+    /// (default `Alt+L`; PL-97 C2).
+    ToggleLiveDetail,
 }
 
 impl KeyAction {
     /// Alle Aktionen in fester Reihenfolge (auch Vorrang bei Gleichstand).
-    pub(crate) const ALL: [Self; 19] = [
+    pub(crate) const ALL: [Self; 22] = [
         Self::ToggleExplorer,
         Self::ToggleAgents,
         Self::CycleFocus,
@@ -145,6 +173,9 @@ impl KeyAction {
         Self::ScrollPanelUp,
         Self::ScrollPanelDown,
         Self::RedrawScreen,
+        Self::FocusJobs,
+        Self::FocusFinished,
+        Self::ToggleLiveDetail,
     ];
 
     /// Name der Aktion in der Keybindings-Datei.
@@ -169,6 +200,9 @@ impl KeyAction {
             Self::ScrollPanelUp => "scroll_panel_up",
             Self::ScrollPanelDown => "scroll_panel_down",
             Self::RedrawScreen => "redraw_screen",
+            Self::FocusJobs => "focus_jobs",
+            Self::FocusFinished => "focus_finished",
+            Self::ToggleLiveDetail => "toggle_live_detail",
         }
     }
 
@@ -195,6 +229,9 @@ impl KeyAction {
             Self::ScrollPanelUp => "Agenten-Panel/Dialogtext nach oben scrollen",
             Self::ScrollPanelDown => "Agenten-Panel/Dialogtext nach unten scrollen",
             Self::RedrawScreen => "Bildschirm vollständig neu zeichnen",
+            Self::FocusJobs => "Jobs-Fenster fokussieren",
+            Self::FocusFinished => "Finished/Failed-Fenster fokussieren",
+            Self::ToggleLiveDetail => "LIVE-Agent: Details öffnen/schließen",
         }
     }
 
@@ -225,8 +262,26 @@ impl KeyAction {
             Self::ScrollPanelUp => (KeyCode::Up, KeyModifiers::CONTROL),
             Self::ScrollPanelDown => (KeyCode::Down, KeyModifiers::CONTROL),
             Self::RedrawScreen => (KeyCode::Char('l'), KeyModifiers::CONTROL),
+            Self::FocusJobs => (KeyCode::Char('j'), KeyModifiers::ALT),
+            Self::FocusFinished => (KeyCode::Char('f'), KeyModifiers::ALT),
+            Self::ToggleLiveDetail => (KeyCode::Char('l'), KeyModifiers::ALT),
         };
         vec![KeyChord { code, modifiers }]
+    }
+}
+
+impl KeyAction {
+    /// `true` for actions whose default chords were added after keybinding
+    /// files were already in use (PL-97 C2): a chord a file binds to another
+    /// action wins over such a default, so an older file that uses
+    /// `alt+j`/`alt+f`/`alt+l` elsewhere stays valid. Chords set explicitly
+    /// on both sides still conflict.
+    #[must_use]
+    pub(crate) fn default_yields(self) -> bool {
+        matches!(
+            self,
+            Self::FocusJobs | Self::FocusFinished | Self::ToggleLiveDetail
+        )
     }
 }
 
@@ -570,6 +625,7 @@ impl KeyBindings {
 
         let mut bindings = Self::default();
         let mut problems = Vec::new();
+        let mut named: Vec<KeyAction> = Vec::new();
         for (name, value) in &table {
             let Some(action) = KeyAction::from_name(name) else {
                 problems.push(format!("unknown action '{name}'"));
@@ -593,7 +649,9 @@ impl KeyBindings {
                 }
             }
             bindings.bindings.insert(action, chords);
+            named.push(action);
         }
+        bindings.yield_new_defaults(&named);
         problems.extend(bindings.conflicts());
 
         if problems.is_empty() {
@@ -603,6 +661,23 @@ impl KeyBindings {
                 path: path.to_path_buf(),
                 problems,
             })
+        }
+    }
+
+    /// Nachgereichte Voreinstellungen ([`KeyAction::default_yields`]) einer in
+    /// der Datei nicht genannten Aktion geben jeden Chord frei, den die Datei
+    /// (`named`) einer anderen Aktion zuordnet.
+    fn yield_new_defaults(&mut self, named: &[KeyAction]) {
+        let explicit: Vec<KeyChord> = named
+            .iter()
+            .filter_map(|action| self.bindings.get(action))
+            .flatten()
+            .copied()
+            .collect();
+        for (action, chords) in &mut self.bindings {
+            if action.default_yields() && !named.contains(action) {
+                chords.retain(|chord| !explicit.contains(chord));
+            }
         }
     }
 
@@ -829,6 +904,18 @@ mod tests {
                 event(KeyCode::Down, KeyModifiers::CONTROL),
                 KeyAction::ScrollPanelDown,
             ),
+            (
+                event(KeyCode::Char('j'), KeyModifiers::ALT),
+                KeyAction::FocusJobs,
+            ),
+            (
+                event(KeyCode::Char('f'), KeyModifiers::ALT),
+                KeyAction::FocusFinished,
+            ),
+            (
+                event(KeyCode::Char('l'), KeyModifiers::ALT),
+                KeyAction::ToggleLiveDetail,
+            ),
         ];
         for (key, expected) in cases {
             assert_eq!(bindings.action_for(&key), Some(expected), "{key:?}");
@@ -862,6 +949,9 @@ mod tests {
 
     #[test]
     fn scroll_panel_actions_are_rebindable() -> TestResult {
+        // `alt+j` ist ab PL-97 C2 die Voreinstellung von `focus_jobs`; eine
+        // ältere Datei, die es anders belegt, bleibt gültig (die Datei
+        // gewinnt, siehe `old_files_using_the_new_default_chords_still_load`).
         let bindings = KeyBindings::from_toml_str(
             "scroll_panel_up = \"alt+k\"\nscroll_panel_down = [\"alt+j\", \"ctrl+down\"]\n",
             Path::new("kb.toml"),
@@ -887,6 +977,100 @@ mod tests {
         assert!(described.iter().any(|(action, chords)| {
             *action == KeyAction::ScrollPanelUp && chords == &vec!["alt+k".to_owned()]
         }));
+        Ok(())
+    }
+
+    /// PL-97 C2: `Ctrl+J` bleibt der Zeilenumbruch, `Alt+J` fokussiert die
+    /// Jobs; die drei neuen Aktionen sind umbelegbar und kollidieren nicht
+    /// mit der Voreinstellung.
+    #[test]
+    fn mission_actions_are_rebindable_and_ctrl_j_stays_newline() -> TestResult {
+        let defaults = KeyBindings::default();
+        assert_eq!(
+            defaults.action_for(&event(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            Some(KeyAction::InsertNewline)
+        );
+        assert_eq!(
+            defaults.action_for(&event(KeyCode::Char('j'), KeyModifiers::ALT)),
+            Some(KeyAction::FocusJobs)
+        );
+        assert_eq!(
+            defaults.action_for(&event(KeyCode::Char('j'), KeyModifiers::NONE)),
+            None,
+            "plain j stays a letter / list key"
+        );
+        let bindings = KeyBindings::from_toml_str(
+            "focus_jobs = \"F13\"\nfocus_finished = [\"F14\", \"alt+x\"]\ntoggle_live_detail = []\n",
+            Path::new("kb.toml"),
+        )?;
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::F(13), KeyModifiers::NONE)),
+            Some(KeyAction::FocusJobs)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('x'), KeyModifiers::ALT)),
+            Some(KeyAction::FocusFinished)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('j'), KeyModifiers::ALT)),
+            None
+        );
+        assert!(bindings.chords(KeyAction::ToggleLiveDetail).is_empty());
+        for (name, action) in [
+            ("focus_jobs", KeyAction::FocusJobs),
+            ("focus_finished", KeyAction::FocusFinished),
+            ("toggle_live_detail", KeyAction::ToggleLiveDetail),
+        ] {
+            assert_eq!(KeyAction::from_name(name), Some(action));
+        }
+        // Zwei ausdrücklich gesetzte Chords kollidieren weiterhin.
+        let problems = invalid_problems(KeyBindings::from_toml_str(
+            "cycle_focus = \"alt+l\"\ntoggle_live_detail = \"alt+l\"\n",
+            Path::new("kb.toml"),
+        ));
+        assert_eq!(problems.len(), 1, "alt+l is set twice: {problems:?}");
+        Ok(())
+    }
+
+    /// PL-97 C2 regression: a keybindings file that was valid before the
+    /// Mission Control defaults existed still loads. The file wins over the
+    /// new default of an action it does not mention (that action only loses
+    /// the chord); older defaults keep conflicting as before.
+    #[test]
+    fn old_files_using_the_new_default_chords_still_load() -> TestResult {
+        let bindings = KeyBindings::from_toml_str(
+            "scroll_panel_down = [\"alt+j\", \"ctrl+down\"]\ncycle_focus = \"alt+l\"\nshow_help = \"alt+f\"\n",
+            Path::new("kb.toml"),
+        )?;
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('j'), KeyModifiers::ALT)),
+            Some(KeyAction::ScrollPanelDown)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('l'), KeyModifiers::ALT)),
+            Some(KeyAction::CycleFocus)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('f'), KeyModifiers::ALT)),
+            Some(KeyAction::ShowHelp)
+        );
+        assert!(bindings.chords(KeyAction::FocusJobs).is_empty());
+        assert!(bindings.chords(KeyAction::FocusFinished).is_empty());
+        assert!(bindings.chords(KeyAction::ToggleLiveDetail).is_empty());
+        // Unberührte neue Aktionen behalten ihre Voreinstellung.
+        let only_one =
+            KeyBindings::from_toml_str("scroll_panel_down = \"alt+j\"\n", Path::new("kb.toml"))?;
+        assert!(only_one.chords(KeyAction::FocusJobs).is_empty());
+        assert_eq!(
+            only_one.action_for(&event(KeyCode::Char('f'), KeyModifiers::ALT)),
+            Some(KeyAction::FocusFinished)
+        );
+        // Ältere Voreinstellungen geben nicht nach (unverändert seit vor C2).
+        let problems = invalid_problems(KeyBindings::from_toml_str(
+            r#"show_help = "F2""#,
+            Path::new("kb.toml"),
+        ));
+        assert_eq!(problems.len(), 1, "{problems:?}");
         Ok(())
     }
 

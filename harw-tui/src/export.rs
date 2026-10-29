@@ -1780,6 +1780,24 @@ mod tests {
         assert!(with.contains("> weil X gilt"));
     }
 
+    /// PL-97 R1: die TUI verbindet `summary_text` mit Leerzeilen; der Export
+    /// behält die Absätze als leere Zitatzeile bei.
+    #[test]
+    fn test_render_markdown_reasoning_keeps_paragraphs() {
+        let entries = vec![ExportEntry::Reasoning(
+            "erster Absatz\n\nzweiter Absatz".to_owned(),
+        )];
+        let opts = ExportOptions {
+            include_reasoning: true,
+            ..ExportOptions::default()
+        };
+        let out = render_markdown(&meta_minimal(), &entries, &opts);
+        assert!(
+            out.contains("> erster Absatz\n> \n> zweiter Absatz\n"),
+            "{out}"
+        );
+    }
+
     /// Fenced-Code-Blöcke bleiben beim Rendern unverändert erhalten.
     #[test]
     fn test_render_markdown_preserves_fenced_code_blocks() {

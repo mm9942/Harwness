@@ -181,12 +181,12 @@ fn sanitize_with(text: &str, lines: LineMode, escapes: EscapeMode) -> String {
     while let Some(&c) = chars.get(index) {
         match c {
             '\u{1b}' => {
-                if escapes == EscapeMode::Strip {
-                    if let Some(len) = escape_sequence_len(&chars[index..]) {
-                        out.push_str(ESC_SEQUENCE_MARKER);
-                        index += len;
-                        continue;
-                    }
+                if escapes == EscapeMode::Strip
+                    && let Some(len) = escape_sequence_len(&chars[index..])
+                {
+                    out.push_str(ESC_SEQUENCE_MARKER);
+                    index += len;
+                    continue;
                 }
                 push_marker(&mut out, c);
             }

@@ -1009,6 +1009,12 @@ impl<R: VerifyRunner> VerificationExecutor<R> {
         now: OffsetDateTime,
     ) -> (VerifyOutcome, Option<CommandTrace>) {
         match step {
+            VerificationStep::CollectSources { .. } => (
+                VerifyOutcome::unverifiable(
+                    "source collection requires a trusted parent progress receipt",
+                ),
+                None,
+            ),
             VerificationStep::Command { cmd, expect_exit } => {
                 self.run_command(cmd, *expect_exit, now).await
             }

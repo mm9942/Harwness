@@ -187,10 +187,10 @@ fn rules_section(scenario: &Scenario, role: SeatRole, out: &mut String) {
             ""
         }
     );
-    if let Scenario::Classic(c) = scenario {
-        if let Some(span) = &c.round_represents {
-            let _ = writeln!(out, "- Eine Runde entspricht {span}.");
-        }
+    if let Scenario::Classic(c) = scenario
+        && let Some(span) = &c.round_represents
+    {
+        let _ = writeln!(out, "- Eine Runde entspricht {span}.");
     }
     match rules.argument_system {
         ArgumentSystem::ProsCons => out.push_str(
@@ -358,16 +358,16 @@ fn own_brief(scenario: &Scenario, player: &PlayerId, out: &mut String) {
     if !f.assets.is_empty() {
         let _ = writeln!(out, "- Machtmittel: {}", f.assets.join(", "));
     }
-    if let Scenario::Business(b) = scenario {
-        if let Some(team) = b.teams.iter().find(|t| t.id == player.as_str()) {
-            if let Some(variant) = &team.strategy_variant {
-                let _ = writeln!(out, "- Zu spielende Strategievariante: {variant}");
-            }
-            if let Some(scale) = &team.assessment_scale {
-                if let [lo, hi] = scale.as_slice() {
-                    let _ = writeln!(out, "- Bewertungsskala: {lo} bis {hi}");
-                }
-            }
+    if let Scenario::Business(b) = scenario
+        && let Some(team) = b.teams.iter().find(|t| t.id == player.as_str())
+    {
+        if let Some(variant) = &team.strategy_variant {
+            let _ = writeln!(out, "- Zu spielende Strategievariante: {variant}");
+        }
+        if let Some(scale) = &team.assessment_scale
+            && let [lo, hi] = scale.as_slice()
+        {
+            let _ = writeln!(out, "- Bewertungsskala: {lo} bis {hi}");
         }
     }
     if !f.secret_goals.is_empty() || f.private_brief.is_some() {

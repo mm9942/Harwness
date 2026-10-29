@@ -102,15 +102,15 @@ fn spawn_and_write(program: &str, args: &[&str], text: &str) -> bool {
         Err(_) => return false,
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(text.as_bytes()).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return false;
-        }
-        // `stdin` wird hier gedroppt und schließt damit die Pipe, sodass das
-        // Zwischenablage-Werkzeug EOF sieht und beendet.
+    if let Some(mut stdin) = child.stdin.take()
+        && stdin.write_all(text.as_bytes()).is_err()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
     }
+    // `stdin` wird hier gedroppt und schließt damit die Pipe, sodass das
+    // Zwischenablage-Werkzeug EOF sieht und beendet.
 
     let deadline = Instant::now() + CLIPBOARD_TIMEOUT;
     loop {

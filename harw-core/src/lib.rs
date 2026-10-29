@@ -51,6 +51,8 @@ pub mod pinned_model;
 pub mod policy;
 pub mod session;
 pub mod session_manager;
+// PL-95 S3 / PL-97 B1: getriggerte Skill-Auszüge je Modellrunde.
+pub mod skill_injection;
 pub mod state_store;
 pub mod stream;
 #[cfg(test)]
@@ -134,6 +136,9 @@ pub use session::{
     PendingHandoff, SessionState, SpawnContext, TurnHandle, TurnRejection,
 };
 pub use session_manager::SessionManager;
+pub use skill_injection::{
+    DeliveredSkill, RoundInjection, SkillInjectionSettings, SkillInjector, SkillProvenance,
+};
 pub use state_store::{
     InMemoryStateStore, SessionThreadMapper, StateStore, TranscriptStateStore, UsageRound,
 };

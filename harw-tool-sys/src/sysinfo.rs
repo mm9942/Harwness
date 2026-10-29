@@ -105,19 +105,19 @@ pub fn run_free(procfs: &ProcFs, args: &FreeArgs) -> ToolOutput {
         "used_percent": if total == 0 { 0.0 } else { (used as f64 / total as f64 * 1000.0).round() / 10.0 },
         "truncated": false,
     });
-    if flag(args.human) {
-        if let Some(map) = data.as_object_mut() {
-            for (key, bytes) in [
-                ("total", total),
-                ("used", used),
-                ("free", free),
-                ("available", available),
-                ("buff_cache", buffers + cached),
-                ("swap_total", swap_total),
-                ("swap_used", swap_used),
-            ] {
-                map.insert(format!("{key}_human"), json!(human_size(bytes)));
-            }
+    if flag(args.human)
+        && let Some(map) = data.as_object_mut()
+    {
+        for (key, bytes) in [
+            ("total", total),
+            ("used", used),
+            ("free", free),
+            ("available", available),
+            ("buff_cache", buffers + cached),
+            ("swap_total", swap_total),
+            ("swap_used", swap_used),
+        ] {
+            map.insert(format!("{key}_human"), json!(human_size(bytes)));
         }
     }
     ok(
@@ -236,7 +236,8 @@ pub fn run_uname(args: &UnameArgs) -> ToolOutput {
     name = "sys.free",
     description = "Reports memory and swap like free: total, used (total minus available), free, shared, buffers, cache, available in bytes, optionally human-readable (-h). Use when you need the current memory situation instead of running free. Returns JSON {total_bytes, used_bytes, available_bytes, swap_*_bytes, used_percent}. Read-only, Linux only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_free(
     _context: &ToolExecutionContext,
@@ -250,7 +251,8 @@ async fn sys_free(
     name = "sys.uptime",
     description = "Reports how long the system has been up, since when, and the 1/5/15 minute load averages like uptime. Use when you need system age or load instead of running uptime. Returns JSON {uptime_secs, pretty, up_since, load_average:{one,five,fifteen}, tasks_running, tasks_total}. Read-only, Linux only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_uptime(
     _context: &ToolExecutionContext,
@@ -267,7 +269,8 @@ async fn sys_uptime(
     name = "sys.uname",
     description = "Reports kernel and system identification like uname: -a all, -s kernel_name (default), -n nodename, -r kernel_release, -v kernel_version, -m machine, -o operating_system. Use when you need kernel, hostname or architecture instead of running uname. Returns JSON {fields:[{field,value}], text} in uname -a order. Read-only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_uname(
     _context: &ToolExecutionContext,

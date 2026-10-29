@@ -1,13 +1,28 @@
 ---
 id: PL94-W02-CHAT-FIRST-MINI-LIVE
 title: "W02 — Chat-first miniature live agent monitor, no separate Progress Agent"
-status: proposed
+status: PARTIALLY LANDED
 date: 2026-10-09
 parent: ../README.md
 baseline_dev: 090a9d2b786a3a6c025182d8da9c7b28bb7cbece
 ---
 
 # W02 — Chat-first mini-live agent activity
+
+> **Status: PARTIALLY LANDED** (2026-10-29, PL-97 X1). U0 landed as PL-97 C1
+> `ca2dfd6c`, U1/U2 as C2 `6db6745a`, U3 and the landscape anchors as C3
+> `3d98064d`, the terminal aggregates (acceptance 6) as C4 `3d98064d`.
+> Acceptance tests: 1 `render_viewport_at_46x78_shows_three_windows_live_and_chat`;
+> 2 `render_viewport_at_48x65_keeps_windows_above_a_dominant_chat`,
+> `render_viewport_at_70x90_splits_agents_and_jobs_into_two_windows`,
+> `render_viewport_at_39x60_and_48x19_shows_the_compact_counters`,
+> `render_viewport_at_120x42_is_the_dense_three_column_landscape`,
+> `render_viewport_at_160x45_shows_five_windows_at_the_landscape_anchors`,
+> `compact_summary_at_39x60_48x19_1x1_0x0`; 6
+> `agent_and_job_of_the_same_child_count_once`. U4 (manual device run at the
+> exact SHA) belongs to the PR description of #154. Open: window title
+> language (owner). Sections CURRENT and DELTA below are the original
+> planning record.
 
 > **Operator-approved UX clarification, 2026-10-09. PLAN ONLY.** The screenshot layout of three status windows above the main Chat is the reference. The earlier PL-94 proposal for a separate model-backed Progress Agent, automatically generated todo narratives, a progress bar and a second large output viewport is **superseded for the primary TUI design** by this contract. This wave makes no runtime code changes.
 

@@ -13,6 +13,11 @@ harw-types = { path = "../harw-types" }
 harw-sandbox = { path = "../harw-sandbox" }
 harw-authority = { path = "../harw-authority" }
 harw-macros = { path = "../harw-macros" }
+# PL-97 M2: `#[harw_macros::tool(activity(...))]` erzeugt
+# `::harw_tools::ActivityDescriptor`-Konstanten und `tool_provider!` die
+# Tabelle `TOOL_ACTIVITIES`; der Re-Export hält `harw-tools` als einzige
+# Pfadwurzel des generierten Codes (kein `harw-activity` in Tool-Crates).
+harw-activity = { path = "../harw-activity" }
 # AW5-07: `context.load` (`context_load.rs`) resolves `DetailMode::References`
 # load keys (`SectionName`/`FragmentLabel`) and enforces the same
 # `ContextBudgetSpec`/`TrustClass` vocabulary the montage uses — no second,

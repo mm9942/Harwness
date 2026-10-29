@@ -85,10 +85,10 @@ impl FirefoxRuntime {
                 .ok_or_else(|| BrowserError::InvalidArgument {
                     detail: format!("browser context '{context_id}' has no revision state"),
                 })?;
-        if let Some(expected) = expected {
-            if expected != current {
-                return Err(BrowserError::StaleRevision { expected, current });
-            }
+        if let Some(expected) = expected
+            && expected != current
+        {
+            return Err(BrowserError::StaleRevision { expected, current });
         }
         Ok(())
     }

@@ -169,9 +169,17 @@ pub(crate) struct ChatOptions {
 /// migrate, `shell.exec` and `latex.*` start their processes only through the
 /// job runtime. Without a port (unsupported platform, store not creatable)
 /// they report "no job runtime" instead of spawning anything themselves.
-fn install_command_port(home: &std::path::Path) {
+/// PL-97 E3: `[jobs] cgroup_root` and `[jobs] trampoline` (trusted layers
+/// only) reach the host port here.
+fn install_command_port(home: &std::path::Path, jobs: &harw_config::harness_config::JobsToml) {
     // First installer wins; `SessionJobs::open` installs the same default.
-    harw_command::install_host_default(&harw_home::paths::cache_dir(home).join("command-jobs"));
+    harw_command::install_host(
+        &harw_home::paths::cache_dir(home).join("command-jobs"),
+        &harw_command::HostPortOptions {
+            cgroup_root: jobs.cgroup_root.clone(),
+            trampoline: jobs.trampoline.clone(),
+        },
+    );
 }
 
 /// Startet den Default-Chat-Pfad.
@@ -258,7 +266,7 @@ pub fn run_chat(
         eprintln!("{hint}");
     }
 
-    install_command_port(&home);
+    install_command_port(&home, &config.harness.jobs);
 
     match initial_prompt {
         Some(prompt) => {
@@ -1186,6 +1194,59 @@ mod tests {
         ModelSource::Echo("chat test reply".to_owned())
     }
 
+    /// Model id of the fixture model that tests driving a real turn configure.
+    const FIXTURE_MODEL_ID: &str = "chat-fixture";
+
+    /// Explicit context window (tokens) of [`FIXTURE_MODEL_ID`].
+    ///
+    /// # Description
+    /// `chat_fixture` configures no model. An assembly with an injected
+    /// provider (`ModelSource::Override`, not the offline echo) then falls
+    /// back to `harw_runtime::assembly::UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`
+    /// (32,768 tokens, warning `runtime.context_window.no_model`), which
+    /// leaves 27,853 tokens for a request after the 4,915-token answer
+    /// reserve. Since PL-97 the Full root sends about 31,500 estimated tokens
+    /// of tool specs alone (see [`FULL_ROOT_TOOL_SPEC_BUDGET_BYTES`]), so the
+    /// pre-flight guard refuses the very first round there. Tests that check
+    /// something other than the window therefore name a window the size of a
+    /// catalogued cloud model, through the same `[models.<id>].context_window`
+    /// a user sets. The tool-spec growth itself is pinned by
+    /// `test_full_root_tool_specs_stay_within_the_pinned_budget`.
+    const FIXTURE_MODEL_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+
+    /// Makes [`FIXTURE_MODEL_ID`] with [`FIXTURE_MODEL_CONTEXT_WINDOW_TOKENS`]
+    /// the default model of the fixture's active profile.
+    ///
+    /// # Description
+    /// Writes `profiles/default/models/chat-fixture.toml` and prepends
+    /// `default_model` to the profile `config.toml` (prepended for the same
+    /// reason as in `write_fixture_uia`: the scaffolded template ends in an
+    /// open table). The model names a provider that is not configured: the
+    /// callers drive the root through `ModelSource::Override`, and a dangling
+    /// provider reference is only a non-fatal catalog diagnostic.
+    fn configure_fixture_model(fixture: &ChatFixture) -> TestResult {
+        let profile_dir = fixture.home.join("profiles").join("default");
+        std::fs::write(
+            profile_dir
+                .join("models")
+                .join(format!("{FIXTURE_MODEL_ID}.toml")),
+            format!(
+                "id = \"{FIXTURE_MODEL_ID}\"\nprovider = \"{FIXTURE_MODEL_ID}\"\n\
+                 context_window = {FIXTURE_MODEL_CONTEXT_WINDOW_TOKENS}\n"
+            ),
+        )
+        .map_err(ctx("write fixture model"))?;
+        let config_path = profile_dir.join("config.toml");
+        let existing = std::fs::read_to_string(&config_path)
+            .map_err(ctx("read profile config for the fixture model"))?;
+        std::fs::write(
+            &config_path,
+            format!("default_model = \"{FIXTURE_MODEL_ID}\"\n{existing}"),
+        )
+        .map_err(ctx("prepend default_model to profile config"))?;
+        Ok(())
+    }
+
     fn write_transcript(sessions_root: &Path, session_id: &str) -> TestResult {
         std::fs::create_dir_all(sessions_root).map_err(ctx("create sessions directory"))?;
         std::fs::write(sessions_root.join(format!("{session_id}.jsonl")), "{}\n")
@@ -1967,6 +2028,11 @@ mod tests {
     #[test]
     fn test_one_shot_policy_gated_tool_call_is_denied_without_pausing() -> TestResult {
         let fixture = chat_fixture()?;
+        // Explizites Modellfenster: das 32k-Rückfallfenster ohne Modell trägt
+        // die Full-Werkzeugfläche seit PL-97 nicht mehr (siehe
+        // `FIXTURE_MODEL_CONTEXT_WINDOW_TOKENS`); dieser Test prüft die
+        // Freigabekette, nicht das Fenster.
+        configure_fixture_model(&fixture)?;
         let mut config_file = std::fs::OpenOptions::new()
             .append(true)
             .open(fixture.home.join("config.toml"))
@@ -1976,11 +2042,24 @@ mod tests {
             .map_err(ctx("append approval policy"))?;
         drop(config_file);
 
+        // Dieser Test prüft die Freigabekette, nicht die Kontextgrenze. Der
+        // ScriptedModel hat ein explizites Fenster für die vollständige
+        // Werkzeugfläche; Override darf in Produktion weiterhin auf das
+        // konservative 32k-Fenster für unbekannte Modelle zurückfallen.
+        let models_dir = fixture.home.join("models");
+        std::fs::create_dir_all(&models_dir).map_err(ctx("create fixture models directory"))?;
+        std::fs::write(
+            models_dir.join("policy-test.toml"),
+            "id = \"policy-test\"\nprovider = \"scripted\"\ncontext_window = 131072\n",
+        )
+        .map_err(ctx("write scripted model context window"))?;
+        let mut policy_startup = startup(InteractionMode::Chat);
+        policy_startup.model = Some("policy-test".to_owned());
         let inputs = fixture_inputs(
             &fixture,
             EntryKind::OneShot,
             IngressSurface::Cli,
-            startup(InteractionMode::Chat),
+            policy_startup,
         )?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
@@ -2053,6 +2132,201 @@ mod tests {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Upper bound (bytes of compact JSON) for the tool specs the Full root
+    /// of a one-shot run sends with every model request.
+    ///
+    /// # Description
+    /// Counted the way `harw_core::context_budget::estimate_request_bytes`
+    /// counts tools. As measured for PL-97 (zone G1, 2026-10-29) the root
+    /// sends 99 tool specs in 94,543 bytes, about 31,500 estimated tokens at
+    /// `harw_core::context_budget::DEFAULT_BYTES_PER_TOKEN`; before PL-97 it
+    /// sent 61 in about 50,800 bytes. PL-97 added `fsread.*` (16 tools,
+    /// 18,175 bytes), `sys.*` (12, 14,345) and `git.*` (6, 8,708) in B4,
+    /// `dod.*` (3, 1,852) in D3 and `tool.index` (668) in B2. The bound
+    /// leaves about 3.7 KB of headroom: a change that grows the surface
+    /// noticeably fails here and has to raise the bound on purpose, after
+    /// checking which model windows still carry the root. The 32,768-token
+    /// fallback window for unknown models does not carry it any more (see
+    /// [`FIXTURE_MODEL_CONTEXT_WINDOW_TOKENS`]).
+    const FULL_ROOT_TOOL_SPEC_BUDGET_BYTES: u64 = 96 * 1024;
+
+    /// Records the name and serialized size of every tool spec of each
+    /// request and answers with plain text, so the turn ends after one round.
+    struct ToolSpecRecorder {
+        requests: std::sync::Mutex<Vec<Vec<(String, u64)>>>,
+    }
+
+    impl ModelProvider for ToolSpecRecorder {
+        fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+            let tools = request
+                .tools
+                .iter()
+                .map(|tool| {
+                    let bytes = serde_json::to_vec(tool).map_or(0, |encoded| encoded.len());
+                    (
+                        tool.name().to_owned(),
+                        u64::try_from(bytes).unwrap_or(u64::MAX),
+                    )
+                })
+                .collect();
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(tools);
+            Box::pin(async { Ok(ModelResponse::text("recorded")) })
+        }
+    }
+
+    // Pinnt das Werkzeugbudget je Anfrage der Full-Wurzel (Zone G1): misst
+    // die Werkzeugschemas der ersten echten Modellanfrage eines One-shot-
+    // Turns, so wie der Pre-flight-Wächter sie zählt. Wächst die Fläche über
+    // `FULL_ROOT_TOOL_SPEC_BUDGET_BYTES`, scheitert dieser Test mit den
+    // größten Familien, statt dass ein fremder Test am Kontextfenster
+    // zerbricht.
+    #[test]
+    fn test_full_root_tool_specs_stay_within_the_pinned_budget() -> TestResult {
+        let fixture = chat_fixture()?;
+        configure_fixture_model(&fixture)?;
+        let inputs = fixture_inputs(
+            &fixture,
+            EntryKind::OneShot,
+            IngressSurface::Cli,
+            startup(InteractionMode::Chat),
+        )?;
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+        let recorder = Arc::new(ToolSpecRecorder {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let model: Arc<dyn ModelProvider> = recorder.clone();
+        let assembly = one_shot_assembly(&inputs, ModelSource::Override(model), event_tx.clone())
+            .map_err(ctx("assemble one-shot runtime with a recording model"))?;
+        let mut root = assembly
+            .new_root_session(assembly.root_session_id().clone(), event_tx, turn_tx, None)
+            .map_err(ctx("create root session"))?;
+        let window = root
+            .session
+            .auto_compact()
+            .map(harw_core::AutoCompactPolicy::context_window_tokens);
+        assert_eq!(
+            window,
+            Some(FIXTURE_MODEL_CONTEXT_WINDOW_TOKENS),
+            "the fixture model's configured window must reach the root session"
+        );
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(ctx("build test runtime"))?;
+        let outcome = runtime
+            .block_on(run_turn(
+                &mut root.session,
+                assembly.model().as_ref(),
+                assembly.state_store().as_ref(),
+                TurnInput::user("list the project files"),
+            ))
+            .map_err(ctx("a one-round turn completes"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+
+        let tools = recorder
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first()
+            .cloned()
+            .ok_or(TestError::Missing(
+                "the turn must have sent one model request",
+            ))?;
+        assert!(
+            tools.iter().any(|(name, _)| name == "fs.write"),
+            "the one-shot Chat root must carry the Full surface (fs.write)"
+        );
+        let total = tools.iter().map(|(_, bytes)| bytes).sum::<u64>();
+        let mut families = std::collections::BTreeMap::<&str, (usize, u64)>::new();
+        for (name, bytes) in &tools {
+            let family = name
+                .split_once('.')
+                .map_or(name.as_str(), |(family, _)| family);
+            let entry = families.entry(family).or_default();
+            entry.0 += 1;
+            entry.1 += bytes;
+        }
+        let mut largest = families.into_iter().collect::<Vec<_>>();
+        largest.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+        let summary = largest
+            .iter()
+            .take(5)
+            .map(|(family, (count, bytes))| format!("{family}: {count} tools, {bytes} B"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let tokens = harw_core::context_budget::TokenCalibration::default().bytes_to_tokens(total);
+        assert!(
+            total <= FULL_ROOT_TOOL_SPEC_BUDGET_BYTES,
+            "the Full root sends {} tool specs in {total} bytes (about {tokens} estimated \
+             tokens), over the pinned {FULL_ROOT_TOOL_SPEC_BUDGET_BYTES} bytes; largest \
+             families: {summary}. Raise the bound only on purpose (see its doc comment).",
+            tools.len()
+        );
+        Ok(())
+    }
+
+    // Bekannte Regression (PL-97, Zone G1; Nachverfolgung im Plan-README
+    // unter B2 „Gate“): ohne Modellfenster fällt die Wurzel auf
+    // `UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS` = 32 768 Tokens zurück, und die
+    // erste Runde der Full-Wurzel (etwa 38,1k geschätzte Tokens gegen ein
+    // Budget von 27 853) wird mit „Kontext erschöpft“ abgelehnt. Fertige
+    // Reproduktion für den Fix: `cargo test -p harw-cli --lib
+    // chat::tests::test_full_root_first_round_fits_the_unknown_model_fallback_window
+    // -- --ignored`.
+    #[test]
+    #[ignore = "known PL-97 regression: the Full root overruns the 32k fallback window \
+                (follow-up in the PL-97 plan README, B2 gate)"]
+    fn test_full_root_first_round_fits_the_unknown_model_fallback_window() -> TestResult {
+        let fixture = chat_fixture()?;
+        let inputs = fixture_inputs(
+            &fixture,
+            EntryKind::OneShot,
+            IngressSurface::Cli,
+            startup(InteractionMode::Chat),
+        )?;
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+        let model: Arc<dyn ModelProvider> = Arc::new(ToolSpecRecorder {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let assembly = one_shot_assembly(&inputs, ModelSource::Override(model), event_tx.clone())
+            .map_err(ctx("assemble one-shot runtime without a configured model"))?;
+        let mut root = assembly
+            .new_root_session(assembly.root_session_id().clone(), event_tx, turn_tx, None)
+            .map_err(ctx("create root session"))?;
+        let window = root
+            .session
+            .auto_compact()
+            .map(harw_core::AutoCompactPolicy::context_window_tokens);
+        assert_eq!(
+            window,
+            Some(32_768),
+            "without a configured model the root must use the unknown-model fallback window"
+        );
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(ctx("build test runtime"))?;
+        let outcome = runtime
+            .block_on(run_turn(
+                &mut root.session,
+                assembly.model().as_ref(),
+                assembly.state_store().as_ref(),
+                TurnInput::user("list the project files"),
+            ))
+            .map_err(ctx(
+                "the first round of a Full root must fit the 32k fallback window",
+            ))?;
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
         Ok(())
     }
 }

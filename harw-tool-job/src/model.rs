@@ -1,6 +1,7 @@
 //! Datenmodell der Job-Verwaltung: [`JobId`], [`JobState`], [`JobOwner`],
-//! [`JobMeta`] (Inhalt von `meta.json`), [`JobEndReason`] (Endgrund) und
-//! [`JobStatus`] (Sicht für Werkzeuge und Oberfläche).
+//! [`JobMeta`] (Inhalt von `meta.json`), [`ManagedJobOrigin`] (Herkunft),
+//! [`JobEndReason`] (Endgrund) und [`JobStatus`] (Sicht für Werkzeuge und
+//! Oberfläche).
 //!
 //! # Nebenläufigkeit
 //! Reine Werttypen, `Send + Sync`.
@@ -19,10 +20,11 @@ use std::path::PathBuf;
 ///   Pfad; Job-Runtime-Doc §15). `proc_start_ticks` wird weiter
 ///   geschrieben, damit ältere harw-Versionen v2-Dateien lesen können.
 /// - Ohne Versionssprung (serde-Vorgabe) ergänzt:
-///   [`JobMeta::stragglers_reaped`], [`JobMeta::log_truncated`] und
-///   [`JobMeta::launch_warnings`]. Ältere Dateien laden mit `false` bzw.
-///   leer; ältere harw-Versionen ignorieren die Felder (`JobMeta` hat kein
-///   `deny_unknown_fields`).
+///   [`JobMeta::stragglers_reaped`], [`JobMeta::log_truncated`],
+///   [`JobMeta::launch_warnings`], [`JobMeta::origin`] (W20-A) und
+///   [`JobProcessIdentity::dedicated_cgroup`] (PL-97 E4). Ältere
+///   Dateien laden mit `false` bzw. leer; ältere harw-Versionen ignorieren
+///   die Felder (`JobMeta` hat kein `deny_unknown_fields`).
 ///
 /// Beide Versionen werden gelesen; [`JobMeta::process_identity`] liefert für
 /// v1 eine Identität ohne Programm und cgroup.
@@ -295,6 +297,101 @@ pub struct JobMeta {
     /// [`JobOwner::session`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_agent: Option<String>,
+    /// W20-A: typed provenance of the job ([`ManagedJobOrigin`]).
+    ///
+    /// Additive like the R18 fields: missing in older `meta.json` (then
+    /// [`JobMeta::resolved_origin`] falls back to `origin_tool` /
+    /// `origin_call_id`) and not serialized when unset. An origin kind this
+    /// version does not know reads as unset instead of making the whole
+    /// record unreadable (a running job must stay visible and stoppable).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_origin_lenient"
+    )]
+    pub origin: Option<ManagedJobOrigin>,
+}
+
+/// Typed provenance of a managed job (W20-A): what started it.
+///
+/// # Description
+/// Persisted as [`JobMeta::origin`] and carried by
+/// [`crate::JobEvent::Started`]. Records written before the field existed
+/// only carry the legacy R18 fields `origin_tool` / `origin_call_id`;
+/// [`JobMeta::resolved_origin`] maps those to [`ManagedJobOrigin::Tool`]. A
+/// record with neither has **unknown** provenance (`None`); consumers must
+/// never guess it from the job name.
+///
+/// # Examples
+/// ```rust
+/// use harw_tool_job::ManagedJobOrigin;
+///
+/// # fn main() -> Result<(), serde_json::Error> {
+/// let origin = ManagedJobOrigin::AgentChild {
+///     child_session_id: "child-1".into(),
+/// };
+/// let json = serde_json::to_string(&origin)?;
+/// assert_eq!(json, r#"{"kind":"agent_child","child_session_id":"child-1"}"#);
+/// assert_eq!(serde_json::from_str::<ManagedJobOrigin>(&json)?, origin);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ManagedJobOrigin {
+    /// The job runs a child agent (the job child backend of
+    /// `harw-agent-runner`).
+    AgentChild {
+        /// Session id of the child agent run this job backs.
+        child_session_id: String,
+    },
+    /// Started by a model tool call (e.g. `job.start`).
+    Tool {
+        /// Name of the starting tool; empty when a legacy record kept only
+        /// the `call_id`.
+        tool: String,
+        /// `call_id` of the starting tool call, if known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+    },
+    /// Started by the operator (a TUI/CLI command), not by a model.
+    Operator,
+}
+
+impl ManagedJobOrigin {
+    /// Maps the legacy R18 fields (`origin_tool`, `origin_call_id`) to a
+    /// typed origin.
+    ///
+    /// # Returns
+    /// [`ManagedJobOrigin::Tool`] when at least one of them is set (only a
+    /// tool call records a `call_id`), `None` (unknown provenance) when both
+    /// are absent.
+    #[must_use]
+    pub fn from_legacy(tool: Option<&str>, call_id: Option<&str>) -> Option<Self> {
+        if tool.is_none() && call_id.is_none() {
+            return None;
+        }
+        Some(Self::Tool {
+            tool: tool.unwrap_or_default().to_owned(),
+            call_id: call_id.map(str::to_owned),
+        })
+    }
+}
+
+/// Reads [`JobMeta::origin`]; an unknown or malformed origin becomes `None`
+/// (unknown provenance) instead of failing the whole `meta.json`.
+fn deserialize_origin_lenient<'de, D>(deserializer: D) -> Result<Option<ManagedJobOrigin>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| match serde_json::from_value(value) {
+        Ok(origin) => Some(origin),
+        Err(err) => {
+            tracing::debug!(error = %err, "job meta.json: unknown origin ignored");
+            None
+        }
+    }))
 }
 
 /// Signalnummer von SIGXCPU (CPU-Budget erschöpft) unter Linux.
@@ -391,7 +488,25 @@ impl JobMeta {
                 start_ticks,
                 executable: None,
                 cgroup_path: None,
+                dedicated_cgroup: None,
             })
+        })
+    }
+
+    /// Provenance of the job (W20-A): [`JobMeta::origin`] if set, else the
+    /// legacy `origin_tool` / `origin_call_id` mapped by
+    /// [`ManagedJobOrigin::from_legacy`].
+    ///
+    /// # Returns
+    /// `None` for unknown provenance (a record without any origin field);
+    /// it is never guessed from [`JobMeta::name`].
+    #[must_use]
+    pub fn resolved_origin(&self) -> Option<ManagedJobOrigin> {
+        self.origin.clone().or_else(|| {
+            ManagedJobOrigin::from_legacy(
+                self.origin_tool.as_deref(),
+                self.origin_call_id.as_deref(),
+            )
         })
     }
 }
@@ -414,9 +529,52 @@ pub struct JobProcessIdentity {
     #[serde(default)]
     pub executable: Option<String>,
     /// Pfad in der cgroup-v2-Hierarchie (`0::<pfad>` aus
-    /// `/proc/<pid>/cgroup`).
+    /// `/proc/<pid>/cgroup`), relativ zur Hierarchie, nicht unter dem
+    /// Einhängepunkt. Ohne delegierte cgroup-Wurzel ist das die geteilte
+    /// cgroup von harw bzw. der Sitzung, nicht die des Jobs (siehe
+    /// [`JobStatus::job_cgroup_path`]).
     #[serde(default)]
     pub cgroup_path: Option<String>,
+    /// Proof from the job runtime that [`JobProcessIdentity::cgroup_path`]
+    /// is this job's own cgroup (PL-97 E4). `None` (the default, also for
+    /// older records) means the path is never attributed to the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedicated_cgroup: Option<DedicatedCgroupProof>,
+}
+
+/// Runtime attestation that a job runs in its own, dedicated cgroup
+/// (PL-97 E4, PR #154 review).
+///
+/// # Description
+/// A `harw-job-*` leaf name alone proves nothing: without a delegated root
+/// harw may itself run in a shared cgroup whose leaf happens to match, and
+/// every job would then persist that same path. The proof therefore records
+/// what the job runtime attested at launch: the attempt id it created the
+/// cgroup for and the delegated root it created it beneath, bound to the
+/// job it was attested for.
+///
+/// The attempt id is assigned by the command port (`<work>-e<epoch>`) and
+/// cannot be derived from [`JobMeta`], so the proof carries the
+/// [`JobId`] it belongs to; [`JobStatus::job_cgroup_path`] rejects a proof
+/// stored in another job's record. The proof must be written only from the
+/// launch result (`StartedCommand`) of this job's own launch through a
+/// delegated root, never copied, cached or shared between jobs: uniqueness
+/// of the attempt id beyond the job binding rests on that single writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedicatedCgroupProof {
+    /// The job this proof was attested for; must equal [`JobMeta::job_id`]
+    /// of the record that stores it. `None` (an unbound proof) is never
+    /// accepted.
+    #[serde(default)]
+    pub job_id: Option<JobId>,
+    /// Attempt id the job runtime attested for this job's launch; its cgroup
+    /// is `harw-job-<attempt id>` (characters outside `[A-Za-z0-9_.-]`
+    /// replaced by `_`, as the runtime names it).
+    pub attempt_id: String,
+    /// The delegated cgroup root the attempt cgroup was created directly
+    /// beneath, hierarchy-relative (e.g. `/harw.slice`); a leading
+    /// `/sys/fs/cgroup` mount point is tolerated.
+    pub delegated_root: String,
 }
 
 /// Sicht auf einen Job für Werkzeuge und Oberfläche.
@@ -435,6 +593,129 @@ pub struct JobStatus {
     pub last_lines: Vec<String>,
     /// Verzeichnis mit `stdout.log`, `stderr.log`, `meta.json`.
     pub log_dir: PathBuf,
+}
+
+/// Name prefix of a dedicated job cgroup: the job runtime places each attempt
+/// in its own child cgroup `harw-job-<attempt>` beneath the delegated cgroup
+/// root (`harw-job-runtime`, `coordinator/linux.rs`, `cgroup_name`).
+const JOB_CGROUP_PREFIX: &str = "harw-job-";
+
+/// The conventional cgroup-v2 mount point, tolerated in front of a
+/// [`DedicatedCgroupProof::delegated_root`].
+const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
+
+/// The cgroup leaf the job runtime creates for `attempt_id`:
+/// `harw-job-<attempt>` with every character outside `[A-Za-z0-9_.-]`
+/// replaced by `_` (mirrors `cgroup_name` in `harw-job-runtime`).
+fn attempt_cgroup_leaf(attempt_id: &str) -> String {
+    let attempt: String = attempt_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{JOB_CGROUP_PREFIX}{attempt}")
+}
+
+/// Splits an absolute cgroup path into its components; `None` for relative
+/// paths and for empty, `.` or `..` components (never resolved, never
+/// trusted).
+fn cgroup_components(path: &str) -> Option<Vec<&str>> {
+    let rest = path.strip_prefix('/')?;
+    if rest.is_empty() {
+        return Some(Vec::new());
+    }
+    let parts: Vec<&str> = rest.split('/').collect();
+    parts
+        .iter()
+        .all(|part| !part.is_empty() && *part != "." && *part != "..")
+        .then_some(parts)
+}
+
+/// Whether `path` is proven to be the dedicated cgroup described by
+/// `proof`: its parent is exactly the (non-hierarchy-root) delegated root
+/// and its leaf is the cgroup the runtime names for the attested attempt.
+fn is_proven_job_cgroup(path: &str, proof: &DedicatedCgroupProof) -> bool {
+    if proof.attempt_id.is_empty() {
+        return false;
+    }
+    let root = proof
+        .delegated_root
+        .strip_prefix(CGROUP_MOUNT)
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        .map_or(proof.delegated_root.as_str(), |rest| {
+            if rest.is_empty() { "/" } else { rest }
+        });
+    let (Some(root), Some(path)) = (cgroup_components(root), cgroup_components(path)) else {
+        return false;
+    };
+    let Some((leaf, parent)) = path.split_last() else {
+        return false;
+    };
+    // The hierarchy root is never a delegated root, and the root must be a
+    // proper ancestor: the attempt cgroup lies directly beneath it.
+    !root.is_empty() && parent == root.as_slice() && *leaf == attempt_cgroup_leaf(&proof.attempt_id)
+}
+
+impl JobStatus {
+    /// cgroup-v2 path of the job's group leader as persisted in its process
+    /// identity ([`JobProcessIdentity::cgroup_path`], `meta.json` v2).
+    ///
+    /// # Description
+    /// The value is what `/proc/<pid>/cgroup` reported (`0::<path>`), so it
+    /// is relative to the cgroup-v2 hierarchy (e.g. `/user.slice/…`), not a
+    /// path under the mount point (`/sys/fs/cgroup/…`).
+    ///
+    /// It is **not necessarily the job's own cgroup**: without a delegated
+    /// cgroup root (the default) the job stays in harw's own or the
+    /// session's shared cgroup, which other processes and jobs share.
+    /// Attribution (e.g. matching findings to jobs) must use
+    /// [`JobStatus::job_cgroup_path`] instead.
+    ///
+    /// # Returns
+    /// `None` for v1 records, platforms without `/proc`, or when the path
+    /// was not observed.
+    #[must_use]
+    pub fn cgroup_path(&self) -> Option<&str> {
+        self.meta
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.cgroup_path.as_deref())
+    }
+
+    /// The job's **dedicated** cgroup: [`JobStatus::cgroup_path`] only with
+    /// a runtime proof ([`JobProcessIdentity::dedicated_cgroup`]).
+    ///
+    /// # Description
+    /// Hierarchy-relative like [`JobStatus::cgroup_path`]. Use this value to
+    /// attribute cgroup-scoped observations to the job. A `harw-job-*` leaf
+    /// name is no proof: harw itself may run in a shared cgroup whose leaf
+    /// matches. The path counts only when the persisted proof belongs to
+    /// this job ([`DedicatedCgroupProof::job_id`]), attests the attempt (the
+    /// leaf is `harw-job-<attested attempt id>`) and a delegated root that
+    /// is the path's direct parent. Everything else
+    /// fails closed instead of assigning one shared cgroup to every job.
+    ///
+    /// # Returns
+    /// `None` when the path is unknown, no proof is recorded, the proof
+    /// belongs to another job, or it does not match the path (e.g. a leaf
+    /// for another attempt).
+    #[must_use]
+    pub fn job_cgroup_path(&self) -> Option<&str> {
+        let identity = self.meta.identity.as_ref()?;
+        let proof = identity
+            .dedicated_cgroup
+            .as_ref()
+            .filter(|proof| proof.job_id.as_ref() == Some(&self.meta.job_id))?;
+        identity
+            .cgroup_path
+            .as_deref()
+            .filter(|path| is_proven_job_cgroup(path, proof))
+    }
 }
 
 /// Dateiname von stdout im Job-Verzeichnis.
@@ -494,6 +775,324 @@ mod tests {
         Ok(())
     }
 
+    /// `meta.json` with only the R18 tool origin (written before W20-A).
+    const LEGACY_TOOL_ORIGIN: &str = include_str!("../tests/fixtures/meta-legacy-tool-origin.json");
+    /// `meta.json` v1 without any origin; its name looks like a child agent
+    /// job on purpose.
+    const LEGACY_NO_ORIGIN: &str = include_str!("../tests/fixtures/meta-legacy-no-origin.json");
+
+    /// W20-A: legacy records map to `Tool` (R18 fields) or to unknown
+    /// provenance (no origin field) — never guessed from the name.
+    #[test]
+    fn test_legacy_meta_fixtures_resolve_to_tool_or_unknown() -> TestResult {
+        let tool: JobMeta =
+            serde_json::from_str(LEGACY_TOOL_ORIGIN).map_err(ctx("parse legacy tool"))?;
+        assert_eq!(tool.origin, None);
+        assert_eq!(
+            tool.resolved_origin(),
+            Some(ManagedJobOrigin::Tool {
+                tool: "job.start".to_owned(),
+                call_id: Some("call-7".to_owned()),
+            })
+        );
+
+        let plain: JobMeta =
+            serde_json::from_str(LEGACY_NO_ORIGIN).map_err(ctx("parse legacy plain"))?;
+        assert_eq!(plain.name, "agent-child-explorer");
+        assert_eq!(plain.origin, None);
+        assert_eq!(plain.resolved_origin(), None);
+
+        // Rewriting a legacy record keeps its shape: no `origin` key appears.
+        let rewritten = serde_json::to_string(&plain).map_err(ctx("serialize plain"))?;
+        assert!(!rewritten.contains("\"origin\""), "{rewritten}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_origin_from_legacy_fields() {
+        assert_eq!(ManagedJobOrigin::from_legacy(None, None), None);
+        assert_eq!(
+            ManagedJobOrigin::from_legacy(Some("job.start"), None),
+            Some(ManagedJobOrigin::Tool {
+                tool: "job.start".to_owned(),
+                call_id: None,
+            })
+        );
+        assert_eq!(
+            ManagedJobOrigin::from_legacy(None, Some("call-1")),
+            Some(ManagedJobOrigin::Tool {
+                tool: String::new(),
+                call_id: Some("call-1".to_owned()),
+            })
+        );
+    }
+
+    /// W20-A: every typed origin survives the `meta.json` round trip in its
+    /// tagged form, and the typed field wins over the legacy fields.
+    #[test]
+    fn test_typed_origin_roundtrips_and_wins_over_legacy() -> TestResult {
+        let base: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        let cases = [
+            (
+                ManagedJobOrigin::AgentChild {
+                    child_session_id: "child-7".to_owned(),
+                },
+                r#""origin":{"kind":"agent_child","child_session_id":"child-7"}"#,
+            ),
+            (
+                ManagedJobOrigin::Tool {
+                    tool: "job.start".to_owned(),
+                    call_id: Some("call-1".to_owned()),
+                },
+                r#""origin":{"kind":"tool","tool":"job.start","call_id":"call-1"}"#,
+            ),
+            (
+                ManagedJobOrigin::Tool {
+                    tool: "agents.build".to_owned(),
+                    call_id: None,
+                },
+                r#""origin":{"kind":"tool","tool":"agents.build"}"#,
+            ),
+            (
+                ManagedJobOrigin::Operator,
+                r#""origin":{"kind":"operator"}"#,
+            ),
+        ];
+        for (origin, expected) in cases {
+            let mut meta = base.clone();
+            meta.version = META_VERSION;
+            meta.origin = Some(origin.clone());
+            let json = serde_json::to_string(&meta).map_err(ctx("serialize"))?;
+            assert!(json.contains(expected), "{json}");
+            let back: JobMeta = serde_json::from_str(&json).map_err(ctx("parse back"))?;
+            assert_eq!(back, meta);
+            assert_eq!(back.resolved_origin(), Some(origin.clone()));
+
+            // Legacy fields of a mixed record never override the typed one.
+            meta.origin_tool = Some("shell.exec".to_owned());
+            meta.origin_call_id = Some("call-legacy".to_owned());
+            assert_eq!(meta.resolved_origin(), Some(origin));
+        }
+        Ok(())
+    }
+
+    /// An origin kind of a newer harw (or a malformed one) reads as unknown
+    /// provenance; the rest of the record still loads.
+    #[test]
+    fn test_unknown_origin_kind_reads_as_unknown() -> TestResult {
+        for origin in [
+            r#""origin":{"kind":"schedule","every":"1h"},"#,
+            r#""origin":{"kind":"agent_child"},"#,
+            r#""origin":"tool","#,
+            r#""origin":null,"#,
+        ] {
+            let meta: JobMeta = serde_json::from_str(&v1_json(origin)).map_err(ctx("parse"))?;
+            assert_eq!(meta.origin, None, "{origin}");
+            assert_eq!(meta.resolved_origin(), None, "{origin}");
+            assert_eq!(meta.state, JobState::Running);
+        }
+        Ok(())
+    }
+
+    /// W20-A/E4: the persisted cgroup path of the process identity is
+    /// surfaced through [`JobStatus::cgroup_path`]; v1 records have none.
+    #[test]
+    fn test_status_surfaces_persisted_cgroup_path() -> TestResult {
+        let status_of = |raw: &str| -> TestResult<JobStatus> {
+            Ok(JobStatus {
+                meta: serde_json::from_str(raw).map_err(ctx("parse fixture"))?,
+                runtime_secs: None,
+                stdout_lines: 0,
+                stderr_lines: 0,
+                last_lines: Vec::new(),
+                log_dir: PathBuf::new(),
+            })
+        };
+        assert_eq!(
+            status_of(LEGACY_TOOL_ORIGIN)?.cgroup_path(),
+            Some("/harw.slice/harw-job-7")
+        );
+        assert_eq!(status_of(LEGACY_NO_ORIGIN)?.cgroup_path(), None);
+        // A legacy record carries no dedicated-cgroup proof: never attributed.
+        assert_eq!(status_of(LEGACY_TOOL_ORIGIN)?.job_cgroup_path(), None);
+        assert_eq!(status_of(LEGACY_NO_ORIGIN)?.job_cgroup_path(), None);
+        Ok(())
+    }
+
+    /// A status whose identity has cgroup `path` and the optional `proof`.
+    fn status_with_cgroup(
+        path: &str,
+        proof: Option<DedicatedCgroupProof>,
+    ) -> TestResult<JobStatus> {
+        let mut meta: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        meta.version = META_VERSION;
+        meta.identity = Some(JobProcessIdentity {
+            start_ticks: 1,
+            executable: None,
+            cgroup_path: Some(path.to_owned()),
+            dedicated_cgroup: proof,
+        });
+        Ok(JobStatus {
+            meta,
+            runtime_secs: None,
+            stdout_lines: 0,
+            stderr_lines: 0,
+            last_lines: Vec::new(),
+            log_dir: PathBuf::new(),
+        })
+    }
+
+    /// A proof for `job-1` (the job id of [`v1_json`]).
+    fn proof(attempt_id: &str, delegated_root: &str) -> DedicatedCgroupProof {
+        DedicatedCgroupProof {
+            job_id: Some(JobId("job-1".to_owned())),
+            attempt_id: attempt_id.to_owned(),
+            delegated_root: delegated_root.to_owned(),
+        }
+    }
+
+    /// PR #154 review (E4): a `harw-job-*` leaf is no proof. Without a
+    /// recorded runtime proof (harw itself in a shared cgroup whose leaf
+    /// matches, which every job would then persist), nothing is attributed;
+    /// the raw path stays visible through [`JobStatus::cgroup_path`].
+    #[test]
+    fn test_shared_matching_leaf_without_proof_is_not_a_job_cgroup() -> TestResult {
+        for path in [
+            "/user.slice",
+            "/user.slice/user-1000.slice/session-2.scope",
+            "/harw.slice",
+            "/harw.slice/harw-job-1",
+            "/user.slice/harw-job-shared",
+            "/delegated/harw-job-job_1.x-e2",
+        ] {
+            let status = status_with_cgroup(path, None)?;
+            assert_eq!(status.cgroup_path(), Some(path), "{path:?}");
+            assert_eq!(status.job_cgroup_path(), None, "{path:?}");
+        }
+        Ok(())
+    }
+
+    /// PR #154 review (E4): a proof only counts for the exact cgroup it
+    /// attests — a leaf for another attempt, a root that is not the direct
+    /// parent, or a malformed proof fails closed.
+    #[test]
+    fn test_forged_or_mismatched_proof_is_not_a_job_cgroup() -> TestResult {
+        let cases = [
+            // Leaf of another attempt.
+            (
+                "/harw.slice/harw-job-other-e1",
+                proof("job-1-e1", "/harw.slice"),
+            ),
+            // Prefix of the attested attempt is still another attempt.
+            (
+                "/harw.slice/harw-job-job-1-e1",
+                proof("job-1-e10", "/harw.slice"),
+            ),
+            // Root is not the direct parent.
+            ("/harw.slice/x/harw-job-a", proof("a", "/harw.slice")),
+            ("/harw.slice/harw-job-a", proof("a", "/other.slice")),
+            (
+                "/harw.slice/harw-job-a",
+                proof("a", "/harw.slice/harw-job-a"),
+            ),
+            // The hierarchy root is never a delegated root.
+            ("/harw-job-a", proof("a", "/")),
+            ("/harw-job-a", proof("a", CGROUP_MOUNT)),
+            // Malformed proofs or paths.
+            ("/harw.slice/harw-job-", proof("", "/harw.slice")),
+            ("/harw.slice/harw-job-a", proof("a", "harw.slice")),
+            ("/harw.slice/../harw-job-a", proof("a", "/harw.slice/..")),
+            ("/harw.slice//harw-job-a", proof("a", "/harw.slice/")),
+            ("/harw.slice/harw-job-a/leaf", proof("a", "/harw.slice")),
+        ];
+        for (path, proof) in cases {
+            let status = status_with_cgroup(path, Some(proof.clone()))?;
+            assert_eq!(status.job_cgroup_path(), None, "{path:?} {proof:?}");
+        }
+        Ok(())
+    }
+
+    /// PR #154 review (E4): the genuine case — the leaf is
+    /// `harw-job-<attested attempt>` directly beneath the attested delegated
+    /// root (mount-point spelling tolerated) — is the job's cgroup, and the
+    /// proof survives a `meta.json` round trip.
+    #[test]
+    fn test_proven_dedicated_cgroup_is_the_job_cgroup() -> TestResult {
+        let cases = [
+            (
+                "/harw.slice/harw-job-job-1-e1",
+                proof("job-1-e1", "/harw.slice"),
+            ),
+            (
+                "/app.slice/harw.slice/harw-job-job_1.x-e2",
+                proof("job:1.x-e2", "/sys/fs/cgroup/app.slice/harw.slice"),
+            ),
+        ];
+        for (path, proof) in cases {
+            let status = status_with_cgroup(path, Some(proof))?;
+            assert_eq!(status.job_cgroup_path(), Some(path), "{path:?}");
+            let json = serde_json::to_string(&status.meta).map_err(ctx("serialize"))?;
+            let back: JobMeta = serde_json::from_str(&json).map_err(ctx("parse back"))?;
+            assert_eq!(back, status.meta);
+        }
+        Ok(())
+    }
+
+    /// PR #154 review (E4): a proof is bound to its job. The same attested
+    /// proof copied into another job's record (two jobs sharing one cgroup
+    /// path and proof) is not attributed to that other job.
+    #[test]
+    fn test_proof_shared_by_two_jobs_only_counts_for_its_own_job() -> TestResult {
+        let path = "/harw.slice/harw-job-job-1-e1";
+        let shared = proof("job-1-e1", "/harw.slice");
+        let own = status_with_cgroup(path, Some(shared.clone()))?;
+        assert_eq!(own.job_cgroup_path(), Some(path));
+        let mut other = status_with_cgroup(path, Some(shared))?;
+        other.meta.job_id = JobId("job-2".to_owned());
+        assert_eq!(other.cgroup_path(), Some(path));
+        assert_eq!(other.job_cgroup_path(), None);
+        // An unbound proof (no job id) still loads but never attributes.
+        let raw = v1_json(
+            r#""identity":{"start_ticks":5,"cgroup_path":"/harw.slice/harw-job-a",
+                "dedicated_cgroup":{"attempt_id":"a","delegated_root":"/harw.slice"}},"#,
+        );
+        let meta: JobMeta = serde_json::from_str(&raw).map_err(ctx("parse unbound"))?;
+        let unbound = JobStatus { meta, ..own };
+        assert_eq!(unbound.cgroup_path(), Some("/harw.slice/harw-job-a"));
+        assert_eq!(unbound.job_cgroup_path(), None);
+        Ok(())
+    }
+
+    /// Control bytes in `meta.json` arrive as JSON escapes; they decode to
+    /// the real bytes (consumers sanitize them); without a proof the path is
+    /// never the job's cgroup.
+    #[test]
+    fn test_escaped_control_bytes_decode_in_origin_and_cgroup() -> TestResult {
+        let raw = v1_json(
+            r#""origin":{"kind":"tool","tool":"job.start\u001b[2J"},
+               "identity":{"start_ticks":5,"cgroup_path":"/harw\u0007.slice/harw-job-3"},"#,
+        );
+        let meta: JobMeta = serde_json::from_str(&raw).map_err(ctx("parse escaped"))?;
+        assert_eq!(
+            meta.resolved_origin(),
+            Some(ManagedJobOrigin::Tool {
+                tool: "job.start\u{1b}[2J".to_owned(),
+                call_id: None,
+            })
+        );
+        let status = JobStatus {
+            meta,
+            runtime_secs: None,
+            stdout_lines: 0,
+            stderr_lines: 0,
+            last_lines: Vec::new(),
+            log_dir: PathBuf::new(),
+        };
+        assert_eq!(status.cgroup_path(), Some("/harw\u{7}.slice/harw-job-3"));
+        assert_eq!(status.job_cgroup_path(), None);
+        Ok(())
+    }
+
     fn v1_json(ticks: &str) -> String {
         format!(
             r#"{{"version":1,"job_id":"job-1","name":"n","command":"c","state":"running",
@@ -515,6 +1114,7 @@ mod tests {
                 start_ticks: 777,
                 executable: None,
                 cgroup_path: None,
+                dedicated_cgroup: None,
             })
         );
         let without: JobMeta =
@@ -531,6 +1131,7 @@ mod tests {
             start_ticks: 2,
             executable: Some("/usr/bin/sleep".to_owned()),
             cgroup_path: Some("/user.slice".to_owned()),
+            dedicated_cgroup: None,
         };
         meta.version = META_VERSION;
         meta.identity = Some(identity.clone());

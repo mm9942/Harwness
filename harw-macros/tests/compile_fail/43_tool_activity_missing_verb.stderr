@@ -1,0 +1,5 @@
+error: `activity(...)` requires `verb = "..."` (required keys: `domain`, `verb`, `effect`; optional: `resource`)
+  --> tests/compile_fail/43_tool_activity_missing_verb.rs:13:5
+   |
+13 |     activity(domain = "filesystem", resource = "path", effect = "observe")
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

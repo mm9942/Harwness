@@ -76,14 +76,14 @@ impl Budget {
     /// Charge `amount` tokens onto `usage`, failing if the token ceiling is passed.
     pub fn charge_tokens(&self, usage: &mut BudgetUsage, amount: u64) -> JobRuntimeResult<()> {
         let new = usage.tokens.saturating_add(amount);
-        if let Some(limit) = self.max_tokens {
-            if new > limit {
-                return Err(JobRuntimeError::BudgetExceeded {
-                    kind: BudgetKind::Tokens,
-                    used: new,
-                    limit,
-                });
-            }
+        if let Some(limit) = self.max_tokens
+            && new > limit
+        {
+            return Err(JobRuntimeError::BudgetExceeded {
+                kind: BudgetKind::Tokens,
+                used: new,
+                limit,
+            });
         }
         usage.tokens = new;
         Ok(())
@@ -92,14 +92,14 @@ impl Budget {
     /// Charge one tool call onto `usage`, failing if the tool-call ceiling is passed.
     pub fn charge_tool_call(&self, usage: &mut BudgetUsage) -> JobRuntimeResult<()> {
         let new = usage.tool_calls.saturating_add(1);
-        if let Some(limit) = self.max_tool_calls {
-            if new > limit {
-                return Err(JobRuntimeError::BudgetExceeded {
-                    kind: BudgetKind::ToolCalls,
-                    used: u64::from(new),
-                    limit: u64::from(limit),
-                });
-            }
+        if let Some(limit) = self.max_tool_calls
+            && new > limit
+        {
+            return Err(JobRuntimeError::BudgetExceeded {
+                kind: BudgetKind::ToolCalls,
+                used: u64::from(new),
+                limit: u64::from(limit),
+            });
         }
         usage.tool_calls = new;
         Ok(())
@@ -123,14 +123,14 @@ impl Budget {
                 used: u64::MAX,
                 limit: self.max_wall.map_or(0, secs_u64),
             })?;
-        if let Some(limit) = self.max_wall {
-            if new > limit {
-                return Err(JobRuntimeError::BudgetExceeded {
-                    kind: BudgetKind::WallTime,
-                    used: secs_u64(new),
-                    limit: secs_u64(limit),
-                });
-            }
+        if let Some(limit) = self.max_wall
+            && new > limit
+        {
+            return Err(JobRuntimeError::BudgetExceeded {
+                kind: BudgetKind::WallTime,
+                used: secs_u64(new),
+                limit: secs_u64(limit),
+            });
         }
         usage.wall = new;
         Ok(())
@@ -138,32 +138,32 @@ impl Budget {
 
     /// Verify current `usage` sits within every ceiling without mutating it.
     pub fn check(&self, usage: &BudgetUsage) -> JobRuntimeResult<()> {
-        if let Some(limit) = self.max_tokens {
-            if usage.tokens > limit {
-                return Err(JobRuntimeError::BudgetExceeded {
-                    kind: BudgetKind::Tokens,
-                    used: usage.tokens,
-                    limit,
-                });
-            }
+        if let Some(limit) = self.max_tokens
+            && usage.tokens > limit
+        {
+            return Err(JobRuntimeError::BudgetExceeded {
+                kind: BudgetKind::Tokens,
+                used: usage.tokens,
+                limit,
+            });
         }
-        if let Some(limit) = self.max_tool_calls {
-            if usage.tool_calls > limit {
-                return Err(JobRuntimeError::BudgetExceeded {
-                    kind: BudgetKind::ToolCalls,
-                    used: u64::from(usage.tool_calls),
-                    limit: u64::from(limit),
-                });
-            }
+        if let Some(limit) = self.max_tool_calls
+            && usage.tool_calls > limit
+        {
+            return Err(JobRuntimeError::BudgetExceeded {
+                kind: BudgetKind::ToolCalls,
+                used: u64::from(usage.tool_calls),
+                limit: u64::from(limit),
+            });
         }
-        if let Some(limit) = self.max_wall {
-            if usage.wall > limit {
-                return Err(JobRuntimeError::BudgetExceeded {
-                    kind: BudgetKind::WallTime,
-                    used: secs_u64(usage.wall),
-                    limit: secs_u64(limit),
-                });
-            }
+        if let Some(limit) = self.max_wall
+            && usage.wall > limit
+        {
+            return Err(JobRuntimeError::BudgetExceeded {
+                kind: BudgetKind::WallTime,
+                used: secs_u64(usage.wall),
+                limit: secs_u64(limit),
+            });
         }
         Ok(())
     }

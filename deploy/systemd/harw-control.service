@@ -50,7 +50,20 @@ PrivateDevices=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes
-ProtectControlGroups=yes
+# PL-97 E3: Delegate=yes hands this service's cgroup R to harw-control, and
+# harw creates one harw-job-<attempt> cgroup per job below it (the own
+# delegated cgroup is the third step of the cgroup-root resolution).
+# DelegateSubgroup=harw-main (systemd >= 254) puts harw itself into the leaf
+# R/harw-main, so R holds no process and the memory/pids controllers can be
+# enabled for the job cgroups (cgroup v2 "no internal processes" rule); the
+# resolver then takes the parent R as the root. Older systemd ignores the
+# key with a warning: harw then sits in R, and the job limits may stay
+# partial (docs/setup/dod.md). ProtectControlGroups=yes would mount
+# /sys/fs/cgroup read-only and void the delegation; systemd grants write
+# access only to the delegated subtree, the rest stays root-owned.
+Delegate=yes
+DelegateSubgroup=harw-main
+ProtectControlGroups=no
 ProtectClock=yes
 ProtectHostname=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

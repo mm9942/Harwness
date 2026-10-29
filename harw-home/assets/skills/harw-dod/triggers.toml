@@ -1,0 +1,8 @@
+# When the `harw-dod` skill is injected (PL-95 trigger manifest, format:
+# harw-catalog/src/skill_triggers.rs). Bundled by harw-home (PL-97 D4, §3.1).
+when = "Host security posture, DoD findings, sentinel/warden state, egress or cgroup anomalies"
+[triggers]
+keywords    = ["security finding", "intrusion", "egress", "sentinel", "warden", "cgroup", "dod", "sicherheit", "angriff", "posture"]
+tools       = ["dod.status", "dod.findings", "dod.sensors"]
+commands    = ["systemctl status harw-dod", "harw dod"]
+priority    = 70

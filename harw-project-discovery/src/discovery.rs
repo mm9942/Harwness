@@ -635,16 +635,16 @@ fn is_trusted_root_candidate(
         }
     };
 
-    if let Some(uid) = current_uid {
-        if metadata.uid() != uid {
-            warn!(
-                dir = %dir.display(),
-                owner = metadata.uid(),
-                current_uid = uid,
-                "root-marker directory is not owned by the current user; ignoring marker"
-            );
-            return false;
-        }
+    if let Some(uid) = current_uid
+        && metadata.uid() != uid
+    {
+        warn!(
+            dir = %dir.display(),
+            owner = metadata.uid(),
+            current_uid = uid,
+            "root-marker directory is not owned by the current user; ignoring marker"
+        );
+        return false;
     }
 
     if metadata.mode() & 0o002 != 0 {

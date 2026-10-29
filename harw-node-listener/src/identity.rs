@@ -20,14 +20,15 @@
 //! ```
 //!
 //! `tier` is `observer|operator|maintainer|owner`, `status` is `active` or
-//! `revoked`. Any line that does not parse is ignored (never repaired into a
-//! grant). The file is re-read on every mapping, so a revocation written by
+//! `revoked`. Malformed rows never grant authority; identity mapping rejects
+//! a registry containing any malformed row. The bounded file is re-read on
+//! every mapping, so a revocation written by
 //! [`DeviceRegistry::mark_revoked`] takes effect for the next handshake
 //! without a restart.
 
 use std::fs;
 use std::future::Future;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
@@ -77,6 +78,24 @@ pub struct DeviceRecord {
 }
 
 impl DeviceRecord {
+    /// Whether an existing authenticated identity still has this exact policy.
+    /// Connection ids are supplied by the listener, never by registry input.
+    #[must_use]
+    pub fn authorizes_identity(&self, identity: &ClientIdentity) -> bool {
+        let expected = identity_of(self, identity.connection);
+        !self.revoked
+            && identity.principal == expected.principal
+            && identity.tenant == expected.tenant
+            && identity.caps == expected.caps
+            && identity.device == expected.device
+            && identity.authenticated_node == expected.authenticated_node
+            && identity.actor == expected.actor
+            && identity.label == expected.label
+            && identity.zone == expected.zone
+            && identity.strength == expected.strength
+            && identity.agent.is_none()
+    }
+
     /// Parse one registry line; `None` when blank, a comment or malformed.
     #[must_use]
     pub fn parse(line: &str) -> Option<Self> {
@@ -247,21 +266,45 @@ impl DeviceRegistry {
             }
             Err(error) => return Err(io(error)),
         };
-        let mut scan = RegistryScan::default();
-        for (index, line) in text.lines().enumerate() {
-            if let Some(record) = DeviceRecord::parse(line) {
-                scan.records.push(record);
-            } else {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                    scan.rejected.push(RejectedLine {
-                        line: index + 1,
-                        text: trimmed.to_owned(),
-                    });
-                }
+        Ok(scan_text(&text))
+    }
+
+    /// Read and parse at most `max_bytes` of registry data.
+    ///
+    /// Oversized input is refused in full, never returned as a partial list.
+    /// Uses the same canonical parser and diagnostics as [`Self::scan`].
+    ///
+    /// # Errors
+    /// [`ListenerError::Io`] if the file is unreadable, invalid UTF-8, not a
+    /// regular file, or exceeds the byte limit. A missing registry is empty.
+    pub fn scan_bounded(&self, max_bytes: usize) -> Result<RegistryScan, ListenerError> {
+        let file = match harw_fsutil::open_nofollow(&self.path, harw_fsutil::OpenMode::read_only())
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RegistryScan::default());
             }
+            Err(error) => return Err(io(error)),
+        };
+        let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        let metadata = file.metadata().map_err(io)?;
+        if !metadata.is_file() || metadata.len() > limit {
+            return Err(io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "device registry exceeds its read limit or is not a regular file",
+            )));
         }
-        Ok(scan)
+        let mut text = String::new();
+        file.take(limit.saturating_add(1))
+            .read_to_string(&mut text)
+            .map_err(io)?;
+        if text.len() > max_bytes {
+            return Err(io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "device registry exceeds its read limit",
+            )));
+        }
+        Ok(scan_text(&text))
     }
 
     /// Set the tier of the one record of `device`, rewriting only that line
@@ -286,10 +329,10 @@ impl DeviceRegistry {
         };
         let mut hits: Vec<(usize, DeviceRecord)> = Vec::new();
         for (index, line) in text.split_inclusive('\n').enumerate() {
-            if let Some(record) = DeviceRecord::parse(line) {
-                if &record.device == device {
-                    hits.push((index, record));
-                }
+            if let Some(record) = DeviceRecord::parse(line)
+                && &record.device == device
+            {
+                hits.push((index, record));
             }
         }
         let (index, before) = match hits.len() {
@@ -408,6 +451,24 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     result
 }
 
+fn scan_text(text: &str) -> RegistryScan {
+    let mut scan = RegistryScan::default();
+    for (index, line) in text.lines().enumerate() {
+        if let Some(record) = DeviceRecord::parse(line) {
+            scan.records.push(record);
+        } else {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                scan.rejected.push(RejectedLine {
+                    line: index + 1,
+                    text: trimmed.to_owned(),
+                });
+            }
+        }
+    }
+    scan
+}
+
 fn io(error: std::io::Error) -> ListenerError {
     ListenerError::Io(error.to_string())
 }
@@ -433,9 +494,25 @@ impl RegistryIdentityMapper {
         connection: ConnectionId,
     ) -> Result<ClientIdentity, ListenerError> {
         // Unreadable registry: deny, do not surface the path or the cause.
-        let record = match self.registry.record_for(&peer.node_id) {
-            Ok(Some(record)) => record,
-            Ok(None) => return Err(ListenerError::UnknownPeer),
+        let record = match self.registry.scan_bounded(1024 * 1024) {
+            Ok(scan) if scan.rejected.is_empty() => {
+                let mut matching = scan.records.iter().filter(|r| r.node_id == peer.node_id);
+                let Some(record) = matching.next() else {
+                    return Err(ListenerError::UnknownPeer);
+                };
+                if matching.next().is_some()
+                    || scan
+                        .records
+                        .iter()
+                        .filter(|r| r.device == record.device)
+                        .count()
+                        != 1
+                {
+                    return Err(ListenerError::UnknownPeer);
+                }
+                record.clone()
+            }
+            Ok(_) => return Err(ListenerError::UnknownPeer),
             Err(error) => {
                 tracing::warn!(%error, "device registry unreadable; refusing peer");
                 return Err(ListenerError::UnknownPeer);
@@ -466,6 +543,8 @@ fn identity_of(record: &DeviceRecord, connection: ConnectionId) -> ClientIdentit
         tenant: Some(record.tenant.clone()),
         caps,
         device: Some(record.device.clone()),
+        authenticated_node: Some(record.node_id.clone()),
+        authenticated_key_fingerprint: None,
         actor: ApprovalActor::Operator { id },
         label: record.label.clone(),
         zone: TrustZone::Remote,
@@ -549,6 +628,41 @@ mod registry_tests {
         );
         // The loader itself is unchanged: same two records, nothing repaired.
         assert_eq!(registry.records()?, scan.records);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_scan_refuses_symlinks_and_special_files_without_blocking() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let registry = DeviceRegistry::new(dir.path());
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "n|d|t|owner|active|Outside\n")?;
+        std::os::unix::fs::symlink(&outside, registry.path())?;
+        assert!(registry.scan_bounded(1024).is_err());
+        std::fs::remove_file(registry.path())?;
+        let status = std::process::Command::new("mkfifo")
+            .arg(registry.path())
+            .status()?;
+        assert!(status.success());
+        let (send, recv) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(registry.scan_bounded(1024).is_err());
+        });
+        assert!(recv.recv_timeout(std::time::Duration::from_secs(2))?);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_scan_refuses_oversize_and_preserves_canonical_diagnostics() -> TestResult {
+        let text = "n1|d1|tenant|owner|active|Laptop|approve\nbroken\n";
+        let (_dir, registry) = registry(text)?;
+        let scan = registry.scan_bounded(text.len())?;
+        assert_eq!(scan.records.len(), 1);
+        assert!(scan.records[0].approve_optin);
+        assert_eq!(scan.rejected[0].line, 2);
+        assert!(registry.scan_bounded(text.len() - 1).is_err());
+        assert!(registry.scan_bounded(0).is_err());
         Ok(())
     }
 

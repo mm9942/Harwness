@@ -99,6 +99,11 @@ async fn test_start_with_origin_records_call_id_and_tool() -> TestResult {
         call_id: Some("call-42".to_owned()),
         tool: Some("job.start".to_owned()),
         owner_agent: None,
+        kind: None,
+    };
+    let typed = ManagedJobOrigin::Tool {
+        tool: "job.start".to_owned(),
+        call_id: Some("call-42".to_owned()),
     };
     let started = env
         .manager
@@ -113,19 +118,24 @@ async fn test_start_with_origin_records_call_id_and_tool() -> TestResult {
     let id = started.meta.job_id.clone();
     assert_eq!(started.meta.origin_call_id.as_deref(), Some("call-42"));
     assert_eq!(started.meta.origin_tool.as_deref(), Some("job.start"));
+    // W20-A: the typed origin is recorded next to the R18 fields.
+    assert_eq!(started.meta.origin.as_ref(), Some(&typed));
     let on_disk = read_meta(&started.log_dir).ok_or(TestError::Missing("meta.json"))?;
     assert_eq!(on_disk.origin_call_id.as_deref(), Some("call-42"));
+    assert_eq!(on_disk.origin.as_ref(), Some(&typed));
     let events = events_of(&env, &id);
     match events.first() {
         Some(JobEvent::Started {
             origin_call_id,
             origin_tool,
             owner_agent,
+            origin,
             ..
         }) => {
             assert_eq!(origin_call_id.as_deref(), Some("call-42"));
             assert_eq!(origin_tool.as_deref(), Some("job.start"));
             assert_eq!(owner_agent, &None);
+            assert_eq!(origin.as_ref(), Some(&typed));
         }
         other => {
             return Err(TestError::Unexpected(format!(
@@ -142,6 +152,113 @@ async fn test_start_with_origin_records_call_id_and_tool() -> TestResult {
         .map_err(ctx("start plain"))?;
     assert_eq!(plain.meta.origin_call_id, None);
     assert_eq!(plain.meta.origin_tool, None);
+    assert_eq!(plain.meta.origin, None);
+    assert_eq!(plain.meta.resolved_origin(), None);
+    Ok(())
+}
+
+/// W20-A: a piped start with [`JobOrigin::agent_child`] (the job child
+/// backend's path) records `AgentChild` in `meta.json` and in `Started`;
+/// the R18 tool fields stay empty.
+#[tokio::test]
+async fn test_start_piped_with_origin_records_agent_child() -> TestResult {
+    let env = Env::new()?;
+    let prepared = env.prepare_piped(&["/bin/cat"]).await?;
+    let piped = env
+        .manager
+        .start_piped_with_origin(
+            request("agent-child-explorer", "parent-session", &[]),
+            prepared,
+            DEFAULT_MAX_PIPED_LINE_BYTES,
+            JobOrigin::agent_child("child-session-7"),
+        )
+        .await
+        .map_err(ctx("start_piped_with_origin"))?;
+    let expected = ManagedJobOrigin::AgentChild {
+        child_session_id: "child-session-7".to_owned(),
+    };
+    let id = piped.job_id.clone();
+    assert_eq!(piped.status.meta.origin.as_ref(), Some(&expected));
+    assert_eq!(piped.status.meta.origin_tool, None);
+    assert_eq!(piped.status.meta.origin_call_id, None);
+    let on_disk = read_meta(&piped.status.log_dir).ok_or(TestError::Missing("meta.json"))?;
+    assert_eq!(on_disk.resolved_origin(), Some(expected.clone()));
+    match events_of(&env, &id).first() {
+        Some(JobEvent::Started { origin, .. }) => assert_eq!(origin.as_ref(), Some(&expected)),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected Started first, got {other:?}"
+            )));
+        }
+    }
+    // `cat` ends on EOF of its stdin.
+    drop(piped.stdin);
+    env.manager
+        .await_exit(&id, Caller::Agent("parent-session"), LIMIT)
+        .await
+        .map_err(ctx("await_exit"))?;
+
+    // The plain piped path keeps starting without provenance.
+    let prepared = env.prepare_piped(&["/bin/cat"]).await?;
+    let plain = env
+        .manager
+        .start_piped(request("plain-piped", "parent-session", &[]), prepared)
+        .await
+        .map_err(ctx("start_piped"))?;
+    assert_eq!(plain.status.meta.origin, None);
+    drop(plain.stdin);
+    env.manager
+        .await_exit(&plain.job_id, Caller::Agent("parent-session"), LIMIT)
+        .await
+        .map_err(ctx("await_exit plain"))?;
+    Ok(())
+}
+
+/// W20-A: `meta.json` of earlier versions reloads with its provenance
+/// resolved — R18 tool fields → `Tool`, nothing → unknown (the name
+/// `agent-child-explorer` is never used to guess) — and the persisted
+/// cgroup path stays visible through [`JobStatus::cgroup_path`].
+#[tokio::test]
+async fn test_reload_resolves_legacy_origin_fixtures() -> TestResult {
+    let env = Env::new()?;
+    let jobs_dir = env.state_dir().join("jobs");
+    for (id, raw) in [
+        (
+            "job-legacy-tool",
+            include_str!("../../tests/fixtures/meta-legacy-tool-origin.json"),
+        ),
+        (
+            "job-legacy-plain",
+            include_str!("../../tests/fixtures/meta-legacy-no-origin.json"),
+        ),
+    ] {
+        let dir = jobs_dir.join(id);
+        fs::create_dir_all(&dir).map_err(ctx("create old job dir"))?;
+        fs::write(dir.join(META_FILE), raw).map_err(ctx("write old meta"))?;
+    }
+
+    let reloaded = JobManager::new(env.manager.config().clone(), Arc::new(crate::NoopNotifier))
+        .map_err(ctx("reload"))?;
+    let tool_id = JobId::parse("job-legacy-tool").ok_or(TestError::Missing("job id"))?;
+    let plain_id = JobId::parse("job-legacy-plain").ok_or(TestError::Missing("job id"))?;
+    let tool = reloaded
+        .status(&tool_id, Caller::Operator)
+        .map_err(ctx("status tool"))?;
+    assert_eq!(tool.meta.origin, None);
+    assert_eq!(
+        tool.meta.resolved_origin(),
+        Some(ManagedJobOrigin::Tool {
+            tool: "job.start".to_owned(),
+            call_id: Some("call-7".to_owned()),
+        })
+    );
+    assert_eq!(tool.cgroup_path(), Some("/harw.slice/harw-job-7"));
+    let plain = reloaded
+        .status(&plain_id, Caller::Operator)
+        .map_err(ctx("status plain"))?;
+    assert_eq!(plain.meta.state, JobState::Failed);
+    assert_eq!(plain.meta.resolved_origin(), None);
+    assert_eq!(plain.cgroup_path(), None);
     Ok(())
 }
 
@@ -455,6 +572,7 @@ fn previous_meta_with(
         origin_call_id: None,
         origin_tool: None,
         owner_agent: None,
+        origin: None,
     })
 }
 
@@ -1439,4 +1557,458 @@ fn test_milestone_key_buckets() {
         milestone_key(&snapshot(None, "compiling a")),
         milestone_key(&snapshot(None, "finished dev"))
     );
+}
+
+/// PL-97 E2b: `job.start` and child agents through the job runtime's
+/// chain path, against a recording command port.
+mod chain {
+    use super::*;
+    use crate::launcher::{JobLauncher as _, ShellJobLauncher, child_agent_launch};
+    use crate::test_support::{context, fast_config, sandbox};
+    use harw_authority::Permission;
+    use harw_command::{
+        BackendKind, CommandOutput, CommandPort, CommandRequest, CommandSandbox, CommandStdin,
+        RunFuture, SandboxProfileName, SandboxRequirement, StartFuture,
+    };
+    use harw_tool_shell::ShellToolProvider;
+    use std::sync::Mutex;
+
+    /// Records every request, reports `backend`, starts nothing.
+    #[derive(Debug, Default)]
+    struct RecordingPort {
+        backend: Option<BackendKind>,
+        requests: Mutex<Vec<CommandRequest>>,
+    }
+
+    impl RecordingPort {
+        fn requests(&self) -> TestResult<Vec<CommandRequest>> {
+            self.requests
+                .lock()
+                .map(|requests| requests.clone())
+                .map_err(|_| TestError::Missing("request log"))
+        }
+    }
+
+    impl CommandPort for RecordingPort {
+        fn run(
+            &self,
+            request: CommandRequest,
+            _cancel: harw_types::cancel::CancelToken,
+        ) -> RunFuture<'_> {
+            if let Ok(mut requests) = self.requests.lock() {
+                requests.push(request);
+            }
+            Box::pin(std::future::pending())
+        }
+
+        fn start(&self, request: CommandRequest) -> StartFuture<'_> {
+            if let Ok(mut requests) = self.requests.lock() {
+                requests.push(request);
+            }
+            Box::pin(async { Err("the recording port starts nothing".to_owned()) })
+        }
+
+        fn workspace_backend(&self, _profile: SandboxProfileName) -> Option<BackendKind> {
+            self.backend
+        }
+    }
+
+    fn manager_over(
+        dir: &tempfile::TempDir,
+        port: &Arc<RecordingPort>,
+    ) -> TestResult<Arc<JobManager>> {
+        JobManager::with_command_port(
+            fast_config(&dir.path().join("state")),
+            Arc::new(crate::NoopNotifier),
+            Arc::clone(port) as Arc<dyn CommandPort>,
+        )
+        .map_err(ctx("job manager"))
+    }
+
+    #[tokio::test]
+    async fn job_start_submits_exactly_one_workspace_request() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let port = Arc::new(RecordingPort {
+            backend: Some(BackendKind::BwrapTrampoline),
+            ..RecordingPort::default()
+        });
+        let manager = manager_over(&dir, &port)?;
+        let mut shell = ShellToolProvider::new()
+            .with_command_port(Arc::clone(&port) as Arc<dyn CommandPort>)
+            .with_execution(crate::launcher::SandboxExecution::Chain);
+        shell.limits.require_rlimits = false;
+        let launcher = ShellJobLauncher::new(shell);
+        let spec = sandbox(
+            &dir.path().join("ws"),
+            vec![
+                Permission::ReadWorkspace,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+            ],
+        )?;
+        let root = spec.workspace().canonical_root().to_path_buf();
+        let worker = context("worker", spec);
+        let launch = launcher
+            .prepare_launch(&worker, "make test", 60)
+            .await
+            .map_err(|output| TestError::Unexpected(format!("{output:?}")))?;
+        assert!(!launch.job.executed_on_host);
+        let expected_limits = launch
+            .sandboxed
+            .as_ref()
+            .ok_or(TestError::Missing("chain submission"))?
+            .limits()
+            .clone();
+        let result = manager
+            .start_launch_with_origin(request("make", "worker", &[]), launch, JobOrigin::default())
+            .await;
+        assert!(matches!(result, Err(JobError::Spawn(_))), "{result:?}");
+
+        let requests = port.requests()?;
+        let [request] = requests.as_slice() else {
+            return Err(TestError::Unexpected(format!("{requests:?}")));
+        };
+        assert_eq!(request.program, "/bin/sh");
+        assert_eq!(request.args, ["-c", "make test"]);
+        assert_eq!(request.cwd, root);
+        assert!(
+            request.env.is_empty(),
+            "the sandbox sets its own environment"
+        );
+        assert_eq!(request.stdin, CommandStdin::Null);
+        assert!(matches!(request.output, CommandOutput::Files { .. }));
+        assert_eq!(request.timeout, JOB_RUNTIME_DEADLINE);
+        assert_eq!(request.limits, expected_limits);
+        assert_eq!(request.limits.pids_max, Some(4096));
+        assert!(request.limits.cpu_time_max.is_some());
+        let CommandSandbox::Workspace(workspace) = &request.sandbox else {
+            return Err(TestError::Unexpected(format!("{:?}", request.sandbox)));
+        };
+        assert_eq!(workspace.root, root);
+        assert_eq!(workspace.profile, SandboxProfileName::NoNetwork);
+        assert_eq!(workspace.requirement, SandboxRequirement::BestEffort);
+        assert!(workspace.tmpfs_size.is_some());
+        let job_spec = request.job_spec().map_err(TestError::Unexpected)?;
+        assert_eq!(job_spec.sandbox_profile, SandboxProfileName::NoNetwork);
+        assert!(job_spec.resources.wall_timeout.is_some());
+
+        let jobs = manager.list(Caller::Operator);
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert!(!jobs[0].meta.executed_on_host);
+        Ok(())
+    }
+
+    /// `JobLauncher::prepare` returns only the process: a chain start is
+    /// refused there instead of running as a host job (fail closed).
+    #[tokio::test]
+    async fn shell_launcher_prepare_refuses_a_chain_start() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let port = Arc::new(RecordingPort {
+            backend: Some(BackendKind::Bwrap),
+            ..RecordingPort::default()
+        });
+        let mut shell = ShellToolProvider::new()
+            .with_command_port(Arc::clone(&port) as Arc<dyn CommandPort>)
+            .with_execution(crate::launcher::SandboxExecution::Chain);
+        shell.limits.require_rlimits = false;
+        let launcher = ShellJobLauncher::new(shell);
+        let worker = context(
+            "worker",
+            sandbox(
+                &dir.path().join("ws"),
+                vec![Permission::ReadWorkspace, Permission::ExecuteProcess],
+            )?,
+        );
+        match launcher.prepare(&worker, "make", 60).await {
+            Err(harw_tools::ToolOutput::Error { message }) => {
+                assert!(message.contains("sandbox chain"), "{message}");
+            }
+            Err(other) => return Err(TestError::Unexpected(format!("{other:?}"))),
+            Ok(job) => return Err(TestError::Unexpected(format!("{job:?}"))),
+        }
+        assert!(port.requests()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn child_agent_launch_is_a_workspace_build_request() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let root = dir.path().canonicalize().map_err(ctx("canonicalize"))?;
+        let port = Arc::new(RecordingPort {
+            backend: Some(BackendKind::LandlockTrampoline),
+            ..RecordingPort::default()
+        });
+        let manager = manager_over(&dir, &port)?;
+        // The command's own cwd is ignored: the root is the one passed.
+        let elsewhere = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let prepared = |cwd: &Path| {
+            let mut command = tokio::process::Command::new("/bin/true");
+            command.current_dir(cwd);
+            PreparedJob {
+                command,
+                executed_on_host: true,
+                env_cleared: false,
+            }
+        };
+        let launch = child_agent_launch(&manager, prepared(elsewhere.path()), &root)
+            .map_err(|refused| TestError::Unexpected(refused.1))?;
+        assert!(
+            launch.job.executed_on_host,
+            "the child process is not confined"
+        );
+        let sandboxed = launch
+            .sandboxed
+            .as_ref()
+            .ok_or(TestError::Missing("chain submission"))?;
+        assert_eq!(sandboxed.backend(), BackendKind::LandlockTrampoline);
+        let CommandSandbox::Workspace(workspace) = sandboxed.sandbox() else {
+            return Err(TestError::Unexpected(format!("{:?}", sandboxed.sandbox())));
+        };
+        assert_eq!(workspace.root, root);
+        assert_eq!(workspace.profile, SandboxProfileName::WorkspaceBuild);
+        assert_eq!(workspace.requirement, SandboxRequirement::None);
+
+        let result = manager
+            .start_piped_launch_with_origin(
+                request("child", "parent", &[]),
+                launch,
+                DEFAULT_MAX_PIPED_LINE_BYTES,
+                JobOrigin::agent_child("child-session"),
+            )
+            .await;
+        assert!(matches!(result, Err(JobError::Spawn(_))), "{result:?}");
+        let requests = port.requests()?;
+        let [request] = requests.as_slice() else {
+            return Err(TestError::Unexpected(format!("{requests:?}")));
+        };
+        assert_eq!(request.cwd, root);
+        assert_eq!(request.stdin, CommandStdin::Pipe);
+        assert!(matches!(&request.sandbox, CommandSandbox::Workspace(_)));
+
+        // A port that runs no workspace requests: the job comes back.
+        let unrouted = Arc::new(RecordingPort::default());
+        let manager = manager_over(&dir, &unrouted)?;
+        let refused = child_agent_launch(&manager, prepared(&root), &root);
+        assert!(
+            refused.is_err_and(|refused| refused.1.contains("workspace")),
+            "a job runtime without workspace requests keeps the host submission"
+        );
+        // A root that does not exist: refused, the job comes back.
+        let manager = manager_over(&dir, &port)?;
+        let refused = child_agent_launch(&manager, prepared(&root), &root.join("missing"));
+        assert!(refused.is_err_and(|refused| refused.1.contains("cannot be resolved")));
+        Ok(())
+    }
+}
+
+/// PL-97 E4: the dedicated-cgroup proof comes only from the runtime's
+/// attestation of this job's launch and is bound to this job.
+mod cgroup_proof {
+    use super::*;
+
+    fn status_of(meta: JobMeta) -> JobStatus {
+        JobStatus {
+            meta,
+            runtime_secs: None,
+            stdout_lines: 0,
+            stderr_lines: 0,
+            last_lines: Vec::new(),
+            log_dir: PathBuf::new(),
+        }
+    }
+
+    fn identity(cgroup_path: &str) -> JobProcessIdentity {
+        JobProcessIdentity {
+            start_ticks: 7,
+            executable: None,
+            cgroup_path: Some(cgroup_path.to_owned()),
+            dedicated_cgroup: None,
+        }
+    }
+
+    fn attested(attempt_id: &str, delegated_root: &str) -> harw_command::AttemptCgroup {
+        harw_command::AttemptCgroup {
+            attempt_id: attempt_id.to_owned(),
+            delegated_root: delegated_root.to_owned(),
+        }
+    }
+
+    #[test]
+    fn proof_is_written_from_the_attestation_and_bound_to_the_job() -> TestResult {
+        let path = "/harw.slice/harw-job-job-1-e1";
+        let mut meta = previous_meta_with("job-1", 42, Some(7), Some(identity(path)))?;
+        attach_cgroup_proof(&mut meta, Some(&attested("job-1-e1", "/harw.slice")));
+        let proof = meta
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.dedicated_cgroup.clone())
+            .ok_or(TestError::Missing("proof"))?;
+        assert_eq!(proof.job_id.as_ref(), Some(&meta.job_id));
+        let own = status_of(meta.clone());
+        assert_eq!(own.job_cgroup_path(), Some(path));
+
+        // The same record under another job id is not attributed.
+        let mut copied = meta;
+        copied.job_id = JobId::parse("job-2").ok_or(TestError::Missing("job id"))?;
+        assert_eq!(status_of(copied).job_cgroup_path(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn without_an_attestation_no_proof_is_written() -> TestResult {
+        // A matching `harw-job-*` leaf without a dedicated cgroup created by
+        // the runtime stays unattributed (fail-closed).
+        let path = "/harw.slice/harw-job-job-1-e1";
+        let mut meta = previous_meta_with("job-1", 42, Some(7), Some(identity(path)))?;
+        attach_cgroup_proof(&mut meta, None);
+        assert_eq!(
+            meta.identity
+                .as_ref()
+                .and_then(|identity| identity.dedicated_cgroup.as_ref()),
+            None
+        );
+        assert_eq!(status_of(meta).job_cgroup_path(), None);
+
+        // No identity: nothing to bind the proof to.
+        let mut bare = previous_meta_with("job-1", 42, None, None)?;
+        attach_cgroup_proof(&mut bare, Some(&attested("job-1-e1", "/harw.slice")));
+        assert_eq!(bare.identity, None);
+
+        // An attestation for another cgroup does not match the observed one.
+        let mut shared = previous_meta_with("job-1", 42, Some(7), Some(identity("/user.slice")))?;
+        attach_cgroup_proof(&mut shared, Some(&attested("job-1-e1", "/harw.slice")));
+        assert_eq!(status_of(shared).job_cgroup_path(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refreshed_identity_keeps_the_launch_proof() -> TestResult {
+        let path = "/harw.slice/harw-job-job-1-e1";
+        let mut meta = previous_meta_with("job-1", 42, Some(7), Some(identity(path)))?;
+        attach_cgroup_proof(&mut meta, Some(&attested("job-1-e1", "/harw.slice")));
+        let fresh = carry_cgroup_proof(meta.identity.as_ref(), identity(path));
+        assert_eq!(Some(&fresh), meta.identity.as_ref());
+        // A process that left its cgroup keeps the proof but no longer matches.
+        meta.identity = Some(carry_cgroup_proof(
+            meta.identity.as_ref(),
+            identity("/user.slice"),
+        ));
+        assert_eq!(status_of(meta).job_cgroup_path(), None);
+        Ok(())
+    }
+
+    /// The real launch path: a process adopted without an attestation gets
+    /// no proof, with one the proof is bound but never matches a shared
+    /// cgroup.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_child_writes_the_proof_only_with_an_attestation() -> TestResult {
+        let pid = std::process::id();
+        let mut meta = previous_meta("job-1", pid, None)?;
+        let _leader = adopt_child(&mut meta, Some(pid), None);
+        let identity = meta
+            .identity
+            .as_ref()
+            .ok_or(TestError::Missing("identity"))?;
+        assert_eq!(identity.dedicated_cgroup, None);
+        assert_eq!(status_of(meta.clone()).job_cgroup_path(), None);
+
+        let _leader = adopt_child(
+            &mut meta,
+            Some(pid),
+            Some(&attested("job-1-e1", "/harw.slice")),
+        );
+        let identity = meta
+            .identity
+            .as_ref()
+            .ok_or(TestError::Missing("identity"))?;
+        let proof = identity
+            .dedicated_cgroup
+            .as_ref()
+            .ok_or(TestError::Missing("proof"))?;
+        assert_eq!(proof.job_id.as_ref(), Some(&meta.job_id));
+        assert_eq!(proof.attempt_id, "job-1-e1");
+        // The test process does not run in `/harw.slice/harw-job-job-1-e1`.
+        assert_eq!(status_of(meta).job_cgroup_path(), None);
+        Ok(())
+    }
+
+    /// The installed host port, reporting `cgroup` as the runtime's
+    /// attestation of every start (the fake executor result).
+    #[derive(Debug)]
+    struct AttestingPort {
+        inner: Arc<dyn harw_command::CommandPort>,
+        cgroup: Option<harw_command::AttemptCgroup>,
+    }
+
+    impl harw_command::CommandPort for AttestingPort {
+        fn run(
+            &self,
+            request: harw_command::CommandRequest,
+            cancel: harw_types::cancel::CancelToken,
+        ) -> harw_command::RunFuture<'_> {
+            self.inner.run(request, cancel)
+        }
+
+        fn start(&self, request: harw_command::CommandRequest) -> harw_command::StartFuture<'_> {
+            let cgroup = self.cgroup.clone();
+            let started = self.inner.start(request);
+            Box::pin(async move {
+                let mut started = started.await?;
+                started.cgroup = cgroup;
+                Ok(started)
+            })
+        }
+    }
+
+    /// The chain from the port's started command to `meta.json`: the proof
+    /// is persisted bound to this job exactly when the start was attested.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn job_start_persists_the_attested_proof_bound_to_the_job() -> TestResult {
+        let env = Env::new()?;
+        let inner = harw_command::installed().ok_or(TestError::Missing("host port"))?;
+        let cases = [
+            ("attested", Some(attested("runtime-e1", "/harw.slice"))),
+            ("plain", None),
+        ];
+        for (tag, cgroup) in cases {
+            let port = Arc::new(AttestingPort {
+                inner: Arc::clone(&inner),
+                cgroup: cgroup.clone(),
+            });
+            let manager = JobManager::with_command_port(
+                crate::test_support::fast_config(&env.dir.path().join(tag)),
+                Arc::new(crate::NoopNotifier),
+                port as Arc<dyn harw_command::CommandPort>,
+            )
+            .map_err(ctx("job manager"))?;
+            let prepared = env.prepare("sleep 30").await?;
+            let started = manager
+                .start(request(tag, "agent-a", &[]), prepared)
+                .await
+                .map_err(ctx("start"))?;
+            let job_id = started.meta.job_id.clone();
+            let on_disk =
+                read_meta(&started.log_dir).ok_or(TestError::Missing("meta.json after start"))?;
+            let proof = on_disk
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.dedicated_cgroup.clone());
+            match &cgroup {
+                Some(cgroup) => {
+                    let proof = proof.ok_or(TestError::Missing("persisted proof"))?;
+                    assert_eq!(proof.job_id.as_ref(), Some(&job_id));
+                    assert_eq!(proof.attempt_id, cgroup.attempt_id);
+                    assert_eq!(proof.delegated_root, cgroup.delegated_root);
+                }
+                None => assert!(proof.is_none(), "{proof:?}"),
+            }
+            manager
+                .stop(&job_id, Caller::Agent("agent-a"), JobSignal::Term)
+                .await
+                .map_err(ctx("stop"))?;
+        }
+        Ok(())
+    }
 }

@@ -379,14 +379,12 @@ impl McpClient {
                 body: safe_body(response.text().await.map_err(McpError::Http)?),
             });
         }
-        if initializing {
-            if let Some(value) = response.headers().get(&MCP_SESSION_HEADER) {
-                let value = value.to_str().map_err(|_| McpError::InvalidSessionId)?;
-                if value.is_empty() || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
-                    return Err(McpError::InvalidSessionId);
-                }
-                self.session_id = Some(value.to_owned());
+        if initializing && let Some(value) = response.headers().get(&MCP_SESSION_HEADER) {
+            let value = value.to_str().map_err(|_| McpError::InvalidSessionId)?;
+            if value.is_empty() || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+                return Err(McpError::InvalidSessionId);
             }
+            self.session_id = Some(value.to_owned());
         }
         let is_sse = response
             .headers()

@@ -27,6 +27,8 @@ use crate::types::Plan;
 
 /// Ein Plan im Katalog samt eigener History und Revisionsfolge.
 struct Slot {
+    bootstrap: Plan,
+    receipts: Vec<crate::parent_progress::ParentProgressReceipt>,
     /// Aktueller Planzustand.
     plan: Plan,
     /// Event-History dieses Plans (append-only).
@@ -213,6 +215,8 @@ impl InMemoryPlanStore {
                 applied_at: now,
             };
             inner.plans.push(Slot {
+                bootstrap: plan.clone(),
+                receipts: Vec::new(),
                 plan,
                 history: vec![event.clone()],
                 next_revision: revision.next(),
@@ -246,6 +250,49 @@ impl InMemoryPlanStore {
 }
 
 impl PlanStore for InMemoryPlanStore {
+    fn reconcile_parent_progress(
+        &self,
+        admission: &crate::parent_progress::ParentAdmission,
+    ) -> PlanResult<crate::parent_progress::ParentProgressView> {
+        let inner = self.read()?;
+        let slot = inner.active_slot().ok_or(PlanError::PlanNotFound)?;
+        crate::parent_progress::reconcile(
+            Some(&slot.bootstrap),
+            &slot.history,
+            &slot.receipts,
+            &slot.plan,
+            admission,
+            &self.config,
+        )
+    }
+    fn commit_parent_progress_checked(
+        &self,
+        request: &crate::parent_progress::CollectSourcesProgress,
+        before_publish: &dyn Fn() -> PlanResult<()>,
+    ) -> PlanResult<crate::parent_progress::ParentProgressReceipt> {
+        let mut inner = self.write()?;
+        self.config.require_enabled().map_err(PlanError::Config)?;
+        let slot = inner.active_slot_mut().ok_or(PlanError::PlanNotFound)?;
+        let view = crate::parent_progress::reconcile(
+            Some(&slot.bootstrap),
+            &slot.history,
+            &slot.receipts,
+            &slot.plan,
+            &request.admission,
+            &self.config,
+        )?;
+        match crate::parent_progress::stage(&view, &slot.receipts, request, &self.config)? {
+            crate::parent_progress::StagedProgress::Existing(receipt) => Ok(receipt),
+            crate::parent_progress::StagedProgress::New(plan, events, receipt) => {
+                before_publish()?;
+                slot.next_revision = plan.revision.next();
+                slot.plan = plan;
+                slot.history.extend(events);
+                slot.receipts.push(receipt.clone());
+                Ok(receipt)
+            }
+        }
+    }
     fn current(&self) -> PlanResult<Plan> {
         let inner = self.read()?;
         inner
@@ -283,6 +330,17 @@ impl PlanStore for InMemoryPlanStore {
         actor: &str,
         expected_rev: RevisionId,
     ) -> PlanResult<PlanRevision> {
+        self.apply_batch_checked(plan, actions, actor, expected_rev, &|| Ok(()))
+    }
+
+    fn apply_batch_checked(
+        &self,
+        plan: &PlanId,
+        actions: Vec<PlanAction>,
+        actor: &str,
+        expected_rev: RevisionId,
+        before_publish: &dyn Fn() -> PlanResult<()>,
+    ) -> PlanResult<PlanRevision> {
         let mut inner = self.write()?;
         self.config.require_enabled().map_err(PlanError::Config)?;
 
@@ -292,6 +350,7 @@ impl PlanStore for InMemoryPlanStore {
         };
         let current = check_batch_target(Some(&slot.plan), plan, expected_rev)?;
         if actions.is_empty() {
+            before_publish()?;
             return Ok(PlanRevision {
                 revision: current.revision,
                 events: Vec::new(),
@@ -308,6 +367,7 @@ impl PlanStore for InMemoryPlanStore {
                 },
             )?;
 
+        before_publish()?;
         let revision = candidate.revision;
         slot.plan = candidate;
         slot.next_revision = revision.next();

@@ -28,6 +28,8 @@
 //!   unverändert.
 //! - [`limits`] — [`ShellLimits`], [`ShellLimitsError`]: rlimits über festgepinntes `prlimit`
 //!   und tmpfs-Größe (W1-03)
+//! - [`job_spec`] — [`SandboxExecution`], [`SandboxedLaunch`]: `shell.exec` und
+//!   `job.start` über die Sandbox-Kette des Job-Runtimes (PL-97 E2b)
 //! - [`host_permit_prompt`] — [`HostPermitPrompt`], [`HostPermitVariant`],
 //!   [`HostPermitPromptSender`]/[`HostPermitPromptReceiver`]: der geteilte
 //!   Fragekanal für Host-Profil-Permit-Anfragen zwischen `ShellExecutor` und
@@ -56,6 +58,7 @@ mod capture;
 pub mod exec;
 pub mod host_escalation;
 pub mod host_permit_prompt;
+pub mod job_spec;
 pub mod latex;
 pub mod limits;
 pub mod sudo;
@@ -82,6 +85,8 @@ pub use host_permit_prompt::{
 pub use latex::{
     LATEX_BUILD_TOOL, LATEX_CHECK_TOOL, LATEX_TEMPLATE_TOOL, LatexEngine, LatexToolProvider,
 };
+// PL-97 E2b: `shell.exec`/`job.start` über die Sandbox-Kette des Job-Runtimes.
+pub use job_spec::{SandboxExecution, SandboxedLaunch};
 pub use limits::{RLIMIT_UNLIMITED, ShellLimits, ShellLimitsError};
 pub use sudo::{
     SUDO_EXEC_TOOL, SUDO_MAX_SECRET_BYTES, SUDO_PROMPT_TIMEOUT, SudoAnswer, SudoAuditRecord,

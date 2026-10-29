@@ -2,7 +2,7 @@
 name = "harw-cloud-gateway"
 version.workspace = true
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 description = "Harwness cloud gateway configuration and status probing"
 publish = false
 license.workspace = true

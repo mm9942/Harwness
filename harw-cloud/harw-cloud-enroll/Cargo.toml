@@ -2,12 +2,13 @@
 name = "harw-cloud-enroll"
 version.workspace = true
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 description = "Device enrollment types for the Harwness cloud home (PL-65/68/94)"
 publish = false
 license.workspace = true
 
 [dependencies]
+jiff = { workspace = true }
 harw-types = { path = "../../harw-types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

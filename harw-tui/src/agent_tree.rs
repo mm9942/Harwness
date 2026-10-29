@@ -98,24 +98,22 @@ impl AgentTree {
             }
             KeyCode::Up => self.selected = Some(visible[index.saturating_sub(1)].id.clone()),
             KeyCode::Left => {
-                if !rows
+                if (!rows
                     .iter()
                     .any(|child| child.parent.as_ref() == Some(&row.id))
-                    || !self.collapsed.insert(row.id.clone())
+                    || !self.collapsed.insert(row.id.clone()))
+                    && let Some(parent) = &row.parent
                 {
-                    if let Some(parent) = &row.parent {
-                        self.selected = Some(parent.clone());
-                    }
+                    self.selected = Some(parent.clone());
                 }
             }
             KeyCode::Right => {
-                if !self.collapsed.remove(&row.id) {
-                    if let Some(child) = rows
+                if !self.collapsed.remove(&row.id)
+                    && let Some(child) = rows
                         .iter()
                         .find(|child| child.parent.as_ref() == Some(&row.id))
-                    {
-                        self.selected = Some(child.id.clone());
-                    }
+                {
+                    self.selected = Some(child.id.clone());
                 }
             }
             KeyCode::Enter => {

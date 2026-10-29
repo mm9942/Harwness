@@ -1,0 +1,27 @@
+# Rebase safety: binding a second provisional job to an already bound WorkId is
+# refused (visible standalone, both instances keep their ids); the same call id
+# in another session is a different provisional key.
+# Observed renames (adapter contract rule 4): the move call is its own Mutate
+# activity keyed by the old path, so it seals the read burst of old.rs and opens
+# a loop; the rebase is a pure binding (no call id) that moves that loop to
+# new.rs (same projection, old path as alias). Moving other.rs onto new.rs
+# replaces new.rs: its loop is sealed and the rebind is refused, never merged.
+# Renaming a file this turn never touched is a plain standalone.
+{"ingest_seq":1,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c1"},"lifecycle":"started"}
+{"ingest_seq":2,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c2"},"lifecycle":"started"}
+{"ingest_seq":3,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c1"},"lifecycle":{"rebase":{"to":{"job":"W1"}}}}
+{"ingest_seq":4,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c2"},"lifecycle":{"rebase":{"to":{"job":"W1"}}}}
+{"ingest_seq":5,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c1"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":6,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c2"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":7,"owner":{"session":"child","turn":1,"call":"c1"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c1"},"lifecycle":"started"}
+{"ingest_seq":8,"owner":{"session":"child","turn":1,"call":"c1"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c1"},"lifecycle":{"rebase":{"to":{"job":"W3"}}}}
+{"ingest_seq":9,"owner":{"session":"root","turn":1,"call":"c3"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"old.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":10,"owner":{"session":"root","turn":1,"call":"c4"},"descriptor":{"domain":"filesystem","verb":"move","resource_field":"path","effect":"mutate"},"resource":{"path":"old.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":11,"owner":{"session":"root","turn":1},"descriptor":{"domain":"filesystem","verb":"move","resource_field":"path","effect":"mutate"},"resource":{"path":"old.rs"},"lifecycle":{"rebase":{"to":{"path":"new.rs"}}}}
+{"ingest_seq":12,"owner":{"session":"root","turn":1,"call":"c5"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"new.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":13,"owner":{"session":"root","turn":1,"call":"c6"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"old.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":14,"owner":{"session":"root","turn":1,"call":"c7"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"other.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":15,"owner":{"session":"root","turn":1,"call":"c8"},"descriptor":{"domain":"filesystem","verb":"move","resource_field":"path","effect":"mutate"},"resource":{"path":"other.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":16,"owner":{"session":"root","turn":1},"descriptor":{"domain":"filesystem","verb":"move","resource_field":"path","effect":"mutate"},"resource":{"path":"other.rs"},"lifecycle":{"rebase":{"to":{"path":"new.rs"}}}}
+{"ingest_seq":17,"owner":{"session":"root","turn":1,"call":"c9"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"new.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":18,"owner":{"session":"root","turn":1},"descriptor":{"domain":"filesystem","verb":"move","resource_field":"path","effect":"mutate"},"resource":{"path":"gone.rs"},"lifecycle":{"rebase":{"to":{"path":"elsewhere.rs"}}}}

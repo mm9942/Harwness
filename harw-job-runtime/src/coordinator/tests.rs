@@ -942,10 +942,10 @@ fn job_cgroup_name(attempt: &AttemptId) -> String {
 fn read_pid_file(path: &Path) -> TestResult<u32> {
     let started = std::time::Instant::now();
     while started.elapsed() < LIMIT {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if let Ok(pid) = text.trim().parse::<u32>() {
-                return Ok(pid);
-            }
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            return Ok(pid);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1748,6 +1748,116 @@ async fn per_process_rlimits_reach_the_program_and_are_reported() -> TestResult 
     Ok(())
 }
 
+/// `process_count_max` is its own rlimit (`RLIMIT_NPROC`): on the plain
+/// path `prlimit --nproc` applies it, and the report says `enforced` only
+/// when it was applied (no cgroup limit is requested here).
+#[tokio::test]
+async fn process_count_rlimit_reaches_the_program_and_is_reported() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-nproc")?;
+    let coordinator = fixture.coordinator(
+        &runner,
+        LinuxExecutorOptions::default(),
+        Duration::from_secs(3),
+    )?;
+    // Never above the current hard limit (raising it needs privilege) and
+    // high enough not to starve the test user's other processes.
+    let current = harw_job_linux::resources::current_rlimit(harw_job_linux::RlimitResource::Nproc);
+    let count = current.hard.map_or(1 << 20, |hard| hard.min(1 << 20));
+    let spec = JobSpec::command("/bin/cat")
+        .arg("/proc/self/limits")
+        .resources(ResourceRequest {
+            process_count_max: Some(count),
+            ..ResourceRequest::default()
+        })
+        .build()
+        .map_err(ctx("spec"))?;
+    let handle = coordinator
+        .submit(envelope(spec)?)
+        .await
+        .map_err(ctx("submit"))?;
+    let result = wait(handle).await?;
+    assert!(result.is_success(), "{result:?}");
+    let report = result.sandbox.ok_or(TestError::Missing("report"))?;
+    if prlimit_present() {
+        let limits = String::from_utf8_lossy(&result.stdout);
+        let line = limits
+            .lines()
+            .find(|line| line.starts_with("Max processes"))
+            .ok_or(TestError::Missing("Max processes"))?;
+        let values: Vec<&str> = line.split_whitespace().skip(2).take(2).collect();
+        let expected = count.to_string();
+        assert_eq!(values, [expected.as_str(), expected.as_str()], "{line}");
+        // PL-97 E2g: set either way, but it binds only an identity the
+        // kernel does not exempt (the harw process' own, here the test
+        // runner's); there is no job cgroup to cover it.
+        let expected = if nproc_exempt() {
+            EnforcementState::NotEnforced
+        } else {
+            EnforcementState::Enforced
+        };
+        assert_eq!(report.resource_limits, expected);
+    } else {
+        assert_eq!(report.resource_limits, EnforcementState::NotEnforced);
+    }
+    Ok(())
+}
+
+/// Whether this process (the harw side of the plain `prlimit` path) is
+/// exempt from `RLIMIT_NPROC`: real uid 0, `CAP_SYS_ADMIN` or
+/// `CAP_SYS_RESOURCE`.
+fn nproc_exempt() -> bool {
+    harw_job_exec::report::nproc_exemption(harw_job_exec::report::ProcessIdentity::current())
+        .is_some()
+}
+
+/// PL-97 E2g: on the plain path a job with `require_rlimits` and
+/// `process_count_max` is refused before it runs when this process is
+/// exempt from `RLIMIT_NPROC` and no job cgroup `pids.max` covers the
+/// request; otherwise it runs. Which branch runs depends on the uid of the
+/// test runner; the decision for injected identities is covered by
+/// `plain_prlimit_path_checks_the_process_count_against_the_identity`.
+#[tokio::test]
+async fn required_process_count_is_refused_for_an_exempt_harw_identity() -> TestResult {
+    if !prlimit_present() {
+        eprintln!("skipped: no prlimit at the fixed paths");
+        return Ok(());
+    }
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-nproc-required")?;
+    let coordinator = fixture.coordinator(
+        &runner,
+        LinuxExecutorOptions::default(),
+        Duration::from_secs(3),
+    )?;
+    let current = harw_job_linux::resources::current_rlimit(harw_job_linux::RlimitResource::Nproc);
+    let count = current.hard.map_or(1 << 20, |hard| hard.min(1 << 20));
+    let spec = JobSpec::command("/bin/sh")
+        .arg("-c")
+        .arg("echo ran > ran")
+        .resources(ResourceRequest {
+            process_count_max: Some(count),
+            require_rlimits: true,
+            ..ResourceRequest::default()
+        })
+        .build()
+        .map_err(ctx("spec"))?;
+    let handle = coordinator
+        .submit(envelope(spec)?)
+        .await
+        .map_err(ctx("submit"))?;
+    let result = wait(handle).await?;
+    let ran = fixture.workspace().join("ran").exists();
+    if nproc_exempt() {
+        assert_eq!(result.state, LifecycleState::Failed, "{result:?}");
+        assert!(!ran, "the job must not run");
+    } else {
+        assert!(result.is_success(), "{result:?}");
+        assert!(ran);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_job_without_rlimits_is_not_wrapped() -> TestResult {
     let fixture = Fixture::new()?;
@@ -1765,5 +1875,391 @@ async fn a_job_without_rlimits_is_not_wrapped() -> TestResult {
     assert_eq!(result.stdout, b"plain\n");
     let report = result.sandbox.ok_or(TestError::Missing("report"))?;
     assert_eq!(report.resource_limits, EnforcementState::Enforced);
+    Ok(())
+}
+
+/// Two dispatchers sharing the durable namespace must retain one work identity
+/// and launch at most one process, including when the first response is lost.
+#[tokio::test]
+async fn existing_process_dispatch_is_fenced_and_replay_does_not_launch() -> TestResult {
+    let fixture = Fixture::new()?;
+    let owner = runner("durable-dispatch")?;
+    let first = fixture.coordinator(&owner, fixture.shim_options(), Duration::from_secs(3))?;
+    let second = fixture.coordinator(&owner, fixture.shim_options(), Duration::from_secs(3))?;
+    let record = first
+        .new_record(&sh("printf launched >> dispatch-count")?, Timestamp::now())
+        .map_err(ctx("new record"))?;
+    let work_id = record.job.id.clone();
+    first
+        .store()
+        .create_job(record)
+        .map_err(ctx("persist admission"))?;
+
+    let (left, right) = tokio::join!(
+        first.start_existing(&work_id),
+        second.start_existing(&work_id)
+    );
+    let handle = match (left, right) {
+        (Ok(handle), Err(error)) | (Err(error), Ok(handle)) => {
+            assert!(error.is_store_conflict(), "unexpected refusal: {error}");
+            handle
+        }
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected one dispatch winner: {other:?}"
+            )));
+        }
+    };
+    assert_eq!(handle.id(), &work_id);
+    assert_eq!(
+        handle.attempt_id(),
+        &attempt_id_for(&work_id, 1).map_err(ctx("attempt id"))?
+    );
+    let result = wait(handle).await?;
+    assert_eq!(result.job_id, work_id);
+    assert_eq!(job_state(first.store(), &work_id)?, JobState::Completed);
+    let completed = first
+        .store()
+        .load(&work_id)
+        .map_err(ctx("completed record"))?;
+    assert_eq!(completed.lease_epoch, 1);
+    assert!(
+        second
+            .start_existing(&work_id)
+            .await
+            .is_err_and(|error| error.is_store_conflict())
+    );
+    assert_eq!(
+        first.store().load(&work_id).map_err(ctx("replay record"))?,
+        completed
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace().join("dispatch-count"))
+            .map_err(ctx("launch count"))?,
+        "launched"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn existing_process_dispatch_refuses_wrong_scope_kind_and_redacted_input() -> TestResult {
+    let fixture = Fixture::new()?;
+    let owner = runner("durable-refusal")?;
+    let coordinator =
+        fixture.coordinator(&owner, fixture.shim_options(), Duration::from_secs(3))?;
+    for rejected in ["scope", "kind", "input"] {
+        let mut record = coordinator
+            .new_record(
+                &sh("printf unexpected >> refused-launch")?,
+                Timestamp::now(),
+            )
+            .map_err(ctx("new record"))?;
+        match rejected {
+            "scope" => {
+                record.scope = harw_job_core::JobScope::new(
+                    harw_types::TenantId::from_str("other-tenant"),
+                    record.scope.workspace().clone(),
+                    record.scope.submitter().clone(),
+                );
+            }
+            "kind" => record.job.kind = harw_job_core::JobKind::Worker,
+            _ => record.input = serde_json::json!({"harw_redacted": {"class": "ephemeral"}}),
+        }
+        let work_id = record.job.id.clone();
+        coordinator
+            .store()
+            .create_job(record.clone())
+            .map_err(ctx("persist admission"))?;
+        assert!(matches!(
+            coordinator.start_existing(&work_id).await,
+            Err(super::RuntimeError::InvalidConfig { .. })
+        ));
+        assert_eq!(
+            coordinator
+                .store()
+                .load(&work_id)
+                .map_err(ctx("refused record"))?,
+            record
+        );
+    }
+    assert!(!fixture.workspace().join("refused-launch").exists());
+    Ok(())
+}
+
+/// Validation must be bound to the very record claimed; a concurrent change
+/// cannot substitute a command or scope between dispatch load and claim.
+#[test]
+fn existing_process_claim_refuses_changed_input_and_scope_without_a_lease() -> TestResult {
+    let fixture = Fixture::new()?;
+    let owner = runner("durable-change")?;
+    let coordinator =
+        fixture.coordinator(&owner, fixture.shim_options(), Duration::from_secs(3))?;
+    for change in ["input", "scope"] {
+        let expected = coordinator
+            .new_record(&sh("printf original")?, Timestamp::now())
+            .map_err(ctx("new record"))?;
+        let work_id = expected.job.id.clone();
+        coordinator
+            .store()
+            .create_job(expected.clone())
+            .map_err(ctx("persist admission"))?;
+        let substituted =
+            serde_json::to_value(sh("printf substituted")?).map_err(ctx("substituted envelope"))?;
+        let changed: harw_job_store::StoreResult<()> =
+            coordinator
+                .store()
+                .records()
+                .update_locked(work_id.as_str(), |record| {
+                    if change == "input" {
+                        record.input = substituted;
+                    } else {
+                        record.scope = harw_job_core::JobScope::new(
+                            harw_types::TenantId::from_str("changed-tenant"),
+                            record.scope.workspace().clone(),
+                            record.scope.submitter().clone(),
+                        );
+                    }
+                    Ok(())
+                });
+        changed.map_err(ctx("change after dispatch validation"))?;
+        let before = coordinator
+            .store()
+            .load(&work_id)
+            .map_err(ctx("changed record"))?;
+        let refused = coordinator.store().claim_existing_job(
+            expected,
+            &owner,
+            ClaimTerms {
+                lease_ttl: SignedDuration::from_secs(3),
+                now: Timestamp::now(),
+            },
+        );
+        assert!(matches!(
+            refused,
+            Err(harw_job_store::StoreError::Conflict { .. })
+        ));
+        assert_eq!(
+            coordinator
+                .store()
+                .load(&work_id)
+                .map_err(ctx("refused claim record"))?,
+            before
+        );
+        assert!(before.lease.is_none());
+        assert_eq!(before.lease_epoch, 0);
+        assert_eq!(before.job.state, JobState::Ready);
+    }
+    Ok(())
+}
+
+/// Injects expiry/revocation during the durable Starting write, before an
+/// executor may be invoked. This exercises dispatch without timing sleeps.
+struct LoseLeaseOnStarting {
+    store: FsJobRecordStore,
+    revoke: bool,
+    gate: Option<std::sync::Arc<StartReadGate>>,
+}
+
+#[derive(Default)]
+struct StartReadGate {
+    armed: std::sync::atomic::AtomicBool,
+    reached: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+impl JobRecordStore for LoseLeaseOnStarting {
+    fn create_job(
+        &self,
+        record: harw_job_core::StoredJob,
+    ) -> harw_job_store::StoreResult<harw_job_core::StoredJob> {
+        self.store.create_job(record)
+    }
+    fn claim_job(
+        &self,
+        job: &WorkId,
+        runner: &RunnerId,
+        terms: ClaimTerms,
+    ) -> harw_job_store::StoreResult<JobClaim> {
+        self.store.claim_job(job, runner, terms)
+    }
+    fn transition(
+        &self,
+        claim: &JobClaim,
+        transition: JobTransition,
+    ) -> harw_job_store::StoreResult<harw_job_core::StoredJob> {
+        self.store.transition(claim, transition)
+    }
+    fn load_recovery_set(
+        &self,
+        runner: &RunnerId,
+    ) -> harw_job_store::StoreResult<Vec<harw_job_core::StoredJob>> {
+        self.store.load_recovery_set(runner)
+    }
+}
+
+impl CoordinatorStore for LoseLeaseOnStarting {
+    fn load_job(&self, job: &WorkId) -> harw_job_store::StoreResult<harw_job_core::StoredJob> {
+        if let Some(gate) = &self.gate
+            && gate.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            gate.reached.notify_one();
+            let released = gate
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (released, _) = gate
+                .release
+                .wait_timeout_while(released, LIMIT, |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !*released {
+                return Err(harw_job_store::StoreError::Unsupported {
+                    operation: "test start guard",
+                    detail: "guard was not released".into(),
+                });
+            }
+        }
+        self.store.load_job(job)
+    }
+    fn claim_existing_job(
+        &self,
+        expected: harw_job_core::StoredJob,
+        runner: &RunnerId,
+        terms: ClaimTerms,
+    ) -> harw_job_store::StoreResult<JobClaim> {
+        self.store.claim_existing_job(expected, runner, terms)
+    }
+    fn write_attempt(&self, attempt: &str, bytes: &[u8]) -> harw_job_store::StoreResult<()> {
+        self.store.write_attempt(attempt, bytes)?;
+        let attempt_record: AttemptRecord<LinuxRecoveryIdentity> = serde_json::from_slice(bytes)
+            .map_err(|error| harw_job_store::StoreError::Corrupt {
+                id: attempt.to_owned(),
+                detail: error.to_string(),
+            })?;
+        if attempt_record.state == LifecycleState::Starting {
+            if let Some(gate) = &self.gate {
+                gate.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(());
+            }
+            self.store
+                .records()
+                .update_locked(attempt_record.job_id.as_str(), |record| {
+                    if self.revoke {
+                        record.lease = None;
+                    } else if let Some(lease) = record.lease.as_mut() {
+                        lease.expires_at = Timestamp::now();
+                    }
+                    Ok::<(), harw_job_store::StoreError>(())
+                })?;
+        }
+        Ok(())
+    }
+    fn read_attempt(&self, attempt: &str) -> harw_job_store::StoreResult<Option<Vec<u8>>> {
+        self.store.read_attempt(attempt)
+    }
+}
+
+#[tokio::test]
+async fn lease_lost_during_starting_refuses_spawn_and_preserves_recovery_record() -> TestResult {
+    for revoke in [false, true] {
+        let fixture = Fixture::new()?;
+        let owner = runner("pre-start-lease")?;
+        let initial =
+            fixture.coordinator(&owner, fixture.shim_options(), Duration::from_secs(3))?;
+        let record = initial
+            .new_record(&sh("printf unexpected > stale-launch")?, Timestamp::now())
+            .map_err(ctx("new record"))?;
+        let work_id = record.job.id.clone();
+        initial
+            .store()
+            .create_job(record)
+            .map_err(ctx("persist admission"))?;
+        let coordinator = Coordinator::new(
+            LoseLeaseOnStarting {
+                store: fixture.store()?,
+                revoke,
+                gate: None,
+            },
+            LinuxExecutor::new(fixture.shim_options()).map_err(ctx("executor"))?,
+            CoordinatorConfig::new(owner, fixture.workspace())
+                .with_lease_ttl(Duration::from_secs(3)),
+        )
+        .map_err(ctx("coordinator"))?;
+        let handle = coordinator
+            .start_existing(&work_id)
+            .await
+            .map_err(ctx("dispatch"))?;
+        let attempt_id = handle.attempt_id().clone();
+        let result = tokio::time::timeout(LIMIT, handle.wait())
+            .await
+            .map_err(ctx("dispatch timeout"))?;
+        assert!(matches!(result, Err(super::RuntimeError::LeaseLost(_))));
+        assert!(!fixture.workspace().join("stale-launch").exists());
+        let current = coordinator
+            .store()
+            .load_job(&work_id)
+            .map_err(ctx("unfinalized record"))?;
+        assert_eq!(current.job.state, JobState::Running);
+        assert!(current.completion.is_none());
+        let attempt = read_attempt(&coordinator.store().store, attempt_id.as_str())?
+            .ok_or(TestError::Missing("Starting attempt"))?;
+        assert_eq!(attempt.state, LifecycleState::Starting);
+        assert!(attempt.identity.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_during_pre_start_read_prevents_executor_invocation() -> TestResult {
+    let fixture = Fixture::new()?;
+    let owner = runner("cancel-before-executor")?;
+    let initial = fixture.coordinator(&owner, fixture.shim_options(), Duration::from_secs(30))?;
+    let record = initial
+        .new_record(
+            &sh("printf unexpected > cancelled-launch")?,
+            Timestamp::now(),
+        )
+        .map_err(ctx("new record"))?;
+    let work_id = record.job.id.clone();
+    initial
+        .store()
+        .create_job(record)
+        .map_err(ctx("persist admission"))?;
+    let gate = std::sync::Arc::new(StartReadGate::default());
+    let coordinator = Coordinator::new(
+        LoseLeaseOnStarting {
+            store: fixture.store()?,
+            revoke: false,
+            gate: Some(std::sync::Arc::clone(&gate)),
+        },
+        LinuxExecutor::new(fixture.shim_options()).map_err(ctx("executor"))?,
+        CoordinatorConfig::new(owner, fixture.workspace()).with_lease_ttl(Duration::from_secs(30)),
+    )
+    .map_err(ctx("coordinator"))?;
+    let handle = coordinator
+        .start_existing(&work_id)
+        .await
+        .map_err(ctx("dispatch"))?;
+    tokio::time::timeout(LIMIT, gate.reached.notified())
+        .await
+        .map_err(ctx("guard not reached"))?;
+    handle.cancel();
+    *gate
+        .released
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    gate.release.notify_one();
+    let result = wait(handle).await?;
+    assert_eq!(result.state, LifecycleState::Cancelled);
+    assert!(!fixture.workspace().join("cancelled-launch").exists());
+    assert_eq!(
+        coordinator
+            .store()
+            .load_job(&work_id)
+            .map_err(ctx("cancelled record"))?
+            .job
+            .state,
+        JobState::Cancelled
+    );
     Ok(())
 }

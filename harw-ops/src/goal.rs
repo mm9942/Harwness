@@ -841,6 +841,9 @@ fn verification_label(step: &VerificationStep) -> String {
         }
         VerificationStep::Artifact { path } => format!("artifact '{path}'"),
         VerificationStep::TraceEvent { name } => format!("trace '{name}'"),
+        VerificationStep::CollectSources { sources } => {
+            format!("collect admitted sources: {}", sources.join(", "))
+        }
         VerificationStep::Manual { note } => format!("manual '{note}'"),
     }
 }

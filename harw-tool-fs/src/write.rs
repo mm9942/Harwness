@@ -124,6 +124,20 @@ struct FsWriteArgs {
 pub struct FsWriteExecutor;
 
 impl FsWriteExecutor {
+    /// Descriptive activity metadata of `fs.write` (PL-71, PL-97 M2), written by
+    /// hand in the form `#[harw_macros::tool(activity(...))]` generates: domain
+    /// `filesystem`, verb `write`, resource field `path`, effect `mutate`.
+    ///
+    /// It grants, implies or checks no permission and is not part of the
+    /// model-facing `ToolSpec`.
+    pub const ACTIVITY: Option<harw_tools::ActivityDescriptor> =
+        Some(harw_tools::ActivityDescriptor::new(
+            "filesystem",
+            "write",
+            Some("path"),
+            harw_tools::Effect::Mutate,
+        ));
+
     /// Führt den Schreib-Vorgang synchron (blockierend) aus.
     ///
     /// # Errors
@@ -135,12 +149,14 @@ impl FsWriteExecutor {
         call: &ToolCall,
     ) -> Result<ToolOutput, ToolsError> {
         // Permission check — fail closed
-        if let Some(err) = harw_tools::sandbox_guard::require_permission(
-            ctx,
-            Permission::WriteWorkspace,
-            "fs.write",
-        ) {
-            return Ok(err);
+        if !ctx
+            .sandbox()
+            .permissions()
+            .contains(Permission::WriteWorkspace)
+        {
+            return Ok(ToolOutput::error(
+                "fs.write denied: WriteWorkspace permission missing",
+            ));
         }
 
         // Parse arguments
@@ -174,6 +190,13 @@ impl FsWriteExecutor {
                     )));
                 }
             };
+        // Scope applies to the resolved destination, not the spelling of an
+        // in-workspace symlink supplied by the model.
+        if let Some(denied) =
+            harw_tools::sandbox_guard::require_file_write(ctx, &relative, "fs.write")
+        {
+            return Ok(denied);
+        }
         if let Some(protected) = protected_component(&relative) {
             return Ok(ToolOutput::error(format!(
                 "fs.write: '{}' liegt im geschützten Bereich '{protected}/' und wird nicht \
@@ -271,6 +294,67 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
+    #[test]
+    fn abgebrochener_write_behaelt_guard_bis_zum_dateieffekt() -> TestResult {
+        use std::sync::mpsc;
+        use std::task::{Context, Poll, Waker};
+        use std::time::Duration;
+
+        struct ReleaseSignal(mpsc::Sender<()>);
+        impl Drop for ReleaseSignal {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let fixture = Fixture::new()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()?;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        // Besetze den einzigen Blocking-Thread: der echte fs.write-Aufruf
+        // wird garantiert eingereiht, bevor sein Future verworfen wird.
+        let blocker = runtime.spawn_blocking(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(ctx("blocker started"))?;
+        let context = fixture
+            .ctx(vec![Permission::WriteWorkspace])?
+            .with_lifetime_guard(Some(harw_tools::ToolLifetimeGuard::new(Box::new(
+                ReleaseSignal(dropped_tx),
+            ))));
+        let call = call(
+            "fs.write",
+            serde_json::json!({"path": "after-abort.txt", "content": "effect"}),
+        );
+        runtime.block_on(async {
+            let executor = FsWriteExecutor;
+            let mut future = executor.execute(&context, &call);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+            drop(future);
+        });
+        drop(context);
+        let retained = matches!(dropped_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(!fixture.ws.join("after-abort.txt").exists());
+        release_tx.send(()).map_err(ctx("release blocker"))?;
+        runtime.block_on(blocker).map_err(ctx("join blocker"))?;
+        dropped_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(ctx("effect guard released"))?;
+        assert!(retained, "guard released while real write was queued");
+        assert_eq!(
+            fs::read_to_string(fixture.ws.join("after-abort.txt"))?,
+            "effect"
+        );
+        Ok(())
+    }
+
     fn make_sandbox_with_permissions(
         root: &Path,
         permissions: Vec<Permission>,
@@ -305,6 +389,63 @@ mod tests {
             name: harw_tools::spec::ToolName::new("fs.write"),
             arguments: args,
         }
+    }
+
+    #[test]
+    fn exact_scope_refuses_mutation_until_topology_isolation_exists() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::write(fixture.ws.join("owned.rs"), "old")?;
+        fs::write(fixture.ws.join("neighbor.rs"), "foreign")?;
+        std::os::unix::fs::symlink("neighbor.rs", fixture.ws.join("alias.rs"))?;
+        let scoped = fixture.scoped_writer(&["owned.rs", "alias.rs"])?;
+        for path in ["neighbor.rs", "alias.rs", "new.rs"] {
+            let output = FsWriteExecutor.write_file(
+                &scoped,
+                &make_call(serde_json::json!({
+                    "path": path, "content": "must not write"
+                })),
+            )?;
+            assert!(matches!(output, ToolOutput::Error { .. }), "path {path}");
+        }
+        assert_eq!(
+            fs::read_to_string(fixture.ws.join("neighbor.rs"))?,
+            "foreign"
+        );
+        assert!(!fixture.ws.join("new.rs").exists());
+        let output = FsWriteExecutor.write_file(
+            &scoped,
+            &make_call(serde_json::json!({
+                "path": "owned.rs", "content": "owned change"
+            })),
+        )?;
+        match output {
+            ToolOutput::Error { message } => assert!(message.contains("isolated writer backend")),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "scoped write must fail closed: {other:?}"
+                )));
+            }
+        }
+        assert_eq!(fs::read_to_string(fixture.ws.join("owned.rs"))?, "old");
+        // An admitted path with no parent must still reach the backend denial,
+        // not an attempted parent open or an unsafe path-based fallback.
+        let scoped = fixture.scoped_writer(&["missing/new.rs"])?;
+        let output = FsWriteExecutor.write_file(
+            &scoped,
+            &make_call(serde_json::json!({
+                "path": "missing/new.rs", "content": "must not create"
+            })),
+        )?;
+        match output {
+            ToolOutput::Error { message } => assert!(message.contains("isolated writer backend")),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "scoped creation must fail closed: {other:?}"
+                )));
+            }
+        }
+        assert!(!fixture.ws.join("missing").exists());
+        Ok(())
     }
 
     #[test]

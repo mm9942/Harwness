@@ -60,7 +60,7 @@ async fn run_one(index: usize) -> TestResult {
     let mut command = Command::new("sh");
     command
         .arg("-c")
-        .arg(if index % 2 == 0 {
+        .arg(if index.is_multiple_of(2) {
             "echo out; echo err >&2; exit 3"
         } else {
             "echo ready; exec sleep 30"

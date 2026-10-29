@@ -1,0 +1,22 @@
+# job-lifecycle@1: job.start is keyed by its call id until the result names the
+# WorkId (rebase Call(c1) -> Job(W1), same projection). status/logs/wait and the
+# run itself update that one instance until the run is terminal. A second job
+# (W2) never merges with W1; a call on W1 after its end stays standalone.
+{"ingest_seq":1,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c1"},"lifecycle":"started"}
+{"ingest_seq":2,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c1"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":3,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c1"},"lifecycle":{"rebase":{"to":{"job":"W1"}}}}
+{"ingest_seq":4,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"job","verb":"status","resource_field":"work_id","effect":"observe"},"resource":{"job":"W1"},"lifecycle":"started"}
+{"ingest_seq":5,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"job","verb":"status","resource_field":"work_id","effect":"observe"},"resource":{"job":"W1"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":6,"owner":{"session":"root"},"descriptor":{"domain":"job","verb":"run","effect":"execute"},"resource":{"job":"W1"},"lifecycle":"progress"}
+{"ingest_seq":7,"owner":{"session":"root","turn":1,"call":"c3"},"descriptor":{"domain":"job","verb":"logs","resource_field":"work_id","effect":"observe"},"resource":{"job":"W1"},"lifecycle":"started"}
+{"ingest_seq":8,"owner":{"session":"root","turn":1,"call":"c3"},"descriptor":{"domain":"job","verb":"logs","resource_field":"work_id","effect":"observe"},"resource":{"job":"W1"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":9,"owner":{"session":"root","turn":1,"call":"c4"},"descriptor":{"domain":"job","verb":"wait","resource_field":"work_id","effect":"observe"},"resource":{"job":"W1"},"lifecycle":"started"}
+{"ingest_seq":10,"owner":{"session":"root","turn":1,"call":"c5"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c5"},"lifecycle":"started"}
+{"ingest_seq":11,"owner":{"session":"root","turn":1,"call":"c5"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c5"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":12,"owner":{"session":"root","turn":1,"call":"c5"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"c5"},"lifecycle":{"rebase":{"to":{"job":"W2"}}}}
+# the job runtime reports the terminal state of W1
+{"ingest_seq":13,"owner":{"session":"root"},"descriptor":{"domain":"job","verb":"run","effect":"execute"},"resource":{"job":"W1"},"lifecycle":"finished","outcome":{"failed":{"class":"exit-1"}}}
+{"ingest_seq":14,"owner":{"session":"root","turn":1,"call":"c4"},"descriptor":{"domain":"job","verb":"wait","resource_field":"work_id","effect":"observe"},"resource":{"job":"W1"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":15,"owner":{"session":"root","turn":1,"call":"c6"},"descriptor":{"domain":"job","verb":"logs","resource_field":"work_id","effect":"observe"},"resource":{"job":"W1"},"lifecycle":"started"}
+{"ingest_seq":16,"owner":{"session":"root","turn":1,"call":"c6"},"descriptor":{"domain":"job","verb":"logs","resource_field":"work_id","effect":"observe"},"resource":{"job":"W1"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":17,"owner":{"session":"root"},"descriptor":{"domain":"job","verb":"run","effect":"execute"},"resource":{"job":"W2"},"lifecycle":"finished","outcome":"succeeded"}

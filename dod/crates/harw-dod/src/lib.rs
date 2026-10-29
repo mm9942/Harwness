@@ -1,8 +1,15 @@
-//! Fassade des Verteidigungssubsystems (DoD) — der einzige Name, den der
-//! Rest des Workspaces vom DoD-Teilbaum kennt (Knoten **AW6-09**).
+//! Fassade des Verteidigungssubsystems Harw-DoD (Detect · Orient · Defend)
+//! — der einzige Name, den der Rest des Workspaces vom DoD-Teilbaum kennt
+//! (Knoten **AW6-09**). „Harw-DoD" ist der Name der Suite, `harw-dod` der
+//! dieser Crate (siehe `docs/design/harw-dod-charter.md` §2).
 //!
 //! # Warum dieser Knoten existiert
-//! Der DoD-Teilbaum umfasst 27 Crates: vier Zugriffs-/Datenvokabular-
+//! Der DoD-Teilbaum (`dod/crates/`) umfasst 34 Crates: diese Fassade, die
+//! vier Binaries (`harw-sentinel`, `harw-probe-fs`, `harw-probe-bpf`,
+//! `harw-warden`), den gemeinsamen Systemkonfigurationsvertrag
+//! (`harw-dod-config`), den Container-Sensor `harw-dod-container`, die
+//! Krypto-Semantik `harw-dod-encrypt` (für diese Fassade bewusst
+//! unerreichbar, siehe unten), vier Zugriffs-/Datenvokabular-
 //! Grundlagen (`harw-dod-cap`, `harw-dod-signals`, `harw-dod-readfs`,
 //! `harw-dod-fixtures`), dreizehn Crates, die `trait Sensor` implementieren
 //! (`-cpu`, `-thermal`, `-memory`, `-blockio`, `-netcounters`, `-gpu`,
@@ -78,7 +85,8 @@
 //!   [`ScanReportSensor`], [`REPORT_HARDNESS`], [`WorkspaceDriftSensor`].
 //!   Ausgewählt über `xtask/src/gate_privileges.rs`s `CRATE_PRIVILEGE`-
 //!   Tabelle: neun der zehn dort als `RequiredPrivilege::Unprivileged`
-//!   geführten Sensor-Crates (die zehnte ist `harw-dod-cgroup`, siehe unten).
+//!   geführten Sensor-Crates (die zehnte ist `harw-dod-cgroup`, siehe unten
+//!   und „Bekannte Lücke").
 //!   **Nein** — `harw_dod_workspace::{Inventory, Edge, StructureChange,
 //!   VersionSeverity, classify_version_change, WorkspaceError,
 //!   WorkspaceResult}`: internes Analysevokabular, mit dem
@@ -87,10 +95,9 @@
 //!   (`baseline: Option<Inventory>`) lässt sich mit `None` befüllen, ohne
 //!   `Inventory` je zu benennen — wie `harw-lens` bei `ByteSpan` bleibt
 //!   dieser Typ innerhalb der einen Crate, die ihn braucht.
-//!   **Nein — `harw-dod-cgroup`**: Gerüst aus Knoten AW0-00, Inhalt entsteht
-//!   erst in Knoten AW2-13. Es gibt noch keinen gelandeten Namen, den diese
-//!   Fassade auswählen oder verschweigen könnte — eine Lücke, kein
-//!   vergessener Fall (siehe „Bekannte Lücke" unten).
+//!   **Noch nicht — `harw-dod-cgroup`**: inzwischen implementiert
+//!   (`CgroupSensor`, von `harw-sentinel` registriert), aber noch nicht in
+//!   diese Fassade aufgenommen (siehe „Bekannte Lücke" unten).
 //!
 //! ## „Bewerte einen Befund" ([`harw_dod_rules`])
 //! [`run_rules`], [`run_rules_checked`], [`Rule`], [`RuleContext`], die drei mitgelieferten Regeln
@@ -257,11 +264,13 @@
 //! ```
 //!
 //! # Bekannte Lücke
-//! `harw-dod-cgroup` ist zum Zeitpunkt dieses Knotens noch ein leeres
-//! Gerüst (kein `pub`-Item außer der Moduldoku). Sobald AW2-13 landet, ist
-//! zu prüfen, ob `CgroupSensor` (oder wie der konkrete Typ dann heißt) den
-//! Kriterien oben genügt — voraussichtlich ja, analog zu den neun bereits
-//! aufgenommenen Sensoren. Das ist bewusst nicht Teil dieses Knotens.
+//! `harw-dod-cgroup` is no longer an empty scaffold: AW2-13 landed
+//! `CgroupSensor` (cgroup v2 `memory.current`/`memory.max`, `pids.current`,
+//! `cpu.stat` for the direct children of its scope root), and
+//! `harw-sentinel` registers it. Whether `CgroupSensor` meets the admission
+//! criteria above — most likely yes, like the nine sensors already admitted
+//! — is an open decision for a later change; this facade does not
+//! re-export it yet.
 //!
 //! # Nebenläufigkeit
 //! Alle Typen dieser Fassade sind entweder reine Daten oder — wie

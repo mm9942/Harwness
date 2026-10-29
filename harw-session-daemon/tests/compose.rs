@@ -36,6 +36,15 @@ struct CountingDriver {
 }
 
 impl TurnDriver for CountingDriver {
+    // This test double performs no privileged runtime/tool effects.
+    fn prepare_execution(
+        &self,
+        _: &harw_types::SessionId,
+        _: harw_session_host::driver::ExecutionAdmission,
+    ) -> harw_session_host::driver::DriverFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn create_session(&self, _: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
         self.created.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
@@ -136,15 +145,14 @@ where
         let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
             .await?
             .ok_or("closed")??;
-        if let Message::Text(text) = message {
-            if let WireMessage::Response(response) = serde_json::from_str(text.as_str())? {
-                if response.id == id {
-                    if let Some(error) = response.error {
-                        return Err(format!("{error:?}").into());
-                    }
-                    return Ok(());
-                }
+        if let Message::Text(text) = message
+            && let WireMessage::Response(response) = serde_json::from_str(text.as_str())?
+            && response.id == id
+        {
+            if let Some(error) = response.error {
+                return Err(format!("{error:?}").into());
             }
+            return Ok(());
         }
     }
 }

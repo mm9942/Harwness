@@ -3625,6 +3625,8 @@ async fn run_turn_with_approvals(
             }
         };
         *session.history_mut() = history;
+        // PL-97 H7: wie `hydrate_from_store` auch den Skill-Injektor.
+        session.restore_skill_injector_from_store(store).await;
     }
 
     // User-Input in den Verlauf spielen und persistieren.
@@ -4224,6 +4226,7 @@ async fn resume_after_approval_with_store(
                                     control.cancel_token(),
                                 ) {
                                     Ok(execution_context) => {
+                                        let execution_context = execution_context.with_lifetime_guard(permit.lifetime_guard());
                                         let started = std::time::Instant::now();
                                         let (outcome, placement) = tokio::select! {
                                             biased;
@@ -4720,11 +4723,10 @@ async fn drive_turn(
                 crate::auto_compact::CompactDecision::Emergency,
             )
             .await
+                && !outcome.no_op
             {
-                if !outcome.no_op {
-                    last_compaction_tokens_after = Some(outcome.tokens_after);
-                    continue;
-                }
+                last_compaction_tokens_after = Some(outcome.tokens_after);
+                continue;
             }
         }
         // (b) `MaxTokens` mitten in Tool-Calls: die Argumente sind
@@ -4757,6 +4759,12 @@ async fn drive_turn(
         context_retry_used = false;
         max_tokens_retry_used = false;
         max_output_override = None;
+        // PL-95 S3: die Skill-Auszüge dieses Requests haben das Modell
+        // erreicht — erst jetzt gilt eine Auswahl als Lieferung. Ein vorher
+        // verworfener Request (Neubau nach Notfall-Verdichtung, Wiederholung
+        // nach Kontextüberschreitung) hinterlässt so kein Ereignis, und jede
+        // Lieferung wird genau einmal festgehalten.
+        record_skill_injections(session, store, &handle.turn_id).await;
         // Ab hier angehängte Tool-Ergebnisse sind in `last_round_usage`
         // noch nicht enthalten — `maybe_compact` schätzt sie ab dieser Marke.
         history_mark = session.history().len();
@@ -4958,18 +4966,18 @@ async fn drive_turn(
 
         // Werkzeug-Budget vor dem Dispatch: höchstens den Rest ausführen.
         over_tool_budget = control.split_over_tool_budget(&mut response.tool_calls);
-        if response.tool_calls.is_empty() {
-            if let Some((calls, message)) = over_tool_budget.take() {
-                return skip_calls_over_tool_budget(
-                    session,
-                    store,
-                    handle,
-                    total_usage,
-                    calls,
-                    &message,
-                )
-                .await;
-            }
+        if response.tool_calls.is_empty()
+            && let Some((calls, message)) = over_tool_budget.take()
+        {
+            return skip_calls_over_tool_budget(
+                session,
+                store,
+                handle,
+                total_usage,
+                calls,
+                &message,
+            )
+            .await;
         }
 
         // Prüfpunkt vor jeder Werkzeugausführung: Abbruch, Aufrufzahl, Wanduhr.
@@ -5403,6 +5411,7 @@ async fn drive_turn(
                             control.cancel_token(),
                         ) {
                             Ok(execution_context) => {
+                                let execution_context = execution_context.with_lifetime_guard(permit.lifetime_guard());
                                 let started = std::time::Instant::now();
                                 // Fix B (Moduldoku „Siebter Nachtrag"): racet
                                 // den Aufruf selbst gegen `control`s
@@ -5872,6 +5881,13 @@ impl RoundBudget {
 /// Runde [`AgentSession::max_output_tokens`] (Wiederholung mit verdoppeltem
 /// Limit).
 ///
+/// PL-95 S3: die getriggerten Skill-Auszüge der Sitzung
+/// ([`crate::skill_injection::SkillInjector`]) kommen als Fragmente der
+/// Sektion `skills.triggered` hinter den cache-stabilen Präfix (siehe
+/// [`prepare_skill_injection`] und [`append_skill_blocks`]). Festgehalten
+/// (`injection`-Ereignis) werden sie erst, wenn das Modell den Request
+/// beantwortet hat ([`record_skill_injections`] in `drive_turn`).
+///
 /// # Errors
 /// Fehler von [`collect_tools`] und der Kontextmontage
 /// ([`ModelRequest::with_context_program`]).
@@ -5906,8 +5922,14 @@ async fn assemble_round_request(
             None => tracing::warn!("turn_loop.wrap_up_fragment_unavailable"),
         }
     }
-    let instructions = load_instructions(session).await;
+    // PL-95 S3: getriggerte Skill-Auszüge dieser Runde (aus den seit der
+    // letzten Runde angehängten Verlaufs-Items).
+    let skill_fragments = prepare_skill_injection(session)
+        .map(|round| round.fragments)
+        .unwrap_or_default();
+    let mut instructions = load_instructions(session).await;
     let mut tools = collect_tools(session)?;
+    let mut workflow_delegation_available = false;
 
     // Nachtrag F (Delegationsprojektion): EIN deterministischer
     // Kontextblock, NACH den Tools angehängt (stabiler Teil — die Liste
@@ -5930,6 +5952,7 @@ async fn assemble_round_request(
             Ok(delegation) => {
                 append_handoff_tools(session, &mut tools, &delegation.targets);
                 let names = delegation.names();
+                workflow_delegation_available = !names.is_empty();
                 restrict_delegate_wave_roles(&mut tools, &names);
                 let via_delegate_tool =
                     tools.iter().any(|spec| spec.name() == AGENTS_DELEGATE_TOOL);
@@ -5954,6 +5977,26 @@ async fn assemble_round_request(
         }
     }
 
+    // Workflow guidance is derived from the final tool surface, not the
+    // baseline identity captured before composition. Static text only: no
+    // repository content or user text is promoted to instruction trust. The
+    // same admitted tool set/mode produces identical bytes for prompt caches.
+    // This guidance neither grants authority nor changes organization routing.
+    if session.activation().is_instructions_enabled("workflow") {
+        let names: Vec<&str> = tools
+            .iter()
+            .map(ToolSpec::name)
+            .filter(|name| *name != "delegate_wave" || workflow_delegation_available)
+            .collect();
+        let workflow = harw_instructions::workflow_capabilities(
+            &names,
+            session.mode() == crate::mode::InteractionMode::Plan,
+        );
+        if !workflow.is_empty() {
+            instructions.fragments.push(workflow);
+        }
+    }
+
     // Programm- und Decken-bewusste Montage (siehe
     // `ModelRequest::with_context_program`s Moduldoku, Abschnitt „Zwei
     // Wege zur Kontextmontage"): läuft nur, wenn die Sitzung **beide**
@@ -5971,12 +6014,14 @@ async fn assemble_round_request(
 
     // Kontext-Ledger: die Fakten der gesammelten Fragmente festhalten, bevor
     // die Montage sie verbraucht (nur wenn ein Ledger registriert ist).
-    let ledger_facts = session
-        .context_ledger()
-        .map(|_| crate::context_ledger_hook::snapshot(&fragments));
+    let ledger_facts = session.context_ledger().map(|_| {
+        let mut facts = crate::context_ledger_hook::snapshot(&fragments);
+        facts.extend(crate::context_ledger_hook::snapshot(&skill_fragments));
+        facts
+    });
 
     // 4. Model-Call (provider-neutral).
-    let request = ModelRequest::with_context_program(
+    let mut request = ModelRequest::with_context_program(
         instructions,
         fragments,
         session.history().clone(),
@@ -5992,6 +6037,19 @@ async fn assemble_round_request(
     .with_max_output_tokens(max_output_tokens)
     .with_cancel_token(control.cancel_token().clone())
     .with_identity(request_identity(session));
+    // PL-95 S3: die Auszüge hinter den cache-stabilen Präfix; danach trägt
+    // der Injektor nur noch, was dieser Request tatsächlich enthält.
+    let skill_labels = match ceiling {
+        Some(ceiling) if !skill_fragments.is_empty() => {
+            append_skill_blocks(&mut request, skill_fragments, program, ceiling)
+        }
+        _ => Vec::new(),
+    };
+    if let Some(injector) = session.skill_injector() {
+        for label in injector.reconcile(&skill_labels) {
+            tracing::debug!(%label, "skills.triggered.omitted");
+        }
+    }
     if let (Some(ledger), Some(facts)) = (session.context_ledger(), ledger_facts.as_deref()) {
         crate::context_ledger_hook::record_turn(
             ledger.as_ref(),
@@ -6005,6 +6063,229 @@ async fn assemble_round_request(
         Some(sink) => request.with_stream_sink(sink),
         None => request,
     })
+}
+
+/// Bereitet die getriggerten Skill-Auszüge einer Runde vor (PL-95 S3).
+///
+/// # Description
+/// `None`, wenn die Sitzung keinen [`crate::skill_injection::SkillInjector`]
+/// trägt oder die Sektion `skills.triggered` nicht zustellen kann
+/// (Aktivierung aus, keine Kontext-Decke, Decke ohne die Sektion) —
+/// fail-closed: dann wird gar nicht erst ausgewählt, und noch aktive Auszüge
+/// verlassen den Kontext. Ein Fragment, dessen Label die Aktivierung
+/// abschaltet, verwirft schon der Injektor; es belegt weder Dedupe noch
+/// Sitzungsbudget.
+fn prepare_skill_injection(
+    session: &AgentSession,
+) -> Option<crate::skill_injection::RoundInjection> {
+    let injector = session.skill_injector()?;
+    let activation = session.activation();
+    let deliverable = activation.is_context_enabled(harw_catalog::FRAGMENT_SECTION)
+        && session
+            .spawn_context()
+            .and_then(|spawn_context| spawn_context.ceiling.as_ref())
+            .is_some_and(|ceiling| {
+                harw_context::SectionName::try_new(harw_catalog::FRAGMENT_SECTION)
+                    .is_ok_and(|section| ceiling.sections.contains(&section))
+            });
+    if !deliverable {
+        for label in injector.reconcile(&[]) {
+            tracing::debug!(%label, "skills.triggered.undeliverable");
+        }
+        return None;
+    }
+    let window_tokens = RoundBudget::of(session).window_tokens;
+    let round = injector.prepare_round_with(session.history(), window_tokens, |fragment| {
+        activation.is_context_enabled(fragment.label.as_str())
+    });
+    for delivered in &round.delivered {
+        tracing::debug!(
+            skill = %delivered.skill,
+            section = delivered.section.as_deref().unwrap_or(""),
+            kind = delivered.kind.as_str(),
+            key = %delivered.key,
+            bytes = delivered.bytes,
+            "skills.triggered.selected"
+        );
+    }
+    for dropped in &round.dropped {
+        tracing::debug!(
+            skill = %dropped.skill,
+            section = dropped.section.as_deref().unwrap_or(""),
+            reason = %dropped.reason,
+            "skills.triggered.dropped"
+        );
+    }
+    for skill in &round.suppressed {
+        tracing::debug!(%skill, "skills.triggered.imported_suppressed");
+    }
+    for label in &round.withheld {
+        tracing::debug!(%label, "skills.triggered.withheld");
+    }
+    for label in &round.evicted {
+        tracing::debug!(%label, "skills.triggered.evicted");
+    }
+    Some(round)
+}
+
+/// Hält jede Skill-Lieferung des eben beantworteten Requests als
+/// `injection`-Ereignis fest (PL-95 S3), genau einmal je Lieferung.
+///
+/// Die Antwort macht jeden noch unbeantworteten aktiven Auszug zur
+/// Lieferung ([`crate::skill_injection::SkillInjector::mark_answered`], mit
+/// `turn_id` als Herkunft). Bestätigt ist eine Lieferung erst, wenn ihr
+/// Ereignis dauerhaft angehängt ist
+/// ([`crate::skill_injection::SkillInjector::pending_deliveries`], danach
+/// [`crate::skill_injection::SkillInjector::confirm_recorded`]). Ein
+/// Store-Fehler wird nur geloggt — die Messung darf den Turn nie abbrechen —
+/// und die Lieferung bleibt offen: die nächste beantwortete Runde hängt sie
+/// erneut an, mit der `turn_id` der ersten Antwort (PR #154).
+async fn record_skill_injections(
+    session: &AgentSession,
+    store: &dyn StateStore,
+    turn_id: &harw_types::TurnId,
+) {
+    let Some(injector) = session.skill_injector() else {
+        return;
+    };
+    injector.mark_answered(turn_id.as_str());
+    for pending in injector.pending_deliveries() {
+        let delivered = &pending.delivery;
+        let record = pending.to_record();
+        if let Err(error) = store.record_skill_injection(session.id(), &record).await {
+            // Offen lassen: die nächste beantwortete Runde versucht es erneut.
+            tracing::warn!(%error, skill = %delivered.skill, "turn_loop.skill_injection_record_failed");
+            continue;
+        }
+        injector.confirm_recorded(&pending);
+        tracing::info!(
+            skill = %delivered.skill,
+            section = delivered.section.as_deref().unwrap_or(""),
+            kind = delivered.kind.as_str(),
+            key = %delivered.key,
+            bytes = delivered.bytes,
+            "skills.triggered.injected"
+        );
+    }
+}
+
+/// Rendert die Skill-Auszüge einer Runde hinter den cache-stabilen Präfix
+/// (PL-95 S3).
+///
+/// # Description
+/// Die Auszüge laufen durch eine eigene Montage gegen das Kontextprogramm
+/// der Sitzung (`exclude`, `must_include`, Detailgrad; ohne Programm ein
+/// leeres) und ihre Decke (Sektion, Vertrauen, Sektionsbudget). Als
+/// Gesamtbudget bleibt, was die reguläre Montage von der Decke übrig lässt.
+///
+/// Platzierung: jeder Provider rendert `system_prompt` und danach
+/// `instruction_fragments` der Reihe nach. Der Instruktionsblock wird
+/// deshalb als **letztes** Element an [`ModelRequest::instruction_fragments`]
+/// gehängt — System-Prompt, gebundene Skill-Fragmente und L0-Katalog bleiben
+/// ein byte-identischer Präfix, auch wenn ein neuer Auszug hinzukommt. Der
+/// Datenblock (importierte Skills, `Evidence`) kommt in
+/// [`ModelRequest::data_block`] hinter den Verlauf. Ohne Programm liest kein
+/// Provider `ModelRequest::context` (F-016/G-023); dieser eine Weg gilt
+/// deshalb für beide Pfade. Ein Montagefehler wird geloggt; der Request
+/// bleibt dann ohne Auszüge.
+///
+/// # Returns
+/// Die Labels der aufgenommenen Auszüge.
+fn append_skill_blocks(
+    request: &mut ModelRequest,
+    fragments: Vec<harw_context::Fragment>,
+    program: Option<&harw_agent_dsl::executable::ContextProgram>,
+    ceiling: &harw_context::ContextCeiling,
+) -> Vec<String> {
+    let empty_program = harw_agent_dsl::executable::ContextProgram::default();
+    // Programmpfad: die reguläre Montage hat ihren Teil des Gesamtbudgets
+    // der Decke schon verbraucht (ohne Programm montiert sie nicht).
+    let spent = match program {
+        Some(_) => {
+            u32::try_from(request.context_assembly.estimated_context_bytes).unwrap_or(u32::MAX)
+        }
+        None => 0,
+    };
+    let budget = harw_context::ContextBudgetSpec {
+        total: harw_lens_types::BudgetSpec {
+            total: ceiling.budget.total.total.saturating_sub(spent),
+        },
+        per_section: ceiling.budget.per_section.clone(),
+    };
+    let assembled = match crate::context_budget::Assembly::gather(fragments)
+        .admit(program.unwrap_or(&empty_program), ceiling)
+        .and_then(|admitted| admitted.budget(&budget))
+    {
+        Ok(budgeted) => budgeted.render(),
+        Err(error) => {
+            tracing::warn!(%error, "turn_loop.skill_injection_montage_failed");
+            return Vec::new();
+        }
+    };
+    let included: Vec<&harw_context::Fragment> = assembled
+        .sections
+        .iter()
+        .flat_map(|section| section.fragments.iter())
+        .collect();
+    let instruction_rank = harw_context::TrustClass::Instruction.trust_rank();
+    let has_instruction = included
+        .iter()
+        .any(|fragment| fragment.trust.trust_rank() == instruction_rank);
+    let has_data = included
+        .iter()
+        .any(|fragment| fragment.trust.trust_rank() != instruction_rank);
+    let labels: Vec<String> = included
+        .iter()
+        .map(|fragment| fragment.label.as_str().to_owned())
+        .collect();
+    let detail = program
+        .map(crate::model::section_detail_map)
+        .unwrap_or_default();
+    let blocks = assembled.render_trust_blocks_with_detail(&harw_observe::NullSink, &detail);
+    if has_instruction {
+        request.instruction_fragments.push(blocks.instruction_block);
+    }
+    if has_data {
+        request.data_block = Some(match request.data_block.take() {
+            Some(mut existing) => {
+                existing.push_str("\n\n");
+                existing.push_str(&blocks.data_block);
+                existing
+            }
+            None => blocks.data_block,
+        });
+    }
+    let assembly = &mut request.context_assembly;
+    assembly
+        .included_fragment_labels
+        .extend(labels.iter().cloned());
+    assembly.estimated_context_bytes = assembly
+        .estimated_context_bytes
+        .saturating_add(assembled.spent.0 as usize);
+    for (label, reason) in &assembled.omissions {
+        let text = match reason {
+            harw_context::OmissionReason::OverBudget => "over-budget",
+            harw_context::OmissionReason::BelowCeiling => "below-ceiling",
+            harw_context::OmissionReason::ExcludedByProgram => "excluded-by-program",
+            harw_context::OmissionReason::Superseded => "superseded",
+        };
+        assembly
+            .omitted_fragment_labels
+            .push(label.as_str().to_owned());
+        assembly
+            .omission_reasons
+            .push((label.as_str().to_owned(), text.to_owned()));
+    }
+    labels
+}
+
+/// Setzt den Skill-Injektor der Sitzung nach einer echten Verdichtung zurück
+/// (PL-95 S3): gelieferte Auszüge dürfen erneut kommen, das Sitzungsbudget
+/// beginnt neu.
+fn reset_skill_injection_after_compaction(session: &AgentSession) {
+    if let Some(injector) = session.skill_injector() {
+        injector.reset_after_compaction();
+    }
 }
 
 /// Verdichtet die Historie auf ein Token-Ziel
@@ -6065,6 +6346,7 @@ async fn run_budget_compaction(
                 elided_results = outcome.elided_results,
                 "turn_loop.compaction_applied",
             );
+            reset_skill_injection_after_compaction(session);
             if let Err(error) = store.save_history(session.id(), session.history()).await {
                 tracing::warn!(%error, "turn_loop.compaction_save_history_failed");
             }
@@ -6201,6 +6483,9 @@ async fn maybe_hard_compact_at_turn_start(
                 summarized = outcome.summarized,
                 "turn_loop.turn_start_hard_compact_applied",
             );
+            if !outcome.no_op {
+                reset_skill_injection_after_compaction(session);
+            }
             if let Err(error) = store.save_history(session.id(), session.history()).await {
                 tracing::warn!(%error, "turn_loop.turn_start_hard_compact_save_history_failed");
             }
@@ -6255,12 +6540,11 @@ fn turn_completed_a_plan_step(session: &AgentSession) -> bool {
 fn json_contains_completed_status(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(map) => map.iter().any(|(key, nested)| {
-            if key == "status" {
-                if let serde_json::Value::String(status) = nested {
-                    if status == "completed" || status == "done" {
-                        return true;
-                    }
-                }
+            if key == "status"
+                && let serde_json::Value::String(status) = nested
+                && (status == "completed" || status == "done")
+            {
+                return true;
             }
             json_contains_completed_status(nested)
         }),
@@ -6645,7 +6929,9 @@ async fn try_execute_parallel_calls(
             }
             continue;
         };
-        let execution_context = execution_context.clone();
+        let execution_context = execution_context
+            .clone()
+            .with_lifetime_guard(permit.lifetime_guard());
         let tool_name = call.name.to_string();
         let tool_span = tracing::info_span!("tool.call", tool_name = %tool_name);
         let arguments_for_capture = call.arguments.clone();
@@ -7723,6 +8009,255 @@ mod tests {
     // ------------------------------------------------------------------
     // collect_tools filter tests
     // ------------------------------------------------------------------
+
+    async fn workflow_request(session: &AgentSession) -> TestResult<ModelRequest> {
+        let turn_id = harw_types::TurnId::new();
+        let input = TurnInputContext {
+            session_id: session.id().clone(),
+            turn_id: turn_id.clone(),
+            metadata: serde_json::Value::Null,
+        };
+        assemble_round_request(
+            session,
+            &input,
+            &TurnControl::new(),
+            &turn_id,
+            &harw_types::TokenUsage::default(),
+            None,
+            None,
+        )
+        .await
+        .map_err(ctx("assemble workflow request"))
+    }
+
+    #[tokio::test]
+    async fn workflow_uses_composed_tools_and_activation_at_request_time() -> TestResult {
+        // No baseline tool inventory: these tools arrive via registry composition.
+        let names = [
+            "fs.read",
+            "plan",
+            "work_driver.enqueue",
+            "work_driver.status",
+            "work_driver.stop",
+        ];
+        let full = make_session(
+            StubToolProvider::with_names(&names),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let request = workflow_request(&full).await?;
+        assert!(
+            request
+                .instruction_fragments
+                .iter()
+                .any(|text| text.contains("### Governed durable execution"))
+        );
+        let repeated = workflow_request(&full).await?;
+        assert_eq!(
+            request.instruction_fragments,
+            repeated.instruction_fragments
+        );
+
+        let mut activation = SessionActivation::new(ToolProfile::Full);
+        activation.disable_tool(ToolName::new("work_driver.enqueue"));
+        let disabled = make_session(StubToolProvider::with_names(&names), activation);
+        let request = workflow_request(&disabled).await?;
+        assert!(
+            !request
+                .instruction_fragments
+                .iter()
+                .any(|text| text.contains("### Governed durable execution"))
+        );
+        Ok(())
+    }
+
+    /// Exercise the merged request path, not the workflow/skill renderers in
+    /// isolation: triggered evidence must never join trusted workflow text.
+    #[tokio::test]
+    async fn workflow_and_skills_preserve_trust_ledger_and_cache_prefix() -> TestResult {
+        use crate::skill_injection::{SkillInjectionSettings, SkillInjector};
+        use harw_context::{ContextBudgetSpec, ContextCeiling, SectionName, TrustClass};
+        use harw_context_ledger::{LedgerKind, MemoryLedger};
+
+        let bundle = [
+            (
+                "skills/trusted/skill.toml",
+                "name = \"trusted\"\ndescription = \"Trusted fixture\"\n",
+            ),
+            (
+                "skills/trusted/triggers.toml",
+                "[triggers]\nkeywords = [\"merge fixture\"]\n",
+            ),
+            (
+                "skills/trusted/instructions.md",
+                "# Trusted\n\n## When to use\n\nBUNDLED_MERGE_MARKER\n",
+            ),
+            (
+                "skills/imported/skill.toml",
+                "name = \"imported\"\ndescription = \"Imported fixture\"\n",
+            ),
+            (
+                "skills/imported/triggers.toml",
+                "[triggers]\nkeywords = [\"merge fixture\"]\n",
+            ),
+            (
+                "skills/imported/instructions.md",
+                "# Imported\n\n## When to use\n\nIMPORTED_MERGE_MARKER\n",
+            ),
+        ];
+        let index = Arc::new(harw_catalog::SkillIndex::build_with_bundle(&[], &bundle));
+        for with_program in [false, true] {
+            let injector = Arc::new(
+                SkillInjector::new(
+                    Arc::clone(&index),
+                    SkillInjectionSettings {
+                        inject_imported: true,
+                        ..SkillInjectionSettings::default()
+                    },
+                )
+                .with_imported_skills(["imported"]),
+            );
+            let ledger = Arc::new(MemoryLedger::new());
+            let mut spawn = test_spawn_context()?;
+            spawn.ceiling = Some(ContextCeiling {
+                sections: harw_context::ceiling::ROOT_CONTEXT_SECTIONS
+                    .iter()
+                    .map(|name| SectionName::try_new(*name))
+                    .collect::<Result<_, _>>()?,
+                max_trust: TrustClass::Instruction,
+                budget: ContextBudgetSpec {
+                    total: harw_lens_types::BudgetSpec { total: 1_000_000 },
+                    per_section: Default::default(),
+                },
+            });
+            let mut session = make_session(
+                StubToolProvider::with_names(&[
+                    "fs.read",
+                    "plan",
+                    "work_driver.enqueue",
+                    "work_driver.status",
+                    "work_driver.stop",
+                ]),
+                SessionActivation::new(ToolProfile::Full),
+            )
+            .with_spawn_context(spawn)
+            .with_skill_injector(Some(injector))
+            .with_context_ledger(Some(ledger.clone()));
+            if with_program {
+                session = session.with_context_program(Default::default());
+            }
+            session.history_mut().push_user_text("hello");
+            let before = workflow_request(&session).await?;
+            assert!(
+                before
+                    .instruction_fragments
+                    .iter()
+                    .any(|text| { text.contains("### Governed durable execution") })
+            );
+            session.history_mut().push_user_text("merge fixture");
+            let injected = workflow_request(&session).await?;
+            let repeated = workflow_request(&session).await?;
+            assert_eq!(before.system_prompt, injected.system_prompt);
+            assert!(
+                injected
+                    .instruction_fragments
+                    .starts_with(&before.instruction_fragments)
+            );
+            assert_eq!(
+                injected.instruction_fragments,
+                repeated.instruction_fragments
+            );
+            assert_eq!(injected.data_block, repeated.data_block);
+            let instructions = injected.instruction_fragments.join("\n");
+            assert!(instructions.contains("BUNDLED_MERGE_MARKER"));
+            assert!(!instructions.contains("IMPORTED_MERGE_MARKER"));
+            assert!(!injected.system_prompt.contains("IMPORTED_MERGE_MARKER"));
+            assert!(
+                injected
+                    .data_block
+                    .as_deref()
+                    .is_some_and(|data| { data.contains("IMPORTED_MERGE_MARKER") })
+            );
+            for (label, trust) in [
+                ("skill:trusted", "instruction"),
+                ("skill:imported", "evidence"),
+            ] {
+                assert!(
+                    injected
+                        .context_assembly
+                        .included_fragment_labels
+                        .iter()
+                        .any(|value| value == label)
+                );
+                let entries: Vec<_> = ledger
+                    .entries()
+                    .into_iter()
+                    .filter(|entry| entry.label == label)
+                    .collect();
+                assert_eq!(
+                    entries.len(),
+                    2,
+                    "one record per assembled request: {label}"
+                );
+                assert!(entries.iter().all(|entry| {
+                    entry.kind == LedgerKind::Offered && entry.trust.as_deref() == Some(trust)
+                }));
+            }
+            let ledger_json = serde_json::to_string(&ledger.entries())?;
+            assert!(!ledger_json.contains("BUNDLED_MERGE_MARKER"));
+            assert!(!ledger_json.contains("IMPORTED_MERGE_MARKER"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_plan_mode_and_missing_spawner_do_not_advertise_execution() -> TestResult {
+        let names = [
+            "fs.read",
+            "fs.write",
+            "delegate_wave",
+            "plan",
+            "work_driver.enqueue",
+            "work_driver.status",
+            "work_driver.stop",
+        ];
+        let session = make_session(
+            StubToolProvider::with_names(&names),
+            SessionActivation::new(ToolProfile::Full),
+        )
+        .with_mode(crate::mode::InteractionMode::Plan);
+        let request = workflow_request(&session).await?;
+        let text = request.instruction_fragments.join("\n");
+        assert!(!text.contains("### Governed durable execution"));
+        assert!(!text.contains("### Direct implementation"));
+        assert!(!text.contains("### Parallel delegation"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_without_spawner_preserves_role_routing_and_can_be_disabled() -> TestResult {
+        let names = ["fs.read", "fs.write", "delegate_wave"];
+        let session = make_session(
+            StubToolProvider::with_names(&names),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let request = workflow_request(&session).await?;
+        let text = request.instruction_fragments.join("\n");
+        assert!(!text.contains("### Parallel delegation"));
+        assert!(text.contains("Organization routing rules take precedence"));
+        assert!(text.contains("missing delegation is a blocker"));
+
+        let mut activation = SessionActivation::new(ToolProfile::Full);
+        activation.disable_instructions("workflow");
+        let disabled = make_session(StubToolProvider::with_names(&names), activation);
+        let request = workflow_request(&disabled).await?;
+        assert!(
+            !request
+                .instruction_fragments
+                .iter()
+                .any(|text| text.contains("### Direct implementation"))
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_collect_tools_full_profile_includes_all() -> TestResult {
@@ -9231,10 +9766,14 @@ mod tests {
     impl ToolExecutor for FenceExecutor {
         fn execute<'a>(
             &'a self,
-            _ctx: &'a ToolExecutionContext,
+            ctx: &'a ToolExecutionContext,
             call: &'a ToolCall,
         ) -> ToolExecutorFuture<'a> {
             Box::pin(async move {
+                assert!(
+                    ctx.lifetime_guard().is_some(),
+                    "admitted guard must reach executor"
+                );
                 push_fence(&self.log, fence_labels(call.name.as_str()).0);
                 if let Some(barrier) = &self.barrier {
                     barrier.wait().await;
@@ -9303,6 +9842,189 @@ mod tests {
         fn parallel_safe(&self, name: &ToolName) -> bool {
             self.parallel && self.names.contains(name)
         }
+    }
+
+    /// Models the filesystem tools' spawn_blocking boundary. The outer tool
+    /// future may disappear, while this closure still owns execution context.
+    struct BlockingFenceProvider {
+        log: FenceLog,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        finished: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl ToolProvider for BlockingFenceProvider {
+        fn tools(&self) -> Vec<ToolSpec> {
+            ["alpha", "beta"]
+                .into_iter()
+                .map(|name| {
+                    ToolSpec::Function(FunctionToolSpec {
+                        name: ToolName::new(name),
+                        description: "blocking fence".to_owned(),
+                        parameters: JsonSchema::default(),
+                        strict: false,
+                    })
+                })
+                .collect()
+        }
+        fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+            matches!(name.as_str(), "alpha" | "beta").then(|| {
+                Arc::new(BlockingFenceExecutor {
+                    log: Arc::clone(&self.log),
+                    started: self.started.clone(),
+                    finished: self.finished.clone(),
+                    release: Arc::clone(&self.release),
+                }) as Arc<dyn ToolExecutor>
+            })
+        }
+        fn parallel_safe(&self, name: &ToolName) -> bool {
+            matches!(name.as_str(), "alpha" | "beta")
+        }
+    }
+
+    struct BlockingFenceExecutor {
+        log: FenceLog,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        finished: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl ToolExecutor for BlockingFenceExecutor {
+        fn execute<'a>(
+            &'a self,
+            context: &'a ToolExecutionContext,
+            call: &'a ToolCall,
+        ) -> ToolExecutorFuture<'a> {
+            let context = context.clone();
+            let log = Arc::clone(&self.log);
+            let started = self.started.clone();
+            let finished = self.finished.clone();
+            let release = Arc::clone(&self.release);
+            let label = fence_labels(call.name.as_str()).0;
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    let _ = started.send(());
+                    release
+                        .lock()
+                        .map_err(|e| ToolsError::ExecutionFailed(e.to_string()))?
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|e| ToolsError::ExecutionFailed(e.to_string()))?;
+                    push_fence(&log, label);
+                    drop(context);
+                    let _ = finished.send(());
+                    Ok(ToolOutput::text("effect finished"))
+                })
+                .await
+                .map_err(|e| ToolsError::ExecutionFailed(e.to_string()))?
+            })
+        }
+    }
+
+    async fn check_blocking_effect_survives_abort(
+        parallel: bool,
+        cancel_cooperatively: bool,
+    ) -> TestResult {
+        let log = fence_log();
+        let (started, mut start_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (finished, mut finish_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let provider = Arc::new(BlockingFenceProvider {
+            log: Arc::clone(&log),
+            started,
+            finished,
+            release: Arc::new(Mutex::new(release_rx)),
+        });
+        let mut session =
+            guarded_session(provider, Arc::new(CountingApproval::allow_everything()))?;
+        let mut calls = vec![call(&ToolCallId::new(), "alpha")];
+        if parallel {
+            calls.push(call(&ToolCallId::new(), "beta"));
+        }
+        let count = calls.len();
+        let model = ScriptedModel::new(vec![response_with(calls)]);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let control = TurnControl::new().with_tool_call_meter(FenceMeter::new(count, &log));
+        let cancel = control.cancel_token().clone();
+        let turn = tokio::spawn(async move {
+            run_turn(
+                &mut session,
+                &model,
+                &store,
+                TurnInput::user("run").with_control(control),
+            )
+            .await
+        });
+        for _ in 0..count {
+            tokio::time::timeout(Duration::from_secs(5), start_rx.recv())
+                .await
+                .map_err(ctx("blocking effect starts"))?
+                .ok_or(TestError::Missing("blocking start signal"))?;
+        }
+        if cancel_cooperatively {
+            cancel.cancel(CancelReason::User);
+            let outcome = tokio::time::timeout(Duration::from_secs(5), turn)
+                .await
+                .map_err(ctx("cancel finishes the async turn"))?
+                .map_err(ctx("join cancelled turn"))?
+                .map_err(ctx("cancelled outcome"))?;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
+        } else {
+            turn.abort();
+            let result = turn.await;
+            assert!(result.is_err_and(|error| error.is_cancelled()));
+        }
+        let before_release = fence_entries(&log);
+        // Release blocking work even when an assertion below would fail.
+        for _ in 0..count {
+            release.send(()).map_err(ctx("release blocking effect"))?;
+        }
+        for _ in 0..count {
+            tokio::time::timeout(Duration::from_secs(5), finish_rx.recv())
+                .await
+                .map_err(ctx("blocking effect finishes"))?
+                .ok_or(TestError::Missing("blocking finish signal"))?;
+        }
+        assert!(
+            before_release.is_empty(),
+            "lease released before effect: {before_release:?}"
+        );
+        let entries = fence_entries(&log);
+        for name in if parallel {
+            vec!["alpha", "beta"]
+        } else {
+            vec!["alpha"]
+        } {
+            let (executed, dropped) = fence_labels(name);
+            let effect = entries
+                .iter()
+                .position(|e| *e == executed)
+                .ok_or(TestError::Missing("effect log"))?;
+            let released = entries
+                .iter()
+                .position(|e| *e == dropped)
+                .ok_or(TestError::Missing("guard drop log"))?;
+            assert!(effect < released, "{entries:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blocking_effect_keeps_permit_after_outer_turn_abort() -> TestResult {
+        check_blocking_effect_survives_abort(false, false).await
+    }
+
+    #[tokio::test]
+    async fn parallel_blocking_effects_keep_permits_after_outer_turn_abort() -> TestResult {
+        check_blocking_effect_survives_abort(true, false).await
+    }
+
+    #[tokio::test]
+    async fn blocking_effect_keeps_permit_after_cooperative_cancel() -> TestResult {
+        check_blocking_effect_survives_abort(false, true).await
+    }
+
+    #[tokio::test]
+    async fn parallel_blocking_effects_keep_permits_after_cooperative_cancel() -> TestResult {
+        check_blocking_effect_survives_abort(true, true).await
     }
 
     /// Modell, das jede Runde protokolliert und mit Text antwortet.

@@ -385,6 +385,9 @@ mod tests {
             .mode(0o755)
             .create(&open_dir)
             .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        // Make the unsafe fixture explicit even under a restrictive caller umask.
+        fs::set_permissions(&open_dir, fs::Permissions::from_mode(0o755))
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
         assert!(matches!(
             MediaStore::open(&open_dir),
             Err(MediaError::UnsafeStore(_))

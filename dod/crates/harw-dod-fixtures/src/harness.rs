@@ -476,16 +476,16 @@ where
         let sensor = build(build_handle(capability, scope));
         let result = sensor.poll(Timestamp::UNIX_EPOCH);
 
-        if let Ok(reading) = &result {
-            if !(reading.samples.is_empty() && reading.events.is_empty()) {
-                return Err(HarnessViolation::Check {
-                    case: case.display().to_string(),
-                    capability,
-                    reason: format!(
-                        "ein ReadScope auf ein echt leeres Unterverzeichnis von tree/ lieferte ein nicht-leeres SensorReading ({reading:?}) — der Sensor hat Daten außerhalb seines Bereichs gelesen (im selben Baum liegen die echten Quelldateien dieses Falls)"
-                    ),
-                });
-            }
+        if let Ok(reading) = &result
+            && !(reading.samples.is_empty() && reading.events.is_empty())
+        {
+            return Err(HarnessViolation::Check {
+                case: case.display().to_string(),
+                capability,
+                reason: format!(
+                    "ein ReadScope auf ein echt leeres Unterverzeichnis von tree/ lieferte ein nicht-leeres SensorReading ({reading:?}) — der Sensor hat Daten außerhalb seines Bereichs gelesen (im selben Baum liegen die echten Quelldateien dieses Falls)"
+                ),
+            });
         }
         // Jedes Err(...) gilt als bestanden — siehe Funktionsdoku.
     }

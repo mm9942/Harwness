@@ -507,10 +507,11 @@ impl Memory for FileMemoryStore {
         }
         for tier in tiers {
             for (ns, path) in self.list_namespaces(tier)? {
-                if let Some(want) = query.namespace {
-                    if ns != want && !ns.starts_with(&format!("{want}/")) {
-                        continue;
-                    }
+                if let Some(want) = query.namespace
+                    && ns != want
+                    && !ns.starts_with(&format!("{want}/"))
+                {
+                    continue;
                 }
                 let content = fs::read_to_string(&path).map_err(|e| MemoryError::Io {
                     path: path.clone(),

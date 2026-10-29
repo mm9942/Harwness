@@ -227,10 +227,10 @@ fn market_section(run: &MatrixRun, out: &mut String) {
     let log = run.log();
     let mut start: BTreeMap<String, f64> = BTreeMap::new();
     for entry in log.journal.entries() {
-        if let EntryKind::VarDeclared { var } = &entry.kind {
-            if let (true, Some(v)) = (var.id.contains(".share."), number(&var.value)) {
-                start.entry(var.id.clone()).or_insert(v);
-            }
+        if let EntryKind::VarDeclared { var } = &entry.kind
+            && let (true, Some(v)) = (var.id.contains(".share."), number(&var.value))
+        {
+            start.entry(var.id.clone()).or_insert(v);
         }
     }
     if start.is_empty() {

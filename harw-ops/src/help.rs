@@ -155,10 +155,10 @@ fn build_grouped_help<'a>(
         }
 
         // Optionaler Name-Filter (case-insensitiv).
-        if let Some(f) = filter_lower {
-            if !meta.name.to_lowercase().contains(f) {
-                continue;
-            }
+        if let Some(f) = filter_lower
+            && !meta.name.to_lowercase().contains(f)
+        {
+            continue;
         }
 
         buckets

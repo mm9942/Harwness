@@ -936,3 +936,148 @@ async fn without_a_ledger_nothing_is_recorded_and_the_turn_is_unchanged() -> Tes
     assert!(matches!(outcome, TurnOutcome::Completed));
     Ok(())
 }
+
+struct ReasoningContextModel {
+    rounds: AtomicUsize,
+    call_id: ToolCallId,
+}
+
+impl ModelProvider for ReasoningContextModel {
+    fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if round == 0 {
+                return Ok(ModelResponse {
+                    message: None,
+                    tool_calls: vec![ToolCall {
+                        id: self.call_id.clone(),
+                        name: ToolName::new("context_lookup"),
+                        arguments: serde_json::json!({"context": "the scoped reference says X"}),
+                    }],
+                    reasoning: Some(harw_protocol::OpaqueReasoning {
+                        provider: "thinking-provider".into(),
+                        model: "thinking-model".into(),
+                        blocks: vec![
+                            serde_json::json!({"type": "reasoning_content", "text": "I need the reference before answering."}),
+                        ],
+                    }),
+                    ..Default::default()
+                });
+            }
+            let retrieved = request.history.to_model_messages().into_iter().any(|message| {
+                matches!(message, harw_core::ModelMessage::ToolResult { call_id, result: harw_protocol::ToolCallResult::Success { value } }
+                    if call_id == self.call_id && value["context"] == "the scoped reference says X")
+            });
+            if !retrieved {
+                return Err(harw_core::ModelError::RequestFailed(
+                    "reasoning continuation did not receive the governed context result".into(),
+                ));
+            }
+            Ok(ModelResponse::text("The reference says X."))
+        })
+    }
+}
+
+#[tokio::test]
+async fn reasoning_round_retrieves_context_before_visible_answer_through_normal_dispatch()
+-> TestResult {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let registry = ExtensionRegistryBuilder::default()
+        .tool_provider(Arc::new(EchoToolProvider {
+            name: ToolName::new("context_lookup"),
+            calls: Arc::clone(&calls),
+        }))
+        .build();
+    let (mut session, _rx) = new_session(registry)?;
+    let model = ReasoningContextModel {
+        rounds: AtomicUsize::new(0),
+        call_id: ToolCallId::new(),
+    };
+    let outcome = run_turn(
+        &mut session,
+        &model,
+        &InMemoryStateStore::new(),
+        TurnInput::user("What does the reference say?"),
+    )
+    .await
+    .map_err(ctx("reasoning retrieval turn"))?;
+    assert!(matches!(outcome, TurnOutcome::Completed));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(model.rounds.load(Ordering::SeqCst), 2);
+    let items = session.history().items();
+    let tool_result = items
+        .iter()
+        .position(|item| matches!(item, harw_protocol::TurnItem::ToolResult(_)))
+        .ok_or(TestError::Missing("context result"))?;
+    let visible_answer = items
+        .iter()
+        .position(|item| matches!(item, harw_protocol::TurnItem::AssistantMessage(_)))
+        .ok_or(TestError::Missing("visible answer"))?;
+    assert!(tool_result < visible_answer);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reasoning_retrieval_keeps_existing_tool_budget() -> TestResult {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let registry = ExtensionRegistryBuilder::default()
+        .tool_provider(Arc::new(EchoToolProvider {
+            name: ToolName::new("context_lookup"),
+            calls: Arc::clone(&calls),
+        }))
+        .build();
+    let (mut session, _rx) = new_session(registry)?;
+    let model = ReasoningContextModel {
+        rounds: AtomicUsize::new(0),
+        call_id: ToolCallId::new(),
+    };
+    let control =
+        harw_core::turn_loop::TurnControl::new().with_limits(harw_core::turn_loop::TurnLimits {
+            max_tool_calls: 0,
+            ..harw_core::turn_loop::TurnLimits::unlimited()
+        });
+    let outcome = run_turn(
+        &mut session,
+        &model,
+        &InMemoryStateStore::new(),
+        TurnInput::user("Find context").with_control(control),
+    )
+    .await
+    .map_err(ctx("budgeted reasoning turn"))?;
+    assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reasoning_text_alone_never_dispatches_a_context_tool() -> TestResult {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let registry = ExtensionRegistryBuilder::default()
+        .tool_provider(Arc::new(EchoToolProvider {
+            name: ToolName::new("context_lookup"),
+            calls: Arc::clone(&calls),
+        }))
+        .build();
+    let (mut session, _rx) = new_session(registry)?;
+    let model = ScriptedModel::new(vec![ModelResponse {
+        reasoning: Some(harw_protocol::OpaqueReasoning {
+            provider: "thinking-provider".into(),
+            model: "thinking-model".into(),
+            blocks: vec![
+                serde_json::json!({"type": "reasoning_content", "text": "<tool_call>context_lookup{\"context\":\"pretend\"}</tool_call>"}),
+            ],
+        }),
+        ..ModelResponse::text("I need a source.")
+    }]);
+    let outcome = run_turn(
+        &mut session,
+        &model,
+        &InMemoryStateStore::new(),
+        TurnInput::user("Find context"),
+    )
+    .await
+    .map_err(ctx("reasoning text remains non-executable"))?;
+    assert!(matches!(outcome, TurnOutcome::Completed));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}

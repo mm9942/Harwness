@@ -506,13 +506,12 @@ fn variant_names(schema: &Value) -> TestResult<BTreeSet<String>> {
 // `exact` additionally requires every declared property to be present, which
 // holds for complete serde output (None serializes as null).
 fn check(schema: &Value, value: &Value, path: &str, exact: bool) -> Result<(), String> {
-    if let Some(branches) = schema.get("anyOf").and_then(Value::as_array) {
-        if !branches
+    if let Some(branches) = schema.get("anyOf").and_then(Value::as_array)
+        && !branches
             .iter()
             .any(|branch| check(branch, value, path, exact).is_ok())
-        {
-            return Err(format!("{path}: no anyOf branch accepts {value}"));
-        }
+    {
+        return Err(format!("{path}: no anyOf branch accepts {value}"));
     }
     if let Some(expected) = schema.get("type").and_then(Value::as_str) {
         let matches = match expected {
@@ -529,10 +528,10 @@ fn check(schema: &Value, value: &Value, path: &str, exact: bool) -> Result<(), S
             return Err(format!("{path}: expected {expected}, got {value}"));
         }
     }
-    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
-        if !allowed.contains(value) {
-            return Err(format!("{path}: {value} not in enum"));
-        }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
+        && !allowed.contains(value)
+    {
+        return Err(format!("{path}: {value} not in enum"));
     }
     if let (Some(properties), Some(object)) = (
         schema.get("properties").and_then(Value::as_object),
@@ -559,12 +558,10 @@ fn check(schema: &Value, value: &Value, path: &str, exact: bool) -> Result<(), S
                 return Err(format!("{path}: missing required {required}"));
             }
         }
-        if exact {
-            if let Some(missing) = properties.keys().find(|key| !object.contains_key(*key)) {
-                return Err(format!(
-                    "{path}: schema property {missing} absent from serde output"
-                ));
-            }
+        if exact && let Some(missing) = properties.keys().find(|key| !object.contains_key(*key)) {
+            return Err(format!(
+                "{path}: schema property {missing} absent from serde output"
+            ));
         }
     }
     if let (Some(items), Some(array)) = (schema.get("items"), value.as_array()) {

@@ -1594,6 +1594,10 @@ mod tests {
         // als Menge statt per `starts_with`-Präfix verglichen.
         let base: HashSet<&str> = [
             "fs.read",
+            // Native Bilddaten und explizite Vision-Delegation (PR #158).
+            // `image.inspect` bleibt trotz lesender Oberfläche freigabepflichtig.
+            "fs.view_image",
+            "image.inspect",
             "fs.write",
             "fs.edit",
             "fs.list",
@@ -1627,12 +1631,61 @@ mod tests {
             "obsidian.search",
             "obsidian.links",
             "obsidian.write",
+            // PL-93-Kommando-Werkzeuge (PL-97 B4): `fsread.*` (`harw-tool-fsread`)
+            // und `git.*` (`harw-tool-gitread`) lesend und auto-freigegeben,
+            // `sys.*` (`harw-tool-sys`, `ExecuteProcess`) fragt wie
+            // `process.list`; alle drei im Full-Profil unbedingt registriert
+            // (harw-registry-defaults/src/profile.rs `FSREAD_TOOLS`,
+            // `GIT_READ_TOOLS`, `SYS_TOOLS`).
+            "fsread.ls",
+            "fsread.stat",
+            "fsread.find",
+            "fsread.du",
+            "fsread.df",
+            "fsread.wc",
+            "fsread.head",
+            "fsread.tail",
+            "fsread.cat",
+            "fsread.file",
+            "fsread.tree",
+            "fsread.readlink",
+            "fsread.realpath",
+            "fsread.hash",
+            "fsread.diff",
+            "fsread.json",
+            "git.status",
+            "git.diff",
+            "git.log",
+            "git.show",
+            "git.branch",
+            "git.blame",
+            "sys.ps",
+            "sys.pgrep",
+            "sys.top",
+            "sys.free",
+            "sys.uptime",
+            "sys.uname",
+            "sys.env",
+            "sys.id",
+            "sys.ss",
+            "sys.lsof",
+            "sys.date",
+            "sys.which",
             // Weitere `harw-ops`-Operationen mit `model_tool(...)`:
             // `/provider-concurrency` (harw-ops/src/provider.rs,
             // approval = "always") und `/sandbox-lease`
             // (harw-ops/src/sandbox_lease.rs).
             "provider-concurrency",
             "sandbox-lease",
+            // PL-97 D3: die lesenden Harw-DoD-Werkzeuge (`harw-ops/src/dod.rs`,
+            // `model_tool(readonly, approval = "none")`), über
+            // `harw_ops::register_all` in jeder Zusammenstellung.
+            "dod.status",
+            "dod.findings",
+            "dod.sensors",
+            // PL-97 B2: der lesende Werkzeug-Index (`harw-ops/src/tool_index_op.rs`),
+            // ebenfalls über `harw_ops::register_all`.
+            "tool.index",
             // `work.result` (harw-ops/src/work_result.rs): liest das Ergebnis
             // eines eigenen, abgeschlossenen Jobs der gebundenen Workspace.
             "work.result",

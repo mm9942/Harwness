@@ -621,10 +621,10 @@ impl SpawnerDriver {
     /// nächste Aufruf startet ein frisches Kind).
     fn forget(&mut self, seat_key: &str) {
         self.last_used.remove(seat_key);
-        if let Some(child) = self.children.remove(seat_key) {
-            if let Err(error) = self.spawner.release_child(&child) {
-                tracing::warn!(child = %child, error = %error, "matrix.seat_release_failed");
-            }
+        if let Some(child) = self.children.remove(seat_key)
+            && let Err(error) = self.spawner.release_child(&child)
+        {
+            tracing::warn!(child = %child, error = %error, "matrix.seat_release_failed");
         }
     }
 
@@ -1030,13 +1030,13 @@ impl MatrixRun {
             std::fs::write(&copy, &source)
                 .map_err(|e| io_err("Szenario-Kopie nicht schreibbar", &copy, &e))?;
             let source_dir = loaded.materials_dir(scenario_path.as_deref());
-            if let Some(src) = &source_dir {
-                if !src.is_dir() {
-                    return Err(OpError::InvalidArguments(format!(
-                        "Unterlagen-Ordner `{}` existiert nicht",
-                        src.display()
-                    )));
-                }
+            if let Some(src) = &source_dir
+                && !src.is_dir()
+            {
+                return Err(OpError::InvalidArguments(format!(
+                    "Unterlagen-Ordner `{}` existiert nicht",
+                    src.display()
+                )));
             }
             let root = dir.join(MATERIALS_DIR);
             let mut seats: Vec<Seat> = log
@@ -1914,12 +1914,12 @@ impl MatrixRun {
                 continue;
             };
             let source = format!("umpire:{}:public_rationale", ruling.argument_id);
-            if !self.guard_text(&source, &text, attempt, report)? {
-                if let Some(ruling) = adjudication.rulings.get_mut(index) {
-                    // Ein öffentliches Veto braucht eine Begründung.
-                    ruling.public_rationale = (ruling.verdict == Verdict::Veto)
-                        .then(|| "Begründung vom Leak-Guard zurückgehalten.".to_owned());
-                }
+            if !self.guard_text(&source, &text, attempt, report)?
+                && let Some(ruling) = adjudication.rulings.get_mut(index)
+            {
+                // Ein öffentliches Veto braucht eine Begründung.
+                ruling.public_rationale = (ruling.verdict == Verdict::Veto)
+                    .then(|| "Begründung vom Leak-Guard zurückgehalten.".to_owned());
             }
         }
         Ok(())
@@ -1942,10 +1942,10 @@ impl MatrixRun {
             keep.push(n);
         }
         narration.narrations = keep;
-        if let Some(summary) = narration.round_summary.clone() {
-            if !self.guard_text("umpire:round_summary", &summary, attempt, report)? {
-                narration.round_summary = None;
-            }
+        if let Some(summary) = narration.round_summary.clone()
+            && !self.guard_text("umpire:round_summary", &summary, attempt, report)?
+        {
+            narration.round_summary = None;
         }
         Ok(())
     }
@@ -2979,21 +2979,21 @@ pub fn materials_plan(
     if let Some(own) = selection.own.as_deref().filter(|own| safe_component(own)) {
         plan.push((PathBuf::from(own), PathBuf::from("eigene")));
     }
-    if selection.pairs_with {
-        if let Seat::Player(me) = seat {
-            for (name, a, b) in &pairs {
-                let partner = if a == me.as_str() {
-                    b
-                } else if b == me.as_str() {
-                    a
-                } else {
-                    continue;
-                };
-                plan.push((
-                    Path::new("paare").join(name),
-                    PathBuf::from(format!("mit-{partner}")),
-                ));
-            }
+    if selection.pairs_with
+        && let Seat::Player(me) = seat
+    {
+        for (name, a, b) in &pairs {
+            let partner = if a == me.as_str() {
+                b
+            } else if b == me.as_str() {
+                a
+            } else {
+                continue;
+            };
+            plan.push((
+                Path::new("paare").join(name),
+                PathBuf::from(format!("mit-{partner}")),
+            ));
         }
     }
     if selection.all_seats {

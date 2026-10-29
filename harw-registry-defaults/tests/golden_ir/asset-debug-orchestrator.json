@@ -18,6 +18,7 @@
   "tools": {
     "admitted": [
       "fs.read",
+      "fs.view_image",
       "fs.list",
       "fs.search",
       "fs.glob",
@@ -191,6 +192,7 @@
       "fs.list",
       "fs.read",
       "fs.search",
+      "fs.view_image",
       "job.list",
       "job.logs",
       "job.status",
@@ -296,7 +298,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/security-structure-triage.toml",
-          "line": 122,
+          "line": 133,
           "column": 11
         },
         "path": "context.program"
@@ -305,6 +307,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "403825c879414e1c23354ea1824baca49b3063ccf4c461796e5671fd831baf63"
+    "digest": "c8d4f4502971b72fae602cf9dc06c3c22fcd6bc6c6140e9050ff38bebc0af6ad"
   }
 }

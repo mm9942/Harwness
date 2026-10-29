@@ -77,6 +77,17 @@ pub enum ExecError {
         /// Rendered `CgroupError`.
         message: String,
     },
+    /// The cgroup membership to verify (`CgroupVerify`) does not hold: the
+    /// unified-hierarchy entry of `/proc/self/cgroup` names another cgroup,
+    /// is missing or could not be read. The report records
+    /// `resource_limits` as not (fully) enforced; the job was not started.
+    CgroupMismatch {
+        /// The path the plan expected.
+        expected: PathBuf,
+        /// What was found instead: the observed path, or why none could be
+        /// determined.
+        found: String,
+    },
     /// Applying the rlimits failed.
     Rlimit {
         /// Rendered `ProcessError`.
@@ -109,7 +120,9 @@ impl ExecError {
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Sandbox { .. } | Self::RequirementNotMet { .. } => exit_code::SANDBOX_REFUSED,
+            Self::Sandbox { .. } | Self::RequirementNotMet { .. } | Self::CgroupMismatch { .. } => {
+                exit_code::SANDBOX_REFUSED
+            }
             Self::Exec { .. } => exit_code::EXEC_FAILED,
             Self::Usage { .. }
             | Self::UnsupportedPlatform
@@ -150,6 +163,11 @@ impl fmt::Display for ExecError {
                 write!(f, "report file {}: {message}", path.display())
             }
             Self::Cgroup { message } => write!(f, "cgroup join failed: {message}"),
+            Self::CgroupMismatch { expected, found } => write!(
+                f,
+                "cgroup membership not verified (resource_limits): expected {}, found {found}",
+                expected.display()
+            ),
             Self::Rlimit { message } => write!(f, "rlimits failed: {message}"),
             Self::Sandbox { message } => write!(f, "sandbox refused: {message}"),
             Self::RequirementNotMet {
@@ -202,6 +220,16 @@ mod tests {
             message: "landlock".to_owned(),
         };
         assert_eq!(sandbox.exit_code(), exit_code::SANDBOX_REFUSED);
+        let mismatch = ExecError::CgroupMismatch {
+            expected: PathBuf::from("/harw.slice/harw-job-1"),
+            found: "/user.slice".to_owned(),
+        };
+        assert_eq!(mismatch.exit_code(), exit_code::SANDBOX_REFUSED);
+        let rendered = mismatch.to_string();
+        assert!(
+            rendered.contains("resource_limits") && rendered.contains("/harw.slice/harw-job-1"),
+            "{rendered}"
+        );
         let exec = ExecError::Exec {
             program: PathBuf::from("/nope"),
             source: io::Error::from(io::ErrorKind::NotFound),

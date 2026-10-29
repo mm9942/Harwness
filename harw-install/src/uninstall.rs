@@ -107,9 +107,10 @@ const STATE_EXCLUDED: &[&str] = &["profiles", "workspace"];
 /// - [`UninstallScope::Workspace`]: `profiles/*/workspace` je Profil.
 /// - [`UninstallScope::Service`]: bekannte Service-Unit-Pfade (systemd/launchd),
 ///   abgeleitet aus dem OS-Home (`home.parent()`).
-/// - [`UninstallScope::Binary`]: `~/.local/bin/harw` und `harw-agent-runner`
-///   (aus dem OS-Home), der Agenten-Build-Cache `cache/agent-builds` und der
-///   Installationsvermerk `install.toml` (#22).
+/// - [`UninstallScope::Binary`]: `~/.local/bin/harw`, `harw-agent-runner`
+///   und das Job-Trampolin `harw-job-exec` (aus dem OS-Home), der
+///   Agenten-Build-Cache `cache/agent-builds` und der Installationsvermerk
+///   `install.toml` (#22).
 ///
 /// # Arguments
 /// - `home` (`&Path`): Wurzel des harw-Home-Verzeichnisses (typisch `~/.harw`).
@@ -155,6 +156,9 @@ pub fn plan(home: &Path, scopes: &[UninstallScope]) -> CleanupPlan {
                 // native agent-build cache it feeds (regenerable, can grow
                 // to gigabytes; `harw agent clean` trims it while installed).
                 push_unique(&mut removals, bin.join("harw-agent-runner"));
+                // PL-97 E1: `make install` legt das Sandbox-Trampolin neben
+                // `harw` ab (der Job-Runtime sucht es dort).
+                push_unique(&mut removals, bin.join("harw-job-exec"));
                 push_unique(&mut removals, home.join("cache").join("agent-builds"));
                 push_unique(&mut removals, home.join("install.toml"));
             }
@@ -413,6 +417,10 @@ mod tests {
         assert!(
             p.removals
                 .contains(&os_home.join(".local").join("bin").join("harw-agent-runner"))
+        );
+        assert!(
+            p.removals
+                .contains(&os_home.join(".local").join("bin").join("harw-job-exec"))
         );
         assert!(
             p.removals

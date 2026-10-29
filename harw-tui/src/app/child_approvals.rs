@@ -131,6 +131,16 @@ impl ChildApprovalUi {
         self.open.is_some()
     }
 
+    /// Ob für das Kind `child` eine Frage offen ist oder wartet (PL-97 C5:
+    /// eine wartende Freigabe hebt seine Live-Zelle auf `NeedsOperator`).
+    #[must_use]
+    pub(crate) fn is_pending_for(&self, child: &str) -> bool {
+        let asks = |prompt: &ChildApprovalPrompt| {
+            prompt.request.child.as_str() == child && prompt.is_waiting()
+        };
+        self.open.as_ref().is_some_and(|(prompt, _)| asks(prompt)) || self.queue.iter().any(asks)
+    }
+
     /// Zahl der wartenden (noch nicht gezeigten) Fragen.
     #[cfg(test)]
     #[must_use]

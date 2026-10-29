@@ -1,0 +1,5 @@
+error: permission `read_workspace` is listed twice in `permission_request!`
+ --> tests/compile_fail/47_permission_request_duplicate_name.rs:4:69
+  |
+4 |     let _request = harw_macros::permission_request!(read_workspace, read_workspace);
+  |                                                                     ^^^^^^^^^^^^^^

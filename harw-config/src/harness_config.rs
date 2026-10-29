@@ -9,6 +9,7 @@ use crate::plan_toml::ToolsSection;
 use crate::research_toml::ResearchSection;
 use crate::retention_toml::RetentionSection;
 use crate::session_listener_toml::SessionListenerSection;
+use crate::skills_toml::SkillsSection;
 use crate::uia_worker_models::UiaWorkerModelsToml;
 
 /// Globale Harness-Konfiguration aus `.harw/config.toml`.
@@ -41,6 +42,11 @@ pub struct HarnessConfig {
     /// `default_model`. `None` → die UIA nutzt `default_model` wie bisher.
     #[serde(default)]
     pub uia_model: Option<String>,
+    /// Keep task execution in the durable root agent instead of spawning
+    /// managed child agents. Tool rights, approvals and budgets are unchanged.
+    /// Internal policy/compaction helpers are not task-agent delegation.
+    #[serde(default)]
+    pub single_agent_mode: bool,
     /// Alter Pin für das Modell der uia-worker-Rollenfamilie (`uia-worker`,
     /// `uia-explorer`, `uia-writer`, `uia-shell-worker`, `uia-latex-writer`).
     /// Seit Runde 5, Teil G gilt er nur noch für Rollen ohne eigenen Eintrag
@@ -78,6 +84,10 @@ pub struct HarnessConfig {
     /// Obergrenzen und Fristen der Wartungsjobs. Siehe `memory_toml.rs`.
     #[serde(default)]
     pub memory: MemorySection,
+    /// `[skills]` — triggered skill injection into the per-round model
+    /// context (PL-95 S3). See `skills_toml.rs`.
+    #[serde(default)]
+    pub skills: SkillsSection,
     /// `[session_listener]` — Remote-Sitzungs-Ingress von `harw gateway`
     /// (nur global). Siehe `session_listener_toml.rs`.
     #[serde(default)]
@@ -365,6 +375,18 @@ pub const JOBS_MAX_RUNNING_RANGE: (u32, u32) = (1, 256);
 ///   außerhalb des Bereichs ist ein Konfigurationsfehler, kein Klemmen.
 ///   Merge-Regel `MinBound`: Home und Profil setzen frei, auch nach oben;
 ///   ein nicht vertrautes Projekt darf nur senken (`crate::merge`, `merge_jobs`).
+/// - `cgroup_root` (PL-97 E3): the delegated cgroup v2 root of harw's jobs,
+///   an absolute path below `/sys/fs/cgroup` (checked fully by
+///   `harw_job_runtime::host::resolve_delegated_root`; a relative path is
+///   already a parse error). First step of the resolution order
+///   (`[jobs] cgroup_root` → `HARW_CGROUP_ROOT` → own delegated cgroup).
+///   Profile scope, `ProfileReplaces`, security critical: only trusted
+///   layers set it, an untrusted project layer never.
+/// - `trampoline` (PL-97 E3): absolute path of the `harw-job-exec`
+///   trampoline, for installs where it does not sit next to `harw`
+///   (`ExecutableSource::Path`). Same scope and merge rule as
+///   `cgroup_root`: an untrusted project layer cannot point harw at
+///   another binary.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobsToml {
@@ -375,6 +397,38 @@ pub struct JobsToml {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_running: Option<u32>,
+    /// Delegated cgroup v2 root of harw's jobs (absolute).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_jobs_absolute_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cgroup_root: Option<std::path::PathBuf>,
+    /// Absolute path of the `harw-job-exec` trampoline.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_jobs_absolute_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub trampoline: Option<std::path::PathBuf>,
+}
+
+// Lehnt einen relativen Pfad für `[jobs] cgroup_root` / `[jobs] trampoline`
+// beim Parsen ab (wie `deserialize_jobs_max_running`).
+fn deserialize_jobs_absolute_path<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::path::PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = std::path::PathBuf::deserialize(deserializer)?;
+    if !value.is_absolute() {
+        return Err(serde::de::Error::custom(format!(
+            "[jobs] paths must be absolute, got {}",
+            value.display()
+        )));
+    }
+    Ok(Some(value))
 }
 
 impl JobsToml {
@@ -482,6 +536,38 @@ pub struct SandboxSection {
     pub cargo: Option<CargoSandboxToml>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux: Option<TmuxSandboxToml>,
+    /// `execution` — how `shell.exec`, `job.start` and child agents start
+    /// their processes (PL-97 E2). `None` means
+    /// [`SandboxExecutionToml::Chain`]; read through
+    /// [`SandboxSection::effective_execution`]. Profile-scoped
+    /// (`ProfileReplaces`): an untrusted project layer cannot set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<SandboxExecutionToml>,
+}
+
+impl SandboxSection {
+    /// The configured execution path, [`SandboxExecutionToml::Chain`] when
+    /// unset.
+    #[must_use]
+    pub fn effective_execution(&self) -> SandboxExecutionToml {
+        self.execution.unwrap_or_default()
+    }
+}
+
+/// `[sandbox] execution` — the execution path of model-driven processes
+/// (PL-97 E2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxExecutionToml {
+    /// Through the job runtime's sandbox chain (cgroup, Bubblewrap,
+    /// Landlock trampoline as `select_backend` finds them). A job with a
+    /// write scope or a `required` sandbox is refused where the chain
+    /// cannot enforce it.
+    #[default]
+    Chain,
+    /// The previous path: a pre-built `prlimit … -- bwrap …` argv run as a
+    /// host job (no cgroup, no Landlock, no per-attempt report).
+    Legacy,
 }
 
 /// Vertrauenswürdige Host-Wurzeln einer Cargo-Toolchain.
@@ -616,6 +702,11 @@ pub struct TuiSection {
     /// Projektion des Goal-/Planstands ein (Vorgabe: aus).
     #[serde(default)]
     pub goal_mode: bool,
+    /// PL-97 R1: wie Reasoning-Zusammenfassungen des Modells im Verlauf
+    /// erscheinen — als lesbarer Nachrichtenblock (`message`, Vorgabe),
+    /// eingeklappt auf eine Zeile (`collapsed`) oder gar nicht (`hidden`).
+    #[serde(default)]
+    pub reasoning: ReasoningDisplayMode,
 }
 
 impl Default for TuiSection {
@@ -626,6 +717,43 @@ impl Default for TuiSection {
             child_stream: ChildStreamModeToml::default(),
             status_expiry: StatusExpiryMode::default(),
             goal_mode: false,
+            reasoning: ReasoningDisplayMode::default(),
+        }
+    }
+}
+
+/// `[tui] reasoning` — Darstellung der Reasoning-Zusammenfassungen im
+/// Verlauf (PL-97 R1).
+///
+/// # Beschreibung
+/// - `"message"` (Vorgabe): ausgeklappter, als Markdown gerenderter Block
+///   mit Kopfzeile `∴ Reasoning`; Ctrl+O klappt ihn ein.
+/// - `"collapsed"`: nur Kopfzeile plus erste Zeile; Ctrl+O klappt ihn aus.
+/// - `"hidden"`: keine Verlaufszelle und kein Live-Reasoning; der Export
+///   zeichnet die Zusammenfassung weiterhin auf.
+///
+/// Rein darstellend, kein Sicherheitsfeld: der Block zeigt nur, was das
+/// Modell ohnehin als Turn-Ereignis meldet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningDisplayMode {
+    /// Lesbarer Nachrichtenblock, ausgeklappt (Vorgabe).
+    #[default]
+    Message,
+    /// Eingeklappt auf Kopfzeile plus erste Zeile.
+    Collapsed,
+    /// Keine Verlaufszelle.
+    Hidden,
+}
+
+impl ReasoningDisplayMode {
+    /// Konfigurationswert als Text (`message`, `collapsed`, `hidden`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Collapsed => "collapsed",
+            Self::Hidden => "hidden",
         }
     }
 }
@@ -834,6 +962,31 @@ mod tests {
             TuiSection::default().status_expiry,
             StatusExpiryMode::Consolidate
         );
+    }
+
+    /// PL-97 R1: `[tui] reasoning` hat die Vorgabe `message`, parst die
+    /// drei Werte und weist einen unbekannten Wert ab.
+    #[test]
+    fn test_tui_reasoning_defaults_to_message_and_parses_modes() -> TestResult {
+        assert_eq!(
+            TuiSection::default().reasoning,
+            ReasoningDisplayMode::Message
+        );
+        for (value, expected) in [
+            ("message", ReasoningDisplayMode::Message),
+            ("collapsed", ReasoningDisplayMode::Collapsed),
+            ("hidden", ReasoningDisplayMode::Hidden),
+        ] {
+            let src = format!(
+                "default_provider = \"anthropic\"\ndefault_model = \"m\"\n[tui]\nreasoning = \"{value}\"\n"
+            );
+            let cfg: HarnessConfig = toml::from_str(&src).map_err(ctx("parse tui.reasoning"))?;
+            assert_eq!(cfg.tui.reasoning, expected);
+            assert_eq!(expected.as_str(), value);
+        }
+        let bogus = "default_provider = \"anthropic\"\n[tui]\nreasoning = \"inline\"\n";
+        assert!(toml::from_str::<HarnessConfig>(bogus).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1223,6 +1376,41 @@ mod tests {
     }
 
     #[test]
+    fn test_sandbox_execution_defaults_to_chain_and_parses() -> TestResult {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                default_provider = "anthropic"
+            "#,
+        )
+        .map_err(ctx("parse config"))?;
+        assert_eq!(cfg.sandbox.execution, None);
+        assert_eq!(
+            cfg.sandbox.effective_execution(),
+            SandboxExecutionToml::Chain
+        );
+        for (text, expected) in [
+            ("chain", SandboxExecutionToml::Chain),
+            ("legacy", SandboxExecutionToml::Legacy),
+        ] {
+            let cfg: HarnessConfig =
+                toml::from_str(&format!("[sandbox]\nexecution = \"{text}\"\n"))
+                    .map_err(ctx("parse execution"))?;
+            assert_eq!(cfg.sandbox.execution, Some(expected));
+            assert_eq!(cfg.sandbox.effective_execution(), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sandbox_execution_rejects_unknown_value() {
+        let src = r#"
+            [sandbox]
+            execution = "host"
+        "#;
+        assert!(toml::from_str::<HarnessConfig>(src).is_err());
+    }
+
+    #[test]
     fn test_sandbox_section_rejects_unknown_field() {
         let src = r#"
             [sandbox]
@@ -1276,6 +1464,33 @@ mod tests {
         .map_err(ctx("parse config with jobs.max_running"))?;
         assert_eq!(cfg.jobs.max_running, Some(3));
         assert_eq!(cfg.jobs.effective_max_running(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_jobs_cgroup_root_and_trampoline_parse_absolute_paths_only() -> TestResult {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+            [jobs]
+            cgroup_root = "/sys/fs/cgroup/user.slice/harw.slice"
+            trampoline = "/opt/harw/libexec/harw-job-exec"
+            "#,
+        )
+        .map_err(ctx("parse jobs paths"))?;
+        assert_eq!(
+            cfg.jobs.cgroup_root.as_deref(),
+            Some(std::path::Path::new("/sys/fs/cgroup/user.slice/harw.slice"))
+        );
+        assert_eq!(
+            cfg.jobs.trampoline.as_deref(),
+            Some(std::path::Path::new("/opt/harw/libexec/harw-job-exec"))
+        );
+        for bad in [
+            "[jobs]\ncgroup_root = \"harw.slice\"",
+            "[jobs]\ntrampoline = \"bin/harw-job-exec\"",
+        ] {
+            assert!(toml::from_str::<HarnessConfig>(bad).is_err(), "{bad}");
+        }
         Ok(())
     }
 

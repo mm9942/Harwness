@@ -133,10 +133,10 @@ impl NotifyThrottle {
         if now.saturating_duration_since(since) < self.config.error_debounce {
             return None;
         }
-        if let Some(last) = self.last_error_at {
-            if now.saturating_duration_since(last) < self.config.error_min_interval {
-                return None;
-            }
+        if let Some(last) = self.last_error_at
+            && now.saturating_duration_since(last) < self.config.error_min_interval
+        {
+            return None;
         }
         self.last_error_at = Some(now);
         self.take_batch()

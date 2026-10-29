@@ -2,6 +2,7 @@
 //! cloudctl control plane) for the UIA operation registry.
 
 pub mod cloudctl;
+pub mod context;
 pub mod enrollments;
 pub mod status;
 

@@ -179,11 +179,13 @@
 //! gemeinsamen DoD-Vertrag aus [`harw_dod_config`] — denselben, den auch die
 //! BPF-Sonde liest ([`load_dod_settings`]):
 //!
-//! - **Quelle.** Ein expliziter administrativer Pfad geht über
-//!   [`harw_dod_config::load_config`]; ohne ihn gilt ausschließlich der feste
-//!   Pfad [`harw_dod_config::SYSTEM_CONFIG_PATH`] über
-//!   [`harw_dod_config::load_system_config`]. Die Kommandozeile trägt heute
-//!   noch kein `--config`-Flag — [`main`] übergibt deshalb stets `None`.
+//! - **Quelle.** Ein expliziter administrativer Pfad (`--config <PATH>`)
+//!   geht über [`harw_dod_config::load_config`]; ohne ihn gilt
+//!   ausschließlich der feste Pfad [`harw_dod_config::SYSTEM_CONFIG_PATH`]
+//!   über [`harw_dod_config::load_system_config`]. Die ausgelieferte Unit
+//!   (`deploy/systemd/harw-sentinel.service`) übergibt
+//!   `--config /etc/harw-dod/config.toml` ausdrücklich — dort ist eine
+//!   fehlende Datei deshalb fail closed, wie bei `harw-probe-bpf`.
 //! - **Fehlt die Systemkonfiguration** (`ENOENT` auf irgendeinem Pfadglied),
 //!   startet dieser Prozess mit den eingebauten Vorgaben und meldet das per
 //!   `tracing::warn!` deutlich — dieses Binary ist unprivilegiert und seine
@@ -217,6 +219,25 @@
 //!   lassen — selbst wenn eine Runde sich um bis zu einen vollen Abstand
 //!   verspätet.
 //!
+//! # Exports for harw (PL-97 D1)
+//! Two optional, unprivileged outputs leave this process: the append-only
+//! findings export (`--findings-export`, module [`export`], schema version
+//! 2) and the health document (`--health-export`, module
+//! [`health_export`]), which defaults to the sibling `health.json` of the
+//! findings export and is replaced atomically at the end of every
+//! [`poll_once`] cycle. Both directories are added as read-write Landlock
+//! roots before [`sandbox::restrict_self`]; neither needs a capability.
+//! Before either writer starts, [`check_export_destinations`] refuses
+//! startup (fail-closed) when the two destinations alias each other by
+//! resolved identity, including the health temporary sibling and rotated
+//! findings generations. When the two exports name different parent
+//! directories, both directories must already exist at startup: an
+//! unresolvable parent cannot be proven distinct, so the sentinel refuses
+//! to start instead of retrying later.
+//! Without both flags nothing is written and the cycle is unchanged (the
+//! health snapshots around `poll_all` are only taken when the health export
+//! is enabled).
+//!
 //! # Fehler
 //! [`error::SentinelBinError`] — ausschließlich die beiden Startpfade ohne
 //! Degradationsoption: Root-Space-Auflösung und Öffnen des
@@ -231,14 +252,18 @@
 //! ```text
 //! $ harw-sentinel --log info --home /var/lib/harwness --interval-secs 5
 //! $ harw-sentinel --once --home /var/lib/harwness
+//! $ harw-sentinel --config /etc/harw-dod/config.toml --home /var/lib/harw-dod \
+//!     --findings-export /var/lib/harw-dod/export/findings.jsonl
 //! ```
 
 #![forbid(unsafe_code)]
 
+mod cgroup_resolve;
 mod cli;
 mod error;
 mod export;
 mod findings;
+mod health_export;
 mod sandbox;
 mod sensors;
 
@@ -590,6 +615,15 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // Export-Ziele vor jedem Schreiber prüfen: ein Alias der beiden
+        // Pfade verweigert den Start (fail-closed, PR #154 P1).
+        if let Err(err) = check_export_destinations(&cli) {
+            tracing::error!(
+                error = %err,
+                "refusing to start: findings and health export destinations are unsafe"
+            );
+            return ExitCode::FAILURE;
+        }
         run(cli, settings)
     };
 
@@ -719,6 +753,9 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
     // damit ein Konfigurationsfehler sofort im Log steht; das Verzeichnis
     // bleibt danach für Rotation/Neuanlage beschreibbar (Regel unten).
     let mut exporter = build_findings_exporter(&cli, sink.as_ref());
+    // Optionaler Gesundheitsexport (`--health-export`, Vorgabe: `health.json`
+    // neben dem Befundexport); sein Verzeichnis braucht dieselbe Regel.
+    let mut health = build_health_exporter(&cli, &settings);
 
     let mut roots = sandbox::default_roots(
         &cli.proc_root,
@@ -734,6 +771,18 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         .and_then(export::FindingsExporter::directory)
     {
         roots.push(sandbox::SandboxRoot::read_write(dir.to_path_buf()));
+    }
+    if let Some(dir) = health
+        .as_ref()
+        .and_then(health_export::HealthExporter::directory)
+    {
+        let same_dir = exporter
+            .as_ref()
+            .and_then(export::FindingsExporter::directory)
+            == Some(dir);
+        if !same_dir {
+            roots.push(sandbox::SandboxRoot::read_write(dir.to_path_buf()));
+        }
     }
     let outcome = sandbox::restrict_self(&roots);
     // `Sentinel` existiert an dieser Stelle noch nicht (siehe unten) — ein
@@ -784,12 +833,16 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         sentinel.record_external_event(event);
     }
 
+    let mut resolver = cgroup_resolve::CgroupResolver::new(cli.cgroup_root.clone());
+
     if cli.once {
         poll_once(
             &mut sentinel,
             inbox.as_ref(),
             sink.as_ref(),
             exporter.as_mut(),
+            health.as_mut(),
+            Some(&mut resolver),
         );
         return Ok(());
     }
@@ -800,6 +853,8 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
             inbox.as_ref(),
             sink.as_ref(),
             exporter.as_mut(),
+            health.as_mut(),
+            Some(&mut resolver),
         );
         std::thread::sleep(timing.interval());
     }
@@ -835,13 +890,26 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
 ///   (siehe [`findings`]-Moduldoku).
 /// - `exporter` (`Option<&mut export::FindingsExporter>`): der optionale
 ///   JSON-Lines-Befundexport (`--findings-export`); `None` exportiert nichts.
+/// - `health` (`Option<&mut health_export::HealthExporter>`): the optional
+///   health document (`--health-export`); rewritten at the end of the cycle
+///   from health snapshots taken around `poll_all`. `None` writes nothing
+///   and takes no snapshot.
+/// - `resolver` (`Option<&mut cgroup_resolve::CgroupResolver>`): maps the raw
+///   cgroup ids forwarded by the probes to cgroup paths beneath
+///   `--cgroup-root` (PL-97 E4); `None` leaves every received actor without
+///   a cgroup.
 fn poll_once(
     sentinel: &mut Sentinel,
     inbox: Option<&IpcInboxHandle>,
     sink: &dyn TelemetrySink,
     exporter: Option<&mut export::FindingsExporter>,
+    health: Option<&mut health_export::HealthExporter>,
+    resolver: Option<&mut cgroup_resolve::CgroupResolver>,
 ) {
     let now = Timestamp::now();
+    // Nur mit Gesundheitsexport: Zustand je Sensor vor dem Abruf festhalten,
+    // damit `SensorTracker` Erfolg/Fehlschlag dieses Zyklus ableiten kann.
+    let before = health.as_ref().map(|_| sentinel.health_snapshot());
     let reading = sentinel.poll_all(now);
     tracing::debug!(
         samples = reading.samples.len(),
@@ -853,7 +921,7 @@ fn poll_once(
         tracing::warn!(?event, "security event observed");
     }
 
-    drain_external_events(sentinel, inbox);
+    drain_external_events(sentinel, inbox, resolver);
 
     match sentinel.freeze(now) {
         Ok(evidence) => {
@@ -872,6 +940,96 @@ fn poll_once(
             tracing::warn!(error = %error, "failed to freeze buffer into evidence this round");
         }
     }
+
+    if let (Some(health), Some(before)) = (health, before) {
+        let after = sentinel.health_snapshot();
+        health.record_cycle(sink, &before, &after, ipc_counters(inbox), now);
+    }
+}
+
+/// Builds the optional health export from `--health-export` (or its
+/// default next to `--findings-export`, see [`Cli::resolved_health_export`]).
+///
+/// # Description
+/// `None` when neither flag is set. That the path does not alias the
+/// findings export is checked before startup by
+/// [`check_export_destinations`] (resolved identity, fail-closed). The
+/// configuration identity (digest, profile) is taken from the already
+/// resolved `settings`.
+fn build_health_exporter(
+    cli: &Cli,
+    settings: &DodSettings,
+) -> Option<health_export::HealthExporter> {
+    let path = cli.resolved_health_export()?;
+    let identity = health_export::ConfigIdentity {
+        config_digest: settings
+            .profile
+            .as_ref()
+            .map(|profile| profile.config_digest().to_string()),
+        profile: settings
+            .profile
+            .as_ref()
+            .map(|profile| profile.profile_id().as_str().to_owned()),
+    };
+    tracing::info!(
+        path = %path.display(),
+        schema_version = health_export::HEALTH_SCHEMA_VERSION,
+        "health export enabled"
+    );
+    Some(health_export::HealthExporter::new(path, identity))
+}
+
+/// Checks the findings and health export destinations before either writer
+/// starts.
+///
+/// # Description
+/// Each configured path must be absolute with normal components only
+/// ([`export::validate_export_path`]). When both are configured (the health
+/// path explicitly or by its default next to the findings export), they are
+/// compared by resolved identity — canonical parent plus file name — via
+/// [`export::check_distinct_destinations`], so a `.`/`..` spelling or a
+/// symlinked parent cannot make the atomic health rename replace the
+/// findings file while the findings writer appends to the unlinked inode;
+/// the health temporary sibling and rotated findings generations are
+/// covered too.
+///
+/// # Errors
+/// [`export::ExportPathError`]; `main` refuses to start on it.
+fn check_export_destinations(cli: &Cli) -> Result<(), export::ExportPathError> {
+    let health = cli.resolved_health_export();
+    match (cli.findings_export.as_deref(), health.as_deref()) {
+        (Some(findings), Some(health)) => export::check_distinct_destinations(findings, health),
+        (Some(findings), None) => export::validate_export_path("findings", findings),
+        (None, Some(health)) => export::validate_export_path("health", health),
+        (None, None) => Ok(()),
+    }
+}
+
+/// Reads the receive-path counters for the health export.
+///
+/// # Description
+/// Locks the inbox once (a poisoned mutex is recovered, exactly like
+/// [`drain_external_events`]); `None` (no bound socket) reports zeros.
+#[cfg(target_os = "linux")]
+fn ipc_counters(inbox: Option<&IpcInboxHandle>) -> health_export::IpcCounters {
+    let Some(inbox) = inbox else {
+        return health_export::IpcCounters::default();
+    };
+    let guard = match inbox.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    health_export::IpcCounters {
+        probes_connected: guard.connected(),
+        events_total: guard.received_total(),
+        dropped_total: guard.dropped(),
+    }
+}
+
+/// See the Linux version; without a receive path every counter is zero.
+#[cfg(not(target_os = "linux"))]
+fn ipc_counters(_inbox: Option<&IpcInboxHandle>) -> health_export::IpcCounters {
+    health_export::IpcCounters::default()
 }
 
 /// Baut den optionalen Befund-Export aus `--findings-export`/`--findings-host`.
@@ -939,7 +1097,11 @@ fn build_findings_exporter(
 /// `inbox.lock()`-Aufruf selbst; `sentinel.record_external_event` läuft
 /// danach lock-frei.
 #[cfg(target_os = "linux")]
-fn drain_external_events(sentinel: &mut Sentinel, inbox: Option<&IpcInboxHandle>) {
+fn drain_external_events(
+    sentinel: &mut Sentinel,
+    inbox: Option<&IpcInboxHandle>,
+    mut resolver: Option<&mut cgroup_resolve::CgroupResolver>,
+) {
     let Some(inbox) = inbox else {
         return;
     };
@@ -987,7 +1149,15 @@ fn drain_external_events(sentinel: &mut Sentinel, inbox: Option<&IpcInboxHandle>
         );
     }
 
-    for item in received {
+    if let Some(resolver) = resolver.as_deref_mut() {
+        resolver.begin_batch();
+    }
+    for mut item in received {
+        // Rohe cgroup-ID der Sonde -> Pfad unter `--cgroup-root`, oder
+        // keine cgroup (PL-97 E4, siehe `cgroup_resolve`).
+        if let Some(actor) = item.event.actor.as_mut() {
+            cgroup_resolve::resolve_actor_cgroup(actor, resolver.as_deref_mut());
+        }
         tracing::debug!(
             sensor = %item.event.sensor.as_str(),
             peer_pid = item.peer.pid,
@@ -1001,7 +1171,12 @@ fn drain_external_events(sentinel: &mut Sentinel, inbox: Option<&IpcInboxHandle>
 /// (siehe [`IpcInboxHandle`], [`spawn_ipc_if_available`]) — diese Funktion
 /// ist entsprechend ein reines No-Op.
 #[cfg(not(target_os = "linux"))]
-fn drain_external_events(_sentinel: &mut Sentinel, _inbox: Option<&IpcInboxHandle>) {}
+fn drain_external_events(
+    _sentinel: &mut Sentinel,
+    _inbox: Option<&IpcInboxHandle>,
+    _resolver: Option<&mut cgroup_resolve::CgroupResolver>,
+) {
+}
 
 /// Bindet den IPC-Empfangssocket, falls möglich, startet seine
 /// Annahmeschleife im Hintergrund und gibt das Inbox-Handle zurück.
@@ -1248,6 +1423,121 @@ egress_allow_cidrs = []
     }
 
     #[test]
+    fn test_health_exporter_is_absent_without_export_flags() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("valid cli"))?;
+        assert!(build_health_exporter(&cli, &DodSettings::builtin_defaults()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_startup_check_refuses_the_findings_export_path() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            "/var/lib/harw-dod/export/findings.jsonl",
+            "--health-export",
+            "/var/lib/harw-dod/export/findings.jsonl",
+        ])
+        .map_err(ctx("valid cli"))?;
+        assert!(matches!(
+            check_export_destinations(&cli),
+            Err(export::ExportPathError::Collision { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_startup_check_refuses_a_dot_component_alias() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let base = dir.path().to_str().ok_or(TestError::Missing("utf8 path"))?;
+        let findings = format!("{base}/findings.jsonl");
+        let alias = format!("{base}/./findings.jsonl");
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            findings.as_str(),
+            "--health-export",
+            alias.as_str(),
+        ])
+        .map_err(ctx("valid cli"))?;
+        assert!(check_export_destinations(&cli).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_startup_check_refuses_a_symlinked_parent_alias() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).map_err(ctx("real dir"))?;
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).map_err(ctx("symlink"))?;
+        let findings = real.join("findings.jsonl");
+        let alias = link.join("findings.jsonl");
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            findings.to_str().ok_or(TestError::Missing("utf8 path"))?,
+            "--health-export",
+            alias.to_str().ok_or(TestError::Missing("utf8 path"))?,
+        ])
+        .map_err(ctx("valid cli"))?;
+        assert!(matches!(
+            check_export_destinations(&cli),
+            Err(export::ExportPathError::Collision { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_startup_check_refuses_findings_on_the_health_temporary_sibling() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            "/var/lib/harw-dod/export/.health.json.tmp",
+            "--health-export",
+            "/var/lib/harw-dod/export/health.json",
+        ])
+        .map_err(ctx("valid cli"))?;
+        assert!(matches!(
+            check_export_destinations(&cli),
+            Err(export::ExportPathError::SiblingOverlap { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_startup_check_accepts_the_default_health_sibling() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let findings = dir.path().join("findings.jsonl");
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            findings.to_str().ok_or(TestError::Missing("utf8 path"))?,
+        ])
+        .map_err(ctx("valid cli"))?;
+        check_export_destinations(&cli).map_err(ctx("default sibling is distinct"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_health_exporter_defaults_next_to_the_findings_export() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            "/var/lib/harw-dod/export/findings.jsonl",
+        ])
+        .map_err(ctx("valid cli"))?;
+        let health = build_health_exporter(&cli, &DodSettings::builtin_defaults())
+            .ok_or(TestError::Missing("default health exporter"))?;
+        assert_eq!(
+            health.path(),
+            Path::new("/var/lib/harw-dod/export/health.json")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_explicit_relative_config_path_is_rejected() {
         let result = load_dod_settings(Some(Path::new("config.toml")));
         assert!(matches!(
@@ -1330,7 +1620,14 @@ egress_allow_cidrs = []
                 Arc::new(harw_observe::NullSink),
                 SentinelConfig::default(),
             );
-            poll_once(&mut sentinel, Some(&inbox), &harw_observe::NullSink, None);
+            poll_once(
+                &mut sentinel,
+                Some(&inbox),
+                &harw_observe::NullSink,
+                None,
+                None,
+                None,
+            );
 
             assert_eq!(sentinel.buffer().event_len(), 1);
             let evidence = sentinel
@@ -1338,6 +1635,69 @@ egress_allow_cidrs = []
                 .map_err(ctx("well-formed buffer content always encodes"))?;
             assert_eq!(evidence.events.len(), 1);
             assert_eq!(evidence.events[0].sensor.as_str(), "probe-fs-0");
+            Ok(())
+        }
+
+        #[test]
+        fn test_received_raw_cgroup_id_is_resolved_beneath_the_cgroup_root() -> TestResult {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let tree = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let job = tree.path().join("harw.slice").join("harw-job-7");
+            std::fs::create_dir_all(&job).map_err(ctx("fixture cgroup"))?;
+            let job_id = std::fs::symlink_metadata(&job)
+                .map_err(ctx("fixture metadata"))?
+                .ino();
+            let inbox: IpcInboxHandle = Arc::new(Mutex::new(ipc::IpcInbox::new(4)));
+            {
+                let mut guard = inbox.lock().map_err(ctx("uncontended lock"))?;
+                for cgroup in [
+                    harw_dod_signals::Actor::raw_cgroup(job_id),
+                    harw_dod_signals::Actor::raw_cgroup(u64::MAX),
+                ] {
+                    let mut event = sample_probe_event("probe-bpf-0");
+                    event.actor = Some(harw_dod_signals::Actor {
+                        uid: 1000,
+                        auid: None,
+                        cgroup,
+                    });
+                    guard.push(ipc::ReceivedEvent {
+                        event,
+                        peer: sample_peer(),
+                    });
+                }
+            }
+            let mut resolver = cgroup_resolve::CgroupResolver::new(tree.path().to_path_buf());
+            let mut sentinel = Sentinel::new(
+                Vec::new(),
+                Arc::new(harw_observe::NullSink),
+                SentinelConfig::default(),
+            );
+            poll_once(
+                &mut sentinel,
+                Some(&inbox),
+                &harw_observe::NullSink,
+                None,
+                None,
+                Some(&mut resolver),
+            );
+
+            let cgroups: Vec<Option<String>> = sentinel
+                .buffer()
+                .events()
+                .map(|event| {
+                    event
+                        .actor
+                        .as_ref()
+                        .and_then(|actor| actor.cgroup.as_ref())
+                        .map(|id| id.as_str().to_owned())
+                })
+                .collect();
+            assert_eq!(
+                cgroups,
+                vec![job.to_str().map(str::to_owned), None],
+                "a resolved id carries its absolute path, an unknown id none"
+            );
             Ok(())
         }
 
@@ -1360,7 +1720,14 @@ egress_allow_cidrs = []
                     peer: sample_peer(),
                 });
 
-            poll_once(&mut sentinel, Some(&inbox), &harw_observe::NullSink, None);
+            poll_once(
+                &mut sentinel,
+                Some(&inbox),
+                &harw_observe::NullSink,
+                None,
+                None,
+                None,
+            );
 
             // Reihenfolge (Frage 1): das intern erzeugte `SensorDegraded`
             // aus `poll_all` steht vor dem extern eingespeisten Ereignis —
@@ -1386,6 +1753,59 @@ egress_allow_cidrs = []
         }
 
         #[test]
+        fn test_poll_once_rewrites_the_health_document_every_cycle() -> TestResult {
+            let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let path = dir.path().join("health.json");
+            let mut health = health_export::HealthExporter::new(
+                path.clone(),
+                health_export::ConfigIdentity::default(),
+            );
+            let mut sentinel = Sentinel::new(
+                vec![mock_degrading_sensor("mock-degrade-0")],
+                Arc::new(harw_observe::NullSink),
+                SentinelConfig::default(),
+            );
+            let inbox: IpcInboxHandle = Arc::new(Mutex::new(ipc::IpcInbox::new(4)));
+            {
+                let mut guard = inbox.lock().map_err(ctx("uncontended lock"))?;
+                guard.peer_connected();
+                guard.push(ipc::ReceivedEvent {
+                    event: sample_probe_event("probe-fs-0"),
+                    peer: sample_peer(),
+                });
+            }
+
+            for _ in 0..2 {
+                poll_once(
+                    &mut sentinel,
+                    Some(&inbox),
+                    &harw_observe::NullSink,
+                    None,
+                    Some(&mut health),
+                    None,
+                );
+            }
+            assert_eq!(health.written(), 2);
+
+            let text = std::fs::read_to_string(&path).map_err(ctx("read health"))?;
+            let value: serde_json::Value =
+                serde_json::from_str(&text).map_err(ctx("parse health"))?;
+            assert_eq!(value["schema_version"], 1);
+            let sensor = &value["sensors"][0];
+            assert_eq!(sensor["id"], "mock-degrade-0");
+            assert_eq!(sensor["health"], "degraded");
+            assert_eq!(sensor["degrade_reason"], "permanent");
+            // Degradiert nach dem ersten Abruf; der zweite Zyklus ruft ihn
+            // nicht mehr ab und zählt deshalb auch keinen Fehler mehr.
+            assert_eq!(sensor["errors_total"], 1);
+            assert_eq!(sensor["readings_total"], 0);
+            assert_eq!(value["ipc"]["probes_connected"], 1);
+            assert_eq!(value["ipc"]["events_total"], 1);
+            assert_eq!(value["ipc"]["dropped_total"], 0);
+            Ok(())
+        }
+
+        #[test]
         fn test_poll_once_with_no_bound_socket_is_a_no_op_on_the_buffer() {
             // `inbox == None` entspricht einem gescheiterten `bind()` beim
             // Start (siehe `spawn_ipc_if_available`) — kein Fehler, nur kein
@@ -1395,7 +1815,14 @@ egress_allow_cidrs = []
                 Arc::new(harw_observe::NullSink),
                 SentinelConfig::default(),
             );
-            poll_once(&mut sentinel, None, &harw_observe::NullSink, None);
+            poll_once(
+                &mut sentinel,
+                None,
+                &harw_observe::NullSink,
+                None,
+                None,
+                None,
+            );
             assert_eq!(sentinel.buffer().event_len(), 0);
         }
     }

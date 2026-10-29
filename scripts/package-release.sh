@@ -5,9 +5,11 @@
 #
 # Expects the binaries of a `--target TARGET` build:
 #   target/TARGET/release/harw, target/TARGET/release/killer,
+#   target/TARGET/release/harw-job-exec,
 #   target/TARGET/release-runner/harw-agent-runner
 # Writes DIST/harw-TAG-TARGET.tar.gz (one directory harw-TAG-TARGET/ with
-# the binaries (no killer on Android), README.md and both licenses) and rewrites
+# the binaries (no killer and no harw-job-exec on Android), README.md and
+# both licenses) and rewrites
 # DIST/SHA256SUMS over every tarball in DIST. This is the layout
 # `harw update` and `scripts/install.sh --binary` read; `make release` and
 # `.github/workflows/release.yml` both call this script.
@@ -25,11 +27,13 @@ stage_name="harw-${tag}-${target}"
 release_dir="target/${target}/release"
 runner_dir="target/${target}/release-runner"
 # `killer` needs Linux procfs and pidfd (harw-killer refuses other target
-# OSes at compile time); Android releases ship without it.
+# OSes at compile time); Android releases ship without it. `harw-job-exec`
+# is the job sandbox trampoline (Landlock, cgroup join, rlimits) that harw
+# looks up next to itself; like `make build` it is Linux-only.
 binaries=("$release_dir/harw" "$runner_dir/harw-agent-runner")
 case "$target" in
   *-android) ;;
-  *) binaries+=("$release_dir/killer") ;;
+  *) binaries+=("$release_dir/killer" "$release_dir/harw-job-exec") ;;
 esac
 for binary in "${binaries[@]}"; do
   [ -x "$binary" ] || die "missing $binary (build with --target $target first)"

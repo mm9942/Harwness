@@ -443,10 +443,11 @@ fn free_uname_id_date_which_uptime_env_match_the_gnu_tools() -> TestResult {
             {
                 continue;
             }
-            if let Some(entry) = ours.iter().find(|e| e["name"] == name) {
-                if entry["masked"] == false && !val.contains('\n') {
-                    assert_eq!(entry["value"].as_str(), Some(val), "{name}");
-                }
+            if let Some(entry) = ours.iter().find(|e| e["name"] == name)
+                && entry["masked"] == false
+                && !val.contains('\n')
+            {
+                assert_eq!(entry["value"].as_str(), Some(val), "{name}");
             }
         }
     } else {

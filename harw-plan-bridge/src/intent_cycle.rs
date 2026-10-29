@@ -672,10 +672,10 @@ pub fn admit_cycle(
                 return Err(CycleRefusal::InvalidJoin);
             }
             check_segments(policy, state, branches)?;
-            if let JoinPolicy::Quorum { required } = join {
-                if *required == 0 || usize::from(*required) > branches.len() {
-                    return Err(CycleRefusal::InvalidJoin);
-                }
+            if let JoinPolicy::Quorum { required } = join
+                && (*required == 0 || usize::from(*required) > branches.len())
+            {
+                return Err(CycleRefusal::InvalidJoin);
             }
         }
         CycleProposal::Reorient {

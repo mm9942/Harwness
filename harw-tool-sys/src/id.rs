@@ -181,7 +181,8 @@ pub fn run(identity: &Identity, db: &UserDb, args: &IdArgs) -> ToolOutput {
     name = "sys.id",
     description = "Shows who the agent process runs as like id and whoami: real/effective uid and gid with names and supplementary groups; flags user (-u), group (-g), groups (-G), name (-n), real (-r) shape the text exactly like GNU id; whoami=true gives only the effective user name. Use when you need the current user, uid or group membership instead of running id or whoami. Returns JSON {text, uid, euid, gid, egid, user, group, groups:[{gid,name}], whoami}. Read-only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_id(_context: &ToolExecutionContext, args: IdArgs) -> Result<ToolOutput, ToolsError> {
     run_blocking(TOOL, move || {

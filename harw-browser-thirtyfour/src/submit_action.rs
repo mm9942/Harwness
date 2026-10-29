@@ -31,10 +31,10 @@ impl FirefoxRuntime {
                     request.context_id
                 ),
             })?;
-        if let Some(expected) = request.expected_revision {
-            if expected != current {
-                return Err(BrowserError::StaleRevision { expected, current });
-            }
+        if let Some(expected) = request.expected_revision
+            && expected != current
+        {
+            return Err(BrowserError::StaleRevision { expected, current });
         }
 
         let target = match &request.action {

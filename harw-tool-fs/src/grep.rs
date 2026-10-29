@@ -285,11 +285,25 @@ impl GrepRun<'_> {
                     Ausdruck und liefert Treffer im GNU-grep-Stil. Die Suche ist intern, \
                     symlink-fest und startet keine externen Prozesse.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    activity(
+        domain = "filesystem",
+        verb = "grep",
+        resource = "path",
+        effect = "observe"
+    )
 )]
 async fn fs_grep(context: &ToolExecutionContext, args: GrepArgs) -> Result<ToolOutput, ToolsError> {
     let root = context.sandbox().workspace().canonical_root().to_path_buf();
-    run_blocking("fs.grep", move || Ok(grep_blocking(&root, &args))).await
+    // Keep the per-call lease in the actual blocking work even if the
+    // awaiting future is cancelled. A root PathBuf alone retains no guard.
+    let context = context.clone();
+    run_blocking("fs.grep", move || {
+        let output = grep_blocking(&root, &args);
+        drop(context);
+        Ok(output)
+    })
+    .await
 }
 
 /// Synchroner, vollständig in-process laufender Kern von [`fs_grep`].
@@ -454,10 +468,10 @@ fn grep_internal(root: &Path, args: &GrepArgs) -> ToolOutput {
                     if entry.entry_type != EntryType::File {
                         return ControlFlow::Continue(());
                     }
-                    if let Some(matcher) = run.file_matcher {
-                        if !matcher.is_match(entry.rel) {
-                            return ControlFlow::Continue(());
-                        }
+                    if let Some(matcher) = run.file_matcher
+                        && !matcher.is_match(entry.rel)
+                    {
+                        return ControlFlow::Continue(());
                     }
                     if entry.len > MAX_FILE_SIZE_BYTES {
                         run.skipped += 1;

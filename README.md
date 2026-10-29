@@ -175,15 +175,17 @@ User and integration surfaces include:
 
 See [docs/setup/local-models.md](docs/setup/local-models.md) for local model configuration.
 
-## Detect · Orient · Defend
+## Harw-DoD (Detect · Orient · Defend)
 
-Detect · Orient · Defend is an optional security subsystem and a peer domain in the workspace. It is not an implicit privilege extension for ordinary agents.
+Harw-DoD (Detect · Orient · Defend) is an optional security suite and a peer domain in the workspace. It is not an implicit privilege extension for ordinary agents. "Harw-DoD" is the suite name; its crates, binaries, paths and units keep their `harw-dod`/`harw-*` names.
 
 Its crates cover host observation and security functions including eBPF integration, filesystem monitoring, process monitoring, cgroups, network policy, rules, findings, escalation, probes, Sentinel, and Warden components.
 
 The privileged Warden is deliberately separated from model execution. Enforcement requests require the expected typed authorization/proof path before privileged actions are accepted.
 
-DoD installation and enablement are explicit operations:
+The unprivileged sentinel exports findings and its own health to `/var/lib/harw-dod/export`, readable by members of the (empty by default) `harw-dod-readers` group; harw only reads these files.
+
+Harw-DoD installation and enablement are explicit operations:
 
 ```bash
 make dod-build

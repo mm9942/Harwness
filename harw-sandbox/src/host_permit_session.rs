@@ -151,10 +151,10 @@ impl HostPermitSessionRegistry {
     /// ```
     pub fn mark_session_approved(&self, session: impl Into<String>) {
         let session = session.into();
-        if let Ok(mut state) = self.state.lock() {
-            if !state.approved_sessions.contains(&session) {
-                state.approved_sessions.push(session);
-            }
+        if let Ok(mut state) = self.state.lock()
+            && !state.approved_sessions.contains(&session)
+        {
+            state.approved_sessions.push(session);
         }
     }
 
@@ -392,10 +392,10 @@ impl HostPermitSessionRegistry {
     /// assert!(registry.has_single_use("session-1"));
     /// ```
     pub fn mark_single_use(&self, session: String) {
-        if let Ok(mut state) = self.state.lock() {
-            if !state.single_use.iter().any(|existing| existing == &session) {
-                state.single_use.push(session);
-            }
+        if let Ok(mut state) = self.state.lock()
+            && !state.single_use.iter().any(|existing| existing == &session)
+        {
+            state.single_use.push(session);
         }
     }
 

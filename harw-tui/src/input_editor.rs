@@ -1114,14 +1114,13 @@ impl InputEditor {
         // Ein zuvor markierter bar `Esc`: prüft, ob DIESES Event ihn als
         // Anfang einer zerstückelten CSI-Sequenz bestätigt.
         if let Some(esc_at) = self.pending_esc_at {
-            if now.duration_since(esc_at) <= CSI_ESC_WINDOW {
-                if let KeyCode::Char(introducer @ ('[' | 'O')) = key.code {
-                    if !ctrl {
-                        self.pending_esc_at = None;
-                        self.csi_collect = Some(introducer.to_string());
-                        return InputAction::Redraw;
-                    }
-                }
+            if now.duration_since(esc_at) <= CSI_ESC_WINDOW
+                && let KeyCode::Char(introducer @ ('[' | 'O')) = key.code
+                && !ctrl
+            {
+                self.pending_esc_at = None;
+                self.csi_collect = Some(introducer.to_string());
+                return InputAction::Redraw;
             }
             // Timeout oder Nicht-Treffer: der vorherige `Esc` war ein
             // echter, bewusster Tastendruck — `key` normal weiterverarbeiten.
@@ -1505,21 +1504,21 @@ impl InputEditor {
     /// getippter Text (werden normal eingefügt) und `key` selbst wird
     /// danach ganz normal weiterverarbeitet.
     fn continue_csi_collection(&mut self, key: KeyEvent, ctrl: bool, now: Instant) -> InputAction {
-        if let KeyCode::Char(ch) = key.code {
-            if !ctrl {
-                let mut collected = self.csi_collect.take().unwrap_or_default();
-                collected.push(ch);
-                let is_final = ch.is_ascii_alphabetic() || ch == '~';
-                if is_final {
-                    return self.resolve_csi_sequence(&collected);
-                }
-                if collected.len() >= CSI_MAX_LEN {
-                    self.insert_str(&collected);
-                    return InputAction::Redraw;
-                }
-                self.csi_collect = Some(collected);
+        if let KeyCode::Char(ch) = key.code
+            && !ctrl
+        {
+            let mut collected = self.csi_collect.take().unwrap_or_default();
+            collected.push(ch);
+            let is_final = ch.is_ascii_alphabetic() || ch == '~';
+            if is_final {
+                return self.resolve_csi_sequence(&collected);
+            }
+            if collected.len() >= CSI_MAX_LEN {
+                self.insert_str(&collected);
                 return InputAction::Redraw;
             }
+            self.csi_collect = Some(collected);
+            return InputAction::Redraw;
         }
         // Abbruch: Ctrl-Kombination oder Nicht-Char-Event mitten in der
         // Sammlung — die bisher gesammelten Zeichen waren offenbar

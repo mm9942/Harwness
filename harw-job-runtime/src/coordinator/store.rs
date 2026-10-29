@@ -6,8 +6,10 @@
 //! [`FsJobRecordStore`] implements both on top of
 //! [`harw_job_store::RecordStore::write_sidecar`].
 
-use harw_job_core::StoredJob;
-use harw_job_store::{FsJobRecordStore, JobRecordStore, StoreResult};
+use harw_job_core::{JobClaim, RunnerId, StoredJob};
+use harw_job_store::{
+    ClaimTerms, Conflict, FsJobRecordStore, JobRecordStore, StoreError, StoreResult,
+};
 use harw_types::WorkId;
 
 use super::attempt::ATTEMPTS_SIDECAR;
@@ -22,6 +24,25 @@ pub trait CoordinatorStore: JobRecordStore + Send + Sync + 'static {
     /// # Errors
     /// [`harw_job_store::StoreError::NotFound`], corrupt record, I/O.
     fn load_job(&self, job: &WorkId) -> StoreResult<StoredJob>;
+
+    /// Claims exactly the record the caller validated, under the mutation lock.
+    /// Any change (including input, scope, scheduling or cancellation) refuses
+    /// the claim without allocating a lease. Backends must opt in atomically;
+    /// a separate load followed by `claim_job` cannot satisfy this contract.
+    ///
+    /// # Errors
+    /// Unsupported backend, changed record, or the normal claim errors.
+    fn claim_existing_job(
+        &self,
+        _expected: StoredJob,
+        _runner: &RunnerId,
+        _terms: ClaimTerms,
+    ) -> StoreResult<JobClaim> {
+        Err(StoreError::Unsupported {
+            operation: "claim_existing_job",
+            detail: "store does not implement atomic validated-record claiming".to_owned(),
+        })
+    }
 
     /// Atomically writes (or replaces) the attempt sidecar `attempt`.
     ///
@@ -39,6 +60,33 @@ pub trait CoordinatorStore: JobRecordStore + Send + Sync + 'static {
 impl CoordinatorStore for FsJobRecordStore {
     fn load_job(&self, job: &WorkId) -> StoreResult<StoredJob> {
         self.load(job)
+    }
+
+    fn claim_existing_job(
+        &self,
+        expected: StoredJob,
+        runner: &RunnerId,
+        terms: ClaimTerms,
+    ) -> StoreResult<JobClaim> {
+        self.records()
+            .update_locked(expected.job.id.as_str(), |record| {
+                if *record != expected {
+                    return Err(StoreError::Conflict {
+                        id: expected.job.id.as_str().to_owned(),
+                        conflict: Conflict::Rejected {
+                            detail: "job changed after process dispatch validation".to_owned(),
+                        },
+                    });
+                }
+                let nonce = WorkId::new().as_str().to_owned();
+                harw_job_store::mechanics::claim(
+                    record,
+                    runner.as_str(),
+                    terms.lease_ttl,
+                    terms.now,
+                    nonce,
+                )
+            })
     }
 
     fn write_attempt(&self, attempt: &str, bytes: &[u8]) -> StoreResult<()> {

@@ -9,11 +9,24 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-harw-job = { path = "../harw-job" }
+# `bwrap`: the host port selects the Bubblewrap backends (PL-97 E1).
+harw-job = { path = "../harw-job", features = ["bwrap"] }
+# `JobWriteScope`, carried by a workspace sandbox request (PL-97 E2b).
+harw-job-core = { path = "../harw-job-core" }
+# The caller's Bubblewrap modules (`SandboxProfile`, `HostPathBinding`) of a
+# workspace sandbox request (PL-97 E2b).
+harw-sandbox = { path = "../harw-sandbox" }
 harw-types = { path = "../harw-types" }
 jiff = { workspace = true }
 tracing = "0.1"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The executor seam (`AttemptContext`, `StartedAttempt`) of the host port's
+# workspace router, which runs a workspace request on its own root (PL-97 E2b).
+harw-job-runtime = { path = "../harw-job-runtime" }
+# `BwrapExecutor::with_profile_modules` for the per-request backends (PL-97 E2b).
+harw-job-executor-bwrap = { path = "../harw-job-executor-bwrap" }
 
 [dev-dependencies]
 harw-test-support = { path = "../harw-test-support" }
