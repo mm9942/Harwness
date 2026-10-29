@@ -2,6 +2,8 @@
 //!
 //! Source: `harw-tui` interaction-contract spec.
 
+mod metadata;
+
 use crate::command::CommandOrigin;
 use crate::{
     CommandDomain, CommandError, CommandResult, CommandScope, CommandSpec, Invocation,
@@ -157,6 +159,8 @@ impl CommandRegistry {
     /// - `output`: defaults to [`OutputSurface::Inline`].
     /// - `aliases`: pulled from [`harw_operations::operation::OperationMeta::aliases`] so that
     ///   short aliases like `"m"`, `"p"`, and `"reasoning"` are wired into the TUI catalog.
+    /// - `summary`: localized only for concrete built-in metadata identities;
+    ///   supplied external summaries remain unchanged, including name collisions.
     /// - `busy`: copied from [`harw_operations::operation::OperationMeta::busy`] so that
     ///   [`CommandSpec::busy`] reflects whether the command may run immediately during a
     ///   busy turn or must wait for turn end (the default).
@@ -295,7 +299,7 @@ impl CommandRegistry {
                         cmd_spec.busy = meta.busy;
                         cmd_spec.busy_subcommands = op.busy_subcommands();
                         cmd_spec.summary = meta.summary.to_owned();
-                        crate::command_catalog::enrich(&mut cmd_spec);
+                        metadata::enrich(&mut cmd_spec, meta);
                         // Record in indexes after successful spec construction.
                         path_index.push((raw_path.clone(), op_name.clone()));
                         name_index.push((canonical.clone(), op_name.clone()));
@@ -441,7 +445,7 @@ impl CommandRegistry {
                 subcommands: Vec::new(),
                 origin: CommandOrigin::Operation,
             };
-            crate::command_catalog::enrich(&mut spec);
+            metadata::enrich(&mut spec, meta);
             specs.push(spec);
         }
         Self::new(specs)
@@ -1129,8 +1133,7 @@ mod tests {
             .collect()
     }
 
-    /// Beide Konstruktoren übernehmen `OperationMeta::summary` und reichern
-    /// über `command_catalog::enrich` an.
+    /// Both constructors localize concrete built-ins and enrich their owned grammar.
     #[test]
     fn constructors_set_summary_usage_subcommands_and_origin() -> TestResult {
         let via_ops = CommandRegistry::from_operation_registry(&ops_registry())
@@ -1150,7 +1153,10 @@ mod tests {
             let model = registry
                 .find("model")
                 .ok_or(TestError::Missing("'model' spec must exist"))?;
-            assert!(model.summary.contains("Modell"), "{:?}", model.summary);
+            assert_eq!(
+                model.summary,
+                "Show the current model or switch it with switch <id>"
+            );
             let names: Vec<&str> = model.subcommands.iter().map(|h| h.name).collect();
             assert_eq!(names, ["show", "list", "switch"]);
         }

@@ -1129,4 +1129,80 @@ mod tests {
         });
         Ok(())
     }
+    #[test]
+    fn builtin_summary_help_refresh_preserves_hidden_commands_and_selection() -> TestResult {
+        use crate::i18n::{tr_for, with_language};
+        use harw_config::UiLanguage;
+        let registry_for = |language| {
+            with_language(language, || -> TestResult<CommandRegistry> {
+                let registry = CommandRegistry::built_in().map_err(ctx("built-in"))?;
+                Ok(CommandRegistry::new(
+                    registry
+                        .specs()
+                        .iter()
+                        .filter(|spec| !matches!(spec.name.as_str(), "model" | "mode"))
+                        .cloned()
+                        .collect(),
+                ))
+            })
+        };
+        let keys = KeyBindings::default();
+        let mut help = HelpOverlay::new(
+            &registry_for(UiLanguage::English)?,
+            &keys,
+            HelpTab::Commands,
+        );
+        help.selected = help
+            .commands
+            .iter()
+            .position(|entry| entry.name == "status")
+            .ok_or(crate::test_support::TestError::Missing("status help entry"))?;
+        help.keys_scroll = 3;
+        help.prefixes_scroll = 2;
+        for language in UiLanguage::ALL {
+            with_language(language, || -> TestResult {
+                let registry = registry_for(language)?;
+                help.refresh_presentation(&registry, &keys);
+                assert_eq!(help.commands[help.selected].name, "status");
+                assert_eq!(
+                    help.commands[help.selected].summary,
+                    tr_for(
+                        language,
+                        "operations.summary.status",
+                        "Show the current session and turn status"
+                    )
+                );
+                assert!(
+                    help.commands
+                        .iter()
+                        .all(|entry| !matches!(entry.name.as_str(), "model" | "mode"))
+                );
+                assert_eq!(help.keys_scroll, 3);
+                assert_eq!(help.prefixes_scroll, 2);
+                assert_eq!(help.tab(), HelpTab::Commands);
+                for width in [1, 8, 20, 80, 160] {
+                    let area = Rect::new(0, 0, width, 20);
+                    let mut buffer = Buffer::empty(area);
+                    help.render(area, &mut buffer, Theme::Dark);
+                    if width == 160 {
+                        let text = crate::test_support::display_buffer_text(&buffer);
+                        assert!(
+                            text.contains(&help.commands[help.selected].summary),
+                            "{language:?}: {text}"
+                        );
+                        assert!(text.contains("/status"), "{text}");
+                    }
+                }
+                assert_eq!(
+                    help.on_key(key(KeyCode::Enter)),
+                    OverlayOutcome::Prefill("/status ".into())
+                );
+                help.on_key(key(KeyCode::Down));
+                help.on_key(key(KeyCode::Up));
+                assert_eq!(help.commands[help.selected].name, "status");
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
 }

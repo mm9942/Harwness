@@ -58,10 +58,6 @@ impl CatalogHint {
     }
 }
 
-/// Maximale Länge (Zeichen) einer Operations-Beschreibung, bevor [`enrich`]
-/// sie auf den ersten Satz kürzt.
-const MAX_SUMMARY_CHARS: usize = 110;
-
 // ---------------------------------------------------------------------------
 // Unterkommando-Tabellen
 // ---------------------------------------------------------------------------
@@ -1247,30 +1243,14 @@ fn usage_for(name: &str) -> Option<&'static str> {
         })
 }
 
-/// Kürzt eine lange Beschreibung auf ihren ersten Satz (oder hart auf
-/// [`MAX_SUMMARY_CHARS`] Zeichen mit `…`).
-fn shorten_summary(summary: &str) -> String {
-    if summary.chars().count() <= MAX_SUMMARY_CHARS {
-        return summary.to_owned();
-    }
-    if let Some(end) = summary.find(". ") {
-        let first = &summary[..end];
-        // Mindestlänge schützt vor Abkürzungen wie „z. B.".
-        let len = first.chars().count();
-        if (20..=MAX_SUMMARY_CHARS).contains(&len) {
-            return first.to_owned();
-        }
-    }
-    let mut short: String = summary.chars().take(MAX_SUMMARY_CHARS - 1).collect();
-    short.push('…');
-    short
-}
-
 /// Ergänzt eine Spezifikation um Katalogwissen.
 ///
 /// # Beschreibung
-/// - `summary`: eine Katalog-Überschreibung gewinnt; bekannte Operations-Texte
-///   werden bei Bedarf gekürzt. Unbekannte und lokale Texte bleiben erhalten.
+/// The caller must establish built-in or TUI-local ownership first; registry
+/// adapters validate concrete metadata identity before calling this helper.
+/// Complete messages are retained; terminal layout owns clipping/wrapping.
+///
+/// - `summary`: catalog overrides win; other complete summaries stay unchanged.
 /// - `subcommands`: nur gesetzt, wenn noch leer.
 /// - `usage`: nur gesetzt, wenn noch leer — aus der Katalogtabelle, sonst
 ///   `"/<name>"`.
@@ -1280,11 +1260,6 @@ pub(crate) fn enrich(spec: &mut CommandSpec) {
     let name = spec.name.as_str().to_owned();
     if let Some((_, key, english)) = SUMMARY_OVERRIDES.iter().find(|(n, _, _)| *n == name) {
         spec.summary = tr(key, english).to_owned();
-    } else if spec.origin == crate::command::CommandOrigin::Operation
-        && usage_for(&name).is_some()
-        && !spec.summary.is_empty()
-    {
-        spec.summary = shorten_summary(&spec.summary);
     }
     if name == "settings" {
         spec.summary = crate::i18n::tr("settings.title", "Settings").to_owned();
@@ -1678,7 +1653,7 @@ mod tests {
         spec.usage.clear();
         spec.subcommands.clear();
         enrich(&mut spec);
-        assert!(spec.summary.chars().count() <= MAX_SUMMARY_CHARS);
+        assert_eq!(spec.summary, "x".repeat(200));
         assert_eq!(spec.usage, "/model [show|list|switch <model-id>]");
         assert_eq!(spec.subcommands.len(), 3);
         let once = spec.clone();
@@ -1851,13 +1826,26 @@ mod tests {
     }
 
     #[test]
-    fn shorten_summary_prefers_the_first_sentence() {
-        let long = format!("Das ist der erste Satz. {}", "y".repeat(200));
-        assert_eq!(shorten_summary(&long), "Das ist der erste Satz");
-        let abbreviation = format!("Etwa z. B. {}", "y".repeat(200));
-        let cut = shorten_summary(&abbreviation);
-        assert_eq!(cut.chars().count(), MAX_SUMMARY_CHARS);
-        assert!(cut.ends_with('…'));
-        assert_eq!(shorten_summary("kurz"), "kurz");
+    fn enrich_preserves_long_complete_operation_summaries() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let registry = CommandRegistry::built_in().map_err(ctx("built-in"))?;
+        let model = registry
+            .find("model")
+            .ok_or(crate::test_support::TestError::Missing("model"))?;
+        // A complete second sentence and wide text must survive metadata refresh.
+        let supplied = format!(
+            "Complete description with a second sentence. {}",
+            "日本語 ".repeat(60)
+        );
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                let mut spec = model.clone();
+                spec.summary = supplied.clone();
+                enrich(&mut spec);
+                assert_eq!(spec.summary, supplied);
+            });
+        }
+        Ok(())
     }
 }

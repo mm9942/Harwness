@@ -1120,4 +1120,74 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn builtin_summary_refresh_preserves_hidden_filter_query_and_navigation() -> TestResult {
+        use crate::i18n::{tr_for, with_language};
+        use harw_config::UiLanguage;
+        let registry_for = |language| {
+            with_language(language, || -> TestResult<CommandRegistry> {
+                let registry = CommandRegistry::built_in().map_err(ctx("built-in"))?;
+                Ok(CommandRegistry::new(
+                    registry
+                        .specs()
+                        .iter()
+                        .filter(|spec| !matches!(spec.name.as_str(), "model" | "mode"))
+                        .cloned()
+                        .collect(),
+                ))
+            })
+        };
+        let mut popup = CommandPopup::new(&registry_for(UiLanguage::English)?);
+        popup.on_query_change("status");
+        popup.move_down();
+        let selected = popup.selected_name().map(str::to_owned);
+        assert_eq!(selected.as_deref(), Some("status"));
+        for language in UiLanguage::ALL {
+            with_language(language, || -> TestResult {
+                let registry = registry_for(language)?;
+                popup.refresh_catalog(&registry);
+                assert_eq!(popup.query, "status");
+                assert_eq!(popup.selected_name(), selected.as_deref());
+                assert!(popup.selection_moved);
+                assert!(
+                    popup
+                        .items
+                        .iter()
+                        .all(|item| !matches!(item.name.as_str(), "model" | "mode"))
+                );
+                let description = tr_for(
+                    language,
+                    "operations.summary.status",
+                    "Show the current session and turn status",
+                );
+                assert!(
+                    popup
+                        .items
+                        .iter()
+                        .any(|item| item.name == "status" && item.description == description)
+                );
+                for width in [1, 8, 20, 80, 160] {
+                    let area = Rect::new(0, 0, width, 3);
+                    let mut buffer = Buffer::empty(area);
+                    popup.render(area, &mut buffer, style::Theme::Dark);
+                    if width == 160 {
+                        let text = crate::test_support::display_buffer_text(&buffer);
+                        assert!(text.contains(description), "{language:?}: {text}");
+                        assert!(text.contains("/status"), "{text}");
+                    }
+                }
+                assert_eq!(popup.tab_outcome(), TabOutcome::Accept("status".into()));
+                assert_eq!(popup.completion_line("status"), "/status ");
+                assert_eq!(
+                    popup.on_key(make_key(KeyCode::Enter)),
+                    PopupAction::Accept("status".into())
+                );
+                popup.on_key(make_key(KeyCode::Up));
+                popup.on_key(make_key(KeyCode::Down));
+                assert_eq!(popup.selected_name(), Some("status"));
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
 }
