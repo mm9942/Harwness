@@ -2389,6 +2389,7 @@ dependencies = [
  "harw-core",
  "harw-dod-encrypt",
  "harw-extension-api",
+ "harw-fsutil",
  "harw-home",
  "harw-infra-client",
  "harw-install",
@@ -2465,6 +2466,7 @@ name = "harw-cloud-enroll"
 version = "0.9.1"
 dependencies = [
  "harw-types",
+ "jiff",
  "serde",
  "serde_json",
  "tracing",
@@ -2486,12 +2488,17 @@ dependencies = [
 name = "harw-cloud-ops"
 version = "0.9.1"
 dependencies = [
+ "harw-authority",
  "harw-cloud-gateway",
+ "harw-home",
  "harw-macros",
+ "harw-node-listener",
  "harw-operations",
  "harw-tools",
+ "harw-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -2500,6 +2507,7 @@ name = "harw-cloudctl"
 version = "0.9.1"
 dependencies = [
  "harw-cloud-gateway",
+ "harw-install",
  "serde_json",
  "tokio",
 ]
@@ -3747,6 +3755,7 @@ version = "0.9.1"
 dependencies = [
  "bytes",
  "futures-util",
+ "harw-fsutil",
  "harw-node-transport",
  "harw-protocol",
  "harw-session-host",
@@ -4390,6 +4399,7 @@ name = "harw-session-driver"
 version = "0.9.1"
 dependencies = [
  "harw-core",
+ "harw-extension-api",
  "harw-protocol",
  "harw-session-host",
  "harw-session-store",
@@ -4404,6 +4414,7 @@ dependencies = [
 name = "harw-session-host"
 version = "0.9.1"
 dependencies = [
+ "fs4",
  "harw-authority",
  "harw-fsutil",
  "harw-protocol",

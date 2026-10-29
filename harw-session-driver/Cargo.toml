@@ -20,6 +20,7 @@ thiserror = "2"
 tracing = { workspace = true }
 
 [dev-dependencies]
+harw-extension-api = { path = "../harw-extension-api" }
 tempfile = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
 

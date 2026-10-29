@@ -57,6 +57,7 @@ use harw_session_driver::{
     SessionWiring,
 };
 use harw_session_host::driver::TurnDriver;
+use harw_session_host::record::RecordStore;
 use harw_session_host::{DurableApprovals, DurableTranscripts, HostConfig};
 use harw_session_store::TranscriptStore;
 use harw_types::{ApprovalActor, IngressSurface, PermissionTier, SessionId, ThreadRef};
@@ -213,15 +214,39 @@ impl CoreSessionFactory for GatewayCoreFactory {
     fn build(
         &self,
         session_id: &SessionId,
+        title: Option<&str>,
+        wiring: SessionWiring,
+    ) -> Result<CoreSession, DriverBridgeError> {
+        self.build_authorized(session_id, title, wiring, None)
+    }
+
+    fn build_with_execution(
+        &self,
+        session_id: &SessionId,
+        title: Option<&str>,
+        wiring: SessionWiring,
+        admission: &harw_session_host::driver::ExecutionAdmission,
+    ) -> Result<CoreSession, DriverBridgeError> {
+        self.build_authorized(session_id, title, wiring, Some(admission))
+    }
+}
+
+impl GatewayCoreFactory {
+    fn build_authorized(
+        &self,
+        session_id: &SessionId,
         _title: Option<&str>,
         wiring: SessionWiring,
+        admission: Option<&harw_session_host::driver::ExecutionAdmission>,
     ) -> Result<CoreSession, DriverBridgeError> {
         let runtime = |error: String| DriverBridgeError::Runtime(error);
         let spec = crate::runtime_entry::runtime_spec(
             EntryKind::SessionHost,
             &self.home,
             &self.cwd,
-            crate::runtime_entry::local_principal(IngressSurface::Tui),
+            admission
+                .map(|admission| admission.principal_with_ceiling(self.tier))
+                .unwrap_or_else(|| crate::runtime_entry::local_principal(IngressSurface::Tui)),
         );
         let assembly = RuntimeAssembly::builder(spec)
             .model(ModelSource::Override(Arc::clone(&self.model)))
@@ -237,7 +262,9 @@ impl CoreSessionFactory for GatewayCoreFactory {
             .narrowing(RuntimeNarrowing {
                 registry_profile: harw_registry_defaults::RegistryProfile::Full,
                 identity: harw_registry_defaults::IdentityOverrides::default(),
-                permissions: permissions_for_tier(self.tier),
+                permissions: permissions_for_tier(admission.map_or(self.tier, |admission| {
+                    self.tier.min(admission.maximum_tier())
+                })),
                 workspace_root: None,
             })
             .build()
@@ -245,7 +272,14 @@ impl CoreSessionFactory for GatewayCoreFactory {
         let root = assembly
             .new_root_session(session_id.clone(), wiring.event_tx, wiring.turn_tx, None)
             .map_err(|error| runtime(error.to_string()))?;
-        let session = with_operator_actor(root.session, self.operator_actor())?;
+        // A configured designated approver is host policy (remote ingress).
+        // Otherwise bind approvals to the authenticated creator actor.
+        let actor = self
+            .actor
+            .clone()
+            .or_else(|| admission.map(|admission| admission.approval_actor().clone()))
+            .unwrap_or_else(|| self.operator_actor());
+        let session = with_operator_actor(root.session, actor)?;
         Ok(CoreSession {
             session,
             model: Arc::clone(&self.model),
@@ -344,11 +378,22 @@ pub async fn start_with_driver(
     let uid = own_uid();
     let transcripts = DurableTranscripts::open(&sessions_root)
         .map_err(|error| format!("transcripts: {error}"))?;
+    let host_state_dir = config.state_dir.join("host");
+    let persisted_sessions = RecordStore::new(&host_state_dir)
+        .list()
+        .map_err(|error| format!("hosted session records: {error}"))?;
+    let persisted_ids: Vec<_> = persisted_sessions
+        .into_iter()
+        .map(|record| record.session_id)
+        .collect();
+    transcripts
+        .repair_tails(&persisted_ids)
+        .map_err(|error| format!("transcript startup recovery: {error}"))?;
     let approvals =
         DurableApprovals::open(&sessions_root).map_err(|error| format!("approvals: {error}"))?;
     let services = DaemonServices::new(driver, Arc::new(transcripts), Arc::new(approvals));
     let daemon = Daemon::start(
-        HostConfig::new(config.state_dir.join("host")),
+        HostConfig::new(host_state_dir),
         services,
         UdsConfig::new(&config.socket, uid),
     )
@@ -377,6 +422,15 @@ mod tests {
     struct NoopDriver;
 
     impl TurnDriver for NoopDriver {
+        // This test double performs no privileged runtime/tool effects.
+        fn prepare_execution(
+            &self,
+            _: &harw_types::SessionId,
+            _: harw_session_host::driver::ExecutionAdmission,
+        ) -> harw_session_host::driver::DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
         fn create_session(&self, _: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
             Box::pin(async { Ok(()) })
         }

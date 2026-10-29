@@ -30,6 +30,7 @@ default = []
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
+harw-fsutil = { path = "../harw-fsutil" }
 harw-authority = { path = "../harw-authority" }
 harw-config = { path = "../harw-config" }
 harw-retention = { path = "../harw-retention" }

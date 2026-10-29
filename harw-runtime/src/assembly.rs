@@ -3080,6 +3080,11 @@ impl RuntimeAssemblyBuilder {
             profile.operations,
             &operations,
             &services,
+            (spec.entry == EntryKind::Tui)
+                .then(|| {
+                    harw_cloud_ops::context::LocalProfileOperator::from_principal(&spec.principal)
+                })
+                .flatten(),
         );
         // Runde 5, Teil H: `agent.result` an der Wurzel — nur mit Spawner und
         // Modell-Werkzeugfläche; ein expliziter Wurzel-Agent nur, wenn seine
@@ -3992,38 +3997,49 @@ fn build_operations(surface: OperationSurface, plan: Option<&PlanServices>) -> O
 /// (z. B. in einem Test-Fixture ohne `TurnControl`), bleibt
 /// `OpContext::cancel_token` `None`.
 fn install_operation_model_tools(
-    builder: ExtensionRegistryBuilder,
+    mut builder: ExtensionRegistryBuilder,
     surface: OperationSurface,
     operations: &Arc<OperationRegistry>,
     services: &Arc<RuntimeServices>,
+    local_cloud_operator: Option<harw_cloud_ops::context::LocalProfileOperator>,
 ) -> ExtensionRegistryBuilder {
-    match surface {
-        OperationSurface::CommandsOnly | OperationSurface::None => builder,
-        OperationSurface::AllWithModelTools => {
-            let exposed: Vec<Arc<dyn Operation>> = operations.iter().map(Arc::clone).collect();
-            let services = Arc::clone(services);
-            let provider = ModelToolProvider::new(exposed, move |execution_context| {
-                let ctx = OpContext::new(
-                    execution_context.session_id().clone(),
-                    execution_context.turn_id().clone(),
-                    execution_context.sandbox().clone(),
-                    services.service_map(ServiceSurface::ModelTool),
-                );
-                // Der Turn-Loop hängt seinen `CancelToken` an jeden
-                // `ToolExecutionContext` (`control.cancel_token()`, siehe
-                // `harw-core::turn_loop`); ohne diesen Schritt bekäme jede
-                // Operation — u. a. `AgentToolAdapter::invoke` und
-                // `fanout_children` in `harw-core-bridge` — nie den echten
-                // Turn-Abbruch zu sehen und müsste immer auf einen frischen,
-                // nie abgebrochenen Token zurückfallen.
-                match execution_context.cancel() {
-                    Some(cancel) => ctx.with_cancel_token(cancel.clone()),
-                    None => ctx,
-                }
-            });
-            builder.tool_provider(Arc::new(provider))
-        }
+    if surface != OperationSurface::AllWithModelTools {
+        return builder;
     }
+    // Local profile administration is a separate read-only capability, not
+    // a synthetic workspace tenant. All other operations keep their existing
+    // caller semantics. Hosted/remote turns receive no local capability.
+    let (cloud_read, other): (Vec<_>, Vec<_>) = operations.iter().cloned().partition(|operation| {
+        matches!(
+            operation.meta().name,
+            "cloud.status" | "cloud.enrollments.list"
+        )
+    });
+    for (exposed, local_operator) in [(other, None), (cloud_read, local_cloud_operator)] {
+        if exposed.is_empty() {
+            continue;
+        }
+        let services = Arc::clone(services);
+        let provider = ModelToolProvider::new(exposed, move |execution_context| {
+            let mut service_map = services.service_map(ServiceSurface::ModelTool);
+            if let Some(operator) = local_operator {
+                service_map.insert(operator);
+            }
+            let ctx = OpContext::new(
+                execution_context.session_id().clone(),
+                execution_context.turn_id().clone(),
+                execution_context.sandbox().clone(),
+                service_map,
+            );
+            // Preserve turn cancellation for both provider groups.
+            match execution_context.cancel() {
+                Some(cancel) => ctx.with_cancel_token(cancel.clone()),
+                None => ctx,
+            }
+        });
+        builder = builder.tool_provider(Arc::new(provider));
+    }
+    builder
 }
 
 /// Die Namen aller in `registry` sichtbaren Werkzeuge, sortiert und

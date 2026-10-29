@@ -45,6 +45,15 @@ struct ParkingDriver {
 }
 
 impl TurnDriver for ParkingDriver {
+    // This test double performs no privileged runtime/tool effects.
+    fn prepare_execution(
+        &self,
+        _: &harw_types::SessionId,
+        _: harw_session_host::driver::ExecutionAdmission,
+    ) -> harw_session_host::driver::DriverFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn create_session(&self, _: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }

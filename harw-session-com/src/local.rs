@@ -34,6 +34,8 @@ pub fn local_identity(uid: u32, tier: PermissionTier) -> ClientIdentity {
         tenant: None,
         caps: caps_for_tier(tier).with(gateway_caps_for_tier(tier)),
         device: None,
+        authenticated_node: None,
+        authenticated_key_fingerprint: None,
         actor: ApprovalActor::Operator {
             id: format!("uid:{uid}"),
         },

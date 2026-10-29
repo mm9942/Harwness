@@ -24,6 +24,9 @@ The operator reports better Pi responsiveness under simultaneous builds and a br
 
 ## 2. Reading order
 
+Current cloud code delivery: [implementation ledger](08-cloud-implementation-status.md).
+The historical evidence below remains pinned to its original audit.
+
 1. [Evidence and gap register](01-evidence-and-gaps.md): bounded claims, source anchors, priorities, closure conditions.
 2. [PR reconciliation](02-pr-reconciliation.md): open work, absorbed work, duplicate heads and integration order.
 3. [Host/process/job contract](03-host-process-contract.md): complete-enough inventory, identity, user scope, ownership and resource control.
