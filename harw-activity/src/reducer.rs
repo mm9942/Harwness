@@ -44,7 +44,7 @@
 //! A rebase is a pure binding: it never becomes a constituent of the
 //! instances it rebinds (it is listed in their provenance only).
 //! - A rebase carrying [`crate::Outcome::Failed`] is not applied
-//!   ([`Anomaly::RebaseFailed`]).
+//!   ([`Anomaly::RebaseFailed`]); a cancelled rebase is also not applied.
 //! - `Call(C)` -> `Job(W)`: binds the job instance of `C` (in the rebase's
 //!   session) to `W`, keeps its [`ProjectionId`], records `Call(C)` as alias
 //!   and adds a running `run` constituent. Refused as
@@ -620,6 +620,9 @@ impl Reducer {
             // Fail closed: a binding that reports a failure is not trusted,
             // and the failure must stay visible.
             Rebound::Standalone(Some(Anomaly::RebaseFailed))
+        } else if matches!(event.outcome, Some(Outcome::Cancelled)) {
+            // Cancellation does not establish that the binding occurred.
+            Rebound::Standalone(None)
         } else {
             match (&event.resource, to) {
                 (Some(from @ ActivityKey::Call(_)), ActivityKey::Job(_)) => {
