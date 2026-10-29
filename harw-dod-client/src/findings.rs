@@ -191,38 +191,31 @@ pub struct FindingsTail {
     /// generation (`<path>.1`, if any of it was read) before the current
     /// file.
     pub lines: Vec<FindingLine>,
-    /// `true` when older export data exists that was not read: the read
-    /// started inside the current file or inside `<path>.1`, an older
-    /// generation (`<path>.2`, ...) exists, or `<path>.1` could not be read.
-    /// Counts over such a tail are lower bounds unless the read lines reach
-    /// back past the window start (see [`FindingsTail::summarize`]).
+    /// `true` when export data exists that was not read: the read started
+    /// inside the current file or inside `<path>.1`, an older generation
+    /// (`<path>.2`, ...) exists, `<path>.1` could not be read, or the export
+    /// kept rotating while it was read (a newer current file may then hold
+    /// findings that are missing here). Counts over such a tail are lower
+    /// bounds (see [`FindingsTail::summarize`]).
     pub truncated: bool,
 }
 
 impl FindingsTail {
     /// [`summarize`] over the tail, with [`FindingsSummary::complete`] set
-    /// to `false` when unread data may still fall inside the window: the
-    /// tail is [`truncated`](Self::truncated) and no read line is older than
-    /// `now - window`.
+    /// to `false` whenever the tail is [`truncated`](Self::truncated).
+    ///
+    /// The timestamps of the read lines are never taken as proof that the
+    /// unread data lies outside the window: `observed_at` comes from the
+    /// untrusted export and its append order is not validated, so an old
+    /// timestamp in the read tail says nothing about the unread bytes before
+    /// it. Only full, stable byte coverage of the export makes the counts
+    /// exact.
     #[must_use]
     pub fn summarize(&self, window: Duration, now: OffsetDateTime) -> FindingsSummary {
         let mut summary = summarize(&self.lines, window, now);
-        summary.complete = !self.truncated || reaches_window_start(&self.lines, window, now);
+        summary.complete = !self.truncated;
         summary
     }
-}
-
-/// `true` when the oldest line lies before the window start, so every
-/// unread (older) line is outside the window as well.
-fn reaches_window_start(lines: &[FindingLine], window: Duration, now: OffsetDateTime) -> bool {
-    let Some(earliest) = window_start(window, now) else {
-        return false;
-    };
-    lines
-        .iter()
-        .map(|line| line.observed_at)
-        .min()
-        .is_some_and(|oldest| oldest < earliest)
 }
 
 fn window_start(window: Duration, now: OffsetDateTime) -> Option<OffsetDateTime> {
@@ -230,6 +223,10 @@ fn window_start(window: Duration, now: OffsetDateTime) -> Option<OffsetDateTime>
         .ok()
         .and_then(|window| now.checked_sub(window))
 }
+
+/// How often [`read_findings_tail`] reads the export when it rotates during
+/// the read; the last attempt is returned as truncated.
+const ROTATION_ATTEMPTS: u32 = 2;
 
 /// Reads the tail of the findings export.
 ///
@@ -242,7 +239,14 @@ fn window_start(window: Duration, now: OffsetDateTime) -> Option<OffsetDateTime>
 /// match the schema are skipped, and lines whose `observed_at` lies more
 /// than [`MAX_CLOCK_SKEW`] after `now` are dropped as implausible (they
 /// would otherwise pin every "latest" view). [`FindingsTail::truncated`]
-/// tells whether older data was left unread.
+/// tells whether export data was left unread.
+///
+/// When the export rotates during the read (`<path>.1` is the file just
+/// read, or `<path>` names another file afterwards), the read is retried
+/// once; if it rotates again the result is marked truncated, because the
+/// new current file may hold newer findings. When the retry fails (for
+/// example because the rotated export has no current file yet), the lines
+/// of the earlier pass are returned as truncated instead of the error.
 ///
 /// # Errors
 /// [`DodClientError::NotFound`] when the export does not exist,
@@ -255,28 +259,110 @@ pub fn read_findings_tail(
     max_bytes: u64,
     now: OffsetDateTime,
 ) -> Result<FindingsTail, DodClientError> {
+    read_findings_tail_with(path, max_bytes, now, |_| {})
+}
+
+/// Points inside one read pass where [`read_findings_tail_with`] runs its
+/// hook (tests inject rotations there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadStage {
+    /// After the current file was read, before `<path>.1` is opened.
+    BetweenOpens,
+    /// After all reads of the pass, before the identity of `<path>` is
+    /// checked again.
+    BeforeStability,
+}
+
+/// [`read_findings_tail`] with a hook that runs at each [`ReadStage`].
+fn read_findings_tail_with(
+    path: &Path,
+    max_bytes: u64,
+    now: OffsetDateTime,
+    mut hook: impl FnMut(ReadStage),
+) -> Result<FindingsTail, DodClientError> {
+    let limit = max_bytes.min(MAX_TAIL_BYTES);
+    let mut attempt = 1;
+    // The lines of the last rotated pass: a failing retry must not discard
+    // them (nor report the export as missing and therefore empty).
+    let mut previous: Option<FindingsTail> = None;
+    loop {
+        let pass = match read_once(path, limit, now, &mut hook) {
+            Ok(pass) => pass,
+            Err(error) => {
+                return match previous {
+                    Some(mut tail) => {
+                        tail.truncated = true;
+                        Ok(tail)
+                    }
+                    None => Err(error),
+                };
+            }
+        };
+        match pass {
+            ReadOnce::Stable(tail) => return Ok(tail),
+            ReadOnce::Rotated(mut tail) => {
+                if attempt >= ROTATION_ATTEMPTS {
+                    tail.truncated = true;
+                    return Ok(tail);
+                }
+                previous = Some(tail);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// One pass of [`read_findings_tail`].
+enum ReadOnce {
+    /// The export kept its identity across the pass.
+    Stable(FindingsTail),
+    /// The export rotated during the pass; newer data may be missing.
+    Rotated(FindingsTail),
+}
+
+fn read_once(
+    path: &Path,
+    limit: u64,
+    now: OffsetDateTime,
+    hook: &mut impl FnMut(ReadStage),
+) -> Result<ReadOnce, DodClientError> {
     let Some(current) = open_regular_nofollow(path)? else {
         return Err(DodClientError::NotFound {
             path: path.to_path_buf(),
         });
     };
-    let limit = max_bytes.min(MAX_TAIL_BYTES);
     let current_identity = current.identity;
     let current_size = current.size;
     let newest = read_tail(path, current, limit)?;
     if newest.started_mid_file {
-        return Ok(FindingsTail {
+        let tail = FindingsTail {
             lines: parse_lines(&newest.body, now),
             truncated: true,
-        });
+        };
+        hook(ReadStage::BeforeStability);
+        return Ok(stability(path, current_identity, tail));
     }
+    hook(ReadStage::BetweenOpens);
     let rotated = generation_path(path, 1);
     let budget = limit.saturating_sub(current_size);
     let (mut lines, truncated) = match open_regular_nofollow(&rotated) {
-        Ok(None) => (Vec::new(), false),
+        // Absent `<path>.1` is full coverage only when no older generation
+        // exists: the sentinel shifts `.1` to `.2` before it renames `<path>`
+        // to `.1`, so a read in between would otherwise skip a generation.
+        Ok(None) => (
+            Vec::new(),
+            fs::symlink_metadata(generation_path(path, 2)).is_ok(),
+        ),
         // The sentinel rotated between the two opens: `<path>.1` is the file
-        // just read. Do not count it twice; older data moved on.
-        Ok(Some(older)) if older.identity == current_identity => (Vec::new(), true),
+        // just read, and `<path>` now names a newer file that was not read.
+        // Do not count the old file twice; the pass is retried.
+        Ok(Some(older)) if older.identity == current_identity => {
+            let tail = FindingsTail {
+                lines: parse_lines(&newest.body, now),
+                truncated: true,
+            };
+            return Ok(ReadOnce::Rotated(tail));
+        }
         Ok(Some(older)) => match read_tail(&rotated, older, budget) {
             Ok(older) => (
                 parse_lines(&older.body, now),
@@ -287,7 +373,26 @@ pub fn read_findings_tail(
         Err(_) => (Vec::new(), true),
     };
     lines.extend(parse_lines(&newest.body, now));
-    Ok(FindingsTail { lines, truncated })
+    hook(ReadStage::BeforeStability);
+    Ok(stability(
+        path,
+        current_identity,
+        FindingsTail { lines, truncated },
+    ))
+}
+
+/// [`ReadOnce::Stable`] when `<path>` still names the file read as current,
+/// [`ReadOnce::Rotated`] otherwise (a rotation after the `<path>.1` open, or
+/// the export vanished).
+fn stability(path: &Path, identity: (u64, u64), tail: FindingsTail) -> ReadOnce {
+    use std::os::unix::fs::MetadataExt as _;
+    let unchanged = fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_file() && (meta.dev(), meta.ino()) == identity);
+    if unchanged {
+        ReadOnce::Stable(tail)
+    } else {
+        ReadOnce::Rotated(tail)
+    }
 }
 
 /// `<path>.<generation>`, the sentinel's rotation naming.
@@ -786,17 +891,233 @@ mod tests {
         };
         assert!(!empty.summarize(DEFAULT_FINDINGS_WINDOW, now).complete);
 
-        // Truncated, but the read reaches back past the window start.
+        // Truncated, even though a read line lies before the window start:
+        // export timestamps are untrusted and unordered, so an old line in
+        // the tail proves nothing about the unread bytes before it.
         let covered = FindingsTail {
             lines: vec![old, recent.clone()],
             truncated: true,
         };
         let summary = covered.summarize(DEFAULT_FINDINGS_WINDOW, now);
-        assert!(summary.complete);
+        assert!(!summary.complete);
         assert_eq!(summary.high_or_critical(), 1);
 
         // A bare slice is taken as complete.
         assert!(summarize(&[recent], DEFAULT_FINDINGS_WINDOW, now).complete);
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_order_old_timestamp_after_unread_recent_findings_stays_partial() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let now = at("2026-10-02T12:00:00Z")?;
+        let path = dir.path().join("findings.jsonl");
+        let unread = v1("unread-recent", "r", "critical", "2026-10-02T11:00:00Z");
+        let old = v1("old-stamp", "r", "low", "2026-09-01T00:00:00Z");
+        let recent = v1("recent", "r", "high", "2026-10-02T11:30:00Z");
+        write_lines(&path, &[unread, old.clone(), recent.clone()])?;
+        // The budget covers the last two lines only.
+        let budget = (old.len() + recent.len() + 2) as u64;
+        let tail = read_findings_tail(&path, budget, now)?;
+        assert_eq!(ids(&tail), ["old-stamp", "recent"]);
+        assert!(tail.truncated);
+        let summary = tail.summarize(DEFAULT_FINDINGS_WINDOW, now);
+        assert!(!summary.complete, "a lower bound must not read as exact");
+        assert_eq!(summary.high_or_critical(), 1);
+        Ok(())
+    }
+
+    /// The sentinel's rotation: `<path>` becomes `<path>.1`, a new current
+    /// file is started with `fresh`.
+    fn rotate(path: &Path, fresh: &[String]) -> std::io::Result<()> {
+        fs::rename(path, generation_path(path, 1))?;
+        write_lines(path, fresh)
+    }
+
+    #[test]
+    fn rotation_between_the_two_opens_is_retried_or_stays_partial() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let now = at("2026-10-02T12:00:00Z")?;
+        let path = dir.path().join("findings.jsonl");
+        write_lines(&path, &[v1("a", "r", "low", "2026-10-02T10:00:00Z")])?;
+
+        // One rotation between the opens: the retry reads the new
+        // generation pair and covers the whole export.
+        let mut rotations = 0_u32;
+        let mut result = Ok(());
+        let tail = read_findings_tail_with(&path, MAX_TAIL_BYTES, now, |stage| {
+            if stage != ReadStage::BetweenOpens {
+                return;
+            }
+            if rotations == 0 {
+                result = rotate(&path, &[v1("b", "r", "critical", "2026-10-02T11:00:00Z")]);
+            }
+            rotations += 1;
+        })?;
+        result?;
+        assert_eq!(ids(&tail), ["a", "b"]);
+        assert!(!tail.truncated);
+        assert!(tail.summarize(DEFAULT_FINDINGS_WINDOW, now).complete);
+
+        // The export keeps rotating: the newer current file was never read,
+        // so the summary stays partial.
+        let mut generation = 0_u32;
+        let mut result = Ok(());
+        let tail = read_findings_tail_with(&path, MAX_TAIL_BYTES, now, |stage| {
+            if stage != ReadStage::BetweenOpens {
+                return;
+            }
+            generation += 1;
+            let id = format!("c-{generation}");
+            if result.is_ok() {
+                result = rotate(&path, &[v1(&id, "r", "critical", "2026-10-02T11:30:00Z")]);
+            }
+        })?;
+        result?;
+        assert!(tail.truncated);
+        let summary = tail.summarize(DEFAULT_FINDINGS_WINDOW, now);
+        assert!(!summary.complete);
+        // The file read as current is not counted twice.
+        let mut seen = ids(&tail);
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), tail.lines.len());
+        Ok(())
+    }
+
+    /// Asserts that no finding id appears twice in `tail`.
+    fn assert_no_duplicates(tail: &FindingsTail) {
+        let mut seen = ids(tail);
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), tail.lines.len());
+    }
+
+    #[test]
+    fn rotation_before_the_stability_check_is_retried_or_stays_partial() -> TestResult {
+        let now = at("2026-10-02T12:00:00Z")?;
+        // Whole-file path (`<path>.1` is read) and mid-file path (the budget
+        // ends inside the current file).
+        for mid_file in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("findings.jsonl");
+            let first = [
+                v1("a-1", "r", "low", "2026-10-02T10:00:00Z"),
+                v1("a-2", "r", "low", "2026-10-02T10:10:00Z"),
+            ];
+            write_lines(&path, &first)?;
+            // Mid-file: more than one line, less than the whole file.
+            let budget = if mid_file {
+                first[1].len() as u64 + 12
+            } else {
+                MAX_TAIL_BYTES
+            };
+
+            // One rotation after the reads: the retry reads the new pair.
+            let mut rotations = 0_u32;
+            let mut result = Ok(());
+            let tail = read_findings_tail_with(&path, budget, now, |stage| {
+                if stage == ReadStage::BeforeStability && rotations == 0 {
+                    rotations += 1;
+                    result = rotate(&path, &[v1("b", "r", "critical", "2026-10-02T11:00:00Z")]);
+                }
+            })?;
+            result?;
+            assert_eq!(rotations, 1);
+            assert_no_duplicates(&tail);
+            if mid_file {
+                // The new current file fits, `<path>.1` is then cut.
+                assert!(ids(&tail).contains(&"b"));
+                assert!(tail.truncated);
+            } else {
+                assert_eq!(ids(&tail), ["a-1", "a-2", "b"]);
+                assert!(!tail.truncated);
+                assert!(tail.summarize(DEFAULT_FINDINGS_WINDOW, now).complete);
+            }
+
+            // Rotation on every pass: newer data may be missing.
+            let mut generation = 0_u32;
+            let mut result = Ok(());
+            let tail = read_findings_tail_with(&path, budget, now, |stage| {
+                if stage == ReadStage::BeforeStability && result.is_ok() {
+                    generation += 1;
+                    let id = format!("c-{generation}");
+                    result = rotate(&path, &[v1(&id, "r", "critical", "2026-10-02T11:30:00Z")]);
+                }
+            })?;
+            result?;
+            assert_eq!(generation, ROTATION_ATTEMPTS);
+            assert!(tail.truncated);
+            assert!(!tail.summarize(DEFAULT_FINDINGS_WINDOW, now).complete);
+            assert_no_duplicates(&tail);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn export_vanishing_during_the_read_keeps_the_earlier_tail_partial() -> TestResult {
+        let now = at("2026-10-02T12:00:00Z")?;
+        for stage_to_hit in [ReadStage::BetweenOpens, ReadStage::BeforeStability] {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("findings.jsonl");
+            write_lines(&path, &[v1("a", "r", "critical", "2026-10-02T11:00:00Z")])?;
+            // The sentinel's rotate() renames `<path>` to `.1` and creates the
+            // new current file only on the next append.
+            let mut result = Ok(());
+            let mut done = false;
+            let tail = read_findings_tail_with(&path, MAX_TAIL_BYTES, now, |stage| {
+                if stage == stage_to_hit && !done {
+                    done = true;
+                    result = fs::rename(&path, generation_path(&path, 1));
+                }
+            })?;
+            result?;
+            assert!(done);
+            assert_eq!(ids(&tail), ["a"]);
+            assert!(tail.truncated);
+            let summary = tail.summarize(DEFAULT_FINDINGS_WINDOW, now);
+            assert!(!summary.complete);
+            assert_eq!(summary.high_or_critical(), 1);
+        }
+
+        // Plain removal of the export during the read: also partial, not an
+        // exact empty summary.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("findings.jsonl");
+        write_lines(&path, &[v1("a", "r", "critical", "2026-10-02T11:00:00Z")])?;
+        let mut result = Ok(());
+        let tail = read_findings_tail_with(&path, MAX_TAIL_BYTES, now, |stage| {
+            if stage == ReadStage::BeforeStability && path.exists() {
+                result = fs::remove_file(&path);
+            }
+        })?;
+        result?;
+        assert!(tail.truncated);
+        assert!(!tail.summarize(DEFAULT_FINDINGS_WINDOW, now).complete);
+        Ok(())
+    }
+
+    #[test]
+    fn generation_shift_between_the_opens_stays_partial() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let now = at("2026-10-02T12:00:00Z")?;
+        let path = dir.path().join("findings.jsonl");
+        write_lines(&path, &[v1("new", "r", "low", "2026-10-02T11:00:00Z")])?;
+        write_lines(
+            &generation_path(&path, 1),
+            &[v1("older", "r", "critical", "2026-10-02T10:00:00Z")],
+        )?;
+        // The sentinel shifted `.1` to `.2` but has not renamed `<path>` yet.
+        let mut result = Ok(());
+        let tail = read_findings_tail_with(&path, MAX_TAIL_BYTES, now, |stage| {
+            if stage == ReadStage::BetweenOpens && result.is_ok() {
+                result = fs::rename(generation_path(&path, 1), generation_path(&path, 2));
+            }
+        })?;
+        result?;
+        assert_eq!(ids(&tail), ["new"]);
+        assert!(tail.truncated);
+        assert!(!tail.summarize(DEFAULT_FINDINGS_WINDOW, now).complete);
         Ok(())
     }
 
