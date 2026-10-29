@@ -195,6 +195,10 @@ pub(crate) struct DodEnv {
     /// PL-97 E5: collects the execution chain facts around the root
     /// `doctor` reports; `None` leaves the chain table out.
     pub(crate) chain: Option<ChainCollector>,
+    /// PL-97 E4: the job records of the project in the working directory
+    /// (`<project>/.harw/state/jobs`) for `findings --job`; `None` outside a
+    /// project.
+    pub(crate) jobs_dir: Option<PathBuf>,
 }
 
 /// Collects the execution chain facts for a given cgroup root (production:
@@ -269,7 +273,17 @@ fn host_env(home_override: Option<PathBuf>) -> DodEnv {
         chain: Some(Box::new(move |root| {
             chain_inputs(&home, ChainScope::Full, Some(root))
         })),
+        jobs_dir: project_jobs_dir(),
     }
+}
+
+/// The job records of the project around the working directory (read-only,
+/// nothing is created), as the TUI's job manager keeps them.
+fn project_jobs_dir() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let project = harw_home::project::discover_project(&cwd, &[]).ok()?;
+    let state = harw_home::project::ProjectHome::at(&project).state_dir();
+    Some(ops::jobs_dir(&state))
 }
 
 /// The uid whose user manager runs `harw-serve`: `SUDO_UID` under sudo,
@@ -403,7 +417,7 @@ fn findings(env: &DodEnv, args: &DodFindingsArgs) -> Outcome {
             );
         }
     };
-    let query = ops::FindingsQuery {
+    let mut query = ops::FindingsQuery {
         limit,
         min_severity: args.severity.map(severity),
         rule: args
@@ -413,7 +427,24 @@ fn findings(env: &DodEnv, args: &DodFindingsArgs) -> Outcome {
             .filter(|rule| !rule.is_empty())
             .map(str::to_owned),
         since: args.since,
+        job: None,
     };
+    if let Some(raw) = args.job.as_deref() {
+        let Some(jobs_dir) = &env.jobs_dir else {
+            let error = "no harw project here: `--job` needs the project's job records";
+            return Outcome::new(EXIT_FAILURE, error.to_owned(), json!({ "error": error }));
+        };
+        match ops::job_filter_from_dir(jobs_dir, raw) {
+            Ok(job) => query.job = Some(job),
+            Err(error) => {
+                return Outcome::new(
+                    EXIT_USAGE,
+                    error.to_string(),
+                    json!({ "error": error.to_string() }),
+                );
+            }
+        }
+    }
     let selection = ops::select_findings(&snapshot(env), &query);
     let code = if matches!(selection.export, ExportState::Unreadable { .. }) {
         EXIT_FAILURE
@@ -1584,6 +1615,7 @@ mod tests {
             root_candidates: Vec::new(),
             service_root: Ok(None),
             chain: None,
+            jobs_dir: None,
         }
     }
 
@@ -1800,6 +1832,7 @@ mod tests {
                 severity: None,
                 rule: None,
                 since: None,
+                job: None,
             }),
             &env,
             &mut system,
@@ -1886,6 +1919,7 @@ mod tests {
                 severity: Some(DodSeverity::High),
                 rule: None,
                 since: Some(std::time::Duration::from_secs(3600)),
+                job: None,
             }),
             &env,
             &mut system,
@@ -1904,6 +1938,7 @@ mod tests {
                 severity: None,
                 rule: None,
                 since: None,
+                job: None,
             }),
             &env,
             &mut system,
@@ -1924,6 +1959,92 @@ mod tests {
             check.text.contains("active profile `host`"),
             "{}",
             check.text
+        );
+        Ok(())
+    }
+
+    /// PL-97 E4: `harw dod findings --job <id>` lists only the findings in
+    /// that job's proven cgroup (path-component prefix); a job without one
+    /// gets none, an unknown or malformed id is a usage error.
+    #[test]
+    fn dod_findings_job_filter_uses_the_proven_job_cgroup() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut env = env_in(dir.path());
+        let export = dir.path().join("export");
+        fs::create_dir_all(&export).map_err(ctx("export dir"))?;
+        let at = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let line = |id: &str, scope: &str| {
+            format!(
+                r#"{{"schema_version":2,"finding_id":"{id}","host":"h","rule_id":"egress-flow","severity":"high","summary":"s","observed_at":"{at}","scope":"{scope}"}}"#
+            )
+        };
+        let lines = [
+            line("f-own", "/harw.slice/harw-job-j-1-e1/sub"),
+            line("f-other", "/harw.slice/harw-job-j-1-e10"),
+        ];
+        fs::write(
+            export.join("findings.jsonl"),
+            format!("{}\n", lines.join("\n")),
+        )
+        .map_err(ctx("write export"))?;
+        let jobs = dir.path().join("jobs");
+        let write_job = |id: &str, identity: &str| -> TestResult {
+            let job_dir = jobs.join(id);
+            fs::create_dir_all(&job_dir).map_err(ctx("job dir"))?;
+            fs::write(
+                job_dir.join("meta.json"),
+                format!(
+                    r#"{{"version":2,"job_id":"{id}","name":"t","command":"true","state":"succeeded",{identity}"harw_instance":"h","owner":{{"session":"s"}},"created_at":"2026-01-01T00:00:00Z","notify_every_secs":60}}"#
+                ),
+            )
+            .map_err(ctx("meta.json"))
+        };
+        write_job(
+            "job-1",
+            r#""identity":{"start_ticks":5,"cgroup_path":"/harw.slice/harw-job-j-1-e1","dedicated_cgroup":{"job_id":"job-1","attempt_id":"j-1-e1","delegated_root":"/harw.slice"}},"#,
+        )?;
+        write_job(
+            "job-2",
+            r#""identity":{"start_ticks":5,"cgroup_path":"/harw.slice/harw-job-j-1-e1"},"#,
+        )?;
+        let args = |job: Option<&str>| {
+            DodAction::Findings(DodFindingsArgs {
+                limit: 50,
+                severity: None,
+                rule: None,
+                since: None,
+                job: job.map(str::to_owned),
+            })
+        };
+        let mut system = FakeSystem::new(1000);
+        let outside = execute(args(Some("job-1")), &env, &mut system);
+        assert_eq!(outside.code, EXIT_FAILURE, "no project: {}", outside.text);
+
+        env.jobs_dir = Some(jobs);
+        let own = execute(args(Some("job-1")), &env, &mut system);
+        assert_eq!(own.code, EXIT_OK, "{}", own.text);
+        assert_eq!(own.json["matched"], json!(1), "{}", own.json);
+        assert_eq!(own.json["findings"][0]["id"], json!("f-own"));
+        assert_eq!(own.json["job"]["attributable"], json!(true));
+
+        let unproven = execute(args(Some("job-2")), &env, &mut system);
+        assert_eq!(unproven.code, EXIT_OK, "{}", unproven.text);
+        assert_eq!(unproven.json["matched"], json!(0));
+        assert!(
+            unproven.text.contains("no dedicated cgroup"),
+            "{}",
+            unproven.text
+        );
+
+        for bad in ["job-9", "../job-1"] {
+            let outcome = execute(args(Some(bad)), &env, &mut system);
+            assert_eq!(outcome.code, EXIT_USAGE, "{bad}: {}", outcome.text);
+        }
+        assert_eq!(
+            execute(args(None), &env, &mut system).json["matched"],
+            json!(2)
         );
         Ok(())
     }
@@ -1988,6 +2109,7 @@ mod tests {
                     severity: None,
                     rule: None,
                     since: None,
+                    job: None,
                 }),
                 &env,
                 &mut system,

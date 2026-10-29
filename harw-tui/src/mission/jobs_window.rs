@@ -22,6 +22,12 @@
 //! Home/End, `Enter` opens the job detail, `x` asks to stop the selected
 //! running job ([`super::stop_job`]: confirmation, then the literal line
 //! `/jobs stop <id>` through the regular command path).
+//!
+//! # DoD badge (PL-97 E4)
+//! A row whose own job cgroup has correlated high/critical Harw-DoD findings
+//! shows `⛨ n`. The counts come from the `/dod status` read the status-line
+//! mark already makes (no timer and no file read of its own); the badge is
+//! hidden for `n = 0` and whenever DoD is unavailable.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -39,9 +45,12 @@ use crate::status_line::fit_width;
 use crate::style::{self, Theme};
 
 /// Draws the Active Jobs window into `area` (bordered, title with the number
-/// of running jobs).
+/// of running jobs). `badges` are the `(job id, n)` pairs of the DoD job
+/// correlation ([`crate::dod_view::DodMarkFeed::job_badges`], PL-97 E4): a
+/// row with `n > 0` correlated high/critical findings shows `⛨ n`.
 pub(crate) fn render(
     jobs: &[JobRow],
+    badges: &[(String, u32)],
     area: Rect,
     buf: &mut Buffer,
     theme: Theme,
@@ -87,7 +96,17 @@ pub(crate) fn render(
         .skip(offset)
         .take(height)
         .map(|(index, row)| {
-            crate::jobs_panel::job_line(row, focused && index == selected, inner_width, theme)
+            let badge = badges
+                .iter()
+                .find(|(id, _)| *id == row.id)
+                .map(|(_, count)| *count);
+            crate::jobs_panel::job_line_with_badge(
+                row,
+                focused && index == selected,
+                inner_width,
+                theme,
+                badge,
+            )
         })
         .collect();
     Paragraph::new(visible).render(inner, buf);
@@ -143,12 +162,29 @@ mod tests {
     use crate::test_support::{TestError, TestResult, ctx};
 
     fn screen(jobs: &[JobRow], ui: &WindowUi, focused: bool) -> TestResult<Vec<String>> {
+        screen_with(jobs, &[], ui, focused)
+    }
+
+    fn screen_with(
+        jobs: &[JobRow],
+        badges: &[(String, u32)],
+        ui: &WindowUi,
+        focused: bool,
+    ) -> TestResult<Vec<String>> {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 4))
             .map_err(ctx("test terminal"))?;
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render(jobs, area, frame.buffer_mut(), Theme::Dark, ui, focused);
+                render(
+                    jobs,
+                    badges,
+                    area,
+                    frame.buffer_mut(),
+                    Theme::Dark,
+                    ui,
+                    focused,
+                );
             })
             .map_err(ctx("draw"))?;
         let buffer = terminal.backend().buffer();
@@ -228,6 +264,94 @@ mod tests {
             Some("j3"),
             "gone: the row that moved into its place is selected"
         );
+        Ok(())
+    }
+
+    /// PL-97 E4: the `⛨ n` badge from a `/dod status` fixture: shown on the
+    /// row whose own cgroup has correlated high/critical findings (never on
+    /// `harw-job-…-e10` for `harw-job-…-e1`), hidden for rows without, for
+    /// `n = 0`, for an unverified source and when DoD is unavailable.
+    #[test]
+    fn jobs_window_shows_the_dod_badge_from_the_status_read() -> TestResult {
+        let mut own = job("j1", true, false, "läuft");
+        own.cgroup = Some("/harw.slice/harw-job-j1-e1".to_owned());
+        let mut sibling = job("j2", true, false, "läuft");
+        sibling.cgroup = Some("/harw.slice/harw-job-j1-e10".to_owned());
+        let unscoped = job("j3", true, false, "läuft");
+        let jobs = vec![own, sibling, unscoped];
+
+        let status = |verified: bool| {
+            let mut status = crate::dod_view::tests::status_fixture(3, verified);
+            if let Some(attention) = status.get_mut("attention").and_then(|a| a.as_object_mut()) {
+                attention.insert(
+                    "scopes".to_owned(),
+                    serde_json::json!([
+                        {"scope": "/sys/fs/cgroup/harw.slice/harw-job-j1-e1/sub", "count": 2},
+                        {"scope": "/harw.slice/harw-job-j1-e1", "count": 1},
+                        {"scope": "/system.slice/sshd.service", "count": 4},
+                    ]),
+                );
+            }
+            status
+        };
+        let output = |data: serde_json::Value| harw_operations::OpOutput {
+            text: String::new(),
+            data: Some(data),
+        };
+        // An unverified source (home/override export) plants no badge.
+        let mut feed = crate::dod_view::DodMarkFeed::default();
+        assert!(feed.apply(&Ok(output(status(false)))));
+        assert!(feed.job_badges(&jobs).is_empty());
+
+        let mut feed = crate::dod_view::DodMarkFeed::default();
+        assert!(feed.apply(&Ok(output(status(true)))));
+        let badges = feed.job_badges(&jobs);
+        assert_eq!(badges, vec![("j1".to_owned(), 3)]);
+
+        let tall = |badges: &[(String, u32)]| -> TestResult<Vec<String>> {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 5))
+                .map_err(ctx("test terminal"))?;
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render(
+                        &jobs,
+                        badges,
+                        area,
+                        frame.buffer_mut(),
+                        Theme::Dark,
+                        &WindowUi::default(),
+                        false,
+                    );
+                })
+                .map_err(ctx("draw"))?;
+            let buffer = terminal.backend().buffer();
+            Ok((0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect())
+        };
+        let rows = tall(&badges)?;
+        let line = |name: &str| -> TestResult<String> {
+            rows.iter()
+                .find(|row| row.contains(name))
+                .cloned()
+                .ok_or(TestError::Missing("job row"))
+        };
+        assert!(line("name-j1")?.contains("⛨ 3"), "{rows:?}");
+        assert!(!line("name-j2")?.contains("⛨"), "{rows:?}");
+        assert!(!line("name-j3")?.contains("⛨"), "{rows:?}");
+
+        // n = 0 hides the badge.
+        let zero = tall(&[("j1".to_owned(), 0)])?;
+        assert!(!zero.iter().any(|row| row.contains("⛨")), "{zero:?}");
+
+        // DoD unavailable (read failed): no badges at all.
+        assert!(feed.apply(&Err("DoD nicht verfügbar".to_owned())));
+        assert!(feed.job_badges(&jobs).is_empty());
         Ok(())
     }
 }

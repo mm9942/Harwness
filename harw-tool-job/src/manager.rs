@@ -42,8 +42,8 @@ use crate::event::{JobEvent, JobNotification, JobNotifier};
 use crate::launcher::{PreparedJob, PreparedLaunch};
 use crate::logs::{LogFollower, clip_line, tail_of_file};
 use crate::model::{
-    JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus, META_FILE, META_VERSION,
-    ManagedJobOrigin, STDERR_LOG, STDOUT_LOG,
+    DedicatedCgroupProof, JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus,
+    META_FILE, META_VERSION, ManagedJobOrigin, STDERR_LOG, STDOUT_LOG,
 };
 use crate::procfs::{JobSignal, Liveness, OwnLeader, Recovered, SignalError};
 use crate::progress::{
@@ -969,7 +969,7 @@ impl JobManager {
         };
 
         let pid = started.pid;
-        let leader = adopt_child(&mut meta, pid);
+        let leader = adopt_child(&mut meta, pid, started.cgroup.as_ref());
         meta.state = JobState::Running;
         meta.started_at = Some(Timestamp::now());
         let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader));
@@ -1170,7 +1170,7 @@ impl JobManager {
         };
 
         let pid = started.pid;
-        let leader = adopt_child(&mut meta, pid);
+        let leader = adopt_child(&mut meta, pid, started.cgroup.as_ref());
         meta.state = JobState::Running;
         meta.started_at = Some(Timestamp::now());
         let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader));
@@ -1462,6 +1462,7 @@ impl JobManager {
                     // Letzte Beobachtung für den nächsten Start festhalten.
                     if let Some(fresh) = entry.leader.as_ref().and_then(OwnLeader::refresh_identity)
                     {
+                        let fresh = carry_cgroup_proof(state.meta.identity.as_ref(), fresh);
                         state.meta.proc_start_ticks = Some(fresh.start_ticks);
                         state.meta.identity = Some(fresh);
                     }
@@ -1546,8 +1547,14 @@ async fn wait_terminal(entry: &Arc<JobEntry>, limit: Duration) -> bool {
 }
 
 /// Übernimmt das eben gestartete Kind `pid` (pidfd, Identität) und trägt
-/// PID und Identität in `meta` ein.
-fn adopt_child(meta: &mut JobMeta, pid: Option<u32>) -> Option<OwnLeader> {
+/// PID und Identität in `meta` ein; `cgroup` ist die Bescheinigung der
+/// eigenen Job-cgroup aus genau diesem Start (PL-97 E4, siehe
+/// [`attach_cgroup_proof`]).
+fn adopt_child(
+    meta: &mut JobMeta,
+    pid: Option<u32>,
+    cgroup: Option<&harw_command::AttemptCgroup>,
+) -> Option<OwnLeader> {
     meta.pid = pid;
     let (leader, identity) = match pid {
         Some(pid) => {
@@ -1558,7 +1565,38 @@ fn adopt_child(meta: &mut JobMeta, pid: Option<u32>) -> Option<OwnLeader> {
     };
     meta.proc_start_ticks = identity.as_ref().map(|identity| identity.start_ticks);
     meta.identity = identity;
+    attach_cgroup_proof(meta, cgroup);
     leader
+}
+
+/// Records the runtime's dedicated-cgroup attestation of this job's own
+/// launch as [`DedicatedCgroupProof`], bound to `meta.job_id` (PL-97 E4).
+///
+/// # Description
+/// Fail-closed: without an attestation (no delegated root, no cgroup
+/// created) or without a captured identity nothing is written, and an
+/// earlier proof is cleared. Whether the proof matches the observed cgroup
+/// is decided when it is read ([`crate::JobStatus::job_cgroup_path`]).
+fn attach_cgroup_proof(meta: &mut JobMeta, cgroup: Option<&harw_command::AttemptCgroup>) {
+    let job_id = meta.job_id.clone();
+    if let Some(identity) = meta.identity.as_mut() {
+        identity.dedicated_cgroup = cgroup.map(|cgroup| DedicatedCgroupProof {
+            job_id: Some(job_id),
+            attempt_id: cgroup.attempt_id.clone(),
+            delegated_root: cgroup.delegated_root.clone(),
+        });
+    }
+}
+
+/// A freshly observed identity keeps the dedicated-cgroup proof of the
+/// launch (`/proc` cannot reproduce it); a moved process no longer matches
+/// it and is then not attributed ([`crate::JobStatus::job_cgroup_path`]).
+fn carry_cgroup_proof(
+    previous: Option<&JobProcessIdentity>,
+    mut fresh: JobProcessIdentity,
+) -> JobProcessIdentity {
+    fresh.dedicated_cgroup = previous.and_then(|identity| identity.dedicated_cgroup.clone());
+    fresh
 }
 
 /// Identitätsprüfung eines Jobs ohne eigenen pidfd (frühere Sitzung).
@@ -2051,6 +2089,7 @@ impl Monitor {
         };
         let changed = {
             let mut state = lock(&self.entry.state);
+            let fresh = carry_cgroup_proof(state.meta.identity.as_ref(), fresh);
             if state.meta.identity.as_ref() == Some(&fresh) {
                 false
             } else {

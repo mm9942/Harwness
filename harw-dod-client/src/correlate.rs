@@ -9,10 +9,8 @@
 //! When job cgroups nest, a finding is attributed to the most specific job
 //! only.
 //!
-//! Status: the client half of E4 landed early with D2 (this module and its
-//! prefix tests). E4 itself adds `impl JobCgroup` for the TUI job rows, the
-//! `job_id` filter and the badge, and re-checks the [`CGROUP_MOUNT`]
-//! stripping once E3 has fixed the canonical cgroup-root spelling.
+//! [`correlate_counts`] applies the same rules to per-scope counts (the
+//! high/critical scopes of `dod.status`), which the TUI job badge uses.
 
 use serde::{Deserialize, Serialize};
 
@@ -66,14 +64,7 @@ pub struct JobFindings {
 /// Findings without `scope` and jobs without a cgroup path are ignored.
 #[must_use]
 pub fn correlate<J: JobCgroup>(findings: &[FindingLine], jobs: &[J]) -> Vec<JobFindings> {
-    let job_components: Vec<Option<Vec<&str>>> = jobs
-        .iter()
-        .map(|job| {
-            job.cgroup_path()
-                .and_then(components)
-                .filter(|parts| !parts.is_empty())
-        })
-        .collect();
+    let job_components = job_components(jobs);
     let mut hits: Vec<JobFindings> = jobs
         .iter()
         .map(|job| JobFindings {
@@ -83,16 +74,10 @@ pub fn correlate<J: JobCgroup>(findings: &[FindingLine], jobs: &[J]) -> Vec<JobF
         })
         .collect();
     for (index, finding) in findings.iter().enumerate() {
-        let Some(scope) = finding.scope.as_deref().and_then(components) else {
+        let Some(scope) = finding.scope.as_deref() else {
             continue;
         };
-        let best = job_components
-            .iter()
-            .enumerate()
-            .filter_map(|(job, parts)| parts.as_ref().map(|parts| (job, parts)))
-            .filter(|(_, parts)| scope.starts_with(parts))
-            .max_by_key(|(_, parts)| parts.len())
-            .map(|(job, _)| job);
+        let best = most_specific_job(&job_components, scope);
         if let Some(entry) = best.and_then(|job| hits.get_mut(job)) {
             entry.findings.push(index);
             if finding.is_high_or_critical() {
@@ -102,6 +87,63 @@ pub fn correlate<J: JobCgroup>(findings: &[FindingLine], jobs: &[J]) -> Vec<JobF
     }
     hits.retain(|entry| !entry.findings.is_empty());
     hits
+}
+
+/// A number of findings observed in one scope (e.g. the high/critical
+/// findings per scope of a status summary).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeCount {
+    /// The cgroup path the findings were attributed to.
+    pub scope: String,
+    /// How many findings carry that scope.
+    pub count: u32,
+}
+
+/// Attributes per-scope counts to jobs with the same rules as
+/// [`correlate`] (path-component prefix, most specific job only).
+///
+/// Returns `(job id, summed count)` for every job with a non-zero sum, in
+/// job order.
+#[must_use]
+pub fn correlate_counts<J: JobCgroup>(scopes: &[ScopeCount], jobs: &[J]) -> Vec<(String, u32)> {
+    let job_components = job_components(jobs);
+    let mut sums = vec![0_u32; jobs.len()];
+    for entry in scopes {
+        if let Some(sum) =
+            most_specific_job(&job_components, &entry.scope).and_then(|job| sums.get_mut(job))
+        {
+            *sum = sum.saturating_add(entry.count);
+        }
+    }
+    jobs.iter()
+        .zip(sums)
+        .filter(|(_, sum)| *sum > 0)
+        .map(|(job, sum)| (job.job_id().to_owned(), sum))
+        .collect()
+}
+
+/// The cgroup components of every job (`None`: no usable cgroup path).
+fn job_components<J: JobCgroup>(jobs: &[J]) -> Vec<Option<Vec<&str>>> {
+    jobs.iter()
+        .map(|job| {
+            job.cgroup_path()
+                .and_then(components)
+                .filter(|parts| !parts.is_empty())
+        })
+        .collect()
+}
+
+/// Index of the job whose cgroup is the longest component prefix of
+/// `scope`, if any.
+fn most_specific_job(job_components: &[Option<Vec<&str>>], scope: &str) -> Option<usize> {
+    let scope = components(scope)?;
+    job_components
+        .iter()
+        .enumerate()
+        .filter_map(|(job, parts)| parts.as_ref().map(|parts| (job, parts)))
+        .filter(|(_, parts)| scope.starts_with(parts))
+        .max_by_key(|(_, parts)| parts.len())
+        .map(|(job, _)| job)
 }
 
 /// `true` when `scope` is `job_cgroup` or one of its descendants
@@ -232,5 +274,34 @@ mod tests {
         );
         assert!(correlate::<JobScope>(&findings, &[]).is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn scope_counts_follow_the_same_prefix_rules() {
+        let count = |scope: &str, count: u32| ScopeCount {
+            scope: scope.to_owned(),
+            count,
+        };
+        let scopes = vec![
+            count("/harw.slice/harw-job-1", 2),
+            count("/sys/fs/cgroup/harw.slice/harw-job-1/child", 1),
+            count("/harw.slice/harw-job-10", 4),
+            count("/harw.slice/harw-job-2/nested/harw-job-3/x", 3),
+            count("/harw.slice/harw-job-1/../harw-job-2", 9),
+            count("/system.slice/sshd.service", 5),
+            count("relative/harw-job-1", 0),
+        ];
+        let jobs = vec![
+            job("job-1", Some("/harw.slice/harw-job-1")),
+            job("job-2", Some("/harw.slice/harw-job-2")),
+            job("job-3", Some("/harw.slice/harw-job-2/nested/harw-job-3")),
+            job("job-none", None),
+            job("job-root", Some("/")),
+        ];
+        assert_eq!(
+            correlate_counts(&scopes, &jobs),
+            vec![("job-1".to_owned(), 3), ("job-3".to_owned(), 3)]
+        );
+        assert!(correlate_counts::<JobScope>(&scopes, &[]).is_empty());
     }
 }

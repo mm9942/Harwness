@@ -2524,6 +2524,7 @@ fn dod_subcommands_parse_into_their_actions() -> TestResult {
             severity: None,
             rule: None,
             since: None,
+            job: None,
         })
     );
     assert_eq!(
@@ -2537,12 +2538,15 @@ fn dod_subcommands_parse_into_their_actions() -> TestResult {
             "structure-drift",
             "--since",
             "24h",
+            "--job",
+            "job-1",
         ])?,
         DodAction::Findings(DodFindingsArgs {
             limit: 5,
             severity: Some(DodSeverity::High),
             rule: Some("structure-drift".to_owned()),
             since: Some(std::time::Duration::from_secs(86_400)),
+            job: Some("job-1".to_owned()),
         })
     );
     assert_eq!(

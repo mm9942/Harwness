@@ -56,7 +56,9 @@ pub use chain::{
     same_or_below,
 };
 pub use config::{ActiveProfile, ConfigReport, ProfileScope, read_system_config};
-pub use correlate::{JobCgroup, JobFindings, JobScope, correlate, scope_within};
+pub use correlate::{
+    JobCgroup, JobFindings, JobScope, ScopeCount, correlate, correlate_counts, scope_within,
+};
 pub use error::DodClientError;
 pub use findings::{
     DEFAULT_FINDINGS_WINDOW, FindingLine, FindingsSummary, FindingsTail, MAX_LINE_BYTES,

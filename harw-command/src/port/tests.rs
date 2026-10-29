@@ -310,3 +310,150 @@ async fn streamed_frames_and_cancel_work_on_a_started_command() -> TestResult {
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }
+
+/// PL-97 E4: a started command reports a dedicated cgroup exactly when the
+/// host executor has a delegated root (it then created and attached
+/// `harw-job-<attempt>`); without one it reports none (fail-closed).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn started_command_reports_a_cgroup_only_with_a_delegated_root() -> TestResult {
+    let root = dir("attested-cgroup")?;
+    let port = port(&root)?;
+    let configured = port
+        .runtime()
+        .coordinator()
+        .executor()
+        .host_executor()
+        .options()
+        .cgroup_root
+        .clone();
+    // Outlives its start, so the delegated-root branch is not a race with
+    // the attempt's end.
+    let mut request = sh("sleep 5", Duration::from_secs(20));
+    request.output = CommandOutput::Files {
+        stdout: root.join("out.log"),
+        stderr: root.join("err.log"),
+    };
+    let started = port.start(request).await.map_err(TestError::Unexpected)?;
+    match (&configured, &started.cgroup) {
+        (None, None) => {}
+        (Some(configured), Some(cgroup)) => {
+            assert!(!cgroup.attempt_id.is_empty(), "{cgroup:?}");
+            assert!(
+                configured.ends_with(cgroup.delegated_root.trim_start_matches('/')),
+                "{configured:?} {cgroup:?}"
+            );
+        }
+        (configured, cgroup) => {
+            return Err(TestError::Unexpected(format!(
+                "configured root {configured:?} but attested {cgroup:?}"
+            )));
+        }
+    }
+    (started.cancel)();
+    let outcome = started.done.await;
+    assert_eq!(outcome.end, CommandEnd::Cancelled, "{outcome:?}");
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+/// A Linux executor that attests every attempt it starts as running in its
+/// own cgroup below `/harw.slice` (the fake executor result of the PL-97 E4
+/// attestation chain).
+#[cfg(target_os = "linux")]
+struct AttestingExecutor {
+    inner: harw_job::LinuxExecutor,
+    ledger: Arc<AttemptCgroups>,
+}
+
+#[cfg(target_os = "linux")]
+impl Executor for AttestingExecutor {
+    type Identity = <harw_job::LinuxExecutor as Executor>::Identity;
+
+    fn start(
+        &self,
+        spec: &JobSpec,
+        ctx: &harw_job_runtime::coordinator::AttemptContext,
+    ) -> Result<harw_job_runtime::coordinator::StartedAttempt<Self::Identity>, harw_job::RuntimeError>
+    {
+        let started = self.inner.start(spec, ctx)?;
+        self.ledger
+            .record(ctx.attempt_id.as_str(), "/harw.slice".to_owned());
+        Ok(started)
+    }
+
+    fn probe(
+        &self,
+        identity: &Self::Identity,
+    ) -> Result<harw_job_runtime::coordinator::Probe, harw_job::RuntimeError> {
+        self.inner.probe(identity)
+    }
+
+    fn reattach(
+        &self,
+        identity: &Self::Identity,
+        ctx: &harw_job_runtime::coordinator::AttemptContext,
+    ) -> Result<harw_job_runtime::coordinator::AttemptRun, harw_job::RuntimeError> {
+        self.inner.reattach(identity, ctx)
+    }
+
+    fn recorded_exit(
+        &self,
+        ctx: &harw_job_runtime::coordinator::AttemptContext,
+    ) -> Option<ExitOutcome> {
+        self.inner.recorded_exit(ctx)
+    }
+
+    fn finished(&self, ctx: &harw_job_runtime::coordinator::AttemptContext) {
+        self.inner.finished(ctx);
+    }
+}
+
+/// PL-97 E4: `start` hands over exactly the attestation of the attempt it
+/// started, also for a command that exits at once, and leaves the others.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn start_hands_over_the_attestation_of_its_own_attempt() -> TestResult {
+    let root = dir("attestation-chain")?;
+    let ledger = Arc::new(AttemptCgroups::default());
+    ledger.record("other-e1", "/other.slice".to_owned());
+    let inner = harw_job::LinuxExecutor::new(harw_job::LinuxExecutorOptions {
+        new_session: true,
+        ..harw_job::LinuxExecutorOptions::default()
+    })
+    .map_err(|error| TestError::Unexpected(error.to_string()))?;
+    let store = FsJobRecordStore::create_ambient(&root.join("state"))
+        .map_err(|error| TestError::Unexpected(error.to_string()))?;
+    let runtime = JobRuntime::builder()
+        .store(store)
+        .executor(AttestingExecutor {
+            inner,
+            ledger: Arc::clone(&ledger),
+        })
+        .workspace_root("/")
+        .build()
+        .map_err(|error| TestError::Unexpected(error.to_string()))?;
+    let port = JobCommandPort::with_attestations(runtime, Arc::clone(&ledger));
+    let mut request = sh("exit 0", Duration::from_secs(20));
+    request.output = CommandOutput::Files {
+        stdout: root.join("out.log"),
+        stderr: root.join("err.log"),
+    };
+    let started = port.start(request).await.map_err(TestError::Unexpected)?;
+    let cgroup = started
+        .cgroup
+        .clone()
+        .ok_or(TestError::Missing("attestation"))?;
+    assert_eq!(cgroup.delegated_root, "/harw.slice");
+    assert_ne!(cgroup.attempt_id, "other-e1");
+    assert_eq!(
+        ledger.take(cgroup.attempt_id.as_str()),
+        None,
+        "collected once"
+    );
+    assert_eq!(ledger.len(), 1, "another attempt's attestation stays");
+    let outcome = started.done.await;
+    assert_eq!(outcome.end, CommandEnd::Exited, "{outcome:?}");
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}

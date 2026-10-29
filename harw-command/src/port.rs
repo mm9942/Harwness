@@ -35,7 +35,7 @@
 //! per-spec workspace root validated by the coordinator, with the modules
 //! as typed executor input.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -399,6 +399,153 @@ pub struct StartedCommand {
     pub pid: Option<u32>,
     /// Resolves when the command ended. Dropping it does not stop the command.
     pub done: RunFuture<'static>,
+    /// The dedicated cgroup the runtime created for this attempt and
+    /// attached its primary process to, beneath a delegated cgroup root
+    /// (PL-97 E4). `None` whenever no such cgroup was created (no delegated
+    /// root, a port without a Linux executor, or an attachment that could
+    /// not be verified): fail-closed, never guessed.
+    pub cgroup: Option<AttemptCgroup>,
+}
+
+/// What the runtime attests about the dedicated cgroup of a started attempt
+/// (PL-97 E4): the attempt id it named the cgroup after
+/// (`harw-job-<attempt>`) and the delegated root it created it directly
+/// beneath. A job record turns this into its dedicated-cgroup proof; it
+/// belongs to exactly the launch that returned it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptCgroup {
+    /// The attempt id the runtime assigned (`<work>-e<epoch>`).
+    pub attempt_id: String,
+    /// The delegated cgroup root, hierarchy-relative (e.g. `/harw.slice`),
+    /// the direct parent of the attempt cgroup.
+    pub delegated_root: String,
+}
+
+/// Most attested attempt cgroups the host port holds at once (attempts
+/// whose start has not been collected yet); beyond, the oldest attestation
+/// is dropped (that job simply gets no proof, fail-closed).
+const MAX_ATTESTED_CGROUPS: usize = 4096;
+
+/// Attempt id → delegated root of the attempts the host executor started
+/// in their own cgroup (PL-97 E4), from the executor's start until
+/// [`JobCommandPort::start`] collects it.
+///
+/// # Description
+/// An attestation outlives its attempt: a command that exits before the
+/// port has read its `AttemptStarted` frame still ran in its own cgroup,
+/// and its job keeps the proof. Bounded by [`MAX_ATTESTED_CGROUPS`],
+/// evicting the oldest entries first (attempt ids are never reused).
+#[derive(Debug, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct AttemptCgroups {
+    attested: Mutex<AttestedLedger>,
+}
+
+/// The entries of [`AttemptCgroups`] and their insertion order.
+#[derive(Debug, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct AttestedLedger {
+    roots: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl AttemptCgroups {
+    /// Records that `attempt_id` runs in its own cgroup below `root`.
+    fn record(&self, attempt_id: &str, root: String) {
+        let mut ledger = self.attested.lock().unwrap_or_else(PoisonError::into_inner);
+        if ledger.roots.insert(attempt_id.to_owned(), root).is_some() {
+            return;
+        }
+        ledger.order.push_back(attempt_id.to_owned());
+        while ledger.roots.len() > MAX_ATTESTED_CGROUPS {
+            let Some(oldest) = ledger.order.pop_front() else {
+                break;
+            };
+            if ledger.roots.remove(&oldest).is_some() {
+                tracing::warn!(
+                    attempt = oldest.as_str(),
+                    "too many uncollected job cgroup attestations; the oldest gets no proof"
+                );
+            }
+        }
+    }
+
+    /// Takes the attestation of `attempt_id`, if any.
+    fn take(&self, attempt_id: &str) -> Option<AttemptCgroup> {
+        let mut ledger = self.attested.lock().unwrap_or_else(PoisonError::into_inner);
+        let delegated_root = ledger.roots.remove(attempt_id)?;
+        ledger.order.retain(|id| id != attempt_id);
+        Some(AttemptCgroup {
+            attempt_id: attempt_id.to_owned(),
+            delegated_root,
+        })
+    }
+
+    /// Number of held attestations (tests).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.attested
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .roots
+            .len()
+    }
+}
+
+/// The cgroup leaf the Linux executor creates for `attempt_id`:
+/// `harw-job-<attempt>` with every character outside `[A-Za-z0-9_.-]`
+/// replaced by `_` (mirrors `cgroup_name` in `harw-job-runtime`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn attempt_cgroup_leaf(attempt_id: &str) -> String {
+    let attempt: String = attempt_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("harw-job-{attempt}")
+}
+
+/// The delegated root to attest for a started attempt (PL-97 E4), or `None`.
+///
+/// `configured_root` is the executor's delegated cgroup root (a path under
+/// the cgroup-v2 mount; `None`: the executor creates no job cgroups) and
+/// `observed` the hierarchy-relative cgroup of the attempt's primary process
+/// captured after it was attached (`0::<path>` of `/proc/<pid>/cgroup`).
+/// Only when the observed cgroup is exactly `harw-job-<attempt>` and its
+/// parent is the configured root (component-wise, never the hierarchy root)
+/// is the parent returned; anything else fails closed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn attested_delegated_root(
+    configured_root: Option<&Path>,
+    attempt_id: &str,
+    observed: Option<&str>,
+) -> Option<String> {
+    let configured_root = configured_root.filter(|root| root.is_absolute())?;
+    let rest = observed?.strip_prefix('/')?;
+    if attempt_id.is_empty() || rest.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return None;
+    }
+    let (leaf, parent) = parts.split_last()?;
+    if parent.is_empty() || *leaf != attempt_cgroup_leaf(attempt_id) {
+        return None;
+    }
+    let parent = parent.join("/");
+    configured_root
+        .ends_with(Path::new(&parent))
+        .then(|| format!("/{parent}"))
 }
 
 /// One piece of live output.
@@ -474,6 +621,9 @@ pub struct JobCommandPort<S, E> {
     runtime: JobRuntime<S, E>,
     /// Workspace requests: registrations and backend kinds (host port only).
     router: Option<Arc<WorkspaceRouter>>,
+    /// Attempts the host executor started in their own cgroup (host port
+    /// on Linux only; PL-97 E4).
+    cgroups: Option<Arc<AttemptCgroups>>,
 }
 
 /// What a workspace request's attempt needs besides its spec (module docs).
@@ -761,6 +911,7 @@ impl JobCommandPort<harw_job::FsJobRecordStore, HostCommandExecutor> {
         let cgroup_root = host_cgroup_root(options);
         let (offline, online) = host_backends_with(state_dir, options, cgroup_root.as_deref());
         let router = Arc::new(WorkspaceRouter::new(offline.chosen, online.chosen));
+        let cgroups = Arc::new(AttemptCgroups::default());
         let template = |cgroup_root: Option<PathBuf>| harw_job::LinuxExecutorOptions {
             new_session: true,
             cgroup_root,
@@ -771,6 +922,7 @@ impl JobCommandPort<harw_job::FsJobRecordStore, HostCommandExecutor> {
             offline.backend.clone(),
             online.backend.clone(),
             Arc::clone(&router),
+            Arc::clone(&cgroups),
         ) {
             Ok(executor) => executor,
             Err(error) if cgroup_root.is_some() => {
@@ -783,6 +935,7 @@ impl JobCommandPort<harw_job::FsJobRecordStore, HostCommandExecutor> {
                     offline.backend,
                     online.backend,
                     Arc::clone(&router),
+                    Arc::clone(&cgroups),
                 )
                 .map_err(|error| format!("job executor: {error}"))?
             }
@@ -797,6 +950,7 @@ impl JobCommandPort<harw_job::FsJobRecordStore, HostCommandExecutor> {
         Ok(Self {
             runtime,
             router: Some(router),
+            cgroups: Some(cgroups),
         })
     }
 }
@@ -826,6 +980,8 @@ pub struct HostCommandExecutor {
     workspace: Mutex<Vec<(WorkspaceLaunch, Arc<harw_job::LinuxExecutor>)>>,
     /// The executor of every running workspace attempt, by attempt id.
     running: Mutex<HashMap<String, Arc<harw_job::LinuxExecutor>>>,
+    /// Attempts started in their own cgroup (PL-97 E4), shared with the port.
+    cgroups: Arc<AttemptCgroups>,
 }
 
 #[cfg(target_os = "linux")]
@@ -845,6 +1001,7 @@ impl HostCommandExecutor {
         offline: harw_job::LinuxSandboxBackend,
         online: harw_job::LinuxSandboxBackend,
         router: Arc<WorkspaceRouter>,
+        cgroups: Arc<AttemptCgroups>,
     ) -> Result<Self, harw_job::RuntimeError> {
         let host = harw_job::LinuxExecutor::new(harw_job::LinuxExecutorOptions {
             sandbox: offline.clone(),
@@ -858,6 +1015,7 @@ impl HostCommandExecutor {
             router,
             workspace: Mutex::new(Vec::new()),
             running: Mutex::new(HashMap::new()),
+            cgroups,
         })
     }
 
@@ -945,6 +1103,32 @@ impl HostCommandExecutor {
         Ok(executor)
     }
 
+    /// Attests the dedicated cgroup of an attempt `executor` just started
+    /// (PL-97 E4): only when the executor has a delegated root (it then
+    /// created `harw-job-<attempt>` and spawned the primary into it, or the
+    /// start failed) and the identity captured after the attachment shows
+    /// the primary in exactly that cgroup.
+    fn attest_cgroup(
+        &self,
+        executor: &harw_job::LinuxExecutor,
+        ctx: &harw_job_runtime::coordinator::AttemptContext,
+        started: &harw_job_runtime::coordinator::StartedAttempt<
+            <harw_job::LinuxExecutor as Executor>::Identity,
+        >,
+    ) {
+        let observed = started
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.cgroup_path.as_deref());
+        if let Some(root) = attested_delegated_root(
+            executor.options().cgroup_root.as_deref(),
+            ctx.attempt_id.as_str(),
+            observed,
+        ) {
+            self.cgroups.record(ctx.attempt_id.as_str(), root);
+        }
+    }
+
     /// The executor that started the attempt of `ctx`.
     fn started_by(
         &self,
@@ -974,7 +1158,9 @@ impl Executor for HostCommandExecutor {
             .map(IdempotencyKey::as_str)
             .filter(|key| key.starts_with(WORKSPACE_KEY_PREFIX))
         else {
-            return self.host.start(spec, ctx);
+            let started = self.host.start(spec, ctx)?;
+            self.attest_cgroup(&self.host, ctx, &started);
+            return Ok(started);
         };
         // Never with the runtime's own root: without its registration the
         // attempt does not run.
@@ -991,6 +1177,7 @@ impl Executor for HostCommandExecutor {
             ..ctx.clone()
         };
         let started = executor.start(spec, &attempt)?;
+        self.attest_cgroup(&executor, ctx, &started);
         self.running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1029,6 +1216,8 @@ impl Executor for HostCommandExecutor {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(ctx.attempt_id.as_str());
+        // The attestation stays until the port collects it: a short attempt
+        // can end before its start frame was read (bounded ledger).
         match started {
             Some(executor) => executor.finished(ctx),
             None => self.host.finished(ctx),
@@ -1067,6 +1256,18 @@ impl<S: CoordinatorStore, E: Executor> JobCommandPort<S, E> {
         Self {
             runtime,
             router: None,
+            cgroups: None,
+        }
+    }
+
+    /// Like [`JobCommandPort::new`], but collecting the attestations an
+    /// executor records into `cgroups` (tests of the attestation chain).
+    #[cfg(test)]
+    fn with_attestations(runtime: JobRuntime<S, E>, cgroups: Arc<AttemptCgroups>) -> Self {
+        Self {
+            runtime,
+            router: None,
+            cgroups: Some(cgroups),
         }
     }
 
@@ -1238,11 +1439,17 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
             // starts ends the stream instead.
             let mut began = false;
             let mut pid = None;
+            let mut attempt = None;
             let wait_for_start = async {
                 while let Some(event) = frames.next().await {
-                    if let FrameEvent::Frame(JobFrame::AttemptStarted { pid: started, .. }) = event
+                    if let FrameEvent::Frame(JobFrame::AttemptStarted {
+                        pid: started,
+                        attempt_id,
+                        ..
+                    }) = event
                     {
                         pid = started;
+                        attempt = Some(attempt_id);
                         began = true;
                         break;
                     }
@@ -1250,6 +1457,11 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
             };
             let _ = tokio::time::timeout(START_TIMEOUT, wait_for_start).await;
             let frames = request.stream.then_some(frames);
+            // Only the attestation of this very attempt (PL-97 E4).
+            let cgroup = match (&self.cgroups, &attempt) {
+                (Some(cgroups), Some(attempt)) => cgroups.take(attempt.as_str()),
+                _ => None,
+            };
             if !began {
                 // The attempt never started (spawn, sandbox or admission
                 // failed): that is a failed start, not a running command.
@@ -1310,6 +1522,7 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
                 }),
                 pid,
                 done,
+                cgroup,
             })
         })
     }
@@ -1788,5 +2001,106 @@ mod workspace_tests {
         ));
         let _ = std::fs::remove_dir_all(&state);
         Ok(())
+    }
+}
+
+/// The dedicated-cgroup attestation of started attempts (PL-97 E4).
+#[cfg(test)]
+mod cgroup_attestation_tests {
+    use std::path::Path;
+
+    use super::{
+        AttemptCgroup, AttemptCgroups, MAX_ATTESTED_CGROUPS, attempt_cgroup_leaf,
+        attested_delegated_root,
+    };
+
+    #[test]
+    fn only_the_attempt_cgroup_directly_beneath_the_configured_root_is_attested() {
+        let root = Some(Path::new("/sys/fs/cgroup/user.slice/harw.slice"));
+        // The genuine case: `harw-job-<attempt>` directly beneath the root.
+        assert_eq!(
+            attested_delegated_root(
+                root,
+                "job-1-e1",
+                Some("/user.slice/harw.slice/harw-job-job-1-e1")
+            )
+            .as_deref(),
+            Some("/user.slice/harw.slice")
+        );
+        // The executor's leaf naming replaces unsafe characters.
+        assert_eq!(attempt_cgroup_leaf("job:1.x-e2"), "harw-job-job_1.x-e2");
+        assert_eq!(
+            attested_delegated_root(
+                root,
+                "job:1.x-e2",
+                Some("/user.slice/harw.slice/harw-job-job_1.x-e2")
+            )
+            .as_deref(),
+            Some("/user.slice/harw.slice")
+        );
+        let refused = [
+            // No delegated root: the executor created no job cgroup.
+            (None, "a", Some("/user.slice/harw.slice/harw-job-a")),
+            // A relative configured root is never trusted.
+            (
+                Some(Path::new("user.slice/harw.slice")),
+                "a",
+                Some("/user.slice/harw.slice/harw-job-a"),
+            ),
+            // No observed cgroup.
+            (root, "a", None),
+            // The primary is still in the shared cgroup.
+            (root, "a", Some("/user.slice/harw.slice")),
+            (root, "a", Some("/user.slice/session-2.scope")),
+            // Leaf of another attempt, or a prefix of this one.
+            (root, "a", Some("/user.slice/harw.slice/harw-job-b")),
+            (root, "a-e1", Some("/user.slice/harw.slice/harw-job-a-e10")),
+            // Not directly beneath the configured root.
+            (root, "a", Some("/user.slice/harw.slice/x/harw-job-a")),
+            (root, "a", Some("/other.slice/harw-job-a")),
+            (root, "a", Some("/harw.slice/harw-job-a/leaf")),
+            // The hierarchy root is never a delegated root.
+            (Some(Path::new("/sys/fs/cgroup")), "a", Some("/harw-job-a")),
+            // Malformed observations and attempt ids.
+            (root, "a", Some("user.slice/harw.slice/harw-job-a")),
+            (root, "a", Some("/user.slice//harw.slice/harw-job-a")),
+            (root, "a", Some("/user.slice/../harw.slice/harw-job-a")),
+            (root, "", Some("/user.slice/harw.slice/harw-job-")),
+        ];
+        for (configured, attempt, observed) in refused {
+            assert_eq!(
+                attested_delegated_root(configured, attempt, observed),
+                None,
+                "{configured:?} {attempt:?} {observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attestation_is_collected_once_and_only_for_its_attempt() {
+        let ledger = AttemptCgroups::default();
+        ledger.record("a-e1", "/harw.slice".to_owned());
+        assert_eq!(ledger.take("b-e1"), None);
+        assert_eq!(
+            ledger.take("a-e1"),
+            Some(AttemptCgroup {
+                attempt_id: "a-e1".to_owned(),
+                delegated_root: "/harw.slice".to_owned(),
+            })
+        );
+        assert_eq!(ledger.take("a-e1"), None, "never handed out twice");
+    }
+
+    #[test]
+    fn a_full_ledger_evicts_the_oldest_attestation() {
+        let ledger = AttemptCgroups::default();
+        for index in 0..=MAX_ATTESTED_CGROUPS {
+            ledger.record(&format!("a{index}-e1"), "/harw.slice".to_owned());
+        }
+        assert_eq!(ledger.len(), MAX_ATTESTED_CGROUPS);
+        assert_eq!(ledger.take("a0-e1"), None, "the oldest went first");
+        assert!(ledger.take("a1-e1").is_some());
+        let newest = format!("a{MAX_ATTESTED_CGROUPS}-e1");
+        assert!(ledger.take(&newest).is_some());
     }
 }

@@ -58,7 +58,7 @@ Services
 System
   init | onboard | doctor [--config-dir DIR] | update
   dod status | doctor | sensors
-      | findings [-n N] [--severity S] [--rule ID] [--since 24h]
+      | findings [-n N] [--severity S] [--rule ID] [--since 24h] [--job ID]
       | config check [--config PATH] | config suggest [--drop-in]
       | enable | disable | restart                 (root only)
       | warden status | warden enable | warden disable   (enable/disable root only)
@@ -316,7 +316,7 @@ agree.
 | --- | --- |
 | `status` | Install state, system config and active profile, the six units, Warden state, sentinel health and the high/critical finding counts of the `[dod] findings_window_hours` window. Counts are prefixed `≥` and marked "partial" when older export data was not read (`lower_bound: true` in `--json`). |
 | `doctor` | Read-only prerequisites: cgroup v2, kernel BTF, tracefs, Landlock, `systemctl`/`systemd-sysusers`/`systemd-tmpfiles`, the daemons, the unit files, the config and both exports, plus three warning-only cgroup-root checks (`cgroup-root`, `profile-root`, `allowed-prefixes`, see [DoD setup](setup/dod.md#observe-harw-jobs-pl-97-e3)) and the execution chain table (below). Exit 1 when a prerequisite is missing. The build toolchain checks stay with `make -C dod doctor`. |
-| `findings [-n N] [--severity S] [--rule ID] [--since SPAN]` | The newest findings of the bounded export tail (default 50, at most 200), at or above severity `S`, of one rule, observed within `SPAN` (`90m`, `24h`, `7d`). |
+| `findings [-n N] [--severity S] [--rule ID] [--since SPAN] [--job ID]` | The newest findings of the bounded export tail (default 50, at most 200), at or above severity `S`, of one rule, observed within `SPAN` (`90m`, `24h`, `7d`). `--job ID` keeps only findings whose `scope` lies within that job's own cgroup (path-component prefix, read from the job records of the project in the working directory); a job without a dedicated cgroup (no delegated cgroup root) gets none. |
 | `sensors` | The sentinel health report (`health.json`): per-sensor state, readings, errors, last success, IPC counters; flagged stale after 2 minutes without an update. |
 | `config check [--config PATH]` | Validates `/etc/harw-dod/config.toml` (or `PATH`) exactly like the daemons do (no symlinks, root-owned, not group/world-writable). Exit 0 only for a valid config that selects an `active_profile`. |
 | `config suggest [--drop-in]` | Prints the DoD profile for harw's job cgroups under the resolved delegated cgroup root (`[jobs] cgroup_root`, `HARW_CGROUP_ROOT`, own delegated cgroup) plus the matching `[dod] allowed_cgroup_prefixes`; without a root, the template and a hint. `--drop-in` prints the sentinel `--cgroup-root` drop-in and the `harw-probe-bpf` ordering drop-in instead (see `docs/setup/dod.md`). |

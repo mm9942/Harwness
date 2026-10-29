@@ -73,6 +73,10 @@ pub struct DodFindingsArgs {
     /// Nur Befunde der letzten Zeitspanne, z. B. `90m`, `24h` oder `7d`.
     #[arg(long, value_name = "DAUER", value_parser = parse_since)]
     pub since: Option<Duration>,
+    /// Nur Befunde aus der eigenen cgroup dieses Jobs (Job-ID wie in `/jobs`;
+    /// ohne eigene Job-cgroup keine).
+    #[arg(long = "job", value_name = "JOB-ID", value_hint = ValueHint::Other)]
+    pub job: Option<String>,
 }
 
 /// Mindestschwere für `harw dod findings --severity`.

@@ -1800,3 +1800,215 @@ mod chain {
         Ok(())
     }
 }
+
+/// PL-97 E4: the dedicated-cgroup proof comes only from the runtime's
+/// attestation of this job's launch and is bound to this job.
+mod cgroup_proof {
+    use super::*;
+
+    fn status_of(meta: JobMeta) -> JobStatus {
+        JobStatus {
+            meta,
+            runtime_secs: None,
+            stdout_lines: 0,
+            stderr_lines: 0,
+            last_lines: Vec::new(),
+            log_dir: PathBuf::new(),
+        }
+    }
+
+    fn identity(cgroup_path: &str) -> JobProcessIdentity {
+        JobProcessIdentity {
+            start_ticks: 7,
+            executable: None,
+            cgroup_path: Some(cgroup_path.to_owned()),
+            dedicated_cgroup: None,
+        }
+    }
+
+    fn attested(attempt_id: &str, delegated_root: &str) -> harw_command::AttemptCgroup {
+        harw_command::AttemptCgroup {
+            attempt_id: attempt_id.to_owned(),
+            delegated_root: delegated_root.to_owned(),
+        }
+    }
+
+    #[test]
+    fn proof_is_written_from_the_attestation_and_bound_to_the_job() -> TestResult {
+        let path = "/harw.slice/harw-job-job-1-e1";
+        let mut meta = previous_meta_with("job-1", 42, Some(7), Some(identity(path)))?;
+        attach_cgroup_proof(&mut meta, Some(&attested("job-1-e1", "/harw.slice")));
+        let proof = meta
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.dedicated_cgroup.clone())
+            .ok_or(TestError::Missing("proof"))?;
+        assert_eq!(proof.job_id.as_ref(), Some(&meta.job_id));
+        let own = status_of(meta.clone());
+        assert_eq!(own.job_cgroup_path(), Some(path));
+
+        // The same record under another job id is not attributed.
+        let mut copied = meta;
+        copied.job_id = JobId::parse("job-2").ok_or(TestError::Missing("job id"))?;
+        assert_eq!(status_of(copied).job_cgroup_path(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn without_an_attestation_no_proof_is_written() -> TestResult {
+        // A matching `harw-job-*` leaf without a dedicated cgroup created by
+        // the runtime stays unattributed (fail-closed).
+        let path = "/harw.slice/harw-job-job-1-e1";
+        let mut meta = previous_meta_with("job-1", 42, Some(7), Some(identity(path)))?;
+        attach_cgroup_proof(&mut meta, None);
+        assert_eq!(
+            meta.identity
+                .as_ref()
+                .and_then(|identity| identity.dedicated_cgroup.as_ref()),
+            None
+        );
+        assert_eq!(status_of(meta).job_cgroup_path(), None);
+
+        // No identity: nothing to bind the proof to.
+        let mut bare = previous_meta_with("job-1", 42, None, None)?;
+        attach_cgroup_proof(&mut bare, Some(&attested("job-1-e1", "/harw.slice")));
+        assert_eq!(bare.identity, None);
+
+        // An attestation for another cgroup does not match the observed one.
+        let mut shared = previous_meta_with("job-1", 42, Some(7), Some(identity("/user.slice")))?;
+        attach_cgroup_proof(&mut shared, Some(&attested("job-1-e1", "/harw.slice")));
+        assert_eq!(status_of(shared).job_cgroup_path(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refreshed_identity_keeps_the_launch_proof() -> TestResult {
+        let path = "/harw.slice/harw-job-job-1-e1";
+        let mut meta = previous_meta_with("job-1", 42, Some(7), Some(identity(path)))?;
+        attach_cgroup_proof(&mut meta, Some(&attested("job-1-e1", "/harw.slice")));
+        let fresh = carry_cgroup_proof(meta.identity.as_ref(), identity(path));
+        assert_eq!(Some(&fresh), meta.identity.as_ref());
+        // A process that left its cgroup keeps the proof but no longer matches.
+        meta.identity = Some(carry_cgroup_proof(
+            meta.identity.as_ref(),
+            identity("/user.slice"),
+        ));
+        assert_eq!(status_of(meta).job_cgroup_path(), None);
+        Ok(())
+    }
+
+    /// The real launch path: a process adopted without an attestation gets
+    /// no proof, with one the proof is bound but never matches a shared
+    /// cgroup.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_child_writes_the_proof_only_with_an_attestation() -> TestResult {
+        let pid = std::process::id();
+        let mut meta = previous_meta("job-1", pid, None)?;
+        let _leader = adopt_child(&mut meta, Some(pid), None);
+        let identity = meta
+            .identity
+            .as_ref()
+            .ok_or(TestError::Missing("identity"))?;
+        assert_eq!(identity.dedicated_cgroup, None);
+        assert_eq!(status_of(meta.clone()).job_cgroup_path(), None);
+
+        let _leader = adopt_child(
+            &mut meta,
+            Some(pid),
+            Some(&attested("job-1-e1", "/harw.slice")),
+        );
+        let identity = meta
+            .identity
+            .as_ref()
+            .ok_or(TestError::Missing("identity"))?;
+        let proof = identity
+            .dedicated_cgroup
+            .as_ref()
+            .ok_or(TestError::Missing("proof"))?;
+        assert_eq!(proof.job_id.as_ref(), Some(&meta.job_id));
+        assert_eq!(proof.attempt_id, "job-1-e1");
+        // The test process does not run in `/harw.slice/harw-job-job-1-e1`.
+        assert_eq!(status_of(meta).job_cgroup_path(), None);
+        Ok(())
+    }
+
+    /// The installed host port, reporting `cgroup` as the runtime's
+    /// attestation of every start (the fake executor result).
+    #[derive(Debug)]
+    struct AttestingPort {
+        inner: Arc<dyn harw_command::CommandPort>,
+        cgroup: Option<harw_command::AttemptCgroup>,
+    }
+
+    impl harw_command::CommandPort for AttestingPort {
+        fn run(
+            &self,
+            request: harw_command::CommandRequest,
+            cancel: harw_types::cancel::CancelToken,
+        ) -> harw_command::RunFuture<'_> {
+            self.inner.run(request, cancel)
+        }
+
+        fn start(&self, request: harw_command::CommandRequest) -> harw_command::StartFuture<'_> {
+            let cgroup = self.cgroup.clone();
+            let started = self.inner.start(request);
+            Box::pin(async move {
+                let mut started = started.await?;
+                started.cgroup = cgroup;
+                Ok(started)
+            })
+        }
+    }
+
+    /// The chain from the port's started command to `meta.json`: the proof
+    /// is persisted bound to this job exactly when the start was attested.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn job_start_persists_the_attested_proof_bound_to_the_job() -> TestResult {
+        let env = Env::new()?;
+        let inner = harw_command::installed().ok_or(TestError::Missing("host port"))?;
+        let cases = [
+            ("attested", Some(attested("runtime-e1", "/harw.slice"))),
+            ("plain", None),
+        ];
+        for (tag, cgroup) in cases {
+            let port = Arc::new(AttestingPort {
+                inner: Arc::clone(&inner),
+                cgroup: cgroup.clone(),
+            });
+            let manager = JobManager::with_command_port(
+                crate::test_support::fast_config(&env.dir.path().join(tag)),
+                Arc::new(crate::NoopNotifier),
+                port as Arc<dyn harw_command::CommandPort>,
+            )
+            .map_err(ctx("job manager"))?;
+            let prepared = env.prepare("sleep 30").await?;
+            let started = manager
+                .start(request(tag, "agent-a", &[]), prepared)
+                .await
+                .map_err(ctx("start"))?;
+            let job_id = started.meta.job_id.clone();
+            let on_disk =
+                read_meta(&started.log_dir).ok_or(TestError::Missing("meta.json after start"))?;
+            let proof = on_disk
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.dedicated_cgroup.clone());
+            match &cgroup {
+                Some(cgroup) => {
+                    let proof = proof.ok_or(TestError::Missing("persisted proof"))?;
+                    assert_eq!(proof.job_id.as_ref(), Some(&job_id));
+                    assert_eq!(proof.attempt_id, cgroup.attempt_id);
+                    assert_eq!(proof.delegated_root, cgroup.delegated_root);
+                }
+                None => assert!(proof.is_none(), "{proof:?}"),
+            }
+            manager
+                .stop(&job_id, Caller::Agent("agent-a"), JobSignal::Term)
+                .await
+                .map_err(ctx("stop"))?;
+        }
+        Ok(())
+    }
+}

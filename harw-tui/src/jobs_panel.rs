@@ -63,7 +63,8 @@ pub(crate) struct JobRow {
     /// `/proc/<pid>/cgroup`), not under `/sys/fs/cgroup`. `None` when unknown
     /// **or** when the job runs in a shared cgroup (no delegated cgroup root:
     /// harw's own or the session's, e.g. `/user.slice`), so attribution by
-    /// this path fails closed. Sanitized; not rendered yet.
+    /// this path fails closed. Sanitized; not rendered, only correlated with
+    /// DoD findings (PL-97 E4, the `⛨ n` badge of the Jobs window).
     pub cgroup: Option<String>,
     /// PL-97 C4: end of the job (`meta.json` `ended_at`), if known; orders
     /// the constituents of the Finished / Failed window (newest first).
@@ -239,6 +240,18 @@ pub(crate) fn failure_reason(status: &JobStatus) -> Option<String> {
     Some(sanitize_inline(&text))
 }
 
+/// PL-97 E4: die Zeile korreliert über ihre **eigene** Job-cgroup
+/// ([`JobRow::cgroup`]); ohne sie wird ihr nichts zugeordnet.
+impl harw_ops::dod::JobCgroup for JobRow {
+    fn job_id(&self) -> &str {
+        &self.id
+    }
+
+    fn cgroup_path(&self) -> Option<&str> {
+        self.cgroup.as_deref()
+    }
+}
+
 /// Symbol und Stil eines Jobs.
 fn job_glyph(row: &JobRow, theme: Theme) -> (&'static str, Style) {
     if row.active {
@@ -259,9 +272,27 @@ fn job_glyph(row: &JobRow, theme: Theme) -> (&'static str, Style) {
 /// mit `…` gekürzt.
 #[must_use]
 pub(crate) fn job_line(row: &JobRow, selected: bool, width: usize, theme: Theme) -> Line<'static> {
+    job_line_with_badge(row, selected, width, theme, None)
+}
+
+/// Wie [`job_line`], mit der DoD-Marke `⛨ n` vor dem Namen (PL-97 E4):
+/// `badge` ist die Zahl der dem Job zugeordneten high/critical-Befunde;
+/// `None` oder `0` blendet sie aus.
+#[must_use]
+pub(crate) fn job_line_with_badge(
+    row: &JobRow,
+    selected: bool,
+    width: usize,
+    theme: Theme,
+    badge: Option<u32>,
+) -> Line<'static> {
     let marker = if selected { "▸" } else { " " };
     let (glyph, glyph_style) = job_glyph(row, theme);
-    let prefix = format!("{marker}{glyph} ");
+    let badge = badge
+        .filter(|count| *count > 0)
+        .map(|count| format!("⛨ {count} "))
+        .unwrap_or_default();
+    let prefix = format!("{marker}{glyph} {badge}");
     let available = width.saturating_sub(display_width(&prefix));
     let name_width = display_width(&row.name);
     let full_right = format!(" {} {}", row.state_label(), row.runtime);
@@ -295,6 +326,12 @@ pub(crate) fn job_line(row: &JobRow, selected: bool, width: usize, theme: Theme)
     let line = Line::from(vec![
         Span::raw(marker.to_owned()),
         Span::styled(format!("{glyph} "), glyph_style),
+        Span::styled(
+            badge,
+            Style::default()
+                .fg(style::error_color(theme))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(progress, detail_style),
         Span::raw(pad),

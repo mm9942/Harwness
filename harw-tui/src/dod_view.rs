@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use harw_operations::OpOutput;
+use harw_ops::dod::ScopeCount;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -170,6 +171,31 @@ pub(crate) struct DodMarkFeed {
     mark: Option<DodMark>,
     /// The read started by [`Self::begin`] that has not reported yet.
     in_flight: Option<MarkRead>,
+    /// PL-97 E4: high/critical findings per cgroup scope of the last read
+    /// (`attention.scopes`); empty whenever the mark is unavailable.
+    scopes: Vec<ScopeCount>,
+}
+
+/// Parses `attention.scopes` of a `/dod status` result (bounded to
+/// [`harw_ops::dod::MAX_ATTENTION_SCOPES`] entries; malformed entries are
+/// skipped).
+fn attention_scopes(data: &Value) -> Vec<ScopeCount> {
+    data.get("attention")
+        .and_then(|attention| attention.get("scopes"))
+        .and_then(Value::as_array)
+        .map(|scopes| {
+            scopes
+                .iter()
+                .filter_map(|entry| {
+                    Some(ScopeCount {
+                        scope: entry.get("scope")?.as_str()?.to_owned(),
+                        count: u32::try_from(entry.get("count")?.as_u64()?).ok()?,
+                    })
+                })
+                .take(harw_ops::dod::MAX_ATTENTION_SCOPES)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl DodMarkFeed {
@@ -221,13 +247,31 @@ impl DodMarkFeed {
     /// # Returns
     /// `true` when the visible mark changed.
     pub(crate) fn apply(&mut self, result: &Result<OpOutput, String>) -> bool {
-        let mark = match result {
-            Ok(output) => output.data.as_ref().and_then(DodMark::from_status),
-            Err(_) => None,
+        let data = result.as_ref().ok().and_then(|output| output.data.as_ref());
+        let mark = data.and_then(DodMark::from_status);
+        let scopes = match (mark, data) {
+            (Some(_), Some(data)) => attention_scopes(data),
+            _ => Vec::new(),
         };
-        let changed = self.visible() != mark.filter(|mark| mark.is_alert());
+        let changed =
+            self.visible() != mark.filter(|mark| mark.is_alert()) || self.scopes != scopes;
         self.mark = mark;
+        self.scopes = scopes;
         changed
+    }
+
+    /// PL-97 E4: `(job id, n)` for every job row with `n > 0` high/critical
+    /// findings attributed to its own cgroup (path-component prefix, most
+    /// specific job), from the last read only — no file is read here.
+    /// Empty when DoD is unavailable, and for an unverified source (a
+    /// home/override export a user process can write): a job row never
+    /// shows such data as a DoD fact.
+    #[must_use]
+    pub(crate) fn job_badges(&self, jobs: &[crate::jobs_panel::JobRow]) -> Vec<(String, u32)> {
+        if !self.mark.is_some_and(|mark| mark.verified) || self.scopes.is_empty() {
+            return Vec::new();
+        }
+        harw_ops::dod::correlate_counts(&self.scopes, jobs)
     }
 
     /// The mark to show: present only with at least one high/critical

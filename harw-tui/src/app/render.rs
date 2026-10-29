@@ -295,6 +295,7 @@ fn draw_cards(
             if let Some(jobs_area) = jobs {
                 jobs_window::render(
                     app.agent_monitor.jobs(),
+                    &app.dod_mark.job_badges(app.agent_monitor.jobs()),
                     jobs_area,
                     buf,
                     theme,

@@ -33,7 +33,7 @@ pub use harw_job_core::spec::JobWriteScope;
 #[cfg(target_os = "linux")]
 pub use port::HostCommandExecutor;
 pub use port::{
-    CommandEnd, CommandFrame, CommandFrames, CommandOutcome, CommandOutput, CommandPort,
-    CommandRequest, CommandSandbox, CommandStdin, HostPortOptions, JobCommandPort, OutputStream,
-    RunFuture, StartFuture, StartedCommand, WorkspaceSandbox,
+    AttemptCgroup, CommandEnd, CommandFrame, CommandFrames, CommandOutcome, CommandOutput,
+    CommandPort, CommandRequest, CommandSandbox, CommandStdin, HostPortOptions, JobCommandPort,
+    OutputStream, RunFuture, StartFuture, StartedCommand, WorkspaceSandbox,
 };
