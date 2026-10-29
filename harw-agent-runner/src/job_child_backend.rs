@@ -40,8 +40,8 @@ use harw_core::child_backend::{
 };
 use harw_core::child_controller::ChildUsage;
 use harw_tool_job::{
-    Caller, JobId, JobManager, JobOwner, JobSignal, PipedJob, PipedLineError, PreparedJob,
-    StartRequest,
+    Caller, JobId, JobManager, JobOrigin, JobOwner, JobSignal, PipedJob, PipedLineError,
+    PreparedJob, StartRequest,
 };
 use harw_types::cancel::CancelReason;
 #[cfg(test)]
@@ -259,7 +259,10 @@ impl StdoutSource {
 
 /// Runs `spec` as a job through `job_manager` (production path): the child
 /// is `spawner`'s command, started with `JobManager::start_piped` so it gets
-/// the same process-group/log/monitor machinery as any other job.
+/// the same process-group/log/monitor machinery as any other job. The job is
+/// tagged with its typed provenance `AgentChild { child_session_id }`
+/// (W20-A), so job views can attribute it to the child run instead of
+/// counting it as a job of its own.
 async fn run_job_managed<S: ChildProcessSpawner>(
     job_manager: &Arc<JobManager>,
     spawner: &S,
@@ -281,8 +284,9 @@ async fn run_job_managed<S: ChildProcessSpawner>(
         notify_every: Duration::ZERO,
         owner: JobOwner::new(spec.parent.as_str(), Vec::new()),
     };
+    let origin = JobOrigin::agent_child(spec.child.as_str());
     let piped = match job_manager
-        .start_piped_with_line_limit(request, prepared, MAX_FRAME_BYTES)
+        .start_piped_with_origin(request, prepared, MAX_FRAME_BYTES, origin)
         .await
     {
         Ok(piped) => piped,
@@ -962,6 +966,54 @@ mod tests {
         assert_eq!(outcome.status, ChildRunStatus::Completed);
         assert_eq!(outcome.text.as_deref(), Some("done"));
         assert_eq!(outcome.usage.tokens, 3);
+        Ok(())
+    }
+
+    /// W20-A: the job-managed path tags the child's job with its typed
+    /// provenance `AgentChild { child_session_id }` — in `meta.json` and in
+    /// the `Started` event — and leaves the R18 tool fields empty.
+    #[tokio::test]
+    async fn job_managed_path_tags_the_job_as_agent_child() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let config = harw_tool_job::JobManagerConfig::new(dir.path());
+        let recorder = Arc::new(harw_tool_job::RecordingNotifier::default());
+        let job_manager = harw_tool_job::JobManager::new(
+            config,
+            Arc::clone(&recorder) as Arc<dyn harw_tool_job::JobNotifier>,
+        )?;
+        harw_command::install_host_default(&std::env::temp_dir().join(format!(
+            "harw-agent-runner-command-jobs-{}",
+            std::process::id()
+        )));
+        let backend = JobChildBackend::with_spawner_and_job_manager(
+            ShellSpawner {
+                script: hello_then_result_script(),
+            },
+            Arc::clone(&job_manager),
+        );
+        let spec = spec(harw_types::cancel::CancelToken::new());
+        let expected = harw_tool_job::ManagedJobOrigin::AgentChild {
+            child_session_id: spec.child.as_str().to_owned(),
+        };
+        let outcome = backend.run(spec, &RecordingIo).await;
+        assert_eq!(outcome.status, ChildRunStatus::Completed);
+
+        let jobs = job_manager.list(Caller::Operator);
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let meta = &jobs[0].meta;
+        assert_eq!(meta.origin.as_ref(), Some(&expected));
+        assert_eq!(meta.resolved_origin(), Some(expected.clone()));
+        assert_eq!(meta.origin_tool, None);
+        assert_eq!(meta.origin_call_id, None);
+        let started = recorder
+            .notifications()
+            .into_iter()
+            .find_map(|notification| match notification.event {
+                harw_tool_job::JobEvent::Started { origin, .. } => Some(origin),
+                _ => None,
+            })
+            .ok_or("no Started event")?;
+        assert_eq!(started, Some(expected));
         Ok(())
     }
 

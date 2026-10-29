@@ -11,7 +11,7 @@
 //! Ereignis, Ansichten bauen beim Öffnen neu).
 
 use harw_tool_job::model::JobEndReason;
-use harw_tool_job::{JobState, JobStatus};
+use harw_tool_job::{JobState, JobStatus, ManagedJobOrigin};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -48,6 +48,19 @@ pub(crate) struct JobRow {
     /// Grund des Fehlschlags (R18 F9), nur bei `failed`; siehe
     /// [`failure_reason`].
     pub reason: Option<String>,
+    /// W20-A: typed provenance (`AgentChild`, `Tool`, `Operator`) from
+    /// [`harw_tool_job::JobMeta::resolved_origin`]; `None` = unknown
+    /// provenance (a legacy record without origin fields), never guessed
+    /// from the name. Not rendered yet.
+    pub origin: Option<ManagedJobOrigin>,
+    /// W20-A/E4: the job's **dedicated** cgroup (`…/harw-job-<attempt>`)
+    /// from its persisted process identity ([`JobStatus::job_cgroup_path`]).
+    /// The path is relative to the cgroup-v2 hierarchy (`0::` form of
+    /// `/proc/<pid>/cgroup`), not under `/sys/fs/cgroup`. `None` when unknown
+    /// **or** when the job runs in a shared cgroup (no delegated cgroup root:
+    /// harw's own or the session's, e.g. `/user.slice`), so attribution by
+    /// this path fails closed. Sanitized; not rendered yet.
+    pub cgroup: Option<String>,
 }
 
 impl JobRow {
@@ -64,7 +77,24 @@ impl JobRow {
             active: !state.is_terminal(),
             failed: matches!(state, JobState::Failed | JobState::Unknown),
             reason: failure_reason(status),
+            origin: status.meta.resolved_origin().map(sanitize_origin),
+            cgroup: status.job_cgroup_path().map(sanitize_inline),
         }
+    }
+}
+
+/// Macht die Texte einer Herkunft terminal-sicher (sie stammen aus
+/// `meta.json`, wie Name und Befehl); saubere Kennungen bleiben unverändert.
+fn sanitize_origin(origin: ManagedJobOrigin) -> ManagedJobOrigin {
+    match origin {
+        ManagedJobOrigin::AgentChild { child_session_id } => ManagedJobOrigin::AgentChild {
+            child_session_id: sanitize_inline(&child_session_id),
+        },
+        ManagedJobOrigin::Tool { tool, call_id } => ManagedJobOrigin::Tool {
+            tool: sanitize_inline(&tool),
+            call_id: call_id.as_deref().map(sanitize_inline),
+        },
+        ManagedJobOrigin::Operator => ManagedJobOrigin::Operator,
     }
 }
 
@@ -443,6 +473,8 @@ mod tests {
             active,
             failed,
             reason: None,
+            origin: None,
+            cgroup: None,
         }
     }
 
@@ -558,6 +590,110 @@ mod tests {
             !detail.header.iter().any(|line| line.starts_with("Grund:")),
             "{:?}",
             detail.header
+        );
+        Ok(())
+    }
+
+    /// W20-A: `JobRow` übernimmt die typisierte Herkunft — alte R18-Felder
+    /// werden `Tool`, ohne Herkunftsfeld bleibt sie unbekannt (nie aus dem
+    /// Namen geraten), `AgentChild`/`Operator` kommen unverändert an — und
+    /// den cgroup-Pfad aus der gespeicherten Prozessidentität, aber nur eine
+    /// eigene Job-cgroup (`harw-job-…`), nie eine geteilte; Steuerzeichen
+    /// kommen nur markiert an.
+    #[test]
+    fn job_row_maps_origin_and_cgroup() -> TestResult {
+        let legacy_tool = status_of(
+            &meta_json(
+                "succeeded",
+                r#""exit_code":0,"origin_call_id":"call-42","origin_tool":"job.start","#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        let row = JobRow::from_status(&legacy_tool);
+        assert_eq!(
+            row.origin,
+            Some(ManagedJobOrigin::Tool {
+                tool: "job.start".to_owned(),
+                call_id: Some("call-42".to_owned()),
+            })
+        );
+        assert_eq!(row.cgroup, None);
+
+        let unknown = status_of(
+            &meta_json("running", "", r#"{"session":"uia"}"#)
+                .replace(r#""name":"tests""#, r#""name":"agent-child-explorer""#),
+            &[],
+        )?;
+        assert_eq!(JobRow::from_status(&unknown).origin, None);
+
+        let child = status_of(
+            &meta_json(
+                "running",
+                r#""origin":{"kind":"agent_child","child_session_id":"child-7"},
+                   "identity":{"start_ticks":5,"cgroup_path":"/harw.slice/harw-job-3"},"#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        let row = JobRow::from_status(&child);
+        assert_eq!(
+            row.origin,
+            Some(ManagedJobOrigin::AgentChild {
+                child_session_id: "child-7".to_owned(),
+            })
+        );
+        assert_eq!(row.cgroup.as_deref(), Some("/harw.slice/harw-job-3"));
+
+        let operator = status_of(
+            &meta_json(
+                "running",
+                r#""origin":{"kind":"operator"},"origin_tool":"job.start","#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        assert_eq!(
+            JobRow::from_status(&operator).origin,
+            Some(ManagedJobOrigin::Operator),
+            "die typisierte Herkunft gewinnt über die R18-Felder"
+        );
+
+        // Eine geteilte cgroup (ohne delegierte Wurzel) ist nie die des Jobs.
+        let shared = status_of(
+            &meta_json(
+                "running",
+                r#""origin":{"kind":"agent_child","child_session_id":"child-8"},
+                   "identity":{"start_ticks":5,"cgroup_path":"/user.slice"},"#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        assert_eq!(shared.cgroup_path(), Some("/user.slice"));
+        assert_eq!(JobRow::from_status(&shared).cgroup, None);
+
+        // Steuerzeichen aus `meta.json` (dort als JSON-Escapes) erreichen die
+        // Zeile nur markiert.
+        let hostile = status_of(
+            &meta_json(
+                "running",
+                r#""origin":{"kind":"tool","tool":"job.start\u001b[2J"},
+                   "identity":{"start_ticks":5,"cgroup_path":"/harw\u0007.slice/harw-job-3"},"#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        let row = JobRow::from_status(&hostile);
+        assert_eq!(
+            row.origin,
+            Some(ManagedJobOrigin::Tool {
+                tool: "job.start⟨ESC⟩".to_owned(),
+                call_id: None,
+            })
+        );
+        assert_eq!(
+            row.cgroup.as_deref(),
+            Some("/harw⟨U+0007⟩.slice/harw-job-3")
         );
         Ok(())
     }

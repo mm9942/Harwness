@@ -15383,6 +15383,8 @@ forbidden = [{forbidden}]
             active: true,
             failed: false,
             reason: None,
+            origin: None,
+            cgroup: None,
         }
     }
 

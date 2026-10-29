@@ -99,6 +99,11 @@ async fn test_start_with_origin_records_call_id_and_tool() -> TestResult {
         call_id: Some("call-42".to_owned()),
         tool: Some("job.start".to_owned()),
         owner_agent: None,
+        kind: None,
+    };
+    let typed = ManagedJobOrigin::Tool {
+        tool: "job.start".to_owned(),
+        call_id: Some("call-42".to_owned()),
     };
     let started = env
         .manager
@@ -113,19 +118,24 @@ async fn test_start_with_origin_records_call_id_and_tool() -> TestResult {
     let id = started.meta.job_id.clone();
     assert_eq!(started.meta.origin_call_id.as_deref(), Some("call-42"));
     assert_eq!(started.meta.origin_tool.as_deref(), Some("job.start"));
+    // W20-A: the typed origin is recorded next to the R18 fields.
+    assert_eq!(started.meta.origin.as_ref(), Some(&typed));
     let on_disk = read_meta(&started.log_dir).ok_or(TestError::Missing("meta.json"))?;
     assert_eq!(on_disk.origin_call_id.as_deref(), Some("call-42"));
+    assert_eq!(on_disk.origin.as_ref(), Some(&typed));
     let events = events_of(&env, &id);
     match events.first() {
         Some(JobEvent::Started {
             origin_call_id,
             origin_tool,
             owner_agent,
+            origin,
             ..
         }) => {
             assert_eq!(origin_call_id.as_deref(), Some("call-42"));
             assert_eq!(origin_tool.as_deref(), Some("job.start"));
             assert_eq!(owner_agent, &None);
+            assert_eq!(origin.as_ref(), Some(&typed));
         }
         other => {
             return Err(TestError::Unexpected(format!(
@@ -142,6 +152,113 @@ async fn test_start_with_origin_records_call_id_and_tool() -> TestResult {
         .map_err(ctx("start plain"))?;
     assert_eq!(plain.meta.origin_call_id, None);
     assert_eq!(plain.meta.origin_tool, None);
+    assert_eq!(plain.meta.origin, None);
+    assert_eq!(plain.meta.resolved_origin(), None);
+    Ok(())
+}
+
+/// W20-A: a piped start with [`JobOrigin::agent_child`] (the job child
+/// backend's path) records `AgentChild` in `meta.json` and in `Started`;
+/// the R18 tool fields stay empty.
+#[tokio::test]
+async fn test_start_piped_with_origin_records_agent_child() -> TestResult {
+    let env = Env::new()?;
+    let prepared = env.prepare_piped(&["/bin/cat"]).await?;
+    let piped = env
+        .manager
+        .start_piped_with_origin(
+            request("agent-child-explorer", "parent-session", &[]),
+            prepared,
+            DEFAULT_MAX_PIPED_LINE_BYTES,
+            JobOrigin::agent_child("child-session-7"),
+        )
+        .await
+        .map_err(ctx("start_piped_with_origin"))?;
+    let expected = ManagedJobOrigin::AgentChild {
+        child_session_id: "child-session-7".to_owned(),
+    };
+    let id = piped.job_id.clone();
+    assert_eq!(piped.status.meta.origin.as_ref(), Some(&expected));
+    assert_eq!(piped.status.meta.origin_tool, None);
+    assert_eq!(piped.status.meta.origin_call_id, None);
+    let on_disk = read_meta(&piped.status.log_dir).ok_or(TestError::Missing("meta.json"))?;
+    assert_eq!(on_disk.resolved_origin(), Some(expected.clone()));
+    match events_of(&env, &id).first() {
+        Some(JobEvent::Started { origin, .. }) => assert_eq!(origin.as_ref(), Some(&expected)),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected Started first, got {other:?}"
+            )));
+        }
+    }
+    // `cat` ends on EOF of its stdin.
+    drop(piped.stdin);
+    env.manager
+        .await_exit(&id, Caller::Agent("parent-session"), LIMIT)
+        .await
+        .map_err(ctx("await_exit"))?;
+
+    // The plain piped path keeps starting without provenance.
+    let prepared = env.prepare_piped(&["/bin/cat"]).await?;
+    let plain = env
+        .manager
+        .start_piped(request("plain-piped", "parent-session", &[]), prepared)
+        .await
+        .map_err(ctx("start_piped"))?;
+    assert_eq!(plain.status.meta.origin, None);
+    drop(plain.stdin);
+    env.manager
+        .await_exit(&plain.job_id, Caller::Agent("parent-session"), LIMIT)
+        .await
+        .map_err(ctx("await_exit plain"))?;
+    Ok(())
+}
+
+/// W20-A: `meta.json` of earlier versions reloads with its provenance
+/// resolved — R18 tool fields → `Tool`, nothing → unknown (the name
+/// `agent-child-explorer` is never used to guess) — and the persisted
+/// cgroup path stays visible through [`JobStatus::cgroup_path`].
+#[tokio::test]
+async fn test_reload_resolves_legacy_origin_fixtures() -> TestResult {
+    let env = Env::new()?;
+    let jobs_dir = env.state_dir().join("jobs");
+    for (id, raw) in [
+        (
+            "job-legacy-tool",
+            include_str!("../../tests/fixtures/meta-legacy-tool-origin.json"),
+        ),
+        (
+            "job-legacy-plain",
+            include_str!("../../tests/fixtures/meta-legacy-no-origin.json"),
+        ),
+    ] {
+        let dir = jobs_dir.join(id);
+        fs::create_dir_all(&dir).map_err(ctx("create old job dir"))?;
+        fs::write(dir.join(META_FILE), raw).map_err(ctx("write old meta"))?;
+    }
+
+    let reloaded = JobManager::new(env.manager.config().clone(), Arc::new(crate::NoopNotifier))
+        .map_err(ctx("reload"))?;
+    let tool_id = JobId::parse("job-legacy-tool").ok_or(TestError::Missing("job id"))?;
+    let plain_id = JobId::parse("job-legacy-plain").ok_or(TestError::Missing("job id"))?;
+    let tool = reloaded
+        .status(&tool_id, Caller::Operator)
+        .map_err(ctx("status tool"))?;
+    assert_eq!(tool.meta.origin, None);
+    assert_eq!(
+        tool.meta.resolved_origin(),
+        Some(ManagedJobOrigin::Tool {
+            tool: "job.start".to_owned(),
+            call_id: Some("call-7".to_owned()),
+        })
+    );
+    assert_eq!(tool.cgroup_path(), Some("/harw.slice/harw-job-7"));
+    let plain = reloaded
+        .status(&plain_id, Caller::Operator)
+        .map_err(ctx("status plain"))?;
+    assert_eq!(plain.meta.state, JobState::Failed);
+    assert_eq!(plain.meta.resolved_origin(), None);
+    assert_eq!(plain.cgroup_path(), None);
     Ok(())
 }
 
@@ -455,6 +572,7 @@ fn previous_meta_with(
         origin_call_id: None,
         origin_tool: None,
         owner_agent: None,
+        origin: None,
     })
 }
 

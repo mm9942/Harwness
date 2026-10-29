@@ -2901,6 +2901,7 @@ mod agents_build_tests {
                 origin_call_id: None,
                 origin_tool: None,
                 owner_agent: None,
+                origin: None,
             };
             Ok(harw_tool_job::JobStatus {
                 meta,

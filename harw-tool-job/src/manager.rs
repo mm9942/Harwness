@@ -43,7 +43,7 @@ use crate::launcher::PreparedJob;
 use crate::logs::{LogFollower, clip_line, tail_of_file};
 use crate::model::{
     JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus, META_FILE, META_VERSION,
-    STDERR_LOG, STDOUT_LOG,
+    ManagedJobOrigin, STDERR_LOG, STDOUT_LOG,
 };
 use crate::procfs::{JobSignal, Liveness, OwnLeader, Recovered, SignalError};
 use crate::progress::{
@@ -206,8 +206,14 @@ pub struct StartRequest {
 /// Werkzeugzelle; `meta.json` und [`JobEvent::Started`] tragen sie.
 ///
 /// Ein eigener Typ statt neuer Felder in [`StartRequest`], damit die
-/// bestehenden Aufrufer (Operator-Wege, Kind-Backends) unverändert bleiben;
-/// sie starten ohne Herkunft (alle Felder `None`).
+/// bestehenden Aufrufer unverändert bleiben; wer [`JobManager::start`]
+/// nutzt, startet ohne Herkunft (alle Felder `None`).
+///
+/// Which origin to pass (W20-A): a model tool sets `tool` and `call_id`
+/// (e.g. `job.start`, `agents.build`), an operator command sets
+/// `kind: Some(ManagedJobOrigin::Operator)`, the job child backend uses
+/// [`JobOrigin::agent_child`]. A job started without any of them has
+/// unknown provenance.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobOrigin {
     /// Id des startenden Werkzeugaufrufs (`ToolCall::id`).
@@ -216,6 +222,34 @@ pub struct JobOrigin {
     pub tool: Option<String>,
     /// Anzeigename des besitzenden Agenten, falls bekannt.
     pub owner_agent: Option<String>,
+    /// W20-A: explicit typed provenance for starts that are not tool calls
+    /// (child agents, operator commands). `None` derives it from `tool` /
+    /// `call_id` (see [`JobOrigin::managed`]).
+    pub kind: Option<ManagedJobOrigin>,
+}
+
+impl JobOrigin {
+    /// Origin of a job that backs the child agent run `child_session_id`
+    /// (W20-A; `harw-agent-runner`'s job child backend).
+    #[must_use]
+    pub fn agent_child(child_session_id: impl Into<String>) -> Self {
+        Self {
+            kind: Some(ManagedJobOrigin::AgentChild {
+                child_session_id: child_session_id.into(),
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// The typed provenance this origin records ([`JobMeta::origin`]):
+    /// [`JobOrigin::kind`] if set, else `tool` / `call_id` mapped by
+    /// [`ManagedJobOrigin::from_legacy`]; `None` when nothing is known.
+    #[must_use]
+    pub fn managed(&self) -> Option<ManagedJobOrigin> {
+        self.kind.clone().or_else(|| {
+            ManagedJobOrigin::from_legacy(self.tool.as_deref(), self.call_id.as_deref())
+        })
+    }
 }
 
 /// Ergebnis von [`JobManager::start_piped`]: derselbe Job wie [`JobManager::start`]
@@ -760,7 +794,13 @@ impl JobManager {
 
     /// Wie [`JobManager::start_with_warnings`], zusätzlich mit der Herkunft
     /// ([`JobOrigin`]): sie landet in `meta.json` (`origin_call_id`,
-    /// `origin_tool`, `owner_agent`) und im [`JobEvent::Started`].
+    /// `origin_tool`, `owner_agent`, typisiert in `origin`) und im
+    /// [`JobEvent::Started`].
+    ///
+    /// [`JobManager::start`] and [`JobManager::start_with_warnings`] record
+    /// no origin: their jobs have unknown provenance (W20-A), so every
+    /// producer that knows its origin (model tools, operator commands)
+    /// should start through this method (see [`JobOrigin`]).
     ///
     /// # Errors
     /// Wie [`JobManager::start`].
@@ -772,6 +812,7 @@ impl JobManager {
         origin: JobOrigin,
     ) -> Result<JobStatus, JobError> {
         self.check_capacity()?;
+        let managed_origin = origin.managed();
         let (id, dir) = self.allocate()?;
         // The runtime appends the process output to these files (they outlive
         // this process); created here for the `O_EXCL` guarantee and the mode.
@@ -810,6 +851,7 @@ impl JobManager {
             origin_call_id: origin.call_id,
             origin_tool: origin.tool,
             owner_agent: origin.owner_agent,
+            origin: managed_origin,
         };
 
         // The job runtime starts the process (PL-93): session, pidfd, cgroup and
@@ -849,6 +891,7 @@ impl JobManager {
                 origin_call_id: meta.origin_call_id.clone(),
                 origin_tool: meta.origin_tool.clone(),
                 owner_agent: meta.owner_agent.clone(),
+                origin: meta.resolved_origin(),
             },
         });
         for text in &meta.launch_warnings {
@@ -913,7 +956,27 @@ impl JobManager {
         prepared: PreparedJob,
         max_line_bytes: usize,
     ) -> Result<PipedJob, JobError> {
+        self.start_piped_with_origin(request, prepared, max_line_bytes, JobOrigin::default())
+            .await
+    }
+
+    /// Like [`JobManager::start_piped_with_line_limit`], additionally with
+    /// the job's provenance ([`JobOrigin`], W20-A): it lands in `meta.json`
+    /// and in [`JobEvent::Started`] exactly as for
+    /// [`JobManager::start_with_origin`]. The job child backend passes
+    /// [`JobOrigin::agent_child`].
+    ///
+    /// # Errors
+    /// Like [`JobManager::start_piped`].
+    pub async fn start_piped_with_origin(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+        max_line_bytes: usize,
+        origin: JobOrigin,
+    ) -> Result<PipedJob, JobError> {
         self.check_capacity()?;
+        let managed_origin = origin.managed();
         let (id, dir) = self.allocate()?;
         let stdout_log_path = dir.join(STDOUT_LOG);
         let stdout_log = create_log(&stdout_log_path).map_err(io_err("create stdout.log"))?;
@@ -948,9 +1011,10 @@ impl JobManager {
             stragglers_reaped: false,
             log_truncated: false,
             launch_warnings: Vec::new(),
-            origin_call_id: None,
-            origin_tool: None,
-            owner_agent: None,
+            origin_call_id: origin.call_id,
+            origin_tool: origin.tool,
+            owner_agent: origin.owner_agent,
+            origin: managed_origin,
         };
 
         // The runtime starts the process and hands over its stdin/stdout pipes;
@@ -988,6 +1052,7 @@ impl JobManager {
                 origin_call_id: meta.origin_call_id.clone(),
                 origin_tool: meta.origin_tool.clone(),
                 owner_agent: meta.owner_agent.clone(),
+                origin: meta.resolved_origin(),
             },
         });
 

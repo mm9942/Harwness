@@ -13,7 +13,7 @@
 //! [`JobNotifier::notify`] wird aus Überwachungs-Tasks aufgerufen und darf
 //! nicht blockieren (z. B. in einen `mpsc`-Kanal schieben).
 
-use crate::model::{JobId, JobOwner, JobState};
+use crate::model::{JobId, JobOwner, JobState, ManagedJobOrigin};
 use crate::progress::ProgressSnapshot;
 use serde::Serialize;
 use std::sync::Mutex;
@@ -45,6 +45,10 @@ pub enum JobEvent {
         /// R18: Anzeigename des besitzenden Agenten, falls bekannt.
         #[serde(skip_serializing_if = "Option::is_none")]
         owner_agent: Option<String>,
+        /// W20-A: typed provenance, as [`crate::JobMeta::resolved_origin`]
+        /// reports it; `None` = unknown (never guessed from `name`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        origin: Option<ManagedJobOrigin>,
     },
     /// Periodischer Fortschritt (nur bei Änderung).
     Progress {
@@ -377,8 +381,9 @@ mod tests {
         Ok(())
     }
 
-    /// R18 (TUI-07): `Started` trägt die Herkunft; ohne Herkunft bleibt die
-    /// serialisierte Form die alte, die Agenten-Notiz ändert sich nicht.
+    /// R18 (TUI-07) / W20-A: `Started` trägt die Herkunft (Aufruf und
+    /// typisierte Herkunft); ohne Herkunft bleibt die serialisierte Form die
+    /// alte, die Agenten-Notiz ändert sich nicht.
     #[test]
     fn test_started_carries_origin_additively() -> TestResult {
         let job_id = JobId::parse("job-o").ok_or(TestError::Missing("job id"))?;
@@ -391,15 +396,23 @@ mod tests {
             origin_call_id: origin_call_id.map(str::to_owned),
             origin_tool: origin_call_id.map(|_| "job.start".to_owned()),
             owner_agent: None,
+            origin: origin_call_id.map(|call_id| ManagedJobOrigin::Tool {
+                tool: "job.start".to_owned(),
+                call_id: Some(call_id.to_owned()),
+            }),
         };
         let plain = serde_json::to_value(started(None))
             .map_err(|err| TestError::Unexpected(err.to_string()))?;
         assert!(plain.get("origin_call_id").is_none(), "{plain}");
         assert!(plain.get("owner_agent").is_none(), "{plain}");
+        assert!(plain.get("origin").is_none(), "{plain}");
         let linked = serde_json::to_value(started(Some("call-1")))
             .map_err(|err| TestError::Unexpected(err.to_string()))?;
         assert_eq!(linked["origin_call_id"], "call-1");
         assert_eq!(linked["origin_tool"], "job.start");
+        assert_eq!(linked["kind"], "started");
+        assert_eq!(linked["origin"]["kind"], "tool");
+        assert_eq!(linked["origin"]["call_id"], "call-1");
         assert_eq!(
             started(Some("call-1")).render_note(),
             started(None).render_note()

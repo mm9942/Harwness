@@ -567,6 +567,80 @@ mod tests {
         Ok(())
     }
 
+    /// W20-A: das Nachführen übernimmt die typisierte Herkunft und die
+    /// eigene Job-cgroup der Verwaltung in die Jobs-Gruppe; ein Start ohne
+    /// Herkunft bleibt unbekannt.
+    #[tokio::test]
+    async fn refresh_carries_origin_and_cgroup_into_job_rows() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let (mut app, manager, plain_id) = app_with_running_job(dir.path(), true).await?;
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(false);
+        let tool_job = manager
+            .start_with_origin(
+                StartRequest {
+                    name: "tests".to_owned(),
+                    command: "sleep 30".to_owned(),
+                    cwd: None,
+                    env_keys: Vec::new(),
+                    notify_every: Duration::ZERO,
+                    owner: JobOwner::new("worker", Vec::new()),
+                },
+                PreparedJob {
+                    command,
+                    executed_on_host: true,
+                    env_cleared: false,
+                },
+                Vec::new(),
+                harw_tool_job::JobOrigin {
+                    call_id: Some("call-1".to_owned()),
+                    tool: Some("job.start".to_owned()),
+                    owner_agent: None,
+                    kind: None,
+                },
+            )
+            .await
+            .map_err(ctx("start tool job"))?;
+        let tool_id = tool_job.meta.job_id.clone();
+        assert!(refresh(&mut app, true), "Jobs-Gruppe übernimmt die Jobs");
+
+        let rows = app.agent_monitor.jobs();
+        let plain = rows
+            .iter()
+            .find(|row| row.id == plain_id.as_str())
+            .ok_or(TestError::Missing("Zeile ohne Herkunft"))?;
+        assert_eq!(plain.origin, None);
+        let tool = rows
+            .iter()
+            .find(|row| row.id == tool_id.as_str())
+            .ok_or(TestError::Missing("Zeile mit Herkunft"))?;
+        assert_eq!(
+            tool.origin,
+            Some(harw_tool_job::ManagedJobOrigin::Tool {
+                tool: "job.start".to_owned(),
+                call_id: Some("call-1".to_owned()),
+            })
+        );
+        let persisted = manager
+            .status(&tool_id, Caller::Operator)
+            .map_err(ctx("status"))?;
+        // Nur eine eigene Job-cgroup erreicht die Zeile; ohne delegierte
+        // cgroup-Wurzel (Testumgebung) läuft der Job in einer geteilten.
+        assert_eq!(tool.cgroup.as_deref(), persisted.job_cgroup_path());
+
+        for id in [&plain_id, &tool_id] {
+            let _ = manager
+                .stop(id, Caller::Operator, harw_tool_job::JobSignal::Kill)
+                .await;
+        }
+        Ok(())
+    }
+
     /// TUI-05 (R18 F9): das Ende eines fehlgeschlagenen Jobs nennt den
     /// Grund (Signal, letzte Ausgabezeile); der Start nennt den Aufruf.
     #[test]
@@ -581,6 +655,10 @@ mod tests {
             origin_call_id: Some("call-9".into()),
             origin_tool: Some("job.start".into()),
             owner_agent: None,
+            origin: Some(harw_tool_job::ManagedJobOrigin::Tool {
+                tool: "job.start".into(),
+                call_id: Some("call-9".into()),
+            }),
         })
         .ok_or(TestError::Missing("Startzeile"))?;
         assert_eq!(

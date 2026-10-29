@@ -3535,6 +3535,8 @@ mod tests {
             active,
             failed,
             reason: None,
+            origin: None,
+            cgroup: None,
         }
     }
 
