@@ -27,7 +27,9 @@ Do **not** transfer this deadline or Mistral pricing onto direct Z.AI `glm-5.2`.
 
 ## Current first-party model surface
 
-The official model overview currently advertises Mistral 3 / Ministral 3 families and specialist models including Devstral 2, OCR 3, Voxtral and Codestral. The provider's model-overview page also exposes versioned aliases; treat aliases as provider-specific discovery metadata rather than rewriting persisted pins.
+The official model overview currently advertises Mistral 3 / Ministral 3 families and specialist models including OCR 3, Voxtral and Codestral. The provider's model-overview page also exposes versioned aliases; treat aliases as provider-specific discovery metadata rather than rewriting persisted pins.
+
+The canonical [Models page](https://docs.mistral.ai/models) lists Devstral 2 (`devstral-2512`) under deprecated and retired models; it is not an active-model example. Its exact retirement instant remains unverified here.
 
 The public deprecation table remains useful for older first-party model families. Harwness should ingest official deprecation status without assuming that a model absent from the overview has a particular retirement instant unless Mistral publishes one.
 
