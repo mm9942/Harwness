@@ -14,6 +14,16 @@
 //!   and tees stdout into `STDOUT_LOG` while also handing this backend a
 //!   line stream of it; stderr goes straight into `STDERR_LOG` as for any
 //!   other job.
+//!
+//!   PL-97 E2b: with [`SandboxExecution::Chain`] (the default, config
+//!   `[sandbox] execution`) the child is no host submission any more but a
+//!   job-runtime request over its real working directory with the
+//!   `workspace_build` profile ([`harw_tool_job::launcher::child_agent_launch`],
+//!   which also says why the child process itself stays unconfined and
+//!   `executed_on_host` stays `true`). Where the job runtime runs no such
+//!   requests, the child keeps the previous host submission, logged once
+//!   per backend (`runs without cgroup/landlock`).
+//!   [`SandboxExecution::Legacy`] keeps the previous submission always.
 //! - **Tests** ([`JobChildBackend::with_spawner`], no `JobManager`): spawns
 //!   [`ChildProcessSpawner::command_for`]'s command itself — a plain
 //!   `/bin/sh -c <script>` standing in for a real compiled child, so the
@@ -31,6 +41,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -39,6 +50,7 @@ use harw_core::child_backend::{
     ChildBackend, ChildBackendFuture, ChildIo, ChildRunOutcome, ChildRunSpec, ChildRunStatus,
 };
 use harw_core::child_controller::ChildUsage;
+use harw_tool_job::launcher::{PreparedLaunch, SandboxExecution, child_agent_launch};
 use harw_tool_job::{
     Caller, JobId, JobManager, JobOrigin, JobOwner, JobSignal, PipedJob, PipedLineError,
     PreparedJob, StartRequest,
@@ -128,6 +140,10 @@ pub struct JobChildBackend<S: ChildProcessSpawner = CurrentExeSpawner> {
     /// its whole process group). `None`: spawn `spawner`'s command directly
     /// and drive/kill it here (the test seam).
     job_manager: Option<Arc<JobManager>>,
+    /// How the job-managed path submits the child (PL-97 E2b, module docs).
+    execution: SandboxExecution,
+    /// Whether the fallback to the host submission was logged already.
+    fallback_logged: AtomicBool,
 }
 
 impl JobChildBackend<CurrentExeSpawner> {
@@ -139,6 +155,8 @@ impl JobChildBackend<CurrentExeSpawner> {
         Self {
             spawner: CurrentExeSpawner { offline_echo },
             job_manager: Some(job_manager),
+            execution: SandboxExecution::default(),
+            fallback_logged: AtomicBool::new(false),
         }
     }
 }
@@ -152,6 +170,8 @@ impl<S: ChildProcessSpawner> JobChildBackend<S> {
         Self {
             spawner,
             job_manager: None,
+            execution: SandboxExecution::default(),
+            fallback_logged: AtomicBool::new(false),
         }
     }
 
@@ -163,6 +183,46 @@ impl<S: ChildProcessSpawner> JobChildBackend<S> {
         Self {
             spawner,
             job_manager: Some(job_manager),
+            execution: SandboxExecution::default(),
+            fallback_logged: AtomicBool::new(false),
+        }
+    }
+
+    /// Chooses how the job-managed path submits each child (config
+    /// `[sandbox] execution`, PL-97 E2b, module docs). Default
+    /// [`SandboxExecution::Chain`]; [`SandboxExecution::Legacy`] keeps the
+    /// previous host submission.
+    #[must_use]
+    pub fn with_execution(mut self, execution: SandboxExecution) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    /// The child's launch for [`JobManager::start_piped_launch_with_origin`]:
+    /// the chain submission, or the previous host submission (legacy mode,
+    /// or a job runtime without workspace requests, logged once).
+    fn child_launch(&self, job_manager: &JobManager, prepared: PreparedJob) -> PreparedLaunch {
+        let host = |job| PreparedLaunch {
+            job,
+            warnings: Vec::new(),
+            sandboxed: None,
+        };
+        match self.execution {
+            SandboxExecution::Legacy => host(prepared),
+            SandboxExecution::Chain => match child_agent_launch(job_manager, prepared) {
+                Ok(launch) => launch,
+                Err(refused) => {
+                    let (job, reason) = *refused;
+                    if !self.fallback_logged.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            %reason,
+                            "child agents run without cgroup/landlock: the previous host \
+                             submission is used"
+                        );
+                    }
+                    host(job)
+                }
+            },
         }
     }
 }
@@ -171,7 +231,7 @@ impl<S: ChildProcessSpawner> ChildBackend for JobChildBackend<S> {
     fn run<'a>(&'a self, spec: ChildRunSpec, io: &'a dyn ChildIo) -> ChildBackendFuture<'a> {
         Box::pin(async move {
             match &self.job_manager {
-                Some(job_manager) => run_job_managed(job_manager, &self.spawner, spec, io).await,
+                Some(job_manager) => run_job_managed(self, job_manager, spec, io).await,
                 #[cfg(test)]
                 None => run_direct(&self.spawner, spec, io).await,
                 #[cfg(not(test))]
@@ -258,24 +318,26 @@ impl StdoutSource {
 }
 
 /// Runs `spec` as a job through `job_manager` (production path): the child
-/// is `spawner`'s command, started with `JobManager::start_piped` so it gets
+/// is `backend`'s spawner command, started with `JobManager::start_piped` so it gets
 /// the same process-group/log/monitor machinery as any other job. The job is
 /// tagged with its typed provenance `AgentChild { child_session_id }`
 /// (W20-A), so job views can attribute it to the child run instead of
 /// counting it as a job of its own.
 async fn run_job_managed<S: ChildProcessSpawner>(
+    backend: &JobChildBackend<S>,
     job_manager: &Arc<JobManager>,
-    spawner: &S,
     spec: ChildRunSpec,
     io: &dyn ChildIo,
 ) -> ChildRunOutcome {
-    let command = spawner.command_for(&spec.agent_id);
+    let command = backend.spawner.command_for(&spec.agent_id);
     let command_text = describe_command(&command);
     let prepared = PreparedJob {
         command,
         executed_on_host: true,
         env_cleared: false,
     };
+    // PL-97 E2b: through the job runtime's chain path (module docs).
+    let launch = backend.child_launch(job_manager, prepared);
     let request = StartRequest {
         name: format!("agent-child-{}", spec.agent_id),
         command: command_text,
@@ -286,7 +348,7 @@ async fn run_job_managed<S: ChildProcessSpawner>(
     };
     let origin = JobOrigin::agent_child(spec.child.as_str());
     let piped = match job_manager
-        .start_piped_with_origin(request, prepared, MAX_FRAME_BYTES, origin)
+        .start_piped_launch_with_origin(request, launch, MAX_FRAME_BYTES, origin)
         .await
     {
         Ok(piped) => piped,
@@ -1195,6 +1257,170 @@ mod tests {
         .await?;
         assert_eq!(outcome.status, ChildRunStatus::Completed);
         assert_eq!(outcome.continuation, None);
+        Ok(())
+    }
+
+    /// PL-97 E2b: a command port that records every request, reports
+    /// `backend` for workspace requests and starts nothing.
+    #[derive(Debug, Default)]
+    struct RecordingPort {
+        backend: Option<harw_command::BackendKind>,
+        requests: Mutex<Vec<harw_command::CommandRequest>>,
+    }
+
+    impl RecordingPort {
+        fn record(&self, request: harw_command::CommandRequest) {
+            if let Ok(mut requests) = self.requests.lock() {
+                requests.push(request);
+            }
+        }
+
+        fn requests(&self) -> Result<Vec<harw_command::CommandRequest>, &'static str> {
+            self.requests
+                .lock()
+                .map(|requests| requests.clone())
+                .map_err(|_| "request log poisoned")
+        }
+    }
+
+    impl harw_command::CommandPort for RecordingPort {
+        fn run(
+            &self,
+            request: harw_command::CommandRequest,
+            _cancel: harw_types::cancel::CancelToken,
+        ) -> harw_command::RunFuture<'_> {
+            self.record(request);
+            Box::pin(std::future::pending())
+        }
+
+        fn start(&self, request: harw_command::CommandRequest) -> harw_command::StartFuture<'_> {
+            self.record(request);
+            Box::pin(async { Err("the recording port starts nothing".to_owned()) })
+        }
+
+        fn workspace_backend(
+            &self,
+            _profile: harw_command::SandboxProfileName,
+        ) -> Option<harw_command::BackendKind> {
+            self.backend
+        }
+    }
+
+    /// What [`submit_child`] observed: the port's requests and the job
+    /// manager (with its state directory, kept alive).
+    type Submitted = (
+        Vec<harw_command::CommandRequest>,
+        Arc<JobManager>,
+        tempfile::TempDir,
+    );
+
+    /// Runs one child through a job manager over `port` and returns what
+    /// the port received, and the job manager.
+    async fn submit_child(
+        port: &Arc<RecordingPort>,
+        execution: SandboxExecution,
+    ) -> Result<Submitted, Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let job_manager = JobManager::with_command_port(
+            harw_tool_job::JobManagerConfig::new(dir.path()),
+            Arc::new(harw_tool_job::NoopNotifier),
+            Arc::clone(port) as Arc<dyn harw_command::CommandPort>,
+        )?;
+        let backend = JobChildBackend::with_spawner_and_job_manager(
+            ShellSpawner {
+                script: hello_then_result_script(),
+            },
+            Arc::clone(&job_manager),
+        )
+        .with_execution(execution);
+        let outcome = backend
+            .run(spec(harw_types::cancel::CancelToken::new()), &RecordingIo)
+            .await;
+        assert!(
+            matches!(
+                &outcome.status,
+                ChildRunStatus::Crashed { stderr_tail, .. }
+                    if stderr_tail.contains("starts nothing")
+            ),
+            "{:?}",
+            outcome.status
+        );
+        Ok((port.requests()?, job_manager, dir))
+    }
+
+    /// PL-97 E2b: in chain mode the child is one job-runtime request over
+    /// its real working directory with the `workspace_build` profile, not
+    /// a host submission; its own process is not confined (requirement
+    /// `none`, `executed_on_host` stays true, see `child_agent_launch`).
+    #[tokio::test]
+    async fn job_child_chain_mode_submits_a_workspace_build_request() -> TestResult {
+        let port = Arc::new(RecordingPort {
+            backend: Some(harw_command::BackendKind::LandlockTrampoline),
+            ..RecordingPort::default()
+        });
+        let (requests, job_manager, _dir) = submit_child(&port, SandboxExecution::Chain).await?;
+        let [request] = requests.as_slice() else {
+            return Err(format!("expected one request, got {requests:?}").into());
+        };
+        let cwd = std::env::current_dir()?;
+        let harw_command::CommandSandbox::Workspace(workspace) = &request.sandbox else {
+            return Err(format!("not a workspace request: {:?}", request.sandbox).into());
+        };
+        assert_eq!(workspace.root, cwd);
+        assert_eq!(
+            workspace.profile,
+            harw_command::SandboxProfileName::WorkspaceBuild
+        );
+        assert_eq!(
+            workspace.requirement,
+            harw_command::SandboxRequirement::None
+        );
+        assert_eq!(workspace.write_scope, None);
+        assert_eq!(request.cwd, cwd);
+        assert_eq!(request.stdin, harw_command::CommandStdin::Pipe);
+        assert!(request.args.iter().any(|arg| arg == "-c"));
+        let job_spec = request.job_spec()?;
+        assert_eq!(
+            job_spec.sandbox_profile,
+            harw_command::SandboxProfileName::WorkspaceBuild
+        );
+        assert_eq!(job_spec.working_dir.as_str(), ".");
+
+        let jobs = job_manager.list(Caller::Operator);
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert!(
+            jobs[0].meta.executed_on_host,
+            "the child process is not confined"
+        );
+        Ok(())
+    }
+
+    /// PL-97 E2b: legacy mode, and a job runtime without workspace
+    /// requests, keep the previous host submission.
+    #[tokio::test]
+    async fn job_child_legacy_mode_and_unrouted_ports_keep_the_host_submission() -> TestResult {
+        let cases = [
+            (
+                Some(harw_command::BackendKind::BwrapTrampoline),
+                SandboxExecution::Legacy,
+            ),
+            (None, SandboxExecution::Chain),
+        ];
+        for (backend, execution) in cases {
+            let port = Arc::new(RecordingPort {
+                backend,
+                ..RecordingPort::default()
+            });
+            let (requests, _job_manager, _dir) = submit_child(&port, execution).await?;
+            let [request] = requests.as_slice() else {
+                return Err(format!("expected one request, got {requests:?}").into());
+            };
+            assert_eq!(
+                request.sandbox,
+                harw_command::CommandSandbox::Host,
+                "{backend:?} {execution:?}"
+            );
+        }
         Ok(())
     }
 

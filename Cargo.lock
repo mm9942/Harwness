@@ -2530,6 +2530,10 @@ name = "harw-command"
 version = "0.9.1"
 dependencies = [
  "harw-job",
+ "harw-job-core",
+ "harw-job-executor-bwrap",
+ "harw-job-runtime",
+ "harw-sandbox",
  "harw-test-support",
  "harw-types",
  "jiff",

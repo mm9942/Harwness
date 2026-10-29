@@ -39,7 +39,7 @@
 //! Warten (`stop`, `wait`) läuft über einen `watch`-Kanal je Job.
 
 use crate::event::{JobEvent, JobNotification, JobNotifier};
-use crate::launcher::PreparedJob;
+use crate::launcher::{PreparedJob, PreparedLaunch};
 use crate::logs::{LogFollower, clip_line, tail_of_file};
 use crate::model::{
     JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus, META_FILE, META_VERSION,
@@ -379,17 +379,31 @@ impl Waiter {
 /// no wall limit of their own; stop is explicit).
 const JOB_RUNTIME_DEADLINE: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 
-/// Hands a prepared job to the installed command port: argv, working directory
-/// and environment from the prepared command, output appended to the job's
-/// log files.
+/// Hands a prepared job to `port`: argv, working directory and environment
+/// from the prepared command, output appended to the job's log files. With
+/// a chain submission (PL-97 E2b) the request carries its workspace sandbox
+/// and resources instead of running as a host command.
 async fn start_on_runtime(
+    port: Option<Arc<dyn harw_command::CommandPort>>,
     prepared: &PreparedJob,
+    sandboxed: Option<harw_tool_shell::SandboxedLaunch>,
     dir: &Path,
     piped: bool,
 ) -> Result<harw_command::StartedCommand, String> {
-    let Some(port) = harw_command::installed() else {
+    let Some(port) = port else {
         return Err("no job runtime is installed; jobs start only through it".to_owned());
     };
+    let request = command_request(prepared, sandboxed, dir, piped);
+    port.start(request).await
+}
+
+/// The command request of a prepared job ([`start_on_runtime`]).
+fn command_request(
+    prepared: &PreparedJob,
+    sandboxed: Option<harw_tool_shell::SandboxedLaunch>,
+    dir: &Path,
+    piped: bool,
+) -> harw_command::CommandRequest {
     let std = prepared.command.as_std();
     let mut request = harw_command::CommandRequest::new(
         std.get_program().to_string_lossy().into_owned(),
@@ -429,7 +443,12 @@ async fn start_on_runtime(
             stderr: dir.join(STDERR_LOG),
         };
     }
-    port.start(request).await
+    if let Some(sandboxed) = sandboxed {
+        let (sandbox, limits) = sandboxed.into_parts();
+        request.sandbox = sandbox;
+        request.limits = limits;
+    }
+    request
 }
 
 /// Veränderlicher Zustand eines Jobs.
@@ -561,6 +580,8 @@ pub struct JobManager {
     counter: AtomicU64,
     // Zur Laufzeit verstellbare Obergrenze (Start: `config.max_running_jobs`).
     max_running: AtomicUsize,
+    // Eigener Kommando-Port; `None`: der installierte (`harw_command::installed`).
+    command_port: Option<Arc<dyn harw_command::CommandPort>>,
 }
 
 impl fmt::Debug for JobManager {
@@ -578,6 +599,27 @@ impl JobManager {
     /// # Errors
     /// Wenn das Job-Verzeichnis nicht angelegt werden kann.
     pub fn new(config: JobManagerConfig, notifier: Arc<dyn JobNotifier>) -> io::Result<Arc<Self>> {
+        Self::build(config, notifier, None)
+    }
+
+    /// Wie [`JobManager::new`], startet Jobs aber über `port` statt über den
+    /// prozessweit installierten Kommando-Port (Einbettung, Tests).
+    ///
+    /// # Errors
+    /// Wenn das Job-Verzeichnis nicht angelegt werden kann.
+    pub fn with_command_port(
+        config: JobManagerConfig,
+        notifier: Arc<dyn JobNotifier>,
+        port: Arc<dyn harw_command::CommandPort>,
+    ) -> io::Result<Arc<Self>> {
+        Self::build(config, notifier, Some(port))
+    }
+
+    fn build(
+        config: JobManagerConfig,
+        notifier: Arc<dyn JobNotifier>,
+        command_port: Option<Arc<dyn harw_command::CommandPort>>,
+    ) -> io::Result<Arc<Self>> {
         let jobs_dir = config.jobs_dir();
         fs::create_dir_all(&jobs_dir)?;
         let instance = format!(
@@ -595,6 +637,7 @@ impl JobManager {
             jobs: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(0),
             max_running: AtomicUsize::new(config_max_running),
+            command_port,
         });
         manager.reload(&jobs_dir);
         Ok(manager)
@@ -604,6 +647,23 @@ impl JobManager {
     #[must_use]
     pub fn config(&self) -> &JobManagerConfig {
         &self.config
+    }
+
+    /// Der Kommando-Port, über den Jobs starten.
+    fn port(&self) -> Option<Arc<dyn harw_command::CommandPort>> {
+        self.command_port.clone().or_else(harw_command::installed)
+    }
+
+    /// The backend this manager's command port runs a workspace sandbox
+    /// request with `profile` on (PL-97 E2b,
+    /// [`harw_command::CommandPort::workspace_backend`]); `None`: there is
+    /// no port, or it runs no workspace requests.
+    #[must_use]
+    pub fn workspace_backend(
+        &self,
+        profile: harw_command::SandboxProfileName,
+    ) -> Option<harw_command::BackendKind> {
+        self.port().and_then(|port| port.workspace_backend(profile))
     }
 
     /// Kennung dieser harw-Instanz (steht in `meta.json`).
@@ -811,6 +871,43 @@ impl JobManager {
         warnings: Vec<String>,
         origin: JobOrigin,
     ) -> Result<JobStatus, JobError> {
+        self.start_prepared(request, prepared, None, warnings, origin)
+            .await
+    }
+
+    /// Wie [`JobManager::start_with_origin`] für einen ganzen
+    /// [`PreparedLaunch`] (`job.start`): nimmt er die Sandbox-Kette
+    /// ([`PreparedLaunch::sandboxed`], PL-97 E2b), geht der Job mit seiner
+    /// Workspace-Sandbox und seinen Ressourcen an den Kommando-Port statt
+    /// als Host-Job. Hinweise des Startwegs wie bei
+    /// [`JobManager::start_with_warnings`].
+    ///
+    /// # Errors
+    /// Wie [`JobManager::start`].
+    pub async fn start_launch_with_origin(
+        self: &Arc<Self>,
+        request: StartRequest,
+        launch: PreparedLaunch,
+        origin: JobOrigin,
+    ) -> Result<JobStatus, JobError> {
+        self.start_prepared(
+            request,
+            launch.job,
+            launch.sandboxed,
+            launch.warnings,
+            origin,
+        )
+        .await
+    }
+
+    async fn start_prepared(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+        sandboxed: Option<harw_tool_shell::SandboxedLaunch>,
+        warnings: Vec<String>,
+        origin: JobOrigin,
+    ) -> Result<JobStatus, JobError> {
         self.check_capacity()?;
         let managed_origin = origin.managed();
         let (id, dir) = self.allocate()?;
@@ -857,7 +954,7 @@ impl JobManager {
         // The job runtime starts the process (PL-93): session, pidfd, cgroup and
         // the output files are its business; this keeps ownership, logs,
         // progress and notifications.
-        let started = match start_on_runtime(&prepared, &dir, false).await {
+        let started = match start_on_runtime(self.port(), &prepared, sandboxed, &dir, false).await {
             Ok(started) => started,
             Err(message) => {
                 warn!(job_id = %id, error = %message, "job spawn failed");
@@ -975,6 +1072,45 @@ impl JobManager {
         max_line_bytes: usize,
         origin: JobOrigin,
     ) -> Result<PipedJob, JobError> {
+        self.start_piped_prepared(request, prepared, None, max_line_bytes, origin)
+            .await
+    }
+
+    /// Like [`JobManager::start_piped_with_origin`] for a whole
+    /// [`PreparedLaunch`] (PL-97 E2b): with a chain submission
+    /// ([`PreparedLaunch::sandboxed`], e.g.
+    /// [`crate::launcher::child_agent_launch`]) the job goes to the command
+    /// port with its workspace sandbox and resources instead of as a host
+    /// command. The launch's warnings are not recorded (as for every piped
+    /// job).
+    ///
+    /// # Errors
+    /// Like [`JobManager::start_piped`].
+    pub async fn start_piped_launch_with_origin(
+        self: &Arc<Self>,
+        request: StartRequest,
+        launch: PreparedLaunch,
+        max_line_bytes: usize,
+        origin: JobOrigin,
+    ) -> Result<PipedJob, JobError> {
+        self.start_piped_prepared(
+            request,
+            launch.job,
+            launch.sandboxed,
+            max_line_bytes,
+            origin,
+        )
+        .await
+    }
+
+    async fn start_piped_prepared(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+        sandboxed: Option<harw_tool_shell::SandboxedLaunch>,
+        max_line_bytes: usize,
+        origin: JobOrigin,
+    ) -> Result<PipedJob, JobError> {
         self.check_capacity()?;
         let managed_origin = origin.managed();
         let (id, dir) = self.allocate()?;
@@ -1019,10 +1155,11 @@ impl JobManager {
 
         // The runtime starts the process and hands over its stdin/stdout pipes;
         // what flows through them never becomes part of a job record.
-        let mut started = match start_on_runtime(&prepared, &dir, true).await {
-            Ok(started) => started,
-            Err(message) => return Err(self.record_piped_launch_failure(dir, meta, message)),
-        };
+        let mut started =
+            match start_on_runtime(self.port(), &prepared, sandboxed, &dir, true).await {
+                Ok(started) => started,
+                Err(message) => return Err(self.record_piped_launch_failure(dir, meta, message)),
+            };
         let (Some(stdin), Some(stdout)) = (started.stdin.take(), started.stdout.take()) else {
             (started.cancel)();
             return Err(self.record_piped_launch_failure(
