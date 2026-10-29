@@ -123,6 +123,10 @@ triggered_injection = true           # deliver matching skill sections per model
 inject_imported = false              # also deliver imported skills, framed as Evidence
 per_turn_bytes = 4096                # cap per round (256..=65536); effective ~3 % of the window, >= 1 KiB
 per_session_bytes = 16384            # cap until the next compaction (256..=65536); at most 4 effective per-round budgets
+
+[sandbox]
+execution = "chain"                  # chain|legacy — how shell.exec, job.start and child agents
+                                     # start processes (PL-97 E2); default "chain"
 ```
 
 Notes:
@@ -137,6 +141,19 @@ Notes:
   so the home layer and the active profile set it and an untrusted project
   layer never does (it cannot switch `inject_imported` on). See §2.7 for what
   the injector delivers.
+- `[sandbox] execution` (PL-97 E2) is profile-scoped and security-critical
+  (`ProfileReplaces`): the home layer and the active profile set it, an
+  untrusted project layer never does (a repository cannot switch its jobs
+  back to the legacy path). `chain` (the default) runs `shell.exec`,
+  `job.start` and child agents through the job runtime's sandbox chain
+  (job cgroup, Bubblewrap, Landlock trampoline, as `select_backend` finds
+  them); a job with a per-job write scope or a `required` sandbox is refused
+  where the chain cannot enforce it. `legacy` keeps the pre-built
+  `prlimit … -- bwrap …` argv run as a host job. Any other value is a parse
+  error. `harw-config` only parses the key
+  (`SandboxSection::effective_execution`); the consumers switch on it in
+  PL-97 E2b. The other `[sandbox]` keys (`cargo`, `tmux`) are home-only
+  (`GlobalOnly`, see `config-scopes.md`).
 
 ### 2.2 `auth.toml` — credential references
 

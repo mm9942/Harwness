@@ -52,7 +52,7 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use harw_job_core::SandboxProfileName;
+use harw_job_core::{EnforcementState, SandboxProfileName};
 use serde::{Deserialize, Serialize};
 
 /// Paths every profile may read and execute (toolchains, shells, libc).
@@ -109,6 +109,13 @@ pub enum LandlockMode {
     BestEffort,
     /// Fail with [`crate::error::SandboxError`] unless the filesystem rules
     /// are fully enforced and (if requested) Landlock network rules exist.
+    ///
+    /// Every rule that grants write must also open exactly the object its
+    /// path names: the ruleset builder reads the opened fd back through
+    /// `/proc/self/fd` and refuses the policy when a symlink or a moved
+    /// directory lies on the way. The write paths of such a policy must
+    /// therefore be canonical (a per-job write scope, PL-97 E2, resolves
+    /// them before planning).
     HardRequirement,
 }
 
@@ -206,6 +213,157 @@ impl SandboxPolicy {
     pub fn hard_requirement(mut self) -> Self {
         self.landlock = LandlockMode::HardRequirement;
         self
+    }
+
+    /// This policy with its write grant on `workspace_root` **replaced** by
+    /// `paths` (a per-job write scope, PL-97 E2): every `read_write` entry
+    /// at or beneath `workspace_root` is removed, the workspace root becomes
+    /// `read_only` (its `exec` entry, if any, stays: execute never grants
+    /// write), and each of `paths` becomes `read_write`. Network,
+    /// capabilities and `NO_NEW_PRIVS` are unchanged; the Landlock mode
+    /// becomes [`LandlockMode::HardRequirement`].
+    ///
+    /// Pure and lexical (component-wise, no symlink resolution): the caller
+    /// passes canonical paths and checks existence. A path that does not
+    /// exist gets no Landlock rule ([`plan_landlock`] keeps it, the ruleset
+    /// builder skips it), so new files need an entry for an existing
+    /// parent directory.
+    ///
+    /// Hard mode closes the window between that check and the ruleset
+    /// build: a scope path lies in a directory other processes may write,
+    /// so it could be swapped for a symlink in between. The ruleset builder
+    /// then refuses every write rule whose opened object is not named by
+    /// its planned path ([`LandlockMode::HardRequirement`]). A scope is a
+    /// requirement anyway: scoped jobs are always `required`.
+    ///
+    /// # Errors
+    /// - [`WriteScopeConflict::NoWorkspaceWrite`] when the policy grants no
+    ///   write on `workspace_root` itself: a scope narrows a grant and never
+    ///   widens the policy.
+    /// - [`WriteScopeConflict::OutsideWorkspace`] for a path not at or
+    ///   beneath `workspace_root`.
+    /// - [`WriteScopeConflict::WritableAncestor`] when a remaining
+    ///   `read_write` entry is an ancestor of `workspace_root` (e.g. `/tmp`
+    ///   for a workspace below `/tmp`): Landlock rights are inherited, so the
+    ///   whole workspace would stay writable.
+    pub fn with_workspace_write_scope(
+        &self,
+        workspace_root: &Path,
+        paths: &[PathBuf],
+    ) -> Result<Self, WriteScopeConflict> {
+        if !self
+            .filesystem
+            .read_write
+            .iter()
+            .any(|path| path == workspace_root)
+        {
+            return Err(WriteScopeConflict::NoWorkspaceWrite);
+        }
+        if let Some(outside) = paths.iter().find(|path| !path.starts_with(workspace_root)) {
+            return Err(WriteScopeConflict::OutsideWorkspace(outside.clone()));
+        }
+        let mut policy = self.clone();
+        let filesystem = &mut policy.filesystem;
+        filesystem
+            .read_write
+            .retain(|path| !path.starts_with(workspace_root));
+        if let Some(ancestor) = filesystem
+            .read_write
+            .iter()
+            .find(|path| workspace_root.starts_with(path))
+        {
+            return Err(WriteScopeConflict::WritableAncestor(ancestor.clone()));
+        }
+        if !filesystem
+            .read_only
+            .iter()
+            .any(|path| path == workspace_root)
+        {
+            filesystem.read_only.push(workspace_root.to_path_buf());
+        }
+        for path in paths {
+            if !filesystem.read_write.contains(path) {
+                filesystem.read_write.push(path.clone());
+            }
+        }
+        Ok(policy.hard_requirement())
+    }
+}
+
+/// Why [`SandboxPolicy::with_workspace_write_scope`] cannot narrow a
+/// policy to a write scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WriteScopeConflict {
+    /// The policy grants no write access on the workspace root, so a scope
+    /// would widen it.
+    NoWorkspaceWrite,
+    /// A scope path is not at or beneath the workspace root.
+    OutsideWorkspace(PathBuf),
+    /// A `read_write` entry outside the scope is an ancestor of the
+    /// workspace root and would keep the whole workspace writable.
+    WritableAncestor(PathBuf),
+}
+
+impl std::fmt::Display for WriteScopeConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoWorkspaceWrite => f.write_str(
+                "the policy grants no write access on the workspace for a write scope to narrow",
+            ),
+            Self::OutsideWorkspace(path) => {
+                write!(f, "write scope path {path:?} lies outside the workspace")
+            }
+            Self::WritableAncestor(path) => write!(
+                f,
+                "{path:?} stays writable and contains the workspace, so a write scope cannot \
+                 narrow it (Landlock rights are inherited)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteScopeConflict {}
+
+/// The Landlock ABI with which the filesystem dimension counts as fully
+/// enforced (V5, Linux 6.10: the ABI this crate targets). Older ABIs give
+/// [`EnforcementState::Partial`].
+pub const LANDLOCK_TARGET_ABI: u8 = 5;
+
+/// What Landlock can enforce on the filesystem dimension with the usable
+/// ABI `abi` ([`LandlockSupport::usable_abi`]), predicted before anything
+/// runs: `Unsupported` without Landlock, `Partial` below
+/// [`LANDLOCK_TARGET_ABI`], `Enforced` from it on. Matches what
+/// `apply_to_current_process` reports for a ruleset it could restrict.
+#[must_use]
+pub fn landlock_filesystem_state(abi: Option<u8>) -> EnforcementState {
+    match abi {
+        None | Some(0) => EnforcementState::Unsupported,
+        Some(abi) if abi < LANDLOCK_TARGET_ABI => EnforcementState::Partial,
+        Some(_) => EnforcementState::Enforced,
+    }
+}
+
+/// The first Landlock ABI with TCP `bind`/`connect` rules (V4, Linux 6.7).
+const LANDLOCK_NETWORK_ABI: u8 = 4;
+
+/// What Landlock can enforce on the network dimension of `network` with
+/// the usable ABI `abi`, predicted before anything runs (as
+/// [`landlock_filesystem_state`]): `Enforced` when `network` restricts
+/// nothing; otherwise `Unsupported` without Landlock, `NotEnforced` below
+/// ABI 4 (no network rules) and `Partial` from ABI 4 on (TCP only: UDP,
+/// raw and abstract sockets stay reachable). Matches what
+/// `apply_to_current_process` reports. Only a network namespace enforces a
+/// restricting network policy fully.
+#[must_use]
+pub fn landlock_network_state(network: &NetworkPolicy, abi: Option<u8>) -> EnforcementState {
+    if *network == NetworkPolicy::Allow {
+        return EnforcementState::Enforced;
+    }
+    match abi {
+        None | Some(0) => EnforcementState::Unsupported,
+        Some(abi) if abi < LANDLOCK_NETWORK_ABI => EnforcementState::NotEnforced,
+        Some(_) => EnforcementState::Partial,
     }
 }
 
@@ -704,7 +862,8 @@ pub use enforce::{PreparedRuleset, apply_to_current_process, build_ruleset, land
 
 #[cfg(feature = "linux-sandbox")]
 mod enforce {
-    use std::path::PathBuf;
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    use std::path::{Path, PathBuf};
 
     use harw_job_core::{EnforcementState, SandboxReport};
     use landlock::{
@@ -770,15 +929,57 @@ mod enforce {
         }
     }
 
+    /// Whether the object `fd` refers to is a directory (`fstat` on the fd,
+    /// not a second lookup of `path`, which could name another object by
+    /// now).
+    fn opened_is_dir(fd: &PathFd, path: &Path) -> Result<bool, SandboxError> {
+        rustix::fs::fstat(fd)
+            .map(|stat| rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir())
+            .map_err(|errno| SandboxError::InvalidPath {
+                path: path.to_path_buf(),
+                source: errno.into(),
+            })
+    }
+
+    /// Refuses a rule whose opened object is not the one `path` names
+    /// without symlinks: `/proc/self/fd/N` reads back the path of the
+    /// object the fd refers to, so a symlink or a moved directory anywhere
+    /// on the way (planted after the path was checked) makes the two
+    /// differ. `path` must be canonical.
+    fn verify_opened_path(fd: &PathFd, path: &Path) -> Result<(), SandboxError> {
+        let invalid = |source: std::io::Error| SandboxError::InvalidPath {
+            path: path.to_path_buf(),
+            source,
+        };
+        let magic = format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd());
+        let opened = std::fs::read_link(magic).map_err(invalid)?;
+        if opened == path {
+            Ok(())
+        } else {
+            Err(invalid(std::io::Error::other(format!(
+                "opened {}, not the planned path: a symlink or a moved directory lies on the \
+                 way, and a hard-requirement write rule must name its target exactly",
+                opened.display()
+            ))))
+        }
+    }
+
     /// Builds the Landlock ruleset for `policy` without enforcing it.
     ///
     /// Safe to call anywhere (tests included): it only opens `O_PATH` fds
-    /// and creates a ruleset fd.
+    /// and creates a ruleset fd. A rule's rights follow the object its fd
+    /// refers to (directory or not). In [`LandlockMode::HardRequirement`]
+    /// every rule that grants write is read back after opening and must
+    /// name exactly its planned path (no symlink, no moved directory on the
+    /// way): a per-job write scope (PL-97 E2) is checked when the attempt
+    /// is prepared and opened here later, and a path swapped in between
+    /// must not carry the write grant elsewhere.
     ///
     /// # Errors
     /// [`SandboxError::Unsupported`] in hard mode when the kernel lacks the
     /// requested Landlock features; [`SandboxError::InvalidPath`] for a
-    /// policy path that exists but cannot be opened;
+    /// policy path that exists but cannot be opened, or (hard mode) a write
+    /// rule that opened another object than its path names;
     /// [`SandboxError::Landlock`] otherwise.
     pub fn build_ruleset(policy: &SandboxPolicy) -> Result<PreparedRuleset, SandboxError> {
         let plan = plan_landlock(policy);
@@ -818,7 +1019,10 @@ mod enforce {
                     });
                 }
             };
-            let bits = fs_bits(access, path.is_dir());
+            if access.write && mode == LandlockMode::HardRequirement {
+                verify_opened_path(&fd, &path)?;
+            }
+            let bits = fs_bits(access, opened_is_dir(&fd, &path)?);
             if bits.is_empty() {
                 continue;
             }
@@ -1036,9 +1240,14 @@ mod enforce {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::sandbox::{BindMode, PathMap};
+        use crate::sandbox::{BindMode, LANDLOCK_TARGET_ABI, PathMap};
         use crate::test_support::{TestResult, ctx};
         use harw_job_core::SandboxProfileName;
+
+        #[test]
+        fn test_target_abi_constant_matches_the_enforced_abi() {
+            assert_eq!(abi_number(TARGET_ABI), LANDLOCK_TARGET_ABI);
+        }
 
         #[test]
         fn test_fs_bits_for_files_drop_directory_rights() {
@@ -1111,6 +1320,79 @@ mod enforce {
             // Paths the map does not cover got no rule at all.
             let etc = std::path::Path::new("/etc");
             assert!(!policy.filesystem.read_only.iter().any(|path| path == etc));
+            Ok(())
+        }
+
+        /// A canonical scratch directory with `real/sub`, `link -> real`
+        /// and `file.txt`.
+        fn swap_scene() -> TestResult<(tempfile::TempDir, PathBuf)> {
+            let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let root = dir.path().canonicalize().map_err(ctx("canonical"))?;
+            std::fs::create_dir_all(root.join("real/sub")).map_err(ctx("real"))?;
+            std::fs::write(root.join("file.txt"), b"f").map_err(ctx("file"))?;
+            std::os::unix::fs::symlink(root.join("real"), root.join("link"))
+                .map_err(ctx("symlink"))?;
+            Ok((dir, root))
+        }
+
+        #[test]
+        fn test_verify_opened_path_refuses_symlinks_on_the_way() -> TestResult {
+            let (_dir, root) = swap_scene()?;
+            for exact in [
+                root.join("real"),
+                root.join("real/sub"),
+                root.join("file.txt"),
+            ] {
+                let fd = PathFd::new(&exact).map_err(ctx("open"))?;
+                verify_opened_path(&fd, &exact).map_err(ctx("canonical path"))?;
+            }
+            // The final component or a directory on the way is a symlink:
+            // the fd names `real`, not the planned path.
+            for swapped in [root.join("link"), root.join("link/sub")] {
+                let fd = PathFd::new(&swapped).map_err(ctx("open swapped"))?;
+                assert!(
+                    matches!(
+                        verify_opened_path(&fd, &swapped),
+                        Err(SandboxError::InvalidPath { ref path, .. }) if *path == swapped
+                    ),
+                    "{swapped:?}"
+                );
+            }
+            let dir = PathFd::new(root.join("real")).map_err(ctx("dir"))?;
+            assert!(opened_is_dir(&dir, &root.join("real")).map_err(ctx("fstat dir"))?);
+            let file = PathFd::new(root.join("file.txt")).map_err(ctx("file"))?;
+            assert!(!opened_is_dir(&file, &root.join("file.txt")).map_err(ctx("fstat file"))?);
+            Ok(())
+        }
+
+        #[test]
+        fn test_hard_mode_refuses_a_write_rule_swapped_for_a_symlink() -> TestResult {
+            let (_dir, root) = swap_scene()?;
+            let swapped = root.join("link");
+            let best_effort =
+                SandboxPolicy::from_profile(SandboxProfileName::ReadOnlyAnalysis, &root)
+                    .with_read_write(&swapped);
+            // Best effort keeps following the path (legacy behaviour).
+            build_ruleset(&best_effort).map_err(ctx("best effort"))?;
+            if landlock_support().usable_abi().unwrap_or(0) < LANDLOCK_TARGET_ABI {
+                // Hard mode cannot even create the ruleset here.
+                return Ok(());
+            }
+            let hard = best_effort.clone().hard_requirement();
+            assert!(
+                matches!(
+                    build_ruleset(&hard),
+                    Err(SandboxError::InvalidPath { ref path, .. }) if *path == swapped
+                ),
+                "a write rule through a symlink must be refused"
+            );
+            // Read-only rules through a symlink stay allowed; a canonical
+            // write rule passes.
+            let fine = SandboxPolicy::from_profile(SandboxProfileName::ReadOnlyAnalysis, &root)
+                .with_read_only(&swapped)
+                .with_read_write(root.join("real/sub"))
+                .hard_requirement();
+            build_ruleset(&fine).map_err(ctx("canonical write rule"))?;
             Ok(())
         }
 
@@ -1684,5 +1966,140 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_write_scope_replaces_the_workspace_write_grant() -> TestResult {
+        let root = Path::new("/work/repo");
+        let scope = [
+            PathBuf::from("/work/repo/src"),
+            PathBuf::from("/work/repo/out/a.txt"),
+        ];
+        for profile in [
+            SandboxProfileName::WorkspaceBuild,
+            SandboxProfileName::NoNetwork,
+            SandboxProfileName::NetworkRestricted,
+        ] {
+            let base = SandboxPolicy::from_profile(profile, root);
+            let scoped = base
+                .with_workspace_write_scope(root, &scope)
+                .map_err(ctx("scope"))?;
+            // Only the scope is writable inside the workspace; the rest of
+            // the policy is untouched.
+            assert!(!scoped.filesystem.read_write.iter().any(|path| path == root));
+            assert!(scoped.filesystem.read_only.iter().any(|path| path == root));
+            assert!(scoped.filesystem.exec.iter().any(|path| path == root));
+            for path in &scope {
+                assert!(scoped.filesystem.read_write.contains(path), "{path:?}");
+            }
+            assert_eq!(scoped.network, base.network);
+            // Hard mode: the ruleset builder re-checks every write rule.
+            assert_eq!(base.landlock, LandlockMode::BestEffort);
+            assert_eq!(scoped.landlock, LandlockMode::HardRequirement);
+            assert!(
+                scoped
+                    .filesystem
+                    .read_write
+                    .contains(&PathBuf::from("/tmp"))
+            );
+            let plan = plan_landlock(&scoped);
+            let workspace = access_of(&plan, root).ok_or(TestError::Missing("workspace rule"))?;
+            assert!(workspace.read && workspace.exec && !workspace.write);
+            let src = access_of(&plan, Path::new("/work/repo/src"))
+                .ok_or(TestError::Missing("scope rule"))?;
+            assert!(src.read && src.write);
+        }
+        // An empty scope leaves the whole workspace read-only.
+        let none = SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, root)
+            .with_workspace_write_scope(root, &[])
+            .map_err(ctx("empty scope"))?;
+        assert!(
+            !none
+                .filesystem
+                .read_write
+                .iter()
+                .any(|path| path.starts_with(root))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_scope_never_widens_and_refuses_writable_ancestors() {
+        let root = Path::new("/work/repo");
+        let read_only = SandboxPolicy::from_profile(SandboxProfileName::ReadOnlyAnalysis, root);
+        assert_eq!(
+            read_only.with_workspace_write_scope(root, &[PathBuf::from("/work/repo/src")]),
+            Err(WriteScopeConflict::NoWorkspaceWrite)
+        );
+        let build = SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, root);
+        for outside in ["/work/repo2/src", "/work", "/etc/passwd"] {
+            assert_eq!(
+                build.with_workspace_write_scope(root, &[PathBuf::from(outside)]),
+                Err(WriteScopeConflict::OutsideWorkspace(PathBuf::from(outside)))
+            );
+        }
+        // `/tmp` stays read-write in every profile: a workspace below it
+        // cannot be narrowed.
+        let under_tmp = Path::new("/tmp/job/repo");
+        let tmp = SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, under_tmp);
+        assert_eq!(
+            tmp.with_workspace_write_scope(under_tmp, &[under_tmp.join("src")]),
+            Err(WriteScopeConflict::WritableAncestor(PathBuf::from("/tmp")))
+        );
+        assert!(
+            WriteScopeConflict::WritableAncestor(PathBuf::from("/tmp"))
+                .to_string()
+                .contains("inherited")
+        );
+    }
+
+    #[test]
+    fn test_landlock_filesystem_state_by_abi() {
+        use harw_job_core::EnforcementState as S;
+        assert_eq!(landlock_filesystem_state(None), S::Unsupported);
+        assert_eq!(landlock_filesystem_state(Some(0)), S::Unsupported);
+        for abi in 1..LANDLOCK_TARGET_ABI {
+            assert_eq!(landlock_filesystem_state(Some(abi)), S::Partial, "{abi}");
+        }
+        assert_eq!(
+            landlock_filesystem_state(Some(LANDLOCK_TARGET_ABI)),
+            S::Enforced
+        );
+        assert_eq!(landlock_filesystem_state(Some(9)), S::Enforced);
+    }
+
+    #[test]
+    fn test_landlock_network_state_by_policy_and_abi() {
+        use harw_job_core::EnforcementState as S;
+        for abi in [None, Some(0), Some(1), Some(4), Some(LANDLOCK_TARGET_ABI)] {
+            assert_eq!(
+                landlock_network_state(&NetworkPolicy::Allow, abi),
+                S::Enforced,
+                "{abi:?}"
+            );
+        }
+        for network in [
+            NetworkPolicy::Deny,
+            NetworkPolicy::ConnectTcpPorts(RESTRICTED_CONNECT_PORTS.to_vec()),
+        ] {
+            assert_eq!(landlock_network_state(&network, None), S::Unsupported);
+            assert_eq!(landlock_network_state(&network, Some(0)), S::Unsupported);
+            for abi in 1..LANDLOCK_NETWORK_ABI {
+                assert_eq!(
+                    landlock_network_state(&network, Some(abi)),
+                    S::NotEnforced,
+                    "{abi}"
+                );
+            }
+            // TCP only, whatever the ABI: never `enforced` without a
+            // network namespace.
+            for abi in [LANDLOCK_NETWORK_ABI, LANDLOCK_TARGET_ABI, 9] {
+                assert_eq!(
+                    landlock_network_state(&network, Some(abi)),
+                    S::Partial,
+                    "{abi}"
+                );
+            }
+        }
     }
 }
