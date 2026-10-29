@@ -108,6 +108,20 @@ struct FsEditArgs {
 pub struct FsEditExecutor;
 
 impl FsEditExecutor {
+    /// Descriptive activity metadata of `fs.edit` (PL-71, PL-97 M2), written by
+    /// hand in the form `#[harw_macros::tool(activity(...))]` generates: domain
+    /// `filesystem`, verb `edit`, resource field `path`, effect `mutate`.
+    ///
+    /// It grants, implies or checks no permission and is not part of the
+    /// model-facing `ToolSpec`.
+    pub const ACTIVITY: Option<harw_tools::ActivityDescriptor> =
+        Some(harw_tools::ActivityDescriptor::new(
+            "filesystem",
+            "edit",
+            Some("path"),
+            harw_tools::Effect::Mutate,
+        ));
+
     /// Führt die Ersetzung synchron (blockierend) aus.
     ///
     /// # Errors

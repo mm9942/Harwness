@@ -130,7 +130,8 @@ pub fn run(root: &Path, args: &StatArgs) -> ToolOutput {
     name = "fsread.stat",
     description = "Shows file metadata like stat: type, size, permissions (octal and rwx), uid/gid with names, atime/mtime/ctime, inode, link count, blocks, device; follow=true is -L (only targets inside the workspace). Use when you need exact metadata of up to 64 paths instead of running stat. Returns JSON {results:[{path, ok, type, size, mode, owner, mtime, ...}], failed}. Symlinks are described, not followed, unless follow is set.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_stat(
     context: &ToolExecutionContext,

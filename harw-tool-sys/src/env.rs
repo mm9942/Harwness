@@ -143,7 +143,8 @@ pub fn run(vars: Vec<(OsString, OsString)>, args: &EnvArgs) -> ToolOutput {
     name = "sys.env",
     description = "Lists environment variables of the agent process like env, with secrets masked: values of names containing KEY, TOKEN, SECRET, PASSWORD, CREDENTIAL, AUTH and so on, and values that look like tokens or URLs with passwords, are replaced by ***. Use when you need to know a variable (PATH, HOME, LANG, proxy settings) instead of running env or printenv. Filter by exact names, prefix or name substring; filters never look at values. There is no way to reveal masked values. Returns JSON {variables:[{name,value,masked}], count, masked, truncated}.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_env(_context: &ToolExecutionContext, args: EnvArgs) -> Result<ToolOutput, ToolsError> {
     run_blocking(TOOL, move || run(std::env::vars_os().collect(), &args)).await

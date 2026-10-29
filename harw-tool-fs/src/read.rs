@@ -275,6 +275,20 @@ pub struct FsReadExecutor {
 }
 
 impl FsReadExecutor {
+    /// Descriptive activity metadata of `fs.read` (PL-71, PL-97 M2), written by
+    /// hand in the form `#[harw_macros::tool(activity(...))]` generates: domain
+    /// `filesystem`, verb `read`, resource field `path`, effect `observe`.
+    ///
+    /// It grants, implies or checks no permission and is not part of the
+    /// model-facing `ToolSpec`.
+    pub const ACTIVITY: Option<harw_tools::ActivityDescriptor> =
+        Some(harw_tools::ActivityDescriptor::new(
+            "filesystem",
+            "read",
+            Some("path"),
+            harw_tools::Effect::Observe,
+        ));
+
     /// Führt den Lese-Vorgang synchron (blockierend) aus.
     ///
     /// # Errors

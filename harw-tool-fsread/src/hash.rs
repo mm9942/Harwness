@@ -142,7 +142,8 @@ pub fn run(root: &Path, args: &HashArgs) -> ToolOutput {
     name = "fsread.hash",
     description = "Computes SHA-256 (sha256sum) or BLAKE3 (b3sum) digests of up to 16 workspace files. Use when you need to fingerprint or compare files instead of running sha256sum or b3sum. Returns JSON {results:[{path, digest, size}], failed}. Files above 64 MiB are rejected rather than hashed partially; symlinks and secret files are never read.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_hash(
     context: &ToolExecutionContext,

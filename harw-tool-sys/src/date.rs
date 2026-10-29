@@ -227,7 +227,8 @@ pub fn run(now: (i64, u32), args: &DateArgs) -> ToolOutput {
     name = "sys.date",
     description = "Reports the current date and time (or a given Unix timestamp) like date: UTC or a fixed offset_minutes, a strftime-style format (%Y-%m-%d %H:%M:%S %z %Z %s %j %a %b and more; unknown specifiers are rejected) and epoch seconds. Use when you need the current time, a Unix timestamp or a formatted date instead of running date. Returns JSON {formatted, iso, epoch, weekday}. No time zone database: only UTC and fixed offsets. Read-only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_date(
     _context: &ToolExecutionContext,

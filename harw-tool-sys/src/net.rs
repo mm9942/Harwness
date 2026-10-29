@@ -403,7 +403,8 @@ pub fn run(procfs: &ProcFs, args: &SsArgs) -> ToolOutput {
     name = "sys.ss",
     description = "Lists network sockets like ss/netstat from /proc/net: -t tcp, -u udp, -x unix, -l listening only, -a all, -4/-6 address family, port filter (local or remote). Use when you need to know which ports are listening or which connections exist instead of running ss or netstat. Returns JSON {sockets:[{proto,state,local_addr,local_port,remote_addr,remote_port,uid,user,inode}], count, matched, truncated}. No process names (-p needs root); read-only, Linux only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_ss(_context: &ToolExecutionContext, args: SsArgs) -> Result<ToolOutput, ToolsError> {
     run_blocking(TOOL, move || run(&ProcFs::real(), &args)).await

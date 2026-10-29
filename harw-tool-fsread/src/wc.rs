@@ -229,7 +229,8 @@ pub fn run(root: &Path, args: &WcArgs) -> ToolOutput {
     name = "fsread.wc",
     description = "Counts lines (-l), words (-w), bytes (-c), characters (-m) and the longest line (-L) of up to 32 workspace files like wc, streaming and bounded to 64 MiB per file. Use when you need sizes or line counts instead of running wc. Returns JSON {results:[{path, lines, words, bytes,...}], total, failed, truncated}. Default counts are lines, words and bytes.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_wc(context: &ToolExecutionContext, args: WcArgs) -> Result<ToolOutput, ToolsError> {
     let root = workspace_root(context);

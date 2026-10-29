@@ -206,7 +206,8 @@ pub fn run(root: &Path, args: &TreeArgs) -> ToolOutput {
     name = "fsread.tree",
     description = "Renders a directory tree of the workspace like tree: -L max_depth (default 3, max 16), -d dirs_only, -a all, bounded by limit (default 500, hard 5000). Use when you need the layout of a project instead of running tree or many ls calls. Returns JSON {tree: text, entries:[{path,depth,type}], directories, files, truncated}. Symlinks are shown as 'name -> target' and never entered; secret directories (.ssh, ...) are not descended.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_tree(
     context: &ToolExecutionContext,

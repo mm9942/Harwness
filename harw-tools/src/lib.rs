@@ -54,6 +54,16 @@ pub use spec::{FunctionToolSpec, ToolName, ToolSpec};
 /// im aufrufenden Crate voraussetzt.
 pub use harw_authority::Permission;
 
+/// Re-export of the activity vocabulary (PL-71, `harw-activity`).
+///
+/// Referenced by `#[harw_macros::tool(activity(...))]` as
+/// `::harw_tools::ActivityDescriptor` / `::harw_tools::Effect` (the `ACTIVITY`
+/// const) and by [`macro@tool_provider`] as the element type of
+/// `TOOL_ACTIVITIES`, so tool crates need no direct `harw-activity`
+/// dependency. Descriptive only: a descriptor grants, implies or checks no
+/// permission and is never part of a [`ToolSpec`].
+pub use harw_activity::{ActivityDescriptor, Effect};
+
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]
 mod test_support;

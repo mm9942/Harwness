@@ -115,7 +115,13 @@ fn is_hard_excluded(name: &OsStr, _is_dir: bool) -> bool {
     name = "fs.glob",
     description = "Findet Dateien im Workspace über ein Glob-Muster.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    activity(
+        domain = "filesystem",
+        verb = "glob",
+        resource = "path",
+        effect = "observe"
+    )
 )]
 async fn fs_glob(context: &ToolExecutionContext, args: GlobArgs) -> Result<ToolOutput, ToolsError> {
     let root = context.sandbox().workspace().canonical_root().to_path_buf();

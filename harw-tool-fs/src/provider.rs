@@ -90,6 +90,35 @@ pub struct FsToolProvider {
 }
 
 impl FsToolProvider {
+    /// Names of the seven tools, in [`ToolProvider::tools`] order (the same
+    /// table `harw_tools::tool_provider!` generates for macro providers).
+    pub const TOOL_NAMES: &'static [&'static str] = &[
+        "fs.read",
+        "fs.write",
+        "fs.edit",
+        "fs.list",
+        "fs.search",
+        FsGlobTool::NAME,
+        FsGrepTool::NAME,
+    ];
+
+    /// Activity descriptors of the tools (PL-71, PL-97 M2), index-aligned with
+    /// [`Self::TOOL_NAMES`], in the shape of `tool_provider!`'s
+    /// `TOOL_ACTIVITIES`: reads, listings and searches are `observe`,
+    /// `fs.write`/`fs.edit` are `mutate`; the resource key is always the `path`
+    /// argument.
+    ///
+    /// Descriptive only: never a permission, never part of a `ToolSpec`.
+    pub const TOOL_ACTIVITIES: &'static [Option<harw_tools::ActivityDescriptor>] = &[
+        FsReadExecutor::ACTIVITY,
+        FsWriteExecutor::ACTIVITY,
+        FsEditExecutor::ACTIVITY,
+        FsListExecutor::ACTIVITY,
+        FsSearchExecutor::ACTIVITY,
+        FsGlobTool::ACTIVITY,
+        FsGrepTool::ACTIVITY,
+    ];
+
     /// Erstellt einen neuen `FsToolProvider` mit Standard-Konfiguration.
     ///
     /// # Returns
@@ -693,6 +722,90 @@ mod tests {
             "{}",
             write.description
         );
+    }
+
+    /// PL-97 M2: `TOOL_NAMES` folgt der Reihenfolge von `tools()`.
+    #[test]
+    fn test_fs_tool_names_follow_tools_order() {
+        let tools = FsToolProvider::new().tools();
+        let names: Vec<&str> = tools.iter().map(ToolSpec::name).collect();
+        assert_eq!(names, FsToolProvider::TOOL_NAMES);
+        assert_eq!(
+            FsToolProvider::TOOL_ACTIVITIES.len(),
+            FsToolProvider::TOOL_NAMES.len()
+        );
+    }
+
+    /// PL-97 M2 (erste Migrationswelle, PL-71 §Migration): jedes `fs.*`-Tool
+    /// trägt einen bekannten `filesystem`-Deskriptor; Lesen/Listen/Suchen ist
+    /// `observe`, Schreiben/Editieren `mutate`, und das Ressourcenfeld ist ein
+    /// Argument der modell-sichtbaren Spezifikation.
+    #[test]
+    fn test_fs_tool_activities_are_annotated() -> TestResult {
+        let specs = FsToolProvider::new().tools();
+        for ((name, activity), spec) in FsToolProvider::TOOL_NAMES
+            .iter()
+            .zip(FsToolProvider::TOOL_ACTIVITIES)
+            .zip(&specs)
+        {
+            let activity = activity
+                .as_ref()
+                .ok_or(TestError::Missing("every fs.* tool declares an activity"))?;
+            assert!(activity.is_known(), "{name}: {activity}");
+            assert_eq!(activity.domain, "filesystem", "{name}");
+            let verb = name
+                .strip_prefix("fs.")
+                .ok_or(TestError::Missing("fs. prefix"))?;
+            assert_eq!(activity.verb, verb, "{name}");
+            let expected = if matches!(*name, "fs.write" | "fs.edit") {
+                harw_tools::Effect::Mutate
+            } else {
+                harw_tools::Effect::Observe
+            };
+            assert_eq!(activity.effect, expected, "{name}");
+            assert_eq!(activity.resource_field.as_deref(), Some("path"), "{name}");
+            let ToolSpec::Function(function) = spec;
+            let properties = function.parameters.properties.clone().unwrap_or_default();
+            assert!(
+                properties.contains_key("path"),
+                "{name}: the resource field must be an argument of the spec"
+            );
+        }
+        // Die makro-generierten Tools liefern denselben Deskriptor wie die Tabelle.
+        assert_eq!(FsGlobTool::ACTIVITY, FsToolProvider::TOOL_ACTIVITIES[5]);
+        assert_eq!(FsGrepTool::ACTIVITY, FsToolProvider::TOOL_ACTIVITIES[6]);
+        assert_eq!(FsGlobTool::SKILL, None);
+        Ok(())
+    }
+
+    /// PL-97 M2: Die Activity-Metadaten ändern die modell-sichtbaren
+    /// Spezifikationen nicht. Die Golden-Datei wurde **vor** der Annotation
+    /// erfasst; absichtliche Änderungen werden mit
+    /// `HARW_UPDATE_GOLDEN=1 cargo test -p harw-tool-fs` neu geschrieben.
+    #[test]
+    fn test_fs_tool_specs_match_golden() -> TestResult {
+        let actual = serde_json::to_value(FsToolProvider::new().tools())?;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join("fs_tool_specs.json");
+        if std::env::var_os("HARW_UPDATE_GOLDEN").is_some() {
+            let parent = path
+                .parent()
+                .ok_or(TestError::Missing("golden file has a parent directory"))?;
+            fs::create_dir_all(parent)?;
+            let mut text = serde_json::to_string_pretty(&actual)?;
+            text.push('\n');
+            fs::write(&path, text)?;
+            return Ok(());
+        }
+        let expected: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        if expected != actual {
+            return Err(TestError::Unexpected(format!(
+                "fs tool specs differ from golden\nexpected: {expected:#}\nactual: {actual:#}"
+            )));
+        }
+        Ok(())
     }
 
     #[test]

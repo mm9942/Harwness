@@ -209,7 +209,8 @@ pub fn run(root: &Path, args: &DfArgs) -> ToolOutput {
     name = "fsread.df",
     description = "Reports size, used, free and available bytes plus inode counts of the filesystem that holds a workspace path, like df (-h via human=true). Use when you need free disk space or inode exhaustion instead of running df. Returns JSON {total_bytes, used_bytes, available_bytes, used_percent, inodes_*, fs_type, source, read_only}. The mount point itself is not reported.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_df(context: &ToolExecutionContext, args: DfArgs) -> Result<ToolOutput, ToolsError> {
     let root = workspace_root(context);

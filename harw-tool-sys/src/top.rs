@@ -247,7 +247,8 @@ fn cpu_summary(before: CpuTimes, after: CpuTimes, cpus: usize) -> Value {
     name = "sys.top",
     description = "Takes a top-like snapshot with a real measurement interval: busiest processes by cpu or mem (interval_ms 100-2000), overall CPU split, load average, task counts by state and memory. Use when you need to know what is using CPU or memory right now instead of running top. Returns JSON {processes:[{pid,user,cpu_percent,mem_percent,rss_kib,name,command}], cpu, load_average, tasks, memory}; 100% means one full core, command lines are masked. Read-only, Linux only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_top(_context: &ToolExecutionContext, args: TopArgs) -> Result<ToolOutput, ToolsError> {
     run_blocking(TOOL, move || {

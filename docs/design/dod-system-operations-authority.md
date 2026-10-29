@@ -11,9 +11,9 @@ and the systemd units described in §5.2 exist under the canonical
 `deploy/systemd/` tree (`harw-dod.target`, `harw-sentinel.service`,
 `harw-probe-bpf.service`, `harw-probe-fs.service`, `harw-warden.service`,
 `harw-warden.socket`; the former duplicate `dod/packaging/systemd/` was
-removed by Crypto Masterplan v2 H10). What is confirmed still open: the
-`permission_request!` macro described in §6.3 does not exist in
-`harw-macros`. The rest of this document's many detailed acceptance
+removed by Crypto Masterplan v2 H10). The `permission_request!` macro
+described in §6.3 has since landed in `harw-macros` (PL-97 M2). The rest of
+this document's many detailed acceptance
 criteria (§8) have not been individually re-verified for this pass — treat
 sections below as the original plan's intent, cross-check specifics against
 the code before relying on them, and see `dod/Makefile`,
@@ -405,13 +405,13 @@ parent policy — no implicit trust in old stored permission sets. Missing
 provenance or policy leads to rejection or an explicitly empty context,
 never full rights.
 
-### 6.3 Macros — partially open
+### 6.3 Macros — implemented
 
 Existing `tool`/`operation` macros use the new authority types and
-generate guard calls. A planned addition, `permission_request!`, for
-validated declarative permission lists (result: only a `PermissionRequest`,
-unknown entries a compile error) — **checked: not present in
-`harw-macros`** as of this review. Open.
+generate guard calls. `permission_request!` for validated declarative
+permission lists (result: only a `PermissionRequest`, unknown entries a
+compile error) is implemented in `harw-macros` (PL-97 M2,
+`harw-macros/src/permission_request.rs`, trybuild cases 45–47).
 
 No macro exception for private grant construction, no `__private` minting
 export, no caller-crate name check as a supposed security boundary.

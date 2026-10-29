@@ -69,6 +69,78 @@ mod tests {
         Ok(())
     }
 
+    /// Returns the value text right after `key =` (a top-level key on its own
+    /// line) up to the end of `text`.
+    fn manifest_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+        let mut offset = 0usize;
+        for line in text.split_inclusive('\n') {
+            let key_len = line
+                .split_once('=')
+                .filter(|(lhs, _)| lhs.trim() == key)
+                .map(|(lhs, _)| lhs.len());
+            if let Some(len) = key_len {
+                return text.get(offset + len + 1..).map(str::trim_start);
+            }
+            offset += line.len();
+        }
+        None
+    }
+
+    /// Reads `name` and the `tools` array of a bundled skill manifest.
+    ///
+    /// The manifests are flat TOML with plain basic strings; any missing or
+    /// malformed entry is an error, so a format change fails this test
+    /// instead of letting it pass vacuously.
+    fn manifest_name_and_tools(text: &str) -> TestResult<(&str, Vec<&str>)> {
+        let name = manifest_value(text, "name")
+            .and_then(|value| value.lines().next())
+            .and_then(|line| line.trim().strip_prefix('"'))
+            .and_then(|line| line.strip_suffix('"'))
+            .ok_or(TestError::Missing("skill.toml: name"))?;
+        let list = manifest_value(text, "tools")
+            .and_then(|value| value.strip_prefix('['))
+            .and_then(|value| value.split_once(']'))
+            .map(|(list, _)| list)
+            .ok_or(TestError::Missing("skill.toml: tools"))?;
+        // Zwischen den Strings darf nur `,` und Leerraum stehen.
+        let well_formed = list.matches('"').count() % 2 == 0
+            && list
+                .split('"')
+                .step_by(2)
+                .all(|gap| gap.chars().all(|c| c == ',' || c.is_whitespace()));
+        if !well_formed {
+            return Err(TestError::Unexpected(format!(
+                "skill.toml: malformed tools list: {list}"
+            )));
+        }
+        let tools: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+        Ok((name, tools))
+    }
+
+    /// PL-97 M2/S4: every tool links to the bundled `sys-tools` skill, and
+    /// that skill's manifest lists exactly this provider's tools.
+    #[test]
+    fn tool_skills_match_the_bundled_skill_manifest() -> TestResult {
+        use std::collections::BTreeSet;
+
+        let (skill, listed) =
+            manifest_name_and_tools(include_str!("../skills/sys-tools/skill.toml"))?;
+        assert_eq!(skill, "sys-tools");
+        assert_eq!(SysToolProvider::TOOL_SKILLS.len(), SYS_TOOL_NAMES.len());
+        for (tool, linked) in SYS_TOOL_NAMES.iter().zip(SysToolProvider::TOOL_SKILLS) {
+            assert_eq!(*linked, Some(skill), "{tool}");
+        }
+        let manifest_tools: BTreeSet<&str> = listed.iter().copied().collect();
+        assert_eq!(
+            manifest_tools.len(),
+            listed.len(),
+            "duplicate in skill.toml"
+        );
+        let provided: BTreeSet<&str> = SYS_TOOL_NAMES.iter().copied().collect();
+        assert_eq!(manifest_tools, provided);
+        Ok(())
+    }
+
     #[test]
     fn descriptions_and_fields_are_documented_for_the_tool_index() -> TestResult {
         for spec in SysToolProvider::new().tools() {

@@ -294,7 +294,8 @@ pub fn run(root: &Path, args: &FindArgs) -> ToolOutput {
     name = "fsread.find",
     description = "Finds files and directories under a workspace path like find: -name/-iname/-path globs, kind (-type) f|d|l|o, size range, modification age, -mindepth/-maxdepth, -empty. Use when you need to locate entries by name, type, size or age instead of running find. Returns JSON {matches:[{path,type,size,mtime}], count, truncated, stopped} sorted by path, bounded (default 200, hard 5000, 100000 entries scanned, 5 s). Never follows symlinks.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_find(
     context: &ToolExecutionContext,

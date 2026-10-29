@@ -130,7 +130,8 @@ pub fn run(root: &Path, args: &CatArgs) -> ToolOutput {
     name = "fsread.cat",
     description = "Reads a bounded slice of a workspace text file like cat, optionally with line numbers (-n) and a byte offset; returns next_offset to continue. Use when you need file contents with stable line numbers instead of running cat. Returns JSON {content, offset, bytes_returned, next_offset, file_size, truncated}; at most 48 KiB per call, binary files refused, secret files (.env, keys) never read.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_cat(
     context: &ToolExecutionContext,

@@ -285,7 +285,13 @@ impl GrepRun<'_> {
                     Ausdruck und liefert Treffer im GNU-grep-Stil. Die Suche ist intern, \
                     symlink-fest und startet keine externen Prozesse.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    activity(
+        domain = "filesystem",
+        verb = "grep",
+        resource = "path",
+        effect = "observe"
+    )
 )]
 async fn fs_grep(context: &ToolExecutionContext, args: GrepArgs) -> Result<ToolOutput, ToolsError> {
     let root = context.sandbox().workspace().canonical_root().to_path_buf();
