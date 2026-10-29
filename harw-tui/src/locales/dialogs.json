@@ -338,7 +338,7 @@
   "dialogs.approval_footer_short": {
     "en": "↑↓ select · Enter ok · v details · Esc No",
     "de": "↑↓ wählen · Enter ok · v Details · Esc Nein",
-    "es": "↑↓ elegir · Enter sí · v detalles · Esc No",
+    "es": "↑↓ elegir · Enter confirmar · v detalles · Esc No",
     "fr": "↑↓ choisir · Enter ok · v détails · Esc Non",
     "pt": "↑↓ selecionar · Enter ok · v detalhes · Esc Não",
     "ja": "↑↓ 選択 · Enter 確定 · v 詳細 · Esc いいえ",
@@ -890,7 +890,7 @@
   "dialogs.sudo_footer_short": {
     "en": "Enter ok · Tab select · Esc deny",
     "de": "Enter ok · Tab wählen · Esc ablehnen",
-    "es": "Enter sí · Tab elegir · Esc rechazar",
+    "es": "Enter confirmar · Tab elegir · Esc rechazar",
     "fr": "Enter ok · Tab choisir · Esc refuser",
     "pt": "Enter ok · Tab selecionar · Esc negar",
     "ja": "Enter 確定 · Tab 選択 · Esc 拒否",
@@ -1346,7 +1346,7 @@
   "dialogs.plan_footer_short": {
     "en": "↑↓ select · Enter ok · PgUp/Down plan · Esc closes",
     "de": "↑↓ wählen · Enter ok · Bild↑/↓ Plan · Esc schließt",
-    "es": "↑↓ elegir · Enter sí · PgUp/Down plan · Esc cerrar",
+    "es": "↑↓ elegir · Enter confirmar · PgUp/Down plan · Esc cerrar",
     "fr": "↑↓ choisir · Enter ok · PgUp/Down plan · Esc fermer",
     "pt": "↑↓ selecionar · Enter ok · PgUp/Down plano · Esc fechar",
     "ja": "↑↓ 選択 · Enter 確定 · PgUp/Down 計画 · Esc 閉じる",

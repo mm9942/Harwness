@@ -1294,6 +1294,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spanish_compact_footer_confirms_the_selected_denial() {
+        let (sudo_prompt, answer) = prompt(true);
+        let mut ui = SudoUi::new(None, DEFAULT_SUDO_SESSION);
+        let shown = Instant::now() - SUDO_ARMING_DELAY - Duration::from_millis(1);
+        ui.open(sudo_prompt, shown);
+        assert_eq!(ui.open.as_ref().map(|open| open.selected), Some(1));
+
+        crate::i18n::with_language(harw_config::UiLanguage::Spanish, || {
+            let area = Rect::new(0, 0, 50, 14);
+            let mut buffer = Buffer::empty(area);
+            assert!(ui.render(area, &mut buffer, style::Theme::Dark));
+            let text: String = buffer
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            assert!(
+                text.contains("Enter confirmar · Tab elegir · Esc rechazar"),
+                "{text}"
+            );
+            assert!(!text.contains("Enter sí"), "{text}");
+            ui.handle_event(key(KeyCode::Enter), Instant::now());
+        });
+
+        assert!(!ui.is_open());
+        assert!(answer.into_answer().await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_passwordless_approval_sends_approve_once() -> TestResult {
         let (sudo_prompt, answer) = prompt(true);
         let mut ui = SudoUi::new(None, DEFAULT_SUDO_SESSION);
