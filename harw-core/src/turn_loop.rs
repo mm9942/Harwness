@@ -3625,6 +3625,8 @@ async fn run_turn_with_approvals(
             }
         };
         *session.history_mut() = history;
+        // PL-97 H7: wie `hydrate_from_store` auch den Skill-Injektor.
+        session.restore_skill_injector_from_store(store).await;
     }
 
     // User-Input in den Verlauf spielen und persistieren.
@@ -6128,9 +6130,17 @@ fn prepare_skill_injection(
 }
 
 /// Hält jede Skill-Lieferung des eben beantworteten Requests als
-/// `injection`-Ereignis fest (PL-95 S3), genau einmal je Lieferung
-/// ([`crate::skill_injection::SkillInjector::confirm_delivered`]). Ein
-/// Store-Fehler wird nur geloggt — die Messung darf den Turn nie abbrechen.
+/// `injection`-Ereignis fest (PL-95 S3), genau einmal je Lieferung.
+///
+/// Die Antwort macht jeden noch unbeantworteten aktiven Auszug zur
+/// Lieferung ([`crate::skill_injection::SkillInjector::mark_answered`], mit
+/// `turn_id` als Herkunft). Bestätigt ist eine Lieferung erst, wenn ihr
+/// Ereignis dauerhaft angehängt ist
+/// ([`crate::skill_injection::SkillInjector::pending_deliveries`], danach
+/// [`crate::skill_injection::SkillInjector::confirm_recorded`]). Ein
+/// Store-Fehler wird nur geloggt — die Messung darf den Turn nie abbrechen —
+/// und die Lieferung bleibt offen: die nächste beantwortete Runde hängt sie
+/// erneut an, mit der `turn_id` der ersten Antwort (PR #154).
 async fn record_skill_injections(
     session: &AgentSession,
     store: &dyn StateStore,
@@ -6139,7 +6149,16 @@ async fn record_skill_injections(
     let Some(injector) = session.skill_injector() else {
         return;
     };
-    for delivered in injector.confirm_delivered() {
+    injector.mark_answered(turn_id.as_str());
+    for pending in injector.pending_deliveries() {
+        let delivered = &pending.delivery;
+        let record = pending.to_record();
+        if let Err(error) = store.record_skill_injection(session.id(), &record).await {
+            // Offen lassen: die nächste beantwortete Runde versucht es erneut.
+            tracing::warn!(%error, skill = %delivered.skill, "turn_loop.skill_injection_record_failed");
+            continue;
+        }
+        injector.confirm_recorded(&pending);
         tracing::info!(
             skill = %delivered.skill,
             section = delivered.section.as_deref().unwrap_or(""),
@@ -6148,10 +6167,6 @@ async fn record_skill_injections(
             bytes = delivered.bytes,
             "skills.triggered.injected"
         );
-        let record = delivered.to_record(turn_id.as_str());
-        if let Err(error) = store.record_skill_injection(session.id(), &record).await {
-            tracing::warn!(%error, skill = %delivered.skill, "turn_loop.skill_injection_record_failed");
-        }
     }
 }
 

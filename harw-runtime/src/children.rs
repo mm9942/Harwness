@@ -2691,6 +2691,9 @@ fn load_enabled_skills<'a>(
             match index {
                 Some(index) if index.is_disabled(name) => continue,
                 Some(index) => match index.get(name).filter(|entry| entry.name == *name) {
+                    Some(entry) if entry.source.is_imported() => {
+                        return Err(imported_skill_refusal(name));
+                    }
                     Some(entry) => {
                         snapshots.push(entry.snapshot().clone());
                         continue;
@@ -2708,11 +2711,25 @@ fn load_enabled_skills<'a>(
             .ok_or_else(|| {
                 format!("skill '{name}' has no skills/*/skill.toml in any trusted config layer")
             })?;
+        if harw_catalog::is_imported_dir(&directory) {
+            return Err(imported_skill_refusal(name));
+        }
         let snapshot = load_skill_runtime_snapshot(&directory, skill)
             .map_err(|error| format!("skill '{name}': {error}"))?;
         snapshots.push(snapshot);
     }
     Ok(snapshots)
+}
+
+/// Die Absage für einen fest gebundenen importierten Skill (PL-97 H8):
+/// sein Text ist Evidenz, nie Instruktion; er erreicht das Modell nur über den
+/// getriggerten Injektor mit `[skills] inject_imported = true`.
+fn imported_skill_refusal(name: &str) -> String {
+    format!(
+        "skill '{name}' is imported ({}); an imported skill cannot be bound as an \
+         instruction, leave it to the triggered injector with [skills] inject_imported = true",
+        harw_catalog::IMPORTED_MARKER_FILE
+    )
 }
 
 /// Rendert die aktivierten Skills `skill_names` als Instruktionsfragmente
@@ -4075,6 +4092,54 @@ mod tests {
         // Ein gänzlich unbekannter fester Skill bleibt fail-closed.
         let unknown = ir_with_skills(&["gibt-es-nicht"])?;
         assert!(root_skill_fragments(&config, &roots, &index, Some(&unknown), None).is_err());
+        Ok(())
+    }
+
+    /// PL-97 H8: ein fest gebundener importierter Skill (Marker
+    /// `imported.toml`) wird nie Instruktionsfragment — weder über den
+    /// Index-Rückfall noch über die Konfiguration; die Montage scheitert
+    /// fail-closed.
+    #[test]
+    fn bound_imported_skills_are_refused_as_instructions() -> TestResult {
+        // Konfigurationsweg: `review` steht in `config.skills`.
+        let (layer, config) = skill_fixture("assistant")?;
+        let roots = vec![layer.path().to_path_buf()];
+        std::fs::write(
+            layer
+                .path()
+                .join("skills")
+                .join("review")
+                .join(harw_catalog::IMPORTED_MARKER_FILE),
+            "",
+        )
+        .map_err(ctx("write marker"))?;
+        let Err(error) = agent_skill_fragments(&config, &roots, "assistant") else {
+            return Err(crate::test_support::TestError::Unexpected(
+                "an imported skill must not become an instruction fragment".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("is imported"), "{error}");
+
+        // Index-Rückfall: der Name fehlt in der Konfiguration.
+        let fremd = layer.path().join("skills").join("fremd");
+        std::fs::create_dir_all(&fremd).map_err(ctx("mkdir fremd"))?;
+        std::fs::write(
+            fremd.join("skill.toml"),
+            "name = \"fremd\"\ndescription = \"Fremd.\"\n",
+        )
+        .map_err(ctx("write manifest"))?;
+        std::fs::write(fremd.join("instructions.md"), "Foreign advice.\n")
+            .map_err(ctx("write body"))?;
+        std::fs::write(fremd.join(harw_catalog::IMPORTED_MARKER_FILE), "")
+            .map_err(ctx("write marker"))?;
+        let index = SkillIndex::build(&roots);
+        let root = ir_with_skills(&["fremd"])?;
+        let Err(error) = root_skill_fragments(&config, &roots, &index, Some(&root), None) else {
+            return Err(crate::test_support::TestError::Unexpected(
+                "an imported index skill must not become an instruction fragment".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("is imported"), "{error}");
         Ok(())
     }
 

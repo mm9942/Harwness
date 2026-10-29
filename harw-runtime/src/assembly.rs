@@ -2352,8 +2352,16 @@ impl RuntimeAssemblyBuilder {
         let skill_injection_settings =
             harw_core::SkillInjectionSettings::from_config(&config.harness.skills);
         let skill_injection = if skill_catalog_at_root {
+            // PL-97 H8: die Katalogzeilen sind Autorentext und landen in der
+            // Instruktionsebene — importierte Skills stehen dort nur mit
+            // `[skills] inject_imported`.
+            let catalog_index = if skill_injection_settings.inject_imported {
+                std::borrow::Cow::Borrowed(skill_index.as_ref())
+            } else {
+                std::borrow::Cow::Owned(skill_index.without_imported())
+            };
             overrides.extra_context.push(skill_catalog_fragment(
-                &skill_index,
+                &catalog_index,
                 skill_injection_settings.l0_bytes,
             ));
             skill_injection_settings
@@ -6720,7 +6728,11 @@ impl RuntimeAssembly {
                 })
                 .with_context_ledger(self.context_ledger.clone())
                 // PL-95 S3: je Sitzung ein frischer Injektor-Zustand über dem
-                // gemeinsamen Index der Montage.
+                // gemeinsamen Index der Montage. PL-97 H7: nimmt die Sitzung
+                // eine gespeicherte wieder auf, stellt
+                // `AgentSession::hydrate_from_store` Auszüge, Dedupe und
+                // verbrauchtes Budget aus den Injektions-Datensätzen wieder
+                // her — vor dem nächsten Turn.
                 .with_skill_injector(self.skill_injection.as_ref().map(|seed| {
                     // PL-97 B2: ein Skill, dessen deklarierte Werkzeuge diese
                     // Sitzung alle nicht registriert, wird nicht eingespielt.
@@ -8396,6 +8408,136 @@ mod tests {
         Ok(())
     }
 
+    /// PL-97 H8: ein importierter Skill der Home-Schicht (Marker
+    /// `imported.toml`) trägt seine Herkunft über den Index und den
+    /// Injektor-Seed der Montage in die Wurzelsitzung: ohne
+    /// `[skills] inject_imported` erreicht er das Modell nicht, mit dem
+    /// Schalter nur als `Evidence` im Datenblock — nie als Instruktion.
+    #[tokio::test]
+    async fn test_imported_skills_are_suppressed_by_default_and_evidence_when_opted_in()
+    -> TestResult {
+        // Liefert die Requests eines auslösenden Turns und die Trust-Werte
+        // der Injektions-Datensätze.
+        let run = |inject_imported: bool| async move {
+            let fixture = build_fixture()?;
+            let skill_dir = fixture.home.join("skills").join("import-probe");
+            std::fs::create_dir_all(&skill_dir).map_err(ctx("Skill-Verzeichnis"))?;
+            std::fs::write(
+                skill_dir.join("skill.toml"),
+                "name = \"import-probe\"\ndescription = \"Use when the import probe matters.\"\n",
+            )
+            .map_err(ctx("skill.toml"))?;
+            std::fs::write(
+                skill_dir.join("instructions.md"),
+                "# Import probe\n\nForeign advice.\n",
+            )
+            .map_err(ctx("instructions.md"))?;
+            std::fs::write(
+                skill_dir.join("triggers.toml"),
+                "[triggers]\nkeywords = [\"import probe\"]\npriority = 90\n",
+            )
+            .map_err(ctx("triggers.toml"))?;
+            std::fs::write(
+                skill_dir.join(harw_catalog::IMPORTED_MARKER_FILE),
+                "source = \"SKILL.md\"\n",
+            )
+            .map_err(ctx("Import-Marker"))?;
+            if inject_imported {
+                let config = fixture
+                    .home
+                    .join("profiles")
+                    .join("default")
+                    .join("config.toml");
+                let mut text = std::fs::read_to_string(&config).map_err(ctx("config lesen"))?;
+                text.push_str("\n[skills]\ninject_imported = true\n");
+                std::fs::write(&config, text).map_err(ctx("config schreiben"))?;
+            }
+            let store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
+            let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+                .stores(RuntimeStores {
+                    state_store: Arc::clone(&store),
+                    job_store: None,
+                    approval_store: None,
+                })
+                .build()
+                .map_err(ctx("montiert"))?;
+            let id = assembly.root_session_id().clone();
+            let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+            let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+            let mut root = assembly
+                .new_root_session(id.clone(), events, turn_events, None)
+                .map_err(ctx("Wurzelsitzung entsteht"))?;
+            let injector = root
+                .session
+                .skill_injector()
+                .ok_or(TestError::Missing("Injektor der Wurzelsitzung"))?;
+            assert_eq!(
+                injector.provenance("import-probe"),
+                harw_core::skill_injection::SkillProvenance::Imported
+            );
+            let model = harw_core::testing::RecordingModelProvider::with_response("ok");
+            harw_core::run_turn(
+                &mut root.session,
+                &model,
+                store.as_ref(),
+                harw_core::TurnInput::user("check the import probe"),
+            )
+            .await
+            .map_err(ctx("auslösender Turn"))?;
+            let trust: Vec<String> = store
+                .load_skill_injections(&id)
+                .await
+                .map_err(ctx("Datensätze"))?
+                .into_iter()
+                .filter(|record| record.skill == "import-probe")
+                .map(|record| record.trust)
+                .collect();
+            Ok::<_, TestError>((model.recorded(), trust))
+        };
+        let marker = "# Skill: import-probe (sha256 ";
+        let in_instructions = |request: &harw_core::ModelRequest| {
+            request
+                .instruction_fragments
+                .iter()
+                .any(|fragment| fragment.contains(marker))
+        };
+        let in_data = |request: &harw_core::ModelRequest| {
+            request
+                .data_block
+                .as_deref()
+                .is_some_and(|block| block.contains(marker))
+        };
+
+        let (requests, trust) = run(false).await?;
+        assert!(!requests.is_empty());
+        assert!(
+            requests.iter().all(|request| !request
+                .instruction_fragments
+                .iter()
+                .any(|fragment| fragment.contains("import-probe"))),
+            "ohne inject_imported nennt auch der L0-Katalog den importierten Skill nicht"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !in_instructions(request) && !in_data(request)),
+            "ohne inject_imported erreicht der importierte Skill das Modell nicht"
+        );
+        assert!(trust.is_empty(), "keine Lieferung: {trust:?}");
+
+        let (requests, trust) = run(true).await?;
+        assert!(
+            requests.iter().any(in_data),
+            "mit inject_imported liegt der Auszug im Datenblock"
+        );
+        assert!(
+            !requests.iter().any(in_instructions),
+            "ein importierter Skill wird nie Instruktion"
+        );
+        assert_eq!(trust, vec!["evidence".to_owned()]);
+        Ok(())
+    }
+
     /// PL-97 D4: ein gesetztes `[dod] export_dir` erreicht die Quelle
     /// `security_signals` der Wurzel; ihre Zähler tragen den Vermerk
     /// „unverifizierte Quelle“ samt Hinweis des Resolvers.
@@ -8511,6 +8653,146 @@ mod tests {
         let off = build_fixture()?;
         append_config(&off, "\n[skills]\ntriggered_injection = false\n")?;
         assert_eq!(injector_of(&off, EntryKind::LocalEcho)?, None);
+        Ok(())
+    }
+
+    /// PL-97 H7: eine neue Montage über demselben dauerhaften Store nimmt die
+    /// Wurzelsitzung mit gleicher `SessionId` wieder auf — ihr Injektor
+    /// übernimmt den aktiven Auszug und das verbrauchte Sitzungsbudget, ein
+    /// folgender `continue`-Turn ohne Treffer schickt den Auszug
+    /// byte-identisch weiter an das Modell.
+    #[tokio::test]
+    async fn test_resumed_root_session_restores_the_skill_injector_state() -> TestResult {
+        let fixture = build_fixture()?;
+        // Ein Skill der Home-Schicht, den ein Schlüsselwort im User-Text
+        // auslöst und der keine Werkzeuge braucht.
+        let skill_dir = fixture.home.join("skills").join("resume-probe");
+        std::fs::create_dir_all(&skill_dir).map_err(ctx("Skill-Verzeichnis"))?;
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            "name = \"resume-probe\"\ndescription = \"Use when the resume probe matters.\"\n",
+        )
+        .map_err(ctx("skill.toml"))?;
+        std::fs::write(
+            skill_dir.join("instructions.md"),
+            "# Resume probe\n\nKeep the probe steady.\n",
+        )
+        .map_err(ctx("instructions.md"))?;
+        std::fs::write(
+            skill_dir.join("triggers.toml"),
+            "[triggers]\nkeywords = [\"resume probe\"]\npriority = 90\n",
+        )
+        .map_err(ctx("triggers.toml"))?;
+        let transcripts = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store: Arc<dyn StateStore> = Arc::new(crate::dream_run::build_dream_state_store(
+            transcripts.path(),
+        ));
+        let id = SessionId::new();
+        let assemble = || -> TestResult<(RuntimeAssembly, RootSession)> {
+            let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+                .stores(RuntimeStores {
+                    state_store: Arc::clone(&store),
+                    job_store: None,
+                    approval_store: None,
+                })
+                .root_session_id(id.clone())
+                .build()
+                .map_err(ctx("montiert"))?;
+            let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+            let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+            let root = assembly
+                .new_root_session(id.clone(), events, turn_events, None)
+                .map_err(ctx("Wurzelsitzung entsteht"))?;
+            Ok((assembly, root))
+        };
+        // Der Skill-Auszug unter den Instruktions-Fragmenten eines Requests.
+        let skill_fragment = |request: &harw_core::ModelRequest| -> Option<String> {
+            request
+                .instruction_fragments
+                .iter()
+                .find(|fragment| fragment.contains("# Skill: resume-probe (sha256 "))
+                .cloned()
+        };
+
+        // Erster Lauf: ein echter Turn löst den Skill per Schlüsselwort aus;
+        // der Turn-Loop hält die Lieferung im Store fest.
+        let (charged, first_excerpt) = {
+            let (_assembly, mut first) = assemble()?;
+            let injector = Arc::clone(
+                first
+                    .session
+                    .skill_injector()
+                    .ok_or(TestError::Missing("Injektor der Wurzelsitzung"))?,
+            );
+            let model = harw_core::testing::RecordingModelProvider::with_response("ok");
+            harw_core::run_turn(
+                &mut first.session,
+                &model,
+                store.as_ref(),
+                harw_core::TurnInput::user("check the resume probe"),
+            )
+            .await
+            .map_err(ctx("auslösender Turn"))?;
+            let excerpt = model
+                .recorded()
+                .last()
+                .and_then(skill_fragment)
+                .ok_or(TestError::Missing("Auszug im ersten Request"))?;
+            assert_eq!(injector.active_count(), 1);
+            (injector.session_bytes(), excerpt)
+        };
+        assert!(charged > 0);
+        assert_eq!(
+            store
+                .load_skill_injections(&id)
+                .await
+                .map_err(ctx("Datensätze"))?
+                .len(),
+            1
+        );
+
+        // Neustart: neue Montage, gleiche Sitzung, frischer Injektor.
+        let (_assembly, mut resumed) = assemble()?;
+        let hydration = resumed
+            .session
+            .hydrate_from_store(store.as_ref())
+            .await
+            .map_err(ctx("hydriert"))?;
+        assert_eq!(hydration.skill_excerpts_restored, 1);
+        let injector = Arc::clone(
+            resumed
+                .session
+                .skill_injector()
+                .ok_or(TestError::Missing("Injektor nach Neustart"))?,
+        );
+        assert_eq!(injector.active_count(), 1);
+        assert_eq!(injector.session_bytes(), charged);
+
+        let model = harw_core::testing::RecordingModelProvider::with_response("ok");
+        harw_core::run_turn(
+            &mut resumed.session,
+            &model,
+            store.as_ref(),
+            harw_core::TurnInput::user("continue"),
+        )
+        .await
+        .map_err(ctx("continue-Turn"))?;
+        assert_eq!(
+            model.recorded().last().and_then(skill_fragment),
+            Some(first_excerpt),
+            "der aktive Auszug erreicht das Modell byte-identisch"
+        );
+        assert_eq!(injector.active_count(), 1, "der Auszug bleibt aktiv");
+        assert_eq!(injector.session_bytes(), charged);
+        assert_eq!(
+            store
+                .load_skill_injections(&id)
+                .await
+                .map_err(ctx("Datensätze"))?
+                .len(),
+            1,
+            "kein zweiter Datensatz für den wiederhergestellten Auszug"
+        );
         Ok(())
     }
 

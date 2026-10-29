@@ -122,6 +122,16 @@ impl InjectionState {
         self.session_bytes = 0;
     }
 
+    /// Restores one earlier delivery when a session is resumed: marks
+    /// `skill`/`section` (`None` = the whole skill) as delivered and books
+    /// `bytes` against the session budget, as [`select`] did when it chose
+    /// the excerpt.
+    pub fn restore_delivered(&mut self, skill: &str, section: Option<&str>, bytes: usize) {
+        self.delivered
+            .insert((skill.to_owned(), section.unwrap_or_default().to_owned()));
+        self.session_bytes = self.session_bytes.saturating_add(bytes);
+    }
+
     /// Vergisst nur `skill` (alle Abschnitte) — wenn nur dieser Auszug durch
     /// eine Verdichtung verloren ging. Die verbrauchten Bytes bleiben.
     pub fn forget_skill(&mut self, skill: &str) {

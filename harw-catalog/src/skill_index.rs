@@ -54,6 +54,15 @@ pub const SHORT_DESCRIPTION_CHARS: usize = 160;
 /// Platte).
 const MAX_INSTRUCTIONS_BYTES: usize = 512 * 1024;
 
+/// Marker file of an imported skill, next to its `skill.toml`.
+///
+/// `harw skill import` (PL-95 S8) converts a foreign skill into a layer skill
+/// and writes this file into the skill directory. Its presence alone marks the
+/// skill as [`SkillSource::Imported`]; the content (a provenance note) is not
+/// read. Any directory entry under this name counts, also an unreadable one
+/// (fail-closed: when in doubt a skill is imported, never trusted).
+pub const IMPORTED_MARKER_FILE: &str = "imported.toml";
+
 /// Woher ein Skill im Index stammt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillSource {
@@ -61,6 +70,11 @@ pub enum SkillSource {
     Layer(PathBuf),
     /// Aus dem in `harw-home` eingebetteten Bündel.
     Bundled,
+    /// Imported from outside (`harw skill import`, PL-95 S8): a layer or bundle
+    /// skill whose directory carries [`IMPORTED_MARKER_FILE`]. The path is the
+    /// skill directory (for a bundle skill its bundle location). Its text is
+    /// evidence, never instruction.
+    Imported(PathBuf),
 }
 
 impl SkillSource {
@@ -69,9 +83,30 @@ impl SkillSource {
     #[must_use]
     pub fn label(&self) -> String {
         match self {
-            Self::Layer(dir) => dir.display().to_string(),
+            Self::Layer(dir) | Self::Imported(dir) => dir.display().to_string(),
             Self::Bundled => BUNDLED_SKILL_SOURCE.to_owned(),
         }
+    }
+
+    /// Whether the skill was imported from outside (see
+    /// [`IMPORTED_MARKER_FILE`]).
+    #[must_use]
+    pub fn is_imported(&self) -> bool {
+        matches!(self, Self::Imported(_))
+    }
+}
+
+/// Whether the skill directory `dir` carries [`IMPORTED_MARKER_FILE`].
+///
+/// Does not follow symlinks; an error other than "not found" counts as
+/// imported (fail-closed). Every path that renders a skill directory as
+/// instruction text (the index here, bound skills in `harw-runtime`) uses this
+/// one check.
+#[must_use]
+pub fn is_imported_dir(dir: &Path) -> bool {
+    match std::fs::symlink_metadata(dir.join(IMPORTED_MARKER_FILE)) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
 }
 
@@ -279,10 +314,14 @@ impl SkillIndex {
             match load_skill_runtime_snapshot(&dir, &manifest) {
                 Ok(snapshot) => {
                     let spec = index.trigger_spec(&name, read_skill_triggers(&dir));
-                    index.entries.insert(
-                        name,
-                        SkillIndexEntry::new(snapshot, SkillSource::Layer(dir), spec),
-                    );
+                    let source = if is_imported_dir(&dir) {
+                        SkillSource::Imported(dir)
+                    } else {
+                        SkillSource::Layer(dir)
+                    };
+                    index
+                        .entries
+                        .insert(name, SkillIndexEntry::new(snapshot, source, spec));
                 }
                 Err(error) => index.skipped.push(SkippedSkill {
                     location: dir.display().to_string(),
@@ -435,9 +474,19 @@ impl SkillIndex {
                 source_path: PathBuf::from(format!("{BUNDLED_SKILL_SOURCE}:{relative}")),
                 sha256: sha256_hex(instructions.as_bytes()),
             };
+            // Ein Bündel (etwa das eines eingebetteten Artefakts) kann einen
+            // importierten Skill samt Marker tragen: er bleibt importiert.
+            let source =
+                if files.contains_key(format!("skills/{dir}/{IMPORTED_MARKER_FILE}").as_str()) {
+                    SkillSource::Imported(PathBuf::from(format!(
+                        "{BUNDLED_SKILL_SOURCE}:skills/{dir}"
+                    )))
+                } else {
+                    SkillSource::Bundled
+                };
             bundled.insert(
                 manifest.name.clone(),
-                SkillIndexEntry::new(snapshot, SkillSource::Bundled, spec),
+                SkillIndexEntry::new(snapshot, source, spec),
             );
         }
         self.entries.extend(bundled);
@@ -493,6 +542,25 @@ impl SkillIndex {
     #[must_use]
     pub fn trigger_index(&self) -> &TriggerIndex {
         &self.triggers
+    }
+
+    /// A copy of this index without the [`SkillSource::Imported`] entries,
+    /// its trigger index rebuilt from the remaining ones.
+    ///
+    /// For text that lands in the instruction tier (the L0 catalog lines
+    /// `name — when` are author text): while `[skills] inject_imported` is off
+    /// an imported skill must not appear there either.
+    #[must_use]
+    pub fn without_imported(&self) -> Self {
+        let mut index = self.clone();
+        index.entries.retain(|_, entry| !entry.source.is_imported());
+        index.triggers = TriggerIndex::from_entries(
+            index
+                .entries
+                .values()
+                .map(|entry| (entry.name.as_str(), &entry.triggers)),
+        );
+        index
     }
 
     /// Rangiert die Skills gegen `query`.
@@ -844,6 +912,60 @@ mod tests {
         );
         assert!(section.contains("`business-writing-pyramid`"), "{section}");
         assert!(!section.contains("### handbuch"), "{section}");
+        Ok(())
+    }
+
+    /// PL-97 H8: ein Skill mit [`IMPORTED_MARKER_FILE`] im Verzeichnis
+    /// trägt die Herkunft `Imported` — aus einem Layer wie aus einem Bündel;
+    /// ohne Marker bleibt es bei `Layer` bzw. `Bundled`.
+    #[test]
+    fn import_marker_marks_layer_and_bundle_skills_as_imported() -> TestResult {
+        let layer = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let imported = write_skill(
+            layer.path(),
+            "fremd",
+            "name = \"fremd\"\ndescription = \"Importiert.\"\n",
+            BODY,
+        )?;
+        std::fs::write(
+            imported.join(IMPORTED_MARKER_FILE),
+            "source = \"SKILL.md\"\n",
+        )
+        .map_err(ctx("write marker"))?;
+        let own = write_skill(
+            layer.path(),
+            "eigen",
+            "name = \"eigen\"\ndescription = \"Eigen.\"\n",
+            BODY,
+        )?;
+        let bundle = [
+            ("skills/b/skill.toml", "name = \"buendel-fremd\"\n"),
+            ("skills/b/imported.toml", ""),
+            ("skills/c/skill.toml", "name = \"buendel-eigen\"\n"),
+        ];
+        let index = SkillIndex::build_with_bundle(&[layer.path().to_path_buf()], &bundle);
+        let entry = |name: &str| index.get(name).ok_or(TestError::Missing("Eintrag"));
+        assert_eq!(
+            entry("fremd")?.source,
+            SkillSource::Imported(imported.clone())
+        );
+        assert!(entry("fremd")?.source.is_imported());
+        assert_eq!(
+            entry("fremd")?.source.label(),
+            imported.display().to_string()
+        );
+        assert_eq!(entry("eigen")?.source, SkillSource::Layer(own.clone()));
+        assert!(!entry("eigen")?.source.is_imported());
+        assert!(entry("buendel-fremd")?.source.is_imported());
+        assert_eq!(entry("buendel-eigen")?.source, SkillSource::Bundled);
+        assert!(is_imported_dir(&imported));
+        assert!(!is_imported_dir(&own));
+        let own_only = index.without_imported();
+        assert!(own_only.get("fremd").is_none());
+        assert!(own_only.get("buendel-fremd").is_none());
+        assert!(own_only.get("eigen").is_some());
+        assert!(own_only.get("buendel-eigen").is_some());
+        assert_eq!(own_only.len(), index.len() - 2);
         Ok(())
     }
 

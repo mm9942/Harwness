@@ -13,7 +13,8 @@
 //!   der einzige Weg zurück nach `Idle` und repariert dabei offene Tool-Calls
 //!   im Live-Verlauf (F-152, F-150).
 //! - [`AgentSession::hydrate_from_store`] lädt Verlauf (mit reparierten
-//!   offenen Calls) und Sitzungszustand; [`AgentSession::persist_state`]
+//!   offenen Calls), Sitzungszustand und den Zustand des Skill-Injektors
+//!   (PL-97 H7); [`AgentSession::persist_state`]
 //!   schreibt Modus, Nutzung und Aktivierung (F-157). Beim Laden wird die
 //!   Basis-Aktivierung nie erweitert: geladene Aktivierung ∩ aktuelle Basis.
 //!
@@ -549,6 +550,11 @@ pub struct SessionHydration {
     pub repaired_tool_calls: Vec<ToolCallId>,
     /// `true`, wenn ein persistierter Sitzungszustand angewandt wurde.
     pub state_restored: bool,
+    /// Active triggered skill excerpts re-established from the injection
+    /// records of the current context epoch (PL-97 H7, see
+    /// [`crate::skill_injection::SkillInjector::restore`]); `0` without an
+    /// injector or records.
+    pub skill_excerpts_restored: usize,
 }
 
 // Baut die Modus-Decke (Tool-Profil + Positivliste) für `mode`, unabhängig
@@ -2160,8 +2166,10 @@ impl AgentSession {
     /// Hat die Session bereits einen Verlauf, geschieht nichts
     /// (`skipped = true`). Sonst: Verlauf laden, offene Tool-Calls reparieren
     /// ([`Self::hydrate_history`]), dann den jüngsten Sitzungszustand über
-    /// [`Self::restore_state`] anwenden. Der Session-Zustand (`Idle`/`Running`)
-    /// wird nicht berührt.
+    /// [`Self::restore_state`] anwenden und — mit Skill-Injektor — dessen
+    /// Zustand aus den Injektions-Datensätzen seit der letzten Verdichtung
+    /// wiederherstellen ([`crate::skill_injection::SkillInjector::restore`],
+    /// PL-97 H7). Der Session-Zustand (`Idle`/`Running`) wird nicht berührt.
     ///
     /// # Arguments
     /// - `store` (`&dyn StateStore`): Quelle.
@@ -2192,11 +2200,15 @@ impl AgentSession {
         let state_restored = state
             .as_ref()
             .is_some_and(|snapshot| self.restore_state(snapshot));
+        // PL-97 H7: Auszüge, Dedupe und verbrauchtes Sitzungsbudget des
+        // Injektors überstehen den Neustart derselben Sitzung.
+        let skill_excerpts_restored = self.restore_skill_injector_from_store(store).await;
         tracing::info!(
             session_id = %self.id,
             history_items = self.history.len(),
             repaired_tool_calls = repaired_tool_calls.len(),
             state_restored,
+            skill_excerpts_restored,
             "session.hydrated"
         );
         Ok(SessionHydration {
@@ -2204,7 +2216,39 @@ impl AgentSession {
             history_items: self.history.len(),
             repaired_tool_calls,
             state_restored,
+            skill_excerpts_restored,
         })
+    }
+
+    /// Stellt den Zustand des Skill-Injektors aus den Injektions-Datensätzen
+    /// der aktuellen Kontext-Epoche wieder her (PL-97 H7).
+    ///
+    /// # Description
+    /// Gemeinsamer Weg für [`Self::hydrate_from_store`] und das eingebaute
+    /// Nachladen des Verlaufs in [`crate::turn_loop::run_turn`]. Ohne
+    /// Injektor wird nichts gelesen; ein Store-Fehler wird nur geloggt und
+    /// ergibt einen frischen Injektor-Zustand — die Wiederaufnahme bricht
+    /// daran nie ab. Ein Injektor mit Live-Zustand bleibt unverändert
+    /// ([`crate::skill_injection::SkillInjector::restore`]).
+    ///
+    /// # Returns
+    /// Die Zahl der wiederhergestellten aktiven Auszüge (`0` ohne Injektor
+    /// oder Datensätze).
+    pub(crate) async fn restore_skill_injector_from_store(&self, store: &dyn StateStore) -> usize {
+        let Some(injector) = self.skill_injector.as_ref() else {
+            return 0;
+        };
+        match store.load_active_skill_injections(&self.id).await {
+            Ok(records) => injector.restore(&records),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %self.id,
+                    %error,
+                    "session.skill_injection_restore_failed"
+                );
+                0
+            }
+        }
     }
 
     /// Terminaler Fehler.

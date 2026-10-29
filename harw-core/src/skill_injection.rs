@@ -43,9 +43,24 @@
 //!   released.
 //!
 //! A selection only becomes a delivery once the model answered a request
-//! carrying it ([`SkillInjector::confirm_delivered`]): a request rebuilt after
-//! an emergency compaction, or retried after a context-length error, records
-//! each excerpt exactly once.
+//! carrying it ([`SkillInjector::mark_answered`]): from then on its bytes
+//! stay charged, and it waits for its `injection` event
+//! ([`SkillInjector::pending_deliveries`]) until that event is durable
+//! ([`SkillInjector::confirm_recorded`]). A request rebuilt after an
+//! emergency compaction, or retried after a context-length error, records
+//! each excerpt exactly once; a failed append stays pending for the next
+//! answered round, even when the excerpt left the context in the meantime
+//! (only a compaction discards it, see
+//! [`SkillInjector::reset_after_compaction`]).
+//!
+//! # Resume (PL-97 H7)
+//! The state survives a restart of the same session: every answered
+//! delivery is recorded with its framed excerpt, and
+//! [`crate::session::AgentSession::hydrate_from_store`] hands the records of
+//! the current context epoch (since the last compaction) to
+//! [`SkillInjector::restore`] before the next turn. The active excerpts,
+//! the dedupe state and the charged session budget are rebuilt from them;
+//! a store without records yields a fresh state.
 //!
 //! # Budgets
 //! Per round, for the whole section (active excerpts included): ~3 % of the
@@ -102,7 +117,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use harw_catalog::{
     DEFAULT_L0_BYTES, DropReason, Dropped, Injection, InjectionBudget, InjectionState, SkillIndex,
-    SkillSource, TriggerEvent, TriggerKind,
+    SkillSource, TriggerEvent, TriggerKind, TriggerReason,
 };
 use harw_context::{Fragment, TrustClass};
 use harw_protocol::{ContentPart, ToolCallResult, TurnItem};
@@ -262,6 +277,29 @@ pub struct DeliveredSkill {
     pub sha256: String,
     /// Trust class of the fragment.
     pub trust: TrustClass,
+    /// The framed excerpt (the fragment body), recorded so that a resumed
+    /// session can re-establish it ([`SkillInjector::restore`]).
+    pub text: String,
+}
+
+/// A delivery the model answered whose `injection` event is not durable yet
+/// ([`SkillInjector::pending_deliveries`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRecord {
+    /// The delivery.
+    pub delivery: DeliveredSkill,
+    /// The turn whose answered request first carried the excerpt; a retried
+    /// append keeps it, so the event names the turn the model received the
+    /// excerpt in.
+    pub turn_id: String,
+}
+
+impl PendingRecord {
+    /// The `injection` record of this delivery.
+    #[must_use]
+    pub fn to_record(&self) -> harw_session_store::InjectionRecord {
+        self.delivery.to_record(&self.turn_id)
+    }
 }
 
 impl DeliveredSkill {
@@ -275,6 +313,7 @@ impl DeliveredSkill {
             bytes: injection.bytes,
             sha256: injection.sha256.clone(),
             trust,
+            text: injection.text.clone(),
         }
     }
 
@@ -290,8 +329,23 @@ impl DeliveredSkill {
             turn_id: turn_id.to_owned(),
             trust: trust_label(self.trust).to_owned(),
             sha256: self.sha256.clone(),
+            text: Some(self.text.clone()),
         }
     }
+}
+
+/// [`TriggerKind`] of the stable name a record stores
+/// ([`TriggerKind::as_str`]).
+fn trigger_kind_of(name: &str) -> Option<TriggerKind> {
+    [
+        TriggerKind::ErrorCode,
+        TriggerKind::Command,
+        TriggerKind::Tool,
+        TriggerKind::Path,
+        TriggerKind::Keyword,
+    ]
+    .into_iter()
+    .find(|kind| kind.as_str() == name)
 }
 
 fn trust_label(trust: TrustClass) -> &'static str {
@@ -310,8 +364,9 @@ pub struct RoundInjection {
     /// nothing is active.
     pub fragments: Vec<Fragment>,
     /// Excerpts selected for the first time in this round. They count as
-    /// delivered (`injection` event) once [`SkillInjector::confirm_delivered`]
-    /// reports them.
+    /// delivered once the model answered a request carrying them
+    /// ([`SkillInjector::mark_answered`]); their `injection` event follows
+    /// ([`SkillInjector::confirm_recorded`]).
     pub delivered: Vec<DeliveredSkill>,
     /// Hits of this round that were not selected, with the reason.
     pub dropped: Vec<Dropped>,
@@ -403,9 +458,11 @@ pub struct SkillInjector {
 struct ActiveExcerpt {
     fragment: Fragment,
     delivery: DeliveredSkill,
-    /// Reported by [`SkillInjector::confirm_delivered`]: a request carrying
-    /// it was answered by the model.
-    confirmed: bool,
+    /// Set by [`SkillInjector::mark_answered`]: a request carrying it was
+    /// answered by the model, so its bytes stay charged when it leaves the
+    /// context. Whether its `injection` event is durable is tracked
+    /// separately ([`InjectorState::unrecorded`]).
+    answered: bool,
 }
 
 #[derive(Debug, Default)]
@@ -415,6 +472,10 @@ struct InjectorState {
     /// widen the session budget again (see [`Self::session_bytes`]).
     released_bytes: usize,
     active: Vec<ActiveExcerpt>,
+    /// Answered deliveries whose `injection` event is not durable yet, in
+    /// answer order. Independent of `active`: an excerpt that leaves the
+    /// context keeps its pending record (the model did see it).
+    unrecorded: Vec<PendingRecord>,
     seen_tools: BTreeSet<String>,
     /// Skills skipped for their tools since the last compaction; they stay
     /// marked in `injection`, so a later hit reaches `select` as "already
@@ -428,6 +489,16 @@ impl InjectorState {
         self.injection.reset_after_compaction();
         self.released_bytes = 0;
         self.active.clear();
+        if !self.unrecorded.is_empty() {
+            // Appended after the compaction, the record would count as a
+            // delivery of the new context epoch (restore would bring the
+            // excerpt back): the pending records are dropped instead.
+            tracing::warn!(
+                count = self.unrecorded.len(),
+                "skill_injection.unrecorded_dropped_on_compaction"
+            );
+            self.unrecorded.clear();
+        }
         self.seen_tools.clear();
         self.unavailable.clear();
         self.cursor = None;
@@ -458,12 +529,13 @@ impl InjectorState {
     }
 
     /// The excerpt left the context: its skill may be selected again, and
-    /// the bytes of an excerpt that never reached the model are released.
+    /// the bytes of an excerpt that never reached the model (not answered)
+    /// are released. A pending record of an answered excerpt is kept.
     /// (`forget_skill` also reopens sibling sections that are still active;
     /// [`SkillInjector::prepare_round_with`] skips such a re-selection.)
     fn drop_excerpt(&mut self, excerpt: &ActiveExcerpt) {
         self.injection.forget_skill(&excerpt.delivery.skill);
-        if !excerpt.confirmed {
+        if !excerpt.answered {
             self.release(excerpt.delivery.bytes);
         }
     }
@@ -503,6 +575,15 @@ impl HistoryCursor {
             None => true,
             Some(last_index) => items.get(last_index).map(item_id) == self.last.as_ref(),
         }
+    }
+}
+
+/// The fragment label of an excerpt (as [`Injection::into_fragment`] forms
+/// it).
+fn excerpt_label(skill: &str, section: Option<&str>) -> String {
+    match section {
+        Some(section) => format!("skill:{skill}:{section}"),
+        None => format!("skill:{skill}"),
     }
 }
 
@@ -560,9 +641,11 @@ impl SkillInjector {
         }
     }
 
-    /// Marks skills as imported (trust class `Evidence`; delivered only with
-    /// `inject_imported`). Nothing in the tree marks skills as imported yet;
-    /// the importer of PL-95 S8 feeds this set.
+    /// Marks additional skills as imported (trust class `Evidence`; delivered
+    /// only with `inject_imported`). In production the provenance comes from
+    /// the index: a skill whose directory carries
+    /// [`harw_catalog::IMPORTED_MARKER_FILE`] is [`SkillSource::Imported`]
+    /// (PL-97 H8); this set only adds names on top of that.
     #[must_use]
     pub fn with_imported_skills<I, S>(mut self, names: I) -> Self
     where
@@ -585,8 +668,9 @@ impl SkillInjector {
         &self.index
     }
 
-    /// Provenance of `skill`: imported (explicitly marked), bundled or from a
-    /// trusted layer.
+    /// Provenance of `skill`: imported (marked by the index as
+    /// [`SkillSource::Imported`], PL-97 H8, or via
+    /// [`Self::with_imported_skills`]), bundled or from a trusted layer.
     ///
     /// A name the index does not know is treated as imported (trust class
     /// `Evidence`): the only trust a skill can carry is the trust of the
@@ -601,7 +685,7 @@ impl SkillInjector {
         match self.index.get(skill).map(|entry| &entry.source) {
             Some(SkillSource::Bundled) => SkillProvenance::Bundled,
             Some(SkillSource::Layer(_)) => SkillProvenance::TrustedLayer,
-            None => SkillProvenance::Imported,
+            Some(SkillSource::Imported(_)) | None => SkillProvenance::Imported,
         }
     }
 
@@ -628,8 +712,133 @@ impl SkillInjector {
     /// every skill may be delivered again and the session budget starts
     /// over. The next round re-reads the history from its latest user
     /// message.
+    ///
+    /// Pending records ([`Self::pending_deliveries`]) are dropped as well
+    /// (logged as a warning): appended after the compaction, they would count
+    /// as deliveries of the new context epoch on a resume.
     pub fn reset_after_compaction(&self) {
         self.lock().reset();
+    }
+
+    /// Rebuilds the state of a resumed session (same `SessionId`, new
+    /// process or assembly) from its injection records (PL-97 H7).
+    ///
+    /// # Description
+    /// Deterministic reconstruction: `records` are the deliveries of the
+    /// current context epoch in append order
+    /// ([`crate::state_store::StateStore::load_active_skill_injections`]).
+    /// Every record charges its bytes against the session budget and marks
+    /// its skill section as delivered, exactly as the original selection did.
+    /// A record whose excerpt is known ([`harw_session_store::InjectionRecord::text`])
+    /// is active again, unchanged and answered (it reached the model once, so
+    /// it is never recorded twice); a later delivery of the same label
+    /// replaces the earlier one. A record without text (older binaries), of a
+    /// skill the index no longer knows, whose tools the session lacks, or an
+    /// imported skill while `inject_imported` is off, counts as an excerpt
+    /// that left the context: its bytes stay charged and the skill may be
+    /// delivered again. Rounds after the restore apply the usual rules
+    /// (section share, admit predicate, request montage) to the restored
+    /// excerpts; the next round reads the history from its latest user
+    /// message.
+    ///
+    /// A no-op (returns `0`) when injection is off, `records` is empty (an
+    /// old store: fresh state) or this injector already has session state.
+    ///
+    /// # Returns
+    /// The number of active excerpts after the restore.
+    pub fn restore(&self, records: &[harw_session_store::InjectionRecord]) -> usize {
+        if !self.settings.enabled || records.is_empty() {
+            return 0;
+        }
+        let mut state = self.lock();
+        if state.cursor.is_some() || !state.active.is_empty() || state.injection.session_bytes() > 0
+        {
+            tracing::debug!("skill_injection.restore_skipped_live_state");
+            return 0;
+        }
+        let produced_at = jiff::Timestamp::now();
+        for record in records {
+            let bytes = usize::try_from(record.bytes).unwrap_or(usize::MAX);
+            state
+                .injection
+                .restore_delivered(&record.skill, record.section.as_deref(), bytes);
+            let label = excerpt_label(&record.skill, record.section.as_deref());
+            state
+                .active
+                .retain(|excerpt| excerpt.delivery.label != label);
+            match self.restored_excerpt(record, produced_at) {
+                Some(excerpt) => state.active.push(excerpt),
+                None => state.injection.forget_skill(&record.skill),
+            }
+        }
+        tracing::debug!(
+            records = records.len(),
+            active = state.active.len(),
+            session_bytes = state.session_bytes(),
+            "skill_injection.restored"
+        );
+        state.active.len()
+    }
+
+    /// The active excerpt of a restored record, or `None` when it cannot or
+    /// must not be re-established (see [`Self::restore`]).
+    fn restored_excerpt(
+        &self,
+        record: &harw_session_store::InjectionRecord,
+        produced_at: jiff::Timestamp,
+    ) -> Option<ActiveExcerpt> {
+        let text = record.text.as_deref()?;
+        let kind = trigger_kind_of(&record.trigger_kind)?;
+        // Bindung an den aktuellen Index: ein seither geänderter Skill
+        // (neue Bundle-Version, editierte Trusted-Layer-Datei) gilt als
+        // Auszug, der den Kontext verlassen hat — die aktuelle Fassung darf
+        // neu geliefert werden. Ebenso muss der Text den Kopf genau dieser
+        // Fassung tragen, sonst wird Plattentext nie zur Instruktion.
+        let entry = self.index.get(&record.skill)?;
+        if entry.snapshot().sha256 != record.sha256
+            || !text.starts_with(&format!(
+                "# Skill: {} (sha256 {})",
+                record.skill, record.sha256
+            ))
+        {
+            tracing::debug!(skill = %record.skill, "skill_injection.restore_stale_excerpt");
+            return None;
+        }
+        let text = text.to_owned();
+        if !self.tools_admit(&record.skill) {
+            return None;
+        }
+        let provenance = self.provenance(&record.skill);
+        if provenance == SkillProvenance::Imported && !self.settings.inject_imported {
+            return None;
+        }
+        let trust = provenance.trust();
+        let injection = Injection {
+            skill: record.skill.clone(),
+            section: record.section.clone(),
+            bytes: text.len(),
+            text,
+            reason: TriggerReason {
+                kind,
+                key: record.trigger_key.clone(),
+            },
+            sha256: record.sha256.clone(),
+        };
+        let mut delivery = DeliveredSkill::of(&injection, String::new(), trust);
+        let mut fragment = match injection.into_fragment(produced_at) {
+            Ok(fragment) => fragment,
+            Err(error) => {
+                tracing::warn!(skill = %record.skill, %error, "skill_injection.restore_rejected");
+                return None;
+            }
+        };
+        fragment.trust = trust;
+        delivery.label = fragment.label.as_str().to_owned();
+        Some(ActiveExcerpt {
+            fragment,
+            delivery,
+            answered: true,
+        })
     }
 
     /// [`Self::prepare_round_with`] without an admit predicate.
@@ -877,7 +1086,7 @@ impl SkillInjector {
         state.active.push(ActiveExcerpt {
             fragment,
             delivery,
-            confirmed: false,
+            answered: false,
         });
     }
 
@@ -899,21 +1108,69 @@ impl SkillInjector {
             .collect()
     }
 
-    /// The model answered a request carrying the active excerpts: returns
-    /// every one not reported before (each delivery exactly once) and marks
-    /// it confirmed.
-    #[must_use]
-    pub fn confirm_delivered(&self) -> Vec<DeliveredSkill> {
+    /// The model answered a request carrying the active excerpts in turn
+    /// `turn_id`: every one not answered before becomes a delivery. Its bytes
+    /// stay charged from now on, and it is queued for its `injection` event
+    /// ([`Self::pending_deliveries`]) with `turn_id` as its provenance.
+    pub fn mark_answered(&self, turn_id: &str) {
         let mut state = self.lock();
-        state
-            .active
-            .iter_mut()
-            .filter(|excerpt| !excerpt.confirmed)
-            .map(|excerpt| {
-                excerpt.confirmed = true;
-                excerpt.delivery.clone()
-            })
-            .collect()
+        let InjectorState {
+            active, unrecorded, ..
+        } = &mut *state;
+        for excerpt in active.iter_mut().filter(|excerpt| !excerpt.answered) {
+            excerpt.answered = true;
+            unrecorded.push(PendingRecord {
+                delivery: excerpt.delivery.clone(),
+                turn_id: turn_id.to_owned(),
+            });
+        }
+    }
+
+    /// Every answered delivery whose `injection` event is not recorded yet,
+    /// in answer order, without changing any state.
+    ///
+    /// # Description
+    /// The caller appends one event per returned record
+    /// ([`PendingRecord::to_record`]) and reports each successful append
+    /// with [`Self::confirm_recorded`]. A record whose append failed stays
+    /// pending, also when its excerpt leaves the context (eviction, admit
+    /// predicate, [`Self::reconcile`]), and is returned again; a recorded one
+    /// is never returned again. Only a compaction or a history rewrite drops
+    /// pending records ([`Self::reset_after_compaction`]). A retried record
+    /// keeps the turn of its first answer ([`PendingRecord::turn_id`]).
+    #[must_use]
+    pub fn pending_deliveries(&self) -> Vec<PendingRecord> {
+        self.lock().unrecorded.clone()
+    }
+
+    /// The `injection` event of `pending` is durable: removes it from the
+    /// pending records.
+    ///
+    /// # Returns
+    /// `true` when the record was pending; `false` when it was confirmed
+    /// already or dropped by a compaction in the meantime.
+    pub fn confirm_recorded(&self, pending: &PendingRecord) -> bool {
+        let mut state = self.lock();
+        match state.unrecorded.iter().position(|open| open == pending) {
+            Some(position) => {
+                state.unrecorded.remove(position);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Test shorthand: marks the active excerpts answered and confirms every
+    /// pending record at once, as if each append had succeeded.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn confirm_delivered(&self) -> Vec<DeliveredSkill> {
+        self.mark_answered("test-turn");
+        let pending = self.pending_deliveries();
+        for record in &pending {
+            self.confirm_recorded(record);
+        }
+        pending.into_iter().map(|record| record.delivery).collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, InjectorState> {
@@ -1200,28 +1457,307 @@ fn command_arguments(arguments: &serde_json::Value) -> Vec<String> {
 fn result_text(result: &ToolCallResult) -> String {
     match result {
         ToolCallResult::Error { message } => head_and_tail(&[message.as_str()]),
-        ToolCallResult::Success { value } => {
-            let mut leaves = Vec::new();
-            collect_string_leaves(value, &mut leaves);
-            head_and_tail(&leaves)
+        ToolCallResult::Success { value } => scan_value(value).0,
+    }
+}
+
+/// Upper bound of the JSON nodes one traversal of a tool result visits
+/// ([`scan_value`] runs at most two: forward for the head, backward for the
+/// tail). An untrusted result with millions of tiny leaves costs at most
+/// this many steps per direction.
+const MAX_RESULT_SCAN_NODES: usize = 65_536;
+
+/// Upper bound of the container nesting [`scan_value`] descends into;
+/// deeper arrays and objects are skipped (their leaves are not scanned).
+const MAX_RESULT_SCAN_DEPTH: usize = 128;
+
+/// Work counters of one [`scan_value`] call (the regression tests assert
+/// them instead of wall time).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ScanStats {
+    /// JSON nodes visited over both traversals.
+    visited: usize,
+    /// Deepest traversal stack (open containers) reached.
+    max_depth: usize,
+    /// Containers skipped because they sat below [`MAX_RESULT_SCAN_DEPTH`].
+    depth_skipped: usize,
+    /// The forward traversal ran out of [`MAX_RESULT_SCAN_NODES`] and the
+    /// tail came from a separate backward traversal.
+    exhausted: bool,
+}
+
+/// Traversal order of [`walk_leaves`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Forward,
+    Backward,
+}
+
+/// The children of an open container on the traversal stack.
+enum Children<'a> {
+    Array(std::slice::Iter<'a, serde_json::Value>),
+    Object(serde_json::map::Values<'a>),
+}
+
+impl<'a> Children<'a> {
+    fn next(&mut self, direction: Direction) -> Option<&'a serde_json::Value> {
+        match (self, direction) {
+            (Self::Array(values), Direction::Forward) => values.next(),
+            (Self::Array(values), Direction::Backward) => values.next_back(),
+            (Self::Object(values), Direction::Forward) => values.next(),
+            (Self::Object(values), Direction::Backward) => values.next_back(),
         }
     }
 }
 
-fn collect_string_leaves<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
-    match value {
-        serde_json::Value::String(text) => out.push(text),
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_string_leaves(value, out);
+/// How a traversal of [`walk_leaves`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkEnd {
+    /// Every node (above the depth limit) was visited.
+    Complete,
+    /// `on_leaf` asked to stop.
+    Stopped,
+    /// [`MAX_RESULT_SCAN_NODES`] nodes were visited before the end.
+    Exhausted,
+}
+
+/// Iterative traversal of the string leaves of `root` in document order
+/// (or its reverse), bounded by [`MAX_RESULT_SCAN_NODES`] visited nodes and
+/// [`MAX_RESULT_SCAN_DEPTH`] open containers. `stats` accumulates the work.
+fn walk_leaves<'a>(
+    root: &'a serde_json::Value,
+    direction: Direction,
+    stats: &mut ScanStats,
+    mut on_leaf: impl FnMut(&'a str) -> std::ops::ControlFlow<()>,
+) -> WalkEnd {
+    let mut stack: Vec<Children<'a>> = Vec::new();
+    let mut next = Some(root);
+    let mut visited = 0usize;
+    loop {
+        let value = match next.take() {
+            Some(value) => value,
+            None => match stack.last_mut() {
+                None => return WalkEnd::Complete,
+                Some(children) => match children.next(direction) {
+                    Some(value) => value,
+                    None => {
+                        stack.pop();
+                        continue;
+                    }
+                },
+            },
+        };
+        if visited >= MAX_RESULT_SCAN_NODES {
+            return WalkEnd::Exhausted;
+        }
+        visited += 1;
+        stats.visited = stats.visited.saturating_add(1);
+        let children = match value {
+            serde_json::Value::String(text) => {
+                if on_leaf(text).is_break() {
+                    return WalkEnd::Stopped;
+                }
+                None
+            }
+            serde_json::Value::Array(values) => Some(Children::Array(values.iter())),
+            serde_json::Value::Object(object) => Some(Children::Object(object.values())),
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                None
+            }
+        };
+        if let Some(children) = children {
+            if stack.len() < MAX_RESULT_SCAN_DEPTH {
+                stack.push(children);
+                stats.max_depth = stats.max_depth.max(stack.len());
+            } else {
+                stats.depth_skipped = stats.depth_skipped.saturating_add(1);
             }
         }
-        serde_json::Value::Object(object) => {
-            for value in object.values() {
-                collect_string_leaves(value, out);
+    }
+}
+
+/// The scan text of a success value ([`result_text`]) with its work
+/// counters.
+///
+/// The string leaves stream through a bounded [`ScanWindow`] during one
+/// forward traversal; nothing proportional to the number of leaves is
+/// collected. When that traversal visits the whole value, the text equals
+/// [`head_and_tail`] over all leaves. When it runs out of nodes, the head is
+/// what it saw and the tail comes from a backward traversal with its own node
+/// budget (the middle is skipped; on values just above the budget the two
+/// ends may share leaves).
+fn scan_value(value: &serde_json::Value) -> (String, ScanStats) {
+    let mut stats = ScanStats::default();
+    let mut window = ScanWindow::new();
+    let end = walk_leaves(value, Direction::Forward, &mut stats, |leaf| {
+        window.push(leaf);
+        std::ops::ControlFlow::Continue(())
+    });
+    if end != WalkEnd::Exhausted {
+        return (window.finish(), stats);
+    }
+    stats.exhausted = true;
+    let mut tail = TailWindow::new();
+    walk_leaves(value, Direction::Backward, &mut stats, |leaf| {
+        tail.push(leaf)
+    });
+    tracing::debug!(
+        visited = stats.visited,
+        "skill_injection.result_scan_node_limit"
+    );
+    (window.finish_with_tail(tail.finish()), stats)
+}
+
+/// Bytes of the head half of a truncated scan text.
+const HEAD_MAX: usize = MAX_RESULT_SCAN_BYTES / 2;
+
+/// Bytes of the tail half of a truncated scan text (one byte goes to the
+/// `\n` between the halves).
+const TAIL_MAX: usize = MAX_RESULT_SCAN_BYTES - HEAD_MAX - 1;
+
+/// Streaming form of [`head_and_tail`]: parts arrive one by one and the
+/// memory stays bounded — the prefix of the joined text up to
+/// [`MAX_RESULT_SCAN_BYTES`] and the shortest suffix of parts that covers
+/// [`TAIL_MAX`] bytes (each retained part costs at least its separator).
+struct ScanWindow<'a> {
+    /// Prefix of the joined text, at most [`MAX_RESULT_SCAN_BYTES`] bytes.
+    head: String,
+    /// A part did not fit into `head` any more.
+    head_full: bool,
+    /// Length of the whole joined text.
+    total: usize,
+    /// Number of parts pushed.
+    parts: usize,
+    /// The last parts, as few as cover [`TAIL_MAX`] bytes.
+    tail: std::collections::VecDeque<&'a str>,
+    /// Joined length of `tail`.
+    tail_len: usize,
+}
+
+impl<'a> ScanWindow<'a> {
+    fn new() -> Self {
+        Self {
+            head: String::new(),
+            head_full: false,
+            total: 0,
+            parts: 0,
+            tail: std::collections::VecDeque::new(),
+            tail_len: 0,
+        }
+    }
+
+    fn push(&mut self, part: &'a str) {
+        if self.parts > 0 {
+            self.total = self.total.saturating_add(1);
+            if !self.head_full {
+                if self.head.len() < MAX_RESULT_SCAN_BYTES {
+                    self.head.push('\n');
+                } else {
+                    self.head_full = true;
+                }
             }
         }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+        self.parts = self.parts.saturating_add(1);
+        self.total = self.total.saturating_add(part.len());
+        if !self.head_full {
+            let room = MAX_RESULT_SCAN_BYTES.saturating_sub(self.head.len());
+            if part.len() <= room {
+                self.head.push_str(part);
+            } else {
+                self.head.push_str(
+                    part.get(..floor_char_boundary(part, room))
+                        .unwrap_or_default(),
+                );
+                self.head_full = true;
+            }
+        }
+
+        if !self.tail.is_empty() {
+            self.tail_len = self.tail_len.saturating_add(1);
+        }
+        self.tail.push_back(part);
+        self.tail_len = self.tail_len.saturating_add(part.len());
+        // Drop the oldest part while the rest alone fills the tail.
+        while self.tail.len() > 1 {
+            let Some(front) = self.tail.front() else {
+                break;
+            };
+            let rest = self.tail_len.saturating_sub(front.len()).saturating_sub(1);
+            if rest < TAIL_MAX {
+                break;
+            }
+            self.tail.pop_front();
+            self.tail_len = rest;
+        }
+    }
+
+    /// The joined text, or its head and tail above
+    /// [`MAX_RESULT_SCAN_BYTES`].
+    fn finish(self) -> String {
+        if self.total <= MAX_RESULT_SCAN_BYTES {
+            return self.head;
+        }
+        let mut tail = TailWindow::new();
+        for part in self.tail.iter().rev() {
+            if tail.push(part).is_break() {
+                break;
+            }
+        }
+        let tail = tail.finish();
+        self.finish_with_tail(tail)
+    }
+
+    /// The head of the pushed parts, `\n` and `tail`.
+    fn finish_with_tail(self, tail: String) -> String {
+        let mut out = self.head;
+        out.truncate(floor_char_boundary(&out, HEAD_MAX));
+        out.push('\n');
+        out.push_str(&tail);
+        out
+    }
+}
+
+/// The tail half of a truncated scan text, fed with parts from the end
+/// backwards: at most [`TAIL_MAX`] bytes of the joined text, the first part
+/// cut at a char boundary.
+struct TailWindow<'a> {
+    /// The parts in reverse order.
+    parts: Vec<&'a str>,
+    /// Joined length of `parts`.
+    len: usize,
+}
+
+impl<'a> TailWindow<'a> {
+    fn new() -> Self {
+        Self {
+            parts: Vec::new(),
+            len: 0,
+        }
+    }
+
+    /// Adds the part before the ones pushed so far; `Break` once the window
+    /// is full.
+    fn push(&mut self, part: &'a str) -> std::ops::ControlFlow<()> {
+        let separator = usize::from(!self.parts.is_empty());
+        let room = TAIL_MAX.saturating_sub(self.len.saturating_add(separator));
+        if room == 0 {
+            return std::ops::ControlFlow::Break(());
+        }
+        if part.len() <= room {
+            self.parts.push(part);
+            self.len = self.len.saturating_add(part.len() + separator);
+            std::ops::ControlFlow::Continue(())
+        } else {
+            let start = ceil_char_boundary(part, part.len() - room);
+            self.parts.push(part.get(start..).unwrap_or_default());
+            self.len = TAIL_MAX;
+            std::ops::ControlFlow::Break(())
+        }
+    }
+
+    fn finish(mut self) -> String {
+        self.parts.reverse();
+        self.parts.join("\n")
     }
 }
 
@@ -1229,58 +1765,11 @@ fn collect_string_leaves<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str
 /// and the last half of that joined text (separated by `\n`), at most
 /// [`MAX_RESULT_SCAN_BYTES`] bytes in all.
 fn head_and_tail(parts: &[&str]) -> String {
-    let total = parts
-        .iter()
-        .map(|part| part.len())
-        .sum::<usize>()
-        .saturating_add(parts.len().saturating_sub(1));
-    if total <= MAX_RESULT_SCAN_BYTES {
-        return parts.join("\n");
+    let mut window = ScanWindow::new();
+    for part in parts {
+        window.push(part);
     }
-    let head_max = MAX_RESULT_SCAN_BYTES / 2;
-    let tail_max = MAX_RESULT_SCAN_BYTES - head_max - 1;
-
-    let mut out = String::with_capacity(MAX_RESULT_SCAN_BYTES);
-    for (position, part) in parts.iter().enumerate() {
-        if position > 0 {
-            if out.len() >= head_max {
-                break;
-            }
-            out.push('\n');
-        }
-        let room = head_max.saturating_sub(out.len());
-        if part.len() <= room {
-            out.push_str(part);
-        } else {
-            out.push_str(
-                part.get(..floor_char_boundary(part, room))
-                    .unwrap_or_default(),
-            );
-            break;
-        }
-    }
-
-    let mut tail: Vec<&str> = Vec::new();
-    let mut tail_len = 0usize;
-    for part in parts.iter().rev() {
-        let separator = usize::from(!tail.is_empty());
-        let room = tail_max.saturating_sub(tail_len.saturating_add(separator));
-        if room == 0 {
-            break;
-        }
-        if part.len() <= room {
-            tail.push(part);
-            tail_len = tail_len.saturating_add(part.len() + separator);
-        } else {
-            let start = ceil_char_boundary(part, part.len() - room);
-            tail.push(part.get(start..).unwrap_or_default());
-            break;
-        }
-    }
-    tail.reverse();
-    out.push('\n');
-    out.push_str(&tail.join("\n"));
-    out
+    window.finish()
 }
 
 fn floor_char_boundary(text: &str, max: usize) -> usize {
@@ -1988,6 +2477,153 @@ mod availability_tests {
             "{:?}",
             round.dropped
         );
+        Ok(())
+    }
+}
+
+/// Bounded traversal of tool results (PR #154 review: the scan limit holds
+/// while traversing, not only after collecting).
+#[cfg(test)]
+mod scan_limit_tests {
+    use super::{
+        MAX_RESULT_SCAN_BYTES, MAX_RESULT_SCAN_DEPTH, MAX_RESULT_SCAN_NODES, ScanWindow,
+        head_and_tail, scan_value,
+    };
+    use crate::test_support::TestResult;
+
+    /// The collect-then-cut reference of the former implementation.
+    fn reference(parts: &[&str]) -> String {
+        let joined = parts.join("\n");
+        if joined.len() <= MAX_RESULT_SCAN_BYTES {
+            return joined;
+        }
+        let head_max = MAX_RESULT_SCAN_BYTES / 2;
+        let tail_max = MAX_RESULT_SCAN_BYTES - head_max - 1;
+        let head = super::floor_char_boundary(&joined, head_max);
+        let mut tail: Vec<&str> = Vec::new();
+        let mut tail_len = 0usize;
+        for part in parts.iter().rev() {
+            let separator = usize::from(!tail.is_empty());
+            let room = tail_max.saturating_sub(tail_len + separator);
+            if room == 0 {
+                break;
+            }
+            if part.len() <= room {
+                tail.push(part);
+                tail_len += part.len() + separator;
+            } else {
+                let start = super::ceil_char_boundary(part, part.len() - room);
+                tail.push(part.get(start..).unwrap_or_default());
+                break;
+            }
+        }
+        tail.reverse();
+        format!(
+            "{}\n{}",
+            joined.get(..head).unwrap_or_default(),
+            tail.join("\n")
+        )
+    }
+
+    #[test]
+    fn streaming_window_matches_the_collect_then_cut_reference() {
+        let big = "x".repeat(MAX_RESULT_SCAN_BYTES);
+        let umlauts = "ä".repeat(MAX_RESULT_SCAN_BYTES / 3);
+        let half = "y".repeat(MAX_RESULT_SCAN_BYTES / 2);
+        let cases: Vec<Vec<&str>> = vec![
+            vec![],
+            vec![""],
+            vec!["a", "b"],
+            vec!["", "", ""],
+            vec![big.as_str()],
+            vec!["HEAD", big.as_str(), "TAIL"],
+            vec![umlauts.as_str(), "mid", umlauts.as_str()],
+            vec![half.as_str(), half.as_str()],
+            vec![half.as_str(), "", half.as_str(), ""],
+            vec![half.as_str(), "z", half.as_str()],
+        ];
+        for parts in cases {
+            assert_eq!(head_and_tail(&parts), reference(&parts));
+        }
+        let many: Vec<String> = (0..200_000).map(|n| format!("{n}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(head_and_tail(&many), reference(&many));
+    }
+
+    #[test]
+    fn small_values_scan_every_leaf_in_document_order() {
+        let value = serde_json::json!({
+            "exit_code": 101,
+            "stderr": "error[E0505]",
+            "stdout": ["a", {"nested": "b"}, null, true],
+        });
+        let (text, stats) = scan_value(&value);
+        assert!(!stats.exhausted);
+        assert_eq!(text, "error[E0505]\na\nb");
+    }
+
+    #[test]
+    fn millions_of_one_byte_leaves_cost_bounded_work() -> TestResult {
+        const LEAVES: usize = 2_000_000;
+        let mut values = Vec::with_capacity(LEAVES);
+        values.push(serde_json::Value::String("H".to_owned()));
+        values.extend((2..LEAVES).map(|_| serde_json::Value::String("a".to_owned())));
+        values.push(serde_json::Value::String("T".to_owned()));
+        let value = serde_json::Value::Array(values);
+
+        let (text, stats) = scan_value(&value);
+        assert!(stats.exhausted);
+        // Root plus at most the node budget per direction.
+        assert!(stats.visited <= 2 * MAX_RESULT_SCAN_NODES);
+        assert!(stats.max_depth <= 1);
+        assert!(text.len() <= MAX_RESULT_SCAN_BYTES);
+        assert!(text.starts_with("H\na"));
+        assert!(text.ends_with("a\nT"));
+
+        // The streaming window keeps a bounded tail, whatever it is fed.
+        let mut window = ScanWindow::new();
+        for _ in 0..LEAVES {
+            window.push("a");
+        }
+        assert!(window.tail.len() <= MAX_RESULT_SCAN_BYTES / 2 + 1);
+        assert!(window.head.len() <= MAX_RESULT_SCAN_BYTES);
+        Ok(())
+    }
+
+    /// Takes a deeply nested array apart iteratively (the derived `Drop`
+    /// of `serde_json::Value` recurses).
+    fn dismantle(mut value: serde_json::Value) {
+        while let serde_json::Value::Array(values) = &mut value {
+            let Some(inner) = values.pop() else {
+                break;
+            };
+            value = inner;
+        }
+    }
+
+    #[test]
+    fn deeply_nested_values_stop_at_the_depth_limit() -> TestResult {
+        const DEPTH: usize = 100_000;
+        let mut value = serde_json::Value::String("E0505 deep".to_owned());
+        for _ in 0..DEPTH {
+            value = serde_json::Value::Array(vec![value]);
+        }
+        let (text, stats) = scan_value(&value);
+        assert!(!stats.exhausted);
+        assert_eq!(stats.max_depth, MAX_RESULT_SCAN_DEPTH);
+        assert_eq!(stats.depth_skipped, 1);
+        assert_eq!(stats.visited, MAX_RESULT_SCAN_DEPTH + 1);
+        assert!(text.is_empty());
+        dismantle(value);
+
+        // Nesting within the limit is scanned completely.
+        let mut shallow = serde_json::Value::String("E0505".to_owned());
+        for _ in 0..MAX_RESULT_SCAN_DEPTH {
+            shallow = serde_json::Value::Array(vec![shallow]);
+        }
+        let (text, stats) = scan_value(&shallow);
+        assert_eq!(text, "E0505");
+        assert_eq!(stats.depth_skipped, 0);
         Ok(())
     }
 }

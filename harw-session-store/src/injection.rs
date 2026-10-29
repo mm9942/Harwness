@@ -6,8 +6,20 @@
 //! excerpts (section `skills.triggered`) into the per-round context. Every
 //! delivery is recorded once in the session transcript with the skill, the
 //! chosen section, the trigger kind and key, the delivered bytes and the turn.
-//! The record carries no skill text; the SHA-256 of the full skill text names
-//! the exact version that was delivered.
+//! The SHA-256 of the full skill text names the exact version that was
+//! delivered. Since PL-97 H7 the record also carries the framed excerpt
+//! ([`InjectionRecord::text`]): a resumed session re-establishes its active
+//! excerpts, dedupe state and charged session budget from the records written
+//! since the last history replacement (deterministic reconstruction, see
+//! `harw_core::skill_injection::SkillInjector::restore`). Records of older
+//! binaries carry no text; they still charge the session budget, but their
+//! excerpt counts as gone from the context.
+//!
+//! # Compatibility
+//! `text` is optional on the wire (omitted when `None`, defaulted when
+//! absent), so a newer reader decodes every older record. An older reader
+//! (`deny_unknown_fields`) does not decode a record with `text` and skips it
+//! like any unknown lifecycle marker; the transcript stays loadable.
 //!
 //! # Wire form
 //! The record is stored as a [`crate::RecordKind::Lifecycle`] payload with
@@ -43,6 +55,7 @@ pub const INJECTION_MARKER: &str = "skill_injection";
 ///     turn_id: "turn-1".to_owned(),
 ///     trust: "instruction".to_owned(),
 ///     sha256: "ab".repeat(32),
+///     text: Some("# Skill: rust-borrow\n...".to_owned()),
 /// };
 /// let payload = record.to_payload()?;
 /// assert_eq!(payload["marker"], "skill_injection");
@@ -68,6 +81,10 @@ pub struct InjectionRecord {
     pub trust: String,
     /// SHA-256 of the full skill text (hex).
     pub sha256: String,
+    /// The framed excerpt exactly as the model received it; `None` in records
+    /// written before PL-97 H7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 impl InjectionRecord {
@@ -124,6 +141,7 @@ mod tests {
             turn_id: "turn-7".to_owned(),
             trust: "evidence".to_owned(),
             sha256: "0f".repeat(32),
+            text: Some("# Skill: cargo-tools\n\nRun the tests.".to_owned()),
         }
     }
 
@@ -145,6 +163,27 @@ mod tests {
             return Err(TestError::Unexpected("injection payload".to_owned()));
         };
         assert_eq!(back, record());
+        Ok(())
+    }
+
+    #[test]
+    fn records_without_text_from_older_binaries_still_decode() -> TestResult {
+        let mut payload = record().to_payload()?;
+        if let serde_json::Value::Object(object) = &mut payload {
+            object.remove("text");
+        }
+        let Some(back) = InjectionRecord::from_payload(&payload) else {
+            return Err(TestError::Unexpected("legacy injection payload".to_owned()));
+        };
+        assert_eq!(back.text, None);
+        assert_eq!(back.skill, "cargo-tools");
+        // `None` is not written, so the wire form stays the legacy one.
+        let legacy = InjectionRecord {
+            text: None,
+            ..record()
+        }
+        .to_payload()?;
+        assert!(legacy.get("text").is_none());
         Ok(())
     }
 
