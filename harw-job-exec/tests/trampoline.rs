@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use harw_job_core::{EnforcementState, SandboxProfileName, SandboxReport, SandboxRequirement};
-use harw_job_exec::{ExecPlanV1, TrampolineCommand, exit_code};
+use harw_job_exec::{
+    CgroupVerify, ExecPlanV1, PROC_SELF_CGROUP, TrampolineCommand, exit_code, unified_cgroup_path,
+};
 use harw_job_linux::{RlimitResource, RlimitSet, RlimitValue, SandboxPolicy};
 
 const TRAMPOLINE: &str = env!("CARGO_BIN_EXE_harw-job-exec");
@@ -224,6 +226,162 @@ fn test_exec_failure_exits_127_after_report() -> TestResult {
     assert_eq!(run.code(), Some(i32::from(exit_code::EXEC_FAILED)));
     assert!(run.stderr().contains("exec"), "{}", run.stderr());
     assert!(run.report.is_some(), "the report precedes exec");
+    Ok(())
+}
+
+/// The unified-hierarchy cgroup of the test process, which a spawned
+/// trampoline inherits, if a plan may name it: `None` on a cgroup v1-only
+/// host and at the root (`0::/`, e.g. a cgroup namespace root), which no
+/// valid plan can expect.
+fn own_job_like_cgroup() -> TestResult<Option<PathBuf>> {
+    let content = std::fs::read_to_string(PROC_SELF_CGROUP).map_err(ctx("read own cgroup"))?;
+    Ok(unified_cgroup_path(&content)
+        .filter(|own| *own != "/")
+        .map(PathBuf::from))
+}
+
+/// A `Nofile` limit `setrlimit` refuses for every caller, root included:
+/// above `fs.nr_open`.
+fn refused_nofile_limit() -> TestResult<RlimitSet> {
+    let nr_open: u64 = std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .map_err(ctx("read fs.nr_open"))?
+        .trim()
+        .parse()
+        .map_err(ctx("parse fs.nr_open"))?;
+    Ok(RlimitSet::new().with(
+        RlimitResource::Nofile,
+        RlimitValue::fixed(nr_open.saturating_add(1)),
+    ))
+}
+
+fn mismatched_cgroup() -> CgroupVerify {
+    CgroupVerify {
+        expected_proc_path: PathBuf::from("/harw-job-exec-test/not-this-cgroup"),
+        limits: Some(EnforcementState::Enforced),
+    }
+}
+
+#[test]
+fn test_verified_cgroup_membership_runs_the_job() -> TestResult {
+    let Some(own) = own_job_like_cgroup()? else {
+        // Skipped, not passed: nothing a plan may expect on this host. The
+        // mismatch tests below still cover the refusal.
+        eprintln!("skipped: the test process is not in a verifiable job cgroup");
+        return Ok(());
+    };
+    let marker_dir = scratch()?;
+    let marker = marker_dir.path().join("ran");
+    let plan = sh(r#"touch "$MARKER""#).with_cgroup(CgroupVerify {
+        expected_proc_path: own,
+        limits: Some(EnforcementState::Enforced),
+    });
+    let run = run(&plan, &[("MARKER", marker.as_path())])?;
+    assert_eq!(run.code(), Some(0), "stderr: {}", run.stderr());
+    assert!(marker.exists());
+    assert_eq!(
+        run.report.map(|report| report.resource_limits),
+        Some(EnforcementState::Enforced)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_cgroup_mismatch_refuses_before_exec_and_records_the_dimension() -> TestResult {
+    let workspace = scratch()?;
+    let marker_dir = scratch()?;
+    let marker = marker_dir.path().join("ran");
+    let policy = SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, workspace.path())
+        .with_read_write(marker_dir.path());
+    let plan = sh(r#"touch "$MARKER""#)
+        .with_cgroup(mismatched_cgroup())
+        .with_sandbox(policy, SandboxRequirement::BestEffort);
+    let run = run(&plan, &[("MARKER", marker.as_path())])?;
+    assert_eq!(
+        run.code(),
+        Some(i32::from(exit_code::SANDBOX_REFUSED)),
+        "stderr: {}",
+        run.stderr()
+    );
+    assert!(!marker.exists(), "the job must never run");
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("cgroup membership not verified")
+            && stderr.contains("/harw-job-exec-test/not-this-cgroup"),
+        "{stderr}"
+    );
+    let Some(report) = run.report else {
+        return fail(format!("no report; stderr: {stderr}"));
+    };
+    // The refused dimension is recorded; the other controls still ran, so
+    // the report names exactly what fell short.
+    assert_eq!(report.resource_limits, EnforcementState::NotEnforced);
+    assert_eq!(report.no_new_privs, EnforcementState::Enforced);
+    assert_eq!(report.capabilities, EnforcementState::Enforced);
+    Ok(())
+}
+
+#[test]
+fn test_cgroup_mismatch_outranks_a_later_rlimit_failure() -> TestResult {
+    let marker_dir = scratch()?;
+    let marker = marker_dir.path().join("ran");
+    let rlimits = refused_nofile_limit()?;
+
+    // The rlimit alone really fails (125), so the next run proves the
+    // precedence, not a lucky setrlimit.
+    let alone = run(
+        &sh(r#"touch "$MARKER""#).with_rlimits(rlimits.clone()),
+        &[("MARKER", marker.as_path())],
+    )?;
+    assert_eq!(
+        alone.code(),
+        Some(i32::from(exit_code::SETUP_FAILED)),
+        "stderr: {}",
+        alone.stderr()
+    );
+    assert!(
+        alone.stderr().contains("rlimits failed"),
+        "{}",
+        alone.stderr()
+    );
+
+    let plan = sh(r#"touch "$MARKER""#)
+        .with_cgroup(mismatched_cgroup())
+        .with_rlimits(rlimits);
+    let run = run(&plan, &[("MARKER", marker.as_path())])?;
+    let stderr = run.stderr();
+    assert_eq!(
+        run.code(),
+        Some(i32::from(exit_code::SANDBOX_REFUSED)),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("cgroup membership not verified") && !stderr.contains("rlimits failed"),
+        "{stderr}"
+    );
+    assert!(!marker.exists(), "the job must never run");
+    Ok(())
+}
+
+#[test]
+fn test_cgroup_mismatch_with_rlimits_reports_partial_limits() -> TestResult {
+    let marker_dir = scratch()?;
+    let marker = marker_dir.path().join("ran");
+    let plan = sh(r#"touch "$MARKER""#)
+        .with_cgroup(mismatched_cgroup())
+        .with_rlimits(RlimitSet::new().with(RlimitResource::Nofile, RlimitValue::fixed(64)));
+    let run = run(&plan, &[("MARKER", marker.as_path())])?;
+    assert_eq!(
+        run.code(),
+        Some(i32::from(exit_code::SANDBOX_REFUSED)),
+        "stderr: {}",
+        run.stderr()
+    );
+    assert!(!marker.exists(), "the job must never run");
+    // The rlimits hold, the cgroup limits do not: Partial, not Enforced.
+    assert_eq!(
+        run.report.map(|report| report.resource_limits),
+        Some(EnforcementState::Partial)
+    );
     Ok(())
 }
 

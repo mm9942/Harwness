@@ -6,6 +6,20 @@
 //! (`apply_to_current_process`, `build_ruleset`) needs feature
 //! `linux-sandbox` (Landlock).
 //!
+//! # Inside a mount namespace
+//! A trampoline running inside a Bubblewrap namespace sees bind
+//! destinations, not host paths. [`PathMap`] describes that view
+//! completely: binds (host path → in-sandbox destination, read-only or
+//! read-write) and the mounts the namespace provides itself (`/proc`,
+//! `/dev`, `/tmp`). [`SandboxPolicy::mapped`] rewrites a policy to that
+//! view and [`plan_landlock_mapped`] plans its rules. Policy paths the map
+//! does not cover are dropped (fail-closed). Policy entries beneath a
+//! read-only bind lose write and, outside the system exec trees, execute —
+//! the distinction a mount namespace cannot make. Landlock rights are
+//! inherited, so a bind nested beneath a kept read-write or exec
+//! destination is not covered by that cap;
+//! [`PathMap::shadowed_read_only_binds`] reports such plans.
+//!
 //! # Scope: the calling thread, before `exec`
 //! `NO_NEW_PRIVS`, capability sets and Landlock domains are per-thread and
 //! inherited across `fork`/`execve`. `apply_to_current_process` restricts
@@ -36,7 +50,7 @@
 //! `Option<bool>` plain data.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use harw_job_core::SandboxProfileName;
 use serde::{Deserialize, Serialize};
@@ -250,6 +264,348 @@ pub fn plan_landlock(policy: &SandboxPolicy) -> LandlockPlan {
         restrict_network,
         connect_ports,
     }
+}
+
+/// How a hierarchy is mounted into a mount namespace (one entry of a
+/// [`PathMap`]).
+///
+/// A mount namespace distinguishes read from write (`--ro-bind` vs.
+/// `--bind`) but not read from execute; Landlock can. The mode caps the
+/// Landlock rights a policy path beneath the entry keeps in
+/// [`FilesystemPolicy::mapped`].
+///
+/// # Inheritance limit
+/// Landlock rights are inherited down the tree, and the cap applies to the
+/// policy entries **beneath** a read-only bind, not to the bind as a whole.
+/// A kept `exec` or `read_write` rule on an **ancestor** of the bind's
+/// destination still reaches into it, e.g. a read-only `.git` bind nested
+/// inside the read-write workspace destination keeps execute.
+/// [`PathMap::shadowed_read_only_binds`] reports such binds; a launcher
+/// must refuse the plan (or not nest the bind).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindMode {
+    /// Read-only (`--ro-bind`, or a read-only mount the namespace provides
+    /// itself). Policy paths beneath it keep read access only: write is
+    /// dropped (the mount refuses it anyway) and execute is dropped too,
+    /// except where the in-sandbox destination lies in a system exec tree
+    /// (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/lib32`). See the
+    /// inheritance limit above.
+    ReadOnly,
+    /// Read-write (`--bind`, a tmpfs): the policy's rights are kept.
+    ReadWrite,
+}
+
+/// A [`PathMap`] path that cannot describe a mount: relative, or with a
+/// `..` component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathMapError {
+    /// The rejected path.
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for PathMapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "path map entry {:?}: must be absolute without `..` components",
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for PathMapError {}
+
+/// Whether `path` is absolute without `..` components: the only form a
+/// [`PathMap`] maps. Component-wise prefix matching is sound only for such
+/// paths (`/repo/../../etc` lies "beneath" `/repo` textually, not on disk).
+fn is_mappable(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .components()
+            .all(|component| !matches!(component, Component::ParentDir))
+}
+
+fn mappable(path: PathBuf) -> Result<PathBuf, PathMapError> {
+    if is_mappable(&path) {
+        Ok(path)
+    } else {
+        Err(PathMapError { path })
+    }
+}
+
+/// One entry of a [`PathMap`]: the host hierarchy `host` is visible inside
+/// the sandbox at `sandbox`. Both paths are absolute without `..`
+/// components; [`PathMap::try_with_bind`] and deserialization reject
+/// anything else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawPathBind")]
+pub struct PathBind {
+    /// Host path.
+    pub host: PathBuf,
+    /// Destination inside the mount namespace.
+    pub sandbox: PathBuf,
+    /// Access the mount grants.
+    pub mode: BindMode,
+}
+
+/// Wire form of a [`PathBind`] before validation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPathBind {
+    host: PathBuf,
+    sandbox: PathBuf,
+    mode: BindMode,
+}
+
+impl TryFrom<RawPathBind> for PathBind {
+    type Error = PathMapError;
+
+    fn try_from(raw: RawPathBind) -> Result<Self, Self::Error> {
+        Ok(Self {
+            host: mappable(raw.host)?,
+            sandbox: mappable(raw.sandbox)?,
+            mode: raw.mode,
+        })
+    }
+}
+
+/// The view of a mount namespace (e.g. a Bubblewrap plan): which host
+/// hierarchies are visible where inside it, and which mounts the namespace
+/// provides itself (Bubblewrap's fresh `/proc`, minimal `/dev`, empty
+/// `/tmp`). Used to plan Landlock rules against the view the sandboxed
+/// process actually has ([`plan_landlock_mapped`]).
+///
+/// The map is the **complete** description of that view. A policy path no
+/// entry covers is not visible inside the namespace, or something else is
+/// mounted there, so [`FilesystemPolicy::mapped`] drops it instead of
+/// keeping its host spelling ([`PathMap::unmapped_paths`] lists what was
+/// dropped). An empty map describes an empty view.
+///
+/// Paths are compared component-wise (`/work/repo2` is not beneath
+/// `/work/repo`). When entries nest on the host side, the one with the
+/// longest host path wins; of two with the same host path the later one
+/// wins. Every entry is absolute without `..` components; a policy path
+/// that is not is unmappable and dropped as well. Symlinks are not
+/// resolved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathMap {
+    binds: Vec<PathBind>,
+}
+
+impl PathMap {
+    /// An empty map: an empty view, nothing is reachable.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a bind: the host hierarchy `host` is visible at `sandbox`
+    /// (builder style).
+    ///
+    /// # Errors
+    /// [`PathMapError`] when `host` or `sandbox` is relative (an empty path
+    /// included) or has a `..` component.
+    pub fn try_with_bind(
+        mut self,
+        host: impl Into<PathBuf>,
+        sandbox: impl Into<PathBuf>,
+        mode: BindMode,
+    ) -> Result<Self, PathMapError> {
+        self.binds.push(PathBind {
+            host: mappable(host.into())?,
+            sandbox: mappable(sandbox.into())?,
+            mode,
+        });
+        Ok(self)
+    }
+
+    /// Declares a mount the namespace provides itself at `path`, such as
+    /// Bubblewrap's fresh procfs at `/proc`, its minimal `/dev` or its empty
+    /// `/tmp` tmpfs (builder style). Policy paths beneath `path` keep their
+    /// spelling, capped by `mode`; they then name the namespace's own
+    /// mount, not the host content. Recorded as a bind of `path` onto
+    /// itself.
+    ///
+    /// # Errors
+    /// As [`PathMap::try_with_bind`].
+    pub fn try_with_provided(
+        self,
+        path: impl Into<PathBuf>,
+        mode: BindMode,
+    ) -> Result<Self, PathMapError> {
+        let path = path.into();
+        self.try_with_bind(path.clone(), path, mode)
+    }
+
+    /// The entries in insertion order.
+    #[must_use]
+    pub fn binds(&self) -> &[PathBind] {
+        &self.binds
+    }
+
+    /// Whether the map has no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.binds.is_empty()
+    }
+
+    /// Where `host_path` is visible inside the sandbox, and through which
+    /// kind of mount; `None` if no entry covers it or it is unmappable
+    /// (relative, or with a `..` component).
+    #[must_use]
+    pub fn resolve(&self, host_path: &Path) -> Option<(PathBuf, BindMode)> {
+        if !is_mappable(host_path) {
+            return None;
+        }
+        let mut best: Option<(&PathBind, &Path, usize)> = None;
+        for bind in &self.binds {
+            let Ok(rest) = host_path.strip_prefix(&bind.host) else {
+                continue;
+            };
+            let depth = bind.host.components().count();
+            // `>=`: of two entries with the same host path the later wins.
+            if best.is_none_or(|(_, _, best_depth)| depth >= best_depth) {
+                best = Some((bind, rest, depth));
+            }
+        }
+        best.map(|(bind, rest, _)| {
+            // `join("")` would append a trailing separator, which turns a
+            // file path into an invalid directory path (`/dev/null/`).
+            let destination = if rest.as_os_str().is_empty() {
+                bind.sandbox.clone()
+            } else {
+                bind.sandbox.join(rest)
+            };
+            (destination, bind.mode)
+        })
+    }
+
+    /// The paths of `policy` that [`FilesystemPolicy::mapped`] drops: not
+    /// covered by any entry, or unmappable. Sorted, without duplicates.
+    #[must_use]
+    pub fn unmapped_paths(&self, policy: &FilesystemPolicy) -> Vec<PathBuf> {
+        let mut unmapped: Vec<PathBuf> = policy
+            .read_only
+            .iter()
+            .chain(&policy.read_write)
+            .chain(&policy.exec)
+            .filter(|path| self.resolve(path).is_none())
+            .cloned()
+            .collect();
+        unmapped.sort();
+        unmapped.dedup();
+        unmapped
+    }
+
+    /// Read-only binds whose Landlock access would **not** be read-only:
+    /// their destination lies at or beneath a destination that keeps
+    /// `read_write`, or `exec` outside the system exec trees, in
+    /// `policy.mapped(self)` (see the inheritance limit on
+    /// [`BindMode`]). Write stays refused by the read-only mount, execute
+    /// does not.
+    ///
+    /// A launcher must refuse a plan for which this is not empty (or
+    /// re-arrange its binds); the mapping itself cannot narrow an
+    /// ancestor's rule without taking it away from the ancestor.
+    #[must_use]
+    pub fn shadowed_read_only_binds(&self, policy: &FilesystemPolicy) -> Vec<&PathBind> {
+        let mapped = policy.mapped(self);
+        let reaching: Vec<&Path> = mapped
+            .read_write
+            .iter()
+            .chain(mapped.exec.iter().filter(|path| !in_system_exec_tree(path)))
+            .map(PathBuf::as_path)
+            .collect();
+        self.binds
+            .iter()
+            .filter(|bind| bind.mode == BindMode::ReadOnly)
+            .filter(|bind| {
+                reaching
+                    .iter()
+                    .any(|ancestor| bind.sandbox.starts_with(ancestor))
+            })
+            .collect()
+    }
+}
+
+/// Whether `path` is one of the system exec trees or beneath one.
+fn in_system_exec_tree(path: &Path) -> bool {
+    SYSTEM_EXEC.iter().any(|tree| path.starts_with(tree))
+}
+
+impl FilesystemPolicy {
+    /// This policy as seen from inside the mount namespace `map` describes.
+    ///
+    /// Every path is rewritten to its in-sandbox destination
+    /// ([`PathMap::resolve`]). A path no entry covers, or an unmappable one
+    /// (relative, or with a `..` component), is dropped: it gets no rule,
+    /// so Landlock denies it ([`PathMap::unmapped_paths`] lists them).
+    /// Rights are then capped by the covering entry ([`BindMode`]):
+    /// - read-write entries keep the policy's rights;
+    /// - read-only entries turn `read_write` and `exec` entries into
+    ///   `read_only` ones, except `exec` entries whose destination lies in
+    ///   a system exec tree.
+    ///
+    /// Mapping never grants a path the policy does not name, and never
+    /// more than the policy grants. The cap holds for the policy entries
+    /// beneath a read-only bind; for rules inherited from an ancestor see
+    /// [`PathMap::shadowed_read_only_binds`].
+    #[must_use]
+    pub fn mapped(&self, map: &PathMap) -> Self {
+        let mut mapped = Self::default();
+        for path in &self.read_only {
+            if let Some((destination, _)) = map.resolve(path) {
+                mapped.read_only.push(destination);
+            }
+        }
+        for path in &self.read_write {
+            match map.resolve(path) {
+                Some((destination, BindMode::ReadWrite)) => mapped.read_write.push(destination),
+                Some((destination, BindMode::ReadOnly)) => mapped.read_only.push(destination),
+                None => {}
+            }
+        }
+        for path in &self.exec {
+            match map.resolve(path) {
+                Some((destination, BindMode::ReadWrite)) => mapped.exec.push(destination),
+                Some((destination, BindMode::ReadOnly)) if in_system_exec_tree(&destination) => {
+                    mapped.exec.push(destination);
+                }
+                Some((destination, BindMode::ReadOnly)) => mapped.read_only.push(destination),
+                None => {}
+            }
+        }
+        mapped
+    }
+}
+
+impl SandboxPolicy {
+    /// This policy with its filesystem lists rewritten to the namespace
+    /// view ([`FilesystemPolicy::mapped`]); network, capability,
+    /// `NO_NEW_PRIVS` and Landlock-mode settings are unchanged.
+    ///
+    /// This is the policy to hand to a trampoline running **inside** the
+    /// namespace: `build_ruleset` / `apply_to_current_process` plan exactly
+    /// [`plan_landlock_mapped`]`(self, map)` from it.
+    #[must_use]
+    pub fn mapped(&self, map: &PathMap) -> Self {
+        Self {
+            filesystem: self.filesystem.mapped(map),
+            ..self.clone()
+        }
+    }
+}
+
+/// Plans the Landlock rules for `policy` as seen from inside the mount
+/// namespace `map` describes: [`plan_landlock`] of
+/// [`SandboxPolicy::mapped`]. A process without its own mount namespace
+/// uses [`plan_landlock`] directly; so does a map that binds `/` onto
+/// itself read-write, which yields the identical plan.
+#[must_use]
+pub fn plan_landlock_mapped(policy: &SandboxPolicy, map: &PathMap) -> LandlockPlan {
+    plan_landlock(&policy.mapped(map))
 }
 
 /// Kernel LSM list (`/sys/kernel/security/lsm`, needs securityfs).
@@ -680,6 +1036,7 @@ mod enforce {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::sandbox::{BindMode, PathMap};
         use crate::test_support::{TestResult, ctx};
         use harw_job_core::SandboxProfileName;
 
@@ -726,6 +1083,34 @@ mod enforce {
             drop(prepared);
             // Still unrestricted: the workspace stays writable.
             std::fs::write(workspace.path().join("probe"), b"ok").map_err(ctx("write probe"))?;
+            Ok(())
+        }
+
+        #[test]
+        fn test_build_ruleset_plans_the_mapped_view() -> TestResult {
+            // The mapped policy is what a trampoline inside the namespace
+            // enforces; on the host, the namespace-only destination does
+            // not exist and is skipped (never an error).
+            let workspace = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let destination = std::path::Path::new("/nonexistent/harw-job-linux/workspace");
+            let map = PathMap::new()
+                .try_with_bind(workspace.path(), destination, BindMode::ReadWrite)
+                .map_err(ctx("bind"))?
+                .try_with_bind("/usr", "/usr", BindMode::ReadOnly)
+                .map_err(ctx("bind /usr"))?;
+            let policy =
+                SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, workspace.path())
+                    .mapped(&map);
+            let prepared = build_ruleset(&policy).map_err(ctx("build mapped ruleset"))?;
+            assert!(
+                prepared
+                    .skipped_paths()
+                    .iter()
+                    .any(|path| path == destination)
+            );
+            // Paths the map does not cover got no rule at all.
+            let etc = std::path::Path::new("/etc");
+            assert!(!policy.filesystem.read_only.iter().any(|path| path == etc));
             Ok(())
         }
 
@@ -779,6 +1164,7 @@ mod enforce {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn access_of(plan: &LandlockPlan, path: &Path) -> Option<FsAccess> {
         plan.rules
@@ -927,5 +1313,376 @@ mod tests {
             SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, Path::new("/w"));
         policy.network = NetworkPolicy::ConnectTcpPorts(vec![443, 80, 443]);
         assert_eq!(plan_landlock(&policy).connect_ports, vec![80, 443]);
+    }
+
+    const READ: FsAccess = FsAccess {
+        read: true,
+        write: false,
+        exec: false,
+    };
+    const READ_EXEC: FsAccess = FsAccess {
+        read: true,
+        write: false,
+        exec: true,
+    };
+    const READ_WRITE_EXEC: FsAccess = FsAccess {
+        read: true,
+        write: true,
+        exec: true,
+    };
+
+    const PROFILES: [SandboxProfileName; 4] = [
+        SandboxProfileName::WorkspaceBuild,
+        SandboxProfileName::ReadOnlyAnalysis,
+        SandboxProfileName::NoNetwork,
+        SandboxProfileName::NetworkRestricted,
+    ];
+
+    /// The view of a typical Bubblewrap plan: system trees read-only at
+    /// their own path, the workspace at `/workspace`, the namespace's own
+    /// `/proc`, `/dev` and `/tmp`, the attempt directory read-write. `/sys`
+    /// and `/run` are withheld (not in the map).
+    fn bwrap_like_map(workspace: BindMode) -> TestResult<PathMap> {
+        PathMap::new()
+            .try_with_bind("/usr", "/usr", BindMode::ReadOnly)
+            .and_then(|map| map.try_with_bind("/bin", "/bin", BindMode::ReadOnly))
+            .and_then(|map| map.try_with_bind("/lib", "/lib", BindMode::ReadOnly))
+            .and_then(|map| map.try_with_bind("/lib64", "/lib64", BindMode::ReadOnly))
+            .and_then(|map| map.try_with_bind("/etc", "/etc", BindMode::ReadOnly))
+            .and_then(|map| map.try_with_provided("/proc", BindMode::ReadOnly))
+            .and_then(|map| map.try_with_provided("/dev", BindMode::ReadWrite))
+            .and_then(|map| map.try_with_provided("/tmp", BindMode::ReadWrite))
+            .and_then(|map| map.try_with_bind("/home/u/repo", "/workspace", workspace))
+            .and_then(|map| {
+                map.try_with_bind(
+                    "/var/lib/harw/attempt-1",
+                    "/run/harw-job/attempt",
+                    BindMode::ReadWrite,
+                )
+            })
+            .map_err(ctx("bwrap-like map"))
+    }
+
+    fn workspace_build() -> SandboxPolicy {
+        SandboxPolicy::from_profile(
+            SandboxProfileName::WorkspaceBuild,
+            Path::new("/home/u/repo"),
+        )
+    }
+
+    #[test]
+    fn test_identity_map_keeps_plan_landlock_identical() -> TestResult {
+        // `/` bound onto itself read-write is the host view: same policy,
+        // same plan, for every profile.
+        let identity = PathMap::new()
+            .try_with_bind("/", "/", BindMode::ReadWrite)
+            .map_err(ctx("identity map"))?;
+        for profile in PROFILES {
+            let policy = SandboxPolicy::from_profile(profile, Path::new("/work/repo"))
+                .with_read_only("/opt/data")
+                .with_read_only("/work/repo")
+                .with_read_write("/var/cache/harw");
+            assert_eq!(policy.mapped(&identity), policy, "{profile:?}");
+            assert_eq!(
+                plan_landlock_mapped(&policy, &identity),
+                plan_landlock(&policy),
+                "{profile:?}"
+            );
+            assert!(identity.unmapped_paths(&policy.filesystem).is_empty());
+            let hard = policy.hard_requirement();
+            assert_eq!(plan_landlock_mapped(&hard, &identity), plan_landlock(&hard));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_path_map_is_an_empty_view() {
+        let empty = PathMap::new();
+        assert!(empty.is_empty());
+        assert_eq!(empty.resolve(Path::new("/usr")), None);
+        let policy = workspace_build();
+        let mapped = policy.mapped(&empty);
+        assert_eq!(mapped.filesystem, FilesystemPolicy::default());
+        assert_eq!(mapped.network, policy.network);
+        let plan = plan_landlock_mapped(&policy, &empty);
+        assert!(plan.rules.is_empty(), "{:?}", plan.rules);
+        // Everything the policy names is reported as dropped.
+        let unmapped = empty.unmapped_paths(&policy.filesystem);
+        assert!(unmapped.contains(&PathBuf::from("/home/u/repo")));
+        assert!(unmapped.contains(&PathBuf::from("/usr")));
+        assert!(
+            unmapped
+                .windows(2)
+                .all(|pair| matches!(pair, [left, right] if left < right))
+        );
+    }
+
+    #[test]
+    fn test_mapped_plan_uses_the_namespace_view() -> TestResult {
+        let policy = workspace_build().with_read_write("/home/u/repo/target");
+        let map = bwrap_like_map(BindMode::ReadWrite)?;
+        let plan = plan_landlock_mapped(&policy, &map);
+
+        assert_eq!(
+            access_of(&plan, Path::new("/workspace")),
+            Some(READ_WRITE_EXEC)
+        );
+        assert_eq!(
+            access_of(&plan, Path::new("/workspace/target")).map(|access| access.write),
+            Some(true)
+        );
+        assert_eq!(
+            access_of(&plan, Path::new("/home/u/repo")),
+            None,
+            "the host spelling of a bound path is gone"
+        );
+        // System exec trees keep read + execute through their read-only
+        // binds; other read-only binds stay read-only.
+        assert_eq!(access_of(&plan, Path::new("/usr")), Some(READ_EXEC));
+        assert_eq!(access_of(&plan, Path::new("/lib64")), Some(READ_EXEC));
+        assert_eq!(access_of(&plan, Path::new("/etc")), Some(READ));
+        // The namespace's own mounts keep the policy spelling.
+        assert_eq!(access_of(&plan, Path::new("/proc")), Some(READ));
+        assert_eq!(
+            access_of(&plan, Path::new("/tmp")).map(|access| (access.write, access.exec)),
+            Some((true, false))
+        );
+        assert_eq!(
+            access_of(&plan, Path::new("/dev/null")).map(|access| access.write),
+            Some(true)
+        );
+        // Withheld trees are not in the view: their rules are dropped and
+        // cannot cover what the namespace mounts there (the attempt dir).
+        assert_eq!(access_of(&plan, Path::new("/run")), None);
+        assert_eq!(access_of(&plan, Path::new("/sys")), None);
+        assert_eq!(access_of(&plan, Path::new("/sbin")), None);
+        assert_eq!(
+            map.unmapped_paths(&policy.filesystem),
+            vec![
+                PathBuf::from("/lib32"),
+                PathBuf::from("/run"),
+                PathBuf::from("/sbin"),
+                PathBuf::from("/sys"),
+            ]
+        );
+        assert!(map.shadowed_read_only_binds(&policy.filesystem).is_empty());
+
+        // Everything but the filesystem lists is unchanged.
+        let mapped = policy.mapped(&map);
+        assert_eq!(mapped.network, policy.network);
+        assert_eq!(mapped.capabilities, policy.capabilities);
+        assert_eq!(mapped.no_new_privs, policy.no_new_privs);
+        assert_eq!(mapped.landlock, policy.landlock);
+        let unmapped = plan_landlock(&policy);
+        assert_eq!(plan.restrict_network, unmapped.restrict_network);
+        assert_eq!(plan.connect_ports, unmapped.connect_ports);
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_only_binds_drop_write_and_execute_outside_system_trees() -> TestResult {
+        // WorkspaceBuild asks for read/write/execute on the workspace.
+        let policy = workspace_build();
+        let read_only = bwrap_like_map(BindMode::ReadOnly)?;
+        assert_eq!(
+            access_of(
+                &plan_landlock_mapped(&policy, &read_only),
+                Path::new("/workspace")
+            ),
+            Some(READ)
+        );
+        let mapped = policy.mapped(&read_only).filesystem;
+        let workspace = PathBuf::from("/workspace");
+        assert!(!mapped.read_write.contains(&workspace));
+        assert!(!mapped.exec.contains(&workspace));
+        assert!(mapped.read_only.contains(&workspace));
+
+        // The system exec trees are judged by the in-sandbox destination.
+        let mut tools =
+            SandboxPolicy::from_profile(SandboxProfileName::ReadOnlyAnalysis, Path::new("/w"));
+        tools.filesystem.exec.push(PathBuf::from("/opt/tools"));
+        tools.filesystem.exec.push(PathBuf::from("/opt/scripts"));
+        let map = PathMap::new()
+            .try_with_bind("/opt/tools", "/usr/local/tools", BindMode::ReadOnly)
+            .and_then(|map| map.try_with_bind("/opt/scripts", "/scripts", BindMode::ReadOnly))
+            .map_err(ctx("tool map"))?;
+        let plan = plan_landlock_mapped(&tools, &map);
+        assert_eq!(
+            access_of(&plan, Path::new("/usr/local/tools")),
+            Some(READ_EXEC)
+        );
+        assert_eq!(access_of(&plan, Path::new("/scripts")), Some(READ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_only_bind_nested_in_writable_workspace_is_reported() -> TestResult {
+        // A read-only `.git` inside the read-write workspace: the policy
+        // entry beneath the bind is capped, but Landlock still lets the
+        // workspace rule (write + execute) reach into the bind.
+        let map = bwrap_like_map(BindMode::ReadWrite)?
+            .try_with_bind("/home/u/repo/.git", "/workspace/.git", BindMode::ReadOnly)
+            .map_err(ctx("git bind"))?;
+        let policy = workspace_build().with_read_write("/home/u/repo/.git");
+        let mapped = policy.mapped(&map).filesystem;
+        let git = PathBuf::from("/workspace/.git");
+        assert!(mapped.read_only.contains(&git));
+        assert!(!mapped.read_write.contains(&git));
+        assert!(!mapped.exec.contains(&git));
+        let shadowed = map.shadowed_read_only_binds(&policy.filesystem);
+        assert_eq!(
+            shadowed
+                .iter()
+                .map(|bind| &bind.sandbox)
+                .collect::<Vec<_>>(),
+            vec![&git]
+        );
+
+        // A read-only workspace has no such ancestor; read-only binds
+        // beneath a system exec tree inherit only the sanctioned execute.
+        let analysis = SandboxPolicy::from_profile(
+            SandboxProfileName::ReadOnlyAnalysis,
+            Path::new("/home/u/repo"),
+        );
+        let read_only = bwrap_like_map(BindMode::ReadOnly)?
+            .try_with_bind("/home/u/repo/.git", "/workspace/.git", BindMode::ReadOnly)
+            .and_then(|map| map.try_with_bind("/opt/tools", "/usr/local/tools", BindMode::ReadOnly))
+            .map_err(ctx("read-only map"))?;
+        assert!(
+            read_only
+                .shadowed_read_only_binds(&analysis.filesystem)
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unmappable_paths_and_invalid_binds_are_refused() -> TestResult {
+        let map = bwrap_like_map(BindMode::ReadWrite)?;
+        // `..` escapes the bind on disk although it is "beneath" it
+        // textually: never rebased, never kept with the bind's rights.
+        let escape = PathBuf::from("/home/u/repo/../../etc");
+        assert_eq!(map.resolve(&escape), None);
+        let mut policy = workspace_build();
+        policy.filesystem.exec.push(escape.clone());
+        policy.filesystem.read_write.push(PathBuf::from("repo/src"));
+        let mapped = policy.mapped(&map).filesystem;
+        let all: Vec<&PathBuf> = mapped
+            .read_only
+            .iter()
+            .chain(&mapped.read_write)
+            .chain(&mapped.exec)
+            .collect();
+        assert!(
+            all.iter().all(|path| is_mappable(path)),
+            "{all:?} contains an unmappable path"
+        );
+        assert!(!mapped.exec.contains(&PathBuf::from("/etc")));
+        let unmapped = map.unmapped_paths(&policy.filesystem);
+        assert!(unmapped.contains(&escape));
+        assert!(unmapped.contains(&PathBuf::from("repo/src")));
+        assert_eq!(map.resolve(Path::new("repo/src")), None);
+
+        // Binds: an empty host, a relative destination and `..` anywhere
+        // are refused, by the builder and by deserialization.
+        for (host, sandbox) in [
+            ("", "/x"),
+            ("/a", ""),
+            ("/a", "x"),
+            ("a", "/x"),
+            ("/a/../b", "/x"),
+            ("/a", "/x/.."),
+        ] {
+            let built = PathMap::new().try_with_bind(host, sandbox, BindMode::ReadOnly);
+            assert!(built.is_err(), "{host:?} -> {sandbox:?}: {built:?}");
+            let json = format!(
+                r#"{{"binds":[{{"host":"{host}","sandbox":"{sandbox}","mode":"read_only"}}]}}"#
+            );
+            assert!(
+                serde_json::from_str::<PathMap>(&json).is_err(),
+                "{json} was accepted"
+            );
+        }
+        assert!(
+            PathMap::new()
+                .try_with_provided("tmp", BindMode::ReadWrite)
+                .is_err()
+        );
+        let error = PathMap::new()
+            .try_with_bind("/a", "rel", BindMode::ReadWrite)
+            .err()
+            .ok_or(TestError::Missing("relative destination refused"))?;
+        assert_eq!(error.path, PathBuf::from("rel"));
+        assert!(error.to_string().contains("absolute"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_path_map_resolution_is_component_wise_and_longest_prefix() -> TestResult {
+        let map = PathMap::new()
+            .try_with_bind("/home/u", "/home/u", BindMode::ReadOnly)
+            .and_then(|map| map.try_with_bind("/home/u/repo", "/workspace", BindMode::ReadWrite))
+            .map_err(ctx("map"))?;
+        assert_eq!(
+            map.resolve(Path::new("/home/u/repo")),
+            Some((PathBuf::from("/workspace"), BindMode::ReadWrite))
+        );
+        assert_eq!(
+            map.resolve(Path::new("/home/u/repo/src/main.rs")),
+            Some((PathBuf::from("/workspace/src/main.rs"), BindMode::ReadWrite))
+        );
+        // `/home/u/repo2` is a sibling of the workspace, not inside it.
+        assert_eq!(
+            map.resolve(Path::new("/home/u/repo2")),
+            Some((PathBuf::from("/home/u/repo2"), BindMode::ReadOnly))
+        );
+        assert_eq!(map.resolve(Path::new("/home/other")), None);
+        assert_eq!(map.resolve(Path::new("/home")), None);
+
+        // An exact match carries no trailing separator (files stay files).
+        let file = PathMap::new()
+            .try_with_bind("/dev/null", "/dev/null", BindMode::ReadWrite)
+            .map_err(ctx("file map"))?;
+        assert_eq!(
+            file.resolve(Path::new("/dev/null"))
+                .map(|(path, _)| path.into_os_string()),
+            Some(std::ffi::OsString::from("/dev/null"))
+        );
+
+        // Same host path twice: the later bind wins.
+        let twice = PathMap::new()
+            .try_with_bind("/data", "/a", BindMode::ReadOnly)
+            .and_then(|map| map.try_with_bind("/data", "/b", BindMode::ReadWrite))
+            .map_err(ctx("twice"))?;
+        assert_eq!(twice.binds().len(), 2);
+        assert_eq!(
+            twice.resolve(Path::new("/data/x")),
+            Some((PathBuf::from("/b/x"), BindMode::ReadWrite))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_path_map_serde_round_trip() -> TestResult {
+        let map = bwrap_like_map(BindMode::ReadOnly)?;
+        let json = serde_json::to_string(&map).map_err(ctx("serialize"))?;
+        assert!(json.contains(r#""mode":"read_only""#), "{json}");
+        let back: PathMap = serde_json::from_str(&json).map_err(ctx("parse"))?;
+        assert_eq!(back, map);
+        assert!(serde_json::from_str::<PathMap>(r#"{"binds":[],"extra":1}"#).is_err());
+        assert!(
+            serde_json::from_str::<PathMap>(
+                r#"{"binds":[{"host":"/a","sandbox":"/b","mode":"read_only","x":1}]}"#
+            )
+            .is_err()
+        );
+        // The removed read-only-exec mode is not accepted.
+        assert!(
+            serde_json::from_str::<PathMap>(
+                r#"{"binds":[{"host":"/a","sandbox":"/b","mode":"read_only_exec"}]}"#
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }

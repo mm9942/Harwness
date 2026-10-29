@@ -10,9 +10,10 @@
 /// not started.
 pub const SETUP_FAILED: u8 = 125;
 
-/// The sandbox could not be applied, or the achieved
-/// [`harw_job_core::SandboxReport`] does not satisfy the plan's
-/// [`harw_job_core::SandboxRequirement`]. The job was not started.
+/// The sandbox could not be applied, the cgroup membership to verify does
+/// not hold, or the achieved [`harw_job_core::SandboxReport`] does not
+/// satisfy the plan's [`harw_job_core::SandboxRequirement`]. The job was
+/// not started.
 pub const SANDBOX_REFUSED: u8 = 126;
 
 /// Every control was applied, but `execve` of the job program failed (not

@@ -1,5 +1,6 @@
 //! The enforcement report the trampoline writes before `exec`, and the pure
-//! decisions around it (requirement check, resource-limit dimension).
+//! decisions around it (requirement check, resource-limit dimension, merge
+//! with a Bubblewrap launcher's predicted report).
 //!
 //! # Report file format
 //! One [`SandboxReport`] as compact JSON followed by a single `\n`. The
@@ -28,9 +29,12 @@ pub fn unsandboxed_report() -> SandboxReport {
 
 /// The `resource_limits` dimension of the report.
 ///
-/// - `cgroup_limits`: `None` if the plan joins no cgroup, otherwise the
-///   state of the cgroup limits (from `CgroupJoin::limits`; unknown counts
-///   as `NotEnforced`).
+/// - `cgroup_limits`: `None` if the plan has no cgroup membership,
+///   otherwise the state of the cgroup limits (from
+///   `CgroupMembership::limits`; unknown counts as `NotEnforced`). A
+///   membership that failed verification (`CgroupVerify`) passes
+///   `NotEnforced`: the job would run outside the cgroup that carries the
+///   limits, so this dimension records the refusal.
 /// - `rlimits_applied`: whether the plan had rlimits (the trampoline fails
 ///   instead of continuing when `setrlimit` fails, so requested means
 ///   applied).
@@ -48,6 +52,50 @@ pub fn resource_limits_state(
         (Some(state), false) => state,
         // cgroup limits fell short, rlimits hold.
         (Some(_), true) => EnforcementState::Partial,
+    }
+}
+
+/// Merges the report a Bubblewrap launcher predicts for its own layer with
+/// the report the trampoline wrote from inside that namespace. Pure.
+///
+/// Both layers restrict the same process at once, so a dimension is as
+/// strong as its stronger layer: `Enforced` over `Partial` over
+/// `NotEnforced` over `Unsupported`. Per dimension:
+/// - `network`: primarily the namespace (an own network namespace,
+///   proxy-only egress); the trampoline's Landlock TCP rules add to it.
+/// - `filesystem`, `no_new_privs`, `capabilities`: primarily the
+///   trampoline (Landlock separates read from execute, a mount namespace
+///   cannot); the launcher's mounts, its own `NO_NEW_PRIVS` and its
+///   capability drop still hold underneath.
+/// - `resource_limits`: the trampoline's report only. The launcher enforces
+///   no limits, and the trampoline reports `Enforced` only when the cgroup
+///   limits and the rlimits both hold ([`resource_limits_state`]).
+///
+/// No dimension ends up stronger than what one of the two layers reports;
+/// one that neither layer enforces stays unenforced.
+#[must_use]
+pub fn merge_reports(bwrap_predicted: &SandboxReport, trampoline: &SandboxReport) -> SandboxReport {
+    SandboxReport {
+        filesystem: stronger(bwrap_predicted.filesystem, trampoline.filesystem),
+        network: stronger(bwrap_predicted.network, trampoline.network),
+        no_new_privs: stronger(bwrap_predicted.no_new_privs, trampoline.no_new_privs),
+        capabilities: stronger(bwrap_predicted.capabilities, trampoline.capabilities),
+        resource_limits: trampoline.resource_limits,
+    }
+}
+
+/// The stronger of two layers' states for the same dimension.
+fn stronger(left: EnforcementState, right: EnforcementState) -> EnforcementState {
+    let rank = |state: EnforcementState| match state {
+        EnforcementState::Unsupported => 0_u8,
+        EnforcementState::NotEnforced => 1,
+        EnforcementState::Partial => 2,
+        EnforcementState::Enforced => 3,
+    };
+    if rank(right) > rank(left) {
+        right
+    } else {
+        left
     }
 }
 
@@ -185,6 +233,98 @@ mod tests {
             resource_limits_state(Some(S::Unsupported), true),
             S::Partial
         );
+    }
+
+    const STATES: [S; 4] = [S::Enforced, S::Partial, S::NotEnforced, S::Unsupported];
+
+    /// The report with `dimension` (index into
+    /// [`SandboxReport::dimensions`]) set to `state` and every other
+    /// dimension `rest`.
+    fn with_dimension(dimension: usize, state: S, rest: S) -> SandboxReport {
+        let mut report = SandboxReport::uniform(rest);
+        match dimension {
+            0 => report.filesystem = state,
+            1 => report.network = state,
+            2 => report.no_new_privs = state,
+            3 => report.capabilities = state,
+            _ => report.resource_limits = state,
+        }
+        report
+    }
+
+    fn dimension_of(report: &SandboxReport, dimension: usize) -> Option<S> {
+        report.dimensions().get(dimension).map(|(_, state)| *state)
+    }
+
+    #[test]
+    fn test_merge_reports_table() -> TestResult {
+        // Expected merge of (bwrap, trampoline) for the four layered
+        // dimensions: the stronger layer, written out by hand.
+        let layered = |bwrap: S, trampoline: S| match (bwrap, trampoline) {
+            (S::Enforced, _) | (_, S::Enforced) => S::Enforced,
+            (S::Partial, _) | (_, S::Partial) => S::Partial,
+            (S::NotEnforced, _) | (_, S::NotEnforced) => S::NotEnforced,
+            (S::Unsupported, S::Unsupported) => S::Unsupported,
+        };
+        for (dimension, (name, _)) in unsandboxed_report().dimensions().iter().enumerate() {
+            for bwrap in STATES {
+                for trampoline in STATES {
+                    for rest in STATES {
+                        let merged = merge_reports(
+                            &with_dimension(dimension, bwrap, rest),
+                            &with_dimension(dimension, trampoline, rest),
+                        );
+                        let expected = if *name == "resource_limits" {
+                            trampoline
+                        } else {
+                            layered(bwrap, trampoline)
+                        };
+                        let got = dimension_of(&merged, dimension)
+                            .ok_or(TestError::Missing("merged dimension"))?;
+                        assert_eq!(got, expected, "{name}: {bwrap:?} + {trampoline:?}");
+                        // Never stronger than one of the layers.
+                        assert!(got == bwrap || got == trampoline, "{name}");
+                        // The other dimensions are untouched.
+                        for other in (0..5).filter(|other| *other != dimension) {
+                            assert_eq!(dimension_of(&merged, other), Some(rest), "{name}");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_reports_bwrap_trampoline_chain() {
+        // What the bubblewrap executor predicts for a network-denying
+        // policy, and a trampoline with Landlock V5, verified cgroup and
+        // rlimits.
+        let bwrap = SandboxReport {
+            filesystem: S::Partial,
+            network: S::Enforced,
+            no_new_privs: S::Enforced,
+            capabilities: S::Enforced,
+            resource_limits: S::NotEnforced,
+        };
+        let mut trampoline = SandboxReport::uniform(S::Enforced);
+        trampoline.network = S::Partial;
+        assert_eq!(
+            merge_reports(&bwrap, &trampoline),
+            SandboxReport::uniform(S::Enforced)
+        );
+        // No Landlock on the kernel: the mounts still confine (Partial);
+        // a refused cgroup verification stays visible.
+        let mut weak = unsandboxed_report();
+        weak.no_new_privs = S::Enforced;
+        weak.capabilities = S::Enforced;
+        weak.filesystem = S::Unsupported;
+        weak.resource_limits = S::NotEnforced;
+        let merged = merge_reports(&bwrap, &weak);
+        assert_eq!(merged.filesystem, S::Partial);
+        assert_eq!(merged.network, S::Enforced);
+        assert_eq!(merged.resource_limits, S::NotEnforced);
+        assert!(!merged.satisfies(SandboxRequirement::Required));
     }
 
     #[test]

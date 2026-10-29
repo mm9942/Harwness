@@ -1,6 +1,12 @@
 //! The trampoline itself: plan → cgroup → rlimits → sandbox → report →
 //! requirement check → `exec` (Job-Runtime-Doc §24).
 //!
+//! The cgroup step either joins the job cgroup ([`CgroupMembership::Attach`])
+//! or verifies `/proc/self/cgroup` ([`CgroupMembership::Verify`]). A failed
+//! verification is recorded, not raised at once: the remaining controls
+//! still run, the report shows `resource_limits` as the dimension that fell
+//! short, and the job is refused right after the report is written.
+//!
 //! Every step before `exec` is a separate function so the pure parts
 //! (argument parsing, plan parsing, requirement check) are unit-testable;
 //! the steps that restrict the calling process are exercised only by the
@@ -21,8 +27,13 @@ use harw_job_linux::sandbox::apply_to_current_process;
 use rustix::fs::{Mode, OFlags};
 
 use crate::error::ExecError;
-use crate::plan::{CgroupJoin, ExecPlanV1, MAX_PLAN_BYTES};
+use crate::plan::{
+    CgroupJoin, CgroupMembership, CgroupVerify, ExecPlanV1, MAX_PLAN_BYTES, PROC_SELF_CGROUP,
+};
 use crate::report::{check_requirement, render_report, resource_limits_state, unsandboxed_report};
+
+/// Upper bound for reading `/proc/self/cgroup` (a few lines in practice).
+const MAX_PROC_CGROUP_BYTES: u64 = 64 * 1024;
 
 /// Parsed command line of the binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,12 +95,26 @@ where
         Some(path) => Some((create_report_file(path)?, path.as_path())),
         None => None,
     };
-    let report = apply_controls(&plan)?;
-    if let Some((file, path)) = report_file {
-        write_report(file, path, &report)?;
-    }
+    let Controls { report, refusal } = apply_controls(&plan)?;
+    let written = match report_file {
+        Some((file, path)) => write_report(file, path, &report),
+        None => Ok(()),
+    };
+    refusal_first(refusal, written)?;
     check_requirement(plan.sandbox_requirement, &report)?;
     Err(exec_job(&plan))
+}
+
+/// A refused cgroup membership outranks a failed report write: it came
+/// first in the §24 order and is the reason the job does not run.
+fn refusal_first(
+    refusal: Option<ExecError>,
+    written: Result<(), ExecError>,
+) -> Result<(), ExecError> {
+    match refusal {
+        Some(refusal) => Err(refusal),
+        None => written,
+    }
 }
 
 /// Opens the plan file without following symlinks, verifies it is a
@@ -179,35 +204,84 @@ fn write_report(mut file: File, path: &Path, report: &SandboxReport) -> Result<(
         })
 }
 
+/// Result of [`apply_controls`].
+#[derive(Debug)]
+struct Controls {
+    /// What is enforced for the process that would become the job.
+    report: SandboxReport,
+    /// Set when the cgroup membership could not be verified: the report is
+    /// still written, then the job is refused with this error.
+    refusal: Option<ExecError>,
+}
+
 /// Applies the controls to the calling process in the §24 order and
-/// returns the merged report: cgroup join → rlimits → sandbox.
+/// returns the merged report: cgroup membership → rlimits → sandbox.
 ///
 /// cgroup first so that every later allocation is already accounted to the
 /// job; rlimits before the sandbox because Landlock/capability drop do not
 /// affect `setrlimit` but a dropped `CAP_SYS_RESOURCE` would; the sandbox
 /// last because `restrict_self` is irreversible and must see the final
 /// state.
-fn apply_controls(plan: &ExecPlanV1) -> Result<SandboxReport, ExecError> {
-    let cgroup_limits = match &plan.cgroup {
-        Some(join) => {
+///
+/// A failed attach aborts at once (as before); a failed verification is
+/// returned in [`Controls::refusal`] with `resource_limits` computed for
+/// cgroup limits that are not in effect. When a later step fails as well,
+/// the verification failure is returned: the first failure in §24 order
+/// is the reason the job does not run.
+fn apply_controls(plan: &ExecPlanV1) -> Result<Controls, ExecError> {
+    let (cgroup_limits, refusal) = match &plan.cgroup {
+        Some(CgroupMembership::Attach(join)) => {
             join_cgroup(join)?;
-            Some(join.limits.unwrap_or(EnforcementState::NotEnforced))
+            (Some(limits_state(join.limits)), None)
         }
-        None => None,
+        Some(CgroupMembership::Verify(verify)) => match verify_cgroup(verify) {
+            Ok(()) => (Some(limits_state(verify.limits)), None),
+            Err(error) => (Some(EnforcementState::NotEnforced), Some(error)),
+        },
+        None => (None, None),
     };
+    let mut report = match apply_process_controls(plan) {
+        Ok(report) => report,
+        Err(error) => return Err(refusal.unwrap_or(error)),
+    };
+    report.resource_limits = resource_limits_state(cgroup_limits, !plan.rlimits.is_empty());
+    Ok(Controls { report, refusal })
+}
+
+/// The steps after the cgroup membership: rlimits → sandbox.
+fn apply_process_controls(plan: &ExecPlanV1) -> Result<SandboxReport, ExecError> {
     plan.rlimits
         .apply_to_current_process()
         .map_err(|error| ExecError::Rlimit {
             message: error.to_string(),
         })?;
-    let mut report = match &plan.sandbox {
+    match &plan.sandbox {
         Some(policy) => apply_to_current_process(policy).map_err(|error| ExecError::Sandbox {
             message: error.to_string(),
-        })?,
-        None => unsandboxed_report(),
-    };
-    report.resource_limits = resource_limits_state(cgroup_limits, !plan.rlimits.is_empty());
-    Ok(report)
+        }),
+        None => Ok(unsandboxed_report()),
+    }
+}
+
+/// Unknown cgroup-limit state counts as not enforced.
+fn limits_state(limits: Option<EnforcementState>) -> EnforcementState {
+    limits.unwrap_or(EnforcementState::NotEnforced)
+}
+
+/// Reads `/proc/self/cgroup` (bounded) and checks it against the plan.
+fn verify_cgroup(verify: &CgroupVerify) -> Result<(), ExecError> {
+    let mut content = String::new();
+    let read = File::open(PROC_SELF_CGROUP).and_then(|file| {
+        file.take(MAX_PROC_CGROUP_BYTES)
+            .read_to_string(&mut content)
+    });
+    match read {
+        Ok(_) => verify.check(&content),
+        Err(error) => Err(ExecError::CgroupMismatch {
+            expected: verify.expected_proc_path.clone(),
+            found: format!("{PROC_SELF_CGROUP} unreadable: {error}"),
+        }),
+    }
 }
 
 fn join_cgroup(join: &CgroupJoin) -> Result<(), ExecError> {
@@ -346,9 +420,85 @@ mod tests {
     fn test_apply_controls_without_controls_changes_nothing() -> TestResult {
         // No cgroup, no rlimits, no sandbox: safe to run in the test
         // process (restricts nothing).
-        let report = apply_controls(&ExecPlanV1::new("/bin/true")).map_err(ctx("apply"))?;
-        assert_eq!(report.filesystem, EnforcementState::NotEnforced);
-        assert_eq!(report.resource_limits, EnforcementState::Enforced);
+        let controls = apply_controls(&ExecPlanV1::new("/bin/true")).map_err(ctx("apply"))?;
+        assert!(controls.refusal.is_none());
+        assert_eq!(controls.report.filesystem, EnforcementState::NotEnforced);
+        assert_eq!(controls.report.resource_limits, EnforcementState::Enforced);
+        Ok(())
+    }
+
+    fn verify_plan(expected: &str, limits: Option<EnforcementState>) -> ExecPlanV1 {
+        ExecPlanV1::new("/bin/true").with_cgroup(CgroupVerify {
+            expected_proc_path: PathBuf::from(expected),
+            limits,
+        })
+    }
+
+    #[test]
+    fn test_apply_controls_verifies_the_own_cgroup() -> TestResult {
+        // Verify only reads /proc/self/cgroup: safe in the test process.
+        let content = std::fs::read_to_string(PROC_SELF_CGROUP).map_err(ctx("read cgroup"))?;
+        let wrong = verify_plan(
+            "/harw-job-exec-test/not-this-cgroup",
+            Some(EnforcementState::Enforced),
+        );
+        let controls = apply_controls(&wrong).map_err(ctx("apply wrong"))?;
+        match &controls.refusal {
+            Some(ExecError::CgroupMismatch { expected, .. }) => {
+                assert_eq!(expected, Path::new("/harw-job-exec-test/not-this-cgroup"));
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        // Recorded: the supervisor's `Enforced` limits do not count.
+        assert_eq!(
+            controls.report.resource_limits,
+            EnforcementState::NotEnforced
+        );
+
+        // Skipped, not passed: a cgroup v1-only host has no unified entry
+        // to match, and a process at the root (`0::/`, e.g. at a cgroup
+        // namespace root) has no job cgroup a plan may name.
+        let Some(own) = crate::plan::unified_cgroup_path(&content).filter(|own| *own != "/") else {
+            eprintln!("skipped: own cgroup {content:?} is not a verifiable job cgroup");
+            return Ok(());
+        };
+        let right = verify_plan(own, Some(EnforcementState::Enforced));
+        let controls = apply_controls(&right).map_err(ctx("apply right"))?;
+        assert!(controls.refusal.is_none(), "{:?}", controls.refusal);
+        assert_eq!(controls.report.resource_limits, EnforcementState::Enforced);
+        let unknown = apply_controls(&verify_plan(own, None)).map_err(ctx("apply unknown"))?;
+        assert_eq!(
+            unknown.report.resource_limits,
+            EnforcementState::NotEnforced
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_refused_membership_outranks_a_failed_report_write() -> TestResult {
+        let mismatch = || ExecError::CgroupMismatch {
+            expected: PathBuf::from("/harw.slice/harw-job-1"),
+            found: "/user.slice".to_owned(),
+        };
+        let write_failed = || {
+            Err(ExecError::ReportIo {
+                path: PathBuf::from("/r"),
+                source: io::Error::from(io::ErrorKind::StorageFull),
+            })
+        };
+        assert!(matches!(
+            refusal_first(Some(mismatch()), write_failed()),
+            Err(ExecError::CgroupMismatch { .. })
+        ));
+        assert!(matches!(
+            refusal_first(Some(mismatch()), Ok(())),
+            Err(ExecError::CgroupMismatch { .. })
+        ));
+        assert!(matches!(
+            refusal_first(None, write_failed()),
+            Err(ExecError::ReportIo { .. })
+        ));
+        refusal_first(None, Ok(())).map_err(ctx("nothing failed"))?;
         Ok(())
     }
 }
