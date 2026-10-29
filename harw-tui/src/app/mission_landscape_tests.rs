@@ -357,7 +357,7 @@ fn render_viewport_at_200x50_with_workbench_and_explorer_keeps_the_anchors() -> 
     assert!(
         !rows
             .iter()
-            .any(|row| row.contains("Werkbank: zu wenig Platz")),
+            .any(|row| row.contains("Workbench: not enough space")),
         "no hint while the workbench is drawn: {shown}"
     );
 
@@ -843,14 +843,14 @@ fn render_viewport_names_a_workbench_without_room_in_the_status_line() -> TestRe
     let shown = rows.join("\n");
     assert!(
         rows.iter()
-            .any(|row| row.contains("Werkbank: zu wenig Platz")),
+            .any(|row| row.contains("Workbench: not enough space")),
         "{shown}"
     );
     let rows = rendered(&app, 160, 45)?;
     assert!(
         !rows
             .iter()
-            .any(|row| row.contains("Werkbank: zu wenig Platz")),
+            .any(|row| row.contains("Workbench: not enough space")),
         "{}",
         rows.join("\n")
     );

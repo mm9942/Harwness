@@ -512,7 +512,7 @@ mod tests {
                 .iter()
                 .find(|row| row.contains("Shift+Tab"))
                 .ok_or(TestError::Missing("Statuszeile"))?;
-            assert!(status.contains("Freigabe:"), "{width}: {status}");
+            assert!(status.contains("Approval:"), "{width}: {status}");
             assert!(!status.contains("(in "), "{width}: {status}");
         }
         let wide = screen(&app, 200, 50)?;

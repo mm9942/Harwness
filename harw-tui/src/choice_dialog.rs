@@ -127,6 +127,16 @@ impl ChoiceDialog {
         }
     }
 
+    /// Replace caller-owned semantic presentation, preserving selected action and
+    /// body scroll. Only the owner may use this with the same ordered actions.
+    pub(crate) fn refresh_owned_presentation(&mut self, fresh: Self) {
+        debug_assert_eq!(self.options.len(), fresh.options.len());
+        self.title = fresh.title;
+        self.prompt = fresh.prompt;
+        self.options = fresh.options;
+        self.footer_hint = fresh.footer_hint;
+    }
+
     /// Setzt die anfänglich markierte Option und gibt `self` für
     /// Builder-Verkettung zurück (z. B. um den aktiven Provider/Modell
     /// vorauszuwählen).
@@ -524,6 +534,34 @@ mod tests {
                 "Abbrechen".to_owned(),
             ],
         )
+    }
+
+    #[test]
+    fn owned_refresh_keeps_selected_action_and_body_scroll() {
+        let mut dialog = ChoiceDialog::new(
+            "old",
+            Some("prompt ".repeat(200)),
+            vec!["first".into(), "second".into()],
+        )
+        .with_selected(1);
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        dialog.render(area, &mut buf, style::Theme::Dark);
+        dialog.scroll_body(false, 3);
+        let offset = dialog.body_scroll.offset();
+        assert!(offset > 0);
+        dialog.refresh_owned_presentation(ChoiceDialog::new(
+            "新しいタイトル",
+            Some("説明文 ".repeat(200)),
+            vec!["最初".into(), "次".into()],
+        ));
+        assert_eq!(dialog.body_scroll.offset(), offset);
+        dialog.render(area, &mut buf, style::Theme::Dark);
+        assert_eq!(dialog.body_scroll.offset(), offset);
+        assert_eq!(
+            dialog.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ChoiceAction::Chosen(1)
+        );
     }
 
     #[test]

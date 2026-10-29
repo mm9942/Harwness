@@ -805,7 +805,7 @@ mod tests {
         assert!(!picker.show_all());
     }
 
-    /// Rendering in einen 80x12-Buffer enthält Titeltext und "vor 5 min".
+    /// Rendering in einen 80x12-Buffer enthält Titeltext und "5 min ago".
     #[test]
     fn test_render_contains_title_and_relative_time() {
         let now = SystemTime::now();
@@ -817,7 +817,7 @@ mod tests {
 
         let rendered = buffer_to_string(&buf);
         assert!(rendered.contains("Mein Testtitel"), "{rendered}");
-        assert!(rendered.contains("vor 5 min"), "{rendered}");
+        assert!(rendered.contains("5 min ago"), "{rendered}");
     }
 
     /// Die markierte Zeile enthält den `❯`-Marker.

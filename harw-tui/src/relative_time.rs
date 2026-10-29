@@ -1,4 +1,4 @@
-//! Relative Zeitangaben ("vor 5 min") für den Session-Picker.
+//! Relative Zeitangaben ("5 min ago") für den Session-Picker.
 //!
 //! Spec-Quelle: Slice A6 des Kontraktdokuments
 //! `docs/design/tui-command-contract.md`
@@ -6,7 +6,7 @@
 //!
 //! # Verantwortung
 //! Reine Umrechnung eines Zeitpunkts in eine kurze, menschenlesbare
-//! deutschsprachige Relativangabe. Kein I/O, kein Zustand.
+//! lokalisierte Relativangabe. Kein I/O, kein Zustand.
 //!
 //! # Zeittyp-Entscheidung
 //! Die Spec verlangt primär `jiff::Timestamp`. `harw-tui/Cargo.toml` hat
@@ -19,12 +19,13 @@
 //! berücksichtigt (im Auftrag als "UTC ok, document" freigegeben).
 //!
 //! # Nebenläufigkeit
-//! [`relative_time`] ist eine reine Funktion ohne inneren Zustand und daher
-//! aus beliebigen Threads aufrufbar.
+//! Calendar arithmetic has no I/O or mutable state. Labels use the current
+//! synchronous session locale; new threads default to English.
 
+use crate::i18n::{tr, tr_args};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Sekundenschwelle, unterhalb derer "gerade eben" statt einer Minutenangabe
+/// Sekundenschwelle, unterhalb derer "just now" statt einer Minutenangabe
 /// gezeigt wird.
 const JUST_NOW_THRESHOLD_SECS: u64 = 45;
 
@@ -34,18 +35,18 @@ const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
 const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
 const SECS_PER_WEEK: u64 = 7 * SECS_PER_DAY;
 
-/// Formt einen Zeitpunkt `then` relativ zu `now` in eine kurze deutsche
+/// Formt einen Zeitpunkt `then` relativ zu `now` in eine kurze lokalisierte
 /// Zeitangabe um.
 ///
 /// # Beschreibung
 /// Buckets (Spec-Abschnitt Session-Picker):
-/// - `< 45s` seit `then` → `"gerade eben"`
+/// - `< 45s` seit `then` → `"just now"`
 /// - `< 60min` → `"vor N min"`
 /// - `< 24h` → `"vor N h"`
 /// - `< 7d` → `"vor N d"`
 /// - sonst → `"dd.mm.yyyy"` (UTC-Kalenderdatum, keine Zeitzonen-Umrechnung)
 ///
-/// Liegt `then` in der Zukunft (nach `now`), wird ebenfalls `"gerade eben"`
+/// Liegt `then` in der Zukunft (nach `now`), wird ebenfalls `"just now"`
 /// zurückgegeben, da eine negative Differenz keine sinnvolle Vergangenheits-
 /// angabe ergibt.
 ///
@@ -54,7 +55,7 @@ const SECS_PER_WEEK: u64 = 7 * SECS_PER_DAY;
 /// - `now` (`SystemTime`): der Referenzzeitpunkt ("jetzt").
 ///
 /// # Rückgabe
-/// Kurze, deutschsprachige Zeitangabe als `String`.
+/// Kurze, lokalisierte Zeitangabe als `String`.
 ///
 /// # Beispiele
 /// ```
@@ -63,29 +64,41 @@ const SECS_PER_WEEK: u64 = 7 * SECS_PER_DAY;
 ///
 /// let now = SystemTime::now();
 /// let five_min_ago = now - Duration::from_secs(5 * 60);
-/// assert_eq!(relative_time(five_min_ago, now), "vor 5 min");
+/// assert_eq!(relative_time(five_min_ago, now), "5 min ago");
 /// ```
 pub fn relative_time(then: SystemTime, now: SystemTime) -> String {
     let elapsed = match now.duration_since(then) {
         Ok(duration) => duration,
         // `then` liegt nach `now` (Zukunft) — Zeitspringen/Uhrdrift werden
-        // hier absichtlich wie "gerade eben" behandelt statt als Fehler.
-        Err(_) => return "gerade eben".to_owned(),
+        // hier absichtlich wie "just now" behandelt statt als Fehler.
+        Err(_) => return tr("chrome.just_now", "just now").to_owned(),
     };
 
     let secs = elapsed.as_secs();
 
     if secs < JUST_NOW_THRESHOLD_SECS {
-        "gerade eben".to_owned()
+        tr("chrome.just_now", "just now").to_owned()
     } else if secs < SECS_PER_HOUR {
         let minutes = secs / SECS_PER_MINUTE;
-        format!("vor {minutes} min")
+        tr_args(
+            "chrome.minutes_ago",
+            "{count} min ago",
+            &[("count", &minutes.to_string())],
+        )
     } else if secs < SECS_PER_DAY {
         let hours = secs / SECS_PER_HOUR;
-        format!("vor {hours} h")
+        tr_args(
+            "chrome.hours_ago",
+            "{count} h ago",
+            &[("count", &hours.to_string())],
+        )
     } else if secs < SECS_PER_WEEK {
         let days = secs / SECS_PER_DAY;
-        format!("vor {days} d")
+        tr_args(
+            "chrome.days_ago",
+            "{count} d ago",
+            &[("count", &days.to_string())],
+        )
     } else {
         format_utc_date(then)
     }
@@ -149,23 +162,46 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn relative_time_uses_current_locale_for_all_buckets_and_future() {
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000);
+        for language in harw_config::UiLanguage::ALL {
+            crate::i18n::with_language(language, || {
+                let just_now = crate::i18n::tr("chrome.just_now", "just now");
+                assert_eq!(relative_time(now, now), just_now);
+                assert_eq!(relative_time(now + Duration::from_secs(60), now), just_now);
+                for (secs, key, fallback) in [
+                    (300, "chrome.minutes_ago", "{count} min ago"),
+                    (18000, "chrome.hours_ago", "{count} h ago"),
+                    (432000, "chrome.days_ago", "{count} d ago"),
+                ] {
+                    assert_eq!(
+                        relative_time(now - Duration::from_secs(secs), now),
+                        crate::i18n::tr_args(key, fallback, &[("count", "5")])
+                    );
+                }
+                assert_eq!(relative_time(UNIX_EPOCH, now), "01.01.1970");
+            });
+        }
+    }
+
     fn at(secs_from_epoch: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs_from_epoch)
     }
 
-    /// Innerhalb von 45s gilt "gerade eben", exakt darunter.
+    /// Innerhalb von 45s gilt "just now", exakt darunter.
     #[test]
     fn test_just_now_below_threshold() {
         let now = at(1_000_000);
         let then = now - Duration::from_secs(44);
-        assert_eq!(relative_time(then, now), "gerade eben");
+        assert_eq!(relative_time(then, now), "just now");
     }
 
-    /// Bei exakt 0 Sekunden Differenz ebenfalls "gerade eben".
+    /// Bei exakt 0 Sekunden Differenz ebenfalls "just now".
     #[test]
     fn test_just_now_zero_diff() {
         let now = at(1_000_000);
-        assert_eq!(relative_time(now, now), "gerade eben");
+        assert_eq!(relative_time(now, now), "just now");
     }
 
     /// Bei exakt 45s wechselt der Bucket zu Minuten (0 min).
@@ -173,7 +209,7 @@ mod tests {
     fn test_boundary_at_45s_switches_to_minutes() {
         let now = at(1_000_000);
         let then = now - Duration::from_secs(45);
-        assert_eq!(relative_time(then, now), "vor 0 min");
+        assert_eq!(relative_time(then, now), "0 min ago");
     }
 
     /// 5 Minuten Differenz.
@@ -181,7 +217,7 @@ mod tests {
     fn test_five_minutes() {
         let now = at(1_000_000);
         let then = now - Duration::from_secs(5 * 60);
-        assert_eq!(relative_time(then, now), "vor 5 min");
+        assert_eq!(relative_time(then, now), "5 min ago");
     }
 
     /// Kurz vor der 60-Minuten-Grenze bleibt es bei Minuten.
@@ -189,7 +225,7 @@ mod tests {
     fn test_boundary_just_below_one_hour() {
         let now = at(1_000_000);
         let then = now - Duration::from_secs(59 * 60 + 59);
-        assert_eq!(relative_time(then, now), "vor 59 min");
+        assert_eq!(relative_time(then, now), "59 min ago");
     }
 
     /// Bei exakt 60 Minuten wechselt der Bucket zu Stunden (1 h).
@@ -197,7 +233,7 @@ mod tests {
     fn test_boundary_at_one_hour_switches_to_hours() {
         let now = at(1_000_000);
         let then = now - Duration::from_secs(60 * 60);
-        assert_eq!(relative_time(then, now), "vor 1 h");
+        assert_eq!(relative_time(then, now), "1 h ago");
     }
 
     /// Kurz vor der 24-Stunden-Grenze bleibt es bei Stunden.
@@ -205,7 +241,7 @@ mod tests {
     fn test_boundary_just_below_one_day() {
         let now = at(1_000_000);
         let then = now - Duration::from_secs(23 * 60 * 60 + 59 * 60);
-        assert_eq!(relative_time(then, now), "vor 23 h");
+        assert_eq!(relative_time(then, now), "23 h ago");
     }
 
     /// Bei exakt 24 Stunden wechselt der Bucket zu Tagen (1 d).
@@ -213,7 +249,7 @@ mod tests {
     fn test_boundary_at_one_day_switches_to_days() {
         let now = at(1_000_000);
         let then = now - Duration::from_secs(24 * 60 * 60);
-        assert_eq!(relative_time(then, now), "vor 1 d");
+        assert_eq!(relative_time(then, now), "1 d ago");
     }
 
     /// Kurz vor der 7-Tage-Grenze bleibt es bei Tagen.
@@ -221,7 +257,7 @@ mod tests {
     fn test_boundary_just_below_seven_days() {
         let now = at(1_000_000_000);
         let then = now - Duration::from_secs(6 * 24 * 60 * 60 + 23 * 60 * 60);
-        assert_eq!(relative_time(then, now), "vor 6 d");
+        assert_eq!(relative_time(then, now), "6 d ago");
     }
 
     /// Bei exakt 7 Tagen wechselt der Bucket zum Kalenderdatum.
@@ -234,12 +270,12 @@ mod tests {
         assert_eq!(relative_time(then, now), "01.01.2000");
     }
 
-    /// Zukünftige Zeitstempel (then nach now) gelten als "gerade eben".
+    /// Zukünftige Zeitstempel (then nach now) gelten als "just now".
     #[test]
     fn test_future_timestamp_is_just_now() {
         let now = at(1_000_000);
         let then = now + Duration::from_secs(3600);
-        assert_eq!(relative_time(then, now), "gerade eben");
+        assert_eq!(relative_time(then, now), "just now");
     }
 
     /// `civil_from_days` liefert für Tag 10957 das bekannte Datum 2000-01-01.

@@ -38,6 +38,8 @@
 //!
 //! [`ChildStreamBlock`]: crate::child_stream::ChildStreamBlock
 
+use crate::i18n::{tr, tr_args};
+
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -77,6 +79,7 @@ const LIVE_CELL_MAX_BODY: usize = 8;
 const LIVE_CELL_MIN_BODY: usize = 2;
 
 /// Marker of a pinned live cell (pin of the Agents / LIVE window, `p`).
+#[cfg(test)]
 pub(crate) const PINNED_MARKER: &str = "▲ pinned";
 
 /// Snapshot of one tracked run for the ranking (plain data, so the mapping
@@ -522,8 +525,12 @@ impl SegmentGeometry {
 pub(crate) fn new_activity_label(count: usize) -> Option<String> {
     match count {
         0 => None,
-        1 => Some("↓ 1 neue Aktivität".to_owned()),
-        n => Some(format!("↓ {n} neue Aktivitäten")),
+        1 => Some(tr("chrome.new_activity", "↓ 1 new activity").to_owned()),
+        n => Some(tr_args(
+            "chrome.new_activities",
+            "↓ {count} new activities",
+            &[("count", &n.to_string())],
+        )),
     }
 }
 
@@ -548,14 +555,21 @@ fn live_cell_lines(
     let dim = style::dim_style(theme);
     let mut header = vec![
         Span::styled("◆ ", accent),
-        Span::styled(format!("live · {}", sanitize_inline(&slot.role)), accent),
+        Span::styled(
+            tr_args(
+                "chrome.live_role",
+                "live · {role}",
+                &[("role", &sanitize_inline(&slot.role))],
+            ),
+            accent,
+        ),
     ];
     if let Some(live) = live {
         header.push(Span::styled(format!(" · {}", live.phase.label()), dim));
     }
     if slot.pinned {
         header.push(Span::styled(
-            format!(" {PINNED_MARKER}"),
+            format!(" {}", tr("chrome.pinned", "▲ pinned")),
             style::warning_style(theme),
         ));
     }
@@ -563,7 +577,11 @@ fn live_cell_lines(
     let body = match block.map(|block| block.lock()) {
         Some(Ok(guard)) => guard.display_lines(width, theme),
         Some(Err(_)) => vec![Line::styled(
-            "  │ ⚠ Live-Block nicht lesbar (Sperre vergiftet)".to_owned(),
+            tr(
+                "chrome.live_unreadable",
+                "  │ ⚠ Live block unreadable (poisoned lock)",
+            )
+            .to_owned(),
             style::warning_style(theme),
         )],
         None => Vec::new(),
@@ -571,7 +589,14 @@ fn live_cell_lines(
     if body.len() > max_body {
         let keep = max_body.saturating_sub(1).max(1);
         let hidden = body.len() - keep;
-        lines.push(Line::styled(format!("  │ … {hidden} Zeilen darüber"), dim));
+        lines.push(Line::styled(
+            tr_args(
+                "chrome.hidden_lines",
+                "  │ … {count} lines above",
+                &[("count", &hidden.to_string())],
+            ),
+            dim,
+        ));
         lines.extend(body.into_iter().skip(hidden));
     } else {
         lines.extend(body);
@@ -737,7 +762,11 @@ impl ChatApp {
             virtual_cells.push(HistorySegment {
                 id: SegmentId::More,
                 lines: vec![Line::styled(
-                    format!("◇ +{} weitere aktiv", projection.more),
+                    tr_args(
+                        "chrome.more_active",
+                        "◇ +{count} more active",
+                        &[("count", &projection.more.to_string())],
+                    ),
                     dim,
                 )],
             });
@@ -767,9 +796,9 @@ impl ChatApp {
             }
             let lines = if homes.contains(&index) {
                 let arrow = if index < insert_at {
-                    "↓ live weiter unten"
+                    tr("chrome.live_below", "↓ live further below")
                 } else {
-                    "↑ live weiter oben"
+                    tr("chrome.live_above", "↑ live further above")
                 };
                 vec![Line::styled(format!("  │ {arrow}"), dim)]
             } else {
@@ -1200,7 +1229,7 @@ mod tests {
     }
 
     /// W01 Abnahme 5: Hochscrollen friert die Reihenfolge ein, hält dieselbe
-    /// oberste Zelle und zeigt `N neue Aktivitäten`; zurück am Ende wird
+    /// oberste Zelle und zeigt `N new activitäten`; zurück am Ende wird
     /// wieder gerankt.
     #[test]
     fn scroll_up_freezes_order_keeps_top_cell_and_counts_new_activity() -> TestResult {
@@ -1227,7 +1256,7 @@ mod tests {
         let quiet = projection(&app, Instant::now());
         assert!(quiet.frozen);
         assert_eq!(quiet.new_activity, 0, "{quiet:?}");
-        assert!(!rows.iter().any(|row| row.contains("neue Aktivit")));
+        assert!(!rows.iter().any(|row| row.contains("new activit")));
         let first_visible = rows
             .iter()
             .find(|row| row.contains("verlauf-zeile-"))
@@ -1256,7 +1285,7 @@ mod tests {
         assert_eq!(frozen_order, order, "eingefroren");
         assert_eq!(frozen.new_activity, 1, "{frozen:?}");
         assert!(
-            rows.iter().any(|row| row.contains("neue Aktivit")),
+            rows.iter().any(|row| row.contains("new activit")),
             "{rows:#?}"
         );
 
@@ -1389,7 +1418,7 @@ mod tests {
             }
         }
         assert!(current.is_some());
-        assert!(text.iter().any(|line| line.contains("live weiter unten")));
+        assert!(text.iter().any(|line| line.contains("live further below")));
         Ok(())
     }
 
@@ -1491,7 +1520,7 @@ mod tests {
         assert_eq!(running.live.len(), 1);
         let text = segment_text(&app.history_segments(&running, 100, style::Theme::Dark, 40));
         assert!(
-            text.iter().any(|line| line.contains("live weiter")),
+            text.iter().any(|line| line.contains("live further")),
             "{text:?}"
         );
 
@@ -1502,7 +1531,7 @@ mod tests {
         assert_eq!(later.more, 0);
         let text = segment_text(&app.history_segments(&later, 100, style::Theme::Dark, 40));
         assert!(
-            !text.iter().any(|line| line.contains("live weiter")),
+            !text.iter().any(|line| line.contains("live further")),
             "{text:?}"
         );
         assert_eq!(
@@ -1547,7 +1576,7 @@ mod tests {
             "{text:?}"
         );
         assert!(
-            !text.iter().any(|line| line.contains("live weiter")),
+            !text.iter().any(|line| line.contains("live further")),
             "{text:?}"
         );
         Ok(())
@@ -1592,7 +1621,7 @@ mod tests {
         };
         let collapsed = home_lines(&app)?;
         assert_eq!(collapsed.len(), 1, "Verweis: {collapsed:?}");
-        assert!(collapsed.iter().any(|line| line.contains("live weiter")));
+        assert!(collapsed.iter().any(|line| line.contains("live further")));
 
         if app.tool_cells.is_empty() {
             return Err(TestError::Missing("aufklappbare Kind-Zelle"));
@@ -1612,7 +1641,7 @@ mod tests {
         assert_eq!(expanded, canonical_home);
         assert!(
             expanded.iter().any(|line| line.contains("a.rs"))
-                && !expanded.iter().any(|line| line.contains("live weiter")),
+                && !expanded.iter().any(|line| line.contains("live further")),
             "voller Block: {expanded:?}"
         );
         Ok(())

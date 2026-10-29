@@ -56,6 +56,21 @@ impl ChatApp {
                 if let Some(Overlay::View(view)) = self.overlay.as_mut() {
                     view.refresh_presentation(&self.command_registry, &self.key_bindings);
                 }
+                match self.overlay.as_mut() {
+                    Some(Overlay::ExportChoice(dialog)) => {
+                        dialog.refresh_owned_presentation(export_choice_dialog())
+                    }
+                    Some(Overlay::EffortChoice { target, dialog }) => {
+                        dialog.refresh_owned_presentation(effort_choice_dialog(*target))
+                    }
+                    _ => {}
+                }
+                if let (Some(prompt), Some(dialog)) = (
+                    &self.pending_host_permit,
+                    &mut self.pending_host_permit_dialog,
+                ) {
+                    dialog.refresh_owned_presentation(build_host_permit_dialog(prompt));
+                }
             });
         }
     }

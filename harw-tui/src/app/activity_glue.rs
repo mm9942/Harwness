@@ -1533,7 +1533,7 @@ mod tests {
         assert!(
             rendered(&app)
                 .iter()
-                .any(|cell| cell.contains("Werkzeuganzeige: einzeilig"))
+                .any(|cell| cell.contains("Tool display: one line"))
         );
 
         // Im Aktivitätsmodus ist eine abgeschlossene Zelle genau eine Zeile.
