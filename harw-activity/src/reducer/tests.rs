@@ -976,6 +976,50 @@ fn a_failure_reported_on_progress_or_start_stays_visible() -> TestResult {
 }
 
 #[test]
+fn cancelled_job_rebase_does_not_bind_or_add_a_run() -> TestResult {
+    let mut reducer = Reducer::new();
+    reducer.apply(&call(
+        1,
+        1,
+        "c1",
+        JOB_START,
+        Some(call_key("c1")),
+        Lifecycle::Started,
+    ));
+    let updates = reducer
+        .apply(&rebase(2, "root", call_key("c1"), job("W1")).with_outcome(Outcome::Cancelled));
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].id, id(2, PatternId::STANDALONE));
+    assert_eq!(updates[0].instance.state.counts.cancelled, 1);
+    assert_eq!(reducer.job_projection("W1"), None);
+    let job = instance(&reducer, 1, PatternId::JOB_LIFECYCLE)?;
+    assert_eq!(job.key, Some(call_key("c1")));
+    assert_eq!(job.state.members.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn cancelled_path_rebase_preserves_both_open_paths() -> TestResult {
+    let mut reducer = Reducer::new();
+    reducer.apply(&done(1, "c1", FS_READ, "old"));
+    reducer.apply(&done(2, "c2", FS_READ, "new"));
+    let updates = reducer
+        .apply(&rebase(3, "root", path("old"), path("new")).with_outcome(Outcome::Cancelled));
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].id, id(3, PatternId::STANDALONE));
+    assert_eq!(
+        instance(&reducer, 1, PatternId::FILE_READ_BURST)?.key,
+        Some(path("old"))
+    );
+    assert!(!instance(&reducer, 2, PatternId::FILE_READ_BURST)?.is_terminal());
+    let old = reducer.apply(&done(4, "c3", FS_READ, "old"));
+    let new = reducer.apply(&done(5, "c4", FS_READ, "new"));
+    assert_eq!(old[0].id, id(1, PatternId::FILE_READ_BURST));
+    assert_eq!(new[0].id, id(2, PatternId::FILE_READ_BURST));
+    Ok(())
+}
+
+#[test]
 fn a_rebase_reporting_a_failure_is_not_applied_and_stays_visible() -> TestResult {
     let mut reducer = Reducer::new();
     reducer.apply(&call(

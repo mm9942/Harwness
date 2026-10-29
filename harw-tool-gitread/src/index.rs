@@ -235,7 +235,13 @@ pub fn parse(data: &[u8]) -> Result<Index, String> {
 }
 
 /// Höchstgröße der Index-Datei.
-pub const MAX_INDEX_BYTES: u64 = 512 * 1024 * 1024;
+///
+/// `git.status` und `git.log` sind in `Full` und `ReadOnlyExplore` ohne
+/// Rückfrage erlaubt; der Index wird vollständig in den Speicher gelesen.
+/// 64 MiB reichen für Arbeitsbäume mit einigen hunderttausend Einträgen
+/// (Linux-Kernel ≈ 7 MiB) und begrenzen, was ein präparierter Workspace
+/// pro Aufruf an Speicher kosten kann (PL-97-Sicherheitsreview, Befund 6).
+pub const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Liest den Index des Repositories; `None`, wenn es keinen gibt.
 ///
@@ -262,6 +268,22 @@ mod tests {
         let checksum = Sha1::digest(&body);
         body.extend_from_slice(checksum.as_slice());
         body
+    }
+
+    #[test]
+    fn oversized_index_is_refused_before_it_is_read() -> TestResult {
+        use crate::test_support::TestRepo;
+        let repo = TestRepo::new()?;
+        // Sparse-Datei: belegt keinen Platz, meldet aber die Übergröße.
+        let file = std::fs::File::create(repo.ws.join(".git").join("index"))?;
+        file.set_len(MAX_INDEX_BYTES + 1)?;
+        drop(file);
+        let opened = crate::repo::Repo::open(&repo.ws)?;
+        let error = read(&opened)
+            .err()
+            .ok_or(TestError::Missing("size error"))?;
+        assert!(error.contains("larger than"), "{error}");
+        Ok(())
     }
 
     #[test]

@@ -222,7 +222,8 @@ impl ConstituentStatus {
         match event.lifecycle {
             Lifecycle::Started | Lifecycle::Progress => Self::Running,
             Lifecycle::Finished => Self::from_outcome(event.outcome.as_ref()),
-            Lifecycle::Rebase { .. } | Lifecycle::Boundary(_) => Self::Succeeded,
+            Lifecycle::Rebase { .. } => Self::from_outcome(event.outcome.as_ref()),
+            Lifecycle::Boundary(_) => Self::Succeeded,
         }
     }
 
