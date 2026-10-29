@@ -135,7 +135,7 @@ pub use runtime_root::{
     run_tui,
 };
 pub use session_picker::{PickerAction, SessionEntry, SessionPicker};
-pub use setup::{SetupApp, SetupOutcome, SetupStage, run_setup};
+pub use setup::{SetupApp, SetupOutcome, SetupStage, run_setup, run_setup_for};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

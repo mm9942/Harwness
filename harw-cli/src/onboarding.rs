@@ -90,8 +90,7 @@ fn run_wizard_with_interaction_mode(home: &Path, interactive: bool) -> Result<()
         // Der Setup-Picker bleibt deterministisch. Die konto-spezifische
         // Quelle ist `harw models scan`, nicht ein impliziter Drittanbieter-
         // Download, der die Auswahl unerwartet aufbläht.
-        let catalog = harw_model_catalog::embedded_catalog();
-        if let Some(outcome) = harw_tui::run_setup(catalog).map_err(|e| e.to_string())? {
+        if let Some(outcome) = run_terminal_setup_with(home, harw_tui::run_setup_for)? {
             persist_outcome(home, &outcome)?;
             return maybe_recommend_openrouter(home, interactive);
         }
@@ -141,6 +140,24 @@ fn run_wizard_with_interaction_mode(home: &Path, interactive: bool) -> Result<()
     };
     persist_outcome(home, &outcome)?;
     maybe_recommend_openrouter(home, interactive)
+}
+
+/// Resolve the active profile on the production terminal-call boundary. The
+/// callback allows a headless regression without changing TTY or locale globals.
+fn run_terminal_setup_with(
+    home: &Path,
+    run: impl FnOnce(
+        harw_config::UiLanguage,
+        Vec<harw_model_catalog::ProviderSpec>,
+    ) -> Result<Option<harw_tui::SetupOutcome>, harw_tui::TuiError>,
+) -> Result<Option<harw_tui::SetupOutcome>, String> {
+    let layers = harw_home::config_layers(home).map_err(|error| error.to_string())?;
+    let config = harw_config::discover_config(&layers).map_err(|error| error.to_string())?;
+    run(
+        config.harness.tui.language,
+        harw_model_catalog::embedded_catalog(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Empfiehlt nach erfolgreicher Ersteinrichtung eines Providers, zusätzlich
@@ -952,6 +969,41 @@ mod tests {
             auth_header: None,
         };
         persist_outcome(home, &outcome).map_err(ctx("persist_outcome"))
+    }
+
+    #[test]
+    fn terminal_setup_receives_resolved_profile_language_and_defaults_to_english() -> TestResult {
+        for (setting, expected) in [
+            (None, harw_config::UiLanguage::English),
+            (Some("ja"), harw_config::UiLanguage::Japanese),
+        ] {
+            let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            harw_home::ensure_home(home.path()).map_err(ctx("ensure home"))?;
+            let profile_name = harw_home::active_profile_name(home.path());
+            let profile =
+                harw_home::profile_dir(home.path(), &profile_name).map_err(ctx("profile"))?;
+            if let Some(language) = setting {
+                std::fs::write(
+                    profile.join("config.toml"),
+                    format!("[tui]\nlanguage = \"{language}\"\n"),
+                )
+                .map_err(ctx("write profile language"))?;
+            }
+            let mut called = false;
+            let outcome = run_terminal_setup_with(home.path(), |language, providers| {
+                called = true;
+                assert_eq!(language, expected);
+                assert_eq!(providers, harw_model_catalog::embedded_catalog());
+                Ok(None)
+            })
+            .map_err(ctx("terminal setup boundary"))?;
+            assert!(called);
+            assert!(outcome.is_none(), "cancellation remains cancellation");
+            let layers = harw_home::config_layers(home.path()).map_err(ctx("config layers"))?;
+            let config = harw_config::discover_config(&layers).map_err(ctx("reload"))?;
+            assert_eq!(config.harness.tui.language, expected);
+        }
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
