@@ -146,12 +146,14 @@ impl CgroupResolver {
     }
 
     /// How many directories are cached right now.
+    #[cfg(test)]
     #[must_use]
     pub fn cached(&self) -> usize {
         self.by_inode.len()
     }
 
     /// How many times the tree was walked since construction.
+    #[cfg(test)]
     #[must_use]
     pub const fn refreshes(&self) -> u64 {
         self.refreshes

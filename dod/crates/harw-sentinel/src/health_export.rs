@@ -351,6 +351,7 @@ impl HealthExporter {
     }
 
     /// Target path of the health document.
+    #[cfg(test)]
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -366,12 +367,14 @@ impl HealthExporter {
     }
 
     /// Number of documents written successfully since process start.
+    #[cfg(test)]
     #[must_use]
     pub const fn written(&self) -> u64 {
         self.written
     }
 
     /// Number of failed writes since process start.
+    #[cfg(test)]
     #[must_use]
     pub const fn failures(&self) -> u64 {
         self.failures
