@@ -192,12 +192,13 @@ impl DodStatus {
                 .any(|unit| unit.is_installed() == Some(true) || unit.is_active())
     }
 
-    /// `true` when the findings and health files come from a source only
-    /// the sentinel or a trusted config layer writes
+    /// `true` when the findings and health files come from the system
+    /// export directory only the sentinel writes
     /// ([`crate::paths::ExportSource::is_verified`]). A `false` snapshot
-    /// may still carry findings (the home fallback); consumers that present
-    /// them as Harw-DoD facts show `export_paths.source` and its
-    /// [`crate::paths::ExportSource::hint`] next to them.
+    /// may still carry findings (the home fallback or a configured
+    /// `export_dir`); consumers that present them as Harw-DoD facts show
+    /// `export_paths.source` and its [`crate::paths::ExportSource::hint`]
+    /// next to them.
     #[must_use]
     pub const fn export_verified(&self) -> bool {
         self.export_paths.source.is_verified()

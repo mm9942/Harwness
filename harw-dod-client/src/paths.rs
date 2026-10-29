@@ -41,15 +41,20 @@ pub enum ExportSource {
 }
 
 impl ExportSource {
-    /// `true` when the export is written only by the sentinel (the system
-    /// directory is `0750 harw-sentinel:harw-dod-readers`) or was named by a
-    /// trusted config layer. `Home` is below the harw home, where any
-    /// process of the harw user can write; `SystemUnreadable` could not be
-    /// read at all. Consumers that present findings as Harw-DoD facts show
-    /// the source for both.
+    /// `true` only for [`Self::System`]: the directory `tmpfiles.d` creates
+    /// as `0750 harw-sentinel:harw-dod-readers`, which only the sentinel
+    /// writes. Every other source is unverified: `Home` is below the harw
+    /// home, where any process of the harw user can write;
+    /// `SystemUnreadable` could not be read at all; `Override` is a path a
+    /// trusted *config* layer named, but config provenance says nothing
+    /// about who can write that directory (`[dod] export_dir` is only
+    /// required to be absolute, so `/tmp/dod-export` or a directory below
+    /// the harw home is accepted). Consumers that present findings as
+    /// Harw-DoD facts show the source and [`Self::hint`] for every
+    /// unverified source.
     #[must_use]
     pub const fn is_verified(self) -> bool {
-        matches!(self, Self::Override | Self::System)
+        matches!(self, Self::System)
     }
 
     /// Operator hint for a source that is not [`Self::is_verified`].
@@ -62,7 +67,10 @@ impl ExportSource {
             Self::Home => Some(
                 "export below the harw home, not the system sentinel export; treat findings as unverified",
             ),
-            Self::Override | Self::System => None,
+            Self::Override => Some(
+                "export directory set by [dod] export_dir; its ownership and modes are not checked, treat findings as unverified",
+            ),
+            Self::System => None,
         }
     }
 }
@@ -248,12 +256,35 @@ mod tests {
     }
 
     #[test]
-    fn only_override_and_system_count_as_verified() {
-        assert!(ExportSource::Override.is_verified());
+    fn only_the_system_directory_counts_as_verified() {
         assert!(ExportSource::System.is_verified());
+        assert!(!ExportSource::Override.is_verified());
         assert!(!ExportSource::Home.is_verified());
         assert!(!ExportSource::SystemUnreadable.is_verified());
         assert!(ExportSource::Home.hint().is_some());
+        assert!(ExportSource::Override.hint().is_some());
         assert!(ExportSource::System.hint().is_none());
+    }
+
+    #[test]
+    fn writable_absolute_override_is_not_verified() -> TestResult {
+        // A trusted layer may name any absolute directory, including one the
+        // same user (and therefore untrusted same-user work) can write.
+        let writable = tempfile::tempdir()?;
+        let paths = resolve_export_paths_with(
+            Some(writable.path()),
+            Path::new("/home/op/.harw"),
+            Path::new("/nonexistent-system-export"),
+        );
+        assert_eq!(paths.source, ExportSource::Override);
+        assert_eq!(paths.findings, writable.path().join(FINDINGS_FILE));
+        assert!(!paths.source.is_verified());
+        assert!(
+            paths
+                .source
+                .hint()
+                .is_some_and(|hint| hint.contains("export_dir"))
+        );
+        Ok(())
     }
 }
