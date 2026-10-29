@@ -403,6 +403,11 @@ const TOOLS: &[SubcommandHint] = &[
 /// Befehl → (Nutzungszeile, Unterkommandos). Einzige Quelle für
 /// [`subcommand_hints`] und die Nutzungszeilen in [`enrich`].
 const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
+    (
+        "settings",
+        "/settings [show|set <key> <value>|reset <key>]",
+        &[],
+    ),
     ("model", "/model [show|list|switch <modell-id>]", MODEL),
     (
         "uia-model",
@@ -605,6 +610,22 @@ pub(crate) fn enrich(spec: &mut CommandSpec) {
         spec.summary = (*summary).to_owned();
     } else if !spec.summary.is_empty() {
         spec.summary = shorten_summary(&spec.summary);
+    }
+    if name == "settings" {
+        spec.summary = crate::i18n::tr("settings.title", "Settings").to_owned();
+        spec.subcommands = vec![
+            SubcommandHint::new("show", "", crate::i18n::tr("settings.title", "Settings")),
+            SubcommandHint::new(
+                "set",
+                "<key> <value>",
+                crate::i18n::tr("settings.scope", "Active profile · applies immediately"),
+            ),
+            SubcommandHint::new(
+                "reset",
+                "<key>",
+                crate::i18n::tr("settings.scope", "Active profile · applies immediately"),
+            ),
+        ];
     }
     if spec.subcommands.is_empty() {
         spec.subcommands = subcommand_hints(&name).to_vec();

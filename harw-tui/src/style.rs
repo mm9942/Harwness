@@ -482,3 +482,12 @@ mod tests {
     // ist hier nicht darstellbar ohne unsafe; die Logik ist durch detect_theme()
     // selbst ausreichend abgesichert (parse-Fehler → Dark-Fallback).
 }
+
+/// Resolve explicit profile theme values, including legacy aliases.
+pub(crate) fn configured_theme(value: &str) -> Theme {
+    match value {
+        "dark" | "default-dark" => Theme::Dark,
+        "light" | "default-light" => Theme::Light,
+        _ => detect_theme(),
+    }
+}

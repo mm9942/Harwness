@@ -1,3 +1,6 @@
+//! Production dispatch uses the explicit-locale `_for` APIs and preserves typed
+//! operation results. Historical text-only helpers remain test compatibility paths.
+//!
 //! Ausführung von `/command`-Eingaben in der Chat-TUI über die
 //! Operation-Adapter-Pipeline (`harw-operations` / `harw-ops`).
 //!
@@ -103,17 +106,21 @@ use std::sync::Arc;
 
 use harw_authority::SandboxSpec;
 #[cfg(test)]
+use harw_operations::OpContext;
+#[cfg(test)]
 use harw_operations::SharedSessionController;
 use harw_operations::adapter::CommandAdapter;
 use harw_operations::operation::{BusyAvailability, BusySubcommand};
 #[cfg(test)]
 use harw_operations::registry::OperationRegistry;
-use harw_operations::{OpContext, PermissionTier, ServiceMap};
+use harw_operations::{PermissionTier, ServiceMap};
 // Runde 6, Teil B: `!`-Befehle laufen über den Operator-Weg auf dem Host.
 use harw_tool_shell::{
     OPERATOR_DEFAULT_TIMEOUT_SECS, OperatorCommand, OperatorEnd, OperatorOutcome, ShellLimits,
 };
-use harw_types::{SessionId, TurnId};
+use harw_types::SessionId;
+#[cfg(test)]
+use harw_types::TurnId;
 
 #[cfg(test)]
 use crate::session_controller::TuiSessionController;
@@ -260,6 +267,7 @@ async fn execute_command(
 /// # Nebenläufigkeit
 /// `async`; ruft `services()` synchron innerhalb des `async fn`-Bodys auf,
 /// bevor `CommandAdapter::dispatch` awaitet wird.
+#[cfg(test)]
 pub(crate) async fn execute_command_as<F>(
     adapters: &[CommandAdapter],
     sandbox: &SandboxSpec,
@@ -280,6 +288,34 @@ where
         services,
     )
     .await
+}
+
+/// Locale-aware compatibility text result for callers that do not need operation data.
+pub(crate) async fn execute_command_as_for<F>(
+    language: harw_config::UiLanguage,
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    caller_permission: PermissionTier,
+    raw_line: &str,
+    services: F,
+) -> String
+where
+    F: FnOnce() -> ServiceMap,
+{
+    dispatch_command_with_shell_result_for(
+        language,
+        adapters,
+        sandbox,
+        session_id,
+        caller_permission,
+        raw_line,
+        None,
+        services,
+    )
+    .await
+    .0
+    .text
 }
 
 /// Kapselt den Idle-Dispatch-Ablauf aus `app.rs` (`HarwEvent::Command`-Zweig,
@@ -326,6 +362,7 @@ where
 /// # Nebenläufigkeit
 /// `async`; ruft [`execute_command_as`] genau einmal auf. Keine eigenen
 /// Locks oder geteilten Zustände.
+#[cfg(test)]
 pub(crate) async fn dispatch_slash_command(
     runtime: Option<&std::sync::Arc<harw_runtime::RuntimeAssembly>>,
     adapters: &[CommandAdapter],
@@ -346,6 +383,35 @@ pub(crate) async fn dispatch_slash_command(
             "Fehler: keine Runtime-Montage".to_owned()
         }
     }
+}
+
+/// Slash dispatch retaining typed success and operation data in the captured locale.
+pub(crate) async fn dispatch_slash_command_for(
+    language: harw_config::UiLanguage,
+    runtime: Option<&std::sync::Arc<harw_runtime::RuntimeAssembly>>,
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    raw: &str,
+) -> Result<harw_operations::OpOutput, String> {
+    let Some(rt) = runtime else {
+        return Err(crate::i18n::tr_for(
+            language,
+            "dispatch.no_runtime",
+            "Error: no runtime assembly",
+        )
+        .to_owned());
+    };
+    crate::command_data::execute_command_with_data_for(
+        language,
+        adapters,
+        sandbox,
+        session_id,
+        crate::runtime_commands::caller_tier(rt.principal()),
+        raw,
+        || crate::runtime_commands::slash_service_map(rt.services()),
+    )
+    .await
 }
 
 /// Eine Befehlszeile, die eine Taste aus typisierten Teilen baut (PL-97 C4,
@@ -555,6 +621,7 @@ fn classify_and_admit(
 /// [`ShellDisplayOutcome`] (siehe Moduldoc „`!`-Modus wie in Claude Code");
 /// `CommandAction::ShellRepeat` kennt hier — mangels Sitzungszustand — keinen
 /// vorherigen Befehl und bleibt bei der bisherigen Meldung (siehe Moduldoc).
+#[cfg(test)]
 async fn execute_with_context<F>(
     adapters: &[CommandAdapter],
     sandbox: &SandboxSpec,
@@ -633,6 +700,7 @@ pub(crate) struct ShellRunOutcome {
 /// Rückgabe von [`execute_shell`]: Anzeigetext für die Verlaufszelle
 /// (unverändert zum bisherigen `String`-Rückgabewert) plus optionales
 /// strukturiertes Ergebnis (Plan Teil F).
+#[cfg(test)]
 struct ShellDisplayOutcome {
     /// Anzeigetext für die Verlaufszelle — identisch zum Rückgabewert vor
     /// Plan Teil F.
@@ -652,6 +720,113 @@ pub(crate) struct CommandDispatchOutcome {
     /// `!`/`!!`-Shell-Befehl ausgeführt hat (nicht bei Admission-Fehlern,
     /// Nicht-Shell-Commands oder `!!` ohne Vorgänger).
     pub(crate) shell: Option<ShellRunOutcome>,
+}
+
+/// Dispatch with a captured locale and structured slash-command result.
+pub(crate) async fn dispatch_command_with_shell_result_for<F>(
+    language: harw_config::UiLanguage,
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    caller_permission: PermissionTier,
+    raw_line: &str,
+    last_shell_command: Option<&str>,
+    services: F,
+) -> (
+    CommandDispatchOutcome,
+    Option<Result<harw_operations::OpOutput, String>>,
+)
+where
+    F: FnOnce() -> ServiceMap,
+{
+    let rewritten = rewrite_note_line(adapters, raw_line);
+    let raw_line = rewritten.as_deref().unwrap_or(raw_line);
+    if raw_line.trim_start().starts_with('/') {
+        let result = crate::command_data::execute_command_with_data_for(
+            language,
+            adapters,
+            sandbox,
+            session_id,
+            caller_permission,
+            raw_line,
+            services,
+        )
+        .await;
+        let text = match &result {
+            Ok(output) => output.text.clone(),
+            Err(error) => error.clone(),
+        };
+        return (CommandDispatchOutcome { text, shell: None }, Some(result));
+    }
+    let action = crate::classify_input(raw_line)
+        .map_err(|error| {
+            crate::i18n::tr_args_for(
+                language,
+                "dispatch.rejected",
+                "Input rejected: {error}",
+                &[("error", &error.to_string())],
+            )
+        })
+        .and_then(|invocation| {
+            CommandRegistry::from_command_adapters(adapters)
+                .dispatch(tui_dispatch_context(caller_permission), invocation)
+                .map_err(|error| crate::command_data::render_admission_error(language, "!", &error))
+        });
+    let command = match action {
+        Ok(CommandAction::Shell(command)) => Some(command),
+        Ok(CommandAction::ShellRepeat) => last_shell_command.map(str::to_owned),
+        Ok(CommandAction::Chat(text)) => {
+            return (CommandDispatchOutcome { text, shell: None }, None);
+        }
+        Ok(CommandAction::Mention { target, body }) => {
+            return (
+                CommandDispatchOutcome {
+                    text: format!("@{target}: {body}"),
+                    shell: None,
+                },
+                None,
+            );
+        }
+        Ok(CommandAction::Note(note)) => {
+            return (
+                CommandDispatchOutcome {
+                    text: note,
+                    shell: None,
+                },
+                None,
+            );
+        }
+        Err(text) => return (CommandDispatchOutcome { text, shell: None }, None),
+        _ => None,
+    };
+    let Some(command) = command else {
+        return (
+            CommandDispatchOutcome {
+                text: crate::i18n::tr_for(
+                    language,
+                    "dispatch.no_previous_shell",
+                    "No previous ! command",
+                )
+                .to_owned(),
+                shell: None,
+            },
+            None,
+        );
+    };
+    let outcome = operator_command(
+        sandbox,
+        &command,
+        std::time::Duration::from_secs(OPERATOR_DEFAULT_TIMEOUT_SECS),
+    )
+    .run()
+    .await;
+    (
+        CommandDispatchOutcome {
+            text: operator_display_text_for(language, &outcome),
+            shell: shell_run_outcome(&outcome),
+        },
+        None,
+    )
 }
 
 /// Klassifiziert, admittiert und führt eine Rohzeile aus — wie
@@ -675,6 +850,7 @@ pub(crate) struct CommandDispatchOutcome {
 /// # Nebenläufigkeit
 /// `async`; ruft `services()` synchron, bevor `CommandAdapter::dispatch`
 /// bzw. [`execute_shell`] awaitet wird — wie [`execute_command_as`].
+#[cfg(test)]
 pub(crate) async fn dispatch_command_with_shell_result<F>(
     adapters: &[CommandAdapter],
     sandbox: &SandboxSpec,
@@ -851,6 +1027,27 @@ fn operator_limits() -> ShellLimits {
 /// N) – auf dem Host ausgeführt, cwd …“ mit Hinweisen auf Zeitlimit bzw.
 /// Kappung.
 #[must_use]
+pub(crate) fn operator_display_text_for(
+    language: harw_config::UiLanguage,
+    outcome: &OperatorOutcome,
+) -> String {
+    match &outcome.end {
+        OperatorEnd::Denied { message } => crate::i18n::tr_args_for(
+            language,
+            "dispatch.rejected",
+            "Input rejected: {error}",
+            &[("error", message)],
+        ),
+        OperatorEnd::Failed { message } if !outcome.executed_on_host => crate::i18n::tr_args_for(
+            language,
+            "dispatch.error",
+            "Error: {error}",
+            &[("error", message)],
+        ),
+        _ => crate::i18n::with_language(language, || operator_display_text(outcome)),
+    }
+}
+
 pub(crate) fn operator_display_text(outcome: &OperatorOutcome) -> String {
     match &outcome.end {
         OperatorEnd::Denied { message } => {
@@ -927,6 +1124,7 @@ pub(crate) fn shell_run_outcome(outcome: &OperatorOutcome) -> Option<ShellRunOut
 /// den asynchronen Weg in `app/operator_shell.rs`; diese Funktion bedient
 /// die synchronen Dispatch-Pfade ([`execute_with_context`],
 /// [`dispatch_command_with_shell_result`]).
+#[cfg(test)]
 async fn execute_shell(sandbox: &SandboxSpec, command: String) -> ShellDisplayOutcome {
     let outcome = operator_command(
         sandbox,
@@ -1398,6 +1596,57 @@ mod tests {
     // -----------------------------------------------------------------------
     // Plan Teil F: `dispatch_command_with_shell_result` löst `!!` echt auf.
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn localized_dispatch_retains_typed_slash_failures_and_shell_semantics() -> TestResult {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox()?;
+        let session = SessionId::new();
+        let controller = test_controller();
+        let (outcome, result) = super::dispatch_command_with_shell_result_for(
+            harw_config::UiLanguage::French,
+            &adapters,
+            &sandbox,
+            &session,
+            harw_operations::PermissionTier::Owner,
+            "/effort invalid",
+            None,
+            || build_services(&adapters, None, None, &controller, None, None),
+        )
+        .await;
+        assert!(outcome.text.starts_with("Erreur :"));
+        assert!(matches!(result, Some(Err(_))));
+        let (outcome, result) = super::dispatch_command_with_shell_result_for(
+            harw_config::UiLanguage::Japanese,
+            &adapters,
+            &sandbox,
+            &session,
+            harw_operations::PermissionTier::Owner,
+            "!!",
+            None,
+            || panic!("shell dispatch must not build slash services"),
+        )
+        .await;
+        assert_eq!(outcome.text, "前の ! コマンドはありません");
+        assert!(outcome.shell.is_none());
+        assert!(result.is_none());
+        let (outcome, result) = super::dispatch_command_with_shell_result_for(
+            harw_config::UiLanguage::English,
+            &adapters,
+            &sandbox,
+            &session,
+            harw_operations::PermissionTier::Owner,
+            "!sudo ls",
+            None,
+            || panic!("denied shell must not build slash services"),
+        )
+        .await;
+        assert!(outcome.text.starts_with("Input rejected:"));
+        assert!(outcome.shell.is_none());
+        assert!(result.is_none());
+        std::fs::remove_dir_all(tmp).ok();
+        Ok(())
+    }
 
     /// Ohne einen vorherigen `!`-Befehl liefert `!!` den dokumentierten
     /// Hinweistext und kein `ShellRunOutcome` — `app.rs` darf dann keinen
@@ -2489,6 +2738,7 @@ mod tests {
         ("review", "immediate", ""),
         ("sandbox-lease", "immediate", ""),
         ("sessions", "deferred", ""),
+        ("settings", "immediate", ""),
         (
             "skills",
             "deferred",

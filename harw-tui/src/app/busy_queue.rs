@@ -82,6 +82,8 @@ pub(super) enum BusyJobDone {
         /// Zeitlimit) — dann gilt auch ein `Staged`-Befehl nicht „ab nächstem
         /// Turn“.
         succeeded: bool,
+        data: Option<serde_json::Value>,
+        language: harw_config::UiLanguage,
     },
     /// Ein Datenabruf lief.
     Fetch {
@@ -95,6 +97,7 @@ pub(super) enum BusyJobDone {
 /// Geklonte, `'static` Dispatch-Daten für einen Busy-Task.
 #[derive(Clone)]
 pub(super) struct BusyDispatch {
+    pub(super) language: harw_config::UiLanguage,
     /// Runtime-Montage (Berechtigungsstufe und Slash-Dienste).
     pub(super) runtime: Option<Arc<harw_runtime::RuntimeAssembly>>,
     /// Command-Adapter der Sitzung.
@@ -111,12 +114,13 @@ pub(super) struct BusyDispatch {
 
 impl BusyDispatch {
     /// Führt eine `/command`-Zeile aus und liefert ihren Anzeigetext.
-    async fn command_text(&self, raw: &str) -> String {
+    async fn command_text(&self, raw: &str) -> Result<OpOutput, String> {
         #[cfg(test)]
         {
             if let (None, Some(controller)) = (&self.runtime, &self.test_controller) {
                 let adapters = Arc::clone(&self.adapters);
-                return crate::command_exec::execute_command_as(
+                return crate::command_data::execute_command_with_data_for(
+                    self.language,
                     &self.adapters,
                     &self.sandbox,
                     &self.session_id,
@@ -131,7 +135,8 @@ impl BusyDispatch {
                 .await;
             }
         }
-        crate::command_exec::dispatch_slash_command(
+        crate::command_exec::dispatch_slash_command_for(
+            self.language,
             self.runtime.as_ref(),
             &self.adapters,
             &self.sandbox,
@@ -147,7 +152,8 @@ impl BusyDispatch {
         {
             if let (None, Some(controller)) = (&self.runtime, &self.test_controller) {
                 let adapters = Arc::clone(&self.adapters);
-                return crate::command_data::execute_command_with_data(
+                return crate::command_data::execute_command_with_data_for(
+                    self.language,
                     &self.adapters,
                     &self.sandbox,
                     &self.session_id,
@@ -163,6 +169,7 @@ impl BusyDispatch {
             }
         }
         super::fetch_command_data(
+            self.language,
             self.runtime.as_ref(),
             &self.adapters,
             &self.sandbox,
@@ -284,28 +291,31 @@ impl BusyJobs {
             self.running += 1;
             tracing::debug!(command = %command.raw, class = ?command.class, "tui.busy.command_started");
             tokio::spawn(async move {
-                let (text, succeeded) = match tokio::time::timeout(
+                let (text, succeeded, data) = match tokio::time::timeout(
                     timeout,
                     dispatch.command_text(&command.raw),
                 )
                 .await
                 {
-                    Ok(text) => {
-                        let succeeded = !is_failure_text(&text);
-                        (text, succeeded)
-                    }
+                    Ok(Ok(output)) => (output.text, true, output.data),
+                    Ok(Err(error)) => (error, false, None),
                     Err(_) => (
-                        format!(
-                            "Zeitlimit überschritten ({} s) — Befehl abgebrochen.",
-                            timeout.as_secs_f32()
+                        crate::i18n::tr_args_for(
+                            dispatch.language,
+                            "dispatch.timeout",
+                            "Time limit exceeded ({seconds} s).",
+                            &[("seconds", &timeout.as_secs_f32().to_string())],
                         ),
                         false,
+                        None,
                     ),
                 };
                 let _ = tx.send(BusyJobDone::Command {
                     command,
                     text,
                     succeeded,
+                    data,
+                    language: dispatch.language,
                 });
                 if let Some(waker) = waker {
                     waker.schedule_frame();
@@ -335,9 +345,11 @@ impl BusyJobs {
         tokio::spawn(async move {
             let result = match tokio::time::timeout(timeout, dispatch.fetch(&raw)).await {
                 Ok(result) => result,
-                Err(_) => Err(format!(
-                    "Zeitlimit überschritten ({} s).",
-                    timeout.as_secs_f32()
+                Err(_) => Err(crate::i18n::tr_args_for(
+                    dispatch.language,
+                    "dispatch.timeout",
+                    "Time limit exceeded ({seconds} s).",
+                    &[("seconds", &timeout.as_secs_f32().to_string())],
                 )),
             };
             let _ = tx.send(BusyJobDone::Fetch { target, result });
@@ -379,27 +391,6 @@ impl BusyJobs {
             self.workbench_in_flight = false;
         }
     }
-}
-
-/// `true`, wenn `text` eine Fehlermeldung des Befehlspfads ist.
-///
-/// # Beschreibung
-/// Der Befehlspfad (`command_exec::execute_with_context`) liefert nur Text;
-/// seine Fehlerpfade beginnen mit festen Präfixen: Operationsfehler
-/// (`Fehler: …`), unbekannter Befehl, verweigerte Berechtigung und
-/// abgelehnte Eingabe/Shell.
-fn is_failure_text(text: &str) -> bool {
-    const FAILURE_PREFIXES: &[&str] = &[
-        "Fehler:",
-        "Unbekannter Command:",
-        "Berechtigung verweigert:",
-        "Eingabe abgelehnt:",
-        "Shell-Ausführung abgelehnt:",
-    ];
-    let text = text.trim_start();
-    FAILURE_PREFIXES
-        .iter()
-        .any(|prefix| text.starts_with(prefix))
 }
 
 /// Anzeigezeilen eines Befehlsergebnisses, das während eines Turns lief.
@@ -603,18 +594,8 @@ mod tests {
             class: BusyAvailability::Staged,
         };
         let text = "Fehler: ungültiger Effort";
-        assert!(is_failure_text(text));
         let lines = plain(&command_result_lines(&command, text, false));
         assert_eq!(lines[0], "/effort ultra (während Turn)");
         assert_eq!(lines[1], text);
-        for failure in [
-            "Unbekannter Command: /x",
-            "Berechtigung verweigert: /x erfordert Operator",
-            "Eingabe abgelehnt: leer",
-            "Shell-Ausführung abgelehnt: aus",
-        ] {
-            assert!(is_failure_text(failure), "{failure}");
-        }
-        assert!(!is_failure_text("Reasoning-Effort gesetzt: high"));
     }
 }

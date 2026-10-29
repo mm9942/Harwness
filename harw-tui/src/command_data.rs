@@ -46,11 +46,12 @@ use crate::{
 /// - `services`: liefert die [`ServiceMap`] für genau diesen Dispatch.
 ///
 /// # Fehler
-/// Ein deutscher Anzeigetext bei Parse-Fehler, Nicht-Befehl, abgelehnter
+/// Ein lokalisierter Anzeigetext bei Parse-Fehler, Nicht-Befehl, abgelehnter
 /// Admission, fehlendem Adapter oder Fehler der Operation.
 ///
 /// # Nebenläufigkeit
 /// `async`; awaitet höchstens einen `CommandAdapter::dispatch`-Aufruf.
+#[cfg(test)]
 pub(crate) async fn execute_command_with_data<F>(
     adapters: &[CommandAdapter],
     sandbox: &SandboxSpec,
@@ -62,19 +63,51 @@ pub(crate) async fn execute_command_with_data<F>(
 where
     F: FnOnce() -> ServiceMap,
 {
-    let invocation =
-        crate::classify_input(raw_line).map_err(|error| format!("Eingabe abgelehnt: {error}"))?;
+    execute_command_with_data_for(
+        harw_config::UiLanguage::English,
+        adapters,
+        sandbox,
+        session_id,
+        caller_tier,
+        raw_line,
+        services,
+    )
+    .await
+}
+
+/// Explicit session locale; no synchronous language scope crosses dispatch await.
+pub(crate) async fn execute_command_with_data_for<F>(
+    language: harw_config::UiLanguage,
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    caller_tier: PermissionTier,
+    raw_line: &str,
+    services: F,
+) -> Result<OpOutput, String>
+where
+    F: FnOnce() -> ServiceMap,
+{
+    use crate::i18n::{tr_args_for, tr_for};
+    let invocation = crate::classify_input(raw_line).map_err(|error| {
+        tr_args_for(
+            language,
+            "dispatch.rejected",
+            "Input rejected: {error}",
+            &[("error", &error.to_string())],
+        )
+    })?;
     let typed = match &invocation {
         Invocation::Command { name, .. } => format!("/{name}"),
         _ => {
-            return Err(format!(
-                "Eingabe abgelehnt: '{}' ist kein /Befehl.",
-                raw_line.trim()
-            ));
+            return Err(
+                tr_for(language, "dispatch.not_command", "Expected a slash command").to_owned(),
+            );
         }
     };
-
-    let registry = CommandRegistry::from_command_adapters(adapters);
+    let registry = crate::i18n::with_language(language, || {
+        CommandRegistry::from_command_adapters(adapters)
+    });
     let action = registry
         .dispatch(
             DispatchContext {
@@ -84,16 +117,20 @@ where
             },
             invocation,
         )
-        .map_err(|error| render_admission_error(&typed, &error))?;
-
+        .map_err(|error| render_admission_error(language, &typed, &error))?;
     let CommandAction::Command(spec, raw_args) = action else {
-        return Err(format!(
-            "Eingabe abgelehnt: {typed} ist kein ausführbarer Befehl."
-        ));
+        return Err(
+            tr_for(language, "dispatch.not_command", "Expected a slash command").to_owned(),
+        );
     };
     let path = format!("/{}", spec.name.as_str());
     let Some(adapter) = adapters.iter().find(|adapter| adapter.path() == path) else {
-        return Err(format!("Unbekannter Command: {path}"));
+        return Err(tr_args_for(
+            language,
+            "dispatch.unknown",
+            "Unknown command: {command}",
+            &[("command", &path)],
+        ));
     };
     let ctx = harw_operations::OpContext::new(
         session_id.clone(),
@@ -101,29 +138,62 @@ where
         sandbox.clone(),
         services(),
     );
-    adapter
-        .dispatch(&ctx, raw_args)
-        .await
-        .map_err(|error| format!("Fehler: {error}"))
+    let mut output = adapter.dispatch(&ctx, raw_args).await.map_err(|error| {
+        tr_args_for(
+            language,
+            "dispatch.error",
+            "Error: {error}",
+            &[("error", &error.to_string())],
+        )
+    })?;
+    if path == "/settings" {
+        output.text = crate::settings_view::present_output(language, &output);
+    }
+    Ok(output)
 }
 
-/// Setzt einen Admission-Fehler in deutschen Anzeigetext um (gleiche
-/// Wortlaute wie `command_exec`).
-fn render_admission_error(typed: &str, error: &CommandError) -> String {
+pub(crate) fn render_admission_error(
+    language: harw_config::UiLanguage,
+    typed: &str,
+    error: &CommandError,
+) -> String {
+    use crate::i18n::tr_args_for;
     match error {
         CommandError::UnknownCommand {
             suggestion: Some(suggestion),
             ..
-        } => format!("Unbekannter Command: {typed} (meinten Sie /{suggestion}?)"),
+        } => tr_args_for(
+            language,
+            "dispatch.suggestion",
+            "Unknown command: {command} (did you mean /{suggestion}?)",
+            &[("command", typed), ("suggestion", suggestion.as_str())],
+        ),
         CommandError::UnknownCommand {
             suggestion: None, ..
-        } => format!("Unbekannter Command: {typed}"),
+        } => tr_args_for(
+            language,
+            "dispatch.unknown",
+            "Unknown command: {command}",
+            &[("command", typed)],
+        ),
         CommandError::PermissionDenied {
             required, actual, ..
-        } => format!(
-            "Berechtigung verweigert: {typed} erfordert {required:?}; aktuelle Stufe ist {actual:?}"
+        } => tr_args_for(
+            language,
+            "dispatch.denied",
+            "Permission denied: {command} requires {required}; current tier is {actual}",
+            &[
+                ("command", typed),
+                ("required", &format!("{required:?}")),
+                ("actual", &format!("{actual:?}")),
+            ],
         ),
-        other => format!("Eingabe abgelehnt: {other}"),
+        other => tr_args_for(
+            language,
+            "dispatch.rejected",
+            "Input rejected: {error}",
+            &[("error", &other.to_string())],
+        ),
     }
 }
 
@@ -273,7 +343,7 @@ mod tests {
         let result = run(&operation, PermissionTier::Observer, "/board show", &built).await?;
         assert_eq!(
             result.err().as_deref(),
-            Some("Berechtigung verweigert: /board erfordert Operator; aktuelle Stufe ist Observer")
+            Some("Permission denied: /board requires Operator; current tier is Observer")
         );
         assert_eq!(built.load(Ordering::Relaxed), 0);
         assert_eq!(operation.dispatches.load(Ordering::Relaxed), 0);
@@ -281,15 +351,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_command_is_reported_in_german() -> TestResult {
+    async fn unknown_command_defaults_to_english() -> TestResult {
         let operation = Arc::new(DataOperation::new(PermissionTier::Observer));
         let built = AtomicUsize::new(0);
         let result = run(&operation, PermissionTier::Owner, "/nichtda", &built).await?;
         let error = result.err().ok_or(TestError::Missing("error"))?;
-        assert!(
-            error.starts_with("Unbekannter Command: /nichtda"),
-            "{error}"
-        );
+        assert!(error.starts_with("Unknown command: /nichtda"), "{error}");
         assert_eq!(built.load(Ordering::Relaxed), 0);
         Ok(())
     }
@@ -301,7 +368,7 @@ mod tests {
         for line in ["hallo welt", "!ls"] {
             let result = run(&operation, PermissionTier::Owner, line, &built).await?;
             let error = result.err().ok_or(TestError::Missing("error"))?;
-            assert!(error.starts_with("Eingabe abgelehnt"), "{line}: {error}");
+            assert!(error.contains("slash command"), "{line}: {error}");
         }
         assert_eq!(built.load(Ordering::Relaxed), 0);
         assert_eq!(operation.dispatches.load(Ordering::Relaxed), 0);

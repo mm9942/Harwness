@@ -38,6 +38,7 @@ use crate::frame_requester::FrameRequester;
 
 /// Ein fertiger `!`-Befehl.
 struct OperatorDone {
+    language: harw_config::UiLanguage,
     /// Laufende Nummer (Zuordnung zu [`OperatorShellJobs::running`]).
     id: u64,
     /// Das vollständige Ergebnis.
@@ -189,6 +190,7 @@ fn operator_timeout(app: &ChatApp) -> Duration {
 /// # Nebenläufigkeit
 /// Muss in einer Tokio-Runtime laufen (`tokio::spawn`).
 pub(super) fn start(app: &mut ChatApp, command: String) {
+    let language = app.language;
     let cancel = CancelToken::new();
     let request = command_exec::operator_command(app.sandbox(), &command, operator_timeout(app))
         .with_cancel(cancel.clone());
@@ -207,7 +209,11 @@ pub(super) fn start(app: &mut ChatApp, command: String) {
     tracing::debug!(id, "tui.operator_shell.started");
     tokio::spawn(async move {
         let outcome = request.run().await;
-        let _ = tx.send(OperatorDone { id, outcome });
+        let _ = tx.send(OperatorDone {
+            id,
+            outcome,
+            language,
+        });
         if let Some(waker) = waker {
             waker.schedule_frame();
         }
@@ -252,7 +258,7 @@ fn take_finished(app: &mut ChatApp) -> (bool, Vec<command_exec::ShellRunOutcome>
             .running
             .retain(|(running, _, _)| *running != done.id);
         let outcome = done.outcome;
-        let text = command_exec::operator_display_text(&outcome);
+        let text = command_exec::operator_display_text_for(done.language, &outcome);
         let mut lines = vec![Line::from(format!("! {}", outcome.command))];
         lines.extend(text.split('\n').map(|line| Line::from(line.to_owned())));
         match command_exec::shell_run_outcome(&outcome) {

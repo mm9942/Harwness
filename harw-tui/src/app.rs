@@ -93,6 +93,7 @@
 //! ```
 
 mod busy_queue;
+mod settings_glue;
 // Runde 5, Teil F: Plan-Modus (Sperre, Plan-Fenster, `/plan …`, Editor).
 pub(crate) mod plan_mode;
 // Runde 5, Teil C: Kanban live (mtime-Signatur der Board-Dateien).
@@ -199,9 +200,9 @@ use crate::approval_dialog::{ApprovalChoice, ApprovalDialog, ApprovalDialogReque
 use crate::chat_scroll::{ChatScroll, ScrollAction};
 use crate::choice_dialog::{ChoiceAction, ChoiceDialog};
 use crate::clipboard::{self, ClipboardTarget};
-use crate::command_exec::{
-    ShellRunOutcome, busy_availability_for, dispatch_command_with_shell_result, execute_command_as,
-};
+#[cfg(test)]
+use crate::command_exec::execute_command_as;
+use crate::command_exec::{ShellRunOutcome, busy_availability_for};
 use crate::command_popup::{CommandPopup, PopupAction, PopupMode};
 use crate::events::{HarwEvent, HarwEventSender};
 use crate::export::{
@@ -1152,7 +1153,9 @@ pub struct ChatApp {
     /// dispatcht zu werden. `None` lässt `/model switch` uneingeschränkt.
     /// Siehe [`Self::with_model_switch_allowlist`].
     model_switch_allowlist: Option<Vec<(String, String)>>,
-    /// Aktives Terminal-Farbschema, einmalig beim Erzeugen erkannt.
+    /// Explicit locale of this session; never inferred from thread state.
+    language: harw_config::UiLanguage,
+    /// Configured theme, with terminal detection for `auto`.
     theme: style::Theme,
     /// Über die Session-Laufzeit aufsummierte Token-Nutzung (aus
     /// `SessionEvent::TurnCompleted`). Wird in der Statuszeile angezeigt.
@@ -1558,6 +1561,7 @@ impl ChatApp {
             hidden_commands: Vec::new(),
             title_override: None,
             model_switch_allowlist: None,
+            language: harw_config::UiLanguage::English,
             theme: style::detect_theme(),
             total_usage: TokenUsage::default(),
             agent_monitor: crate::agent_monitor::AgentMonitor::default(),
@@ -2827,6 +2831,10 @@ impl ChatApp {
     /// veraltet ([`Self::apply_knowledge_event`]).
     /// Liefert `true`, wenn sich Sichtbares geändert hat.
     pub(crate) fn drain_agent_events(&mut self) -> bool {
+        crate::i18n::with_language(self.language, || self.drain_agent_events_scoped())
+    }
+
+    fn drain_agent_events_scoped(&mut self) -> bool {
         let mut changed = self.poll_explorer();
         // Runde 5, Teil C: offenes Kanban-Board alle 2 s gegen die Platte
         // prüfen (Spinner-Takt im Busy-Pfad, Leerlauf-Takt in `run_loop`).
@@ -3145,6 +3153,7 @@ impl ChatApp {
     /// Geklonte Dispatch-Daten für einen Busy-Task (Runde 4, Teil H).
     fn busy_dispatch(&self) -> BusyDispatch {
         BusyDispatch {
+            language: self.interface_language(),
             runtime: self.runtime.clone(),
             adapters: Arc::clone(&self.adapters),
             sandbox: self.sandbox.clone(),
@@ -3987,6 +3996,10 @@ fn is_workbench_command(raw: &str) -> bool {
 /// [`local_commands::intercept`]. Das Ergebnis besitzt keine Borrows auf
 /// `app`, der Aufrufer darf danach mutieren.
 fn local_intercept_for(app: &ChatApp, raw: &str) -> Option<LocalIntercept> {
+    crate::i18n::with_language(app.language, || local_intercept_for_scoped(app, raw))
+}
+
+fn local_intercept_for_scoped(app: &ChatApp, raw: &str) -> Option<LocalIntercept> {
     // PL-97 D5: `/dod view` ist TUI-lokal (Harw-DoD-Ansicht); alle übrigen
     // `/dod`-Formen gehören der `dod`-Operation. Ein ausgeblendetes `/dod`
     // (fixed agent) meldet `local_commands::intercept` wie gewohnt.
@@ -4029,6 +4042,16 @@ fn local_intercept_for(app: &ChatApp, raw: &str) -> Option<LocalIntercept> {
 /// `Some(outcome)`, wenn die TUI-Schleife mit diesem Ergebnis enden soll
 /// (bare `/resume`); sonst `None`.
 fn apply_local_intercept(
+    app: &mut ChatApp,
+    intercepted: LocalIntercept,
+    bus: &HarwEventSender,
+) -> Option<TuiRunOutcome> {
+    crate::i18n::with_language(app.language, || {
+        apply_local_intercept_scoped(app, intercepted, bus)
+    })
+}
+
+fn apply_local_intercept_scoped(
     app: &mut ChatApp,
     intercepted: LocalIntercept,
     bus: &HarwEventSender,
@@ -4125,6 +4148,7 @@ fn apply_local_intercept(
 /// übrigen Dispatch-Aufrufe in [`run_loop`]), damit über das `await` keine
 /// Referenz auf den ganzen App-Zustand gehalten wird.
 async fn fetch_command_data(
+    language: harw_config::UiLanguage,
     runtime: Option<&Arc<harw_runtime::RuntimeAssembly>>,
     adapters: &[CommandAdapter],
     sandbox: &SandboxSpec,
@@ -4132,9 +4156,15 @@ async fn fetch_command_data(
     raw: &str,
 ) -> Result<OpOutput, String> {
     let Some(rt) = runtime else {
-        return Err("Fehler: keine Runtime-Montage".to_owned());
+        return Err(crate::i18n::tr_for(
+            language,
+            "dispatch.no_runtime",
+            "Error: no runtime assembly",
+        )
+        .to_owned());
     };
-    command_data::execute_command_with_data(
+    command_data::execute_command_with_data_for(
+        language,
         adapters,
         sandbox,
         session_id,
@@ -4187,6 +4217,16 @@ fn take_fetch_requests(app: &mut ChatApp) -> Vec<(FetchTarget, String)> {
 /// Ein Ergebnis für eine inzwischen ersetzte Ansicht (andere Generation)
 /// wird verworfen.
 fn apply_fetch_result(app: &mut ChatApp, target: FetchTarget, result: Result<OpOutput, String>) {
+    crate::i18n::with_language(app.language, || {
+        apply_fetch_result_scoped(app, target, result)
+    })
+}
+
+fn apply_fetch_result_scoped(
+    app: &mut ChatApp,
+    target: FetchTarget,
+    result: Result<OpOutput, String>,
+) {
     match target {
         FetchTarget::Overlay { generation } => {
             if generation != app.overlay_generation {
@@ -4224,6 +4264,7 @@ async fn process_pending_fetches(app: &mut ChatApp) -> bool {
     }
     for (target, command) in requests {
         let result = fetch_command_data(
+            app.language,
             app.runtime.as_ref(),
             &app.adapters,
             &app.sandbox,
@@ -4285,8 +4326,10 @@ fn poll_dod_mark(app: &mut ChatApp) -> bool {
     let session_id = app.session_id.clone();
     let waker = app.dod_mark_waker.clone();
     let (tx, read) = tokio::sync::oneshot::channel();
+    let language = app.language;
     tokio::spawn(async move {
         let fetch = fetch_command_data(
+            language,
             Some(&runtime),
             &adapters,
             &sandbox,
@@ -4295,9 +4338,11 @@ fn poll_dod_mark(app: &mut ChatApp) -> bool {
         );
         let result = match tokio::time::timeout(DOD_MARK_READ_TIMEOUT, fetch).await {
             Ok(result) => result,
-            Err(_) => Err(format!(
-                "Zeitlimit überschritten ({} s).",
-                DOD_MARK_READ_TIMEOUT.as_secs()
+            Err(_) => Err(crate::i18n::tr_args_for(
+                language,
+                "dispatch.timeout",
+                "Time limit exceeded ({seconds} s).",
+                &[("seconds", &DOD_MARK_READ_TIMEOUT.as_secs().to_string())],
             )),
         };
         let _ = tx.send(result);
@@ -5471,7 +5516,8 @@ pub(crate) async fn run_loop(
                                             let caller_tier = runtime_commands::caller_tier(rt.principal());
                                             let export_output = if export_request_for_command(&raw).is_some() {
                                                 Some(
-                                                    command_data::execute_command_with_data(
+                                                    command_data::execute_command_with_data_for(
+                                                        app.language,
                                                         app.adapters(),
                                                         app.sandbox(),
                                                         app.session_id(),
@@ -5496,7 +5542,8 @@ pub(crate) async fn run_loop(
                                                     // (`!!` löst hier — anders als in
                                                     // `execute_command_as` — echt gegen
                                                     // `app.last_shell_command` auf).
-                                                    let outcome = dispatch_command_with_shell_result(
+                                                    let (outcome, slash_result) = crate::command_exec::dispatch_command_with_shell_result_for(
+                                                        app.language,
                                                         app.adapters(),
                                                         app.sandbox(),
                                                         app.session_id(),
@@ -5508,14 +5555,21 @@ pub(crate) async fn run_loop(
                                                         ),
                                                     )
                                                     .await;
+                                                    let data = match slash_result {
+                                                        Some(Ok(output)) => {
+                                                            app.refresh_changed_display_preference(&raw);
+                                                            output.data
+                                                        },
+                                                        _ => None,
+                                                    };
                                                     shell_result = outcome.shell;
-                                                    (outcome.text, None)
+                                                    (outcome.text, data)
                                                 }
                                             }
                                         }
                                         None => {
                                             tracing::error!("tui.command.no_runtime_assembly");
-                                            ("Fehler: keine Runtime-Montage".to_owned(), None)
+                                            (crate::i18n::tr_for(app.language, "dispatch.no_runtime", "Error: no runtime assembly").to_owned(), None)
                                         }
                                     }
                                 };
@@ -7212,6 +7266,10 @@ fn handle_agent_tree_key(app: &mut ChatApp, key: KeyEvent) {
 /// # Rückgabe
 /// `true` wenn ein Redraw angefordert werden soll, sonst `false`.
 fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
+    crate::i18n::with_language(app.language, || handle_key_scoped(app, key, bus))
+}
+
+fn handle_key_scoped(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
     // Runde 5, Teil L: Esc bricht eine wartende `/btw`-Nebenfrage ab.
     if app.btw_esc_cancels(&key) {
         return true;
@@ -9109,7 +9167,8 @@ async fn apply_approval_decision(
                     "/permissions allow {tool_name} {} --project",
                     quote_for_synthetic_command(rule)
                 );
-                let output = execute_command_as(
+                let output = crate::command_exec::execute_command_as_for(
+                    app.language,
                     app.adapters(),
                     app.sandbox(),
                     app.session_id(),
@@ -9153,7 +9212,8 @@ async fn apply_approval_decision(
                 }
                 if *scope == LearnScope::Project {
                     let command = offer.persist_command(quote_for_synthetic_command);
-                    let output = execute_command_as(
+                    let output = crate::command_exec::execute_command_as_for(
+                        app.language,
                         app.adapters(),
                         app.sandbox(),
                         app.session_id(),
@@ -9817,10 +9877,18 @@ fn apply_busy_job_done(app: &mut ChatApp, done: BusyJobDone) {
             command,
             text,
             succeeded,
+            data,
+            language,
         } => {
+            if succeeded {
+                app.refresh_changed_display_preference(&command.raw);
+            }
+            let _ = data; // Retained typed payload for operation-specific presentation.
             tracing::debug!(command = %command.raw, succeeded, "tui.busy.command_finished");
             // Runde 6, Teil C: Busy-Ergebnis auch in den Export.
-            app.push_lines_exported(busy_queue::command_result_lines(&command, &text, succeeded));
+            app.push_lines_exported(crate::i18n::with_language(language, || {
+                busy_queue::command_result_lines(&command, &text, succeeded)
+            }));
             app.queue_overlay_refresh();
             if is_workbench_command(&command.raw) {
                 app.workbench.mark_stale();
@@ -10029,6 +10097,10 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
 /// prüft und dann sofort beendet — derselbe Ausgang wie [`HarwEvent::Quit`]
 /// im Idle-Pfad.
 fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
+    crate::i18n::with_language(app.language, || handle_busy_event_scoped(app, event))
+}
+
+fn handle_busy_event_scoped(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
     // Abgelaufenen Beenden-Hinweis verwerfen — Pendant zur Ablaufprüfung im
     // Idle-Pfad von `run_loop`, hier für den Busy-Pfad (Welle 4c, Punkt 5).
     if let Some(arm) = app.pending_quit
@@ -10481,6 +10553,17 @@ fn draw_viewport(
 
 /// Renders the same viewport on a real terminal or a test backend.
 fn render_viewport(
+    frame: &mut ratatui::Frame<'_>,
+    app: &ChatApp,
+    spinner: &Spinner,
+    quit_hint: Option<&str>,
+) {
+    crate::i18n::with_language(app.language, || {
+        render_viewport_scoped(frame, app, spinner, quit_hint)
+    })
+}
+
+fn render_viewport_scoped(
     frame: &mut ratatui::Frame<'_>,
     app: &ChatApp,
     spinner: &Spinner,
@@ -15484,6 +15567,166 @@ forbidden = [{forbidden}]
         Ok(app)
     }
 
+    #[test]
+    fn settings_refresh_updates_consumers_without_changing_history_or_draft() -> TestResult {
+        let mut app = ops_chat_app()?.with_hidden_commands(vec!["model".to_owned()]);
+        app.push_line(Role::User, "Deutsch 日本語 नमस्ते /model".to_owned());
+        let original_history = history_plain(&app);
+        app.input.insert_str("/settings");
+        app.sync_command_popup();
+        let selected = app
+            .command_popup
+            .as_ref()
+            .and_then(CommandPopup::selected_name)
+            .map(str::to_owned);
+        let mut tui = harw_config::TuiSection::default();
+        tui.language = harw_config::UiLanguage::Japanese;
+        tui.theme = "light".to_owned();
+        tui.reasoning = ReasoningDisplayMode::Hidden;
+        tui.child_stream = harw_config::harness_config::ChildStreamModeToml::Off;
+        tui.status_expiry = harw_config::StatusExpiryMode::Hide;
+        app.apply_display_preferences(&tui);
+        assert_eq!(app.language, harw_config::UiLanguage::Japanese);
+        assert_eq!(app.theme, style::Theme::Light);
+        assert_eq!(app.reasoning_mode, ReasoningDisplayMode::Hidden);
+        assert_eq!(app.child_stream.mode().as_str(), "none");
+        assert_eq!(app.status_expiry, harw_config::StatusExpiryMode::Hide);
+        assert_eq!(app.input.submission_text(), "/settings");
+        assert_eq!(history_plain(&app), original_history);
+        assert!(app.command_registry.find("model").is_none());
+        assert_eq!(
+            app.command_registry
+                .find("settings")
+                .map(|spec| spec.summary.as_str()),
+            Some("設定")
+        );
+        assert_eq!(
+            app.command_popup
+                .as_ref()
+                .and_then(CommandPopup::selected_name),
+            selected.as_deref()
+        );
+        assert_eq!(crate::i18n::tr("settings.title", "Settings"), "Settings");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_changes_preserve_unrelated_session_stream_override() -> TestResult {
+        let mut fixture = crate::runtime_root::tests::runtime_backed_app()?;
+        let app = &mut fixture.app;
+        app.apply_child_stream_command("all");
+        for command in [
+            "/settings set tui.theme light",
+            "/settings: set 'tui.language' fr",
+        ] {
+            let language = app.language;
+            let output = crate::command_exec::dispatch_slash_command_for(
+                language,
+                app.runtime(),
+                app.adapters(),
+                app.sandbox(),
+                app.session_id(),
+                command,
+            )
+            .await
+            .map_err(ctx("settings mutation"))?;
+            apply_busy_job_done(
+                app,
+                BusyJobDone::Command {
+                    command: BusyCommand {
+                        raw: command.to_owned(),
+                        class: BusyAvailability::Immediate,
+                    },
+                    text: output.text,
+                    data: output.data,
+                    succeeded: true,
+                    language,
+                },
+            );
+            assert_eq!(app.child_stream.mode().as_str(), "all");
+        }
+        assert_eq!(app.language, harw_config::UiLanguage::French);
+        assert_eq!(app.theme, style::Theme::Light);
+        // A failed command must not reload even the named setting.
+        apply_busy_job_done(
+            app,
+            BusyJobDone::Command {
+                command: BusyCommand {
+                    raw: "/settings set tui.child_stream invalid".to_owned(),
+                    class: BusyAvailability::Immediate,
+                },
+                text: "Erreur".to_owned(),
+                data: None,
+                succeeded: false,
+                language: app.language,
+            },
+        );
+        assert_eq!(app.child_stream.mode().as_str(), "all");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_busy_failures_use_captured_locale_and_typed_success() -> TestResult {
+        let failing_app = |delay| -> TestResult<ChatApp> {
+            let mut operation = SlowOperation::new(delay);
+            operation.fail = true;
+            let adapters = CommandAdapter::from_operation(Arc::new(operation));
+            let mut app = ChatApp::new(adapters, test_sandbox()?, SessionId::new());
+            app.busy_jobs.enable_dispatch_without_runtime();
+            Ok(app)
+        };
+        let mut japanese = failing_app(Duration::from_millis(60))?;
+        let mut french = failing_app(Duration::from_millis(5))?;
+        japanese.language = harw_config::UiLanguage::Japanese;
+        french.language = harw_config::UiLanguage::French;
+        for app in [&mut japanese, &mut french] {
+            app.busy_jobs.queue(BusyCommand {
+                raw: "/slow".to_owned(),
+                class: BusyAvailability::Staged,
+            });
+            start_busy_work(app);
+        }
+        japanese.language = harw_config::UiLanguage::Hindi;
+        let (fr, ja) = tokio::join!(french.busy_jobs.recv(), japanese.busy_jobs.recv());
+        for (app, result, prefix) in [
+            (&mut french, fr, "Erreur :"),
+            (&mut japanese, ja, "エラー:"),
+        ] {
+            let done = result.ok_or(TestError::Missing("busy result"))?;
+            match &done {
+                BusyJobDone::Command {
+                    succeeded, text, ..
+                } => {
+                    assert!(!succeeded, "failure must remain typed");
+                    assert!(text.starts_with(prefix), "{text}");
+                }
+                _ => return Err(TestError::Missing("command result")),
+            }
+            apply_busy_job_done(app, done);
+            assert!(!history_plain(app).contains("gilt ab nächstem Turn"));
+        }
+        assert_eq!(crate::i18n::tr("settings.title", "Settings"), "Settings");
+        Ok(())
+    }
+
+    #[test]
+    fn settings_open_busy_and_delegation_preserves_fixed_model_rules() -> TestResult {
+        let fixture = crate::runtime_root::tests::runtime_backed_app()?;
+        let mut app = fixture
+            .app
+            .with_hidden_commands(vec!["model".to_owned(), "models".to_owned()]);
+        app.active_cancel = Some(CancelToken::new());
+        app.input.insert_str("/settings");
+        let enter = TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(handle_busy_event(&mut app, enter), BusyKeyOutcome::Local);
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+        assert!(matches!(
+            local_intercept_for(&app, "/model"),
+            Some(LocalIntercept::System(_))
+        ));
+        Ok(())
+    }
+
     /// Ein Picker-Accept während eines Turns (Effort-Auswahl) wird als
     /// `Staged` eingestuft, läuft sofort und merkt die Änderung nur im
     /// Controller vor — die Session selbst ändert sich erst an der
@@ -15547,6 +15790,7 @@ forbidden = [{forbidden}]
     struct SlowOperation {
         meta: harw_operations::OperationMeta,
         delay: Duration,
+        fail: bool,
     }
 
     impl SlowOperation {
@@ -15564,6 +15808,7 @@ forbidden = [{forbidden}]
                     ..harw_operations::OperationMeta::default()
                 },
                 delay,
+                fail: false,
             }
         }
     }
@@ -15580,6 +15825,11 @@ forbidden = [{forbidden}]
         ) -> harw_operations::OpFuture<'a> {
             Box::pin(async move {
                 tokio::time::sleep(self.delay).await;
+                if self.fail {
+                    return Err(harw_operations::OpError::Execution(
+                        "invalid test choice".to_owned(),
+                    ));
+                }
                 Ok(OpOutput::from("langsam fertig".to_owned()))
             })
         }
@@ -15650,7 +15900,7 @@ forbidden = [{forbidden}]
             .map_err(ctx("Busy-Ergebnis"))?
             .ok_or(TestError::Missing("Busy-Ergebnis"))?;
         apply_busy_job_done(&mut app, done);
-        assert!(history_plain(&app).contains("Zeitlimit überschritten"));
+        assert!(history_plain(&app).contains("Time limit exceeded"));
         Ok(())
     }
 

@@ -557,6 +557,25 @@ impl HelpOverlay {
 }
 
 impl OverlayView for HelpOverlay {
+    fn refresh_presentation(&mut self, registry: &CommandRegistry, keys: &KeyBindings) {
+        let selected = self
+            .commands
+            .get(self.selected)
+            .map(|entry| entry.name.clone());
+        let mut refreshed = Self::new(registry, keys, self.tab);
+        refreshed.selected = selected
+            .and_then(|name| {
+                refreshed
+                    .commands
+                    .iter()
+                    .position(|entry| entry.name == name)
+            })
+            .unwrap_or(0);
+        refreshed.keys_scroll = self.keys_scroll;
+        refreshed.prefixes_scroll = self.prefixes_scroll;
+        *self = refreshed;
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer, theme: Theme) {
         let header = Some(self.tab_bar(theme));
         match self.tab {

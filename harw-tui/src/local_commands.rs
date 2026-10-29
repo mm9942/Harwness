@@ -275,6 +275,11 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
     }
 
     match name {
+        "settings" if bare && ctx.tier >= PermissionTier::Operator => {
+            Some(LocalIntercept::OpenOverlay(Box::new(
+                crate::settings_view::SettingsView::new(ctx.hidden_commands),
+            )))
+        }
         "resume" if bare => Some(LocalIntercept::OpenSessionPicker),
         "agent" if bare => Some(LocalIntercept::OpenAgentTree),
         // Runde 5, Teil K: Hintergrund-Agenten — Liste und Abbruch, vor der
@@ -543,6 +548,20 @@ mod tests {
         fn run(&self, raw: &str) -> Option<LocalIntercept> {
             intercept(raw, &self.ctx())
         }
+    }
+
+    #[test]
+    fn settings_projection_requires_operator_and_preserves_explicit_dispatch() {
+        let fixture = Fixture::new(CommandRegistry::new(Vec::new()));
+        assert!(matches!(
+            fixture.run("/settings"),
+            Some(LocalIntercept::OpenOverlay(_))
+        ));
+        assert!(fixture.run("/settings show").is_none());
+        assert!(fixture.run("/settings set tui.language ja").is_none());
+        let mut observer = fixture.ctx();
+        observer.tier = PermissionTier::Observer;
+        assert!(intercept("/settings", &observer).is_none());
     }
 
     fn spec(name: &str) -> TestResult<CommandSpec> {

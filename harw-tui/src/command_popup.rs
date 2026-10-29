@@ -179,6 +179,31 @@ pub(crate) struct CommandPopup {
 const NAME_COLUMN_WIDTH: u16 = 22;
 
 impl CommandPopup {
+    /// Rebuild translated metadata while retaining query and selected identity.
+    pub(crate) fn refresh_catalog(&mut self, registry: &CommandRegistry) {
+        let selected = self.selected_name().map(str::to_owned);
+        let refreshed = match &self.mode {
+            PopupMode::CommandName => Some(Self::new(registry)),
+            PopupMode::Subcommand { command } => {
+                registry.find(command).and_then(Self::for_subcommands)
+            }
+        };
+        if let Some(mut refreshed) = refreshed {
+            refreshed.on_query_change(&self.query);
+            if let Some(selected) = selected {
+                if let Some(index) = refreshed
+                    .filtered
+                    .iter()
+                    .position(|index| refreshed.items[*index].name == selected)
+                {
+                    refreshed.selected = index;
+                }
+            }
+            refreshed.selection_moved = self.selection_moved;
+            *self = refreshed;
+        }
+    }
+
     /// Erstellt ein neues `CommandPopup` aus einer `CommandRegistry`.
     pub(crate) fn new(registry: &CommandRegistry) -> Self {
         // Die Runtime-Registry ist die einzige Command-Quelle. Neue

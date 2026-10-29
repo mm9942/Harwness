@@ -1134,6 +1134,7 @@ fn build_root_runtime(
             assembly.config_agents().executable_agents.values(),
         ),
     );
+    app.refresh_display_preferences();
     // Runde 5, Teil F: Plan-Fragekanal (`plan.exit`/`plan.enter`/`ask_user`,
     // nur TUI-Montage) und geteilter Plan-Zustand (Sperre, `/plan …`).
     app = app.with_plan_ui(
@@ -1719,6 +1720,45 @@ pub(crate) mod tests {
         assert_eq!(
             runtime.app.reasoning_mode(),
             harw_config::harness_config::ReasoningDisplayMode::Hidden
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_persist_and_reopen_in_the_active_profile() -> TestResult {
+        let fixture = fixture()?;
+        {
+            let (assembly, wiring) = tui_assembly(&fixture, None)?;
+            let mut runtime =
+                build_root_runtime(&assembly, wiring, None, false).map_err(ctx("root runtime"))?;
+            let result = crate::command_exec::dispatch_slash_command_for(
+                runtime.app.interface_language(),
+                Some(&assembly),
+                runtime.app.adapters(),
+                runtime.app.sandbox(),
+                runtime.app.session_id(),
+                "/settings set tui.language ja",
+            )
+            .await
+            .map_err(ctx("settings set"))?;
+            assert!(
+                result
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["language"] == "ja")
+            );
+            runtime.app.refresh_display_preferences();
+            assert_eq!(
+                runtime.app.interface_language(),
+                harw_config::UiLanguage::Japanese
+            );
+        }
+        let (assembly, wiring) = tui_assembly(&fixture, None)?;
+        let runtime =
+            build_root_runtime(&assembly, wiring, None, false).map_err(ctx("reopen runtime"))?;
+        assert_eq!(
+            runtime.app.interface_language(),
+            harw_config::UiLanguage::Japanese
         );
         Ok(())
     }

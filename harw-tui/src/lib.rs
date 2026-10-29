@@ -22,6 +22,7 @@ pub(crate) mod chat_scroll;
 mod live_ranker;
 mod recency;
 mod recency_view;
+mod settings_view;
 // h22: read-only StepList-Ansicht für das Explorer-Fenster.
 pub(crate) mod step_list_view;
 // Runde 5, Teil I: Live-Stream der Kind-Agenten im Verlauf.
