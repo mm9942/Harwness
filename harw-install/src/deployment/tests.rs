@@ -706,6 +706,168 @@ fn test_probes_and_sentinel_agree_on_the_sentinel_socket() -> TestResult {
 }
 
 #[test]
+fn test_sentinel_unit_wires_config_and_both_exports_into_the_export_dir() -> TestResult {
+    // PL-97 D1: explicit config, findings export and health export, all
+    // without any capability (the unit stays in the unprivileged class).
+    let sentinel = parsed(embedded_unit("harw-sentinel.service")?);
+    let exec = sentinel
+        .last_value("Service", "ExecStart")
+        .ok_or(TestError::Missing("sentinel ExecStart"))?;
+    assert_eq!(
+        exec_flag(exec, "--config"),
+        Some("/etc/harw-dod/config.toml")
+    );
+    let findings = exec_flag(exec, "--findings-export")
+        .ok_or(TestError::Missing("sentinel --findings-export"))?;
+    let health =
+        exec_flag(exec, "--health-export").ok_or(TestError::Missing("sentinel --health-export"))?;
+    assert_eq!(findings, "/var/lib/harw-dod/export/findings.jsonl");
+    assert_eq!(health, "/var/lib/harw-dod/export/health.json");
+
+    // The export directory lies below a ReadWritePaths= entry.
+    let writable: Vec<String> = words(&sentinel.values("Service", "ReadWritePaths"));
+    for path in [findings, health] {
+        assert!(
+            writable
+                .iter()
+                .map(|p| p.trim_start_matches(['-', '+']))
+                .any(|root| path.starts_with(&format!("{root}/"))),
+            "{path} is not below any ReadWritePaths= entry: {writable:?}"
+        );
+    }
+    for key in ["CapabilityBoundingSet", "AmbientCapabilities"] {
+        assert!(
+            sentinel
+                .last_value("Service", key)
+                .is_some_and(|v| capability_set(v).is_empty()),
+            "harw-sentinel.service: {key}= must stay present and empty"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_tmpfiles_creates_the_export_dir_for_harw_dod_readers() -> TestResult {
+    let tmpfiles = asset("deploy/tmpfiles.d/harw.conf").ok_or(TestError::Missing("tmpfiles"))?;
+    let rendered_tmpfiles = rendered(tmpfiles);
+    let lines: BTreeMap<String, Vec<String>> = rendered_tmpfiles
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
+        .filter_map(|fields| fields.get(1).cloned().map(|path| (path, fields)))
+        .collect();
+    let export = lines
+        .get("/var/lib/harw-dod/export")
+        .ok_or(TestError::Missing(
+            "tmpfiles line for /var/lib/harw-dod/export",
+        ))?;
+    assert_eq!(
+        export,
+        &[
+            "d",
+            "/var/lib/harw-dod/export",
+            "2750",
+            "harw-sentinel",
+            "harw-dod-readers",
+            "-"
+        ],
+        "export dir: setgid, sentinel-owned, readable by harw-dod-readers only"
+    );
+    let state = lines
+        .get("/var/lib/harw-dod")
+        .ok_or(TestError::Missing("tmpfiles line for /var/lib/harw-dod"))?;
+    assert_eq!(
+        state,
+        &[
+            "d",
+            "/var/lib/harw-dod",
+            "0710",
+            "harw-sentinel",
+            "harw-dod-readers",
+            "-"
+        ],
+        "state dir: harw-dod-readers may traverse to export/, never list"
+    );
+    // No age column on either: the findings export is security evidence.
+    for path in ["/var/lib/harw-dod", "/var/lib/harw-dod/export"] {
+        assert_eq!(
+            lines
+                .get(path)
+                .and_then(|fields| fields.get(5))
+                .map(String::as_str),
+            Some("-"),
+            "{path}: no age-based cleanup"
+        );
+    }
+    let (_, groups) = sysusers_declarations()?;
+    assert!(
+        groups.contains("harw-dod-readers"),
+        "sysusers.d must declare harw-dod-readers"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_harw_dod_readers_has_no_default_members() -> TestResult {
+    let sysusers = asset("deploy/sysusers.d/harw.conf").ok_or(TestError::Missing("sysusers"))?;
+    for line in sysusers.contents.lines().map(str::trim) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert!(
+            !(fields.first() == Some(&"m") && fields.get(2) == Some(&"harw-dod-readers")),
+            "harw-dod-readers must be empty by default, found: {line}"
+        );
+    }
+    Ok(())
+}
+
+/// `docs/setup/dod.md` ("Letting `harw-security-hub` read the findings")
+/// documents that the shipped hub unit does **not** read the sentinel
+/// exports: `harw-dod-readers` stays memberless by default and the hub gets
+/// it only through an operator drop-in. If the unit ever grants the group,
+/// this test fails so that section is rewritten together with the unit.
+#[test]
+fn test_security_hub_unit_is_not_granted_harw_dod_readers_by_default() -> TestResult {
+    let unit = parsed(embedded_unit("harw-security-hub.service")?);
+    assert_eq!(
+        unit.last_value("Service", "User"),
+        Some("harw-security-hub")
+    );
+    assert_eq!(unit.last_value("Service", "Group"), Some("harw-security"));
+    for value in unit.values("Service", "SupplementaryGroups") {
+        assert!(
+            !value
+                .split_whitespace()
+                .any(|group| group == "harw-dod-readers"),
+            "SupplementaryGroups={value} grants harw-dod-readers; update docs/setup/dod.md"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_dod_units_use_the_harw_dod_suite_name() -> TestResult {
+    for name in [
+        "harw-dod.target",
+        "harw-sentinel.service",
+        "harw-probe-bpf.service",
+        "harw-probe-fs.service",
+        "harw-warden.service",
+        "harw-warden.socket",
+    ] {
+        let unit = parsed(embedded_unit(name)?);
+        let description = unit
+            .last_value("Unit", "Description")
+            .ok_or(TestError::Missing("Description="))?;
+        assert!(
+            description.starts_with("Harw-DoD "),
+            "{name}: Description={description} must name the Harw-DoD suite"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_dod_target_pulls_in_observation_only() -> TestResult {
     let target = parsed(embedded_unit("harw-dod.target")?);
     let wants = words(&target.values("Unit", "Wants"));

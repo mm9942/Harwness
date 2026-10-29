@@ -1,5 +1,7 @@
-# DoD system installation
+# Harw-DoD system installation
 
+Harw-DoD (Detect · Orient · Defend) is the suite name; crates, binaries,
+paths, groups and unit files keep their `harw-dod`/`harw-*` names.
 See [`docs/setup/dod.md`](../docs/setup/dod.md) for a full walkthrough
 (purpose, components, privilege model, and step-by-step installation). This
 file documents the packaging Makefile itself.
@@ -16,6 +18,8 @@ one system identity per binary (`harw-sentinel`, `harw-probe-fs`,
 * eBPF objects and manifest: `/usr/local/lib/harw-dod/bpf`
 * configuration: `/etc/harw-dod`
 * state and telemetry: `/var/lib/harw-dod`, `/var/log/harw-dod`
+* sentinel exports for harw: `/var/lib/harw-dod/export` (`findings.jsonl`,
+  `health.json`; `2750 harw-sentinel:harw-dod-readers`)
 * runtime sockets: `/run/harw/sentinel.sock`, `/run/harw/warden.sock`
 
 The systemd units, the `sysusers.d` accounts and the `tmpfiles.d`
@@ -33,8 +37,12 @@ root and calls only the already-installed `systemd-sysusers`,
 `systemd-tmpfiles`, and `systemctl daemon-reload` helpers; it never invokes
 Cargo or installs prerequisites. The sentinel and the eBPF probe receive
 read-only membership in the dedicated `harw-dod-config` group; the separate
-`harw-ipc` group is reserved for the sentinel socket path, and
-`harw-warden-clients` (empty by default) for the Warden socket.
+`harw-ipc` group is reserved for the sentinel socket path,
+`harw-warden-clients` (empty by default) for the Warden socket, and
+`harw-dod-readers` (empty by default) for reading the sentinel exports — add
+a user with `usermod -aG harw-dod-readers <user>`. `harw-security-hub` is not
+a member either; it reads `findings.jsonl` only after the drop-in described
+in `docs/setup/dod.md` ("Letting `harw-security-hub` read the findings").
 
 Before enabling observation, copy the example to `/etc/harw-dod/config.toml`
 and add exactly one `active_profile`. `make -C dod enable` runs the explicit
@@ -49,13 +57,16 @@ either unit.
 
 ## Current binary integration boundary
 
-The units in `../deploy/systemd/` use the CLI the binaries have today:
-`harw-sentinel --home <STATEDIR> --socket /run/harw/sentinel.sock` (it reads
-`/etc/harw-dod/config.toml` by default) and `harw-probe-bpf --config`. The
-planned system contract (`harw-sentinel --config --state-dir --telemetry-dir
---runtime-dir`) does not exist yet; packaging does not silently substitute a
-personal home path. Until that integration lands, the units are an
-installable contract, not a claim of live service readiness.
+The units in `../deploy/systemd/` pass the configuration explicitly:
+`harw-sentinel --config /etc/harw-dod/config.toml --home <STATEDIR> --socket
+/run/harw/sentinel.sock --findings-export <STATEDIR>/export/findings.jsonl
+--health-export <STATEDIR>/export/health.json` and `harw-probe-bpf --config
+/etc/harw-dod/config.toml`. With `--config`, a missing, untrusted or invalid
+configuration is fail closed for both binaries, so enable only after
+`/etc/harw-dod/config.toml` exists with an `active_profile` (`make -C dod
+enable` checks this first). There are no separate `--state-dir
+--telemetry-dir --runtime-dir` flags; `--home` is the sentinel's state
+directory, and packaging never substitutes a personal home path.
 
 The BPF artefacts are build outputs and are never checked in: `make build-bpf`
 compiles `bpf/src/*.bpf.c` with the pinned toolchain and writes

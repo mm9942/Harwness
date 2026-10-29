@@ -14,7 +14,7 @@
 # the sentinel socket FIRST and only then restricts itself.
 
 [Unit]
-Description=HARW DoD fanotify probe (push-only)
+Description=Harw-DoD fanotify probe (push-only)
 Documentation=man:harw-probe-fs(1)
 PartOf=harw-dod.target
 After=harw-sentinel.service

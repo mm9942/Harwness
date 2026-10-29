@@ -15,6 +15,18 @@
 //! {"finding_id":"…","host":"host-a","rule_id":"structure-drift","severity":"medium","summary":"…","observed_at":"2026-09-27T10:00:00Z"}
 //! ```
 //!
+//! ## Schema version 2 (additive, PL-97 D1)
+//! Every line written by this binary now also carries
+//! `"schema_version": 2` ([`EXPORT_SCHEMA_VERSION`]) and, when the finding
+//! can be attributed to a cgroup, an optional `"scope"` (the absolute cgroup
+//! path, see [`sanitize_scope`]). Both fields are additive: a line without
+//! `schema_version` is a version-1 line with exactly the six fields above,
+//! and every known reader (`harw-security-hub`'s `DodFinding`, harw's
+//! `security_signals` context source) ignores unknown fields, so v1 and v2
+//! lines parse alike. Today no finding carries a cgroup attribution yet
+//! (`Finding<RuleChecked>` has no actor; the id-to-path resolver is PL-97
+//! E4), so `scope` is omitted from every line until that lands.
+//!
 //! Die Feldtypen sind dieselben, die der Hub deserialisiert:
 //! [`harw_types::FindingId`], [`harw_types::HostId`],
 //! [`harw_types::ImpactSeverity`] (snake_case) und `jiff::Timestamp`.
@@ -22,7 +34,8 @@
 //! `ImpactSeverity` abgebildet — keine String-Umwandlung dazwischen.
 //!
 //! # Keine Geheimnisse, bereinigter Freitext
-//! Exportiert werden ausschließlich die sechs Felder oben — kein Beleg,
+//! Exportiert werden ausschließlich die sechs Felder oben (plus
+//! `schema_version` und das optionale `scope`) — kein Beleg,
 //! keine Rohereignisse, keine Konfiguration. Der einzige Freitext,
 //! `summary`, wird von [`sanitize_summary`] bereinigt (Steuerzeichen und
 //! bidirektionale Formatzeichen durch Leerzeichen ersetzt) und auf
@@ -76,6 +89,18 @@ pub const EXPORT_FILE_MODE: u32 = 0o640;
 /// Kernel-Hostname, Vorgabe für das `host`-Feld ohne `--findings-host`.
 pub const HOSTNAME_PATH: &str = "/proc/sys/kernel/hostname";
 
+/// Schema version written into every export line (`schema_version`).
+///
+/// Version 1 is the original six-field line without this field; version 2
+/// adds `schema_version` itself and the optional `scope`. Both changes are
+/// additive (see the module documentation).
+pub const EXPORT_SCHEMA_VERSION: u32 = 2;
+
+/// Longest exported `scope` (cgroup path) in bytes; a longer value is
+/// omitted rather than truncated, because a cut path would name a
+/// different cgroup.
+pub const MAX_SCOPE_BYTES: usize = 4096;
+
 harw_macros::metrics! {
     /// Wie oft eine Befundzeile seit Prozessstart nicht in die
     /// JSON-Lines-Exportdatei geschrieben werden konnte (Öffnen, Rotation,
@@ -84,16 +109,20 @@ harw_macros::metrics! {
         name = "harw_sentinel_findings_export_failure_total";
 }
 
-/// Eine Exportzeile — Feldnamen und -typen spiegeln exakt
-/// `harw_security_hub::findings::DodFinding`.
+/// Eine Exportzeile — die ersten sechs Feldnamen und -typen spiegeln exakt
+/// `harw_security_hub::findings::DodFinding`; `schema_version` und `scope`
+/// sind die additiven Felder von Version 2 (siehe Moduldoku).
 #[derive(Debug, Serialize)]
 struct ExportLine<'a> {
+    schema_version: u32,
     finding_id: &'a FindingId,
     host: &'a HostId,
     rule_id: &'a str,
     severity: ImpactSeverity,
     summary: String,
     observed_at: Timestamp,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a str>,
 }
 
 /// Bildet die DoD-Schwere erschöpfend auf die hub-seitige Skala ab.
@@ -145,7 +174,27 @@ pub fn sanitize_summary(raw: &str) -> String {
     out
 }
 
+/// Validates an optional `scope` (cgroup path) for the export.
+///
+/// # Description
+/// Returns the value unchanged when it is non-empty, absolute, at most
+/// [`MAX_SCOPE_BYTES`] bytes long and free of the characters rejected by
+/// [`is_unsafe_char`]. Anything else yields `None`: the line is then written
+/// without `scope` instead of carrying a rewritten or truncated path that
+/// would name a different cgroup.
+#[must_use]
+pub fn sanitize_scope(raw: Option<&str>) -> Option<&str> {
+    let scope = raw?;
+    let acceptable = scope.starts_with('/')
+        && scope.len() <= MAX_SCOPE_BYTES
+        && !scope.chars().any(is_unsafe_char);
+    acceptable.then_some(scope)
+}
+
 /// Kodiert eine Exportzeile inklusive abschließendem `\n`.
+///
+/// `scope` is the optional cgroup attribution of version 2; it passes
+/// through [`sanitize_scope`] and is omitted when absent or unacceptable.
 ///
 /// # Errors
 /// `serde_json::Error`, falls die Serialisierung scheitert (für diese
@@ -157,14 +206,17 @@ pub fn encode_line(
     severity: Severity,
     summary: &str,
     observed_at: Timestamp,
+    scope: Option<&str>,
 ) -> Result<String, serde_json::Error> {
     let line = ExportLine {
+        schema_version: EXPORT_SCHEMA_VERSION,
         finding_id,
         host,
         rule_id,
         severity: impact_severity(severity),
         summary: sanitize_summary(summary),
         observed_at,
+        scope: sanitize_scope(scope),
     };
     let mut encoded = serde_json::to_string(&line)?;
     encoded.push('\n');
@@ -341,6 +393,8 @@ impl FindingsExporter {
     /// `true`, wenn die Zeile geschrieben wurde; `false` nach einem
     /// gezählten und geloggten Fehler.
     pub fn export(&mut self, sink: &dyn TelemetrySink, finding: &Finding<RuleChecked>) -> bool {
+        // `Finding<RuleChecked>` trägt (noch) keine cgroup-Zuordnung; `scope`
+        // bleibt deshalb leer, bis PL-97 E4 den id→Pfad-Auflöser liefert.
         self.export_fields(
             sink,
             finding.id(),
@@ -348,10 +402,14 @@ impl FindingsExporter {
             finding.severity(),
             finding.summary(),
             finding.observed_at(),
+            None,
         )
     }
 
     /// Wie [`Self::export`], aus Einzelfeldern — der eigentliche Schreibweg.
+    ///
+    /// `scope` is the optional cgroup attribution (schema version 2).
+    #[allow(clippy::too_many_arguments)]
     pub fn export_fields(
         &mut self,
         sink: &dyn TelemetrySink,
@@ -360,6 +418,7 @@ impl FindingsExporter {
         severity: Severity,
         summary: &str,
         observed_at: Timestamp,
+        scope: Option<&str>,
     ) -> bool {
         let line = match encode_line(
             finding_id,
@@ -368,6 +427,7 @@ impl FindingsExporter {
             severity,
             summary,
             observed_at,
+            scope,
         ) {
             Ok(line) => line,
             Err(error) => {
@@ -467,10 +527,11 @@ mod tests {
     use serde::Deserialize;
 
     /// Spiegel von `harw_security_hub::findings::DodFinding` — derselbe
-    /// Feldsatz, dieselben Typen. `deny_unknown_fields` macht den Test
-    /// strenger als den Hub: der Export darf **genau** diese Felder tragen.
+    /// Feldsatz, dieselben Typen, und wie dort **ohne**
+    /// `deny_unknown_fields`: der Hub ignoriert die additiven Felder von
+    /// Version 2. Nur lokaler Rauchtest; verbindlich sind die Tests der
+    /// echten Leser gegen [`V2_FIXTURE_LINE`].
     #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
     struct HubDodFinding {
         finding_id: FindingId,
         host: HostId,
@@ -479,6 +540,50 @@ mod tests {
         summary: String,
         observed_at: Timestamp,
     }
+
+    /// Spiegel der Zeile, die `harw-runtime/src/security_signals.rs`
+    /// (`Line`) liest — drei Strings, unbekannte Felder werden ignoriert.
+    #[derive(Debug, Deserialize)]
+    struct SecuritySignalsLine {
+        rule_id: String,
+        severity: String,
+        observed_at: String,
+    }
+
+    /// Strenger Spiegel einer Version-2-Zeile: `deny_unknown_fields`, damit
+    /// der Export **genau** diese Felder trägt und keines mehr.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ExportLineV2 {
+        #[serde(default = "schema_v1")]
+        schema_version: u32,
+        finding_id: FindingId,
+        host: HostId,
+        rule_id: String,
+        severity: ImpactSeverity,
+        summary: String,
+        observed_at: Timestamp,
+        #[serde(default)]
+        scope: Option<String>,
+    }
+
+    /// A line without `schema_version` is a version-1 line.
+    const fn schema_v1() -> u32 {
+        1
+    }
+
+    /// Eine Version-1-Zeile, wie sie vor PL-97 D1 geschrieben wurde.
+    const V1_LINE: &str = r#"{"finding_id":"f-1","host":"host-a","rule_id":"structure-drift","severity":"high","summary":"s","observed_at":"2026-09-27T10:00:00Z"}"#;
+
+    /// Canonical version-2 fixture line: byte-for-byte what [`encode_line`]
+    /// writes for this finding (pinned by
+    /// `test_v2_fixture_line_is_byte_identical_to_encode_line`). The
+    /// reader-side tests in `harw-security-hub` (`findings::DodFinding`,
+    /// tail reader) and `harw-runtime` (`security_signals::count_recent`)
+    /// copy exactly this line, so a change to the encoder or to a reader
+    /// (`deny_unknown_fields`, a new required field) breaks a test on the
+    /// side that changed.
+    const V2_FIXTURE_LINE: &str = r#"{"schema_version":2,"finding_id":"f-1","host":"host-a","rule_id":"structure-drift","severity":"high","summary":"s","observed_at":"2026-09-27T10:00:00Z","scope":"/sys/fs/cgroup/harw.slice"}"#;
 
     fn host() -> TestResult<HostId> {
         HostId::try_from_str("host-a").map_err(ctx("host id"))
@@ -503,6 +608,7 @@ mod tests {
             Severity::High,
             "new workspace member",
             observed_at,
+            None,
         )
         .map_err(ctx("encode"))?;
 
@@ -522,6 +628,121 @@ mod tests {
             serde_json::from_str(line.trim_end()).map_err(ctx("raw parse"))?;
         assert_eq!(value["severity"], "high", "snake_case severity names");
         assert_eq!(value["observed_at"], "2026-09-27T10:00:00Z");
+        Ok(())
+    }
+
+    #[test]
+    fn test_encoded_line_is_schema_version_2_without_scope_by_default() -> TestResult {
+        let line = encode_line(
+            &finding_id()?,
+            &host()?,
+            "structure-drift",
+            Severity::High,
+            "s",
+            Timestamp::UNIX_EPOCH,
+            None,
+        )
+        .map_err(ctx("encode"))?;
+        let strict: ExportLineV2 =
+            serde_json::from_str(line.trim_end()).map_err(ctx("strict v2 parse"))?;
+        assert_eq!(strict.schema_version, EXPORT_SCHEMA_VERSION);
+        assert_eq!(strict.schema_version, 2);
+        assert_eq!(strict.scope, None);
+        let value: serde_json::Value =
+            serde_json::from_str(line.trim_end()).map_err(ctx("raw parse"))?;
+        assert!(value.get("scope").is_none(), "absent scope is omitted");
+        Ok(())
+    }
+
+    #[test]
+    fn test_encoded_line_carries_an_acceptable_scope() -> TestResult {
+        let line = encode_line(
+            &finding_id()?,
+            &host()?,
+            "egress-flow",
+            Severity::Critical,
+            "s",
+            Timestamp::UNIX_EPOCH,
+            Some("/sys/fs/cgroup/harw.slice/harw-job-1"),
+        )
+        .map_err(ctx("encode"))?;
+        let strict: ExportLineV2 =
+            serde_json::from_str(line.trim_end()).map_err(ctx("strict v2 parse"))?;
+        assert_eq!(
+            strict.scope.as_deref(),
+            Some("/sys/fs/cgroup/harw.slice/harw-job-1")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_sanitize_scope_omits_instead_of_rewriting() {
+        assert_eq!(sanitize_scope(None), None);
+        assert_eq!(sanitize_scope(Some("")), None);
+        assert_eq!(sanitize_scope(Some("relative/cgroup")), None);
+        assert_eq!(sanitize_scope(Some("/a\nb")), None);
+        assert_eq!(sanitize_scope(Some("/a\u{202E}b")), None);
+        let long = format!("/{}", "x".repeat(MAX_SCOPE_BYTES));
+        assert_eq!(sanitize_scope(Some(&long)), None);
+        assert_eq!(sanitize_scope(Some("/harw.slice")), Some("/harw.slice"));
+    }
+
+    #[test]
+    fn test_v1_and_v2_lines_parse_for_every_known_reader() -> TestResult {
+        let v2 = encode_line(
+            &finding_id()?,
+            &host()?,
+            "structure-drift",
+            Severity::High,
+            "s",
+            "2026-09-27T10:00:00Z".parse().map_err(ctx("timestamp"))?,
+            Some("/sys/fs/cgroup/harw.slice"),
+        )
+        .map_err(ctx("encode"))?;
+        for raw in [V1_LINE, v2.trim_end()] {
+            let hub: HubDodFinding = serde_json::from_str(raw).map_err(ctx("hub reader"))?;
+            assert_eq!(hub.rule_id, "structure-drift");
+            assert_eq!(hub.severity, ImpactSeverity::High);
+            let signals: SecuritySignalsLine =
+                serde_json::from_str(raw).map_err(ctx("security_signals reader"))?;
+            assert_eq!(signals.rule_id, "structure-drift");
+            assert_eq!(signals.severity, "high");
+            assert_eq!(signals.observed_at, "2026-09-27T10:00:00Z");
+        }
+        let v1: ExportLineV2 = serde_json::from_str(V1_LINE).map_err(ctx("v1 via v2 shape"))?;
+        assert_eq!(v1.schema_version, 1, "missing schema_version means v1");
+        assert_eq!(v1.scope, None);
+        assert_eq!(v1.finding_id.as_str(), "f-1");
+        assert_eq!(v1.host.as_str(), "host-a");
+        assert_eq!(v1.rule_id, "structure-drift");
+        assert_eq!(v1.severity, ImpactSeverity::High);
+        assert_eq!(v1.summary, "s");
+        assert_eq!(
+            v1.observed_at,
+            "2026-09-27T10:00:00Z"
+                .parse::<Timestamp>()
+                .map_err(ctx("timestamp"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_v2_fixture_line_is_byte_identical_to_encode_line() -> TestResult {
+        let encoded = encode_line(
+            &finding_id()?,
+            &host()?,
+            "structure-drift",
+            Severity::High,
+            "s",
+            "2026-09-27T10:00:00Z".parse().map_err(ctx("timestamp"))?,
+            Some("/sys/fs/cgroup/harw.slice"),
+        )
+        .map_err(ctx("encode"))?;
+        assert_eq!(encoded, format!("{V2_FIXTURE_LINE}\n"));
+        let strict: ExportLineV2 =
+            serde_json::from_str(V2_FIXTURE_LINE).map_err(ctx("strict v2 parse"))?;
+        assert_eq!(strict.schema_version, EXPORT_SCHEMA_VERSION);
+        assert_eq!(strict.scope.as_deref(), Some("/sys/fs/cgroup/harw.slice"));
         Ok(())
     }
 
@@ -569,6 +790,7 @@ mod tests {
             Severity::Low,
             &format!("evil\n{{\"injected\":1}}{}", "y".repeat(4096)),
             Timestamp::UNIX_EPOCH,
+            None,
         )
         .map_err(ctx("encode"))?;
         assert_eq!(line.matches('\n').count(), 1, "no line injection");
@@ -593,6 +815,7 @@ mod tests {
                 Severity::Medium,
                 "summary",
                 Timestamp::UNIX_EPOCH,
+                None,
             );
             assert!(ok);
         }
@@ -655,6 +878,7 @@ mod tests {
             Severity::Info,
             "s",
             Timestamp::UNIX_EPOCH,
+            None,
         )
         .map_err(ctx("encode"))?
         .len();
@@ -670,6 +894,7 @@ mod tests {
                 Severity::Info,
                 "s",
                 Timestamp::UNIX_EPOCH,
+                None,
             );
             assert!(ok);
         }
@@ -694,6 +919,7 @@ mod tests {
             Severity::Info,
             "s",
             Timestamp::UNIX_EPOCH,
+            None,
         )
         .map_err(ctx("encode"))?
         .len();
@@ -709,6 +935,7 @@ mod tests {
                 Severity::Info,
                 "s",
                 Timestamp::UNIX_EPOCH,
+                None,
             ));
         }
         for generation in 1..=3 {
@@ -751,6 +978,7 @@ mod tests {
             Severity::High,
             "s",
             Timestamp::UNIX_EPOCH,
+            None,
         );
         assert!(!ok);
         assert_eq!(exporter.failures(), 2, "prepare + export both counted");

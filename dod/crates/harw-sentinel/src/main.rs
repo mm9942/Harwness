@@ -179,11 +179,13 @@
 //! gemeinsamen DoD-Vertrag aus [`harw_dod_config`] — denselben, den auch die
 //! BPF-Sonde liest ([`load_dod_settings`]):
 //!
-//! - **Quelle.** Ein expliziter administrativer Pfad geht über
-//!   [`harw_dod_config::load_config`]; ohne ihn gilt ausschließlich der feste
-//!   Pfad [`harw_dod_config::SYSTEM_CONFIG_PATH`] über
-//!   [`harw_dod_config::load_system_config`]. Die Kommandozeile trägt heute
-//!   noch kein `--config`-Flag — [`main`] übergibt deshalb stets `None`.
+//! - **Quelle.** Ein expliziter administrativer Pfad (`--config <PATH>`)
+//!   geht über [`harw_dod_config::load_config`]; ohne ihn gilt
+//!   ausschließlich der feste Pfad [`harw_dod_config::SYSTEM_CONFIG_PATH`]
+//!   über [`harw_dod_config::load_system_config`]. Die ausgelieferte Unit
+//!   (`deploy/systemd/harw-sentinel.service`) übergibt
+//!   `--config /etc/harw-dod/config.toml` ausdrücklich — dort ist eine
+//!   fehlende Datei deshalb fail closed, wie bei `harw-probe-bpf`.
 //! - **Fehlt die Systemkonfiguration** (`ENOENT` auf irgendeinem Pfadglied),
 //!   startet dieser Prozess mit den eingebauten Vorgaben und meldet das per
 //!   `tracing::warn!` deutlich — dieses Binary ist unprivilegiert und seine
@@ -217,6 +219,18 @@
 //!   lassen — selbst wenn eine Runde sich um bis zu einen vollen Abstand
 //!   verspätet.
 //!
+//! # Exports for harw (PL-97 D1)
+//! Two optional, unprivileged outputs leave this process: the append-only
+//! findings export (`--findings-export`, module [`export`], schema version
+//! 2) and the health document (`--health-export`, module
+//! [`health_export`]), which defaults to the sibling `health.json` of the
+//! findings export and is replaced atomically at the end of every
+//! [`poll_once`] cycle. Both directories are added as read-write Landlock
+//! roots before [`sandbox::restrict_self`]; neither needs a capability.
+//! Without both flags nothing is written and the cycle is unchanged (the
+//! health snapshots around `poll_all` are only taken when the health export
+//! is enabled).
+//!
 //! # Fehler
 //! [`error::SentinelBinError`] — ausschließlich die beiden Startpfade ohne
 //! Degradationsoption: Root-Space-Auflösung und Öffnen des
@@ -231,6 +245,8 @@
 //! ```text
 //! $ harw-sentinel --log info --home /var/lib/harwness --interval-secs 5
 //! $ harw-sentinel --once --home /var/lib/harwness
+//! $ harw-sentinel --config /etc/harw-dod/config.toml --home /var/lib/harw-dod \
+//!     --findings-export /var/lib/harw-dod/export/findings.jsonl
 //! ```
 
 #![forbid(unsafe_code)]
@@ -239,6 +255,7 @@ mod cli;
 mod error;
 mod export;
 mod findings;
+mod health_export;
 mod sandbox;
 mod sensors;
 
@@ -719,6 +736,9 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
     // damit ein Konfigurationsfehler sofort im Log steht; das Verzeichnis
     // bleibt danach für Rotation/Neuanlage beschreibbar (Regel unten).
     let mut exporter = build_findings_exporter(&cli, sink.as_ref());
+    // Optionaler Gesundheitsexport (`--health-export`, Vorgabe: `health.json`
+    // neben dem Befundexport); sein Verzeichnis braucht dieselbe Regel.
+    let mut health = build_health_exporter(&cli, &settings);
 
     let mut roots = sandbox::default_roots(
         &cli.proc_root,
@@ -734,6 +754,18 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         .and_then(export::FindingsExporter::directory)
     {
         roots.push(sandbox::SandboxRoot::read_write(dir.to_path_buf()));
+    }
+    if let Some(dir) = health
+        .as_ref()
+        .and_then(health_export::HealthExporter::directory)
+    {
+        let same_dir = exporter
+            .as_ref()
+            .and_then(export::FindingsExporter::directory)
+            == Some(dir);
+        if !same_dir {
+            roots.push(sandbox::SandboxRoot::read_write(dir.to_path_buf()));
+        }
     }
     let outcome = sandbox::restrict_self(&roots);
     // `Sentinel` existiert an dieser Stelle noch nicht (siehe unten) — ein
@@ -790,6 +822,7 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
             inbox.as_ref(),
             sink.as_ref(),
             exporter.as_mut(),
+            health.as_mut(),
         );
         return Ok(());
     }
@@ -800,6 +833,7 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
             inbox.as_ref(),
             sink.as_ref(),
             exporter.as_mut(),
+            health.as_mut(),
         );
         std::thread::sleep(timing.interval());
     }
@@ -835,13 +869,21 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
 ///   (siehe [`findings`]-Moduldoku).
 /// - `exporter` (`Option<&mut export::FindingsExporter>`): der optionale
 ///   JSON-Lines-Befundexport (`--findings-export`); `None` exportiert nichts.
+/// - `health` (`Option<&mut health_export::HealthExporter>`): the optional
+///   health document (`--health-export`); rewritten at the end of the cycle
+///   from health snapshots taken around `poll_all`. `None` writes nothing
+///   and takes no snapshot.
 fn poll_once(
     sentinel: &mut Sentinel,
     inbox: Option<&IpcInboxHandle>,
     sink: &dyn TelemetrySink,
     exporter: Option<&mut export::FindingsExporter>,
+    health: Option<&mut health_export::HealthExporter>,
 ) {
     let now = Timestamp::now();
+    // Nur mit Gesundheitsexport: Zustand je Sensor vor dem Abruf festhalten,
+    // damit `SensorTracker` Erfolg/Fehlschlag dieses Zyklus ableiten kann.
+    let before = health.as_ref().map(|_| sentinel.health_snapshot());
     let reading = sentinel.poll_all(now);
     tracing::debug!(
         samples = reading.samples.len(),
@@ -872,6 +914,76 @@ fn poll_once(
             tracing::warn!(error = %error, "failed to freeze buffer into evidence this round");
         }
     }
+
+    if let (Some(health), Some(before)) = (health, before) {
+        let after = sentinel.health_snapshot();
+        health.record_cycle(sink, &before, &after, ipc_counters(inbox), now);
+    }
+}
+
+/// Builds the optional health export from `--health-export` (or its
+/// default next to `--findings-export`, see [`Cli::resolved_health_export`]).
+///
+/// # Description
+/// `None` when neither flag is set. A path that equals the findings export
+/// path is refused with a warning (the atomic rename would replace the
+/// findings file). The configuration identity (digest, profile) is taken
+/// from the already resolved `settings`.
+fn build_health_exporter(
+    cli: &Cli,
+    settings: &DodSettings,
+) -> Option<health_export::HealthExporter> {
+    let path = cli.resolved_health_export()?;
+    if cli.findings_export.as_deref() == Some(path.as_path()) {
+        tracing::warn!(
+            path = %path.display(),
+            "health export disabled: its path equals --findings-export"
+        );
+        return None;
+    }
+    let identity = health_export::ConfigIdentity {
+        config_digest: settings
+            .profile
+            .as_ref()
+            .map(|profile| profile.config_digest().to_string()),
+        profile: settings
+            .profile
+            .as_ref()
+            .map(|profile| profile.profile_id().as_str().to_owned()),
+    };
+    tracing::info!(
+        path = %path.display(),
+        schema_version = health_export::HEALTH_SCHEMA_VERSION,
+        "health export enabled"
+    );
+    Some(health_export::HealthExporter::new(path, identity))
+}
+
+/// Reads the receive-path counters for the health export.
+///
+/// # Description
+/// Locks the inbox once (a poisoned mutex is recovered, exactly like
+/// [`drain_external_events`]); `None` (no bound socket) reports zeros.
+#[cfg(target_os = "linux")]
+fn ipc_counters(inbox: Option<&IpcInboxHandle>) -> health_export::IpcCounters {
+    let Some(inbox) = inbox else {
+        return health_export::IpcCounters::default();
+    };
+    let guard = match inbox.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    health_export::IpcCounters {
+        probes_connected: guard.connected(),
+        events_total: guard.received_total(),
+        dropped_total: guard.dropped(),
+    }
+}
+
+/// See the Linux version; without a receive path every counter is zero.
+#[cfg(not(target_os = "linux"))]
+fn ipc_counters(_inbox: Option<&IpcInboxHandle>) -> health_export::IpcCounters {
+    health_export::IpcCounters::default()
 }
 
 /// Baut den optionalen Befund-Export aus `--findings-export`/`--findings-host`.
@@ -1248,6 +1360,44 @@ egress_allow_cidrs = []
     }
 
     #[test]
+    fn test_health_exporter_is_absent_without_export_flags() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("valid cli"))?;
+        assert!(build_health_exporter(&cli, &DodSettings::builtin_defaults()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_health_exporter_refuses_the_findings_export_path() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            "/var/lib/harw-dod/export/findings.jsonl",
+            "--health-export",
+            "/var/lib/harw-dod/export/findings.jsonl",
+        ])
+        .map_err(ctx("valid cli"))?;
+        assert!(build_health_exporter(&cli, &DodSettings::builtin_defaults()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_health_exporter_defaults_next_to_the_findings_export() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            "/var/lib/harw-dod/export/findings.jsonl",
+        ])
+        .map_err(ctx("valid cli"))?;
+        let health = build_health_exporter(&cli, &DodSettings::builtin_defaults())
+            .ok_or(TestError::Missing("default health exporter"))?;
+        assert_eq!(
+            health.path(),
+            Path::new("/var/lib/harw-dod/export/health.json")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_explicit_relative_config_path_is_rejected() {
         let result = load_dod_settings(Some(Path::new("config.toml")));
         assert!(matches!(
@@ -1330,7 +1480,13 @@ egress_allow_cidrs = []
                 Arc::new(harw_observe::NullSink),
                 SentinelConfig::default(),
             );
-            poll_once(&mut sentinel, Some(&inbox), &harw_observe::NullSink, None);
+            poll_once(
+                &mut sentinel,
+                Some(&inbox),
+                &harw_observe::NullSink,
+                None,
+                None,
+            );
 
             assert_eq!(sentinel.buffer().event_len(), 1);
             let evidence = sentinel
@@ -1360,7 +1516,13 @@ egress_allow_cidrs = []
                     peer: sample_peer(),
                 });
 
-            poll_once(&mut sentinel, Some(&inbox), &harw_observe::NullSink, None);
+            poll_once(
+                &mut sentinel,
+                Some(&inbox),
+                &harw_observe::NullSink,
+                None,
+                None,
+            );
 
             // Reihenfolge (Frage 1): das intern erzeugte `SensorDegraded`
             // aus `poll_all` steht vor dem extern eingespeisten Ereignis —
@@ -1386,6 +1548,58 @@ egress_allow_cidrs = []
         }
 
         #[test]
+        fn test_poll_once_rewrites_the_health_document_every_cycle() -> TestResult {
+            let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let path = dir.path().join("health.json");
+            let mut health = health_export::HealthExporter::new(
+                path.clone(),
+                health_export::ConfigIdentity::default(),
+            );
+            let mut sentinel = Sentinel::new(
+                vec![mock_degrading_sensor("mock-degrade-0")],
+                Arc::new(harw_observe::NullSink),
+                SentinelConfig::default(),
+            );
+            let inbox: IpcInboxHandle = Arc::new(Mutex::new(ipc::IpcInbox::new(4)));
+            {
+                let mut guard = inbox.lock().map_err(ctx("uncontended lock"))?;
+                guard.peer_connected();
+                guard.push(ipc::ReceivedEvent {
+                    event: sample_probe_event("probe-fs-0"),
+                    peer: sample_peer(),
+                });
+            }
+
+            for _ in 0..2 {
+                poll_once(
+                    &mut sentinel,
+                    Some(&inbox),
+                    &harw_observe::NullSink,
+                    None,
+                    Some(&mut health),
+                );
+            }
+            assert_eq!(health.written(), 2);
+
+            let text = std::fs::read_to_string(&path).map_err(ctx("read health"))?;
+            let value: serde_json::Value =
+                serde_json::from_str(&text).map_err(ctx("parse health"))?;
+            assert_eq!(value["schema_version"], 1);
+            let sensor = &value["sensors"][0];
+            assert_eq!(sensor["id"], "mock-degrade-0");
+            assert_eq!(sensor["health"], "degraded");
+            assert_eq!(sensor["degrade_reason"], "permanent");
+            // Degradiert nach dem ersten Abruf; der zweite Zyklus ruft ihn
+            // nicht mehr ab und zählt deshalb auch keinen Fehler mehr.
+            assert_eq!(sensor["errors_total"], 1);
+            assert_eq!(sensor["readings_total"], 0);
+            assert_eq!(value["ipc"]["probes_connected"], 1);
+            assert_eq!(value["ipc"]["events_total"], 1);
+            assert_eq!(value["ipc"]["dropped_total"], 0);
+            Ok(())
+        }
+
+        #[test]
         fn test_poll_once_with_no_bound_socket_is_a_no_op_on_the_buffer() {
             // `inbox == None` entspricht einem gescheiterten `bind()` beim
             // Start (siehe `spawn_ipc_if_available`) — kein Fehler, nur kein
@@ -1395,7 +1609,7 @@ egress_allow_cidrs = []
                 Arc::new(harw_observe::NullSink),
                 SentinelConfig::default(),
             );
-            poll_once(&mut sentinel, None, &harw_observe::NullSink, None);
+            poll_once(&mut sentinel, None, &harw_observe::NullSink, None, None);
             assert_eq!(sentinel.buffer().event_len(), 0);
         }
     }

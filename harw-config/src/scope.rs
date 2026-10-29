@@ -280,6 +280,14 @@ pub struct FieldScope {
 /// gegen diese Tabelle prüft, lebt bewusst in Paket C
 /// (`harw-config/tests/config_scope_exhaustive.rs`), nicht hier (Abschnitt
 /// 7a der Spezifikation).
+///
+/// Sections parsed outside `HarnessConfig` (`[network]`, `[browser]`,
+/// `[dod]`, `[web]`, `[infrastructure]`) have no rows here: a trusted layer
+/// replaces such a section wholesale, and the untrusted repository layer is
+/// handled by the per-section `merge_restricted_*` functions in
+/// `crate::discovery`. For `[dod]` that means `proof_key_dir`, `export_dir`
+/// and `findings_window_hours` are profile-scoped and never taken from an
+/// untrusted layer; `config_scope_exhaustive.rs` pins that per field.
 #[rustfmt::skip]
 pub static FIELD_TABLE: &[FieldScope] = &[
     // 1.1 Top-Level (11)

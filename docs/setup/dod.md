@@ -1,8 +1,8 @@
-# DoD (Detect · Orient · Defend)
+# Harw-DoD (Detect · Orient · Defend)
 
-> Status: partially implemented · Last reviewed: 2026-09-24
+> Status: partially implemented · Last reviewed: 2026-10-28
 
-DoD is Harwness's on-device observation-and-defense subsystem: it watches
+Harw-DoD (short: DoD) is Harwness's on-device observation-and-defense suite: it watches
 what is happening on the host around agent activity (process starts,
 network connections, file writes, authentication, resource pressure, …)
 and — behind an explicit, disabled-by-default enforcement path — can act on
@@ -17,6 +17,14 @@ requires it.
 This page explains what DoD is made of, how it is installed, and — as
 honestly as the code allows — what currently works and what is still a
 contract rather than a live capability.
+
+**Naming.** "Harw-DoD" is the name of the suite in human-facing text. Crate
+names (`harw-dod`, `harw-dod-*`), binary names (`harw-sentinel`,
+`harw-probe-*`, `harw-warden`), FHS paths (`/etc/harw-dod`,
+`/var/lib/harw-dod`, …), socket paths, groups, config keys and unit file
+names keep their existing spelling; renaming them would break every
+installation for no functional gain (see the
+[facade charter](../design/harw-dod-charter.md#2-the-name)).
 
 ## Purpose
 
@@ -36,9 +44,9 @@ answer, split into two halves:
 
 ## Components
 
-The DoD domain (`dod/crates/`, part of the root workspace) has around 30
-crates. Grouped by role, with what each
-one is responsible for:
+The DoD domain (`dod/crates/`, part of the root workspace) has 34 crates.
+Grouped by role, with what each one is responsible for (the list below
+names the main ones):
 
 **Access and data vocabulary** (shared foundations, not sensors themselves)
 - `harw-dod-cap` — the capability/read-scope vocabulary every sensor is
@@ -90,9 +98,10 @@ one is responsible for:
   should apply for a scope; applies nothing itself.
 
 **Facade and running processes**
-- `harw-dod` — the curated facade the rest of the workspace uses; a
-  consumer that wants "observe the host" or "evaluate a finding" depends
-  on this, not on individual sensor crates.
+- `harw-dod` — the curated facade intended for the rest of the workspace;
+  a consumer that wants "observe the host" or "evaluate a finding" should
+  depend on this, not on individual sensor crates (no workspace crate
+  depends on it yet).
 - `harw-sentinel` — the unprivileged binary: runs the sensors and the
   collection loop.
 - `harw-probe-fs` — the privileged (`CAP_SYS_ADMIN`) fanotify probe binary;
@@ -151,7 +160,10 @@ more.
   read-only access to `/etc/harw-dod`; `harw-ipc` lets the sentinel create,
   and the two probes connect to, `/run/harw/sentinel.sock`;
   `harw-warden-clients` (empty by default) may connect to
-  `/run/harw/warden.sock` — add the escalation client explicitly.
+  `/run/harw/warden.sock` — add the escalation client explicitly;
+  `harw-dod-readers` (empty by default) may read the sentinel exports in
+  `/var/lib/harw-dod/export` — see
+  [Exports read by harw](#exports-read-by-harw).
 - **Capabilities, per binary, and nothing beyond them:**
   `CapabilityBoundingSet`/`AmbientCapabilities` are empty for
   `harw-sentinel` (no elevated capability at all); `CAP_BPF CAP_PERFMON`
@@ -167,6 +179,8 @@ more.
   - eBPF objects + manifest: `/usr/local/lib/harw-dod/bpf`
   - configuration: `/etc/harw-dod`
   - state/telemetry: `/var/lib/harw-dod`, `/var/log/harw-dod`
+  - sentinel exports: `/var/lib/harw-dod/export` (`findings.jsonl`,
+    `health.json`)
   - runtime sockets: `/run/harw/sentinel.sock`, `/run/harw/warden.sock`
     (`/run/harw` is created by `deploy/tmpfiles.d/harw.conf`; the
     infrastructure daemons use `/run/harw/infra/`)
@@ -199,9 +213,85 @@ The `[dod]` section's defaults are deliberately restrictive
 - `allowed_cgroup_prefixes` — which cgroup path prefixes the escalation
   chain may address at all; an untrusted layer may only narrow this list,
   never widen it.
+- `export_dir` — explicit directory of the sentinel exports that harw
+  reads (absolute path). Unset (default): `/var/lib/harw-dod/export` if
+  readable, else `<HARW home>/dod/export`. Like `proof_key_dir`, never
+  taken from an untrusted (repository) layer — a repository must not be
+  able to point harw at fabricated posture.
+- `findings_window_hours` — how far back harw summarizes exported findings
+  (default `24`, must be at least `1`); set by trusted layers only.
+
+These invariants are checked while the `[dod]` table is loaded: a `[dod]`
+table in any layer — trusted or not — with `kill_requires_human = false`, a
+blank `allowed_cgroup_prefixes` entry, a relative `export_dir` or
+`findings_window_hours = 0` makes harw's config loading fail with a
+`[dod]: …` error instead of starting with that value.
 
 Enforcement itself lives entirely in the escalation/warden binaries; this
 config section only describes the policy they must honor.
+
+### Exports read by harw
+
+The sentinel writes two files for harw to read. `harw-security-hub` can
+also read `findings.jsonl` (its `[findings] path`), but only after its
+service has been granted the reader group — on a stock install it cannot
+(see [Letting `harw-security-hub` read the findings](#letting-harw-security-hub-read-the-findings)).
+Both are optional sentinel flags; the shipped unit enables both:
+
+| File | Flag | Written | Content |
+|---|---|---|---|
+| `/var/lib/harw-dod/export/findings.jsonl` | `--findings-export <abs path>` | appended per certified finding; rotated at 16 MiB (`--findings-export-keep`) | one JSON object per line: `finding_id`, `host`, `rule_id`, `severity`, `summary` (sanitized, ≤ 512 bytes), `observed_at`, plus `schema_version: 2` and an optional `scope` (cgroup path, once findings carry a cgroup attribution) |
+| `/var/lib/harw-dod/export/health.json` | `--health-export <abs path>` (default: `health.json` next to the findings export) | replaced atomically (temporary file + rename) every poll cycle | `schema_version: 1`, `written_at`, `config_digest`, `profile` (both `null` on built-in defaults), `sensors[]` (`id`, `health` = `bound`/`retrying`/`degraded`, `degrade_reason?`, `last_ok_at?`, `readings_total`, `errors_total`), `ipc` (`probes_connected`, `events_total`, `dropped_total`) |
+
+Version 2 of the findings line is additive: a line without `schema_version`
+is version 1, and every reader ignores unknown fields, so old and new lines
+parse alike. Neither file contains evidence, raw events, configuration
+contents or secrets.
+
+**Permissions.** `deploy/tmpfiles.d/harw.conf` creates the export directory
+as `2750 harw-sentinel:harw-dod-readers` (setgid, so the files inherit the
+group) and the state directory as `0710 harw-sentinel:harw-dod-readers`
+(members may traverse to `export/`, not list the state directory). The
+files themselves are `0640`. The group `harw-dod-readers` is **empty by
+default**; to let a user's harw read the posture:
+
+```sh
+sudo usermod -aG harw-dod-readers <user>   # takes effect at the user's next login
+```
+
+(The planned `harw dod enable --grant-read <user>`, PL-97 D3, is not
+available yet; it will do the same.)
+
+#### Letting `harw-security-hub` read the findings
+
+`harw-security-hub.service` runs as `harw-security-hub:harw-security` and
+is **not** a member of `harw-dod-readers`; the shipped unit grants no
+supplementary group, so the group stays memberless by default. Until you
+grant it, the hub cannot even traverse `/var/lib/harw-dod`: reading its
+default `[findings] path` (`/var/lib/harw-dod/export/findings.jsonl`) fails
+with `EACCES`, and `GET /v1/posture` reports its DoD part as
+`"status": "unavailable"` with no findings. To grant
+read access to the hub service only (not to the hub account at large), add
+a drop-in and restart the hub:
+
+```sh
+sudo mkdir -p /etc/systemd/system/harw-security-hub.service.d
+printf '[Service]\nSupplementaryGroups=harw-dod-readers\n' \
+  | sudo tee /etc/systemd/system/harw-security-hub.service.d/dod-readers.conf
+sudo systemctl daemon-reload
+sudo systemctl restart harw-security-hub.service
+```
+
+The group must exist (it is created by `systemd-sysusers` from
+`deploy/sysusers.d/harw.conf` during the DoD install); with the drop-in in
+place and the group missing, the hub service fails to start. Remove the
+drop-in before deleting the group (see [Uninstalling](#uninstalling)).
+
+**Where harw looks.** The shared resolver (`harw-dod-client`, PL-97 D2)
+picks the export directory in this order: `[dod] export_dir`, then
+`/var/lib/harw-dod/export` if it is readable, then `<HARW home>/dod/export`.
+The opt-in `[memory] security_signals` context source still reads only
+`<HARW home>/dod/export/findings.jsonl` until it switches to that resolver.
 
 ## Installation
 
@@ -302,24 +392,19 @@ turned off.
   escalation/warden chain is implemented as a library and a socket-
   activated binary, but is disabled by every default install path, as
   described above.
-- **Binary integration boundary.** Per `dod/README.md`, the shipped
-  systemd unit for `harw-sentinel` currently invokes it with the legacy
-  `--home`/socket-only CLI (`harw-sentinel --home <state-dir> --socket
-  <path> --log info`) rather than the planned system contract
-  (`--config --state-dir --telemetry-dir --runtime-dir`). `harw-probe-bpf`
-  already takes `--config` on the shipped unit. `harw-sentinel`'s own
-  module documentation confirms the CLI has no `--config` flag yet: the
-  system configuration path is passed as `None` from `main`, and DoD falls
-  back to a fixed default path
-  (`harw_dod_config::SYSTEM_CONFIG_PATH`) with built-in defaults if
-  nothing is found there, logging a warning rather than failing closed on
-  a missing file (it *does* fail closed — refuses to start — on a
-  present-but-untrusted or invalid configuration: wrong owner, group/world
-  writable, a symlink, or a parse/schema error). In short: **the systemd
-  units are an installable, correctly-scoped contract, not yet a claim
-  that `--config`-driven service configuration is fully wired through
-  every binary.** Verify current behavior against
-  `dod/crates/harw-sentinel/src/main.rs` and
+- **Binary integration boundary.** Both observation units pass the
+  configuration explicitly: `harw-sentinel --config
+  /etc/harw-dod/config.toml --home /var/lib/harw-dod --socket
+  /run/harw/sentinel.sock --findings-export …/export/findings.jsonl
+  --health-export …/export/health.json` and `harw-probe-bpf --config …`.
+  With an explicit `--config`, a missing, untrusted (wrong owner,
+  group/world writable, symlink) or invalid configuration makes the
+  sentinel refuse to start; only when started **without** `--config` (by
+  hand) does it fall back to built-in defaults if
+  `/etc/harw-dod/config.toml` does not exist, with a warning. The planned
+  separate `--state-dir --telemetry-dir --runtime-dir` flags do not exist;
+  `--home` is the state directory. Verify current behavior against
+  `dod/crates/harw-sentinel/src/{cli,main}.rs` and
   `dod/crates/harw-probe-bpf/src/main.rs` before relying on a specific CLI
   surface.
 - **eBPF artifacts are never checked into the repository**; they must be
@@ -341,7 +426,7 @@ system unit (Crypto Masterplan v2 §22, H10); there is no second copy under
 | `deploy/systemd/harw-dod.target`, `harw-sentinel.service`, `harw-probe-bpf.service`, `harw-probe-fs.service`, `harw-warden.service`, `harw-warden.socket` | DoD (installed by `make -C dod install`) |
 | `deploy/systemd/harw-infra.target`, `harw-control.{socket,service}`, `harw-auth-hub.{socket,service}`, `harw-netsec.{socket,service}`, `harw-security-hub.{socket,service}` | infrastructure daemons (not installed by the DoD package) |
 | `deploy/sysusers.d/harw.conf` | all system accounts and groups |
-| `deploy/tmpfiles.d/harw.conf` | `/run/harw`, `/run/harw/infra`, DoD state/log directories |
+| `deploy/tmpfiles.d/harw.conf` | `/run/harw`, `/run/harw/infra`, DoD state/log directories, the sentinel export directory |
 
 The same files are compiled into `harw` byte-identically (`harw-install`
 parity tests fail on any drift). To inspect exactly what is shipped, with
@@ -379,10 +464,12 @@ full teardown:
 
 ```sh
 sudo systemctl disable --now harw-dod.target harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service
+# only if you added it (see "Letting harw-security-hub read the findings"):
+sudo rm -f /etc/systemd/system/harw-security-hub.service.d/dod-readers.conf && sudo systemctl daemon-reload
 sudo rm -rf /etc/harw-dod /var/lib/harw-dod /var/log/harw-dod
 sudo rm -f /run/harw/sentinel.sock /run/harw/warden.sock
 for u in harw-sentinel harw-probe-fs harw-probe-bpf harw-warden; do sudo userdel "$u"; done
-sudo groupdel harw-dod-config; sudo groupdel harw-ipc; sudo groupdel harw-warden-clients
+sudo groupdel harw-dod-config; sudo groupdel harw-ipc; sudo groupdel harw-warden-clients; sudo groupdel harw-dod-readers
 ```
 
 ## Troubleshooting
