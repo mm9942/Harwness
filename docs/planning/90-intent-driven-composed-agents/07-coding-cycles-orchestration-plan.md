@@ -16,6 +16,16 @@ Owner decisions still required: whether each start needs approval or a bounded, 
 - The model loop, WorkDriver and intent cycle are separate paths. `make install` builds and installs binaries and the UIA runner; service activation is separate. Cycle tools enabled in configuration do not themselves guarantee a running workspace-bound worker.
 - Candidate A: extend existing WorkDriver with a durable tool-using supervisor and isolated writer adapter; reuse existing verification and job mechanics. Candidate B: extend the intent-cycle state machine with writing and child execution, requiring reconciliation with WorkDriver. Candidate C: retain one persistent root model and use explicit delegated jobs; durability and central verification must be proven. Compare all three against code and tests before selecting; do not create competing schedulers or duplicate security policy.
 
+### Inspection ledger (2026-10-29)
+
+CURRENT is pinned to #153 at `ec3f70bd` and the baseline above. The following external branch observations are integration inputs, not capabilities available on this branch:
+
+- PL-97 #154 at `ed0aaaa0`, including the §8 amendment from `c1ff4a2c`: `docs/planning/97-harw-dod-mission-control-chain/README.md` §8 and E2 specify a versioned `JobSpec` write scope and refusal before execution when required containment is unavailable. E1a supplies planning/verification primitives; the E1/E2 runtime chain and its cross-worker tests remain dependencies to prove. A planning amendment or a coordination comment does not satisfy that gate.
+- Prototype `feat/cycle-coding-wiring` at `919b91e9`: `harw-authority/src/file_write_scope.rs` has lexical narrowing and intersection, but no schema version; its filesystem guard deliberately refuses even an admitted exact-file write pending an isolated backend. It is uncompiled, untested experimental input. Do not cherry-pick it wholesale or describe it as a working writer. Its withdrawn per-process worker lanes also do not establish shared capacity.
+- At this branch, `drive_worker_turn` in `harw-cli/src/job_worker_work_driver.rs` calls `run_turn` in-process. Those filesystem effects do not traverse `harw-job-exec`. `harw-job-core/src/spec.rs` has `SandboxRequirement::Required`, but no per-worker file scope. `harw-plan-bridge/src/cycle_write_admission.rs` explicitly refuses new-file admission and requires a later adapter to revalidate its proof at mutation time.
+
+PLANNED working direction: evaluate A first, reusing WorkDriver rounds/central verification and the intent-cycle journal's fencing rules. W0 must record the choice and demonstrate that its callers, recovery and authority contracts fit before W3 expands execution. No scheduler, service activation or write automation is enabled by this direction.
+
 ## System invariants
 
 1. Authority comes from trusted admission, never model output, files, prompt, cached projections or deserialized claims alone. Revalidate actor, tenant, workspace, intent revision, consent and live lease at each effect boundary.
@@ -62,6 +72,40 @@ Owner decisions still required: whether each start needs approval or a bounded, 
 - Write negative and crash/restart integration tests before enabling write automation. Cover foreign tenant/workspace, stale epoch and approval, duplicate admission, lost acknowledgement after a real write, cancellation, symlink/rename and parent-directory replacement races, absolute host paths, sibling-worktree/shared-Git-directory writes, restricted worker trying another worker's file, exhausted budget, provider outage, conflict and failed verification.
 - Exercise an end-to-end two-worker change with disjoint files and actual overlap, integration and central verification; prove the one-agent mode can use its approved tools and cycles without relying on children. Record versions and exact commit.
 - Run formatting, clippy, workspace tests, documentation tests, xtask architecture/privilege gates, relevant sandbox/DoD tests and full CI on the final head. Report local tests separately from GitHub Actions. No merge or enablement while required security or recovery checks are unverified.
+
+## Implementation order and PL-97 handoff
+
+The following DELTA is a proposed implementation contract responding to the #153/#154 coordination, not an assertion that either branch has delivered it. Preserve the W0 owner decisions; scope schema work and rejection tests can proceed before activation policy is settled.
+
+| Order | Delivery and owner | Evidence required before the next dependent slice |
+| --- | --- | --- |
+| 1 | W0/W2 agree the scope wire contract with PL-97 E1/E2; W1 prepares admission without enabling writers. | Versioned fixtures and rejection tests, exact file ownership and shared-file base recorded; no scope-bearing call can run via a legacy backend. |
+| 2 | PL-97 E1–E3 wire the process chain; #153 maps trusted reservations into its scope input. | Integrated no-backend/partial-backend tests start zero processes; an allowed existing-file mutation succeeds and a sibling mutation is denied with unchanged bytes. Propagation tests cover shell, jobs, children and restart. |
+| 3 | #153 W2 closes the in-process writer gap and adds journaled execution. | Both allowed and refused filesystem effects are demonstrated at the actual WorkDriver entry. Lost acknowledgements, stale leases and topology races pass. Until then scoped in-process mutations remain refused. |
+| 4 | #153 W3 adds supervisor modes on the selected existing driver. | One-agent and two-worker tasks reach central verification; cancellation/restart and shared capacity hold across two worker processes, with no duplicate claims or effects. |
+| 5 | PL-97 E5 supplies execution readiness; #153 W4 adds workspace worker readiness and the approved activation policy. | Fresh/existing install checks distinguish installed/configured/running/ready; a running service with the wrong workspace is not ready for this task. W5 final-head evidence gates enablement. |
+
+### Scope and effect contract
+
+- Use one optional, versioned generic `JobSpec` scope for process execution, owned with PL-97; keep tenant, consent, intent, leases and coding policy at trusted admission/composition boundaries. Define the representation in the existing job/authority layers according to `xtask/arch-policy.toml`; do not introduce a job-core dependency on plan-bridge or a second sandbox policy. A serialized scope is a requested ceiling, never authority.
+- Distinguish absent legacy scope from a present empty scope (no writes). Reject unknown versions, fields, invalid paths and unsupported required operations before effects. A scoped call requires `SandboxRequirement::Required`; required means every requested containment dimension is enforceable. Missing cgroup, trampoline, Landlock, path mapping or equivalent platform capability yields a visible blocked/unsupported result, never workspace-wide execution. Legacy compatibility must not strip a scope during serialization or reissue.
+- Translate the admitted scope to `FilesystemPolicy.read_write` before the PL-97 mapped Landlock plan, intersecting existing restrictions rather than adding the workspace back as writable. Bind the request to the resolved workspace, attempt and live fenced ownership; child and resumed jobs may only narrow it. Do not silently skip missing admitted targets: refuse them in the first existing-file slice. New files, rename and delete require a later explicit contract; granting their parent directory would also grant siblings and cannot implement an exact-file ceiling.
+- For in-process `fs.write`/`fs.edit`, require a pre-mutation denial for scoped requests until a topology-safe writer adapter or a process-isolated writer is proven. Checking a path then opening it, or checking it after the parallel block, is insufficient. Pin the target/preimage and validate live lease/revocation at the effect boundary; reject unsafe aliases including hard links unless the isolation design proves they cannot mutate another owner's data. A Landlock inode rule alone does not prove lexical ownership through rename, link or parent replacement; exercise those races against the chosen design.
+- `ManagedJobOrigin` remains display/provenance only. Decide whether durable WorkDriver jobs need an additional origin variant only when W4 connects them to managed-job rows; no authority or admission decision may depend on that leniently read metadata. Supervisor recovery must also restore PL-97's durable skill-injection delivery/dedupe state once that mechanism is verified; transcript replay alone must not silently refill budgets or repeat delivery.
+
+### Shared-file sequencing
+
+PL-97 goes first on config scope/merge and runtime assembly (B1), process ports/coordinator/executors/trampoline and shell/job/child launchers (E1/E2), registry declarations and install/service assets. #153 rebases onto each reviewed slice before adding its consumer. #153 owns intent-cycle/WorkDriver admission and execution, plan-bridge leases and write proofs, authority narrowing, and filesystem mutation enforcement; PL-97's filesystem metadata work must preserve that boundary. Agree any `harw-sandbox/src/bwrap.rs` launcher hunk before editing it because the prototype touches the legacy path. Record exact rebased heads and focused checks for shared files; the discussion's file split is proposed coordination, not a lock or proof of integration.
+
+### First reviewable code slice
+
+Implement the agreed scope schema and a fail-closed execution guard in `harw-job-core/src/spec.rs` and the process-dispatch boundary selected with PL-97. Reuse the existing `JobSpecEnvelope` validation boundary and specify its compatibility/version migration alongside the scope payload. Keep scoped execution disabled until the backend can consume the scope. Update constructors and add focused tests for absent versus empty scope, unsupported schema, malformed paths, required scope rejected by legacy/no/partial backend, and serialization round-trip through persisted/reissued jobs. Assert zero process starts with an executor spy; include old-reader fixtures proving a scope-bearing request is rejected instead of downgraded. This slice neither admits new-file writes nor exposes an automatic coding start. It is tractable independently of the supervisor and produces a concrete hook for E2; code ownership must be agreed before both branches edit those files.
+
+## Verification ledger and implementation status
+
+For each delivery above, record the implementation PR, exact tested head, test command, platform/backend and result (pass/fail/not run), with the relevant acceptance rows. Process integration requires a host with the actual bwrap/trampoline, Landlock and delegated cgroup chain; unit mocks do not prove kernel enforcement. Add an allowed-write control so a backend that denies every operation cannot pass as working isolation. Required host tests that cannot run leave the gate pending.
+
+This document is planning only. Local source/discussion inspection supports the ledger; it supplies no Cargo, host-containment or GitHub Actions pass. No W1–W5 capability is marked complete here. Refresh the pinned refs and dependencies before implementation or a merge recommendation.
 
 ## Risks and unresolved questions
 
