@@ -52,6 +52,7 @@ pub(crate) mod hard_kill;
 pub(crate) mod help_overlay;
 pub(crate) mod history_cell;
 pub mod host_permit_dialog;
+pub mod i18n;
 mod input;
 pub(crate) mod input_editor;
 pub(crate) mod input_history;

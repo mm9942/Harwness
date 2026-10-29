@@ -1,0 +1,50 @@
+{
+  "settings.title": {
+    "en": "Settings",
+    "de": "Einstellungen",
+    "es": "Configuración",
+    "fr": "Paramètres",
+    "pt": "Configurações",
+    "ja": "設定",
+    "zh-CN": "设置",
+    "ko": "설정",
+    "vi": "Cài đặt",
+    "hi": "सेटिंग्स"
+  },
+  "settings.language": {
+    "en": "Language",
+    "de": "Sprache",
+    "es": "Idioma",
+    "fr": "Langue",
+    "pt": "Idioma",
+    "ja": "言語",
+    "zh-CN": "语言",
+    "ko": "언어",
+    "vi": "Ngôn ngữ",
+    "hi": "भाषा"
+  },
+  "settings.saved": {
+    "en": "Settings saved",
+    "de": "Einstellungen gespeichert",
+    "es": "Configuración guardada",
+    "fr": "Paramètres enregistrés",
+    "pt": "Configurações salvas",
+    "ja": "設定を保存しました",
+    "zh-CN": "设置已保存",
+    "ko": "설정이 저장되었습니다",
+    "vi": "Đã lưu cài đặt",
+    "hi": "सेटिंग्स सहेजी गईं"
+  },
+  "settings.language_changed": {
+    "en": "Interface language: {language}",
+    "de": "Oberflächensprache: {language}",
+    "es": "Idioma de la interfaz: {language}",
+    "fr": "Langue de l’interface : {language}",
+    "pt": "Idioma da interface: {language}",
+    "ja": "表示言語: {language}",
+    "zh-CN": "界面语言：{language}",
+    "ko": "인터페이스 언어: {language}",
+    "vi": "Ngôn ngữ giao diện: {language}",
+    "hi": "इंटरफ़ेस की भाषा: {language}"
+  }
+}
