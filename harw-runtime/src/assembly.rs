@@ -2422,7 +2422,10 @@ impl RuntimeAssemblyBuilder {
             ))
             // Runde 5, Teil N: `[shell] max_timeout_secs` für jeden
             // Shell-Provider (Wurzel und Kinder).
-            .with_shell_max_timeout_secs(config.harness.shell.effective_max_timeout_secs());
+            .with_shell_max_timeout_secs(config.harness.shell.effective_max_timeout_secs())
+            // PL-97 E2b: `[sandbox] execution` (Vorgabe `chain`) für jeden
+            // Shell-Provider und `job.start` (Wurzel und Kinder).
+            .with_sandbox_execution(config.harness.sandbox.effective_execution());
         // Plan R9, Teil F: eine Job-Verwaltung je interaktiver TUI-Sitzung
         // (`<projekt>/.harw/state/jobs/`). Sie reist mit der Host-Permit-
         // Verdrahtung zu Wurzel und Kind-Fabriken: `job.*` neben jedem

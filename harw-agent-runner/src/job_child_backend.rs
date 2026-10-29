@@ -25,8 +25,11 @@
 //!   stays `true`). Without a workspace root, or where the job runtime runs
 //!   no such requests, the child keeps the previous host submission, logged
 //!   once per backend (`runs without cgroup/landlock`).
-//!   [`SandboxExecution::Legacy`], the default until the composition passes
-//!   the configured value, keeps the previous submission always.
+//!   [`SandboxExecution::Legacy`] keeps the previous submission always; it
+//!   stays the safe default of a backend built without a config. The
+//!   runner's composition (`crate::context::RunnerContext`) passes the
+//!   configured value (`chain` for a compiled agent, which reads no
+//!   `[sandbox]` table) and the runner's canonical working directory.
 //! - **Tests** ([`JobChildBackend::with_spawner`], no `JobManager`): spawns
 //!   [`ChildProcessSpawner::command_for`]'s command itself — a plain
 //!   `/bin/sh -c <script>` standing in for a real compiled child, so the
@@ -199,8 +202,9 @@ impl<S: ChildProcessSpawner> JobChildBackend<S> {
 
     /// Chooses how the job-managed path submits each child (config
     /// `[sandbox] execution`, PL-97 E2b, module docs). Default
-    /// [`SandboxExecution::Legacy`], the previous host submission, until the
-    /// composition passes the configured value.
+    /// [`SandboxExecution::Legacy`], the previous host submission, the safe
+    /// fallback where no config exists; the runner's composition passes the
+    /// configured value.
     #[must_use]
     pub fn with_execution(mut self, execution: SandboxExecution) -> Self {
         self.execution = execution;

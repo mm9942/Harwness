@@ -163,7 +163,9 @@ impl RunnerContext {
     /// [`harwness_sdk::HarwnessBuilder::home`] would resolve to), with no
     /// notifier — the job's own progress reaches the parent through the
     /// child protocol frames [`crate::child::run_child`] writes, not through
-    /// job notifications.
+    /// job notifications. It submits children on the configured execution
+    /// path ([`harw_registry_defaults::profile::compiled_agent_sandbox_execution`])
+    /// over the runner's canonical working directory (PL-97 E2b).
     ///
     /// # Errors
     /// [`RunnerError::Io`] if the root space cannot be resolved or the job
@@ -181,16 +183,67 @@ impl RunnerContext {
                 context: "start the job manager for the job-backed child backend",
                 source,
             })?;
-        Ok(Arc::new(JobChildBackend::new(
-            manager,
-            self.args.offline_echo,
-        )))
+        // PL-97 E2b: the execution path of the embedded run's config and
+        // the canonical root the parent run works on.
+        let backend = JobChildBackend::new(manager, self.args.offline_echo)
+            .with_execution(harw_registry_defaults::profile::compiled_agent_sandbox_execution());
+        let backend = match std::env::current_dir()
+            .ok()
+            .and_then(|cwd| child_workspace_root(&cwd))
+        {
+            Some(root) => backend.with_workspace_root(root),
+            None => backend,
+        };
+        Ok(Arc::new(backend))
     }
+}
+
+/// The workspace root a job-backed child runs over (PL-97 E2b): the
+/// canonical working directory of this runner, the same directory
+/// [`RunnerContext::builder`] hands the session as its `cwd` and from which
+/// the parent's own sandbox root is discovered.
+///
+/// # Description
+/// The previous host submission let the child inherit exactly this
+/// directory; the chain submission makes it the child's root and working
+/// directory, so the child's own assembly discovers the same project.
+/// `None` when it cannot be resolved to a directory: the backend then keeps
+/// the previous host submission (logged once).
+fn child_workspace_root(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    cwd.canonicalize().ok().filter(|root| root.is_dir())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::offline_echo_enabled;
+    use super::{child_workspace_root, offline_echo_enabled};
+
+    /// PL-97 E2b: the job-backed child runs over the canonical working
+    /// directory; a path that is no directory gives no root (host
+    /// submission, logged once).
+    #[test]
+    fn test_context_child_workspace_root_is_the_canonical_cwd()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let nested = dir.path().join("work");
+        std::fs::create_dir(&nested)?;
+        let dotted = nested.join("..").join("work");
+        assert_eq!(child_workspace_root(&dotted), Some(nested.canonicalize()?));
+        let file = nested.join("file");
+        std::fs::write(&file, b"")?;
+        assert_eq!(child_workspace_root(&file), None);
+        assert_eq!(child_workspace_root(&dir.path().join("missing")), None);
+        Ok(())
+    }
+
+    /// PL-97 E2b: a compiled agent reads no `[sandbox]` table, so its
+    /// child backend takes the configured default, the sandbox chain.
+    #[test]
+    fn test_context_child_backend_execution_is_the_config_default() {
+        assert_eq!(
+            harw_registry_defaults::profile::compiled_agent_sandbox_execution(),
+            harw_tool_job::launcher::SandboxExecution::Chain
+        );
+    }
 
     #[test]
     fn test_offline_echo_truth_table() {

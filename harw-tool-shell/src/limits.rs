@@ -217,6 +217,10 @@ impl ShellLimits {
     /// [`ShellLimitsError::PrlimitUnavailable`], wenn nicht gefunden und
     /// `require_rlimits == true`.
     pub fn resolve_prlimit(&self) -> Result<Option<PathBuf>, ShellLimitsError> {
+        #[cfg(test)]
+        if test_seam::prlimit_hidden() {
+            return self.resolve_prlimit_in(&[Path::new(test_seam::MISSING_PRLIMIT)]);
+        }
         let candidates = PRLIMIT_CANDIDATES.map(Path::new);
         self.resolve_prlimit_in(&candidates)
     }
@@ -328,6 +332,48 @@ pub(crate) fn launch_command(
             program: program.to_path_buf(),
             args: args.to_vec(),
         },
+    }
+}
+
+/// Test seam (PL-97 E2b): a host without a fixed-path `prlimit`, for the
+/// regressions that the sandbox chain picks its route before it looks for
+/// `prlimit` (`shell.exec` and `job.start`). Per thread, so parallel tests
+/// on other threads still see the real candidates.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::cell::Cell;
+
+    /// A candidate path that never exists.
+    pub(crate) const MISSING_PRLIMIT: &str = "/nonexistent/harw-test/prlimit";
+
+    thread_local! {
+        static HIDDEN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether [`super::ShellLimits::resolve_prlimit`] finds nothing on
+    /// this thread.
+    pub(crate) fn prlimit_hidden() -> bool {
+        HIDDEN.with(Cell::get)
+    }
+
+    /// Hides `prlimit` on this thread until dropped.
+    pub(crate) struct HiddenPrlimit {
+        previous: bool,
+    }
+
+    impl HiddenPrlimit {
+        /// From now on this thread's `prlimit` lookup finds nothing.
+        pub(crate) fn install() -> Self {
+            Self {
+                previous: HIDDEN.with(|hidden| hidden.replace(true)),
+            }
+        }
+    }
+
+    impl Drop for HiddenPrlimit {
+        fn drop(&mut self) {
+            HIDDEN.with(|hidden| hidden.set(self.previous));
+        }
     }
 }
 

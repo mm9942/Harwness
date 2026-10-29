@@ -53,6 +53,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use harw_authority::PermissionSet;
+use harw_config::harness_config::SandboxExecutionToml;
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_extension_api::{
     ExtensionRegistryBuilder, ToolExecutor, ToolName, ToolProvider, ToolSpec,
@@ -825,11 +826,12 @@ pub fn matrix_tools_for_role(role: &str) -> &'static [&'static str] {
 /// # Why not part of a [`RegistryProfile`]
 /// They are `harw-ops` operations (`model_tool(readonly, approval =
 /// "none")`), not tools of a tool-provider crate. A root session serves
-/// them through its operation model-tool provider. Child registries do
-/// **not** serve them yet: `harw-runtime/src/children.rs` mounts no
-/// provider for [`dod_tools_for_role`] (open PL-97 D3 item, owner: runtime),
-/// so the triage roles admit them without seeing them, which fails closed.
-/// Each only reads the Harw-DoD
+/// them through its operation model-tool provider. A child registry serves
+/// them only for the roles of [`dod_tools_for_role`]: the role-bound
+/// provider `RuntimeChildRegistryFactory::dod_read_provider` in
+/// `harw-runtime/src/children.rs` (PL-97 D4) mounts exactly these three
+/// operations, with the bound root space as their `OpContext`; every other
+/// child registers none of them. Each only reads the Harw-DoD
 /// export, the sentinel health report, the system config and `systemctl
 /// show`; none writes DoD state or reaches the Warden or the escalation
 /// ladder (invariant S1). They need no sandbox right
@@ -850,10 +852,11 @@ const DOD_TRIAGE_ROLES: &[&str] = &[
 /// otherwise nothing.
 ///
 /// The triage roles keep [`RegistryProfile::NoTools`] (no workspace, shell
-/// or network tool); the Harw-DoD tools are the only tools they admit.
-/// Admitted is not served: until `harw-runtime/src/children.rs` mounts the
-/// operations for these roles (open item, owner: runtime), a triage child
-/// registers none of them.
+/// or network tool); the Harw-DoD tools are the only tools they admit. A
+/// triage child is served them by the role-bound provider
+/// `RuntimeChildRegistryFactory::dod_read_provider` in
+/// `harw-runtime/src/children.rs` (PL-97 D4), which the child factory mounts
+/// next to the empty profile for exactly the roles this function names.
 ///
 /// # Examples
 /// ```rust
@@ -884,7 +887,9 @@ pub fn dod_tools_for_role(role: &str) -> &'static [&'static str] {
 /// # Why not part of a [`RegistryProfile`]
 /// Like [`DOD_READ_TOOLS`] it is a `harw-ops` operation
 /// (`model_tool(readonly, approval = "none")`); a root session serves it
-/// through its operation model-tool provider, child registries do not. It
+/// through its operation model-tool provider. Unlike the `dod.*` reads,
+/// which `harw-runtime/src/children.rs` mounts role-bound for the triage
+/// children (PL-97 D4), no child registry serves `tool.index`. It
 /// reads only static data of this binary (catalog, profiles, tool specs,
 /// bundled skill manifests), needs no sandbox right
 /// ([`crate::authority::tool_permission`] is `None`, like `ps`) and stands in
@@ -1781,9 +1786,11 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 /// Die vier `security-*-triage`-Rollen (siehe [`role_names`]) admittieren
 /// kein Profil-Werkzeug: sie bekommen bereits ausgewertete `Finding`-Batches
 /// als Parameter und admittieren nur die drei lesenden `dod.*`-Werkzeuge
-/// ([`dod_tools_for_role`], PL-97 D3) — zugelassen, aber noch von keiner
-/// Kind-Registry bereitgestellt (offener Punkt `children.rs`, Runtime).
-/// `ReadOnlyExplore`
+/// ([`dod_tools_for_role`], PL-97 D3). Diese stellt nicht das Profil bereit,
+/// sondern der rollengebundene Provider
+/// `RuntimeChildRegistryFactory::dod_read_provider` in
+/// `harw-runtime/src/children.rs` (PL-97 D4), den die Kind-Fabrik genau für
+/// diese vier Rollen neben dem leeren Profil montiert. `ReadOnlyExplore`
 /// registriert trotzdem zehn Werkzeuge (`fs.*`, `deps.*`) und bewirbt sie im
 /// System-Prompt-Inventar — der Deckungstest
 /// (`harw-registry-defaults/tests/tool_admission_coverage.rs`,
@@ -1840,9 +1847,12 @@ pub enum RegistryProfile {
     /// Composition-Root gehören **nicht** dazu (siehe W1-05).
     Planning,
     /// Registriert und bewirbt keine Werkzeuge — für Rollen, die bereits
-    /// ausgewertete Befund-Batches als Parameter bekommen (`[tools].admitted
-    /// = []`), etwa die vier `security-*-triage`-Rollen (siehe
-    /// [`role_names::SECURITY_EGRESS_TRIAGE`] u. a.).
+    /// ausgewertete Befund-Batches als Parameter bekommen (kein
+    /// Profil-Werkzeug in `[tools].admitted`), etwa die vier
+    /// `security-*-triage`-Rollen (siehe [`role_names::SECURITY_EGRESS_TRIAGE`]
+    /// u. a.). Deren einzige Werkzeuge, die lesenden `dod.*`, montiert
+    /// nicht dieses Profil, sondern der rollengebundene Provider in
+    /// `harw-runtime/src/children.rs` (PL-97 D4, [`dod_tools_for_role`]).
     ///
     /// Zugleich die lokale Grundlage eines an ein Gateway angebundenen
     /// Agenten (R18 D-A): dort montiert die Runtime `NoTools` plus
@@ -2535,8 +2545,9 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         // Die vier Triage-Rollen bekommen bereits ausgewertete Befund-Batches
         // als Parameter; ihr Profil registriert nichts. Sie admittieren nur
         // die lesenden `dod.*` (PL-97 D3, `dod_tools_for_role`); bereitgestellt
-        // werden diese erst, wenn `harw-runtime/src/children.rs` sie montiert
-        // (offener Punkt, Runtime). Siehe die Begründung bei
+        // werden diese vom rollengebundenen Provider
+        // `RuntimeChildRegistryFactory::dod_read_provider` in
+        // `harw-runtime/src/children.rs` (PL-97 D4). Siehe die Begründung bei
         // `RegistryProfile::NoTools`.
         role_names::SECURITY_EGRESS_TRIAGE
         | role_names::SECURITY_BASELINE_TRIAGE
@@ -2901,6 +2912,12 @@ pub struct HostPermitWiring {
     /// `harw_tool_shell::DEFAULT_MAX_TIMEOUT_SECS`. Reist mit dieser
     /// Verdrahtung, weil sie jeden Shell-Provider (Wurzel und Kinder) erreicht.
     pub shell_max_timeout_secs: Option<u64>,
+    /// PL-97 E2b: der Startweg von `shell.exec` und `job.start` aus
+    /// `[sandbox] execution` ([`Self::with_sandbox_execution`]). Reist wie
+    /// `shell_max_timeout_secs` zu jedem Shell-Provider (Wurzel und Kinder);
+    /// `job.*` klont denselben Provider. `None`: die sichere Vorgabe
+    /// [`harw_tool_shell::SandboxExecution::default`] (keine Konfiguration).
+    pub shell_execution: Option<harw_tool_shell::SandboxExecution>,
     /// Plan R9, Teil F: die Job-Verwaltung der harw-Sitzung samt
     /// Elternkette. `Some` montiert `job.*` neben jedem `shell.exec`
     /// ([`JOB_TOOLS`]) und die Kontrollwerkzeuge der Orchestratoren
@@ -2991,8 +3008,17 @@ impl HostPermitWiring {
             sudo_prompts: None,
             host_escalation: None,
             shell_max_timeout_secs: None,
+            shell_execution: None,
             jobs: None,
         }
+    }
+
+    /// PL-97 E2b: setzt den Startweg von `shell.exec` und `job.start` aus
+    /// `[sandbox] execution` ([`sandbox_execution`]).
+    #[must_use]
+    pub fn with_sandbox_execution(mut self, execution: SandboxExecutionToml) -> Self {
+        self.shell_execution = Some(sandbox_execution(execution));
+        self
     }
 
     /// Plan R9, Teil F: hängt die Job-Verwaltung an (`job.*` neben jedem
@@ -3036,6 +3062,74 @@ impl HostPermitWiring {
         self.preselected_variant = variant;
         self
     }
+}
+
+/// PL-97 E2b: `[sandbox] execution` als Startweg von `shell.exec`,
+/// `job.start` und Kind-Agenten.
+///
+/// # Examples
+/// ```rust
+/// use harw_config::harness_config::SandboxExecutionToml;
+/// use harw_registry_defaults::profile::sandbox_execution;
+/// use harw_tool_shell::SandboxExecution;
+///
+/// assert_eq!(sandbox_execution(SandboxExecutionToml::Chain), SandboxExecution::Chain);
+/// assert_eq!(sandbox_execution(SandboxExecutionToml::Legacy), SandboxExecution::Legacy);
+/// ```
+#[must_use]
+pub fn sandbox_execution(execution: SandboxExecutionToml) -> harw_tool_shell::SandboxExecution {
+    match execution {
+        SandboxExecutionToml::Chain => harw_tool_shell::SandboxExecution::Chain,
+        SandboxExecutionToml::Legacy => harw_tool_shell::SandboxExecution::Legacy,
+    }
+}
+
+/// PL-97 E2b: der Startweg eines kompilierten Agenten (`harw-agent-runner`).
+///
+/// # Beschreibung
+/// Ein eingebetteter Lauf liest keine `[sandbox]`-Tabelle:
+/// `harw_runtime::config::load_config_embedded` beginnt mit
+/// `ResolvedConfig::default()`. Sein Wert ist daher der der Vorgabe
+/// ([`harw_config::SandboxSection::effective_execution`], `chain`) — hier an
+/// einer Stelle, damit Wurzel-Shell und Kind-Backend des Runners dieselbe
+/// Quelle lesen.
+#[must_use]
+pub fn compiled_agent_sandbox_execution() -> harw_tool_shell::SandboxExecution {
+    sandbox_execution(harw_config::SandboxSection::default().effective_execution())
+}
+
+/// Baut einen `ShellToolProvider` für `sandbox_profile` und hängt, sobald
+/// `host_permits` übergeben wurde, deren Verdrahtung an (siehe
+/// [`profile_tool_providers`]).
+fn shell_provider_for(
+    sandbox_profile: &SandboxProfile,
+    host_permits: Option<&HostPermitWiring>,
+    approval_mode: &ApprovalModeCell,
+) -> ShellToolProvider {
+    let mut provider = ShellToolProvider::default()
+        .with_sandbox_profile(sandbox_profile.clone())
+        .with_approval_mode(approval_mode.clone());
+    if let Some(wiring) = host_permits {
+        provider = provider
+            .with_permit_ledger(Arc::clone(&wiring.ledger))
+            .with_host_permit_registry(Arc::clone(&wiring.registry))
+            .with_host_permit_prompts(wiring.prompt_sender.clone())
+            .with_preselected_permit_variant(wiring.preselected_variant);
+        // Runde 5, Teil N: Host-Mode-Anfrage nur mit TUI-Verdrahtung.
+        if let Some(escalation) = &wiring.host_escalation {
+            provider = provider.with_host_escalation(escalation.clone());
+        }
+        // Runde 5, Teil N: Obergrenze `[shell] max_timeout_secs`.
+        if let Some(max_timeout_secs) = wiring.shell_max_timeout_secs {
+            provider = provider.with_max_timeout_secs(max_timeout_secs);
+        }
+        // PL-97 E2b: `[sandbox] execution`; ohne Wert bleibt die sichere
+        // Vorgabe des Providers.
+        if let Some(execution) = wiring.shell_execution {
+            provider = provider.with_execution(execution);
+        }
+    }
+    provider
 }
 
 /// Erzeugt die Tool-Provider eines Profils in Registrierungsreihenfolge.
@@ -3084,25 +3178,7 @@ fn profile_tool_providers(
     // Sitzungs- oder Einmalfreigabe für die aufrufende Session meldet — ohne
     // eine solche Freigabe läuft der Aufruf unverändert in bwrap.
     let build_shell = |sandbox_profile: &SandboxProfile| -> ShellToolProvider {
-        let mut provider = ShellToolProvider::default()
-            .with_sandbox_profile(sandbox_profile.clone())
-            .with_approval_mode(approval_mode.clone());
-        if let Some(wiring) = host_permits {
-            provider = provider
-                .with_permit_ledger(Arc::clone(&wiring.ledger))
-                .with_host_permit_registry(Arc::clone(&wiring.registry))
-                .with_host_permit_prompts(wiring.prompt_sender.clone())
-                .with_preselected_permit_variant(wiring.preselected_variant);
-            // Runde 5, Teil N: Host-Mode-Anfrage nur mit TUI-Verdrahtung.
-            if let Some(escalation) = &wiring.host_escalation {
-                provider = provider.with_host_escalation(escalation.clone());
-            }
-            // Runde 5, Teil N: Obergrenze `[shell] max_timeout_secs`.
-            if let Some(max_timeout_secs) = wiring.shell_max_timeout_secs {
-                provider = provider.with_max_timeout_secs(max_timeout_secs);
-            }
-        }
-        provider
+        shell_provider_for(sandbox_profile, host_permits, approval_mode)
     };
     // Plan R9, Teil F: `shell.exec` plus — mit Job-Verdrahtung — direkt
     // dahinter `job.*` über einem Klon **desselben** Shell-Providers
@@ -5903,6 +5979,58 @@ mod tests {
     // beweist, dass Ledger bzw. Registry tatsächlich erreicht werden — ein
     // Blick auf `registered_tool_names()` allein würde die Verdrahtung nicht
     // zeigen.
+
+    /// PL-97 E2b: `[sandbox] execution` reaches the shell provider the
+    /// composition builds (and with it `job.start`, which clones that
+    /// provider); unset means `chain`, and without any config the
+    /// provider keeps its safe default.
+    #[test]
+    fn test_sandbox_execution_config_reaches_the_shell_provider() -> TestResult {
+        use harw_tool_shell::SandboxExecution;
+        let approval_mode = ApprovalModeCell::default();
+        let wiring = || {
+            let (sender, _receiver) = harw_tool_shell::host_permit_prompt_channel();
+            HostPermitWiring::new(
+                Arc::new(ProcessPermitLedger::default()),
+                Arc::new(HostPermitSessionRegistry::default()),
+                sender,
+            )
+        };
+        for (text, expected) in [
+            ("chain", SandboxExecution::Chain),
+            ("legacy", SandboxExecution::Legacy),
+        ] {
+            let config: harw_config::HarnessConfig =
+                toml::from_str(&format!("[sandbox]\nexecution = \"{text}\"\n"))
+                    .map_err(ctx("parse [sandbox] execution"))?;
+            let wiring = wiring().with_sandbox_execution(config.sandbox.effective_execution());
+            assert_eq!(wiring.shell_execution, Some(expected), "{text}");
+            for sandbox_profile in [SandboxProfile::Strict, SandboxProfile::Host] {
+                let shell = shell_provider_for(&sandbox_profile, Some(&wiring), &approval_mode);
+                assert_eq!(shell.execution(), expected, "{text} {sandbox_profile:?}");
+            }
+        }
+        let unset = wiring()
+            .with_sandbox_execution(harw_config::SandboxSection::default().effective_execution());
+        assert_eq!(
+            shell_provider_for(&SandboxProfile::Strict, Some(&unset), &approval_mode).execution(),
+            SandboxExecution::Chain
+        );
+        assert_eq!(compiled_agent_sandbox_execution(), SandboxExecution::Chain);
+        // No config: the provider's safe default.
+        for host_permits in [None, Some(wiring())] {
+            assert_eq!(
+                shell_provider_for(
+                    &SandboxProfile::Strict,
+                    host_permits.as_ref(),
+                    &approval_mode
+                )
+                .execution(),
+                SandboxExecution::default()
+            );
+        }
+        Ok(())
+    }
 
     mod permits_wiring {
         use super::*;

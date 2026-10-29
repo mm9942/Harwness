@@ -4502,6 +4502,71 @@ mod tests {
         Ok(())
     }
 
+    /// PL-97 E2b (PR #154 review): the route is chosen before `prlimit` is
+    /// looked up. On a host without a fixed-path `prlimit` and with
+    /// `require_rlimits = true`, a `bwrap-trampoline` route is not refused
+    /// (the trampoline sets the rlimits itself) and the job spec carries
+    /// the rlimits; a plain Bubblewrap route still needs `prlimit`.
+    #[tokio::test]
+    async fn test_chain_trampoline_route_runs_without_a_fixed_path_prlimit() -> TestResult {
+        let _hidden = crate::limits::test_seam::HiddenPrlimit::install();
+        let required = ShellLimits::default();
+        assert!(required.require_rlimits);
+        assert!(
+            required.resolve_prlimit().is_err(),
+            "the seam must hide prlimit with require_rlimits = true"
+        );
+
+        let port = RecordingPort::new(Some(BackendKind::BwrapTrampoline));
+        let mut provider = recording_provider(&port);
+        provider.limits.require_rlimits = true;
+        let (output, _sandbox) = execute(
+            &provider,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+            "echo hi",
+        )
+        .await?;
+        match &output {
+            ToolOutput::Json { content } => assert_eq!(content["exit_code"], 0, "{content}"),
+            other => return Err(TestError::Unexpected(format!("refused: {other:?}"))),
+        }
+        let requests = port.requests()?;
+        let [request] = requests.as_slice() else {
+            return Err(TestError::Unexpected(format!(
+                "expected one request, got {requests:?}"
+            )));
+        };
+        let limits = timeouts::limits_for(provider.limits, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(request.limits, limits.job_resources());
+        let spec = request.job_spec().map_err(TestError::Unexpected)?;
+        assert!(spec.resources.require_rlimits);
+        assert_eq!(spec.resources.address_space_max, Some(limits.as_bytes));
+        assert_eq!(spec.resources.cpu_time_max, Some(limits.cpu_secs));
+        assert_eq!(spec.resources.file_size_max, Some(limits.fsize_bytes));
+        assert_eq!(
+            spec.resources.open_files_max,
+            u32::try_from(limits.nofile).ok()
+        );
+
+        // Plain Bubblewrap: the runtime puts `prlimit` in front of `bwrap`,
+        // so a missing one still refuses the call before anything starts.
+        let port = RecordingPort::new(Some(BackendKind::Bwrap));
+        let mut provider = recording_provider(&port);
+        provider.limits.require_rlimits = true;
+        let (output, _sandbox) = execute(
+            &provider,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+            "echo hi",
+        )
+        .await?;
+        match &output {
+            ToolOutput::Error { message } => assert!(message.contains("prlimit"), "{message}"),
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        assert!(port.requests()?.is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_chain_results_keep_the_timeout_and_truncation_shape() -> TestResult {
         let budget = TRUNCATION_MARKER.len() + 4;

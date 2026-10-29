@@ -22,9 +22,20 @@
 //! - Eigenes Absenden ([`ChatScroll::force_follow`]) und
 //!   [`ChatScroll::jump_to_bottom`] springen ans Ende und folgen wieder.
 //!
+//! # Identitätsanker (PL-94 W01 M2c)
+//! Der zeilenbasierte Abgleich reicht nicht, sobald der Verlauf virtuelle,
+//! umsortierbare Segmente enthält (Live-Zellen der Hintergrund-Agenten,
+//! `app/live_slots.rs`). Solange hochgescrollt ist, merkt sich
+//! [`ChatScroll::sync_anchor`] deshalb zusätzlich die **oberste sichtbare
+//! kanonische Zelle** ([`CellAnchor`]: [`CellId`] plus Zeile in der Zelle)
+//! und stellt sie beim nächsten Zeichnen exakt wieder her. Jede
+//! Scroll-Bewegung des Nutzers verwirft den Anker; er wird dann aus dem neuen
+//! Offset neu bestimmt. Zurück am Ende gibt es keinen Anker.
+//!
 //! # Schlüsseltypen
 //! - [`ChatScroll`] — das zentrale State-Struct
 //! - [`ScrollAction`] — Rückgabewert von Event-Handlern
+//! - [`CellId`] / [`CellAnchor`] — Identitätsanker auf eine kanonische Zelle
 //!
 //! # Nebenläufigkeit
 //! Der Zustand liegt in [`Cell`]s, damit das Rendering (das nur `&ChatApp`
@@ -60,6 +71,22 @@ struct Measure {
     width: u16,
 }
 
+/// UI-only identity of a canonical history cell: its index in the
+/// append-only cell vector of the chat. Virtual segments (live slots) have no
+/// `CellId`; they never serve as an anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CellId(pub usize);
+
+/// Identity anchor of the top visible row while scrolled away from the tail:
+/// the canonical cell and the wrapped row inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellAnchor {
+    /// Canonical cell that holds (or precedes) the top visible row.
+    pub cell: CellId,
+    /// Wrapped row of the top visible row, counted from the start of `cell`.
+    pub line: usize,
+}
+
 /// State der Chat-Scroll-Position.
 ///
 /// `offset` ist die Anzahl Zeilen VOM ENDE aus gemessen:
@@ -74,6 +101,10 @@ pub struct ChatScroll {
     unseen: Cell<usize>,
     /// Geometrie des letzten [`ChatScroll::sync_layout`]-Aufrufs.
     last: Cell<Option<Measure>>,
+    /// Identitätsanker der obersten sichtbaren Zeile, solange hochgescrollt
+    /// (siehe [`ChatScroll::sync_anchor`]); `None` am Ende oder direkt nach
+    /// einer Scroll-Bewegung des Nutzers.
+    anchor: Cell<Option<CellAnchor>>,
 }
 
 /// Ergebnis einer Event-Bearbeitung.
@@ -95,6 +126,7 @@ impl ChatScroll {
             offset: Cell::new(0),
             unseen: Cell::new(0),
             last: Cell::new(None),
+            anchor: Cell::new(None),
         }
     }
 
@@ -120,11 +152,20 @@ impl ChatScroll {
         self.is_following()
     }
 
+    /// Identitätsanker der obersten sichtbaren Zeile (nur hochgescrollt und
+    /// nach mindestens einem [`ChatScroll::sync_anchor`]).
+    pub fn anchor(&self) -> Option<CellAnchor> {
+        self.anchor.get()
+    }
+
     /// Setzt den Offset und hält die Invariante `unseen <= offset`
-    /// (ungesehen kann nur sein, was unterhalb der Ansicht liegt).
+    /// (ungesehen kann nur sein, was unterhalb der Ansicht liegt). Eine
+    /// Bewegung durch den Nutzer verwirft den Identitätsanker; das nächste
+    /// [`ChatScroll::sync_anchor`] bestimmt ihn aus dem neuen Offset.
     fn set_offset(&self, offset: usize) {
         self.offset.set(offset);
         self.unseen.set(self.unseen.get().min(offset));
+        self.anchor.set(None);
     }
 
     /// Größter sinnvoller Offset laut letzter Messung; ohne Messung
@@ -272,6 +313,60 @@ impl ChatScroll {
         offset = offset.min(max_offset);
         self.offset.set(offset);
         self.unseen.set(unseen.min(offset));
+        offset
+    }
+
+    /// Stellt die oberste sichtbare Zelle per Identität wieder her und merkt
+    /// sie für das nächste Zeichnen (PL-94 W01 M2c).
+    ///
+    /// # Description
+    /// Wird nach [`ChatScroll::sync_layout`] mit der Geometrie der aktuellen
+    /// (virtuellen) Zellliste aufgerufen:
+    /// - **Folgen** (`offset = 0`): kein Anker, Offset bleibt 0.
+    /// - **Hochgescrollt mit Anker**: löst `resolve` den Anker auf (Startzeile
+    ///   der Zelle plus Zeile in der Zelle), wird der Offset so gesetzt, dass
+    ///   genau diese Zeile oben steht — unabhängig davon, wie viele Zeilen
+    ///   darüber oder darunter dazugekommen sind. Mindestens 1, damit das
+    ///   Folgen nicht stillschweigend wieder angeht.
+    /// - Danach wird der Anker aus der jetzt obersten Zeile neu bestimmt
+    ///   (`locate`); ohne auflösbare Zelle bleibt es beim zeilenbasierten
+    ///   Offset.
+    ///
+    /// # Arguments
+    /// - `total_lines` (`usize`): Gesamtzeilen (nach Umbruch).
+    /// - `viewport` (`usize`): sichtbare Zeilen.
+    /// - `resolve`: Anker → oberste Zeile (vom Anfang gezählt), `None` wenn
+    ///   die Zelle nicht mehr existiert.
+    /// - `locate`: oberste Zeile → Anker.
+    ///
+    /// # Returns
+    /// Den Offset vom Ende, mit dem jetzt gezeichnet werden soll.
+    pub fn sync_anchor<R, L>(
+        &self,
+        total_lines: usize,
+        viewport: usize,
+        resolve: R,
+        locate: L,
+    ) -> usize
+    where
+        R: Fn(CellAnchor) -> Option<usize>,
+        L: Fn(usize) -> Option<CellAnchor>,
+    {
+        let max_offset = total_lines.saturating_sub(viewport);
+        let mut offset = self.offset.get().min(max_offset);
+        if offset == 0 {
+            self.anchor.set(None);
+            return 0;
+        }
+        if let Some(top) = self.anchor.get().and_then(&resolve) {
+            // `max_offset >= 1`, sonst wäre `offset` oben schon 0 gewesen.
+            offset = max_offset.saturating_sub(top).clamp(1, max_offset);
+            let unseen = self.unseen.get().min(offset);
+            self.offset.set(offset);
+            self.unseen.set(unseen);
+        }
+        let top = max_offset.saturating_sub(offset);
+        self.anchor.set(locate(top));
         offset
     }
 
@@ -760,5 +855,115 @@ mod tests {
         s.jump_to_bottom();
         s.jump_to_top_measured();
         assert_eq!(s.offset(), 80);
+    }
+
+    /// PL-94 W01 M2c: Zellen der Höhe 10 ab Zeile `start`; `locate`/`resolve`
+    /// über eine feste Liste (Startzeile, Höhe) je Zelle.
+    fn geometry(starts: &[(usize, usize)]) -> (
+        impl Fn(CellAnchor) -> Option<usize> + '_,
+        impl Fn(usize) -> Option<CellAnchor> + '_,
+    ) {
+        let resolve = move |anchor: CellAnchor| {
+            starts
+                .get(anchor.cell.0)
+                .map(|(start, rows)| start + anchor.line.min(rows.saturating_sub(1)))
+        };
+        let locate = move |top: usize| {
+            starts
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, (start, _))| *start <= top)
+                .map(|(index, (start, _))| CellAnchor {
+                    cell: CellId(index),
+                    line: top - start,
+                })
+        };
+        (resolve, locate)
+    }
+
+    /// Am Ende gibt es keinen Anker; hochgescrollt merkt sich der Abgleich die
+    /// oberste sichtbare Zelle samt Zeile.
+    #[test]
+    fn anchor_is_set_only_while_scrolled_away() {
+        let mut s = ChatScroll::new();
+        let cells = [(0, 10), (10, 10), (20, 10), (30, 10)];
+        let (resolve, locate) = geometry(&cells);
+        assert_eq!(s.sync_anchor(40, 10, &resolve, &locate), 0);
+        assert_eq!(s.anchor(), None);
+        s.scroll_up(15, 40, 10);
+        assert_eq!(s.sync_anchor(40, 10, &resolve, &locate), 15);
+        // oberste Zeile = 40 - 10 - 15 = 15 → Zelle 1, Zeile 5.
+        assert_eq!(
+            s.anchor(),
+            Some(CellAnchor {
+                cell: CellId(1),
+                line: 5
+            })
+        );
+        s.jump_to_bottom();
+        assert_eq!(s.anchor(), None);
+        assert_eq!(s.sync_anchor(40, 10, &resolve, &locate), 0);
+    }
+
+    /// Schiebt sich oberhalb der Ansicht ein virtuelles Segment ein (die
+    /// Zeilenzählung allein sähe nur „unten gewachsen“), hält der Anker
+    /// trotzdem exakt dieselbe oberste Zelle.
+    #[test]
+    fn anchor_keeps_the_same_top_cell_when_rows_appear_above_it() {
+        let mut s = ChatScroll::new();
+        let before = [(0, 10), (10, 10), (20, 10), (30, 10)];
+        let (resolve, locate) = geometry(&before);
+        s.scroll_up(15, 40, 10);
+        s.sync_layout(40, 10, 80);
+        s.sync_anchor(40, 10, &resolve, &locate);
+        // 6 neue Zeilen VOR Zelle 1 (etwa eine Live-Zelle) und 4 am Ende.
+        let after = [(0, 10), (16, 10), (26, 10), (36, 14)];
+        let (resolve, locate) = geometry(&after);
+        s.sync_layout(50, 10, 80);
+        let offset = s.sync_anchor(50, 10, &resolve, &locate);
+        // oberste Zeile = 50 - 10 - offset muss wieder Zelle 1, Zeile 5 sein.
+        assert_eq!(50 - 10 - offset, 21);
+        assert_eq!(
+            s.anchor(),
+            Some(CellAnchor {
+                cell: CellId(1),
+                line: 5
+            })
+        );
+        assert!(!s.is_following());
+    }
+
+    /// Eine Scroll-Bewegung verwirft den Anker; er folgt dem neuen Offset.
+    #[test]
+    fn user_scroll_rederives_the_anchor() {
+        let mut s = ChatScroll::new();
+        let cells = [(0, 10), (10, 10), (20, 10), (30, 10)];
+        let (resolve, locate) = geometry(&cells);
+        s.scroll_up(15, 40, 10);
+        s.sync_anchor(40, 10, &resolve, &locate);
+        s.scroll_up(10, 40, 10);
+        assert_eq!(s.anchor(), None);
+        assert_eq!(s.sync_anchor(40, 10, &resolve, &locate), 25);
+        assert_eq!(
+            s.anchor(),
+            Some(CellAnchor {
+                cell: CellId(0),
+                line: 5
+            })
+        );
+    }
+
+    /// Verschwindet die Ankerzelle (`/clear`), bleibt es beim zeilenbasierten
+    /// Offset, ohne Panic und ohne stillschweigendes Folgen.
+    #[test]
+    fn unresolvable_anchor_falls_back_to_the_line_offset() {
+        let mut s = ChatScroll::new();
+        let cells = [(0, 10), (10, 10), (20, 10), (30, 10)];
+        let (resolve, locate) = geometry(&cells);
+        s.scroll_up(15, 40, 10);
+        s.sync_anchor(40, 10, &resolve, &locate);
+        let none = |_: CellAnchor| None;
+        assert_eq!(s.sync_anchor(40, 10, none, &locate), 15);
     }
 }

@@ -1,0 +1,34 @@
+export const meta = {
+  name: 'pl97-zone-runner',
+  description: 'PL-97 generic zone runner: per zone code -> correctness + plan-conformance review -> fix, zones from args',
+  phases: [
+    { title: 'Code', detail: 'one coding agent per zone' },
+    { title: 'Review', detail: 'two reviewers per zone' },
+    { title: 'Fix', detail: 'apply findings, re-run gates' },
+  ],
+}
+const REPO = '/home/user/Harwness'
+const PLAN = REPO + '/docs/planning/97-harw-dod-mission-control-chain/README.md'
+const BUSY = (args && args.busy) ? args.busy : ''
+const RULES = 'HARD RULES for this shared working tree (' + REPO + ', branch ccr-54aa3dfd-o46he2, based on origin/dev). Other agents edit OTHER files at the same time' + (BUSY ? ' (currently busy elsewhere: ' + BUSY + ')' : '') + '. (1) Edit ONLY the files listed in your zone; Cargo.lock may change via cargo. If you must touch a file outside your zone for the build to work, make the smallest possible change and report it in deviations_from_plan. (2) NEVER run git commands that change state (no add/commit/stash/checkout/reset/clean/restore); read-only git (diff, log, show, status) is fine. (3) NEVER run `cargo fmt --all`; use `cargo fmt -p <crate>`. (4) Builds share one target dir and serialize on a lock: write all code first, then at most ~4 check/test cycles with -p selections; CARGO_INCREMENTAL=0; be patient with file-lock waits; for very large crates (harw-tui, harw-core, harw-runtime, harw-cli) run tests with a name filter for your modules and clippy for the whole crate. (5) Conventions (plan §0.2): Rust 2024, no unsafe, NO unwrap/expect/panic in production code (tests return Result with ?), English doc comments and docs, inline comments in the language of the surrounding file (German in harw-tui/harw-ops/harw-registry-defaults/harw-cli where the file is German), respect xtask/arch-policy.toml layers (run `cargo run -q -p xtask -- gates arch` if you add a dependency edge). (6) Read the plan ' + PLAN + ' (your WP in §4, §0, the §2 baseline for your area, the §3 design) and the code before writing; the CODE is the source of truth — follow the tree and record deviations. (7) Earlier waves already landed parts of the plan in this tree (see `git log --oneline origin/dev..HEAD` and the current files); build on them, do not duplicate. (8) Files in your zone may contain partial work from an interrupted attempt: check `git diff`/`git status --short` first and continue. (9) No scope creep, no unrelated refactors. (10) Final answer = the structured result only.'
+const RESULT = { type: 'object', properties: { zone: { type: 'string' }, changed_files: { type: 'array', items: { type: 'string' } }, tests_added: { type: 'array', items: { type: 'string' } }, gates: { type: 'object', properties: { fmt: { type: 'string' }, clippy: { type: 'string' }, test: { type: 'string' } }, required: ['fmt', 'clippy', 'test'] }, deviations_from_plan: { type: 'array', items: { type: 'string' } }, open_issues: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' } }, required: ['zone', 'changed_files', 'gates', 'summary'] }
+const FINDINGS = { type: 'object', properties: { findings: { type: 'array', items: { type: 'object', properties: { severity: { type: 'string', enum: ['blocking', 'should', 'nit'] }, file: { type: 'string' }, line: { type: 'integer' }, issue: { type: 'string' }, fix: { type: 'string' } }, required: ['severity', 'file', 'issue'] } }, verdict: { type: 'string' } }, required: ['findings', 'verdict'] }
+const ZONES = args.zones
+log('zones: ' + ZONES.map(z => z.id).join(', '))
+const runZone = (z) => agent('You are the coding agent for PL-97 zone ' + z.id + '.\n' + RULES + '\nYOUR FILES: ' + z.files + '\nYOUR SPEC: ' + z.spec + '\nGATES for this zone: ' + z.gates + '\nWork until those gates are green; if a gate cannot pass because of something outside your zone, report it precisely in open_issues.', { label: 'code:' + z.id, phase: 'Code', schema: RESULT })
+  .then(code => code ? parallel([
+    ['correctness', 'correctness, safety and repo conventions (no unwrap/expect/panic in production paths, no unsafe, error context, fail-closed behaviour, on-disk/wire compatibility, authority boundaries: no new path from model output to host action, approvals not bypassed; test quality: do tests assert the spec?)'],
+    ['plan-conformance', 'conformance with the PL-97 WP spec and the owner-approved designs in plan §3, and scope discipline (missing spec items, unrequested additions, files touched outside the zone, unjustified deviations)'],
+  ].map(([lens, what]) => () => agent('You are the ' + lens + ' reviewer for PL-97 zone ' + z.id + ' in ' + REPO + ' (read-only: do not edit files, no git state changes; do NOT run cargo builds/tests unless one specific claim cannot be settled by reading the code -- at most one targeted run; the coding agent already ran the gates and the orchestrator re-runs them before committing). Plan: ' + PLAN + '. Zone files: ' + z.files + '. Spec: ' + z.spec + '. Coding result: ' + JSON.stringify(code) + '\nReview for ' + what + '. Read the real diff (`git diff -- <zone paths>`, `git status --short`, new files in full). Return findings (severity blocking|should|nit, file, line, issue, concrete fix) and a one-line verdict.', { label: 'review:' + z.id + ':' + lens, phase: 'Review', schema: FINDINGS }))).then(rs => ({ code, reviews: rs.filter(Boolean) })) : null)
+  .then(r => {
+    if (!r) return null
+    const all = r.reviews.flatMap(x => x.findings)
+    const todo = all.filter(f => f.severity !== 'nit')
+    log('zone ' + z.id + ': ' + all.filter(f => f.severity === 'blocking').length + ' blocking, ' + all.filter(f => f.severity === 'should').length + ' should')
+    if (!todo.length) return { zone: z.id, code: r.code, reviews: r.reviews, fix: null }
+    return agent('You are the fix agent for PL-97 zone ' + z.id + '.\n' + RULES + '\nYOUR FILES: ' + z.files + '\nApply every blocking finding and every clearly-correct should finding; for any you reject, say why in deviations_from_plan: ' + JSON.stringify(todo) + '\nPrevious result: ' + JSON.stringify(r.code) + '\nThen re-run the zone gates until green: ' + z.gates, { label: 'fix:' + z.id, phase: 'Fix', schema: RESULT }).then(fix => ({ zone: z.id, code: r.code, reviews: r.reviews, fix }))
+  })
+const lanes = args.lanes || ZONES.map(z => [z.id])
+const byId = {}; ZONES.forEach(z => { byId[z.id] = z })
+const out = await parallel(lanes.map(lane => async () => { const res = []; for (const id of lane) { res.push(await runZone(byId[id])) } return res }))
+return out.flat().filter(Boolean).map(r => { const fin = r.fix || r.code; return { zone: r.zone, summary: fin.summary, gates: fin.gates, changed_files: fin.changed_files, open_issues: fin.open_issues || [], deviations: fin.deviations_from_plan || [], verdicts: r.reviews.map(x => x.verdict) } })
