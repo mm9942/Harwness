@@ -192,10 +192,22 @@ impl DodStatus {
                 .any(|unit| unit.is_installed() == Some(true) || unit.is_active())
     }
 
+    /// `true` when the findings and health files come from a source only
+    /// the sentinel or a trusted config layer writes
+    /// ([`crate::paths::ExportSource::is_verified`]). A `false` snapshot
+    /// may still carry findings (the home fallback); consumers that present
+    /// them as Harw-DoD facts show `export_paths.source` and its
+    /// [`crate::paths::ExportSource::hint`] next to them.
+    #[must_use]
+    pub const fn export_verified(&self) -> bool {
+        self.export_paths.source.is_verified()
+    }
+
     /// `high + critical` findings in the window, or `None` when DoD is not
     /// installed ([`Self::suite_installed`]) or the findings export is
     /// unreadable (the TUI hides its status mark then). When
-    /// `findings.complete` is `false` the count is a lower bound.
+    /// `findings.complete` is `false` the count is a lower bound. The count
+    /// does not check [`Self::export_verified`]; the caller labels the mark.
     #[must_use]
     pub fn attention_count(&self) -> Option<u32> {
         (self.suite_installed() && self.findings_export == ExportState::Readable)
@@ -253,6 +265,16 @@ pub fn status(ctx: &DodClientContext) -> DodStatus {
                 (summary, export)
             }
         };
+    // An unreadable system export is reported as such, with the operator
+    // hint, never replaced by the home fallback (see `resolve_export_paths`).
+    let (health_export, findings_export) = if export_paths.source.is_verified() {
+        (health_export, findings_export)
+    } else {
+        (
+            with_source_hint(health_export, export_paths.source),
+            with_source_hint(findings_export, export_paths.source),
+        )
+    };
     DodStatus {
         install: install_state(&ctx.libexec_dir),
         config,
@@ -263,6 +285,16 @@ pub fn status(ctx: &DodClientContext) -> DodStatus {
         findings,
         findings_export,
         export_paths,
+    }
+}
+
+/// Appends the source hint to an unreadable state; other states are kept.
+fn with_source_hint(state: ExportState, source: crate::paths::ExportSource) -> ExportState {
+    match (state, source.hint()) {
+        (ExportState::Unreadable { reason }, Some(hint)) => ExportState::Unreadable {
+            reason: sanitize(&format!("{reason}; {hint}"), MAX_REASON_BYTES * 2, ' '),
+        },
+        (state, _) => state,
     }
 }
 
@@ -453,6 +485,76 @@ mod tests {
         // A guard file alone, with systemd out of reach, confirms nothing.
         fs::write(&ctx.warden_flag, "")?;
         assert_eq!(status(&ctx).warden, WardenState::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_system_export_is_not_replaced_by_planted_home_findings() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let home = root.path().join("home");
+        let planted = home.join("dod").join("export");
+        fs::create_dir_all(&planted)?;
+        fs::write(
+            planted.join("findings.jsonl"),
+            concat!(
+                r#"{"finding_id":"f-1","host":"h","rule_id":"egress","severity":"critical","summary":"planted","observed_at":"2026-10-28T09:00:00Z"}"#,
+                "
+",
+            ),
+        )?;
+        let system = root.path().join("system-export");
+        fs::create_dir(&system)?;
+        fs::set_permissions(&system, fs::Permissions::from_mode(0o000))?;
+        let listable = fs::read_dir(&system).is_ok();
+        let libexec = root.path().join("libexec");
+        fs::create_dir(&libexec)?;
+        for binary in DOD_BINARIES {
+            fs::write(libexec.join(binary), "")?;
+            fs::set_permissions(libexec.join(binary), fs::Permissions::from_mode(0o755))?;
+        }
+        let empty_path = root.path().join("bin");
+        fs::create_dir(&empty_path)?;
+        let now = OffsetDateTime::parse("2026-10-28T10:00:00Z", &Rfc3339)?;
+        let ctx = DodClientContext {
+            harw_home: home,
+            export_dir: None,
+            system_export_dir: system.clone(),
+            config_path: Some(root.path().join("absent-config.toml")),
+            libexec_dir: libexec,
+            warden_flag: root.path().join("warden.enable"),
+            search_path: Some(empty_path.into_os_string()),
+            findings_window: DEFAULT_FINDINGS_WINDOW,
+            now,
+        };
+        let snapshot = status(&ctx);
+        fs::set_permissions(&system, fs::Permissions::from_mode(0o750))?;
+        if listable {
+            // Root can list a 0o000 directory; the ordinary rule applies and
+            // the planted home file is out of the picture either way.
+            assert_eq!(snapshot.export_paths.source, ExportSource::System);
+            assert_eq!(snapshot.findings.total(), 0);
+            return Ok(());
+        }
+        assert_eq!(snapshot.export_paths.source, ExportSource::SystemUnreadable);
+        assert!(!snapshot.export_verified());
+        assert_eq!(
+            snapshot.export_paths.findings,
+            system.join("findings.jsonl")
+        );
+        // The planted critical finding below the home is never counted.
+        assert_eq!(snapshot.findings.total(), 0);
+        assert!(!snapshot.findings.complete);
+        assert_eq!(snapshot.attention_count(), None);
+        match &snapshot.findings_export {
+            ExportState::Unreadable { reason } => {
+                assert!(reason.contains("harw-dod-readers"), "{reason}");
+            }
+            other => return Err(format!("expected unreadable, got {other:?}").into()),
+        }
+        assert!(matches!(
+            snapshot.health_export,
+            ExportState::Unreadable { .. }
+        ));
         Ok(())
     }
 
