@@ -154,8 +154,8 @@ Verified corrections discovered during integration:
   prevents cancellation of the outer future from prematurely dropping the
   dispatch lifetime. The guard grants no permission and does not establish
   quiescence for unrelated remote/process effects.
-- The combined configuration table contains 201 entries / 102 ProfileReplaces;
-  the base operation registry contains 52 operations, not the independently
+- The combined configuration table contains 202 entries / 103 ProfileReplaces;
+  the base operation registry contains 53 operations, not the independently
   updated counts from either upstream branch.
 - A #157 host summary call needed explicit MutexGuard dereferencing to compile.
 - The #157 rollback tombstone was originally mistaken for a never-admitted

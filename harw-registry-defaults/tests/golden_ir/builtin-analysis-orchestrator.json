@@ -18,6 +18,7 @@
   "tools": {
     "admitted": [
       "fs.read",
+      "fs.view_image",
       "fs.list",
       "fs.search",
       "fs.glob",
@@ -185,6 +186,7 @@
       "fs.list",
       "fs.read",
       "fs.search",
+      "fs.view_image",
       "job.list",
       "job.logs",
       "job.status",
@@ -296,6 +298,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "825399934f47a8a2efb18ff19ff7ca1c676513f108f11af7fde1c598c30a30cc"
+    "digest": "74078a14dde39ba893eb61134c07413ff463482e851d9a69e127b4d1d962c087"
   }
 }

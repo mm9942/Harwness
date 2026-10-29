@@ -24,6 +24,7 @@
       "job.stop",
       "job.list",
       "fs.read",
+      "fs.view_image",
       "fs.list",
       "fs.search",
       "fs.glob",
@@ -124,6 +125,7 @@
       "fs.list",
       "fs.read",
       "fs.search",
+      "fs.view_image",
       "host.sudo_exec",
       "job.list",
       "job.logs",
@@ -229,6 +231,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "2cd9ef4dd550ac98ef4e15bab2af7a9e2d2b96c171815c284ab851279d6a85a4"
+    "digest": "21c6c4f23417258529a8210ad13e3c3a9f24b7fa4859008f8dfa951c9677451a"
   }
 }

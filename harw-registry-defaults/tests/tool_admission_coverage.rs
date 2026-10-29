@@ -502,7 +502,7 @@ fn spawning_roles_admit_exactly_their_child_result_tools() -> TestResult {
 }
 
 /// Runde 3, Welle E + Matrix-Unterlagen: die drei Matrix-Game-Sitze
-/// admittieren genau die lesenden Unterlagen-Werkzeuge (fünf lesende `fs.*`
+/// admittieren genau die lesenden Unterlagen-Werkzeuge (sechs lesende `fs.*`
 /// plus `doc.read_pdf`), und ihr Profil (`MatrixReader`) bewirbt genau
 /// diese — Inventar und Aufrufrecht bleiben deckungsgleich, ohne Netz,
 /// Schreiben oder Exec.
@@ -510,6 +510,7 @@ fn spawning_roles_admit_exactly_their_child_result_tools() -> TestResult {
 fn matrix_roles_admit_and_advertise_exactly_the_read_tools() -> TestResult {
     let expected: BTreeSet<&str> = [
         "fs.read",
+        "fs.view_image",
         "fs.list",
         "fs.search",
         "fs.glob",
@@ -611,6 +612,7 @@ fn uia_latex_writer_admits_exactly_files_pdf_and_latex_build() -> TestResult {
     assert_eq!(profile, RegistryProfile::UiaLatexWriter);
     let expected: BTreeSet<&str> = [
         "fs.read",
+        "fs.view_image",
         "fs.write",
         "fs.edit",
         "fs.list",
@@ -893,6 +895,7 @@ fn game_master_admits_exactly_its_matrix_tools() -> TestResult {
         .collect();
     let expected: BTreeSet<&str> = [
         "fs.read",
+        "fs.view_image",
         "fs.list",
         "fs.search",
         "fs.glob",

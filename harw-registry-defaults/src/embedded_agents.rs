@@ -2812,7 +2812,7 @@ mod tests {
     // ── Matrix-Game-Sitze (Runde 3, Welle E) ───────────────────────────────
 
     /// Die drei Matrix-Sitz-Rollen: organisatorisch `Worker`, admittieren
-    /// genau die lesenden Unterlagen-Werkzeuge (fünf lesende `fs.*` plus
+    /// genau die lesenden Unterlagen-Werkzeuge (sechs lesende `fs.*` plus
     /// `doc.read_pdf`, Runde 3 „Matrix-Unterlagen“) und verbieten Schreiben,
     /// Exec und Netz ausdrücklich; nicht pausierbar, ohne eigene Ebene
     /// darunter, mit höchstens 16 Werkzeugaufrufen und einem
@@ -2837,6 +2837,7 @@ mod tests {
                 .collect();
             let expected: std::collections::BTreeSet<&str> = [
                 "fs.read",
+                "fs.view_image",
                 "fs.list",
                 "fs.search",
                 "fs.glob",
@@ -2895,6 +2896,7 @@ mod tests {
             explorer.tool_surface().admitted(),
             [
                 "fs.read",
+                "fs.view_image",
                 "fs.list",
                 "fs.search",
                 "fs.glob",
