@@ -180,6 +180,17 @@ pub(crate) fn project(
                 return None;
             }
             let model = nullable(data, "model")?;
+            // UIA always supplies this nullable field, including when a model
+            // is selected. Never discard incompatible cleared-model detail.
+            let cleared_model = if target == "uia" {
+                let cleared = nullable(data, "cleared_model")?;
+                if model.is_some() && cleared.is_some() {
+                    return None;
+                }
+                cleared
+            } else {
+                None
+            };
             lines.push(t(
                 "operation_feedback.model",
                 "Model selection ({target}): {provider}/{model}.",
@@ -193,7 +204,7 @@ pub(crate) fn project(
                 if target != "uia" {
                     return None;
                 }
-                if let Some(previous) = nullable(data, "cleared_model")? {
+                if let Some(previous) = cleared_model {
                     lines.push(t(
                         "operation_feedback.cleared",
                         "Incompatible model cleared: {model}.",
@@ -555,5 +566,161 @@ mod tests {
         );
         assert!(!shown.text.contains("saved"));
         assert_eq!(output.data, before);
+    }
+    fn assert_fallback_preserves(meta: &OperationMeta, feedback: Value) {
+        let data = json!({"root_payload":{"user":"aktiviert {model}"},"ui_feedback":feedback});
+        let original = "original output with user/model detail aktiviert";
+        let mut output = OpOutput {
+            text: original.to_owned(),
+            data: Some(data.clone()),
+        };
+        // Mirror the shared dispatch application: rejected projection must leave
+        // both the operation's text and its complete original data untouched.
+        let projected = project(meta, UiLanguage::German, &output);
+        assert!(
+            projected.is_none(),
+            "malformed feedback projected: {feedback}"
+        );
+        if let Some(projected) = projected {
+            output.text = projected.text;
+        }
+        assert_eq!(output.text, original);
+        assert_eq!(output.data, Some(data));
+    }
+
+    #[test]
+    fn uia_model_requires_complete_consistent_cleared_state() {
+        let meta = harw_ops::model::UiaModelOperation.meta();
+        let valid = json!({"kind":"model_selection","target":"uia","provider":"p","model":"m","changed":true,"effective":"next_uia_turn","cleared_model":null,"warning":null,"note":null});
+        let output = OpOutput {
+            text: "legacy".to_owned(),
+            data: Some(json!({"ui_feedback":valid})),
+        };
+        assert!(project(meta, UiLanguage::English, &output).is_some());
+        let mut missing = valid.clone();
+        missing
+            .as_object_mut()
+            .expect("object")
+            .remove("cleared_model");
+        assert_fallback_preserves(meta, missing);
+        for invalid in [
+            json!(7),
+            json!(true),
+            json!([]),
+            json!({}),
+            json!("silently lost detail"),
+        ] {
+            let mut malformed = valid.clone();
+            malformed["cleared_model"] = invalid;
+            assert_fallback_preserves(meta, malformed);
+        }
+        for cleared in [Value::Null, json!("old incompatible model")] {
+            let mut valid_empty = valid.clone();
+            valid_empty["model"] = Value::Null;
+            valid_empty["cleared_model"] = cleared.clone();
+            let output = OpOutput {
+                text: "legacy".into(),
+                data: Some(json!({"ui_feedback":valid_empty})),
+            };
+            let shown =
+                project(meta, UiLanguage::English, &output).expect("valid empty UIA selection");
+            assert!(shown.text.contains("No model selected"));
+            if let Some(previous) = cleared.as_str() {
+                assert!(shown.text.contains(previous));
+            }
+        }
+    }
+
+    #[test]
+    fn every_semantic_variant_rejects_missing_and_wrong_type_required_fields() {
+        let cases: Vec<(&OperationMeta, Value)> = vec![
+            (
+                harw_ops::skills::SkillsOperation.meta(),
+                json!({"kind":"skill_state","name":"review","enabled":true,"changed":true,"manifest":"/profile/skill.toml","effective":"next_config_load"}),
+            ),
+            (
+                harw_ops::model::ModelOperation.meta(),
+                json!({"kind":"model_selection","target":"session","provider":"p","model":"m","changed":true,"effective":"next_turn","warning":null,"note":null}),
+            ),
+            (
+                harw_ops::model::UiaModelOperation.meta(),
+                json!({"kind":"model_selection","target":"uia","provider":"p","model":"m","changed":true,"effective":"next_uia_turn","cleared_model":null,"warning":null,"note":null}),
+            ),
+            (
+                harw_ops::model::UiaWorkerModelOperation.meta(),
+                json!({"kind":"model_selection","target":"uia-worker","provider":"p","model":"m","effective":"next_session","warning":null,"note":null}),
+            ),
+            (
+                harw_ops::models::ModelsOperation.meta(),
+                json!({"kind":"role_model","action":"set","role":"explorer","provider":"p","model":"m","live":true,"effective":"new_agents","warning":null,"note":null}),
+            ),
+            (
+                harw_ops::models::ModelsOperation.meta(),
+                json!({"kind":"role_model","action":"reset","role":"explorer","provider":null,"model":null,"live":false,"effective":"next_session","warning":null,"note":null}),
+            ),
+            (
+                harw_ops::models::ModelsOperation.meta(),
+                json!({"kind":"worker_model","roles":["uia-writer"],"choice":"uia","effective":"routing_unconfirmed","warning":null,"note":null,"fallback_provider":null}),
+            ),
+            (
+                harw_ops::effort::EffortOperation.meta(),
+                json!({"kind":"effort","target":"session","action":"set","level":"high","changed":true,"effective":"next_turn","note":null}),
+            ),
+            (
+                harw_ops::effort::EffortOperation.meta(),
+                json!({"kind":"effort","target":"session","action":"reset","level":null,"changed":true,"effective":"next_turn","note":null}),
+            ),
+            (
+                harw_ops::effort::EffortOperation.meta(),
+                json!({"kind":"effort","target":"session","action":"show","level":null,"changed":null,"effective":"current","note":null}),
+            ),
+            (
+                harw_ops::effort::UiaEffortOperation.meta(),
+                json!({"kind":"effort","target":"uia","action":"set","level":"high","changed":null,"effective":"next_session","note":null}),
+            ),
+            (
+                harw_ops::effort::UiaEffortOperation.meta(),
+                json!({"kind":"effort","target":"uia","action":"reset","level":null,"changed":null,"effective":"next_session","note":null}),
+            ),
+            (
+                harw_ops::effort::UiaEffortOperation.meta(),
+                json!({"kind":"effort","target":"uia","action":"show","level":null,"changed":null,"effective":"current","note":null}),
+            ),
+            (
+                harw_ops::mode::ModeOperation.meta(),
+                json!({"kind":"mode","action":"switch","mode":"plan","effective":"next_turn","note":null}),
+            ),
+            (
+                harw_ops::mode::ModeOperation.meta(),
+                json!({"kind":"mode","action":"default","mode":"work","effective":"next_session","note":null}),
+            ),
+            (
+                harw_ops::mode::ModeOperation.meta(),
+                json!({"kind":"mode","action":"show","mode":null,"default":null,"effective":"current","note":null}),
+            ),
+            (
+                harw_ops::permissions::PermissionsOperation.meta(),
+                json!({"kind":"approval","mode":"ask","changed":true,"effective":"next_tool_call"}),
+            ),
+        ];
+        for (meta, valid) in cases {
+            let output = OpOutput {
+                text: "legacy".into(),
+                data: Some(json!({"ui_feedback":valid})),
+            };
+            assert!(
+                project(meta, UiLanguage::English, &output).is_some(),
+                "valid {}: {valid}",
+                meta.name
+            );
+            for field in valid.as_object().expect("object").keys() {
+                let mut missing = valid.clone();
+                missing.as_object_mut().expect("object").remove(field);
+                assert_fallback_preserves(meta, missing);
+                let mut wrong_type = valid.clone();
+                wrong_type[field] = json!({"invalid":true});
+                assert_fallback_preserves(meta, wrong_type);
+            }
+        }
     }
 }
