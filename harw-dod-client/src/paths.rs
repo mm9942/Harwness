@@ -30,7 +30,7 @@ pub enum ExportSource {
     Override,
     /// The readable system export directory ([`SYSTEM_EXPORT_DIR`]).
     System,
-    /// [`SYSTEM_EXPORT_DIR`] exists but this process may not list it
+    /// [`SYSTEM_EXPORT_DIR`] cannot be inspected or listed by this process
     /// (typically: the user is not in the `harw-dod-readers` group). The
     /// paths still point at the system directory, so every read reports
     /// *unreadable* instead of silently showing the home fallback, which
@@ -104,7 +104,7 @@ impl ExportPaths {
 /// is taken relative to `harw_home`), 2. [`SYSTEM_EXPORT_DIR`] if it is a
 /// directory this process can list, 3. `<harw_home>/dod/export`.
 ///
-/// A system directory that exists but cannot be listed is **not** replaced
+/// A system path that cannot be inspected or listed is **not** replaced
 /// by the home fallback: the result is [`ExportSource::SystemUnreadable`]
 /// with the system paths, so the caller reports an unreadable export rather
 /// than findings from a directory the harw user can write.
@@ -150,14 +150,20 @@ enum DirProbe {
     Absent,
     /// A real directory this process can list.
     Listable,
-    /// A real directory this process cannot list (permission or any other
+    /// The path cannot be inspected or listed (permission or another
     /// error): reported, never silently replaced.
     Unreadable,
 }
 
 fn probe_dir(dir: &Path) -> DirProbe {
-    if !fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_dir()) {
-        return DirProbe::Absent;
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if !meta.file_type().is_dir() => return DirProbe::Absent,
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return DirProbe::Absent,
+        // An inaccessible ancestor can prevent even inspecting the export
+        // directory. That is not evidence it is absent: preserve the system
+        // paths instead of selecting a user-writable home fallback.
+        Err(_) => return DirProbe::Unreadable,
     }
     match fs::read_dir(dir) {
         Ok(_) => DirProbe::Listable,
@@ -264,6 +270,73 @@ mod tests {
         assert!(ExportSource::Home.hint().is_some());
         assert!(ExportSource::Override.hint().is_some());
         assert!(ExportSource::System.hint().is_none());
+    }
+
+    #[test]
+    fn inaccessible_system_parent_does_not_select_home_findings() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = tempfile::tempdir()?;
+        let parent = scratch.path().join("system");
+        let system = parent.join("export");
+        fs::create_dir_all(&system)?;
+        let home = scratch.path().join("home");
+        let planted = home.join("dod/export");
+        fs::create_dir_all(&planted)?;
+        fs::write(
+            planted.join(FINDINGS_FILE),
+            concat!(
+                r#"{"finding_id":"planted","host":"h","rule_id":"r","severity":"critical","summary":"untrusted","observed_at":"2026-10-28T09:00:00Z"}"#,
+                "\n",
+            ),
+        )?;
+        let now = time::OffsetDateTime::parse(
+            "2026-10-28T10:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )?;
+        let mut context = crate::DodClientContext::new(&home, now);
+        context.system_export_dir = system.clone();
+        context.search_path = None;
+        context.config_path = Some(scratch.path().join("missing-config"));
+        context.libexec_dir = scratch.path().join("missing-bin");
+        context.warden_flag = scratch.path().join("missing-guard");
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000))?;
+        let metadata = fs::symlink_metadata(&system);
+        let snapshot = crate::status(&context);
+        // Restore traversal before assertions so a failing regression cleans up.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
+        if metadata.is_ok() {
+            // Privileged runners can bypass directory search permissions.
+            assert_eq!(snapshot.export_paths.source, ExportSource::System);
+        } else {
+            assert_eq!(
+                metadata.err().map(|e| e.kind()),
+                Some(io::ErrorKind::PermissionDenied)
+            );
+            assert_eq!(snapshot.export_paths.source, ExportSource::SystemUnreadable);
+            assert!(!snapshot.export_verified());
+            assert!(matches!(
+                snapshot.findings_export,
+                crate::ExportState::Unreadable { .. }
+            ));
+            assert!(!snapshot.findings.complete);
+        }
+        assert_eq!(snapshot.export_paths.findings, system.join(FINDINGS_FILE));
+        assert_eq!(snapshot.findings.total(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn uncheckable_system_path_is_not_treated_as_missing() -> TestResult {
+        let scratch = tempfile::tempdir()?;
+        let not_a_directory = scratch.path().join("file");
+        fs::write(&not_a_directory, "")?;
+        let system = not_a_directory.join("export");
+        let paths = resolve_export_paths_with(None, &scratch.path().join("home"), &system);
+        assert_eq!(paths.source, ExportSource::SystemUnreadable);
+        assert_eq!(paths.findings, system.join(FINDINGS_FILE));
+        Ok(())
     }
 
     #[test]
