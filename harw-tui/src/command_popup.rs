@@ -171,7 +171,10 @@ const NAME_COLUMN_WIDTH: u16 = 22;
 impl CommandPopup {
     /// Rebuild translated metadata while retaining query and selected identity.
     pub(crate) fn refresh_catalog(&mut self, registry: &CommandRegistry) {
-        let selected = self.selected_name().map(str::to_owned);
+        let selected = self.filtered.get(self.selected).map(|&index| {
+            let item = &self.items[index];
+            (item.name.as_str(), item.usage.as_str())
+        });
         let refreshed = match &self.mode {
             PopupMode::CommandName => Some(Self::new(registry)),
             PopupMode::Subcommand { command } => {
@@ -180,12 +183,14 @@ impl CommandPopup {
         };
         if let Some(mut refreshed) = refreshed {
             refreshed.on_query_change(&self.query);
-            if let Some(selected) = selected {
-                if let Some(index) = refreshed
-                    .filtered
-                    .iter()
-                    .position(|index| refreshed.items[*index].name == selected)
-                {
+            if let Some((name, usage)) = selected {
+                if let Some(index) = refreshed.filtered.iter().position(|index| {
+                    let item = &refreshed.items[*index];
+                    // Subcommand usage is invariant parent/name/argument grammar;
+                    // command usage may also contain localized explanatory prose.
+                    item.name == name
+                        && (matches!(self.mode, PopupMode::CommandName) || item.usage == usage)
+                }) {
                     refreshed.selected = index;
                 }
             }
@@ -1049,6 +1054,67 @@ mod tests {
                     popup.on_key(make_key(KeyCode::Enter)),
                     PopupAction::Accept("list".to_owned())
                 );
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_subcommand_variant_survives_locale_refresh() -> TestResult {
+        use crate::i18n::{tr_for, with_language};
+        use harw_config::UiLanguage;
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        let spec = registry
+            .find("workbench")
+            .ok_or(TestError::Missing("workbench spec"))?;
+        let mut popup = CommandPopup::for_subcommands(spec)
+            .ok_or(TestError::Missing("workbench subcommands"))?;
+        popup.on_query_change("note");
+        popup.move_down();
+        let usage = "/workbench note edit <n> <text> | rm <n>";
+        assert_eq!(popup.items[popup.filtered[popup.selected]].usage, usage);
+        assert_eq!(
+            popup.items[popup.filtered[popup.selected]].description,
+            "Edit or delete a note"
+        );
+        for language in UiLanguage::ALL {
+            with_language(language, || -> TestResult {
+                let registry = CommandRegistry::built_in().map_err(ctx("localized registry"))?;
+                popup.refresh_catalog(&registry);
+                assert_eq!(popup.query, "note");
+                assert_eq!(
+                    popup.mode(),
+                    &PopupMode::Subcommand {
+                        command: "workbench".to_owned()
+                    }
+                );
+                assert!(popup.selection_moved);
+                assert_eq!(popup.selected, 1);
+                let selected = &popup.items[popup.filtered[popup.selected]];
+                assert_eq!(selected.name, "note");
+                assert_eq!(selected.usage, usage);
+                assert_eq!(
+                    selected.description,
+                    tr_for(
+                        language,
+                        "commands.subcommand.workbench.note_edit",
+                        "Edit or delete a note"
+                    )
+                );
+                assert_eq!(popup.completion_line("note"), "/workbench note ");
+                assert_eq!(popup.tab_outcome(), TabOutcome::Accept("note".to_owned()));
+                assert_eq!(
+                    popup.on_key(make_key(KeyCode::Enter)),
+                    PopupAction::Accept("note".to_owned())
+                );
+                popup.move_up();
+                assert_eq!(
+                    popup.items[popup.filtered[popup.selected]].usage,
+                    "/workbench note <text>"
+                );
+                popup.move_down();
+                assert_eq!(popup.items[popup.filtered[popup.selected]].usage, usage);
                 Ok(())
             })?;
         }
