@@ -73,8 +73,20 @@ const FIXED_KEYS: &[(&str, &str)] = &[
     ),
     ("Jobs-Fenster (fokussiert): Job-Details öffnen", "Enter"),
     (
+        "Jobs-Fenster (fokussiert): gewählten Job stoppen (Rückfrage, dann /jobs stop)",
+        "x",
+    ),
+    (
         "Finished/Failed (fokussiert): Kategorien auf-/zuklappen",
-        "Enter, f",
+        "f (Enter klappt auf)",
+    ),
+    (
+        "Finished/Failed (aufgeklappt): Einzelläufe öffnen und quittieren",
+        "Enter",
+    ),
+    (
+        "Finished/Failed (fokussiert): gewählte Kategorie quittieren (eingeklappt: alle)",
+        "a",
     ),
     ("Finished/Failed (fokussiert): Fehlschläge quittieren", "c"),
     (
@@ -806,6 +818,9 @@ mod tests {
         assert!(text.contains("alt+l"), "{text}");
         assert!(text.contains("an LIVE anheften"), "{text}");
         assert!(text.contains("Finished/Failed (fokussiert)"), "{text}");
+        // PL-97 C4: Stopp im Jobs-Fenster und Quittieren in Finished/Failed.
+        assert!(text.contains("gewählten Job stoppen"), "{text}");
+        assert!(text.contains("Einzelläufe öffnen und quittieren"), "{text}");
         assert!(text.contains("Composer mit Text"), "{text}");
         Ok(())
     }

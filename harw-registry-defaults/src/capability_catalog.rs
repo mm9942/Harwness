@@ -24,7 +24,7 @@
 //! for every profile plus the tools the composition root synthesizes outside
 //! the profiles (`transfer_to_*`, `agents.*`, `agent.*`, `skills.*`,
 //! `job.*`, `parent.message`, `delegate_wave`, knowledge, plan, matrix,
-//! sudo). The test `test_every_registered_tool_is_in_the_catalog` keeps it
+//! sudo, the read-only Harw-DoD tools `dod.*`). The test `test_every_registered_tool_is_in_the_catalog` keeps it
 //! complete; a new tool without a catalog row fails it.
 //!
 //! # Feature names
@@ -232,6 +232,11 @@ pub mod providers {
         "authoring"
     );
     provider!(MATRIX, "matrix", "harw-matrix-game", "matrix");
+    // PL-97 D3: the read-only Harw-DoD tools are `harw-ops` operations; the
+    // agent core serves them (no provider crate, no runner feature of its own).
+    provider!(DOD, "dod", "harw-ops", "core");
+    // PL-97 B2: `tool.index` is a `harw-ops` operation as well.
+    provider!(TOOL, "tool", "harw-ops", "core");
     provider!(SKILLS, "skills", "harw-registry-defaults", "core");
     provider!(AGENTS, "agents", "harw-core", "core");
 }
@@ -526,6 +531,16 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("matrix.start", MATRIX, Agent),
     row!("matrix.run", MATRIX, Agent),
     row!("matrix.finish", MATRIX, Agent),
+    // Harw-DoD (PL-97 D3): read the DoD export, sentinel health, system
+    // config and unit state outside the workspace; no workspace read, no
+    // manifest right (`Meta`, like the `gateway.*` reads). Read-only and
+    // auto-approved; the triage roles admit them.
+    row!("dod.status", DOD, Meta),
+    row!("dod.findings", DOD, Meta),
+    row!("dod.sensors", DOD, Meta),
+    // Tool index (PL-97 B2): static data of this binary (catalog, profiles,
+    // tool specs, bundled skill manifests); read-only, auto-approved.
+    row!("tool.index", TOOL, Meta),
     // skill catalog (always there)
     row!("skills.search", SKILLS, Meta, always),
     row!("skills.load", SKILLS, Meta, always),
@@ -616,6 +631,8 @@ mod tests {
             PARENT_MESSAGE_TOOLS,
             SUDO_TOOLS,
             MATRIX_GAME_MASTER_TOOLS,
+            crate::profile::DOD_READ_TOOLS,
+            crate::profile::TOOL_INDEX_TOOLS,
             KNOWLEDGE_READ_TOOLS,
             KANBAN_READ_TOOLS,
             JOB_TOOLS,
@@ -964,6 +981,45 @@ mod tests {
                 !crate::AUTO_APPROVED_TOOLS.contains(tool),
                 "{tool} must not be auto-approved"
             );
+        }
+    }
+
+    /// PL-97 D3: the Harw-DoD tools have `Meta` rows of the `dod` provider
+    /// (agent core feature), are auto-approved, never always-ask and not
+    /// served by every runner by default; the catalog rows of the provider are
+    /// exactly [`crate::profile::DOD_READ_TOOLS`].
+    #[test]
+    fn test_dod_tools_are_classified() {
+        let rows: BTreeSet<&str> = CATALOG
+            .iter()
+            .filter(|entry| entry.provider.id == providers::DOD.id)
+            .filter_map(|entry| match entry.pattern {
+                ToolPattern::Exact(name) => Some(name),
+                ToolPattern::Prefix(_) => None,
+            })
+            .collect();
+        let expected: BTreeSet<&str> = crate::profile::DOD_READ_TOOLS.iter().copied().collect();
+        assert_eq!(rows, expected);
+        for tool in crate::profile::DOD_READ_TOOLS {
+            let entry = lookup(tool);
+            assert_eq!(
+                entry.map(|entry| entry.class),
+                Some(CapabilityClass::Meta),
+                "{tool}"
+            );
+            assert_eq!(
+                entry.map(CapabilityEntry::feature),
+                Some(CORE_FEATURE),
+                "{tool}"
+            );
+            assert!(entry.is_some_and(|entry| !entry.always_available), "{tool}");
+            assert_eq!(
+                CapabilityCatalog.classify(tool),
+                Some(CapabilityClass::Meta.tool_classes()),
+                "{tool} carries no manifest right"
+            );
+            assert!(crate::AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
         }
     }
 

@@ -456,6 +456,8 @@ fn all_registered_ops_are_reachable_by_name() {
         "matrix",
         // Plan R9, Teil F: `/jobs` (`tui_only`, Surface::Command).
         "jobs",
+        // PL-97 D3: `/dod` (Harw-DoD, lesend, `channel_reduced`).
+        "dod",
     ];
 
     // Jede Operation muss mindestens eine Fläche tragen. Eine ohne wäre über

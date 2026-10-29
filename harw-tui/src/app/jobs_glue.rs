@@ -13,6 +13,12 @@
 //! - Beenden: [`before_quit`] fragt bei laufenden Jobs einmal nach („Jobs
 //!   stoppen“ / „Weiterlaufen lassen“ / „Abbrechen“) und führt die Wahl aus
 //!   (`stop_all` bzw. `detach_all`).
+//! - PL-97 C4 (W20-E): nach einem bestätigten `x` im Jobs-Fenster
+//!   ([`crate::mission::stop_job`]) läuft `/jobs stop <id>` über den
+//!   regulären Befehlsweg; [`note_stop_requested`] merkt sich den Job, und
+//!   das nächste Nachführen meldet neutral den Zustand, den es dann sieht
+//!   („Zustand jetzt: …“) — nie ein angenommenes „gestoppt“. Dieses Modul
+//!   ruft dafür keine Job-API auf.
 //!
 //! # Nebenläufigkeit
 //! Läuft auf dem Thread der Ereignisschleife; die Verwaltung ist
@@ -43,11 +49,32 @@ pub(crate) enum JobsQuitChoice {
     Detach,
 }
 
+/// PL-97 C4: spätestens nach dieser Zeit meldet das Nachführen den Zustand
+/// eines zum Stoppen bestätigten Jobs, auch wenn er sich nicht änderte (die
+/// Stopp-Politik wartet `stop_grace` = 5 s, dann KILL).
+pub(crate) const STOP_STATE_REPORT_AFTER: Duration = Duration::from_secs(10);
+
+/// PL-97 C4: ein zum Stoppen bestätigter Job, dessen Zustand das nächste
+/// Nachführen meldet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingStop {
+    /// Job-Kennung.
+    id: String,
+    /// Anzeigename.
+    name: String,
+    /// Zustand bei der Bestätigung.
+    state: JobState,
+    /// Zeitpunkt der Bestätigung.
+    requested: Instant,
+}
+
 /// TUI-Zustand der Jobs (Feld `ChatApp::jobs_ui`).
 #[derive(Debug, Default)]
 pub(crate) struct JobsUi {
     /// Zeitpunkt des letzten Nachführens der Jobs-Gruppe.
     last_refresh: Option<Instant>,
+    /// PL-97 C4: zum Stoppen bestätigter Job (siehe [`note_stop_requested`]).
+    pending_stop: Option<PendingStop>,
     /// Im Beenden-Dialog getroffene Wahl (wird beim nächsten Beenden
     /// eingelöst).
     pub(crate) quit_choice: Option<JobsQuitChoice>,
@@ -112,6 +139,7 @@ pub(crate) fn refresh(app: &mut ChatApp, force: bool) -> bool {
     app.jobs_ui.last_refresh = Some(Instant::now());
     let rows = rows_of(&manager.list(Caller::Operator));
     let mut changed = app.agent_monitor.set_jobs(rows);
+    changed |= report_stop_state(app, Instant::now());
     if let Some(detail) = app.agent_detail.as_mut()
         && let Some(job) = detail.job.clone()
     {
@@ -122,6 +150,52 @@ pub(crate) fn refresh(app: &mut ChatApp, force: bool) -> bool {
         }
     }
     changed
+}
+
+/// PL-97 C4: merkt sich einen bestätigten Stopp (`x` im Jobs-Fenster); die
+/// Zeile `/jobs stop <id>` selbst schickt der Aufrufer über den regulären
+/// Befehlsweg. Ein neuer Stopp ersetzt einen noch nicht gemeldeten.
+pub(crate) fn note_stop_requested(
+    app: &mut ChatApp,
+    target: &crate::mission::stop_job::StopTarget,
+) {
+    app.jobs_ui.pending_stop = Some(PendingStop {
+        id: target.job.as_str().to_owned(),
+        name: target.name.clone(),
+        state: target.state,
+        requested: Instant::now(),
+    });
+}
+
+/// PL-97 C4: meldet den Zustand eines zum Stoppen bestätigten Jobs, sobald
+/// das Nachführen eine Änderung sieht oder [`STOP_STATE_REPORT_AFTER`]
+/// verstrichen ist — neutral, als der Zustand, den die Verwaltung dann
+/// meldet (auch nach einer abgelehnten Zulassung, dann unverändert).
+///
+/// # Rückgabe
+/// `true`, wenn eine Zeile hinzukam.
+fn report_stop_state(app: &mut ChatApp, now: Instant) -> bool {
+    let Some(pending) = app.jobs_ui.pending_stop.as_ref() else {
+        return false;
+    };
+    let row = app
+        .agent_monitor
+        .jobs()
+        .iter()
+        .find(|row| row.id == pending.id);
+    let due = now.saturating_duration_since(pending.requested) >= STOP_STATE_REPORT_AFTER;
+    let state = match row {
+        Some(row) if row.state != pending.state || due => row.state_label().to_owned(),
+        None if due => "nicht mehr gelistet".to_owned(),
+        _ => return false,
+    };
+    let line = format!(
+        "⚙ Job {} „{}“ – Zustand jetzt: {state}",
+        pending.id, pending.name
+    );
+    app.jobs_ui.pending_stop = None;
+    app.push_line(Role::System, line);
+    true
 }
 
 /// Panelzeilen aus der Liste der Verwaltung (älteste zuerst).
@@ -638,6 +712,281 @@ mod tests {
                 .stop(id, Caller::Operator, harw_tool_job::JobSignal::Kill)
                 .await;
         }
+        Ok(())
+    }
+
+    /// Zeichnet ein Bild, damit Fokusziele und Mission-Fenster stehen.
+    fn draw(app: &ChatApp, width: u16, height: u16) -> TestResult {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .map_err(ctx("test terminal"))?;
+        terminal
+            .draw(|frame| {
+                super::super::render_viewport(frame, app, &crate::spinner::Spinner::new(), None);
+            })
+            .map_err(ctx("draw"))?;
+        Ok(())
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Öffnet über `x` im fokussierten Jobs-Fenster den Stopp-Dialog und
+    /// bestätigt ihn; liefert die einzige Zeile, die auf dem Bus ankam.
+    fn confirm_stop_via_x(app: &mut ChatApp) -> TestResult<String> {
+        draw(app, 70, 90)?;
+        app.panels.focus = crate::panes::PaneFocus::Jobs;
+        let (bus, mut receiver) = crate::events::harw_event_channel();
+        assert!(super::super::handle_key(
+            app,
+            press(KeyCode::Char('x')),
+            &bus
+        ));
+        assert!(matches!(app.overlay, Some(Overlay::StopJob(_))));
+        assert!(
+            receiver.try_recv().is_err(),
+            "der Dialog schickt noch nichts"
+        );
+        assert!(super::super::handle_key(app, press(KeyCode::Enter), &bus));
+        assert!(app.overlay.is_none());
+        let line = match receiver.try_recv() {
+            Ok(crate::events::HarwEvent::Command(line)) => line,
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete HarwEvent::Command, bekam {other:?}"
+                )));
+            }
+        };
+        assert!(receiver.try_recv().is_err(), "genau eine Zeile");
+        Ok(line)
+    }
+
+    fn system_text(app: &ChatApp, needle: &str) -> bool {
+        app.export_entries.iter().any(|entry| {
+            matches!(entry, crate::export::ExportEntry::System(text) if text.contains(needle))
+        })
+    }
+
+    /// PL-97 C4 (W20-E): `x` → Dialog → Enter schickt genau eine Zeile
+    /// `/jobs stop <id>` über den Befehlsweg; die Taste selbst ruft keine
+    /// Job-API auf (der Job läuft weiter, kein Stopp angefordert). Die Zeile
+    /// erreicht das `jobs`-Kommando genau einmal; über die echte Operation
+    /// gestoppt, meldet das nächste Nachführen neutral den Zustand.
+    #[tokio::test]
+    async fn stop_job_x_dialog_dispatches_exactly_one_jobs_stop_line() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let (mut app, manager, id) = app_with_running_job(dir.path(), true).await?;
+        assert!(refresh(&mut app, true));
+        let line = confirm_stop_via_x(&mut app)?;
+        assert_eq!(line, format!("/jobs stop {id}"));
+        let status = manager
+            .status(&id, Caller::Operator)
+            .map_err(ctx("status"))?;
+        assert_eq!(status.meta.state, JobState::Running, "keine Job-API");
+        assert!(!status.meta.stop_requested);
+
+        let recorder = crate::mission::stop_job::tests::RecordingJobs::new();
+        let output = crate::command_exec::execute_command_as(
+            &recorder.adapters(),
+            app.sandbox(),
+            app.session_id(),
+            harw_operations::PermissionTier::Operator,
+            &line,
+            harw_operations::ServiceMap::new,
+        )
+        .await;
+        assert_eq!(output, "recorded");
+        assert_eq!(
+            recorder.calls(),
+            vec![vec!["stop".to_owned(), id.as_str().to_owned()]]
+        );
+
+        // Die echte `/jobs`-Operation stoppt ihn (TERM, Stopp-Politik).
+        let mut registry = harw_operations::registry::OperationRegistry::new();
+        harw_ops::register_all(&mut registry);
+        let adapters: Vec<harw_operations::adapter::CommandAdapter> = registry
+            .iter()
+            .flat_map(|op| harw_operations::adapter::CommandAdapter::from_operation(Arc::clone(op)))
+            .collect();
+        let output = crate::command_exec::execute_command_as(
+            &adapters,
+            app.sandbox(),
+            app.session_id(),
+            harw_operations::PermissionTier::Owner,
+            &line,
+            || {
+                let mut services = harw_operations::ServiceMap::new();
+                services.insert(Arc::clone(&manager));
+                services
+            },
+        )
+        .await;
+        assert!(output.contains("TERM"), "{output}");
+        assert!(refresh(&mut app, true));
+        let label = harw_ops::jobs::state_label(JobState::Stopped);
+        assert!(
+            system_text(&app, &format!("„ladybird build“ – Zustand jetzt: {label}")),
+            "{:?}",
+            app.export_entries
+        );
+        assert!(app.jobs_ui.pending_stop.is_none(), "einmal gemeldet");
+        Ok(())
+    }
+
+    /// Esc schließt den Dialog und schickt nichts.
+    #[tokio::test]
+    async fn stop_job_esc_dispatches_nothing() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let (mut app, manager, id) = app_with_running_job(dir.path(), true).await?;
+        refresh(&mut app, true);
+        draw(&app, 70, 90)?;
+        app.panels.focus = crate::panes::PaneFocus::Jobs;
+        let (bus, mut receiver) = crate::events::harw_event_channel();
+        assert!(super::super::handle_key(
+            &mut app,
+            press(KeyCode::Char('x')),
+            &bus
+        ));
+        assert!(matches!(app.overlay, Some(Overlay::StopJob(_))));
+        assert!(super::super::handle_key(
+            &mut app,
+            press(KeyCode::Esc),
+            &bus
+        ));
+        assert!(app.overlay.is_none());
+        assert!(receiver.try_recv().is_err(), "Esc schickt nichts");
+        assert!(app.jobs_ui.pending_stop.is_none());
+        let status = manager
+            .status(&id, Caller::Operator)
+            .map_err(ctx("status"))?;
+        assert_eq!(status.meta.state, JobState::Running);
+        let _ = manager
+            .stop(&id, Caller::Operator, harw_tool_job::JobSignal::Kill)
+            .await;
+        Ok(())
+    }
+
+    /// Eine abgelehnte Zulassung (Aufrufer unter der Stufe von `/jobs`) ist
+    /// das Ende: kein zweiter Weg, der Job läuft weiter; das Nachführen
+    /// meldet nach der Frist neutral den unveränderten Zustand.
+    #[tokio::test]
+    async fn stop_job_rejected_admission_has_no_second_path() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let (mut app, manager, id) = app_with_running_job(dir.path(), true).await?;
+        refresh(&mut app, true);
+        let line = confirm_stop_via_x(&mut app)?;
+        let mut registry = harw_operations::registry::OperationRegistry::new();
+        harw_ops::register_all(&mut registry);
+        let adapters: Vec<harw_operations::adapter::CommandAdapter> = registry
+            .iter()
+            .flat_map(|op| harw_operations::adapter::CommandAdapter::from_operation(Arc::clone(op)))
+            .collect();
+        let output = crate::command_exec::execute_command_as(
+            &adapters,
+            app.sandbox(),
+            app.session_id(),
+            harw_operations::PermissionTier::Observer,
+            &line,
+            || {
+                let mut services = harw_operations::ServiceMap::new();
+                services.insert(Arc::clone(&manager));
+                services
+            },
+        )
+        .await;
+        assert!(!output.contains("TERM"), "{output}");
+        let status = manager
+            .status(&id, Caller::Operator)
+            .map_err(ctx("status"))?;
+        assert_eq!(status.meta.state, JobState::Running);
+        assert!(!status.meta.stop_requested, "kein Rückfall auf die Job-API");
+
+        refresh(&mut app, true);
+        assert!(app.jobs_ui.pending_stop.is_some(), "noch nichts zu melden");
+        let later = Instant::now() + STOP_STATE_REPORT_AFTER;
+        assert!(report_stop_state(&mut app, later));
+        let label = harw_ops::jobs::state_label(JobState::Running);
+        assert!(
+            system_text(&app, &format!("Zustand jetzt: {label}")),
+            "{:?}",
+            app.export_entries
+        );
+        let _ = manager
+            .stop(&id, Caller::Operator, harw_tool_job::JobSignal::Kill)
+            .await;
+        Ok(())
+    }
+
+    /// PL-97 C4: im Fenster Finished/Failed bleibt ein fehlgeschlagener Job
+    /// `NEW`, bis seine Kategorie quittiert ist — `a` quittiert die gewählte
+    /// Kategorie, `Enter` quittiert und öffnet ihre Einzelläufe (Esc
+    /// schließt sie); die Zähler bleiben, nichts wird gelöscht.
+    #[test]
+    fn finished_window_acknowledges_failed_jobs_and_opens_constituents() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut app = ChatApp::new(Vec::new(), sandbox(dir.path())?, SessionId::new());
+        let failed = |id: &str| JobRow {
+            origin: Some(harw_tool_job::ManagedJobOrigin::Tool {
+                tool: "job.start".to_owned(),
+                call_id: None,
+            }),
+            ..crate::mission::projection::tests::job_in(id, JobState::Failed)
+        };
+        app.agent_monitor
+            .set_jobs(vec![failed("job-1"), failed("job-2")]);
+        let rows = |app: &ChatApp| {
+            crate::mission::projection::terminal_aggregate(
+                &app.agent_monitor,
+                app.agent_monitor.jobs(),
+            )
+        };
+        let row = rows(&app);
+        assert_eq!(
+            row.first()
+                .map(|row| (row.label.as_str(), row.unseen_failures)),
+            Some(("tool:job.start", 2))
+        );
+        let (bus, _receiver) = crate::events::harw_event_channel();
+        draw(&app, 70, 90)?;
+        app.panels.focus = crate::panes::PaneFocus::Finished;
+        assert!(super::super::handle_key(
+            &mut app,
+            press(KeyCode::Enter),
+            &bus
+        ));
+        assert!(app.mission.finished_expanded, "Enter klappt zuerst auf");
+        assert!(app.overlay.is_none());
+        draw(&app, 70, 90)?;
+        assert!(super::super::handle_key(
+            &mut app,
+            press(KeyCode::Char('a')),
+            &bus
+        ));
+        assert!(app.agent_monitor.job_failure_seen("job-1"));
+        assert!(app.agent_monitor.job_failure_seen("job-2"));
+        let after = rows(&app);
+        assert_eq!(
+            after
+                .first()
+                .map(|row| (row.total, row.failed, row.unseen_failures)),
+            Some((2, 2, 0)),
+            "quittiert, nichts gelöscht"
+        );
+
+        assert!(super::super::handle_key(
+            &mut app,
+            press(KeyCode::Enter),
+            &bus
+        ));
+        assert!(matches!(app.overlay, Some(Overlay::View(_))), "Einzelläufe");
+        assert!(super::super::handle_key(
+            &mut app,
+            press(KeyCode::Esc),
+            &bus
+        ));
+        assert!(app.overlay.is_none());
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Finished);
         Ok(())
     }
 

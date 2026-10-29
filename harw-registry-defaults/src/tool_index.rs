@@ -14,6 +14,24 @@
 //! Die Familie ist strukturell der Namenspräfix vor dem ersten `.`; Namen ohne
 //! `.` gehören zur Familie `core`. Der Index vergibt keine Rechte: er zeigt nur,
 //! was die Registry ohnehin beschreibt.
+//!
+//! # Werkzeug → Skill (PL-97 B2, PL-95 S4)
+//! [`ToolSkillMap`] verknüpft ein Werkzeug mit dem gebündelten Skill, der es
+//! erklärt. Quellen: die `tools = [...]`-Listen der `skill.toml` (über einen
+//! [`SkillIndex`]) und die Provider-Bindungen `#[tool(skill = "...")]`
+//! (`TOOL_SKILLS`, gesammelt in [`crate::profile::provider_tool_skills`]).
+//! [`ToolIndex::with_skills`] trägt die Verknüpfung in die Einträge ein.
+//!
+//! # Verbraucher
+//! Das Modell-Werkzeug `tool.index` (`harw-ops/src/tool_index_op.rs`),
+//! `harw tool list|describe` (`harw-cli/src/tool_cmd.rs`) und der
+//! System-Prompt-Block `## Tool families` ([`families_of`], übergeben an
+//! `AgentIdentity::with_tool_families` in `profile.rs`).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
+
+use harw_catalog::SkillIndex;
 
 use crate::capability_catalog::{CATALOG, CapabilityClass, ToolPattern};
 use crate::profile::RegistryProfile;
@@ -57,6 +75,10 @@ pub struct ToolIndexEntry {
     pub profiles: Vec<String>,
     /// Erster Satz der echten Beschreibung, falls geliefert.
     pub summary: Option<String>,
+    /// The bundled skill that explains this tool ([`ToolSkillMap::skill_for`]),
+    /// set by [`ToolIndex::with_skills`]; `None` without a link. Descriptive
+    /// only, never a permission.
+    pub skill: Option<String>,
 }
 
 /// Der Index über alle exakt benannten Katalogzeilen. Der Speicher ist privat:
@@ -73,6 +95,156 @@ pub fn family_of(name: &str) -> &str {
     match name.split_once('.') {
         Some((family, _)) if !family.is_empty() => family,
         _ => "core",
+    }
+}
+
+/// The tool families of `names` with their tool counts, sorted by family
+/// ([`family_of`]); duplicate names count once.
+///
+/// This is the data of the system-prompt block `## Tool families`
+/// (`AgentIdentity::with_tool_families`): it depends only on the set of
+/// names, never on their order, so the prompt prefix stays cache-stable.
+///
+/// # Examples
+/// ```rust
+/// use harw_registry_defaults::tool_index::families_of;
+///
+/// let names = ["git.log", "fs.read", "fs.write", "delegate_wave"];
+/// assert_eq!(
+///     families_of(&names),
+///     vec![("core".to_owned(), 1), ("fs".to_owned(), 2), ("git".to_owned(), 1)]
+/// );
+/// ```
+#[must_use]
+pub fn families_of<S: AsRef<str>>(names: &[S]) -> Vec<(String, usize)> {
+    let unique: BTreeSet<&str> = names.iter().map(AsRef::as_ref).collect();
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for name in unique {
+        *counts.entry(family_of(name)).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(family, count)| (family.to_owned(), count))
+        .collect()
+}
+
+/// The names of every exactly named catalog row
+/// ([`crate::capability_catalog::CATALOG`]), in catalog order: every tool
+/// name a session of this binary can register, apart from the prefix rows
+/// (`transfer_to_*`).
+#[must_use]
+pub fn catalog_tool_names() -> Vec<&'static str> {
+    CATALOG
+        .iter()
+        .filter_map(|row| match row.pattern {
+            ToolPattern::Exact(name) => Some(name),
+            ToolPattern::Prefix(_) => None,
+        })
+        .collect()
+}
+
+/// Tool → skill links (PL-97 B2, PL-95 S4): which skill explains a tool.
+///
+/// # Sources
+/// - the `tools = [...]` list of every skill manifest (`skill.toml`) in a
+///   [`SkillIndex`] (the reverse map: tool → declaring skills);
+/// - the provider bindings `#[tool(skill = "...")]` (`TOOL_SKILLS` of the
+///   concrete providers, [`crate::profile::provider_tool_skills`]).
+///
+/// A binding wins. Without one, the link is the **only** skill that declares
+/// the tool; a tool several skills declare (e.g. `web.fetch`) has no link.
+/// [`Self::disagreements`] lists bindings the manifests contradict. A link is
+/// descriptive: it never grants a tool or a right.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolSkillMap {
+    /// Werkzeug → Skills, deren Manifest es in `tools` nennt.
+    declared: BTreeMap<String, BTreeSet<String>>,
+    /// Werkzeug → Skill aus `TOOL_SKILLS`.
+    bound: BTreeMap<String, String>,
+}
+
+impl ToolSkillMap {
+    /// The links of the skills in `index` plus the provider `bindings`
+    /// (`(tool, skill)`).
+    #[must_use]
+    pub fn new(index: &SkillIndex, bindings: &[(&str, &str)]) -> Self {
+        let mut declared: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for entry in index.entries() {
+            for tool in &entry.tools {
+                declared
+                    .entry(tool.clone())
+                    .or_default()
+                    .insert(entry.name.clone());
+            }
+        }
+        let bound = bindings
+            .iter()
+            .map(|(tool, skill)| ((*tool).to_owned(), (*skill).to_owned()))
+            .collect();
+        Self { declared, bound }
+    }
+
+    /// The links of this binary: the bundled skills (`SkillIndex::build`
+    /// without layers) plus [`crate::profile::provider_tool_skills`]. Built
+    /// once per process.
+    #[must_use]
+    pub fn bundled() -> &'static Self {
+        static BUNDLED: OnceLock<ToolSkillMap> = OnceLock::new();
+        BUNDLED.get_or_init(|| {
+            Self::new(
+                &SkillIndex::build(&[]),
+                &crate::profile::provider_tool_skills(),
+            )
+        })
+    }
+
+    /// The skill linked to `tool`: its provider binding, otherwise the only
+    /// skill whose manifest declares it.
+    #[must_use]
+    pub fn skill_for(&self, tool: &str) -> Option<&str> {
+        if let Some(skill) = self.bound.get(tool) {
+            return Some(skill.as_str());
+        }
+        let skills = self.declared.get(tool)?;
+        match (skills.len(), skills.iter().next()) {
+            (1, Some(skill)) => Some(skill.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The skills whose manifest declares `tool`, sorted.
+    #[must_use]
+    pub fn declaring(&self, tool: &str) -> Vec<&str> {
+        self.declared
+            .get(tool)
+            .map(|skills| skills.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    /// The provider bindings as `(tool, skill)`, sorted by tool.
+    #[must_use]
+    pub fn bindings(&self) -> Vec<(&str, &str)> {
+        self.bound
+            .iter()
+            .map(|(tool, skill)| (tool.as_str(), skill.as_str()))
+            .collect()
+    }
+
+    /// Provider bindings the manifests contradict, as `(tool, bound skill)`:
+    /// the bound skill does not declare the tool in its `tools` list (or is
+    /// not in the index at all). Empty when both sources agree.
+    #[must_use]
+    pub fn disagreements(&self) -> Vec<(&str, &str)> {
+        self.bound
+            .iter()
+            .filter(|(tool, skill)| {
+                !self
+                    .declared
+                    .get(tool.as_str())
+                    .is_some_and(|skills| skills.contains(skill.as_str()))
+            })
+            .map(|(tool, skill)| (tool.as_str(), skill.as_str()))
+            .collect()
     }
 }
 
@@ -122,16 +294,33 @@ impl ToolIndex {
                     .map(|&p| profile_label(p))
                     .collect(),
                 summary: describe(name).map(|d| first_sentence(&d)),
+                skill: None,
             })
             .collect();
         entries.sort_by(|a, b| (a.family, a.name).cmp(&(b.family, b.name)));
         Self { entries }
     }
 
+    /// Fills [`ToolIndexEntry::skill`] of every entry from `skills`
+    /// ([`ToolSkillMap::skill_for`]).
+    #[must_use]
+    pub fn with_skills(mut self, skills: &ToolSkillMap) -> Self {
+        for entry in &mut self.entries {
+            entry.skill = skills.skill_for(entry.name).map(str::to_owned);
+        }
+        self
+    }
+
     /// Alle Einträge, sortiert nach Familie, dann Name (nur lesend).
     #[must_use]
     pub fn entries(&self) -> &[ToolIndexEntry] {
         &self.entries
+    }
+
+    /// The entry of the tool `name`, if the catalog names it exactly.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&ToolIndexEntry> {
+        self.entries.iter().find(|entry| entry.name == name)
     }
 
     /// Einträge einer Familie.
@@ -179,10 +368,18 @@ impl ToolIndex {
                     if let Some(s) = &e.summary {
                         let _ = write!(out, " {s}");
                     }
+                    // Klammerzusatz: verknüpfter Skill, dann Verfügbarkeit.
+                    let mut notes: Vec<String> = Vec::new();
+                    if let Some(skill) = &e.skill {
+                        notes.push(format!("skill: {skill}"));
+                    }
                     if e.always_available {
-                        out.push_str(" (always available)");
+                        notes.push("always available".to_owned());
                     } else if !e.profiles.is_empty() {
-                        let _ = write!(out, " (profiles: {})", e.profiles.join(", "));
+                        notes.push(format!("profiles: {}", e.profiles.join(", ")));
+                    }
+                    if !notes.is_empty() {
+                        let _ = write!(out, " ({})", notes.join("; "));
                     }
                     out.push('\n');
                 }
@@ -311,6 +508,164 @@ mod tests {
         ensure(
             unknown.starts_with("Unknown family") && unknown.contains("fs"),
             "unknown lists families",
+        )
+    }
+
+    /// An index over an in-memory bundle: `(name, tools)`.
+    fn skill_index_of(skills: &[(&str, &[&str])]) -> SkillIndex {
+        let mut files: Vec<(String, String)> = Vec::new();
+        for (name, tools) in skills {
+            let tools = tools
+                .iter()
+                .map(|tool| format!("\"{tool}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            files.push((
+                format!("skills/{name}/skill.toml"),
+                format!(
+                    "name = \"{name}\"\ndescription = \"Use when {name} matters.\"\ntools = [{tools}]\n"
+                ),
+            ));
+            files.push((
+                format!("skills/{name}/instructions.md"),
+                format!("# {name}\n\nBody.\n"),
+            ));
+        }
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect();
+        SkillIndex::build_with_bundle(&[], &refs)
+    }
+
+    #[test]
+    fn skill_map_links_the_only_declaring_skill_and_prefers_bindings() -> TestResult {
+        let index = skill_index_of(&[
+            ("sys-tools", &["sys.ps", "sys.free"]),
+            ("research-a", &["web.fetch"]),
+            ("research-b", &["web.fetch", "web.search"]),
+        ]);
+        let map = ToolSkillMap::new(&index, &[]);
+        ensure(
+            map.skill_for("sys.ps") == Some("sys-tools"),
+            "unique declarer",
+        )?;
+        ensure(map.skill_for("web.search") == Some("research-b"), "unique")?;
+        ensure(map.skill_for("web.fetch").is_none(), "ambiguous: no link")?;
+        ensure(
+            map.declaring("web.fetch") == ["research-a", "research-b"],
+            "declarers sorted",
+        )?;
+        ensure(map.skill_for("fs.read").is_none(), "undeclared")?;
+        ensure(map.disagreements().is_empty(), "no bindings")?;
+
+        // Eine Bindung entscheidet die Mehrdeutigkeit, muss aber zum Manifest
+        // passen.
+        let bound = ToolSkillMap::new(&index, &[("web.fetch", "research-a")]);
+        ensure(
+            bound.skill_for("web.fetch") == Some("research-a"),
+            "binding",
+        )?;
+        ensure(bound.disagreements().is_empty(), "binding agrees")?;
+        let wrong = ToolSkillMap::new(&index, &[("sys.ps", "research-a"), ("fs.read", "fs-tools")]);
+        ensure(
+            wrong.disagreements() == [("fs.read", "fs-tools"), ("sys.ps", "research-a")],
+            "contradicting and dangling bindings are reported",
+        )
+    }
+
+    /// PL-97 B2: beide Quellen der Werkzeug→Skill-Verknüpfung stimmen
+    /// überein — jede Provider-Bindung (`TOOL_SKILLS` der konkreten Provider)
+    /// nennt einen gebündelten Skill, dessen `skill.toml` das Werkzeug in
+    /// `tools` führt; umgekehrt verweist jedes Werkzeug der vier gebündelten
+    /// Werkzeug-Skills eindeutig auf seinen Skill und ist ein echtes,
+    /// katalogisiertes Werkzeug. (Heute bindet noch kein Provider per
+    /// `#[tool(skill = ...)]`; der Test hält künftige Bindungen ehrlich.)
+    #[test]
+    fn provider_bindings_and_bundled_skill_manifests_agree() -> TestResult {
+        let bundled = SkillIndex::build(&[]);
+        let bindings = crate::profile::provider_tool_skills();
+        let map = ToolSkillMap::new(&bundled, &bindings);
+        ensure(
+            map.disagreements().is_empty(),
+            &format!("bindings contradict skill.toml: {:?}", map.disagreements()),
+        )?;
+        for (tool, skill) in &bindings {
+            ensure(
+                map.skill_for(tool) == Some(*skill),
+                &format!("{tool}: binding {skill}"),
+            )?;
+        }
+        let catalog = catalog_tool_names();
+        for skill in ["sys-tools", "fsread-tools", "git-read-tools", "cargo-tools"] {
+            let entry = bundled
+                .get(skill)
+                .ok_or_else(|| TestError::Unexpected(format!("{skill} not bundled")))?;
+            ensure(!entry.tools.is_empty(), skill)?;
+            for tool in &entry.tools {
+                ensure(
+                    map.skill_for(tool) == Some(skill),
+                    &format!(
+                        "{tool} must link {skill}, declared by {:?}",
+                        map.declaring(tool)
+                    ),
+                )?;
+                ensure(
+                    catalog.contains(&tool.as_str()),
+                    &format!("{skill} declares {tool}, which no catalog row names"),
+                )?;
+            }
+        }
+        ensure(
+            ToolSkillMap::bundled().skill_for("sys.ps") == Some("sys-tools"),
+            "bundled map",
+        )
+    }
+
+    #[test]
+    fn index_entries_carry_the_skill_link_and_render_it() -> TestResult {
+        let idx = ToolIndex::build(&none).with_skills(ToolSkillMap::bundled());
+        let ps = idx.get("sys.ps").ok_or(TestError::Missing("sys.ps"))?;
+        ensure(ps.skill.as_deref() == Some("sys-tools"), "linked")?;
+        let read = idx.get("fs.read").ok_or(TestError::Missing("fs.read"))?;
+        ensure(read.skill.is_none(), "fs.read has no skill")?;
+        let sys = idx.render(Some("sys"));
+        ensure(
+            sys.lines()
+                .any(|line| line.starts_with("sys.ps [") && line.contains("skill: sys-tools")),
+            &format!("skill rendered: {sys}"),
+        )?;
+        ensure(
+            ToolIndex::build(&none)
+                .get("sys.ps")
+                .is_some_and(|e| e.skill.is_none()),
+            "build alone links nothing",
+        )
+    }
+
+    #[test]
+    fn families_of_ignores_order_and_duplicates() -> TestResult {
+        let a = families_of(&["fs.read", "git.log", "fs.write", "fs.read"]);
+        let b = families_of(&["git.log", "fs.write", "fs.read"]);
+        ensure(a == b, "order and duplicates do not matter")?;
+        ensure(
+            a == [("fs".to_owned(), 2), ("git".to_owned(), 1)],
+            "counts per family",
+        )?;
+        ensure(families_of::<&str>(&[]).is_empty(), "empty")
+    }
+
+    #[test]
+    fn catalog_tool_names_are_the_exact_rows() -> TestResult {
+        let names = catalog_tool_names();
+        ensure(names.contains(&"fs.read"), "fs.read")?;
+        ensure(
+            !names.iter().any(|name| name.ends_with('*')),
+            "no prefix rows",
+        )?;
+        ensure(
+            names.len() == ToolIndex::build(&none).entries().len(),
+            "one name per index entry",
         )
     }
 

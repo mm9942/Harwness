@@ -12,6 +12,7 @@
 
 use harw_tool_job::model::JobEndReason;
 use harw_tool_job::{JobState, JobStatus, ManagedJobOrigin};
+use jiff::Timestamp;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -35,8 +36,9 @@ pub(crate) struct JobRow {
     pub id: String,
     /// Anzeigename.
     pub name: String,
-    /// Kurzer Zustand (`läuft`, `fertig`, …).
-    pub state: &'static str,
+    /// PL-97 C4: typed state of the job; the display label comes from
+    /// [`Self::state_label`] (never compare localized labels).
+    pub state: JobState,
     /// Erkannter Fortschritt (`ninja 120/900 13%`) oder `—`.
     pub progress: String,
     /// Laufzeit (`1m15s`) oder `—`.
@@ -51,7 +53,9 @@ pub(crate) struct JobRow {
     /// W20-A: typed provenance (`AgentChild`, `Tool`, `Operator`) from
     /// [`harw_tool_job::JobMeta::resolved_origin`]; `None` = unknown
     /// provenance (a legacy record without origin fields), never guessed
-    /// from the name. Not rendered yet.
+    /// from the name. Provenance only: it groups the Finished / Failed
+    /// window and links job-backed child agents, it never feeds an
+    /// authority decision.
     pub origin: Option<ManagedJobOrigin>,
     /// W20-A/E4: the job's **dedicated** cgroup (`…/harw-job-<attempt>`)
     /// from its persisted process identity ([`JobStatus::job_cgroup_path`]).
@@ -61,6 +65,33 @@ pub(crate) struct JobRow {
     /// harw's own or the session's, e.g. `/user.slice`), so attribution by
     /// this path fails closed. Sanitized; not rendered yet.
     pub cgroup: Option<String>,
+    /// PL-97 C4: end of the job (`meta.json` `ended_at`), if known; orders
+    /// the constituents of the Finished / Failed window (newest first).
+    pub ended_at: Option<Timestamp>,
+    /// PL-97 C4 (W20-A): how a job-backed child agent's job relates to the
+    /// agent run the monitor knows. [`JobRow::from_status`] only knows the
+    /// provenance; [`crate::agent_monitor::AgentMonitor`] keeps it current
+    /// against its agent runs (jobs snapshot and agent events).
+    pub child_link: ChildRunLink,
+}
+
+/// PL-97 C4 (W20-A): relation of a job to the child agent run it backs.
+///
+/// A job tagged [`ManagedJobOrigin::AgentChild`] runs a child agent; the
+/// agent run owns its rows and counts, so the job never shows up a second
+/// time. Unknown runs stay `Pending`: never promoted to a category of their
+/// own, never guessed from the job name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ChildRunLink {
+    /// Not a job-backed child agent.
+    #[default]
+    NotAChild,
+    /// A job-backed child whose agent run the monitor does not know (yet).
+    Pending,
+    /// The agent run is known and still active.
+    RunActive,
+    /// The agent run is known and finished.
+    RunEnded,
 }
 
 impl JobRow {
@@ -68,17 +99,59 @@ impl JobRow {
     #[must_use]
     pub(crate) fn from_status(status: &JobStatus) -> Self {
         let state = status.meta.state;
+        let origin = status.meta.resolved_origin().map(sanitize_origin);
+        // Die Verknüpfung mit dem Agentenlauf setzt der Monitor; bis dahin
+        // gilt ein Kind-Job als „noch nicht zugeordnet“.
+        let child_link = if matches!(origin, Some(ManagedJobOrigin::AgentChild { .. })) {
+            ChildRunLink::Pending
+        } else {
+            ChildRunLink::NotAChild
+        };
         Self {
             id: status.meta.job_id.to_string(),
             name: sanitize_inline(&status.meta.name),
-            state: harw_ops::jobs::state_label(state),
+            state,
             progress: sanitize_inline(&harw_ops::jobs::progress_label(status)),
             runtime: harw_ops::jobs::runtime_label(status),
             active: !state.is_terminal(),
             failed: matches!(state, JobState::Failed | JobState::Unknown),
             reason: failure_reason(status),
-            origin: status.meta.resolved_origin().map(sanitize_origin),
+            origin,
             cgroup: status.job_cgroup_path().map(sanitize_inline),
+            ended_at: status.meta.ended_at,
+            child_link,
+        }
+    }
+
+    /// Kurzer, lokalisierter Zustand (`läuft`, `fertig`, …) zur Anzeige.
+    #[must_use]
+    pub(crate) fn state_label(&self) -> &'static str {
+        harw_ops::jobs::state_label(self.state)
+    }
+
+    /// Session id of the child agent run this job backs, if it is a
+    /// job-backed child agent.
+    #[must_use]
+    pub(crate) fn child_session_id(&self) -> Option<&str> {
+        match &self.origin {
+            Some(ManagedJobOrigin::AgentChild { child_session_id }) => Some(child_session_id),
+            _ => None,
+        }
+    }
+
+    /// PL-97 C4: `true` when the job has its own row in the job lists (Jobs
+    /// window, jobs group of the agent panel).
+    ///
+    /// A job-backed child agent is represented by its agent run as long as
+    /// the monitor knows it; only a job that outlives its finished run (the
+    /// process is still active) or whose run is unknown keeps a job row, so
+    /// it stays visible and stoppable.
+    #[must_use]
+    pub(crate) fn is_listed(&self) -> bool {
+        match self.child_link {
+            ChildRunLink::NotAChild | ChildRunLink::Pending => true,
+            ChildRunLink::RunActive => false,
+            ChildRunLink::RunEnded => self.active,
         }
     }
 }
@@ -188,8 +261,8 @@ pub(crate) fn job_line(row: &JobRow, selected: bool, width: usize, theme: Theme)
     let prefix = format!("{marker}{glyph} ");
     let available = width.saturating_sub(display_width(&prefix));
     let name_width = display_width(&row.name);
-    let full_right = format!(" {} {}", row.state, row.runtime);
-    let short_right = format!(" {}", row.state);
+    let full_right = format!(" {} {}", row.state_label(), row.runtime);
+    let short_right = format!(" {}", row.state_label());
     let right = if name_width.min(8) + display_width(&full_right) <= available {
         full_right
     } else if name_width.min(8) + display_width(&short_right) <= available {
@@ -413,7 +486,9 @@ pub(crate) fn render_job_detail(
         .border_style(Style::default().fg(Color::Cyan))
         .title(format!(
             " Job · {} · {} · {} · Esc zurück ",
-            detail.row.name, detail.row.state, detail.row.runtime
+            detail.row.name,
+            detail.row.state_label(),
+            detail.row.runtime
         ));
     let inner = block.inner(area);
     block.render(area, buf);
@@ -463,7 +538,7 @@ mod tests {
     use super::*;
     use crate::test_support::{TestResult, ctx};
 
-    fn row(name: &str, state: &'static str, active: bool, failed: bool) -> JobRow {
+    fn row(name: &str, state: JobState, active: bool, failed: bool) -> JobRow {
         JobRow {
             id: "job-20260924-101112-001".to_owned(),
             name: name.to_owned(),
@@ -475,6 +550,8 @@ mod tests {
             reason: None,
             origin: None,
             cgroup: None,
+            ended_at: None,
+            child_link: ChildRunLink::NotAChild,
         }
     }
 
@@ -698,15 +775,73 @@ mod tests {
         Ok(())
     }
 
+    /// PL-97 C4: die Zeile trägt den typisierten Zustand (die Anzeige kommt
+    /// aus `state_label`), das Ende aus `meta.json` und — für einen
+    /// Kind-Agenten-Job — zunächst eine offene Verknüpfung; gelistet bleibt
+    /// ein Kind-Job nur ohne bekannten Lauf oder solange er seinen beendeten
+    /// Lauf überlebt.
+    #[test]
+    fn job_row_carries_typed_state_end_and_child_link() -> TestResult {
+        let stopped = status_of(
+            &meta_json(
+                "stopped",
+                r#""ended_at":"2026-01-01T00:00:05Z","#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        let row = JobRow::from_status(&stopped);
+        assert_eq!(row.state, JobState::Stopped);
+        assert_eq!(
+            row.state_label(),
+            harw_ops::jobs::state_label(JobState::Stopped)
+        );
+        assert!(!row.active && !row.failed);
+        assert_eq!(
+            row.ended_at.map(|at| at.as_second()),
+            Some(1_767_225_605),
+            "{:?}",
+            row.ended_at
+        );
+        assert_eq!(row.child_link, ChildRunLink::NotAChild);
+        assert!(row.is_listed());
+        assert_eq!(row.child_session_id(), None);
+
+        let child = status_of(
+            &meta_json(
+                "running",
+                r#""origin":{"kind":"agent_child","child_session_id":"child-7"},"#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        let mut row = JobRow::from_status(&child);
+        assert_eq!(row.child_link, ChildRunLink::Pending);
+        assert_eq!(row.child_session_id(), Some("child-7"));
+        assert!(row.is_listed(), "unbekannter Lauf: der Job bleibt sichtbar");
+        row.child_link = ChildRunLink::RunActive;
+        assert!(!row.is_listed(), "der laufende Agent vertritt den Job");
+        row.child_link = ChildRunLink::RunEnded;
+        assert!(row.is_listed(), "der Job überlebt seinen Lauf");
+        row.active = false;
+        assert!(!row.is_listed(), "beendet: der Lauf zählt, nicht der Job");
+        Ok(())
+    }
+
     /// Plan R9, Teil F: jede Zeile der Jobs-Gruppe ist genau `width` breit
     /// (oder schmaler) und bricht nie um — auch bei sehr langen Namen und
     /// sehr schmalen Panels.
     #[test]
     fn job_lines_never_exceed_the_panel_width() {
-        let long = row(&"ladybird build ".repeat(10), "läuft", true, false);
+        let long = row(
+            &"ladybird build ".repeat(10),
+            JobState::Running,
+            true,
+            false,
+        );
         let finished = [
-            row("restore", "fertig", false, false),
-            row("tests", "fehlgeschlagen", false, true),
+            row("restore", JobState::Succeeded, false, false),
+            row("tests", JobState::Failed, false, true),
         ];
         let refs: Vec<&JobRow> = finished.iter().collect();
         for width in [0, 1, 5, 12, 24, 40, 80] {

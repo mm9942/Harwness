@@ -138,6 +138,9 @@ pub(crate) mod jobs_glue;
 // Ansichten zeigen nach einer Änderung sofort den Live-Stand (Tests).
 #[cfg(test)]
 mod live_views_tests;
+// PL-97 C3: Querformat-Fenster (drei Spalten, flach, kompakt).
+#[cfg(test)]
+mod mission_landscape_tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -666,6 +669,10 @@ enum Overlay {
     /// stoppen“ / „Weiterlaufen lassen“ / „Abbrechen“
     /// ([`jobs_glue::before_quit`]).
     JobsQuitChoice(ChoiceDialog),
+    /// PL-97 C4 (W20-E): Bestätigung von `x` im Jobs-Fenster; Enter schickt
+    /// `/jobs stop <id>` über den regulären Befehlsweg
+    /// ([`crate::mission::stop_job`]).
+    StopJob(crate::mission::stop_job::StopJobDialog),
 }
 
 /// Ausstehender Datenabruf (`OpOutput.data`) für eine Ansicht oder das
@@ -2563,7 +2570,14 @@ impl ChatApp {
     /// PL-97 C2 (`Alt+L`): öffnet die Detailansicht des Agenten, den das
     /// LIVE-Fenster gerade zeigt (Fokus: Agenten-Panel), bzw. schließt sie
     /// wieder. Im Hochformat ist LIVE selbst nie fokussiert.
+    /// PL-97 C3: mit dem LIVE-Fenster der Querformat-Mittelspalte erscheinen
+    /// die Details dort an Ort und Stelle, LIVE bekommt den Fokus.
     fn toggle_live_detail(&mut self) -> bool {
+        if self.agent_detail.is_none()
+            && (self.panels.revealed.live || self.mission.live_detail_agent().is_some())
+        {
+            return self.toggle_live_detail_in_place();
+        }
         if self.mission.live_expanded {
             if self
                 .agent_detail
@@ -2589,10 +2603,38 @@ impl ChatApp {
         opened
     }
 
+    /// PL-97 C3: `Alt+L`/Enter am LIVE-Fenster der Querformat-Mittelspalte —
+    /// zeigt die bestehende Agenten-Detailansicht der LIVE-Quelle im selben
+    /// Rechteck (LIVE fokussiert, ohne Vollbild) bzw. schließt sie wieder.
+    fn toggle_live_detail_in_place(&mut self) -> bool {
+        if self.mission.live_detail_agent().is_some() {
+            self.mission.close_live_detail();
+            return true;
+        }
+        let Some(agent) = self
+            .mission
+            .live_source(&self.agent_monitor, Instant::now())
+            .map(|(live, _)| live.id.clone())
+        else {
+            return false;
+        };
+        // Ein angesehener Fehlschlag wandert in die Sammelzeile (wie Enter in
+        // der Agentenliste).
+        self.agent_monitor.mark_seen(&agent);
+        self.panels.agents_visible = true;
+        self.panels.maximized = false;
+        self.panels.focus = crate::panes::PaneFocus::Live;
+        self.mission.open_live_detail(&agent);
+        true
+    }
+
     /// Schließt die Detailansicht, wenn das Agenten-Panel Fokus oder
     /// Sichtbarkeit verloren hat (F3/F4/Esc über die Panel-Logik). Eine
     /// Job-Detailansicht aus dem Jobs-Fenster bleibt dort offen.
+    /// PL-97 C3: ebenso die LIVE-Details an Ort und Stelle, sobald LIVE den
+    /// Fokus verliert.
     fn sync_agent_detail(&mut self) {
+        self.mission.sync_live_focus(self.panels.focus);
         let agents_active = self.panels.agents_visible
             && match self.panels.focus {
                 crate::panes::PaneFocus::Agents => true,
@@ -6836,6 +6878,23 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
                 bus.send(HarwEvent::Quit);
             }
         },
+        // PL-97 C4 (W20-E): Enter schickt die wörtliche Zeile `/jobs stop
+        // <id>` über denselben Weg wie eine getippte Zeile (Zulassung,
+        // Busy-Klasse, `OpContext`); keine Job-API von hier, kein zweiter Weg.
+        Some(Overlay::StopJob(stop)) => match stop.handle_key(key) {
+            crate::mission::stop_job::StopDecision::Stay => {}
+            crate::mission::stop_job::StopDecision::Cancel => app.overlay = None,
+            crate::mission::stop_job::StopDecision::Confirm { line, target } => {
+                app.overlay = None;
+                tracing::info!(
+                    job_id = %target.job,
+                    line = line.as_str(),
+                    "tui.jobs.stop_confirmed"
+                );
+                jobs_glue::note_stop_requested(app, &target);
+                bus.send(HarwEvent::Command(line.into_line()));
+            }
+        },
         Some(Overlay::EffortChoice { target, dialog }) => {
             let target = *target;
             match dialog.handle_key(key) {
@@ -6941,11 +7000,15 @@ fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
 /// Esc und Navigation im fokussierten Panel).
 /// `None`: Taste gehört dem Chat/Composer.
 fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
-    // Ein offenes Popup/Dialog behält Esc & Pfeile für sich.
+    // Ein offenes Popup/Dialog behält Esc & Pfeile für sich. PL-97 C4: auch
+    // ein Overlay, das ein fokussiertes Fenster öffnete (Stopp-Dialog der
+    // Jobs, Einzelläufe von Finished/Failed) — wie im Busy-Pfad gehen seine
+    // Tasten vor die Panel-Tasten.
     if app.command_popup.as_ref().is_some_and(|p| !p.is_empty())
         || app.mention_popup.as_ref().is_some_and(|p| !p.is_empty())
         || app.pending_approval_dialog.is_some()
         || app.pending_host_permit_dialog.is_some()
+        || app.has_overlay()
     {
         return None;
     }
@@ -7000,9 +7063,16 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
             crate::panes::PaneFocus::Agents => handle_agents_list_key(app, key),
             crate::panes::PaneFocus::Jobs => handle_jobs_window_key(app, key),
             crate::panes::PaneFocus::Finished => handle_finished_window_key(app, key),
-            // LIVE ist reine Anzeige und nimmt keine Tasten (fokussierbar
-            // erst als aufgeklapptes Querformat-Fenster, PL-97 C3).
-            crate::panes::PaneFocus::Live => false,
+            // PL-97 C3: LIVE ist nur als Fenster der Querformat-Mittelspalte
+            // fokussierbar; dort scrollt es, Enter zeigt/schließt die Details.
+            crate::panes::PaneFocus::Live
+                if key.code == KeyCode::Enter && key.modifiers.is_empty() =>
+            {
+                app.toggle_live_detail_in_place()
+            }
+            crate::panes::PaneFocus::Live => {
+                crate::mission::live_window::handle_key(&mut app.mission, key)
+            }
             crate::panes::PaneFocus::Explorer => handle_explorer_key(app, key),
             crate::panes::PaneFocus::Workbench => app.handle_workbench_key(key),
             crate::panes::PaneFocus::Chat => false,
@@ -7067,6 +7137,9 @@ fn composer_owns_mission_key(app: &ChatApp, key: &KeyEvent) -> bool {
 /// umbelegbar): `↑`/`↓`, `k`/`j` wählen, `Bild↑`/`Bild↓` blättern,
 /// `Pos1`/`Ende` springen, `Enter` öffnet die Job-Details. Die Auswahl gehört
 /// dem Fenster ([`crate::mission::MissionUi::jobs`]), nicht der Agentenliste.
+/// PL-97 C4 (W20-E): `x` fragt, ob der gewählte laufende Job gestoppt
+/// werden soll (`k` bleibt „hoch“); bestätigt läuft `/jobs stop <id>` über
+/// den Befehlsweg, nie direkt über die Job-Verwaltung.
 fn handle_jobs_window_key(app: &mut ChatApp, key: KeyEvent) -> bool {
     if key
         .modifiers
@@ -7076,6 +7149,18 @@ fn handle_jobs_window_key(app: &mut ChatApp, key: KeyEvent) -> bool {
     }
     if key.code == KeyCode::Enter {
         return app.open_job_window_detail();
+    }
+    if key.code == KeyCode::Char('x') {
+        let dialog =
+            crate::mission::jobs_window::selected_row(app.agent_monitor.jobs(), &app.mission.jobs)
+                .and_then(crate::mission::stop_job::StopJobDialog::for_row);
+        return match dialog {
+            Some(dialog) => {
+                app.overlay = Some(Overlay::StopJob(dialog));
+                true
+            }
+            None => false,
+        };
     }
     // Die Auswahl hängt an der Job-Kennung (bleibt beim Umsortieren).
     let keys = crate::mission::jobs_window::row_keys(app.agent_monitor.jobs());
@@ -7092,9 +7177,12 @@ fn handle_jobs_window_key(app: &mut ChatApp, key: KeyEvent) -> bool {
     true
 }
 
-/// PL-97 C2: Tasten des fokussierten Finished/Failed-Fensters (fest):
-/// `Enter`/`f` klappen die Kategorien auf/zu, `c` quittiert Fehlschläge;
-/// aufgeklappt wählen `↑`/`↓`/`k`/`j`, `Bild↑`/`Bild↓`, `Pos1`/`Ende`.
+/// PL-97 C2/C4: Tasten des fokussierten Finished/Failed-Fensters (fest):
+/// `f` klappt die Kategorien auf/zu, `Enter` klappt auf; aufgeklappt
+/// quittiert `Enter` die gewählte Kategorie und öffnet ihre Einzelläufe
+/// (neueste zuerst), `a` quittiert die gewählte Kategorie (eingeklappt:
+/// alle), `c` alle; gewählt wird mit `↑`/`↓`/`k`/`j`, `Bild↑`/`Bild↓`,
+/// `Pos1`/`Ende`. Quittieren löscht nichts.
 fn handle_finished_window_key(app: &mut ChatApp, key: KeyEvent) -> bool {
     if key
         .modifiers
@@ -7102,21 +7190,41 @@ fn handle_finished_window_key(app: &mut ChatApp, key: KeyEvent) -> bool {
     {
         return false;
     }
+    let expanded = app.mission.finished_expanded;
     match key.code {
-        KeyCode::Enter | KeyCode::Char('f') => {
-            app.mission.finished_expanded = !app.mission.finished_expanded;
+        KeyCode::Char('f') => {
+            app.mission.finished_expanded = !expanded;
+            return true;
+        }
+        KeyCode::Enter if !expanded => {
+            app.mission.finished_expanded = true;
             return true;
         }
         KeyCode::Char('c') => return app.agent_monitor.acknowledge_failures(),
+        KeyCode::Char('a') if !expanded => return app.agent_monitor.acknowledge_failures(),
         _ => {}
     }
-    if !app.mission.finished_expanded {
+    if !expanded {
         return false;
     }
     let rows = crate::mission::projection::terminal_aggregate(
         &app.agent_monitor,
         app.agent_monitor.jobs(),
     );
+    if matches!(key.code, KeyCode::Enter | KeyCode::Char('a')) {
+        let Some(row) = crate::mission::finished_window::selected_row(&rows, &app.mission.finished)
+        else {
+            return false;
+        };
+        let acknowledged =
+            crate::mission::projection::acknowledge(&mut app.agent_monitor, &row.category);
+        if key.code == KeyCode::Char('a') {
+            return acknowledged;
+        }
+        let view = crate::mission::finished_window::ConstituentsView::new(row);
+        app.open_overlay_view(Box::new(view));
+        return true;
+    }
     // Die Auswahl hängt an der Kategorie (bleibt beim Umsortieren).
     let keys = crate::mission::finished_window::row_keys(&rows);
     let ui = &mut app.mission.finished;
@@ -10152,7 +10260,8 @@ fn render_viewport(
         }
         Some(Overlay::ExportChoice(dialog))
         | Some(Overlay::EffortChoice { dialog, .. })
-        | Some(Overlay::JobsQuitChoice(dialog)) => {
+        | Some(Overlay::JobsQuitChoice(dialog))
+        | Some(Overlay::StopJob(crate::mission::stop_job::StopJobDialog { dialog, .. })) => {
             frame.render_widget(Clear, area);
             dialog.render(area, frame.buffer_mut(), theme);
             return;
@@ -10463,6 +10572,8 @@ fn render_viewport(
         Seg::new(20, vec![context_suffix, context_short, String::new()]),
         Seg::optional(60, agents_suffix),
         Seg::optional(30, explorer_suffix),
+        // PL-97 C3: eingeschaltete Werkbank ohne Platz in dieser Lage.
+        Seg::optional(25, body.workbench_hint),
         Seg::optional(240, cancel_suffix),
         Seg::optional(230, queue_cleared_suffix),
         Seg::optional(250, quit_suffix),
@@ -15354,7 +15465,7 @@ forbidden = [{forbidden}]
         crate::jobs_panel::JobRow {
             id: "job-1".to_owned(),
             name: "build".to_owned(),
-            state: "läuft",
+            state: harw_tool_job::JobState::Running,
             progress: "13%".to_owned(),
             runtime: "1m15s".to_owned(),
             active: true,
@@ -15362,6 +15473,8 @@ forbidden = [{forbidden}]
             reason: None,
             origin: None,
             cgroup: None,
+            ended_at: None,
+            child_link: crate::jobs_panel::ChildRunLink::NotAChild,
         }
     }
 
@@ -15620,8 +15733,9 @@ forbidden = [{forbidden}]
     }
 
     /// Breite Terminals (Landschaft) behalten ihre Aufteilung: die Recency-Slots
-    /// ändern das Bild bei 120×42 nicht (der Streifen gehört nur zum
-    /// Portrait-Dock).
+    /// ändern das Bild bei 120×42 nur im LIVE-Fenster der Mittelspalte
+    /// (PL-97 C3: dort stehen sie wie im Streifen des Portrait-Docks); Chat,
+    /// Finished/Failed, Agenten und Jobs bleiben Zelle für Zelle gleich.
     #[test]
     fn wide_layout_is_unchanged_by_the_recency_slots() -> TestResult {
         let mut app = test_chat_app()?;
@@ -15632,7 +15746,29 @@ forbidden = [{forbidden}]
             text: "zweite Meldung".to_owned(),
         });
         let after = rendered_rows(&app, 120, 42)?;
-        assert_eq!(before, after);
+        let live = app
+            .last_regions
+            .get()
+            .live
+            .ok_or(TestError::Missing("LIVE-Fenster"))?;
+        let outside_live = |y: usize, row: &str| -> String {
+            row.chars()
+                .enumerate()
+                .filter(|(x, _)| {
+                    let at = (u16::try_from(*x), u16::try_from(y));
+                    !matches!(at, (Ok(x), Ok(y)) if live.contains(ratatui::layout::Position::new(x, y)))
+                })
+                .map(|(_, cell)| cell)
+                .collect()
+        };
+        for (y, (old, new)) in before.iter().zip(&after).enumerate() {
+            assert_eq!(outside_live(y, old), outside_live(y, new), "row {y}");
+        }
+        assert!(
+            after.iter().any(|row| row.contains("zweite Meldung")),
+            "{}",
+            after.join("\n")
+        );
         Ok(())
     }
 
