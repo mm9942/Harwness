@@ -1,6 +1,6 @@
 # Mediated Process Execution and Sandbox Modules
 
-> Status: implemented · Last reviewed: 2026-09-24
+> Status: implemented · Last reviewed: 2026-10-29
 
 ## Goal
 
@@ -276,6 +276,137 @@ Every grant is persisted as a session event. It does not transfer to other
 sessions, siblings, or remote entry points, and can never be widened by a
 child.
 
+## Composition: Bubblewrap ∘ trampoline ∘ cgroup (job runtime)
+
+The job runtime (`harw-job-runtime`) has four Linux sandbox backends.
+Bubblewrap alone gives namespaces and mounts but cannot separate *read*
+from *execute*, enforces no rlimits, and its child runs a few
+microseconds outside the job cgroup between spawn and attach. The Landlock
+trampoline (`harw-job-exec`) alone gives Landlock, `NO_NEW_PRIVS`, the
+capability drop and rlimits, but no namespaces. The
+`LinuxSandboxBackend::BwrapTrampoline` backend (PL-97 E1) composes both:
+namespaces outside, Landlock inside.
+
+```text
+LinuxExecutor (job cgroup R/harw-job-<attempt> created with its limits)
+ └─ harw-job-exec --plan <attempt>/outer.json        outer stage, process-group leader
+      cgroup attach_self (first) → rlimits → exec bwrap   (no Landlock here)
+    └─ bwrap --die-with-parent --new-session
+             --unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts
+             … --ro-bind <harw-job-exec> /run/harw-job/exec
+               --bind <attempt> /run/harw-job/attempt
+             -- [relay prefix] /run/harw-job/exec --plan /run/harw-job/attempt/inner.json
+                                                 --report /run/harw-job/attempt/report.json
+        └─ inner stage: verify /proc/self/cgroup → rlimits → NO_NEW_PRIVS →
+           capability drop → Landlock (namespace view) → exec <program>
+```
+
+### Cgroup membership without a race
+
+The outer trampoline joins the job cgroup **before** it `exec`s `bwrap`,
+so `bwrap`, its init and every descendant are born inside the cgroup.
+There is no spawn-to-attach window and no need to hold `bwrap` with
+`--block-fd`. The supervisor's own attach after spawn
+(`LinuxJobGroup::spawn_in_cgroup`) is kept and is a no-op for the
+already joined process. The inner stage only verifies membership
+(`CgroupJoin::Verify` with `CgroupHandle::proc_path`) and refuses with
+exit `126` on a mismatch. That check needs the caller's cgroup namespace,
+so this backend lists the namespaces explicitly
+(`BwrapLauncher::with_shared_cgroup_namespace`) instead of
+`--unshare-all`, which in bubblewrap 0.9 includes `--unshare-cgroup-try`.
+Without a configured cgroup root, neither stage has a cgroup step.
+
+### Landlock against the namespace view
+
+The inner stage sees bind destinations, not host paths.
+`BwrapExecutor::plan_with_trampoline` therefore describes its own mounts
+as a `harw_job_linux::PathMap` built from the same classification as the
+argv: the workspace (read-write or read-only), the always-bound system
+trees, the NSS files and other read-only policy paths (read-only), the
+relay binary and proxy socket, the trampoline binary (read-only) and the
+attempt directory (read-write), plus bwrap's own `/proc` (read-only),
+`/dev` and `/tmp` (read-write). The inner policy is `policy.mapped(&map)`:
+read-only binds lose write and, outside the system exec trees, execute,
+which is the distinction the mounts cannot make. Policy paths without an
+entry (`/sys`, `/run`, workspace ancestors — the withheld paths) get no
+rule. A plan in which a read-only bind lies beneath a path that keeps write
+or execute (`PathMap::shadowed_read_only_binds`) is refused. One example is
+a read-only workspace beneath `/tmp`, because every profile keeps `/tmp`
+read-write.
+
+The network dimension stays with the namespace: an own empty network
+namespace (`Deny`) or proxy-only egress (`Allow`) leave nothing to
+Landlock, so the inner policy asks for no network rules. A port allowlist
+behind the relay becomes TCP `connect` to the relay port only.
+
+### Report and requirement
+
+The attempt report is `harw_job_exec::merge_reports(bwrap predicted,
+inner report)`: per dimension the stronger layer, resource limits from the
+trampoline only, capped by the cgroup domain. It is known after the job
+ran, as with the Landlock trampoline. A `Required` job is checked against
+the namespace layer's network and the resource domain before anything
+runs; the inner stage checks its own dimensions and exits `126` instead of
+running the job.
+
+### Files and trust
+
+Each attempt gets a fresh `0700` directory below the backend's `plan_dir`
+(`harw-job-<attempt>.<pid>.<seq>/`) with both `0600` plans and the report.
+Both trampolines delete their plan after reading it, and the directory is
+removed after the job ended or a failed start. The plan is refused when the
+workspace contains the trampoline binary or the attempt directory, or
+overlaps `/run/harw-job`. Otherwise a job could replace the binary that the
+next attempt runs on the host, or rewrite its own plan or report. Both
+Bubblewrap backends also refuse a workspace that is (or resolves to) the
+host root `/`, which would bind the whole host read-write.
+
+The attempt directory is bound read-write, and only the inner Landlock
+layer keeps the job out of it (no policy path covers
+`/run/harw-job/attempt`). Without a usable Landlock ABI the job could
+rewrite its report to claim a stronger state than any layer enforced
+(`merge_reports` keeps the stronger layer per dimension), or replace the
+report with a FIFO that blocks the reader. `select_backend` therefore never
+chooses this backend without a usable Landlock ABI: `auto` falls through to
+Bubblewrap alone, and an explicit request ends in none. As defense in
+depth, the runtime reads the report only when it is a regular file (no
+symlink, FIFO or directory); by then the pid namespace has ended, so no
+job process can swap it.
+
+- Trust boundary: the outer stage runs unsandboxed as the harw user, like
+  `bwrap` itself; it applies only controls that narrow.
+- Failure mode: fail-closed. A plan the backend cannot express, a failed
+  cgroup verification or an unmet requirement means the job does not run.
+- Persistence: plans and reports exist only in the private attempt
+  directory while the attempt runs.
+
+### Backend selection
+
+`harw_job_runtime::select_backend(&HostReport, &BackendPreferences)` is the
+one resolver. With `auto` it chooses Bubblewrap ∘ trampoline (which also
+needs a usable Landlock ABI, see above), else Bubblewrap, else the Landlock
+trampoline, else none, and records every step in
+`BackendSelection::reasons`. An explicitly requested backend that is not
+available ends in none; there is no fallback. "Trusted `bwrap`" means one at the
+fixed root-owned paths. The trampoline is looked up next to the running
+executable, or at an explicit path, and never on `PATH`. `make install`
+installs `harw-job-exec` next to `harw`.
+
+- `harw_command::JobCommandPort::host` uses it with a private
+  `<state_dir>/sandbox-plans` directory. Host commands
+  (`CommandSandbox::Host`) run exactly as before; the backend applies only
+  to sandboxed requests.
+- The sandboxed verify runner (`harw-cli/src/verify_sandbox.rs`) sets
+  `needs_network`, because its `WorkspaceBuild` jobs need network and
+  this path configures no egress relay. The Bubblewrap backends are then
+  always skipped. `HARW_VERIFY_BACKEND=auto|bwrap-trampoline|bwrap|landlock|none`
+  chooses the request (unknown values fail closed). An explicit
+  `bwrap-trampoline` or `bwrap` therefore ends in none, and no verify
+  runner is built (the work driver keeps its fallback verifier). The
+  runner logs the choice with a per-dimension table (namespace,
+  filesystem, network, `no_new_privs`, capabilities, resource limits,
+  cgroup; `harw_job_runtime::predicted_dimensions`).
+
 ## Implementation
 
 ### `SandboxProfile` (`harw-sandbox/src/profile.rs`)
@@ -298,6 +429,10 @@ sandbox. `Inspect` binds read-only; `Write` binds read-write.
 
 ### `BwrapLauncher` (`harw-sandbox/src/bwrap.rs`)
 
+- `with_shared_cgroup_namespace()` replaces `--unshare-all` by the explicit
+  list `--unshare-user --unshare-ipc --unshare-pid --unshare-net
+  --unshare-uts` (no new cgroup namespace) for the trampoline composition
+  above; every other plan is unchanged.
 - `with_profile(&SandboxProfile)` sets all modules in one call;
   `with_cargo_profile()`/`with_tmux_profile()` remain for individual use.
 - `plan()` binds the cargo toolchain and/or tmux socket per the profile.

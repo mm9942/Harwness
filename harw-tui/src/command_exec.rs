@@ -2413,7 +2413,8 @@ mod tests {
         (
             "skills",
             "deferred",
-            "-=immediate,list=immediate,show=immediate",
+            // PL-97 B3: `preview`/`validate` sind lesend und laufen sofort.
+            "-=immediate,list=immediate,show=immediate,preview=immediate,validate=immediate",
         ),
         ("status", "immediate", ""),
         ("stop", "immediate", ""),

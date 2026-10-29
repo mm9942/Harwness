@@ -52,6 +52,7 @@ caller chooses stdio and the job boundary: `LinuxProcess` (pidfd),
 | `/proc`, `/dev`, `/tmp` | bwrap's own fresh procfs, minimal `/dev`, empty tmpfs | — |
 | `/sys`, `/run`, ancestors of the workspace | **withheld** (not bound), see `withheld_paths()` | — |
 | read-write path outside workspace/`/tmp`/`/dev` | refused: `Unsupported(Filesystem)` | — |
+| workspace is (or resolves to) the host root `/` | refused: `Unsupported(Filesystem)` (the whole host would be bound read-write) | — |
 | `NetworkPolicy::Deny` | `NetworkMode::None` (own empty netns) | network `Enforced` |
 | `NetworkPolicy::Allow` | `NetworkMode::ProxyOnly` if a relay is set, else `Unsupported(Network)` | network `Enforced` |
 | `NetworkPolicy::ConnectTcpPorts` | `NetworkMode::ProxyOnly` if a relay is set, else `Unsupported(Network)` | network `Partial` |
@@ -61,7 +62,8 @@ caller chooses stdio and the job boundary: `LinuxProcess` (pidfd),
 | `ResourceRequest` | not handled by bwrap | resource_limits `NotEnforced` |
 
 Every plan contains `--die-with-parent --new-session --unshare-all
---unshare-net --clearenv`. The job's environment (`spec.env`) is added after
+--unshare-net --clearenv` (the trampoline composition lists the namespaces
+explicitly instead, see below). The job's environment (`spec.env`) is added after
 the `harw-sandbox` baseline (`HOME`, `PATH`, `USER`/`LOGNAME`), and the
 working directory is `<workspace>/<spec.working_dir>`.
 
@@ -86,20 +88,44 @@ refused rather than silently widened or narrowed.
   merges the cgroup/rlimit results and decides whether the merged report
   meets `spec.sandbox` (`SandboxRequirement::Required`).
 
-## Future: trampoline inside the sandbox
+## Composition with the trampoline (PL-97 E1)
 
-Running the `harw-job-exec` trampoline as the sandboxed command
-(`bwrap … -- harw-job-exec … -- <program>`) would add rlimits and a Landlock
-layer (which restores read vs. exec) inside the namespace. This is not wired
-up yet.
+`BwrapExecutor::plan_with_trampoline(spec, policy, workspace, &TrampolineMount
+{ exec_path, attempt_dir })` runs the `harw-job-exec` trampoline as the
+sandboxed command, which adds rlimits and a Landlock layer (read vs. exec)
+inside the namespace:
+
+- `--ro-bind <exec_path> /run/harw-job/exec` and
+  `--bind <attempt_dir> /run/harw-job/attempt`, after the workspace and
+  relay binds;
+- command `/run/harw-job/exec --plan /run/harw-job/attempt/inner.json
+  --report /run/harw-job/attempt/report.json`, behind the relay prefix in
+  proxy-only mode;
+- `--unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts`
+  instead of `--unshare-all`, so `/proc/self/cgroup` inside shows the job
+  cgroup's real path for the trampoline's cgroup verification.
+
+The returned `BwrapTrampolinePlan` holds the `bwrap` plan, the namespace
+view as a `harw_job_linux::PathMap` (module docs of `executor.rs`), the
+inner policy `policy.mapped(&path_map)` (network left to the namespace) and
+the policy paths without a rule inside (`unmapped_paths`, usually the
+withheld ones). It refuses a plan whose read-only binds would keep write or
+execute through an ancestor's Landlock rule (e.g. a read-only workspace
+beneath `/tmp`), and a workspace that contains the trampoline binary or the
+attempt directory. The job runtime's `LinuxSandboxBackend::BwrapTrampoline`
+writes the inner plan, starts `bwrap` through an outer trampoline that joins
+the job cgroup first, and merges this crate's predicted report with the
+inner report (`harw_job_exec::merge_reports`).
 
 ## Tests
 
 - Unit tests (`src/executor/tests.rs`): pure argv/report mapping for all four
   `SandboxProfileName`s via `SandboxPolicy::from_profile`, network refusal
   without a relay, proxy-only with a relay, report prediction, env/working-dir
-  splicing, and the refused filesystem/capability cases. No process is
-  started.
+  splicing, and the refused filesystem/capability cases; for the trampoline
+  composition the binds, the inner command, the namespace list, the relay
+  prefix order, path-map completeness against the argv, the inner network
+  and the shadow/overlap refusals. No process is started.
 - Integration test (`tests/bwrap_run.rs`): runs `echo ok` (succeeds),
   `sh -c 'touch /etc/x'` (fails), and writes to the workspace (succeeds
   read-write, fails read-only) through the real `bwrap`. The test skips

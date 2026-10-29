@@ -39,13 +39,28 @@
 //! - Read-write paths outside the workspace (other than the sandbox's own
 //!   `/tmp` and `/dev`): `harw-sandbox` can only make the workspace writable.
 //! - Capability keep-lists: the launcher offers no `--cap-add`.
+//! - A workspace that is (or resolves to) the host root `/`: every policy
+//!   path would be a workspace subpath and the whole host would be bound
+//!   read-write.
 //!
-//! # Future: trampoline inside the sandbox
-//! Resource limits (`rlimit`s) and a Landlock layer inside the namespace can
-//! later be added by running the `harw-job-exec` trampoline as the sandboxed
-//! command (`bwrap … -- harw-job-exec … -- <program>`). Until then
-//! `resource_limits` is predicted as `NotEnforced`; cgroup limits come from
-//! `harw-job-linux` around the `bwrap` process.
+//! # Composition with the trampoline (PL-97 E1)
+//! [`BwrapExecutor::plan_with_trampoline`] runs the `harw-job-exec`
+//! trampoline as the sandboxed command: the binary is bound read-only at
+//! [`SANDBOX_TRAMPOLINE_PATH`], a per-attempt directory read-write at
+//! [`SANDBOX_ATTEMPT_DIR`], and the plan keeps the caller's cgroup
+//! namespace (explicit `--unshare-*` list instead of `--unshare-all`). The
+//! returned [`BwrapTrampolinePlan`] carries the namespace view
+//! ([`harw_job_linux::PathMap`]) and the inner policy planned against it,
+//! so Landlock inside the namespace separates read from execute — the
+//! distinction the mounts cannot make. The caller (the job runtime's
+//! `BwrapTrampoline` backend) writes the inner plan, starts `bwrap` through
+//! an outer trampoline that joins the job cgroup first, and merges the
+//! predicted report of this crate with the inner trampoline's report
+//! (`harw_job_exec::merge_reports`).
+//!
+//! [`BwrapExecutor::plan`] alone predicts `resource_limits` as
+//! `NotEnforced`; cgroup limits and rlimits come from the layers around and
+//! inside the `bwrap` process.
 //!
 //! On targets other than Linux this crate is empty.
 
@@ -62,4 +77,7 @@ mod test_support;
 #[cfg(target_os = "linux")]
 pub use error::{BwrapExecutorError, Dimension};
 #[cfg(target_os = "linux")]
-pub use executor::{BwrapExecutor, BwrapJobPlan};
+pub use executor::{
+    BwrapExecutor, BwrapJobPlan, BwrapTrampolinePlan, INNER_PLAN_FILE, INNER_REPORT_FILE,
+    SANDBOX_ATTEMPT_DIR, SANDBOX_TRAMPOLINE_DIR, SANDBOX_TRAMPOLINE_PATH, TrampolineMount,
+};

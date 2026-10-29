@@ -19,8 +19,17 @@
 //! show_help = "F1"
 //! scroll_panel_up = "ctrl+up"
 //! scroll_panel_down = "ctrl+down"
+//! focus_jobs = "alt+j"
+//! focus_finished = "alt+f"
+//! toggle_live_detail = "alt+l"
 //! end_host_mode = []
 //! ```
+//!
+//! Mission Control (PL-97 C2): `focus_jobs` (Standard `Alt+J`) und
+//! `focus_finished` (`Alt+F`) fokussieren das Jobs- bzw.
+//! Finished/Failed-Fenster (ohne eigenes Fenster das Agenten-Panel),
+//! `toggle_live_detail` (`Alt+L`) öffnet/schließt die Detailansicht des
+//! Agenten, den das LIVE-Fenster zeigt. `Ctrl+J` bleibt der Zeilenumbruch.
 //!
 //! `scroll_panel_up`/`scroll_panel_down` (Standard `Ctrl+↑`/`Ctrl+↓`)
 //! scrollen ohne Fokuswechsel: bei offenem Dialog (Freigabe, sudo,
@@ -32,8 +41,12 @@
 //! Fest (nicht umbelegbar) im fokussierten Agenten-Panel (`F4`): `↑`/`↓`,
 //! `k`/`j` und `w`/`s` wählen, `Bild↑`/`Bild↓` blättern, `Pos1`/`Ende`
 //! springen, `Enter` öffnet Details bzw. klappt die Sammelzeile der
-//! fertigen Agenten auf, `f` klappt sie auf/zu, `c` quittiert Fehlschläge.
-//! `w`/`s` gelten nur dort — im Composer bleiben es normale Buchstaben.
+//! fertigen Agenten auf, `f` klappt sie auf/zu, `c` quittiert Fehlschläge,
+//! `p` heftet den gewählten Agenten an das LIVE-Fenster (erneut: lösen).
+//! `w`/`s` gelten nur dort — im Composer bleiben es normale Buchstaben. Im
+//! fokussierten Jobs-Fenster wählen `↑`/`↓`/`k`/`j` (Bild↑↓, Pos1/Ende),
+//! `Enter` öffnet die Job-Details; im Finished/Failed-Fenster klappen
+//! `Enter`/`f` die Kategorien auf/zu, `c` quittiert Fehlschläge.
 //!
 //! Nicht genannte Aktionen behalten ihre Voreinstellung
 //! ([`KeyBindings::default`], identisch zur bisher fest verdrahteten
@@ -121,11 +134,18 @@ pub(crate) enum KeyAction {
     /// Bildschirm vollständig neu zeichnen (Standard `Ctrl+L`), falls der
     /// Terminal-Emulator Zeichenbreiten anders zählt und Reste stehen bleiben.
     RedrawScreen,
+    /// Focus the Active Jobs window (default `Alt+J`; PL-97 C2).
+    FocusJobs,
+    /// Focus the Finished / Failed window (default `Alt+F`; PL-97 C2).
+    FocusFinished,
+    /// Open or close the detail view of the agent the LIVE window shows
+    /// (default `Alt+L`; PL-97 C2).
+    ToggleLiveDetail,
 }
 
 impl KeyAction {
     /// Alle Aktionen in fester Reihenfolge (auch Vorrang bei Gleichstand).
-    pub(crate) const ALL: [Self; 19] = [
+    pub(crate) const ALL: [Self; 22] = [
         Self::ToggleExplorer,
         Self::ToggleAgents,
         Self::CycleFocus,
@@ -145,6 +165,9 @@ impl KeyAction {
         Self::ScrollPanelUp,
         Self::ScrollPanelDown,
         Self::RedrawScreen,
+        Self::FocusJobs,
+        Self::FocusFinished,
+        Self::ToggleLiveDetail,
     ];
 
     /// Name der Aktion in der Keybindings-Datei.
@@ -169,6 +192,9 @@ impl KeyAction {
             Self::ScrollPanelUp => "scroll_panel_up",
             Self::ScrollPanelDown => "scroll_panel_down",
             Self::RedrawScreen => "redraw_screen",
+            Self::FocusJobs => "focus_jobs",
+            Self::FocusFinished => "focus_finished",
+            Self::ToggleLiveDetail => "toggle_live_detail",
         }
     }
 
@@ -195,6 +221,9 @@ impl KeyAction {
             Self::ScrollPanelUp => "Agenten-Panel/Dialogtext nach oben scrollen",
             Self::ScrollPanelDown => "Agenten-Panel/Dialogtext nach unten scrollen",
             Self::RedrawScreen => "Bildschirm vollständig neu zeichnen",
+            Self::FocusJobs => "Jobs-Fenster fokussieren",
+            Self::FocusFinished => "Finished/Failed-Fenster fokussieren",
+            Self::ToggleLiveDetail => "LIVE-Agent: Details öffnen/schließen",
         }
     }
 
@@ -225,6 +254,9 @@ impl KeyAction {
             Self::ScrollPanelUp => (KeyCode::Up, KeyModifiers::CONTROL),
             Self::ScrollPanelDown => (KeyCode::Down, KeyModifiers::CONTROL),
             Self::RedrawScreen => (KeyCode::Char('l'), KeyModifiers::CONTROL),
+            Self::FocusJobs => (KeyCode::Char('j'), KeyModifiers::ALT),
+            Self::FocusFinished => (KeyCode::Char('f'), KeyModifiers::ALT),
+            Self::ToggleLiveDetail => (KeyCode::Char('l'), KeyModifiers::ALT),
         };
         vec![KeyChord { code, modifiers }]
     }
@@ -829,6 +861,18 @@ mod tests {
                 event(KeyCode::Down, KeyModifiers::CONTROL),
                 KeyAction::ScrollPanelDown,
             ),
+            (
+                event(KeyCode::Char('j'), KeyModifiers::ALT),
+                KeyAction::FocusJobs,
+            ),
+            (
+                event(KeyCode::Char('f'), KeyModifiers::ALT),
+                KeyAction::FocusFinished,
+            ),
+            (
+                event(KeyCode::Char('l'), KeyModifiers::ALT),
+                KeyAction::ToggleLiveDetail,
+            ),
         ];
         for (key, expected) in cases {
             assert_eq!(bindings.action_for(&key), Some(expected), "{key:?}");
@@ -862,8 +906,10 @@ mod tests {
 
     #[test]
     fn scroll_panel_actions_are_rebindable() -> TestResult {
+        // `alt+j` ist ab PL-97 C2 die Voreinstellung von `focus_jobs`; wer
+        // es umlegt, gibt es dort frei.
         let bindings = KeyBindings::from_toml_str(
-            "scroll_panel_up = \"alt+k\"\nscroll_panel_down = [\"alt+j\", \"ctrl+down\"]\n",
+            "scroll_panel_up = \"alt+k\"\nscroll_panel_down = [\"alt+j\", \"ctrl+down\"]\nfocus_jobs = []\n",
             Path::new("kb.toml"),
         )?;
         assert_eq!(
@@ -887,6 +933,57 @@ mod tests {
         assert!(described.iter().any(|(action, chords)| {
             *action == KeyAction::ScrollPanelUp && chords == &vec!["alt+k".to_owned()]
         }));
+        Ok(())
+    }
+
+    /// PL-97 C2: `Ctrl+J` bleibt der Zeilenumbruch, `Alt+J` fokussiert die
+    /// Jobs; die drei neuen Aktionen sind umbelegbar und kollidieren nicht
+    /// mit der Voreinstellung.
+    #[test]
+    fn mission_actions_are_rebindable_and_ctrl_j_stays_newline() -> TestResult {
+        let defaults = KeyBindings::default();
+        assert_eq!(
+            defaults.action_for(&event(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            Some(KeyAction::InsertNewline)
+        );
+        assert_eq!(
+            defaults.action_for(&event(KeyCode::Char('j'), KeyModifiers::ALT)),
+            Some(KeyAction::FocusJobs)
+        );
+        assert_eq!(
+            defaults.action_for(&event(KeyCode::Char('j'), KeyModifiers::NONE)),
+            None,
+            "plain j stays a letter / list key"
+        );
+        let bindings = KeyBindings::from_toml_str(
+            "focus_jobs = \"F13\"\nfocus_finished = [\"F14\", \"alt+x\"]\ntoggle_live_detail = []\n",
+            Path::new("kb.toml"),
+        )?;
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::F(13), KeyModifiers::NONE)),
+            Some(KeyAction::FocusJobs)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('x'), KeyModifiers::ALT)),
+            Some(KeyAction::FocusFinished)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('j'), KeyModifiers::ALT)),
+            None
+        );
+        assert!(bindings.chords(KeyAction::ToggleLiveDetail).is_empty());
+        for (name, action) in [
+            ("focus_jobs", KeyAction::FocusJobs),
+            ("focus_finished", KeyAction::FocusFinished),
+            ("toggle_live_detail", KeyAction::ToggleLiveDetail),
+        ] {
+            assert_eq!(KeyAction::from_name(name), Some(action));
+        }
+        let problems = invalid_problems(KeyBindings::from_toml_str(
+            r#"cycle_focus = "alt+l""#,
+            Path::new("kb.toml"),
+        ));
+        assert_eq!(problems.len(), 1, "alt+l is taken: {problems:?}");
         Ok(())
     }
 

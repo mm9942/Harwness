@@ -27,13 +27,27 @@
 //! grow every round. A persisting condition therefore never repeats every
 //! interval, and is never silent either.
 //!
+//! # Roots missing at start
+//! A configured root that did not resolve when the probe started
+//! (`crate::profile::resolve_scope`) has no kernel id and is therefore not
+//! part of the tracked scope. It is never re-resolved later (a cgroup created
+//! under that path afterwards is not silently admitted, see
+//! `harw_dod_config`), but it is not forgotten either:
+//! [`ScopeRescan::with_startup`] carries the count into every round's
+//! [`ScopeHealth::roots_unavailable`], so the scope stays degraded for the
+//! lifetime of the process and never logs a false recovery. The startup
+//! health is also the baseline of the first round: a start that was already
+//! degraded (and reported once by `main::run`) is not reported again.
+//!
 //! # Privileges
 //! No new capability: the walk needs `lstat` and directory listing on the
 //! cgroup2 mount (`--cgroup-root`), the map update uses the object the probe
-//! already holds. The Landlock ruleset of this probe is unchanged by this
-//! module (see `crate::landlock`); it does **not** contain the cgroup2 mount
-//! today, so a rescan after `restrict_self` sees `EACCES`, which surfaces as
-//! an incomplete (degraded) round and never retires an id.
+//! already holds. Because this rescan runs after `restrict_self`, `main::run`
+//! adds `--cgroup-root` to the Landlock ruleset as a list-only root
+//! (`crate::landlock::RootAccess::ListDirectories`) whenever a descendant
+//! scope is active, and only then; see `crate::landlock`. Should listing
+//! still fail (`EACCES`), the round is incomplete (degraded) and never
+//! retires an id.
 //!
 //! # Concurrency
 //! Owned and driven by the single collect thread (`main::collect_forever`).
@@ -120,6 +134,9 @@ pub struct ScopeRescan {
     next_due: Instant,
     stats: ScopeRescanStats,
     last_health: ScopeHealth,
+    /// Configured roots that did not resolve at start; counted as
+    /// unavailable in every round.
+    unresolved_roots: usize,
 }
 
 impl ScopeRescan {
@@ -147,7 +164,24 @@ impl ScopeRescan {
             limits,
             stats,
             last_health: ScopeHealth::default(),
+            unresolved_roots: 0,
         }
+    }
+
+    /// Carries the attach-time state into the rescan.
+    ///
+    /// - `unresolved_roots`: configured roots that did not resolve at start.
+    ///   They are added to [`ScopeHealth::roots_unavailable`] of every round,
+    ///   so the scope never reports itself fully observed while part of the
+    ///   profile is missing (see the module docs, "Roots missing at start").
+    /// - `startup`: the health of the attach-time expansion. It is the
+    ///   baseline of the first round, so a degradation the caller already
+    ///   reported at start is not reported again as `newly_degraded`.
+    #[must_use]
+    pub fn with_startup(mut self, unresolved_roots: usize, startup: ScopeHealth) -> Self {
+        self.unresolved_roots = unresolved_roots;
+        self.last_health = startup;
+        self
     }
 
     /// Runs [`Self::rescan`] when the interval has elapsed.
@@ -203,7 +237,9 @@ impl ScopeRescan {
         let health = ScopeHealth {
             overflowed,
             depth_limited: report.depth_limited,
-            roots_unavailable: report.roots_unavailable,
+            roots_unavailable: report
+                .roots_unavailable
+                .saturating_add(self.unresolved_roots),
             incomplete: !report.observation.complete,
             apply_failed,
         };
@@ -306,7 +342,7 @@ mod tests {
     };
     use harw_types::SensorId;
 
-    use super::{SCOPE_RESCAN_INTERVAL, ScopeRescan};
+    use super::{SCOPE_RESCAN_INTERVAL, ScopeHealth, ScopeRescan};
     use crate::test_support::{TestError, TestResult, ctx};
 
     /// Gefälschter cgroup-Baum unter einem Tempdir, wie die Sonde ihn über
@@ -555,6 +591,41 @@ mod tests {
         assert!(round.health.incomplete);
         assert!(round.delta.remove.is_empty());
         assert_eq!(probe.map()?, before);
+        Ok(())
+    }
+
+    /// Eine beim Start nicht auflösbare Wurzel bleibt in jeder Runde als
+    /// nicht verfügbar gezählt; der bereits beim Start gemeldete Zustand wird
+    /// weder erneut gemeldet noch fälschlich als erholt geloggt.
+    #[test]
+    fn root_missing_at_start_keeps_every_round_degraded_and_is_not_reported_again() -> TestResult
+    {
+        let tree = FakeTree::new()?;
+        let Probe {
+            loader,
+            handles,
+            rescan,
+            start,
+        } = Probe::attach(&tree, MAX_SCOPE_CGROUP_IDS)?;
+        let startup = ScopeHealth {
+            roots_unavailable: 1,
+            ..ScopeHealth::default()
+        };
+        let mut probe = Probe {
+            loader,
+            handles,
+            rescan: rescan.with_startup(1, startup),
+            start,
+        };
+        let job = tree.mkcg("/harw.slice/harw-job-1")?;
+        let first = probe.rescan();
+        assert_eq!(first.health, startup);
+        assert!(first.health.is_degraded());
+        assert!(!first.newly_degraded, "already reported at start");
+        assert_eq!(first.delta.insert, vec![job], "resolved roots keep working");
+        let second = probe.rescan();
+        assert_eq!(second.health.roots_unavailable, 1);
+        assert!(!second.newly_degraded);
         Ok(())
     }
 

@@ -19,8 +19,10 @@
 //! gefälschtes `bwrap` mehr unterschieben, das unsandboxed auf dem Host liefe.
 //!
 //! W5 N-SBX (F-003, F-120): Das Backend teilt **nie** den Host-Netz-Namespace.
-//! Jeder Plan enthält `--unshare-all --unshare-net`; `--share-net` wird in keiner
-//! Kombination erzeugt. Netz gibt es nur über [`NetworkMode::ProxyOnly`]: Das
+//! Jeder Plan enthält `--unshare-all --unshare-net` (bzw. mit
+//! [`BwrapLauncher::with_shared_cgroup_namespace`] die explizite Liste
+//! `--unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts`);
+//! `--share-net` wird in keiner Kombination erzeugt. Netz gibt es nur über [`NetworkMode::ProxyOnly`]: Das
 //! Relay (`harw-netns-relay`, Exec-Modus) wird als `COMMAND` der Sandbox
 //! gestartet, bindet `127.0.0.1:<port>` und startet danach den eigentlichen
 //! Befehl als Kind in derselben netns. Gestartete Prozesse laufen in
@@ -180,6 +182,10 @@ pub struct BwrapLauncher {
     /// z. B. die TeX-Bäume und die Font-Konfiguration für `latex.build`
     /// (Runde 4, Teil E). Leer = Plan byte-identisch zu vorher.
     read_only_paths: Vec<PathBuf>,
+    /// PL-97 E1b: `true` ersetzt `--unshare-all` durch die explizite Liste
+    /// ohne Cgroup-Namespace (siehe [`Self::with_shared_cgroup_namespace`]).
+    /// `false` (Default) = Plan byte-identisch zu vorher.
+    share_cgroup_namespace: bool,
 }
 
 impl Default for BwrapLauncher {
@@ -206,6 +212,7 @@ impl BwrapLauncher {
             host_path: None,
             identity: None,
             read_only_paths: Vec::new(),
+            share_cgroup_namespace: false,
         }
     }
 
@@ -381,6 +388,35 @@ impl BwrapLauncher {
         &self.read_only_paths
     }
 
+    /// Keeps the sandbox in the caller's cgroup namespace (PL-97 E1b).
+    ///
+    /// # Description
+    /// [`plan`](Self::plan) then lists `--unshare-user --unshare-ipc
+    /// --unshare-pid --unshare-net --unshare-uts` explicitly instead of
+    /// `--unshare-all`, which (bubblewrap 0.9) also implies
+    /// `--unshare-cgroup-try`. Every other namespace is still new; the
+    /// network namespace stays unshared as in every plan. The user
+    /// namespace becomes mandatory (`--unshare-user` instead of the
+    /// `--unshare-user-try` inside `--unshare-all`).
+    ///
+    /// Needed when a process inside the sandbox must check its own cgroup:
+    /// in a fresh cgroup namespace `/proc/self/cgroup` prints paths relative
+    /// to the namespace root (`0::/`), so the `harw-job-exec` trampoline's
+    /// cgroup verification could not tell the job cgroup from any other.
+    /// Only [`plan`](Self::plan) honors it; [`plan_read_only`](Self::plan_read_only)
+    /// always uses `--unshare-all`.
+    #[must_use]
+    pub fn with_shared_cgroup_namespace(mut self) -> Self {
+        self.share_cgroup_namespace = true;
+        self
+    }
+
+    /// Whether [`Self::with_shared_cgroup_namespace`] is set.
+    #[must_use]
+    pub fn shares_cgroup_namespace(&self) -> bool {
+        self.share_cgroup_namespace
+    }
+
     /// Setzt ein gebündeltes [`SandboxProfile`] und konfiguriert damit alle
     /// Module in einem Schritt. `Strict` löscht Cargo/tmux; `Cargo` und `Tmux`
     /// setzen das jeweilige Profil; `Host` ist ein Marker, der hier keine
@@ -461,9 +497,27 @@ impl BwrapLauncher {
         let mut args = vec![
             OsString::from("--die-with-parent"),
             OsString::from("--new-session"),
-            OsString::from("--unshare-all"),
-            OsString::from("--unshare-net"),
         ];
+        if self.share_cgroup_namespace {
+            // PL-97 E1b: alle Namespaces außer Cgroup einzeln, damit
+            // `/proc/self/cgroup` in der Sandbox den Pfad aus Sicht des
+            // Aufrufers zeigt (siehe `with_shared_cgroup_namespace`).
+            args.extend(
+                [
+                    "--unshare-user",
+                    "--unshare-ipc",
+                    "--unshare-pid",
+                    "--unshare-net",
+                    "--unshare-uts",
+                ]
+                .map(OsString::from),
+            );
+        } else {
+            args.extend([
+                OsString::from("--unshare-all"),
+                OsString::from("--unshare-net"),
+            ]);
+        }
         // Zusatzauftrag „echte Prozessidentität in der Sandbox“: `--uid`/
         // `--gid` verlangen laut bwrap(1) zwingend ein explizites
         // `--unshare-user` — das in `--unshare-all` bereits enthaltene
@@ -477,8 +531,11 @@ impl BwrapLauncher {
         // `--uid`/`--gid`/`--unshare-user` (siehe `resolve_process_identity`).
         let identity = self.identity.or_else(resolve_process_identity);
         if let Some((uid, gid)) = identity {
+            // Mit der expliziten Liste steht `--unshare-user` schon oben.
+            if !self.share_cgroup_namespace {
+                args.push(OsString::from("--unshare-user"));
+            }
             args.extend([
-                OsString::from("--unshare-user"),
                 OsString::from("--uid"),
                 OsString::from(uid.to_string()),
                 OsString::from("--gid"),
@@ -1540,6 +1597,70 @@ mod tests {
             proxied.network_mode(),
             &NetworkMode::ProxyOnly(relay_spec())
         );
+    }
+
+    /// PL-97 E1b: mit geteiltem Cgroup-Namespace steht die explizite Liste
+    /// ohne `--unshare-all`/`--unshare-cgroup*` im Plan, `--unshare-user`
+    /// genau einmal (auch mit `--uid`/`--gid`); ohne die Option bleibt der
+    /// Plan wie bisher.
+    #[test]
+    fn shared_cgroup_namespace_lists_every_other_namespace_explicitly() -> TestResult {
+        let spec = networked_sandbox()?;
+        let launcher =
+            BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap")).with_identity(1000, 1000);
+        assert!(!launcher.shares_cgroup_namespace());
+        let default_args = strings(
+            &launcher
+                .clone()
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
+        );
+        assert_eq!(
+            default_args.get(..4),
+            Some(
+                &[
+                    "--die-with-parent",
+                    "--new-session",
+                    "--unshare-all",
+                    "--unshare-net"
+                ]
+                .map(str::to_owned)[..]
+            )
+        );
+        let shared = launcher.with_shared_cgroup_namespace();
+        assert!(shared.shares_cgroup_namespace());
+        let args = strings(
+            &shared
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
+        );
+        let expected_head = [
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-user",
+            "--unshare-ipc",
+            "--unshare-pid",
+            "--unshare-net",
+            "--unshare-uts",
+            "--uid",
+            "1000",
+            "--gid",
+            "1000",
+        ]
+        .map(str::to_owned);
+        assert_eq!(args.get(..expected_head.len()), Some(&expected_head[..]));
+        assert!(!args.iter().any(|arg| arg == "--unshare-all"), "{args:?}");
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("--unshare-cgroup")),
+            "{args:?}"
+        );
+        assert_eq!(args.iter().filter(|a| *a == "--unshare-user").count(), 1);
+        assert_eq!(args.iter().filter(|a| *a == "--unshare-net").count(), 1);
+        assert!(!args.contains(&"--share-net".to_owned()));
+        // Alles nach dem Kopf ist identisch zum Standardplan (dessen Kopf:
+        // vier Flags plus `--unshare-user --uid 1000 --gid 1000`).
+        assert_eq!(args.get(expected_head.len()..), default_args.get(9..));
+        Ok(())
     }
 
     #[test]

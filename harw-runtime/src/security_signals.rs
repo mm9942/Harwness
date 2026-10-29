@@ -2,13 +2,19 @@
 //!
 //! Liest den DoD-Befund-Export (JSON Lines, siehe `harw-security-hub`) nur als
 //! Zähler: je Regel die Anzahl hoher/kritischer Befunde der letzten 24 h.
+//! Den Exportpfad löst derselbe Resolver auf wie `harw dod` und die
+//! `dod.*`-Werkzeuge (`harw_dod_client::resolve_export_paths`, PL-97 D3):
+//! `[dod] export_dir`, sonst `/var/lib/harw-dod/export`, falls lesbar, sonst
+//! `<home>/dod/export` — ohne Override und ohne lesbaren Systempfad also
+//! derselbe Pfad wie zuvor. Die Auflösung läuft je Turn, ein später lesbar
+//! gewordener Systemexport greift ohne Neustart.
 //! Kein Befundtext, keine Host- oder Befund-IDs. Das Fragment ist Evidenz
 //! (nie Anweisung); die Datei ist angreiferbeeinflusst und wird deshalb nur
 //! begrenzt gelesen (Endstück, Zeilenlimit, kein Symlink).
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use harw_extension_api::{ContextFragment, ContextProvider, ExtFuture, TurnInputContext};
 use time::OffsetDateTime;
@@ -17,7 +23,7 @@ use time::format_description::well_known::Rfc3339;
 /// Label des Fragments.
 pub const SECURITY_SIGNALS_LABEL: &str = "security.signals";
 /// Dateiname des Exports unter `<home>/dod/export`.
-pub const EXPORT_FILE: &str = "findings.jsonl";
+pub const EXPORT_FILE: &str = harw_dod_client::FINDINGS_FILE;
 /// Gelesenes Endstück in Bytes.
 const MAX_TAIL_BYTES: u64 = 256 * 1024;
 /// Längste geparste Zeile.
@@ -91,24 +97,49 @@ pub fn render(counts: &BTreeMap<String, u32>) -> Option<String> {
 /// Anbieter der Quelle `security_signals`.
 #[derive(Debug)]
 pub struct SecuritySignalsContextProvider {
-    export: PathBuf,
+    home: PathBuf,
+    export_dir: Option<PathBuf>,
+    system_export_dir: PathBuf,
 }
 
 impl SecuritySignalsContextProvider {
-    /// Anbieter über `<home>/dod/export/findings.jsonl`.
+    /// Provider over the findings export resolved for `home` without a
+    /// `[dod] export_dir` override (see [`Self::with_export_dir`]).
     #[must_use]
-    pub fn new(home: &std::path::Path) -> Self {
+    pub fn new(home: &Path) -> Self {
+        Self::with_export_dir(home, None)
+    }
+
+    /// Provider over the findings export resolved by
+    /// [`harw_dod_client::resolve_export_paths`] from `export_dir` (the
+    /// trusted `[dod] export_dir`) and `home`.
+    #[must_use]
+    pub fn with_export_dir(home: &Path, export_dir: Option<&Path>) -> Self {
         Self {
-            export: home.join("dod").join("export").join(EXPORT_FILE),
+            home: home.to_path_buf(),
+            export_dir: export_dir.map(Path::to_path_buf),
+            system_export_dir: PathBuf::from(harw_dod_client::SYSTEM_EXPORT_DIR),
         }
     }
 
+    /// The findings export path as resolved now.
+    #[must_use]
+    pub fn export_path(&self) -> PathBuf {
+        harw_dod_client::resolve_export_paths_with(
+            self.export_dir.as_deref(),
+            &self.home,
+            &self.system_export_dir,
+        )
+        .findings
+    }
+
     fn read_tail(&self) -> Option<Vec<u8>> {
-        let meta = std::fs::symlink_metadata(&self.export).ok()?;
+        let export = self.export_path();
+        let meta = std::fs::symlink_metadata(&export).ok()?;
         if !meta.file_type().is_file() {
             return None;
         }
-        let mut file = std::fs::File::open(&self.export).ok()?;
+        let mut file = std::fs::File::open(&export).ok()?;
         let len = meta.len();
         let start = len.saturating_sub(MAX_TAIL_BYTES);
         file.seek(SeekFrom::Start(start)).ok()?;
@@ -192,6 +223,76 @@ mod tests {
             counts.keys().next().map(String::as_str),
             Some("abIgnoreall")
         );
+    }
+
+    /// The canonical v2 export line (`V2_FIXTURE_LINE` in
+    /// `dod/crates/harw-sentinel/src/export.rs`).
+    const V2_FIXTURE_LINE: &str = r#"{"schema_version":2,"finding_id":"f-1","host":"host-a","rule_id":"structure-drift","severity":"high","summary":"s","observed_at":"2026-09-27T10:00:00Z","scope":"/sys/fs/cgroup/harw.slice"}"#;
+
+    fn fixture_now() -> OffsetDateTime {
+        OffsetDateTime::parse("2026-09-27T12:00:00Z", &Rfc3339)
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+    }
+
+    fn provider_with_system_dir(
+        home: &Path,
+        export_dir: Option<&Path>,
+        system: &Path,
+    ) -> SecuritySignalsContextProvider {
+        let mut provider = SecuritySignalsContextProvider::with_export_dir(home, export_dir);
+        provider.system_export_dir = system.to_path_buf();
+        provider
+    }
+
+    #[test]
+    fn security_signals_count_the_v2_fixture_line() {
+        let counts = count_recent(V2_FIXTURE_LINE.as_bytes(), fixture_now());
+        assert_eq!(counts.get("structure-drift"), Some(&1));
+        assert_eq!(counts.len(), 1);
+    }
+
+    #[test]
+    fn security_signals_path_is_unchanged_without_override_and_readable_system_dir()
+    -> Result<(), std::io::Error> {
+        let scratch = tempfile::tempdir()?;
+        let home = scratch.path().join("home");
+        let unreadable = scratch.path().join("absent-system-export");
+        let provider = provider_with_system_dir(&home, None, &unreadable);
+        // Derselbe Pfad wie vor dem Resolver: `<home>/dod/export/findings.jsonl`.
+        assert_eq!(
+            provider.export_path(),
+            home.join("dod").join("export").join("findings.jsonl")
+        );
+        // Und er wird tatsächlich gelesen und gezählt (v1- und v2-Zeilen).
+        std::fs::create_dir_all(home.join("dod").join("export"))?;
+        std::fs::write(
+            provider.export_path(),
+            format!(
+                "{V2_FIXTURE_LINE}\n{}\n",
+                r#"{"finding_id":"f-2","host":"host-a","rule_id":"structure-drift","severity":"critical","summary":"v1","observed_at":"2026-09-27T11:00:00Z"}"#
+            ),
+        )?;
+        let bytes = provider.read_tail().unwrap_or_default();
+        assert_eq!(
+            count_recent(&bytes, fixture_now()).get("structure-drift"),
+            Some(&2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn security_signals_override_and_readable_system_dir_win_over_home()
+    -> Result<(), std::io::Error> {
+        let scratch = tempfile::tempdir()?;
+        let home = scratch.path().join("home");
+        let system = scratch.path().join("system-export");
+        std::fs::create_dir_all(&system)?;
+        let provider = provider_with_system_dir(&home, None, &system);
+        assert_eq!(provider.export_path(), system.join("findings.jsonl"));
+        let explicit = scratch.path().join("explicit");
+        let provider = provider_with_system_dir(&home, Some(&explicit), &system);
+        assert_eq!(provider.export_path(), explicit.join("findings.jsonl"));
+        Ok(())
     }
 
     #[test]

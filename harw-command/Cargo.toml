@@ -9,7 +9,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-harw-job = { path = "../harw-job" }
+# `bwrap`: the host port selects the Bubblewrap backends (PL-97 E1).
+harw-job = { path = "../harw-job", features = ["bwrap"] }
 harw-types = { path = "../harw-types" }
 jiff = { workspace = true }
 tracing = "0.1"

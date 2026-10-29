@@ -64,6 +64,8 @@ use harw_registry_defaults::profile::{
 };
 // Runde 7, Teil M: die Matrix-Werkzeuge des Game Masters ebenso.
 use harw_registry_defaults::profile::{MATRIX_GAME_MASTER_TOOLS, matrix_tools_for_role};
+// PL-97 D3: die lesenden `dod.*` der Triage-Rollen ebenso.
+use harw_registry_defaults::profile::dod_tools_for_role;
 // Plan R9, Teil A: `skills.search`/`skills.load` ebenso.
 use harw_registry_defaults::profile::{
     SKILL_CATALOG_EXCLUDED_ROLES, SKILL_CATALOG_TOOLS, skill_catalog_tools_for_role,
@@ -120,6 +122,8 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
             .chain(parent_message_tools_for_role(role).iter().copied())
             // Runde 7, Teil M: `matrix.*` (nur Game Master).
             .chain(matrix_tools_for_role(role).iter().copied())
+            // PL-97 D3: `dod.*` (nur die vier Triage-Rollen).
+            .chain(dod_tools_for_role(role).iter().copied())
             // Plan R9, Teil A: `skills.search`/`skills.load` (Skill-Katalog).
             .chain(skill_catalog_tools_for_role(role).iter().copied())
             // Plan R9, Teil F: Job-Kontrolle der Orchestratoren.

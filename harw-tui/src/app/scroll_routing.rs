@@ -8,11 +8,15 @@
 //! 1. ein offener Dialog (Freigabe, sudo, Host-Permit, Plan, `ask_user`) —
 //!    dessen Körper; bei der Plan-Freigabe auch über dem Plan im Verlauf;
 //! 2. das Agenten-Panel (bzw. seine Detailansicht);
-//! 3. sonst der Chat-Verlauf (wie bisher).
+//! 3. die Mission-Control-Fenster (PL-97 C2): Jobs und Finished/Failed
+//!    scrollen je für sich ([`crate::mission::WindowUi`]); über dem
+//!    LIVE-Streifen des Hochformats scrollt nichts (er ist reine Anzeige);
+//! 4. sonst der Chat-Verlauf (wie bisher).
 //!
 //! Die Scroll-Aktionen der Tastenbelegung wirken ohne Fokuswechsel: bei
-//! sichtbarem Dialog auf dessen Körper, sonst auf das sichtbare
-//! Agenten-Panel; ist beides nicht sichtbar, geht die Taste normal weiter.
+//! sichtbarem Dialog auf dessen Körper, sonst auf das fokussierte Jobs- bzw.
+//! Finished/Failed-Fenster, sonst auf das sichtbare Agenten-Panel; ist
+//! nichts davon sichtbar, geht die Taste normal weiter.
 //!
 //! # Sicherheit
 //! Scrollen ist reines Lesen: es trifft nie eine Entscheidung, ändert keine
@@ -31,6 +35,8 @@ use super::ChatApp;
 use crate::chat_scroll::ScrollAction;
 use crate::dialog_frame::WHEEL_LINES;
 use crate::keybindings::KeyAction;
+use crate::mission::{MissionWindow, WindowUi};
+use crate::panes::PaneFocus;
 use crate::tui_event::TuiEvent;
 
 /// Flächen des zuletzt gezeichneten Frames für das Maus-Routing.
@@ -41,10 +47,36 @@ pub(crate) struct FrameRegions {
     /// schmaler, hoher Terminals. Für das Rad- und Tasten-Routing macht das
     /// keinen Unterschied — beide sind nur eine Fläche.
     pub(crate) agents: Option<Rect>,
+    /// Active Jobs window (Mission Control, PL-97 C2).
+    pub(crate) jobs: Option<Rect>,
+    /// Finished/Failed window or strip.
+    pub(crate) finished: Option<Rect>,
+    /// LIVE window or strip.
+    pub(crate) live: Option<Rect>,
     /// Ein offener Dialog anstelle des Composers.
     pub(crate) dialog: Option<Rect>,
     /// Der Plan über dem Verlauf, solange die Plan-Freigabe offen ist.
     pub(crate) plan: Option<Rect>,
+}
+
+impl FrameRegions {
+    /// The Mission Control window under `at`, if any (the agents panel
+    /// counts as [`MissionWindow::Agents`]).
+    #[must_use]
+    pub(crate) fn window_at(&self, at: Position) -> Option<MissionWindow> {
+        let hit = |area: Option<Rect>| area.is_some_and(|area| area.contains(at));
+        if hit(self.agents) {
+            Some(MissionWindow::Agents)
+        } else if hit(self.jobs) {
+            Some(MissionWindow::Jobs)
+        } else if hit(self.finished) {
+            Some(MissionWindow::Finished)
+        } else if hit(self.live) {
+            Some(MissionWindow::Live)
+        } else {
+            None
+        }
+    }
 }
 
 /// Leitet Mausrad und Scroll-Tasten weiter.
@@ -79,8 +111,18 @@ pub(crate) fn route_wheel(app: &mut ChatApp, mouse: MouseEvent) -> Option<bool> 
     {
         return Some(redraw);
     }
-    if hit(regions.agents) {
-        return Some(scroll_agents(app, up, WHEEL_LINES));
+    match regions.window_at(at) {
+        Some(MissionWindow::Agents) => return Some(scroll_agents(app, up, WHEEL_LINES)),
+        Some(MissionWindow::Jobs) => {
+            return Some(scroll_window(&app.mission.jobs, up, WHEEL_LINES));
+        }
+        Some(MissionWindow::Finished) => {
+            return Some(scroll_window(&app.mission.finished, up, WHEEL_LINES));
+        }
+        // Der LIVE-Streifen scrollt nicht und gibt das Rad auch nicht an den
+        // Chat weiter: unter dem Zeiger liegt kein Verlauf.
+        Some(MissionWindow::Live) => return Some(false),
+        None => {}
     }
     Some(
         app.scroll.handle_mouse(
@@ -103,6 +145,15 @@ fn route_scroll_key(app: &mut ChatApp, key: &KeyEvent) -> Option<bool> {
         && let Some(redraw) = scroll_open_dialog(app, up, 1)
     {
         return Some(redraw);
+    }
+    match app.panels.focus {
+        PaneFocus::Jobs if regions.jobs.is_some() => {
+            return Some(scroll_window(&app.mission.jobs, up, 1));
+        }
+        PaneFocus::Finished if regions.finished.is_some() => {
+            return Some(scroll_window(&app.mission.finished, up, 1));
+        }
+        _ => {}
     }
     if regions.agents.is_some() {
         return Some(scroll_agents(app, up, 1));
@@ -129,6 +180,14 @@ fn scroll_open_dialog(app: &mut ChatApp, up: bool, lines: usize) -> Option<bool>
         return Some(dialog.scroll_body(up, lines));
     }
     None
+}
+
+/// Scrollt ein Mission-Fenster (Jobs, Finished/Failed), ohne Auswahl oder
+/// Fokus zu ändern; das nächste Zeichnen begrenzt den Versatz.
+fn scroll_window(ui: &WindowUi, up: bool, lines: usize) -> bool {
+    let delta = isize::try_from(lines).unwrap_or(isize::MAX);
+    ui.scroll_by(if up { -delta } else { delta });
+    true
 }
 
 /// Scrollt das Agenten-Panel (bzw. die Detailansicht), ohne die Auswahl
@@ -481,13 +540,19 @@ mod tests {
             app.push_line(Role::System, format!("Zeile-{index:03}"));
         }
         let _ = screen(&app, 80, 40)?;
-        let dock = app
-            .last_regions
-            .get()
-            .agents
-            .ok_or(TestError::Missing("Portrait-Dock"))?;
+        let regions = app.last_regions.get();
+        let dock = regions.agents.ok_or(TestError::Missing("Portrait-Dock"))?;
+        let jobs = regions.jobs.ok_or(TestError::Missing("Jobs-Fenster"))?;
+        let live = regions.live.ok_or(TestError::Missing("LIVE-Streifen"))?;
         assert_eq!(dock.y, 0, "der Dock ist oben angedockt");
-        assert_eq!(dock.width, 80, "der Dock nimmt die volle Breite ein");
+        // PL-97 C2: ab 68 Spalten teilen sich Agenten- und Jobs-Fenster die
+        // volle Breite der Kartenzeile.
+        assert_eq!(dock.x, 0);
+        assert_eq!(
+            dock.width + jobs.width,
+            80,
+            "die Kartenzeile nimmt die volle Breite ein"
+        );
         assert!(app.scroll.is_following());
 
         let over_dock = wheel(MouseEventKind::ScrollDown, dock.x + 2, dock.y + 1);
@@ -495,7 +560,7 @@ mod tests {
         assert_eq!(app.agent_monitor.panel_scroll_offset(), WHEEL_LINES);
         assert!(app.scroll.is_following(), "der Verlauf bleibt unberührt");
 
-        let below_dock = dock.y + dock.height + 1;
+        let below_dock = live.y + live.height + 1;
         let over_chat = wheel(MouseEventKind::ScrollUp, 2, below_dock);
         assert_eq!(route_scroll_input(&mut app, &over_chat), Some(true));
         assert!(!app.scroll.is_following(), "der Verlauf scrollt");
@@ -536,6 +601,105 @@ mod tests {
             1,
             "ohne sichtbaren Dock ändert sich der Versatz nicht"
         );
+        Ok(())
+    }
+
+    /// PL-97 C2: das Mausrad über jedem Fenster (Agenten, Jobs,
+    /// Finished/Failed, LIVE) scrollt nur dieses Fenster — LIVE gar nichts —,
+    /// über dem Chat nur den Chat; ein offener Dialog behält den Vorrang.
+    #[test]
+    fn wheel_over_each_mission_window_scrolls_only_that_window() -> TestResult {
+        let mut app = test_chat_app()?;
+        for index in 0..20 {
+            running(
+                &mut app,
+                &format!("a{index:02}"),
+                &format!("rolle-{index:02}"),
+            );
+        }
+        app.agent_monitor.set_jobs(
+            (0..12)
+                .map(|index| {
+                    crate::mission::projection::tests::job(
+                        &format!("j{index}"),
+                        true,
+                        false,
+                        "läuft",
+                    )
+                })
+                .collect(),
+        );
+        for index in 0..100 {
+            app.push_line(Role::System, format!("Zeile-{index:03}"));
+        }
+        let _ = screen(&app, 70, 90)?;
+        let regions = app.last_regions.get();
+        let agents = regions
+            .agents
+            .ok_or(TestError::Missing("Agenten-Fenster"))?;
+        let jobs = regions.jobs.ok_or(TestError::Missing("Jobs-Fenster"))?;
+        let finished = regions
+            .finished
+            .ok_or(TestError::Missing("Finished-Fenster"))?;
+        let live = regions.live.ok_or(TestError::Missing("LIVE-Streifen"))?;
+        let offsets = |app: &ChatApp| {
+            (
+                app.agent_monitor.panel_scroll_offset(),
+                app.mission.jobs.scroll_offset(),
+                app.mission.finished.scroll_offset(),
+                app.scroll.is_following(),
+            )
+        };
+        assert_eq!(offsets(&app), (0, 0, 0, true));
+
+        let over = |area: Rect| wheel(MouseEventKind::ScrollDown, area.x + 1, area.y);
+        assert_eq!(route_scroll_input(&mut app, &over(jobs)), Some(true));
+        assert_eq!(offsets(&app), (0, WHEEL_LINES, 0, true), "only the jobs");
+        assert_eq!(route_scroll_input(&mut app, &over(agents)), Some(true));
+        assert_eq!(
+            offsets(&app),
+            (WHEEL_LINES, WHEEL_LINES, 0, true),
+            "only the agents"
+        );
+        assert_eq!(route_scroll_input(&mut app, &over(finished)), Some(true));
+        assert_eq!(
+            offsets(&app),
+            (WHEEL_LINES, WHEEL_LINES, WHEEL_LINES, true),
+            "only the finished window"
+        );
+        assert_eq!(
+            route_scroll_input(&mut app, &over(live)),
+            Some(false),
+            "LIVE consumes the wheel without scrolling"
+        );
+        assert_eq!(offsets(&app), (WHEEL_LINES, WHEEL_LINES, WHEEL_LINES, true));
+        let over_chat = wheel(MouseEventKind::ScrollUp, 2, live.y + live.height + 2);
+        assert_eq!(route_scroll_input(&mut app, &over_chat), Some(true));
+        assert_eq!(
+            offsets(&app),
+            (WHEEL_LINES, WHEEL_LINES, WHEEL_LINES, false),
+            "only the chat"
+        );
+
+        // Ctrl+↓ folgt dem Fokus: im Jobs-Fenster scrollen die Jobs.
+        app.panels.focus = crate::panes::PaneFocus::Jobs;
+        let ctrl_down = TuiEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(route_scroll_input(&mut app, &ctrl_down), Some(true));
+        assert_eq!(app.mission.jobs.scroll_offset(), WHEEL_LINES + 1);
+        assert_eq!(app.agent_monitor.panel_scroll_offset(), WHEEL_LINES);
+
+        // Ein offener Dialog behält den Vorrang vor allen Fenstern.
+        app.pending_approval_dialog = Some(crowded_dialog(60));
+        let _ = screen(&app, 70, 90)?;
+        let dialog = app
+            .last_regions
+            .get()
+            .dialog
+            .ok_or(TestError::Missing("Dialogfläche"))?;
+        let over_dialog = wheel(MouseEventKind::ScrollDown, dialog.x + 2, dialog.y + 2);
+        let before = offsets(&app);
+        assert_eq!(route_scroll_input(&mut app, &over_dialog), Some(true));
+        assert_eq!(offsets(&app), before, "the dialog scrolls, no window does");
         Ok(())
     }
 

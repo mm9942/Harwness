@@ -35,6 +35,11 @@ harw-core = { path = "../harw-core" }
 # nicht von `harw-runtime` ab (nur harw-authority/-types/-sandbox/-operations/
 # -core/-extension-api/-research und `harw-dod-signals`).
 harw-core-bridge = { path = "../harw-core-bridge" }
+# PL-97 D3: `security_signals.rs` löst den Harw-DoD-Export über denselben
+# Resolver auf wie `harw dod`, `/dod` und die `dod.*`-Werkzeuge
+# (`[dod] export_dir` → `/var/lib/harw-dod/export`, falls lesbar →
+# `<home>/dod/export`). Der Client zieht weder Warden noch Eskalation (S1).
+harw-dod-client = { path = "../harw-dod-client" }
 harw-extension-api = { path = "../harw-extension-api" }
 # `handoff.rs` (Agent OPS): symlinkfestes, atomares Schreiben der
 # `handoff.json` (Tempdatei im Zielverzeichnis + `rename`), analog zu

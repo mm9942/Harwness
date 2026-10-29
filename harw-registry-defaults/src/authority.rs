@@ -631,6 +631,11 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 ///   Operations-Registry, nicht dieser Rechtefilter. Jedes von
 ///   `delegate_wave` gestartete Kind bekommt seine Rechte über den
 ///   [`AuthorityReducer`] seiner eigenen Rolle.
+/// - `dod.status`, `dod.findings`, `dod.sensors` (PL-97 D3,
+///   [`crate::profile::DOD_READ_TOOLS`]) → `None`, wie `ps` und die lesenden
+///   `gateway.*`: lesende `harw-ops`-Operationen über den Harw-DoD-Export
+///   außerhalb des Workspace, ohne Sandbox-Recht; ihre Zulassung regeln
+///   [`crate::profile::dod_tools_for_role`] und die Operations-Registry.
 ///
 /// Die Deps- und Lens-Zuordnung prüft ein Test zusätzlich gegen die
 /// `TOOL_PERMISSIONS`-Konstanten der Provider (andere Quelle als diese Tabelle).
@@ -1038,6 +1043,22 @@ mod tests {
         // eigene Hintergrund-Agenten; die Grenze zieht der Spawner.
         assert_eq!(tool_permission("agent.status"), None);
         assert_eq!(tool_permission("agent.cancel"), None);
+    }
+
+    /// PL-97 D3: die lesenden Harw-DoD-Werkzeuge tragen wie `ps` und die
+    /// lesenden `gateway.*` kein Sandbox-Recht.
+    #[test]
+    fn test_tool_permission_maps_dod_tools_like_other_read_only_operations() {
+        assert_eq!(crate::profile::DOD_READ_TOOLS.len(), 3);
+        for tool in crate::profile::DOD_READ_TOOLS {
+            assert_eq!(tool_permission(tool), None, "{tool}");
+            assert_eq!(tool_permission(tool), tool_permission("ps"), "{tool}");
+            assert_eq!(
+                tool_permission(tool),
+                tool_permission("gateway.status"),
+                "{tool}"
+            );
+        }
     }
 
     /// R14: `work_driver.enqueue` startet einen dauerhaften Hintergrund-Job

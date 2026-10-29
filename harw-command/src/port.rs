@@ -288,22 +288,81 @@ impl<S, E> std::fmt::Debug for JobCommandPort<S, E> {
     }
 }
 
+/// Directory below the host port's `state_dir` for the plan and report
+/// files of the trampoline sandbox backends.
+#[cfg(target_os = "linux")]
+const SANDBOX_PLAN_DIR: &str = "sandbox-plans";
+
+/// The sandbox backend of the host port: [`harw_job::select_backend`] for
+/// this host, with a private plan directory below `state_dir` and every
+/// other preference at its default (trampoline next to the running
+/// executable, trusted `bwrap` at its fixed paths). Logs the choice and
+/// every skipped candidate once.
+#[cfg(target_os = "linux")]
+fn host_backend(state_dir: &std::path::Path) -> harw_job::BackendSelection {
+    let plan_dir = state_dir.join(SANDBOX_PLAN_DIR);
+    let plan_dir = match create_private_dir(&plan_dir) {
+        Ok(()) => Some(plan_dir),
+        Err(error) => {
+            tracing::warn!(
+                path = %plan_dir.display(),
+                %error,
+                "no private sandbox plan directory; trampoline backends are unavailable"
+            );
+            None
+        }
+    };
+    let selection = harw_job::select_backend(
+        &harw_job::HostReport::probe(),
+        &harw_job::BackendPreferences {
+            plan_dir,
+            ..harw_job::BackendPreferences::default()
+        },
+    );
+    tracing::info!(
+        backend = %selection.chosen,
+        reasons = ?selection.reasons,
+        "command port sandbox backend"
+    );
+    selection
+}
+
+/// Creates `dir` (and parents) and restricts it to `0700`.
+#[cfg(target_os = "linux")]
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 #[cfg(target_os = "linux")]
 impl JobCommandPort<harw_job::FsJobRecordStore, harw_job::LinuxExecutor> {
     /// The host runtime: file-backed job records below `state_dir` and the
-    /// Linux executor (pidfd + process group, no sandbox backend; sandboxed
-    /// commands need a configured executor).
+    /// Linux executor (pidfd + process group, host commands in a new
+    /// session) with the sandbox backend [`harw_job::select_backend`] picks
+    /// for this host (PL-97 E1): Bubblewrap ∘ trampoline, else Bubblewrap,
+    /// else the Landlock trampoline, else none. Plan files of the
+    /// trampoline backends live in `<state_dir>/sandbox-plans` (`0700`).
+    ///
+    /// The backend applies to sandboxed requests ([`CommandSandbox::Profile`])
+    /// only; host commands ([`CommandSandbox::Host`]) run exactly as before.
+    /// No cgroup root is configured here.
     ///
     /// # Errors
     /// The store or the runtime cannot be created.
     pub fn host(state_dir: &std::path::Path) -> Result<Self, String> {
         let store = harw_job::FsJobRecordStore::create_ambient(state_dir)
             .map_err(|error| format!("job store {}: {error}", state_dir.display()))?;
+        let selection = host_backend(state_dir);
         let runtime = JobRuntime::builder()
             .store(store)
             .executor(
                 harw_job::LinuxExecutor::new(harw_job::LinuxExecutorOptions {
                     new_session: true,
+                    sandbox: selection.backend,
                     ..harw_job::LinuxExecutorOptions::default()
                 })
                 .map_err(|error| format!("job executor: {error}"))?,
@@ -694,3 +753,50 @@ impl<S: CoordinatorStore, E: Executor> CommandPort for JobCommandPort<S, E> {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests;
+
+/// The host port's backend choice (PL-97 E1).
+#[cfg(all(test, target_os = "linux"))]
+mod backend_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use harw_job::BackendKind;
+
+    use super::{JobCommandPort, SANDBOX_PLAN_DIR, host_backend};
+
+    harw_test_support::define_test_error!(pub(crate));
+
+    #[test]
+    fn host_port_runs_the_selected_backend() -> TestResult {
+        let dir =
+            harw_test_support::unique_tmp_created("harw-command", "backend").map_err(ctx("tmp"))?;
+        let port = JobCommandPort::host(&dir).map_err(TestError::Unexpected)?;
+        // The same host gives the same decision.
+        let selection = host_backend(&dir);
+        let backend = &port.runtime().coordinator().executor().options().sandbox;
+        assert_eq!(backend.kind(), selection.chosen, "{:?}", selection.reasons);
+        // Never silent: one line per candidate tried, up to the chosen one.
+        let tried = BackendKind::ALL
+            .iter()
+            .position(|kind| *kind == selection.chosen)
+            .ok_or(TestError::Missing("chosen kind in BackendKind::ALL"))?
+            + 1;
+        assert_eq!(selection.reasons.len(), tried, "{:?}", selection.reasons);
+        let last = selection
+            .reasons
+            .last()
+            .ok_or(TestError::Missing("reason"))?;
+        assert!(
+            last.starts_with(&format!("{}: selected", selection.chosen)),
+            "{last}"
+        );
+        // The trampoline backends get a private plan directory.
+        let plan_dir = dir.join(SANDBOX_PLAN_DIR);
+        let mode = std::fs::metadata(&plan_dir)
+            .map_err(ctx("plan dir"))?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::remove_dir_all(&dir).map_err(ctx("cleanup"))?;
+        Ok(())
+    }
+}
