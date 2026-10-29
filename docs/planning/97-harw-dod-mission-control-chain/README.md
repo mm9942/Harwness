@@ -666,6 +666,16 @@ layer to `SkillIndex`) and give each a `triggers.toml` (`tools = [...]`,
 `sys.*`, `fsread.*`, `git.*` in `Full` and `ReadOnlyExplore`; `cargo.*` in `Full`.
 Keep `shell.exec` untouched.
 
+*As built in B4 (deviation, see §7):* `sys.*` is registered in `Full` only and is
+**not** auto-approved. `harw-tool-sys` declares `ExecuteProcess` for all twelve
+tools (it reads host state outside the workspace; `sys.env` exposes the harness
+environment), no read-only profile grants `ExecuteProcess`, so the tools ask like
+`process.list`. The skills are embedded by `harw-home/src/bundle.rs` with
+`include_str!` from the tool crates instead of an `include_dir!` layer in
+`harw-registry-defaults`. `cargo.*` beyond `cargo.test_one` is not registered yet,
+so `cargo-tools/triggers.toml` carries only `tools` (no `commands`, no `E0…`
+codes) until it is.
+
 ### 3.3 TUI Mission Control (PL-94 W02 + landscape anchors, PL-68 W20, PL-94 W01)
 
 #### 3.3.1 Target screens (authoritative; cell-exact tests derive from these)
@@ -1169,6 +1179,22 @@ Recommended execution order:
 - Tests: catalog parity, `tool_permission` parity with each crate's
   `TOOL_PERMISSIONS`, profiles contain the expected names, skills discoverable via
   `skills.search`, `cargo test` command trigger fires `cargo-tools`.
+- As landed: `fsread.*`/`git.*` in `Full` + `ReadOnlyExplore` (auto-approved),
+  `sys.*` in `Full` only (`ExecuteProcess`, asks like `process.list`), runner
+  features `tool-fsread`/`tool-gitread`/`tool-sys` reported by `--capabilities`,
+  the four skills bundled through `harw-home` with a `triggers.toml` each.
+- **Deferred (open):** registering the other eight `cargo.*` tools in `Full`
+  (`CargoToolProvider` over the `shell.exec` executor, `ExecuteProcess`,
+  auto-approved in `Full` only, which needs a per-profile approval rule that does
+  not exist today), and with it the `commands` and `E0…` error-code triggers of
+  `cargo-tools`. Until then `cargo-tools` fires only on first use of a `cargo.*`
+  tool, and the `cargo test` command-trigger test is inverted (it must **not**
+  fire).
+- **Depends on B1:** the command triggers of `fsread-tools`, `git-read-tools` and
+  `sys-tools` (`ls`, `git status`, `ps`, …) also fire in sessions that have
+  `shell.exec` but not those tools (e.g. `executor`/`ShellExecution`, the root in
+  Explore/Plan mode). The injector must skip a triggered skill whose declared
+  `tools` are all absent from the session's registered tool names (owner: B1).
 
 ### B5 — CLI rules test (S6, minimal)
 - A test walking the clap tree: every non-hidden command has help text and either
@@ -1394,6 +1420,10 @@ before starting B4** and scale B4 down to whatever is actually missing.
 - PL-93 internal tool crates get registered (B4) because "internal functions
   the models know how to use" is the ask; scale B4 to whatever is still
   unregistered on dev (§6.3 caution).
+- B4 deviates from §3.2 in two places: `sys.*` stays `Full`-only and asks
+  (it declares `ExecuteProcess`; fail-closed, same as `process.list`), and the
+  `cargo.*` registration in `Full` is deferred, so `cargo-tools` has no command
+  or error-code triggers yet (§4 B4).
 - W01 inline live cells (C5) are **in scope but last** with a go/no-go after
   C1–C4 land; the three windows + LIVE strip (W02) are the primary target.
 - Translation pass (#133) is **not** part of this PR beyond the DoD files D1

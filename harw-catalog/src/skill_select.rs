@@ -990,13 +990,23 @@ mod tests {
     #[test]
     fn bundled_skills_load_unchanged() {
         let index = SkillIndex::build(&[]);
-        assert_eq!(index.len(), 75, "Anzahl gebündelter Skills");
+        assert_eq!(index.len(), 79, "Anzahl gebündelter Skills");
         assert!(index.skipped().is_empty(), "{:?}", index.skipped());
         assert!(index.warnings().is_empty(), "{:?}", index.warnings());
-        assert!(
-            index.trigger_index().is_empty(),
-            "S1 liefert noch keine Trigger"
+        // PL-97 B4: genau die vier gebündelten Werkzeug-Skills der PL-93-Crates
+        // bringen eine `triggers.toml` mit; alle übrigen bleiben triggerlos.
+        let mut triggered: Vec<&str> = index
+            .entries()
+            .filter(|entry| !entry.triggers.is_empty())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        triggered.sort_unstable();
+        assert_eq!(
+            triggered,
+            ["cargo-tools", "fsread-tools", "git-read-tools", "sys-tools"],
+            "gebündelte Skills mit Triggern"
         );
+        assert!(!index.trigger_index().is_empty());
     }
 
     #[test]

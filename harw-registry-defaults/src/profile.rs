@@ -67,11 +67,14 @@ use harw_tool_deps::DepsToolProvider;
 use harw_tool_doc::DocToolProvider;
 use harw_tool_explorer::ExplorerToolProvider;
 use harw_tool_fs::FsToolProvider;
+use harw_tool_fsread::FsreadToolProvider;
+use harw_tool_gitread::GitReadToolProvider;
 use harw_tool_lens::LensToolProvider;
 use harw_tool_process::ProcessToolProvider;
 use harw_tool_shell::{
     HostPermitPromptSender, HostPermitVariant, LatexToolProvider, ShellToolProvider,
 };
+use harw_tool_sys::SysToolProvider;
 use harw_tool_web::WebToolProvider;
 
 #[cfg(feature = "browser")]
@@ -1221,6 +1224,40 @@ pub(crate) const PROCESS_TOOLS: &[&str] = &["process.list", "process.kill"];
 /// die der Roster durchlässt (`roster::TEST_ENGINEER_EXTRA_TOOLS`), sieht es.
 pub const CARGO_TEST_ONE_TOOLS: &[&str] = &["cargo.test_one"];
 
+/// The read-only file system tools of `harw-tool-fsread` (PL-93, PL-97 B4),
+/// in provider order: `ls`, `stat`, `find`, `du`, `df`, `wc`, `head`,
+/// `tail`, `cat`, `file`, `tree`, `readlink`, `realpath`, `hash`, `diff`,
+/// `json`.
+///
+/// Every one declares `Permission::ReadWorkspace`, resolves paths strictly
+/// beneath the workspace root and never reads a secret path (see
+/// [`crate::authority::tool_permission`]). Registered in
+/// [`RegistryProfile::Full`] and [`RegistryProfile::ReadOnlyExplore`] and
+/// auto-approved like `fs.read` ([`crate::AUTO_APPROVED_TOOLS`]).
+pub(crate) const FSREAD_TOOLS: &[&str] = harw_tool_fsread::FSREAD_TOOL_NAMES;
+
+/// The read-only Git tools of `harw-tool-gitread` (PL-93, PL-97 B4), in
+/// provider order: `git.status`, `git.diff`, `git.log`, `git.show`,
+/// `git.branch`, `git.blame`.
+///
+/// Pure Rust reader of `<workspace>/.git`; no `git` process, no write, no
+/// remote URL in the output. Every one declares `Permission::ReadWorkspace`;
+/// registered in [`RegistryProfile::Full`] and
+/// [`RegistryProfile::ReadOnlyExplore`] and auto-approved.
+pub(crate) const GIT_READ_TOOLS: &[&str] = harw_tool_gitread::GIT_TOOL_NAMES;
+
+/// The process and system inspection tools of `harw-tool-sys` (PL-93,
+/// PL-97 B4), in provider order: `ps`, `pgrep`, `top`, `free`, `uptime`,
+/// `uname`, `env`, `id`, `ss`, `lsof`, `date`, `which`.
+///
+/// They start no process and only read, but they read host state outside the
+/// workspace (`/proc`, the harness environment), so the crate declares
+/// `Permission::ExecuteProcess` for all of them, modelled on `process.list`.
+/// Accordingly they are registered in [`RegistryProfile::Full`] only (no
+/// read-only profile carries `ExecuteProcess`) and stay outside
+/// [`crate::AUTO_APPROVED_TOOLS`], exactly like `process.list`.
+pub(crate) const SYS_TOOLS: &[&str] = harw_tool_sys::SYS_TOOL_NAMES;
+
 /// Das eine Werkzeug von `harw-tool-lens` (AW6-10): semantische Abfrage über
 /// `docs.design` und `knowledge.palace`.
 ///
@@ -1810,6 +1847,11 @@ impl RegistryProfile {
                 .chain(JOB_TOOLS.iter())
                 .chain(PROCESS_TOOLS.iter())
                 .chain(OBSIDIAN_TOOLS.iter())
+                // PL-97 B4: die typisierten Kommando-Werkzeuge aus PL-93
+                // (`fsread.*`, `git.*` lesend; `sys.*` mit `ExecuteProcess`).
+                .chain(FSREAD_TOOLS.iter())
+                .chain(GIT_READ_TOOLS.iter())
+                .chain(SYS_TOOLS.iter())
                 .copied()
                 .collect(),
             RegistryProfile::ShellExecution => SHELL_TOOLS
@@ -1827,6 +1869,11 @@ impl RegistryProfile {
                 // `researcher-deps` verbieten beide in ihrer TOML, und jeder
                 // Abruf braucht weiterhin `NetworkAccess` im Sandbox-Scope.
                 .chain(EXPLORER_WEB_TOOLS.iter())
+                // PL-97 B4: `fsread.*` und `git.*` lesen nur den Workspace
+                // (`ReadWorkspace`). `sys.*` fehlt bewusst: es verlangt
+                // `ExecuteProcess`, das kein read-only Profil trägt.
+                .chain(FSREAD_TOOLS.iter())
+                .chain(GIT_READ_TOOLS.iter())
                 .copied()
                 .collect(),
             // `Planning` teilt den read-only Kern mit `ReadOnlyExplore`, hängt
@@ -2729,6 +2776,11 @@ fn profile_tool_providers(
             // Obsidian vault tools (read + write): coding agents maintain
             // the project's long-form memory alongside the code.
             providers.push(Arc::new(harw_tool_obsidian::ObsidianToolProvider::new()));
+            // PL-97 B4: Reihenfolge wie `FSREAD_TOOLS`, `GIT_READ_TOOLS`,
+            // `SYS_TOOLS` in `registered_tool_names`.
+            providers.push(Arc::new(FsreadToolProvider::new()));
+            providers.push(Arc::new(GitReadToolProvider::new()));
+            providers.push(Arc::new(SysToolProvider::new()));
             providers
         }
         RegistryProfile::ShellExecution => build_shell_providers(sandbox_profile),
@@ -2740,6 +2792,9 @@ fn profile_tool_providers(
                 Arc::new(WebToolProvider::new()),
                 EXPLORER_WEB_TOOLS,
             )));
+            // PL-97 B4: rein lesende Kommando-Werkzeuge, ohne `sys.*`.
+            providers.push(Arc::new(FsreadToolProvider::new()));
+            providers.push(Arc::new(GitReadToolProvider::new()));
             providers
         }
         // `LensToolProvider::new()` ist zustandslos (keine Bau-, Home- oder
@@ -3913,6 +3968,87 @@ mod tests {
         Ok(())
     }
 
+    /// PL-97 B4: `Full` registriert alle drei PL-93-Familien (`fsread.*`,
+    /// `git.*`, `sys.*`), `ReadOnlyExplore` nur die beiden lesenden; kein
+    /// anderes Profil führt eines davon. Die Namenslisten sind die
+    /// `TOOL_NAMES` der Crates, und die gebaute Registry trägt die Executor.
+    #[test]
+    fn test_pl93_command_tools_are_registered_in_full_and_read_only_explore() -> TestResult {
+        assert_eq!(
+            FSREAD_TOOLS,
+            harw_tool_fsread::FsreadToolProvider::TOOL_NAMES
+        );
+        assert_eq!(
+            GIT_READ_TOOLS,
+            harw_tool_gitread::GitReadToolProvider::TOOL_NAMES
+        );
+        assert_eq!(SYS_TOOLS, harw_tool_sys::SysToolProvider::TOOL_NAMES);
+        assert_eq!(
+            (FSREAD_TOOLS.len(), GIT_READ_TOOLS.len(), SYS_TOOLS.len()),
+            (16, 6, 12)
+        );
+        let read_families: Vec<&str> = FSREAD_TOOLS
+            .iter()
+            .chain(GIT_READ_TOOLS.iter())
+            .copied()
+            .collect();
+        let full = RegistryProfile::Full.registered_tool_names();
+        let explore = RegistryProfile::ReadOnlyExplore.registered_tool_names();
+        for tool in &read_families {
+            assert!(full.contains(tool), "Full: {tool}");
+            assert!(explore.contains(tool), "ReadOnlyExplore: {tool}");
+        }
+        for tool in SYS_TOOLS {
+            assert!(full.contains(tool), "Full: {tool}");
+            assert!(!explore.contains(tool), "ReadOnlyExplore: {tool}");
+        }
+        for profile in RegistryProfile::ALL {
+            if matches!(
+                profile,
+                RegistryProfile::Full | RegistryProfile::ReadOnlyExplore
+            ) {
+                continue;
+            }
+            let names = profile.registered_tool_names();
+            assert!(
+                !names.iter().any(|tool| tool.starts_with("fsread.")
+                    || tool.starts_with("git.")
+                    || tool.starts_with("sys.")),
+                "{profile:?} führt PL-93-Werkzeuge: {names:?}"
+            );
+        }
+        // Tatsächlich montiert, mit Executor.
+        for (profile, expected) in [
+            (
+                RegistryProfile::Full,
+                read_families
+                    .iter()
+                    .chain(SYS_TOOLS.iter())
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ),
+            (RegistryProfile::ReadOnlyExplore, read_families.clone()),
+        ] {
+            let assembled = assemble(profile)?;
+            for tool in expected {
+                let executor = assembled
+                    .registry
+                    .tool_providers()
+                    .iter()
+                    .find_map(|provider| provider.executor(&ToolName::new(tool)));
+                assert!(executor.is_some(), "{profile:?}: {tool} ohne Executor");
+            }
+            assert!(
+                !registered_names(&assembled)
+                    .iter()
+                    .any(|tool| profile == RegistryProfile::ReadOnlyExplore
+                        && tool.starts_with("sys.")),
+                "ReadOnlyExplore montiert sys.*"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_read_only_explore_exposes_exact_tool_set() -> TestResult {
         let assembled = assemble(RegistryProfile::ReadOnlyExplore)?;
@@ -3938,6 +4074,29 @@ mod tests {
                 // durchsuchen — nur diese zwei, nie `web.docs_rs`/`web.crates_io`.
                 "web.fetch",
                 "web.search",
+                // PL-97 B4: lesende Kommando-Werkzeuge (PL-93), ohne `sys.*`.
+                "fsread.ls",
+                "fsread.stat",
+                "fsread.find",
+                "fsread.du",
+                "fsread.df",
+                "fsread.wc",
+                "fsread.head",
+                "fsread.tail",
+                "fsread.cat",
+                "fsread.file",
+                "fsread.tree",
+                "fsread.readlink",
+                "fsread.realpath",
+                "fsread.hash",
+                "fsread.diff",
+                "fsread.json",
+                "git.status",
+                "git.diff",
+                "git.log",
+                "git.show",
+                "git.branch",
+                "git.blame",
             ]
         );
         Ok(())
@@ -4283,7 +4442,30 @@ mod tests {
                 "explore.relations",
                 "explore.find",
                 "deps.graph",
-                "deps.locked"
+                "deps.locked",
+                // PL-97 B4: `fsread.*` und `git.*` brauchen nur `ReadWorkspace`.
+                "fsread.ls",
+                "fsread.stat",
+                "fsread.find",
+                "fsread.du",
+                "fsread.df",
+                "fsread.wc",
+                "fsread.head",
+                "fsread.tail",
+                "fsread.cat",
+                "fsread.file",
+                "fsread.tree",
+                "fsread.readlink",
+                "fsread.realpath",
+                "fsread.hash",
+                "fsread.diff",
+                "fsread.json",
+                "git.status",
+                "git.diff",
+                "git.log",
+                "git.show",
+                "git.branch",
+                "git.blame",
             ]
         );
         for profile in RegistryProfile::ALL {

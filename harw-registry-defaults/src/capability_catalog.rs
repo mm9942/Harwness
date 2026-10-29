@@ -208,6 +208,9 @@ pub mod providers {
     provider!(JOB, "job", "harw-tool-job", "tool-job");
     provider!(PROCESS, "process", "harw-tool-process", "tool-process");
     provider!(CARGO, "cargo", "harw-tool-cargo", "tool-cargo");
+    provider!(FSREAD, "fsread", "harw-tool-fsread", "tool-fsread");
+    provider!(GIT, "git", "harw-tool-gitread", "tool-gitread");
+    provider!(SYS, "sys", "harw-tool-sys", "tool-sys");
     provider!(PLAN, "plan", "harw-tool-plan", "tool-plan");
     provider!(TUNNEL, "tunnel", "harw-tool-tunnel", "tool-tunnel");
     provider!(
@@ -247,6 +250,8 @@ pub const PROVIDER_FEATURES: &[&str] = &[
     "tool-doc",
     "tool-explorer",
     "tool-fs",
+    "tool-fsread",
+    "tool-gitread",
     "tool-job",
     "tool-latex",
     "tool-lens",
@@ -255,6 +260,7 @@ pub const PROVIDER_FEATURES: &[&str] = &[
     "tool-process",
     "tool-shell",
     "tool-sudo",
+    "tool-sys",
     "tool-web",
 ];
 
@@ -427,6 +433,48 @@ pub const CATALOG: &[CapabilityEntry] = &[
     // starts a container and always asks)
     row!("container.images", CONTAINER, Meta),
     row!("container.run", CONTAINER, Shell),
+    // fsread (PL-93, PL-97 B4): read-only file system commands beneath the
+    // workspace root (`ReadWorkspace`).
+    row!("fsread.ls", FSREAD, Read),
+    row!("fsread.stat", FSREAD, Read),
+    row!("fsread.find", FSREAD, Read),
+    row!("fsread.du", FSREAD, Read),
+    row!("fsread.df", FSREAD, Read),
+    row!("fsread.wc", FSREAD, Read),
+    row!("fsread.head", FSREAD, Read),
+    row!("fsread.tail", FSREAD, Read),
+    row!("fsread.cat", FSREAD, Read),
+    row!("fsread.file", FSREAD, Read),
+    row!("fsread.tree", FSREAD, Read),
+    row!("fsread.readlink", FSREAD, Read),
+    row!("fsread.realpath", FSREAD, Read),
+    row!("fsread.hash", FSREAD, Read),
+    row!("fsread.diff", FSREAD, Read),
+    row!("fsread.json", FSREAD, Read),
+    // git (PL-93, PL-97 B4): read-only Git reader in pure Rust over
+    // `<workspace>/.git`; no `git` process (`ReadWorkspace`).
+    row!("git.status", GIT, Read),
+    row!("git.diff", GIT, Read),
+    row!("git.log", GIT, Read),
+    row!("git.show", GIT, Read),
+    row!("git.branch", GIT, Read),
+    row!("git.blame", GIT, Read),
+    // sys (PL-93, PL-97 B4): process and system inspection over `/proc`.
+    // Nothing is started, but host state outside the workspace is read, so
+    // the crate declares `ExecuteProcess` (modelled on `process.list`);
+    // the class follows that right (`Shell`, like `process.list`).
+    row!("sys.ps", SYS, Shell),
+    row!("sys.pgrep", SYS, Shell),
+    row!("sys.top", SYS, Shell),
+    row!("sys.free", SYS, Shell),
+    row!("sys.uptime", SYS, Shell),
+    row!("sys.uname", SYS, Shell),
+    row!("sys.env", SYS, Shell),
+    row!("sys.id", SYS, Shell),
+    row!("sys.ss", SYS, Shell),
+    row!("sys.lsof", SYS, Shell),
+    row!("sys.date", SYS, Shell),
+    row!("sys.which", SYS, Shell),
     // processes
     row!("process.list", PROCESS, Shell),
     row!("process.kill", PROCESS, Shell),
@@ -617,7 +665,7 @@ mod tests {
     /// (agents, authoring, sudo, latex, matrix, ...) are not listed here.
     #[test]
     fn test_catalog_rows_match_provider_tool_names() -> Result<(), String> {
-        let parity: [(&ToolProvider, &[&[&str]]); 12] = [
+        let parity: [(&ToolProvider, &[&[&str]]); 15] = [
             (
                 &providers::DOC,
                 &[harw_tool_doc::DocToolProvider::TOOL_NAMES],
@@ -650,6 +698,18 @@ mod tests {
             (
                 &providers::CARGO,
                 &[harw_tool_cargo::CargoToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::FSREAD,
+                &[harw_tool_fsread::FsreadToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::GIT,
+                &[harw_tool_gitread::GitReadToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::SYS,
+                &[harw_tool_sys::SysToolProvider::TOOL_NAMES],
             ),
             (
                 &providers::PLAN,
@@ -904,6 +964,52 @@ mod tests {
                 !crate::AUTO_APPROVED_TOOLS.contains(tool),
                 "{tool} must not be auto-approved"
             );
+        }
+    }
+
+    /// PL-97 B4: the PL-93 command tools have catalog rows with their own
+    /// provider and runner feature; `fsread.*`/`git.*` are `Read` and
+    /// auto-approved, `sys.*` follows its declared `ExecuteProcess` right
+    /// (`Shell`, like `process.list`) and is never auto-approved.
+    #[test]
+    fn test_pl93_command_tools_are_classified() {
+        let cases: [(&[&str], &ToolProvider, CapabilityClass, bool); 3] = [
+            (
+                crate::profile::FSREAD_TOOLS,
+                &providers::FSREAD,
+                CapabilityClass::Read,
+                true,
+            ),
+            (
+                crate::profile::GIT_READ_TOOLS,
+                &providers::GIT,
+                CapabilityClass::Read,
+                true,
+            ),
+            (
+                crate::profile::SYS_TOOLS,
+                &providers::SYS,
+                CapabilityClass::Shell,
+                false,
+            ),
+        ];
+        for (tools, provider, class, auto_approved) in cases {
+            assert!(PROVIDER_FEATURES.contains(&provider.feature));
+            for tool in tools {
+                let entry = lookup(tool);
+                assert_eq!(entry.map(|entry| entry.provider), Some(provider), "{tool}");
+                assert_eq!(entry.map(|entry| entry.class), Some(class), "{tool}");
+                assert!(
+                    entry.is_some_and(|entry| !entry.always_available),
+                    "{tool}: needs its provider feature"
+                );
+                assert_eq!(
+                    crate::AUTO_APPROVED_TOOLS.contains(tool),
+                    auto_approved,
+                    "{tool}"
+                );
+                assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+            }
         }
     }
 

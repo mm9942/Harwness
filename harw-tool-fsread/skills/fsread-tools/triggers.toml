@@ -1,0 +1,41 @@
+# When the `fsread-tools` skill is injected (PL-95 trigger manifest, format:
+# harw-catalog/src/skill_triggers.rs). Bundled by harw-home (PL-97 B4).
+when = "Listing, finding or reading files and directories in the workspace: use the read-only fsread.* tools instead of ls, cat, find or du."
+
+[triggers]
+tools = [
+  "fsread.ls",
+  "fsread.stat",
+  "fsread.find",
+  "fsread.du",
+  "fsread.df",
+  "fsread.wc",
+  "fsread.head",
+  "fsread.tail",
+  "fsread.cat",
+  "fsread.file",
+  "fsread.tree",
+  "fsread.readlink",
+  "fsread.realpath",
+  "fsread.hash",
+  "fsread.diff",
+  "fsread.json",
+]
+commands = [
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "find",
+  "stat",
+  "du",
+  "df",
+  "wc",
+  "tree",
+  "file",
+  "readlink",
+  "realpath",
+  "sha256sum",
+  "diff",
+  "jq",
+]
