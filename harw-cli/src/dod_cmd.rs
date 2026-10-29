@@ -1395,7 +1395,8 @@ fn warden_status(env: &DodEnv) -> Outcome {
     )
 }
 
-/// `install -d -m 0750 <dir>` (only when missing) and `touch <flag>`.
+/// Create the missing directory with at most 0750, respecting the caller's
+/// umask, and create the flag without replacing an existing file.
 fn create_flag(flag: &Path) -> Result<(), String> {
     if let Some(dir) = flag.parent() {
         match fs::symlink_metadata(dir) {
@@ -1758,10 +1759,15 @@ mod tests {
         let dir_mode = fs::metadata(flag.parent().ok_or(TestError::Missing("flag dir"))?)
             .map_err(ctx("flag dir"))?
             .permissions();
+        // DirBuilder applies the caller's umask: 077 legitimately produces
+        // 0700. Preserve that stricter policy while checking the permission ceiling.
+        let mode = std::os::unix::fs::PermissionsExt::mode(&dir_mode) & 0o777;
         assert_eq!(
-            std::os::unix::fs::PermissionsExt::mode(&dir_mode) & 0o777,
-            0o750
+            mode & !0o750,
+            0,
+            "no permissions beyond the requested ceiling"
         );
+        assert_eq!(mode & 0o700, 0o700, "the owner can manage the flag");
         // Nur Freigabedatei und ihr Verzeichnis sind neu.
         let mut created: Vec<String> = fs::read_dir(dir.path())
             .map_err(ctx("list"))?
