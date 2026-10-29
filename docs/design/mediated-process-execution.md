@@ -547,16 +547,62 @@ Landlock and `exec` (on `bwrap-trampoline` in the outer stage, before
 `bwrap`, and again inside), and the plain `bwrap` backend passes
 `--nproc` to its `prlimit`. It holds without a cgroup root. Like every
 `RLIMIT_NPROC` it counts the tasks (threads included) of the job's real
-UID, not of the job alone, and a process with `CAP_SYS_RESOURCE` or
-`CAP_SYS_ADMIN` is exempt: it is a fork-bomb guard, not a per-job count.
+UID, not of the job alone: it is a fork-bomb guard, not a per-job count.
 `pids_max` stays the exact per-job cap of the job cgroup's `pids.max`;
 without a cgroup root that cgroup limit is reported as not enforced.
+
+A successful `setrlimit(RLIMIT_NPROC)` is no proof that the cap holds
+(PL-97 E2g): the kernel exempts a process with real UID 0,
+`CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE` (getrlimit(2)). The rule is
+fail-closed on every Linux path:
+
+- The trampoline reads its own identity from `/proc/self/status` after
+  the sandbox step (capabilities already dropped;
+  `harw_job_exec::report::ProcessIdentity`). An identity with real UID 0,
+  either capability in the effective or permitted set, or an unreadable
+  status is exempt. On `bwrap-trampoline` both stages check, so the outer
+  stage sees the supervisor's real UID before `bwrap` could remap it.
+- The plan carries a `process_count` guard (`ProcessCountGuard`):
+  `required` mirrors `require_rlimits`, `cgroup_pids_cover` says the job
+  cgroup was created with the `pids` controller delegated and
+  `pids_max <= process_count_max`. The cover counts only once the
+  trampoline's attach or verification of the membership succeeded.
+- For an exempt identity without that cover `process_count_max` is never
+  reported `enforced`: `resource_limits` drops to `not_enforced` (to
+  `partial` when other rlimits or cgroup limits still hold). With
+  `require_rlimits` the trampoline writes the report and then refuses to
+  `exec` the job (exit `SANDBOX_REFUSED`, reason names `RLIMIT_NPROC` and
+  the exemption).
+- On the plain path (no backend, or plain `bwrap` with the runtime's
+  outer `prlimit --nproc`) the runtime checks the harw process' own
+  identity (`prlimit` and `bwrap` keep its real UID) with the same rule,
+  and `require_rlimits` refuses before the spawn unless the job cgroup's
+  `pids.max` covers the request. On this route `shell.exec` and `job.start`
+  leave the identity to the runtime
+  (`ShellLimits::resolve_prlimit_without_nproc_identity`), so every chain
+  backend accepts a root harw whose delegated cgroup root covers `nproc`.
+- The paths without a job runtime use `ShellLimits::resolve_prlimit`, which
+  has no job cgroup in view and refuses an exempt harw process outright
+  under `require_rlimits`: the legacy `prlimit … -- bwrap …` path of
+  `shell.exec` (`[sandbox] execution = "legacy"`) and the LaTeX tools
+  (`latex.build`, `latex.check`). There an unprivileged harw user or
+  `require_rlimits = false` are the only ways out.
+- `host.sudo_exec` does not check harw's identity: the target runs as
+  uid 0 after `sudo`, so `RLIMIT_NPROC` never binds it whatever harw's own
+  identity is. It keeps its `prlimit --nproc` and logs a warning that the
+  process count is not capped.
+- The approved host path of `shell.exec` (host permit,
+  `run_host_command`) behaves the same way: it is an explicitly approved
+  host run, so an exempt harw identity logs a warning instead of refusing
+  it, and nothing claims a process cap there.
+
 The report has no rlimit dimension of its own (a known E2f deviation):
 `resource_limits` is the worse of the cgroup and the rlimit state, so with
 `pids_max` requested and no cgroup root it reads `not_enforced` even
 though `RLIMIT_NPROC` holds. This under-claims, never over-claims; a
 separate `rlimits` (or `process_count`) dimension in `SandboxReport` is an
-open PL-97 follow-up.
+open PL-97 follow-up; until then an uncapped process count (E2g) lowers
+`resource_limits` as well.
 `prlimit` is looked up only
 where it is needed: on the plain `bwrap` backend the runtime runs its own
 `prlimit` in front of `bwrap` (same check and warning as before); the

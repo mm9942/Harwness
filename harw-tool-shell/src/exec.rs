@@ -892,9 +892,11 @@ impl ShellExecutor {
         match self.chain_route(sandbox, session_id, TOOL_NAME) {
             Ok(Some(backend)) => {
                 // Reines Bubblewrap: das Job-Runtime stellt sein `prlimit` vor
-                // `bwrap`; dieselbe Prüfung und Warnung wie bisher.
+                // `bwrap`; dieselbe Prüfung und Warnung wie bisher. Die
+                // RLIMIT_NPROC-Identität prüft das Job-Runtime selbst, mit
+                // Blick auf das pids.max der Job-Cgroup (PL-97 E2g).
                 if !backend.uses_trampoline() {
-                    match self.limits.resolve_prlimit() {
+                    match self.limits.resolve_prlimit_without_nproc_identity() {
                         Ok(Some(_)) => {}
                         Ok(None) => warn!(
                             "shell.exec runs WITHOUT rlimits: prlimit missing and require_rlimits=false"
@@ -1286,7 +1288,25 @@ impl ShellExecutor {
     /// verhält sich dies byte-identisch zu [`Self::resolve_limits`].
     fn resolve_host_limits(&self) -> Result<(NonZeroU64, Option<PathBuf>), ShellLimitsError> {
         match self.exec_platform {
-            ExecPlatform::Sandboxed => self.resolve_limits(),
+            ExecPlatform::Sandboxed => {
+                // PL-97 E2g: der Host-Pfad ist eine ausdrücklich genehmigte
+                // Ausführung auf dem Host (Host-Permit), wie host.sudo_exec.
+                // Läuft harw als uid 0 oder mit CAP_SYS_RESOURCE/CAP_SYS_ADMIN,
+                // bindet RLIMIT_NPROC dort nie; statt die genehmigte Ausführung
+                // abzulehnen, wird gewarnt und kein Prozessdeckel behauptet.
+                let tmpfs_size = self.resolve_sandbox_limits()?;
+                let prlimit = self.limits.resolve_prlimit_without_nproc_identity()?;
+                let exemption = crate::limits::current_nproc_exemption();
+                if self.limits.nproc != crate::limits::RLIMIT_UNLIMITED {
+                    if let Some(reason) = exemption {
+                        warn!(
+                            reason,
+                            "shell.exec host run: RLIMIT_NPROC (nproc) caps nothing for this harw identity"
+                        );
+                    }
+                }
+                Ok((tmpfs_size, prlimit))
+            }
             ExecPlatform::NoSandbox => {
                 let limits = ShellLimits {
                     require_rlimits: false,
@@ -2741,6 +2761,11 @@ mod tests {
     fn sandbox_runtime_available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         *AVAILABLE.get_or_init(|| {
+            // PL-97 E2g: als uid 0 bzw. mit CAP_SYS_ADMIN/CAP_SYS_RESOURCE
+            // deckelt RLIMIT_NPROC nichts; ohne Job-Cgroup lehnt die Kette ab.
+            if crate::limits::real_nproc_exemption().is_some() {
+                return false;
+            }
             let Ok(launcher) = BwrapLauncher::discover() else {
                 return false;
             };
@@ -4507,6 +4532,39 @@ mod tests {
             ),
             "{requests:?}"
         );
+        Ok(())
+    }
+
+    /// PL-97 E2g: on the plain-bwrap chain route `shell.exec` does not check
+    /// harw's own RLIMIT_NPROC identity; the job runtime does, with the job
+    /// cgroup's `pids.max` in view. An exempt harw reaches the runtime.
+    #[tokio::test]
+    async fn test_chain_plain_bwrap_route_leaves_the_nproc_identity_to_the_runtime() -> TestResult {
+        if ShellLimits::default()
+            .resolve_prlimit_without_nproc_identity()
+            .is_err()
+        {
+            eprintln!("skipped: no trusted prlimit at the fixed paths");
+            return Ok(());
+        }
+        let _exempt = crate::limits::test_seam::ExemptIdentity::install(
+            "der harw-Prozess läuft mit realer uid 0",
+        );
+        let port = RecordingPort::new(Some(BackendKind::Bwrap));
+        let mut provider = recording_provider(&port);
+        provider.limits.require_rlimits = true;
+        assert!(provider.limits.resolve_prlimit().is_err());
+        let (output, _sandbox) = execute(
+            &provider,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+            "echo hi",
+        )
+        .await?;
+        match &output {
+            ToolOutput::Json { content } => assert_eq!(content["exit_code"], 0, "{content}"),
+            other => return Err(TestError::Unexpected(format!("refused: {other:?}"))),
+        }
+        assert_eq!(port.requests()?.len(), 1);
         Ok(())
     }
 

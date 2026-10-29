@@ -43,9 +43,19 @@ Semantic Versioning within the 0.x pre-release range.
 - `shell.exec` and `job.start` run through the sandbox chain by default
   (child agents get the parent workspace root but stay unconfined): `[sandbox] execution = "chain"` is the default and
   `[sandbox] execution = "legacy"` keeps the previous `prlimit … -- bwrap …`
-  path (profile scope; a repository layer cannot set it). On the chain path
-  RLIMIT_NPROC is capped only through the job cgroup's `pids.max` until the
-  follow-up lands.
+  path (profile scope; a repository layer cannot set it). The chain sets
+  RLIMIT_NPROC (`process_count_max`) through the trampoline or `prlimit`
+  next to the job cgroup's `pids.max`. Because the kernel exempts real uid
+  0, `CAP_SYS_ADMIN` and `CAP_SYS_RESOURCE` from RLIMIT_NPROC, such an
+  identity never reports the process count as enforced, and with
+  `require_rlimits` (the `shell.exec` default) the job is refused unless
+  the job cgroup's `pids.max` covers it. On the chain (every backend) a
+  root harw therefore needs a delegated cgroup root whose `pids.max` covers
+  `nproc`; the legacy `shell.exec` path and the LaTeX tools (`latex.build`,
+  `latex.check`) have no job cgroup and need an unprivileged harw or
+  `require_rlimits = false`. `host.sudo_exec` is unaffected (its target runs
+  as root after `sudo`, so RLIMIT_NPROC never binds it; it logs a warning),
+  and so is the approved host path of `shell.exec`, which also warns.
 - Reasoning summaries in the TUI render as readable, expanded markdown
   blocks; `[tui] reasoning = "collapsed" | "hidden"` restores a compact view
   or hides them.

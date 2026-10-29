@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use harw_job_core::{EnforcementState, SandboxProfileName, SandboxReport, SandboxRequirement};
+use harw_job_exec::plan::ProcessCountGuard;
+use harw_job_exec::report::{ProcessIdentity, nproc_exemption};
 use harw_job_exec::{
     CgroupVerify, ExecPlanV1, PROC_SELF_CGROUP, TrampolineCommand, exit_code, unified_cgroup_path,
 };
@@ -146,10 +148,60 @@ fn test_process_count_rlimit_reaches_the_job() -> TestResult {
     let values: Vec<&str> = line.split_whitespace().skip(2).take(2).collect();
     let expected = count.to_string();
     assert_eq!(values, [expected.as_str(), expected.as_str()], "{line}");
+    // PL-97 E2g: the limit is set either way, but it only binds an
+    // identity the kernel does not exempt (the unsandboxed trampoline has
+    // the test runner's identity).
+    let expected = if nproc_exempt() {
+        EnforcementState::NotEnforced
+    } else {
+        EnforcementState::Enforced
+    };
     assert_eq!(
         run.report.map(|report| report.resource_limits),
-        Some(EnforcementState::Enforced)
+        Some(expected)
     );
+    Ok(())
+}
+
+/// Whether the test runner's identity (and so an unsandboxed
+/// trampoline's) is exempt from `RLIMIT_NPROC`.
+fn nproc_exempt() -> bool {
+    nproc_exemption(ProcessIdentity::current()).is_some()
+}
+
+/// PL-97 E2g: a job that requires its process count cap is refused (exit
+/// `SANDBOX_REFUSED`, the report written first) when the identity that
+/// would exec it is exempt from `RLIMIT_NPROC` and no job cgroup covers
+/// the request; an unprivileged identity runs it. Which branch runs
+/// depends on the uid of the test runner (the decision itself is covered
+/// for every identity by the unit tests with an injected identity).
+#[test]
+fn test_required_process_count_is_refused_for_an_exempt_identity() -> TestResult {
+    let current = harw_job_linux::resources::current_rlimit(RlimitResource::Nproc);
+    let count = current.hard.map_or(1 << 20, |hard| hard.min(1 << 20));
+    let plan = sh("echo ran")
+        .with_rlimits(RlimitSet::new().with(RlimitResource::Nproc, RlimitValue::fixed(count)))
+        .with_process_count(ProcessCountGuard {
+            required: true,
+            cgroup_pids_cover: false,
+        });
+    let run = run(&plan, &[])?;
+    let resource_limits = run.report.map(|report| report.resource_limits);
+    if nproc_exempt() {
+        assert_eq!(
+            run.code(),
+            Some(i32::from(exit_code::SANDBOX_REFUSED)),
+            "stderr: {}",
+            run.stderr()
+        );
+        assert!(run.stderr().contains("RLIMIT_NPROC"), "{}", run.stderr());
+        assert!(run.output.stdout.is_empty(), "the job must not run");
+        assert_eq!(resource_limits, Some(EnforcementState::NotEnforced));
+    } else {
+        assert_eq!(run.code(), Some(0), "stderr: {}", run.stderr());
+        assert_eq!(String::from_utf8_lossy(&run.output.stdout), "ran\n");
+        assert_eq!(resource_limits, Some(EnforcementState::Enforced));
+    }
     Ok(())
 }
 

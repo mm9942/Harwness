@@ -102,6 +102,15 @@ pub enum ShellLimitsError {
         /// Geprüfte feste Pfade.
         candidates: Vec<PathBuf>,
     },
+    /// `require_rlimits` is set, but `prlimit --nproc` would cap nothing
+    /// (PL-97 E2g): the kernel exempts this harw process (real uid 0,
+    /// `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE`, inherited through `prlimit`
+    /// and `bwrap`) from `RLIMIT_NPROC`, and this path has no job cgroup
+    /// whose `pids.max` could cap the process count instead.
+    NprocNotEnforced {
+        /// Why the identity is exempt.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for ShellLimitsError {
@@ -124,6 +133,14 @@ impl fmt::Display for ShellLimitsError {
                      ohne rlimits laufen zu lassen"
                 )
             }
+            Self::NprocNotEnforced { reason } => write!(
+                f,
+                "RLIMIT_NPROC (nproc) wird nicht durchgesetzt: {reason}, was der Kernel von \
+                 RLIMIT_NPROC ausnimmt, und kein Job-cgroup-pids.max deckt die Prozesszahl ab; \
+                 harw als unprivilegierten Nutzer starten, für shell.exec die Sandbox-Kette \
+                 mit delegierter cgroup-Wurzel nutzen, oder ShellLimits::require_rlimits = false \
+                 setzen, um das Werkzeug bewusst ohne Prozessdeckel laufen zu lassen"
+            ),
         }
     }
 }
@@ -216,13 +233,63 @@ impl ShellLimits {
     /// # Errors
     /// [`ShellLimitsError::PrlimitUnavailable`], wenn nicht gefunden und
     /// `require_rlimits == true`.
+    ///
+    /// [`ShellLimitsError::NprocNotEnforced`], wenn `require_rlimits ==
+    /// true`, `nproc` begrenzt ist und der harw-Prozess selbst von
+    /// `RLIMIT_NPROC` ausgenommen ist ([`nproc_exemption`], PL-97 E2g):
+    /// `prlimit --nproc` würde dann nichts deckeln.
+    ///
+    /// Gilt für die Wege ohne Job-Runtime: Legacy-`shell.exec` und die
+    /// LaTeX-Werkzeuge. Die Sandbox-Kette und `host.sudo_exec` nehmen
+    /// [`resolve_prlimit_without_nproc_identity`](Self::resolve_prlimit_without_nproc_identity).
     pub fn resolve_prlimit(&self) -> Result<Option<PathBuf>, ShellLimitsError> {
+        let prlimit = self.resolve_prlimit_without_nproc_identity()?;
+        self.check_nproc_identity(current_nproc_exemption())?;
+        Ok(prlimit)
+    }
+
+    /// Like [`resolve_prlimit`](Self::resolve_prlimit), without the
+    /// `RLIMIT_NPROC` identity check (PL-97 E2g).
+    ///
+    /// # Description
+    /// For two callers only. The plain-bwrap route of the sandbox chain
+    /// (`shell.exec`, background `job.start`): the job runtime puts its
+    /// own `prlimit` in front of `bwrap` and checks the same identity
+    /// fail-closed, and only it knows whether the job cgroup's `pids.max`
+    /// covers `nproc`. And `host.sudo_exec`: the target runs as uid 0
+    /// after `sudo`, so `RLIMIT_NPROC` never binds it whatever harw's own
+    /// identity is; the caller warns about that instead.
+    ///
+    /// # Errors
+    /// [`ShellLimitsError::PrlimitUnavailable`], wenn nicht gefunden und
+    /// `require_rlimits == true`.
+    pub fn resolve_prlimit_without_nproc_identity(
+        &self,
+    ) -> Result<Option<PathBuf>, ShellLimitsError> {
         #[cfg(test)]
         if test_seam::prlimit_hidden() {
             return self.resolve_prlimit_in(&[Path::new(test_seam::MISSING_PRLIMIT)]);
         }
         let candidates = PRLIMIT_CANDIDATES.map(Path::new);
         self.resolve_prlimit_in(&candidates)
+    }
+
+    /// Refuses limits that require their rlimits when `RLIMIT_NPROC` cannot
+    /// bind this process (`exemption`, from [`nproc_exemption`]). Pure.
+    ///
+    /// # Errors
+    /// [`ShellLimitsError::NprocNotEnforced`] for `require_rlimits`, a
+    /// bounded `nproc` and an exempt identity.
+    pub(crate) fn check_nproc_identity(
+        &self,
+        exemption: Option<&'static str>,
+    ) -> Result<(), ShellLimitsError> {
+        match exemption {
+            Some(reason) if self.require_rlimits && self.nproc != RLIMIT_UNLIMITED => {
+                Err(ShellLimitsError::NprocNotEnforced { reason })
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Wie [`resolve_prlimit`](Self::resolve_prlimit), mit expliziten Kandidaten
@@ -285,6 +352,80 @@ impl ShellLimits {
             ..harw_command::ResourceRequest::default()
         }
     }
+}
+
+/// Linux capability number of `CAP_SYS_ADMIN`.
+const CAP_SYS_ADMIN: u32 = 21;
+/// Linux capability number of `CAP_SYS_RESOURCE`.
+const CAP_SYS_RESOURCE: u32 = 24;
+
+/// Why `RLIMIT_NPROC` would not bind a process with this
+/// `/proc/<pid>/status` (PL-97 E2g), `None` when it binds. Pure.
+///
+/// The kernel exempts real UID 0, `CAP_SYS_ADMIN` and `CAP_SYS_RESOURCE`
+/// (getrlimit(2)); a successful `prlimit --nproc` then caps nothing. A
+/// missing or unparsable status counts as exempt (fail-closed). Mirrors
+/// `harw_job_exec::report::ProcessIdentity` (this crate does not depend
+/// on the job runtime).
+pub(crate) fn nproc_exemption(status: Option<&str>) -> Option<&'static str> {
+    const UNKNOWN: &str = "die Identität des harw-Prozesses ist unbekannt";
+    let Some(status) = status else {
+        return Some(UNKNOWN);
+    };
+    let field = |key: &str| {
+        status.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name == key).then(|| value.trim())
+        })
+    };
+    let real_uid = field("Uid")
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|uid| uid.parse::<u32>().ok());
+    let caps = |key: &str| field(key).and_then(|value| u64::from_str_radix(value, 16).ok());
+    let (Some(real_uid), Some(effective), Some(permitted)) =
+        (real_uid, caps("CapEff"), caps("CapPrm"))
+    else {
+        return Some(UNKNOWN);
+    };
+    let exempting = (1_u64 << CAP_SYS_ADMIN) | (1_u64 << CAP_SYS_RESOURCE);
+    if real_uid == 0 {
+        Some("der harw-Prozess läuft mit realer uid 0")
+    } else if (effective | permitted) & exempting != 0 {
+        Some("der harw-Prozess hält CAP_SYS_ADMIN oder CAP_SYS_RESOURCE")
+    } else {
+        None
+    }
+}
+
+/// [`nproc_exemption`] of this process as [`ShellLimits::resolve_prlimit`]
+/// sees it.
+///
+/// In this crate's unit tests the identity is unprivileged unless a test
+/// installs an exempt one ([`test_seam::ExemptIdentity`]), so the host and
+/// legacy paths behave the same under any uid. The sandbox tests that run
+/// the job runtime (which always probes the real identity) check
+/// [`real_nproc_exemption`] themselves.
+pub(crate) fn current_nproc_exemption() -> Option<&'static str> {
+    #[cfg(test)]
+    {
+        test_seam::nproc_exemption_override().unwrap_or(None)
+    }
+    #[cfg(not(test))]
+    {
+        real_nproc_exemption()
+    }
+}
+
+/// [`nproc_exemption`] of this process, read from `/proc/self/status`
+/// (bounded).
+pub(crate) fn real_nproc_exemption() -> Option<&'static str> {
+    use std::io::Read as _;
+    // Obergrenze für `/proc/self/status` (real ~1,5 KiB).
+    const MAX_PROC_STATUS_BYTES: u64 = 64 * 1024;
+    let mut status = String::new();
+    let read = std::fs::File::open("/proc/self/status")
+        .and_then(|file| file.take(MAX_PROC_STATUS_BYTES).read_to_string(&mut status));
+    nproc_exemption(read.ok().map(|_| status.as_str()))
 }
 
 /// Zahlenwert für `prlimit`; [`RLIMIT_UNLIMITED`] wird zu `unlimited`
@@ -353,6 +494,35 @@ pub(crate) mod test_seam {
 
     thread_local! {
         static HIDDEN: Cell<bool> = const { Cell::new(false) };
+        static NPROC_EXEMPTION: Cell<Option<Option<&'static str>>> = const { Cell::new(None) };
+    }
+
+    /// The `RLIMIT_NPROC` exemption [`super::current_nproc_exemption`]
+    /// reports on this thread (PL-97 E2g): `None` (unprivileged) unless
+    /// [`ExemptIdentity`] is installed.
+    pub(crate) fn nproc_exemption_override() -> Option<Option<&'static str>> {
+        NPROC_EXEMPTION.with(Cell::get)
+    }
+
+    /// Makes this thread's harw process look exempt from `RLIMIT_NPROC`
+    /// (real uid 0 or a capability) until dropped.
+    pub(crate) struct ExemptIdentity {
+        previous: Option<Option<&'static str>>,
+    }
+
+    impl ExemptIdentity {
+        /// From now on this thread's identity is exempt for `reason`.
+        pub(crate) fn install(reason: &'static str) -> Self {
+            Self {
+                previous: NPROC_EXEMPTION.with(|cell| cell.replace(Some(Some(reason)))),
+            }
+        }
+    }
+
+    impl Drop for ExemptIdentity {
+        fn drop(&mut self) {
+            NPROC_EXEMPTION.with(|cell| cell.set(self.previous));
+        }
     }
 
     /// Whether [`super::ShellLimits::resolve_prlimit`] finds nothing on
@@ -481,6 +651,73 @@ mod tests {
         assert!(message.contains("util-linux/prlimit fehlt"), "{message}");
         assert!(message.contains("require_rlimits"), "{message}");
         assert!(message.contains("PATH is never searched"), "{message}");
+        Ok(())
+    }
+
+    /// PL-97 E2g: `prlimit --nproc` caps nothing for a harw process with
+    /// real uid 0, `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE`; with
+    /// `require_rlimits` the plain path then refuses (it has no job cgroup
+    /// whose `pids.max` could cover it). An unprivileged identity passes.
+    #[test]
+    fn nproc_exempt_identity_is_refused_under_require_rlimits() -> TestResult {
+        let root = "Uid:\t0\t0\t0\t0\nCapPrm:\t0\nCapEff:\t0\n";
+        let capable = "Uid:\t1000\t1000\t1000\t1000\nCapPrm:\t1000000\nCapEff:\t0\n";
+        let admin = "Uid:\t1000\t1000\t1000\t1000\nCapPrm:\t200000\nCapEff:\t200000\n";
+        let user = "Uid:\t1000\t0\t0\t0\nCapPrm:\t3000\nCapEff:\t3000\n";
+        for status in [
+            Some(root),
+            Some(capable),
+            Some(admin),
+            None,
+            Some("Uid:\t7\n"),
+        ] {
+            assert!(nproc_exemption(status).is_some(), "{status:?}");
+        }
+        assert_eq!(nproc_exemption(Some(user)), None);
+
+        let limits = ShellLimits::default();
+        let exempt = nproc_exemption(Some(root));
+        let Err(error) = limits.check_nproc_identity(exempt) else {
+            return Err(TestError::Unexpected("root must be refused".into()));
+        };
+        let message = error.to_string();
+        assert!(message.contains("RLIMIT_NPROC"), "{message}");
+        assert!(message.contains("require_rlimits"), "{message}");
+        limits
+            .check_nproc_identity(None)
+            .map_err(ctx("unprivileged"))?;
+        let optional = ShellLimits {
+            require_rlimits: false,
+            ..ShellLimits::default()
+        };
+        optional
+            .check_nproc_identity(exempt)
+            .map_err(ctx("not required"))?;
+        let unbounded = ShellLimits {
+            nproc: RLIMIT_UNLIMITED,
+            ..ShellLimits::default()
+        };
+        unbounded
+            .check_nproc_identity(exempt)
+            .map_err(ctx("no nproc cap"))?;
+
+        // Through the seam: `resolve_prlimit` itself refuses, when a
+        // trusted `prlimit` exists at all.
+        let _exempt = test_seam::ExemptIdentity::install("der harw-Prozess läuft mit realer uid 0");
+        match limits.resolve_prlimit() {
+            Err(ShellLimitsError::NprocNotEnforced { .. }) => {}
+            Err(ShellLimitsError::PrlimitUnavailable { .. }) => {
+                eprintln!("skipped: no trusted prlimit at the fixed paths");
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        assert!(optional.resolve_prlimit().is_ok());
+        // The chain route and `host.sudo_exec` leave the identity to the
+        // job runtime resp. never rely on it: no `NprocNotEnforced` there.
+        assert!(!matches!(
+            limits.resolve_prlimit_without_nproc_identity(),
+            Err(ShellLimitsError::NprocNotEnforced { .. })
+        ));
         Ok(())
     }
 

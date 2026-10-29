@@ -1,5 +1,6 @@
-//! The trampoline itself: plan → cgroup → rlimits → sandbox → report →
-//! requirement check → `exec` (Job-Runtime-Doc §24).
+//! The trampoline itself: plan → cgroup → rlimits → sandbox → identity
+//! check of `RLIMIT_NPROC` → report → requirement check → `exec`
+//! (Job-Runtime-Doc §24).
 //!
 //! The cgroup step either joins the job cgroup ([`CgroupMembership::Attach`])
 //! or verifies `/proc/self/cgroup` ([`CgroupMembership::Verify`]). A failed
@@ -22,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use harw_job_core::{EnforcementState, SandboxReport};
+use harw_job_linux::RlimitResource;
 use harw_job_linux::cgroup::{CgroupBackend as _, CgroupV2Fs};
 use harw_job_linux::sandbox::apply_to_current_process;
 use rustix::fs::{Mode, OFlags};
@@ -30,7 +32,10 @@ use crate::error::ExecError;
 use crate::plan::{
     CgroupJoin, CgroupMembership, CgroupVerify, ExecPlanV1, MAX_PLAN_BYTES, PROC_SELF_CGROUP,
 };
-use crate::report::{check_requirement, render_report, resource_limits_state, unsandboxed_report};
+use crate::report::{
+    ProcessCountCap, ProcessIdentity, check_requirement, nproc_exemption, process_count_refusal,
+    render_report, resource_limits_state, unsandboxed_report, with_process_count,
+};
 
 /// Upper bound for reading `/proc/self/cgroup` (a few lines in practice).
 const MAX_PROC_CGROUP_BYTES: u64 = 64 * 1024;
@@ -228,7 +233,20 @@ struct Controls {
 /// cgroup limits that are not in effect. When a later step fails as well,
 /// the verification failure is returned: the first failure in §24 order
 /// is the reason the job does not run.
+///
+/// After the sandbox step (capabilities already dropped) the identity that
+/// will `exec` the job is read ([`ProcessIdentity::current`]) and an
+/// `Nproc` rlimit is checked against it ([`process_count_outcome`]).
 fn apply_controls(plan: &ExecPlanV1) -> Result<Controls, ExecError> {
+    apply_controls_with(plan, ProcessIdentity::current)
+}
+
+/// [`apply_controls`] with the identity probe injected (test seam: the
+/// unit tests decide the identity instead of the test runner's uid).
+fn apply_controls_with(
+    plan: &ExecPlanV1,
+    identity: impl FnOnce() -> Option<ProcessIdentity>,
+) -> Result<Controls, ExecError> {
     let (cgroup_limits, refusal) = match &plan.cgroup {
         Some(CgroupMembership::Attach(join)) => {
             join_cgroup(join)?;
@@ -245,7 +263,66 @@ fn apply_controls(plan: &ExecPlanV1) -> Result<Controls, ExecError> {
         Err(error) => return Err(refusal.unwrap_or(error)),
     };
     report.resource_limits = resource_limits_state(cgroup_limits, !plan.rlimits.is_empty());
-    Ok(Controls { report, refusal })
+    if plan.rlimits.get(RlimitResource::Nproc).is_none() {
+        return Ok(Controls { report, refusal });
+    }
+    let membership_holds = plan.cgroup.is_some() && refusal.is_none();
+    let (resource_limits, process_count) = process_count_outcome(
+        plan,
+        report.resource_limits,
+        cgroup_limits,
+        membership_holds,
+        identity(),
+    );
+    report.resource_limits = resource_limits;
+    Ok(Controls {
+        report,
+        refusal: refusal.or(process_count),
+    })
+}
+
+/// Checks the plan's `Nproc` rlimit against the identity that will `exec`
+/// the job (PL-97 E2g). Pure.
+///
+/// The kernel exempts real UID 0, `CAP_SYS_ADMIN` and `CAP_SYS_RESOURCE`
+/// from `RLIMIT_NPROC` ([`nproc_exemption`]; an unknown identity counts as
+/// exempt). For such an identity the process count is capped only when the
+/// plan's [`crate::plan::ProcessCountGuard::cgroup_pids_cover`] says the
+/// job cgroup's `pids.max` enforces the request and the membership holds
+/// (`membership_holds`). Otherwise `resource_limits` is lowered
+/// ([`with_process_count`], never `Enforced`) and, when the guard is
+/// `required`, the job is refused ([`process_count_refusal`]).
+///
+/// Returns the new `resource_limits` and the refusal, if any.
+fn process_count_outcome(
+    plan: &ExecPlanV1,
+    resource_limits: EnforcementState,
+    cgroup_limits: Option<EnforcementState>,
+    membership_holds: bool,
+    identity: Option<ProcessIdentity>,
+) -> (EnforcementState, Option<ExecError>) {
+    let guard = plan.process_count.unwrap_or_default();
+    let exemption = nproc_exemption(identity);
+    let cap = ProcessCountCap::decide(
+        exemption.is_some(),
+        guard.cgroup_pids_cover && membership_holds,
+    );
+    let other_limits_hold = plan
+        .rlimits
+        .iter()
+        .any(|(resource, _)| resource != RlimitResource::Nproc)
+        || matches!(
+            cgroup_limits,
+            Some(EnforcementState::Enforced | EnforcementState::Partial)
+        );
+    let state = with_process_count(resource_limits, cap, other_limits_hold);
+    let refusal = match exemption {
+        Some(exemption) if cap == ProcessCountCap::NotEnforced && guard.required => {
+            Some(process_count_refusal(exemption))
+        }
+        _ => None,
+    };
+    (state, refusal)
 }
 
 /// The steps after the cgroup membership: rlimits → sandbox.
@@ -449,10 +526,155 @@ mod tests {
                 .collect::<Vec<_>>(),
             [RlimitResource::Nproc]
         );
-        let controls = apply_controls(&plan).map_err(ctx("apply"))?;
+        // An unprivileged identity, whatever uid runs the tests.
+        let controls = apply_controls_with(&plan, || Some(UNPRIVILEGED)).map_err(ctx("apply"))?;
         assert!(controls.refusal.is_none());
         assert_eq!(controls.report.resource_limits, EnforcementState::Enforced);
         assert_eq!(current_rlimit(RlimitResource::Nproc), current);
+        // The same plan for a root identity: set, but not enforced.
+        let root = apply_controls_with(&plan, || Some(ROOT)).map_err(ctx("apply root"))?;
+        assert!(root.refusal.is_none(), "no guard: reported, not refused");
+        assert_eq!(root.report.resource_limits, EnforcementState::NotEnforced);
+        Ok(())
+    }
+
+    const UNPRIVILEGED: ProcessIdentity = ProcessIdentity {
+        real_uid: 1000,
+        effective_caps: 0,
+        permitted_caps: 0,
+    };
+    const ROOT: ProcessIdentity = ProcessIdentity {
+        real_uid: 0,
+        effective_caps: 0,
+        permitted_caps: 0,
+    };
+    /// Non-root, but `CAP_SYS_RESOURCE` (24) still permitted.
+    const CAPABLE: ProcessIdentity = ProcessIdentity {
+        real_uid: 1000,
+        effective_caps: 0,
+        permitted_caps: 1 << 24,
+    };
+
+    fn nproc_plan(guard: crate::plan::ProcessCountGuard) -> ExecPlanV1 {
+        use harw_job_linux::{RlimitSet, RlimitValue};
+        ExecPlanV1::new("/bin/true")
+            .with_rlimits(RlimitSet::new().with(RlimitResource::Nproc, RlimitValue::fixed(4096)))
+            .with_process_count(guard)
+    }
+
+    /// PL-97 E2g: an exempt identity (real uid 0, `CAP_SYS_ADMIN` or
+    /// `CAP_SYS_RESOURCE`, or unknown) never yields an enforced process
+    /// count; under `require_rlimits` it is refused unless a verified job
+    /// cgroup's `pids.max` covers the request. An unprivileged identity
+    /// keeps `Enforced`.
+    #[test]
+    fn test_process_count_outcome_for_exempt_and_unprivileged_identities() -> TestResult {
+        use crate::plan::ProcessCountGuard;
+        use EnforcementState as S;
+        let required = ProcessCountGuard {
+            required: true,
+            cgroup_pids_cover: false,
+        };
+        let covered = ProcessCountGuard {
+            required: true,
+            cgroup_pids_cover: true,
+        };
+        let cgroup = CgroupJoin {
+            root: PathBuf::from("/sys/fs/cgroup/harw"),
+            relative: "harw-job-1".to_owned(),
+            limits: Some(S::Enforced),
+        };
+        let without_cgroup = nproc_plan(required);
+        let with_cgroup = nproc_plan(covered).with_cgroup(cgroup.clone());
+        let uncovered_cgroup = nproc_plan(required).with_cgroup(cgroup);
+        let exempt = [Some(ROOT), Some(CAPABLE), None];
+
+        for identity in exempt {
+            // No cgroup: not enforced, refused.
+            let (state, refusal) =
+                process_count_outcome(&without_cgroup, S::Enforced, None, false, identity);
+            assert_eq!(state, S::NotEnforced, "{identity:?}");
+            match &refusal {
+                Some(error @ ExecError::Sandbox { message }) => {
+                    assert_eq!(error.exit_code(), crate::exit_code::SANDBOX_REFUSED);
+                    assert!(message.contains("RLIMIT_NPROC"), "{message}");
+                }
+                other => return Err(TestError::Unexpected(format!("{identity:?}: {other:?}"))),
+            }
+            // An enforcing pids.max in a verified cgroup: passes.
+            let (state, refusal) =
+                process_count_outcome(&with_cgroup, S::Enforced, Some(S::Enforced), true, identity);
+            assert_eq!(state, S::Enforced, "{identity:?}");
+            assert!(refusal.is_none(), "{identity:?}: {refusal:?}");
+            // The cover counts only while the membership holds.
+            let (state, refusal) = process_count_outcome(
+                &with_cgroup,
+                S::Enforced,
+                Some(S::Enforced),
+                false,
+                identity,
+            );
+            assert_eq!(state, S::Partial, "{identity:?}");
+            assert!(refusal.is_some(), "{identity:?}");
+            // A cgroup whose pids.max does not cover the request: refused,
+            // the other cgroup limits keep the dimension partial.
+            let (state, refusal) = process_count_outcome(
+                &uncovered_cgroup,
+                S::Enforced,
+                Some(S::Enforced),
+                true,
+                identity,
+            );
+            assert_eq!(state, S::Partial, "{identity:?}");
+            assert!(refusal.is_some(), "{identity:?}");
+            // Not required: reported, not refused.
+            let (state, refusal) = process_count_outcome(
+                &nproc_plan(ProcessCountGuard::default()),
+                S::Enforced,
+                None,
+                false,
+                identity,
+            );
+            assert_eq!(state, S::NotEnforced, "{identity:?}");
+            assert!(refusal.is_none(), "{identity:?}");
+        }
+
+        // Unprivileged: the rlimit binds, nothing changes.
+        for plan in [&without_cgroup, &with_cgroup, &uncovered_cgroup] {
+            let (state, refusal) =
+                process_count_outcome(plan, S::Enforced, None, false, Some(UNPRIVILEGED));
+            assert_eq!(state, S::Enforced);
+            assert!(refusal.is_none(), "{refusal:?}");
+        }
+        Ok(())
+    }
+
+    /// The injected root identity reaches the refusal through
+    /// [`apply_controls_with`]: the report is still produced (written
+    /// before the refusal by [`run_trampoline`]).
+    #[test]
+    fn test_apply_controls_refuses_a_required_process_count_for_root() -> TestResult {
+        use crate::plan::ProcessCountGuard;
+        use harw_job_linux::resources::current_rlimit;
+        use harw_job_linux::{RlimitSet, RlimitValue};
+        // Re-apply the current value so the test process is not restricted.
+        let current: RlimitValue = current_rlimit(RlimitResource::Nproc);
+        let plan = ExecPlanV1::new("/bin/true")
+            .with_rlimits(RlimitSet::new().with(RlimitResource::Nproc, current))
+            .with_process_count(ProcessCountGuard {
+                required: true,
+                cgroup_pids_cover: false,
+            });
+        let controls = apply_controls_with(&plan, || Some(ROOT)).map_err(ctx("apply"))?;
+        assert!(matches!(controls.refusal, Some(ExecError::Sandbox { .. })));
+        assert_eq!(
+            controls.report.resource_limits,
+            EnforcementState::NotEnforced
+        );
+        let controls =
+            apply_controls_with(&plan, || Some(UNPRIVILEGED)).map_err(ctx("unprivileged"))?;
+        assert!(controls.refusal.is_none(), "{:?}", controls.refusal);
+        assert_eq!(controls.report.resource_limits, EnforcementState::Enforced);
         Ok(())
     }
 

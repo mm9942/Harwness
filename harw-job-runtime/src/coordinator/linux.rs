@@ -147,6 +147,11 @@ use harw_job_tokio::{
 };
 use tokio::sync::mpsc;
 
+use harw_job_exec::plan::ProcessCountGuard;
+use harw_job_exec::report::{
+    ProcessCountCap, ProcessIdentity, nproc_exemption, with_process_count,
+};
+
 use super::error::RuntimeError;
 use super::executor::{
     AttemptContext, AttemptControl, AttemptEvent, AttemptEventSender, AttemptEvents, AttemptRun,
@@ -492,6 +497,9 @@ struct ChainCgroup<'a> {
     name: &'a str,
     /// `CgroupHandle::proc_path` (`CgroupVerify::expected_proc_path`).
     proc_path: &'a str,
+    /// The job cgroup's `pids.max` covers `process_count_max`
+    /// ([`cgroup_pids_cover`], `ProcessCountGuard::cgroup_pids_cover`).
+    pids_cover: bool,
 }
 
 /// The two trampoline plans of a `BwrapTrampoline` launch.
@@ -578,6 +586,14 @@ fn chain_plans(
         let rlimits = rlimit_set(spec);
         outer = outer.with_rlimits(rlimits.clone());
         inner = inner.with_rlimits(rlimits);
+    }
+    // PL-97 E2g: both stages check RLIMIT_NPROC against their identity;
+    // the outer one runs in the supervisor's namespaces, before `bwrap`
+    // can remap the uid.
+    let pids_cover = cgroup.as_ref().is_some_and(|cgroup| cgroup.pids_cover);
+    if let Some(guard) = process_count_guard(spec, pids_cover) {
+        outer = outer.with_process_count(guard);
+        inner = inner.with_process_count(guard);
     }
     if let Some(cgroup) = cgroup {
         outer = outer.with_cgroup(harw_job_exec::CgroupJoin {
@@ -1381,11 +1397,16 @@ impl LinuxExecutor {
                     env: spec.env.clone(),
                     cwd: Some(workdir),
                 };
-                let rlimits = apply_prlimit(&mut launch, spec);
+                let rlimits = apply_prlimit(
+                    &mut launch,
+                    spec,
+                    ProcessIdentity::current(),
+                    cgroup_pids_cover(spec, cgroup),
+                );
                 require_rlimits(spec, rlimits)?;
                 Ok(Prepared::plain(
                     launch,
-                    unsandboxed_report(worse(resource_limits, rlimits)),
+                    unsandboxed_report(worse(resource_limits, rlimits.state)),
                 ))
             }
             (
@@ -1436,6 +1457,11 @@ impl LinuxExecutor {
                 // sandbox, and fails the job instead of continuing without.
                 if spec.resources.requests_rlimits() {
                     plan = plan.with_rlimits(rlimit_set(spec));
+                }
+                // PL-97 E2g: the trampoline checks RLIMIT_NPROC against the
+                // identity that execs the job.
+                if let Some(guard) = process_count_guard(spec, cgroup_pids_cover(spec, cgroup)) {
+                    plan = plan.with_process_count(guard);
                 }
                 if let Some((backend, handle)) = cgroup {
                     plan = plan.with_cgroup(harw_job_exec::CgroupJoin {
@@ -1492,11 +1518,17 @@ impl LinuxExecutor {
                     cwd: None,
                 };
                 // `prlimit` runs in front of bwrap; the limits are inherited
-                // by the sandboxed program.
-                let rlimits = apply_prlimit(&mut launch, spec);
+                // by the sandboxed program. bwrap keeps the real uid (and
+                // so the kernel's RLIMIT_NPROC exemption) of this process.
+                let rlimits = apply_prlimit(
+                    &mut launch,
+                    spec,
+                    ProcessIdentity::current(),
+                    cgroup_pids_cover(spec, cgroup),
+                );
                 require_rlimits(spec, rlimits)?;
                 let report = SandboxReport {
-                    resource_limits: worse(resource_limits, rlimits),
+                    resource_limits: worse(resource_limits, rlimits.state),
                     ..plan.report()
                 };
                 Ok(Prepared::plain(launch, report))
@@ -1603,10 +1635,12 @@ fn prepare_chain(
     bwrap: &harw_job_executor_bwrap::BwrapExecutor,
     mount: &harw_job_executor_bwrap::TrampolineMount,
 ) -> Result<Prepared, RuntimeError> {
+    let pids_cover = cgroup_pids_cover(spec, cgroup);
     let membership = cgroup.map(|(backend, handle)| ChainCgroup {
         root: backend.root_path(),
         name: handle.name(),
         proc_path: handle.proc_path(),
+        pids_cover,
     });
     let plans = chain_plans(
         bwrap,
@@ -1711,15 +1745,75 @@ fn worse(a: EnforcementState, b: EnforcementState) -> EnforcementState {
     if rank(b) > rank(a) { b } else { a }
 }
 
+/// What [`apply_prlimit`] achieved for the per-process rlimits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RlimitOutcome {
+    /// The rlimit part of `resource_limits`.
+    state: EnforcementState,
+    /// Why `process_count_max` is not enforced although `prlimit --nproc`
+    /// sets it (PL-97 E2g): the kernel exempts this identity and no job
+    /// cgroup `pids.max` covers the request.
+    uncapped_process_count: Option<&'static str>,
+}
+
+impl RlimitOutcome {
+    /// Every requested rlimit holds (or none is requested).
+    const ENFORCED: Self = Self {
+        state: EnforcementState::Enforced,
+        uncapped_process_count: None,
+    };
+}
+
 /// A job that demands its rlimits does not run without them.
-fn require_rlimits(spec: &JobSpec, state: EnforcementState) -> Result<(), RuntimeError> {
-    if spec.resources.require_rlimits && state != EnforcementState::Enforced {
-        return Err(RuntimeError::Unsupported {
-            operation: "rlimits",
-            detail: "the job requires per-process rlimits but no prlimit is available".to_owned(),
-        });
+fn require_rlimits(spec: &JobSpec, outcome: RlimitOutcome) -> Result<(), RuntimeError> {
+    if !spec.resources.require_rlimits || outcome.state == EnforcementState::Enforced {
+        return Ok(());
     }
-    Ok(())
+    let detail = match outcome.uncapped_process_count {
+        Some(exemption) => format!(
+            "the job requires its rlimits but process_count_max (RLIMIT_NPROC) is not \
+             enforced: {exemption}, which the kernel exempts from RLIMIT_NPROC, and no job \
+             cgroup pids.max at or below the requested count covers it"
+        ),
+        None => "the job requires per-process rlimits but no prlimit is available".to_owned(),
+    };
+    Err(RuntimeError::Unsupported {
+        operation: "rlimits",
+        detail,
+    })
+}
+
+/// Whether the job cgroup's `pids.max` enforces at most
+/// `process_count_max` (PL-97 E2g): the cgroup was created with its limits
+/// written (not a reopened handle), the `pids` controller is delegated and
+/// `pids_max <= process_count_max`. The spawn into the cgroup (or the
+/// trampoline's attach/verify) makes the membership itself fail-closed.
+fn cgroup_pids_cover(spec: &JobSpec, cgroup: Option<&(Arc<CgroupV2Fs>, CgroupHandle)>) -> bool {
+    let pids_written = cgroup.is_some_and(|(backend, handle)| {
+        handle.limits_enforcement().is_some()
+            && backend
+                .enabled_controllers()
+                .contains(&harw_job_linux::CgroupController::Pids)
+    });
+    pids_cover(&spec.resources, pids_written)
+}
+
+/// [`cgroup_pids_cover`] once it is known whether the job cgroup's
+/// `pids.max` was written (`pids_written`). Pure.
+fn pids_cover(resources: &ResourceRequest, pids_written: bool) -> bool {
+    match (resources.process_count_max, resources.pids_max) {
+        (Some(count), Some(pids)) => pids_written && u64::from(pids) <= count,
+        _ => false,
+    }
+}
+
+/// The trampoline's process count guard of `spec`: `Some` exactly when
+/// `process_count_max` is requested (the plan then has an `Nproc` rlimit).
+fn process_count_guard(spec: &JobSpec, pids_cover: bool) -> Option<ProcessCountGuard> {
+    spec.resources.process_count_max.map(|_| ProcessCountGuard {
+        required: spec.resources.require_rlimits,
+        cgroup_pids_cover: pids_cover,
+    })
 }
 
 /// Starts the launch through `prlimit` so the limits hold for the program
@@ -1727,16 +1821,31 @@ fn require_rlimits(spec: &JobSpec, state: EnforcementState) -> Result<(), Runtim
 /// `exec`s the program, so the PID stays the primary's. Returns whether the
 /// limits are applied: without a `prlimit` they are **not**, and the report
 /// says so (a `Required` job then fails before it runs).
-fn apply_prlimit(launch: &mut Launch, spec: &JobSpec) -> EnforcementState {
+///
+/// `prlimit --nproc` binds only an identity the kernel does not exempt
+/// (PL-97 E2g): `identity` is this process' own
+/// ([`ProcessIdentity::current`]; `prlimit` and `bwrap` keep its real
+/// uid), and for an exempt one `process_count_max` holds only when the job
+/// cgroup's `pids.max` covers it (`pids_cover`, [`cgroup_pids_cover`]).
+/// Otherwise the outcome is never `Enforced`.
+fn apply_prlimit(
+    launch: &mut Launch,
+    spec: &JobSpec,
+    identity: Option<ProcessIdentity>,
+    pids_cover: bool,
+) -> RlimitOutcome {
     let resources = &spec.resources;
     if !resources.requests_rlimits() {
-        return EnforcementState::Enforced;
+        return RlimitOutcome::ENFORCED;
     }
     let Some(prlimit) = PRLIMIT_CANDIDATES
         .iter()
         .find(|candidate| Path::new(candidate).is_file())
     else {
-        return EnforcementState::NotEnforced;
+        return RlimitOutcome {
+            state: EnforcementState::NotEnforced,
+            uncapped_process_count: None,
+        };
     };
     let mut wrapped: Vec<OsString> = Vec::new();
     if let Some(bytes) = resources.address_space_max {
@@ -1759,7 +1868,30 @@ fn apply_prlimit(launch: &mut Launch, spec: &JobSpec) -> EnforcementState {
     wrapped.append(&mut launch.args);
     launch.program = OsString::from(prlimit);
     launch.args = wrapped;
-    EnforcementState::Enforced
+    process_count_outcome(resources, identity, pids_cover)
+}
+
+/// The rlimit outcome once `prlimit` applies every requested rlimit: an
+/// exempt identity leaves `process_count_max` uncapped unless `pids_cover`.
+/// Pure.
+fn process_count_outcome(
+    resources: &ResourceRequest,
+    identity: Option<ProcessIdentity>,
+    pids_cover: bool,
+) -> RlimitOutcome {
+    if resources.process_count_max.is_none() {
+        return RlimitOutcome::ENFORCED;
+    }
+    let exemption = nproc_exemption(identity);
+    let cap = ProcessCountCap::decide(exemption.is_some(), pids_cover);
+    let other_rlimits = resources.address_space_max.is_some()
+        || resources.cpu_time_max.is_some()
+        || resources.file_size_max.is_some()
+        || resources.open_files_max.is_some();
+    RlimitOutcome {
+        state: with_process_count(EnforcementState::Enforced, cap, other_rlimits),
+        uncapped_process_count: exemption.filter(|_| cap == ProcessCountCap::NotEnforced),
+    }
 }
 
 /// The sandbox policy of a profile rooted at the workspace.
@@ -2789,6 +2921,7 @@ mod scope_tests {
         SandboxProfileName, SandboxRequirement, SpecError,
     };
     use harw_job_exec::ExecPlanV1;
+    use harw_job_exec::report::ProcessIdentity;
     use harw_job_linux::sandbox::plan_landlock;
     use harw_job_linux::{
         CpuQuota, IoLimits, JobResources, LandlockMode, RlimitResource, RlimitValue,
@@ -3309,6 +3442,15 @@ mod scope_tests {
             Some(RlimitValue::fixed(4096))
         );
         assert_eq!(plan.rlimits, rlimit_set(&capped));
+        // PL-97 E2g: no cgroup root here, so pids.max covers nothing and
+        // the trampoline relies on the rlimit binding its identity.
+        assert_eq!(
+            plan.process_count,
+            Some(harw_job_exec::plan::ProcessCountGuard {
+                required: false,
+                cgroup_pids_cover: false,
+            })
+        );
 
         let uncapped = JobSpec::command("true")
             .sandbox(SandboxProfileName::WorkspaceBuild)
@@ -3320,7 +3462,109 @@ mod scope_tests {
             .map_err(ctx("uncapped"))?;
         let plan = landlock_plan(&executor, &uncapped, &scene)?;
         assert_eq!(plan.rlimits.get(RlimitResource::Nproc), None);
+        assert_eq!(plan.process_count, None);
         Ok(())
+    }
+
+    const ROOT: ProcessIdentity = ProcessIdentity {
+        real_uid: 0,
+        effective_caps: 0,
+        permitted_caps: 0,
+    };
+    const CAPABLE: ProcessIdentity = ProcessIdentity {
+        real_uid: 1000,
+        effective_caps: 1 << 21,
+        permitted_caps: 1 << 21,
+    };
+    const UNPRIVILEGED: ProcessIdentity = ProcessIdentity {
+        real_uid: 1000,
+        effective_caps: 0,
+        permitted_caps: 0,
+    };
+
+    /// PL-97 E2g, plain `prlimit` path (no backend, plain bwrap): a
+    /// successful `prlimit --nproc` caps nothing for a uid-0 or capable
+    /// harw process. `process_count_max` is then never `Enforced`, and
+    /// `require_rlimits` refuses before the spawn unless the job cgroup's
+    /// `pids.max` covers the request; an unprivileged identity keeps
+    /// `Enforced`. The identity is injected, the tests need no root.
+    #[test]
+    fn plain_prlimit_path_checks_the_process_count_against_the_identity() -> TestResult {
+        use super::{RlimitOutcome, process_count_outcome, require_rlimits};
+        let request = |require: bool, others: bool| ResourceRequest {
+            process_count_max: Some(4096),
+            pids_max: Some(4096),
+            open_files_max: others.then_some(256),
+            require_rlimits: require,
+            ..ResourceRequest::default()
+        };
+        let job = |resources: ResourceRequest| {
+            JobSpec::command("true")
+                .resources(resources)
+                .build()
+                .map_err(ctx("spec"))
+        };
+        for identity in [Some(ROOT), Some(CAPABLE), None] {
+            // Without a covering cgroup: not enforced, refused.
+            let outcome = process_count_outcome(&request(true, false), identity, false);
+            assert_eq!(outcome.state, S::NotEnforced, "{identity:?}");
+            assert!(outcome.uncapped_process_count.is_some());
+            match require_rlimits(&job(request(true, false))?, outcome) {
+                Err(RuntimeError::Unsupported { detail, .. }) => {
+                    assert!(detail.contains("RLIMIT_NPROC"), "{detail}");
+                }
+                other => return Err(TestError::Unexpected(format!("{identity:?}: {other:?}"))),
+            }
+            // Other rlimits still hold: partial, still refused.
+            let outcome = process_count_outcome(&request(true, true), identity, false);
+            assert_eq!(outcome.state, S::Partial, "{identity:?}");
+            assert!(require_rlimits(&job(request(true, true))?, outcome).is_err());
+            // Not required: reported, not refused.
+            let outcome = process_count_outcome(&request(false, false), identity, false);
+            assert_eq!(outcome.state, S::NotEnforced);
+            require_rlimits(&job(request(false, false))?, outcome).map_err(ctx("optional"))?;
+            // An enforcing pids.max covers it: passes.
+            let outcome = process_count_outcome(&request(true, false), identity, true);
+            assert_eq!(outcome, RlimitOutcome::ENFORCED, "{identity:?}");
+            require_rlimits(&job(request(true, false))?, outcome).map_err(ctx("covered"))?;
+        }
+        let outcome = process_count_outcome(&request(true, true), Some(UNPRIVILEGED), false);
+        assert_eq!(outcome, RlimitOutcome::ENFORCED);
+        require_rlimits(&job(request(true, true))?, outcome).map_err(ctx("unprivileged"))?;
+        // No process count requested: the identity does not matter.
+        let outcome = process_count_outcome(
+            &ResourceRequest {
+                open_files_max: Some(256),
+                ..ResourceRequest::default()
+            },
+            Some(ROOT),
+            false,
+        );
+        assert_eq!(outcome, RlimitOutcome::ENFORCED);
+        Ok(())
+    }
+
+    /// `pids.max` covers `process_count_max` only when it was written
+    /// (fresh job cgroup, `pids` controller delegated) with a value at or
+    /// below the request; never without a cgroup.
+    #[test]
+    fn pids_max_covers_the_process_count_only_at_or_below_the_request() {
+        use super::{cgroup_pids_cover, pids_cover};
+        let request = |process_count_max: Option<u64>, pids_max: Option<u32>| ResourceRequest {
+            process_count_max,
+            pids_max,
+            ..ResourceRequest::default()
+        };
+        assert!(pids_cover(&request(Some(64), Some(64)), true));
+        assert!(pids_cover(&request(Some(64), Some(32)), true));
+        assert!(!pids_cover(&request(Some(64), Some(64)), false));
+        assert!(!pids_cover(&request(Some(64), Some(65)), true));
+        assert!(!pids_cover(&request(Some(64), None), true));
+        assert!(!pids_cover(&request(None, Some(64)), true));
+        let spec = JobSpec::command("true")
+            .resources(request(Some(64), Some(64)))
+            .build();
+        assert!(spec.is_ok_and(|spec| !cgroup_pids_cover(&spec, None)));
     }
 
     #[test]
@@ -3459,6 +3703,7 @@ mod chain_tests {
             root: Path::new("/sys/fs/cgroup/harw.slice"),
             name: "harw-job-j-e1",
             proc_path: "/harw.slice/harw-job-j-e1",
+            pids_cover: true,
         };
         let chain = chain_plans(
             &bwrap(),
@@ -3534,6 +3779,14 @@ mod chain_tests {
             }))
         );
         assert_eq!(inner.rlimits, rlimit_set(&spec));
+        // PL-97 E2g: both stages check RLIMIT_NPROC against their own
+        // identity; the cgroup's pids.max covers it here.
+        let guard = Some(harw_job_exec::plan::ProcessCountGuard {
+            required: false,
+            cgroup_pids_cover: true,
+        });
+        assert_eq!(outer.process_count, guard);
+        assert_eq!(inner.process_count, guard);
         assert_eq!(inner.sandbox_requirement, SandboxRequirement::BestEffort);
         // Ported from alice/consolidate-20261029: even a best-effort job's
         // inner Landlock layer is a hard requirement (it protects the

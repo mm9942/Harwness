@@ -334,12 +334,14 @@ impl ShellToolProvider {
             if let Some(backend) = chain {
                 // Reines Bubblewrap: das Job-Runtime stellt sein `prlimit` vor
                 // `bwrap`; dieselbe Prüfung und dieselben Hinweise wie bisher.
+                // Die RLIMIT_NPROC-Identität prüft das Job-Runtime selbst, mit
+                // Blick auf das pids.max der Job-Cgroup (PL-97 E2g).
                 let warnings = if backend.uses_trampoline() {
                     Vec::new()
                 } else {
                     let prlimit = executor
                         .limits
-                        .resolve_prlimit()
+                        .resolve_prlimit_without_nproc_identity()
                         .map_err(limits_unavailable)?;
                     if prlimit.is_none() {
                         warn!(
@@ -789,6 +791,39 @@ mod tests {
             }
             other => return Err(TestError::Unexpected(format!("{other:?}"))),
         }
+        Ok(())
+    }
+
+    /// PL-97 E2g: auf dem reinen Bubblewrap-Weg der Kette prüft `job.start`
+    /// harws eigene RLIMIT_NPROC-Identität nicht; das übernimmt das
+    /// Job-Runtime mit Blick auf das pids.max der Job-Cgroup.
+    #[tokio::test]
+    async fn test_background_plain_bwrap_route_leaves_the_nproc_identity_to_the_runtime()
+    -> TestResult {
+        if crate::limits::ShellLimits::default()
+            .resolve_prlimit_without_nproc_identity()
+            .is_err()
+        {
+            eprintln!("skipped: no trusted prlimit at the fixed paths");
+            return Ok(());
+        }
+        let _exempt = crate::limits::test_seam::ExemptIdentity::install(
+            "der harw-Prozess läuft mit realer uid 0",
+        );
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(
+            &tmp,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+        )?;
+        let context = ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox);
+        let mut plain = chain_provider(Some(harw_command::BackendKind::Bwrap));
+        plain.limits.require_rlimits = true;
+        assert!(plain.limits.resolve_prlimit().is_err());
+        let launch = plain
+            .prepare_background_launch(&context, "make test", "job.start", 5)
+            .await
+            .map_err(|output| TestError::Unexpected(format!("refused: {output:?}")))?;
+        assert!(launch.sandboxed().is_some());
         Ok(())
     }
 

@@ -1788,9 +1788,72 @@ async fn process_count_rlimit_reaches_the_program_and_is_reported() -> TestResul
         let values: Vec<&str> = line.split_whitespace().skip(2).take(2).collect();
         let expected = count.to_string();
         assert_eq!(values, [expected.as_str(), expected.as_str()], "{line}");
-        assert_eq!(report.resource_limits, EnforcementState::Enforced);
+        // PL-97 E2g: set either way, but it binds only an identity the
+        // kernel does not exempt (the harw process' own, here the test
+        // runner's); there is no job cgroup to cover it.
+        let expected = if nproc_exempt() {
+            EnforcementState::NotEnforced
+        } else {
+            EnforcementState::Enforced
+        };
+        assert_eq!(report.resource_limits, expected);
     } else {
         assert_eq!(report.resource_limits, EnforcementState::NotEnforced);
+    }
+    Ok(())
+}
+
+/// Whether this process (the harw side of the plain `prlimit` path) is
+/// exempt from `RLIMIT_NPROC`: real uid 0, `CAP_SYS_ADMIN` or
+/// `CAP_SYS_RESOURCE`.
+fn nproc_exempt() -> bool {
+    harw_job_exec::report::nproc_exemption(harw_job_exec::report::ProcessIdentity::current())
+        .is_some()
+}
+
+/// PL-97 E2g: on the plain path a job with `require_rlimits` and
+/// `process_count_max` is refused before it runs when this process is
+/// exempt from `RLIMIT_NPROC` and no job cgroup `pids.max` covers the
+/// request; otherwise it runs. Which branch runs depends on the uid of the
+/// test runner; the decision for injected identities is covered by
+/// `plain_prlimit_path_checks_the_process_count_against_the_identity`.
+#[tokio::test]
+async fn required_process_count_is_refused_for_an_exempt_harw_identity() -> TestResult {
+    if !prlimit_present() {
+        eprintln!("skipped: no prlimit at the fixed paths");
+        return Ok(());
+    }
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-nproc-required")?;
+    let coordinator = fixture.coordinator(
+        &runner,
+        LinuxExecutorOptions::default(),
+        Duration::from_secs(3),
+    )?;
+    let current = harw_job_linux::resources::current_rlimit(harw_job_linux::RlimitResource::Nproc);
+    let count = current.hard.map_or(1 << 20, |hard| hard.min(1 << 20));
+    let spec = JobSpec::command("/bin/sh")
+        .arg("-c")
+        .arg("echo ran > ran")
+        .resources(ResourceRequest {
+            process_count_max: Some(count),
+            require_rlimits: true,
+            ..ResourceRequest::default()
+        })
+        .build()
+        .map_err(ctx("spec"))?;
+    let handle = coordinator
+        .submit(envelope(spec)?)
+        .await
+        .map_err(ctx("submit"))?;
+    let result = wait(handle).await?;
+    let ran = fixture.workspace().join("ran").exists();
+    if nproc_exempt() {
+        assert_eq!(result.state, LifecycleState::Failed, "{result:?}");
+        assert!(!ran, "the job must not run");
+    } else {
+        assert!(result.is_success(), "{result:?}");
+        assert!(ran);
     }
     Ok(())
 }

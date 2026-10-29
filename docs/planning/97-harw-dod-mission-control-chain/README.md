@@ -22,7 +22,8 @@ related:
 > **Status: IN IMPLEMENTATION** (2026-10-29). Every work package except E4
 > (jobs ↔ findings correlation; only the client half landed with D2) and
 > X1b (translation) has a commit on `ccr-54aa3dfd-o46he2` (draft PR #154
-> against `dev`); the RLIMIT_NPROC follow-up of E2 (zone E2f) is in flight.
+> against `dev`), including the RLIMIT_NPROC follow-ups of E2 (E2f
+> `7b9e23e3`, the E2g identity fix in this commit).
 > Per-WP commits, main tests and the open items: [§9](#9-landed-state-x1-2026-10-29).
 > Ledger entries: `MIG-016` … `MIG-020` in
 > [`../90-migration-ledger/MIGRATION_LEDGER.md`](../90-migration-ledger/MIGRATION_LEDGER.md).
@@ -1642,9 +1643,10 @@ carry no content of their own and are not listed.
 | E2e `[sandbox] execution` wiring | `f31d639f` | `test_chain_trampoline_route_runs_without_a_fixed_path_prlimit`, `test_background_trampoline_route_runs_without_a_fixed_path_prlimit` (harw-tool-shell); `test_sandbox_execution_config_reaches_the_shell_provider` (harw-registry-defaults); `test_context_child_backend_execution_is_the_config_default` (harw-agent-runner) |
 | E3 shared cgroup-root contract | `f31d639f` | `delegated_root_resolution_order_is_config_env_own_none`, `delegated_root_refuses_relative_unnormalized_and_outside_mount_roots` (harw-job-runtime); `dod_config_suggest_prints_the_profile_for_the_resolved_root`, `dod_config_suggest_drop_in_sets_the_sentinel_root_and_orders_the_probe`, `dod_doctor_warns_when_the_profile_or_prefixes_miss_the_cgroup_root` (harw-cli) |
 | E5 `ExecutionChainReport` | `f31d639f` | `chain_table_golden_for_the_four_host_situations` (harw-dod-client), `execution_chain_checks_report_one_stage_each_and_never_fail` (harw-install), `verify_chain_reports_the_root_the_verify_jobs_use` (harw-cli) |
-| E2f RLIMIT_NPROC through `ResourceRequest` and the trampoline | in flight (uncommitted at X1 time) | — |
+| E2f RLIMIT_NPROC through `ResourceRequest` and the trampoline | `7b9e23e3` | `test_process_count_rlimit_is_encoded_in_the_plan`, `test_apply_controls_sets_the_process_count_rlimit`, `test_process_count_rlimit_reaches_the_job` (harw-job-exec); `landlock_trampoline_plan_carries_the_process_count_rlimit`, `process_count_rlimit_reaches_the_program_and_is_reported` (harw-job-runtime); `job_resources_map_every_limit` (harw-tool-shell). Validation: `cargo test -p harw-job-core`, `-p harw-job-exec`, `-p harw-job-darwin`, `-p harw-job-runtime --features bwrap` (127), `-p harw-tool-shell` (215, incl. the ignored chain rlimit test) |
+| E2g RLIMIT_NPROC identity check (PR #154 review: uid 0, `CAP_SYS_ADMIN`, `CAP_SYS_RESOURCE` are exempt) | this commit | `test_process_count_outcome_for_exempt_and_unprivileged_identities`, `test_apply_controls_refuses_a_required_process_count_for_root`, `test_process_identity_parsing_and_exemption`, `test_required_process_count_is_refused_for_an_exempt_identity` (harw-job-exec); `plain_prlimit_path_checks_the_process_count_against_the_identity`, `pids_max_covers_the_process_count_only_at_or_below_the_request`, `required_process_count_is_refused_for_an_exempt_harw_identity` (harw-job-runtime); `nproc_exempt_identity_is_refused_under_require_rlimits`, `test_chain_plain_bwrap_route_leaves_the_nproc_identity_to_the_runtime`, `test_background_plain_bwrap_route_leaves_the_nproc_identity_to_the_runtime`, `test_sandboxed_command_refuses_an_nproc_exempt_harw` (latex), `test_build_command_ignores_the_harw_nproc_identity` (sudo) (harw-tool-shell). Validation: `cargo test -p harw-job-exec` (33 unit + 14 integration), `-p harw-job-runtime --features bwrap` (130, 3 ignored), `-p harw-tool-shell` (220, 14 ignored); run as root, so the real-identity tests took the exempt branches |
 | E4 jobs ↔ findings correlation | **not landed**; only `harw-dod-client/src/correlate.rs` (path-component prefix match) from D2 | — |
-| X1 docs, ledger, status labels | this commit | `python3 -m unittest discover -s scripts/tests`, `cargo test -p xtask` |
+| X1 docs, ledger, status labels | `d9be3b3a` | `python3 -m unittest discover -s scripts/tests`, `cargo test -p xtask` |
 | X1b translation (#133) | **not done** (optional) | — |
 
 ### 9.2 Open items and known gaps (checked against the tree)
@@ -1656,9 +1658,24 @@ carry no content of their own and are not listed.
   badge in `harw-tui/src/mission/jobs_window.rs`, no `Actor.cgroup` in the
   sentinel findings. Kernel-side ancestor matching (E3b optional second
   commit) is open as well.
-- **E2f** (in flight): on the chain path RLIMIT_NPROC is capped only through
-  the job cgroup's `pids.max` until the follow-up carries it through
-  `ResourceRequest` and the trampoline.
+- **E2f/E2g follow-up:** `SandboxReport` has no own rlimit (or
+  `process_count`) dimension; `resource_limits` stays the worse of the
+  cgroup and rlimit states, and an uncapped process count (exempt
+  identity, E2g) lowers it too (under-claims, never over-claims).
+- **E2g behaviour change:** a harw running as root (or with
+  `CAP_SYS_ADMIN`/`CAP_SYS_RESOURCE`) now refuses `shell.exec` and
+  `job.start` under the default `require_rlimits = true` unless a delegated
+  cgroup root's `pids.max` covers `nproc`; the legacy `shell.exec` path and
+  `latex.build`/`latex.check` refuse it outright (no job cgroup).
+  `host.sudo_exec` and the approved host path of `shell.exec` are not
+  affected (they warn instead; the sudo target runs as root anyway). On a
+  root test host the four `sandbox_test!` cases of `harw-tool-shell`
+  (cancel ×2, `chain_and_legacy_results_match`, `chain_rlimits_and_tmpfs`)
+  skip, and the ignored `test_exec_chain_rlimits_and_tmpfs_size_apply_required`
+  (`cargo test -- --ignored`) fails by design as root without a cgroup root;
+  the 215-test E2f validation above predates E2g. Crates that drive a real
+  `shell.exec` as root (harw-tool-job, harw-registry-defaults, harw-cli)
+  were not re-run for E2g.
 - **E2b:** child agents get the explicit parent workspace root but stay
   unconfined on the chain path (recorded deviation in `05d2d5b7`).
 - **E3:** `harw serve` and `harw web` do not build their host command port

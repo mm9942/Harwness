@@ -55,6 +55,180 @@ pub fn resource_limits_state(
     }
 }
 
+/// Linux capability number of `CAP_SYS_ADMIN` (`linux/capability.h`).
+const CAP_SYS_ADMIN: u32 = 21;
+/// Linux capability number of `CAP_SYS_RESOURCE` (`linux/capability.h`).
+const CAP_SYS_RESOURCE: u32 = 24;
+
+/// Where [`ProcessIdentity::current`] reads the identity.
+pub const PROC_SELF_STATUS: &str = "/proc/self/status";
+
+/// Upper bound for reading `/proc/self/status` (about 1.5 KiB in practice).
+const MAX_PROC_STATUS_BYTES: u64 = 64 * 1024;
+
+/// The part of a process' identity that decides whether `RLIMIT_NPROC`
+/// binds it (PL-97 E2g).
+///
+/// The kernel checks `RLIMIT_NPROC` on `fork`/`clone` but exempts a
+/// process whose real UID is 0 and one with `CAP_SYS_ADMIN` or
+/// `CAP_SYS_RESOURCE` (getrlimit(2)). A successful
+/// `setrlimit(RLIMIT_NPROC)` therefore proves nothing for such a process:
+/// the limit is set and never enforced.
+///
+/// The values come from `/proc/self/status` (`Uid:` real UID, `CapEff:`,
+/// `CapPrm:`), as the process sees them in its own user namespace. A
+/// capability held in a child user namespace never counts towards the
+/// kernel's exemption, so counting it here only under-claims; a real UID
+/// remapped away from 0 inside a user namespace is caught by the stage
+/// that runs in the supervisor's namespace (the outer stage of the
+/// Bubblewrap chain probes before `bwrap`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    /// Real UID (first field of `Uid:`).
+    pub real_uid: u32,
+    /// Effective capability set (`CapEff:`, bit `n` = capability `n`).
+    pub effective_caps: u64,
+    /// Permitted capability set (`CapPrm:`).
+    pub permitted_caps: u64,
+}
+
+impl ProcessIdentity {
+    /// Parses the content of `/proc/<pid>/status`. Pure.
+    ///
+    /// `None` when `Uid:`, `CapEff:` or `CapPrm:` is missing or malformed;
+    /// callers treat an unknown identity as exempt (fail-closed,
+    /// [`nproc_exemption`]).
+    #[must_use]
+    pub fn parse_status(status: &str) -> Option<Self> {
+        let mut real_uid = None;
+        let mut effective_caps = None;
+        let mut permitted_caps = None;
+        for line in status.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            match key {
+                "Uid" => real_uid = value.split_whitespace().next()?.parse().ok(),
+                "CapEff" => effective_caps = u64::from_str_radix(value, 16).ok(),
+                "CapPrm" => permitted_caps = u64::from_str_radix(value, 16).ok(),
+                _ => {}
+            }
+        }
+        Some(Self {
+            real_uid: real_uid?,
+            effective_caps: effective_caps?,
+            permitted_caps: permitted_caps?,
+        })
+    }
+
+    /// The identity of the calling process, read from
+    /// [`PROC_SELF_STATUS`] (bounded). `None` when it cannot be read or
+    /// parsed.
+    #[must_use]
+    pub fn current() -> Option<Self> {
+        let mut content = String::new();
+        std::fs::File::open(PROC_SELF_STATUS)
+            .and_then(|file| {
+                file.take(MAX_PROC_STATUS_BYTES)
+                    .read_to_string(&mut content)
+            })
+            .ok()?;
+        Self::parse_status(&content)
+    }
+
+    /// Why `RLIMIT_NPROC` would not bind this identity, `None` when it
+    /// does.
+    #[must_use]
+    pub fn nproc_exemption(&self) -> Option<&'static str> {
+        let exempting = (1_u64 << CAP_SYS_ADMIN) | (1_u64 << CAP_SYS_RESOURCE);
+        if self.real_uid == 0 {
+            Some("the process that execs the job has real uid 0")
+        } else if (self.effective_caps | self.permitted_caps) & exempting != 0 {
+            Some("the process that execs the job keeps CAP_SYS_ADMIN or CAP_SYS_RESOURCE")
+        } else {
+            None
+        }
+    }
+}
+
+/// Why `RLIMIT_NPROC` would not bind a process of `identity`, `None` when
+/// it does. An unknown identity counts as exempt (fail-closed).
+#[must_use]
+pub fn nproc_exemption(identity: Option<ProcessIdentity>) -> Option<&'static str> {
+    match identity {
+        Some(identity) => identity.nproc_exemption(),
+        None => Some("the identity of the process that execs the job is unknown"),
+    }
+}
+
+/// How the process count cap of a job (`process_count_max`) holds
+/// (PL-97 E2g).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessCountCap {
+    /// `RLIMIT_NPROC` binds the process that execs the job.
+    Rlimit,
+    /// The rlimit does not bind (exempt identity), but the job cgroup's
+    /// `pids.max` enforces at most the requested count.
+    CgroupPids,
+    /// Neither holds: the job's process count is not capped.
+    NotEnforced,
+}
+
+impl ProcessCountCap {
+    /// The cap for an identity that is (`exempt`) or is not exempt from
+    /// `RLIMIT_NPROC`, with or without an enforcing `pids.max` in a
+    /// verified job cgroup (`cgroup_pids_cover`). Pure.
+    #[must_use]
+    pub fn decide(exempt: bool, cgroup_pids_cover: bool) -> Self {
+        match (exempt, cgroup_pids_cover) {
+            (false, _) => Self::Rlimit,
+            (true, true) => Self::CgroupPids,
+            (true, false) => Self::NotEnforced,
+        }
+    }
+}
+
+/// The `resource_limits` dimension once the process count cap is known.
+/// Pure.
+///
+/// `SandboxReport` has no own rlimit dimension yet, so an uncapped process
+/// count lowers `resource_limits`: to [`EnforcementState::NotEnforced`]
+/// when nothing else of the request holds, otherwise to at most
+/// [`EnforcementState::Partial`] (`other_limits_hold`: another rlimit is
+/// applied, or the job cgroup enforces at least part of its limits). A cap
+/// that holds leaves `state` unchanged. Never `Enforced` for an uncapped
+/// process count.
+#[must_use]
+pub fn with_process_count(
+    state: EnforcementState,
+    cap: ProcessCountCap,
+    other_limits_hold: bool,
+) -> EnforcementState {
+    match cap {
+        ProcessCountCap::Rlimit | ProcessCountCap::CgroupPids => state,
+        ProcessCountCap::NotEnforced if !other_limits_hold => EnforcementState::NotEnforced,
+        ProcessCountCap::NotEnforced => match state {
+            EnforcementState::Enforced => EnforcementState::Partial,
+            other => other,
+        },
+    }
+}
+
+/// The refusal of a job that requires its rlimits (`require_rlimits`)
+/// while its process count is not capped (`exemption` from
+/// [`nproc_exemption`]): exit [`crate::exit_code::SANDBOX_REFUSED`].
+#[must_use]
+pub fn process_count_refusal(exemption: &str) -> ExecError {
+    ExecError::Sandbox {
+        message: format!(
+            "process_count_max (RLIMIT_NPROC) is required (require_rlimits) but not enforced: \
+             {exemption}, which the kernel exempts from RLIMIT_NPROC, and no verified job \
+             cgroup pids.max at or below the requested count covers it"
+        ),
+    }
+}
+
 /// Merges the report a Bubblewrap launcher predicts for its own layer with
 /// the report the trampoline wrote from inside that namespace. Pure.
 ///
@@ -233,6 +407,100 @@ mod tests {
             resource_limits_state(Some(S::Unsupported), true),
             S::Partial
         );
+    }
+
+    /// `/proc/self/status` of a root shell in a container, trimmed.
+    const ROOT_STATUS: &str = "Name:\tcat\nUmask:\t0022\nState:\tR (running)\n\
+        Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nCapInh:\t0000000000000000\n\
+        CapPrm:\t00000000a80425fb\nCapEff:\t00000000a80425fb\nCapBnd:\t00000000a80425fb\n";
+
+    #[test]
+    fn test_process_identity_parsing_and_exemption() -> TestResult {
+        let root = ProcessIdentity::parse_status(ROOT_STATUS).ok_or(TestError::Missing("root"))?;
+        assert_eq!(root.real_uid, 0);
+        assert_eq!(root.effective_caps, 0xa804_25fb);
+        assert!(root.nproc_exemption().is_some());
+
+        // Real uid 1000 with effective uid 0 (setuid): the real uid counts.
+        let user = "Uid:\t1000\t0\t0\t0\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\n";
+        let user = ProcessIdentity::parse_status(user).ok_or(TestError::Missing("user"))?;
+        assert_eq!(user.real_uid, 1000);
+        assert_eq!(user.nproc_exemption(), None);
+        assert_eq!(nproc_exemption(Some(user)), None);
+
+        // CAP_SYS_ADMIN (21) effective, CAP_SYS_RESOURCE (24) permitted.
+        for caps in [
+            "CapPrm:\t0\nCapEff:\t200000\n",
+            "CapPrm:\t1000000\nCapEff:\t0\n",
+        ] {
+            let status = format!("Uid:\t1000\t1000\t1000\t1000\n{caps}");
+            let capable =
+                ProcessIdentity::parse_status(&status).ok_or(TestError::Missing("capable"))?;
+            assert!(capable.nproc_exemption().is_some(), "{status}");
+        }
+        // Other capabilities do not exempt (CAP_NET_ADMIN = 12).
+        let net = ProcessIdentity::parse_status("Uid:\t7 7 7 7\nCapPrm:\t1000\nCapEff:\t1000\n")
+            .ok_or(TestError::Missing("net"))?;
+        assert_eq!(net.nproc_exemption(), None);
+
+        // Missing or malformed fields: unknown, which counts as exempt.
+        for broken in [
+            "",
+            "Uid:\t0\n",
+            "Uid:\tx\nCapPrm:\t0\nCapEff:\t0\n",
+            "Uid:\t0\nCapPrm:\tzz\nCapEff:\t0\n",
+        ] {
+            assert_eq!(ProcessIdentity::parse_status(broken), None, "{broken:?}");
+        }
+        assert!(nproc_exemption(None).is_some());
+        // The real file parses on Linux.
+        assert!(ProcessIdentity::current().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_count_cap_and_dimension() {
+        assert_eq!(
+            ProcessCountCap::decide(false, false),
+            ProcessCountCap::Rlimit
+        );
+        assert_eq!(
+            ProcessCountCap::decide(false, true),
+            ProcessCountCap::Rlimit
+        );
+        assert_eq!(
+            ProcessCountCap::decide(true, true),
+            ProcessCountCap::CgroupPids
+        );
+        assert_eq!(
+            ProcessCountCap::decide(true, false),
+            ProcessCountCap::NotEnforced
+        );
+        for state in STATES {
+            for others in [false, true] {
+                assert_eq!(
+                    with_process_count(state, ProcessCountCap::Rlimit, others),
+                    state
+                );
+                assert_eq!(
+                    with_process_count(state, ProcessCountCap::CgroupPids, others),
+                    state
+                );
+                let uncapped = with_process_count(state, ProcessCountCap::NotEnforced, others);
+                assert_ne!(uncapped, S::Enforced, "{state:?} {others}");
+            }
+            assert_eq!(
+                with_process_count(state, ProcessCountCap::NotEnforced, false),
+                S::NotEnforced
+            );
+        }
+        assert_eq!(
+            with_process_count(S::Enforced, ProcessCountCap::NotEnforced, true),
+            S::Partial
+        );
+        let refusal = process_count_refusal("the process that execs the job has real uid 0");
+        assert_eq!(refusal.exit_code(), crate::exit_code::SANDBOX_REFUSED);
+        assert!(refusal.to_string().contains("real uid 0"));
     }
 
     const STATES: [S; 4] = [S::Enforced, S::Partial, S::NotEnforced, S::Unsupported];

@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use harw_job_core::{EnforcementState, SandboxRequirement};
-use harw_job_linux::{RlimitSet, SandboxPolicy};
+use harw_job_linux::{RlimitResource, RlimitSet, SandboxPolicy};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ExecError;
@@ -190,6 +190,34 @@ pub fn unified_cgroup_path(proc_self_cgroup: &str) -> Option<&str> {
     found
 }
 
+/// How the trampoline treats the plan's `RLIMIT_NPROC` (PL-97 E2g).
+///
+/// The kernel exempts a process with real UID 0, `CAP_SYS_ADMIN` or
+/// `CAP_SYS_RESOURCE` from `RLIMIT_NPROC` (getrlimit(2)), so a successful
+/// `setrlimit` does not prove the process count is capped. After the
+/// sandbox step the trampoline reads its own identity
+/// ([`crate::report::ProcessIdentity`]); for an exempt identity the cap
+/// holds only through the job cgroup's `pids.max`
+/// ([`ProcessCountGuard::cgroup_pids_cover`]) and the report never says
+/// `enforced` without it. A plan with an `Nproc` rlimit but no guard is
+/// treated as `ProcessCountGuard::default()` (reported, not refused).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCountGuard {
+    /// The job requires its rlimits (`ResourceRequest::require_rlimits`):
+    /// refuse to `exec` (exit [`crate::exit_code::SANDBOX_REFUSED`]) when
+    /// the process count is not capped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
+    /// The supervisor wrote the job cgroup's `pids.max` (the `pids`
+    /// controller is delegated) with a value at or below the `Nproc`
+    /// rlimit. Counts only once the trampoline's own membership holds
+    /// (attach succeeded or verification passed); needs a
+    /// [`ExecPlanV1::cgroup`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cgroup_pids_cover: bool,
+}
+
 /// Launch plan, version 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -206,6 +234,10 @@ pub struct ExecPlanV1 {
     /// cgroup exists (counted per real UID, not per job).
     #[serde(default)]
     pub rlimits: RlimitSet,
+    /// How an `Nproc` rlimit is checked against the identity that execs
+    /// the job ([`ProcessCountGuard`]); only valid with an `Nproc` rlimit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_count: Option<ProcessCountGuard>,
     /// Sandbox policy to apply, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<SandboxPolicy>,
@@ -233,6 +265,7 @@ impl ExecPlanV1 {
             version: PLAN_VERSION,
             cgroup: None,
             rlimits: RlimitSet::new(),
+            process_count: None,
             sandbox: None,
             sandbox_requirement: SandboxRequirement::None,
             program: program.into(),
@@ -266,6 +299,13 @@ impl ExecPlanV1 {
         self
     }
 
+    /// Sets the process count guard of the `Nproc` rlimit (builder style).
+    #[must_use]
+    pub fn with_process_count(mut self, guard: ProcessCountGuard) -> Self {
+        self.process_count = Some(guard);
+        self
+    }
+
     /// Sets the sandbox policy and requirement (builder style).
     #[must_use]
     pub fn with_sandbox(mut self, policy: SandboxPolicy, requirement: SandboxRequirement) -> Self {
@@ -280,8 +320,10 @@ impl ExecPlanV1 {
     /// [`ExecError::UnsupportedVersion`] for a version other than
     /// [`PLAN_VERSION`]; [`ExecError::InvalidPlan`] for an empty program, a
     /// NUL byte in program or arguments, an invalid cgroup membership, invalid
-    /// rlimits, or [`SandboxRequirement::Required`] without a sandbox
-    /// policy (contradictory: nothing could ever satisfy it).
+    /// rlimits, a [`ProcessCountGuard`] without an `Nproc` rlimit (or with
+    /// `cgroup_pids_cover` but no cgroup membership), or
+    /// [`SandboxRequirement::Required`] without a sandbox policy
+    /// (contradictory: nothing could ever satisfy it).
     pub fn validate(&self) -> Result<(), ExecError> {
         if self.version != PLAN_VERSION {
             return Err(ExecError::UnsupportedVersion {
@@ -306,6 +348,14 @@ impl ExecPlanV1 {
             .map_err(|error| ExecError::InvalidPlan {
                 reason: error.to_string(),
             })?;
+        if let Some(guard) = &self.process_count {
+            if self.rlimits.get(RlimitResource::Nproc).is_none() {
+                return invalid("process count guard without an Nproc rlimit".to_owned());
+            }
+            if guard.cgroup_pids_cover && self.cgroup.is_none() {
+                return invalid("process count covered by pids.max without a cgroup".to_owned());
+            }
+        }
         if self.sandbox_requirement == SandboxRequirement::Required && self.sandbox.is_none() {
             return invalid("sandbox requirement `required` without a sandbox policy".to_owned());
         }
@@ -619,6 +669,57 @@ mod tests {
             parsed.rlimits.get(RlimitResource::Nproc),
             Some(RlimitValue::fixed(4096))
         );
+        Ok(())
+    }
+
+    /// The process count guard (PL-97 E2g) round-trips, is omitted from
+    /// the JSON when absent (older plans stay byte-identical) and is only
+    /// valid next to an `Nproc` rlimit; `cgroup_pids_cover` needs a cgroup.
+    #[test]
+    fn test_process_count_guard_is_encoded_and_validated() -> TestResult {
+        let nproc = RlimitSet::new().with(RlimitResource::Nproc, RlimitValue::fixed(4096));
+        let bare = ExecPlanV1::new("/bin/true").with_rlimits(nproc.clone());
+        let json = String::from_utf8(bare.to_json().map_err(ctx("bare"))?).map_err(ctx("utf-8"))?;
+        assert!(!json.contains("process_count"), "{json}");
+
+        let guarded = bare.clone().with_process_count(ProcessCountGuard {
+            required: true,
+            cgroup_pids_cover: false,
+        });
+        let json =
+            String::from_utf8(guarded.to_json().map_err(ctx("guarded"))?).map_err(ctx("utf-8"))?;
+        assert!(
+            json.contains(r#""process_count":{"required":true}"#),
+            "{json}"
+        );
+        assert_eq!(
+            ExecPlanV1::from_json(json.as_bytes()).map_err(ctx("parse"))?,
+            guarded
+        );
+
+        let without_nproc = ExecPlanV1::new("/bin/true")
+            .with_rlimits(RlimitSet::new().with(RlimitResource::Nofile, RlimitValue::fixed(64)))
+            .with_process_count(ProcessCountGuard::default());
+        assert!(matches!(
+            without_nproc.validate(),
+            Err(ExecError::InvalidPlan { .. })
+        ));
+        let cover = ProcessCountGuard {
+            required: true,
+            cgroup_pids_cover: true,
+        };
+        assert!(matches!(
+            bare.clone().with_process_count(cover).validate(),
+            Err(ExecError::InvalidPlan { .. })
+        ));
+        bare.with_cgroup(CgroupJoin {
+            root: PathBuf::from("/sys/fs/cgroup/harw"),
+            relative: "harw-job-1".to_owned(),
+            limits: Some(EnforcementState::Enforced),
+        })
+        .with_process_count(cover)
+        .validate()
+        .map_err(ctx("covered"))?;
         Ok(())
     }
 
