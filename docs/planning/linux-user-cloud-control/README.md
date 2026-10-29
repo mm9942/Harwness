@@ -6,6 +6,12 @@
 
 **Review date:** 2026-10-16. **Repository:** `mm9942/Harwness`.
 
+**Cloud integration refresh (2026-10-29):**
+[harw-cloud delivery and integration plan](07-harw-cloud-integration.md) pins
+`dev@fcb12b41`, reconciles restored cloud code and the #153/#154 dependencies,
+and defines incremental acceptance gates. Its refreshed cloud observations are
+current at that ref; the frozen evidence below remains historical.
+
 ## 1. Frozen evidence and limits
 
 | Label | Exact source | Meaning |
