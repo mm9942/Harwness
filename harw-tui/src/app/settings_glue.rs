@@ -60,6 +60,27 @@ impl ChatApp {
         }
     }
 
+    /// Complete a settings mutation in both idle and busy paths. Ordinary show
+    /// refreshes update rows without erasing the panel's mutation feedback.
+    pub(super) fn apply_settings_completion(
+        &mut self,
+        raw: &str,
+        language: harw_config::UiLanguage,
+        result: Result<&OpOutput, &str>,
+    ) {
+        if changed_setting_key(raw).is_none() {
+            return;
+        }
+        if result.is_ok() {
+            self.refresh_changed_display_preference(raw);
+        }
+        if let Some(Overlay::View(view)) = self.overlay.as_mut()
+            && view.refresh_command().as_deref() == Some("/settings show")
+        {
+            view.apply_command_result(language, result);
+        }
+    }
+
     /// Refresh only the successful command's key, preserving other session overrides.
     pub(super) fn refresh_changed_display_preference(&mut self, raw: &str) {
         let Some(key) = changed_setting_key(raw) else {

@@ -5542,8 +5542,9 @@ pub(crate) async fn run_loop(
                                                     // (`!!` löst hier — anders als in
                                                     // `execute_command_as` — echt gegen
                                                     // `app.last_shell_command` auf).
+                                                    let language = app.language;
                                                     let (outcome, slash_result) = crate::command_exec::dispatch_command_with_shell_result_for(
-                                                        app.language,
+                                                        language,
                                                         app.adapters(),
                                                         app.sandbox(),
                                                         app.session_id(),
@@ -5555,13 +5556,10 @@ pub(crate) async fn run_loop(
                                                         ),
                                                     )
                                                     .await;
-                                                    let data = match slash_result {
-                                                        Some(Ok(output)) => {
-                                                            app.refresh_changed_display_preference(&raw);
-                                                            output.data
-                                                        },
-                                                        _ => None,
-                                                    };
+                                                    if let Some(result) = slash_result.as_ref() {
+                                                        app.apply_settings_completion(&raw, language, result.as_ref().map_err(String::as_str));
+                                                    }
+                                                    let data = slash_result.and_then(Result::ok).and_then(|output| output.data);
                                                     shell_result = outcome.shell;
                                                     (outcome.text, data)
                                                 }
@@ -9880,14 +9878,20 @@ fn apply_busy_job_done(app: &mut ChatApp, done: BusyJobDone) {
             data,
             language,
         } => {
-            if succeeded {
-                app.refresh_changed_display_preference(&command.raw);
-            }
-            let _ = data; // Retained typed payload for operation-specific presentation.
+            let output = OpOutput { text, data };
+            app.apply_settings_completion(
+                &command.raw,
+                language,
+                if succeeded {
+                    Ok(&output)
+                } else {
+                    Err(&output.text)
+                },
+            );
             tracing::debug!(command = %command.raw, succeeded, "tui.busy.command_finished");
             // Runde 6, Teil C: Busy-Ergebnis auch in den Export.
             app.push_lines_exported(crate::i18n::with_language(language, || {
-                busy_queue::command_result_lines(&command, &text, succeeded)
+                busy_queue::command_result_lines(&command, &output.text, succeeded)
             }));
             app.queue_overlay_refresh();
             if is_workbench_command(&command.raw) {
@@ -15607,6 +15611,135 @@ forbidden = [{forbidden}]
             selected.as_deref()
         );
         assert_eq!(crate::i18n::tr("settings.title", "Settings"), "Settings");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_panel_keeps_failed_save_and_committed_warning_visible_after_refresh()
+    -> TestResult {
+        fn screen(app: &ChatApp, width: u16) -> TestResult<String> {
+            let backend = ratatui::backend::TestBackend::new(width, 18);
+            let mut terminal = ratatui::Terminal::new(backend).map_err(ctx("settings terminal"))?;
+            terminal
+                .draw(|frame| render_viewport(frame, app, &Spinner::new(), None))
+                .map_err(ctx("settings render"))?;
+            Ok(terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "))
+        }
+        fn complete(app: &mut ChatApp, busy: bool, raw: &str, result: Result<OpOutput, String>) {
+            let language = app.language;
+            if busy {
+                let (succeeded, output) = match result {
+                    Ok(output) => (true, output),
+                    Err(text) => (false, OpOutput { text, data: None }),
+                };
+                apply_busy_job_done(
+                    app,
+                    BusyJobDone::Command {
+                        command: BusyCommand {
+                            raw: raw.to_owned(),
+                            class: BusyAvailability::Immediate,
+                        },
+                        text: output.text,
+                        data: output.data,
+                        succeeded,
+                        language,
+                    },
+                );
+            } else {
+                app.apply_settings_completion(
+                    raw,
+                    language,
+                    result.as_ref().map_err(String::as_str),
+                );
+                app.queue_overlay_refresh();
+            }
+        }
+        for busy in [false, true] {
+            let mut fixture = crate::runtime_root::tests::runtime_backed_app()?;
+            let app = &mut fixture.app;
+            let before = app.theme;
+            app.open_overlay_view(Box::new(crate::settings_view::SettingsView::new(&[])));
+            process_pending_fetches(app).await;
+            let path = fixture
+                .assembly
+                .spec()
+                .home
+                .join("profiles/default/config.toml");
+            let lock =
+                harw_config::ConfigWriter::open_locked(&path).map_err(ctx("hold config lock"))?;
+            let raw = "/settings set tui.theme light";
+            let failed = crate::command_exec::dispatch_slash_command_for(
+                app.language,
+                app.runtime(),
+                app.adapters(),
+                app.sandbox(),
+                app.session_id(),
+                raw,
+            )
+            .await;
+            assert!(
+                failed.is_err(),
+                "held writer lock must reject save before commit"
+            );
+            drop(lock);
+            complete(app, busy, raw, failed);
+            process_pending_fetches(app).await;
+            assert_eq!(app.theme, before, "failed save must not update live theme");
+            for width in [24, 80] {
+                assert!(
+                    screen(app, width)?.contains("configuration busy"),
+                    "busy={busy}, width={width}"
+                );
+            }
+
+            let mut committed = crate::command_exec::dispatch_slash_command_for(
+                app.language,
+                app.runtime(),
+                app.adapters(),
+                app.sandbox(),
+                app.session_id(),
+                raw,
+            )
+            .await
+            .map_err(ctx("commit settings"))?;
+            // Deterministic committed-result fixture; the ops suite exercises the
+            // actual durability-uncertain save outcome and live publication.
+            committed
+                .data
+                .as_mut()
+                .ok_or(TestError::Missing("settings data"))?["warning"] =
+                serde_json::json!("durability_uncertain");
+            assert_eq!(app.theme, before, "consumer waits for typed completion");
+            complete(app, busy, raw, Ok(committed));
+            process_pending_fetches(app).await;
+            assert_eq!(app.theme, style::Theme::Light);
+            assert!(matches!(app.overlay, Some(Overlay::View(_))));
+            // Feedback is pinned even when navigating into the last enum editor.
+            if let Some(Overlay::View(view)) = app.overlay.as_mut() {
+                for _ in 0..4 {
+                    view.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                }
+                view.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            for width in [24, 80] {
+                let shown = screen(app, width)?;
+                assert!(shown.contains("saved and applied"), "{shown}");
+                assert!(shown.contains("uncertain"), "{shown}");
+                assert!(
+                    !shown.contains("configuration busy"),
+                    "later completion replaces old status"
+                );
+            }
+        }
         Ok(())
     }
 

@@ -6,7 +6,12 @@ use crate::overlay_view::{
 use crate::style::{self, Theme};
 use crossterm::event::{KeyCode, KeyEvent};
 use harw_config::UiLanguage;
-use ratatui::{buffer::Buffer, layout::Rect, text::Line};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    text::Line,
+    widgets::{Paragraph, Widget, Wrap},
+};
 
 const KEYS: [&str; 5] = [
     "tui.language",
@@ -32,6 +37,7 @@ pub(crate) struct SettingsView {
     editing: Option<usize>,
     values: [Option<String>; 5],
     error: Option<String>,
+    mutation_feedback: Option<String>,
     hidden: Vec<String>,
 }
 
@@ -115,6 +121,29 @@ impl SettingsView {
 }
 impl OverlayView for SettingsView {
     fn render(&self, area: Rect, buf: &mut Buffer, theme: Theme) {
+        // Keep mutation feedback outside the scrolling rows, including while editing.
+        let area = if let Some(feedback) = &self.mutation_feedback {
+            let paragraph = Paragraph::new(crate::sanitize::sanitize_inline(feedback))
+                .wrap(Wrap { trim: false });
+            let height = u16::try_from(paragraph.line_count(area.width))
+                .unwrap_or(u16::MAX)
+                .min(area.height.saturating_sub(4));
+            let feedback_area = Rect::new(
+                area.x,
+                area.bottom().saturating_sub(height),
+                area.width,
+                height,
+            );
+            paragraph.render(feedback_area, buf);
+            Rect::new(
+                area.x,
+                area.y,
+                area.width,
+                area.height.saturating_sub(height),
+            )
+        } else {
+            area
+        };
         let tabs = [
             tr("settings.interface", "Interface"),
             tr("settings.models", "Models by role"),
@@ -281,6 +310,29 @@ impl OverlayView for SettingsView {
                 .and_then(|row| row["value"].as_str())
                 .filter(|value| choices(index).contains(value))
                 .map(str::to_owned)
+        });
+    }
+    fn apply_command_result(
+        &mut self,
+        language: UiLanguage,
+        result: Result<&harw_operations::OpOutput, &str>,
+    ) {
+        self.mutation_feedback = Some(match result {
+            Err(error) => error.to_owned(),
+            Ok(output)
+                if output
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["warning"] == "durability_uncertain") =>
+            {
+                crate::i18n::tr_for(
+                    language,
+                    "settings.durability",
+                    "Settings were saved and applied, but durability across a crash is uncertain.",
+                )
+                .to_owned()
+            }
+            Ok(_) => crate::i18n::tr_for(language, "settings.saved", "Settings saved").to_owned(),
         });
     }
     fn apply_error(&mut self, text: &str) {
