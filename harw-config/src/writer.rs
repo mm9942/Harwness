@@ -35,6 +35,9 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value, value};
 use crate::error::{ConfigError, ConfigResult};
 use crate::permissions_toml::{PermissionsSection, RuleToml};
 
+/// Committed write, optionally carrying a post-rename durability warning.
+pub use harw_fsutil::AtomicWriteOutcome as ConfigSaveOutcome;
+
 /// Höchste Anzahl aufbewahrter Backups (`<datei>.bak.<n>`); ältere werden
 /// nach jedem `save()` gelöscht.
 const MAX_BACKUPS: usize = 5;
@@ -283,8 +286,34 @@ impl ConfigWriter {
     /// - [`ConfigError::Invalid`]: die resultierende `[permissions]`-Sektion
     ///   verletzt [`PermissionsSection::validate`] — die Datei bleibt
     ///   unverändert (fail closed).
-    /// - [`ConfigError::Io`]: Backup oder atomares Schreiben schlugen fehl.
+    /// - [`ConfigError::Io`]: Backup oder Schreiben vor dem Commit schlugen fehl.
+    /// - [`ConfigError::CommittedDurabilityUncertain`]: bereits geschrieben,
+    ///   aber Verzeichnis-Synchronisierung fehlgeschlagen.
     pub fn save(&self) -> ConfigResult<()> {
+        match self.save_with_outcome()? {
+            ConfigSaveOutcome::Committed => Ok(()),
+            ConfigSaveOutcome::DurabilityUncertain(error) => {
+                Err(ConfigError::CommittedDurabilityUncertain(error))
+            }
+        }
+    }
+
+    /// Save and distinguish pre-commit errors from committed durability warnings.
+    ///
+    /// Both successful outcomes advance the writer snapshot. Callers publishing
+    /// live state must publish both outcomes and surface any durability warning.
+    pub fn save_with_outcome(&self) -> ConfigResult<ConfigSaveOutcome> {
+        self.save_with_write(harw_fsutil::write_atomic_with_outcome)
+    }
+
+    fn save_with_write(
+        &self,
+        write: impl FnOnce(
+            &Path,
+            &[u8],
+            harw_fsutil::AtomicWriteOptions,
+        ) -> io::Result<ConfigSaveOutcome>,
+    ) -> ConfigResult<ConfigSaveOutcome> {
         let _lock = if self.lock.is_none() {
             Some(acquire_lock(&self.path)?)
         } else {
@@ -306,13 +335,13 @@ impl ConfigWriter {
             .map_err(ConfigError::Invalid)?;
 
         rotate_backups(&self.path)?;
-        harw_fsutil::write_atomic(
+        let outcome = write(
             &self.path,
             rendered.as_bytes(),
             harw_fsutil::AtomicWriteOptions::with_mode(0o600),
         )?;
         *original = Some(rendered);
-        Ok(())
+        Ok(outcome)
     }
 
     /// Liefert `[permissions]` als veränderliche Tabelle, legt sie bei
@@ -636,6 +665,39 @@ mod tests {
 
     fn temp_config_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         dir.path().join(name)
+    }
+
+    #[test]
+    fn post_commit_sync_warning_advances_writer_snapshot() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("config.toml");
+        let mut writer = ConfigWriter::open_locked(&path).map_err(ctx("locked writer"))?;
+        writer
+            .set_value("tui.language", value("de"))
+            .map_err(ctx("set German"))?;
+        let outcome = writer
+            .save_with_write(|path, bytes, options| {
+                harw_fsutil::write_atomic_with_outcome(path, bytes, options)?;
+                Ok(ConfigSaveOutcome::DurabilityUncertain(io::Error::other(
+                    "injected directory fsync error",
+                )))
+            })
+            .map_err(ctx("save with post-commit warning"))?;
+        assert!(matches!(outcome, ConfigSaveOutcome::DurabilityUncertain(_)));
+        assert_eq!(
+            read_document(&path).map_err(ctx("read committed"))?,
+            Some(writer.document())
+        );
+        writer
+            .set_value("tui.language", value("ja"))
+            .map_err(ctx("set Japanese"))?;
+        // This would conflict if the writer retained its pre-commit snapshot.
+        writer.save().map_err(ctx("save after uncertain commit"))?;
+        assert_eq!(
+            read_document(&path).map_err(ctx("read final"))?,
+            Some(writer.document())
+        );
+        Ok(())
     }
 
     #[test]

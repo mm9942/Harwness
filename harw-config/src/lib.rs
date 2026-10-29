@@ -123,7 +123,7 @@ pub use uia_worker_models::{
     resolve_uia_worker_model, resolve_uia_worker_models,
 };
 pub use web_toml::{WebIdentityModeToml, WebIdentityToml, WebSearchToml, WebSection};
-pub use writer::{ConfigWriter, RuleKind};
+pub use writer::{ConfigSaveOutcome, ConfigWriter, RuleKind};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

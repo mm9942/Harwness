@@ -127,7 +127,7 @@ struct SettingsLayers {
 }
 
 fn settings_layers(home: &harw_home::ResolvedHomeContext) -> Result<SettingsLayers, OpError> {
-    let report = harw_home::config_layers_report_at(&home.home, &home.project.root)
+    let report = harw_home::config_layers_report_at(&home.home, &home.config_discovery_cwd)
         .map_err(|_| OpError::Execution("Settings config layers are unavailable".to_owned()))?;
     let mut trusted = vec![home.home.clone(), home.profile_dir.clone()];
     trusted.extend(report.layers.into_iter().skip(2));
@@ -186,6 +186,14 @@ fn output(tui: &TuiSection) -> OpOutput {
 }
 
 fn handle_settings(ctx: &OpContext, args: SettingsArgs) -> Result<OpOutput, OpError> {
+    handle_settings_with_save(ctx, args, ConfigWriter::save_with_outcome)
+}
+
+fn handle_settings_with_save(
+    ctx: &OpContext,
+    args: SettingsArgs,
+    save: impl FnOnce(&ConfigWriter) -> harw_config::ConfigResult<harw_config::ConfigSaveOutcome>,
+) -> Result<OpOutput, OpError> {
     let action = args.action.as_deref().unwrap_or("show");
     if args.extra.is_some() {
         return Err(usage());
@@ -229,14 +237,23 @@ fn handle_settings(ctx: &OpContext, args: SettingsArgs) -> Result<OpOutput, OpEr
     .map_err(config_error)?;
     candidate.validate().map_err(config_error)?;
     // Resolve/validate reset inheritance before the first persistent change.
-    writer.save().map_err(config_error)?;
+    let outcome = save(&writer).map_err(config_error)?;
     crate::live_config::mirror(ctx, |config| {
         setting.publish(&candidate.harness.tui, &mut config.harness.tui)
     });
-    let result = match ctx.service::<crate::live_config::SharedLiveConfig>() {
+    let mut result = match ctx.service::<crate::live_config::SharedLiveConfig>() {
         Some(live) => output(&live.current().harness.tui),
         None => output(&candidate.harness.tui),
     };
+    if matches!(
+        outcome,
+        harw_config::ConfigSaveOutcome::DurabilityUncertain(_)
+    ) {
+        result.text.push_str("\nWarning: settings were saved and applied, but durability across a crash is uncertain.");
+        if let Some(data) = result.data.as_mut() {
+            data["warning"] = json!("durability_uncertain");
+        }
+    }
     // Retain serialization through publication and construction of its result.
     drop(writer);
     Ok(result)
@@ -491,6 +508,98 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(default_path).map_err(ctx("default unchanged"))?,
             "[tui]\nlanguage='ko'\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reset_keeps_startup_nested_repository_above_custom_marker_root() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home_path = dir.path().join("home");
+        let group = dir.path().join("group");
+        let repo = group.join("repo");
+        std::fs::create_dir_all(&home_path).map_err(ctx("home"))?;
+        std::fs::create_dir_all(repo.join(".git")).map_err(ctx("nested repository"))?;
+        std::fs::create_dir_all(repo.join(".harw")).map_err(ctx("repository config directory"))?;
+        std::fs::write(group.join("CUSTOM_ROOT"), "").map_err(ctx("custom marker"))?;
+        std::fs::write(
+            home_path.join("config.toml"),
+            "project_root_markers=['CUSTOM_ROOT']\n[tui]\nlanguage='de'\n",
+        )
+        .map_err(ctx("home config"))?;
+        std::fs::write(repo.join(".harw/config.toml"), "[tui]\nlanguage='ja'\n")
+            .map_err(ctx("repository preference"))?;
+        harw_home::trust_project(&home_path, &repo).map_err(ctx("trust repository"))?;
+        let project = harw_home::discover_project(&repo, &["CUSTOM_ROOT".to_owned()])
+            .map_err(ctx("custom project"))?;
+        assert_eq!(project.root, group);
+        let home = harw_home::ResolvedHomeContext::new(&home_path, "default".to_owned(), project)
+            .and_then(|context| context.with_config_discovery_cwd(&repo))
+            .map_err(ctx("bind home"))?;
+        let (context, live) = fixture(&home)?;
+        let startup =
+            harw_home::config_layers_report_at(&home.home, &repo).map_err(ctx("startup layers"))?;
+        let expected =
+            harw_config::discover_config(&startup.layers).map_err(ctx("startup config"))?;
+        assert_eq!(
+            expected.harness.tui.language,
+            harw_config::UiLanguage::Japanese
+        );
+        live.update(|config| config.harness.tui.language = expected.harness.tui.language);
+        command(&context, "reset tui.language").map_err(ctx("reset"))?;
+        assert_eq!(
+            live.current().harness.tui.language,
+            expected.harness.tui.language
+        );
+        assert_eq!(
+            command(&context, "show")
+                .map_err(ctx("show"))?
+                .data
+                .as_ref()
+                .map(|data| &data["language"]),
+            Some(&json!("ja"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_sync_warning_updates_live_and_reports_uncertain_durability() -> TestResult {
+        use harw_operations::FromRawArgs;
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = crate::config_util::test_home_context(dir.path())?;
+        let (context, live) = fixture(&home)?;
+        let tokens = ["set", "tui.language", "ja"].map(str::to_owned);
+        let args = SettingsArgs::from_raw_args(&tokens).map_err(ctx("arguments"))?;
+        let output = handle_settings_with_save(&context, args, |writer| {
+            writer.save_with_outcome()?;
+            Ok(harw_config::ConfigSaveOutcome::DurabilityUncertain(
+                std::io::Error::other("private injected fsync detail"),
+            ))
+        })
+        .map_err(ctx("committed result"))?;
+        assert_eq!(
+            live.current().harness.tui.language,
+            harw_config::UiLanguage::Japanese
+        );
+        let config = harw_config::discover_config(&[home.home.clone(), home.profile_dir.clone()])
+            .map_err(ctx("read committed profile"))?;
+        assert_eq!(
+            config.harness.tui.language,
+            harw_config::UiLanguage::Japanese
+        );
+        assert_eq!(
+            output.data.as_ref().map(|data| &data["warning"]),
+            Some(&json!("durability_uncertain"))
+        );
+        assert!(output.text.contains("saved and applied"));
+        assert!(!output.text.contains("were not changed"));
+        assert!(!output.text.contains("private injected"));
+        assert!(
+            !output
+                .data
+                .map(|data| data.to_string())
+                .unwrap_or_default()
+                .contains("private injected")
         );
         Ok(())
     }

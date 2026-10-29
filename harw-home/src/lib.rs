@@ -81,6 +81,8 @@ pub struct ResolvedHomeContext {
     pub home: std::path::PathBuf,
     pub profile_name: String,
     pub profile_dir: std::path::PathBuf,
+    /// Startup input for repository config/trust discovery, independent of custom project markers.
+    pub config_discovery_cwd: std::path::PathBuf,
     pub project: ProjectRoot,
     pub project_home: ProjectHome,
     pub project_settings_path: std::path::PathBuf,
@@ -103,9 +105,46 @@ impl ResolvedHomeContext {
             home,
             profile_name,
             profile_dir,
+            config_discovery_cwd: project.root.clone(),
             project,
             project_home,
             project_settings_path,
         })
+    }
+
+    /// Bind the actual startup repository-discovery input without changing project scope.
+    pub fn with_config_discovery_cwd(mut self, cwd: &std::path::Path) -> HomeResult<Self> {
+        self.config_discovery_cwd =
+            std::path::absolute(cwd).map_err(|error| HomeError::io(cwd, error))?;
+        Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod resolved_context_tests {
+    use super::*;
+    use crate::test_support::TestResult;
+
+    #[test]
+    fn repository_discovery_cwd_is_bound_independently_of_custom_project_root() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let group = dir.path().join("group");
+        let nested_repository = group.join("repo");
+        std::fs::create_dir_all(&nested_repository)?;
+        let project = ProjectRoot {
+            root: group.clone(),
+            trust_key: group.clone(),
+            kind: ProjectKind::Marker("CUSTOM_ROOT".to_owned()),
+        };
+        let default = ResolvedHomeContext::new(dir.path(), "selected".to_owned(), project)?;
+        assert_eq!(default.config_discovery_cwd, group);
+        let bound = default
+            .clone()
+            .with_config_discovery_cwd(&nested_repository)?;
+        assert_eq!(bound.config_discovery_cwd, nested_repository);
+        assert_eq!(bound.project.root, default.project.root);
+        assert_eq!(bound.profile_dir, default.profile_dir);
+        assert_eq!(bound.project_settings_path, default.project_settings_path);
+        Ok(())
     }
 }
