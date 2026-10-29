@@ -164,6 +164,7 @@ fn test_field_table_exhaustive_logging_section() {
 #[test]
 fn test_field_table_exhaustive_tui_section() {
     let TuiSection {
+        language,
         theme,
         keybindings_file,
         child_stream,
@@ -172,6 +173,7 @@ fn test_field_table_exhaustive_tui_section() {
         reasoning,
     } = TuiSection::default();
     let _ = (
+        language,
         theme,
         keybindings_file,
         child_stream,
@@ -180,6 +182,7 @@ fn test_field_table_exhaustive_tui_section() {
         reasoning,
     );
     for path in [
+        "tui.language",
         "tui.theme",
         "tui.keybindings_file",
         "tui.child_stream",
