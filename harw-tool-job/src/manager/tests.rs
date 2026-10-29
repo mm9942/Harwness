@@ -1558,3 +1558,245 @@ fn test_milestone_key_buckets() {
         milestone_key(&snapshot(None, "finished dev"))
     );
 }
+
+/// PL-97 E2b: `job.start` and child agents through the job runtime's
+/// chain path, against a recording command port.
+mod chain {
+    use super::*;
+    use crate::launcher::{JobLauncher as _, ShellJobLauncher, child_agent_launch};
+    use crate::test_support::{context, fast_config, sandbox};
+    use harw_authority::Permission;
+    use harw_command::{
+        BackendKind, CommandOutput, CommandPort, CommandRequest, CommandSandbox, CommandStdin,
+        RunFuture, SandboxProfileName, SandboxRequirement, StartFuture,
+    };
+    use harw_tool_shell::ShellToolProvider;
+    use std::sync::Mutex;
+
+    /// Records every request, reports `backend`, starts nothing.
+    #[derive(Debug, Default)]
+    struct RecordingPort {
+        backend: Option<BackendKind>,
+        requests: Mutex<Vec<CommandRequest>>,
+    }
+
+    impl RecordingPort {
+        fn requests(&self) -> TestResult<Vec<CommandRequest>> {
+            self.requests
+                .lock()
+                .map(|requests| requests.clone())
+                .map_err(|_| TestError::Missing("request log"))
+        }
+    }
+
+    impl CommandPort for RecordingPort {
+        fn run(
+            &self,
+            request: CommandRequest,
+            _cancel: harw_types::cancel::CancelToken,
+        ) -> RunFuture<'_> {
+            if let Ok(mut requests) = self.requests.lock() {
+                requests.push(request);
+            }
+            Box::pin(std::future::pending())
+        }
+
+        fn start(&self, request: CommandRequest) -> StartFuture<'_> {
+            if let Ok(mut requests) = self.requests.lock() {
+                requests.push(request);
+            }
+            Box::pin(async { Err("the recording port starts nothing".to_owned()) })
+        }
+
+        fn workspace_backend(&self, _profile: SandboxProfileName) -> Option<BackendKind> {
+            self.backend
+        }
+    }
+
+    fn manager_over(
+        dir: &tempfile::TempDir,
+        port: &Arc<RecordingPort>,
+    ) -> TestResult<Arc<JobManager>> {
+        JobManager::with_command_port(
+            fast_config(&dir.path().join("state")),
+            Arc::new(crate::NoopNotifier),
+            Arc::clone(port) as Arc<dyn CommandPort>,
+        )
+        .map_err(ctx("job manager"))
+    }
+
+    #[tokio::test]
+    async fn job_start_submits_exactly_one_workspace_request() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let port = Arc::new(RecordingPort {
+            backend: Some(BackendKind::BwrapTrampoline),
+            ..RecordingPort::default()
+        });
+        let manager = manager_over(&dir, &port)?;
+        let mut shell = ShellToolProvider::new()
+            .with_command_port(Arc::clone(&port) as Arc<dyn CommandPort>)
+            .with_execution(crate::launcher::SandboxExecution::Chain);
+        shell.limits.require_rlimits = false;
+        let launcher = ShellJobLauncher::new(shell);
+        let spec = sandbox(
+            &dir.path().join("ws"),
+            vec![
+                Permission::ReadWorkspace,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+            ],
+        )?;
+        let root = spec.workspace().canonical_root().to_path_buf();
+        let worker = context("worker", spec);
+        let launch = launcher
+            .prepare_launch(&worker, "make test", 60)
+            .await
+            .map_err(|output| TestError::Unexpected(format!("{output:?}")))?;
+        assert!(!launch.job.executed_on_host);
+        let expected_limits = launch
+            .sandboxed
+            .as_ref()
+            .ok_or(TestError::Missing("chain submission"))?
+            .limits()
+            .clone();
+        let result = manager
+            .start_launch_with_origin(request("make", "worker", &[]), launch, JobOrigin::default())
+            .await;
+        assert!(matches!(result, Err(JobError::Spawn(_))), "{result:?}");
+
+        let requests = port.requests()?;
+        let [request] = requests.as_slice() else {
+            return Err(TestError::Unexpected(format!("{requests:?}")));
+        };
+        assert_eq!(request.program, "/bin/sh");
+        assert_eq!(request.args, ["-c", "make test"]);
+        assert_eq!(request.cwd, root);
+        assert!(
+            request.env.is_empty(),
+            "the sandbox sets its own environment"
+        );
+        assert_eq!(request.stdin, CommandStdin::Null);
+        assert!(matches!(request.output, CommandOutput::Files { .. }));
+        assert_eq!(request.timeout, JOB_RUNTIME_DEADLINE);
+        assert_eq!(request.limits, expected_limits);
+        assert_eq!(request.limits.pids_max, Some(4096));
+        assert!(request.limits.cpu_time_max.is_some());
+        let CommandSandbox::Workspace(workspace) = &request.sandbox else {
+            return Err(TestError::Unexpected(format!("{:?}", request.sandbox)));
+        };
+        assert_eq!(workspace.root, root);
+        assert_eq!(workspace.profile, SandboxProfileName::NoNetwork);
+        assert_eq!(workspace.requirement, SandboxRequirement::BestEffort);
+        assert!(workspace.tmpfs_size.is_some());
+        let job_spec = request.job_spec().map_err(TestError::Unexpected)?;
+        assert_eq!(job_spec.sandbox_profile, SandboxProfileName::NoNetwork);
+        assert!(job_spec.resources.wall_timeout.is_some());
+
+        let jobs = manager.list(Caller::Operator);
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert!(!jobs[0].meta.executed_on_host);
+        Ok(())
+    }
+
+    /// `JobLauncher::prepare` returns only the process: a chain start is
+    /// refused there instead of running as a host job (fail closed).
+    #[tokio::test]
+    async fn shell_launcher_prepare_refuses_a_chain_start() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let port = Arc::new(RecordingPort {
+            backend: Some(BackendKind::Bwrap),
+            ..RecordingPort::default()
+        });
+        let mut shell = ShellToolProvider::new()
+            .with_command_port(Arc::clone(&port) as Arc<dyn CommandPort>)
+            .with_execution(crate::launcher::SandboxExecution::Chain);
+        shell.limits.require_rlimits = false;
+        let launcher = ShellJobLauncher::new(shell);
+        let worker = context(
+            "worker",
+            sandbox(
+                &dir.path().join("ws"),
+                vec![Permission::ReadWorkspace, Permission::ExecuteProcess],
+            )?,
+        );
+        match launcher.prepare(&worker, "make", 60).await {
+            Err(harw_tools::ToolOutput::Error { message }) => {
+                assert!(message.contains("sandbox chain"), "{message}");
+            }
+            Err(other) => return Err(TestError::Unexpected(format!("{other:?}"))),
+            Ok(job) => return Err(TestError::Unexpected(format!("{job:?}"))),
+        }
+        assert!(port.requests()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn child_agent_launch_is_a_workspace_build_request() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let root = dir.path().canonicalize().map_err(ctx("canonicalize"))?;
+        let port = Arc::new(RecordingPort {
+            backend: Some(BackendKind::LandlockTrampoline),
+            ..RecordingPort::default()
+        });
+        let manager = manager_over(&dir, &port)?;
+        // The command's own cwd is ignored: the root is the one passed.
+        let elsewhere = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let prepared = |cwd: &Path| {
+            let mut command = tokio::process::Command::new("/bin/true");
+            command.current_dir(cwd);
+            PreparedJob {
+                command,
+                executed_on_host: true,
+                env_cleared: false,
+            }
+        };
+        let launch = child_agent_launch(&manager, prepared(elsewhere.path()), &root)
+            .map_err(|refused| TestError::Unexpected(refused.1))?;
+        assert!(
+            launch.job.executed_on_host,
+            "the child process is not confined"
+        );
+        let sandboxed = launch
+            .sandboxed
+            .as_ref()
+            .ok_or(TestError::Missing("chain submission"))?;
+        assert_eq!(sandboxed.backend(), BackendKind::LandlockTrampoline);
+        let CommandSandbox::Workspace(workspace) = sandboxed.sandbox() else {
+            return Err(TestError::Unexpected(format!("{:?}", sandboxed.sandbox())));
+        };
+        assert_eq!(workspace.root, root);
+        assert_eq!(workspace.profile, SandboxProfileName::WorkspaceBuild);
+        assert_eq!(workspace.requirement, SandboxRequirement::None);
+
+        let result = manager
+            .start_piped_launch_with_origin(
+                request("child", "parent", &[]),
+                launch,
+                DEFAULT_MAX_PIPED_LINE_BYTES,
+                JobOrigin::agent_child("child-session"),
+            )
+            .await;
+        assert!(matches!(result, Err(JobError::Spawn(_))), "{result:?}");
+        let requests = port.requests()?;
+        let [request] = requests.as_slice() else {
+            return Err(TestError::Unexpected(format!("{requests:?}")));
+        };
+        assert_eq!(request.cwd, root);
+        assert_eq!(request.stdin, CommandStdin::Pipe);
+        assert!(matches!(&request.sandbox, CommandSandbox::Workspace(_)));
+
+        // A port that runs no workspace requests: the job comes back.
+        let unrouted = Arc::new(RecordingPort::default());
+        let manager = manager_over(&dir, &unrouted)?;
+        let refused = child_agent_launch(&manager, prepared(&root), &root);
+        assert!(
+            refused.is_err_and(|refused| refused.1.contains("workspace")),
+            "a job runtime without workspace requests keeps the host submission"
+        );
+        // A root that does not exist: refused, the job comes back.
+        let manager = manager_over(&dir, &port)?;
+        let refused = child_agent_launch(&manager, prepared(&root), &root.join("missing"));
+        assert!(refused.is_err_and(|refused| refused.1.contains("cannot be resolved")));
+        Ok(())
+    }
+}

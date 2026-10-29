@@ -511,6 +511,149 @@ the previous pre-built `prlimit … -- bwrap …` host job. It is parsed here
 and consumed by `shell.exec`, `job.start` and the child agents in PL-97
 E2b.
 
+### `shell.exec`, `job.start` and child agents on the chain (PL-97 E2b)
+
+With `execution = "chain"` the sandboxed path of `shell.exec`
+and `job.start` no longer builds a `prlimit … -- bwrap …` argv and runs it
+as a host job. It submits one job-runtime request
+(`harw_command::CommandSandbox::Workspace`, built in
+`harw-tool-shell/src/job_spec.rs`):
+
+| Field | Value |
+|---|---|
+| program | `/bin/sh -c <command>`, exactly the shell semantics of before |
+| working directory and workspace root | the sandbox's canonical workspace root |
+| profile | `no_network` with `WriteWorkspace`, else `read_only_analysis` |
+| requirement | `best_effort`; `required` with a write scope |
+| modules | the trusted `SandboxProfile` (Cargo, tmux), the host `PATH` binding and the `/tmp` size of `ShellLimits` |
+| resources | `ShellLimits::job_resources` of the provider's limits; for the `shell.exec` defaults 2 GiB `RLIMIT_AS` (per process; no job-wide `memory_max`, which the legacy path never had), the CPU seconds (grown with the granted timeout), 256 MiB `RLIMIT_FSIZE`, 256 `RLIMIT_NOFILE` and 4096 `pids_max`; `require_rlimits` as configured |
+| deadline | `shell.exec`: the effective timeout; `job.start`: none of its own (stop is explicit), as before |
+| environment | empty: the sandbox sets its own baseline, as the legacy plan did with `--clearenv` |
+| stdio | piped through the command port, which keeps the output caps, truncation, cancel and exit codes of before |
+
+`RLIMIT_NPROC` has no field in the request: the process count is capped by
+the job cgroup's `pids.max` instead, so without a cgroup root it is
+reported as not enforced rather than capped. `prlimit` is looked up only
+where it is needed: on the plain `bwrap` backend the runtime runs its own
+`prlimit` in front of `bwrap` (same check and warning as before); the
+trampoline backends set the rlimits themselves, so a host without
+`prlimit` does not block them.
+
+**Builder default: `legacy`, for now.** The config default is `chain`
+(E2a), but the composition does not pass `[sandbox] execution` to
+`ShellToolProvider::with_execution` (`harw-registry-defaults`
+`build_shell`) or to `JobChildBackend::with_execution`
+(`harw-agent-runner` context) yet. Until it does, `SandboxExecution::default()`
+is `Legacy`, so production keeps the previous path and users are not given
+a chain they cannot opt out of. The chain is opt-in through the builders.
+
+**The workspace root.** The host port's runtime has `/` as its workspace
+root, and both Bubblewrap backends refuse a host-root workspace. A
+workspace request therefore carries its own root. `JobCommandPort::host`
+registers root and modules under a fresh idempotency key before it
+submits, and its executor (`HostCommandExecutor`) starts the attempt with
+that root on a Linux executor per module set and network class (at most
+16). An attempt whose key has no registration does not run.
+`CommandPort::workspace_backend(profile)` tells a caller which backend its
+request would get. Host commands and `CommandSandbox::Profile` requests
+run exactly as before.
+
+**Profile modules.** `BwrapExecutor::with_profile_modules`, `with_host_path`
+and `with_tmpfs_size` (`harw-job-executor-bwrap`) bind what the legacy
+launcher bound: the Cargo toolchain and cache, the tmux socket, the host
+`PATH` directories, the `/tmp` size. `harw-sandbox` plans these binds as
+before. The trampoline composition reads them back from the launcher argv
+(`BwrapTrampolinePlan::module_binds`), maps them into the namespace view
+and gives each one Landlock rule inside: read and execute for a read-only
+bind, read, write and execute for a read-write one. That is what the mount
+alone grants, so nothing the modules allowed is lost.
+
+**Network, per `NetworkMode`.** The host port selects twice
+(`select_backend`): once for profiles that deny the network, once with
+`needs_network`. No egress relay is configured there, so the second
+selection always skips both Bubblewrap backends (`landlock`, else `none`).
+
+| Mode | Profiles | Backend from the host port | `shell.exec` / `job.start` |
+|---|---|---|---|
+| `NetworkMode::None` (own empty network namespace) | `no_network`, `read_only_analysis` | `bwrap-trampoline`, else `bwrap`, else `landlock`, else `none` | chain on `bwrap-trampoline` or `bwrap`. On `landlock` or `none` the chain would be weaker than the legacy namespace: an unscoped call keeps the legacy path, a scoped one is refused |
+| `NetworkMode::ProxyOnly` (relay) | `workspace_build`, `network_restricted` | `landlock`, else `none` (no relay configured) | not used: the legacy plan never had network, so the chain profiles never ask for it. A networked call would get no namespace, so it could only fall back or, with a write scope or `required`, be refused |
+
+**Fail closed.** Only an unscoped call may keep the weaker legacy path.
+A call with a write scope never takes the host path: when host execution
+applies (an approved session or single-use lease, a `Host` sandbox
+profile, `HostWithoutPrompt` on a platform without sandbox), `shell.exec`
+and `job.start` refuse it before anything starts ("host execution cannot
+enforce a write scope"). A write scope also needs `WriteWorkspace`: a
+scoped read-only call is refused with a clear tool error instead of
+failing later in the job spec.
+The first such call of a session logs `runs without cgroup/landlock` with
+the reason. A call with a write scope (`ShellToolProvider::with_write_scope`,
+trusted runtime input, never a tool argument) needs `bwrap-trampoline` for
+these offline profiles: plain `bwrap` cannot narrow the workspace bind, and
+the Landlock trampoline has no network namespace. On any other backend, or
+with `execution = "legacy"`, the call is refused with a tool error, and
+nothing is submitted. The runtime checks the same again before a process
+starts. `execution = "legacy"` keeps the previous path for every unscoped
+call, byte for byte. Approvals are unchanged: the host-permit path
+(`run_host_command`, `!` host mode) stays the only `CommandSandbox::Host`
+submission of a model call.
+
+**Child agents.** `JobChildBackend` (`harw-agent-runner`) submits each child
+through `harw_tool_job::launcher::child_agent_launch` when it runs in
+chain mode and the composition passed the parent's canonical workspace
+root (`JobChildBackend::with_workspace_root`; harw's process working
+directory is never used, it is not necessarily the parent's workspace).
+The child is a workspace request over that root with the
+`workspace_build` profile, no longer a host submission over `/`. Without
+a root the child keeps the host submission (logged once).
+
+This is an accepted deviation from plan §3.4 E2, which asked for a
+confined child with `executed_on_host = false`: the child process itself
+runs with requirement `none` and `executed_on_host = true`, so it is as
+unconfined as before; only the record's root and executor change. The
+follow-up (grants for the harw home and the runner path, the child's tool
+processes delegated to the parent runtime) is tracked for PL-97. No
+backend can confine the child today:
+
+- A Landlock domain (both trampoline backends) forbids `mount(2)` and
+  `pivot_root(2)`. The Bubblewrap sandboxes the child starts for its own
+  tool calls would fail inside it.
+- The `workspace_build` policy grants neither the harw home (the child's
+  session store and job state) nor the runner executable outside the
+  system trees (`~/.local/bin` by default).
+- A networked profile gets no Bubblewrap backend from the host port.
+
+The child keeps what every runtime job has: the job cgroup (once the
+runtime has a cgroup root), the process group and the attempt record. Its
+tool processes are confined one by one, as before. Where the job runtime
+runs no workspace requests (no router, a non-Linux host), the child keeps
+the host submission, logged once per backend.
+
+**Known gaps (open PL-97 follow-ups).**
+- A command that starts its own `bwrap` fails under `bwrap-trampoline`
+  (Landlock forbids `mount(2)`), where the legacy plain `bwrap` allowed
+  nesting with user namespaces.
+- A scoped job with profile modules on `bwrap-trampoline` gets no Landlock
+  rules for the modules: the coordinator's scoped inner policy does not add
+  `module_binds` yet.
+- `[sandbox] execution` is parsed but not yet passed to
+  `ShellToolProvider::with_execution` and `JobChildBackend::with_execution`
+  (plus `with_workspace_root`) by the composition (`harw-registry-defaults`
+  `build_shell`, `harw-agent-runner` context); both builders default to
+  `legacy` until then. The wiring needs a config-to-provider test.
+- `RLIMIT_NPROC` on the chain: `nproc` maps to `pids_max`, which needs the
+  job cgroup. Without a cgroup root the process count is not capped
+  (fork-bomb protection the legacy `prlimit` gave). Fix: carry
+  `RLIMIT_NPROC` through `ResourceRequest` and the trampoline
+  (`harw-job-core`, `harw-job-exec`), or keep the chain opt-in until E3.
+- The host port carries the per-request root and modules through an
+  idempotency-key registration (`HostCommandExecutor`). A workspace-marked
+  key never deduplicates, and a persisted record is refused after a
+  restart. A typed per-spec workspace root is the intended replacement;
+  this needs owner approval as a plan §8 amendment.
+- The host port has no cgroup root yet (E3), so no job, child or not,
+  gets a job cgroup in production.
+
 ## Implementation
 
 ### `SandboxProfile` (`harw-sandbox/src/profile.rs`)

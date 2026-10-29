@@ -239,6 +239,45 @@ impl ShellLimits {
     }
 }
 
+impl ShellLimits {
+    /// These limits as the job runtime's resource request (PL-97 E2b, the
+    /// sandbox chain of `shell.exec` and `job.start`).
+    ///
+    /// # Description
+    /// | Limit | Request field | Enforced by |
+    /// |---|---|---|
+    /// | `as_bytes` | `address_space_max` (`RLIMIT_AS`, per process) | trampoline or `prlimit` |
+    /// | `cpu_secs` | `cpu_time_max` (`RLIMIT_CPU`) | trampoline or `prlimit` |
+    /// | `fsize_bytes` | `file_size_max` (`RLIMIT_FSIZE`) | trampoline or `prlimit` |
+    /// | `nofile` | `open_files_max` (`RLIMIT_NOFILE`) | trampoline or `prlimit` |
+    /// | `nproc` | `pids_max` (the whole job) | the job cgroup |
+    /// | `require_rlimits` | `require_rlimits` | the runtime refuses to start without rlimits |
+    ///
+    /// [`RLIMIT_UNLIMITED`] becomes "no limit" (`None`). `tmpfs_bytes` is
+    /// not a resource of the request but the Bubblewrap `/tmp` size of the
+    /// sandbox. The request has no `RLIMIT_NPROC`: the process count is
+    /// capped by the job cgroup's `pids.max`, so without a delegated cgroup
+    /// root the runtime reports it as not enforced instead of capping it.
+    ///
+    /// `memory_max` stays `None`: the legacy path never had a job-wide
+    /// memory cap, only the per-process `RLIMIT_AS`. Mapping `as_bytes` to
+    /// the job cgroup would OOM-kill a parallel build (several compilers of
+    /// up to `as_bytes` each) that runs today.
+    #[must_use]
+    pub fn job_resources(&self) -> harw_command::ResourceRequest {
+        let bounded = |value: u64| (value != RLIMIT_UNLIMITED).then_some(value);
+        harw_command::ResourceRequest {
+            address_space_max: bounded(self.as_bytes),
+            cpu_time_max: Some(self.cpu_secs),
+            file_size_max: bounded(self.fsize_bytes),
+            open_files_max: u32::try_from(self.nofile).ok(),
+            pids_max: u32::try_from(self.nproc).ok(),
+            require_rlimits: self.require_rlimits,
+            ..harw_command::ResourceRequest::default()
+        }
+    }
+}
+
 /// Zahlenwert für `prlimit`; [`RLIMIT_UNLIMITED`] wird zu `unlimited`
 /// (prlimit(1) versteht beides, das Wort ist unabhängig von der Breite von
 /// `rlim_t`).
@@ -324,6 +363,27 @@ mod tests {
             binding,
             PermissionSet::from_policy([Permission::ExecuteProcess]),
         ))
+    }
+
+    #[test]
+    fn job_resources_map_every_limit() {
+        let request = ShellLimits::default().job_resources();
+        // Kein jobweiter Speicherdeckel: der bisherige Weg kannte nur RLIMIT_AS.
+        assert_eq!(request.memory_max, None);
+        assert_eq!(request.address_space_max, Some(2 * GIB));
+        assert_eq!(request.cpu_time_max, Some(60));
+        assert_eq!(request.file_size_max, Some(256 * MIB));
+        assert_eq!(request.open_files_max, Some(256));
+        assert_eq!(request.pids_max, Some(4096));
+        assert!(request.require_rlimits);
+        assert!(request.validate().is_ok());
+        // Jobs: no address-space or file-size cap.
+        let jobs = ShellLimits::for_jobs().job_resources();
+        assert_eq!(jobs.memory_max, None);
+        assert_eq!(jobs.address_space_max, None);
+        assert_eq!(jobs.file_size_max, None);
+        assert_eq!(jobs.open_files_max, Some(4096));
+        assert_eq!(jobs.pids_max, Some(4096));
     }
 
     fn strings(args: &[OsString]) -> Vec<String> {

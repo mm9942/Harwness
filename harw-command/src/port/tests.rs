@@ -1,10 +1,10 @@
 use super::*;
+#[cfg(target_os = "linux")]
+use crate::HostCommandExecutor as HostExecutor;
 use crate::{CommandFrame, CommandOutput, CommandStdin};
 #[cfg(target_os = "macos")]
 use harw_job::DarwinExecutor as HostExecutor;
 use harw_job::FsJobRecordStore;
-#[cfg(target_os = "linux")]
-use harw_job::LinuxExecutor as HostExecutor;
 
 harw_test_support::define_test_error!(pub(crate));
 

@@ -38,14 +38,29 @@
 //! | relay (proxy-only egress) | relay binary / proxy socket | `/run/harw/netns-relay` / `/run/harw/egress.sock` | read-only / read-write |
 //! | trampoline | `harw-job-exec` binary | [`SANDBOX_TRAMPOLINE_PATH`] | read-only |
 //! | attempt directory | per-attempt directory | [`SANDBOX_ATTEMPT_DIR`] | read-write mount (for the trampoline's report), no Landlock rule |
+//! | profile modules, host `PATH` | Cargo toolchain and cache, tmux socket, `PATH` directories | as `harw-sandbox` binds them | as bound; see "Profile modules" |
 //!
 //! Withheld policy paths (`/sys`, `/run`, workspace ancestors) have no
 //! entry, so the in-namespace Landlock policy drops them as well
 //! ([`BwrapTrampolinePlan::unmapped_paths`]). No inner policy path keeps
 //! write access to [`SANDBOX_TRAMPOLINE_DIR`]: the job cannot rewrite the
 //! report once the inner trampoline has restricted itself.
+//!
+//! # Profile modules (PL-97 E2b)
+//! [`BwrapExecutor::with_profile_modules`], [`BwrapExecutor::with_host_path`]
+//! and [`BwrapExecutor::with_tmpfs_size`] carry what `shell.exec` and
+//! `job.start` configure on their own launcher today: the Cargo toolchain
+//! or tmux socket of the caller's [`SandboxProfile`], the host `PATH`
+//! binding and the size of `/tmp`. `harw-sandbox` plans the binds exactly
+//! as for those tools. The trampoline composition reads them back from the
+//! launcher's argv ([`BwrapTrampolinePlan::module_binds`]), adds them to
+//! the namespace view and gives each one Landlock rule inside: read and
+//! execute for a read-only bind, read, write and execute for a read-write
+//! one. That is what the mount grants without Landlock, so nothing the
+//! modules allow today is lost. The policy paths stay capped as before.
 
 use std::ffi::OsString;
+use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -55,11 +70,12 @@ use harw_authority::{
 };
 use harw_job_core::{EnforcementState, JobSpec, SandboxReport};
 use harw_job_linux::{
-    BindMode, CapabilityPolicy, FilesystemPolicy, NetworkPolicy, PathMap, PathMapError,
+    BindMode, CapabilityPolicy, FilesystemPolicy, NetworkPolicy, PathBind, PathMap, PathMapError,
     SandboxPolicy,
 };
 use harw_sandbox::{
-    BwrapLauncher, NetworkMode, RelaySpec, SANDBOX_PROXY_SOCKET_PATH, SANDBOX_RELAY_PATH,
+    BwrapLauncher, HostPathBinding, NetworkMode, RelaySpec, SANDBOX_PROXY_SOCKET_PATH,
+    SANDBOX_RELAY_PATH, SandboxProfile,
 };
 use harw_types::{TenantId, WorkspaceId};
 
@@ -103,7 +119,9 @@ const RELAY_PREFIX_LEN: usize = 4;
 /// Holds only the trusted `bwrap` path and optional launch settings; it is a
 /// pure value. Every [`plan`](Self::plan) starts from a fresh launcher, so no
 /// Cargo/tmux/host-`PATH` module of `harw-sandbox` can leak into a job: the
-/// policy is the only source of binds.
+/// policy is the only source of binds, plus the modules configured
+/// explicitly on this value ([`with_profile_modules`](Self::with_profile_modules),
+/// [`with_host_path`](Self::with_host_path), module docs).
 ///
 /// # Concurrency
 /// `Send + Sync`; planning has no side effects besides canonicalizing the
@@ -113,6 +131,12 @@ pub struct BwrapExecutor {
     executable: PathBuf,
     relay: Option<RelaySpec>,
     identity: Option<(u32, u32)>,
+    /// Cargo/tmux module of the caller's sandbox profile; never `Host`.
+    modules: SandboxProfile,
+    /// Host `PATH` binding of the caller.
+    host_path: Option<HostPathBinding>,
+    /// Size of the sandbox's `/tmp` tmpfs (`--size`).
+    tmpfs_size: Option<NonZeroU64>,
 }
 
 impl BwrapExecutor {
@@ -139,6 +163,9 @@ impl BwrapExecutor {
             executable,
             relay: None,
             identity: None,
+            modules: SandboxProfile::Strict,
+            host_path: None,
+            tmpfs_size: None,
         }
     }
 
@@ -176,6 +203,64 @@ impl BwrapExecutor {
         self.relay.as_ref()
     }
 
+    /// Binds the modules of the caller's trusted sandbox profile into every
+    /// plan, as `harw_sandbox::BwrapLauncher::with_profile` does for
+    /// `shell.exec` (PL-97 E2b): the Cargo toolchain and cache of
+    /// [`SandboxProfile::Cargo`], the socket of [`SandboxProfile::Tmux`].
+    /// [`SandboxProfile::Strict`] and [`SandboxProfile::Host`] add nothing
+    /// (`Host` is a marker for unsandboxed execution, which this backend
+    /// never does).
+    ///
+    /// The profile is trusted runtime input, never a tool argument. A Cargo
+    /// profile in `Fetch` mode needs network, which this backend's plans do
+    /// not grant; planning fails then, as it does for `shell.exec`.
+    #[must_use]
+    pub fn with_profile_modules(mut self, profile: &SandboxProfile) -> Self {
+        self.modules = match profile {
+            SandboxProfile::Host => SandboxProfile::Strict,
+            other => other.clone(),
+        };
+        self
+    }
+
+    /// Binds the host `PATH` directories (and the Cargo/rustup homes they
+    /// need) read-only into every plan and sets the sandbox's `PATH` to
+    /// the host's, as `harw_sandbox::BwrapLauncher::with_host_path` does
+    /// for `shell.exec` (PL-97 E2b).
+    #[must_use]
+    pub fn with_host_path(mut self, binding: HostPathBinding) -> Self {
+        self.host_path = Some(binding);
+        self
+    }
+
+    /// Limits the sandbox's `/tmp` tmpfs to `bytes` (`bwrap --size`, PL-97
+    /// E2b; `shell.exec` uses 256 MiB). Without it the kernel default
+    /// applies.
+    #[must_use]
+    pub fn with_tmpfs_size(mut self, bytes: NonZeroU64) -> Self {
+        self.tmpfs_size = Some(bytes);
+        self
+    }
+
+    /// The profile modules bound into every plan
+    /// ([`with_profile_modules`](Self::with_profile_modules)).
+    #[must_use]
+    pub fn profile_modules(&self) -> &SandboxProfile {
+        &self.modules
+    }
+
+    /// The host `PATH` binding, if any ([`with_host_path`](Self::with_host_path)).
+    #[must_use]
+    pub fn host_path(&self) -> Option<&HostPathBinding> {
+        self.host_path.as_ref()
+    }
+
+    /// The `/tmp` size limit, if any ([`with_tmpfs_size`](Self::with_tmpfs_size)).
+    #[must_use]
+    pub fn tmpfs_size(&self) -> Option<NonZeroU64> {
+        self.tmpfs_size
+    }
+
     /// Plans `spec` under `policy` with `workspace_root` as the job's
     /// workspace.
     ///
@@ -191,8 +276,10 @@ impl BwrapExecutor {
     ///   is refused.
     /// - `no_new_privs`: `bwrap` always sets `PR_SET_NO_NEW_PRIVS`.
     /// - Environment: `--clearenv`, then the `harw-sandbox` baseline
-    ///   (`HOME`, `PATH`, `USER`/`LOGNAME`), then `spec.env` (which may
-    ///   override the baseline).
+    ///   (`HOME`, `PATH`, `USER`/`LOGNAME`, and what the profile modules
+    ///   set), then `spec.env` (which may override the baseline).
+    /// - Profile modules, host `PATH` and `/tmp` size: as configured on
+    ///   this executor (module docs).
     /// - Working directory: `<workspace>/<spec.working_dir>`.
     ///
     /// The returned report is a **prediction** for the `bwrap` layer only;
@@ -249,10 +336,12 @@ impl BwrapExecutor {
     /// `policy.mapped(&path_map)` with the network rewritten to what the
     /// namespace leaves to Landlock (own empty netns or proxy-only egress
     /// → `Allow`, a port allowlist behind the relay → TCP connect to the
-    /// relay port only). The namespace enforces the network dimension; the
-    /// inner layer must not report a stronger network state than the
-    /// namespace provides, and must not report a weaker one that would
-    /// make its own requirement check refuse an enforced job.
+    /// relay port only), plus one rule per profile-module bind
+    /// ([`BwrapTrampolinePlan::module_binds`]). The namespace enforces the
+    /// network dimension; the inner layer must not report a stronger
+    /// network state than the namespace provides, and must not report a
+    /// weaker one that would make its own requirement check refuse an
+    /// enforced job.
     ///
     /// The attempt directory is bound read-write only so the inner
     /// trampoline can create its report before it restricts itself. The
@@ -288,8 +377,15 @@ impl BwrapExecutor {
         }
         let (bwrap, filesystem) = self.plan_launch(spec, policy, workspace_root, Some(mount))?;
         refuse_mount_overlaps(bwrap.workspace(), workspace_root, mount)?;
-        let path_map = namespace_view(&bwrap, workspace_root, &filesystem, mount)?;
-        let shadowed = path_map.shadowed_read_only_binds(&policy.filesystem);
+        let (path_map, module_binds) = namespace_view(&bwrap, workspace_root, &filesystem, mount)?;
+        // A module bind beneath a writable policy path (a host `PATH`
+        // entry below `/tmp`) gets read and execute by design; the mount
+        // keeps it read-only.
+        let shadowed: Vec<_> = path_map
+            .shadowed_read_only_binds(&policy.filesystem)
+            .into_iter()
+            .filter(|bind| !module_binds.contains(*bind))
+            .collect();
         if !shadowed.is_empty() {
             let names: Vec<String> = shadowed
                 .iter()
@@ -307,12 +403,14 @@ impl BwrapExecutor {
         let unmapped = path_map.unmapped_paths(&policy.filesystem);
         let mut inner_policy = policy.mapped(&path_map);
         inner_policy.network = inner_network(&policy.network, bwrap.network_mode());
+        add_module_rules(&mut inner_policy.filesystem, &module_binds);
         refuse_writable_trampoline_dir(&inner_policy.filesystem)?;
         Ok(BwrapTrampolinePlan {
             bwrap,
             inner_policy,
             path_map,
             unmapped,
+            module_binds,
         })
     }
 
@@ -363,7 +461,14 @@ impl BwrapExecutor {
 
         let mut launcher = BwrapLauncher::new(self.executable.clone())
             .with_network_mode(network_mode.clone())
-            .with_read_only_paths(filesystem.extra_read_only.clone());
+            .with_read_only_paths(filesystem.extra_read_only.clone())
+            .with_profile(&self.modules);
+        if let Some(binding) = &self.host_path {
+            launcher = launcher.with_host_path(binding.clone());
+        }
+        if let Some(size) = self.tmpfs_size {
+            launcher = launcher.with_tmpfs_size(size);
+        }
         if let Some((uid, gid)) = self.identity {
             launcher = launcher.with_identity(uid, gid);
         }
@@ -381,6 +486,10 @@ impl BwrapExecutor {
             ),
         };
         let planned = launcher.plan(&sandbox, &command)?;
+        // The launcher's own binds, before the job context is spliced in
+        // (its environment values never reach the parser).
+        let mut filesystem = filesystem;
+        filesystem.launcher_binds = launcher_binds(planned.args())?;
         let args = splice_job_context(
             planned.args(),
             &workspace,
@@ -589,6 +698,7 @@ pub struct BwrapTrampolinePlan {
     inner_policy: SandboxPolicy,
     path_map: PathMap,
     unmapped: Vec<PathBuf>,
+    module_binds: Vec<PathBind>,
 }
 
 impl BwrapTrampolinePlan {
@@ -622,6 +732,78 @@ impl BwrapTrampolinePlan {
     pub fn withheld_paths(&self) -> &[PathBuf] {
         self.bwrap.withheld_paths()
     }
+
+    /// The binds of the profile modules and the host `PATH` binding (module
+    /// docs, PL-97 E2b), in argv order; empty without modules. Each one is
+    /// in [`path_map`](Self::path_map) and has its own rule in
+    /// [`inner_policy`](Self::inner_policy). A caller that builds its own
+    /// inner policy from the path map (a per-job write scope) has to add
+    /// these rules itself, or the job cannot use the modules.
+    #[must_use]
+    pub fn module_binds(&self) -> &[PathBind] {
+        &self.module_binds
+    }
+}
+
+/// Adds the Landlock rules of the module binds (in-namespace paths): read
+/// and execute for a read-only bind, read, write and execute for a
+/// read-write one, which is what the mount alone grants.
+fn add_module_rules(filesystem: &mut FilesystemPolicy, binds: &[PathBind]) {
+    for bind in binds {
+        if bind.mode == BindMode::ReadWrite {
+            push_unique(&mut filesystem.read_write, &bind.sandbox);
+        }
+        push_unique(&mut filesystem.exec, &bind.sandbox);
+    }
+}
+
+/// Every `--bind`, `--ro-bind` and `--ro-bind-try` of a `harw-sandbox`
+/// launcher argv, up to its `--` separator. The argv is parsed option by
+/// option (every value is skipped by the option's arity), so a value that
+/// looks like an option is never read as one. An option the launcher is
+/// not known to emit fails the plan (fail closed).
+fn launcher_binds(args: &[OsString]) -> Result<Vec<PathBind>, BwrapExecutorError> {
+    let mut binds = Vec::new();
+    let mut rest = args.iter();
+    while let Some(option) = rest.next() {
+        let Some(option) = option.to_str() else {
+            return Err(BwrapExecutorError::PlanShape);
+        };
+        let (arity, mode) = match option {
+            "--" => return Ok(binds),
+            "--die-with-parent" | "--new-session" | "--unshare-all" | "--unshare-net"
+            | "--unshare-user" | "--unshare-ipc" | "--unshare-pid" | "--unshare-uts"
+            | "--unshare-cgroup" | "--clearenv" => (0, None),
+            "--uid" | "--gid" | "--proc" | "--dev" | "--size" | "--tmpfs" | "--dir" | "--chdir" => {
+                (1, None)
+            }
+            "--setenv" => (2, None),
+            "--bind" => (2, Some(BindMode::ReadWrite)),
+            "--ro-bind" | "--ro-bind-try" => (2, Some(BindMode::ReadOnly)),
+            _ => return Err(BwrapExecutorError::PlanShape),
+        };
+        let values: Vec<&OsString> = rest.by_ref().take(arity).collect();
+        if values.len() != arity {
+            return Err(BwrapExecutorError::PlanShape);
+        }
+        if let (Some(mode), [host, sandbox]) = (mode, values.as_slice()) {
+            let invalid = |path: &OsString| BwrapExecutorError::InvalidPath {
+                path: PathBuf::from(path),
+            };
+            if !Path::new(host).is_absolute() {
+                return Err(invalid(host));
+            }
+            if !Path::new(sandbox).is_absolute() {
+                return Err(invalid(sandbox));
+            }
+            binds.push(PathBind {
+                host: PathBuf::from(host),
+                sandbox: PathBuf::from(sandbox),
+                mode,
+            });
+        }
+    }
+    Err(BwrapExecutorError::PlanShape)
 }
 
 /// The sandboxed command of the trampoline composition.
@@ -728,8 +910,34 @@ fn refuse_mount_overlaps(
     Ok(())
 }
 
-/// The [`PathMap`] of a trampoline plan (table in the module docs).
+/// The [`PathMap`] of a trampoline plan (table in the module docs), and the
+/// binds of the profile modules in it: every launcher bind that is not one
+/// of the classified entries.
 fn namespace_view(
+    plan: &BwrapJobPlan,
+    requested_root: &Path,
+    filesystem: &FilesystemMapping,
+    mount: &TrampolineMount,
+) -> Result<(PathMap, Vec<PathBind>), BwrapExecutorError> {
+    let invalid = |error: PathMapError| BwrapExecutorError::InvalidPath { path: error.path };
+    let classified = classified_view(plan, requested_root, filesystem, mount)?;
+    let mut map = classified.clone();
+    let mut modules = Vec::new();
+    for bind in &filesystem.launcher_binds {
+        if classified.binds().contains(bind) || modules.contains(bind) {
+            continue;
+        }
+        map = map
+            .try_with_bind(&bind.host, &bind.sandbox, bind.mode)
+            .map_err(invalid)?;
+        modules.push(bind.clone());
+    }
+    Ok((map, modules))
+}
+
+/// The classified part of the namespace view: workspace, system trees,
+/// policy read-only paths, bwrap's own mounts, relay and trampoline.
+fn classified_view(
     plan: &BwrapJobPlan,
     requested_root: &Path,
     filesystem: &FilesystemMapping,
@@ -817,6 +1025,8 @@ struct FilesystemMapping {
     workspace_writable: bool,
     extra_read_only: Vec<PathBuf>,
     withheld: Vec<PathBuf>,
+    /// Every bind of the launcher's argv ([`launcher_binds`]).
+    launcher_binds: Vec<PathBind>,
 }
 
 fn resolve_workspace(workspace_root: &Path) -> Result<WorkspaceBinding, BwrapExecutorError> {

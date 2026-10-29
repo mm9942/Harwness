@@ -13,16 +13,33 @@
 //! Hinweise des Startwegs (z. B. Start ohne rlimits) wandern über
 //! [`PreparedLaunch`] in `meta.json` und als `JobEvent::Warning` zum Besitzer.
 //!
+//! PL-97 E2b: Nimmt der Start die Sandbox-Kette des Job-Runtimes
+//! ([`harw_tool_shell::job_spec`]), trägt [`PreparedLaunch::sandboxed`]
+//! Workspace-Sandbox und Ressourcen; die Job-Verwaltung übergibt den Befehl
+//! (`/bin/sh -c …`) dann mit ihnen an den Kommando-Port statt als Host-Job
+//! ([`crate::JobManager::start_launch_with_origin`]).
+//!
+//! Kind-Agenten (PL-97 E2b): [`child_agent_launch`] — kein Host-Auftrag
+//! mehr, sondern ein Job-Runtime-Auftrag über den ausdrücklich übergebenen
+//! Workspace des Elternteils (siehe dort, warum der Kind-Prozess selbst
+//! noch unbeschränkt bleibt).
+//!
 //! # Nebenläufigkeit
 //! `Send + Sync`; [`JobLauncher::prepare`] und
 //! [`JobLauncher::prepare_launch`] können auf eine Nutzerfreigabe warten
 //! (Host-Permit-Frage).
 
-use harw_tool_shell::ShellToolProvider;
+use harw_command::{ResourceRequest, SandboxProfileName, SandboxRequirement, WorkspaceSandbox};
+use harw_tool_shell::{SandboxedLaunch, ShellToolProvider};
 use harw_tools::{ToolExecutionContext, ToolOutput};
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use tokio::process::Command as TokioCommand;
+
+// PL-97 E2b: Startweg-Wahl (`[sandbox] execution`) auch für Kind-Agenten,
+// die diese Crate, aber nicht `harw-tool-shell` kennen.
+pub use harw_tool_shell::SandboxExecution;
 
 /// Ein geprüfter, noch nicht gestarteter Job-Prozess.
 #[derive(Debug)]
@@ -48,6 +65,9 @@ pub struct PreparedLaunch {
     pub job: PreparedJob,
     /// Hinweise für den Besitzer (z. B. Start ohne rlimits); nie Werte von Umgebungsvariablen.
     pub warnings: Vec<String>,
+    /// PL-97 E2b: Übergabe an die Sandbox-Kette; `None`: `job.command`
+    /// läuft wie bisher als Host-Job.
+    pub sandboxed: Option<SandboxedLaunch>,
 }
 
 /// Future von [`JobLauncher::prepare_launch`].
@@ -87,6 +107,7 @@ pub trait JobLauncher: Send + Sync {
             Ok(PreparedLaunch {
                 job,
                 warnings: Vec::new(),
+                sandboxed: None,
             })
         })
     }
@@ -115,9 +136,19 @@ impl JobLauncher for ShellJobLauncher {
         cpu_budget_secs: u64,
     ) -> LaunchFuture<'a> {
         Box::pin(async move {
-            self.prepare_launch(context, command, cpu_budget_secs)
-                .await
-                .map(|launch| launch.job)
+            let launch = self
+                .prepare_launch(context, command, cpu_budget_secs)
+                .await?;
+            // PL-97 E2b, fail-closed: ohne die Übergabe an die Sandbox-Kette
+            // liefe `/bin/sh -c …` als Host-Job, also unbeschränkt.
+            if launch.sandboxed.is_some() {
+                return Err(ToolOutput::error(format!(
+                    "{}: this start runs through the job runtime's sandbox chain, which needs \
+                     `JobLauncher::prepare_launch`; it never runs as a host job",
+                    crate::JOB_START_TOOL
+                )));
+            }
+            Ok(launch.job)
         })
     }
 
@@ -134,7 +165,7 @@ impl JobLauncher for ShellJobLauncher {
                 .await?;
             let executed_on_host = launch.executed_on_host();
             let env_cleared = launch.env_cleared();
-            let (command, warnings) = launch.into_parts();
+            let (command, warnings, sandboxed) = launch.into_launch_parts();
             Ok(PreparedLaunch {
                 job: PreparedJob {
                     command,
@@ -142,9 +173,84 @@ impl JobLauncher for ShellJobLauncher {
                     env_cleared,
                 },
                 warnings,
+                sandboxed,
             })
         })
     }
+}
+
+/// The start of a child agent's process through the job runtime's chain
+/// path (PL-97 E2b), for [`crate::JobManager::start_piped_launch_with_origin`].
+///
+/// # Description
+/// The child becomes a [`harw_command::CommandSandbox::Workspace`] request
+/// over `workspace_root`, the parent's canonical workspace root the caller
+/// passes explicitly (never harw's process working directory), with the
+/// profile [`SandboxProfileName::WorkspaceBuild`], instead of a
+/// [`harw_command::CommandSandbox::Host`] submission over the runtime's
+/// `/` root. The host-permit path of `shell.exec` stays the only host
+/// submission of a model call.
+///
+/// Not yet confined (an accepted deviation from plan §3.4 E2, tracked as a
+/// follow-up: grants for the harw home and the runner path, and the
+/// child's tool processes delegated to the parent runtime). The child
+/// process itself runs with [`SandboxRequirement::None`], and
+/// `executed_on_host` stays `true`:
+/// - a Landlock domain (both trampoline backends) forbids `mount(2)` and
+///   `pivot_root(2)`, so the Bubblewrap sandboxes the child starts for its
+///   own tool calls would fail inside it;
+/// - the `workspace_build` policy grants neither the harw home (the
+///   child's session store and job state) nor the runner executable
+///   outside the system trees (`~/.local/bin` by default);
+/// - a networked profile gets no Bubblewrap backend from the host port (no
+///   egress relay is configured).
+///
+/// The child keeps what every runtime job has: its own cgroup (when the
+/// runtime has a cgroup root), the process group and the attempt record.
+/// Its tool processes are confined one by one, as before. The working
+/// directory of `job.command` is set to `workspace_root`.
+///
+/// # Errors
+/// The prepared job back, with the reason, when the chain cannot take it:
+/// `workspace_root` is not an absolute directory, or `manager`'s command
+/// port runs no workspace requests. The caller then keeps the legacy host
+/// submission (an unscoped call; a child carries no write scope).
+pub fn child_agent_launch(
+    manager: &crate::JobManager,
+    mut job: PreparedJob,
+    workspace_root: &Path,
+) -> Result<PreparedLaunch, Box<(PreparedJob, String)>> {
+    let profile = SandboxProfileName::WorkspaceBuild;
+    let root = match workspace_root.canonicalize() {
+        Ok(root) if root.is_dir() => root,
+        Ok(root) => {
+            let reason = format!("the workspace root {} is no directory", root.display());
+            return Err(Box::new((job, reason)));
+        }
+        Err(error) => {
+            let reason = format!(
+                "the workspace root {} cannot be resolved: {error}",
+                workspace_root.display()
+            );
+            return Err(Box::new((job, reason)));
+        }
+    };
+    let Some(backend) = manager.workspace_backend(profile) else {
+        let reason = "the job runtime runs no workspace sandbox requests".to_owned();
+        return Err(Box::new((job, reason)));
+    };
+    job.command.current_dir(&root);
+    job.executed_on_host = true;
+    let workspace = WorkspaceSandbox::new(root, profile, SandboxRequirement::None);
+    Ok(PreparedLaunch {
+        job,
+        warnings: Vec::new(),
+        sandboxed: Some(SandboxedLaunch::new(
+            workspace,
+            ResourceRequest::default(),
+            backend,
+        )),
+    })
 }
 
 /// Startet `/bin/sh -c <command>` direkt auf dem Host in eigener
