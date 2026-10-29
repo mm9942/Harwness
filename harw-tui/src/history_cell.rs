@@ -53,16 +53,23 @@
 //!   [`ToolCell::complete`] (Plan Schritt 2, Contract A5) — ersetzt
 //!   vollständig die früheren Alttypen `ToolCallHistoryCell`/
 //!   `ToolResultHistoryCell` (siehe Modul-Verantwortung oben).
-//! - [`ToolGroupCell`]: fasst aufeinanderfolgende lesende `fs.*`-Aufrufe
-//!   (`fs.read`, `fs.search`, `fs.grep`, `fs.list`, `fs.glob`) zu einer
-//!   Sammelzeile zusammen.
+//! - [`ToolGroupCell`]: fasst aufeinanderfolgende beobachtende Aufrufe auf
+//!   Pfaden (`fs.read`, `fs.search`, `fs.grep`, `fs.list`, `fs.glob`,
+//!   `doc.read_pdf`) zu einer Sammelzeile zusammen, oder zeigt genau eine
+//!   Projektion des Aktivitäts-Reducers (PL-97 M3: `file-edit-read-loop@1`
+//!   eines Pfads als `A · Edit ×1 · Read ×3`, `job-lifecycle@1` eines Jobs
+//!   als eine fortgeschriebene Zelle). Welche Aufrufe zusammengehören,
+//!   entscheidet der Reducer (`crate::app::activity_glue`) über die
+//!   Aktivitätsdeskriptoren der Werkzeuge
+//!   ([`harw_registry_defaults::activity_for`]), nicht eine Namensliste.
 //!
 //! # Verbosity (Schritt 2)
 //! [`ToolCell`] und [`ToolGroupCell`] rendern zusätzlich über
 //! [`ToolCell::display_lines_with`] / [`ToolGroupCell::display_lines_with`]
 //! mit einem [`ToolVerbosity`]-Parameter: `Verbose` verhält sich wie
 //! ausgeklappt und zeigt zusätzlich die rohen Aufrufargumente (eingerückt
-//! als JSON) unter dem Label.
+//! als JSON) unter dem Label; `Activity` (PL-97 M3, aus PR #76) zeigt eine
+//! einzelne Zeile je Werkzeugzelle.
 //!
 //! # Nebenläufigkeit
 //! Alle Typen implementieren [`Send`] + [`Sync`] (erzwungen durch den Trait-Bound).
@@ -92,6 +99,7 @@ use std::sync::{Arc, Mutex};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use harw_activity::{ConstituentStatus, Effect, PatternId, PatternInstance};
 use harw_extension_api::ToolCall;
 use harw_plan::goal::GoalReport;
 use harw_plan::{Plan, PlanNode, PlanNodeStatus, TaskId};
@@ -1374,9 +1382,11 @@ impl HistoryCell for GoalCell {
 /// Bricht `text` wortweise auf Zeilen der Breite `width` um.
 ///
 /// # Beschreibung
-/// Wörter werden an Leerzeichen getrennt und auf Zeilen aufgeteilt. Passt ein
-/// einzelnes Wort nicht in die Spaltenbreite, wird es hart an `width` Stellen
-/// aufgeteilt (harte Trennung als Fallback). `width == 0` wird wie `1` behandelt.
+/// Wörter werden an Leerzeichen getrennt und auf Zeilen aufgeteilt; gemessen
+/// wird in Anzeigespalten (`unicode-width`, PL-97 M3). Passt ein einzelnes
+/// Wort nicht in die Spaltenbreite, wird es zuerst an weichen Trennpunkten
+/// (`/`, `·`, `_`) und erst dann hart an `width` Spalten aufgeteilt (siehe
+/// [`split_at_soft_breaks`]). `width == 0` wird wie `1` behandelt.
 ///
 /// Leerer `text` ergibt eine leere [`Vec`]. Zeilenumbrüche im Eingabetext (`\n`)
 /// erzeugen explizite Zeilentrennungen.
@@ -1401,6 +1411,7 @@ impl HistoryCell for GoalCell {
 ///
 /// Spec-Quelle: `docs/design/tui-architecture.md`.
 pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
     let col_width = (width as usize).max(1);
     let mut result: Vec<Line<'static>> = Vec::new();
 
@@ -1414,26 +1425,25 @@ pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
         let mut current_len: usize = 0;
 
         for word in paragraph.split_ascii_whitespace() {
-            let word_len = word.chars().count();
-
-            if word_len >= col_width {
+            // PL-97 M3 (aus PR #76, B14): Breite in Anzeigespalten
+            // (unicode-width), nicht Zeichenanzahl — CJK/Emoji zählen breit.
+            // Überlange Wörter werden zuerst an weichen Trennpunkten (`/`,
+            // `·`, `_`) zerlegt; nur Segmente, die allein immer noch zu breit
+            // sind, werden hart (spaltengenau) geteilt.
+            if UnicodeWidthStr::width(word) >= col_width {
                 // Harte Trennung: aktuell akkumulierte Zeile erst flushen
                 if !current_line.is_empty() {
-                    result.push(Line::from(Span::raw(current_line.clone())));
-                    current_line.clear();
+                    result.push(Line::from(Span::raw(std::mem::take(&mut current_line))));
                     current_len = 0;
                 }
-                // Wort selbst in col_width-Häppchen aufteilen
-                let chars: Vec<char> = word.chars().collect();
-                let mut offset = 0;
-                while offset < chars.len() {
-                    let end = (offset + col_width).min(chars.len());
-                    let chunk: String = chars[offset..end].iter().collect();
-                    result.push(Line::from(Span::raw(chunk)));
-                    offset = end;
+                // Jedes Segment auf eine eigene Zeile (wie die frühere harte
+                // Trennung); das nächste Wort beginnt eine neue Zeile.
+                for segment in split_at_soft_breaks(word, col_width) {
+                    result.push(Line::from(Span::raw(segment)));
                 }
                 continue;
             }
+            let word_len = UnicodeWidthStr::width(word);
 
             // Wort passt in eine Zeile
             if current_len == 0 {
@@ -1459,6 +1469,65 @@ pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
     }
 
     result
+}
+
+/// Zerlegt ein überlanges Wort greedy an weichen Trennpunkten (`/`, `·`, `_`)
+/// in Segmente von höchstens `col_width` Anzeigespalten (PL-97 M3, aus PR #76
+/// B14). Segmente, die allein breiter sind, werden zeichenweise und
+/// spaltengenau hart geteilt (CJK- und Emoji-sicher). Der Trenner bleibt am
+/// Segmentende, damit Pfade als `crates/` + `harw-tui/` brechen. Kein
+/// Zeichen geht verloren oder kommt hinzu.
+fn split_at_soft_breaks(word: &str, col_width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    // Tokenisieren: jedes Token endet an einem Trennzeichen (Trenner inklusive).
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in word.chars() {
+        current.push(ch);
+        if matches!(ch, '/' | '·' | '_') {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    // Greedy zu Segmenten <= col_width packen.
+    let mut segments: Vec<String> = Vec::new();
+    let mut segment = String::new();
+    let mut segment_width: usize = 0;
+    for token in tokens {
+        let token_width = UnicodeWidthStr::width(token.as_str());
+        if segment_width + token_width <= col_width {
+            segment.push_str(&token);
+            segment_width += token_width;
+            continue;
+        }
+        if !segment.is_empty() {
+            segments.push(std::mem::take(&mut segment));
+            segment_width = 0;
+        }
+        if token_width <= col_width {
+            segment = token;
+            segment_width = token_width;
+            continue;
+        }
+        // Hart teilen, spaltengenau; der Rest bleibt offenes Segment.
+        for ch in token.chars() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if segment_width + char_width > col_width && !segment.is_empty() {
+                segments.push(std::mem::take(&mut segment));
+                segment_width = 0;
+            }
+            segment.push(ch);
+            segment_width += char_width;
+        }
+    }
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+    segments
 }
 
 /// Kürzt `text` char-sicher auf höchstens `max_chars` Zeichen.
@@ -1556,11 +1625,18 @@ pub(crate) enum ToolState {
 /// sich wie ausgeklappt (`expanded == true`) und zeigt **zusätzlich** die
 /// rohen Aufrufargumente als eingerücktes JSON unter dem Label — nützlich
 /// zur Fehlersuche, wenn das kompakte Label ein wichtiges Argument verbirgt.
+/// `Activity` (PL-97 M3, aus PR #76 B11a) rendert jede eingeklappte
+/// Werkzeugzelle als genau eine Zeile; `Compact` bleibt der Default,
+/// `/verbose` schaltet `Compact → Verbose → Activity → Compact`.
 ///
 /// # Spec-Referenz
 /// Plan Schritt 2, Contract-Slice A5 („Verbosity“).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolVerbosity {
+    /// Einzeilige Aktivität: Statuspunkt, Label, Zusammenfassung und Dauer —
+    /// keine Vorschau- oder Diff-Zeilen. Ausklappen (Ctrl+O) zeigt die
+    /// Details wie `Compact`.
+    Activity,
     /// Nur das an- bzw. ausgeklappte Ergebnis, keine rohen Argumente.
     Compact,
     /// Wie ausgeklappt, zusätzlich die rohen Aufrufargumente als JSON.
@@ -2596,8 +2672,22 @@ impl ToolCell {
         theme: style::Theme,
         verbosity: ToolVerbosity,
     ) -> Vec<Line<'static>> {
+        self.render_lines(width, theme, verbosity, self.expanded)
+    }
+
+    /// Wie [`ToolCell::display_lines_with`], aber mit explizitem
+    /// Ausklapp-Zustand `expanded_flag` statt `self.expanded` — für eine
+    /// einzelne Zelle in einer Reducer-Projektion, deren Gruppe Ctrl+O
+    /// ausklappt (PL-97 M3).
+    pub(crate) fn render_lines(
+        &self,
+        width: u16,
+        theme: style::Theme,
+        verbosity: ToolVerbosity,
+        expanded_flag: bool,
+    ) -> Vec<Line<'static>> {
         let verbose = matches!(verbosity, ToolVerbosity::Verbose);
-        let expanded = self.expanded || verbose;
+        let expanded = expanded_flag || verbose;
 
         let (glyph_style, dot_glyph) = match self.state {
             ToolState::Running => (style::dim_style(theme), "● "),
@@ -2608,6 +2698,33 @@ impl ToolCell {
         let dim = style::dim_style(theme);
 
         let mut lines: Vec<Line<'static>> = Vec::new();
+
+        // Aktivitätsmodus (PL-97 M3, aus PR #76 B11a): genau eine Kopfzeile —
+        // Statuspunkt, Label, Zusammenfassung, Dauer; keine rohen Argumente,
+        // kein Ergebnistext. Ausklappen bleibt über `self.expanded` möglich.
+        if verbosity == ToolVerbosity::Activity && !expanded_flag {
+            let tail = match &self.summary {
+                Some(summary) => format!(" · {summary}{}", self.header_tail()),
+                None => self.header_tail(),
+            };
+            push_header_line(
+                &mut lines,
+                HeaderPart {
+                    text: dot_glyph,
+                    style: glyph_style,
+                },
+                HeaderPart {
+                    text: &self.label,
+                    style: label_style,
+                },
+                HeaderPart {
+                    text: &tail,
+                    style: dim,
+                },
+                width,
+            );
+            return lines;
+        }
 
         // Kopfzeile: Statuspunkt + fettes Label + gedimmte Dauer/Notiz,
         // wortweise umgebrochen wie die übrigen Zellen dieser Datei.
@@ -2945,54 +3062,78 @@ fn push_indented_wrapped_capped(
     hidden
 }
 
-/// Sammelzelle für aufeinanderfolgende, lesende `fs.*`-Aufrufe desselben
-/// Turns (`fs.read`, `fs.search`, `fs.grep`, `fs.list`, `fs.glob`).
+/// Sammelzelle für zusammengehörige Werkzeugaufrufe: aufeinanderfolgende
+/// beobachtende Aufrufe auf Pfaden (`fs.read`, `fs.search`, `fs.grep`,
+/// `fs.list`, `fs.glob`, `doc.read_pdf`) oder genau eine Projektion des
+/// Aktivitäts-Reducers (PL-97 M3, siehe [`ToolGroupKind`]).
 ///
 /// # Beschreibung
-/// Eingeklappt zeigt sie eine Sammelzeile mit Zählern je Kategorie
-/// (`"N Dateien gelesen, N Muster gesucht, N Verzeichnisse gelistet"`,
-/// nur nicht-leere Kategorien); ausgeklappt rendert sie jede enthaltene
-/// [`ToolCell`] einzeln über deren eigene [`HistoryCell::display_lines`].
-/// Der Aufrufer entscheidet über [`ToolGroupCell::accepts`], ob ein neu
-/// eingetroffener Aufruf noch in die laufende Gruppe passt, oder ob eine neue
-/// Gruppe (bzw. eine einzelne [`ToolCell`]) beginnt.
+/// [`ToolGroupKind::Reads`] (Default, [`ToolGroupCell::new`]): eingeklappt
+/// eine Sammelzeile mit Zählern je Kategorie (`"N Dateien gelesen, N Muster
+/// gesucht, N Verzeichnisse gelistet"`, nur nicht-leere Kategorien);
+/// ausgeklappt rendert sie jede enthaltene [`ToolCell`] einzeln über deren
+/// eigene [`HistoryCell::display_lines`]. Die Kategorie kommt aus dem
+/// Aktivitätsdeskriptor des Werkzeugs (Verb `read`, `search`/`grep`,
+/// `list`/`glob`), nicht aus einer Namensliste.
+///
+/// [`ToolGroupKind::Activity`] ([`ToolGroupCell::for_projection`]): eine
+/// Projektion (`file-edit-read-loop@1`, `job-lifecycle@1`), die sich an Ort
+/// und Stelle fortschreibt. Mit nur einer Zelle sieht sie genau wie diese
+/// Zelle aus; ab zwei Zellen eine kompakte Zeile aus dem Reducer-Stand
+/// (`● A · Edit ×1 · Read ×3`, `● Job(build) · läuft · status ×2`), jeder
+/// Fehlschlag bleibt als `✗` sichtbar. Ctrl+O zeigt die einzelnen Aufrufe.
+///
+/// Welche Aufrufe in welche Gruppe gehören, entscheidet der Reducer im
+/// Adapter (`crate::app::activity_glue`); [`ToolGroupCell::accepts`] bleibt
+/// das Deskriptor-Prädikat für die Lese-Gruppen der Kind-Live-Blöcke.
 ///
 /// # Felder
 /// - `cells` (`Vec<SharedToolCell>`): die gruppierten Zellen in
 ///   Ankunftsreihenfolge.
 /// - `expanded` (`bool`): Nutzer-Umschalter (Ctrl+O).
+/// - `kind` ([`ToolGroupKind`]): Lese-Gruppe oder Reducer-Projektion.
 ///
 /// # Spec-Referenz
-/// Plan Schritt 2 („Gruppierung“), Contract-Slice A5.
+/// Plan Schritt 2 („Gruppierung“), Contract-Slice A5; PL-97 §3.5 „TUI
+/// adapter“, PL-71/03.
 ///
-/// # Semantische Grenze und geplanter Ausbau
-/// Diese Struktur ist der **heutige TUI-lokale** Aggregator für genau eine
-/// bekannte Darstellung: aufeinanderfolgende, lesende Werkzeugaufrufe. Sie
-/// ist damit zugleich der konkrete Migrationsanker für
-/// `docs/planning/71-semantic-activity-patterns/`.
-///
-/// Wichtig für spätere Umbauten:
-///
+/// # Semantische Grenze
 /// - die enthaltenen `ToolCell`s und ihre `ToolCallId`s bleiben die
 ///   konkreten Laufzeitbeobachtungen;
 /// - eine kompakte Sammelzeile ist nur eine abgeleitete Projektion und darf
 ///   die zugrunde liegenden Aufrufe nicht aus Verlauf/Audit entfernen;
-/// - künftige ressourcenbezogene Muster (zum Beispiel
-///   `fs.edit(path=X) -> fs.read(path=X) *`) sollen nicht als weitere
-///   Namens-Sonderfälle direkt in diesen Renderer wachsen, sondern über eine
-///   gemeinsame Pattern-/Reducer-Schicht eingespeist werden;
-/// - `ToolGroupCell` darf während dieser Migration als kompatible
-///   Darstellungsoberfläche bestehen bleiben.
-///
-/// Die geplante Pattern-Schicht ist ausdrücklich **keine Authority-Schicht**:
-/// Gruppierung oder Mustererkennung darf weder Tool-Berechtigungen noch
-/// Approval-Entscheidungen verändern.
+/// - Gruppierung oder Mustererkennung ist ausdrücklich **keine
+///   Authority-Schicht**: sie verändert weder Tool-Berechtigungen noch
+///   Approval-Entscheidungen.
 #[derive(Debug)]
 pub(crate) struct ToolGroupCell {
     /// Die gruppierten Zellen in Ankunftsreihenfolge.
     pub cells: Vec<SharedToolCell>,
     /// Nutzer-Umschalter (Ctrl+O).
     pub expanded: bool,
+    /// Lese-Gruppe oder Reducer-Projektion (PL-97 M3).
+    pub kind: ToolGroupKind,
+}
+
+/// What a [`ToolGroupCell`] stands for (PL-97 M3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolGroupKind {
+    /// Consecutive observing calls on paths: one or more
+    /// `file-read-burst@1` instances opened one after another, rendered as
+    /// the category tally (`"2 Dateien gelesen, 1 Muster gesucht"`).
+    Reads,
+    /// Exactly one reducer projection, updated in place.
+    Activity(ActivityProjection),
+}
+
+/// Reducer-backed state of a [`ToolGroupKind::Activity`] group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActivityProjection {
+    /// Title of the compact line: the path (`src/a.rs`) or the job label
+    /// (`Job(build)`). Raw; sanitized when rendered.
+    pub(crate) title: String,
+    /// Latest snapshot of the projection (`ProjectionUpdate::instance`).
+    pub(crate) instance: PatternInstance,
 }
 
 impl Default for ToolGroupCell {
@@ -3003,12 +3144,43 @@ impl Default for ToolGroupCell {
 }
 
 impl ToolGroupCell {
-    /// Erzeugt eine leere Gruppe (eingeklappt, ohne Zellen).
+    /// Erzeugt eine leere Lese-Gruppe (eingeklappt, ohne Zellen).
     pub(crate) fn new() -> Self {
         Self {
             cells: Vec::new(),
             expanded: false,
+            kind: ToolGroupKind::Reads,
         }
+    }
+
+    /// An empty group for one reducer projection (PL-97 M3), titled `title`.
+    pub(crate) fn for_projection(title: String, instance: PatternInstance) -> Self {
+        Self {
+            cells: Vec::new(),
+            expanded: false,
+            kind: ToolGroupKind::Activity(ActivityProjection { title, instance }),
+        }
+    }
+
+    /// Takes over a newer snapshot of the group's projection.
+    ///
+    /// Ignored for a read group, for another projection and for a revision
+    /// that is not newer than the one shown (PL-71: consumers drop stale
+    /// updates).
+    ///
+    /// # Returns
+    /// `true` when the snapshot changed.
+    pub(crate) fn update_projection(&mut self, instance: &PatternInstance) -> bool {
+        let ToolGroupKind::Activity(projection) = &mut self.kind else {
+            return false;
+        };
+        if projection.instance.id != instance.id
+            || instance.revision <= projection.instance.revision
+        {
+            return false;
+        }
+        projection.instance = instance.clone();
+        true
     }
 
     /// Hängt eine weitere Zelle an die Gruppe an.
@@ -3021,22 +3193,28 @@ impl ToolGroupCell {
         self.cells.push(cell);
     }
 
-    /// Prüft, ob ein Werkzeugname noch in eine Lese-Gruppe passt.
+    /// Prüft, ob ein Werkzeug in eine Lese-Gruppe passt.
+    ///
+    /// # Beschreibung
+    /// PL-97 M3: entschieden über den Aktivitätsdeskriptor
+    /// ([`harw_registry_defaults::activity_for`]) statt über eine
+    /// Namensliste: bekannte Semantik, Effekt `observe`, Ressourcenfeld
+    /// `path` — genau die Aufrufe, die `file-read-burst@1` bündelt.
     ///
     /// # Argumente
     /// - `tool_name` (`&str`): der zu prüfende Werkzeugname.
     ///
     /// # Rückgabe
     /// `true` für `fs.read`, `fs.search`, `fs.grep`, `fs.list`, `fs.glob`,
-    /// `doc.read_pdf` (ebenfalls ein reines Lesewerkzeug); sonst `false`
-    /// (z. B. `shell.exec`, `fs.write`, unbekannte Werkzeuge — jeder Aufruf
-    /// mit Seiteneffekten oder unbekanntem Verhalten bleibt eine eigene,
-    /// einzeln sichtbare Zelle).
+    /// `doc.read_pdf`; sonst `false` (z. B. `shell.exec`, `fs.write`,
+    /// unbekannte Werkzeuge — jeder Aufruf mit Seiteneffekten oder
+    /// unbekanntem Verhalten bleibt eine eigene, einzeln sichtbare Zelle).
     pub(crate) fn accepts(tool_name: &str) -> bool {
-        matches!(
-            tool_name,
-            "fs.read" | "fs.search" | "fs.grep" | "fs.list" | "fs.glob" | "doc.read_pdf"
-        )
+        harw_registry_defaults::activity_for(tool_name).is_some_and(|descriptor| {
+            descriptor.is_known()
+                && descriptor.effect == Effect::Observe
+                && descriptor.resource_field.as_deref() == Some("path")
+        })
     }
 
     /// Zählt Kategorie- und Fehlschlags-Vorkommen über alle enthaltenen
@@ -3049,11 +3227,14 @@ impl ToolGroupCell {
                 tally.running += 1;
                 continue;
             };
-            match guard.tool_name.as_str() {
-                "fs.read" | "doc.read_pdf" => tally.read += 1,
-                "fs.search" | "fs.grep" => tally.search += 1,
-                "fs.list" | "fs.glob" => tally.list += 1,
-                _ => {}
+            // Kategorie aus dem Verb des Deskriptors, nicht aus dem Namen.
+            let verb = harw_registry_defaults::activity_for(&guard.tool_name)
+                .map(|descriptor| descriptor.verb.into_owned());
+            match verb.as_deref() {
+                Some("read") => tally.read += 1,
+                Some("search" | "grep") => tally.search += 1,
+                Some("list" | "glob") => tally.list += 1,
+                _ => tally.other += 1,
             }
             match guard.state {
                 ToolState::Running => tally.running += 1,
@@ -3065,7 +3246,8 @@ impl ToolGroupCell {
     }
 
     /// Rendert die Gruppe mit explizitem [`ToolVerbosity`] (siehe
-    /// [`ToolCell::display_lines_with`] für die Bedeutung von `Verbose`).
+    /// [`ToolCell::display_lines_with`] für die Bedeutung von `Verbose` und
+    /// `Activity`).
     pub(crate) fn display_lines_with(
         &self,
         width: u16,
@@ -3073,19 +3255,13 @@ impl ToolGroupCell {
         verbosity: ToolVerbosity,
     ) -> Vec<Line<'static>> {
         let expanded = self.expanded || matches!(verbosity, ToolVerbosity::Verbose);
+        if let ToolGroupKind::Activity(projection) = &self.kind {
+            return self.activity_lines(projection, expanded, width, theme, verbosity);
+        }
 
         if expanded {
             let mut lines: Vec<Line<'static>> = Vec::new();
-            for cell in &self.cells {
-                let Ok(guard) = cell.lock() else {
-                    lines.push(Line::from(Span::styled(
-                        "⚠ Werkzeugzelle nicht lesbar (Sperre vergiftet)",
-                        style::warning_style(theme),
-                    )));
-                    continue;
-                };
-                lines.extend(guard.display_lines_with(width, theme, verbosity));
-            }
+            self.push_cells(&mut lines, width, theme, verbosity);
             return lines;
         }
 
@@ -3105,6 +3281,14 @@ impl ToolGroupCell {
                 "Verzeichnisse"
             };
             parts.push(format!("{} {noun} gelistet", tally.list));
+        }
+        if tally.other > 0 {
+            let noun = if tally.other == 1 {
+                "weiterer Lesezugriff"
+            } else {
+                "weitere Lesezugriffe"
+            };
+            parts.push(format!("{} {noun}", tally.other));
         }
         let summary = if parts.is_empty() {
             "0 Werkzeuge".to_owned()
@@ -3151,17 +3335,182 @@ impl ToolGroupCell {
 
         lines
     }
+
+    /// Rendert jede enthaltene Zelle einzeln (ausgeklappte Ansicht).
+    /// `Activity` zeigt ausgeklappt die Details wie `Compact`; nur `Verbose`
+    /// reicht die rohen Argumente an die Zellen durch.
+    fn push_cells(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        width: u16,
+        theme: style::Theme,
+        verbosity: ToolVerbosity,
+    ) {
+        let child_verbosity = match verbosity {
+            ToolVerbosity::Verbose => ToolVerbosity::Verbose,
+            ToolVerbosity::Activity | ToolVerbosity::Compact => ToolVerbosity::Compact,
+        };
+        for cell in &self.cells {
+            let Ok(guard) = cell.lock() else {
+                lines.push(Line::from(Span::styled(
+                    "⚠ Werkzeugzelle nicht lesbar (Sperre vergiftet)",
+                    style::warning_style(theme),
+                )));
+                continue;
+            };
+            lines.extend(guard.display_lines_with(width, theme, child_verbosity));
+        }
+    }
+
+    /// Rendert eine [`ToolGroupKind::Activity`]-Gruppe (PL-97 M3).
+    ///
+    /// Mit höchstens einer Zelle unverändert diese Zelle (dieselben Zeilen
+    /// wie ohne Gruppe); sonst die kompakte Zeile aus dem Reducer-Stand,
+    /// ausgeklappt gefolgt von den einzelnen Aufrufen.
+    fn activity_lines(
+        &self,
+        projection: &ActivityProjection,
+        expanded: bool,
+        width: u16,
+        theme: style::Theme,
+        verbosity: ToolVerbosity,
+    ) -> Vec<Line<'static>> {
+        if self.cells.len() == 1
+            && let Some(cell) = self.cells.first()
+        {
+            return match cell.lock() {
+                Ok(guard) => guard.render_lines(width, theme, verbosity, guard.expanded || expanded),
+                Err(_) => vec![Line::from(Span::styled(
+                    "⚠ Werkzeugzelle nicht lesbar (Sperre vergiftet)",
+                    style::warning_style(theme),
+                ))],
+            };
+        }
+
+        let instance = &projection.instance;
+        let counts = instance.state.counts;
+        let any_cell_running = self.cells.iter().any(|cell| {
+            cell.lock()
+                .map(|guard| guard.state == ToolState::Running)
+                .unwrap_or(true)
+        });
+        let (glyph, glyph_style) = if counts.failed > 0 {
+            ("✗ ", style::error_style(theme))
+        } else if counts.running > 0 || any_cell_running {
+            ("● ", style::dim_style(theme))
+        } else {
+            ("● ", style::success_style(theme))
+        };
+        let tail = activity_tail(instance);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_header_line(
+            &mut lines,
+            HeaderPart {
+                text: glyph,
+                style: glyph_style,
+            },
+            HeaderPart {
+                text: &projection.title,
+                style: Style::default().add_modifier(Modifier::BOLD),
+            },
+            HeaderPart {
+                text: &tail,
+                style: style::dim_style(theme),
+            },
+            width,
+        );
+        if counts.failed > 0 && verbosity != ToolVerbosity::Activity {
+            push_indented_wrapped(
+                &mut lines,
+                &format!("{} fehlgeschlagen", counts.failed),
+                width,
+                TOOL_RESULT_LEAD,
+                style::error_style(theme),
+            );
+        }
+        if expanded {
+            self.push_cells(&mut lines, width, theme, verbosity);
+        }
+        lines
+    }
+}
+
+/// Anhang der kompakten Zeile einer Reducer-Projektion (PL-97 M3, PL-71/03):
+/// - `file-edit-read-loop@1`: ` · Edit ×1 · Read ×3` (Verben in der
+///   Reihenfolge ihres ersten Auftretens, ein Fehlschlag als ` ✗n` am Verb),
+///   dazu ` · N läuft`, solange Aufrufe laufen;
+/// - `job-lifecycle@1`: ` · <Zustand> · status ×2 · logs ×1` (ohne `start`
+///   und den Lauf selbst, die Titel bzw. Zustand stellen).
+fn activity_tail(instance: &PatternInstance) -> String {
+    let is_job = instance.pattern == PatternId::JOB_LIFECYCLE;
+    let mut parts: Vec<String> = Vec::new();
+    if is_job {
+        parts.push(job_phase_text(instance).to_owned());
+    }
+    for tally in &instance.state.verbs {
+        let verb = tally.verb.as_ref();
+        if is_job && matches!(verb, "start" | "run") {
+            continue;
+        }
+        let shown = if is_job {
+            verb.to_owned()
+        } else {
+            capitalize(verb)
+        };
+        let mut part = format!("{shown} ×{}", tally.counts.total);
+        if tally.counts.failed > 0 {
+            part.push_str(&format!(" ✗{}", tally.counts.failed));
+        }
+        parts.push(part);
+    }
+    if !is_job && instance.state.counts.running > 0 {
+        parts.push(format!("{} läuft", instance.state.counts.running));
+    }
+    parts
+        .iter()
+        .map(|part| format!(" · {part}"))
+        .collect::<String>()
+}
+
+/// Zustand eines Jobs aus seiner Lauf-Konstituente (`run`, nach dem Rebase
+/// `Call(C) → Job(W)`); vor der Bindung `startet` bzw. `nicht gestartet`.
+fn job_phase_text(instance: &PatternInstance) -> &'static str {
+    let run = instance
+        .state
+        .members
+        .iter()
+        .find(|member| member.verb == "run");
+    match run.map(|member| &member.status) {
+        Some(ConstituentStatus::Running) => "läuft",
+        Some(ConstituentStatus::Succeeded) => "beendet",
+        Some(ConstituentStatus::Failed { .. }) => "fehlgeschlagen",
+        Some(ConstituentStatus::Cancelled) => "gestoppt",
+        None if instance.is_terminal() => "nicht gestartet",
+        None => "startet",
+    }
+}
+
+/// `edit` → `Edit` (erstes Zeichen groß, der Rest unverändert).
+fn capitalize(verb: &str) -> String {
+    let mut chars = verb.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// Ergebnis von [`ToolGroupCell::tally`]: Zählung je Kategorie und Status.
 #[derive(Debug, Default, Clone, Copy)]
 struct ToolGroupTally {
-    /// Zahl der `fs.read`-/`doc.read_pdf`-Zellen.
+    /// Zahl der lesenden Zellen (Verb `read`: `fs.read`, `doc.read_pdf`).
     read: usize,
-    /// Zahl der `fs.search`/`fs.grep`-Zellen.
+    /// Zahl der suchenden Zellen (Verb `search`/`grep`).
     search: usize,
-    /// Zahl der `fs.list`/`fs.glob`-Zellen.
+    /// Zahl der listenden Zellen (Verb `list`/`glob`).
     list: usize,
+    /// Zahl der übrigen beobachtenden Zellen (anderes Verb).
+    other: usize,
     /// Zahl der Zellen mit `state == Failed`.
     failed: usize,
     /// Zahl der Zellen mit `state == Running` (plus vergiftete Locks).

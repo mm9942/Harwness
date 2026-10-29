@@ -77,6 +77,8 @@ pub mod permissions_view;
 pub(crate) mod plan_dialog;
 // Runde 5, Teil P: Goal-Marke der Statuszeile und Goal-/Schritt-Verlaufszeilen.
 pub(crate) mod goal_marker;
+// PL-97 R1: Renderer der Reasoning-Zellen (Kopfzeile + Markdown-Körper).
+pub(crate) mod reasoning_cell;
 mod registry;
 pub mod relative_time;
 pub(crate) mod runtime_commands;

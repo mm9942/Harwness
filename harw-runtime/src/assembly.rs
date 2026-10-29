@@ -855,6 +855,21 @@ fn skill_catalog_fragment(index: &harw_catalog::SkillIndex, l0_bytes: usize) -> 
     text
 }
 
+/// The `security_signals` context source of a root (PL-97 D4): the findings
+/// export resolved from the trusted `[dod] export_dir` of `config` and the
+/// harw `home`, through the same resolver as `harw dod` and the `dod.*`
+/// tools. Counts from a configured `export_dir` are marked unverified in
+/// the fragment (`ExportSource::Override`).
+fn security_signals_provider(
+    home: &Path,
+    config: &ResolvedConfig,
+) -> crate::security_signals::SecuritySignalsContextProvider {
+    crate::security_signals::SecuritySignalsContextProvider::with_export_dir(
+        home,
+        config.dod.export_dir.as_deref(),
+    )
+}
+
 /// Das Kontextprogramm der Wurzel-IR, geprüft gegen die Wurzeldecke
 /// (#22 Welle 1B).
 ///
@@ -3410,12 +3425,12 @@ impl RuntimeAssemblyBuilder {
         };
 
         // 12c2. Sicherheits-Signale (`[memory] security_signals`, Standard aus):
-        //       nur Zähler aus dem DoD-Export, Evidenz, nie Anweisung.
+        //       nur Zähler aus dem DoD-Export, Evidenz, nie Anweisung. Ein
+        //       gesetztes `[dod] export_dir` erreicht die Quelle (PL-97 D4) und
+        //       bleibt dort als unverifiziert markiert.
         let registry_builder = if config.harness.memory.security_signals {
             registry_builder
-                .context_provider(Arc::new(
-                    crate::security_signals::SecuritySignalsContextProvider::new(&spec.home),
-                ))
+                .context_provider(Arc::new(security_signals_provider(&spec.home, &config)))
                 .map_err(|error| RuntimeError::Registry {
                     detail: format!("could not register the security signals provider: {error}"),
                 })?

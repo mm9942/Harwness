@@ -1431,25 +1431,20 @@ specialization = "fake-lead"
                 .chain(matrix_tools_for_role(name).iter().copied())
                 .chain(skill_catalog_tools_for_role(name).iter().copied())
                 .chain(job_control_tools_for_role(name).iter().copied())
+                // PL-97 D4: die lesenden `dod.*` der Triage-Rollen, montiert
+                // vom rollengebundenen Provider in `harw-runtime/src/children.rs`.
+                .chain(dod_tools_for_role(name).iter().copied())
                 .collect();
             let granted = crate::authority::permissions_of(&surface);
             let manifest = &ir.permissions;
-            // PL-97 D3, offene Lücke (Eigentümer: Runtime): die Triage-Rollen
-            // admittieren die lesenden `dod.*`, aber `harw-runtime/src/
-            // children.rs` montiert sie noch nicht — sie zählen deshalb nicht
-            // zur Oberfläche. Ausdrückliche Ausnahme, die kein Recht trägt.
-            let unserved_dod = dod_tools_for_role(name);
             assert!(
-                crate::authority::permissions_of(unserved_dod)
+                crate::authority::permissions_of(dod_tools_for_role(name))
                     .iter()
                     .next()
                     .is_none(),
                 "{name}: dod.* darf kein Sandbox-Recht tragen"
             );
             for tool in &manifest.tools {
-                if unserved_dod.contains(&tool.as_str()) {
-                    continue;
-                }
                 assert!(
                     surface.contains(&tool.as_str()),
                     "{name}: Manifest-Werkzeug {tool} fehlt in {profile:?}"

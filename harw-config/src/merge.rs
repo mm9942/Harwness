@@ -1000,6 +1000,15 @@ fn merge_tui(
         "tui.goal_mode",
         layer_path,
     );
+    // PL-97 R1: `[tui] reasoning` (rein darstellend, `ProfileReplaces`).
+    profile_replaces(
+        &mut trusted.tui.reasoning,
+        incoming.reasoning,
+        present("reasoning"),
+        role,
+        "tui.reasoning",
+        layer_path,
+    );
 }
 
 // `[session]` (Abschnitt 1.4) — `retention_days` ist `MinBound`
@@ -3268,6 +3277,48 @@ mod tests {
             trusted.tui.goal_mode,
             "nicht vertrautes Projekt bleibt wirkungslos"
         );
+        Ok(())
+    }
+
+    // [tui] reasoning (PL-97 R1): ProfileReplaces; Vorgabe `message`, ein
+    // nicht vertrautes Projekt wird ignoriert.
+    #[test]
+    fn test_tui_reasoning_profile_replaces() -> TestResult {
+        use crate::harness_config::ReasoningDisplayMode;
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.tui.reasoning, ReasoningDisplayMode::Message);
+
+        let collapsed = "[tui]\nreasoning = \"collapsed\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(collapsed).map_err(ctx("parse collapsed"))?,
+            &raw_from(collapsed)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.reasoning, ReasoningDisplayMode::Collapsed);
+
+        let hidden = "[tui]\nreasoning = \"hidden\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(hidden).map_err(ctx("parse hidden"))?,
+            &raw_from(hidden)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.tui.reasoning,
+            ReasoningDisplayMode::Collapsed,
+            "nicht vertrautes Projekt bleibt wirkungslos"
+        );
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(hidden).map_err(ctx("parse hidden"))?,
+            &raw_from(hidden)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.reasoning, ReasoningDisplayMode::Hidden);
         Ok(())
     }
 

@@ -972,6 +972,70 @@ pub fn provider_tool_tables() -> [(&'static [&'static str], &'static [Option<&'s
     ]
 }
 
+/// `(TOOL_NAMES, TOOL_ACTIVITIES)` of every provider that carries activity
+/// metadata (PL-97 M3, PL-71): the `tool_provider!` providers of
+/// [`provider_tool_tables`], in the same order, plus the hand-written
+/// [`FsToolProvider`], whose `TOOL_ACTIVITIES` has the same shape.
+///
+/// # Why here
+/// Like `TOOL_SKILLS`, `TOOL_ACTIVITIES` is an inherent const of the concrete
+/// provider type and does not survive `Arc<dyn ToolProvider>`; this function
+/// names the types where [`profile_tool_providers`] constructs them. It is
+/// the source of [`crate::activity_map::activity_for`]; a drift test checks
+/// that it lists exactly the providers of [`provider_tool_tables`] plus
+/// `FsToolProvider`. The two tables of a row are index-aligned. Descriptors
+/// are descriptive only: never a permission, never part of a [`ToolSpec`].
+#[must_use]
+pub fn provider_tool_activity_tables() -> [(
+    &'static [&'static str],
+    &'static [Option<harw_tools::ActivityDescriptor>],
+); 15] {
+    [
+        (DocToolProvider::TOOL_NAMES, DocToolProvider::TOOL_ACTIVITIES),
+        (
+            ExplorerToolProvider::TOOL_NAMES,
+            ExplorerToolProvider::TOOL_ACTIVITIES,
+        ),
+        (DepsToolProvider::TOOL_NAMES, DepsToolProvider::TOOL_ACTIVITIES),
+        (LensToolProvider::TOOL_NAMES, LensToolProvider::TOOL_ACTIVITIES),
+        (WebToolProvider::TOOL_NAMES, WebToolProvider::TOOL_ACTIVITIES),
+        (
+            ShellToolProvider::TOOL_NAMES,
+            ShellToolProvider::TOOL_ACTIVITIES,
+        ),
+        (
+            LatexToolProvider::TOOL_NAMES,
+            LatexToolProvider::TOOL_ACTIVITIES,
+        ),
+        (
+            ProcessToolProvider::TOOL_NAMES,
+            ProcessToolProvider::TOOL_ACTIVITIES,
+        ),
+        (
+            harw_tool_obsidian::ObsidianToolProvider::TOOL_NAMES,
+            harw_tool_obsidian::ObsidianToolProvider::TOOL_ACTIVITIES,
+        ),
+        (
+            FsreadToolProvider::TOOL_NAMES,
+            FsreadToolProvider::TOOL_ACTIVITIES,
+        ),
+        (
+            GitReadToolProvider::TOOL_NAMES,
+            GitReadToolProvider::TOOL_ACTIVITIES,
+        ),
+        (SysToolProvider::TOOL_NAMES, SysToolProvider::TOOL_ACTIVITIES),
+        (
+            CargoToolProvider::TOOL_NAMES,
+            CargoToolProvider::TOOL_ACTIVITIES,
+        ),
+        (
+            harw_tool_job::JobToolProvider::TOOL_NAMES,
+            harw_tool_job::JobToolProvider::TOOL_ACTIVITIES,
+        ),
+        (FsToolProvider::TOOL_NAMES, FsToolProvider::TOOL_ACTIVITIES),
+    ]
+}
+
 /// The real [`ToolSpec`]s of the tools the composition root adds beside the
 /// profile registries whose providers need no session state, one per name,
 /// sorted by name (PL-97 B2: summaries in `tool.index` and `harw tool`, the

@@ -386,6 +386,19 @@ static BUNDLED_FILES: &[BundledFile] = &[
         relative_path: "skills/function-signature-design/skill.toml",
         contents: include_str!("../assets/skills/function-signature-design/skill.toml"),
     },
+    // PL-97 D4: Harw-DoD-Lese-Skill der Werkzeuge `dod.*` samt Triggern.
+    BundledFile {
+        relative_path: "skills/harw-dod/instructions.md",
+        contents: include_str!("../assets/skills/harw-dod/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/harw-dod/skill.toml",
+        contents: include_str!("../assets/skills/harw-dod/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/harw-dod/triggers.toml",
+        contents: include_str!("../assets/skills/harw-dod/triggers.toml"),
+    },
     BundledFile {
         relative_path: "skills/implementation/instructions.md",
         contents: include_str!("../assets/skills/implementation/instructions.md"),
@@ -1282,7 +1295,8 @@ mod tests {
         // Plan R9, Teil D: +10 Methoden-Skills der Analyse-Familie.
         // Plan R9, Web-Recherche: +`osint-web-research`.
         // PL-97 B4: +4 Nutzungs-Skills der Kommando-Werkzeuge (PL-93).
-        assert_eq!(skills, 79, "das Bundle liefert 79 Skills");
+        // PL-97 D4: +`harw-dod`.
+        assert_eq!(skills, 80, "das Bundle liefert 80 Skills");
         Ok(())
     }
 
