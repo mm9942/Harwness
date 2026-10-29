@@ -10,7 +10,7 @@ No upstream branch was rewritten and this consolidation has not been pushed.
 | Merged dev baseline | `fcb12b41f5e53c19cc20607a63c98b829452b505` | Common ancestor |
 | Local coding-scope WIP | `56cab4d1` | Preserved |
 | Frozen local workflow, lifetime, checkpoint and callback changes | `5c3480dc` | Snapshot commit, including previously untracked files |
-| PR #154 PL-97 implementation | `ea690e9203ab630388d54c7454612b615dcccc7c` | Merged |
+| PR #154 PL-97 implementation (snapshot) | `ea690e9203ab630388d54c7454612b615dcccc7c` | Used as base; PR #154 is still an open draft |
 | PR #156 security review fixes | `22b0a27557cc41b22f0789b4a691d770a1485605` | Merged |
 | Codex unknown export / Warden state fix | `5bb503bcf65cf7e07bd8b4cf69f66e61d713be92` | Cherry-picked |
 | Codex consumer provenance propagation | `3983e115cd12541d9eb52170cdcb8fca8c01ee39` | Cherry-picked |
@@ -154,7 +154,7 @@ Verified corrections discovered during integration:
   prevents cancellation of the outer future from prematurely dropping the
   dispatch lifetime. The guard grants no permission and does not establish
   quiescence for unrelated remote/process effects.
-- The combined configuration table contains 202 entries / 103 ProfileReplaces;
+- The combined configuration table contains 203 entries / 104 ProfileReplaces;
   the base operation registry contains 53 operations, not the independently
   updated counts from either upstream branch.
 - A #157 host summary call needed explicit MutexGuard dereferencing to compile.

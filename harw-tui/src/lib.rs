@@ -36,6 +36,8 @@ pub(crate) mod command_popup;
 mod image_attach;
 // Gemeinsames Dialog-Layout: angeheftete Optionen, scrollbarer Körper.
 pub(crate) mod dialog_frame;
+// PL-97 D5: Harw-DoD-Ansicht (`/dod view`) und DoD-Marke der Statuszeile.
+pub(crate) mod dod_view;
 mod error;
 pub(crate) mod events;
 pub(crate) mod explorer_panel;
@@ -45,6 +47,8 @@ pub mod export;
 pub mod fixed_agent;
 pub(crate) mod frame_requester;
 pub mod gateway;
+// PL-97 C4b: fester Not-Aus (2× Ctrl+C) und seine Prozessbaum-Rückfallebene.
+pub(crate) mod hard_kill;
 pub(crate) mod help_overlay;
 pub(crate) mod history_cell;
 pub mod host_permit_dialog;
@@ -75,8 +79,11 @@ pub(crate) mod panes;
 pub mod permissions_view;
 // Runde 5, Teil F: Plan-Freigabe (`plan.exit`), Plan-Vorschlag (`plan.enter`), `/plan …`.
 pub(crate) mod plan_dialog;
+pub(crate) mod process_tree;
 // Runde 5, Teil P: Goal-Marke der Statuszeile und Goal-/Schritt-Verlaufszeilen.
 pub(crate) mod goal_marker;
+// PL-97 R1: Renderer der Reasoning-Zellen (Kopfzeile + Markdown-Körper).
+pub(crate) mod reasoning_cell;
 mod registry;
 pub mod relative_time;
 pub(crate) mod runtime_commands;

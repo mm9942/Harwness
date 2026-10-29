@@ -43,6 +43,10 @@ use crate::style::{self, Theme};
 /// Seitensprung für `Bild↑`/`Bild↓`.
 const PAGE: isize = 10;
 
+/// Hilfetext des TUI-lokalen Unterbefehls `/dod view` (PL-97 D5).
+const DOD_VIEW_SUMMARY: &str =
+    "Harw-DoD-Ansicht: Units, Sensoren, letzte Befunde (lokal, nur lesend)";
+
 /// Fußzeile des Reiters „Befehle“.
 const FOOTER_COMMANDS: &str = "Tab Reiter · j/k wählen · Enter vorbelegen · Esc schließen";
 
@@ -328,6 +332,17 @@ impl HelpOverlay {
                 .then_with(|| left.name.cmp(&right.name))
         });
         commands.dedup_by(|left, right| left.name == right.name);
+        // PL-97 D5: `/dod view` ist TUI-lokal (Harw-DoD-Ansicht) und steht
+        // deshalb nicht in den Unterbefehlen der `dod`-Operation.
+        if let Some(dod) = commands.iter_mut().find(|entry| entry.name == "dod")
+            && !dod.subcommands.iter().any(|(name, _, _)| name == "view")
+        {
+            dod.subcommands.push((
+                "view".to_owned(),
+                String::new(),
+                DOD_VIEW_SUMMARY.to_owned(),
+            ));
+        }
 
         let mut keys: Vec<(String, String)> = keys
             .describe()
@@ -687,6 +702,38 @@ mod tests {
 
     fn overlay(tab: HelpTab) -> TestResult<HelpOverlay> {
         Ok(HelpOverlay::new(&registry()?, &KeyBindings::default(), tab))
+    }
+
+    /// PL-97 D5: die Hilfe nennt `/dod view` unter `/dod`.
+    #[test]
+    fn dod_help_lists_the_local_view_subcommand() -> TestResult {
+        let dod = CommandSpec::new(
+            "dod",
+            Vec::<String>::new(),
+            CommandScope::TuiOnly,
+            PermissionTier::Operator,
+            OutputSurface::Inline,
+            CommandDomain::Security,
+        )
+        .map_err(ctx("dod spec"))?
+        .with_help("Harw-DoD", "/dod [status]", &[]);
+        let help = HelpOverlay::new(
+            &CommandRegistry::new(vec![dod]),
+            &KeyBindings::default(),
+            HelpTab::Commands,
+        );
+        let entry = help
+            .commands
+            .iter()
+            .find(|entry| entry.name == "dod")
+            .ok_or(crate::test_support::TestError::Missing("dod entry"))?;
+        assert!(
+            entry
+                .subcommands
+                .iter()
+                .any(|(name, _, summary)| name == "view" && summary == DOD_VIEW_SUMMARY)
+        );
+        Ok(())
     }
 
     #[test]

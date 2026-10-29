@@ -658,6 +658,11 @@ pub struct TuiSection {
     /// Projektion des Goal-/Planstands ein (Vorgabe: aus).
     #[serde(default)]
     pub goal_mode: bool,
+    /// PL-97 R1: wie Reasoning-Zusammenfassungen des Modells im Verlauf
+    /// erscheinen — als lesbarer Nachrichtenblock (`message`, Vorgabe),
+    /// eingeklappt auf eine Zeile (`collapsed`) oder gar nicht (`hidden`).
+    #[serde(default)]
+    pub reasoning: ReasoningDisplayMode,
 }
 
 impl Default for TuiSection {
@@ -668,6 +673,43 @@ impl Default for TuiSection {
             child_stream: ChildStreamModeToml::default(),
             status_expiry: StatusExpiryMode::default(),
             goal_mode: false,
+            reasoning: ReasoningDisplayMode::default(),
+        }
+    }
+}
+
+/// `[tui] reasoning` — Darstellung der Reasoning-Zusammenfassungen im
+/// Verlauf (PL-97 R1).
+///
+/// # Beschreibung
+/// - `"message"` (Vorgabe): ausgeklappter, als Markdown gerenderter Block
+///   mit Kopfzeile `∴ Reasoning`; Ctrl+O klappt ihn ein.
+/// - `"collapsed"`: nur Kopfzeile plus erste Zeile; Ctrl+O klappt ihn aus.
+/// - `"hidden"`: keine Verlaufszelle und kein Live-Reasoning; der Export
+///   zeichnet die Zusammenfassung weiterhin auf.
+///
+/// Rein darstellend, kein Sicherheitsfeld: der Block zeigt nur, was das
+/// Modell ohnehin als Turn-Ereignis meldet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningDisplayMode {
+    /// Lesbarer Nachrichtenblock, ausgeklappt (Vorgabe).
+    #[default]
+    Message,
+    /// Eingeklappt auf Kopfzeile plus erste Zeile.
+    Collapsed,
+    /// Keine Verlaufszelle.
+    Hidden,
+}
+
+impl ReasoningDisplayMode {
+    /// Konfigurationswert als Text (`message`, `collapsed`, `hidden`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Collapsed => "collapsed",
+            Self::Hidden => "hidden",
         }
     }
 }
@@ -876,6 +918,31 @@ mod tests {
             TuiSection::default().status_expiry,
             StatusExpiryMode::Consolidate
         );
+    }
+
+    /// PL-97 R1: `[tui] reasoning` hat die Vorgabe `message`, parst die
+    /// drei Werte und weist einen unbekannten Wert ab.
+    #[test]
+    fn test_tui_reasoning_defaults_to_message_and_parses_modes() -> TestResult {
+        assert_eq!(
+            TuiSection::default().reasoning,
+            ReasoningDisplayMode::Message
+        );
+        for (value, expected) in [
+            ("message", ReasoningDisplayMode::Message),
+            ("collapsed", ReasoningDisplayMode::Collapsed),
+            ("hidden", ReasoningDisplayMode::Hidden),
+        ] {
+            let src = format!(
+                "default_provider = \"anthropic\"\ndefault_model = \"m\"\n[tui]\nreasoning = \"{value}\"\n"
+            );
+            let cfg: HarnessConfig = toml::from_str(&src).map_err(ctx("parse tui.reasoning"))?;
+            assert_eq!(cfg.tui.reasoning, expected);
+            assert_eq!(expected.as_str(), value);
+        }
+        let bogus = "default_provider = \"anthropic\"\n[tui]\nreasoning = \"inline\"\n";
+        assert!(toml::from_str::<HarnessConfig>(bogus).is_err());
+        Ok(())
     }
 
     #[test]

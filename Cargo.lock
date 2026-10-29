@@ -4940,6 +4940,7 @@ name = "harw-tui"
 version = "0.9.1"
 dependencies = [
  "crossterm 0.29.0",
+ "harw-activity",
  "harw-agent-artifact",
  "harw-agent-dsl",
  "harw-authority",
@@ -4976,6 +4977,7 @@ dependencies = [
  "harw-types",
  "jiff",
  "ratatui",
+ "rustix 1.1.5",
  "secrecy 0.8.0",
  "serde_json",
  "tempfile",

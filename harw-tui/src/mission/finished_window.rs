@@ -29,12 +29,31 @@ use super::projection::{
     ConstituentKind, TerminalBadge, TerminalConstituent, TerminalOutcome, TerminalRow,
     counted_totals,
 };
+use crate::dod_view::DodMark;
 use crate::overlay_view::{OverlayOutcome, OverlayView, is_down, is_up, plain, render_panel};
 use crate::status_line::{display_width, fit_width};
 use crate::style::{self, Theme};
 
 /// Title of the window.
 pub(crate) const FINISHED_TITLE: &str = "FINISHED / FAILED";
+
+/// Title suffix of the window while Harw-DoD reports high/critical findings
+/// in its summary window (PL-97 D5): ` · ⛨ DoD 2`, ` · ⛨ DoD ≥ 2` for a
+/// lower bound, `unverified` appended for an unverified export source.
+/// `None` without such findings (or without Harw-DoD).
+#[must_use]
+pub(crate) fn dod_suffix(mark: Option<DodMark>) -> Option<String> {
+    let mark = mark.filter(|mark| mark.is_alert())?;
+    let unverified = if mark.verified { "" } else { " unverified" };
+    Some(format!(" · ⛨ DoD {}{unverified}", mark.count_text()))
+}
+
+/// The [`dod_suffix`] as a styled header span.
+fn dod_span(mark: Option<DodMark>, theme: Theme) -> Option<Span<'static>> {
+    let text = dod_suffix(mark)?;
+    let mark = mark?;
+    Some(Span::styled(text, crate::dod_view::mark_style(mark, theme)))
+}
 
 /// Text of a strip without any finished run.
 const NOTHING_FINISHED: &str = "none yet";
@@ -69,6 +88,57 @@ pub(crate) fn row_keys(rows: &[TerminalRow]) -> Vec<&str> {
 pub(crate) fn selected_row<'a>(rows: &'a [TerminalRow], ui: &WindowUi) -> Option<&'a TerminalRow> {
     let keys = row_keys(rows);
     rows.get(ui.selected(&keys))
+}
+
+/// One `agent-role-failure-burst@1` projection of the activity reducer as
+/// the unseen-failure badge sees it (PL-97 M3, PL-71): failed child runs of
+/// one role, summed over the bursts of that role
+/// (`crate::app::activity_glue::ActivityGlue::failure_badges`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FailureBurstBadge {
+    /// Terminal-safe role, spelled like the label of its
+    /// [`super::projection::TerminalCategory::Role`] row.
+    pub(crate) role: String,
+    /// Failure bursts of the role (one per parent and failure class).
+    pub(crate) bursts: usize,
+    /// Failed runs the bursts cover (every run, earlier runs of an agent
+    /// included).
+    pub(crate) failed: usize,
+    /// Of these: the current run of its agent (what the role's row counts
+    /// as failed).
+    pub(crate) current_failed: usize,
+    /// Of these: not acknowledged yet.
+    pub(crate) unseen: usize,
+}
+
+/// Badge source of the Finished / Failed window (PL-97 M3): the
+/// `agent-role-failure-burst@1` projections back the unseen-failure badge
+/// (`✗n NEW`) of every agent-role row.
+///
+/// The bursts are the source: a row's unseen failures are the unseen runs
+/// its bursts cover. Only for the failed runs no burst covers (not reduced
+/// yet, or evicted with their burst: `row.failed - current_failed`) the row's
+/// own count is kept, at most one per uncovered run, so such a run stays NEW
+/// (fail visible). Rows without a badge and rows of other categories (jobs)
+/// are left alone.
+pub(crate) fn apply_failure_bursts(rows: &mut [TerminalRow], badges: &[FailureBurstBadge]) {
+    for row in rows.iter_mut() {
+        let super::projection::TerminalCategory::Role(role) = &row.category else {
+            continue;
+        };
+        let mut covered = false;
+        let (mut unseen, mut current_failed) = (0usize, 0usize);
+        for badge in badges.iter().filter(|badge| badge.role == *role) {
+            covered = true;
+            unseen = unseen.saturating_add(badge.unseen);
+            current_failed = current_failed.saturating_add(badge.current_failed);
+        }
+        if !covered {
+            continue;
+        }
+        let uncovered = row.failed.saturating_sub(current_failed);
+        row.unseen_failures = unseen.saturating_add(row.unseen_failures.min(uncovered));
+    }
 }
 
 /// Compact text of one category: `uia-worker ×3 ✓2 ✗1 ⊘1 NEW`; with only
@@ -179,7 +249,9 @@ fn clip(line: Line<'static>, width: usize) -> Line<'static> {
 }
 
 /// Draws the window: the header rule in the first row, the category rows
-/// below it when `area` has more than one row.
+/// below it when `area` has more than one row. `dod` adds the
+/// [`dod_suffix`] right after the title (before the counts, so narrow
+/// strips cut the counts first).
 pub(crate) fn render(
     rows: &[TerminalRow],
     area: Rect,
@@ -187,6 +259,7 @@ pub(crate) fn render(
     theme: Theme,
     ui: &WindowUi,
     focused: bool,
+    dod: Option<DodMark>,
 ) {
     let area = area.intersection(buf.area);
     if area.width == 0 || area.height == 0 {
@@ -197,7 +270,7 @@ pub(crate) fn render(
     let header_area = Rect { height: 1, ..area };
     if area.height == 1 {
         // Eingeklappt: alle Kategorien in der Kopfzeile.
-        let mut detail = Vec::new();
+        let mut detail: Vec<Span<'static>> = dod_span(dod, theme).into_iter().collect();
         if rows.is_empty() {
             detail.push(Span::styled(format!(" · {NOTHING_FINISHED}"), dim));
         }
@@ -212,10 +285,15 @@ pub(crate) fn render(
     // Die Zeile „Agent child (pending)“ zählt nie mit (sie gehört später
     // zu ihrem Lauf).
     let (ok, failed) = counted_totals(rows);
-    let detail = vec![
-        Span::styled(format!(" · ✓ {ok}"), style::success_style(theme)),
-        Span::styled(format!(" · ✗ {failed}"), style::error_style(theme)),
-    ];
+    let mut detail: Vec<Span<'static>> = dod_span(dod, theme).into_iter().collect();
+    detail.push(Span::styled(
+        format!(" · ✓ {ok}"),
+        style::success_style(theme),
+    ));
+    detail.push(Span::styled(
+        format!(" · ✗ {failed}"),
+        style::error_style(theme),
+    ));
     Paragraph::new(header_line(detail, width, theme, focused)).render(header_area, buf);
 
     let body = Rect {
@@ -429,6 +507,35 @@ mod tests {
         }
     }
 
+    /// PL-97 M3: die Bursts sind die Quelle des NEW-Abzeichens; nur nicht
+    /// abgedeckte Fehlschläge behalten die Zählung der Zeile.
+    #[test]
+    fn failure_bursts_are_the_source_of_the_unseen_badge() {
+        let badge = |unseen, current_failed| FailureBurstBadge {
+            role: "uia-writer".to_owned(),
+            bursts: 1,
+            failed: current_failed,
+            current_failed,
+            unseen,
+        };
+        // Alle drei Fehlschläge abgedeckt: die Bursts entscheiden.
+        let mut rows = vec![row("uia-writer", 0, 3, 2)];
+        apply_failure_bursts(&mut rows, &[badge(1, 3)]);
+        assert_eq!(rows[0].unseen_failures, 1);
+        // Ein Burst deckt einen Fehlschlag, den die Zeile noch nicht zählt.
+        let mut rows = vec![row("uia-writer", 0, 3, 2)];
+        apply_failure_bursts(&mut rows, &[badge(3, 3)]);
+        assert_eq!(rows[0].unseen_failures, 3);
+        // Ein nicht abgedeckter Fehlschlag bleibt NEW (fail visible).
+        let mut rows = vec![row("uia-writer", 0, 3, 2)];
+        apply_failure_bursts(&mut rows, &[badge(1, 2)]);
+        assert_eq!(rows[0].unseen_failures, 2);
+        // Ohne Burst der Rolle bleibt die Zeile unverändert.
+        let mut rows = vec![row("uia-writer", 0, 3, 2), row("other", 1, 1, 1)];
+        apply_failure_bursts(&mut rows, &[]);
+        assert_eq!((rows[0].unseen_failures, rows[1].unseen_failures), (2, 1));
+    }
+
     fn screen(
         rows: &[TerminalRow],
         width: u16,
@@ -442,7 +549,15 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render(rows, area, frame.buffer_mut(), Theme::Dark, ui, focused);
+                render(
+                    rows,
+                    area,
+                    frame.buffer_mut(),
+                    Theme::Dark,
+                    ui,
+                    focused,
+                    None,
+                );
             })
             .map_err(ctx("draw"))?;
         let buffer = terminal.backend().buffer();
@@ -453,6 +568,54 @@ mod tests {
                     .collect::<String>()
             })
             .collect())
+    }
+
+    /// PL-97 D5: mit hohen/kritischen DoD-Befunden trägt der Titel
+    /// `· ⛨ DoD n` direkt hinter „FINISHED / FAILED“; ohne Befunde nichts.
+    #[test]
+    fn dod_suffix_follows_the_title_when_high_findings_exist() -> TestResult {
+        let mark = |count, lower_bound, verified| DodMark {
+            count,
+            lower_bound,
+            verified,
+        };
+        assert_eq!(dod_suffix(None), None);
+        assert_eq!(dod_suffix(Some(mark(0, false, true))), None);
+        assert_eq!(
+            dod_suffix(Some(mark(2, false, true))).as_deref(),
+            Some(" · ⛨ DoD 2")
+        );
+        assert_eq!(
+            dod_suffix(Some(mark(2, true, false))).as_deref(),
+            Some(" · ⛨ DoD ≥ 2 unverified")
+        );
+        let rows = vec![row("uia-worker", 2, 1, 1)];
+        for height in [1u16, 4] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, height))
+                    .map_err(ctx("test terminal"))?;
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render(
+                        &rows,
+                        area,
+                        frame.buffer_mut(),
+                        Theme::Dark,
+                        &WindowUi::default(),
+                        false,
+                        Some(mark(2, false, true)),
+                    );
+                })
+                .map_err(ctx("draw"))?;
+            let buffer = terminal.backend().buffer();
+            let header: String = (0..60).map(|x| buffer[(x, 0)].symbol()).collect();
+            assert!(
+                header.starts_with("─ FINISHED / FAILED · ⛨ DoD 2 · "),
+                "height {height}: {header:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

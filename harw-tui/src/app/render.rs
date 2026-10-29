@@ -99,7 +99,13 @@ impl<'a> MissionContent<'a> {
         let source = app.mission.live_source(&app.agent_monitor, now);
         let tool_started = source.and_then(|(live, _)| app.mission.tool_started(live));
         let live = live_window::view(source, tool_started, &app.recency, width, app.theme, now);
-        let finished = projection::terminal_aggregate(&app.agent_monitor, app.agent_monitor.jobs());
+        let mut finished =
+            projection::terminal_aggregate(&app.agent_monitor, app.agent_monitor.jobs());
+        // PL-97 M3: die Fehlschlag-Bursts des Reducers speisen das NEW-Abzeichen.
+        finished_window::apply_failure_bursts(
+            &mut finished,
+            &app.activity.failure_badges(&app.agent_monitor),
+        );
         Self {
             source,
             tool_started,
@@ -336,6 +342,7 @@ fn compose_portrait(
             theme,
             &app.mission.finished,
             focus == PaneFocus::Finished,
+            app.dod_mark.visible(),
         );
     }
     if let Some(live_area) = areas.live {
@@ -438,6 +445,7 @@ fn compose_columns(
                 theme,
                 &app.mission.finished,
                 focus == PaneFocus::Finished,
+                app.dod_mark.visible(),
             );
         } else {
             finished_window::render(
@@ -447,6 +455,7 @@ fn compose_columns(
                 theme,
                 &app.mission.finished,
                 focus == PaneFocus::Finished,
+                app.dod_mark.visible(),
             );
         }
     }
@@ -539,6 +548,7 @@ fn render_finished_framed(
     theme: Theme,
     ui: &WindowUi,
     focused: bool,
+    dod: Option<crate::dod_view::DodMark>,
 ) {
     let area = area.intersection(buf.area);
     if area.width < 3 || area.height < 3 {
@@ -556,7 +566,7 @@ fn render_finished_framed(
         height: area.height.saturating_sub(1),
         ..area
     };
-    finished_window::render(rows, content, buf, theme, ui, focused);
+    finished_window::render(rows, content, buf, theme, ui, focused, dod);
 }
 
 /// Finished / Failed totals `(ok, failed)` of the compact counters: like the
