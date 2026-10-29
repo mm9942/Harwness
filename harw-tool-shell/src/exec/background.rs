@@ -47,11 +47,22 @@
 //! `kill_on_drop` ist bewusst `false`: ein vom Nutzer „abgelöster" Job
 //! (`detach`) läuft nach dem Ende von harw weiter. Im Bubblewrap-Pfad endet
 //! der Job trotzdem mit harw (`--die-with-parent`).
+//!
+//! # Sandbox-Kette (PL-97 E2b)
+//! Mit [`crate::job_spec::SandboxExecution::Chain`] (Vorgabe) baut der
+//! Sandbox-Zweig keinen `prlimit … -- bwrap …`-Befehl mehr, sondern
+//! `/bin/sh -c <Befehl>` im Workspace mit leerer Umgebung und dazu eine
+//! [`SandboxedLaunch`] ([`BackgroundLaunch::sandboxed`]): Workspace-Sandbox
+//! und Ressourcen, die die Job-Verwaltung statt eines Host-Jobs an den
+//! Kommando-Port übergibt. Wann der bisherige Weg bleibt oder ein Aufruf
+//! mit Schreibbereich abgelehnt wird, beschreibt [`crate::job_spec`].
 
 use super::{
-    ShellExecArgs, ShellExecError, ShellToolProvider, host_shell_argv, resolve_host_shell, timeouts,
+    CHAIN_SHELL, ShellExecArgs, ShellExecError, ShellToolProvider, host_shell_argv,
+    resolve_host_shell, timeouts,
 };
-use crate::limits::launch_command;
+use crate::job_spec::SandboxedLaunch;
+use crate::limits::{ShellLimitsError, launch_command};
 use harw_authority::Permission;
 use harw_sandbox::BwrapLauncher;
 use harw_tools::{ToolExecutionContext, ToolOutput};
@@ -111,6 +122,8 @@ pub struct BackgroundLaunch {
     /// The environment is exactly what is set on `command` (nothing inherited).
     env_cleared: bool,
     warnings: Vec<String>,
+    /// The chain submission (PL-97 E2b); `None`: `command` runs as a host job.
+    sandboxed: Option<SandboxedLaunch>,
 }
 
 impl BackgroundLaunch {
@@ -134,15 +147,36 @@ impl BackgroundLaunch {
     }
 
     /// Gibt den konfigurierten Befehl heraus (noch nicht gestartet).
+    ///
+    /// PL-97 E2b: Mit einer Übergabe an die Sandbox-Kette ([`Self::sandboxed`])
+    /// darf dieser Befehl nie als Host-Job laufen; dann
+    /// [`Self::into_launch_parts`] verwenden.
     #[must_use]
     pub fn into_command(self) -> TokioCommand {
         self.command
     }
 
-    /// Befehl und Hinweise.
+    /// Befehl und Hinweise (ohne die Übergabe an die Sandbox-Kette, siehe
+    /// [`Self::into_command`]).
     #[must_use]
     pub fn into_parts(self) -> (TokioCommand, Vec<String>) {
         (self.command, self.warnings)
+    }
+
+    /// PL-97 E2b: die Übergabe an die Sandbox-Kette, falls dieser Start sie
+    /// nimmt. Dann ist [`Self::into_command`] nur `/bin/sh -c <Befehl>` im
+    /// Workspace (leere Umgebung); Sandbox und Ressourcen stehen hier, und
+    /// der Aufrufer darf den Befehl nicht als Host-Job starten.
+    #[must_use]
+    pub fn sandboxed(&self) -> Option<&SandboxedLaunch> {
+        self.sandboxed.as_ref()
+    }
+
+    /// Befehl, Hinweise und die Übergabe an die Sandbox-Kette
+    /// ([`Self::sandboxed`]).
+    #[must_use]
+    pub fn into_launch_parts(self) -> (TokioCommand, Vec<String>, Option<SandboxedLaunch>) {
+        (self.command, self.warnings, self.sandboxed)
     }
 }
 
@@ -263,6 +297,84 @@ impl ShellToolProvider {
                 );
                 ToolOutput::error(message)
             })?;
+        // PL-97 E2b, fail-closed: ein Start mit Schreibbereich läuft nie auf
+        // dem Host, auch nicht mit Freigabe.
+        if let Some(message) = executor.host_scope_refusal(effective_host, tool_name) {
+            warn!(
+                session_id,
+                tool_name, "background launch refused: write scope on the host path"
+            );
+            return Err(ToolOutput::error(message));
+        }
+
+        let limits_unavailable = |err: ShellLimitsError| {
+            let err = ShellExecError::ResourceLimits(err);
+            warn!(error = %err, tool_name, "background launch: resource limits unavailable");
+            ToolOutput::error(err.to_string())
+        };
+        let limits = timeouts::limits_for(executor.limits, cpu_budget_secs);
+
+        // PL-97 E2b: Sandbox-Kette, sofern sie nicht schwächer ist als der
+        // bisherige Weg; ein Start mit Schreibbereich ohne Kette läuft nie.
+        // `prlimit` erst danach: das Trampolin setzt die rlimits selbst, ein
+        // fehlendes `prlimit` darf diesen Weg nicht versperren.
+        if !effective_host {
+            let tmpfs_size = executor
+                .resolve_sandbox_limits()
+                .map_err(limits_unavailable)?;
+            let chain = executor
+                .chain_route(sandbox, session_id, tool_name)
+                .map_err(|message| {
+                    warn!(
+                        session_id,
+                        tool_name, "background launch refused: write scope without a sandbox"
+                    );
+                    ToolOutput::error(message)
+                })?;
+            if let Some(backend) = chain {
+                // Reines Bubblewrap: das Job-Runtime stellt sein `prlimit` vor
+                // `bwrap`; dieselbe Prüfung und dieselben Hinweise wie bisher.
+                // Die RLIMIT_NPROC-Identität prüft das Job-Runtime selbst, mit
+                // Blick auf das pids.max der Job-Cgroup (PL-97 E2g).
+                let warnings = if backend.uses_trampoline() {
+                    Vec::new()
+                } else {
+                    let prlimit = executor
+                        .limits
+                        .resolve_prlimit_without_nproc_identity()
+                        .map_err(limits_unavailable)?;
+                    if prlimit.is_none() {
+                        warn!(
+                            tool_name,
+                            "background launch runs WITHOUT rlimits: prlimit missing"
+                        );
+                    }
+                    rlimit_warnings(prlimit.as_deref())
+                };
+                let sandboxed = executor.sandboxed_launch(sandbox, &limits, tmpfs_size, backend);
+                let mut launched = TokioCommand::new(CHAIN_SHELL);
+                launched
+                    .arg("-c")
+                    .arg(command)
+                    .current_dir(sandbox.workspace().canonical_root())
+                    .env_clear()
+                    .stdin(Stdio::null())
+                    .kill_on_drop(false);
+                debug!(
+                    tool_name,
+                    command_len = command.len(),
+                    %backend,
+                    "background launch prepared for the sandbox chain"
+                );
+                return Ok(BackgroundLaunch {
+                    command: launched,
+                    executed_on_host: false,
+                    env_cleared: true,
+                    warnings,
+                    sandboxed: Some(sandboxed),
+                });
+            }
+        }
 
         // Android-Anbindung: auf dem Host-Pfad ist ein fehlendes `prlimit`
         // (Termux paketiert es typischerweise nicht) auf `ExecPlatform::NoSandbox`
@@ -273,11 +385,7 @@ impl ShellToolProvider {
         } else {
             executor.resolve_limits()
         }
-        .map_err(|err| {
-            let err = ShellExecError::ResourceLimits(err);
-            warn!(error = %err, tool_name, "background launch: resource limits unavailable");
-            ToolOutput::error(err.to_string())
-        })?;
+        .map_err(limits_unavailable)?;
         if prlimit.is_none() {
             warn!(
                 tool_name,
@@ -285,7 +393,6 @@ impl ShellToolProvider {
             );
         }
         let warnings = rlimit_warnings(prlimit.as_deref());
-        let limits = timeouts::limits_for(executor.limits, cpu_budget_secs);
 
         let env_cleared = effective_host;
         let mut launched = if effective_host {
@@ -348,6 +455,7 @@ impl ShellToolProvider {
             executed_on_host: effective_host,
             env_cleared,
             warnings,
+            sandboxed: None,
         })
     }
 }
@@ -555,6 +663,238 @@ mod tests {
             return Err(TestError::Unexpected(
                 "caller-passed variable must reach the job".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    /// PL-97 E2b: ein Port, der nur sein Backend meldet.
+    #[derive(Debug)]
+    struct BackendOnly(Option<harw_command::BackendKind>);
+
+    impl harw_command::CommandPort for BackendOnly {
+        fn run(
+            &self,
+            _request: harw_command::CommandRequest,
+            _cancel: harw_types::cancel::CancelToken,
+        ) -> harw_command::RunFuture<'_> {
+            Box::pin(std::future::pending())
+        }
+
+        fn start(&self, _request: harw_command::CommandRequest) -> harw_command::StartFuture<'_> {
+            Box::pin(async { Err("unused".to_owned()) })
+        }
+
+        fn workspace_backend(
+            &self,
+            _profile: harw_command::SandboxProfileName,
+        ) -> Option<harw_command::BackendKind> {
+            self.0
+        }
+    }
+
+    fn chain_provider(backend: Option<harw_command::BackendKind>) -> ShellToolProvider {
+        let mut provider = ShellToolProvider::default()
+            .with_exec_platform(ExecPlatform::Sandboxed)
+            .with_command_port(std::sync::Arc::new(BackendOnly(backend)))
+            .with_execution(crate::job_spec::SandboxExecution::Chain);
+        provider.limits.require_rlimits = false;
+        provider
+    }
+
+    /// PL-97 E2b: `job.start` übergibt `/bin/sh -c <Befehl>` mit
+    /// Workspace-Sandbox und Ressourcen an die Kette, nicht als Host-Job.
+    #[tokio::test]
+    async fn test_background_launch_takes_the_sandbox_chain() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(
+            &tmp,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+        )?;
+        let root = sandbox.workspace().canonical_root().to_path_buf();
+        let context = ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox);
+        let provider = chain_provider(Some(harw_command::BackendKind::Bwrap));
+        let launch = provider
+            .prepare_background_launch(&context, "make test", "job.start", 5)
+            .await
+            .map_err(|output| TestError::Unexpected(format!("{output:?}")))?;
+        assert!(!launch.executed_on_host());
+        assert!(launch.env_cleared());
+        let sandboxed = launch
+            .sandboxed()
+            .ok_or(TestError::Missing("chain submission"))?
+            .clone();
+        let harw_command::CommandSandbox::Workspace(workspace) = sandboxed.sandbox() else {
+            return Err(TestError::Unexpected(format!("{:?}", sandboxed.sandbox())));
+        };
+        assert_eq!(workspace.root, root);
+        assert_eq!(
+            workspace.profile,
+            harw_command::SandboxProfileName::NoNetwork
+        );
+        assert_eq!(
+            sandboxed.limits(),
+            &timeouts::limits_for(provider.limits, 5).job_resources()
+        );
+        let (command, _warnings, chained) = launch.into_launch_parts();
+        assert!(chained.is_some());
+        let std = command.as_std();
+        assert_eq!(std.get_program(), "/bin/sh");
+        let args: Vec<_> = std.get_args().collect();
+        assert_eq!(args, ["-c", "make test"]);
+        assert_eq!(std.get_current_dir(), Some(root.as_path()));
+        assert_eq!(std.get_envs().count(), 0);
+        Ok(())
+    }
+
+    /// PL-97 E2b (PR #154 Review): der Startweg steht vor der Suche nach
+    /// `prlimit` fest. Ohne `prlimit` an den festen Pfaden und mit
+    /// `require_rlimits = true` wird ein `bwrap-trampoline`-Start nicht
+    /// abgelehnt (das Trampolin setzt die rlimits selbst), und die Übergabe
+    /// trägt die rlimits; reines Bubblewrap braucht `prlimit` weiterhin.
+    #[tokio::test]
+    async fn test_background_trampoline_route_runs_without_a_fixed_path_prlimit() -> TestResult {
+        let _hidden = crate::limits::test_seam::HiddenPrlimit::install();
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(
+            &tmp,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+        )?;
+        let context = ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox);
+        let mut provider = chain_provider(Some(harw_command::BackendKind::BwrapTrampoline));
+        provider.limits.require_rlimits = true;
+        assert!(provider.limits.resolve_prlimit().is_err());
+        let launch = provider
+            .prepare_background_launch(&context, "make test", "job.start", 5)
+            .await
+            .map_err(|output| TestError::Unexpected(format!("refused: {output:?}")))?;
+        assert!(!launch.executed_on_host());
+        let sandboxed = launch
+            .sandboxed()
+            .ok_or(TestError::Missing("chain submission"))?;
+        let limits = timeouts::limits_for(provider.limits, 5);
+        let resources = sandboxed.limits();
+        assert_eq!(resources, &limits.job_resources());
+        assert!(resources.require_rlimits);
+        assert_eq!(resources.cpu_time_max, Some(limits.cpu_secs));
+        assert_eq!(resources.open_files_max, u32::try_from(limits.nofile).ok());
+        // RLIMIT_NPROC wie auf dem bisherigen prlimit-Weg (PL-97 E2f).
+        assert_eq!(resources.process_count_max, Some(4096));
+
+        let mut plain = chain_provider(Some(harw_command::BackendKind::Bwrap));
+        plain.limits.require_rlimits = true;
+        match plain
+            .prepare_background_launch(&context, "make test", "job.start", 5)
+            .await
+        {
+            Err(ToolOutput::Error { message }) => {
+                assert!(message.contains("prlimit"), "{message}");
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        Ok(())
+    }
+
+    /// PL-97 E2g: auf dem reinen Bubblewrap-Weg der Kette prüft `job.start`
+    /// harws eigene RLIMIT_NPROC-Identität nicht; das übernimmt das
+    /// Job-Runtime mit Blick auf das pids.max der Job-Cgroup.
+    #[tokio::test]
+    async fn test_background_plain_bwrap_route_leaves_the_nproc_identity_to_the_runtime()
+    -> TestResult {
+        if crate::limits::ShellLimits::default()
+            .resolve_prlimit_without_nproc_identity()
+            .is_err()
+        {
+            eprintln!("skipped: no trusted prlimit at the fixed paths");
+            return Ok(());
+        }
+        let _exempt = crate::limits::test_seam::ExemptIdentity::install(
+            "der harw-Prozess läuft mit realer uid 0",
+        );
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(
+            &tmp,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+        )?;
+        let context = ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox);
+        let mut plain = chain_provider(Some(harw_command::BackendKind::Bwrap));
+        plain.limits.require_rlimits = true;
+        assert!(plain.limits.resolve_prlimit().is_err());
+        let launch = plain
+            .prepare_background_launch(&context, "make test", "job.start", 5)
+            .await
+            .map_err(|output| TestError::Unexpected(format!("refused: {output:?}")))?;
+        assert!(launch.sandboxed().is_some());
+        Ok(())
+    }
+
+    /// PL-97 E2b: ein Start mit Schreibbereich ohne Bubblewrap-Backend wird
+    /// abgelehnt; der bisherige Weg (`legacy`) übergibt nichts an die Kette.
+    #[tokio::test]
+    async fn test_background_launch_scope_and_legacy() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(
+            &tmp,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+        )?;
+        let scope =
+            harw_command::JobWriteScope::new([sandbox.workspace().canonical_root().join("src")])
+                .map_err(ctx("scope"))?;
+        let context = ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox);
+        let refused = chain_provider(Some(harw_command::BackendKind::LandlockTrampoline))
+            .with_write_scope(scope)
+            .prepare_background_launch(&context, "make", "job.start", 5)
+            .await;
+        match refused {
+            Err(ToolOutput::Error { message }) => {
+                assert!(message.contains("write scope"), "{message}");
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        if BwrapLauncher::discover().is_ok() {
+            let legacy = chain_provider(Some(harw_command::BackendKind::Bwrap))
+                .with_execution(crate::job_spec::SandboxExecution::Legacy)
+                .prepare_background_launch(&context, "make", "job.start", 5)
+                .await
+                .map_err(|output| TestError::Unexpected(format!("{output:?}")))?;
+            assert!(legacy.sandboxed().is_none());
+            assert!(!legacy.executed_on_host());
+        }
+        Ok(())
+    }
+
+    /// PL-97 E2b, fail-closed: ein Start mit Schreibbereich läuft nie auf
+    /// dem Host (Sitzungsfreigabe; `NoSandbox` mit `FullAccess`).
+    #[tokio::test]
+    async fn test_background_launch_with_scope_never_runs_on_the_host() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(
+            &tmp,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+        )?;
+        let scope =
+            harw_command::JobWriteScope::new([sandbox.workspace().canonical_root().join("src")])
+                .map_err(ctx("scope"))?;
+        let context = ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox);
+        let registry = std::sync::Arc::new(harw_sandbox::HostPermitSessionRegistry::default());
+        registry.mark_session_approved(context.session_id().as_str());
+        let leased = chain_provider(Some(harw_command::BackendKind::BwrapTrampoline))
+            .with_host_permit_registry(registry)
+            .with_write_scope(scope.clone());
+        let full_access = chain_provider(Some(harw_command::BackendKind::BwrapTrampoline))
+            .with_exec_platform(ExecPlatform::NoSandbox)
+            .with_approval_mode(ApprovalModeCell::new(ApprovalMode::FullAccess))
+            .with_write_scope(scope);
+        for provider in [leased, full_access] {
+            match provider
+                .prepare_background_launch(&context, "make", "job.start", 5)
+                .await
+            {
+                Err(ToolOutput::Error { message }) => {
+                    assert!(message.contains("write scope"), "{message}");
+                    assert!(message.contains("host execution"), "{message}");
+                }
+                other => return Err(TestError::Unexpected(format!("{other:?}"))),
+            }
         }
         Ok(())
     }

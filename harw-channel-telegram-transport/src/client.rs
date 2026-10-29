@@ -322,16 +322,16 @@ impl TelegramClient {
         allowed_updates: &[&str],
         drop_pending_updates: bool,
     ) -> TransportResult<()> {
-        if let Some(secret_token) = secret_token {
-            if !is_valid_webhook_secret(secret_token) {
-                return Err(TelegramTransportError::ApiRejected {
-                    method: "setWebhook",
-                    code: 0,
-                    description:
-                        "webhook secret token must be 1-256 ASCII characters from [A-Za-z0-9_-]"
-                            .to_owned(),
-                });
-            }
+        if let Some(secret_token) = secret_token
+            && !is_valid_webhook_secret(secret_token)
+        {
+            return Err(TelegramTransportError::ApiRejected {
+                method: "setWebhook",
+                code: 0,
+                description:
+                    "webhook secret token must be 1-256 ASCII characters from [A-Za-z0-9_-]"
+                        .to_owned(),
+            });
         }
         self.call_ok(
             "setWebhook",

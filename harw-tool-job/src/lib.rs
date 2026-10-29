@@ -41,7 +41,10 @@
 //! # Herkunft
 //! [`JobOrigin`] (Aufruf-Id und Werkzeug des startenden Aufrufs) steht in
 //! `meta.json` und im `Started`-Ereignis; `job.start` setzt sie aus dem
-//! Werkzeugaufruf.
+//! Werkzeugaufruf. Typisiert (W20-A) als [`ManagedJobOrigin`]
+//! (`AgentChild`, `Tool`, `Operator`): das Kind-Backend setzt `AgentChild`;
+//! [`JobMeta::resolved_origin`] liest ältere Einträge (`Tool` aus den
+//! R18-Feldern, sonst unbekannt).
 //!
 //! # Module
 //! - [`model`] — [`JobId`], [`JobState`], [`JobOwner`], [`JobMeta`], [`JobStatus`]
@@ -80,7 +83,9 @@ pub use manager::{
     Caller, DEFAULT_MAX_PIPED_LINE_BYTES, DetachSummary, JobError, JobManager, JobManagerConfig,
     JobOrigin, PipedJob, PipedLineError, StartRequest,
 };
-pub use model::{JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus};
+pub use model::{
+    JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus, ManagedJobOrigin,
+};
 pub use procfs::JobSignal;
 pub use progress::{
     ProgressSnapshot, ProgressSource, ProgressTracker, ProgressUpdate, Severity, detect_progress,

@@ -132,11 +132,17 @@ pub struct Criterion {
 /// Ein einzelner Verifikationsschritt für ein Akzeptanzkriterium.
 ///
 /// # Description
-/// Diskriminiertes Enum (tag `kind`). Vier Varianten: Shell-Befehl, Artefakt,
+/// Diskriminiertes Enum (tag `kind`): Quellsammlung, Shell-Befehl, Artefakt,
 /// Trace-Event und manuelle Prüfung.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VerificationStep {
+    /// Exact source collection, verified only by the parent progress receipt.
+    /// This proves observed source coverage, not semantic analysis correctness.
+    CollectSources {
+        /// Exact workspace-relative files; no directories, symbols or globs.
+        sources: Vec<String>,
+    },
     /// Führt einen Shell-Befehl aus und prüft den Exit-Code.
     Command {
         /// Shell-Befehl.

@@ -275,6 +275,20 @@ pub struct FsReadExecutor {
 }
 
 impl FsReadExecutor {
+    /// Descriptive activity metadata of `fs.read` (PL-71, PL-97 M2), written by
+    /// hand in the form `#[harw_macros::tool(activity(...))]` generates: domain
+    /// `filesystem`, verb `read`, resource field `path`, effect `observe`.
+    ///
+    /// It grants, implies or checks no permission and is not part of the
+    /// model-facing `ToolSpec`.
+    pub const ACTIVITY: Option<harw_tools::ActivityDescriptor> =
+        Some(harw_tools::ActivityDescriptor::new(
+            "filesystem",
+            "read",
+            Some("path"),
+            harw_tools::Effect::Observe,
+        ));
+
     /// Führt den Lese-Vorgang synchron (blockierend) aus.
     ///
     /// # Errors
@@ -579,10 +593,11 @@ impl FsReadExecutor {
 /// Nur wenn davor gültiger Text steht; sonst bleibt der Puffer unverändert
 /// (verlustbehaftete Dekodierung, garantiert Fortschritt beim Weiterlesen).
 fn trim_partial_utf8(raw: &mut Vec<u8>) {
-    if let Err(err) = std::str::from_utf8(raw) {
-        if err.error_len().is_none() && err.valid_up_to() > 0 {
-            raw.truncate(err.valid_up_to());
-        }
+    if let Err(err) = std::str::from_utf8(raw)
+        && err.error_len().is_none()
+        && err.valid_up_to() > 0
+    {
+        raw.truncate(err.valid_up_to());
     }
 }
 

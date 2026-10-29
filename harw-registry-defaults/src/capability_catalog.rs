@@ -24,7 +24,7 @@
 //! for every profile plus the tools the composition root synthesizes outside
 //! the profiles (`transfer_to_*`, `agents.*`, `agent.*`, `skills.*`,
 //! `job.*`, `parent.message`, `delegate_wave`, knowledge, plan, matrix,
-//! sudo). The test `test_every_registered_tool_is_in_the_catalog` keeps it
+//! sudo, the read-only Harw-DoD tools `dod.*`). The test `test_every_registered_tool_is_in_the_catalog` keeps it
 //! complete; a new tool without a catalog row fails it.
 //!
 //! # Feature names
@@ -208,6 +208,9 @@ pub mod providers {
     provider!(JOB, "job", "harw-tool-job", "tool-job");
     provider!(PROCESS, "process", "harw-tool-process", "tool-process");
     provider!(CARGO, "cargo", "harw-tool-cargo", "tool-cargo");
+    provider!(FSREAD, "fsread", "harw-tool-fsread", "tool-fsread");
+    provider!(GIT, "git", "harw-tool-gitread", "tool-gitread");
+    provider!(SYS, "sys", "harw-tool-sys", "tool-sys");
     provider!(PLAN, "plan", "harw-tool-plan", "tool-plan");
     provider!(TUNNEL, "tunnel", "harw-tool-tunnel", "tool-tunnel");
     provider!(
@@ -229,6 +232,11 @@ pub mod providers {
         "authoring"
     );
     provider!(MATRIX, "matrix", "harw-matrix-game", "matrix");
+    // PL-97 D3: the read-only Harw-DoD tools are `harw-ops` operations; the
+    // agent core serves them (no provider crate, no runner feature of its own).
+    provider!(DOD, "dod", "harw-ops", "core");
+    // PL-97 B2: `tool.index` is a `harw-ops` operation as well.
+    provider!(TOOL, "tool", "harw-ops", "core");
     provider!(SKILLS, "skills", "harw-registry-defaults", "core");
     provider!(AGENTS, "agents", "harw-core", "core");
 }
@@ -247,6 +255,8 @@ pub const PROVIDER_FEATURES: &[&str] = &[
     "tool-doc",
     "tool-explorer",
     "tool-fs",
+    "tool-fsread",
+    "tool-gitread",
     "tool-job",
     "tool-latex",
     "tool-lens",
@@ -255,6 +265,7 @@ pub const PROVIDER_FEATURES: &[&str] = &[
     "tool-process",
     "tool-shell",
     "tool-sudo",
+    "tool-sys",
     "tool-web",
 ];
 
@@ -320,6 +331,7 @@ macro_rules! row {
 pub const CATALOG: &[CapabilityEntry] = &[
     // fs
     row!("fs.read", FS, Read),
+    row!("fs.view_image", FS, Read),
     row!("fs.list", FS, Read),
     row!("fs.search", FS, Read),
     row!("fs.glob", FS, Read),
@@ -427,6 +439,48 @@ pub const CATALOG: &[CapabilityEntry] = &[
     // starts a container and always asks)
     row!("container.images", CONTAINER, Meta),
     row!("container.run", CONTAINER, Shell),
+    // fsread (PL-93, PL-97 B4): read-only file system commands beneath the
+    // workspace root (`ReadWorkspace`).
+    row!("fsread.ls", FSREAD, Read),
+    row!("fsread.stat", FSREAD, Read),
+    row!("fsread.find", FSREAD, Read),
+    row!("fsread.du", FSREAD, Read),
+    row!("fsread.df", FSREAD, Read),
+    row!("fsread.wc", FSREAD, Read),
+    row!("fsread.head", FSREAD, Read),
+    row!("fsread.tail", FSREAD, Read),
+    row!("fsread.cat", FSREAD, Read),
+    row!("fsread.file", FSREAD, Read),
+    row!("fsread.tree", FSREAD, Read),
+    row!("fsread.readlink", FSREAD, Read),
+    row!("fsread.realpath", FSREAD, Read),
+    row!("fsread.hash", FSREAD, Read),
+    row!("fsread.diff", FSREAD, Read),
+    row!("fsread.json", FSREAD, Read),
+    // git (PL-93, PL-97 B4): read-only Git reader in pure Rust over
+    // `<workspace>/.git`; no `git` process (`ReadWorkspace`).
+    row!("git.status", GIT, Read),
+    row!("git.diff", GIT, Read),
+    row!("git.log", GIT, Read),
+    row!("git.show", GIT, Read),
+    row!("git.branch", GIT, Read),
+    row!("git.blame", GIT, Read),
+    // sys (PL-93, PL-97 B4): process and system inspection over `/proc`.
+    // Nothing is started, but host state outside the workspace is read, so
+    // the crate declares `ExecuteProcess` (modelled on `process.list`);
+    // the class follows that right (`Shell`, like `process.list`).
+    row!("sys.ps", SYS, Shell),
+    row!("sys.pgrep", SYS, Shell),
+    row!("sys.top", SYS, Shell),
+    row!("sys.free", SYS, Shell),
+    row!("sys.uptime", SYS, Shell),
+    row!("sys.uname", SYS, Shell),
+    row!("sys.env", SYS, Shell),
+    row!("sys.id", SYS, Shell),
+    row!("sys.ss", SYS, Shell),
+    row!("sys.lsof", SYS, Shell),
+    row!("sys.date", SYS, Shell),
+    row!("sys.which", SYS, Shell),
     // processes
     row!("process.list", PROCESS, Shell),
     row!("process.kill", PROCESS, Shell),
@@ -478,6 +532,16 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("matrix.start", MATRIX, Agent),
     row!("matrix.run", MATRIX, Agent),
     row!("matrix.finish", MATRIX, Agent),
+    // Harw-DoD (PL-97 D3): read the DoD export, sentinel health, system
+    // config and unit state outside the workspace; no workspace read, no
+    // manifest right (`Meta`, like the `gateway.*` reads). Read-only and
+    // auto-approved; the triage roles admit them.
+    row!("dod.status", DOD, Meta),
+    row!("dod.findings", DOD, Meta),
+    row!("dod.sensors", DOD, Meta),
+    // Tool index (PL-97 B2): static data of this binary (catalog, profiles,
+    // tool specs, bundled skill manifests); read-only, auto-approved.
+    row!("tool.index", TOOL, Meta),
     // skill catalog (always there)
     row!("skills.search", SKILLS, Meta, always),
     row!("skills.load", SKILLS, Meta, always),
@@ -568,6 +632,8 @@ mod tests {
             PARENT_MESSAGE_TOOLS,
             SUDO_TOOLS,
             MATRIX_GAME_MASTER_TOOLS,
+            crate::profile::DOD_READ_TOOLS,
+            crate::profile::TOOL_INDEX_TOOLS,
             KNOWLEDGE_READ_TOOLS,
             KANBAN_READ_TOOLS,
             JOB_TOOLS,
@@ -617,7 +683,7 @@ mod tests {
     /// (agents, authoring, sudo, latex, matrix, ...) are not listed here.
     #[test]
     fn test_catalog_rows_match_provider_tool_names() -> Result<(), String> {
-        let parity: [(&ToolProvider, &[&[&str]]); 12] = [
+        let parity: [(&ToolProvider, &[&[&str]]); 15] = [
             (
                 &providers::DOC,
                 &[harw_tool_doc::DocToolProvider::TOOL_NAMES],
@@ -650,6 +716,18 @@ mod tests {
             (
                 &providers::CARGO,
                 &[harw_tool_cargo::CargoToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::FSREAD,
+                &[harw_tool_fsread::FsreadToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::GIT,
+                &[harw_tool_gitread::GitReadToolProvider::TOOL_NAMES],
+            ),
+            (
+                &providers::SYS,
+                &[harw_tool_sys::SysToolProvider::TOOL_NAMES],
             ),
             (
                 &providers::PLAN,
@@ -904,6 +982,91 @@ mod tests {
                 !crate::AUTO_APPROVED_TOOLS.contains(tool),
                 "{tool} must not be auto-approved"
             );
+        }
+    }
+
+    /// PL-97 D3: the Harw-DoD tools have `Meta` rows of the `dod` provider
+    /// (agent core feature), are auto-approved, never always-ask and not
+    /// served by every runner by default; the catalog rows of the provider are
+    /// exactly [`crate::profile::DOD_READ_TOOLS`].
+    #[test]
+    fn test_dod_tools_are_classified() {
+        let rows: BTreeSet<&str> = CATALOG
+            .iter()
+            .filter(|entry| entry.provider.id == providers::DOD.id)
+            .filter_map(|entry| match entry.pattern {
+                ToolPattern::Exact(name) => Some(name),
+                ToolPattern::Prefix(_) => None,
+            })
+            .collect();
+        let expected: BTreeSet<&str> = crate::profile::DOD_READ_TOOLS.iter().copied().collect();
+        assert_eq!(rows, expected);
+        for tool in crate::profile::DOD_READ_TOOLS {
+            let entry = lookup(tool);
+            assert_eq!(
+                entry.map(|entry| entry.class),
+                Some(CapabilityClass::Meta),
+                "{tool}"
+            );
+            assert_eq!(
+                entry.map(CapabilityEntry::feature),
+                Some(CORE_FEATURE),
+                "{tool}"
+            );
+            assert!(entry.is_some_and(|entry| !entry.always_available), "{tool}");
+            assert_eq!(
+                CapabilityCatalog.classify(tool),
+                Some(CapabilityClass::Meta.tool_classes()),
+                "{tool} carries no manifest right"
+            );
+            assert!(crate::AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+        }
+    }
+
+    /// PL-97 B4: the PL-93 command tools have catalog rows with their own
+    /// provider and runner feature; `fsread.*`/`git.*` are `Read` and
+    /// auto-approved, `sys.*` follows its declared `ExecuteProcess` right
+    /// (`Shell`, like `process.list`) and is never auto-approved.
+    #[test]
+    fn test_pl93_command_tools_are_classified() {
+        let cases: [(&[&str], &ToolProvider, CapabilityClass, bool); 3] = [
+            (
+                crate::profile::FSREAD_TOOLS,
+                &providers::FSREAD,
+                CapabilityClass::Read,
+                true,
+            ),
+            (
+                crate::profile::GIT_READ_TOOLS,
+                &providers::GIT,
+                CapabilityClass::Read,
+                true,
+            ),
+            (
+                crate::profile::SYS_TOOLS,
+                &providers::SYS,
+                CapabilityClass::Shell,
+                false,
+            ),
+        ];
+        for (tools, provider, class, auto_approved) in cases {
+            assert!(PROVIDER_FEATURES.contains(&provider.feature));
+            for tool in tools {
+                let entry = lookup(tool);
+                assert_eq!(entry.map(|entry| entry.provider), Some(provider), "{tool}");
+                assert_eq!(entry.map(|entry| entry.class), Some(class), "{tool}");
+                assert!(
+                    entry.is_some_and(|entry| !entry.always_available),
+                    "{tool}: needs its provider feature"
+                );
+                assert_eq!(
+                    crate::AUTO_APPROVED_TOOLS.contains(tool),
+                    auto_approved,
+                    "{tool}"
+                );
+                assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+            }
         }
     }
 

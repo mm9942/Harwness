@@ -286,6 +286,75 @@ impl JobStore {
         &self.root
     }
 
+    /// Reads a WorkDriver checkpoint for observation, without claiming it.
+    /// This snapshot never grants authority to resume execution.
+    ///
+    /// # Errors
+    /// Unsafe IDs, malformed filesystem entries or I/O errors.
+    pub fn read_work_driver_state(&self, work_id: &WorkId) -> SessionStoreResult<Option<Vec<u8>>> {
+        validate_id(work_id.as_str())?;
+        match self.existing_store()? {
+            Some(store) => store
+                .read_sidecar("work_driver", work_id.as_str())
+                .map_err(Into::into),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads a WorkDriver checkpoint while holding its current live claim.
+    /// The guard is released after reading; later effects need their own
+    /// admission, and publication must use [`Self::write_work_driver_state`].
+    /// Blocking: call from a blocking worker, never across a model await.
+    ///
+    /// # Errors
+    /// Lease validation failures or errors from [`Self::read_work_driver_state`].
+    pub fn read_claimed_work_driver_state(
+        &self,
+        token: &LeaseToken,
+    ) -> SessionStoreResult<Option<Vec<u8>>> {
+        let held = self.hold_live_lease(token)?;
+        let state = self.read_work_driver_state(&token.work_id)?;
+        held.still_live()?;
+        Ok(state)
+    }
+
+    /// Atomically publishes a WorkDriver checkpoint under the current claim.
+    /// Holds the job record lock (excluding reclaim/cancel) through temp sync,
+    /// final deadline validation, rename and directory sync. Old/expired
+    /// tokens cannot overwrite a newer claim's checkpoint. As with the cycle
+    /// store, the wall clock can advance between the final check and rename;
+    /// the lock prevents claim replacement, not passage of time. Existing JSON
+    /// checkpoint bytes remain compatible. This is neither checkpoint CAS
+    /// nor a transaction with external worker effects or the Plan store.
+    /// Blocking: call from a blocking worker.
+    ///
+    /// # Errors
+    /// Lease validation failures, unsafe IDs or I/O errors. A directory-sync
+    /// error may occur after publication; never assume such a write did not run.
+    pub fn write_work_driver_state(
+        &self,
+        token: &LeaseToken,
+        bytes: &[u8],
+    ) -> SessionStoreResult<()> {
+        self.write_work_driver_state_checked(token, bytes, || Ok(()))
+    }
+
+    // Shared publication path; the private hook makes lock lifetime testable
+    // at the exact post-sync commit boundary without sleeps or timing races.
+    fn write_work_driver_state_checked(
+        &self,
+        token: &LeaseToken,
+        bytes: &[u8],
+        before_publish: impl FnOnce() -> SessionStoreResult<()>,
+    ) -> SessionStoreResult<()> {
+        let held = self.hold_live_lease(token)?;
+        self.store()?
+            .write_sidecar_checked("work_driver", token.work_id.as_str(), bytes, || {
+                before_publish()?;
+                held.still_live()
+            })
+    }
+
     /// Persists a server-resolved job request. Existing work IDs are never
     /// overwritten, even if an earlier record has reached a terminal state.
     pub fn admit(&self, record: &StoredJob) -> SessionStoreResult<()> {
@@ -2262,6 +2331,132 @@ mod tests {
             Err(SessionStoreError::LeaseTokenMismatch { .. })
         ));
         assert_eq!(store.get(&work_id)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn work_driver_checkpoint_holds_job_lock_at_publication_boundary() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        let id = WorkId::from_str("checkpoint-lock");
+        store.admit(&record(id.as_str())?)?;
+        let claim = claim_for(&store, &id, Timestamp::now())?;
+        store.write_work_driver_state_checked(&claim.token, b"checkpoint", || {
+            // A second thread attempts both mutations after the temp sync,
+            // while the exact publication path still owns the job lock.
+            let other = Arc::clone(&store);
+            let other_id = id.clone();
+            std::thread::spawn(move || {
+                let actor = ApprovalActor::Operator {
+                    id: "owner".to_owned(),
+                };
+                let cancelled = other.cancel(
+                    &other_id,
+                    &CancelRequest {
+                        cancelled_at: Timestamp::now(),
+                        cancelled_by: actor.clone(),
+                        reason: "stop".to_owned(),
+                    },
+                );
+                let reclaimed = other.reclaim(&other_id, Timestamp::now(), actor);
+                assert!(matches!(
+                    cancelled,
+                    Err(SessionStoreError::JobLockContended { .. })
+                ));
+                assert!(matches!(
+                    reclaimed,
+                    Err(SessionStoreError::JobLockContended { .. })
+                ));
+            })
+            .join()
+            .map_err(|_| {
+                SessionStoreError::Io(std::io::Error::other("concurrent lock test failed"))
+            })?;
+            Ok(())
+        })?;
+        assert_eq!(
+            store.read_work_driver_state(&id)?,
+            Some(b"checkpoint".to_vec())
+        );
+        // The completed publication releases the lock.
+        store.cancel(
+            &id,
+            &CancelRequest {
+                cancelled_at: Timestamp::now(),
+                cancelled_by: ApprovalActor::Operator {
+                    id: "owner".to_owned(),
+                },
+                reason: "stop".to_owned(),
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn work_driver_checkpoint_rejects_old_claim_and_preserves_new_bytes() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let id = WorkId::from_str("checkpoint-fence");
+        store.admit(&record(id.as_str())?)?;
+        let now = Timestamp::now();
+        let first = claim_for(&store, &id, now)?;
+        store.write_work_driver_state(&first.token, b"old checkpoint")?;
+        store.reclaim(
+            &id,
+            now,
+            ApprovalActor::Operator {
+                id: "owner".to_owned(),
+            },
+        )?;
+        let second = claim_for(
+            &store,
+            &id,
+            now.checked_add(SignedDuration::from_secs(20))
+                .map_err(ctx("claim later"))?,
+        )?;
+        store.write_work_driver_state(&second.token, b"new checkpoint")?;
+        assert!(matches!(
+            store.write_work_driver_state(&first.token, b"stale overwrite"),
+            Err(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        assert!(store.read_claimed_work_driver_state(&first.token).is_err());
+        assert_eq!(
+            store.read_claimed_work_driver_state(&second.token)?,
+            Some(b"new checkpoint".to_vec())
+        );
+        assert_eq!(
+            store.read_work_driver_state(&id)?,
+            Some(b"new checkpoint".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn work_driver_checkpoint_rejects_expired_lease_without_reclaim() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let id = WorkId::from_str("checkpoint-expired");
+        let past = Timestamp::now()
+            .checked_sub(SignedDuration::from_secs(120))
+            .map_err(ctx("past"))?;
+        store.admit(&StoredJob {
+            not_before: past,
+            ..record(id.as_str())?
+        })?;
+        let claim = store.claim(
+            &id,
+            &ClaimRequest {
+                worker_id: "worker".to_owned(),
+                lease_ttl: SignedDuration::from_secs(1),
+                now: past,
+            },
+        )?;
+        assert!(matches!(
+            store.write_work_driver_state(&claim.token, b"expired"),
+            Err(SessionStoreError::JobLeaseExpired { .. })
+        ));
+        assert!(store.read_claimed_work_driver_state(&claim.token).is_err());
+        assert_eq!(store.read_work_driver_state(&id)?, None);
         Ok(())
     }
 

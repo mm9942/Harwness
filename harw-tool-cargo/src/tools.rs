@@ -938,10 +938,10 @@ fn read_and_remove(
             .map_err(|e| format!("metadata output is not valid JSON: {e}"))
     })();
     // Aufräumen, egal wie das Lesen ausging: nur die eigene Datei, dirfd-relativ.
-    if let Ok(dir_rel) = scope.rel(SCRATCH_DIR) {
-        if let Ok(dir) = scope.open_dir(&dir_rel) {
-            let _ = unlinkat(dir.as_fd(), name, AtFlags::empty());
-        }
+    if let Ok(dir_rel) = scope.rel(SCRATCH_DIR)
+        && let Ok(dir) = scope.open_dir(&dir_rel)
+    {
+        let _ = unlinkat(dir.as_fd(), name, AtFlags::empty());
     }
     result
 }

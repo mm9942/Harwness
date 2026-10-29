@@ -377,6 +377,19 @@ fn drift_payload(event: &crate::guard::DriftEvent) -> StateStoreResult<serde_jso
     .map_err(|error| harw_session_store::SessionStoreError::from(error).into())
 }
 
+// `true`, wenn beide Verläufe dieselben Items tragen (`TurnItem` hat kein
+// `PartialEq`; Vergleich über die serialisierte Form). Ein
+// Serialisierungsfehler gilt als Unterschied.
+fn same_items(left: &[TurnItem], right: &[TurnItem]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            match (serde_json::to_value(left), serde_json::to_value(right)) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => false,
+            }
+        })
+}
+
 // Liefert `item_count`, wenn `payload` ein `history_replaced`-Marker ist,
 // sonst `None` (auch für den Sitzungszustand- und `{"event": …}`-Payload).
 fn history_replaced_item_count(payload: &serde_json::Value) -> Option<usize> {
@@ -645,6 +658,58 @@ pub trait StateStore: Send + Sync {
         let _ = (sid, event);
         Box::pin(async { Ok(()) })
     }
+
+    /// Persists one triggered skill delivery (PL-95 S3, `injection` event,
+    /// see [`harw_session_store::InjectionRecord`]).
+    ///
+    /// # Description
+    /// Default: no-op, so existing test doubles stay valid — like
+    /// [`Self::record_drift`].
+    ///
+    /// # Errors
+    /// Backend-specific, see [`StateStoreError`].
+    fn record_skill_injection<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        record: &'a harw_session_store::InjectionRecord,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        let _ = (sid, record);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Loads the triggered skill deliveries of a session in append order.
+    ///
+    /// # Description
+    /// Default: empty (a store without an injection archive).
+    ///
+    /// # Errors
+    /// Backend-specific, see [`StateStoreError`].
+    fn load_skill_injections<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<harw_session_store::InjectionRecord>>> {
+        let _ = sid;
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Loads the triggered skill deliveries of the session's current context
+    /// epoch: those recorded after the last history replacement
+    /// ([`Self::save_history`], written by every compaction), in append
+    /// order. A resumed session rebuilds its injector state from them
+    /// ([`crate::skill_injection::SkillInjector::restore`]).
+    ///
+    /// # Description
+    /// Default: every record of [`Self::load_skill_injections`] (a store that
+    /// does not track history replacements).
+    ///
+    /// # Errors
+    /// Backend-specific, see [`StateStoreError`].
+    fn load_active_skill_injections<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<harw_session_store::InjectionRecord>>> {
+        self.load_skill_injections(sid)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +843,108 @@ impl TranscriptStateStore {
 }
 
 impl StateStore for TranscriptStateStore {
+    fn record_skill_injection<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        record: &'a harw_session_store::InjectionRecord,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        Box::pin(async move {
+            let payload = record.to_payload()?;
+            self.append_record(sid, RecordKind::Lifecycle, payload)
+                .await
+        })
+    }
+
+    fn load_skill_injections<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<harw_session_store::InjectionRecord>>> {
+        Box::pin(async move {
+            let store = Arc::clone(&self.transcript_store);
+            let thread = (self.thread_for_session)(sid);
+            let sid = sid.clone();
+            run_blocking("transcript_load_skill_injections", move || {
+                let reader = match store.reader(&sid) {
+                    Ok(reader) => reader,
+                    Err(harw_session_store::SessionStoreError::NotFound { .. }) => {
+                        return Ok(Vec::new());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let mut records = Vec::new();
+                for record in reader {
+                    let record = record?;
+                    if record.kind != RecordKind::Lifecycle || record.thread != thread {
+                        continue;
+                    }
+                    if let Some(injection) =
+                        harw_session_store::InjectionRecord::from_payload(&record.payload)
+                    {
+                        records.push(injection);
+                    }
+                }
+                Ok(records)
+            })
+            .await
+        })
+    }
+
+    fn load_active_skill_injections<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<harw_session_store::InjectionRecord>>> {
+        Box::pin(async move {
+            let store = Arc::clone(&self.transcript_store);
+            let thread = (self.thread_for_session)(sid);
+            let sid = sid.clone();
+            run_blocking("transcript_load_active_skill_injections", move || {
+                let reader = match store.reader(&sid) {
+                    Ok(reader) => reader,
+                    Err(harw_session_store::SessionStoreError::NotFound { .. }) => {
+                        return Ok(Vec::new());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let mut records = Vec::new();
+                // Roh-Payloads der Items wie in `load_history`, um eine echte
+                // Ersetzung von einem unveränderten Neuschreiben zu trennen.
+                let mut items: Vec<serde_json::Value> = Vec::new();
+                for record in reader {
+                    let record = record?;
+                    if record.thread != thread {
+                        continue;
+                    }
+                    if record.kind == RecordKind::Item {
+                        items.push(record.payload);
+                        continue;
+                    }
+                    if record.kind != RecordKind::Lifecycle {
+                        continue;
+                    }
+                    if let Some(item_count) = history_replaced_item_count(&record.payload) {
+                        // `save_history` hängt den neuen Verlauf direkt vor
+                        // den Marker. Nur eine echte Ersetzung (Verdichtung,
+                        // Rewind) beginnt eine neue Kontext-Epoche; schreibt
+                        // `save_history` den Verlauf unverändert neu (z. B.
+                        // eine No-op-Verdichtung), behält der Live-Injektor
+                        // seine Auszüge — dann auch die Wiederaufnahme.
+                        let keep_from = items.len().saturating_sub(item_count);
+                        if items[..keep_from] != items[keep_from..] {
+                            records.clear();
+                        }
+                        items.drain(..keep_from);
+                    } else if let Some(injection) =
+                        harw_session_store::InjectionRecord::from_payload(&record.payload)
+                    {
+                        records.push(injection);
+                    }
+                }
+                Ok(records)
+            })
+            .await
+        })
+    }
+
     fn record_agent_orchestration<'a>(
         &'a self,
         sid: &'a SessionId,
@@ -894,11 +1061,11 @@ impl StateStore for TranscriptStateStore {
                             serde_json::from_value(record.payload)
                                 .map_err(harw_session_store::SessionStoreError::from)?,
                         );
-                    } else if record.kind == RecordKind::Lifecycle {
-                        if let Some(item_count) = history_replaced_item_count(&record.payload) {
-                            let keep_from = items.len().saturating_sub(item_count);
-                            items.drain(..keep_from);
-                        }
+                    } else if record.kind == RecordKind::Lifecycle
+                        && let Some(item_count) = history_replaced_item_count(&record.payload)
+                    {
+                        let keep_from = items.len().saturating_sub(item_count);
+                        items.drain(..keep_from);
                     }
                 }
                 Ok(ConversationHistory::from_items(items))
@@ -1030,6 +1197,10 @@ pub struct InMemoryStateStore {
     inner: Mutex<HashMap<String, Vec<TurnItem>>>,
     states: Mutex<HashMap<String, SessionStateSnapshot>>,
     orchestration: Mutex<HashMap<String, Vec<AgentOrchestrationEvent>>>,
+    injections: Mutex<HashMap<String, Vec<harw_session_store::InjectionRecord>>>,
+    /// Per session: number of injection records written before the last
+    /// [`StateStore::save_history`] (start of the current context epoch).
+    injection_epochs: Mutex<HashMap<String, usize>>,
 }
 
 impl InMemoryStateStore {
@@ -1070,6 +1241,32 @@ impl InMemoryStateStore {
 }
 
 impl StateStore for InMemoryStateStore {
+    fn record_skill_injection<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        record: &'a harw_session_store::InjectionRecord,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        Box::pin(async move {
+            lock_state(&self.injections, "record_skill_injection")?
+                .entry(sid.as_str().to_owned())
+                .or_default()
+                .push(record.clone());
+            Ok(())
+        })
+    }
+
+    fn load_skill_injections<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<harw_session_store::InjectionRecord>>> {
+        Box::pin(async move {
+            Ok(lock_state(&self.injections, "load_skill_injections")?
+                .get(sid.as_str())
+                .cloned()
+                .unwrap_or_default())
+        })
+    }
+
     fn record_agent_orchestration<'a>(
         &'a self,
         sid: &'a SessionId,
@@ -1081,6 +1278,24 @@ impl StateStore for InMemoryStateStore {
                 .or_default()
                 .push(event.clone());
             Ok(())
+        })
+    }
+
+    fn load_active_skill_injections<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<harw_session_store::InjectionRecord>>> {
+        Box::pin(async move {
+            let start = lock_state(&self.injection_epochs, "load_active_skill_injections")?
+                .get(sid.as_str())
+                .copied()
+                .unwrap_or_default();
+            Ok(
+                lock_state(&self.injections, "load_active_skill_injections")?
+                    .get(sid.as_str())
+                    .map(|records| records.get(start..).unwrap_or_default().to_vec())
+                    .unwrap_or_default(),
+            )
         })
     }
 
@@ -1116,7 +1331,19 @@ impl StateStore for InMemoryStateStore {
     ) -> ExtFuture<'a, StateStoreResult<()>> {
         Box::pin(async move {
             let mut map = lock_state(&self.inner, "save_history")?;
-            map.insert(sid.as_str().to_owned(), history.items().to_vec());
+            let previous = map.insert(sid.as_str().to_owned(), history.items().to_vec());
+            drop(map);
+            // Wie der `history_replaced`-Marker des Transkript-Stores: nur
+            // eine echte Verlaufsersetzung beginnt eine neue Injektions-Epoche,
+            // ein unverändertes Neuschreiben nicht.
+            if previous.is_some_and(|previous| same_items(&previous, history.items())) {
+                return Ok(());
+            }
+            let written = lock_state(&self.injections, "save_history")?
+                .get(sid.as_str())
+                .map_or(0, Vec::len);
+            lock_state(&self.injection_epochs, "save_history")?
+                .insert(sid.as_str().to_owned(), written);
             Ok(())
         })
     }
@@ -1196,6 +1423,90 @@ mod tests {
             serde_json::to_value(loaded.items())?,
             serde_json::to_value(history.items())?
         );
+        Ok(())
+    }
+
+    fn injection(skill: &str) -> harw_session_store::InjectionRecord {
+        harw_session_store::InjectionRecord {
+            skill: skill.to_owned(),
+            section: None,
+            trigger_kind: "keyword".to_owned(),
+            trigger_key: skill.to_owned(),
+            bytes: 10,
+            turn_id: "turn-1".to_owned(),
+            trust: "instruction".to_owned(),
+            sha256: "ab".repeat(32),
+            text: Some(format!("# Skill: {skill}")),
+        }
+    }
+
+    /// PL-97 H7: the active injection records are those after the last
+    /// history replacement, in both stores; the full archive stays complete.
+    #[tokio::test]
+    async fn active_skill_injections_start_after_the_last_history_replacement() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let durable =
+            TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
+        let memory = InMemoryStateStore::new();
+        let stores: [&dyn StateStore; 2] = [&durable, &memory];
+        let sid = session();
+        for store in stores {
+            assert!(store.load_active_skill_injections(&sid).await?.is_empty());
+            store
+                .record_skill_injection(&sid, &injection("old"))
+                .await?;
+            let mut history = ConversationHistory::new();
+            history.push_user_text("hello");
+            store.save_history(&sid, &history).await?;
+            assert!(store.load_active_skill_injections(&sid).await?.is_empty());
+            store
+                .record_skill_injection(&sid, &injection("new"))
+                .await?;
+            let active = store.load_active_skill_injections(&sid).await?;
+            assert_eq!(active, vec![injection("new")]);
+            assert_eq!(store.load_skill_injections(&sid).await?.len(), 2);
+        }
+        Ok(())
+    }
+
+    /// PL-97 H7 review: `save_history` with an unchanged history (e.g. the
+    /// turn-start hard compact persisting a no-op outcome) keeps the live
+    /// injector's excerpts, so it must not open a new context epoch; a real
+    /// replacement still does.
+    #[tokio::test]
+    async fn an_unchanged_save_history_keeps_the_active_skill_injections() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let durable =
+            TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
+        let memory = InMemoryStateStore::new();
+        let stores: [&dyn StateStore; 2] = [&durable, &memory];
+        let sid = session();
+        for store in stores {
+            let mut history = ConversationHistory::new();
+            history.push_user_text("why does the borrow checker complain?");
+            store.save_history(&sid, &history).await?;
+            store
+                .record_skill_injection(&sid, &injection("borrow"))
+                .await?;
+            // Appended turns, then the same history rewritten unchanged.
+            history.push_assistant_text("ok", None);
+            if let Some(item) = history.items().last() {
+                store.save_turn(&sid, item).await?;
+            }
+            store.save_history(&sid, &history).await?;
+            assert_eq!(
+                store.load_active_skill_injections(&sid).await?,
+                vec![injection("borrow")],
+                "an unchanged history keeps the epoch"
+            );
+            let mut compacted = ConversationHistory::new();
+            compacted.push_user_text("summary");
+            store.save_history(&sid, &compacted).await?;
+            assert!(
+                store.load_active_skill_injections(&sid).await?.is_empty(),
+                "a real replacement opens a new epoch"
+            );
+        }
         Ok(())
     }
 

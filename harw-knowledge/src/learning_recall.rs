@@ -111,10 +111,10 @@ fn is_eligible(
     if c.revoked || c.superseded {
         return false;
     }
-    if let Some(exp) = c.expires_at {
-        if exp <= req.now_unix {
-            return false;
-        }
+    if let Some(exp) = c.expires_at
+        && exp <= req.now_unix
+    {
+        return false;
     }
     if !req.allowed_scopes.contains(&c.scope_label) {
         return false;

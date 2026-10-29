@@ -100,13 +100,13 @@ pub fn drop_capabilities(
         .fold(CapabilitySet::empty(), |acc, name| acc | name.to_set());
 
     // Ambient set: EINVAL on kernels before 4.3 (no ambient set to clear).
-    if let Err(errno) = clear_ambient_capability_set() {
-        if errno != rustix::io::Errno::INVAL {
-            return Err(SandboxError::Os {
-                operation: "PR_CAP_AMBIENT_CLEAR_ALL",
-                errno: errno.raw_os_error(),
-            });
-        }
+    if let Err(errno) = clear_ambient_capability_set()
+        && errno != rustix::io::Errno::INVAL
+    {
+        return Err(SandboxError::Os {
+            operation: "PR_CAP_AMBIENT_CLEAR_ALL",
+            errno: errno.raw_os_error(),
+        });
     }
 
     let mut bounding_complete = true;

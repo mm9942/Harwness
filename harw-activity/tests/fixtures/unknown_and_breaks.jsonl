@@ -1,0 +1,19 @@
+# PL-71 I5 and break conditions: an unknown tool is standalone and seals the
+# open read burst of its turn; an unkeyed execute (shell.exec) seals too; a
+# keyed write of another path does not; an effect-other descriptor on a path is
+# standalone; a communicate call neither groups nor seals; a delete of A seals
+# A's burst and stays standalone; an unmatched rebase is a visible standalone.
+{"ingest_seq":1,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"started"}
+{"ingest_seq":2,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":3,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"unknown","verb":"unknown","effect":"other"},"lifecycle":"started"}
+{"ingest_seq":4,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"unknown","verb":"unknown","effect":"other"},"lifecycle":"finished","outcome":{"failed":{"class":"boom"}}}
+{"ingest_seq":5,"owner":{"session":"root","turn":1,"call":"c3"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":6,"owner":{"session":"root","turn":1,"call":"c4"},"descriptor":{"domain":"process","verb":"exec","effect":"execute"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":7,"owner":{"session":"root","turn":1,"call":"c5"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":8,"owner":{"session":"root","turn":1,"call":"c6"},"descriptor":{"domain":"filesystem","verb":"write","resource_field":"path","effect":"mutate"},"resource":{"path":"b.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":9,"owner":{"session":"root","turn":1,"call":"c7"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":10,"owner":{"session":"root","turn":1,"call":"c8"},"descriptor":{"domain":"filesystem","verb":"chmod","resource_field":"path","effect":"other"},"resource":{"path":"a.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":11,"owner":{"session":"root","turn":1,"call":"c9"},"descriptor":{"domain":"network","verb":"fetch","resource_field":"url","effect":"communicate"},"resource":{"other":"docs.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":12,"owner":{"session":"root","turn":1,"call":"c10"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"a.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":13,"owner":{"session":"root","turn":1,"call":"c11"},"descriptor":{"domain":"filesystem","verb":"delete","resource_field":"path","effect":"delete"},"resource":{"path":"a.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":14,"owner":{"session":"root","turn":1,"call":"c12"},"descriptor":{"domain":"job","verb":"start","effect":"execute"},"resource":{"call":"zz"},"lifecycle":{"rebase":{"to":{"job":"W9"}}}}

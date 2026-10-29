@@ -110,6 +110,19 @@ pub struct ModelCapabilitiesToml {
     /// `false`) wirkt nur ein ausdrückliches `false` hier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_input: Option<bool>,
+    /// Chat protocol for preserving the provider's original reasoning between
+    /// assistant/tool rounds. Omitted uses verified endpoint defaults; unknown
+    /// compatible endpoints keep replay disabled. `disabled` explicitly opts out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_reasoning_replay: Option<ChatReasoningReplay>,
+}
+
+/// Explicit model-level chat reasoning protocol; never executes reasoning text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatReasoningReplay {
+    Disabled,
+    ReasoningContent,
 }
 
 #[cfg(test)]
@@ -283,6 +296,29 @@ mod tests {
         model.validate().map_err(ctx("no rate_limit is valid"))?;
         let encoded = toml::to_string(&model).map_err(ctx("model-toml serialisieren"))?;
         assert!(!encoded.contains("rate_limit"));
+        Ok(())
+    }
+    #[test]
+    fn explicit_chat_reasoning_protocol_round_trips_and_rejects_unknown_modes() -> TestResult {
+        let source = "id = 'custom-thinker'\nprovider = 'proxy'\n[capabilities]\nchat_reasoning_replay = 'reasoning_content'\n";
+        let model: ModelToml = toml::from_str(source).map_err(ctx("parse replay protocol"))?;
+        assert_eq!(
+            model.capabilities.chat_reasoning_replay,
+            Some(ChatReasoningReplay::ReasoningContent)
+        );
+        let encoded = toml::to_string(&model).map_err(ctx("serialize replay protocol"))?;
+        let restored: ModelToml =
+            toml::from_str(&encoded).map_err(ctx("restore replay protocol"))?;
+        assert_eq!(
+            restored.capabilities.chat_reasoning_replay,
+            model.capabilities.chat_reasoning_replay
+        );
+        assert!(
+            toml::from_str::<ModelToml>(
+                &source.replace("reasoning_content", "interpret_reasoning_as_commands")
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

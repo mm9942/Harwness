@@ -1,10 +1,10 @@
-//! `cloud.status` — probe the local cloud stack (gateway ports + systemd
-//! unit state of `harw.cloud.service`).
+//! Profile-bound cloud diagnostics. Filesystem observations are not service
+//! identity, validated configuration, or authenticated readiness evidence.
 
-use std::process::Command;
+use std::path::Path;
+use std::sync::Arc;
 
-use harw_cloud_gateway::config::{GatewayConfig, PortMap};
-use harw_cloud_gateway::status::{self as gateway_status, CloudStatus};
+use harw_home::ResolvedHomeContext;
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
 use serde::Deserialize;
@@ -15,89 +15,69 @@ use serde_json::json;
 #[serde(deny_unknown_fields)]
 pub struct CloudStatusArgs {}
 
-/// Build the local gateway configuration for the cloud stack probe.
-fn local_gateway_config() -> GatewayConfig {
-    GatewayConfig {
-        listen_addr: "127.0.0.1:7443".into(),
-        tls: None,
-        ports: vec![
-            PortMap {
-                name: "api".into(),
-                port: 7443,
-            },
-            PortMap {
-                name: "enrollment".into(),
-                port: 8080,
-            },
-        ],
+fn directory_observation(path: &Path) -> &'static str {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => "present",
+        Ok(_) => "not_directory",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing",
+        Err(_) => "unknown",
     }
 }
 
-/// Query whether the `harw.cloud.service` systemd unit is active.
-fn systemd_active() -> String {
-    Command::new("systemctl")
-        .args(["is-active", "harw.cloud.service"])
-        .output()
-        .map(|out| {
-            let text = String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .to_ascii_lowercase();
-            if text.is_empty() {
-                "unknown".into()
-            } else {
-                text
-            }
-        })
-        .unwrap_or_else(|_| "unknown".into())
-}
-
-/// Render a probe result as JSON.
-fn status_json(status: &CloudStatus, systemd: &str) -> serde_json::Value {
-    let ports: Vec<serde_json::Value> = status
-        .ports
-        .iter()
-        .map(|p| json!({ "name": p.name, "port": p.port, "listening": p.listening }))
-        .collect();
+fn status_json(home: &ResolvedHomeContext) -> serde_json::Value {
     json!({
-        "running": status.running,
-        "ports": ports,
-        "systemd": systemd,
+        "schema_version": 2,
+        "profile": home.profile_name,
+        "profile_directory": directory_observation(&home.profile_dir),
+        "installed": null,
+        "configured": null,
+        "running": null,
+        "ready": null,
+        "evidence": {
+            "source": "bound_profile_filesystem",
+            "installed": "unknown: no profile-bound service installation evidence",
+            "configured": "unknown: profile presence does not validate service configuration",
+            "running": "unknown: no profile-bound service identity observation",
+            "ready": "unknown: no authenticated operation-specific readiness observation"
+        }
     })
 }
 
-/// Probe the local cloud stack: gateway ports on `127.0.0.1` and the
-/// `harw.cloud.service` systemd unit state.
+/// Inspect the bound profile without starting a service or probing guessed ports.
 ///
 /// # Errors
-/// [`OpError::Execution`] is never returned by the probe itself; port checks
-/// are reported as `listening: false`, not as errors.
+/// [`OpError::NotAvailable`] if trusted caller or profile context is absent.
 #[operation(
     name = "cloud.status",
-    summary = "Probe the local cloud stack: gateway ports (127.0.0.1:7443 and :8080) and the state of the harw.cloud.service systemd unit.",
+    summary = "Inspect the selected cloud profile and report service readiness evidence; unknown states remain explicit.",
     domain = "execution",
     permission = "maintainer",
     model_tool(readonly, approval = "none")
 )]
-async fn cloud_status(_ctx: &OpContext, _args: CloudStatusArgs) -> Result<OpOutput, OpError> {
-    let config = local_gateway_config();
-    let status = gateway_status::probe(&config).await;
-    let systemd = systemd_active();
-    let data = status_json(&status, &systemd);
-    let running = if status.running { "running" } else { "stopped" };
+async fn cloud_status(ctx: &OpContext, _args: CloudStatusArgs) -> Result<OpOutput, OpError> {
+    let local_operator = ctx
+        .service::<crate::context::LocalProfileOperator>()
+        .is_some();
+    if ctx.tenant().is_none() && !local_operator {
+        return Err(OpError::NotAvailable(
+            "cloud status requires a caller tenant or explicit local-profile operator capability"
+                .into(),
+        ));
+    }
+    let home = ctx.service::<Arc<ResolvedHomeContext>>().ok_or_else(|| {
+        OpError::NotAvailable("cloud status requires a bound home/profile context".into())
+    })?;
+    let mut data = status_json(home);
+    data["visibility"] = json!(if ctx.tenant().is_some() {
+        "tenant"
+    } else {
+        "local_profile_operator"
+    });
     Ok(OpOutput {
         text: format!(
-            "Cloud stack: {running} (ports: {}, systemd: {systemd})",
-            status
-                .ports
-                .iter()
-                .map(|p| format!(
-                    "{}:{}={}",
-                    p.name,
-                    p.port,
-                    if p.listening { "up" } else { "down" }
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "Cloud profile {}: directory {}; installation, configuration, running state and readiness unknown (service evidence not bound)",
+            home.profile_name,
+            directory_observation(&home.profile_dir)
         ),
         data: Some(data),
     })
@@ -106,28 +86,45 @@ async fn cloud_status(_ctx: &OpContext, _args: CloudStatusArgs) -> Result<OpOutp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harw_home::{ProjectKind, ProjectRoot};
 
-    #[tokio::test]
-    async fn closed_port_reports_not_running() {
-        // Probe an ephemeral local port that is (almost certainly) closed.
-        let config = GatewayConfig {
-            listen_addr: "127.0.0.1:1".into(),
-            tls: None,
-            ports: vec![PortMap {
-                name: "api".into(),
-                port: 1,
-            }],
+    #[test]
+    fn existing_profile_does_not_prove_service_readiness() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let project = ProjectRoot {
+            root: dir.path().to_owned(),
+            trust_key: dir.path().to_owned(),
+            kind: ProjectKind::Directory,
         };
-        let status = gateway_status::probe(&config).await;
-        assert!(!status.running);
-        assert_eq!(status.ports.len(), 1);
-        assert!(!status.ports[0].listening);
+        let home = ResolvedHomeContext::new(dir.path(), "selected".into(), project)?;
+        std::fs::create_dir_all(&home.profile_dir)?;
+        let data = status_json(&home);
+        assert_eq!(data["profile"], "selected");
+        assert_eq!(data["profile_directory"], "present");
+        for state in ["installed", "configured", "running", "ready"] {
+            assert!(
+                data[state].is_null(),
+                "{state} must not be inferred from a directory"
+            );
+        }
+        assert!(data.get("ports").is_none());
+        Ok(())
     }
 
     #[test]
-    fn systemd_active_never_panics() {
-        // May be "unknown" in a sandbox without systemctl; must not panic.
-        let value = systemd_active();
-        assert!(!value.is_empty());
+    fn missing_invalid_and_uncheckable_paths_are_distinct() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("file");
+        std::fs::write(&file, "not a directory")?;
+        assert_eq!(directory_observation(dir.path()), "present");
+        assert_eq!(directory_observation(&file), "not_directory");
+        assert_eq!(
+            directory_observation(&dir.path().join("missing")),
+            "missing"
+        );
+        assert_eq!(directory_observation(&file.join("child")), "unknown");
+        Ok(())
     }
 }

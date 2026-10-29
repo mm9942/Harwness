@@ -1,6 +1,6 @@
 # harw-tui Architecture
 
-> Status: implemented · Last reviewed: 2026-09-24
+> Status: implemented · Last reviewed: 2026-09-24 · PL-97 sections (§10–§14) added 2026-10-29
 
 This document describes `harw-tui`'s own internal architecture: how the
 chat loop is driven, how a redraw gets scheduled, how the chat history is
@@ -121,10 +121,21 @@ implementations for different kinds of content:
   and re-wraps it differently per render width, so a terminal resize
   re-flows old messages correctly instead of leaving them wrapped for a
   width that no longer applies.
-- **`ReasoningHistoryCell`** — a reasoning summary, dimmed and italic with
-  a `"∴ "` marker and an optional note of which agent it came from;
-  collapsed by default, expandable via Ctrl+O through a shared, mutable
-  handle (`SharedReasoningCell`) so all reasoning cells expand together.
+- **`ReasoningHistoryCell`** — a reasoning summary rendered like a message
+  (PL-97 R1, renderer in `reasoning_cell.rs`): a dimmed header `∴ Reasoning`
+  with an optional `[role]` note of which agent it came from, and a body
+  that goes through the same markdown renderer and wrapping as assistant
+  messages (headings, lists, code fences, tables), in the theme's normal
+  text colour with a dim `│ ` gutter. The `summary_text` entries are joined
+  with blank lines so paragraphs survive. `[tui] reasoning` picks the start
+  state: `message` (default) starts expanded and Ctrl+O collapses it to
+  header + first line + `… (N Zeilen · Ctrl+O)`, `collapsed` starts
+  collapsed, `hidden` pushes no cell (the export entry is still recorded).
+  The live preview of a streaming turn follows the same mode: `message`
+  shows `∴ Reasoning …` plus up to eight wrapped tail lines with paragraph
+  breaks, `collapsed` three dimmed lines, `hidden` none. The toggle goes
+  through a shared, mutable handle (`SharedReasoningCell`) so all reasoning
+  cells expand together.
 - **`SubAgentCell`** — a running or finished child agent
   (`TurnEvent::ChildSpawned`/`ChildProgress`/`ChildCompleted`); unlike the
   cells above, this one is **updatable in place** via
@@ -259,3 +270,93 @@ it — following the same "state machine returns an action, the caller
 applies it" shape as the input editor and setup flow above. It completes
 both command names and subcommands, sourced from the command registry
 described in `docs/design/tui-command-contract.md` §8.
+
+## 10. Mission Control windows (`mission/`, PL-97 C1–C4)
+
+The body around the chat is laid out by the pure classifier
+`harw_tui_layout::classify_mission` (std only, layer F): one of
+PortraitStack, LandscapeThreeColumns, ShallowLandscape or CompactSummary,
+with up to five window rectangles (agents, jobs, finished/failed, live,
+chat) plus explorer/workbench, status and composer. `panes.rs` converts the
+result into `MissionAreas`; `app/render.rs` (`compose_body`) draws it.
+
+`harw-tui/src/mission/` owns only presentation state and renderers:
+
+- `mod.rs` — `MissionUi`: one `WindowUi` (scroll, selection, follow) for
+  Jobs and for Finished/Failed, the pinned agent, the LIVE scroll
+  (`live_scroll`, landscape) and the agent whose detail `Alt+L` shows in
+  place. The Agents window keeps the legacy `AgentMonitor` selection, so the
+  existing agent-list keys work unchanged.
+- `projection.rs` — pure projections over `AgentMonitor` and the job
+  snapshot (`JobRow`); no second store. `terminal_aggregate` groups
+  finished agent runs and jobs by a typed `TerminalCategory` (role,
+  `tool:<name>`, `Operator job`, `Unknown job`, `Agent child (pending)`),
+  counts a job-backed child once (by its agent run), and keeps at most
+  `TERMINAL_RETENTION_PER_CATEGORY` (50) constituents per row with counters
+  that survive eviction. Provenance (`ManagedJobOrigin`) is display only.
+- `agents_window.rs`, `jobs_window.rs`, `finished_window.rs`,
+  `live_window.rs` — the four renderers; LIVE shows the reasoning tail, the
+  current tool, the last status and the recency slots of the selected agent
+  (pinned, else the active root orchestrator, else the top
+  `LiveActivityRanker` candidate), sanitized and bounded.
+- `stop_job.rs` — the `x` confirmation dialog; confirming emits the literal
+  `/jobs stop <id>` line through the regular command path.
+
+`FrameRegions` carries the jobs/finished/live rectangles so the mouse wheel
+and left click reach only the window under the pointer
+(`app/scroll_routing.rs`); modal dialogs keep precedence.
+
+## 11. Inline live cells (`app/live_slots.rs`, PL-97 C5)
+
+`LiveSlots::project` turns the `LiveActivityRanker` order of this session's
+streaming background runs into a `LiveSlotProjection` every frame: where in
+the tail at most `MAX_INLINE_LIVE` (2) **virtual** live cells are inserted
+(slot #2 while idle and after the final reply, #3 while a user message or
+UIA answer is in flight) and how many further runs collapse into one
+`+N weitere aktiv` row. `ChatApp::history_segments` builds the virtual cell
+list from the unchanged canonical cells plus the projected live cells.
+While the chat is scrolled away from the tail the projection is frozen and
+a `N neue Aktivitäten` row counts what changed; `ChatScroll::sync_anchor`
+keeps the top visible canonical cell by identity. Export, persistence,
+model context and the final-reply dedupe never see the virtual cells.
+
+## 12. Activity adapter (`app/activity_glue.rs`, PL-97 M3)
+
+Feeds the root session's tool, job and agent lifecycles into one
+`harw_activity::Reducer` (descriptors from
+`harw_registry_defaults::activity_for`) and lets its projections decide
+where a new tool cell goes: read bursts share one `ToolGroupKind::Reads`
+group, an edit/read loop on one path updates one cell (`A · Edit ×1 ·
+Read ×3`), `job.start`/`job.status`/`job.logs`/`job.stop` of one job update
+one cell, unknown terminal job states count as failed, and agent failure
+bursts back the Finished/Failed `NEW` badge. Everything else stays a single
+cell. The reducer keeps a bounded number of closed projections
+(`RETAINED_CLOSED_PROJECTIONS`); grouping feeds no permission, approval or
+sandbox decision.
+
+## 13. Harw-DoD view and mark (`dod_view.rs`, PL-97 D5)
+
+`DodView` is an `OverlayView` opened by the TUI-local `/dod view`; every
+other `/dod` form is an inline command of the `dod` operation. The view
+names its commands (`/dod status`, `/dod sensors`, `/dod findings`), which
+`app.rs` runs through the regular fetch path; the view only formats the
+returned `OpOutput.data`. `DodMark`/`DodMarkFeed` give the status-line mark
+`⛨ n high` and the `· ⛨ DoD n` suffix of the Finished/Failed title, read
+from the `attention` field of `/dod status` off the event loop. Nothing
+here reads a file or asks systemd; every export text is sanitized and cut,
+and findings from an unverified export source are labelled `UNVERIFIED`.
+
+## 14. Reasoning cell and hard stop (`reasoning_cell.rs`, `hard_kill.rs`)
+
+`reasoning_cell.rs` renders `ReasoningHistoryCell` (§4) and the live
+reasoning preview according to `[tui] reasoning` (PL-97 R1).
+
+`hard_kill.rs` (PL-97 C4b, with `process_tree.rs` and `input_reader.rs`)
+detects two `Ctrl+C` presses inside `DOUBLE_PRESS_WINDOW` while a turn or a
+managed job runs: background agents are cancelled, managed jobs stop
+through `JobManager::stop(…, JobSignal::Kill)`, descendants in a
+`harw-job-<attempt>` cgroup end through that cgroup's `cgroup.kill`, and
+only remaining descendants in harw's own cgroup are killed through the
+process tree; the composition root restores the terminal, saves the
+session and exits with 130 (a watchdog forces the exit after `EXIT_GRACE`).
+With nothing running, a double `Ctrl+C` is the normal quit.

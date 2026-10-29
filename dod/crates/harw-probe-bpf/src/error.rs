@@ -1,18 +1,22 @@
 //! Fehlertyp der eBPF-Sonde `harw-probe-bpf`.
 //!
 //! # Verantwortungsbereich
-//! [`ProbeError`] ist der eine Fehlertyp dieses Binaries. Er deckt fünf
+//! [`ProbeError`] ist der eine Fehlertyp dieses Binaries. Er deckt sechs
 //! Quellen ab:
 //!
-//! 1. die Landlock-Durchsetzung ([`crate::landlock`]);
-//! 2. das Laden der eBPF-Objekte — den transaktionalen Produktionspfad
+//! 1. das aktive DoD-Profil und seinen cgroup-Scope ([`crate::profile`]:
+//!    ungültige oder nicht vertrauenswürdige Konfiguration, kein auflösbarer
+//!    cgroup-Wurzelpfad, ungültiges `--cgroup-root`) — immer ein harter
+//!    Startabbruch vor jedem Lade- oder Anheftschritt;
+//! 2. die Landlock-Durchsetzung ([`crate::landlock`]);
+//! 3. das Laden der eBPF-Objekte — den transaktionalen Produktionspfad
 //!    `RealBpfLoader::load_contracts` ([`crate::real_loader::load_sensor`])
 //!    ebenso wie einen gescheiterten `load()`-Aufruf auf einem echten oder
 //!    Fixture-`harw_dod_bpf::BpfLoader` ([`crate::sensors`]);
-//! 3. den Sendeweg zum Sentinel ([`crate::sink`]);
-//! 4. Sensorfehler aus der Sammelschleife ([`crate::collect`], über
+//! 4. den Sendeweg zum Sentinel ([`crate::sink`]);
+//! 5. Sensorfehler aus der Sammelschleife ([`crate::collect`], über
 //!    `harw_dod_cap::SensorError`);
-//! 5. den `completions`-Unterbefehl (über
+//! 6. den `completions`-Unterbefehl (über
 //!    `harw_completions::CompletionError`).
 //!
 //! **Nicht** hierher gehört ein fehlendes oder ungültiges eBPF-Objekt: die
@@ -61,6 +65,11 @@
 //! Host gelesenes Geheimnis, kein Rohereignisbyte.
 //! [`ProbeError::Completions`] trägt höchstens Pfade der Shell-
 //! Konfiguration des aufrufenden Nutzers (Completion-Datei, rc-Datei).
+//! [`ProbeError::Config`] reicht die Meldung von `harw_dod_config::ConfigError`
+//! durch; bei einem TOML-Parsefehler kann sie die betroffene Zeile der
+//! Konfigurationsdatei zitieren — der eigenen, root-eigenen
+//! Betreiberkonfiguration (Profilnamen, cgroup-Pfade, CIDRs; kein
+//! Hostgeheimnis), genau so, wie `harw-sentinel` sie beim Start protokolliert.
 //!
 //! # Exportierte Typen
 //! [`ProbeError`].
@@ -84,6 +93,49 @@ use std::fmt;
 /// Siehe Moduldoku für die Einteilung der Varianten und die
 /// Inhaltsfreiheits-Ausnahme.
 pub enum ProbeError {
+    /// The DoD configuration could not be loaded, is not trusted, or selects
+    /// no (or an unknown) active profile. Always a hard start failure: this
+    /// probe never falls back to built-in defaults or to the host scope.
+    ///
+    /// # Arguments
+    /// - `source`: the configuration path that was read (`--config` or
+    ///   `harw_dod_config::SYSTEM_CONFIG_PATH`), as configured by the
+    ///   operator.
+    /// - `error` (`harw_dod_config::ConfigError`): the underlying cause,
+    ///   linked through `std::error::Error::source()`.
+    Config {
+        /// The configuration path that was read.
+        source: String,
+        /// The loader or resolver error.
+        error: harw_dod_config::ConfigError,
+    },
+
+    /// A cgroup-scoped profile is active, but none of its configured roots
+    /// resolved below `--cgroup-root`. The probe refuses to attach instead of
+    /// widening the scope to the host.
+    CgroupScopeUnresolved {
+        /// The cgroup2 mount the roots were resolved against.
+        cgroup_root: String,
+        /// Number of configured roots, none of which resolved.
+        configured: usize,
+    },
+
+    /// `--cgroup-root` is not usable for a cgroup-scoped profile: it must be
+    /// absolute, must not be `/` and must not contain `..` (it becomes a
+    /// Landlock root, see `crate::landlock`).
+    CgroupRootInvalid {
+        /// The rejected `--cgroup-root`, as configured by the operator.
+        path: String,
+    },
+
+    /// The resolved cgroup ids do not form a valid BPF scope (e.g. more
+    /// roots than `harw_dod_bpf::MAX_SCOPE_CGROUP_IDS`).
+    ///
+    /// # Arguments
+    /// - `source` (`harw_dod_bpf::BpfError`): the content-free rejection,
+    ///   linked through `std::error::Error::source()`.
+    CgroupScopeRejected(harw_dod_bpf::BpfError),
+
     /// Landlock hat den Dateisystem-Ausschnitt dieser Sonde nicht vollständig
     /// durchgesetzt (jeder Ausgang außer `RulesetStatus::FullyEnforced`).
     ///
@@ -147,6 +199,27 @@ pub enum ProbeError {
 impl fmt::Display for ProbeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Config { source, error } => write!(
+                f,
+                "refusing to start: DoD configuration '{source}' is untrusted, invalid or selects no active profile: {error}"
+            ),
+            Self::CgroupScopeUnresolved {
+                cgroup_root,
+                configured,
+            } => write!(
+                f,
+                "refusing to attach: none of the {configured} configured cgroup roots of the active DoD profile exists below '{cgroup_root}' (the scope is never widened to the host)"
+            ),
+            Self::CgroupRootInvalid { path } => write!(
+                f,
+                "refusing to start: --cgroup-root '{path}' must be an absolute directory other than '/' without '..' components"
+            ),
+            Self::CgroupScopeRejected(source) => {
+                write!(
+                    f,
+                    "refusing to attach: the resolved cgroup scope is invalid: {source}"
+                )
+            }
             Self::LandlockUnavailable => write!(
                 f,
                 "Landlock did not fully enforce the configured filesystem scope; refusing to start"
@@ -174,6 +247,8 @@ impl fmt::Debug for ProbeError {
 impl std::error::Error for ProbeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Config { error, .. } => Some(error),
+            Self::CgroupScopeRejected(source) => Some(source),
             Self::BpfLoad(source) => Some(source),
             Self::EventEncodeFailed(source) => Some(source),
             Self::Sensor(source) => Some(source),
@@ -286,6 +361,37 @@ mod tests {
         assert!(matches!(mapped, ProbeError::EventEncodeFailed(_)));
         assert!(std::error::Error::source(&mapped).is_some());
         Ok(())
+    }
+
+    #[test]
+    fn test_config_error_names_the_source_and_links_the_cause() {
+        let err = ProbeError::Config {
+            source: "/etc/harw-dod/config.toml".to_owned(),
+            error: harw_dod_config::ConfigError::MissingActiveProfile,
+        };
+        let text = err.to_string();
+        assert!(
+            text.starts_with("refusing to start: DoD configuration '/etc/harw-dod/config.toml'")
+        );
+        assert!(text.contains("no active_profile"));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn test_cgroup_scope_errors_say_the_scope_is_not_widened() {
+        let unresolved = ProbeError::CgroupScopeUnresolved {
+            cgroup_root: "/sys/fs/cgroup".to_owned(),
+            configured: 2,
+        };
+        assert!(unresolved.to_string().contains("never widened to the host"));
+        assert!(std::error::Error::source(&unresolved).is_none());
+        let rejected =
+            ProbeError::CgroupScopeRejected(harw_dod_bpf::BpfError::InvalidProgramContract);
+        assert!(std::error::Error::source(&rejected).is_some());
+        let root = ProbeError::CgroupRootInvalid {
+            path: "/".to_owned(),
+        };
+        assert!(root.to_string().contains("--cgroup-root '/'"));
     }
 
     #[test]

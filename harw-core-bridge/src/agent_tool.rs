@@ -2465,10 +2465,10 @@ pub(crate) async fn fanout_children_with(
                 winner_decided = true;
                 winner.store(true, Ordering::SeqCst);
                 for (sibling, _) in &running {
-                    if let Some(child) = admitted[*sibling].get() {
-                        if !spawner.request_cancellation(child) {
-                            tracing::warn!(child = %child, "agent_fanout.cancel_channel_missing");
-                        }
+                    if let Some(child) = admitted[*sibling].get()
+                        && !spawner.request_cancellation(child)
+                    {
+                        tracing::warn!(child = %child, "agent_fanout.cancel_channel_missing");
                     }
                 }
             }

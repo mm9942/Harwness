@@ -82,10 +82,10 @@ impl ConfigWriter {
     /// - [`ConfigError::Io`]: das Elternverzeichnis konnte nicht angelegt
     ///   oder nicht auf `0700` gesetzt werden.
     pub fn open(path: &Path) -> ConfigResult<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                ensure_private_dir(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            ensure_private_dir(parent)?;
         }
         let doc = match fs::read_to_string(path) {
             Ok(content) => content
@@ -546,12 +546,11 @@ fn collect_backup_numbers(path: &Path) -> ConfigResult<Vec<u32>> {
     let mut numbers = Vec::new();
     for entry in entries {
         let entry = entry.map_err(ConfigError::from)?;
-        if let Some(name) = entry.file_name().to_str() {
-            if let Some(suffix) = name.strip_prefix(&prefix) {
-                if let Ok(n) = suffix.parse::<u32>() {
-                    numbers.push(n);
-                }
-            }
+        if let Some(name) = entry.file_name().to_str()
+            && let Some(suffix) = name.strip_prefix(&prefix)
+            && let Ok(n) = suffix.parse::<u32>()
+        {
+            numbers.push(n);
         }
     }
     Ok(numbers)

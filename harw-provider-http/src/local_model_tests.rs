@@ -11,6 +11,7 @@ use super::*;
 use crate::test_support::{TestError, TestResult, ctx};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 

@@ -34,6 +34,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod capacity;
 pub mod error;
 mod fsops;
 pub mod job_record_store;

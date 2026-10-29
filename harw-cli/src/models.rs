@@ -465,10 +465,10 @@ fn protected_model_ids(
     }
 
     let uia_provider = harness.uia_provider.as_deref().or(default_provider);
-    if uia_provider == Some(provider_name) {
-        if let Some(id) = &harness.uia_model {
-            protected.insert(id.clone(), ProtectionReason::InUse);
-        }
+    if uia_provider == Some(provider_name)
+        && let Some(id) = &harness.uia_model
+    {
+        protected.insert(id.clone(), ProtectionReason::InUse);
     }
 
     // uia_worker_model ist an uia_provider gekoppelt (dieselbe Or-Kette wie
@@ -479,10 +479,10 @@ fn protected_model_ids(
     // Provider-Katalog-Modell, greift dieser Block nicht — das ist reine
     // Prune-Schutzlogik, die Ablehnung der Inkonsistenz selbst passiert an
     // anderer Stelle.
-    if uia_provider == Some(provider_name) {
-        if let Some(id) = &harness.uia_worker_model {
-            protected.insert(id.clone(), ProtectionReason::InUse);
-        }
+    if uia_provider == Some(provider_name)
+        && let Some(id) = &harness.uia_worker_model
+    {
+        protected.insert(id.clone(), ProtectionReason::InUse);
     }
 
     for point in harw_config::InternalModelPoint::ALL {
@@ -490,10 +490,10 @@ fn protected_model_ids(
             continue;
         };
         let choice_provider = choice.provider.as_deref().or(default_provider);
-        if choice_provider == Some(provider_name) {
-            if let Some(id) = &choice.model {
-                protected.insert(id.clone(), ProtectionReason::InUse);
-            }
+        if choice_provider == Some(provider_name)
+            && let Some(id) = &choice.model
+        {
+            protected.insert(id.clone(), ProtectionReason::InUse);
         }
     }
 
@@ -713,13 +713,14 @@ fn delete_model(home: &Path, target: &str) -> Result<(), ModelsError> {
     selected.remove(model_id);
     write_provider_model_list(&provider_path(&profile, provider_name), selected)?;
     let model_path = profile.join("models").join(model_filename(model_id));
-    if let Ok(metadata) = fs::symlink_metadata(&model_path) {
-        if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-            fs::remove_file(&model_path).map_err(|source| ModelsError::Io {
-                path: model_path,
-                source,
-            })?;
-        }
+    if let Ok(metadata) = fs::symlink_metadata(&model_path)
+        && metadata.file_type().is_file()
+        && !metadata.file_type().is_symlink()
+    {
+        fs::remove_file(&model_path).map_err(|source| ModelsError::Io {
+            path: model_path,
+            source,
+        })?;
     }
     println!("{provider_name}/{model_id} entfernt.");
     Ok(())
@@ -1024,6 +1025,7 @@ fn write_discovered_model_file(
             // Unknown: images are sent and a model without image input answers
             // with a visible server error (see `ModelCapabilitiesToml::image_input`).
             image_input: None,
+            chat_reasoning_replay: None,
         },
         default_reasoning_effort: None,
     };

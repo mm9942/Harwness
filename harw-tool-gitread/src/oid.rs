@@ -105,7 +105,7 @@ pub fn parse_hex_prefix(text: &str) -> Option<(Vec<u8>, Option<u8>)> {
     }
     let bytes = text.as_bytes();
     let mut full = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         full.push(hex_value(chunk[0])? << 4 | hex_value(chunk[1])?);
     }
     let half = if bytes.len() % 2 == 1 {

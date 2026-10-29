@@ -18,6 +18,7 @@
   "tools": {
     "admitted": [
       "fs.read",
+      "fs.view_image",
       "fs.list",
       "fs.search",
       "fs.glob",
@@ -103,7 +104,8 @@
       "fs.grep",
       "fs.list",
       "fs.read",
-      "fs.search"
+      "fs.search",
+      "fs.view_image"
     ],
     "forbidden_tools": [
       "fs.edit",
@@ -189,6 +191,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "5a454fe3025e408d46859b84017d0dd0f91a4783f01e53d3f822b822571fada7"
+    "digest": "04d1cce990248cfdf28c860f03a077b1f8dc95ab7967144b19054902fd5684a6"
   }
 }

@@ -589,11 +589,11 @@ fn normalize_schema(value: &Value) -> Value {
                 _ => {}
             },
             "anyOf" | "oneOf" => {
-                if let Value::Array(variants) = entry {
-                    if !out.contains_key("anyOf") {
-                        let mapped = variants.iter().map(normalize_schema).collect();
-                        out.insert("anyOf".to_owned(), Value::Array(mapped));
-                    }
+                if let Value::Array(variants) = entry
+                    && !out.contains_key("anyOf")
+                {
+                    let mapped = variants.iter().map(normalize_schema).collect();
+                    out.insert("anyOf".to_owned(), Value::Array(mapped));
                 }
             }
             "items" => {

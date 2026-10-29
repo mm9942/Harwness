@@ -23,7 +23,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Obergrenze beim Lesen einer einzelnen Git-Datei (Index, Refs, Packs-Index, …).
-pub const MAX_GIT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Kein Aufrufer übergibt mehr an [`Repo::read_git_file`]; eine
+/// Compile-Zeit-Prüfung im Testmodul hält die Einzelgrenzen darunter.
+pub const MAX_GIT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Obergrenze beim Auflisten eines Verzeichnisses.
 pub const MAX_DIR_NAMES: usize = 200_000;
@@ -134,6 +136,15 @@ impl Repo {
     /// I/O-Fehler oder Überschreitung von `cap` (`InvalidData`).
     pub fn read_git_file(&self, rest: &str, cap: u64) -> std::io::Result<Vec<u8>> {
         let mut file = self.open_git_file(rest)?;
+        // Größe vor dem Lesen prüfen: eine übergroße Datei kostet so weder
+        // Zeit noch Speicher. Der `take` darunter bleibt als Schutz gegen
+        // eine Datei, die zwischen `fstat` und Lesen wächst.
+        if file.metadata()?.len() > cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{rest} is larger than {cap} bytes"),
+            ));
+        }
         let mut bytes = Vec::new();
         file.by_ref()
             .take(cap.saturating_add(1))
@@ -200,6 +211,31 @@ mod tests {
         assert!(opened.read_git_file("missing", 10).is_err());
         Ok(())
     }
+
+    #[test]
+    fn oversized_git_file_is_refused_by_size_before_reading() -> TestResult {
+        let repo = TestRepo::new()?;
+        let file = File::create(repo.ws.join(".git").join("big"))?;
+        file.set_len(MAX_GIT_FILE_BYTES + 1)?;
+        drop(file);
+        let opened = Repo::open(&repo.ws)?;
+        let error = opened
+            .read_git_file("big", MAX_GIT_FILE_BYTES)
+            .err()
+            .ok_or(TestError::Missing("size error"))?;
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        Ok(())
+    }
+
+    // Auto-approved git.* reads: no single file above 64 MiB. Checked at
+    // compile time so a raised cap fails the build of the test target.
+    const _: () = {
+        assert!(crate::index::MAX_INDEX_BYTES <= MAX_GIT_FILE_BYTES);
+        assert!(crate::odb::MAX_IDX_BYTES <= MAX_GIT_FILE_BYTES);
+        assert!(crate::odb::MAX_OBJECT_BYTES <= MAX_GIT_FILE_BYTES);
+        assert!(crate::refs::MAX_PACKED_REFS_BYTES <= MAX_GIT_FILE_BYTES);
+        assert!(MAX_GIT_FILE_BYTES <= 64 * 1024 * 1024);
+    };
 
     #[test]
     fn missing_dot_git_and_foreign_gitdir_are_rejected() -> TestResult {

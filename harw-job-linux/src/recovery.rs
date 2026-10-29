@@ -87,21 +87,21 @@ impl LinuxRecoveryIdentity {
         if let Some(reason) = self.compare_start_time(observed) {
             return Some(reason);
         }
-        if let (Some(expected), Some(actual)) = (&self.executable, &observed.executable) {
-            if normalize_exe(expected) != normalize_exe(actual) {
-                return Some(MismatchReason::ExecutableDiffers {
-                    expected: expected.clone(),
-                    actual: actual.clone(),
-                });
-            }
+        if let (Some(expected), Some(actual)) = (&self.executable, &observed.executable)
+            && normalize_exe(expected) != normalize_exe(actual)
+        {
+            return Some(MismatchReason::ExecutableDiffers {
+                expected: expected.clone(),
+                actual: actual.clone(),
+            });
         }
-        if let (Some(expected), Some(actual)) = (&self.cgroup_path, &observed.cgroup_v2_path) {
-            if expected != actual {
-                return Some(MismatchReason::CgroupDiffers {
-                    expected: expected.clone(),
-                    actual: actual.clone(),
-                });
-            }
+        if let (Some(expected), Some(actual)) = (&self.cgroup_path, &observed.cgroup_v2_path)
+            && expected != actual
+        {
+            return Some(MismatchReason::CgroupDiffers {
+                expected: expected.clone(),
+                actual: actual.clone(),
+            });
         }
         None
     }

@@ -11,7 +11,7 @@
 # service. `make -C dod enable-warden` starts it explicitly.
 
 [Unit]
-Description=HARW DoD Warden activation socket (SOCK_SEQPACKET, disabled by default)
+Description=Harw-DoD Warden activation socket (SOCK_SEQPACKET, disabled by default)
 Documentation=man:harw-warden(1)
 ConditionPathExists=@SYSCONFDIR@/warden.enable
 

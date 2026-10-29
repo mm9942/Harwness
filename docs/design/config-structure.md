@@ -104,6 +104,9 @@ json = false                         # structured JSON logs vs. human-readable
 [tui]
 theme = "default-dark"
 keybindings_file = "keybindings.toml"   # relative to this config.toml's own layer directory
+reasoning = "message"                # message|collapsed|hidden — how the model's reasoning
+                                     # summaries appear in the history (PL-97 R1): a readable
+                                     # markdown block (default), one collapsed line, or not at all
 
 [session]
 store_dir = "sessions"               # relative to workspace_root
@@ -117,16 +120,43 @@ require_approval_for = ["exec", "fs-write-outside-workspace"]
 [tools.doc]
 remote_ocr = "ask"                   # off|ask|on — may doc.read_pdf upload PDFs to a remote OCR
                                      # service (Mistral)? default "off"; "ask" asks before every upload
+
+[skills]
+triggered_injection = true           # deliver matching skill sections per model round (L1)
+inject_imported = false              # also deliver imported skills, framed as Evidence
+per_turn_bytes = 4096                # cap per round (256..=65536); effective ~3 % of the window, >= 1 KiB
+per_session_bytes = 16384            # cap until the next compaction (256..=65536); at most 4 effective per-round budgets
+
+[sandbox]
+execution = "chain"                  # chain|legacy — how shell.exec, job.start and child agents
+                                     # start processes (PL-97 E2); default "chain"
 ```
 
 Notes:
-- `[logging]`, `[tui]`, `[session]`, `[policy]`, `[tools.doc]` are all optional tables;
+- `[logging]`, `[tui]`, `[session]`, `[policy]`, `[tools.doc]`, `[skills]` are all optional tables;
   every field inside them has a hard-coded default so a bare `config.toml`
   with only `default_provider`/`default_model` remains valid (backward
   compatible with the pre-existing two-field `HarnessConfig`).
 - `tui.keybindings_file` is resolved relative to the *layer* the
   `config.toml` came from, so a repo-level `.harw/config.toml` can point at
   a repo-level `.harw/keybindings.toml` without an absolute path.
+- `[skills]` (PL-95 S3) is profile-scoped: every field is `ProfileReplaces`,
+  so the home layer and the active profile set it and an untrusted project
+  layer never does (it cannot switch `inject_imported` on). See §2.7 for what
+  the injector delivers.
+- `[sandbox] execution` (PL-97 E2) is profile-scoped and security-critical
+  (`ProfileReplaces`): the home layer and the active profile set it, an
+  untrusted project layer never does (a repository cannot switch its jobs
+  back to the legacy path). `chain` (the default) runs `shell.exec`,
+  `job.start` and child agents through the job runtime's sandbox chain
+  (job cgroup, Bubblewrap, Landlock trampoline, as `select_backend` finds
+  them); a job with a per-job write scope or a `required` sandbox is refused
+  where the chain cannot enforce it. `legacy` keeps the pre-built
+  `prlimit … -- bwrap …` argv run as a host job. Any other value is a parse
+  error. `harw-config` only parses the key
+  (`SandboxSection::effective_execution`); the consumers switch on it in
+  PL-97 E2b. The other `[sandbox]` keys (`cargo`, `tmux`) are home-only
+  (`GlobalOnly`, see `config-scopes.md`).
 
 ### 2.2 `auth.toml` — credential references
 
@@ -316,7 +346,45 @@ priority    = 50                                     # u8, higher first
 ```
 
 Triggers never grant rights. S1 ships the parser, `TriggerIndex` and the pure
-`select` core in `harw-catalog`; runtime wiring follows in later cycles.
+`select` core in `harw-catalog`.
+
+**Triggered injection (S3, `[skills]`).** The skill index (and with it the
+`TriggerIndex`) is built once per runtime assembly. Every root session gets a
+`harw_core::SkillInjector` that, before each model round, feeds the history
+items since the previous round into `select`: user text (keywords, error
+codes), tool results (error codes), the first call of a tool name (`tools`),
+path arguments of `fs.*`/`doc.*` calls (`paths`) and command arguments of
+`shell.*`/`process.*`/`job.start` calls (`commands`). Each selected `##`
+section becomes a context fragment of section `skills.triggered`
+(`Stability::Fresh`, trust `Instruction` for bundled and trusted-layer skills,
+`Evidence` for imported ones). The excerpts go through their own montage
+against the session's context program (`exclude`, `must_include`) and
+ceiling, with the total budget the regular montage leaves. The rendered
+instruction block is appended as the *last* entry of the request's
+instruction fragments, and every provider renders `system_prompt` followed by
+the instruction fragments in order. So the system prompt, the bound skill
+fragments and the L0 catalog stay a byte-identical prefix of the provider's
+system text when an excerpt arrives. Imported skills (`Evidence`) go into the
+data block after the history instead.
+A delivered excerpt stays active and is re-sent in every request until the
+next compaction; a skill section is delivered at most once while it is
+active. Budgets: per round ~3 % of the model window, at least 1 KiB, at most
+`per_turn_bytes`. This bounds both the new deliveries of a round and the
+active excerpts every request carries: older excerpts are evicted to make
+room, and an evicted excerpt may be delivered again. Per session (until the
+next compaction) the cap is `per_session_bytes`, at most four effective
+per-round budgets.
+A selection that never reaches the model costs nothing: the activation
+switching its label off, or the montage omitting it, releases its dedupe and
+its session bytes. A delivery is recorded only once the model has answered a
+request that carries it, exactly once even when the request is rebuilt after
+an emergency compaction or retried after a context-length error. It is
+recorded in the session transcript as a lifecycle record with
+`"marker": "skill_injection"` (skill, section, trigger kind and key, bytes,
+turn, trust, SHA-256 — never the text). A session whose context ceiling
+does not admit `skills.triggered` (closed entry points) gets nothing. The L0
+catalog in the root's instruction fragments lists `name — when` lines of the
+skills, ordered by priority and name and capped at 1.5 KiB.
 
 `mcps/*.toml` contains declarative metadata (`name`, `description`,
 `transport`, endpoint or command metadata, tools, and `enabled`). Discovery

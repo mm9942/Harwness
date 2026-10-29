@@ -3634,14 +3634,14 @@ impl ManagedAgentSpawner {
         // dabei bricht die Verlängerung nicht ab — die In-Memory-Sicht bleibt
         // korrekt, nur die Durability hinkt bis zur nächsten Verlängerung
         // hinterher.
-        if let Some(lease_store) = &self.lease_store {
-            if let Err(error) = lease_store.renew(child, self.limits.lease_seconds, now) {
-                tracing::warn!(
-                    child = %child,
-                    error = %error,
-                    "child_lease_renew.durable_renew_failed"
-                );
-            }
+        if let Some(lease_store) = &self.lease_store
+            && let Err(error) = lease_store.renew(child, self.limits.lease_seconds, now)
+        {
+            tracing::warn!(
+                child = %child,
+                error = %error,
+                "child_lease_renew.durable_renew_failed"
+            );
         }
         Ok(())
     }
@@ -5220,12 +5220,11 @@ impl ManagedAgentSpawner {
             return false;
         };
         token.cancel(reason);
-        if let Ok(mut active) = self.active.lock() {
-            if let Some(record) = active.get_mut(child.as_str()) {
-                if matches!(record.status, ChildStatus::Admitted | ChildStatus::Paused) {
-                    record.status = ChildStatus::Cancelled;
-                }
-            }
+        if let Ok(mut active) = self.active.lock()
+            && let Some(record) = active.get_mut(child.as_str())
+            && matches!(record.status, ChildStatus::Admitted | ChildStatus::Paused)
+        {
+            record.status = ChildStatus::Cancelled;
         }
         true
     }
@@ -8258,16 +8257,15 @@ impl ManagedAgentSpawner {
         // A recovery envelope is evidence, never authority. Identity fields
         // must bind exactly to the fresh admission request before any mutable
         // controller state is created.
-        if let Some(recovery) = recovery {
-            if recovery.child.as_str().is_empty()
+        if let Some(recovery) = recovery
+            && (recovery.child.as_str().is_empty()
                 || recovery.parent != input.parent_session_id
                 || recovery.handoff_call_id != input.handoff_call_id
-                || recovery.role != role_name
-            {
-                return Err(AdmitRejection::Other(Self::reject(
-                    "agent recovery identity does not match the current admission",
-                )));
-            }
+                || recovery.role != role_name)
+        {
+            return Err(AdmitRejection::Other(Self::reject(
+                "agent recovery identity does not match the current admission",
+            )));
         }
 
         // W2-19: die Agent-IR dieser Rolle wird vor jeder Prüfung aufgelöst,
@@ -8507,9 +8505,10 @@ impl ManagedAgentSpawner {
             let entry = recent
                 .entry(input.parent_session_id.as_str().to_owned())
                 .or_default();
-            if entry.contains(&hash) {
-                if let Some(observer) = &self.drift_observer {
-                    observer.on_drift(&crate::guard::DriftEvent {
+            if entry.contains(&hash)
+                && let Some(observer) = &self.drift_observer
+            {
+                observer.on_drift(&crate::guard::DriftEvent {
                         kind: crate::guard::DriftKind::DuplicateDelegation,
                         session_id: input.parent_session_id.as_str().to_owned(),
                         detail: format!(
@@ -8518,7 +8517,6 @@ impl ManagedAgentSpawner {
                         tool_name: None,
                         child_role: Some(role_name.to_owned()),
                     });
-                }
             }
             entry.push_back(hash);
             if entry.len() > RECENT_DELEGATION_HASH_CAPACITY {
@@ -8672,15 +8670,15 @@ impl ManagedAgentSpawner {
         // Deckenschnitt, aus demselben Grund wie dieser selbst: ein
         // zweiter, separater Prüfschritt wäre eine Lücke, die vergessen
         // werden könnte.
-        if let Some(ir) = executable_ir {
-            if let Some(violation) = Self::describe_context_program_ceiling_violation(
+        if let Some(ir) = executable_ir
+            && let Some(violation) = Self::describe_context_program_ceiling_violation(
                 &child_ceiling,
                 ir.context_program(),
-            ) {
-                return Err(AdmitRejection::Other(Self::reject(format!(
-                    "child context program escalation rejected: {violation}"
-                ))));
-            }
+            )
+        {
+            return Err(AdmitRejection::Other(Self::reject(format!(
+                "child context program escalation rejected: {violation}"
+            ))));
         }
         // Wave 8: Reasoning-Effort wird monoton vom Parent geerbt (Kind ≤ Parent).
         // Der Default ist Gleichheit; ein Budget-Clamp oder Owner-Override wird

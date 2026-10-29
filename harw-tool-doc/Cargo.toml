@@ -6,13 +6,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-# Höher als workspace.package.rust-version (1.85): oxidize-pdf >=5 (die von
-# doc.read_pdf/native.rs verwendete API-Generation, siehe design-doc
-# doc_read_pdf_design.md) deklariert selbst rust-version 1.88. Mit dem
-# geerbten Workspace-Default löst `cargo add`/der MSRV-Resolver still auf die
-# inkompatible 2.x-Reihe zurück. Der installierte Compiler (1.98.1) erfüllt
-# 1.88 problemlos; nur diese Crate braucht die höhere deklarierte MSRV.
-rust-version = "1.88"
+# oxidize-pdf >=5 (doc.read_pdf/native.rs, design-doc doc_read_pdf_design.md)
+# deklariert rust-version 1.88; die Workspace-MSRV (1.89) deckt das ab.
+rust-version.workspace = true
 
 [dependencies]
 harw-authority = { path = "../harw-authority" }

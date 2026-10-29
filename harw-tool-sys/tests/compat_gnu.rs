@@ -239,15 +239,14 @@ fn lsof_sees_the_same_files_as_lsof() -> TestResult {
         eprintln!("skipped: lsof");
     }
     drop(held);
-    // Fremde Prozesse (PID 1 gehört root) werden abgelehnt, sofern wir nicht root sind.
-    if uid != 0 {
-        let foreign = harw_tool_sys::lsof::run(
-            &ProcFs::real(),
-            uid,
-            &serde_json::from_value(json!({"pid": 1}))?,
-        );
-        assert!(matches!(foreign, ToolOutput::Error { .. }));
-    }
+    // A different caller UID cannot inspect this known live process. PID 1
+    // may belong to our own user in a container, so it is not a foreign fixture.
+    let foreign = harw_tool_sys::lsof::run(
+        &ProcFs::real(),
+        uid.wrapping_add(1),
+        &serde_json::from_value(json!({"pid": pid}))?,
+    );
+    assert!(matches!(foreign, ToolOutput::Error { .. }));
     Ok(())
 }
 
@@ -443,10 +442,11 @@ fn free_uname_id_date_which_uptime_env_match_the_gnu_tools() -> TestResult {
             {
                 continue;
             }
-            if let Some(entry) = ours.iter().find(|e| e["name"] == name) {
-                if entry["masked"] == false && !val.contains('\n') {
-                    assert_eq!(entry["value"].as_str(), Some(val), "{name}");
-                }
+            if let Some(entry) = ours.iter().find(|e| e["name"] == name)
+                && entry["masked"] == false
+                && !val.contains('\n')
+            {
+                assert_eq!(entry["value"].as_str(), Some(val), "{name}");
             }
         }
     } else {

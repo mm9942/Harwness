@@ -239,14 +239,14 @@ pub(crate) fn set_tier(
             .scan()
             .map_err(|error| format!("Geräte-Registry nicht lesbar: {error}"))?;
         let mut hits = scan.records.iter().filter(|r| r.device == id);
-        if let (Some(current), None) = (hits.next(), hits.next()) {
-            if current.tier != PermissionTier::Owner {
-                return Err(format!(
-                    "Das Erhöhen von Gerät '{}' ({} -> owner) verlangt --yes-owner; nichts geschrieben.",
-                    clean(id.as_str()),
-                    tier_name(current.tier)
-                ));
-            }
+        if let (Some(current), None) = (hits.next(), hits.next())
+            && current.tier != PermissionTier::Owner
+        {
+            return Err(format!(
+                "Das Erhöhen von Gerät '{}' ({} -> owner) verlangt --yes-owner; nichts geschrieben.",
+                clean(id.as_str()),
+                tier_name(current.tier)
+            ));
         }
     }
     let change = registry.set_tier(&id, tier).map_err(|error| match error {

@@ -22,13 +22,18 @@
 //!    and validate the [`plan::ExecPlanV1`].
 //! 3. Create the report file (`O_CREAT|O_EXCL|O_NOFOLLOW`, `0600`) while
 //!    the process is still unrestricted.
-//! 4. Security-sensitive ordering (§24): join the job cgroup
-//!    (`CgroupBackend::attach_self`) → `setrlimit` → sandbox
-//!    (`NO_NEW_PRIVS`, capability drop, Landlock `restrict_self`).
+//! 4. Security-sensitive ordering (§24): cgroup membership — join the job
+//!    cgroup (`CgroupBackend::attach_self`), or only verify the
+//!    unified-hierarchy entry of `/proc/self/cgroup` when the supervisor
+//!    already placed the process there ([`plan::CgroupVerify`]) →
+//!    `setrlimit` → sandbox (`NO_NEW_PRIVS`, capability drop, Landlock
+//!    `restrict_self`).
 //! 5. Write the [`harw_job_core::SandboxReport`] into the already open
 //!    report file.
-//! 6. Check the plan's [`harw_job_core::SandboxRequirement`]; if it is not
-//!    met, exit [`exit_code::SANDBOX_REFUSED`] without ever running the job.
+//! 6. A failed cgroup verification (recorded in the report as
+//!    `resource_limits` not enforced) exits [`exit_code::SANDBOX_REFUSED`];
+//!    so does a plan [`harw_job_core::SandboxRequirement`] that is not met.
+//!    Either way the job never runs.
 //! 7. `exec` the job program with its arguments. The environment, working
 //!    directory and stdio are inherited from the supervisor's `Command`.
 //!
@@ -81,9 +86,14 @@ pub use error::ExecError;
 #[cfg(target_os = "linux")]
 pub use parent::TrampolineCommand;
 #[cfg(target_os = "linux")]
-pub use plan::{CgroupJoin, ExecPlanV1, MAX_PLAN_BYTES, PLAN_VERSION};
+pub use plan::{
+    CgroupJoin, CgroupMembership, CgroupVerify, ExecPlanV1, MAX_PLAN_BYTES, PLAN_VERSION,
+    PROC_SELF_CGROUP, unified_cgroup_path,
+};
 #[cfg(target_os = "linux")]
-pub use report::{check_requirement, read_report, resource_limits_state, unsandboxed_report};
+pub use report::{
+    check_requirement, merge_reports, read_report, resource_limits_state, unsandboxed_report,
+};
 #[cfg(target_os = "linux")]
 pub use trampoline::{TrampolineArgs, run_trampoline};
 

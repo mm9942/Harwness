@@ -293,6 +293,7 @@ pub(super) async fn execute_kanban_claim(
     };
     let card_notes = notes::load_notes(store, &card.board_id, &card.record.id).unwrap_or_default();
     let narrowing = RuntimeNarrowing {
+        write_scope: sandbox.write_scope().clone(),
         registry_profile: profile,
         identity: kanban_identity(&card, profile),
         permissions: sandbox.permissions().clone(),

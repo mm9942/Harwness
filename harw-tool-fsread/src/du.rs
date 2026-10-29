@@ -228,7 +228,8 @@ pub fn run(root: &Path, args: &DuArgs) -> ToolOutput {
     name = "fsread.du",
     description = "Sums disk usage of a workspace directory like du: allocated blocks (default) or --apparent-size, -s, -d/max_depth, -a, -h; hard links are counted once. Use when you need to know what takes space instead of running du. Returns JSON {entries:[{path,bytes}], total_bytes, complete, truncated}; the walk is bounded (100000 entries, 5 s) and complete=false means the total is a lower bound.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_du(context: &ToolExecutionContext, args: DuArgs) -> Result<ToolOutput, ToolsError> {
     let root = workspace_root(context);

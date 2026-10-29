@@ -10,6 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use jiff::SignedDuration;
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,59 @@ pub enum SpecError {
         /// Rendered cause.
         reason: String,
     },
+    /// The write scope version is not understood by this build. Refused,
+    /// never ignored.
+    UnsupportedWriteScopeVersion {
+        /// Version found in the scope.
+        found: u32,
+        /// Version this build reads.
+        supported: u32,
+    },
+    /// A write scope lists more paths than [`JobWriteScope::MAX_PATHS`].
+    TooManyWriteScopePaths {
+        /// Number of listed paths.
+        count: usize,
+        /// The maximum.
+        max: usize,
+    },
+    /// A write scope path is not absolute, not normalised, not UTF-8, the
+    /// host root, or resolves outside the workspace.
+    InvalidWriteScopePath {
+        /// The rejected path (lossy rendering).
+        path: String,
+        /// Human-readable constraint.
+        reason: &'static str,
+    },
+    /// A write scope path appeared twice.
+    DuplicateWriteScopePath {
+        /// The duplicated path.
+        path: String,
+    },
+    /// A job with a write scope does not use [`SandboxRequirement::Required`].
+    WriteScopeNotRequired {
+        /// The requirement the spec carries.
+        requirement: SandboxRequirement,
+    },
+    /// The sandbox profile grants no workspace write access a write scope
+    /// could narrow (a scope never widens the profile).
+    WriteScopeWithoutWorkspaceWrite {
+        /// The profile of the spec.
+        profile: SandboxProfileName,
+    },
+    /// A write scope path lies outside the job's workspace (checked by the
+    /// runtime, which knows the workspace root).
+    WriteScopeOutsideWorkspace {
+        /// The rejected path.
+        path: String,
+    },
+    /// A write scope path does not exist and no entry of the scope covers an
+    /// existing ancestor directory of it (checked by the runtime). The
+    /// Landlock planner skips paths that do not exist, so such a path would
+    /// grant nothing.
+    WriteScopeUncovered {
+        /// The uncovered path.
+        path: String,
+    },
 }
 
 impl fmt::Display for SpecError {
@@ -100,7 +154,60 @@ impl fmt::Display for SpecError {
             Self::InvalidId { field, reason } => {
                 write!(f, "job spec field '{field}' is not a valid id: {reason}")
             }
+            Self::UnsupportedWriteScopeVersion { found, supported } => write!(
+                f,
+                "job write scope version {found} is not supported (this build reads {supported})"
+            ),
+            Self::TooManyWriteScopePaths { count, max } => {
+                write!(f, "job write scope lists {count} paths (at most {max})")
+            }
+            Self::InvalidWriteScopePath { path, reason } => {
+                write!(f, "write scope path '{path}' {reason}")
+            }
+            Self::DuplicateWriteScopePath { path } => {
+                write!(f, "write scope path '{path}' is listed twice")
+            }
+            Self::WriteScopeNotRequired { requirement } => write!(
+                f,
+                "a job with a write scope must use sandbox requirement 'required', not '{}'",
+                requirement_name(*requirement)
+            ),
+            Self::WriteScopeWithoutWorkspaceWrite { profile } => write!(
+                f,
+                "sandbox profile '{}' grants no workspace write access for a write scope to narrow",
+                profile_name(*profile)
+            ),
+            Self::WriteScopeOutsideWorkspace { path } => {
+                write!(
+                    f,
+                    "write scope path '{path}' lies outside the job's workspace"
+                )
+            }
+            Self::WriteScopeUncovered { path } => write!(
+                f,
+                "write scope path '{path}' does not exist and no scope entry covers an existing \
+                 parent directory of it (paths that do not exist get no Landlock rule)"
+            ),
         }
+    }
+}
+
+/// Wire name of a [`SandboxRequirement`] (diagnostics).
+fn requirement_name(requirement: SandboxRequirement) -> &'static str {
+    match requirement {
+        SandboxRequirement::None => "none",
+        SandboxRequirement::BestEffort => "best_effort",
+        SandboxRequirement::Required => "required",
+    }
+}
+
+/// Wire name of a [`SandboxProfileName`] (diagnostics).
+fn profile_name(profile: SandboxProfileName) -> &'static str {
+    match profile {
+        SandboxProfileName::WorkspaceBuild => "workspace_build",
+        SandboxProfileName::ReadOnlyAnalysis => "read_only_analysis",
+        SandboxProfileName::NoNetwork => "no_network",
+        SandboxProfileName::NetworkRestricted => "network_restricted",
     }
 }
 
@@ -180,6 +287,40 @@ impl From<WorkspacePath> for String {
     }
 }
 
+/// CPU bandwidth of the whole job: at most `quota_us` of CPU time per
+/// `period_us` (cgroup v2 `cpu.max`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CpuBandwidth {
+    /// CPU time per period in microseconds, at least
+    /// [`CpuBandwidth::MIN_QUOTA_US`]; above the period for more than one
+    /// CPU.
+    pub quota_us: u64,
+    /// Period length in microseconds, within
+    /// [`CpuBandwidth::MIN_PERIOD_US`]`..=`[`CpuBandwidth::MAX_PERIOD_US`].
+    pub period_us: u64,
+}
+
+impl CpuBandwidth {
+    /// Smallest quota the kernel accepts (1 ms).
+    pub const MIN_QUOTA_US: u64 = 1_000;
+    /// Shortest period the kernel accepts (1 ms).
+    pub const MIN_PERIOD_US: u64 = 1_000;
+    /// Longest period the kernel accepts (1 s).
+    pub const MAX_PERIOD_US: u64 = 1_000_000;
+    /// Default cgroup v2 period (100 ms).
+    pub const DEFAULT_PERIOD_US: u64 = 100_000;
+
+    /// A quota of `cpus` whole CPUs at the default period.
+    #[must_use]
+    pub fn cpus(cpus: u32) -> Self {
+        Self {
+            quota_us: u64::from(cpus).saturating_mul(Self::DEFAULT_PERIOD_US),
+            period_us: Self::DEFAULT_PERIOD_US,
+        }
+    }
+}
+
 /// Platform-neutral resource request. Every field is optional; `None` means
 /// "no explicit limit requested". Backends report whether they could enforce
 /// it via `SandboxReport::resource_limits`.
@@ -189,12 +330,23 @@ pub struct ResourceRequest {
     /// Memory ceiling for the whole job in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_max: Option<u64>,
+    /// Memory throttling threshold for the whole job in bytes (cgroup v2
+    /// `memory.high`); at most `memory_max` when both are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_high: Option<u64>,
     /// Relative CPU weight in `1..=10_000` (100 is the neutral default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_weight: Option<u16>,
+    /// CPU bandwidth limit of the whole job (cgroup v2 `cpu.max`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_max: Option<CpuBandwidth>,
     /// Maximum number of processes/threads in the job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pids_max: Option<u32>,
+    /// Relative I/O weight in `1..=10_000` (cgroup v2 `io.weight`; 100 is
+    /// the neutral default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_weight: Option<u16>,
     /// Wall-clock timeout of one attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_timeout: Option<SignedDuration>,
@@ -203,6 +355,19 @@ pub struct ResourceRequest {
     /// runaway allocation in a process that has no cgroup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_space_max: Option<u64>,
+    /// Process count ceiling (`RLIMIT_NPROC`), applied to the job's first
+    /// process and inherited by everything it starts.
+    ///
+    /// Linux counts `RLIMIT_NPROC` **per real UID**, not per job: a fork
+    /// fails once the user owning the job has this many processes (threads
+    /// included) in total, wherever they run, and a process with
+    /// `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN` is exempt. Inside a user
+    /// namespace (the Bubblewrap backends) the count belongs to the
+    /// namespace's UID mapping of that user. It is a fork-bomb guard that
+    /// holds without a resource domain; `pids_max` (the job cgroup) stays
+    /// the exact per-job cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_count_max: Option<u64>,
     /// CPU time ceiling per process in seconds (`RLIMIT_CPU`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_time_max: Option<u64>,
@@ -219,17 +384,33 @@ pub struct ResourceRequest {
 }
 
 impl ResourceRequest {
-    /// Whether any per-process rlimit (`address_space_max`, `cpu_time_max`,
-    /// `file_size_max`, `open_files_max`) is requested.
+    /// Whether any limit of the whole job is requested: `memory_max`,
+    /// `memory_high`, `cpu_weight`, `cpu_max`, `pids_max` or `io_weight`
+    /// (a resource domain such as a cgroup enforces them; per-process
+    /// rlimits and the wall-clock timeout are not included).
+    #[must_use]
+    pub fn requests_job_limits(&self) -> bool {
+        self.memory_max.is_some()
+            || self.memory_high.is_some()
+            || self.cpu_weight.is_some()
+            || self.cpu_max.is_some()
+            || self.pids_max.is_some()
+            || self.io_weight.is_some()
+    }
+
+    /// Whether any rlimit (`address_space_max`, `process_count_max`,
+    /// `cpu_time_max`, `file_size_max`, `open_files_max`) is requested.
     #[must_use]
     pub fn requests_rlimits(&self) -> bool {
         self.address_space_max.is_some()
+            || self.process_count_max.is_some()
             || self.cpu_time_max.is_some()
             || self.file_size_max.is_some()
             || self.open_files_max.is_some()
     }
 
-    /// Maximum permitted [`ResourceRequest::cpu_weight`].
+    /// Maximum permitted [`ResourceRequest::cpu_weight`] (and
+    /// [`ResourceRequest::io_weight`]).
     pub const MAX_CPU_WEIGHT: u16 = 10_000;
 
     /// Checks every requested value is in range.
@@ -258,8 +439,47 @@ impl ResourceRequest {
                 constraint: "must be greater than zero",
             });
         }
+        if self.memory_high == Some(0) {
+            return Err(SpecError::InvalidResource {
+                resource: "memory_high",
+                constraint: "must be greater than zero",
+            });
+        }
+        if let (Some(high), Some(max)) = (self.memory_high, self.memory_max)
+            && high > max
+        {
+            return Err(SpecError::InvalidResource {
+                resource: "memory_high",
+                constraint: "must not exceed memory_max",
+            });
+        }
+        if let Some(cpu) = self.cpu_max {
+            if !(CpuBandwidth::MIN_PERIOD_US..=CpuBandwidth::MAX_PERIOD_US).contains(&cpu.period_us)
+            {
+                return Err(SpecError::InvalidResource {
+                    resource: "cpu_max.period_us",
+                    constraint: "must be within 1000..=1000000",
+                });
+            }
+            if cpu.quota_us < CpuBandwidth::MIN_QUOTA_US {
+                return Err(SpecError::InvalidResource {
+                    resource: "cpu_max.quota_us",
+                    constraint: "must be at least 1000",
+                });
+            }
+        }
+        if self
+            .io_weight
+            .is_some_and(|weight| !(1..=Self::MAX_CPU_WEIGHT).contains(&weight))
+        {
+            return Err(SpecError::InvalidResource {
+                resource: "io_weight",
+                constraint: "must be within 1..=10000",
+            });
+        }
         for (resource, zero) in [
             ("address_space_max", self.address_space_max == Some(0)),
+            ("process_count_max", self.process_count_max == Some(0)),
             ("cpu_time_max", self.cpu_time_max == Some(0)),
             ("file_size_max", self.file_size_max == Some(0)),
             ("open_files_max", self.open_files_max == Some(0)),
@@ -312,6 +532,133 @@ pub enum SandboxProfileName {
     NetworkRestricted,
 }
 
+/// A versioned per-job write scope (PL-97 E2, PR #153 W2): the only
+/// locations inside the job's workspace the job may write.
+///
+/// # Description
+/// The scope **replaces** the workspace write grant of the job's sandbox
+/// profile and never widens it: the workspace becomes read-only except the
+/// listed paths. Writes outside the workspace (`/tmp`, `/dev/null`) are
+/// what the profile grants. A job with a write scope always runs under
+/// [`SandboxRequirement::Required`] ([`JobSpecBuilder::write_scope`] sets
+/// it, [`JobSpec::validate`] refuses anything else), so a runtime that
+/// cannot enforce the filesystem dimension refuses the job before any
+/// process starts. Profiles without workspace write access
+/// ([`SandboxProfileName::ReadOnlyAnalysis`]) take no scope.
+///
+/// # Paths
+/// Absolute, UTF-8, already normalised (no empty, `.` or `..` segment, no
+/// trailing `/`), not `/` itself, no duplicates, at most
+/// [`JobWriteScope::MAX_PATHS`]; checked here. The runtime, which knows the
+/// workspace root, checks the rest when the attempt starts: every path lies
+/// inside the workspace (also after resolving symlinks), and a path that
+/// does not exist yet (a file the job will create) is covered by another
+/// entry naming an existing ancestor directory, usually its parent. The
+/// Landlock planner skips paths that do not exist, so such a path gets no
+/// rule of its own; the covering directory entry is what grants the write.
+///
+/// # Versions
+/// `version` is checked first: a scope of another version is refused with
+/// [`SpecError::UnsupportedWriteScopeVersion`] at admission and at start,
+/// never ignored. A scope with fields this build does not know fails to
+/// deserialize.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobWriteScope {
+    /// Schema version of the scope ([`JobWriteScope::CURRENT_VERSION`]).
+    pub version: u32,
+    /// Absolute paths inside the workspace the job may write (see the type
+    /// docs).
+    pub paths: Vec<PathBuf>,
+}
+
+impl JobWriteScope {
+    /// The scope version this build writes and reads.
+    pub const CURRENT_VERSION: u32 = 1;
+    /// Most paths one scope may list (each becomes a Landlock rule).
+    pub const MAX_PATHS: usize = 256;
+
+    /// A current-version scope of `paths`, validated
+    /// ([`JobWriteScope::validate`]).
+    ///
+    /// # Errors
+    /// [`SpecError`] naming the first invalid path.
+    pub fn new<I, P>(paths: I) -> Result<Self, SpecError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        let scope = Self {
+            version: Self::CURRENT_VERSION,
+            paths: paths.into_iter().map(Into::into).collect(),
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    /// Checks the version first, then every path (see the type docs).
+    ///
+    /// # Errors
+    /// [`SpecError::UnsupportedWriteScopeVersion`],
+    /// [`SpecError::TooManyWriteScopePaths`],
+    /// [`SpecError::InvalidWriteScopePath`] or
+    /// [`SpecError::DuplicateWriteScopePath`].
+    pub fn validate(&self) -> Result<(), SpecError> {
+        if self.version != Self::CURRENT_VERSION {
+            return Err(SpecError::UnsupportedWriteScopeVersion {
+                found: self.version,
+                supported: Self::CURRENT_VERSION,
+            });
+        }
+        if self.paths.len() > Self::MAX_PATHS {
+            return Err(SpecError::TooManyWriteScopePaths {
+                count: self.paths.len(),
+                max: Self::MAX_PATHS,
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for path in &self.paths {
+            check_write_scope_path(path)?;
+            if !seen.insert(path.as_path()) {
+                return Err(SpecError::DuplicateWriteScopePath {
+                    path: path.to_string_lossy().into_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The textual rules for one write scope path (raw segments, because
+/// [`Path::components`] silently drops `.` and repeated separators).
+fn check_write_scope_path(path: &Path) -> Result<(), SpecError> {
+    let invalid = |reason: &'static str| {
+        Err(SpecError::InvalidWriteScopePath {
+            path: path.to_string_lossy().into_owned(),
+            reason,
+        })
+    };
+    let Some(text) = path.to_str() else {
+        return invalid("is not valid UTF-8");
+    };
+    if text.contains('\0') {
+        return invalid("contains a NUL byte");
+    }
+    let Some(rest) = text.strip_prefix('/') else {
+        return invalid("must be absolute");
+    };
+    if rest.is_empty() {
+        return invalid("must not be the host root");
+    }
+    if rest
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return invalid("must be normalised (no empty, '.' or '..' segment, no trailing '/')");
+    }
+    Ok(())
+}
+
 /// Minimal typed job specification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -339,6 +686,11 @@ pub struct JobSpec {
     pub idempotency_key: Option<IdempotencyKey>,
     /// Generic authority scope the job runs in.
     pub scope: JobScopeId,
+    /// Optional per-job write scope ([`JobWriteScope`]): narrows the
+    /// profile's workspace write grant to the listed paths. `None` (and
+    /// absent in old records): the profile applies unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_scope: Option<JobWriteScope>,
 }
 
 impl JobSpec {
@@ -364,7 +716,21 @@ impl JobSpec {
                 return Err(SpecError::DuplicateEnvName { name: name.clone() });
             }
         }
-        self.resources.validate()
+        self.resources.validate()?;
+        if let Some(scope) = &self.write_scope {
+            scope.validate()?;
+            if self.sandbox != SandboxRequirement::Required {
+                return Err(SpecError::WriteScopeNotRequired {
+                    requirement: self.sandbox,
+                });
+            }
+            if self.sandbox_profile == SandboxProfileName::ReadOnlyAnalysis {
+                return Err(SpecError::WriteScopeWithoutWorkspaceWrite {
+                    profile: self.sandbox_profile,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Starts a builder for running `program` (Job-Runtime-Doc §16).
@@ -372,8 +738,8 @@ impl JobSpec {
     /// Defaults: no arguments, the workspace root as working directory, an
     /// empty environment, no resource limits, sandbox profile
     /// [`SandboxProfileName::WorkspaceBuild`] at
-    /// [`SandboxRequirement::BestEffort`], scope [`DEFAULT_SCOPE`]. Nothing
-    /// is validated until [`JobSpecBuilder::build`].
+    /// [`SandboxRequirement::BestEffort`], scope [`DEFAULT_SCOPE`], no write
+    /// scope. Nothing is validated until [`JobSpecBuilder::build`].
     ///
     /// ```
     /// use harw_job_core::{JobSpec, SandboxProfileName, WorkspacePath};
@@ -399,6 +765,7 @@ impl JobSpec {
             sandbox_profile: SandboxProfileName::WorkspaceBuild,
             idempotency_key: None,
             scope: None,
+            write_scope: None,
         }
     }
 }
@@ -419,6 +786,7 @@ pub struct JobSpecBuilder {
     sandbox_profile: SandboxProfileName,
     idempotency_key: Option<IdempotencyKey>,
     scope: Option<JobScopeId>,
+    write_scope: Option<JobWriteScope>,
 }
 
 impl JobSpecBuilder {
@@ -486,6 +854,16 @@ impl JobSpecBuilder {
         self
     }
 
+    /// Narrows the job's workspace writes to `scope` ([`JobWriteScope`])
+    /// and sets [`SandboxRequirement::Required`]: a scoped job never runs on
+    /// a backend that cannot enforce it. Lowering the requirement afterwards
+    /// makes [`JobSpecBuilder::build`] fail.
+    pub fn write_scope(mut self, scope: JobWriteScope) -> Self {
+        self.write_scope = Some(scope);
+        self.sandbox = SandboxRequirement::Required;
+        self
+    }
+
     /// Builds and validates the spec.
     ///
     /// # Errors
@@ -509,6 +887,7 @@ impl JobSpecBuilder {
             sandbox_profile: self.sandbox_profile,
             idempotency_key: self.idempotency_key,
             scope,
+            write_scope: self.write_scope,
         };
         spec.validate()?;
         Ok(spec)
@@ -561,12 +940,13 @@ impl JobSpecEnvelope {
 #[cfg(test)]
 mod tests {
     use super::{
-        JobSpec, JobSpecEnvelope, ResourceRequest, SandboxProfileName, SandboxRequirement,
-        SpecError, WorkspacePath,
+        CpuBandwidth, JobSpec, JobSpecEnvelope, JobWriteScope, ResourceRequest, SandboxProfileName,
+        SandboxRequirement, SpecError, WorkspacePath,
     };
     use crate::ids::{IdempotencyKey, JobScopeId};
     use crate::test_support::{TestError, TestResult, ctx};
     use jiff::SignedDuration;
+    use std::path::PathBuf;
 
     fn spec() -> TestResult<JobSpec> {
         Ok(JobSpec {
@@ -585,6 +965,7 @@ mod tests {
             sandbox_profile: SandboxProfileName::WorkspaceBuild,
             idempotency_key: Some(IdempotencyKey::new("build-42").map_err(ctx("key"))?),
             scope: JobScopeId::new("scope-a").map_err(ctx("scope"))?,
+            write_scope: None,
         })
     }
 
@@ -900,6 +1281,10 @@ mod tests {
                 ..ResourceRequest::default()
             },
             ResourceRequest {
+                process_count_max: Some(4096),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
                 cpu_time_max: Some(60),
                 ..ResourceRequest::default()
             },
@@ -918,6 +1303,10 @@ mod tests {
         for request in [
             ResourceRequest {
                 address_space_max: Some(0),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                process_count_max: Some(0),
                 ..ResourceRequest::default()
             },
             ResourceRequest {
@@ -942,5 +1331,347 @@ mod tests {
         let old = r#"{"memory_max": 1024}"#;
         let parsed: Result<ResourceRequest, _> = serde_json::from_str(old);
         assert!(parsed.is_ok_and(|r| !r.requests_rlimits()));
+    }
+
+    #[test]
+    fn process_count_max_is_additive_and_validated() -> TestResult {
+        // An old request without the field parses, and nothing new appears
+        // when it is written back.
+        let old = r#"{"pids_max":4096,"address_space_max":1073741824}"#;
+        let parsed: ResourceRequest = serde_json::from_str(old).map_err(ctx("parse old"))?;
+        assert_eq!(parsed.process_count_max, None);
+        assert_eq!(
+            serde_json::to_string(&parsed).map_err(ctx("write old"))?,
+            old
+        );
+
+        let request = ResourceRequest {
+            pids_max: Some(4096),
+            process_count_max: Some(4096),
+            ..ResourceRequest::default()
+        };
+        let json = serde_json::to_string(&request).map_err(ctx("write"))?;
+        assert!(json.contains(r#""process_count_max":4096"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ResourceRequest>(&json).map_err(ctx("parse"))?,
+            request
+        );
+        assert!(request.requests_rlimits());
+        assert!(request.validate().is_ok());
+
+        let zero = ResourceRequest {
+            process_count_max: Some(0),
+            ..ResourceRequest::default()
+        };
+        assert_eq!(
+            zero.validate(),
+            Err(SpecError::InvalidResource {
+                resource: "process_count_max",
+                constraint: "must be greater than zero",
+            })
+        );
+        Ok(())
+    }
+
+    fn scoped_spec() -> TestResult<JobSpec> {
+        JobSpec::command("make")
+            .sandbox(SandboxProfileName::NoNetwork)
+            .write_scope(
+                JobWriteScope::new(["/work/repo/src", "/work/repo/target"])
+                    .map_err(ctx("scope"))?,
+            )
+            .build()
+            .map_err(ctx("build"))
+    }
+
+    #[test]
+    fn write_scope_round_trips_and_old_records_have_none() -> TestResult {
+        let spec = scoped_spec()?;
+        assert_eq!(
+            spec.sandbox,
+            SandboxRequirement::Required,
+            "set by the builder"
+        );
+        let scope = spec
+            .write_scope
+            .clone()
+            .ok_or(TestError::Missing("write scope"))?;
+        assert_eq!(scope.version, JobWriteScope::CURRENT_VERSION);
+        assert_eq!(
+            scope.paths,
+            [
+                PathBuf::from("/work/repo/src"),
+                PathBuf::from("/work/repo/target")
+            ]
+        );
+        let envelope = JobSpecEnvelope::new(spec.clone()).map_err(ctx("envelope"))?;
+        let json = serde_json::to_string(&envelope).map_err(ctx("serialize"))?;
+        assert!(
+            json.contains(
+                r#""write_scope":{"version":1,"paths":["/work/repo/src","/work/repo/target"]}"#
+            ),
+            "{json}"
+        );
+        let back: JobSpecEnvelope = serde_json::from_str(&json).map_err(ctx("deserialize"))?;
+        assert_eq!(back.into_spec().map_err(ctx("into_spec"))?, spec);
+
+        // A record written before the field existed reads as unscoped, and
+        // an unscoped spec serializes exactly as before (no new key).
+        let old = r#"{"version":1,"spec":{"program":"true","working_dir":".","sandbox_profile":"no_network","scope":"s"}}"#;
+        let old: JobSpecEnvelope = serde_json::from_str(old).map_err(ctx("old record"))?;
+        let old = old.into_spec().map_err(ctx("old into_spec"))?;
+        assert_eq!(old.write_scope, None);
+        let unscoped = serde_json::to_string(&old).map_err(ctx("serialize unscoped"))?;
+        assert!(!unscoped.contains("write_scope"), "{unscoped}");
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_write_scope_version_is_refused_not_ignored() -> TestResult {
+        let mut spec = scoped_spec()?;
+        if let Some(scope) = spec.write_scope.as_mut() {
+            scope.version = 2;
+        }
+        let expected = SpecError::UnsupportedWriteScopeVersion {
+            found: 2,
+            supported: 1,
+        };
+        assert_eq!(spec.validate(), Err(expected.clone()));
+        // The version is checked before the paths.
+        if let Some(scope) = spec.write_scope.as_mut() {
+            scope.paths.push(PathBuf::from("relative"));
+        }
+        assert_eq!(spec.validate(), Err(expected.clone()));
+
+        // At admission: a deserialized record with a newer scope version.
+        let json = r#"{"version":1,"spec":{"program":"true","working_dir":".","sandbox":"required","sandbox_profile":"no_network","scope":"s","write_scope":{"version":7,"paths":["/w/a"]}}}"#;
+        let envelope: JobSpecEnvelope = serde_json::from_str(json).map_err(ctx("parse"))?;
+        assert_eq!(
+            envelope.into_spec(),
+            Err(SpecError::UnsupportedWriteScopeVersion {
+                found: 7,
+                supported: 1
+            })
+        );
+        // A scope with unknown fields does not deserialize at all.
+        let shaped = r#"{"version":1,"spec":{"program":"true","working_dir":".","sandbox":"required","sandbox_profile":"no_network","scope":"s","write_scope":{"version":2,"paths":[],"globs":["**"]}}}"#;
+        assert!(serde_json::from_str::<JobSpecEnvelope>(shaped).is_err());
+        assert_eq!(
+            expected.to_string(),
+            "job write scope version 2 is not supported (this build reads 1)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_scope_paths_must_be_absolute_and_normalised() {
+        for (path, reason) in [
+            ("relative/x", "must be absolute"),
+            ("/", "must not be the host root"),
+            ("/w/./a", "must be normalised"),
+            ("/w/../etc", "must be normalised"),
+            ("/w//a", "must be normalised"),
+            ("/w/a/", "must be normalised"),
+            ("/w/a\0b", "contains a NUL byte"),
+        ] {
+            assert!(
+                matches!(
+                    JobWriteScope::new([path]),
+                    Err(SpecError::InvalidWriteScopePath { reason: found, .. })
+                        if found.starts_with(reason)
+                ),
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            JobWriteScope::new(["/w/a", "/w/a"]),
+            Err(SpecError::DuplicateWriteScopePath {
+                path: "/w/a".into()
+            })
+        );
+        let many = (0..=JobWriteScope::MAX_PATHS).map(|index| format!("/w/{index}"));
+        assert_eq!(
+            JobWriteScope::new(many),
+            Err(SpecError::TooManyWriteScopePaths {
+                count: JobWriteScope::MAX_PATHS + 1,
+                max: JobWriteScope::MAX_PATHS
+            })
+        );
+        // An empty scope is valid: the whole workspace becomes read-only.
+        assert!(JobWriteScope::new(Vec::<PathBuf>::new()).is_ok());
+    }
+
+    #[test]
+    fn write_scope_requires_required_and_a_writable_profile() -> TestResult {
+        let scope = JobWriteScope::new(["/w/a"]).map_err(ctx("scope"))?;
+        for requirement in [SandboxRequirement::None, SandboxRequirement::BestEffort] {
+            assert_eq!(
+                JobSpec::command("true")
+                    .write_scope(scope.clone())
+                    .sandbox_requirement(requirement)
+                    .build(),
+                Err(SpecError::WriteScopeNotRequired { requirement })
+            );
+        }
+        let read_only = JobSpec::command("true")
+            .sandbox(SandboxProfileName::ReadOnlyAnalysis)
+            .write_scope(scope.clone())
+            .build();
+        assert_eq!(
+            read_only,
+            Err(SpecError::WriteScopeWithoutWorkspaceWrite {
+                profile: SandboxProfileName::ReadOnlyAnalysis
+            })
+        );
+        assert_eq!(
+            SpecError::WriteScopeNotRequired {
+                requirement: SandboxRequirement::BestEffort
+            }
+            .to_string(),
+            "a job with a write scope must use sandbox requirement 'required', not 'best_effort'"
+        );
+        for profile in [
+            SandboxProfileName::WorkspaceBuild,
+            SandboxProfileName::NoNetwork,
+            SandboxProfileName::NetworkRestricted,
+        ] {
+            JobSpec::command("true")
+                .sandbox(profile)
+                .write_scope(scope.clone())
+                .build()
+                .map_err(ctx("scoped spec"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn job_limits_are_validated_and_detected() {
+        assert!(!ResourceRequest::default().requests_job_limits());
+        let all = ResourceRequest {
+            memory_max: Some(1 << 30),
+            memory_high: Some(1 << 29),
+            cpu_weight: Some(200),
+            cpu_max: Some(CpuBandwidth::cpus(2)),
+            pids_max: Some(64),
+            io_weight: Some(50),
+            ..ResourceRequest::default()
+        };
+        assert_eq!(all.validate(), Ok(()));
+        for single in [
+            ResourceRequest {
+                memory_high: Some(1),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                cpu_max: Some(CpuBandwidth::cpus(1)),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                io_weight: Some(1),
+                ..ResourceRequest::default()
+            },
+        ] {
+            assert!(single.requests_job_limits(), "{single:?}");
+            assert!(!single.requests_rlimits(), "{single:?}");
+        }
+        let cases = [
+            (
+                ResourceRequest {
+                    memory_high: Some(0),
+                    ..ResourceRequest::default()
+                },
+                "memory_high",
+            ),
+            (
+                ResourceRequest {
+                    memory_max: Some(10),
+                    memory_high: Some(11),
+                    ..ResourceRequest::default()
+                },
+                "memory_high",
+            ),
+            (
+                ResourceRequest {
+                    cpu_max: Some(CpuBandwidth {
+                        quota_us: 50_000,
+                        period_us: 999,
+                    }),
+                    ..ResourceRequest::default()
+                },
+                "cpu_max.period_us",
+            ),
+            (
+                ResourceRequest {
+                    cpu_max: Some(CpuBandwidth {
+                        quota_us: 50_000,
+                        period_us: 1_000_001,
+                    }),
+                    ..ResourceRequest::default()
+                },
+                "cpu_max.period_us",
+            ),
+            (
+                ResourceRequest {
+                    cpu_max: Some(CpuBandwidth {
+                        quota_us: 999,
+                        period_us: 100_000,
+                    }),
+                    ..ResourceRequest::default()
+                },
+                "cpu_max.quota_us",
+            ),
+            (
+                ResourceRequest {
+                    io_weight: Some(0),
+                    ..ResourceRequest::default()
+                },
+                "io_weight",
+            ),
+            (
+                ResourceRequest {
+                    io_weight: Some(10_001),
+                    ..ResourceRequest::default()
+                },
+                "io_weight",
+            ),
+        ];
+        for (request, field) in cases {
+            assert!(
+                matches!(
+                    request.validate(),
+                    Err(SpecError::InvalidResource { resource, .. }) if resource == field
+                ),
+                "{field}: {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_job_limits_round_trip_and_old_requests_stay_unchanged() -> TestResult {
+        let request = ResourceRequest {
+            memory_high: Some(4096),
+            cpu_max: Some(CpuBandwidth {
+                quota_us: 20_000,
+                period_us: 100_000,
+            }),
+            io_weight: Some(10),
+            ..ResourceRequest::default()
+        };
+        let json = serde_json::to_string(&request).map_err(ctx("serialize"))?;
+        assert_eq!(
+            json,
+            r#"{"memory_high":4096,"cpu_max":{"quota_us":20000,"period_us":100000},"io_weight":10}"#
+        );
+        let back: ResourceRequest = serde_json::from_str(&json).map_err(ctx("deserialize"))?;
+        assert_eq!(back, request);
+        let old = ResourceRequest {
+            memory_max: Some(1),
+            ..ResourceRequest::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&old).map_err(ctx("serialize old"))?,
+            r#"{"memory_max":1}"#
+        );
+        Ok(())
     }
 }

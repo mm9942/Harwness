@@ -72,6 +72,14 @@ steps the system may take on its own and omits the fourth.
 center. The facade is a re-export module with no logic and no rights of its
 own — the narrowest part of the system, not the most powerful one.
 
+**Suite name vs. crate name (PL-97).** "Harw-DoD" is the name of the whole
+suite in human-facing text (READMEs, setup docs, CLI `about` strings,
+systemd `Description=` lines). `harw-dod` remains the name of this facade
+crate, and every other technical identifier — crate and binary names, FHS
+paths (`/etc/harw-dod`, `/var/lib/harw-dod`, …), socket paths, groups,
+config keys and unit file names — keeps its spelling. The rename is
+editorial only.
+
 ---
 
 ## 3. What the facade is

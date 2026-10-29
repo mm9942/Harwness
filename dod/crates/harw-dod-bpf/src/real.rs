@@ -211,7 +211,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, Map, MapData, PerCpuArray, RingBuf};
+use aya::maps::{
+    Array as AyaArray, HashMap as AyaHashMap, Map, MapData, MapError, PerCpuArray, RingBuf,
+};
 use aya::programs::{FEntry, KProbe, TracePoint};
 use aya::{Btf, Ebpf};
 
@@ -223,8 +225,8 @@ use crate::contract::{
 use crate::error::BpfError;
 use crate::event::{RawBpfEvent, parse_raw_event};
 use crate::handle::BpfHandle;
-use crate::loader::BpfLoader;
-use crate::profile::BpfScope;
+use crate::loader::{BpfLoader, BpfScopeWriter};
+use crate::profile::{BpfScope, ScopeDelta, ScopeWritePolicy};
 use crate::spec::{BpfProgramKind, BpfProgramSpec};
 use crate::time::{KernelTimeMapper, TimeConfidence};
 
@@ -251,11 +253,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Typs verlässt [`RealBpfLoader`] — siehe Moduldoku, Abschnitt „Warum kein
 /// `aya`-Typ nach außen dringt“.
 struct LoadedProgram {
-    /// Gehalten für ihre Nebenwirkung (Programm bleibt geladen/angeheftet),
-    /// nie gelesen — daher der führende Unterstrich.
-    _ebpf: Ebpf,
+    /// Gehalten für ihre Nebenwirkung (Programm bleibt geladen/angeheftet);
+    /// gelesen nur, um die darin verbliebene `SCOPE_CGROUP_IDS`-Map
+    /// inkrementell zu aktualisieren ([`BpfScopeWriter`]).
+    ebpf: Ebpf,
     ring_buf: RingBuf<MapData>,
     loss_counts: PerCpuArray<MapData, u64>,
+    /// Was [`BpfScopeWriter`] an der Scope-Map ändern darf, beim Laden aus
+    /// dem Vertrags-Scope festgelegt: Host-Scope und cgroups ohne
+    /// Nachfahren bleiben unverändert, bei `include_descendants = true`
+    /// werden die expliziten Wurzeln nie entfernt.
+    scope_policy: ScopeWritePolicy,
 }
 
 /// Die reale, `aya`-gestützte Implementierung von [`crate::loader::BpfLoader`].
@@ -397,9 +405,10 @@ impl RealBpfLoader {
         loaded.insert(
             handle.id(),
             LoadedProgram {
-                _ebpf: ebpf,
+                ebpf,
                 ring_buf,
                 loss_counts,
+                scope_policy: ScopeWritePolicy::for_scope(&contract.scope),
             },
         );
         Ok(handle)
@@ -639,17 +648,53 @@ fn populate_scope_map(ebpf: &mut Ebpf, scope: &BpfScope) -> Result<(), BpfError>
         .ok_or(BpfError::InvalidProgramContract)?;
     let mut ids: AyaHashMap<&mut MapData, u64, u8> =
         AyaHashMap::try_from(map).map_err(|_| BpfError::InvalidProgramContract)?;
-    match scope {
-        BpfScope::Host => ids
-            .insert(0u64, 1u8, 0)
-            .map_err(|_| BpfError::InvalidProgramContract),
-        BpfScope::Cgroups { groups, .. } => {
-            for group in groups {
-                ids.insert(group.id, 1u8, 0)
-                    .map_err(|_| BpfError::InvalidProgramContract)?;
-            }
-            Ok(())
+    for id in scope.map_ids() {
+        ids.insert(id, 1u8, 0)
+            .map_err(|_| BpfError::InvalidProgramContract)?;
+    }
+    Ok(())
+}
+
+impl BpfScopeWriter for RealBpfLoader {
+    /// See [`BpfScopeWriter::apply_scope_delta`]. The delta is validated
+    /// before the registry lock is taken and then checked against the
+    /// write policy fixed at load time (fixed scopes and pinned roots are
+    /// refused before any map access); the map is reached through the
+    /// object that keeps the program attached, so no second map handle is
+    /// ever created.
+    fn apply_scope_delta(&self, handle: &BpfHandle, delta: &ScopeDelta) -> Result<(), BpfError> {
+        delta.validate()?;
+        let mut loaded = self
+            .loaded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = loaded
+            .get_mut(&handle.id())
+            .ok_or(BpfError::UnknownHandle)?;
+        entry.scope_policy.admit(delta)?;
+        if delta.is_empty() {
+            return Ok(());
         }
+        let map = entry
+            .ebpf
+            .map_mut(SCOPE_MAP_NAME)
+            .ok_or(BpfError::InvalidProgramContract)?;
+        let mut ids: AyaHashMap<&mut MapData, u64, u8> =
+            AyaHashMap::try_from(map).map_err(|_| BpfError::InvalidProgramContract)?;
+        for id in &delta.remove {
+            match ids.remove(id) {
+                Ok(()) => {}
+                // Bereits entfernt: idempotent, kein Fehler.
+                Err(MapError::SyscallError(error))
+                    if error.io_error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(BpfError::ScopeMapUpdateFailed),
+            }
+        }
+        for id in &delta.insert {
+            ids.insert(*id, 1u8, 0)
+                .map_err(|_| BpfError::ScopeMapUpdateFailed)?;
+        }
+        Ok(())
     }
 }
 
@@ -754,8 +799,38 @@ mod tests {
         CAP_BPF_BIT, RealBpfLoader, cap_bpf_bit_set, has_cap_bpf, split_tracepoint_attach_point,
     };
     use crate::error::BpfError;
-    use crate::loader::BpfLoader;
+    use crate::handle::BpfHandle;
+    use crate::loader::{BpfLoader, BpfScopeWriter};
+    use crate::profile::ScopeDelta;
+    use crate::spec::BpfProgramKind;
     use crate::test_support::{TestError, TestResult, ctx};
+
+    #[test]
+    fn test_apply_scope_delta_rejects_invalid_deltas_and_unknown_handles() {
+        // Kein Kernelzugriff: beide Ablehnungen fallen vor jedem `aya`-Aufruf.
+        let loader = RealBpfLoader::new();
+        let handle = BpfHandle::new(
+            harw_types::SensorId::from_str("procmon-0"),
+            BpfProgramKind::Tracepoint,
+            "sched:sched_process_exec",
+        );
+        let host_marker = ScopeDelta {
+            insert: vec![0],
+            remove: Vec::new(),
+        };
+        assert!(matches!(
+            loader.apply_scope_delta(&handle, &host_marker),
+            Err(BpfError::InvalidProgramContract)
+        ));
+        let valid = ScopeDelta {
+            insert: vec![7],
+            remove: Vec::new(),
+        };
+        assert!(matches!(
+            loader.apply_scope_delta(&handle, &valid),
+            Err(BpfError::UnknownHandle)
+        ));
+    }
 
     #[test]
     fn test_new_boxed_as_dyn_bpf_loader_compiles_and_holds_no_programs() {

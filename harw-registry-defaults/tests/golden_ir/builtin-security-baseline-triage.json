@@ -16,7 +16,11 @@
     "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
   },
   "tools": {
-    "admitted": [],
+    "admitted": [
+      "dod.status",
+      "dod.findings",
+      "dod.sensors"
+    ],
     "forbidden": [
       "fs.write",
       "fs.edit",
@@ -109,7 +113,12 @@
   "research": null,
   "verification": null,
   "skills": {
-    "entries": []
+    "entries": [
+      {
+        "name": "harw-dod",
+        "hash": null
+      }
+    ]
   },
   "binary": {
     "name": "security-baseline-triage",
@@ -119,7 +128,11 @@
     "default_interface": "cli"
   },
   "permissions": {
-    "tools": [],
+    "tools": [
+      "dod.findings",
+      "dod.sensors",
+      "dod.status"
+    ],
     "forbidden_tools": [
       "fs.edit",
       "fs.write",
@@ -206,7 +219,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/security-baseline-triage.toml",
-          "line": 125,
+          "line": 135,
           "column": 11
         },
         "path": "context.program"
@@ -215,6 +228,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "301253285babe0e2bb14161fe552a328c580f624a545eaa64f0087384e3ccad6"
+    "digest": "1b4314e47706734bb00254bd00770672a3f121431e94dde0948e8105d3d4c14f"
   }
 }

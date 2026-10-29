@@ -1,7 +1,7 @@
 # PL-93 — Typisierte Werkzeuge für häufige Kommandos
 
-> **Status:** Crates gebaut und getestet, **nicht an Registry/Profile angebunden** (siehe §8, §10)  
-> **Baseline:** `origin/dev@ee1bb10`, Branch `feat/common-command-tools`  
+> **Status:** PARTIALLY LANDED — PL-97 B4 (`../97-harw-dod-mission-control-chain/README.md` §4 B4) registers `fsread.*` and `git.*` (profiles `Full` + `ReadOnlyExplore`, auto-approved) and `sys.*` (`Full` only, `ExecuteProcess`, asks like `process.list`), and bundles the four usage skills with a `triggers.toml` each (§9); still open: the `cargo.*` tools other than `cargo.test_one` are not registered (§8, §10).
+> **Baseline:** `origin/dev@ee1bb10`, Branch `feat/common-command-tools`
 > **Regel:** Code ist die Quelle der Wahrheit (`../README.md` §2). Dieses Dokument beschreibt, was im Code steht; was dort nicht steht, steht in §10 „Nicht gebaut / Lücken“.
 
 ## 1. Ziel
@@ -114,13 +114,23 @@ JSON-Antwort höchstens rund 64 KiB (`MAX_OUTPUT_BYTES`; bei `git.diff`/`git.sho
 - `unsafe` verboten; keine `unwrap`/`expect`/`panic` im Produktivcode (per Skript geprüft; Treffer nur in Fehlermeldungstexten mit dem Wort „unsafe“).
 - Mutationsproben (Prüfung entfernen → Test rot → zurück) für Scope-Prüfung, Geheimnis-Maskierung/-Auslassung und Limits je Crate; Ergebnisse im Abschlussbericht, äquivalente Mutanten dort benannt.
 
-## 8. Anbindung (offen)
+## 8. Wiring (PL-97 B4)
 
-**Nicht erfolgt.** Vorgesehen sind `capability_catalog.rs` (Provider + Zeilen, Feature im Runner), `profile.rs` (Tool-Namenslisten + Provider-Registrierung), `authority.rs` (Permission-Tabelle) und `harw-agent-runner` (Features), nach dem Muster von `ProcessToolProvider`. Jeder Provider stellt dafür `TOOL_NAMES` und `TOOL_PERMISSIONS` bereit (`FsreadToolProvider`, `SysToolProvider`, `CargoToolProvider`, `GitReadToolProvider`; `CargoToolProvider` braucht den `shell.exec`-Ausführer als Abhängigkeit). Das berührt Goldentests und Profile quer durch `harw-registry-defaults` und ist ein eigener Zyklus.
+`fsread.*`, `git.*` and `sys.*` are wired into the registry following the `ProcessToolProvider` / `ObsidianToolProvider` pattern; `cargo.*` is wired only for `cargo.test_one`.
 
-## 9. Nutzungs-Skills (PL-95)
+- **Name lists and profiles** (`harw-registry-defaults/src/profile.rs`): `FSREAD_TOOLS`, `GIT_READ_TOOLS` and `SYS_TOOLS` are the crates' own `TOOL_NAMES`. `RegistryProfile::Full` registers `FsreadToolProvider`, `GitReadToolProvider` and `SysToolProvider`; `RegistryProfile::ReadOnlyExplore` registers only the two `ReadWorkspace` providers (`fsread.*`, `git.*`). No other profile carries any of the three families. `sys.*` stays out of `ReadOnlyExplore` because it declares `ExecuteProcess`, which no read-only profile grants.
+- **Roles**: the built-in roles on `ReadOnlyExplore` (`explorer`, `analyst`, `researcher-deps`, and `dependency-analyst` by inheritance) admit `fsread.*` and `git.*` (`harw-registry-defaults/agents/*.toml`).
+- **Authority** (`authority.rs`): `tool_permission` returns `ReadWorkspace` for `fsread.*`/`git.*` and `ExecuteProcess` for `sys.*`; a parity test compares it with each crate's `TOOL_PERMISSIONS`.
+- **Capability catalog** (`capability_catalog.rs`): providers `fsread`, `git` and `sys` with the runner features `tool-fsread`, `tool-gitread` and `tool-sys` (in `PROVIDER_FEATURES`); one row per tool, `fsread.*`/`git.*` as `Read`, `sys.*` as `Shell`.
+- **Approval** (`lib.rs`): the 22 `fsread.*`/`git.*` tools are in `AUTO_APPROVED_TOOLS`. `sys.*` is in neither list and asks like `process.list` (fail-closed: it reads host state outside the workspace, `sys.env` the harness environment).
+- **Runner** (`harw-agent-runner`): the three features are declared and in `default`, and `--capabilities` reports them (`src/capabilities.rs`).
+- **`cargo.*` (open)**: only `cargo.test_one` is registered, in `RegistryProfile::WorkspaceEdit` through the profile's `shell.exec` executor (`CargoToolProvider` needs that executor as a dependency) and admitted only for `test-engineer`; it is not auto-approved. The other eight tools (`cargo.check`, `cargo.build`, `cargo.clippy`, `cargo.test`, `cargo.fmt_check`, `cargo.tree`, `cargo.doc`, `cargo.metadata`) are in no profile and have no `tool_permission` branch (their catalog rows already exist).
 
-Je Werkzeuggruppe liegt eine kurze Nutzungs-Skill-Datei im Crate: `<crate>/skills/<name>/skill.toml` + `instructions.md` (Abschnitte „Wann welches Werkzeug“, „Ausgabe lesen“, „Grenzen und `truncated`“), Namen `fsread-tools`, `sys-tools`, `cargo-tools`, `git-read-tools`. Die Manifeste nutzen nur die heutigen Felder (`name`, `description`, `instructions_file`, `tools`); `when`/`[triggers]` kommen mit PL-95. Die Einbindung in den Skill-Index (`harw-home/assets/skills`) folgt in Zyklus S4.
+## 9. Usage skills (PL-95)
+
+Each tool group ships a short usage skill in its crate: `<crate>/skills/<name>/skill.toml` + `instructions.md` (sections "Wann welches Werkzeug", "Ausgabe lesen", "Grenzen und `truncated`") + `triggers.toml`, named `fsread-tools`, `sys-tools`, `cargo-tools`, `git-read-tools`. `harw-home/src/bundle.rs` embeds all three files of each skill with `include_str!` straight from the crate (no copy under `harw-home/assets/skills`), so the `SkillIndex` loads them as bundled skills and `skills.search` finds them.
+
+Each `triggers.toml` has a `when` sentence and `tools = [...]` (the crate's tool names; first use fires the skill). `fsread-tools`, `git-read-tools` and `sys-tools` also carry `commands` (for example `ls`, `cat`, `git status`, `ps`, `top`), so a matching `shell.exec` command fires the skill. `cargo-tools` deliberately has no `commands` and no error-code triggers yet: as long as only `cargo.test_one` is registered, a `cargo test` trigger would point the model at tools its session does not have.
 
 ## 10. Nicht gebaut / Lücken (gegen den Code abgeglichen)
 
@@ -130,4 +140,4 @@ Je Werkzeuggruppe liegt eine kurze Nutzungs-Skill-Datei im Crate: `<crate>/skill
 - `top` als dauerhaft laufende Ansicht (nur Schnappschuss); `lsof` für fremde Benutzer; `ss -p`; `uname -p/-i`; `df` ohne Mountpunkt.
 - `jq`-Filtersprache (nur Pfadzugriff).
 - `cargo fetch`/`update`/`add`/`install`/`publish`, `clippy --fix`, `doc --open`; `cargo.clippy` kennt Lint-Namen nur als Zeichenmuster, nicht gegen eine Liste.
-- Anbindung an Registry/Profile/Katalog (§8) und Skill-Index (§9).
+- Registration of the eight `cargo.*` tools other than `cargo.test_one` (§8), and with it the `commands` and `E0…` error-code triggers of `cargo-tools` (§9).

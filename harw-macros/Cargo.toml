@@ -34,6 +34,10 @@ harw-types = { path = "../harw-types" }
 # zyklisch mit `harw-tools`' normaler Abhängigkeit auf `harw-macros` zurück
 # (dieselbe Dev-Dependency-Ausnahme wie oben bei `harw-observe`).
 harw-tools = { path = "../harw-tools" }
+# PL-97 M2 (`permission_request!`): Positivtests und trybuild expandieren gegen
+# die echten `harw_authority::{Permission, PermissionRequest, PermissionSet}`.
+# Nur Dev-Dependency — der erzeugte Code nennt `::harw_authority::..` textuell.
+harw-authority = { path = "../harw-authority" }
 # `retention_classes!`: Positivtests expandieren gegen die echten
 # `harw-retention`-Typen. Zyklisch mit `harw-retention`s normaler Abhängigkeit
 # auf `harw-macros` (dieselbe Dev-Dependency-Ausnahme wie oben).

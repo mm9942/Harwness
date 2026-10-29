@@ -1,0 +1,37 @@
+# When the `sys-tools` skill is injected (PL-95 trigger manifest, format:
+# harw-catalog/src/skill_triggers.rs). Bundled by harw-home (PL-97 B4).
+when = "Inspecting processes, memory, load, ports, environment, user or time: use the sys.* tools instead of ps, top, free, ss or printenv."
+
+[triggers]
+tools = [
+  "sys.ps",
+  "sys.pgrep",
+  "sys.top",
+  "sys.free",
+  "sys.uptime",
+  "sys.uname",
+  "sys.env",
+  "sys.id",
+  "sys.ss",
+  "sys.lsof",
+  "sys.date",
+  "sys.which",
+]
+commands = [
+  "ps",
+  "pgrep",
+  "top",
+  "htop",
+  "free",
+  "uptime",
+  "uname",
+  "printenv",
+  "id",
+  "whoami",
+  "ss",
+  "netstat",
+  "lsof",
+  "date",
+  "which",
+  "command -v",
+]

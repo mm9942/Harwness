@@ -18,6 +18,7 @@
   "tools": {
     "admitted": [
       "fs.read",
+      "fs.view_image",
       "fs.list",
       "fs.search",
       "fs.glob",
@@ -166,6 +167,7 @@
       "fs.list",
       "fs.read",
       "fs.search",
+      "fs.view_image",
       "lens.ask",
       "obsidian.links",
       "obsidian.map",
@@ -265,7 +267,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/planner.toml",
-          "line": 107,
+          "line": 108,
           "column": 11
         },
         "path": "context.program"
@@ -274,6 +276,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "39c78ff91df957565db29c82465aed38f61c608c44745ff00af53ec27bc53677"
+    "digest": "10c05cb6201e5888f92cdc6b6b876fd9ead8e0f267fc1de8cce05e7afef022ec"
   }
 }

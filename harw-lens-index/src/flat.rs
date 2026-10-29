@@ -392,13 +392,13 @@ impl VectorIndex for FlatIndex {
             .as_ref()
             .ok_or(IndexError::MissingEmbedding)?;
 
-        if let Some(expected) = self.dimension {
-            if query_embedding.len() != expected {
-                return Err(IndexError::EmbeddingDimensionMismatch {
-                    expected,
-                    actual: query_embedding.len(),
-                });
-            }
+        if let Some(expected) = self.dimension
+            && query_embedding.len() != expected
+        {
+            return Err(IndexError::EmbeddingDimensionMismatch {
+                expected,
+                actual: query_embedding.len(),
+            });
         }
 
         let scored = self.entries.iter().map(|entry| Ranked {

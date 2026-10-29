@@ -28,6 +28,7 @@
     ],
     "forbidden": [
       "fs.read",
+      "fs.view_image",
       "fs.search",
       "fs.list",
       "fs.glob",
@@ -174,6 +175,7 @@
       "fs.list",
       "fs.read",
       "fs.search",
+      "fs.view_image",
       "fs.write",
       "lens.ask",
       "web.crates_io",
@@ -258,7 +260,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/executor.toml",
-          "line": 132,
+          "line": 133,
           "column": 11
         },
         "path": "context.program"
@@ -267,6 +269,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "811c297851dae996199e83681c67b8fe643f59d554dd3df00c9e6aaf3532cd91"
+    "digest": "8aced9b2c831afa800980ba396eaa3f0068b470d6b5320551f27ca7de3d60e5d"
   }
 }

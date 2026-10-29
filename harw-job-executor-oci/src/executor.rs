@@ -10,7 +10,7 @@ use harw_container_model::{
     ContainerId, ContainerInstance, ImageDigest, LABEL_ATTEMPT, LABEL_EPOCH, LABEL_OWNER,
     LABEL_TENANT, LABEL_WORK_ID, OwnerLabels,
 };
-use harw_job_core::{ExitOutcome, JobSpec, SandboxProfileName, SandboxReport};
+use harw_job_core::{ExitOutcome, JobSpec, ResourceRequest, SandboxProfileName, SandboxReport};
 use harw_job_runtime::RuntimeError;
 use harw_job_runtime::coordinator::{
     AttemptContext, AttemptControl, AttemptEvent, AttemptEventSender, AttemptEvents, AttemptRun,
@@ -65,6 +65,64 @@ fn network_for(profile: SandboxProfileName) -> (&'static str, NetworkIntent) {
 
 fn cpu_shares(weight: u16) -> u64 {
     (u64::from(weight) * 1024 / 100).clamp(2, 262_144)
+}
+
+/// Whether `resources` asks for a limit that [`create_body`] does not pass
+/// to the engine: `memory_high` (no field of the engine API), `cpu_max` and
+/// `io_weight` (not mapped, so nothing to read back) and every per-process
+/// rlimit (`address_space_max`, `process_count_max`, `cpu_time_max`,
+/// `file_size_max`, `open_files_max`; not mapped to `Ulimits`). The report
+/// then never claims the resource dimension `Enforced`.
+///
+/// The request is destructured without a rest pattern, so a new
+/// [`ResourceRequest`] field does not compile until it is classified here.
+fn unmapped_limits(resources: &ResourceRequest) -> bool {
+    let ResourceRequest {
+        // Passed to the engine (`create_body`) and read back (`Requested`).
+        memory_max: _,
+        cpu_weight: _,
+        pids_max: _,
+        // No field of the engine API.
+        memory_high,
+        // Not mapped to `CpuQuota`/`CpuPeriod` or `BlkioWeight`.
+        cpu_max,
+        io_weight,
+        // Enforced by the coordinator's attempt deadline, not by the engine.
+        wall_timeout: _,
+        // Per-process rlimits: not applied by this backend.
+        address_space_max,
+        process_count_max,
+        cpu_time_max,
+        file_size_max,
+        open_files_max,
+        // Checked before the create (`refuse_required_rlimits`).
+        require_rlimits: _,
+    } = resources;
+    memory_high.is_some()
+        || cpu_max.is_some()
+        || io_weight.is_some()
+        || address_space_max.is_some()
+        || process_count_max.is_some()
+        || cpu_time_max.is_some()
+        || file_size_max.is_some()
+        || open_files_max.is_some()
+}
+
+/// Refuses a job that demands per-process rlimits (`require_rlimits` with
+/// any rlimit set): this backend does not apply them, and such a job must
+/// not run without them, whatever its [`harw_job_core::SandboxRequirement`].
+///
+/// # Errors
+/// [`RuntimeError::Unsupported`] with the operation `rlimits`.
+fn refuse_required_rlimits(resources: &ResourceRequest) -> Result<(), RuntimeError> {
+    if resources.require_rlimits && resources.requests_rlimits() {
+        return Err(RuntimeError::Unsupported {
+            operation: "rlimits",
+            detail: "the job requires per-process rlimits, which the OCI executor does not apply"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn work_dir(spec: &JobSpec) -> Result<String, OciError> {
@@ -361,13 +419,16 @@ pub(crate) struct Prepared {
 
 impl OciExecutor {
     /// Creates the container and reads its applied configuration back.
-    /// Nothing has run; a failed internal check removes the container.
+    /// Nothing has run; a failed internal check removes the container. A job
+    /// that requires per-process rlimits is refused before anything is
+    /// created.
     pub(crate) fn create_and_readback(
         &self,
         spec: &JobSpec,
         ctx: &AttemptContext,
     ) -> Result<Prepared, RuntimeError> {
         spec.validate()?;
+        refuse_required_rlimits(&spec.resources)?;
         let cfg = self.engine.config();
         let image = cfg.image_for(spec.sandbox_profile).ok_or_else(|| {
             OciError::Unsupported(format!(
@@ -383,6 +444,7 @@ impl OciExecutor {
             memory: spec.resources.memory_max,
             cpu_shares: spec.resources.cpu_weight.map(cpu_shares),
             pids: spec.resources.pids_max,
+            unmapped_limits: unmapped_limits(&spec.resources),
         };
         let body = create_body(cfg, spec, &image.reference(), &labels, network)?;
 

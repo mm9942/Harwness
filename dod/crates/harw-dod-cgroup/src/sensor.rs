@@ -331,10 +331,10 @@ impl Sensor for CgroupSensor {
             }
         }
 
-        if samples.is_empty() {
-            if let Some(first_error) = errors.into_iter().next() {
-                return Err(first_error);
-            }
+        if samples.is_empty()
+            && let Some(first_error) = errors.into_iter().next()
+        {
+            return Err(first_error);
         }
 
         Ok(SensorReading {

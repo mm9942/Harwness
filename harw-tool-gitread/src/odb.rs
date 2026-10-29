@@ -34,7 +34,12 @@ pub const MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_DELTA_DEPTH: usize = 100;
 
 /// Größte Pack-Indexdatei.
-pub const MAX_IDX_BYTES: u64 = 128 * 1024 * 1024;
+///
+/// Wird je Pack vollständig gelesen; größere `.idx` werden übersprungen
+/// (deren Objekte gelten dann als fehlend). Gleiche Begründung wie
+/// [`crate::index::MAX_INDEX_BYTES`]: ohne Rückfrage erreichbarer Speicher
+/// pro Aufruf bleibt begrenzt (PL-97-Sicherheitsreview, Befund 6).
+pub const MAX_IDX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Obergrenze der Objekt-Cache-Größe in Bytes.
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -450,12 +455,11 @@ impl<'a> Odb<'a> {
         // lose Objekte
         let dir_name = &prefix.to_ascii_lowercase()[..2];
         for entry in self.repo.list_git_dir(&format!("objects/{dir_name}")) {
-            if entry.name.len() == 38 {
-                if let Some(oid) = Oid::from_hex(&format!("{dir_name}{}", entry.name)) {
-                    if matches_prefix(oid.as_bytes()) {
-                        found.push(oid);
-                    }
-                }
+            if entry.name.len() == 38
+                && let Some(oid) = Oid::from_hex(&format!("{dir_name}{}", entry.name))
+                && matches_prefix(oid.as_bytes())
+            {
+                found.push(oid);
             }
         }
         // Packs

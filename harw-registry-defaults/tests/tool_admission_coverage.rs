@@ -64,6 +64,9 @@ use harw_registry_defaults::profile::{
 };
 // Runde 7, Teil M: die Matrix-Werkzeuge des Game Masters ebenso.
 use harw_registry_defaults::profile::{MATRIX_GAME_MASTER_TOOLS, matrix_tools_for_role};
+// PL-97 D3/D4: die lesenden `dod.*` der Triage-Rollen steuert ebenfalls die
+// Composition-Root bei (rollengebundener Provider in `harw-runtime/src/children.rs`).
+use harw_registry_defaults::profile::{DOD_READ_TOOLS, dod_tools_for_role};
 // Plan R9, Teil A: `skills.search`/`skills.load` ebenso.
 use harw_registry_defaults::profile::{
     SKILL_CATALOG_EXCLUDED_ROLES, SKILL_CATALOG_TOOLS, skill_catalog_tools_for_role,
@@ -120,6 +123,8 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
             .chain(parent_message_tools_for_role(role).iter().copied())
             // Runde 7, Teil M: `matrix.*` (nur Game Master).
             .chain(matrix_tools_for_role(role).iter().copied())
+            // PL-97 D4: `dod.*` (nur die vier Triage-Rollen).
+            .chain(dod_tools_for_role(role).iter().copied())
             // Plan R9, Teil A: `skills.search`/`skills.load` (Skill-Katalog).
             .chain(skill_catalog_tools_for_role(role).iter().copied())
             // Plan R9, Teil F: Job-Kontrolle der Orchestratoren.
@@ -497,7 +502,7 @@ fn spawning_roles_admit_exactly_their_child_result_tools() -> TestResult {
 }
 
 /// Runde 3, Welle E + Matrix-Unterlagen: die drei Matrix-Game-Sitze
-/// admittieren genau die lesenden Unterlagen-Werkzeuge (fünf lesende `fs.*`
+/// admittieren genau die lesenden Unterlagen-Werkzeuge (sechs lesende `fs.*`
 /// plus `doc.read_pdf`), und ihr Profil (`MatrixReader`) bewirbt genau
 /// diese — Inventar und Aufrufrecht bleiben deckungsgleich, ohne Netz,
 /// Schreiben oder Exec.
@@ -505,6 +510,7 @@ fn spawning_roles_admit_exactly_their_child_result_tools() -> TestResult {
 fn matrix_roles_admit_and_advertise_exactly_the_read_tools() -> TestResult {
     let expected: BTreeSet<&str> = [
         "fs.read",
+        "fs.view_image",
         "fs.list",
         "fs.search",
         "fs.glob",
@@ -606,6 +612,7 @@ fn uia_latex_writer_admits_exactly_files_pdf_and_latex_build() -> TestResult {
     assert_eq!(profile, RegistryProfile::UiaLatexWriter);
     let expected: BTreeSet<&str> = [
         "fs.read",
+        "fs.view_image",
         "fs.write",
         "fs.edit",
         "fs.list",
@@ -888,6 +895,7 @@ fn game_master_admits_exactly_its_matrix_tools() -> TestResult {
         .collect();
     let expected: BTreeSet<&str> = [
         "fs.read",
+        "fs.view_image",
         "fs.list",
         "fs.search",
         "fs.glob",
@@ -1034,4 +1042,50 @@ fn every_organizational_role_knows_how_to_find_and_load_skills() {
             assert!(text.contains(needle), "{role:?}: fehlt {needle}");
         }
     }
+}
+
+/// PL-97 D4: die vier Security-Triage-Rollen admittieren genau die lesenden
+/// `dod.*` (die die Composition-Root ihnen jetzt auch bereitstellt) und
+/// binden fest den gebündelten Skill `harw-dod`, der genau diese Werkzeuge
+/// deklariert; keine andere eingebaute Rolle bindet ihn oder admittiert ein
+/// `dod.*`.
+#[test]
+fn security_triage_roles_admit_the_dod_tools_and_bind_the_bundled_harw_dod_skill() -> TestResult {
+    let roles = resolved_roles()?;
+    let bundled = harw_catalog::SkillIndex::build(&[]);
+    let skill = bundled
+        .get("harw-dod")
+        .ok_or(TestError::Missing("harw-dod liegt im Bündel"))?;
+    assert_eq!(skill.tools, DOD_READ_TOOLS, "harw-dod deklariert die dod.*");
+    let mut triage = 0;
+    for role in role_names::ALL {
+        let ir = roles
+            .get(*role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let offered = dod_tools_for_role(role);
+        if offered.is_empty() {
+            assert!(
+                !admitted.iter().any(|tool| DOD_READ_TOOLS.contains(tool)),
+                "{role} admittiert dod.* ohne Angebot"
+            );
+            assert!(
+                !ir.skills().iter().any(|name| name == "harw-dod"),
+                "{role} bindet harw-dod"
+            );
+            continue;
+        }
+        triage += 1;
+        assert_eq!(offered, DOD_READ_TOOLS, "{role}");
+        let expected: BTreeSet<&str> = DOD_READ_TOOLS.iter().copied().collect();
+        assert_eq!(admitted, expected, "{role}: genau die dod.*");
+        assert_eq!(ir.skills(), ["harw-dod"], "{role}: skills");
+    }
+    assert_eq!(triage, 4, "vier Triage-Rollen");
+    Ok(())
 }

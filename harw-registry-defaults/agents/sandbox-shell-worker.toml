@@ -48,6 +48,7 @@ admitted = [
 ]
 forbidden = [
   "fs.read",
+  "fs.view_image",
   "fs.search",
   "fs.list",
   "fs.glob",

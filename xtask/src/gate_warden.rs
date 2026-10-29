@@ -1138,19 +1138,18 @@ fn parse_manifest_facts(content: &str) -> ManifestFacts {
 
         match section {
             ManifestSection::Lib => {
-                if let Some(rest) = line.strip_prefix("proc-macro") {
-                    if let Some(value) = rest.trim_start().strip_prefix('=') {
-                        if value.trim() == "true" {
-                            facts.is_proc_macro = true;
-                        }
-                    }
+                if let Some(rest) = line.strip_prefix("proc-macro")
+                    && let Some(value) = rest.trim_start().strip_prefix('=')
+                    && value.trim() == "true"
+                {
+                    facts.is_proc_macro = true;
                 }
             }
             ManifestSection::Package => {
-                if let Some(rest) = line.strip_prefix("links") {
-                    if rest.trim_start().starts_with('=') {
-                        facts.has_links = true;
-                    }
+                if let Some(rest) = line.strip_prefix("links")
+                    && rest.trim_start().starts_with('=')
+                {
+                    facts.has_links = true;
                 }
             }
             ManifestSection::Dependencies => {
@@ -1183,43 +1182,41 @@ fn parse_manifest_facts(content: &str) -> ManifestFacts {
                 if let Some(eq_pos) = line.find('=') {
                     let raw_key = line[..eq_pos].trim();
                     let value = line[eq_pos + 1..].trim();
-                    if let Some(first) = raw_key.chars().next() {
-                        if first.is_ascii_alphanumeric() || first == '_' {
-                            let mut parts = raw_key.splitn(2, '.');
-                            let base = parts.next().unwrap_or(raw_key).to_owned();
-                            match parts.next() {
-                                Some(sub_key) => {
-                                    let attrs =
-                                        facts.dependency_attrs.entry(base.clone()).or_default();
-                                    if apply_dependency_attr_kv(attrs, sub_key, value) {
-                                        pending_array = Some((true, base));
-                                    }
+                    if let Some(first) = raw_key.chars().next()
+                        && (first.is_ascii_alphanumeric() || first == '_')
+                    {
+                        let mut parts = raw_key.splitn(2, '.');
+                        let base = parts.next().unwrap_or(raw_key).to_owned();
+                        match parts.next() {
+                            Some(sub_key) => {
+                                let attrs = facts.dependency_attrs.entry(base.clone()).or_default();
+                                if apply_dependency_attr_kv(attrs, sub_key, value) {
+                                    pending_array = Some((true, base));
                                 }
-                                None => {
-                                    // Neu (Nachkorrektur): der Eintrag wird
-                                    // jetzt IMMER angelegt, auch für die
-                                    // reine Zeichenketten-Schreibweise
-                                    // (`foo = "1.2.3"`, ohne `{...}`) — vorher
-                                    // fehlte er für diese Form komplett, was
-                                    // `parse_workspace_dependencies` blind für
-                                    // genau die Wurzel-Einträge machte, die
-                                    // keine Inline-Tabelle sind (`blake3`,
-                                    // `serde_json`, `tracing`, `rustix`; siehe
-                                    // Abschlussbericht). Der reine
-                                    // Default-Eintrag (nicht optional,
-                                    // Default-Features an, keine Features)
-                                    // ist für diese Form korrekt.
-                                    let attrs =
-                                        facts.dependency_attrs.entry(base.clone()).or_default();
-                                    if let Some(inner) =
-                                        value.strip_prefix('{').and_then(|v| v.strip_suffix('}'))
-                                    {
-                                        for part in split_top_level_commas(inner) {
-                                            if let Some(part_eq) = part.find('=') {
-                                                let k = part[..part_eq].trim();
-                                                let v = &part[part_eq + 1..];
-                                                apply_dependency_attr_kv(attrs, k, v);
-                                            }
+                            }
+                            None => {
+                                // Neu (Nachkorrektur): der Eintrag wird
+                                // jetzt IMMER angelegt, auch für die
+                                // reine Zeichenketten-Schreibweise
+                                // (`foo = "1.2.3"`, ohne `{...}`) — vorher
+                                // fehlte er für diese Form komplett, was
+                                // `parse_workspace_dependencies` blind für
+                                // genau die Wurzel-Einträge machte, die
+                                // keine Inline-Tabelle sind (`blake3`,
+                                // `serde_json`, `tracing`, `rustix`; siehe
+                                // Abschlussbericht). Der reine
+                                // Default-Eintrag (nicht optional,
+                                // Default-Features an, keine Features)
+                                // ist für diese Form korrekt.
+                                let attrs = facts.dependency_attrs.entry(base.clone()).or_default();
+                                if let Some(inner) =
+                                    value.strip_prefix('{').and_then(|v| v.strip_suffix('}'))
+                                {
+                                    for part in split_top_level_commas(inner) {
+                                        if let Some(part_eq) = part.find('=') {
+                                            let k = part[..part_eq].trim();
+                                            let v = &part[part_eq + 1..];
+                                            apply_dependency_attr_kv(attrs, k, v);
                                         }
                                     }
                                 }
@@ -1229,11 +1226,11 @@ fn parse_manifest_facts(content: &str) -> ManifestFacts {
                 }
             }
             ManifestSection::BuildDependencies => {
-                if let Some(name) = extract_leading_key(line) {
-                    if C_BUILD_TOOL_CRATES.contains(&name.as_str()) {
-                        facts.build_needs_c_compiler = true;
-                        facts.build_tool_names.push(name);
-                    }
+                if let Some(name) = extract_leading_key(line)
+                    && C_BUILD_TOOL_CRATES.contains(&name.as_str())
+                {
+                    facts.build_needs_c_compiler = true;
+                    facts.build_tool_names.push(name);
                 }
             }
             ManifestSection::Features => {

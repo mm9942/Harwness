@@ -12,6 +12,8 @@ rust-version.workspace = true
 flate2 = "1.1.9"
 getrandom = "0.4.3"
 harw-config = { path = "../harw-config" }
+# PL-97 E5: `harw doctor` renders the execution chain report (pure types).
+harw-dod-client = { path = "../harw-dod-client" }
 harw-home = { path = "../harw-home" }
 jiff = { workspace = true }
 serde = { version = "1.0.228", features = ["derive"] }

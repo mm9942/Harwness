@@ -43,6 +43,10 @@ use crate::style::{self, Theme};
 /// Seitensprung für `Bild↑`/`Bild↓`.
 const PAGE: isize = 10;
 
+/// Hilfetext des TUI-lokalen Unterbefehls `/dod view` (PL-97 D5).
+const DOD_VIEW_SUMMARY: &str =
+    "Harw-DoD-Ansicht: Units, Sensoren, letzte Befunde (lokal, nur lesend)";
+
 /// Fußzeile des Reiters „Befehle“.
 const FOOTER_COMMANDS: &str = "Tab Reiter · j/k wählen · Enter vorbelegen · Esc schließen";
 
@@ -64,12 +68,54 @@ const FIXED_KEYS: &[(&str, &str)] = &[
     ("Agenten-Panel (fokussiert): fertige auf-/zuklappen", "f"),
     ("Agenten-Panel (fokussiert): Fehlschläge quittieren", "c"),
     (
+        "Agenten-Panel (fokussiert): Agent an LIVE anheften / lösen",
+        "p",
+    ),
+    (
+        "Jobs-Fenster (fokussiert): Auswahl / blättern",
+        "↑/↓, k/j, Bild↑/Bild↓, Pos1/Ende",
+    ),
+    ("Jobs-Fenster (fokussiert): Job-Details öffnen", "Enter"),
+    (
+        "Jobs-Fenster (fokussiert): gewählten Job stoppen (Rückfrage, dann /jobs stop)",
+        "x",
+    ),
+    (
+        "Finished/Failed (fokussiert): Kategorien auf-/zuklappen",
+        "f (Enter klappt auf)",
+    ),
+    (
+        "Finished/Failed (aufgeklappt/Querformat): Einzelläufe öffnen und quittieren",
+        "Enter",
+    ),
+    (
+        "Finished/Failed (fokussiert): gewählte Kategorie quittieren (eingeklappt: alle)",
+        "a",
+    ),
+    ("Finished/Failed (fokussiert): Fehlschläge quittieren", "c"),
+    (
+        "LIVE-Streifen (Hochformat, flaches Querformat)",
+        "nur Anzeige: nie fokussiert, nie gescrollt, nimmt keine Tasten",
+    ),
+    (
+        "LIVE-Fenster (Querformat, fokussiert): scrollen / Details",
+        "↑/↓, k/j, Bild↑/Bild↓, Pos1/g, Ende/G, Enter (Details), r (Reasoning)",
+    ),
+    (
+        "Linksklick",
+        "fokussiert Agenten-, Jobs-, Finished- oder LIVE-Fenster (Querformat) unter dem Zeiger",
+    ),
+    (
+        "Composer mit Text: Wort zurück / vor",
+        "Alt+B / Alt+F (Vorrang vor focus_finished)",
+    ),
+    (
         "Dialog: Text scrollen (Optionen bleiben sichtbar)",
         "Strg+↑/↓ (scroll_panel_up/down), Mausrad",
     ),
     (
         "Mausrad",
-        "scrollt Dialog, Agenten-Panel oder Verlauf unter dem Zeiger",
+        "scrollt Dialog, Agenten-, Jobs-, Finished-, LIVE-Fenster (Querformat) oder Verlauf unter dem Zeiger",
     ),
 ];
 
@@ -286,6 +332,17 @@ impl HelpOverlay {
                 .then_with(|| left.name.cmp(&right.name))
         });
         commands.dedup_by(|left, right| left.name == right.name);
+        // PL-97 D5: `/dod view` ist TUI-lokal (Harw-DoD-Ansicht) und steht
+        // deshalb nicht in den Unterbefehlen der `dod`-Operation.
+        if let Some(dod) = commands.iter_mut().find(|entry| entry.name == "dod")
+            && !dod.subcommands.iter().any(|(name, _, _)| name == "view")
+        {
+            dod.subcommands.push((
+                "view".to_owned(),
+                String::new(),
+                DOD_VIEW_SUMMARY.to_owned(),
+            ));
+        }
 
         let mut keys: Vec<(String, String)> = keys
             .describe()
@@ -647,6 +704,38 @@ mod tests {
         Ok(HelpOverlay::new(&registry()?, &KeyBindings::default(), tab))
     }
 
+    /// PL-97 D5: die Hilfe nennt `/dod view` unter `/dod`.
+    #[test]
+    fn dod_help_lists_the_local_view_subcommand() -> TestResult {
+        let dod = CommandSpec::new(
+            "dod",
+            Vec::<String>::new(),
+            CommandScope::TuiOnly,
+            PermissionTier::Operator,
+            OutputSurface::Inline,
+            CommandDomain::Security,
+        )
+        .map_err(ctx("dod spec"))?
+        .with_help("Harw-DoD", "/dod [status]", &[]);
+        let help = HelpOverlay::new(
+            &CommandRegistry::new(vec![dod]),
+            &KeyBindings::default(),
+            HelpTab::Commands,
+        );
+        let entry = help
+            .commands
+            .iter()
+            .find(|entry| entry.name == "dod")
+            .ok_or(crate::test_support::TestError::Missing("dod entry"))?;
+        assert!(
+            entry
+                .subcommands
+                .iter()
+                .any(|(name, _, summary)| name == "view" && summary == DOD_VIEW_SUMMARY)
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_enter_prefills_selected_command() -> TestResult {
         let mut help = overlay(HelpTab::Commands)?;
@@ -777,6 +866,29 @@ mod tests {
         assert!(text.contains("ctrl+down"), "{text}");
         assert!(text.contains("w/s"), "{text}");
         assert!(text.contains("Mausrad"), "{text}");
+        // PL-97 C2: neue Aktionen samt Belegung und feste Fenstertasten.
+        assert!(text.contains("Jobs-Fenster fokussieren"), "{text}");
+        assert!(text.contains("alt+j"), "{text}");
+        assert!(text.contains("alt+f"), "{text}");
+        assert!(text.contains("alt+l"), "{text}");
+        assert!(text.contains("an LIVE anheften"), "{text}");
+        assert!(text.contains("Finished/Failed (fokussiert)"), "{text}");
+        // PL-97 C4: Stopp im Jobs-Fenster und Quittieren in Finished/Failed.
+        assert!(text.contains("gewählten Job stoppen"), "{text}");
+        assert!(text.contains("Einzelläufe öffnen und quittieren"), "{text}");
+        // PL-97 C3: LIVE-Fenster des Querformats und Klick-Fokus.
+        assert!(
+            text.contains("LIVE-Fenster (Querformat, fokussiert)"),
+            "{text}"
+        );
+        assert!(text.contains("Pos1/g, Ende/G, Enter (Details)"), "{text}");
+        assert!(text.contains("LIVE-Streifen (Hochformat"), "{text}");
+        assert!(text.contains("Linksklick"), "{text}");
+        assert!(
+            text.contains("Finished-, LIVE-Fenster (Querformat)"),
+            "{text}"
+        );
+        assert!(text.contains("Composer mit Text"), "{text}");
         Ok(())
     }
 }

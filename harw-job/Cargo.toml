@@ -10,7 +10,8 @@ description = "Public facade of the Harw job runtime (Job-Runtime-Doc §16): Job
 
 [features]
 default = []
-# Bubblewrap sandbox backend (`LinuxSandboxBackend::Bwrap`).
+# Bubblewrap sandbox backends (`LinuxSandboxBackend::Bwrap`,
+# `LinuxSandboxBackend::BwrapTrampoline`).
 bwrap = ["harw-job-runtime/bwrap"]
 # OCI container backend (`OciExecutor`, Podman/Docker over the engine socket).
 oci = ["dep:harw-job-executor-oci"]

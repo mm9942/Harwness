@@ -8,7 +8,7 @@ These rules are binding for every task in this repository.
   beyond it. If you notice something else, mention it in the PR, don't fix it.
 
 ## Rust rules
-- Edition 2024, **MSRV 1.85**: no let-chains (`if let … && …`), no newer std APIs.
+- Edition 2024, **MSRV 1.89** (workspace `rust-version`): let-chains are fine; no std APIs newer than 1.89.
 - `unsafe` is forbidden workspace-wide (`#![forbid(unsafe_code)]`).
 - No `unwrap()`, `expect()` or `panic!` in library code **or tests**. Tests
   return `TestResult` and use the crate's existing test helpers (`ctx(...)`,

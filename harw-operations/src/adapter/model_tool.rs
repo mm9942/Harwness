@@ -264,7 +264,10 @@ impl ToolExecutor for ModelToolExecutor {
                 });
             }
 
-            let op_context = (self.context_factory)(execution_context);
+            // Context factories supply services/authority, but may not strip the
+            // dispatcher-owned effect lifetime at this adapter boundary.
+            let op_context = (self.context_factory)(execution_context)
+                .with_lifetime_guard(execution_context.lifetime_guard().cloned());
             self.adapter
                 .invoke(&op_context, call.arguments.clone())
                 .await
@@ -1507,6 +1510,101 @@ mod tests {
             provider.approval_policy(&ToolName::new("stop")),
             Some(ApprovalPolicy::None)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_operation_retains_dispatch_guard_in_detached_work() -> TestResult {
+        use std::sync::Mutex;
+        use std::task::{Context, Poll, Waker};
+
+        struct Release(Arc<AtomicUsize>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct RetainOp {
+            meta: OperationMeta,
+            retained: Arc<Mutex<Option<ToolExecutionContext>>>,
+        }
+        impl Operation for RetainOp {
+            fn meta(&self) -> &OperationMeta {
+                &self.meta
+            }
+            fn run<'a>(&'a self, context: &'a OpContext, _: OpInput) -> OpFuture<'a> {
+                Box::pin(async move {
+                    // Model the context moved into an uncancellable blocking job.
+                    let nested = ToolExecutionContext::new(
+                        context.session_id().clone(),
+                        context.turn_id().clone(),
+                        context.sandbox().clone(),
+                    )
+                    .with_lifetime_guard(context.lifetime_guard().cloned());
+                    *self.retained.lock().map_err(|_| {
+                        OpError::Execution("retained context lock poisoned".to_owned())
+                    })? = Some(nested);
+                    std::future::pending().await
+                })
+            }
+        }
+        let (trusted, tmp) = make_test_ctx()?;
+        let released = Arc::new(AtomicUsize::new(0));
+        let retained = Arc::new(Mutex::new(None));
+        let operation = RetainOp {
+            meta: OperationMeta {
+                name: "retain-effect",
+                summary: "Retain an effect context after cancellation.",
+                domain: OperationDomain::Misc,
+                permission: PermissionTier::Observer,
+                surfaces: vec![Surface::ModelTool {
+                    readonly: true,
+                    approval: ApprovalPolicy::None,
+                }],
+                aliases: &[],
+                category: OperationCategory::Misc,
+                args_schema: None,
+                output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
+            },
+            retained: Arc::clone(&retained),
+        };
+        let provider = ModelToolProvider::new(
+            vec![Arc::new(operation) as Arc<dyn Operation>],
+            |authority| {
+                OpContext::new(
+                    authority.session_id().clone(),
+                    authority.turn_id().clone(),
+                    authority.sandbox().clone(),
+                    ServiceMap::new(),
+                )
+            },
+        );
+        let execution = ToolExecutionContext::new(
+            trusted.session_id().clone(),
+            trusted.turn_id().clone(),
+            trusted.sandbox().clone(),
+        )
+        .with_lifetime_guard(Some(harw_tools::ToolLifetimeGuard::new(Box::new(Release(
+            Arc::clone(&released),
+        )))));
+        let executor = provider
+            .executor(&ToolName::new("retain-effect"))
+            .ok_or(TestError::Missing("retaining executor"))?;
+        let call = ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("retain-effect"),
+            arguments: serde_json::json!({}),
+        };
+        let mut future = executor.execute(&execution, &call);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        drop(future);
+        drop(execution);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        retained.lock().map_err(ctx("retained context"))?.take();
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(tmp).map_err(ctx("remove test workspace"))?;
         Ok(())
     }
 

@@ -40,6 +40,8 @@ default = [
     "tool-doc",
     "tool-explorer",
     "tool-fs",
+    "tool-fsread",
+    "tool-gitread",
     "tool-job",
     "tool-latex",
     "tool-lens",
@@ -48,6 +50,7 @@ default = [
     "tool-process",
     "tool-shell",
     "tool-sudo",
+    "tool-sys",
     "tool-web",
 ]
 
@@ -97,6 +100,9 @@ tool-deps = []
 tool-doc = []
 tool-explorer = []
 tool-fs = []
+# PL-97 B4: the PL-93 command tool providers (`fsread.*`, `git.*`, `sys.*`).
+tool-fsread = []
+tool-gitread = []
 tool-job = []
 tool-latex = []
 tool-lens = []
@@ -105,6 +111,7 @@ tool-plan = []
 tool-process = []
 tool-shell = []
 tool-sudo = []
+tool-sys = []
 tool-web = []
 
 [dependencies]

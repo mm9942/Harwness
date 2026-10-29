@@ -53,6 +53,15 @@ const WAIT: Duration = Duration::from_secs(5);
 struct IdleDriver;
 
 impl TurnDriver for IdleDriver {
+    // This test double performs no privileged runtime/tool effects.
+    fn prepare_execution(
+        &self,
+        _: &harw_types::SessionId,
+        _: harw_session_host::driver::ExecutionAdmission,
+    ) -> harw_session_host::driver::DriverFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn create_session(&self, _: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -251,6 +260,8 @@ fn human_identity(uid: u32, tier: PermissionTier, tenant: Option<TenantId>) -> C
         tenant,
         caps: caps_for_tier(tier).with(gateway_caps_for_tier(tier)),
         device: None,
+        authenticated_node: None,
+        authenticated_key_fingerprint: None,
         actor: ApprovalActor::Operator {
             id: format!("uid:{uid}"),
         },
@@ -280,6 +291,8 @@ fn agent_identity(host: &SessionHost, credential: &str) -> TestResult<ClientIden
         tenant: resolved.tenant,
         caps: caps_for_tier(PermissionTier::Operator).with(ClientCaps::TOOL_CALL),
         device: None,
+        authenticated_node: None,
+        authenticated_key_fingerprint: None,
         actor: ApprovalActor::Operator { id: id.clone() },
         label: id,
         zone: TrustZone::Local,

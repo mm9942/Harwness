@@ -194,6 +194,7 @@ pub struct OpContext {
     sandbox: SandboxSpec,
     services: ServiceMap,
     cancel: Option<CancelToken>,
+    lifetime_guard: Option<harw_tools::ToolLifetimeGuard>,
     tenant: Option<TenantId>,
     security_context: Option<SecurityContextSummary>,
 }
@@ -232,9 +233,24 @@ impl OpContext {
             sandbox,
             services,
             cancel: None,
+            lifetime_guard: None,
             tenant: None,
             security_context: None,
         }
+    }
+
+    /// Retains the trusted tool effect lifetime across nested operation work.
+    /// This opaque guard grants no authority and must not come from model input.
+    #[must_use]
+    pub fn with_lifetime_guard(mut self, guard: Option<harw_tools::ToolLifetimeGuard>) -> Self {
+        self.lifetime_guard = guard;
+        self
+    }
+
+    /// Clone into any work that can outlive the operation's returned future.
+    #[must_use]
+    pub fn lifetime_guard(&self) -> Option<&harw_tools::ToolLifetimeGuard> {
+        self.lifetime_guard.as_ref()
     }
 
     /// Bindet diesen Kontext an einen Mandanten (Builder, H12).

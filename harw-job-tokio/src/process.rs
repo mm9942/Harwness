@@ -156,7 +156,15 @@ impl AsyncLinuxProcess {
                 });
             }
         };
-        match AsyncFd::with_interest(duplicate, Interest::READABLE) {
+        // tokio 1.54 deprecates the safe constructors (RUSTSEC-2026-0386):
+        // they are unsound for an `inner` whose `as_raw_fd` can change or
+        // close behind the reactor. `duplicate` is an `OwnedFd` owned by the
+        // `AsyncFd` for its whole lifetime, so the fd stays open and stable;
+        // the unsafe `register_with_interest` would add nothing here and the
+        // workspace forbids `unsafe_code`.
+        #[allow(deprecated)]
+        let registered = AsyncFd::with_interest(duplicate, Interest::READABLE);
+        match registered {
             Ok(readiness) => Ok(Self { target, readiness }),
             Err(error) => Err(AdoptError {
                 error: io_error("epoll_ctl(pidfd)", &error),

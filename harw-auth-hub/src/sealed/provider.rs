@@ -430,10 +430,10 @@ fn open(
     if frame.purpose != purpose {
         return Err(FAIL);
     }
-    if let Some(version) = key.version {
-        if version != frame.key_version {
-            return Err(FAIL);
-        }
+    if let Some(version) = key.version
+        && version != frame.key_version
+    {
+        return Err(FAIL);
     }
 
     let entry = match table.resolve_version(&key.namespace, &key.id, frame.key_version) {

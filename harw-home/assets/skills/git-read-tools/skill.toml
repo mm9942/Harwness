@@ -1,0 +1,4 @@
+name = "git-read-tools"
+description = "Use the read-only git.* tools (status, diff, log, show, branch, blame) to inspect a repository without running git."
+instructions_file = "instructions.md"
+tools = ["git.status", "git.diff", "git.log", "git.show", "git.branch", "git.blame"]

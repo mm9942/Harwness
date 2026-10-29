@@ -62,6 +62,12 @@
 //! security-relevant classes) from that single list. Generated paths are
 //! textual (`::harw_retention::..`).
 //!
+//! [`macro@permission_request`] turns a validated, declarative permission
+//! list into a `harw_authority::PermissionRequest` (authority doc §6.3) and
+//! nothing else: no grant, no `PermissionSet`. Generated paths are textual
+//! (`::harw_authority::..`); `harw-macros` does not depend on
+//! `harw-authority`.
+//!
 //! # Modulaufbau
 //!
 //! Proc-Macro-Crates dürfen `#[proc_macro*]`-Funktionen nur aus dem Crate-Root
@@ -85,6 +91,9 @@
 //! - [`warden_actions`][]: `warden_actions!`-Expansion (Wire-Enum,
 //!   Vorschlagsform, Tool-Schema, Audit-Typ und Zulässigkeitsmatrix für den
 //!   Warden-Durchsetzer).
+//! - [`permission_request`][]: `permission_request!`-Expansion und die
+//!   einzige Tabelle Permission-Name → `Permission`-Variante (auch von
+//!   [`tool`] genutzt).
 
 use proc_macro::TokenStream;
 use syn::{DeriveInput, ItemFn, parse_macro_input};
@@ -98,6 +107,7 @@ mod kebab_enum;
 mod metrics;
 mod op_args;
 mod operation;
+mod permission_request;
 mod raw_args;
 mod redact;
 mod retention_classes;
@@ -189,13 +199,47 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
 /// | `parallel_safe` | flag or `= true`/`= false` | `false` | whether concurrent calls are safe |
 /// | `state` | `= Type` | none | the executor carries a `Type`; the fn takes `&Type` as an extra first argument |
 /// | `schema_from` | `= path` | none | `path()` returns the `ToolSpec` (externally built schema) instead of `Args::tool_spec()` |
+/// | `activity` | `(domain = "..", verb = "..", resource = "..", effect = "..")` | none | descriptive activity metadata (PL-71); `resource` optional |
+/// | `skill` | `= "<skill-name>"` | none | the bundled skill that explains this tool |
 ///
 /// Accepted `permission` values are `"read_workspace"`, `"write_workspace"`,
 /// `"execute_process"`, `"network_access"`, `"read_secrets"`,
-/// `"manage_plugins"` and `"read_cargo_registry"` — the variants of
-/// `harw_authority::Permission`. Any other value is a compile error listing the
-/// allowed set rather than a silent fallback onto a different permission; a
-/// typo must never resolve to a *different* (possibly weaker) permission.
+/// `"manage_plugins"`, `"read_cargo_registry"` and `"manage_containers"` — the
+/// variants of `harw_authority::Permission`. Any other value is a compile
+/// error listing the allowed set rather than a silent fallback onto a
+/// different permission; a typo must never resolve to a *different* (possibly
+/// weaker) permission.
+///
+/// # Activity metadata and skill binding
+///
+/// ```ignore
+/// #[tool(
+///     name = "fs.glob",
+///     permission = "read_workspace",
+///     parallel_safe,
+///     activity(domain = "filesystem", verb = "glob", resource = "path", effect = "observe"),
+///     skill = "fs-tools",
+/// )]
+/// async fn fs_glob(context: &ToolExecutionContext, args: GlobArgs)
+///     -> Result<ToolOutput, ToolsError> { ... }
+/// ```
+///
+/// - `domain` and `verb` are required vocabulary words (a lowercase ASCII
+///   letter, then lowercase letters, digits, `_` or `-`).
+/// - `effect` is required and one of `observe`, `mutate`, `execute`,
+///   `communicate`, `create`, `delete`, `control`, `other` (the spelling of
+///   `harw_activity::Effect::as_str`).
+/// - `resource` is optional and must name a field of the args type. The
+///   attribute only sees the type's name, so the expansion adds a never-called
+///   function in an anonymous `const _` that borrows `&args.<resource>`; a
+///   missing field is a rustc error at the `resource` literal.
+/// - `skill` uses the `harw-catalog` skill-name rule (1 to 64 lowercase ASCII
+///   letters, digits or `-`).
+///
+/// Activity metadata is descriptive and does not grant authority: it never
+/// changes the permission prologue, and neither `activity` nor `skill` enters
+/// `spec()` (the model-facing `ToolSpec` is byte-identical with or without
+/// them).
 ///
 /// # Stateful tools and external schemas
 ///
@@ -229,9 +273,13 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
 /// 2. A wrapper struct (`FsGlobTool`) — a unit struct deriving `Debug`,
 ///    `Clone`, `Copy` and `Default`, or (with `state`) a one-field struct with
 ///    `new(state)`.
-/// 3. Associated consts `NAME`, `DESCRIPTION`, `PARALLEL_SAFE: bool` and
-///    `PERMISSION: Option<::harw_tools::Permission>`. `PERMISSION` is the
-///    auditable declaration; the prologue below is the actual enforcement.
+/// 3. Associated consts `NAME`, `DESCRIPTION`, `PARALLEL_SAFE: bool`,
+///    `PERMISSION: Option<::harw_tools::Permission>`,
+///    `ACTIVITY: Option<::harw_tools::ActivityDescriptor>` and
+///    `SKILL: Option<&'static str>` (`None` without `activity` / `skill`).
+///    `PERMISSION` is the auditable declaration; the prologue below is the
+///    actual enforcement. `ACTIVITY` is built with the `const fn`
+///    `ActivityDescriptor::new`, so it is a true constant.
 /// 4. `pub fn spec() -> ::harw_tools::ToolSpec`, built from the *second*
 ///    argument's type (which must derive [`macro@Tool`]) with `name` and
 ///    `description` overwritten from `NAME` / `DESCRIPTION`, so a provider can
@@ -256,12 +304,13 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
 ///
 /// # Path requirements on the consumer crate
 ///
-/// The generated tokens reference `::harw_tools::{Permission, ToolCall,
-/// ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName,
-/// ToolOutput, ToolSpec, require_permission, require_host_access,
-/// host_from_url}` and `::serde_json`. A crate using `#[tool]` must therefore
-/// depend on `harw-tools` and `serde_json`; it does **not** need a direct
-/// `harw-sandbox` dependency, because `Permission` is re-exported by
+/// The generated tokens reference `::harw_tools::{ActivityDescriptor, Effect,
+/// Permission, ToolCall, ToolExecutionContext, ToolExecutor,
+/// ToolExecutorFuture, ToolName, ToolOutput, ToolSpec, require_permission,
+/// require_host_access, host_from_url}` and `::serde_json`. A crate using
+/// `#[tool]` must therefore depend on `harw-tools` and `serde_json`; it does
+/// **not** need a direct `harw-sandbox` or `harw-activity` dependency, because
+/// `Permission`, `ActivityDescriptor` and `Effect` are re-exported by
 /// `harw-tools`.
 ///
 /// # Compile-time diagnostics
@@ -270,7 +319,13 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
 /// - unknown attribute key;
 /// - unknown `permission` value (the message lists the allowed values);
 /// - `host_from` without `permission = "network_access"`;
-/// - `host_from` whose value is not a valid field identifier.
+/// - `host_from` whose value is not a valid field identifier;
+/// - a duplicate `activity(...)` or `skill` key, an unknown or duplicate key
+///   inside `activity(...)`, a missing `domain`/`verb`/`effect`, an invalid
+///   vocabulary word, an unknown `effect` (the message lists the allowed
+///   values), an invalid `skill` name;
+/// - a `resource` that is not a valid identifier, or (reported by rustc) not a
+///   field of the args type.
 #[proc_macro_attribute]
 pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parsed = match tool::parse_tool_attr(attr.into()) {
@@ -1311,6 +1366,47 @@ pub fn derive_sensor_source(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn warden_actions(input: TokenStream) -> TokenStream {
     match warden_actions::expand_warden_actions(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Build a `harw_authority::PermissionRequest` from a validated, declarative
+/// list of permission names (authority doc §6.3).
+///
+/// ```ignore
+/// let request: harw_authority::PermissionRequest =
+///     harw_macros::permission_request!(read_workspace, write_workspace);
+/// ```
+///
+/// expands to
+/// `::harw_authority::PermissionRequest::from_permissions([::harw_authority::Permission::ReadWorkspace, ::harw_authority::Permission::WriteWorkspace])`;
+/// an empty list expands to `::harw_authority::PermissionRequest::empty()`.
+///
+/// Accepted names are the spellings of `#[tool(permission = "...")]`:
+/// `read_workspace`, `write_workspace`, `execute_process`, `network_access`,
+/// `read_secrets`, `manage_plugins`, `read_cargo_registry` and
+/// `manage_containers`.
+///
+/// # Security properties
+///
+/// - **Request only.** The expansion calls nothing but the public request API
+///   of `harw-authority`. A `PermissionRequest` grants nothing by itself; it
+///   becomes authority only through `PolicyBootstrap` or by restricting an
+///   existing `AuthorityContext`. The macro has no syntax for a grant, and its
+///   value is not a `PermissionSet` (using it where one is expected is a type
+///   error).
+/// - **No fallback.** An unknown name is a compile error listing the allowed
+///   names; a permission listed twice is a compile error.
+///
+/// # Path requirements on the consumer crate
+///
+/// The generated tokens reference `::harw_authority::{Permission,
+/// PermissionRequest}`, so the calling crate must depend on `harw-authority`.
+/// `harw-macros` itself has no dependency on it.
+#[proc_macro]
+pub fn permission_request(input: TokenStream) -> TokenStream {
+    match permission_request::expand_permission_request(input.into()) {
         Ok(ts) => ts.into(),
         Err(err) => err.to_compile_error().into(),
     }

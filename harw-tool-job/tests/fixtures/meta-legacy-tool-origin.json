@@ -1,0 +1,39 @@
+{
+  "version": 2,
+  "job_id": "job-legacy-tool",
+  "name": "workspace tests",
+  "command": "cargo test --workspace",
+  "cwd": null,
+  "env_keys": [],
+  "state": "succeeded",
+  "pid": 4242,
+  "proc_start_ticks": 777,
+  "identity": {
+    "start_ticks": 777,
+    "executable": "/usr/bin/cargo",
+    "cgroup_path": "/harw.slice/harw-job-7"
+  },
+  "executed_on_host": false,
+  "harw_instance": "harw-r18",
+  "owner": {
+    "session": "worker",
+    "ancestors": ["uia"]
+  },
+  "created_at": "2026-09-24T10:11:12Z",
+  "started_at": "2026-09-24T10:11:13Z",
+  "ended_at": "2026-09-24T10:23:16Z",
+  "exit_code": 0,
+  "signal": null,
+  "stop_requested": false,
+  "detached": false,
+  "notify_every_secs": 60,
+  "progress": null,
+  "warnings": 0,
+  "errors": 0,
+  "launch_error": null,
+  "stragglers_reaped": false,
+  "log_truncated": false,
+  "launch_warnings": [],
+  "origin_call_id": "call-7",
+  "origin_tool": "job.start"
+}

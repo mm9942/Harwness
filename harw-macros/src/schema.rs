@@ -134,12 +134,12 @@ pub(crate) fn vec_inner(ty: &Type) -> Option<&Type> {
 pub(crate) fn generic_inner<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type> {
     if let Type::Path(tp) = ty {
         let seg = tp.path.segments.last()?;
-        if seg.ident == wrapper {
-            if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                for arg in &args.args {
-                    if let syn::GenericArgument::Type(inner) = arg {
-                        return Some(inner);
-                    }
+        if seg.ident == wrapper
+            && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+        {
+            for arg in &args.args {
+                if let syn::GenericArgument::Type(inner) = arg {
+                    return Some(inner);
                 }
             }
         }
@@ -154,12 +154,11 @@ pub(crate) fn doc_string(attrs: &[syn::Attribute]) -> Option<String> {
         if !attr.path().is_ident("doc") {
             continue;
         }
-        if let syn::Meta::NameValue(nv) = &attr.meta {
-            if let syn::Expr::Lit(expr_lit) = &nv.value {
-                if let syn::Lit::Str(s) = &expr_lit.lit {
-                    lines.push(s.value().trim().to_string());
-                }
-            }
+        if let syn::Meta::NameValue(nv) = &attr.meta
+            && let syn::Expr::Lit(expr_lit) = &nv.value
+            && let syn::Lit::Str(s) = &expr_lit.lit
+        {
+            lines.push(s.value().trim().to_string());
         }
     }
     if lines.is_empty() {

@@ -275,13 +275,31 @@ impl SessionJobs {
         state_dir: &Path,
         max_running: u32,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<JobNotification>)> {
+        Self::open_with_port(
+            state_dir,
+            max_running,
+            &harw_command::HostPortOptions::default(),
+        )
+    }
+
+    /// Wie [`SessionJobs::open`], installiert den Befehls-Port aber mit
+    /// `port` (PL-97 E3: `[jobs] cgroup_root` und `[jobs] trampoline` aus
+    /// vertrauenswürdigen Schichten, siehe [`host_port_options`]).
+    ///
+    /// # Errors
+    /// Wie [`SessionJobs::open`].
+    pub fn open_with_port(
+        state_dir: &Path,
+        max_running: u32,
+        port: &harw_command::HostPortOptions,
+    ) -> io::Result<(Self, mpsc::UnboundedReceiver<JobNotification>)> {
         let (notifier, receiver) = ChannelNotifier::channel();
         let mut config = JobManagerConfig::new(state_dir);
         // `[jobs] max_running` (1–256, beim Parsen geprüft); defensiv geklemmt.
         config.max_running_jobs = usize::try_from(max_running.clamp(1, 256)).unwrap_or(16);
         let manager = JobManager::new(config, Arc::new(notifier))?;
         // Jobs start only through the job runtime (PL-93).
-        harw_command::install_host_default(&state_dir.join("runtime-jobs"));
+        harw_command::install_host(&state_dir.join("runtime-jobs"), port);
         Ok((
             Self {
                 manager,
@@ -295,6 +313,19 @@ impl SessionJobs {
     #[must_use]
     pub fn wiring(&self) -> harw_registry_defaults::JobWiring {
         harw_registry_defaults::JobWiring::new(Arc::clone(&self.manager), self.router.lineage())
+    }
+}
+
+/// Die vertrauenswürdigen Eingaben des Befehls-Ports aus `[jobs]` (PL-97
+/// E3): `cgroup_root` und `trampoline`. Eine nicht vertrauenswürdige
+/// Projektschicht kann beide nicht setzen (`harw_config` verwirft sie).
+#[must_use]
+pub fn host_port_options(
+    jobs: &harw_config::harness_config::JobsToml,
+) -> harw_command::HostPortOptions {
+    harw_command::HostPortOptions {
+        cgroup_root: jobs.cgroup_root.clone(),
+        trampoline: jobs.trampoline.clone(),
     }
 }
 
@@ -522,6 +553,24 @@ mod tests {
         let (jobs, _rx) = SessionJobs::open(dir.path(), 3)?;
         assert_eq!(jobs.manager.config().max_running_jobs, 3);
         Ok(())
+    }
+
+    /// PL-97 E3: `[jobs] cgroup_root` und `[jobs] trampoline` erreichen den
+    /// Befehls-Port unverändert.
+    #[test]
+    fn host_port_options_carry_the_jobs_cgroup_root_and_trampoline() {
+        let jobs = harw_config::harness_config::JobsToml {
+            cgroup_root: Some("/sys/fs/cgroup/harw.slice".into()),
+            trampoline: Some("/opt/harw/bin/harw-job-exec".into()),
+            ..Default::default()
+        };
+        let options = host_port_options(&jobs);
+        assert_eq!(options.cgroup_root, jobs.cgroup_root);
+        assert_eq!(options.trampoline, jobs.trampoline);
+        assert_eq!(
+            host_port_options(&harw_config::harness_config::JobsToml::default()),
+            harw_command::HostPortOptions::default()
+        );
     }
 
     /// Werte außerhalb von 1..=256 werden defensiv geklemmt (die eigentliche

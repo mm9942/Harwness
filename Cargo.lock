@@ -204,7 +204,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -215,7 +215,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -647,7 +647,7 @@ dependencies = [
  "maybe-owned",
  "rustix 1.1.5",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -1350,9 +1350,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "a2376ffd6f96d8a9db59875b4b6b0237d6900b5baf64279714e05493ce64828a"
 dependencies = [
  "cmov",
 ]
@@ -1724,7 +1724,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2142,6 +2142,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-activity"
+version = "0.9.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harw-agent-artifact"
 version = "0.9.1"
 dependencies = [
@@ -2387,12 +2395,13 @@ dependencies = [
  "harw-config",
  "harw-context",
  "harw-core",
+ "harw-dod-client",
  "harw-dod-encrypt",
  "harw-extension-api",
+ "harw-fsutil",
  "harw-home",
  "harw-infra-client",
  "harw-install",
- "harw-job-executor-bwrap",
  "harw-job-runtime",
  "harw-job-store",
  "harw-killer",
@@ -2431,6 +2440,7 @@ dependencies = [
  "harw-tailscale",
  "harw-tool-doc",
  "harw-tool-lens",
+ "harw-tools",
  "harw-tui",
  "harw-types",
  "harw-web",
@@ -2444,6 +2454,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tikv-jemallocator",
+ "time",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "toml_edit",
@@ -2465,6 +2476,7 @@ name = "harw-cloud-enroll"
 version = "0.9.1"
 dependencies = [
  "harw-types",
+ "jiff",
  "serde",
  "serde_json",
  "tracing",
@@ -2486,12 +2498,17 @@ dependencies = [
 name = "harw-cloud-ops"
 version = "0.9.1"
 dependencies = [
+ "harw-authority",
  "harw-cloud-gateway",
+ "harw-home",
  "harw-macros",
+ "harw-node-listener",
  "harw-operations",
  "harw-tools",
+ "harw-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -2500,6 +2517,7 @@ name = "harw-cloudctl"
 version = "0.9.1"
 dependencies = [
  "harw-cloud-gateway",
+ "harw-install",
  "serde_json",
  "tokio",
 ]
@@ -2520,6 +2538,10 @@ name = "harw-command"
 version = "0.9.1"
 dependencies = [
  "harw-job",
+ "harw-job-core",
+ "harw-job-executor-bwrap",
+ "harw-job-runtime",
+ "harw-sandbox",
  "harw-test-support",
  "harw-types",
  "jiff",
@@ -2748,6 +2770,19 @@ dependencies = [
  "jiff",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "harw-dod-client"
+version = "0.9.1"
+dependencies = [
+ "harw-dod-config",
+ "harw-types",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
 ]
 
 [[package]]
@@ -3206,6 +3241,7 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "harw-config",
+ "harw-dod-client",
  "harw-home",
  "harw-test-support",
  "jiff",
@@ -3353,6 +3389,7 @@ dependencies = [
  "harw-provider",
  "harw-types",
  "jiff",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "tempfile",
@@ -3573,6 +3610,7 @@ name = "harw-macros"
 version = "0.9.1"
 dependencies = [
  "blake3",
+ "harw-authority",
  "harw-dod-cap",
  "harw-dod-readfs",
  "harw-dod-signals",
@@ -3647,6 +3685,7 @@ dependencies = [
  "harw-protocol",
  "harw-test-support",
  "rustix 1.1.5",
+ "serde",
  "tempfile",
 ]
 
@@ -3747,6 +3786,7 @@ version = "0.9.1"
 dependencies = [
  "bytes",
  "futures-util",
+ "harw-fsutil",
  "harw-node-transport",
  "harw-protocol",
  "harw-session-host",
@@ -3886,6 +3926,7 @@ dependencies = [
  "harw-config",
  "harw-core",
  "harw-core-bridge",
+ "harw-dod-client",
  "harw-explorer",
  "harw-extension-api",
  "harw-home",
@@ -3937,6 +3978,7 @@ dependencies = [
 name = "harw-plan"
 version = "0.9.1"
 dependencies = [
+ "fs4",
  "harw-macros",
  "harw-types",
  "serde",
@@ -4120,12 +4162,15 @@ dependencies = [
  "harw-tool-doc",
  "harw-tool-explorer",
  "harw-tool-fs",
+ "harw-tool-fsread",
+ "harw-tool-gitread",
  "harw-tool-job",
  "harw-tool-lens",
  "harw-tool-obsidian",
  "harw-tool-plan",
  "harw-tool-process",
  "harw-tool-shell",
+ "harw-tool-sys",
  "harw-tool-web",
  "harw-tools",
  "harw-types",
@@ -4186,6 +4231,7 @@ dependencies = [
  "harw-context-ledger",
  "harw-core",
  "harw-core-bridge",
+ "harw-dod-client",
  "harw-explorer",
  "harw-extension-api",
  "harw-fsutil",
@@ -4197,6 +4243,7 @@ dependencies = [
  "harw-lens-types",
  "harw-macros",
  "harw-mcp-client",
+ "harw-media",
  "harw-memory",
  "harw-model-catalog",
  "harw-observe",
@@ -4213,6 +4260,7 @@ dependencies = [
  "harw-session-store",
  "harw-tool-container",
  "harw-tool-container-run",
+ "harw-tool-fs",
  "harw-tool-job",
  "harw-tool-plan",
  "harw-tool-remote",
@@ -4390,6 +4438,7 @@ name = "harw-session-driver"
 version = "0.9.1"
 dependencies = [
  "harw-core",
+ "harw-extension-api",
  "harw-protocol",
  "harw-session-host",
  "harw-session-store",
@@ -4404,6 +4453,7 @@ dependencies = [
 name = "harw-session-host"
 version = "0.9.1"
 dependencies = [
+ "fs4",
  "harw-authority",
  "harw-fsutil",
  "harw-protocol",
@@ -4631,6 +4681,8 @@ dependencies = [
  "harw-fsutil",
  "harw-home",
  "harw-macros",
+ "harw-media",
+ "harw-protocol",
  "harw-sandbox",
  "harw-tools",
  "harw-types",
@@ -4870,6 +4922,7 @@ name = "harw-tools"
 version = "0.9.1"
 dependencies = [
  "async-trait",
+ "harw-activity",
  "harw-authority",
  "harw-context",
  "harw-lens-types",
@@ -4888,6 +4941,7 @@ name = "harw-tui"
 version = "0.9.1"
 dependencies = [
  "crossterm 0.29.0",
+ "harw-activity",
  "harw-agent-artifact",
  "harw-agent-dsl",
  "harw-authority",
@@ -4924,6 +4978,7 @@ dependencies = [
  "harw-types",
  "jiff",
  "ratatui",
+ "rustix 1.1.5",
  "secrecy 0.8.0",
  "serde_json",
  "tempfile",
@@ -5305,7 +5360,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -6210,7 +6265,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6926,7 +6981,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7142,7 +7197,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -7246,7 +7301,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7314,7 +7369,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7325,9 +7380,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -7830,7 +7885,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8004,10 +8059,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8198,9 +8253,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -8568,7 +8623,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8844,9 +8899,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -8857,14 +8912,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -8891,7 +8946,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9416,27 +9471,27 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.14.0"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf06bd8162af0734b344780deb55b42a2429ae430870d13fcc12f238e880fe6e"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "8.0.0"
+version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae42c0555055784c70058d19ba8e275528e8a99a706684868ace5da4e716a4ab"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.0+zstd.1.5.7"
+version = "2.1.2+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",

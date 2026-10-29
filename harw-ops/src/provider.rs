@@ -725,26 +725,26 @@ pub(crate) fn handle_switch_core(
         }
         None => {
             let snap = controller.snapshot();
-            if let Some(ref active_model) = snap.active_model {
-                if let Some(model) = config.models.values().find(|model| {
+            if let Some(ref active_model) = snap.active_model
+                && let Some(model) = config.models.values().find(|model| {
                     model.id == *active_model
                         || model.aliases.iter().any(|alias| alias == active_model)
-                }) {
-                    let model_provider = configured_provider(&config, &model.provider)
-                        .map(|(canonical, _)| canonical)
-                        .unwrap_or(model.provider.as_str());
-                    if model_provider != canonical_target {
-                        return Err(OpError::InvalidArguments(format!(
-                            "active model '{active_model}' is not available on provider '{canonical_target}' \
+                })
+            {
+                let model_provider = configured_provider(&config, &model.provider)
+                    .map(|(canonical, _)| canonical)
+                    .unwrap_or(model.provider.as_str());
+                if model_provider != canonical_target {
+                    return Err(OpError::InvalidArguments(format!(
+                        "active model '{active_model}' is not available on provider '{canonical_target}' \
                              (model belongs to provider '{model_provider}'); \
                              use `/model switch` first or accept a provider-appropriate model."
-                        )));
-                    }
+                    )));
                 }
-                // An unknown active model is outside this operation's authority. Its runtime
-                // executor remains responsible for rejecting it; provider selection stays
-                // constrained to the configured provider catalog above.
             }
+            // An unknown active model is outside this operation's authority. Its runtime
+            // executor remains responsible for rejecting it; provider selection stays
+            // constrained to the configured provider catalog above.
             None
         }
     };

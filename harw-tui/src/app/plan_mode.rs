@@ -276,10 +276,8 @@ pub(crate) fn run_pending_editor(guard: &mut TerminalGuard, app: &mut ChatApp) -
         Ok(()) => {
             let repinned = app.plan_ui.session().is_some_and(|session| {
                 let pinned = session.pinned().get().is_some_and(|doc| doc.slug == slug);
-                if pinned {
-                    if let Ok(content) = session.dir().read(&slug) {
-                        session.pinned().pin(&slug, &content);
-                    }
+                if pinned && let Ok(content) = session.dir().read(&slug) {
+                    session.pinned().pin(&slug, &content);
                 }
                 pinned
             });

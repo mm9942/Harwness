@@ -246,12 +246,12 @@ fn remote_ask_model_entry() -> Option<ModelEntry> {
 /// ```
 #[must_use]
 pub fn ask_embedder() -> Box<dyn Embedder> {
-    if let Some((base_url, api_key)) = remote_ask_config() {
-        if let Some(entry) = remote_ask_model_entry() {
-            let backend = HttpEmbedBackend::new(base_url, entry.spec.name, api_key);
-            let remote = RemoteEmbedder::new(backend, entry.spec.dimensions);
-            return Box::new(DimensionCheckedEmbedder::new(remote));
-        }
+    if let Some((base_url, api_key)) = remote_ask_config()
+        && let Some(entry) = remote_ask_model_entry()
+    {
+        let backend = HttpEmbedBackend::new(base_url, entry.spec.name, api_key);
+        let remote = RemoteEmbedder::new(backend, entry.spec.dimensions);
+        return Box::new(DimensionCheckedEmbedder::new(remote));
     }
     Box::new(DeterministicEmbedder::new(ASK_EMBEDDING_DIMENSIONS))
 }
@@ -300,10 +300,10 @@ pub fn ask_descriptor() -> EmbeddingDescriptor {
 /// [`ModelEntry::spec`]s `name`, wenn ein entfernter Endpunkt konfiguriert
 /// und der Katalogeintrag auflösbar ist; sonst [`ASK_EMBEDDING_MODEL`].
 fn ask_embedding_model() -> String {
-    if remote_ask_config().is_some() {
-        if let Some(entry) = remote_ask_model_entry() {
-            return entry.spec.name;
-        }
+    if remote_ask_config().is_some()
+        && let Some(entry) = remote_ask_model_entry()
+    {
+        return entry.spec.name;
     }
     ASK_EMBEDDING_MODEL.to_owned()
 }

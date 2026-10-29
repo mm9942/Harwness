@@ -30,8 +30,9 @@ harw-dod-rules = { path = "../harw-dod-rules" }
 
 # Neun der zehn in `xtask/src/gate_privileges.rs`s `CRATE_PRIVILEGE` als
 # `RequiredPrivilege::Unprivileged` geführten Sensor-Crates (die zehnte,
-# `harw-dod-cgroup`, ist noch Gerüst -- siehe `//!`-Block in src/lib.rs,
-# Abschnitt "Bekannte Lücke"). Jede liefert genau einen konkreten
+# `harw-dod-cgroup`, ist implementiert, aber noch nicht in die Fassade
+# aufgenommen -- siehe `//!`-Block in src/lib.rs, Abschnitt "Bekannte
+# Lücke"). Jede liefert genau einen konkreten
 # `Sensor`-Typ -- das Werkzeug, mit dem ein Aufrufer tatsächlich etwas
 # beobachten kann, nicht nur das Vokabular dafür.
 harw-dod-cpu = { path = "../harw-dod-cpu" }

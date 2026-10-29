@@ -89,10 +89,10 @@ fn read_note_parts(
         "body": truncate(body, MAX_BODY_CHARS),
         "wikilinks": links,
     });
-    if let (Some(yaml), Some(store)) = (yaml.as_deref(), memory) {
-        if let Some(node_id) = frontmatter_scalar(yaml, MEMORY_KEY) {
-            value["memory"] = resolve_memory(store, node_id);
-        }
+    if let (Some(yaml), Some(store)) = (yaml.as_deref(), memory)
+        && let Some(node_id) = frontmatter_scalar(yaml, MEMORY_KEY)
+    {
+        value["memory"] = resolve_memory(store, node_id);
     }
     Ok(value)
 }

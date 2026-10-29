@@ -359,7 +359,8 @@ pub fn run_tail(root: &Path, args: &TailArgs) -> ToolOutput {
     name = "fsread.head",
     description = "Returns the first lines (-n, default 10, max 5000) or bytes (-c) of a workspace text file like head. Use when you need only the beginning of a file instead of running head or reading it whole. Returns JSON {content, lines_returned, bytes_returned, file_size, truncated, more_available}; output is capped at 48 KiB and binary files are refused.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_head(
     context: &ToolExecutionContext,
@@ -374,7 +375,8 @@ async fn fsread_head(
     name = "fsread.tail",
     description = "Returns the last lines (-n, default 10, max 5000) or bytes (-c) of a workspace text file like tail, or everything from a given line (from_line, the -n +N form). Use when you need the end of a log or file instead of running tail. Returns JSON {content, lines_returned, file_size, truncated, more_available}; searches the last 1 MiB, output capped at 48 KiB keeping the end, binary files refused.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_tail(
     context: &ToolExecutionContext,

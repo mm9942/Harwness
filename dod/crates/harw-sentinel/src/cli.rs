@@ -6,7 +6,9 @@
 //! `harw-cli`s Fehlerverhalten), Wurzelverzeichnisse für die sechs
 //! eingebetteten Dateisystem-Sensoren (`--proc-root`, `--thermal-root`,
 //! `--workspace-root`, `--blockio-root`, `--gpu-root`, `--cgroup-root`), den
-//! Pfad des IPC-Empfangssockets und die Poll-Taktung. Diese Datei parst
+//! Pfad des IPC-Empfangssockets, die Poll-Taktung, den expliziten
+//! Konfigurationspfad (`--config`) und die beiden optionalen Exporte
+//! (`--findings-export`, `--health-export`). Diese Datei parst
 //! nur — sie kennt weder `Sentinel` noch einen Sensor.
 //!
 //! # Nebenläufigkeit
@@ -127,7 +129,7 @@ impl LogLevel {
     name = "harw-sentinel",
     bin_name = "harw-sentinel",
     version,
-    about = "Unprivilegierte Sammelstelle: ruft Sensoren, führt den Degradationsautomaten, puffert.",
+    about = "Harw-DoD Sentinel — unprivilegierte Sammelstelle: ruft Sensoren, führt den Degradationsautomaten, puffert.",
     subcommand_negates_reqs = true
 )]
 pub struct Cli {
@@ -207,11 +209,18 @@ pub struct Cli {
     pub telemetry_max_files: Option<u64>,
 
     /// Optionaler JSON-Lines-Export jedes zertifizierten Befundes für
-    /// `harw-security-hub` (siehe `crate::export`), z. B.
-    /// `/var/lib/harw-sentinel/findings.jsonl`. Muss absolut sein. Ohne
-    /// Angabe wird nichts exportiert.
+    /// `harw-security-hub` und harw (siehe `crate::export`), z. B.
+    /// `/var/lib/harw-dod/export/findings.jsonl` (die ausgelieferte Unit).
+    /// Muss absolut sein. Ohne Angabe wird nichts exportiert.
     #[arg(long, value_name = "PATH", value_parser = parse_absolute_path)]
     pub findings_export: Option<PathBuf>,
+
+    /// Optional health document, atomically rewritten every poll cycle
+    /// (see `crate::health_export`). Must be absolute. Without it, the
+    /// default is the sibling `health.json` of `--findings-export`; with
+    /// neither flag nothing is written.
+    #[arg(long, value_name = "PATH", value_parser = parse_absolute_path)]
+    pub health_export: Option<PathBuf>,
 
     /// `host`-Feld jeder Exportzeile — muss `server.host` des Hubs
     /// entsprechen. Ohne Angabe: der Kernel-Hostname
@@ -227,7 +236,25 @@ pub struct Cli {
     pub findings_export_keep: u32,
 }
 
-/// `clap`-Wertparser für `--findings-export`: nur absolute Pfade.
+impl Cli {
+    /// The effective health export path.
+    ///
+    /// # Returns
+    /// `--health-export` when given; otherwise, when `--findings-export` is
+    /// set, its sibling [`crate::health_export::DEFAULT_HEALTH_FILE_NAME`];
+    /// otherwise `None` (no health export).
+    #[must_use]
+    pub fn resolved_health_export(&self) -> Option<PathBuf> {
+        self.health_export.clone().or_else(|| {
+            self.findings_export
+                .as_deref()
+                .and_then(crate::health_export::default_path_for)
+        })
+    }
+}
+
+/// `clap`-Wertparser für `--findings-export`/`--health-export`: nur
+/// absolute Pfade.
 fn parse_absolute_path(raw: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(raw);
     if path.is_absolute() {
@@ -406,6 +433,74 @@ mod tests {
             Some("host-a")
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_config_flag_accepts_the_shipped_system_path() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel", "--config", "/etc/harw-dod/config.toml"])
+            .map_err(ctx("valid --config"))?;
+        assert_eq!(
+            cli.config,
+            Some(std::path::PathBuf::from("/etc/harw-dod/config.toml"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_health_export_is_disabled_without_either_export_flag() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert!(cli.health_export.is_none());
+        assert!(cli.resolved_health_export().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_health_export_defaults_to_the_findings_export_sibling() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            "/var/lib/harw-dod/export/findings.jsonl",
+        ])
+        .map_err(ctx("valid export flag"))?;
+        assert_eq!(
+            cli.resolved_health_export(),
+            Some(std::path::PathBuf::from(
+                "/var/lib/harw-dod/export/health.json"
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_explicit_health_export_wins_over_the_default() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            "/var/lib/harw-dod/export/findings.jsonl",
+            "--health-export",
+            "/run/harw-dod/health.json",
+        ])
+        .map_err(ctx("valid export flags"))?;
+        assert_eq!(
+            cli.resolved_health_export(),
+            Some(std::path::PathBuf::from("/run/harw-dod/health.json"))
+        );
+        let alone = Cli::try_parse_from(["harw-sentinel", "--health-export", "/tmp/h.json"])
+            .map_err(ctx("health export alone"))?;
+        assert_eq!(
+            alone.resolved_health_export(),
+            Some(std::path::PathBuf::from("/tmp/h.json"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_health_export_rejects_a_relative_path() {
+        let result = Cli::try_parse_from(["harw-sentinel", "--health-export", "health.json"]);
+        assert!(
+            result.is_err(),
+            "a relative health export path must not parse"
+        );
     }
 
     #[test]

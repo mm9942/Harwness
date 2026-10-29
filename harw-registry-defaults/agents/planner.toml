@@ -28,6 +28,7 @@ may_write_code = false
 [tools]
 admitted = [
   "fs.read",
+  "fs.view_image",
   "fs.list",
   "fs.search",
   "fs.glob",

@@ -37,6 +37,12 @@ harw-tool-process = { path = "../harw-tool-process" }
 # `cargo.test_one` (Plan 93): der einzige registrierte `cargo.*`-Eintrag, nur
 # für `test-engineer` (siehe `profile::CARGO_TEST_ONE_TOOLS`).
 harw-tool-cargo = { path = "../harw-tool-cargo" }
+# PL-93/PL-97 B4: die lesenden Kommando-Werkzeuge `fsread.*` (Dateisystem),
+# `git.*` (Git-Leser in reinem Rust) und `sys.*` (Prozess-/Systemzustand über
+# `/proc`); siehe `profile::{FSREAD_TOOLS, GIT_READ_TOOLS, SYS_TOOLS}`.
+harw-tool-fsread = { path = "../harw-tool-fsread" }
+harw-tool-gitread = { path = "../harw-tool-gitread" }
+harw-tool-sys = { path = "../harw-tool-sys" }
 # `doc.read_pdf` (Anbindung W3): lesendes PDF-Werkzeug, erscheint überall, wo
 # ein lesender `FsToolProvider` registriert wird (siehe `profile::DOC_TOOLS`).
 harw-tool-doc = { version = "0.9.1", path = "../harw-tool-doc" }

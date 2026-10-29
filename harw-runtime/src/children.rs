@@ -1563,6 +1563,46 @@ impl RuntimeChildRegistryFactory {
         )
     }
 
+    /// Die lesenden Harw-DoD-Werkzeuge der Triage-Rollen (PL-97 D4).
+    ///
+    /// # Description
+    /// Baut einen [`ModelToolProvider`] mit genau den drei Operationen
+    /// `dod.status`, `dod.findings` und `dod.sensors` aus `harw_ops::dod`
+    /// — montiert nur für die Rollen aus
+    /// [`harw_registry_defaults::profile::dod_tools_for_role`] (die vier
+    /// `security-*-triage`-Rollen). Alle drei sind lesend und ohne Freigabe
+    /// (`model_tool(readonly, approval = "none")`, in `AUTO_APPROVED_TOOLS`),
+    /// tragen kein Sandbox-Recht und erreichen weder Warden noch
+    /// Eskalationsleiter (Invariante S1). Der `OpContext` entsteht je Aufruf
+    /// wie bei [`Self::matrix_game_master_provider`]; seine Dienste
+    /// ([`dod_services`]) sind der gebundene Root-Space
+    /// ([`Self::with_home_context`]), aus dem `harw_ops::dod::dod_service`
+    /// den geteilten `DodService` (5-s-Cache, `[dod] export_dir` des
+    /// Root-Space) ableitet, und die Identität des Kindes. Ohne Root-Space
+    /// scheitert jeder Aufruf fail-closed mit `OpError::NotAvailable` — nie
+    /// ein Rückfall auf `HARW_HOME`.
+    fn dod_read_provider(&self, identity: Arc<CallerIdentity>) -> ModelToolProvider {
+        let home_context = self.home_context.clone();
+        let operations: [Arc<dyn Operation>; 3] = [
+            Arc::new(harw_ops::dod::DodStatusOperation),
+            Arc::new(harw_ops::dod::DodFindingsOperation),
+            Arc::new(harw_ops::dod::DodSensorsOperation),
+        ];
+        ModelToolProvider::new(operations, move |execution_context| {
+            let services = dod_services(home_context.as_ref(), &identity);
+            let ctx = OpContext::new(
+                execution_context.session_id().clone(),
+                execution_context.turn_id().clone(),
+                execution_context.sandbox().clone(),
+                services,
+            );
+            match execution_context.cancel() {
+                Some(cancel) => ctx.with_cancel_token(cancel.clone()),
+                None => ctx,
+            }
+        })
+    }
+
     /// Die Skill-Fragmente einer Kind-Rolle: die direkt im Katalog
     /// (`agents/<rolle>/agent.toml`) konfigurierten Skills, vereinigt mit den
     /// Skills der eingebauten Agent-Definition der Rolle
@@ -1799,6 +1839,28 @@ fn game_master_services(
     if let Some(store) = state_store {
         services.insert(Arc::clone(store));
     }
+    if let Some(context) = home_context {
+        services.insert(Arc::clone(context));
+    }
+    services.insert(Arc::clone(identity));
+    services
+}
+
+/// Die Dienste des `OpContext` der lesenden `dod.*`-Werkzeuge (PL-97 D4).
+///
+/// # Description
+/// Nur der gebundene Root-Space (falls gesetzt) und die Identität des
+/// Kindes — kein Spawner, kein `StateStore`: die Operationen lesen allein
+/// den Harw-DoD-Export über `harw_ops::dod::dod_service`.
+///
+/// # Arguments
+/// - `home_context`: der gebundene Root-Space der Wurzel, falls gesetzt.
+/// - `identity`: die vertrauenswürdige Identität dieses Kindes.
+fn dod_services(
+    home_context: Option<&Arc<harw_home::ResolvedHomeContext>>,
+    identity: &Arc<CallerIdentity>,
+) -> ServiceMap {
+    let mut services = ServiceMap::new();
     if let Some(context) = home_context {
         services.insert(Arc::clone(context));
     }
@@ -2124,6 +2186,14 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             registry_builder = registry_builder.tool_provider(Arc::new(
                 self.matrix_game_master_provider(Arc::clone(&identity)),
             ));
+        }
+        // PL-97 D4: die lesenden `dod.*` ausschließlich für die vier
+        // Triage-Rollen (rollengebundener `ModelToolProvider`, siehe
+        // `dod_read_provider`); die `SessionActivation` schaltet sie nur frei,
+        // wenn die Definition sie admittiert.
+        if !harw_registry_defaults::profile::dod_tools_for_role(lookup).is_empty() {
+            registry_builder = registry_builder
+                .tool_provider(Arc::new(self.dod_read_provider(Arc::clone(&identity))));
         }
         // Runde 5, Teil H: `agent.result` für jede Rolle, die Kinder starten
         // darf; der Spawner wird wie bei `delegate_wave` nur schwach gehalten.
@@ -2621,6 +2691,9 @@ fn load_enabled_skills<'a>(
             match index {
                 Some(index) if index.is_disabled(name) => continue,
                 Some(index) => match index.get(name).filter(|entry| entry.name == *name) {
+                    Some(entry) if entry.source.is_imported() => {
+                        return Err(imported_skill_refusal(name));
+                    }
                     Some(entry) => {
                         snapshots.push(entry.snapshot().clone());
                         continue;
@@ -2638,11 +2711,25 @@ fn load_enabled_skills<'a>(
             .ok_or_else(|| {
                 format!("skill '{name}' has no skills/*/skill.toml in any trusted config layer")
             })?;
+        if harw_catalog::is_imported_dir(&directory) {
+            return Err(imported_skill_refusal(name));
+        }
         let snapshot = load_skill_runtime_snapshot(&directory, skill)
             .map_err(|error| format!("skill '{name}': {error}"))?;
         snapshots.push(snapshot);
     }
     Ok(snapshots)
+}
+
+/// Die Absage für einen fest gebundenen importierten Skill (PL-97 H8):
+/// sein Text ist Evidenz, nie Instruktion; er erreicht das Modell nur über den
+/// getriggerten Injektor mit `[skills] inject_imported = true`.
+fn imported_skill_refusal(name: &str) -> String {
+    format!(
+        "skill '{name}' is imported ({}); an imported skill cannot be bound as an \
+         instruction, leave it to the triggered injector with [skills] inject_imported = true",
+        harw_catalog::IMPORTED_MARKER_FILE
+    )
 }
 
 /// Rendert die aktivierten Skills `skill_names` als Instruktionsfragmente
@@ -4008,6 +4095,54 @@ mod tests {
         Ok(())
     }
 
+    /// PL-97 H8: ein fest gebundener importierter Skill (Marker
+    /// `imported.toml`) wird nie Instruktionsfragment — weder über den
+    /// Index-Rückfall noch über die Konfiguration; die Montage scheitert
+    /// fail-closed.
+    #[test]
+    fn bound_imported_skills_are_refused_as_instructions() -> TestResult {
+        // Konfigurationsweg: `review` steht in `config.skills`.
+        let (layer, config) = skill_fixture("assistant")?;
+        let roots = vec![layer.path().to_path_buf()];
+        std::fs::write(
+            layer
+                .path()
+                .join("skills")
+                .join("review")
+                .join(harw_catalog::IMPORTED_MARKER_FILE),
+            "",
+        )
+        .map_err(ctx("write marker"))?;
+        let Err(error) = agent_skill_fragments(&config, &roots, "assistant") else {
+            return Err(crate::test_support::TestError::Unexpected(
+                "an imported skill must not become an instruction fragment".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("is imported"), "{error}");
+
+        // Index-Rückfall: der Name fehlt in der Konfiguration.
+        let fremd = layer.path().join("skills").join("fremd");
+        std::fs::create_dir_all(&fremd).map_err(ctx("mkdir fremd"))?;
+        std::fs::write(
+            fremd.join("skill.toml"),
+            "name = \"fremd\"\ndescription = \"Fremd.\"\n",
+        )
+        .map_err(ctx("write manifest"))?;
+        std::fs::write(fremd.join("instructions.md"), "Foreign advice.\n")
+            .map_err(ctx("write body"))?;
+        std::fs::write(fremd.join(harw_catalog::IMPORTED_MARKER_FILE), "")
+            .map_err(ctx("write marker"))?;
+        let index = SkillIndex::build(&roots);
+        let root = ir_with_skills(&["fremd"])?;
+        let Err(error) = root_skill_fragments(&config, &roots, &index, Some(&root), None) else {
+            return Err(crate::test_support::TestError::Unexpected(
+                "an imported index skill must not become an instruction fragment".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("is imported"), "{error}");
+        Ok(())
+    }
+
     /// Runde 7, Teil T5: ohne Skill-Katalog startet der LaTeX-Writer nicht
     /// (fail-closed) — nie ein Kind ohne seine Skills.
     #[test]
@@ -4396,6 +4531,184 @@ mod tests {
             .flat_map(|provider| provider.tools())
             .map(|spec| spec.name().to_owned())
             .collect()
+    }
+
+    // -------------------------------------------------------------------
+    // PL-97 D4 — die lesenden Harw-DoD-Werkzeuge der Triage-Rollen.
+    // -------------------------------------------------------------------
+
+    /// Eine Fabrik wie im echten Lauf mit den mitgelieferten Skills: die
+    /// Triage-Rollen verlangen ihren Definitions-Skill `harw-dod` und
+    /// starten ohne Skill-Katalog fail-closed nicht.
+    fn factory_with_bundled_skills() -> TestResult<RuntimeChildRegistryFactory> {
+        let config = harw_config::ResolvedConfig::default();
+        RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_skill_catalog(&config, Vec::new())
+        .map_err(ctx("skill catalog"))
+    }
+
+    /// Die sortierten Werkzeugnamen der Kind-Registry von `role`.
+    fn served_tools(factory: &RuntimeChildRegistryFactory, role: &str) -> TestResult<Vec<String>> {
+        let registry = factory
+            .build_registry(role, &test_spawn_input(), None)
+            .map_err(|error| TestError::Unexpected(format!("{role}: {}", error.message)))?;
+        let mut names = registry_tool_names(&registry);
+        names.sort();
+        Ok(names)
+    }
+
+    /// PL-97 D4: ein `security-egress-triage`-Kind bekommt genau
+    /// `dod.status`, `dod.findings` und `dod.sensors` (lesend, ohne Freigabe)
+    /// und den fest gebundenen Skill `harw-dod`; die drei übrigen
+    /// Triage-Rollen ebenso, keine andere eingebaute Rolle bekommt den
+    /// Provider.
+    #[test]
+    fn security_egress_triage_child_serves_exactly_the_dod_read_tools() -> TestResult {
+        let factory = factory_with_bundled_skills()?;
+        assert_eq!(
+            served_tools(&factory, role_names::SECURITY_EGRESS_TRIAGE)?,
+            ["dod.findings", "dod.sensors", "dod.status"]
+        );
+
+        let provider = factory
+            .dod_read_provider(factory.child_caller_identity(role_names::SECURITY_EGRESS_TRIAGE));
+        for tool in harw_registry_defaults::profile::DOD_READ_TOOLS {
+            assert_eq!(
+                provider.approval_policy(&harw_tools::ToolName::new(*tool)),
+                Some(harw_operations::ApprovalPolicy::None),
+                "{tool}: lesend, ohne Freigabe"
+            );
+            assert!(
+                harw_registry_defaults::AUTO_APPROVED_TOOLS.contains(tool),
+                "{tool} ist auto-freigegeben"
+            );
+        }
+
+        let fragments = factory
+            .skill_fragments_for_role(role_names::SECURITY_EGRESS_TRIAGE)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert_eq!(fragments.len(), 1, "{fragments:?}");
+        assert!(
+            fragments
+                .first()
+                .is_some_and(|fragment| fragment.starts_with("# Skill: harw-dod (sha256 ")),
+            "{fragments:?}"
+        );
+
+        for role in [
+            role_names::SECURITY_BASELINE_TRIAGE,
+            role_names::SECURITY_STRUCTURE_TRIAGE,
+            role_names::SECURITY_ENDPOINT_TRIAGE,
+        ] {
+            assert_eq!(
+                served_tools(&factory, role)?,
+                ["dod.findings", "dod.sensors", "dod.status"],
+                "{role}"
+            );
+        }
+        for role in role_names::ALL {
+            let triage = role.starts_with("security-") && role.ends_with("-triage");
+            assert_eq!(
+                !harw_registry_defaults::profile::dod_tools_for_role(role).is_empty(),
+                triage,
+                "{role}"
+            );
+        }
+        Ok(())
+    }
+
+    /// PL-97 D4: der `OpContext` der `dod.*` trägt den gebundenen Root-Space
+    /// und die Identität des Kindes; ohne Root-Space scheitert ein Aufruf
+    /// fail-closed (`NotAvailable`), statt auf `HARW_HOME` auszuweichen.
+    #[tokio::test]
+    async fn dod_read_tools_need_the_bound_home_context() -> TestResult {
+        use harw_extension_api::{ToolExecutionContext, ToolProvider as _};
+
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let project_dir = home.path().join("project");
+        std::fs::create_dir_all(&project_dir).map_err(ctx("project dir"))?;
+        let project = harw_home::ProjectRoot {
+            root: project_dir.clone(),
+            trust_key: project_dir.clone(),
+            kind: harw_home::ProjectKind::Directory,
+        };
+        let context = Arc::new(
+            harw_home::ResolvedHomeContext::new(home.path(), "default".to_owned(), project)
+                .map_err(ctx("home context"))?,
+        );
+        let factory = factory_with_bundled_skills()?;
+        let identity = factory.child_caller_identity(role_names::SECURITY_EGRESS_TRIAGE);
+
+        let unbound = dod_services(factory.home_context.as_ref(), &identity);
+        assert!(
+            unbound
+                .get::<Arc<harw_home::ResolvedHomeContext>>()
+                .is_none()
+        );
+        let carried = unbound
+            .get::<Arc<CallerIdentity>>()
+            .ok_or(TestError::Missing("dod-ServiceMap ohne Identität"))?;
+        assert!(Arc::ptr_eq(carried, &identity));
+
+        // Ohne Root-Space: der Aufruf scheitert, bevor etwas gelesen wird.
+        let registry = harw_authority::WorkspaceRegistry::build(
+            home.path(),
+            [harw_authority::WorkspaceRegistration {
+                tenant: harw_types::TenantId::from_str("t"),
+                workspace: harw_types::WorkspaceId::from_str("project"),
+                root: project_dir,
+            }],
+        )
+        .map_err(ctx("workspace registry"))?;
+        let binding = registry
+            .resolve(
+                &harw_types::TenantId::from_str("t"),
+                &harw_types::WorkspaceId::from_str("project"),
+            )
+            .map_err(ctx("resolve"))?;
+        let execution = ToolExecutionContext::new(
+            harw_types::SessionId::new(),
+            harw_types::TurnId::new(),
+            harw_authority::SandboxSpec::from_resolved(
+                binding,
+                harw_authority::PermissionSet::from_policy(Vec::new()),
+            ),
+        );
+        let provider = factory.dod_read_provider(Arc::clone(&identity));
+        let name = harw_tools::ToolName::new("dod.status");
+        let executor = provider
+            .executor(&name)
+            .ok_or(TestError::Missing("dod.status-Executor"))?;
+        let call = harw_extension_api::ToolCall {
+            id: harw_types::ToolCallId::new(),
+            name,
+            arguments: serde_json::json!({}),
+        };
+        match executor.execute(&execution, &call).await {
+            Err(error) => assert!(
+                error.to_string().contains("bound harw root space"),
+                "{error}"
+            ),
+            Ok(output) => {
+                return Err(TestError::Unexpected(format!(
+                    "ohne Root-Space darf dod.status nichts liefern: {output:?}"
+                )));
+            }
+        }
+
+        // Mit Root-Space: dieselbe Instanz im OpContext.
+        let factory = factory.with_home_context(Arc::clone(&context));
+        let bound = dod_services(factory.home_context.as_ref(), &identity);
+        let found = bound
+            .get::<Arc<harw_home::ResolvedHomeContext>>()
+            .ok_or(TestError::Missing("dod-ServiceMap ohne Root-Space"))?;
+        assert!(Arc::ptr_eq(found, &context));
+        Ok(())
     }
 
     /// PL-90 W03d: die Operations-Werkzeuge einer Kind-Registry tragen die

@@ -892,12 +892,11 @@ fn escalation_program_at_depth(command: &str, depth: u8) -> Option<&'static str>
                 let mut rest = words.by_ref().skip_while(|arg| {
                     !(arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))
                 });
-                if rest.next().is_some() {
-                    if let Some(script) = rest.next() {
-                        if let Some(found) = escalation_program_at_depth(script, depth + 1) {
-                            return Some(found);
-                        }
-                    }
+                if rest.next().is_some()
+                    && let Some(script) = rest.next()
+                    && let Some(found) = escalation_program_at_depth(script, depth + 1)
+                {
+                    return Some(found);
                 }
             }
             break;
@@ -1268,12 +1267,19 @@ impl SudoExecExecutor {
         self.limits
             .validate()
             .map_err(|err| format!("host.sudo_exec: Ressourcengrenzen: {err}"))?;
+        // PL-97 E2g: ohne Identitätsprüfung. Das Ziel läuft nach `sudo` als
+        // uid 0, RLIMIT_NPROC bindet es also nie, gleich wie harw selbst
+        // läuft; die Prüfung von harws Identität sagte hier nichts aus.
         let prlimit = self
             .limits
-            .resolve_prlimit()
+            .resolve_prlimit_without_nproc_identity()
             .map_err(|err| format!("host.sudo_exec: Ressourcengrenzen: {err}"))?;
         if prlimit.is_none() {
             warn!("host.sudo_exec runs WITHOUT rlimits: prlimit missing and require_rlimits=false");
+        } else if self.limits.nproc != crate::limits::RLIMIT_UNLIMITED {
+            warn!(
+                "host.sudo_exec: RLIMIT_NPROC (nproc) caps nothing, the target runs as uid 0 after sudo"
+            );
         }
         let mut sudo_args: Vec<OsString> = match mode {
             SudoMode::Passwordless => vec!["-n".into(), "-k".into()],
@@ -2015,6 +2021,42 @@ mod tests {
 
     fn full_rights() -> [Permission; 2] {
         [Permission::ReadWorkspace, Permission::ExecuteProcess]
+    }
+
+    /// PL-97 E2g: `host.sudo_exec` prüft harws eigene RLIMIT_NPROC-Identität
+    /// nicht (das Ziel läuft nach `sudo` ohnehin als uid 0); eine als root
+    /// laufende Instanz wird unter `require_rlimits` nicht deswegen abgelehnt.
+    #[test]
+    fn test_build_command_ignores_the_harw_nproc_identity() -> TestResult {
+        let (prompts, _receiver) = sudo_prompt_channel();
+        let executor = SudoExecExecutor {
+            prompts,
+            worker: "uia-shell-worker".to_owned(),
+            timeout_secs: 20,
+            max_output_bytes: 4096,
+            limits: ShellLimits::default(),
+            prompt_timeout: Duration::from_secs(1),
+            password_window: Duration::from_millis(300),
+            audit: Arc::new(TracingSudoAudit),
+            sudo_path: None,
+        };
+        let _exempt = crate::limits::test_seam::ExemptIdentity::install(
+            "der harw-Prozess läuft mit realer uid 0",
+        );
+        let built = executor.build_command(
+            Path::new("/usr/bin/sudo"),
+            SudoMode::Passwordless,
+            "marker",
+            &["true".to_owned()],
+            Path::new("/"),
+        );
+        match built {
+            Ok(_) => Ok(()),
+            Err(message) if message.contains("RLIMIT_NPROC") => Err(TestError::Unexpected(message)),
+            // Kein vertrauenswürdiges prlimit an den festen Pfaden.
+            Err(message) if message.contains("prlimit") => Ok(()),
+            Err(message) => Err(TestError::Unexpected(message)),
+        }
     }
 
     // ── Geheimnis ─────────────────────────────────────────────────────────

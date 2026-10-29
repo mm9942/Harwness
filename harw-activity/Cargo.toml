@@ -1,0 +1,16 @@
+[package]
+publish.workspace = true
+name = "harw-activity"
+description = "Semantic activity vocabulary and deterministic pattern reducer (PL-71): ActivityDescriptor, ActivityEvent, PatternInstance, projections; no I/O, no authority"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

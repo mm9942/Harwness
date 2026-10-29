@@ -1,0 +1,5 @@
+error: duplicate `activity` key: a tool declares at most one activity descriptor
+  --> tests/compile_fail/42_tool_activity_duplicate.rs:14:5
+   |
+14 |     activity(domain = "filesystem", verb = "edit", resource = "path", effect = "mutate")
+   |     ^^^^^^^^

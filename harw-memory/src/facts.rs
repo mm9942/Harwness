@@ -1168,25 +1168,25 @@ impl FactStore {
         to_write.body = redact(&to_write.body);
         to_write.tags = to_write.tags.iter().map(|t| redact(t)).collect();
 
-        if let Some(max) = self.limits.max_body_bytes {
-            if to_write.body.len() > max {
-                return Err(MemoryError::LimitExceeded {
-                    limit: "max_body_bytes",
-                    max,
-                    actual: to_write.body.len(),
-                });
-            }
+        if let Some(max) = self.limits.max_body_bytes
+            && to_write.body.len() > max
+        {
+            return Err(MemoryError::LimitExceeded {
+                limit: "max_body_bytes",
+                max,
+                actual: to_write.body.len(),
+            });
         }
-        if existing.is_none() {
-            if let Some(max) = self.limits.max_facts {
-                let count = self.count_fact_files()?;
-                if count >= max {
-                    return Err(MemoryError::LimitExceeded {
-                        limit: "max_facts",
-                        max,
-                        actual: count + 1,
-                    });
-                }
+        if existing.is_none()
+            && let Some(max) = self.limits.max_facts
+        {
+            let count = self.count_fact_files()?;
+            if count >= max {
+                return Err(MemoryError::LimitExceeded {
+                    limit: "max_facts",
+                    max,
+                    actual: count + 1,
+                });
             }
         }
 
@@ -1760,18 +1760,20 @@ pub fn find_repo_specific_reference(text: &str) -> Option<String> {
             }
             continue;
         }
-        if let Some((_, anchor)) = token.rsplit_once("#L") {
-            if !anchor.is_empty() && anchor.chars().all(|c| c.is_ascii_digit() || c == '-') {
-                return Some(token.to_owned());
-            }
+        if let Some((_, anchor)) = token.rsplit_once("#L")
+            && !anchor.is_empty()
+            && anchor.chars().all(|c| c.is_ascii_digit() || c == '-')
+        {
+            return Some(token.to_owned());
         }
         if token.contains('/') {
             let last = token.rsplit('/').next().unwrap_or("");
             let last = last.split(['#', ':']).next().unwrap_or("");
-            if let Some((stem, ext)) = last.rsplit_once('.') {
-                if !stem.is_empty() && FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
-                    return Some(token.to_owned());
-                }
+            if let Some((stem, ext)) = last.rsplit_once('.')
+                && !stem.is_empty()
+                && FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+            {
+                return Some(token.to_owned());
             }
         }
     }

@@ -926,9 +926,10 @@ impl JobToolExecutor {
             call_id: Some(call.id.as_str().to_owned()),
             tool: Some(call.name.as_str().to_owned()),
             owner_agent: None,
+            kind: None,
         };
         match manager
-            .start_with_origin(request, launch.job, launch.warnings, origin)
+            .start_launch_with_origin(request, launch, origin)
             .await
         {
             Ok(status) => {

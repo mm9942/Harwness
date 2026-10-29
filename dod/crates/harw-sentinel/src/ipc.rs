@@ -401,6 +401,12 @@ pub struct IpcInbox {
     /// privilegierte Sonde tatsächlich beobachtet. Der Ringpuffer in
     /// `harw-dod-sentinel` meldet aus demselben Grund seine Auslastung.
     dropped: u64,
+    /// Total number of events pushed into this inbox since start, including
+    /// the ones later evicted (see [`Self::dropped`]).
+    received: u64,
+    /// Number of probe connections currently open (accepted and not yet
+    /// closed), maintained by the receive loop.
+    connected: u64,
 }
 
 impl IpcInbox {
@@ -418,12 +424,15 @@ impl IpcInbox {
             capacity,
             events: VecDeque::with_capacity(capacity),
             dropped: 0,
+            received: 0,
+            connected: 0,
         }
     }
 
     /// Nimmt ein empfangenes Ereignis auf; verdrängt bei voller Kapazität
     /// das älteste.
     pub fn push(&mut self, event: ReceivedEvent) {
+        self.received = self.received.saturating_add(1);
         if self.events.len() >= self.capacity {
             self.events.pop_front();
             self.dropped = self.dropped.saturating_add(1);
@@ -465,6 +474,37 @@ impl IpcInbox {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// Total number of events received since start (every [`Self::push`],
+    /// including events that were later evicted).
+    ///
+    /// # Returns
+    /// A monotonically increasing count; the `ipc.events_total` field of the
+    /// health export (`crate::health_export`).
+    #[must_use]
+    pub fn received_total(&self) -> u64 {
+        self.received
+    }
+
+    /// Number of probe connections that are currently open.
+    ///
+    /// # Returns
+    /// The `ipc.probes_connected` field of the health export
+    /// (`crate::health_export`).
+    #[must_use]
+    pub fn connected(&self) -> u64 {
+        self.connected
+    }
+
+    /// Records that the receive loop accepted a probe connection.
+    pub fn peer_connected(&mut self) {
+        self.connected = self.connected.saturating_add(1);
+    }
+
+    /// Records that a previously accepted probe connection closed.
+    pub fn peer_disconnected(&mut self) {
+        self.connected = self.connected.saturating_sub(1);
     }
 }
 
@@ -519,6 +559,19 @@ pub fn spawn_receive_loop(listener: IpcListener, inbox: Arc<Mutex<IpcInbox>>) ->
 /// schließt oder ein `recv()` selbst fehlschlägt.
 fn receive_until_closed(connection: IpcConnection, inbox: &Mutex<IpcInbox>) {
     let peer = connection.peer();
+    // Verbindungszähler für den Gesundheitsexport (`ipc.probes_connected`).
+    if let Ok(mut inbox) = inbox.lock() {
+        inbox.peer_connected();
+    }
+    receive_events(&connection, peer, inbox);
+    if let Ok(mut inbox) = inbox.lock() {
+        inbox.peer_disconnected();
+    }
+}
+
+/// Die eigentliche Empfangsschleife einer Verbindung (siehe
+/// [`receive_until_closed`]).
+fn receive_events(connection: &IpcConnection, peer: PeerCredentials, inbox: &Mutex<IpcInbox>) {
     loop {
         match connection.recv_event() {
             Ok(Some(event)) => {
@@ -625,6 +678,33 @@ mod tests {
         // zwei sind probe-1 und probe-2.
         assert_eq!(sensor.as_str(), "probe-1");
         Ok(())
+    }
+
+    #[test]
+    fn test_ipc_inbox_counts_received_events_including_evicted_ones() {
+        let mut inbox = IpcInbox::new(1);
+        for _ in 0..3 {
+            inbox.push(ReceivedEvent {
+                event: sample_event(),
+                peer: sample_peer(),
+            });
+        }
+        assert_eq!(inbox.received_total(), 3);
+        assert_eq!(inbox.dropped(), 2);
+        let _ = inbox.drain();
+        assert_eq!(inbox.received_total(), 3, "draining keeps the total");
+    }
+
+    #[test]
+    fn test_ipc_inbox_connection_counter_never_underflows() {
+        let mut inbox = IpcInbox::new(1);
+        inbox.peer_connected();
+        inbox.peer_connected();
+        assert_eq!(inbox.connected(), 2);
+        inbox.peer_disconnected();
+        inbox.peer_disconnected();
+        inbox.peer_disconnected();
+        assert_eq!(inbox.connected(), 0);
     }
 
     #[test]

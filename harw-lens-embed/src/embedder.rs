@@ -170,11 +170,11 @@ impl DeterministicEmbedder {
             hasher.update(text.as_bytes());
             hasher.update(&counter.to_le_bytes());
             let hash = hasher.finalize();
-            for chunk in hash.as_bytes().chunks_exact(4) {
+            for bytes in hash.as_bytes().as_chunks::<4>().0 {
                 if out.len() == self.dimensions {
                     break;
                 }
-                let bytes: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
+                let bytes: [u8; 4] = *bytes;
                 // Auf [0, 1) abgebildet: reicht für einen Test-Fixture-Vektor,
                 // ohne dass diese Crate eine Zufallszahlen-Abhängigkeit braucht.
                 let value = u32::from_le_bytes(bytes);

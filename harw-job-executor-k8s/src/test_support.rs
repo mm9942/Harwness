@@ -157,12 +157,13 @@ fn unescape(text: &str) -> String {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&text[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(v) = u8::from_str_radix(&text[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -211,14 +212,12 @@ fn serve(mut conn: TcpStream, state: &Arc<Mutex<State>>) {
         if behavior.webhook_privileged {
             json["spec"]["containers"][0]["securityContext"]["privileged"] = true.into();
         }
-        if behavior.normalize_memory {
-            if let Some(m) = json["spec"]["containers"][0]["resources"]["limits"]["memory"].as_str()
-            {
-                if let Ok(bytes) = m.parse::<u64>() {
-                    json["spec"]["containers"][0]["resources"]["limits"]["memory"] =
-                        format!("{}Mi", bytes >> 20).into();
-                }
-            }
+        if behavior.normalize_memory
+            && let Some(m) = json["spec"]["containers"][0]["resources"]["limits"]["memory"].as_str()
+            && let Ok(bytes) = m.parse::<u64>()
+        {
+            json["spec"]["containers"][0]["resources"]["limits"]["memory"] =
+                format!("{}Mi", bytes >> 20).into();
         }
         let gated = !behavior.strip_gate;
         if !gated {
@@ -267,10 +266,10 @@ fn serve(mut conn: TcpStream, state: &Arc<Mutex<State>>) {
     match (method.as_str(), sub) {
         ("GET", "log") => respond(&mut conn, 200, b"hello\n"),
         ("GET", "") => {
-            if let Some(pod) = st.pods.get_mut(&name) {
-                if !pod.gated {
-                    pod.gets_after_lift += 1;
-                }
+            if let Some(pod) = st.pods.get_mut(&name)
+                && !pod.gated
+            {
+                pod.gets_after_lift += 1;
             }
             let out = view(&st.pods[&name], &behavior);
             respond(&mut conn, 200, out.to_string().as_bytes());

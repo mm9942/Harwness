@@ -378,11 +378,11 @@ impl AgentRegistry {
         targets.extend(agents.descendants(id));
         let mut revoked = Vec::new();
         for target in targets {
-            if let Some(entry) = agents.by_id.get_mut(&target) {
-                if !entry.revoked {
-                    entry.revoked = true;
-                    revoked.push(target);
-                }
+            if let Some(entry) = agents.by_id.get_mut(&target)
+                && !entry.revoked
+            {
+                entry.revoked = true;
+                revoked.push(target);
             }
         }
         Ok(revoked)

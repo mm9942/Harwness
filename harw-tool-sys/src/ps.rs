@@ -385,10 +385,8 @@ fn build(procfs: &ProcFs, args: &PsArgs) -> Result<ToolOutput, String> {
     let mut out = Collector::new(limit);
     for (depth, row) in &ordered {
         let mut value = row_json(row, &fields);
-        if tree {
-            if let Some(map) = value.as_object_mut() {
-                map.insert("depth".to_owned(), json!(depth));
-            }
+        if tree && let Some(map) = value.as_object_mut() {
+            map.insert("depth".to_owned(), json!(depth));
         }
         if !out.push(value) {
             break;
@@ -463,7 +461,8 @@ fn forest(rows: Vec<Row>) -> Vec<(usize, Row)> {
     name = "sys.ps",
     description = "Lists processes like ps from /proc: filter by pids, ppids, user, name, name_contains, masked command text and states; sort by cpu, mem, rss, start, pid or name; choose fields; tree=true for a process tree. Use when you need to find or inspect running processes instead of running ps. Returns JSON {processes:[{pid, ppid, user, state, cpu_percent, mem_percent, rss_kib, start, name, command}], count, matched, truncated}; command lines are masked for secrets, output is bounded (default 100, hard 2000), vanishing processes are tolerated. Read-only, Linux only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_ps(_context: &ToolExecutionContext, args: PsArgs) -> Result<ToolOutput, ToolsError> {
     run_blocking(TOOL, move || run(&ProcFs::real(), &args)).await

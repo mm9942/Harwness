@@ -25,6 +25,7 @@ pub mod call;
 pub mod context_load;
 pub mod error;
 pub mod executor;
+pub mod lifetime_guard;
 pub mod output;
 pub mod provider_macro;
 pub mod sandbox_guard;
@@ -42,6 +43,7 @@ pub use executor::{
     EXECUTED_ON_FIELD, ExecutionPlacement, PlacedToolExecutor, PlacedToolExecutorFuture,
     PlacedToolOutput, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, TracedToolExecutor,
 };
+pub use lifetime_guard::ToolLifetimeGuard;
 pub use output::ToolOutput;
 pub use sandbox_guard::{host_from_url, require_host_access, require_permission};
 pub use schema::{AdditionalProperties, JsonSchema, JsonSchemaType};
@@ -53,6 +55,16 @@ pub use spec::{FunctionToolSpec, ToolName, ToolSpec};
 /// der generierte Sicherheits-Prolog keine direkte `harw-authority`-Dependency
 /// im aufrufenden Crate voraussetzt.
 pub use harw_authority::Permission;
+
+/// Re-export of the activity vocabulary (PL-71, `harw-activity`).
+///
+/// Referenced by `#[harw_macros::tool(activity(...))]` as
+/// `::harw_tools::ActivityDescriptor` / `::harw_tools::Effect` (the `ACTIVITY`
+/// const) and by [`macro@tool_provider`] as the element type of
+/// `TOOL_ACTIVITIES`, so tool crates need no direct `harw-activity`
+/// dependency. Descriptive only: a descriptor grants, implies or checks no
+/// permission and is never part of a [`ToolSpec`].
+pub use harw_activity::{ActivityDescriptor, Effect};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

@@ -155,7 +155,7 @@ pub fn strip_comments(source: &str) -> String {
     for line in source.lines() {
         let mut backslashes = 0usize;
         for c in line.chars() {
-            if c == '%' && backslashes % 2 == 0 {
+            if c == '%' && backslashes.is_multiple_of(2) {
                 break;
             }
             backslashes = if c == '\\' { backslashes + 1 } else { 0 };

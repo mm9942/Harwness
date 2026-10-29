@@ -137,6 +137,26 @@ pub(crate) fn check_batch_target<'a>(
 /// `Send + Sync` — alle Methoden nehmen `&self` und sichern intern via `RwLock`
 /// oder vergleichbare Mechanismen.
 pub trait PlanStore: Send + Sync {
+    /// Atomically reconstructs admission and verifies every subsequent transition.
+    fn reconcile_parent_progress(
+        &self,
+        _admission: &crate::parent_progress::ParentAdmission,
+    ) -> PlanResult<crate::parent_progress::ParentProgressView> {
+        Err(PlanError::CatalogUnsupported {
+            operation: "reconcile_parent_progress",
+        })
+    }
+    /// Restricted runtime publication; unsupported stores fail closed.
+    fn commit_parent_progress_checked(
+        &self,
+        _request: &crate::parent_progress::CollectSourcesProgress,
+        _before_publish: &dyn Fn() -> PlanResult<()>,
+    ) -> PlanResult<crate::parent_progress::ParentProgressReceipt> {
+        Err(PlanError::CatalogUnsupported {
+            operation: "commit_parent_progress_checked",
+        })
+    }
+
     /// Gibt den aktuellen Planzustand zurück.
     ///
     /// # Errors
@@ -260,6 +280,30 @@ pub trait PlanStore: Send + Sync {
         actor: &str,
         expected_rev: RevisionId,
     ) -> PlanResult<PlanRevision>;
+
+    /// Applies a batch with a trusted, synchronous publication check.
+    ///
+    /// The check runs under the plan write lock immediately before the first
+    /// authoritative mutation (history append for file stores). It must not
+    /// acquire another store lock: callers acquire their lease guard first.
+    /// The guard must remain held for this call. A successful check is not a
+    /// transaction with an external job store, nor a promise about wall-clock
+    /// expiry during the subsequent write/fsync. Unsupported stores fail closed.
+    ///
+    /// # Errors
+    /// The same errors as `apply_batch`, plus the publication check's error.
+    fn apply_batch_checked(
+        &self,
+        _plan: &PlanId,
+        _actions: Vec<PlanAction>,
+        _actor: &str,
+        _expected_rev: RevisionId,
+        _before_publish: &dyn Fn() -> PlanResult<()>,
+    ) -> PlanResult<PlanRevision> {
+        Err(PlanError::CatalogUnsupported {
+            operation: "apply_batch_checked",
+        })
+    }
 
     // ── Plan-Katalog (Runde 5, Teil P) ──────────────────────────────────────
     //

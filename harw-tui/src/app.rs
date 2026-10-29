@@ -115,6 +115,8 @@ pub(crate) mod background_agents;
 mod agent_messages;
 // PL-94 W01 M2b: Anzeigereihenfolge der Kind-Statusmeldungen (`crate::live_ranker`).
 mod live_order_glue;
+// PL-97 C5 (PL-94 W01 M2a/M2c): virtuelle Live-Zellen der Hintergrund-Läufe im Chat.
+mod live_slots;
 // Runde 5, Teil O: Doppel-Esc bei laufenden Kindern, ehrliche Abbruch-Beschriftung.
 mod turn_safety;
 // Runde 5, Teil O: Freigabe-Fragen von Kind-Agenten im Freigabedialog.
@@ -129,12 +131,21 @@ pub(crate) mod export_capture;
 mod operator_shell;
 // Kleine Fenster: Mausrad nach Position, `scroll_panel_up/down`.
 pub(crate) mod scroll_routing;
+// PL-97 C2: Aufbau der Fläche zwischen Overlays und Statuszeile
+// (Mission-Control-Fenster im Hochformat, sonst Seitenspalte/Zusammenfassung).
+mod render;
 // Plan R9, Teil F: Hintergrund-Jobs (Jobs-Gruppe, Notizen an die Wurzel,
 // Beenden-Dialog).
 pub(crate) mod jobs_glue;
+// PL-97 M3: Aktivitäts-Reducer (PL-71) hinter den Werkzeugzellen —
+// Gruppierung, Job-Lebenszyklus, Fehlschlag-Bursts für Finished / Failed.
+pub(crate) mod activity_glue;
 // Ansichten zeigen nach einer Änderung sofort den Live-Stand (Tests).
 #[cfg(test)]
 mod live_views_tests;
+// PL-97 C3: Querformat-Fenster (drei Spalten, flach, kompakt).
+#[cfg(test)]
+mod mission_landscape_tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -157,6 +168,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use harw_authority::SandboxSpec;
+use harw_config::harness_config::ReasoningDisplayMode;
 use harw_core::cancel::{CancelReason, CancelToken};
 use harw_core::turn_loop::TurnControl;
 use harw_core::{
@@ -663,6 +675,10 @@ enum Overlay {
     /// stoppen“ / „Weiterlaufen lassen“ / „Abbrechen“
     /// ([`jobs_glue::before_quit`]).
     JobsQuitChoice(ChoiceDialog),
+    /// PL-97 C4 (W20-E): Bestätigung von `x` im Jobs-Fenster; Enter schickt
+    /// `/jobs stop <id>` über den regulären Befehlsweg
+    /// ([`crate::mission::stop_job`]).
+    StopJob(crate::mission::stop_job::StopJobDialog),
 }
 
 /// Ausstehender Datenabruf (`OpOutput.data`) für eine Ansicht oder das
@@ -1058,10 +1074,21 @@ pub struct ChatApp {
     /// Kind-Statusmeldungen in der Statuszeile (`app/live_order_glue.rs`).
     /// Hinter einer `RefCell`, weil das Zeichnen nur `&ChatApp` hat.
     live_order: RefCell<live_order_glue::LiveOrder>,
+    /// PL-97 C5: Projektion der virtuellen Live-Zellen im Verlauf
+    /// (`app/live_slots.rs`); hinter einer `RefCell`, weil das Zeichnen nur
+    /// `&ChatApp` hat.
+    live_slots: RefCell<live_slots::LiveSlots>,
+    /// PL-97 C2: presentation state of the Mission Control windows (Jobs and
+    /// Finished/Failed selection and scroll, LIVE pin and ranking).
+    mission: crate::mission::MissionUi,
     /// TOML-gesteuertes Verhalten abgelaufener Kind-Statusmeldungen
     /// (nach dem 30s-Fenster): `[tui].status_expiry` — konsolidieren oder
     /// ausblenden. Default: konsolidieren.
     status_expiry: harw_config::StatusExpiryMode,
+    /// PL-97 R1: Darstellung der Reasoning-Zusammenfassungen (`[tui]
+    /// reasoning`): `message` (ausgeklappter Markdown-Block, Vorgabe),
+    /// `collapsed` (eingeklappt) oder `hidden` (keine Zelle, kein Live-Text).
+    reasoning_mode: ReasoningDisplayMode,
     /// Read-only Step-/TODO-Anzeige (h22): Bibliothekszustand der
     /// `harw-step-list`; die Explorer-Ansicht rendert daraus nur Zeilen.
     /// `None`, solange keine Liste geladen/gesetzt wurde.
@@ -1232,6 +1259,13 @@ pub struct ChatApp {
     plan_services: Option<TuiPlanServices>,
     /// Runde 5, Teil P: Goal-Marke und Übergänge (`crate::goal_marker`).
     goal_tracker: crate::goal_marker::GoalTracker,
+    /// PL-97 D5: DoD-Marke der Statuszeile und Titelzusatz des
+    /// Finished-/Failed-Fensters (gelesen über `/dod status`, siehe
+    /// [`poll_dod_mark`]).
+    dod_mark: crate::dod_view::DodMarkFeed,
+    /// Weckt [`run_loop`], wenn ein nebenläufiger DoD-Markenabruf fertig ist
+    /// (gesetzt beim Start von [`run_loop`]).
+    dod_mark_waker: Option<FrameRequester>,
     /// Detailgrad, mit dem Werkzeugzellen gerendert werden (Plan Schritt 2
     /// „Verbosity"); gesetzt über [`Self::with_verbose_tools`].
     tool_verbosity: ToolVerbosity,
@@ -1243,6 +1277,9 @@ pub struct ChatApp {
     /// sofern noch erweiterbar; `None` schließt implizit jede vorherige
     /// Gruppe (Plan Schritt 2 „Gruppierung").
     open_tool_group: Option<Arc<Mutex<ToolGroupCell>>>,
+    /// PL-97 M3: Aktivitäts-Reducer der Wurzel-Werkzeugzellen (entscheidet
+    /// die Gruppierung, siehe [`activity_glue`]).
+    activity: activity_glue::ActivityGlue,
     /// Zuletzt als Zelle gezeigter Plan-Stand: der nächste
     /// `TurnEvent::PlanUpdated` desselben Plans rendert nur das Delta
     /// (R18 F4).
@@ -1497,7 +1534,10 @@ impl ChatApp {
             child_infos: std::collections::HashMap::new(),
             recency: crate::recency::RecencySlots::new(),
             live_order: RefCell::new(live_order_glue::LiveOrder::new(Instant::now())),
+            live_slots: RefCell::new(live_slots::LiveSlots::new(Instant::now())),
+            mission: crate::mission::MissionUi::new(Instant::now()),
             status_expiry: harw_config::StatusExpiryMode::default(),
+            reasoning_mode: ReasoningDisplayMode::default(),
             step_list: None,
             pending_turns: std::collections::VecDeque::new(),
             images: crate::image_attach::ImageAttachments::default(),
@@ -1547,9 +1587,12 @@ impl ChatApp {
             active_mode: InteractionMode::default(),
             plan_services: None,
             goal_tracker: crate::goal_marker::GoalTracker::default(),
+            dod_mark: crate::dod_view::DodMarkFeed::default(),
+            dod_mark_waker: None,
             tool_verbosity: ToolVerbosity::Compact,
             tool_cells: Vec::new(),
             open_tool_group: None,
+            activity: activity_glue::ActivityGlue::default(),
             last_shown_plan: None,
             // Runde 5, Teil I.
             child_stream: crate::child_stream::ChildStreamRegistry::default(),
@@ -2411,45 +2454,25 @@ impl ChatApp {
     }
 
     /// Hängt eine neue, geteilte Werkzeugzelle an den Verlauf an und gruppiert
-    /// sie bei Bedarf mit der zuletzt offenen Lese-Gruppe (Plan Schritt 2).
+    /// sie nach dem Aktivitäts-Reducer (PL-97 M3, Plan Schritt 2).
     ///
     /// # Beschreibung
-    /// Passt `tool_name` in [`ToolGroupCell::accepts`], wird die Zelle der
-    /// zuletzt offenen Gruppe beigetreten (oder eine neue Gruppe eröffnet);
-    /// sonst wird jede offene Gruppe geschlossen und die Zelle einzeln
-    /// angehängt. Nur Top-Level-Zellen/-Gruppen bekommen ein
-    /// [`ToolCellHandle`] in `self.tool_cells` (Ctrl+O „alle").
+    /// Der Reducer ([`activity_glue::append_tool_cell`]) entscheidet über
+    /// die Aktivitätsdeskriptoren der Werkzeuge: beobachtende Aufrufe auf
+    /// Pfaden treten der offenen Lese-Gruppe bei (oder eröffnen eine),
+    /// Bearbeitungen eines Pfads und Jobs bekommen eine eigene, an Ort und
+    /// Stelle fortgeschriebene Gruppe, alles andere bleibt eine einzelne
+    /// Zelle und schließt die offene Lese-Gruppe. Nur Top-Level-Zellen/
+    /// -Gruppen bekommen ein [`ToolCellHandle`] in `self.tool_cells`
+    /// (Ctrl+O „alle").
     ///
     /// # Argumente
-    /// - `tool_name` (`&str`): roher Werkzeugname des Aufrufs.
+    /// - `call` (`&ToolCall`): Kennung, Name und Argumente des Aufrufs.
+    /// - `turn` (`Option<&str>`): Turn-Kennung eines Live-Aufrufs, `None`
+    ///   für den Freigabe- und den Resume-Pfad.
     /// - `cell` ([`SharedToolCell`]): die neu erzeugte, geteilte Zelle.
-    fn append_tool_cell(&mut self, tool_name: &str, cell: SharedToolCell) {
-        if ToolGroupCell::accepts(tool_name) {
-            if let Some(group) = self.open_tool_group.clone() {
-                if let Ok(mut guard) = group.lock() {
-                    guard.push(cell);
-                }
-                return;
-            }
-            let group = Arc::new(Mutex::new(ToolGroupCell::new()));
-            if let Ok(mut guard) = group.lock() {
-                guard.push(cell);
-            }
-            self.push_cell(Box::new(ToolHistoryCell {
-                handle: ToolCellHandle::Group(Arc::clone(&group)),
-                verbosity: self.tool_verbosity,
-            }));
-            self.tool_cells
-                .push(ToolCellHandle::Group(Arc::clone(&group)));
-            self.open_tool_group = Some(group);
-        } else {
-            self.close_tool_group();
-            self.push_cell(Box::new(ToolHistoryCell {
-                handle: ToolCellHandle::Single(Arc::clone(&cell)),
-                verbosity: self.tool_verbosity,
-            }));
-            self.tool_cells.push(ToolCellHandle::Single(cell));
-        }
+    fn append_tool_cell(&mut self, call: &ToolCall, turn: Option<&str>, cell: SharedToolCell) {
+        activity_glue::append_tool_cell(self, call, turn, cell);
     }
 
     /// Verarbeitet Ctrl+O: klappt die zuletzt angehängte Werkzeugzelle auf/zu,
@@ -2492,6 +2515,12 @@ impl ChatApp {
         let Some(agent) = self.agent_monitor.selected_agent() else {
             return false;
         };
+        self.open_agent_detail_for(agent)
+    }
+
+    /// Opens the detail view of `agent` (Enter in the agents list, `Alt+L`
+    /// for the LIVE source) and maximizes the panel for it.
+    fn open_agent_detail_for(&mut self, agent: SessionId) -> bool {
         // Ein angesehener Fehlschlag wandert in die Sammelzeile.
         self.agent_monitor.mark_seen(agent.as_str());
         let prev_maximized = self
@@ -2516,13 +2545,114 @@ impl ChatApp {
         if let Some(detail) = self.agent_detail.take() {
             self.panels.maximized = detail.prev_maximized;
         }
+        // PL-97 C2: eine per `Alt+L` geöffnete LIVE-Detailansicht ist zu.
+        self.mission.live_expanded = false;
+    }
+
+    /// PL-97 C2: Enter im Jobs-Fenster öffnet die Detailansicht (Kopf und
+    /// Log-Ende) des dort gewählten Jobs; sie lädt über
+    /// [`jobs_glue::refresh`] wie die Detailansicht aus der Agentenliste.
+    fn open_job_window_detail(&mut self) -> bool {
+        let Some(job) = crate::mission::jobs_window::selected_job(
+            self.agent_monitor.jobs(),
+            &self.mission.jobs,
+        ) else {
+            return false;
+        };
+        let prev_maximized = self
+            .agent_detail
+            .as_ref()
+            .map_or(self.panels.maximized, |detail| detail.prev_maximized);
+        self.agent_detail = Some(AgentDetailState {
+            agent: SessionId(job.clone()),
+            scroll: ChatScroll::new(),
+            show_reasoning: true,
+            prev_maximized,
+            job: Some(job),
+            job_view: None,
+        });
+        self.panels.maximized = true;
+        let _ = jobs_glue::refresh(self, true);
+        true
+    }
+
+    /// PL-97 C2 (`Alt+L`): öffnet die Detailansicht des Agenten, den das
+    /// LIVE-Fenster gerade zeigt (Fokus: Agenten-Panel), bzw. schließt sie
+    /// wieder. Im Hochformat ist LIVE selbst nie fokussiert.
+    /// PL-97 C3: mit dem LIVE-Fenster der Querformat-Mittelspalte erscheinen
+    /// die Details dort an Ort und Stelle, LIVE bekommt den Fokus.
+    fn toggle_live_detail(&mut self) -> bool {
+        if self.agent_detail.is_none()
+            && (self.panels.revealed.live || self.mission.live_detail_agent().is_some())
+        {
+            return self.toggle_live_detail_in_place();
+        }
+        if self.mission.live_expanded {
+            if self
+                .agent_detail
+                .as_ref()
+                .is_some_and(|detail| detail.job.is_none())
+            {
+                self.close_agent_detail();
+            }
+            self.mission.live_expanded = false;
+            return true;
+        }
+        let Some(agent) = self
+            .mission
+            .live_source(&self.agent_monitor, Instant::now())
+            .map(|(live, _)| SessionId(live.id.clone()))
+        else {
+            return false;
+        };
+        self.panels.agents_visible = true;
+        self.panels.focus = crate::panes::PaneFocus::Agents;
+        let opened = self.open_agent_detail_for(agent);
+        self.mission.live_expanded = opened;
+        opened
+    }
+
+    /// PL-97 C3: `Alt+L`/Enter am LIVE-Fenster der Querformat-Mittelspalte —
+    /// zeigt die bestehende Agenten-Detailansicht der LIVE-Quelle im selben
+    /// Rechteck (LIVE fokussiert, ohne Vollbild) bzw. schließt sie wieder.
+    fn toggle_live_detail_in_place(&mut self) -> bool {
+        if self.mission.live_detail_agent().is_some() {
+            self.mission.close_live_detail();
+            return true;
+        }
+        let Some(agent) = self
+            .mission
+            .live_source(&self.agent_monitor, Instant::now())
+            .map(|(live, _)| live.id.clone())
+        else {
+            return false;
+        };
+        // Ein angesehener Fehlschlag wandert in die Sammelzeile (wie Enter in
+        // der Agentenliste).
+        self.agent_monitor.mark_seen(&agent);
+        self.panels.agents_visible = true;
+        self.panels.maximized = false;
+        self.panels.focus = crate::panes::PaneFocus::Live;
+        self.mission.open_live_detail(&agent);
+        true
     }
 
     /// Schließt die Detailansicht, wenn das Agenten-Panel Fokus oder
-    /// Sichtbarkeit verloren hat (F3/F4/Esc über die Panel-Logik).
+    /// Sichtbarkeit verloren hat (F3/F4/Esc über die Panel-Logik). Eine
+    /// Job-Detailansicht aus dem Jobs-Fenster bleibt dort offen.
+    /// PL-97 C3: ebenso die LIVE-Details an Ort und Stelle, sobald LIVE den
+    /// Fokus verliert.
     fn sync_agent_detail(&mut self) {
-        let agents_active =
-            self.panels.focus == crate::panes::PaneFocus::Agents && self.panels.agents_visible;
+        self.mission.sync_live_focus(self.panels.focus);
+        let agents_active = self.panels.agents_visible
+            && match self.panels.focus {
+                crate::panes::PaneFocus::Agents => true,
+                crate::panes::PaneFocus::Jobs => self
+                    .agent_detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.job.is_some()),
+                _ => false,
+            };
         if agents_active || self.agent_detail.is_none() {
             return;
         }
@@ -2536,15 +2666,41 @@ impl ChatApp {
         };
     }
 
-    /// Hängt eine (eingeklappte) Reasoning-Zelle an den Verlauf und merkt sie
-    /// für Ctrl+O vor (Runde 2 / Welle 2).
+    /// Setzt die Darstellung der Reasoning-Zusammenfassungen (`[tui]
+    /// reasoning`, PL-97 R1; Builder, Composition-Root).
+    ///
+    /// # Argumente
+    /// - `mode` ([`ReasoningDisplayMode`]): `message`, `collapsed` oder `hidden`.
+    #[must_use]
+    pub(crate) fn with_reasoning_mode(mut self, mode: ReasoningDisplayMode) -> Self {
+        self.reasoning_mode = mode;
+        self
+    }
+
+    /// Die aktive Darstellung der Reasoning-Zusammenfassungen (nur Tests,
+    /// etwa die Verdrahtung in `runtime_root`).
+    #[cfg(test)]
+    pub(crate) fn reasoning_mode(&self) -> ReasoningDisplayMode {
+        self.reasoning_mode
+    }
+
+    /// Hängt eine Reasoning-Zelle an den Verlauf und merkt sie für Ctrl+O
+    /// vor (Runde 2 / Welle 2; PL-97 R1: Startzustand nach `[tui] reasoning`).
+    ///
+    /// `message` startet ausgeklappt, `collapsed` eingeklappt; bei `hidden`
+    /// entsteht keine Zelle (der Export-Eintrag entsteht beim Aufrufer).
     ///
     /// # Argumente
     /// - `summary` (`String`): Zusammengefasster Denkprozess-Text.
     /// - `origin` (`Option<&str>`): Rolle eines Kind-Agenten; `None` für den
     ///   Hauptagenten.
     fn push_reasoning_cell(&mut self, summary: String, origin: Option<&str>) {
-        let mut cell = ReasoningHistoryCell::new(summary);
+        let expanded = match self.reasoning_mode {
+            ReasoningDisplayMode::Message => true,
+            ReasoningDisplayMode::Collapsed => false,
+            ReasoningDisplayMode::Hidden => return,
+        };
+        let mut cell = ReasoningHistoryCell::new(summary).with_expanded(expanded);
         if let Some(role) = origin {
             cell = cell.with_origin(role);
         }
@@ -2687,6 +2843,10 @@ impl ChatApp {
         changed |= self.poll_goal_marker();
         // Plan R9, Teil F: Job-Ereignisse und Jobs-Gruppe (gedrosselt).
         changed |= jobs_glue::poll(self);
+        // PL-97 D5: DoD-Marke auch während eines Turns (nebenläufig).
+        changed |= poll_dod_mark(self);
+        // PL-97 M3: beendete Jobs beenden ihren Lebenszyklus (Regel 3).
+        self.activity.sync_jobs(self.agent_monitor.jobs());
         let mut touched_agents: Vec<String> = Vec::new();
         let Some(rx) = self.agent_rx.as_mut() else {
             return changed;
@@ -2733,6 +2893,10 @@ impl ChatApp {
         // Hintergrund-Kinder: Live-Zähler in ihre Verlaufszelle fortschreiben.
         touched_agents.sort_unstable();
         touched_agents.dedup();
+        // PL-97 M3: Läufe der Agenten in den Aktivitäts-Reducer
+        // (Fehlschlag-Bursts für Finished / Failed).
+        self.activity
+            .sync_agents(&self.agent_monitor, &touched_agents);
         for agent in &touched_agents {
             changed |= self.sync_child_cell(agent);
         }
@@ -3139,6 +3303,11 @@ impl ChatApp {
         // Lese-Gruppe (Plan Schritt 2 „Gruppierung": „sobald … Assistententext
         // kommt, wird die Gruppe geschlossen").
         self.close_tool_group();
+        // PL-97 M3: eine Nutzernachricht beginnt einen neuen Turn (auch beim
+        // Resume, wo keine Turn-Kennungen vorliegen).
+        if role == Role::User {
+            self.activity.next_turn();
+        }
         match role {
             // Eingespeiste Hintergrund-Meldungen stehen im Verlauf als
             // Nutzernachricht, im Export aber nicht unter `## Du`.
@@ -3150,6 +3319,8 @@ impl ChatApp {
                 .push(ExportEntry::Assistant(text.clone())),
             Role::System => self.export_entries.push(ExportEntry::System(text.clone())),
         }
+        // PL-97 C5: Lage der Nachricht für die Slot-Tabelle der Live-Zellen.
+        self.note_live_slot_message(role);
         let cell: Box<dyn HistoryCell> = match role {
             Role::User => Box::new(UserHistoryCell { text }),
             Role::Assistant => Box::new(AssistantHistoryCell { source: text }),
@@ -3412,13 +3583,19 @@ impl ChatApp {
 
     /// Reiht einen Datenabruf für die offene generische Ansicht ein
     /// (doppelte Einträge werden zusammengefasst).
+    ///
+    /// PL-97 D5: der Abruf der DoD-Ansicht ([`crate::dod_view::REFRESH_COMMAND`])
+    /// steht für ihre drei Abschnitte und wird in drei Abrufe derselben
+    /// Generation zerlegt ([`crate::dod_view::fetch_commands`]).
     fn queue_overlay_fetch(&mut self, command: String) {
-        let fetch = DataFetch::Overlay {
-            command,
-            generation: self.overlay_generation,
-        };
-        if !self.pending_fetches.contains(&fetch) {
-            self.pending_fetches.push(fetch);
+        for command in crate::dod_view::fetch_commands(command) {
+            let fetch = DataFetch::Overlay {
+                command,
+                generation: self.overlay_generation,
+            };
+            if !self.pending_fetches.contains(&fetch) {
+                self.pending_fetches.push(fetch);
+            }
         }
     }
 
@@ -3482,8 +3659,11 @@ impl ChatApp {
     /// Modellkontext und Exporteinträge bleiben unverändert.
     fn clear_transcript(&mut self) {
         self.cells.clear();
+        self.clear_live_slot_cells();
         self.tool_cells.clear();
         self.open_tool_group = None;
+        // PL-97 M3: ohne Zellen kein Gruppenbezug mehr.
+        self.activity = activity_glue::ActivityGlue::default();
         // Nach `/clear` ist kein Plan mehr sichtbar: der nächste Stand kommt
         // wieder als Vollbild.
         self.last_shown_plan = None;
@@ -3493,26 +3673,28 @@ impl ChatApp {
         self.scroll.force_follow();
     }
 
-    /// Schaltet die ausführliche Werkzeuganzeige um (`/verbose`).
+    /// Schaltet die Werkzeuganzeige weiter (`/verbose`).
     ///
     /// # Beschreibung
-    /// Neue Werkzeugzellen erhalten die neue [`ToolVerbosity`]; bestehende
-    /// Zellen werden passend auf- bzw. zugeklappt.
+    /// PL-97 M3 (aus PR #76): Zyklus `Compact → Verbose → Activity →
+    /// Compact`; `Compact` bleibt der Default. Neue Werkzeugzellen erhalten
+    /// die neue [`ToolVerbosity`]; bestehende Zellen werden bei `Verbose`
+    /// aufgeklappt, sonst zugeklappt.
     ///
     /// # Rückgabe
-    /// `true`, wenn jetzt die ausführliche Anzeige aktiv ist.
-    fn toggle_verbose(&mut self) -> bool {
-        let verbose = self.tool_verbosity != ToolVerbosity::Verbose;
-        self.tool_verbosity = if verbose {
-            ToolVerbosity::Verbose
-        } else {
-            ToolVerbosity::Compact
+    /// Die jetzt aktive [`ToolVerbosity`].
+    fn toggle_verbose(&mut self) -> ToolVerbosity {
+        self.tool_verbosity = match self.tool_verbosity {
+            ToolVerbosity::Compact => ToolVerbosity::Verbose,
+            ToolVerbosity::Verbose => ToolVerbosity::Activity,
+            ToolVerbosity::Activity => ToolVerbosity::Compact,
         };
+        let verbose = self.tool_verbosity == ToolVerbosity::Verbose;
         for handle in &self.tool_cells {
             handle.set_expanded(verbose);
         }
         self.ctrl_o_expand_last_armed = false;
-        verbose
+        self.tool_verbosity
     }
 
     /// `/uia-worker-model` bare: Picker für den an den effektiven
@@ -3805,6 +3987,19 @@ fn is_workbench_command(raw: &str) -> bool {
 /// [`local_commands::intercept`]. Das Ergebnis besitzt keine Borrows auf
 /// `app`, der Aufrufer darf danach mutieren.
 fn local_intercept_for(app: &ChatApp, raw: &str) -> Option<LocalIntercept> {
+    // PL-97 D5: `/dod view` ist TUI-lokal (Harw-DoD-Ansicht); alle übrigen
+    // `/dod`-Formen gehören der `dod`-Operation. Ein ausgeblendetes `/dod`
+    // (fixed agent) meldet `local_commands::intercept` wie gewohnt.
+    if crate::dod_view::is_view_command(raw)
+        && !app
+            .hidden_commands
+            .iter()
+            .any(|hidden| hidden.eq_ignore_ascii_case("dod"))
+    {
+        return Some(LocalIntercept::OpenOverlay(Box::new(
+            crate::dod_view::DodView::new(),
+        )));
+    }
     let config = app.resolved_config();
     let (live_provider, live_model) = app.live_model();
     let project_root = std::path::PathBuf::from(&app.project_root);
@@ -3860,7 +4055,7 @@ fn apply_local_intercept(
         LocalIntercept::TogglePanel(PanelToggle::Workbench) => app.toggle_workbench(),
         LocalIntercept::TogglePanel(PanelToggle::Agents) => {
             app.panels.agents_visible = !app.panels.agents_visible;
-            if !app.panels.agents_visible && app.panels.focus == crate::panes::PaneFocus::Agents {
+            if !app.panels.agents_visible && app.panels.focus.is_mission() {
                 app.panels.focus = crate::panes::PaneFocus::Chat;
                 app.panels.maximized = false;
             }
@@ -3876,10 +4071,10 @@ fn apply_local_intercept(
             app.ensure_explorer();
         }
         LocalIntercept::ToggleVerbose => {
-            let text = if app.toggle_verbose() {
-                "Ausführliche Werkzeuganzeige: an"
-            } else {
-                "Ausführliche Werkzeuganzeige: aus"
+            let text = match app.toggle_verbose() {
+                ToolVerbosity::Verbose => "Ausführliche Werkzeuganzeige: an",
+                ToolVerbosity::Activity => "Werkzeuganzeige: einzeilig",
+                ToolVerbosity::Compact => "Ausführliche Werkzeuganzeige: aus",
             };
             app.push_lines(vec![Line::from(text)]);
         }
@@ -4039,6 +4234,79 @@ async fn process_pending_fetches(app: &mut ChatApp) -> bool {
         apply_fetch_result(app, target, result);
     }
     true
+}
+
+/// Zeitlimit eines nebenläufigen DoD-Markenabrufs (wie ein Busy-Abruf):
+/// danach gilt der Abruf als gescheitert und die Marke verschwindet.
+const DOD_MARK_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// PL-97 D5: führt die DoD-Marke der Statuszeile über `/dod status` nach
+/// (regulärer Datenpfad [`fetch_command_data`], nie in den Chat).
+///
+/// # Beschreibung
+/// Läuft überall dort, wo [`jobs_glue::poll`] läuft (Leerlauf in
+/// [`run_loop`], Busy-Pfad in [`ChatApp::drain_agent_events`]), kein eigener
+/// Timer. Wartet nie: ein fertiger Abruf wird übernommen, ein fälliger
+/// (höchstens alle [`crate::dod_view::MARK_REFRESH_INTERVAL`] — so lange
+/// cacht der `DodService` ohnehin) startet als eigener Task, wie die
+/// Busy-Abrufe ([`spawn_busy_fetches`]); sein Ende weckt die Schleife über
+/// [`ChatApp::dod_mark_waker`]. Ohne Runtime-Montage geschieht nichts. Ist
+/// die DoD-Ansicht offen, wird sie mit jedem fertigen Abruf neu geladen.
+///
+/// # Nebenläufigkeit
+/// Startet einen Abruf nur innerhalb einer Tokio-Runtime; ohne Runtime
+/// (synchrone Tests) bleibt es beim Übernehmen.
+///
+/// # Rückgabe
+/// `true`, wenn sich Sichtbares änderte (Marke oder eingereihtes Nachladen).
+fn poll_dod_mark(app: &mut ChatApp) -> bool {
+    let mut changed = false;
+    if let Some(mark_changed) = app.dod_mark.poll() {
+        changed = mark_changed;
+        let dod_view_open = matches!(
+            &app.overlay,
+            Some(Overlay::View(view))
+                if view.refresh_command().as_deref() == Some(crate::dod_view::REFRESH_COMMAND)
+        );
+        if dod_view_open {
+            app.queue_overlay_refresh();
+            changed = true;
+        }
+    }
+    let now = Instant::now();
+    if !app.dod_mark.due(now) || tokio::runtime::Handle::try_current().is_err() {
+        return changed;
+    }
+    let Some(runtime) = app.runtime.clone() else {
+        return changed;
+    };
+    let adapters = Arc::clone(&app.adapters);
+    let sandbox = app.sandbox.clone();
+    let session_id = app.session_id.clone();
+    let waker = app.dod_mark_waker.clone();
+    let (tx, read) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let fetch = fetch_command_data(
+            Some(&runtime),
+            &adapters,
+            &sandbox,
+            &session_id,
+            crate::dod_view::REFRESH_COMMAND,
+        );
+        let result = match tokio::time::timeout(DOD_MARK_READ_TIMEOUT, fetch).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "Zeitlimit überschritten ({} s).",
+                DOD_MARK_READ_TIMEOUT.as_secs()
+            )),
+        };
+        let _ = tx.send(result);
+        if let Some(waker) = waker {
+            waker.schedule_frame();
+        }
+    });
+    app.dod_mark.begin(now, read);
+    changed
 }
 
 /// Busy-Gegenstück zu [`process_pending_fetches`]: startet jeden
@@ -4411,7 +4679,7 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
                     None => {
                         let cell = Arc::new(Mutex::new(ToolCell::started(&call)));
                         tool_cells.insert(call_item.call_id.clone(), Arc::clone(&cell));
-                        app.append_tool_cell(call_item.tool_name.as_str(), Arc::clone(&cell));
+                        app.append_tool_cell(&call, None, Arc::clone(&cell));
                         app.export_entries.push(export_tool_call_entry(
                             &call_item.call_id,
                             &call_item.tool_name,
@@ -4439,7 +4707,7 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
                         };
                         let cell = Arc::new(Mutex::new(ToolCell::started(&call)));
                         tool_cells.insert(result_item.call_id.clone(), Arc::clone(&cell));
-                        app.append_tool_cell("tool.result", Arc::clone(&cell));
+                        app.append_tool_cell(&call, None, Arc::clone(&cell));
                         app.export_entries.push(export_tool_call_entry(
                             &result_item.call_id,
                             "tool.result",
@@ -4483,13 +4751,24 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
                         Some(result_item.trust),
                     ));
                 }
+                // PL-97 M3: Ende des Aufrufs in den Aktivitäts-Reducer.
+                activity_glue::tool_completed(
+                    app,
+                    result_item.call_id.as_str(),
+                    &cell,
+                    Some(&result_item.result),
+                );
             }
             TurnItem::Reasoning(reasoning) => {
-                let summary = reasoning.summary_text.join(" ");
+                // PL-97 R1: Leerzeilen zwischen den Einträgen erhalten die Absätze.
+                let summary = reasoning.summary_text.join("\n\n");
                 if !summary.trim().is_empty() {
                     app.export_entries
                         .push(ExportEntry::Reasoning(summary.clone()));
                     app.push_reasoning_cell(summary, None);
+                    // Symmetrisch zum Live-Pfad: die fertige Zelle ersetzt
+                    // eine etwaige Live-Vorschau.
+                    app.live_reasoning.clear();
                 }
             }
             TurnItem::Error(error) => {
@@ -4516,22 +4795,28 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
         let Some(cell) = tool_cells.get(call_id) else {
             continue;
         };
-        if let Ok(mut guard) = cell.lock() {
-            if guard.state == ToolState::Running {
-                guard.mark_incomplete();
-                if let Some(index) = tool_export_indices.get(call_id)
-                    && let Some(ExportEntry::ToolCall { tool_name, .. }) =
-                        app.export_entries.get(*index)
-                {
-                    app.export_entries.push(export_tool_result_entry(
-                        call_id,
-                        Some(tool_name.clone()),
-                        &ToolCallResult::error("unvollständig (Resume-Abbruch)"),
-                        0,
-                        Some(ResultTrust::Runtime),
-                    ));
-                }
+        let mut marked = false;
+        if let Ok(mut guard) = cell.lock()
+            && guard.state == ToolState::Running
+        {
+            guard.mark_incomplete();
+            marked = true;
+            if let Some(index) = tool_export_indices.get(call_id)
+                && let Some(ExportEntry::ToolCall { tool_name, .. }) =
+                    app.export_entries.get(*index)
+            {
+                app.export_entries.push(export_tool_result_entry(
+                    call_id,
+                    Some(tool_name.clone()),
+                    &ToolCallResult::error("unvollständig (Resume-Abbruch)"),
+                    0,
+                    Some(ResultTrust::Runtime),
+                ));
             }
+        }
+        if marked {
+            // PL-97 M3: der offene Aufruf endet auch im Reducer (fehlgeschlagen).
+            activity_glue::tool_completed(app, call_id.as_str(), cell, None);
         }
     }
 }
@@ -4686,7 +4971,11 @@ pub(crate) fn tui_error_from_approval_driver(error: ApprovalDriverError) -> TuiE
 }
 
 /// Zeitfenster, in dem ein zweites Ctrl+C/Ctrl+D den Chat beendet.
-const QUIT_HINT_WINDOW: Duration = Duration::from_secs(2);
+///
+/// Dasselbe Fenster nutzt der Not-Aus im Eingabe-Thread
+/// ([`crate::hard_kill::DOUBLE_PRESS_WINDOW`]); beide teilen sich die
+/// Konstante, damit Hinweis und Not-Aus nie auseinanderlaufen.
+const QUIT_HINT_WINDOW: Duration = crate::hard_kill::DOUBLE_PRESS_WINDOW;
 
 /// Maximale Popup-Höhe in Zeilen (ohne Rahmen).
 const POPUP_MAX_ROWS: u16 = 8;
@@ -4799,6 +5088,8 @@ pub(crate) async fn run_loop(
     app.btw.set_waker(frame_req.clone());
     // Runde 6, Teil B: ein fertiger `!`-Befehl weckt die Schleife.
     app.operator_shell.set_waker(frame_req.clone());
+    // PL-97 D5: ein fertiger DoD-Markenabruf weckt die Schleife.
+    app.dod_mark_waker = Some(frame_req.clone());
 
     loop {
         // Runde 5, Teil B: außerhalb eines Turns darf kein sudo-Fenster offen
@@ -4869,6 +5160,11 @@ pub(crate) async fn run_loop(
         if jobs_glue::poll(app) {
             frame_req.schedule_frame();
         }
+        // PL-97 D5: DoD-Marke im selben Takt (gedrosselt auf den DoD-Cache,
+        // nebenläufig — wartet nie auf den Abruf).
+        if poll_dod_mark(app) {
+            frame_req.schedule_frame();
+        }
 
         // Eine während des vorherigen Turns abgeschickte Eingabe hat Vorrang.
         // Sie passiert denselben Pfad wie eine frische `HarwEvent::Submit`.
@@ -4902,11 +5198,10 @@ pub(crate) async fn run_loop(
                     let Some(tev) = maybe_tev else { return Ok(TuiRunOutcome::Quit) };
 
                     // Abgelaufenen Beenden-Hinweis verwerfen.
-                    if let Some(arm) = app.pending_quit {
-                        if arm.at.elapsed() > QUIT_HINT_WINDOW {
+                    if let Some(arm) = app.pending_quit
+                        && arm.at.elapsed() > QUIT_HINT_WINDOW {
                             app.pending_quit = None;
                         }
-                    }
                     // Runde 5, Teil K: ein im Leerlauf offenes sudo- oder
                     // Host-Permit-Fenster (Hintergrund-Agent) bekommt die Eingabe.
                     // Mausrad nach Position und `scroll_panel_up/down` —
@@ -5424,14 +5719,13 @@ pub(crate) async fn run_loop(
         }
         // Auto-Correction-Detection (harw-memory M3): reine Textregel,
         // kein LLM-Call. Bei Match: Signal explizit an das Backend geben.
-        if let Some(mem) = app.memory() {
-            if let Some(sig) =
+        if let Some(mem) = app.memory()
+            && let Some(sig) =
                 harw_memory::detect_correction(&text, Some(format!("session:{}", app.session_id())))
-            {
-                // Fehler bewusst still verschlucken — Memory-Record ist
-                // best-effort und darf den User-Turn niemals unterbrechen.
-                let _ = mem.record(sig);
-            }
+        {
+            // Fehler bewusst still verschlucken — Memory-Record ist
+            // best-effort und darf den User-Turn niemals unterbrechen.
+            let _ = mem.record(sig);
         }
         // Turn treiben (Spinner animiert), Antwort simuliert streamen.
         //
@@ -5533,6 +5827,8 @@ pub(crate) async fn run_loop(
 /// - `state` (`&mut TurnEventState`): hält `call_id → Zelle`.
 /// - `call_id` (`harw_types::ToolCallId`): Kennung des Aufrufs.
 /// - `call` (`&ToolCall`): vollständiger Aufruf (Name + Argumente).
+/// - `turn` (`Option<&str>`): Turn-Kennung, wenn bekannt (PL-97 M3:
+///   Turn-Grenze des Aktivitäts-Reducers); `None` auf dem Freigabepfad.
 ///
 /// # Rückgabe
 /// Die eine, geteilte [`SharedToolCell`] dieses Aufrufs.
@@ -5541,13 +5837,14 @@ fn ensure_tool_cell(
     state: &mut TurnEventState,
     call_id: harw_types::ToolCallId,
     call: &ToolCall,
+    turn: Option<&str>,
 ) -> SharedToolCell {
     if let Some(existing) = state.pending_tool_cells.get(&call_id) {
         return Arc::clone(existing);
     }
     let cell: SharedToolCell = Arc::new(Mutex::new(ToolCell::started(call)));
     state.pending_tool_cells.insert(call_id, Arc::clone(&cell));
-    app.append_tool_cell(call.name.as_str(), Arc::clone(&cell));
+    app.append_tool_cell(call, turn, Arc::clone(&cell));
     cell
 }
 
@@ -5595,20 +5892,48 @@ fn ensure_tool_cell(
 ///
 /// # Rückgabe
 /// `true`, wenn sich der sichtbare Zustand geändert hat und ein Redraw nötig ist.
-/// Obergrenze (Zeichen) des vorgehaltenen Live-Reasoning-Schwanzes.
-const LIVE_REASONING_MAX_CHARS: usize = 2000;
-/// Maximale Zahl umbrochener Live-Reasoning-Zeilen im Chat.
+/// Obergrenze (Zeichen) des vorgehaltenen Live-Reasoning-Schwanzes
+/// (PL-97 R1: genug für acht umbrochene Zeilen samt Absätzen).
+const LIVE_REASONING_MAX_CHARS: usize = 4000;
+/// Maximale Zahl umbrochener Live-Reasoning-Zeilen im Chat bei
+/// `[tui] reasoning = "collapsed"`.
 const LIVE_REASONING_MAX_LINES: usize = 3;
+/// Maximale Zahl umbrochener Live-Reasoning-Zeilen (nach der Kopfzeile) bei
+/// `[tui] reasoning = "message"` (PL-97 R1).
+const LIVE_REASONING_MESSAGE_MAX_LINES: usize = 8;
 
-/// Baut die transienten Live-Reasoning-Zeilen: die letzten (bis zu)
-/// [`LIVE_REASONING_MAX_LINES`] umbrochenen Zeilen, gedimmt, die erste mit
-/// `"∴ "`-Markierung.
+/// Baut die transienten Live-Reasoning-Zeilen je nach `[tui] reasoning`
+/// (PL-97 R1):
+/// - `message`: Kopfzeile `∴ Reasoning …` plus die letzten (bis zu)
+///   [`LIVE_REASONING_MESSAGE_MAX_LINES`] umbrochenen Zeilen mit erhaltenen
+///   Absätzen und Randspalte (siehe [`crate::reasoning_cell::live_message_lines`]),
+/// - `collapsed`: die letzten (bis zu) [`LIVE_REASONING_MAX_LINES`]
+///   umbrochenen Zeilen, gedimmt, die erste mit `"∴ "`-Markierung,
+/// - `hidden`: keine Zeilen.
 ///
 /// # Argumente
 /// - `text` (`&str`): Roher, gestreamter Reasoning-Text (wird sanitisiert).
 /// - `width` (`u16`): Breite der Verlaufsfläche.
 /// - `theme` ([`style::Theme`]): Farbschema.
-fn live_reasoning_lines(text: &str, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+/// - `mode` ([`ReasoningDisplayMode`]): konfigurierte Darstellung.
+fn live_reasoning_lines(
+    text: &str,
+    width: u16,
+    theme: style::Theme,
+    mode: ReasoningDisplayMode,
+) -> Vec<Line<'static>> {
+    match mode {
+        ReasoningDisplayMode::Hidden => return Vec::new(),
+        ReasoningDisplayMode::Message => {
+            return crate::reasoning_cell::live_message_lines(
+                text,
+                width,
+                theme,
+                LIVE_REASONING_MESSAGE_MAX_LINES,
+            );
+        }
+        ReasoningDisplayMode::Collapsed => {}
+    }
     let sanitized = crate::sanitize::sanitize_inline(text);
     let wrapped = crate::history_cell::wrap_plain(sanitized.trim(), width.saturating_sub(4));
     let skip = wrapped.len().saturating_sub(LIVE_REASONING_MAX_LINES);
@@ -5641,6 +5966,8 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             let surface_root_id = app.session_id().as_str().to_owned();
             app.agent_monitor
                 .surface_root_tool(&surface_root_id, "assistant", Some(&tool_name));
+            // PL-97 M3: Turn-Kennung für die Turn-Grenze des Reducers.
+            let turn_key = turn_id.as_str().to_owned();
             // Runde 5, Teil O: Turn des Aufrufs für die Abbruch-Markierung.
             state.tool_call_turns.insert(call_id.clone(), turn_id);
             let already_known = state.pending_tool_cells.contains_key(&call_id);
@@ -5649,7 +5976,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                 name: ToolName::new(tool_name.clone()),
                 arguments: arguments.clone(),
             };
-            ensure_tool_cell(app, state, call_id.clone(), &call);
+            ensure_tool_cell(app, state, call_id.clone(), &call, Some(&turn_key));
             if let Some(index) = state.export_tool_calls.get(&call_id).copied() {
                 if let Some(ExportEntry::ToolCall {
                     tool_name: exported_name,
@@ -5698,7 +6025,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                     state
                         .pending_tool_cells
                         .insert(call_id.clone(), Arc::clone(&cell));
-                    app.append_tool_cell("tool.result", Arc::clone(&cell));
+                    app.append_tool_cell(&orphan, None, Arc::clone(&cell));
                     cell
                 }
             };
@@ -5755,6 +6082,9 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             if let Some(entry) = export_entry {
                 app.export_entries.push(entry);
             }
+            // PL-97 M3: Ende des Aufrufs in den Aktivitäts-Reducer (nach dem
+            // Lösen der Sperre: der Adapter liest den Zellzustand selbst).
+            activity_glue::tool_completed(app, call_id.as_str(), &cell, Some(&result));
             // Runde 5, Teil E: „auto ✓ <Grund>“ bzw. „Vom Auto-Modus
             // abgelehnt · <Kategorie>“ an der Zelle; löst der Deckel aus,
             // erscheint sein Hinweis einmal als Systemzeile.
@@ -5767,10 +6097,9 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                         .verdict_for(call_id.as_str())
                         .as_ref()
                         .and_then(auto_note_for)
+                        && let Ok(mut guard) = cell.lock()
                     {
-                        if let Ok(mut guard) = cell.lock() {
-                            guard.set_approval_note(&note);
-                        }
+                        guard.set_approval_note(&note);
                     }
                     auto.log().take_notice()
                 });
@@ -5783,14 +6112,26 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             item: TurnItem::Reasoning(reasoning),
             ..
         } => {
-            let summary = reasoning.summary_text.join(" ");
-            if summary.is_empty() {
+            // PL-97 R1: Leerzeilen zwischen den Einträgen erhalten die Absätze.
+            let summary = reasoning.summary_text.join("\n\n");
+            // Wie `hydrate_visible_history`: nur Leerraum ergibt keine Zelle.
+            if summary.trim().is_empty() {
                 return false;
             }
             app.close_tool_group();
             app.export_entries
                 .push(ExportEntry::Reasoning(summary.clone()));
             app.push_reasoning_cell(summary, None);
+            // Die fertige Zelle ersetzt die Live-Vorschau (in jedem Modus),
+            // sonst stünde derselbe Text zweimal auf dem Schirm.
+            app.live_reasoning.clear();
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.agent_monitor.sync_surface_root_stream(
+                &surface_root_id,
+                "assistant",
+                &app.live_reasoning,
+                &app.live_stream,
+            );
             true
         }
         TurnEvent::AssistantDelta { text, .. } => {
@@ -5807,7 +6148,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
         TurnEvent::ReasoningDelta { text, .. } => {
             app.live_reasoning.push_str(&text);
             // Nur ein Schwanz bleibt vorgehalten — genug für die letzten
-            // drei umbrochenen Zeilen auch auf breiten Terminals.
+            // acht umbrochenen Zeilen auch auf breiten Terminals.
             let count = app.live_reasoning.chars().count();
             if count > LIVE_REASONING_MAX_CHARS {
                 app.live_reasoning = app
@@ -6137,6 +6478,7 @@ fn mark_incomplete_tool_exports(
         .cloned()
         .collect();
     let mut changed = false;
+    let mut marked: Vec<harw_types::ToolCallId> = Vec::new();
     for call_id in call_ids {
         let Some(cell) = state.pending_tool_cells.get(&call_id) else {
             continue;
@@ -6167,8 +6509,16 @@ fn mark_incomplete_tool_exports(
             0,
             Some(ResultTrust::Runtime),
         ));
-        state.export_incomplete_tools.insert(call_id, ());
+        state.export_incomplete_tools.insert(call_id.clone(), ());
         changed = true;
+        marked.push(call_id);
+    }
+    // PL-97 M3: die abgebrochenen Aufrufe enden auch im Reducer
+    // (fehlgeschlagen), nachdem die Sperren gelöst sind.
+    for call_id in marked {
+        if let Some(cell) = state.pending_tool_cells.get(&call_id).cloned() {
+            activity_glue::tool_completed(app, call_id.as_str(), &cell, None);
+        }
     }
     changed
 }
@@ -6757,6 +7107,23 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
                 bus.send(HarwEvent::Quit);
             }
         },
+        // PL-97 C4 (W20-E): Enter schickt die wörtliche Zeile `/jobs stop
+        // <id>` über denselben Weg wie eine getippte Zeile (Zulassung,
+        // Busy-Klasse, `OpContext`); keine Job-API von hier, kein zweiter Weg.
+        Some(Overlay::StopJob(stop)) => match stop.handle_key(key) {
+            crate::mission::stop_job::StopDecision::Stay => {}
+            crate::mission::stop_job::StopDecision::Cancel => app.overlay = None,
+            crate::mission::stop_job::StopDecision::Confirm { line, target } => {
+                app.overlay = None;
+                tracing::info!(
+                    job_id = %target.job,
+                    line = line.as_str(),
+                    "tui.jobs.stop_confirmed"
+                );
+                jobs_glue::note_stop_requested(app, &target);
+                bus.send(HarwEvent::Command(line.into_line()));
+            }
+        },
         Some(Overlay::EffortChoice { target, dialog }) => {
             let target = *target;
             match dialog.handle_key(key) {
@@ -6862,26 +7229,52 @@ fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
 /// Esc und Navigation im fokussierten Panel).
 /// `None`: Taste gehört dem Chat/Composer.
 fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
-    // Ein offenes Popup/Dialog behält Esc & Pfeile für sich.
+    // Ein offenes Popup/Dialog behält Esc & Pfeile für sich. PL-97 C4: auch
+    // ein Overlay, das ein fokussiertes Fenster öffnete (Stopp-Dialog der
+    // Jobs, Einzelläufe von Finished/Failed) — wie im Busy-Pfad gehen seine
+    // Tasten vor die Panel-Tasten.
     if app.command_popup.as_ref().is_some_and(|p| !p.is_empty())
         || app.mention_popup.as_ref().is_some_and(|p| !p.is_empty())
         || app.pending_approval_dialog.is_some()
         || app.pending_host_permit_dialog.is_some()
+        || app.has_overlay()
     {
+        return None;
+    }
+    sync_mission_focus(app);
+    if composer_owns_mission_key(app, &key) {
         return None;
     }
     // Die Agenten-Detailansicht bekommt ihre Tasten (insbesondere Esc) vor
     // der Panel-Logik, die Esc sonst als „Fokus zurück an den Chat" deutet.
-    if app.agent_detail.is_some() && app.panels.focus == crate::panes::PaneFocus::Agents {
-        if let Some(redraw) = handle_agent_detail_key(app, key) {
-            return Some(redraw);
-        }
+    if app.agent_detail.is_some()
+        && matches!(
+            app.panels.focus,
+            crate::panes::PaneFocus::Agents | crate::panes::PaneFocus::Jobs
+        )
+        && let Some(redraw) = handle_agent_detail_key(app, key)
+    {
+        return Some(redraw);
+    }
+    // PL-97 C2: `Alt+L` öffnet/schließt die Details des LIVE-Agenten.
+    if app.key_bindings.action_for(&key) == Some(KeyAction::ToggleLiveDetail) {
+        return Some(app.toggle_live_detail());
     }
     match app.panels.handle_key(key, &app.key_bindings) {
         crate::panes::PanelKey::Ignored => None,
         crate::panes::PanelKey::Changed => {
             app.sync_agent_detail();
             app.ensure_explorer();
+            // Ohne eigenes Jobs-Fenster wählt `Alt+J` den ersten Job der
+            // kombinierten Liste (`PanelState` landet nur dann im
+            // Agenten-Panel, wenn auch nach dem Einblenden kein Jobs-Fenster
+            // existiert).
+            if app.key_bindings.action_for(&key) == Some(KeyAction::FocusJobs)
+                && app.panels.focus == crate::panes::PaneFocus::Agents
+                && !app.panels.revealed.jobs
+            {
+                crate::mission::agents_window::select_first_job(&mut app.agent_monitor);
+            }
             // Frisch eingeblendete Werkbank lädt neu (siehe
             // `process_pending_fetches`).
             if app.panels.workbench_visible
@@ -6896,11 +7289,201 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
         crate::panes::PanelKey::ForFocused(_) if app.agent_detail.is_some() => Some(false),
         crate::panes::PanelKey::ForFocused(key) => Some(match app.panels.focus {
             crate::panes::PaneFocus::Agents => handle_agents_list_key(app, key),
+            crate::panes::PaneFocus::Jobs => handle_jobs_window_key(app, key),
+            crate::panes::PaneFocus::Finished => handle_finished_window_key(app, key),
+            // PL-97 C3: LIVE ist nur als Fenster der Querformat-Mittelspalte
+            // fokussierbar; dort scrollt es, Enter zeigt/schließt die Details.
+            crate::panes::PaneFocus::Live
+                if key.code == KeyCode::Enter && key.modifiers.is_empty() =>
+            {
+                app.toggle_live_detail_in_place()
+            }
+            crate::panes::PaneFocus::Live => {
+                crate::mission::live_window::handle_key(&mut app.mission, key)
+            }
             crate::panes::PaneFocus::Explorer => handle_explorer_key(app, key),
             crate::panes::PaneFocus::Workbench => app.handle_workbench_key(key),
             crate::panes::PaneFocus::Chat => false,
         }),
     }
+}
+
+/// PL-97 C2: übernimmt, welche Mission-Fenster das letzte Bild zeigte (und
+/// welche das Hochformat nach dem Einblenden zeigt), als Fokusziele (`F4`,
+/// `Alt+J`, `Alt+F`). Verschwindet ein fokussiertes Fenster
+/// (Größenänderung), geht der Fokus dorthin, wo sein Inhalt jetzt steht:
+/// Jobs und Finished/Failed in das Agenten-Panel, ohne sichtbare
+/// Kartenzeile (kurzer Körper) wie LIVE an den Chat. Eine offene
+/// Detailansicht behält ihren Fokus; fehlt die Kartenzeile, in der sie
+/// steht, wird sie maximiert statt unsichtbar zu bleiben.
+fn sync_mission_focus(app: &mut ChatApp) {
+    use crate::panes::PaneFocus;
+    let regions = app.last_regions.get();
+    let presence = regions.presence;
+    app.panels.mission = presence;
+    app.panels.revealed = regions.revealed;
+    if app.agent_detail.is_some() || app.panels.maximized {
+        if presence.agents_hidden && app.agent_detail.is_some() {
+            app.panels.maximized = true;
+        }
+        return;
+    }
+    let fallback = if presence.agents_hidden {
+        PaneFocus::Chat
+    } else {
+        PaneFocus::Agents
+    };
+    app.panels.focus = match app.panels.focus {
+        PaneFocus::Jobs if !presence.jobs => fallback,
+        PaneFocus::Finished if !presence.finished => fallback,
+        PaneFocus::Agents if presence.agents_hidden => PaneFocus::Chat,
+        PaneFocus::Live if !presence.live => PaneFocus::Chat,
+        focus => focus,
+    };
+    // PL-97 C3: verliert LIVE so den Fokus (das Querformat-Fenster ist
+    // verschwunden), schließen auch seine Details an Ort und Stelle — sonst
+    // bliebe ein unsichtbarer Zustand, den das nächste `Alt+L` nur schließt.
+    app.mission.sync_live_focus(app.panels.focus);
+}
+
+/// PL-97 C2: beim Tippen gewinnt der Composer. Die Voreinstellungen der
+/// Mission-Aktionen (`Alt+J`, `Alt+F`, `Alt+L`) dürfen dessen
+/// Emacs-Wortsprünge (`Alt+B`/`Alt+F`) nicht schlucken, solange der Chat
+/// fokussiert ist und der Composer Text enthält; mit leerem Composer (oder
+/// umbelegt) gelten sie wie jede Panel-Taste.
+fn composer_owns_mission_key(app: &ChatApp, key: &KeyEvent) -> bool {
+    let mission_action = matches!(
+        app.key_bindings.action_for(key),
+        Some(KeyAction::FocusJobs | KeyAction::FocusFinished | KeyAction::ToggleLiveDetail)
+    );
+    let word_motion = key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('b' | 'B' | 'f' | 'F'));
+    mission_action
+        && word_motion
+        && app.panels.focus == crate::panes::PaneFocus::Chat
+        && !app.input.is_empty()
+}
+
+/// PL-97 C2: Tasten des fokussierten Jobs-Fensters (fest, nicht
+/// umbelegbar): `↑`/`↓`, `k`/`j` wählen, `Bild↑`/`Bild↓` blättern,
+/// `Pos1`/`Ende` springen, `Enter` öffnet die Job-Details. Die Auswahl gehört
+/// dem Fenster ([`crate::mission::MissionUi::jobs`]), nicht der Agentenliste.
+/// PL-97 C4 (W20-E): `x` fragt, ob der gewählte laufende Job gestoppt
+/// werden soll (`k` bleibt „hoch“); bestätigt läuft `/jobs stop <id>` über
+/// den Befehlsweg, nie direkt über die Job-Verwaltung.
+fn handle_jobs_window_key(app: &mut ChatApp, key: KeyEvent) -> bool {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
+    }
+    if key.code == KeyCode::Enter {
+        return app.open_job_window_detail();
+    }
+    if key.code == KeyCode::Char('x') {
+        let dialog =
+            crate::mission::jobs_window::selected_row(app.agent_monitor.jobs(), &app.mission.jobs)
+                .and_then(crate::mission::stop_job::StopJobDialog::for_row);
+        return match dialog {
+            Some(dialog) => {
+                app.overlay = Some(Overlay::StopJob(dialog));
+                true
+            }
+            None => false,
+        };
+    }
+    // Die Auswahl hängt an der Job-Kennung (bleibt beim Umsortieren).
+    let keys = crate::mission::jobs_window::row_keys(app.agent_monitor.jobs());
+    let ui = &mut app.mission.jobs;
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => ui.select_step(true, &keys),
+        KeyCode::Up | KeyCode::Char('k') => ui.select_step(false, &keys),
+        KeyCode::PageDown => ui.select_page(true, &keys),
+        KeyCode::PageUp => ui.select_page(false, &keys),
+        KeyCode::Home => ui.select_edge(false, &keys),
+        KeyCode::End => ui.select_edge(true, &keys),
+        _ => return false,
+    }
+    true
+}
+
+/// PL-97 C2/C4: Tasten des fokussierten Finished/Failed-Fensters (fest):
+/// `f` klappt die Kategorien auf/zu, `Enter` klappt auf; aufgeklappt
+/// quittiert `Enter` die gewählte Kategorie und öffnet ihre Einzelläufe
+/// (neueste zuerst), `a` quittiert die gewählte Kategorie (eingeklappt:
+/// alle), `c` alle; gewählt wird mit `↑`/`↓`/`k`/`j`, `Bild↑`/`Bild↓`,
+/// `Pos1`/`Ende`. Quittieren löscht nichts.
+fn handle_finished_window_key(app: &mut ChatApp, key: KeyEvent) -> bool {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
+    }
+    let expanded = app.mission.finished_expanded;
+    // PL-97 C3: das gerahmte Fenster des dreispaltigen Querformats zeigt
+    // seine Kategorien immer; die Tasten bedienen dieselbe sichtbare Liste
+    // wie das Mausrad (`scroll_routing::finished_scrolls`).
+    let listed = expanded || scroll_routing::finished_scrolls(app.last_regions.get());
+    match key.code {
+        KeyCode::Char('f') => {
+            app.mission.finished_expanded = !expanded;
+            return true;
+        }
+        KeyCode::Enter if !listed => {
+            app.mission.finished_expanded = true;
+            return true;
+        }
+        KeyCode::Char('c') => return app.agent_monitor.acknowledge_failures(),
+        KeyCode::Char('a') if !listed => return app.agent_monitor.acknowledge_failures(),
+        _ => {}
+    }
+    if !listed {
+        return false;
+    }
+    let rows = crate::mission::projection::terminal_aggregate(
+        &app.agent_monitor,
+        app.agent_monitor.jobs(),
+    );
+    if matches!(key.code, KeyCode::Enter | KeyCode::Char('a')) {
+        let Some(row) = crate::mission::finished_window::selected_row(&rows, &app.mission.finished)
+        else {
+            return false;
+        };
+        let category = row.category.clone();
+        let acknowledged =
+            crate::mission::projection::acknowledge(&mut app.agent_monitor, &category);
+        if key.code == KeyCode::Char('a') {
+            return acknowledged;
+        }
+        // Die Einzelläufe aus dem frisch quittierten Stand: die eben
+        // quittierten Fehlschläge tragen kein `NEW` mehr.
+        let fresh = crate::mission::projection::terminal_aggregate(
+            &app.agent_monitor,
+            app.agent_monitor.jobs(),
+        );
+        let Some(row) = fresh.iter().find(|row| row.category == category) else {
+            return acknowledged;
+        };
+        let view = crate::mission::finished_window::ConstituentsView::new(row);
+        app.open_overlay_view(Box::new(view));
+        return true;
+    }
+    // Die Auswahl hängt an der Kategorie (bleibt beim Umsortieren).
+    let keys = crate::mission::finished_window::row_keys(&rows);
+    let ui = &mut app.mission.finished;
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => ui.select_step(true, &keys),
+        KeyCode::Up | KeyCode::Char('k') => ui.select_step(false, &keys),
+        KeyCode::PageDown => ui.select_page(true, &keys),
+        KeyCode::PageUp => ui.select_page(false, &keys),
+        KeyCode::Home => ui.select_edge(false, &keys),
+        KeyCode::End => ui.select_edge(true, &keys),
+        _ => return false,
+    }
+    true
 }
 
 /// Tasten der Agenten-Liste bei fokussiertem Panel (fest, nicht umbelegbar).
@@ -6909,9 +7492,10 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
 /// `↑`/`↓`, `k`/`j` und — spieletypisch — `w`/`s` wählen; `Bild↑`/`Bild↓`
 /// blättern seitenweise, `Pos1`/`Ende` springen an Anfang/Ende; `Enter`
 /// öffnet die Detailansicht bzw. klappt die Sammelzeile der fertigen
-/// Agenten auf; `f` klappt sie auf/zu; `c` quittiert Fehlschläge. `w`/`s`
-/// gelten nur hier — im Composer bleiben es Buchstaben (der Chat-Fokus
-/// erreicht diese Funktion nie).
+/// Agenten auf; `f` klappt sie auf/zu; `c` quittiert Fehlschläge; `p` heftet
+/// den gewählten Agenten an das LIVE-Fenster. `w`/`s` gelten nur hier — im
+/// Composer bleiben es Buchstaben (der Chat-Fokus erreicht diese Funktion
+/// nie).
 ///
 /// # Rückgabe
 /// `true`, wenn neu gezeichnet werden soll.
@@ -6922,21 +7506,33 @@ fn handle_agents_list_key(app: &mut ChatApp, key: KeyEvent) -> bool {
     {
         return false;
     }
+    // PL-97 C2: mit eigenem Jobs-Fenster bleibt die Auswahl der
+    // Agentenliste auf Agenten (die Jobs wählt das Jobs-Fenster).
+    let jobs_window = app.last_regions.get().jobs.is_some();
+    let settle = |app: &mut ChatApp, forward: bool| {
+        if jobs_window {
+            crate::mission::agents_window::settle_on_agent_entry(&mut app.agent_monitor, forward);
+        }
+    };
     match key.code {
         KeyCode::Down | KeyCode::Char('j' | 's') => {
             app.agent_monitor.select_next();
+            settle(app, true);
             true
         }
         KeyCode::Up | KeyCode::Char('k' | 'w') => {
             app.agent_monitor.select_prev();
+            settle(app, false);
             true
         }
         KeyCode::PageDown => {
             app.agent_monitor.select_page(true);
+            settle(app, false);
             true
         }
         KeyCode::PageUp => {
             app.agent_monitor.select_page(false);
+            settle(app, false);
             true
         }
         KeyCode::Home => {
@@ -6945,8 +7541,18 @@ fn handle_agents_list_key(app: &mut ChatApp, key: KeyEvent) -> bool {
         }
         KeyCode::End => {
             app.agent_monitor.select_edge(true);
+            settle(app, false);
             true
         }
+        // PL-97 C2: `p` heftet den gewählten Agenten an das LIVE-Fenster
+        // (erneut `p`: lösen).
+        KeyCode::Char('p') => match app.agent_monitor.selected_agent() {
+            Some(agent) => {
+                app.mission.toggle_pin(agent.as_str());
+                true
+            }
+            None => false,
+        },
         KeyCode::Char('f') => {
             app.agent_monitor.toggle_finished();
             true
@@ -7425,35 +8031,35 @@ async fn run_turn_streaming(
     // Kinder erben `cancel.child()`; ein harter Ctrl+C-Abbruch bricht sie
     // dadurch mit ab. Ein Fehler (z. B. weil diese Session selbst ein
     // admittiertes Kind ist) ist nicht fatal für den Turn — nur geloggt.
-    if let Some(spawner) = app.managed_spawner() {
-        if let Err(error) = spawner.register_parent_cancel_token(app.session_id(), cancel.clone()) {
-            tracing::warn!(error = %error, "tui.turn.register_parent_cancel_token_failed");
-        }
+    if let Some(spawner) = app.managed_spawner()
+        && let Err(error) = spawner.register_parent_cancel_token(app.session_id(), cancel.clone())
+    {
+        tracing::warn!(error = %error, "tui.turn.register_parent_cancel_token_failed");
     }
     // Runde 5, Teil E: die Nutzernachricht ist das „Ziel der Sitzung“ für
     // den Auto-Modus-Klassifizierer (Geheimnisse entfernt er selbst).
-    if let Some(rt) = app.runtime() {
-        if let Some(auto) = rt.auto_mode() {
-            // Runde 6, Teil A: `set_goal` ist ein Ringpuffer der letzten drei
-            // Nachrichten; die Sitzungs-Id bestimmt, wessen Host-Lease zählt.
-            auto.context().set_goal(text);
-            auto.set_lease_session(app.session_id().to_string());
-            // Runde 5 (Integration E/F): der angeheftete, freigegebene Plan ist
-            // Kontext für den Klassifizierer (gekürzt, ohne Geheimnis-Pfad —
-            // Redaction übernimmt der Klassifizierer selbst).
-            let plan = rt.plan_session().pinned().get().map(|doc| {
-                let mut content = doc.content;
-                if content.len() > 4096 {
-                    let mut cut = 4096;
-                    while !content.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    content.truncate(cut);
+    if let Some(rt) = app.runtime()
+        && let Some(auto) = rt.auto_mode()
+    {
+        // Runde 6, Teil A: `set_goal` ist ein Ringpuffer der letzten drei
+        // Nachrichten; die Sitzungs-Id bestimmt, wessen Host-Lease zählt.
+        auto.context().set_goal(text);
+        auto.set_lease_session(app.session_id().to_string());
+        // Runde 5 (Integration E/F): der angeheftete, freigegebene Plan ist
+        // Kontext für den Klassifizierer (gekürzt, ohne Geheimnis-Pfad —
+        // Redaction übernimmt der Klassifizierer selbst).
+        let plan = rt.plan_session().pinned().get().map(|doc| {
+            let mut content = doc.content;
+            if content.len() > 4096 {
+                let mut cut = 4096;
+                while !content.is_char_boundary(cut) {
+                    cut -= 1;
                 }
-                format!("{}\n{content}", doc.display_path)
-            });
-            auto.context().set_plan(plan);
-        }
+                content.truncate(cut);
+            }
+            format!("{}\n{content}", doc.display_path)
+        });
+        auto.context().set_plan(plan);
     }
     spinner.start();
     let reply = drive_turn_animated(
@@ -8600,10 +9206,12 @@ async fn apply_approval_decision(
             (false, prompt.reject(reason))
         }
     };
-    if approved && delivered && !learned {
-        if let Some(auto) = app.runtime().and_then(|rt| rt.auto_mode()) {
-            auto.record_manual_approval(&approved_call);
-        }
+    if approved
+        && delivered
+        && !learned
+        && let Some(auto) = app.runtime().and_then(|rt| rt.auto_mode())
+    {
+        auto.record_manual_approval(&approved_call);
     }
 
     let note = if approved && delivered {
@@ -8850,8 +9458,13 @@ async fn drive_pauses_to_completion(
                         // Dieselbe Zelle, die auch `TurnEvent::ToolCallRequested`
                         // anlegt bzw. wiederfindet (Wettlauf beider Kanäle, siehe
                         // `ensure_tool_cell`-Doku).
-                        let tool_cell =
-                            ensure_tool_cell(app, turn_state, prompt.call_id().clone(), prompt.call());
+                        let tool_cell = ensure_tool_cell(
+                            app,
+                            turn_state,
+                            prompt.call_id().clone(),
+                            prompt.call(),
+                            None,
+                        );
                         let timeout = approval_driver.handler().timeout();
                         // Runde 5, Teil O: die Wurzel-Frage hat Vorrang; eine
                         // offene Kind-Frage wartet, bis der Dialog frei ist.
@@ -9418,10 +10031,10 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
 fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
     // Abgelaufenen Beenden-Hinweis verwerfen — Pendant zur Ablaufprüfung im
     // Idle-Pfad von `run_loop`, hier für den Busy-Pfad (Welle 4c, Punkt 5).
-    if let Some(arm) = app.pending_quit {
-        if arm.at.elapsed() > QUIT_HINT_WINDOW {
-            app.pending_quit = None;
-        }
+    if let Some(arm) = app.pending_quit
+        && arm.at.elapsed() > QUIT_HINT_WINDOW
+    {
+        app.pending_quit = None;
     }
     // Runde 5, Teil L: Esc bricht zuerst eine wartende `/btw`-Nebenfrage ab —
     // der Turn läuft weiter; erst ein weiteres Esc unterbricht ihn.
@@ -9756,6 +10369,7 @@ const STATUS_HOST_HINT_MIN_COLS: u16 = 60;
 /// Marke (Goal, Plan, Host-Modus) Platz neben den Segmenten bräuchte.
 fn status_rows_for(app: &ChatApp, theme: style::Theme, width: u16) -> u16 {
     let has_marks = app.host_mode_active()
+        || app.dod_mark.visible().is_some()
         || app.current_permission_stage() == PermissionCycleStage::Plan
         || !app.goal_status_spans(theme, width).is_empty();
     if width < STATUS_TWO_ROWS_MAX_COLS && has_marks {
@@ -9776,8 +10390,8 @@ const HOST_MODE_MARK_SHORT: &str = " HOST-MODUS AKTIV ·";
 const PLAN_MARK_SHORT: &str = " ⏸ plan ";
 
 /// Setzt die Marken der Statuszeile zusammen: Host-Warnung zuerst mit fest
-/// reserviertem Platz, dann die Plan-Marke (voll, sonst kurz, sonst weg) und
-/// die Goal-Marke, gekürzt auf den Rest.
+/// reserviertem Platz, dann die DoD-Marke (PL-97 D5) und die Plan-Marke
+/// (je voll, sonst kurz, sonst weg) und die Goal-Marke, gekürzt auf den Rest.
 ///
 /// # Rückgabe
 /// Die Spans und ihre Gesamtbreite in Spalten (nie über `width`, außer die
@@ -9799,6 +10413,7 @@ fn child_info_expired_segment(child: &str, age_secs: u64) -> String {
 
 fn status_mark_spans(
     host: Option<Span<'static>>,
+    dod: Option<(Span<'static>, Span<'static>)>,
     plan: Option<(Span<'static>, Span<'static>)>,
     goal: Vec<Span<'static>>,
     width: usize,
@@ -9810,7 +10425,9 @@ fn status_mark_spans(
         spans.push(host);
     }
     let mut remaining = width.saturating_sub(used);
-    if let Some((full, short)) = plan {
+    // PL-97 D5: DoD-Marke direkt nach der Host-Warnung, vor Plan und Goal
+    // (voll, sonst kurz, sonst weg) — wie die Plan-Marke.
+    for (full, short) in [dod, plan].into_iter().flatten() {
         let pick = if full.width() <= remaining {
             Some(full)
         } else if short.width() <= remaining {
@@ -9862,64 +10479,6 @@ fn draw_viewport(
     Ok(())
 }
 
-/// Einrückung der Körperzeilen des Mini-Live-Streifens unter seiner Kopfzeile.
-const LIVE_STRIP_INDENT: u16 = 2;
-
-/// Kopfzeilen-Beschriftung des Mini-Live-Streifens (eine Spalte je Zeichen).
-const LIVE_STRIP_LABEL: &str = " Live ";
-
-/// Zeichnet den Mini-Live-Streifen des Portrait-Docks (PL-94 W02): eine
-/// Kopfzeile und darunter bis zu `body_lines` Recency-Slots, neueste
-/// Agentenmeldung zuerst. Bei `body_lines == 0` ist nur Platz für die
-/// Kopfzeile; sie trägt dann die neueste Meldung selbst. Die Texte stammen von
-/// Agenten und sind in [`crate::recency_view::slot_lines`] bereits bereinigt
-/// und auf die Breite gekürzt.
-fn render_live_strip(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    recency: &crate::recency::RecencySlots,
-    body_lines: u16,
-    theme: style::Theme,
-) {
-    let label = Span::styled(
-        LIVE_STRIP_LABEL,
-        Style::default()
-            .fg(style::accent_color(theme))
-            .add_modifier(Modifier::BOLD),
-    );
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    if body_lines == 0 {
-        let label_width = u16::try_from(LIVE_STRIP_LABEL.chars().count()).unwrap_or(0);
-        let newest =
-            crate::recency_view::slot_lines(recency, area.width.saturating_sub(label_width))
-                .into_iter()
-                .next()
-                .map(|line| line.text)
-                .unwrap_or_default();
-        rows.push(Line::from(vec![
-            label,
-            Span::styled(newest, style::dim_style(theme)),
-        ]));
-    } else {
-        rows.push(Line::from(label));
-        let indent = " ".repeat(usize::from(LIVE_STRIP_INDENT));
-        let body =
-            crate::recency_view::slot_lines(recency, area.width.saturating_sub(LIVE_STRIP_INDENT));
-        for line in body.into_iter().take(usize::from(body_lines)) {
-            let line_style = if line.slot == 1 {
-                Style::default()
-            } else {
-                style::dim_style(theme)
-            };
-            rows.push(Line::from(Span::styled(
-                format!("{indent}{}", line.text),
-                line_style,
-            )));
-        }
-    }
-    frame.render_widget(Paragraph::new(rows), area);
-}
-
 /// Renders the same viewport on a real terminal or a test backend.
 fn render_viewport(
     frame: &mut ratatui::Frame<'_>,
@@ -9958,7 +10517,8 @@ fn render_viewport(
         }
         Some(Overlay::ExportChoice(dialog))
         | Some(Overlay::EffortChoice { dialog, .. })
-        | Some(Overlay::JobsQuitChoice(dialog)) => {
+        | Some(Overlay::JobsQuitChoice(dialog))
+        | Some(Overlay::StopJob(crate::mission::stop_job::StopJobDialog { dialog, .. })) => {
             frame.render_widget(Clear, area);
             dialog.render(area, frame.buffer_mut(), theme);
             return;
@@ -10030,257 +10590,25 @@ fn render_viewport(
         area.width,
     );
 
-    // Klassifiziert die Terminalgröße einmal pro Bild (siehe `panes::classify_screen`):
-    // breite Seitenspalte (`WideSide`), oben angedockter Portrait-Dock
-    // (`PortraitDock`) oder Zusammenfassungs-/Kompakt-Fallback. `status_rows`
-    // (1, siehe die `Constraint::Length(1)`-Statuszeile unten) und
-    // `composer_rows` (`input_height`, siehe oben) sind exakt die Zeilen, die
-    // die Statuszeile bzw. der Composer heute reservieren.
     // Schmale Terminals (Hochformat, Handy): Goal-, Plan- und Host-Marke
     // bekommen eine eigene Zeile über den Statussegmenten, statt deren Breite
     // aufzuzehren. Auf einer Zeile würde `fit_segments` sonst Modus, Modell
     // und Kontext still verwerfen (Befund 2026-09-28, Hochformat-TUI).
     let status_rows = status_rows_for(app, theme, area.width);
-    let screen = crate::panes::classify_screen(area, status_rows, input_height);
-    let dock = if app.panels.agents_visible && !app.panels.maximized {
-        match screen.placement {
-            harw_tui_layout::Placement::PortraitDock { .. } => screen.agents,
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let (history_area, status_area, input_area) = if let Some(dock_area) = dock {
-        // Portrait-Dock: oben angedockt, darunter Chat über die volle
-        // Breite, dann Warteschlange, Statuszeile und Eingabe. Modale Dialoge
-        // und Freigabefragen zeichnen weiterhin `status_area`/`input_area`
-        // unterhalb des Docks in denselben Puffer — sie liegen also immer
-        // über (zeitlich nach) dem Dock, nie darin. Diese Reihenfolge darf
-        // eine spätere Änderung nicht umdrehen.
-        // Das Dock belegt seine Höhe bereits fest: ohne ihren Abzug könnten
-        // Dock + Warteschlange + Status + Composer die Fläche übersteigen und
-        // Statuszeile und Composer aus dem Bild schieben.
-        let queue_height = (queue_lines.len() as u16).min(
-            area.height
-                .saturating_sub(input_height + 4)
-                .saturating_sub(dock_area.height),
-        );
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(dock_area.height),
-                Constraint::Min(history_min),
-                Constraint::Length(queue_height),
-                Constraint::Length(status_rows),
-                Constraint::Length(input_height),
-            ])
-            .split(area);
-        let dock_area = chunks[0];
-        let below_dock = chunks[1];
-        let queue_area = chunks[2];
-        let status_area = chunks[3];
-        let input_area = chunks[4];
-        if queue_height > 0 {
-            frame.render_widget(
-                Paragraph::new(queue_lines).style(Style::default().fg(style::border_color(theme))),
-                queue_area,
-            );
-        }
-        // Mini-Live-Streifen (PL-94 W02): die zwei letzten Agentenmeldungen
-        // (Recency-Slots, h7) zwischen Dock und Chat. `chat_first` verteilt die
-        // Höhe (siehe `panes::portrait_live_strip`): der Chat behält seine
-        // Mindesthöhe, der Körper bleibt auf `MINI_LIVE_MAX_BODY_LINES` Zeilen
-        // begrenzt und entfällt vor der Kopfzeile. Ohne Meldungen gibt es keinen
-        // Streifen, der Chat bleibt unverändert.
-        let wanted_body_lines = crate::recency_view::slot_lines(
-            &app.recency,
-            below_dock.width.saturating_sub(LIVE_STRIP_INDENT),
-        )
-        .len();
-        let live_strip = crate::panes::portrait_live_strip(
-            below_dock,
-            u16::try_from(wanted_body_lines).unwrap_or(u16::MAX),
-        );
-        if let Some(strip_area) = live_strip.live {
-            render_live_strip(
-                frame,
-                strip_area,
-                &app.recency,
-                live_strip.body_lines,
-                theme,
-            );
-        }
-        let below_dock = live_strip.chat;
-        let pane_areas = crate::panes::split(below_dock, &app.panels);
-        let history_area_for_regions =
-            pane_areas
-                .chat
-                .unwrap_or(Rect::new(below_dock.x, below_dock.y, 0, 0));
-        app.last_regions.set(scroll_routing::FrameRegions {
-            agents: Some(dock_area),
-            dialog: dialog_open.then_some(input_area),
-            plan: app
-                .plan_ui
-                .covers_history()
-                .then_some(history_area_for_regions),
-        });
-        if let Some(detail) = app.agent_detail.as_ref() {
-            if detail.job.is_some() {
-                crate::jobs_panel::render_job_detail(
-                    detail.job_view.as_ref(),
-                    dock_area,
-                    frame.buffer_mut(),
-                    &detail.scroll,
-                    theme,
-                );
-            } else {
-                app.agent_monitor.render_agent_detail(
-                    &detail.agent,
-                    dock_area,
-                    frame.buffer_mut(),
-                    &detail.scroll,
-                    detail.show_reasoning,
-                );
-            }
-        } else {
-            crate::agent_monitor::render_dock(
-                &app.agent_monitor,
-                crate::panes::split_dock_areas(dock_area),
-                frame.buffer_mut(),
-                theme,
-                app.panels.focus == crate::panes::PaneFocus::Agents,
-            );
-        }
-        if let Some(explorer_area) = pane_areas.explorer {
-            render_explorer_panel(app, explorer_area, frame.buffer_mut(), theme);
-        }
-        if let Some(workbench_area) = pane_areas.workbench {
-            app.workbench.render(
-                workbench_area,
-                frame.buffer_mut(),
-                theme,
-                app.panels.focus == crate::panes::PaneFocus::Workbench,
-            );
-        }
-        let history_area = pane_areas
-            .chat
-            .unwrap_or(Rect::new(below_dock.x, below_dock.y, 0, 0));
-        (history_area, status_area, input_area)
-    } else {
-        // Schmale Terminals: das Agenten-Panel klappt zu einer Zeile über der
-        // Statuszeile zusammen (ab `AGENTS_SUMMARY_MIN_HEIGHT` Zeilen, darunter
-        // entfällt es ganz), damit der Chat seine Breite behält.
-        let agents_collapsed = app.panels.agents_visible
-            && !app.panels.maximized
-            && area.width < crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH;
-        let agents_summary = if agents_collapsed
-            && area.height >= crate::panes::AGENTS_SUMMARY_MIN_HEIGHT
-            && area.height > input_height + history_min + 2
-        {
-            crate::agent_monitor::render_collapsed_summary(
-                &app.agent_monitor,
-                area.width,
-                theme,
-                app.panels.focus == crate::panes::PaneFocus::Agents,
-            )
-        } else {
-            None
-        };
-        let summary_height = u16::from(agents_summary.is_some());
-
-        // Der Block darf den Verlauf nie ganz verdrängen.
-        let queue_height = (queue_lines.len() as u16).min(
-            area.height
-                .saturating_sub(input_height + summary_height + 4),
-        );
-
-        // History | Warteschlange | permanente Statuszeile | Eingabe. Der
-        // Sicherheitsmodus muss sichtbar bleiben und darf nicht vom Verlauf
-        // verdrängt werden.
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(history_min),
-                Constraint::Length(queue_height),
-                Constraint::Length(summary_height),
-                Constraint::Length(status_rows),
-                Constraint::Length(input_height),
-            ])
-            .split(area);
-        let queue_area = chunks[1];
-        let summary_area = chunks[2];
-        let status_area = chunks[3];
-        let input_area = chunks[4];
-        if let Some(summary) = agents_summary {
-            frame.render_widget(Paragraph::new(summary), summary_area);
-        }
-        if queue_height > 0 {
-            frame.render_widget(
-                Paragraph::new(queue_lines).style(Style::default().fg(style::border_color(theme))),
-                queue_area,
-            );
-        }
-        // Seitenpanels (Explorer links, Agenten rechts) teilen sich die obere
-        // Fläche mit dem Verlauf; auf schmalen Terminals bleibt nur der Chat.
-        let pane_areas = crate::panes::split(chunks[0], &app.panels);
-        let history_area_for_regions =
-            pane_areas
-                .chat
-                .unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
-        app.last_regions.set(scroll_routing::FrameRegions {
-            agents: pane_areas.agents,
-            dialog: dialog_open.then_some(input_area),
-            plan: app
-                .plan_ui
-                .covers_history()
-                .then_some(history_area_for_regions),
-        });
-        if let Some(agents_area) = pane_areas.agents {
-            if let Some(detail) = app.agent_detail.as_ref() {
-                if detail.job.is_some() {
-                    // Plan R9, Teil F: Job-Detailansicht (Kopf und Log-Ende).
-                    crate::jobs_panel::render_job_detail(
-                        detail.job_view.as_ref(),
-                        agents_area,
-                        frame.buffer_mut(),
-                        &detail.scroll,
-                        theme,
-                    );
-                } else {
-                    app.agent_monitor.render_agent_detail(
-                        &detail.agent,
-                        agents_area,
-                        frame.buffer_mut(),
-                        &detail.scroll,
-                        detail.show_reasoning,
-                    );
-                }
-            } else {
-                crate::agent_monitor::render_agents_panel(
-                    &app.agent_monitor,
-                    agents_area,
-                    frame.buffer_mut(),
-                    theme,
-                    app.panels.focus == crate::panes::PaneFocus::Agents,
-                );
-            }
-        }
-        if let Some(explorer_area) = pane_areas.explorer {
-            render_explorer_panel(app, explorer_area, frame.buffer_mut(), theme);
-        }
-        if let Some(workbench_area) = pane_areas.workbench {
-            app.workbench.render(
-                workbench_area,
-                frame.buffer_mut(),
-                theme,
-                app.panels.focus == crate::panes::PaneFocus::Workbench,
-            );
-        }
-        let history_area = pane_areas
-            .chat
-            .unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
-        (history_area, status_area, input_area)
-    };
+    // PL-97 C2: Fenster, Warteschlange und Seitenpanels (`app/render.rs`);
+    // danach folgen Statuszeile, Verlauf und Composer.
+    let body = render::compose_body(
+        frame,
+        app,
+        queue_lines,
+        render::BodyRows {
+            status_rows,
+            input_height,
+            history_min,
+            dialog_open,
+        },
+    );
+    let (history_area, status_area, input_area) = (body.history, body.status, body.input);
 
     let permission = match app.current_permission_stage() {
         PermissionCycleStage::Ask => "Ask",
@@ -10370,7 +10698,19 @@ fn render_viewport(
     // `quit_hint` (z. B. "Ctrl+C"/"Ctrl+D") signalisiert die Scharfstellung
     // des zweistufigen Beenden-Hinweises (`QuitArm`) und wurde bisher
     // stillschweigend verworfen.
+    //
+    // PL-97 C4b: läuft ein Turn oder ein Job, beendet der zweite Ctrl+C nicht
+    // nur die App, sondern sofort alle KI-Arbeit samt Jobs und Prozessen
+    // (Not-Aus, siehe [`crate::hard_kill`]) — das soll der Hinweis auch sagen.
+    // Dieselbe Bedingung geht an den Not-Aus-Detektor im Eingabe-Thread: er
+    // löst nur aus, wenn dieser Hinweis den Not-Aus ankündigen würde; im
+    // Leerlauf bleibt 2× Ctrl+C das normale Beenden.
+    let work_running = app.active_cancel.is_some() || jobs_glue::has_running(app);
+    crate::hard_kill::publish_work_running(work_running);
     let quit_suffix = match quit_hint {
+        Some(label) if label == "Ctrl+C" && work_running => {
+            format!(" · nochmal {label}: alles sofort beenden")
+        }
         Some(label) => format!(" · nochmal {label} zum Beenden"),
         None => String::new(),
     };
@@ -10386,7 +10726,21 @@ fn render_viewport(
         ""
     };
     // Kontexthinweis für das fokussierte Agenten-Panel.
-    let agents_hint = if app.panels.focus == crate::panes::PaneFocus::Agents {
+    let agents_hint = if matches!(
+        app.panels.focus,
+        crate::panes::PaneFocus::Jobs | crate::panes::PaneFocus::Finished
+    ) && app.agent_detail.is_none()
+    {
+        // PL-97 C2: Hinweise der Mission-Fenster.
+        if app.panels.focus == crate::panes::PaneFocus::Jobs {
+            " · Jobs · Enter: Details · j/k wählen · Esc: Chat".to_owned()
+        } else {
+            " · Finished/Failed · Enter/f: auf-/zuklappen · c: Fehler quittieren".to_owned()
+        }
+    } else if matches!(
+        app.panels.focus,
+        crate::panes::PaneFocus::Agents | crate::panes::PaneFocus::Jobs
+    ) {
         match app.agent_detail.as_ref() {
             Some(detail) if detail.job.is_some() => {
                 " · Job-Log · Esc: Liste | j/k/Bild↑↓: scrollen | g/G: Anfang/Ende".to_owned()
@@ -10487,6 +10841,8 @@ fn render_viewport(
         Seg::new(20, vec![context_suffix, context_short, String::new()]),
         Seg::optional(60, agents_suffix),
         Seg::optional(30, explorer_suffix),
+        // PL-97 C3: eingeschaltete Werkbank ohne Platz in dieser Lage.
+        Seg::optional(25, body.workbench_hint),
         Seg::optional(240, cancel_suffix),
         Seg::optional(230, queue_cleared_suffix),
         Seg::optional(250, quit_suffix),
@@ -10551,8 +10907,14 @@ fn render_viewport(
         status_area.width
     };
     let goal_spans = app.goal_status_spans(theme, goal_budget);
+    let dod_spans = app.dod_mark.visible().map(|mark| {
+        let (full, short) = status_line::dod_mark_text(&mark.count_text(), mark.verified);
+        let style = crate::dod_view::mark_style(mark, theme);
+        (Span::styled(full, style), Span::styled(short, style))
+    });
     let (mut marks, marks_width) = status_mark_spans(
         host_span,
+        dod_spans,
         plan_spans,
         goal_spans,
         usize::from(status_area.width),
@@ -10577,16 +10939,28 @@ fn render_viewport(
     }
 
     // ── History ──────────────────────────────────────────────────────
-    // Alle Zellen zu einem flachen Zeilen-Vec zusammenführen.
+    // Alle Zellen zu einem flachen Zeilen-Vec zusammenführen. PL-97 C5: die
+    // kanonischen Zellen unverändert, dazwischen die virtuellen Live-Zellen
+    // der Hintergrund-Läufe (`app/live_slots.rs`).
     let width = history_area.width;
-    let mut all_lines: Vec<Line<'static>> = app
-        .cells
-        .iter()
-        .flat_map(|cell| cell.display_lines(width, theme))
+    let live_projection = app.live_slot_projection(Instant::now(), history_area.height);
+    let segments = app.history_segments(&live_projection, width, theme, history_area.height);
+    // Identitätsanker nur beim Hochscrollen (die Messung kostet einen Umbruch
+    // je Segment).
+    let geometry = (!app.scroll.is_following())
+        .then(|| live_slots::SegmentGeometry::measure(&segments, width));
+    let mut all_lines: Vec<Line<'static>> = segments
+        .into_iter()
+        .flat_map(|segment| segment.lines)
         .collect();
     // Transient: live gestreamtes Reasoning/Text der laufenden Runde.
     if !app.live_reasoning.is_empty() {
-        all_lines.extend(live_reasoning_lines(&app.live_reasoning, width, theme));
+        all_lines.extend(live_reasoning_lines(
+            &app.live_reasoning,
+            width,
+            theme,
+            app.reasoning_mode,
+        ));
     }
     if !app.live_stream.is_empty() {
         for (index, text) in app.live_stream.lines().enumerate() {
@@ -10620,6 +10994,15 @@ fn render_viewport(
     let back = app
         .scroll
         .sync_layout(usize::from(total_lines), usize::from(visible_rows), width);
+    let back = match geometry.as_ref() {
+        Some(geometry) => app.scroll.sync_anchor(
+            usize::from(total_lines),
+            usize::from(visible_rows),
+            |anchor| geometry.resolve(anchor),
+            |top| geometry.locate(top),
+        ),
+        None => back,
+    };
     let scroll_from_top: u16 = if total_lines > visible_rows {
         let max_offset = total_lines - visible_rows;
         // Offset zählt vom Ende → in „von oben" umrechnen.
@@ -10655,31 +11038,54 @@ fn render_viewport(
             indicator_area,
         );
     }
+    // PL-97 C5: eingefrorene Live-Reihenfolge — was seitdem passierte, eine
+    // Zeile über dem Hinweis.
+    if let Some(text) = live_slots::new_activity_label(live_projection.new_activity)
+        && history_area.height > 1
+    {
+        let label = format!(" {text} ");
+        let label_width = u16::try_from(label.chars().count())
+            .unwrap_or(u16::MAX)
+            .min(history_area.width);
+        let activity_area = Rect {
+            x: history_area.x + history_area.width - label_width,
+            y: history_area.y + history_area.height - 2,
+            width: label_width,
+            height: 1,
+        };
+        frame.render_widget(Clear, activity_area);
+        frame.render_widget(
+            Paragraph::new(label).style(
+                Style::default()
+                    .fg(style::accent_color(theme))
+                    .add_modifier(Modifier::REVERSED),
+            ),
+            activity_area,
+        );
+    }
 
     // Popup überlagert den unteren Teil des History-Bereichs (falls offen).
     let popup_open = app
         .command_popup
         .as_ref()
         .is_some_and(|popup| !popup.is_empty());
-    if popup_open {
-        if let Some(popup) = app.command_popup.as_ref() {
-            let popup_height = popup
-                .preferred_height(POPUP_MAX_ROWS)
-                .min(history_area.height);
-            if popup_height > 0 {
-                let popup_area = Rect::new(
-                    history_area.x,
-                    history_area.y + history_area.height - popup_height,
-                    history_area.width,
-                    popup_height,
-                );
-                // Ohne `Clear` bleibt der Chat-Text unter dem Popup
-                // stehen: die Zellen, die das Popup nicht selbst
-                // überschreibt, behalten ihren alten Inhalt, und beide
-                // Texte lesen sich ineinander verschachtelt.
-                frame.render_widget(Clear, popup_area);
-                popup.render(popup_area, frame.buffer_mut(), theme);
-            }
+    if popup_open && let Some(popup) = app.command_popup.as_ref() {
+        let popup_height = popup
+            .preferred_height(POPUP_MAX_ROWS)
+            .min(history_area.height);
+        if popup_height > 0 {
+            let popup_area = Rect::new(
+                history_area.x,
+                history_area.y + history_area.height - popup_height,
+                history_area.width,
+                popup_height,
+            );
+            // Ohne `Clear` bleibt der Chat-Text unter dem Popup
+            // stehen: die Zellen, die das Popup nicht selbst
+            // überschreibt, behalten ihren alten Inhalt, und beide
+            // Texte lesen sich ineinander verschachtelt.
+            frame.render_widget(Clear, popup_area);
+            popup.render(popup_area, frame.buffer_mut(), theme);
         }
     }
 
@@ -10889,6 +11295,7 @@ impl From<ContextProviderRegistrationError> for TuiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mission::tests::screen_row;
     use crate::test_support::{TestError, TestResult, ctx};
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -11196,41 +11603,348 @@ mod tests {
     }
 
     /// Runde 5: Ctrl+O wirkt auch während eines laufenden Turns sofort und
-    /// landet nicht im Composer bzw. in der Busy-Queue.
+    /// landet nicht im Composer bzw. in der Busy-Queue. PL-97 R1: in der
+    /// Vorgabe `message` startet die Reasoning-Zelle ausgeklappt, Ctrl+O
+    /// klappt sie ein.
     #[test]
     fn toggle_tool_cells_works_while_busy() -> TestResult {
         let mut app = test_chat_app()?;
         app.push_reasoning_cell("erste Zeile\nzweite Zeile".to_owned(), None);
-        assert!(app.has_collapsed_tool_cells());
+        assert!(
+            !app.has_collapsed_tool_cells(),
+            "`message` startet ausgeklappt"
+        );
         let ctrl_o = TuiEvent::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(matches!(
             handle_busy_event(&mut app, ctrl_o),
             BusyKeyOutcome::Redraw
         ));
-        assert!(!app.has_collapsed_tool_cells());
+        assert!(app.has_collapsed_tool_cells());
         assert!(app.input.text().is_empty(), "Ctrl+O darf nichts eintippen");
         Ok(())
     }
 
-    /// Ctrl+O klappt auch Reasoning-Zellen auf und zu.
+    /// Ctrl+O klappt auch Reasoning-Zellen zu und wieder auf (Vorgabe
+    /// `message`: ausgeklappt → eingeklappt → ausgeklappt).
     #[test]
     fn toggle_tool_cells_expands_reasoning_cells() -> TestResult {
         let mut app = test_chat_app()?;
         app.push_reasoning_cell("erste Zeile\nzweite Zeile".to_owned(), None);
+        assert!(!app.has_collapsed_tool_cells());
+        assert!(app.toggle_tool_cells());
         assert!(app.has_collapsed_tool_cells());
         assert!(app.toggle_tool_cells());
         assert!(!app.has_collapsed_tool_cells());
         Ok(())
     }
 
-    /// Live-Reasoning zeigt höchstens drei umbrochene Zeilen, die neuesten.
+    /// Testhilfe: die Zeilen des Verlaufs als Strings (PL-97 R1).
+    fn history_strings(app: &ChatApp, width: u16) -> Vec<String> {
+        app.cells
+            .iter()
+            .flat_map(|cell| cell.display_lines(width, style::Theme::Dark))
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// PL-97 R1 (`message`): die Zelle startet ausgeklappt mit Kopfzeile und
+    /// Markdown-Körper; Ctrl+O reduziert sie auf Kopfzeile + erste Zeile +
+    /// Hinweis und ein zweites Ctrl+O klappt sie wieder aus.
+    #[test]
+    fn reasoning_message_mode_starts_expanded_and_ctrl_o_collapses() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.push_reasoning_cell("Erste Zeile\n\nZweite Zeile\nDritte Zeile".to_owned(), None);
+        let expanded = history_strings(&app, 80);
+        assert_eq!(
+            expanded,
+            vec![
+                "∴ Reasoning".to_owned(),
+                "│ Erste Zeile".to_owned(),
+                "│ ".to_owned(),
+                "│ Zweite Zeile".to_owned(),
+                "│ Dritte Zeile".to_owned(),
+            ]
+        );
+        assert!(app.toggle_tool_cells());
+        assert_eq!(
+            history_strings(&app, 80),
+            vec![
+                "∴ Reasoning".to_owned(),
+                "│ Erste Zeile".to_owned(),
+                "│ … (4 Zeilen · Ctrl+O)".to_owned(),
+            ]
+        );
+        assert!(app.toggle_tool_cells());
+        assert_eq!(history_strings(&app, 80), expanded);
+        Ok(())
+    }
+
+    /// PL-97 R1 (`collapsed`): die Zelle startet eingeklappt, nutzt aber
+    /// ausgeklappt denselben Renderer.
+    #[test]
+    fn reasoning_collapsed_mode_starts_collapsed() -> TestResult {
+        let mut app = test_chat_app()?.with_reasoning_mode(ReasoningDisplayMode::Collapsed);
+        app.push_reasoning_cell("- erstens\n- zweitens".to_owned(), None);
+        assert!(app.has_collapsed_tool_cells());
+        assert_eq!(
+            history_strings(&app, 80),
+            vec![
+                "∴ Reasoning".to_owned(),
+                "│ • erstens".to_owned(),
+                "│ … (2 Zeilen · Ctrl+O)".to_owned(),
+            ]
+        );
+        assert!(app.toggle_tool_cells());
+        assert_eq!(
+            history_strings(&app, 80),
+            vec![
+                "∴ Reasoning".to_owned(),
+                "│ • erstens".to_owned(),
+                "│ • zweitens".to_owned(),
+            ]
+        );
+        Ok(())
+    }
+
+    /// PL-97 R1: `summary_text` aus reinem Leerraum (nach dem `"\n\n"`-Join
+    /// also etwa `"\n\n"`) ergibt weder Zelle noch Export-Eintrag — wie in
+    /// `hydrate_visible_history`.
+    #[test]
+    fn reasoning_whitespace_only_summary_pushes_nothing() -> TestResult {
+        use harw_protocol::items::ReasoningItem;
+        use harw_types::{ItemId, TurnId};
+
+        let mut app = test_chat_app()?;
+        let mut state = TurnEventState::default();
+        let cells_before = app.cells_len();
+        let exports_before = app.export_entries.len();
+        let handled = handle_turn_event(
+            &mut app,
+            &mut state,
+            TurnEvent::ItemAdded {
+                turn_id: TurnId::new(),
+                item: TurnItem::Reasoning(ReasoningItem {
+                    id: ItemId::new(),
+                    summary_text: vec![String::new(), " ".to_owned()],
+                    raw_content: Vec::new(),
+                }),
+            },
+        );
+        assert!(!handled);
+        assert_eq!(app.cells_len(), cells_before);
+        assert_eq!(app.export_entries.len(), exports_before);
+        Ok(())
+    }
+
+    /// PL-97 R1 (`hidden`): `ItemAdded(Reasoning)` schiebt keine Zelle in den
+    /// Verlauf, zeichnet den Export-Eintrag aber weiterhin auf — mit den
+    /// `summary_text`-Einträgen als Absätze.
+    #[test]
+    fn reasoning_hidden_mode_pushes_no_cell_but_records_export() -> TestResult {
+        use harw_protocol::items::ReasoningItem;
+        use harw_types::{ItemId, TurnId};
+
+        let mut app = test_chat_app()?.with_reasoning_mode(ReasoningDisplayMode::Hidden);
+        let mut state = TurnEventState::default();
+        let before = app.cells_len();
+        let handled = handle_turn_event(
+            &mut app,
+            &mut state,
+            TurnEvent::ItemAdded {
+                turn_id: TurnId::new(),
+                item: TurnItem::Reasoning(ReasoningItem {
+                    id: ItemId::new(),
+                    summary_text: vec!["erster Absatz".to_owned(), "zweiter Absatz".to_owned()],
+                    raw_content: Vec::new(),
+                }),
+            },
+        );
+        assert!(handled);
+        assert_eq!(app.cells_len(), before, "hidden: keine Verlaufszelle");
+        assert!(app.tool_cells.is_empty());
+        assert_eq!(
+            app.export_entries.last(),
+            Some(&ExportEntry::Reasoning(
+                "erster Absatz\n\nzweiter Absatz".to_owned()
+            ))
+        );
+        assert!(
+            live_reasoning_lines("x", 80, style::Theme::Dark, ReasoningDisplayMode::Hidden)
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// PL-97 R1 (PR #154, P2): Ende-zu-Ende je Modus — `ReasoningDelta` und
+    /// `ItemAdded(Reasoning)` laufen durch den echten Event-Handler, der
+    /// Bildschirm wird über `render_viewport` gezeichnet. `message` zeigt
+    /// Live-Kopfzeile und ausgeklappten Block, `collapsed` die gedimmte
+    /// Dreizeilen-Vorschau und den eingeklappten Block, `hidden` nichts —
+    /// der Export-Eintrag bleibt in allen drei Modi erhalten.
+    #[test]
+    fn reasoning_modes_end_to_end_through_event_handler() -> TestResult {
+        use harw_protocol::items::ReasoningItem;
+        use harw_types::{ItemId, TurnId};
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40))
+            .map_err(ctx("test terminal"))?;
+        let mut screen = |app: &ChatApp| -> TestResult<String> {
+            terminal
+                .draw(|frame| render_viewport(frame, app, &Spinner::new(), None))
+                .map_err(ctx("draw"))?;
+            let buffer = terminal.backend().buffer();
+            Ok((0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        };
+
+        let mut results = Vec::new();
+        for mode in [
+            ReasoningDisplayMode::Message,
+            ReasoningDisplayMode::Collapsed,
+            ReasoningDisplayMode::Hidden,
+        ] {
+            let mut app = test_chat_app()?.with_reasoning_mode(mode);
+            let mut state = TurnEventState::default();
+            let turn_id = TurnId::new();
+            assert!(handle_turn_event(
+                &mut app,
+                &mut state,
+                TurnEvent::ReasoningDelta {
+                    turn_id: turn_id.clone(),
+                    text: "Liveabsatz eins\n\nLiveabsatz zwei".to_owned(),
+                },
+            ));
+            let live = screen(&app)?;
+            // Dieselbe Live-Projektion, die `render_viewport` an den Verlauf hängt.
+            let live_history: Vec<String> = live_reasoning_lines(
+                &app.live_reasoning,
+                80,
+                style::Theme::Dark,
+                app.reasoning_mode,
+            )
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+            assert!(handle_turn_event(
+                &mut app,
+                &mut state,
+                TurnEvent::ItemAdded {
+                    turn_id,
+                    item: TurnItem::Reasoning(ReasoningItem {
+                        id: ItemId::new(),
+                        summary_text: vec![
+                            "Erster Absatz".to_owned(),
+                            "- Punkt eins\n- Punkt zwei".to_owned(),
+                        ],
+                        raw_content: Vec::new(),
+                    }),
+                },
+            ));
+            assert_eq!(
+                app.export_entries.last(),
+                Some(&ExportEntry::Reasoning(
+                    "Erster Absatz\n\n- Punkt eins\n- Punkt zwei".to_owned()
+                )),
+                "{mode:?}: Export-Eintrag fehlt"
+            );
+            // Der echte Übergang: ItemAdded ersetzt die Live-Vorschau.
+            assert!(app.live_reasoning.is_empty(), "{mode:?}");
+            let after = screen(&app)?;
+            assert!(!after.contains("∴ Reasoning …"), "{mode:?}: {after}");
+            let headers = after.matches("∴ Reasoning").count();
+            let expected_headers = usize::from(mode != ReasoningDisplayMode::Hidden);
+            assert_eq!(headers, expected_headers, "{mode:?}: {after}");
+            results.push((mode, live, live_history, history_strings(&app, 80)));
+        }
+
+        for (mode, live, live_history, history) in &results {
+            match mode {
+                ReasoningDisplayMode::Message => {
+                    assert!(live.contains("∴ Reasoning …"), "{live}");
+                    assert!(live.contains("│ Liveabsatz eins"), "{live}");
+                    assert!(live.contains("│ Liveabsatz zwei"), "{live}");
+                    assert_eq!(
+                        live_history,
+                        &vec![
+                            "∴ Reasoning …".to_owned(),
+                            "│ Liveabsatz eins".to_owned(),
+                            "│ ".to_owned(),
+                            "│ Liveabsatz zwei".to_owned(),
+                        ]
+                    );
+                    assert_eq!(
+                        history,
+                        &vec![
+                            "∴ Reasoning".to_owned(),
+                            "│ Erster Absatz".to_owned(),
+                            "│ ".to_owned(),
+                            "│ • Punkt eins".to_owned(),
+                            "│ • Punkt zwei".to_owned(),
+                        ]
+                    );
+                }
+                ReasoningDisplayMode::Collapsed => {
+                    assert!(!live.contains("∴ Reasoning …"), "{live}");
+                    assert_eq!(
+                        live_history,
+                        &vec!["  ∴ Liveabsatz eins Liveabsatz zwei".to_owned()]
+                    );
+                    assert_eq!(
+                        history,
+                        &vec![
+                            "∴ Reasoning".to_owned(),
+                            "│ Erster Absatz".to_owned(),
+                            "│ … (4 Zeilen · Ctrl+O)".to_owned(),
+                        ]
+                    );
+                }
+                ReasoningDisplayMode::Hidden => {
+                    // Der Agenten-Monitor spiegelt den Live-Strom weiterhin
+                    // (bewusst unverändert); der Verlauf zeigt nichts davon.
+                    assert!(!live.contains("∴ Reasoning"), "{live}");
+                    assert!(live_history.is_empty(), "{live_history:?}");
+                    assert!(
+                        !history.iter().any(|line| line.contains("Reasoning")
+                            || line.contains("Absatz")
+                            || line.contains("Punkt")),
+                        "{history:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Live-Reasoning in `collapsed` zeigt höchstens drei umbrochene Zeilen,
+    /// die neuesten.
     #[test]
     fn live_reasoning_shows_last_three_wrapped_lines() {
         let text = (0..40)
             .map(|index| format!("wort{index}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let lines = live_reasoning_lines(&text, 24, style::Theme::Dark);
+        let lines = live_reasoning_lines(
+            &text,
+            24,
+            style::Theme::Dark,
+            ReasoningDisplayMode::Collapsed,
+        );
         assert_eq!(lines.len(), 3);
         let rendered: Vec<String> = lines
             .iter()
@@ -11243,6 +11957,65 @@ mod tests {
             .collect();
         assert!(rendered[0].starts_with("  ∴ "));
         assert!(rendered[2].contains("wort39"));
+    }
+
+    /// PL-97 R1: Live-Reasoning in `message` zeigt die Kopfzeile
+    /// `∴ Reasoning …` plus höchstens acht umbrochene Zeilen (die neuesten),
+    /// Absatzgrenzen bleiben als Leerzeile erhalten; Breite 24 ohne Panik.
+    #[test]
+    fn live_reasoning_message_mode_shows_header_and_eight_lines() {
+        let text = (0..40)
+            .map(|index| format!("wort{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lines =
+            live_reasoning_lines(&text, 24, style::Theme::Dark, ReasoningDisplayMode::Message);
+        assert_eq!(lines.len(), 1 + LIVE_REASONING_MESSAGE_MAX_LINES);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rendered[0], "∴ Reasoning …");
+        assert!(rendered[1].starts_with("│ "));
+        assert!(rendered[8].contains("wort39"));
+
+        let short = live_reasoning_lines(
+            "a\n\nb",
+            24,
+            style::Theme::Dark,
+            ReasoningDisplayMode::Message,
+        );
+        let short: Vec<String> = short
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            short,
+            vec![
+                "∴ Reasoning …".to_owned(),
+                "│ a".to_owned(),
+                "│ ".to_owned(),
+                "│ b".to_owned(),
+            ]
+        );
+        for width in [0u16, 1, 3, 24] {
+            let _ = live_reasoning_lines(
+                &text,
+                width,
+                style::Theme::Dark,
+                ReasoningDisplayMode::Message,
+            );
+        }
     }
 
     /// Baut einen Session-Store-Sidecar mit festem `created_at`/`last_opened_at`
@@ -12073,6 +12846,46 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    /// PL-97 C4b: die Statuszeile nennt nach dem ersten Ctrl+C die
+    /// tatsächliche Wirkung — während eines Turns beendet der zweite Druck
+    /// alles sofort (Not-Aus), im Leerlauf ohne Jobs nur die App.
+    #[test]
+    fn armed_ctrl_c_hint_names_the_hard_kill_only_while_work_runs() -> TestResult {
+        let mut app = test_chat_app()?;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 20))
+            .map_err(ctx("test terminal"))?;
+        let mut screen = |app: &ChatApp, hint: Option<&str>| -> TestResult<String> {
+            terminal
+                .draw(|frame| render_viewport(frame, app, &Spinner::new(), hint))
+                .map_err(ctx("draw"))?;
+            let buffer = terminal.backend().buffer();
+            Ok((0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        };
+
+        let idle = screen(&app, Some("Ctrl+C"))?;
+        assert!(idle.contains("nochmal Ctrl+C zum Beenden"), "{idle}");
+        assert!(!idle.contains("alles sofort beenden"), "{idle}");
+
+        app.active_cancel = Some(CancelToken::new());
+        let busy = screen(&app, Some("Ctrl+C"))?;
+        assert!(
+            busy.contains("nochmal Ctrl+C: alles sofort beenden"),
+            "{busy}"
+        );
+
+        // Ctrl+D kennt keinen Not-Aus: sein Hinweis bleibt auch im Turn gleich.
+        let ctrl_d = screen(&app, Some("Ctrl+D"))?;
+        assert!(ctrl_d.contains("nochmal Ctrl+D zum Beenden"), "{ctrl_d}");
         Ok(())
     }
 
@@ -14893,6 +15706,7 @@ forbidden = [{forbidden}]
             ] {
                 let (spans, used) = status_mark_spans(
                     Some(Span::raw(host_text(width))),
+                    None,
                     with_plan.then(plan),
                     if with_goal { goal() } else { Vec::new() },
                     usize::from(width),
@@ -14920,6 +15734,237 @@ forbidden = [{forbidden}]
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// PL-97 D5: die DoD-Marke steht direkt hinter der Host-Warnung und
+    /// überlebt 40, 45 und 55 Spalten (notfalls in Kurzform), auch neben
+    /// Plan- und Goal-Marke; die Host-Warnung bleibt vollständig.
+    #[test]
+    fn dod_mark_survives_narrow_widths_after_the_host_warning() -> TestResult {
+        let theme = crate::style::Theme::Dark;
+        let dod = || {
+            let (full, short) = status_line::dod_mark_text("≥ 12", false);
+            (Span::raw(full), Span::raw(short))
+        };
+        let plan = || {
+            let full = crate::plan_dialog::plan_status_span(theme);
+            let short = Span::styled(PLAN_MARK_SHORT, full.style);
+            (full, short)
+        };
+        let goal = || {
+            vec![Span::raw(
+                " ◎ Goal: Auf aktueller dev-Basis einen sicheren Reviewer bauen · 1/5 ",
+            )]
+        };
+        for width in [40u16, 45, 55] {
+            let host = if width < STATUS_HOST_HINT_MIN_COLS {
+                HOST_MODE_MARK_SHORT
+            } else {
+                HOST_MODE_MARK
+            };
+            for (with_plan, with_goal) in [(false, false), (true, false), (true, true)] {
+                let (spans, used) = status_mark_spans(
+                    Some(Span::raw(host)),
+                    Some(dod()),
+                    with_plan.then(plan),
+                    if with_goal { goal() } else { Vec::new() },
+                    usize::from(width),
+                );
+                assert!(used <= usize::from(width), "{width}: {used}");
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1))
+                        .map_err(ctx("test terminal"))?;
+                terminal
+                    .draw(|frame| {
+                        frame
+                            .render_widget(Paragraph::new(Line::from(spans.clone())), frame.area());
+                    })
+                    .map_err(ctx("draw"))?;
+                let buffer = terminal.backend().buffer();
+                let row: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+                assert!(row.contains("HOST-MODUS AKTIV"), "{width}: {row:?}");
+                let after_host = row
+                    .split_once("HOST-MODUS AKTIV")
+                    .map_or("", |(_, rest)| rest);
+                assert!(
+                    after_host.contains("⛨ ≥ 12"),
+                    "{width} plan={with_plan} goal={with_goal}: DoD mark lost: {row:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// PL-97 D5: Vorrang in der Markenzeile (`status_mark_spans`, ersetzt
+    /// das `fit_segments`-Segment): wird es eng, fällt zuerst das Goal, dann
+    /// kürzt bzw. fällt die Plan-Marke, die DoD-Marke behält mindestens ihre
+    /// Kurzform; die Host-Warnung bleibt immer vollständig.
+    #[test]
+    fn status_mark_spans_cut_goal_then_plan_before_the_dod_mark() {
+        let theme = crate::style::Theme::Dark;
+        let (dod_full, dod_short) = status_line::dod_mark_text("3", true);
+        let plan_full = crate::plan_dialog::plan_status_span(theme);
+        let plan_short = Span::styled(PLAN_MARK_SHORT, plan_full.style);
+        let goal = " ◎ Goal: Auf aktueller dev-Basis einen sicheren Reviewer bauen · 1/5 ";
+        let host = HOST_MODE_MARK_SHORT;
+        let w = |text: &str| status_line::display_width(text);
+        let (hw, dfw, dsw) = (w(host), w(&dod_full), w(&dod_short));
+        let (pfw, psw) = (plan_full.width(), plan_short.width());
+        assert!(psw > 0 && psw < pfw && dsw < dfw);
+        let row = |width: usize| {
+            let (spans, used) = status_mark_spans(
+                Some(Span::raw(host)),
+                Some((Span::raw(dod_full.clone()), Span::raw(dod_short.clone()))),
+                Some((plan_full.clone(), plan_short.clone())),
+                vec![Span::raw(goal)],
+                width,
+            );
+            assert!(used <= width, "{width}: {used}");
+            let texts: Vec<String> = spans.iter().map(|span| span.content.to_string()).collect();
+            texts
+        };
+        let plan_full_text = plan_full.content.to_string();
+        // Alles passt bis auf das Goal: es wird gekürzt, nichts sonst.
+        let texts = row(hw + dfw + pfw + 5);
+        assert_eq!(
+            texts[..3],
+            [host.to_owned(), dod_full.clone(), plan_full_text.clone()]
+        );
+        assert_eq!(texts.len(), 4, "{texts:?}");
+        assert!(w(&texts[3]) <= 5 && texts[3] != goal, "{texts:?}");
+        // Kein Platz fürs Goal und die volle Plan-Marke: Plan in Kurzform.
+        let texts = row(hw + dfw + psw);
+        assert_eq!(
+            texts,
+            [
+                host.to_owned(),
+                dod_full.clone(),
+                PLAN_MARK_SHORT.to_owned()
+            ]
+        );
+        // Noch enger: die Plan-Marke fällt (der Rest bleibt dem gekürzten
+        // Goal), die DoD-Marke bleibt voll.
+        let texts = row(hw + dfw + psw - 1);
+        assert_eq!(texts[..2], [host.to_owned(), dod_full.clone()]);
+        assert!(!texts.iter().any(|text| text.contains("plan")), "{texts:?}");
+        // Am engsten: die DoD-Marke in Kurzform.
+        let texts = row(hw + dsw);
+        assert_eq!(texts, [host.to_owned(), dod_short.clone()]);
+    }
+
+    /// PL-97 D5: ohne installiertes Harw-DoD (oder mit unlesbarem Export)
+    /// bleibt die Marke weg; mit hohen Befunden steht sie in der Statuszeile
+    /// und im Titel des Finished-/Failed-Fensters.
+    #[test]
+    fn dod_mark_is_hidden_when_dod_is_not_installed() -> TestResult {
+        let mut app = test_chat_app()?;
+        let ok = |data: serde_json::Value| -> Result<OpOutput, String> {
+            Ok(OpOutput {
+                text: String::new(),
+                data: Some(data),
+            })
+        };
+        let draw = |app: &ChatApp| -> TestResult<String> {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30))
+                .map_err(ctx("test terminal"))?;
+            terminal
+                .draw(|frame| render_viewport(frame, app, &Spinner::new(), None))
+                .map_err(ctx("draw"))?;
+            Ok(crate::overlay_view::buffer_text(
+                terminal.backend().buffer(),
+            ))
+        };
+        let mut not_installed = crate::dod_view::tests::status_fixture(4, true);
+        not_installed["installed"] = serde_json::json!(false);
+        not_installed["attention"] = serde_json::Value::Null;
+        app.dod_mark.apply(&ok(not_installed));
+        assert_eq!(app.dod_mark.visible(), None);
+        assert!(!draw(&app)?.contains('⛨'));
+        app.dod_mark
+            .apply(&Err("Unbekannter Command: /dod".to_owned()));
+        assert!(!draw(&app)?.contains('⛨'));
+
+        assert!(
+            app.dod_mark
+                .apply(&ok(crate::dod_view::tests::status_fixture(4, true)))
+        );
+        let shown = draw(&app)?;
+        assert!(shown.contains("⛨ 4 high"), "{shown}");
+        Ok(())
+    }
+
+    /// PL-97 D5: `/dod view` öffnet die DoD-Ansicht, reiht ihre drei Abrufe
+    /// über den regulären Datenpfad ein und zeigt Units, Sensoren und Befunde
+    /// aus den Ergebnissen — nichts davon landet im Chat.
+    #[tokio::test]
+    async fn dod_view_command_opens_the_overlay_and_renders_fixture_data() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        let intercepted =
+            local_intercept_for(&app, "/dod view").ok_or(TestError::Missing("dod view"))?;
+        assert!(local_intercept_for(&app, "/dod status").is_none());
+        apply_local_intercept(&mut app, intercepted, &bus);
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+        let generation = app.overlay_generation;
+        let queued: Vec<String> = app
+            .pending_fetches
+            .iter()
+            .filter_map(|fetch| match fetch {
+                DataFetch::Overlay {
+                    command,
+                    generation: queued,
+                } if *queued == generation => Some(command.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            queued,
+            vec![
+                crate::dod_view::REFRESH_COMMAND.to_owned(),
+                crate::dod_view::SENSORS_COMMAND.to_owned(),
+                crate::dod_view::findings_command(),
+            ]
+        );
+        let cells = app.cells_len();
+        for data in [
+            crate::dod_view::tests::status_fixture(1, true),
+            crate::dod_view::tests::sensors_fixture(true),
+            crate::dod_view::tests::findings_fixture(false),
+        ] {
+            apply_fetch_result(
+                &mut app,
+                FetchTarget::Overlay { generation },
+                Ok(OpOutput {
+                    text: String::new(),
+                    data: Some(data),
+                }),
+            );
+        }
+        assert_eq!(
+            app.cells_len(),
+            cells,
+            "Datenabruf schreibt nie in den Chat"
+        );
+        let Some(Overlay::View(view)) = app.overlay.as_ref() else {
+            return Err(TestError::Missing("dod overlay"));
+        };
+        let area = Rect::new(0, 0, 110, 40);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        view.render(area, &mut buf, app.theme);
+        let text = crate::overlay_view::buffer_text(&buf);
+        for expected in [
+            "Harw-DoD",
+            "UNITS",
+            "harw-sentinel.service",
+            "SENSORS",
+            "tcp-connect",
+            "FINDINGS",
+            "UNVERIFIED source (home)",
+            "egress.unexpected",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
         }
         Ok(())
     }
@@ -15377,12 +16422,16 @@ forbidden = [{forbidden}]
         crate::jobs_panel::JobRow {
             id: "job-1".to_owned(),
             name: "build".to_owned(),
-            state: "läuft",
+            state: harw_tool_job::JobState::Running,
             progress: "13%".to_owned(),
             runtime: "1m15s".to_owned(),
             active: true,
             failed: false,
             reason: None,
+            origin: None,
+            cgroup: None,
+            ended_at: None,
+            child_link: crate::jobs_panel::ChildRunLink::NotAChild,
         }
     }
 
@@ -15420,7 +16469,16 @@ forbidden = [{forbidden}]
             dock.is_some_and(|dock| dock.y == 0 && dock.width == 45),
             "portrait dock expected at the top:\n{shown}"
         );
-        assert!(shown.contains("root-orchestrator"), "{shown}");
+        // PL-97 C2: die Rolle muss im Dock selbst stehen, nicht nur in der
+        // LIVE-Kopfzeile darunter.
+        let dock_height = dock.map_or(0, |dock| usize::from(dock.height));
+        assert!(
+            shown
+                .lines()
+                .take(dock_height)
+                .any(|row| row.contains("root-orchestrator")),
+            "{shown}"
+        );
         Ok(())
     }
 
@@ -15446,6 +16504,9 @@ forbidden = [{forbidden}]
     /// Mini-Live-Streifen mit den zwei letzten Agentenmeldungen — Kopfzeile
     /// plus zwei Körperzeilen, wie `chat_first` sie für diese Höhe vorsieht
     /// (neueste Meldung zuerst). Der Chat beginnt erst darunter.
+    /// PL-97 C2: der Streifen ist das LIVE-Fenster (`LIVE · <Rolle>`) unter
+    /// dem Finished/Failed-Streifen; ohne Spur des gewählten Agenten folgen
+    /// die Recency-Zeilen direkt auf die Kopfzeile.
     #[test]
     fn portrait_dock_shows_the_recency_slots_in_the_mini_live_strip_at_46x78() -> TestResult {
         let mut app = test_chat_app()?;
@@ -15468,15 +16529,15 @@ forbidden = [{forbidden}]
         let shown = rows.join("\n");
         let row_at = |index: usize| rows.get(index).map(String::as_str).unwrap_or_default();
 
-        let dock = app
+        let live = app
             .last_regions
             .get()
-            .agents
-            .ok_or(TestError::Missing("Portrait-Dock"))?;
-        let header = usize::from(dock.y + dock.height);
+            .live
+            .ok_or(TestError::Missing("LIVE-Streifen"))?;
+        let header = usize::from(live.y);
         assert!(
-            row_at(header).contains("Live"),
-            "Kopfzeile fehlt direkt unter dem Dock:\n{shown}"
+            row_at(header).contains("LIVE · uia-worker"),
+            "Kopfzeile fehlt unter Dock und Finished-Streifen:\n{shown}"
         );
         assert!(
             row_at(header + 1).contains("1 neu: zweite Meldung"),
@@ -15541,33 +16602,35 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
-    /// Ohne Agentenmeldungen gibt es keinen Streifen: Dock und Chat liegen wie
-    /// vor der Einbindung direkt aufeinander.
+    /// Ohne Agentenmeldungen und ohne sichtbare Spur erfindet LIVE nichts:
+    /// PL-97 C2 (W02) zeigt nur die Kopfzeile mit „no visible events yet“,
+    /// der Chat folgt direkt darunter.
     #[test]
-    fn portrait_dock_without_recency_has_no_mini_live_strip() -> TestResult {
+    fn portrait_dock_without_recency_shows_an_honest_live_header() -> TestResult {
         let mut app = test_chat_app()?;
         dock_test_running_agent(&mut app, "w1", "uia-worker");
         let rows = rendered_rows(&app, 46, 78)?;
-        let dock = app
-            .last_regions
-            .get()
-            .agents
-            .ok_or(TestError::Missing("Portrait-Dock"))?;
-        let below_dock = rows
-            .get(usize::from(dock.y + dock.height))
-            .ok_or(TestError::Missing("Zeile unter dem Dock"))?;
+        let regions = app.last_regions.get();
+        let live = regions.live.ok_or(TestError::Missing("LIVE-Streifen"))?;
+        assert_eq!(live.height, 1, "nur die Kopfzeile");
+        let header = rows
+            .get(usize::from(live.y))
+            .ok_or(TestError::Missing("LIVE-Kopfzeile"))?;
         assert!(
-            !below_dock.contains("Live"),
-            "unerwarteter Streifen:\n{}",
+            header.contains("LIVE · uia-worker · no visible events yet"),
+            "{}",
             rows.join("\n")
         );
         Ok(())
     }
 
-    /// Knapper Platz (46×28 mit achtzeiligem Composer, darunter bleiben 9
-    /// Zeilen unter dem Dock): der Chat behält seine Mindesthöhe von 8 Zeilen,
-    /// vom Streifen bleibt nur die Kopfzeile, und sie trägt die neueste
-    /// Meldung selbst; Slot 2 entfällt (Körper zuerst, dann Kopfzeile).
+    /// Knapper Platz: der Chat behält seine Mindesthöhe von 8 Zeilen, vom
+    /// Streifen bleibt nur die Kopfzeile, und sie trägt die neueste Meldung
+    /// selbst; Slot 2 entfällt (Körper zuerst, dann Kopfzeile).
+    /// PL-97 C2: die Kartenzeile ist nur noch 4 Zeilen hoch, deshalb reicht
+    /// ein achtzeiliger Composer bei 46×28 nicht mehr für die Enge; ein
+    /// 13-zeiliger Dialog anstelle des Composers lässt dem Körper genau
+    /// 14 Zeilen (Karten 4, Finished 1, LIVE-Kopf 1, Chat 8).
     #[test]
     fn portrait_dock_collapses_the_strip_to_its_header_when_space_is_short() -> TestResult {
         let mut app = test_chat_app()?;
@@ -15582,19 +16645,44 @@ forbidden = [{forbidden}]
             role: String::new(),
             text: "zweite Meldung".to_owned(),
         });
-        app.input.insert_str("z1\nz2\nz3\nz4\nz5\nz6\nz7\nz8");
-        let rows = rendered_rows(&app, 46, 28)?;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(46, 28))
+            .map_err(ctx("test terminal"))?;
+        terminal
+            .draw(|frame| {
+                let body = render::compose_body(
+                    frame,
+                    &app,
+                    Vec::new(),
+                    render::BodyRows {
+                        status_rows: 1,
+                        input_height: 13,
+                        history_min: 1,
+                        dialog_open: true,
+                    },
+                );
+                assert_eq!(body.history.height, 8, "the chat keeps its floor");
+            })
+            .map_err(ctx("draw"))?;
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
         let shown = rows.join("\n");
-        let dock = app
+        let live = app
             .last_regions
             .get()
-            .agents
-            .ok_or(TestError::Missing("Portrait-Dock"))?;
+            .live
+            .ok_or(TestError::Missing("LIVE-Streifen"))?;
+        assert_eq!(live.height, 1, "nur die Kopfzeile:\n{shown}");
         let header = rows
-            .get(usize::from(dock.y + dock.height))
+            .get(usize::from(live.y))
             .ok_or(TestError::Missing("Kopfzeile unter dem Dock"))?;
         assert!(
-            header.contains("Live") && header.contains("1 neu: zweite Meldung"),
+            header.contains("LIVE") && header.contains("1 neu: zweite Meldung"),
             "die Kopfzeile trägt die neueste Meldung:\n{shown}"
         );
         assert!(!shown.contains("2 alt"), "Slot 2 entfällt:\n{shown}");
@@ -15602,8 +16690,9 @@ forbidden = [{forbidden}]
     }
 
     /// Breite Terminals (Landschaft) behalten ihre Aufteilung: die Recency-Slots
-    /// ändern das Bild bei 120×42 nicht (der Streifen gehört nur zum
-    /// Portrait-Dock).
+    /// ändern das Bild bei 120×42 nur im LIVE-Fenster der Mittelspalte
+    /// (PL-97 C3: dort stehen sie wie im Streifen des Portrait-Docks); Chat,
+    /// Finished/Failed, Agenten und Jobs bleiben Zelle für Zelle gleich.
     #[test]
     fn wide_layout_is_unchanged_by_the_recency_slots() -> TestResult {
         let mut app = test_chat_app()?;
@@ -15614,7 +16703,651 @@ forbidden = [{forbidden}]
             text: "zweite Meldung".to_owned(),
         });
         let after = rendered_rows(&app, 120, 42)?;
-        assert_eq!(before, after);
+        let live = app
+            .last_regions
+            .get()
+            .live
+            .ok_or(TestError::Missing("LIVE-Fenster"))?;
+        let outside_live = |y: usize, row: &str| -> String {
+            row.chars()
+                .enumerate()
+                .filter(|(x, _)| {
+                    let at = (u16::try_from(*x), u16::try_from(y));
+                    !matches!(at, (Ok(x), Ok(y)) if live.contains(ratatui::layout::Position::new(x, y)))
+                })
+                .map(|(_, cell)| cell)
+                .collect()
+        };
+        for (y, (old, new)) in before.iter().zip(&after).enumerate() {
+            assert_eq!(outside_live(y, old), outside_live(y, new), "row {y}");
+        }
+        assert!(
+            after.iter().any(|row| row.contains("zweite Meldung")),
+            "{}",
+            after.join("\n")
+        );
+        Ok(())
+    }
+
+    /// PL-97 C2: Bus-Ereignis eines Kind-Agenten der Testsitzung.
+    fn mission_event(app: &mut ChatApp, id: &str, role: &str, turn: TurnEvent) {
+        let event = harw_core::AgentEvent {
+            agent: SessionId::from_str(id),
+            parent: Some(app.session_id().clone()),
+            role: role.to_owned(),
+            kind: harw_core::AgentEventKind::Turn(turn),
+        };
+        app.agent_monitor.apply(&event);
+    }
+
+    /// PL-97 C2: ein denkender Root-Orchestrator mit laufendem Werkzeug, ein
+    /// Worker, ein fehlgeschlagener Explorer und ein Job.
+    fn mission_test_app() -> TestResult<ChatApp> {
+        let mut app = test_chat_app()?;
+        let orchestrator = harw_registry_defaults::profile::role_names::ROOT_ORCHESTRATOR;
+        mission_event(
+            &mut app,
+            "o1",
+            orchestrator,
+            TurnEvent::ReasoningDelta {
+                turn_id: harw_types::TurnId::new(),
+                text: "Prüfe Lens und interne Werkzeugverträge".to_owned(),
+            },
+        );
+        mission_event(
+            &mut app,
+            "o1",
+            orchestrator,
+            TurnEvent::ToolCallRequested {
+                turn_id: harw_types::TurnId::new(),
+                call_id: harw_types::ToolCallId::new(),
+                tool_name: "fs.read".to_owned(),
+                arguments: serde_json::json!({ "path": "README.md" }),
+            },
+        );
+        dock_test_running_agent(&mut app, "w1", "uia-worker");
+        mission_event(
+            &mut app,
+            "e2",
+            "uia-explorer",
+            TurnEvent::TurnFailed {
+                turn_id: harw_types::TurnId::new(),
+                reason: "Zeitlimit".to_owned(),
+                retryable: false,
+            },
+        );
+        app.agent_monitor.set_jobs(vec![dock_test_job()]);
+        app.push_line(
+            Role::System,
+            "einzigartige-verlaufszeile-mission".to_owned(),
+        );
+        Ok(app)
+    }
+
+    /// Zeilenindex der einzigartigen Verlaufszeile aus [`mission_test_app`].
+    fn mission_history_row(rows: &[String]) -> TestResult<usize> {
+        rows.iter()
+            .position(|row| row.contains("einzigartige-verlaufszeile-mission"))
+            .ok_or(TestError::Missing("Verlaufszeile"))
+    }
+
+    /// PL-97 C2 / W02 Abnahme 1: bei 46×78 stehen Agenten (unter 68 Spalten
+    /// mit den Jobs kombiniert), der Finished/Failed-Streifen und LIVE des
+    /// Root-Orchestrators über dem Chat, der die größte Fläche bleibt;
+    /// Statuszeile und Composer bleiben unten.
+    #[test]
+    fn render_viewport_at_46x78_shows_three_windows_live_and_chat() -> TestResult {
+        let app = mission_test_app()?;
+        let rows = rendered_rows(&app, 46, 78)?;
+        let shown = rows.join("\n");
+        let regions = app.last_regions.get();
+        assert_eq!(regions.agents, Some(Rect::new(0, 0, 46, 4)), "{shown}");
+        assert_eq!(regions.jobs, None, "combined below 68 columns: {shown}");
+        assert_eq!(regions.finished, Some(Rect::new(0, 4, 46, 1)), "{shown}");
+        let live = regions.live.ok_or(TestError::Missing("LIVE-Streifen"))?;
+        assert_eq!((live.x, live.y, live.width), (0, 5, 46), "{shown}");
+        assert!(
+            screen_row(&rows, 0)?.starts_with('┌') && screen_row(&rows, 0)?.contains("Agenten"),
+            "{shown}"
+        );
+        assert!(
+            screen_row(&rows, 3)?.starts_with('└'),
+            "eigener Rahmen: {shown}"
+        );
+        assert!(
+            screen_row(&rows, 4)?.starts_with("─ FINISHED / FAILED · uia-explorer ×1 ✗1 NEW"),
+            "{shown}"
+        );
+        assert!(
+            screen_row(&rows, 5)?.starts_with("─ LIVE · root-orchestrator ─"),
+            "{shown}"
+        );
+        assert!(
+            screen_row(&rows, 6)?.starts_with("  ∴ Prüfe Lens"),
+            "{shown}"
+        );
+        assert!(
+            screen_row(&rows, 7)?.starts_with("  ● fs.read · läuft · "),
+            "{shown}"
+        );
+        let history_row = mission_history_row(&rows)?;
+        assert!(
+            history_row >= usize::from(live.y + live.height),
+            "der Chat beginnt unter LIVE: {shown}"
+        );
+        let input_height = usize::from(input_height_for_test(&app, 46));
+        assert!(
+            screen_row(&rows, rows.len() - input_height - 1)?.contains("Ask"),
+            "Statuszeile über dem Composer: {shown}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("› ")),
+            "Composer: {shown}"
+        );
+        let chat_rows = 78 - input_height - 1 - usize::from(live.y + live.height);
+        assert!(
+            chat_rows > 78 / 2,
+            "der Chat ist die größte Fläche ({chat_rows} Zeilen): {shown}"
+        );
+        Ok(())
+    }
+
+    /// PL-97 C2 / W02 Abnahme 2: 48×65 — dieselbe Reihenfolge, nichts
+    /// überlappt, der Chat bleibt dominant.
+    #[test]
+    fn render_viewport_at_48x65_keeps_windows_above_a_dominant_chat() -> TestResult {
+        let app = mission_test_app()?;
+        let rows = rendered_rows(&app, 48, 65)?;
+        let shown = rows.join("\n");
+        let regions = app.last_regions.get();
+        let agents = regions
+            .agents
+            .ok_or(TestError::Missing("Agenten-Fenster"))?;
+        let finished = regions.finished.ok_or(TestError::Missing("Finished"))?;
+        let live = regions.live.ok_or(TestError::Missing("LIVE"))?;
+        assert_eq!(agents, Rect::new(0, 0, 48, 4), "{shown}");
+        assert_eq!(finished, Rect::new(0, 4, 48, 1), "{shown}");
+        assert_eq!(live.y, 5, "{shown}");
+        assert!(live.height <= 5, "header plus at most four lines: {shown}");
+        for (a, b) in [(agents, finished), (finished, live), (agents, live)] {
+            assert!(a.intersection(b).is_empty(), "{a:?} overlaps {b:?}");
+        }
+        assert!(
+            screen_row(&rows, 4)?.contains("FINISHED / FAILED"),
+            "{shown}"
+        );
+        assert!(
+            screen_row(&rows, 5)?.contains("LIVE · root-orchestrator"),
+            "{shown}"
+        );
+        let history_row = mission_history_row(&rows)?;
+        assert!(history_row >= usize::from(live.y + live.height), "{shown}");
+        let chat_rows = 65
+            - usize::from(input_height_for_test(&app, 48))
+            - 1
+            - usize::from(live.y + live.height);
+        assert!(chat_rows > 65 / 2, "{chat_rows}: {shown}");
+        Ok(())
+    }
+
+    /// PL-97 C2: ab 68 Spalten (70×90) sind Agenten und Jobs zwei getrennt
+    /// gerahmte Fenster nebeneinander; die Jobs zeigen den laufenden Job.
+    #[test]
+    fn render_viewport_at_70x90_splits_agents_and_jobs_into_two_windows() -> TestResult {
+        let app = mission_test_app()?;
+        let rows = rendered_rows(&app, 70, 90)?;
+        let shown = rows.join("\n");
+        let regions = app.last_regions.get();
+        assert_eq!(regions.agents, Some(Rect::new(0, 0, 35, 4)), "{shown}");
+        assert_eq!(regions.jobs, Some(Rect::new(35, 0, 35, 4)), "{shown}");
+        let top: String = screen_row(&rows, 0)?.chars().collect();
+        assert!(
+            top.starts_with("┌ Agenten") && top.contains("┐┌ Jobs · 1 aktiv"),
+            "zwei eigene Rahmen: {shown}"
+        );
+        let jobs_rows: Vec<String> = rows
+            .get(1..3)
+            .ok_or(TestError::Missing("Kartenzeilen"))?
+            .iter()
+            .map(|row| row.chars().skip(35).collect())
+            .collect();
+        assert!(jobs_rows.iter().any(|row| row.contains("build")), "{shown}");
+        let agents_rows: Vec<String> = rows
+            .get(1..3)
+            .ok_or(TestError::Missing("Kartenzeilen"))?
+            .iter()
+            .map(|row| row.chars().take(35).collect())
+            .collect();
+        assert!(
+            !agents_rows.iter().any(|row| row.contains("build")),
+            "keine Jobs im Agenten-Fenster: {shown}"
+        );
+        assert!(
+            screen_row(&rows, 4)?.starts_with("─ FINISHED / FAILED"),
+            "{shown}"
+        );
+        assert!(
+            screen_row(&rows, 5)?.starts_with("─ LIVE · root-orchestrator"),
+            "{shown}"
+        );
+        let history_row = mission_history_row(&rows)?;
+        assert!(history_row >= 6, "{shown}");
+        Ok(())
+    }
+
+    /// PL-97 C2: `F4` läuft Chat → Agenten → Jobs → Finished/Failed → Chat
+    /// (LIVE ist im Hochformat nie fokussierbar, auch nicht aufgeklappt);
+    /// `Esc` gibt an den Chat zurück, `Alt+J`/`Alt+F` springen direkt. Unter
+    /// 68 Spalten wählt `Alt+J` den ersten Job der kombinierten Liste.
+    #[test]
+    fn focus_cycle_walks_the_mission_windows_and_skips_portrait_live() -> TestResult {
+        let mut app = mission_test_app()?;
+        let _ = rendered_rows(&app, 70, 90)?;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        app.mission.live_expanded = true;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            assert_eq!(handle_panel_key(&mut app, key(KeyCode::F(4))), Some(true));
+            seen.push(app.panels.focus);
+        }
+        use crate::panes::PaneFocus;
+        assert_eq!(
+            seen,
+            vec![
+                PaneFocus::Agents,
+                PaneFocus::Jobs,
+                PaneFocus::Finished,
+                PaneFocus::Chat
+            ]
+        );
+        assert_eq!(handle_panel_key(&mut app, alt('j')), Some(true));
+        assert_eq!(app.panels.focus, PaneFocus::Jobs);
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Esc)), Some(true));
+        assert_eq!(app.panels.focus, PaneFocus::Chat);
+        assert_eq!(handle_panel_key(&mut app, alt('f')), Some(true));
+        assert_eq!(app.panels.focus, PaneFocus::Finished);
+        // Enter klappt Finished/Failed auf; das nächste Bild gibt mehr Zeilen.
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Enter)), Some(true));
+        assert!(app.mission.finished_expanded);
+        let _ = rendered_rows(&app, 70, 90)?;
+        let finished = app
+            .last_regions
+            .get()
+            .finished
+            .ok_or(TestError::Missing("Finished"))?;
+        assert!(finished.height >= 3, "{finished:?}");
+
+        // Schmal (46 Spalten): kein eigenes Jobs-Fenster — der Fokus springt
+        // aus dem verschwundenen Jobs-Fenster ins Agenten-Panel, `Alt+J`
+        // wählt dort den ersten Job.
+        app.panels.focus = PaneFocus::Jobs;
+        let _ = rendered_rows(&app, 46, 78)?;
+        assert_eq!(handle_panel_key(&mut app, alt('j')), Some(true));
+        assert_eq!(app.panels.focus, PaneFocus::Agents);
+        assert_eq!(app.agent_monitor.selected_job().as_deref(), Some("job-1"));
+        Ok(())
+    }
+
+    /// PL-97 C2 / W02 Abnahme 4: das Jobs-Fenster hat eine eigene Auswahl;
+    /// im Agenten-Fenster bleibt die Auswahl auf Agenten, `p` heftet LIVE an.
+    #[test]
+    fn jobs_window_selection_is_independent_and_p_pins_live() -> TestResult {
+        let mut app = mission_test_app()?;
+        let _ = rendered_rows(&app, 70, 90)?;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.panels.focus = crate::panes::PaneFocus::Agents;
+        for _ in 0..5 {
+            handle_panel_key(&mut app, key(KeyCode::Char('j')));
+            assert!(
+                app.agent_monitor.selected_job().is_none(),
+                "die Agentenliste wählt keine Jobs"
+            );
+        }
+        app.agent_monitor.selected = 0;
+        let pinned = app
+            .agent_monitor
+            .selected_agent()
+            .ok_or(TestError::Missing("gewählter Agent"))?;
+        assert_eq!(
+            handle_panel_key(&mut app, key(KeyCode::Char('p'))),
+            Some(true)
+        );
+        assert_eq!(app.mission.pinned_agent.as_deref(), Some(pinned.as_str()));
+        let rows = rendered_rows(&app, 70, 90)?;
+        assert!(
+            screen_row(&rows, 5)?.contains("· pinned"),
+            "{}",
+            rows.join("\n")
+        );
+
+        app.panels.focus = crate::panes::PaneFocus::Jobs;
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Down)), Some(true));
+        assert_eq!(app.agent_monitor.selected, 0, "Agentenauswahl unverändert");
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Enter)), Some(true));
+        let detail = app
+            .agent_detail
+            .as_ref()
+            .ok_or(TestError::Missing("Job-Detailansicht"))?;
+        assert_eq!(detail.job.as_deref(), Some("job-1"));
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Jobs);
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Esc)), Some(true));
+        assert!(app.agent_detail.is_none(), "Esc schließt die Detailansicht");
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Jobs);
+        Ok(())
+    }
+
+    /// PL-97 C2 / W02 Abnahme 4 + §3.3.3: LIVE nimmt nie Composer-Tasten —
+    /// getippter Text landet im Composer, `F4` erreicht LIVE nicht, `Alt+L`
+    /// öffnet nur die Details des LIVE-Agenten (Esc schließt sie wieder).
+    #[test]
+    fn live_never_takes_composer_keys() -> TestResult {
+        let mut app = mission_test_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        let _ = rendered_rows(&app, 46, 78)?;
+        assert!(app.last_regions.get().live.is_some());
+        for c in ['h', 'a', 'l', 'l', 'o'] {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &bus,
+            );
+        }
+        assert_eq!(app.input.text(), "hallo");
+        app.mission.live_expanded = true;
+        for _ in 0..6 {
+            handle_panel_key(&mut app, KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+            assert_ne!(app.panels.focus, crate::panes::PaneFocus::Live);
+        }
+        app.mission.live_expanded = false;
+        app.panels.focus = crate::panes::PaneFocus::Chat;
+
+        let alt_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT);
+        assert!(handle_key(&mut app, alt_l, &bus));
+        let detail = app
+            .agent_detail
+            .as_ref()
+            .ok_or(TestError::Missing("LIVE-Detailansicht"))?;
+        assert_eq!(detail.agent.as_str(), "o1", "the LIVE source");
+        assert_eq!(app.input.text(), "hallo", "Alt+L tippt nichts");
+        assert!(handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &bus
+        ));
+        assert!(app.agent_detail.is_none());
+        assert!(!app.mission.live_expanded);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &bus,
+        );
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Chat);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+            &bus,
+        );
+        assert_eq!(app.input.text(), "hallo!");
+        Ok(())
+    }
+
+    /// PL-97 C2 / W02 Abnahme 3 + 9: mehrteilige Agenten-Prosa mit
+    /// Steuerzeichen erscheint in LIVE als höchstens vier bereinigte Zeilen;
+    /// kein ESC/BEL erreicht den Puffer.
+    #[test]
+    fn multi_paragraph_agent_prose_renders_at_most_four_sanitized_live_lines() -> TestResult {
+        let mut app = mission_test_app()?;
+        let orchestrator = harw_registry_defaults::profile::role_names::ROOT_ORCHESTRATOR;
+        mission_event(
+            &mut app,
+            "o1",
+            orchestrator,
+            TurnEvent::ReasoningDelta {
+                turn_id: harw_types::TurnId::new(),
+                text:
+                    "\n\nAbsatz zwei mit \u{1b}[31mFarbe\u{1b}[0m.\n\nAbsatz drei\u{7} endet hier."
+                        .to_owned(),
+            },
+        );
+        mission_event(
+            &mut app,
+            "o1",
+            orchestrator,
+            TurnEvent::AssistantDelta {
+                turn_id: harw_types::TurnId::new(),
+                text: "Erste Antwortzeile\n\nZweite Antwortzeile\n\nDritte".to_owned(),
+            },
+        );
+        // Deltas setzen die Phase auf „denkt“; der nächste Aufruf läuft.
+        mission_event(
+            &mut app,
+            "o1",
+            orchestrator,
+            TurnEvent::ToolCallRequested {
+                turn_id: harw_types::TurnId::new(),
+                call_id: harw_types::ToolCallId::new(),
+                tool_name: "fs.read".to_owned(),
+                arguments: serde_json::json!({ "path": "docs/README.md" }),
+            },
+        );
+        for index in 0..3 {
+            app.recency.push(crate::recency::RecencyEntry {
+                child: format!("kind-{index}"),
+                role: "uia-writer".to_owned(),
+                text: format!("Meldung {index}\nmit zweiter Zeile\u{1b}]0;titel\u{7}"),
+            });
+        }
+        let rows = rendered_rows(&app, 46, 78)?;
+        let shown = rows.join("\n");
+        let live = app
+            .last_regions
+            .get()
+            .live
+            .ok_or(TestError::Missing("LIVE"))?;
+        assert!(live.height <= 5, "header plus at most four lines: {shown}");
+        assert_eq!(live.height, 5, "four lines are wanted here: {shown}");
+        let live_rows = rows
+            .get(usize::from(live.y)..usize::from(live.y + live.height))
+            .ok_or(TestError::Missing("LIVE-Zeilen"))?;
+        let live_row = |index: usize| {
+            live_rows
+                .get(index)
+                .map(String::as_str)
+                .ok_or(TestError::Missing("LIVE-Zeile"))
+        };
+        for row in live_rows {
+            assert!(
+                !row.chars().any(|c| c.is_control()),
+                "Steuerzeichen in LIVE: {row:?}"
+            );
+            assert!(
+                !row.contains("[31m") && !row.contains("[0m") && !row.contains("]0;"),
+                "CSI-/OSC-Nutzlast in LIVE: {row:?}"
+            );
+        }
+        assert!(
+            live_row(1)?.contains("∴ …") && live_row(1)?.contains("endet hier."),
+            "der neueste Teil des Reasonings: {shown}"
+        );
+        assert!(live_row(2)?.contains("● fs.read"), "{shown}");
+        assert!(
+            live_row(3)?.contains("1 uia-writer: Meldung 2 mit"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains('\u{1b}') && !shown.contains('\u{7}'),
+            "kein rohes ESC/BEL im Bild"
+        );
+        assert!(
+            !shown.contains("[31m") && !shown.contains("]0;titel"),
+            "keine Sequenz-Nutzlast im Bild: {shown}"
+        );
+        Ok(())
+    }
+
+    /// PL-97 C2: solange der Chat fokussiert ist und der Composer Text
+    /// enthält, bleibt `Alt+F` dort „Wort vorwärts“: der Fokus wandert nicht
+    /// nach Finished/Failed, das nächste `c` wird getippt und quittiert keinen
+    /// Fehlschlag. Mit leerem Composer fokussiert `Alt+F` wie vorgesehen.
+    #[test]
+    fn alt_f_while_typing_moves_by_word_and_never_acknowledges_failures() -> TestResult {
+        let mut app = mission_test_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        let _ = rendered_rows(&app, 70, 90)?;
+        let plain = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        for c in ['a', 'b', ' ', 'c', 'd'] {
+            handle_key(&mut app, plain(c), &bus);
+        }
+        handle_key(&mut app, alt('b'), &bus);
+        handle_key(&mut app, alt('b'), &bus);
+        assert!(handle_key(&mut app, alt('f'), &bus), "word forward redraws");
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Chat);
+        handle_key(&mut app, plain('c'), &bus);
+        let text = app.input.text().to_owned();
+        assert_eq!(text.chars().count(), 6, "c is typed: {text:?}");
+        assert_ne!(text, "cab cd", "Alt+F moved the cursor off the start");
+        assert!(
+            app.agent_monitor
+                .agent("e2")
+                .is_some_and(crate::agent_monitor::AgentLive::is_unseen_failure),
+            "no failure is acknowledged"
+        );
+
+        app.input.clear();
+        assert!(handle_key(&mut app, alt('f'), &bus));
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Finished);
+        Ok(())
+    }
+
+    /// PL-97 C2: `Alt+J`/`Alt+F` nach `F3` (oder aus einem maximierten
+    /// Panel) richten sich nach der Lage mit eingeblendeten Fenstern, nicht
+    /// nach dem letzten Bild ohne Fenster: bei 70×90 landet `Alt+J` im
+    /// Jobs-Fenster, und die Agentenliste bleibt auf einem Agenten.
+    #[test]
+    fn alt_j_after_hiding_the_windows_focuses_the_jobs_window() -> TestResult {
+        use crate::panes::PaneFocus;
+        let mut app = mission_test_app()?;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        let _ = rendered_rows(&app, 70, 90)?;
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::F(3))), Some(true));
+        assert!(!app.panels.agents_visible);
+        let _ = rendered_rows(&app, 70, 90)?;
+        assert_eq!(app.last_regions.get().jobs, None, "no windows on screen");
+        let selected = app.agent_monitor.selected;
+        assert_eq!(handle_panel_key(&mut app, alt('j')), Some(true));
+        assert!(app.panels.agents_visible, "Alt+J shows the windows");
+        assert_eq!(app.panels.focus, PaneFocus::Jobs);
+        assert_eq!(app.agent_monitor.selected, selected);
+        assert!(
+            app.agent_monitor.selected_job().is_none(),
+            "the agents list keeps an agent selected"
+        );
+
+        // Aus dem maximierten Agenten-Panel: Alt+F öffnet Finished/Failed.
+        let _ = rendered_rows(&app, 70, 90)?;
+        app.panels.focus = PaneFocus::Agents;
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::F(11))), Some(true));
+        assert!(app.panels.maximized);
+        let _ = rendered_rows(&app, 70, 90)?;
+        assert_eq!(handle_panel_key(&mut app, alt('f')), Some(true));
+        assert!(!app.panels.maximized);
+        assert_eq!(app.panels.focus, PaneFocus::Finished);
+        Ok(())
+    }
+
+    /// PL-97 C2: auf einem kurzen Körper entfällt die Kartenzeile (der Chat
+    /// behält seine Mindesthöhe). Dann ist die Agentenliste kein Fokusziel:
+    /// ein Agenten-Fokus geht an den Chat, eine offene Detailansicht wird
+    /// maximiert statt unsichtbar zu bleiben.
+    #[test]
+    fn a_dropped_card_row_releases_the_agents_focus() -> TestResult {
+        use crate::panes::PaneFocus;
+        let mut app = mission_test_app()?;
+        let draw_short = |app: &ChatApp| -> TestResult {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(46, 28))
+                .map_err(ctx("test terminal"))?;
+            terminal
+                .draw(|frame| {
+                    let _ = render::compose_body(
+                        frame,
+                        app,
+                        Vec::new(),
+                        render::BodyRows {
+                            status_rows: 1,
+                            input_height: 17,
+                            history_min: 1,
+                            dialog_open: true,
+                        },
+                    );
+                })
+                .map_err(ctx("draw"))?;
+            Ok(())
+        };
+        app.panels.focus = PaneFocus::Agents;
+        draw_short(&app)?;
+        let regions = app.last_regions.get();
+        assert_eq!(regions.agents, None, "no card row on a 10-row body");
+        assert!(regions.presence.agents_hidden);
+        sync_mission_focus(&mut app);
+        assert_eq!(app.panels.focus, PaneFocus::Chat);
+        assert!(!app.panels.can_focus(PaneFocus::Agents));
+
+        app.panels.focus = PaneFocus::Agents;
+        assert!(app.open_agent_detail());
+        app.panels.maximized = false;
+        draw_short(&app)?;
+        sync_mission_focus(&mut app);
+        assert!(app.panels.maximized, "the detail is shown full screen");
+        assert!(app.agent_detail.is_some());
+        Ok(())
+    }
+
+    /// PL-97 C2 / W02 acceptance 2: `render_viewport` over the W02 size
+    /// matrix never panics, and every window region of the frame lies inside
+    /// the screen and is disjoint from the others.
+    #[test]
+    fn render_viewport_size_matrix_keeps_window_regions_in_bounds_and_disjoint() -> TestResult {
+        let app = mission_test_app()?;
+        for (width, height) in [
+            (46, 78),
+            (48, 65),
+            (70, 90),
+            (39, 60),
+            (48, 19),
+            (60, 60),
+            (80, 40),
+            (100, 30),
+            (120, 42),
+            (160, 45),
+            (200, 50),
+            (1, 1),
+            (0, 0),
+        ] {
+            let _ = rendered_rows(&app, width, height)?;
+            let regions = app.last_regions.get();
+            let windows: Vec<Rect> = [regions.agents, regions.jobs, regions.finished, regions.live]
+                .into_iter()
+                .flatten()
+                .collect();
+            for rect in &windows {
+                assert!(
+                    rect.x.saturating_add(rect.width) <= width
+                        && rect.y.saturating_add(rect.height) <= height,
+                    "{width}x{height}: {rect:?} leaves the screen"
+                );
+            }
+            for (index, a) in windows.iter().enumerate() {
+                for b in windows.iter().skip(index + 1) {
+                    assert!(
+                        a.intersection(*b).is_empty(),
+                        "{width}x{height}: {a:?} overlaps {b:?}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -15692,15 +17425,16 @@ forbidden = [{forbidden}]
             .collect();
         let shown = rows.join("\n");
 
-        let dock = app
-            .last_regions
-            .get()
-            .agents
-            .ok_or(TestError::Missing("Portrait-Dock"))?;
+        let regions = app.last_regions.get();
+        let dock = regions.agents.ok_or(TestError::Missing("Portrait-Dock"))?;
+        let jobs = regions.jobs.ok_or(TestError::Missing("Jobs-Fenster"))?;
         assert_eq!(dock.y, 0, "der Dock ist oben angedockt: {shown}");
+        // PL-97 C2: ab 68 Spalten teilen sich Agenten- und Jobs-Fenster die
+        // Kartenzeile über die volle Breite.
         assert_eq!(
-            dock.width, 80,
-            "der Dock nimmt die volle Breite ein: {shown}"
+            (dock.x, dock.width + jobs.width, jobs.y),
+            (0, 80, 0),
+            "die Kartenzeile nimmt die volle Breite ein: {shown}"
         );
         assert!(
             rows[..usize::from(dock.height)]

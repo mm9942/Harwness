@@ -138,10 +138,11 @@ fn test_uia_explorer_and_uia_writer_are_uia_worker_and_allowed_for_uia() -> Test
 }
 
 /// Die lesenden Datei-Werkzeuge, die eine UIA-freigegebene Matrix-Rolle
-/// höchstens registrieren darf: die fünf lesenden `fs.*` plus
+/// höchstens registrieren darf: die sechs lesenden `fs.*` plus
 /// `doc.read_pdf` — kein Netz, kein Schreiben, keine Ausführung.
 const READ_ONLY_FILE_TOOLS: &[&str] = &[
     "fs.read",
+    "fs.view_image",
     "fs.list",
     "fs.search",
     "fs.glob",

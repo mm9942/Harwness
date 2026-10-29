@@ -218,10 +218,10 @@ pub fn load_env_layer(layers: &[std::path::PathBuf]) -> BTreeMap<String, String>
 #[must_use]
 pub fn resolve_env_ref(name: &str, env_layer: &BTreeMap<String, String>) -> Option<String> {
     // Prozess-Umgebung hat Priorität.
-    if let Ok(value) = std::env::var(name) {
-        if !value.trim().is_empty() {
-            return Some(value);
-        }
+    if let Ok(value) = std::env::var(name)
+        && !value.trim().is_empty()
+    {
+        return Some(value);
     }
     // Fallback auf den Env-Layer.
     env_layer.get(name).cloned()

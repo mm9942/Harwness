@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+fs4.workspace = true
 harw-macros = { path = "../harw-macros" }
 harw-types = { path = "../harw-types" }
 serde = { version = "1.0.228", features = ["derive"] }

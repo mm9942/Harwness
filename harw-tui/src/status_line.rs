@@ -200,6 +200,31 @@ pub(crate) fn fit_width(text: &str, max: usize) -> String {
     out
 }
 
+/// Harw-DoD-Marke der Statuszeile (PL-97 D5): `(voll, kurz)`.
+///
+/// # Beschreibung
+/// Voll ` ⛨ 2 high `, aus einer ungeprüften Exportquelle
+/// ` ⛨ 2 high (unverified) `; kurz ` ⛨ 2 ` bzw. ` ⛨ 2? `. Ist die Zahl eine
+/// Untergrenze (älterer Export nicht gelesen), steht `≥ 2`. Die Marke steht
+/// nach der Host-Warnung und vor Plan- und Goal-Marke
+/// (`app::status_mark_spans`); passt die volle Form nicht, folgt die kurze,
+/// sonst entfällt sie.
+///
+/// # Argumente
+/// - `count`: Text der Anzahl (`2` oder `≥ 2`).
+/// - `verified`: `false` für eine ungeprüfte Exportquelle.
+#[must_use]
+pub(crate) fn dod_mark_text(count: &str, verified: bool) -> (String, String) {
+    if verified {
+        (format!(" ⛨ {count} high "), format!(" ⛨ {count} "))
+    } else {
+        (
+            format!(" ⛨ {count} high (unverified) "),
+            format!(" ⛨ {count}? "),
+        )
+    }
+}
+
 /// Ein Abschnitt der Statuszeile mit Kürzungsstufen.
 ///
 /// `variants` geht von der Vollform zur kürzesten Form; eine leere
@@ -325,6 +350,23 @@ mod tests {
         assert!(narrow.contains("Freigabe: full"), "{narrow}");
         assert!(narrow.contains("gpt-5"), "{narrow}");
         assert!(!narrow.contains("Σ"), "{narrow}");
+    }
+
+    #[test]
+    fn dod_mark_text_has_full_and_short_forms() {
+        assert_eq!(
+            dod_mark_text("2", true),
+            (" ⛨ 2 high ".to_owned(), " ⛨ 2 ".to_owned())
+        );
+        assert_eq!(
+            dod_mark_text("≥ 3", false),
+            (
+                " ⛨ ≥ 3 high (unverified) ".to_owned(),
+                " ⛨ ≥ 3? ".to_owned()
+            )
+        );
+        let (full, short) = dod_mark_text("2", true);
+        assert!(display_width(&short) < display_width(&full));
     }
 
     #[test]

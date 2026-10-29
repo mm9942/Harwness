@@ -81,12 +81,10 @@ fn parse_field_policy(attrs: &[Attribute]) -> syn::Result<FieldPolicy> {
                 return Err(meta.error("unbekanntes redact-Attribut; erwartet: show, hash"));
             };
 
-            if let Some(existing) = policy {
-                if existing != found {
-                    return Err(
-                        meta.error("widersprüchliche #[redact(...)]-Attribute auf einem Feld")
-                    );
-                }
+            if let Some(existing) = policy
+                && existing != found
+            {
+                return Err(meta.error("widersprüchliche #[redact(...)]-Attribute auf einem Feld"));
             }
             policy = Some(found);
             Ok(())
