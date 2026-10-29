@@ -50,7 +50,7 @@ const OPTIONAL_OPERATIONS: &[&dyn Operation] = &[
     &harw_ops::compact::CompactOperation,
 ];
 
-fn is_builtin(meta: &OperationMeta) -> bool {
+pub(crate) fn is_builtin(meta: &OperationMeta) -> bool {
     base_operations()
         .iter()
         .any(|operation| std::ptr::eq(operation.meta(), meta))

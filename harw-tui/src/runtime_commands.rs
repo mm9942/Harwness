@@ -94,6 +94,24 @@ pub(crate) enum ToolToggleError {
     },
 }
 
+impl ToolToggleError {
+    pub(crate) fn present(&self) -> String {
+        use crate::i18n::tr_args;
+        match self {
+            Self::UnknownTool { name } => tr_args(
+                "command_feedback.unknown_tool",
+                "Unknown tool '{name}': not registered in this session",
+                &[("name", name)],
+            ),
+            Self::BeyondCeiling { name } => tr_args(
+                "command_feedback.ceiling",
+                "Cannot enable tool '{name}': the session ceiling (base ∩ mode) forbids it",
+                &[("name", name)],
+            ),
+        }
+    }
+}
+
 /// Prüft, ob `/tools on|off <tool>` zulässig ist, bevor die Aktivierung
 /// verändert wird.
 ///

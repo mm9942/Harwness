@@ -160,14 +160,27 @@ async fn effort(ctx: &OpContext, args: EffortArgs) -> Result<OpOutput, OpError> 
                 Some(e) => format!("Reasoning-Effort: {e}"),
                 None => "Reasoning-Effort: (nicht gesetzt — Provider-Default)".to_string(),
             };
-            Ok(OpOutput::from(text))
+            Ok(effort_output(
+                text,
+                "session",
+                "show",
+                snap.reasoning_effort.map(|e| e.to_string()),
+                None,
+                None,
+            ))
         }
         "clear" | "none" | "auto" => {
+            let changed = controller.snapshot().reasoning_effort.is_some();
             controller
                 .set_reasoning_effort(None)
                 .map_err(|e| OpError::Execution(e.to_string()))?;
-            Ok(OpOutput::from(
+            Ok(effort_output(
                 "Reasoning-Effort zurückgesetzt (Provider-Default)".to_string(),
+                "session",
+                "reset",
+                None,
+                None,
+                Some(changed),
             ))
         }
         other => {
@@ -177,11 +190,36 @@ async fn effort(ctx: &OpContext, args: EffortArgs) -> Result<OpOutput, OpError> 
                      Erwartet: minimal | low | medium | high | xhigh | max | clear | show."
                 ))
             })?;
+            let changed = controller.snapshot().reasoning_effort != Some(effort);
             controller
                 .set_reasoning_effort(Some(effort))
                 .map_err(|e| OpError::Execution(e.to_string()))?;
-            Ok(OpOutput::from(format!("Reasoning-Effort gesetzt: {other}")))
+            Ok(effort_output(
+                format!("Reasoning-Effort gesetzt: {other}"),
+                "session",
+                "set",
+                Some(effort.to_string()),
+                None,
+                Some(changed),
+            ))
         }
+    }
+}
+
+fn effort_output(
+    text: String,
+    target: &str,
+    action: &str,
+    level: Option<String>,
+    note: Option<String>,
+    changed: Option<bool>,
+) -> OpOutput {
+    OpOutput {
+        text,
+        data: Some(serde_json::json!({"ui_feedback": {
+            "kind":"effort", "target":target, "action":action, "level":level, "changed":changed,
+            "effective":if action == "show" {"current"} else if target == "session" {"next_turn"} else {"next_session"}, "note":note
+        }})),
     }
 }
 
@@ -239,14 +277,15 @@ fn handle_uia_effort_switch(
     let level = effort.to_string();
 
     let mut text = format!("Reasoning-Effort für die UIA gesetzt: {level}");
-    match persist(Some(level.as_str())) {
+    let note = persist(Some(level.as_str()));
+    match note.as_deref() {
         Some(note) => {
             text.push('\n');
             text.push_str(&note);
         }
         None => text.push_str(" (gespeichert für die nächste Sitzung)"),
     }
-    Ok(OpOutput::from(text))
+    Ok(effort_output(text, "uia", "set", Some(level), note, None))
 }
 
 /// Verarbeitet `/uia-effort clear|none|auto`: entfernt den `reasoning.uia`-Pin
@@ -264,14 +303,15 @@ fn handle_uia_effort_switch(
 /// Nie.
 fn handle_uia_effort_clear(persist: impl FnOnce(Option<&str>) -> Option<String>) -> OpOutput {
     let mut text = "Reasoning-Effort für die UIA zurückgesetzt".to_string();
-    match persist(None) {
+    let note = persist(None);
+    match note.as_deref() {
         Some(note) => {
             text.push('\n');
             text.push_str(&note);
         }
         None => text.push_str(" (gespeichert für die nächste Sitzung)"),
     }
-    OpOutput::from(text)
+    effort_output(text, "uia", "reset", None, note, None)
 }
 
 /// Verarbeitet die `/uia-effort`-Operation.
@@ -347,7 +387,14 @@ async fn uia_effort(ctx: &OpContext, args: EffortArgs) -> Result<OpOutput, OpErr
                 Some(level) => format!("Reasoning-Effort (UIA): {level}"),
                 None => "Reasoning-Effort (UIA): (nicht gesetzt — Rollen-Default)".to_string(),
             };
-            Ok(OpOutput::from(text))
+            Ok(effort_output(
+                text,
+                "uia",
+                "show",
+                config.harness.reasoning.uia.clone(),
+                None,
+                None,
+            ))
         }
         "clear" | "none" | "auto" => {
             let persistence = crate::config_util::selection_persistence(ctx);

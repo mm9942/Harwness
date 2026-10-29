@@ -3,6 +3,7 @@
 //! Source: `harw-tui` interaction-contract spec.
 
 mod metadata;
+pub(crate) use metadata::is_builtin;
 
 use crate::command::CommandOrigin;
 use crate::{

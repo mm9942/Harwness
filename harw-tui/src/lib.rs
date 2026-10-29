@@ -35,6 +35,7 @@ pub(crate) mod command_data;
 pub(crate) mod command_exec;
 pub(crate) mod command_popup;
 mod image_attach;
+pub(crate) mod operation_feedback;
 // Gemeinsames Dialog-Layout: angeheftete Optionen, scrollbarer Körper.
 pub(crate) mod dialog_frame;
 // PL-97 D5: Harw-DoD-Ansicht (`/dod view`) und DoD-Marke der Statuszeile.

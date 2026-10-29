@@ -705,7 +705,13 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
     }
     if let Some(error) = key_bindings_error {
         tracing::warn!(%error, "tui.keybindings.load_failed");
-        push_system_text(&mut app, &format!("{error}; using default key bindings"));
+        let message = crate::i18n::tr_args_for(
+            app.interface_language(),
+            "command_feedback.key_defaults",
+            "{error}; using default key bindings",
+            &[("error", &error.present_for(app.interface_language()))],
+        );
+        push_system_text(&mut app, &message);
     }
     let mut gateway = ResumableGateway::new(
         session,

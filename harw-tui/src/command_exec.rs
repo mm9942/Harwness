@@ -764,7 +764,7 @@ where
                 language,
                 "dispatch.rejected",
                 "Input rejected: {error}",
-                &[("error", &error.to_string())],
+                &[("error", &error.present_for(language, raw_line))],
             )
         })
         .and_then(|invocation| {

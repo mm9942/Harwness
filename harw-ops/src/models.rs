@@ -616,6 +616,7 @@ fn handle_set(
         text,
         data: Some(json!({
             "action": "set",
+            "ui_feedback": {"kind":"role_model", "action":"set", "role":role.key(), "provider":provider, "model":model, "live":live, "effective":if live {"new_agents"} else {"next_session"}, "warning":lifecycle_warning, "note":note},
             "source": "explizit gewählt",
             "role": role.key(),
             "provider": provider,
@@ -674,6 +675,7 @@ fn handle_reset(ctx: &OpContext, role: ModelRole) -> Result<OpOutput, OpError> {
         text,
         data: Some(json!({
             "action": "reset",
+            "ui_feedback": {"kind":"role_model", "action":"reset", "role":role.key(), "provider":null, "model":null, "live":live, "effective":if live {"new_agents"} else {"next_session"}, "warning":null, "note":note},
             "role": role.key(),
             "provider": Value::Null,
             "model": Value::Null,

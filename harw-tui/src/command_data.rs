@@ -94,7 +94,7 @@ where
             language,
             "dispatch.rejected",
             "Input rejected: {error}",
-            &[("error", &error.to_string())],
+            &[("error", &error.present_for(language, raw_line))],
         )
     })?;
     let typed = match &invocation {
@@ -146,6 +146,12 @@ where
             &[("error", &error.to_string())],
         )
     })?;
+    if let Some(presentation) =
+        crate::operation_feedback::project(adapter.operation().meta(), language, &output)
+    {
+        let _timing = presentation.timing;
+        output.text = presentation.text;
+    }
     if path == "/settings" {
         output.text = crate::settings_view::present_output(language, &output);
     }
@@ -157,44 +163,7 @@ pub(crate) fn render_admission_error(
     typed: &str,
     error: &CommandError,
 ) -> String {
-    use crate::i18n::tr_args_for;
-    match error {
-        CommandError::UnknownCommand {
-            suggestion: Some(suggestion),
-            ..
-        } => tr_args_for(
-            language,
-            "dispatch.suggestion",
-            "Unknown command: {command} (did you mean /{suggestion}?)",
-            &[("command", typed), ("suggestion", suggestion.as_str())],
-        ),
-        CommandError::UnknownCommand {
-            suggestion: None, ..
-        } => tr_args_for(
-            language,
-            "dispatch.unknown",
-            "Unknown command: {command}",
-            &[("command", typed)],
-        ),
-        CommandError::PermissionDenied {
-            required, actual, ..
-        } => tr_args_for(
-            language,
-            "dispatch.denied",
-            "Permission denied: {command} requires {required}; current tier is {actual}",
-            &[
-                ("command", typed),
-                ("required", &format!("{required:?}")),
-                ("actual", &format!("{actual:?}")),
-            ],
-        ),
-        other => tr_args_for(
-            language,
-            "dispatch.rejected",
-            "Input rejected: {error}",
-            &[("error", &other.to_string())],
-        ),
-    }
+    error.present_for(language, typed)
 }
 
 #[cfg(test)]
@@ -372,6 +341,340 @@ mod tests {
         }
         assert_eq!(built.load(Ordering::Relaxed), 0);
         assert_eq!(operation.dispatches.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+    struct SkillPersistence {
+        changed: bool,
+        fail: bool,
+    }
+    impl harw_ops::skills::SkillStatePersistence for SkillPersistence {
+        fn set_skill_enabled(
+            &self,
+            _name: &str,
+            _enabled: bool,
+        ) -> Result<harw_ops::skills::SkillStateOutcome, harw_operations::OpError> {
+            if self.fail {
+                return Err(harw_operations::OpError::Execution(
+                    "save refused detail".into(),
+                ));
+            }
+            Ok(harw_ops::skills::SkillStateOutcome {
+                manifest: PathBuf::from("/active-profile/skills/review/skill.toml"),
+                changed: self.changed,
+            })
+        }
+    }
+    fn skill_services(changed: bool, fail: bool) -> ServiceMap {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.skills.insert(
+            "review".into(),
+            harw_config::SkillToml {
+                name: "review".into(),
+                enabled: false,
+                description: "user description aktiviert".into(),
+                instructions_file: None,
+                tools: vec![],
+                mcps: vec![],
+            },
+        );
+        let mut services = ServiceMap::new();
+        services.insert(Arc::new(config));
+        let persistence: Arc<dyn harw_ops::skills::SkillStatePersistence> =
+            Arc::new(SkillPersistence { changed, fail });
+        services.insert(persistence);
+        services
+    }
+    #[tokio::test]
+    async fn operation_feedback_real_skill_dispatch_retains_explicit_locale_and_typed_errors()
+    -> TestResult {
+        use harw_config::UiLanguage::{English, German};
+        let adapters = CommandAdapter::from_operation(Arc::new(harw_ops::skills::SkillsOperation));
+        let (sandbox, root) = test_sandbox()?;
+        let session = SessionId::new();
+        // Futures are created before poll; unrelated synchronous locale scopes
+        // cannot affect the captured dispatch locale after suspension.
+        let en = super::execute_command_with_data_for(
+            English,
+            &adapters,
+            &sandbox,
+            &session,
+            PermissionTier::Owner,
+            "/skills activate review",
+            || skill_services(true, false),
+        );
+        let de = super::execute_command_with_data_for(
+            German,
+            &adapters,
+            &sandbox,
+            &session,
+            PermissionTier::Owner,
+            "/skills activate review",
+            || skill_services(false, false),
+        );
+        crate::i18n::with_language(German, || {
+            assert_eq!(
+                crate::i18n::tr("operation_feedback.activated", "Activated"),
+                "Aktiviert"
+            )
+        });
+        tokio::task::yield_now().await;
+        let (en, de) = tokio::join!(en, de);
+        let en = en.map_err(TestError::Unexpected)?;
+        let de = de.map_err(TestError::Unexpected)?;
+        assert!(en.text.contains(": Activated ("), "{}", en.text);
+        assert!(de.text.contains(": Aktiviert ("), "{}", de.text);
+        assert!(de.text.contains("Bereits gesetzt."));
+        assert!(en.text.contains("next config load (next session)"));
+        assert_eq!(en.data.as_ref().unwrap()["ui_feedback"]["changed"], true);
+        assert_eq!(de.data.as_ref().unwrap()["ui_feedback"]["changed"], false);
+        let disabled = super::execute_command_with_data_for(
+            English,
+            &adapters,
+            &sandbox,
+            &session,
+            PermissionTier::Owner,
+            "/skills deactivate review",
+            || skill_services(true, false),
+        )
+        .await
+        .map_err(TestError::Unexpected)?;
+        assert!(disabled.text.contains(": Deactivated ("));
+        let failed = super::execute_command_with_data_for(
+            German,
+            &adapters,
+            &sandbox,
+            &session,
+            PermissionTier::Owner,
+            "/skills activate review",
+            || skill_services(true, true),
+        )
+        .await;
+        assert!(failed.is_err());
+        assert!(failed.unwrap_err().contains("save refused detail"));
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+        Ok(())
+    }
+
+    struct TestLiveModels;
+    impl harw_ops::live_model::LiveModelControl for TestLiveModels {
+        fn ensure_provider_ready(&self, _provider: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_internal_model(
+            &self,
+            point: harw_config::InternalModelPoint,
+            _choice: Option<harw_config::InternalModelChoice>,
+        ) -> bool {
+            point != harw_config::InternalModelPoint::SessionTitle
+        }
+    }
+    #[tokio::test]
+    async fn operation_feedback_actual_control_commands_keep_timing_and_root_data() -> TestResult {
+        use harw_config::UiLanguage::{English, German};
+        let mut registry = harw_operations::registry::OperationRegistry::new();
+        harw_ops::register_all(&mut registry);
+        let adapters: Vec<_> = registry
+            .iter()
+            .flat_map(|op| CommandAdapter::from_operation(Arc::clone(op)))
+            .collect();
+        let (sandbox, root) = test_sandbox()?;
+        let session = SessionId::new();
+        let mut config = harw_config::ResolvedConfig::default();
+        config.providers.insert("test-provider".into(),serde_json::from_value(serde_json::json!({"name":"test-provider","api":"openai-chat","base_url":"https://example.test","auth":"env:NEVER_READ_TEST_KEY","enabled":true})).map_err(ctx("provider"))?);
+        config.models.insert(
+            "test-model".into(),
+            serde_json::from_value(
+                serde_json::json!({"id":"test-model","provider":"test-provider"}),
+            )
+            .map_err(ctx("model"))?,
+        );
+        let controller: harw_operations::SharedSessionController =
+            Arc::new(harw_operations::NullSessionController::new());
+        let live: harw_ops::live_model::SharedLiveModelControl = Arc::new(TestLiveModels);
+        let cell = harw_extension_api::approval_mode::ApprovalModeCell::default();
+        let services = || {
+            let mut services = ServiceMap::new();
+            services.insert(Arc::new(config.clone()));
+            services.insert(Arc::clone(&controller));
+            services.insert(Arc::clone(&live));
+            services.insert(cell.clone());
+            services
+        };
+        for (command, timing, needle) in [
+            (
+                "/model switch test-model",
+                "next_turn",
+                "Model selection (session): test-provider/test-model.",
+            ),
+            (
+                "/uia-model switch test-model",
+                "next_uia_turn",
+                "next UIA turn",
+            ),
+            (
+                "/uia-worker-model switch test-model",
+                "next_session",
+                "next session",
+            ),
+            (
+                "/models set explorer test-provider/test-model",
+                "new_agents",
+                "running agents keep their model",
+            ),
+            (
+                "/models reset explorer",
+                "new_agents",
+                "role default applies",
+            ),
+            (
+                "/models set session-title test-provider/test-model",
+                "next_session",
+                "next session",
+            ),
+            (
+                "/models worker uia-writer test-provider/test-model",
+                "routing_unconfirmed",
+                "current-session routing is not confirmed",
+            ),
+            (
+                "/models worker uia-writer uia",
+                "routing_unconfirmed",
+                "Worker roles uia-writer: uia.",
+            ),
+            (
+                "/models worker all uia",
+                "routing_unconfirmed",
+                "Worker roles",
+            ),
+            (
+                "/effort high",
+                "next_turn",
+                "Reasoning effort (session): high.",
+            ),
+            ("/effort clear", "next_turn", "Provider default"),
+            (
+                "/uia-effort high",
+                "next_session",
+                "Reasoning effort (uia): high.",
+            ),
+            ("/uia-effort clear", "next_session", "Role default"),
+            ("/mode plan", "next_turn", "Mode requested: plan."),
+            (
+                "/mode default work",
+                "next_session",
+                "Default mode selected: work.",
+            ),
+            ("/permissions mode ask", "next_tool_call", "next tool call"),
+        ] {
+            let (shown, result) = crate::command_exec::dispatch_command_with_shell_result_for(
+                English,
+                &adapters,
+                &sandbox,
+                &session,
+                PermissionTier::Owner,
+                command,
+                None,
+                services,
+            )
+            .await;
+            let output = result
+                .ok_or(TestError::Missing("structured result"))?
+                .map_err(TestError::Unexpected)?;
+            assert_eq!(shown.text, output.text);
+            assert!(output.text.contains(needle), "{command}: {}", output.text);
+            assert_eq!(
+                output.data.as_ref().unwrap()["ui_feedback"]["effective"],
+                timing,
+                "{command}"
+            );
+            if let Some(note) = output.data.as_ref().unwrap()["ui_feedback"]["note"].as_str() {
+                assert!(
+                    output.text.ends_with(note),
+                    "save detail must survive: {command}"
+                );
+            }
+            if command.starts_with("/models ") {
+                assert!(output.data.as_ref().unwrap().get("action").is_some());
+                assert!(output.data.as_ref().unwrap().get("persisted").is_some());
+            }
+        }
+        let already = super::execute_command_with_data_for(
+            German,
+            &adapters,
+            &sandbox,
+            &session,
+            PermissionTier::Owner,
+            "/model switch test-model",
+            services,
+        )
+        .await
+        .map_err(TestError::Unexpected)?;
+        assert!(already.text.contains("Bereits gesetzt."));
+        let before = controller.snapshot();
+        let invalid = super::execute_command_with_data_for(
+            German,
+            &adapters,
+            &sandbox,
+            &session,
+            PermissionTier::Owner,
+            "/model switch forbidden",
+            services,
+        )
+        .await;
+        assert!(invalid.is_err());
+        assert_eq!(controller.snapshot().active_model, before.active_model);
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+        Ok(())
+    }
+    struct DelayedFailure {
+        meta: OperationMeta,
+    }
+    impl Operation for DelayedFailure {
+        fn meta(&self) -> &OperationMeta {
+            &self.meta
+        }
+        fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
+            Box::pin(async {
+                tokio::task::yield_now().await;
+                Err(harw_operations::OpError::Execution(
+                    "backend detail aktiviert".into(),
+                ))
+            })
+        }
+    }
+    #[tokio::test]
+    async fn operation_feedback_delayed_errors_keep_captured_locale_and_backend_detail()
+    -> TestResult {
+        let base = DataOperation::new(PermissionTier::Observer);
+        let adapters = CommandAdapter::from_operation(Arc::new(DelayedFailure { meta: base.meta }));
+        let (sandbox, root) = test_sandbox()?;
+        let session = SessionId::new();
+        let en = super::execute_command_with_data_for(
+            harw_config::UiLanguage::English,
+            &adapters,
+            &sandbox,
+            &session,
+            PermissionTier::Owner,
+            "/board",
+            ServiceMap::new,
+        );
+        let de = super::execute_command_with_data_for(
+            harw_config::UiLanguage::German,
+            &adapters,
+            &sandbox,
+            &session,
+            PermissionTier::Owner,
+            "/board",
+            ServiceMap::new,
+        );
+        let (en, de) = tokio::join!(en, de);
+        let en = en.expect_err("backend failure");
+        let de = de.expect_err("backend failure");
+        assert!(en.starts_with("Error: "), "{en}");
+        assert!(de.starts_with("Fehler: "), "{de}");
+        assert!(en.ends_with("backend detail aktiviert"));
+        assert!(de.ends_with("backend detail aktiviert"));
+        std::fs::remove_dir_all(root).map_err(ctx("remove workspace"))?;
         Ok(())
     }
 }

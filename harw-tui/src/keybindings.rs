@@ -444,9 +444,53 @@ impl fmt::Display for KeyChord {
 /// Eine lesbare Beschreibung bei leerem Chord, unbekanntem Modifikator,
 /// unbekannter Taste, doppeltem Modifikator oder fehlender Taste.
 pub(crate) fn parse_chord(raw: &str) -> Result<KeyChord, String> {
+    parse_chord_diagnostic(raw).map_err(|error| error.to_string())
+}
+
+#[derive(Debug)]
+pub(crate) struct BindingProblem {
+    key: &'static str,
+    english: &'static str,
+    args: Vec<(&'static str, String)>,
+    action: Option<String>,
+}
+impl BindingProblem {
+    fn new(key: &'static str, english: &'static str, args: &[(&'static str, &str)]) -> Self {
+        Self {
+            key,
+            english,
+            args: args.iter().map(|(k, v)| (*k, (*v).to_owned())).collect(),
+            action: None,
+        }
+    }
+    fn present_for(&self, language: harw_config::UiLanguage) -> String {
+        let args: Vec<_> = self.args.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let text = crate::i18n::tr_args_for(language, self.key, self.english, &args);
+        self.action
+            .as_ref()
+            .map_or(text.clone(), |action| format!("{action}: {text}"))
+    }
+}
+impl fmt::Display for BindingProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.present_for(harw_config::UiLanguage::English))
+    }
+}
+fn problem(
+    key: &'static str,
+    english: &'static str,
+    args: &[(&'static str, &str)],
+) -> BindingProblem {
+    BindingProblem::new(key, english, args)
+}
+fn parse_chord_diagnostic(raw: &str) -> Result<KeyChord, BindingProblem> {
     let lowered = raw.trim().to_lowercase();
     if lowered.is_empty() {
-        return Err("empty key chord".to_owned());
+        return Err(problem(
+            "command_feedback.key_empty",
+            "Empty key chord",
+            &[],
+        ));
     }
     // `ctrl++` bzw. `+` meint die Plus-Taste selbst.
     let (modifier_part, key_part) = if lowered == "+" {
@@ -460,7 +504,11 @@ pub(crate) fn parse_chord(raw: &str) -> Result<KeyChord, String> {
         }
     };
     if key_part.is_empty() {
-        return Err(format!("key chord '{raw}' has no key after '+'"));
+        return Err(problem(
+            "command_feedback.key_missing",
+            "Key chord '{raw}' has no key after '+'",
+            &[("raw", raw)],
+        ));
     }
 
     let mut modifiers = KeyModifiers::NONE;
@@ -471,18 +519,39 @@ pub(crate) fn parse_chord(raw: &str) -> Result<KeyChord, String> {
                 "alt" | "option" | "meta" => KeyModifiers::ALT,
                 "shift" => KeyModifiers::SHIFT,
                 "super" | "cmd" | "win" => KeyModifiers::SUPER,
-                "" => return Err(format!("key chord '{raw}' contains an empty modifier")),
-                other => return Err(format!("unknown modifier '{other}' in key chord '{raw}'")),
+                "" => {
+                    return Err(problem(
+                        "command_feedback.key_empty_modifier",
+                        "Key chord '{raw}' contains an empty modifier",
+                        &[("raw", raw)],
+                    ));
+                }
+                other => {
+                    return Err(problem(
+                        "command_feedback.key_modifier",
+                        "Unknown modifier '{modifier}' in key chord '{raw}'",
+                        &[("modifier", other), ("raw", raw)],
+                    ));
+                }
             };
             if modifiers.contains(flag) {
-                return Err(format!("duplicate modifier '{token}' in key chord '{raw}'"));
+                return Err(problem(
+                    "command_feedback.key_duplicate_modifier",
+                    "Duplicate modifier '{modifier}' in key chord '{raw}'",
+                    &[("modifier", token), ("raw", raw)],
+                ));
             }
             modifiers.insert(flag);
         }
     }
 
-    let code = parse_key_name(key_part.trim())
-        .ok_or_else(|| format!("unknown key '{key_part}' in key chord '{raw}'"))?;
+    let code = parse_key_name(key_part.trim()).ok_or_else(|| {
+        problem(
+            "command_feedback.key_unknown",
+            "Unknown key '{key}' in key chord '{raw}'",
+            &[("key", key_part), ("raw", raw)],
+        )
+    })?;
     Ok(KeyChord::normalized(code, modifiers))
 }
 
@@ -540,8 +609,43 @@ pub(crate) enum KeyBindingsError {
     /// einzelnen (unbekannte Aktion, ungültiger Chord, Werttyp, Konflikt).
     Invalid {
         path: PathBuf,
-        problems: Vec<String>,
+        problems: Vec<BindingProblem>,
     },
+}
+
+impl KeyBindingsError {
+    pub(crate) fn present_for(&self, language: harw_config::UiLanguage) -> String {
+        let (key, english, path, detail) = match self {
+            Self::Read { path, source } => (
+                "command_feedback.key_read",
+                "Cannot read keybindings file {path}: {detail}",
+                path,
+                source.to_string(),
+            ),
+            Self::Parse { path, message } => (
+                "command_feedback.key_parse",
+                "Invalid TOML in keybindings file {path}: {detail}",
+                path,
+                message.clone(),
+            ),
+            Self::Invalid { path, problems } => (
+                "command_feedback.key_invalid",
+                "Invalid keybindings in {path}: {detail}",
+                path,
+                problems
+                    .iter()
+                    .map(|p| p.present_for(language))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        };
+        crate::i18n::tr_args_for(
+            language,
+            key,
+            english,
+            &[("path", &path.display().to_string()), ("detail", &detail)],
+        )
+    }
 }
 
 impl fmt::Display for KeyBindingsError {
@@ -565,7 +669,11 @@ impl fmt::Display for KeyBindingsError {
                 formatter,
                 "invalid keybindings in {}: {}",
                 path.display(),
-                problems.join("; ")
+                problems
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
         }
     }
@@ -662,7 +770,11 @@ impl KeyBindings {
         let mut named: Vec<KeyAction> = Vec::new();
         for (name, value) in &table {
             let Some(action) = KeyAction::from_name(name) else {
-                problems.push(format!("unknown action '{name}'"));
+                problems.push(problem(
+                    "command_feedback.key_action",
+                    "Unknown action '{name}'",
+                    &[("name", name)],
+                ));
                 continue;
             };
             let raw_chords: Vec<&toml::Value> = match value.as_array() {
@@ -672,13 +784,17 @@ impl KeyBindings {
             let mut chords = Vec::with_capacity(raw_chords.len());
             for raw in raw_chords {
                 match raw.as_str() {
-                    Some(text) => match parse_chord(text) {
+                    Some(text) => match parse_chord_diagnostic(text) {
                         Ok(chord) => chords.push(chord),
-                        Err(problem) => problems.push(format!("{name}: {problem}")),
+                        Err(mut problem) => {
+                            problem.action = Some(name.clone());
+                            problems.push(problem);
+                        }
                     },
-                    None => problems.push(format!(
-                        "{name}: expected a key chord string or an array of strings, found {}",
-                        raw.type_str()
+                    None => problems.push(problem(
+                        "command_feedback.key_type",
+                        "{name}: expected a key chord string or an array of strings, found {type}",
+                        &[("name", name), ("type", raw.type_str())],
                     )),
                 }
             }
@@ -717,17 +833,30 @@ impl KeyBindings {
 
     /// Chords, die mehr als einer Aktion (oder einer Aktion doppelt)
     /// zugeordnet sind.
-    fn conflicts(&self) -> Vec<String> {
+    fn conflicts(&self) -> Vec<BindingProblem> {
         let mut seen: Vec<(KeyChord, KeyAction)> = Vec::new();
         let mut problems = Vec::new();
         for (action, chords) in &self.bindings {
             for chord in chords {
                 match seen.iter().find(|(other, _)| other == chord) {
                     Some((_, owner)) if owner == action => {
-                        problems.push(format!("{action}: key chord '{chord}' listed twice"));
+                        problems.push(problem(
+                            "command_feedback.key_twice",
+                            "{action}: key chord '{chord}' listed twice",
+                            &[
+                                ("action", &action.to_string()),
+                                ("chord", &chord.to_string()),
+                            ],
+                        ));
                     }
-                    Some((_, owner)) => problems.push(format!(
-                        "key chord '{chord}' is bound to both '{owner}' and '{action}'"
+                    Some((_, owner)) => problems.push(problem(
+                        "command_feedback.key_conflict",
+                        "Key chord '{chord}' is bound to both '{owner}' and '{action}'",
+                        &[
+                            ("chord", &chord.to_string()),
+                            ("owner", &owner.to_string()),
+                            ("action", &action.to_string()),
+                        ],
                     )),
                     None => seen.push((*chord, *action)),
                 }
@@ -776,7 +905,9 @@ mod tests {
 
     fn invalid_problems(result: Result<KeyBindings, KeyBindingsError>) -> Vec<String> {
         match result {
-            Err(KeyBindingsError::Invalid { problems, .. }) => problems,
+            Err(KeyBindingsError::Invalid { problems, .. }) => {
+                problems.iter().map(ToString::to_string).collect()
+            }
             other => vec![format!("unexpected result: {other:?}")],
         }
     }
@@ -1327,9 +1458,32 @@ cycle_focus = 5
         std::fs::write(&missing, "bogus = \"F1\"\n")?;
         let error = load(&missing).err().ok_or("expected an error")?;
         assert!(
-            error.to_string().contains("unknown action 'bogus'"),
+            error.to_string().contains("Unknown action 'bogus'"),
             "{error}"
         );
+        Ok(())
+    }
+    #[test]
+    fn diagnostics_render_in_display_locale_without_parsing_cached_text() -> TestResult {
+        let error = KeyBindings::from_toml_str(
+            "toggle_explorer = \"hyper+q\"",
+            Path::new("/user/keys.toml"),
+        )
+        .err()
+        .ok_or("expected diagnostic")?;
+        let german = error.present_for(harw_config::UiLanguage::German);
+        let japanese = error.present_for(harw_config::UiLanguage::Japanese);
+        assert!(
+            german.contains("Unbekannter Modifikator 'hyper'"),
+            "{german}"
+        );
+        assert!(japanese.contains("不明な修飾キー 'hyper'"), "{japanese}");
+        for text in [german, japanese] {
+            assert!(text.contains("toggle_explorer"));
+            assert!(text.contains("/user/keys.toml"));
+            assert!(text.contains("hyper+q"));
+        }
+        assert!(error.to_string().contains("Unknown modifier 'hyper'"));
         Ok(())
     }
 }

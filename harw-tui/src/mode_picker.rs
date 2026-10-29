@@ -419,7 +419,7 @@ impl OverlayView for ModePicker {
     }
 }
 
-fn mode_summary(mode: InteractionMode) -> &'static str {
+pub(crate) fn mode_summary(mode: InteractionMode) -> &'static str {
     match mode {
         InteractionMode::Chat => tr(
             "pickers.summary_chat",

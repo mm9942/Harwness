@@ -814,7 +814,8 @@ fn handle_uia_worker_model_switch(
         text.push_str("\nWarnung: ");
         text.push_str(warning);
     }
-    match persist(Some(configured_id.as_str())) {
+    let note = persist(Some(configured_id.as_str()));
+    match note.as_deref() {
         Some(note) => {
             text.push('\n');
             text.push_str(&note);
@@ -822,7 +823,12 @@ fn handle_uia_worker_model_switch(
         None => text.push_str("\n(gespeichert für die nächste Sitzung)"),
     }
 
-    Ok(OpOutput::from(text))
+    Ok(OpOutput {
+        text,
+        data: Some(
+            serde_json::json!({"ui_feedback": {"kind":"model_selection", "target":"uia-worker", "provider":provider, "model":configured_id, "effective":"next_session", "warning":lifecycle_warning, "note":note}}),
+        ),
+    })
 }
 
 /// Formatiert das `/uia-worker-model show`-Sub-Kommando: zeigt das für

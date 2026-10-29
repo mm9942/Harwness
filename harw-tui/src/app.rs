@@ -5472,19 +5472,20 @@ pub(crate) async fn run_loop(
                                 // parsed args. `/tools` may narrow, but never widen
                                 // beyond this ceiling (W2d-1/F-T, E8).
                                 let ceiling = gateway.session_mut().mode_ceiling();
-                                Some(crate::tools_command::dispatch_tools_command_bounded(
-                                    &args,
-                                    &tool_names,
-                                    gateway.session_mut().activation_mut(),
-                                    &ceiling,
-                                ))
+                                Some(crate::i18n::with_language(app.language, || {
+                                    crate::tools_command::dispatch_tools_command_bounded(
+                                        &args,
+                                        &tool_names,
+                                        gateway.session_mut().activation_mut(),
+                                        &ceiling,
+                                    )
+                                }))
                             } else {
                                 None
                             };
 
                             if let Some(outcome) = tools_outcome {
-                                let lines: Vec<Line<'static>> = outcome
-                                    .into_lines()
+                                let lines: Vec<Line<'static>> = crate::i18n::with_language(app.language, || outcome.into_lines())
                                     .into_iter()
                                     .map(Line::from)
                                     .collect();

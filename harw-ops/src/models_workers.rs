@@ -185,9 +185,15 @@ pub(crate) fn handle_worker(
         text.push_str("\nWarnung: ");
         text.push_str(warning);
     }
-    if let UiaWorkerModelChoice::Fixed { provider, .. } = &choice
-        && !provider_is_logged_in(config, provider)
-    {
+    let fallback_provider = match &choice {
+        UiaWorkerModelChoice::Fixed { provider, .. }
+            if !provider_is_logged_in(config, provider) =>
+        {
+            Some(provider.as_str())
+        }
+        _ => None,
+    };
+    if let Some(provider) = fallback_provider {
         text.push_str(&format!(
             "\nHinweis: Provider „{provider}“ ist nicht angemeldet — bis zur Anmeldung folgt \
              die Rolle der UIA."
@@ -197,6 +203,7 @@ pub(crate) fn handle_worker(
         text,
         data: Some(json!({
             "action": "worker",
+            "ui_feedback": {"kind":"worker_model", "roles":roles, "choice":value, "effective":"routing_unconfirmed", "warning":lifecycle_warning, "note":note, "fallback_provider":fallback_provider},
             "roles": roles,
             "choice": value,
             "follows_uia": choice.follows_uia(),
