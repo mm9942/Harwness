@@ -122,7 +122,9 @@ pub use export::{
 };
 pub use gateway::{ChatGateway, LocalGateway};
 pub use input::{Invocation, classify_input};
-pub use model_picker::{ModelPickerOutcome, ModelPickerProvider, run_model_picker};
+pub use model_picker::{
+    ModelPickerOutcome, ModelPickerProvider, run_model_picker, run_model_picker_for,
+};
 pub use registry::{
     CapabilitySet, CommandAction, CommandRegistry, DispatchContext, InvocationSurface,
     ShellCapability,

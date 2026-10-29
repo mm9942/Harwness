@@ -7,9 +7,10 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::i18n::{tr, tr_args};
+use crate::i18n::{tr, tr_args, with_language};
 use crate::setup::TerminalGuard;
 use crate::{TuiError, style};
+use harw_config::UiLanguage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPickerProvider {
@@ -100,10 +101,19 @@ impl PickerApp {
 pub fn run_model_picker(
     providers: Vec<ModelPickerProvider>,
 ) -> Result<Option<ModelPickerOutcome>, TuiError> {
+    run_model_picker_for(UiLanguage::English, providers)
+}
+
+/// Run the standalone picker in the active profile's explicit interface language.
+/// The compatibility entry point defaults to English regardless of ambient scope.
+pub fn run_model_picker_for(
+    language: UiLanguage,
+    providers: Vec<ModelPickerProvider>,
+) -> Result<Option<ModelPickerOutcome>, TuiError> {
     let mut app = PickerApp::new(providers);
     let mut terminal = TerminalGuard::enter()?;
     let result = loop {
-        draw(&mut terminal, &app)?;
+        draw(language, &mut terminal, &app)?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
@@ -114,7 +124,7 @@ pub fn run_model_picker(
             if key.code == KeyCode::Esc {
                 break Ok(None);
             }
-            if let Some(outcome) = app.on_key(key) {
+            if let Some(outcome) = with_language(language, || app.on_key(key)) {
                 break Ok(Some(outcome));
             }
         }
@@ -123,12 +133,20 @@ pub fn run_model_picker(
     result
 }
 
-fn draw(terminal: &mut TerminalGuard, app: &PickerApp) -> Result<(), TuiError> {
+fn draw(
+    language: UiLanguage,
+    terminal: &mut TerminalGuard,
+    app: &PickerApp,
+) -> Result<(), TuiError> {
     terminal
         .terminal()
-        .draw(|frame| render(frame, app))
+        .draw(|frame| render_for(language, frame, app))
         .map_err(TuiError::from)?;
     Ok(())
+}
+
+fn render_for(language: UiLanguage, frame: &mut ratatui::Frame<'_>, app: &PickerApp) {
+    with_language(language, || render(frame, app));
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &PickerApp) {
@@ -221,7 +239,7 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
     #[test]
-    fn rendered_provider_count_and_model_selection_use_current_locale() -> TestResult {
+    fn standalone_render_uses_explicit_language_and_preserves_model_selection() -> TestResult {
         use crate::i18n::with_language;
         use harw_config::UiLanguage;
         let mut app = PickerApp::new(vec![ModelPickerProvider {
@@ -231,22 +249,32 @@ mod tests {
         }]);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10))
             .map_err(ctx("test terminal"))?;
-        terminal
-            .draw(|frame| render(frame, &app))
-            .map_err(ctx("draw"))?;
+        with_language(UiLanguage::German, || {
+            terminal.draw(|frame| render_for(UiLanguage::English, frame, &app))
+        })
+        .map_err(ctx("draw"))?;
         assert!(
             crate::test_support::display_buffer_text(terminal.backend().buffer())
                 .contains("(1 models)")
         );
-        with_language(UiLanguage::Japanese, || {
-            terminal.draw(|frame| render(frame, &app))
-        })
-        .map_err(ctx("localized draw"))?;
-        assert!(
-            crate::test_support::display_buffer_text(terminal.backend().buffer())
-                .contains("1 モデル")
+        terminal
+            .draw(|frame| render_for(UiLanguage::Japanese, frame, &app))
+            .map_err(ctx("localized draw"))?;
+        let japanese = crate::test_support::display_buffer_text(terminal.backend().buffer());
+        assert!(japanese.contains("プロバイダーを選択"));
+        assert!(japanese.contains("1 モデル"));
+        assert!(japanese.contains("移動"));
+        assert_eq!(
+            tr("pickers.provider_title", "Choose provider"),
+            "Choose provider"
         );
         app.on_key(key(KeyCode::Enter));
+        terminal
+            .draw(|frame| render_for(UiLanguage::Japanese, frame, &app))
+            .map_err(ctx("model-stage draw"))?;
+        let japanese = crate::test_support::display_buffer_text(terminal.backend().buffer());
+        assert!(japanese.contains("モデルを選択"));
+        assert!(japanese.contains("模型"));
         app.on_key(key(KeyCode::Char(' ')));
         let outcome = with_language(UiLanguage::Hindi, || app.on_key(key(KeyCode::Enter)))
             .ok_or(TestError::Missing("selected model"))?;
