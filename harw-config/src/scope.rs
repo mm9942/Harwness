@@ -482,6 +482,13 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "memory.context_ledger", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "memory.security_signals", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "memory.llm_extraction", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // [skills] (4) — PL-95 S3 / PL-97 B1: triggered skill injection. Home and
+    // profile replace, an untrusted project sets none of them (`merge_skills`).
+    // `inject_imported` decides whether imported skill text reaches the model.
+    FieldScope { path: "skills.triggered_injection", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "skills.inject_imported", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "skills.per_turn_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "skills.per_session_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // [retention.<klasse>] (10 Klassen x 5 = 50) — Aufbewahrungsgrenzen. enabled/keep_newest:
     // ein nicht vertrautes Projekt darf sie nicht setzen; max_*: Home/Profil setzen frei,
     // das Projekt darf nur senken (merge_retention). Pfade folgen harw_retention::CLASSES.
@@ -543,7 +550,7 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_195_entries() {
+    fn test_field_table_has_exactly_199_entries() {
         // Runde 5, Teil B: +1 für `host.sudo_session_minutes`.
         // Runde 5, Teil E: +1 für `internal_models.auto_classifier`.
         // Runde 5, Teil G: +5 für `uia_worker_models.*`.
@@ -562,7 +569,8 @@ mod merge_rule_tests {
         // [tools.container]: +4 (`enabled`, `engine`, `connection`, `images`), alle GlobalOnly.
         // [session_listener]: +6, alle GlobalOnly.
         // h7/h9: +2 für `tui.status_expiry`, `tui.goal_mode`.
-        assert_eq!(FIELD_TABLE.len(), 195);
+        // PL-97 B1: +4 für `skills.*`.
+        assert_eq!(FIELD_TABLE.len(), 199);
     }
 
     #[test]
@@ -584,7 +592,8 @@ mod merge_rule_tests {
         // [memory]: +11 (`memory.*`).
         // [retention]: +20 ProfileReplaces, +30 MinBound.
         // h7/h9: +2 (`tui.status_expiry`, `tui.goal_mode`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 96);
+        // PL-97 B1: +4 (`skills.*`).
+        assert_eq!(count(MergeRule::ProfileReplaces), 100);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

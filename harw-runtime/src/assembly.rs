@@ -831,6 +831,30 @@ fn root_activation(ir: Option<&ExecutableAgentIr>) -> SessionActivation {
     activation
 }
 
+/// What every root session's triggered skill injector is built from
+/// (PL-95 S3): the assembly's skill index (its `TriggerIndex` is built once
+/// with it) and the `[skills]` settings.
+#[derive(Debug, Clone)]
+struct SkillInjectionSeed {
+    index: Arc<harw_catalog::SkillIndex>,
+    settings: harw_core::SkillInjectionSettings,
+}
+
+/// The L0 skill catalog of the root's instruction fragments (PL-95 S3): the
+/// count line of [`harw_registry_defaults::skill_catalog_hint`] followed by
+/// [`harw_catalog::catalog_lines`] (`name — when`, at most `l0_bytes`).
+/// Without task text the lines are ordered by priority and name, so the
+/// fragment is identical in every turn (cache-stable prefix).
+fn skill_catalog_fragment(index: &harw_catalog::SkillIndex, l0_bytes: usize) -> String {
+    let mut text = harw_registry_defaults::skill_catalog_hint(index.len());
+    let lines = harw_catalog::catalog_lines(index, "", l0_bytes);
+    if !lines.is_empty() {
+        text.push('\n');
+        text.push_str(&lines.join("\n"));
+    }
+    text
+}
+
 /// Das Kontextprogramm der Wurzel-IR, geprüft gegen die Wurzeldecke
 /// (#22 Welle 1B).
 ///
@@ -2282,13 +2306,27 @@ impl RuntimeAssemblyBuilder {
             || harw_registry_defaults::profile::SKILL_CATALOG_TOOLS
                 .iter()
                 .all(|tool| activation.is_tool_enabled(&ToolName::new((*tool).to_owned()))));
-        if skill_catalog_at_root {
-            overrides
-                .extra_context
-                .push(harw_registry_defaults::skill_catalog_hint(
-                    skill_index.len(),
-                ));
-        }
+        // PL-95 S3 / PL-97 B1: statt der einen Zahlzeile die budgetierten
+        // L0-Katalogzeilen `name — when` (ohne Aufgabentext: nach Priorität
+        // und Name, damit der Präfix cache-stabil bleibt). Der Injektor jeder
+        // Wurzelsitzung wählt aus demselben, einmal je Montage gebauten Index
+        // (samt `TriggerIndex`).
+        let skill_injection_settings =
+            harw_core::SkillInjectionSettings::from_config(&config.harness.skills);
+        let skill_injection = if skill_catalog_at_root {
+            overrides.extra_context.push(skill_catalog_fragment(
+                &skill_index,
+                skill_injection_settings.l0_bytes,
+            ));
+            skill_injection_settings
+                .enabled
+                .then(|| SkillInjectionSeed {
+                    index: Arc::clone(&skill_index),
+                    settings: skill_injection_settings,
+                })
+        } else {
+            None
+        };
         let narrowed_root = narrowing
             .as_ref()
             .and_then(|narrowing| narrowing.workspace_root.as_ref())
@@ -3526,6 +3564,7 @@ impl RuntimeAssemblyBuilder {
             approval_timeout,
             agent_ir,
             root_context_program,
+            skill_injection,
             activation,
             operations,
             services,
@@ -5704,6 +5743,10 @@ pub struct RuntimeAssembly {
     /// Agent, sonst UIA), bereits gegen die Wurzeldecke geprüft; `None` ohne
     /// deklariertes Programm.
     root_context_program: Option<harw_agent_dsl::executable::ContextProgram>,
+    /// PL-95 S3: Grundlage des Skill-Injektors jeder Wurzelsitzung; `None`
+    /// ohne Skill-Katalog an der Wurzel oder mit
+    /// `[skills] triggered_injection = false`.
+    skill_injection: Option<SkillInjectionSeed>,
     activation: SessionActivation,
     operations: Arc<OperationRegistry>,
     /// Hinter einem `Arc`, weil die Modell-Tool-Fläche der Operationen
@@ -6606,6 +6649,14 @@ impl RuntimeAssembly {
                     }
                 })
                 .with_context_ledger(self.context_ledger.clone())
+                // PL-95 S3: je Sitzung ein frischer Injektor-Zustand über dem
+                // gemeinsamen Index der Montage.
+                .with_skill_injector(self.skill_injection.as_ref().map(|seed| {
+                    Arc::new(harw_core::SkillInjector::new(
+                        Arc::clone(&seed.index),
+                        seed.settings,
+                    ))
+                }))
                 // Addendum F+G: Wächter-Verdrahtung der Wurzel-(UIA-)Sitzung.
                 .with_guard_policy(Some(self.guard_policy))
                 .with_drift_observer(Some(
@@ -8231,6 +8282,101 @@ mod tests {
             "mit Schalter hat die Wurzelsitzung einen Ledger"
         );
         assert!(on.home.join("context-ledger").is_dir());
+        Ok(())
+    }
+
+    /// PL-95 S3: der L0-Katalog der Wurzel ist die Zahlzeile, danach
+    /// höchstens `l0_bytes` an `name — when`-Zeilen — ohne Aufgabentext nach
+    /// Priorität und Name, also in jeder Runde byte-identisch.
+    #[test]
+    fn test_skill_catalog_fragment_is_the_hint_plus_bounded_catalog_lines() -> TestResult {
+        let l0 = harw_catalog::DEFAULT_L0_BYTES;
+        let index = harw_catalog::SkillIndex::build(&[]);
+        let hint = harw_registry_defaults::skill_catalog_hint(index.len());
+        let fragment = skill_catalog_fragment(&index, l0);
+        let lines = fragment
+            .strip_prefix(hint.as_str())
+            .and_then(|rest| rest.strip_prefix('\n'))
+            .ok_or(TestError::Missing("Zahlzeile vor den Katalogzeilen"))?;
+        assert!(!lines.is_empty(), "gebündelte Skills ergeben Katalogzeilen");
+        assert!(lines.len() <= l0, "{} Bytes > {l0}", lines.len());
+        assert_eq!(
+            lines,
+            harw_catalog::catalog_lines(&index, "", l0).join("\n")
+        );
+        assert_eq!(
+            fragment,
+            skill_catalog_fragment(&index, l0),
+            "deterministisch"
+        );
+
+        // Ohne Skills bleibt nur die Zahlzeile.
+        let empty = harw_catalog::SkillIndex::build_with_bundle(&[], &[]);
+        assert_eq!(
+            skill_catalog_fragment(&empty, l0),
+            harw_registry_defaults::skill_catalog_hint(0)
+        );
+        Ok(())
+    }
+
+    /// PL-95 S3: eine Wurzelsitzung mit Skill-Katalog bekommt einen
+    /// Injektor mit den `[skills]`-Werten; `triggered_injection = false` und
+    /// ein werkzeugloser Einstieg (`NoTools`) bekommen keinen.
+    #[test]
+    fn test_root_skill_injector_follows_the_catalog_and_the_skills_switch() -> TestResult {
+        let injector_of = |fixture: &BuildFixture,
+                           entry: EntryKind|
+         -> TestResult<Option<harw_core::SkillInjectionSettings>> {
+            let assembly = fixture_builder(entry, fixture)
+                .build()
+                .map_err(ctx("montiert"))?;
+            let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+            let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+            let root = assembly
+                .new_root_session(
+                    assembly.root_session_id().clone(),
+                    events,
+                    turn_events,
+                    None,
+                )
+                .map_err(ctx("Wurzelsitzung entsteht"))?;
+            Ok(root
+                .session
+                .skill_injector()
+                .map(|injector| *injector.settings()))
+        };
+        let append_config = |fixture: &BuildFixture, extra: &str| -> TestResult {
+            let config = fixture
+                .home
+                .join("profiles")
+                .join("default")
+                .join("config.toml");
+            let mut text = std::fs::read_to_string(&config).map_err(ctx("config lesen"))?;
+            text.push_str(extra);
+            std::fs::write(&config, text).map_err(ctx("config schreiben"))?;
+            Ok(())
+        };
+
+        let default = build_fixture()?;
+        assert_eq!(
+            injector_of(&default, EntryKind::LocalEcho)?,
+            Some(harw_core::SkillInjectionSettings::default())
+        );
+        assert_eq!(
+            injector_of(&default, EntryKind::JobPrompt)?,
+            None,
+            "NoTools: kein Skill-Katalog, kein Injektor"
+        );
+
+        let tuned = build_fixture()?;
+        append_config(&tuned, "\n[skills]\nper_turn_bytes = 2048\n")?;
+        let settings = injector_of(&tuned, EntryKind::LocalEcho)?
+            .ok_or(TestError::Missing("Injektor mit eigenen Werten"))?;
+        assert_eq!(settings.per_turn_cap_bytes, 2048);
+
+        let off = build_fixture()?;
+        append_config(&off, "\n[skills]\ntriggered_injection = false\n")?;
+        assert_eq!(injector_of(&off, EntryKind::LocalEcho)?, None);
         Ok(())
     }
 

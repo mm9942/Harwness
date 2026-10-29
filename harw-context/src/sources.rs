@@ -54,6 +54,33 @@ context_sources! {
     pinned_plan: { namespace = "plan.pinned", trust = Evidence, budget_share_pct = 5, default_enabled = true }
     knowledge: { namespace = "knowledge", trust = Data, budget_share_pct = 10, default_enabled = true }
     security_signals: { namespace = "harw.runtime.security_signals", trust = Evidence, budget_share_pct = 2, default_enabled = false }
+    skills_triggered: { namespace = "skills.triggered", trust = Instruction, budget_share_pct = 3, default_enabled = true }
+}
+
+/// Ids of sources produced by the harness core itself, never by a
+/// `ContextProvider`. Only these may declare [`TrustClass::Instruction`]:
+/// `skills_triggered` carries text of bundled or trusted-layer skills that
+/// `harw-core` selects deterministically (PL-95 S3); an imported skill is
+/// lowered to [`TrustClass::Evidence`] by the producer.
+pub const CORE_OWNED_SOURCES: &[&str] = &["skills_triggered"];
+
+impl ContextSource {
+    /// This source's share of `total` (any unit), rounded down.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_context::sources::skills_triggered;
+    ///
+    /// assert_eq!(skills_triggered.share_of(100_000), 3_000);
+    /// assert_eq!(skills_triggered.share_of(0), 0);
+    /// ```
+    #[must_use]
+    pub const fn share_of(&self, total: u64) -> u64 {
+        let pct = self.budget_share_pct as u64;
+        (total / 100)
+            .saturating_mul(pct)
+            .saturating_add(total % 100 * pct / 100)
+    }
 }
 
 /// Sucht eine Quelle über ihren Namensraum.
@@ -88,9 +115,36 @@ mod tests {
     #[test]
     fn no_source_claims_instruction_trust_and_shares_fit_the_budget() {
         for s in SOURCES {
+            if CORE_OWNED_SOURCES.contains(&s.id) {
+                continue;
+            }
             assert_ne!(s.max_trust, TrustClass::Instruction, "{}", s.id);
         }
         let total: u32 = SOURCES.iter().map(|s| u32::from(s.budget_share_pct)).sum();
         assert!(total <= 100);
+    }
+
+    #[test]
+    fn skills_triggered_is_the_only_core_owned_source_and_matches_its_section() {
+        assert_eq!(CORE_OWNED_SOURCES, &["skills_triggered"]);
+        assert_eq!(
+            skills_triggered.namespace,
+            crate::ceiling::SKILLS_TRIGGERED_SECTION
+        );
+        assert_eq!(skills_triggered.max_trust, TrustClass::Instruction);
+        assert_eq!(skills_triggered.budget_share_pct, 3);
+        assert!(
+            SOURCES
+                .iter()
+                .any(|s| s.id == "skills_triggered" && s.default_enabled)
+        );
+        assert_eq!(source("skills.triggered"), Some(&skills_triggered));
+    }
+
+    #[test]
+    fn share_of_rounds_down_and_never_overflows() {
+        assert_eq!(skills_triggered.share_of(32_768 * 4), 3_932);
+        assert_eq!(skills_triggered.share_of(99), 2);
+        assert_eq!(knowledge.share_of(u64::MAX), u64::MAX / 100 * 10 + 1);
     }
 }

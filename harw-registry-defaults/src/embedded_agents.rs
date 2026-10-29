@@ -858,6 +858,7 @@ const ROOT_CEILING_SECTIONS: &[&str] = &[
     "legacy.v1",
     "delegation.targets",
     "continuation.instruction",
+    "skills.triggered",
 ];
 
 /// Sammelt die Kontextprogramme direkt unter `agents/context-programs/`.

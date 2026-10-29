@@ -645,6 +645,39 @@ pub trait StateStore: Send + Sync {
         let _ = (sid, event);
         Box::pin(async { Ok(()) })
     }
+
+    /// Persists one triggered skill delivery (PL-95 S3, `injection` event,
+    /// see [`harw_session_store::InjectionRecord`]).
+    ///
+    /// # Description
+    /// Default: no-op, so existing test doubles stay valid — like
+    /// [`Self::record_drift`].
+    ///
+    /// # Errors
+    /// Backend-specific, see [`StateStoreError`].
+    fn record_skill_injection<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        record: &'a harw_session_store::InjectionRecord,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        let _ = (sid, record);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Loads the triggered skill deliveries of a session in append order.
+    ///
+    /// # Description
+    /// Default: empty (a store without an injection archive).
+    ///
+    /// # Errors
+    /// Backend-specific, see [`StateStoreError`].
+    fn load_skill_injections<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<harw_session_store::InjectionRecord>>> {
+        let _ = sid;
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +811,52 @@ impl TranscriptStateStore {
 }
 
 impl StateStore for TranscriptStateStore {
+    fn record_skill_injection<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        record: &'a harw_session_store::InjectionRecord,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        Box::pin(async move {
+            let payload = record.to_payload()?;
+            self.append_record(sid, RecordKind::Lifecycle, payload)
+                .await
+        })
+    }
+
+    fn load_skill_injections<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<harw_session_store::InjectionRecord>>> {
+        Box::pin(async move {
+            let store = Arc::clone(&self.transcript_store);
+            let thread = (self.thread_for_session)(sid);
+            let sid = sid.clone();
+            run_blocking("transcript_load_skill_injections", move || {
+                let reader = match store.reader(&sid) {
+                    Ok(reader) => reader,
+                    Err(harw_session_store::SessionStoreError::NotFound { .. }) => {
+                        return Ok(Vec::new());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let mut records = Vec::new();
+                for record in reader {
+                    let record = record?;
+                    if record.kind != RecordKind::Lifecycle || record.thread != thread {
+                        continue;
+                    }
+                    if let Some(injection) =
+                        harw_session_store::InjectionRecord::from_payload(&record.payload)
+                    {
+                        records.push(injection);
+                    }
+                }
+                Ok(records)
+            })
+            .await
+        })
+    }
+
     fn record_agent_orchestration<'a>(
         &'a self,
         sid: &'a SessionId,
@@ -1030,6 +1109,7 @@ pub struct InMemoryStateStore {
     inner: Mutex<HashMap<String, Vec<TurnItem>>>,
     states: Mutex<HashMap<String, SessionStateSnapshot>>,
     orchestration: Mutex<HashMap<String, Vec<AgentOrchestrationEvent>>>,
+    injections: Mutex<HashMap<String, Vec<harw_session_store::InjectionRecord>>>,
 }
 
 impl InMemoryStateStore {
@@ -1070,6 +1150,32 @@ impl InMemoryStateStore {
 }
 
 impl StateStore for InMemoryStateStore {
+    fn record_skill_injection<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        record: &'a harw_session_store::InjectionRecord,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        Box::pin(async move {
+            lock_state(&self.injections, "record_skill_injection")?
+                .entry(sid.as_str().to_owned())
+                .or_default()
+                .push(record.clone());
+            Ok(())
+        })
+    }
+
+    fn load_skill_injections<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<harw_session_store::InjectionRecord>>> {
+        Box::pin(async move {
+            Ok(lock_state(&self.injections, "load_skill_injections")?
+                .get(sid.as_str())
+                .cloned()
+                .unwrap_or_default())
+        })
+    }
+
     fn record_agent_orchestration<'a>(
         &'a self,
         sid: &'a SessionId,

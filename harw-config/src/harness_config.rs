@@ -9,6 +9,7 @@ use crate::plan_toml::ToolsSection;
 use crate::research_toml::ResearchSection;
 use crate::retention_toml::RetentionSection;
 use crate::session_listener_toml::SessionListenerSection;
+use crate::skills_toml::SkillsSection;
 use crate::uia_worker_models::UiaWorkerModelsToml;
 
 /// Globale Harness-Konfiguration aus `.harw/config.toml`.
@@ -78,6 +79,10 @@ pub struct HarnessConfig {
     /// Obergrenzen und Fristen der Wartungsjobs. Siehe `memory_toml.rs`.
     #[serde(default)]
     pub memory: MemorySection,
+    /// `[skills]` — triggered skill injection into the per-round model
+    /// context (PL-95 S3). See `skills_toml.rs`.
+    #[serde(default)]
+    pub skills: SkillsSection,
     /// `[session_listener]` — Remote-Sitzungs-Ingress von `harw gateway`
     /// (nur global). Siehe `session_listener_toml.rs`.
     #[serde(default)]

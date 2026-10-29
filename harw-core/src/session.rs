@@ -291,6 +291,9 @@ pub struct AgentSession {
     /// Kontext-Ledger dieser Session: pro Turn je Fragment angeboten oder
     /// ausgelassen (nur Labels und Größen, nie Inhalt). `None`: kein Ledger.
     context_ledger: Option<std::sync::Arc<dyn harw_context_ledger::LedgerSink>>,
+    /// PL-95 S3: per-session triggered skill injector (section
+    /// `skills.triggered`). `None`: no triggered skill excerpts.
+    skill_injector: Option<std::sync::Arc<crate::skill_injection::SkillInjector>>,
     /// Fest zugeordnetes Provider-/Modellpaar für den Compaction-
     /// Zusammenfassungs-Aufruf dieser Session (Addendum C: interne
     /// Modellstellen). `(None, None)`: kein Pin gesetzt — `maybe_compact`
@@ -623,6 +626,7 @@ impl AgentSession {
             compaction_observer: None,
             tool_outcome_observer: None,
             context_ledger: None,
+            skill_injector: None,
             compaction_summary_model: (None, None),
             guard_policy: crate::guard::GuardPolicy::default(),
             drift_observer: None,
@@ -1134,6 +1138,23 @@ impl AgentSession {
     #[must_use]
     pub fn context_ledger(&self) -> Option<&std::sync::Arc<dyn harw_context_ledger::LedgerSink>> {
         self.context_ledger.as_ref()
+    }
+
+    /// Attaches the per-session triggered skill injector (PL-95 S3). `None`
+    /// leaves the session without triggered skill excerpts.
+    #[must_use]
+    pub fn with_skill_injector(
+        mut self,
+        injector: Option<std::sync::Arc<crate::skill_injection::SkillInjector>>,
+    ) -> Self {
+        self.skill_injector = injector;
+        self
+    }
+
+    /// The triggered skill injector of this session, if any.
+    #[must_use]
+    pub fn skill_injector(&self) -> Option<&std::sync::Arc<crate::skill_injection::SkillInjector>> {
+        self.skill_injector.as_ref()
     }
 
     /// Liefert den aktuell registrierten Tool-Outcome-Beobachter, falls vorhanden.

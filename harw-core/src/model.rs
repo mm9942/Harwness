@@ -513,7 +513,7 @@ fn fragment_to_v1(fragment: ContextFragmentV2) -> ContextFragment {
 /// `render_trust_blocks_with_detail` rendert eine solche Sektion mit
 /// `DetailMode::Full` (Entscheidung „nur verdrahten, was ausdrücklich
 /// gesetzt ist", siehe `context_budget.rs`s Moduldoku).
-fn section_detail_map(
+pub(crate) fn section_detail_map(
     program: &ContextProgram,
 ) -> std::collections::BTreeMap<SectionName, DetailMode> {
     let mut map = std::collections::BTreeMap::new();

@@ -91,6 +91,7 @@ use crate::plan_toml::ToolsSection;
 use crate::research_toml::ResearchSection;
 use crate::retention_toml::RetentionSection;
 use crate::scope::{PERMISSIONS_DEFAULT_MODE_ORDER, POLICY_VISIBILITY_SCOPE_ORDER};
+use crate::skills_toml::SkillsSection;
 use crate::uia_worker_models::UiaWorkerModelsToml;
 
 /// Grober Vertrauens-/Ebenen-Kontext eines `merge_layer_into`-Aufrufs;
@@ -1582,6 +1583,51 @@ fn merge_memory(
     );
 }
 
+// `[skills]` (PL-97 B1) — alle vier Felder `ProfileReplaces`: Home und Profil
+// ersetzen, ein nicht vertrautes Projekt darf keines setzen (wird gemeldet und
+// verworfen) — insbesondere nicht `inject_imported` einschalten.
+fn merge_skills(
+    trusted: &mut HarnessConfig,
+    incoming: SkillsSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+) {
+    let present = |field: &str| field_present(raw, &["skills", field]);
+    profile_replaces(
+        &mut trusted.skills.triggered_injection,
+        incoming.triggered_injection,
+        present("triggered_injection"),
+        role,
+        "skills.triggered_injection",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.skills.inject_imported,
+        incoming.inject_imported,
+        present("inject_imported"),
+        role,
+        "skills.inject_imported",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.skills.per_turn_bytes,
+        incoming.per_turn_bytes,
+        present("per_turn_bytes"),
+        role,
+        "skills.per_turn_bytes",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.skills.per_session_bytes,
+        incoming.per_session_bytes,
+        present("per_session_bytes"),
+        role,
+        "skills.per_session_bytes",
+        layer_path,
+    );
+}
+
 // `[permissions]` (Abschnitt 1.11) — alle fuenf direkten Felder sowie
 // `RuleToml.tool`/`.pattern` sicherheitskritisch (🔒).
 fn merge_permissions(
@@ -2373,6 +2419,7 @@ pub(crate) fn merge_layer_into(
     merge_mode(trusted, incoming.mode, raw, role, layer_path);
     merge_research(trusted, incoming.research, raw, role, layer_path, &mut out);
     merge_memory(trusted, incoming.memory, raw, role, layer_path);
+    merge_skills(trusted, incoming.skills, raw, role, layer_path);
     merge_session_listener(
         trusted,
         incoming.session_listener.clone(),
@@ -2981,6 +3028,52 @@ mod tests {
             &layer_path(),
         );
         assert_eq!(trusted.retention.tui_log.max_files, Some(99));
+        Ok(())
+    }
+
+    #[test]
+    fn test_skills_trusted_layers_replace_untrusted_project_is_ignored() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(trusted.skills.triggered_injection);
+        assert!(!trusted.skills.inject_imported);
+
+        let home = "[skills]\ntriggered_injection = false\nper_turn_bytes = 2048";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert!(!trusted.skills.triggered_injection);
+        assert_eq!(trusted.skills.per_turn_bytes, 2048);
+
+        let profile = "[skills]\ntriggered_injection = true";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert!(trusted.skills.triggered_injection);
+        // Ein Profil ohne `per_turn_bytes` lässt den Home-Wert stehen.
+        assert_eq!(trusted.skills.per_turn_bytes, 2048);
+
+        // Ein nicht vertrauter Projekt-Layer darf nichts davon ändern.
+        let project = "[skills]\ninject_imported = true\nper_session_bytes = 65536";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(project).map_err(ctx("parse project"))?,
+            &raw_from(project)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert!(!trusted.skills.inject_imported);
+        assert_eq!(
+            trusted.skills.per_session_bytes,
+            crate::DEFAULT_SKILLS_PER_SESSION_BYTES
+        );
         Ok(())
     }
 

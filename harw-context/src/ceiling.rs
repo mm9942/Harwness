@@ -13,8 +13,9 @@
 //! [`ContextCeiling`], [`CeilingViolation`], die Konstanten
 //! [`ROOT_CONTEXT_SECTIONS`] (Obergrenze jeder lokal-vertrauten Wurzeldecke),
 //! [`LEGACY_V1_SECTION`] (Sektion der v1-Brücke, W3 C-PROTO / F-163) sowie
-//! [`DELEGATION_TARGETS_SECTION`] und [`CONTINUATION_INSTRUCTION_SECTION`]
-//! (vom Turn-Loop selbst erzeugte Instruktionsfragmente).
+//! [`DELEGATION_TARGETS_SECTION`], [`CONTINUATION_INSTRUCTION_SECTION`] und
+//! [`SKILLS_TRIGGERED_SECTION`] (vom Turn-Loop selbst erzeugte
+//! Instruktionsfragmente).
 //!
 //! # Kosten
 //! [`ContextCeiling::admits`] vertraut `Fragment::cost` nicht blind: die
@@ -84,6 +85,17 @@ pub const DELEGATION_TARGETS_SECTION: &str = "delegation.targets";
 /// admitted by root ceilings.
 pub const CONTINUATION_INSTRUCTION_SECTION: &str = "continuation.instruction";
 
+/// Section of the skill excerpts the turn loop injects per round (PL-95 S3).
+///
+/// # Description
+/// `harw_core`'s skill injector delivers deterministic, budgeted excerpts of
+/// bundled and trusted-layer skills (trust class `Instruction`; imported
+/// skills `Evidence`) as fragments of this section, after the cache-stable
+/// prefix. The same literal as `harw_catalog::FRAGMENT_SECTION`
+/// (`harw-context` cannot depend on `harw-catalog`; the equality is asserted
+/// in `harw-core`'s tests).
+pub const SKILLS_TRIGGERED_SECTION: &str = "skills.triggered";
+
 /// Upper bound of sections a locally trusted root session may expose.
 ///
 /// # Description
@@ -104,6 +116,8 @@ pub const CONTINUATION_INSTRUCTION_SECTION: &str = "continuation.instruction";
 ///   targets (`transfer_to_<name>`).
 /// - [`CONTINUATION_INSTRUCTION_SECTION`]: the turn loop's own continuation
 ///   hint after a `MaxTokens` cut-off.
+/// - [`SKILLS_TRIGGERED_SECTION`]: the turn loop's own triggered skill
+///   excerpts (PL-95 S3).
 ///
 /// Deliberately absent: `credential.*`, `secret.*`, full or sibling
 /// transcripts, `plan.current`, `web.fetch_allowlist`, and every other
@@ -120,6 +134,7 @@ pub const CONTINUATION_INSTRUCTION_SECTION: &str = "continuation.instruction";
 /// assert!(ROOT_CONTEXT_SECTIONS.contains(&"history.tail"));
 /// assert!(ROOT_CONTEXT_SECTIONS.contains(&DELEGATION_TARGETS_SECTION));
 /// assert!(ROOT_CONTEXT_SECTIONS.contains(&CONTINUATION_INSTRUCTION_SECTION));
+/// assert!(ROOT_CONTEXT_SECTIONS.contains(&harw_context::ceiling::SKILLS_TRIGGERED_SECTION));
 /// ```
 pub const ROOT_CONTEXT_SECTIONS: &[&str] = &[
     "task.objective",
@@ -129,6 +144,7 @@ pub const ROOT_CONTEXT_SECTIONS: &[&str] = &[
     LEGACY_V1_SECTION,
     DELEGATION_TARGETS_SECTION,
     CONTINUATION_INSTRUCTION_SECTION,
+    SKILLS_TRIGGERED_SECTION,
 ];
 
 /// Lower bound for the cost of a fragment, derived from its body.
@@ -512,6 +528,7 @@ mod tests {
         }
         assert!(ROOT_CONTEXT_SECTIONS.contains(&LEGACY_V1_SECTION));
         assert!(ROOT_CONTEXT_SECTIONS.contains(&"history.tail"));
+        assert!(ROOT_CONTEXT_SECTIONS.contains(&super::SKILLS_TRIGGERED_SECTION));
         for forbidden in [
             "credential.tokens",
             "secret.values",

@@ -41,6 +41,7 @@ pub mod session_listener_toml;
 // Runde 5, Teil N: `[shell] max_timeout_secs`.
 pub mod shell_limits;
 pub mod skill_toml;
+pub mod skills_toml;
 // Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle.
 pub mod uia_worker_models;
 pub mod web_toml;
@@ -112,6 +113,9 @@ pub use role_models::*;
 pub use scope::{FIELD_TABLE, FieldScope, MergeRule, Scope, SettingScope};
 pub use session_listener_toml::SessionListenerSection;
 pub use skill_toml::SkillToml;
+pub use skills_toml::{
+    DEFAULT_SKILLS_PER_SESSION_BYTES, DEFAULT_SKILLS_PER_TURN_BYTES, SkillsSection,
+};
 pub use uia_worker_models::{
     FOLLOW_UIA_VALUE, ResolvedUiaWorkerModel, UIA_WORKER_ROLES, UiaWorkerModelChoice,
     UiaWorkerModelSource, UiaWorkerModelsToml, catalog_provider_of, provider_is_logged_in,

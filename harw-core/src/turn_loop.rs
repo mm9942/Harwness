@@ -4757,6 +4757,12 @@ async fn drive_turn(
         context_retry_used = false;
         max_tokens_retry_used = false;
         max_output_override = None;
+        // PL-95 S3: die Skill-Auszüge dieses Requests haben das Modell
+        // erreicht — erst jetzt gilt eine Auswahl als Lieferung. Ein vorher
+        // verworfener Request (Neubau nach Notfall-Verdichtung, Wiederholung
+        // nach Kontextüberschreitung) hinterlässt so kein Ereignis, und jede
+        // Lieferung wird genau einmal festgehalten.
+        record_skill_injections(session, store, &handle.turn_id).await;
         // Ab hier angehängte Tool-Ergebnisse sind in `last_round_usage`
         // noch nicht enthalten — `maybe_compact` schätzt sie ab dieser Marke.
         history_mark = session.history().len();
@@ -5872,6 +5878,13 @@ impl RoundBudget {
 /// Runde [`AgentSession::max_output_tokens`] (Wiederholung mit verdoppeltem
 /// Limit).
 ///
+/// PL-95 S3: die getriggerten Skill-Auszüge der Sitzung
+/// ([`crate::skill_injection::SkillInjector`]) kommen als Fragmente der
+/// Sektion `skills.triggered` hinter den cache-stabilen Präfix (siehe
+/// [`prepare_skill_injection`] und [`append_skill_blocks`]). Festgehalten
+/// (`injection`-Ereignis) werden sie erst, wenn das Modell den Request
+/// beantwortet hat ([`record_skill_injections`] in `drive_turn`).
+///
 /// # Errors
 /// Fehler von [`collect_tools`] und der Kontextmontage
 /// ([`ModelRequest::with_context_program`]).
@@ -5906,6 +5919,11 @@ async fn assemble_round_request(
             None => tracing::warn!("turn_loop.wrap_up_fragment_unavailable"),
         }
     }
+    // PL-95 S3: getriggerte Skill-Auszüge dieser Runde (aus den seit der
+    // letzten Runde angehängten Verlaufs-Items).
+    let skill_fragments = prepare_skill_injection(session)
+        .map(|round| round.fragments)
+        .unwrap_or_default();
     let instructions = load_instructions(session).await;
     let mut tools = collect_tools(session)?;
 
@@ -5971,12 +5989,14 @@ async fn assemble_round_request(
 
     // Kontext-Ledger: die Fakten der gesammelten Fragmente festhalten, bevor
     // die Montage sie verbraucht (nur wenn ein Ledger registriert ist).
-    let ledger_facts = session
-        .context_ledger()
-        .map(|_| crate::context_ledger_hook::snapshot(&fragments));
+    let ledger_facts = session.context_ledger().map(|_| {
+        let mut facts = crate::context_ledger_hook::snapshot(&fragments);
+        facts.extend(crate::context_ledger_hook::snapshot(&skill_fragments));
+        facts
+    });
 
     // 4. Model-Call (provider-neutral).
-    let request = ModelRequest::with_context_program(
+    let mut request = ModelRequest::with_context_program(
         instructions,
         fragments,
         session.history().clone(),
@@ -5992,6 +6012,19 @@ async fn assemble_round_request(
     .with_max_output_tokens(max_output_tokens)
     .with_cancel_token(control.cancel_token().clone())
     .with_identity(request_identity(session));
+    // PL-95 S3: die Auszüge hinter den cache-stabilen Präfix; danach trägt
+    // der Injektor nur noch, was dieser Request tatsächlich enthält.
+    let skill_labels = match ceiling {
+        Some(ceiling) if !skill_fragments.is_empty() => {
+            append_skill_blocks(&mut request, skill_fragments, program, ceiling)
+        }
+        _ => Vec::new(),
+    };
+    if let Some(injector) = session.skill_injector() {
+        for label in injector.reconcile(&skill_labels) {
+            tracing::debug!(%label, "skills.triggered.omitted");
+        }
+    }
     if let (Some(ledger), Some(facts)) = (session.context_ledger(), ledger_facts.as_deref()) {
         crate::context_ledger_hook::record_turn(
             ledger.as_ref(),
@@ -6005,6 +6038,216 @@ async fn assemble_round_request(
         Some(sink) => request.with_stream_sink(sink),
         None => request,
     })
+}
+
+/// Bereitet die getriggerten Skill-Auszüge einer Runde vor (PL-95 S3).
+///
+/// # Description
+/// `None`, wenn die Sitzung keinen [`crate::skill_injection::SkillInjector`]
+/// trägt oder die Sektion `skills.triggered` nicht zustellen kann
+/// (Aktivierung aus, keine Kontext-Decke, Decke ohne die Sektion) —
+/// fail-closed: dann wird gar nicht erst ausgewählt, und noch aktive Auszüge
+/// verlassen den Kontext. Ein Fragment, dessen Label die Aktivierung
+/// abschaltet, verwirft schon der Injektor; es belegt weder Dedupe noch
+/// Sitzungsbudget.
+fn prepare_skill_injection(
+    session: &AgentSession,
+) -> Option<crate::skill_injection::RoundInjection> {
+    let injector = session.skill_injector()?;
+    let activation = session.activation();
+    let deliverable = activation.is_context_enabled(harw_catalog::FRAGMENT_SECTION)
+        && session
+            .spawn_context()
+            .and_then(|spawn_context| spawn_context.ceiling.as_ref())
+            .is_some_and(|ceiling| {
+                harw_context::SectionName::try_new(harw_catalog::FRAGMENT_SECTION)
+                    .is_ok_and(|section| ceiling.sections.contains(&section))
+            });
+    if !deliverable {
+        for label in injector.reconcile(&[]) {
+            tracing::debug!(%label, "skills.triggered.undeliverable");
+        }
+        return None;
+    }
+    let window_tokens = RoundBudget::of(session).window_tokens;
+    let round = injector.prepare_round_with(session.history(), window_tokens, |fragment| {
+        activation.is_context_enabled(fragment.label.as_str())
+    });
+    for delivered in &round.delivered {
+        tracing::debug!(
+            skill = %delivered.skill,
+            section = delivered.section.as_deref().unwrap_or(""),
+            kind = delivered.kind.as_str(),
+            key = %delivered.key,
+            bytes = delivered.bytes,
+            "skills.triggered.selected"
+        );
+    }
+    for dropped in &round.dropped {
+        tracing::debug!(
+            skill = %dropped.skill,
+            section = dropped.section.as_deref().unwrap_or(""),
+            reason = %dropped.reason,
+            "skills.triggered.dropped"
+        );
+    }
+    for skill in &round.suppressed {
+        tracing::debug!(%skill, "skills.triggered.imported_suppressed");
+    }
+    for label in &round.withheld {
+        tracing::debug!(%label, "skills.triggered.withheld");
+    }
+    for label in &round.evicted {
+        tracing::debug!(%label, "skills.triggered.evicted");
+    }
+    Some(round)
+}
+
+/// Hält jede Skill-Lieferung des eben beantworteten Requests als
+/// `injection`-Ereignis fest (PL-95 S3), genau einmal je Lieferung
+/// ([`crate::skill_injection::SkillInjector::confirm_delivered`]). Ein
+/// Store-Fehler wird nur geloggt — die Messung darf den Turn nie abbrechen.
+async fn record_skill_injections(
+    session: &AgentSession,
+    store: &dyn StateStore,
+    turn_id: &harw_types::TurnId,
+) {
+    let Some(injector) = session.skill_injector() else {
+        return;
+    };
+    for delivered in injector.confirm_delivered() {
+        tracing::info!(
+            skill = %delivered.skill,
+            section = delivered.section.as_deref().unwrap_or(""),
+            kind = delivered.kind.as_str(),
+            key = %delivered.key,
+            bytes = delivered.bytes,
+            "skills.triggered.injected"
+        );
+        let record = delivered.to_record(turn_id.as_str());
+        if let Err(error) = store.record_skill_injection(session.id(), &record).await {
+            tracing::warn!(%error, skill = %delivered.skill, "turn_loop.skill_injection_record_failed");
+        }
+    }
+}
+
+/// Rendert die Skill-Auszüge einer Runde hinter den cache-stabilen Präfix
+/// (PL-95 S3).
+///
+/// # Description
+/// Die Auszüge laufen durch eine eigene Montage gegen das Kontextprogramm
+/// der Sitzung (`exclude`, `must_include`, Detailgrad; ohne Programm ein
+/// leeres) und ihre Decke (Sektion, Vertrauen, Sektionsbudget). Als
+/// Gesamtbudget bleibt, was die reguläre Montage von der Decke übrig lässt.
+///
+/// Platzierung: jeder Provider rendert `system_prompt` und danach
+/// `instruction_fragments` der Reihe nach. Der Instruktionsblock wird
+/// deshalb als **letztes** Element an [`ModelRequest::instruction_fragments`]
+/// gehängt — System-Prompt, gebundene Skill-Fragmente und L0-Katalog bleiben
+/// ein byte-identischer Präfix, auch wenn ein neuer Auszug hinzukommt. Der
+/// Datenblock (importierte Skills, `Evidence`) kommt in
+/// [`ModelRequest::data_block`] hinter den Verlauf. Ohne Programm liest kein
+/// Provider `ModelRequest::context` (F-016/G-023); dieser eine Weg gilt
+/// deshalb für beide Pfade. Ein Montagefehler wird geloggt; der Request
+/// bleibt dann ohne Auszüge.
+///
+/// # Returns
+/// Die Labels der aufgenommenen Auszüge.
+fn append_skill_blocks(
+    request: &mut ModelRequest,
+    fragments: Vec<harw_context::Fragment>,
+    program: Option<&harw_agent_dsl::executable::ContextProgram>,
+    ceiling: &harw_context::ContextCeiling,
+) -> Vec<String> {
+    let empty_program = harw_agent_dsl::executable::ContextProgram::default();
+    // Programmpfad: die reguläre Montage hat ihren Teil des Gesamtbudgets
+    // der Decke schon verbraucht (ohne Programm montiert sie nicht).
+    let spent = match program {
+        Some(_) => {
+            u32::try_from(request.context_assembly.estimated_context_bytes).unwrap_or(u32::MAX)
+        }
+        None => 0,
+    };
+    let budget = harw_context::ContextBudgetSpec {
+        total: harw_lens_types::BudgetSpec {
+            total: ceiling.budget.total.total.saturating_sub(spent),
+        },
+        per_section: ceiling.budget.per_section.clone(),
+    };
+    let assembled = match crate::context_budget::Assembly::gather(fragments)
+        .admit(program.unwrap_or(&empty_program), ceiling)
+        .and_then(|admitted| admitted.budget(&budget))
+    {
+        Ok(budgeted) => budgeted.render(),
+        Err(error) => {
+            tracing::warn!(%error, "turn_loop.skill_injection_montage_failed");
+            return Vec::new();
+        }
+    };
+    let included: Vec<&harw_context::Fragment> = assembled
+        .sections
+        .iter()
+        .flat_map(|section| section.fragments.iter())
+        .collect();
+    let instruction_rank = harw_context::TrustClass::Instruction.trust_rank();
+    let has_instruction = included
+        .iter()
+        .any(|fragment| fragment.trust.trust_rank() == instruction_rank);
+    let has_data = included
+        .iter()
+        .any(|fragment| fragment.trust.trust_rank() != instruction_rank);
+    let labels: Vec<String> = included
+        .iter()
+        .map(|fragment| fragment.label.as_str().to_owned())
+        .collect();
+    let detail = program
+        .map(crate::model::section_detail_map)
+        .unwrap_or_default();
+    let blocks = assembled.render_trust_blocks_with_detail(&harw_observe::NullSink, &detail);
+    if has_instruction {
+        request.instruction_fragments.push(blocks.instruction_block);
+    }
+    if has_data {
+        request.data_block = Some(match request.data_block.take() {
+            Some(mut existing) => {
+                existing.push_str("\n\n");
+                existing.push_str(&blocks.data_block);
+                existing
+            }
+            None => blocks.data_block,
+        });
+    }
+    let assembly = &mut request.context_assembly;
+    assembly
+        .included_fragment_labels
+        .extend(labels.iter().cloned());
+    assembly.estimated_context_bytes = assembly
+        .estimated_context_bytes
+        .saturating_add(assembled.spent.0 as usize);
+    for (label, reason) in &assembled.omissions {
+        let text = match reason {
+            harw_context::OmissionReason::OverBudget => "over-budget",
+            harw_context::OmissionReason::BelowCeiling => "below-ceiling",
+            harw_context::OmissionReason::ExcludedByProgram => "excluded-by-program",
+            harw_context::OmissionReason::Superseded => "superseded",
+        };
+        assembly
+            .omitted_fragment_labels
+            .push(label.as_str().to_owned());
+        assembly
+            .omission_reasons
+            .push((label.as_str().to_owned(), text.to_owned()));
+    }
+    labels
+}
+
+/// Setzt den Skill-Injektor der Sitzung nach einer echten Verdichtung zurück
+/// (PL-95 S3): gelieferte Auszüge dürfen erneut kommen, das Sitzungsbudget
+/// beginnt neu.
+fn reset_skill_injection_after_compaction(session: &AgentSession) {
+    if let Some(injector) = session.skill_injector() {
+        injector.reset_after_compaction();
+    }
 }
 
 /// Verdichtet die Historie auf ein Token-Ziel
@@ -6065,6 +6308,7 @@ async fn run_budget_compaction(
                 elided_results = outcome.elided_results,
                 "turn_loop.compaction_applied",
             );
+            reset_skill_injection_after_compaction(session);
             if let Err(error) = store.save_history(session.id(), session.history()).await {
                 tracing::warn!(%error, "turn_loop.compaction_save_history_failed");
             }
@@ -6201,6 +6445,9 @@ async fn maybe_hard_compact_at_turn_start(
                 summarized = outcome.summarized,
                 "turn_loop.turn_start_hard_compact_applied",
             );
+            if !outcome.no_op {
+                reset_skill_injection_after_compaction(session);
+            }
             if let Err(error) = store.save_history(session.id(), session.history()).await {
                 tracing::warn!(%error, "turn_loop.turn_start_hard_compact_save_history_failed");
             }

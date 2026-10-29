@@ -91,6 +91,8 @@ fn test_field_table_exhaustive_harness_config() {
         jobs: _,
         // `[memory]`, eigener Abschnittstest unten.
         memory: _,
+        // PL-97 B1: `[skills]`, eigener Abschnittstest unten.
+        skills: _,
         // `[retention]`, eigener Abschnittstest unten.
         retention: _,
         // `[session_listener]`, eigener Abschnittstest unten.
@@ -878,6 +880,34 @@ fn test_field_table_exhaustive_memory_section() {
         "memory.context_ledger",
         "memory.security_signals",
         "memory.llm_extraction",
+    ] {
+        assert_path_in_field_table_exactly_once(path);
+    }
+}
+
+// ---------------------------------------------------------------------
+// [skills] (4 Felder) — PL-97 B1: getriggerte Skill-Auszüge
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_skills_section() {
+    let harw_config::SkillsSection {
+        triggered_injection,
+        inject_imported,
+        per_turn_bytes,
+        per_session_bytes,
+    } = harw_config::SkillsSection::default();
+    let _ = (
+        triggered_injection,
+        inject_imported,
+        per_turn_bytes,
+        per_session_bytes,
+    );
+    for path in [
+        "skills.triggered_injection",
+        "skills.inject_imported",
+        "skills.per_turn_bytes",
+        "skills.per_session_bytes",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }
