@@ -254,14 +254,18 @@ impl ShellLimits {
     /// | `cpu_secs` | `cpu_time_max` (`RLIMIT_CPU`) | trampoline or `prlimit` |
     /// | `fsize_bytes` | `file_size_max` (`RLIMIT_FSIZE`) | trampoline or `prlimit` |
     /// | `nofile` | `open_files_max` (`RLIMIT_NOFILE`) | trampoline or `prlimit` |
+    /// | `nproc` | `process_count_max` (`RLIMIT_NPROC`, per real UID) | trampoline or `prlimit` |
     /// | `nproc` | `pids_max` (the whole job) | the job cgroup |
     /// | `require_rlimits` | `require_rlimits` | the runtime refuses to start without rlimits |
     ///
     /// [`RLIMIT_UNLIMITED`] becomes "no limit" (`None`). `tmpfs_bytes` is
     /// not a resource of the request but the Bubblewrap `/tmp` size of the
-    /// sandbox. The request has no `RLIMIT_NPROC`: the process count is
-    /// capped by the job cgroup's `pids.max`, so without a delegated cgroup
-    /// root the runtime reports it as not enforced instead of capping it.
+    /// sandbox. `nproc` sets both process caps: `process_count_max` is the
+    /// `RLIMIT_NPROC` the legacy `prlimit` path set (it counts every task of
+    /// the real UID, see the module note), so the fork-bomb guard holds
+    /// without a delegated cgroup root; `pids_max` is the exact per-job cap
+    /// of the job cgroup's `pids.max`, reported as not enforced where there
+    /// is no cgroup root.
     ///
     /// `memory_max` stays `None`: the legacy path never had a job-wide
     /// memory cap, only the per-process `RLIMIT_AS`. Mapping `as_bytes` to
@@ -275,6 +279,7 @@ impl ShellLimits {
             cpu_time_max: Some(self.cpu_secs),
             file_size_max: bounded(self.fsize_bytes),
             open_files_max: u32::try_from(self.nofile).ok(),
+            process_count_max: bounded(self.nproc),
             pids_max: u32::try_from(self.nproc).ok(),
             require_rlimits: self.require_rlimits,
             ..harw_command::ResourceRequest::default()
@@ -421,6 +426,9 @@ mod tests {
         assert_eq!(request.file_size_max, Some(256 * MIB));
         assert_eq!(request.open_files_max, Some(256));
         assert_eq!(request.pids_max, Some(4096));
+        // RLIMIT_NPROC wie auf dem bisherigen prlimit-Weg, auch ohne cgroup.
+        assert_eq!(request.process_count_max, Some(4096));
+        assert!(request.requests_rlimits());
         assert!(request.require_rlimits);
         assert!(request.validate().is_ok());
         // Jobs: no address-space or file-size cap.
@@ -430,6 +438,7 @@ mod tests {
         assert_eq!(jobs.file_size_max, None);
         assert_eq!(jobs.open_files_max, Some(4096));
         assert_eq!(jobs.pids_max, Some(4096));
+        assert_eq!(jobs.process_count_max, Some(4096));
     }
 
     fn strings(args: &[OsString]) -> Vec<String> {

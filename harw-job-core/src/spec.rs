@@ -355,6 +355,19 @@ pub struct ResourceRequest {
     /// runaway allocation in a process that has no cgroup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_space_max: Option<u64>,
+    /// Process count ceiling (`RLIMIT_NPROC`), applied to the job's first
+    /// process and inherited by everything it starts.
+    ///
+    /// Linux counts `RLIMIT_NPROC` **per real UID**, not per job: a fork
+    /// fails once the user owning the job has this many processes (threads
+    /// included) in total, wherever they run, and a process with
+    /// `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN` is exempt. Inside a user
+    /// namespace (the Bubblewrap backends) the count belongs to the
+    /// namespace's UID mapping of that user. It is a fork-bomb guard that
+    /// holds without a resource domain; `pids_max` (the job cgroup) stays
+    /// the exact per-job cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_count_max: Option<u64>,
     /// CPU time ceiling per process in seconds (`RLIMIT_CPU`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_time_max: Option<u64>,
@@ -385,11 +398,12 @@ impl ResourceRequest {
             || self.io_weight.is_some()
     }
 
-    /// Whether any per-process rlimit (`address_space_max`, `cpu_time_max`,
-    /// `file_size_max`, `open_files_max`) is requested.
+    /// Whether any rlimit (`address_space_max`, `process_count_max`,
+    /// `cpu_time_max`, `file_size_max`, `open_files_max`) is requested.
     #[must_use]
     pub fn requests_rlimits(&self) -> bool {
         self.address_space_max.is_some()
+            || self.process_count_max.is_some()
             || self.cpu_time_max.is_some()
             || self.file_size_max.is_some()
             || self.open_files_max.is_some()
@@ -465,6 +479,7 @@ impl ResourceRequest {
         }
         for (resource, zero) in [
             ("address_space_max", self.address_space_max == Some(0)),
+            ("process_count_max", self.process_count_max == Some(0)),
             ("cpu_time_max", self.cpu_time_max == Some(0)),
             ("file_size_max", self.file_size_max == Some(0)),
             ("open_files_max", self.open_files_max == Some(0)),
@@ -1266,6 +1281,10 @@ mod tests {
                 ..ResourceRequest::default()
             },
             ResourceRequest {
+                process_count_max: Some(4096),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
                 cpu_time_max: Some(60),
                 ..ResourceRequest::default()
             },
@@ -1284,6 +1303,10 @@ mod tests {
         for request in [
             ResourceRequest {
                 address_space_max: Some(0),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                process_count_max: Some(0),
                 ..ResourceRequest::default()
             },
             ResourceRequest {
@@ -1308,6 +1331,46 @@ mod tests {
         let old = r#"{"memory_max": 1024}"#;
         let parsed: Result<ResourceRequest, _> = serde_json::from_str(old);
         assert!(parsed.is_ok_and(|r| !r.requests_rlimits()));
+    }
+
+    #[test]
+    fn process_count_max_is_additive_and_validated() -> TestResult {
+        // An old request without the field parses, and nothing new appears
+        // when it is written back.
+        let old = r#"{"pids_max":4096,"address_space_max":1073741824}"#;
+        let parsed: ResourceRequest = serde_json::from_str(old).map_err(ctx("parse old"))?;
+        assert_eq!(parsed.process_count_max, None);
+        assert_eq!(
+            serde_json::to_string(&parsed).map_err(ctx("write old"))?,
+            old
+        );
+
+        let request = ResourceRequest {
+            pids_max: Some(4096),
+            process_count_max: Some(4096),
+            ..ResourceRequest::default()
+        };
+        let json = serde_json::to_string(&request).map_err(ctx("write"))?;
+        assert!(json.contains(r#""process_count_max":4096"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ResourceRequest>(&json).map_err(ctx("parse"))?,
+            request
+        );
+        assert!(request.requests_rlimits());
+        assert!(request.validate().is_ok());
+
+        let zero = ResourceRequest {
+            process_count_max: Some(0),
+            ..ResourceRequest::default()
+        };
+        assert_eq!(
+            zero.validate(),
+            Err(SpecError::InvalidResource {
+                resource: "process_count_max",
+                constraint: "must be greater than zero",
+            })
+        );
+        Ok(())
     }
 
     fn scoped_spec() -> TestResult<JobSpec> {

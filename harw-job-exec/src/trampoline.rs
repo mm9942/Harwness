@@ -249,6 +249,10 @@ fn apply_controls(plan: &ExecPlanV1) -> Result<Controls, ExecError> {
 }
 
 /// The steps after the cgroup membership: rlimits → sandbox.
+///
+/// Every rlimit of the plan is set here, `RLIMIT_NPROC` included, before
+/// `NO_NEW_PRIVS`, Landlock and `exec`; a failing `setrlimit` refuses the
+/// job instead of running it without the limit.
 fn apply_process_controls(plan: &ExecPlanV1) -> Result<SandboxReport, ExecError> {
     plan.rlimits
         .apply_to_current_process()
@@ -424,6 +428,31 @@ mod tests {
         assert!(controls.refusal.is_none());
         assert_eq!(controls.report.filesystem, EnforcementState::NotEnforced);
         assert_eq!(controls.report.resource_limits, EnforcementState::Enforced);
+        Ok(())
+    }
+
+    /// `RLIMIT_NPROC` is applied with the other rlimits and counts for the
+    /// report. The test re-applies the process' current values, so it calls
+    /// the real `setrlimit(RLIMIT_NPROC)` without restricting the test.
+    #[test]
+    fn test_apply_controls_sets_the_process_count_rlimit() -> TestResult {
+        use harw_job_linux::RlimitResource;
+        use harw_job_linux::RlimitSet;
+        use harw_job_linux::resources::current_rlimit;
+        let current = current_rlimit(RlimitResource::Nproc);
+        let plan = ExecPlanV1::new("/bin/true")
+            .with_rlimits(RlimitSet::new().with(RlimitResource::Nproc, current));
+        assert_eq!(
+            plan.rlimits
+                .iter()
+                .map(|(resource, _)| resource)
+                .collect::<Vec<_>>(),
+            [RlimitResource::Nproc]
+        );
+        let controls = apply_controls(&plan).map_err(ctx("apply"))?;
+        assert!(controls.refusal.is_none());
+        assert_eq!(controls.report.resource_limits, EnforcementState::Enforced);
+        assert_eq!(current_rlimit(RlimitResource::Nproc), current);
         Ok(())
     }
 

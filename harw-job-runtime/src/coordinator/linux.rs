@@ -790,8 +790,11 @@ fn job_resources(spec: &JobSpec) -> JobResources {
         io_weight,
         // Enforced by the coordinator's deadline, not by a resource domain.
         wall_timeout: _,
-        // Per-process limits: `rlimit_set`.
+        // Per-process limits: `rlimit_set`. `process_count_max`
+        // (`RLIMIT_NPROC`) is the rlimit guard next to the cgroup's
+        // `pids_max`: it holds without a cgroup root.
         address_space_max: _,
+        process_count_max: _,
         cpu_time_max: _,
         file_size_max: _,
         open_files_max: _,
@@ -1678,6 +1681,12 @@ fn rlimit_set(spec: &JobSpec) -> harw_job_linux::RlimitSet {
     if let Some(bytes) = resources.address_space_max {
         set.set(RlimitResource::AddressSpace, RlimitValue::fixed(bytes));
     }
+    // `RLIMIT_NPROC` counts the processes of the job's real UID (in its
+    // user namespace), not of the job alone; see
+    // `ResourceRequest::process_count_max`.
+    if let Some(count) = resources.process_count_max {
+        set.set(RlimitResource::Nproc, RlimitValue::fixed(count));
+    }
     if let Some(seconds) = resources.cpu_time_max {
         set.set(RlimitResource::Cpu, RlimitValue::fixed(seconds));
     }
@@ -1732,6 +1741,9 @@ fn apply_prlimit(launch: &mut Launch, spec: &JobSpec) -> EnforcementState {
     let mut wrapped: Vec<OsString> = Vec::new();
     if let Some(bytes) = resources.address_space_max {
         wrapped.push(format!("--as={bytes}").into());
+    }
+    if let Some(count) = resources.process_count_max {
+        wrapped.push(format!("--nproc={count}").into());
     }
     if let Some(seconds) = resources.cpu_time_max {
         wrapped.push(format!("--cpu={seconds}").into());
@@ -2778,7 +2790,9 @@ mod scope_tests {
     };
     use harw_job_exec::ExecPlanV1;
     use harw_job_linux::sandbox::plan_landlock;
-    use harw_job_linux::{CpuQuota, IoLimits, JobResources, LandlockMode};
+    use harw_job_linux::{
+        CpuQuota, IoLimits, JobResources, LandlockMode, RlimitResource, RlimitValue,
+    };
     use harw_types::WorkId;
 
     use super::{
@@ -2932,6 +2946,7 @@ mod scope_tests {
                 pids_max: Some(64),
                 io_weight: Some(50),
                 address_space_max: Some(1 << 30),
+                process_count_max: Some(4096),
                 cpu_time_max: Some(60),
                 file_size_max: Some(1 << 20),
                 open_files_max: Some(256),
@@ -2958,7 +2973,12 @@ mod scope_tests {
                 rlimits: rlimit_set(&spec),
             }
         );
-        assert_eq!(resources.rlimits.iter().count(), 4);
+        assert_eq!(resources.rlimits.iter().count(), 5);
+        // `pids_max` stays the cgroup's, `process_count_max` is the rlimit.
+        assert_eq!(
+            resources.rlimits.get(RlimitResource::Nproc),
+            Some(RlimitValue::fixed(4096))
+        );
         resources.validate().map_err(ctx("cgroup domain"))?;
         // Every job limit needs a resource domain: without a cgroup root it
         // is reported `not_enforced`, never dropped.
@@ -3266,6 +3286,43 @@ mod scope_tests {
         Ok(())
     }
 
+    /// The Landlock trampoline gets `RLIMIT_NPROC` in its plan (applied
+    /// before `NO_NEW_PRIVS`, Landlock and `exec`): the process count is
+    /// capped without a cgroup root. Without the field the plan has no
+    /// `RLIMIT_NPROC`, and nothing claims one.
+    #[test]
+    fn landlock_trampoline_plan_carries_the_process_count_rlimit() -> TestResult {
+        let scene = scene()?;
+        let executor = landlock_executor(&scene.plans, Some(6))?;
+        let capped = JobSpec::command("true")
+            .sandbox(SandboxProfileName::WorkspaceBuild)
+            .resources(ResourceRequest {
+                pids_max: Some(4096),
+                process_count_max: Some(4096),
+                ..ResourceRequest::default()
+            })
+            .build()
+            .map_err(ctx("capped"))?;
+        let plan = landlock_plan(&executor, &capped, &scene)?;
+        assert_eq!(
+            plan.rlimits.get(RlimitResource::Nproc),
+            Some(RlimitValue::fixed(4096))
+        );
+        assert_eq!(plan.rlimits, rlimit_set(&capped));
+
+        let uncapped = JobSpec::command("true")
+            .sandbox(SandboxProfileName::WorkspaceBuild)
+            .resources(ResourceRequest {
+                pids_max: Some(4096),
+                ..ResourceRequest::default()
+            })
+            .build()
+            .map_err(ctx("uncapped"))?;
+        let plan = landlock_plan(&executor, &uncapped, &scene)?;
+        assert_eq!(plan.rlimits.get(RlimitResource::Nproc), None);
+        Ok(())
+    }
+
     #[test]
     fn scoped_policy_is_none_without_a_scope() -> TestResult {
         let spec = JobSpec::command("true").build().map_err(ctx("spec"))?;
@@ -3324,6 +3381,7 @@ mod chain_tests {
     fn rlimited() -> ResourceRequest {
         ResourceRequest {
             open_files_max: Some(256),
+            process_count_max: Some(4096),
             ..ResourceRequest::default()
         }
     }
@@ -3424,6 +3482,12 @@ mod chain_tests {
             }))
         );
         assert_eq!(outer.rlimits, rlimit_set(&spec));
+        // `RLIMIT_NPROC` is set before bwrap and again inside, before
+        // Landlock: the process count is capped without a cgroup root.
+        assert_eq!(
+            outer.rlimits.get(harw_job_linux::RlimitResource::Nproc),
+            Some(harw_job_linux::RlimitValue::fixed(4096))
+        );
         assert!(outer.sandbox.is_none(), "no Landlock outside the namespace");
         assert_eq!(outer.sandbox_requirement, SandboxRequirement::None);
         let args = &outer.args;

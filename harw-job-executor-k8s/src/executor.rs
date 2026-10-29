@@ -245,9 +245,9 @@ fn profile_name(profile: SandboxProfileName) -> String {
 /// only `memory_max` becomes a container limit; a CPU weight or bandwidth
 /// (`cpu_weight`, `cpu_max`), a pids ceiling, a memory throttling threshold
 /// (`memory_high`), an I/O weight (`io_weight`) and the per-process rlimits
-/// (`address_space_max`, `cpu_time_max`, `file_size_max`, `open_files_max`;
-/// a pod spec has no ulimit field) are not set, so the report never claims
-/// the resource dimension `Enforced`.
+/// (`address_space_max`, `process_count_max`, `cpu_time_max`,
+/// `file_size_max`, `open_files_max`; a pod spec has no ulimit field) are
+/// not set, so the report never claims the resource dimension `Enforced`.
 ///
 /// The request is destructured without a rest pattern, so a new
 /// [`ResourceRequest`] field does not compile until it is classified here.
@@ -265,6 +265,7 @@ fn inexpressible_limits(resources: &ResourceRequest) -> bool {
         wall_timeout: _,
         // Per-process rlimits: not in the pod manifest either.
         address_space_max,
+        process_count_max,
         cpu_time_max,
         file_size_max,
         open_files_max,
@@ -277,6 +278,7 @@ fn inexpressible_limits(resources: &ResourceRequest) -> bool {
         || pids_max.is_some()
         || io_weight.is_some()
         || address_space_max.is_some()
+        || process_count_max.is_some()
         || cpu_time_max.is_some()
         || file_size_max.is_some()
         || open_files_max.is_some()

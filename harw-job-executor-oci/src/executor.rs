@@ -70,9 +70,9 @@ fn cpu_shares(weight: u16) -> u64 {
 /// Whether `resources` asks for a limit that [`create_body`] does not pass
 /// to the engine: `memory_high` (no field of the engine API), `cpu_max` and
 /// `io_weight` (not mapped, so nothing to read back) and every per-process
-/// rlimit (`address_space_max`, `cpu_time_max`, `file_size_max`,
-/// `open_files_max`; not mapped to `Ulimits`). The report then never claims
-/// the resource dimension `Enforced`.
+/// rlimit (`address_space_max`, `process_count_max`, `cpu_time_max`,
+/// `file_size_max`, `open_files_max`; not mapped to `Ulimits`). The report
+/// then never claims the resource dimension `Enforced`.
 ///
 /// The request is destructured without a rest pattern, so a new
 /// [`ResourceRequest`] field does not compile until it is classified here.
@@ -91,6 +91,7 @@ fn unmapped_limits(resources: &ResourceRequest) -> bool {
         wall_timeout: _,
         // Per-process rlimits: not applied by this backend.
         address_space_max,
+        process_count_max,
         cpu_time_max,
         file_size_max,
         open_files_max,
@@ -101,6 +102,7 @@ fn unmapped_limits(resources: &ResourceRequest) -> bool {
         || cpu_max.is_some()
         || io_weight.is_some()
         || address_space_max.is_some()
+        || process_count_max.is_some()
         || cpu_time_max.is_some()
         || file_size_max.is_some()
         || open_files_max.is_some()

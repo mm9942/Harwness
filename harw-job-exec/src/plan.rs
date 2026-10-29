@@ -199,7 +199,11 @@ pub struct ExecPlanV1 {
     /// How the job's cgroup membership is established, if at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cgroup: Option<CgroupMembership>,
-    /// rlimits to apply to the trampoline (and so to the job).
+    /// rlimits to apply to the trampoline (and so to the job), before the
+    /// sandbox and `exec`. Any [`harw_job_linux::RlimitResource`] may appear,
+    /// `RLIMIT_NPROC` (`Nproc`) included: the job runtime's
+    /// `process_count_max`, which caps the process count where no job
+    /// cgroup exists (counted per real UID, not per job).
     #[serde(default)]
     pub rlimits: RlimitSet,
     /// Sandbox policy to apply, if any.
@@ -589,6 +593,32 @@ mod tests {
             root.check("0::/\n"),
             Err(ExecError::InvalidPlan { .. })
         ));
+        Ok(())
+    }
+
+    /// `RLIMIT_NPROC` travels in the plan like every other rlimit (key
+    /// `Nproc`), in the deterministic application order of the set.
+    #[test]
+    fn test_process_count_rlimit_is_encoded_in_the_plan() -> TestResult {
+        let plan = ExecPlanV1::new("/bin/true").with_rlimits(
+            RlimitSet::new()
+                .with(RlimitResource::Nofile, RlimitValue::fixed(256))
+                .with(RlimitResource::Nproc, RlimitValue::fixed(4096)),
+        );
+        let json =
+            String::from_utf8(plan.to_json().map_err(ctx("serialize"))?).map_err(ctx("utf-8"))?;
+        assert!(
+            json.contains(
+                r#""rlimits":{"limits":{"Nproc":{"soft":4096,"hard":4096},"Nofile":{"soft":256,"hard":256}}}"#
+            ),
+            "{json}"
+        );
+        let parsed = ExecPlanV1::from_json(json.as_bytes()).map_err(ctx("parse"))?;
+        assert_eq!(parsed, plan);
+        assert_eq!(
+            parsed.rlimits.get(RlimitResource::Nproc),
+            Some(RlimitValue::fixed(4096))
+        );
         Ok(())
     }
 

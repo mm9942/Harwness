@@ -1748,6 +1748,53 @@ async fn per_process_rlimits_reach_the_program_and_are_reported() -> TestResult 
     Ok(())
 }
 
+/// `process_count_max` is its own rlimit (`RLIMIT_NPROC`): on the plain
+/// path `prlimit --nproc` applies it, and the report says `enforced` only
+/// when it was applied (no cgroup limit is requested here).
+#[tokio::test]
+async fn process_count_rlimit_reaches_the_program_and_is_reported() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-nproc")?;
+    let coordinator = fixture.coordinator(
+        &runner,
+        LinuxExecutorOptions::default(),
+        Duration::from_secs(3),
+    )?;
+    // Never above the current hard limit (raising it needs privilege) and
+    // high enough not to starve the test user's other processes.
+    let current = harw_job_linux::resources::current_rlimit(harw_job_linux::RlimitResource::Nproc);
+    let count = current.hard.map_or(1 << 20, |hard| hard.min(1 << 20));
+    let spec = JobSpec::command("/bin/cat")
+        .arg("/proc/self/limits")
+        .resources(ResourceRequest {
+            process_count_max: Some(count),
+            ..ResourceRequest::default()
+        })
+        .build()
+        .map_err(ctx("spec"))?;
+    let handle = coordinator
+        .submit(envelope(spec)?)
+        .await
+        .map_err(ctx("submit"))?;
+    let result = wait(handle).await?;
+    assert!(result.is_success(), "{result:?}");
+    let report = result.sandbox.ok_or(TestError::Missing("report"))?;
+    if prlimit_present() {
+        let limits = String::from_utf8_lossy(&result.stdout);
+        let line = limits
+            .lines()
+            .find(|line| line.starts_with("Max processes"))
+            .ok_or(TestError::Missing("Max processes"))?;
+        let values: Vec<&str> = line.split_whitespace().skip(2).take(2).collect();
+        let expected = count.to_string();
+        assert_eq!(values, [expected.as_str(), expected.as_str()], "{line}");
+        assert_eq!(report.resource_limits, EnforcementState::Enforced);
+    } else {
+        assert_eq!(report.resource_limits, EnforcementState::NotEnforced);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_job_without_rlimits_is_not_wrapped() -> TestResult {
     let fixture = Fixture::new()?;

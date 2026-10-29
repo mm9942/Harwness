@@ -22,6 +22,8 @@
 //! - `cpu_time_max` → `RLIMIT_CPU`, `file_size_max` → `RLIMIT_FSIZE`,
 //!   `open_files_max` → `RLIMIT_NOFILE` (soft = hard = the request). These
 //!   are per-process limits XNU enforces as asked.
+//! - `process_count_max` → `RLIMIT_NPROC` as asked (it is the per-user
+//!   limit by definition); with `pids_max` the smaller value is set.
 //! - `address_space_max` → not mapped (`RLIMIT_AS`; the same XNU caveat as
 //!   `memory_max` applies).
 //! - `wall_timeout` → not an rlimit; enforced by the supervisor through
@@ -156,6 +158,7 @@ impl RlimitPlan {
             pids_max,
             io_weight,
             address_space_max,
+            process_count_max,
             cpu_time_max,
             file_size_max,
             open_files_max,
@@ -171,11 +174,22 @@ impl RlimitPlan {
         let mut weaker = false;
         // Mapped exactly as requested.
         let mut faithful = false;
-        if let Some(pids) = pids_max {
-            let pids = u64::from(*pids);
-            set.set(RlimitResource::Processes, Some(pids), Some(pids))?;
+        // `pids_max` and `process_count_max` share `RLIMIT_NPROC`: the
+        // smaller one wins.
+        let processes = match (pids_max.map(u64::from), *process_count_max) {
+            (Some(pids), Some(count)) => Some(pids.min(count)),
+            (pids, count) => pids.or(count),
+        };
+        if let Some(processes) = processes {
+            set.set(RlimitResource::Processes, Some(processes), Some(processes))?;
+        }
+        if pids_max.is_some() {
             // RLIMIT_NPROC is per user, never per job.
             weaker = true;
+        }
+        if process_count_max.is_some() {
+            // Asked as the per-user RLIMIT_NPROC: applied as asked.
+            faithful = true;
         }
         for (resource, limit) in [
             (RlimitResource::Cpu, *cpu_time_max),
@@ -298,6 +312,41 @@ mod tests {
             RlimitPlan::from_request(&invalid),
             Err(ProcessError::InvalidArgument { .. })
         ));
+        Ok(())
+    }
+
+    /// PL-97 E2f: `process_count_max` is the per-user `RLIMIT_NPROC` and is
+    /// applied as asked; with `pids_max` the smaller value wins and the
+    /// per-job `pids_max` keeps the dimension `Partial`.
+    #[test]
+    fn test_plan_maps_process_count_max_to_nproc() -> TestResult {
+        let cases = [
+            (None, Some(100), 100, EnforcementState::Enforced),
+            (Some(64), Some(100), 64, EnforcementState::Partial),
+            (Some(200), Some(100), 100, EnforcementState::Partial),
+            (Some(64), None, 64, EnforcementState::Partial),
+        ];
+        for (pids_max, process_count_max, expected, state) in cases {
+            let request = ResourceRequest {
+                pids_max,
+                process_count_max,
+                ..ResourceRequest::default()
+            };
+            let plan = RlimitPlan::from_request(&request).map_err(ctx("plan"))?;
+            assert_eq!(
+                plan.set.get(RlimitResource::Processes),
+                Some(RlimitValue {
+                    soft: Some(expected),
+                    hard: Some(expected)
+                }),
+                "{pids_max:?}/{process_count_max:?}"
+            );
+            assert_eq!(
+                plan.resource_limits, state,
+                "{pids_max:?}/{process_count_max:?}"
+            );
+            assert!(plan.unmapped.is_empty(), "{:?}", plan.unmapped);
+        }
         Ok(())
     }
 

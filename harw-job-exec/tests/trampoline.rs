@@ -123,6 +123,36 @@ fn test_rlimits_reach_the_job() -> TestResult {
     Ok(())
 }
 
+/// `RLIMIT_NPROC` (the job runtime's `process_count_max`) reaches the job:
+/// the trampoline sets it before `exec`, soft = hard. The value never
+/// exceeds the current hard limit and leaves room for the user's other
+/// processes (the limit counts per real UID).
+#[test]
+fn test_process_count_rlimit_reaches_the_job() -> TestResult {
+    let current = harw_job_linux::resources::current_rlimit(RlimitResource::Nproc);
+    let count = current.hard.map_or(1 << 20, |hard| hard.min(1 << 20));
+    let plan = ExecPlanV1::new("/bin/cat")
+        .with_args(["/proc/self/limits"])
+        .with_rlimits(RlimitSet::new().with(RlimitResource::Nproc, RlimitValue::fixed(count)));
+    let run = run(&plan, &[])?;
+    assert_eq!(run.code(), Some(0), "stderr: {}", run.stderr());
+    let limits = String::from_utf8_lossy(&run.output.stdout);
+    let Some(line) = limits
+        .lines()
+        .find(|line| line.starts_with("Max processes"))
+    else {
+        return fail(format!("no process limit in {limits}"));
+    };
+    let values: Vec<&str> = line.split_whitespace().skip(2).take(2).collect();
+    let expected = count.to_string();
+    assert_eq!(values, [expected.as_str(), expected.as_str()], "{line}");
+    assert_eq!(
+        run.report.map(|report| report.resource_limits),
+        Some(EnforcementState::Enforced)
+    );
+    Ok(())
+}
+
 #[test]
 fn test_read_only_analysis_denies_workspace_writes_when_landlock_enforces() -> TestResult {
     let workspace = scratch()?;

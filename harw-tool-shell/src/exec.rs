@@ -3096,17 +3096,18 @@ mod tests {
         check_rlimits_and_tmpfs(&provider, true).await
     }
 
-    /// PL-97 E2b: in der Sandbox-Kette setzen Trampolin oder `prlimit` des
-    /// Job-Runtimes dieselben rlimits; die Prozesszahl deckelt `pids.max`
-    /// der Job-Cgroup statt `RLIMIT_NPROC` (ohne Cgroup-Wurzel gemeldet,
-    /// nicht gedeckelt), die tmpfs-Grenze gilt unverändert.
+    /// PL-97 E2b/E2f: in der Sandbox-Kette setzen Trampolin oder `prlimit`
+    /// des Job-Runtimes dieselben fünf rlimits, einschließlich
+    /// `RLIMIT_NPROC` (4096, auch ohne Cgroup-Wurzel); `pids.max` der
+    /// Job-Cgroup deckelt die Prozesszahl zusätzlich je Job. Die
+    /// tmpfs-Grenze gilt unverändert.
     async fn chain_rlimits_and_tmpfs_size_apply_inside_sandbox() -> TestResult {
         if !chain_available() {
             eprintln!("übersprungen: der Kommando-Port hat kein Bubblewrap-Backend");
             return Ok(());
         }
         let provider = ShellToolProvider::new().with_execution(SandboxExecution::Chain);
-        check_rlimits_and_tmpfs(&provider, false).await
+        check_rlimits_and_tmpfs(&provider, true).await
     }
     sandbox_test!(
         test_exec_chain_rlimits_and_tmpfs_size_apply,
@@ -4468,6 +4469,8 @@ mod tests {
         assert_eq!(spec.resources.memory_max, None);
         assert_eq!(spec.resources.address_space_max, Some(limits.as_bytes));
         assert_eq!(spec.resources.pids_max, Some(4096));
+        // RLIMIT_NPROC wie auf dem bisherigen prlimit-Weg (PL-97 E2f).
+        assert_eq!(spec.resources.process_count_max, Some(4096));
         assert_eq!(spec.resources.cpu_time_max, Some(limits.cpu_secs));
         assert_eq!(
             spec.resources.wall_timeout,

@@ -497,8 +497,17 @@ executor logs that once ("runs without full cgroup/landlock enforcement").
 
 The same work package maps every job limit of `ResourceRequest` into the
 job cgroup (`memory_max`, `memory_high`, `cpu_weight`, `cpu_max`,
-`pids_max`, `io_weight`) and the per-process limits into the trampoline's
-rlimits. A limit the host cannot apply is reported, never dropped: without
+`pids_max`, `io_weight`) and the rlimits (`address_space_max`,
+`process_count_max`, `cpu_time_max`, `file_size_max`, `open_files_max`)
+into the trampoline's rlimit set, or into `prlimit` on the plain backend.
+`process_count_max` (PL-97 E2f) is an additive, optional field: a request
+written before it parses unchanged, and `0` is refused like `pids_max`.
+The rlimits count for the report's `resource_limits` dimension: `enforced`
+only when the trampoline or `prlimit` applied them, `not_enforced` when no
+`prlimit` exists on the plain path, and `require_rlimits = true` then
+refuses the job before it starts. The OCI and Kubernetes executors apply
+no rlimit, `process_count_max` included: they report the dimension below
+`enforced` and refuse a job with `require_rlimits`. A limit the host cannot apply is reported, never dropped: without
 a cgroup root every job limit counts as `not_enforced`, and a controller
 that is not delegated makes the cgroup report `partial` or `not_enforced`.
 The OCI and Kubernetes executors do not map or report `memory_high`,
@@ -526,14 +535,29 @@ as a host job. It submits one job-runtime request
 | profile | `no_network` with `WriteWorkspace`, else `read_only_analysis` |
 | requirement | `best_effort`; `required` with a write scope |
 | modules | the trusted `SandboxProfile` (Cargo, tmux), the host `PATH` binding and the `/tmp` size of `ShellLimits` |
-| resources | `ShellLimits::job_resources` of the provider's limits; for the `shell.exec` defaults 2 GiB `RLIMIT_AS` (per process; no job-wide `memory_max`, which the legacy path never had), the CPU seconds (grown with the granted timeout), 256 MiB `RLIMIT_FSIZE`, 256 `RLIMIT_NOFILE` and 4096 `pids_max`; `require_rlimits` as configured |
+| resources | `ShellLimits::job_resources` of the provider's limits; for the `shell.exec` defaults 2 GiB `RLIMIT_AS` (per process; no job-wide `memory_max`, which the legacy path never had), the CPU seconds (grown with the granted timeout), 256 MiB `RLIMIT_FSIZE`, 256 `RLIMIT_NOFILE`, 4096 `process_count_max` (`RLIMIT_NPROC`) and 4096 `pids_max`; `require_rlimits` as configured |
 | deadline | `shell.exec`: the effective timeout; `job.start`: none of its own (stop is explicit), as before |
 | environment | empty: the sandbox sets its own baseline, as the legacy plan did with `--clearenv` |
 | stdio | piped through the command port, which keeps the output caps, truncation, cancel and exit codes of before |
 
-`RLIMIT_NPROC` has no field in the request: the process count is capped by
-the job cgroup's `pids.max` instead, so without a cgroup root it is
-reported as not enforced rather than capped. `prlimit` is looked up only
+`nproc` sets two caps. `process_count_max` is `RLIMIT_NPROC`, the limit
+the legacy `prlimit` path set: the trampoline backends call
+`setrlimit(RLIMIT_NPROC)` with the other rlimits, before `NO_NEW_PRIVS`,
+Landlock and `exec` (on `bwrap-trampoline` in the outer stage, before
+`bwrap`, and again inside), and the plain `bwrap` backend passes
+`--nproc` to its `prlimit`. It holds without a cgroup root. Like every
+`RLIMIT_NPROC` it counts the tasks (threads included) of the job's real
+UID, not of the job alone, and a process with `CAP_SYS_RESOURCE` or
+`CAP_SYS_ADMIN` is exempt: it is a fork-bomb guard, not a per-job count.
+`pids_max` stays the exact per-job cap of the job cgroup's `pids.max`;
+without a cgroup root that cgroup limit is reported as not enforced.
+The report has no rlimit dimension of its own (a known E2f deviation):
+`resource_limits` is the worse of the cgroup and the rlimit state, so with
+`pids_max` requested and no cgroup root it reads `not_enforced` even
+though `RLIMIT_NPROC` holds. This under-claims, never over-claims; a
+separate `rlimits` (or `process_count`) dimension in `SandboxReport` is an
+open PL-97 follow-up.
+`prlimit` is looked up only
 where it is needed: on the plain `bwrap` backend the runtime runs its own
 `prlimit` in front of `bwrap` (same check and warning as before); the
 trampoline backends set the rlimits themselves, so a host without
@@ -649,17 +673,6 @@ the host submission, logged once per backend.
 - A scoped job with profile modules on `bwrap-trampoline` gets no Landlock
   rules for the modules: the coordinator's scoped inner policy does not add
   `module_binds` yet.
-- `RLIMIT_NPROC` on the chain: `nproc` maps to `pids_max`, which needs the
-  job cgroup. Without a cgroup root the process count is not capped
-  (fork-bomb protection the legacy `prlimit` gave). Since the host port has
-  no cgroup root yet (E3, below), this is a fail-open regression for every
-  production `shell.exec` and `job.start` now that `chain` is the default.
-  Shipping chain-by-default without the cap needs an explicit owner
-  sign-off in the PL-97 plan/ledger, and the PR description must name the
-  behaviour change. `execution = "legacy"` is the workaround where that
-  matters. Fix: carry `RLIMIT_NPROC` through `ResourceRequest` and the
-  trampoline (`harw-job-core`, `harw-job-exec`), or land the E3 cgroup
-  root.
 - The runner's child root is its canonical working directory, not the
   parent's bound sandbox root (the discovered project root, narrowed by a
   compiled write path), which only the runtime assembly computes. That is

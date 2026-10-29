@@ -775,6 +775,8 @@ mod tests {
         assert!(resources.require_rlimits);
         assert_eq!(resources.cpu_time_max, Some(limits.cpu_secs));
         assert_eq!(resources.open_files_max, u32::try_from(limits.nofile).ok());
+        // RLIMIT_NPROC wie auf dem bisherigen prlimit-Weg (PL-97 E2f).
+        assert_eq!(resources.process_count_max, Some(4096));
 
         let mut plain = chain_provider(Some(harw_command::BackendKind::Bwrap));
         plain.limits.require_rlimits = true;

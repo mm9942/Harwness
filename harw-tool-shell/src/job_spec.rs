@@ -8,9 +8,8 @@
 //! runner into its child-agent backend. [`SandboxExecution::Legacy`] stays
 //! the builder default, the safe fallback of a provider built without
 //! config, and `execution = "legacy"` is the opt-out. The chain loses
-//! things the legacy path has (`RLIMIT_NPROC` without a cgroup root,
-//! nested `bwrap` under Landlock, module rules inside a scoped job; see the
-//! design doc's known gaps).
+//! things the legacy path has (nested `bwrap` under Landlock, module rules
+//! inside a scoped job; see the design doc's known gaps).
 //!
 //! # What is submitted
 //! With [`SandboxExecution::Chain`] a sandboxed call no longer
@@ -24,7 +23,7 @@
 //! | profile | `no_network` with [`Permission::WriteWorkspace`], else `read_only_analysis`: the network stays denied, as in the legacy plan |
 //! | requirement | `best_effort`; `required` with a write scope |
 //! | modules | the trusted [`SandboxProfile`] (Cargo, tmux), the host `PATH` binding and the `/tmp` size of [`ShellLimits`] |
-//! | resources | [`ShellLimits::job_resources`]; the timeout becomes the attempt's deadline |
+//! | resources | [`ShellLimits::job_resources`] (`process_count_max` and `pids_max` from `nproc`); the timeout becomes the attempt's deadline |
 //! | environment | empty: the sandbox sets its own baseline, as the legacy plan did |
 //!
 //! Output caps, truncation, cancel and exit codes stay with the command
