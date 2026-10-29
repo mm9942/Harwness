@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(popup.selected_name(), Some("model"));
         assert_eq!(
             popup.footer_line().as_deref(),
-            Some("Usage: /model [show|list|switch <modell-id>]")
+            Some("Usage: /model [show|list|switch <model-id>]")
         );
         let rows = render_rows(&popup, 80, 3);
         assert!(rows[2].starts_with("Usage: /model"), "{rows:?}");
@@ -866,7 +866,7 @@ mod tests {
         assert_eq!(popup.selected_name(), Some("switch"));
         assert_eq!(
             popup.footer_line().as_deref(),
-            Some("Usage: /model switch <modell-id>")
+            Some("Usage: /model switch <model-id>")
         );
         assert_eq!(popup.tab_outcome(), TabOutcome::Accept("switch".to_owned()));
         assert_eq!(popup.completion_line("switch"), "/model switch ");
@@ -974,7 +974,9 @@ mod tests {
     fn localized_subcommand_refresh_keeps_grammar_and_selection() -> TestResult {
         use crate::i18n::with_language;
         use harw_config::UiLanguage;
-        let spec = model_spec()?;
+        let mut spec = model_spec()?;
+        // Supplied syntax is payload even when it uses a legacy German metavar.
+        spec.subcommands[2].args = "<modell-id>";
         let registry = CommandRegistry::new(vec![spec.clone()]);
         let mut popup =
             CommandPopup::for_subcommands(&spec).ok_or(TestError::Missing("model subcommands"))?;
@@ -994,6 +996,62 @@ mod tests {
                 PopupAction::Stay
             );
         });
+        Ok(())
+    }
+
+    #[test]
+    fn owned_subcommand_locale_refresh_renders_narrowly_and_keeps_navigation() -> TestResult {
+        use crate::i18n::{tr_for, with_language};
+        use harw_config::UiLanguage;
+        let english = model_spec()?;
+        assert_eq!(english.subcommands[0].summary, "Show the active model");
+        for language in UiLanguage::ALL {
+            let mut popup = CommandPopup::for_subcommands(&english)
+                .ok_or(TestError::Missing("model subcommands"))?;
+            popup.on_query_change("sw");
+            with_language(language, || -> TestResult {
+                let registry = CommandRegistry::built_in().map_err(ctx("localized registry"))?;
+                popup.refresh_catalog(&registry);
+                assert_eq!(popup.query, "sw");
+                assert_eq!(popup.selected_name(), Some("switch"));
+                let description = tr_for(
+                    language,
+                    "commands.subcommand.model.switch",
+                    "Switch provider and model immediately",
+                );
+                assert_eq!(popup.items[2].description, description);
+                for width in [1, 8, 20, 80] {
+                    let area = Rect::new(0, 0, width, 3);
+                    let mut buffer = Buffer::empty(area);
+                    popup.render(area, &mut buffer, style::Theme::Dark);
+                    if width == 80 {
+                        let text = crate::test_support::display_buffer_text(&buffer);
+                        assert!(
+                            text.contains("/model switch <model-id>"),
+                            "{language:?}: {text}"
+                        );
+                        if matches!(
+                            language,
+                            UiLanguage::Japanese
+                                | UiLanguage::ChineseSimplified
+                                | UiLanguage::Korean
+                        ) {
+                            assert!(text.contains(description), "{language:?}: {text}");
+                        }
+                    }
+                }
+                assert_eq!(popup.completion_line("switch"), "/model switch ");
+                popup.on_query_change("");
+                assert_eq!(popup.selected_name(), Some("show"));
+                assert_eq!(popup.on_key(make_key(KeyCode::Down)), PopupAction::Stay);
+                assert_eq!(popup.selected_name(), Some("list"));
+                assert_eq!(
+                    popup.on_key(make_key(KeyCode::Enter)),
+                    PopupAction::Accept("list".to_owned())
+                );
+                Ok(())
+            })?;
+        }
         Ok(())
     }
 }

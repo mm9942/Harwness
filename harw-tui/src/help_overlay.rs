@@ -6,7 +6,7 @@
 //! Zeigt eine statische Übersicht aller Slash-Befehle (gruppiert nach
 //! [`CommandDomain`], mit Kurzbeschreibung, Aufruf und Unterbefehlen; lokale
 //! TUI-Befehle als „lokal“, geplante aus
-//! [`crate::command_catalog::PLANNED_COMMANDS`] als „geplant“), der aktiven
+//! [`crate::command_catalog::planned_commands`] als „geplant“), der aktiven
 //! Tastenbelegung ([`KeyBindings::describe`]) und der Eingabe-Präfixe.
 //! Die Daten werden beim Öffnen kopiert; die Ansicht lädt nichts nach.
 //!
@@ -31,7 +31,7 @@ use ratatui::{
 };
 
 use crate::command::{CommandDomain, CommandOrigin, CommandSpec};
-use crate::command_catalog::PLANNED_COMMANDS;
+use crate::command_catalog::planned_commands;
 use crate::i18n::{tr, tr_args};
 use crate::keybindings::KeyBindings;
 use crate::overlay_view::{
@@ -207,14 +207,14 @@ fn fixed_keys() -> [(&'static str, &'static str); 19] {
 fn prefixes() -> [(&'static str, &'static str); 8] {
     [
         (
-            "/befehl",
+            "/command",
             tr(
                 "help.prefix.slash",
                 "Run a slash command; the popup completes names (see Commands tab).",
             ),
         ),
         (
-            "!befehl",
+            "!command",
             tr(
                 "help.prefix.shell",
                 "Run a shell command in the project directory (subject to approval).",
@@ -235,14 +235,14 @@ fn prefixes() -> [(&'static str, &'static str); 8] {
             ),
         ),
         (
-            "@rolle text",
+            "@role text",
             tr(
                 "help.prefix.role",
                 "Send a message with a routing hint to an agent role.",
             ),
         ),
         (
-            "@pfad",
+            "@path",
             tr(
                 "help.prefix.file",
                 "Attach a project file to the message (size limited).",
@@ -429,7 +429,7 @@ impl HelpOverlay {
             .iter()
             .map(CommandEntry::from_spec)
             .collect();
-        for (name, summary) in PLANNED_COMMANDS {
+        for (name, summary) in planned_commands() {
             let bare = name.trim_start_matches('/');
             if commands.iter().any(|entry| entry.name == bare) {
                 continue;
@@ -949,7 +949,7 @@ mod tests {
             help.selected = index;
             assert_eq!(help.on_key(key(KeyCode::Enter)), OverlayOutcome::Stay);
         }
-        for (name, _) in PLANNED_COMMANDS {
+        for (name, _) in planned_commands() {
             let bare = name.trim_start_matches('/');
             assert!(help.commands.iter().any(|entry| entry.name == bare));
         }
@@ -975,7 +975,7 @@ mod tests {
         help.render(area, &mut buf, Theme::Dark);
         let text = buffer_text(&buf);
         assert!(text.contains("!!"));
-        assert!(text.contains("@rolle"));
+        assert!(text.contains("@role"));
         Ok(())
     }
 
@@ -1102,7 +1102,7 @@ mod tests {
                 let labels: Vec<_> = fixed_keys().into_iter().collect();
                 assert_eq!(labels[0].1, "↑/↓, k/j, w/s");
                 assert!(labels[8].0.contains("/jobs stop"));
-                assert_eq!(prefixes()[0].0, "/befehl");
+                assert_eq!(prefixes()[0].0, "/command");
                 assert!(prefixes()[3].1.contains("/memory record"));
             });
         }
