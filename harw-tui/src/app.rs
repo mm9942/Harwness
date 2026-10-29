@@ -138,6 +138,9 @@ pub(crate) mod jobs_glue;
 // Ansichten zeigen nach einer Änderung sofort den Live-Stand (Tests).
 #[cfg(test)]
 mod live_views_tests;
+// PL-97 C3: Querformat-Fenster (drei Spalten, flach, kompakt).
+#[cfg(test)]
+mod mission_landscape_tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -2563,7 +2566,14 @@ impl ChatApp {
     /// PL-97 C2 (`Alt+L`): öffnet die Detailansicht des Agenten, den das
     /// LIVE-Fenster gerade zeigt (Fokus: Agenten-Panel), bzw. schließt sie
     /// wieder. Im Hochformat ist LIVE selbst nie fokussiert.
+    /// PL-97 C3: mit dem LIVE-Fenster der Querformat-Mittelspalte erscheinen
+    /// die Details dort an Ort und Stelle, LIVE bekommt den Fokus.
     fn toggle_live_detail(&mut self) -> bool {
+        if self.agent_detail.is_none()
+            && (self.panels.revealed.live || self.mission.live_detail_agent().is_some())
+        {
+            return self.toggle_live_detail_in_place();
+        }
         if self.mission.live_expanded {
             if self
                 .agent_detail
@@ -2589,10 +2599,38 @@ impl ChatApp {
         opened
     }
 
+    /// PL-97 C3: `Alt+L`/Enter am LIVE-Fenster der Querformat-Mittelspalte —
+    /// zeigt die bestehende Agenten-Detailansicht der LIVE-Quelle im selben
+    /// Rechteck (LIVE fokussiert, ohne Vollbild) bzw. schließt sie wieder.
+    fn toggle_live_detail_in_place(&mut self) -> bool {
+        if self.mission.live_detail_agent().is_some() {
+            self.mission.close_live_detail();
+            return true;
+        }
+        let Some(agent) = self
+            .mission
+            .live_source(&self.agent_monitor, Instant::now())
+            .map(|(live, _)| live.id.clone())
+        else {
+            return false;
+        };
+        // Ein angesehener Fehlschlag wandert in die Sammelzeile (wie Enter in
+        // der Agentenliste).
+        self.agent_monitor.mark_seen(&agent);
+        self.panels.agents_visible = true;
+        self.panels.maximized = false;
+        self.panels.focus = crate::panes::PaneFocus::Live;
+        self.mission.open_live_detail(&agent);
+        true
+    }
+
     /// Schließt die Detailansicht, wenn das Agenten-Panel Fokus oder
     /// Sichtbarkeit verloren hat (F3/F4/Esc über die Panel-Logik). Eine
     /// Job-Detailansicht aus dem Jobs-Fenster bleibt dort offen.
+    /// PL-97 C3: ebenso die LIVE-Details an Ort und Stelle, sobald LIVE den
+    /// Fokus verliert.
     fn sync_agent_detail(&mut self) {
+        self.mission.sync_live_focus(self.panels.focus);
         let agents_active = self.panels.agents_visible
             && match self.panels.focus {
                 crate::panes::PaneFocus::Agents => true,
@@ -7000,9 +7038,16 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
             crate::panes::PaneFocus::Agents => handle_agents_list_key(app, key),
             crate::panes::PaneFocus::Jobs => handle_jobs_window_key(app, key),
             crate::panes::PaneFocus::Finished => handle_finished_window_key(app, key),
-            // LIVE ist reine Anzeige und nimmt keine Tasten (fokussierbar
-            // erst als aufgeklapptes Querformat-Fenster, PL-97 C3).
-            crate::panes::PaneFocus::Live => false,
+            // PL-97 C3: LIVE ist nur als Fenster der Querformat-Mittelspalte
+            // fokussierbar; dort scrollt es, Enter zeigt/schließt die Details.
+            crate::panes::PaneFocus::Live
+                if key.code == KeyCode::Enter && key.modifiers.is_empty() =>
+            {
+                app.toggle_live_detail_in_place()
+            }
+            crate::panes::PaneFocus::Live => {
+                crate::mission::live_window::handle_key(&mut app.mission, key)
+            }
             crate::panes::PaneFocus::Explorer => handle_explorer_key(app, key),
             crate::panes::PaneFocus::Workbench => app.handle_workbench_key(key),
             crate::panes::PaneFocus::Chat => false,
@@ -10463,6 +10508,8 @@ fn render_viewport(
         Seg::new(20, vec![context_suffix, context_short, String::new()]),
         Seg::optional(60, agents_suffix),
         Seg::optional(30, explorer_suffix),
+        // PL-97 C3: eingeschaltete Werkbank ohne Platz in dieser Lage.
+        Seg::optional(25, body.workbench_hint),
         Seg::optional(240, cancel_suffix),
         Seg::optional(230, queue_cleared_suffix),
         Seg::optional(250, quit_suffix),
@@ -15620,8 +15667,9 @@ forbidden = [{forbidden}]
     }
 
     /// Breite Terminals (Landschaft) behalten ihre Aufteilung: die Recency-Slots
-    /// ändern das Bild bei 120×42 nicht (der Streifen gehört nur zum
-    /// Portrait-Dock).
+    /// ändern das Bild bei 120×42 nur im LIVE-Fenster der Mittelspalte
+    /// (PL-97 C3: dort stehen sie wie im Streifen des Portrait-Docks); Chat,
+    /// Finished/Failed, Agenten und Jobs bleiben Zelle für Zelle gleich.
     #[test]
     fn wide_layout_is_unchanged_by_the_recency_slots() -> TestResult {
         let mut app = test_chat_app()?;
@@ -15632,7 +15680,29 @@ forbidden = [{forbidden}]
             text: "zweite Meldung".to_owned(),
         });
         let after = rendered_rows(&app, 120, 42)?;
-        assert_eq!(before, after);
+        let live = app
+            .last_regions
+            .get()
+            .live
+            .ok_or(TestError::Missing("LIVE-Fenster"))?;
+        let outside_live = |y: usize, row: &str| -> String {
+            row.chars()
+                .enumerate()
+                .filter(|(x, _)| {
+                    let at = (u16::try_from(*x), u16::try_from(y));
+                    !matches!(at, (Ok(x), Ok(y)) if live.contains(ratatui::layout::Position::new(x, y)))
+                })
+                .map(|(_, cell)| cell)
+                .collect()
+        };
+        for (y, (old, new)) in before.iter().zip(&after).enumerate() {
+            assert_eq!(outside_live(y, old), outside_live(y, new), "row {y}");
+        }
+        assert!(
+            after.iter().any(|row| row.contains("zweite Meldung")),
+            "{}",
+            after.join("\n")
+        );
         Ok(())
     }
 

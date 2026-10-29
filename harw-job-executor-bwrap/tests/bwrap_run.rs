@@ -41,6 +41,7 @@ fn job(program: &str, args: &[&str]) -> TestResult<JobSpec> {
         sandbox_profile: SandboxProfileName::NoNetwork,
         idempotency_key: None,
         scope: JobScopeId::new("scope-a").map_err(ctx("scope"))?,
+        write_scope: None,
     })
 }
 

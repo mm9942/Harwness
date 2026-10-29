@@ -23,6 +23,7 @@ mod skill_triggers;
 pub use skill_index::{
     BUNDLED_SKILL_SOURCE, MAX_SKILL_LOAD_BYTES, SHORT_DESCRIPTION_CHARS, SkillHeading, SkillIndex,
     SkillIndexEntry, SkillSearchHit, SkillSource, SkippedSkill, TRIGGERS_FILE, bundled_skill_files,
+    read_skill_triggers,
 };
 pub use skill_select::{
     DEFAULT_L0_BYTES, DEFAULT_PER_SESSION_BYTES, DEFAULT_PER_TURN_BYTES, DropReason, Dropped,

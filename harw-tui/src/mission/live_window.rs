@@ -19,17 +19,31 @@
 //! never scrolled; it takes no keys. A header-only strip carries the most
 //! telling line in the header: the tool, else the status, else the
 //! reasoning tail, else the newest recency line (W02 `LIVE role · last tool`).
+//!
+//! In the landscape centre column (PL-97 C3, [`render_window`]) LIVE is a
+//! bordered window titled `LIVE · <role>`: the same lines, but the reasoning
+//! preview wrapped in full instead of its one-row tail. It scrolls
+//! ChatScroll-style ([`super::MissionUi::live_scroll`], newest line at the
+//! bottom while following) and takes the keys of [`handle_key`] when
+//! focused; `Alt+L`/Enter show the existing agent detail of the LIVE source
+//! in the same rect instead.
 
 use std::time::Instant;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
+    Widget, Wrap,
+};
 use unicode_width::UnicodeWidthChar;
 
+use super::MissionUi;
 use crate::agent_monitor::{AgentLive, AgentPhase, TraceEntry, compact_elapsed};
+use crate::chat_scroll::ChatScroll;
 use crate::recency::RecencySlots;
 use crate::sanitize::sanitize_inline;
 use crate::status_line::{display_width, fit_width};
@@ -43,6 +57,10 @@ pub(crate) const NO_VISIBLE_EVENTS: &str = "no visible events yet";
 
 /// Indent of the body lines below the header.
 pub(crate) const LIVE_INDENT: u16 = 2;
+
+/// Lines one PageUp/PageDown moves the landscape LIVE window (mirrors
+/// `AGENT_DETAIL_PAGE` of the agent detail view).
+const LIVE_PAGE: usize = 10;
 
 /// What a body line shows (the header-only strip picks by kind).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +91,9 @@ pub(crate) struct LiveView {
     label: Option<String>,
     /// Body lines in display order.
     lines: Vec<LiveLine>,
+    /// The whole reasoning preview, sanitized with collapsed whitespace
+    /// (the landscape window wraps it instead of showing its tail).
+    reasoning: String,
 }
 
 impl LiveView {
@@ -212,6 +233,7 @@ pub(crate) fn view(
     let cols = usize::from(content_width);
     let mut lines = Vec::new();
     let mut label = None;
+    let mut full_reasoning = String::new();
     if let Some((live, pinned)) = source {
         let role = sanitize_inline(live.role.trim());
         label = Some(if pinned {
@@ -227,6 +249,7 @@ pub(crate) fn view(
                 style: style::dim_style(theme).add_modifier(Modifier::ITALIC),
             });
         }
+        full_reasoning = reasoning;
         if live.phase == AgentPhase::Tool
             && let Some(tool) = live.current_tool.as_deref()
         {
@@ -261,7 +284,11 @@ pub(crate) fn view(
             style: line_style,
         });
     }
-    LiveView { label, lines }
+    LiveView {
+        label,
+        lines,
+        reasoning: full_reasoning,
+    }
 }
 
 /// Draws `view` into `area`: the header rule in the first row and
@@ -345,6 +372,123 @@ pub(crate) fn render(view: &LiveView, area: Rect, buf: &mut Buffer, theme: Theme
         ..area
     };
     Paragraph::new(body).render(body_area, buf);
+}
+
+/// Draws `view` as the bordered landscape LIVE window (PL-97 C3) into
+/// `area`: title `LIVE · <role>`, the full reasoning preview wrapped, then
+/// the tool, status and recency lines, scrolled by `scroll` (ChatScroll:
+/// following shows the newest, lowest lines). Build `view` for the inner
+/// width plus [`LIVE_INDENT`] so its one-row lines fit the window.
+pub(crate) fn render_window(
+    view: &LiveView,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: Theme,
+    scroll: &ChatScroll,
+    focused: bool,
+) {
+    let area = area.intersection(buf.area);
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let title = match &view.label {
+        Some(label) => format!(" {LIVE_TITLE} · {label} "),
+        None => format!(" {LIVE_TITLE} "),
+    };
+    let border = if focused {
+        Style::default().fg(style::accent_color(theme))
+    } else {
+        Style::default().fg(style::border_color(theme))
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border)
+        .title(fit_width(&title, inner_width));
+    let inner = block.inner(area);
+    block.render(area, buf);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if !view.reasoning.is_empty() {
+        lines.push(Line::styled(
+            format!("∴ {}", view.reasoning),
+            style::dim_style(theme).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    lines.extend(
+        view.lines
+            .iter()
+            .filter(|line| line.kind != LineKind::Reasoning)
+            .map(|line| Line::styled(fit_width(&line.text, inner_width), line.style)),
+    );
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            fit_width(NO_VISIBLE_EVENTS, inner_width),
+            style::dim_style(theme),
+        ));
+    }
+    // Wie der Chat-Verlauf: umbrochene Zeilen zählen, der Versatz zählt vom
+    // Ende (0 folgt der neuesten Zeile).
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total = paragraph.line_count(inner.width);
+    let viewport = usize::from(inner.height);
+    let back = scroll.sync_layout(total, viewport, inner.width);
+    let max_offset = total.saturating_sub(viewport);
+    let from_top = max_offset.saturating_sub(back);
+    paragraph
+        .scroll((u16::try_from(from_top).unwrap_or(u16::MAX), 0))
+        .render(inner, buf);
+    if max_offset > 0 {
+        let bar_area = Rect {
+            width: inner.width.saturating_add(1),
+            ..inner
+        }
+        .intersection(area);
+        let mut state = ScrollbarState::new(max_offset.saturating_add(1))
+            .position(from_top)
+            .viewport_content_length(viewport);
+        StatefulWidget::render(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            bar_area,
+            buf,
+            &mut state,
+        );
+    }
+}
+
+/// Keys of the focused landscape LIVE window (fixed, not rebindable):
+/// `↑`/`k` and `↓`/`j` scroll one line, PageUp/PageDown ten, Home/`g` jump to
+/// the oldest line, End/`G` back to the newest; in the in-place detail `r`
+/// toggles the reasoning entries. Enter (open/close the detail) belongs to
+/// the caller, which knows the LIVE source.
+///
+/// # Returns
+/// `true` when the key was used (redraw).
+pub(crate) fn handle_key(ui: &mut MissionUi, key: KeyEvent) -> bool {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => ui.live_scroll.scroll_up_measured(1),
+        KeyCode::Down | KeyCode::Char('j') => ui.live_scroll.scroll_down(1),
+        KeyCode::PageUp => ui.live_scroll.scroll_up_measured(LIVE_PAGE),
+        KeyCode::PageDown => ui.live_scroll.scroll_down(LIVE_PAGE),
+        KeyCode::Home | KeyCode::Char('g') => ui.live_scroll.jump_to_top_measured(),
+        KeyCode::End | KeyCode::Char('G') => ui.live_scroll.jump_to_bottom(),
+        KeyCode::Char('r') if ui.live_detail_agent().is_some() => {
+            ui.live_detail_reasoning = !ui.live_detail_reasoning;
+        }
+        _ => return false,
+    }
+    true
 }
 
 #[cfg(test)]

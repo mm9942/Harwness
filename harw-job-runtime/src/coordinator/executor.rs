@@ -321,8 +321,7 @@ pub fn unsandboxed_report(resource_limits: EnforcementState) -> SandboxReport {
 /// or rlimits). The wall-clock timeout is enforced by the coordinator.
 #[must_use]
 pub fn requests_resource_limits(spec: &JobSpec) -> bool {
-    let resources = &spec.resources;
-    resources.memory_max.is_some() || resources.cpu_weight.is_some() || resources.pids_max.is_some()
+    spec.resources.requests_job_limits()
 }
 
 /// Checks `report` against `requirement` before anything runs.

@@ -20,6 +20,7 @@
 "harw-cli/src/auth.rs" = "tooling: git/gh/cargo/editor invocation by the CLI, not a user workload"
 "harw-cli/src/auto_build.rs" = "tooling: git/gh/cargo/editor invocation by the CLI, not a user workload"
 "harw-cli/src/completions.rs" = "tooling: git/gh/cargo/editor invocation by the CLI, not a user workload"
+"harw-cli/src/dod_cmd.rs" = "service manager (systemctl) invocation by the root-only `harw dod enable|disable|restart|warden`, not a user workload"
 "harw-cli/src/lifecycle.rs" = "tooling: git/gh/cargo/editor invocation by the CLI, not a user workload"
 "harw-cli/src/pr_review.rs" = "tooling: git/gh/cargo/editor invocation by the CLI, not a user workload"
 "harw-cli/src/update_cmd.rs" = "tooling: git/gh/cargo/editor invocation by the CLI, not a user workload"

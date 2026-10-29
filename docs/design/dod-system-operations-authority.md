@@ -410,8 +410,12 @@ never full rights.
 Existing `tool`/`operation` macros use the new authority types and
 generate guard calls. `permission_request!` for validated declarative
 permission lists (result: only a `PermissionRequest`, unknown entries a
-compile error) is implemented in `harw-macros` (PL-97 M2,
-`harw-macros/src/permission_request.rs`, trybuild cases 45–47).
+compile error) has landed in `harw-macros` (PL-97 M2,
+`harw-macros/src/permission_request.rs`, trybuild cases 45–47); its call
+site is open: no operation path consumes a `harw_authority::PermissionRequest`
+(`OperationMeta` carries only a `PermissionTier`) and the `dod.*` operations
+require no permission, so the planned `dod.*` call site (PL-97 §3.5) waits
+for that consumer.
 
 No macro exception for private grant construction, no `__private` minting
 export, no caller-crate name check as a supposed security boundary.

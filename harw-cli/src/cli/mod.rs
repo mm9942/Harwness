@@ -26,6 +26,7 @@ mod channel;
 mod completions;
 mod cycle;
 mod debug;
+mod dod;
 mod gateway;
 mod global;
 mod jobs;
@@ -41,6 +42,7 @@ mod sandbox;
 mod service;
 mod session;
 mod settings;
+mod skill;
 mod uia;
 pub mod values;
 
@@ -55,6 +57,7 @@ pub use channel::*;
 pub use completions::*;
 pub use cycle::*;
 pub use debug::*;
+pub use dod::*;
 pub use gateway::*;
 pub use global::*;
 pub use jobs::*;
@@ -70,6 +73,7 @@ pub use sandbox::*;
 pub use service::*;
 pub use session::*;
 pub use settings::*;
+pub use skill::*;
 pub use uia::*;
 pub use values::*;
 
@@ -217,6 +221,17 @@ pub enum Command {
         /// Auszuführende Cycle-Aktion.
         #[command(subcommand)]
         action: CycleAction,
+    },
+    /// Zeigt Skills, sagt ohne Modellaufruf voraus, welche Skill-Abschnitte
+    /// eine Aufgabe triggert, und prüft Skill-Verzeichnisse.
+    ///
+    /// `list`, `show` und `preview` laufen über dieselbe Operation wie der
+    /// Chat-Befehl `/skills`. Exit-Codes: 0 ok, 1 Fehlschlag (auch: `validate`
+    /// beanstandet etwas), 2 Aufruf.
+    Skill {
+        /// Auszuführende Skill-Aktion.
+        #[command(subcommand)]
+        action: SkillAction,
     },
     /// Räumt ephemere Daten (Logs, Caches, Spools) nach den Aufbewahrungsregeln auf.
     ///
@@ -369,14 +384,17 @@ pub enum Command {
         #[command(subcommand)]
         action: TailscaleAction,
     },
-    /// Zeigt die eingebetteten systemd-Systemunits aus `deploy/`.
+    /// Harw-DoD (Detect · Orient · Defend): Zustand, Befunde, Sensoren,
+    /// Diagnose und Dienststeuerung der Sicherheitssuite.
     ///
-    /// Die DoD-Units installiert `make -C dod install` aus derselben Quelle;
-    /// dieser Befehl installiert nichts, er gibt nur aus.
-    Install {
-        /// Eingebettete systemd-Unit ausgeben (z. B. `harw-warden.socket`); ohne UNIT alle.
-        #[arg(long, value_name = "UNIT", num_args = 0..=1, value_hint = ValueHint::Other)]
-        print_systemd: Option<Option<String>>,
+    /// Lesende Aktionen laufen als jede Person; `enable`, `disable`,
+    /// `restart` und `warden enable|disable` nur als root. Exit-Codes: 0 ok,
+    /// 1 Fehlschlag, 2 Aufruf, 3 verweigert (nicht root, kein gültiges
+    /// `active_profile`).
+    Dod {
+        /// Auszuführende Harw-DoD-Aktion.
+        #[command(subcommand)]
+        action: DodAction,
     },
     /// Deinstalliert Harwness ganz oder teilweise.
     Uninstall {
@@ -497,6 +515,17 @@ pub enum Command {
         /// Die einzuordnende Eingabe.
         #[arg(required = true, num_args = 1.., value_hint = ValueHint::Other)]
         input: Vec<String>,
+    },
+    /// Ältere Schreibweise von `harw dod install --print-systemd`: zeigt die
+    /// eingebetteten systemd-Systemunits aus `deploy/`.
+    ///
+    /// Die DoD-Units installiert `make -C dod install` aus derselben Quelle;
+    /// dieser Befehl installiert nichts, er gibt nur aus.
+    #[command(hide = true)]
+    Install {
+        /// Eingebettete systemd-Unit ausgeben (z. B. `harw-warden.socket`); ohne UNIT alle.
+        #[arg(long, value_name = "UNIT", num_args = 0..=1, value_hint = ValueHint::Other)]
+        print_systemd: Option<Option<String>>,
     },
 }
 

@@ -50,6 +50,28 @@
 //! usable Landlock ABI before the directory exists; the report is read
 //! only if it is still a regular file.
 //!
+//! # Per-job write scope and fail-closed fallback (PL-97 E2)
+//! A [`JobSpec::write_scope`] replaces the profile's workspace write grant:
+//! the workspace becomes read-only except the listed paths
+//! (`SandboxPolicy::with_workspace_write_scope`). Every path must lie inside
+//! the workspace, also after resolving symlinks; existing paths get a rule
+//! for their canonical form; a path that does not exist gets none (the
+//! Landlock planner skips it) and must be covered by an entry for an
+//! existing ancestor directory. A read-write rule containing the workspace
+//! (`/tmp` for a workspace below it) is refused, because Landlock rights
+//! are inherited. With `LandlockTrampoline` the scoped policy is the
+//! trampoline's policy; with `BwrapTrampoline` bwrap binds the workspace as
+//! the profile says and the scoped policy, mapped onto the namespace view,
+//! is the inner stage's Landlock policy: every scope path must keep a
+//! read-write bind there, or the plan is refused instead of dropping it.
+//!
+//! A job with a write scope always carries [`SandboxRequirement::Required`]
+//! (`JobSpec::validate`). A `required` job is refused before any process
+//! starts when the backend cannot enforce its filesystem dimension: `None`
+//! and `Bwrap` never can, the trampoline backends only with Landlock ABI
+//! `LANDLOCK_TARGET_ABI` (5) or newer. Only legacy unscoped best-effort jobs
+//! run on a weaker backend; the executor logs that once.
+//!
 //! # Exit-status shim (optional)
 //! pidfds do not survive a restart, and a reattached process is not our
 //! child, so its exit status is unobservable. With
@@ -98,14 +120,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use harw_job_core::spec::JobWriteScope;
 use harw_job_core::{
-    EnforcementState, ExitOutcome, JobSpec, SandboxProfileName, SandboxReport, SandboxRequirement,
+    EnforcementState, ExitOutcome, JobSpec, ResourceRequest, SandboxProfileName, SandboxReport,
+    SandboxRequirement, SpecError,
 };
 use harw_job_linux::cgroup::{CgroupBackend, CgroupHandle, CgroupSpec, CgroupV2Fs};
 use harw_job_linux::group::JobCgroup;
+use harw_job_linux::sandbox::{WriteScopeConflict, landlock_filesystem_state};
 use harw_job_linux::{
-    CgroupError, IdentityCheck, JobResources, LaunchError, LinuxJobGroup, LinuxRecoveryIdentity,
-    ProcessError, RecoveryError, SandboxPolicy, TerminationPolicy,
+    CgroupError, CpuQuota, IdentityCheck, IoLimits, JobResources, LaunchError, LinuxJobGroup,
+    LinuxRecoveryIdentity, ProcessError, RecoveryError, SandboxPolicy, TerminationPolicy,
 };
 use harw_job_tokio::{
     AsyncLinuxProcess, Canceller, ProcessEvent, SupervisedTarget, Supervisor, SupervisorConfig,
@@ -266,10 +291,12 @@ pub struct LinuxExecutor {
     /// Guards [`LinuxExecutor::ensure_leftover_sweep`] so the background
     /// sweep task is spawned at most once.
     sweep_spawned: AtomicBool,
-    /// Usable Landlock ABI of this host for the `BwrapTrampoline` backend,
-    /// probed on its first launch ([`LinuxExecutor::chain_landlock_abi`]).
-    #[cfg(feature = "bwrap")]
+    /// Usable Landlock ABI of this host for the trampoline backends,
+    /// probed when a launch first needs it ([`LinuxExecutor::landlock_abi`]).
     landlock_probe: std::sync::OnceLock<Option<u8>>,
+    /// Guards the once-per-executor log line for best-effort jobs on a
+    /// backend that cannot enforce everything ([`LinuxExecutor::note_best_effort`]).
+    weak_backend_logged: AtomicBool,
 }
 
 /// What to exec, before it becomes a [`Command`].
@@ -501,10 +528,26 @@ fn chain_plans(
     cgroup: Option<ChainCgroup<'_>>,
     resource_limits: EnforcementState,
 ) -> Result<ChainPlans, RuntimeError> {
+    // A write scope narrows the workspace inside the namespace, through
+    // Landlock: bwrap binds the workspace as a whole (it cannot bind a
+    // read-write path below a read-only workspace), so the namespace layer
+    // gets the profile policy and the inner policy the scoped one.
+    let scoped = scoped_policy(spec, workspace_root)?;
     let policy = policy_for(spec.sandbox_profile, workspace_root);
     let plan = bwrap
         .plan_with_trampoline(spec, &policy, workspace_root, mount)
         .map_err(bwrap_error)?;
+    let (inner_policy, unmapped) = match &scoped {
+        Some(scoped) => (
+            scoped_inner_policy(&plan, scoped)?,
+            plan.path_map().unmapped_paths(&scoped.policy.filesystem),
+        ),
+        None => (plan.inner_policy().clone(), plan.unmapped_paths().to_vec()),
+    };
+    // Security review finding 4: the job never gets write access to its
+    // attempt directory (checked by `plan_with_trampoline` for its own
+    // inner policy, and here again for the policy that is actually used).
+    refuse_writable_attempt_dir(&inner_policy)?;
     // The outer plan is JSON: the bwrap argv must be UTF-8.
     let bwrap_args = plan
         .bwrap()
@@ -521,7 +564,7 @@ fn chain_plans(
     let mut outer = harw_job_exec::ExecPlanV1::new(plan.bwrap().executable()).with_args(bwrap_args);
     let mut inner = harw_job_exec::ExecPlanV1::new(&spec.program)
         .with_args(spec.args.iter().cloned())
-        .with_sandbox(plan.inner_policy().clone(), spec.sandbox);
+        .with_sandbox(inner_policy, spec.sandbox);
     if spec.resources.requests_rlimits() {
         let rlimits = rlimit_set(spec);
         outer = outer.with_rlimits(rlimits.clone());
@@ -542,9 +585,97 @@ fn chain_plans(
         outer,
         inner,
         bwrap_report: plan.bwrap().report(),
-        unmapped: plan.unmapped_paths().to_vec(),
+        unmapped,
         withheld: plan.withheld_paths().to_vec(),
     })
+}
+
+/// The inner policy of a scoped job: the scoped policy mapped onto the
+/// namespace view of `plan`, with the network the namespace leaves to
+/// Landlock (as `plan.inner_policy()`).
+///
+/// Refuses, instead of letting the mapping drop or widen anything: a scope
+/// path without a read-write bind (the mapping would drop it as unmapped,
+/// or cap it to read-only), a read-only bind beneath a path that keeps
+/// write or execute, and a read-write rule other than the scope's that
+/// contains the workspace destination.
+#[cfg(feature = "bwrap")]
+fn scoped_inner_policy(
+    plan: &harw_job_executor_bwrap::BwrapTrampolinePlan,
+    scoped: &ScopedPolicy,
+) -> Result<SandboxPolicy, RuntimeError> {
+    let refuse = |detail: String| Err(RuntimeError::Sandbox { detail });
+    let map = plan.path_map();
+    let mut destinations = Vec::with_capacity(scoped.writes.len());
+    for path in &scoped.writes {
+        match map.resolve(path) {
+            Some((destination, harw_job_linux::BindMode::ReadWrite)) => {
+                destinations.push(destination);
+            }
+            Some((destination, harw_job_linux::BindMode::ReadOnly)) => {
+                return refuse(format!(
+                    "write scope path '{}' is mounted read-only at '{}' inside the bubblewrap \
+                     namespace",
+                    path.display(),
+                    destination.display()
+                ));
+            }
+            None => {
+                return refuse(format!(
+                    "write scope path '{}' has no bind inside the bubblewrap namespace; the \
+                     job could not write it",
+                    path.display()
+                ));
+            }
+        }
+    }
+    let shadowed = map.shadowed_read_only_binds(&scoped.policy.filesystem);
+    if let Some(bind) = shadowed.first() {
+        return refuse(format!(
+            "the read-only bind '{}' lies beneath a scoped path that keeps write or execute",
+            bind.sandbox.display()
+        ));
+    }
+    let mut inner = scoped.policy.mapped(map);
+    inner.network = plan.inner_policy().network.clone();
+    let workspace = plan.bwrap().workspace();
+    if let Some(ancestor) = inner
+        .filesystem
+        .read_write
+        .iter()
+        .filter(|path| !destinations.contains(path))
+        .find(|path| workspace.starts_with(path))
+    {
+        return refuse(
+            WriteScopeConflict::WritableAncestor(ancestor.clone()).to_string(),
+        );
+    }
+    Ok(inner)
+}
+
+/// Refuses an inner policy with write access at, beneath or above
+/// [`harw_job_executor_bwrap::SANDBOX_TRAMPOLINE_DIR`], which holds the
+/// trampoline and the attempt directory with the plan and the report
+/// (PL-97 security review, finding 4).
+#[cfg(feature = "bwrap")]
+fn refuse_writable_attempt_dir(policy: &SandboxPolicy) -> Result<(), RuntimeError> {
+    let dir = Path::new(harw_job_executor_bwrap::SANDBOX_TRAMPOLINE_DIR);
+    match policy
+        .filesystem
+        .read_write
+        .iter()
+        .find(|path| path.starts_with(dir) || dir.starts_with(path))
+    {
+        Some(path) => Err(RuntimeError::Sandbox {
+            detail: format!(
+                "the inner policy would grant write access to '{}', which covers the attempt \
+                 directory {}",
+                path.display(),
+                harw_job_executor_bwrap::SANDBOX_ATTEMPT_DIR
+            ),
+        }),
+        None => Ok(()),
+    }
 }
 
 fn process_error(operation: &'static str, program: &str, error: ProcessError) -> RuntimeError {
@@ -631,13 +762,49 @@ fn cgroup_name(ctx: &AttemptContext) -> String {
     format!("harw-job-{attempt}")
 }
 
-/// cgroup limits for a spec.
+/// The resource policy of a spec: every job limit as a cgroup limit, the
+/// per-process limits as rlimits (applied by the trampoline, or through
+/// `prlimit`).
+///
+/// The request is destructured without a rest pattern, so a new
+/// [`ResourceRequest`] field does not compile until it is mapped here or
+/// named as handled elsewhere: nothing is dropped silently. A limit the
+/// host cannot apply is reported, not dropped: without a cgroup root every
+/// job limit counts as `not_enforced`
+/// ([`super::executor::requests_resource_limits`]), and a controller that
+/// is not delegated makes the cgroup report `partial`/`not_enforced`.
 fn job_resources(spec: &JobSpec) -> JobResources {
+    let ResourceRequest {
+        memory_max,
+        memory_high,
+        cpu_weight,
+        cpu_max,
+        pids_max,
+        io_weight,
+        // Enforced by the coordinator's deadline, not by a resource domain.
+        wall_timeout: _,
+        // Per-process limits: `rlimit_set`.
+        address_space_max: _,
+        cpu_time_max: _,
+        file_size_max: _,
+        open_files_max: _,
+        // Checked against the rlimit enforcement (`require_rlimits`).
+        require_rlimits: _,
+    } = &spec.resources;
     JobResources {
-        memory_max: spec.resources.memory_max,
-        cpu_weight: spec.resources.cpu_weight.map(u64::from),
-        pids_max: spec.resources.pids_max.map(u64::from),
-        ..JobResources::default()
+        memory_max: *memory_max,
+        memory_high: *memory_high,
+        cpu_weight: cpu_weight.map(u64::from),
+        cpu_max: cpu_max.map(|bandwidth| CpuQuota {
+            quota_us: bandwidth.quota_us,
+            period_us: bandwidth.period_us,
+        }),
+        pids_max: pids_max.map(u64::from),
+        io: io_weight.map(|weight| IoLimits {
+            weight: Some(weight),
+            devices: Vec::new(),
+        }),
+        rlimits: rlimit_set(spec),
     }
 }
 
@@ -1051,19 +1218,43 @@ impl LinuxExecutor {
             cgroup,
             leftovers: LeftoverRegistry::default(),
             sweep_spawned: AtomicBool::new(false),
-            #[cfg(feature = "bwrap")]
             landlock_probe: std::sync::OnceLock::new(),
+            weak_backend_logged: AtomicBool::new(false),
         })
     }
 
-    /// The usable Landlock ABI of this host for the `BwrapTrampoline`
-    /// backend, probed once per executor
+    /// The usable Landlock ABI of this host for the trampoline backends,
+    /// probed once per executor
     /// (`harw_job_linux::sandbox::landlock_support`, a throwaway thread).
-    #[cfg(feature = "bwrap")]
-    fn chain_landlock_abi(&self) -> Option<u8> {
+    fn landlock_abi(&self) -> Option<u8> {
         *self
             .landlock_probe
             .get_or_init(|| harw_job_linux::sandbox::landlock_support().usable_abi())
+    }
+
+    /// Logs once per executor that a legacy unscoped best-effort job runs
+    /// on a backend that does not enforce everything: the filesystem
+    /// dimension below `enforced`, or no job cgroup. Scoped and `required`
+    /// jobs never get here on such a backend; they are refused before
+    /// anything runs (PL-97 E2, fail closed).
+    fn note_best_effort(&self, spec: &JobSpec, filesystem: EnforcementState) {
+        if spec.sandbox != SandboxRequirement::BestEffort {
+            return;
+        }
+        let job_cgroup = self.cgroup.is_some();
+        if filesystem == EnforcementState::Enforced && job_cgroup {
+            return;
+        }
+        if self.weak_backend_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            backend = %self.options.sandbox.kind(),
+            filesystem = ?filesystem,
+            job_cgroup,
+            "best-effort sandboxed jobs run without full cgroup/landlock enforcement on this \
+             backend; jobs with a write scope or a `required` sandbox are refused"
+        );
     }
 
     /// The options.
@@ -1169,6 +1360,11 @@ impl LinuxExecutor {
         let sandboxed = spec.sandbox != SandboxRequirement::None;
         match (sandboxed, &self.options.sandbox) {
             (false, _) | (true, LinuxSandboxBackend::None) => {
+                // A `required` job (every scoped job is one) is refused by
+                // `start` before the spawn: this report enforces nothing.
+                if sandboxed {
+                    self.note_best_effort(spec, EnforcementState::NotEnforced);
+                }
                 let mut launch = Launch {
                     program: OsString::from(&spec.program),
                     args: spec.args.iter().map(OsString::from).collect(),
@@ -1189,17 +1385,33 @@ impl LinuxExecutor {
                     plan_dir,
                 },
             ) => {
-                // Lower bound known before spawning: the resource domain.
-                if spec.sandbox == SandboxRequirement::Required
-                    && resource_limits != EnforcementState::Enforced
-                {
+                // Lower bound known before spawning: the resource domain and
+                // what the host's Landlock ABI can enforce on the filesystem
+                // (a `required` job, every scoped job included, is refused
+                // here instead of by the trampoline after the spawn).
+                let filesystem = landlock_filesystem_state(self.landlock_abi());
+                if spec.sandbox == SandboxRequirement::Required {
                     let report = SandboxReport {
+                        filesystem,
                         resource_limits,
                         ..SandboxReport::uniform(EnforcementState::Enforced)
                     };
                     check_requirement(spec.sandbox, &report)?;
                 }
-                let policy = policy_for(spec.sandbox_profile, &ctx.workspace_root);
+                self.note_best_effort(spec, filesystem);
+                // The write scope replaces the workspace write grant; there
+                // is no namespace, so the policy keeps host paths.
+                let policy = match scoped_policy(spec, &ctx.workspace_root)? {
+                    Some(scoped) => {
+                        tracing::debug!(
+                            attempt = %ctx.attempt_id,
+                            writes = ?scoped.writes,
+                            "write scope narrows the workspace write grant"
+                        );
+                        scoped.policy
+                    }
+                    None => policy_for(spec.sandbox_profile, &ctx.workspace_root),
+                };
                 let mut plan = harw_job_exec::ExecPlanV1::new(&spec.program)
                     .with_args(spec.args.iter().cloned())
                     .with_sandbox(policy, spec.sandbox);
@@ -1238,6 +1450,19 @@ impl LinuxExecutor {
             }
             #[cfg(feature = "bwrap")]
             (true, LinuxSandboxBackend::Bwrap(bwrap)) => {
+                // Mounts cannot separate read from execute, and the workspace
+                // is bound as a whole: the filesystem dimension is `partial`
+                // at best, so a `required` job (every scoped job included)
+                // is refused before it is planned.
+                if spec.sandbox == SandboxRequirement::Required {
+                    let report = SandboxReport {
+                        filesystem: EnforcementState::Partial,
+                        resource_limits,
+                        ..SandboxReport::uniform(EnforcementState::Enforced)
+                    };
+                    check_requirement(spec.sandbox, &report)?;
+                }
+                self.note_best_effort(spec, EnforcementState::Partial);
                 let policy = policy_for(spec.sandbox_profile, &ctx.workspace_root);
                 let plan = bwrap
                     .plan(spec, &policy, &ctx.workspace_root)
@@ -1271,7 +1496,20 @@ impl LinuxExecutor {
                 // Only the inner Landlock layer keeps the job out of its
                 // attempt directory (bound read-write for the report):
                 // without a usable ABI nothing is created or bound.
-                require_landlock_for_chain(self.chain_landlock_abi())?;
+                let abi = require_landlock_for_chain(self.landlock_abi())?;
+                // A `required` job (every scoped job included) also needs
+                // the ABI that fully enforces the filesystem rules; checked
+                // before the attempt directory exists.
+                let filesystem = landlock_filesystem_state(Some(abi));
+                if spec.sandbox == SandboxRequirement::Required {
+                    let report = SandboxReport {
+                        filesystem,
+                        resource_limits,
+                        ..SandboxReport::uniform(EnforcementState::Enforced)
+                    };
+                    check_requirement(spec.sandbox, &report)?;
+                }
+                self.note_best_effort(spec, filesystem);
                 let attempt_dir = create_attempt_dir(plan_dir, ctx)?;
                 let mount = harw_job_executor_bwrap::TrampolineMount {
                     exec_path: trampoline.clone(),
@@ -1501,6 +1739,146 @@ fn apply_prlimit(launch: &mut Launch, spec: &JobSpec) -> EnforcementState {
 /// The sandbox policy of a profile rooted at the workspace.
 fn policy_for(profile: SandboxProfileName, workspace_root: &Path) -> SandboxPolicy {
     SandboxPolicy::from_profile(profile, workspace_root)
+}
+
+/// A job's sandbox policy narrowed to its write scope ([`scoped_policy`]).
+#[derive(Debug, Clone)]
+struct ScopedPolicy {
+    /// The profile policy rooted at the canonical workspace, with the
+    /// workspace write grant replaced by `writes` (host paths).
+    policy: SandboxPolicy,
+    /// The scope paths that get a write rule: canonical and existing.
+    writes: Vec<PathBuf>,
+}
+
+/// The policy of a job with a write scope (PL-97 E2), `None` without one.
+///
+/// The profile policy is rooted at the canonical workspace, its workspace
+/// write grant is replaced by the resolved scope
+/// ([`resolve_write_scope`], [`SandboxPolicy::with_workspace_write_scope`]):
+/// the workspace becomes read-only except the listed paths. A read-write
+/// rule that contains the workspace (e.g. `/tmp`, writable in every
+/// profile, for a workspace below it) would keep the whole workspace
+/// writable, so such a job is refused.
+///
+/// # Errors
+/// [`RuntimeError::InvalidSpec`] for a scope this build refuses (unknown
+/// version, a path outside the workspace, an uncovered path that does not
+/// exist, a profile without workspace write access);
+/// [`RuntimeError::Sandbox`] when the workspace cannot be resolved or a
+/// writable ancestor contains it.
+fn scoped_policy(
+    spec: &JobSpec,
+    workspace_root: &Path,
+) -> Result<Option<ScopedPolicy>, RuntimeError> {
+    let Some(scope) = &spec.write_scope else {
+        return Ok(None);
+    };
+    scope.validate()?;
+    let canonical = workspace_root
+        .canonicalize()
+        .map_err(|error| RuntimeError::Sandbox {
+            detail: format!("workspace {}: {error}", workspace_root.display()),
+        })?;
+    let writes = resolve_write_scope(scope, workspace_root, &canonical)?;
+    let policy = policy_for(spec.sandbox_profile, &canonical)
+        .with_workspace_write_scope(&canonical, &writes)
+        .map_err(|conflict| match conflict {
+            WriteScopeConflict::NoWorkspaceWrite => {
+                RuntimeError::InvalidSpec(SpecError::WriteScopeWithoutWorkspaceWrite {
+                    profile: spec.sandbox_profile,
+                })
+            }
+            WriteScopeConflict::OutsideWorkspace(path) => {
+                RuntimeError::InvalidSpec(SpecError::WriteScopeOutsideWorkspace {
+                    path: path.to_string_lossy().into_owned(),
+                })
+            }
+            other => RuntimeError::Sandbox {
+                detail: other.to_string(),
+            },
+        })?;
+    // The lexical check above misses a writable entry that is a symlink to
+    // an ancestor of the workspace; compare resolved paths too.
+    for entry in &policy.filesystem.read_write {
+        if writes.contains(entry) {
+            continue;
+        }
+        let resolved = entry.canonicalize().unwrap_or_else(|_| entry.clone());
+        if canonical.starts_with(&resolved) {
+            return Err(RuntimeError::Sandbox {
+                detail: WriteScopeConflict::WritableAncestor(entry.clone()).to_string(),
+            });
+        }
+    }
+    Ok(Some(ScopedPolicy { policy, writes }))
+}
+
+/// Resolves the paths of a write scope against the job's workspace
+/// (`workspace_root` as requested, `canonical` resolved):
+/// - every path lies at or beneath the workspace, spelled with either root;
+/// - an existing path is resolved (symlinks included) and must still lie
+///   inside the canonical workspace; its canonical form gets the rule, so
+///   the Landlock rule names what was checked;
+/// - a path that does not exist is not passed on: the Landlock planner
+///   skips paths that do not exist, so it would grant nothing, and a rule
+///   opened later could follow a symlink planted in its place. It must be
+///   covered by an entry for an existing ancestor directory (usually its
+///   parent), whose rule grants the write.
+///
+/// # Errors
+/// [`RuntimeError::InvalidSpec`] with [`SpecError::WriteScopeOutsideWorkspace`],
+/// [`SpecError::InvalidWriteScopePath`] (resolves outside the workspace) or
+/// [`SpecError::WriteScopeUncovered`]; [`RuntimeError::Sandbox`] when a path
+/// cannot be resolved for another reason.
+fn resolve_write_scope(
+    scope: &JobWriteScope,
+    workspace_root: &Path,
+    canonical: &Path,
+) -> Result<Vec<PathBuf>, RuntimeError> {
+    let lossy = |path: &Path| path.to_string_lossy().into_owned();
+    let mut writes: Vec<PathBuf> = Vec::new();
+    let mut directories: Vec<&Path> = Vec::new();
+    let mut missing: Vec<&Path> = Vec::new();
+    for path in &scope.paths {
+        if !path.starts_with(workspace_root) && !path.starts_with(canonical) {
+            return Err(RuntimeError::InvalidSpec(
+                SpecError::WriteScopeOutsideWorkspace { path: lossy(path) },
+            ));
+        }
+        match path.canonicalize() {
+            Ok(resolved) => {
+                if !resolved.starts_with(canonical) {
+                    return Err(RuntimeError::InvalidSpec(SpecError::InvalidWriteScopePath {
+                        path: lossy(path),
+                        reason: "resolves to a location outside the job's workspace",
+                    }));
+                }
+                if resolved.is_dir() {
+                    directories.push(path);
+                }
+                if !writes.contains(&resolved) {
+                    writes.push(resolved);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(path),
+            Err(error) => {
+                return Err(RuntimeError::Sandbox {
+                    detail: format!("write scope path {}: {error}", path.display()),
+                });
+            }
+        }
+    }
+    if let Some(uncovered) = missing.iter().find(|path| {
+        !directories
+            .iter()
+            .any(|directory| path.starts_with(directory))
+    }) {
+        return Err(RuntimeError::InvalidSpec(SpecError::WriteScopeUncovered {
+            path: lossy(uncovered),
+        }));
+    }
+    Ok(writes)
 }
 
 /// Kills and reaps a target that could not be adopted.

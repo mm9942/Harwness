@@ -52,7 +52,7 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use harw_job_core::SandboxProfileName;
+use harw_job_core::{EnforcementState, SandboxProfileName};
 use serde::{Deserialize, Serialize};
 
 /// Paths every profile may read and execute (toolchains, shells, libc).
@@ -206,6 +206,122 @@ impl SandboxPolicy {
     pub fn hard_requirement(mut self) -> Self {
         self.landlock = LandlockMode::HardRequirement;
         self
+    }
+
+    /// This policy with its write grant on `workspace_root` **replaced** by
+    /// `paths` (a per-job write scope, PL-97 E2): every `read_write` entry
+    /// at or beneath `workspace_root` is removed, the workspace root becomes
+    /// `read_only` (its `exec` entry, if any, stays: execute never grants
+    /// write), and each of `paths` becomes `read_write`. Network,
+    /// capabilities, `NO_NEW_PRIVS` and the Landlock mode are unchanged.
+    ///
+    /// Pure and lexical (component-wise, no symlink resolution): the caller
+    /// passes canonical paths and checks existence. A path that does not
+    /// exist gets no Landlock rule ([`plan_landlock`] keeps it, the ruleset
+    /// builder skips it), so new files need an entry for an existing
+    /// parent directory.
+    ///
+    /// # Errors
+    /// - [`WriteScopeConflict::NoWorkspaceWrite`] when the policy grants no
+    ///   write on `workspace_root` itself: a scope narrows a grant and never
+    ///   widens the policy.
+    /// - [`WriteScopeConflict::OutsideWorkspace`] for a path not at or
+    ///   beneath `workspace_root`.
+    /// - [`WriteScopeConflict::WritableAncestor`] when a remaining
+    ///   `read_write` entry is an ancestor of `workspace_root` (e.g. `/tmp`
+    ///   for a workspace below `/tmp`): Landlock rights are inherited, so the
+    ///   whole workspace would stay writable.
+    pub fn with_workspace_write_scope(
+        &self,
+        workspace_root: &Path,
+        paths: &[PathBuf],
+    ) -> Result<Self, WriteScopeConflict> {
+        if !self
+            .filesystem
+            .read_write
+            .iter()
+            .any(|path| path == workspace_root)
+        {
+            return Err(WriteScopeConflict::NoWorkspaceWrite);
+        }
+        if let Some(outside) = paths.iter().find(|path| !path.starts_with(workspace_root)) {
+            return Err(WriteScopeConflict::OutsideWorkspace(outside.clone()));
+        }
+        let mut policy = self.clone();
+        let filesystem = &mut policy.filesystem;
+        filesystem
+            .read_write
+            .retain(|path| !path.starts_with(workspace_root));
+        if let Some(ancestor) = filesystem
+            .read_write
+            .iter()
+            .find(|path| workspace_root.starts_with(path))
+        {
+            return Err(WriteScopeConflict::WritableAncestor(ancestor.clone()));
+        }
+        if !filesystem.read_only.iter().any(|path| path == workspace_root) {
+            filesystem.read_only.push(workspace_root.to_path_buf());
+        }
+        for path in paths {
+            if !filesystem.read_write.contains(path) {
+                filesystem.read_write.push(path.clone());
+            }
+        }
+        Ok(policy)
+    }
+}
+
+/// Why [`SandboxPolicy::with_workspace_write_scope`] cannot narrow a
+/// policy to a write scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WriteScopeConflict {
+    /// The policy grants no write access on the workspace root, so a scope
+    /// would widen it.
+    NoWorkspaceWrite,
+    /// A scope path is not at or beneath the workspace root.
+    OutsideWorkspace(PathBuf),
+    /// A `read_write` entry outside the scope is an ancestor of the
+    /// workspace root and would keep the whole workspace writable.
+    WritableAncestor(PathBuf),
+}
+
+impl std::fmt::Display for WriteScopeConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoWorkspaceWrite => f.write_str(
+                "the policy grants no write access on the workspace for a write scope to narrow",
+            ),
+            Self::OutsideWorkspace(path) => {
+                write!(f, "write scope path {path:?} lies outside the workspace")
+            }
+            Self::WritableAncestor(path) => write!(
+                f,
+                "{path:?} stays writable and contains the workspace, so a write scope cannot \
+                 narrow it (Landlock rights are inherited)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteScopeConflict {}
+
+/// The Landlock ABI with which the filesystem dimension counts as fully
+/// enforced (V5, Linux 6.10: the ABI this crate targets). Older ABIs give
+/// [`EnforcementState::Partial`].
+pub const LANDLOCK_TARGET_ABI: u8 = 5;
+
+/// What Landlock can enforce on the filesystem dimension with the usable
+/// ABI `abi` ([`LandlockSupport::usable_abi`]), predicted before anything
+/// runs: `Unsupported` without Landlock, `Partial` below
+/// [`LANDLOCK_TARGET_ABI`], `Enforced` from it on. Matches what
+/// `apply_to_current_process` reports for a ruleset it could restrict.
+#[must_use]
+pub fn landlock_filesystem_state(abi: Option<u8>) -> EnforcementState {
+    match abi {
+        None | Some(0) => EnforcementState::Unsupported,
+        Some(abi) if abi < LANDLOCK_TARGET_ABI => EnforcementState::Partial,
+        Some(_) => EnforcementState::Enforced,
     }
 }
 
@@ -1036,9 +1152,14 @@ mod enforce {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::sandbox::{BindMode, PathMap};
+        use crate::sandbox::{BindMode, LANDLOCK_TARGET_ABI, PathMap};
         use crate::test_support::{TestResult, ctx};
         use harw_job_core::SandboxProfileName;
+
+        #[test]
+        fn test_target_abi_constant_matches_the_enforced_abi() {
+            assert_eq!(abi_number(TARGET_ABI), LANDLOCK_TARGET_ABI);
+        }
 
         #[test]
         fn test_fs_bits_for_files_drop_directory_rights() {
@@ -1684,5 +1805,85 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_write_scope_replaces_the_workspace_write_grant() -> TestResult {
+        let root = Path::new("/work/repo");
+        let scope = [PathBuf::from("/work/repo/src"), PathBuf::from("/work/repo/out/a.txt")];
+        for profile in [
+            SandboxProfileName::WorkspaceBuild,
+            SandboxProfileName::NoNetwork,
+            SandboxProfileName::NetworkRestricted,
+        ] {
+            let base = SandboxPolicy::from_profile(profile, root);
+            let scoped = base
+                .with_workspace_write_scope(root, &scope)
+                .map_err(ctx("scope"))?;
+            // Only the scope is writable inside the workspace; the rest of
+            // the policy is untouched.
+            assert!(!scoped.filesystem.read_write.iter().any(|path| path == root));
+            assert!(scoped.filesystem.read_only.iter().any(|path| path == root));
+            assert!(scoped.filesystem.exec.iter().any(|path| path == root));
+            for path in &scope {
+                assert!(scoped.filesystem.read_write.contains(path), "{path:?}");
+            }
+            assert_eq!(scoped.network, base.network);
+            assert!(scoped.filesystem.read_write.contains(&PathBuf::from("/tmp")));
+            let plan = plan_landlock(&scoped);
+            let workspace = access_of(&plan, root).ok_or(TestError::Missing("workspace rule"))?;
+            assert!(workspace.read && workspace.exec && !workspace.write);
+            let src = access_of(&plan, Path::new("/work/repo/src"))
+                .ok_or(TestError::Missing("scope rule"))?;
+            assert!(src.read && src.write);
+        }
+        // An empty scope leaves the whole workspace read-only.
+        let none = SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, root)
+            .with_workspace_write_scope(root, &[])
+            .map_err(ctx("empty scope"))?;
+        assert!(!none.filesystem.read_write.iter().any(|path| path.starts_with(root)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_scope_never_widens_and_refuses_writable_ancestors() {
+        let root = Path::new("/work/repo");
+        let read_only = SandboxPolicy::from_profile(SandboxProfileName::ReadOnlyAnalysis, root);
+        assert_eq!(
+            read_only.with_workspace_write_scope(root, &[PathBuf::from("/work/repo/src")]),
+            Err(WriteScopeConflict::NoWorkspaceWrite)
+        );
+        let build = SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, root);
+        for outside in ["/work/repo2/src", "/work", "/etc/passwd"] {
+            assert_eq!(
+                build.with_workspace_write_scope(root, &[PathBuf::from(outside)]),
+                Err(WriteScopeConflict::OutsideWorkspace(PathBuf::from(outside)))
+            );
+        }
+        // `/tmp` stays read-write in every profile: a workspace below it
+        // cannot be narrowed.
+        let under_tmp = Path::new("/tmp/job/repo");
+        let tmp = SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, under_tmp);
+        assert_eq!(
+            tmp.with_workspace_write_scope(under_tmp, &[under_tmp.join("src")]),
+            Err(WriteScopeConflict::WritableAncestor(PathBuf::from("/tmp")))
+        );
+        assert!(
+            WriteScopeConflict::WritableAncestor(PathBuf::from("/tmp"))
+                .to_string()
+                .contains("inherited")
+        );
+    }
+
+    #[test]
+    fn test_landlock_filesystem_state_by_abi() {
+        use harw_job_core::EnforcementState as S;
+        assert_eq!(landlock_filesystem_state(None), S::Unsupported);
+        assert_eq!(landlock_filesystem_state(Some(0)), S::Unsupported);
+        for abi in 1..LANDLOCK_TARGET_ABI {
+            assert_eq!(landlock_filesystem_state(Some(abi)), S::Partial, "{abi}");
+        }
+        assert_eq!(landlock_filesystem_state(Some(LANDLOCK_TARGET_ABI)), S::Enforced);
+        assert_eq!(landlock_filesystem_state(Some(9)), S::Enforced);
     }
 }
