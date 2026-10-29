@@ -329,10 +329,10 @@ impl DeviceRegistry {
         };
         let mut hits: Vec<(usize, DeviceRecord)> = Vec::new();
         for (index, line) in text.split_inclusive('\n').enumerate() {
-            if let Some(record) = DeviceRecord::parse(line) {
-                if &record.device == device {
-                    hits.push((index, record));
-                }
+            if let Some(record) = DeviceRecord::parse(line)
+                && &record.device == device
+            {
+                hits.push((index, record));
             }
         }
         let (index, before) = match hits.len() {

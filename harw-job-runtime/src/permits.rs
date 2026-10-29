@@ -91,13 +91,13 @@ impl Drop for Permit {
     fn drop(&mut self) {
         let mut state = self.owner.state();
         state.in_use = state.in_use.saturating_sub(1);
-        if let Some(permit) = self.permit.take() {
-            if state.debt > 0 {
-                state.debt -= 1;
-                permit.forget();
-            }
-            // Otherwise the permit returns to the semaphore as it drops.
+        if let Some(permit) = self.permit.take()
+            && state.debt > 0
+        {
+            state.debt -= 1;
+            permit.forget();
         }
+        // Otherwise the permit returns to the semaphore as it drops.
     }
 }
 

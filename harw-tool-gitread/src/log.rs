@@ -107,10 +107,10 @@ fn wanted(commit: &Commit, opts: &LogOpts) -> bool {
             return false;
         }
     }
-    if let Some(grep) = &opts.grep {
-        if !commit.message.to_lowercase().contains(&grep.to_lowercase()) {
-            return false;
-        }
+    if let Some(grep) = &opts.grep
+        && !commit.message.to_lowercase().contains(&grep.to_lowercase())
+    {
+        return false;
     }
     true
 }

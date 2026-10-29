@@ -87,20 +87,20 @@ fn head_json(repo: &Repo, odb: &Odb<'_>, refs: &Refs<'_>, head: &Head) -> Value 
     };
     let mut value =
         json!({"branch": branch, "detached": branch.is_none(), "oid": oid.map(|o| o.hex())});
-    if let Some(oid) = oid {
-        if let Ok(commit) = read_commit(odb, &oid) {
-            value["subject"] = json!(commit.subject().chars().take(200).collect::<String>());
-        }
+    if let Some(oid) = oid
+        && let Ok(commit) = read_commit(odb, &oid)
+    {
+        value["subject"] = json!(commit.subject().chars().take(200).collect::<String>());
     }
-    if let (Some(name), Some(tip)) = (&branch, oid) {
-        if let Some((upstream_ref, upstream_short)) = Config::load(repo).upstream(name) {
-            value["upstream"] = json!(upstream_short);
-            let upstream = refs.resolve(&upstream_ref).ok().flatten();
-            let counts = upstream.and_then(|up| ahead_behind(odb, &tip, &up, deadline()));
-            value["upstream_gone"] = json!(upstream.is_none());
-            value["ahead"] = counts.map_or(Value::Null, |(a, _)| json!(a));
-            value["behind"] = counts.map_or(Value::Null, |(_, b)| json!(b));
-        }
+    if let (Some(name), Some(tip)) = (&branch, oid)
+        && let Some((upstream_ref, upstream_short)) = Config::load(repo).upstream(name)
+    {
+        value["upstream"] = json!(upstream_short);
+        let upstream = refs.resolve(&upstream_ref).ok().flatten();
+        let counts = upstream.and_then(|up| ahead_behind(odb, &tip, &up, deadline()));
+        value["upstream_gone"] = json!(upstream.is_none());
+        value["ahead"] = counts.map_or(Value::Null, |(a, _)| json!(a));
+        value["behind"] = counts.map_or(Value::Null, |(_, b)| json!(b));
     }
     value
 }

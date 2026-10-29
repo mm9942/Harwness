@@ -1092,11 +1092,11 @@ impl WebFetcher {
 
         let cached = self.load_cached(path.clone(), &key_hex, start.url()).await;
 
-        if let Some(entry) = cached.as_ref() {
-            if entry_is_fresh(entry, self.options.ttl) {
-                tracing::debug!(host = %start.host(), "web.fetch.cache_hit");
-                return Ok(document_from_entry(entry, entry.status, true));
-            }
+        if let Some(entry) = cached.as_ref()
+            && entry_is_fresh(entry, self.options.ttl)
+        {
+            tracing::debug!(host = %start.host(), "web.fetch.cache_hit");
+            return Ok(document_from_entry(entry, entry.status, true));
         }
 
         let etag = cached.as_ref().and_then(|entry| entry.etag.clone());
@@ -1235,10 +1235,10 @@ impl WebFetcher {
                 .get(current.url())
                 .header(reqwest::header::USER_AGENT, USER_AGENT_VALUE)
                 .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS));
-            if hop == 0 {
-                if let Some(tag) = etag {
-                    request = request.header(reqwest::header::IF_NONE_MATCH, tag);
-                }
+            if hop == 0
+                && let Some(tag) = etag
+            {
+                request = request.header(reqwest::header::IF_NONE_MATCH, tag);
             }
 
             let response = request
@@ -1300,13 +1300,13 @@ impl WebFetcher {
             let class = classify_content_type(&raw_content_type, current.host())?;
 
             let limit = self.options.max_bytes;
-            if let Some(announced) = response.content_length() {
-                if announced > u64::try_from(limit).unwrap_or(u64::MAX) {
-                    return Err(WebToolError::ResponseTooLarge {
-                        limit,
-                        host: current.host().to_owned(),
-                    });
-                }
+            if let Some(announced) = response.content_length()
+                && announced > u64::try_from(limit).unwrap_or(u64::MAX)
+            {
+                return Err(WebToolError::ResponseTooLarge {
+                    limit,
+                    host: current.host().to_owned(),
+                });
             }
 
             let response_etag = response

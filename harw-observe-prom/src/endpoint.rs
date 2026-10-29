@@ -318,10 +318,10 @@ fn require_loopback(address: SocketAddr) -> Result<(), PromError> {
 // und lässt `UnixListener::bind` mit einem klaren I/O-Fehler fehlschlagen,
 // statt sie stillschweigend zu überschreiben.
 fn remove_stale_socket(path: &std::path::Path) {
-    if let Ok(metadata) = std::fs::symlink_metadata(path) {
-        if metadata.file_type().is_socket() {
-            let _ = std::fs::remove_file(path);
-        }
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_socket()
+    {
+        let _ = std::fs::remove_file(path);
     }
 }
 

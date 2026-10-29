@@ -1918,15 +1918,14 @@ fn open_serve_secret_resolver(
     };
     let mut needs_resolver = false;
 
-    if let Some(provider_id) = config.harness.default_provider.as_deref() {
-        if let Some(provider) = config.providers.get(provider_id) {
-            if secret_store::provider_uses_sealed_secret(provider_id, provider, &config.auth) {
-                resolver_config
-                    .providers
-                    .insert(provider_id.to_owned(), provider.clone());
-                needs_resolver = true;
-            }
-        }
+    if let Some(provider_id) = config.harness.default_provider.as_deref()
+        && let Some(provider) = config.providers.get(provider_id)
+        && secret_store::provider_uses_sealed_secret(provider_id, provider, &config.auth)
+    {
+        resolver_config
+            .providers
+            .insert(provider_id.to_owned(), provider.clone());
+        needs_resolver = true;
     }
 
     if config

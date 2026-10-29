@@ -317,10 +317,10 @@ pub fn select_for_turn<M: crate::store::Memory>(
         .iter()
         .filter(|sig| {
             // Schritt 2: Minimaler PromotionScore (falls gesetzt).
-            if let Some(min_score) = request.min_promotion_score {
-                if sig.promotion_score().total() < min_score {
-                    return false;
-                }
+            if let Some(min_score) = request.min_promotion_score
+                && sig.promotion_score().total() < min_score
+            {
+                return false;
             }
             // Schritt 3a: Kein abgelaufenes Signal.
             if sig.is_expired(now) {

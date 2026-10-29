@@ -213,10 +213,10 @@ where
 {
     ws.send(request(id, method, params)?).await?;
     loop {
-        if let WireMessage::Response(response) = next(ws).await? {
-            if response.id == id {
-                return Ok(response);
-            }
+        if let WireMessage::Response(response) = next(ws).await?
+            && response.id == id
+        {
+            return Ok(response);
         }
     }
 }

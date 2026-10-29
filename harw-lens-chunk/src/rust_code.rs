@@ -279,12 +279,12 @@ fn detect_item_keyword(line: &str) -> bool {
     loop {
         let mut advanced = false;
         for modifier in MODIFIERS {
-            if let Some(after) = rest.strip_prefix(modifier) {
-                if after.starts_with(char::is_whitespace) {
-                    rest = after.trim_start();
-                    advanced = true;
-                    break;
-                }
+            if let Some(after) = rest.strip_prefix(modifier)
+                && after.starts_with(char::is_whitespace)
+            {
+                rest = after.trim_start();
+                advanced = true;
+                break;
             }
         }
         if !advanced {
@@ -295,17 +295,17 @@ fn detect_item_keyword(line: &str) -> bool {
     let is_word_boundary = |c: char| c.is_whitespace() || c == '<' || c == '(' || c == '!';
 
     for keyword in KEYWORDS {
-        if let Some(after) = rest.strip_prefix(keyword) {
-            if after.is_empty() || after.starts_with(is_word_boundary) {
-                return true;
-            }
+        if let Some(after) = rest.strip_prefix(keyword)
+            && (after.is_empty() || after.starts_with(is_word_boundary))
+        {
+            return true;
         }
     }
 
-    if let Some(after) = rest.strip_prefix("impl") {
-        if after.is_empty() || after.starts_with(|c: char| c.is_whitespace() || c == '<') {
-            return true;
-        }
+    if let Some(after) = rest.strip_prefix("impl")
+        && (after.is_empty() || after.starts_with(|c: char| c.is_whitespace() || c == '<'))
+    {
+        return true;
     }
 
     false

@@ -138,10 +138,10 @@ impl SessionView {
     /// late replay. Frames at the same position are applied, and applying a
     /// frame twice is harmless because each step is idempotent.
     pub fn apply(&mut self, envelope: &FrameEnvelope) -> Action {
-        if let Some(seen) = &self.cursor {
-            if is_stale(seen, &envelope.cursor) {
-                return Action::None;
-            }
+        if let Some(seen) = &self.cursor
+            && is_stale(seen, &envelope.cursor)
+        {
+            return Action::None;
         }
         self.cursor = Some(envelope.cursor);
         match &envelope.frame {
@@ -209,10 +209,10 @@ impl SessionView {
                     ToolState::Failed
                 };
                 for entry in &mut self.transcript {
-                    if entry.key == call_id.as_str() {
-                        if let EntryKind::Tool { state: slot, .. } = &mut entry.kind {
-                            *slot = state;
-                        }
+                    if entry.key == call_id.as_str()
+                        && let EntryKind::Tool { state: slot, .. } = &mut entry.kind
+                    {
+                        *slot = state;
                     }
                 }
             }

@@ -299,13 +299,12 @@ mod tests {
             let session = params.session_id.clone();
             let mut refuse = false;
             if let Ok(mut calls) = self.attaches.lock() {
-                if !calls.is_empty() {
-                    if let Ok(mut failing) = self.failing_attaches.lock() {
-                        if *failing > 0 {
-                            *failing -= 1;
-                            refuse = true;
-                        }
-                    }
+                if !calls.is_empty()
+                    && let Ok(mut failing) = self.failing_attaches.lock()
+                    && *failing > 0
+                {
+                    *failing -= 1;
+                    refuse = true;
                 }
                 calls.push(params);
             }

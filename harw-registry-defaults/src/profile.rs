@@ -2841,24 +2841,24 @@ pub fn agent_definition_tool_names_for_access(
         .chain(AGENT_DEFINITION_LIST_TOOLS.iter())
         .copied()
         .collect();
-    if let Some(access) = access {
-        if access.ceiling.is_some() {
-            tools.extend_from_slice(&AGENT_DEFINITION_WRITE_TOOLS[..2]);
-            if access.mode == DefinitionWriteMode::Commit {
-                tools.extend_from_slice(&AGENT_DEFINITION_WRITE_TOOLS[2..]);
-            }
+    if let Some(access) = access
+        && access.ceiling.is_some()
+    {
+        tools.extend_from_slice(&AGENT_DEFINITION_WRITE_TOOLS[..2]);
+        if access.mode == DefinitionWriteMode::Commit {
+            tools.extend_from_slice(&AGENT_DEFINITION_WRITE_TOOLS[2..]);
         }
     }
     // Danach die Werkzeuge des daneben montierten
     // `SkillProposalToolProvider` — dieselbe Staffelung: lesend immer, mit
     // Decke `skills.propose`, im Commit-Modus zusätzlich Commit/Reject.
     tools.extend_from_slice(SKILL_PROPOSAL_READ_TOOLS);
-    if let Some(access) = access {
-        if access.ceiling.is_some() {
-            tools.extend_from_slice(SKILL_PROPOSAL_PROPOSE_TOOLS);
-            if access.mode == DefinitionWriteMode::Commit {
-                tools.extend_from_slice(SKILL_PROPOSAL_DECIDE_TOOLS);
-            }
+    if let Some(access) = access
+        && access.ceiling.is_some()
+    {
+        tools.extend_from_slice(SKILL_PROPOSAL_PROPOSE_TOOLS);
+        if access.mode == DefinitionWriteMode::Commit {
+            tools.extend_from_slice(SKILL_PROPOSAL_DECIDE_TOOLS);
         }
     }
     tools

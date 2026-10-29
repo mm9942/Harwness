@@ -105,19 +105,19 @@ pub fn run_free(procfs: &ProcFs, args: &FreeArgs) -> ToolOutput {
         "used_percent": if total == 0 { 0.0 } else { (used as f64 / total as f64 * 1000.0).round() / 10.0 },
         "truncated": false,
     });
-    if flag(args.human) {
-        if let Some(map) = data.as_object_mut() {
-            for (key, bytes) in [
-                ("total", total),
-                ("used", used),
-                ("free", free),
-                ("available", available),
-                ("buff_cache", buffers + cached),
-                ("swap_total", swap_total),
-                ("swap_used", swap_used),
-            ] {
-                map.insert(format!("{key}_human"), json!(human_size(bytes)));
-            }
+    if flag(args.human)
+        && let Some(map) = data.as_object_mut()
+    {
+        for (key, bytes) in [
+            ("total", total),
+            ("used", used),
+            ("free", free),
+            ("available", available),
+            ("buff_cache", buffers + cached),
+            ("swap_total", swap_total),
+            ("swap_used", swap_used),
+        ] {
+            map.insert(format!("{key}_human"), json!(human_size(bytes)));
         }
     }
     ok(

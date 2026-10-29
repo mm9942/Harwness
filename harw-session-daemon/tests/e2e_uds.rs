@@ -160,12 +160,11 @@ where
         let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
             .await?
             .ok_or("closed")??;
-        if let Message::Text(text) = message {
-            if let WireMessage::Response(response) = serde_json::from_str(text.as_str())? {
-                if response.id == id {
-                    return Ok(response);
-                }
-            }
+        if let Message::Text(text) = message
+            && let WireMessage::Response(response) = serde_json::from_str(text.as_str())?
+            && response.id == id
+        {
+            return Ok(response);
         }
     }
 }

@@ -208,11 +208,14 @@ impl<J> Scheduler<J> {
     }
 
     fn schedule(&mut self, key: &SessionKey) {
-        if let Some(lane) = self.lanes.get_mut(key) {
-            if !lane.running && !lane.blocked && !lane.scheduled && !lane.queue.is_empty() {
-                lane.scheduled = true;
-                self.ready.push_back(key.clone());
-            }
+        if let Some(lane) = self.lanes.get_mut(key)
+            && !lane.running
+            && !lane.blocked
+            && !lane.scheduled
+            && !lane.queue.is_empty()
+        {
+            lane.scheduled = true;
+            self.ready.push_back(key.clone());
         }
     }
 

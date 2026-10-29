@@ -222,13 +222,13 @@ impl AttachmentQueue {
     ) -> PushOutcome {
         // Merge into the previous undelivered delta of the same turn.
         let mut merged: Option<(usize, usize)> = None;
-        if let Some(last) = state.queue.back_mut() {
-            if merge_delta(&mut last.envelope.frame, &envelope.frame, !compact) {
-                last.envelope.cursor = envelope.cursor;
-                let old = last.bytes;
-                last.bytes = frame_bytes(&last.envelope);
-                merged = Some((old, last.bytes));
-            }
+        if let Some(last) = state.queue.back_mut()
+            && merge_delta(&mut last.envelope.frame, &envelope.frame, !compact)
+        {
+            last.envelope.cursor = envelope.cursor;
+            let old = last.bytes;
+            last.bytes = frame_bytes(&last.envelope);
+            merged = Some((old, last.bytes));
         }
         if let Some((old, new)) = merged {
             state.bytes = state.bytes.saturating_sub(old).saturating_add(new);

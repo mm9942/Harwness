@@ -53,18 +53,17 @@ fn unescape(field: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            if let Some(digits) = bytes.get(index + 1..index + 4) {
-                if digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
-                    let value = digits
-                        .iter()
-                        .fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
-                    if let Ok(byte) = u8::try_from(value) {
-                        out.push(byte);
-                        index += 4;
-                        continue;
-                    }
-                }
+        if bytes[index] == b'\\'
+            && let Some(digits) = bytes.get(index + 1..index + 4)
+            && digits.iter().all(|d| (b'0'..=b'7').contains(d))
+        {
+            let value = digits
+                .iter()
+                .fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
+            if let Ok(byte) = u8::try_from(value) {
+                out.push(byte);
+                index += 4;
+                continue;
             }
         }
         out.push(bytes[index]);

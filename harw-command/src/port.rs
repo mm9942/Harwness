@@ -286,10 +286,10 @@ impl CommandRequest {
             .timeout(timeout)
             .sandbox(profile)
             .sandbox_requirement(requirement);
-        if let CommandSandbox::Workspace(workspace) = &self.sandbox {
-            if let Some(scope) = &workspace.write_scope {
-                builder = builder.write_scope(scope.clone());
-            }
+        if let CommandSandbox::Workspace(workspace) = &self.sandbox
+            && let Some(scope) = &workspace.write_scope
+        {
+            builder = builder.write_scope(scope.clone());
         }
         for (name, value) in &self.env {
             builder = builder.env(name.clone(), value.clone());

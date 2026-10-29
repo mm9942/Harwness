@@ -265,12 +265,11 @@ fn snapshot_mtimes(dir: &Path) -> HashMap<PathBuf, SystemTime> {
         return map;
     };
     for entry in entries.filter_map(Result::ok) {
-        if let Ok(meta) = fs::symlink_metadata(entry.path()) {
-            if meta.file_type().is_file() {
-                if let Ok(mtime) = meta.modified() {
-                    map.insert(entry.path(), mtime);
-                }
-            }
+        if let Ok(meta) = fs::symlink_metadata(entry.path())
+            && meta.file_type().is_file()
+            && let Ok(mtime) = meta.modified()
+        {
+            map.insert(entry.path(), mtime);
         }
     }
     map

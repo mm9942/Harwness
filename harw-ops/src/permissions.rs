@@ -324,15 +324,15 @@ fn compute_mode_origin(
     global: Option<&PermissionsSection>,
     active: ApprovalMode,
 ) -> String {
-    if let Some(section) = project {
-        if section.default_mode.as_deref() == Some(active.as_str()) {
-            return "Projekt".to_owned();
-        }
+    if let Some(section) = project
+        && section.default_mode.as_deref() == Some(active.as_str())
+    {
+        return "Projekt".to_owned();
     }
-    if let Some(section) = global {
-        if section.default_mode.as_deref() == Some(active.as_str()) {
-            return "Global".to_owned();
-        }
+    if let Some(section) = global
+        && section.default_mode.as_deref() == Some(active.as_str())
+    {
+        return "Global".to_owned();
     }
     "Sitzung (nicht dauerhaft gespeichert)".to_owned()
 }

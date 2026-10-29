@@ -130,12 +130,12 @@ impl CheckpointLog {
         event_count: u64,
         signing_key: &SecretBox<[u8]>,
     ) -> AuditResult<&Checkpoint> {
-        if let Some(previous) = self.checkpoints.last() {
-            if event_count <= previous.event_count {
-                return Err(AuditError::NonMonotonicCheckpoint {
-                    index: self.checkpoints.len() as u64,
-                });
-            }
+        if let Some(previous) = self.checkpoints.last()
+            && event_count <= previous.event_count
+        {
+            return Err(AuditError::NonMonotonicCheckpoint {
+                index: self.checkpoints.len() as u64,
+            });
         }
 
         let mut checkpoint = Checkpoint {

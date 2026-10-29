@@ -681,10 +681,10 @@ pub fn extract_anthropic_text(body: &Value) -> Option<String> {
     let content = body.get("content")?.as_array()?;
     let mut text = String::new();
     for block in content {
-        if block.get("type").and_then(Value::as_str) == Some("text") {
-            if let Some(chunk) = block.get("text").and_then(Value::as_str) {
-                text.push_str(chunk);
-            }
+        if block.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(chunk) = block.get("text").and_then(Value::as_str)
+        {
+            text.push_str(chunk);
         }
     }
     if text.is_empty() { None } else { Some(text) }

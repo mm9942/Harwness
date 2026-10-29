@@ -759,14 +759,14 @@ pub async fn run_job_worker_once(
 // its commit in list order. Returns the jobs that reached a terminal state.
 async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -> usize {
     let mut completed = lane.reap();
-    if let Some(plan) = services.plan_services.as_ref() {
-        if let Err(error) = PlanJobBridge::recover_pending_admissions(
+    if let Some(plan) = services.plan_services.as_ref()
+        && let Err(error) = PlanJobBridge::recover_pending_admissions(
             plan.plan(),
             &services.store,
             Timestamp::now(),
-        ) {
-            tracing::warn!(error = %error, "could not publish staged plan-node admissions");
-        }
+        )
+    {
+        tracing::warn!(error = %error, "could not publish staged plan-node admissions");
     }
     let page = match services.store.list(&JobListQuery {
         states: Some(vec![JobState::Ready]),
@@ -1428,12 +1428,12 @@ fn check_declared_scope_fields(
         ("tenant", scope.tenant().as_str()),
         ("workspace", scope.workspace().as_str()),
     ] {
-        if let Some(declared) = object.get(key) {
-            if declared.as_str() != Some(expected) {
-                return Err(format!(
-                    "scope: the {origin} declares a {key} other than the job's server-resolved {key}"
-                ));
-            }
+        if let Some(declared) = object.get(key)
+            && declared.as_str() != Some(expected)
+        {
+            return Err(format!(
+                "scope: the {origin} declares a {key} other than the job's server-resolved {key}"
+            ));
         }
     }
     Ok(())
@@ -2593,13 +2593,13 @@ impl PromptTokenLedger {
         if let Some(reason) = &state.exceeded {
             return Err(reason.clone());
         }
-        if let Some(limit) = self.budget.max_tokens {
-            if state.usage.tokens >= limit {
-                let reason =
-                    format!("budget: token limit of {limit} is exhausted; no further model round");
-                state.exceeded = Some(reason.clone());
-                return Err(reason);
-            }
+        if let Some(limit) = self.budget.max_tokens
+            && state.usage.tokens >= limit
+        {
+            let reason =
+                format!("budget: token limit of {limit} is exhausted; no further model round");
+            state.exceeded = Some(reason.clone());
+            return Err(reason);
         }
         Ok(())
     }
@@ -4607,10 +4607,10 @@ impl ExecutionControl for WorkerExecutionControl {
     }
 
     fn force_abort(&self) {
-        if let Ok(slot) = self.abort_handle.lock() {
-            if let Some(handle) = slot.as_ref() {
-                handle.abort();
-            }
+        if let Ok(slot) = self.abort_handle.lock()
+            && let Some(handle) = slot.as_ref()
+        {
+            handle.abort();
         }
     }
 

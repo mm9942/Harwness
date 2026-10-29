@@ -468,10 +468,10 @@ fn grep_internal(root: &Path, args: &GrepArgs) -> ToolOutput {
                     if entry.entry_type != EntryType::File {
                         return ControlFlow::Continue(());
                     }
-                    if let Some(matcher) = run.file_matcher {
-                        if !matcher.is_match(entry.rel) {
-                            return ControlFlow::Continue(());
-                        }
+                    if let Some(matcher) = run.file_matcher
+                        && !matcher.is_match(entry.rel)
+                    {
+                        return ControlFlow::Continue(());
                     }
                     if entry.len > MAX_FILE_SIZE_BYTES {
                         run.skipped += 1;

@@ -121,13 +121,13 @@ fn parse_kind(value: &str) -> Option<Kind> {
 fn split_kind(args: PsArgs) -> Result<(Option<Kind>, Option<String>), OpError> {
     let PsArgs { status, kind } = args;
     if let Some(kind_from_status) = status.as_deref().and_then(parse_kind) {
-        if let Some(second) = kind.as_deref() {
-            if parse_kind(second).is_some() {
-                return Err(OpError::InvalidArguments(format!(
-                    "two job kinds given: `{}` and `{second}`",
-                    status.as_deref().unwrap_or_default()
-                )));
-            }
+        if let Some(second) = kind.as_deref()
+            && parse_kind(second).is_some()
+        {
+            return Err(OpError::InvalidArguments(format!(
+                "two job kinds given: `{}` and `{second}`",
+                status.as_deref().unwrap_or_default()
+            )));
         }
         return Ok((Some(kind_from_status), kind));
     }

@@ -942,10 +942,10 @@ fn job_cgroup_name(attempt: &AttemptId) -> String {
 fn read_pid_file(path: &Path) -> TestResult<u32> {
     let started = std::time::Instant::now();
     while started.elapsed() < LIMIT {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if let Ok(pid) = text.trim().parse::<u32>() {
-                return Ok(pid);
-            }
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            return Ok(pid);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -2100,23 +2100,23 @@ impl JobRecordStore for LoseLeaseOnStarting {
 
 impl CoordinatorStore for LoseLeaseOnStarting {
     fn load_job(&self, job: &WorkId) -> harw_job_store::StoreResult<harw_job_core::StoredJob> {
-        if let Some(gate) = &self.gate {
-            if gate.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                gate.reached.notify_one();
-                let released = gate
-                    .released
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let (released, _) = gate
-                    .release
-                    .wait_timeout_while(released, LIMIT, |released| !*released)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !*released {
-                    return Err(harw_job_store::StoreError::Unsupported {
-                        operation: "test start guard",
-                        detail: "guard was not released".into(),
-                    });
-                }
+        if let Some(gate) = &self.gate
+            && gate.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            gate.reached.notify_one();
+            let released = gate
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (released, _) = gate
+                .release
+                .wait_timeout_while(released, LIMIT, |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !*released {
+                return Err(harw_job_store::StoreError::Unsupported {
+                    operation: "test start guard",
+                    detail: "guard was not released".into(),
+                });
             }
         }
         self.store.load_job(job)

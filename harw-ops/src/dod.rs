@@ -299,10 +299,10 @@ impl DodService {
     #[must_use]
     pub fn snapshot(&self) -> Arc<DodSnapshot> {
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(cached) = cache.as_ref() {
-            if cached.at.elapsed() < self.ttl {
-                return Arc::clone(&cached.snapshot);
-            }
+        if let Some(cached) = cache.as_ref()
+            && cached.at.elapsed() < self.ttl
+        {
+            return Arc::clone(&cached.snapshot);
         }
         let snapshot = Arc::new(self.backend.read((self.clock)()));
         *cache = Some(CachedSnapshot {

@@ -278,10 +278,10 @@ fn collect_arguments(journal: &Journal) -> Vec<ArgInfo> {
             }
             EntryKind::CountersSubmitted { seat, counters } => {
                 for c in counters.iter().filter(|c| !c.cons.is_empty()) {
-                    if let Some(i) = index(&args, &c.argument_id) {
-                        if let Some(a) = args.get_mut(i) {
-                            a.counters.push((seat.clone(), c.cons.clone()));
-                        }
+                    if let Some(i) = index(&args, &c.argument_id)
+                        && let Some(a) = args.get_mut(i)
+                    {
+                        a.counters.push((seat.clone(), c.cons.clone()));
                     }
                 }
             }
@@ -297,10 +297,10 @@ fn collect_arguments(journal: &Journal) -> Vec<ArgInfo> {
                 }
             }
             EntryKind::DiceRolled { roll } => {
-                if let Some(a) = index(&args, &roll.argument_id).and_then(|i| args.get_mut(i)) {
-                    if !a.rolls.contains(roll) {
-                        a.rolls.push(roll.clone());
-                    }
+                if let Some(a) = index(&args, &roll.argument_id).and_then(|i| args.get_mut(i))
+                    && !a.rolls.contains(roll)
+                {
+                    a.rolls.push(roll.clone());
                 }
             }
             EntryKind::ArgumentResolved {
@@ -525,10 +525,10 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
         match &entry.kind {
             EntryKind::VarDeclared { var } => {
                 current.insert(var.id.clone(), var.value.clone());
-                if entry.round == 0 {
-                    if let Some(v) = track_value(&var.value) {
-                        start.entry(var.id.clone()).or_insert(v);
-                    }
+                if entry.round == 0
+                    && let Some(v) = track_value(&var.value)
+                {
+                    start.entry(var.id.clone()).or_insert(v);
                 }
             }
             EntryKind::WorldDelta { var, to, .. } => {

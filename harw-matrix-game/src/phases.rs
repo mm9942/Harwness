@@ -804,10 +804,10 @@ pub fn validate_player_argument(
             ));
         }
     }
-    if let Some(target) = &argument.conflict_target {
-        if target == player.as_str() || !state.players.iter().any(|p| p.as_str() == target) {
-            errors.push(format!("conflict_target `{target}` ist kein anderer Sitz"));
-        }
+    if let Some(target) = &argument.conflict_target
+        && (target == player.as_str() || !state.players.iter().any(|p| p.as_str() == target))
+    {
+        errors.push(format!("conflict_target `{target}` ist kein anderer Sitz"));
     }
     if let Some(project) = &argument.project {
         let visible = state.vars.get(project).is_some_and(|v| {
@@ -1121,12 +1121,12 @@ fn validate_ruling(
             "{label}: inconsistent_with verweist auf sich selbst"
         ));
     }
-    if let Some(secret) = &ruling.triggers_secret {
-        if state.secrets.get(secret).is_none_or(|s| s.revealed) {
-            errors.push(format!(
-                "{label}: triggers_secret `{secret}` unbekannt oder offen"
-            ));
-        }
+    if let Some(secret) = &ruling.triggers_secret
+        && state.secrets.get(secret).is_none_or(|s| s.revealed)
+    {
+        errors.push(format!(
+            "{label}: triggers_secret `{secret}` unbekannt oder offen"
+        ));
     }
     if let Some(text) = &ruling.public_rationale {
         check_len(
@@ -2413,11 +2413,11 @@ pub fn submit_red_cell(
         }
     };
     log.record(GameEntry::new(round, Audience::Public, entry), at)?;
-    if let Some(target) = &objection.target {
-        if let Some(arg) = args.iter_mut().find(|a| &a.id == target) {
-            arg.counters
-                .insert(PlayerId::new(RED_CELL_KEY), objection.cons.clone());
-        }
+    if let Some(target) = &objection.target
+        && let Some(arg) = args.iter_mut().find(|a| &a.id == target)
+    {
+        arg.counters
+            .insert(PlayerId::new(RED_CELL_KEY), objection.cons.clone());
     }
     Ok(())
 }

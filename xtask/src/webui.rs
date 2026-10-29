@@ -606,12 +606,12 @@ fn test_module_ranges(source: &str) -> Vec<(usize, usize)> {
                     while k < bytes.len() && (bytes[k] as char).is_whitespace() {
                         k += 1;
                     }
-                    if bytes.get(k) == Some(&b'{') {
-                        if let Some(close) = matching_delimiter(source, k, '{', '}') {
-                            ranges.push((k, close));
-                            i = close + 1;
-                            continue;
-                        }
+                    if bytes.get(k) == Some(&b'{')
+                        && let Some(close) = matching_delimiter(source, k, '{', '}')
+                    {
+                        ranges.push((k, close));
+                        i = close + 1;
+                        continue;
                     }
                 }
             }
@@ -658,12 +658,12 @@ fn find_struct_blocks(source: &str, needle: &str) -> Vec<(usize, usize)> {
             while j < bytes.len() && (bytes[j] as char).is_whitespace() {
                 j += 1;
             }
-            if bytes.get(j) == Some(&b'{') {
-                if let Some(close) = matching_delimiter(source, j, '{', '}') {
-                    blocks.push((j, close));
-                    i = close + 1;
-                    continue;
-                }
+            if bytes.get(j) == Some(&b'{')
+                && let Some(close) = matching_delimiter(source, j, '{', '}')
+            {
+                blocks.push((j, close));
+                i = close + 1;
+                continue;
             }
         }
         i = idx + needle.len();

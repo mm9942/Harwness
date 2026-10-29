@@ -39,13 +39,13 @@ pub async fn fetch_attachment(
     attachment: &AttachmentRef,
 ) -> TransportResult<DownloadedAttachment> {
     intake.validate_declared_size(attachment.declared_size)?;
-    if let Some(reported) = attachment.reported_mime.as_deref() {
-        if !intake.may_accept_reported(reported) {
-            return Err(rejected(format!(
-                "reported MIME type is not allowed: {}",
-                normalize_mime(reported)
-            )));
-        }
+    if let Some(reported) = attachment.reported_mime.as_deref()
+        && !intake.may_accept_reported(reported)
+    {
+        return Err(rejected(format!(
+            "reported MIME type is not allowed: {}",
+            normalize_mime(reported)
+        )));
     }
     let file = client.get_file(&attachment.remote_id).await?;
     intake.validate_declared_size(file.file_size)?;

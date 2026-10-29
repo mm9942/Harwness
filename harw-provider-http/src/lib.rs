@@ -2301,12 +2301,12 @@ pub(crate) fn parse_retry_after(
     const DEFAULT_SECS: u64 = 30;
 
     // 1. Retry-After-Header als numerischer Sekundenwert.
-    if let Some(header_val) = retry_after_header {
-        if let Ok(secs) = header_val.trim().parse::<u64>() {
-            return std::time::Duration::from_secs(secs);
-        }
-        // HTTP-Date-Format: ignoriert, Fallback auf Body.
+    if let Some(header_val) = retry_after_header
+        && let Ok(secs) = header_val.trim().parse::<u64>()
+    {
+        return std::time::Duration::from_secs(secs);
     }
+    // HTTP-Date-Format: ignoriert, Fallback auf Body.
 
     // 2. Body-Extraktion: suche "wait N seconds" (case-insensitive).
     //    Einfache Variante ohne externe Regex-Crate:
@@ -2318,10 +2318,10 @@ pub(crate) fn parse_retry_after(
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .collect();
-        if let Ok(secs) = num_str.parse::<u64>() {
-            if secs > 0 {
-                return std::time::Duration::from_secs(secs);
-            }
+        if let Ok(secs) = num_str.parse::<u64>()
+            && secs > 0
+        {
+            return std::time::Duration::from_secs(secs);
         }
     }
 
@@ -2966,25 +2966,25 @@ fn build_responses_body(
     replay: &[ReplayEntry],
 ) -> Result<Value, serde_json::Error> {
     let mut body = serde_json::to_value(build_request(model, request))?;
-    if !replay.is_empty() {
-        if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
-            let items = std::mem::take(input);
-            let mut emitted = vec![false; replay.len()];
-            for item in items {
-                let function_call_id = (item.get("type").and_then(Value::as_str)
-                    == Some("function_call"))
-                .then(|| item.get("call_id").and_then(Value::as_str))
-                .flatten();
-                if let Some(call_id) = function_call_id {
-                    for (entry, done) in replay.iter().zip(emitted.iter_mut()) {
-                        if !*done && entry.call_ids.iter().any(|id| id == call_id) {
-                            *done = true;
-                            input.extend(entry.blocks.iter().cloned());
-                        }
+    if !replay.is_empty()
+        && let Some(input) = body.get_mut("input").and_then(Value::as_array_mut)
+    {
+        let items = std::mem::take(input);
+        let mut emitted = vec![false; replay.len()];
+        for item in items {
+            let function_call_id = (item.get("type").and_then(Value::as_str)
+                == Some("function_call"))
+            .then(|| item.get("call_id").and_then(Value::as_str))
+            .flatten();
+            if let Some(call_id) = function_call_id {
+                for (entry, done) in replay.iter().zip(emitted.iter_mut()) {
+                    if !*done && entry.call_ids.iter().any(|id| id == call_id) {
+                        *done = true;
+                        input.extend(entry.blocks.iter().cloned());
                     }
                 }
-                input.push(item);
             }
+            input.push(item);
         }
     }
     if let Some(max_output_tokens) = request.max_output_tokens {
@@ -3380,10 +3380,10 @@ fn extract_assistant_text(body: &Value) -> Option<String> {
             continue;
         };
         for part in parts {
-            if part.get("type").and_then(Value::as_str) == Some("output_text") {
-                if let Some(chunk) = part.get("text").and_then(Value::as_str) {
-                    text.push_str(chunk);
-                }
+            if part.get("type").and_then(Value::as_str) == Some("output_text")
+                && let Some(chunk) = part.get("text").and_then(Value::as_str)
+            {
+                text.push_str(chunk);
             }
         }
     }

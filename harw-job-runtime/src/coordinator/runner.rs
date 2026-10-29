@@ -483,17 +483,17 @@ fn decide(
     if ending.exit.is_success() {
         return (LifecycleEvent::Succeed, None);
     }
-    if let Some(report) = sandbox {
-        if !report.satisfies(requirement) {
-            return (
-                LifecycleEvent::Fail,
-                Some(format!(
-                    "policy: sandbox requirement not met (not fully enforced: {}); {}",
-                    report.shortfalls().join(", "),
-                    ending.exit
-                )),
-            );
-        }
+    if let Some(report) = sandbox
+        && !report.satisfies(requirement)
+    {
+        return (
+            LifecycleEvent::Fail,
+            Some(format!(
+                "policy: sandbox requirement not met (not fully enforced: {}); {}",
+                report.shortfalls().join(", "),
+                ending.exit
+            )),
+        );
     }
     if ending.exit == ExitOutcome::Unknown {
         return (
@@ -2021,24 +2021,24 @@ where
 
     // Defense in depth: never count an attempt as Running whose known
     // enforcement contradicts a hard requirement.
-    if let Some(report) = record.sandbox {
-        if !report.satisfies(spec.sandbox) {
-            run.cancel();
-            let exit = drain(&mut run).await;
-            record.exit = Some(exit);
-            let reason = format!(
-                "{POLICY_PREFIX} sandbox requirement not met (not fully enforced: {}); the job was killed before it counted as running",
-                report.shortfalls().join(", ")
-            );
-            return Ok(AttemptEnd {
-                ctx,
-                record,
-                output: Output::default(),
-                event: LifecycleEvent::Fail,
-                reason: Some(reason),
-                write_record: true,
-            });
-        }
+    if let Some(report) = record.sandbox
+        && !report.satisfies(spec.sandbox)
+    {
+        run.cancel();
+        let exit = drain(&mut run).await;
+        record.exit = Some(exit);
+        let reason = format!(
+            "{POLICY_PREFIX} sandbox requirement not met (not fully enforced: {}); the job was killed before it counted as running",
+            report.shortfalls().join(", ")
+        );
+        return Ok(AttemptEnd {
+            ctx,
+            record,
+            output: Output::default(),
+            event: LifecycleEvent::Fail,
+            reason: Some(reason),
+            write_record: true,
+        });
     }
 
     record.apply(LifecycleEvent::Spawned, Timestamp::now())?;
@@ -2188,10 +2188,10 @@ where
         record.sandbox = late_report;
     }
     let mut exit = exit;
-    if exit == ExitOutcome::Unknown {
-        if let Some(recorded) = inner.executor.recorded_exit(&ctx) {
-            exit = recorded;
-        }
+    if exit == ExitOutcome::Unknown
+        && let Some(recorded) = inner.executor.recorded_exit(&ctx)
+    {
+        exit = recorded;
     }
     record.exit = Some(exit);
     record.cancellation.clone_from(&cause);

@@ -593,10 +593,11 @@ impl FsReadExecutor {
 /// Nur wenn davor gültiger Text steht; sonst bleibt der Puffer unverändert
 /// (verlustbehaftete Dekodierung, garantiert Fortschritt beim Weiterlesen).
 fn trim_partial_utf8(raw: &mut Vec<u8>) {
-    if let Err(err) = std::str::from_utf8(raw) {
-        if err.error_len().is_none() && err.valid_up_to() > 0 {
-            raw.truncate(err.valid_up_to());
-        }
+    if let Err(err) = std::str::from_utf8(raw)
+        && err.error_len().is_none()
+        && err.valid_up_to() > 0
+    {
+        raw.truncate(err.valid_up_to());
     }
 }
 

@@ -606,26 +606,25 @@ impl TurnGuard {
             }
         }
 
-        if PLAN_SCOPE_TOOLS.contains(&tool_name) {
-            if let Some(plan_text) = self.last_plan_text.as_deref() {
-                if let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) {
-                    let file_name = file_name_of(path);
-                    let already_warned = self.scope_drift_warned_paths.contains(path);
-                    if !file_name.is_empty() && !plan_text.contains(file_name) && !already_warned {
-                        self.scope_drift_warned_paths.insert(path.to_owned());
-                        let event = self.event(
-                            DriftKind::PlanScopeDrift,
-                            format!("`{path}` kommt im zuletzt bekannten Plan nicht vor"),
-                            Some(tool_name),
-                        );
-                        return GuardVerdict::Warn {
-                            hint: format!(
-                                "[harw-Wächter] `{path}` ist im aktuellen Plan nicht erwähnt — Planumfang prüfen."
-                            ),
-                            event,
-                        };
-                    }
-                }
+        if PLAN_SCOPE_TOOLS.contains(&tool_name)
+            && let Some(plan_text) = self.last_plan_text.as_deref()
+            && let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str)
+        {
+            let file_name = file_name_of(path);
+            let already_warned = self.scope_drift_warned_paths.contains(path);
+            if !file_name.is_empty() && !plan_text.contains(file_name) && !already_warned {
+                self.scope_drift_warned_paths.insert(path.to_owned());
+                let event = self.event(
+                    DriftKind::PlanScopeDrift,
+                    format!("`{path}` kommt im zuletzt bekannten Plan nicht vor"),
+                    Some(tool_name),
+                );
+                return GuardVerdict::Warn {
+                    hint: format!(
+                        "[harw-Wächter] `{path}` ist im aktuellen Plan nicht erwähnt — Planumfang prüfen."
+                    ),
+                    event,
+                };
             }
         }
 

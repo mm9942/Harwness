@@ -378,13 +378,13 @@ impl ProviderToml {
                 )));
             }
         }
-        if let Some(originator) = &self.originator {
-            if originator.len() > MAX_ORIGINATOR_CHARS || !is_printable_ascii(originator) {
-                return Err(ConfigError::Invalid(format!(
-                    "provider '{}': originator must be non-empty, printable ASCII (no control characters) and at most {MAX_ORIGINATOR_CHARS} characters",
-                    self.name
-                )));
-            }
+        if let Some(originator) = &self.originator
+            && (originator.len() > MAX_ORIGINATOR_CHARS || !is_printable_ascii(originator))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "provider '{}': originator must be non-empty, printable ASCII (no control characters) and at most {MAX_ORIGINATOR_CHARS} characters",
+                self.name
+            )));
         }
         Ok(())
     }

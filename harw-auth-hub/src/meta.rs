@@ -272,7 +272,7 @@ fn fallback_entropy() -> [u8; 16] {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     let mut out = [0_u8; 16];
-    for (lane, chunk) in out.chunks_exact_mut(8).enumerate() {
+    for (lane, chunk) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         let mut hasher = RandomState::new().build_hasher();
         hasher.write_usize(lane);
         hasher.write_u128(nanos);

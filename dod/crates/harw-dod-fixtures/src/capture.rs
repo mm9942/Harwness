@@ -247,10 +247,10 @@ fn redaction_pairs() -> Vec<(String, &'static str)> {
     let user = std::env::var("USER")
         .ok()
         .or_else(|| std::env::var("LOGNAME").ok());
-    if let Some(user) = user {
-        if !user.trim().is_empty() {
-            pairs.push((user, "<REDACTED-USER>"));
-        }
+    if let Some(user) = user
+        && !user.trim().is_empty()
+    {
+        pairs.push((user, "<REDACTED-USER>"));
     }
 
     if let Ok(hostname) = std::fs::read_to_string("/proc/sys/kernel/hostname") {

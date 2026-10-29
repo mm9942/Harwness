@@ -455,12 +455,11 @@ impl<'a> Odb<'a> {
         // lose Objekte
         let dir_name = &prefix.to_ascii_lowercase()[..2];
         for entry in self.repo.list_git_dir(&format!("objects/{dir_name}")) {
-            if entry.name.len() == 38 {
-                if let Some(oid) = Oid::from_hex(&format!("{dir_name}{}", entry.name)) {
-                    if matches_prefix(oid.as_bytes()) {
-                        found.push(oid);
-                    }
-                }
+            if entry.name.len() == 38
+                && let Some(oid) = Oid::from_hex(&format!("{dir_name}{}", entry.name))
+                && matches_prefix(oid.as_bytes())
+            {
+                found.push(oid);
             }
         }
         // Packs

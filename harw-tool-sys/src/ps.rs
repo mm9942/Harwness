@@ -385,10 +385,8 @@ fn build(procfs: &ProcFs, args: &PsArgs) -> Result<ToolOutput, String> {
     let mut out = Collector::new(limit);
     for (depth, row) in &ordered {
         let mut value = row_json(row, &fields);
-        if tree {
-            if let Some(map) = value.as_object_mut() {
-                map.insert("depth".to_owned(), json!(depth));
-            }
+        if tree && let Some(map) = value.as_object_mut() {
+            map.insert("depth".to_owned(), json!(depth));
         }
         if !out.push(value) {
             break;

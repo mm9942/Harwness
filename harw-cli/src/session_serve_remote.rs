@@ -444,10 +444,10 @@ async fn watch_revocations(
         // Extract explicit revocations even if another row is malformed.
         if let Ok(scan) = &scan {
             for record in scan.records.iter().filter(|record| record.revoked) {
-                if applied.insert(record.device.clone()) {
-                    if let Err(error) = revoker.revoke_device(&record.device) {
-                        tracing::warn!(%error, "device revocation incomplete");
-                    }
+                if applied.insert(record.device.clone())
+                    && let Err(error) = revoker.revoke_device(&record.device)
+                {
+                    tracing::warn!(%error, "device revocation incomplete");
                 }
             }
         }

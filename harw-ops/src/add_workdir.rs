@@ -232,14 +232,14 @@ fn remove_workdir(ctx: &OpContext, path_str: &str) -> Result<OpOutput, OpError> 
     }
 
     let mut note = String::new();
-    if let Ok(path) = crate::permissions::scope_path(ctx, SettingScope::Project) {
-        if let Ok(mut writer) = ConfigWriter::open(&path) {
-            // Bestes Bemühen: ein interner Schreibfehler (siehe
-            // `ConfigError::WriterShapeMismatch`) zählt hier wie "nicht
-            // entfernt", genau wie ein fehlgeschlagenes `save()`.
-            if writer.remove_extra_root(&canonical).unwrap_or(false) && writer.save().is_ok() {
-                note = format!(" Auch dauerhaft aus {} entfernt.", path.display());
-            }
+    if let Ok(path) = crate::permissions::scope_path(ctx, SettingScope::Project)
+        && let Ok(mut writer) = ConfigWriter::open(&path)
+    {
+        // Bestes Bemühen: ein interner Schreibfehler (siehe
+        // `ConfigError::WriterShapeMismatch`) zählt hier wie "nicht
+        // entfernt", genau wie ein fehlgeschlagenes `save()`.
+        if writer.remove_extra_root(&canonical).unwrap_or(false) && writer.save().is_ok() {
+            note = format!(" Auch dauerhaft aus {} entfernt.", path.display());
         }
     }
 

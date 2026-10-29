@@ -151,10 +151,10 @@ async fn wait_delta(frames: &mut Box<dyn FrameSource>, expected: &str) -> TestRe
         let frame = tokio::time::timeout(WAIT, frames.next())
             .await??
             .ok_or("frame stream ended")?;
-        if let SessionFrame::Turn(TurnEvent::AssistantDelta { text, .. }) = &frame.frame {
-            if text == expected {
-                return Ok(());
-            }
+        if let SessionFrame::Turn(TurnEvent::AssistantDelta { text, .. }) = &frame.frame
+            && text == expected
+        {
+            return Ok(());
         }
     }
     Err(format!("delta {expected:?} never arrived").into())

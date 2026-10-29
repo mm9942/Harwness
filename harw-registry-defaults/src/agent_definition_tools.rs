@@ -504,10 +504,9 @@ fn claimed_rights_of(ir: &ExecutableAgentIr) -> DefinitionAuthorCeiling {
 fn base_role_rights_of(definition_name: &str, role: AgentRoleId) -> DefinitionAuthorCeiling {
     if let Ok(builtins) =
         crate::embedded_agents::builtin_agent_definitions(&std::collections::HashMap::new())
+        && let Some(base_ir) = builtins.get(definition_name)
     {
-        if let Some(base_ir) = builtins.get(definition_name) {
-            return claimed_rights_of(base_ir);
-        }
+        return claimed_rights_of(base_ir);
     }
     if let Some(profile) = crate::profile_for_role(definition_name) {
         let tools: BTreeSet<String> = profile
@@ -780,23 +779,23 @@ fn commit_definition(
     let target_path = definition_path(target_dir, name);
     let legacy_path = legacy_flat_definition_path(target_dir, name);
     let legacy_id = existing_definition_id(&legacy_path)?;
-    if let Some(existing_id) = &legacy_id {
-        if existing_id != new_id {
-            return Err(format!(
-                "vorhandene Datei {} hat id '{existing_id}', neue Definition hat id '{new_id}' \
+    if let Some(existing_id) = &legacy_id
+        && existing_id != new_id
+    {
+        return Err(format!(
+            "vorhandene Datei {} hat id '{existing_id}', neue Definition hat id '{new_id}' \
                  — wird nicht überschrieben",
-                legacy_path.display()
-            ));
-        }
+            legacy_path.display()
+        ));
     }
-    if let Some(existing_id) = existing_definition_id(&target_path)? {
-        if existing_id != new_id {
-            return Err(format!(
-                "vorhandene Datei {} hat id '{existing_id}', neue Definition hat id '{new_id}' \
+    if let Some(existing_id) = existing_definition_id(&target_path)?
+        && existing_id != new_id
+    {
+        return Err(format!(
+            "vorhandene Datei {} hat id '{existing_id}', neue Definition hat id '{new_id}' \
                  — wird nicht überschrieben",
-                target_path.display()
-            ));
-        }
+            target_path.display()
+        ));
     }
     write_atomic(&target_path, toml_source.as_bytes(), DEFINITION_FILE_MODE).map_err(|error| {
         format!(
@@ -804,14 +803,14 @@ fn commit_definition(
             target_path.display()
         )
     })?;
-    if legacy_id.is_some() {
-        if let Err(error) = std::fs::remove_file(&legacy_path) {
-            tracing::warn!(
-                path = %legacy_path.display(),
-                %error,
-                "agents.commit_definition.legacy_flat_file_not_removed"
-            );
-        }
+    if legacy_id.is_some()
+        && let Err(error) = std::fs::remove_file(&legacy_path)
+    {
+        tracing::warn!(
+            path = %legacy_path.display(),
+            %error,
+            "agents.commit_definition.legacy_flat_file_not_removed"
+        );
     }
     Ok(target_path)
 }
@@ -830,14 +829,14 @@ fn commit_uia_bundle(
     user_md: &str,
 ) -> Result<(), String> {
     let definition_path = bundle_dir.join("definition.toml");
-    if let Some(existing_id) = existing_definition_id(&definition_path)? {
-        if existing_id != new_id {
-            return Err(format!(
-                "vorhandenes Bundle {} hat id '{existing_id}', neue Definition hat id '{new_id}' \
+    if let Some(existing_id) = existing_definition_id(&definition_path)?
+        && existing_id != new_id
+    {
+        return Err(format!(
+            "vorhandenes Bundle {} hat id '{existing_id}', neue Definition hat id '{new_id}' \
                  — wird nicht überschrieben",
-                bundle_dir.display()
-            ));
-        }
+            bundle_dir.display()
+        ));
     }
     let mut files: Vec<(PathBuf, &str)> = vec![
         (definition_path, definition_toml),

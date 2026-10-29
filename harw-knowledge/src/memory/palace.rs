@@ -198,16 +198,17 @@ pub fn scan_wikilinks(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i + 1 < bytes.len() {
-        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
-            if let Some(close) = find_closing(body, i + 2) {
-                let inner = &body[i + 2..close];
-                let target = inner.split('|').next().unwrap_or(inner).trim();
-                if !target.is_empty() {
-                    out.push(target.to_owned());
-                }
-                i = close + 2;
-                continue;
+        if bytes[i] == b'['
+            && bytes[i + 1] == b'['
+            && let Some(close) = find_closing(body, i + 2)
+        {
+            let inner = &body[i + 2..close];
+            let target = inner.split('|').next().unwrap_or(inner).trim();
+            if !target.is_empty() {
+                out.push(target.to_owned());
             }
+            i = close + 2;
+            continue;
         }
         i += 1;
     }

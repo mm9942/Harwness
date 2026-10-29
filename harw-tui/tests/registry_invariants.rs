@@ -94,14 +94,14 @@ fn alias_uniqueness_across_all_ops() -> TestResult {
             let alias_s = alias.to_string();
 
             // Check: alias must not equal a *different* op's primary name.
-            if let Some(&other_name) = name_to_op.get(&alias_s) {
-                if other_name != meta.name {
-                    return Err(TestError::Unexpected(format!(
-                        "alias '{alias}' of op '{}' clashes with the primary command \
+            if let Some(&other_name) = name_to_op.get(&alias_s)
+                && other_name != meta.name
+            {
+                return Err(TestError::Unexpected(format!(
+                    "alias '{alias}' of op '{}' clashes with the primary command \
                          name of op '{other_name}'",
-                        meta.name,
-                    )));
-                }
+                    meta.name,
+                )));
             }
 
             // Check: alias must not already be claimed by a different op.

@@ -74,10 +74,10 @@ fn describe(scope: &Scope, db: &UserDb, input: &str, follow: bool, long: bool) -
         "group": db.group_or_id(meta.gid),
         "mtime": meta.mtime.iso(),
     });
-    if meta.kind == Kind::Symlink {
-        if let Ok(target) = scope.read_link(&target_rel) {
-            value["link_target"] = json!(target.to_string_lossy());
-        }
+    if meta.kind == Kind::Symlink
+        && let Ok(target) = scope.read_link(&target_rel)
+    {
+        value["link_target"] = json!(target.to_string_lossy());
     }
     if follow && target_rel != rel {
         value["resolved_path"] = json!(target_rel.display());

@@ -459,10 +459,10 @@ fn create_attempt_dir(plan_dir: &Path, ctx: &AttemptContext) -> Result<PathBuf, 
 
 /// Removes an attempt directory and everything in it. Best effort.
 fn remove_attempt_dir(dir: &Path) {
-    if let Err(error) = std::fs::remove_dir_all(dir) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(path = %dir.display(), %error, "cannot remove attempt directory");
-        }
+    if let Err(error) = std::fs::remove_dir_all(dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %dir.display(), %error, "cannot remove attempt directory");
     }
 }
 
@@ -1110,10 +1110,10 @@ impl AfterExit {
         } else {
             None
         };
-        if let Err(error) = std::fs::remove_file(path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(path = %path.display(), %error, "cannot remove trampoline report");
-            }
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(path = %path.display(), %error, "cannot remove trampoline report");
         }
         // Both layers restrict the same process: per dimension the stronger
         // one counts, resource limits come from the trampoline only.
@@ -1177,10 +1177,10 @@ async fn forward(
     }
     match handle.join().await {
         Ok(process) => {
-            if let SupervisedTarget::Group(mut group) = process.into_target() {
-                if let Some(cgroup) = group.take_cgroup() {
-                    remove_cgroup(cgroup, Some(&after.leftovers)).await;
-                }
+            if let SupervisedTarget::Group(mut group) = process.into_target()
+                && let Some(cgroup) = group.take_cgroup()
+            {
+                remove_cgroup(cgroup, Some(&after.leftovers)).await;
             }
         }
         Err(error) => tracing::warn!(%error, "supervisor task failed"),
@@ -1221,19 +1221,19 @@ impl LinuxExecutor {
             } => Some((trampoline, plan_dir)),
             _ => None,
         };
-        if let Some((trampoline, plan_dir)) = trampoline_paths {
-            if !trampoline.is_absolute() || !plan_dir.is_absolute() {
-                return Err(RuntimeError::InvalidConfig {
-                    detail: "trampoline and plan_dir must be absolute paths".to_owned(),
-                });
-            }
+        if let Some((trampoline, plan_dir)) = trampoline_paths
+            && (!trampoline.is_absolute() || !plan_dir.is_absolute())
+        {
+            return Err(RuntimeError::InvalidConfig {
+                detail: "trampoline and plan_dir must be absolute paths".to_owned(),
+            });
         }
-        if let Some(dir) = &options.exit_status_dir {
-            if !dir.is_absolute() {
-                return Err(RuntimeError::InvalidConfig {
-                    detail: "exit_status_dir must be an absolute path".to_owned(),
-                });
-            }
+        if let Some(dir) = &options.exit_status_dir
+            && !dir.is_absolute()
+        {
+            return Err(RuntimeError::InvalidConfig {
+                detail: "exit_status_dir must be an absolute path".to_owned(),
+            });
         }
         let cgroup = match &options.cgroup_root {
             Some(root) => Some(Arc::new(CgroupV2Fs::open(root).map_err(cgroup_error)?)),
@@ -2081,10 +2081,10 @@ impl Executor for LinuxExecutor {
                 .unwrap_or(EnforcementState::NotEnforced)
         };
         let release = |cgroup: Option<(Arc<CgroupV2Fs>, CgroupHandle)>| {
-            if let Some((backend, handle)) = cgroup {
-                if let Err(error) = backend.remove(handle) {
-                    tracing::warn!(%error, "cannot remove unused job cgroup");
-                }
+            if let Some((backend, handle)) = cgroup
+                && let Err(error) = backend.remove(handle)
+            {
+                tracing::warn!(%error, "cannot remove unused job cgroup");
             }
         };
         // 2. + 3. sandbox plan and requirement check before anything runs
@@ -2095,12 +2095,12 @@ impl Executor for LinuxExecutor {
                 return Err(error);
             }
         };
-        if let Some(report) = &prepared.report {
-            if let Err(error) = check_requirement(spec.sandbox, report) {
-                prepared.discard_files();
-                release(cgroup);
-                return Err(error);
-            }
+        if let Some(report) = &prepared.report
+            && let Err(error) = check_requirement(spec.sandbox, report)
+        {
+            prepared.discard_files();
+            release(cgroup);
+            return Err(error);
         }
         let status_path = self.status_path(ctx);
         let mut launch = prepared.launch;
@@ -2109,10 +2109,10 @@ impl Executor for LinuxExecutor {
         // legitimately `exec`; start time and cgroup identify it then.
         let keep_executable = status_path.is_some();
         if let Some(status) = &status_path {
-            if let Err(error) = std::fs::remove_file(status) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %status.display(), %error, "cannot remove stale status file");
-                }
+            if let Err(error) = std::fs::remove_file(status)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %status.display(), %error, "cannot remove stale status file");
             }
             launch = launch.wrap_in_shim(status);
         }
@@ -2380,12 +2380,11 @@ impl Executor for LinuxExecutor {
     }
 
     fn finished(&self, ctx: &AttemptContext) {
-        if let Some(path) = self.status_path(ctx) {
-            if let Err(error) = std::fs::remove_file(&path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::debug!(path = %path.display(), %error, "cannot remove status file");
-                }
-            }
+        if let Some(path) = self.status_path(ctx)
+            && let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(path = %path.display(), %error, "cannot remove status file");
         }
     }
 }

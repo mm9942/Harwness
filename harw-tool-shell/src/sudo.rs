@@ -892,12 +892,11 @@ fn escalation_program_at_depth(command: &str, depth: u8) -> Option<&'static str>
                 let mut rest = words.by_ref().skip_while(|arg| {
                     !(arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))
                 });
-                if rest.next().is_some() {
-                    if let Some(script) = rest.next() {
-                        if let Some(found) = escalation_program_at_depth(script, depth + 1) {
-                            return Some(found);
-                        }
-                    }
+                if rest.next().is_some()
+                    && let Some(script) = rest.next()
+                    && let Some(found) = escalation_program_at_depth(script, depth + 1)
+                {
+                    return Some(found);
                 }
             }
             break;

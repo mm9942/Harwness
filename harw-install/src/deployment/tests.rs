@@ -137,23 +137,23 @@ fn workspace_binaries(root: &Path) -> TestResult<BTreeSet<String>> {
                     .collect()
             })
             .unwrap_or_default();
-        if explicit.is_empty() && dir.join("src/main.rs").is_file() {
-            if let Some(name) = doc
+        if explicit.is_empty()
+            && dir.join("src/main.rs").is_file()
+            && let Some(name) = doc
                 .get("package")
                 .and_then(|p| p.get("name"))
                 .and_then(toml_edit::Item::as_str)
-            {
-                binaries.insert(name.to_owned());
-            }
+        {
+            binaries.insert(name.to_owned());
         }
         binaries.extend(explicit);
         if let Ok(entries) = fs::read_dir(dir.join("src/bin")) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().is_some_and(|e| e == "rs") {
-                    if let Some(stem) = path.file_stem() {
-                        binaries.insert(stem.to_string_lossy().into_owned());
-                    }
+                if path.extension().is_some_and(|e| e == "rs")
+                    && let Some(stem) = path.file_stem()
+                {
+                    binaries.insert(stem.to_string_lossy().into_owned());
                 }
             }
         }

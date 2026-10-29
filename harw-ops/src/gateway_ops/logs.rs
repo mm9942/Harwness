@@ -403,10 +403,10 @@ pub(crate) fn digest_lines<'a>(
                 _ => continue,
             }
         }
-        if let Some(text) = &filter.contains {
-            if !normalized.to_lowercase().contains(text.as_str()) {
-                continue;
-            }
+        if let Some(text) = &filter.contains
+            && !normalized.to_lowercase().contains(text.as_str())
+        {
+            continue;
         }
         matched += 1;
         match index.get(&normalized) {
@@ -475,10 +475,10 @@ fn looks_like_timestamp(token: &str) -> bool {
 pub(crate) fn normalize(raw: &str) -> String {
     let line = strip_ansi(raw);
     let trimmed = line.trim();
-    if trimmed.starts_with('{') {
-        if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(trimmed) {
-            return normalize_json(&object);
-        }
+    if trimmed.starts_with('{')
+        && let Ok(Value::Object(object)) = serde_json::from_str::<Value>(trimmed)
+    {
+        return normalize_json(&object);
     }
     let mut tokens = trimmed.split_whitespace().peekable();
     if tokens

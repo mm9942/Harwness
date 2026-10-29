@@ -4723,11 +4723,10 @@ async fn drive_turn(
                 crate::auto_compact::CompactDecision::Emergency,
             )
             .await
+                && !outcome.no_op
             {
-                if !outcome.no_op {
-                    last_compaction_tokens_after = Some(outcome.tokens_after);
-                    continue;
-                }
+                last_compaction_tokens_after = Some(outcome.tokens_after);
+                continue;
             }
         }
         // (b) `MaxTokens` mitten in Tool-Calls: die Argumente sind
@@ -4967,18 +4966,18 @@ async fn drive_turn(
 
         // Werkzeug-Budget vor dem Dispatch: höchstens den Rest ausführen.
         over_tool_budget = control.split_over_tool_budget(&mut response.tool_calls);
-        if response.tool_calls.is_empty() {
-            if let Some((calls, message)) = over_tool_budget.take() {
-                return skip_calls_over_tool_budget(
-                    session,
-                    store,
-                    handle,
-                    total_usage,
-                    calls,
-                    &message,
-                )
-                .await;
-            }
+        if response.tool_calls.is_empty()
+            && let Some((calls, message)) = over_tool_budget.take()
+        {
+            return skip_calls_over_tool_budget(
+                session,
+                store,
+                handle,
+                total_usage,
+                calls,
+                &message,
+            )
+            .await;
         }
 
         // Prüfpunkt vor jeder Werkzeugausführung: Abbruch, Aufrufzahl, Wanduhr.
@@ -6541,12 +6540,11 @@ fn turn_completed_a_plan_step(session: &AgentSession) -> bool {
 fn json_contains_completed_status(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(map) => map.iter().any(|(key, nested)| {
-            if key == "status" {
-                if let serde_json::Value::String(status) = nested {
-                    if status == "completed" || status == "done" {
-                        return true;
-                    }
-                }
+            if key == "status"
+                && let serde_json::Value::String(status) = nested
+                && (status == "completed" || status == "done")
+            {
+                return true;
             }
             json_contains_completed_status(nested)
         }),

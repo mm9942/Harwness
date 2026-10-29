@@ -173,10 +173,10 @@ pub fn on_start(home_override: Option<PathBuf>) {
         return;
     };
     let checker = UpdateChecker::new(&home);
-    if let Ok(Some(info)) = checker.read() {
-        if let Some(notice) = update_notice(&info, CURRENT_VERSION) {
-            eprintln!("harw: {notice}");
-        }
+    if let Ok(Some(info)) = checker.read()
+        && let Some(notice) = update_notice(&info, CURRENT_VERSION)
+    {
+        eprintln!("harw: {notice}");
     }
     if !checker.is_stale(jiff::Timestamp::now(), DEFAULT_TTL_SECS) {
         return;

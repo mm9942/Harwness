@@ -76,7 +76,7 @@ impl FromStr for ArtifactDigest {
             return Err(InvalidArtifactDigest);
         }
         let mut out = [0u8; 32];
-        for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
             let high = hex_value(pair[0]).ok_or(InvalidArtifactDigest)?;
             let low = hex_value(pair[1]).ok_or(InvalidArtifactDigest)?;
             *slot = (high << 4) | low;

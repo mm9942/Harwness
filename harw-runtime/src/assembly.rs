@@ -3558,27 +3558,27 @@ impl RuntimeAssemblyBuilder {
         // Hintergrund-Thread reine Verschwendung wäre (siehe
         // `entry_wants_startup_sweep`); harmlos best-effort, kein Fehler
         // dieses Schritts bricht die Montage ab.
-        if let Some(capture) = memory_capture.as_ref() {
-            if entry_wants_startup_sweep(spec.entry) {
-                // Als `memory_maintenance`-Job im Ledger des Profils (Frist
-                // aus `[memory] sweep_deadline_secs`), nie inline im
-                // Build-Pfad.
-                let ledger = stores.job_store.clone().or_else(|| {
-                    profile_dir(&spec.home, &profile_name)
-                        .ok()
-                        .map(|dir| Arc::new(JobStore::new(&dir)))
-                });
-                crate::memory_wiring::enqueue_learning_extract(
-                    capture.memories_root(),
-                    ledger.as_deref(),
-                    &config.harness.memory,
-                );
-                let _ = crate::memory_wiring::spawn_startup_sweep_job(
-                    Arc::clone(capture),
-                    ledger,
-                    &config.harness.memory,
-                );
-            }
+        if let Some(capture) = memory_capture.as_ref()
+            && entry_wants_startup_sweep(spec.entry)
+        {
+            // Als `memory_maintenance`-Job im Ledger des Profils (Frist
+            // aus `[memory] sweep_deadline_secs`), nie inline im
+            // Build-Pfad.
+            let ledger = stores.job_store.clone().or_else(|| {
+                profile_dir(&spec.home, &profile_name)
+                    .ok()
+                    .map(|dir| Arc::new(JobStore::new(&dir)))
+            });
+            crate::memory_wiring::enqueue_learning_extract(
+                capture.memories_root(),
+                ledger.as_deref(),
+                &config.harness.memory,
+            );
+            let _ = crate::memory_wiring::spawn_startup_sweep_job(
+                Arc::clone(capture),
+                ledger,
+                &config.harness.memory,
+            );
         }
 
         let registry_builder = if let Some(embedded) = spec.embedded.as_ref() {
@@ -4797,10 +4797,8 @@ fn effective_root_model_id(config: &ResolvedConfig, uia_root: bool) -> Option<St
                         .get(provider_id)
                         .is_some_and(|provider| provider.enabled)
                 });
-        if uia_provider_usable {
-            if let Some(model) = config.harness.uia_model.as_deref() {
-                return Some(model.to_owned());
-            }
+        if uia_provider_usable && let Some(model) = config.harness.uia_model.as_deref() {
+            return Some(model.to_owned());
         }
     }
     config.harness.default_model.clone()
@@ -4912,10 +4910,10 @@ fn normalize_model_id(model_id: &str) -> String {
             id = stripped.to_owned();
         }
         // `@YYYYMMDD` (Vertex-Schreibweise) bzw. jede `@`-Version.
-        if let Some((head, _)) = id.rsplit_once('@') {
-            if !head.is_empty() {
-                id = head.to_owned();
-            }
+        if let Some((head, _)) = id.rsplit_once('@')
+            && !head.is_empty()
+        {
+            id = head.to_owned();
         }
         // `-YYYY-MM-DD`: nur ASCII-Bytes geprüft, `truncate` trifft deshalb
         // immer eine Zeichengrenze.
@@ -4940,10 +4938,8 @@ fn normalize_model_id(model_id: &str) -> String {
                 && (tail.len() == 8 || tail.len() == 4)
                 && tail.bytes().all(|byte| byte.is_ascii_digit())
         });
-        if strip_numeric {
-            if let Some((head, _)) = id.rsplit_once('-') {
-                id = head.to_owned();
-            }
+        if strip_numeric && let Some((head, _)) = id.rsplit_once('-') {
+            id = head.to_owned();
         }
         if id.len() == before {
             return id;

@@ -75,10 +75,10 @@ impl PickerApp {
                         }
                     }
                     KeyCode::Char(' ') => {
-                        if let Some(model) = provider.models.get(self.model_index) {
-                            if !provider.selected.remove(model) {
-                                provider.selected.insert(model.clone());
-                            }
+                        if let Some(model) = provider.models.get(self.model_index)
+                            && !provider.selected.remove(model)
+                        {
+                            provider.selected.insert(model.clone());
                         }
                     }
                     KeyCode::Left => self.stage = Stage::Providers,

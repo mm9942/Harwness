@@ -86,7 +86,7 @@ const H0: [u32; 8] = [
 
 fn compress(state: &mut [u32; 8], block: &[u8]) {
     let mut w = [0u32; 64];
-    for (i, chunk) in block.chunks_exact(4).enumerate() {
+    for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
         w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
     }
     for i in 16..64 {
@@ -127,18 +127,17 @@ fn compress(state: &mut [u32; 8], block: &[u8]) {
 #[must_use]
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut state = H0;
-    let mut chunks = data.chunks_exact(64);
-    for block in &mut chunks {
+    let (blocks, rest) = data.as_chunks::<64>();
+    for block in blocks {
         compress(&mut state, block);
     }
-    let rest = chunks.remainder();
     let mut tail = rest.to_vec();
     tail.push(0x80);
     while tail.len() % 64 != 56 {
         tail.push(0);
     }
     tail.extend_from_slice(&((data.len() as u64).wrapping_mul(8)).to_be_bytes());
-    for block in tail.chunks_exact(64) {
+    for block in tail.as_chunks::<64>().0 {
         compress(&mut state, block);
     }
     state.iter().map(|word| format!("{word:08x}")).collect()

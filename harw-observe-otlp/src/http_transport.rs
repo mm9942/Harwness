@@ -381,10 +381,10 @@ mod tests {
                     break;
                 }
                 received.extend_from_slice(&buf[..read]);
-                if header_end.is_none() {
-                    if let Some(pos) = find_subslice(&received, b"\r\n\r\n") {
-                        header_end = Some(pos + 4);
-                    }
+                if header_end.is_none()
+                    && let Some(pos) = find_subslice(&received, b"\r\n\r\n")
+                {
+                    header_end = Some(pos + 4);
                 }
                 if let Some(header_end) = header_end {
                     let content_length = content_length_of(&received[..header_end]);

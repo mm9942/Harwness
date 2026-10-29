@@ -1061,11 +1061,11 @@ impl StateStore for TranscriptStateStore {
                             serde_json::from_value(record.payload)
                                 .map_err(harw_session_store::SessionStoreError::from)?,
                         );
-                    } else if record.kind == RecordKind::Lifecycle {
-                        if let Some(item_count) = history_replaced_item_count(&record.payload) {
-                            let keep_from = items.len().saturating_sub(item_count);
-                            items.drain(..keep_from);
-                        }
+                    } else if record.kind == RecordKind::Lifecycle
+                        && let Some(item_count) = history_replaced_item_count(&record.payload)
+                    {
+                        let keep_from = items.len().saturating_sub(item_count);
+                        items.drain(..keep_from);
                     }
                 }
                 Ok(ConversationHistory::from_items(items))

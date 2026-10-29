@@ -905,10 +905,11 @@ mod tests {
                     method: m,
                     approval: a,
                 } = surface
+                    && *p == *path
+                    && *m == *method
+                    && *a == *approval
                 {
-                    if *p == *path && *m == *method && *a == *approval {
-                        found = true;
-                    }
+                    found = true;
                 }
             }
             assert!(

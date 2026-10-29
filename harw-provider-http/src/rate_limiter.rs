@@ -597,10 +597,10 @@ impl ProviderRateLimiter {
 
         let mut candidates: Vec<(&'static str, Duration)> = Vec::new();
 
-        if let Some(reset) = state.retry_after_until {
-            if reset > now {
-                candidates.push(("retry_after", (reset - now).min(MAX_WAIT)));
-            }
+        if let Some(reset) = state.retry_after_until
+            && reset > now
+        {
+            candidates.push(("retry_after", (reset - now).min(MAX_WAIT)));
         }
 
         for (label, dim) in [
@@ -611,13 +611,11 @@ impl ProviderRateLimiter {
         ] {
             if let (Some(limit), Some(remaining), Some(reset_at)) =
                 (dim.limit, dim.remaining, dim.reset_at)
+                && reset_at > now
+                && remaining.saturating_mul(100)
+                    <= limit.saturating_mul(u64::from(self.safety_margin_pct))
             {
-                if reset_at > now
-                    && remaining.saturating_mul(100)
-                        <= limit.saturating_mul(u64::from(self.safety_margin_pct))
-                {
-                    candidates.push((label, (reset_at - now).min(MAX_WAIT)));
-                }
+                candidates.push((label, (reset_at - now).min(MAX_WAIT)));
             }
         }
 
@@ -649,14 +647,15 @@ fn check_fits_limit(state: &State, estimate: u64) -> Result<(), RateBudgetError>
         ("input_tokens", &state.input_tokens),
         ("tokens", &state.tokens),
     ] {
-        if let Some(limit) = dim.limit {
-            if limit > 0 && estimate > limit {
-                return Err(RateBudgetError::RequestExceedsLimit {
-                    dimension,
-                    estimated_tokens: estimate,
-                    limit,
-                });
-            }
+        if let Some(limit) = dim.limit
+            && limit > 0
+            && estimate > limit
+        {
+            return Err(RateBudgetError::RequestExceedsLimit {
+                dimension,
+                estimated_tokens: estimate,
+                limit,
+            });
         }
     }
     Ok(())
@@ -672,11 +671,11 @@ fn refill_expired(state: &mut State, now: Instant) {
         &mut state.output_tokens,
         &mut state.tokens,
     ] {
-        if let (Some(limit), Some(reset_at)) = (dim.limit, dim.reset_at) {
-            if reset_at <= now {
-                dim.remaining = Some(limit);
-                dim.reset_at = Some(now + dim.window.unwrap_or(DEFAULT_WINDOW));
-            }
+        if let (Some(limit), Some(reset_at)) = (dim.limit, dim.reset_at)
+            && reset_at <= now
+        {
+            dim.remaining = Some(limit);
+            dim.reset_at = Some(now + dim.window.unwrap_or(DEFAULT_WINDOW));
         }
     }
     if state.retry_after_until.is_some_and(|until| until <= now) {
@@ -743,10 +742,10 @@ fn evaluate_admission(
             ("output_tokens", &state.output_tokens, 0),
             ("tokens", &state.tokens, estimate),
         ] {
-            if let Some(wait) = dimension_wait(dim, needed, safety_margin_pct, now) {
-                if longest.is_none_or(|(_, current)| wait > current) {
-                    longest = Some((label, wait));
-                }
+            if let Some(wait) = dimension_wait(dim, needed, safety_margin_pct, now)
+                && longest.is_none_or(|(_, current)| wait > current)
+            {
+                longest = Some((label, wait));
             }
         }
         if let Some((dimension, wait)) = longest {

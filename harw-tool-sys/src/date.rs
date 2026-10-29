@@ -167,13 +167,13 @@ pub fn run(now: (i64, u32), args: &DateArgs) -> ToolOutput {
             ),
         );
     }
-    if let Some(format) = &args.format {
-        if format.chars().count() > MAX_FORMAT_CHARS || format.contains('\0') {
-            return fail(
-                TOOL,
-                format!("format must be at most {MAX_FORMAT_CHARS} characters without NUL"),
-            );
-        }
+    if let Some(format) = &args.format
+        && (format.chars().count() > MAX_FORMAT_CHARS || format.contains('\0'))
+    {
+        return fail(
+            TOOL,
+            format!("format must be at most {MAX_FORMAT_CHARS} characters without NUL"),
+        );
     }
     let (epoch, nanos) = match args.epoch_secs {
         Some(secs) => {

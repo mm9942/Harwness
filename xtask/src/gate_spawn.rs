@@ -195,10 +195,10 @@ pub fn evaluate(found: &BTreeSet<String>, scanned: usize, policy: &Policy) -> Ga
     for file in found {
         let crate_dir = crate_of(file);
         let by_crate = crate_dir.is_some_and(|dir| policy.crates.contains_key(dir));
-        if let Some(dir) = crate_dir {
-            if by_crate {
-                crates_seen.insert(dir.to_owned());
-            }
+        if let Some(dir) = crate_dir
+            && by_crate
+        {
+            crates_seen.insert(dir.to_owned());
         }
         if !by_crate && !policy.files.contains_key(file) {
             violations.push(format!(

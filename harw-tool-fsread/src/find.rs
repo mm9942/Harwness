@@ -138,10 +138,10 @@ pub fn run(root: &Path, args: &FindArgs) -> ToolOutput {
             .as_deref()
             .map(|p| glob(p, false, false))
             .transpose()?;
-        if let (Some(min), Some(max)) = (args.min_size, args.max_size) {
-            if min > max {
-                return Err(format!("min_size {min} is larger than max_size {max}"));
-            }
+        if let (Some(min), Some(max)) = (args.min_size, args.max_size)
+            && min > max
+        {
+            return Err(format!("min_size {min} is larger than max_size {max}"));
         }
         let max_depth = limit_or(
             args.max_depth.map(|d| d.max(1)),

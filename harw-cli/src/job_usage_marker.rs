@@ -378,13 +378,13 @@ impl UsageMarkerStore {
                 reservation.schema_version
             ));
         }
-        if let Some(existing) = self.read_in_flight(&reservation.work_id)? {
-            if existing.epoch > reservation.epoch {
-                return Err(format!(
-                    "{IN_FLIGHT_LABEL} for '{}' is held by the newer epoch {} (writer epoch {})",
-                    reservation.work_id, existing.epoch, reservation.epoch
-                ));
-            }
+        if let Some(existing) = self.read_in_flight(&reservation.work_id)?
+            && existing.epoch > reservation.epoch
+        {
+            return Err(format!(
+                "{IN_FLIGHT_LABEL} for '{}' is held by the newer epoch {} (writer epoch {})",
+                reservation.work_id, existing.epoch, reservation.epoch
+            ));
         }
         let bytes = serde_json::to_vec(reservation)
             .map_err(|error| format!("{IN_FLIGHT_LABEL}: encoding failed: {error}"))?;
@@ -397,10 +397,8 @@ impl UsageMarkerStore {
                 self.in_flight_dir.display()
             )
         })?;
-        if !existed {
-            if let Some(parent) = self.in_flight_dir.parent() {
-                sync_dir(parent)?;
-            }
+        if !existed && let Some(parent) = self.in_flight_dir.parent() {
+            sync_dir(parent)?;
         }
         write_atomic(&self.in_flight_dir, &path, &reservation.work_id, &bytes)
     }

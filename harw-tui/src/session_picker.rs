@@ -167,10 +167,10 @@ fn entry_matches(entry: &SessionEntry, needle_lower: &str) -> bool {
     if entry.title.to_ascii_lowercase().contains(needle_lower) {
         return true;
     }
-    if let Some(label) = &entry.project_label {
-        if label.to_ascii_lowercase().contains(needle_lower) {
-            return true;
-        }
+    if let Some(label) = &entry.project_label
+        && label.to_ascii_lowercase().contains(needle_lower)
+    {
+        return true;
     }
     entry.id.to_ascii_lowercase().starts_with(needle_lower)
 }

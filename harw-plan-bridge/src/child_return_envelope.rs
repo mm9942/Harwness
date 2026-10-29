@@ -162,13 +162,12 @@ pub fn sanitize(
     {
         return Err(EnvelopeRefusal::SummaryControlChars);
     }
-    if let Some(code) = &raw.failure_code {
-        if code.is_empty()
+    if let Some(code) = &raw.failure_code
+        && (code.is_empty()
             || code.chars().count() > MAX_FAILURE_CODE_CHARS
-            || !code.chars().all(is_prompt_safe_char)
-        {
-            return Err(EnvelopeRefusal::BadFailureCode);
-        }
+            || !code.chars().all(is_prompt_safe_char))
+    {
+        return Err(EnvelopeRefusal::BadFailureCode);
     }
 
     let ChildReturnEnvelope {

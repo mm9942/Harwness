@@ -560,13 +560,12 @@ impl HostInner {
             if self.is_revoked(identity) {
                 continue;
             }
-            if let Some(agent) = &identity.agent {
-                if self
+            if let Some(agent) = &identity.agent
+                && self
                     .check_agent_registration(agent, identity.tenant.as_ref())
                     .is_err()
-                {
-                    continue;
-                }
+            {
+                continue;
             }
             if let Ok(request) =
                 record.revalidate_creator_execution(identity, harw_types::PermissionTier::Owner)
@@ -672,10 +671,10 @@ impl HostInner {
             move |_| SessionFrame::HostDraining { retry_after_ms },
         );
         for slot in self.all_slots() {
-            if let Ok(state) = slot.lock() {
-                if let Some(cancel) = &state.cancel {
-                    let _ = cancel.send(true);
-                }
+            if let Ok(state) = slot.lock()
+                && let Some(cancel) = &state.cancel
+            {
+                let _ = cancel.send(true);
             }
         }
     }
@@ -721,10 +720,9 @@ impl HostInner {
             // attachment or on who submitted the current turn.
             if state.record.creator_execution.is_some()
                 && self.execution_admission(&state.record).is_err()
+                && let Some(cancel) = &state.cancel
             {
-                if let Some(cancel) = &state.cancel {
-                    let _ = cancel.send(true);
-                }
+                let _ = cancel.send(true);
             }
         }
     }
@@ -1214,10 +1212,10 @@ impl HostConnection {
             .map_or(ceiling, |requested| requested.intersect(ceiling))
             .for_wire_minor(wire_minor);
         *granted = Some(caps);
-        if let Ok(mut connections) = self.host.connections.lock() {
-            if let Some(entry) = connections.get_mut(&self.identity.connection) {
-                entry.granted = Some(caps);
-            }
+        if let Ok(mut connections) = self.host.connections.lock()
+            && let Some(entry) = connections.get_mut(&self.identity.connection)
+        {
+            entry.granted = Some(caps);
         }
         let features = params
             .features

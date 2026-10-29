@@ -445,13 +445,13 @@ impl ResourceRequest {
                 constraint: "must be greater than zero",
             });
         }
-        if let (Some(high), Some(max)) = (self.memory_high, self.memory_max) {
-            if high > max {
-                return Err(SpecError::InvalidResource {
-                    resource: "memory_high",
-                    constraint: "must not exceed memory_max",
-                });
-            }
+        if let (Some(high), Some(max)) = (self.memory_high, self.memory_max)
+            && high > max
+        {
+            return Err(SpecError::InvalidResource {
+                resource: "memory_high",
+                constraint: "must not exceed memory_max",
+            });
         }
         if let Some(cpu) = self.cpu_max {
             if !(CpuBandwidth::MIN_PERIOD_US..=CpuBandwidth::MAX_PERIOD_US).contains(&cpu.period_us)

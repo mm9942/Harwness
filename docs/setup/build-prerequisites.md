@@ -20,10 +20,11 @@ therefore have no file of their own — and installs the version on the first `c
 `rustup toolchain install`; locally and in CI the same compiler, the same
 `rustfmt` and the same `clippy` are used.
 
-Separately, the workspace root `Cargo.toml` sets `rust-version = "1.85"` as
+Separately, the workspace root `Cargo.toml` sets `rust-version = "1.89"` as
 the MSRV floor — the *lowest* version this workspace must compile against
 per the manifest, not a statement about the toolchain that is actually
-tested.
+tested. It is 1.89 because `uuid` 1.27 and `aes` 0.9 declare 1.89 (and `time`
+0.3.55 declares 1.88).
 
 ```
 $ rustup show active-toolchain

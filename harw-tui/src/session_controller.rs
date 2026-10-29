@@ -399,11 +399,11 @@ impl TuiSessionController {
                 }
             }
         }
-        if let Some(mode) = inner.interaction_mode {
-            if session.mode() != mode {
-                session.set_mode(mode);
-                changed_besides_route = true;
-            }
+        if let Some(mode) = inner.interaction_mode
+            && session.mode() != mode
+        {
+            session.set_mode(mode);
+            changed_besides_route = true;
         }
         inner.applied_generation = inner.generation;
         inner.effort_dirty = false;

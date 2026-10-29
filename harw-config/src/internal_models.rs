@@ -400,15 +400,15 @@ pub fn resolve_internal_model(
         };
     }
 
-    if point == InternalModelPoint::SessionTitle {
-        if let Some(model) = config.harness.session.title_model.clone() {
-            return ResolvedInternalModel {
-                point,
-                provider: config.harness.default_provider.clone(),
-                model: Some(model),
-                source: InternalModelSource::Explicit,
-            };
-        }
+    if point == InternalModelPoint::SessionTitle
+        && let Some(model) = config.harness.session.title_model.clone()
+    {
+        return ResolvedInternalModel {
+            point,
+            provider: config.harness.default_provider.clone(),
+            model: Some(model),
+            source: InternalModelSource::Explicit,
+        };
     }
 
     if point.uses_openrouter_default()

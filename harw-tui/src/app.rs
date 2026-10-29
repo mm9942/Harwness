@@ -4796,22 +4796,22 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
             continue;
         };
         let mut marked = false;
-        if let Ok(mut guard) = cell.lock() {
-            if guard.state == ToolState::Running {
-                guard.mark_incomplete();
-                marked = true;
-                if let Some(index) = tool_export_indices.get(call_id)
-                    && let Some(ExportEntry::ToolCall { tool_name, .. }) =
-                        app.export_entries.get(*index)
-                {
-                    app.export_entries.push(export_tool_result_entry(
-                        call_id,
-                        Some(tool_name.clone()),
-                        &ToolCallResult::error("unvollständig (Resume-Abbruch)"),
-                        0,
-                        Some(ResultTrust::Runtime),
-                    ));
-                }
+        if let Ok(mut guard) = cell.lock()
+            && guard.state == ToolState::Running
+        {
+            guard.mark_incomplete();
+            marked = true;
+            if let Some(index) = tool_export_indices.get(call_id)
+                && let Some(ExportEntry::ToolCall { tool_name, .. }) =
+                    app.export_entries.get(*index)
+            {
+                app.export_entries.push(export_tool_result_entry(
+                    call_id,
+                    Some(tool_name.clone()),
+                    &ToolCallResult::error("unvollständig (Resume-Abbruch)"),
+                    0,
+                    Some(ResultTrust::Runtime),
+                ));
             }
         }
         if marked {
@@ -5198,11 +5198,10 @@ pub(crate) async fn run_loop(
                     let Some(tev) = maybe_tev else { return Ok(TuiRunOutcome::Quit) };
 
                     // Abgelaufenen Beenden-Hinweis verwerfen.
-                    if let Some(arm) = app.pending_quit {
-                        if arm.at.elapsed() > QUIT_HINT_WINDOW {
+                    if let Some(arm) = app.pending_quit
+                        && arm.at.elapsed() > QUIT_HINT_WINDOW {
                             app.pending_quit = None;
                         }
-                    }
                     // Runde 5, Teil K: ein im Leerlauf offenes sudo- oder
                     // Host-Permit-Fenster (Hintergrund-Agent) bekommt die Eingabe.
                     // Mausrad nach Position und `scroll_panel_up/down` —
@@ -5720,14 +5719,13 @@ pub(crate) async fn run_loop(
         }
         // Auto-Correction-Detection (harw-memory M3): reine Textregel,
         // kein LLM-Call. Bei Match: Signal explizit an das Backend geben.
-        if let Some(mem) = app.memory() {
-            if let Some(sig) =
+        if let Some(mem) = app.memory()
+            && let Some(sig) =
                 harw_memory::detect_correction(&text, Some(format!("session:{}", app.session_id())))
-            {
-                // Fehler bewusst still verschlucken — Memory-Record ist
-                // best-effort und darf den User-Turn niemals unterbrechen.
-                let _ = mem.record(sig);
-            }
+        {
+            // Fehler bewusst still verschlucken — Memory-Record ist
+            // best-effort und darf den User-Turn niemals unterbrechen.
+            let _ = mem.record(sig);
         }
         // Turn treiben (Spinner animiert), Antwort simuliert streamen.
         //
@@ -6099,10 +6097,9 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                         .verdict_for(call_id.as_str())
                         .as_ref()
                         .and_then(auto_note_for)
+                        && let Ok(mut guard) = cell.lock()
                     {
-                        if let Ok(mut guard) = cell.lock() {
-                            guard.set_approval_note(&note);
-                        }
+                        guard.set_approval_note(&note);
                     }
                     auto.log().take_notice()
                 });
@@ -7255,10 +7252,9 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
             app.panels.focus,
             crate::panes::PaneFocus::Agents | crate::panes::PaneFocus::Jobs
         )
+        && let Some(redraw) = handle_agent_detail_key(app, key)
     {
-        if let Some(redraw) = handle_agent_detail_key(app, key) {
-            return Some(redraw);
-        }
+        return Some(redraw);
     }
     // PL-97 C2: `Alt+L` öffnet/schließt die Details des LIVE-Agenten.
     if app.key_bindings.action_for(&key) == Some(KeyAction::ToggleLiveDetail) {
@@ -8035,35 +8031,35 @@ async fn run_turn_streaming(
     // Kinder erben `cancel.child()`; ein harter Ctrl+C-Abbruch bricht sie
     // dadurch mit ab. Ein Fehler (z. B. weil diese Session selbst ein
     // admittiertes Kind ist) ist nicht fatal für den Turn — nur geloggt.
-    if let Some(spawner) = app.managed_spawner() {
-        if let Err(error) = spawner.register_parent_cancel_token(app.session_id(), cancel.clone()) {
-            tracing::warn!(error = %error, "tui.turn.register_parent_cancel_token_failed");
-        }
+    if let Some(spawner) = app.managed_spawner()
+        && let Err(error) = spawner.register_parent_cancel_token(app.session_id(), cancel.clone())
+    {
+        tracing::warn!(error = %error, "tui.turn.register_parent_cancel_token_failed");
     }
     // Runde 5, Teil E: die Nutzernachricht ist das „Ziel der Sitzung“ für
     // den Auto-Modus-Klassifizierer (Geheimnisse entfernt er selbst).
-    if let Some(rt) = app.runtime() {
-        if let Some(auto) = rt.auto_mode() {
-            // Runde 6, Teil A: `set_goal` ist ein Ringpuffer der letzten drei
-            // Nachrichten; die Sitzungs-Id bestimmt, wessen Host-Lease zählt.
-            auto.context().set_goal(text);
-            auto.set_lease_session(app.session_id().to_string());
-            // Runde 5 (Integration E/F): der angeheftete, freigegebene Plan ist
-            // Kontext für den Klassifizierer (gekürzt, ohne Geheimnis-Pfad —
-            // Redaction übernimmt der Klassifizierer selbst).
-            let plan = rt.plan_session().pinned().get().map(|doc| {
-                let mut content = doc.content;
-                if content.len() > 4096 {
-                    let mut cut = 4096;
-                    while !content.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    content.truncate(cut);
+    if let Some(rt) = app.runtime()
+        && let Some(auto) = rt.auto_mode()
+    {
+        // Runde 6, Teil A: `set_goal` ist ein Ringpuffer der letzten drei
+        // Nachrichten; die Sitzungs-Id bestimmt, wessen Host-Lease zählt.
+        auto.context().set_goal(text);
+        auto.set_lease_session(app.session_id().to_string());
+        // Runde 5 (Integration E/F): der angeheftete, freigegebene Plan ist
+        // Kontext für den Klassifizierer (gekürzt, ohne Geheimnis-Pfad —
+        // Redaction übernimmt der Klassifizierer selbst).
+        let plan = rt.plan_session().pinned().get().map(|doc| {
+            let mut content = doc.content;
+            if content.len() > 4096 {
+                let mut cut = 4096;
+                while !content.is_char_boundary(cut) {
+                    cut -= 1;
                 }
-                format!("{}\n{content}", doc.display_path)
-            });
-            auto.context().set_plan(plan);
-        }
+                content.truncate(cut);
+            }
+            format!("{}\n{content}", doc.display_path)
+        });
+        auto.context().set_plan(plan);
     }
     spinner.start();
     let reply = drive_turn_animated(
@@ -9210,10 +9206,12 @@ async fn apply_approval_decision(
             (false, prompt.reject(reason))
         }
     };
-    if approved && delivered && !learned {
-        if let Some(auto) = app.runtime().and_then(|rt| rt.auto_mode()) {
-            auto.record_manual_approval(&approved_call);
-        }
+    if approved
+        && delivered
+        && !learned
+        && let Some(auto) = app.runtime().and_then(|rt| rt.auto_mode())
+    {
+        auto.record_manual_approval(&approved_call);
     }
 
     let note = if approved && delivered {
@@ -10033,10 +10031,10 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
 fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
     // Abgelaufenen Beenden-Hinweis verwerfen — Pendant zur Ablaufprüfung im
     // Idle-Pfad von `run_loop`, hier für den Busy-Pfad (Welle 4c, Punkt 5).
-    if let Some(arm) = app.pending_quit {
-        if arm.at.elapsed() > QUIT_HINT_WINDOW {
-            app.pending_quit = None;
-        }
+    if let Some(arm) = app.pending_quit
+        && arm.at.elapsed() > QUIT_HINT_WINDOW
+    {
+        app.pending_quit = None;
     }
     // Runde 5, Teil L: Esc bricht zuerst eine wartende `/btw`-Nebenfrage ab —
     // der Turn läuft weiter; erst ein weiteres Esc unterbricht ihn.
@@ -11071,25 +11069,23 @@ fn render_viewport(
         .command_popup
         .as_ref()
         .is_some_and(|popup| !popup.is_empty());
-    if popup_open {
-        if let Some(popup) = app.command_popup.as_ref() {
-            let popup_height = popup
-                .preferred_height(POPUP_MAX_ROWS)
-                .min(history_area.height);
-            if popup_height > 0 {
-                let popup_area = Rect::new(
-                    history_area.x,
-                    history_area.y + history_area.height - popup_height,
-                    history_area.width,
-                    popup_height,
-                );
-                // Ohne `Clear` bleibt der Chat-Text unter dem Popup
-                // stehen: die Zellen, die das Popup nicht selbst
-                // überschreibt, behalten ihren alten Inhalt, und beide
-                // Texte lesen sich ineinander verschachtelt.
-                frame.render_widget(Clear, popup_area);
-                popup.render(popup_area, frame.buffer_mut(), theme);
-            }
+    if popup_open && let Some(popup) = app.command_popup.as_ref() {
+        let popup_height = popup
+            .preferred_height(POPUP_MAX_ROWS)
+            .min(history_area.height);
+        if popup_height > 0 {
+            let popup_area = Rect::new(
+                history_area.x,
+                history_area.y + history_area.height - popup_height,
+                history_area.width,
+                popup_height,
+            );
+            // Ohne `Clear` bleibt der Chat-Text unter dem Popup
+            // stehen: die Zellen, die das Popup nicht selbst
+            // überschreibt, behalten ihren alten Inhalt, und beide
+            // Texte lesen sich ineinander verschachtelt.
+            frame.render_widget(Clear, popup_area);
+            popup.render(popup_area, frame.buffer_mut(), theme);
         }
     }
 

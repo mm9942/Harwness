@@ -309,10 +309,10 @@ fn check_admitted_plan_revision(
         }
     }
     let frozen = input.frozen_scope.as_ref().map(|scope| scope.plan_revision);
-    if let (Some(admitted), Some(frozen)) = (input.plan_revision, frozen) {
-        if admitted != frozen {
-            return Err("work-driver: conflicting admitted plan revision pins; stop and re-enqueue after scope approval".to_owned());
-        }
+    if let (Some(admitted), Some(frozen)) = (input.plan_revision, frozen)
+        && admitted != frozen
+    {
+        return Err("work-driver: conflicting admitted plan revision pins; stop and re-enqueue after scope approval".to_owned());
     }
     let Some(expected) = input.plan_revision.or(frozen) else {
         return Ok(());
@@ -1068,13 +1068,13 @@ fn apply_operator_answer(
         .filter(|note| !note.trim().is_empty())
         .unwrap_or_else(|| "(freigegeben ohne Notiz)".to_owned());
     for worker in &mut state.workers {
-        if let Some(result) = worker.last_result.as_mut() {
-            if matches!(result.outcome, WorkerOutcome::Blocked { .. }) {
-                result.outcome = WorkerOutcome::Partial;
-                memory
-                    .operator_notes
-                    .insert(worker.worker_id.clone(), note.clone());
-            }
+        if let Some(result) = worker.last_result.as_mut()
+            && matches!(result.outcome, WorkerOutcome::Blocked { .. })
+        {
+            result.outcome = WorkerOutcome::Partial;
+            memory
+                .operator_notes
+                .insert(worker.worker_id.clone(), note.clone());
         }
     }
     state.verification = VerificationState::NotRun;
@@ -1839,22 +1839,22 @@ async fn run_verification(
         })
         .cloned()
         .collect();
-    if !fresh.is_empty() {
-        if let Err(reason) = ports.goals.attach_evidence(&input.goal_id, &fresh) {
-            // Fail closed wie jeder andere Verifikationsausgang dieser
-            // Funktion: ohne die angehängte Evidenz bliebe das Kriterium in
-            // `evaluate_goal` für immer offen und die Runde würde mit
-            // identischem Feedback endlos wiederholt, statt den Menschen auf
-            // den eigentlichen Fehler (Goal-Speicher) hinzuweisen.
-            tracing::warn!(goal = %input.goal_id, reason = %reason, "work-driver could not attach verification evidence");
-            state.last_rationale.push(format!(
-                "verification: bestandene Nachweise konnten nicht am Goal hinterlegt werden ({reason})"
-            ));
-            return Some(RoundEnd::Finish(needs_input(&format!(
-                "Die zentrale Verifikation ist bestanden, aber die Nachweise ließen sich nicht am \
+    if !fresh.is_empty()
+        && let Err(reason) = ports.goals.attach_evidence(&input.goal_id, &fresh)
+    {
+        // Fail closed wie jeder andere Verifikationsausgang dieser
+        // Funktion: ohne die angehängte Evidenz bliebe das Kriterium in
+        // `evaluate_goal` für immer offen und die Runde würde mit
+        // identischem Feedback endlos wiederholt, statt den Menschen auf
+        // den eigentlichen Fehler (Goal-Speicher) hinzuweisen.
+        tracing::warn!(goal = %input.goal_id, reason = %reason, "work-driver could not attach verification evidence");
+        state.last_rationale.push(format!(
+            "verification: bestandene Nachweise konnten nicht am Goal hinterlegt werden ({reason})"
+        ));
+        return Some(RoundEnd::Finish(needs_input(&format!(
+            "Die zentrale Verifikation ist bestanden, aber die Nachweise ließen sich nicht am \
                  Goal hinterlegen: {reason}. Nach Abhilfe freigeben, dann wird erneut verifiziert."
-            ))));
-        }
+        ))));
     }
     if matches!(
         report.verdict,
@@ -3887,12 +3887,12 @@ impl WorkspaceScopeGuard {
             job_store.root(),
         ] {
             let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            if let Ok(relative) = canonical.strip_prefix(&root) {
-                if let Some(relative) = relative.to_str() {
-                    let relative = relative.replace('\\', "/");
-                    if !relative.is_empty() {
-                        excluded.push(relative);
-                    }
+            if let Ok(relative) = canonical.strip_prefix(&root)
+                && let Some(relative) = relative.to_str()
+            {
+                let relative = relative.replace('\\', "/");
+                if !relative.is_empty() {
+                    excluded.push(relative);
                 }
             }
         }

@@ -211,7 +211,11 @@ version = "0.9.1"
 # ohne Versionsangabe erlaubt).
 publish = false
 edition = "2024"
-rust-version = "1.85"
+# MSRV = höchste `rust-version` im aufgelösten Baum: `uuid` 1.27 (über
+# harw-types in fast jedem Crate) und `aes` 0.9 verlangen 1.89, `time` 0.3.46+
+# (harw-dod-client) 1.88. 1.85 war nicht mehr baubar. Gebaut wird mit der in
+# `rust-toolchain.toml` gepinnten Toolchain.
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mm9942/harwness"
 

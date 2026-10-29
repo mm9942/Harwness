@@ -872,10 +872,10 @@ pub fn plaintext_secret_refs(config: &ResolvedConfig) -> Vec<String> {
     let mut found = Vec::new();
 
     for (key, provider) in &config.providers {
-        if let Some(auth) = &provider.auth {
-            if is_plaintext(auth) {
-                found.push(format!("providers.{key}.auth={}", auth.as_ref_string()));
-            }
+        if let Some(auth) = &provider.auth
+            && is_plaintext(auth)
+        {
+            found.push(format!("providers.{key}.auth={}", auth.as_ref_string()));
         }
         for (name, value) in &provider.headers {
             if !ProviderToml::is_sensitive_header_name(name) {
@@ -897,10 +897,10 @@ pub fn plaintext_secret_refs(config: &ResolvedConfig) -> Vec<String> {
     }
 
     for (key, mcp) in &config.mcps {
-        if let Some(auth) = &mcp.auth {
-            if is_plaintext(auth) {
-                found.push(format!("mcps.{key}.auth={}", auth.as_ref_string()));
-            }
+        if let Some(auth) = &mcp.auth
+            && is_plaintext(auth)
+        {
+            found.push(format!("mcps.{key}.auth={}", auth.as_ref_string()));
         }
     }
 
@@ -913,13 +913,13 @@ pub fn plaintext_secret_refs(config: &ResolvedConfig) -> Vec<String> {
                         t.bot_token_ref.as_ref_string()
                     ));
                 }
-                if let Some(webhook) = &t.transport_webhook {
-                    if is_plaintext(&webhook.secret_token_ref) {
-                        found.push(format!(
-                            "channels.{key}.transport_webhook.secret_token_ref={}",
-                            webhook.secret_token_ref.as_ref_string()
-                        ));
-                    }
+                if let Some(webhook) = &t.transport_webhook
+                    && is_plaintext(&webhook.secret_token_ref)
+                {
+                    found.push(format!(
+                        "channels.{key}.transport_webhook.secret_token_ref={}",
+                        webhook.secret_token_ref.as_ref_string()
+                    ));
                 }
             }
         }

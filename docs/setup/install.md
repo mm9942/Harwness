@@ -126,7 +126,7 @@ phone. The installer detects Termux (`uname -o` = `Android`) and then:
 - installs missing build tools with `pkg install` (no root, no sudo):
   `rust clang make cmake pkg-config git binutils`. `rust` comes from
   Termux because rustup has no Android host toolchain; the pinned
-  `rust-toolchain.toml` is therefore not applied, any Rust ≥ 1.85 builds.
+  `rust-toolchain.toml` is therefore not applied, any Rust ≥ 1.89 builds.
 - does **not** require `bwrap`, `prlimit` or the D-Bus development files.
   Android has no bubblewrap and no user namespaces, and the keyring does not
   use D-Bus there; secrets live in the encrypted SecretStore.

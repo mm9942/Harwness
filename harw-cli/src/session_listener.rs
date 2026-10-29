@@ -75,7 +75,7 @@ impl AuthHubSign for HubSign {
 
 /// Decodes lowercase/uppercase hex; `None` for odd length or a bad digit.
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let digit = |b: u8| match b {

@@ -1137,10 +1137,10 @@ fn handle_post_mcp(state: &McpHttpState, headers: &HeaderMap, body: Value) -> Ht
             None => empty_response(StatusCode::ACCEPTED),
         }
     };
-    if let Some(id) = issued_session {
-        if let Ok(value) = HeaderValue::from_str(&id) {
-            response.headers_mut().insert(SESSION_HEADER, value);
-        }
+    if let Some(id) = issued_session
+        && let Ok(value) = HeaderValue::from_str(&id)
+    {
+        response.headers_mut().insert(SESSION_HEADER, value);
     }
     response
 }

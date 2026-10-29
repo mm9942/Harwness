@@ -815,12 +815,13 @@ impl FilePlanStore {
             (None, None)
         };
         let wal = Self::read_wal(root, plan_id, 0, RevisionId::new(0))?;
-        if let Some(plan) = &snapshot {
-            if !wal.events.is_empty() && !wal.committed_revisions.contains(&plan.revision) {
-                return Err(Self::invalid_history(
-                    "Snapshot is not a committed WAL boundary",
-                ));
-            }
+        if let Some(plan) = &snapshot
+            && !wal.events.is_empty()
+            && !wal.committed_revisions.contains(&plan.revision)
+        {
+            return Err(Self::invalid_history(
+                "Snapshot is not a committed WAL boundary",
+            ));
         }
         let mut plan = snapshot
             .or(wal.bootstrap.clone())

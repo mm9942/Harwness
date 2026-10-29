@@ -354,10 +354,10 @@ impl ShellExecutor {
     ) -> Result<Option<harw_command::BackendKind>, String> {
         // Ein Schreibbereich ohne Schreibrecht auf den Workspace lehnt die
         // Job-Spezifikation ab; hier mit klarer Meldung, bevor etwas startet.
-        if self.write_scope.is_some() {
-            if let Some(reason) = crate::job_spec::scoped_permission_refusal(sandbox) {
-                return Err(crate::job_spec::scoped_refusal(tool, reason));
-            }
+        if self.write_scope.is_some()
+            && let Some(reason) = crate::job_spec::scoped_permission_refusal(sandbox)
+        {
+            return Err(crate::job_spec::scoped_refusal(tool, reason));
         }
         if self.execution == SandboxExecution::Legacy {
             if self.write_scope.is_some() {
@@ -373,10 +373,10 @@ impl ShellExecutor {
             ChainRoute::Chain(kind) => {
                 // Ein Schreibbereich braucht `bwrap-trampoline`; jedes andere
                 // Backend würde ihn erst nach der Übergabe ablehnen.
-                if self.write_scope.is_some() {
-                    if let Some(reason) = crate::job_spec::scoped_backend_refusal(kind) {
-                        return Err(crate::job_spec::scoped_refusal(tool, &reason));
-                    }
+                if self.write_scope.is_some()
+                    && let Some(reason) = crate::job_spec::scoped_backend_refusal(kind)
+                {
+                    return Err(crate::job_spec::scoped_refusal(tool, &reason));
                 }
                 Ok(Some(kind))
             }
@@ -582,14 +582,14 @@ impl ShellExecutor {
             environment: ProcessEnvironment::LocalHost,
         };
 
-        if let Some(id) = registry.lookup_permit(&request) {
-            if ledger.authorize(id, &request).is_ok() {
-                return Ok(());
-            }
-            // Gemerkter Permit ist abgelaufen oder wurde widerrufen; fällt
-            // unten zur Neubeantragung durch, falls die Sitzung weiterhin
-            // zugestimmt hat oder jetzt gefragt werden kann.
+        if let Some(id) = registry.lookup_permit(&request)
+            && ledger.authorize(id, &request).is_ok()
+        {
+            return Ok(());
         }
+        // Gemerkter Permit ist abgelaufen oder wurde widerrufen; fällt
+        // unten zur Neubeantragung durch, falls die Sitzung weiterhin
+        // zugestimmt hat oder jetzt gefragt werden kann.
 
         if registry.is_session_approved(session_id) {
             return Self::issue_and_remember(
@@ -1297,13 +1297,13 @@ impl ShellExecutor {
                 let tmpfs_size = self.resolve_sandbox_limits()?;
                 let prlimit = self.limits.resolve_prlimit_without_nproc_identity()?;
                 let exemption = crate::limits::current_nproc_exemption();
-                if self.limits.nproc != crate::limits::RLIMIT_UNLIMITED {
-                    if let Some(reason) = exemption {
-                        warn!(
-                            reason,
-                            "shell.exec host run: RLIMIT_NPROC (nproc) caps nothing for this harw identity"
-                        );
-                    }
+                if self.limits.nproc != crate::limits::RLIMIT_UNLIMITED
+                    && let Some(reason) = exemption
+                {
+                    warn!(
+                        reason,
+                        "shell.exec host run: RLIMIT_NPROC (nproc) caps nothing for this harw identity"
+                    );
                 }
                 Ok((tmpfs_size, prlimit))
             }

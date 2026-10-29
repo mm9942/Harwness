@@ -365,11 +365,11 @@ impl OtlpSink {
             match point.key.kind {
                 MetricKind::Counter => {
                     let (as_double, as_int) = schema::metric_value_to_number(point.value);
-                    if let Some(d) = as_double {
-                        if !d.is_finite() {
-                            self.non_finite_dropped.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
+                    if let Some(d) = as_double
+                        && !d.is_finite()
+                    {
+                        self.non_finite_dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
                     group.sum_points.push(NumberDataPoint {
                         attributes,
@@ -381,11 +381,11 @@ impl OtlpSink {
                 }
                 MetricKind::Gauge => {
                     let (as_double, as_int) = schema::metric_value_to_number(point.value);
-                    if let Some(d) = as_double {
-                        if !d.is_finite() {
-                            self.non_finite_dropped.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
+                    if let Some(d) = as_double
+                        && !d.is_finite()
+                    {
+                        self.non_finite_dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
                     group.gauge_points.push(NumberDataPoint {
                         attributes,

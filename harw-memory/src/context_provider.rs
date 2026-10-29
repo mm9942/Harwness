@@ -729,72 +729,65 @@ impl<M: Memory> MemoryContextProvider<M> {
 
         // (4) Dateiwissen-Treffer — nur wenn ein Index gesetzt ist und
         // Stichworte vorliegen (Addendum B); respektiert dasselbe Budget.
-        if let Some(index) = &self.file_index {
-            if let Some(keywords) = &keywords_opt {
-                match index.search(keywords, FILE_INDEX_SEARCH_LIMIT) {
-                    Ok(hits) => {
-                        let mut lines: Vec<String> = Vec::new();
-                        for hit in hits {
-                            let summary = hit.summary.as_deref().unwrap_or("");
-                            let symbols: Vec<&str> = hit
-                                .symbols
-                                .iter()
-                                .take(FILE_INDEX_MAX_SYMBOLS)
-                                .map(String::as_str)
-                                .collect();
-                            let line =
-                                format!("- {} — {} [{}]", hit.path, summary, symbols.join(", "));
-                            let cost = line.len() / 4;
-                            if used_tokens + cost > self.memory_token_budget {
-                                break;
-                            }
-                            used_tokens += cost;
-                            lines.push(line);
+        if let Some(index) = &self.file_index
+            && let Some(keywords) = &keywords_opt
+        {
+            match index.search(keywords, FILE_INDEX_SEARCH_LIMIT) {
+                Ok(hits) => {
+                    let mut lines: Vec<String> = Vec::new();
+                    for hit in hits {
+                        let summary = hit.summary.as_deref().unwrap_or("");
+                        let symbols: Vec<&str> = hit
+                            .symbols
+                            .iter()
+                            .take(FILE_INDEX_MAX_SYMBOLS)
+                            .map(String::as_str)
+                            .collect();
+                        let line = format!("- {} — {} [{}]", hit.path, summary, symbols.join(", "));
+                        let cost = line.len() / 4;
+                        if used_tokens + cost > self.memory_token_budget {
+                            break;
                         }
-                        if !lines.is_empty() {
-                            let body = format!(
-                                "## Bekannte Dateien (bereits gelesen)\n{}",
-                                lines.join("\n")
-                            );
-                            push_fragment(
-                                out,
-                                SECTION_FILE_INDEX,
-                                "known-files",
-                                &body,
-                                produced_at,
-                            );
-                        }
+                        used_tokens += cost;
+                        lines.push(line);
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            "file_index: Stichwortsuche fehlgeschlagen"
+                    if !lines.is_empty() {
+                        let body = format!(
+                            "## Bekannte Dateien (bereits gelesen)\n{}",
+                            lines.join("\n")
                         );
+                        push_fragment(out, SECTION_FILE_INDEX, "known-files", &body, produced_at);
                     }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "file_index: Stichwortsuche fehlgeschlagen"
+                    );
                 }
             }
         }
 
-        if !project_delivered.is_empty() {
-            if let Some(store) = &self.project_facts {
-                let names: Vec<&str> = project_delivered.iter().map(String::as_str).collect();
-                if let Err(error) = store.record_usage(&names) {
-                    tracing::warn!(
-                        error = %error,
-                        "facts: Nutzungszähler (Projekt) konnten nicht geschrieben werden"
-                    );
-                }
+        if !project_delivered.is_empty()
+            && let Some(store) = &self.project_facts
+        {
+            let names: Vec<&str> = project_delivered.iter().map(String::as_str).collect();
+            if let Err(error) = store.record_usage(&names) {
+                tracing::warn!(
+                    error = %error,
+                    "facts: Nutzungszähler (Projekt) konnten nicht geschrieben werden"
+                );
             }
         }
-        if !global_delivered.is_empty() {
-            if let Some(store) = &self.global_facts {
-                let names: Vec<&str> = global_delivered.iter().map(String::as_str).collect();
-                if let Err(error) = store.record_usage(&names) {
-                    tracing::warn!(
-                        error = %error,
-                        "facts: Nutzungszähler (Global) konnten nicht geschrieben werden"
-                    );
-                }
+        if !global_delivered.is_empty()
+            && let Some(store) = &self.global_facts
+        {
+            let names: Vec<&str> = global_delivered.iter().map(String::as_str).collect();
+            if let Err(error) = store.record_usage(&names) {
+                tracing::warn!(
+                    error = %error,
+                    "facts: Nutzungszähler (Global) konnten nicht geschrieben werden"
+                );
             }
         }
     }
