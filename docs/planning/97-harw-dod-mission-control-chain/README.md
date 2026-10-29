@@ -931,12 +931,20 @@ modules and `HostPathBinding` so nothing `shell.exec` can do today is lost),
 output caps/truncation/cancel semantics. Child agents: `JobChildBackend`
 submits with `SandboxProfileName::WorkspaceBuild` (or the role's profile) and
 `executed_on_host = false`; the host-permit path (`run_host_command`) stays the
-only `Host` submission. Fallback when `select_backend` → `None`: today's
-behaviour, logged once per session as `runs without cgroup/landlock`. Config
+only `Host` submission. Fallback when `select_backend` → `None` (or a
+backend that cannot enforce a required dimension): **only legacy unscoped
+calls** keep today's behaviour, logged once per session as `runs without
+cgroup/landlock`. A job that carries a per-worker write scope (§8.2) or
+`SandboxRequirement::Required` is **refused before execution** (fail closed;
+PR #153 invariant 5). Scoped jobs always set `SandboxRequirement::Required`,
+and the admitted, versioned scope propagates unchanged through the
+`shell.exec`, `job.start` and child-agent paths. Config
 `[sandbox] execution = "chain" | "legacy"` (default `chain`). Tests: fake port
 receives one `JobSpec` per call with the expected policy; output/timeout parity
 against the existing `spawn_and_collect` fixtures; a child agent's job record
-carries a cgroup path.
+carries a cgroup path; **a scoped job with no backend is refused with no
+process started; a scoped worker's write to a sibling worker's file is denied
+before mutation** (integration test, host-probe gated).
 
 **E3b — DoD observes cgroups created after attach** (the BPF scope is static
 today): (1) userspace first — `harw-probe-bpf` rescans the profile's
