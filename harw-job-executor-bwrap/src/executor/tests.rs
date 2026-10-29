@@ -987,3 +987,272 @@ fn expect_unsupported_trampoline(
         ))),
     }
 }
+
+/// Profile modules, host `PATH` and `/tmp` size (PL-97 E2b): bound as
+/// `harw-sandbox` binds them for `shell.exec`, and granted inside the
+/// trampoline's Landlock view.
+mod profile_modules {
+    use std::ffi::OsString;
+    use std::num::NonZeroU64;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+
+    use harw_job_linux::{BindMode, PathBind, SandboxPolicy};
+    use harw_sandbox::{
+        CargoExecutionMode, CargoSandboxProfile, HostPathBinding, SandboxProfile,
+        TmuxOperationMode, TmuxSandboxProfile,
+    };
+
+    use super::{executor, has_pair, has_triple, job, mount, strings, trampoline_workspace};
+    use crate::error::BwrapExecutorError;
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_job_core::SandboxProfileName;
+
+    /// Destinations `harw-sandbox` uses for the Cargo module.
+    const TOOLCHAIN: &str = "/opt/harw/toolchain/bin";
+    const RUSTUP: &str = "/opt/harw/rustup";
+    const CARGO_CACHE: &str = "/var/cache/harw/cargo";
+    const TMUX_SOCKET: &str = "/run/harw/tmux.sock";
+
+    struct CargoFixture {
+        _dir: tempfile::TempDir,
+        bin_dir: PathBuf,
+        rustup: PathBuf,
+        cache: PathBuf,
+    }
+
+    fn cargo_fixture() -> TestResult<CargoFixture> {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let root = dir.path().canonicalize().map_err(ctx("canonicalize"))?;
+        let bin_dir = root.join("toolchain/bin");
+        let rustup = root.join("rustup");
+        let cache = root.join("cargo-home");
+        for path in [&bin_dir, &rustup, &cache] {
+            std::fs::create_dir_all(path).map_err(ctx("create dir"))?;
+        }
+        let cargo = bin_dir.join("cargo");
+        std::fs::write(&cargo, b"#!/bin/sh\n").map_err(ctx("write cargo"))?;
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755))
+            .map_err(ctx("chmod cargo"))?;
+        Ok(CargoFixture {
+            _dir: dir,
+            bin_dir,
+            rustup,
+            cache,
+        })
+    }
+
+    fn cargo_profile(
+        fixture: &CargoFixture,
+        mode: CargoExecutionMode,
+    ) -> TestResult<SandboxProfile> {
+        let profile = CargoSandboxProfile::new(
+            mode,
+            fixture.bin_dir.join("cargo"),
+            &fixture.rustup,
+            &fixture.cache,
+        )
+        .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        Ok(SandboxProfile::Cargo(profile))
+    }
+
+    fn text(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn modules_host_path_and_tmpfs_size_reach_the_plain_plan() -> TestResult {
+        let (_ws, root) = super::workspace()?;
+        let fixture = cargo_fixture()?;
+        let tools = tempfile::tempdir().map_err(ctx("tools dir"))?;
+        let tools = tools.path().canonicalize().map_err(ctx("canonicalize"))?;
+        let size = NonZeroU64::new(256 * 1024 * 1024).ok_or(TestError::Missing("size"))?;
+        let executor = executor()
+            .with_profile_modules(&cargo_profile(&fixture, CargoExecutionMode::BuildOffline)?)
+            .with_host_path(HostPathBinding {
+                path: format!("{}:/usr/bin", tools.display()),
+                ..HostPathBinding::default()
+            })
+            .with_tmpfs_size(size);
+        assert_eq!(executor.tmpfs_size(), Some(size));
+        assert!(executor.host_path().is_some());
+        assert!(executor.profile_modules().is_cargo());
+        let policy = SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, &root);
+        let plan = executor
+            .plan(&job("cargo", &["build"])?, &policy, &root)
+            .map_err(ctx("plan"))?;
+        let args = strings(&plan);
+        assert!(has_triple(&args, "--ro-bind", &text(&fixture.bin_dir), TOOLCHAIN));
+        assert!(has_triple(&args, "--ro-bind", &text(&fixture.rustup), RUSTUP));
+        // BuildOffline may write its cache.
+        assert!(has_triple(&args, "--bind", &text(&fixture.cache), CARGO_CACHE));
+        assert!(has_pair(&args, "CARGO_NET_OFFLINE", "true"));
+        assert!(has_triple(&args, "--ro-bind-try", &text(&tools), &text(&tools)));
+        // `--size` directly before the `/tmp` tmpfs.
+        assert!(
+            args.windows(4).any(|window| window
+                == ["--size", "268435456", "--tmpfs", "/tmp"].map(String::from)),
+            "{args:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trampoline_plan_maps_and_grants_the_module_binds() -> TestResult {
+        let (_ws, root) = trampoline_workspace()?;
+        let fixture = cargo_fixture()?;
+        let sockets = tempfile::tempdir().map_err(ctx("socket dir"))?;
+        let socket = sockets.path().join("tmux.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&socket).map_err(ctx("bind socket"))?;
+        let socket = socket.canonicalize().map_err(ctx("canonicalize socket"))?;
+        let tools = tempfile::tempdir().map_err(ctx("tools dir"))?;
+        let tools = tools.path().canonicalize().map_err(ctx("canonicalize"))?;
+        let policy = SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, &root);
+        let tmux = SandboxProfile::Tmux(
+            TmuxSandboxProfile::new(TmuxOperationMode::Write, &socket)
+                .map_err(|error| TestError::Unexpected(error.to_string()))?,
+        );
+        let cases: [(SandboxProfile, Vec<(PathBuf, &str, BindMode)>); 3] = [
+            (
+                cargo_profile(&fixture, CargoExecutionMode::BuildOffline)?,
+                vec![
+                    (fixture.bin_dir.clone(), TOOLCHAIN, BindMode::ReadOnly),
+                    (fixture.rustup.clone(), RUSTUP, BindMode::ReadOnly),
+                    (fixture.cache.clone(), CARGO_CACHE, BindMode::ReadWrite),
+                ],
+            ),
+            (
+                cargo_profile(&fixture, CargoExecutionMode::Inspect)?,
+                vec![
+                    (fixture.bin_dir.clone(), TOOLCHAIN, BindMode::ReadOnly),
+                    (fixture.rustup.clone(), RUSTUP, BindMode::ReadOnly),
+                    (fixture.cache.clone(), CARGO_CACHE, BindMode::ReadOnly),
+                ],
+            ),
+            (
+                tmux,
+                vec![(socket.clone(), TMUX_SOCKET, BindMode::ReadWrite)],
+            ),
+        ];
+        for (profile, expected) in cases {
+            let executor = executor()
+                .with_profile_modules(&profile)
+                .with_host_path(HostPathBinding {
+                    path: format!("{}:/usr/bin", tools.display()),
+                    ..HostPathBinding::default()
+                });
+            let plan = executor
+                .plan_with_trampoline(&job("true", &[])?, &policy, &root, &mount())
+                .map_err(ctx("plan with trampoline"))?;
+            let mut expected: Vec<PathBind> = expected
+                .into_iter()
+                .map(|(host, sandbox, mode)| PathBind {
+                    host,
+                    sandbox: PathBuf::from(sandbox),
+                    mode,
+                })
+                .collect();
+            expected.push(PathBind {
+                host: tools.clone(),
+                sandbox: tools.clone(),
+                mode: BindMode::ReadOnly,
+            });
+            let mut found = plan.module_binds().to_vec();
+            found.sort_by(|a, b| a.sandbox.cmp(&b.sandbox));
+            expected.sort_by(|a, b| a.sandbox.cmp(&b.sandbox));
+            assert_eq!(found, expected, "{profile:?}");
+            let inner = &plan.inner_policy().filesystem;
+            for bind in plan.module_binds() {
+                assert_eq!(
+                    plan.path_map().resolve(&bind.host),
+                    Some((bind.sandbox.clone(), bind.mode)),
+                    "{bind:?}"
+                );
+                assert!(inner.exec.contains(&bind.sandbox), "{bind:?}");
+                assert_eq!(
+                    inner.read_write.contains(&bind.sandbox),
+                    bind.mode == BindMode::ReadWrite,
+                    "{bind:?}"
+                );
+            }
+            // The policy part of the inner view is unchanged.
+            for path in policy.filesystem.mapped(plan.path_map()).read_write {
+                assert!(inner.read_write.contains(&path), "{path:?}");
+            }
+            assert!(
+                !inner
+                    .read_write
+                    .iter()
+                    .any(|path| path.starts_with(super::super::SANDBOX_TRAMPOLINE_DIR))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn strict_and_host_profiles_add_no_module_binds() -> TestResult {
+        let (_ws, root) = trampoline_workspace()?;
+        let policy = SandboxPolicy::from_profile(SandboxProfileName::NoNetwork, &root);
+        let base = executor()
+            .plan_with_trampoline(&job("true", &[])?, &policy, &root, &mount())
+            .map_err(ctx("base plan"))?;
+        for profile in [SandboxProfile::Strict, SandboxProfile::Host] {
+            let executor = executor().with_profile_modules(&profile);
+            assert_eq!(executor.profile_modules(), &SandboxProfile::Strict);
+            let plan = executor
+                .plan_with_trampoline(&job("true", &[])?, &policy, &root, &mount())
+                .map_err(ctx("plan"))?;
+            assert!(plan.module_binds().is_empty(), "{profile:?}");
+            assert_eq!(plan, base, "{profile:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn launcher_binds_are_parsed_option_by_option() -> TestResult {
+        let args = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
+        // A value that looks like an option is skipped with its option.
+        let binds = super::super::launcher_binds(&args(&[
+            "--setenv",
+            "X",
+            "--bind",
+            "--ro-bind",
+            "/a",
+            "/b",
+            "--dir",
+            "/tmp/home",
+            "--",
+            "--bind",
+            "/c",
+            "/d",
+        ]))
+        .map_err(ctx("parse"))?;
+        assert_eq!(
+            binds,
+            [PathBind {
+                host: PathBuf::from("/a"),
+                sandbox: PathBuf::from("/b"),
+                mode: BindMode::ReadOnly,
+            }]
+        );
+        for broken in [
+            args(&["--share-net", "--"]),
+            args(&["--bind", "/a"]),
+            args(&["--ro-bind", "/a", "/b"]),
+        ] {
+            assert!(
+                matches!(
+                    super::super::launcher_binds(&broken),
+                    Err(BwrapExecutorError::PlanShape)
+                ),
+                "{broken:?}"
+            );
+        }
+        assert!(matches!(
+            super::super::launcher_binds(&args(&["--bind", "relative", "/b", "--"])),
+            Err(BwrapExecutorError::InvalidPath { .. })
+        ));
+        Ok(())
+    }
+}

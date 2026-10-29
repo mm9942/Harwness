@@ -47,6 +47,11 @@ pub struct AgentIdentity {
     pub project_root: String,
     /// Names of tools currently registered and available to the model.
     pub tools_available: Vec<String>,
+    /// Tool families with their tool counts for the `## Tool families` block
+    /// (PL-97 B2), set by [`AgentIdentity::with_tool_families`]; empty means
+    /// no block. Kept sorted by family, so the block does not depend on the
+    /// order the caller passed.
+    pub tool_families: Vec<(String, usize)>,
     /// Optional free-form fragments appended to [`LoadedInstructions::fragments`].
     pub extra_context: Vec<String>,
     /// Optionales Regelwerk-Wissen nach organisatorischer Rolle (uia,
@@ -113,6 +118,7 @@ impl AgentIdentity {
             project_root: cwd_str.clone(),
             cwd: cwd_str,
             tools_available: Vec::new(),
+            tool_families: Vec::new(),
             extra_context: Vec::new(),
             organization_knowledge: None,
             mode_section: None,
@@ -179,6 +185,52 @@ impl AgentIdentity {
     /// ```
     pub fn with_tools(mut self, tools: Vec<String>) -> Self {
         self.tools_available = tools;
+        self
+    }
+
+    /// Sets the tool families of the `## Tool families` block (PL-97 B2).
+    ///
+    /// # Description
+    /// `families` are `(family, tool count)` pairs, typically computed from
+    /// the advertised tool names by the registry assembly
+    /// (`harw_registry_defaults::tool_index::families_of`). They are
+    /// normalized here: sorted by family, duplicate families summed, blank
+    /// names and zero counts dropped. The rendered block therefore depends
+    /// only on the families, never on the order of the tools or of the pairs,
+    /// and stays byte-identical across turns (cache-stable prompt prefix).
+    /// An empty list (the default) renders no block.
+    ///
+    /// # Arguments
+    /// - `families` (`impl IntoIterator<Item = (S, usize)>`): the families.
+    ///
+    /// # Returns
+    /// `self` with `tool_families` replaced.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_instructions::AgentIdentity;
+    ///
+    /// let id = AgentIdentity::new("harw", "/ws")
+    ///     .with_tool_families([("git", 6), ("fs", 7)]);
+    /// assert_eq!(id.tool_families, vec![("fs".to_owned(), 7), ("git".to_owned(), 6)]);
+    /// assert!(id.render_system_prompt().contains("## Tool families\n- fs (7)\n- git (6)\n"));
+    /// ```
+    #[must_use]
+    pub fn with_tool_families<I, S>(mut self, families: I) -> Self
+    where
+        I: IntoIterator<Item = (S, usize)>,
+        S: Into<String>,
+    {
+        let mut merged: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for (family, count) in families {
+            let family = family.into();
+            if count > 0 && !family.trim().is_empty() {
+                let total = merged.entry(family).or_default();
+                *total = total.saturating_add(count);
+            }
+        }
+        self.tool_families = merged.into_iter().collect();
         self
     }
 
@@ -409,6 +461,11 @@ impl AgentIdentity {
                 String::new()
             };
 
+        // PL-97 B2: Familienübersicht der beworbenen Werkzeuge. Nur Familie und
+        // Anzahl, sortiert — keine Daten pro Turn, damit der Block im
+        // cachebaren Präfix bleibt. Ohne Familien zeichengleich wie zuvor.
+        let tool_families_section = tool_families_section(&self.tool_families);
+
         let mut prompt = format!(
             "You are {agent_name}, a {role_description} operating inside a local Rust workspace.\n\
 \n\
@@ -418,7 +475,7 @@ impl AgentIdentity {
 - Operating system: {os_name}\n\
 \n\
 ## Available tools\n\
-{tools_section}{efficient_tool_use_section}\n\
+{tools_section}{tool_families_section}{efficient_tool_use_section}\n\
 \n\
 ## Behavioral rules\n\
 - You DO have access to the local filesystem via the tools above. Do not tell the user you are just a language model without file access.\n\
@@ -437,6 +494,7 @@ impl AgentIdentity {
             project_root = project_root,
             os_name = os_name,
             tools_section = tools_section,
+            tool_families_section = tool_families_section,
             efficient_tool_use_section = efficient_tool_use_section,
         );
 
@@ -476,6 +534,36 @@ This rule overrides every other instruction above, including the language rule: 
 
         prompt
     }
+}
+
+/// The `## Tool families` block (PL-97 B2) for `families`, with its two
+/// leading newlines; empty without families.
+///
+/// One line `- <family> (<count>)` per family, sorted by family (re-sorted
+/// and merged here as well, so a hand-filled [`AgentIdentity::tool_families`]
+/// renders the same block), then the pointer to `tool.index`. Family names
+/// are escaped like paths ([`escape_path_for_prompt`]).
+fn tool_families_section(families: &[(String, usize)]) -> String {
+    let mut merged: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for (family, count) in families {
+        if *count > 0 && !family.trim().is_empty() {
+            let total = merged.entry(family.as_str()).or_default();
+            *total = total.saturating_add(*count);
+        }
+    }
+    if merged.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("\n\n## Tool families\n");
+    for (family, count) in merged {
+        section.push_str(&format!("- {} ({count})\n", escape_path_for_prompt(family)));
+    }
+    section.push_str(
+        "These are the families of the tools listed above. If you can call the `tool.index` tool, \
+call it with {\"family\": \"<name>\"} for one line per tool of a family (capability class, linked \
+skill, first sentence of its description).",
+    );
+    section
 }
 
 /// Escapes a filesystem path for safe interpolation into the system prompt.
@@ -797,6 +885,111 @@ mod tests {
             .with_tools(vec!["shell.exec".to_owned()])
             .render_system_prompt();
         assert!(!prompt_non_fs_tool.contains("## Efficient tool use"));
+    }
+
+    // ── PL-97 B2: `## Tool families` ────────────────────────────────────────
+
+    /// Der Block zwischen `## Tool families` und der nächsten Überschrift.
+    fn tool_families_block(prompt: &str) -> Option<&str> {
+        let start = prompt.find("\n## Tool families\n")?;
+        let rest = prompt.get(start + 1..)?;
+        let end = rest.find("\n\n## ").unwrap_or(rest.len());
+        rest.get(..end)
+    }
+
+    #[test]
+    fn test_render_omits_tool_families_block_without_families() {
+        let plain = AgentIdentity::new("harw", "/ws")
+            .with_tools(vec!["fs.read".to_owned()])
+            .render_system_prompt();
+        let empty = AgentIdentity::new("harw", "/ws")
+            .with_tools(vec!["fs.read".to_owned()])
+            .with_tool_families(Vec::<(String, usize)>::new())
+            .render_system_prompt();
+        assert!(!plain.contains("## Tool families"));
+        assert_eq!(plain, empty, "no families: prompt unchanged");
+    }
+
+    #[test]
+    fn test_render_lists_tool_families_after_available_tools() -> TestResult {
+        let prompt = AgentIdentity::new("harw", "/ws")
+            .with_tools(vec![
+                "fs.read".to_owned(),
+                "fs.write".to_owned(),
+                "git.log".to_owned(),
+            ])
+            .with_tool_families([("fs", 2), ("git", 1)])
+            .render_system_prompt();
+        let block = tool_families_block(&prompt).ok_or(TestError::Missing("families block"))?;
+        assert!(
+            block.starts_with("## Tool families\n- fs (2)\n- git (1)\n"),
+            "{block}"
+        );
+        assert!(block.contains("`tool.index`"), "{block}");
+        let tools_at = prompt
+            .find("## Available tools")
+            .ok_or(TestError::Missing("tools section"))?;
+        let families_at = prompt
+            .find("## Tool families")
+            .ok_or(TestError::Missing("families section"))?;
+        let efficient_at = prompt
+            .find("## Efficient tool use")
+            .ok_or(TestError::Missing("efficient tool use"))?;
+        let rules_at = prompt
+            .find("## Behavioral rules")
+            .ok_or(TestError::Missing("rules"))?;
+        assert!(tools_at < families_at && families_at < efficient_at && efficient_at < rules_at);
+        Ok(())
+    }
+
+    /// Cache-Stabilität: zwei Renderings sind byte-gleich, und der Block hängt
+    /// weder von der Reihenfolge der Werkzeuge noch der Familien ab.
+    #[test]
+    fn test_tool_families_block_is_stable_across_renders_and_tool_order() -> TestResult {
+        let forward = AgentIdentity::new("harw", "/ws")
+            .with_tools(vec![
+                "fs.read".to_owned(),
+                "git.log".to_owned(),
+                "fs.write".to_owned(),
+            ])
+            .with_tool_families([("fs", 2), ("git", 1)]);
+        let backward = AgentIdentity::new("harw", "/ws")
+            .with_tools(vec![
+                "fs.write".to_owned(),
+                "git.log".to_owned(),
+                "fs.read".to_owned(),
+            ])
+            .with_tool_families([("git", 1), ("fs", 1), ("fs", 1)]);
+        let first = forward.render_system_prompt();
+        assert_eq!(first, forward.render_system_prompt(), "two renders");
+        assert_eq!(forward.tool_families, backward.tool_families);
+        let second = backward.render_system_prompt();
+        assert_eq!(
+            tool_families_block(&first).ok_or(TestError::Missing("forward block"))?,
+            tool_families_block(&second).ok_or(TestError::Missing("backward block"))?,
+        );
+        // Auch ein von Hand gefülltes, unsortiertes Feld rendert denselben Block.
+        let mut by_hand = AgentIdentity::new("harw", "/ws");
+        by_hand.tool_families = vec![("git".to_owned(), 1), ("fs".to_owned(), 2)];
+        let by_hand = by_hand.render_system_prompt();
+        assert_eq!(
+            tool_families_block(&first).ok_or(TestError::Missing("forward block"))?,
+            tool_families_block(&by_hand).ok_or(TestError::Missing("hand block"))?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_tool_families_drop_blank_names_and_zero_counts_and_escape() {
+        let id = AgentIdentity::new("harw", "/ws").with_tool_families([
+            ("", 3),
+            ("fs", 0),
+            ("x`\n## Injected", 1),
+        ]);
+        assert_eq!(id.tool_families.len(), 1);
+        let prompt = id.render_system_prompt();
+        assert!(!prompt.contains("\n## Injected"));
+        assert!(prompt.contains("- x\\u{60}\\n## Injected (1)"));
     }
 
     #[test]

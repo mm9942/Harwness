@@ -13,6 +13,10 @@
 //! - Jobs and Finished / Failed each own one [`WindowUi`] in [`MissionUi`].
 //! - LIVE in the portrait stack is neither focusable nor scrollable; it only
 //!   remembers the pinned agent and its ranking state.
+//! - LIVE in the landscape centre column (PL-97 C3) is a focusable window
+//!   with its own [`ChatScroll`] ([`MissionUi::live_scroll`]); `Alt+L` shows
+//!   the existing agent detail of the LIVE source in place
+//!   ([`MissionUi::live_detail_agent`]).
 //!
 //! Everything here is presentation only: no model call, no job, no change to
 //! scheduling, permissions or history (W02 "Reuse, no extra model or job").
@@ -21,6 +25,7 @@ use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use crate::agent_monitor::{AgentLive, AgentMonitor, AgentPhase};
+use crate::chat_scroll::ChatScroll;
 use crate::live_ranker::{ActivityTier, LiveActivityRanker, LiveCandidate, RankerConfig};
 use crate::panes::PaneFocus;
 
@@ -29,6 +34,7 @@ pub(crate) mod finished_window;
 pub(crate) mod jobs_window;
 pub(crate) mod live_window;
 pub(crate) mod projection;
+pub(crate) mod stop_job;
 
 /// Focus cycle order of `F4` (PL-97 §3.3.3): Chat → Agents → Jobs →
 /// Finished → LIVE (only while focusable) → Explorer → Workbench → Chat.
@@ -289,10 +295,20 @@ pub(crate) struct MissionUi {
     pub(crate) finished_expanded: bool,
     /// LIVE detail requested (`Alt+L`): in the portrait stack it opens the
     /// existing agent detail view of the LIVE source; the landscape centre
-    /// window (C3) shows it in place and becomes focusable.
+    /// window (C3) shows it in place (see [`MissionUi::live_detail_agent`]).
     pub(crate) live_expanded: bool,
     /// Agent pinned as the LIVE source (`p` in the Agents window).
     pub(crate) pinned_agent: Option<String>,
+    /// Scroll state of the landscape LIVE window (PL-97 C3), ChatScroll-style:
+    /// the offset counts from the newest line, `0` follows it. The in-place
+    /// detail uses the same state; opening or closing it starts at the
+    /// newest line again.
+    pub(crate) live_scroll: ChatScroll,
+    /// Agent whose detail the landscape LIVE window shows in place (`Alt+L`),
+    /// fixed when it was opened so a changing LIVE source never swaps it.
+    live_detail: Option<String>,
+    /// Reasoning entries of the in-place detail in full (`r` toggles).
+    pub(crate) live_detail_reasoning: bool,
     /// Ranking state of the LIVE fallback source.
     live_rank: RefCell<LiveRank>,
     /// Start of the tool call LIVE shows (see [`ToolClock`]).
@@ -308,6 +324,9 @@ impl MissionUi {
             finished_expanded: false,
             live_expanded: false,
             pinned_agent: None,
+            live_scroll: ChatScroll::new(),
+            live_detail: None,
+            live_detail_reasoning: true,
             live_rank: RefCell::new(LiveRank {
                 ranker: LiveActivityRanker::new(RankerConfig::default()),
                 epoch,
@@ -343,6 +362,40 @@ impl MissionUi {
         clock.as_ref().map(|clock| clock.started)
     }
 
+    /// The agent the landscape LIVE window shows in place (`Alt+L`), if its
+    /// detail is open there.
+    #[must_use]
+    pub(crate) fn live_detail_agent(&self) -> Option<&str> {
+        self.live_detail.as_deref().filter(|_| self.live_expanded)
+    }
+
+    /// Opens the in-place LIVE detail of `agent` (landscape `Alt+L`/Enter),
+    /// starting at its newest entry.
+    pub(crate) fn open_live_detail(&mut self, agent: &str) {
+        self.live_detail = Some(agent.to_owned());
+        self.live_detail_reasoning = true;
+        self.live_expanded = true;
+        self.live_scroll.jump_to_bottom();
+    }
+
+    /// Closes the in-place LIVE detail (the window shows its W02 lines again,
+    /// following the newest one).
+    pub(crate) fn close_live_detail(&mut self) {
+        self.live_detail = None;
+        self.live_expanded = false;
+        self.live_scroll.jump_to_bottom();
+    }
+
+    /// Focus moved (`F4`, `Esc`, click): an in-place LIVE detail closes once
+    /// LIVE lost the focus, like the agent detail closes when the agents
+    /// panel loses it. The portrait detail (`Alt+L` without a LIVE window)
+    /// is an agent detail view and closes by its own path.
+    pub(crate) fn sync_live_focus(&mut self, focus: PaneFocus) {
+        if self.live_detail.is_some() && focus != PaneFocus::Live {
+            self.close_live_detail();
+        }
+    }
+
     /// `p`: pins `agent` as the LIVE source, or unpins it when it already is.
     pub(crate) fn toggle_pin(&mut self, agent: &str) {
         if self.pinned_agent.as_deref() == Some(agent) {
@@ -368,7 +421,7 @@ impl MissionUi {
             .as_deref()
             .and_then(|id| monitor.agent(id))
             .filter(|live| {
-                projection::is_active(live.phase)
+                live.phase.is_active()
                     || live.is_unseen_failure()
                     || live
                         .finished
@@ -382,7 +435,7 @@ impl MissionUi {
             .into_iter()
             .map(|(_, live)| live)
             .filter(|live| {
-                projection::is_active(live.phase)
+                live.phase.is_active()
                     && live.role.trim()
                         == harw_registry_defaults::profile::role_names::ROOT_ORCHESTRATOR
             })
@@ -518,6 +571,30 @@ pub(crate) mod tests {
         later.phase = AgentPhase::Thinking;
         assert_eq!(ui.tool_started(&later), None, "no tool, no clock");
         Ok(())
+    }
+
+    /// PL-97 C3: the in-place LIVE detail keeps the agent it was opened
+    /// for, starts at the newest line and closes once LIVE loses the focus.
+    #[test]
+    fn in_place_live_detail_opens_closes_and_follows_the_focus() {
+        let mut ui = MissionUi::new(Instant::now());
+        assert_eq!(ui.live_detail_agent(), None);
+        ui.live_scroll.scroll_up(4, 100, 10);
+        ui.open_live_detail("o1");
+        assert_eq!(ui.live_detail_agent(), Some("o1"));
+        assert!(ui.live_expanded && ui.live_scroll.is_following());
+        ui.sync_live_focus(PaneFocus::Live);
+        assert_eq!(ui.live_detail_agent(), Some("o1"), "LIVE keeps the focus");
+        ui.sync_live_focus(PaneFocus::Chat);
+        assert_eq!(ui.live_detail_agent(), None);
+        assert!(!ui.live_expanded);
+
+        // Ein Hochformat-Detail (`live_expanded` ohne Agent an Ort und
+        // Stelle) bleibt unberührt.
+        ui.live_expanded = true;
+        ui.sync_live_focus(PaneFocus::Agents);
+        assert!(ui.live_expanded);
+        assert_eq!(ui.live_detail_agent(), None);
     }
 
     #[test]

@@ -13,12 +13,18 @@
 //! Hinweise des Startwegs (z. B. Start ohne rlimits) wandern über
 //! [`PreparedLaunch`] in `meta.json` und als `JobEvent::Warning` zum Besitzer.
 //!
+//! PL-97 E2b: Nimmt der Start die Sandbox-Kette des Job-Runtimes
+//! ([`harw_tool_shell::job_spec`]), trägt [`PreparedLaunch::sandboxed`]
+//! Workspace-Sandbox und Ressourcen; die Job-Verwaltung übergibt den Befehl
+//! (`/bin/sh -c …`) dann mit ihnen an den Kommando-Port statt als Host-Job
+//! ([`crate::JobManager::start_launch_with_origin`]).
+//!
 //! # Nebenläufigkeit
 //! `Send + Sync`; [`JobLauncher::prepare`] und
 //! [`JobLauncher::prepare_launch`] können auf eine Nutzerfreigabe warten
 //! (Host-Permit-Frage).
 
-use harw_tool_shell::ShellToolProvider;
+use harw_tool_shell::{SandboxedLaunch, ShellToolProvider};
 use harw_tools::{ToolExecutionContext, ToolOutput};
 use std::future::Future;
 use std::pin::Pin;
@@ -48,6 +54,9 @@ pub struct PreparedLaunch {
     pub job: PreparedJob,
     /// Hinweise für den Besitzer (z. B. Start ohne rlimits); nie Werte von Umgebungsvariablen.
     pub warnings: Vec<String>,
+    /// PL-97 E2b: Übergabe an die Sandbox-Kette; `None`: `job.command`
+    /// läuft wie bisher als Host-Job.
+    pub sandboxed: Option<SandboxedLaunch>,
 }
 
 /// Future von [`JobLauncher::prepare_launch`].
@@ -87,6 +96,7 @@ pub trait JobLauncher: Send + Sync {
             Ok(PreparedLaunch {
                 job,
                 warnings: Vec::new(),
+                sandboxed: None,
             })
         })
     }
@@ -134,7 +144,7 @@ impl JobLauncher for ShellJobLauncher {
                 .await?;
             let executed_on_host = launch.executed_on_host();
             let env_cleared = launch.env_cleared();
-            let (command, warnings) = launch.into_parts();
+            let (command, warnings, sandboxed) = launch.into_launch_parts();
             Ok(PreparedLaunch {
                 job: PreparedJob {
                     command,
@@ -142,6 +152,7 @@ impl JobLauncher for ShellJobLauncher {
                     env_cleared,
                 },
                 warnings,
+                sandboxed,
             })
         })
     }

@@ -4,7 +4,7 @@ use crate::{CommandFrame, CommandOutput, CommandStdin};
 use harw_job::DarwinExecutor as HostExecutor;
 use harw_job::FsJobRecordStore;
 #[cfg(target_os = "linux")]
-use harw_job::LinuxExecutor as HostExecutor;
+use crate::HostCommandExecutor as HostExecutor;
 
 harw_test_support::define_test_error!(pub(crate));
 

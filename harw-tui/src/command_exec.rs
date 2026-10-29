@@ -348,6 +348,42 @@ pub(crate) async fn dispatch_slash_command(
     }
 }
 
+/// Eine Befehlszeile, die eine Taste aus typisierten Teilen baut (PL-97 C4,
+/// W20-E), statt einen freien Text zusammenzusetzen.
+///
+/// # Beschreibung
+/// Die Zeile ist wortgleich die, die eine Bedienerin tippen würde. Der
+/// Aufrufer reicht sie über den regulären Befehlsweg weiter
+/// (`HarwEvent::Command` → [`execute_command_as`] bzw. im Busy-Pfad
+/// `route_busy_command`): dieselbe Admission
+/// ([`crate::CommandRegistry::dispatch`]), dieselbe Busy-Klasse und derselbe
+/// `OpContext` wie eine getippte Zeile. Es gibt keinen zweiten Weg: eine
+/// abgelehnte Admission ist das Ende, nie ein direkter Aufruf der
+/// Job-Verwaltung.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DispatchLine(String);
+
+impl DispatchLine {
+    /// `/jobs stop <id>`: stoppt einen verwalteten Job (TERM, dann die
+    /// bestehende Stopp-Politik des Jobs).
+    #[must_use]
+    pub(crate) fn jobs_stop(job: &harw_tool_job::JobId) -> Self {
+        Self(format!("/jobs stop {job}"))
+    }
+
+    /// Die Zeile, wie sie getippt würde.
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Die Zeile für den Befehlsweg (`HarwEvent::Command`).
+    #[must_use]
+    pub(crate) fn into_line(self) -> String {
+        self.0
+    }
+}
+
 /// Klassifiziert eine rohe Eingabezeile in ihre
 /// [`harw_operations::operation::BusyAvailability`] für den Busy-Dispatch
 /// (Runde 4, Teil H).
@@ -2196,6 +2232,47 @@ mod tests {
             admit_shell_line(&adapters, tier, "\\!ls", None),
             ShellAdmission::NotShell
         );
+    }
+
+    /// PL-97 C4 (W20-E): die getippte Form der Stopp-Taste ist wörtlich
+    /// `/jobs stop <id>` und hat dieselbe Busy-Klasse und Zulassung wie die
+    /// getippte Zeile (ohne Job-Verwaltung meldet `/jobs` „nicht verfügbar“,
+    /// identisch für beide).
+    #[tokio::test]
+    async fn dispatch_line_jobs_stop_is_the_typed_line() -> TestResult {
+        let id = harw_tool_job::JobId::parse("job-7").ok_or(TestError::Missing("job id"))?;
+        let line = super::DispatchLine::jobs_stop(&id);
+        assert_eq!(line.as_str(), "/jobs stop job-7");
+        let registry = built_in_registry()?;
+        assert_eq!(
+            super::busy_availability_for(&registry, line.as_str()),
+            super::busy_availability_for(&registry, "/jobs stop job-7"),
+        );
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox()?;
+        let session_id = SessionId::new();
+        let run = |raw: String| {
+            let adapters = &adapters;
+            let sandbox = &sandbox;
+            let session_id = &session_id;
+            async move {
+                super::execute_command_as(
+                    adapters,
+                    sandbox,
+                    session_id,
+                    PermissionTier::Owner,
+                    &raw,
+                    harw_operations::ServiceMap::new,
+                )
+                .await
+            }
+        };
+        let keyed = run(line.clone().into_line()).await;
+        let typed = run("/jobs stop job-7".to_owned()).await;
+        std::fs::remove_dir_all(tmp).ok();
+        assert_eq!(keyed, typed);
+        assert!(!keyed.contains("Unbekannter Command"), "{keyed}");
+        Ok(())
     }
 
     #[test]

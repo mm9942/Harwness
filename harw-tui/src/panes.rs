@@ -27,11 +27,12 @@
 //! wandelt deren Klassifikation (breite Seitenspalte, oben angedockter
 //! Portrait-Dock oder Zusammenfassungs-/Kompakt-Fallback) in
 //! `ratatui::layout::Rect` um, [`classify_mission`] entsprechend die
-//! Mission-Control-Geometrie (PL-97 C2: Agenten- und Jobs-Fenster,
-//! Finished/Failed-Streifen, LIVE-Streifen und Chat über
-//! [`harw_tui_layout::classify_mission`]). [`split`] und
-//! `split_right_column` beschreiben weiterhin nur die breite
-//! Seitenspalten-Darstellung von oben; `F4` läuft in der Reihenfolge
+//! Mission-Control-Geometrie über [`harw_tui_layout::classify_mission`]
+//! (PL-97 C2/C3: Hochformat-Stapel, dreispaltiges Querformat, flaches
+//! Querformat mit Agenten über Jobs in der Seitenspalte, Kompakt-Fallback).
+//! [`split`] und `split_right_column` beschreiben nur noch die
+//! Seitenspalten-Darstellung eines maximierten Panels (`F11`,
+//! Detailansicht) und des Kompakt-Fallbacks; `F4` läuft in der Reihenfolge
 //! [`crate::mission::FOCUS_ORDER`] über alle sichtbaren Flächen.
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -63,7 +64,11 @@ pub(crate) const AGENTS_MIN_ROWS: u16 = 3;
 /// Platzierung, aber Rechtecke als `ratatui::layout::Rect` — dies ist die
 /// einzige Stelle, an der `harw-tui` den dritten Rect-Typ aus
 /// `harw-tui-layout` in einen eigenen umwandelt.
+///
+/// Seit PL-97 C3 klassifiziert das Bild über [`classify_mission`]; diese
+/// Fassung bleibt als Gegenprobe der bisherigen Klassifikation in den Tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ScreenAreas {
     pub placement: harw_tui_layout::Placement,
     pub chat: Rect,
@@ -79,7 +84,9 @@ pub(crate) struct ScreenAreas {
 /// (`harw-tui/src/app.rs:9552`, immer 1) und Composer (die dort berechnete
 /// `input_height`) reserviert, damit die Fallback-Formel byte-identisch zu
 /// heute bleibt (siehe `harw-tui-layout/src/placement.rs`, Funktion
-/// `fallback`).
+/// `fallback`). Seit PL-97 C3 nur noch Gegenprobe in den Tests (siehe
+/// [`ScreenAreas`]).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn classify_screen(area: Rect, status_rows: u16, composer_rows: u16) -> ScreenAreas {
     let out = harw_tui_layout::classify(harw_tui_layout::LayoutInput {
         cols: area.width,
@@ -666,6 +673,47 @@ mod tests {
         let shifted = classify_mission(Rect::new(3, 2, 46, 78), &state, mission_rows(2));
         assert_eq!(shifted.live, Some(Rect::new(3, 7, 46, 3)));
         assert_eq!(shifted.chat, Rect::new(3, 10, 46, 66));
+        Ok(())
+    }
+
+    /// PL-97 C3: im Querformat liefert [`classify_mission`] die Anker der
+    /// drei Spalten (160×45: Chat 88 | Finished über LIVE 40 | Agenten über
+    /// Jobs 32) bzw. das flache Querformat (100×30: Seitenspalte 44 mit
+    /// Agenten über Jobs, Finished- und LIVE-Streifen über dem Chat), alles
+    /// um den Ursprung der Eingabefläche verschoben.
+    #[test]
+    fn classify_mission_converts_the_landscape_anchors_and_the_shallow_stack() -> TestResult {
+        let state = PanelState::default();
+        let three = classify_mission(Rect::new(0, 0, 160, 45), &state, mission_rows(2));
+        assert_eq!(
+            three.placement,
+            harw_tui_layout::MissionPlacement::LandscapeThreeColumns
+        );
+        assert_eq!(three.chat, Rect::new(0, 0, 88, 41));
+        assert_eq!(three.finished, Some(Rect::new(88, 0, 40, 5)));
+        assert_eq!(three.live, Some(Rect::new(88, 5, 40, 36)));
+        assert_eq!(three.agents, Some(Rect::new(128, 0, 32, 21)));
+        assert_eq!(three.jobs, Some(Rect::new(128, 21, 32, 20)));
+        assert_eq!(three.status, Rect::new(0, 41, 160, 1));
+        assert_eq!(three.composer, Rect::new(0, 42, 160, 3));
+
+        let shifted = classify_mission(Rect::new(4, 1, 160, 45), &state, mission_rows(2));
+        assert_eq!(shifted.live, Some(Rect::new(92, 6, 40, 36)));
+        assert_eq!(shifted.jobs, Some(Rect::new(132, 22, 32, 20)));
+
+        let shallow = classify_mission(Rect::new(0, 0, 100, 30), &state, mission_rows(2));
+        assert_eq!(
+            shallow.placement,
+            harw_tui_layout::MissionPlacement::ShallowLandscape
+        );
+        let agents = shallow.agents.ok_or("shallow agents")?;
+        let jobs = shallow.jobs.ok_or("shallow jobs")?;
+        assert_eq!((agents.x, agents.width), (100 - AGENTS_WIDTH, AGENTS_WIDTH));
+        assert_eq!((jobs.x, jobs.y), (agents.x, agents.y + agents.height));
+        assert_eq!(shallow.finished, Some(Rect::new(0, 0, 56, 1)));
+        assert_eq!(shallow.live, Some(Rect::new(0, 1, 56, 1)));
+        assert_eq!(shallow.live_body_lines, 0, "header-only LIVE strip");
+        assert_eq!(shallow.chat, Rect::new(0, 2, 56, 24));
         Ok(())
     }
 

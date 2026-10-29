@@ -15,7 +15,9 @@
 //!   exceeding it cancels the job ([`CommandEnd::OutputLimit`]). A lagging
 //!   consumer is reported as [`CommandOutcome::lagged`], not silently ignored.
 //! - **Working directory**: any existing absolute directory; the runtime's
-//!   workspace root is `/` for this port.
+//!   workspace root is `/` for this port. A workspace sandbox request
+//!   ([`CommandSandbox::Workspace`], PL-97 E2b) runs on its own root
+//!   instead.
 
 #![forbid(unsafe_code)]
 
@@ -24,9 +26,14 @@ mod port;
 
 pub use global::{install, install_host_default, installed, replace};
 
-pub use harw_job::{Persistence, ResourceRequest, SandboxProfileName, SandboxRequirement};
+pub use harw_job::{
+    BackendKind, Persistence, ResourceRequest, SandboxProfileName, SandboxRequirement,
+};
+pub use harw_job_core::spec::JobWriteScope;
+#[cfg(target_os = "linux")]
+pub use port::HostCommandExecutor;
 pub use port::{
     CommandEnd, CommandFrame, CommandFrames, CommandOutcome, CommandOutput, CommandPort,
     CommandRequest, CommandSandbox, CommandStdin, JobCommandPort, OutputStream, RunFuture,
-    StartFuture, StartedCommand,
+    StartFuture, StartedCommand, WorkspaceSandbox,
 };

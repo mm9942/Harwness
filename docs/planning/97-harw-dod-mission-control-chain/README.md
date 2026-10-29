@@ -1173,6 +1173,43 @@ Recommended execution order:
 - Tests: `tool.index` output for `family = "dod"`; prompt block stable across
   turns; first use of `sys.ps` triggers `sys-tools` even without a `triggers.toml`;
   lint fails on a fixture tool with a 10-char description.
+- As landed: `ToolIndexEntry::skill` is `Option<String>` (skill names come
+  from the runtime-built `SkillIndex`). A skill declares the tools of its
+  `skill.toml` `tools` and of its `[triggers] tools` (`cargo.test_one` links
+  `cargo-tools`); a tool several skills declare has no link; provider
+  bindings (`TOOL_SKILLS`, collected in `profile::provider_tool_tables`, with
+  a drift test) win. The lint is one rule, `tool_index::lint_tool_spec`:
+  at least 60 characters, a start matching
+  `^(?:Use when\b|\p{Lu}[\p{Ll}-]*[st]\b)` (English or German third-person
+  verb), every top-level argument described; per-tool allowlists with a
+  reason in `harw-registry-defaults/tests/tool_registry_lint.rs` (profile
+  tools and the state-free root tools) and `harw-ops/src/tool_index_op.rs`
+  (operation model tools). Tools whose specs need runtime state (`job.*`,
+  the spawn, delegation and message tools, `plan.*`/`ask_user`,
+  `host.sudo_exec`, `container.*`, `browser.*`) are neither linted nor
+  summarised in `tool.index`. The tool-availability filter of §4 B4 lives in
+  the injector (root sessions only); a skipped skill takes no per-round room.
+  `## Tool families` counts the profile tools of `## Available tools`;
+  `tool.index` lists every tool of the build.
+- **Deferred (open):**
+  - S4 synthetic `Tool` trigger ("tools bring their skill") and its plan
+    test (`sys.ps` without a `triggers.toml`). Owner: harw-catalog
+    `TriggerIndex` — seed `tools` triggers for a skill without
+    `triggers.toml` from its `skill.toml` `tools` (unique-declarer rule of
+    `ToolSkillMap`) when the index is built. Today all four tool skills ship
+    a `triggers.toml`, so they fire anyway.
+  - The root's real tool set: the root prompt's `## Tool families` omits the
+    composition-root families (`dod`, `tool`, `job`, `skills`, …) and
+    `tool.index` does not mark tools the calling session lacks. Owner:
+    harw-runtime assembly (pass `registered_tool_names` into the identity
+    and a session-tools service into the model-tool service map).
+  - Summaries and lint for `job.*` need a state-free spec function in
+    `harw-tool-job`.
+  - Gate: `harw-cli` `chat::tests::test_one_shot_policy_gated_tool_call_is_denied_without_pausing`
+    overruns its fixture window (about 38k estimated tokens against about
+    27.9k). B2 adds about 1.2 KB per root request (the `tool.index` spec and
+    the families block), a few hundred tokens of a roughly 10k overrun.
+    Owner: the wave-4 gate-fix zone (chat.rs fixture and tool-spec budget).
 
 ### B3 — `harw skill …` and `/skills preview|validate` (S2)
 - Files: `harw-cli/src/cli/skill.rs`, `harw-ops/src/skills.rs`, `docs/cli.md`.

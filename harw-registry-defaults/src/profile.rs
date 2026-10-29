@@ -203,20 +203,21 @@ pub mod role_names {
 
     /// Triagiert Netz-Befunde (`EgressFlow`/`ListenerOpened`) der
     /// `EgressFlowRule`; bekommt bereits ausgewertete `Finding`-Batches als
-    /// Parameter, ruft selbst kein Werkzeug auf (`[tools].admitted = []` in
+    /// Parameter und liest Harw-DoD höchstens über die drei lesenden
+    /// `dod.*`-Werkzeuge ([`crate::profile::DOD_READ_TOOLS`], PL-97 D3;
     /// `agents/roles/security-egress-triage/security-egress-triage.toml`).
     pub const SECURITY_EGRESS_TRIAGE: &str = "security-egress-triage";
     /// Triagiert Baseline-Abweichungs-Befunde (`HostSample` gegen
     /// `Baseline`) der `BaselineDeviationRule`; ebenfalls parametergetrieben,
-    /// keine eigene Werkzeugoberfläche.
+    /// Werkzeuge nur die lesenden `dod.*`.
     pub const SECURITY_BASELINE_TRIAGE: &str = "security-baseline-triage";
     /// Triagiert Struktur-Abweichungs-Befunde (`StructureDrift`) der
-    /// `StructureDriftRule`; parametergetrieben, keine eigene
-    /// Werkzeugoberfläche.
+    /// `StructureDriftRule`; parametergetrieben, Werkzeuge nur die lesenden
+    /// `dod.*`.
     pub const SECURITY_STRUCTURE_TRIAGE: &str = "security-structure-triage";
     /// Bündelt die drei Ereignisarten ohne eigene verdichtende Regel
-    /// (`ProcessExec`, `FileWrite`, `AuthEvent`); parametergetrieben, keine
-    /// eigene Werkzeugoberfläche.
+    /// (`ProcessExec`, `FileWrite`, `AuthEvent`); parametergetrieben,
+    /// Werkzeuge nur die lesenden `dod.*`.
     pub const SECURITY_ENDPOINT_TRIAGE: &str = "security-endpoint-triage";
 
     /// Spieler-Sitz des Matrix-Games (Runde 3, Welle E): formuliert aus der
@@ -521,7 +522,8 @@ pub fn child_result_tools_for_role(role: &str) -> &'static [&'static str] {
 pub const SKILL_CATALOG_TOOLS: &[&str] = &["skills.search", "skills.load"];
 
 /// Die eingebauten Rollen **ohne** Skill-Katalog: die vier
-/// Security-Triage-Rollen (bewusst werkzeuglos, `admitted = []`) und die vier
+/// Security-Triage-Rollen (bewusst ohne Werkzeuge außer den lesenden
+/// [`DOD_READ_TOOLS`]) und die vier
 /// Matrix-Sitze (feste, exakt geprüfte Leseflächen; ihre Anweisungen kommen
 /// vom Matrix-Runner).
 pub const SKILL_CATALOG_EXCLUDED_ROLES: &[&str] = &[
@@ -813,6 +815,284 @@ pub fn matrix_tools_for_role(role: &str) -> &'static [&'static str] {
     } else {
         &[]
     }
+}
+
+// ── PL-97 D3: Harw-DoD-Werkzeuge ────────────────────────────────────────────
+
+/// The read-only Harw-DoD model tools (PL-97 D3, `harw-ops/src/dod.rs`):
+/// `dod.status`, `dod.findings`, `dod.sensors`.
+///
+/// # Why not part of a [`RegistryProfile`]
+/// They are `harw-ops` operations (`model_tool(readonly, approval =
+/// "none")`), not tools of a tool-provider crate. A root session serves
+/// them through its operation model-tool provider. Child registries do
+/// **not** serve them yet: `harw-runtime/src/children.rs` mounts no
+/// provider for [`dod_tools_for_role`] (open PL-97 D3 item, owner: runtime),
+/// so the triage roles admit them without seeing them, which fails closed.
+/// Each only reads the Harw-DoD
+/// export, the sentinel health report, the system config and `systemctl
+/// show`; none writes DoD state or reaches the Warden or the escalation
+/// ladder (invariant S1). They need no sandbox right
+/// ([`crate::authority::tool_permission`] is `None`, like `ps` and the
+/// `gateway.*` reads) and stand in [`crate::AUTO_APPROVED_TOOLS`].
+pub const DOD_READ_TOOLS: &[&str] = &["dod.status", "dod.findings", "dod.sensors"];
+
+/// The roles that admit the Harw-DoD tools: the four `security-*-triage`
+/// roles.
+const DOD_TRIAGE_ROLES: &[&str] = &[
+    role_names::SECURITY_EGRESS_TRIAGE,
+    role_names::SECURITY_BASELINE_TRIAGE,
+    role_names::SECURITY_STRUCTURE_TRIAGE,
+    role_names::SECURITY_ENDPOINT_TRIAGE,
+];
+
+/// Returns [`DOD_READ_TOOLS`] for the four `security-*-triage` roles,
+/// otherwise nothing.
+///
+/// The triage roles keep [`RegistryProfile::NoTools`] (no workspace, shell
+/// or network tool); the Harw-DoD tools are the only tools they admit.
+/// Admitted is not served: until `harw-runtime/src/children.rs` mounts the
+/// operations for these roles (open item, owner: runtime), a triage child
+/// registers none of them.
+///
+/// # Examples
+/// ```rust
+/// use harw_registry_defaults::profile::{dod_tools_for_role, role_names};
+///
+/// assert_eq!(
+///     dod_tools_for_role(role_names::SECURITY_EGRESS_TRIAGE),
+///     &["dod.status", "dod.findings", "dod.sensors"]
+/// );
+/// assert!(dod_tools_for_role(role_names::EXPLORER).is_empty());
+/// ```
+#[must_use]
+pub fn dod_tools_for_role(role: &str) -> &'static [&'static str] {
+    if DOD_TRIAGE_ROLES.contains(&role) {
+        DOD_READ_TOOLS
+    } else {
+        &[]
+    }
+}
+
+// ── PL-97 B2: Werkzeug-Index ────────────────────────────────────────────────
+
+/// The read-only model tool `tool.index` (PL-97 B2, PL-88,
+/// `harw-ops/src/tool_index_op.rs`): the tool families with their counts, or
+/// one line per tool of a family (class, linked skill, profiles, first
+/// sentence of the real description).
+///
+/// # Why not part of a [`RegistryProfile`]
+/// Like [`DOD_READ_TOOLS`] it is a `harw-ops` operation
+/// (`model_tool(readonly, approval = "none")`); a root session serves it
+/// through its operation model-tool provider, child registries do not. It
+/// reads only static data of this binary (catalog, profiles, tool specs,
+/// bundled skill manifests), needs no sandbox right
+/// ([`crate::authority::tool_permission`] is `None`, like `ps`) and stands in
+/// [`crate::AUTO_APPROVED_TOOLS`].
+pub const TOOL_INDEX_TOOLS: &[&str] = &["tool.index"];
+
+/// The tool → skill bindings `#[tool(skill = "...")]` of the concrete
+/// providers [`profile_tool_providers`] constructs, as `(tool, skill)` (PL-97
+/// B2, PL-95 S4).
+///
+/// # Why here
+/// `TOOL_SKILLS` (generated by `harw_tools::tool_provider!`, index-aligned
+/// with `TOOL_NAMES`) is an inherent const of the concrete provider type; it
+/// does not survive `Arc<dyn ToolProvider>`. This function therefore names
+/// the types where they are constructed.
+/// [`crate::tool_index::ToolSkillMap::bundled`] merges the bindings with the
+/// `tools = [...]` lists of the bundled skill manifests; a test checks that
+/// both sources agree. `FsToolProvider` and the agent-definition and
+/// skill-proposal providers are written by hand (no `tool_provider!`, hence
+/// no `TOOL_SKILLS`) and declare no skills. A drift test checks that every
+/// tool of [`known_tool_specs`] comes from a provider of
+/// [`provider_tool_tables`] or from one of these three, so a new
+/// `tool_provider!` provider cannot be left out of the table unnoticed.
+#[must_use]
+pub fn provider_tool_skills() -> Vec<(&'static str, &'static str)> {
+    provider_tool_tables()
+        .iter()
+        .flat_map(|(names, skills)| {
+            names
+                .iter()
+                .zip(skills.iter())
+                .filter_map(|(name, skill)| skill.map(|skill| (*name, skill)))
+        })
+        .collect()
+}
+
+/// `(TOOL_NAMES, TOOL_SKILLS)` of every `tool_provider!` provider that
+/// [`profile_tool_providers`] constructs (plus `JobToolProvider`, built by
+/// [`JobWiring::tool_provider`]), in construction order. The source of
+/// [`provider_tool_skills`]; the two tables of a row are index-aligned.
+#[must_use]
+pub fn provider_tool_tables() -> [(&'static [&'static str], &'static [Option<&'static str>]); 14] {
+    [
+        (DocToolProvider::TOOL_NAMES, DocToolProvider::TOOL_SKILLS),
+        (
+            ExplorerToolProvider::TOOL_NAMES,
+            ExplorerToolProvider::TOOL_SKILLS,
+        ),
+        (DepsToolProvider::TOOL_NAMES, DepsToolProvider::TOOL_SKILLS),
+        (LensToolProvider::TOOL_NAMES, LensToolProvider::TOOL_SKILLS),
+        (WebToolProvider::TOOL_NAMES, WebToolProvider::TOOL_SKILLS),
+        (
+            ShellToolProvider::TOOL_NAMES,
+            ShellToolProvider::TOOL_SKILLS,
+        ),
+        (
+            LatexToolProvider::TOOL_NAMES,
+            LatexToolProvider::TOOL_SKILLS,
+        ),
+        (
+            ProcessToolProvider::TOOL_NAMES,
+            ProcessToolProvider::TOOL_SKILLS,
+        ),
+        (
+            harw_tool_obsidian::ObsidianToolProvider::TOOL_NAMES,
+            harw_tool_obsidian::ObsidianToolProvider::TOOL_SKILLS,
+        ),
+        (
+            FsreadToolProvider::TOOL_NAMES,
+            FsreadToolProvider::TOOL_SKILLS,
+        ),
+        (
+            GitReadToolProvider::TOOL_NAMES,
+            GitReadToolProvider::TOOL_SKILLS,
+        ),
+        (SysToolProvider::TOOL_NAMES, SysToolProvider::TOOL_SKILLS),
+        (
+            CargoToolProvider::TOOL_NAMES,
+            CargoToolProvider::TOOL_SKILLS,
+        ),
+        (
+            harw_tool_job::JobToolProvider::TOOL_NAMES,
+            harw_tool_job::JobToolProvider::TOOL_SKILLS,
+        ),
+    ]
+}
+
+/// The real [`ToolSpec`]s of the tools the composition root adds beside the
+/// profile registries whose providers need no session state, one per name,
+/// sorted by name (PL-97 B2: summaries in `tool.index` and `harw tool`, the
+/// registry lint).
+///
+/// # Description
+/// Built once per process: `skills.search`/`skills.load` over the bundled
+/// skill index, the knowledge tools (`workbench.*`, `diary.read`,
+/// `palace.*`, `kanban.list`/`kanban.show`) over a detached
+/// [`harw_knowledge::KnowledgeStore`] and `memory.recall`/`memory.record`
+/// over unbound roots; plus the steward's author and decision tools
+/// (`agents.write_definition`, `agents.write_uia`, `agents.commit_proposal`,
+/// `agents.reject_proposal`, `skills.propose`, `skills.commit_proposal`,
+/// `skills.reject_proposal`), which the composition root enables through the
+/// definition access (commit mode with an author ceiling; here an empty
+/// ceiling without directories). Constructing these providers reads and
+/// writes nothing; only their specs are used. Not included are the root
+/// tools whose specs need runtime state (`job.*` needs a `JobManager`, which
+/// creates its state directory; the spawn, delegation, result, message and
+/// matrix tools of `harw-runtime`; `plan.*`/`ask_user`; `host.sudo_exec`;
+/// `container.*`; `browser.*`) and the operation model tools (`harw-ops`).
+#[must_use]
+pub fn root_tool_specs() -> &'static [ToolSpec] {
+    static SPECS: std::sync::OnceLock<Vec<ToolSpec>> = std::sync::OnceLock::new();
+    SPECS.get_or_init(|| {
+        let store = Arc::new(harw_knowledge::KnowledgeStore::new(std::path::Path::new(
+            "",
+        )));
+        // Leere Decke: nur damit die Provider ihre Autor- und
+        // Entscheidungswerkzeuge zeigen; es wird nichts ausgeführt.
+        let role = harw_agent_dsl::roles::AgentRoleId::AgentSteward;
+        let definition_ceiling = DefinitionAuthorCeiling {
+            role,
+            tools: std::collections::BTreeSet::new(),
+            permissions: PermissionSet::empty(),
+            max_depth: 0,
+            budget_tokens: 0,
+            effort_cap: None,
+        };
+        let skill_ceiling = SkillAuthorCeiling {
+            role,
+            tools: std::collections::BTreeSet::new(),
+            mcps: std::collections::BTreeSet::new(),
+        };
+        let providers: Vec<Arc<dyn ToolProvider>> = vec![
+            Arc::new(crate::SkillCatalogToolProvider::new(Arc::new(
+                harw_catalog::SkillIndex::build(&[]),
+            ))),
+            Arc::new(crate::WorkbenchToolProvider::new(Arc::clone(&store))),
+            Arc::new(crate::WorkbenchReadToolProvider::new(Arc::clone(&store))),
+            Arc::new(crate::DiaryToolProvider::new(
+                Arc::clone(&store),
+                harw_knowledge::AgentId::new("root"),
+            )),
+            Arc::new(crate::PalaceToolProvider::new(Arc::clone(&store))),
+            Arc::new(crate::KanbanReadToolProvider::new(store)),
+            Arc::new(crate::MemoryToolProvider::new(PathBuf::new(), None)),
+            Arc::new(
+                crate::agent_definition_tools::AgentDefinitionToolProvider::new(
+                    None,
+                    None,
+                    DefinitionWriteMode::Commit,
+                    Some(definition_ceiling),
+                ),
+            ),
+            Arc::new(SkillProposalToolProvider::new(
+                None,
+                DefinitionWriteMode::Commit,
+                Some(skill_ceiling),
+            )),
+        ];
+        let mut by_name: std::collections::BTreeMap<String, ToolSpec> =
+            std::collections::BTreeMap::new();
+        for spec in providers.iter().flat_map(|provider| provider.tools()) {
+            by_name.entry(spec.name().to_owned()).or_insert(spec);
+        }
+        by_name.into_values().collect()
+    })
+}
+
+/// The real [`ToolSpec`]s of every tool a [`RegistryProfile`] registers, one
+/// per name, sorted by name (PL-97 B2: `tool.index`, `harw tool`, the
+/// registry lint).
+///
+/// # Description
+/// Built once per process from the providers [`profile_tool_providers`]
+/// constructs for each profile, with neutral wiring: a strict sandbox, no
+/// host-permit or job wiring, the fail-closed definition access and a
+/// detached approval cell. Constructing a provider performs no I/O and runs
+/// nothing. Not included are tools the composition root adds outside the
+/// profiles: [`root_tool_specs`] has those whose providers need no session
+/// state (`skills.search`/`skills.load`, the knowledge and memory tools);
+/// `job.*`, the spawn and delegation tools and the operation model tools
+/// are in neither list.
+#[must_use]
+pub fn known_tool_specs() -> &'static [ToolSpec] {
+    static SPECS: std::sync::OnceLock<Vec<ToolSpec>> = std::sync::OnceLock::new();
+    SPECS.get_or_init(|| {
+        let approval_mode = ApprovalModeCell::default();
+        let mut by_name: std::collections::BTreeMap<String, ToolSpec> =
+            std::collections::BTreeMap::new();
+        for profile in RegistryProfile::ALL {
+            let access = AgentDefinitionAccess {
+                project_agents_dir: None,
+                profile_agents_dir: None,
+                mode: DefinitionWriteMode::ProposalOnly,
+                ceiling: None,
+            };
+            let providers = profile_tool_providers(
+                *profile,
+                access,
+                &SandboxProfile::Strict,
+                None,
+                &approval_mode,
+            );
+            for spec in providers.iter().flat_map(|provider| provider.tools()) {
+                by_name.entry(spec.name().to_owned()).or_insert(spec);
+            }
+        }
+        by_name.into_values().collect()
+    })
 }
 
 /// Die lesenden Wissenswerkzeuge (Plan Teil D), die die Composition-Root
@@ -1409,9 +1689,12 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 ///   `lens.ask` (siehe [`RegistryProfile::UiaLatexWriter`]).
 ///
 /// # Warum `NoTools` und nicht `ReadOnlyExplore` für die Triage-Rollen
-/// Die vier `security-*-triage`-Rollen (siehe [`role_names`]) haben
-/// `[tools].admitted = []`: sie bekommen bereits ausgewertete `Finding`-Batches
-/// als Parameter, statt selbst ein Werkzeug aufzurufen. `ReadOnlyExplore`
+/// Die vier `security-*-triage`-Rollen (siehe [`role_names`]) admittieren
+/// kein Profil-Werkzeug: sie bekommen bereits ausgewertete `Finding`-Batches
+/// als Parameter und admittieren nur die drei lesenden `dod.*`-Werkzeuge
+/// ([`dod_tools_for_role`], PL-97 D3) — zugelassen, aber noch von keiner
+/// Kind-Registry bereitgestellt (offener Punkt `children.rs`, Runtime).
+/// `ReadOnlyExplore`
 /// registriert trotzdem zehn Werkzeuge (`fs.*`, `deps.*`) und bewirbt sie im
 /// System-Prompt-Inventar — der Deckungstest
 /// (`harw-registry-defaults/tests/tool_admission_coverage.rs`,
@@ -1423,7 +1706,7 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 /// schon einmal gescheitert ist (siehe [`LENS_TOOLS`]), nur diesmal in die
 /// andere Richtung: mehr im Inventar, als die Rolle je aufrufen darf.
 /// `NoTools` registriert nichts und bewirbt nichts — Inventar und
-/// Aufrufrecht bleiben deckungsgleich leer.
+/// Aufrufrecht der Profil-Werkzeuge bleiben deckungsgleich leer.
 ///
 /// # Warum es kein `Default` gibt (R4, G-071)
 /// `RegistryProfile` hatte `#[derive(Default)]` mit `#[default] Full`. Damit
@@ -2160,9 +2443,12 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
             Some(RegistryProfile::ReadOnlyResearch)
         }
         role_names::PLANNER => Some(RegistryProfile::Planning),
-        // Die vier Triage-Rollen admittieren kein Werkzeug (`[tools].admitted
-        // = []`) — sie bekommen bereits ausgewertete Befund-Batches als
-        // Parameter. Siehe die Begründung bei `RegistryProfile::NoTools`.
+        // Die vier Triage-Rollen bekommen bereits ausgewertete Befund-Batches
+        // als Parameter; ihr Profil registriert nichts. Sie admittieren nur
+        // die lesenden `dod.*` (PL-97 D3, `dod_tools_for_role`); bereitgestellt
+        // werden diese erst, wenn `harw-runtime/src/children.rs` sie montiert
+        // (offener Punkt, Runtime). Siehe die Begründung bei
+        // `RegistryProfile::NoTools`.
         role_names::SECURITY_EGRESS_TRIAGE
         | role_names::SECURITY_BASELINE_TRIAGE
         | role_names::SECURITY_STRUCTURE_TRIAGE
@@ -3727,6 +4013,9 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_
     )
     .with_role(role_description.unwrap_or_else(|| profile.role_description().to_owned()))
     .with_project_root(project.project_root.display().to_string())
+    // PL-97 B2: `## Tool families` aus genau den beworbenen Werkzeugen
+    // (Familie und Anzahl, unabhängig von der Reihenfolge, cache-stabil).
+    .with_tool_families(crate::tool_index::families_of(&advertised_tools))
     .with_tools(advertised_tools)
     .with_extra_context(extra_context);
     // Das Regelwerk wird nur angehängt, wenn der Aufrufer eine organisatorische
@@ -4898,6 +5187,217 @@ mod tests {
             }
         }
         assert!(composition_tools_for_role("unbekannt").is_empty());
+    }
+
+    /// PL-97 D3: die Harw-DoD-Werkzeuge bekommen genau die vier
+    /// Triage-Rollen; kein Profil registriert sie selbst.
+    #[test]
+    fn test_dod_tools_are_offered_only_to_the_four_triage_roles() {
+        for role in role_names::ALL {
+            let expected: &[&str] = if DOD_TRIAGE_ROLES.contains(role) {
+                DOD_READ_TOOLS
+            } else {
+                &[]
+            };
+            assert_eq!(dod_tools_for_role(role), expected, "{role}");
+        }
+        assert_eq!(DOD_TRIAGE_ROLES.len(), 4);
+        for profile in RegistryProfile::ALL {
+            for tool in DOD_READ_TOOLS {
+                assert!(
+                    !profile.registered_tool_names().contains(tool),
+                    "{profile:?} darf {tool} nicht selbst registrieren"
+                );
+            }
+        }
+        assert!(dod_tools_for_role("unbekannt").is_empty());
+    }
+
+    /// PL-97 D3: jede Triage-Rolle admittiert genau die drei lesenden
+    /// `dod.*`-Werkzeuge und verbietet Schreiben, Exec und Netz weiterhin;
+    /// keine andere eingebaute Rolle admittiert eines davon.
+    #[test]
+    fn test_triage_roles_admit_exactly_the_dod_tools() -> TestResult {
+        let roles =
+            crate::embedded_agents::builtin_agent_definitions(&std::collections::HashMap::new())
+                .map_err(ctx("eingebaute Rollen lösen sich auf"))?;
+        for role in role_names::ALL {
+            let ir = roles
+                .get(*role)
+                .ok_or_else(|| TestError::Unexpected(format!("{role} fehlt")))?;
+            let admitted: Vec<&str> = ir
+                .tool_surface()
+                .admitted()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            if DOD_TRIAGE_ROLES.contains(role) {
+                assert_eq!(admitted, DOD_READ_TOOLS, "{role}");
+                let forbidden = ir.tool_surface().forbidden();
+                for tool in ["fs.write", "fs.edit", "shell.exec", "web.fetch"] {
+                    assert!(
+                        forbidden.iter().any(|name| name == tool),
+                        "{role} muss {tool} verbieten"
+                    );
+                }
+            } else {
+                for tool in DOD_READ_TOOLS {
+                    assert!(!admitted.contains(tool), "{role} admittiert {tool}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// PL-97 B2: die Identität trägt die Familien genau der beworbenen
+    /// Werkzeuge; `## Tool families` steht neben `## Available tools`, ist
+    /// über zwei Renderings byte-gleich und fehlt ohne Werkzeuge.
+    #[test]
+    fn test_identity_lists_the_tool_families_of_the_advertised_tools() -> TestResult {
+        let full = assemble(RegistryProfile::Full)?;
+        let identity = &full.identity;
+        assert_eq!(
+            identity.tool_families,
+            crate::tool_index::families_of(&identity.tools_available)
+        );
+        let prompt = identity.render_system_prompt();
+        assert!(prompt.contains("## Available tools\n1. "), "{prompt}");
+        assert!(prompt.contains("\n\n## Tool families\n"), "{prompt}");
+        for (family, count) in &identity.tool_families {
+            assert!(
+                prompt.contains(&format!("\n- {family} ({count})")),
+                "{family} ({count}) fehlt"
+            );
+        }
+        assert!(prompt.contains("`tool.index`"), "{prompt}");
+        assert_eq!(prompt, identity.render_system_prompt(), "cache-stabil");
+
+        let none = assemble(RegistryProfile::NoTools)?;
+        assert!(none.identity.tool_families.is_empty());
+        assert!(
+            !none
+                .identity
+                .render_system_prompt()
+                .contains("## Tool families")
+        );
+        Ok(())
+    }
+
+    /// PL-97 B2: die bekannten Spezifikationen decken jedes Werkzeug ab, das
+    /// irgendein Profil tatsächlich registriert, je Name genau einmal.
+    #[test]
+    fn test_known_tool_specs_cover_every_profile_registry() -> TestResult {
+        let known: Vec<&str> = known_tool_specs().iter().map(ToolSpec::name).collect();
+        let mut sorted = known.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(known, sorted, "sortiert und dublettenfrei");
+        for profile in RegistryProfile::ALL {
+            let assembled = assemble(*profile)?;
+            for name in registered_names(&assembled) {
+                assert!(
+                    known.contains(&name.as_str()),
+                    "{profile:?}: {name} fehlt in known_tool_specs"
+                );
+            }
+        }
+        assert!(known.contains(&"sys.ps") && known.contains(&"fs.write"));
+        Ok(())
+    }
+
+    /// PL-97 B2, Drift: jedes Werkzeug, das ein Profil registriert, stammt
+    /// aus einem Provider der Tabelle `provider_tool_tables` (deren
+    /// `TOOL_SKILLS` gelesen werden) oder aus einem der drei
+    /// handgeschriebenen Provider ohne `TOOL_SKILLS`. Ein neuer
+    /// `tool_provider!`-Provider in `profile_tool_providers`, der in der
+    /// Tabelle fehlt, ließe seine `#[tool(skill = ...)]`-Bindungen sonst
+    /// stillschweigend fallen.
+    #[test]
+    fn test_provider_tool_tables_cover_every_profile_tool() {
+        let tables = provider_tool_tables();
+        let mut covered: std::collections::BTreeSet<String> = tables
+            .iter()
+            .flat_map(|(names, _)| names.iter().map(|name| (*name).to_owned()))
+            .collect();
+        for (names, skills) in &tables {
+            assert_eq!(names.len(), skills.len(), "indexgleich: {names:?}");
+        }
+        let hand_written: [Arc<dyn ToolProvider>; 3] = [
+            Arc::new(FsToolProvider::default()),
+            Arc::new(
+                crate::agent_definition_tools::AgentDefinitionToolProvider::new(
+                    None,
+                    None,
+                    DefinitionWriteMode::ProposalOnly,
+                    None,
+                ),
+            ),
+            Arc::new(SkillProposalToolProvider::new(
+                None,
+                DefinitionWriteMode::ProposalOnly,
+                None,
+            )),
+        ];
+        let hand_written_names: Vec<String> = hand_written
+            .iter()
+            .flat_map(|provider| provider.tools())
+            .map(|spec| spec.name().to_owned())
+            .collect();
+        for name in &hand_written_names {
+            assert!(
+                !covered.contains(name),
+                "{name}: handgeschrieben und zugleich in der Tabelle"
+            );
+        }
+        covered.extend(hand_written_names);
+        for spec in known_tool_specs() {
+            assert!(
+                covered.contains(spec.name()),
+                "{} kommt aus einem Provider, der in provider_tool_tables fehlt",
+                spec.name()
+            );
+        }
+        // Die Bindungen sind genau die gesetzten Einträge der Tabelle.
+        let bound: usize = tables
+            .iter()
+            .map(|(_, skills)| skills.iter().filter(|skill| skill.is_some()).count())
+            .sum();
+        assert_eq!(provider_tool_skills().len(), bound);
+    }
+
+    /// PL-97 B2: die zustandslosen Wurzel-Provider liefern ihre echten
+    /// Spezifikationen, je Name genau einmal, ohne Profil-Werkzeuge.
+    #[test]
+    fn test_root_tool_specs_are_the_state_free_root_providers() {
+        let names: Vec<&str> = root_tool_specs().iter().map(ToolSpec::name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names, sorted, "sortiert und dublettenfrei");
+        for expected in [
+            "skills.search",
+            "skills.load",
+            "workbench.show",
+            "workbench.note",
+            "diary.read",
+            "palace.search",
+            "kanban.list",
+            "memory.recall",
+            "memory.record",
+            "agents.write_definition",
+            "agents.commit_proposal",
+            "skills.propose",
+            "skills.commit_proposal",
+        ] {
+            assert!(names.contains(&expected), "{expected} fehlt: {names:?}");
+        }
+        for spec in known_tool_specs() {
+            assert!(
+                !names.contains(&spec.name()),
+                "{} ist ein Profil-Werkzeug",
+                spec.name()
+            );
+        }
     }
 
     /// Runde 5, Teil B: `host.sudo_exec` bekommen ausschließlich die beiden

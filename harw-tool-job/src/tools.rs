@@ -929,7 +929,7 @@ impl JobToolExecutor {
             kind: None,
         };
         match manager
-            .start_with_origin(request, launch.job, launch.warnings, origin)
+            .start_launch_with_origin(request, launch, origin)
             .await
         {
             Ok(status) => {
