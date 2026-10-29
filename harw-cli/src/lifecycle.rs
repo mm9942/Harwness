@@ -1673,6 +1673,15 @@ mod tests {
             // (harw-ops/src/sandbox_lease.rs).
             "provider-concurrency",
             "sandbox-lease",
+            // PL-97 D3: die lesenden Harw-DoD-Werkzeuge (`harw-ops/src/dod.rs`,
+            // `model_tool(readonly, approval = "none")`), über
+            // `harw_ops::register_all` in jeder Zusammenstellung.
+            "dod.status",
+            "dod.findings",
+            "dod.sensors",
+            // PL-97 B2: der lesende Werkzeug-Index (`harw-ops/src/tool_index_op.rs`),
+            // ebenfalls über `harw_ops::register_all`.
+            "tool.index",
             // `work.result` (harw-ops/src/work_result.rs): liest das Ergebnis
             // eines eigenen, abgeschlossenen Jobs der gebundenen Workspace.
             "work.result",

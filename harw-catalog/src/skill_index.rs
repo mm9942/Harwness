@@ -278,7 +278,7 @@ impl SkillIndex {
             }
             match load_skill_runtime_snapshot(&dir, &manifest) {
                 Ok(snapshot) => {
-                    let spec = index.trigger_spec(&name, read_layer_triggers(&dir));
+                    let spec = index.trigger_spec(&name, read_skill_triggers(&dir));
                     index.entries.insert(
                         name,
                         SkillIndexEntry::new(snapshot, SkillSource::Layer(dir), spec),
@@ -661,10 +661,24 @@ pub(crate) fn score_entry(entry: &SkillIndexEntry, words: &[String]) -> u32 {
     score
 }
 
-/// Liest `triggers.toml` eines Skill-Verzeichnisses. `None`, wenn es fehlt.
-/// Größenprüfung vor dem Lesen; Symlink-/Traversal-Schutz über
-/// [`harw_config::load_skill_instructions`] wie bei `instructions_file`.
-fn read_layer_triggers(dir: &Path) -> Option<Result<String, String>> {
+/// Reads the `triggers.toml` of a skill directory exactly the way the index
+/// does while scanning a layer.
+///
+/// # Description
+/// Checks the metadata before reading: the file must be a regular file of at
+/// most [`MAX_TRIGGERS_FILE_BYTES`] bytes; the read itself goes through
+/// [`harw_config::load_skill_instructions`] (symlink and traversal guard, as
+/// for `instructions_file`). Shared with `/skills validate` so that the check
+/// and the index cannot report different things for the same directory.
+///
+/// # Returns
+/// - `None`: there is no `triggers.toml`.
+/// - `Some(Ok(text))`: the file content, to be checked with
+///   [`parse_triggers_file`](crate::parse_triggers_file).
+/// - `Some(Err(reason))`: the file is discarded; `reason` is the warning the
+///   index records (German, as in [`SkillIndex::warnings`]).
+#[must_use]
+pub fn read_skill_triggers(dir: &Path) -> Option<Result<String, String>> {
     let path = dir.join(TRIGGERS_FILE);
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,

@@ -1,8 +1,9 @@
 # `harw` command line
 
 This page describes the command tree of the `harw` program, the global
-flags and session flags, the behavior of `--json`, the `harw kill` process
-killer, and the mapping from older spellings to the current commands. The
+flags and session flags, the behavior of `--json`, the Harw-DoD commands
+(`harw dod`), the `harw kill` process killer, and the mapping from older
+spellings to the current commands. The
 exact grammar of your installed build is always available via `harw --help`
 and `harw <command> --help`.
 
@@ -44,6 +45,7 @@ Agents and knowledge
   jobs list [FILTER] | show ID | approve ID [--note TEXT]
        | deny ID [--reason TEXT] | cancel ID | retry ID
   cycle list [STATE [--limit N]] | status ID | stop ID [--reason TEXT]
+  tool list [FAMILY] | describe NAME            Tool index (same data as `tool.index`)
 
 Services
   gateway [install|start|stop|restart|enable|disable|status]
@@ -55,7 +57,12 @@ Services
 
 System
   init | onboard | doctor [--config-dir DIR] | update
-  install --print-systemd [UNIT]
+  dod status | doctor | sensors
+      | findings [-n N] [--severity S] [--rule ID] [--since 24h]
+      | config check [--config PATH] | config suggest
+      | enable | disable | restart                 (root only)
+      | warden status | warden enable | warden disable   (enable/disable root only)
+      | install --print-systemd [UNIT]
   uninstall [--scope …] [--dry-run] [--yes]
   completions [SHELL] [--install | --uninstall] [--dry-run]
   bug-report [--type …] [--title …] …
@@ -69,8 +76,9 @@ forward all following arguments unchanged, including ones with a leading
 hyphen. They correspond to the chat commands `/skills`, `/plugins`,
 `/memory` and `/context-proposal`.
 
-`install --print-systemd [UNIT]` prints the systemd system units that are
-embedded from `deploy/systemd/` (the single canonical source, see
+`dod install --print-systemd [UNIT]` (formerly `harw install
+--print-systemd`) prints the systemd system units that are embedded from
+`deploy/systemd/` (the single canonical source, see
 [DoD setup](setup/dod.md#systemd-units-and-the-deploy-tree)), rendered with the
 default paths of `dod/scripts/install.sh`. Without `UNIT` it prints every
 unit, each after a `# ---- deploy/systemd/<name> ----` header. It writes,
@@ -110,6 +118,105 @@ Optional fields in `providers/<name>.toml`: `request_timeout_secs`,
 `allow_insecure_lan`. Local providers have their own defaults. The overview
 and the startup commands for vLLM and LM Studio are in
 [setup/local-models.md](setup/local-models.md).
+
+## Skills (`harw skill`)
+
+`harw skill` shows the skill catalog, previews which skill sections a task
+would trigger, and checks a skill directory. `list`, `show` and `preview` run
+the same operation as the chat command `/skills` (`/skills list`,
+`/skills show NAME`, `/skills preview …`), so terminal and chat answer
+identically. With `--json`, `preview` and `validate` print their structured
+data; `list` and `show` print `{"text": "…"}` with the text output.
+
+| Action | Effect |
+| --- | --- |
+| `list` | The configured skills with status and description. |
+| `show NAME` | Description, declared tools and MCPs of one skill. |
+| `preview [TEXT…] [--tool NAME]… [--error TEXT]… [--path PATH]… [--command CMD]… [--budget BYTES]` | Without any model call: the skill sections the first round of a fresh session would inject (context section `skills.triggered`) for this input — each with skill, section, trigger kind and key, bytes and trust class — and every hit that was dropped, with its reason (`already_delivered`, `turn_budget`, `session_budget`). |
+| `validate DIR` | Reads `DIR/skill.toml` and `DIR/triggers.toml` the way the skill index does (same file, size and safe-read checks) and prints every error and every warning of the `triggers.toml` check verbatim (e.g. `triggers.keywords: 17 Einträge, nur die ersten 16 behalten`). A `DIR` that is a symlink or whose name starts with `.` is an error, because the index skips such skill directories. Needs no Harwness home. |
+
+The `preview` inputs stand for what the turn loop reads from a session's
+history:
+
+- `TEXT` — a user message (keywords and error codes),
+- `--tool` — the first use of a tool,
+- `--error` — tool output (error codes such as `E0505`),
+- `--path` — a path argument of an `fs.*`/`doc.*` call,
+- `--command` — a command line of a `shell.*`/`process.*`/`job.start` call.
+
+At least one input is required; the options are repeatable. The selection
+uses the same `[skills]` settings and the same selection code as the turn
+loop. The skill index is the session's own when one is available; otherwise
+it is built the same way the runtime builds it (the trusted config layers of
+the bound home, including the project settings directory, plus the bundled
+skills, each with its `triggers.toml`). The `Index:` line (JSON `index`) says
+which one was used, and also lists skills the index skipped and trigger
+warnings it recorded. A native build with an embedded bundle reads only that
+bundle, so its sessions can differ from a rebuilt index.
+
+The per-round budget is `[skills] per_turn_bytes` (or `--budget`, 256 to
+65536 bytes); the session cap is `[skills] per_session_bytes`, at most four
+per-round budgets. The preview assumes an unknown model window, for which the
+per-round cap applies unchanged. A session uses about 3 % of its window
+(4 bytes per token), capped at the same value, so it reaches the cap only
+from a window of about `per_turn_bytes / 0.12` tokens (about 34k tokens for
+the default 4096 bytes, about 546k for 65536) and selects less below that.
+The `Budget:` line (JSON `budget.full_cap_window_tokens`) gives the exact
+threshold. The preview also selects when `[skills] triggered_injection =
+false` and then says that a session would inject none of it.
+
+In the chat, `/skills preview "TEXT" --command "cargo test"` and
+`/skills validate DIR` (relative to the workspace root) do the same. Both are
+read-only and run immediately, even during a turn; they are not available
+over channels such as Telegram.
+
+Exit codes: `0` success, `1` failure (the operation fails, `validate`
+reports an error or a warning, the directory cannot be resolved, or the
+output cannot be written), `2` usage error (no `preview` input, a `--budget`
+out of range).
+
+```bash
+# Which skill sections would a failing test pull in?
+harw skill preview "cargo test fails with E0505 in src/lib.rs" --command "cargo test"
+
+# Check a skill directory before bundling it
+harw skill validate harw-tool-sys/skills/sys-tools
+```
+
+## Tools (`harw tool`)
+
+`harw tool` shows the tool index of this build: the same data the model gets
+from the read-only model tool `tool.index`. It reads only data built into the
+`harw` binary (the capability catalog, the registry profiles, the real tool
+descriptions and the bundled skill manifests), needs no configuration and no
+Harwness home, and writes nothing. It lists every tool the build knows, not
+only the tools a particular session or role may call.
+
+| Action | Effect |
+| --- | --- |
+| `list` | The tool families with their tool counts. A family is the name prefix before the first `.` (`fs`, `git`, `dod`, …); names without a `.` belong to `core`. |
+| `list FAMILY` | One line per tool of the family: name, capability class, the first sentence of its description, the skill that explains it (`skill: …`) and the profiles that register it (or `always available`). |
+| `describe NAME` | One tool: family, provider and crate, capability class, profiles, linked skill, how the default approval policy treats a call, the full description and every parameter with type, whether it is required, and its description. |
+
+The linked skill comes from the bundled skill manifests (a skill whose
+`skill.toml` is the only one to list the tool in `tools = [...]`) and from
+`#[tool(skill = "...")]` bindings of the tool providers; a tool that several
+skills list has no link. With `--json`, `list` prints the families (or the
+tools of the family) and `describe` the entry, the description, the parameter
+list and the parameter schema.
+
+Exit codes: `0` success, `1` unknown family or unknown tool (the message lists
+the known families), `2` usage error.
+
+```bash
+# Which read-only Harw-DoD tools are there, and what do they take?
+harw tool list dod
+harw tool describe dod.findings --json
+```
+
+The system prompt of every session with tools carries a matching
+`## Tool families` block (each family of the session's own tools with its
+count) and points the model at `tool.index` for details.
 
 ## Global flags
 
@@ -175,11 +282,63 @@ error.
 - **Operations** (`harw jobs …`, `harw cycle …`, `harw agent skills|plugins`,
   `harw knowledge memory|proposals`) return their structured data where
   available, otherwise `{"text": "…"}` with the text output.
+- **`harw dod …`** prints one object per action (the same structure as the
+  `/dod` command and the `dod.*` model tools; service actions report the
+  `systemctl` steps they ran).
+- **`harw tool …`** prints the same structure as the `tool.index` model tool
+  (`describe` adds the description, the parameters and their schema).
 
 Commands without a JSON form — such as interactive dialogs like
 `harw agent uia-new`, `harw knowledge index` or `harw provider …` — abort
 with `--json` with the message `` `<command>` does not support --json ``
 instead of ignoring the flag. The exit status is then non-zero.
+
+## Harw-DoD (`harw dod`)
+
+`harw dod` reads and controls the Harw-DoD suite (Detect · Orient · Defend,
+see [DoD setup](setup/dod.md)). The read-only actions work as any user and
+on hosts without the suite (they report "not installed"); everything goes
+through the read-only client `harw-dod-client`, so the CLI, the `/dod` chat
+command and the model tools `dod.status`, `dod.findings` and `dod.sensors`
+agree.
+
+| Action | Effect |
+| --- | --- |
+| `status` | Install state, system config and active profile, the six units, Warden state, sentinel health and the high/critical finding counts of the `[dod] findings_window_hours` window. Counts are prefixed `≥` and marked "partial" when older export data was not read (`lower_bound: true` in `--json`). |
+| `doctor` | Read-only prerequisites: cgroup v2, kernel BTF, tracefs, Landlock, `systemctl`/`systemd-sysusers`/`systemd-tmpfiles`, the daemons, the unit files, the config and both exports. Exit 1 when a prerequisite is missing. The build toolchain checks stay with `make -C dod doctor`. |
+| `findings [-n N] [--severity S] [--rule ID] [--since SPAN]` | The newest findings of the bounded export tail (default 50, at most 200), at or above severity `S`, of one rule, observed within `SPAN` (`90m`, `24h`, `7d`). |
+| `sensors` | The sentinel health report (`health.json`): per-sensor state, readings, errors, last success, IPC counters; flagged stale after 2 minutes without an update. |
+| `config check [--config PATH]` | Validates `/etc/harw-dod/config.toml` (or `PATH`) exactly like the daemons do (no symlinks, root-owned, not group/world-writable). Exit 0 only for a valid config that selects an `active_profile`. |
+| `config suggest` | Prints a profile template for harw's job cgroups; the delegated cgroup root is filled in by PL-97 E3. |
+| `enable` | Root only. Checks the config, then `systemctl daemon-reload` and `systemctl enable --now harw-dod.target` (`make -C dod enable`). The Warden stays disabled. |
+| `disable` | Root only. `systemctl disable --now harw-dod.target harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service`, then disables `harw-warden.socket` and `harw-warden.service` (errors there are ignored), like `make -C dod disable`. |
+| `restart` | Root only. Checks the config, `systemctl daemon-reload`, `systemctl restart harw-dod.target`. |
+| `warden status` | Warden state, guard file and socket unit. |
+| `warden enable` | Root only. Creates `/etc/harw-dod` (mode `0750`, only when missing) and the guard file `/etc/harw-dod/warden.enable`, then `systemctl daemon-reload` and `systemctl enable --now harw-warden.socket` (`make -C dod enable-warden`). `kill_requires_human` stays true. |
+| `warden disable` | Root only. `systemctl disable --now harw-warden.socket harw-warden.service`, then removes the guard file. |
+| `install --print-systemd [UNIT]` | Prints the embedded units (see above). |
+
+The service actions only call `systemctl` and write (or remove) the one
+guard file; they never run `cargo` or `make`, and harw never talks to the
+Warden or the escalation binaries. Membership in `harw-dod-readers` (needed
+to read the exports as a regular user) is still granted by hand, see
+[DoD setup](setup/dod.md).
+
+Only the system export `/var/lib/harw-dod/export` (`source: system`),
+which only the sentinel writes, is verified. Findings and sensor health
+from the harw home fallback (`<home>/dod/export`, used only when the system
+export directory does not exist) or from a configured `[dod] export_dir`
+are labelled `UNVERIFIED` with the source and its hint in the text output
+of `status`, `findings` and `sensors`, and carry `"verified": false`,
+`"source"` and `"hint"` in `--json` (the same as `/dod` and the `dod.*`
+model tools); they are not Harw-DoD facts, and `doctor` reports these
+exports as `WARN`. A system export that exists but cannot be read is
+reported as unreadable with the hint to add the user to `harw-dod-readers`;
+it is never replaced by the home fallback.
+
+Exit codes: `0` success, `1` failure (a `systemctl` step failed, a
+prerequisite is missing, an export is unreadable), `2` usage error, `3`
+refused (not root, or no valid `active_profile` for `enable`/`restart`).
 
 ## `harw kill`
 
@@ -255,6 +414,7 @@ permanently.
 | `harw uia new` | `harw agent uia-new` |
 | `harw run TEXT…` | `harw debug echo TEXT…` |
 | `harw classify TEXT…` | `harw debug classify TEXT…` |
+| `harw install --print-systemd [UNIT]` | `harw dod install --print-systemd [UNIT]` |
 | `harw analyze --bottom-up` / `--top-down` | `harw analyze --order bottom-up` / `--order top-down` |
 | `/skills`, `/plugins` (chat only) | `harw agent skills …`, `harw agent plugins …` |
 | `/memory`, `/context-proposal` (chat only) | `harw knowledge memory …`, `harw knowledge proposals …` |

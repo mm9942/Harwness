@@ -18,6 +18,25 @@
 //! `<profil>/skills/<name>/`; einem Agenten zugewiesen wird der Skill dadurch
 //! nicht.
 //!
+//! `preview <aufgabentext> [--tool NAME] [--error TEXT] [--path PFAD]
+//! [--command BEFEHL] [--budget BYTES]` (PL-97 B3) zeigt **ohne
+//! Modellaufruf**, welche Skill-Abschnitte die erste Runde einer frischen
+//! Sitzung getriggert einspielen würde — samt verworfener Treffer mit
+//! typisiertem Grund. Gewählt wird über denselben Weg wie im Turn-Loop
+//! ([`harw_core::SkillInjector::preview`]): Einstellungen aus `[skills]`
+//! ([`harw_core::SkillInjectionSettings::from_config`]) und ein
+//! [`harw_catalog::SkillIndex`] samt `TriggerIndex`: der injizierte
+//! `Arc<SkillIndex>` der Sitzung, sonst derselbe Bau wie in der
+//! Laufzeit-Montage über die vertrauten Layer; welcher, nennt die Ausgabe
+//! (`Index: …`, JSON `index.source`), ebenso die vom Index übersprungenen
+//! Skills und verworfenen Trigger. `validate <verzeichnis>` prüft
+//! `skill.toml` und `triggers.toml` eines Skill-Verzeichnisses so, wie der
+//! Index sie liest ([`validate_skill_dir`], `triggers.toml` über
+//! [`harw_catalog::read_skill_triggers`]), und meldet jede Warnung von
+//! [`harw_catalog::parse_triggers_file`] wörtlich. Beide sind rein lesend und
+//! laufen auch während eines Turns sofort; `harw skill preview|validate`
+//! nutzt dieselben Wege.
+//!
 //! # Root-Space
 //! Ohne injizierten Dienst lesen und schreiben `activate`/`deactivate` und die
 //! Vorschlags-Aktionen ausschließlich im an die Sitzung gebundenen Root-Space
@@ -34,7 +53,10 @@
 //!
 //! # Schlüsseltypen
 //! - [`SkillsArgs`] — typisierte Felder für Action (`list` | `activate` |
-//!   `deactivate` | `show`) und optionalen Skill-Namen (`target`).
+//!   `deactivate` | `show` | `preview` | `validate` | …), optionalen
+//!   Skill-Namen (`target`) und die ungekürzten Folge-Token (`rest`).
+//! - [`PreviewArgs`] — die geparsten Optionen von `preview`.
+//! - [`SkillDirReport`] — Ergebnis von [`validate_skill_dir`].
 //! - [`SkillsOperation`] — generiertes Unit-Struct (via `#[operation]`-Makro)
 //! - [`SkillStatePersistence`] — austauschbarer Dienst für das Umschalten
 //!   des `enabled`-Felds; per `Arc<dyn SkillStatePersistence>` in der
@@ -72,18 +94,27 @@
 //! assert_eq!(op.meta().name, "skills");
 //! ```
 
+use harw_catalog::{DropReason, SkillIndex, SkillTriggerSpec, TRIGGERS_FILE};
 use harw_config::{ResolvedConfig, SkillToml};
+use harw_core::skill_injection::{
+    RoundInjection, SkillInjectionSettings, SkillInjector, SkillPreview, SkillPreviewInput,
+};
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
 use harw_registry_defaults::skill_proposal_tools::{
     CommitAuthority, LoadedSkillProposal, SkillProposalError, SkillProposalListing,
     SkillProposalStore,
 };
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Dateiname des Skill-Manifests innerhalb eines Skill-Verzeichnisses.
 const SKILL_MANIFEST: &str = "skill.toml";
+
+/// Größte `skill.toml`, die `validate` liest (wie der Deckel der
+/// `triggers.toml`); schützt vor Geräte- und Riesendateien.
+const MAX_SKILL_MANIFEST_BYTES: usize = 64 * 1024;
 
 // ── Args ──────────────────────────────────────────────────────────────────────
 
@@ -91,9 +122,12 @@ const SKILL_MANIFEST: &str = "skill.toml";
 ///
 /// # Beschreibung
 /// Trägt das Sub-Kommando (`action`) und einen optionalen Skill-Namen (`target`).
-/// Die Felder werden durch das [`harw_macros::FromRawArgs`]-Derive direkt aus
-/// den tokenisierten TUI-Rohargumenten befüllt — jedes Feld erhält genau das
-/// Token an der entsprechenden Position (0-basiert).
+/// Die Felder werden von [`harw_operations::FromRawArgs`] direkt aus den
+/// tokenisierten TUI-Rohargumenten befüllt — `action`/`target`/`value`
+/// erhalten genau das Token an der entsprechenden Position (0-basiert), wie
+/// es das Derive mit `first`/`nth` täte; `rest` erhält alle Token hinter dem
+/// Sub-Kommando unverbunden, weil `preview` Optionswerte mit Leerzeichen
+/// trägt (`--command "cargo test"`).
 ///
 /// - `None` oder `action = Some("list")` → Skills auflisten (Standard-Verhalten).
 /// - `action = Some("show")` mit `target` → Details eines Skills.
@@ -103,14 +137,23 @@ const SKILL_MANIFEST: &str = "skill.toml";
 /// - `action = Some("review")`/`Some("accept")` mit `target` (Vorschlags-ID) →
 ///   Vorschlag ansehen bzw. übernehmen; `Some("reject")` mit `target` und
 ///   optionalem Grund in `value` → verwerfen.
+/// - `action = Some("preview")` mit `rest` → Trigger-Vorschau ([`PreviewArgs`]).
+/// - `action = Some("validate")` mit `rest` (genau ein Verzeichnis) →
+///   Skill-Verzeichnis prüfen ([`validate_skill_dir`]).
+///
+/// `preview` und `validate` lesen `rest`; ein JSON-Aufruf ohne `rest` gilt
+/// als `rest = [target, value]` (soweit gesetzt).
 ///
 /// # Felder
 /// - `action` (`Option<String>`): Token 0 — Sub-Kommando: `"list"` (Standard),
 ///   `"activate"`, `"deactivate"`, `"show"`. `None` wird wie `"list"` behandelt.
 /// - `target` (`Option<String>`): Token 1 — Skill-Name. Pflicht für `activate`,
-///   `deactivate` und `show`; bei `list` ignoriert.
+///   `deactivate` und `show`; bei `list` ignoriert; bei `validate` das
+///   Skill-Verzeichnis.
 /// - `value` (`Option<String>`): Token 2 — dritter Parameter (reserviert für
 ///   zukünftige Erweiterungen; aktuell ungenutzt).
+/// - `rest` (`Vec<String>`): Token 1 bis Ende, unverbunden — die Optionen und
+///   der Aufgabentext von `preview`.
 ///
 /// # Deserialisierung
 /// Das `#[operation]`-Makro deserialisiert `input.json_args` via `serde_json`
@@ -133,23 +176,41 @@ const SKILL_MANIFEST: &str = "skill.toml";
 /// let args = SkillsArgs::from_raw_args(&["activate".to_owned(), "my-skill".to_owned()]).unwrap();
 /// assert_eq!(args.action.as_deref(), Some("activate"));
 /// assert_eq!(args.target.as_deref(), Some("my-skill"));
+/// assert_eq!(args.rest, vec!["my-skill".to_owned()]);
 /// ```
-#[derive(Default, serde::Deserialize, harw_macros::FromRawArgs)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct SkillsArgs {
     /// Sub-Kommando: `"list"` (Standard), `"activate"`, `"deactivate"`, `"show"`. Token 0.
     ///
     /// `None` wird wie `"list"` behandelt.
     #[serde(default)]
-    #[raw(first)]
     pub action: Option<String>,
     /// Skill-Name (z. B. `"my-skill"`). Token 1. `None` wenn nicht angegeben.
     #[serde(default)]
-    #[raw(nth = 1)]
     pub target: Option<String>,
     /// Dritter Parameter (reserviert). Token 2. `None` wenn nicht angegeben.
     #[serde(default)]
-    #[raw(nth = 2)]
     pub value: Option<String>,
+    /// Alle Token hinter dem Sub-Kommando, unverbunden (Token 1 bis Ende).
+    #[serde(default)]
+    pub rest: Vec<String>,
+}
+
+impl harw_operations::FromRawArgs for SkillsArgs {
+    /// Verteilt die Token wie das Derive (`first`, `nth = 1`, `nth = 2`) und
+    /// behält zusätzlich alle Token hinter dem Sub-Kommando in `rest`.
+    ///
+    /// # Fehler
+    /// Nie; jede Token-Folge ist syntaktisch gültig, die Aktion prüft ihre
+    /// Argumente selbst.
+    fn from_raw_args(tokens: &[String]) -> Result<Self, OpError> {
+        Ok(Self {
+            action: harw_operations::args::first_optional(tokens),
+            target: harw_operations::args::nth_optional(tokens, 1),
+            value: harw_operations::args::nth_optional(tokens, 2),
+            rest: tokens.get(1..).map(<[String]>::to_vec).unwrap_or_default(),
+        })
+    }
 }
 
 // ── Persistenz ────────────────────────────────────────────────────────────────
@@ -636,6 +697,770 @@ fn run_proposal_action(
     }
 }
 
+// ── Vorschau und Prüfung (PL-97 B3) ───────────────────────────────────────────
+
+/// Modellfenster der Vorschau in Token: `0` = unbekannt, dann gilt der
+/// Pro-Runde-Deckel (`[skills] per_turn_bytes` bzw. `--budget`) unverändert.
+/// Im Turn-Loop sind es ~3 % des Fensters (4 Bytes je Token), gedeckelt:
+/// denselben Wert ergibt erst ein Fenster ab Deckel / 0,12 Token (rund
+/// 34 000 Token beim Standarddeckel von 4096 Bytes, rund 546 000 bei 65 536);
+/// kleinere Fenster wählen knapper. Die genaue Schwelle nennt die Ausgabe
+/// ([`full_cap_window_tokens`]).
+const PREVIEW_WINDOW_TOKENS: u64 = 0;
+
+/// Turn-Kennung der `injection`-Ereignisse, in deren Form die Vorschau ihre
+/// Lieferungen zeigt (sie wird nie gespeichert).
+const PREVIEW_TURN_ID: &str = "preview";
+
+/// Aufrufform von `/skills preview` für Fehlermeldungen.
+const PREVIEW_USAGE: &str = "usage: /skills preview [--tool NAME] [--error TEXT] [--path PATH] \
+     [--command COMMAND] [--budget BYTES] [--] <task text>";
+
+/// Die geparsten Argumente von `/skills preview`.
+///
+/// # Felder
+/// - `input`: die Trigger-Eingaben (Aufgabentext, `--tool`, `--error`,
+///   `--path`, `--command`).
+/// - `budget`: `--budget`, der Pro-Runde-Deckel in Bytes statt
+///   `[skills] per_turn_bytes`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreviewArgs {
+    /// Die Trigger-Eingaben.
+    pub input: SkillPreviewInput,
+    /// `--budget`: Pro-Runde-Deckel in Bytes.
+    pub budget: Option<usize>,
+}
+
+impl PreviewArgs {
+    /// Parst die Token hinter `preview`.
+    ///
+    /// # Beschreibung
+    /// `--tool`, `--error`, `--path` und `--command` sind wiederholbar und
+    /// nehmen genau das folgende Token (oder `--option=wert`); `--budget`
+    /// nimmt eine Byte-Zahl im erlaubten Bereich von `[skills]
+    /// per_turn_bytes`. Alle übrigen Token — und alles nach `--` — bilden,
+    /// mit Leerzeichen verbunden, den Aufgabentext.
+    ///
+    /// # Fehler
+    /// [`OpError::InvalidArguments`] bei einer unbekannten Option, einer
+    /// Option ohne Wert, einem ungültigen Budget oder ganz ohne Eingabe.
+    pub fn parse(tokens: &[String]) -> Result<Self, OpError> {
+        let mut args = Self::default();
+        let mut task: Vec<&str> = Vec::new();
+        let mut options_done = false;
+        let mut tokens = tokens.iter();
+        while let Some(token) = tokens.next() {
+            if options_done || !token.starts_with("--") {
+                task.push(token.as_str());
+                continue;
+            }
+            if token == "--" {
+                options_done = true;
+                continue;
+            }
+            let (option, inline) = match token.split_once('=') {
+                Some((option, value)) => (option, Some(value.to_owned())),
+                None => (token.as_str(), None),
+            };
+            if !matches!(
+                option,
+                "--tool" | "--error" | "--path" | "--command" | "--budget"
+            ) {
+                return Err(OpError::InvalidArguments(format!(
+                    "unknown option '{option}' for /skills preview; {PREVIEW_USAGE}"
+                )));
+            }
+            let value = match inline {
+                Some(value) => value,
+                None => tokens.next().cloned().ok_or_else(|| {
+                    OpError::InvalidArguments(format!(
+                        "option '{option}' requires a value; {PREVIEW_USAGE}"
+                    ))
+                })?,
+            };
+            match option {
+                "--tool" => args.input.tools.push(value),
+                "--error" => args.input.tool_output.push(value),
+                "--path" => args.input.paths.push(value),
+                "--command" => args.input.commands.push(value),
+                _ => args.budget = Some(parse_preview_budget(&value)?),
+            }
+        }
+        args.input.task = task.join(" ");
+        if args.input.is_empty() {
+            return Err(OpError::InvalidArguments(format!(
+                "/skills preview needs task text or at least one of --tool, --error, --path, \
+                 --command; {PREVIEW_USAGE}"
+            )));
+        }
+        Ok(args)
+    }
+}
+
+/// Das kleinste Modellfenster in Token, für das eine Sitzung denselben
+/// Pro-Runde-Deckel wählt wie die Vorschau (die ein unbekanntes Fenster
+/// annimmt, [`PREVIEW_WINDOW_TOKENS`]).
+///
+/// # Beschreibung
+/// Sucht binär über [`SkillInjectionSettings::per_turn_bytes`] — dieselbe
+/// Ableitung wie im Turn-Loop, ohne ihren Anteil hier zu wiederholen; sie
+/// wächst monoton mit dem Fenster.
+fn full_cap_window_tokens(settings: &SkillInjectionSettings) -> u64 {
+    let cap = settings.per_turn_cap_bytes;
+    let (mut low, mut high) = (1_u64, u64::MAX / 8);
+    if settings.per_turn_bytes(high) < cap {
+        return high;
+    }
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if settings.per_turn_bytes(middle) >= cap {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
+}
+
+/// Die Folge-Token einer Aktion: `rest` aus den Rohargumenten, für einen
+/// JSON-Aufruf ohne `rest` ersatzweise `target` und `value`.
+fn action_tokens(args: &SkillsArgs) -> Vec<String> {
+    if !args.rest.is_empty() {
+        return args.rest.clone();
+    }
+    args.target.iter().chain(&args.value).cloned().collect()
+}
+
+/// Prüft `--budget` gegen den erlaubten Bereich von `[skills] per_turn_bytes`.
+fn parse_preview_budget(value: &str) -> Result<usize, OpError> {
+    let (min, max) = harw_config::skills_toml::SKILLS_PER_TURN_BYTES_RANGE;
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|bytes| (min..=max).contains(bytes))
+        .ok_or_else(|| {
+            OpError::InvalidArguments(format!(
+                "--budget must be a byte count between {min} and {max}, got '{value}'"
+            ))
+        })
+}
+
+/// Woher der Index einer Vorschau stammt (Text `Index: …`, JSON `index`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreviewIndexSource {
+    /// Der injizierte `Arc<SkillIndex>` der Sitzung.
+    Session,
+    /// Neu gebaut über diese Layer (aufsteigende Präzedenz) samt
+    /// eingebettetem Bündel.
+    Layers(Vec<PathBuf>),
+}
+
+impl PreviewIndexSource {
+    /// Eine Zeile für die Textausgabe.
+    fn render(&self) -> String {
+        match self {
+            Self::Session => "Index: Skill-Index der Sitzung".to_owned(),
+            Self::Layers(layers) => format!(
+                "Index: neu gebaut wie in der Laufzeit-Montage aus {} vertrauten Layer(n) des \
+                 gebundenen Root-Space samt eingebettetem Bündel (ein eingebetteter Lauf liest \
+                 nur das Bündel seines Artefakts)",
+                layers.len()
+            ),
+        }
+    }
+
+    /// JSON-Form (`index` der Vorschau).
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Session => serde_json::json!({ "source": "session" }),
+            Self::Layers(layers) => serde_json::json!({
+                "source": "layers",
+                "layers": layers
+                    .iter()
+                    .map(|layer| layer.display().to_string())
+                    .collect::<Vec<_>>(),
+            }),
+        }
+    }
+}
+
+/// Die vertrauten Layer des gebundenen Root-Space in derselben Folge wie
+/// `ConfigTrustReport::layers` der Laufzeit (`harw_runtime::config`):
+/// Root, Profil, vertrauter Repo-Layer und danach das
+/// Projekt-Einstellungsverzeichnis, sobald es `settings.toml` oder
+/// `config.toml` enthält.
+///
+/// # Fehler
+/// Wie [`crate::config_util::bound_config_layers`].
+fn preview_index_layers(
+    home: &harw_home::ResolvedHomeContext,
+) -> Result<Vec<PathBuf>, harw_home::HomeError> {
+    let mut layers = crate::config_util::bound_config_layers(home)?;
+    if let Some(settings_dir) = home.project_settings_path.parent()
+        && (home.project_settings_path.is_file() || settings_dir.join("config.toml").is_file())
+    {
+        layers.push(settings_dir.to_path_buf());
+    }
+    Ok(layers)
+}
+
+/// Der Skill-Index der Vorschau: ein injizierter `Arc<SkillIndex>` (der Index
+/// der laufenden Montage), sonst derselbe Bau wie in der Laufzeit-Montage —
+/// [`SkillIndex::build`] über die vertrauten Layer des gebundenen Root-Space
+/// ([`preview_index_layers`]), eingebettete Skills als Rückfall, der
+/// `TriggerIndex` einmal mit ihm.
+///
+/// # Fehler
+/// - [`OpError::NotAvailable`]: kein Index injiziert und kein Root-Space
+///   gebunden (kein Rückfall auf `HARW_HOME`).
+/// - [`OpError::Execution`]: Layer des gebundenen Root-Space nicht auflösbar.
+fn preview_skill_index(ctx: &OpContext) -> Result<(Arc<SkillIndex>, PreviewIndexSource), OpError> {
+    if let Some(index) = ctx.service::<Arc<SkillIndex>>() {
+        return Ok((Arc::clone(index), PreviewIndexSource::Session));
+    }
+    let home = crate::config_util::bound_home(ctx)?;
+    let layers = preview_index_layers(home)
+        .map_err(|error| OpError::Execution(format!("Config-Layer nicht auflösbar: {error}")))?;
+    let index = Arc::new(SkillIndex::build(&layers));
+    Ok((index, PreviewIndexSource::Layers(layers)))
+}
+
+/// Führt `/skills preview …` aus: dieselben Einstellungen, derselbe Index und
+/// derselbe Auswahlweg wie die erste Runde einer Sitzung, ohne Modellaufruf.
+///
+/// # Fehler
+/// Wie [`PreviewArgs::parse`] und [`preview_skill_index`].
+fn run_preview(
+    ctx: &OpContext,
+    config: &ResolvedConfig,
+    args: &SkillsArgs,
+) -> Result<OpOutput, OpError> {
+    let preview_args = PreviewArgs::parse(&action_tokens(args))?;
+    let mut settings = SkillInjectionSettings::from_config(&config.harness.skills);
+    if let Some(budget) = preview_args.budget {
+        settings.per_turn_cap_bytes = budget;
+    }
+    let (index, source) = preview_skill_index(ctx)?;
+    let preview = SkillInjector::new(Arc::clone(&index), settings)
+        .preview(&preview_args.input, PREVIEW_WINDOW_TOKENS);
+    let frame = PreviewFrame {
+        input: &preview_args.input,
+        source: &source,
+        index: &index,
+        full_cap_window_tokens: full_cap_window_tokens(&settings),
+    };
+    Ok(OpOutput {
+        text: render_preview(&frame, &preview),
+        data: Some(preview_json(&frame, &preview)),
+    })
+}
+
+/// Was eine Vorschau neben der Auswahl selbst zeigt.
+struct PreviewFrame<'a> {
+    /// Die Trigger-Eingaben.
+    input: &'a SkillPreviewInput,
+    /// Woher der Index stammt.
+    source: &'a PreviewIndexSource,
+    /// Der Index (für übersprungene Skills und Trigger-Warnungen).
+    index: &'a SkillIndex,
+    /// Ab welchem Modellfenster eine Sitzung denselben Deckel wählt.
+    full_cap_window_tokens: u64,
+}
+
+/// Stabiler Schlüssel eines Verwerfungsgrunds (JSON, Klammer im Text).
+fn drop_reason_key(reason: DropReason) -> &'static str {
+    match reason {
+        DropReason::AlreadyDelivered => "already_delivered",
+        DropReason::TurnBudget => "turn_budget",
+        DropReason::SessionBudget => "session_budget",
+    }
+}
+
+/// `skill` bzw. `skill § abschnitt`.
+fn excerpt_label(skill: &str, section: Option<&str>) -> String {
+    match section {
+        Some(section) => format!("{skill} § {section}"),
+        None => skill.to_owned(),
+    }
+}
+
+/// Die nicht leeren Eingaben als eine Zeile (zur Kontrolle der Quotierung).
+fn render_preview_input(input: &SkillPreviewInput) -> String {
+    let mut parts = Vec::new();
+    if !input.task.trim().is_empty() {
+        parts.push(format!("Text „{}“", first_line(input.task.trim(), 80)));
+    }
+    for (label, values) in [
+        ("--tool", &input.tools),
+        ("--error", &input.tool_output),
+        ("--path", &input.paths),
+        ("--command", &input.commands),
+    ] {
+        if !values.is_empty() {
+            let shown: Vec<String> = values.iter().map(|value| first_line(value, 80)).collect();
+            parts.push(format!("{label} {}", shown.join(", ")));
+        }
+    }
+    format!("Eingaben: {}", parts.join(" · "))
+}
+
+/// Rendert eine Vorschau für `/skills preview`.
+fn render_preview(frame: &PreviewFrame<'_>, preview: &SkillPreview) -> String {
+    let round = &preview.round;
+    let mut lines = vec![
+        "Skill-Vorschau (ohne Modellaufruf; erste Runde einer frischen Sitzung)".to_owned(),
+        render_preview_input(frame.input),
+        frame.source.render(),
+        format!(
+            "Budget: {} Bytes je Runde, {} Bytes je Sitzung (Modellfenster unbekannt: es gilt der \
+             Pro-Runde-Deckel; eine Sitzung wählt so erst ab {} Token Fenster, darunter knapper)",
+            preview.budget.per_turn_bytes,
+            preview.budget.per_session_bytes,
+            frame.full_cap_window_tokens
+        ),
+    ];
+    if !preview.enabled {
+        lines.push(
+            "Hinweis: [skills] triggered_injection = false — eine Sitzung spielt keinen dieser \
+             Auszüge ein."
+                .to_owned(),
+        );
+    }
+    if round.delivered.is_empty() && round.dropped.is_empty() && round.suppressed.is_empty() {
+        lines.push("Kein Skill getroffen.".to_owned());
+    } else {
+        render_preview_round(round, &mut lines);
+    }
+    render_index_notes(frame.index, &mut lines);
+    lines.join("\n")
+}
+
+/// Die Lieferungen, verworfenen Treffer und zurückgehaltenen Skills einer
+/// Vorschau-Runde.
+fn render_preview_round(round: &RoundInjection, lines: &mut Vec<String>) {
+    let bytes: usize = round
+        .delivered
+        .iter()
+        .map(|delivered| delivered.bytes)
+        .sum();
+    lines.push(format!(
+        "Eingespielt ({} Auszug/Auszüge, {bytes} Bytes):",
+        round.delivered.len()
+    ));
+    if round.delivered.is_empty() {
+        lines.push("- keiner".to_owned());
+    }
+    for delivered in &round.delivered {
+        // Dieselbe Form wie das `injection`-Ereignis der Sitzung.
+        let record = delivered.to_record(PREVIEW_TURN_ID);
+        lines.push(format!(
+            "- {} — {} {} · {} Bytes · {}",
+            excerpt_label(&record.skill, record.section.as_deref()),
+            record.trigger_kind,
+            record.trigger_key,
+            record.bytes,
+            record.trust
+        ));
+    }
+    if !round.dropped.is_empty() {
+        lines.push(format!("Verworfen ({}):", round.dropped.len()));
+        for dropped in &round.dropped {
+            lines.push(format!(
+                "- {} — {} ({})",
+                excerpt_label(&dropped.skill, dropped.section.as_deref()),
+                dropped.reason,
+                drop_reason_key(dropped.reason)
+            ));
+        }
+    }
+    if !round.suppressed.is_empty() {
+        lines.push(format!(
+            "Zurückgehalten (importiert, [skills] inject_imported = false): {}",
+            round.suppressed.join(", ")
+        ));
+    }
+}
+
+/// Was der Index beim Bau übersprungen bzw. an Triggern verworfen hat — der
+/// Grund, warum ein erwarteter Skill nicht getroffen wird. Nichts, wenn der
+/// Index sauber ist.
+fn render_index_notes(index: &SkillIndex, lines: &mut Vec<String>) {
+    let (skipped, warnings) = (index.skipped(), index.warnings());
+    if skipped.is_empty() && warnings.is_empty() {
+        return;
+    }
+    lines.push(format!(
+        "Index-Hinweise ({} Skill(s) übersprungen, {} Trigger-Warnung(en)):",
+        skipped.len(),
+        warnings.len()
+    ));
+    for skipped in skipped {
+        lines.push(format!(
+            "- übersprungen: {} — {}",
+            skipped.location, skipped.reason
+        ));
+    }
+    for warning in warnings {
+        lines.push(format!("- Warnung: {} — {}", warning.skill, warning.reason));
+    }
+}
+
+/// JSON-Form einer Vorschau (`harw skill preview --json`).
+fn preview_json(frame: &PreviewFrame<'_>, preview: &SkillPreview) -> serde_json::Value {
+    let round = &preview.round;
+    let input = frame.input;
+    let injections: Vec<serde_json::Value> = round
+        .delivered
+        .iter()
+        .map(|delivered| {
+            let record = delivered.to_record(PREVIEW_TURN_ID);
+            serde_json::json!({
+                "skill": record.skill,
+                "section": record.section,
+                "label": delivered.label,
+                "trigger_kind": record.trigger_kind,
+                "trigger_key": record.trigger_key,
+                "bytes": record.bytes,
+                "trust": record.trust,
+                "sha256": record.sha256,
+            })
+        })
+        .collect();
+    let dropped: Vec<serde_json::Value> = round
+        .dropped
+        .iter()
+        .map(|dropped| {
+            serde_json::json!({
+                "skill": dropped.skill,
+                "section": dropped.section,
+                "reason": drop_reason_key(dropped.reason),
+                "reason_text": dropped.reason.to_string(),
+            })
+        })
+        .collect();
+    let bytes: usize = round
+        .delivered
+        .iter()
+        .map(|delivered| delivered.bytes)
+        .sum();
+    let mut index = frame.source.to_json();
+    if let serde_json::Value::Object(fields) = &mut index {
+        fields.insert(
+            "skipped".to_owned(),
+            frame
+                .index
+                .skipped()
+                .iter()
+                .map(|skipped| {
+                    serde_json::json!({ "location": skipped.location, "reason": skipped.reason })
+                })
+                .collect(),
+        );
+        fields.insert(
+            "warnings".to_owned(),
+            frame
+                .index
+                .warnings()
+                .iter()
+                .map(|warning| serde_json::json!({ "skill": warning.skill, "reason": warning.reason }))
+                .collect(),
+        );
+    }
+    serde_json::json!({
+        "action": "preview",
+        "index": index,
+        "injection_enabled": preview.enabled,
+        "budget": {
+            "per_turn_bytes": preview.budget.per_turn_bytes,
+            "per_session_bytes": preview.budget.per_session_bytes,
+            "window_tokens": PREVIEW_WINDOW_TOKENS,
+            "full_cap_window_tokens": frame.full_cap_window_tokens,
+        },
+        "input": {
+            "task": input.task,
+            "tools": input.tools,
+            "errors": input.tool_output,
+            "paths": input.paths,
+            "commands": input.commands,
+        },
+        "injections": injections,
+        "dropped": dropped,
+        "suppressed": round.suppressed,
+        "bytes": bytes,
+    })
+}
+
+/// Ergebnis von [`validate_skill_dir`]: was der Skill-Index beim Lesen dieses
+/// Verzeichnisses verwerfen oder bemängeln würde.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDirReport {
+    /// Das geprüfte Verzeichnis.
+    pub dir: PathBuf,
+    /// Skill-Name aus `skill.toml`, falls lesbar.
+    pub name: Option<String>,
+    /// `enabled` aus `skill.toml`, falls lesbar (`false`: der Index führt den
+    /// Skill nicht).
+    pub enabled: Option<bool>,
+    /// Fehler, mit denen der Index den Skill überspringen würde
+    /// (`skill.toml`, Anweisungstext, ein Symlink- oder versteckter
+    /// Verzeichnisname).
+    pub errors: Vec<String>,
+    /// Verworfene Teile der `triggers.toml`, wörtlich wie
+    /// [`harw_catalog::parse_triggers_file`] (bzw. das Lesen der Datei im
+    /// Index) sie meldet; der Skill bliebe geladen.
+    pub warnings: Vec<String>,
+    /// Die gültigen Teile der `triggers.toml`; `None` ohne lesbare Datei.
+    pub triggers: Option<SkillTriggerSpec>,
+}
+
+impl SkillDirReport {
+    /// Ob nichts zu beanstanden ist (keine Fehler, keine Warnungen).
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.errors.is_empty() && self.warnings.is_empty()
+    }
+
+    /// Menschenlesbarer Bericht (`/skills validate`, `harw skill validate`).
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut lines = vec![format!("Skill-Verzeichnis: {}", self.dir.display())];
+        match (&self.name, self.enabled) {
+            (Some(name), Some(false)) => lines.push(format!(
+                "Skill: {name} (enabled = false — der Index führt ihn nicht)"
+            )),
+            (Some(name), _) => lines.push(format!("Skill: {name}")),
+            (None, _) => {}
+        }
+        lines.extend(self.errors.iter().map(|error| format!("Fehler: {error}")));
+        lines.extend(
+            self.warnings
+                .iter()
+                .map(|warning| format!("Warnung: {warning}")),
+        );
+        match &self.triggers {
+            None if self.warnings.is_empty() => lines.push(format!(
+                "{TRIGGERS_FILE}: keine (der Skill wird nur über skills.search/skills.load \
+                 gefunden)"
+            )),
+            None => lines.push(format!("{TRIGGERS_FILE}: verworfen")),
+            Some(spec) if spec.triggers.is_empty() => {
+                lines.push(format!("{TRIGGERS_FILE}: keine gültigen Trigger"));
+            }
+            Some(spec) => {
+                let triggers = &spec.triggers;
+                let mut line = format!(
+                    "{TRIGGERS_FILE}: keywords {}, error_codes {}, paths {}, tools {}, \
+                     commands {}, priority {}",
+                    triggers.keywords.len(),
+                    triggers.error_codes.len(),
+                    triggers.paths.len(),
+                    triggers.tools.len(),
+                    triggers.commands.len(),
+                    triggers.priority
+                );
+                if let Some(when) = &spec.when {
+                    line.push_str(&format!("; when „{when}“"));
+                }
+                lines.push(line);
+            }
+        }
+        lines.push(if self.is_valid() {
+            "Ergebnis: gültig".to_owned()
+        } else {
+            format!(
+                "Ergebnis: zu beanstanden ({} Fehler, {} Warnung(en))",
+                self.errors.len(),
+                self.warnings.len()
+            )
+        });
+        lines.join("\n")
+    }
+
+    /// JSON-Form (`harw skill validate --json`).
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        let triggers = self.triggers.as_ref().map(|spec| {
+            serde_json::json!({
+                "when": spec.when,
+                "keywords": spec.triggers.keywords,
+                "error_codes": spec.triggers.error_codes,
+                "paths": spec.triggers.paths,
+                "tools": spec.triggers.tools,
+                "commands": spec.triggers.commands,
+                "priority": spec.triggers.priority,
+            })
+        });
+        serde_json::json!({
+            "action": "validate",
+            "dir": self.dir.display().to_string(),
+            "skill": self.name,
+            "enabled": self.enabled,
+            "valid": self.is_valid(),
+            "errors": self.errors,
+            "warnings": self.warnings,
+            "triggers": triggers,
+        })
+    }
+}
+
+/// Prüft ein Skill-Verzeichnis so, wie der Skill-Index es liest.
+///
+/// # Beschreibung
+/// `skill.toml` muss eine reguläre Datei (wie im Index, der andere
+/// Verzeichnisse überspringt) von höchstens 64 KiB und ein gültiges
+/// [`SkillToml`] sein, sein Anweisungstext über
+/// [`harw_catalog::load_skill_runtime_snapshot`] ladbar (Symlink- und
+/// Traversal-Schutz, 512-KiB-Deckel) — sonst überspränge der Index den Skill
+/// (Fehler). Ebenso ein Fehler: das Verzeichnis selbst ist ein Symlink oder
+/// sein Name beginnt mit `.` (beides liest der Index in keinem Layer). Eine vorhandene `triggers.toml` liest dieselbe Funktion wie im
+/// Index ([`harw_catalog::read_skill_triggers`]: Datei, Größe, sicheres
+/// Lesen) und prüft [`harw_catalog::parse_triggers_file`]; jede dabei
+/// verworfene Angabe erscheint wörtlich als Warnung. Anders als der Index
+/// prüft die Funktion auch einen Skill mit `enabled = false` vollständig.
+/// Rein lesend; liest nie aus FIFOs oder Gerätedateien.
+///
+/// # Rückgabe
+/// Der [`SkillDirReport`]; [`SkillDirReport::is_valid`] ist `false`, sobald
+/// es einen Fehler oder eine Warnung gibt.
+#[must_use]
+pub fn validate_skill_dir(dir: &Path) -> SkillDirReport {
+    let mut report = SkillDirReport {
+        dir: dir.to_path_buf(),
+        name: None,
+        enabled: None,
+        errors: Vec::new(),
+        warnings: Vec::new(),
+        triggers: None,
+    };
+    if !dir.is_dir() {
+        report
+            .errors
+            .push(format!("'{}' ist kein Verzeichnis", dir.display()));
+        return report;
+    }
+    // Wie `SkillIndex::build` beim Lesen eines Layers: Skill-Verzeichnisse,
+    // die Symlinks sind oder mit '.' beginnen, überspringt der Index.
+    if std::fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        report.errors.push(
+            "das Verzeichnis ist ein Symlink (der Index überspringt Skill-Verzeichnisse, die \
+             Symlinks sind)"
+                .to_owned(),
+        );
+    }
+    if dir
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+    {
+        report.errors.push(
+            "der Verzeichnisname beginnt mit '.' (der Index überspringt versteckte \
+             Skill-Verzeichnisse)"
+                .to_owned(),
+        );
+    }
+    match read_skill_manifest(dir) {
+        Err(reason) => report.errors.push(reason),
+        Ok(source) => match toml::from_str::<SkillToml>(&source) {
+            Err(error) => report
+                .errors
+                .push(format!("{SKILL_MANIFEST} ungültig: {error}")),
+            Ok(manifest) => {
+                report.name = Some(manifest.name.clone());
+                report.enabled = Some(manifest.enabled);
+                if let Err(error) = harw_catalog::load_skill_runtime_snapshot(dir, &manifest) {
+                    report.errors.push(error.to_string());
+                }
+            }
+        },
+    }
+    match harw_catalog::read_skill_triggers(dir) {
+        None => {}
+        Some(Err(reason)) => report.warnings.push(reason),
+        Some(Ok(source)) => {
+            let (spec, warnings) = harw_catalog::parse_triggers_file(&source);
+            report.warnings.extend(warnings);
+            report.triggers = Some(spec);
+        }
+    }
+    report
+}
+
+/// Liest `skill.toml` eines Skill-Verzeichnisses für `validate`: nur eine
+/// reguläre Datei (der Index überspringt das Verzeichnis sonst; ein FIFO oder
+/// eine Gerätedatei würde das Lesen blockieren bzw. nie enden), höchstens
+/// [`MAX_SKILL_MANIFEST_BYTES`] Bytes, auch wenn die Datei während des Lesens
+/// wächst.
+///
+/// # Fehler
+/// Die Meldung für [`SkillDirReport::errors`].
+fn read_skill_manifest(dir: &Path) -> Result<String, String> {
+    let path = dir.join(SKILL_MANIFEST);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "{SKILL_MANIFEST} fehlt (der Index überspringt das Verzeichnis)"
+            ));
+        }
+        Err(error) => return Err(format!("{SKILL_MANIFEST} nicht lesbar: {error}")),
+    };
+    if !metadata.is_file() {
+        return Err(format!(
+            "{SKILL_MANIFEST} ist keine Datei (der Index überspringt das Verzeichnis)"
+        ));
+    }
+    let too_large = || format!("{SKILL_MANIFEST} größer als {MAX_SKILL_MANIFEST_BYTES} Bytes");
+    let limit = u64::try_from(MAX_SKILL_MANIFEST_BYTES).unwrap_or(u64::MAX);
+    if metadata.len() > limit {
+        return Err(too_large());
+    }
+    let file = std::fs::File::open(&path)
+        .map_err(|error| format!("{SKILL_MANIFEST} nicht lesbar: {error}"))?;
+    let mut source = String::new();
+    file.take(limit.saturating_add(1))
+        .read_to_string(&mut source)
+        .map_err(|error| format!("{SKILL_MANIFEST} nicht lesbar: {error}"))?;
+    if source.len() > MAX_SKILL_MANIFEST_BYTES {
+        return Err(too_large());
+    }
+    Ok(source)
+}
+
+/// Führt `/skills validate <verzeichnis>` aus; ein relatives Verzeichnis gilt
+/// relativ zur Workspace-Wurzel der Sitzung.
+///
+/// # Fehler
+/// [`OpError::InvalidArguments`] ohne Verzeichnis oder mit überzähligen
+/// Token. Ein beanstandetes Verzeichnis ist kein Fehler der Operation: der
+/// Bericht nennt es (`valid = false`).
+fn run_validate(ctx: &OpContext, args: &SkillsArgs) -> Result<OpOutput, OpError> {
+    let tokens = action_tokens(args);
+    let target = match tokens.as_slice() {
+        [] => None,
+        [target] => Some(target).filter(|target| !target.trim().is_empty()),
+        _ => {
+            return Err(OpError::InvalidArguments(
+                "action 'validate' takes exactly one skill directory (quote paths with spaces)"
+                    .to_owned(),
+            ));
+        }
+    }
+    .ok_or_else(|| {
+        OpError::InvalidArguments("action 'validate' requires a skill directory".to_owned())
+    })?;
+    let path = Path::new(target);
+    let dir = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        ctx.sandbox().workspace().canonical_root().join(path)
+    };
+    let report = validate_skill_dir(&dir);
+    Ok(OpOutput {
+        text: report.render(),
+        data: Some(report.to_json()),
+    })
+}
+
 // ── Operation ─────────────────────────────────────────────────────────────────
 
 /// Liest den Skill-Katalog und schaltet Skills dauerhaft an oder ab.
@@ -643,13 +1468,19 @@ fn run_proposal_action(
 /// # Beschreibung
 /// - `list` (Standard): alle konfigurierten Skills mit Status.
 /// - `show <name>`: Details eines Skills.
+/// - `preview <aufgabentext> [--tool …] [--error …] [--path …] [--command …]
+///   [--budget BYTES]`: Trigger-Vorschau ohne Modellaufruf ([`PreviewArgs`]).
+/// - `validate <verzeichnis>`: prüft `skill.toml` und `triggers.toml`
+///   ([`validate_skill_dir`]).
 /// - `activate <name>` / `deactivate <name>`: setzt `enabled` im wirksamen
 ///   Skill-Manifest über [`SkillStatePersistence`]; wirksam ab dem nächsten
 ///   Config-Laden.
 ///
 /// # Argumente
-/// - `ctx` (`&OpContext`): Ausführungskontext; `list`/`show`/`activate`/
-///   `deactivate` benötigen `Arc<ResolvedConfig>` (oder die Live-Config).
+/// - `ctx` (`&OpContext`): Ausführungskontext; `list`/`show`/`preview`/
+///   `activate`/`deactivate` benötigen `Arc<ResolvedConfig>` (oder die
+///   Live-Config). `preview` nutzt einen injizierten `Arc<SkillIndex>`, sonst
+///   die Layer des gebundenen Root-Space; `validate` braucht nichts davon.
 ///   `activate`/`deactivate` nutzen einen injizierten
 ///   `Arc<dyn SkillStatePersistence>`, sonst den gebundenen Root-Space
 ///   (`Arc<harw_home::ResolvedHomeContext>`); die Vorschlags-Aktionen ebenso
@@ -684,19 +1515,23 @@ fn run_proposal_action(
 /// ```
 #[operation(
     name = "skills",
-    summary = "Skill-Katalog (list/show/activate/deactivate) und Skill-Vorschläge (proposals/review/accept/reject).",
+    summary = "Skill-Katalog (list/show/preview/validate/activate/deactivate) und Skill-Vorschläge (proposals/review/accept/reject).",
     domain = "catalog_config",
     permission = "operator",
     command(
         path = "/skills",
         visibility = "channel_reduced",
         channel_subcommands = "-,list,show",
-        busy_subcommands = "-=immediate, list=immediate, show=immediate"
+        busy_subcommands = "-=immediate, list=immediate, show=immediate, preview=immediate, validate=immediate"
     )
 )]
 async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> {
     if let Some(action @ ("proposals" | "review" | "accept" | "reject")) = args.action.as_deref() {
         return run_proposal_action(ctx, action, &args);
+    }
+    // PL-97 B3: `validate` prüft nur Dateien und braucht keinen Config-Dienst.
+    if args.action.as_deref() == Some("validate") {
+        return run_validate(ctx, &args);
     }
     // Live-Stand zuerst, damit `list`/`show` einen eben umgeschalteten Skill
     // sofort mit dem neuen Zustand zeigen.
@@ -748,6 +1583,7 @@ async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> 
                 skill.mcps.join(", ")
             )))
         }
+        "preview" => run_preview(ctx, &config, &args),
         action @ ("activate" | "deactivate") => {
             let enabled = action == "activate";
             let Some(target) = args.target.as_deref() else {
@@ -882,7 +1718,7 @@ mod tests {
             Err(OpError::NotAvailable(message)) if message == expected
         ));
         assert!(matches!(
-            super::skills(&ctx, SkillsArgs { action: Some("list".to_owned()), target: None, value: None }).await,
+            super::skills(&ctx, SkillsArgs { action: Some("list".to_owned()), ..SkillsArgs::default() }).await,
             Err(OpError::NotAvailable(message)) if message == expected
         ));
         std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
@@ -944,6 +1780,7 @@ mod tests {
                 action: Some(action.to_owned()),
                 target: Some(target.to_owned()),
                 value: Some(value.to_owned()),
+                rest: vec![target.to_owned(), value.to_owned()],
             },
         )
         .await;
@@ -1075,6 +1912,7 @@ mod tests {
             action: Some(action.to_owned()),
             target: target.map(str::to_owned),
             value: None,
+            rest: target.map(str::to_owned).into_iter().collect(),
         }
     }
 
@@ -1377,6 +2215,7 @@ mod tests {
                 action: Some("reject".to_owned()),
                 target: Some(id.clone()),
                 value: Some("doppelt".to_owned()),
+                rest: vec![id.clone(), "doppelt".to_owned()],
             },
         )
         .await;
@@ -1435,5 +2274,773 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    // ── preview / validate (PL-97 B3) ────────────────────────────────────────
+
+    mod preview_validate {
+        use std::path::{Path, PathBuf};
+        use std::sync::Arc;
+
+        use harw_catalog::SkillIndex;
+        use harw_core::skill_injection::{
+            SkillInjectionSettings, SkillInjector, SkillPreviewInput,
+        };
+        use harw_operations::context::ServiceMap;
+        use harw_operations::operation::BusyAvailability;
+        use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput, Operation};
+
+        use super::super::{PreviewArgs, SkillsArgs, SkillsOperation, validate_skill_dir};
+        use super::context_with_services;
+        use crate::test_support::{TestError, TestResult, ctx};
+        use crate::testutil::toks;
+
+        const BORROW_BODY: &str = "# Borrow\n\nIntro.\n\n## When to use\n\nWhenever the borrow checker complains.\n\n## Cause E0505\n\nThe value is still borrowed.\n\n## Fix\n\nOwn the value first.\n";
+        const BORROW_TRIGGERS: &str = "[triggers]\nerror_codes = [\"E0505\"]\npaths = [\"**/*.rs\"]\ncommands = [\"cargo test\"]\npriority = 70\n";
+        const LINT_BODY: &str = "# Lint\n\n## Clippy\n\nRun clippy with -D warnings and fix every lint before the commit.\n";
+        const LINT_TRIGGERS: &str =
+            "[triggers]\nkeywords = [\"clippy\"]\ntools = [\"shell.exec\"]\npriority = 40\n";
+
+        /// Ein Index über ein Bündel im Speicher: `(name, triggers.toml, text)`.
+        fn index() -> Arc<SkillIndex> {
+            let mut files: Vec<(String, String)> = Vec::new();
+            for (name, triggers, body) in [
+                ("borrow", BORROW_TRIGGERS, BORROW_BODY),
+                ("lint", LINT_TRIGGERS, LINT_BODY),
+            ] {
+                files.push((
+                    format!("skills/{name}/skill.toml"),
+                    format!("name = \"{name}\"\ndescription = \"Use when {name} matters.\"\n"),
+                ));
+                files.push((format!("skills/{name}/instructions.md"), body.to_owned()));
+                files.push((format!("skills/{name}/triggers.toml"), triggers.to_owned()));
+            }
+            let refs: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(path, content)| (path.as_str(), content.as_str()))
+                .collect();
+            Arc::new(SkillIndex::build_with_bundle(&[], &refs))
+        }
+
+        fn preview_context(index: Arc<SkillIndex>) -> TestResult<(OpContext, PathBuf)> {
+            let mut services = ServiceMap::new();
+            services.insert(Arc::new(harw_config::ResolvedConfig::default()));
+            services.insert(index);
+            context_with_services(services)
+        }
+
+        async fn run(op_ctx: &OpContext, tokens: &[&str]) -> Result<OpOutput, OpError> {
+            let args = SkillsArgs::from_raw_args(&toks(tokens))?;
+            super::super::skills(op_ctx, args).await
+        }
+
+        fn input() -> SkillPreviewInput {
+            SkillPreviewInput {
+                task: "cargo test fails, clippy too".to_owned(),
+                tools: vec!["shell.exec".to_owned()],
+                tool_output: vec!["error[E0505]: cannot move out of `v`".to_owned()],
+                paths: vec!["src/lib.rs".to_owned()],
+                commands: vec!["cargo test".to_owned()],
+            }
+        }
+
+        const PREVIEW_TOKENS: &[&str] = &[
+            "preview",
+            "--tool",
+            "shell.exec",
+            "--error",
+            "error[E0505]: cannot move out of `v`",
+            "--path",
+            "src/lib.rs",
+            "--command",
+            "cargo test",
+            "--",
+            "cargo test fails, clippy too",
+        ];
+
+        #[test]
+        fn skills_args_keep_the_unjoined_tokens_after_the_action() -> TestResult {
+            let args = SkillsArgs::from_raw_args(&toks(&[
+                "preview",
+                "cargo test fails",
+                "--command",
+                "cargo test",
+            ]))
+            .map_err(ctx("SkillsArgs::from_raw_args"))?;
+            assert_eq!(args.action.as_deref(), Some("preview"));
+            assert_eq!(args.target.as_deref(), Some("cargo test fails"));
+            assert_eq!(args.value.as_deref(), Some("--command"));
+            assert_eq!(
+                args.rest,
+                toks(&["cargo test fails", "--command", "cargo test"])
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn preview_args_parse_repeatable_options_budget_and_task_text() -> TestResult {
+            let args = PreviewArgs::parse(&toks(&[
+                "--tool",
+                "sys.ps",
+                "cargo",
+                "test",
+                "--command",
+                "cargo test",
+                "--error=E0505",
+                "--path",
+                "src/lib.rs",
+                "--tool=fs.read",
+                "--budget",
+                "512",
+                "--",
+                "--literal",
+            ]))
+            .map_err(ctx("PreviewArgs::parse"))?;
+            assert_eq!(args.input.task, "cargo test --literal");
+            assert_eq!(args.input.tools, toks(&["sys.ps", "fs.read"]));
+            assert_eq!(args.input.tool_output, toks(&["E0505"]));
+            assert_eq!(args.input.paths, toks(&["src/lib.rs"]));
+            assert_eq!(args.input.commands, toks(&["cargo test"]));
+            assert_eq!(args.budget, Some(512));
+            Ok(())
+        }
+
+        #[test]
+        fn preview_args_reject_bad_options_budgets_and_empty_input() -> TestResult {
+            for (tokens, needle) in [
+                (vec!["--frobnicate", "x"], "unknown option '--frobnicate'"),
+                (vec!["task", "--tool"], "option '--tool' requires a value"),
+                (
+                    vec!["task", "--budget", "12"],
+                    "--budget must be a byte count",
+                ),
+                (
+                    vec!["task", "--budget", "many"],
+                    "--budget must be a byte count",
+                ),
+                (vec![], "needs task text"),
+                (vec!["--", "  "], "needs task text"),
+            ] {
+                match PreviewArgs::parse(&toks(&tokens)) {
+                    Err(OpError::InvalidArguments(message)) => {
+                        assert!(message.contains(needle), "{tokens:?}: {message}");
+                    }
+                    other => {
+                        return Err(TestError::Unexpected(format!(
+                            "{tokens:?}: expected InvalidArguments, got {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// `/skills preview` liefert genau die Auswahl des gemeinsamen
+        /// Injektors (`SkillInjector::preview`) mit denselben Einstellungen —
+        /// derselbe Weg wie die erste Runde des Turn-Loops.
+        #[tokio::test]
+        async fn skills_preview_prints_the_selection_of_the_shared_injector() -> TestResult {
+            let index = index();
+            let (op_ctx, root) = preview_context(Arc::clone(&index))?;
+            let output = run(&op_ctx, PREVIEW_TOKENS).await;
+            std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+            let output = output.map_err(ctx("/skills preview"))?;
+
+            let settings = SkillInjectionSettings::from_config(
+                &harw_config::ResolvedConfig::default().harness.skills,
+            );
+            let expected = SkillInjector::new(index, settings).preview(&input(), 0);
+            assert_eq!(expected.round.delivered.len(), 2);
+
+            let data = output.data.ok_or(TestError::Missing("preview data"))?;
+            let injections = data["injections"]
+                .as_array()
+                .ok_or(TestError::Missing("injections"))?;
+            assert_eq!(injections.len(), expected.round.delivered.len());
+            for (json, delivered) in injections.iter().zip(&expected.round.delivered) {
+                assert_eq!(json["skill"], delivered.skill.as_str());
+                assert_eq!(json["section"].as_str(), delivered.section.as_deref());
+                assert_eq!(json["label"], delivered.label.as_str());
+                assert_eq!(json["trigger_kind"], delivered.kind.as_str());
+                assert_eq!(json["trigger_key"], delivered.key.as_str());
+                assert_eq!(json["bytes"].as_u64(), u64::try_from(delivered.bytes).ok());
+                assert_eq!(json["trust"], "instruction");
+                assert_eq!(json["sha256"], delivered.sha256.as_str());
+            }
+            assert_eq!(
+                data["budget"]["per_turn_bytes"].as_u64(),
+                u64::try_from(expected.budget.per_turn_bytes).ok()
+            );
+            assert_eq!(data["injection_enabled"], true);
+            assert_eq!(data["index"]["source"], "session");
+            assert!(
+                output.text.contains("Index: Skill-Index der Sitzung"),
+                "{}",
+                output.text
+            );
+            assert!(
+                data["dropped"].as_array().is_some_and(Vec::is_empty),
+                "{data}"
+            );
+            assert!(
+                output
+                    .text
+                    .contains("- borrow § Cause E0505 — error_code E0505 · "),
+                "{}",
+                output.text
+            );
+            assert!(
+                output.text.contains("- lint § Clippy — tool shell.exec · "),
+                "{}",
+                output.text
+            );
+            assert!(
+                output.text.contains("--command cargo test"),
+                "{}",
+                output.text
+            );
+            Ok(())
+        }
+
+        /// `--budget` ersetzt den Pro-Runde-Deckel; was nicht mehr passt,
+        /// steht mit typisiertem Grund unter „Verworfen“ — wie im Injektor.
+        #[tokio::test]
+        async fn skills_preview_budget_drops_hits_with_typed_reasons() -> TestResult {
+            let index = index();
+            let (op_ctx, root) = preview_context(Arc::clone(&index))?;
+            let mut tokens = PREVIEW_TOKENS.to_vec();
+            tokens.insert(1, "260");
+            tokens.insert(1, "--budget");
+            let output = run(&op_ctx, &tokens).await;
+            std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+            let output = output.map_err(ctx("/skills preview --budget"))?;
+
+            let settings = SkillInjectionSettings {
+                per_turn_cap_bytes: 260,
+                ..SkillInjectionSettings::from_config(
+                    &harw_config::ResolvedConfig::default().harness.skills,
+                )
+            };
+            let expected = SkillInjector::new(index, settings).preview(&input(), 0);
+            let data = output.data.ok_or(TestError::Missing("preview data"))?;
+            let dropped = data["dropped"]
+                .as_array()
+                .ok_or(TestError::Missing("dropped"))?;
+            assert_eq!(dropped.len(), expected.round.dropped.len());
+            assert_eq!(dropped.len(), 1);
+            assert_eq!(dropped[0]["skill"], "lint");
+            assert_eq!(dropped[0]["reason"], "turn_budget");
+            assert_eq!(dropped[0]["reason_text"], "Pro-Turn-Budget überschritten");
+            assert_eq!(data["budget"]["per_turn_bytes"], 260);
+            assert!(
+                output
+                    .text
+                    .contains("- lint § Clippy — Pro-Turn-Budget überschritten (turn_budget)"),
+                "{}",
+                output.text
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn skills_preview_without_a_hit_says_so() -> TestResult {
+            let (op_ctx, root) = preview_context(index())?;
+            let output = run(&op_ctx, &["preview", "write a poem"]).await;
+            std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+            let output = output.map_err(ctx("/skills preview"))?;
+            assert!(
+                output.text.contains("Kein Skill getroffen."),
+                "{}",
+                output.text
+            );
+            Ok(())
+        }
+
+        /// Die Schwelle ist das kleinste Fenster, für das der Turn-Loop
+        /// denselben Pro-Runde-Deckel wählt wie die Vorschau (rund 34 000
+        /// Token beim Standarddeckel, rund 546 000 bei 65 536 Bytes).
+        #[test]
+        fn full_cap_window_is_the_smallest_window_that_reaches_the_cap() {
+            let defaults = SkillInjectionSettings::from_config(
+                &harw_config::ResolvedConfig::default().harness.skills,
+            );
+            for cap in [256, 1024, 4096, 65_536] {
+                let settings = SkillInjectionSettings {
+                    per_turn_cap_bytes: cap,
+                    ..defaults
+                };
+                let window = super::super::full_cap_window_tokens(&settings);
+                assert_eq!(settings.per_turn_bytes(window), cap, "cap {cap}");
+                assert_eq!(settings.per_turn_bytes(0), cap, "cap {cap}");
+                if window > 1 {
+                    assert!(settings.per_turn_bytes(window - 1) < cap, "cap {cap}");
+                }
+            }
+            let settings = SkillInjectionSettings {
+                per_turn_cap_bytes: 4096,
+                ..defaults
+            };
+            assert!((34_000..=34_200).contains(&super::super::full_cap_window_tokens(&settings)));
+        }
+
+        /// Die Vorschau nennt die Fenster-Schwelle und die Hinweise des
+        /// Index (übersprungene Skills, verworfene Trigger) — der Grund,
+        /// warum ein erwarteter Skill nicht trifft.
+        #[tokio::test]
+        async fn skills_preview_names_the_window_threshold_and_the_index_warnings() -> TestResult {
+            let keywords: Vec<String> = (1..=17).map(|n| format!("\"keyword{n:02}\"")).collect();
+            let triggers = format!("[triggers]\nkeywords = [{}]\n", keywords.join(", "));
+            let files = [
+                (
+                    "skills/noisy/skill.toml",
+                    "name = \"noisy\"\ndescription = \"Use when noisy.\"\n",
+                ),
+                (
+                    "skills/noisy/instructions.md",
+                    "# Noisy\n\n## Use\n\nNoise.\n",
+                ),
+                ("skills/noisy/triggers.toml", triggers.as_str()),
+            ];
+            let index = Arc::new(SkillIndex::build_with_bundle(&[], &files));
+            let warning = "triggers.keywords: 17 Einträge, nur die ersten 16 behalten";
+            let (op_ctx, root) = preview_context(index)?;
+            let output = run(&op_ctx, &["preview", "write a poem"]).await;
+            std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+            let output = output.map_err(ctx("/skills preview"))?;
+
+            let threshold =
+                super::super::full_cap_window_tokens(&SkillInjectionSettings::from_config(
+                    &harw_config::ResolvedConfig::default().harness.skills,
+                ));
+            let text = &output.text;
+            assert!(text.contains("Kein Skill getroffen."), "{text}");
+            assert!(
+                text.contains(&format!("erst ab {threshold} Token Fenster")),
+                "{text}"
+            );
+            assert!(
+                text.contains("Index-Hinweise (0 Skill(s) übersprungen, 1 Trigger-Warnung(en)):"),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("- Warnung: noisy — {warning}")),
+                "{text}"
+            );
+            let data = output.data.ok_or(TestError::Missing("preview data"))?;
+            assert_eq!(
+                data["budget"]["full_cap_window_tokens"].as_u64(),
+                Some(threshold)
+            );
+            assert_eq!(data["budget"]["window_tokens"], 0);
+            assert_eq!(data["index"]["warnings"][0]["skill"], "noisy");
+            assert_eq!(data["index"]["warnings"][0]["reason"], warning);
+            assert!(
+                data["index"]["skipped"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty),
+                "{data}"
+            );
+            Ok(())
+        }
+
+        /// Ein JSON-Aufruf ohne `rest` nennt Verzeichnis bzw. Aufgabentext
+        /// in `target`; `validate` und `preview` lesen es dann von dort.
+        #[tokio::test]
+        async fn skills_validate_and_preview_fall_back_to_the_target_without_rest() -> TestResult {
+            let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let dir = temp.path().join("probe");
+            write_skill(&dir, None)?;
+            let (op_ctx, root) = preview_context(index())?;
+            let validate = super::super::skills(
+                &op_ctx,
+                SkillsArgs {
+                    action: Some("validate".to_owned()),
+                    target: Some(dir.display().to_string()),
+                    ..SkillsArgs::default()
+                },
+            )
+            .await;
+            let preview = super::super::skills(
+                &op_ctx,
+                SkillsArgs {
+                    action: Some("preview".to_owned()),
+                    target: Some("clippy complains".to_owned()),
+                    ..SkillsArgs::default()
+                },
+            )
+            .await;
+            std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+            let validate = validate.map_err(ctx("/skills validate via target"))?;
+            assert!(
+                validate.text.contains("Ergebnis: gültig"),
+                "{}",
+                validate.text
+            );
+            let preview = preview.map_err(ctx("/skills preview via target"))?;
+            let data = preview.data.ok_or(TestError::Missing("preview data"))?;
+            assert_eq!(data["input"]["task"], "clippy complains");
+            assert_eq!(data["injections"][0]["skill"], "lint");
+            Ok(())
+        }
+
+        /// Ohne injizierten Index und ohne gebundenen Root-Space ist die
+        /// Vorschau nicht verfügbar, statt auf `HARW_HOME` auszuweichen.
+        #[tokio::test]
+        async fn skills_preview_without_index_or_bound_home_is_not_available() -> TestResult {
+            let mut services = ServiceMap::new();
+            services.insert(Arc::new(harw_config::ResolvedConfig::default()));
+            let (op_ctx, root) = context_with_services(services)?;
+            let result = run(&op_ctx, &["preview", "cargo test"]).await;
+            std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+            assert!(
+                matches!(result, Err(OpError::NotAvailable(_))),
+                "{result:?}"
+            );
+            Ok(())
+        }
+
+        /// Ohne injizierten Index baut die Vorschau ihn wie die Laufzeit-Montage
+        /// über die vertrauten Layer — samt Projekt-Einstellungsverzeichnis,
+        /// sobald es `settings.toml` hat — und nennt diese Quelle.
+        #[tokio::test]
+        async fn skills_preview_without_an_index_rebuilds_it_from_the_trusted_layers() -> TestResult
+        {
+            let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let home = crate::config_util::test_home_context(temp.path())?;
+            let settings_dir = home
+                .project_settings_path
+                .parent()
+                .ok_or(TestError::Missing("project settings dir"))?
+                .to_path_buf();
+            let skill_dir = settings_dir.join("skills").join("probe");
+            write_skill(
+                &skill_dir,
+                Some("[triggers]\nkeywords = [\"probe layer\"]\n"),
+            )?;
+            let mut services = ServiceMap::new();
+            services.insert(Arc::new(harw_config::ResolvedConfig::default()));
+            services.insert(Arc::clone(&home));
+            let (op_ctx, root) = context_with_services(services)?;
+            let tokens = ["preview", "please probe layer settings"];
+
+            // Ohne `settings.toml`/`config.toml` ist das Verzeichnis (wie in
+            // der Laufzeit) kein Layer.
+            let without = run(&op_ctx, &tokens).await;
+            let written = std::fs::write(settings_dir.join("settings.toml"), "");
+            let with = run(&op_ctx, &tokens).await;
+            std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+            written.map_err(ctx("write settings.toml"))?;
+
+            let settings_layer = settings_dir.display().to_string();
+            let injected = |data: &serde_json::Value| {
+                data["injections"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item["skill"] == "probe"))
+            };
+            let layers = |data: &serde_json::Value| -> Vec<String> {
+                data["index"]["layers"]
+                    .as_array()
+                    .map(|layers| {
+                        layers
+                            .iter()
+                            .filter_map(|layer| layer.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+
+            let without = without.map_err(ctx("/skills preview without settings"))?;
+            let data = without.data.ok_or(TestError::Missing("preview data"))?;
+            assert_eq!(data["index"]["source"], "layers");
+            assert!(!layers(&data).contains(&settings_layer), "{data}");
+            assert!(!injected(&data), "{data}");
+
+            let with = with.map_err(ctx("/skills preview with settings"))?;
+            assert!(
+                with.text
+                    .contains("Index: neu gebaut wie in der Laufzeit-Montage"),
+                "{}",
+                with.text
+            );
+            let data = with.data.ok_or(TestError::Missing("preview data"))?;
+            assert_eq!(data["index"]["source"], "layers");
+            assert_eq!(layers(&data).last(), Some(&settings_layer), "{data}");
+            assert!(injected(&data), "{data}");
+            Ok(())
+        }
+
+        #[test]
+        fn skills_preview_and_validate_are_immediate_but_not_channel_reachable() {
+            let busy = SkillsOperation.busy_subcommands();
+            for sub in ["preview", "validate"] {
+                assert!(
+                    busy.iter().any(|entry| entry.subcommand == Some(sub)
+                        && entry.busy == BusyAvailability::Immediate),
+                    "{sub} must be immediate"
+                );
+                assert!(!SkillsOperation.channel_subcommands().contains(&sub));
+            }
+        }
+
+        fn write_skill(dir: &Path, triggers: Option<&str>) -> TestResult {
+            std::fs::create_dir_all(dir).map_err(ctx("create skill dir"))?;
+            std::fs::write(
+                dir.join("skill.toml"),
+                "name = \"probe\"\ndescription = \"Use when probing.\"\n",
+            )
+            .map_err(ctx("write skill.toml"))?;
+            std::fs::write(dir.join("instructions.md"), "# Probe\n\n## Use\n\nProbe.\n")
+                .map_err(ctx("write instructions.md"))?;
+            if let Some(triggers) = triggers {
+                std::fs::write(dir.join("triggers.toml"), triggers)
+                    .map_err(ctx("write triggers.toml"))?;
+            }
+            Ok(())
+        }
+
+        fn seventeen_keywords() -> String {
+            let keywords: Vec<String> = (1..=17).map(|n| format!("\"keyword{n:02}\"")).collect();
+            format!(
+                "when = \"Probing\"\n[triggers]\nkeywords = [{}]\n",
+                keywords.join(", ")
+            )
+        }
+
+        /// Eine `triggers.toml` mit 17 Schlüsselwörtern wird beanstandet, mit
+        /// genau der Warnung aus `harw_catalog::parse_triggers_file`.
+        #[tokio::test]
+        async fn skills_validate_rejects_seventeen_keywords_with_the_catalog_warning() -> TestResult
+        {
+            let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let dir = temp.path().join("probe");
+            let source = seventeen_keywords();
+            write_skill(&dir, Some(&source))?;
+
+            let (_, catalog_warnings) = harw_catalog::parse_triggers_file(&source);
+            assert_eq!(
+                catalog_warnings,
+                vec!["triggers.keywords: 17 Einträge, nur die ersten 16 behalten".to_owned()]
+            );
+
+            let report = validate_skill_dir(&dir);
+            assert!(!report.is_valid());
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(report.warnings, catalog_warnings);
+            assert_eq!(
+                report
+                    .triggers
+                    .as_ref()
+                    .map(|spec| spec.triggers.keywords.len()),
+                Some(16)
+            );
+
+            let (op_ctx, root) = context_with_services(ServiceMap::new())?;
+            let dir_token = dir.display().to_string();
+            let output = run(&op_ctx, &["validate", dir_token.as_str()]).await;
+            std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+            let output = output.map_err(ctx("/skills validate"))?;
+            assert!(
+                output.text.contains(
+                    "Warnung: triggers.keywords: 17 Einträge, nur die ersten 16 behalten"
+                ),
+                "{}",
+                output.text
+            );
+            assert!(
+                output.text.contains("Ergebnis: zu beanstanden"),
+                "{}",
+                output.text
+            );
+            let data = output.data.ok_or(TestError::Missing("validate data"))?;
+            assert_eq!(data["valid"], false);
+            assert_eq!(data["skill"], "probe");
+            assert_eq!(
+                data["warnings"][0],
+                "triggers.keywords: 17 Einträge, nur die ersten 16 behalten"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn skills_validate_accepts_a_clean_dir_and_reports_broken_manifests() -> TestResult {
+            let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let clean = temp.path().join("clean");
+            write_skill(
+                &clean,
+                Some("when = \"Probing\"\n[triggers]\nkeywords = [\"probe it\"]\n"),
+            )?;
+            let report = validate_skill_dir(&clean);
+            assert!(report.is_valid(), "{report:?}");
+            assert!(report.render().contains("Ergebnis: gültig"));
+            assert!(report.render().contains("keywords 1"));
+
+            let untriggered = temp.path().join("untriggered");
+            write_skill(&untriggered, None)?;
+            let report = validate_skill_dir(&untriggered);
+            assert!(report.is_valid(), "{report:?}");
+            assert!(report.triggers.is_none());
+
+            let broken = temp.path().join("broken");
+            std::fs::create_dir_all(&broken).map_err(ctx("create broken dir"))?;
+            std::fs::write(broken.join("skill.toml"), "name = \"x\"\nunknown = 1\n")
+                .map_err(ctx("write broken skill.toml"))?;
+            let report = validate_skill_dir(&broken);
+            assert!(!report.is_valid());
+            assert!(
+                report
+                    .errors
+                    .first()
+                    .is_some_and(|error| error.starts_with("skill.toml ungültig: ")),
+                "{report:?}"
+            );
+
+            let missing = validate_skill_dir(&temp.path().join("missing"));
+            assert!(!missing.is_valid());
+            assert!(
+                missing
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("kein Verzeichnis"))
+            );
+            Ok(())
+        }
+
+        /// `skill.toml` muss eine reguläre Datei sein: ein Verzeichnis, eine
+        /// Gerätedatei hinter einem Symlink oder eine Riesendatei wird nicht
+        /// gelesen, sondern als Fehler gemeldet — `validate` kehrt sofort
+        /// zurück.
+        #[test]
+        fn skills_validate_reads_only_a_bounded_regular_skill_manifest() -> TestResult {
+            let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let assert_error = |dir: &Path, needle: &str| {
+                let report = validate_skill_dir(dir);
+                assert!(!report.is_valid(), "{report:?}");
+                assert!(
+                    report.errors.iter().any(|error| error.contains(needle)),
+                    "{needle}: {report:?}"
+                );
+                assert!(report.name.is_none(), "{report:?}");
+            };
+
+            let missing = temp.path().join("missing-manifest");
+            std::fs::create_dir_all(&missing).map_err(ctx("create dir"))?;
+            assert_error(&missing, "skill.toml fehlt");
+
+            let nested = temp.path().join("dir-manifest");
+            std::fs::create_dir_all(nested.join("skill.toml")).map_err(ctx("create dir"))?;
+            assert_error(&nested, "skill.toml ist keine Datei");
+
+            let huge = temp.path().join("huge-manifest");
+            std::fs::create_dir_all(&huge).map_err(ctx("create dir"))?;
+            let mut body = "name = \"huge\"\n".to_owned();
+            body.push_str(&format!(
+                "# {}\n",
+                "x".repeat(super::super::MAX_SKILL_MANIFEST_BYTES)
+            ));
+            std::fs::write(huge.join("skill.toml"), body).map_err(ctx("write skill.toml"))?;
+            assert_error(&huge, "skill.toml größer als 65536 Bytes");
+
+            #[cfg(unix)]
+            {
+                let device = temp.path().join("device-manifest");
+                std::fs::create_dir_all(&device).map_err(ctx("create dir"))?;
+                std::os::unix::fs::symlink("/dev/zero", device.join("skill.toml"))
+                    .map_err(ctx("symlink /dev/zero"))?;
+                assert_error(&device, "skill.toml ist keine Datei");
+            }
+            Ok(())
+        }
+
+        /// Ein Skill-Verzeichnis, das der Index in keinem Layer liest — ein
+        /// Symlink oder ein Name mit führendem '.' —, ist ein Fehler, auch
+        /// wenn sein Inhalt gültig ist; dasselbe Ziel über seinen echten
+        /// Pfad ist gültig.
+        #[test]
+        fn skills_validate_rejects_symlinked_and_hidden_skill_dirs() -> TestResult {
+            let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let real = temp.path().join("probe");
+            write_skill(&real, None)?;
+            assert!(validate_skill_dir(&real).is_valid());
+
+            let hidden = temp.path().join(".probe");
+            write_skill(&hidden, None)?;
+            let report = validate_skill_dir(&hidden);
+            assert!(!report.is_valid());
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("beginnt mit '.'")),
+                "{report:?}"
+            );
+            assert_eq!(report.name.as_deref(), Some("probe"));
+
+            #[cfg(unix)]
+            {
+                let link = temp.path().join("linked");
+                std::os::unix::fs::symlink(&real, &link).map_err(ctx("symlink skill dir"))?;
+                let report = validate_skill_dir(&link);
+                assert!(!report.is_valid());
+                assert!(
+                    report.errors.iter().any(|error| error.contains("Symlink")),
+                    "{report:?}"
+                );
+            }
+            Ok(())
+        }
+
+        /// `validate` und der Index lesen `triggers.toml` über dieselbe
+        /// Funktion: eine nicht reguläre Datei ergibt dieselbe Warnung.
+        #[test]
+        fn skills_validate_reports_the_index_warning_for_a_non_file_triggers_toml() -> TestResult {
+            let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let dir = temp.path().join("probe");
+            write_skill(&dir, None)?;
+            std::fs::create_dir_all(dir.join("triggers.toml")).map_err(ctx("create dir"))?;
+            let expected = match harw_catalog::read_skill_triggers(&dir) {
+                Some(Err(reason)) => reason,
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected a discarded triggers.toml, got {other:?}"
+                    )));
+                }
+            };
+            let report = validate_skill_dir(&dir);
+            assert!(report.errors.is_empty(), "{report:?}");
+            assert_eq!(report.warnings, vec![expected]);
+            assert!(report.triggers.is_none());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn skills_validate_needs_exactly_one_directory() -> TestResult {
+            let (op_ctx, root) = context_with_services(ServiceMap::new())?;
+            let missing = run(&op_ctx, &["validate"]).await;
+            let extra = run(&op_ctx, &["validate", "a", "b"]).await;
+            std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+            assert!(
+                matches!(&missing, Err(OpError::InvalidArguments(message)) if message.contains("requires a skill directory")),
+                "{missing:?}"
+            );
+            assert!(
+                matches!(&extra, Err(OpError::InvalidArguments(message)) if message.contains("exactly one")),
+                "{extra:?}"
+            );
+            Ok(())
+        }
+
+        /// Ein relatives Verzeichnis gilt relativ zur Workspace-Wurzel.
+        #[tokio::test]
+        async fn skills_validate_resolves_relative_dirs_against_the_workspace() -> TestResult {
+            let (op_ctx, root) = context_with_services(ServiceMap::new())?;
+            let workspace = op_ctx.sandbox().workspace().canonical_root().to_path_buf();
+            let written = write_skill(&workspace.join("skills").join("probe"), None);
+            let output = run(&op_ctx, &["validate", "skills/probe"]).await;
+            std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+            written?;
+            let output = output.map_err(ctx("/skills validate"))?;
+            assert!(output.text.contains("Ergebnis: gültig"), "{}", output.text);
+            Ok(())
+        }
     }
 }

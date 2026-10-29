@@ -904,7 +904,9 @@ fn test_command_parses_the_same_as_the_derived_parser() -> TestResult {
 #[test]
 fn test_legacy_commands_are_hidden_but_still_known() -> TestResult {
     let cmd = command();
-    for name in ["connect", "lens", "uia", "catalog", "run", "classify"] {
+    for name in [
+        "connect", "lens", "uia", "catalog", "run", "classify", "install",
+    ] {
         let sub = cmd
             .find_subcommand(name)
             .ok_or_else(|| TestError::Unexpected(format!("`{name}` fehlt in der Grammatik")))?;
@@ -923,6 +925,7 @@ fn test_legacy_commands_are_hidden_but_still_known() -> TestResult {
         "cycle",
         "channel",
         "debug",
+        "dod",
     ] {
         let sub = cmd
             .find_subcommand(name)
@@ -2488,6 +2491,355 @@ fn device_and_node_help_is_german_and_listed_in_the_root_help() -> TestResult {
         }
         let text = sub.render_long_help().to_string();
         assert!(text.contains(needle), "{path:?}: {text}");
+    }
+    Ok(())
+}
+
+// ── dod (PL-97 D3) ─────────────────────────────────────────────────────
+
+fn dod_action(args: &[&str]) -> TestResult<DodAction> {
+    let mut argv = vec!["harw", "dod"];
+    argv.extend_from_slice(args);
+    let cli = Cli::try_parse_from(argv).map_err(ctx("`harw dod …` sollte parsen"))?;
+    match cli.command {
+        Some(Command::Dod { action }) => Ok(action),
+        other => Err(TestError::Unexpected(format!(
+            "erwartete dod, bekam {other:?}"
+        ))),
+    }
+}
+
+#[test]
+fn dod_subcommands_parse_into_their_actions() -> TestResult {
+    assert_eq!(dod_action(&["status"])?, DodAction::Status);
+    assert_eq!(dod_action(&["doctor"])?, DodAction::Doctor);
+    assert_eq!(dod_action(&["sensors"])?, DodAction::Sensors);
+    assert_eq!(dod_action(&["enable"])?, DodAction::Enable);
+    assert_eq!(dod_action(&["disable"])?, DodAction::Disable);
+    assert_eq!(dod_action(&["restart"])?, DodAction::Restart);
+    assert_eq!(
+        dod_action(&["findings"])?,
+        DodAction::Findings(DodFindingsArgs {
+            limit: 50,
+            severity: None,
+            rule: None,
+            since: None,
+        })
+    );
+    assert_eq!(
+        dod_action(&[
+            "findings",
+            "-n",
+            "5",
+            "--severity",
+            "high",
+            "--rule",
+            "structure-drift",
+            "--since",
+            "24h",
+        ])?,
+        DodAction::Findings(DodFindingsArgs {
+            limit: 5,
+            severity: Some(DodSeverity::High),
+            rule: Some("structure-drift".to_owned()),
+            since: Some(std::time::Duration::from_secs(86_400)),
+        })
+    );
+    assert_eq!(
+        dod_action(&["config", "check", "--config", "/tmp/dod.toml"])?,
+        DodAction::Config {
+            action: DodConfigAction::Check {
+                config: Some(PathBuf::from("/tmp/dod.toml")),
+            },
+        }
+    );
+    assert_eq!(
+        dod_action(&["config", "suggest"])?,
+        DodAction::Config {
+            action: DodConfigAction::Suggest,
+        }
+    );
+    for (verb, action) in [
+        ("status", DodWardenAction::Status),
+        ("enable", DodWardenAction::Enable),
+        ("disable", DodWardenAction::Disable),
+    ] {
+        assert_eq!(
+            dod_action(&["warden", verb])?,
+            DodAction::Warden { action },
+            "{verb}"
+        );
+    }
+    assert_eq!(
+        dod_action(&["install", "--print-systemd"])?,
+        DodAction::Install {
+            print_systemd: Some(None),
+        }
+    );
+    assert_eq!(
+        dod_action(&["install", "--print-systemd", "harw-warden.socket"])?,
+        DodAction::Install {
+            print_systemd: Some(Some("harw-warden.socket".to_owned())),
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn dod_rejects_out_of_range_limits_bad_spans_and_unknown_verbs() {
+    for args in [
+        &["findings", "-n", "0"][..],
+        &["findings", "-n", "201"],
+        &["findings", "--since", "5x"],
+        &["findings", "--severity", "apocalyptic"],
+        &["warden"],
+        &["config"],
+        &["kill"],
+    ] {
+        let mut argv = vec!["harw", "dod"];
+        argv.extend_from_slice(args);
+        assert!(Cli::try_parse_from(argv).is_err(), "{args:?}");
+    }
+}
+
+/// Jeder Knoten unter `harw dod` trägt einen Hilfetext, jedes Argument
+/// einen eigenen, und die Hilfe rendert (deutsch, wie der Rest der
+/// Grammatik). `--json` ist global und gilt dort überall.
+#[test]
+fn dod_every_subcommand_and_argument_has_help() -> TestResult {
+    fn walk(cmd: &clap::Command, path: &str, seen: &mut Vec<String>) -> TestResult {
+        let about = cmd.get_about().map(ToString::to_string).unwrap_or_default();
+        assert!(!about.trim().is_empty(), "`{path}` ohne Hilfetext");
+        let help = cmd.clone().render_long_help().to_string();
+        assert!(!help.trim().is_empty(), "`{path}`: leere Hilfe");
+        for arg in cmd.get_arguments() {
+            let id = arg.get_id().as_str();
+            if matches!(id, "help" | "version") || arg.is_global_set() {
+                continue;
+            }
+            assert!(
+                arg.get_help()
+                    .is_some_and(|help| !help.to_string().trim().is_empty()),
+                "`{path}`: Argument `{id}` ohne Hilfetext"
+            );
+        }
+        seen.push(path.to_owned());
+        for sub in cmd.get_subcommands() {
+            if sub.get_name() == "help" {
+                continue;
+            }
+            walk(sub, &format!("{path} {}", sub.get_name()), seen)?;
+        }
+        Ok(())
+    }
+    let root = command();
+    let dod = root
+        .find_subcommand("dod")
+        .ok_or(TestError::Missing("dod in der Grammatik"))?;
+    let mut seen = Vec::new();
+    walk(dod, "harw dod", &mut seen)?;
+    for expected in [
+        "harw dod status",
+        "harw dod doctor",
+        "harw dod findings",
+        "harw dod sensors",
+        "harw dod config check",
+        "harw dod config suggest",
+        "harw dod enable",
+        "harw dod disable",
+        "harw dod restart",
+        "harw dod warden status",
+        "harw dod warden enable",
+        "harw dod warden disable",
+        "harw dod install",
+    ] {
+        assert!(
+            seen.iter().any(|path| path == expected),
+            "{expected} fehlt: {seen:?}"
+        );
+    }
+    let root_help = root.clone().render_help().to_string();
+    assert!(root_help.contains("dod"), "{root_help}");
+    let json = root
+        .get_arguments()
+        .find(|arg| arg.get_id().as_str() == "json")
+        .ok_or(TestError::Missing("--json"))?;
+    assert!(
+        json.is_global_set(),
+        "--json gilt für jeden dod-Unterbefehl"
+    );
+    Ok(())
+}
+
+#[test]
+fn dod_install_and_the_legacy_install_parse_the_same_flag() -> TestResult {
+    let legacy = Cli::try_parse_from(["harw", "install", "--print-systemd", "harw-warden.socket"])
+        .map_err(ctx("`harw install --print-systemd UNIT` bleibt gültig"))?;
+    let Some(Command::Install { print_systemd }) = legacy.command else {
+        return Err(TestError::Unexpected("erwartete install".into()));
+    };
+    assert_eq!(
+        DodAction::Install { print_systemd },
+        dod_action(&["install", "--print-systemd", "harw-warden.socket"])?
+    );
+    Ok(())
+}
+
+// ── Skills: skill list|show|preview|validate (PL-97 B3) ─────────────────
+
+/// Parst `harw <argv…>` und liefert die `skill`-Aktion.
+fn skill_action(argv: &[&str]) -> TestResult<SkillAction> {
+    let cli = Cli::try_parse_from(["harw"].iter().chain(argv))
+        .map_err(ctx("`harw skill …` sollte parsen"))?;
+    match cli.command {
+        Some(Command::Skill { action }) => Ok(action),
+        other => Err(TestError::Unexpected(format!(
+            "erwartete Command::Skill, bekam {other:?}"
+        ))),
+    }
+}
+
+#[test]
+fn test_skill_list_show_validate_parse() -> TestResult {
+    assert!(matches!(
+        skill_action(&["skill", "list"])?,
+        SkillAction::List
+    ));
+    assert!(matches!(
+        skill_action(&["skill", "show", "rust-borrow"])?,
+        SkillAction::Show { name } if name == "rust-borrow"
+    ));
+    assert!(matches!(
+        skill_action(&["skill", "validate", "harw-tool-sys/skills/sys-tools"])?,
+        SkillAction::Validate { dir } if dir.as_path() == std::path::Path::new("harw-tool-sys/skills/sys-tools")
+    ));
+    // Ohne Name bzw. Verzeichnis und mit unbekanntem Verb: Parse-Fehler.
+    assert!(Cli::try_parse_from(["harw", "skill", "show"]).is_err());
+    assert!(Cli::try_parse_from(["harw", "skill", "validate"]).is_err());
+    assert!(Cli::try_parse_from(["harw", "skill", "import", "x"]).is_err());
+    Ok(())
+}
+
+#[test]
+fn test_skill_preview_parses_task_words_and_repeatable_options() -> TestResult {
+    let action = skill_action(&[
+        "skill",
+        "preview",
+        "cargo test fails",
+        "with",
+        "--tool",
+        "sys.ps",
+        "--tool",
+        "fs.read",
+        "--error",
+        "E0505",
+        "--path",
+        "src/lib.rs",
+        "--command",
+        "cargo test",
+        "--budget",
+        "1024",
+        "E0505",
+    ])?;
+    let SkillAction::Preview {
+        task,
+        tools,
+        errors,
+        paths,
+        commands,
+        budget,
+    } = action
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete preview, bekam {action:?}"
+        )));
+    };
+    assert_eq!(task, vec!["cargo test fails", "with", "E0505"]);
+    assert_eq!(tools, vec!["sys.ps", "fs.read"]);
+    assert_eq!(errors, vec!["E0505"]);
+    assert_eq!(paths, vec!["src/lib.rs"]);
+    assert_eq!(commands, vec!["cargo test"]);
+    assert_eq!(budget, Some(1024));
+
+    // Ohne Aufgabentext parst `preview` (die Prüfung „mindestens eine
+    // Eingabe" macht der Befehl selbst).
+    assert!(matches!(
+        skill_action(&["skill", "preview", "--tool", "sys.ps"])?,
+        SkillAction::Preview { task, .. } if task.is_empty()
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_skill_preview_budget_outside_the_config_range_is_a_usage_error() -> TestResult {
+    for budget in ["12", "70000", "viel"] {
+        let Err(error) = Cli::try_parse_from(["harw", "skill", "preview", "x", "--budget", budget])
+        else {
+            return Err(TestError::Unexpected(format!(
+                "--budget {budget} muss abgelehnt werden"
+            )));
+        };
+        assert_eq!(error.exit_code(), 2, "--budget {budget}: {error}");
+    }
+    Ok(())
+}
+
+/// Jeder `skill`-Unterbefehl und jedes seiner Argumente trägt einen
+/// Hilfetext; `--json` wird vor und hinter dem Befehl angenommen und nicht
+/// als „ohne JSON-Form" abgelehnt.
+#[test]
+fn test_skill_tree_has_help_text_and_accepts_json() -> TestResult {
+    let root = command();
+    let skill = root
+        .find_subcommand("skill")
+        .ok_or(TestError::Missing("`skill` fehlt in der Grammatik"))?;
+    assert!(!skill.is_hide_set(), "`skill` muss sichtbar sein");
+    assert!(
+        skill
+            .get_about()
+            .is_some_and(|about| !about.to_string().trim().is_empty())
+    );
+    for name in ["list", "show", "preview", "validate"] {
+        let sub = skill
+            .find_subcommand(name)
+            .ok_or(TestError::Missing("skill-Unterbefehl"))?;
+        assert!(
+            sub.get_about()
+                .is_some_and(|about| !about.to_string().trim().is_empty()),
+            "`skill {name}` braucht einen Hilfetext"
+        );
+        for arg in sub.get_arguments() {
+            assert!(
+                arg.get_help()
+                    .is_some_and(|help| !help.to_string().trim().is_empty()),
+                "`skill {name}`: Argument `{}` braucht einen Hilfetext",
+                arg.get_id()
+            );
+        }
+    }
+    let help = skill.clone().render_help().to_string();
+    for name in ["list", "show", "preview", "validate"] {
+        assert!(help.contains(name), "{help}");
+    }
+
+    for argv in [
+        &["harw", "skill", "list", "--json"][..],
+        &["harw", "--json", "skill", "show", "x"],
+        &[
+            "harw",
+            "skill",
+            "preview",
+            "cargo test",
+            "--json",
+            "--tool",
+            "sys.ps",
+        ],
+        &["harw", "skill", "validate", "dir", "--json"],
+    ] {
+        let cli = Cli::try_parse_from(argv).map_err(ctx("`harw skill … --json` parsen"))?;
+        assert!(cli.global.json, "{argv:?}");
+        crate::reject_unsupported_json(cli.command.as_ref(), &cli.global)
+            .map_err(ctx("`harw skill …` nimmt --json an"))?;
     }
     Ok(())
 }
