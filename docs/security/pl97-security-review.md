@@ -17,9 +17,17 @@ of refuting it; only the survivors are listed. Targeted test runs:
 `cargo fmt --all -- --check` (clean). Nothing was changed during the review
 itself; the fixes live in the pull request that carries this document.
 
-**Result.** No critical and no high finding. One medium finding (a test gate
-that is red on a clean checkout), six low findings, two of them rules the next
-work package (E1b) must follow rather than defects in the landed code.
+**Result of this pass.** Within the questions above this pass found no
+critical and no high finding: one medium finding (a test gate that is red on
+a clean checkout), six low findings, two of them rules the next work package
+(E1b) must follow rather than defects in the landed code.
+
+**Scope limit — this is a partial review.** The repository owner's review
+threads on PR #154 cover the same commit range and hold reproducible
+file:line findings this pass did not triage, so "every survivor is listed"
+holds only for the questions above, not for the range as a whole. Those
+threads remain authoritative for their files and are listed in §1.1 with the
+state known at the time of writing; none of them is closed by this document.
 
 ## 1. Ranked findings
 
@@ -34,6 +42,36 @@ work package (E1b) must follow rather than defects in the landed code.
 | 7 | Low (informational) | C4a, M1 | `harw-tool-job/src/model.rs`, `harw-activity/src/reducer.rs:149-161` | documented; reducer eviction goes to M3 |
 
 Line numbers refer to the reviewed head `47a0720e`.
+
+### 1.1 Findings from the PR #154 review threads, not triaged here
+
+Reproducible findings the repository owner posted on PR #154 against the
+same range (`fcb12b41..47a0720e`). This pass neither verified nor refuted
+them; they are listed so this report does not read as exhaustive. Status is
+the thread state at the time of writing; the threads, not this list, are
+authoritative.
+
+| Thread | Severity | Finding (owner's wording, condensed) |
+|--------|----------|--------------------------------------|
+| `harw-dod-client/src/findings.rs:210` | P1 | `reaches_window_start` treats the minimum `observed_at` in the read tail as proof that unread older records are outside the window; a truncated or unordered export can be marked complete. |
+| `harw-dod-client/src/status.rs:328` | P1 | Warden can be reported `Enabled` with an inactive socket and an unreadable guard file (`flag_absent` is false for every error except `ENOENT`). |
+| `harw-dod-client/Cargo.toml:21` | P2 | `time` 0.3.53 requires Rust 1.88, above the crate's inherited `rust-version`. |
+| `dod/crates/harw-sentinel/src/main.rs:936` | P1 | Export destinations are compared lexically; `.`/`..` components or symlinked parents let findings and health aliases collide. |
+| `harw-home/src/bundle.rs:1001` | P1 | `include_str!` paths escape the publishable `harw-home` package into sibling crates. |
+| `harw-tool-job/src/model.rs:617` | P2 | A `harw-job-*` leaf name is not proof of a dedicated job cgroup without a delegated root. |
+| `harw-activity/src/reducer.rs:619` | P2 | A cancelled `Call → Job` rebase binds the job and injects a running constituent. |
+| `docs/setup/dod.md:270` | P2 | Documents a default hub findings source that `HubConfig` does not have. |
+| `docs/planning/97-…/README.md:1462` | P1 | The injector's active/dedupe state is not persisted across restart; the B1 status text claims otherwise. |
+| `harw-core/src/skill_injection.rs:459` | P2 | Imported provenance has no production producer (same gap as finding 3 here). |
+| `harw-core/src/skill_injection.rs:960` | P2 | The tool-result scan limit is enforced after collecting every leaf, not while traversing. |
+| `harw-core/src/turn_loop.rs:6128` | P2 | An injection delivery is acknowledged before its event is durable. |
+| `harw-tools/src/provider_macro.rs:511` | P1 | `TOOL_ACTIVITIES` is not reachable after provider registration (type erasure). |
+| `docs/design/dod-system-operations-authority.md:413` | P2 | `permission_request!` has no productive consumer yet; status should stay partial. |
+| `dod/crates/harw-probe-bpf/src/scope_rescan.rs:231` | P1 | Partial per-handle scope updates are declared recovered (E3b, outside this pass's range). |
+
+Where the two lists overlap (`harw-activity` fixtures, imported provenance,
+reducer behaviour, job cgroup leaf), the owner's thread carries the
+stricter reading.
 
 ### 1. Medium — `harw-activity` replay fixtures are not in git; the workspace test gate is red
 
@@ -74,13 +112,19 @@ Line numbers refer to the reviewed head `47a0720e`.
   new `ExportSource::SystemUnreadable` with the *system* paths, so every read
   reports `Unreadable` and `status()` appends the operator hint ("add the
   user to the harw-dod-readers group") instead of counting home findings.
-  `ExportSource::is_verified()` / `hint()` and `DodStatus::export_verified()`
-  let D3/D5 label the `Home` fallback as unverified; `attention_count()` is
-  unchanged. Migration for D3: a `match` on `ExportSource` gains one arm;
+  `ExportSource::is_verified()` is `true` for `System` only: `Override` is a
+  path a trusted *config* layer named, but `[dod] export_dir` is only
+  required to be absolute and nothing checks who can write that directory
+  (`/tmp/dod-export` or a directory below the harw home is accepted), so
+  config provenance must not be read as file integrity (owner's review of
+  PR #156). `hint()` and `DodStatus::export_verified()` let D3/D5 label every
+  unverified source; `attention_count()` is unchanged. Migration for D3: a `match` on `ExportSource` gains one arm;
   `DodStatus` has no new field. Regression tests:
-  `unreadable_system_dir_is_reported_instead_of_the_home_fallback` and
+  `unreadable_system_dir_is_reported_instead_of_the_home_fallback`,
   `unreadable_system_export_is_not_replaced_by_planted_home_findings`
-  (both skip the unreadable branch when running as root).
+  (both skip the unreadable branch when running as root),
+  `only_the_system_directory_counts_as_verified` and
+  `writable_absolute_override_is_not_verified`.
 
 ### 3. Low — `provenance()` fails toward the most trusted class
 
