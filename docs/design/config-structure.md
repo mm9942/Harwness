@@ -104,6 +104,9 @@ json = false                         # structured JSON logs vs. human-readable
 [tui]
 theme = "default-dark"
 keybindings_file = "keybindings.toml"   # relative to this config.toml's own layer directory
+reasoning = "message"                # message|collapsed|hidden — how the model's reasoning
+                                     # summaries appear in the history (PL-97 R1): a readable
+                                     # markdown block (default), one collapsed line, or not at all
 
 [session]
 store_dir = "sessions"               # relative to workspace_root

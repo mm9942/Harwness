@@ -121,10 +121,21 @@ implementations for different kinds of content:
   and re-wraps it differently per render width, so a terminal resize
   re-flows old messages correctly instead of leaving them wrapped for a
   width that no longer applies.
-- **`ReasoningHistoryCell`** — a reasoning summary, dimmed and italic with
-  a `"∴ "` marker and an optional note of which agent it came from;
-  collapsed by default, expandable via Ctrl+O through a shared, mutable
-  handle (`SharedReasoningCell`) so all reasoning cells expand together.
+- **`ReasoningHistoryCell`** — a reasoning summary rendered like a message
+  (PL-97 R1, renderer in `reasoning_cell.rs`): a dimmed header `∴ Reasoning`
+  with an optional `[role]` note of which agent it came from, and a body
+  that goes through the same markdown renderer and wrapping as assistant
+  messages (headings, lists, code fences, tables), in the theme's normal
+  text colour with a dim `│ ` gutter. The `summary_text` entries are joined
+  with blank lines so paragraphs survive. `[tui] reasoning` picks the start
+  state: `message` (default) starts expanded and Ctrl+O collapses it to
+  header + first line + `… (N Zeilen · Ctrl+O)`, `collapsed` starts
+  collapsed, `hidden` pushes no cell (the export entry is still recorded).
+  The live preview of a streaming turn follows the same mode: `message`
+  shows `∴ Reasoning …` plus up to eight wrapped tail lines with paragraph
+  breaks, `collapsed` three dimmed lines, `hidden` none. The toggle goes
+  through a shared, mutable handle (`SharedReasoningCell`) so all reasoning
+  cells expand together.
 - **`SubAgentCell`** — a running or finished child agent
   (`TurnEvent::ChildSpawned`/`ChildProgress`/`ChildCompleted`); unlike the
   cells above, this one is **updatable in place** via
