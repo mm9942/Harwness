@@ -2751,6 +2751,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-dod-client"
+version = "0.9.1"
+dependencies = [
+ "harw-dod-config",
+ "harw-types",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+]
+
+[[package]]
 name = "harw-dod-config"
 version = "0.9.1"
 dependencies = [

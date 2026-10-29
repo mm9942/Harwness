@@ -41,6 +41,8 @@ members = [
     "harw-extension-api",
     "harw-sandbox",
     "harw-catalog",
+    # PL-97 D2: read-only Harw-DoD client (export paths, findings/health, config, units, status).
+    "harw-dod-client",
     "harw-core",
     "harw-provider",
     "harw-provider-http",

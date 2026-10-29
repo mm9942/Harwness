@@ -150,6 +150,9 @@ layer = "I"
 layer = "I"
 [packages."harw-catalog"]
 layer = "I"
+# PL-97 D2: lesender Harw-DoD-Client (harw-dod-config ist Ring D, daher Ring A).
+[packages."harw-dod-client"]
+layer = "A"
 [packages."harw-config"]
 layer = "I"
 [packages."harw-home"]
@@ -511,6 +514,11 @@ reason = "W00 D10/ARC-02: WebSocket transport is owned by ring A (harw-session-w
 names = ["hyper", "tungstenite", "tokio-tungstenite", "harw-node-transport", "harw-web", "harw-cli", "harw-tui", "harw-session-host", "harw-session-ws"]
 packages = ["harw-protocol"]
 reason = "W00 §2.1/ARC-01: harw-protocol has no async runtime or network transport dependency"
+
+[[forbidden_crates]]
+names = ["harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs"]
+packages = ["harw-dod-client"]
+reason = "PL-97 §3.1 / S1: the read-only Harw-DoD client never links the Warden, the escalation ladder or a DoD daemon"
 
 [packages."harw-context-ledger"]
 layer = "I"

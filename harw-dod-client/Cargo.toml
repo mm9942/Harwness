@@ -1,0 +1,27 @@
+[package]
+publish.workspace = true
+name = "harw-dod-client"
+description = "Read-only client for the Harw-DoD suite: export path resolution, findings/health readers, system-config and unit state, status assembly; never touches the Warden"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-dod-config = { path = "../dod/crates/harw-dod-config" }
+harw-types = { path = "../harw-types" }
+# One `open(O_NOFOLLOW | O_NONBLOCK)` per export read (no lstat/open race, a
+# swapped-in FIFO cannot block); already in the tree via harw-dod-config.
+rustix = { workspace = true, features = ["fs"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# RFC 3339 timestamps of the export lines and the health report; the
+# `serde-well-known` helpers serialize them for `--json` output.
+time = { version = "0.3.53", features = ["formatting", "parsing", "serde-well-known"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

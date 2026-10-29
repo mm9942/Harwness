@@ -15,6 +15,7 @@
 "harw-agent-runner/src/job_child_backend.rs" = "recipe: builds the command; the job runtime starts it (PL-93)"
 "harw-cloud/harw-cloud-ops/src/cloudctl.rs" = "cloud control plane: fixed harw-ctl subcommands (up/down/restart/enroll/revoke) behind cloud.cloudctl.* operations, no user-supplied program"
 "harw-cloud/harw-cloud-ops/src/status.rs" = "service manager (systemctl) status query, not a user workload"
+"harw-dod-client/src/units.rs" = "service manager (systemctl show) status query for the Harw-DoD units, not a user workload"
 "harw-cloud/harw-cloudctl/src/main.rs" = "service manager (systemctl) invocation by the cloud control CLI, not a user workload"
 "harw-cli/src/auth.rs" = "tooling: git/gh/cargo/editor invocation by the CLI, not a user workload"
 "harw-cli/src/auto_build.rs" = "tooling: git/gh/cargo/editor invocation by the CLI, not a user workload"
