@@ -1,16 +1,16 @@
-//! Kontextquelle `security_signals` (Opt-in, `[memory] security_signals`).
+//! Opt-in `security_signals` context source (`[memory] security_signals`).
 //!
-//! Liest den DoD-Befund-Export (JSON Lines, siehe `harw-security-hub`) nur als
-//! Zähler: je Regel die Anzahl hoher/kritischer Befunde der letzten 24 h.
-//! Den Exportpfad löst derselbe Resolver auf wie `harw dod` und die
-//! `dod.*`-Werkzeuge (`harw_dod_client::resolve_export_paths`, PL-97 D3):
-//! `[dod] export_dir`, sonst `/var/lib/harw-dod/export`, falls lesbar, sonst
-//! `<home>/dod/export` — ohne Override und ohne lesbaren Systempfad also
-//! derselbe Pfad wie zuvor. Die Auflösung läuft je Turn, ein später lesbar
-//! gewordener Systemexport greift ohne Neustart.
-//! Kein Befundtext, keine Host- oder Befund-IDs. Das Fragment ist Evidenz
-//! (nie Anweisung); die Datei ist angreiferbeeinflusst und wird deshalb nur
-//! begrenzt gelesen (Endstück, Zeilenlimit, kein Symlink).
+//! Reads only per-rule counts of high/critical DoD findings from the last
+//! 24 hours. The same resolver as `harw dod` and the `dod.*` tools selects
+//! the export: an explicit `[dod] export_dir` wins; otherwise an unreadable
+//! system export is retained, and only an absent system export permits the
+//! home fallback. Resolution runs each turn, so newly readable system
+//! exports take effect without restarting.
+//!
+//! Each fragment retains the source and verification hint. It contains no
+//! finding text, host IDs or finding IDs and remains evidence, never an
+//! instruction. The attacker-influenced file is read with bounded tail and
+//! line limits; symlinks are rejected by the metadata check.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -125,16 +125,20 @@ impl SecuritySignalsContextProvider {
     /// The findings export path as resolved now.
     #[must_use]
     pub fn export_path(&self) -> PathBuf {
+        self.export_paths().findings
+    }
+
+    fn export_paths(&self) -> harw_dod_client::ExportPaths {
         harw_dod_client::resolve_export_paths_with(
             self.export_dir.as_deref(),
             &self.home,
             &self.system_export_dir,
         )
-        .findings
     }
 
-    fn read_tail(&self) -> Option<Vec<u8>> {
-        let export = self.export_path();
+    fn read_tail(&self) -> Option<(Vec<u8>, harw_dod_client::ExportSource)> {
+        let paths = self.export_paths();
+        let export = paths.findings;
         let meta = std::fs::symlink_metadata(&export).ok()?;
         if !meta.file_type().is_file() {
             return None;
@@ -153,7 +157,7 @@ impl SecuritySignalsContextProvider {
                 .map_or(buf.len(), |i| i + 1);
             buf.drain(..cut);
         }
-        Some(buf)
+        Some((buf, paths.source))
     }
 }
 
@@ -168,15 +172,25 @@ impl ContextProvider for SecuritySignalsContextProvider {
 
     fn contribute<'a>(&'a self, _ctx: &'a TurnInputContext) -> ExtFuture<'a, Vec<ContextFragment>> {
         Box::pin(async move {
-            let Some(bytes) = self.read_tail() else {
+            let Some((bytes, source)) = self.read_tail() else {
                 return Vec::new();
             };
             let counts = count_recent(&bytes, OffsetDateTime::now_utc());
             render(&counts)
                 .map(|content| {
+                    let label = match source {
+                        harw_dod_client::ExportSource::System => "system",
+                        harw_dod_client::ExportSource::SystemUnreadable => "system unreadable",
+                        harw_dod_client::ExportSource::Override => "override",
+                        harw_dod_client::ExportSource::Home => "home",
+                    };
+                    let provenance = match source.hint() {
+                        Some(hint) => format!("Export source: {label} (unverified); {hint}"),
+                        None => format!("Export source: {label} (verified)"),
+                    };
                     vec![ContextFragment {
                         label: SECURITY_SIGNALS_LABEL.to_owned(),
-                        content,
+                        content: format!("{provenance}\n{content}"),
                     }]
                 })
                 .unwrap_or_default()
@@ -272,7 +286,10 @@ mod tests {
                 r#"{"finding_id":"f-2","host":"host-a","rule_id":"structure-drift","severity":"critical","summary":"v1","observed_at":"2026-09-27T11:00:00Z"}"#
             ),
         )?;
-        let bytes = provider.read_tail().unwrap_or_default();
+        let bytes = provider
+            .read_tail()
+            .map(|(bytes, _)| bytes)
+            .unwrap_or_default();
         assert_eq!(
             count_recent(&bytes, fixture_now()).get("structure-drift"),
             Some(&2)
@@ -292,6 +309,36 @@ mod tests {
         let explicit = scratch.path().join("explicit");
         let provider = provider_with_system_dir(&home, Some(&explicit), &system);
         assert_eq!(provider.export_path(), explicit.join("findings.jsonl"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_fragments_preserve_unverified_export_provenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = tempfile::tempdir()?;
+        let home = scratch.path().join("home");
+        let system = scratch.path().join("absent-system");
+        let home_export = home.join("dod/export");
+        let explicit = scratch.path().join("override");
+        for dir in [&home_export, &explicit] {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(
+                dir.join(EXPORT_FILE),
+                serde_json::to_string(&serde_json::json!({
+                    "rule_id": "test-rule", "severity": "high",
+                    "observed_at": OffsetDateTime::now_utc().format(&Rfc3339)?,
+                }))?,
+            )?;
+        }
+        for (override_dir, source) in [(None, "home"), (Some(explicit.as_path()), "override")] {
+            let provider = provider_with_system_dir(&home, override_dir, &system);
+            let fragments = provider.contribute(&TurnInputContext::default()).await;
+            assert_eq!(fragments.len(), 1);
+            let text = &fragments[0].content;
+            assert!(text.contains("test-rule: 1"), "{text}");
+            assert!(text.contains("unverified"), "{text}");
+            assert!(text.contains(source), "{text}");
+        }
         Ok(())
     }
 
