@@ -855,6 +855,21 @@ fn skill_catalog_fragment(index: &harw_catalog::SkillIndex, l0_bytes: usize) -> 
     text
 }
 
+/// The `security_signals` context source of a root (PL-97 D4): the findings
+/// export resolved from the trusted `[dod] export_dir` of `config` and the
+/// harw `home`, through the same resolver as `harw dod` and the `dod.*`
+/// tools. Counts from a configured `export_dir` are marked unverified in
+/// the fragment (`ExportSource::Override`).
+fn security_signals_provider(
+    home: &Path,
+    config: &ResolvedConfig,
+) -> crate::security_signals::SecuritySignalsContextProvider {
+    crate::security_signals::SecuritySignalsContextProvider::with_export_dir(
+        home,
+        config.dod.export_dir.as_deref(),
+    )
+}
+
 /// Das Kontextprogramm der Wurzel-IR, geprüft gegen die Wurzeldecke
 /// (#22 Welle 1B).
 ///
@@ -3410,12 +3425,12 @@ impl RuntimeAssemblyBuilder {
         };
 
         // 12c2. Sicherheits-Signale (`[memory] security_signals`, Standard aus):
-        //       nur Zähler aus dem DoD-Export, Evidenz, nie Anweisung.
+        //       nur Zähler aus dem DoD-Export, Evidenz, nie Anweisung. Ein
+        //       gesetztes `[dod] export_dir` erreicht die Quelle (PL-97 D4) und
+        //       bleibt dort als unverifiziert markiert.
         let registry_builder = if config.harness.memory.security_signals {
             registry_builder
-                .context_provider(Arc::new(
-                    crate::security_signals::SecuritySignalsContextProvider::new(&spec.home),
-                ))
+                .context_provider(Arc::new(security_signals_provider(&spec.home, &config)))
                 .map_err(|error| RuntimeError::Registry {
                     detail: format!("could not register the security signals provider: {error}"),
                 })?
@@ -8322,6 +8337,63 @@ mod tests {
         assert_eq!(
             skill_catalog_fragment(&empty, l0),
             harw_registry_defaults::skill_catalog_hint(0)
+        );
+        Ok(())
+    }
+
+    /// PL-97 D4: ein gesetztes `[dod] export_dir` erreicht die Quelle
+    /// `security_signals` der Wurzel; ihre Zähler tragen den Vermerk
+    /// „unverifizierte Quelle“ samt Hinweis des Resolvers.
+    #[tokio::test]
+    async fn security_signals_follow_the_configured_dod_export_dir() -> TestResult {
+        use harw_extension_api::ContextProvider as _;
+        use time::format_description::well_known::Rfc3339;
+
+        let scratch = tempfile::tempdir()?;
+        let home = scratch.path().join("home");
+        let export = scratch.path().join("export");
+        std::fs::create_dir_all(&export)?;
+        let observed_at = time::OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(ctx("Zeitstempel"))?;
+        std::fs::write(
+            export.join(harw_dod_client::FINDINGS_FILE),
+            format!(
+                "{{\"schema_version\":2,\"finding_id\":\"f-1\",\"host\":\"h\",\"rule_id\":\"egress-flow\",\"severity\":\"high\",\"summary\":\"s\",\"observed_at\":\"{observed_at}\"}}\n"
+            ),
+        )?;
+        let mut config = ResolvedConfig::default();
+        config.dod.export_dir = Some(export.clone());
+
+        let provider = security_signals_provider(&home, &config);
+        assert_eq!(
+            provider.export_path(),
+            export.join(harw_dod_client::FINDINGS_FILE)
+        );
+        let fragments = provider
+            .contribute(&TurnInputContext {
+                session_id: harw_types::SessionId::new(),
+                turn_id: harw_types::TurnId::new(),
+                metadata: serde_json::Value::Null,
+            })
+            .await;
+        let content = fragments
+            .first()
+            .map(|fragment| fragment.content.as_str())
+            .ok_or(TestError::Missing("security.signals-Fragment"))?;
+        let header = content.lines().next().unwrap_or_default();
+        assert!(header.contains("UNVERIFIZIERTE Quelle"), "{content}");
+        let hint = harw_dod_client::ExportSource::Override
+            .hint()
+            .ok_or(TestError::Missing("Override-Hinweis"))?;
+        assert!(header.contains(hint), "{content}");
+        assert!(content.contains("egress-flow: 1"), "{content}");
+
+        // Ohne `export_dir` liest die Quelle das konfigurierte Verzeichnis nie.
+        let plain = security_signals_provider(&home, &ResolvedConfig::default());
+        assert_ne!(
+            plain.export_path(),
+            export.join(harw_dod_client::FINDINGS_FILE)
         );
         Ok(())
     }

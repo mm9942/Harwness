@@ -113,7 +113,12 @@
   "research": null,
   "verification": null,
   "skills": {
-    "entries": []
+    "entries": [
+      {
+        "name": "harw-dod",
+        "hash": null
+      }
+    ]
   },
   "binary": {
     "name": "security-baseline-triage",
@@ -214,7 +219,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/security-baseline-triage.toml",
-          "line": 131,
+          "line": 135,
           "column": 11
         },
         "path": "context.program"
@@ -223,6 +228,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "429d294bbacb738cdb9e9521d4240abea76c0712ef8a9e678aa8e00dd907287e"
+    "digest": "1b4314e47706734bb00254bd00770672a3f121431e94dde0948e8105d3d4c14f"
   }
 }

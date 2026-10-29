@@ -113,7 +113,12 @@
   "research": null,
   "verification": null,
   "skills": {
-    "entries": []
+    "entries": [
+      {
+        "name": "harw-dod",
+        "hash": null
+      }
+    ]
   },
   "binary": {
     "name": "security-egress-triage",
@@ -214,7 +219,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/security-egress-triage.toml",
-          "line": 131,
+          "line": 135,
           "column": 11
         },
         "path": "context.program"
@@ -223,6 +228,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "88c6c8a65dc2fe458f2f1b8a017ecf46899b962c73a58b8af11ccc6f567cb78c"
+    "digest": "ec12a7b5a27330979f0e676ff791ad23378962b327fb7992ab21d828370308ca"
   }
 }

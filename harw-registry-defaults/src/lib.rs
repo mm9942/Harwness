@@ -60,6 +60,9 @@
 
 mod error;
 
+// PL-97 M3: Werkzeugname → Aktivitätsdeskriptor (PL-71), über die
+// Typlöschung der Provider hinweg.
+pub mod activity_map;
 pub mod agent_definition_tools;
 pub mod authority;
 // #22 wave 2B: tool name → provider, capability class, runner feature.
@@ -105,6 +108,7 @@ use harw_project_discovery::ProjectContext;
 // Freigabe-Hinweis ohne eigene `harw-tool-doc`-Kante testen kann.
 pub use harw_tool_doc::{RemoteOcrApproval, RemoteOcrTarget, remote_ocr_target};
 
+pub use activity_map::activity_for;
 pub use agent_definition_tools::{
     AgentDefinitionToolProvider, DefinitionAuthorCeiling, DefinitionWriteMode,
     UiaSelfDocumentToolProvider,

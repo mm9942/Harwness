@@ -1206,10 +1206,27 @@ Recommended execution order:
   - Summaries and lint for `job.*` need a state-free spec function in
     `harw-tool-job`.
   - Gate: `harw-cli` `chat::tests::test_one_shot_policy_gated_tool_call_is_denied_without_pausing`
-    overruns its fixture window (about 38k estimated tokens against about
+    overran its fixture window (about 38k estimated tokens against about
     27.9k). B2 adds about 1.2 KB per root request (the `tool.index` spec and
     the families block), a few hundred tokens of a roughly 10k overrun.
-    Owner: the wave-4 gate-fix zone (chat.rs fixture and tool-spec budget).
+    Test side closed by wave-4 zone G1: the fixture names a 200k window and
+    `test_full_root_tool_specs_stay_within_the_pinned_budget` pins the Full
+    root's tool specs (94,543 bytes for 99 tools, bound 96 KiB).
+  - Open product regression (follow-up from zone G1, **needs an owner
+    decision**): a Full root (TUI or one-shot) on any model that falls back
+    to 32,768 tokens (`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`: unknown models,
+    local models without `[models.<id>].context_window`, catalogued 32k
+    Qwen/Moonshot entries) is refused on its first round: the request is
+    about 38.1k estimated tokens against a 27,853-token budget; a 40,960
+    window is refused too. Owner: harw-runtime assembly / tool-surface
+    design. Measured remedies, none decided: (a) give the root the compact
+    tool schemas children already get below 64k (about 30.6k tokens: fits
+    40k, not 32k); (b) leave out `fsread.*`/`sys.*`/`git.*` on small windows
+    (about 24.3k tokens, fits 32k, but `## Available tools` and
+    `## Tool families` must then come from the trimmed set); (c) on-demand
+    exposure via the unused `ToolExposure::Deferred`. Reproduction:
+    the `#[ignore]`d `harw-cli` test
+    `chat::tests::test_full_root_first_round_fits_the_unknown_model_fallback_window`.
 
 ### B3 — `harw skill …` and `/skills preview|validate` (S2)
 - Files: `harw-cli/src/cli/skill.rs`, `harw-ops/src/skills.rs`, `docs/cli.md`.

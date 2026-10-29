@@ -113,7 +113,12 @@
   "research": null,
   "verification": null,
   "skills": {
-    "entries": []
+    "entries": [
+      {
+        "name": "harw-dod",
+        "hash": null
+      }
+    ]
   },
   "binary": {
     "name": "security-endpoint-triage",
@@ -214,7 +219,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/security-endpoint-triage.toml",
-          "line": 147,
+          "line": 151,
           "column": 11
         },
         "path": "context.program"
@@ -223,6 +228,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "8b4d6f275e5d91b776fc6015d2c5d4c73ee6a16a9eda384e9c00027710dbc0f9"
+    "digest": "7fe18565935e8e67413b81c1c8cced1bd5aa8458ba3100ee3e7cf5ba95bcebdf"
   }
 }

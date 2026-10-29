@@ -286,7 +286,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/security-structure-triage.toml",
-          "line": 129,
+          "line": 133,
           "column": 11
         },
         "path": "context.program"

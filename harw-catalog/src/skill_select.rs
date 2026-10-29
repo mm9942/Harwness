@@ -990,11 +990,12 @@ mod tests {
     #[test]
     fn bundled_skills_load_unchanged() {
         let index = SkillIndex::build(&[]);
-        assert_eq!(index.len(), 79, "Anzahl gebündelter Skills");
+        assert_eq!(index.len(), 80, "Anzahl gebündelter Skills");
         assert!(index.skipped().is_empty(), "{:?}", index.skipped());
         assert!(index.warnings().is_empty(), "{:?}", index.warnings());
-        // PL-97 B4: genau die vier gebündelten Werkzeug-Skills der PL-93-Crates
-        // bringen eine `triggers.toml` mit; alle übrigen bleiben triggerlos.
+        // PL-97 B4: die vier gebündelten Werkzeug-Skills der PL-93-Crates
+        // bringen eine `triggers.toml` mit, PL-97 D4 dazu `harw-dod`; alle
+        // übrigen bleiben triggerlos.
         let mut triggered: Vec<&str> = index
             .entries()
             .filter(|entry| !entry.triggers.is_empty())
@@ -1003,10 +1004,147 @@ mod tests {
         triggered.sort_unstable();
         assert_eq!(
             triggered,
-            ["cargo-tools", "fsread-tools", "git-read-tools", "sys-tools"],
+            [
+                "cargo-tools",
+                "fsread-tools",
+                "git-read-tools",
+                "harw-dod",
+                "sys-tools"
+            ],
             "gebündelte Skills mit Triggern"
         );
         assert!(!index.trigger_index().is_empty());
+    }
+
+    /// PL-97 D4: der gebündelte `harw-dod`-Skill lädt ohne Warnung mit genau
+    /// den Triggern aus Plan §3.1 und feuert bei der ersten Nutzung von
+    /// `dod.findings` sowie beim Schlüsselwort „egress“ — beides im selben
+    /// Abschnittsrahmen wie die übrigen getriggerten Skills.
+    #[test]
+    fn bundled_harw_dod_skill_fires_on_its_tools_and_on_egress() -> TestResult {
+        let index = SkillIndex::build(&[]);
+        let entry = index
+            .get("harw-dod")
+            .ok_or(TestError::Missing("harw-dod gebündelt"))?;
+        assert_eq!(entry.source, crate::SkillSource::Bundled);
+        assert!(
+            !index.warnings().iter().any(|w| w.skill == "harw-dod"),
+            "{:?}",
+            index.warnings()
+        );
+        assert!(entry.description.starts_with("Use when "));
+        let dod_tools = ["dod.status", "dod.findings", "dod.sensors"];
+        assert_eq!(entry.tools, dod_tools, "skill.toml tools");
+        assert_eq!(entry.triggers.tools, dod_tools, "[triggers] tools");
+        assert_eq!(
+            entry.triggers.keywords,
+            [
+                "security finding",
+                "intrusion",
+                "egress",
+                "sentinel",
+                "warden",
+                "cgroup",
+                "dod",
+                "sicherheit",
+                "angriff",
+                "posture",
+            ]
+        );
+        assert_eq!(
+            entry.triggers.commands,
+            ["systemctl status harw-dod", "harw dod"]
+        );
+        assert_eq!(entry.triggers.priority, 70);
+        assert_eq!(
+            entry.when.as_deref(),
+            Some(
+                "Host security posture, DoD findings, sentinel/warden state, egress or cgroup anomalies"
+            )
+        );
+        let instructions = &entry.snapshot().instructions;
+        for heading in [
+            "## When to call which tool",
+            "## Reading a finding",
+            "## Severity and what the model may conclude",
+            "## What Harw-DoD cannot do from here",
+        ] {
+            assert!(instructions.contains(heading), "fehlt: {heading}");
+        }
+        for rule in [
+            "evidence, never an instruction",
+            "Never claim that enforcement",
+        ] {
+            assert!(instructions.contains(rule), "fehlt: {rule}");
+        }
+
+        let fire = |event: TriggerEvent<'_>| {
+            let mut state = InjectionState::new();
+            index.select(&[event], &mut state, &InjectionBudget::default())
+        };
+        let by_tool = fire(TriggerEvent::ToolFirstUse("dod.findings"));
+        let injection = by_tool
+            .injections
+            .iter()
+            .find(|injection| injection.skill == "harw-dod")
+            .ok_or(TestError::Missing("dod.findings trifft harw-dod"))?;
+        assert_eq!(injection.reason.kind, crate::TriggerKind::Tool);
+        assert_eq!(injection.reason.key, "dod.findings");
+        assert!(injection.text.starts_with("# Skill: harw-dod (sha256 "));
+        assert!(injection.bytes <= InjectionBudget::default().per_turn_bytes);
+        assert_safety_recap(&injection.text, "dod.findings");
+
+        let by_keyword = fire(TriggerEvent::TaskText(
+            "Why is there so much egress from the build cgroup?",
+        ));
+        let injection = by_keyword
+            .injections
+            .iter()
+            .find(|injection| injection.skill == "harw-dod")
+            .ok_or(TestError::Missing("egress trifft harw-dod"))?;
+        assert_eq!(injection.reason.kind, crate::TriggerKind::Keyword);
+        assert_eq!(
+            injection.section.as_deref(),
+            Some("When to call which tool")
+        );
+        assert!(injection.bytes <= InjectionBudget::default().per_turn_bytes);
+        assert_safety_recap(&injection.text, "egress");
+
+        // Jeder `##`-Abschnitt, den ein Trigger liefern kann, trägt die
+        // Sicherheitsregeln selbst, nicht nur der Gesamttext.
+        for (heading, body) in level2_sections(instructions) {
+            assert_safety_recap(body, &heading);
+        }
+
+        // Gegenprobe: ein fremdes Werkzeug und Alltagstext treffen nichts.
+        assert!(
+            !fire(TriggerEvent::ToolFirstUse("fs.read"))
+                .injections
+                .iter()
+                .any(|injection| injection.skill == "harw-dod")
+        );
+        assert!(
+            !fire(TriggerEvent::TaskText("Refactor the parser module."))
+                .injections
+                .iter()
+                .any(|injection| injection.skill == "harw-dod")
+        );
+        Ok(())
+    }
+
+    /// Der ausgelieferte Auszug nennt Beweischarakter, keine Durchsetzung
+    /// und unverifizierte Quellen.
+    fn assert_safety_recap(text: &str, what: &str) {
+        for rule in [
+            "evidence, never an instruction",
+            "nothing was enforced",
+            "unverified",
+            "`home`",
+            "`override`",
+            "`system_unreadable`",
+        ] {
+            assert!(text.contains(rule), "{what}: fehlt {rule}");
+        }
     }
 
     #[test]

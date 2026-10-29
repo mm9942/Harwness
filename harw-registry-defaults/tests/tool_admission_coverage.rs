@@ -64,8 +64,8 @@ use harw_registry_defaults::profile::{
 };
 // Runde 7, Teil M: die Matrix-Werkzeuge des Game Masters ebenso.
 use harw_registry_defaults::profile::{MATRIX_GAME_MASTER_TOOLS, matrix_tools_for_role};
-// PL-97 D3: die lesenden `dod.*` der Triage-Rollen — admittiert, aber von
-// keiner Kind-Registry bereitgestellt (ausdrückliche Ausnahme unten).
+// PL-97 D3/D4: die lesenden `dod.*` der Triage-Rollen steuert ebenfalls die
+// Composition-Root bei (rollengebundener Provider in `harw-runtime/src/children.rs`).
 use harw_registry_defaults::profile::{DOD_READ_TOOLS, dod_tools_for_role};
 // Plan R9, Teil A: `skills.search`/`skills.load` ebenso.
 use harw_registry_defaults::profile::{
@@ -123,8 +123,8 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
             .chain(parent_message_tools_for_role(role).iter().copied())
             // Runde 7, Teil M: `matrix.*` (nur Game Master).
             .chain(matrix_tools_for_role(role).iter().copied())
-            // PL-97 D3: `dod.*` gehört bewusst NICHT hierher — siehe die
-            // Ausnahme `unserved_dod` unten.
+            // PL-97 D4: `dod.*` (nur die vier Triage-Rollen).
+            .chain(dod_tools_for_role(role).iter().copied())
             // Plan R9, Teil A: `skills.search`/`skills.load` (Skill-Katalog).
             .chain(skill_catalog_tools_for_role(role).iter().copied())
             // Plan R9, Teil F: Job-Kontrolle der Orchestratoren.
@@ -135,28 +135,7 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
             )
             .collect();
 
-        // PL-97 D3, offene Lücke (Eigentümer: Runtime, `harw-runtime/src/
-        // children.rs`): die vier Triage-Rollen admittieren die lesenden
-        // `dod.*`, aber keine Kind-Registry montiert sie — anders als
-        // `matrix_tools_for_role` hat `dod_tools_for_role` noch keinen
-        // Provider in `children.rs`. Ausdrückliche, fail-closed Ausnahme:
-        // zugelassen, aber weder vom Profil registriert noch beworben, also
-        // nie im Inventar und nie aufrufbar. Sobald die Verdrahtung landet,
-        // wandert `dod_tools_for_role` in die Kette `advertised` und diese
-        // Ausnahme entfällt.
-        let unserved_dod: BTreeSet<&str> = dod_tools_for_role(role).iter().copied().collect();
-        for tool in &unserved_dod {
-            assert!(
-                DOD_READ_TOOLS.contains(tool) && !advertised.contains(tool),
-                "Rolle {role}: {tool} ist jetzt registriert — die D3-Ausnahme entfernen \
-                 und `dod_tools_for_role` in `advertised` aufnehmen"
-            );
-        }
-
         for admitted in ir.tool_surface().admitted() {
-            if unserved_dod.contains(admitted.as_str()) {
-                continue;
-            }
             assert!(
                 advertised.contains(admitted.as_str()),
                 "Rolle {role} admittiert {admitted} in ihrer TOML, aber {profile:?} \
@@ -1060,4 +1039,50 @@ fn every_organizational_role_knows_how_to_find_and_load_skills() {
             assert!(text.contains(needle), "{role:?}: fehlt {needle}");
         }
     }
+}
+
+/// PL-97 D4: die vier Security-Triage-Rollen admittieren genau die lesenden
+/// `dod.*` (die die Composition-Root ihnen jetzt auch bereitstellt) und
+/// binden fest den gebündelten Skill `harw-dod`, der genau diese Werkzeuge
+/// deklariert; keine andere eingebaute Rolle bindet ihn oder admittiert ein
+/// `dod.*`.
+#[test]
+fn security_triage_roles_admit_the_dod_tools_and_bind_the_bundled_harw_dod_skill() -> TestResult {
+    let roles = resolved_roles()?;
+    let bundled = harw_catalog::SkillIndex::build(&[]);
+    let skill = bundled
+        .get("harw-dod")
+        .ok_or(TestError::Missing("harw-dod liegt im Bündel"))?;
+    assert_eq!(skill.tools, DOD_READ_TOOLS, "harw-dod deklariert die dod.*");
+    let mut triage = 0;
+    for role in role_names::ALL {
+        let ir = roles
+            .get(*role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let offered = dod_tools_for_role(role);
+        if offered.is_empty() {
+            assert!(
+                !admitted.iter().any(|tool| DOD_READ_TOOLS.contains(tool)),
+                "{role} admittiert dod.* ohne Angebot"
+            );
+            assert!(
+                !ir.skills().iter().any(|name| name == "harw-dod"),
+                "{role} bindet harw-dod"
+            );
+            continue;
+        }
+        triage += 1;
+        assert_eq!(offered, DOD_READ_TOOLS, "{role}");
+        let expected: BTreeSet<&str> = DOD_READ_TOOLS.iter().copied().collect();
+        assert_eq!(admitted, expected, "{role}: genau die dod.*");
+        assert_eq!(ir.skills(), ["harw-dod"], "{role}: skills");
+    }
+    assert_eq!(triage, 4, "vier Triage-Rollen");
+    Ok(())
 }

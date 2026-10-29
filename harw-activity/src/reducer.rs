@@ -67,6 +67,17 @@
 //! state lives in ordered maps, nothing reads a clock, and ids and revisions
 //! are `ingest_seq` values, so `replay(log) == live(log)` holds by
 //! construction.
+//!
+//! # Bounded retention
+//! On its own the reducer keeps every instance, so its memory grows with the
+//! stream. A long-lived consumer (the TUI adapter of PL-97 M3) bounds it with
+//! [`Reducer::evict_closed`]: closed ([`crate::Phase::Terminal`]) instances
+//! beyond a cap are dropped, oldest [`ProjectionId`] first, together with
+//! every index entry that points at them. Open and quiescent instances are
+//! never evicted. The counters of evicted instances are preserved
+//! ([`Reducer::evicted_instances`], [`Reducer::evicted_counts`]), so a
+//! failure never disappears from the totals. Eviction is deterministic: the
+//! same events with the same eviction calls yield the same state.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -74,7 +85,7 @@ use std::fmt;
 use crate::descriptor::{AGENT_DOMAIN, ActivityDescriptor, Effect, JOB_DOMAIN};
 use crate::event::{ActivityEvent, ActivityKey, Boundary, Lifecycle, Outcome};
 use crate::pattern::{
-    Anomaly, Constituent, ConstituentId, ConstituentStatus, PatternId, PatternInstance,
+    Anomaly, Constituent, ConstituentId, ConstituentStatus, Counts, PatternId, PatternInstance,
     ProjectionId, ProjectionUpdate, Scope,
 };
 
@@ -146,9 +157,11 @@ struct BurstSlot {
 
 /// Deterministic pattern reducer over one totally ordered activity stream.
 ///
-/// The reducer never removes an instance and never moves a constituent
-/// between instances, so every applied activity stays visible in exactly one
-/// home instance (plus, for failed agent runs, one failure burst).
+/// The reducer never moves a constituent between instances and removes an
+/// instance only when asked to ([`Reducer::evict_closed`], closed instances
+/// only), so every applied activity stays visible in exactly one home
+/// instance (plus, for failed agent runs, one failure burst) until its
+/// instance is closed and evicted; its counters survive the eviction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Reducer {
     last_seq: Option<u64>,
@@ -159,6 +172,10 @@ pub struct Reducer {
     keys: BTreeMap<KeySlot, ProjectionId>,
     bursts: BTreeMap<BurstSlot, ProjectionId>,
     burst_of: BTreeMap<ConstituentId, ProjectionId>,
+    /// Number of instances removed by [`Reducer::evict_closed`].
+    evicted: u64,
+    /// Summed constituent counters of the evicted instances, per pattern.
+    evicted_counts: BTreeMap<PatternId, Counts>,
 }
 
 impl Reducer {
@@ -258,6 +275,83 @@ impl Reducer {
             key: ActivityKey::Job(work_id.to_owned()),
         };
         self.keys.get(&slot).copied()
+    }
+
+    // ── bounded retention ───────────────────────────────────────────────────
+
+    /// Number of closed ([`crate::Phase::Terminal`]) instances currently held.
+    pub fn closed_instances(&self) -> usize {
+        self.instances
+            .values()
+            .filter(|instance| instance.is_terminal())
+            .count()
+    }
+
+    /// Bounded retention: evicts the oldest closed instances so that at most
+    /// `keep` closed ones remain, and returns the evicted ids in eviction
+    /// order (ascending [`ProjectionId`]).
+    ///
+    /// Only [`crate::Phase::Terminal`] instances are evicted: nothing runs in
+    /// them and they take no new constituents. Open and quiescent instances,
+    /// the stream position ([`Reducer::last_seq`]) and the stale counter are
+    /// never touched. Every index entry pointing at an evicted instance goes
+    /// with it, so memory is bounded by the open instances plus `keep`. The
+    /// counters of the evicted instances are added to
+    /// [`Reducer::evicted_counts`] (failures included), so totals over live
+    /// and evicted instances never shrink.
+    ///
+    /// A later event of a constituent whose instance was evicted is reduced
+    /// as a new constituent (its history is gone); a job whose terminal
+    /// instance was evicted opens a new `job-lifecycle@1` instance on its next
+    /// observation instead of a standalone one.
+    pub fn evict_closed(&mut self, keep: usize) -> Vec<ProjectionId> {
+        let closed: Vec<ProjectionId> = self
+            .instances
+            .iter()
+            .filter(|(_, instance)| instance.is_terminal())
+            .map(|(id, _)| *id)
+            .collect();
+        let excess = closed.len().saturating_sub(keep);
+        if excess == 0 {
+            return Vec::new();
+        }
+        let evicted: Vec<ProjectionId> = closed.into_iter().take(excess).collect();
+        for id in &evicted {
+            if let Some(instance) = self.instances.remove(id) {
+                let tally = self.evicted_counts.entry(instance.pattern).or_default();
+                add_counts(tally, &instance.state.counts);
+                self.evicted += 1;
+            }
+        }
+        let gone: BTreeSet<ProjectionId> = evicted.iter().copied().collect();
+        self.homes.retain(|_, id| !gone.contains(id));
+        self.burst_of.retain(|_, id| !gone.contains(id));
+        self.files.retain(|_, id| !gone.contains(id));
+        self.keys.retain(|_, id| !gone.contains(id));
+        self.bursts.retain(|_, id| !gone.contains(id));
+        evicted
+    }
+
+    /// Number of instances evicted so far by [`Reducer::evict_closed`].
+    pub fn evicted_instances(&self) -> u64 {
+        self.evicted
+    }
+
+    /// Summed constituent counters of every evicted instance (all patterns).
+    pub fn evicted_counts(&self) -> Counts {
+        let mut total = Counts::default();
+        for counts in self.evicted_counts.values() {
+            add_counts(&mut total, counts);
+        }
+        total
+    }
+
+    /// Summed constituent counters of the evicted instances of `pattern`.
+    pub fn evicted_counts_of(&self, pattern: PatternId) -> Counts {
+        self.evicted_counts
+            .get(&pattern)
+            .copied()
+            .unwrap_or_default()
     }
 
     fn updates(&self, touched: BTreeSet<ProjectionId>) -> Vec<ProjectionUpdate> {
@@ -786,6 +880,15 @@ fn file_slot(event: &ActivityEvent, pattern: PatternId, path: &str) -> FileSlot 
     }
 }
 
+/// Adds `more` to `total`, field by field (saturating).
+fn add_counts(total: &mut Counts, more: &Counts) {
+    total.total = total.total.saturating_add(more.total);
+    total.running = total.running.saturating_add(more.running);
+    total.succeeded = total.succeeded.saturating_add(more.succeeded);
+    total.failed = total.failed.saturating_add(more.failed);
+    total.cancelled = total.cancelled.saturating_add(more.cancelled);
+}
+
 /// `true` for known agent-runtime semantics (child agent run events).
 fn is_agent_run(descriptor: &ActivityDescriptor) -> bool {
     descriptor.is_known() && descriptor.domain == AGENT_DOMAIN
@@ -804,3 +907,177 @@ fn breaks_file_instances(event: &ActivityEvent) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// Tests of the bounded retention API ([`Reducer::evict_closed`]).
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::event::ActivityOwner;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const FS_READ: ActivityDescriptor =
+        ActivityDescriptor::new("filesystem", "read", Some("path"), Effect::Observe);
+    const JOB_START: ActivityDescriptor =
+        ActivityDescriptor::new("job", "start", None, Effect::Execute);
+
+    fn read(seq: u64, turn: u64, call: &str, path: &str, lifecycle: Lifecycle) -> ActivityEvent {
+        ActivityEvent::new(
+            seq,
+            ActivityOwner::session("root")
+                .with_turn(turn)
+                .with_call(call),
+            FS_READ,
+            lifecycle,
+        )
+        .with_resource(ActivityKey::Path(path.to_owned()))
+    }
+
+    fn turn_end(seq: u64, turn: u64) -> ActivityEvent {
+        ActivityEvent::new(
+            seq,
+            ActivityOwner::session("root").with_turn(turn),
+            ActivityDescriptor::SCOPE,
+            Lifecycle::Boundary(Boundary::TurnEnd),
+        )
+    }
+
+    fn call_id(call: &str) -> ConstituentId {
+        ConstituentId::Call {
+            session: "root".to_owned(),
+            call: call.to_owned(),
+        }
+    }
+
+    fn burst(opened_at: u64) -> ProjectionId {
+        ProjectionId {
+            opened_at,
+            pattern: PatternId::FILE_READ_BURST,
+        }
+    }
+
+    /// Two closed bursts (one with a failure) and one open burst.
+    fn stream() -> Vec<ActivityEvent> {
+        vec![
+            read(1, 1, "c1", "a", Lifecycle::Started),
+            read(2, 1, "c1", "a", Lifecycle::Finished).with_outcome(Outcome::failed("io")),
+            read(3, 1, "c2", "b", Lifecycle::Started),
+            read(4, 1, "c2", "b", Lifecycle::Finished),
+            turn_end(5, 1),
+            read(6, 2, "c3", "c", Lifecycle::Started),
+        ]
+    }
+
+    #[test]
+    fn eviction_drops_only_closed_instances_and_keeps_the_counters() -> TestResult {
+        let mut reducer = Reducer::replay(&stream());
+        assert_eq!(reducer.closed_instances(), 2);
+        let failed_before: u64 = reducer.instances().map(PatternInstance::failed).sum();
+        assert_eq!(failed_before, 1);
+
+        // Oldest closed instance first; the open burst `c` is never a candidate.
+        assert_eq!(reducer.evict_closed(1), vec![burst(1)]);
+        assert!(reducer.instance(&burst(1)).is_none());
+        assert!(reducer.instance(&burst(3)).is_some());
+        assert!(reducer.instance(&burst(6)).is_some());
+        assert_eq!(reducer.projection_of(&call_id("c1")), None);
+        assert_eq!(reducer.projection_of(&call_id("c2")), Some(burst(3)));
+
+        // Counters survive the eviction: no failure leaves the totals.
+        assert_eq!(reducer.evicted_instances(), 1);
+        let evicted = reducer.evicted_counts();
+        assert_eq!((evicted.total, evicted.failed), (1, 1));
+        assert_eq!(
+            reducer.evicted_counts_of(PatternId::FILE_READ_BURST),
+            evicted
+        );
+        assert_eq!(
+            reducer.evicted_counts_of(PatternId::JOB_LIFECYCLE),
+            Counts::default()
+        );
+        let live_failed: u64 = reducer.instances().map(PatternInstance::failed).sum();
+        assert_eq!(live_failed + evicted.failed, failed_before);
+        assert_eq!(reducer.last_seq(), Some(6));
+        assert_eq!(reducer.stale_events(), 0);
+
+        // keep = 0 evicts the remaining closed burst, never the open one.
+        assert_eq!(reducer.evict_closed(0), vec![burst(3)]);
+        assert!(reducer.evict_closed(0).is_empty());
+        assert_eq!(reducer.closed_instances(), 0);
+        assert_eq!(reducer.evicted_instances(), 2);
+        assert_eq!(reducer.evicted_counts().total, 2);
+        let open = reducer
+            .instance(&burst(6))
+            .ok_or("the open burst must stay")?;
+        assert_eq!(open.state.counts.running, 1);
+
+        // The open burst keeps reducing normally after evictions.
+        let updates = reducer.apply(&read(7, 2, "c3", "c", Lifecycle::Finished));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].id, burst(6));
+        Ok(())
+    }
+
+    #[test]
+    fn eviction_is_deterministic_and_replayable() {
+        let events = stream();
+        let run = || {
+            let mut reducer = Reducer::new();
+            let mut evicted = Vec::new();
+            for event in &events {
+                reducer.apply(event);
+                evicted.extend(reducer.evict_closed(1));
+            }
+            (reducer, evicted)
+        };
+        let (first, first_evicted) = run();
+        let (second, second_evicted) = run();
+        assert_eq!(first, second);
+        assert_eq!(first_evicted, second_evicted);
+        assert_eq!(first_evicted, vec![burst(1)]);
+    }
+
+    #[test]
+    fn a_running_job_is_kept_and_its_index_goes_with_the_eviction() -> TestResult {
+        let owner = || ActivityOwner::session("root").with_turn(1).with_call("s");
+        let mut reducer = Reducer::new();
+        reducer.apply(
+            &ActivityEvent::new(1, owner(), JOB_START, Lifecycle::Started)
+                .with_resource(ActivityKey::Call("s".into())),
+        );
+        reducer.apply(
+            &ActivityEvent::new(2, owner(), JOB_START, Lifecycle::Finished)
+                .with_resource(ActivityKey::Call("s".into())),
+        );
+        reducer.apply(
+            &ActivityEvent::new(
+                3,
+                ActivityOwner::session("root").with_turn(1),
+                JOB_START,
+                Lifecycle::Rebase {
+                    to: ActivityKey::Job("W".into()),
+                },
+            )
+            .with_resource(ActivityKey::Call("s".into())),
+        );
+        // The run is still going: nothing to evict.
+        assert!(reducer.evict_closed(0).is_empty());
+        let job = reducer.job_projection("W").ok_or("the job is bound to W")?;
+
+        reducer.apply(
+            &ActivityEvent::new(
+                4,
+                ActivityOwner::session("root"),
+                ActivityDescriptor::JOB_RUN,
+                Lifecycle::Finished,
+            )
+            .with_resource(ActivityKey::Job("W".into()))
+            .with_outcome(Outcome::Succeeded),
+        );
+        assert_eq!(reducer.evict_closed(0), vec![job]);
+        assert_eq!(reducer.job_projection("W"), None);
+        let counts = reducer.evicted_counts_of(PatternId::JOB_LIFECYCLE);
+        assert_eq!((counts.total, counts.succeeded, counts.failed), (2, 2, 0));
+        Ok(())
+    }
+}

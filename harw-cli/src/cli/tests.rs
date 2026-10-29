@@ -2843,3 +2843,443 @@ fn test_skill_tree_has_help_text_and_accepts_json() -> TestResult {
     }
     Ok(())
 }
+
+// ── PL-97 B5: Regeln für den ganzen Befehlsbaum ────────────────────────────
+
+/// Befehle, die `--json` an der Dispatch-Schranke
+/// (`crate::reject_unsupported_json`) ablehnen und nur Text ausgeben.
+///
+/// Jeder Eintrag deckt den Pfad selbst und alle Unterbefehle darunter ab.
+/// Neue Befehle sollen `--json` über den bestehenden `Printer` liefern;
+/// wer bewusst reinen Text ausgibt, trägt sich hier mit Grund ein.
+const TEXT_ONLY_COMMANDS: &[(&str, &str)] = &[
+    // Interaktive Oberflächen und Dialoge: es gibt kein Ergebnis-Objekt.
+    ("harw", "ohne Subcommand startet der interaktive Chat"),
+    ("harw chat", "interaktiver Chat"),
+    ("harw exec", "Modell-Ausgabe wird als Text gestreamt"),
+    ("harw analyze", "Agentenlauf mit gestreamter Ausgabe"),
+    ("harw session resume", "setzt den interaktiven Chat fort"),
+    (
+        "harw attach",
+        "interaktive Verbindung zu einer Host-Sitzung",
+    ),
+    ("harw onboard", "interaktiver Einrichtungsassistent"),
+    (
+        "harw config",
+        "Menü und Konfigurationsdialoge; älterer Befehl ohne JSON-Form",
+    ),
+    // Ältere Verwaltungsbefehle ohne JSON-Form (vor PL-97, nicht Teil von B5).
+    ("harw model", "älterer Befehl ohne JSON-Form"),
+    ("harw auth", "älterer Befehl; liest Geheimnisse interaktiv"),
+    ("harw project", "älterer Befehl ohne JSON-Form"),
+    ("harw pr-review", "Agentenlauf mit gestreamter Ausgabe"),
+    ("harw mcp", "älterer Befehl ohne JSON-Form"),
+    ("harw channel", "interaktive Kopplung eines Kanals"),
+    ("harw init", "älterer Befehl ohne JSON-Form"),
+    ("harw doctor", "älterer Befehl ohne JSON-Form"),
+    ("harw update", "Installationsvorgang mit Rückfrage"),
+    ("harw tailscale", "älterer Befehl ohne JSON-Form"),
+    ("harw uninstall", "Deinstallation mit Rückfrage"),
+    ("harw completions", "gibt ein Shell-Skript aus"),
+    ("harw bug-report", "älterer Befehl ohne JSON-Form"),
+    ("harw sandbox", "älterer Befehl ohne JSON-Form"),
+    ("harw debug", "Entwickler-Diagnose ohne JSON-Form"),
+    (
+        "harw kill",
+        "reicht alle Argumente an das Kill-Werkzeug weiter",
+    ),
+    // Dienste laufen im Vordergrund oder steuern Dienst-Einheiten.
+    ("harw gateway", "Dienst im Vordergrund bzw. Dienst-Einheit"),
+    ("harw serve", "Dienst im Vordergrund"),
+    ("harw web", "Dienst im Vordergrund"),
+    (
+        "harw service",
+        "steuert systemd/launchd, älterer Befehl ohne JSON-Form",
+    ),
+    // Versteckte ältere Schreibweisen (siehe `PERMANENT_ALIASES`) bleiben
+    // bei der Ausgabeform ihres Ursprungs.
+    (
+        "harw connect",
+        "ältere Schreibweise von `harw channel connect`",
+    ),
+    (
+        "harw lens",
+        "ältere Schreibweise von `harw knowledge index`",
+    ),
+    ("harw uia", "ältere Schreibweise von `harw agent uia-new`"),
+    (
+        "harw catalog",
+        "ältere Schreibweise von `harw model catalog`",
+    ),
+    ("harw run", "ältere Schreibweise von `harw debug echo`"),
+    (
+        "harw classify",
+        "ältere Schreibweise von `harw debug classify`",
+    ),
+    (
+        "harw install",
+        "ältere Schreibweise von `harw dod install --print-systemd`; \
+         die JSON-Form hat nur der neue Name",
+    ),
+];
+
+/// Befehle, die die Dispatch-Schranke passieren, `--json` aber erst im
+/// Befehl selbst per `Printer::require_text` ablehnen und nur Text ausgeben.
+///
+/// Gleiche Abdeckungsregel wie `TEXT_ONLY_COMMANDS`. Der Test verlangt, dass
+/// jeder Eintrag die Schranke passiert (sonst gehört er in
+/// `TEXT_ONLY_COMMANDS`), nicht veraltet ist und dass jedes
+/// Literal `"harw …"` als Argument von `require_text` in `harw-cli/src` von einer der beiden
+/// Listen abgedeckt wird.
+const RUNTIME_TEXT_ONLY_COMMANDS: &[(&str, &str)] = &[
+    (
+        "harw provider",
+        "zur Laufzeit abgelehnt von `Printer::require_text` (provider_cmd.rs)",
+    ),
+    (
+        "harw knowledge index",
+        "zur Laufzeit abgelehnt von `Printer::require_text` (knowledge_cmd.rs)",
+    ),
+    (
+        "harw agent uia-new",
+        "zur Laufzeit abgelehnt von `Printer::require_text` (agent_cmd.rs)",
+    ),
+];
+
+/// Versteckte Befehle: dauerhafte ältere Schreibweisen (mit neuem Namen)
+/// und interne Einstiege, die nur Skripte wie `make install` aufrufen.
+const HIDDEN_COMMANDS: &[(&str, &str)] = &[
+    ("harw connect", "harw channel connect"),
+    ("harw lens", "harw knowledge index"),
+    ("harw uia", "harw agent uia-new"),
+    ("harw catalog", "harw model catalog"),
+    ("harw run", "harw debug echo"),
+    ("harw classify", "harw debug classify"),
+    ("harw install", "harw dod install --print-systemd"),
+    ("harw agent install-record", "intern: `make install`"),
+    (
+        "harw agent auto-build-uia",
+        "intern: Start und `make install`",
+    ),
+    ("harw sandbox leases", "intern: Prozess-lokale Diagnose"),
+    ("harw sandbox revoke", "intern: Prozess-lokale Diagnose"),
+];
+
+/// Dauerhafte Alias-Namen von Befehlen (sichtbar oder versteckt).
+const PERMANENT_ALIASES: &[(&str, &str)] = &[
+    ("harw config", "settings"),
+    ("harw model", "models"),
+    ("harw model remove", "delete"),
+    ("harw completions", "completion"),
+];
+
+/// Ein Knoten des Befehlsbaums mit seinem Pfad ab `harw`.
+struct CommandNode {
+    path: Vec<String>,
+    command: clap::Command,
+    /// Der Knoten selbst oder ein Vorfahr ist versteckt.
+    hidden: bool,
+}
+
+/// Sammelt alle Befehle unterhalb von `harw` (ohne den Wurzelbefehl).
+fn collect_command_nodes(
+    command: &clap::Command,
+    path: &[String],
+    hidden: bool,
+    out: &mut Vec<CommandNode>,
+) {
+    for sub in command.get_subcommands() {
+        let mut sub_path = path.to_vec();
+        sub_path.push(sub.get_name().to_owned());
+        let sub_hidden = hidden || sub.is_hide_set();
+        collect_command_nodes(sub, &sub_path, sub_hidden, out);
+        out.push(CommandNode {
+            path: sub_path,
+            command: sub.clone(),
+            hidden: sub_hidden,
+        });
+    }
+}
+
+/// Alle Befehle von `harw` samt Wurzel (Pfad leer).
+fn command_nodes() -> Vec<CommandNode> {
+    let root = command();
+    let mut nodes = Vec::new();
+    collect_command_nodes(&root, &[], false, &mut nodes);
+    nodes.push(CommandNode {
+        path: Vec::new(),
+        command: root,
+        hidden: false,
+    });
+    nodes
+}
+
+/// `harw …` als lesbarer Pfad.
+fn path_label(path: &[String]) -> String {
+    std::iter::once("harw")
+        .chain(path.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Ein Beispielwert für ein Pflichtargument: der erste mögliche Wert eines
+/// `ValueEnum`, sonst `1` (passt für Text, Pfade und Zahlen).
+fn sample_value(arg: &clap::Arg) -> String {
+    arg.get_possible_values()
+        .first()
+        .map_or_else(|| "1".to_owned(), |value| value.get_name().to_owned())
+}
+
+/// Baut eine parsebare Kommandozeile `harw --json PFAD ARGUMENTE`: jede
+/// Pflichtoption und jedes Positionsargument bekommt einen Beispielwert
+/// (Positionsargumente auch dann, wenn sie nur bedingt Pflicht sind, etwa
+/// über `required_unless_present`).
+fn probe_argv(node: &CommandNode) -> Vec<String> {
+    let mut argv = vec!["harw".to_owned(), "--json".to_owned()];
+    argv.extend(node.path.iter().cloned());
+    for arg in node.command.get_arguments() {
+        if !arg.is_required_set() && !arg.is_positional() {
+            continue;
+        }
+        if let Some(long) = arg.get_long() {
+            argv.push(format!("--{long}"));
+        }
+        argv.push(sample_value(arg));
+    }
+    argv
+}
+
+/// Ob ein Knoten selbst aufrufbar ist: ein Blatt oder ein Befehl mit
+/// optionalem Unterbefehl.
+fn is_invocable(command: &clap::Command) -> bool {
+    !command.has_subcommands() || !command.is_subcommand_required_set()
+}
+
+/// Der Eintrag aus `entries`, der `label` selbst oder als Vorfahr abdeckt;
+/// der Wurzeleintrag `harw` gilt nur für sich selbst.
+fn covering_entry(entries: &[(&'static str, &'static str)], label: &str) -> Option<&'static str> {
+    entries
+        .iter()
+        .map(|(path, _)| *path)
+        .filter(|path| {
+            label == *path || (*path != "harw" && label.starts_with(&format!("{path} ")))
+        })
+        .max_by_key(|path| path.len())
+}
+
+/// Der Eintrag aus `TEXT_ONLY_COMMANDS`, der `label` abdeckt.
+fn text_only_entry(label: &str) -> Option<&'static str> {
+    covering_entry(TEXT_ONLY_COMMANDS, label)
+}
+
+/// Der Eintrag aus `RUNTIME_TEXT_ONLY_COMMANDS`, der `label` abdeckt.
+fn runtime_text_only_entry(label: &str) -> Option<&'static str> {
+    covering_entry(RUNTIME_TEXT_ONLY_COMMANDS, label)
+}
+
+/// Sammelt alle `.rs`-Dateien unterhalb von `dir` (rekursiv).
+fn collect_rust_sources(
+    dir: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_rust_sources(&path, out)?;
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Alle String-Literale `"harw …"`, die direkt an `require_text(` übergeben
+/// werden, mit der Datei, in der sie stehen.
+fn require_text_literals(source: &str) -> Vec<String> {
+    const NEEDLE: &str = "require_text(\"";
+    let mut literals = Vec::new();
+    let mut rest = source;
+    while let Some(start) = rest.find(NEEDLE) {
+        rest = &rest[start + NEEDLE.len()..];
+        if let Some(end) = rest.find('"') {
+            let literal = &rest[..end];
+            if literal == "harw" || literal.starts_with("harw ") {
+                literals.push(literal.to_owned());
+            }
+            rest = &rest[end..];
+        }
+    }
+    literals
+}
+
+/// PL-97 B5: jeder sichtbare Befehl und Unterbefehl hat einen Hilfetext.
+#[test]
+fn every_visible_command_has_help_text() {
+    let missing: Vec<String> = command_nodes()
+        .into_iter()
+        .filter(|node| !node.hidden)
+        .filter(|node| {
+            let about = node
+                .command
+                .get_about()
+                .or_else(|| node.command.get_long_about());
+            !about.is_some_and(|text| !text.to_string().trim().is_empty())
+        })
+        .map(|node| path_label(&node.path))
+        .collect();
+    assert!(missing.is_empty(), "Befehle ohne Hilfetext: {missing:?}");
+}
+
+/// PL-97 B5: jeder aufrufbare Befehl liefert `--json` über den `Printer`
+/// oder steht in `TEXT_ONLY_COMMANDS` — und kein Eintrag dort ist veraltet.
+#[test]
+fn every_command_supports_json_or_is_listed_as_text_only() -> TestResult {
+    let mut wrongly_rejected = Vec::new();
+    let mut wrongly_listed = Vec::new();
+    let mut wrongly_runtime = Vec::new();
+    let mut used = std::collections::BTreeSet::new();
+    let mut used_runtime = std::collections::BTreeSet::new();
+    for node in command_nodes()
+        .into_iter()
+        .filter(|node| is_invocable(&node.command))
+    {
+        let label = path_label(&node.path);
+        let argv = probe_argv(&node);
+        let cli = Cli::try_parse_from(&argv)
+            .map_err(|error| TestError::Unexpected(format!("{argv:?} parst nicht: {error}")))?;
+        assert!(cli.global.json, "{argv:?}: --json fehlt");
+        let accepts_json =
+            crate::reject_unsupported_json(cli.command.as_ref(), &cli.global).is_ok();
+        let runtime = runtime_text_only_entry(&label);
+        match (accepts_json, text_only_entry(&label), runtime) {
+            (true, None, None) => {}
+            (true, None, Some(entry)) => {
+                used_runtime.insert(entry);
+            }
+            (true, Some(entry), _) => wrongly_listed.push(format!("{label} (Eintrag {entry})")),
+            (false, None, None) => wrongly_rejected.push(label),
+            (false, Some(entry), None) => {
+                used.insert(entry);
+            }
+            (false, _, Some(entry)) => {
+                wrongly_runtime.push(format!("{label} (Eintrag {entry})"));
+            }
+        }
+    }
+    assert!(
+        wrongly_rejected.is_empty(),
+        "lehnen --json ab, fehlen aber in TEXT_ONLY_COMMANDS: {wrongly_rejected:?}"
+    );
+    assert!(
+        wrongly_listed.is_empty(),
+        "nehmen --json an, stehen aber in TEXT_ONLY_COMMANDS: {wrongly_listed:?}"
+    );
+    assert!(
+        wrongly_runtime.is_empty(),
+        "lehnen --json schon an der Schranke ab, stehen aber in \
+         RUNTIME_TEXT_ONLY_COMMANDS: {wrongly_runtime:?}"
+    );
+    let stale: Vec<&str> = TEXT_ONLY_COMMANDS
+        .iter()
+        .map(|(path, _)| *path)
+        .filter(|path| !used.contains(path))
+        .collect();
+    assert!(stale.is_empty(), "veraltete TEXT_ONLY_COMMANDS: {stale:?}");
+    let stale_runtime: Vec<&str> = RUNTIME_TEXT_ONLY_COMMANDS
+        .iter()
+        .map(|(path, _)| *path)
+        .filter(|path| !used_runtime.contains(path))
+        .collect();
+    assert!(
+        stale_runtime.is_empty(),
+        "veraltete RUNTIME_TEXT_ONLY_COMMANDS: {stale_runtime:?}"
+    );
+    Ok(())
+}
+
+/// PL-97 B5: jeder Befehlspfad, den der Quelltext von `harw-cli` per
+/// `require_text` mit einem Literal `"harw …"` zur Laufzeit auf Text festlegt, steht in
+/// `RUNTIME_TEXT_ONLY_COMMANDS` oder `TEXT_ONLY_COMMANDS`.
+#[test]
+fn every_runtime_require_text_path_is_listed() -> TestResult {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rust_sources(&src, &mut files)
+        .map_err(|error| TestError::Unexpected(format!("{}: {error}", src.display())))?;
+    let mut found = 0_usize;
+    let mut unlisted = Vec::new();
+    for file in &files {
+        let source = std::fs::read_to_string(file)
+            .map_err(|error| TestError::Unexpected(format!("{}: {error}", file.display())))?;
+        for literal in require_text_literals(&source) {
+            found += 1;
+            if runtime_text_only_entry(&literal).is_none() && text_only_entry(&literal).is_none() {
+                unlisted.push(format!("{literal} ({})", file.display()));
+            }
+        }
+    }
+    // Schutz gegen einen Scanner, der still nichts mehr findet.
+    assert!(
+        found > 0,
+        "keine require_text-Literale in {}",
+        src.display()
+    );
+    assert!(
+        unlisted.is_empty(),
+        "require_text ohne Eintrag in RUNTIME_TEXT_ONLY_COMMANDS/TEXT_ONLY_COMMANDS: {unlisted:?}"
+    );
+    Ok(())
+}
+
+/// PL-97 B5: versteckte Befehle und Alias-Namen sind genau die explizit
+/// gelisteten; die neuen Namen der älteren Schreibweisen existieren.
+#[test]
+fn hidden_commands_and_aliases_are_listed_explicitly() -> TestResult {
+    let nodes = command_nodes();
+    let hidden: std::collections::BTreeSet<String> = nodes
+        .iter()
+        .filter(|node| node.command.is_hide_set())
+        .map(|node| path_label(&node.path))
+        .collect();
+    let listed: std::collections::BTreeSet<String> = HIDDEN_COMMANDS
+        .iter()
+        .map(|(path, _)| (*path).to_owned())
+        .collect();
+    assert_eq!(
+        hidden, listed,
+        "versteckte Befehle weichen von HIDDEN_COMMANDS ab"
+    );
+
+    let aliases: std::collections::BTreeSet<(String, String)> = nodes
+        .iter()
+        .flat_map(|node| {
+            let label = path_label(&node.path);
+            node.command
+                .get_all_aliases()
+                .map(move |alias| (label.clone(), alias.to_owned()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let listed_aliases: std::collections::BTreeSet<(String, String)> = PERMANENT_ALIASES
+        .iter()
+        .map(|(path, alias)| ((*path).to_owned(), (*alias).to_owned()))
+        .collect();
+    assert_eq!(
+        aliases, listed_aliases,
+        "Alias-Namen weichen von PERMANENT_ALIASES ab"
+    );
+
+    // Jede ältere Schreibweise zeigt auf einen existierenden Befehl, und der
+    // neue Name parst mit denselben Pflichtargumenten.
+    for (_, target) in HIDDEN_COMMANDS
+        .iter()
+        .filter(|(_, target)| target.starts_with("harw "))
+    {
+        let argv: Vec<&str> = target.split(' ').collect();
+        Cli::try_parse_from(argv.iter().chain(["--help"].iter()))
+            .err()
+            .filter(|error| error.kind() == clap::error::ErrorKind::DisplayHelp)
+            .ok_or_else(|| TestError::Unexpected(format!("`{target}` ist kein Befehl")))?;
+    }
+    Ok(())
+}

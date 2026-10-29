@@ -185,16 +185,18 @@ capabilities = [
 # admittiert jede genau die drei lesenden Harw-DoD-Werkzeuge `dod.status`,
 # `dod.findings` und `dod.sensors` (`profile::DOD_READ_TOOLS`, alle in
 # `AUTO_APPROVED_TOOLS`, ohne Sandbox-Recht, ohne Pfad zu Warden oder
-# Eskalation) und sonst nichts — zugelassen, aber bis zur Verdrahtung in
-# `harw-runtime/src/children.rs` (offen, Runtime) nicht bereitgestellt. Den
-# Rückgabevertrag deklariert jede Rolle selbst (`[return]`; `[defaults]` erbt nicht).
+# Eskalation) und sonst nichts; seit PL-97 D4 stellt sie der
+# rollengebundene Provider in `harw-runtime/src/children.rs`
+# (`dod_tools_for_role`) dem Kind auch bereit. Den Rückgabevertrag
+# deklariert jede Rolle selbst (`[return]`; `[defaults]` erbt nicht).
 #
-# Skill-Bindung: Der Plan (PL-97 §3.1) bindet den gebündelten Skill
-# `harw-dod` an diese Familie. Die Familien-Grammatik kennt kein
-# `skills`-Feld (`deny_unknown_fields`), `[defaults]` wird nicht vererbt,
-# und ein `skills = ["harw-dod"]` in den Rollendateien liefe ins Leere, bis
-# D4 den Skill ausliefert — das Kind würde dann fail-closed nicht starten
-# (unbekannter Definitions-Skill). Die Bindung folgt deshalb mit D4.
+# Skill-Bindung (PL-97 §3.1, D4): die Familie bindet den gebündelten Skill
+# `harw-dod` (`harw-home/assets/skills/harw-dod/`). Die Familien-Grammatik
+# kennt kein `skills`-Feld (`deny_unknown_fields`) und `[defaults]` wird
+# nicht vererbt; die Bindung steht deshalb als `skills = ["harw-dod"]` in
+# jeder der vier Rollendateien unten (geprüft durch
+# `tests/tool_admission_coverage.rs`). Fehlt der Skill-Katalog, startet ein
+# Triage-Kind fail-closed nicht (unbekannter Definitions-Skill).
 #
 # `intel-scout` und `context-steward` bleiben hier bewusst AUSSEN VOR: ihre
 # Mitgliedschaft ist ein eigener, an anderer Stelle offen gebliebener Befund

@@ -39,8 +39,8 @@
 # könnte; ein Befund bleibt Evidenz, nie Anweisung. `forbidden` benennt
 # jedes Schreib- und Netzwerkzeug ausdrücklich, damit eine Ablehnung
 # nachvollziehbar ist statt nur "nicht in admitted". Profil bleibt `NoTools`;
-# zugelassen heißt noch nicht bereitgestellt: bis `harw-runtime/src/children.rs`
-# sie montiert (offener Punkt PL-97 D3, Runtime), fehlen sie der Kind-Registry.
+# bereitgestellt werden sie vom rollengebundenen Provider in
+# `harw-runtime/src/children.rs` (`dod_tools_for_role`, PL-97 D4).
 #
 # ── Was sie ausdrücklich NICHT tut ──────────────────────────────────────────
 #   - sie leitet keine Schwere aus `detail`-Freitext ab — nur aus
@@ -89,6 +89,10 @@ version = "1.0.0"
 extends = { id = "harwness.agent.worker-base@1" }
 role = "worker"
 specialization = "security-structure-triage"
+# PL-97 D4: der gebündelte Skill `harw-dod` (welches `dod.*`-Werkzeug wann,
+# Befunde lesen, was ein Befund belegt, Grenzen) ist fest eingebunden; ohne
+# Skill-Katalog startet das Kind fail-closed nicht.
+skills = ["harw-dod"]
 
 name = "Security Structure Triage"
 description = "Sichtet Struktur-Abweichungen (StructureDrift/DriftSeverity) gegen bereits ausgewertete StructureDriftRule-Funde; schlägt ein Verdikt vor, committet nie."

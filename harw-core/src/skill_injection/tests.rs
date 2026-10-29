@@ -1161,3 +1161,198 @@ async fn turn_loop_places_imported_skills_in_the_data_block() -> TestResult {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// PL-97 D4: the bundled `harw-dod` skill through the turn loop
+// ---------------------------------------------------------------------------
+
+/// The three read-only Harw-DoD model tools.
+const DOD_TOOLS: [&str; 3] = ["dod.status", "dod.findings", "dod.sensors"];
+
+/// A provider serving the three `dod.*` names with a fixed, harmless status
+/// (no Harw-DoD read): the fake behind the end-to-end test.
+struct FakeDodTools;
+
+impl harw_extension_api::ToolProvider for FakeDodTools {
+    fn tools(&self) -> Vec<harw_tools::ToolSpec> {
+        DOD_TOOLS
+            .iter()
+            .map(|name| {
+                harw_tools::ToolSpec::Function(harw_tools::FunctionToolSpec {
+                    name: harw_tools::ToolName::new(*name),
+                    description: format!("Fake {name}"),
+                    parameters: harw_tools::JsonSchema::default(),
+                    strict: false,
+                })
+            })
+            .collect()
+    }
+
+    fn executor(&self, name: &harw_tools::ToolName) -> Option<Arc<dyn harw_tools::ToolExecutor>> {
+        DOD_TOOLS
+            .contains(&name.as_str())
+            .then(|| Arc::new(FakeDodExecutor) as Arc<dyn harw_tools::ToolExecutor>)
+    }
+}
+
+struct FakeDodExecutor;
+
+impl harw_tools::ToolExecutor for FakeDodExecutor {
+    fn execute<'a>(
+        &'a self,
+        _context: &'a harw_tools::ToolExecutionContext,
+        _call: &'a harw_tools::ToolCall,
+    ) -> harw_tools::ToolExecutorFuture<'a> {
+        Box::pin(async {
+            Ok(harw_tools::ToolOutput::Text {
+                content:
+                    r#"{"installed":true,"warden":"disabled","source":"home","verified":false}"#
+                        .to_owned(),
+            })
+        })
+    }
+}
+
+/// A model answer that calls `tool` with `arguments`.
+fn tool_call(tool: &str, arguments: serde_json::Value) -> ModelResponse {
+    ModelResponse {
+        tool_calls: vec![harw_tools::ToolCall {
+            id: ToolCallId::new(),
+            name: harw_tools::ToolName::new(tool),
+            arguments,
+        }],
+        ..ModelResponse::default()
+    }
+}
+
+/// A root session with the fake `dod.*` tools, the bundled skill index (its
+/// `harw-dod` included) and the availability filter of a session that
+/// registers the three tools.
+fn dod_session() -> TestResult<(AgentSession, Arc<SkillInjector>)> {
+    let injector = Arc::new(
+        SkillInjector::new(
+            Arc::new(SkillIndex::build(&[])),
+            SkillInjectionSettings::default(),
+        )
+        .with_tool_availability(super::ToolAvailability::new(DOD_TOOLS, DOD_TOOLS)),
+    );
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let registry = ExtensionRegistryBuilder::default()
+        .instructions_provider(Arc::new(StaticInstructions))
+        .tool_provider(Arc::new(FakeDodTools))
+        .build();
+    let session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
+        .with_spawn_context(SpawnContext {
+            sandbox: test_sandbox()?,
+            suggestions: None,
+            capability_snapshot: None,
+            approval_actor: None,
+            organizational_role: harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+            allowed_child_orchestrators: Vec::new(),
+            trace: None,
+            ceiling: Some(local_ceiling()?),
+        })
+        .with_skill_injector(Some(Arc::clone(&injector)));
+    Ok((session, injector))
+}
+
+/// How often a request carries a `harw-dod` excerpt (system text and data
+/// block together).
+fn harw_dod_excerpts(request: &ModelRequest) -> usize {
+    rendered_system(request)
+        .matches("# Skill: harw-dod")
+        .count()
+        + request
+            .data_block
+            .as_deref()
+            .map_or(0, |block| block.matches("# Skill: harw-dod").count())
+}
+
+/// PL-97 D4, end to end: a turn whose fake model calls `dod.status` (and then
+/// `dod.findings`) carries the bundled `harw-dod` excerpt in the
+/// `skills.triggered` section exactly once from the round after the call on,
+/// records one delivery, and stays within the per-round and session budgets.
+/// A keyword hit in the user text and the later tool call hit the same
+/// excerpt: delivered once, not twice.
+#[tokio::test]
+async fn a_turn_calling_dod_status_gets_the_harw_dod_excerpt_once_within_budget() -> TestResult {
+    let budget = SkillInjectionSettings::default();
+    for (label, user_text, first_carrier, kind, key) in [
+        (
+            "tool trigger",
+            "Please check the machine.",
+            1,
+            "tool",
+            "dod.status",
+        ),
+        (
+            "keyword, then tool",
+            "Is Harw-DoD running on this host?",
+            0,
+            "keyword",
+            "dod",
+        ),
+    ] {
+        let (mut session, injector) = dod_session()?;
+        let store = InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            Ok(tool_call("dod.status", serde_json::json!({}))),
+            Ok(tool_call("dod.findings", serde_json::json!({ "limit": 5 }))),
+            Ok(ModelResponse::text(
+                "Nothing was enforced; findings are unverified.",
+            )),
+        ]);
+        run_turn(&mut session, &model, &store, TurnInput::user(user_text))
+            .await
+            .map_err(ctx("turn"))?;
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 3, "{label}: three rounds");
+        let carried: Vec<usize> = requests.iter().map(harw_dod_excerpts).collect();
+        let expected: Vec<usize> = (0..3)
+            .map(|round| usize::from(round >= first_carrier))
+            .collect();
+        assert_eq!(carried, expected, "{label}: excerpts per round");
+        let last = requests.last().ok_or(TestError::Missing("last request"))?;
+        assert!(
+            rendered_system(last).contains(&format!("[triggered by: {kind} {key}]")),
+            "{label}"
+        );
+        // Once delivered, the excerpt is re-emitted unchanged (stable text).
+        let carrying: Vec<String> = requests
+            .iter()
+            .skip(first_carrier)
+            .map(rendered_system)
+            .collect();
+        assert!(
+            carrying.windows(2).all(|pair| pair.first() == pair.last()),
+            "{label}: the rendered system text stays stable"
+        );
+
+        let records = store.load_skill_injections(session.id()).await?;
+        assert_eq!(records.len(), 1, "{label}: one delivery");
+        let record = records.first().ok_or(TestError::Missing("record"))?;
+        assert_eq!(record.skill, "harw-dod", "{label}");
+        assert_eq!(record.trigger_kind, kind, "{label}");
+        assert_eq!(record.trigger_key, key, "{label}");
+        assert_eq!(record.trust, "instruction", "{label}");
+        assert_eq!(
+            record.section.as_deref(),
+            Some("What Harw-DoD cannot do from here"),
+            "{label}"
+        );
+
+        // Within budget: one excerpt, under the per-round cap and the
+        // session cap.
+        assert_eq!(injector.active_count(), 1, "{label}");
+        let bytes = injector.active_bytes();
+        assert!(bytes > 0, "{label}");
+        assert!(bytes <= budget.per_turn_bytes(0), "{label}: {bytes}");
+        assert_eq!(injector.session_bytes(), bytes, "{label}");
+        assert!(
+            injector.session_bytes() <= budget.session_cap_bytes(0),
+            "{label}"
+        );
+    }
+    Ok(())
+}

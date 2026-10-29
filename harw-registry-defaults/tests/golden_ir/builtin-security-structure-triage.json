@@ -113,7 +113,12 @@
   "research": null,
   "verification": null,
   "skills": {
-    "entries": []
+    "entries": [
+      {
+        "name": "harw-dod",
+        "hash": null
+      }
+    ]
   },
   "binary": {
     "name": "security-structure-triage",
@@ -214,7 +219,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/security-structure-triage.toml",
-          "line": 129,
+          "line": 133,
           "column": 11
         },
         "path": "context.program"
@@ -223,6 +228,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "c61e3b85eda9c8e113eb19594eba514d2fba9c7dab41be5aacb76f4ae3352205"
+    "digest": "4eff45c93da18f02a600dd676fa40f8cd882023bb51e94266304906a48826a93"
   }
 }
