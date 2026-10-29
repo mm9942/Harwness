@@ -51,6 +51,8 @@ impl ChatApp {
             self.child_stream.remember_task(child_id, question);
         }
         if let Some(block) = self.child_stream.attach_root_child(child_id, role) {
+            // PL-97 C5: derselbe Block speist die virtuelle Live-Zelle im Chat.
+            self.track_live_child_block(child_id, role, std::sync::Arc::clone(&block));
             self.push_shared_cell(block);
             self.absorb_child_stream_handles();
         }
@@ -70,6 +72,9 @@ impl ChatApp {
             if verbose {
                 handle.set_expanded(true);
             }
+            // PL-97 C5: aufgeklappte Kind-Details halten den Block an seiner
+            // kanonischen Stelle (statt Verweis auf die Live-Zelle).
+            self.note_live_detail_handle(handle.clone());
             self.tool_cells.push(handle);
         }
     }

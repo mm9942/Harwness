@@ -55,8 +55,10 @@ pub(super) struct ChildActivity {
     pub(super) info_at: Option<Instant>,
 }
 
-/// Abbildung auf die Anzeige-Stufe des Rankers (siehe Moduldoku).
-fn tier_of(child: &ChildActivity, now: Instant) -> ActivityTier {
+/// Abbildung auf die Anzeige-Stufe des Rankers (siehe Moduldoku); auch
+/// für die Live-Zellen im Chat (`app/live_slots.rs`), damit Statuszeile und
+/// Chat dieselbe Stufe zeigen.
+pub(super) fn tier_of(child: &ChildActivity, now: Instant) -> ActivityTier {
     let fresh_info = child
         .info_at
         .is_some_and(|at| super::child_info_visible(now.saturating_duration_since(at).as_secs()));

@@ -115,6 +115,8 @@ pub(crate) mod background_agents;
 mod agent_messages;
 // PL-94 W01 M2b: Anzeigereihenfolge der Kind-Statusmeldungen (`crate::live_ranker`).
 mod live_order_glue;
+// PL-97 C5 (PL-94 W01 M2a/M2c): virtuelle Live-Zellen der Hintergrund-Läufe im Chat.
+mod live_slots;
 // Runde 5, Teil O: Doppel-Esc bei laufenden Kindern, ehrliche Abbruch-Beschriftung.
 mod turn_safety;
 // Runde 5, Teil O: Freigabe-Fragen von Kind-Agenten im Freigabedialog.
@@ -1072,6 +1074,10 @@ pub struct ChatApp {
     /// Kind-Statusmeldungen in der Statuszeile (`app/live_order_glue.rs`).
     /// Hinter einer `RefCell`, weil das Zeichnen nur `&ChatApp` hat.
     live_order: RefCell<live_order_glue::LiveOrder>,
+    /// PL-97 C5: Projektion der virtuellen Live-Zellen im Verlauf
+    /// (`app/live_slots.rs`); hinter einer `RefCell`, weil das Zeichnen nur
+    /// `&ChatApp` hat.
+    live_slots: RefCell<live_slots::LiveSlots>,
     /// PL-97 C2: presentation state of the Mission Control windows (Jobs and
     /// Finished/Failed selection and scroll, LIVE pin and ranking).
     mission: crate::mission::MissionUi,
@@ -1528,6 +1534,7 @@ impl ChatApp {
             child_infos: std::collections::HashMap::new(),
             recency: crate::recency::RecencySlots::new(),
             live_order: RefCell::new(live_order_glue::LiveOrder::new(Instant::now())),
+            live_slots: RefCell::new(live_slots::LiveSlots::new(Instant::now())),
             mission: crate::mission::MissionUi::new(Instant::now()),
             status_expiry: harw_config::StatusExpiryMode::default(),
             reasoning_mode: ReasoningDisplayMode::default(),
@@ -3312,6 +3319,8 @@ impl ChatApp {
                 .push(ExportEntry::Assistant(text.clone())),
             Role::System => self.export_entries.push(ExportEntry::System(text.clone())),
         }
+        // PL-97 C5: Lage der Nachricht für die Slot-Tabelle der Live-Zellen.
+        self.note_live_slot_message(role);
         let cell: Box<dyn HistoryCell> = match role {
             Role::User => Box::new(UserHistoryCell { text }),
             Role::Assistant => Box::new(AssistantHistoryCell { source: text }),
@@ -3650,6 +3659,7 @@ impl ChatApp {
     /// Modellkontext und Exporteinträge bleiben unverändert.
     fn clear_transcript(&mut self) {
         self.cells.clear();
+        self.clear_live_slot_cells();
         self.tool_cells.clear();
         self.open_tool_group = None;
         // PL-97 M3: ohne Zellen kein Gruppenbezug mehr.
@@ -10931,12 +10941,19 @@ fn render_viewport(
     }
 
     // ── History ──────────────────────────────────────────────────────
-    // Alle Zellen zu einem flachen Zeilen-Vec zusammenführen.
+    // Alle Zellen zu einem flachen Zeilen-Vec zusammenführen. PL-97 C5: die
+    // kanonischen Zellen unverändert, dazwischen die virtuellen Live-Zellen
+    // der Hintergrund-Läufe (`app/live_slots.rs`).
     let width = history_area.width;
-    let mut all_lines: Vec<Line<'static>> = app
-        .cells
-        .iter()
-        .flat_map(|cell| cell.display_lines(width, theme))
+    let live_projection = app.live_slot_projection(Instant::now(), history_area.height);
+    let segments = app.history_segments(&live_projection, width, theme, history_area.height);
+    // Identitätsanker nur beim Hochscrollen (die Messung kostet einen Umbruch
+    // je Segment).
+    let geometry = (!app.scroll.is_following())
+        .then(|| live_slots::SegmentGeometry::measure(&segments, width));
+    let mut all_lines: Vec<Line<'static>> = segments
+        .into_iter()
+        .flat_map(|segment| segment.lines)
         .collect();
     // Transient: live gestreamtes Reasoning/Text der laufenden Runde.
     if !app.live_reasoning.is_empty() {
@@ -10979,6 +10996,15 @@ fn render_viewport(
     let back = app
         .scroll
         .sync_layout(usize::from(total_lines), usize::from(visible_rows), width);
+    let back = match geometry.as_ref() {
+        Some(geometry) => app.scroll.sync_anchor(
+            usize::from(total_lines),
+            usize::from(visible_rows),
+            |anchor| geometry.resolve(anchor),
+            |top| geometry.locate(top),
+        ),
+        None => back,
+    };
     let scroll_from_top: u16 = if total_lines > visible_rows {
         let max_offset = total_lines - visible_rows;
         // Offset zählt vom Ende → in „von oben" umrechnen.
@@ -11012,6 +11038,31 @@ fn render_viewport(
                     .add_modifier(Modifier::REVERSED),
             ),
             indicator_area,
+        );
+    }
+    // PL-97 C5: eingefrorene Live-Reihenfolge — was seitdem passierte, eine
+    // Zeile über dem Hinweis.
+    if let Some(text) = live_slots::new_activity_label(live_projection.new_activity)
+        && history_area.height > 1
+    {
+        let label = format!(" {text} ");
+        let label_width = u16::try_from(label.chars().count())
+            .unwrap_or(u16::MAX)
+            .min(history_area.width);
+        let activity_area = Rect {
+            x: history_area.x + history_area.width - label_width,
+            y: history_area.y + history_area.height - 2,
+            width: label_width,
+            height: 1,
+        };
+        frame.render_widget(Clear, activity_area);
+        frame.render_widget(
+            Paragraph::new(label).style(
+                Style::default()
+                    .fg(style::accent_color(theme))
+                    .add_modifier(Modifier::REVERSED),
+            ),
+            activity_area,
         );
     }
 
