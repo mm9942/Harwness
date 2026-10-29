@@ -10,7 +10,7 @@ The actual sanitized pixels travel through the normal provider image schemas: Op
 
 For a model configured with `image_input = false`, the existing provider gate replaces the image tool result with a structured `image_inspection_unavailable` outcome (`status: error`, `code: vision_unavailable`) before request serialization. No image pixels are sent to that text-only model, and this route does not change provider or model. A separate explicitly configured image-understanding operation, where available, is a distinct tool route.
 
-Regression tests cover permission and path denial, invalid images, successful sanitized media reads, image association after parallel results, rejection of arbitrary tool JSON, text-only refusal, and native image serialization for all three provider formats. Tests are authored but have not been run in this change because Cargo execution was prohibited for this worktree.
+Synthetic PNG fixtures exercise header inspection and sanitization; they do not establish decoder-valid pixels. Regression tests cover permission and path denial, invalid images, successful sanitized media reads, image association after parallel results, rejection of arbitrary tool JSON, text-only refusal, and native image serialization for all three provider formats. Tests are authored but have not been run in this change because Cargo execution was prohibited for this worktree.
 
 ## Selecting an auxiliary image model
 

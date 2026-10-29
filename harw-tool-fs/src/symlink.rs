@@ -52,8 +52,14 @@ use std::time::{Duration, Instant};
 pub const MAX_SYMLINK_HOPS: usize = 40;
 
 /// Lesende fs-Werkzeuge, deren `path` einem Symlink folgen darf.
-pub const SYMLINK_FOLLOWING_TOOLS: [&str; 5] =
-    ["fs.read", "fs.list", "fs.search", "fs.grep", "fs.glob"];
+pub const SYMLINK_FOLLOWING_TOOLS: [&str; 6] = [
+    "fs.read",
+    "fs.view_image",
+    "fs.list",
+    "fs.search",
+    "fs.grep",
+    "fs.glob",
+];
 
 /// Präfix der Ablehnung eines Symlinks nach außen.
 pub const OUTSIDE_PREFIX: &str = "Symlink zeigt außerhalb des Arbeitsbereichs";
