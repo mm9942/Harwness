@@ -1,6 +1,6 @@
 # Harw-DoD (Detect · Orient · Defend)
 
-> Status: partially implemented · Last reviewed: 2026-10-28
+> Status: partially implemented · Last reviewed: 2026-10-29
 
 Harw-DoD (short: DoD) is Harwness's on-device observation-and-defense suite: it watches
 what is happening on the host around agent activity (process starts,
@@ -25,6 +25,73 @@ names (`harw-dod`, `harw-dod-*`), binary names (`harw-sentinel`,
 names keep their existing spelling; renaming them would break every
 installation for no functional gain (see the
 [facade charter](../design/harw-dod-charter.md#2-the-name)).
+
+## Operator flow (PL-97)
+
+The short path from a fresh host to `harw dod status` reporting a running,
+harw-aware suite. Each step links to the details further down.
+
+1. **Install the suite** (once, as the unprivileged operator, not as
+   root): `make dod-install` ([Installation](#installation)) builds as the
+   invoking user and then escalates by itself (`sudo -E`) for the file
+   install and the enable step; `build` refuses to run as root, so
+   `sudo make dod-install` fails. Alternatively `make dod-build`, then
+   `sudo make -C dod install-existing`, which installs the already built
+   artifacts and skips the enable step. `install` ends
+   by running `scripts/service.sh enable`, which validates
+   `/etc/harw-dod/config.toml` first; on a fresh host without a chosen
+   `active_profile` that last step refuses and nothing is started (the
+   files, accounts and units are installed by then).
+2. **Give harw a delegated cgroup root** so its jobs land in
+   `harw-job-<attempt>` cgroups: run harw under `harw service install`
+   (`harw-serve` user unit) or `deploy/systemd/harw-control.service`, or
+   start it with `systemd-run --user --scope -p Delegate=yes harw …`, or
+   set `[jobs] cgroup_root` ([Observe harw jobs](#observe-harw-jobs-pl-97-e3)).
+3. **Generate the profile** as the harw user: `harw dod config suggest`
+   prints the `[profiles.harw-jobs]` stanza for the resolved root plus the
+   matching `[dod] allowed_cgroup_prefixes` for harw's own config. The
+   stanza is filled in only when `[jobs] cgroup_root` is set or
+   `HARW_CGROUP_ROOT=<root>` is exported; otherwise `config suggest` prints
+   the `<R>` template and lists the service-unit cgroups
+   (`system.slice/harw-control.service`, `…/app.slice/harw-serve.service`)
+   as candidates. `harw dod doctor` falls back to a delegated service-unit
+   cgroup, `config suggest` does not;
+   `harw dod config suggest --drop-in` prints the sentinel and probe
+   drop-ins. Merge the profile into `/etc/harw-dod/config.toml` (root-owned,
+   not group/world-writable) and check it with
+   `sudo harw dod config check`.
+4. **Enable**: `sudo harw dod enable` (the same steps as
+   `make -C dod enable`: config check, `systemctl daemon-reload`,
+   `systemctl enable --now harw-dod.target`). The Warden stays disabled.
+5. **Read the posture**: add the operator to `harw-dod-readers`
+   ([Exports read by harw](#exports-read-by-harw)), log in again, then
+   `harw dod status`, `harw dod doctor` (prerequisites, the three
+   cgroup-root checks and the execution chain table), `harw dod findings
+   -n 5` and `harw dod sensors`. In the TUI: `/dod status` and `/dod view`;
+   models get the read-only tools `dod.status`, `dod.findings` and
+   `dod.sensors` and, on first use, the bundled `harw-dod` skill.
+   `harw doctor` adds one `chain/<stage>` check per readiness stage
+   (`installed`, `configured`, `running`, `ready`), warnings only.
+
+**Running as root (euid 0).** `harw dod enable|disable|restart` and
+`harw dod warden enable|disable` require euid 0 and otherwise exit `3`
+("refused") without changing anything; `enable` and `restart` also exit
+`3` without a valid `active_profile`. The read-only actions run as any
+user. Under `sudo`, the harw home is the one of root's environment unless
+you pass `--home`, so `[jobs] cgroup_root` of the operator's config is not
+seen; run `config suggest` and `doctor` as the harw user. As euid 0 harw
+never treats its own cgroup as a delegated root (resolver step 3), and
+`harw dod doctor` reports the cgroups of the harw service units (looked up
+for `SUDO_UID`) only as candidates with the reason "root can write every
+cgroup".
+
+**Known gaps.** `/dod config suggest` in the chat prints the static
+template with `<R>` placeholders (only the CLI fills in the resolved root);
+`harw serve` and `harw web` do not read `[jobs] cgroup_root` or
+`[jobs] trampoline`; jobs ↔ findings correlation (a per-job `⛨` badge,
+`job_id` filter) is not built yet (PL-97 E4); a TUI mark for the execution
+chain report does not exist (the report is in `harw doctor` and
+`harw dod doctor`).
 
 ## Purpose
 
@@ -370,8 +437,8 @@ default**; to let a user's harw read the posture:
 sudo usermod -aG harw-dod-readers <user>   # takes effect at the user's next login
 ```
 
-(The planned `harw dod enable --grant-read <user>`, PL-97 D3, is not
-available yet; it will do the same.)
+(`harw dod` has no `--grant-read` option; group membership stays a manual
+step.)
 
 #### Letting `harw-security-hub` read the findings
 
@@ -400,14 +467,20 @@ drop-in before deleting the group (see [Uninstalling](#uninstalling)).
 
 **Where harw looks.** The shared resolver (`harw-dod-client`, PL-97 D2)
 picks the export directory in this order: `[dod] export_dir`, then
-`/var/lib/harw-dod/export` if it is readable, then `<HARW home>/dod/export`.
-The opt-in `[memory] security_signals` context source still reads only
-`<HARW home>/dod/export/findings.jsonl` until it switches to that resolver.
+`/var/lib/harw-dod/export` if it is a directory this process can list,
+then `<HARW home>/dod/export` only when the system path is absent (missing,
+a symlink or not a directory). A
+system export directory that exists but cannot be listed is reported as
+unreadable (with the hint to join `harw-dod-readers`), never replaced by
+the home fallback. Only the system export counts as verified; findings from
+`export_dir` or the home fallback are labelled `UNVERIFIED`. The CLI, the
+`/dod` command, the `dod.*` model tools, the TUI and the opt-in
+`[memory] security_signals` context source all use this resolver.
 
 ## Installation
 
 DoD is built and installed from `dod/`, or via the root `Makefile`'s
-delegation targets (`make dod-build`, `sudo make dod-install`, `make
+delegation targets (`make dod-build`, `make dod-install`, `make
 dod-enable`, `make dod-uninstall` — thin wrappers around `make -C dod
 <target>`; run `make -C dod help` or `dod/README.md` for the complete
 target list).
@@ -434,8 +507,11 @@ target list).
 
 3. **Install.**
    ```sh
-   sudo make dod-install   # from the repo root, or: sudo make -C dod install
+   make dod-install   # unprivileged, from the repo root, or: make -C dod install
    ```
+   Run it as the unprivileged operator, not with `sudo`: `install` depends
+   on `build`, which refuses to run as root, and escalates by itself
+   (`sudo -E`, one prompt) for the file install and the enable step.
    Rebuilds (to avoid installing stale artifacts), then installs files and
    creates the system accounts (`systemd-sysusers`), runtime
    directories (`systemd-tmpfiles`), and systemd units — all taken from
@@ -443,10 +519,15 @@ target list).
    [below](#systemd-units-and-the-deploy-tree)) — and reloads the
    systemd daemon. Unit files of the old layout (`harw-dod-sentinel.service`,
    `harw-dod-bpf.service`, `harw-dod-warden.*`, `harw-dod.conf`) are
-   removed. It performs **no enable/start action** by itself beyond
-   that — see step 5. For package building, use `DESTDIR=/path/to/stage
-   make -C dod stage` instead: pure staging, no accounts, no systemd calls,
-   no host state touched.
+   removed. As its last step `install` runs the enable action of step 5
+   (`scripts/service.sh enable`), which validates the config first: without
+   a chosen `active_profile` it refuses, so on a fresh host nothing is
+   started and `install` reports that failure after the files are in
+   place. `sudo make -C dod install-existing` installs already built
+   artifacts without the enable step. `DESTDIR=/path/to/stage make -C dod
+   stage` runs the same `install` target into a staging root; it, too,
+   ends with the enable step (flagged in PL-97 §8.4 against the "no silent
+   services" policy, still open).
 
 4. **Configure.** Copy the shipped example and choose exactly one profile:
    ```sh
@@ -468,10 +549,10 @@ target list).
 
 5. **Enable.**
    ```sh
-   make dod-enable         # from the repo root, or: make -C dod enable
+   sudo harw dod enable    # or: make dod-enable / make -C dod enable (as root)
    ```
    Runs the explicit configuration/profile validation first and refuses to
-   enable without a chosen `active_profile`. This starts and enables
+   enable without a chosen `active_profile` (`harw dod enable` exits `3`). This starts and enables
    `harw-sentinel.service` and `harw-probe-bpf.service` under
    `harw-dod.target` — observation only, never the Warden.
    `harw-probe-fs.service` is installed but not part of the target: set its
@@ -488,7 +569,7 @@ enable, restart, and observation-target operations never start or enable
 either unit. To opt into enforcement explicitly:
 
 ```sh
-sudo make -C dod enable-warden
+sudo harw dod warden enable   # or: sudo make -C dod enable-warden
 ```
 
 This creates `/etc/harw-dod/warden.enable`, reloads systemd, and enables

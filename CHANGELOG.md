@@ -6,7 +6,58 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Added
+
+- PL-97 (draft PR #154 against `dev`; ledger `MIG-016` … `MIG-020`):
+  - **Harw-DoD through harw.** `harw dod status|doctor|findings|sensors|config check|config suggest|enable|disable|restart|warden …`
+    (`--json`; exit code 3 = refused: not root or no valid `active_profile`),
+    the `/dod` command and the read-only, auto-approved model tools
+    `dod.status`, `dod.findings` and `dod.sensors`, all through the new
+    read-only `harw-dod-client`. Only the system export
+    `/var/lib/harw-dod/export` is verified; other sources are labelled
+    `UNVERIFIED`. The sentinel unit now writes `health.json` next to
+    `findings.jsonl` (findings line `schema_version: 2`, additive); new empty
+    group `harw-dod-readers`. Bundled `harw-dod` skill with triggers. See
+    `docs/setup/dod.md` ("Operator flow") and `docs/cli.md`.
+  - **Skill triggers per turn.** Matching skill sections are injected as
+    `skills.triggered` fragments within per-turn and per-session budgets
+    (`[skills]`, on by default). `harw skill list|show|preview|validate`
+    and `/skills preview|validate` show the selection without a model call.
+  - **Tool landscape.** `fsread.*` and `git.*` (auto-approved) and `sys.*`
+    (asks) are registered; `harw tool list|describe` and the model tool
+    `tool.index` show every tool with its linked skill.
+  - **TUI Mission Control.** Separately bordered Agents, Jobs,
+    Finished/Failed and LIVE windows in portrait and landscape; `Alt+J`,
+    `Alt+F`, `Alt+L`; `p` pins an agent to LIVE; `x` stops a job through
+    `/jobs stop <id>` after a confirmation; `/dod view` and the `⛨ n high`
+    status mark; inline activity-ranked live cells in the chat; edit/read
+    loops and job lifecycles update one history cell.
+  - **Execution chain.** Sandboxed jobs run in their `harw-job-<attempt>`
+    cgroup, inside Bubblewrap, with Landlock, `NO_NEW_PRIVS`, a capability
+    drop and rlimits (`BwrapTrampoline`); per-job write scopes fail closed.
+    `harw doctor` gains `chain/<stage>` checks and `harw dod doctor` the
+    execution chain table (`execution_chain` in `--json`).
+
 ### Changed
+
+- `shell.exec` and `job.start` run through the sandbox chain by default
+  (child agents get the parent workspace root but stay unconfined): `[sandbox] execution = "chain"` is the default and
+  `[sandbox] execution = "legacy"` keeps the previous `prlimit … -- bwrap …`
+  path (profile scope; a repository layer cannot set it). On the chain path
+  RLIMIT_NPROC is capped only through the job cgroup's `pids.max` until the
+  follow-up lands.
+- Reasoning summaries in the TUI render as readable, expanded markdown
+  blocks; `[tui] reasoning = "collapsed" | "hidden"` restores a compact view
+  or hides them.
+- A second `Ctrl+C` while a turn or a managed job runs is now an emergency
+  stop (managed jobs through the job manager, job cgroups through
+  `cgroup.kill`, exit code 130); with nothing running it stays the normal
+  quit.
+- `harw-control.service` and the `harw-serve` user unit set `Delegate=yes`
+  and `DelegateSubgroup=harw-main`; `harw-job-exec` ships with every
+  release path, and `[jobs] cgroup_root` / `[jobs] trampoline` select the
+  delegated cgroup root and the trampoline (interactive and one-shot
+  `harw`; `harw serve` and `harw web` do not read them yet).
 
 - Delegation through the turn-loop handoff (`transfer_to_<role>`, via the agent
   job submitter or the host background launcher, e.g. the TUI) is now

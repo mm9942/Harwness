@@ -315,7 +315,7 @@ agree.
 | Action | Effect |
 | --- | --- |
 | `status` | Install state, system config and active profile, the six units, Warden state, sentinel health and the high/critical finding counts of the `[dod] findings_window_hours` window. Counts are prefixed `≥` and marked "partial" when older export data was not read (`lower_bound: true` in `--json`). |
-| `doctor` | Read-only prerequisites: cgroup v2, kernel BTF, tracefs, Landlock, `systemctl`/`systemd-sysusers`/`systemd-tmpfiles`, the daemons, the unit files, the config and both exports. Exit 1 when a prerequisite is missing. The build toolchain checks stay with `make -C dod doctor`. |
+| `doctor` | Read-only prerequisites: cgroup v2, kernel BTF, tracefs, Landlock, `systemctl`/`systemd-sysusers`/`systemd-tmpfiles`, the daemons, the unit files, the config and both exports, plus three warning-only cgroup-root checks (`cgroup-root`, `profile-root`, `allowed-prefixes`, see [DoD setup](setup/dod.md#observe-harw-jobs-pl-97-e3)) and the execution chain table (below). Exit 1 when a prerequisite is missing. The build toolchain checks stay with `make -C dod doctor`. |
 | `findings [-n N] [--severity S] [--rule ID] [--since SPAN]` | The newest findings of the bounded export tail (default 50, at most 200), at or above severity `S`, of one rule, observed within `SPAN` (`90m`, `24h`, `7d`). |
 | `sensors` | The sentinel health report (`health.json`): per-sensor state, readings, errors, last success, IPC counters; flagged stale after 2 minutes without an update. |
 | `config check [--config PATH]` | Validates `/etc/harw-dod/config.toml` (or `PATH`) exactly like the daemons do (no symlinks, root-owned, not group/world-writable). Exit 0 only for a valid config that selects an `active_profile`. |
@@ -345,6 +345,46 @@ model tools); they are not Harw-DoD facts, and `doctor` reports these
 exports as `WARN`. A system export that exists but cannot be read is
 reported as unreadable with the hint to add the user to `harw-dod-readers`;
 it is never replaced by the home fallback.
+
+### Execution chain (`harw dod doctor`, `harw doctor`)
+
+`harw dod doctor` ends with one table that answers "can harw run a
+sandboxed, cgroup-limited, Harw-DoD-observed job on this host?"
+(`harw_dod_client::chain::ExecutionChainReport`). The first line names the
+highest stage reached (`execution chain: ready`, or `none`); each further
+line is `stage  item  level  detail`. The items per stage:
+
+| Stage | Items |
+| --- | --- |
+| `installed` | `harw`, `killer`, `harw-agent-runner`, `harw-job-exec` |
+| `configured` | `config` (the harw config loads), `cgroup-root` (the delegated root resolves and is delegated) |
+| `running` | `harw-serve` (`harw service status`), `harw-dod.target` |
+| `ready` | `bwrap`, `trampoline`, `landlock-abi`, `dod-profile-covers-root`, `warden`, `serve-workspace` |
+
+Levels are `ok`, `warn` (works, but weaker than the full chain), `miss`
+(the stage is not reached) and `skip` (not applicable here, e.g. every DoD
+item on a host without the suite). A stage counts as reached when no item
+in it or below it is `miss`. `serve-workspace` is `ok` only when the serve
+worker's root (its HARW home) is the project workspace of the invocation,
+`skip` outside a project or while `harw-serve` is not running, and a
+standing `warn` otherwise. With `--json` the same report is the
+`execution_chain` key of the doctor object (`installed`, `config`,
+`cgroup_root`, `serve`, `dod_target`, `bwrap`, `trampoline`, `landlock_abi`,
+`dod_profile_covers_root`, `warden`, … — each item with `id`, `stage`,
+`level`, `detail`). The table is informational: it never changes the exit
+code of `harw dod doctor`.
+
+`harw doctor` reports the same report as one check per stage,
+`chain/installed`, `chain/configured`, `chain/running` and `chain/ready`;
+each is `ok` (all items `ok` or `skip`, "n ok (m skipped)") or a warning
+that lists the `warn`/`miss` items, never a failure. The verify runner logs
+the same table. There is no TUI mark for it yet.
+
+`/dod config suggest` in the chat prints the static template with `<R>`
+placeholders; only `harw dod config suggest` fills in the resolved root.
+Run `config suggest` and `doctor` as the harw user: under `sudo` harw reads
+the home of root's environment (unless `--home`), and as euid 0 the
+cgroups of the harw service units only count as candidates.
 
 Exit codes: `0` success, `1` failure (a `systemctl` step failed, a
 prerequisite is missing, an export is unreadable), `2` usage error, `3`

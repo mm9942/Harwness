@@ -1,12 +1,26 @@
 ---
 id: W20-CONTROL-DECK-V2
 title: "W20 Contract — portrait operator control deck"
-status: proposed
+status: PARTIALLY LANDED
 date: 2026-10-01
 parent: ../CONTROL-DECK-V2.md
 ---
 
 # W20 Contract — portrait operator control deck
+
+> **Status: PARTIALLY LANDED** (2026-10-29, PL-97 X1), on
+> `ccr-54aa3dfd-o46he2` (draft PR #154):
+>
+> | Package | Landed as | Main tests (harw-tui unless noted) |
+> |---|---|---|
+> | W20-A | PL-97 C4a `d21fc698`, C4 `3d98064d` | `test_legacy_meta_fixtures_resolve_to_tool_or_unknown` (harw-tool-job), `agent_and_job_of_the_same_child_count_once`, `job_categories_come_from_provenance_only`, `counters_count_a_job_backed_child_once_and_skip_the_pending_row` |
+> | W20-B | replaced by `classify_mission` (C1 `ca2dfd6c`) and the Mission Control windows (C2 `6db6745a`); no `DockAreas::ControlDeck` | `portrait_stack_at_46x78_48x65_70x90_60x60_80x40`, `render_viewport_at_80x40_pins_a_top_dock_full_width_chat_below_and_status_composer_at_bottom`, the R19 portrait tests unchanged |
+> | W20-C | C2 `6db6745a` (`MissionUi`, one `WindowUi` per window), C4 `3d98064d` (`✗ n NEW`, newest-first constituents) | `row_text_marks_new_failures_and_diverging_outcomes`, `constituent_list_shows_counters_and_newest_first` |
+> | W20-D | C2 `6db6745a`: `focus_jobs` (`Alt+J`), `focus_finished` (`Alt+F`) | keybinding tests in `keybindings.rs` |
+> | W20-E | C4 `3d98064d`: `x` (not `k`, which stays "up"; PL-97 §7) opens a confirmation naming the job and dispatches the literal `/jobs stop <id>` through the command path | `stop_job_dialog_names_the_job_and_the_stop_policy`, `stop_job_line_reaches_the_jobs_command_once_or_not_at_all` |
+>
+> Open: a stop for durable `harw-job-store` jobs from the window (PL-97
+> §8.3). The text below is the original handoff contract.
 
 Pinned baseline: `dev@70faabed9182834792a5f36e67cd80535792542a`.
 

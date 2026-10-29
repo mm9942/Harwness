@@ -1,7 +1,7 @@
 ---
 id: PL-68-CONTROL-DECK-V2
 title: "Portrait control deck v2 — active agents, terminal work aggregates, running jobs"
-status: proposed
+status: PARTIALLY LANDED
 date: 2026-10-01
 tags: [planning, tui, portrait, agents, jobs, operator-control]
 related:
@@ -13,6 +13,18 @@ related:
 ---
 
 # Portrait control deck v2
+
+> **Status: PARTIALLY LANDED** (2026-10-29, PL-97 X1). The control deck
+> landed as part of PL-94 W02 Mission Control on `ccr-54aa3dfd-o46he2`
+> (draft PR #154 against `dev`), not as the `DockAreas::ControlDeck` variant
+> sketched here: W20-A as PL-97 C4a `d21fc698` (typed `ManagedJobOrigin`,
+> job cgroup in `JobRow`) and C4 `3d98064d` (terminal aggregates); W20-B/C
+> through `harw_tui_layout::classify_mission` (C1 `ca2dfd6c`) and the
+> Mission Control windows (C2 `6db6745a`, C3 `3d98064d`); W20-D as
+> `focus_jobs` (`Alt+J`, C2); W20-E as the `x` stop (C4; `x` instead of `k`,
+> PL-97 §7). Details and test names: [W20 status](contracts/W20-control-deck-v2.md)
+> and [PL-97 §9.1](../97-harw-dod-mission-control-chain/README.md#9-landed-state-x1-2026-10-29).
+> The text below is the original planning record.
 
 > **Pinned CURRENT:** `dev@70faabed9182834792a5f36e67cd80535792542a`.
 >

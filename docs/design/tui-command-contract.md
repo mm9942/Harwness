@@ -784,10 +784,12 @@ levels plus a "provider default (reset)" entry that emits `clear`.
 
 ---
 
-## 8. Current state of the command surface (2026-09-24)
+## 8. Current state of the command surface (2026-09-24, PL-97 update 2026-10-29)
 
 This section describes what the code delivers and, on any conflict, wins
-over §§1–7. Sources: `harw-ops/src/lib.rs` (`register_all`,
+over §§1–7. The PL-97 additions (Mission Control keys, `/dod`,
+`/dod view`, `/skills preview|validate`, `[tui] reasoning`, the 2×Ctrl+C
+hard stop) are from `ccr-54aa3dfd-o46he2` (draft PR #154). Sources: `harw-ops/src/lib.rs` (`register_all`,
 `register_plan_tools`), `harw-tui/src/command_catalog.rs`
 (`local_command_specs`, `FALLBACK_COMMANDS`, `PLANNED_COMMANDS`,
 `HINT_TABLE`), `harw-tui/src/keybindings.rs`, `harw-tui/src/mention.rs`,
@@ -834,7 +836,8 @@ turn; otherwise deferred until the turn ends; details in §6.1).
 | `/stop` | `[job-id]` | Op | Y | immediate |
 | `/diff` | — | Obs | Y | immediate |
 | `/agent` | `[list \| stop <agent-id> \| budget [agent-id] \| use <name> \| use --clear \| stream <orchestrators\|all\|none> \| bg \| cancel <agent-id>]`; bare opens the agent tree with live values (root "UIA · <name>"); `use` sets the root agent from the next session (profile `active_agent_definition`); `stream`, `bg`, and `cancel` are intercepted locally by the TUI (see below) | Op | Y | immediate (including `stream`/`bg`/`cancel`) |
-| `/skills` | `[list \| show <name> \| …]` | Op | R | immediate (bare/`list`/`show`) |
+| `/skills` | `[list \| show <name> \| preview [TEXT…] [--tool NAME] [--error TEXT] [--path PATH] [--command CMD] [--budget BYTES] \| validate <dir> \| …]`; `preview` shows the selection the turn-loop injector would deliver (no model call), `validate` checks a skill directory relative to the workspace root (PL-97 B3, see `docs/cli.md` "Skills") | Op | R (channels: bare/`list`/`show` only) | immediate (bare/`list`/`show`/`preview`/`validate`) |
+| `/dod` | `[status \| findings [n] \| sensors \| doctor \| config [check\|suggest]]` — Harw-DoD posture, read-only (PL-97 D3); `config suggest` prints the static template with `<R>` placeholders (only `harw dod config suggest` fills in the root); `view` is TUI-local (below) | Op | R (channels: bare/`status`/`findings`/`sensors`) | immediate |
 | `/plugins` | — | Maint | - | immediate (except `install`/`activate`/`uninstall`) |
 | `/model` | `[show \| list \| switch <model-id>]` — **live** from the next turn | Op | - | immediate (`show`/`list`), otherwise staged |
 | `/provider` | `[show \| list \| test]` (no `switch`) | Op | - | immediate (except `test`) |
@@ -923,6 +926,7 @@ boundary (the response says `requested`, not `applied`). No model tool.
 | `/agent stream` | `<orchestrators\|all\|none>` — a live stream of child agents into the transcript for this session (default from `[tui] child_stream`) | Obs | immediate |
 | `/agent bg` | lists background agents with progress | Obs | immediate |
 | `/agent cancel` | `<agent-id>` — cancel your own background agent | Op | immediate |
+| `/dod view` | opens the Harw-DoD view (units, sensor health, last findings; unverified export sources labelled `UNVERIFIED`), refreshed through the read-only `/dod status\|sensors\|findings` (PL-97 D5); every other `/dod` form goes to the `dod` operation | Obs | immediate |
 
 `/agents` no longer exists; typing it shows a hint ("/agents no longer
 exists – use /agent") and is not forwarded. `/btw` exists only in the TUI;
@@ -986,6 +990,36 @@ Rebindable via `[tui].keybindings_file` (a flat TOML table `action =
 | `Ctrl+J` | insert a newline (`insert_newline`) |
 | `Shift+Tab` | approval cycle `ask → auto → full → plan → ask` (`cycle_permission_mode`); the `plan` step is plan mode (marker "⏸ plan mode on (shift+tab to cycle)", the lock is immediate); has no effect while a `/`-popup is open |
 | `Ctrl+↑` / `Ctrl+↓` | scroll without changing focus (`scroll_panel_up` / `scroll_panel_down`): the body of an open dialog (approval, sudo, host permit, plan, `ask_user`), otherwise the visible agent panel (or its detail view); with neither visible the key goes to the composer |
+| `Alt+J` | focus the Jobs window (`focus_jobs`; without a Jobs window of its own: the agent panel) |
+| `Alt+F` | focus the Finished/Failed window (`focus_finished`); while the focused composer holds text, `Alt+F` stays "word forward" |
+| `Alt+L` | open/close the detail view of the agent the LIVE window shows (`toggle_live_detail`) |
+
+The three `Alt` defaults (PL-97 C2) came after existing keybindings files:
+when a file already binds one of these chords to another action, the file
+wins and the unnamed Mission Control action only loses that chord.
+
+`F4` cycles Chat → Agents → Jobs → Finished → LIVE (only where LIVE is a
+focusable window, outside the portrait stack) → Explorer → Workbench;
+`Esc` returns to the chat. A left click focuses the Mission Control window
+under the pointer.
+
+Mission Control windows, when focused (fixed keys, PL-97 C2–C4):
+
+- **Agents:** the agent panel keys below, plus `p` pins the selected agent
+  to the LIVE window (and to the front of the inline live cells); `p`
+  again releases it.
+- **Jobs:** `↑`/`↓`, `k`/`j`, `PageUp`/`PageDown`, `Home`/`End` select,
+  `Enter` opens the job detail, `x` asks for confirmation to stop the
+  selected running job (`k` stays "up"). Confirmed, the TUI dispatches the
+  literal `/jobs stop <id>` through the regular command path (same
+  admission, busy class and `OpContext` as typing it); a refused admission
+  is final, and the key handler never calls the job manager.
+- **Finished/Failed:** `f` expands/collapses the categories, `Enter`
+  expands, and in the expanded list acknowledges the selected category and
+  opens its runs (newest first); `a` acknowledges the selected category
+  (collapsed: all), `c` all failures. Acknowledging deletes nothing.
+- **LIVE** (focusable outside the portrait stack): scrolls on its own; `Alt+L` shows the agent
+  detail in place.
 
 Agent panel, when focused (`F4`, fixed): `↑`/`↓`, `k`/`j` and `w`/`s`
 select, `PageUp`/`PageDown` page, `Home`/`End` jump, `Enter` opens the
@@ -997,20 +1031,44 @@ the chat history. Dialog options and the key-hint line stay pinned and
 always visible; the dialog body scrolls (`Ctrl+↑↓`, wheel), and `↑`/`↓`
 stay option selection.
 
-Small windows: below 100 columns the agent panel collapses to a one-line
-summary above the status line (from 16 rows up; below that it is hidden),
-so the chat keeps its width. The status line drops token details first,
+Small windows: the Mission Control geometry (`harw_tui_layout::classify_mission`,
+PL-97 C1) picks a portrait stack (Agents and Jobs as two windows from 68
+columns, combined below; a one-row collapsed Finished/Failed strip; a LIVE
+strip; chat below), three landscape columns (Chat left and widest,
+Finished/Failed top-centre, LIVE below it, Agents above Jobs on the right),
+a shallow landscape (Agents above Jobs on the right, one-row Finished strip,
+LIVE header above the chat) or, at the smallest sizes, a compact summary
+with Agents/Jobs/Done counters. The chat keeps the largest region in every
+case. The status line drops token details first,
 then the context gauge and hints, and keeps mode, approval and model.
 Dialogs keep options and hints visible down to 40×12.
 
 Not rebindable: `Ctrl+C`/`Ctrl+D`, `Esc`, `Enter` including
-`Shift/Alt+Enter`, and keys inside dialogs/overlays. The `/`-popup also
+`Shift/Alt+Enter`, and keys inside dialogs/overlays. **2×Ctrl+C** (PL-97
+C4b): while a turn or a managed job runs, a second `Ctrl+C` inside the quit
+hint window is an emergency stop: background agents are cancelled, managed
+jobs stop through `JobManager::stop`, `harw-job-*` attempt cgroups are
+killed through `cgroup.kill`, only processes without a known cgroup fall
+back to the process tree, durable store jobs are untouched, and harw exits
+with code 130. With nothing running, a double `Ctrl+C` stays the normal
+quit. The `/`-popup also
 responds to up/down/Tab/Esc/Enter mid-turn; the input history also
 contains `/`-commands (never `/btw`). While child agents are running,
 `Esc` mid-turn asks for confirmation first ("press Esc again to confirm");
 `Enter` queues during a turn and never aborts one. The status line shows
 `Mode: <mode> · Approval: <ask|auto|full>` (with "(pending)" appended while
 a mode change is waiting for the turn boundary) and the active model.
+With the Harw-DoD suite installed it also carries the mark `⛨ n high` (or
+`≥ n` for a partial count), refreshed off the event loop; the
+Finished/Failed title gains `· ⛨ DoD n` (PL-97 D5).
+
+`[tui] reasoning = "message" | "collapsed" | "hidden"` (default `message`,
+profile scope, PL-97 R1) sets how reasoning summaries appear: `message`
+starts expanded as a markdown block with the `∴ Reasoning` header and
+`Ctrl+O` collapses it, `collapsed` starts as header plus first line,
+`hidden` adds no history cell and no live reasoning (the export still
+records it). `/verbose` cycles the tool display Compact → Verbose →
+Activity (PL-97 M3).
 
 ### 8.5 CLI flags for session startup
 

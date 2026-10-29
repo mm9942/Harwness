@@ -252,7 +252,8 @@ that watches host activity around agent execution. It is a distinct
 system-level install (own crates under `dod/crates/` in the root workspace,
 own Makefile, root-owned service accounts) and is never installed or enabled by `make install`/`make
 service`. See [`docs/setup/dod.md`](dod.md) for what it is and how to set
-it up; `make dod-build`, `sudo make dod-install` and `make dod-enable` are
+it up; `make dod-build`, `make dod-install` (run unprivileged: the build
+refuses root, and `install` asks for sudo itself) and `make dod-enable` are
 thin delegations to `dod/Makefile` from the repository root.
 
 All system units (DoD and the infrastructure daemons), the `sysusers.d`

@@ -1,7 +1,7 @@
 ---
 id: PL-97-HARW-DOD-MISSION-CONTROL-CHAIN
 title: "Harw-DoD final suite · tool triggers · TUI Mission Control · execution chain"
-status: APPROVED PLAN
+status: IN IMPLEMENTATION
 date: 2026-10-28
 baseline_dev: fcb12b41f5e53c19cc20607a63c98b829452b505
 tags: [dod, tools, skills, triggers, tui, mission-control, macros, activity, cgroup, bwrap, landlock]
@@ -18,6 +18,14 @@ related:
 ---
 
 # Harw-DoD final suite · tool triggers · TUI Mission Control — implementation plan
+
+> **Status: IN IMPLEMENTATION** (2026-10-29). Every work package except E4
+> (jobs ↔ findings correlation; only the client half landed with D2) and
+> X1b (translation) has a commit on `ccr-54aa3dfd-o46he2` (draft PR #154
+> against `dev`); the RLIMIT_NPROC follow-up of E2 (zone E2f) is in flight.
+> Per-WP commits, main tests and the open items: [§9](#9-landed-state-x1-2026-10-29).
+> Ledger entries: `MIG-016` … `MIG-020` in
+> [`../90-migration-ledger/MIGRATION_LEDGER.md`](../90-migration-ledger/MIGRATION_LEDGER.md).
 
 > Written for a **fresh executing session** with no access to the planning
 > conversation. Everything needed is in this file: verified baseline facts with
@@ -1586,3 +1594,102 @@ work packages above. Where they disagree with §3 or §4, this section wins.
   `DESTDIR` stage path starting services conflicts with PR #153's "no silent
   services" policy and is flagged for D3/X1.
 
+
+## 9. Landed state (X1, 2026-10-29)
+
+Ground truth: `git log --oneline origin/dev..HEAD` on `ccr-54aa3dfd-o46he2`
+and the tree. Several commits carry more than one WP because the WPs edit
+the same files hunk by hunk; the commit messages say which hunks belong to
+which WP. Safety snapshots (`wip: PL-97 safety snapshot …`) and their merges
+carry no content of their own and are not listed.
+
+### 9.1 Per work package
+
+| WP | Commit | Main tests (crate) |
+|---|---|---|
+| Plan | `9d27dbea`, amendments `c1ff4a2c`, `ed0aaaa0` | — |
+| C1 mission geometry | `ca2dfd6c` | `portrait_stack_at_46x78_48x65_70x90_60x60_80x40`, `three_columns_at_120x42_160x45_200x50`, `shallow_landscape_at_100x30`, `compact_summary_at_39x60_48x19_1x1_0x0`, `exhaustive_0x0_to_250x120_keeps_every_invariant_and_the_spec_placement`, `orientation_flip_reclassifies_without_state` (harw-tui-layout) |
+| D2 `harw-dod-client` | `7903df02` | `tail_is_bounded_and_drops_the_cut_line`, `tail_refuses_symlinks_and_reports_missing`, `tail_reads_the_rotated_generation_and_reports_coverage`, `systemctl_absent_fake_and_failing` (harw-dod-client) |
+| M1 `harw-activity` | `27ea6e10`, fixtures `a7111029` | `every_fixture_replays_identically_and_keeps_the_invariants`, `fixture_file_edit_read_loop`, `fixture_job_lifecycle` (harw-activity) |
+| D1 naming, export pipeline | `30b44321` | `test_v1_and_v2_lines_parse_for_every_known_reader`, `test_v2_fixture_line_is_byte_identical_to_encode_line`, `test_explicit_health_export_wins_over_the_default` (harw-sentinel); `test_tmpfiles_creates_the_export_dir_for_harw_dod_readers`, `test_harw_dod_readers_has_no_default_members` (harw-install) |
+| C4a provenance | `d21fc698` | `test_legacy_meta_fixtures_resolve_to_tool_or_unknown` (harw-tool-job) |
+| B4 PL-93 tools | `6f33d09a` | `pl93_read_tools_are_auto_approved_and_sys_tools_ask_like_process_list` (harw-registry-defaults) |
+| E1a Verify, PathMap, report merge | `2cfd4e7a` | `test_verify_check_against_proc_content`, `test_pre_verify_plan_json_still_parses_and_serializes_unchanged`, `test_merge_reports_table` (harw-job-exec); `test_path_map_resolution_is_component_wise_and_longest_prefix` (harw-job-linux) |
+| B1 triggered injection | `765d6e9d` | `keyword_in_user_text_injects_one_fresh_instruction_fragment`, `delivered_excerpts_stay_active_and_are_deduplicated_across_rounds`, `per_turn_and_per_session_budgets_report_dropped_reasons`, `reset_after_compaction_allows_redelivery`, `turn_loop_appends_after_the_stable_prefix_and_records_one_event` (harw-core) |
+| M2 macros | `47a0720e` | `annotated_tool_exposes_activity_and_skill` (harw-macros `tool_activity`), `permission_request` tests, trybuild compile-fail cases 40–47 |
+| E3b BPF descendant scope | `1b63871c` | `cgroup_created_after_attach_is_in_scope_after_one_rescan`, `capacity_overflow_is_counted_reported_once_and_map_stays_at_capacity` (harw-probe-bpf, harw-dod-bpf) |
+| Security review wave 1 | report `aa1b17c8`, `22b0a275`; fixes `4b080e50`, `8c39f26b`, `87d7fa45`, `3eaccea2`, `64d3831c`, `ff7ca74a` (PR #156, merged `c471013f`) | `unreadable_system_dir_is_reported_instead_of_the_home_fallback`, `unknown_skill_names_fail_closed_to_imported`, `oversized_index_is_refused_before_it_is_read`, `writable_absolute_override_is_not_verified` |
+| C2 portrait windows + LIVE | `6db6745a` | `render_viewport_at_46x78_shows_three_windows_live_and_chat`, `render_viewport_at_48x65_keeps_windows_above_a_dominant_chat`, `render_viewport_at_70x90_splits_agents_and_jobs_into_two_windows` (harw-tui) |
+| E1b `BwrapTrampoline` | `a07f7f6f` | `bwrap_trampoline_chain_runs_true_and_merges_the_report` (harw-job-runtime `tests/bwrap_trampoline.rs`, includes the five report-forging attempts; skips without bwrap/Landlock) |
+| E3c probe follows the profile | `a214d590` | `explicit_relative_or_missing_config_path_refuses_to_start`, `egress_cidrs_come_from_the_profile`, `cgroup_profile_with_descendants_yields_roots_and_existing_descendants` (harw-probe-bpf) |
+| E2a per-job write scope | `0922d70e` | `envelope_rejects_unknown_version_unknown_fields_and_invalid_specs`, `best_effort_unscoped_job_still_runs_on_no_backend`, `a_missing_scope_path_needs_an_existing_parent_entry` (harw-job-core, harw-job-runtime) |
+| E2c / E2d non-Linux executors | `08aaecd8`, `93471a44` | OCI, K8s and Darwin executor tests (refuse `require_rlimits`, never over-report) |
+| D3 `harw dod`, `/dod`, `dod.*` | `af2b53a0` | `dod_service_control_refuses_without_root_with_exit_3_and_changes_nothing`, `dod_read_only_actions_work_on_a_host_without_the_suite`, `dod_cli_labels_findings_from_an_unverified_source` (harw-cli); `dod_surfaces_are_three_read_only_model_tools_and_one_operator_command`, `dod_every_surface_labels_findings_from_an_unverified_source` (harw-ops) |
+| B3 `harw skill`, `/skills preview\|validate` | `af2b53a0` | `skills_preview_prints_the_selection_of_the_shared_injector`, `skills_preview_budget_drops_hits_with_typed_reasons` (harw-ops); `preview_delivers_what_the_first_round_of_the_injector_delivers` (harw-core) |
+| B2 tool index, prompt block, lint | `af2b53a0` | `skill_map_links_the_only_declaring_skill_and_prefers_bindings`, `provider_bindings_and_bundled_skill_manifests_agree`, `lint_report_flags_violations_and_stale_or_unexplained_entries`, `families_are_sorted_and_counted` (harw-registry-defaults, harw-ops) |
+| C3 landscape | `3d98064d` | `render_viewport_at_160x45_shows_five_windows_at_the_landscape_anchors`, `render_viewport_at_200x50_with_workbench_and_explorer_keeps_the_anchors`, `render_viewport_at_100x30_is_shallow_with_finished_and_live_strips`, `render_viewport_alt_l_shows_the_live_detail_in_place_at_160x45` (harw-tui) |
+| C4 aggregates, job stop | `3d98064d` | `agent_and_job_of_the_same_child_count_once`, `job_categories_come_from_provenance_only`, `stop_job_line_reaches_the_jobs_command_once_or_not_at_all` (harw-tui) |
+| E2b chain path for `shell.exec`, `job.start`, children | `05d2d5b7` | `scoped_worker_cannot_write_its_siblings_file` (needs bwrap-trampoline; skips otherwise), `chain_and_legacy_results_match`, `chain_rlimits_and_tmpfs_size_apply_inside_sandbox` (harw-tool-shell) |
+| D4 `harw-dod` skill | `703d9745` | `bundled_harw_dod_skill_fires_on_its_tools_and_on_egress`, `a_turn_calling_dod_status_gets_the_harw_dod_excerpt_once_within_budget`, `security_triage_roles_admit_the_dod_tools_and_bind_the_bundled_harw_dod_skill` |
+| B5 CLI rules | `703d9745` | `every_visible_command_has_help_text`, `every_command_supports_json_or_is_listed_as_text_only` (harw-cli) |
+| G1 tool budget pin | `703d9745` | `test_full_root_tool_specs_stay_within_the_pinned_budget`; reproduction `test_full_root_first_round_fits_the_unknown_model_fallback_window` (`#[ignore]`, harw-cli) |
+| M3 TUI activity adapter | registry side `703d9745`, TUI side `2ce5b2fd` | `edit_then_three_reads_of_one_path_render_one_loop_cell`, `job_lifecycle_collapses_into_one_updating_cell`, `a_failed_edit_keeps_the_cross_visible_in_the_loop`, `a_job_with_an_unknown_end_counts_as_failed` (harw-tui `app/activity_glue.rs`) |
+| D5 TUI DoD surfaces | `2ce5b2fd` | `dod_view_renders_units_sensors_and_findings_from_fixtures`, `dod_unverified_source_labels_every_finding_with_the_hint`, `dod_mark_reads_attention_and_hides_without_install`, `dod_suffix_follows_the_title_when_high_findings_exist` (harw-tui) |
+| C4b 2×Ctrl+C hard stop | `2ce5b2fd`, spawn allow-list `86867b59` | `a_job_backed_child_is_stopped_through_the_job_path`, `only_jobs_of_this_session_are_stopped`, `a_job_started_after_the_trip_is_stopped_by_the_final_sweep` (harw-tui `hard_kill`) |
+| R1 readable reasoning (owner request, not in §4) | `2ce5b2fd` | `two_paragraphs_render_with_a_blank_line_between`, `markdown_list_and_code_fence_render_through_markdown`, `collapsed_shows_header_first_line_and_hint` (harw-tui `reasoning_cell.rs`) |
+| Alice consolidation | `22d325f4`, `ddce4f25`, `d3de2055`, `589d24d1`, PR #160 merge `cae9486a`, status fix `3f0a3e5d` | registry rights expectations and golden IR (harw-registry-defaults) |
+| C5 inline live cells | `654b2677` | `root_moves_between_slot_two_and_three_around_a_uia_turn`, `three_concurrent_runs_show_two_cells_and_one_more_row`, `reasoning_spam_cannot_outrank_a_milestone`, `scroll_up_freezes_order_keeps_top_cell_and_counts_new_activity`, `pin_keeps_the_selected_run_in_front_with_a_marker`, `canonical_cells_and_export_are_unchanged_by_the_projection` (harw-tui `app/live_slots.rs`) |
+| E2e `[sandbox] execution` wiring | `f31d639f` | `test_chain_trampoline_route_runs_without_a_fixed_path_prlimit`, `test_background_trampoline_route_runs_without_a_fixed_path_prlimit` (harw-tool-shell); `test_sandbox_execution_config_reaches_the_shell_provider` (harw-registry-defaults); `test_context_child_backend_execution_is_the_config_default` (harw-agent-runner) |
+| E3 shared cgroup-root contract | `f31d639f` | `delegated_root_resolution_order_is_config_env_own_none`, `delegated_root_refuses_relative_unnormalized_and_outside_mount_roots` (harw-job-runtime); `dod_config_suggest_prints_the_profile_for_the_resolved_root`, `dod_config_suggest_drop_in_sets_the_sentinel_root_and_orders_the_probe`, `dod_doctor_warns_when_the_profile_or_prefixes_miss_the_cgroup_root` (harw-cli) |
+| E5 `ExecutionChainReport` | `f31d639f` | `chain_table_golden_for_the_four_host_situations` (harw-dod-client), `execution_chain_checks_report_one_stage_each_and_never_fail` (harw-install), `verify_chain_reports_the_root_the_verify_jobs_use` (harw-cli) |
+| E2f RLIMIT_NPROC through `ResourceRequest` and the trampoline | in flight (uncommitted at X1 time) | — |
+| E4 jobs ↔ findings correlation | **not landed**; only `harw-dod-client/src/correlate.rs` (path-component prefix match) from D2 | — |
+| X1 docs, ledger, status labels | this commit | `python3 -m unittest discover -s scripts/tests`, `cargo test -p xtask` |
+| X1b translation (#133) | **not done** (optional) | — |
+
+### 9.2 Open items and known gaps (checked against the tree)
+
+- **G1, needs an owner decision.** A Full root on a model that falls back to
+  a 32,768-token window is refused on its first round (§4 B2, "Open product
+  regression"); the remedies (a)–(c) are measured, none is chosen.
+- **E4** is open: no `job_id` filter in `harw-ops/src/dod.rs`, no `⛨ n`
+  badge in `harw-tui/src/mission/jobs_window.rs`, no `Actor.cgroup` in the
+  sentinel findings. Kernel-side ancestor matching (E3b optional second
+  commit) is open as well.
+- **E2f** (in flight): on the chain path RLIMIT_NPROC is capped only through
+  the job cgroup's `pids.max` until the follow-up carries it through
+  `ResourceRequest` and the trampoline.
+- **E2b:** child agents get the explicit parent workspace root but stay
+  unconfined on the chain path (recorded deviation in `05d2d5b7`).
+- **E3:** `harw serve` and `harw web` do not build their host command port
+  from the `[jobs]` options (`[jobs] cgroup_root`, `[jobs] trampoline`);
+  they use `HARW_CGROUP_ROOT`, their own delegated cgroup and the trampoline
+  next to `harw` (`docs/setup/install.md`, `docs/setup/dod.md`).
+- **E3/D3:** `/dod config suggest` in the `dod` operation returns the static
+  template (`CONFIG_SUGGEST_TEMPLATE`, `<R>` placeholders); only
+  `harw dod config suggest` fills in the resolved root.
+- **E5:** the TUI status mark for the `ExecutionChainReport` is not built;
+  the report reaches `harw doctor` (`chain/<stage>`), `harw dod doctor`
+  (`execution_chain`) and the verify runner's dimension table.
+- **B2/B4 deferrals** stay as written in §4 B2 and §4 B4 (synthetic `Tool`
+  trigger, the root's real tool set in `## Tool families`, `job.*` lint,
+  the remaining `cargo.*` tools).
+- **D3:** `harw dod enable --grant-read <user>` does not exist; membership
+  in `harw-dod-readers` is granted by hand.
+- **D1/§8.4:** `make -C dod install` and the `DESTDIR` `stage` target both
+  end with `scripts/service.sh enable`; the stage path starting services
+  conflicts with PR #153's "no silent services" policy and is still open.
+- **M2:** `permission_request!` has no consumption point in the operation
+  framework yet ("landed, call site open").
+- **§8.1:** child sessions get no `SkillInjector`.
+- **§8.3:** the `x` stop dispatches `/jobs stop <id>` for managed jobs; a
+  durable-job stop under `JobMutationScope` from the Jobs window is not
+  built; whether durable `harw-job-store` jobs get their own origin or
+  stay out of the managed-jobs window is still the open question of §8.3.
+- **PL-87 (§6.3, §4 X1):** the PL-87 gap README from `coop/tools-gap` is
+  not ported; follow-up. `docs/planning/87-tool-gaps/TOOL-DISCOVERABILITY.md`
+  (PL-88) is marked PARTIALLY LANDED for B2 `af2b53a0` (`tool.index`,
+  `harw tool list|describe`, description lint, `## Tool families`);
+  `harw config defaults` (its §2.2) is open.
+- The `wip/` directory of this plan is removed by the orchestrator, not by
+  this commit.

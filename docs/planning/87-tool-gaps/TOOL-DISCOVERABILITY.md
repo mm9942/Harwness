@@ -1,12 +1,22 @@
 ---
 id: PL-88-TOOL-DISCOVERABILITY
 title: "Tool discoverability and explicit defaults"
-status: proposed
+status: PARTIALLY LANDED
 date: 2026-10-01
 baseline: dev@70faabed9182834792a5f36e67cd80535792542a
 ---
 
 # Tool discoverability and explicit defaults
+
+> **Status: PARTIALLY LANDED** (2026-10-29, PL-97 X1). PL-97 B2
+> (`af2b53a0`) landed §3 steps 1, 2, 4 and 5: the tool index with its
+> tool→skill link, the read-only model tool `tool.index`, the CLI as
+> `harw tool list|describe` (not `harw tools`), the registry description
+> lint (descriptions of at least 60 characters with a documented start
+> pattern, every argument described; existing offenders allowlisted by
+> name) and the cache-stable `## Tool families` prompt block. Step 3
+> (`harw config defaults`, `config.defaults.toml` and its round-trip test,
+> §2.2) is open. Details: [PL-97 §9](../97-harw-dod-mission-control-chain/README.md#9-landed-state-x1-2026-10-29).
 
 ## 1. Problem (observed)
 
