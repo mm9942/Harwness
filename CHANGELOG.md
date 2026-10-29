@@ -37,6 +37,13 @@ Semantic Versioning within the 0.x pre-release range.
     drop and rlimits (`BwrapTrampoline`); per-job write scopes fail closed.
     `harw doctor` gains `chain/<stage>` checks and `harw dod doctor` the
     execution chain table (`execution_chain` in `--json`).
+  - **Jobs ↔ DoD findings (PL-97 E4).** The sentinel attributes findings to
+    the job cgroup that caused them and exports that `scope` (export
+    `schema_version 2`, additive). `harw dod findings --job <id>`,
+    `/dod findings --job` and the `dod.findings` tool filter by job, and
+    the TUI Jobs window shows `⛨ n` for high/critical findings of a job.
+    Attribution needs a delegated cgroup root; without one jobs carry no
+    cgroup proof and nothing is correlated.
 
 ### Changed
 

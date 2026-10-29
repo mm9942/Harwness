@@ -314,7 +314,7 @@
 **Tests added/changed:** see PL-97 §9.1 rows D1–D5 (harw-sentinel, harw-install, harw-dod-client, harw-cli `dod_cmd`, harw-ops `dod`, harw-tui `dod_view`).
 **Architecture gates changed:** `harw-dod-client` in `xtask/arch-policy.toml` (layer A, forbidden from the Warden/escalation/daemons); spawn policy allows the `systemctl` status query.
 **Documentation updated:** `README.md`, `dod/README.md`, `docs/setup/dod.md`, `docs/cli.md`, `docs/design/harw-dod-charter.md`, `docs/security/pl97-security-review.md`.
-**Remaining plan items:** E4 jobs ↔ findings correlation (client half only); `harw dod enable --grant-read`; the `make -C dod install`/`stage` enable step versus "no silent services" (PL-97 §8.4); Warden v2 proofs (PL-96 W01).
+**Remaining plan items:** E4 landed in `0bababe2` (DoD side) and `b58fcd13` (harw side: `--job` filter, `⛨ n` badge); multi-cgroup rule findings stay without scope; `harw dod enable --grant-read`; the `make -C dod install`/`stage` enable step versus "no silent services" (PL-97 §8.4); Warden v2 proofs (PL-96 W01).
 
 ## MIG-017 — Skill triggers and the tool landscape (PL-97 B1–B5, PL-95 S2–S6, PL-93)
 
@@ -360,7 +360,7 @@
 **Tests added/changed:** PL-97 §9.1 rows C1–C5, C4b, R1 (harw-tui 1426 lib tests at `654b2677`).
 **Architecture gates changed:** spawn policy allow-lists the read-only `ps` snapshot of the hard stop.
 **Documentation updated:** `docs/design/tui-command-contract.md` §8, `docs/design/tui-architecture.md`, PL-94/PL-68 status.
-**Remaining plan items:** durable-job stop from the Jobs window (PL-97 §8.3); the `⛨ n` job badge (E4); a TUI mark for the execution chain report (E5); window title language.
+**Remaining plan items:** durable-job stop from the Jobs window (PL-97 §8.3); a TUI mark for the execution chain report (E5); window title language.
 
 ## MIG-019 — Execution chain: Bubblewrap ∘ Landlock ∘ cgroup v2 ∘ DoD (PL-97 E1–E5)
 
@@ -384,7 +384,7 @@
 **Tests added/changed:** PL-97 §9.1 rows E1a–E5.
 **Architecture gates changed:** `harw-job-exec` stays in `gate_privileges`; no `*-sys` crate in layer J; no new DoD capability; `harw-cli` drops its unused `harw-job-executor-bwrap` dependency.
 **Documentation updated:** `docs/design/mediated-process-execution.md`, `docs/design/config-scopes.md`, `docs/setup/install.md`, `docs/setup/dod.md`, `docs/cli.md`.
-**Remaining plan items:** a separate rlimit (`process_count`) dimension in `SandboxReport` (E2f/E2g follow-up); child agents stay unconfined on the chain path; `harw serve`/`harw web` do not build their command port from the `[jobs]` options; E4 correlation; kernel-side ancestor matching; TUI chain mark. Note: the `f31d639f` message says `DelegateSubgroup=harw.slice`; the tree uses `harw-main`.
+**Remaining plan items:** a separate rlimit (`process_count`) dimension in `SandboxReport` (E2f/E2g follow-up); child agents stay unconfined on the chain path; `harw serve`/`harw web` do not build their command port from the `[jobs]` options; kernel-side ancestor matching; TUI chain mark. Note: the `f31d639f` message says `DelegateSubgroup=harw.slice`; the tree uses `harw-main`.
 
 ## MIG-020 — Semantic activity and macro metadata (PL-97 M1–M3, PL-71)
 

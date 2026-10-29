@@ -1645,7 +1645,8 @@ carry no content of their own and are not listed.
 | E5 `ExecutionChainReport` | `f31d639f` | `chain_table_golden_for_the_four_host_situations` (harw-dod-client), `execution_chain_checks_report_one_stage_each_and_never_fail` (harw-install), `verify_chain_reports_the_root_the_verify_jobs_use` (harw-cli) |
 | E2f RLIMIT_NPROC through `ResourceRequest` and the trampoline | `7b9e23e3` | `test_process_count_rlimit_is_encoded_in_the_plan`, `test_apply_controls_sets_the_process_count_rlimit`, `test_process_count_rlimit_reaches_the_job` (harw-job-exec); `landlock_trampoline_plan_carries_the_process_count_rlimit`, `process_count_rlimit_reaches_the_program_and_is_reported` (harw-job-runtime); `job_resources_map_every_limit` (harw-tool-shell). Validation: `cargo test -p harw-job-core`, `-p harw-job-exec`, `-p harw-job-darwin`, `-p harw-job-runtime --features bwrap` (127), `-p harw-tool-shell` (215, incl. the ignored chain rlimit test) |
 | E2g RLIMIT_NPROC identity check (PR #154 review: uid 0, `CAP_SYS_ADMIN`, `CAP_SYS_RESOURCE` are exempt) | `97804cbb` | `test_process_count_outcome_for_exempt_and_unprivileged_identities`, `test_apply_controls_refuses_a_required_process_count_for_root`, `test_process_identity_parsing_and_exemption`, `test_required_process_count_is_refused_for_an_exempt_identity` (harw-job-exec); `plain_prlimit_path_checks_the_process_count_against_the_identity`, `pids_max_covers_the_process_count_only_at_or_below_the_request`, `required_process_count_is_refused_for_an_exempt_harw_identity` (harw-job-runtime); `nproc_exempt_identity_is_refused_under_require_rlimits`, `test_chain_plain_bwrap_route_leaves_the_nproc_identity_to_the_runtime`, `test_background_plain_bwrap_route_leaves_the_nproc_identity_to_the_runtime`, `test_sandboxed_command_refuses_an_nproc_exempt_harw` (latex), `test_build_command_ignores_the_harw_nproc_identity` (sudo) (harw-tool-shell). Validation: `cargo test -p harw-job-exec` (33 unit + 14 integration), `-p harw-job-runtime --features bwrap` (130, 3 ignored), `-p harw-tool-shell` (220, 14 ignored); run as root, so the real-identity tests took the exempt branches |
-| E4 jobs ↔ findings correlation | **not landed**; only `harw-dod-client/src/correlate.rs` (path-component prefix match) from D2 | — |
+| E4a DoD side: probe forwards the cgroup id, sentinel resolves id → path (unprivileged, bounded caches, no symlinks), `Actor.cgroup`, export `schema_version 2` + optional `scope` | `0bababe2` | `cargo test -p harw-probe-bpf` (104), `-p harw-sentinel` (134), `-p harw-dod-client` (52), `-p harw-security-hub` (41 + 1 doctest); xtask gates (privileges unchanged) |
+| E4b harw side: dedicated-cgroup proof writer (harw-command attestation → harw-tool-job proof bound to the job), `correlate` by path-component prefix, `dod.findings`/`/dod findings`/`harw dod findings --job`, `⛨ n` job badge | `b58fcd13` | `cargo test -p harw-command`, `-p harw-tool-job`, `-p harw-dod-client`, `harw-ops dod` (26+1), `harw-cli dod` (24), `harw-tui jobs` (37) and `dod` (18); xtask gates |
 | X1 docs, ledger, status labels | `d9be3b3a` | `python3 -m unittest discover -s scripts/tests`, `cargo test -p xtask` |
 | X1b translation (#133) | **not done** (optional) | — |
 
@@ -1654,10 +1655,12 @@ carry no content of their own and are not listed.
 - **G1, needs an owner decision.** A Full root on a model that falls back to
   a 32,768-token window is refused on its first round (§4 B2, "Open product
   regression"); the remedies (a)–(c) are measured, none is chosen.
-- **E4** is open: no `job_id` filter in `harw-ops/src/dod.rs`, no `⛨ n`
-  badge in `harw-tui/src/mission/jobs_window.rs`, no `Actor.cgroup` in the
-  sentinel findings. Kernel-side ancestor matching (E3b optional second
-  commit) is open as well.
+- **E4 remaining:** a rule that combines events from several cgroups
+  yields findings without `scope` (the rule engine records no event
+  provenance); the `⛨ n` badge has no `≥` form for a truncated
+  (lower-bound) count; the proof path has not run end to end under a real
+  delegated root (fake-executor tests cover it). Kernel-side ancestor
+  matching (E3b optional second commit) is open.
 - **E2f/E2g follow-up:** `SandboxReport` has no own rlimit (or
   `process_count`) dimension; `resource_limits` stays the worse of the
   cgroup and rlimit states, and an uncapped process count (exempt
@@ -1708,5 +1711,5 @@ carry no content of their own and are not listed.
   (PL-88) is marked PARTIALLY LANDED for B2 `af2b53a0` (`tool.index`,
   `harw tool list|describe`, description lint, `## Tool families`);
   `harw config defaults` (its §2.2) is open.
-- The `wip/` directory of this plan is removed by the orchestrator, not by
-  this commit.
+- The `wip/` working directory of this plan was never committed and is
+  removed.
