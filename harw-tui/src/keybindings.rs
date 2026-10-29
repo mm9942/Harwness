@@ -206,32 +206,66 @@ impl KeyAction {
         }
     }
 
-    /// Deutsche Kurzbeschreibung für Hilfe und Tastenübersicht.
-    pub(crate) const fn label_de(self) -> &'static str {
+    /// Localized short description for help and key binding summaries.
+    pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::ToggleExplorer => "Explorer ein-/ausblenden",
-            Self::ToggleAgents => "Agenten-Panel ein-/ausblenden",
-            Self::CycleFocus => "Fokus reihum wechseln",
-            Self::MaximizePanel => "Fokussiertes Panel im Vollbild",
-            Self::FocusExplorer => "Explorer fokussieren",
-            Self::ToggleToolCells => "Werkzeugzellen auf-/zuklappen",
-            Self::EndHostMode => "Host-Arbeitsphase beenden",
-            Self::DeleteLine => "Eingabezeile löschen",
-            Self::InsertNewline => "Neue Zeile in der Eingabe",
-            // Runde 5, Teil F: die vierte Stufe ist der Plan-Modus.
-            Self::CyclePermissionMode => "Freigabe wechseln: ask → auto → full → plan",
-            Self::ToggleWorkbench => "Workbench ein-/ausblenden",
-            Self::OpenKanban => "Kanban-Board öffnen",
-            Self::OpenModePicker => "Modus und Freigabe wählen",
-            Self::OpenModels => "Modelle je Rolle anzeigen",
-            Self::ShowHelp => "Hilfe anzeigen",
-            Self::OpenMatrix => "Matrix-Game-Panel öffnen",
-            Self::ScrollPanelUp => "Agenten-Panel/Dialogtext nach oben scrollen",
-            Self::ScrollPanelDown => "Agenten-Panel/Dialogtext nach unten scrollen",
-            Self::RedrawScreen => "Bildschirm vollständig neu zeichnen",
-            Self::FocusJobs => "Jobs-Fenster fokussieren",
-            Self::FocusFinished => "Finished/Failed-Fenster fokussieren",
-            Self::ToggleLiveDetail => "LIVE-Agent: Details öffnen/schließen",
+            Self::ToggleExplorer => {
+                crate::i18n::tr("help.action.toggle_explorer", "Show/hide explorer")
+            }
+            Self::ToggleAgents => {
+                crate::i18n::tr("help.action.toggle_agents", "Show/hide agent panel")
+            }
+            Self::CycleFocus => crate::i18n::tr("help.action.cycle_focus", "Cycle focus"),
+            Self::MaximizePanel => {
+                crate::i18n::tr("help.action.maximize_panel", "Maximize focused panel")
+            }
+            Self::FocusExplorer => crate::i18n::tr("help.action.focus_explorer", "Focus explorer"),
+            Self::ToggleToolCells => crate::i18n::tr(
+                "help.action.toggle_tool_cells",
+                "Expand/collapse tool cells",
+            ),
+            Self::EndHostMode => {
+                crate::i18n::tr("help.action.end_host_mode", "End host work phase")
+            }
+            Self::DeleteLine => crate::i18n::tr("help.action.delete_line", "Delete input line"),
+            Self::InsertNewline => {
+                crate::i18n::tr("help.action.insert_newline", "Insert input newline")
+            }
+            Self::CyclePermissionMode => crate::i18n::tr(
+                "help.action.cycle_permission_mode",
+                "Cycle approval: ask → auto → full → plan",
+            ),
+            Self::ToggleWorkbench => {
+                crate::i18n::tr("help.action.toggle_workbench", "Show/hide workbench")
+            }
+            Self::OpenKanban => crate::i18n::tr("help.action.open_kanban", "Open Kanban board"),
+            Self::OpenModePicker => {
+                crate::i18n::tr("help.action.open_mode_picker", "Choose mode and approval")
+            }
+            Self::OpenModels => crate::i18n::tr("help.action.open_models", "Show models by role"),
+            Self::ShowHelp => crate::i18n::tr("help.action.show_help", "Show help"),
+            Self::OpenMatrix => {
+                crate::i18n::tr("help.action.open_matrix", "Open Matrix game panel")
+            }
+            Self::ScrollPanelUp => crate::i18n::tr(
+                "help.action.scroll_panel_up",
+                "Scroll agent panel/dialog text up",
+            ),
+            Self::ScrollPanelDown => crate::i18n::tr(
+                "help.action.scroll_panel_down",
+                "Scroll agent panel/dialog text down",
+            ),
+            Self::RedrawScreen => {
+                crate::i18n::tr("help.action.redraw_screen", "Redraw entire screen")
+            }
+            Self::FocusJobs => crate::i18n::tr("help.action.focus_jobs", "Focus Jobs window"),
+            Self::FocusFinished => {
+                crate::i18n::tr("help.action.focus_finished", "Focus Finished/Failed window")
+            }
+            Self::ToggleLiveDetail => crate::i18n::tr(
+                "help.action.toggle_live_detail",
+                "LIVE agent: open/close details",
+            ),
         }
     }
 
@@ -1093,9 +1127,9 @@ mod tests {
     }
 
     #[test]
-    fn every_action_has_a_german_label_and_a_default() {
+    fn every_action_has_a_localized_label_and_a_default() {
         for action in KeyAction::ALL {
-            assert!(!action.label_de().is_empty(), "{action}");
+            assert!(!action.label().is_empty(), "{action}");
             assert_eq!(action.default_chords().len(), 1, "{action}");
         }
         assert!(

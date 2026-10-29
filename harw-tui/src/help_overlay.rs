@@ -32,6 +32,7 @@ use ratatui::{
 
 use crate::command::{CommandDomain, CommandOrigin, CommandSpec};
 use crate::command_catalog::PLANNED_COMMANDS;
+use crate::i18n::{tr, tr_args};
 use crate::keybindings::KeyBindings;
 use crate::overlay_view::{
     OverlayOutcome, OverlayView, is_down, is_up, plain, render_panel, scroll_offset_for,
@@ -39,115 +40,224 @@ use crate::overlay_view::{
 use crate::registry::CommandRegistry;
 use crate::sanitize::sanitize_inline;
 use crate::style::{self, Theme};
+use unicode_width::UnicodeWidthStr;
 
 /// Seitensprung für `Bild↑`/`Bild↓`.
 const PAGE: isize = 10;
 
 /// Hilfetext des TUI-lokalen Unterbefehls `/dod view` (PL-97 D5).
-const DOD_VIEW_SUMMARY: &str =
-    "Harw-DoD-Ansicht: Units, Sensoren, letzte Befunde (lokal, nur lesend)";
+const DOD_VIEW_SUMMARY: &str = "Harw DoD view: units, sensors, recent findings (local, read-only)";
 
 /// Fußzeile des Reiters „Befehle“.
-const FOOTER_COMMANDS: &str = "Tab Reiter · j/k wählen · Enter vorbelegen · Esc schließen";
+const FOOTER_COMMANDS: &str = "Tab: tab · j/k: select · Enter: prefill · Esc: close";
 
 /// Fußzeile der Reiter „Tasten“/„Präfixe“.
-const FOOTER_SCROLL: &str = "Tab Reiter · j/k scrollen · Esc schließen";
+const FOOTER_SCROLL: &str = "Tab: tab · j/k: scroll · Esc: close";
 
 /// Feste (nicht umbelegbare) Tasten, die der Reiter „Tasten“ nach den
 /// umbelegbaren Aktionen zeigt.
-const FIXED_KEYS: &[(&str, &str)] = &[
-    ("Agenten-Panel (fokussiert): Auswahl", "↑/↓, k/j, w/s"),
-    (
-        "Agenten-Panel (fokussiert): blättern / springen",
-        "Bild↑/Bild↓, Pos1/Ende",
-    ),
-    (
-        "Agenten-Panel (fokussiert): Details / Sammelzeile öffnen",
-        "Enter",
-    ),
-    ("Agenten-Panel (fokussiert): fertige auf-/zuklappen", "f"),
-    ("Agenten-Panel (fokussiert): Fehlschläge quittieren", "c"),
-    (
-        "Agenten-Panel (fokussiert): Agent an LIVE anheften / lösen",
-        "p",
-    ),
-    (
-        "Jobs-Fenster (fokussiert): Auswahl / blättern",
-        "↑/↓, k/j, Bild↑/Bild↓, Pos1/Ende",
-    ),
-    ("Jobs-Fenster (fokussiert): Job-Details öffnen", "Enter"),
-    (
-        "Jobs-Fenster (fokussiert): gewählten Job stoppen (Rückfrage, dann /jobs stop)",
-        "x",
-    ),
-    (
-        "Finished/Failed (fokussiert): Kategorien auf-/zuklappen",
-        "f (Enter klappt auf)",
-    ),
-    (
-        "Finished/Failed (aufgeklappt/Querformat): Einzelläufe öffnen und quittieren",
-        "Enter",
-    ),
-    (
-        "Finished/Failed (fokussiert): gewählte Kategorie quittieren (eingeklappt: alle)",
-        "a",
-    ),
-    ("Finished/Failed (fokussiert): Fehlschläge quittieren", "c"),
-    (
-        "LIVE-Streifen (Hochformat, flaches Querformat)",
-        "nur Anzeige: nie fokussiert, nie gescrollt, nimmt keine Tasten",
-    ),
-    (
-        "LIVE-Fenster (Querformat, fokussiert): scrollen / Details",
-        "↑/↓, k/j, Bild↑/Bild↓, Pos1/g, Ende/G, Enter (Details), r (Reasoning)",
-    ),
-    (
-        "Linksklick",
-        "fokussiert Agenten-, Jobs-, Finished- oder LIVE-Fenster (Querformat) unter dem Zeiger",
-    ),
-    (
-        "Composer mit Text: Wort zurück / vor",
-        "Alt+B / Alt+F (Vorrang vor focus_finished)",
-    ),
-    (
-        "Dialog: Text scrollen (Optionen bleiben sichtbar)",
-        "Strg+↑/↓ (scroll_panel_up/down), Mausrad",
-    ),
-    (
-        "Mausrad",
-        "scrollt Dialog, Agenten-, Jobs-, Finished-, LIVE-Fenster (Querformat) oder Verlauf unter dem Zeiger",
-    ),
-];
+fn fixed_keys() -> [(&'static str, &'static str); 19] {
+    [
+        (
+            tr("help.fixed.agent_select", "Agent panel (focused): select"),
+            "↑/↓, k/j, w/s",
+        ),
+        (
+            tr(
+                "help.fixed.agent_page",
+                "Agent panel (focused): page / jump",
+            ),
+            "PgUp/PgDown, Home/End",
+        ),
+        (
+            tr(
+                "help.fixed.agent_details",
+                "Agent panel (focused): open details / aggregate row",
+            ),
+            "Enter",
+        ),
+        (
+            tr(
+                "help.fixed.agent_finished",
+                "Agent panel (focused): expand/collapse finished agents",
+            ),
+            "f",
+        ),
+        (
+            tr(
+                "help.fixed.agent_failures",
+                "Agent panel (focused): acknowledge failures",
+            ),
+            "c",
+        ),
+        (
+            tr(
+                "help.fixed.agent_pin",
+                "Agent panel (focused): pin/unpin agent in LIVE",
+            ),
+            "p",
+        ),
+        (
+            tr(
+                "help.fixed.jobs_select",
+                "Jobs window (focused): select / page",
+            ),
+            "↑/↓, k/j, PgUp/PgDown, Home/End",
+        ),
+        (
+            tr(
+                "help.fixed.jobs_details",
+                "Jobs window (focused): open job details",
+            ),
+            "Enter",
+        ),
+        (
+            tr(
+                "help.fixed.jobs_stop",
+                "Jobs window (focused): stop selected job (confirm, then /jobs stop)",
+            ),
+            "x",
+        ),
+        (
+            tr(
+                "help.fixed.finished_toggle",
+                "Finished/Failed (focused): expand/collapse categories",
+            ),
+            tr("help.fixed.finished_toggle_chords", "f (Enter expands)"),
+        ),
+        (
+            tr(
+                "help.fixed.finished_runs",
+                "Finished/Failed (expanded/landscape): open and acknowledge individual runs",
+            ),
+            "Enter",
+        ),
+        (
+            tr(
+                "help.fixed.finished_ack",
+                "Finished/Failed (focused): acknowledge selected category (collapsed: all)",
+            ),
+            "a",
+        ),
+        (
+            tr(
+                "help.fixed.finished_failures",
+                "Finished/Failed (focused): acknowledge failures",
+            ),
+            "c",
+        ),
+        (
+            tr(
+                "help.fixed.live_strip",
+                "LIVE strip (portrait, shallow landscape)",
+            ),
+            tr(
+                "help.fixed.live_strip_desc",
+                "Display only: never focused or scrolled, accepts no keys",
+            ),
+        ),
+        (
+            tr(
+                "help.fixed.live_window",
+                "LIVE window (landscape, focused): scroll / details",
+            ),
+            tr(
+                "help.fixed.live_chords",
+                "↑/↓, k/j, PgUp/PgDown, Home/g, End/G, Enter (details), r (reasoning)",
+            ),
+        ),
+        (
+            tr("help.fixed.click", "Left click"),
+            tr(
+                "help.fixed.click_desc",
+                "Focuses the agent, Jobs, Finished or LIVE window (landscape) under the pointer",
+            ),
+        ),
+        (
+            tr(
+                "help.fixed.composer",
+                "Composer with text: previous / next word",
+            ),
+            tr(
+                "help.fixed.composer_chords",
+                "Alt+B / Alt+F (takes priority over focus_finished)",
+            ),
+        ),
+        (
+            tr(
+                "help.fixed.dialog",
+                "Dialog: scroll text (options remain visible)",
+            ),
+            tr(
+                "help.fixed.dialog_chords",
+                "Ctrl+↑/↓ (scroll_panel_up/down), mouse wheel",
+            ),
+        ),
+        (
+            tr("help.fixed.wheel", "Mouse wheel"),
+            tr(
+                "help.fixed.wheel_desc",
+                "Scrolls the dialog, agent, Jobs, Finished, LIVE window (landscape) or history under the pointer",
+            ),
+        ),
+    ]
+}
 
 /// Erklärungen der Eingabe-Präfixe (Präfix, Erklärung).
-const PREFIXES: &[(&str, &str)] = &[
-    (
-        "/befehl",
-        "Slash-Befehl ausführen; das Popup vervollständigt Namen (siehe Reiter „Befehle“).",
-    ),
-    (
-        "!befehl",
-        "Shell-Befehl im Projektverzeichnis ausführen (unterliegt der Freigabe).",
-    ),
-    ("!!", "Den zuletzt ausgeführten Shell-Befehl wiederholen."),
-    (
-        "#text",
-        "Notiz festhalten: ins Tagebuch (/diary note), sonst als Erinnerung (/memory record).",
-    ),
-    (
-        "@rolle text",
-        "Nachricht mit Routing-Hinweis an eine Agentenrolle schicken.",
-    ),
-    (
-        "@pfad",
-        "Datei aus dem Projekt an die Nachricht anhängen (Größe gedeckelt).",
-    ),
-    (
-        "\\/text",
-        "Präfix maskieren: sendet „/text“ wörtlich als Chat (gilt auch für \\! \\# \\@ \\$).",
-    ),
-    ("$", "Reserviert für spätere Verwendung."),
-];
+fn prefixes() -> [(&'static str, &'static str); 8] {
+    [
+        (
+            "/befehl",
+            tr(
+                "help.prefix.slash",
+                "Run a slash command; the popup completes names (see Commands tab).",
+            ),
+        ),
+        (
+            "!befehl",
+            tr(
+                "help.prefix.shell",
+                "Run a shell command in the project directory (subject to approval).",
+            ),
+        ),
+        (
+            "!!",
+            tr(
+                "help.prefix.repeat",
+                "Repeat the last executed shell command.",
+            ),
+        ),
+        (
+            "#text",
+            tr(
+                "help.prefix.note",
+                "Record a note: in the diary (/diary note), otherwise as memory (/memory record).",
+            ),
+        ),
+        (
+            "@rolle text",
+            tr(
+                "help.prefix.role",
+                "Send a message with a routing hint to an agent role.",
+            ),
+        ),
+        (
+            "@pfad",
+            tr(
+                "help.prefix.file",
+                "Attach a project file to the message (size limited).",
+            ),
+        ),
+        (
+            "\\/text",
+            tr(
+                "help.prefix.escape",
+                "Escape a prefix: sends “/text” as literal chat (also applies to \\! \\# \\@ \\$).",
+            ),
+        ),
+        ("$", tr("help.prefix.reserved", "Reserved for future use.")),
+    ]
+}
 
 /// Reiter des Hilfe-Overlays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -165,13 +275,13 @@ impl HelpTab {
     /// Alle Reiter in Anzeigereihenfolge.
     const ALL: [Self; 3] = [Self::Commands, Self::Keys, Self::Prefixes];
 
-    /// Deutsche Reiterbeschriftung.
+    /// Localized tab label.
     #[must_use]
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Commands => "Befehle",
-            Self::Keys => "Tasten",
-            Self::Prefixes => "Präfixe",
+            Self::Commands => tr("help.commands", "Commands"),
+            Self::Keys => tr("help.keys", "Keys"),
+            Self::Prefixes => tr("help.prefixes", "Prefixes"),
         }
     }
 
@@ -227,20 +337,20 @@ struct CommandEntry {
 }
 
 /// Deutsche Bezeichnung und Sortierrang einer [`CommandDomain`].
-fn domain_label(domain: CommandDomain) -> (&'static str, u8) {
+pub(crate) fn domain_label(domain: CommandDomain) -> (&'static str, u8) {
     match domain {
-        CommandDomain::SessionLifecycle => ("Sitzung", 0),
-        CommandDomain::AgentTopology => ("Agenten", 1),
-        CommandDomain::WorkGovernance => ("Arbeit & Freigaben", 2),
-        CommandDomain::Execution => ("Ausführung", 3),
-        CommandDomain::CatalogConfig => ("Modelle & Konfiguration", 4),
-        CommandDomain::Knowledge => ("Wissen", 5),
-        CommandDomain::Channels => ("Kanäle", 6),
-        CommandDomain::Identity => ("Identität & Geräte", 7),
-        CommandDomain::Network => ("Netzwerk", 8),
-        CommandDomain::Security => ("Sicherheit", 9),
-        CommandDomain::Crypto => ("Kryptografie & Schlüssel", 10),
-        CommandDomain::Misc => ("Sonstiges", 11),
+        CommandDomain::SessionLifecycle => (tr("help.session", "Session"), 0),
+        CommandDomain::AgentTopology => (tr("help.agents", "Agents"), 1),
+        CommandDomain::WorkGovernance => (tr("help.work", "Work & approvals"), 2),
+        CommandDomain::Execution => (tr("help.execution", "Execution"), 3),
+        CommandDomain::CatalogConfig => (tr("help.config", "Models & configuration"), 4),
+        CommandDomain::Knowledge => (tr("help.knowledge", "Knowledge"), 5),
+        CommandDomain::Channels => (tr("help.channels", "Channels"), 6),
+        CommandDomain::Identity => (tr("help.identity", "Identity & devices"), 7),
+        CommandDomain::Network => (tr("help.network", "Network"), 8),
+        CommandDomain::Security => (tr("help.security", "Security"), 9),
+        CommandDomain::Crypto => (tr("help.crypto", "Cryptography & keys"), 10),
+        CommandDomain::Misc => (tr("help.misc", "Miscellaneous"), 11),
     }
 }
 
@@ -281,7 +391,7 @@ impl CommandEntry {
             summary: summary.to_owned(),
             usage: String::new(),
             subcommands: Vec::new(),
-            group: "Geplant",
+            group: tr("help.planned", "Planned"),
             group_rank: u8::MAX,
             kind: EntryKind::Planned,
         }
@@ -340,7 +450,7 @@ impl HelpOverlay {
             dod.subcommands.push((
                 "view".to_owned(),
                 String::new(),
-                DOD_VIEW_SUMMARY.to_owned(),
+                tr("help.dod_view", DOD_VIEW_SUMMARY).to_owned(),
             ));
         }
 
@@ -349,15 +459,15 @@ impl HelpOverlay {
             .into_iter()
             .map(|(action, chords)| {
                 let chords = if chords.is_empty() {
-                    "— (nicht belegt)".to_owned()
+                    tr("help.unbound", "— (unbound)").to_owned()
                 } else {
                     chords.join(", ")
                 };
-                (action.label_de().to_owned(), chords)
+                (action.label().to_owned(), chords)
             })
             .collect();
         keys.extend(
-            FIXED_KEYS
+            fixed_keys()
                 .iter()
                 .map(|(label, chords)| ((*label).to_owned(), (*chords).to_owned())),
         );
@@ -434,10 +544,16 @@ impl HelpOverlay {
             match entry.kind {
                 EntryKind::Operation => {}
                 EntryKind::Local => {
-                    spans.push(Span::styled(" [lokal]", style::dim_style(theme)));
+                    spans.push(Span::styled(
+                        tr("help.local", " [local]"),
+                        style::dim_style(theme),
+                    ));
                 }
                 EntryKind::Planned => {
-                    spans.push(Span::styled(" [geplant]", style::warning_style(theme)));
+                    spans.push(Span::styled(
+                        tr("help.planned_tag", " [planned]"),
+                        style::warning_style(theme),
+                    ));
                 }
             }
             let summary = if entry.summary.trim().is_empty() {
@@ -451,7 +567,11 @@ impl HelpOverlay {
             if is_selected {
                 if !entry.usage.trim().is_empty() {
                     lines.push(Line::styled(
-                        format!("      Aufruf: {}", sanitize_inline(&entry.usage)),
+                        tr_args(
+                            "help.usage",
+                            "      Usage: {usage}",
+                            &[("usage", &sanitize_inline(&entry.usage))],
+                        ),
                         style::dim_style(theme),
                     ));
                 }
@@ -462,7 +582,11 @@ impl HelpOverlay {
                         .map(|alias| format!("/{}", sanitize_inline(alias)))
                         .collect();
                     lines.push(Line::styled(
-                        format!("      Alias: {}", aliases.join(", ")),
+                        tr_args(
+                            "help.aliases",
+                            "      Aliases: {aliases}",
+                            &[("aliases", &aliases.join(", "))],
+                        ),
                         style::dim_style(theme),
                     ));
                 }
@@ -479,7 +603,7 @@ impl HelpOverlay {
                 }
                 if entry.kind == EntryKind::Planned {
                     lines.push(Line::styled(
-                        "      Noch nicht verfügbar.".to_owned(),
+                        tr("help.unavailable", "      Not available yet.").to_owned(),
                         style::dim_style(theme),
                     ));
                 }
@@ -488,7 +612,7 @@ impl HelpOverlay {
         }
         if lines.is_empty() {
             lines.push(Line::styled(
-                "Keine Befehle registriert.".to_owned(),
+                tr("help.no_commands", "No commands registered.").to_owned(),
                 style::dim_style(theme),
             ));
         }
@@ -499,20 +623,20 @@ impl HelpOverlay {
     fn key_lines(&self, theme: Theme) -> Vec<Line<'static>> {
         if self.keys.is_empty() {
             return vec![Line::styled(
-                "Keine Tastenbelegung bekannt.".to_owned(),
+                tr("help.no_keys", "No key bindings available.").to_owned(),
                 style::dim_style(theme),
             )];
         }
         let width = self
             .keys
             .iter()
-            .map(|(label, _)| label.chars().count())
+            .map(|(label, _)| label.width())
             .max()
             .unwrap_or(0);
         self.keys
             .iter()
             .map(|(label, chords)| {
-                let pad = width.saturating_sub(label.chars().count());
+                let pad = width.saturating_sub(label.width());
                 Line::from(vec![
                     Span::raw(format!("  {label}{}  ", " ".repeat(pad))),
                     Span::styled(
@@ -526,7 +650,7 @@ impl HelpOverlay {
 
     /// Zeilen des Reiters „Präfixe“.
     fn prefix_lines(theme: Theme) -> Vec<Line<'static>> {
-        PREFIXES
+        prefixes()
             .iter()
             .map(|(prefix, text)| {
                 Line::from(vec![
@@ -550,7 +674,7 @@ impl HelpOverlay {
             HelpTab::Commands => self.selected = apply(self.selected, self.commands.len()),
             HelpTab::Keys => self.keys_scroll = apply(self.keys_scroll, self.keys_len()),
             HelpTab::Prefixes => {
-                self.prefixes_scroll = apply(self.prefixes_scroll, PREFIXES.len());
+                self.prefixes_scroll = apply(self.prefixes_scroll, prefixes().len());
             }
         }
     }
@@ -587,11 +711,11 @@ impl OverlayView for HelpOverlay {
                     area,
                     buf,
                     theme,
-                    "Hilfe",
+                    tr("help.title", "Help"),
                     header,
                     &lines,
                     scroll,
-                    FOOTER_COMMANDS,
+                    tr("help.footer_commands", FOOTER_COMMANDS),
                 );
             }
             HelpTab::Keys => {
@@ -600,11 +724,11 @@ impl OverlayView for HelpOverlay {
                     area,
                     buf,
                     theme,
-                    "Hilfe",
+                    tr("help.title", "Help"),
                     header,
                     &lines,
                     self.keys_scroll,
-                    FOOTER_SCROLL,
+                    tr("help.footer_scroll", FOOTER_SCROLL),
                 );
             }
             HelpTab::Prefixes => {
@@ -613,11 +737,11 @@ impl OverlayView for HelpOverlay {
                     area,
                     buf,
                     theme,
-                    "Hilfe",
+                    tr("help.title", "Help"),
                     header,
                     &lines,
                     self.prefixes_scroll,
-                    FOOTER_SCROLL,
+                    tr("help.footer_scroll", FOOTER_SCROLL),
                 );
             }
         }
@@ -839,11 +963,11 @@ mod tests {
         let mut buf = Buffer::empty(area);
         help.render(area, &mut buf, Theme::Dark);
         let text = buffer_text(&buf);
-        assert!(text.contains("Befehle"));
+        assert!(text.contains("Commands"));
         assert!(text.contains("/mode"));
-        assert!(text.contains("Aufruf: /mode [modus]"));
+        assert!(text.contains("Usage: /mode [modus]"));
         assert!(text.contains("default <modus>"));
-        assert!(text.contains("[lokal]"));
+        assert!(text.contains("[local]"));
 
         help.on_key(key(KeyCode::Tab));
         help.on_key(key(KeyCode::Tab));
@@ -877,37 +1001,132 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            text.contains("Agenten-Panel/Dialogtext nach oben scrollen"),
-            "{text}"
-        );
+        assert!(text.contains("Scroll agent panel/dialog text up"), "{text}");
         assert!(text.contains("alt+k"), "{text}");
         assert!(text.contains("ctrl+down"), "{text}");
         assert!(text.contains("w/s"), "{text}");
-        assert!(text.contains("Mausrad"), "{text}");
+        assert!(text.contains("Mouse wheel"), "{text}");
         // PL-97 C2: neue Aktionen samt Belegung und feste Fenstertasten.
-        assert!(text.contains("Jobs-Fenster fokussieren"), "{text}");
+        assert!(text.contains("Focus Jobs window"), "{text}");
         assert!(text.contains("alt+j"), "{text}");
         assert!(text.contains("alt+f"), "{text}");
         assert!(text.contains("alt+l"), "{text}");
-        assert!(text.contains("an LIVE anheften"), "{text}");
-        assert!(text.contains("Finished/Failed (fokussiert)"), "{text}");
+        assert!(text.contains("pin/unpin agent in LIVE"), "{text}");
+        assert!(text.contains("Finished/Failed (focused)"), "{text}");
         // PL-97 C4: Stopp im Jobs-Fenster und Quittieren in Finished/Failed.
-        assert!(text.contains("gewählten Job stoppen"), "{text}");
-        assert!(text.contains("Einzelläufe öffnen und quittieren"), "{text}");
+        assert!(text.contains("stop selected job"), "{text}");
+        assert!(
+            text.contains("open and acknowledge individual runs"),
+            "{text}"
+        );
         // PL-97 C3: LIVE-Fenster des Querformats und Klick-Fokus.
-        assert!(
-            text.contains("LIVE-Fenster (Querformat, fokussiert)"),
-            "{text}"
+        assert!(text.contains("LIVE window (landscape, focused)"), "{text}");
+        assert!(text.contains("Home/g, End/G, Enter (details)"), "{text}");
+        assert!(text.contains("LIVE strip (portrait"), "{text}");
+        assert!(text.contains("Left click"), "{text}");
+        assert!(text.contains("Finished, LIVE window (landscape)"), "{text}");
+        assert!(text.contains("Composer with text"), "{text}");
+        Ok(())
+    }
+    #[test]
+    fn locale_refresh_preserves_identity_tab_and_scrolls() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let registry = CommandRegistry::new(
+            registry()?
+                .specs()
+                .iter()
+                .filter(|spec| spec.name.as_str() != "mode")
+                .cloned()
+                .collect(),
         );
-        assert!(text.contains("Pos1/g, Ende/G, Enter (Details)"), "{text}");
-        assert!(text.contains("LIVE-Streifen (Hochformat"), "{text}");
-        assert!(text.contains("Linksklick"), "{text}");
-        assert!(
-            text.contains("Finished-, LIVE-Fenster (Querformat)"),
-            "{text}"
-        );
-        assert!(text.contains("Composer mit Text"), "{text}");
+        let keys = KeyBindings::default();
+        let mut help = HelpOverlay::new(&registry, &keys, HelpTab::Commands);
+        let selected = help.commands[help.selected].name.clone();
+        assert_eq!(HelpTab::Commands.label(), "Commands");
+        assert_eq!(HelpTab::Keys.label(), "Keys");
+        assert_eq!(HelpTab::Prefixes.label(), "Prefixes");
+        assert_eq!(help.commands[help.selected].group, "Models & configuration");
+        assert!(help.commands.iter().all(|entry| entry.name != "mode"));
+        help.keys_scroll = 3;
+        help.prefixes_scroll = 2;
+        with_language(UiLanguage::Japanese, || {
+            help.refresh_presentation(&registry, &keys);
+            assert_eq!(HelpTab::Prefixes.label(), "プレフィックス");
+            assert_eq!(help.commands[help.selected].name, selected);
+            assert_eq!(help.commands[help.selected].group, "モデルと設定");
+            assert_eq!(
+                help.commands[help.selected].summary,
+                "Sitzungsmodell wählen"
+            );
+            assert_eq!(help.keys_scroll, 3);
+            assert_eq!(help.prefixes_scroll, 2);
+            assert_eq!(help.tab(), HelpTab::Commands);
+            let area = Rect::new(0, 0, 80, 16);
+            let mut buf = Buffer::empty(area);
+            help.render(area, &mut buf, Theme::Dark);
+            let text = crate::test_support::display_buffer_text(&buf);
+            assert!(text.contains("ヘルプ"), "{text}");
+            assert!(text.contains("使い方: /model"), "{text}");
+            assert_eq!(
+                help.on_key(key(KeyCode::Enter)),
+                OverlayOutcome::Prefill("/model ".to_owned())
+            );
+            help.on_key(key(KeyCode::Tab));
+            assert_eq!(help.tab(), HelpTab::Keys);
+            help.refresh_presentation(&registry, &keys);
+            assert_eq!(help.tab(), HelpTab::Keys);
+            assert_eq!(help.keys_scroll, 3);
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn all_locales_render_all_tabs_at_narrow_widths_and_keep_chords() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let registry = registry()?;
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                let keys = KeyBindings::default();
+                for tab in HelpTab::ALL {
+                    let mut help = HelpOverlay::new(&registry, &keys, tab);
+                    for width in [1, 8, 20, 80] {
+                        let area = Rect::new(0, 0, width, 12);
+                        let mut buf = Buffer::empty(area);
+                        help.render(area, &mut buf, Theme::Dark);
+                        help.on_key(key(KeyCode::PageDown));
+                        help.render(area, &mut buf, Theme::Dark);
+                    }
+                }
+                let labels: Vec<_> = fixed_keys().into_iter().collect();
+                assert_eq!(labels[0].1, "↑/↓, k/j, w/s");
+                assert!(labels[8].0.contains("/jobs stop"));
+                assert_eq!(prefixes()[0].0, "/befehl");
+                assert!(prefixes()[3].1.contains("/memory record"));
+            });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cjk_key_columns_align_by_display_width() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let mut help = overlay(HelpTab::Keys)?;
+        help.keys = vec![
+            ("日本語".to_owned(), "Enter".to_owned()),
+            ("ab".to_owned(), "Tab".to_owned()),
+        ];
+        with_language(UiLanguage::Japanese, || {
+            let area = Rect::new(0, 0, 30, 2);
+            let mut buf = Buffer::empty(area);
+            for (index, line) in help.key_lines(Theme::Dark).into_iter().enumerate() {
+                ratatui::widgets::Widget::render(line, Rect::new(0, index as u16, 30, 1), &mut buf);
+            }
+            assert_eq!(buf[(10, 0)].symbol(), "E");
+            assert_eq!(buf[(10, 1)].symbol(), "T");
+        });
         Ok(())
     }
 }

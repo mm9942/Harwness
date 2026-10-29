@@ -37,38 +37,28 @@ use ratatui::{buffer::Buffer, layout::Rect, style::Style, text::Line, widgets::W
 
 use crate::CommandRegistry;
 use crate::CommandSpec;
+use crate::command::{CommandDomain, PermissionTier};
+use crate::i18n::{tr, tr_args};
 use crate::style;
 
 // ---------------------------------------------------------------------------
 // Interne Hilfsfunktion
 // ---------------------------------------------------------------------------
 
-/// Leitet eine kurze menschenlesbare Beschreibung aus den Debug-Repräsentationen
-/// der Felder `domain` und `permission` eines `CommandSpec` ab.
-fn make_description(domain_str: &str, permission_str: &str) -> String {
-    let domain_label = match domain_str {
-        "SessionLifecycle" => "Sitzung",
-        "AgentTopology" => "Agenten",
-        "WorkGovernance" => "Aufgaben",
-        "Execution" => "Ausführung",
-        "CatalogConfig" => "Katalog",
-        "Knowledge" => "Wissen",
-        "Channels" => "Kanäle",
-        "Identity" => "Identität",
-        "Network" => "Netzwerk",
-        "Security" => "Sicherheit",
-        "Crypto" => "Kryptografie",
-        "Misc" => "Allgemein",
-        other => other,
+/// Formats fallback UI metadata from typed command domain and permission.
+fn make_description(domain: CommandDomain, permission: PermissionTier) -> String {
+    let domain = crate::help_overlay::domain_label(domain).0;
+    let permission = match permission {
+        PermissionTier::Observer => tr("help.observer", "Observer"),
+        PermissionTier::Operator => tr("help.operator", "Operator"),
+        PermissionTier::Maintainer => tr("help.maintainer", "Maintainer"),
+        PermissionTier::Owner => tr("help.owner", "Owner"),
     };
-    let perm_label = match permission_str {
-        "Observer" => "Beobachter",
-        "Operator" => "Operator",
-        "Maintainer" => "Maintainer",
-        "Owner" => "Eigentümer",
-        other => other,
-    };
-    format!("{domain_label} · Berechtigung: {perm_label}")
+    tr_args(
+        "help.popup_description",
+        "{domain} · Permission: {permission}",
+        &[("domain", domain), ("permission", permission)],
+    )
 }
 
 /// Längstes gemeinsames Präfix aller `strings` (case-sensitiv, auf
@@ -214,9 +204,7 @@ impl CommandPopup {
             .iter()
             .map(|spec| {
                 let description = if spec.summary.is_empty() {
-                    let domain_str = format!("{:?}", spec.domain);
-                    let permission_str = format!("{:?}", spec.permission);
-                    make_description(&domain_str, &permission_str)
+                    make_description(spec.domain, spec.permission)
                 } else {
                     spec.summary.clone()
                 };
@@ -391,7 +379,8 @@ impl CommandPopup {
     pub(crate) fn footer_line(&self) -> Option<String> {
         let &item_idx = self.filtered.get(self.selected)?;
         let usage = &self.items[item_idx].usage;
-        (!usage.is_empty()).then(|| format!("Nutzung: {usage}"))
+        (!usage.is_empty())
+            .then(|| tr_args("help.popup_usage", "Usage: {usage}", &[("usage", usage)]))
     }
 
     /// Gewünschte Höhe in Zeilen bei höchstens `max_rows`: Trefferzahl plus
@@ -812,7 +801,7 @@ mod tests {
         let popup = CommandPopup::new(&CommandRegistry::new(vec![spec]));
         assert_eq!(
             popup.items[0].description,
-            "Allgemein · Berechtigung: Operator"
+            "Miscellaneous · Permission: Operator"
         );
         assert_eq!(popup.footer_line(), None, "no usage → no footer");
         Ok(())
@@ -825,10 +814,10 @@ mod tests {
         assert_eq!(popup.selected_name(), Some("model"));
         assert_eq!(
             popup.footer_line().as_deref(),
-            Some("Nutzung: /model [show|list|switch <modell-id>]")
+            Some("Usage: /model [show|list|switch <modell-id>]")
         );
         let rows = render_rows(&popup, 80, 3);
-        assert!(rows[2].starts_with("Nutzung: /model"), "{rows:?}");
+        assert!(rows[2].starts_with("Usage: /model"), "{rows:?}");
         assert!(rows[0].contains("/model"), "{rows:?}");
         let hits = u16::try_from(popup.filtered.len()).map_err(ctx("hit count"))?;
         assert_eq!(popup.preferred_height(20), hits + 1, "hits plus footer");
@@ -877,7 +866,7 @@ mod tests {
         assert_eq!(popup.selected_name(), Some("switch"));
         assert_eq!(
             popup.footer_line().as_deref(),
-            Some("Nutzung: /model switch <modell-id>")
+            Some("Usage: /model switch <modell-id>")
         );
         assert_eq!(popup.tab_outcome(), TabOutcome::Accept("switch".to_owned()));
         assert_eq!(popup.completion_line("switch"), "/model switch ");
@@ -886,7 +875,7 @@ mod tests {
         popup.on_query_change("show");
         assert_eq!(
             popup.footer_line().as_deref(),
-            Some("Nutzung: /model show"),
+            Some("Usage: /model show"),
             "no args → no trailing space"
         );
         let rows = render_rows(&popup, 60, 2);
@@ -916,6 +905,95 @@ mod tests {
         assert!(command_popup.digits_select());
         assert_eq!(command_popup.completion_line("model"), "/model ");
         assert_eq!(command_popup.query_line("mo"), "/mo");
+        Ok(())
+    }
+    #[test]
+    fn localized_fallback_refresh_preserves_query_identity_and_external_metadata() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let make = |name: &str| {
+            CommandSpec::new(
+                name,
+                Vec::<String>::new(),
+                crate::CommandScope::TuiOnly,
+                PermissionTier::Operator,
+                crate::OutputSurface::Inline,
+                CommandDomain::Misc,
+            )
+            .map_err(ctx("valid spec"))
+        };
+        let bare = make("bare")?;
+        let external =
+            make("external")?.with_help("Datei unchanged {usage}", "/external <pfad>", &[]);
+        let registry = CommandRegistry::new(vec![bare, external]);
+        let mut popup = CommandPopup::new(&registry);
+        popup.on_query_change("a");
+        popup.move_down();
+        let selected = popup.selected_name().map(str::to_owned);
+        assert!(
+            popup
+                .items
+                .iter()
+                .any(|item| item.description == "Miscellaneous · Permission: Operator")
+        );
+        with_language(UiLanguage::Japanese, || {
+            popup.refresh_catalog(&registry);
+            assert_eq!(popup.query, "a");
+            assert_eq!(popup.selected_name(), selected.as_deref());
+            assert!(popup.selection_moved);
+            assert!(
+                popup
+                    .items
+                    .iter()
+                    .any(|item| item.description == "その他 · 権限: 操作担当者")
+            );
+            let supplied = popup.items.iter().find(|item| item.name == "external");
+            assert!(
+                supplied.is_some_and(|item| item.description == "Datei unchanged {usage}"
+                    && item.usage == "/external <pfad>")
+            );
+            popup.on_query_change("bare");
+            let area = Rect::new(0, 0, 80, 3);
+            let mut buf = Buffer::empty(area);
+            popup.render(area, &mut buf, style::Theme::Dark);
+            let text = crate::test_support::display_buffer_text(&buf);
+            assert!(text.contains("その他 · 権限: 操作担当者"), "{text}");
+            assert_eq!(
+                popup.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                PopupAction::Accept("bare".to_owned())
+            );
+            for width in [1, 8, 20] {
+                let area = Rect::new(0, 0, width, 2);
+                popup.render(area, &mut Buffer::empty(area), style::Theme::Dark);
+            }
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn localized_subcommand_refresh_keeps_grammar_and_selection() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let spec = model_spec()?;
+        let registry = CommandRegistry::new(vec![spec.clone()]);
+        let mut popup =
+            CommandPopup::for_subcommands(&spec).ok_or(TestError::Missing("model subcommands"))?;
+        popup.on_query_change("sw");
+        with_language(UiLanguage::ChineseSimplified, || {
+            popup.refresh_catalog(&registry);
+            assert_eq!(popup.selected_name(), Some("switch"));
+            assert_eq!(popup.query, "sw");
+            assert_eq!(
+                popup.footer_line().as_deref(),
+                Some("用法：/model switch <modell-id>")
+            );
+            assert_eq!(popup.completion_line("switch"), "/model switch ");
+            assert!(!popup.digits_select());
+            assert_eq!(
+                popup.on_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+                PopupAction::Stay
+            );
+        });
         Ok(())
     }
 }
