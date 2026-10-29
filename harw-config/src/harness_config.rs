@@ -370,6 +370,18 @@ pub const JOBS_MAX_RUNNING_RANGE: (u32, u32) = (1, 256);
 ///   außerhalb des Bereichs ist ein Konfigurationsfehler, kein Klemmen.
 ///   Merge-Regel `MinBound`: Home und Profil setzen frei, auch nach oben;
 ///   ein nicht vertrautes Projekt darf nur senken (`crate::merge`, `merge_jobs`).
+/// - `cgroup_root` (PL-97 E3): the delegated cgroup v2 root of harw's jobs,
+///   an absolute path below `/sys/fs/cgroup` (checked fully by
+///   `harw_job_runtime::host::resolve_delegated_root`; a relative path is
+///   already a parse error). First step of the resolution order
+///   (`[jobs] cgroup_root` → `HARW_CGROUP_ROOT` → own delegated cgroup).
+///   Profile scope, `ProfileReplaces`, security critical: only trusted
+///   layers set it, an untrusted project layer never.
+/// - `trampoline` (PL-97 E3): absolute path of the `harw-job-exec`
+///   trampoline, for installs where it does not sit next to `harw`
+///   (`ExecutableSource::Path`). Same scope and merge rule as
+///   `cgroup_root`: an untrusted project layer cannot point harw at
+///   another binary.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobsToml {
@@ -380,6 +392,38 @@ pub struct JobsToml {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_running: Option<u32>,
+    /// Delegated cgroup v2 root of harw's jobs (absolute).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_jobs_absolute_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cgroup_root: Option<std::path::PathBuf>,
+    /// Absolute path of the `harw-job-exec` trampoline.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_jobs_absolute_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub trampoline: Option<std::path::PathBuf>,
+}
+
+// Lehnt einen relativen Pfad für `[jobs] cgroup_root` / `[jobs] trampoline`
+// beim Parsen ab (wie `deserialize_jobs_max_running`).
+fn deserialize_jobs_absolute_path<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::path::PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = std::path::PathBuf::deserialize(deserializer)?;
+    if !value.is_absolute() {
+        return Err(serde::de::Error::custom(format!(
+            "[jobs] paths must be absolute, got {}",
+            value.display()
+        )));
+    }
+    Ok(Some(value))
 }
 
 impl JobsToml {
@@ -1415,6 +1459,33 @@ mod tests {
         .map_err(ctx("parse config with jobs.max_running"))?;
         assert_eq!(cfg.jobs.max_running, Some(3));
         assert_eq!(cfg.jobs.effective_max_running(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_jobs_cgroup_root_and_trampoline_parse_absolute_paths_only() -> TestResult {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+            [jobs]
+            cgroup_root = "/sys/fs/cgroup/user.slice/harw.slice"
+            trampoline = "/opt/harw/libexec/harw-job-exec"
+            "#,
+        )
+        .map_err(ctx("parse jobs paths"))?;
+        assert_eq!(
+            cfg.jobs.cgroup_root.as_deref(),
+            Some(std::path::Path::new("/sys/fs/cgroup/user.slice/harw.slice"))
+        );
+        assert_eq!(
+            cfg.jobs.trampoline.as_deref(),
+            Some(std::path::Path::new("/opt/harw/libexec/harw-job-exec"))
+        );
+        for bad in [
+            "[jobs]\ncgroup_root = \"harw.slice\"",
+            "[jobs]\ntrampoline = \"bin/harw-job-exec\"",
+        ] {
+            assert!(toml::from_str::<HarnessConfig>(bad).is_err(), "{bad}");
+        }
         Ok(())
     }
 

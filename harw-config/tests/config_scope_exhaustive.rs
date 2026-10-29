@@ -841,15 +841,40 @@ fn test_field_table_exhaustive_shell_toml() {
 }
 
 // ---------------------------------------------------------------------
-// [jobs] (1 Feld) — Höchstzahl laufender Hintergrund-Jobs
+// [jobs] (3 Felder) — Höchstzahl laufender Jobs, cgroup-Wurzel, Trampolin
 // ---------------------------------------------------------------------
 
 #[test]
 fn test_field_table_exhaustive_jobs_toml() {
-    let harw_config::harness_config::JobsToml { max_running } =
-        harw_config::harness_config::JobsToml::default();
-    let _ = max_running;
-    assert_path_in_field_table_exactly_once("jobs.max_running");
+    let harw_config::harness_config::JobsToml {
+        max_running,
+        cgroup_root,
+        trampoline,
+    } = harw_config::harness_config::JobsToml::default();
+    let _ = (max_running, cgroup_root, trampoline);
+    for path in ["jobs.max_running", "jobs.cgroup_root", "jobs.trampoline"] {
+        assert_path_in_field_table_exactly_once(path);
+    }
+}
+
+// PL-97 E3: `jobs.cgroup_root` und `jobs.trampoline` sind Profil-Ebene und
+// sicherheitsrelevant; ein nicht vertrautes Projekt darf sie nicht setzen.
+#[test]
+fn test_jobs_cgroup_root_and_trampoline_are_profile_scoped_and_security_critical() -> TestResult {
+    for path in ["jobs.cgroup_root", "jobs.trampoline"] {
+        let entry = FIELD_TABLE
+            .iter()
+            .find(|f| f.path == path)
+            .ok_or(common::TestError::Missing("jobs path"))?;
+        assert_eq!(entry.scope, harw_config::Scope::Profile, "{path}");
+        assert_eq!(
+            entry.merge,
+            harw_config::MergeRule::ProfileReplaces,
+            "{path}"
+        );
+        assert!(entry.security_critical, "{path}");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

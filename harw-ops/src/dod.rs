@@ -101,28 +101,33 @@ const DOD_USAGE: &str = "/dod [status | findings [n] | sensors | doctor | config
 /// Profile stanza printed by `/dod config suggest` and
 /// `harw dod config suggest`.
 ///
-/// A template: PL-97 E3 replaces `<cgroup root>` with harw's delegated
-/// cgroup root. Pasted unchanged it does not validate (cgroup paths must
-/// start with `/`), so an incomplete profile cannot be enabled by mistake.
+/// A template with the placeholder `<R>` (harw's delegated cgroup root
+/// without the `/sys/fs/cgroup` prefix). Pasted unchanged it does not
+/// validate (cgroup paths must start with `/`), so an incomplete profile
+/// cannot be enabled by mistake. `harw dod config suggest` (harw-cli)
+/// fills `<R>` in from `[jobs] cgroup_root` or `HARW_CGROUP_ROOT`.
 pub const CONFIG_SUGGEST_TEMPLATE: &str = r#"# Harw-DoD observation profile for harw's job cgroups (template).
-# Replace <cgroup root> with the cgroup harw delegates its jobs to, as a
-# path below the cgroup2 mount (e.g. /user.slice/user-1000.slice/user@1000.service/harw.slice;
-# PL-97 E3 fills it in automatically), merge the profile into
+# <R> is harw's delegated cgroup root without the /sys/fs/cgroup prefix
+# (e.g. /system.slice/harw-control.service). `harw dod config suggest` fills
+# it in from `[jobs] cgroup_root` or HARW_CGROUP_ROOT. Merge the profile into
 # /etc/harw-dod/config.toml and run `sudo harw dod enable`.
+# The root must exist before harw-probe-bpf starts: the probe refuses to
+# start while no configured cgroup root resolves (`harw dod config suggest --drop-in`).
 schema_version = 1
 mode = "observe"
 active_profile = "harw-jobs"
 
 [profiles.harw-jobs]
 scope = "cgroups"
-cgroup_paths = ["<cgroup root>"]
+cgroup_paths = ["<R>"]
 include_descendants = true
 sensors = ["exec", "tcp-connect"]
 egress_allow_cidrs = []
 
-# Matching entry in harw's own config (`~/.harw/config.toml`):
+# Matching entry in harw's own config (`~/.harw/config.toml`), canonical
+# form (absolute, below /sys/fs/cgroup):
 # [dod]
-# allowed_cgroup_prefixes = ["<cgroup root>"]
+# allowed_cgroup_prefixes = ["/sys/fs/cgroup<R>"]
 "#;
 
 // ── Snapshot, backend, service ──────────────────────────────────────────────
@@ -1700,7 +1705,7 @@ async fn dod_command(ctx: &OpContext, args: DodCommandArgs) -> Result<OpOutput, 
             data: Some(json!({
                 "template": CONFIG_SUGGEST_TEMPLATE,
                 "complete": false,
-                "note": "the delegated cgroup root is filled in by PL-97 E3",
+                "note": "replace <R> with the delegated cgroup root; `harw dod config suggest` fills it in",
             })),
         });
     }

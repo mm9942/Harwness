@@ -169,9 +169,17 @@ pub(crate) struct ChatOptions {
 /// migrate, `shell.exec` and `latex.*` start their processes only through the
 /// job runtime. Without a port (unsupported platform, store not creatable)
 /// they report "no job runtime" instead of spawning anything themselves.
-fn install_command_port(home: &std::path::Path) {
+/// PL-97 E3: `[jobs] cgroup_root` and `[jobs] trampoline` (trusted layers
+/// only) reach the host port here.
+fn install_command_port(home: &std::path::Path, jobs: &harw_config::harness_config::JobsToml) {
     // First installer wins; `SessionJobs::open` installs the same default.
-    harw_command::install_host_default(&harw_home::paths::cache_dir(home).join("command-jobs"));
+    harw_command::install_host(
+        &harw_home::paths::cache_dir(home).join("command-jobs"),
+        &harw_command::HostPortOptions {
+            cgroup_root: jobs.cgroup_root.clone(),
+            trampoline: jobs.trampoline.clone(),
+        },
+    );
 }
 
 /// Startet den Default-Chat-Pfad.
@@ -258,7 +266,7 @@ pub fn run_chat(
         eprintln!("{hint}");
     }
 
-    install_command_port(&home);
+    install_command_port(&home, &config.harness.jobs);
 
     match initial_prompt {
         Some(prompt) => {

@@ -744,6 +744,52 @@ mod tests {
         Ok(())
     }
 
+    /// PL-97 E2b (PR #154 Review): der Startweg steht vor der Suche nach
+    /// `prlimit` fest. Ohne `prlimit` an den festen Pfaden und mit
+    /// `require_rlimits = true` wird ein `bwrap-trampoline`-Start nicht
+    /// abgelehnt (das Trampolin setzt die rlimits selbst), und die Übergabe
+    /// trägt die rlimits; reines Bubblewrap braucht `prlimit` weiterhin.
+    #[tokio::test]
+    async fn test_background_trampoline_route_runs_without_a_fixed_path_prlimit() -> TestResult {
+        let _hidden = crate::limits::test_seam::HiddenPrlimit::install();
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(
+            &tmp,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+        )?;
+        let context = ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox);
+        let mut provider = chain_provider(Some(harw_command::BackendKind::BwrapTrampoline));
+        provider.limits.require_rlimits = true;
+        assert!(provider.limits.resolve_prlimit().is_err());
+        let launch = provider
+            .prepare_background_launch(&context, "make test", "job.start", 5)
+            .await
+            .map_err(|output| TestError::Unexpected(format!("refused: {output:?}")))?;
+        assert!(!launch.executed_on_host());
+        let sandboxed = launch
+            .sandboxed()
+            .ok_or(TestError::Missing("chain submission"))?;
+        let limits = timeouts::limits_for(provider.limits, 5);
+        let resources = sandboxed.limits();
+        assert_eq!(resources, &limits.job_resources());
+        assert!(resources.require_rlimits);
+        assert_eq!(resources.cpu_time_max, Some(limits.cpu_secs));
+        assert_eq!(resources.open_files_max, u32::try_from(limits.nofile).ok());
+
+        let mut plain = chain_provider(Some(harw_command::BackendKind::Bwrap));
+        plain.limits.require_rlimits = true;
+        match plain
+            .prepare_background_launch(&context, "make test", "job.start", 5)
+            .await
+        {
+            Err(ToolOutput::Error { message }) => {
+                assert!(message.contains("prlimit"), "{message}");
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        Ok(())
+    }
+
     /// PL-97 E2b: ein Start mit Schreibbereich ohne Bubblewrap-Backend wird
     /// abgelehnt; der bisherige Weg (`legacy`) übergibt nichts an die Kette.
     #[tokio::test]

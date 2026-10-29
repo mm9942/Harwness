@@ -119,7 +119,8 @@ RELEASE_TAG ?= v$(HARW_VERSION)
 DIST ?= dist
 
 # killer needs Linux procfs and pidfd; Android targets build harw only.
-RELEASE_PACKAGES = -p harw-cli $(if $(findstring android,$(RELEASE_TARGET)),,-p harw-killer)
+# harw-job-exec (job sandbox trampoline) ships next to harw like killer.
+RELEASE_PACKAGES = -p harw-cli $(if $(findstring android,$(RELEASE_TARGET)),,-p harw-killer -p harw-job-exec)
 
 release: ## Build and package a release tarball + SHA256SUMS into $(DIST)/ (RELEASE_TARGET, RELEASE_TAG)
 	$(CARGO) build --release --locked $(RELEASE_PACKAGES) --target $(RELEASE_TARGET)

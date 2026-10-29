@@ -51,11 +51,13 @@ sha256sum -c SHA256SUMS --ignore-missing
 tar -xzf "harw-$tag-$target.tar.gz"
 install -Dm755 "harw-$tag-$target/harw" ~/.local/bin/harw
 install -Dm755 "harw-$tag-$target/killer" ~/.local/bin/killer
+install -Dm755 "harw-$tag-$target/harw-job-exec" ~/.local/bin/harw-job-exec
 install -Dm755 "harw-$tag-$target/harw-agent-runner" ~/.local/bin/harw-agent-runner
 ```
 
 The tarball holds one directory `harw-<tag>-<target>/` with `harw`,
-`killer` (not in Android builds), `harw-agent-runner`, `LICENSE-MIT`,
+`killer` and `harw-job-exec` (both not in Android builds),
+`harw-agent-runner`, `LICENSE-MIT`,
 `LICENSE-APACHE` and `README.md`. The same steps, checksum included, in one
 line:
 
@@ -149,7 +151,7 @@ The root `Makefile` is the single build/install entry point. From a
 checkout:
 
 ```sh
-make install                 # release-build harw + killer, install into ~/.local/bin
+make install                 # release-build harw, killer, harw-job-exec, install into ~/.local/bin
 make install BINDIR=/usr/local/bin   # or PREFIX=/usr/local (BINDIR wins if both are set)
 ```
 
@@ -158,9 +160,9 @@ make install BINDIR=/usr/local/bin   # or PREFIX=/usr/local (BINDIR wins if both
 | Target | What it does |
 |---|---|
 | `help` | Lists targets (default goal) |
-| `build` | Release-build `harw` and `killer` |
-| `install` | Build, then install both binaries into `BINDIR` |
-| `uninstall` | Remove the two installed binaries (never touches `~/.harw`) |
+| `build` | Release-build `harw`, `killer`, `harw-job-exec` and the agent runner |
+| `install` | Build, then install the binaries into `BINDIR` |
+| `uninstall` | Remove the installed binaries (never touches `~/.harw`) |
 | `service` | Install and enable the user systemd services (`harw serve`, `harw gateway`) |
 | `check` | Fast workspace type check |
 | `fmt` | Format check |
@@ -205,7 +207,43 @@ harw service install
 ```
 
 `harw service status` / `harw service uninstall` manage the same two
-services afterwards.
+services afterwards. Installing harw never starts a service; `make service`
+(or `harw service install`) is the explicit step.
+
+The rendered user units set `Delegate=yes` and `DelegateSubgroup=harw-main`,
+so `harw serve` owns its own cgroup R, sits itself in the leaf `R/harw-main`
+(systemd 254 or newer; older systemd ignores the key with a warning) and
+runs each job in a `harw-job-<attempt>` cgroup below R (the delegated
+cgroup root, PL-97 E3). The system unit
+`deploy/systemd/harw-control.service` sets both keys as well.
+`HARW_CGROUP_ROOT` picks another delegated root for every entry point.
+`[jobs] cgroup_root` in the home or profile config applies to the
+interactive and one-shot `harw` paths (chat, TUI) and to the verify runner
+only; `harw serve` and `harw web` do not read it yet and use
+`HARW_CGROUP_ROOT` or their own delegated cgroup. Without any delegated
+root, jobs run without their own cgroup. See
+[`docs/setup/dod.md`](dod.md#observe-harw-jobs-pl-97-e3) for the resolution
+order and the matching DoD profile.
+
+### The job sandbox trampoline (`harw-job-exec`)
+
+Sandboxed jobs on Linux start through `harw-job-exec`: it joins the job
+cgroup, applies rlimits, `NO_NEW_PRIVS`, the capability drop and Landlock,
+then runs the job. Every install path puts it next to `harw` (`make
+install`, the release tarball, `scripts/install.sh --binary`, `harw
+update`). If it lives somewhere else, set an absolute path in the home or
+profile config (an untrusted repository layer cannot set it):
+
+```toml
+[jobs]
+trampoline = "/opt/harw/libexec/harw-job-exec"
+```
+
+`[jobs] trampoline` applies to the same paths as `[jobs] cgroup_root`
+(interactive and one-shot `harw`, the verify runner); `harw serve` and
+`harw web` always look for the trampoline next to `harw`. `harw doctor`
+warns when the trampoline is missing (at `[jobs] trampoline`, else next to
+`harw`).
 
 ## Optional: DoD (Detect · Orient · Defend)
 
@@ -237,8 +275,8 @@ harw update --dismiss  # hide the start notice for the known newest version
 - **Release first.** It asks the GitHub API for the latest release
   (`HARW_UPDATE_API` overrides the endpoint). If that release is newer, it
   downloads `harw-<tag>-<target>.tar.gz` and `SHA256SUMS`, refuses the
-  tarball unless its checksum matches, and replaces `harw`, `killer` and
-  (if included) `harw-agent-runner` in the directory recorded in
+  tarball unless its checksum matches, and replaces `harw`, `killer`,
+  `harw-job-exec` and (if included) `harw-agent-runner` in the directory recorded in
   `~/.harw/install.toml` (else next to the running `harw`). The previous
   binaries stay as `<name>.old`.
 - **Otherwise from source.** With no published release it updates the
@@ -273,9 +311,9 @@ Nothing under `~/.harw` is ever silently overwritten once you've edited it.
 ## Uninstalling
 
 ```sh
-make uninstall        # removes only $(BINDIR)/harw and $(BINDIR)/killer
+make uninstall        # removes $(BINDIR)/harw, killer, harw-job-exec and harw-agent-runner
 # or, if installed via scripts/install.sh:
-rm "$HARW_INSTALL_DIR/harw" "$HARW_INSTALL_DIR/killer"   # default $HOME/.local/bin
+rm "$HARW_INSTALL_DIR/harw" "$HARW_INSTALL_DIR/killer" "$HARW_INSTALL_DIR/harw-job-exec"   # default $HOME/.local/bin
 ```
 
 `~/.harw` (config, agent state, logs, credentials) is **kept** — uninstalling

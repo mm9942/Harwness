@@ -537,15 +537,25 @@ reported as not enforced rather than capped. `prlimit` is looked up only
 where it is needed: on the plain `bwrap` backend the runtime runs its own
 `prlimit` in front of `bwrap` (same check and warning as before); the
 trampoline backends set the rlimits themselves, so a host without
-`prlimit` does not block them.
+`prlimit` does not block them. The route is chosen before `prlimit` is
+looked up, for `shell.exec` and `job.start` alike: with `require_rlimits =
+true` and no fixed-path `prlimit`, a `bwrap-trampoline` route still runs
+and its job spec carries the rlimits in its `ResourceRequest`, while a
+plain `bwrap` route is refused before anything starts (regression tests
+in `harw-tool-shell/src/exec.rs` and `exec/background.rs`).
 
-**Builder default: `legacy`, for now.** The config default is `chain`
-(E2a), but the composition does not pass `[sandbox] execution` to
-`ShellToolProvider::with_execution` (`harw-registry-defaults`
-`build_shell`) or to `JobChildBackend::with_execution`
-(`harw-agent-runner` context) yet. Until it does, `SandboxExecution::default()`
-is `Legacy`, so production keeps the previous path and users are not given
-a chain they cannot opt out of. The chain is opt-in through the builders.
+**Composition.** The runtime assembly passes `[sandbox] execution` (default
+`chain`) through `HostPermitWiring::with_sandbox_execution` to every shell
+provider it builds (`harw-registry-defaults` `build_shell`, root and child
+registries); `job.start` clones that provider, so it takes the same path.
+A compiled agent reads no `[sandbox]` table (`load_config_embedded` starts
+from the config defaults), so `harw-agent-runner` passes the default,
+`chain`, to `JobChildBackend::with_execution`
+(`compiled_agent_sandbox_execution`), together with its canonical working
+directory (`with_workspace_root`). `execution = "legacy"` is the opt-out.
+`SandboxExecution::default()` stays `Legacy`: it is the safe fallback of
+a provider or backend built without any config (tests, the job-control
+provider of orchestrators, which never starts a job).
 
 **The workspace root.** The host port's runtime has `/` as its workspace
 root, and both Bubblewrap backends refuse a host-root workspace. A
@@ -600,9 +610,12 @@ submission of a model call.
 
 **Child agents.** `JobChildBackend` (`harw-agent-runner`) submits each child
 through `harw_tool_job::launcher::child_agent_launch` when it runs in
-chain mode and the composition passed the parent's canonical workspace
-root (`JobChildBackend::with_workspace_root`; harw's process working
-directory is never used, it is not necessarily the parent's workspace).
+chain mode and the composition passed a canonical workspace root
+(`JobChildBackend::with_workspace_root`; the backend never falls back to
+the process working directory on its own). The runner passes its own
+canonical working directory: the directory its session runs in, from
+which the parent's sandbox root is discovered, and the directory the
+previous host submission let the child inherit.
 The child is a workspace request over that root with the
 `workspace_build` profile, no longer a host submission over `/`. Without
 a root the child keeps the host submission (logged once).
@@ -636,16 +649,22 @@ the host submission, logged once per backend.
 - A scoped job with profile modules on `bwrap-trampoline` gets no Landlock
   rules for the modules: the coordinator's scoped inner policy does not add
   `module_binds` yet.
-- `[sandbox] execution` is parsed but not yet passed to
-  `ShellToolProvider::with_execution` and `JobChildBackend::with_execution`
-  (plus `with_workspace_root`) by the composition (`harw-registry-defaults`
-  `build_shell`, `harw-agent-runner` context); both builders default to
-  `legacy` until then. The wiring needs a config-to-provider test.
 - `RLIMIT_NPROC` on the chain: `nproc` maps to `pids_max`, which needs the
   job cgroup. Without a cgroup root the process count is not capped
-  (fork-bomb protection the legacy `prlimit` gave). Fix: carry
-  `RLIMIT_NPROC` through `ResourceRequest` and the trampoline
-  (`harw-job-core`, `harw-job-exec`), or keep the chain opt-in until E3.
+  (fork-bomb protection the legacy `prlimit` gave). Since the host port has
+  no cgroup root yet (E3, below), this is a fail-open regression for every
+  production `shell.exec` and `job.start` now that `chain` is the default.
+  Shipping chain-by-default without the cap needs an explicit owner
+  sign-off in the PL-97 plan/ledger, and the PR description must name the
+  behaviour change. `execution = "legacy"` is the workaround where that
+  matters. Fix: carry `RLIMIT_NPROC` through `ResourceRequest` and the
+  trampoline (`harw-job-core`, `harw-job-exec`), or land the E3 cgroup
+  root.
+- The runner's child root is its canonical working directory, not the
+  parent's bound sandbox root (the discovered project root, narrowed by a
+  compiled write path), which only the runtime assembly computes. That is
+  harmless while the child runs with requirement `none`; a confined child
+  needs the bound root passed through instead.
 - The host port carries the per-request root and modules through an
   idempotency-key registration (`HostCommandExecutor`). A workspace-marked
   key never deduplicates, and a persisted record is refused after a

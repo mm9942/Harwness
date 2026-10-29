@@ -26,6 +26,9 @@
 //!   ⇒ [`UnitStatus::NotAvailable`].
 //! - [`status()`] — one [`DodStatus`] snapshot from a [`DodClientContext`].
 //! - [`correlate()`] — jobs ↔ findings by cgroup path-component prefix (E4).
+//! - [`ExecutionChainReport`] — the Installed/Configured/Running/Ready
+//!   readiness of the job execution chain from plain host, cgroup-root and
+//!   DoD facts (E5; pure, see [`chain`]).
 //!
 //! # Trust boundary
 //! Everything read here is evidence produced from attacker-influenced
@@ -36,6 +39,7 @@
 //! in time and output).
 #![forbid(unsafe_code)]
 
+pub mod chain;
 pub mod config;
 pub mod correlate;
 mod error;
@@ -46,6 +50,11 @@ pub mod paths;
 pub mod status;
 pub mod units;
 
+pub use chain::{
+    ChainBinary, ChainDod, ChainHost, ChainInputs, ChainItem, ChainLevel, ChainRoot, ChainStage,
+    ExecutionChainReport, ProfileCoverage, ServeWorkspace, ServiceState, profile_coverage,
+    same_or_below,
+};
 pub use config::{ActiveProfile, ConfigReport, ProfileScope, read_system_config};
 pub use correlate::{JobCgroup, JobFindings, JobScope, correlate, scope_within};
 pub use error::DodClientError;

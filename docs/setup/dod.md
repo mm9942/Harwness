@@ -212,7 +212,11 @@ The `[dod]` section's defaults are deliberately restrictive
   live; never inherited from an untrusted config layer.
 - `allowed_cgroup_prefixes` — which cgroup path prefixes the escalation
   chain may address at all; an untrusted layer may only narrow this list,
-  never widen it.
+  never widen it. The one canonical form is an absolute path strictly
+  below the cgroup2 mount (`/sys/fs/cgroup/<…>`, trailing `/` optional);
+  a relative entry is rejected. `harw_config::dod_toml::warden_cgroup_id`
+  converts an entry to the Warden's relative `CgroupId`
+  (`/sys/fs/cgroup/user.slice/harw.slice` → `user.slice/harw.slice`).
 - `export_dir` — explicit directory of the sentinel exports that harw
   reads (absolute path). Unset (default): `/var/lib/harw-dod/export` if
   readable, else `<HARW home>/dod/export`. Like `proof_key_dir`, never
@@ -223,12 +227,119 @@ The `[dod]` section's defaults are deliberately restrictive
 
 These invariants are checked while the `[dod]` table is loaded: a `[dod]`
 table in any layer — trusted or not — with `kill_requires_human = false`, a
-blank `allowed_cgroup_prefixes` entry, a relative `export_dir` or
+blank or non-canonical (relative, outside `/sys/fs/cgroup`)
+`allowed_cgroup_prefixes` entry, a relative `export_dir` or
 `findings_window_hours = 0` makes harw's config loading fail with a
 `[dod]: …` error instead of starting with that value.
 
 Enforcement itself lives entirely in the escalation/warden binaries; this
 config section only describes the policy they must honor.
+
+### Observe harw jobs (PL-97 E3)
+
+harw runs every job in its own `harw-job-<attempt>` cgroup below one
+**delegated cgroup v2 root** `R`. The same `R` drives harw's executors,
+the DoD profile and the Warden prefixes. harw resolves it in this order
+(`harw_job_runtime::host::resolve_delegated_root`):
+
+1. `[jobs] cgroup_root` in harw's home or profile config (an untrusted
+   repository layer cannot set it). It applies to the interactive and
+   one-shot `harw` paths (chat, TUI) and to the verify runner; `harw serve`
+   and `harw web` do not read it yet and use the next steps;
+2. the `HARW_CGROUP_ROOT` environment variable (the verify runner still
+   accepts the deprecated `HARW_VERIFY_CGROUP_ROOT`);
+3. the cgroup harw itself runs in (its parent when harw sits in the
+   `harw-main` leaf, see below), when there is real delegation evidence:
+   writable cgroup2 plus systemd's `user.delegate`/`trusted.delegate`
+   xattr, or, outside a user manager, a cgroup systemd handed to the
+   unit's `User=`. Write access alone is not enough (every cgroup below
+   `user@<uid>.service` belongs to the user, so a terminal's `app-*.scope`
+   would pass), and this step never applies as euid 0. The `harw-serve`
+   user unit (`harw service install`) and
+   `deploy/systemd/harw-control.service` both set `Delegate=yes`.
+   `harw dod config suggest` and `harw dod doctor` skip this step: the CLI's
+   own cgroup (a terminal scope or the sudo session) is never harw's job
+   root. Without steps 1–2 they list the service roots as candidates;
+4. none: jobs run without their own cgroup, and harw logs the hint to
+   start it under `systemd-run --user --scope -p Delegate=yes harw …` or
+   from one of those units.
+
+`R` must be an absolute path strictly below `/sys/fs/cgroup`; anything
+else is refused. Both units also set `DelegateSubgroup=harw-main`: on
+systemd 254 or later harw itself runs in the leaf `R/harw-main`, `R` holds
+no process, and the memory/pids controllers can be enabled for the job
+cgroups. Older systemd ignores the key with a warning. harw then lives in
+`R` itself, so the kernel's "no internal processes" rule can keep the
+memory/pids controllers off for the job cgroups: membership, kill and
+observation work, and the limits may only be partial. The same holds for
+the `systemd-run --user --scope -p Delegate=yes` route (scopes have no
+`DelegateSubgroup=`); to get limits there, point `[jobs] cgroup_root` or
+`HARW_CGROUP_ROOT` at a child cgroup of the scope that holds no process.
+
+On installs where `harw-job-exec` (the job sandbox trampoline) does not sit
+next to `harw`, set `[jobs] trampoline = "/abs/path/harw-job-exec"` (trusted
+layers only; same paths as `[jobs] cgroup_root`, `harw serve` and
+`harw web` look next to `harw`). `harw doctor` warns when the trampoline is
+missing.
+
+`harw dod config suggest` prints, for the resolved `R`, the DoD profile
+and the matching harw entry:
+
+```toml
+[profiles.harw-jobs]
+scope = "cgroups"
+cgroup_paths = ["/user.slice/user-1000.slice/user@1000.service/app.slice/harw-serve.service"]
+include_descendants = true
+sensors = ["exec", "tcp-connect"]
+
+# harw's own config:
+[dod]
+allowed_cgroup_prefixes = ["/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/harw-serve.service"]
+```
+
+The profile's `cgroup_paths` are relative to the probe's `--cgroup-root`
+(the cgroup2 mount, `/sys/fs/cgroup`) with a leading `/`; harw's
+`allowed_cgroup_prefixes` use the canonical absolute form. Values are
+printed as TOML strings with escaping, so systemd escapes in cgroup names
+(`\x2d`) survive. Without a resolved root the command prints the template
+with `<R>` placeholders, the service roots that exist on this host, and
+the probe ordering requirement below.
+
+`harw dod config suggest --drop-in` prints two systemd drop-ins:
+
+- `harw-sentinel.service.d/harw-jobs.conf` resets `ExecStart=` and adds
+  `--cgroup-root <R>`, so the sentinel's cgroup sensor reports the
+  `harw-job-<attempt>` cgroups (the direct children of `R`).
+- `harw-probe-bpf.service.d/harw-jobs.conf` handles ordering. **`R` must
+  exist before `harw-probe-bpf` starts**: with a `scope = "cgroups"`
+  profile the probe refuses to start while no configured cgroup root
+  resolves. When `R` belongs to a system unit (for example
+  `/system.slice/harw-control.service`) the drop-in adds
+  `BindsTo=<unit>`, `PartOf=<unit>` and `After=<unit>`. The probe resolves
+  cgroup ids once at start, and every start of the unit creates `R` anew:
+  `BindsTo=` stops the probe when the unit stops or fails (no silent watch
+  on a stale cgroup), `PartOf=` restarts it with the unit. After a crash
+  and automatic restart (`Restart=on-failure`) run `sudo harw dod restart`.
+  When `R` belongs to the user manager or to a transient scope, systemd
+  cannot order the probe after it. Start harw first
+  (`systemctl --user start harw-serve`), then run `sudo harw dod restart`,
+  and run it again after **every** `harw-serve` restart (`Restart=always`,
+  `harw update`): each restart gives `R` a new cgroup id. New job cgroups
+  below `R` are picked up by the probe's rescan (every 2 s) without a
+  restart.
+- The sentinel `ExecStart=` argument doubles `\` and `%`, so systemd
+  passes `R` verbatim (no unescaping, no specifier expansion).
+
+`harw dod doctor` adds three checks, all warnings only: `cgroup-root`
+(`R` resolves), `profile-root` (the active profile has a `cgroup_paths`
+entry at or above `R` with `include_descendants = true`, or observes the
+host) and `allowed-prefixes` (every `allowed_cgroup_prefixes` entry lies
+within `R`).
+
+**Out of scope:** harw does not pass `allowed_cgroup_prefixes` to the
+Warden's `ProofPolicy`. That wiring belongs to the v2 proof path
+(PL-96 W01); the Warden still verifies v1 proofs. Starting services stays
+an explicit operator action: installing harw starts nothing.
 
 ### Exports read by harw
 

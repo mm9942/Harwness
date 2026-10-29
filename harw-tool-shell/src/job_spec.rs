@@ -1,14 +1,16 @@
 //! `shell.exec` and `job.start` through the job runtime's sandbox chain
 //! (PL-97 E2b).
 //!
-//! # Opt-in until the configuration reaches it
-//! [`SandboxExecution::Legacy`] is the builder default of
-//! [`crate::ShellToolProvider`] (and of the child-agent backend) until the
-//! composition passes config `[sandbox] execution` through
-//! [`crate::ShellToolProvider::with_execution`]. The chain also loses things
-//! the legacy path has (`RLIMIT_NPROC` without a cgroup root, nested
-//! `bwrap` under Landlock, module rules inside a scoped job; see the design
-//! doc's known gaps), so it is not forced on users who cannot opt out.
+//! # Configured default and no-config fallback
+//! Production passes config `[sandbox] execution` (default `chain`)
+//! through [`crate::ShellToolProvider::with_execution`]: the runtime
+//! assembly via `HostPermitWiring::with_sandbox_execution`, the agent
+//! runner into its child-agent backend. [`SandboxExecution::Legacy`] stays
+//! the builder default, the safe fallback of a provider built without
+//! config, and `execution = "legacy"` is the opt-out. The chain loses
+//! things the legacy path has (`RLIMIT_NPROC` without a cgroup root,
+//! nested `bwrap` under Landlock, module rules inside a scoped job; see the
+//! design doc's known gaps).
 //!
 //! # What is submitted
 //! With [`SandboxExecution::Chain`] a sandboxed call no longer
@@ -76,8 +78,9 @@ const MAX_NOTICED_SESSIONS: usize = 4096;
 /// How `shell.exec` and `job.start` start sandboxed processes (config
 /// `[sandbox] execution`, PL-97 E2).
 ///
-/// The default is [`Self::Legacy`] until the composition passes the
-/// configured value (module docs).
+/// [`Self::Legacy`] is the builder default, the fallback of a provider
+/// built without config; production passes the configured value (default
+/// [`Self::Chain`], module docs).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SandboxExecution {
     /// Through the job runtime's sandbox chain (module docs).

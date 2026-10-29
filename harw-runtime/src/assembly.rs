@@ -2422,7 +2422,10 @@ impl RuntimeAssemblyBuilder {
             ))
             // Runde 5, Teil N: `[shell] max_timeout_secs` für jeden
             // Shell-Provider (Wurzel und Kinder).
-            .with_shell_max_timeout_secs(config.harness.shell.effective_max_timeout_secs());
+            .with_shell_max_timeout_secs(config.harness.shell.effective_max_timeout_secs())
+            // PL-97 E2b: `[sandbox] execution` (Vorgabe `chain`) für jeden
+            // Shell-Provider und `job.start` (Wurzel und Kinder).
+            .with_sandbox_execution(config.harness.sandbox.effective_execution());
         // Plan R9, Teil F: eine Job-Verwaltung je interaktiver TUI-Sitzung
         // (`<projekt>/.harw/state/jobs/`). Sie reist mit der Host-Permit-
         // Verdrahtung zu Wurzel und Kind-Fabriken: `job.*` neben jedem
@@ -2431,9 +2434,11 @@ impl RuntimeAssemblyBuilder {
         // bekommen keine Jobs.
         let (session_jobs, job_notifications) = if spec.entry == EntryKind::Tui {
             // `[jobs] max_running` — Höchstzahl laufender Jobs dieser Sitzung.
-            match crate::job_wiring::SessionJobs::open(
+            // PL-97 E3: `[jobs] cgroup_root`/`trampoline` erreichen den Befehls-Port.
+            match crate::job_wiring::SessionJobs::open_with_port(
                 &home_project.state_dir(),
                 config.harness.jobs.effective_max_running(),
+                &crate::job_wiring::host_port_options(&config.harness.jobs),
             ) {
                 Ok((jobs, receiver)) => (Some(jobs), Some(receiver)),
                 Err(error) => {

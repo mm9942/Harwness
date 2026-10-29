@@ -2556,7 +2556,13 @@ fn dod_subcommands_parse_into_their_actions() -> TestResult {
     assert_eq!(
         dod_action(&["config", "suggest"])?,
         DodAction::Config {
-            action: DodConfigAction::Suggest,
+            action: DodConfigAction::Suggest { drop_in: false },
+        }
+    );
+    assert_eq!(
+        dod_action(&["config", "suggest", "--drop-in"])?,
+        DodAction::Config {
+            action: DodConfigAction::Suggest { drop_in: true },
         }
     );
     for (verb, action) in [

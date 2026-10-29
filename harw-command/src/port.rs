@@ -590,9 +590,20 @@ fn host_backend(state_dir: &std::path::Path) -> harw_job::BackendSelection {
 /// denies the network, and for jobs that reach it (`needs_network`, so the
 /// Bubblewrap backends, which have no egress relay here, are skipped).
 /// Logs both once.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn host_backends(
     state_dir: &std::path::Path,
+) -> (harw_job::BackendSelection, harw_job::BackendSelection) {
+    host_backends_with(state_dir, &HostPortOptions::default(), None)
+}
+
+/// [`host_backends`] with the trampoline override of `options` and the
+/// host probed against `cgroup_root` (the resolved delegated root).
+#[cfg(target_os = "linux")]
+fn host_backends_with(
+    state_dir: &std::path::Path,
+    options: &HostPortOptions,
+    cgroup_root: Option<&std::path::Path>,
 ) -> (harw_job::BackendSelection, harw_job::BackendSelection) {
     let plan_dir = state_dir.join(SANDBOX_PLAN_DIR);
     let plan_dir = match create_private_dir(&plan_dir) {
@@ -606,11 +617,16 @@ fn host_backends(
             None
         }
     };
-    let host = harw_job::HostReport::probe();
+    let host = harw_job::HostReport::probe_with_cgroup_root(cgroup_root);
+    let trampoline = match &options.trampoline {
+        Some(path) => harw_job::ExecutableSource::Path(path.clone()),
+        None => harw_job::ExecutableSource::Discover,
+    };
     let offline = harw_job::select_backend(
         &host,
         &harw_job::BackendPreferences {
             plan_dir: plan_dir.clone(),
+            trampoline: trampoline.clone(),
             ..harw_job::BackendPreferences::default()
         },
     );
@@ -618,6 +634,7 @@ fn host_backends(
         &host,
         &harw_job::BackendPreferences {
             plan_dir,
+            trampoline,
             needs_network: true,
             ..harw_job::BackendPreferences::default()
         },
@@ -646,6 +663,62 @@ fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
+/// Trusted inputs of the host port (PL-97 E3), taken from the merged config
+/// by the composition root: `[jobs] cgroup_root` and `[jobs] trampoline`.
+/// Both come from trusted layers only (`harw_config` drops them from an
+/// untrusted project layer). The default is "nothing configured": the
+/// delegated root then comes from `HARW_CGROUP_ROOT` or the own delegated
+/// cgroup, the trampoline from next to the running executable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostPortOptions {
+    /// `[jobs] cgroup_root`.
+    pub cgroup_root: Option<PathBuf>,
+    /// `[jobs] trampoline` (absolute path of `harw-job-exec`).
+    pub trampoline: Option<PathBuf>,
+}
+
+/// The delegated cgroup root of the host port (PL-97 E3):
+/// `harw_job_runtime::host::resolve_delegated_root`, confirmed delegated by
+/// the host probe. A refused, missing or undelegated root means no cgroup
+/// (today's behaviour), logged once with the reason or hint.
+#[cfg(target_os = "linux")]
+fn host_cgroup_root(options: &HostPortOptions) -> Option<PathBuf> {
+    use harw_job_runtime::host::{RootConfig, RootEnv, resolve_delegated_root};
+    let config = RootConfig {
+        cgroup_root: options.cgroup_root.clone(),
+    };
+    let resolution = match resolve_delegated_root(&config, &RootEnv::from_process()) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            tracing::warn!(%error, "cgroup root refused; jobs run without their own cgroup");
+            return None;
+        }
+    };
+    let Some(root) = resolution.root else {
+        tracing::info!(
+            hint = resolution.hint.as_deref().unwrap_or_default(),
+            "command port without a delegated cgroup root"
+        );
+        return None;
+    };
+    if harw_job::HostReport::probe_with_cgroup_root(Some(&root)).cgroup_v2_delegated {
+        tracing::info!(
+            root = %root.display(),
+            source = %resolution.source,
+            "command port delegated cgroup root"
+        );
+        Some(root)
+    } else {
+        tracing::warn!(
+            root = %root.display(),
+            source = %resolution.source,
+            "cgroup root is not a delegated cgroup v2 root (missing or not writable); jobs run \
+             without their own cgroup"
+        );
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl JobCommandPort<harw_job::FsJobRecordStore, HostCommandExecutor> {
     /// The host runtime: file-backed job records below `state_dir` and the
@@ -658,25 +731,63 @@ impl JobCommandPort<harw_job::FsJobRecordStore, HostCommandExecutor> {
     /// The backend applies to sandboxed requests ([`CommandSandbox::Profile`])
     /// only; host commands ([`CommandSandbox::Host`]) run exactly as before.
     /// [`CommandSandbox::Workspace`] requests run on their own root
-    /// (module docs, PL-97 E2b). No cgroup root is configured here.
+    /// (module docs, PL-97 E2b). The cgroup root is resolved as in
+    /// [`JobCommandPort::host_with`] with nothing configured.
     ///
     /// # Errors
     /// The store or the runtime cannot be created.
     pub fn host(state_dir: &std::path::Path) -> Result<Self, String> {
+        Self::host_with(state_dir, &HostPortOptions::default())
+    }
+
+    /// [`JobCommandPort::host`] with the trusted config inputs of
+    /// `options` (PL-97 E3): the delegated cgroup root
+    /// (`[jobs] cgroup_root` → `HARW_CGROUP_ROOT` → own delegated cgroup)
+    /// goes into `LinuxExecutorOptions::cgroup_root` of every executor of
+    /// the port, so each job gets its own `harw-job-<attempt>` cgroup below
+    /// it; the trampoline override goes into the backend selection. No
+    /// usable root keeps the no-cgroup behaviour (logged once); a root the
+    /// executor cannot open is dropped with a warning instead of leaving
+    /// the process without a job runtime.
+    ///
+    /// # Errors
+    /// The store or the runtime cannot be created.
+    pub fn host_with(
+        state_dir: &std::path::Path,
+        options: &HostPortOptions,
+    ) -> Result<Self, String> {
         let store = harw_job::FsJobRecordStore::create_ambient(state_dir)
             .map_err(|error| format!("job store {}: {error}", state_dir.display()))?;
-        let (offline, online) = host_backends(state_dir);
+        let cgroup_root = host_cgroup_root(options);
+        let (offline, online) = host_backends_with(state_dir, options, cgroup_root.as_deref());
         let router = Arc::new(WorkspaceRouter::new(offline.chosen, online.chosen));
-        let executor = HostCommandExecutor::new(
-            harw_job::LinuxExecutorOptions {
-                new_session: true,
-                ..harw_job::LinuxExecutorOptions::default()
-            },
-            offline.backend,
-            online.backend,
+        let template = |cgroup_root: Option<PathBuf>| harw_job::LinuxExecutorOptions {
+            new_session: true,
+            cgroup_root,
+            ..harw_job::LinuxExecutorOptions::default()
+        };
+        let executor = match HostCommandExecutor::new(
+            template(cgroup_root.clone()),
+            offline.backend.clone(),
+            online.backend.clone(),
             Arc::clone(&router),
-        )
-        .map_err(|error| format!("job executor: {error}"))?;
+        ) {
+            Ok(executor) => executor,
+            Err(error) if cgroup_root.is_some() => {
+                tracing::warn!(
+                    %error,
+                    "delegated cgroup root unusable; jobs run without their own cgroup"
+                );
+                HostCommandExecutor::new(
+                    template(None),
+                    offline.backend,
+                    online.backend,
+                    Arc::clone(&router),
+                )
+                .map_err(|error| format!("job executor: {error}"))?
+            }
+            Err(error) => return Err(format!("job executor: {error}")),
+        };
         let runtime = JobRuntime::builder()
             .store(store)
             .executor(executor)
@@ -1316,7 +1427,7 @@ mod backend_tests {
 
     use harw_job::BackendKind;
 
-    use super::{JobCommandPort, SANDBOX_PLAN_DIR, host_backend};
+    use super::{HostPortOptions, JobCommandPort, SANDBOX_PLAN_DIR, host_backend};
 
     harw_test_support::define_test_error!(pub(crate));
 
@@ -1357,6 +1468,91 @@ mod backend_tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+        std::fs::remove_dir_all(&dir).map_err(ctx("cleanup"))?;
+        Ok(())
+    }
+
+    /// PL-97 E3: a configured root that is refused (relative), missing or
+    /// not delegated leaves the port working without a cgroup root.
+    #[test]
+    fn host_port_drops_an_unusable_cgroup_root_and_keeps_running() -> TestResult {
+        for root in [
+            "relative/harw.slice",
+            "/tmp/harw-not-a-cgroup",
+            "/sys/fs/cgroup/harw-e3-does-not-exist.slice",
+        ] {
+            let dir = harw_test_support::unique_tmp_created("harw-command", "cgroup-root")
+                .map_err(ctx("tmp"))?;
+            let options = HostPortOptions {
+                cgroup_root: Some(std::path::PathBuf::from(root)),
+                trampoline: None,
+            };
+            let port = JobCommandPort::host_with(&dir, &options).map_err(TestError::Unexpected)?;
+            let executor = port.runtime().coordinator().executor().host_executor();
+            assert_eq!(executor.options().cgroup_root, None, "{root}");
+            std::fs::remove_dir_all(&dir).map_err(ctx("cleanup"))?;
+        }
+        Ok(())
+    }
+
+    /// PL-97 E3: a delegated root from `[jobs] cgroup_root` reaches
+    /// `LinuxExecutorOptions::cgroup_root` (host-gated by
+    /// `HARW_TEST_CGROUP_ROOT`, a delegated cgroup v2 directory).
+    #[test]
+    fn host_port_passes_a_delegated_config_root_to_the_executor() -> TestResult {
+        let Some(root) = std::env::var_os("HARW_TEST_CGROUP_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: HARW_TEST_CGROUP_ROOT is not set");
+            return Ok(());
+        };
+        if !harw_job::HostReport::probe_with_cgroup_root(Some(&root)).cgroup_v2_delegated {
+            eprintln!("skipped: HARW_TEST_CGROUP_ROOT is not delegated");
+            return Ok(());
+        }
+        let dir = harw_test_support::unique_tmp_created("harw-command", "cgroup-config")
+            .map_err(ctx("tmp"))?;
+        let options = HostPortOptions {
+            cgroup_root: Some(root.clone()),
+            trampoline: None,
+        };
+        let port = JobCommandPort::host_with(&dir, &options).map_err(TestError::Unexpected)?;
+        let executor = port.runtime().coordinator().executor().host_executor();
+        assert_eq!(
+            executor.options().cgroup_root.as_deref(),
+            Some(root.as_path())
+        );
+        std::fs::remove_dir_all(&dir).map_err(ctx("cleanup"))?;
+        Ok(())
+    }
+
+    /// PL-97 E3: `[jobs] trampoline` replaces the lookup next to the
+    /// running executable; a path that is no executable rules out both
+    /// trampoline backends (with the reason), never silently.
+    #[test]
+    fn host_port_uses_the_configured_trampoline_path() -> TestResult {
+        let dir = harw_test_support::unique_tmp_created("harw-command", "trampoline")
+            .map_err(ctx("tmp"))?;
+        let missing = dir.join("no-such-harw-job-exec");
+        let options = HostPortOptions {
+            cgroup_root: None,
+            trampoline: Some(missing),
+        };
+        let port = JobCommandPort::host_with(&dir, &options).map_err(TestError::Unexpected)?;
+        let kind = port
+            .runtime()
+            .coordinator()
+            .executor()
+            .host_executor()
+            .options()
+            .sandbox
+            .kind();
+        assert!(
+            !matches!(
+                kind,
+                BackendKind::BwrapTrampoline | BackendKind::LandlockTrampoline
+            ),
+            "{kind}"
+        );
         std::fs::remove_dir_all(&dir).map_err(ctx("cleanup"))?;
         Ok(())
     }

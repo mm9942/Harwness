@@ -178,10 +178,10 @@ harw-session-ws = { path = "../harw-session-ws" }
 # `harw kill` einen Fehler (Exit-Code 2).
 [target.'cfg(target_os = "linux")'.dependencies]
 harw-killer = { path = "../harw-killer" }
-# Sandboxed verify for the work driver (`src/verify_sandbox.rs`): bwrap as the
-# fallback backend when no Landlock trampoline is found. Linux-only.
+# Sandboxed verify for the work driver (`src/verify_sandbox.rs`): the
+# Bubblewrap backends (feature `bwrap`) next to the Landlock trampoline.
+# Linux-only.
 harw-job-runtime = { path = "../harw-job-runtime", features = ["bwrap"] }
-harw-job-executor-bwrap = { path = "../harw-job-executor-bwrap" }
 
 [dev-dependencies]
 tempfile = "3"

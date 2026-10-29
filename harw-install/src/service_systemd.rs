@@ -298,8 +298,20 @@ fn remove_files_if_present(paths: &[PathBuf]) -> Result<(), ServiceError> {
 /// # Description
 /// Erzeugt die `[Unit]`/`[Service]`/`[Install]`-Abschnitte aus `spec`:
 /// `ExecStart` aus `spec.exec`, `WorkingDirectory`, je eine `Environment=`-Zeile
-/// pro Variable, `Restart=always`, `RestartSec=<restart_sec>` und
-/// `WantedBy=default.target`.
+/// pro Variable, `Delegate=yes`, `DelegateSubgroup=harw-main`,
+/// `Restart=always`, `RestartSec=<restart_sec>` und `WantedBy=default.target`.
+///
+/// `Delegate=yes` (PL-97 E3): der User-Manager übergibt dem Dienst seine
+/// eigene cgroup R. `harw serve` (Job-Worker und Verifier) legt darunter je
+/// Job eine `harw-job-<attempt>`-cgroup an; die delegierte Wurzel ist dann R
+/// (dritter Schritt von `harw_job_runtime::host::resolve_delegated_root`).
+/// `DelegateSubgroup=harw-main` (systemd ≥ 254) setzt harw selbst in das
+/// Blatt R/harw-main, damit R prozessfrei bleibt und `memory`/`pids` für die
+/// Job-cgroups einschaltbar sind (cgroup-v2-Regel „keine internen
+/// Prozesse"); der Resolver nimmt dann den Elternknoten R. Älteres systemd
+/// ignoriert den Schlüssel mit einer Warnung (harw liegt dann in R, Limits
+/// bleiben ggf. teilweise). Eine abweichende Wurzel setzt `[jobs]
+/// cgroup_root` oder ein `HARW_CGROUP_ROOT` in `spec.env`.
 ///
 /// # Arguments
 /// - `spec` (`&ServiceSpec`): Dienstbeschreibung.
@@ -322,6 +334,9 @@ fn render_systemd_unit(spec: &ServiceSpec) -> String {
     for (key, value) in &spec.env {
         out.push_str(&format!("Environment={key}={value}\n"));
     }
+    out.push_str("Delegate=yes\n");
+    // Muss `harw_job_runtime::host::DELEGATE_SUBGROUP` entsprechen.
+    out.push_str("DelegateSubgroup=harw-main\n");
     out.push_str("Restart=always\n");
     out.push_str(&format!("RestartSec={}\n\n", spec.restart_sec));
     out.push_str("[Install]\n");
@@ -377,6 +392,25 @@ mod tests {
         assert!(unit.contains("WantedBy=default.target"));
         assert!(unit.contains("WorkingDirectory=/var/lib/harw"));
         assert!(unit.contains("Restart=always"));
+    }
+
+    #[test]
+    fn test_render_unit_delegates_the_cgroup_for_job_cgroups() {
+        let unit = render_systemd_unit(&spec());
+        assert_eq!(
+            unit.lines().filter(|line| *line == "Delegate=yes").count(),
+            1,
+            "{unit}"
+        );
+        // Inside [Service], not [Unit]/[Install].
+        let service = unit
+            .split("[Service]")
+            .nth(1)
+            .and_then(|rest| rest.split("[Install]").next())
+            .unwrap_or_default();
+        assert!(service.contains("Delegate=yes\n"), "{unit}");
+        // harw selbst in einem Blatt, die Wurzel bleibt prozessfrei.
+        assert!(service.contains("DelegateSubgroup=harw-main\n"), "{unit}");
     }
 
     #[test]

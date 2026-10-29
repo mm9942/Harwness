@@ -31,9 +31,13 @@
 //! # Limits
 //! [`CoordinatorVerifyRunner`] always requests
 //! `SandboxRequirement::Required`, which includes enforced resource limits.
-//! Those need a delegated cgroup v2 root: set `HARW_VERIFY_CGROUP_ROOT` to
-//! one (e.g. a `Delegate=yes` subgroup of the `harw serve` unit). It is only
-//! used when the host probe confirms delegation. Without it the resource
+//! Those need a delegated cgroup v2 root, resolved like the host command
+//! port's (`harw_job_runtime::host::resolve_delegated_root`, PL-97 E3):
+//! `[jobs] cgroup_root` of the home/profile config → `HARW_CGROUP_ROOT` →
+//! the deprecated `HARW_VERIFY_CGROUP_ROOT` → the own cgroup when it is
+//! delegated (the `harw-serve` user unit has `Delegate=yes`). It is only
+//! used when the host probe confirms delegation. `[jobs] trampoline`
+//! overrides where `harw-job-exec` is taken from. Without a root the resource
 //! dimension stays `Partial` and commands come back as
 //! `RunnerError::NoSandbox` (step unverifiable) instead of passing: fail
 //! closed, never unsandboxed.
@@ -64,10 +68,6 @@ const BACKEND_ENV: &str = "HARW_VERIFY_BACKEND";
 /// Stable runner id of the verify coordinator (recovery finds its jobs).
 #[cfg(target_os = "linux")]
 const RUNNER_ID: &str = "work-driver-verify";
-
-/// Environment variable naming a delegated cgroup v2 root for verify jobs.
-#[cfg(target_os = "linux")]
-const CGROUP_ROOT_ENV: &str = "HARW_VERIFY_CGROUP_ROOT";
 
 /// Environment variables passed into every verify job (when set).
 #[cfg(target_os = "linux")]
@@ -136,7 +136,11 @@ fn try_build(home: &Path, cwd: &Path) -> Result<SandboxVerifier, String> {
     let base = home.join("jobs").join("verify");
     let request = backend_request(std::env::var(BACKEND_ENV).ok().as_deref())
         .map_err(|error| format!("{BACKEND_ENV}: {error}"))?;
-    let cgroup_root = delegated_cgroup_root(std::env::var_os(CGROUP_ROOT_ENV).map(PathBuf::from));
+    let jobs = jobs_config(home);
+    let cgroup_root = delegated_cgroup_root(
+        jobs.cgroup_root.clone(),
+        &harw_job_runtime::host::RootEnv::from_process_with_verify_alias(),
+    );
     // Only the trampoline backends need the plan directory: without it
     // they are skipped (with the reason), the others stay selectable.
     let plan_dir = base.join("plans");
@@ -148,11 +152,12 @@ fn try_build(home: &Path, cwd: &Path) -> Result<SandboxVerifier, String> {
         }
     };
     let host = HostReport::probe_with_cgroup_root(cgroup_root.as_deref());
-    let selection = select_backend(&host, request, plan_dir);
+    let selection = select_backend(&host, request, plan_dir, jobs.trampoline);
     tracing::info!(
         backend = %selection.chosen,
         reasons = ?selection.reasons,
         table = %dimension_table(selection.chosen, &host, cgroup_root.is_some()),
+        chain = %verify_chain(home, cgroup_root.as_deref()).table(),
         "sandboxed verify backend"
     );
     if selection.chosen == BackendKind::None {
@@ -182,19 +187,57 @@ fn try_build(home: &Path, cwd: &Path) -> Result<SandboxVerifier, String> {
     })
 }
 
-/// `root` if it is absolute and the host probe confirms it as a delegated
-/// cgroup v2 root; otherwise `None` (with one `warn!` when a root was set).
+/// `[jobs]` of the trusted config layers below `home` (read-only); the
+/// defaults with one `warn!` when the config cannot be loaded.
 #[cfg(target_os = "linux")]
-fn delegated_cgroup_root(root: Option<PathBuf>) -> Option<PathBuf> {
-    let root = root?;
-    let delegated = root.is_absolute()
-        && harw_job_runtime::HostReport::probe_with_cgroup_root(Some(&root)).cgroup_v2_delegated;
-    if delegated {
+fn jobs_config(home: &Path) -> harw_config::harness_config::JobsToml {
+    harw_home::config_layers(home)
+        .map_err(|error| error.to_string())
+        .and_then(|layers| harw_config::discover_config(&layers).map_err(|error| error.to_string()))
+        .map(|config| config.harness.jobs)
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "config unreadable; verify jobs use the default [jobs] settings");
+            harw_config::harness_config::JobsToml::default()
+        })
+}
+
+/// The delegated cgroup root of verify jobs: the shared resolver
+/// (`[jobs] cgroup_root` → `HARW_CGROUP_ROOT` → deprecated
+/// `HARW_VERIFY_CGROUP_ROOT` → own delegated cgroup), used only when the
+/// host probe confirms delegation; otherwise `None` with one `warn!`.
+#[cfg(target_os = "linux")]
+fn delegated_cgroup_root(
+    config_root: Option<PathBuf>,
+    env: &harw_job_runtime::host::RootEnv,
+) -> Option<PathBuf> {
+    use harw_job_runtime::host::{RootConfig, resolve_delegated_root};
+    let config = RootConfig {
+        cgroup_root: config_root,
+    };
+    let resolution = match resolve_delegated_root(&config, env) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            tracing::warn!(%error, "verify jobs run without cgroup limits");
+            return None;
+        }
+    };
+    let Some(root) = resolution.root else {
+        tracing::info!(
+            hint = resolution.hint.as_deref().unwrap_or_default(),
+            "verify jobs run without cgroup limits"
+        );
+        return None;
+    };
+    if let Some(hint) = &resolution.hint {
+        tracing::warn!(%hint, "deprecated cgroup root variable");
+    }
+    if harw_job_runtime::HostReport::probe_with_cgroup_root(Some(&root)).cgroup_v2_delegated {
         Some(root)
     } else {
         tracing::warn!(
             root = %root.display(),
-            "{CGROUP_ROOT_ENV} is not a delegated cgroup v2 root; verify jobs run without cgroup limits"
+            source = %resolution.source,
+            "not a delegated cgroup v2 root; verify jobs run without cgroup limits"
         );
         None
     }
@@ -219,12 +262,16 @@ fn select_backend(
     host: &HostReport,
     request: BackendRequest,
     plan_dir: Option<PathBuf>,
+    trampoline: Option<PathBuf>,
 ) -> BackendSelection {
     harw_job_runtime::select_backend(
         host,
         &BackendPreferences {
             request,
             plan_dir,
+            trampoline: trampoline
+                .map(harw_job_runtime::ExecutableSource::Path)
+                .unwrap_or_default(),
             needs_network: true,
             ..BackendPreferences::default()
         },
@@ -240,6 +287,34 @@ fn dimension_table(kind: BackendKind, host: &HostReport, cgroup_root: bool) -> S
         table.push_str(&format!("\n  {dimension:<16} {state}"));
     }
     table
+}
+
+/// The execution chain report next to the dimension table (PL-97 E5):
+/// the shared host facts ([`crate::dod_cmd::chain_inputs`], no service
+/// state, no DoD) with the cgroup root these verify jobs actually use.
+#[cfg(target_os = "linux")]
+fn verify_chain(home: &Path, cgroup_root: Option<&Path>) -> harw_dod_client::ExecutionChainReport {
+    let inputs = crate::dod_cmd::chain_inputs(
+        home,
+        crate::dod_cmd::ChainScope::HostOnly,
+        Some(Ok(verify_chain_root(cgroup_root))),
+    );
+    harw_dod_client::ExecutionChainReport::build(&inputs)
+}
+
+/// The chain's cgroup root for the verify jobs: the root
+/// [`delegated_cgroup_root`] confirmed, or none.
+#[cfg(target_os = "linux")]
+fn verify_chain_root(cgroup_root: Option<&Path>) -> harw_dod_client::ChainRoot {
+    harw_dod_client::ChainRoot {
+        root: cgroup_root.map(Path::to_path_buf),
+        relative: cgroup_root.and_then(harw_job_runtime::host::cgroup_path_below_mount),
+        source: "verify-runner".to_owned(),
+        hint: cgroup_root
+            .is_none()
+            .then(|| harw_job_runtime::host::NO_ROOT_HINT.to_owned()),
+        delegated: cgroup_root.is_some(),
+    }
 }
 
 /// Creates `dir` (and parents) and restricts it to `0700`.
@@ -282,19 +357,56 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cgroup_root_is_only_used_when_delegated() -> TestResult {
-        if delegated_cgroup_root(None).is_some() {
-            return Err(TestError::Unexpected("no root must stay None".to_owned()));
+    fn verify_chain_reports_the_root_the_verify_jobs_use() -> TestResult {
+        use harw_dod_client::{ChainLevel, ChainStage};
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let none = verify_chain(home.path(), None);
+        if none.cgroup_root.level != ChainLevel::Miss
+            || none.reached() >= Some(ChainStage::Configured)
+        {
+            return Err(TestError::Unexpected(format!(
+                "no root must keep the chain below configured: {}",
+                none.table()
+            )));
         }
-        if delegated_cgroup_root(Some(PathBuf::from("relative/cgroup"))).is_some() {
+        let root = verify_chain_root(Some(Path::new("/sys/fs/cgroup/harw.slice")));
+        if root.relative.as_deref() != Some("/harw.slice") || !root.delegated {
+            return Err(TestError::Unexpected(format!("{root:?}")));
+        }
+        // Verify checks neither services nor DoD: those rows are skipped.
+        for item in [&none.serve, &none.dod_target, &none.warden] {
+            if item.level != ChainLevel::Skip {
+                return Err(TestError::Unexpected(format!("{item:?}")));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_root_is_only_used_when_delegated() -> TestResult {
+        use harw_job_runtime::host::RootEnv;
+        let none = RootEnv::default();
+        if delegated_cgroup_root(Some(PathBuf::from("relative/cgroup")), &none).is_some() {
             return Err(TestError::Unexpected(
                 "relative root must be ignored".to_owned(),
             ));
         }
         let plain = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        if delegated_cgroup_root(Some(plain.path().to_path_buf())).is_some() {
+        if delegated_cgroup_root(Some(plain.path().to_path_buf()), &none).is_some() {
             return Err(TestError::Unexpected(
-                "a plain directory is no delegated cgroup v2 root".to_owned(),
+                "a directory outside the cgroup2 mount is no delegated root".to_owned(),
+            ));
+        }
+        // The deprecated alias still feeds the resolver (and is still
+        // checked for delegation).
+        let alias = RootEnv {
+            cgroup_root: None,
+            deprecated_verify_root: Some("/sys/fs/cgroup/harw-e3-missing.slice".into()),
+        };
+        if delegated_cgroup_root(None, &alias).is_some() {
+            return Err(TestError::Unexpected(
+                "a missing cgroup is no delegated root".to_owned(),
             ));
         }
         Ok(())
@@ -338,6 +450,7 @@ mod tests {
             &host,
             BackendRequest::Auto,
             Some(plan_dir.path().to_path_buf()),
+            None,
         );
         // WorkspaceBuild needs network: proxy-only egress has no relay here.
         if selection.chosen.uses_bwrap() {
@@ -364,7 +477,8 @@ mod tests {
         let host = HostReport::probe();
         for kind in [BackendKind::BwrapTrampoline, BackendKind::Bwrap] {
             let request = backend_request(Some(kind.as_str())).map_err(ctx("parse"))?;
-            let selection = select_backend(&host, request, Some(plan_dir.path().to_path_buf()));
+            let selection =
+                select_backend(&host, request, Some(plan_dir.path().to_path_buf()), None);
             // No relay for the networked jobs, and no fallback for an
             // explicit request: fail closed, whatever the host offers.
             if selection.chosen != BackendKind::None {
@@ -390,7 +504,7 @@ mod tests {
     #[test]
     fn missing_plan_dir_skips_only_the_trampoline_backends() -> TestResult {
         let host = HostReport::probe();
-        let selection = select_backend(&host, BackendRequest::Auto, None);
+        let selection = select_backend(&host, BackendRequest::Auto, None, None);
         if selection.chosen.uses_trampoline() {
             return Err(TestError::Unexpected(format!(
                 "a trampoline backend without a plan directory: {:?}",

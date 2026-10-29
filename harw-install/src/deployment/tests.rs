@@ -1137,6 +1137,25 @@ fn test_infra_services_are_hardened() -> TestResult {
     Ok(())
 }
 
+/// PL-97 E3: the control plane runs harw's jobs below its own delegated
+/// cgroup, so it needs `Delegate=yes` and a writable cgroup subtree.
+#[test]
+fn test_control_plane_delegates_its_cgroup_for_job_cgroups() -> TestResult {
+    let unit = parsed(embedded_unit("harw-control.service")?);
+    assert_eq!(unit.last_value("Service", "Delegate"), Some("yes"));
+    // harw itself in a leaf (harw_job_runtime::host::DELEGATE_SUBGROUP).
+    assert_eq!(
+        unit.last_value("Service", "DelegateSubgroup"),
+        Some("harw-main")
+    );
+    assert_ne!(
+        unit.last_value("Service", "ProtectControlGroups"),
+        Some("yes"),
+        "ProtectControlGroups=yes mounts /sys/fs/cgroup read-only and voids Delegate=yes"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_every_dod_and_infra_service_sets_the_common_hardening() -> TestResult {
     for asset in systemd_units().filter(|a| a.kind == AssetKind::SystemdService) {

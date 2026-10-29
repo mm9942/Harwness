@@ -58,6 +58,10 @@ harw-job-tokio = { path = "../harw-job-tokio" }
 # only; the binary is located at runtime through LinuxSandboxBackend).
 harw-job-exec = { path = "../harw-job-exec" }
 harw-job-executor-bwrap = { path = "../harw-job-executor-bwrap", optional = true }
+# PL-97 E3: delegation evidence of the own cgroup for the cgroup-root
+# resolution (`host::OwnCgroup::probe`): `geteuid` and the
+# `trusted.delegate`/`user.delegate` xattr systemd sets on delegated cgroups.
+rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

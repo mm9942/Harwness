@@ -40,6 +40,7 @@ jobs:
             use_cross: true
           # Termux on Android phones. No killer: harw-killer needs Linux
           # procfs and pidfd and refuses other target OSes at compile time.
+          # No harw-job-exec either (the Linux job sandbox trampoline).
           - target: aarch64-linux-android
             use_cross: true
             packages: -p harw-cli
@@ -82,17 +83,17 @@ jobs:
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
         run: |
-          cargo build --release --locked ${{ matrix.packages || '-p harw-cli -p harw-killer' }} --target ${{ matrix.target }}
+          cargo build --release --locked ${{ matrix.packages || '-p harw-cli -p harw-killer -p harw-job-exec' }} --target ${{ matrix.target }}
           cargo build --profile release-runner --locked -p harw-agent-runner --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.use_cross
         run: |
-          cross build --release --locked ${{ matrix.packages || '-p harw-cli -p harw-killer' }} --target ${{ matrix.target }}
+          cross build --release --locked ${{ matrix.packages || '-p harw-cli -p harw-killer -p harw-job-exec' }} --target ${{ matrix.target }}
           cross build --profile release-runner --locked -p harw-agent-runner --target ${{ matrix.target }}
 
       # Same layout as `make release` (scripts/package-release.sh): one
-      # directory harw-<tag>-<target>/ with harw, killer and the
+      # directory harw-<tag>-<target>/ with harw, killer, harw-job-exec and the
       # `release-runner` harw-agent-runner (fat LTO, `panic = "abort"`),
       # which `harw agent build` needs next to `harw`.
       - name: Package

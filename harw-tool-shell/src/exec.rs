@@ -56,9 +56,12 @@
 //!   unverändert (`tracing::debug!` einmalig).
 //!
 //! # Sandbox chain (PL-97 E2b)
-//! With [`SandboxExecution::Chain`] (config `[sandbox] execution`; the
-//! builder default is [`SandboxExecution::Legacy`] until the composition
-//! passes the configured value, see [`crate::job_spec`]) the sandboxed path submits `/bin/sh -c <command>` as a workspace sandbox
+//! With [`SandboxExecution::Chain`] (config `[sandbox] execution`, default
+//! `chain`; the runtime assembly passes it through
+//! `HostPermitWiring::with_sandbox_execution`, and
+//! [`SandboxExecution::Legacy`] is only the safe fallback of a provider
+//! built without config, see [`crate::job_spec`]) the sandboxed path
+//! submits `/bin/sh -c <command>` as a workspace sandbox
 //! request to the command port instead of the pre-built `prlimit … --
 //! bwrap …` argv above; see [`crate::job_spec`] for what is submitted and
 //! when a call keeps the legacy path or is refused. The host path is
@@ -1802,8 +1805,10 @@ impl ShellToolProvider {
     /// Wählt, wie der Sandbox-Pfad Prozesse startet (Konfig `[sandbox]
     /// execution`, PL-97 E2b, siehe [`crate::job_spec`]). Vorgabe
     /// [`SandboxExecution::Legacy`] (der bisherige `prlimit … -- bwrap …`-Weg
-    /// für jeden Aufruf), bis die Komposition den konfigurierten Wert
-    /// durchreicht; [`SandboxExecution::Chain`] nimmt die Sandbox-Kette. Der
+    /// für jeden Aufruf) als sichere Rückfallebene eines Providers ohne
+    /// Konfig; die Laufzeit-Komposition reicht `[sandbox] execution`
+    /// (Vorgabe `chain`) über `HostPermitWiring::with_sandbox_execution`
+    /// durch. [`SandboxExecution::Chain`] nimmt die Sandbox-Kette. Der
     /// Host-Pfad ist davon nicht betroffen.
     #[must_use]
     pub fn with_execution(mut self, execution: SandboxExecution) -> Self {
@@ -4499,6 +4504,71 @@ mod tests {
             ),
             "{requests:?}"
         );
+        Ok(())
+    }
+
+    /// PL-97 E2b (PR #154 review): the route is chosen before `prlimit` is
+    /// looked up. On a host without a fixed-path `prlimit` and with
+    /// `require_rlimits = true`, a `bwrap-trampoline` route is not refused
+    /// (the trampoline sets the rlimits itself) and the job spec carries
+    /// the rlimits; a plain Bubblewrap route still needs `prlimit`.
+    #[tokio::test]
+    async fn test_chain_trampoline_route_runs_without_a_fixed_path_prlimit() -> TestResult {
+        let _hidden = crate::limits::test_seam::HiddenPrlimit::install();
+        let required = ShellLimits::default();
+        assert!(required.require_rlimits);
+        assert!(
+            required.resolve_prlimit().is_err(),
+            "the seam must hide prlimit with require_rlimits = true"
+        );
+
+        let port = RecordingPort::new(Some(BackendKind::BwrapTrampoline));
+        let mut provider = recording_provider(&port);
+        provider.limits.require_rlimits = true;
+        let (output, _sandbox) = execute(
+            &provider,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+            "echo hi",
+        )
+        .await?;
+        match &output {
+            ToolOutput::Json { content } => assert_eq!(content["exit_code"], 0, "{content}"),
+            other => return Err(TestError::Unexpected(format!("refused: {other:?}"))),
+        }
+        let requests = port.requests()?;
+        let [request] = requests.as_slice() else {
+            return Err(TestError::Unexpected(format!(
+                "expected one request, got {requests:?}"
+            )));
+        };
+        let limits = timeouts::limits_for(provider.limits, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(request.limits, limits.job_resources());
+        let spec = request.job_spec().map_err(TestError::Unexpected)?;
+        assert!(spec.resources.require_rlimits);
+        assert_eq!(spec.resources.address_space_max, Some(limits.as_bytes));
+        assert_eq!(spec.resources.cpu_time_max, Some(limits.cpu_secs));
+        assert_eq!(spec.resources.file_size_max, Some(limits.fsize_bytes));
+        assert_eq!(
+            spec.resources.open_files_max,
+            u32::try_from(limits.nofile).ok()
+        );
+
+        // Plain Bubblewrap: the runtime puts `prlimit` in front of `bwrap`,
+        // so a missing one still refuses the call before anything starts.
+        let port = RecordingPort::new(Some(BackendKind::Bwrap));
+        let mut provider = recording_provider(&port);
+        provider.limits.require_rlimits = true;
+        let (output, _sandbox) = execute(
+            &provider,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+            "echo hi",
+        )
+        .await?;
+        match &output {
+            ToolOutput::Error { message } => assert!(message.contains("prlimit"), "{message}"),
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        assert!(port.requests()?.is_empty());
         Ok(())
     }
 

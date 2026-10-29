@@ -3223,6 +3223,10 @@ fn run_doctor_checks(home: &Path, config: &ResolvedConfig) -> bool {
     checks.push(Box::new(harw_install::doctor::KekFilePermsCheck::new(
         kek_file_perms_evidence(config),
     )));
+    // PL-97 E5: je Bereitschaftsstufe der Ausführungskette ein Check.
+    checks.extend(harw_install::doctor::execution_chain_checks(
+        &dod_cmd::host_execution_chain(home),
+    ));
 
     let mut any_failed = false;
     for (id, outcome) in harw_install::doctor::run_all(&checks) {

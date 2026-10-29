@@ -59,7 +59,7 @@ System
   init | onboard | doctor [--config-dir DIR] | update
   dod status | doctor | sensors
       | findings [-n N] [--severity S] [--rule ID] [--since 24h]
-      | config check [--config PATH] | config suggest
+      | config check [--config PATH] | config suggest [--drop-in]
       | enable | disable | restart                 (root only)
       | warden status | warden enable | warden disable   (enable/disable root only)
       | install --print-systemd [UNIT]
@@ -319,7 +319,7 @@ agree.
 | `findings [-n N] [--severity S] [--rule ID] [--since SPAN]` | The newest findings of the bounded export tail (default 50, at most 200), at or above severity `S`, of one rule, observed within `SPAN` (`90m`, `24h`, `7d`). |
 | `sensors` | The sentinel health report (`health.json`): per-sensor state, readings, errors, last success, IPC counters; flagged stale after 2 minutes without an update. |
 | `config check [--config PATH]` | Validates `/etc/harw-dod/config.toml` (or `PATH`) exactly like the daemons do (no symlinks, root-owned, not group/world-writable). Exit 0 only for a valid config that selects an `active_profile`. |
-| `config suggest` | Prints a profile template for harw's job cgroups; the delegated cgroup root is filled in by PL-97 E3. |
+| `config suggest [--drop-in]` | Prints the DoD profile for harw's job cgroups under the resolved delegated cgroup root (`[jobs] cgroup_root`, `HARW_CGROUP_ROOT`, own delegated cgroup) plus the matching `[dod] allowed_cgroup_prefixes`; without a root, the template and a hint. `--drop-in` prints the sentinel `--cgroup-root` drop-in and the `harw-probe-bpf` ordering drop-in instead (see `docs/setup/dod.md`). |
 | `enable` | Root only. Checks the config, then `systemctl daemon-reload` and `systemctl enable --now harw-dod.target` (`make -C dod enable`). The Warden stays disabled. |
 | `disable` | Root only. `systemctl disable --now harw-dod.target harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service`, then disables `harw-warden.socket` and `harw-warden.service` (errors there are ignored), like `make -C dod disable`. |
 | `restart` | Root only. Checks the config, `systemctl daemon-reload`, `systemctl restart harw-dod.target`. |

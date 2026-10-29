@@ -17,7 +17,7 @@
 //!
 //!   PL-97 E2b: with [`SandboxExecution::Chain`] (config `[sandbox]
 //!   execution`, set through [`JobChildBackend::with_execution`]) and the
-//!   parent's workspace root ([`JobChildBackend::with_workspace_root`]) the
+//!   a canonical workspace root ([`JobChildBackend::with_workspace_root`]) the
 //!   child is no host submission any more but a job-runtime request over
 //!   that root with the `workspace_build` profile
 //!   ([`harw_tool_job::launcher::child_agent_launch`], which also says why
@@ -25,8 +25,11 @@
 //!   stays `true`). Without a workspace root, or where the job runtime runs
 //!   no such requests, the child keeps the previous host submission, logged
 //!   once per backend (`runs without cgroup/landlock`).
-//!   [`SandboxExecution::Legacy`], the default until the composition passes
-//!   the configured value, keeps the previous submission always.
+//!   [`SandboxExecution::Legacy`] keeps the previous submission always; it
+//!   stays the safe default of a backend built without a config. The
+//!   runner's composition (`crate::context::RunnerContext`) passes the
+//!   configured value (`chain` for a compiled agent, which reads no
+//!   `[sandbox]` table) and the runner's canonical working directory.
 //! - **Tests** ([`JobChildBackend::with_spawner`], no `JobManager`): spawns
 //!   [`ChildProcessSpawner::command_for`]'s command itself — a plain
 //!   `/bin/sh -c <script>` standing in for a real compiled child, so the
@@ -145,7 +148,7 @@ pub struct JobChildBackend<S: ChildProcessSpawner = CurrentExeSpawner> {
     job_manager: Option<Arc<JobManager>>,
     /// How the job-managed path submits the child (PL-97 E2b, module docs).
     execution: SandboxExecution,
-    /// The parent's canonical workspace root, the root of a chain
+    /// The canonical workspace root, the root of a chain
     /// submission (PL-97 E2b, [`Self::with_workspace_root`]).
     workspace_root: Option<std::path::PathBuf>,
     /// Whether the fallback to the host submission was logged already.
@@ -199,18 +202,22 @@ impl<S: ChildProcessSpawner> JobChildBackend<S> {
 
     /// Chooses how the job-managed path submits each child (config
     /// `[sandbox] execution`, PL-97 E2b, module docs). Default
-    /// [`SandboxExecution::Legacy`], the previous host submission, until the
-    /// composition passes the configured value.
+    /// [`SandboxExecution::Legacy`], the previous host submission, the safe
+    /// fallback where no config exists; the runner's composition passes the
+    /// configured value.
     #[must_use]
     pub fn with_execution(mut self, execution: SandboxExecution) -> Self {
         self.execution = execution;
         self
     }
 
-    /// The parent's workspace root, the root and working directory of
-    /// every chain submission (PL-97 E2b). Without it a chain-mode child
-    /// keeps the previous host submission (logged once): harw's own
-    /// working directory is not necessarily the parent's workspace.
+    /// The canonical workspace root, the root and working directory of
+    /// every chain submission (PL-97 E2b). The backend never falls back to
+    /// the process working directory on its own: without a root a
+    /// chain-mode child keeps the previous host submission (logged once).
+    /// The runner passes its canonical working directory
+    /// (`crate::context::child_workspace_root`; a known gap in
+    /// `docs/design/mediated-process-execution.md`).
     #[must_use]
     pub fn with_workspace_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.workspace_root = Some(root.into());

@@ -71,6 +71,33 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Mount point of the cgroup v2 hierarchy: the canonical
+/// [`DodSection::allowed_cgroup_prefixes`] form is an absolute path strictly
+/// below it (PL-97 E3; the same contract as
+/// `harw_job_runtime::host::CGROUP2_MOUNT`).
+pub const CGROUP2_MOUNT: &str = "/sys/fs/cgroup";
+
+/// Converts a canonical `allowed_cgroup_prefixes` entry (absolute, strictly
+/// below [`CGROUP2_MOUNT`], optional trailing `/`) to the Warden's relative
+/// `CgroupId` form (`/sys/fs/cgroup/user.slice/harw.slice/` →
+/// `user.slice/harw.slice`). `None` for any other form (relative paths,
+/// `.`/`..` segments, paths outside the mount, the mount itself), which
+/// [`DodSection::validate`] rejects. Wiring the converted prefixes into the
+/// Warden's `ProofPolicy` is not done here (PL-96 W01).
+#[must_use]
+pub fn warden_cgroup_id(prefix: &str) -> Option<String> {
+    let rest = prefix
+        .trim()
+        .strip_prefix(CGROUP2_MOUNT)?
+        .strip_prefix('/')?;
+    let rest = rest.trim_end_matches('/');
+    let valid = !rest.is_empty()
+        && rest
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+    valid.then(|| rest.to_owned())
+}
+
 /// Default of [`DodSection::findings_window_hours`]: one day.
 pub const DEFAULT_FINDINGS_WINDOW_HOURS: u32 = 24;
 
@@ -208,6 +235,12 @@ impl DodSection {
         for prefix in &self.allowed_cgroup_prefixes {
             if prefix.trim().is_empty() {
                 return Err("dod.allowed_cgroup_prefixes enthält einen leeren Eintrag".to_owned());
+            }
+            if warden_cgroup_id(prefix).is_none() {
+                return Err(format!(
+                    "dod.allowed_cgroup_prefixes entries must be absolute paths below \
+                     {CGROUP2_MOUNT} (canonical form, e.g. {CGROUP2_MOUNT}/harw.slice), got {prefix:?}"
+                ));
             }
         }
         if let Some(dir) = &self.export_dir
@@ -375,6 +408,42 @@ mod tests {
         };
         assert!(error.contains("kill_requires_human"));
         Ok(())
+    }
+
+    #[test]
+    fn test_validate_rejects_relative_and_outside_mount_cgroup_prefixes() -> TestResult {
+        for bad in [
+            "harw.slice",
+            "/harw.slice",
+            "/sys/fs/cgroup",
+            "/sys/fs/cgroup/",
+            "/sys/fs/cgroup/../etc",
+            "/sys/fs/cgroupx/harw.slice",
+            "/sys/fs/cgroup//harw.slice",
+        ] {
+            let section = DodSection {
+                allowed_cgroup_prefixes: vec![bad.to_owned()],
+                ..DodSection::default()
+            };
+            let Err(error) = section.validate() else {
+                return Err(TestError::Unexpected(format!("{bad:?} must be rejected")));
+            };
+            assert!(error.contains("allowed_cgroup_prefixes"), "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_warden_cgroup_id_converts_the_canonical_prefix_form() {
+        assert_eq!(
+            warden_cgroup_id("/sys/fs/cgroup/user.slice/harw.slice/").as_deref(),
+            Some("user.slice/harw.slice")
+        );
+        assert_eq!(
+            warden_cgroup_id("/sys/fs/cgroup/harw.slice").as_deref(),
+            Some("harw.slice")
+        );
+        assert_eq!(warden_cgroup_id("harw.slice"), None);
     }
 
     #[test]

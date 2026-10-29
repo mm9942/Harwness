@@ -465,6 +465,11 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // setzen frei, ein nicht vertrautes Projekt senkt nur (`merge_jobs`);
     // 0 oder > 256 ist schon beim Parsen ein Fehler.
     FieldScope { path: "jobs.max_running", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    // PL-97 E3: delegierte cgroup-Wurzel und Trampolin-Pfad der Jobs. Nur
+    // vertraute Layer setzen sie (`merge_jobs`); ein nicht vertrautes Projekt
+    // könnte sonst Jobs in eine fremde cgroup oder ein fremdes Binary lenken.
+    FieldScope { path: "jobs.cgroup_root", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "jobs.trampoline", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
     // [agent_compiler] (3) — #22 Welle 2B: Build-Cache, Versionsaufbewahrung
     // und UIA-Autobuild. Reine Komfort-Grenzen ohne Rechtewirkung; ein nicht
     // vertrautes Projekt darf sie nicht setzen (`merge_agent_compiler`).
@@ -577,7 +582,8 @@ mod merge_rule_tests {
         // PL-97 B1: +4 für `skills.*`.
         // PL-97 E2: +1 für `sandbox.execution`.
         // PL-97 R1: +1 für `tui.reasoning`.
-        assert_eq!(FIELD_TABLE.len(), 201);
+        // PL-97 E3: +2 für `jobs.cgroup_root`, `jobs.trampoline`.
+        assert_eq!(FIELD_TABLE.len(), 203);
     }
 
     #[test]
@@ -602,7 +608,8 @@ mod merge_rule_tests {
         // PL-97 B1: +4 (`skills.*`).
         // PL-97 E2: +1 (`sandbox.execution`).
         // PL-97 R1: +1 (`tui.reasoning`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 102);
+        // PL-97 E3: +2 (`jobs.cgroup_root`, `jobs.trampoline`).
+        assert_eq!(count(MergeRule::ProfileReplaces), 104);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

@@ -99,9 +99,15 @@ pub enum DodConfigAction {
         #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
         config: Option<PathBuf>,
     },
-    /// Gibt eine Profilvorlage für harws Job-cgroups aus (die delegierte
-    /// cgroup-Wurzel trägt PL-97 E3 ein).
-    Suggest,
+    /// Gibt das DoD-Profil für harws Job-cgroups unter der delegierten
+    /// cgroup-Wurzel aus, dazu den passenden `[dod] allowed_cgroup_prefixes`-
+    /// Eintrag für harws Konfiguration.
+    Suggest {
+        /// Stattdessen systemd-Drop-ins ausgeben: `--cgroup-root <Wurzel>` für
+        /// harw-sentinel und die Startreihenfolge für harw-probe-bpf.
+        #[arg(long)]
+        drop_in: bool,
+    },
 }
 
 /// Aktionen von `harw dod warden`.

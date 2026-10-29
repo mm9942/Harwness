@@ -49,6 +49,16 @@
 //! unsandboxed mode. Every other OS gets a report in which nothing is
 //! enforced.
 //!
+//! # Delegated cgroup root (PL-97 E3)
+//! [`resolve_delegated_root`] is the one cgroup-root contract shared by the
+//! host command port, the verify runner and `harw dod config suggest`:
+//! `[jobs] cgroup_root` (trusted config layers only) → `HARW_CGROUP_ROOT`
+//! → the own cgroup when the probe confirms it as delegated → none (with
+//! [`NO_ROOT_HINT`]). A root is always an absolute path strictly below
+//! [`CGROUP2_MOUNT`]; [`cgroup_path_below_mount`] converts it to the
+//! mount-relative form of a Harw-DoD profile (and, without the leading
+//! `/`, of the Warden's `CgroupId`).
+//!
 //! # Backend selection (PL-97 E1)
 //! `select_backend` (Linux) turns a [`HostReport`] and
 //! [`BackendPreferences`] into the `LinuxSandboxBackend` the executor uses.
@@ -805,6 +815,458 @@ fn resolve_plan_dir(dir: Option<&Path>) -> Result<PathBuf, String> {
     }
 }
 
+// ── Delegated cgroup root (PL-97 E3) ────────────────────────────────────────
+
+/// Mount point of the cgroup v2 hierarchy. Every delegated root harw
+/// accepts is an absolute path strictly below it; this is also the one
+/// canonical prefix form shared with `[dod] allowed_cgroup_prefixes`.
+pub const CGROUP2_MOUNT: &str = "/sys/fs/cgroup";
+
+/// Environment variable naming the delegated cgroup v2 root of harw's jobs
+/// (second step of [`resolve_delegated_root`]).
+pub const CGROUP_ROOT_ENV: &str = "HARW_CGROUP_ROOT";
+
+/// Deprecated alias of [`CGROUP_ROOT_ENV`], honoured only by the verify
+/// runner ([`RootEnv::from_process_with_verify_alias`]).
+pub const DEPRECATED_VERIFY_CGROUP_ROOT_ENV: &str = "HARW_VERIFY_CGROUP_ROOT";
+
+/// Hint shown when no delegated root resolves.
+pub const NO_ROOT_HINT: &str = "no delegated cgroup v2 root: set `[jobs] cgroup_root` (home or \
+     profile config) or HARW_CGROUP_ROOT, start harw under `systemd-run --user --scope -p \
+     Delegate=yes harw …`, or run it from a unit with Delegate=yes (harw-serve user unit, \
+     harw-control.service); jobs run without their own cgroup";
+
+/// Where [`resolve_delegated_root`] took the root from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RootSource {
+    /// `[jobs] cgroup_root` of a trusted config layer.
+    Config,
+    /// [`CGROUP_ROOT_ENV`] (or, for the verify runner, its deprecated alias).
+    Env,
+    /// The cgroup this process runs in, confirmed as delegated.
+    OwnCgroupDelegated,
+    /// Nothing resolved: jobs get no cgroup.
+    None,
+}
+
+impl RootSource {
+    /// Stable lowercase name (`config`, `env`, `own-cgroup-delegated`, `none`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Env => "env",
+            Self::OwnCgroupDelegated => "own-cgroup-delegated",
+            Self::None => "none",
+        }
+    }
+}
+
+impl fmt::Display for RootSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The outcome of [`resolve_delegated_root`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootResolution {
+    /// The delegated root (absolute, strictly below [`CGROUP2_MOUNT`]),
+    /// or `None` when nothing resolved.
+    pub root: Option<PathBuf>,
+    /// Where it came from.
+    pub source: RootSource,
+    /// An operator hint: [`NO_ROOT_HINT`] without a root, a deprecation
+    /// note for the verify alias, else `None`.
+    pub hint: Option<String>,
+}
+
+/// The config input of [`resolve_delegated_root`]: `[jobs] cgroup_root`
+/// after the config merge (trusted layers only; an untrusted project
+/// layer cannot set it, `harw_config` enforces that).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RootConfig {
+    /// `[jobs] cgroup_root`.
+    pub cgroup_root: Option<PathBuf>,
+}
+
+/// The environment input of [`resolve_delegated_root`] (passed in, so tests
+/// need no `set_var`). Empty values count as unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RootEnv {
+    /// [`CGROUP_ROOT_ENV`].
+    pub cgroup_root: Option<std::ffi::OsString>,
+    /// [`DEPRECATED_VERIFY_CGROUP_ROOT_ENV`]; only used when
+    /// `cgroup_root` is unset.
+    pub deprecated_verify_root: Option<std::ffi::OsString>,
+}
+
+impl RootEnv {
+    /// [`CGROUP_ROOT_ENV`] of this process (the alias is ignored).
+    #[must_use]
+    pub fn from_process() -> Self {
+        Self {
+            cgroup_root: std::env::var_os(CGROUP_ROOT_ENV),
+            deprecated_verify_root: None,
+        }
+    }
+
+    /// As [`RootEnv::from_process`], plus the deprecated
+    /// [`DEPRECATED_VERIFY_CGROUP_ROOT_ENV`] alias (verify runner only).
+    #[must_use]
+    pub fn from_process_with_verify_alias() -> Self {
+        Self {
+            cgroup_root: std::env::var_os(CGROUP_ROOT_ENV),
+            deprecated_verify_root: std::env::var_os(DEPRECATED_VERIFY_CGROUP_ROOT_ENV),
+        }
+    }
+}
+
+/// Name of the sub-cgroup harw's own process sits in when its unit sets
+/// `DelegateSubgroup=harw-main` (systemd >= 254; older systemd ignores the
+/// key with a warning). The delegated root is then the parent, which holds
+/// no process, so the cgroup v2 "no internal processes" rule does not keep
+/// the `memory`/`pids` controllers off for the job cgroups below it.
+pub const DELEGATE_SUBGROUP: &str = "harw-main";
+
+/// The own-cgroup input of [`resolve_delegated_root_with`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnCgroup {
+    /// The candidate root: `/sys/fs/cgroup/<own cgroup v2 path>`, or its
+    /// parent when the own cgroup is [`DELEGATE_SUBGROUP`]; `None` without
+    /// cgroup v2 membership.
+    pub path: Option<PathBuf>,
+    /// The candidate is delegated to this process
+    /// ([`own_cgroup_is_delegated`]).
+    pub delegated: bool,
+}
+
+/// What [`OwnCgroup::probe`] knows about the candidate root; the input of
+/// the pure [`own_cgroup_is_delegated`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnCgroupEvidence {
+    /// cgroup2 and writable for this process (directory, `cgroup.procs`,
+    /// `cgroup.subtree_control`; [`HostReport::cgroup_v2_delegated`]).
+    pub writable: bool,
+    /// The effective uid is 0 (writable says nothing then).
+    pub privileged: bool,
+    /// systemd marked the cgroup as delegated (`trusted.delegate` or
+    /// `user.delegate` xattr = `1`).
+    pub delegate_xattr: bool,
+}
+
+/// Whether the candidate own-cgroup root `path` is really delegated to
+/// this process. Writable alone is no evidence: every cgroup below
+/// `user@<uid>.service` belongs to the user (a terminal's `app-*.scope`
+/// is writable but not delegated), and as euid 0 every cgroup passes. So:
+///
+/// - never as euid 0 (pass the root via `[jobs] cgroup_root` or
+///   `HARW_CGROUP_ROOT` instead);
+/// - accepted with systemd's delegation xattr on a writable cgroup;
+/// - accepted without it only outside a user manager (no
+///   `user@<uid>.service` component): there systemd hands a cgroup to a
+///   unit's `User=` only with `Delegate=yes`, the rest stays root-owned.
+#[must_use]
+pub fn own_cgroup_is_delegated(path: &Path, evidence: &OwnCgroupEvidence) -> bool {
+    if evidence.privileged || !evidence.writable {
+        return false;
+    }
+    evidence.delegate_xattr || !below_user_manager(path)
+}
+
+/// `path` lies in a systemd user manager's subtree (`user@<uid>.service`).
+fn below_user_manager(path: &Path) -> bool {
+    path.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|name| {
+            name.strip_prefix("user@")
+                .and_then(|rest| rest.strip_suffix(".service"))
+                .is_some()
+        })
+    })
+}
+
+/// The candidate root for the own cgroup `own`: its parent when `own` is
+/// the [`DELEGATE_SUBGROUP`] leaf, else `own` itself.
+#[must_use]
+pub fn own_cgroup_root_candidate(own: &Path) -> PathBuf {
+    match (own.file_name(), own.parent()) {
+        (Some(name), Some(parent)) if name == DELEGATE_SUBGROUP => parent.to_path_buf(),
+        _ => own.to_path_buf(),
+    }
+}
+
+impl OwnCgroup {
+    /// Reads `/proc/self/cgroup`, picks the candidate root
+    /// ([`own_cgroup_root_candidate`]) and checks delegation of it
+    /// ([`own_cgroup_is_delegated`]; read-only, see the module docs). Off
+    /// Linux: nothing.
+    #[must_use]
+    pub fn probe() -> Self {
+        let path = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|content| own_cgroup_from_proc(&content))
+            .map(|own| own_cgroup_root_candidate(&own));
+        let delegated = path.as_deref().is_some_and(|path| {
+            let evidence = OwnCgroupEvidence {
+                writable: HostReport::probe_with_cgroup_root(Some(path)).cgroup_v2_delegated,
+                privileged: euid_is_root(),
+                delegate_xattr: has_delegate_xattr(path),
+            };
+            own_cgroup_is_delegated(path, &evidence)
+        });
+        Self { path, delegated }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn euid_is_root() -> bool {
+    rustix::process::geteuid().is_root()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn euid_is_root() -> bool {
+    false
+}
+
+/// systemd's delegation marker on `path` (`trusted.delegate` needs
+/// CAP_SYS_ADMIN to read, `user.delegate` does not).
+#[cfg(target_os = "linux")]
+fn has_delegate_xattr(path: &Path) -> bool {
+    ["trusted.delegate", "user.delegate"]
+        .into_iter()
+        .any(|name| {
+            let mut value = [0_u8; 8];
+            rustix::fs::getxattr(path, name, &mut value[..])
+                .ok()
+                .and_then(|len| value.get(..len))
+                .is_some_and(|value| value == b"1")
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_delegate_xattr(_path: &Path) -> bool {
+    false
+}
+
+/// `/sys/fs/cgroup/<path>` from the unified (`0::`) line of a
+/// `/proc/<pid>/cgroup` text; `None` without one.
+fn own_cgroup_from_proc(content: &str) -> Option<PathBuf> {
+    let relative = content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim();
+    if !relative.starts_with('/') {
+        return None;
+    }
+    Some(Path::new(CGROUP2_MOUNT).join(relative.trim_start_matches('/')))
+}
+
+/// Why a configured cgroup root was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DelegatedRootError {
+    /// The value is not valid UTF-8 or empty after trimming.
+    Unreadable {
+        /// Where it came from.
+        source: RootSource,
+    },
+    /// Not an absolute path.
+    NotAbsolute {
+        /// Where it came from.
+        source: RootSource,
+        /// The refused value.
+        path: PathBuf,
+    },
+    /// Contains `.` or `..` components.
+    NotNormalized {
+        /// Where it came from.
+        source: RootSource,
+        /// The refused value.
+        path: PathBuf,
+    },
+    /// Not strictly below [`CGROUP2_MOUNT`].
+    OutsideCgroupMount {
+        /// Where it came from.
+        source: RootSource,
+        /// The refused value.
+        path: PathBuf,
+    },
+}
+
+impl fmt::Display for DelegatedRootError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreadable { source } => {
+                write!(f, "cgroup root from {source} is empty or not UTF-8")
+            }
+            Self::NotAbsolute { source, path } => write!(
+                f,
+                "cgroup root '{}' from {source} is not an absolute path",
+                path.display()
+            ),
+            Self::NotNormalized { source, path } => write!(
+                f,
+                "cgroup root '{}' from {source} contains '.' or '..'",
+                path.display()
+            ),
+            Self::OutsideCgroupMount { source, path } => write!(
+                f,
+                "cgroup root '{}' from {source} is not below the cgroup2 mount {CGROUP2_MOUNT}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DelegatedRootError {}
+
+/// Checks that `path` is an absolute, normalized path strictly below
+/// [`CGROUP2_MOUNT`] and returns it without a trailing slash. Pure: it
+/// does not check that the cgroup exists or is delegated.
+///
+/// # Errors
+/// [`DelegatedRootError`] naming `source`.
+pub fn validate_cgroup_root(
+    path: &Path,
+    source: RootSource,
+) -> Result<PathBuf, DelegatedRootError> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(DelegatedRootError::NotAbsolute {
+            source,
+            path: path.to_path_buf(),
+        });
+    }
+    let text = path.to_string_lossy();
+    if text
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(DelegatedRootError::NotNormalized {
+            source,
+            path: path.to_path_buf(),
+        });
+    }
+    let normalized: PathBuf = path.components().collect();
+    let below = normalized
+        .strip_prefix(CGROUP2_MOUNT)
+        .ok()
+        .filter(|rest| rest.components().any(|c| matches!(c, Component::Normal(_))));
+    if below.is_none() {
+        return Err(DelegatedRootError::OutsideCgroupMount {
+            source,
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(normalized)
+}
+
+/// The path of `root` relative to the cgroup2 mount, with a leading `/`
+/// (`/sys/fs/cgroup/user.slice/harw.slice` → `/user.slice/harw.slice`):
+/// the form of a Harw-DoD profile's `cgroup_paths` and of
+/// `/proc/<pid>/cgroup`. Strip the leading `/` for the Warden's relative
+/// `CgroupId` (`user.slice/harw.slice`). `None` when `root` is not a valid
+/// root ([`validate_cgroup_root`]).
+#[must_use]
+pub fn cgroup_path_below_mount(root: &Path) -> Option<String> {
+    let root = validate_cgroup_root(root, RootSource::Config).ok()?;
+    let rest = root.strip_prefix(CGROUP2_MOUNT).ok()?;
+    Some(format!("/{}", rest.to_string_lossy()))
+}
+
+/// Resolves the delegated cgroup v2 root of harw's jobs (PL-97 E3), in
+/// this order:
+///
+/// 1. `[jobs] cgroup_root` ([`RootConfig`], trusted layers only);
+/// 2. [`CGROUP_ROOT_ENV`] (verify runner: then the deprecated
+///    [`DEPRECATED_VERIFY_CGROUP_ROOT_ENV`]);
+/// 3. the cgroup this process runs in (its parent when it is the
+///    [`DELEGATE_SUBGROUP`] leaf), when [`OwnCgroup::probe`] finds real
+///    delegation evidence ([`own_cgroup_is_delegated`]: never as euid 0,
+///    writable alone counts only outside a user manager);
+/// 4. none, with [`NO_ROOT_HINT`].
+///
+/// A configured or environment root must be an absolute path strictly
+/// below [`CGROUP2_MOUNT`]; anything else is refused (no fallback to a
+/// later step). Whether it exists and is writable is checked where it is
+/// used (`CgroupV2Fs::open`).
+///
+/// # Errors
+/// [`DelegatedRootError`] for a malformed configured or environment root.
+pub fn resolve_delegated_root(
+    config: &RootConfig,
+    env: &RootEnv,
+) -> Result<RootResolution, DelegatedRootError> {
+    resolve_delegated_root_with(config, env, OwnCgroup::probe)
+}
+
+/// [`resolve_delegated_root`] with an injected own-cgroup probe (called
+/// only when steps 1 and 2 are empty).
+///
+/// # Errors
+/// As [`resolve_delegated_root`].
+pub fn resolve_delegated_root_with(
+    config: &RootConfig,
+    env: &RootEnv,
+    own_cgroup: impl FnOnce() -> OwnCgroup,
+) -> Result<RootResolution, DelegatedRootError> {
+    if let Some(root) = &config.cgroup_root {
+        let root = validate_cgroup_root(root, RootSource::Config)?;
+        return Ok(RootResolution {
+            root: Some(root),
+            source: RootSource::Config,
+            hint: None,
+        });
+    }
+    let present = |value: &Option<std::ffi::OsString>| value.clone().filter(|v| !v.is_empty());
+    let (value, hint) = match (
+        present(&env.cgroup_root),
+        present(&env.deprecated_verify_root),
+    ) {
+        (Some(value), _) => (Some(value), None),
+        (None, Some(value)) => (
+            Some(value),
+            Some(format!(
+                "{DEPRECATED_VERIFY_CGROUP_ROOT_ENV} is deprecated; set {CGROUP_ROOT_ENV} or \
+                 `[jobs] cgroup_root` instead"
+            )),
+        ),
+        (None, None) => (None, None),
+    };
+    if let Some(value) = value {
+        let text = value
+            .to_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or(DelegatedRootError::Unreadable {
+                source: RootSource::Env,
+            })?;
+        let root = validate_cgroup_root(Path::new(text), RootSource::Env)?;
+        return Ok(RootResolution {
+            root: Some(root),
+            source: RootSource::Env,
+            hint,
+        });
+    }
+    let own = own_cgroup();
+    if own.delegated
+        && let Some(path) = own.path
+        && let Ok(root) = validate_cgroup_root(&path, RootSource::OwnCgroupDelegated)
+    {
+        return Ok(RootResolution {
+            root: Some(root),
+            source: RootSource::OwnCgroupDelegated,
+            hint: None,
+        });
+    }
+    Ok(RootResolution {
+        root: None,
+        source: RootSource::None,
+        hint: Some(NO_ROOT_HINT.to_owned()),
+    })
+}
+
 fn probe_facts(cgroup_root: Option<&Path>) -> HostFacts {
     let mut facts = HostFacts {
         target_os: std::env::consts::OS.to_owned(),
@@ -1440,5 +1902,227 @@ mod tests {
         assert!(!find_executable("harw-missing-tool", Some(&path)));
         assert!(!find_executable("harw-fake-tool", None));
         Ok(())
+    }
+
+    // ── PL-97 E3: delegated cgroup root ──
+
+    fn own(path: Option<&str>, delegated: bool) -> OwnCgroup {
+        OwnCgroup {
+            path: path.map(PathBuf::from),
+            delegated,
+        }
+    }
+
+    fn env(primary: Option<&str>, alias: Option<&str>) -> RootEnv {
+        RootEnv {
+            cgroup_root: primary.map(Into::into),
+            deprecated_verify_root: alias.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn delegated_root_resolution_order_is_config_env_own_none() -> TestResult {
+        let config = RootConfig {
+            cgroup_root: Some(PathBuf::from("/sys/fs/cgroup/config.slice/")),
+        };
+        let own_ok = || own(Some("/sys/fs/cgroup/own.scope"), true);
+        let unused = || -> OwnCgroup { own(Some("/sys/fs/cgroup/never"), true) };
+
+        // 1. Config wins over env and the own cgroup (trailing slash dropped).
+        let got =
+            resolve_delegated_root_with(&config, &env(Some("/sys/fs/cgroup/env"), None), unused)
+                .map_err(|e| crate::test_support::TestError::Unexpected(e.to_string()))?;
+        assert_eq!(got.source, RootSource::Config);
+        assert_eq!(got.root, Some(PathBuf::from("/sys/fs/cgroup/config.slice")));
+        assert_eq!(got.hint, None);
+
+        // 2. Env over the own cgroup.
+        let got = resolve_delegated_root_with(
+            &RootConfig::default(),
+            &env(
+                Some("/sys/fs/cgroup/env.slice"),
+                Some("/sys/fs/cgroup/alias"),
+            ),
+            unused,
+        )
+        .map_err(|e| crate::test_support::TestError::Unexpected(e.to_string()))?;
+        assert_eq!(got.source, RootSource::Env);
+        assert_eq!(got.root, Some(PathBuf::from("/sys/fs/cgroup/env.slice")));
+        assert_eq!(got.hint, None);
+
+        // 2b. The deprecated alias only when the primary is unset or empty.
+        let got = resolve_delegated_root_with(
+            &RootConfig::default(),
+            &env(Some(""), Some("/sys/fs/cgroup/alias.slice")),
+            unused,
+        )
+        .map_err(|e| crate::test_support::TestError::Unexpected(e.to_string()))?;
+        assert_eq!(got.source, RootSource::Env);
+        assert_eq!(got.root, Some(PathBuf::from("/sys/fs/cgroup/alias.slice")));
+        assert!(
+            got.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("deprecated")),
+            "{got:?}"
+        );
+
+        // 3. The own cgroup, only when delegated.
+        let got = resolve_delegated_root_with(&RootConfig::default(), &RootEnv::default(), own_ok)
+            .map_err(|e| crate::test_support::TestError::Unexpected(e.to_string()))?;
+        assert_eq!(got.source, RootSource::OwnCgroupDelegated);
+        assert_eq!(got.root, Some(PathBuf::from("/sys/fs/cgroup/own.scope")));
+
+        // 4. Nothing: none with the hint.
+        for fallback in [
+            own(Some("/sys/fs/cgroup/own.scope"), false),
+            own(None, true),
+            own(Some("/sys/fs/cgroup"), true),
+        ] {
+            let got =
+                resolve_delegated_root_with(&RootConfig::default(), &RootEnv::default(), || {
+                    fallback.clone()
+                })
+                .map_err(|e| crate::test_support::TestError::Unexpected(e.to_string()))?;
+            assert_eq!(got.source, RootSource::None);
+            assert_eq!(got.root, None);
+            assert!(
+                got.hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("systemd-run --user --scope -p Delegate=yes")),
+                "{got:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn own_cgroup_needs_delegation_evidence_not_only_write_access() {
+        let app_scope = Path::new(
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome\\x2dterminal-1.scope",
+        );
+        let serve = Path::new(
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/harw-serve.service",
+        );
+        let control = Path::new("/sys/fs/cgroup/system.slice/harw-control.service");
+        let session = Path::new("/sys/fs/cgroup/user.slice/user-1000.slice/session-3.scope");
+        let writable = OwnCgroupEvidence {
+            writable: true,
+            ..OwnCgroupEvidence::default()
+        };
+        let marked = OwnCgroupEvidence {
+            delegate_xattr: true,
+            ..writable
+        };
+        let as_root = OwnCgroupEvidence {
+            privileged: true,
+            ..marked
+        };
+
+        // (a) Below user@<uid>.service everything is user-owned: a terminal's
+        // app scope is writable but not delegated; the xattr decides.
+        assert!(!own_cgroup_is_delegated(app_scope, &writable));
+        assert!(!own_cgroup_is_delegated(serve, &writable));
+        assert!(own_cgroup_is_delegated(serve, &marked));
+        // A system unit with User= gets its cgroup only through Delegate=yes.
+        assert!(own_cgroup_is_delegated(control, &writable));
+        assert!(!own_cgroup_is_delegated(
+            control,
+            &OwnCgroupEvidence::default()
+        ));
+        // (b) As euid 0 (sudo) every cgroup is writable: never accepted.
+        for path in [app_scope, serve, control, session] {
+            assert!(
+                !own_cgroup_is_delegated(path, &as_root),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn own_cgroup_root_is_the_parent_of_the_delegate_subgroup() {
+        let root = Path::new("/sys/fs/cgroup/system.slice/harw-control.service");
+        assert_eq!(
+            own_cgroup_root_candidate(&root.join(DELEGATE_SUBGROUP)),
+            root
+        );
+        assert_eq!(own_cgroup_root_candidate(root), root);
+        assert_eq!(
+            own_cgroup_root_candidate(&root.join("harw-main2")),
+            root.join("harw-main2")
+        );
+    }
+
+    #[test]
+    fn delegated_root_refuses_relative_unnormalized_and_outside_mount_roots() {
+        for (bad, expected) in [
+            ("relative/harw.slice", "NotAbsolute"),
+            ("/sys/fs/cgroup/../etc", "NotNormalized"),
+            ("/sys/fs/cgroup/./harw", "NotNormalized"),
+            ("/tmp/harw.slice", "OutsideCgroupMount"),
+            ("/sys/fs/cgroupx/harw", "OutsideCgroupMount"),
+            ("/sys/fs/cgroup", "OutsideCgroupMount"),
+            ("/sys/fs/cgroup/", "OutsideCgroupMount"),
+        ] {
+            let config = RootConfig {
+                cgroup_root: Some(PathBuf::from(bad)),
+            };
+            // A refused config root never falls back to env or the own cgroup.
+            let result = resolve_delegated_root_with(
+                &config,
+                &env(Some("/sys/fs/cgroup/env"), None),
+                || own(Some("/sys/fs/cgroup/own"), true),
+            );
+            let error = format!("{result:?}");
+            assert!(error.contains(expected), "{bad}: {error}");
+            assert!(error.contains("Config"), "{bad}: {error}");
+        }
+        let result = resolve_delegated_root_with(
+            &RootConfig::default(),
+            &env(Some("harw.slice"), None),
+            || own(None, false),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(DelegatedRootError::NotAbsolute {
+                    source: RootSource::Env,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        let result =
+            resolve_delegated_root_with(&RootConfig::default(), &env(Some("   "), None), || {
+                own(None, false)
+            });
+        assert!(
+            matches!(
+                result,
+                Err(DelegatedRootError::Unreadable {
+                    source: RootSource::Env
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn host_cgroup_root_converts_to_the_dod_and_warden_forms() {
+        assert_eq!(
+            cgroup_path_below_mount(Path::new("/sys/fs/cgroup/user.slice/harw.slice/")).as_deref(),
+            Some("/user.slice/harw.slice")
+        );
+        assert_eq!(cgroup_path_below_mount(Path::new("/sys/fs/cgroup")), None);
+        assert_eq!(cgroup_path_below_mount(Path::new("user.slice")), None);
+        assert_eq!(
+            own_cgroup_from_proc("12:pids:/x\n0::/user.slice/harw.scope\n"),
+            Some(PathBuf::from("/sys/fs/cgroup/user.slice/harw.scope"))
+        );
+        assert_eq!(own_cgroup_from_proc("4:memory:/x\n"), None);
+        assert_eq!(
+            RootSource::OwnCgroupDelegated.to_string(),
+            "own-cgroup-delegated"
+        );
     }
 }

@@ -34,13 +34,33 @@ pub fn replace(port: Arc<dyn CommandPort>) {
 /// Linux executor in new-session mode) unless a port is already installed.
 /// Returns whether a port is installed afterwards. Without Linux support, or
 /// when the runtime cannot be created, nothing is installed and surfaces fail
-/// closed.
+/// closed. Nothing configured: see [`install_host`].
 pub fn install_host_default(state_dir: &std::path::Path) -> bool {
+    install_host(state_dir, &crate::HostPortOptions::default())
+}
+
+/// [`install_host_default`] with the trusted config inputs of `options`
+/// (PL-97 E3: `[jobs] cgroup_root` and `[jobs] trampoline`). On Linux the
+/// delegated cgroup root resolves `[jobs] cgroup_root` → `HARW_CGROUP_ROOT`
+/// → the own delegated cgroup and goes into `LinuxExecutorOptions::cgroup_root`
+/// (`JobCommandPort::host_with`); without one jobs keep running without
+/// their own cgroup, with one logged hint. The first installer wins.
+pub fn install_host(state_dir: &std::path::Path, options: &crate::HostPortOptions) -> bool {
     if installed().is_some() {
         return true;
     }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
+        match crate::JobCommandPort::host_with(state_dir, options) {
+            Ok(port) => {
+                let _ = install(Arc::new(port));
+            }
+            Err(error) => tracing::warn!(%error, "no job runtime for commands"),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = options;
         match crate::JobCommandPort::host(state_dir) {
             Ok(port) => {
                 let _ = install(Arc::new(port));
@@ -49,7 +69,7 @@ pub fn install_host_default(state_dir: &std::path::Path) -> bool {
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let _ = state_dir;
+    let _ = (state_dir, options);
     installed().is_some()
 }
 

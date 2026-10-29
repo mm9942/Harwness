@@ -2067,7 +2067,10 @@ fn merge_shell_limits(
 // (Home und Profil) setzen frei, auch nach oben; ein nicht vertrautes
 // Projekt darf die Obergrenze nur senken (Vergleichswert: der bisher
 // gesetzte Wert, sonst die Vorgabe 16). Der Bereich 1–256 ist schon beim
-// Parsen geprüft (`harness_config::JobsToml`).
+// Parsen geprüft (`harness_config::JobsToml`). `cgroup_root` und
+// `trampoline` (PL-97 E3) sind `ProfileReplaces`: Home und Profil setzen
+// sie, ein nicht vertrautes Projekt nie (es könnte sonst Jobs in eine
+// fremde cgroup oder durch ein fremdes Trampolin lenken).
 fn merge_jobs(
     trusted: &mut HarnessConfig,
     incoming: crate::harness_config::JobsToml,
@@ -2077,6 +2080,22 @@ fn merge_jobs(
     out: &mut Vec<ScopeDiagnostic>,
 ) {
     const FIELD: &str = "jobs.max_running";
+    profile_replaces(
+        &mut trusted.jobs.cgroup_root,
+        incoming.cgroup_root,
+        field_present(raw, &["jobs", "cgroup_root"]),
+        role,
+        "jobs.cgroup_root",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.jobs.trampoline,
+        incoming.trampoline,
+        field_present(raw, &["jobs", "trampoline"]),
+        role,
+        "jobs.trampoline",
+        layer_path,
+    );
     if !field_present(raw, &["jobs", "max_running"]) {
         return;
     }
@@ -3568,6 +3587,71 @@ mod tests {
             &layer_path(),
         );
         assert_eq!(trusted.sandbox.execution, Some(SandboxExecutionToml::Chain));
+        Ok(())
+    }
+
+    // PL-97 E3: `jobs.cgroup_root` und `jobs.trampoline` sind
+    // `ProfileReplaces` — ein nicht vertrautes Projekt setzt keinen von beiden.
+    #[test]
+    fn test_jobs_cgroup_root_and_trampoline_only_from_trusted_layers() -> TestResult {
+        use std::path::PathBuf;
+
+        let mut trusted = HarnessConfig::default();
+        let home = "[jobs]\ncgroup_root = \"/sys/fs/cgroup/harw.slice\"\n\
+                    trampoline = \"/opt/harw/harw-job-exec\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.jobs.cgroup_root,
+            Some(PathBuf::from("/sys/fs/cgroup/harw.slice"))
+        );
+        assert_eq!(
+            trusted.jobs.trampoline,
+            Some(PathBuf::from("/opt/harw/harw-job-exec"))
+        );
+
+        let profile = "[jobs]\ncgroup_root = \"/sys/fs/cgroup/profile.slice\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.jobs.cgroup_root,
+            Some(PathBuf::from("/sys/fs/cgroup/profile.slice"))
+        );
+        // Not named in the profile layer: kept.
+        assert_eq!(
+            trusted.jobs.trampoline,
+            Some(PathBuf::from("/opt/harw/harw-job-exec"))
+        );
+
+        let untrusted = "[jobs]\ncgroup_root = \"/sys/fs/cgroup/evil.slice\"\n\
+                         trampoline = \"/tmp/evil\"\nmax_running = 4";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(untrusted).map_err(ctx("parse untrusted"))?,
+            &raw_from(untrusted)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.jobs.cgroup_root,
+            Some(PathBuf::from("/sys/fs/cgroup/profile.slice"))
+        );
+        assert_eq!(
+            trusted.jobs.trampoline,
+            Some(PathBuf::from("/opt/harw/harw-job-exec"))
+        );
+        // The rest of the table still merges by its own rule.
+        assert_eq!(trusted.jobs.max_running, Some(4));
         Ok(())
     }
 

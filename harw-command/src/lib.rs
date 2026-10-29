@@ -24,7 +24,7 @@
 mod global;
 mod port;
 
-pub use global::{install, install_host_default, installed, replace};
+pub use global::{install, install_host, install_host_default, installed, replace};
 
 pub use harw_job::{
     BackendKind, Persistence, ResourceRequest, SandboxProfileName, SandboxRequirement,
@@ -34,6 +34,6 @@ pub use harw_job_core::spec::JobWriteScope;
 pub use port::HostCommandExecutor;
 pub use port::{
     CommandEnd, CommandFrame, CommandFrames, CommandOutcome, CommandOutput, CommandPort,
-    CommandRequest, CommandSandbox, CommandStdin, JobCommandPort, OutputStream, RunFuture,
-    StartFuture, StartedCommand, WorkspaceSandbox,
+    CommandRequest, CommandSandbox, CommandStdin, HostPortOptions, JobCommandPort, OutputStream,
+    RunFuture, StartFuture, StartedCommand, WorkspaceSandbox,
 };
