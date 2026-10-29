@@ -443,6 +443,12 @@ impl SkillInjector {
 
     /// Provenance of `skill`: imported (explicitly marked), bundled or from a
     /// trusted layer.
+    ///
+    /// A name the index does not know is treated as imported (trust class
+    /// `Evidence`): the only trust a skill can carry is the trust of the
+    /// layer it was loaded from, and an unknown name has none. `select` only
+    /// yields indexed skills, so this arm is a fail-closed default, not a
+    /// path taken in normal operation.
     #[must_use]
     pub fn provenance(&self, skill: &str) -> SkillProvenance {
         if self.imported.contains(skill) {
@@ -450,7 +456,8 @@ impl SkillInjector {
         }
         match self.index.get(skill).map(|entry| &entry.source) {
             Some(SkillSource::Bundled) => SkillProvenance::Bundled,
-            Some(SkillSource::Layer(_)) | None => SkillProvenance::TrustedLayer,
+            Some(SkillSource::Layer(_)) => SkillProvenance::TrustedLayer,
+            None => SkillProvenance::Imported,
         }
     }
 

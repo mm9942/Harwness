@@ -635,6 +635,21 @@ fn imported_skills_are_evidence_and_off_by_default() -> TestResult {
 }
 
 #[test]
+fn unknown_skill_names_fail_closed_to_imported() {
+    // A name the index does not know carries no layer trust: it must never
+    // be classified as a trusted layer (`Instruction`) by default.
+    let injector = injector(SkillInjectionSettings::default());
+    assert_eq!(
+        injector.provenance("not-in-the-index"),
+        SkillProvenance::Imported
+    );
+    assert_eq!(
+        injector.provenance("not-in-the-index").trust(),
+        TrustClass::Evidence
+    );
+}
+
+#[test]
 fn constants_agree_across_crates() {
     assert_eq!(
         harw_catalog::FRAGMENT_SECTION,
