@@ -711,7 +711,9 @@ mod tests {
             &meta_json(
                 "running",
                 r#""origin":{"kind":"agent_child","child_session_id":"child-7"},
-                   "identity":{"start_ticks":5,"cgroup_path":"/harw.slice/harw-job-3"},"#,
+                   "identity":{"start_ticks":5,"cgroup_path":"/harw.slice/harw-job-3",
+                     "dedicated_cgroup":{"job_id":"job-1","attempt_id":"3",
+                       "delegated_root":"/harw.slice"}},"#,
                 r#"{"session":"uia"}"#,
             ),
             &[],
@@ -752,13 +754,27 @@ mod tests {
         assert_eq!(shared.cgroup_path(), Some("/user.slice"));
         assert_eq!(JobRow::from_status(&shared).cgroup, None);
 
+        // Ein passender `harw-job-*`-Name ohne Laufzeit-Nachweis ist kein Beleg.
+        let unproven = status_of(
+            &meta_json(
+                "running",
+                r#""identity":{"start_ticks":5,"cgroup_path":"/harw.slice/harw-job-3"},"#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        assert_eq!(unproven.cgroup_path(), Some("/harw.slice/harw-job-3"));
+        assert_eq!(JobRow::from_status(&unproven).cgroup, None);
+
         // Steuerzeichen aus `meta.json` (dort als JSON-Escapes) erreichen die
         // Zeile nur markiert.
         let hostile = status_of(
             &meta_json(
                 "running",
                 r#""origin":{"kind":"tool","tool":"job.start\u001b[2J"},
-                   "identity":{"start_ticks":5,"cgroup_path":"/harw\u0007.slice/harw-job-3"},"#,
+                   "identity":{"start_ticks":5,"cgroup_path":"/harw\u0007.slice/harw-job-3",
+                     "dedicated_cgroup":{"job_id":"job-1","attempt_id":"3",
+                       "delegated_root":"/harw\u0007.slice"}},"#,
                 r#"{"session":"uia"}"#,
             ),
             &[],

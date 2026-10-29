@@ -201,6 +201,7 @@ pub(crate) fn capture_identity(pid: u32) -> Option<JobProcessIdentity> {
         start_ticks: snap.start_time_ticks,
         executable: snap.executable,
         cgroup_path: snap.cgroup_v2_path,
+        dedicated_cgroup: None,
     })
 }
 

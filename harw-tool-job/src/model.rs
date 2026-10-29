@@ -21,7 +21,8 @@ use std::path::PathBuf;
 ///   geschrieben, damit ältere harw-Versionen v2-Dateien lesen können.
 /// - Ohne Versionssprung (serde-Vorgabe) ergänzt:
 ///   [`JobMeta::stragglers_reaped`], [`JobMeta::log_truncated`],
-///   [`JobMeta::launch_warnings`] und [`JobMeta::origin`] (W20-A). Ältere
+///   [`JobMeta::launch_warnings`], [`JobMeta::origin`] (W20-A) und
+///   [`JobProcessIdentity::dedicated_cgroup`] (PL-97 E4). Ältere
 ///   Dateien laden mit `false` bzw. leer; ältere harw-Versionen ignorieren
 ///   die Felder (`JobMeta` hat kein `deny_unknown_fields`).
 ///
@@ -487,6 +488,7 @@ impl JobMeta {
                 start_ticks,
                 executable: None,
                 cgroup_path: None,
+                dedicated_cgroup: None,
             })
         })
     }
@@ -533,6 +535,46 @@ pub struct JobProcessIdentity {
     /// [`JobStatus::job_cgroup_path`]).
     #[serde(default)]
     pub cgroup_path: Option<String>,
+    /// Proof from the job runtime that [`JobProcessIdentity::cgroup_path`]
+    /// is this job's own cgroup (PL-97 E4). `None` (the default, also for
+    /// older records) means the path is never attributed to the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedicated_cgroup: Option<DedicatedCgroupProof>,
+}
+
+/// Runtime attestation that a job runs in its own, dedicated cgroup
+/// (PL-97 E4, PR #154 review).
+///
+/// # Description
+/// A `harw-job-*` leaf name alone proves nothing: without a delegated root
+/// harw may itself run in a shared cgroup whose leaf happens to match, and
+/// every job would then persist that same path. The proof therefore records
+/// what the job runtime attested at launch: the attempt id it created the
+/// cgroup for and the delegated root it created it beneath, bound to the
+/// job it was attested for.
+///
+/// The attempt id is assigned by the command port (`<work>-e<epoch>`) and
+/// cannot be derived from [`JobMeta`], so the proof carries the
+/// [`JobId`] it belongs to; [`JobStatus::job_cgroup_path`] rejects a proof
+/// stored in another job's record. The proof must be written only from the
+/// launch result (`StartedCommand`) of this job's own launch through a
+/// delegated root, never copied, cached or shared between jobs: uniqueness
+/// of the attempt id beyond the job binding rests on that single writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedicatedCgroupProof {
+    /// The job this proof was attested for; must equal [`JobMeta::job_id`]
+    /// of the record that stores it. `None` (an unbound proof) is never
+    /// accepted.
+    #[serde(default)]
+    pub job_id: Option<JobId>,
+    /// Attempt id the job runtime attested for this job's launch; its cgroup
+    /// is `harw-job-<attempt id>` (characters outside `[A-Za-z0-9_.-]`
+    /// replaced by `_`, as the runtime names it).
+    pub attempt_id: String,
+    /// The delegated cgroup root the attempt cgroup was created directly
+    /// beneath, hierarchy-relative (e.g. `/harw.slice`); a leading
+    /// `/sys/fs/cgroup` mount point is tolerated.
+    pub delegated_root: String,
 }
 
 /// Sicht auf einen Job für Werkzeuge und Oberfläche.
@@ -558,19 +600,65 @@ pub struct JobStatus {
 /// root (`harw-job-runtime`, `coordinator/linux.rs`, `cgroup_name`).
 const JOB_CGROUP_PREFIX: &str = "harw-job-";
 
-/// Whether `path` names a dedicated job cgroup: its last component is
-/// `harw-job-<attempt>` with a non-empty attempt made of `[A-Za-z0-9_.-]`
-/// only (the character set the job runtime emits).
-fn is_job_cgroup_path(path: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .and_then(|leaf| leaf.strip_prefix(JOB_CGROUP_PREFIX))
-        .is_some_and(|attempt| {
-            !attempt.is_empty()
-                && attempt
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+/// The conventional cgroup-v2 mount point, tolerated in front of a
+/// [`DedicatedCgroupProof::delegated_root`].
+const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
+
+/// The cgroup leaf the job runtime creates for `attempt_id`:
+/// `harw-job-<attempt>` with every character outside `[A-Za-z0-9_.-]`
+/// replaced by `_` (mirrors `cgroup_name` in `harw-job-runtime`).
+fn attempt_cgroup_leaf(attempt_id: &str) -> String {
+    let attempt: String = attempt_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-') {
+                ch
+            } else {
+                '_'
+            }
         })
+        .collect();
+    format!("{JOB_CGROUP_PREFIX}{attempt}")
+}
+
+/// Splits an absolute cgroup path into its components; `None` for relative
+/// paths and for empty, `.` or `..` components (never resolved, never
+/// trusted).
+fn cgroup_components(path: &str) -> Option<Vec<&str>> {
+    let rest = path.strip_prefix('/')?;
+    if rest.is_empty() {
+        return Some(Vec::new());
+    }
+    let parts: Vec<&str> = rest.split('/').collect();
+    parts
+        .iter()
+        .all(|part| !part.is_empty() && *part != "." && *part != "..")
+        .then_some(parts)
+}
+
+/// Whether `path` is proven to be the dedicated cgroup described by
+/// `proof`: its parent is exactly the (non-hierarchy-root) delegated root
+/// and its leaf is the cgroup the runtime names for the attested attempt.
+fn is_proven_job_cgroup(path: &str, proof: &DedicatedCgroupProof) -> bool {
+    if proof.attempt_id.is_empty() {
+        return false;
+    }
+    let root = proof
+        .delegated_root
+        .strip_prefix(CGROUP_MOUNT)
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        .map_or(proof.delegated_root.as_str(), |rest| {
+            if rest.is_empty() { "/" } else { rest }
+        });
+    let (Some(root), Some(path)) = (cgroup_components(root), cgroup_components(path)) else {
+        return false;
+    };
+    let Some((leaf, parent)) = path.split_last() else {
+        return false;
+    };
+    // The hierarchy root is never a delegated root, and the root must be a
+    // proper ancestor: the attempt cgroup lies directly beneath it.
+    !root.is_empty() && parent == root.as_slice() && *leaf == attempt_cgroup_leaf(&proof.attempt_id)
 }
 
 impl JobStatus {
@@ -599,22 +687,34 @@ impl JobStatus {
             .and_then(|identity| identity.cgroup_path.as_deref())
     }
 
-    /// The job's **dedicated** cgroup: [`JobStatus::cgroup_path`] only when
-    /// its last component is a job cgroup of the job runtime
-    /// (`harw-job-<attempt>`).
+    /// The job's **dedicated** cgroup: [`JobStatus::cgroup_path`] only with
+    /// a runtime proof ([`JobProcessIdentity::dedicated_cgroup`]).
     ///
     /// # Description
     /// Hierarchy-relative like [`JobStatus::cgroup_path`]. Use this value to
-    /// attribute cgroup-scoped observations to the job; a shared cgroup
-    /// (`/user.slice`, harw's own scope) is never reported, so attribution
-    /// fails closed instead of assigning everything in that cgroup to every
-    /// job in it.
+    /// attribute cgroup-scoped observations to the job. A `harw-job-*` leaf
+    /// name is no proof: harw itself may run in a shared cgroup whose leaf
+    /// matches. The path counts only when the persisted proof belongs to
+    /// this job ([`DedicatedCgroupProof::job_id`]), attests the attempt (the
+    /// leaf is `harw-job-<attested attempt id>`) and a delegated root that
+    /// is the path's direct parent. Everything else
+    /// fails closed instead of assigning one shared cgroup to every job.
     ///
     /// # Returns
-    /// `None` when the path is unknown or names a shared, non-job cgroup.
+    /// `None` when the path is unknown, no proof is recorded, the proof
+    /// belongs to another job, or it does not match the path (e.g. a leaf
+    /// for another attempt).
     #[must_use]
     pub fn job_cgroup_path(&self) -> Option<&str> {
-        self.cgroup_path().filter(|path| is_job_cgroup_path(path))
+        let identity = self.meta.identity.as_ref()?;
+        let proof = identity
+            .dedicated_cgroup
+            .as_ref()
+            .filter(|proof| proof.job_id.as_ref() == Some(&self.meta.job_id))?;
+        identity
+            .cgroup_path
+            .as_deref()
+            .filter(|path| is_proven_job_cgroup(path, proof))
     }
 }
 
@@ -813,61 +913,159 @@ mod tests {
             Some("/harw.slice/harw-job-7")
         );
         assert_eq!(status_of(LEGACY_NO_ORIGIN)?.cgroup_path(), None);
-        assert_eq!(
-            status_of(LEGACY_TOOL_ORIGIN)?.job_cgroup_path(),
-            Some("/harw.slice/harw-job-7")
-        );
+        // A legacy record carries no dedicated-cgroup proof: never attributed.
+        assert_eq!(status_of(LEGACY_TOOL_ORIGIN)?.job_cgroup_path(), None);
         assert_eq!(status_of(LEGACY_NO_ORIGIN)?.job_cgroup_path(), None);
         Ok(())
     }
 
-    /// W20-A/E4: only a dedicated `harw-job-<attempt>` cgroup counts as the
-    /// job's cgroup; a shared cgroup (no delegated root: harw's own or the
-    /// session's) is surfaced raw but never as the job's cgroup.
+    /// A status whose identity has cgroup `path` and the optional `proof`.
+    fn status_with_cgroup(
+        path: &str,
+        proof: Option<DedicatedCgroupProof>,
+    ) -> TestResult<JobStatus> {
+        let mut meta: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        meta.version = META_VERSION;
+        meta.identity = Some(JobProcessIdentity {
+            start_ticks: 1,
+            executable: None,
+            cgroup_path: Some(path.to_owned()),
+            dedicated_cgroup: proof,
+        });
+        Ok(JobStatus {
+            meta,
+            runtime_secs: None,
+            stdout_lines: 0,
+            stderr_lines: 0,
+            last_lines: Vec::new(),
+            log_dir: PathBuf::new(),
+        })
+    }
+
+    /// A proof for `job-1` (the job id of [`v1_json`]).
+    fn proof(attempt_id: &str, delegated_root: &str) -> DedicatedCgroupProof {
+        DedicatedCgroupProof {
+            job_id: Some(JobId("job-1".to_owned())),
+            attempt_id: attempt_id.to_owned(),
+            delegated_root: delegated_root.to_owned(),
+        }
+    }
+
+    /// PR #154 review (E4): a `harw-job-*` leaf is no proof. Without a
+    /// recorded runtime proof (harw itself in a shared cgroup whose leaf
+    /// matches, which every job would then persist), nothing is attributed;
+    /// the raw path stays visible through [`JobStatus::cgroup_path`].
     #[test]
-    fn test_shared_cgroup_is_not_a_job_cgroup() -> TestResult {
-        let base: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
-        let cases = [
-            ("/user.slice", false),
-            ("/user.slice/user-1000.slice/session-2.scope", false),
-            ("/harw.slice", false),
-            ("/harw.slice/harw-job-", false),
-            ("/harw.slice/not-harw-job-1", false),
-            ("/harw.slice/harw-job-1/leaf", false),
-            ("/harw.slice/harw-job-a b", false),
-            ("/harw.slice/harw-job-x\u{7}", false),
-            ("/harw.slice/harw-job-1", true),
-            ("/delegated/harw-job-job_1.x-e2", true),
-        ];
-        for (path, dedicated) in cases {
-            let mut meta = base.clone();
-            meta.version = META_VERSION;
-            meta.identity = Some(JobProcessIdentity {
-                start_ticks: 1,
-                executable: None,
-                cgroup_path: Some(path.to_owned()),
-            });
-            let status = JobStatus {
-                meta,
-                runtime_secs: None,
-                stdout_lines: 0,
-                stderr_lines: 0,
-                last_lines: Vec::new(),
-                log_dir: PathBuf::new(),
-            };
+    fn test_shared_matching_leaf_without_proof_is_not_a_job_cgroup() -> TestResult {
+        for path in [
+            "/user.slice",
+            "/user.slice/user-1000.slice/session-2.scope",
+            "/harw.slice",
+            "/harw.slice/harw-job-1",
+            "/user.slice/harw-job-shared",
+            "/delegated/harw-job-job_1.x-e2",
+        ] {
+            let status = status_with_cgroup(path, None)?;
             assert_eq!(status.cgroup_path(), Some(path), "{path:?}");
-            assert_eq!(
-                status.job_cgroup_path(),
-                dedicated.then_some(path),
-                "{path:?}"
-            );
+            assert_eq!(status.job_cgroup_path(), None, "{path:?}");
         }
         Ok(())
     }
 
+    /// PR #154 review (E4): a proof only counts for the exact cgroup it
+    /// attests — a leaf for another attempt, a root that is not the direct
+    /// parent, or a malformed proof fails closed.
+    #[test]
+    fn test_forged_or_mismatched_proof_is_not_a_job_cgroup() -> TestResult {
+        let cases = [
+            // Leaf of another attempt.
+            (
+                "/harw.slice/harw-job-other-e1",
+                proof("job-1-e1", "/harw.slice"),
+            ),
+            // Prefix of the attested attempt is still another attempt.
+            (
+                "/harw.slice/harw-job-job-1-e1",
+                proof("job-1-e10", "/harw.slice"),
+            ),
+            // Root is not the direct parent.
+            ("/harw.slice/x/harw-job-a", proof("a", "/harw.slice")),
+            ("/harw.slice/harw-job-a", proof("a", "/other.slice")),
+            (
+                "/harw.slice/harw-job-a",
+                proof("a", "/harw.slice/harw-job-a"),
+            ),
+            // The hierarchy root is never a delegated root.
+            ("/harw-job-a", proof("a", "/")),
+            ("/harw-job-a", proof("a", CGROUP_MOUNT)),
+            // Malformed proofs or paths.
+            ("/harw.slice/harw-job-", proof("", "/harw.slice")),
+            ("/harw.slice/harw-job-a", proof("a", "harw.slice")),
+            ("/harw.slice/../harw-job-a", proof("a", "/harw.slice/..")),
+            ("/harw.slice//harw-job-a", proof("a", "/harw.slice/")),
+            ("/harw.slice/harw-job-a/leaf", proof("a", "/harw.slice")),
+        ];
+        for (path, proof) in cases {
+            let status = status_with_cgroup(path, Some(proof.clone()))?;
+            assert_eq!(status.job_cgroup_path(), None, "{path:?} {proof:?}");
+        }
+        Ok(())
+    }
+
+    /// PR #154 review (E4): the genuine case — the leaf is
+    /// `harw-job-<attested attempt>` directly beneath the attested delegated
+    /// root (mount-point spelling tolerated) — is the job's cgroup, and the
+    /// proof survives a `meta.json` round trip.
+    #[test]
+    fn test_proven_dedicated_cgroup_is_the_job_cgroup() -> TestResult {
+        let cases = [
+            (
+                "/harw.slice/harw-job-job-1-e1",
+                proof("job-1-e1", "/harw.slice"),
+            ),
+            (
+                "/app.slice/harw.slice/harw-job-job_1.x-e2",
+                proof("job:1.x-e2", "/sys/fs/cgroup/app.slice/harw.slice"),
+            ),
+        ];
+        for (path, proof) in cases {
+            let status = status_with_cgroup(path, Some(proof))?;
+            assert_eq!(status.job_cgroup_path(), Some(path), "{path:?}");
+            let json = serde_json::to_string(&status.meta).map_err(ctx("serialize"))?;
+            let back: JobMeta = serde_json::from_str(&json).map_err(ctx("parse back"))?;
+            assert_eq!(back, status.meta);
+        }
+        Ok(())
+    }
+
+    /// PR #154 review (E4): a proof is bound to its job. The same attested
+    /// proof copied into another job's record (two jobs sharing one cgroup
+    /// path and proof) is not attributed to that other job.
+    #[test]
+    fn test_proof_shared_by_two_jobs_only_counts_for_its_own_job() -> TestResult {
+        let path = "/harw.slice/harw-job-job-1-e1";
+        let shared = proof("job-1-e1", "/harw.slice");
+        let own = status_with_cgroup(path, Some(shared.clone()))?;
+        assert_eq!(own.job_cgroup_path(), Some(path));
+        let mut other = status_with_cgroup(path, Some(shared))?;
+        other.meta.job_id = JobId("job-2".to_owned());
+        assert_eq!(other.cgroup_path(), Some(path));
+        assert_eq!(other.job_cgroup_path(), None);
+        // An unbound proof (no job id) still loads but never attributes.
+        let raw = v1_json(
+            r#""identity":{"start_ticks":5,"cgroup_path":"/harw.slice/harw-job-a",
+                "dedicated_cgroup":{"attempt_id":"a","delegated_root":"/harw.slice"}},"#,
+        );
+        let meta: JobMeta = serde_json::from_str(&raw).map_err(ctx("parse unbound"))?;
+        let unbound = JobStatus { meta, ..own };
+        assert_eq!(unbound.cgroup_path(), Some("/harw.slice/harw-job-a"));
+        assert_eq!(unbound.job_cgroup_path(), None);
+        Ok(())
+    }
+
     /// Control bytes in `meta.json` arrive as JSON escapes; they decode to
-    /// the real bytes (consumers sanitize them) and never make a leaf a job
-    /// cgroup.
+    /// the real bytes (consumers sanitize them); without a proof the path is
+    /// never the job's cgroup.
     #[test]
     fn test_escaped_control_bytes_decode_in_origin_and_cgroup() -> TestResult {
         let raw = v1_json(
@@ -890,10 +1088,8 @@ mod tests {
             last_lines: Vec::new(),
             log_dir: PathBuf::new(),
         };
-        assert_eq!(
-            status.job_cgroup_path(),
-            Some("/harw\u{7}.slice/harw-job-3")
-        );
+        assert_eq!(status.cgroup_path(), Some("/harw\u{7}.slice/harw-job-3"));
+        assert_eq!(status.job_cgroup_path(), None);
         Ok(())
     }
 
@@ -918,6 +1114,7 @@ mod tests {
                 start_ticks: 777,
                 executable: None,
                 cgroup_path: None,
+                dedicated_cgroup: None,
             })
         );
         let without: JobMeta =
@@ -934,6 +1131,7 @@ mod tests {
             start_ticks: 2,
             executable: Some("/usr/bin/sleep".to_owned()),
             cgroup_path: Some("/user.slice".to_owned()),
+            dedicated_cgroup: None,
         };
         meta.version = META_VERSION;
         meta.identity = Some(identity.clone());
