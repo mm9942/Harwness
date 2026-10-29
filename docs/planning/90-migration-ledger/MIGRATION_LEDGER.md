@@ -366,7 +366,7 @@
 
 **Planning compartment:** `docs/planning/97-harw-dod-mission-control-chain` (§3.4, §4 E1–E5, §8.2), `docs/planning/90-intent-driven-composed-agents/07-coding-cycles-orchestration-plan.md` (PR #153 contract)
 **Baseline commit:** `dev@fcb12b41`
-**Implementation commit / PR:** draft PR #154: E1a `2cfd4e7a`, E1b `a07f7f6f`, E2a `0922d70e`, E2c `08aaecd8`, E2d `93471a44`, E2b `05d2d5b7`, E3b `1b63871c`, E3c `a214d590`, E2e + E3 + E5 `f31d639f`; E2f (RLIMIT_NPROC through `ResourceRequest` and the trampoline) `7b9e23e3`; E2g (RLIMIT_NPROC refused or reported not enforced for an exempt uid 0 / `CAP_SYS_ADMIN` / `CAP_SYS_RESOURCE` identity unless `pids.max` covers it) in the PR #154 review-fix commit
+**Implementation commit / PR:** draft PR #154: E1a `2cfd4e7a`, E1b `a07f7f6f`, E2a `0922d70e`, E2c `08aaecd8`, E2d `93471a44`, E2b `05d2d5b7`, E3b `1b63871c`, E3c `a214d590`, E2e + E3 + E5 `f31d639f`; E2f (RLIMIT_NPROC through `ResourceRequest` and the trampoline) `7b9e23e3`; E2g (RLIMIT_NPROC refused or reported not enforced for an exempt uid 0 / `CAP_SYS_ADMIN` / `CAP_SYS_RESOURCE` identity unless `pids.max` covers it) `97804cbb`
 **Affected crates:** `harw-job-exec`, `harw-job-linux`, `harw-job-core`, `harw-job-runtime`, `harw-job-executor-{bwrap,oci,k8s,darwin}`, `harw-command`, `harw-sandbox`, `harw-tool-shell`, `harw-tool-job`, `harw-agent-runner`, `harw-config`, `harw-install`, `harw-dod-client`, `harw-cli`, `dod/crates/{harw-dod-bpf,harw-probe-bpf}`
 
 **Before:** bwrap, the Landlock trampoline and cgroups were alternative backends; `shell.exec` ran a `prlimit … -- bwrap …` argv as an unsandboxed host job; the probe always attached with host scope.
