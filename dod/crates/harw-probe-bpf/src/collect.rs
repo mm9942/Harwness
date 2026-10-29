@@ -19,9 +19,17 @@
 //!   Verlustzähler der Ladeschicht ab. [`unload_all`] entfernt beim
 //!   kontrollierten Stopp alle Griffe wieder.
 //!
+//! - **Scope-Rescan (PL-97 E3b).** [`rescan_scope_once`] führt einen fälligen
+//!   [`crate::scope_rescan::ScopeRescan`] über alle Griffe aller Quellen aus
+//!   (neue Nachfahren-cgroups einfügen, verschwundene zurückziehen) und
+//!   meldet einen neu degradierten Scope (Map voll, unvollständiger Walk,
+//!   abgelehnte Map-Aktualisierung) mit genau einem `SensorDegraded` je
+//!   Sensor.
+//!
 //! Die Schleife selbst lebt nicht hier: `main::collect_forever` ruft je
-//! Runde [`run_once`] und [`drain_wire_once`] auf, entscheidet über
-//! vorübergehende Fehler und liest die Systemuhr (Kompositionswurzel).
+//! Runde [`run_once`], [`rescan_scope_once`] und [`drain_wire_once`] auf,
+//! entscheidet über vorübergehende Fehler und liest die Systemuhr
+//! (Kompositionswurzel).
 //!
 //! # Zeitbudget einer Wire-Runde
 //! [`WIRE_ROUND_BUDGET`] (200 ms, dieselbe Wartezeit wie
@@ -105,7 +113,7 @@
 //!
 //! # Exportierte Typen
 //! [`run_once`], [`WireSource`], [`WIRE_ROUND_BUDGET`],
-//! [`drain_wire_once`], [`unload_all`].
+//! [`drain_wire_once`], [`rescan_scope_once`], [`unload_all`].
 //!
 //! # Nebenläufigkeit
 //! [`run_once`] hat keine innere Veränderlichkeit.
@@ -127,11 +135,12 @@
 //! ```
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use harw_authority::NetworkScope;
 use harw_dod_bpf::{
-    BpfHandle, BpfLossCounters, KernelTimeMapper, RealBpfLoader, TimedWireEvent, WireEventType,
+    BpfHandle, BpfLossCounters, BpfScopeWriter, KernelTimeMapper, RealBpfLoader, TimedWireEvent,
+    WireEventType,
 };
 use harw_dod_flow::{Direction, FlowEvent, Protocol};
 use harw_dod_procmon::ExecutablePathCapture;
@@ -140,6 +149,7 @@ use harw_types::{ContentDigest, SensorId};
 use jiff::Timestamp;
 
 use crate::error::ProbeError;
+use crate::scope_rescan::ScopeRescan;
 use crate::sink::EventSink;
 
 /// Führt eine einzelne Erfassungsrunde über alle übergebenen Sensoren aus.
@@ -500,9 +510,26 @@ fn per_handle_timeout(budget: Duration, handle_count: usize) -> Duration {
 /// # Returns
 /// Die zu sendenden Meldungen.
 fn degraded_events(rounds: &[(&SensorId, SensorRound)], now: Timestamp) -> Vec<SecurityEvent> {
+    let affected: Vec<&SensorId> = rounds
+        .iter()
+        .filter(|(_, round)| round.is_degraded())
+        .map(|(sensor, _)| *sensor)
+        .collect();
+    sensor_degraded_events(&affected, now)
+}
+
+/// Baut genau ein `EventKind::SensorDegraded` je verschiedener `SensorId`.
+///
+/// # Arguments
+/// - `sensors` (`&[&SensorId]`): betroffene Sensoren, Dubletten erlaubt.
+/// - `now` (`Timestamp`): `observed_at` der Meldungen.
+///
+/// # Returns
+/// Die Meldungen in Reihenfolge des ersten Auftretens.
+fn sensor_degraded_events(sensors: &[&SensorId], now: Timestamp) -> Vec<SecurityEvent> {
     let mut affected: Vec<&SensorId> = Vec::new();
-    for (sensor, round) in rounds {
-        if round.is_degraded() && !affected.contains(sensor) {
+    for sensor in sensors {
+        if !affected.contains(sensor) {
             affected.push(*sensor);
         }
     }
@@ -630,6 +657,65 @@ pub fn drain_wire_once(
     Ok(sent)
 }
 
+/// Führt einen fälligen Scope-Rescan über alle Griffe aller Quellen aus.
+///
+/// # Description
+/// Alle Quellen wurden mit demselben Scope geladen (so baut sie `main`);
+/// dieselbe [`harw_dod_bpf::ScopeDelta`] geht deshalb an jeden Griff (siehe
+/// [`ScopeRescan::rescan`]). Wird der Scope in dieser Runde neu degradiert
+/// (siehe [`crate::scope_rescan::RescanRound::newly_degraded`]), meldet
+/// diese Funktion genau ein `EventKind::SensorDegraded` je Sensor: eine
+/// cgroup, die nicht in die Map passt, fehlt Prozessstart- und
+/// Verbindungssensor gleichermaßen. Ein andauernder Zustand wird nicht in
+/// jeder Runde erneut gemeldet; Log-Zeile und Zähler führt
+/// [`ScopeRescan`] selbst.
+///
+/// # Arguments
+/// - `rescan` (`&mut ScopeRescan`): der Rescan-Zustand.
+/// - `writer` (`&dyn BpfScopeWriter`): der Lader, der alle Griffe geladen hat.
+/// - `sources` (`&[WireSource]`): die geladenen Quellen.
+/// - `sink` (`&dyn EventSink`): Ziel der Degradierungsmeldungen.
+/// - `now` (`Instant`): injizierte monotone Zeit für die Fälligkeit.
+///
+/// # Returns
+/// Die Anzahl der gesendeten Meldungen (0, wenn kein Rescan fällig war oder
+/// der Scope nicht neu degradiert wurde).
+///
+/// # Errors
+/// Der Fehler von [`EventSink::send`]. Walk- und Map-Fehler sind keine
+/// Fehler dieser Funktion, sondern Degradierung.
+pub fn rescan_scope_once(
+    rescan: &mut ScopeRescan,
+    writer: &dyn BpfScopeWriter,
+    sources: &[WireSource],
+    sink: &dyn EventSink,
+    now: Instant,
+) -> Result<usize, ProbeError> {
+    let handles: Vec<&BpfHandle> = sources
+        .iter()
+        .flat_map(|source| source.handles.iter())
+        .collect();
+    let Some(round) = rescan.rescan_if_due(writer, &handles, now) else {
+        return Ok(0);
+    };
+    if !round.newly_degraded {
+        return Ok(0);
+    }
+    let sensors: Vec<&SensorId> = sources.iter().map(|source| &source.sensor).collect();
+    tracing::debug!(
+        sensors = sensors.len(),
+        overflowed = round.health.overflowed,
+        planned_inserts = round.delta.insert.len(),
+        "reporting the degraded bpf cgroup scope to the sentinel"
+    );
+    let mut sent = 0usize;
+    for event in sensor_degraded_events(&sensors, Timestamp::now()) {
+        sink.send(&event)?;
+        sent += 1;
+    }
+    Ok(sent)
+}
+
 /// Entfernt alle Griffe aller Quellen aus dem Lader.
 ///
 /// # Description
@@ -723,6 +809,84 @@ mod tests {
                 argv_digest: ContentDigest::of(b"unused in this test"),
             },
         }
+    }
+
+    /// Ein voller Scope (Kapazität = nur die Wurzel) meldet beim ersten
+    /// fälligen Rescan genau ein `SensorDegraded` je Sensor, danach nicht
+    /// erneut, solange der Zustand andauert.
+    #[test]
+    fn test_rescan_scope_once_reports_a_newly_degraded_scope_once_per_sensor() -> TestResult {
+        use harw_dod_bpf::cgroup_walk::{HostCgroupFs, WalkLimits, host_path, resolve_cgroup};
+        use harw_dod_bpf::{BpfProgramSource, DescendantScope, FixtureBpfLoader};
+        use std::borrow::Cow;
+        use std::time::Instant;
+
+        use super::{WireSource, rescan_scope_once};
+        use crate::scope_rescan::{SCOPE_RESCAN_INTERVAL, ScopeRescan};
+
+        let tree = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir_all(host_path(tree.path(), "/harw.slice")).map_err(ctx("fake root"))?;
+        let root = resolve_cgroup(&HostCgroupFs, tree.path(), "/harw.slice")
+            .map_err(ctx("resolve root"))?;
+        let scope = DescendantScope::new(vec![root], 1).map_err(ctx("scope"))?;
+
+        let loader = FixtureBpfLoader::new(Vec::new());
+        let source = || BpfProgramSource::Embedded(Cow::Borrowed(b"ELF".as_slice()));
+        let mut sources = Vec::new();
+        for sensor in ["probe-bpf-procmon-0", "probe-bpf-flow-0"] {
+            let handles = harw_dod_procmon::procmon_contracts(
+                SensorId::from_str(sensor),
+                source(),
+                source(),
+                scope.bpf_scope(),
+            )
+            .iter()
+            .map(|contract| loader.load_contract(contract))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ctx("fixture loads the contracts"))?;
+            sources.push(WireSource::new(SensorId::from_str(sensor), handles, None));
+        }
+        let start = Instant::now();
+        let mut rescan = ScopeRescan::new(
+            scope,
+            tree.path().to_path_buf(),
+            SCOPE_RESCAN_INTERVAL,
+            WalkLimits::default(),
+            start,
+        );
+        std::fs::create_dir_all(host_path(tree.path(), "/harw.slice/harw-job-1"))
+            .map_err(ctx("new job cgroup"))?;
+
+        let sink = RecordingSink::default();
+        let not_due = rescan_scope_once(&mut rescan, &loader, &sources, &sink, start)
+            .map_err(ctx("not due"))?;
+        assert_eq!(not_due, 0);
+        let due = start + SCOPE_RESCAN_INTERVAL;
+        let sent = rescan_scope_once(&mut rescan, &loader, &sources, &sink, due)
+            .map_err(ctx("due rescan"))?;
+        assert_eq!(sent, 2);
+        let again = rescan_scope_once(&mut rescan, &loader, &sources, &sink, due)
+            .map_err(ctx("not due again"))?;
+        assert_eq!(again, 0);
+        let later = due + SCOPE_RESCAN_INTERVAL;
+        let persisting = rescan_scope_once(&mut rescan, &loader, &sources, &sink, later)
+            .map_err(ctx("persisting overflow"))?;
+        assert_eq!(persisting, 0);
+
+        let sent = sink
+            .sent
+            .lock()
+            .map_err(|_| TestError::Unexpected("recording sink poisoned".into()))?
+            .clone();
+        let degraded: Vec<&str> = sent
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::SensorDegraded { sensor } => Some(sensor.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(degraded, vec!["probe-bpf-procmon-0", "probe-bpf-flow-0"]);
+        Ok(())
     }
 
     #[test]

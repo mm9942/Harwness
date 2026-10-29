@@ -120,6 +120,41 @@
 //! geladenen Griffe werden als [`collect::WireSource`] von
 //! [`collect::drain_wire_once`] gelesen (v1-Wire-Ereignisse, Verlustzähler).
 //!
+//! # Dynamischer cgroup-Scope (PL-97 E3b): Mechanismus gelandet, nicht verdrahtet
+//! Der Userspace-Mechanismus steht: ein Profil mit `scope = "cgroups"` und
+//! `include_descendants = true` würde seine Wurzeln vor dem Anheften in die
+//! `SCOPE_CGROUP_IDS`-Map expandieren und sie danach über
+//! [`scope_rescan::ScopeRescan`] aktuell halten: alle
+//! [`scope_rescan::SCOPE_RESCAN_INTERVAL`] (2 s) werden die Wurzeln unter
+//! `--cgroup-root` neu durchlaufen, neue Nachfahren eingefügt, verschwundene
+//! zurückgezogen ([`collect::rescan_scope_once`]).
+//!
+//! **Zur Laufzeit ändert das heute nichts.** Diese Sonde löst das aktive
+//! Profil noch nicht auf: [`profile_descendant_scope`] liefert immer `None`,
+//! jeder Sensor lädt mit `BpfScope::Host`, der Rescan läuft nie, und
+//! `--config`/`--cgroup-root` werden geparst, aber nicht gelesen. Das Ziel
+//! von E3b (cgroups, die nach dem Anheften entstehen, werden beobachtet) ist
+//! erst mit zwei blockierenden Folgeschritten erreicht (eigenes Folge-WP):
+//! 1. Profil auflösen: `harw_dod_config::load_config` bzw.
+//!    `load_system_config` und `resolve_active` (die Abhängigkeit besteht
+//!    schon), vor Landlock `cgroup_walk::resolve_cgroup` +
+//!    `walk_descendants` + `DescendantScope::plan`/`commit`, Sensoren und
+//!    Egress-CIDRs aus dem Profil wählen und den Scope aus
+//!    [`profile_descendant_scope`] zurückgeben.
+//! 2. `--cgroup-root` als nur lesende Landlock-Wurzel aufnehmen, nur bei
+//!    aktivem cgroup-Profil, mit einem Privilegien-/Landlock-Test für die
+//!    neue Wurzel. Das ist eine für den Betreiber sichtbare Änderung am
+//!    Regelsatz dieser Sonde (keine neue Fähigkeit) und braucht eine
+//!    ausdrückliche Freigabe. Ohne sie bekommt jeder Rescan nach
+//!    `restrict_self` `EACCES` beim Verzeichnislesen ([`KERNEL_INTERFACE_ROOTS`]
+//!    enthält den cgroup2-Mount nicht): jede Runde ist unvollständig und
+//!    degradiert, neue cgroups werden nie aufgenommen (es wird aber auch nie
+//!    fälschlich etwas zurückgezogen).
+//!
+//! Getrennt davon bleibt der kernelseitige Vorfahrenabgleich
+//! (`bpf_get_current_ancestor_cgroup_id` unter `dod/bpf/`) ein eigener
+//! Folgeschritt; er schlösse das Fenster bis zum nächsten Rescan.
+//!
 //! Degradierung statt Prozessende, je Sensor unabhängig:
 //! - fehlt ein Objekt oder ist es ungültig, registriert [`run`] einen
 //!   [`sensors::UnavailableSensor`] mit der Mängelliste;
@@ -162,6 +197,7 @@ mod collect;
 mod error;
 mod landlock;
 mod real_loader;
+mod scope_rescan;
 mod sensors;
 mod sink;
 
@@ -171,11 +207,15 @@ mod push_only_guard;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Instant;
 
 use clap::Parser as _;
 use harw_authority::{EgressTarget, NetworkScope};
 use harw_completions::CompletionsSubcommand;
-use harw_dod_bpf::{BpfError, BpfObjectContract, BpfProgramSource, BpfScope, RealBpfLoader};
+use harw_dod_bpf::cgroup_walk::WalkLimits;
+use harw_dod_bpf::{
+    BpfError, BpfObjectContract, BpfProgramSource, BpfScope, DescendantScope, RealBpfLoader,
+};
 use harw_dod_cap::Permanence;
 use harw_dod_signals::Sensor;
 use harw_types::SensorId;
@@ -184,6 +224,7 @@ use jiff::Timestamp;
 use cli::{Cli, LogLevel};
 use collect::WireSource;
 use error::ProbeError;
+use scope_rescan::{SCOPE_RESCAN_INTERVAL, ScopeRescan};
 use sensors::{ObjectUnavailable, ResolvedBpfObject, UnavailableSensor};
 use sink::EventSink;
 
@@ -381,6 +422,13 @@ fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
         cli.tcp_v6_program_path.as_deref(),
     );
 
+    // Scope vor Landlock festlegen: die Expansion eines Nachfahren-Scopes
+    // liest den cgroup-Baum. Ohne Nachfahren-Scope gilt der Host-Scope.
+    let descendant_scope = profile_descendant_scope();
+    let scope = descendant_scope
+        .as_ref()
+        .map_or(BpfScope::Host, DescendantScope::bpf_scope);
+
     landlock::enforce_fs_scope(&fs_scope_roots())?;
 
     let loader = real_loader::build_real_loader()?;
@@ -391,9 +439,7 @@ fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
         &loader,
         SensorId::from_str(cli.sensor_id_procmon.clone()),
         procmon_objects,
-        |sensor, exec, exit| {
-            harw_dod_procmon::procmon_contracts(sensor, exec, exit, BpfScope::Host)
-        },
+        |sensor, exec, exit| harw_dod_procmon::procmon_contracts(sensor, exec, exit, scope.clone()),
         None,
     )?
     .register(&mut degraded, &mut sources);
@@ -403,7 +449,7 @@ fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
         SensorId::from_str(cli.sensor_id_flow.clone()),
         flow_objects,
         |sensor, tcp_v4, tcp_v6| {
-            harw_dod_flow::flow_contracts(sensor, tcp_v4, tcp_v6, BpfScope::Host)
+            harw_dod_flow::flow_contracts(sensor, tcp_v4, tcp_v6, scope.clone())
         },
         Some(network_scope(&[])),
     );
@@ -422,10 +468,45 @@ fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
         "sensors registered"
     );
 
-    let result = collect_forever(&loader, &degraded, &sources, sink.as_ref());
+    let mut rescan = descendant_scope.map(|scope| {
+        ScopeRescan::new(
+            scope,
+            cli.cgroup_root.clone(),
+            SCOPE_RESCAN_INTERVAL,
+            WalkLimits::default(),
+            Instant::now(),
+        )
+    });
+    let result = collect_forever(&loader, &degraded, &sources, sink.as_ref(), rescan.as_mut());
     collect::unload_all(&loader, &sources);
     tracing::info!("bpf objects unloaded after the collect loop ended");
     result
+}
+
+/// The dynamic descendant scope of the active profile, if it has one.
+///
+/// # Description
+/// Not wired yet (PL-97 E3b landed the mechanism only, see the module docs,
+/// section "Dynamischer cgroup-Scope"): this probe does not resolve the
+/// active DoD profile, `--config` and `--cgroup-root` are parsed but never
+/// read, and every sensor is loaded with `BpfScope::Host`. A host scope has
+/// nothing to rescan, so this returns `None` and [`collect_forever`] runs
+/// without [`scope_rescan::ScopeRescan`].
+///
+/// The follow-up has two blocking steps: (1) resolve the profile here
+/// (`harw_dod_config::load_config`/`load_system_config` + `resolve_active`)
+/// and, for `scope = "cgroups"` with `include_descendants = true`, resolve
+/// the roots (`harw_dod_bpf::cgroup_walk::resolve_cgroup`) and expand them
+/// (`walk_descendants` + `DescendantScope::plan`/`commit`) before Landlock is
+/// enforced, then return the result; (2) add `--cgroup-root` as a
+/// read-only Landlock root (owner-visible ruleset change, needs explicit
+/// sign-off), otherwise every rescan after `restrict_self` is incomplete
+/// (`EACCES`) and reported as degraded.
+///
+/// # Returns
+/// Always `None` today.
+fn profile_descendant_scope() -> Option<DescendantScope> {
+    None
 }
 
 /// Ergebnis des Aufbaus eines Sensors: geladen oder degradiert.
@@ -560,6 +641,9 @@ fn degrades_sensor(err: &BpfError) -> bool {
 /// - `degraded` (`&[Arc<dyn Sensor>]`): die degradierten Sensoren.
 /// - `sources` (`&[WireSource]`): die geladenen Quellen.
 /// - `sink` (`&dyn EventSink`): die Senke zum Sentinel.
+/// - `rescan` (`Option<&mut ScopeRescan>`): der Rescan eines
+///   Nachfahren-Scopes; je Runde vor dem Leeren der Ringpuffer bedient,
+///   sobald er fällig ist ([`collect::rescan_scope_once`]).
 ///
 /// # Returns
 /// `Ok(())` nur, wenn beide Listen leer sind (dann gibt es nichts zu
@@ -573,6 +657,7 @@ fn collect_forever(
     degraded: &[Arc<dyn Sensor>],
     sources: &[WireSource],
     sink: &dyn EventSink,
+    mut rescan: Option<&mut ScopeRescan>,
 ) -> Result<(), ProbeError> {
     if degraded.is_empty() && sources.is_empty() {
         tracing::warn!("no bpf sensor registered; nothing to collect");
@@ -583,6 +668,15 @@ fn collect_forever(
             retry_transient(collect::run_once(degraded, sink, Timestamp::now()))?;
         }
         if !sources.is_empty() {
+            if let Some(rescan) = rescan.as_deref_mut() {
+                retry_transient(collect::rescan_scope_once(
+                    rescan,
+                    loader,
+                    sources,
+                    sink,
+                    Instant::now(),
+                ))?;
+            }
             retry_transient(collect::drain_wire_once(loader, sources, sink))?;
         }
     }

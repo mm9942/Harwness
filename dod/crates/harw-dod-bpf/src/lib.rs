@@ -108,6 +108,10 @@
 //! [`error::BpfError`], [`error::BpfResult`], [`fixture::FixtureBpfLoader`],
 //! [`real::RealBpfLoader`], [`REQUIRED_CAPABILITY`].
 //!
+//! Dynamic cgroup scope (PL-97 E3b): [`BpfScopeWriter`],
+//! [`DescendantScope`], [`ScopeDelta`], [`ScopeObservation`] and the bounded,
+//! symlink-free walk in [`cgroup_walk`].
+//!
 //! # Nebenläufigkeit
 //! [`BpfLoader`] ist `Send + Sync`; ein Sentinel hält Lader hinter `Arc`.
 //! Alle Datentypen sind reine Werte ohne innere Veränderlichkeit.
@@ -142,6 +146,7 @@
 //! ```
 
 pub mod abi;
+pub mod cgroup_walk;
 pub mod contract;
 pub mod error;
 pub mod event;
@@ -164,10 +169,13 @@ pub use contract::{
 };
 pub use error::BpfError;
 pub use event::RawBpfEvent;
-pub use fixture::FixtureBpfLoader;
+pub use fixture::{FixtureBpfLoader, ScopeMapOp};
 pub use handle::BpfHandle;
-pub use loader::BpfLoader;
-pub use profile::{BpfScope, MAX_SCOPE_CGROUP_IDS, ResolvedCgroup};
+pub use loader::{BpfLoader, BpfScopeWriter};
+pub use profile::{
+    BpfScope, DescendantScope, DescendantScopeStats, MAX_SCOPE_CGROUP_IDS, ResolvedCgroup,
+    ScopeDelta, ScopeObservation, ScopePlan,
+};
 pub use real::{BpfLossCounters, RealBpfLoader, TimedWireEvent};
 pub use spec::{BpfProgramKind, BpfProgramSource, BpfProgramSpec};
 pub use time::{KernelTimeMapper, TimeConfidence};
