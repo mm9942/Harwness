@@ -1566,12 +1566,13 @@ fn split_at_soft_breaks(word: &str, col_width: usize) -> Vec<String> {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
 
-    // Tokenisieren: jedes Token endet an einem Trennzeichen (Trenner inklusive).
+    // Break after the complete original grapheme containing a separator,
+    // including any combining marks attached to that separator.
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
-    for ch in word.chars() {
-        current.push(ch);
-        if matches!(ch, '/' | '·' | '_') {
+    for grapheme in word.graphemes(true) {
+        current.push_str(grapheme);
+        if matches!(grapheme.chars().next(), Some('/' | '·' | '_')) {
             tokens.push(std::mem::take(&mut current));
         }
     }
@@ -2970,10 +2971,22 @@ impl ToolCell {
         verbosity: ToolVerbosity,
         expanded_flag: bool,
     ) -> Vec<Line<'static>> {
-        let label = self
-            .live_label
-            .as_ref()
-            .map(ToolLabelPresentation::render)
+        self.render_lines_with_label(width, theme, verbosity, expanded_flag, None)
+    }
+
+    /// A live projection can own its title after the underlying call completes.
+    /// Override only the rendered label; the child keeps its historical data.
+    fn render_lines_with_label(
+        &self,
+        width: u16,
+        theme: style::Theme,
+        verbosity: ToolVerbosity,
+        expanded_flag: bool,
+        label_override: Option<&str>,
+    ) -> Vec<Line<'static>> {
+        let label = label_override
+            .map(str::to_owned)
+            .or_else(|| self.live_label.as_ref().map(ToolLabelPresentation::render))
             .unwrap_or_else(|| self.label.clone());
         let verbose = matches!(verbosity, ToolVerbosity::Verbose);
         let expanded = expanded_flag || verbose;
@@ -3755,9 +3768,9 @@ impl ToolGroupCell {
 
     /// Rendert eine [`ToolGroupKind::Activity`]-Gruppe (PL-97 M3).
     ///
-    /// Mit höchstens einer Zelle unverändert diese Zelle (dieselben Zeilen
-    /// wie ohne Gruppe); sonst die kompakte Zeile aus dem Reducer-Stand,
-    /// ausgeklappt gefolgt von den einzelnen Aufrufen.
+    /// A sole child keeps its own layout and historical data; an active job
+    /// projection supplies its live title. Larger groups show the reducer
+    /// summary, followed by individual calls when expanded.
     fn activity_lines(
         &self,
         projection: &ActivityProjection,
@@ -3769,10 +3782,22 @@ impl ToolGroupCell {
         if self.cells.len() == 1
             && let Some(cell) = self.cells.first()
         {
+            let live_title = if self.has_live_presentation() {
+                projection
+                    .live_title
+                    .as_ref()
+                    .map(ToolLabelPresentation::render)
+            } else {
+                None
+            };
             return match cell.lock() {
-                Ok(guard) => {
-                    guard.render_lines(width, theme, verbosity, guard.expanded || expanded)
-                }
+                Ok(guard) => guard.render_lines_with_label(
+                    width,
+                    theme,
+                    verbosity,
+                    guard.expanded || expanded,
+                    live_title.as_deref(),
+                ),
                 Err(_) => vec![Line::from(Span::styled(
                     tr("tool_chrome.lock", "⚠ Tool cell unreadable (poisoned lock)"),
                     style::warning_style(theme),

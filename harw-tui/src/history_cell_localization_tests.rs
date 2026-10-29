@@ -301,3 +301,40 @@ fn plan_and_goal_owned_labels_keep_locale_and_fit_translated_widths() {
         assert_eq!(plan.nodes[0].status, PlanNodeStatus::Draft);
     }
 }
+
+#[test]
+fn soft_break_separators_keep_attached_combining_marks_on_original_graphemes() {
+    for separator in ['/', '·', '_'] {
+        let source = format!("abcdefg{separator}\u{301}z");
+        let boundaries = source
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .chain(std::iter::once(source.len()))
+            .collect::<Vec<_>>();
+        for width in [1, 2, 4, 8] {
+            let mut offset = 0;
+            for line in wrap_plain(&source, width) {
+                let value = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                assert!(
+                    boundaries.contains(&offset),
+                    "start inside grapheme: {source:?}/{width}/{offset}"
+                );
+                assert_eq!(
+                    source.get(offset..offset + value.len()),
+                    Some(value.as_str())
+                );
+                offset += value.len();
+                assert!(
+                    boundaries.contains(&offset),
+                    "end inside grapheme: {source:?}/{width}/{offset}"
+                );
+                assert!(UnicodeWidthStr::width(value.as_str()) <= usize::from(width));
+            }
+            assert_eq!(offset, source.len());
+        }
+    }
+}
