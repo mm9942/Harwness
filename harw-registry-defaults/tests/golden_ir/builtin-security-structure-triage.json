@@ -16,7 +16,11 @@
     "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
   },
   "tools": {
-    "admitted": [],
+    "admitted": [
+      "dod.status",
+      "dod.findings",
+      "dod.sensors"
+    ],
     "forbidden": [
       "fs.write",
       "fs.edit",
@@ -119,7 +123,11 @@
     "default_interface": "cli"
   },
   "permissions": {
-    "tools": [],
+    "tools": [
+      "dod.findings",
+      "dod.sensors",
+      "dod.status"
+    ],
     "forbidden_tools": [
       "fs.edit",
       "fs.write",
@@ -206,7 +214,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/security-structure-triage.toml",
-          "line": 122,
+          "line": 129,
           "column": 11
         },
         "path": "context.program"
@@ -215,6 +223,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "b0333820a21201129e231a0b8e0098fff1f46119017d83a5d5047e657da64859"
+    "digest": "c61e3b85eda9c8e113eb19594eba514d2fba9c7dab41be5aacb76f4ae3352205"
   }
 }

@@ -124,6 +124,14 @@ secrecy = "0.10.3"
 secrecy_08 = { package = "secrecy", version = "0.8" }
 serde_json = "1"
 harw-install = { path = "../harw-install" }
+# PL-97 D3: `harw dod …` (`src/dod_cmd.rs`) liest Harw-DoD über den lesenden
+# Client (Export, Health, Systemkonfiguration, `systemctl show`); die
+# Darstellung teilt es mit `/dod` (`harw_ops::dod`). Kein Pfad zu Warden oder
+# Eskalation (S1).
+harw-dod-client = { path = "../harw-dod-client" }
+# Zeitstempel der Harw-DoD-Exporte (`harw-dod-client` rechnet in
+# `time::OffsetDateTime`); Version wie dort gepinnt.
+time = "0.3.53"
 harw-model-catalog = { path = "../harw-model-catalog" }
 clap_complete = "4.6.7"
 harw-completions = { path = "../harw-completions", features = ["clap-args"] }

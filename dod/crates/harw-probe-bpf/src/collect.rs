@@ -24,7 +24,8 @@
 //!   (neue Nachfahren-cgroups einfügen, verschwundene zurückziehen) und
 //!   meldet einen neu degradierten Scope (Map voll, unvollständiger Walk,
 //!   abgelehnte Map-Aktualisierung) mit genau einem `SensorDegraded` je
-//!   Sensor.
+//!   Sensor; [`report_scope_degraded`] meldet einen schon beim Start
+//!   unvollständigen Scope (PL-97 E3c) auf dieselbe Weise.
 //!
 //! Die Schleife selbst lebt nicht hier: `main::collect_forever` ruft je
 //! Runde [`run_once`], [`rescan_scope_once`] und [`drain_wire_once`] auf,
@@ -113,7 +114,8 @@
 //!
 //! # Exportierte Typen
 //! [`run_once`], [`WireSource`], [`WIRE_ROUND_BUDGET`],
-//! [`drain_wire_once`], [`rescan_scope_once`], [`unload_all`].
+//! [`drain_wire_once`], [`rescan_scope_once`], [`report_scope_degraded`],
+//! [`unload_all`].
 //!
 //! # Nebenläufigkeit
 //! [`run_once`] hat keine innere Veränderlichkeit.
@@ -701,15 +703,43 @@ pub fn rescan_scope_once(
     if !round.newly_degraded {
         return Ok(0);
     }
-    let sensors: Vec<&SensorId> = sources.iter().map(|source| &source.sensor).collect();
     tracing::debug!(
-        sensors = sensors.len(),
+        sensors = sources.len(),
         overflowed = round.health.overflowed,
         planned_inserts = round.delta.insert.len(),
         "reporting the degraded bpf cgroup scope to the sentinel"
     );
+    report_scope_degraded(sources, sink, Timestamp::now())
+}
+
+/// Meldet einen unvollständig beobachteten cgroup-Scope an den Sentinel.
+///
+/// # Description
+/// Genau ein `EventKind::SensorDegraded` je verschiedener Sensorkennung der
+/// geladenen Quellen. `main::run` ruft das einmal direkt nach dem Anheften
+/// auf, wenn der Scope schon beim Start unvollständig ist (eine
+/// konfigurierte Wurzel fehlt, die Map ist voll, der Walk war
+/// unvollständig); [`rescan_scope_once`] nutzt es für einen später neu
+/// degradierten Scope.
+///
+/// # Arguments
+/// - `sources` (`&[WireSource]`): die geladenen Quellen.
+/// - `sink` (`&dyn EventSink`): Ziel der Meldungen.
+/// - `now` (`Timestamp`): `observed_at` der Meldungen.
+///
+/// # Returns
+/// Die Anzahl der gesendeten Meldungen.
+///
+/// # Errors
+/// Der Fehler von [`EventSink::send`].
+pub fn report_scope_degraded(
+    sources: &[WireSource],
+    sink: &dyn EventSink,
+    now: Timestamp,
+) -> Result<usize, ProbeError> {
+    let sensors: Vec<&SensorId> = sources.iter().map(|source| &source.sensor).collect();
     let mut sent = 0usize;
-    for event in sensor_degraded_events(&sensors, Timestamp::now()) {
+    for event in sensor_degraded_events(&sensors, now) {
         sink.send(&event)?;
         sent += 1;
     }

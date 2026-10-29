@@ -16,7 +16,11 @@
     "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
   },
   "tools": {
-    "admitted": [],
+    "admitted": [
+      "dod.status",
+      "dod.findings",
+      "dod.sensors"
+    ],
     "forbidden": [
       "fs.write",
       "fs.edit",
@@ -119,7 +123,11 @@
     "default_interface": "cli"
   },
   "permissions": {
-    "tools": [],
+    "tools": [
+      "dod.findings",
+      "dod.sensors",
+      "dod.status"
+    ],
     "forbidden_tools": [
       "fs.edit",
       "fs.write",
@@ -206,7 +214,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/security-egress-triage.toml",
-          "line": 130,
+          "line": 131,
           "column": 11
         },
         "path": "context.program"
@@ -215,6 +223,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "8d74bbd3c44739b594ea5acb867e1923b2f36d8755332b8e997d5823bd5f2485"
+    "digest": "88c6c8a65dc2fe458f2f1b8a017ecf46899b962c73a58b8af11ccc6f567cb78c"
   }
 }

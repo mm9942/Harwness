@@ -396,6 +396,15 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     "gateway.channels.connect_info",
     "gateway.health",
     "gateway.logs",
+    // PL-97 D3: die lesenden Harw-DoD-Werkzeuge (`profile::DOD_READ_TOOLS`,
+    // `model_tool(readonly, approval = "none")`, `harw-ops/src/dod.rs`). Sie
+    // lesen nur den begrenzten, bereinigten Export, den Health-Bericht, die
+    // Systemkonfiguration und `systemctl show`; nie DoD-Zustand schreibend,
+    // nie Warden oder Eskalation (S1). Die Triage-Rollen laufen mit
+    // `allow_pause = false` und könnten eine Rückfrage nie beantworten.
+    "dod.status",
+    "dod.findings",
+    "dod.sensors",
     // Bewusst entfernt (W1-05, Register F-014, G-003, G-004, F-043, G-068):
     // - `plan`, `goal`: deklarieren `model_tool(approval = "always")` und
     //   mutieren PlanStore bzw. Ziel; die Auto-Freigabe überstimmte die
@@ -1216,6 +1225,8 @@ mod tests {
         // WorkDriver-Worker (schreibt nur den eigenen Berichts-Slot).
         read_only_surface.extend_from_slice(crate::profile::GATEWAY_READ_TOOLS);
         read_only_surface.extend_from_slice(crate::profile::WORK_DRIVER_REPORT_TOOLS);
+        // PL-97 D3: die lesenden Harw-DoD-Werkzeuge (nur Lesen des Exports).
+        read_only_surface.extend_from_slice(crate::profile::DOD_READ_TOOLS);
         // harw-tool-tunnel-v1: die lesenden Tunnel-Werkzeuge stehen in
         // `AUTO_APPROVED_TOOLS` (Besitzprüfung im Tool selbst, `tunnel.stop`
         // beendet nur einen eigenen Tunnel), aber kein read-only Profil
@@ -1515,6 +1526,24 @@ mod tests {
             assert!(
                 DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
                 "{tool} darf nie auto-freigegeben sein"
+            );
+        }
+    }
+
+    /// PL-97 D3: die lesenden Harw-DoD-Werkzeuge laufen ohne Rückfrage und
+    /// stehen nie in `ALWAYS_ASK_TOOLS`.
+    #[test]
+    fn dod_read_tools_are_auto_approved_and_never_always_ask() {
+        assert_eq!(
+            crate::profile::DOD_READ_TOOLS,
+            ["dod.status", "dod.findings", "dod.sensors"]
+        );
+        for tool in crate::profile::DOD_READ_TOOLS {
+            assert!(AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+            assert!(
+                !DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                "{tool} muss ohne Rückfrage laufen"
             );
         }
     }

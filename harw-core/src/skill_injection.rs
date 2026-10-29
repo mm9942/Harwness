@@ -62,6 +62,12 @@
 //! is text and nothing else. Every delivery is reported as a
 //! [`DeliveredSkill`] for the session store's `injection` event.
 //!
+//! # Preview
+//! [`SkillInjector::preview`] runs the selection of a fresh session's first
+//! round over explicit [`SkillPreviewInput`]s instead of a history (PL-97 B3:
+//! `harw skill preview`, `/skills preview`): same settings, budget, index and
+//! framing as the turn loop, no model call, no session state.
+//!
 //! # Concurrency
 //! `Send + Sync`; the per-session state sits behind a `Mutex` that is never
 //! held across an `.await`.
@@ -676,6 +682,133 @@ impl SkillInjector {
     fn lock(&self) -> std::sync::MutexGuard<'_, InjectorState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Previews the first round of a fresh session for `input`
+    /// (`harw skill preview`, `/skills preview`, PL-97 B3) — without a model
+    /// call and without touching this injector's session state.
+    ///
+    /// # Description
+    /// The selection path of [`Self::prepare_round_with`] without an admit
+    /// predicate: the budget from [`SkillInjectionSettings::budget`],
+    /// [`harw_catalog::select`] over this injector's index (and its
+    /// `TriggerIndex`), provenance, trust and the fragment framing. A fresh
+    /// round never exceeds the section share (the selection is bounded by the
+    /// same per-round budget), so nothing is evicted. A session whose
+    /// `[skills] triggered_injection` is off delivers nothing; the preview
+    /// selects anyway and reports the switch in [`SkillPreview::enabled`].
+    ///
+    /// # Arguments
+    /// - `input`: the trigger inputs (see [`SkillPreviewInput`]).
+    /// - `window_tokens`: the model window (`0` = unknown, the per-round cap
+    ///   applies).
+    #[must_use]
+    pub fn preview(&self, input: &SkillPreviewInput, window_tokens: u64) -> SkillPreview {
+        let mut state = InjectorState::default();
+        let mut round = RoundInjection::default();
+        let events = input.events();
+        if !events.is_empty() {
+            self.select_into(
+                &mut state,
+                &events,
+                window_tokens,
+                &|_: &Fragment| true,
+                &mut round,
+            );
+        }
+        round.fragments = state
+            .active
+            .iter()
+            .map(|excerpt| excerpt.fragment.clone())
+            .collect();
+        SkillPreview {
+            enabled: self.settings.enabled,
+            budget: self.settings.budget(window_tokens),
+            round,
+        }
+    }
+}
+
+/// Trigger inputs of a selection preview ([`SkillInjector::preview`]): what
+/// the event feed of the turn loop would read from the history of a fresh
+/// session. Each field becomes the [`TriggerEvent`] the feed derives from the
+/// matching history item (see the module documentation); blank entries are
+/// ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillPreviewInput {
+    /// Text of a user message → [`TriggerEvent::TaskText`] (keywords, error
+    /// codes).
+    pub task: String,
+    /// Tools called for the first time → [`TriggerEvent::ToolFirstUse`].
+    pub tools: Vec<String>,
+    /// Text of tool results → [`TriggerEvent::ToolOutput`] (error codes,
+    /// e.g. `E0505`).
+    pub tool_output: Vec<String>,
+    /// Path arguments of `fs.*`/`doc.*` calls → [`TriggerEvent::PathTouched`].
+    pub paths: Vec<String>,
+    /// Command lines of `shell.*`/`process.*`/`job.start` calls →
+    /// [`TriggerEvent::Command`].
+    pub commands: Vec<String>,
+}
+
+impl SkillPreviewInput {
+    /// Whether no entry yields a trigger event (blank task text, every list
+    /// empty or blank).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events().is_empty()
+    }
+
+    /// The events of these inputs, framed like the history feed
+    /// ([`collect_events`]): tool output is scanned through [`result_text`]'s
+    /// head-and-tail window, a tool counts once.
+    fn events(&self) -> Vec<OwnedEvent> {
+        let mut events = Vec::new();
+        if !self.task.trim().is_empty() {
+            events.push(OwnedEvent::Task(self.task.clone()));
+        }
+        let mut seen_tools = BTreeSet::new();
+        for tool in &self.tools {
+            let tool = tool.trim();
+            if !tool.is_empty() && seen_tools.insert(tool) {
+                events.push(OwnedEvent::FirstUse(tool.to_owned()));
+            }
+        }
+        for text in &self.tool_output {
+            if !text.trim().is_empty() {
+                events.push(OwnedEvent::Output {
+                    tool: String::new(),
+                    text: head_and_tail(&[text.as_str()]),
+                });
+            }
+        }
+        for path in &self.paths {
+            if !path.trim().is_empty() {
+                events.push(OwnedEvent::Path(path.clone()));
+            }
+        }
+        for command in &self.commands {
+            if !command.trim().is_empty() {
+                events.push(OwnedEvent::Command(command.clone()));
+            }
+        }
+        events
+    }
+}
+
+/// Result of [`SkillInjector::preview`].
+#[derive(Debug, Clone, Default)]
+pub struct SkillPreview {
+    /// `[skills] triggered_injection`. `false`: a session delivers none of
+    /// this (the preview selects anyway).
+    pub enabled: bool,
+    /// The budget of the round, from the settings and the model window.
+    pub budget: InjectionBudget,
+    /// The round: [`RoundInjection::delivered`] is what the first round of a
+    /// fresh session delivers (in rank order), [`RoundInjection::dropped`]
+    /// the hits not selected with their typed reason,
+    /// [`RoundInjection::suppressed`] the imported skills withheld, and
+    /// [`RoundInjection::fragments`] the framed excerpts.
+    pub round: RoundInjection,
 }
 
 /// Start of the first read: the latest user message (or the start). Tools
@@ -931,3 +1064,246 @@ fn ceil_char_boundary(text: &str, min: usize) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+/// Parity of [`SkillInjector::preview`] with the first round of the turn
+/// loop (PL-97 B3).
+#[cfg(test)]
+mod preview_tests {
+    use std::sync::Arc;
+
+    use harw_catalog::{DropReason, SkillIndex, TriggerKind};
+    use harw_protocol::ToolCallResult;
+    use harw_types::ToolCallId;
+
+    use super::{SkillInjectionSettings, SkillInjector, SkillPreviewInput};
+    use crate::history::ConversationHistory;
+    use crate::test_support::{TestError, TestResult};
+
+    const BORROW_BODY: &str = "# Borrow\n\nIntro.\n\n## When to use\n\nWhenever the borrow checker complains.\n\n## Cause E0505\n\nThe value is still borrowed.\n\n## Fix\n\nOwn the value first.\n";
+    const BORROW_TRIGGERS: &str = "[triggers]\nerror_codes = [\"E0505\"]\npaths = [\"**/*.rs\"]\ncommands = [\"cargo test\"]\npriority = 70\n";
+    const LINT_BODY: &str = "# Lint\n\n## Clippy\n\nRun clippy with -D warnings and fix every lint before the commit.\n";
+    const LINT_TRIGGERS: &str =
+        "[triggers]\nkeywords = [\"clippy\"]\ntools = [\"shell.exec\"]\npriority = 40\n";
+
+    /// An index over an in-memory bundle: `(name, triggers.toml, body)`.
+    fn index_of(skills: &[(&str, &str, &str)]) -> Arc<SkillIndex> {
+        let mut files: Vec<(String, String)> = Vec::new();
+        for (name, triggers, body) in skills {
+            files.push((
+                format!("skills/{name}/skill.toml"),
+                format!("name = \"{name}\"\ndescription = \"Use when {name} matters.\"\n"),
+            ));
+            files.push((format!("skills/{name}/instructions.md"), (*body).to_owned()));
+            files.push((
+                format!("skills/{name}/triggers.toml"),
+                (*triggers).to_owned(),
+            ));
+        }
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect();
+        Arc::new(SkillIndex::build_with_bundle(&[], &refs))
+    }
+
+    fn two_skills() -> Arc<SkillIndex> {
+        index_of(&[
+            ("borrow", BORROW_TRIGGERS, BORROW_BODY),
+            ("lint", LINT_TRIGGERS, LINT_BODY),
+        ])
+    }
+
+    /// The history the preview inputs stand for: a user message, a `fs.read`
+    /// of `src/lib.rs`, a `shell.exec` of `cargo test` failing with E0505.
+    fn history() -> ConversationHistory {
+        let mut history = ConversationHistory::new();
+        history.push_user_text("cargo test fails, clippy too");
+        history.push_tool_call(
+            ToolCallId::from_str("c1"),
+            "fs.read",
+            serde_json::json!({ "path": "src/lib.rs" }),
+        );
+        history.push_tool_result(
+            ToolCallId::from_str("c1"),
+            ToolCallResult::success(serde_json::json!("fn main() {}")),
+            1,
+        );
+        history.push_tool_call(
+            ToolCallId::from_str("c2"),
+            "shell.exec",
+            serde_json::json!({ "command": "cargo test" }),
+        );
+        history.push_tool_result(
+            ToolCallId::from_str("c2"),
+            ToolCallResult::error("error[E0505]: cannot move out of `v`"),
+            1,
+        );
+        history
+    }
+
+    fn input() -> SkillPreviewInput {
+        SkillPreviewInput {
+            task: "cargo test fails, clippy too".to_owned(),
+            tools: vec!["fs.read".to_owned(), "shell.exec".to_owned()],
+            tool_output: vec![
+                "fn main() {}".to_owned(),
+                "error[E0505]: cannot move out of `v`".to_owned(),
+            ],
+            paths: vec!["src/lib.rs".to_owned()],
+            commands: vec!["cargo test".to_owned()],
+        }
+    }
+
+    fn assert_same_round(settings: SkillInjectionSettings, window_tokens: u64) -> TestResult {
+        let index = two_skills();
+        let turn = SkillInjector::new(Arc::clone(&index), settings)
+            .prepare_round(&history(), window_tokens);
+        let preview = SkillInjector::new(index, settings).preview(&input(), window_tokens);
+        assert_eq!(preview.round.delivered, turn.delivered);
+        assert_eq!(preview.round.dropped, turn.dropped);
+        assert_eq!(preview.round.suppressed, turn.suppressed);
+        let bodies = |fragments: &[harw_context::Fragment]| -> Vec<(String, String)> {
+            fragments
+                .iter()
+                .map(|fragment| (fragment.label.as_str().to_owned(), fragment.body.clone()))
+                .collect()
+        };
+        assert_eq!(bodies(&preview.round.fragments), bodies(&turn.fragments));
+        assert_eq!(preview.budget, settings.budget(window_tokens));
+        Ok(())
+    }
+
+    #[test]
+    fn preview_delivers_what_the_first_round_of_the_injector_delivers() -> TestResult {
+        assert_same_round(SkillInjectionSettings::default(), 0)?;
+        let preview = SkillInjector::new(two_skills(), SkillInjectionSettings::default())
+            .preview(&input(), 0);
+        let kinds: Vec<(&str, TriggerKind, &str)> = preview
+            .round
+            .delivered
+            .iter()
+            .map(|delivered| {
+                (
+                    delivered.skill.as_str(),
+                    delivered.kind,
+                    delivered.key.as_str(),
+                )
+            })
+            .collect();
+        // Rank order: priority 70 before 40; per skill the first reason
+        // (error code before command, path and keyword; tool before keyword).
+        assert_eq!(
+            kinds,
+            vec![
+                ("borrow", TriggerKind::ErrorCode, "E0505"),
+                ("lint", TriggerKind::Tool, "shell.exec"),
+            ]
+        );
+        assert!(preview.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn preview_reports_the_same_budget_drops_as_the_injector() -> TestResult {
+        // Room for one excerpt only: the lower-priority skill is dropped.
+        let settings = SkillInjectionSettings {
+            per_turn_cap_bytes: 260,
+            ..SkillInjectionSettings::default()
+        };
+        assert_same_round(settings, 0)?;
+        let preview = SkillInjector::new(two_skills(), settings).preview(&input(), 0);
+        let dropped = preview
+            .round
+            .dropped
+            .first()
+            .ok_or(TestError::Missing("dropped hit"))?;
+        assert_eq!(dropped.skill, "lint");
+        assert_eq!(dropped.reason, DropReason::TurnBudget);
+        Ok(())
+    }
+
+    /// The preview takes the trust class from the injector's own provenance,
+    /// like the turn loop (anything not known as bundled or from a trusted
+    /// layer is imported, PR #156): an imported skill is withheld without
+    /// `inject_imported` and delivered as evidence with it — in the preview
+    /// exactly as in the first round.
+    #[test]
+    fn preview_follows_the_injectors_provenance_for_imported_skills() -> TestResult {
+        for inject_imported in [false, true] {
+            let settings = SkillInjectionSettings {
+                inject_imported,
+                ..SkillInjectionSettings::default()
+            };
+            let injector =
+                || SkillInjector::new(two_skills(), settings).with_imported_skills(["lint"]);
+            let turn = injector().prepare_round(&history(), 0);
+            let preview = injector().preview(&input(), 0);
+            assert_eq!(preview.round.delivered, turn.delivered);
+            assert_eq!(preview.round.dropped, turn.dropped);
+            assert_eq!(preview.round.suppressed, turn.suppressed);
+            let lint = preview
+                .round
+                .delivered
+                .iter()
+                .find(|delivered| delivered.skill == "lint");
+            if inject_imported {
+                let lint = lint.ok_or(TestError::Missing("imported skill delivered"))?;
+                assert_eq!(lint.trust, harw_context::TrustClass::Evidence);
+            } else {
+                assert!(lint.is_none());
+                assert_eq!(preview.round.suppressed, vec!["lint".to_owned()]);
+            }
+            let borrow = preview
+                .round
+                .delivered
+                .iter()
+                .find(|delivered| delivered.skill == "borrow")
+                .ok_or(TestError::Missing("bundled skill delivered"))?;
+            assert_eq!(borrow.trust, harw_context::TrustClass::Instruction);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn preview_selects_even_when_injection_is_off() {
+        let settings = SkillInjectionSettings {
+            enabled: false,
+            ..SkillInjectionSettings::default()
+        };
+        let turn = SkillInjector::new(two_skills(), settings).prepare_round(&history(), 0);
+        assert!(turn.delivered.is_empty());
+        let preview = SkillInjector::new(two_skills(), settings).preview(&input(), 0);
+        assert!(!preview.enabled);
+        assert_eq!(preview.round.delivered.len(), 2);
+    }
+
+    #[test]
+    fn preview_leaves_the_session_state_untouched() {
+        let injector = SkillInjector::new(two_skills(), SkillInjectionSettings::default());
+        let preview = injector.preview(&input(), 0);
+        assert!(!preview.round.delivered.is_empty());
+        assert_eq!(injector.session_bytes(), 0);
+        assert_eq!(injector.active_count(), 0);
+        // The session still delivers on its first round.
+        assert_eq!(
+            injector.prepare_round(&history(), 0).delivered,
+            preview.round.delivered
+        );
+    }
+
+    #[test]
+    fn blank_preview_input_is_empty() {
+        assert!(SkillPreviewInput::default().is_empty());
+        let blank = SkillPreviewInput {
+            task: "  ".to_owned(),
+            tools: vec![String::new()],
+            ..SkillPreviewInput::default()
+        };
+        assert!(blank.is_empty());
+        let task = SkillPreviewInput {
+            task: "x".to_owned(),
+            ..SkillPreviewInput::default()
+        };
+        assert!(!task.is_empty());
+    }
+}

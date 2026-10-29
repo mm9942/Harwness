@@ -1410,8 +1410,9 @@ specialization = "fake-lead"
     fn builtin_manifests_stay_within_their_registry_profiles() -> TestResult {
         use crate::profile::{
             child_message_tools_for_role, child_result_tools_for_role, composition_tools_for_role,
-            job_control_tools_for_role, knowledge_tools_for_role, matrix_tools_for_role,
-            parent_message_tools_for_role, skill_catalog_tools_for_role, sudo_tools_for_role,
+            dod_tools_for_role, job_control_tools_for_role, knowledge_tools_for_role,
+            matrix_tools_for_role, parent_message_tools_for_role, skill_catalog_tools_for_role,
+            sudo_tools_for_role,
         };
         let builtin = builtin()?;
         assert_eq!(builtin.len(), role_names::ALL.len());
@@ -1433,7 +1434,22 @@ specialization = "fake-lead"
                 .collect();
             let granted = crate::authority::permissions_of(&surface);
             let manifest = &ir.permissions;
+            // PL-97 D3, offene Lücke (Eigentümer: Runtime): die Triage-Rollen
+            // admittieren die lesenden `dod.*`, aber `harw-runtime/src/
+            // children.rs` montiert sie noch nicht — sie zählen deshalb nicht
+            // zur Oberfläche. Ausdrückliche Ausnahme, die kein Recht trägt.
+            let unserved_dod = dod_tools_for_role(name);
+            assert!(
+                crate::authority::permissions_of(unserved_dod)
+                    .iter()
+                    .next()
+                    .is_none(),
+                "{name}: dod.* darf kein Sandbox-Recht tragen"
+            );
             for tool in &manifest.tools {
+                if unserved_dod.contains(&tool.as_str()) {
+                    continue;
+                }
                 assert!(
                     surface.contains(&tool.as_str()),
                     "{name}: Manifest-Werkzeug {tool} fehlt in {profile:?}"
