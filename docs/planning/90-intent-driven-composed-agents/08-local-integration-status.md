@@ -1,7 +1,9 @@
 # Local coding-cycle / PL-97 consolidation
 
 Status: **LOCAL INTEGRATION CANDIDATE — NOT RELEASE ACCEPTANCE** (2026-10-29).
-No upstream branch was rewritten and this consolidation has not been pushed.
+No upstream branch was rewritten. This consolidation is pushed to the draft
+integration PR #154 (merge `cae9486a`, via PR #160); it is not merged into
+`dev` and not release-accepted.
 
 ## Immutable inputs
 
@@ -128,7 +130,7 @@ explicitly returns `None`; production profile-to-cgroup resolution and the
 list-only cgroup-root Landlock mount are not wired by this patch. Passing fixture
 regressions is not proof of live BPF loading, kernel-map behavior, or an enabled
 production rescan. This local follow-up is not full-workspace CI or release
-acceptance, and has not been pushed.
+acceptance; it is pushed to the draft integration PR #154, not merged.
 
 ## Cloud and native-image follow-on integration
 
@@ -163,7 +165,8 @@ Verified corrections discovered during integration:
   before factory construction/hydration. The regression that previously hung
   now has a bounded timeout and passes without recreating a legacy runtime.
 
-These are local integration changes, not upstream publication or a declaration
+These changes are pushed to the draft integration PR #154 but not merged into
+`dev`; they are not a release or a declaration
 that hosted/cloud execution and image-budget integration are fully complete.
 
 Follow-on validation, separate from the earlier pre-#157 test counts:
