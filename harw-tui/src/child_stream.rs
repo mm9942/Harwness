@@ -645,6 +645,7 @@ impl ChildStreamBlock {
                     return false;
                 }
                 let summary = Arc::new(Mutex::new(SubAgentCell {
+                    language: crate::i18n::current_language(),
                     child_id: child_id.clone(),
                     role: role.clone(),
                     question: question.as_deref().map(redact_text),
@@ -1524,7 +1525,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "genau eine Zusammenfassungszeile");
         let rendered = text(&lines);
         assert!(rendered.contains(role_names::EXECUTOR), "{rendered}");
-        assert!(rendered.contains("4 Tools · 900 Tok"), "{rendered}");
+        assert!(rendered.contains("4 tools · 900 tokens"), "{rendered}");
         assert_eq!(reg.take_new_handles().len(), 0);
         Ok(())
     }

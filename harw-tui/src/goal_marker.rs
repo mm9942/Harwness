@@ -35,8 +35,8 @@ use crate::style::{self, Theme};
 /// Mindestabstand zwischen zwei Store-Abfragen.
 pub(crate) const GOAL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Höchstlänge des Titels in Zeichen (vor der Breitenkürzung).
-const TITLE_MAX_CHARS: usize = 40;
+/// Terminal-column budget for the stored goal-title preview.
+const TITLE_MAX_COLUMNS: usize = 40;
 
 /// Die angezeigte Marke.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +144,7 @@ impl GoalSnapshot {
         } else {
             self.statement.as_str()
         };
-        truncate_chars(&sanitize_inline(raw), TITLE_MAX_CHARS)
+        clip_cells(&sanitize_inline(raw), TITLE_MAX_COLUMNS)
     }
 
     fn marker(&self) -> Option<GoalMarker> {
@@ -156,16 +156,9 @@ impl GoalSnapshot {
     }
 }
 
-/// Kürzt auf höchstens `max` Zeichen (mit „…“).
-fn truncate_chars(text: &str, max: usize) -> String {
-    let count = text.chars().count();
-    if count <= max {
-        return text.to_owned();
-    }
-    let keep = max.saturating_sub(1);
-    let mut out: String = text.chars().take(keep).collect();
-    out.push('…');
-    out
+/// Clips to display columns at extended grapheme boundaries.
+fn clip_cells(text: &str, max: usize) -> String {
+    crate::status_line::fit_width(text, max)
 }
 
 /// Verfolgt Goal und Plan und liefert Marke und Verlaufszeilen.
@@ -247,9 +240,19 @@ fn transition_lines(before: Option<&GoalSnapshot>, after: Option<&GoalSnapshot>)
     if !same_goal && after.is_open() {
         let steps = after
             .progress
-            .map(|(_, total)| format!(" · {total} Schritt(e)"))
+            .map(|(_, total)| {
+                crate::i18n::tr_args(
+                    "activity_chrome.steps",
+                    " · {count} step(s)",
+                    &[("count", &total.to_string())],
+                )
+            })
             .unwrap_or_default();
-        lines.push(format!("◎ Goal gesetzt: {}{steps}", after.title()));
+        lines.push(crate::i18n::tr_args(
+            "activity_chrome.goal_set",
+            "◎ Goal set: {title}{steps}",
+            &[("title", &after.title()), ("steps", &steps)],
+        ));
     }
     if let Some(before) = before.filter(|_| same_goal) {
         let total = after.progress.map_or(after.steps.len(), |(_, total)| total);
@@ -269,25 +272,42 @@ fn transition_lines(before: Option<&GoalSnapshot>, after: Option<&GoalSnapshot>)
                     let evidence = step
                         .evidence
                         .as_deref()
-                        .map(|locator| {
-                            format!(" ({})", truncate_chars(&sanitize_inline(locator), 60))
-                        })
+                        .map(|locator| format!(" ({})", clip_cells(&sanitize_inline(locator), 60)))
                         .unwrap_or_default();
-                    lines.push(format!(
-                        "◎ Schritt {done}/{total} erledigt: {}{evidence}",
-                        truncate_chars(&sanitize_inline(&step.objective), 60)
+                    lines.push(crate::i18n::tr_args(
+                        "activity_chrome.step_done",
+                        "◎ Step {done}/{total} done: {objective}{evidence}",
+                        &[
+                            ("done", &done.to_string()),
+                            ("total", &total.to_string()),
+                            (
+                                "objective",
+                                &clip_cells(&sanitize_inline(&step.objective), 60),
+                            ),
+                            ("evidence", &evidence),
+                        ],
                     ));
                 }
-                PlanNodeStatus::Blocked => lines.push(format!(
-                    "⚠ Schritt {} blockiert: {}",
-                    step.id,
-                    truncate_chars(&sanitize_inline(&step.objective), 60)
+                PlanNodeStatus::Blocked => lines.push(crate::i18n::tr_args(
+                    "activity_chrome.step_blocked",
+                    "⚠ Step {id} blocked: {objective}",
+                    &[
+                        ("id", &step.id.to_string()),
+                        (
+                            "objective",
+                            &clip_cells(&sanitize_inline(&step.objective), 60),
+                        ),
+                    ],
                 )),
                 _ => {}
             }
         }
         if before.status != GoalStatus::Achieved && after.status == GoalStatus::Achieved {
-            lines.push(format!("◎ Goal erreicht: {}", after.title()));
+            lines.push(crate::i18n::tr_args(
+                "activity_chrome.goal_achieved",
+                "◎ Goal achieved: {title}",
+                &[("title", &after.title())],
+            ));
         }
     }
     lines
@@ -324,21 +344,31 @@ pub(crate) fn status_spans(
         .map(|(done, total)| format!(" · {done}/{total}"))
         .unwrap_or_default();
     let blocked = if marker.blocked {
-        " · ⚠ blockiert"
+        crate::i18n::tr("activity_chrome.blocked", " · ⚠ blocked")
     } else {
         ""
     };
     let budget = usize::from(width / 3).max(18);
-    let fixed =
-        " ◎ Goal: ".chars().count() + progress.chars().count() + blocked.chars().count() + 1;
-    let title = truncate_chars(&marker.title, budget.saturating_sub(fixed).max(4));
+    let marker_text = |title: &str| {
+        crate::i18n::tr_args(
+            "activity_chrome.marker",
+            " ◎ Goal: {title}{progress}{blocked} ",
+            &[
+                ("title", title),
+                ("progress", &progress),
+                ("blocked", blocked),
+            ],
+        )
+    };
+    let fixed = unicode_width::UnicodeWidthStr::width(marker_text("").as_str());
+    let title = clip_cells(&marker.title, budget.saturating_sub(fixed));
     let color = if marker.blocked {
         style::warning_color(theme)
     } else {
         goal_color(theme)
     };
     vec![Span::styled(
-        format!(" ◎ Goal: {title}{progress}{blocked} "),
+        crate::status_line::fit_width(&marker_text(&title), budget.min(usize::from(width))),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )]
 }
@@ -434,7 +464,7 @@ mod tests {
         let mut tracker = GoalTracker::default();
         tracker.observe(snapshot(GoalStatus::Active, &[Completed, Blocked]));
         let spans = status_spans(tracker.marker(), Theme::Dark, 120);
-        assert!(text(&spans).contains("⚠ blockiert"));
+        assert!(text(&spans).contains("⚠ blocked"));
         assert_eq!(spans[0].style.fg, Some(style::warning_color(Theme::Dark)));
     }
 
@@ -476,7 +506,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             set,
-            vec!["◎ Goal gesetzt: Secret-Key 0600 · 2 Schritt(e)".to_owned()]
+            vec!["◎ Goal set: Secret-Key 0600 · 2 step(s)".to_owned()]
         );
 
         let done = tracker
@@ -484,16 +514,13 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             done,
-            vec!["◎ Schritt 1/2 erledigt: Schritt 0 (cargo test -p x)".to_owned()]
+            vec!["◎ Step 1/2 done: Schritt 0 (cargo test -p x)".to_owned()]
         );
 
         let blocked = tracker
             .observe(snapshot(GoalStatus::Active, &[Completed, Blocked]))
             .unwrap_or_default();
-        assert_eq!(
-            blocked,
-            vec!["⚠ Schritt t-1 blockiert: Schritt 1".to_owned()]
-        );
+        assert_eq!(blocked, vec!["⚠ Step t-1 blocked: Schritt 1".to_owned()]);
 
         assert_eq!(
             tracker.observe(snapshot(GoalStatus::Active, &[Completed, Blocked])),
@@ -506,7 +533,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             achieved,
-            vec!["◎ Goal erreicht: Secret-Key 0600".to_owned()]
+            vec!["◎ Goal achieved: Secret-Key 0600".to_owned()]
         );
     }
 

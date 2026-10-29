@@ -11,6 +11,12 @@ use std::sync::OnceLock;
 
 // Register each new component zone here; every JSON key starts with that zone.
 const CATALOG_SOURCES: &[(&str, &str)] = &[
+    ("history", include_str!("locales/history.json")),
+    ("tool_chrome", include_str!("locales/tool_chrome.json")),
+    (
+        "activity_chrome",
+        include_str!("locales/activity_chrome.json"),
+    ),
     (
         "operation_feedback",
         include_str!("locales/operation_feedback.json"),
@@ -131,6 +137,11 @@ fn interpolate(message: &str, args: &[(&str, &str)]) -> String {
     }
     output.push_str(remaining);
     output
+}
+
+/// Capture the current synchronous constructor scope for owned historical presentation.
+pub(crate) fn current_language() -> UiLanguage {
+    LANGUAGE.get()
 }
 
 /// Run a synchronous render or handler in one session's language.

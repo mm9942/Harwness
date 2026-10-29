@@ -1,0 +1,98 @@
+{
+  "history.reasoning": {
+    "en": "∴ Reasoning",
+    "de": "∴ Überlegung",
+    "es": "∴ Razonamiento",
+    "fr": "∴ Raisonnement",
+    "pt": "∴ Raciocínio",
+    "ja": "∴ 推論",
+    "zh-CN": "∴ 推理",
+    "ko": "∴ 추론",
+    "vi": "∴ Suy luận",
+    "hi": "∴ तर्क"
+  },
+  "history.collapsed": {
+    "en": "… ({count} lines · Ctrl+O)",
+    "de": "… ({count} Zeilen · Ctrl+O)",
+    "es": "… ({count} líneas · Ctrl+O)",
+    "fr": "… ({count} lignes · Ctrl+O)",
+    "pt": "… ({count} linhas · Ctrl+O)",
+    "ja": "… ({count} 行 · Ctrl+O)",
+    "zh-CN": "…（{count} 行 · Ctrl+O）",
+    "ko": "… ({count}줄 · Ctrl+O)",
+    "vi": "… ({count} dòng · Ctrl+O)",
+    "hi": "… ({count} पंक्तियाँ · Ctrl+O)"
+  },
+  "history.reasoning_lock": {
+    "en": "⚠ Reasoning cell unreadable (poisoned lock)",
+    "de": "⚠ Reasoning-Zelle nicht lesbar (Sperre vergiftet)",
+    "es": "⚠ Celda de razonamiento ilegible (bloqueo dañado)",
+    "fr": "⚠ Cellule de raisonnement illisible (verrou corrompu)",
+    "pt": "⚠ Célula de raciocínio ilegível (bloqueio corrompido)",
+    "ja": "⚠ 推論セルを読み取れません（ロック破損）",
+    "zh-CN": "⚠ 推理单元无法读取（锁已损坏）",
+    "ko": "⚠ 추론 셀을 읽을 수 없음 (잠금 손상)",
+    "vi": "⚠ Không đọc được ô suy luận (khóa hỏng)",
+    "hi": "⚠ तर्क सेल पढ़ा नहीं जा सकता (लॉक दूषित)"
+  },
+  "history.no_task": {
+    "en": "(no task supplied)",
+    "de": "(kein Auftrag angegeben)",
+    "es": "(sin tarea indicada)",
+    "fr": "(aucune tâche fournie)",
+    "pt": "(nenhuma tarefa fornecida)",
+    "ja": "（タスク未指定）",
+    "zh-CN": "（未提供任务）",
+    "ko": "(작업 미지정)",
+    "vi": "(chưa có nhiệm vụ)",
+    "hi": "(कोई कार्य नहीं दिया गया)"
+  },
+  "history.running": {
+    "en": "running",
+    "de": "läuft",
+    "es": "en curso",
+    "fr": "en cours",
+    "pt": "em execução",
+    "ja": "実行中",
+    "zh-CN": "运行中",
+    "ko": "실행 중",
+    "vi": "đang chạy",
+    "hi": "चल रहा है"
+  },
+  "history.done": {
+    "en": "done ({duration}ms)",
+    "de": "fertig ({duration}ms)",
+    "es": "terminado ({duration}ms)",
+    "fr": "terminé ({duration}ms)",
+    "pt": "concluído ({duration}ms)",
+    "ja": "完了（{duration}ms）",
+    "zh-CN": "完成（{duration}ms）",
+    "ko": "완료 ({duration}ms)",
+    "vi": "xong ({duration}ms)",
+    "hi": "पूर्ण ({duration}ms)"
+  },
+  "history.failed": {
+    "en": "failed: {outcome} ({duration}ms)",
+    "de": "gescheitert: {outcome} ({duration}ms)",
+    "es": "falló: {outcome} ({duration}ms)",
+    "fr": "échec : {outcome} ({duration}ms)",
+    "pt": "falhou: {outcome} ({duration}ms)",
+    "ja": "失敗: {outcome}（{duration}ms）",
+    "zh-CN": "失败：{outcome}（{duration}ms）",
+    "ko": "실패: {outcome} ({duration}ms)",
+    "vi": "thất bại: {outcome} ({duration}ms)",
+    "hi": "विफल: {outcome} ({duration}ms)"
+  },
+  "history.agent": {
+    "en": "{role} [{child}]: {question} — {status} · {tools} tools · {tokens} tokens",
+    "de": "{role} [{child}]: {question} — {status} · {tools} Tools · {tokens} Token",
+    "es": "{role} [{child}]: {question} — {status} · {tools} herramientas · {tokens} tokens",
+    "fr": "{role} [{child}] : {question} — {status} · {tools} outils · {tokens} jetons",
+    "pt": "{role} [{child}]: {question} — {status} · {tools} ferramentas · {tokens} tokens",
+    "ja": "{role} [{child}]: {question} — {status} · ツール {tools} 回 · {tokens} トークン",
+    "zh-CN": "{role} [{child}]：{question} — {status} · {tools} 次工具调用 · {tokens} 个词元",
+    "ko": "{role} [{child}]: {question} — {status} · 도구 {tools}회 · 토큰 {tokens}개",
+    "vi": "{role} [{child}]: {question} — {status} · {tools} công cụ · {tokens} token",
+    "hi": "{role} [{child}]: {question} — {status} · {tools} उपकरण · {tokens} टोकन"
+  }
+}

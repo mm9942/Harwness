@@ -35,7 +35,9 @@ impl ChatApp {
         };
         let plans = Arc::clone(&services.plan_store);
         let goals = Arc::clone(&services.goal_store);
-        let Some(lines) = self.goal_tracker.poll(plans.as_ref(), goals.as_ref(), now) else {
+        let Some(lines) = crate::i18n::with_language(self.language, || {
+            self.goal_tracker.poll(plans.as_ref(), goals.as_ref(), now)
+        }) else {
             return false;
         };
         for line in lines {
@@ -46,7 +48,9 @@ impl ChatApp {
 
     /// Die Statuszeilen-Spans der Goal-Marke (leer ohne aktives Goal).
     pub(super) fn goal_status_spans(&self, theme: Theme, width: u16) -> Vec<Span<'static>> {
-        crate::goal_marker::status_spans(self.goal_tracker.marker(), theme, width)
+        crate::i18n::with_language(self.language, || {
+            crate::goal_marker::status_spans(self.goal_tracker.marker(), theme, width)
+        })
     }
 }
 

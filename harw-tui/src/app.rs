@@ -2717,7 +2717,9 @@ impl ChatApp {
             ReasoningDisplayMode::Collapsed => false,
             ReasoningDisplayMode::Hidden => return,
         };
-        let mut cell = ReasoningHistoryCell::new(summary).with_expanded(expanded);
+        let mut cell = crate::i18n::with_language(self.language, || {
+            ReasoningHistoryCell::new(summary).with_expanded(expanded)
+        });
         if let Some(role) = origin {
             cell = cell.with_origin(role);
         }
@@ -2730,10 +2732,11 @@ impl ChatApp {
     /// Plans, sonst das Delta zum zuletzt gezeigten Stand; merkt sie für
     /// Ctrl+O vor.
     fn push_plan_cell(&mut self, plan: harw_plan::Plan) {
-        let cell = match self.last_shown_plan.as_ref() {
-            Some(previous) => PlanGraphCell::delta(previous, plan.clone()),
-            None => PlanGraphCell::full(plan.clone()),
-        };
+        let cell =
+            crate::i18n::with_language(self.language, || match self.last_shown_plan.as_ref() {
+                Some(previous) => PlanGraphCell::delta(previous, plan.clone()),
+                None => PlanGraphCell::full(plan.clone()),
+            });
         self.last_shown_plan = Some(plan);
         let shared = cell.into_shared();
         self.push_cell(Box::new(Arc::clone(&shared)));
@@ -4730,6 +4733,12 @@ fn export_tool_result_entry(
 }
 
 fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
+    crate::i18n::with_language(app.language, || {
+        hydrate_visible_history_scoped(app, history)
+    });
+}
+
+fn hydrate_visible_history_scoped(app: &mut ChatApp, history: &ConversationHistory) {
     let mut tool_cells: HashMap<harw_types::ToolCallId, SharedToolCell> = HashMap::new();
     let mut tool_export_indices: HashMap<harw_types::ToolCallId, usize> = HashMap::new();
     let mut tool_export_order: Vec<harw_types::ToolCallId> = Vec::new();
@@ -5942,7 +5951,10 @@ fn ensure_tool_cell(
     if let Some(existing) = state.pending_tool_cells.get(&call_id) {
         return Arc::clone(existing);
     }
-    let cell: SharedToolCell = Arc::new(Mutex::new(ToolCell::started(call)));
+    let cell: SharedToolCell =
+        Arc::new(Mutex::new(crate::i18n::with_language(app.language, || {
+            ToolCell::started(call)
+        })));
     state.pending_tool_cells.insert(call_id, Arc::clone(&cell));
     app.append_tool_cell(call, turn, Arc::clone(&cell));
     cell
@@ -6054,6 +6066,14 @@ fn live_reasoning_lines(
 }
 
 fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnEvent) -> bool {
+    crate::i18n::with_language(app.language, || handle_turn_event_scoped(app, state, event))
+}
+
+fn handle_turn_event_scoped(
+    app: &mut ChatApp,
+    state: &mut TurnEventState,
+    event: TurnEvent,
+) -> bool {
     match event {
         TurnEvent::ToolCallRequested {
             turn_id,
@@ -6374,6 +6394,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             let child_id = child.as_str().to_owned();
             let parent_id = exported_agent_parent_id(app, &child);
             let cell = Arc::new(Mutex::new(SubAgentCell {
+                language: crate::i18n::current_language(),
                 child_id: child_id.clone(),
                 role: role.clone(),
                 question: question.clone(),
@@ -6659,6 +6680,7 @@ fn goal_cell_for_command(app: &ChatApp, raw: &str) -> Option<GoalCell> {
         .ok()?;
     let report = evaluate_goal(&goal, &plan);
     Some(GoalCell {
+        language: app.language,
         statement: goal.statement.clone(),
         report,
     })
@@ -12041,7 +12063,7 @@ mod tests {
             vec![
                 "∴ Reasoning".to_owned(),
                 "│ Erste Zeile".to_owned(),
-                "│ … (4 Zeilen · Ctrl+O)".to_owned(),
+                "│ … (4 lines · Ctrl+O)".to_owned(),
             ]
         );
         assert!(app.toggle_tool_cells());
@@ -12061,7 +12083,7 @@ mod tests {
             vec![
                 "∴ Reasoning".to_owned(),
                 "│ • erstens".to_owned(),
-                "│ … (2 Zeilen · Ctrl+O)".to_owned(),
+                "│ … (2 lines · Ctrl+O)".to_owned(),
             ]
         );
         assert!(app.toggle_tool_cells());
@@ -12275,7 +12297,7 @@ mod tests {
                         &vec![
                             "∴ Reasoning".to_owned(),
                             "│ Erster Absatz".to_owned(),
-                            "│ … (4 Zeilen · Ctrl+O)".to_owned(),
+                            "│ … (4 lines · Ctrl+O)".to_owned(),
                         ]
                     );
                 }
@@ -13940,8 +13962,8 @@ forbidden = [{forbidden}]
             .join("\n");
         assert!(visible.contains("look [non-text content]"));
         assert!(visible.contains("persisted answer"));
-        assert!(visible.contains("1 Datei gelesen"));
-        assert!(visible.contains("1 fehlgeschlagen"));
+        assert!(visible.contains("1 file read"));
+        assert!(visible.contains("1 failed"));
         assert!(visible.contains("private reasoning"));
         assert!(visible.contains("sensitive backend detail"));
         for secret in ["secret.example", "raw secret"] {
@@ -13993,7 +14015,7 @@ forbidden = [{forbidden}]
             .join("\n");
         assert!(visible.contains("tool.result"));
         assert!(visible.contains("orphan result"));
-        assert!(visible.contains("unvollständig (Resume-Abbruch)"));
+        assert!(visible.contains("incomplete (resume interrupted)"));
         let tool_entries = app
             .export_entries
             .iter()
@@ -14737,7 +14759,7 @@ forbidden = [{forbidden}]
         assert!(rendered.contains(role_names::EXPLORER));
         assert!(rendered.contains('7'), "Tool-Aufrufe fehlen: {rendered:?}");
         assert!(
-            rendered.contains("fertig"),
+            rendered.contains("done"),
             "die Zelle muss den Abschluss zeigen: {rendered:?}"
         );
         Ok(())
@@ -15125,28 +15147,25 @@ forbidden = [{forbidden}]
 
         app.push_plan_cell(plan());
         let first = rendered_cells(&app);
-        assert!(first.contains("(keine Knoten im Plan)"), "{first}");
-        assert!(!first.contains("keine Knotenänderung"), "{first}");
+        assert!(first.contains("(no nodes in plan)"), "{first}");
+        assert!(!first.contains("no node changes"), "{first}");
 
         app.push_plan_cell(plan());
         let second = rendered_cells(&app);
         assert!(
-            second.contains("keine Knotenänderung · 0 Knoten · ctrl+o zum Ausklappen"),
+            second.contains("no node changes · 0 nodes · ctrl+o to expand"),
             "{second}"
         );
         // Ctrl+O klappt die letzte (Delta-)Zelle auf: Fortschritt statt Hinweis.
         assert!(app.toggle_tool_cells());
         let expanded = rendered_cells(&app);
-        assert!(!expanded.contains("keine Knotenänderung"), "{expanded}");
-        assert!(expanded.contains("0/0 erledigt (0 %)"), "{expanded}");
+        assert!(!expanded.contains("no node changes"), "{expanded}");
+        assert!(expanded.contains("0/0 done (0 %)"), "{expanded}");
 
         app.clear_transcript();
         app.push_plan_cell(plan());
         let after_clear = rendered_cells(&app);
-        assert!(
-            !after_clear.contains("keine Knotenänderung"),
-            "{after_clear}"
-        );
+        assert!(!after_clear.contains("no node changes"), "{after_clear}");
         Ok(())
     }
 
@@ -16190,7 +16209,10 @@ forbidden = [{forbidden}]
 
         let history = history_plain(&app);
         assert!(history.contains("gilt ab nächstem Turn"), "{history}");
-        assert!(history.contains("Reasoning-Effort gesetzt"), "{history}");
+        assert!(
+            history.contains("Reasoning effort (session): minimal."),
+            "{history}"
+        );
         assert!(app.session_controller.snapshot().reasoning_effort.is_some());
         // Die Session selbst ist unberührt, bis die Turn-Grenze anwendet.
         assert!(app.apply_pending_controller_state(&mut session));
@@ -17019,6 +17041,7 @@ forbidden = [{forbidden}]
         let mut app = test_chat_app()?;
         let child = "child-bg-1";
         let cell = Arc::new(Mutex::new(SubAgentCell {
+            language: crate::i18n::current_language(),
             child_id: child.to_owned(),
             role: "root-orchestrator".to_owned(),
             question: Some("Review".to_owned()),
@@ -18807,3 +18830,7 @@ mod child_info_render_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "app/history_localization_tests.rs"]
+mod history_localization_tests;

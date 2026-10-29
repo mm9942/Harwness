@@ -107,8 +107,17 @@ use harw_plan::goal::GoalReport;
 use harw_plan::{Plan, PlanNode, PlanNodeStatus, TaskId};
 use harw_protocol::items::{ToolCallResult, ToolPlacement};
 
+use crate::i18n::{tr, tr_args, with_language};
 use crate::sanitize::{sanitize_display, sanitize_inline};
 use crate::style;
+use harw_config::UiLanguage;
+
+// Only owned templates enter the catalog; values remain literal payload.
+macro_rules! message {
+    ($key:literal, $english:literal $(, $name:ident = $value:expr)* $(,)?) => {
+        tr_args($key, $english, &[$((stringify!($name), &$value.to_string())),*])
+    };
+}
 
 // ─── Trait ───────────────────────────────────────────────────────────────────
 
@@ -339,7 +348,8 @@ impl HistoryCell for AssistantHistoryCell {
 /// `width`, werden hart geteilt. Auch von [`crate::reasoning_cell`] genutzt
 /// (PL-97 R1), damit Reasoning-Körper genau wie Assistenten-Antworten umbrechen.
 pub(crate) fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
     let width = width.max(1);
     let line_style = line.style;
     let total: usize = line
@@ -401,17 +411,17 @@ pub(crate) fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static
             used = token_width;
             continue;
         }
-        // Überlanges Wort: zeichenweise teilen.
+        // Split an overlong word only at extended grapheme boundaries.
         let mut chunk = String::new();
-        for ch in text.chars() {
-            let cw = ch.width().unwrap_or(0);
+        for grapheme in text.graphemes(true) {
+            let cw = UnicodeWidthStr::width(grapheme);
             if used + cw > width && used > 0 {
                 if !chunk.is_empty() {
                     spans.push(Span::styled(std::mem::take(&mut chunk), span_style));
                 }
                 flush(&mut spans, &mut out, &mut used);
             }
-            chunk.push(ch);
+            chunk.push_str(grapheme);
             used += cw;
         }
         if !chunk.is_empty() {
@@ -460,6 +470,8 @@ pub(crate) fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static
 /// PL-97 R1 — lesbarer Nachrichtenblock.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReasoningHistoryCell {
+    /// Locale of this generated historical presentation. Never inferred from text.
+    pub(crate) language: UiLanguage,
     /// Zusammengefasster Denkprozess-Text.
     pub summary: String,
     /// Nutzer-Umschalter (Ctrl+O): `true` zeigt den vollständigen Text.
@@ -483,6 +495,7 @@ impl ReasoningHistoryCell {
     /// - `summary` (`impl Into<String>`): Zusammengefasster Denkprozess-Text.
     pub(crate) fn new(summary: impl Into<String>) -> Self {
         Self {
+            language: crate::i18n::current_language(),
             summary: summary.into(),
             expanded: false,
             origin: None,
@@ -552,6 +565,12 @@ impl HistoryCell for ReasoningHistoryCell {
     /// # Rückgabe
     /// Liste der darstellbaren Zeilen beginnend mit `"∴ Reasoning"`.
     fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+        with_language(self.language, || self.localized_lines(width, theme))
+    }
+}
+
+impl ReasoningHistoryCell {
+    fn localized_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
         crate::reasoning_cell::display_lines(
             &self.summary,
             self.origin.as_deref(),
@@ -569,7 +588,10 @@ impl HistoryCell for SharedReasoningCell {
         match self.lock() {
             Ok(guard) => guard.display_lines(width, theme),
             Err(_) => vec![Line::from(Span::styled(
-                "⚠ Reasoning-Zelle nicht lesbar (Sperre vergiftet)".to_owned(),
+                tr(
+                    "history.reasoning_lock",
+                    "⚠ Reasoning cell unreadable (poisoned lock)",
+                ),
                 style::warning_style(theme),
             ))],
         }
@@ -578,15 +600,14 @@ impl HistoryCell for SharedReasoningCell {
 
 // ─── SubAgentCell ─────────────────────────────────────────────────────────────
 
-/// Obergrenze für die angezeigte Länge der Kind-Frage/des Kind-Auftrags in
-/// [`SubAgentCell`], bevor char-sicher mit [`truncate_chars`] gekürzt wird.
-const SUBAGENT_QUESTION_PREVIEW_CHARS: usize = 80;
+/// Terminal-column budget for the child task preview; clipped at grapheme boundaries.
+const SUBAGENT_QUESTION_PREVIEW_COLUMNS: usize = 80;
 
 /// Obergrenze für die angezeigte Kind-Kennung in [`SubAgentCell`].
 ///
 /// Kurz genug, dass die Zeile nicht von der ID beherrscht wird, lang genug, um
 /// gleichzeitig laufende Kinder derselben Rolle auseinanderzuhalten.
-const SUBAGENT_CHILD_ID_PREVIEW_CHARS: usize = 12;
+const SUBAGENT_CHILD_ID_PREVIEW_COLUMNS: usize = 12;
 
 /// Kürzt eine Kind-Kennung auf ihr **Ende** statt auf ihren Anfang.
 ///
@@ -599,20 +620,31 @@ const SUBAGENT_CHILD_ID_PREVIEW_CHARS: usize = 12;
 ///
 /// # Argumente
 /// - `id` (`&str`): die vollständige Kennung.
-/// - `max_chars` (`usize`): Obergrenze in **Zeichen**, nicht Bytes.
+/// - `max_chars` (`usize`): Terminal-column budget, including the ellipsis.
 ///
 /// # Rückgabe
 /// Die Kennung, falls sie kurz genug ist; sonst `…` gefolgt von ihren letzten
-/// `max_chars - 1` Zeichen. Die Zählung läuft über `char`, schneidet also nie
-/// mitten in ein Mehrbyte-Zeichen.
+/// the remaining display columns. Extended grapheme clusters remain intact.
 fn truncate_id_tail(id: &str, max_chars: usize) -> String {
-    let total = id.chars().count();
-    if total <= max_chars || max_chars == 0 {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if UnicodeWidthStr::width(id) <= max_chars {
         return id.to_owned();
     }
-    let keep = max_chars.saturating_sub(1);
-    let tail: String = id.chars().skip(total - keep).collect();
-    format!("…{tail}")
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut used = 1;
+    let mut tail = Vec::new();
+    for g in id.graphemes(true).rev() {
+        let w = UnicodeWidthStr::width(g);
+        if used + w > max_chars {
+            break;
+        }
+        used += w;
+        tail.push(g);
+    }
+    format!("…{}", tail.into_iter().rev().collect::<String>())
 }
 
 /// Laufzeitstatus eines Sub-Agenten innerhalb einer [`SubAgentCell`].
@@ -679,6 +711,8 @@ pub(crate) enum SubAgentStatus {
 /// ChildProgress, ChildCompleted}`.
 #[derive(Debug)]
 pub(crate) struct SubAgentCell {
+    /// Locale of this generated historical presentation. Never inferred from text.
+    pub(crate) language: UiLanguage,
     /// Bezeichner des Kindes (`SessionId::as_str()`).
     pub child_id: String,
     /// Rolle des Kindes.
@@ -760,25 +794,47 @@ impl HistoryCell for SubAgentCell {
     /// # Rückgabe
     /// Liste der darstellbaren Zeilen beginnend mit dem Status-Präfix.
     fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+        with_language(
+            if self.status == SubAgentStatus::Running {
+                crate::i18n::current_language()
+            } else {
+                self.language
+            },
+            || self.localized_lines(width, theme),
+        )
+    }
+}
+
+impl SubAgentCell {
+    fn localized_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
         let prefix_len = 2_u16;
         let text_width = width.saturating_sub(prefix_len).max(1);
 
         let question_display = match &self.question {
-            Some(q) if !q.is_empty() => {
-                sanitize_inline(&truncate_chars(q, SUBAGENT_QUESTION_PREVIEW_CHARS))
-            }
-            _ => "(kein Auftrag angegeben)".to_owned(),
+            Some(q) if !q.is_empty() => sanitize_inline(&crate::status_line::fit_width(
+                q,
+                SUBAGENT_QUESTION_PREVIEW_COLUMNS,
+            )),
+            _ => tr("history.no_task", "(no task supplied)").to_owned(),
         };
 
         let (glyph, cell_style, status_text) = match &self.status {
-            SubAgentStatus::Running => ("▶ ", style::tool_style(theme), "läuft".to_owned()),
+            SubAgentStatus::Running => (
+                "▶ ",
+                style::tool_style(theme),
+                tr("history.running", "running").to_owned(),
+            ),
             SubAgentStatus::Done {
                 outcome,
                 duration_ms,
             } if outcome == "completed" => (
                 "✓ ",
                 style::success_style(theme),
-                format!("fertig ({duration_ms}ms)"),
+                message!(
+                    "history.done",
+                    "done ({duration}ms)",
+                    duration = duration_ms
+                ),
             ),
             SubAgentStatus::Done {
                 outcome,
@@ -786,9 +842,11 @@ impl HistoryCell for SubAgentCell {
             } => (
                 "✗ ",
                 style::error_style(theme),
-                format!(
-                    "gescheitert: {} ({duration_ms}ms)",
-                    sanitize_inline(outcome)
+                message!(
+                    "history.failed",
+                    "failed: {outcome} ({duration}ms)",
+                    outcome = sanitize_inline(outcome),
+                    duration = duration_ms
                 ),
             ),
         };
@@ -798,15 +856,18 @@ impl HistoryCell for SubAgentCell {
         // „explorer: …" wären nicht auseinanderzuhalten. Gekürzt wird am
         // **Anfang** (`truncate_id_tail`), weil Kennungen sich am Ende
         // unterscheiden — eine Kürzung von hinten machte sie wieder gleich.
-        let text = format!(
-            "{role} [{child}]: {question_display} — {status_text} · {tool_calls} Tools · {tokens} Tok",
+        let text = message!(
+            "history.agent",
+            "{role} [{child}]: {question} — {status} · {tools} tools · {tokens} tokens",
             role = sanitize_inline(&self.role),
             child = sanitize_inline(&truncate_id_tail(
                 &self.child_id,
-                SUBAGENT_CHILD_ID_PREVIEW_CHARS
+                SUBAGENT_CHILD_ID_PREVIEW_COLUMNS
             )),
-            tool_calls = self.tool_calls,
-            tokens = self.tokens,
+            question = question_display,
+            status = status_text,
+            tools = self.tool_calls,
+            tokens = self.tokens
         );
 
         let wrapped = wrap_plain(&text, text_width);
@@ -838,9 +899,8 @@ impl HistoryCell for SubAgentCell {
 /// [`PlanGraphCell::display_lines`]).
 const PLAN_GRAPH_MAX_NODES: usize = 25;
 
-/// Obergrenze für die angezeigte Länge des `objective`-Texts je Plan-Knoten,
-/// bevor char-sicher mit [`truncate_chars`] gekürzt wird.
-const PLAN_GRAPH_OBJECTIVE_PREVIEW_CHARS: usize = 48;
+/// Terminal-column budget for each objective preview; clipped at grapheme boundaries.
+const PLAN_GRAPH_OBJECTIVE_PREVIEW_COLUMNS: usize = 48;
 
 /// Höchstzahl der in der Delta-Darstellung einzeln gezeigten geänderten
 /// Knoten; darüber nennt eine Sammelzeile den Rest (R18 F4).
@@ -885,6 +945,8 @@ const PLAN_GRAPH_PROGRESS_BAR_CHARS: usize = 10;
 /// PlanNodeKind}`; R18 F4.
 #[derive(Debug, Clone)]
 pub(crate) struct PlanGraphCell {
+    /// Locale of this generated historical presentation. Never inferred from text.
+    pub(crate) language: UiLanguage,
     /// Der darzustellende Plan.
     pub plan: Plan,
     /// Geänderte Knoten gegenüber dem vorigen Stand; `None` = Vollbild.
@@ -904,6 +966,7 @@ impl PlanGraphCell {
     #[must_use]
     pub(crate) fn full(plan: Plan) -> Self {
         Self {
+            language: crate::i18n::current_language(),
             plan,
             changed: None,
             removed: 0,
@@ -946,6 +1009,7 @@ impl PlanGraphCell {
             .filter(|old| !plan.nodes.iter().any(|node| node.id == old.id))
             .count();
         Self {
+            language: crate::i18n::current_language(),
             plan,
             changed: Some(changed),
             removed,
@@ -988,10 +1052,15 @@ impl PlanGraphCell {
             "▰".repeat(filled),
             "▱".repeat(PLAN_GRAPH_PROGRESS_BAR_CHARS.saturating_sub(filled))
         );
-        format!(
-            "Plan {} @{} · {bar} {done}/{total} erledigt ({percent} %)",
-            sanitize_inline(self.plan.id.as_str()),
-            self.plan.revision
+        message!(
+            "activity_chrome.progress",
+            "Plan {id} @{revision} · {bar} {done}/{total} done ({percent} %)",
+            id = sanitize_inline(self.plan.id.as_str()),
+            revision = self.plan.revision,
+            bar = bar,
+            done = done,
+            total = total,
+            percent = percent
         )
     }
 
@@ -1016,18 +1085,21 @@ impl PlanGraphCell {
             .wave
             .map(|w| w.to_string())
             .unwrap_or_else(|| "–".to_owned());
-        let objective_preview = sanitize_inline(&truncate_chars(
+        let objective_preview = sanitize_inline(&crate::status_line::fit_width(
             &node.objective,
-            PLAN_GRAPH_OBJECTIVE_PREVIEW_CHARS,
+            PLAN_GRAPH_OBJECTIVE_PREVIEW_COLUMNS,
         ));
-        let node_text = format!(
-            "{id} · {kind:?} · {status:?} · Welle {wave_display} · {objective_preview}",
+        let node_text = message!(
+            "activity_chrome.node",
+            "{id} · {kind} · {status} · Wave {wave} · {objective}",
             id = sanitize_inline(node.id.as_ref()),
-            kind = node.kind,
-            status = node.status,
+            kind = plan_node_kind_text(node.kind),
+            status = plan_node_status_text(node.status),
+            wave = wave_display,
+            objective = objective_preview
         );
-
         let wrapped = wrap_plain(&node_text, text_width);
+
         for (i, line) in wrapped.into_iter().enumerate() {
             let raw: String = line
                 .spans
@@ -1054,6 +1126,12 @@ impl HistoryCell for PlanGraphCell {
     /// Liste der darstellbaren Zeilen; enthält bei einem leeren Plan genau
     /// eine gedimmte Platzhalterzeile statt einer leeren Liste.
     fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+        with_language(self.language, || self.localized_lines(width, theme))
+    }
+}
+
+impl PlanGraphCell {
+    fn localized_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
         let prefix_len = 2_u16;
         let text_width = width.saturating_sub(prefix_len).max(1);
         let dim = style::dim_style(theme);
@@ -1076,18 +1154,27 @@ impl HistoryCell for PlanGraphCell {
             }
             let mut notes: Vec<String> = Vec::new();
             if changed_nodes.len() > PLAN_GRAPH_MAX_CHANGED {
-                notes.push(format!(
-                    "{} weitere geänderte Knoten",
-                    changed_nodes.len() - PLAN_GRAPH_MAX_CHANGED
+                notes.push(message!(
+                    "activity_chrome.changed",
+                    "{count} more changed nodes",
+                    count = changed_nodes.len() - PLAN_GRAPH_MAX_CHANGED
                 ));
             }
             if changed_nodes.is_empty() {
-                notes.push("keine Knotenänderung".to_owned());
+                notes.push(tr("activity_chrome.unchanged", "no node changes").to_owned());
             }
             if self.removed > 0 {
-                notes.push(format!("{} Knoten entfernt", self.removed));
+                notes.push(message!(
+                    "activity_chrome.removed",
+                    "{count} nodes removed",
+                    count = self.removed
+                ));
             }
-            notes.push(format!("{total} Knoten · ctrl+o zum Ausklappen"));
+            notes.push(message!(
+                "activity_chrome.expand",
+                "{count} nodes · ctrl+o to expand",
+                count = total
+            ));
             let note = format!("… {}", notes.join(" · "));
             for piece in wrap_plain(&note, width.max(1)) {
                 let raw: String = piece.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1111,15 +1198,26 @@ impl HistoryCell for PlanGraphCell {
 
         if total > visible {
             let elided = total - visible;
-            let note = format!("… {elided} weitere Knoten ausgeblendet (insgesamt {total})");
+            let note = message!(
+                "activity_chrome.hidden",
+                "… {count} more nodes hidden ({total} total)",
+                count = elided,
+                total = total
+            );
             lines.push(Line::from(Span::styled(note, dim)));
         }
 
         if lines.is_empty() {
-            lines.push(Line::from(Span::styled("(keine Knoten im Plan)", dim)));
+            lines.push(Line::from(Span::styled(
+                tr("activity_chrome.empty", "(no nodes in plan)"),
+                dim,
+            )));
         }
 
         lines
+            .into_iter()
+            .flat_map(|line| wrap_styled(line, usize::from(width.max(1))))
+            .collect()
     }
 }
 
@@ -1130,7 +1228,10 @@ impl HistoryCell for SharedPlanGraphCell {
         match self.lock() {
             Ok(guard) => guard.display_lines(width, theme),
             Err(_) => vec![Line::from(Span::styled(
-                "⚠ Plan-Zelle nicht lesbar (Sperre vergiftet)".to_owned(),
+                tr(
+                    "activity_chrome.plan_lock",
+                    "⚠ Plan cell unreadable (poisoned lock)",
+                ),
                 style::warning_style(theme),
             ))],
         }
@@ -1216,9 +1317,8 @@ fn quote_approval_text(value: &str) -> String {
 
 // ─── GoalCell ─────────────────────────────────────────────────────────────────
 
-/// Obergrenze für die angezeigte Länge des Ziel-Statements in [`GoalCell`],
-/// bevor char-sicher mit [`truncate_chars`] gekürzt wird.
-const GOAL_STATEMENT_PREVIEW_CHARS: usize = 100;
+/// Terminal-column budget for the goal statement preview; clipped at grapheme boundaries.
+const GOAL_STATEMENT_PREVIEW_COLUMNS: usize = 100;
 
 /// Zeigt ein Goal gegen einen ausgewerteten `harw_plan::goal::GoalReport` an.
 ///
@@ -1247,6 +1347,8 @@ const GOAL_STATEMENT_PREVIEW_CHARS: usize = 100;
 /// AP W5-10a — `harw-plan/src/goal.rs::{GoalReport, evaluate_goal}`.
 #[derive(Debug, Clone)]
 pub(crate) struct GoalCell {
+    /// Locale of this generated historical presentation. Never inferred from text.
+    pub(crate) language: UiLanguage,
     /// Ziel-Statement (`Goal::statement`).
     pub statement: String,
     /// Auswertungsergebnis aus `evaluate_goal`.
@@ -1264,15 +1366,25 @@ impl HistoryCell for GoalCell {
     /// # Rückgabe
     /// Liste der darstellbaren Zeilen.
     fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+        with_language(self.language, || self.localized_lines(width, theme))
+    }
+}
+
+impl GoalCell {
+    fn localized_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
         let prefix_len = 2_u16;
         let text_width = width.saturating_sub(prefix_len).max(1);
         let mut lines: Vec<Line<'static>> = Vec::new();
 
-        let statement_preview = sanitize_inline(&truncate_chars(
+        let statement_preview = sanitize_inline(&crate::status_line::fit_width(
             &self.statement,
-            GOAL_STATEMENT_PREVIEW_CHARS,
+            GOAL_STATEMENT_PREVIEW_COLUMNS,
         ));
-        let header_text = format!("Ziel: {statement_preview}");
+        let header_text = message!(
+            "activity_chrome.goal",
+            "Goal: {title}",
+            title = statement_preview
+        );
         let header_style = style::selected_style(theme);
         let wrapped_header = wrap_plain(&header_text, text_width);
         for (i, line) in wrapped_header.into_iter().enumerate() {
@@ -1293,8 +1405,12 @@ impl HistoryCell for GoalCell {
         let total_count = met_count + self.report.criteria_open.len();
         // Sättigender Cast (siehe Typdokumentation): NaN/negativ → 0, kein Panic.
         let coverage_pct = (self.report.coverage * 100.0).round() as u32;
-        lines.push(Line::from(Span::raw(format!(
-            "Kriterien: {met_count} von {total_count} erfüllt ({coverage_pct} %)"
+        lines.push(Line::from(Span::raw(message!(
+            "activity_chrome.criteria",
+            "Criteria: {met} of {total} met ({percent} %)",
+            met = met_count,
+            total = total_count,
+            percent = coverage_pct
         ))));
 
         let mut criteria: Vec<(usize, bool)> = self
@@ -1307,27 +1423,42 @@ impl HistoryCell for GoalCell {
         criteria.sort_by_key(|&(idx, _)| idx);
         for (idx, is_met) in criteria {
             let (label, crit_style) = if is_met {
-                ("erfüllt", style::success_style(theme))
+                (
+                    message!(
+                        "activity_chrome.criterion_met",
+                        "  Criterion {number}: met",
+                        number = idx + 1
+                    ),
+                    style::success_style(theme),
+                )
             } else {
-                ("offen", style::dim_style(theme))
+                (
+                    message!(
+                        "activity_chrome.criterion_open",
+                        "  Criterion {number}: open",
+                        number = idx + 1
+                    ),
+                    style::dim_style(theme),
+                )
             };
-            lines.push(Line::from(Span::styled(
-                format!("  Kriterium {}: {label}", idx + 1),
-                crit_style,
-            )));
+            lines.push(Line::from(Span::styled(label, crit_style)));
         }
 
         for invariant_id in &self.report.invariants_violated {
             lines.push(Line::from(Span::styled(
-                format!(
-                    "  Invariante '{}' nicht belegt",
-                    sanitize_inline(invariant_id)
+                message!(
+                    "activity_chrome.invariant",
+                    "  Invariant '{id}' not evidenced",
+                    id = sanitize_inline(invariant_id)
                 ),
                 style::error_style(theme),
             )));
         }
 
         lines
+            .into_iter()
+            .flat_map(|line| wrap_styled(line, usize::from(width.max(1))))
+            .collect()
     }
 }
 
@@ -1432,7 +1563,8 @@ pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
 /// Segmentende, damit Pfade als `crates/` + `harw-tui/` brechen. Kein
 /// Zeichen geht verloren oder kommt hinzu.
 fn split_at_soft_breaks(word: &str, col_width: usize) -> Vec<String> {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
 
     // Tokenisieren: jedes Token endet an einem Trennzeichen (Trenner inklusive).
     let mut tokens: Vec<String> = Vec::new();
@@ -1467,14 +1599,14 @@ fn split_at_soft_breaks(word: &str, col_width: usize) -> Vec<String> {
             segment_width = token_width;
             continue;
         }
-        // Hart teilen, spaltengenau; der Rest bleibt offenes Segment.
-        for ch in token.chars() {
-            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        // Split at grapheme boundaries; the remainder stays in the open segment.
+        for grapheme in token.graphemes(true) {
+            let char_width = UnicodeWidthStr::width(grapheme);
             if segment_width + char_width > col_width && !segment.is_empty() {
                 segments.push(std::mem::take(&mut segment));
                 segment_width = 0;
             }
-            segment.push(ch);
+            segment.push_str(grapheme);
             segment_width += char_width;
         }
     }
@@ -1651,10 +1783,13 @@ pub(crate) enum ToolVerbosity {
 /// Plan Schritt 2 — `history_cell.rs::ToolCell`, Contract-Slice A5.
 #[derive(Debug)]
 pub(crate) struct ToolCell {
+    /// Locale of this generated historical presentation. Never inferred from text.
+    pub(crate) language: UiLanguage,
     /// Roher Werkzeugname (z. B. `"shell.exec"`).
     pub tool_name: String,
     /// Vorab berechnetes Klartext-Label (siehe [`tool_label`]).
     pub label: String,
+    live_label: Option<ToolLabelPresentation>,
     /// Laufzeitstatus.
     pub state: ToolState,
     /// Laufzeit in Millisekunden, `None` solange `state == Running`.
@@ -1687,6 +1822,160 @@ pub(crate) struct ToolCell {
 /// `HashMap<ToolCallId, SharedToolCell>`, um `TurnEvent::ToolCallCompleted`
 /// der richtigen Instanz zuzuordnen.
 pub(crate) type SharedToolCell = Arc<Mutex<ToolCell>>;
+
+/// Minimal owned wrapper data for a running call. Never stores write bodies,
+/// JSON payloads, heredoc bodies or unknown-tool arguments for relocalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolLabelPresentation {
+    Template {
+        key: &'static str,
+        english: &'static str,
+        args: Vec<(&'static str, String)>,
+    },
+    Shell {
+        head: String,
+        heredoc_lines: Option<usize>,
+    },
+    Pdf {
+        path: String,
+        pages: Option<String>,
+        remote_host: Option<String>,
+    },
+}
+
+impl ToolLabelPresentation {
+    fn from_call(call: &ToolCall) -> Option<Self> {
+        let arg = |key: &str| {
+            call.arguments
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        };
+        let single = |key, english, name, value: String| Self::Template {
+            key,
+            english,
+            args: vec![(name, value)],
+        };
+        Some(match call.name.as_str() {
+            "shell.exec" => Self::Shell {
+                head: crate::status_line::fit_width(
+                    arg("command").lines().next().unwrap_or(""),
+                    SHELL_LABEL_MAX_COLUMNS,
+                ),
+                heredoc_lines: heredoc_body_lines(arg("command")),
+            },
+            "fs.read" => single(
+                "tool_chrome.read",
+                "Read({path})",
+                "path",
+                arg("path").to_owned(),
+            ),
+            "fs.list" | "fs.glob" => single(
+                "tool_chrome.list",
+                "List({path})",
+                "path",
+                arg("path").to_owned(),
+            ),
+            "fs.write" => single(
+                "tool_chrome.write",
+                "Write({path})",
+                "path",
+                arg("path").to_owned(),
+            ),
+            "fs.edit" => single(
+                "tool_chrome.edit",
+                "Edit({path})",
+                "path",
+                arg("path").to_owned(),
+            ),
+            "fs.search" | "fs.grep" => Self::Template {
+                key: "tool_chrome.search",
+                english: "Search(\"{pattern}\" in {path})",
+                args: vec![
+                    ("pattern", arg("pattern").to_owned()),
+                    (
+                        "path",
+                        call.arguments
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(".")
+                            .to_owned(),
+                    ),
+                ],
+            },
+            "job.start" if !arg("name").trim().is_empty() => single(
+                "tool_chrome.job",
+                "Job({name})",
+                "name",
+                crate::status_line::fit_width(arg("name").trim(), 60),
+            ),
+            // Empty job names need a localized semantic fallback, not cached text.
+            "job.start" => Self::Template {
+                key: "tool_chrome.job_unnamed",
+                english: "Job(unnamed)",
+                args: vec![],
+            },
+            "agents.delegate"
+                if call
+                    .arguments
+                    .get("agent")
+                    .and_then(|v| v.as_str())
+                    .is_some() =>
+            {
+                single(
+                    "tool_chrome.agent",
+                    "Agent({role})",
+                    "role",
+                    arg("agent").to_owned(),
+                )
+            }
+            name if name.starts_with("transfer_to_") && name.len() > "transfer_to_".len() => {
+                single(
+                    "tool_chrome.agent",
+                    "Agent({role})",
+                    "role",
+                    name["transfer_to_".len()..].to_owned(),
+                )
+            }
+            "doc.read_pdf" => {
+                let target = harw_registry_defaults::remote_ocr_target();
+                Self::Pdf {
+                    path: arg("path").to_owned(),
+                    pages: call
+                        .arguments
+                        .get("pages")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                    remote_host: harw_registry_defaults::remote_ocr_host(call, target.as_ref())
+                        .map(str::to_owned),
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Template { key, english, args } => tr_args(
+                key,
+                english,
+                &args
+                    .iter()
+                    .map(|(k, v)| (*k, v.as_str()))
+                    .collect::<Vec<_>>(),
+            ),
+            Self::Shell {
+                head,
+                heredoc_lines,
+            } => shell_label(head, *heredoc_lines),
+            Self::Pdf {
+                path,
+                pages,
+                remote_host,
+            } => read_pdf_label(path, pages.as_deref(), remote_host.as_deref()),
+        }
+    }
+}
 
 /// Baut das kompakte Klartext-Label eines Werkzeugaufrufs (Claude-Code-Stil),
 /// niemals rohes JSON.
@@ -1735,24 +2024,12 @@ pub(crate) type SharedToolCell = Arc<Mutex<ToolCell>>;
 /// `String`, z. B. `"Shell(git status --short)"`, `"Read(src/app.rs)"`,
 /// `"Search(\"TODO\" in src)"`, `"Agent(explorer)"`.
 pub(crate) fn tool_label(call: &ToolCall) -> String {
+    if let Some(presentation) = ToolLabelPresentation::from_call(call) {
+        return presentation.render();
+    }
     let tool_name = call.name.as_str();
-    let object = call.arguments.as_object();
-    let str_arg = |key: &str| -> Option<&str> {
-        object
-            .and_then(|entries| entries.get(key))
-            .and_then(|v| v.as_str())
-    };
-
+    let str_arg = |key: &str| call.arguments.get(key).and_then(|v| v.as_str());
     match tool_name {
-        "shell.exec" => shell_label(str_arg("command").unwrap_or("")),
-        "job.start" => {
-            let name = str_arg("name").map(str::trim).unwrap_or("");
-            if name.is_empty() {
-                "Job(unbenannt)".to_owned()
-            } else {
-                format!("Job({})", truncate_chars(name, 60))
-            }
-        }
         "job.status" | "job.logs" => format!("{tool_name}({})", str_arg("job_id").unwrap_or("?")),
         "job.stop" => match str_arg("signal") {
             Some(signal) if !signal.is_empty() => {
@@ -1762,36 +2039,12 @@ pub(crate) fn tool_label(call: &ToolCall) -> String {
         },
         "job.list" => format!("job.list({})", str_arg("kind").unwrap_or("")),
         "plan" if str_arg("action").is_some() => plan_tool_label(call),
-        "fs.read" => format!("Read({})", str_arg("path").unwrap_or("")),
-        "fs.search" | "fs.grep" => format!(
-            "Search(\"{}\" in {})",
-            str_arg("pattern").unwrap_or(""),
-            str_arg("path").unwrap_or(".")
-        ),
-        "fs.list" | "fs.glob" => format!("List({})", str_arg("path").unwrap_or("")),
-        "fs.write" => format!("Write({})", str_arg("path").unwrap_or("")),
-        "fs.edit" => format!("Edit({})", str_arg("path").unwrap_or("")),
-        "doc.read_pdf" => {
-            let target = harw_registry_defaults::remote_ocr_target();
-            read_pdf_label(
-                str_arg("path").unwrap_or(""),
-                str_arg("pages"),
-                harw_registry_defaults::remote_ocr_host(call, target.as_ref()),
-            )
-        }
-        other if other.len() > "transfer_to_".len() && other.starts_with("transfer_to_") => {
-            format!("Agent({})", &other["transfer_to_".len()..])
-        }
-        // Plan R9, Teil C: `agents.delegate` ist derselbe Handoff.
-        "agents.delegate" if str_arg("agent").is_some() => {
-            format!("Agent({})", str_arg("agent").unwrap_or_default())
-        }
         _ => unknown_tool_label(call),
     }
 }
 
 /// Höchstlänge der ersten Befehlszeile im `Shell(…)`-Label.
-const SHELL_LABEL_MAX_CHARS: usize = 120;
+const SHELL_LABEL_MAX_COLUMNS: usize = 120;
 
 /// Label für `shell.exec`: `Shell(<erste Zeile>)`, bei einem Heredoc mit
 /// eingeklapptem Rumpf.
@@ -1809,12 +2062,15 @@ const SHELL_LABEL_MAX_CHARS: usize = 120;
 ///
 /// # Rückgabe
 /// Das unsanitisierte Label, z. B. `"Shell(python3 - <<'EOF' … heredoc 12 Zeilen)"`.
-fn shell_label(command: &str) -> String {
-    let first_line = command.lines().next().unwrap_or("");
-    let head = truncate_chars(first_line, SHELL_LABEL_MAX_CHARS);
-    match heredoc_body_lines(command) {
-        Some(count) => format!("Shell({head} … heredoc {count} Zeilen)"),
-        None => format!("Shell({head})"),
+fn shell_label(head: &str, heredoc_lines: Option<usize>) -> String {
+    match heredoc_lines {
+        Some(count) => message!(
+            "tool_chrome.heredoc",
+            "Shell({command} … heredoc {count} lines)",
+            command = head,
+            count = count
+        ),
+        None => message!("tool_chrome.shell", "Shell({command})", command = head),
     }
 }
 
@@ -1879,10 +2135,10 @@ fn plan_tool_label(call: &ToolCall) -> String {
     match (str_arg("id"), target) {
         (Some(id), Some(state)) => format!(
             "plan({action} {} → {})",
-            truncate_chars(id, 40),
-            truncate_chars(state, 20)
+            crate::status_line::fit_width(id, 40),
+            crate::status_line::fit_width(state, 20)
         ),
-        (Some(id), None) => format!("plan({action} {})", truncate_chars(id, 40)),
+        (Some(id), None) => format!("plan({action} {})", crate::status_line::fit_width(id, 40)),
         _ => format!("plan({action})"),
     }
 }
@@ -1892,11 +2148,21 @@ fn plan_tool_label(call: &ToolCall) -> String {
 /// geht (`remote_host` ist `Some`).
 fn read_pdf_label(path: &str, pages: Option<&str>, remote_host: Option<&str>) -> String {
     let base = match pages {
-        Some(pages) if !pages.is_empty() => format!("ReadPdf({path}, Seiten {pages})"),
-        _ => format!("ReadPdf({path})"),
+        Some(pages) if !pages.is_empty() => message!(
+            "tool_chrome.pdf_pages",
+            "ReadPdf({path}, pages {pages})",
+            path = path,
+            pages = pages
+        ),
+        _ => message!("tool_chrome.pdf", "ReadPdf({path})", path = path),
     };
     match remote_host {
-        Some(host) => format!("{base} → remote OCR ({host})"),
+        Some(host) => message!(
+            "tool_chrome.remote_ocr",
+            "{label} → remote OCR ({host})",
+            label = base,
+            host = host
+        ),
         None => base,
     }
 }
@@ -1922,7 +2188,7 @@ fn unknown_tool_label(call: &ToolCall) -> String {
             break;
         }
         let rendered = if let Some(text) = value.as_str() {
-            quote_approval_text(&truncate_chars(text, 40))
+            quote_approval_text(&crate::status_line::fit_width(text, 40))
         } else if value.is_number() || value.is_boolean() || value.is_null() {
             value.to_string()
         } else {
@@ -1940,9 +2206,16 @@ fn unknown_tool_label(call: &ToolCall) -> String {
 pub(crate) fn placement_badge(placement: &ToolPlacement) -> String {
     match placement {
         ToolPlacement::Gateway { node: Some(node) } if !node.trim().is_empty() => {
-            format!("gateway {}", truncate_chars(node.trim(), 32))
+            message!(
+                "tool_chrome.gateway_node",
+                "gateway {node}",
+                node = crate::status_line::fit_width(node.trim(), 32)
+            )
         }
-        other => other.label().to_owned(),
+        ToolPlacement::Host => tr("tool_chrome.host", "host").to_owned(),
+        ToolPlacement::Sandbox => tr("tool_chrome.sandbox", "sandbox").to_owned(),
+        ToolPlacement::Gateway { .. } => tr("tool_chrome.gateway", "gateway").to_owned(),
+        _ => tr("tool_chrome.unknown", "unknown").to_owned(),
     }
 }
 
@@ -2076,9 +2349,16 @@ impl ToolCell {
     /// # Rückgabe
     /// Neue [`ToolCell`] im Zustand `Running`.
     pub(crate) fn started(call: &ToolCall) -> Self {
+        let live_label = ToolLabelPresentation::from_call(call);
+        let label = live_label
+            .as_ref()
+            .map(ToolLabelPresentation::render)
+            .unwrap_or_else(|| tool_label(call));
         Self {
+            language: crate::i18n::current_language(),
             tool_name: call.name.as_str().to_owned(),
-            label: tool_label(call),
+            label,
+            live_label,
             state: ToolState::Running,
             duration_ms: None,
             preview: Vec::new(),
@@ -2103,8 +2383,10 @@ impl ToolCell {
     /// [`ToolVerbosity::Verbose`] zeigt für eine solche Zelle keine Argumente.
     pub(crate) fn labelled(tool_name: &str, label: String) -> Self {
         Self {
+            language: crate::i18n::current_language(),
             tool_name: tool_name.to_owned(),
             label,
+            live_label: None,
             state: ToolState::Running,
             duration_ms: None,
             preview: Vec::new(),
@@ -2149,7 +2431,10 @@ impl ToolCell {
     /// synthetisch angelegte Result-Zelle.
     pub(crate) fn resume_call(&mut self, call: &ToolCall) {
         self.tool_name = call.name.as_str().to_owned();
-        self.label = tool_label(call);
+        self.label = with_language(self.language, || tool_label(call));
+        self.live_label = (self.state == ToolState::Running)
+            .then(|| ToolLabelPresentation::from_call(call))
+            .flatten();
         self.arguments_json = call.arguments.to_string();
     }
 
@@ -2159,7 +2444,12 @@ impl ToolCell {
     /// Verlaufs); ein Turn-Ende nennt seinen echten Grund über
     /// [`Self::mark_incomplete_with`] (Runde 5, Teil M).
     pub(crate) fn mark_incomplete(&mut self) {
-        self.mark_incomplete_with("unvollständig (Resume-Abbruch)");
+        let reason = crate::i18n::tr_for(
+            self.language,
+            "tool_chrome.incomplete",
+            "incomplete (resume interrupted)",
+        );
+        self.mark_incomplete_with(reason);
     }
 
     /// Runde 5, Teil M: markiert einen offenen Aufruf als unvollständig und
@@ -2167,6 +2457,7 @@ impl ToolCell {
     pub(crate) fn mark_incomplete_with(&mut self, reason: &str) {
         if self.state == ToolState::Running {
             self.state = ToolState::Failed;
+            self.live_label = None;
             self.summary = Some(reason.to_owned());
         }
     }
@@ -2237,8 +2528,20 @@ impl ToolCell {
         duration_ms: u64,
         placement: Option<&ToolPlacement>,
     ) {
+        with_language(self.language, || {
+            self.complete_at_localized(result, duration_ms, placement)
+        });
+    }
+
+    fn complete_at_localized(
+        &mut self,
+        result: &ToolCallResult,
+        duration_ms: u64,
+        placement: Option<&ToolPlacement>,
+    ) {
         self.placement = placement.cloned().or_else(|| placement_from_result(result));
         self.duration_ms = Some(duration_ms);
+        self.live_label = None;
         match result {
             ToolCallResult::Error { message } => self.apply_error(message),
             ToolCallResult::Success { .. } => self.apply_success(result),
@@ -2259,8 +2562,7 @@ impl ToolCell {
         // Runde 5, Teil M: der Endbericht eines Kind-Agenten nennt den
         // echten Grund („abgebrochen: Zeitbudget 15 min erreicht · Übergabe
         // verfügbar") statt eines generischen Fehlers.
-        self.summary =
-            harw_core::parse_child_end(message).map(|header| harw_core::child_end_label(&header));
+        self.summary = harw_core::parse_child_end(message).map(|header| child_end_summary(&header));
         let first_line = message.lines().next().unwrap_or(message).to_owned();
         self.full_output = message.lines().map(str::to_owned).collect();
         self.preview = vec![first_line];
@@ -2303,7 +2605,11 @@ impl ToolCell {
                 self.summary = if exit_code == 0 {
                     None
                 } else {
-                    Some(format!("exit {exit_code}"))
+                    Some(message!(
+                        "tool_chrome.exit",
+                        "exit {code}",
+                        code = exit_code
+                    ))
                 };
                 self.preview = non_empty
                     .iter()
@@ -2330,7 +2636,11 @@ impl ToolCell {
                     }
                 };
                 self.state = ToolState::Succeeded;
-                self.summary = Some(format!("{line_count} Zeilen"));
+                self.summary = Some(message!(
+                    "tool_chrome.lines",
+                    "{count} lines",
+                    count = line_count
+                ));
                 self.preview = Vec::new();
                 self.hidden_lines = 0;
                 self.full_output = lines;
@@ -2365,9 +2675,11 @@ impl ToolCell {
                 // Eigene Darstellung statt des generischen `schlüssel: wert`-
                 // Fallbacks, der das ganze Array zu einer Riesenzeile machte.
                 let (array_key, noun) = match self.tool_name.as_str() {
-                    "explore.projects" => ("projects", "Projekte"),
-                    "explore.find" => ("matches", "Treffer"),
-                    _ => ("relations", "Beziehungen"),
+                    "explore.projects" => {
+                        ("projects", ("tool_chrome.projects", "{count} projects"))
+                    }
+                    "explore.find" => ("matches", ("tool_chrome.hits", "{count} hits")),
+                    _ => ("relations", ("tool_chrome.relations", "{count} relations")),
                 };
                 let is_relations = self.tool_name == "explore.relations";
                 let entries = value.get(array_key).and_then(|v| v.as_array());
@@ -2409,10 +2721,14 @@ impl ToolCell {
                     .unwrap_or(false);
                 let mut summary = match value.get("summary").and_then(|v| v.as_str()) {
                     Some(text) if array_key != "projects" => text.to_owned(),
-                    _ => format!("{total} {noun}"),
+                    _ => tr_args(noun.0, noun.1, &[("count", &total.to_string())]),
                 };
                 if truncated {
-                    summary.push_str(" (gekürzt)");
+                    summary = message!(
+                        "tool_chrome.truncated",
+                        "{summary} (truncated)",
+                        summary = summary
+                    );
                 }
                 self.summary = Some(summary);
                 self.hidden_lines = 0;
@@ -2436,14 +2752,20 @@ impl ToolCell {
                 let message = value
                     .get("user_message")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("LaTeX ist nicht installiert.");
+                    .unwrap_or_else(|| {
+                        tr("tool_chrome.latex_unavailable", "LaTeX is not installed.")
+                    });
                 let lines: Vec<String> = message
                     .split(" · ")
                     .map(|part| part.trim().to_owned())
                     .filter(|part| !part.is_empty())
                     .collect();
                 self.state = ToolState::Failed;
-                self.summary = Some(format!("LaTeX nicht installiert: {}", missing.join(", ")));
+                self.summary = Some(message!(
+                    "tool_chrome.latex_missing",
+                    "LaTeX not installed: {programs}",
+                    programs = missing.join(", ")
+                ));
                 self.preview = lines.clone();
                 self.hidden_lines = 0;
                 self.full_output = lines;
@@ -2459,9 +2781,9 @@ impl ToolCell {
                     .unwrap_or(0);
                 let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("?");
                 let noun = if replacements == 1 {
-                    "Ersetzung"
+                    ("tool_chrome.replacement", "{count} replacement in {path}")
                 } else {
-                    "Ersetzungen"
+                    ("tool_chrome.replacements", "{count} replacements in {path}")
                 };
                 let diff: Vec<String> = value
                     .get("diff_excerpt")
@@ -2476,7 +2798,11 @@ impl ToolCell {
                     .cloned()
                     .collect();
                 self.state = ToolState::Succeeded;
-                self.summary = Some(format!("{replacements} {noun} in {path}"));
+                self.summary = Some(tr_args(
+                    noun.0,
+                    noun.1,
+                    &[("count", &replacements.to_string()), ("path", path)],
+                ));
                 self.preview = changed
                     .iter()
                     .take(TOOL_CELL_COLLAPSED_LINES)
@@ -2501,11 +2827,15 @@ impl ToolCell {
                 parts.extend(field("job_id").map(str::to_owned));
                 parts.extend(field("state").map(str::to_owned));
                 if let Some(code) = status.get("exit_code").and_then(|v| v.as_i64()) {
-                    parts.push(format!("exit {code}"));
+                    parts.push(message!("tool_chrome.exit", "exit {code}", code = code));
                 }
                 let mut lines: Vec<String> = Vec::new();
                 if let Some(command) = field("command") {
-                    lines.push(format!("Befehl: {command}"));
+                    lines.push(message!(
+                        "tool_chrome.command",
+                        "Command: {command}",
+                        command = command
+                    ));
                 }
                 if let Some(cwd) = field("cwd") {
                     lines.push(format!("cwd: {cwd}"));
@@ -2535,7 +2865,7 @@ impl ToolCell {
                     .map(|matches| matches.len())
                     .unwrap_or(0);
                 self.state = ToolState::Succeeded;
-                self.summary = Some(format!("{count} Treffer"));
+                self.summary = Some(message!("tool_chrome.hits", "{count} hits", count = count));
                 self.preview = Vec::new();
                 self.hidden_lines = 0;
                 self.full_output = Vec::new();
@@ -2600,7 +2930,7 @@ impl ToolCell {
         }
         if let Some(placement) = &self.placement {
             text.push_str(" · ");
-            text.push_str(&placement_badge(placement));
+            text.push_str(&with_language(self.language, || placement_badge(placement)));
         }
         if let Some(note) = &self.approval_note {
             text.push_str(&format!(" · {note}"));
@@ -2640,6 +2970,11 @@ impl ToolCell {
         verbosity: ToolVerbosity,
         expanded_flag: bool,
     ) -> Vec<Line<'static>> {
+        let label = self
+            .live_label
+            .as_ref()
+            .map(ToolLabelPresentation::render)
+            .unwrap_or_else(|| self.label.clone());
         let verbose = matches!(verbosity, ToolVerbosity::Verbose);
         let expanded = expanded_flag || verbose;
 
@@ -2668,7 +3003,7 @@ impl ToolCell {
                     style: glyph_style,
                 },
                 HeaderPart {
-                    text: &self.label,
+                    text: &label,
                     style: label_style,
                 },
                 HeaderPart {
@@ -2689,7 +3024,7 @@ impl ToolCell {
                 style: glyph_style,
             },
             HeaderPart {
-                text: &self.label,
+                text: &label,
                 style: label_style,
             },
             HeaderPart {
@@ -2707,7 +3042,11 @@ impl ToolCell {
             }
             if arg_lines.len() > TOOL_CELL_VERBOSE_ARGUMENT_LINES {
                 let elided = arg_lines.len() - TOOL_CELL_VERBOSE_ARGUMENT_LINES;
-                let note = format!("… +{elided} Zeilen Argumente");
+                let note = message!(
+                    "tool_chrome.arguments_hidden",
+                    "… +{count} argument lines",
+                    count = elided
+                );
                 push_indented_wrapped(&mut lines, &note, width, TOOL_RESULT_CONTINUATION, dim);
             }
         }
@@ -2740,7 +3079,11 @@ impl ToolCell {
                 dim,
             );
             if hidden > 0 {
-                push_body(&format!("… +{hidden} Zeilen"), &mut lines, &mut body_first);
+                push_body(
+                    &message!("tool_chrome.hidden", "… +{count} lines", count = hidden),
+                    &mut lines,
+                    &mut body_first,
+                );
             }
         } else {
             let mut hidden = self.push_body_rows(
@@ -2757,7 +3100,11 @@ impl ToolCell {
                 .map(|row| wrapped_row_count(row, width, TOOL_RESULT_CONTINUATION))
                 .sum::<usize>();
             if hidden > 0 {
-                let note = format!("… +{hidden} Zeilen (ctrl+o zum Ausklappen)");
+                let note = message!(
+                    "tool_chrome.expand",
+                    "… +{count} lines (ctrl+o to expand)",
+                    count = hidden
+                );
                 push_body(&note, &mut lines, &mut body_first);
             }
         }
@@ -3004,10 +3351,7 @@ fn push_indented_wrapped_capped(
     for (i, raw) in wrapped.into_iter().take(shown).enumerate() {
         let prefix = if i == 0 { lead } else { continuation.as_str() };
         let text = if hidden > 0 && i + 1 == shown {
-            let keep = usize::from(inner_width).saturating_sub(1);
-            let mut cut: String = raw.chars().take(keep).collect();
-            cut.push('…');
-            cut
+            crate::status_line::fit_width(&format!("{raw}…"), usize::from(inner_width))
         } else {
             raw
         };
@@ -3061,6 +3405,8 @@ fn push_indented_wrapped_capped(
 ///   Approval-Entscheidungen.
 #[derive(Debug)]
 pub(crate) struct ToolGroupCell {
+    /// Locale of this generated historical presentation. Never inferred from text.
+    pub(crate) language: UiLanguage,
     /// Die gruppierten Zellen in Ankunftsreihenfolge.
     pub cells: Vec<SharedToolCell>,
     /// Nutzer-Umschalter (Ctrl+O).
@@ -3086,6 +3432,7 @@ pub(crate) struct ActivityProjection {
     /// Title of the compact line: the path (`src/a.rs`) or the job label
     /// (`Job(build)`). Raw; sanitized when rendered.
     pub(crate) title: String,
+    live_title: Option<ToolLabelPresentation>,
     /// Latest snapshot of the projection (`ProjectionUpdate::instance`).
     pub(crate) instance: PatternInstance,
 }
@@ -3101,6 +3448,7 @@ impl ToolGroupCell {
     /// Erzeugt eine leere Lese-Gruppe (eingeklappt, ohne Zellen).
     pub(crate) fn new() -> Self {
         Self {
+            language: crate::i18n::current_language(),
             cells: Vec::new(),
             expanded: false,
             kind: ToolGroupKind::Reads,
@@ -3110,10 +3458,49 @@ impl ToolGroupCell {
     /// An empty group for one reducer projection (PL-97 M3), titled `title`.
     pub(crate) fn for_projection(title: String, instance: PatternInstance) -> Self {
         Self {
+            language: crate::i18n::current_language(),
             cells: Vec::new(),
             expanded: false,
-            kind: ToolGroupKind::Activity(Box::new(ActivityProjection { title, instance })),
+            kind: ToolGroupKind::Activity(Box::new(ActivityProjection {
+                title,
+                live_title: None,
+                instance,
+            })),
         }
+    }
+
+    /// Keeps only the owned job-title semantics needed while its run is live.
+    pub(crate) fn for_projection_with_call(
+        title: String,
+        instance: PatternInstance,
+        call: &ToolCall,
+    ) -> Self {
+        let live_title = if instance.pattern == PatternId::JOB_LIFECYCLE {
+            if call.name.as_str() == "job.start" {
+                ToolLabelPresentation::from_call(call)
+            } else {
+                instance.key.as_ref().and_then(|key| match key {
+                    harw_activity::ActivityKey::Job(id) => Some(ToolLabelPresentation::Template {
+                        key: "tool_chrome.job",
+                        english: "Job({name})",
+                        args: vec![("name", id.clone())],
+                    }),
+                    _ => None,
+                })
+            }
+        } else {
+            None
+        };
+        let mut group = Self::for_projection(title, instance);
+        if let ToolGroupKind::Activity(projection) = &mut group.kind {
+            projection.live_title = live_title;
+        }
+        group
+    }
+
+    fn has_live_presentation(&self) -> bool {
+        self.tally().running > 0
+            || matches!(&self.kind, ToolGroupKind::Activity(projection) if projection.instance.state.counts.running > 0)
     }
 
     /// Takes over a newer snapshot of the group's projection.
@@ -3208,6 +3595,22 @@ impl ToolGroupCell {
         theme: style::Theme,
         verbosity: ToolVerbosity,
     ) -> Vec<Line<'static>> {
+        with_language(
+            if self.has_live_presentation() {
+                crate::i18n::current_language()
+            } else {
+                self.language
+            },
+            || self.localized_lines(width, theme, verbosity),
+        )
+    }
+
+    fn localized_lines(
+        &self,
+        width: u16,
+        theme: style::Theme,
+        verbosity: ToolVerbosity,
+    ) -> Vec<Line<'static>> {
         let expanded = self.expanded || matches!(verbosity, ToolVerbosity::Verbose);
         if let ToolGroupKind::Activity(projection) = &self.kind {
             return self.activity_lines(projection, expanded, width, theme, verbosity);
@@ -3222,30 +3625,60 @@ impl ToolGroupCell {
         let tally = self.tally();
         let mut parts: Vec<String> = Vec::new();
         if tally.read > 0 {
-            let noun = if tally.read == 1 { "Datei" } else { "Dateien" };
-            parts.push(format!("{} {noun} gelesen", tally.read));
+            parts.push(if tally.read == 1 {
+                message!(
+                    "activity_chrome.read_one",
+                    "{count} file read",
+                    count = tally.read
+                )
+            } else {
+                message!(
+                    "activity_chrome.read_many",
+                    "{count} files read",
+                    count = tally.read
+                )
+            });
         }
         if tally.search > 0 {
-            parts.push(format!("{} Muster gesucht", tally.search));
+            parts.push(message!(
+                "activity_chrome.searches",
+                "{count} patterns searched",
+                count = tally.search
+            ));
         }
         if tally.list > 0 {
-            let noun = if tally.list == 1 {
-                "Verzeichnis"
+            parts.push(if tally.list == 1 {
+                message!(
+                    "activity_chrome.list_one",
+                    "{count} directory listed",
+                    count = tally.list
+                )
             } else {
-                "Verzeichnisse"
-            };
-            parts.push(format!("{} {noun} gelistet", tally.list));
+                message!(
+                    "activity_chrome.list_many",
+                    "{count} directories listed",
+                    count = tally.list
+                )
+            });
         }
         if tally.other > 0 {
-            let noun = if tally.other == 1 {
-                "weiterer Lesezugriff"
+            parts.push(if tally.other == 1 {
+                message!(
+                    "activity_chrome.other_one",
+                    "{count} other read",
+                    count = tally.other
+                )
             } else {
-                "weitere Lesezugriffe"
-            };
-            parts.push(format!("{} {noun}", tally.other));
+                message!(
+                    "activity_chrome.other_many",
+                    "{count} other reads",
+                    count = tally.other
+                )
+            });
         }
+
         let summary = if parts.is_empty() {
-            "0 Werkzeuge".to_owned()
+            tr("activity_chrome.no_tools", "0 tools").to_owned()
         } else {
             parts.join(", ")
         };
@@ -3277,7 +3710,11 @@ impl ToolGroupCell {
         );
 
         if tally.failed > 0 {
-            let note = format!("{} fehlgeschlagen", tally.failed);
+            let note = message!(
+                "activity_chrome.failed_count",
+                "{count} failed",
+                count = tally.failed
+            );
             push_indented_wrapped(
                 &mut lines,
                 &note,
@@ -3307,7 +3744,7 @@ impl ToolGroupCell {
         for cell in &self.cells {
             let Ok(guard) = cell.lock() else {
                 lines.push(Line::from(Span::styled(
-                    "⚠ Werkzeugzelle nicht lesbar (Sperre vergiftet)",
+                    tr("tool_chrome.lock", "⚠ Tool cell unreadable (poisoned lock)"),
                     style::warning_style(theme),
                 )));
                 continue;
@@ -3337,7 +3774,7 @@ impl ToolGroupCell {
                     guard.render_lines(width, theme, verbosity, guard.expanded || expanded)
                 }
                 Err(_) => vec![Line::from(Span::styled(
-                    "⚠ Werkzeugzelle nicht lesbar (Sperre vergiftet)",
+                    tr("tool_chrome.lock", "⚠ Tool cell unreadable (poisoned lock)"),
                     style::warning_style(theme),
                 ))],
             };
@@ -3358,6 +3795,15 @@ impl ToolGroupCell {
             ("● ", style::success_style(theme))
         };
         let tail = activity_tail(instance);
+        let title = if self.has_live_presentation() {
+            projection
+                .live_title
+                .as_ref()
+                .map(ToolLabelPresentation::render)
+                .unwrap_or_else(|| projection.title.clone())
+        } else {
+            projection.title.clone()
+        };
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         push_header_line(
@@ -3367,7 +3813,7 @@ impl ToolGroupCell {
                 style: glyph_style,
             },
             HeaderPart {
-                text: &projection.title,
+                text: &title,
                 style: Style::default().add_modifier(Modifier::BOLD),
             },
             HeaderPart {
@@ -3379,7 +3825,11 @@ impl ToolGroupCell {
         if counts.failed > 0 && verbosity != ToolVerbosity::Activity {
             push_indented_wrapped(
                 &mut lines,
-                &format!("{} fehlgeschlagen", counts.failed),
+                &message!(
+                    "activity_chrome.failed_count",
+                    "{count} failed",
+                    count = counts.failed
+                ),
                 width,
                 TOOL_RESULT_LEAD,
                 style::error_style(theme),
@@ -3409,10 +3859,11 @@ fn activity_tail(instance: &PatternInstance) -> String {
         if is_job && matches!(verb, "start" | "run") {
             continue;
         }
-        let shown = if is_job {
-            verb.to_owned()
-        } else {
-            capitalize(verb)
+        let shown = match verb {
+            "read" | "edit" | "write" | "search" | "grep" | "list" | "glob" | "status" | "logs"
+            | "stop" => activity_verb_text(verb),
+            other if is_job => other.to_owned(),
+            other => capitalize(other),
         };
         let mut part = format!("{shown} ×{}", tally.counts.total);
         if tally.counts.failed > 0 {
@@ -3421,7 +3872,11 @@ fn activity_tail(instance: &PatternInstance) -> String {
         parts.push(part);
     }
     if !is_job && instance.state.counts.running > 0 {
-        parts.push(format!("{} läuft", instance.state.counts.running));
+        parts.push(message!(
+            "activity_chrome.running_count",
+            "{count} running",
+            count = instance.state.counts.running
+        ));
     }
     parts
         .iter()
@@ -3431,19 +3886,100 @@ fn activity_tail(instance: &PatternInstance) -> String {
 
 /// Zustand eines Jobs aus seiner Lauf-Konstituente (`run`, nach dem Rebase
 /// `Call(C) → Job(W)`); vor der Bindung `startet` bzw. `nicht gestartet`.
-fn job_phase_text(instance: &PatternInstance) -> &'static str {
+pub(crate) fn job_phase_text(instance: &PatternInstance) -> &'static str {
     let run = instance
         .state
         .members
         .iter()
         .find(|member| member.verb == "run");
     match run.map(|member| &member.status) {
-        Some(ConstituentStatus::Running) => "läuft",
-        Some(ConstituentStatus::Succeeded) => "beendet",
-        Some(ConstituentStatus::Failed { .. }) => "fehlgeschlagen",
-        Some(ConstituentStatus::Cancelled) => "gestoppt",
-        None if instance.is_terminal() => "nicht gestartet",
-        None => "startet",
+        Some(ConstituentStatus::Running) => tr("activity_chrome.phase_running", "running"),
+        Some(ConstituentStatus::Succeeded) => tr("activity_chrome.phase_finished", "finished"),
+        Some(ConstituentStatus::Failed { .. }) => tr("activity_chrome.phase_failed", "failed"),
+        Some(ConstituentStatus::Cancelled) => tr("activity_chrome.phase_stopped", "stopped"),
+        None if instance.is_terminal() => tr("activity_chrome.phase_not_started", "not started"),
+        None => tr("activity_chrome.phase_starting", "starting"),
+    }
+}
+
+/// Presentation only; serialized node values and reducer identities remain unchanged.
+pub(crate) fn plan_node_status_text(value: harw_plan::PlanNodeStatus) -> &'static str {
+    match value {
+        harw_plan::PlanNodeStatus::Draft => tr("activity_chrome.node_draft", "Draft"),
+        harw_plan::PlanNodeStatus::Ready => tr("activity_chrome.node_ready", "Ready"),
+        harw_plan::PlanNodeStatus::InProgress => {
+            tr("activity_chrome.node_inprogress", "In progress")
+        }
+        harw_plan::PlanNodeStatus::Blocked => tr("activity_chrome.node_blocked", "Blocked"),
+        harw_plan::PlanNodeStatus::Completed => tr("activity_chrome.node_completed", "Completed"),
+        harw_plan::PlanNodeStatus::Superseded => {
+            tr("activity_chrome.node_superseded", "Superseded")
+        }
+        harw_plan::PlanNodeStatus::Invalidated => {
+            tr("activity_chrome.node_invalidated", "Invalidated")
+        }
+    }
+}
+
+/// Presentation only; serialized node values and reducer identities remain unchanged.
+pub(crate) fn plan_node_kind_text(value: harw_plan::PlanNodeKind) -> &'static str {
+    match value {
+        harw_plan::PlanNodeKind::Research => tr("activity_chrome.node_research", "Research"),
+        harw_plan::PlanNodeKind::Explore => tr("activity_chrome.node_explore", "Explore"),
+        harw_plan::PlanNodeKind::Analysis => tr("activity_chrome.node_analysis", "Analysis"),
+        harw_plan::PlanNodeKind::Synthesis => tr("activity_chrome.node_synthesis", "Synthesis"),
+        harw_plan::PlanNodeKind::Contract => tr("activity_chrome.node_contract", "Contract"),
+        harw_plan::PlanNodeKind::Coding => tr("activity_chrome.node_coding", "Coding"),
+        harw_plan::PlanNodeKind::Integration => {
+            tr("activity_chrome.node_integration", "Integration")
+        }
+        harw_plan::PlanNodeKind::Verification => {
+            tr("activity_chrome.node_verification", "Verification")
+        }
+        harw_plan::PlanNodeKind::Docs => tr("activity_chrome.node_docs", "Documentation"),
+        harw_plan::PlanNodeKind::Composite => tr("activity_chrome.node_composite", "Composite"),
+    }
+}
+
+/// Local wrapper for typed child-end metadata; the report body and reason remain payload.
+fn child_end_summary(header: &harw_core::ChildEndHeader) -> String {
+    use harw_core::ChildEndStatus;
+    match (header.status, header.handoff) {
+        (ChildEndStatus::Failed, true) => message!(
+            "tool_chrome.child_failed_handoff",
+            "failed: {reason} · handoff available",
+            reason = header.reason
+        ),
+        (ChildEndStatus::Failed, false) => message!(
+            "tool_chrome.child_failed_journal",
+            "failed: {reason} · journal available",
+            reason = header.reason
+        ),
+        (_, true) => message!(
+            "tool_chrome.child_cancelled_handoff",
+            "cancelled: {reason} · handoff available",
+            reason = header.reason
+        ),
+        (_, false) => message!(
+            "tool_chrome.child_cancelled_journal",
+            "cancelled: {reason} · journal available",
+            reason = header.reason
+        ),
+    }
+}
+
+/// Localized presentation of known activity verbs; unknown extension verbs remain payload.
+pub(crate) fn activity_verb_text(verb: &str) -> String {
+    match verb {
+        "read" => tr("activity_chrome.verb_read", "Read").to_owned(),
+        "edit" => tr("activity_chrome.verb_edit", "Edit").to_owned(),
+        "write" => tr("activity_chrome.verb_write", "Write").to_owned(),
+        "search" | "grep" => tr("activity_chrome.verb_search", "Search").to_owned(),
+        "list" | "glob" => tr("activity_chrome.verb_list", "List").to_owned(),
+        "status" => tr("activity_chrome.verb_status", "status").to_owned(),
+        "logs" => tr("activity_chrome.verb_logs", "logs").to_owned(),
+        "stop" => tr("activity_chrome.verb_stop", "stop").to_owned(),
+        other => other.to_owned(),
     }
 }
 
@@ -3647,7 +4183,7 @@ mod tests {
         let expected = vec![
             "∴ Reasoning".to_owned(),
             "│ Erste Zeile".to_owned(),
-            "│ … (3 Zeilen · Ctrl+O)".to_owned(),
+            "│ … (3 lines · Ctrl+O)".to_owned(),
         ];
         if lines != expected {
             return Err(TestError::Unexpected(format!("war: {lines:?}")));
@@ -3716,7 +4252,7 @@ mod tests {
         let expanded = ReasoningHistoryCell::new(text).with_expanded(true);
         let full = expanded.display_lines(30, style::Theme::Dark);
         let short = lines_to_strings(&collapsed.display_lines(30, style::Theme::Dark));
-        let hint = format!("… ({} Zeilen · Ctrl+O)", full.len() - 1);
+        let hint = format!("… ({} lines · Ctrl+O)", full.len() - 1);
         if full.len() < 3 || short.len() != 3 || !short[2].contains(&hint) {
             return Err(TestError::Unexpected(format!(
                 "voll: {} Zeilen, kurz: {short:?}",
@@ -3819,6 +4355,7 @@ mod tests {
     #[test]
     fn test_subagent_cell_renders_running_state_with_role_question_and_counts() {
         let cell = SubAgentCell {
+            language: crate::i18n::current_language(),
             child_id: "child-1".to_owned(),
             role: "explorer".to_owned(),
             question: Some("Wie sieht X aus?".to_owned()),
@@ -3831,7 +4368,7 @@ mod tests {
         // Die Kind-Kennung steht in der Zeile, weil bei einem Fan-out mehrere
         // Kinder derselben Rolle laufen und sonst nicht unterscheidbar wären.
         assert_eq!(
-            rendered[0], "▶ explorer [child-1]: Wie sieht X aus? — läuft · 3 Tools · 128 Tok",
+            rendered[0], "▶ explorer [child-1]: Wie sieht X aus? — running · 3 tools · 128 tokens",
             "war: {:?}",
             rendered[0]
         );
@@ -3843,6 +4380,7 @@ mod tests {
     fn test_subagent_cells_of_the_same_role_stay_distinguishable() {
         let render = |child: &str| {
             let cell = SubAgentCell {
+                language: crate::i18n::current_language(),
                 child_id: child.to_owned(),
                 role: "explorer".to_owned(),
                 question: Some("Wie sieht X aus?".to_owned()),
@@ -3862,7 +4400,7 @@ mod tests {
             first, second,
             "zwei Kinder derselben Rolle dürfen nicht identisch gerendert werden"
         );
-        assert!(first.ends_with("· 0 Tok"), "war: {first:?}");
+        assert!(first.ends_with("· 0 tokens"), "war: {first:?}");
         assert!(
             first.contains("orer-1]"),
             "das unterscheidende Ende muss sichtbar bleiben, war: {first:?}"
@@ -3879,13 +4417,14 @@ mod tests {
         // nicht über Bytes — sonst entstünde ungültiges UTF-8. "aaaaaaaaaaüber"
         // sind 14 Zeichen (aber 15 Bytes); bei `max = 6` bleiben die letzten 5.
         assert_eq!(truncate_id_tail("aaaaaaaaaaüber", 6), "…aüber");
-        assert_eq!(truncate_id_tail("egal", 0), "egal");
+        assert_eq!(truncate_id_tail("egal", 0), "");
     }
 
     /// Prüft, dass ein fehlender Auftrag als Platzhaltertext gerendert wird.
     #[test]
     fn test_subagent_cell_no_question_shows_placeholder() {
         let cell = SubAgentCell {
+            language: crate::i18n::current_language(),
             child_id: "child-2".to_owned(),
             role: "worker".to_owned(),
             question: None,
@@ -3896,7 +4435,7 @@ mod tests {
         let lines = cell.display_lines(120, style::Theme::Dark);
         let rendered = lines_to_strings(&lines);
         assert!(
-            rendered[0].contains("(kein Auftrag angegeben)"),
+            rendered[0].contains("(no task supplied)"),
             "war: {:?}",
             rendered[0]
         );
@@ -3907,6 +4446,7 @@ mod tests {
     #[test]
     fn test_subagent_cell_apply_progress_updates_counts() {
         let mut cell = SubAgentCell {
+            language: crate::i18n::current_language(),
             child_id: "child-3".to_owned(),
             role: "explorer".to_owned(),
             question: None,
@@ -3920,7 +4460,7 @@ mod tests {
         let lines = cell.display_lines(120, style::Theme::Dark);
         let rendered = lines_to_strings(&lines);
         assert!(
-            rendered[0].contains("5 Tools · 999 Tok"),
+            rendered[0].contains("5 tools · 999 tokens"),
             "war: {:?}",
             rendered[0]
         );
@@ -3931,6 +4471,7 @@ mod tests {
     #[test]
     fn test_subagent_cell_apply_completion_success_shows_fertig() {
         let mut cell = SubAgentCell {
+            language: crate::i18n::current_language(),
             child_id: "child-4".to_owned(),
             role: "explorer".to_owned(),
             question: None,
@@ -3949,7 +4490,7 @@ mod tests {
         let lines = cell.display_lines(120, style::Theme::Dark);
         let rendered = lines_to_strings(&lines);
         assert!(
-            rendered[0].starts_with("✓ ") && rendered[0].contains("fertig (512ms)"),
+            rendered[0].starts_with("✓ ") && rendered[0].contains("done (512ms)"),
             "war: {:?}",
             rendered[0]
         );
@@ -3960,6 +4501,7 @@ mod tests {
     #[test]
     fn test_subagent_cell_apply_completion_failure_shows_gescheitert() {
         let mut cell = SubAgentCell {
+            language: crate::i18n::current_language(),
             child_id: "child-5".to_owned(),
             role: "explorer".to_owned(),
             question: None,
@@ -3972,7 +4514,7 @@ mod tests {
         let rendered = lines_to_strings(&lines);
         assert!(
             rendered[0].starts_with("✗ ")
-                && rendered[0].contains("gescheitert: budget_exceeded (900ms)"),
+                && rendered[0].contains("failed: budget_exceeded (900ms)"),
             "war: {:?}",
             rendered[0]
         );
@@ -3998,7 +4540,7 @@ mod tests {
         assert!(joined.contains("t-1"), "war: {joined:?}");
         assert!(joined.contains("Coding"), "war: {joined:?}");
         assert!(joined.contains("Ready"), "war: {joined:?}");
-        assert!(joined.contains("Welle 2"), "war: {joined:?}");
+        assert!(joined.contains("Wave 2"), "war: {joined:?}");
         assert!(joined.contains("Auth-Modul refactorn"), "war: {joined:?}");
     }
 
@@ -4027,7 +4569,7 @@ mod tests {
         let last_content = &rendered[rendered.len() - 1];
         assert_eq!(
             last_content,
-            &format!("… 5 weitere Knoten ausgeblendet (insgesamt {total_nodes})"),
+            &format!("… 5 more nodes hidden ({total_nodes} total)"),
             "war: {last_content:?}"
         );
     }
@@ -4040,7 +4582,7 @@ mod tests {
         let cell = PlanGraphCell::full(plan);
         let lines = cell.display_lines(80, style::Theme::Dark);
         let rendered = lines_to_strings(&lines);
-        assert_eq!(rendered, vec!["(keine Knoten im Plan)".to_owned()]);
+        assert_eq!(rendered, vec!["(no nodes in plan)".to_owned()]);
     }
 
     /// TUI-03: ein weiterer Stand desselben Plans zeigt eingeklappt nur
@@ -4069,7 +4611,7 @@ mod tests {
             "Fortschritt + Knoten + Hinweis: {collapsed:?}"
         );
         assert!(
-            collapsed[0].contains("1/95 erledigt (1 %)"),
+            collapsed[0].contains("1/95 done (1 %)"),
             "war: {collapsed:?}"
         );
         assert!(
@@ -4077,20 +4619,18 @@ mod tests {
             "war: {collapsed:?}"
         );
         assert_eq!(
-            collapsed[2], "… 95 Knoten · ctrl+o zum Ausklappen",
+            collapsed[2], "… 95 nodes · ctrl+o to expand",
             "war: {collapsed:?}"
         );
         assert!(
-            !collapsed
-                .iter()
-                .any(|l| l.contains("weitere Knoten ausgeblendet")),
+            !collapsed.iter().any(|l| l.contains("more nodes hidden")),
             "war: {collapsed:?}"
         );
 
         cell.set_expanded(true);
         let expanded = lines_to_strings(&cell.display_lines(120, style::Theme::Dark));
         assert_eq!(expanded.len(), total_nodes + 1, "Fortschritt + alle Knoten");
-        assert!(expanded[0].contains("1/95 erledigt"), "war: {expanded:?}");
+        assert!(expanded[0].contains("1/95 done"), "war: {expanded:?}");
     }
 
     /// Delta ohne Knotenänderung und mit entfernten Knoten nennt beides; ein
@@ -4111,7 +4651,7 @@ mod tests {
         let rendered = lines_to_strings(&cell.display_lines(120, style::Theme::Dark));
         assert_eq!(
             rendered.last().map(String::as_str),
-            Some("… keine Knotenänderung · 1 Knoten entfernt · 1 Knoten · ctrl+o zum Ausklappen"),
+            Some("… no node changes · 1 nodes removed · 1 nodes · ctrl+o to expand"),
             "war: {rendered:?}"
         );
 
@@ -4160,10 +4700,12 @@ mod tests {
             }),
             Box::new(ReasoningHistoryCell::new(HOSTILE)),
             Box::new(ReasoningHistoryCell {
+                language: crate::i18n::current_language(),
                 expanded: true,
                 ..ReasoningHistoryCell::new(format!("{HOSTILE}\n{HOSTILE}")).with_origin(HOSTILE)
             }),
             Box::new(SubAgentCell {
+                language: crate::i18n::current_language(),
                 child_id: HOSTILE.to_owned(),
                 role: HOSTILE.to_owned(),
                 question: Some(HOSTILE.to_owned()),
@@ -4176,6 +4718,7 @@ mod tests {
             }),
             Box::new(PlanGraphCell::full(make_plan(vec![plan_node]))),
             Box::new(GoalCell {
+                language: crate::i18n::current_language(),
                 statement: HOSTILE.to_owned(),
                 report: GoalReport {
                     criteria_met: vec![],
@@ -4240,21 +4783,22 @@ mod tests {
             next_actions: vec![],
         };
         let cell = GoalCell {
+            language: crate::i18n::current_language(),
             statement: "Testziel".to_owned(),
             report,
         };
         let lines = cell.display_lines(120, style::Theme::Dark);
         let joined = lines_to_strings(&lines).join("\n");
 
-        assert!(joined.contains("◎ Ziel: Testziel"), "war: {joined:?}");
+        assert!(joined.contains("◎ Goal: Testziel"), "war: {joined:?}");
         assert!(
-            joined.contains("Kriterien: 1 von 2 erfüllt (50 %)"),
+            joined.contains("Criteria: 1 of 2 met (50 %)"),
             "war: {joined:?}"
         );
-        assert!(joined.contains("Kriterium 1: erfüllt"), "war: {joined:?}");
-        assert!(joined.contains("Kriterium 2: offen"), "war: {joined:?}");
+        assert!(joined.contains("Criterion 1: met"), "war: {joined:?}");
+        assert!(joined.contains("Criterion 2: open"), "war: {joined:?}");
         assert!(
-            joined.contains("Invariante 'inv-1' nicht belegt"),
+            joined.contains("Invariant 'inv-1' not evidenced"),
             "war: {joined:?}"
         );
     }
@@ -4271,13 +4815,14 @@ mod tests {
             next_actions: vec![],
         };
         let cell = GoalCell {
+            language: crate::i18n::current_language(),
             statement: "Ziel".to_owned(),
             report,
         };
         let lines = cell.display_lines(120, style::Theme::Dark);
         let joined = lines_to_strings(&lines).join("\n");
         assert!(
-            joined.contains("Kriterien: 0 von 3 erfüllt (0 %)"),
+            joined.contains("Criteria: 0 of 3 met (0 %)"),
             "war: {joined:?}"
         );
         assert!(
@@ -4300,13 +4845,14 @@ mod tests {
             next_actions: vec![],
         };
         let cell = GoalCell {
+            language: crate::i18n::current_language(),
             statement: "Ziel".to_owned(),
             report,
         };
         let lines = cell.display_lines(120, style::Theme::Dark);
         let joined = lines_to_strings(&lines).join("\n");
         assert!(
-            joined.contains("Kriterien: 0 von 0 erfüllt (100 %)"),
+            joined.contains("Criteria: 0 of 0 met (100 %)"),
             "war: {joined:?}"
         );
         assert!(
@@ -4330,6 +4876,7 @@ mod tests {
             next_actions: vec![],
         };
         let cell = GoalCell {
+            language: crate::i18n::current_language(),
             statement: "Ziel".to_owned(),
             report,
         };
@@ -4422,7 +4969,7 @@ mod tests {
         );
         assert_eq!(
             tool_label(&call),
-            "Shell(cd crate && python3 - <<'EOF' … heredoc 3 Zeilen)"
+            "Shell(cd crate && python3 - <<'EOF' … heredoc 3 lines)"
         );
 
         // `<<-"END"` mit eingerücktem Trenner; danach ohne Trenner: alle übrigen Zeilen.
@@ -4432,7 +4979,7 @@ mod tests {
         );
         assert_eq!(
             tool_label(&dashed),
-            "Shell(cat <<-\"END\" > f … heredoc 1 Zeilen)"
+            "Shell(cat <<-\"END\" > f … heredoc 1 lines)"
         );
         let unterminated = make_tool_call(
             "shell.exec",
@@ -4440,7 +4987,7 @@ mod tests {
         );
         assert_eq!(
             tool_label(&unterminated),
-            "Shell(cat <<EOF … heredoc 2 Zeilen)"
+            "Shell(cat <<EOF … heredoc 2 lines)"
         );
 
         // Ein Here-String ist kein Heredoc.
@@ -4471,7 +5018,7 @@ mod tests {
         cell.set_expanded(true);
         let lines = lines_to_strings(&cell.display_lines(120, style::Theme::Dark));
         assert!(
-            lines[0].starts_with("● Shell(python3 - <<'EOF' … heredoc 1 Zeilen) · 7ms"),
+            lines[0].starts_with("● Shell(python3 - <<'EOF' … heredoc 1 lines) · 7ms"),
             "war: {lines:?}"
         );
         assert!(
@@ -4492,7 +5039,7 @@ mod tests {
             "job.start",
             harw_tools::serde_json::json!({ "command": "make" }),
         );
-        assert_eq!(tool_label(&unnamed), "Job(unbenannt)");
+        assert_eq!(tool_label(&unnamed), "Job(unnamed)");
         let status = make_tool_call(
             "job.status",
             harw_tools::serde_json::json!({ "job_id": "job-1" }),
@@ -4552,7 +5099,7 @@ mod tests {
         assert!(
             expanded
                 .iter()
-                .any(|l| l.contains("Befehl: cargo build --release")),
+                .any(|l| l.contains("Command: cargo build --release")),
             "war: {expanded:?}"
         );
     }
@@ -4678,7 +5225,7 @@ mod tests {
         );
         assert_eq!(
             tool_label(&with_pages),
-            "ReadPdf(docs/report.pdf, Seiten 2-5)"
+            "ReadPdf(docs/report.pdf, pages 2-5)"
         );
     }
 
@@ -4687,7 +5234,7 @@ mod tests {
     fn test_read_pdf_label_names_remote_ocr_host() {
         assert_eq!(
             read_pdf_label("a.pdf", Some("1-2"), Some("api.mistral.ai")),
-            "ReadPdf(a.pdf, Seiten 1-2) → remote OCR (api.mistral.ai)"
+            "ReadPdf(a.pdf, pages 1-2) → remote OCR (api.mistral.ai)"
         );
         assert_eq!(read_pdf_label("a.pdf", None, None), "ReadPdf(a.pdf)");
     }
@@ -4758,7 +5305,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("+1 Zeilen (ctrl+o zum Ausklappen)")),
+                .any(|l| l.contains("+1 lines (ctrl+o to expand)")),
             "war: {lines:?}"
         );
     }
@@ -4846,7 +5393,7 @@ mod tests {
         }));
         cell.complete(&result, 1);
 
-        assert_eq!(cell.summary.as_deref(), Some("3 Zeilen"));
+        assert_eq!(cell.summary.as_deref(), Some("3 lines"));
         assert!(cell.preview.is_empty());
     }
 
@@ -4869,7 +5416,7 @@ mod tests {
 
         assert_eq!(
             cell.summary.as_deref(),
-            Some("LaTeX nicht installiert: latexmk, xelatex")
+            Some("LaTeX not installed: latexmk, xelatex")
         );
         assert!(cell.expanded, "Hinweis darf nicht eingeklappt sein");
         assert_eq!(
@@ -4902,7 +5449,10 @@ mod tests {
         }));
         cell.complete(&result, 1);
 
-        assert_eq!(cell.summary.as_deref(), Some("1 Ersetzung in src/main.rs"));
+        assert_eq!(
+            cell.summary.as_deref(),
+            Some("1 replacement in src/main.rs")
+        );
         assert_eq!(
             cell.preview,
             vec!["-    let x = 1;".to_owned(), "+    let x = 2;".to_owned()]
@@ -4917,7 +5467,7 @@ mod tests {
             "diff_excerpt": "@@ Zeile 1 @@\n-foo\n+bar\n@@ Zeile 2 @@\n-foo\n+bar",
         }));
         many.complete(&result, 1);
-        assert_eq!(many.summary.as_deref(), Some("3 Ersetzungen in a.txt"));
+        assert_eq!(many.summary.as_deref(), Some("3 replacements in a.txt"));
         assert_eq!(many.preview.len(), TOOL_CELL_COLLAPSED_LINES);
         assert_eq!(many.hidden_lines, 1);
     }
@@ -4935,7 +5485,7 @@ mod tests {
         }));
         cell.complete(&result, 1);
 
-        assert_eq!(cell.summary.as_deref(), Some("2 Treffer"));
+        assert_eq!(cell.summary.as_deref(), Some("2 hits"));
     }
 
     /// Setzt eine Freigabe-Notiz; sie erscheint gedimmt in der Kopfzeile.
@@ -5050,7 +5600,7 @@ mod tests {
         let collapsed = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
         assert!(collapsed.len() <= 1 + 3 + 1, "war: {collapsed:?}");
         let hint = collapsed.last().ok_or(TestError::Missing("letzte Zeile"))?;
-        assert!(hint.contains("ctrl+o zum Ausklappen"), "war: {collapsed:?}");
+        assert!(hint.contains("ctrl+o to expand"), "war: {collapsed:?}");
         assert!(collapsed[3].trim_end().ends_with('…'), "war: {collapsed:?}");
         // Versteckt: Rest der gekappten Vorschauzeile (500 Zeichen ≈ 7
         // Bildschirmzeilen, davon 3 gezeigt).
@@ -5091,7 +5641,7 @@ mod tests {
         );
         let last = lines.last().ok_or(TestError::Missing("letzte Zeile"))?;
         assert!(
-            last.contains("Zeilen") && last.contains("… +"),
+            last.contains("lines") && last.contains("… +"),
             "war: {last}"
         );
         Ok(())
@@ -5114,7 +5664,7 @@ mod tests {
         }));
         cell.complete(&result, 1);
 
-        assert_eq!(cell.summary.as_deref(), Some("2 Projekte"));
+        assert_eq!(cell.summary.as_deref(), Some("2 projects"));
         assert_eq!(cell.preview, vec![". (cargo-workspace)", "a (cargo-crate)"]);
         assert_eq!(cell.hidden_lines, 0);
 
@@ -5150,10 +5700,7 @@ mod tests {
         let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
         assert_eq!(lines.len(), 1 + 1 + 3 + 1, "war: {lines:?}");
         let hint = lines.last().ok_or(TestError::Missing("letzte Zeile"))?;
-        assert!(
-            hint.contains("+7 Zeilen (ctrl+o zum Ausklappen)"),
-            "war: {hint}"
-        );
+        assert!(hint.contains("+7 lines (ctrl+o to expand)"), "war: {hint}");
         Ok(())
     }
 
@@ -5171,7 +5718,7 @@ mod tests {
             "truncated": false,
         }));
         cell.complete(&result, 1);
-        assert_eq!(cell.summary.as_deref(), Some("1 Treffer"));
+        assert_eq!(cell.summary.as_deref(), Some("1 hits"));
         assert_eq!(cell.preview, vec!["src/lib.rs (rust)"]);
 
         let call = make_tool_call("explore.relations", harw_tools::serde_json::json!({}));
@@ -5182,7 +5729,7 @@ mod tests {
             "truncated": true,
         }));
         cell.complete(&result, 1);
-        assert_eq!(cell.summary.as_deref(), Some("1 Beziehungen (gekürzt)"));
+        assert_eq!(cell.summary.as_deref(), Some("1 relations (truncated)"));
         assert_eq!(cell.preview, vec![". → a (member)"]);
     }
 
@@ -5245,7 +5792,7 @@ mod tests {
 
         let lines = lines_to_strings(&group.display_lines(80, style::Theme::Dark));
         assert!(
-            lines[0].contains("2 Dateien gelesen") && lines[0].contains("1 Muster gesucht"),
+            lines[0].contains("2 files read") && lines[0].contains("1 patterns searched"),
             "war: {lines:?}"
         );
 
@@ -5287,7 +5834,7 @@ mod tests {
         group.push(bad_cell);
 
         let joined = lines_to_strings(&group.display_lines(80, style::Theme::Dark)).join("\n");
-        assert!(joined.contains("1 fehlgeschlagen"), "war: {joined:?}");
+        assert!(joined.contains("1 failed"), "war: {joined:?}");
         Ok(())
     }
 
@@ -5435,10 +5982,7 @@ mod tests {
             ),
         )?);
         let lines = lines_to_strings(&group.display_lines(80, style::Theme::Dark));
-        assert_eq!(
-            lines,
-            vec!["✗ A · Edit ×1 ✗1 · Read ×1", "  ⎿  1 fehlgeschlagen"]
-        );
+        assert_eq!(lines, vec!["✗ A · Edit ×1 ✗1 · Read ×1", "  ⎿  1 failed"]);
         // Eine Lese-Gruppe nimmt keinen Reducer-Stand an.
         assert!(!ToolGroupCell::new().update_projection(&instance));
         Ok(())
@@ -5506,7 +6050,7 @@ mod tests {
             style::Theme::Dark,
             ToolVerbosity::Activity,
         ));
-        assert_eq!(activity, vec!["● 2 Dateien gelesen"]);
+        assert_eq!(activity, vec!["● 2 files read"]);
         group.expanded = true;
         let expanded = lines_to_strings(&group.display_lines_with(
             80,
@@ -5573,7 +6117,7 @@ mod tests {
         resumed.mark_incomplete();
         assert_eq!(
             resumed.summary.as_deref(),
-            Some("unvollständig (Resume-Abbruch)")
+            Some("incomplete (resume interrupted)")
         );
     }
 
@@ -5595,7 +6139,7 @@ mod tests {
         assert_eq!(cell.state, ToolState::Failed);
         assert_eq!(
             cell.summary.as_deref(),
-            Some("abgebrochen: Zeitbudget 15 min erreicht · Übergabe verfügbar")
+            Some("cancelled: Zeitbudget 15 min erreicht · handoff available")
         );
         // Ein gewöhnlicher Fehler bleibt ohne Zusammenfassung.
         let mut plain = ToolCell::started(&call);
@@ -5603,3 +6147,7 @@ mod tests {
         assert_eq!(plain.summary, None);
     }
 }
+
+#[cfg(test)]
+#[path = "history_cell_localization_tests.rs"]
+mod localization_tests;

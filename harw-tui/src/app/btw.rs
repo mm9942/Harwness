@@ -800,7 +800,7 @@ mod tests {
         let (mut app, _turn) = busy_app(recording.clone(), None)?;
         let _ = route_busy_command(&mut app, "/btw".to_owned());
         assert!(!app.btw.is_pending());
-        assert!(rendered(&app).contains("Nutzung: /btw <frage>"));
+        assert!(rendered(&app).contains("Usage: /btw <question>"));
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(recording.recorded().is_empty());
         Ok(())

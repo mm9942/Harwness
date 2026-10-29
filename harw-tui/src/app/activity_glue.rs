@@ -634,6 +634,17 @@ pub(super) fn append_tool_cell(
     turn: Option<&str>,
     cell: SharedToolCell,
 ) {
+    crate::i18n::with_language(app.language, || {
+        append_tool_cell_scoped(app, call, turn, cell)
+    });
+}
+
+fn append_tool_cell_scoped(
+    app: &mut ChatApp,
+    call: &ToolCall,
+    turn: Option<&str>,
+    cell: SharedToolCell,
+) {
     let session = app.session_id().as_str().to_owned();
     match app.activity.tool_started(&session, turn, call) {
         Placement::Join { group, id } => {
@@ -661,7 +672,9 @@ pub(super) fn append_tool_cell(
             instance,
         } => {
             app.close_tool_group();
-            let group = Arc::new(Mutex::new(ToolGroupCell::for_projection(title, *instance)));
+            let group = Arc::new(Mutex::new(ToolGroupCell::for_projection_with_call(
+                title, *instance, call,
+            )));
             if let Ok(mut guard) = group.lock() {
                 guard.push(cell);
             }
@@ -771,7 +784,7 @@ fn projection_title(instance: &PatternInstance, call: &ToolCall) -> String {
     match (instance.pattern, &instance.key) {
         (PatternId::FILE_EDIT_READ_LOOP, Some(ActivityKey::Path(path))) => path.clone(),
         (PatternId::JOB_LIFECYCLE, Some(key @ ActivityKey::Job(_))) => {
-            format!("Job({})", key.value())
+            crate::i18n::tr_args("tool_chrome.job", "Job({name})", &[("name", key.value())])
         }
         _ => tool_label(call),
     }
@@ -956,7 +969,7 @@ mod tests {
         let cell = rendered(&app).last().cloned().unwrap_or_default();
         let header = cell.lines().next().unwrap_or_default();
         assert_eq!(header, "● src/a.rs · Edit ×1 · Read ×3");
-        assert!(!cell.contains("fehlgeschlagen"), "war: {cell:?}");
+        assert!(!cell.contains("failed"), "war: {cell:?}");
 
         // Ctrl+O zeigt die einzelnen Aufrufe.
         assert!(app.toggle_tool_cells());
@@ -993,7 +1006,7 @@ mod tests {
         let cell = rendered(&app).last().cloned().unwrap_or_default();
         let mut lines = cell.lines();
         assert_eq!(lines.next(), Some("✗ A · Edit ×1 ✗1 · Read ×1"));
-        assert_eq!(lines.next(), Some("  ⎿  1 fehlgeschlagen"));
+        assert_eq!(lines.next(), Some("  ⎿  1 failed"));
         Ok(())
     }
 
@@ -1026,7 +1039,7 @@ mod tests {
         assert_eq!(app.cells.len(), before + 1);
         assert_eq!(
             rendered(&app).last().map(String::as_str),
-            Some("● 2 Dateien gelesen, 1 Muster gesucht")
+            Some("● 2 files read, 1 patterns searched")
         );
         // `shell.exec` schließt die Gruppe; der nächste Lesezugriff beginnt
         // eine neue.
@@ -1049,7 +1062,7 @@ mod tests {
         assert_eq!(app.cells.len(), before + 3);
         assert_eq!(
             rendered(&app).last().map(String::as_str),
-            Some("● 1 Datei gelesen")
+            Some("● 1 file read")
         );
         Ok(())
     }
@@ -1083,7 +1096,7 @@ mod tests {
         let running = rendered(&app).last().cloned().unwrap_or_default();
         assert_eq!(
             running.lines().next(),
-            Some("● Job(build) · läuft · status ×1")
+            Some("● Job(build) · running · status ×1")
         );
         run_tool(
             &mut app,
@@ -1107,7 +1120,7 @@ mod tests {
         let done = rendered(&app).last().cloned().unwrap_or_default();
         assert_eq!(
             done.lines().next(),
-            Some("● Job(build) · beendet · status ×2 · logs ×1")
+            Some("● Job(build) · finished · status ×2 · logs ×1")
         );
         let job = app
             .activity
@@ -1160,7 +1173,7 @@ mod tests {
         let cell = rendered(&app).last().cloned().unwrap_or_default();
         assert_eq!(
             cell.lines().next(),
-            Some("✗ Job(test) · fehlgeschlagen · status ×1")
+            Some("✗ Job(test) · failed · status ×1")
         );
         Ok(())
     }
@@ -1205,13 +1218,13 @@ mod tests {
             .skip(before)
             .map(|cell| cell.lines().next().unwrap_or_default())
             .collect();
-        assert_eq!(tail.first().copied(), Some("● 1 Datei gelesen"));
+        assert_eq!(tail.first().copied(), Some("● 1 file read"));
         assert!(
             tail.get(1)
                 .is_some_and(|line| line.starts_with("● Edit(B)")),
             "war: {tail:?}"
         );
-        assert_eq!(tail.get(2).copied(), Some("● 1 Datei gelesen"));
+        assert_eq!(tail.get(2).copied(), Some("● 1 file read"));
         // Ein weiterer Lesezugriff auf A trifft jetzt die offene, neue Gruppe.
         run_tool(
             &mut app,
@@ -1224,7 +1237,7 @@ mod tests {
         assert_eq!(app.cells.len(), before + 3);
         assert_eq!(
             rendered(&app).last().map(String::as_str),
-            Some("● 2 Dateien gelesen")
+            Some("● 2 files read")
         );
         Ok(())
     }
@@ -1260,7 +1273,7 @@ mod tests {
         let cell = rendered(&app).last().cloned().unwrap_or_default();
         assert_eq!(
             cell.lines().next(),
-            Some("✗ Job(test) · fehlgeschlagen · status ×1")
+            Some("✗ Job(test) · failed · status ×1")
         );
         let job = app
             .activity
