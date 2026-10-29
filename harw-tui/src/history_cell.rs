@@ -38,9 +38,11 @@
 //! - [`UserHistoryCell`]: Nutzer-Eingabe mit `"> "`-Präfix und Wort-Wrapping.
 //! - [`AssistantHistoryCell`]: Assistenten-Antwort, speichert Quelltext; bricht bei
 //!   unterschiedlichem `width` unterschiedlich um (Re-Render-on-Resize).
-//! - [`ReasoningHistoryCell`]: Reasoning-Zusammenfassung, gedimmt-kursiv mit
-//!   `"∴ "`-Markierung und optionaler Agenten-Herkunft; standardmäßig
-//!   eingeklappt, per Ctrl+O über [`SharedReasoningCell`] ausklappbar.
+//! - [`ReasoningHistoryCell`]: Reasoning-Zusammenfassung als lesbarer
+//!   Nachrichtenblock (Kopfzeile `∴ Reasoning`, Markdown-Körper mit gedimmter
+//!   Randspalte `│ `, optionale Agenten-Herkunft; Renderer in
+//!   [`crate::reasoning_cell`], PL-97 R1); Startzustand nach `[tui] reasoning`,
+//!   per Ctrl+O über [`SharedReasoningCell`] ein-/ausklappbar.
 //! - [`SubAgentCell`]: laufender/beendeter Kind-Agent (`TurnEvent::ChildSpawned`
 //!   / `ChildProgress` / `ChildCompleted`); **aktualisierbar** über
 //!   [`SubAgentCell::apply_progress`] / [`SubAgentCell::apply_completion`].
@@ -53,16 +55,23 @@
 //!   [`ToolCell::complete`] (Plan Schritt 2, Contract A5) — ersetzt
 //!   vollständig die früheren Alttypen `ToolCallHistoryCell`/
 //!   `ToolResultHistoryCell` (siehe Modul-Verantwortung oben).
-//! - [`ToolGroupCell`]: fasst aufeinanderfolgende lesende `fs.*`-Aufrufe
-//!   (`fs.read`, `fs.search`, `fs.grep`, `fs.list`, `fs.glob`) zu einer
-//!   Sammelzeile zusammen.
+//! - [`ToolGroupCell`]: fasst aufeinanderfolgende beobachtende Aufrufe auf
+//!   Pfaden (`fs.read`, `fs.search`, `fs.grep`, `fs.list`, `fs.glob`,
+//!   `doc.read_pdf`) zu einer Sammelzeile zusammen, oder zeigt genau eine
+//!   Projektion des Aktivitäts-Reducers (PL-97 M3: `file-edit-read-loop@1`
+//!   eines Pfads als `A · Edit ×1 · Read ×3`, `job-lifecycle@1` eines Jobs
+//!   als eine fortgeschriebene Zelle). Welche Aufrufe zusammengehören,
+//!   entscheidet der Reducer (`crate::app::activity_glue`) über die
+//!   Aktivitätsdeskriptoren der Werkzeuge
+//!   ([`harw_registry_defaults::activity_for`]), nicht eine Namensliste.
 //!
 //! # Verbosity (Schritt 2)
 //! [`ToolCell`] und [`ToolGroupCell`] rendern zusätzlich über
 //! [`ToolCell::display_lines_with`] / [`ToolGroupCell::display_lines_with`]
 //! mit einem [`ToolVerbosity`]-Parameter: `Verbose` verhält sich wie
 //! ausgeklappt und zeigt zusätzlich die rohen Aufrufargumente (eingerückt
-//! als JSON) unter dem Label.
+//! als JSON) unter dem Label; `Activity` (PL-97 M3, aus PR #76) zeigt eine
+//! einzelne Zeile je Werkzeugzelle.
 //!
 //! # Nebenläufigkeit
 //! Alle Typen implementieren [`Send`] + [`Sync`] (erzwungen durch den Trait-Bound).
@@ -92,6 +101,7 @@ use std::sync::{Arc, Mutex};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use harw_activity::{ConstituentStatus, Effect, PatternId, PatternInstance};
 use harw_extension_api::ToolCall;
 use harw_plan::goal::GoalReport;
 use harw_plan::{Plan, PlanNode, PlanNodeStatus, TaskId};
@@ -326,8 +336,9 @@ impl HistoryCell for AssistantHistoryCell {
 
 /// Bricht eine gestylte Zeile wortweise auf `width` Spalten um und erhält
 /// dabei die Styles der einzelnen Spans. Wörter, die allein breiter sind als
-/// `width`, werden hart geteilt.
-fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+/// `width`, werden hart geteilt. Auch von [`crate::reasoning_cell`] genutzt
+/// (PL-97 R1), damit Reasoning-Körper genau wie Assistenten-Antworten umbrechen.
+pub(crate) fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
     let line_style = line.style;
@@ -415,41 +426,38 @@ fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 
 // ─── ReasoningHistoryCell ─────────────────────────────────────────────────────
 
-/// Markierung der ersten Zeile einer [`ReasoningHistoryCell`].
-const REASONING_MARKER: &str = "∴ ";
-
-/// Obergrenze (in Zeichen) der Herkunftskennung einer [`ReasoningHistoryCell`]
-/// (`[rolle] `), bevor char-sicher mit [`truncate_chars`] gekürzt wird.
-const REASONING_ORIGIN_MAX_CHARS: usize = 24;
-
-/// Zeigt eine Reasoning-Zusammenfassung des Modells an — eingeklappt oder
-/// ausgeklappt.
+/// Zeigt eine Reasoning-Zusammenfassung des Modells an — als lesbarer
+/// Nachrichtenblock, ein- oder ausgeklappt (PL-97 R1).
 ///
 /// # Beschreibung
 /// Wird bei `TurnEvent::ItemAdded { item: TurnItem::Reasoning(..), .. }`
-/// erzeugt. Der Text wird gedimmt-kursiv gerendert, die erste Zeile trägt die
-/// gedimmte Markierung `"∴ "` (optional gefolgt von der Herkunft
-/// `"[rolle] "`), Folgezeilen sind bündig darunter eingerückt.
+/// erzeugt. Gerendert wird über [`crate::reasoning_cell::display_lines`]:
+/// eine Kopfzeile `∴ Reasoning` (gedimmt, optional gefolgt von der Herkunft
+/// `[rolle]`) und darunter der Körper als Markdown (wie Assistenten-
+/// Antworten: Überschriften, Listen, Code-Zäune, Tabellen) in der normalen
+/// Textfarbe des Themes mit gedimmter Randspalte `│ `.
 ///
-/// Standardmäßig **eingeklappt**: sichtbar ist nur die erste umgebrochene
-/// Zeile plus der Hinweis `"… (N Zeilen · Ctrl+O)"`, wobei `N` die Zahl der
-/// Zeilen der ausgeklappten Darstellung bei der aktuellen Breite ist. Passt
-/// der gesamte Text in eine Zeile, entfällt der Hinweis. Ausgeklappt wird
-/// genau wie bei [`ToolCell`]: über das Feld `expanded` bzw.
-/// [`ReasoningHistoryCell::set_expanded`] — geteilt über
+/// Eingeklappt sind nur Kopfzeile, erste Körperzeile und der Hinweis
+/// `"… (N Zeilen · Ctrl+O)"` sichtbar, wobei `N` die Zahl der Körperzeilen
+/// bei der aktuellen Breite ist. Passt der Körper in eine Zeile, entfällt
+/// der Hinweis. Den Startzustand bestimmt `app.rs` nach `[tui] reasoning`
+/// (`message` → ausgeklappt, `collapsed` → eingeklappt) über
+/// [`ReasoningHistoryCell::with_expanded`]; umgeschaltet wird genau wie bei
+/// [`ToolCell`] über [`ReasoningHistoryCell::set_expanded`] — geteilt über
 /// [`SharedReasoningCell`], damit `app.rs` (Ctrl+O) den Zustand einer bereits
 /// in den Verlauf geschobenen Zelle umschalten kann.
 ///
 /// # Felder
-/// - `summary` (`String`): Zusammengefasster Denkprozess-Text (bereits aus
-///   `ReasoningItem::summary_text` zusammengefügt).
-/// - `expanded` (`bool`): Nutzer-Umschalter (Ctrl+O); Standard `false`.
+/// - `summary` (`String`): Zusammengefasster Denkprozess-Text (die Einträge
+///   aus `ReasoningItem::summary_text`, mit Leerzeilen zu Absätzen verbunden).
+/// - `expanded` (`bool`): Nutzer-Umschalter (Ctrl+O); `new` startet mit `false`.
 /// - `origin` (`Option<String>`): Rolle des Agenten, von dem das Reasoning
 ///   stammt (z. B. ein Kind-Agent); `None` für den Hauptagenten.
 ///
 /// # Spec-Referenz
 /// Welle 3 — Verdrahtung von `TurnEvent::ItemAdded(Reasoning)` in
-/// `app.rs::run_loop`; Runde 2 / Welle 2 — einklappbares Reasoning.
+/// `app.rs::run_loop`; Runde 2 / Welle 2 — einklappbares Reasoning;
+/// PL-97 R1 — lesbarer Nachrichtenblock.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReasoningHistoryCell {
     /// Zusammengefasster Denkprozess-Text.
@@ -489,7 +497,7 @@ impl ReasoningHistoryCell {
     ///
     /// # Rückgabe
     /// Die Zelle mit gesetzter (bzw. entfernter) Herkunft; gerendert als
-    /// gedimmter Präfix `"[rolle] "` hinter der Markierung `"∴ "`.
+    /// gedimmtes `"[rolle]"` hinter der Kopfzeile `∴ Reasoning`.
     #[must_use]
     pub(crate) fn with_origin(mut self, role: &str) -> Self {
         let trimmed = role.trim();
@@ -498,6 +506,17 @@ impl ReasoningHistoryCell {
         } else {
             Some(trimmed.to_owned())
         };
+        self
+    }
+
+    /// Setzt den Startzustand (Builder): `[tui] reasoning = "message"`
+    /// startet ausgeklappt, `"collapsed"` eingeklappt (PL-97 R1).
+    ///
+    /// # Argumente
+    /// - `expanded` (`bool`): `true` zeigt den vollständigen Körper.
+    #[must_use]
+    pub(crate) fn with_expanded(mut self, expanded: bool) -> Self {
+        self.expanded = expanded;
         self
     }
 
@@ -522,81 +541,24 @@ impl ReasoningHistoryCell {
 }
 
 impl HistoryCell for ReasoningHistoryCell {
-    /// Rendert die Reasoning-Zusammenfassung gedimmt-kursiv mit `"∴ "`-Markierung,
-    /// optionaler Herkunft `"[rolle] "` und wortweisem Wrapping; eingeklappt
-    /// nur die erste Zeile plus `"… (N Zeilen · Ctrl+O)"`.
+    /// Rendert Kopfzeile `∴ Reasoning` (+ optionale Herkunft `[rolle]`) und
+    /// den Markdown-Körper mit Randspalte `│ ` über
+    /// [`crate::reasoning_cell::display_lines`]; eingeklappt nur Kopfzeile,
+    /// erste Körperzeile und `"… (N Zeilen · Ctrl+O)"`.
     ///
     /// # Argumente
-    /// - `width` (`u16`): Gesamtbreite in Spalten (inklusive Präfix).
+    /// - `width` (`u16`): Gesamtbreite in Spalten (inklusive Randspalte).
     ///
     /// # Rückgabe
-    /// Liste der darstellbaren Zeilen beginnend mit `"∴ <summary>"`.
+    /// Liste der darstellbaren Zeilen beginnend mit `"∴ Reasoning"`.
     fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
-        let dim = style::dim_style(theme);
-        let text_style = dim.add_modifier(Modifier::ITALIC);
-
-        // Kürzung vor Bereinigung (siehe Modul-Doku, W1-08).
-        let origin = self.origin.as_deref().map(|role| {
-            format!(
-                "[{}] ",
-                sanitize_inline(&truncate_chars(role, REASONING_ORIGIN_MAX_CHARS))
-            )
-        });
-        let lead_chars =
-            REASONING_MARKER.chars().count() + origin.as_deref().map_or(0, |o| o.chars().count());
-        let lead_width = u16::try_from(lead_chars).unwrap_or(u16::MAX);
-        let text_width = width.saturating_sub(lead_width).max(1);
-        let continuation = " ".repeat(lead_chars);
-
-        let sanitized = sanitize_display(&self.summary);
-        let body = sanitized.trim_matches('\n');
-        let mut rows: Vec<String> = wrap_plain(body, text_width)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .into_iter()
-                    .map(|s| s.content.into_owned())
-                    .collect()
-            })
-            .collect();
-        if rows.is_empty() {
-            rows.push(String::new());
-        }
-        let total = rows.len();
-
-        let first_row = |text: String| -> Line<'static> {
-            let mut spans = vec![Span::styled(REASONING_MARKER, dim)];
-            if let Some(origin) = &origin {
-                spans.push(Span::styled(origin.clone(), dim));
-            }
-            spans.push(Span::styled(text, text_style));
-            Line::from(spans)
-        };
-
-        let mut rows = rows.into_iter();
-        let mut out: Vec<Line<'static>> = Vec::new();
-        if let Some(first) = rows.next() {
-            out.push(first_row(first));
-        }
-
-        if self.expanded || total <= 1 {
-            out.extend(rows.map(|text| {
-                Line::from(vec![
-                    Span::raw(continuation.clone()),
-                    Span::styled(text, text_style),
-                ])
-            }));
-        } else {
-            let hint = format!("… ({total} Zeilen · Ctrl+O)");
-            for piece in wrap_plain(&hint, text_width) {
-                let raw: String = piece.spans.iter().map(|s| s.content.as_ref()).collect();
-                out.push(Line::from(vec![
-                    Span::raw(continuation.clone()),
-                    Span::styled(raw, dim),
-                ]));
-            }
-        }
-        out
+        crate::reasoning_cell::display_lines(
+            &self.summary,
+            self.origin.as_deref(),
+            self.expanded,
+            width,
+            theme,
+        )
     }
 }
 
@@ -1374,9 +1336,11 @@ impl HistoryCell for GoalCell {
 /// Bricht `text` wortweise auf Zeilen der Breite `width` um.
 ///
 /// # Beschreibung
-/// Wörter werden an Leerzeichen getrennt und auf Zeilen aufgeteilt. Passt ein
-/// einzelnes Wort nicht in die Spaltenbreite, wird es hart an `width` Stellen
-/// aufgeteilt (harte Trennung als Fallback). `width == 0` wird wie `1` behandelt.
+/// Wörter werden an Leerzeichen getrennt und auf Zeilen aufgeteilt; gemessen
+/// wird in Anzeigespalten (`unicode-width`, PL-97 M3). Passt ein einzelnes
+/// Wort nicht in die Spaltenbreite, wird es zuerst an weichen Trennpunkten
+/// (`/`, `·`, `_`) und erst dann hart an `width` Spalten aufgeteilt (siehe
+/// [`split_at_soft_breaks`]). `width == 0` wird wie `1` behandelt.
 ///
 /// Leerer `text` ergibt eine leere [`Vec`]. Zeilenumbrüche im Eingabetext (`\n`)
 /// erzeugen explizite Zeilentrennungen.
@@ -1401,6 +1365,7 @@ impl HistoryCell for GoalCell {
 ///
 /// Spec-Quelle: `docs/design/tui-architecture.md`.
 pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
     let col_width = (width as usize).max(1);
     let mut result: Vec<Line<'static>> = Vec::new();
 
@@ -1414,26 +1379,25 @@ pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
         let mut current_len: usize = 0;
 
         for word in paragraph.split_ascii_whitespace() {
-            let word_len = word.chars().count();
-
-            if word_len >= col_width {
+            // PL-97 M3 (aus PR #76, B14): Breite in Anzeigespalten
+            // (unicode-width), nicht Zeichenanzahl — CJK/Emoji zählen breit.
+            // Überlange Wörter werden zuerst an weichen Trennpunkten (`/`,
+            // `·`, `_`) zerlegt; nur Segmente, die allein immer noch zu breit
+            // sind, werden hart (spaltengenau) geteilt.
+            if UnicodeWidthStr::width(word) >= col_width {
                 // Harte Trennung: aktuell akkumulierte Zeile erst flushen
                 if !current_line.is_empty() {
-                    result.push(Line::from(Span::raw(current_line.clone())));
-                    current_line.clear();
+                    result.push(Line::from(Span::raw(std::mem::take(&mut current_line))));
                     current_len = 0;
                 }
-                // Wort selbst in col_width-Häppchen aufteilen
-                let chars: Vec<char> = word.chars().collect();
-                let mut offset = 0;
-                while offset < chars.len() {
-                    let end = (offset + col_width).min(chars.len());
-                    let chunk: String = chars[offset..end].iter().collect();
-                    result.push(Line::from(Span::raw(chunk)));
-                    offset = end;
+                // Jedes Segment auf eine eigene Zeile (wie die frühere harte
+                // Trennung); das nächste Wort beginnt eine neue Zeile.
+                for segment in split_at_soft_breaks(word, col_width) {
+                    result.push(Line::from(Span::raw(segment)));
                 }
                 continue;
             }
+            let word_len = UnicodeWidthStr::width(word);
 
             // Wort passt in eine Zeile
             if current_len == 0 {
@@ -1459,6 +1423,65 @@ pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
     }
 
     result
+}
+
+/// Zerlegt ein überlanges Wort greedy an weichen Trennpunkten (`/`, `·`, `_`)
+/// in Segmente von höchstens `col_width` Anzeigespalten (PL-97 M3, aus PR #76
+/// B14). Segmente, die allein breiter sind, werden zeichenweise und
+/// spaltengenau hart geteilt (CJK- und Emoji-sicher). Der Trenner bleibt am
+/// Segmentende, damit Pfade als `crates/` + `harw-tui/` brechen. Kein
+/// Zeichen geht verloren oder kommt hinzu.
+fn split_at_soft_breaks(word: &str, col_width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    // Tokenisieren: jedes Token endet an einem Trennzeichen (Trenner inklusive).
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in word.chars() {
+        current.push(ch);
+        if matches!(ch, '/' | '·' | '_') {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    // Greedy zu Segmenten <= col_width packen.
+    let mut segments: Vec<String> = Vec::new();
+    let mut segment = String::new();
+    let mut segment_width: usize = 0;
+    for token in tokens {
+        let token_width = UnicodeWidthStr::width(token.as_str());
+        if segment_width + token_width <= col_width {
+            segment.push_str(&token);
+            segment_width += token_width;
+            continue;
+        }
+        if !segment.is_empty() {
+            segments.push(std::mem::take(&mut segment));
+            segment_width = 0;
+        }
+        if token_width <= col_width {
+            segment = token;
+            segment_width = token_width;
+            continue;
+        }
+        // Hart teilen, spaltengenau; der Rest bleibt offenes Segment.
+        for ch in token.chars() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if segment_width + char_width > col_width && !segment.is_empty() {
+                segments.push(std::mem::take(&mut segment));
+                segment_width = 0;
+            }
+            segment.push(ch);
+            segment_width += char_width;
+        }
+    }
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+    segments
 }
 
 /// Kürzt `text` char-sicher auf höchstens `max_chars` Zeichen.
@@ -1556,11 +1579,18 @@ pub(crate) enum ToolState {
 /// sich wie ausgeklappt (`expanded == true`) und zeigt **zusätzlich** die
 /// rohen Aufrufargumente als eingerücktes JSON unter dem Label — nützlich
 /// zur Fehlersuche, wenn das kompakte Label ein wichtiges Argument verbirgt.
+/// `Activity` (PL-97 M3, aus PR #76 B11a) rendert jede eingeklappte
+/// Werkzeugzelle als genau eine Zeile; `Compact` bleibt der Default,
+/// `/verbose` schaltet `Compact → Verbose → Activity → Compact`.
 ///
 /// # Spec-Referenz
 /// Plan Schritt 2, Contract-Slice A5 („Verbosity“).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolVerbosity {
+    /// Einzeilige Aktivität: Statuspunkt, Label, Zusammenfassung und Dauer —
+    /// keine Vorschau- oder Diff-Zeilen. Ausklappen (Ctrl+O) zeigt die
+    /// Details wie `Compact`.
+    Activity,
     /// Nur das an- bzw. ausgeklappte Ergebnis, keine rohen Argumente.
     Compact,
     /// Wie ausgeklappt, zusätzlich die rohen Aufrufargumente als JSON.
@@ -2596,8 +2626,22 @@ impl ToolCell {
         theme: style::Theme,
         verbosity: ToolVerbosity,
     ) -> Vec<Line<'static>> {
+        self.render_lines(width, theme, verbosity, self.expanded)
+    }
+
+    /// Wie [`ToolCell::display_lines_with`], aber mit explizitem
+    /// Ausklapp-Zustand `expanded_flag` statt `self.expanded` — für eine
+    /// einzelne Zelle in einer Reducer-Projektion, deren Gruppe Ctrl+O
+    /// ausklappt (PL-97 M3).
+    pub(crate) fn render_lines(
+        &self,
+        width: u16,
+        theme: style::Theme,
+        verbosity: ToolVerbosity,
+        expanded_flag: bool,
+    ) -> Vec<Line<'static>> {
         let verbose = matches!(verbosity, ToolVerbosity::Verbose);
-        let expanded = self.expanded || verbose;
+        let expanded = expanded_flag || verbose;
 
         let (glyph_style, dot_glyph) = match self.state {
             ToolState::Running => (style::dim_style(theme), "● "),
@@ -2608,6 +2652,33 @@ impl ToolCell {
         let dim = style::dim_style(theme);
 
         let mut lines: Vec<Line<'static>> = Vec::new();
+
+        // Aktivitätsmodus (PL-97 M3, aus PR #76 B11a): genau eine Kopfzeile —
+        // Statuspunkt, Label, Zusammenfassung, Dauer; keine rohen Argumente,
+        // kein Ergebnistext. Ausklappen bleibt über `self.expanded` möglich.
+        if verbosity == ToolVerbosity::Activity && !expanded_flag {
+            let tail = match &self.summary {
+                Some(summary) => format!(" · {summary}{}", self.header_tail()),
+                None => self.header_tail(),
+            };
+            push_header_line(
+                &mut lines,
+                HeaderPart {
+                    text: dot_glyph,
+                    style: glyph_style,
+                },
+                HeaderPart {
+                    text: &self.label,
+                    style: label_style,
+                },
+                HeaderPart {
+                    text: &tail,
+                    style: dim,
+                },
+                width,
+            );
+            return lines;
+        }
 
         // Kopfzeile: Statuspunkt + fettes Label + gedimmte Dauer/Notiz,
         // wortweise umgebrochen wie die übrigen Zellen dieser Datei.
@@ -2945,54 +3016,78 @@ fn push_indented_wrapped_capped(
     hidden
 }
 
-/// Sammelzelle für aufeinanderfolgende, lesende `fs.*`-Aufrufe desselben
-/// Turns (`fs.read`, `fs.search`, `fs.grep`, `fs.list`, `fs.glob`).
+/// Sammelzelle für zusammengehörige Werkzeugaufrufe: aufeinanderfolgende
+/// beobachtende Aufrufe auf Pfaden (`fs.read`, `fs.search`, `fs.grep`,
+/// `fs.list`, `fs.glob`, `doc.read_pdf`) oder genau eine Projektion des
+/// Aktivitäts-Reducers (PL-97 M3, siehe [`ToolGroupKind`]).
 ///
 /// # Beschreibung
-/// Eingeklappt zeigt sie eine Sammelzeile mit Zählern je Kategorie
-/// (`"N Dateien gelesen, N Muster gesucht, N Verzeichnisse gelistet"`,
-/// nur nicht-leere Kategorien); ausgeklappt rendert sie jede enthaltene
-/// [`ToolCell`] einzeln über deren eigene [`HistoryCell::display_lines`].
-/// Der Aufrufer entscheidet über [`ToolGroupCell::accepts`], ob ein neu
-/// eingetroffener Aufruf noch in die laufende Gruppe passt, oder ob eine neue
-/// Gruppe (bzw. eine einzelne [`ToolCell`]) beginnt.
+/// [`ToolGroupKind::Reads`] (Default, [`ToolGroupCell::new`]): eingeklappt
+/// eine Sammelzeile mit Zählern je Kategorie (`"N Dateien gelesen, N Muster
+/// gesucht, N Verzeichnisse gelistet"`, nur nicht-leere Kategorien);
+/// ausgeklappt rendert sie jede enthaltene [`ToolCell`] einzeln über deren
+/// eigene [`HistoryCell::display_lines`]. Die Kategorie kommt aus dem
+/// Aktivitätsdeskriptor des Werkzeugs (Verb `read`, `search`/`grep`,
+/// `list`/`glob`), nicht aus einer Namensliste.
+///
+/// [`ToolGroupKind::Activity`] ([`ToolGroupCell::for_projection`]): eine
+/// Projektion (`file-edit-read-loop@1`, `job-lifecycle@1`), die sich an Ort
+/// und Stelle fortschreibt. Mit nur einer Zelle sieht sie genau wie diese
+/// Zelle aus; ab zwei Zellen eine kompakte Zeile aus dem Reducer-Stand
+/// (`● A · Edit ×1 · Read ×3`, `● Job(build) · läuft · status ×2`), jeder
+/// Fehlschlag bleibt als `✗` sichtbar. Ctrl+O zeigt die einzelnen Aufrufe.
+///
+/// Welche Aufrufe in welche Gruppe gehören, entscheidet der Reducer im
+/// Adapter (`crate::app::activity_glue`); [`ToolGroupCell::accepts`] bleibt
+/// das Deskriptor-Prädikat für die Lese-Gruppen der Kind-Live-Blöcke.
 ///
 /// # Felder
 /// - `cells` (`Vec<SharedToolCell>`): die gruppierten Zellen in
 ///   Ankunftsreihenfolge.
 /// - `expanded` (`bool`): Nutzer-Umschalter (Ctrl+O).
+/// - `kind` ([`ToolGroupKind`]): Lese-Gruppe oder Reducer-Projektion.
 ///
 /// # Spec-Referenz
-/// Plan Schritt 2 („Gruppierung“), Contract-Slice A5.
+/// Plan Schritt 2 („Gruppierung“), Contract-Slice A5; PL-97 §3.5 „TUI
+/// adapter“, PL-71/03.
 ///
-/// # Semantische Grenze und geplanter Ausbau
-/// Diese Struktur ist der **heutige TUI-lokale** Aggregator für genau eine
-/// bekannte Darstellung: aufeinanderfolgende, lesende Werkzeugaufrufe. Sie
-/// ist damit zugleich der konkrete Migrationsanker für
-/// `docs/planning/71-semantic-activity-patterns/`.
-///
-/// Wichtig für spätere Umbauten:
-///
+/// # Semantische Grenze
 /// - die enthaltenen `ToolCell`s und ihre `ToolCallId`s bleiben die
 ///   konkreten Laufzeitbeobachtungen;
 /// - eine kompakte Sammelzeile ist nur eine abgeleitete Projektion und darf
 ///   die zugrunde liegenden Aufrufe nicht aus Verlauf/Audit entfernen;
-/// - künftige ressourcenbezogene Muster (zum Beispiel
-///   `fs.edit(path=X) -> fs.read(path=X) *`) sollen nicht als weitere
-///   Namens-Sonderfälle direkt in diesen Renderer wachsen, sondern über eine
-///   gemeinsame Pattern-/Reducer-Schicht eingespeist werden;
-/// - `ToolGroupCell` darf während dieser Migration als kompatible
-///   Darstellungsoberfläche bestehen bleiben.
-///
-/// Die geplante Pattern-Schicht ist ausdrücklich **keine Authority-Schicht**:
-/// Gruppierung oder Mustererkennung darf weder Tool-Berechtigungen noch
-/// Approval-Entscheidungen verändern.
+/// - Gruppierung oder Mustererkennung ist ausdrücklich **keine
+///   Authority-Schicht**: sie verändert weder Tool-Berechtigungen noch
+///   Approval-Entscheidungen.
 #[derive(Debug)]
 pub(crate) struct ToolGroupCell {
     /// Die gruppierten Zellen in Ankunftsreihenfolge.
     pub cells: Vec<SharedToolCell>,
     /// Nutzer-Umschalter (Ctrl+O).
     pub expanded: bool,
+    /// Lese-Gruppe oder Reducer-Projektion (PL-97 M3).
+    pub kind: ToolGroupKind,
+}
+
+/// What a [`ToolGroupCell`] stands for (PL-97 M3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolGroupKind {
+    /// Consecutive observing calls on paths: one or more
+    /// `file-read-burst@1` instances opened one after another, rendered as
+    /// the category tally (`"2 Dateien gelesen, 1 Muster gesucht"`).
+    Reads,
+    /// Exactly one reducer projection, updated in place.
+    Activity(Box<ActivityProjection>),
+}
+
+/// Reducer-backed state of a [`ToolGroupKind::Activity`] group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActivityProjection {
+    /// Title of the compact line: the path (`src/a.rs`) or the job label
+    /// (`Job(build)`). Raw; sanitized when rendered.
+    pub(crate) title: String,
+    /// Latest snapshot of the projection (`ProjectionUpdate::instance`).
+    pub(crate) instance: PatternInstance,
 }
 
 impl Default for ToolGroupCell {
@@ -3003,12 +3098,43 @@ impl Default for ToolGroupCell {
 }
 
 impl ToolGroupCell {
-    /// Erzeugt eine leere Gruppe (eingeklappt, ohne Zellen).
+    /// Erzeugt eine leere Lese-Gruppe (eingeklappt, ohne Zellen).
     pub(crate) fn new() -> Self {
         Self {
             cells: Vec::new(),
             expanded: false,
+            kind: ToolGroupKind::Reads,
         }
+    }
+
+    /// An empty group for one reducer projection (PL-97 M3), titled `title`.
+    pub(crate) fn for_projection(title: String, instance: PatternInstance) -> Self {
+        Self {
+            cells: Vec::new(),
+            expanded: false,
+            kind: ToolGroupKind::Activity(Box::new(ActivityProjection { title, instance })),
+        }
+    }
+
+    /// Takes over a newer snapshot of the group's projection.
+    ///
+    /// Ignored for a read group, for another projection and for a revision
+    /// that is not newer than the one shown (PL-71: consumers drop stale
+    /// updates).
+    ///
+    /// # Returns
+    /// `true` when the snapshot changed.
+    pub(crate) fn update_projection(&mut self, instance: &PatternInstance) -> bool {
+        let ToolGroupKind::Activity(projection) = &mut self.kind else {
+            return false;
+        };
+        if projection.instance.id != instance.id
+            || instance.revision <= projection.instance.revision
+        {
+            return false;
+        }
+        projection.instance = instance.clone();
+        true
     }
 
     /// Hängt eine weitere Zelle an die Gruppe an.
@@ -3021,22 +3147,28 @@ impl ToolGroupCell {
         self.cells.push(cell);
     }
 
-    /// Prüft, ob ein Werkzeugname noch in eine Lese-Gruppe passt.
+    /// Prüft, ob ein Werkzeug in eine Lese-Gruppe passt.
+    ///
+    /// # Beschreibung
+    /// PL-97 M3: entschieden über den Aktivitätsdeskriptor
+    /// ([`harw_registry_defaults::activity_for`]) statt über eine
+    /// Namensliste: bekannte Semantik, Effekt `observe`, Ressourcenfeld
+    /// `path` — genau die Aufrufe, die `file-read-burst@1` bündelt.
     ///
     /// # Argumente
     /// - `tool_name` (`&str`): der zu prüfende Werkzeugname.
     ///
     /// # Rückgabe
     /// `true` für `fs.read`, `fs.search`, `fs.grep`, `fs.list`, `fs.glob`,
-    /// `doc.read_pdf` (ebenfalls ein reines Lesewerkzeug); sonst `false`
-    /// (z. B. `shell.exec`, `fs.write`, unbekannte Werkzeuge — jeder Aufruf
-    /// mit Seiteneffekten oder unbekanntem Verhalten bleibt eine eigene,
-    /// einzeln sichtbare Zelle).
+    /// `doc.read_pdf`; sonst `false` (z. B. `shell.exec`, `fs.write`,
+    /// unbekannte Werkzeuge — jeder Aufruf mit Seiteneffekten oder
+    /// unbekanntem Verhalten bleibt eine eigene, einzeln sichtbare Zelle).
     pub(crate) fn accepts(tool_name: &str) -> bool {
-        matches!(
-            tool_name,
-            "fs.read" | "fs.search" | "fs.grep" | "fs.list" | "fs.glob" | "doc.read_pdf"
-        )
+        harw_registry_defaults::activity_for(tool_name).is_some_and(|descriptor| {
+            descriptor.is_known()
+                && descriptor.effect == Effect::Observe
+                && descriptor.resource_field.as_deref() == Some("path")
+        })
     }
 
     /// Zählt Kategorie- und Fehlschlags-Vorkommen über alle enthaltenen
@@ -3049,11 +3181,14 @@ impl ToolGroupCell {
                 tally.running += 1;
                 continue;
             };
-            match guard.tool_name.as_str() {
-                "fs.read" | "doc.read_pdf" => tally.read += 1,
-                "fs.search" | "fs.grep" => tally.search += 1,
-                "fs.list" | "fs.glob" => tally.list += 1,
-                _ => {}
+            // Kategorie aus dem Verb des Deskriptors, nicht aus dem Namen.
+            let verb = harw_registry_defaults::activity_for(&guard.tool_name)
+                .map(|descriptor| descriptor.verb.into_owned());
+            match verb.as_deref() {
+                Some("read") => tally.read += 1,
+                Some("search" | "grep") => tally.search += 1,
+                Some("list" | "glob") => tally.list += 1,
+                _ => tally.other += 1,
             }
             match guard.state {
                 ToolState::Running => tally.running += 1,
@@ -3065,7 +3200,8 @@ impl ToolGroupCell {
     }
 
     /// Rendert die Gruppe mit explizitem [`ToolVerbosity`] (siehe
-    /// [`ToolCell::display_lines_with`] für die Bedeutung von `Verbose`).
+    /// [`ToolCell::display_lines_with`] für die Bedeutung von `Verbose` und
+    /// `Activity`).
     pub(crate) fn display_lines_with(
         &self,
         width: u16,
@@ -3073,19 +3209,13 @@ impl ToolGroupCell {
         verbosity: ToolVerbosity,
     ) -> Vec<Line<'static>> {
         let expanded = self.expanded || matches!(verbosity, ToolVerbosity::Verbose);
+        if let ToolGroupKind::Activity(projection) = &self.kind {
+            return self.activity_lines(projection, expanded, width, theme, verbosity);
+        }
 
         if expanded {
             let mut lines: Vec<Line<'static>> = Vec::new();
-            for cell in &self.cells {
-                let Ok(guard) = cell.lock() else {
-                    lines.push(Line::from(Span::styled(
-                        "⚠ Werkzeugzelle nicht lesbar (Sperre vergiftet)",
-                        style::warning_style(theme),
-                    )));
-                    continue;
-                };
-                lines.extend(guard.display_lines_with(width, theme, verbosity));
-            }
+            self.push_cells(&mut lines, width, theme, verbosity);
             return lines;
         }
 
@@ -3105,6 +3235,14 @@ impl ToolGroupCell {
                 "Verzeichnisse"
             };
             parts.push(format!("{} {noun} gelistet", tally.list));
+        }
+        if tally.other > 0 {
+            let noun = if tally.other == 1 {
+                "weiterer Lesezugriff"
+            } else {
+                "weitere Lesezugriffe"
+            };
+            parts.push(format!("{} {noun}", tally.other));
         }
         let summary = if parts.is_empty() {
             "0 Werkzeuge".to_owned()
@@ -3151,17 +3289,184 @@ impl ToolGroupCell {
 
         lines
     }
+
+    /// Rendert jede enthaltene Zelle einzeln (ausgeklappte Ansicht).
+    /// `Activity` zeigt ausgeklappt die Details wie `Compact`; nur `Verbose`
+    /// reicht die rohen Argumente an die Zellen durch.
+    fn push_cells(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        width: u16,
+        theme: style::Theme,
+        verbosity: ToolVerbosity,
+    ) {
+        let child_verbosity = match verbosity {
+            ToolVerbosity::Verbose => ToolVerbosity::Verbose,
+            ToolVerbosity::Activity | ToolVerbosity::Compact => ToolVerbosity::Compact,
+        };
+        for cell in &self.cells {
+            let Ok(guard) = cell.lock() else {
+                lines.push(Line::from(Span::styled(
+                    "⚠ Werkzeugzelle nicht lesbar (Sperre vergiftet)",
+                    style::warning_style(theme),
+                )));
+                continue;
+            };
+            lines.extend(guard.display_lines_with(width, theme, child_verbosity));
+        }
+    }
+
+    /// Rendert eine [`ToolGroupKind::Activity`]-Gruppe (PL-97 M3).
+    ///
+    /// Mit höchstens einer Zelle unverändert diese Zelle (dieselben Zeilen
+    /// wie ohne Gruppe); sonst die kompakte Zeile aus dem Reducer-Stand,
+    /// ausgeklappt gefolgt von den einzelnen Aufrufen.
+    fn activity_lines(
+        &self,
+        projection: &ActivityProjection,
+        expanded: bool,
+        width: u16,
+        theme: style::Theme,
+        verbosity: ToolVerbosity,
+    ) -> Vec<Line<'static>> {
+        if self.cells.len() == 1
+            && let Some(cell) = self.cells.first()
+        {
+            return match cell.lock() {
+                Ok(guard) => {
+                    guard.render_lines(width, theme, verbosity, guard.expanded || expanded)
+                }
+                Err(_) => vec![Line::from(Span::styled(
+                    "⚠ Werkzeugzelle nicht lesbar (Sperre vergiftet)",
+                    style::warning_style(theme),
+                ))],
+            };
+        }
+
+        let instance = &projection.instance;
+        let counts = instance.state.counts;
+        let any_cell_running = self.cells.iter().any(|cell| {
+            cell.lock()
+                .map(|guard| guard.state == ToolState::Running)
+                .unwrap_or(true)
+        });
+        let (glyph, glyph_style) = if counts.failed > 0 {
+            ("✗ ", style::error_style(theme))
+        } else if counts.running > 0 || any_cell_running {
+            ("● ", style::dim_style(theme))
+        } else {
+            ("● ", style::success_style(theme))
+        };
+        let tail = activity_tail(instance);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_header_line(
+            &mut lines,
+            HeaderPart {
+                text: glyph,
+                style: glyph_style,
+            },
+            HeaderPart {
+                text: &projection.title,
+                style: Style::default().add_modifier(Modifier::BOLD),
+            },
+            HeaderPart {
+                text: &tail,
+                style: style::dim_style(theme),
+            },
+            width,
+        );
+        if counts.failed > 0 && verbosity != ToolVerbosity::Activity {
+            push_indented_wrapped(
+                &mut lines,
+                &format!("{} fehlgeschlagen", counts.failed),
+                width,
+                TOOL_RESULT_LEAD,
+                style::error_style(theme),
+            );
+        }
+        if expanded {
+            self.push_cells(&mut lines, width, theme, verbosity);
+        }
+        lines
+    }
+}
+
+/// Anhang der kompakten Zeile einer Reducer-Projektion (PL-97 M3, PL-71/03):
+/// - `file-edit-read-loop@1`: ` · Edit ×1 · Read ×3` (Verben in der
+///   Reihenfolge ihres ersten Auftretens, ein Fehlschlag als ` ✗n` am Verb),
+///   dazu ` · N läuft`, solange Aufrufe laufen;
+/// - `job-lifecycle@1`: ` · <Zustand> · status ×2 · logs ×1` (ohne `start`
+///   und den Lauf selbst, die Titel bzw. Zustand stellen).
+fn activity_tail(instance: &PatternInstance) -> String {
+    let is_job = instance.pattern == PatternId::JOB_LIFECYCLE;
+    let mut parts: Vec<String> = Vec::new();
+    if is_job {
+        parts.push(job_phase_text(instance).to_owned());
+    }
+    for tally in &instance.state.verbs {
+        let verb = tally.verb.as_ref();
+        if is_job && matches!(verb, "start" | "run") {
+            continue;
+        }
+        let shown = if is_job {
+            verb.to_owned()
+        } else {
+            capitalize(verb)
+        };
+        let mut part = format!("{shown} ×{}", tally.counts.total);
+        if tally.counts.failed > 0 {
+            part.push_str(&format!(" ✗{}", tally.counts.failed));
+        }
+        parts.push(part);
+    }
+    if !is_job && instance.state.counts.running > 0 {
+        parts.push(format!("{} läuft", instance.state.counts.running));
+    }
+    parts
+        .iter()
+        .map(|part| format!(" · {part}"))
+        .collect::<String>()
+}
+
+/// Zustand eines Jobs aus seiner Lauf-Konstituente (`run`, nach dem Rebase
+/// `Call(C) → Job(W)`); vor der Bindung `startet` bzw. `nicht gestartet`.
+fn job_phase_text(instance: &PatternInstance) -> &'static str {
+    let run = instance
+        .state
+        .members
+        .iter()
+        .find(|member| member.verb == "run");
+    match run.map(|member| &member.status) {
+        Some(ConstituentStatus::Running) => "läuft",
+        Some(ConstituentStatus::Succeeded) => "beendet",
+        Some(ConstituentStatus::Failed { .. }) => "fehlgeschlagen",
+        Some(ConstituentStatus::Cancelled) => "gestoppt",
+        None if instance.is_terminal() => "nicht gestartet",
+        None => "startet",
+    }
+}
+
+/// `edit` → `Edit` (erstes Zeichen groß, der Rest unverändert).
+fn capitalize(verb: &str) -> String {
+    let mut chars = verb.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// Ergebnis von [`ToolGroupCell::tally`]: Zählung je Kategorie und Status.
 #[derive(Debug, Default, Clone, Copy)]
 struct ToolGroupTally {
-    /// Zahl der `fs.read`-/`doc.read_pdf`-Zellen.
+    /// Zahl der lesenden Zellen (Verb `read`: `fs.read`, `doc.read_pdf`).
     read: usize,
-    /// Zahl der `fs.search`/`fs.grep`-Zellen.
+    /// Zahl der suchenden Zellen (Verb `search`/`grep`).
     search: usize,
-    /// Zahl der `fs.list`/`fs.glob`-Zellen.
+    /// Zahl der listenden Zellen (Verb `list`/`glob`).
     list: usize,
+    /// Zahl der übrigen beobachtenden Zellen (anderes Verb).
+    other: usize,
     /// Zahl der Zellen mit `state == Failed`.
     failed: usize,
     /// Zahl der Zellen mit `state == Running` (plus vergiftete Locks).
@@ -3311,52 +3616,16 @@ mod tests {
         );
     }
 
-    /// Prüft, dass `ReasoningHistoryCell::display_lines` die `"∴ "`-Markierung
-    /// gefolgt vom Zusammenfassungstext liefert und eine einzeilige
-    /// Zusammenfassung keinen Ausklapp-Hinweis bekommt.
+    /// Prüft, dass `ReasoningHistoryCell::display_lines` mit der Kopfzeile
+    /// `∴ Reasoning` beginnt, den Text mit Randspalte `│ ` darunter zeigt und
+    /// ein einzeiliger Körper keinen Ausklapp-Hinweis bekommt (PL-97 R1).
     #[test]
-    fn test_reasoning_cell_has_marker_prefix() -> TestResult {
+    fn test_reasoning_cell_has_header_and_gutter() -> TestResult {
         let cell = ReasoningHistoryCell::new("Denke über die Lösung nach");
         let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
-        let first = lines.first().ok_or(TestError::Missing("erste Zeile"))?;
-        if first != "∴ Denke über die Lösung nach" || lines.len() != 1 {
-            return Err(TestError::Unexpected(format!("war: {lines:?}")));
-        }
-        Ok(())
-    }
-
-    /// Eingeklappt (Standard): nur die erste Zeile plus Hinweis mit der
-    /// Gesamtzahl der Zeilen der ausgeklappten Darstellung.
-    #[test]
-    fn test_reasoning_cell_collapsed_by_default_shows_first_line_and_hint() -> TestResult {
-        let cell = ReasoningHistoryCell::new("Erste Zeile\nZweite Zeile\nDritte Zeile");
-        if cell.is_expanded() {
-            return Err(TestError::Unexpected(
-                "Standard muss eingeklappt sein".to_owned(),
-            ));
-        }
-        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
-        if lines
-            != vec![
-                "∴ Erste Zeile".to_owned(),
-                "  … (3 Zeilen · Ctrl+O)".to_owned(),
-            ]
-        {
-            return Err(TestError::Unexpected(format!("war: {lines:?}")));
-        }
-        Ok(())
-    }
-
-    /// Ausgeklappt: vollständiger Text, bündig eingerückt, ohne Hinweis.
-    #[test]
-    fn test_reasoning_cell_expanded_shows_full_text() -> TestResult {
-        let mut cell = ReasoningHistoryCell::new("Erste Zeile\nZweite Zeile\nDritte Zeile");
-        cell.set_expanded(true);
-        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
         let expected = vec![
-            "∴ Erste Zeile".to_owned(),
-            "  Zweite Zeile".to_owned(),
-            "  Dritte Zeile".to_owned(),
+            "∴ Reasoning".to_owned(),
+            "│ Denke über die Lösung nach".to_owned(),
         ];
         if lines != expected {
             return Err(TestError::Unexpected(format!("war: {lines:?}")));
@@ -3364,20 +3633,91 @@ mod tests {
         Ok(())
     }
 
-    /// Ein langer Absatz ohne Zeilenumbruch wird eingeklappt ebenfalls auf eine
-    /// Zeile reduziert; `N` entspricht der ausgeklappten Zeilenzahl.
+    /// `new` startet eingeklappt: Kopfzeile, erste Körperzeile plus Hinweis
+    /// mit der Zahl der Körperzeilen der ausgeklappten Darstellung.
+    #[test]
+    fn test_reasoning_cell_new_is_collapsed_and_shows_first_line_and_hint() -> TestResult {
+        let cell = ReasoningHistoryCell::new("Erste Zeile\nZweite Zeile\nDritte Zeile");
+        if cell.is_expanded() {
+            return Err(TestError::Unexpected(
+                "`new` muss eingeklappt sein".to_owned(),
+            ));
+        }
+        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        let expected = vec![
+            "∴ Reasoning".to_owned(),
+            "│ Erste Zeile".to_owned(),
+            "│ … (3 Zeilen · Ctrl+O)".to_owned(),
+        ];
+        if lines != expected {
+            return Err(TestError::Unexpected(format!("war: {lines:?}")));
+        }
+        Ok(())
+    }
+
+    /// Ausgeklappt (`with_expanded(true)`): vollständiger Körper mit
+    /// Randspalte, ohne Hinweis.
+    #[test]
+    fn test_reasoning_cell_expanded_shows_full_text() -> TestResult {
+        let cell = ReasoningHistoryCell::new("Erste Zeile\nZweite Zeile\nDritte Zeile")
+            .with_expanded(true);
+        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        let expected = vec![
+            "∴ Reasoning".to_owned(),
+            "│ Erste Zeile".to_owned(),
+            "│ Zweite Zeile".to_owned(),
+            "│ Dritte Zeile".to_owned(),
+        ];
+        if lines != expected {
+            return Err(TestError::Unexpected(format!("war: {lines:?}")));
+        }
+        Ok(())
+    }
+
+    /// Zwei `summary_text`-Einträge (mit Leerzeile verbunden) bleiben zwei
+    /// Absätze: dazwischen steht eine leere Randspalten-Zeile.
+    #[test]
+    fn test_reasoning_cell_keeps_paragraphs() -> TestResult {
+        let summary = ["Erster Absatz.", "Zweiter Absatz."].join("\n\n");
+        let cell = ReasoningHistoryCell::new(summary).with_expanded(true);
+        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        let expected = vec![
+            "∴ Reasoning".to_owned(),
+            "│ Erster Absatz.".to_owned(),
+            "│ ".to_owned(),
+            "│ Zweiter Absatz.".to_owned(),
+        ];
+        if lines != expected {
+            return Err(TestError::Unexpected(format!("war: {lines:?}")));
+        }
+        Ok(())
+    }
+
+    /// Der Körper läuft durch den Markdown-Renderer: Aufzählungspunkt und
+    /// Code-Randspalte sind hinter der Reasoning-Randspalte sichtbar.
+    #[test]
+    fn test_reasoning_cell_renders_markdown_list_and_code_fence() -> TestResult {
+        let cell = ReasoningHistoryCell::new("- Punkt\n\n```\nlet x = 1;\n```").with_expanded(true);
+        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        if !lines.contains(&"│ • Punkt".to_owned()) || !lines.contains(&"│ ▏ let x = 1;".to_owned())
+        {
+            return Err(TestError::Unexpected(format!("war: {lines:?}")));
+        }
+        Ok(())
+    }
+
+    /// Ein langer Absatz ohne Zeilenumbruch wird eingeklappt ebenfalls auf
+    /// Kopfzeile + eine Körperzeile + Hinweis reduziert; `N` entspricht der
+    /// ausgeklappten Körperzeilenzahl.
     #[test]
     fn test_reasoning_cell_long_paragraph_collapses_to_one_row() -> TestResult {
         let text = "wort ".repeat(40);
         let collapsed = ReasoningHistoryCell::new(text.clone());
-        let expanded = ReasoningHistoryCell {
-            expanded: true,
-            ..ReasoningHistoryCell::new(text)
-        };
+        let expanded = ReasoningHistoryCell::new(text).with_expanded(true);
         let full = expanded.display_lines(30, style::Theme::Dark);
         let short = lines_to_strings(&collapsed.display_lines(30, style::Theme::Dark));
-        let hint = format!("… ({} Zeilen · Ctrl+O)", full.len());
-        if full.len() < 2 || short.len() != 2 || !short[1].contains(&hint) {
+        let hint = format!("… ({} Zeilen · Ctrl+O)", full.len() - 1);
+        if full.len() < 3 || short.len() != 3 || !short[2].contains(&hint) {
             return Err(TestError::Unexpected(format!(
                 "voll: {} Zeilen, kurz: {short:?}",
                 full.len()
@@ -3386,14 +3726,22 @@ mod tests {
         Ok(())
     }
 
-    /// Der Text ist gedimmt-kursiv gestylt.
+    /// Der Körper ist weder gedimmt noch kursiv (normale Textfarbe); nur
+    /// die Randspalte ist gedimmt.
     #[test]
-    fn test_reasoning_cell_text_is_italic() -> TestResult {
-        let cell = ReasoningHistoryCell::new("Kursiv");
+    fn test_reasoning_cell_body_is_readable_not_italic() -> TestResult {
+        let cell = ReasoningHistoryCell::new("Lesbar");
         let lines = cell.display_lines(80, style::Theme::Dark);
-        let first = lines.first().ok_or(TestError::Missing("erste Zeile"))?;
-        let text_span = first.spans.last().ok_or(TestError::Missing("Text-Span"))?;
-        if !text_span.style.add_modifier.contains(Modifier::ITALIC) {
+        let body = lines.get(1).ok_or(TestError::Missing("Körperzeile"))?;
+        let gutter = body.spans.first().ok_or(TestError::Missing("Randspalte"))?;
+        let text_span = body.spans.last().ok_or(TestError::Missing("Text-Span"))?;
+        if gutter.style.fg != Some(style::dim_color(style::Theme::Dark)) {
+            return Err(TestError::Unexpected(format!(
+                "Randspalte: {:?}",
+                gutter.style
+            )));
+        }
+        if text_span.style.add_modifier.contains(Modifier::ITALIC) || text_span.style.fg.is_some() {
             return Err(TestError::Unexpected(format!(
                 "Stil: {:?}",
                 text_span.style
@@ -3402,17 +3750,18 @@ mod tests {
         Ok(())
     }
 
-    /// `with_origin` rendert `"[rolle] "` hinter der Markierung; Folgezeilen
-    /// sind bündig unter dem Text eingerückt; leere Rolle entfernt die Herkunft.
+    /// `with_origin` rendert `" [rolle]"` hinter der Kopfzeile; der Körper
+    /// bleibt davon unberührt; leere Rolle entfernt die Herkunft.
     #[test]
-    fn test_reasoning_cell_with_origin_renders_role_prefix() -> TestResult {
-        let mut cell =
-            ReasoningHistoryCell::new("Plan prüfen\nDann lesen").with_origin(" explorer ");
-        cell.set_expanded(true);
+    fn test_reasoning_cell_with_origin_renders_role_in_header() -> TestResult {
+        let cell = ReasoningHistoryCell::new("Plan prüfen\nDann lesen")
+            .with_origin(" explorer ")
+            .with_expanded(true);
         let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
         let expected = vec![
-            "∴ [explorer] Plan prüfen".to_owned(),
-            "             Dann lesen".to_owned(),
+            "∴ Reasoning [explorer]".to_owned(),
+            "│ Plan prüfen".to_owned(),
+            "│ Dann lesen".to_owned(),
         ];
         if lines != expected {
             return Err(TestError::Unexpected(format!("war: {lines:?}")));
@@ -3426,15 +3775,29 @@ mod tests {
         Ok(())
     }
 
+    /// Schmale Breiten (auch 0) rendern ohne Panik, mit und ohne Herkunft.
+    #[test]
+    fn test_reasoning_cell_narrow_width_does_not_panic() {
+        let text =
+            "# Titel\n\n- ein sehr langer Aufzählungspunkt ohne jedes Ende\n\n```\ncode\n```";
+        for width in [0u16, 1, 2, 24] {
+            let _ = ReasoningHistoryCell::new(text).display_lines(width, style::Theme::Dark);
+            let _ = ReasoningHistoryCell::new(text)
+                .with_origin("explorer")
+                .with_expanded(true)
+                .display_lines(width, style::Theme::Light);
+        }
+    }
+
     /// Die geteilte Variante rendert wie die Zelle selbst und folgt dem über
     /// eine zweite Referenz gesetzten Ausklapp-Zustand (Ctrl+O-Pfad in `app.rs`).
     #[test]
     fn test_shared_reasoning_cell_follows_expansion_toggle() -> TestResult {
         let shared = ReasoningHistoryCell::new("a\nb").into_shared();
         let boxed: Box<dyn HistoryCell> = Box::new(Arc::clone(&shared));
-        if boxed.display_lines(80, style::Theme::Dark).len() != 2 {
+        if boxed.display_lines(80, style::Theme::Dark).len() != 3 {
             return Err(TestError::Unexpected(
-                "eingeklappt: 2 Zeilen erwartet".to_owned(),
+                "eingeklappt: 3 Zeilen erwartet".to_owned(),
             ));
         }
         {
@@ -3443,7 +3806,7 @@ mod tests {
             guard.set_expanded(next);
         }
         let lines = lines_to_strings(&boxed.display_lines(80, style::Theme::Dark));
-        if lines != vec!["∴ a".to_owned(), "  b".to_owned()] {
+        if lines != vec!["∴ Reasoning".to_owned(), "│ a".to_owned(), "│ b".to_owned()] {
             return Err(TestError::Unexpected(format!("war: {lines:?}")));
         }
         Ok(())
@@ -4926,6 +5289,271 @@ mod tests {
         let joined = lines_to_strings(&group.display_lines(80, style::Theme::Dark)).join("\n");
         assert!(joined.contains("1 fehlgeschlagen"), "war: {joined:?}");
         Ok(())
+    }
+
+    /// PL-97 M3: `accepts` entscheidet über den Aktivitätsdeskriptor;
+    /// `doc.read_pdf` (handgeschrieben, beobachtet `path`) gehört dazu.
+    #[test]
+    fn test_tool_group_cell_accepts_follows_the_descriptor() {
+        assert!(ToolGroupCell::accepts("doc.read_pdf"));
+        for tool in ["fs.edit", "job.status", "job.start", "process.list"] {
+            assert!(!ToolGroupCell::accepts(tool), "sollte ablehnen: {tool}");
+        }
+    }
+
+    /// Hilfe: abgeschlossene Zelle eines Werkzeugs.
+    fn finished_cell(
+        tool: &str,
+        arguments: harw_tools::serde_json::Value,
+        result: harw_protocol::items::ToolCallResult,
+    ) -> Result<SharedToolCell, TestError> {
+        let cell = Arc::new(Mutex::new(ToolCell::started(&make_tool_call(
+            tool, arguments,
+        ))));
+        cell.lock()
+            .map_err(ctx("Mutex vergiftet"))?
+            .complete(&result, 1);
+        Ok(cell)
+    }
+
+    /// Hilfe: Reducer-Stand von `fs.edit(A)` (Ausgang `edit_failed`) und
+    /// `reads` beobachtenden Aufrufen auf `A`.
+    fn edit_read_loop(reads: u64, edit_failed: bool) -> Result<PatternInstance, TestError> {
+        use harw_activity::{
+            ActivityDescriptor, ActivityEvent, ActivityKey, ActivityOwner, Lifecycle, Outcome,
+            Reducer,
+        };
+        let edit = ActivityDescriptor::new("filesystem", "edit", Some("path"), Effect::Mutate);
+        let read = ActivityDescriptor::new("filesystem", "read", Some("path"), Effect::Observe);
+        let event = |seq: u64, descriptor: &ActivityDescriptor, lifecycle: Lifecycle| {
+            ActivityEvent::new(
+                seq,
+                ActivityOwner::session("root")
+                    .with_turn(1)
+                    .with_call(format!("c{}", seq.div_ceil(2))),
+                descriptor.clone(),
+                lifecycle,
+            )
+            .with_resource(ActivityKey::Path("A".into()))
+        };
+        let mut reducer = Reducer::new();
+        reducer.apply(&event(1, &edit, Lifecycle::Started));
+        let outcome = if edit_failed {
+            Outcome::failed("error")
+        } else {
+            Outcome::Succeeded
+        };
+        let mut last = reducer.apply(&event(2, &edit, Lifecycle::Finished).with_outcome(outcome));
+        for index in 0..reads {
+            let seq = 3 + 2 * index;
+            reducer.apply(&event(seq, &read, Lifecycle::Started));
+            last = reducer.apply(&event(seq + 1, &read, Lifecycle::Finished));
+        }
+        last.pop()
+            .map(|update| update.instance)
+            .ok_or(TestError::Missing("projection update"))
+    }
+
+    /// PL-97 M3: `fs.edit(A)` und dreimal `fs.read(A)` werden eine Zeile
+    /// `A · Edit ×1 · Read ×3`; ausgeklappt folgen die einzelnen Aufrufe.
+    #[test]
+    fn test_activity_group_renders_the_edit_read_loop() -> TestResult {
+        let instance = edit_read_loop(3, false)?;
+        assert_eq!(instance.pattern, PatternId::FILE_EDIT_READ_LOOP);
+        let mut group = ToolGroupCell::for_projection("A".to_owned(), instance);
+        group.push(finished_cell(
+            "fs.edit",
+            harw_tools::serde_json::json!({ "path": "A" }),
+            harw_protocol::items::ToolCallResult::success(
+                harw_tools::serde_json::json!({ "replacements": 1, "path": "A" }),
+            ),
+        )?);
+        // Mit einer Zelle sieht die Gruppe genau wie diese Zelle aus.
+        let single = lines_to_strings(&group.display_lines(80, style::Theme::Dark));
+        let alone = group
+            .cells
+            .first()
+            .ok_or(TestError::Missing("Zelle"))?
+            .lock()
+            .map_err(ctx("Mutex vergiftet"))?
+            .display_lines(80, style::Theme::Dark);
+        assert_eq!(single, lines_to_strings(&alone));
+
+        for _ in 0..3 {
+            group.push(finished_cell(
+                "fs.read",
+                harw_tools::serde_json::json!({ "path": "A" }),
+                harw_protocol::items::ToolCallResult::success(
+                    harw_tools::serde_json::json!({ "content": "x" }),
+                ),
+            )?);
+        }
+        let lines = lines_to_strings(&group.display_lines(80, style::Theme::Dark));
+        assert_eq!(lines, vec!["● A · Edit ×1 · Read ×3"]);
+        let activity = lines_to_strings(&group.display_lines_with(
+            80,
+            style::Theme::Dark,
+            ToolVerbosity::Activity,
+        ));
+        assert_eq!(activity, lines);
+
+        group.expanded = true;
+        let expanded = lines_to_strings(&group.display_lines(80, style::Theme::Dark));
+        assert_eq!(
+            expanded.first().map(String::as_str),
+            Some("● A · Edit ×1 · Read ×3")
+        );
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|line| line.contains("Read(A)"))
+                .count(),
+            3
+        );
+        assert!(expanded.iter().any(|line| line.contains("Edit(A)")));
+        Ok(())
+    }
+
+    /// PL-97 M3: ein fehlgeschlagener verändernder Aufruf bleibt als ✗ am
+    /// Verb und als Fehlerzahl sichtbar; ein veralteter Stand wird verworfen.
+    #[test]
+    fn test_activity_group_keeps_a_failed_edit_visible() -> TestResult {
+        let instance = edit_read_loop(1, true)?;
+        let mut group = ToolGroupCell::for_projection("A".to_owned(), edit_read_loop(0, true)?);
+        assert!(group.update_projection(&instance));
+        assert!(!group.update_projection(&instance), "gleiche Revision");
+        group.push(finished_cell(
+            "fs.edit",
+            harw_tools::serde_json::json!({ "path": "A" }),
+            harw_protocol::items::ToolCallResult::error("old string not found"),
+        )?);
+        group.push(finished_cell(
+            "fs.read",
+            harw_tools::serde_json::json!({ "path": "A" }),
+            harw_protocol::items::ToolCallResult::success(
+                harw_tools::serde_json::json!({ "content": "x" }),
+            ),
+        )?);
+        let lines = lines_to_strings(&group.display_lines(80, style::Theme::Dark));
+        assert_eq!(
+            lines,
+            vec!["✗ A · Edit ×1 ✗1 · Read ×1", "  ⎿  1 fehlgeschlagen"]
+        );
+        // Eine Lese-Gruppe nimmt keinen Reducer-Stand an.
+        assert!(!ToolGroupCell::new().update_projection(&instance));
+        Ok(())
+    }
+
+    /// PL-97 M3 (aus PR #76 B11a): `ToolVerbosity::Activity` rendert genau
+    /// eine Zeile — Statuspunkt, Label, Zusammenfassung und Dauer; weder rohe
+    /// Argumente noch Ergebnistext.
+    #[test]
+    fn test_tool_cell_activity_is_single_line() {
+        let call = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({ "command": "ls", "timeout_secs": 30 }),
+        );
+        let mut cell = ToolCell::started(&call);
+        cell.complete(
+            &harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+                "exit_code": 2,
+                "stdout": "eins\nzwei\n",
+                "stderr": "",
+            })),
+            2,
+        );
+        let activity = lines_to_strings(&cell.display_lines_with(
+            80,
+            style::Theme::Dark,
+            ToolVerbosity::Activity,
+        ));
+        assert_eq!(activity, vec!["● Shell(ls) · exit 2 · 2ms"]);
+
+        // Ausgeklappt zeigt `Activity` die Details wie `Compact`, ohne rohe
+        // Argumente (die bleiben `Verbose` vorbehalten).
+        cell.set_expanded(true);
+        let expanded = lines_to_strings(&cell.display_lines_with(
+            80,
+            style::Theme::Dark,
+            ToolVerbosity::Activity,
+        ));
+        assert!(
+            expanded.iter().any(|line| line.contains("eins")),
+            "{expanded:?}"
+        );
+        assert!(
+            !expanded.join("\n").contains("timeout_secs"),
+            "{expanded:?}"
+        );
+    }
+
+    /// PL-97 M3 (aus PR #76 B11a): in der Lese-Gruppe zeigt `Activity` die
+    /// Sammelzeile, ausgeklappt die einzelnen Aufrufe.
+    #[test]
+    fn test_tool_group_cell_activity_summarizes_and_expands() -> TestResult {
+        let mut group = ToolGroupCell::new();
+        for path in ["a", "b"] {
+            group.push(finished_cell(
+                "fs.read",
+                harw_tools::serde_json::json!({ "path": path }),
+                harw_protocol::items::ToolCallResult::success(
+                    harw_tools::serde_json::json!({ "content": "x" }),
+                ),
+            )?);
+        }
+        let activity = lines_to_strings(&group.display_lines_with(
+            80,
+            style::Theme::Dark,
+            ToolVerbosity::Activity,
+        ));
+        assert_eq!(activity, vec!["● 2 Dateien gelesen"]);
+        group.expanded = true;
+        let expanded = lines_to_strings(&group.display_lines_with(
+            80,
+            style::Theme::Dark,
+            ToolVerbosity::Activity,
+        ))
+        .join("\n");
+        assert!(expanded.contains("Read(a)") && expanded.contains("Read(b)"));
+        Ok(())
+    }
+
+    /// PL-97 M3 (aus PR #76 B14): keine Zeile breiter als `width`, auch bei
+    /// CJK (zwei Spalten je Zeichen).
+    #[test]
+    fn test_wrap_plain_cjk_never_exceeds_width() {
+        use unicode_width::UnicodeWidthStr;
+        let text = "你好世界 これは 日本語の テキストです longer_ascii_word_here";
+        let lines = lines_to_strings(&wrap_plain(text, 10));
+        assert!(lines.len() >= 2, "war: {lines:?}");
+        for line in &lines {
+            let width = UnicodeWidthStr::width(line.as_str());
+            assert!(width <= 10, "Zeile '{line}' ist {width} Spalten breit");
+        }
+        // Kein Zeichen geht verloren.
+        let joined: String = lines
+            .concat()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let original: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(joined, original);
+    }
+
+    /// PL-97 M3 (aus PR #76 B14): überlange Pfade brechen an weichen
+    /// Trennpunkten (`/`, `·`, `_`), der Trenner bleibt am Segmentende.
+    #[test]
+    fn test_wrap_plain_breaks_paths_at_soft_break_points() {
+        let lines = lines_to_strings(&wrap_plain("crates/harw-tui/src/history_cell.rs und", 12));
+        assert_eq!(
+            lines,
+            vec!["crates/", "harw-tui/", "src/history_", "cell.rs", "und"]
+        );
+        // Ohne Trennpunkt bleibt es bei der harten Trennung wie bisher.
+        assert_eq!(
+            lines_to_strings(&wrap_plain("abcdefghij xy", 4)),
+            vec!["abcd", "efgh", "ij", "xy"]
+        );
     }
 
     /// Runde 5, Teil M: ein Turn-Ende nennt seinen echten Grund; nur der

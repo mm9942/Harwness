@@ -314,6 +314,8 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // h7/h9: Ablaufverhalten der Kind-Statusmeldungen und read-only Zielmodus.
     FieldScope { path: "tui.status_expiry", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "tui.goal_mode", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // PL-97 R1: Darstellung der Reasoning-Zusammenfassungen (rein darstellend).
+    FieldScope { path: "tui.reasoning", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.4 [session] (5)
     FieldScope { path: "session.store_dir", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "session.journal_format", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -574,7 +576,8 @@ mod merge_rule_tests {
         // h7/h9: +2 für `tui.status_expiry`, `tui.goal_mode`.
         // PL-97 B1: +4 für `skills.*`.
         // PL-97 E2: +1 für `sandbox.execution`.
-        assert_eq!(FIELD_TABLE.len(), 200);
+        // PL-97 R1: +1 für `tui.reasoning`.
+        assert_eq!(FIELD_TABLE.len(), 201);
     }
 
     #[test]
@@ -598,7 +601,8 @@ mod merge_rule_tests {
         // h7/h9: +2 (`tui.status_expiry`, `tui.goal_mode`).
         // PL-97 B1: +4 (`skills.*`).
         // PL-97 E2: +1 (`sandbox.execution`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 101);
+        // PL-97 R1: +1 (`tui.reasoning`).
+        assert_eq!(count(MergeRule::ProfileReplaces), 102);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

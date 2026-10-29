@@ -166,6 +166,7 @@ fn test_field_table_exhaustive_tui_section() {
         child_stream,
         status_expiry,
         goal_mode,
+        reasoning,
     } = TuiSection::default();
     let _ = (
         theme,
@@ -173,6 +174,7 @@ fn test_field_table_exhaustive_tui_section() {
         child_stream,
         status_expiry,
         goal_mode,
+        reasoning,
     );
     for path in [
         "tui.theme",
@@ -180,6 +182,7 @@ fn test_field_table_exhaustive_tui_section() {
         "tui.child_stream",
         "tui.status_expiry",
         "tui.goal_mode",
+        "tui.reasoning",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }
