@@ -43,6 +43,8 @@ members = [
     "harw-catalog",
     # PL-97 D2: read-only Harw-DoD client (export paths, findings/health, config, units, status).
     "harw-dod-client",
+    # PL-97 M1: semantic activity vocabulary and deterministic pattern reducer (PL-71).
+    "harw-activity",
     "harw-core",
     "harw-provider",
     "harw-provider-http",

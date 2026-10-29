@@ -2142,6 +2142,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-activity"
+version = "0.9.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harw-agent-artifact"
 version = "0.9.1"
 dependencies = [

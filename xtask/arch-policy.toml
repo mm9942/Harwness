@@ -150,6 +150,9 @@ layer = "I"
 layer = "I"
 [packages."harw-catalog"]
 layer = "I"
+# PL-97 M1: reine Vokabular-/Reducer-Crate (serde, serde_json), von TUI/Registry konsumiert.
+[packages."harw-activity"]
+layer = "I"
 # PL-97 D2: lesender Harw-DoD-Client (harw-dod-config ist Ring D, daher Ring A).
 [packages."harw-dod-client"]
 layer = "A"
