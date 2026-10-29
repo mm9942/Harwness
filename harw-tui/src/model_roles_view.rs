@@ -38,34 +38,38 @@ use ratatui::{
     text::{Line, Span},
 };
 
+use crate::i18n::{tr, tr_args};
 use crate::overlay_view::{
     OverlayOutcome, OverlayView, content_height, is_down, is_up, json_str, plain, render_panel,
     scroll_offset_for,
 };
 use crate::sanitize::sanitize_inline;
 use crate::style::{self, Theme};
+use harw_config::{RoleModelSource, UiaWorkerModelSource};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Befehl, der die Tabellendaten liefert.
 pub(crate) const REFRESH_COMMAND: &str = "/models show";
 
 /// Beschriftung der Live-Zeile.
-const LIVE_LABEL: &str = "Aktive Sitzung (live)";
+const LIVE_LABEL: &str = "Active session (live)";
 
 /// Wirkungs-Spalte der Live-Zeile.
-const LIVE_EFFECT: &str = "sofort (/model)";
+const LIVE_EFFECT: &str = "immediately (/model)";
 
 /// Standard-Befehl für `Enter` auf der Live-Zeile.
 const LIVE_COMMAND: &str = "/model";
 
 /// Wirkungs-Spalte der Rollen-Zeilen.
-const ROLE_EFFECT: &str = "ab nächster Sitzung";
+const ROLE_EFFECT: &str = "from next session";
 
 /// Wirkungs-Spalte der Kind-Rollen (Live-Modellwechsel: neu gestartete
 /// Agenten nehmen die Wahl sofort).
-const CHILD_ROLE_EFFECT: &str = "neue Agenten sofort";
+const CHILD_ROLE_EFFECT: &str = "new agents immediately";
 
 /// Fußzeile.
-const FOOTER: &str = "j/k wählen · Enter Modell wählen · r zurücksetzen · Esc schließen";
+const FOOTER: &str = "j/k select · Enter choose model · r reset · Esc close";
 
 /// Spaltenbreiten (Zeichen): Rolle, Provider, Modell, Quelle, Effort.
 const WIDTHS: [usize; 5] = [24, 14, 30, 22, 8];
@@ -75,10 +79,10 @@ pub(crate) const WORKERS_REFRESH_COMMAND: &str = "/models worker";
 
 /// Runde 5, Teil G: Fußzeile des Worker-Bereichs.
 const WORKERS_FOOTER: &str =
-    "j/k wählen · Enter Modell wählen · r wie UIA · a alle wie UIA · Esc schließen";
+    "j/k select · Enter choose model · r follow UIA · a all follow UIA · Esc close";
 
 /// Runde 5, Teil G: Wirkungs-Spalte des Worker-Bereichs.
-const WORKER_EFFECT: &str = "neue Worker";
+const WORKER_EFFECT: &str = "new workers";
 
 /// Welche Tabelle die Ansicht zeigt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,8 +105,9 @@ struct RoleRow {
     provider: Option<String>,
     /// Modell, falls aufgelöst.
     model: Option<String>,
-    /// Herkunft (bereits als Anzeigetext).
-    source: String,
+    /// Typed source, or an unknown source payload from legacy operation JSON.
+    source: RowSource,
+    follows_uia: bool,
     /// Reasoning-Effort, falls gesetzt.
     effort: Option<String>,
 }
@@ -115,24 +120,39 @@ impl RoleRow {
             label: LIVE_LABEL.to_owned(),
             provider: provider.map(str::to_owned),
             model: model.map(str::to_owned),
-            source: "live".to_owned(),
+            source: RowSource::Live,
+            follows_uia: false,
             effort: None,
+        }
+    }
+
+    fn display_label(&self, mode: ViewMode) -> &str {
+        if mode == ViewMode::UiaWorkers {
+            return &self.label;
+        }
+        match self.key.as_deref() {
+            None => tr("pickers.live", LIVE_LABEL),
+            Some(key) => ModelRole::parse(key).map(role_label).unwrap_or(&self.label),
         }
     }
 
     /// Wirkungs-Spalte.
     fn effect(&self, mode: ViewMode) -> &'static str {
         match (mode, self.key.is_some()) {
-            (ViewMode::UiaWorkers, _) => WORKER_EFFECT,
+            (ViewMode::UiaWorkers, _) => tr("pickers.effect_workers", WORKER_EFFECT),
             (ViewMode::Roles, true) => {
                 let live = self
                     .key
                     .as_deref()
                     .and_then(harw_config::ModelRole::parse)
                     .is_some_and(harw_config::ModelRole::applies_to_new_agents_live);
-                if live { CHILD_ROLE_EFFECT } else { ROLE_EFFECT }
+                if live {
+                    tr("pickers.effect_agents", CHILD_ROLE_EFFECT)
+                } else {
+                    tr("pickers.effect_session", ROLE_EFFECT)
+                }
             }
-            (ViewMode::Roles, false) => LIVE_EFFECT,
+            (ViewMode::Roles, false) => tr("pickers.effect_live", LIVE_EFFECT),
         }
     }
 
@@ -142,14 +162,15 @@ impl RoleRow {
             UiaWorkerModelChoice::Fixed { provider, model } => {
                 (Some(provider.clone()), Some(model.clone()))
             }
-            UiaWorkerModelChoice::FollowUia => (None, Some(resolved.choice.label())),
+            UiaWorkerModelChoice::FollowUia => (None, None),
         };
         Self {
             key: Some(resolved.role.clone()),
             label: resolved.role.clone(),
             provider,
             model,
-            source: resolved.source.label().to_owned(),
+            source: RowSource::Worker(resolved.source),
+            follows_uia: matches!(resolved.choice, UiaWorkerModelChoice::FollowUia),
             effort: None,
         }
     }
@@ -194,10 +215,11 @@ impl ModelRolesView {
         let mut rows = vec![RoleRow::live(live_provider, live_model)];
         rows.extend(resolve_role_models(config).into_iter().map(|row| RoleRow {
             key: Some(row.role.key().to_owned()),
-            label: row.role.label().to_owned(),
+            label: role_label(row.role).to_owned(),
             provider: row.provider,
             model: row.model,
-            source: row.source.label().to_owned(),
+            source: RowSource::Role(row.source),
+            follows_uia: false,
             effort: row.reasoning_effort,
         }));
         Self {
@@ -218,10 +240,11 @@ impl ModelRolesView {
         let mut rows = vec![RoleRow::live(live_provider, live_model)];
         rows.extend(ModelRole::ALL.into_iter().map(|role| RoleRow {
             key: Some(role.key().to_owned()),
-            label: role.label().to_owned(),
+            label: role_label(role).to_owned(),
             provider: None,
             model: None,
-            source: "—".to_owned(),
+            source: RowSource::Unknown("—".to_owned()),
+            follows_uia: false,
             effort: None,
         }));
         Self {
@@ -297,12 +320,12 @@ impl ModelRolesView {
     fn header_line(theme: Theme) -> Line<'static> {
         let text = format!(
             "  {}{}{}{}{}{}",
-            cell("Rolle", WIDTHS[0]),
-            cell("Provider", WIDTHS[1]),
-            cell("Modell", WIDTHS[2]),
-            cell("Quelle", WIDTHS[3]),
-            cell("Effort", WIDTHS[4]),
-            "Wirkung"
+            cell(tr("pickers.heading_role", "Role"), WIDTHS[0]),
+            cell(tr("pickers.heading_provider", "Provider"), WIDTHS[1]),
+            cell(tr("pickers.heading_model", "Model"), WIDTHS[2]),
+            cell(tr("pickers.heading_source", "Source"), WIDTHS[3]),
+            cell(tr("pickers.heading_effort", "Effort"), WIDTHS[4]),
+            tr("pickers.heading_effect", "Effect")
         );
         Line::styled(
             text,
@@ -329,15 +352,26 @@ impl ModelRolesView {
                 };
                 let text = format!(
                     "{marker}{}{}{}{}{}",
-                    cell(&row.label, WIDTHS[0]),
+                    cell(row.display_label(self.mode), WIDTHS[0]),
                     cell(row.provider.as_deref().unwrap_or(dash), WIDTHS[1]),
-                    cell(row.model.as_deref().unwrap_or(dash), WIDTHS[2]),
-                    cell(&row.source, WIDTHS[3]),
+                    cell(
+                        if row.follows_uia {
+                            tr("pickers.follow_uia", "follow UIA")
+                        } else {
+                            row.model.as_deref().unwrap_or(dash)
+                        },
+                        WIDTHS[2]
+                    ),
+                    cell(row.source.label(), WIDTHS[3]),
                     cell(row.effort.as_deref().unwrap_or(dash), WIDTHS[4]),
                 );
                 // Die Live-Zeile nennt den Befehl, der sie tatsächlich ändert.
                 let effect = if row.key.is_none() && self.mode == ViewMode::Roles {
-                    format!("sofort ({})", self.live_command)
+                    tr_args(
+                        "pickers.immediate",
+                        "immediately ({command})",
+                        &[("command", &self.live_command)],
+                    )
                 } else {
                     row.effect(self.mode).to_owned()
                 };
@@ -359,7 +393,11 @@ impl ModelRolesView {
         if let Some(error) = &self.error {
             lines.push(Line::from(""));
             lines.push(Line::styled(
-                format!("Aktualisieren fehlgeschlagen: {}", sanitize_inline(error)),
+                tr_args(
+                    "pickers.refresh_error",
+                    "Refresh failed: {error}",
+                    &[("error", &sanitize_inline(error))],
+                ),
                 style::error_style(theme),
             ));
         }
@@ -371,29 +409,42 @@ impl ModelRolesView {
 /// Leerzeichen Abstand auf.
 fn cell(text: &str, width: usize) -> String {
     let clean = sanitize_inline(text);
-    let count = clean.chars().count();
+    let count = UnicodeWidthStr::width(clean.as_str());
     let body = if count > width {
-        let mut short: String = clean.chars().take(width.saturating_sub(1)).collect();
+        let mut short = String::new();
+        let mut used = 0;
+        for grapheme in clean.graphemes(true) {
+            let cells = UnicodeWidthStr::width(grapheme);
+            if used + cells > width.saturating_sub(1) {
+                break;
+            }
+            short.push_str(grapheme);
+            used += cells;
+        }
         short.push('…');
         short
     } else {
         format!("{clean}{}", " ".repeat(width - count))
     };
-    format!("{body} ")
+    format!(
+        "{body}{} ",
+        " ".repeat(width.saturating_sub(UnicodeWidthStr::width(body.as_str())))
+    )
 }
 
 /// Liest eine Tabellenzeile aus dem `/models show`-JSON (tolerant).
 fn row_from_json(value: &serde_json::Value) -> Option<RoleRow> {
     let key = json_str(value, "role")?;
     let label = json_str(value, "label")
-        .or_else(|| ModelRole::parse(&key).map(|role| role.label().to_owned()))
+        .or_else(|| ModelRole::parse(&key).map(|role| role_label(role).to_owned()))
         .unwrap_or_else(|| key.clone());
     Some(RoleRow {
         key: Some(key),
         label,
         provider: json_str(value, "provider"),
         model: json_str(value, "model"),
-        source: json_str(value, "source").unwrap_or_else(|| "—".to_owned()),
+        source: RowSource::from_role_json(json_str(value, "source")),
+        follows_uia: false,
         effort: json_str(value, "effort"),
     })
 }
@@ -440,7 +491,7 @@ impl ModelRolesView {
                 UiaWorkerModelChoice::Fixed { provider, model } => {
                     (Some(provider.clone()), Some(model.clone()))
                 }
-                UiaWorkerModelChoice::FollowUia => (None, Some(choice.label())),
+                UiaWorkerModelChoice::FollowUia => (None, None),
             };
             if let Some(notice) = json_str(item, "notice") {
                 notices.push(notice);
@@ -450,7 +501,8 @@ impl ModelRolesView {
                 label: role,
                 provider,
                 model,
-                source: json_str(item, "source").unwrap_or_else(|| "—".to_owned()),
+                source: RowSource::from_worker_json(json_str(item, "source")),
+                follows_uia: matches!(choice, UiaWorkerModelChoice::FollowUia),
                 effort: None,
             });
         }
@@ -469,8 +521,14 @@ impl OverlayView for ModelRolesView {
         let lines = self.body_lines(theme);
         let scroll = scroll_offset_for(self.selected, content_height(area, true));
         let (title, footer) = match self.mode {
-            ViewMode::Roles => ("Modelle je Rolle", FOOTER),
-            ViewMode::UiaWorkers => ("UIA-Worker-Modelle", WORKERS_FOOTER),
+            ViewMode::Roles => (
+                tr("pickers.roles_title", "Models by role"),
+                tr("pickers.roles_footer", FOOTER),
+            ),
+            ViewMode::UiaWorkers => (
+                tr("pickers.workers_title", "UIA worker models"),
+                tr("pickers.workers_footer", WORKERS_FOOTER),
+            ),
         };
         render_panel(
             area,
@@ -569,12 +627,108 @@ impl OverlayView for ModelRolesView {
     }
 }
 
+/// TUI-owned role names; canonical role keys stay unchanged.
+pub(crate) fn role_label(role: ModelRole) -> &'static str {
+    match role {
+        ModelRole::Uia => tr("pickers.role_uia", "User interface (UIA)"),
+        ModelRole::UiaWorker => tr("pickers.role_uia_worker", "UIA worker"),
+        ModelRole::Orchestrator => tr("pickers.role_orchestrator", "Orchestrator"),
+        ModelRole::SubOrchestrator => tr("pickers.role_sub_orchestrator", "Sub-orchestrator"),
+        ModelRole::WorkerSimple => tr("pickers.role_worker_simple", "Worker (simple)"),
+        ModelRole::WorkerComplex => tr("pickers.role_worker_complex", "Worker (complex)"),
+        ModelRole::Explorer => tr("pickers.role_explorer", "Explorer"),
+        ModelRole::Research => tr("pickers.role_research", "Research"),
+        ModelRole::CompactionSummary => tr("pickers.role_compaction", "Compaction"),
+        ModelRole::SessionTitle => tr("pickers.role_title", "Session title"),
+        ModelRole::MemoryConsolidation => tr("pickers.role_memory", "Memory consolidation"),
+        ModelRole::DreamReflection => tr("pickers.role_dream", "Dream reflection"),
+        ModelRole::AutoClassifier => tr("pickers.role_classifier", "Auto mode classifier"),
+        ModelRole::WorkDriverJudge => tr("pickers.role_judge", "work-driver judge"),
+        ModelRole::ImageUnderstanding => tr("pickers.role_image", "Image understanding"),
+    }
+}
+
+/// Config paths carry typed sources. Legacy operation JSON exposes only source
+/// labels: decode that finite API vocabulary here and preserve unknown payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowSource {
+    Live,
+    Role(RoleModelSource),
+    Worker(UiaWorkerModelSource),
+    Unknown(String),
+}
+impl RowSource {
+    fn label(&self) -> &str {
+        match self {
+            Self::Live => tr("pickers.live_source", "live"),
+            Self::Role(source) => match source {
+                RoleModelSource::Explicit => tr("pickers.source_explicit", "explicit selection"),
+                RoleModelSource::OpenRouterDefault => {
+                    tr("pickers.source_router", "OpenRouter default")
+                }
+                RoleModelSource::UiaPin => tr("pickers.source_uia", "UIA pin"),
+                RoleModelSource::UiaWorkerPin => tr("pickers.source_worker", "UIA worker pin"),
+                RoleModelSource::InheritsUia => {
+                    tr("pickers.source_inherit_uia", "inherited from UIA")
+                }
+                RoleModelSource::InheritsOrchestrator => tr(
+                    "pickers.source_inherit_orchestrator",
+                    "inherited from orchestrator",
+                ),
+                RoleModelSource::DefaultModel => {
+                    tr("pickers.source_default_model", "default model")
+                }
+                RoleModelSource::Unset => tr("pickers.source_unset", "not set"),
+            },
+            Self::Worker(source) => match source {
+                UiaWorkerModelSource::Explicit => tr("pickers.source_own", "own selection"),
+                UiaWorkerModelSource::Default => tr("pickers.source_default", "default"),
+                UiaWorkerModelSource::FellBack => tr("pickers.source_fallback", "fallback"),
+                UiaWorkerModelSource::Legacy => "uia_worker_model",
+            },
+            Self::Unknown(text) => text,
+        }
+    }
+    fn from_role_json(text: Option<String>) -> Self {
+        let text = text.unwrap_or_else(|| "—".to_owned());
+        for source in [
+            RoleModelSource::Explicit,
+            RoleModelSource::OpenRouterDefault,
+            RoleModelSource::UiaPin,
+            RoleModelSource::UiaWorkerPin,
+            RoleModelSource::InheritsUia,
+            RoleModelSource::InheritsOrchestrator,
+            RoleModelSource::DefaultModel,
+            RoleModelSource::Unset,
+        ] {
+            if text == source.label() {
+                return Self::Role(source);
+            }
+        }
+        Self::Unknown(text)
+    }
+    fn from_worker_json(text: Option<String>) -> Self {
+        let text = text.unwrap_or_else(|| "—".to_owned());
+        for source in [
+            UiaWorkerModelSource::Explicit,
+            UiaWorkerModelSource::Default,
+            UiaWorkerModelSource::FellBack,
+            UiaWorkerModelSource::Legacy,
+        ] {
+            if text == source.label() {
+                return Self::Worker(source);
+            }
+        }
+        Self::Unknown(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyModifiers;
 
     use super::*;
-    use crate::overlay_view::buffer_text;
+    use crate::test_support::display_buffer_text as buffer_text;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -582,6 +736,43 @@ mod tests {
 
     fn view() -> ModelRolesView {
         ModelRolesView::empty(Some("anthropic"), Some("claude-sonnet"))
+    }
+
+    #[test]
+    fn semantic_sources_and_role_labels_refresh_without_translating_payloads() {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let mut view = view();
+        view.apply_data(&serde_json::json!({"roles": [
+            {"role": "explorer", "label": "Explorer", "source": "explizit gewählt", "provider": "提供方", "model": "payload-{model}"},
+            {"role": "custom-role", "label": "custom payload", "source": "raw payload"}
+        ]}));
+        view.on_key(key(KeyCode::Down));
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                for width in [1, 8, 24, 140] {
+                    let area = Rect::new(0, 0, width, 14);
+                    view.render(area, &mut Buffer::empty(area), Theme::Dark);
+                }
+            });
+        }
+        let area = Rect::new(0, 0, 160, 14);
+        let mut buf = Buffer::empty(area);
+        with_language(UiLanguage::Japanese, || {
+            view.render(area, &mut buf, Theme::Dark)
+        });
+        let text = buffer_text(&buf);
+        assert!(text.contains("探索エージェント"));
+        assert!(text.contains("明示的な選択"));
+        assert!(text.contains("payload-{model}"));
+        assert!(text.contains("custom payload"));
+        assert!(text.contains("raw payload"));
+        assert_eq!(
+            view.on_key(key(KeyCode::Enter)),
+            OverlayOutcome::RunAndClose("/models pick explorer".into())
+        );
+        assert_eq!(UnicodeWidthStr::width(cell("日本語", 5).as_str()), 6);
+        assert_eq!(cell("é日本", 4), "é日… ");
     }
 
     #[test]
@@ -701,7 +892,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         view.render(area, &mut buf, Theme::Dark);
         let text = buffer_text(&buf);
-        assert!(text.contains("Modelle je Rolle"));
+        assert!(text.contains("Models by role"));
         assert!(text.contains(LIVE_LABEL));
         assert!(text.contains("claude-sonnet"));
         assert!(text.contains(ROLE_EFFECT));
@@ -723,7 +914,8 @@ mod tests {
         assert_eq!(view.rows.len(), UIA_WORKER_ROLES.len());
         for (row, role) in view.rows.iter().zip(UIA_WORKER_ROLES) {
             assert_eq!(row.key.as_deref(), Some(role));
-            assert_eq!(row.model.as_deref(), Some("wie UIA"));
+            assert_eq!(row.model, None);
+            assert!(row.follows_uia);
         }
         assert_eq!(
             view.refresh_command().as_deref(),
@@ -771,8 +963,8 @@ mod tests {
         let mut buf = Buffer::empty(area);
         view.render(area, &mut buf, Theme::Dark);
         let text = buffer_text(&buf);
-        assert!(text.contains("UIA-Worker-Modelle"));
-        assert!(text.contains("wie UIA"));
+        assert!(text.contains("UIA worker models"));
+        assert!(text.contains("follow UIA"));
         assert!(text.contains("nicht angemeldet"));
         assert!(text.contains(WORKER_EFFECT));
     }

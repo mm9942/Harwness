@@ -336,8 +336,29 @@ impl ChoiceDialog {
     /// # Nebenläufigkeit
     /// Rein synchron; kein Locking erforderlich.
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: style::Theme) {
+        self.render_with_presentation(
+            area,
+            buf,
+            theme,
+            &self.title,
+            self.prompt.as_deref(),
+            self.footer_text(),
+        );
+    }
+
+    /// Render caller-owned semantic chrome without replacing navigation, scroll,
+    /// or supplied option labels. Callers resolve these labels in the current locale.
+    pub(crate) fn render_with_presentation(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: style::Theme,
+        title: &str,
+        prompt: Option<&str>,
+        footer: &str,
+    ) {
         let area = area.intersection(buf.area);
-        let title = sanitize_inline(&self.title);
+        let title = sanitize_inline(title);
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         Widget::render(block, area, buf);
@@ -349,10 +370,7 @@ impl ChoiceDialog {
         let height = usize::from(inner.height);
 
         // Fußzeile: angeheftet unten, umgebrochen statt abgeschnitten.
-        let footer = vec![Line::styled(
-            self.footer_text().to_owned(),
-            style::dim_style(theme),
-        )];
+        let footer = vec![Line::styled(footer.to_owned(), style::dim_style(theme))];
         let footer_rows = if height >= 2 {
             wrapped_rows(&footer, width).min(height - 1)
         } else {
@@ -362,7 +380,8 @@ impl ChoiceDialog {
 
         // Hinweistext: bekommt, was die Optionen übrig lassen (mindestens
         // eine Zeile), und scrollt darüber hinaus.
-        let prompt = self.prompt_lines(theme);
+        let prompt =
+            prompt.map(|text| vec![Line::styled(sanitize_inline(text), style::dim_style(theme))]);
         let prompt_rows = prompt
             .as_ref()
             .map_or(0, |lines| wrapped_rows(lines, width));
@@ -505,6 +524,38 @@ mod tests {
                 "Abbrechen".to_owned(),
             ],
         )
+    }
+
+    #[test]
+    fn presentation_override_preserves_selected_option_and_prompt_scroll() {
+        let mut dialog = ChoiceDialog::new(
+            "payload title",
+            Some("original".repeat(200)),
+            vec!["payload-one".into(), "payload-two".into()],
+        )
+        .with_selected(1);
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        dialog.render(area, &mut buf, style::Theme::Dark);
+        dialog.scroll_body(false, 3);
+        let offset = dialog.body_scroll.offset();
+        assert!(offset > 0);
+        dialog.render_with_presentation(
+            area,
+            &mut buf,
+            style::Theme::Dark,
+            "モデルを選択",
+            Some(&"説明文です。".repeat(200)),
+            "Enter 確定",
+        );
+        assert_eq!(dialog.body_scroll.offset(), offset);
+        assert!(crate::overlay_view::buffer_text(&buf).contains("payload-two"));
+        assert_eq!(
+            dialog.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ChoiceAction::Chosen(1)
+        );
+        assert_eq!(dialog.title, "payload title");
+        assert_eq!(dialog.options[1], "payload-two");
     }
 
     /// `Esc` liefert `ChoiceAction::Cancel`.

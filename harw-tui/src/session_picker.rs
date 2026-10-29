@@ -39,30 +39,33 @@ use ratatui::{
 };
 use std::time::SystemTime;
 
+use crate::i18n::{tr, tr_args};
 use crate::relative_time::relative_time;
 use crate::sanitize;
 use crate::style::{self, Theme};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Anzahl Einträge, um die `PageUp`/`PageDown` die Auswahl verschieben.
 const PAGE_STEP: isize = 10;
 
-/// Spaltenbreite (in Zeichen) für die rechts aufgefüllte Relativzeit-Spalte.
+/// Terminal display cells reserved for the relative-time column.
 const RELTIME_COLUMN_WIDTH: usize = 12;
 
 /// Breite (in Spalten) der Auswahl-Markierung ("❯ " bzw. zwei Leerzeichen).
 const MARKER_WIDTH: usize = 2;
 
 /// Titel des umrahmenden Popup-Rahmens.
-const POPUP_TITLE: &str = " Session fortsetzen ";
+const POPUP_TITLE: &str = " Resume session ";
 
 /// Fußzeile mit Tastaturhinweisen.
-const FOOTER_HINT: &str = "↑↓ wählen · Enter öffnen · Esc abbrechen · Ctrl+A alle Projekte";
+const FOOTER_HINT: &str = "↑↓ select · Enter open · Esc cancel · Ctrl+A all projects";
 
 /// Hinweistext in der Filterzeile, solange noch nichts getippt wurde.
-const FILTER_PLACEHOLDER: &str = "Tippen zum Filtern";
+const FILTER_PLACEHOLDER: &str = "Type to filter";
 
 /// Text für den Leerzustand (kein Eintrag passt zum Filter).
-const EMPTY_STATE_TEXT: &str = "Keine Sessions gefunden";
+const EMPTY_STATE_TEXT: &str = "No sessions found";
 
 /// Ein einzelner Eintrag der Sitzungsliste im Picker.
 ///
@@ -175,38 +178,48 @@ fn entry_matches(entry: &SessionEntry, needle_lower: &str) -> bool {
     entry.id.to_ascii_lowercase().starts_with(needle_lower)
 }
 
-/// Kürzt `s` char-sicher (keine UTF-8-Byte-Grenzen-Panik) auf höchstens
-/// `max_chars` sichtbare Zeichen und hängt bei Kürzung `"…"` an.
+/// Clips to terminal display cells, preserving complete grapheme clusters.
 ///
 /// # Argumente
 /// - `s` (`&str`): der zu kürzende Text.
-/// - `max_chars` (`usize`): maximale Zeichenzahl der Ausgabe (inklusive `…`).
+/// - `max_width` (`usize`): maximale Spaltenbreite der Ausgabe (inklusive `…`).
 ///
 /// # Rückgabe
 /// `s` unverändert, falls es bereits kurz genug ist; sonst ein gekürztes
-/// Präfix mit angehängtem `…`. Bei `max_chars == 0` wird `""` zurückgegeben.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
+/// Präfix mit angehängtem `…`. Bei `max_width == 0` wird `""` zurückgegeben.
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
         return String::new();
     }
-    if s.chars().count() <= max_chars {
+    if UnicodeWidthStr::width(s) <= max_width {
         return s.to_owned();
     }
-    if max_chars == 1 {
+    if max_width == 1 {
         return "…".to_owned();
     }
-    let mut truncated: String = s.chars().take(max_chars - 1).collect();
+    let mut truncated = String::new();
+    let mut used = 0;
+    for grapheme in s.graphemes(true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        if used + width > max_width - 1 {
+            break;
+        }
+        truncated.push_str(grapheme);
+        used += width;
+    }
     truncated.push('…');
     truncated
 }
 
-/// Berechnet die Bildlauf-Basiszeile, sodass `selected` innerhalb des
-/// sichtbaren Fensters (`visible` Zeilen von `total`) liegt.
-///
-/// # Beschreibung
-/// Klassische "Fenster hinter Cursor herziehen"-Logik: die Basiszeile wird
-/// nur soweit erhöht, wie nötig ist, damit `selected` die letzte sichtbare
-/// Zeile ist, und nie über `total - visible` hinaus.
+/// Pad to terminal display cells.
+fn pad_to_width(text: &str, width: usize) -> String {
+    format!(
+        "{text}{}",
+        " ".repeat(width.saturating_sub(UnicodeWidthStr::width(text)))
+    )
+}
+
+/// Keep the selected row within the visible window.
 fn clamp_scroll(selected: usize, total: usize, visible: usize) -> usize {
     if visible == 0 || total <= visible {
         return 0;
@@ -422,13 +435,18 @@ impl SessionPicker {
         let marker_text = if is_selected { "❯ " } else { "  " };
 
         let reltime = relative_time(entry.last_active, self.now);
-        let reltime_padded = format!("{reltime:<RELTIME_COLUMN_WIDTH$}");
+        let time_width = RELTIME_COLUMN_WIDTH.min(width.saturating_sub(MARKER_WIDTH));
+        let reltime_padded = pad_to_width(&truncate_to_width(&reltime, time_width), time_width);
 
-        let remaining = width.saturating_sub(MARKER_WIDTH + RELTIME_COLUMN_WIDTH);
+        let remaining = width.saturating_sub(MARKER_WIDTH + time_width);
 
         let mut suffix_parts: Vec<String> = Vec::new();
         if let Some(turns) = entry.turns {
-            suffix_parts.push(format!("· {turns} Turns"));
+            suffix_parts.push(tr_args(
+                "pickers.turns",
+                "· {count} turns",
+                &[("count", &turns.to_string())],
+            ));
         }
         if let Some(label) = &entry.project_label {
             suffix_parts.push(sanitize::sanitize_inline(label));
@@ -437,7 +455,7 @@ impl SessionPicker {
         let mut suffix_reserved = if suffix.is_empty() {
             0
         } else {
-            suffix.chars().count() + 2
+            UnicodeWidthStr::width(suffix.as_str()) + 2
         };
         // Nur anzeigen, wenn neben dem Suffix noch sinnvoll Platz für den
         // Titel bleibt; sonst Suffix ganz weglassen statt den Titel auf
@@ -449,8 +467,8 @@ impl SessionPicker {
 
         let title_width = remaining.saturating_sub(suffix_reserved);
         let title_sanitized = sanitize::sanitize_inline(&entry.title);
-        let title_truncated = truncate_chars(&title_sanitized, title_width);
-        let title_display = format!("{title_truncated:<title_width$}");
+        let title_truncated = truncate_to_width(&title_sanitized, title_width);
+        let title_display = pad_to_width(&title_truncated, title_width);
 
         let title_style = if is_selected {
             style::selected_style(theme)
@@ -475,7 +493,7 @@ impl SessionPicker {
     ///
     /// # Beschreibung
     /// Layout von oben nach unten: umrahmender `Block` mit Titel
-    /// `" Session fortsetzen "`; Filterzeile (`🔍 <filter>` oder gedimmter
+    /// `" Resume session "`; Filterzeile (`🔍 <filter>` oder gedimmter
     /// Platzhalter); Liste der gefilterten Einträge (Bildlauf hält die
     /// Auswahl sichtbar, siehe [`clamp_scroll`]) oder gedimmter Leerzustand;
     /// gedimmte Fußzeile mit Tastaturhinweisen. Fremdtext (Titel,
@@ -502,7 +520,9 @@ impl SessionPicker {
     /// nimmt.
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let theme = *theme;
-        let block = Block::default().borders(Borders::ALL).title(POPUP_TITLE);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(tr("pickers.session_title", POPUP_TITLE));
         let inner = block.inner(area);
         Widget::render(block, area, buf);
 
@@ -514,7 +534,10 @@ impl SessionPicker {
         let filter_area = Rect::new(inner.x, inner.y, inner.width, 1);
         if self.filter.is_empty() {
             Widget::render(
-                Line::styled(FILTER_PLACEHOLDER, style::dim_style(theme)),
+                Line::styled(
+                    tr("pickers.filter", FILTER_PLACEHOLDER),
+                    style::dim_style(theme),
+                ),
                 filter_area,
                 buf,
             );
@@ -530,7 +553,10 @@ impl SessionPicker {
         // Fußzeile (immer die letzte Innenzeile, sofern Platz vorhanden).
         let footer_area = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
         Widget::render(
-            Line::styled(FOOTER_HINT, style::dim_style(theme)),
+            Line::styled(
+                tr("pickers.session_footer", FOOTER_HINT),
+                style::dim_style(theme),
+            ),
             footer_area,
             buf,
         );
@@ -544,7 +570,10 @@ impl SessionPicker {
         if self.filtered.is_empty() {
             let empty_area = Rect::new(inner.x, list_top, inner.width, 1);
             Widget::render(
-                Line::styled(EMPTY_STATE_TEXT, style::dim_style(theme)),
+                Line::styled(
+                    tr("pickers.empty", EMPTY_STATE_TEXT),
+                    style::dim_style(theme),
+                ),
                 empty_area,
                 buf,
             );
@@ -592,6 +621,50 @@ mod tests {
 
     fn make_key_ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn translated_chrome_preserves_query_selection_and_display_cell_widths() {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let now = SystemTime::now();
+        let mut entries = vec![
+            make_entry("id-1", "日本語 नमस्ते é one", 60, now),
+            make_entry("id-2", "日本語 नमस्ते é two", 120, now),
+        ];
+        entries[1].turns = Some(17);
+        let mut picker = SessionPicker::new(entries, now);
+        picker.handle_key(make_key(KeyCode::Char('日')));
+        picker.handle_key(make_key(KeyCode::Down));
+        let area = Rect::new(0, 0, 100, 10);
+        let mut english = Buffer::empty(area);
+        picker.render(area, &mut english, &Theme::Dark);
+        assert!(buffer_to_string(&english).contains("Resume session"));
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                for width in [2, 8, 24, 80, 120] {
+                    let row = picker.build_row_line(&picker.entries[1], true, width, Theme::Dark);
+                    assert!(row.width() <= width, "{language:?}, width={width}: {row:?}");
+                    let area = Rect::new(0, 0, width as u16, 10);
+                    picker.render(area, &mut Buffer::empty(area), &Theme::Dark);
+                }
+            });
+        }
+        let mut japanese = Buffer::empty(area);
+        with_language(UiLanguage::Japanese, || {
+            picker.render(area, &mut japanese, &Theme::Dark)
+        });
+        let text = crate::test_support::display_buffer_text(&japanese);
+        assert!(text.contains("セッションを再開"));
+        assert!(text.contains("17 ターン"));
+        assert_eq!(picker.filter, "日");
+        assert_eq!(picker.selected, 1);
+        assert_eq!(
+            picker.handle_key(make_key(KeyCode::Enter)),
+            PickerAction::Open("id-2".into())
+        );
+        assert_eq!(truncate_to_width("é日本語", 4), "é日…");
+        assert_eq!(truncate_to_width("नमस्ते日本語", 5), "नमस्ते…");
     }
 
     /// `new` sortiert Einträge absteigend nach `last_active` (neueste zuerst).

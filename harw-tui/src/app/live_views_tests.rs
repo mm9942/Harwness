@@ -294,12 +294,12 @@ async fn mode_default_change_is_shown_after_reopening_the_mode_picker() -> TestR
     let env = runtime_backed_app()?;
     let recorder = Arc::new(RecordingSelectionPersistence::new());
     let before = view_text(&env.app.mode_picker_view());
-    assert!(!before.contains("Standard: work"), "{before}");
+    assert!(!before.contains("Default: work"), "{before}");
 
     run_op(&env, &recorder, "/mode default work").await?;
 
     let after = view_text(&env.app.mode_picker_view());
-    assert!(after.contains("Standard: work"), "{after}");
+    assert!(after.contains("Default: work"), "{after}");
     Ok(())
 }
 
