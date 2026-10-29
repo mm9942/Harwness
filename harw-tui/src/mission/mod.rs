@@ -34,6 +34,7 @@ pub(crate) mod finished_window;
 pub(crate) mod jobs_window;
 pub(crate) mod live_window;
 pub(crate) mod projection;
+pub(crate) mod stop_job;
 
 /// Focus cycle order of `F4` (PL-97 §3.3.3): Chat → Agents → Jobs →
 /// Finished → LIVE (only while focusable) → Explorer → Workbench → Chat.
@@ -365,9 +366,7 @@ impl MissionUi {
     /// detail is open there.
     #[must_use]
     pub(crate) fn live_detail_agent(&self) -> Option<&str> {
-        self.live_detail
-            .as_deref()
-            .filter(|_| self.live_expanded)
+        self.live_detail.as_deref().filter(|_| self.live_expanded)
     }
 
     /// Opens the in-place LIVE detail of `agent` (landscape `Alt+L`/Enter),
@@ -422,7 +421,7 @@ impl MissionUi {
             .as_deref()
             .and_then(|id| monitor.agent(id))
             .filter(|live| {
-                projection::is_active(live.phase)
+                live.phase.is_active()
                     || live.is_unseen_failure()
                     || live
                         .finished
@@ -436,7 +435,7 @@ impl MissionUi {
             .into_iter()
             .map(|(_, live)| live)
             .filter(|live| {
-                projection::is_active(live.phase)
+                live.phase.is_active()
                     && live.role.trim()
                         == harw_registry_defaults::profile::role_names::ROOT_ORCHESTRATOR
             })
@@ -572,6 +571,30 @@ pub(crate) mod tests {
         later.phase = AgentPhase::Thinking;
         assert_eq!(ui.tool_started(&later), None, "no tool, no clock");
         Ok(())
+    }
+
+    /// PL-97 C3: the in-place LIVE detail keeps the agent it was opened
+    /// for, starts at the newest line and closes once LIVE loses the focus.
+    #[test]
+    fn in_place_live_detail_opens_closes_and_follows_the_focus() {
+        let mut ui = MissionUi::new(Instant::now());
+        assert_eq!(ui.live_detail_agent(), None);
+        ui.live_scroll.scroll_up(4, 100, 10);
+        ui.open_live_detail("o1");
+        assert_eq!(ui.live_detail_agent(), Some("o1"));
+        assert!(ui.live_expanded && ui.live_scroll.is_following());
+        ui.sync_live_focus(PaneFocus::Live);
+        assert_eq!(ui.live_detail_agent(), Some("o1"), "LIVE keeps the focus");
+        ui.sync_live_focus(PaneFocus::Chat);
+        assert_eq!(ui.live_detail_agent(), None);
+        assert!(!ui.live_expanded);
+
+        // Ein Hochformat-Detail (`live_expanded` ohne Agent an Ort und
+        // Stelle) bleibt unberührt.
+        ui.live_expanded = true;
+        ui.sync_live_focus(PaneFocus::Agents);
+        assert!(ui.live_expanded);
+        assert_eq!(ui.live_detail_agent(), None);
     }
 
     #[test]

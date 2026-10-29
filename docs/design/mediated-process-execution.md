@@ -413,6 +413,104 @@ installs `harw-job-exec` next to `harw`.
   filesystem, network, `no_new_privs`, capabilities, resource limits,
   cgroup; `harw_job_runtime::predicted_dimensions`).
 
+### Per-job write scope and fail-closed fallback (PL-97 E2)
+
+A `JobSpec` may carry a versioned write scope
+(`write_scope: Option<JobWriteScope>`, `{ version, paths }`, absent in old
+records). It is the typed hook for per-worker file isolation (PR #153
+W2). The scope **replaces** the workspace write grant of the job's
+sandbox profile and never widens it. The workspace becomes read-only
+(read and execute stay), and only the listed paths stay writable. What
+the profile grants outside the workspace (`/tmp`, `/dev/null`) is
+unchanged.
+
+- Versions: the runtime checks `version` before anything else. An
+  unknown version is refused with `SpecError::UnsupportedWriteScopeVersion`
+  at admission (`JobSpec::validate`, `JobSpecEnvelope::into_spec`) and
+  again at start, never ignored. A scope with unknown fields does not
+  deserialize.
+- Paths: absolute, normalised (no empty, `.` or `..` segment, no trailing
+  `/`), not `/`, no duplicates, at most 256. When the attempt starts, the
+  Linux executor resolves them against the workspace. A path outside the
+  workspace is refused (`WriteScopeOutsideWorkspace`), and so is one that
+  resolves outside it through a symlink. An existing path gets a rule for
+  its canonical form. The Landlock planner skips paths that do not exist
+  (`PreparedRuleset::skipped_paths`). A path that does not exist yet (a file
+  the job will create) therefore gets no rule of its own. It must be covered
+  by an entry for an existing ancestor directory, usually its parent, whose
+  rule grants the write; an uncovered one is refused (`WriteScopeUncovered`).
+- Profiles: `read_only_analysis` grants no workspace write and takes no
+  scope. A read-write rule that contains the workspace would keep the
+  whole workspace writable, because Landlock rights are inherited. The
+  common case is `/tmp`, which is writable in every profile, for a
+  workspace below it. Such a scoped job is refused.
+- `LandlockTrampoline`: the scoped policy (host paths) is the trampoline's
+  policy.
+- `BwrapTrampoline`: bwrap binds the workspace as the profile says, as a
+  whole, because a mount namespace cannot make a path below a read-only
+  bind writable. The scoped policy, mapped onto the namespace view
+  (`PathMap`), becomes the inner stage's Landlock policy. Every scope path
+  must keep a read-write bind there. Otherwise the plan is refused instead
+  of the mapping dropping the path as unmapped. The rule from the security
+  review (finding 4) holds for the policy that is actually used: no inner
+  policy grants write at, beneath or above `/run/harw-job`, where the
+  attempt directory is bound.
+
+Scoped jobs always carry `SandboxRequirement::Required`
+(`JobSpecBuilder::write_scope` sets it, `JobSpec::validate` refuses
+anything else). A `required` job is refused **before any process starts**
+when the selected backend cannot enforce the filesystem dimension, or, on
+`landlock`, the network dimension of the job's profile:
+
+| Backend | Filesystem dimension | Scoped / `required` job |
+|---|---|---|
+| `none` | not enforced | refused (`SandboxRequirementNotMet`) |
+| `bwrap` | partial (mounts cannot separate read from execute) | refused before planning |
+| `landlock` | Landlock ABI ≥ 5 enforced, 1–4 partial, none unsupported; no network namespace, so a profile that restricts the network is partial at best (Landlock restricts TCP only) | runs only with ABI ≥ 5 **and** a network-allowing profile (`workspace_build`); `no_network` and `network_restricted` scoped jobs are refused (use `bwrap-trampoline`); refused before the plan file exists |
+| `bwrap-trampoline` | as `landlock` (needs a usable ABI at all); the namespace enforces the network | runs only with ABI ≥ 5, any profile with workspace write; refused before the attempt directory exists |
+
+Only legacy unscoped `best_effort` jobs run on a weaker backend. The
+executor logs that once ("runs without full cgroup/landlock enforcement").
+
+- Trust boundary: the scope is policy data of the job spec. The runtime
+  narrows with it and never grants a path the profile does not already
+  grant for writing.
+- Failure mode: fail-closed. An unknown version, an unresolvable or
+  uncovered path, a writable ancestor or a backend that cannot enforce the
+  scope means the job does not run.
+- Persistence: the scope travels in the job record (`JobSpecEnvelope`
+  version 1, additive optional field) and in the trampoline plan of the
+  attempt.
+- Swapped paths: scope paths are resolved when the attempt is prepared
+  and opened again by the trampoline just before `exec`. A process that
+  can write an ancestor directory of a scope path (another job, a sibling
+  worker) could swap the path for a symlink in that window. The scoped
+  policy is therefore in Landlock hard-requirement mode: the trampoline
+  reads every write rule back through `/proc/self/fd` after opening it and
+  refuses the job when the opened object is not exactly the planned
+  canonical path (`SandboxError::InvalidPath`). The rights of a rule follow
+  the opened fd (`fstat`), not a second lookup of the path. Every write
+  rule of a scoped policy must therefore be canonical where the trampoline
+  runs, `/tmp` and `/dev/null` included; on a host where `/tmp` is a
+  symlink, scoped jobs are refused. Read and execute rules grant no write
+  and are not read back.
+
+The same work package maps every job limit of `ResourceRequest` into the
+job cgroup (`memory_max`, `memory_high`, `cpu_weight`, `cpu_max`,
+`pids_max`, `io_weight`) and the per-process limits into the trampoline's
+rlimits. A limit the host cannot apply is reported, never dropped: without
+a cgroup root every job limit counts as `not_enforced`, and a controller
+that is not delegated makes the cgroup report `partial` or `not_enforced`.
+The OCI and Kubernetes executors do not map or report `memory_high`,
+`cpu_max` and `io_weight` yet (an open PL-97 follow-up); no producer may
+set them for those executors before it lands. Those executors never mount
+the host workspace, so a write scope has nothing to narrow there.
+`[sandbox] execution = "chain" | "legacy"` (default `chain`,
+profile-scoped, see `config-structure.md`) selects between this path and
+the previous pre-built `prlimit … -- bwrap …` host job. It is parsed here
+and consumed by `shell.exec`, `job.start` and the child agents in PL-97
+E2b.
+
 ## Implementation
 
 ### `SandboxProfile` (`harw-sandbox/src/profile.rs`)

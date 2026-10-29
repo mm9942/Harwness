@@ -405,6 +405,12 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     "dod.status",
     "dod.findings",
     "dod.sensors",
+    // PL-97 B2: der Werkzeug-Index (`profile::TOOL_INDEX_TOOLS`,
+    // `model_tool(readonly, approval = "none")`, `harw-ops/src/tool_index_op.rs`).
+    // Liest nur statische Daten dieses Binaries (Katalog, Profile,
+    // Werkzeug-Spezifikationen, gebündelte Skill-Manifeste); kein Workspace,
+    // kein Netz, kein Sitzungszustand, kein Sandbox-Recht.
+    "tool.index",
     // Bewusst entfernt (W1-05, Register F-014, G-003, G-004, F-043, G-068):
     // - `plan`, `goal`: deklarieren `model_tool(approval = "always")` und
     //   mutieren PlanStore bzw. Ziel; die Auto-Freigabe überstimmte die
@@ -1227,6 +1233,8 @@ mod tests {
         read_only_surface.extend_from_slice(crate::profile::WORK_DRIVER_REPORT_TOOLS);
         // PL-97 D3: die lesenden Harw-DoD-Werkzeuge (nur Lesen des Exports).
         read_only_surface.extend_from_slice(crate::profile::DOD_READ_TOOLS);
+        // PL-97 B2: der Werkzeug-Index (nur statische Daten).
+        read_only_surface.extend_from_slice(crate::profile::TOOL_INDEX_TOOLS);
         // harw-tool-tunnel-v1: die lesenden Tunnel-Werkzeuge stehen in
         // `AUTO_APPROVED_TOOLS` (Besitzprüfung im Tool selbst, `tunnel.stop`
         // beendet nur einen eigenen Tunnel), aber kein read-only Profil

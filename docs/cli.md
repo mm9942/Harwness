@@ -45,6 +45,7 @@ Agents and knowledge
   jobs list [FILTER] | show ID | approve ID [--note TEXT]
        | deny ID [--reason TEXT] | cancel ID | retry ID
   cycle list [STATE [--limit N]] | status ID | stop ID [--reason TEXT]
+  tool list [FAMILY] | describe NAME            Tool index (same data as `tool.index`)
 
 Services
   gateway [install|start|stop|restart|enable|disable|status]
@@ -182,6 +183,41 @@ harw skill preview "cargo test fails with E0505 in src/lib.rs" --command "cargo 
 harw skill validate harw-tool-sys/skills/sys-tools
 ```
 
+## Tools (`harw tool`)
+
+`harw tool` shows the tool index of this build: the same data the model gets
+from the read-only model tool `tool.index`. It reads only data built into the
+`harw` binary (the capability catalog, the registry profiles, the real tool
+descriptions and the bundled skill manifests), needs no configuration and no
+Harwness home, and writes nothing. It lists every tool the build knows, not
+only the tools a particular session or role may call.
+
+| Action | Effect |
+| --- | --- |
+| `list` | The tool families with their tool counts. A family is the name prefix before the first `.` (`fs`, `git`, `dod`, …); names without a `.` belong to `core`. |
+| `list FAMILY` | One line per tool of the family: name, capability class, the first sentence of its description, the skill that explains it (`skill: …`) and the profiles that register it (or `always available`). |
+| `describe NAME` | One tool: family, provider and crate, capability class, profiles, linked skill, how the default approval policy treats a call, the full description and every parameter with type, whether it is required, and its description. |
+
+The linked skill comes from the bundled skill manifests (a skill whose
+`skill.toml` is the only one to list the tool in `tools = [...]`) and from
+`#[tool(skill = "...")]` bindings of the tool providers; a tool that several
+skills list has no link. With `--json`, `list` prints the families (or the
+tools of the family) and `describe` the entry, the description, the parameter
+list and the parameter schema.
+
+Exit codes: `0` success, `1` unknown family or unknown tool (the message lists
+the known families), `2` usage error.
+
+```bash
+# Which read-only Harw-DoD tools are there, and what do they take?
+harw tool list dod
+harw tool describe dod.findings --json
+```
+
+The system prompt of every session with tools carries a matching
+`## Tool families` block (each family of the session's own tools with its
+count) and points the model at `tool.index` for details.
+
 ## Global flags
 
 Global flags may appear before or after any command and apply to every
@@ -249,6 +285,8 @@ error.
 - **`harw dod …`** prints one object per action (the same structure as the
   `/dod` command and the `dod.*` model tools; service actions report the
   `systemctl` steps they ran).
+- **`harw tool …`** prints the same structure as the `tool.index` model tool
+  (`describe` adds the description, the parameters and their schema).
 
 Commands without a JSON form — such as interactive dialogs like
 `harw agent uia-new`, `harw knowledge index` or `harw provider …` — abort

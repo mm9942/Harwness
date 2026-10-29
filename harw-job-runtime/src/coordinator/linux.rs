@@ -65,12 +65,19 @@
 //! is the inner stage's Landlock policy: every scope path must keep a
 //! read-write bind there, or the plan is refused instead of dropping it.
 //!
+//! The scoped policy is in Landlock hard-requirement mode: the trampoline
+//! reads every write rule back after opening it and refuses the job when
+//! the opened object is not the canonical path checked here (a symlink
+//! swapped in between).
+//!
 //! A job with a write scope always carries [`SandboxRequirement::Required`]
 //! (`JobSpec::validate`). A `required` job is refused before any process
 //! starts when the backend cannot enforce its filesystem dimension: `None`
 //! and `Bwrap` never can, the trampoline backends only with Landlock ABI
-//! `LANDLOCK_TARGET_ABI` (5) or newer. Only legacy unscoped best-effort jobs
-//! run on a weaker backend; the executor logs that once.
+//! `LANDLOCK_TARGET_ABI` (5) or newer. `LandlockTrampoline` has no network
+//! namespace either, so there a `required` job also needs a profile that
+//! allows the network (Landlock restricts TCP only). Only legacy unscoped
+//! best-effort jobs run on a weaker backend; the executor logs that once.
 //!
 //! # Exit-status shim (optional)
 //! pidfds do not survive a restart, and a reattached process is not our
@@ -127,7 +134,9 @@ use harw_job_core::{
 };
 use harw_job_linux::cgroup::{CgroupBackend, CgroupHandle, CgroupSpec, CgroupV2Fs};
 use harw_job_linux::group::JobCgroup;
-use harw_job_linux::sandbox::{WriteScopeConflict, landlock_filesystem_state};
+use harw_job_linux::sandbox::{
+    WriteScopeConflict, landlock_filesystem_state, landlock_network_state,
+};
 use harw_job_linux::{
     CgroupError, CpuQuota, IdentityCheck, IoLimits, JobResources, LaunchError, LinuxJobGroup,
     LinuxRecoveryIdentity, ProcessError, RecoveryError, SandboxPolicy, TerminationPolicy,
@@ -646,9 +655,7 @@ fn scoped_inner_policy(
         .filter(|path| !destinations.contains(path))
         .find(|path| workspace.starts_with(path))
     {
-        return refuse(
-            WriteScopeConflict::WritableAncestor(ancestor.clone()).to_string(),
-        );
+        return refuse(WriteScopeConflict::WritableAncestor(ancestor.clone()).to_string());
     }
     Ok(inner)
 }
@@ -1387,12 +1394,19 @@ impl LinuxExecutor {
             ) => {
                 // Lower bound known before spawning: the resource domain and
                 // what the host's Landlock ABI can enforce on the filesystem
-                // (a `required` job, every scoped job included, is refused
-                // here instead of by the trampoline after the spawn).
-                let filesystem = landlock_filesystem_state(self.landlock_abi());
+                // and on the network. Without a namespace Landlock restricts
+                // TCP only, so a profile that restricts the network is
+                // `partial` at best: here a `required` job (every scoped job
+                // included) runs only with a network-allowing profile
+                // (`workspace_build`). It is refused before the plan file
+                // exists, not by the trampoline after the spawn.
+                let abi = self.landlock_abi();
+                let profile = policy_for(spec.sandbox_profile, &ctx.workspace_root);
+                let filesystem = landlock_filesystem_state(abi);
                 if spec.sandbox == SandboxRequirement::Required {
                     let report = SandboxReport {
                         filesystem,
+                        network: landlock_network_state(&profile.network, abi),
                         resource_limits,
                         ..SandboxReport::uniform(EnforcementState::Enforced)
                     };
@@ -1410,7 +1424,7 @@ impl LinuxExecutor {
                         );
                         scoped.policy
                     }
-                    None => policy_for(spec.sandbox_profile, &ctx.workspace_root),
+                    None => profile,
                 };
                 let mut plan = harw_job_exec::ExecPlanV1::new(&spec.program)
                     .with_args(spec.args.iter().cloned())
@@ -1759,7 +1773,9 @@ struct ScopedPolicy {
 /// the workspace becomes read-only except the listed paths. A read-write
 /// rule that contains the workspace (e.g. `/tmp`, writable in every
 /// profile, for a workspace below it) would keep the whole workspace
-/// writable, so such a job is refused.
+/// writable, so such a job is refused. The policy is in Landlock
+/// hard-requirement mode, so the trampoline refuses a write rule that no
+/// longer opens the canonical path resolved here.
 ///
 /// # Errors
 /// [`RuntimeError::InvalidSpec`] for a scope this build refuses (unknown
@@ -1849,10 +1865,12 @@ fn resolve_write_scope(
         match path.canonicalize() {
             Ok(resolved) => {
                 if !resolved.starts_with(canonical) {
-                    return Err(RuntimeError::InvalidSpec(SpecError::InvalidWriteScopePath {
-                        path: lossy(path),
-                        reason: "resolves to a location outside the job's workspace",
-                    }));
+                    return Err(RuntimeError::InvalidSpec(
+                        SpecError::InvalidWriteScopePath {
+                            path: lossy(path),
+                            reason: "resolves to a location outside the job's workspace",
+                        },
+                    ));
                 }
                 if resolved.is_dir() {
                     directories.push(path);
@@ -2746,6 +2764,520 @@ mod tests {
     }
 }
 
+/// Write scope, fail-closed fallback and resource mapping (PL-97 E2).
+#[cfg(test)]
+mod scope_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+
+    use harw_job_core::spec::{CpuBandwidth, JobWriteScope};
+    use harw_job_core::{
+        AttemptId, EnforcementState as S, ExitOutcome, JobSpec, ResourceRequest, RunnerId,
+        SandboxProfileName, SandboxRequirement, SpecError,
+    };
+    use harw_job_exec::ExecPlanV1;
+    use harw_job_linux::sandbox::plan_landlock;
+    use harw_job_linux::{CpuQuota, IoLimits, JobResources, LandlockMode};
+    use harw_types::WorkId;
+
+    use super::{
+        LinuxExecutor, LinuxExecutorOptions, LinuxSandboxBackend, RuntimeError, job_resources,
+        policy_for, rlimit_set, scoped_policy,
+    };
+    use crate::coordinator::executor::{
+        AttemptContext, AttemptEvent, Executor as _, requests_resource_limits,
+    };
+    use crate::test_support::{TestError, TestResult, ctx};
+
+    const TRAMPOLINE: &str = "/opt/harw/bin/harw-job-exec";
+
+    /// A canonical workspace with `src/` and `notes.txt`, a private plan
+    /// directory and a directory outside the workspace.
+    pub(super) struct Scene {
+        pub(super) dir: tempfile::TempDir,
+        pub(super) workspace: PathBuf,
+        pub(super) plans: PathBuf,
+    }
+
+    impl Scene {
+        pub(super) fn path(&self, relative: &str) -> PathBuf {
+            self.workspace.join(relative)
+        }
+    }
+
+    /// A [`Scene`] below `parent`. Scoped tests use `/var/tmp`: every
+    /// profile keeps `/tmp` writable, so a scope below it cannot hold.
+    pub(super) fn scene_in(parent: &str) -> TestResult<Scene> {
+        let dir = tempfile::Builder::new()
+            .prefix("harw-scope-")
+            .tempdir_in(parent)
+            .map_err(ctx("tempdir"))?;
+        let workspace = dir.path().join("workspace");
+        let plans = dir.path().join("plans");
+        std::fs::create_dir_all(workspace.join("src")).map_err(ctx("workspace"))?;
+        std::fs::write(workspace.join("notes.txt"), b"n").map_err(ctx("notes"))?;
+        std::fs::create_dir(dir.path().join("outside")).map_err(ctx("outside"))?;
+        std::fs::create_dir(&plans).map_err(ctx("plans"))?;
+        std::fs::set_permissions(&plans, std::fs::Permissions::from_mode(0o700))
+            .map_err(ctx("chmod plans"))?;
+        let workspace = workspace.canonicalize().map_err(ctx("canonical"))?;
+        Ok(Scene {
+            dir,
+            workspace,
+            plans,
+        })
+    }
+
+    pub(super) fn scene() -> TestResult<Scene> {
+        scene_in("/var/tmp")
+    }
+
+    pub(super) fn context(workspace: &Path) -> TestResult<AttemptContext> {
+        Ok(AttemptContext {
+            job_id: WorkId::from_str("j"),
+            attempt_id: AttemptId::new("j-e1").map_err(ctx("attempt"))?,
+            runner_id: RunnerId::new("r").map_err(ctx("runner"))?,
+            lease_epoch: 1,
+            workspace_root: workspace.to_path_buf(),
+            output_files: None,
+            stdio_handoff: None,
+        })
+    }
+
+    /// A `profile` job running `/bin/sh -c <script>`, scoped to `paths`.
+    pub(super) fn scoped_as(
+        profile: SandboxProfileName,
+        script: &str,
+        paths: &[PathBuf],
+    ) -> TestResult<JobSpec> {
+        JobSpec::command("/bin/sh")
+            .args(["-c", script])
+            .sandbox(profile)
+            .write_scope(JobWriteScope::new(paths.iter().cloned()).map_err(ctx("scope"))?)
+            .build()
+            .map_err(ctx("scoped spec"))
+    }
+
+    /// A `NoNetwork` scoped job ([`scoped_as`]): runs on `BwrapTrampoline`
+    /// (the namespace enforces the network), never on `LandlockTrampoline`.
+    pub(super) fn scoped(script: &str, paths: &[PathBuf]) -> TestResult<JobSpec> {
+        scoped_as(SandboxProfileName::NoNetwork, script, paths)
+    }
+
+    /// A `WorkspaceBuild` scoped job: the profile `LandlockTrampoline` can
+    /// run scoped (network allowed, nothing for Landlock to restrict).
+    fn scoped_build(script: &str, paths: &[PathBuf]) -> TestResult<JobSpec> {
+        scoped_as(SandboxProfileName::WorkspaceBuild, script, paths)
+    }
+
+    fn landlock_executor(plans: &Path, abi: Option<u8>) -> TestResult<LinuxExecutor> {
+        let executor = LinuxExecutor::new(LinuxExecutorOptions {
+            sandbox: LinuxSandboxBackend::LandlockTrampoline {
+                trampoline: PathBuf::from(TRAMPOLINE),
+                plan_dir: plans.to_path_buf(),
+            },
+            ..LinuxExecutorOptions::default()
+        })
+        .map_err(ctx("executor"))?;
+        executor
+            .landlock_probe
+            .set(abi)
+            .map_err(|_| TestError::Unexpected("landlock ABI already probed".to_owned()))?;
+        Ok(executor)
+    }
+
+    pub(super) fn entries(dir: &Path) -> TestResult<usize> {
+        Ok(std::fs::read_dir(dir).map_err(ctx("read dir"))?.count())
+    }
+
+    /// The trampoline plan `prepare` wrote for the Landlock trampoline.
+    fn landlock_plan(
+        executor: &LinuxExecutor,
+        spec: &JobSpec,
+        scene: &Scene,
+    ) -> TestResult<ExecPlanV1> {
+        let prepared = executor
+            .prepare(spec, &context(&scene.workspace)?, None, S::Enforced)
+            .map_err(ctx("prepare"))?;
+        let path = prepared
+            .trampoline_plan
+            .clone()
+            .ok_or(TestError::Missing("plan path"))?;
+        let plan = ExecPlanV1::from_json(&std::fs::read(&path).map_err(ctx("read plan"))?)
+            .map_err(ctx("parse plan"))?;
+        prepared.discard_files();
+        Ok(plan)
+    }
+
+    fn invalid_spec(result: Result<impl Sized, RuntimeError>) -> TestResult<SpecError> {
+        match result {
+            Err(RuntimeError::InvalidSpec(error)) => Ok(error),
+            Err(other) => Err(TestError::Unexpected(format!("{other}"))),
+            Ok(_) => Err(TestError::Unexpected("accepted".to_owned())),
+        }
+    }
+
+    #[test]
+    fn job_resources_maps_every_field() -> TestResult {
+        let spec = JobSpec::command("true")
+            .resources(ResourceRequest {
+                memory_max: Some(512 << 20),
+                memory_high: Some(256 << 20),
+                cpu_weight: Some(200),
+                cpu_max: Some(CpuBandwidth {
+                    quota_us: 150_000,
+                    period_us: 100_000,
+                }),
+                pids_max: Some(64),
+                io_weight: Some(50),
+                address_space_max: Some(1 << 30),
+                cpu_time_max: Some(60),
+                file_size_max: Some(1 << 20),
+                open_files_max: Some(256),
+                ..ResourceRequest::default()
+            })
+            .build()
+            .map_err(ctx("spec"))?;
+        let resources = job_resources(&spec);
+        assert_eq!(
+            resources,
+            JobResources {
+                memory_max: Some(512 << 20),
+                memory_high: Some(256 << 20),
+                cpu_weight: Some(200),
+                cpu_max: Some(CpuQuota {
+                    quota_us: 150_000,
+                    period_us: 100_000,
+                }),
+                pids_max: Some(64),
+                io: Some(IoLimits {
+                    weight: Some(50),
+                    devices: Vec::new(),
+                }),
+                rlimits: rlimit_set(&spec),
+            }
+        );
+        assert_eq!(resources.rlimits.iter().count(), 4);
+        resources.validate().map_err(ctx("cgroup domain"))?;
+        // Every job limit needs a resource domain: without a cgroup root it
+        // is reported `not_enforced`, never dropped.
+        for request in [
+            ResourceRequest {
+                memory_high: Some(1),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                cpu_max: Some(CpuBandwidth::cpus(1)),
+                ..ResourceRequest::default()
+            },
+            ResourceRequest {
+                io_weight: Some(10),
+                ..ResourceRequest::default()
+            },
+        ] {
+            let spec = JobSpec::command("true")
+                .resources(request)
+                .build()
+                .map_err(ctx("single"))?;
+            assert!(requests_resource_limits(&spec), "{:?}", spec.resources);
+            assert!(job_resources(&spec).has_cgroup_limits());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_job_on_no_backend_is_refused_before_any_process_starts() -> TestResult {
+        let scene = scene()?;
+        let marker = scene.path("marker");
+        let spec = scoped(
+            &format!("touch '{}'", marker.display()),
+            &[scene.path("src")],
+        )?;
+        let executor =
+            LinuxExecutor::new(LinuxExecutorOptions::default()).map_err(ctx("executor"))?;
+        match executor.start(&spec, &context(&scene.workspace)?) {
+            Err(RuntimeError::SandboxRequirementNotMet { report, shortfalls }) => {
+                assert_eq!(report.filesystem, S::NotEnforced);
+                assert!(shortfalls.contains(&"filesystem"), "{shortfalls:?}");
+            }
+            Err(other) => return Err(TestError::Unexpected(format!("{other}"))),
+            Ok(_) => return Err(TestError::Unexpected("scoped job started".to_owned())),
+        }
+        assert!(!marker.exists(), "no process ran");
+        assert!(!executor.weak_backend_logged.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn best_effort_unscoped_job_still_runs_on_no_backend() -> TestResult {
+        let scene = scene()?;
+        let spec = JobSpec::command("/bin/sh")
+            .args(["-c", "touch marker"])
+            .sandbox(SandboxProfileName::NoNetwork)
+            .sandbox_requirement(SandboxRequirement::BestEffort)
+            .build()
+            .map_err(ctx("spec"))?;
+        let executor =
+            LinuxExecutor::new(LinuxExecutorOptions::default()).map_err(ctx("executor"))?;
+        let mut started = executor
+            .start(&spec, &context(&scene.workspace)?)
+            .map_err(ctx("start"))?;
+        assert_eq!(
+            started.sandbox.map(|report| report.filesystem),
+            Some(S::NotEnforced)
+        );
+        loop {
+            match started.run.next_event().await {
+                Some(AttemptEvent::Exited { outcome, .. }) => {
+                    assert_eq!(outcome, ExitOutcome::Exited(0));
+                    break;
+                }
+                Some(_) => {}
+                None => return Err(TestError::Missing("exit event")),
+            }
+        }
+        assert!(scene.path("marker").exists(), "the job ran");
+        assert!(
+            executor.weak_backend_logged.load(Ordering::Relaxed),
+            "logged once"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_scope_version_is_refused_at_start() -> TestResult {
+        let scene = scene()?;
+        let marker = scene.path("marker");
+        let mut spec = scoped_build(
+            &format!("touch '{}'", marker.display()),
+            &[scene.path("src")],
+        )?;
+        if let Some(scope) = spec.write_scope.as_mut() {
+            scope.version = 9;
+        }
+        let expected = SpecError::UnsupportedWriteScopeVersion {
+            found: 9,
+            supported: JobWriteScope::CURRENT_VERSION,
+        };
+        let plain = LinuxExecutor::new(LinuxExecutorOptions::default()).map_err(ctx("plain"))?;
+        let landlock = landlock_executor(&scene.plans, Some(6))?;
+        for executor in [&plain, &landlock] {
+            let error = invalid_spec(executor.start(&spec, &context(&scene.workspace)?))?;
+            assert_eq!(error, expected);
+        }
+        // The trampoline backend refuses it as well when it plans the
+        // policy (defense in depth below `start`'s validation).
+        let error =
+            invalid_spec(landlock.prepare(&spec, &context(&scene.workspace)?, None, S::Enforced))?;
+        assert_eq!(error, expected);
+        assert!(!marker.exists());
+        assert_eq!(entries(&scene.plans)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn landlock_plan_is_workspace_read_only_plus_the_listed_paths() -> TestResult {
+        let scene = scene()?;
+        let executor = landlock_executor(&scene.plans, Some(6))?;
+        let src = scene.path("src");
+        let notes = scene.path("notes.txt");
+        let new_file = scene.path("src/new.rs");
+        let spec = scoped_build("true", &[src.clone(), new_file.clone(), notes.clone()])?;
+        let plan = landlock_plan(&executor, &spec, &scene)?;
+        assert_eq!(plan.sandbox_requirement, SandboxRequirement::Required);
+        let policy = plan.sandbox.ok_or(TestError::Missing("policy"))?;
+        // The trampoline re-checks every write rule after opening it.
+        assert_eq!(policy.landlock, LandlockMode::HardRequirement);
+        let filesystem = &policy.filesystem;
+        let workspace = &scene.workspace;
+        assert!(!filesystem.read_write.contains(workspace));
+        assert!(filesystem.read_only.contains(workspace));
+        assert!(filesystem.read_write.contains(&src));
+        assert!(filesystem.read_write.contains(&notes));
+        assert!(
+            !filesystem.read_write.contains(&new_file),
+            "a path that does not exist gets no rule; its parent entry covers it"
+        );
+        let rules = plan_landlock(&policy);
+        let access = |path: &Path| {
+            rules
+                .rules
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, access)| *access)
+        };
+        let root = access(workspace).ok_or(TestError::Missing("workspace rule"))?;
+        assert!(root.read && root.exec && !root.write);
+        assert!(access(&src).is_some_and(|rule| rule.write));
+        assert!(access(Path::new("/tmp")).is_some_and(|rule| rule.write));
+        assert_eq!(entries(&scene.plans)?, 0, "the plan is discarded");
+
+        // Without a scope the profile policy is used unchanged.
+        let unscoped = JobSpec::command("true")
+            .sandbox(SandboxProfileName::NoNetwork)
+            .build()
+            .map_err(ctx("unscoped"))?;
+        let plan = landlock_plan(&executor, &unscoped, &scene)?;
+        assert_eq!(
+            plan.sandbox,
+            Some(policy_for(SandboxProfileName::NoNetwork, workspace))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scope_paths_outside_the_workspace_are_refused() -> TestResult {
+        let scene = scene()?;
+        let executor = landlock_executor(&scene.plans, Some(6))?;
+        let outside = scene.dir.path().join("outside");
+        for path in [outside.clone(), PathBuf::from("/etc")] {
+            let spec = scoped_build("true", &[scene.path("src"), path.clone()])?;
+            let error = invalid_spec(executor.prepare(
+                &spec,
+                &context(&scene.workspace)?,
+                None,
+                S::Enforced,
+            ))?;
+            assert_eq!(
+                error,
+                SpecError::WriteScopeOutsideWorkspace {
+                    path: path.to_string_lossy().into_owned()
+                }
+            );
+        }
+        // Inside the workspace, but a symlink out of it.
+        let link = scene.path("link");
+        std::os::unix::fs::symlink(&outside, &link).map_err(ctx("symlink"))?;
+        let spec = scoped("true", &[link])?;
+        match invalid_spec(scoped_policy(&spec, &scene.workspace))? {
+            SpecError::InvalidWriteScopePath { reason, .. } => {
+                assert!(reason.starts_with("resolves"), "{reason}");
+            }
+            other => return Err(TestError::Unexpected(format!("{other}"))),
+        }
+        assert_eq!(entries(&scene.plans)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_scope_path_needs_an_existing_parent_entry() -> TestResult {
+        let scene = scene()?;
+        let new_file = scene.path("src/new.rs");
+        let alone = scoped("true", std::slice::from_ref(&new_file))?;
+        assert_eq!(
+            invalid_spec(scoped_policy(&alone, &scene.workspace))?,
+            SpecError::WriteScopeUncovered {
+                path: new_file.to_string_lossy().into_owned()
+            }
+        );
+        let covered = scoped("true", &[scene.path("src"), new_file])?;
+        let resolved = scoped_policy(&covered, &scene.workspace)
+            .map_err(ctx("covered"))?
+            .ok_or(TestError::Missing("scoped policy"))?;
+        assert_eq!(resolved.writes, [scene.path("src")]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_workspace_below_tmp_cannot_be_scoped() -> TestResult {
+        let scene = scene_in("/tmp")?;
+        let spec = scoped("true", &[scene.path("src")])?;
+        match scoped_policy(&spec, &scene.workspace) {
+            Err(RuntimeError::Sandbox { detail }) => {
+                assert!(detail.contains("\"/tmp\""), "{detail}");
+            }
+            Err(other) => return Err(TestError::Unexpected(format!("{other}"))),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "scope below /tmp accepted".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_profile_without_workspace_writes_takes_no_scope() -> TestResult {
+        let scene = scene()?;
+        let mut spec = scoped("true", &[scene.path("src")])?;
+        // Bypasses `JobSpec::validate`, which refuses the combination too.
+        spec.sandbox_profile = SandboxProfileName::ReadOnlyAnalysis;
+        assert_eq!(
+            invalid_spec(scoped_policy(&spec, &scene.workspace))?,
+            SpecError::WriteScopeWithoutWorkspaceWrite {
+                profile: SandboxProfileName::ReadOnlyAnalysis
+            }
+        );
+        Ok(())
+    }
+
+    /// On `LandlockTrampoline` a scoped job needs the full Landlock ABI
+    /// (filesystem) and a profile that allows the network: without a
+    /// namespace Landlock restricts TCP only, so `no_network` and
+    /// `network_restricted` are `partial` at best. Both are refused before
+    /// the plan file exists.
+    #[test]
+    fn scoped_job_needs_the_full_landlock_abi_and_an_open_network() -> TestResult {
+        use SandboxProfileName::{NetworkRestricted, NoNetwork, WorkspaceBuild};
+        let scene = scene()?;
+        let cases: [(SandboxProfileName, Option<u8>, &[&str]); 9] = [
+            (WorkspaceBuild, None, &["filesystem"]),
+            (WorkspaceBuild, Some(1), &["filesystem"]),
+            (WorkspaceBuild, Some(4), &["filesystem"]),
+            (NoNetwork, None, &["filesystem", "network"]),
+            (NoNetwork, Some(3), &["filesystem", "network"]),
+            (NoNetwork, Some(4), &["filesystem", "network"]),
+            (NoNetwork, Some(5), &["network"]),
+            (NoNetwork, Some(6), &["network"]),
+            (NetworkRestricted, Some(6), &["network"]),
+        ];
+        for (profile, abi, expected) in cases {
+            let spec = scoped_as(profile, "true", &[scene.path("src")])?;
+            let executor = landlock_executor(&scene.plans, abi)?;
+            match executor.prepare(&spec, &context(&scene.workspace)?, None, S::Enforced) {
+                Err(RuntimeError::SandboxRequirementNotMet { shortfalls, .. }) => {
+                    assert_eq!(shortfalls, expected, "{profile:?} {abi:?}");
+                }
+                Err(other) => return Err(TestError::Unexpected(format!("{other}"))),
+                Ok(_) => {
+                    return Err(TestError::Unexpected(format!(
+                        "planned {profile:?} with {abi:?}"
+                    )));
+                }
+            }
+            assert_eq!(
+                entries(&scene.plans)?,
+                0,
+                "no plan file: {profile:?} {abi:?}"
+            );
+        }
+        // Unscoped best-effort jobs still run there.
+        let executor = landlock_executor(&scene.plans, Some(4))?;
+        let unscoped = JobSpec::command("true")
+            .sandbox(NoNetwork)
+            .build()
+            .map_err(ctx("unscoped"))?;
+        landlock_plan(&executor, &unscoped, &scene)?;
+        assert!(executor.weak_backend_logged.load(Ordering::Relaxed));
+        // ABI 5 and an open network: planned.
+        let full = landlock_executor(&scene.plans, Some(5))?;
+        landlock_plan(&full, &scoped_build("true", &[scene.path("src")])?, &scene)?;
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_policy_is_none_without_a_scope() -> TestResult {
+        let spec = JobSpec::command("true").build().map_err(ctx("spec"))?;
+        assert!(
+            scoped_policy(&spec, Path::new("/nonexistent"))
+                .map_err(ctx("unscoped"))?
+                .is_none()
+        );
+        Ok(())
+    }
+}
+
 /// Plan and report tests of the `BwrapTrampoline` backend (PL-97 E1); no
 /// process is started.
 #[cfg(all(test, feature = "bwrap"))]
@@ -2763,9 +3295,11 @@ mod chain_tests {
     };
     use harw_types::WorkId;
 
+    use super::scope_tests::{context, entries, scene, scoped};
     use super::{
         AfterExit, ChainCgroup, LeftoverRegistry, LinuxExecutor, LinuxExecutorOptions,
-        LinuxSandboxBackend, OUTER_PLAN_FILE, RuntimeError, chain_plans, rlimit_set,
+        LinuxSandboxBackend, OUTER_PLAN_FILE, RuntimeError, chain_plans,
+        refuse_writable_attempt_dir, rlimit_set,
     };
     use crate::coordinator::executor::AttemptContext;
     use crate::host::BackendKind;
@@ -3241,6 +3775,184 @@ mod chain_tests {
             left, 0,
             "the attempt directory (with both plans) is removed"
         );
+        Ok(())
+    }
+
+    /// The inner policy a chain plan hands to the trampoline.
+    fn inner_policy(chain: &super::ChainPlans) -> TestResult<&harw_job_linux::SandboxPolicy> {
+        chain
+            .inner
+            .sandbox
+            .as_ref()
+            .ok_or(TestError::Missing("inner sandbox"))
+    }
+
+    #[test]
+    fn scoped_chain_maps_the_scope_into_the_namespace_view() -> TestResult {
+        let scene = scene()?;
+        let mount = TrampolineMount {
+            exec_path: PathBuf::from(TRAMPOLINE),
+            attempt_dir: scene.plans.join("a1"),
+        };
+        let src = scene.path("src");
+        let notes = scene.path("notes.txt");
+        let new_file = scene.path("src/new.rs");
+        let spec = scoped("true", &[src.clone(), new_file.clone(), notes.clone()])?;
+        let chain = chain_plans(&bwrap(), &mount, &spec, &scene.workspace, None, S::Enforced)
+            .map_err(ctx("chain plans"))?;
+        // bwrap binds the workspace as a whole (read-write); Landlock inside
+        // narrows it.
+        let workspace = scene.workspace.to_string_lossy().into_owned();
+        assert!(has_triple(
+            &chain.outer.args,
+            ["--bind", &workspace, &workspace]
+        ));
+        assert_eq!(
+            chain.inner.sandbox_requirement,
+            SandboxRequirement::Required
+        );
+        let policy = inner_policy(&chain)?;
+        // The inner trampoline re-checks every write rule after opening it
+        // (a scope path swapped for a symlink to the attempt directory is
+        // refused, not followed).
+        assert_eq!(
+            policy.landlock,
+            harw_job_linux::LandlockMode::HardRequirement
+        );
+        let filesystem = &policy.filesystem;
+        assert!(!filesystem.read_write.contains(&scene.workspace));
+        assert!(filesystem.read_only.contains(&scene.workspace));
+        // The scope survives the mapping (the workspace bind keeps its path).
+        assert!(filesystem.read_write.contains(&src));
+        assert!(filesystem.read_write.contains(&notes));
+        assert!(!filesystem.read_write.contains(&new_file));
+        assert!(
+            !chain
+                .unmapped
+                .iter()
+                .any(|path| path.starts_with(&scene.workspace))
+        );
+        let rules = harw_job_linux::sandbox::plan_landlock(policy);
+        let access = |path: &Path| {
+            rules
+                .rules
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, access)| *access)
+        };
+        let root = access(&scene.workspace).ok_or(TestError::Missing("workspace rule"))?;
+        assert!(root.read && !root.write);
+        assert!(access(&src).is_some_and(|rule| rule.write));
+        assert_eq!(policy.network, harw_job_linux::NetworkPolicy::Allow);
+        chain.inner.validate().map_err(ctx("inner plan"))?;
+        Ok(())
+    }
+
+    /// Security review finding 4 (E1b handoff): whatever the profile and
+    /// scope, the policy the inner trampoline applies never grants write on
+    /// the attempt directory, the trampoline directory or anything above it.
+    #[test]
+    fn the_inner_policy_never_grants_write_on_the_attempt_directory() -> TestResult {
+        let scene = scene()?;
+        let mount = TrampolineMount {
+            exec_path: PathBuf::from(TRAMPOLINE),
+            attempt_dir: scene.plans.join("a1"),
+        };
+        let unscoped = |profile: SandboxProfileName| {
+            JobSpec::command("true")
+                .sandbox(profile)
+                .build()
+                .map_err(ctx("spec"))
+        };
+        let specs = [
+            unscoped(SandboxProfileName::NoNetwork)?,
+            unscoped(SandboxProfileName::ReadOnlyAnalysis)?,
+            scoped("true", &[scene.path("src")])?,
+            scoped("true", &[])?,
+        ];
+        let attempt = Path::new(SANDBOX_ATTEMPT_DIR);
+        for spec in &specs {
+            let chain = chain_plans(&bwrap(), &mount, spec, &scene.workspace, None, S::Enforced)
+                .map_err(ctx("chain plans"))?;
+            let policy = inner_policy(&chain)?;
+            for path in &policy.filesystem.read_write {
+                assert!(
+                    !path.starts_with("/run/harw-job") && !attempt.starts_with(path),
+                    "{path:?} would make {SANDBOX_ATTEMPT_DIR} writable"
+                );
+            }
+            let rules = harw_job_linux::sandbox::plan_landlock(policy);
+            assert!(
+                !rules.rules.iter().any(|(path, access)| access.write
+                    && (path.starts_with(attempt) || attempt.starts_with(path))),
+                "{:?}",
+                rules.rules
+            );
+        }
+        // The guard itself.
+        for writable in ["/run/harw-job/attempt", "/run/harw-job", "/run", "/"] {
+            let policy = harw_job_linux::SandboxPolicy::from_profile(
+                SandboxProfileName::NoNetwork,
+                &scene.workspace,
+            )
+            .with_read_write(writable);
+            assert!(
+                matches!(
+                    refuse_writable_attempt_dir(&policy),
+                    Err(RuntimeError::Sandbox { .. })
+                ),
+                "{writable}"
+            );
+        }
+        let profile = harw_job_linux::SandboxPolicy::from_profile(
+            SandboxProfileName::NoNetwork,
+            &scene.workspace,
+        );
+        assert!(refuse_writable_attempt_dir(&profile).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_job_needs_the_full_landlock_abi_in_the_chain() -> TestResult {
+        let scene = scene()?;
+        let spec = scoped("true", &[scene.path("src")])?;
+        for abi in [Some(1), Some(4)] {
+            let executor = chain_executor(&scene.plans, abi)?;
+            match executor.prepare(&spec, &context(&scene.workspace)?, None, S::Enforced) {
+                Err(RuntimeError::SandboxRequirementNotMet { shortfalls, .. }) => {
+                    assert_eq!(shortfalls, ["filesystem"], "{abi:?}");
+                }
+                Err(other) => return Err(TestError::Unexpected(format!("{other}"))),
+                Ok(_) => return Err(TestError::Unexpected(format!("planned with {abi:?}"))),
+            }
+            assert_eq!(entries(&scene.plans)?, 0, "no attempt directory ({abi:?})");
+        }
+        let executor = chain_executor(&scene.plans, Some(5))?;
+        let prepared = executor
+            .prepare(&spec, &context(&scene.workspace)?, None, S::Enforced)
+            .map_err(ctx("prepare with ABI 5"))?;
+        prepared.discard_files();
+        assert_eq!(entries(&scene.plans)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_job_on_plain_bwrap_is_refused_before_planning() -> TestResult {
+        let scene = scene()?;
+        let executor = LinuxExecutor::new(LinuxExecutorOptions {
+            sandbox: LinuxSandboxBackend::Bwrap(bwrap()),
+            ..LinuxExecutorOptions::default()
+        })
+        .map_err(ctx("executor"))?;
+        let spec = scoped("true", &[scene.path("src")])?;
+        match executor.prepare(&spec, &context(&scene.workspace)?, None, S::Enforced) {
+            Err(RuntimeError::SandboxRequirementNotMet { report, shortfalls }) => {
+                assert_eq!(report.filesystem, S::Partial);
+                assert_eq!(shortfalls, ["filesystem"]);
+            }
+            Err(other) => return Err(TestError::Unexpected(format!("{other}"))),
+            Ok(_) => return Err(TestError::Unexpected("scoped job planned".to_owned())),
+        }
         Ok(())
     }
 

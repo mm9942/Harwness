@@ -43,6 +43,7 @@ mod service;
 mod session;
 mod settings;
 mod skill;
+mod tool;
 mod uia;
 pub mod values;
 
@@ -74,6 +75,7 @@ pub use service::*;
 pub use session::*;
 pub use settings::*;
 pub use skill::*;
+pub use tool::*;
 pub use uia::*;
 pub use values::*;
 
@@ -232,6 +234,17 @@ pub enum Command {
         /// Auszuführende Skill-Aktion.
         #[command(subcommand)]
         action: SkillAction,
+    },
+    /// Zeigt den Werkzeug-Index: Werkzeugfamilien, je Werkzeug Klasse,
+    /// Kurzbeschreibung, verknüpften Skill und Profile.
+    ///
+    /// Dieselben Daten wie das Modell-Werkzeug `tool.index`; liest nur
+    /// eingebaute Daten dieses Programms, keine Konfiguration. Exit-Codes:
+    /// 0 ok, 1 unbekannte Familie bzw. unbekanntes Werkzeug, 2 Aufruf.
+    Tool {
+        /// Auszuführende Index-Aktion.
+        #[command(subcommand)]
+        action: ToolAction,
     },
     /// Räumt ephemere Daten (Logs, Caches, Spools) nach den Aufbewahrungsregeln auf.
     ///

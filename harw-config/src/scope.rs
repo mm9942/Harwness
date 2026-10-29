@@ -380,7 +380,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "permissions.extra_roots", scope: Scope::Global, merge: MergeRule::Intersection, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "RuleToml.tool", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "RuleToml.pattern", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
-    // 1.12 [sandbox] (8)
+    // 1.12 [sandbox] (9)
     FieldScope { path: "sandbox.cargo", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.cargo.mode", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.cargo.cargo_bin", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
@@ -389,6 +389,9 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "sandbox.tmux", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.tmux.mode", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.tmux.socket_path", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    // PL-97 E2: Ausführungspfad (`chain` | `legacy`); Profil-Ebene, ein nicht
+    // vertrautes Projekt darf ihn nie setzen (`merge_sandbox`).
+    FieldScope { path: "sandbox.execution", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
     // 1.13 [internal_models] (13)
     FieldScope { path: "internal_models.use_openrouter_defaults", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.session_title", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -570,7 +573,8 @@ mod merge_rule_tests {
         // [session_listener]: +6, alle GlobalOnly.
         // h7/h9: +2 für `tui.status_expiry`, `tui.goal_mode`.
         // PL-97 B1: +4 für `skills.*`.
-        assert_eq!(FIELD_TABLE.len(), 199);
+        // PL-97 E2: +1 für `sandbox.execution`.
+        assert_eq!(FIELD_TABLE.len(), 200);
     }
 
     #[test]
@@ -593,7 +597,8 @@ mod merge_rule_tests {
         // [retention]: +20 ProfileReplaces, +30 MinBound.
         // h7/h9: +2 (`tui.status_expiry`, `tui.goal_mode`).
         // PL-97 B1: +4 (`skills.*`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 100);
+        // PL-97 E2: +1 (`sandbox.execution`).
+        assert_eq!(count(MergeRule::ProfileReplaces), 101);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

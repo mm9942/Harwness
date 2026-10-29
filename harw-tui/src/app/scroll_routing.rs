@@ -471,7 +471,9 @@ mod tests {
     }
 
     /// Unter 100 Spalten klappt das Agenten-Panel zu einer Zeile zusammen
-    /// (ab 16 Zeilen Höhe), darüber erscheint das volle Panel.
+    /// (ab 16 Zeilen Höhe), darüber erscheint das volle Panel. PL-97 C3:
+    /// 120×40 und 200×50 sind dreispaltiges Querformat — die fertigen
+    /// Agenten zählt dort das Finished/Failed-Fenster.
     #[test]
     fn agent_panel_collapses_below_the_width_threshold() -> TestResult {
         let mut app = test_chat_app()?;
@@ -484,7 +486,8 @@ mod tests {
             if width >= crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH {
                 assert!(panel && !summary, "{width}x{height}: {shown}");
                 assert!(
-                    rows.iter().any(|row| row.contains("✓ 6 fertig")),
+                    rows.iter()
+                        .any(|row| row.contains("FINISHED / FAILED · ✓ 6 · ✗ 0")),
                     "{width}x{height}: {shown}"
                 );
             } else if height >= crate::panes::AGENTS_SUMMARY_MIN_HEIGHT {
@@ -541,8 +544,23 @@ mod tests {
         assert_eq!(route_scroll_input(&mut app, &over_panel), Some(true));
         assert_eq!(app.agent_monitor.panel_scroll_offset(), WHEEL_LINES);
         assert!(app.scroll.is_following(), "der Verlauf bleibt unberührt");
-        let shown = screen(&app, 120, 40)?.join("\n");
+        // PL-97 C3: LIVE (Mittelspalte) darf `rolle-00` als Quelle nennen;
+        // das Agenten-Fenster selbst ist weitergescrollt.
+        let rows = screen(&app, 120, 40)?;
+        let panel_rows: Vec<String> = rows
+            .iter()
+            .skip(usize::from(panel.y))
+            .take(usize::from(panel.height))
+            .map(|row| {
+                row.chars()
+                    .skip(usize::from(panel.x))
+                    .take(usize::from(panel.width))
+                    .collect()
+            })
+            .collect();
+        let shown = panel_rows.join("\n");
         assert!(!shown.contains("rolle-00"), "{shown}");
+        assert!(shown.contains("rolle-03"), "{shown}");
 
         let over_chat = wheel(MouseEventKind::ScrollUp, 2, 5);
         assert_eq!(route_scroll_input(&mut app, &over_chat), Some(true));

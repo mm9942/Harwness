@@ -653,6 +653,118 @@ mod tests {
         Ok(())
     }
 
+    /// Draws `view` as the landscape window filling a `width` × `height`
+    /// terminal.
+    fn window_screen(
+        view: &LiveView,
+        scroll: &ChatScroll,
+        width: u16,
+        height: u16,
+    ) -> TestResult<Vec<String>> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .map_err(ctx("test terminal"))?;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_window(view, area, frame.buffer_mut(), Theme::Dark, scroll, true);
+            })
+            .map_err(ctx("draw"))?;
+        let buffer = terminal.backend().buffer();
+        Ok((0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect())
+    }
+
+    /// PL-97 C3: the landscape LIVE window is bordered and titled, wraps the
+    /// whole reasoning preview instead of its one-row tail, follows the
+    /// newest (lowest) line and scrolls back ChatScroll-style with its keys.
+    #[test]
+    fn landscape_window_wraps_the_reasoning_and_scrolls_like_the_chat() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        thinking(
+            &mut monitor,
+            "w1",
+            "uia-worker",
+            "eins zwei drei vier fünf sechs sieben acht neun zehn elf zwölf",
+        );
+        let live = monitor.agent("w1").ok_or(TestError::Missing("agent"))?;
+        let view = view(
+            Some((live, false)),
+            None,
+            &RecencySlots::new(),
+            14 + LIVE_INDENT,
+            Theme::Dark,
+            Instant::now(),
+        );
+        let mut ui = MissionUi::new(Instant::now());
+        let rows = window_screen(&view, &ui.live_scroll, 16, 5)?;
+        assert!(
+            screen_row(&rows, 0)?.starts_with("┌ LIVE · uia-w"),
+            "{rows:?}"
+        );
+        assert!(screen_row(&rows, 4)?.starts_with('└'), "{rows:?}");
+        let shown = rows.join("\n");
+        assert!(
+            shown.contains("zwölf") && !shown.contains("eins"),
+            "following shows the newest lines: {rows:?}"
+        );
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(handle_key(&mut ui, key(KeyCode::Home)));
+        let shown = window_screen(&view, &ui.live_scroll, 16, 5)?.join("\n");
+        assert!(
+            shown.contains("∴ eins") && !shown.contains("zwölf"),
+            "Home shows the oldest line: {shown}"
+        );
+        assert!(!ui.live_scroll.is_following());
+        assert!(handle_key(&mut ui, key(KeyCode::Char('j'))));
+        assert!(handle_key(&mut ui, key(KeyCode::End)));
+        assert!(ui.live_scroll.is_following(), "End follows again");
+        assert!(handle_key(&mut ui, key(KeyCode::Up)));
+        assert_eq!(ui.live_scroll.offset(), 1);
+        assert!(handle_key(&mut ui, key(KeyCode::PageDown)));
+        assert_eq!(ui.live_scroll.offset(), 0);
+
+        assert!(
+            !handle_key(&mut ui, key(KeyCode::Char('r'))),
+            "r only acts on the in-place detail"
+        );
+        ui.open_live_detail("w1");
+        assert!(handle_key(&mut ui, key(KeyCode::Char('r'))));
+        assert!(!ui.live_detail_reasoning);
+        assert!(
+            !handle_key(&mut ui, KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL)),
+            "Ctrl+↑ belongs to scroll_panel_up"
+        );
+        assert!(!handle_key(&mut ui, key(KeyCode::Char('x'))));
+        Ok(())
+    }
+
+    /// PL-97 C3: an empty landscape window says so inside its frame.
+    #[test]
+    fn empty_landscape_window_says_so_honestly() -> TestResult {
+        let view = view(
+            None,
+            None,
+            &RecencySlots::new(),
+            30,
+            Theme::Dark,
+            Instant::now(),
+        );
+        let rows = window_screen(&view, &ChatScroll::new(), 30, 4)?;
+        assert!(screen_row(&rows, 0)?.starts_with("┌ LIVE ─"), "{rows:?}");
+        assert!(
+            screen_row(&rows, 1)?.starts_with(&format!("│{NO_VISIBLE_EVENTS}")),
+            "{rows:?}"
+        );
+        Ok(())
+    }
+
     /// The body lines of one LIVE view (below the header), trimmed.
     fn body(
         monitor: &AgentMonitor,

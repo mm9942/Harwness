@@ -80,6 +80,7 @@ mod tailscale_cmd;
 mod telegram_launcher;
 #[cfg(test)]
 mod test_support;
+mod tool_cmd;
 mod uia_bootstrap;
 mod update_cmd;
 mod verify_sandbox;
@@ -709,6 +710,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Jobs { .. } => "jobs",
             Command::Cycle { .. } => "cycle",
             Command::Skill { .. } => "skill",
+            Command::Tool { .. } => "tool",
             Command::Cleanup { .. } => "cleanup",
             Command::PrReview(_) => "pr-review",
             Command::Gateway { .. } => "gateway",
@@ -794,7 +796,7 @@ fn reject_misplaced_session_flags(
 ///
 /// # Description
 /// JSON liefern `harw session list|show`, `harw jobs …`, `harw cycle …`,
-/// `harw skill …`, `harw dod …`, `harw knowledge memory|proposals` und
+/// `harw skill …`, `harw dod …`, `harw tool …`, `harw knowledge memory|proposals` und
 /// `harw agent skills|plugins`; diese
 /// Befehle (und `provider`) prüfen ihre Unterfälle selbst. Jeder andere
 /// Befehl bricht mit `--json` ab, statt stillschweigend Text auszugeben.
@@ -822,7 +824,9 @@ fn reject_unsupported_json(command: Option<&Command>, global: &GlobalArgs) -> Re
             | Command::Node { .. }
             | Command::Provider { .. }
             // PL-97 D3: jede `harw dod`-Aktion liefert eine JSON-Form.
-            | Command::Dod { .. },
+            | Command::Dod { .. }
+            // PL-97 B2: `harw tool list|describe` ebenso.
+            | Command::Tool { .. },
         ) => Ok(()),
         other => printer.require_text(&command_label(other)),
     }
@@ -1055,6 +1059,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             lifecycle::install(print_systemd)
         }
         Some(Command::Dod { action }) => dod_cmd::run(&global, action),
+        Some(Command::Tool { action }) => tool_cmd::run(&global, action),
         Some(Command::Service { action }) => lifecycle::service(home_override, action),
         Some(Command::Catalog { refresh }) => {
             legacy_hint("catalog", "model catalog");
@@ -1197,6 +1202,8 @@ fn run_startup_migrations(
             // PL-97 D3: `harw dod` liest die Config nur (auch als root via
             // sudo) und darf dabei nichts migrieren oder anlegen.
             | Command::Dod { .. }
+            // PL-97 B2: `harw tool` liest nur eingebaute Daten.
+            | Command::Tool { .. }
             | Command::Service { .. }
             | Command::Catalog { .. }
             | Command::Auth { .. }

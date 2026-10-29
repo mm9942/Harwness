@@ -1403,15 +1403,14 @@ impl AgentMonitor {
     }
 
     /// Markiert den Fehlschlag eines Agenten als gesehen (Detailansicht).
-    /// Liefert `true`, wenn er neu als gesehen markiert wurde.
+    /// Liefert `true`, wenn damit ein ungesehener Fehlschlag quittiert wurde.
     pub(crate) fn mark_seen(&mut self, id: &str) -> bool {
-        match self.agents.get_mut(id) {
-            Some(live) if live.is_unseen_failure() => {
-                live.failure_seen = true;
-                true
-            }
-            _ => false,
-        }
+        let Some(live) = self.agents.get_mut(id) else {
+            return false;
+        };
+        let newly = live.is_unseen_failure();
+        live.failure_seen = true;
+        newly
     }
 
     /// `c`: alle Fehlschläge quittieren (sie wandern in die Sammelzeile);
@@ -2482,6 +2481,10 @@ fn dock_follow_column(entries: &[PanelEntry<'_>], selected: usize) -> Option<(bo
 /// Jobs-Spalte liegt —, denn [`render_agents_only_panel`]/
 /// [`render_jobs_only_panel`] werten `follow_selection` selbst nicht mehr
 /// aus (siehe [`render_dock_rows`]).
+///
+/// PL-97 C4: das Dock sind die Karten der Mission-Fenster („Active
+/// Agents“); es zeigt nur laufende Agenten ([`PanelScope::ActiveOnly`]) —
+/// Fehlschläge, Fertige und ihre Zähler stehen in Finished/Failed.
 pub(crate) fn render_dock(
     monitor: &AgentMonitor,
     areas: crate::panes::DockAreas,
@@ -4171,7 +4174,11 @@ mod tests {
                 retryable: false,
             },
         )?);
-        assert_eq!(monitor.panel_entries().len(), 3, "alle: w7, f1, Sammelzeile");
+        assert_eq!(
+            monitor.panel_entries().len(),
+            3,
+            "alle: w7, f1, Sammelzeile"
+        );
         for split in [true, false] {
             let shown = dock_screen(&monitor, split).join("\n");
             assert!(shown.contains("Agenten · 1 aktiv"), "{shown}");

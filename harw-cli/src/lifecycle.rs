@@ -1679,6 +1679,9 @@ mod tests {
             "dod.status",
             "dod.findings",
             "dod.sensors",
+            // PL-97 B2: der lesende Werkzeug-Index (`harw-ops/src/tool_index_op.rs`),
+            // ebenfalls über `harw_ops::register_all`.
+            "tool.index",
             // `work.result` (harw-ops/src/work_result.rs): liest das Ergebnis
             // eines eigenen, abgeschlossenen Jobs der gebundenen Workspace.
             "work.result",

@@ -14,7 +14,7 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 51 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 52 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `work.result`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
 //! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
@@ -22,12 +22,15 @@
 //! `approve`, `deny`, `review`, `cancel`, `retry`, `provider-concurrency`,
 //! `uia-worker-model`, `uia-effort`, `sandbox-lease`, `models`, `workbench`,
 //! `kanban`, `diary`, `palace`, `dream`, `learn`, `matrix`, `jobs`, `dod`,
-//! `dod.status`, `dod.findings`, `dod.sensors`.
+//! `dod.status`, `dod.findings`, `dod.sensors`, `tool.index`.
 //! `dod` (PL-97 D3, siehe `crate::dod`-Moduldoku) ist die Operator-Fläche
 //! `/dod` über die Harw-DoD-Suite; `dod.status`/`dod.findings`/`dod.sensors`
 //! sind ihre lesenden Modell-Werkzeuge ohne Freigabe. Keine davon schreibt
 //! DoD-Zustand oder erreicht Warden bzw. Eskalation (Invariante S1); die
 //! Dienststeuerung gibt es nur als root-CLI `harw dod`.
+//! `tool.index` (PL-97 B2, siehe `crate::tool_index_op`) ist das lesende
+//! Modell-Werkzeug über den Werkzeug-Index (Familien, Klassen, verknüpfte
+//! Skills, erste Sätze der echten Beschreibungen) ohne Freigabe.
 //! `uia-worker-model` (Welle 2, harw-ops/src/model.rs) und `uia-effort`
 //! (harw-ops/src/effort.rs) waren implementiert, aber bis zu diesem Knoten
 //! nicht in `register_all` eingetragen — dadurch existierten `/uia-worker-model`
@@ -266,6 +269,7 @@ pub mod stop;
 pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod tool_index_op;
 pub mod usage;
 // PL-90: `intent_cycle.*` (start/status/list/stop) und `/cycle` — dauerhafte,
 // nur lesende Intent-Zyklen; registriert über `register_intent_cycle_tools`.
@@ -376,9 +380,10 @@ macro_rules! register_ops {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 51);
+/// assert_eq!(registry.len(), 52);
 /// assert!(registry.find_by_command("/dod").is_some());
 /// assert!(registry.find_by_name("dod.findings").is_some());
+/// assert!(registry.find_by_name("tool.index").is_some());
 /// assert!(registry.find_by_name("help").is_some());
 /// assert!(registry.find_by_name("work.result").is_some());
 /// assert!(registry.find_by_command("/uia-provider").is_some());
@@ -529,6 +534,9 @@ register_ops! {
         Arc::new(dod::DodStatusOperation),
         Arc::new(dod::DodFindingsOperation),
         Arc::new(dod::DodSensorsOperation),
+        // PL-97 B2: der lesende Werkzeug-Index für das Modell (ohne Freigabe,
+        // ohne Sandbox-Recht; statische Daten dieses Binaries).
+        Arc::new(tool_index_op::ToolIndexOperation),
     ];
 }
 
@@ -1046,7 +1054,7 @@ mod tests {
     fn register_all_adds_forty_six_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 51);
+        assert_eq!(reg.len(), 52);
     }
 
     #[test]
@@ -1358,6 +1366,8 @@ mod tests {
             "dod.status",
             "dod.findings",
             "dod.sensors",
+            // PL-97 B2: der lesende Werkzeug-Index.
+            "tool.index",
             "plan",
             "goal",
             "explore",
@@ -1416,8 +1426,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            51,
-            "first register_all must produce exactly 51 ops"
+            52,
+            "first register_all must produce exactly 52 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -1431,8 +1441,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            51,
-            "registry must stay at 51 after a rejected duplicate"
+            52,
+            "registry must stay at 52 after a rejected duplicate"
         );
     }
 }

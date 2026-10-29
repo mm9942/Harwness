@@ -487,6 +487,38 @@ pub struct SandboxSection {
     pub cargo: Option<CargoSandboxToml>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux: Option<TmuxSandboxToml>,
+    /// `execution` — how `shell.exec`, `job.start` and child agents start
+    /// their processes (PL-97 E2). `None` means
+    /// [`SandboxExecutionToml::Chain`]; read through
+    /// [`SandboxSection::effective_execution`]. Profile-scoped
+    /// (`ProfileReplaces`): an untrusted project layer cannot set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<SandboxExecutionToml>,
+}
+
+impl SandboxSection {
+    /// The configured execution path, [`SandboxExecutionToml::Chain`] when
+    /// unset.
+    #[must_use]
+    pub fn effective_execution(&self) -> SandboxExecutionToml {
+        self.execution.unwrap_or_default()
+    }
+}
+
+/// `[sandbox] execution` — the execution path of model-driven processes
+/// (PL-97 E2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxExecutionToml {
+    /// Through the job runtime's sandbox chain (cgroup, Bubblewrap,
+    /// Landlock trampoline as `select_backend` finds them). A job with a
+    /// write scope or a `required` sandbox is refused where the chain
+    /// cannot enforce it.
+    #[default]
+    Chain,
+    /// The previous path: a pre-built `prlimit … -- bwrap …` argv run as a
+    /// host job (no cgroup, no Landlock, no per-attempt report).
+    Legacy,
 }
 
 /// Vertrauenswürdige Host-Wurzeln einer Cargo-Toolchain.
@@ -1225,6 +1257,41 @@ mod tests {
         assert_eq!(tmux.mode, TmuxOperationModeToml::Inspect);
         assert_eq!(tmux.socket_path, "/tmp/tmux-1000/default");
         Ok(())
+    }
+
+    #[test]
+    fn test_sandbox_execution_defaults_to_chain_and_parses() -> TestResult {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                default_provider = "anthropic"
+            "#,
+        )
+        .map_err(ctx("parse config"))?;
+        assert_eq!(cfg.sandbox.execution, None);
+        assert_eq!(
+            cfg.sandbox.effective_execution(),
+            SandboxExecutionToml::Chain
+        );
+        for (text, expected) in [
+            ("chain", SandboxExecutionToml::Chain),
+            ("legacy", SandboxExecutionToml::Legacy),
+        ] {
+            let cfg: HarnessConfig =
+                toml::from_str(&format!("[sandbox]\nexecution = \"{text}\"\n"))
+                    .map_err(ctx("parse execution"))?;
+            assert_eq!(cfg.sandbox.execution, Some(expected));
+            assert_eq!(cfg.sandbox.effective_execution(), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sandbox_execution_rejects_unknown_value() {
+        let src = r#"
+            [sandbox]
+            execution = "host"
+        "#;
+        assert!(toml::from_str::<HarnessConfig>(src).is_err());
     }
 
     #[test]

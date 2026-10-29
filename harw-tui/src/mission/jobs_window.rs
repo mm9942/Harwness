@@ -1,4 +1,4 @@
-//! Active Jobs window (PL-97 C2).
+//! Active Jobs window (PL-97 C2/C4).
 //!
 //! Its own bordered window next to Active Agents (portrait stack from
 //! `PHONE_DOCK_SPLIT_MIN_COLS` columns) with its own selection and scroll
@@ -7,6 +7,20 @@
 //! ([`crate::jobs_panel::job_line`]): never wrapped, clipped with `…`. The
 //! selection is anchored by job id ([`row_keys`]), so it stays on the same
 //! job when a running job finishes and the rows reorder.
+//!
+//! # Scope: managed jobs only
+//! The window lists the session's **managed** jobs (`JobManager`, the
+//! `/jobs` operation) and nothing else. Durable `harw-job-store` work items
+//! are out of this window (PL-97 §8.3): they have their own lease/claim
+//! path (`/jobs work`, `JobMutationScope`), which a key here must never
+//! bypass. A job-backed child agent appears as its agent run, not a second
+//! time as a job ([`crate::jobs_panel::JobRow::is_listed`]).
+//!
+//! # Keys (focused)
+//! `↑`/`↓`, `k`/`j` select (`k` stays "up", as in every list), PgUp/PgDn,
+//! Home/End, `Enter` opens the job detail, `x` asks to stop the selected
+//! running job ([`super::stop_job`]: confirmation, then the literal line
+//! `/jobs stop <id>` through the regular command path).
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -110,8 +124,15 @@ pub(crate) fn row_keys(jobs: &[JobRow]) -> Vec<&str> {
 /// Id of the selected job, if any.
 #[must_use]
 pub(crate) fn selected_job(jobs: &[JobRow], ui: &WindowUi) -> Option<String> {
-    let keys = row_keys(jobs);
-    keys.get(ui.selected(&keys)).map(|id| (*id).to_owned())
+    selected_row(jobs, ui).map(|row| row.id.clone())
+}
+
+/// The selected job row, if any.
+#[must_use]
+pub(crate) fn selected_row<'a>(jobs: &'a [JobRow], ui: &WindowUi) -> Option<&'a JobRow> {
+    let rows = job_window_rows(jobs);
+    let keys: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+    rows.get(ui.selected(&keys)).copied()
 }
 
 #[cfg(test)]
@@ -191,7 +212,7 @@ mod tests {
         assert_eq!(selected_job(&jobs, &ui).as_deref(), Some("j2"));
         let first = jobs.first_mut().ok_or(TestError::Missing("j1"))?;
         first.active = false;
-        first.state = "fertig";
+        first.state = harw_tool_job::JobState::Succeeded;
         assert_eq!(row_keys(&jobs), vec!["j2", "j3", "j1"]);
         assert_eq!(selected_job(&jobs, &ui).as_deref(), Some("j2"));
         let rows = screen(&jobs, &ui, true)?;

@@ -524,16 +524,35 @@ fn test_field_table_exhaustive_rule_toml() {
 }
 
 // ---------------------------------------------------------------------
-// [sandbox] (Abschnitt 1.12, 2 Container-Felder + Cargo 4 + Tmux 2)
+// [sandbox] (Abschnitt 1.12, 2 Container-Felder + Cargo 4 + Tmux 2 +
+// `execution`, PL-97 E2)
 // ---------------------------------------------------------------------
 
 #[test]
 fn test_field_table_exhaustive_sandbox_section() {
-    let SandboxSection { cargo, tmux } = SandboxSection::default();
-    let _ = (cargo, tmux);
-    for path in ["sandbox.cargo", "sandbox.tmux"] {
+    let SandboxSection {
+        cargo,
+        tmux,
+        execution,
+    } = SandboxSection::default();
+    let _ = (cargo, tmux, execution);
+    for path in ["sandbox.cargo", "sandbox.tmux", "sandbox.execution"] {
         assert_path_in_field_table_exactly_once(path);
     }
+}
+
+// PL-97 E2: `sandbox.execution` ist Profil-Ebene und sicherheitsrelevant; ein
+// nicht vertrautes Projekt darf ihn nicht setzen (`ProfileReplaces`).
+#[test]
+fn test_sandbox_execution_is_profile_scoped_and_security_critical() -> TestResult {
+    let entry = FIELD_TABLE
+        .iter()
+        .find(|f| f.path == "sandbox.execution")
+        .ok_or(common::TestError::Missing("sandbox.execution"))?;
+    assert_eq!(entry.scope, harw_config::Scope::Profile);
+    assert_eq!(entry.merge, harw_config::MergeRule::ProfileReplaces);
+    assert!(entry.security_critical);
+    Ok(())
 }
 
 #[test]

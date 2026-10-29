@@ -792,7 +792,10 @@ mod tests {
         )?;
         let row = JobRow::from_status(&stopped);
         assert_eq!(row.state, JobState::Stopped);
-        assert_eq!(row.state_label(), harw_ops::jobs::state_label(JobState::Stopped));
+        assert_eq!(
+            row.state_label(),
+            harw_ops::jobs::state_label(JobState::Stopped)
+        );
         assert!(!row.active && !row.failed);
         assert_eq!(
             row.ended_at.map(|at| at.as_second()),
@@ -830,7 +833,12 @@ mod tests {
     /// sehr schmalen Panels.
     #[test]
     fn job_lines_never_exceed_the_panel_width() {
-        let long = row(&"ladybird build ".repeat(10), JobState::Running, true, false);
+        let long = row(
+            &"ladybird build ".repeat(10),
+            JobState::Running,
+            true,
+            false,
+        );
         let finished = [
             row("restore", JobState::Succeeded, false, false),
             row("tests", JobState::Failed, false, true),

@@ -235,6 +235,8 @@ pub mod providers {
     // PL-97 D3: the read-only Harw-DoD tools are `harw-ops` operations; the
     // agent core serves them (no provider crate, no runner feature of its own).
     provider!(DOD, "dod", "harw-ops", "core");
+    // PL-97 B2: `tool.index` is a `harw-ops` operation as well.
+    provider!(TOOL, "tool", "harw-ops", "core");
     provider!(SKILLS, "skills", "harw-registry-defaults", "core");
     provider!(AGENTS, "agents", "harw-core", "core");
 }
@@ -536,6 +538,9 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("dod.status", DOD, Meta),
     row!("dod.findings", DOD, Meta),
     row!("dod.sensors", DOD, Meta),
+    // Tool index (PL-97 B2): static data of this binary (catalog, profiles,
+    // tool specs, bundled skill manifests); read-only, auto-approved.
+    row!("tool.index", TOOL, Meta),
     // skill catalog (always there)
     row!("skills.search", SKILLS, Meta, always),
     row!("skills.load", SKILLS, Meta, always),
@@ -627,6 +632,7 @@ mod tests {
             SUDO_TOOLS,
             MATRIX_GAME_MASTER_TOOLS,
             crate::profile::DOD_READ_TOOLS,
+            crate::profile::TOOL_INDEX_TOOLS,
             KNOWLEDGE_READ_TOOLS,
             KANBAN_READ_TOOLS,
             JOB_TOOLS,

@@ -62,6 +62,18 @@
 //! is text and nothing else. Every delivery is reported as a
 //! [`DeliveredSkill`] for the session store's `injection` event.
 //!
+//! # Tool availability (PL-97 B2)
+//! With [`SkillInjector::with_tool_availability`], a triggered skill whose
+//! manifest declares tools (`skill.toml` `tools = [...]`) of which this
+//! session registers none is skipped ([`RoundInjection::unavailable`]): a
+//! session without `sys.*` that runs `ps aux` through `shell.exec` gets no
+//! `sys-tools` excerpt telling it to use tools it does not have. Only
+//! declared names the [`ToolAvailability`] knows as tool names count;
+//! abstract capability names (`filesystem.read`) never filter a skill. A
+//! skipped skill stays marked until the next compaction and costs no session
+//! bytes. Without the filter (the default) every triggered skill is
+//! eligible.
+//!
 //! # Preview
 //! [`SkillInjector::preview`] runs the selection of a fresh session's first
 //! round over explicit [`SkillPreviewInput`]s instead of a history (PL-97 B3:
@@ -292,10 +304,73 @@ pub struct RoundInjection {
     pub dropped: Vec<Dropped>,
     /// Imported skills withheld because `inject_imported` is off.
     pub suppressed: Vec<String>,
+    /// Skills skipped because this session registers none of the tools
+    /// their manifest declares (see [`ToolAvailability`]).
+    pub unavailable: Vec<String>,
     /// Labels the admit predicate rejected (new or active excerpts).
     pub withheld: Vec<String>,
     /// Labels of older excerpts that made room for newer ones.
     pub evicted: Vec<String>,
+}
+
+/// The tool names of one session for the availability filter of the
+/// injector (PL-97 B2, see the module documentation).
+///
+/// # Description
+/// `registered` are the tool names the session registers; `known` every tool
+/// name a session of this binary can register (typically the capability
+/// catalog; the registered names are added). A skill is admitted when its
+/// manifest declares no known tool name, or at least one of them is
+/// registered. Declared names outside `known` (abstract capabilities such as
+/// `filesystem.read`) say nothing about availability. Descriptive only: an
+/// admitted skill gains no tool and no right.
+///
+/// # Examples
+/// ```rust
+/// use harw_core::skill_injection::ToolAvailability;
+///
+/// let tools = ToolAvailability::new(["shell.exec", "fs.read"], ["sys.ps", "sys.free"]);
+/// assert!(!tools.admits(&["sys.ps".to_owned(), "sys.free".to_owned()]));
+/// assert!(tools.admits(&["sys.ps".to_owned(), "fs.read".to_owned()]));
+/// assert!(tools.admits(&["filesystem.read".to_owned()]));
+/// assert!(tools.admits(&[]));
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolAvailability {
+    registered: BTreeSet<String>,
+    known: BTreeSet<String>,
+}
+
+impl ToolAvailability {
+    /// The availability of a session registering `registered`, out of the
+    /// tool names `known` to this binary.
+    #[must_use]
+    pub fn new<R, S, K, T>(registered: R, known: K) -> Self
+    where
+        R: IntoIterator<Item = S>,
+        S: Into<String>,
+        K: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let registered: BTreeSet<String> = registered.into_iter().map(Into::into).collect();
+        let mut known: BTreeSet<String> = known.into_iter().map(Into::into).collect();
+        known.extend(registered.iter().cloned());
+        Self { registered, known }
+    }
+
+    /// Whether a skill declaring `tools` fits the session: it declares no
+    /// known tool name, or the session registers at least one it declares.
+    #[must_use]
+    pub fn admits(&self, tools: &[String]) -> bool {
+        let mut declared = tools
+            .iter()
+            .filter(|tool| self.known.contains(tool.as_str()))
+            .peekable();
+        if declared.peek().is_none() {
+            return true;
+        }
+        declared.any(|tool| self.registered.contains(tool.as_str()))
+    }
 }
 
 /// Per-session triggered skill injector (see the module documentation).
@@ -304,6 +379,8 @@ pub struct SkillInjector {
     index: Arc<SkillIndex>,
     settings: SkillInjectionSettings,
     imported: BTreeSet<String>,
+    /// The availability filter; `None` admits every triggered skill.
+    tools: Option<ToolAvailability>,
     state: Mutex<InjectorState>,
 }
 
@@ -418,7 +495,28 @@ impl SkillInjector {
             index,
             settings,
             imported: BTreeSet::new(),
+            tools: None,
             state: Mutex::new(InjectorState::default()),
+        }
+    }
+
+    /// Enables the tool-availability filter (PL-97 B2): a triggered skill
+    /// whose manifest declares only tools `tools` does not register is
+    /// skipped ([`RoundInjection::unavailable`]).
+    #[must_use]
+    pub fn with_tool_availability(mut self, tools: ToolAvailability) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Whether `skill` fits the session's tools ([`ToolAvailability::admits`]
+    /// over its declared tools); always `true` without the filter or for a
+    /// name the index does not know.
+    #[must_use]
+    pub fn tools_admit(&self, skill: &str) -> bool {
+        match (&self.tools, self.index.get(skill)) {
+            (Some(tools), Some(entry)) => tools.admits(&entry.tools),
+            _ => true,
         }
     }
 
@@ -600,6 +698,15 @@ impl SkillInjector {
                 // but costs no session bytes.
                 state.release(injection.bytes);
                 round.suppressed.push(injection.skill);
+                continue;
+            }
+            if !self.tools_admit(&injection.skill) {
+                // The session has none of the tools the skill explains: stays
+                // marked (no re-selection until the next compaction), but
+                // costs no session bytes and reaches no request.
+                tracing::debug!(skill = %injection.skill, "skill_injection.tools_unavailable");
+                state.release(injection.bytes);
+                round.unavailable.push(injection.skill);
                 continue;
             }
             let trust = provenance.trust();
@@ -1305,5 +1412,145 @@ mod preview_tests {
             ..SkillPreviewInput::default()
         };
         assert!(!task.is_empty());
+    }
+}
+
+/// The tool-availability filter (PL-97 B2): a triggered skill whose declared
+/// tools the session does not register is not injected.
+#[cfg(test)]
+mod availability_tests {
+    use std::sync::Arc;
+
+    use harw_catalog::SkillIndex;
+    use harw_protocol::ToolCallResult;
+    use harw_types::ToolCallId;
+
+    use super::{SkillInjectionSettings, SkillInjector, ToolAvailability};
+    use crate::history::ConversationHistory;
+    use crate::test_support::{TestError, TestResult};
+
+    /// The bundled skills (`sys-tools` with its `triggers.toml` included).
+    fn bundled() -> Arc<SkillIndex> {
+        Arc::new(SkillIndex::build(&[]))
+    }
+
+    /// A session that runs `ps aux` through `shell.exec`.
+    fn ps_aux_history() -> ConversationHistory {
+        let mut history = ConversationHistory::new();
+        history.push_user_text("which processes are running?");
+        history.push_tool_call(
+            ToolCallId::from_str("c1"),
+            "shell.exec",
+            serde_json::json!({ "command": "ps aux" }),
+        );
+        history.push_tool_result(
+            ToolCallId::from_str("c1"),
+            ToolCallResult::success(serde_json::json!("PID TTY TIME CMD")),
+            1,
+        );
+        history
+    }
+
+    /// Every tool name the bundled `sys-tools` manifest declares.
+    fn sys_tools(index: &SkillIndex) -> TestResult<Vec<String>> {
+        let entry = index
+            .get("sys-tools")
+            .ok_or(TestError::Missing("sys-tools bundled"))?;
+        Ok(entry.tools.clone())
+    }
+
+    fn delivered_skills(injector: &SkillInjector) -> Vec<String> {
+        injector
+            .prepare_round(&ps_aux_history(), 0)
+            .delivered
+            .into_iter()
+            .map(|delivered| delivered.skill)
+            .collect()
+    }
+
+    #[test]
+    fn a_session_without_sys_tools_running_ps_aux_gets_no_sys_tools_injection() -> TestResult {
+        let index = bundled();
+        let sys = sys_tools(&index)?;
+        // Without the filter (as before) `ps aux` pulls in `sys-tools`.
+        let unfiltered = SkillInjector::new(Arc::clone(&index), SkillInjectionSettings::default());
+        assert!(
+            delivered_skills(&unfiltered).contains(&"sys-tools".to_owned()),
+            "control: the command trigger fires without the filter"
+        );
+
+        // A session with `shell.exec` but without a single `sys.*` tool.
+        let without_sys = SkillInjector::new(Arc::clone(&index), SkillInjectionSettings::default())
+            .with_tool_availability(ToolAvailability::new(
+                ["shell.exec", "fs.read"],
+                sys.iter().cloned(),
+            ));
+        let mut history = ps_aux_history();
+        let round = without_sys.prepare_round(&history, 0);
+        assert!(
+            !round
+                .delivered
+                .iter()
+                .any(|delivered| delivered.skill == "sys-tools"),
+            "{:?}",
+            round.delivered
+        );
+        assert_eq!(round.unavailable, vec!["sys-tools".to_owned()]);
+        assert!(
+            !round
+                .fragments
+                .iter()
+                .any(|fragment| fragment.label.as_str().starts_with("skill:sys-tools")),
+            "no fragment reaches the request"
+        );
+        assert_eq!(without_sys.session_bytes(), 0, "costs no session bytes");
+        // Stays marked until the next compaction: a second `ps` call does not
+        // select it again.
+        history.push_tool_call(
+            ToolCallId::from_str("c2"),
+            "shell.exec",
+            serde_json::json!({ "command": "ps -ef" }),
+        );
+        history.push_tool_result(
+            ToolCallId::from_str("c2"),
+            ToolCallResult::success(serde_json::json!("PID")),
+            1,
+        );
+        let again = without_sys.prepare_round(&history, 0);
+        assert!(again.unavailable.is_empty(), "{:?}", again.unavailable);
+        assert!(
+            !again
+                .delivered
+                .iter()
+                .any(|delivered| delivered.skill == "sys-tools")
+        );
+
+        // With one registered `sys.*` tool the skill is delivered again.
+        let with_sys =
+            SkillInjector::new(index, SkillInjectionSettings::default()).with_tool_availability(
+                ToolAvailability::new(["shell.exec", "sys.ps"], sys.iter().cloned()),
+            );
+        assert!(delivered_skills(&with_sys).contains(&"sys-tools".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn availability_ignores_declared_names_that_are_no_tool_names() {
+        let tools = ToolAvailability::new(["shell.exec"], ["sys.ps"]);
+        // Abstract capability names of the bundled manifests never filter.
+        assert!(tools.admits(&["filesystem.read".to_owned()]));
+        assert!(tools.admits(&[]));
+        assert!(!tools.admits(&["sys.ps".to_owned(), "filesystem.read".to_owned()]));
+        // Registered names always count as known.
+        assert!(tools.admits(&["shell.exec".to_owned()]));
+        // Without the filter, and for unknown skills: admitted.
+        let plain = SkillInjector::new(
+            Arc::new(SkillIndex::build(&[])),
+            SkillInjectionSettings::default(),
+        );
+        assert!(plain.tools_admit("sys-tools"));
+        let filtered = plain.with_tool_availability(tools);
+        assert!(!filtered.tools_admit("sys-tools"));
+        assert!(filtered.tools_admit("no-such-skill"));
     }
 }

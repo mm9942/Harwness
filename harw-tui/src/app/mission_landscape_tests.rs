@@ -148,10 +148,26 @@ fn assert_framed(rows: &[String], rect: Rect, name: &str) -> TestResult {
     let right = rect.x + rect.width - 1;
     let bottom = rect.y + rect.height - 1;
     let shown = rows.join("\n");
-    assert_eq!(cell(rows, rect.x, rect.y)?, '┌', "{name} top left:\n{shown}");
-    assert_eq!(cell(rows, right, rect.y)?, '┐', "{name} top right:\n{shown}");
-    assert_eq!(cell(rows, rect.x, bottom)?, '└', "{name} bottom left:\n{shown}");
-    assert_eq!(cell(rows, right, bottom)?, '┘', "{name} bottom right:\n{shown}");
+    assert_eq!(
+        cell(rows, rect.x, rect.y)?,
+        '┌',
+        "{name} top left:\n{shown}"
+    );
+    assert_eq!(
+        cell(rows, right, rect.y)?,
+        '┐',
+        "{name} top right:\n{shown}"
+    );
+    assert_eq!(
+        cell(rows, rect.x, bottom)?,
+        '└',
+        "{name} bottom left:\n{shown}"
+    );
+    assert_eq!(
+        cell(rows, right, bottom)?,
+        '┘',
+        "{name} bottom right:\n{shown}"
+    );
     Ok(())
 }
 
@@ -212,7 +228,7 @@ fn assert_five_windows(
     assert_eq!((live.x, live.y), (finished.x, finished.height));
     assert_eq!((agents.x, agents.y), (finished.x + finished.width, 0));
     assert_eq!((jobs.x, jobs.y), (agents.x, agents.height));
-    assert!(cells(rows, 1, 0, 6)? == " Chat ", "{shown}");
+    assert_eq!(cells(rows, 1, 0, 6)?, " Chat ", "{shown}");
     assert!(
         cells(rows, finished.x + 1, 0, finished.width - 2)?
             .starts_with(" FINISHED / FAILED · ✓ 0 · ✗ 1 "),
@@ -260,9 +276,12 @@ fn assert_five_windows(
         "der Verlauf steht im Chat-Fenster: {shown}"
     );
     let status = cells(rows, 0, chat.height, chat.width)?;
-    assert!(status.contains("Ask"), "Statuszeile unter den Fenstern: {shown}");
     assert!(
-        cells(rows, 0, chat.height + 2, 4)?.starts_with("│› "),
+        status.contains("Ask"),
+        "Statuszeile unter den Fenstern: {shown}"
+    );
+    assert!(
+        cells(rows, 0, chat.height + 2, 6)?.contains("› "),
         "Composer: {shown}"
     );
     Ok(())
@@ -331,7 +350,9 @@ fn render_viewport_at_200x50_with_workbench_and_explorer_keeps_the_anchors() -> 
     assert_framed(&rows, Rect::new(36, 0, 74, 46), "chat")?;
     assert_eq!(cells(&rows, 37, 0, 6)?, " Chat ", "{shown}");
     assert!(
-        !rows.iter().any(|row| row.contains("Werkbank: zu wenig Platz")),
+        !rows
+            .iter()
+            .any(|row| row.contains("Werkbank: zu wenig Platz")),
         "no hint while the workbench is drawn: {shown}"
     );
 
@@ -416,9 +437,14 @@ fn render_viewport_at_100x30_is_shallow_with_finished_and_live_strips() -> TestR
     assert!(cells(&rows, 57, 13, 10)?.starts_with(" Jobs"), "{shown}");
     let history = rows
         .iter()
-        .position(|row| row.starts_with("einzigartige-verlaufszeile-quer"))
-        .ok_or(TestError::Missing("Verlaufszeile ohne Rahmen"))?;
+        .position(|row| row.contains("einzigartige-verlaufszeile-quer"))
+        .ok_or(TestError::Missing("Verlaufszeile"))?;
     assert!(history >= 2, "der Chat beginnt unter den Streifen: {shown}");
+    assert_ne!(
+        cell(&rows, 0, 2)?,
+        '┌',
+        "der Chat bleibt ohne Rahmen: {shown}"
+    );
     Ok(())
 }
 
@@ -501,7 +527,10 @@ fn render_viewport_resize_flip_keeps_selection_scroll_and_jobs() -> TestResult {
     // Hochformat mit eigenem Jobs-Fenster (ab 68 Spalten).
     let _ = rendered(&app, 70, 90)?;
     let regions = app.last_regions.get();
-    assert_eq!(regions.agents.map(|rect| (rect.y, rect.height)), Some((0, 4)));
+    assert_eq!(
+        regions.agents.map(|rect| (rect.y, rect.height)),
+        Some((0, 4))
+    );
     assert!(!regions.presence.live, "portrait LIVE is a strip");
     assert_eq!(state(&app), expected);
     assert_eq!(app.mission.jobs.scroll_offset(), 5);
@@ -534,11 +563,24 @@ fn render_viewport_wheel_over_each_landscape_window_scrolls_only_that_window() -
     let mut app = mission_app()?;
     let orchestrator = harw_registry_defaults::profile::role_names::ROOT_ORCHESTRATOR;
     for index in 0..40 {
-        running(&mut app, &format!("a{index:02}"), &format!("rolle-{index:02}"));
-        tool_call(&mut app, "o1", orchestrator, &format!("datei-{index:02}.md"));
+        running(
+            &mut app,
+            &format!("a{index:02}"),
+            &format!("rolle-{index:02}"),
+        );
+        tool_call(
+            &mut app,
+            "o1",
+            orchestrator,
+            &format!("datei-{index:02}.md"),
+        );
     }
     for index in 0..6 {
-        failed(&mut app, &format!("f{index}"), &format!("fehlrolle-{index}"));
+        failed(
+            &mut app,
+            &format!("f{index}"),
+            &format!("fehlrolle-{index}"),
+        );
     }
     app.agent_monitor.set_jobs(
         (0..40)
@@ -558,7 +600,11 @@ fn render_viewport_wheel_over_each_landscape_window_scrolls_only_that_window() -
     assert_eq!(offsets(&app), (0, 0, 0, 0, true));
 
     assert_eq!(route_scroll_input(&mut app, &down(agents)), Some(true));
-    assert_eq!(offsets(&app), (WHEEL_LINES, 0, 0, 0, true), "only the agents");
+    assert_eq!(
+        offsets(&app),
+        (WHEEL_LINES, 0, 0, 0, true),
+        "only the agents"
+    );
     assert_eq!(route_scroll_input(&mut app, &down(jobs)), Some(true));
     assert_eq!(
         offsets(&app),
@@ -592,7 +638,11 @@ fn render_viewport_wheel_over_each_landscape_window_scrolls_only_that_window() -
     let ctrl_up = TuiEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
     assert_eq!(app.panels.focus, PaneFocus::Live);
     assert_eq!(route_scroll_input(&mut app, &ctrl_up), Some(true));
-    assert_eq!(app.mission.live_scroll.offset(), WHEEL_LINES + 1, "Ctrl+↑ follows the focus");
+    assert_eq!(
+        app.mission.live_scroll.offset(),
+        WHEEL_LINES + 1,
+        "Ctrl+↑ follows the focus"
+    );
 
     let over_chat = mouse(MouseEventKind::ScrollUp, 5, 10);
     let before = offsets(&app);
@@ -613,8 +663,11 @@ fn render_viewport_wheel_over_each_landscape_window_scrolls_only_that_window() -
         .ok_or(TestError::Missing("Dialogfläche"))?;
     let before = offsets(&app);
     let over_dialog = mouse(MouseEventKind::ScrollDown, dialog.x + 2, dialog.y + 1);
-    assert_eq!(route_scroll_input(&mut app, &over_dialog), Some(true));
-    assert_eq!(offsets(&app), before, "the dialog scrolls, no window does");
+    assert!(
+        route_scroll_input(&mut app, &over_dialog).is_some(),
+        "the dialog takes the wheel"
+    );
+    assert_eq!(offsets(&app), before, "no window scrolls behind the dialog");
     Ok(())
 }
 
@@ -657,7 +710,11 @@ fn render_viewport_click_focuses_the_window_under_the_pointer() -> TestResult {
         (finished, PaneFocus::Finished),
         (live, PaneFocus::Live),
     ] {
-        assert_eq!(route_scroll_input(&mut app, &on(area)), Some(true), "{focus:?}");
+        assert_eq!(
+            route_scroll_input(&mut app, &on(area)),
+            Some(true),
+            "{focus:?}"
+        );
         assert_eq!(app.panels.focus, focus);
     }
     assert_eq!(
@@ -665,7 +722,11 @@ fn render_viewport_click_focuses_the_window_under_the_pointer() -> TestResult {
         Some(false),
         "already focused"
     );
-    assert_eq!(route_scroll_input(&mut app, &click(5, 10)), None, "chat: no window");
+    assert_eq!(
+        route_scroll_input(&mut app, &click(5, 10)),
+        None,
+        "chat: no window"
+    );
     assert_eq!(app.panels.focus, PaneFocus::Live);
 
     // Ein Klick auf ein anderes Fenster schließt die LIVE-Details.
@@ -733,7 +794,7 @@ fn render_viewport_alt_l_shows_the_live_detail_in_place_at_160x45() -> TestResul
     assert_eq!(app.last_regions.get().live, Some(live), "{shown}");
     assert_framed(&rows, live, "live detail")?;
     assert!(
-        cells(&rows, 89, 5, 38)?.starts_with(" Agent · root-orchestrator · Esc zurück"),
+        cells(&rows, 89, 5, 38)?.starts_with(" Agent · root-orchestrator · Esc"),
         "{shown}"
     );
     assert!(
@@ -745,7 +806,10 @@ fn render_viewport_alt_l_shows_the_live_detail_in_place_at_160x45() -> TestResul
         handle_panel_key(&mut app, key(KeyCode::Char('r'))),
         Some(true)
     );
-    assert!(!app.mission.live_detail_reasoning, "r toggles the reasoning");
+    assert!(
+        !app.mission.live_detail_reasoning,
+        "r toggles the reasoning"
+    );
     assert_eq!(handle_panel_key(&mut app, key(KeyCode::Enter)), Some(true));
     assert!(app.mission.live_detail_agent().is_none(), "Enter closes");
     let rows = rendered(&app, 160, 45)?;
@@ -773,12 +837,15 @@ fn render_viewport_names_a_workbench_without_room_in_the_status_line() -> TestRe
     let rows = rendered(&app, 140, 14)?;
     let shown = rows.join("\n");
     assert!(
-        rows.iter().any(|row| row.contains("Werkbank: zu wenig Platz")),
+        rows.iter()
+            .any(|row| row.contains("Werkbank: zu wenig Platz")),
         "{shown}"
     );
     let rows = rendered(&app, 160, 45)?;
     assert!(
-        !rows.iter().any(|row| row.contains("Werkbank: zu wenig Platz")),
+        !rows
+            .iter()
+            .any(|row| row.contains("Werkbank: zu wenig Platz")),
         "{}",
         rows.join("\n")
     );

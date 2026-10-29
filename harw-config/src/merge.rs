@@ -1706,7 +1706,9 @@ fn merge_permissions(
 // sind Pflichtfeld-Structs: alle Unterfelder werden gemeinsam gesetzt oder
 // gar nicht, ein whole-struct-Vergleich ist daher aequivalent zu acht
 // unabhaengigen Einzelfeld-Vergleichen, die `FIELD_TABLE` fuer
-// Exhaustivitaets-Zwecke dennoch einzeln auflistet).
+// Exhaustivitaets-Zwecke dennoch einzeln auflistet). `execution` (PL-97 E2)
+// ist `ProfileReplaces`: Home und Profil setzen ihn, ein nicht vertrautes
+// Projekt nie.
 fn merge_sandbox(
     trusted: &mut HarnessConfig,
     incoming: SandboxSection,
@@ -1732,6 +1734,14 @@ fn merge_sandbox(
         "sandbox.tmux",
         layer_path,
         out,
+    );
+    profile_replaces(
+        &mut trusted.sandbox.execution,
+        incoming.execution,
+        field_present(raw, &["sandbox", "execution"]),
+        role,
+        "sandbox.execution",
+        layer_path,
     );
 }
 
@@ -3450,6 +3460,63 @@ mod tests {
             .ok_or(TestError::Missing("sandbox.cargo after merge"))?;
         assert_eq!(cargo.cargo_bin, "/opt/harw/cargo");
         assert!(diagnostics.iter().any(|d| d.field == "sandbox.cargo"));
+        Ok(())
+    }
+
+    // PL-97 E2: `sandbox.execution` ist `ProfileReplaces` — Home und Profil
+    // setzen ihn, ein nicht vertrautes Projekt kann ihn nie umschalten.
+    #[test]
+    fn test_sandbox_execution_trusted_layers_set_it_untrusted_project_cannot() -> TestResult {
+        use crate::harness_config::SandboxExecutionToml;
+
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(
+            trusted.sandbox.effective_execution(),
+            SandboxExecutionToml::Chain
+        );
+        let legacy = "[sandbox]\nexecution = \"legacy\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(legacy).map_err(ctx("parse legacy"))?,
+            &raw_from(legacy)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.sandbox.execution,
+            Some(SandboxExecutionToml::Legacy)
+        );
+
+        let chain = "[sandbox]\nexecution = \"chain\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(chain).map_err(ctx("parse chain"))?,
+            &raw_from(chain)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.execution, Some(SandboxExecutionToml::Chain));
+
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(legacy).map_err(ctx("parse untrusted"))?,
+            &raw_from(legacy)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.execution, Some(SandboxExecutionToml::Chain));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        // A layer without the key keeps the value.
+        let other = "[jobs]\nmax_running = 8";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(other).map_err(ctx("parse other"))?,
+            &raw_from(other)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.execution, Some(SandboxExecutionToml::Chain));
         Ok(())
     }
 

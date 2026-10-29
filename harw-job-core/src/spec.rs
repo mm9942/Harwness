@@ -178,7 +178,10 @@ impl fmt::Display for SpecError {
                 profile_name(*profile)
             ),
             Self::WriteScopeOutsideWorkspace { path } => {
-                write!(f, "write scope path '{path}' lies outside the job's workspace")
+                write!(
+                    f,
+                    "write scope path '{path}' lies outside the job's workspace"
+                )
             }
             Self::WriteScopeUncovered { path } => write!(
                 f,
@@ -922,13 +925,13 @@ impl JobSpecEnvelope {
 #[cfg(test)]
 mod tests {
     use super::{
-        CpuBandwidth, JobSpec, JobSpecEnvelope, JobWriteScope, ResourceRequest,
-        SandboxProfileName, SandboxRequirement, SpecError, WorkspacePath,
+        CpuBandwidth, JobSpec, JobSpecEnvelope, JobWriteScope, ResourceRequest, SandboxProfileName,
+        SandboxRequirement, SpecError, WorkspacePath,
     };
-    use std::path::PathBuf;
     use crate::ids::{IdempotencyKey, JobScopeId};
     use crate::test_support::{TestError, TestResult, ctx};
     use jiff::SignedDuration;
+    use std::path::PathBuf;
 
     fn spec() -> TestResult<JobSpec> {
         Ok(JobSpec {
@@ -1321,7 +1324,11 @@ mod tests {
     #[test]
     fn write_scope_round_trips_and_old_records_have_none() -> TestResult {
         let spec = scoped_spec()?;
-        assert_eq!(spec.sandbox, SandboxRequirement::Required, "set by the builder");
+        assert_eq!(
+            spec.sandbox,
+            SandboxRequirement::Required,
+            "set by the builder"
+        );
         let scope = spec
             .write_scope
             .clone()
@@ -1337,7 +1344,9 @@ mod tests {
         let envelope = JobSpecEnvelope::new(spec.clone()).map_err(ctx("envelope"))?;
         let json = serde_json::to_string(&envelope).map_err(ctx("serialize"))?;
         assert!(
-            json.contains(r#""write_scope":{"version":1,"paths":["/work/repo/src","/work/repo/target"]}"#),
+            json.contains(
+                r#""write_scope":{"version":1,"paths":["/work/repo/src","/work/repo/target"]}"#
+            ),
             "{json}"
         );
         let back: JobSpecEnvelope = serde_json::from_str(&json).map_err(ctx("deserialize"))?;

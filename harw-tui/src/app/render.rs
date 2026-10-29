@@ -182,8 +182,7 @@ fn revealed_presence(
         maximized: false,
         ..app.panels.clone()
     };
-    let areas =
-        crate::panes::classify_mission(area, &panels, content.mission_rows(app, rows, 0));
+    let areas = crate::panes::classify_mission(area, &panels, content.mission_rows(app, rows, 0));
     MissionPresence {
         jobs: areas.jobs.is_some(),
         finished: areas.finished.is_some(),
