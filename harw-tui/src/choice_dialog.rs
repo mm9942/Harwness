@@ -20,6 +20,8 @@
 //! # Fehlertypen
 //! Keine — alle Operationen sind infallibel.
 
+use crate::i18n::tr;
+
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
@@ -31,14 +33,15 @@ use ratatui::{
         Widget, Wrap,
     },
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::dialog_frame::{BodyScroll, wrapped_rows};
 use crate::sanitize::sanitize_inline;
 use crate::style;
 
 /// Fußzeilen-Hinweis mit der Tastaturbelegung des Dialogs.
-const FOOTER_HINT: &str = "↑↓ wählen · Enter bestätigen · Esc abbrechen";
+const FOOTER_HINT: &str = "↑↓ select · Enter confirm · Esc cancel";
 
 /// Aktionssignal, das [`ChoiceDialog::handle_key`] zurückgibt.
 ///
@@ -236,7 +239,9 @@ impl ChoiceDialog {
     }
 
     fn footer_text(&self) -> &str {
-        self.footer_hint.as_deref().unwrap_or(FOOTER_HINT)
+        self.footer_hint
+            .as_deref()
+            .unwrap_or_else(|| tr("dialogs.choice_footer", FOOTER_HINT))
     }
 
     fn prompt_lines(&self, theme: style::Theme) -> Option<Vec<Line<'static>>> {
@@ -454,19 +459,19 @@ impl ChoiceDialog {
 
 /// Kürzt `text` auf `width` Spalten (mit `…`), ohne Zeichen zu zerteilen.
 fn fit_to_width(text: &str, width: usize) -> String {
-    let total: usize = text.chars().map(|ch| ch.width().unwrap_or(0)).sum();
+    let total = UnicodeWidthStr::width(text);
     if total <= width {
         return text.to_owned();
     }
     let mut out = String::new();
     let mut used = 0;
-    for ch in text.chars() {
-        let w = ch.width().unwrap_or(0);
+    for grapheme in text.graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
         if used + w + 1 > width {
             break;
         }
         used += w;
-        out.push(ch);
+        out.push_str(grapheme);
     }
     if width > 0 {
         out.push('…');
@@ -609,7 +614,7 @@ mod tests {
         assert!(rendered.contains("In die Zwischenablage kopieren"));
         assert!(rendered.contains("Als Datei speichern"));
         assert!(rendered.contains("Abbrechen"));
-        assert!(rendered.contains("wählen"));
+        assert!(rendered.contains("select"));
     }
 
     /// `desired_height` zählt Rahmen, Hinweiszeile plus Leerzeile, eine Zeile
@@ -719,5 +724,30 @@ mod tests {
             ChoiceAction::Chosen(1),
             "Scrollen hat die Auswahl nicht verändert"
         );
+    }
+    #[test]
+    fn non_latin_labels_fit_display_cells_without_splitting_graphemes() {
+        for text in [
+            "日本語の選択肢",
+            "e\u{301}e\u{301}e\u{301}",
+            "क्षिक्षिक्षि",
+            "👩‍💻👩‍💻",
+        ] {
+            for width in 0..16 {
+                let fitted = fit_to_width(text, width);
+                assert!(
+                    UnicodeWidthStr::width(fitted.as_str()) <= width,
+                    "{width}: {fitted:?}"
+                );
+                if let Some(prefix) = fitted.strip_suffix('…') {
+                    assert!(
+                        text.grapheme_indices(true).any(|(i, _)| i == prefix.len()),
+                        "{text:?}: {prefix:?}"
+                    );
+                } else if width > 0 {
+                    assert_eq!(fitted, text);
+                }
+            }
+        }
     }
 }

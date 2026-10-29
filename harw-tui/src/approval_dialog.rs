@@ -65,6 +65,8 @@
 //! assert!(dialog.desired_height(60) > 0);
 //! ```
 
+use crate::i18n::{tr, tr_args};
+
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -117,11 +119,15 @@ fn classifier_unavailable_cause(reason: &str) -> Option<String> {
         .strip_prefix("Klassifizierer-Fehler:")
         .map_or(rest, str::trim);
     let cause = if cause.is_empty() {
-        "Klassifizierer nicht erreichbar".to_owned()
+        tr("dialogs.classifier_unreachable", "Classifier unreachable").to_owned()
     } else if cause.eq_ignore_ascii_case(EMPTY_RESPONSE_RAW) {
-        "Klassifizierer lieferte leere Antwort".to_owned()
+        tr(
+            "dialogs.classifier_empty",
+            "Classifier returned an empty response",
+        )
+        .to_owned()
     } else {
-        cause.replace(EMPTY_RESPONSE_RAW, "leere Antwort")
+        cause.to_owned()
     };
     Some(cause)
 }
@@ -132,28 +138,23 @@ use crate::sanitize::{sanitize_inline, sanitize_reveal, sanitize_reveal_inline};
 use crate::style::{self, Theme};
 
 /// Fußzeilen-Hinweis mit der Tastaturbelegung des Panels.
-const FOOTER_HINT: &str = "↑↓ wählen · Enter bestätigen · v Details · Esc = Nein";
-
-/// Varianten des Fußzeilen-Hinweises, von lang nach kurz; gezeigt wird die
-/// längste, die in die Innenbreite passt (nie abgeschnitten).
-const FOOTER_HINTS: &[&str] = &[
-    FOOTER_HINT,
-    "↑↓ wählen · Enter ok · v Details · Esc Nein",
-    "↑↓ · Enter · v Details · Esc Nein",
-    "↑↓ Enter v Esc",
-];
-
-/// Endung der verdichteten Vorschauzeile des Hauptarguments.
-const DETAILS_MARKER: &str = "… v Details";
-
-/// Hinweis auf `Esc` in der Beschriftung der Ablehnungs-Option.
-const REJECT_HINT_PLAIN: &str = "(Esc)";
-
-/// Hinweis auf `Esc` plus `Tab`, wenn eine Begründung eingegeben werden kann.
-const REJECT_HINT_WITH_REASON: &str = "(Esc) · Tab: Grund angeben";
-
-/// Text vor dem Freitext-Eingabefeld für die Ablehnungsbegründung.
-const REASON_PROMPT: &str = "Grund: ";
+fn footer_hints() -> [&'static str; 4] {
+    [
+        tr(
+            "dialogs.approval_footer",
+            "↑↓ select · Enter confirm · v details · Esc = No",
+        ),
+        tr(
+            "dialogs.approval_footer_short",
+            "↑↓ select · Enter ok · v details · Esc No",
+        ),
+        tr(
+            "dialogs.approval_footer_compact",
+            "↑↓ · Enter · v details · Esc No",
+        ),
+        "↑↓ Enter v Esc",
+    ]
+}
 
 /// Schwelle (Sekunden), ab der der Countdown in Warnfarbe erscheint.
 const COUNTDOWN_WARNING_THRESHOLD_SECS: u64 = 60;
@@ -495,12 +496,18 @@ impl ApprovalDialog {
     /// Baut die Beschriftung einer Option (ohne Nummer/Marker).
     fn option_label(&self, kind: OptionKind) -> String {
         match kind {
-            OptionKind::Approve => "Ja".to_owned(),
+            OptionKind::Approve => tr("dialogs.approve", "Yes").to_owned(),
             OptionKind::Remember => {
                 let rule = self.remember_rule.as_deref().unwrap_or_default();
-                format!("Ja, und nicht mehr fragen für: {}", sanitize_inline(rule))
+                tr_args(
+                    "dialogs.remember_rule",
+                    "Yes, and do not ask again for: {rule}",
+                    &[("rule", &sanitize_inline(rule))],
+                )
             }
-            OptionKind::AutoMode => "Ja, und in den auto-Modus wechseln".to_owned(),
+            OptionKind::AutoMode => {
+                tr("dialogs.approve_auto", "Yes, and switch to auto mode").to_owned()
+            }
             OptionKind::LearnSession => self
                 .learn_offer
                 .as_ref()
@@ -513,11 +520,11 @@ impl ApprovalDialog {
                 .unwrap_or_default(),
             OptionKind::Reject => {
                 let hint = if self.reason_input_enabled {
-                    REJECT_HINT_WITH_REASON
+                    tr("dialogs.reject_reason_hint", "(Esc) · Tab: give reason")
                 } else {
-                    REJECT_HINT_PLAIN
+                    "(Esc)"
                 };
-                format!("Nein {hint}")
+                tr_args("dialogs.reject", "No {hint}", &[("hint", hint)])
             }
         }
     }
@@ -791,11 +798,11 @@ impl ApprovalDialog {
     /// Wählt den Titel anhand des Werkzeugnamens (Plan Schritt 3).
     fn title_text(&self) -> String {
         match self.tool_name.as_str() {
-            "shell.exec" => " Befehl ausführen? ".to_owned(),
-            "fs.write" | "fs.patch" => " Datei schreiben? ".to_owned(),
+            "shell.exec" => tr("dialogs.execute_title", " Execute command? ").to_owned(),
+            "fs.write" | "fs.patch" => tr("dialogs.write_title", " Write file? ").to_owned(),
             // Runde 5, Teil H: `fs.edit` (Teil D) bekommt einen eigenen Titel.
-            "fs.edit" => " Datei bearbeiten? ".to_owned(),
-            _ => " Werkzeug freigeben? ".to_owned(),
+            "fs.edit" => tr("dialogs.edit_title", " Edit file? ").to_owned(),
+            _ => tr("dialogs.tool_title", " Approve tool? ").to_owned(),
         }
     }
 
@@ -851,7 +858,11 @@ impl ApprovalDialog {
         }
 
         if self.reason_editing {
-            let text = format!("{REASON_PROMPT}{}", self.reason_text);
+            let text = format!(
+                "{}{}",
+                tr("dialogs.reason_label", "Reason: "),
+                self.reason_text
+            );
             for line in wrapped_strings(&text, width) {
                 pinned.push(PinnedRow::content(Line::styled(
                     line,
@@ -861,7 +872,7 @@ impl ApprovalDialog {
         }
 
         pinned.push(PinnedRow::padding());
-        let hint = dialog_frame::pick_fitting(FOOTER_HINTS, width);
+        let hint = dialog_frame::pick_fitting(&footer_hints(), width);
         for line in wrapped_strings(hint, width) {
             pinned.push(PinnedRow::content(Line::styled(
                 line,
@@ -880,7 +891,7 @@ impl ApprovalDialog {
         if let Some(origin) = &self.origin {
             // Runde 5, Teil O: Kind-Freigaben nennen ihren Absender als
             // „angefragt von: <rolle> (<pfad im baum>)“.
-            fields.push(("angefragt von", origin.clone()));
+            fields.push((tr("dialogs.requested_by", "requested by"), origin.clone()));
         }
         // Runde 6, Teil A1: der Grund des Auto-Modus steht vor cwd/Risiko.
         // R18 F2: fiel der Klassifizierer aus, steht dort in Klartext, dass
@@ -888,20 +899,27 @@ impl ApprovalDialog {
         if let Some(reason) = &self.auto_reason {
             match classifier_unavailable_cause(reason) {
                 Some(cause) => fields.push((
-                    "Auto-Modus nicht verfügbar",
-                    format!("{cause} – bitte selbst entscheiden"),
+                    tr("dialogs.auto_unavailable", "Auto mode unavailable"),
+                    tr_args(
+                        "dialogs.decide_manually",
+                        "{cause} — please decide yourself",
+                        &[("cause", &cause)],
+                    ),
                 )),
-                None => fields.push(("Auto-Modus", reason.clone())),
+                None => fields.push((tr("dialogs.auto_mode", "Auto mode"), reason.clone())),
             }
         }
         if let Some(cwd) = &self.cwd {
             fields.push(("cwd", cwd.clone()));
         }
         if let Some(risk) = &self.risk {
-            fields.push(("Risiko", risk.clone()));
+            fields.push((tr("dialogs.risk", "Risk"), risk.clone()));
         }
         if let Some(justification) = &self.justification {
-            fields.push(("Begründung", justification.clone()));
+            fields.push((
+                tr("dialogs.justification", "Justification"),
+                justification.clone(),
+            ));
         }
         fields
     }
@@ -938,7 +956,11 @@ impl ApprovalDialog {
             let hidden = rest.len() - APPROVAL_COLLAPSED_ARGUMENT_LINES;
             rest.truncate(APPROVAL_COLLAPSED_ARGUMENT_LINES);
             rest.extend(wrapped_strings(
-                &format!("… {hidden} weitere Zeilen ausgeblendet — [v] vollständig anzeigen"),
+                &tr_args(
+                    "dialogs.hidden_arguments",
+                    "… {count} more lines hidden — [v] show all",
+                    &[("count", &hidden.to_string())],
+                ),
                 width,
             ));
         }
@@ -1015,29 +1037,41 @@ fn wrapped_strings(text: &str, width: u16) -> Vec<String> {
 /// Formatiert die verbleibende Zeit als `"noch M:SS"` (z. B. `"noch 4:52"`).
 fn format_countdown(remaining: Duration) -> String {
     let total_secs = remaining.as_secs();
-    format!("noch {}:{:02}", total_secs / 60, total_secs % 60)
+    tr_args(
+        "dialogs.countdown",
+        "{time} remaining",
+        &[(
+            "time",
+            &format!("{}:{:02}", total_secs / 60, total_secs % 60),
+        )],
+    )
 }
 
 /// Einzeilige Vorschau des Hauptarguments, die mit „… v Details“ endet
 /// und genau in `width` Spalten passt.
 fn compact_preview(text: &str, width: u16) -> String {
-    use unicode_width::UnicodeWidthChar;
-    let marker_width = unicode_width::UnicodeWidthStr::width(DETAILS_MARKER);
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if width == 0 {
+        return String::new();
+    }
+    let details_marker = tr("dialogs.details_marker", "… v details");
+    let marker_width = UnicodeWidthStr::width(details_marker);
     let budget = usize::from(width).saturating_sub(marker_width + 1);
     let mut out = String::new();
     let mut used = 0;
-    for ch in text.chars() {
-        let ch = if ch == '\n' { ' ' } else { ch };
-        let w = ch.width().unwrap_or(0);
+    let inline = text.replace('\n', " ");
+    for grapheme in inline.graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
         if used + w > budget {
             break;
         }
         used += w;
-        out.push(ch);
+        out.push_str(grapheme);
     }
     if usize::from(width) > marker_width {
         out.push(' ');
-        out.push_str(DETAILS_MARKER);
+        out.push_str(details_marker);
     } else {
         out = "…".to_owned();
     }
@@ -1109,16 +1143,16 @@ mod tests {
     fn test_options_with_remember_rule_are_numbered_one_to_four() {
         let dialog = shell_dialog(Some("git status"));
         let rendered = render_dialog(&dialog, 70, 20);
-        assert!(rendered.contains("1. Ja"), "{rendered}");
+        assert!(rendered.contains("1. Yes"), "{rendered}");
         assert!(
-            rendered.contains("2. Ja, und nicht mehr fragen für: git status"),
+            rendered.contains("2. Yes, and do not ask again for: git status"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("3. Ja, und in den auto-Modus wechseln"),
+            rendered.contains("3. Yes, and switch to auto mode"),
             "{rendered}"
         );
-        assert!(rendered.contains("4. Nein"), "{rendered}");
+        assert!(rendered.contains("4. No"), "{rendered}");
     }
 
     /// Runde 5 (Integration O): Kind-Freigaben bieten nur „Ja“ und „Nein“.
@@ -1130,21 +1164,21 @@ mod tests {
             vec![OptionKind::Approve, OptionKind::Reject]
         );
         let rendered = render_dialog(&dialog, 70, 20);
-        assert!(!rendered.contains("auto-Modus"), "{rendered}");
-        assert!(rendered.contains("2. Nein"), "{rendered}");
+        assert!(!rendered.contains("auto mode"), "{rendered}");
+        assert!(rendered.contains("2. No"), "{rendered}");
     }
 
     #[test]
     fn test_options_without_remember_rule_are_renumbered() {
         let dialog = shell_dialog(None);
         let rendered = render_dialog(&dialog, 70, 20);
-        assert!(rendered.contains("1. Ja"), "{rendered}");
-        assert!(!rendered.contains("nicht mehr fragen"), "{rendered}");
+        assert!(rendered.contains("1. Yes"), "{rendered}");
+        assert!(!rendered.contains("do not ask again"), "{rendered}");
         assert!(
-            rendered.contains("2. Ja, und in den auto-Modus wechseln"),
+            rendered.contains("2. Yes, and switch to auto mode"),
             "{rendered}"
         );
-        assert!(rendered.contains("3. Nein"), "{rendered}");
+        assert!(rendered.contains("3. No"), "{rendered}");
         assert!(!rendered.contains("4."), "{rendered}");
     }
 
@@ -1270,9 +1304,9 @@ mod tests {
 
     #[test]
     fn test_format_countdown_formats_five_minutes() {
-        assert_eq!(format_countdown(Duration::from_secs(300)), "noch 5:00");
-        assert_eq!(format_countdown(Duration::from_secs(292)), "noch 4:52");
-        assert_eq!(format_countdown(Duration::from_secs(5)), "noch 0:05");
+        assert_eq!(format_countdown(Duration::from_secs(300)), "5:00 remaining");
+        assert_eq!(format_countdown(Duration::from_secs(292)), "4:52 remaining");
+        assert_eq!(format_countdown(Duration::from_secs(5)), "0:05 remaining");
     }
 
     #[test]
@@ -1292,7 +1326,7 @@ mod tests {
         });
         let rendered = render_dialog(&dialog, 70, 20);
         assert!(
-            rendered.contains("noch 4:5") || rendered.contains("noch 5:00"),
+            rendered.contains("4:5") || rendered.contains("5:00 remaining"),
             "{rendered}"
         );
     }
@@ -1437,7 +1471,7 @@ mod tests {
     }
 
     /// Runde 6, Teil A1: fragt der Auto-Modus statt abzulehnen, steht sein
-    /// Grund als Zeile „Auto-Modus: <Kategorie> – <Grund>“ im Dialog.
+    /// Grund als Zeile „Auto mode: <Kategorie> – <Grund>“ im Dialog.
     #[test]
     fn test_auto_mode_reason_is_shown_as_a_line() {
         let dialog = shell_dialog(None).with_auto_reason(Some(
@@ -1445,11 +1479,11 @@ mod tests {
         ));
         let rendered = render_dialog(&dialog, 90, 24);
         assert!(
-            rendered.contains("Auto-Modus: exfiltration – verschiebt export.md nach ~"),
+            rendered.contains("Auto mode: exfiltration – verschiebt export.md nach ~"),
             "{rendered}"
         );
         let plain = render_dialog(&shell_dialog(None).with_auto_reason(None), 90, 24);
-        assert!(!plain.contains("Auto-Modus:"), "{plain}");
+        assert!(!plain.contains("Auto mode:"), "{plain}");
     }
 
     /// TUI-06 (R18 F2): fiel der Klassifizierer aus, nennt der Dialog das in
@@ -1463,8 +1497,8 @@ mod tests {
         let rendered = render_dialog(&dialog, 120, 24);
         assert!(
             rendered.contains(
-                "Auto-Modus nicht verfügbar: Klassifizierer lieferte leere Antwort – bitte \
-                 selbst entscheiden"
+                "Auto mode unavailable: Classifier returned an empty response — please \
+                 decide yourself"
             ),
             "{rendered}"
         );
@@ -1483,7 +1517,7 @@ mod tests {
         );
         assert_eq!(
             classifier_unavailable_cause("classifier-unavailable – ").as_deref(),
-            Some("Klassifizierer nicht erreichbar")
+            Some("Classifier unreachable")
         );
         assert_eq!(
             classifier_unavailable_cause("shell – unbekannter Befehl"),
@@ -1507,7 +1541,7 @@ mod tests {
             reason_input_enabled: false,
         });
         let rendered = render_dialog(&dialog, 70, 20);
-        assert!(!rendered.contains("Tab: Grund angeben"), "{rendered}");
+        assert!(!rendered.contains("Tab: give reason"), "{rendered}");
     }
 
     // ── Titel je Werkzeug ────────────────────────────────────────────────
@@ -1515,7 +1549,7 @@ mod tests {
     #[test]
     fn test_title_depends_on_tool_name() {
         let shell = shell_dialog(None);
-        assert!(render_dialog(&shell, 70, 20).contains("Befehl ausführen?"));
+        assert!(render_dialog(&shell, 70, 20).contains("Execute command?"));
 
         let write = ApprovalDialog::new(ApprovalDialogRequest {
             call: tool_call(
@@ -1530,9 +1564,9 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(300),
             reason_input_enabled: false,
         });
-        assert!(render_dialog(&write, 70, 20).contains("Datei schreiben?"));
+        assert!(render_dialog(&write, 70, 20).contains("Write file?"));
 
-        // Runde 5, Teil H: `fs.edit` fragt „Datei bearbeiten?“ und zeigt
+        // Runde 5, Teil H: `fs.edit` fragt „Edit file?“ und zeigt
         // Pfad, alten und neuen Text.
         let edit = ApprovalDialog::new(ApprovalDialogRequest {
             call: tool_call(
@@ -1552,7 +1586,7 @@ mod tests {
             reason_input_enabled: false,
         });
         let rendered = render_dialog(&edit, 70, 24);
-        assert!(rendered.contains("Datei bearbeiten?"), "{rendered}");
+        assert!(rendered.contains("Edit file?"), "{rendered}");
         assert!(rendered.contains("src/lib.rs"), "{rendered}");
         assert!(rendered.contains("old_string"), "{rendered}");
         assert!(rendered.contains("new_string"), "{rendered}");
@@ -1567,7 +1601,7 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(300),
             reason_input_enabled: false,
         });
-        assert!(render_dialog(&other, 70, 20).contains("Werkzeug freigeben?"));
+        assert!(render_dialog(&other, 70, 20).contains("Approve tool?"));
     }
 
     // ── Runde 5, Teil E: Lern-Angebot ────────────────────────────────────────
@@ -1598,7 +1632,7 @@ mod tests {
         );
         let rendered = render_dialog(&with, 90, 24);
         assert!(
-            rendered.contains("künftig erlauben: shell.exec git status *"),
+            rendered.contains("allow in future: shell.exec git status *"),
             "{rendered}"
         );
     }
@@ -1660,20 +1694,20 @@ mod tests {
         let dialog = crowded_dialog();
         for (width, height) in [(40u16, 10u16), (60, 12), (80, 14), (120, 14)] {
             let rendered = render_dialog(&dialog, width, height);
-            assert!(rendered.contains("1. Ja"), "{width}x{height}: {rendered}");
+            assert!(rendered.contains("1. Yes"), "{width}x{height}: {rendered}");
             assert!(
-                rendered.contains("Nein (Esc)"),
+                rendered.contains("No (Esc)"),
                 "{width}x{height}: {rendered}"
             );
             let inner = width - 2;
-            let hint = dialog_frame::pick_fitting(FOOTER_HINTS, inner);
+            let hint = dialog_frame::pick_fitting(&footer_hints(), inner);
             assert!(
                 rows_of(&rendered).iter().any(|row| row.contains(hint)),
                 "{width}x{height}: Hinweis {hint:?} fehlt: {rendered}"
             );
             // Die erste Zeile verdichtet den Befehl („… v Details“).
             assert!(
-                rendered.contains(DETAILS_MARKER),
+                rendered.contains(tr("dialogs.details_marker", "… v details")),
                 "{width}x{height}: {rendered}"
             );
             // Nichts ragt über den Rahmen hinaus.
@@ -1697,7 +1731,7 @@ mod tests {
         assert_eq!(dialog.body_offset(), 2);
         let after = render_dialog(&dialog, 60, 12);
         assert_ne!(before, after, "der Körper hat sich bewegt");
-        assert!(after.contains("1. Ja"), "{after}");
+        assert!(after.contains("1. Yes"), "{after}");
         assert!(after.contains("❯ 2."), "Auswahl bleibt sichtbar: {after}");
         let ctrl_up = KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL);
         assert_eq!(dialog.handle_key(ctrl_up, true), DialogAction::Scrolled);
@@ -1713,7 +1747,7 @@ mod tests {
         assert_eq!(dialog.body_offset(), dialog_frame::WHEEL_LINES);
         let scrolled = render_dialog(&dialog, 60, 12);
         assert_ne!(top, scrolled);
-        for needle in ["1. Ja", "Nein (Esc)"] {
+        for needle in ["1. Yes", "No (Esc)"] {
             assert!(scrolled.contains(needle), "{needle}: {scrolled}");
         }
     }
@@ -1723,21 +1757,64 @@ mod tests {
         let mut dialog = crowded_dialog();
         dialog.handle_key(make_key(KeyCode::Char('v')), true);
         let rendered = render_dialog(&dialog, 60, 12);
-        assert!(!rendered.contains(DETAILS_MARKER), "{rendered}");
+        assert!(
+            !rendered.contains(tr("dialogs.details_marker", "… v details")),
+            "{rendered}"
+        );
         // Bis ans Ende scrollen: der letzte Befehlsteil wird erreichbar.
         for _ in 0..40 {
             dialog.scroll_wheel(crossterm::event::MouseEventKind::ScrollDown);
             let _ = render_dialog(&dialog, 60, 12);
         }
         let end = render_dialog(&dialog, 60, 12);
-        assert!(end.contains("Begründung"), "{end}");
-        assert!(end.contains("1. Ja"), "{end}");
+        assert!(end.contains("Justification"), "{end}");
+        assert!(end.contains("1. Yes"), "{end}");
     }
 
     #[test]
     fn test_compact_preview_fits_the_width() {
         let preview = compact_preview("git status --short && cargo build", 20);
-        assert!(preview.ends_with(DETAILS_MARKER), "{preview}");
+        assert!(
+            preview.ends_with(tr("dialogs.details_marker", "… v details")),
+            "{preview}"
+        );
         assert!(unicode_width::UnicodeWidthStr::width(preview.as_str()) <= 20);
+    }
+    #[test]
+    fn localized_preview_fits_cjk_hindi_and_combining_graphemes() {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        use unicode_segmentation::UnicodeSegmentation;
+        use unicode_width::UnicodeWidthStr;
+
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                for text in [
+                    "日本語 日本語",
+                    "क्षिक्षिक्षि",
+                    "e\u{301}e\u{301}e\u{301}",
+                    "👩‍💻👩‍💻",
+                ] {
+                    for width in 0..40 {
+                        let preview = compact_preview(text, width);
+                        assert!(
+                            UnicodeWidthStr::width(preview.as_str()) <= usize::from(width),
+                            "{language:?}/{width}: {preview:?}"
+                        );
+                        let marker = tr("dialogs.details_marker", "… v details");
+                        if let Some(prefix) = preview
+                            .strip_suffix(marker)
+                            .and_then(|s| s.strip_suffix(' '))
+                        {
+                            assert!(
+                                prefix == text
+                                    || text.grapheme_indices(true).any(|(i, _)| i == prefix.len()),
+                                "{text:?}: {prefix:?}"
+                            );
+                        }
+                    }
+                }
+            });
+        }
     }
 }

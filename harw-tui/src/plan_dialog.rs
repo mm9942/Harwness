@@ -37,6 +37,8 @@
 //! # Nebenläufigkeit
 //! Lebt exklusiv in der `ChatApp` (Renderer-Thread).
 
+use crate::i18n::{tr, tr_args};
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
@@ -72,11 +74,11 @@ pub(crate) const MAX_FEEDBACK_CHARS: usize = 4000;
 pub(crate) const PLAN_STATUS_MARKER: &str = "⏸ plan mode on (shift+tab to cycle) ";
 
 /// Titel des Composers im Plan-Modus.
-pub(crate) const PLAN_COMPOSER_TITLE: &str = " Plan-Modus – es wird nichts verändert ";
+pub(crate) const PLAN_COMPOSER_TITLE: &str = " Plan mode — no changes are made ";
 
 /// Platzhalter des leeren Composers im Plan-Modus.
 pub(crate) const PLAN_COMPOSER_PLACEHOLDER: &str =
-    "Plan-Modus – es wird nichts verändert · beschreibe die Aufgabe · Shift+Tab wechselt weiter";
+    "Plan mode — no changes are made · describe the task · Shift+Tab cycles modes";
 
 // ── Farben, Statuszeile, Composer ────────────────────────────────────────────
 
@@ -102,14 +104,17 @@ pub(crate) fn plan_style(theme: Theme) -> Style {
 /// Die Statuszeilen-Marke „⏸ plan mode on (shift+tab to cycle)“.
 #[must_use]
 pub(crate) fn plan_status_span(theme: Theme) -> Span<'static> {
-    Span::styled(format!(" {PLAN_STATUS_MARKER}"), plan_style(theme))
+    Span::styled(
+        format!(" {}", tr("dialogs.plan_status", PLAN_STATUS_MARKER)),
+        plan_style(theme),
+    )
 }
 
 /// Titel, Titelstil und Rahmenstil des Composers im Plan-Modus.
 #[must_use]
 pub(crate) fn plan_composer_chrome(theme: Theme) -> (&'static str, Style, Style) {
     (
-        PLAN_COMPOSER_TITLE,
+        tr("dialogs.plan_composer_title", PLAN_COMPOSER_TITLE),
         plan_style(theme),
         Style::default().fg(plan_color(theme)),
     )
@@ -120,7 +125,10 @@ pub(crate) fn plan_composer_chrome(theme: Theme) -> (&'static str, Style, Style)
 pub(crate) fn plan_placeholder_line(theme: Theme) -> Line<'static> {
     Line::from(vec![
         Span::styled("› ", plan_style(theme)),
-        Span::styled(PLAN_COMPOSER_PLACEHOLDER, style::dim_style(theme)),
+        Span::styled(
+            tr("dialogs.plan_placeholder", PLAN_COMPOSER_PLACEHOLDER),
+            style::dim_style(theme),
+        ),
     ])
 }
 
@@ -168,12 +176,22 @@ pub(crate) fn parse_plan_command(args: &str) -> Option<PlanCommand> {
         Some("list") => PlanCommand::List,
         Some("open") => match words.next() {
             Some(slug) => PlanCommand::Open(slug.to_owned()),
-            None => PlanCommand::Usage("Nutzung: /plan open <name> — siehe /plan list".to_owned()),
+            None => PlanCommand::Usage(
+                tr(
+                    "dialogs.plan_open_usage",
+                    "Usage: /plan open <name> — see /plan list",
+                )
+                .to_owned(),
+            ),
         },
         Some(_) => return None,
     };
     if words.next().is_some() {
-        return Some(PlanCommand::Usage(format!("Nutzung: {PLAN_USAGE}")));
+        return Some(PlanCommand::Usage(tr_args(
+            "dialogs.plan_usage",
+            "Usage: {usage}",
+            &[("usage", PLAN_USAGE)],
+        )));
     }
     Some(command)
 }
@@ -216,36 +234,39 @@ pub(crate) fn run_plan_command(
     let Some(session) = session else {
         return match command {
             PlanCommand::Enter => PlanCommandEffect::EnterPlanStage(
-                "Plan-Modus an — es wird nichts verändert (Shift+Tab wechselt weiter).".to_owned(),
+                tr(
+                    "dialogs.plan_enter_simple",
+                    "Plan mode on — no changes are made (Shift+Tab cycles modes).",
+                )
+                .to_owned(),
             ),
             PlanCommand::Usage(text) => PlanCommandEffect::Text(text.clone()),
             _ => PlanCommandEffect::Text(
-                "/plan: in dieser Sitzung gibt es keine Plan-Dateien (keine Montage).".to_owned(),
+                tr(
+                    "dialogs.plan_no_runtime",
+                    "/plan: no plan files in this session (no runtime).",
+                )
+                .to_owned(),
             ),
         };
     };
     match command {
         PlanCommand::Enter => PlanCommandEffect::EnterPlanStage(
-            "Plan-Modus an — es wird nichts verändert. Der Agent erkundet, fragt nach und legt \
-             einen Plan zur Freigabe vor (Shift+Tab wechselt weiter)."
+            tr("dialogs.plan_enter", "Plan mode on — no changes are made. The agent explores, asks questions and submits a plan for approval (Shift+Tab cycles modes).")
                 .to_owned(),
         ),
         PlanCommand::Usage(text) => PlanCommandEffect::Text(text.clone()),
         PlanCommand::Show => {
             let Some(slug) = focused_slug(session) else {
                 return PlanCommandEffect::Text(
-                    "Noch kein Plan in dieser Sitzung — /plan list zeigt frühere Pläne.".to_owned(),
+                    tr("dialogs.plan_none", "No plan in this session yet — /plan list shows earlier plans.").to_owned(),
                 );
             };
             match session.dir().read(&slug) {
                 Ok(content) => {
                     let pinned = session.pinned().get().is_some_and(|doc| doc.slug == slug);
-                    let marker = if pinned { " (angeheftet)" } else { "" };
-                    PlanCommandEffect::Text(format!(
-                        "── Plan {}{marker} ──\n{}",
-                        display_path(&slug),
-                        content.trim_end()
-                    ))
+                    let marker = if pinned { tr("dialogs.plan_pinned_marker", " (pinned)") } else { "" };
+                    PlanCommandEffect::Text(tr_args("dialogs.plan_show", "── Plan {path}{marker} ──\n{content}", &[("path", &display_path(&slug)), ("marker", marker), ("content", content.trim_end())]))
                 }
                 Err(error) => PlanCommandEffect::Text(format!("/plan show: {error}")),
             }
@@ -253,45 +274,41 @@ pub(crate) fn run_plan_command(
         PlanCommand::Edit => {
             let Some(slug) = focused_slug(session) else {
                 return PlanCommandEffect::Text(
-                    "Kein aktueller Plan — erst /plan open <name> oder den Agenten planen lassen."
+                    tr("dialogs.plan_no_current", "No current plan — use /plan open <name> or ask the agent to plan first.")
                         .to_owned(),
                 );
             };
             match session.dir().path_for(&slug) {
                 Ok(path) if path.exists() => PlanCommandEffect::Edit { slug, path },
-                Ok(_) => PlanCommandEffect::Text(format!(
-                    "/plan edit: {} existiert noch nicht",
-                    display_path(&slug)
-                )),
+                Ok(_) => PlanCommandEffect::Text(tr_args("dialogs.plan_missing_file", "/plan edit: {path} does not exist yet", &[("path", &display_path(&slug))])),
                 Err(error) => PlanCommandEffect::Text(format!("/plan edit: {error}")),
             }
         }
         PlanCommand::List => match session.dir().list() {
             Ok(entries) if entries.is_empty() => PlanCommandEffect::Text(
-                "Keine Pläne unter .harw/plans/ — im Plan-Modus schreibt der Agent sie mit \
-                 plan.write."
+                tr("dialogs.plan_empty_list", "No plans under .harw/plans/ — in plan mode the agent writes them with plan.write.")
                     .to_owned(),
             ),
             Ok(entries) => {
                 let current = session.current_slug();
                 let pinned = session.pinned().get().map(|doc| doc.slug);
-                let mut lines = vec!["Pläne des Projekts (neueste zuerst):".to_owned()];
+                let mut lines = vec![tr("dialogs.plan_list_heading", "Project plans (newest first):").to_owned()];
                 for entry in entries {
                     let mut marks = Vec::new();
                     if current.as_deref() == Some(entry.slug.as_str()) {
-                        marks.push("aktuell");
+                        marks.push(tr("dialogs.plan_current", "current"));
                     }
                     if pinned.as_deref() == Some(entry.slug.as_str()) {
-                        marks.push("angeheftet");
+                        marks.push(tr("dialogs.plan_pinned", "pinned"));
                     }
                     let marks = if marks.is_empty() {
                         String::new()
                     } else {
                         format!(" [{}]", marks.join(", "))
                     };
-                    lines.push(format!("  {} · {} Bytes{marks}", entry.slug, entry.bytes));
+                    lines.push(tr_args("dialogs.plan_list_entry", "  {slug} · {bytes} bytes{marks}", &[("slug", &entry.slug), ("bytes", &entry.bytes.to_string()), ("marks", &marks)]));
                 }
-                lines.push("/plan open <name> lädt einen Plan zum Weiterplanen.".to_owned());
+                lines.push(tr("dialogs.plan_open_hint", "/plan open <name> loads a plan to continue planning.").to_owned());
                 PlanCommandEffect::Text(lines.join("\n"))
             }
             Err(error) => PlanCommandEffect::Text(format!("/plan list: {error}")),
@@ -304,11 +321,7 @@ pub(crate) fn run_plan_command(
             match session.dir().read(&slug) {
                 Ok(_) => {
                     session.set_current_slug(Some(slug.clone()));
-                    PlanCommandEffect::EnterPlanStage(format!(
-                        "Plan {} geöffnet — Plan-Modus an. Beschreibe, was sich ändern soll; \
-                         plan.write überschreibt diesen Plan, plan.exit legt ihn erneut vor.",
-                        display_path(&slug)
-                    ))
+                    PlanCommandEffect::EnterPlanStage(tr_args("dialogs.plan_opened", "Plan {path} opened — plan mode on. Describe what should change; plan.write overwrites this plan, plan.exit submits it again.", &[("path", &display_path(&slug))]))
                 }
                 Err(error) => PlanCommandEffect::Text(format!("/plan open: {error}")),
             }
@@ -359,18 +372,6 @@ pub(crate) enum PlanDialogAction {
 // ── plan.exit ────────────────────────────────────────────────────────────────
 
 /// Die drei Optionen des Freigabefensters.
-const EXIT_OPTIONS: [&str; 3] = [
-    "Ja, umsetzen im Auto-Modus (work · Freigabe auto)",
-    "Ja, umsetzen und Änderungen einzeln freigeben (work · Freigabe ask)",
-    "Nein, weiter planen — Rückmeldung: ",
-];
-
-/// Runde 5, Teil P: die zwei Optionen der Variante „Plan bestätigen“.
-const CONFIRM_OPTIONS: [&str; 2] = [
-    "Ja, bestätigen — der Plan wird aktiv und als Goal verfolgt",
-    "Nein — Rückmeldung an den Agenten: ",
-];
-
 /// Die wartende Frage hinter dem Freigabefenster.
 enum DialogPrompt {
     /// `plan.exit` (Plan-Datei).
@@ -438,7 +439,7 @@ impl PlanExitDialog {
     /// Runde 5, Teil P: öffnet das Fenster in der Variante „Plan bestätigen“.
     pub(crate) fn new_confirm(prompt: PlanConfirmPrompt, now: Instant) -> Self {
         Self {
-            display_path: format!("Plan {}", prompt.plan_id()),
+            display_path: prompt.plan_id().to_owned(),
             empty: prompt.content().trim().is_empty(),
             markdown: prompt.content().to_owned(),
             confirm: Some(prompt.kind()),
@@ -502,11 +503,45 @@ impl PlanExitDialog {
 
     /// Die Optionen der gezeigten Variante; die letzte ist immer die
     /// Rückmeldung.
-    fn options(&self) -> &'static [&'static str] {
+    fn display_path_text(&self) -> String {
         if self.confirm.is_some() {
-            &CONFIRM_OPTIONS
+            tr_args(
+                "dialogs.plan_identifier",
+                "Plan {id}",
+                &[("id", &sanitize_inline(&self.display_path))],
+            )
         } else {
-            &EXIT_OPTIONS
+            sanitize_inline(&self.display_path)
+        }
+    }
+
+    fn options(&self) -> Vec<&'static str> {
+        if self.confirm.is_some() {
+            vec![
+                tr(
+                    "dialogs.plan_confirm_option",
+                    "Yes, confirm — activate the plan and track it as a Goal",
+                ),
+                tr(
+                    "dialogs.plan_reject_option",
+                    "No — feedback for the agent: ",
+                ),
+            ]
+        } else {
+            vec![
+                tr(
+                    "dialogs.plan_auto_option",
+                    "Yes, implement in auto mode (work · approval auto)",
+                ),
+                tr(
+                    "dialogs.plan_ask_option",
+                    "Yes, implement and approve changes individually (work · approval ask)",
+                ),
+                tr(
+                    "dialogs.plan_keep_option",
+                    "No, continue planning — feedback: ",
+                ),
+            ]
         }
     }
 
@@ -666,17 +701,27 @@ impl PlanExitDialog {
         let dim = style::dim_style(theme);
         let accent = plan_style(theme);
         let title = match self.confirm {
-            Some(PlanConfirmKind::NewPlan) => format!(
-                "Plan bestätigen? · {} · {}",
-                sanitize_inline(&self.display_path),
-                sanitize_inline(&self.summary)
+            Some(PlanConfirmKind::NewPlan) => tr_args(
+                "dialogs.plan_confirm_heading",
+                "Confirm plan? · {path} · {summary}",
+                &[
+                    ("path", &self.display_path_text()),
+                    ("summary", &sanitize_inline(&self.summary)),
+                ],
             ),
-            Some(PlanConfirmKind::Change) => format!(
-                "Änderung übernehmen? · {} · {}",
-                sanitize_inline(&self.display_path),
-                sanitize_inline(&self.summary)
+            Some(PlanConfirmKind::Change) => tr_args(
+                "dialogs.plan_change_heading",
+                "Apply change? · {path} · {summary}",
+                &[
+                    ("path", &self.display_path_text()),
+                    ("summary", &sanitize_inline(&self.summary)),
+                ],
             ),
-            None => format!("Plan umsetzen? · {}", sanitize_inline(&self.display_path)),
+            None => tr_args(
+                "dialogs.plan_implement_heading",
+                "Implement plan? · {path}",
+                &[("path", &self.display_path_text())],
+            ),
         };
         let mut body = vec![Line::styled(
             title,
@@ -684,7 +729,10 @@ impl PlanExitDialog {
         )];
         if self.empty {
             body.push(Line::styled(
-                "⚠ Der Plan ist leer — eine Freigabe setzt nichts Konkretes um.",
+                tr(
+                    "dialogs.plan_empty",
+                    "⚠ The plan is empty — approval implements nothing concrete.",
+                ),
                 style::warning_style(theme),
             ));
         }
@@ -702,7 +750,7 @@ impl PlanExitDialog {
                 let text = if self.editing {
                     format!("{}▏", sanitize_inline(&self.feedback))
                 } else if self.feedback.is_empty() {
-                    "(Enter, dann tippen)".to_owned()
+                    tr("dialogs.plan_feedback_placeholder", "(Enter, then type)").to_owned()
                 } else {
                     sanitize_inline(&self.feedback)
                 };
@@ -715,26 +763,53 @@ impl PlanExitDialog {
         }
         let footers: &[&str] = if !self.armed(now) {
             &[
-                "Fenster wird gleich scharf … · Bild↑/↓ scrollt · Esc schließt",
-                "gleich scharf … · Esc schließt",
+                tr(
+                    "dialogs.plan_arming",
+                    "Window ready shortly … · PgUp/Down scroll · Esc closes",
+                ),
+                tr("dialogs.plan_arming_short", "Ready shortly … · Esc closes"),
             ]
         } else if self.editing {
             &[
-                "Rückmeldung tippen · Enter senden · Shift+Enter neue Zeile · Esc zurück",
-                "Enter senden · Shift+Enter Zeile · Esc zurück",
+                tr(
+                    "dialogs.plan_feedback_footer",
+                    "Type feedback · Enter send · Shift+Enter newline · Esc back",
+                ),
+                tr(
+                    "dialogs.plan_feedback_short",
+                    "Enter send · Shift+Enter newline · Esc back",
+                ),
                 "Enter · Esc",
             ]
         } else if self.confirm.is_some() {
             &[
-                "↑↓ wählen · 1/2 direkt · Enter bestätigen · Bild↑/↓ scrollt den Plan · Esc schließt",
-                "↑↓ wählen · Enter ok · Bild↑/↓ Plan · Esc schließt",
-                "↑↓ · Enter · Bild↑/↓ · Esc",
+                tr(
+                    "dialogs.plan_confirm_footer",
+                    "↑↓ select · 1/2 direct · Enter confirm · PgUp/Down scroll plan · Esc closes",
+                ),
+                tr(
+                    "dialogs.plan_footer_short",
+                    "↑↓ select · Enter ok · PgUp/Down plan · Esc closes",
+                ),
+                tr(
+                    "dialogs.plan_footer_compact",
+                    "↑↓ · Enter · PgUp/Down · Esc",
+                ),
             ]
         } else {
             &[
-                "↑↓ wählen · 1–3 direkt · Enter bestätigen · Bild↑/↓ scrollt den Plan · Esc schließt",
-                "↑↓ wählen · Enter ok · Bild↑/↓ Plan · Esc schließt",
-                "↑↓ · Enter · Bild↑/↓ · Esc",
+                tr(
+                    "dialogs.plan_exit_footer",
+                    "↑↓ select · 1–3 direct · Enter confirm · PgUp/Down scroll plan · Esc closes",
+                ),
+                tr(
+                    "dialogs.plan_footer_short",
+                    "↑↓ select · Enter ok · PgUp/Down plan · Esc closes",
+                ),
+                tr(
+                    "dialogs.plan_footer_compact",
+                    "↑↓ · Enter · PgUp/Down · Esc",
+                ),
             ]
         };
         pinned.push(PinnedRow::content(Line::styled(
@@ -771,11 +846,11 @@ impl PlanExitDialog {
                     format!(
                         " {} · {} ",
                         if self.confirm.is_some() {
-                            "Plan zur Bestätigung"
+                            tr("dialogs.plan_confirmation_title", "Plan for confirmation")
                         } else {
-                            "Plan zur Freigabe"
+                            tr("dialogs.plan_approval_title", "Plan for approval")
                         },
-                        sanitize_inline(&self.display_path)
+                        self.display_path_text()
                     ),
                     plan_style(theme),
                 ));
@@ -790,9 +865,9 @@ impl PlanExitDialog {
             .border_style(Style::default().fg(plan_color(theme)))
             .title(Span::styled(
                 if self.confirm.is_some() {
-                    " Plan bestätigen · plan "
+                    tr("dialogs.plan_confirm_title", " Confirm plan · plan ")
                 } else {
-                    " Plan-Freigabe · plan.exit "
+                    tr("dialogs.plan_exit_title", " Plan approval · plan.exit ")
                 },
                 plan_style(theme),
             ));
@@ -903,22 +978,28 @@ impl PlanEnterDialog {
         };
         let body = vec![
             Line::styled(
-                "Der Agent schlägt vor, zuerst zu planen (Plan-Modus: nichts wird verändert).",
+                tr(
+                    "dialogs.plan_suggestion",
+                    "The agent suggests planning first (plan mode: no changes are made).",
+                ),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Line::from(vec![
-                Span::styled("Grund: ", dim),
+                Span::styled(tr("dialogs.reason_label", "Reason: "), dim),
                 Span::raw(sanitize_inline(&self.reason)),
             ]),
         ];
         let pinned = vec![
-            option(0, "Ja, in den Plan-Modus wechseln"),
-            option(1, "Nein, weiter wie bisher"),
+            option(0, tr("dialogs.plan_enter_yes", "Yes, switch to plan mode")),
+            option(1, tr("dialogs.plan_enter_no", "No, continue as before")),
             PinnedRow::content(Line::styled(
                 dialog_frame::pick_fitting(
                     &[
-                        "←→ wählen · 1/2 · Enter bestätigen · Esc = Nein",
-                        "←→ · 1/2 · Enter · Esc = Nein",
+                        tr(
+                            "dialogs.plan_enter_footer",
+                            "←→ select · 1/2 · Enter confirm · Esc = No",
+                        ),
+                        tr("dialogs.plan_enter_short", "←→ · 1/2 · Enter · Esc = No"),
                     ],
                     width,
                 ),
@@ -940,7 +1021,10 @@ impl PlanEnterDialog {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(plan_color(theme)))
             .title(Span::styled(
-                " Plan-Modus vorgeschlagen · plan.enter ",
+                tr(
+                    "dialogs.plan_enter_title",
+                    " Plan mode suggested · plan.enter ",
+                ),
                 plan_style(theme),
             ));
         let width = block.inner(area.intersection(buf.area)).width.max(1);
@@ -1348,8 +1432,8 @@ mod tests {
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
             .collect();
-        assert!(header.contains("Plan bestätigen?"), "{header}");
-        assert!(header.contains("2. Nein"), "{header}");
+        assert!(header.contains("Confirm plan?"), "{header}");
+        assert!(header.contains("2. No"), "{header}");
         assert!(!header.contains("3."), "keine dritte Option: {header}");
 
         assert_eq!(
@@ -1476,7 +1560,7 @@ mod tests {
         let session = PlanSession::new(PlanDir::new(temp.path().join(".harw/plans")), false);
         assert!(matches!(
             run_plan_command(&PlanCommand::Show, Some(&session)),
-            PlanCommandEffect::Text(text) if text.contains("Noch kein Plan")
+            PlanCommandEffect::Text(text) if text.contains("No plan")
         ));
         session
             .dir()
@@ -1516,12 +1600,12 @@ mod tests {
         assert!(span.content.contains("plan mode on (shift+tab to cycle)"));
         assert_eq!(span.style.fg, Some(plan_color(Theme::Dark)));
         let (title, _, _) = plan_composer_chrome(Theme::Light);
-        assert!(title.contains("es wird nichts verändert"));
+        assert!(title.contains("no changes are made"));
         let line = plan_placeholder_line(Theme::Dark);
         assert!(
             line.spans
                 .iter()
-                .any(|span| span.content.contains("es wird nichts verändert"))
+                .any(|span| span.content.contains("no changes are made"))
         );
     }
 }

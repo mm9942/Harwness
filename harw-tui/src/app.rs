@@ -17915,7 +17915,7 @@ forbidden = [{forbidden}]
         let dialog_rows: Vec<usize> = rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| row.contains("Ja") || row.contains("Nein (Esc)"))
+            .filter(|(_, row)| row.contains("Yes") || row.contains("No (Esc)"))
             .map(|(y, _)| y)
             .collect();
         assert!(!dialog_rows.is_empty(), "Dialogzeilen fehlen: {shown}");

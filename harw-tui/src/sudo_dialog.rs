@@ -42,6 +42,8 @@
 //! einem `Arc<Mutex<…>>`, weil der Ablauf-Zeitgeber und der Fehler-Rückruf
 //! ihn (über `Weak`) löschen können.
 
+use crate::i18n::{tr, tr_args};
+
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -223,21 +225,71 @@ struct OpenDialog {
     kind: DialogKind,
     input: PasswordBuffer,
     selected: usize,
-    notice: Option<&'static str>,
+    notice: Option<SudoNotice>,
     /// Scroll-Zustand des Körpers (Worker, Verzeichnis, Befehl, Grund).
     body_scroll: BodyScroll,
+}
+
+#[derive(Clone, Copy)]
+enum SudoNotice {
+    FullAccessPassword,
+    TooLong,
+    PasteRejected,
+    Expired,
+    EnterPassword,
+    Invalid,
+}
+
+impl SudoNotice {
+    fn text(self) -> &'static str {
+        match self {
+            Self::FullAccessPassword => tr(
+                "dialogs.sudo_need_password",
+                "Full Access: sudo requires a password (Esc cancels)",
+            ),
+            Self::TooLong => tr("dialogs.sudo_too_long", "Password too long"),
+            Self::PasteRejected => tr(
+                "dialogs.sudo_paste_rejected",
+                "Paste rejected (control characters or too long)",
+            ),
+            Self::Expired => tr(
+                "dialogs.sudo_expired",
+                "Session password expired — please enter password",
+            ),
+            Self::EnterPassword => tr(
+                "dialogs.sudo_enter_password",
+                "Please enter password (Esc denies)",
+            ),
+            Self::Invalid => tr(
+                "dialogs.sudo_invalid",
+                "Invalid password — please try again",
+            ),
+        }
+    }
 }
 
 impl OpenDialog {
     /// Beschriftungen der wählbaren Optionen.
     fn options(&self, session_allowed: bool) -> Vec<&'static str> {
         match self.kind {
-            DialogKind::Passwordless => vec!["Freigeben", "Ablehnen"],
+            DialogKind::Passwordless => vec![
+                tr("dialogs.sudo_allow", "Approve"),
+                tr("dialogs.sudo_deny", "Deny"),
+            ],
             DialogKind::RememberedSession => {
-                vec!["Freigeben (gemerktes Sitzungspasswort)", "Ablehnen"]
+                vec![
+                    tr(
+                        "dialogs.sudo_remembered_option",
+                        "Approve (remembered session password)",
+                    ),
+                    tr("dialogs.sudo_deny", "Deny"),
+                ]
             }
-            DialogKind::Password if session_allowed => vec!["Einmalig", "Für diese Sitzung"],
-            DialogKind::Password => vec!["Einmalig"],
+            DialogKind::Password if session_allowed => vec![
+                tr("dialogs.sudo_once", "Once"),
+                tr("dialogs.sudo_session", "For this session"),
+            ],
+            DialogKind::Password => vec![tr("dialogs.sudo_once", "Once")],
         }
     }
 }
@@ -498,8 +550,10 @@ impl SudoUi {
         let argv = display_argv(prompt.argv());
         if prompt.passwordless() {
             prompt.approve(SudoAnswer::ApproveOnce);
-            notices.push(format!(
-                "sudo ohne Rückfrage ausgeführt (Full Access, passwortlos): {argv}"
+            notices.push(tr_args(
+                "dialogs.sudo_full_passwordless",
+                "sudo executed without prompting (Full Access, passwordless): {argv}",
+                &[("argv", &argv)],
             ));
             return SudoFullAccessOutcome {
                 notices,
@@ -509,9 +563,7 @@ impl SudoUi {
         if let Some((secret, generation)) = self.remembered_copy(now) {
             let hook = self.failure_hook(generation);
             prompt.approve_with_failure_hook(SudoAnswer::ApproveSession { secret }, hook);
-            notices.push(format!(
-                "sudo ohne Rückfrage ausgeführt (Full Access, gemerktes Sitzungspasswort): {argv}"
-            ));
+            notices.push(tr_args("dialogs.sudo_full_remembered", "sudo executed without prompting (Full Access, remembered session password): {argv}", &[("argv", &argv)]));
             return SudoFullAccessOutcome {
                 notices,
                 opened: false,
@@ -523,7 +575,7 @@ impl SudoUi {
             kind: DialogKind::Password,
             input: PasswordBuffer::new(),
             selected: 0,
-            notice: Some("Full Access: sudo verlangt ein Passwort (Esc bricht ab)"),
+            notice: Some(SudoNotice::FullAccessPassword),
             body_scroll: BodyScroll::default(),
         });
         SudoFullAccessOutcome {
@@ -541,7 +593,11 @@ impl SudoUi {
         open.input.clear();
         let argv = display_argv(open.prompt.argv());
         open.prompt.deny();
-        Some(format!("sudo-Anfrage abgelehnt: {argv}"))
+        Some(tr_args(
+            "dialogs.sudo_rejected",
+            "sudo request denied: {argv}",
+            &[("argv", &argv)],
+        ))
     }
 
     /// Verarbeitet **jedes** Eingabeereignis, solange das Fenster offen ist.
@@ -610,7 +666,7 @@ impl SudoUi {
                 SudoEventOutcome::redraw()
             }
             KeyCode::Char(c) if open.kind == DialogKind::Password && !ctrl && !alt => {
-                open.notice = (!open.input.push_char(c)).then_some("Passwort zu lang");
+                open.notice = (!open.input.push_char(c)).then_some(SudoNotice::TooLong);
                 SudoEventOutcome::redraw()
             }
             // Alles andere wird verschluckt.
@@ -628,8 +684,7 @@ impl SudoUi {
             return SudoEventOutcome::default();
         }
         let trimmed = text.trim_end_matches(['\r', '\n']);
-        open.notice = (!open.input.push_str(trimmed))
-            .then_some("Einfügen abgelehnt (Steuerzeichen oder zu lang)");
+        open.notice = (!open.input.push_str(trimmed)).then_some(SudoNotice::PasteRejected);
         SudoEventOutcome::redraw()
         // `text` wird hier genullt (Drop).
     }
@@ -645,30 +700,44 @@ impl SudoUi {
             DialogKind::Passwordless => {
                 if open.selected != 0 {
                     open.prompt.deny();
-                    return SudoEventOutcome::closed(format!("sudo-Anfrage abgelehnt: {argv}"));
+                    return SudoEventOutcome::closed(tr_args(
+                        "dialogs.sudo_rejected",
+                        "sudo request denied: {argv}",
+                        &[("argv", &argv)],
+                    ));
                 }
                 open.prompt.approve(SudoAnswer::ApproveOnce);
-                SudoEventOutcome::closed(format!("sudo freigegeben (passwortlos): {argv}"))
+                SudoEventOutcome::closed(tr_args(
+                    "dialogs.sudo_approved_passwordless",
+                    "sudo approved (passwordless): {argv}",
+                    &[("argv", &argv)],
+                ))
             }
             DialogKind::RememberedSession => {
                 if open.selected != 0 {
                     open.prompt.deny();
-                    return SudoEventOutcome::closed(format!("sudo-Anfrage abgelehnt: {argv}"));
+                    return SudoEventOutcome::closed(tr_args(
+                        "dialogs.sudo_rejected",
+                        "sudo request denied: {argv}",
+                        &[("argv", &argv)],
+                    ));
                 }
                 match self.remembered_copy(now) {
                     Some((secret, generation)) => {
                         let hook = self.failure_hook(generation);
                         open.prompt
                             .approve_with_failure_hook(SudoAnswer::ApproveSession { secret }, hook);
-                        SudoEventOutcome::closed(format!(
-                            "sudo freigegeben (Sitzungspasswort): {argv}"
+                        SudoEventOutcome::closed(tr_args(
+                            "dialogs.sudo_approved_session",
+                            "sudo approved (session password): {argv}",
+                            &[("argv", &argv)],
                         ))
                     }
                     None => {
                         // Inzwischen abgelaufen: zurück zur Passworteingabe.
                         open.kind = DialogKind::Password;
                         open.selected = 0;
-                        open.notice = Some("Sitzungspasswort abgelaufen — bitte Passwort eingeben");
+                        open.notice = Some(SudoNotice::Expired);
                         self.open = Some(open);
                         SudoEventOutcome::redraw()
                     }
@@ -676,7 +745,7 @@ impl SudoUi {
             }
             DialogKind::Password => {
                 if open.input.is_empty() {
-                    open.notice = Some("Bitte Passwort eingeben (Esc lehnt ab)");
+                    open.notice = Some(SudoNotice::EnterPassword);
                     self.open = Some(open);
                     return SudoEventOutcome::redraw();
                 }
@@ -684,7 +753,7 @@ impl SudoUi {
                     Ok(secret) => secret,
                     Err(_) => {
                         open.input.clear();
-                        open.notice = Some("Passwort ungültig — bitte erneut eingeben");
+                        open.notice = Some(SudoNotice::Invalid);
                         self.open = Some(open);
                         return SudoEventOutcome::redraw();
                     }
@@ -699,15 +768,21 @@ impl SudoUi {
                         },
                         hook,
                     );
-                    SudoEventOutcome::closed(format!(
-                        "sudo freigegeben (für diese Sitzung gemerkt): {argv}"
+                    SudoEventOutcome::closed(tr_args(
+                        "dialogs.sudo_approved_remember",
+                        "sudo approved (remembered for this session): {argv}",
+                        &[("argv", &argv)],
                     ))
                 } else {
                     open.prompt.approve(SudoAnswer::Password {
                         secret,
                         remember: false,
                     });
-                    SudoEventOutcome::closed(format!("sudo freigegeben (einmalig): {argv}"))
+                    SudoEventOutcome::closed(tr_args(
+                        "dialogs.sudo_approved_once",
+                        "sudo approved (once): {argv}",
+                        &[("argv", &argv)],
+                    ))
                 }
             }
         }
@@ -751,46 +826,64 @@ impl SudoUi {
         let dim = style::dim_style(theme);
         let body = vec![
             Line::styled(
-                format!(
-                    "Worker: {} · Sitzung: {}",
-                    sanitize_inline(prompt.worker()),
-                    sanitize_inline(prompt.session())
+                tr_args(
+                    "dialogs.sudo_worker",
+                    "Worker: {worker} · Session: {session}",
+                    &[
+                        ("worker", &sanitize_inline(prompt.worker())),
+                        ("session", &sanitize_inline(prompt.session())),
+                    ],
                 ),
                 dim,
             ),
-            Line::from(format!(
-                "Verzeichnis: {}",
-                sanitize_reveal_inline(&prompt.cwd().display().to_string())
+            Line::from(tr_args(
+                "dialogs.sudo_directory",
+                "Directory: {path}",
+                &[(
+                    "path",
+                    &sanitize_reveal_inline(&prompt.cwd().display().to_string()),
+                )],
             )),
             Line::from(vec![
-                Span::raw("Befehl (als root): "),
+                Span::raw(tr("dialogs.sudo_command_label", "Command (as root): ")),
                 Span::styled(
                     sanitize_reveal_inline(&display_argv(prompt.argv())),
                     style::warning_style(theme),
                 ),
             ]),
-            Line::from(format!(
-                "Grund: {}",
-                sanitize_reveal_inline(prompt.reason())
+            Line::from(tr_args(
+                "dialogs.sudo_reason",
+                "Reason: {reason}",
+                &[("reason", &sanitize_reveal_inline(prompt.reason()))],
             )),
         ];
         let mut pinned = vec![PinnedRow::padding()];
         match open.kind {
             DialogKind::Passwordless => pinned.push(PinnedRow::content(Line::styled(
-                "Passwortloses sudo — keine Passworteingabe nötig.",
+                tr(
+                    "dialogs.sudo_passwordless",
+                    "Passwordless sudo — no password input needed.",
+                ),
                 dim,
             ))),
             DialogKind::RememberedSession => pinned.push(PinnedRow::content(Line::styled(
-                "Gemerktes Sitzungspasswort wird verwendet (jeder Befehl braucht diese Freigabe).",
+                tr(
+                    "dialogs.sudo_remembered",
+                    "Using remembered session password (each command requires this approval).",
+                ),
                 dim,
             ))),
             DialogKind::Password => {
                 let shown = if open.input.is_empty() {
-                    "(leer)"
+                    tr("dialogs.sudo_empty", "(empty)")
                 } else {
                     MASK
                 };
-                pinned.push(PinnedRow::content(format!("Passwort: {shown}")));
+                pinned.push(PinnedRow::content(tr_args(
+                    "dialogs.sudo_password",
+                    "Password: {mask}",
+                    &[("mask", shown)],
+                )));
             }
         }
         let mut options: Vec<Span<'static>> = Vec::new();
@@ -809,23 +902,32 @@ impl SudoUi {
         pinned.push(PinnedRow::content(Line::from(options)));
         if let Some(notice) = open.notice {
             pinned.push(PinnedRow::content(Line::styled(
-                notice,
+                notice.text(),
                 style::warning_style(theme),
             )));
         }
         let footer = if now.saturating_duration_since(open.shown_at) < SUDO_ARMING_DELAY {
             dialog_frame::pick_fitting(
                 &[
-                    "Fenster wird gleich scharf … · Esc/Ctrl+C lehnt ab",
-                    "gleich scharf … · Esc lehnt ab",
+                    tr(
+                        "dialogs.sudo_arming",
+                        "Window ready shortly … · Esc/Ctrl+C denies",
+                    ),
+                    tr("dialogs.sudo_arming_short", "Ready shortly … · Esc denies"),
                 ],
                 width,
             )
         } else {
             dialog_frame::pick_fitting(
                 &[
-                    "Enter bestätigen · Tab/←→ wählen · Esc/Ctrl+C ablehnen",
-                    "Enter ok · Tab wählen · Esc ablehnen",
+                    tr(
+                        "dialogs.sudo_footer",
+                        "Enter confirm · Tab/←→ select · Esc/Ctrl+C deny",
+                    ),
+                    tr(
+                        "dialogs.sudo_footer_short",
+                        "Enter ok · Tab select · Esc deny",
+                    ),
                     "Enter · Tab · Esc",
                 ],
                 width,
@@ -863,7 +965,7 @@ impl SudoUi {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(style::warning_style(theme))
-            .title(" sudo-Freigabe · Root-Befehl ");
+            .title(tr("dialogs.sudo_title", " sudo approval · Root command "));
         let inner_width = block.inner(area.intersection(buf.area)).width.max(1);
         let Some(content) = self.content(theme, Instant::now(), inner_width) else {
             return false;
@@ -887,6 +989,12 @@ impl SudoUi {
 /// # Rückgabe
 /// `true`, wenn neu gezeichnet werden soll.
 pub(crate) fn accept_prompt(app: &mut ChatApp, maybe_prompt: Option<SudoPrompt>) -> bool {
+    crate::i18n::with_language(app.interface_language(), || {
+        accept_prompt_scoped(app, maybe_prompt)
+    })
+}
+
+fn accept_prompt_scoped(app: &mut ChatApp, maybe_prompt: Option<SudoPrompt>) -> bool {
     match maybe_prompt {
         Some(prompt) => {
             // Nutzerentscheidung 2026-09-24: unter „Full Access" keine
@@ -933,6 +1041,10 @@ pub(crate) fn accept_prompt(app: &mut ChatApp, maybe_prompt: Option<SudoPrompt>)
 /// # Rückgabe
 /// `true`, wenn neu gezeichnet werden soll.
 pub(crate) fn route_event(app: &mut ChatApp, event: TuiEvent) -> bool {
+    crate::i18n::with_language(app.interface_language(), || route_event_scoped(app, event))
+}
+
+fn route_event_scoped(app: &mut ChatApp, event: TuiEvent) -> bool {
     let outcome = app.sudo.handle_event(event, Instant::now());
     if let Some(notice) = outcome.notice {
         app.push_line(Role::System, notice);
@@ -945,6 +1057,10 @@ pub(crate) fn route_event(app: &mut ChatApp, event: TuiEvent) -> bool {
 /// # Rückgabe
 /// `true`, wenn ein Fenster offen war.
 pub(crate) fn deny_open(app: &mut ChatApp) -> bool {
+    crate::i18n::with_language(app.interface_language(), || deny_open_scoped(app))
+}
+
+fn deny_open_scoped(app: &mut ChatApp) -> bool {
     match app.sudo.deny_open() {
         Some(notice) => {
             app.push_line(Role::System, notice);
@@ -1141,7 +1257,7 @@ mod tests {
             .as_ref()
             .map(|open| open.options(ui.session_allowed()))
             .unwrap_or_default();
-        assert_eq!(options, vec!["Einmalig"]);
+        assert_eq!(options, vec!["Once"]);
     }
 
     #[tokio::test]
@@ -1281,6 +1397,61 @@ mod tests {
         assert!(!rendered.contains("geheim"), "{rendered}");
         assert!(rendered.contains(MASK), "{rendered}");
         assert!(ui.desired_height(80, theme).is_some());
+    }
+
+    #[test]
+    fn cached_notice_and_options_follow_render_locale_without_exposing_secret() {
+        use crate::i18n::{tr_for, with_language};
+        use harw_config::UiLanguage;
+
+        let (sudo_prompt, _answer) = prompt(false);
+        let shown = Instant::now();
+        let mut ui = SudoUi::new(None, DEFAULT_SUDO_SESSION);
+        with_language(UiLanguage::German, || {
+            ui.open(sudo_prompt, shown);
+            ui.handle_event(key(KeyCode::Enter), armed_now(shown));
+        });
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                let content = ui
+                    .content(style::Theme::Dark, armed_now(shown), 120)
+                    .unwrap_or_default();
+                let text = content
+                    .body
+                    .iter()
+                    .map(ToString::to_string)
+                    .chain(content.pinned.iter().map(|row| row.line.to_string()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    text.contains(tr_for(
+                        language,
+                        "dialogs.sudo_enter_password",
+                        "Please enter password (Esc denies)"
+                    )),
+                    "{language:?}: {text}"
+                );
+                assert!(text.contains("Werkzeug fehlt"), "reason is payload: {text}");
+                assert!(text.contains("apt-get install ripgrep"));
+                assert_eq!(ui.open.as_ref().map(|open| open.selected), Some(0));
+                for width in [1, 8, 20, 80] {
+                    let area = Rect::new(0, 0, width, 14);
+                    let mut buffer = Buffer::empty(area);
+                    assert!(ui.render(area, &mut buffer, style::Theme::Dark));
+                }
+            });
+        }
+        type_password(&mut ui, armed_now(shown), PASSWORD);
+        let area = Rect::new(0, 0, 80, 14);
+        let mut buffer = Buffer::empty(area);
+        ui.render(area, &mut buffer, style::Theme::Dark);
+        let text: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!text.contains(PASSWORD));
+        assert!(text.contains(MASK));
     }
 
     #[test]
