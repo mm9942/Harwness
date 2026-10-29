@@ -25,6 +25,13 @@ TUI text is largely hard-coded German. There is no locale field or `/settings` s
 
 Localization uses stable catalog keys, complete parameterized messages, English fallback and catalog/placeholder validation. Keep locale session-specific. Explicit locale parameters are preferred for new components; existing synchronous rendering/event paths may use a tightly scoped thread-local locale helper with restoration on exit/panic, never a process-global mutable locale or a guard spanning await. This allows incremental migration of numerous existing view APIs without mixing locales across concurrently running sessions. Document and test this tradeoff. Locale changes redraw chrome immediately and affect future notices; historical content is preserved.
 
+## Builder-check resolutions
+
+- Async command helpers and background fetches capture/pass an explicit UiLanguage; only individual synchronous formatting/rendering closures use scoped locale. Test interleaved asynchronous sessions.
+- Serialize read-modify-write config access using a cooperating ConfigWriter file lock (return a clear busy/conflict error rather than block indefinitely). New settings mutation holds its ordering boundary through live publication. Compute/validate the post-reset resolved value before committing. Atomic rename alone is not concurrency control; external editors that ignore locks remain outside this guarantee.
+- Rebuild cached command summaries/popup labels when language changes. Inventory generated activation feedback; add structured presentation where needed instead of translating arbitrary operation text.
+- Only the new interface preference allowlist targets the active profile. Delegated model/mode/approval controls preserve their existing scopes and display them explicitly; they are not generic `/settings set` keys.
+
 ## Ownership and sequence
 
 1. Config language schema/scope/merge and validated settings backend.

@@ -34,14 +34,14 @@
 
 ### Task 1: Typed locale and validated settings operations
 
-**Files:** modify `harw-config/src/harness_config.rs`, `harw-config/src/lib.rs`, `harw-config/src/scope.rs`, `harw-config/src/merge.rs` and directly affected tests; create `harw-ops/src/settings.rs`; register in `harw-ops/src/lib.rs`; adjust live configuration/persistence helpers only as needed.
+**Files:** modify `harw-config/src/harness_config.rs`, `harw-config/src/lib.rs`, `harw-config/src/scope.rs`, `harw-config/src/merge.rs` and `harw-config/src/writer.rs` plus directly affected tests; create `harw-ops/src/settings.rs`; register in `harw-ops/src/lib.rs`; adjust live configuration/persistence helpers only as needed.
 
 **Interfaces:** export `harw_config::UiLanguage` (Copy/Default/Eq/serde, English default) with `as_str()`, `native_name()`, `ALL` and strict parsing. Add `TuiSection.language`. Register operator command `/settings show|set <key> <value>|reset <key>` without model tool exposure. Supported editable keys: `tui.language`, `tui.theme`, `tui.reasoning`, `tui.child_stream`, `tui.status_expiry`. `show` returns allowlisted `OpOutput.data` containing language and rows with `key`, `value`, `choices`, `scope`=`profile`, `apply`=`now`; values are stable config tokens. Include safe model/navigation summaries only if needed by Task 3; no arbitrary config serialization. Reset removes the selected override and correctly recomputes its inherited/default live value.
 
 - [ ] Add focused tests for English default, all codes round-trip, unsupported code refusal, profile-only scope/merge and missing-field backwards compatibility.
 - [ ] Implement enum, field and merge/scope wiring; update schema field counts as actually required.
 - [ ] Add settings operation tests for typed validation, reset/inheritance, active profile isolation, unrelated TOML/comment preservation, failure atomicity and no secret fields/model exposure.
-- [ ] Implement fresh-read validated persistence and live mirroring after successful save; serialize competing settings writes and document existing cross-writer limitations rather than inventing guarantees.
+- [ ] Implement fresh-read validated persistence and live mirroring after successful save; add a cooperating ConfigWriter file lock with clear busy/conflict failure (no indefinite blocking), hold new-setting serialization through live publication, and prepare the resolved reset result before committing. Test competing writers; external editors ignoring the lock are outside the guarantee.
 - [ ] Run focused config/settings tests, diff/format checks; commit and report exact commands and remaining integration needs.
 
 ### Task 2: Localization infrastructure and catalog contract
@@ -59,12 +59,12 @@
 
 **Files:** create `harw-tui/src/settings_view.rs`; modify `local_commands.rs`, `command_catalog.rs`, `app.rs`, `runtime_root.rs`, `overlay_view.rs` as needed, `style.rs`, appropriate app submodules and settings locale catalog.
 
-**Interfaces:** SettingsView implements OverlayView, reads `/settings show`, sends `/settings set|reset` and delegates model/effort/mode/permissions to existing local/action commands. ChatApp holds current UiLanguage and establishes only synchronous locale scopes around rendering/input/event handling; refreshes display preferences from current_config after successful settings operations. Existing constructors/default fixtures remain English by default. Provide explicit profile/apply timing and native language names.
+**Interfaces:** SettingsView implements OverlayView, reads `/settings show`, sends `/settings set|reset` and delegates model/effort/mode/permissions to existing local/action commands. ChatApp holds current UiLanguage and establishes only synchronous locale scopes around rendering/input/event handling; refreshes display preferences from current_config after successful settings operations, rebuilds cached command summaries/popups, and passes captured locale explicitly across async command/fetch helpers. Existing constructors/default fixtures remain English by default. Provide explicit profile/apply timing and native language names.
 
 - [ ] Add interaction tests for open/navigate/edit/cancel/reset/refresh and safe command generation; numeric/text editors only for supported settings.
 - [ ] Implement categories Interface, Models, Behavior/Approvals and safe provider navigation. Use existing pickers rather than duplicating model admission.
 - [ ] Wire language, configured theme, reasoning, child stream and status expiry to actual live consumers; preserve transcript text during changes.
-- [ ] Test persistence reopening, two differently localized apps, narrow widths, busy/fixed-agent model behavior and no secret output.
+- [ ] Test persistence reopening, two differently localized apps with interleaved async completions, narrow widths, busy/fixed-agent model behavior and no secret output.
 - [ ] Run focused overlay/config-consumer tests and relevant operation integration checks; commit and report.
 
 ### Task 4: Localize dialogs, pickers, help and setup
