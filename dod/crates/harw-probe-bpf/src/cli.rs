@@ -72,7 +72,10 @@ pub struct Cli {
     pub sensor_id_flow: String,
 
     /// Root of the cgroup-v2 hierarchy. It exists only for an administrative
-    /// test mount; the profile paths remain mount-relative.
+    /// test mount; the profile paths remain mount-relative. Read only for a
+    /// cgroup-scoped profile: it must then be absolute, not `/` and without
+    /// `..`, and with `include_descendants = true` it becomes the one
+    /// list-only Landlock root of the descendant rescan.
     #[arg(long, value_name = "DIR", default_value = DEFAULT_CGROUP_ROOT)]
     pub cgroup_root: PathBuf,
 

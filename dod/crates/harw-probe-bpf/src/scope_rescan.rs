@@ -27,17 +27,54 @@
 //! grow every round. A persisting condition therefore never repeats every
 //! interval, and is never silent either.
 //!
+//! # Partial updates across handles (PR #154 review, P1)
+//! One round applies its delta to several handles (every object of every
+//! wire sensor). When one handle rejects the update while another accepts
+//! it, the round is not committed, so the tracked scope no longer describes
+//! the maps: the accepting handle may hold an id the tracker never recorded
+//! (or lack one it still tracks), and the rejecting handle may hold any
+//! prefix of its delta (the real loader keeps entries applied before a
+//! kernel error). Replanning from the tracker alone would never revisit such
+//! an id once its cgroup changed again (for example, a new descendant that
+//! disappears before the retry would stay in the accepting handle's map for
+//! the rest of the process, while the health already reports recovery).
+//!
+//! [`ScopeRescan`] therefore keeps, per handle, the ids whose presence in
+//! that handle's map may differ from the tracked scope. Every later round
+//! adds a reconciliation to that handle's delta: each such id is inserted
+//! when the round's target set contains it and removed otherwise (both
+//! operations are idempotent, so an unknown partial state converges). The
+//! set of a handle is cleared only when a round is committed, i.e. when
+//! every handle accepted its delta; until then the round counts as
+//! `apply_failed`, so recovery is reported only after every handle's map
+//! matches the tracked scope.
+//!
+//! # Roots missing at start
+//! A configured root that did not resolve when the probe started
+//! (`crate::profile::resolve_scope`) has no kernel id and is therefore not
+//! part of the tracked scope. It is never re-resolved later (a cgroup created
+//! under that path afterwards is not silently admitted, see
+//! `harw_dod_config`), but it is not forgotten either:
+//! [`ScopeRescan::with_startup`] carries the count into every round's
+//! [`ScopeHealth::roots_unavailable`], so the scope stays degraded for the
+//! lifetime of the process and never logs a false recovery. The startup
+//! health is also the baseline of the first round: a start that was already
+//! degraded (and reported once by `main::run`) is not reported again.
+//!
 //! # Privileges
 //! No new capability: the walk needs `lstat` and directory listing on the
 //! cgroup2 mount (`--cgroup-root`), the map update uses the object the probe
-//! already holds. The Landlock ruleset of this probe is unchanged by this
-//! module (see `crate::landlock`); it does **not** contain the cgroup2 mount
-//! today, so a rescan after `restrict_self` sees `EACCES`, which surfaces as
-//! an incomplete (degraded) round and never retires an id.
+//! already holds. Because this rescan runs after `restrict_self`, `main::run`
+//! adds `--cgroup-root` to the Landlock ruleset as a list-only root
+//! (`crate::landlock::RootAccess::ListDirectories`) whenever a descendant
+//! scope is active, and only then; see `crate::landlock`. Should listing
+//! still fail (`EACCES`), the round is incomplete (degraded) and never
+//! retires an id.
 //!
 //! # Concurrency
 //! Owned and driven by the single collect thread (`main::collect_forever`).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -64,6 +101,9 @@ pub struct ScopeRescanStats {
     pub incomplete_rounds: u64,
     /// Rounds in which at least one map update was rejected.
     pub apply_failures: u64,
+    /// Handles whose map may still differ from the tracked scope after the
+    /// last round (see the module docs, "Partial updates across handles").
+    pub divergent_handles: usize,
     /// Ids currently installed (roots plus descendants).
     pub installed: usize,
     /// Map entries this scope may occupy.
@@ -81,7 +121,8 @@ pub struct ScopeHealth {
     pub roots_unavailable: usize,
     /// The walk was incomplete (I/O error or entry budget exhausted).
     pub incomplete: bool,
-    /// A map update was rejected; the round was not committed.
+    /// A map update was rejected; the round was not committed and at least
+    /// one handle's map may still differ from the tracked scope.
     pub apply_failed: bool,
 }
 
@@ -120,6 +161,13 @@ pub struct ScopeRescan {
     next_due: Instant,
     stats: ScopeRescanStats,
     last_health: ScopeHealth,
+    /// Configured roots that did not resolve at start; counted as
+    /// unavailable in every round.
+    unresolved_roots: usize,
+    /// Per handle (`BpfHandle::id`): ids whose presence in that handle's map
+    /// may differ from `scope.installed_ids()`, because an uncommitted round
+    /// changed (or failed to change) them. Empty after every committed round.
+    divergent: BTreeMap<u64, BTreeSet<u64>>,
 }
 
 impl ScopeRescan {
@@ -147,7 +195,25 @@ impl ScopeRescan {
             limits,
             stats,
             last_health: ScopeHealth::default(),
+            unresolved_roots: 0,
+            divergent: BTreeMap::new(),
         }
+    }
+
+    /// Carries the attach-time state into the rescan.
+    ///
+    /// - `unresolved_roots`: configured roots that did not resolve at start.
+    ///   They are added to [`ScopeHealth::roots_unavailable`] of every round,
+    ///   so the scope never reports itself fully observed while part of the
+    ///   profile is missing (see the module docs, "Roots missing at start").
+    /// - `startup`: the health of the attach-time expansion. It is the
+    ///   baseline of the first round, so a degradation the caller already
+    ///   reported at start is not reported again as `newly_degraded`.
+    #[must_use]
+    pub fn with_startup(mut self, unresolved_roots: usize, startup: ScopeHealth) -> Self {
+        self.unresolved_roots = unresolved_roots;
+        self.last_health = startup;
+        self
     }
 
     /// Runs [`Self::rescan`] when the interval has elapsed.
@@ -161,9 +227,15 @@ impl ScopeRescan {
     }
 
     /// Walks, plans, applies the delta to every handle and commits it when
-    /// every handle accepted it. A rejected update leaves the tracked scope
-    /// unchanged, so the next round plans (and re-applies, idempotently) the
-    /// same change.
+    /// every handle accepted it.
+    ///
+    /// Each handle receives the planned delta plus the reconciliation of the
+    /// ids that an earlier, uncommitted round left uncertain in its map (see
+    /// the module docs, "Partial updates across handles"). A rejected update
+    /// leaves the tracked scope unchanged, so the next round plans (and
+    /// re-applies, idempotently) the same change, and records per handle
+    /// which ids may now differ from the tracked scope, so the next round
+    /// converges them even when the cgroups changed in between.
     pub fn rescan(
         &mut self,
         writer: &dyn BpfScopeWriter,
@@ -181,29 +253,35 @@ impl ScopeRescan {
         let delta = plan.delta.clone();
         let overflowed = plan.overflowed;
 
-        let mut apply_failed = false;
-        if !delta.is_empty() {
-            for handle in handles {
-                if let Err(error) = writer.apply_scope_delta(handle, &delta) {
-                    apply_failed = true;
-                    tracing::debug!(
-                        attach_point = handle.attach_point(),
-                        error = %error,
-                        "bpf scope map update rejected; retrying in the next rescan"
-                    );
-                }
-            }
-        }
+        let outcome = self.apply_to_handles(writer, handles, &delta);
+        let mut apply_failed = outcome.failed > 0;
         if !apply_failed && self.scope.commit(plan).is_err() {
             // Kann nicht eintreten (der Plan stammt aus genau diesem Zustand);
-            // sicherheitshalber wie eine abgelehnte Aktualisierung behandeln.
+            // sicherheitshalber wie eine abgelehnte Aktualisierung behandeln:
+            // jeder Griff trägt dann die Plan-Änderung, der Tracker nicht.
             apply_failed = true;
+        }
+        self.divergent = if apply_failed {
+            outcome.divergent
+        } else {
+            BTreeMap::new()
+        };
+        self.stats.divergent_handles = self.divergent.len();
+        if outcome.reconciled > 0 {
+            tracing::debug!(
+                reconciled = outcome.reconciled,
+                failed_handles = outcome.failed,
+                divergent_handles = self.stats.divergent_handles,
+                "bpf scope maps reconciled after an earlier partial update"
+            );
         }
 
         let health = ScopeHealth {
             overflowed,
             depth_limited: report.depth_limited,
-            roots_unavailable: report.roots_unavailable,
+            roots_unavailable: report
+                .roots_unavailable
+                .saturating_add(self.unresolved_roots),
             incomplete: !report.observation.complete,
             apply_failed,
         };
@@ -217,6 +295,72 @@ impl ScopeRescan {
             health,
             newly_degraded,
         }
+    }
+
+    /// Applies `planned` plus each handle's reconciliation to every handle.
+    ///
+    /// # Returns
+    /// The number of rejected updates, the number of reconciliation entries
+    /// sent, and the per-handle divergence that holds **if this round is not
+    /// committed**: a handle that accepted its delta now matches the plan's
+    /// target, so it differs from the (uncommitted) tracked scope exactly in
+    /// the planned ids; a handle that rejected it may hold any part of it,
+    /// so every id it was sent stays uncertain.
+    fn apply_to_handles(
+        &self,
+        writer: &dyn BpfScopeWriter,
+        handles: &[&BpfHandle],
+        planned: &ScopeDelta,
+    ) -> ApplyOutcome {
+        let planned_ids: BTreeSet<u64> = planned
+            .insert
+            .iter()
+            .chain(&planned.remove)
+            .copied()
+            .collect();
+        // Zielmenge dieser Runde, nur gebraucht, wenn ein Griff abweicht.
+        let target: BTreeSet<u64> = if self.divergent.is_empty() {
+            BTreeSet::new()
+        } else {
+            let mut target = self.scope.installed_ids();
+            for id in &planned.remove {
+                target.remove(id);
+            }
+            target.extend(planned.insert.iter().copied());
+            target
+        };
+
+        let mut outcome = ApplyOutcome::default();
+        for handle in handles {
+            let uncertain = self.divergent.get(&handle.id());
+            let (delta, reconciled) = handle_delta(planned, &planned_ids, uncertain, &target);
+            outcome.reconciled = outcome.reconciled.saturating_add(reconciled);
+            if delta.is_empty() {
+                continue;
+            }
+            match writer.apply_scope_delta(handle, &delta) {
+                Ok(()) => {
+                    if !planned_ids.is_empty() {
+                        outcome.divergent.insert(handle.id(), planned_ids.clone());
+                    }
+                }
+                Err(error) => {
+                    outcome.failed = outcome.failed.saturating_add(1);
+                    let sent: BTreeSet<u64> =
+                        delta.insert.iter().chain(&delta.remove).copied().collect();
+                    outcome.divergent.insert(handle.id(), sent);
+                    tracing::debug!(
+                        attach_point = handle.attach_point(),
+                        error = %error,
+                        inserts = delta.insert.len(),
+                        removals = delta.remove.len(),
+                        reconciled,
+                        "bpf scope map update rejected; reconciling in the next rescan"
+                    );
+                }
+            }
+        }
+        outcome
     }
 
     /// Updates the cumulative counters for one round.
@@ -276,6 +420,7 @@ impl ScopeRescan {
                 incomplete_rounds = stats.incomplete_rounds,
                 apply_failed = health.apply_failed,
                 apply_failures = stats.apply_failures,
+                divergent_handles = stats.divergent_handles,
                 installed = stats.installed,
                 capacity = stats.capacity,
                 "bpf cgroup scope degraded: part of the profile scope is not observed"
@@ -292,6 +437,52 @@ impl ScopeRescan {
     }
 }
 
+/// What [`ScopeRescan::apply_to_handles`] did in one round.
+#[derive(Debug, Default)]
+struct ApplyOutcome {
+    /// Handles that rejected their update.
+    failed: usize,
+    /// Reconciliation entries sent in addition to the planned delta.
+    reconciled: usize,
+    /// The per-handle divergence if the round is not committed.
+    divergent: BTreeMap<u64, BTreeSet<u64>>,
+}
+
+/// The delta one handle needs in this round.
+///
+/// # Description
+/// `planned` plus, for every `uncertain` id that `planned` does not already
+/// cover, an insertion when `target` (the round's installed set after the
+/// plan) contains it and a removal otherwise. `planned` never touches a
+/// root and a root is always in `target`, so a root is never removed here.
+/// The result passes `ScopeDelta::validate` whenever `planned` does: the
+/// added ids are distinct, not in `planned`, and split by `target` into
+/// insertions and removals.
+///
+/// # Returns
+/// The delta and the number of reconciliation entries added.
+fn handle_delta(
+    planned: &ScopeDelta,
+    planned_ids: &BTreeSet<u64>,
+    uncertain: Option<&BTreeSet<u64>>,
+    target: &BTreeSet<u64>,
+) -> (ScopeDelta, usize) {
+    let mut delta = planned.clone();
+    let mut reconciled = 0usize;
+    for id in uncertain.into_iter().flatten() {
+        if planned_ids.contains(id) {
+            continue;
+        }
+        if target.contains(id) {
+            delta.insert.push(*id);
+        } else {
+            delta.remove.push(*id);
+        }
+        reconciled = reconciled.saturating_add(1);
+    }
+    (delta, reconciled)
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -306,7 +497,7 @@ mod tests {
     };
     use harw_types::SensorId;
 
-    use super::{SCOPE_RESCAN_INTERVAL, ScopeRescan};
+    use super::{SCOPE_RESCAN_INTERVAL, ScopeHealth, ScopeRescan};
     use crate::test_support::{TestError, TestResult, ctx};
 
     /// Gefälschter cgroup-Baum unter einem Tempdir, wie die Sonde ihn über
@@ -402,6 +593,18 @@ mod tests {
             let handles: Vec<&BpfHandle> = self.handles.iter().collect();
             let now = self.start + SCOPE_RESCAN_INTERVAL * 10;
             self.rescan.rescan(&self.loader, &handles, now)
+        }
+
+        /// Inhalt der Scope-Map jedes Objekts, in Ladereihenfolge.
+        fn maps(&self) -> TestResult<Vec<BTreeSet<u64>>> {
+            self.handles
+                .iter()
+                .map(|handle| {
+                    self.loader
+                        .scope_ids(handle)
+                        .ok_or(TestError::Missing("map"))
+                })
+                .collect()
         }
 
         /// Inhalt der Scope-Map; beide Objekte müssen denselben tragen.
@@ -539,6 +742,93 @@ mod tests {
         Ok(())
     }
 
+    /// PR #154 (P1): das erste von zwei Objekten lehnt die Aktualisierung ab,
+    /// das zweite fügt den neuen Nachfahren ein. Verschwindet die cgroup vor
+    /// dem nächsten Versuch, plant der Tracker nichts mehr für sie — die
+    /// Kennung muss trotzdem aus der zweiten Map verschwinden, und eine
+    /// Erholung wird erst gemeldet, wenn beide Maps übereinstimmen.
+    #[test]
+    fn partial_insert_converges_when_the_descendant_vanishes_before_the_retry() -> TestResult {
+        let tree = FakeTree::new()?;
+        let root = tree.id("/harw.slice")?;
+        let mut probe = Probe::attach(&tree, MAX_SCOPE_CGROUP_IDS)?;
+        let job = tree.mkcg("/harw.slice/harw-job-1")?;
+
+        probe.loader.fail_next_scope_updates(1);
+        let failed = probe.rescan();
+        assert_eq!(failed.delta.insert, vec![job]);
+        assert!(failed.health.apply_failed);
+        assert!(failed.newly_degraded);
+        assert_eq!(
+            probe.maps()?,
+            vec![BTreeSet::from([root]), BTreeSet::from([root, job])],
+            "the second handle accepted the uncommitted insert"
+        );
+        assert_eq!(probe.rescan.stats.divergent_handles, 2);
+
+        tree.rmcg("/harw.slice/harw-job-1")?;
+        // Auch der Abgleich kann scheitern: dann bleibt der Scope degradiert.
+        probe.loader.fail_next_scope_updates(1);
+        let still = probe.rescan();
+        assert!(still.delta.is_empty(), "the tracker never recorded the id");
+        assert!(still.health.apply_failed);
+        assert!(
+            !still.newly_degraded,
+            "a persisting failure is reported once"
+        );
+        assert_eq!(probe.rescan.stats.divergent_handles, 1);
+
+        let converged = probe.rescan();
+        assert!(converged.delta.is_empty());
+        assert!(!converged.health.is_degraded());
+        assert_eq!(probe.map()?, BTreeSet::from([root]));
+        assert_eq!(probe.rescan.scope.installed_ids(), BTreeSet::from([root]));
+        assert_eq!(probe.rescan.stats.divergent_handles, 0);
+        assert_eq!(probe.rescan.stats.inserted_total, 0);
+        Ok(())
+    }
+
+    /// Gegenstück zum Einfügen: das erste Objekt lehnt das Zurückziehen ab,
+    /// das zweite zieht die Kennung zurück. Taucht dieselbe cgroup (gleiche
+    /// Kennung) vor dem nächsten Versuch wieder auf, ist der Plan leer — die
+    /// zweite Map muss die Kennung trotzdem zurückbekommen.
+    #[test]
+    fn partial_removal_converges_when_the_descendant_is_observed_again() -> TestResult {
+        let tree = FakeTree::new()?;
+        let root = tree.id("/harw.slice")?;
+        let job = tree.mkcg("/harw.slice/harw-job-1")?;
+        let mut probe = Probe::attach(&tree, MAX_SCOPE_CGROUP_IDS)?;
+        assert_eq!(probe.map()?, BTreeSet::from([root, job]));
+
+        // Aus dem Wurzelbaum verschoben (gleiche Kennung): eine vollständige
+        // Runde plant das Zurückziehen.
+        let inside = host_path(tree.root(), "/harw.slice/harw-job-1");
+        let parked = host_path(tree.root(), "/parked");
+        std::fs::rename(&inside, &parked).map_err(ctx("park the descendant"))?;
+        probe.loader.fail_next_scope_updates(1);
+        let failed = probe.rescan();
+        assert_eq!(failed.delta.remove, vec![job]);
+        assert!(failed.health.apply_failed);
+        assert_eq!(
+            probe.maps()?,
+            vec![BTreeSet::from([root, job]), BTreeSet::from([root])],
+            "the second handle accepted the uncommitted removal"
+        );
+
+        std::fs::rename(&parked, &inside).map_err(ctx("restore the descendant"))?;
+        assert_eq!(tree.id("/harw.slice/harw-job-1")?, job);
+        let converged = probe.rescan();
+        assert!(converged.delta.is_empty(), "the tracker still holds the id");
+        assert!(!converged.health.is_degraded());
+        assert_eq!(probe.map()?, BTreeSet::from([root, job]));
+        assert_eq!(
+            probe.rescan.scope.installed_ids(),
+            BTreeSet::from([root, job])
+        );
+        assert_eq!(probe.rescan.stats.divergent_handles, 0);
+        Ok(())
+    }
+
     #[test]
     fn incomplete_walk_never_retires() -> TestResult {
         let tree = FakeTree::new()?;
@@ -555,6 +845,40 @@ mod tests {
         assert!(round.health.incomplete);
         assert!(round.delta.remove.is_empty());
         assert_eq!(probe.map()?, before);
+        Ok(())
+    }
+
+    /// Eine beim Start nicht auflösbare Wurzel bleibt in jeder Runde als
+    /// nicht verfügbar gezählt; der bereits beim Start gemeldete Zustand wird
+    /// weder erneut gemeldet noch fälschlich als erholt geloggt.
+    #[test]
+    fn root_missing_at_start_keeps_every_round_degraded_and_is_not_reported_again() -> TestResult {
+        let tree = FakeTree::new()?;
+        let Probe {
+            loader,
+            handles,
+            rescan,
+            start,
+        } = Probe::attach(&tree, MAX_SCOPE_CGROUP_IDS)?;
+        let startup = ScopeHealth {
+            roots_unavailable: 1,
+            ..ScopeHealth::default()
+        };
+        let mut probe = Probe {
+            loader,
+            handles,
+            rescan: rescan.with_startup(1, startup),
+            start,
+        };
+        let job = tree.mkcg("/harw.slice/harw-job-1")?;
+        let first = probe.rescan();
+        assert_eq!(first.health, startup);
+        assert!(first.health.is_degraded());
+        assert!(!first.newly_degraded, "already reported at start");
+        assert_eq!(first.delta.insert, vec![job], "resolved roots keep working");
+        let second = probe.rescan();
+        assert_eq!(second.health.roots_unavailable, 1);
+        assert!(!second.newly_degraded);
         Ok(())
     }
 

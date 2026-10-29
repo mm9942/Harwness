@@ -69,6 +69,19 @@ authoritative.
 | `docs/design/dod-system-operations-authority.md:413` | P2 | `permission_request!` has no productive consumer yet; status should stay partial. |
 | `dod/crates/harw-probe-bpf/src/scope_rescan.rs:231` | P1 | Partial per-handle scope updates are declared recovered (E3b, outside this pass's range). |
 
+**Updates after the report (PR #154 branch).**
+
+- `harw-dod-client/src/status.rs:328` is fixed in `64d3831c`.
+- `harw-activity/src/reducer.rs:619` is fixed in `ff7ca74a`.
+- `dod/crates/harw-probe-bpf/src/scope_rescan.rs:231` is fixed in the E3c
+  commit. Every handle's map converges before recovery is reported. The
+  regression tests are
+  `partial_insert_converges_when_the_descendant_vanishes_before_the_retry`
+  and `partial_removal_converges_when_the_descendant_is_observed_again`.
+- PR #159 assigns ten of the remaining rows to the Codex helper. Its
+  handoff file `docs/planning/97-harw-dod-mission-control-chain/HANDOFF-review-fixes.md`
+  lists each row with its owner.
+
 Where the two lists overlap (`harw-activity` fixtures, imported provenance,
 reducer behaviour, job cgroup leaf), the owner's thread carries the
 stricter reading.
