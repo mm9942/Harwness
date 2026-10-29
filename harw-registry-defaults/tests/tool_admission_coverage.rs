@@ -64,6 +64,9 @@ use harw_registry_defaults::profile::{
 };
 // Runde 7, Teil M: die Matrix-Werkzeuge des Game Masters ebenso.
 use harw_registry_defaults::profile::{MATRIX_GAME_MASTER_TOOLS, matrix_tools_for_role};
+// PL-97 D3: die lesenden `dod.*` der Triage-Rollen — admittiert, aber von
+// keiner Kind-Registry bereitgestellt (ausdrückliche Ausnahme unten).
+use harw_registry_defaults::profile::{DOD_READ_TOOLS, dod_tools_for_role};
 // Plan R9, Teil A: `skills.search`/`skills.load` ebenso.
 use harw_registry_defaults::profile::{
     SKILL_CATALOG_EXCLUDED_ROLES, SKILL_CATALOG_TOOLS, skill_catalog_tools_for_role,
@@ -120,6 +123,8 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
             .chain(parent_message_tools_for_role(role).iter().copied())
             // Runde 7, Teil M: `matrix.*` (nur Game Master).
             .chain(matrix_tools_for_role(role).iter().copied())
+            // PL-97 D3: `dod.*` gehört bewusst NICHT hierher — siehe die
+            // Ausnahme `unserved_dod` unten.
             // Plan R9, Teil A: `skills.search`/`skills.load` (Skill-Katalog).
             .chain(skill_catalog_tools_for_role(role).iter().copied())
             // Plan R9, Teil F: Job-Kontrolle der Orchestratoren.
@@ -130,7 +135,28 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
             )
             .collect();
 
+        // PL-97 D3, offene Lücke (Eigentümer: Runtime, `harw-runtime/src/
+        // children.rs`): die vier Triage-Rollen admittieren die lesenden
+        // `dod.*`, aber keine Kind-Registry montiert sie — anders als
+        // `matrix_tools_for_role` hat `dod_tools_for_role` noch keinen
+        // Provider in `children.rs`. Ausdrückliche, fail-closed Ausnahme:
+        // zugelassen, aber weder vom Profil registriert noch beworben, also
+        // nie im Inventar und nie aufrufbar. Sobald die Verdrahtung landet,
+        // wandert `dod_tools_for_role` in die Kette `advertised` und diese
+        // Ausnahme entfällt.
+        let unserved_dod: BTreeSet<&str> = dod_tools_for_role(role).iter().copied().collect();
+        for tool in &unserved_dod {
+            assert!(
+                DOD_READ_TOOLS.contains(tool) && !advertised.contains(tool),
+                "Rolle {role}: {tool} ist jetzt registriert — die D3-Ausnahme entfernen \
+                 und `dod_tools_for_role` in `advertised` aufnehmen"
+            );
+        }
+
         for admitted in ir.tool_surface().admitted() {
+            if unserved_dod.contains(admitted.as_str()) {
+                continue;
+            }
             assert!(
                 advertised.contains(admitted.as_str()),
                 "Rolle {role} admittiert {admitted} in ihrer TOML, aber {profile:?} \

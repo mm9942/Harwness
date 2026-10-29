@@ -470,6 +470,51 @@ mod tests {
         Ok(())
     }
 
+    /// The canonical v2 export line (`V2_FIXTURE_LINE` in
+    /// `dod/crates/harw-sentinel/src/export.rs`, PL-97 D1/E4): additive
+    /// `schema_version` and `scope` must not break the hub reader.
+    const V2_FIXTURE_LINE: &str = r#"{"schema_version":2,"finding_id":"f-1","host":"host-a","rule_id":"structure-drift","severity":"high","summary":"s","observed_at":"2026-09-27T10:00:00Z","scope":"/sys/fs/cgroup/harw.slice"}"#;
+
+    #[test]
+    fn test_v2_fixture_line_parses_through_the_finding_and_the_tail_reader() -> TestResult {
+        let finding: super::DodFinding =
+            serde_json::from_str(V2_FIXTURE_LINE).map_err(ctx("v2 line deserializes"))?;
+        assert_eq!(finding.finding_id.as_str(), "f-1");
+        assert_eq!(finding.rule_id, "structure-drift");
+        assert_eq!(finding.severity, ImpactSeverity::High);
+
+        let text = format!(
+            "{}\n{V2_FIXTURE_LINE}\n",
+            line("f0", "host-a", "critical", "2026-09-27T09:00:00Z")
+        );
+        let batch = parse_findings(
+            text.as_bytes(),
+            false,
+            &filter()?,
+            &FindingLimits::default(),
+        );
+        assert_eq!(batch.skipped_malformed, 0);
+        let ids: Vec<&str> = batch
+            .findings
+            .iter()
+            .map(|f| f.finding_id.as_str())
+            .collect();
+        assert_eq!(ids, ["f-1", "f0"], "v1 and v2 lines, newest first");
+
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        std::fs::write(&path, format!("{V2_FIXTURE_LINE}\n")).map_err(ctx("write export"))?;
+        let batch = JsonlFindingSource::new(&path, FindingLimits::default())
+            .recent(&filter()?)
+            .map_err(ctx("recent"))?;
+        assert_eq!(batch.findings.len(), 1);
+        assert_eq!(
+            batch.findings.first().map(|f| f.summary.as_str()),
+            Some("s")
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_missing_file_and_directory_are_distinct_errors() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;

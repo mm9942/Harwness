@@ -6652,10 +6652,17 @@ impl RuntimeAssembly {
                 // PL-95 S3: je Sitzung ein frischer Injektor-Zustand über dem
                 // gemeinsamen Index der Montage.
                 .with_skill_injector(self.skill_injection.as_ref().map(|seed| {
-                    Arc::new(harw_core::SkillInjector::new(
-                        Arc::clone(&seed.index),
-                        seed.settings,
-                    ))
+                    // PL-97 B2: ein Skill, dessen deklarierte Werkzeuge diese
+                    // Sitzung alle nicht registriert, wird nicht eingespielt.
+                    Arc::new(
+                        harw_core::SkillInjector::new(Arc::clone(&seed.index), seed.settings)
+                            .with_tool_availability(
+                                harw_core::skill_injection::ToolAvailability::new(
+                                    self.tools.iter().cloned(),
+                                    harw_registry_defaults::tool_index::catalog_tool_names(),
+                                ),
+                            ),
+                    )
                 }))
                 // Addendum F+G: Wächter-Verdrahtung der Wurzel-(UIA-)Sitzung.
                 .with_guard_policy(Some(self.guard_policy))
