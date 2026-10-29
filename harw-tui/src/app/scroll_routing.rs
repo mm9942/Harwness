@@ -8,15 +8,23 @@
 //! 1. ein offener Dialog (Freigabe, sudo, Host-Permit, Plan, `ask_user`) —
 //!    dessen Körper; bei der Plan-Freigabe auch über dem Plan im Verlauf;
 //! 2. das Agenten-Panel (bzw. seine Detailansicht);
-//! 3. die Mission-Control-Fenster (PL-97 C2): Jobs und Finished/Failed
-//!    scrollen je für sich ([`crate::mission::WindowUi`]); über dem
-//!    LIVE-Streifen des Hochformats scrollt nichts (er ist reine Anzeige);
+//! 3. die Mission-Control-Fenster (PL-97 C2/C3): Jobs und Finished/Failed
+//!    scrollen je für sich ([`crate::mission::WindowUi`]), das LIVE-Fenster
+//!    der Querformat-Mittelspalte mit eigenem [`crate::chat_scroll::ChatScroll`]
+//!    (auch seine Details an Ort und Stelle); über dem LIVE-Streifen des
+//!    Hochformats und des flachen Querformats scrollt nichts (er ist reine
+//!    Anzeige);
 //! 4. sonst der Chat-Verlauf (wie bisher).
 //!
 //! Die Scroll-Aktionen der Tastenbelegung wirken ohne Fokuswechsel: bei
-//! sichtbarem Dialog auf dessen Körper, sonst auf das fokussierte Jobs- bzw.
-//! Finished/Failed-Fenster, sonst auf das sichtbare Agenten-Panel; ist
-//! nichts davon sichtbar, geht die Taste normal weiter.
+//! sichtbarem Dialog auf dessen Körper, sonst auf das fokussierte Jobs-,
+//! Finished/Failed- bzw. LIVE-Fenster, sonst auf das sichtbare
+//! Agenten-Panel; ist nichts davon sichtbar, geht die Taste normal weiter.
+//!
+//! Ein Linksklick (PL-97 C3) fokussiert das Mission-Control-Fenster unter
+//! dem Zeiger ([`FrameRegions::window_at`]); er wählt nichts aus und löst
+//! nichts aus. Solange ein Dialog offen ist, ändert ein Klick den Fokus
+//! nicht (Dialoge behalten den Vorrang).
 //!
 //! # Sicherheit
 //! Scrollen ist reines Lesen: es trifft nie eine Entscheidung, ändert keine
@@ -28,7 +36,7 @@
 //! [`ChatApp::last_regions`] ab ([`FrameRegions`]); Overlays setzen sie
 //! zurück (dann scrollt das Rad wie bisher den Verlauf).
 
-use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use super::ChatApp;
@@ -98,14 +106,16 @@ pub(crate) fn route_scroll_input(app: &mut ChatApp, event: &TuiEvent) -> Option<
     }
 }
 
-/// Mausrad nach Zeigerposition.
+/// Mausrad nach Zeigerposition; ein Linksklick fokussiert das
+/// Mission-Control-Fenster unter dem Zeiger ([`route_click`]).
 ///
 /// # Rückgabe
-/// `None` für Nicht-Rad-Ereignisse (Klicks bleiben unbeachtet).
+/// `None` für übrige Ereignisse (Bewegungen, Klicks neben den Fenstern).
 pub(crate) fn route_wheel(app: &mut ChatApp, mouse: MouseEvent) -> Option<bool> {
     let up = match mouse.kind {
         MouseEventKind::ScrollUp => true,
         MouseEventKind::ScrollDown => false,
+        MouseEventKind::Down(MouseButton::Left) => return route_click(app, mouse),
         _ => return None,
     };
     let regions = app.last_regions.get();
@@ -124,14 +134,20 @@ pub(crate) fn route_wheel(app: &mut ChatApp, mouse: MouseEvent) -> Option<bool> 
         // Eingeklappt ist Finished/Failed eine einzige Zeile ohne
         // Scroll-Inhalt: das Rad wird verbraucht, scrollt aber nichts.
         Some(MissionWindow::Finished) => {
-            if !finished_scrolls(app, regions) {
+            if !finished_scrolls(regions) {
                 return Some(false);
             }
             return Some(scroll_window(&app.mission.finished, up, WHEEL_LINES));
         }
-        // Der LIVE-Streifen scrollt nicht und gibt das Rad auch nicht an den
-        // Chat weiter: unter dem Zeiger liegt kein Verlauf.
-        Some(MissionWindow::Live) => return Some(false),
+        // Das LIVE-Fenster der Querformat-Mittelspalte scrollt (auch seine
+        // Details); der LIVE-Streifen scrollt nicht und gibt das Rad auch
+        // nicht an den Chat weiter: unter dem Zeiger liegt kein Verlauf.
+        Some(MissionWindow::Live) => {
+            if !regions.presence.live {
+                return Some(false);
+            }
+            return Some(scroll_live(app, up, WHEEL_LINES));
+        }
         None => {}
     }
     Some(
@@ -161,8 +177,11 @@ fn route_scroll_key(app: &mut ChatApp, key: &KeyEvent) -> Option<bool> {
             return Some(scroll_window(&app.mission.jobs, up, 1));
         }
         // Eingeklappt fällt die Taste wie bisher an das Agenten-Panel.
-        PaneFocus::Finished if finished_scrolls(app, regions) => {
+        PaneFocus::Finished if finished_scrolls(regions) => {
             return Some(scroll_window(&app.mission.finished, up, 1));
+        }
+        PaneFocus::Live if regions.presence.live => {
+            return Some(scroll_live(app, up, 1));
         }
         _ => {}
     }
@@ -193,10 +212,14 @@ fn scroll_open_dialog(app: &mut ChatApp, up: bool, lines: usize) -> Option<bool>
     None
 }
 
-/// `true`, wenn das Finished/Failed-Fenster aufgeklappt ist und mehr als
-/// seine Kopfzeile zeigt (nur dann gibt es etwas zu scrollen).
-fn finished_scrolls(app: &ChatApp, regions: FrameRegions) -> bool {
-    app.mission.finished_expanded && regions.finished.is_some_and(|area| area.height > 1)
+/// `true`, wenn das Finished/Failed-Fenster mehr als seine Kopfzeile zeigt
+/// (nur dann gibt es etwas zu scrollen): aufgeklappt im Hochformat, immer
+/// als gerahmtes Fenster des dreispaltigen Querformats (PL-97 C3); der
+/// einzeilige Streifen nie. Dasselbe Prädikat entscheidet, ob die Tasten des
+/// fokussierten Fensters die sichtbare Kategorienliste bedienen
+/// (`handle_finished_window_key`), damit Rad und Tasten übereinstimmen.
+pub(super) fn finished_scrolls(regions: FrameRegions) -> bool {
+    regions.finished.is_some_and(|area| area.height > 1)
 }
 
 /// Scrollt ein Mission-Fenster (Jobs, Finished/Failed), ohne Auswahl oder
@@ -205,6 +228,53 @@ fn scroll_window(ui: &WindowUi, up: bool, lines: usize) -> bool {
     let delta = isize::try_from(lines).unwrap_or(isize::MAX);
     ui.scroll_by(if up { -delta } else { delta });
     true
+}
+
+/// Scrollt das LIVE-Fenster der Querformat-Mittelspalte (bzw. seine Details
+/// an Ort und Stelle) im ChatScroll-Stil: hoch zu älteren Zeilen, runter
+/// zurück zur neuesten; der Fokus bleibt.
+fn scroll_live(app: &mut ChatApp, up: bool, lines: usize) -> bool {
+    if up {
+        app.mission.live_scroll.scroll_up_measured(lines);
+    } else {
+        app.mission.live_scroll.scroll_down(lines);
+    }
+    true
+}
+
+/// Linksklick: fokussiert das Mission-Control-Fenster unter dem Zeiger
+/// (Agenten, Jobs, Finished/Failed, LIVE als Querformat-Fenster). Ein
+/// Fokuswechsel schließt wie `F4` eine Detailansicht, deren Fenster den
+/// Fokus verliert.
+///
+/// # Rückgabe
+/// - `Some(true)`: Fokus gewechselt (neu zeichnen);
+/// - `Some(false)`: über einem Fenster, aber nichts zu tun (schon
+///   fokussiert, nicht fokussierbarer LIVE-Streifen);
+/// - `None`: offener Dialog oder kein Fenster unter dem Zeiger — normal
+///   weiterverarbeiten.
+fn route_click(app: &mut ChatApp, mouse: MouseEvent) -> Option<bool> {
+    let regions = app.last_regions.get();
+    // Dialoge behalten den Vorrang: kein Fokuswechsel hinter ihrem Rücken.
+    if regions.dialog.is_some() {
+        return None;
+    }
+    let at = Position::new(mouse.column, mouse.row);
+    let focus = match regions.window_at(at)? {
+        MissionWindow::Agents => PaneFocus::Agents,
+        MissionWindow::Jobs => PaneFocus::Jobs,
+        MissionWindow::Finished => PaneFocus::Finished,
+        MissionWindow::Live if regions.presence.live => PaneFocus::Live,
+        MissionWindow::Live => return Some(false),
+    };
+    if app.panels.focus == focus {
+        return Some(false);
+    }
+    app.panels.mission = regions.presence;
+    app.panels.revealed = regions.revealed;
+    app.panels.focus = focus;
+    app.sync_agent_detail();
+    Some(true)
 }
 
 /// Scrollt das Agenten-Panel (bzw. die Detailansicht), ohne die Auswahl
@@ -403,7 +473,9 @@ mod tests {
     }
 
     /// Unter 100 Spalten klappt das Agenten-Panel zu einer Zeile zusammen
-    /// (ab 16 Zeilen Höhe), darüber erscheint das volle Panel.
+    /// (ab 16 Zeilen Höhe), darüber erscheint das volle Panel. PL-97 C3:
+    /// 120×40 und 200×50 sind dreispaltiges Querformat — die fertigen
+    /// Agenten zählt dort das Finished/Failed-Fenster.
     #[test]
     fn agent_panel_collapses_below_the_width_threshold() -> TestResult {
         let mut app = test_chat_app()?;
@@ -416,7 +488,8 @@ mod tests {
             if width >= crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH {
                 assert!(panel && !summary, "{width}x{height}: {shown}");
                 assert!(
-                    rows.iter().any(|row| row.contains("✓ 6 fertig")),
+                    rows.iter()
+                        .any(|row| row.contains("FINISHED / FAILED · ✓ 6 · ✗ 0")),
                     "{width}x{height}: {shown}"
                 );
             } else if height >= crate::panes::AGENTS_SUMMARY_MIN_HEIGHT {
@@ -473,8 +546,23 @@ mod tests {
         assert_eq!(route_scroll_input(&mut app, &over_panel), Some(true));
         assert_eq!(app.agent_monitor.panel_scroll_offset(), WHEEL_LINES);
         assert!(app.scroll.is_following(), "der Verlauf bleibt unberührt");
-        let shown = screen(&app, 120, 40)?.join("\n");
+        // PL-97 C3: LIVE (Mittelspalte) darf `rolle-00` als Quelle nennen;
+        // das Agenten-Fenster selbst ist weitergescrollt.
+        let rows = screen(&app, 120, 40)?;
+        let panel_rows: Vec<String> = rows
+            .iter()
+            .skip(usize::from(panel.y))
+            .take(usize::from(panel.height))
+            .map(|row| {
+                row.chars()
+                    .skip(usize::from(panel.x))
+                    .take(usize::from(panel.width))
+                    .collect()
+            })
+            .collect();
+        let shown = panel_rows.join("\n");
         assert!(!shown.contains("rolle-00"), "{shown}");
+        assert!(shown.contains("rolle-03"), "{shown}");
 
         let over_chat = wheel(MouseEventKind::ScrollUp, 2, 5);
         assert_eq!(route_scroll_input(&mut app, &over_chat), Some(true));

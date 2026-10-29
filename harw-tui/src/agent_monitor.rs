@@ -35,7 +35,7 @@
 //! Agent-, Tool- oder Host-Authority.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
 use harw_core::{AgentEvent, AgentEventKind};
@@ -59,7 +59,7 @@ use crate::chat_scroll::ChatScroll;
 use crate::child_stream::redact_result;
 use crate::export::redact_json_value;
 use crate::history_cell::{ToolCell, ToolState, tool_label};
-use crate::jobs_panel::JobRow;
+use crate::jobs_panel::{ChildRunLink, JobRow};
 use crate::sanitize::{sanitize_display, sanitize_inline};
 use crate::status_line::{display_width, fit_width, model_segment};
 use crate::style::{self, Theme};
@@ -447,7 +447,10 @@ impl AgentPhase {
         }
     }
 
-    fn is_active(self) -> bool {
+    /// `true` while the run is not finished (admitted, thinking, using a
+    /// tool or waiting); the one definition every projection uses.
+    #[must_use]
+    pub(crate) fn is_active(self) -> bool {
         matches!(
             self,
             Self::Admitted | Self::Thinking | Self::Tool | Self::Waiting
@@ -609,9 +612,69 @@ fn push_tail(target: &mut String, text: &str) {
     }
 }
 
+/// PL-97 C4 (W20-A): verknüpft jeden Kind-Agenten-Job mit dem Lauf, den er
+/// ausführt (`ManagedJobOrigin::AgentChild`, Schlüssel: Kind-Sitzung).
+/// Reine Herkunft für die Darstellung, nie eine Berechtigungsentscheidung.
+///
+/// # Rückgabe
+/// `true`, wenn sich eine Verknüpfung änderte.
+fn link_jobs(agents: &BTreeMap<String, AgentLive>, jobs: &mut [JobRow]) -> bool {
+    let mut changed = false;
+    for row in jobs.iter_mut() {
+        let link = match row.child_session_id() {
+            None => ChildRunLink::NotAChild,
+            Some(child) => match agents.get(child) {
+                None => ChildRunLink::Pending,
+                Some(live) if live.phase.is_active() => ChildRunLink::RunActive,
+                Some(_) => ChildRunLink::RunEnded,
+            },
+        };
+        if row.child_link != link {
+            row.child_link = link;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Ab so vielen fertigen Agenten fasst das Panel sie zu einer Sammelzeile
 /// zusammen (ein einzelner fertiger Agent braucht ohnehin nur eine Zeile).
 pub(crate) const FINISHED_COLLAPSE_MIN: usize = 2;
+
+/// PL-97 C4: which agent runs the selectable list holds.
+///
+/// The Mission Control cards ([`render_dock`]) show only active runs
+/// while a Finished / Failed window is drawn next to them: unseen failures,
+/// finished runs, their summary row and the finished counts belong to that
+/// window. Without it (cards-only layouts) the cards keep the full list, so
+/// nothing disappears from the screen; the composition picks the scope with
+/// [`Self::for_cards`]. The legacy side panel ([`render_agents_panel`])
+/// always shows the full list. The renderer records the scope it drew --
+/// like the scroll offset, presentation state of the single store -- so
+/// keys follow the list on screen; before the first frame it is
+/// [`Self::All`], which hides nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PanelScope {
+    /// Active runs, unseen failures and finished runs (legacy panel).
+    #[default]
+    All,
+    /// Only active runs (Active Agents window next to Finished / Failed).
+    ActiveOnly,
+}
+
+impl PanelScope {
+    /// Scope of the Mission Control cards: [`Self::ActiveOnly`] when a
+    /// Finished / Failed window is drawn in the same frame to take the
+    /// finished runs, [`Self::All`] otherwise.
+    #[must_use]
+    pub(crate) fn for_cards(finished_window_drawn: bool) -> Self {
+        if finished_window_drawn {
+            Self::ActiveOnly
+        } else {
+            Self::All
+        }
+    }
+}
 
 /// Eine auswählbare Zeile des Agenten-Panels.
 #[derive(Debug, Clone, Copy)]
@@ -654,7 +717,16 @@ pub(crate) struct AgentMonitor {
     panel_height: Cell<usize>,
     /// Plan R9, Teil F: Schnappschuss der Hintergrund-Jobs der Sitzung
     /// (Jobs-Gruppe), älteste zuerst; nachgeführt über [`Self::set_jobs`].
+    /// PL-97 C4: die Verknüpfung von Kind-Agenten-Jobs mit ihrem Lauf
+    /// ([`JobRow::child_link`]) hält der Monitor selbst aktuell.
     jobs: Vec<JobRow>,
+    /// PL-97 C4: welche Läufe die auswählbare Liste zeigt (zuletzt
+    /// gezeichnete Liste, siehe [`PanelScope`]).
+    scope: Cell<PanelScope>,
+    /// PL-97 C4: quittierte Job-Fehlschläge (Job-Kennungen). Agenten führen
+    /// ihr eigenes `failure_seen`; Jobs werden bei jedem Nachführen neu
+    /// gebaut, daher steht die Quittung hier. Nichts wird gelöscht.
+    seen_job_failures: BTreeSet<String>,
 }
 
 impl AgentMonitor {
@@ -678,6 +750,13 @@ impl AgentMonitor {
 
     /// Verarbeitet ein Bus-Event. Liefert `true`, wenn sich Sichtbares änderte.
     pub(crate) fn apply(&mut self, event: &AgentEvent) -> bool {
+        let changed = self.apply_event(event);
+        // PL-97 C4: ein neuer oder beendeter Lauf ändert, welcher
+        // Kind-Agenten-Job eine eigene Zeile hat.
+        self.relink_jobs() || changed
+    }
+
+    fn apply_event(&mut self, event: &AgentEvent) -> bool {
         match &event.kind {
             AgentEventKind::InternalUsage { purpose, usage } => {
                 self.internal.entry(purpose.clone()).or_default().add(usage);
@@ -1152,35 +1231,38 @@ impl AgentMonitor {
             .filter(|(_, live)| live.phase.is_active())
             .map(|&(depth, live)| PanelEntry::Agent { depth, live })
             .collect();
-        entries.extend(
-            rows.iter()
-                .filter(|(_, live)| live.is_unseen_failure())
-                .map(|&(depth, live)| PanelEntry::Agent { depth, live }),
-        );
-        let finished: Vec<PanelEntry<'_>> = rows
-            .iter()
-            .filter(|(_, live)| live.is_finished_quietly())
-            .map(|&(depth, live)| PanelEntry::Agent { depth, live })
-            .collect();
-        if finished.len() >= FINISHED_COLLAPSE_MIN {
-            entries.push(PanelEntry::Finished);
-            if self.finished_expanded {
+        // PL-97 C4: das Fenster „Active Agents“ zeigt nur laufende Agenten;
+        // Fehlschläge und Fertige stehen im Fenster Finished/Failed.
+        if self.scope.get() == PanelScope::All {
+            entries.extend(
+                rows.iter()
+                    .filter(|(_, live)| live.is_unseen_failure())
+                    .map(|&(depth, live)| PanelEntry::Agent { depth, live }),
+            );
+            let finished: Vec<PanelEntry<'_>> = rows
+                .iter()
+                .filter(|(_, live)| live.is_finished_quietly())
+                .map(|&(depth, live)| PanelEntry::Agent { depth, live })
+                .collect();
+            if finished.len() >= FINISHED_COLLAPSE_MIN {
+                entries.push(PanelEntry::Finished);
+                if self.finished_expanded {
+                    entries.extend(finished);
+                }
+            } else {
                 entries.extend(finished);
             }
-        } else {
-            entries.extend(finished);
         }
         // Plan R9, Teil F: die Jobs-Gruppe — laufende Jobs einzeln, beendete
         // ab `FINISHED_COLLAPSE_MIN` als Sammelzeile (dieselbe Taste `f`).
+        // PL-97 C4: ein Kind-Agenten-Job, den sein Lauf vertritt, fehlt hier.
         entries.extend(
-            self.jobs
-                .iter()
+            self.listed_jobs()
                 .filter(|row| row.active)
                 .map(|row| PanelEntry::Job { row }),
         );
         let finished_jobs: Vec<PanelEntry<'_>> = self
-            .jobs
-            .iter()
+            .listed_jobs()
             .filter(|row| !row.active)
             .map(|row| PanelEntry::Job { row })
             .collect();
@@ -1199,7 +1281,8 @@ impl AgentMonitor {
     ///
     /// # Rückgabe
     /// `true`, wenn sich Sichtbares änderte.
-    pub(crate) fn set_jobs(&mut self, jobs: Vec<JobRow>) -> bool {
+    pub(crate) fn set_jobs(&mut self, mut jobs: Vec<JobRow>) -> bool {
+        link_jobs(&self.agents, &mut jobs);
         if self.jobs == jobs {
             return false;
         }
@@ -1209,10 +1292,39 @@ impl AgentMonitor {
         true
     }
 
-    /// Plan R9, Teil F: der aktuelle Job-Schnappschuss.
+    /// Plan R9, Teil F: der aktuelle Job-Schnappschuss (alle Jobs, auch die
+    /// von ihrem Agentenlauf vertretenen Kind-Agenten-Jobs).
     #[must_use]
     pub(crate) fn jobs(&self) -> &[JobRow] {
         &self.jobs
+    }
+
+    /// PL-97 C4: Jobs mit eigener Zeile ([`JobRow::is_listed`]).
+    fn listed_jobs(&self) -> impl Iterator<Item = &JobRow> {
+        self.jobs.iter().filter(|row| row.is_listed())
+    }
+
+    /// PL-97 C4: führt die Verknüpfung der Kind-Agenten-Jobs mit ihren
+    /// Läufen nach. Liefert `true`, wenn sich eine Verknüpfung änderte.
+    fn relink_jobs(&mut self) -> bool {
+        let changed = link_jobs(&self.agents, &mut self.jobs);
+        if changed {
+            let len = self.panel_entries().len();
+            self.selected = self.selected.min(len.saturating_sub(1));
+        }
+        changed
+    }
+
+    /// PL-97 C4: wurde der Fehlschlag des Jobs `id` quittiert?
+    #[must_use]
+    pub(crate) fn job_failure_seen(&self, id: &str) -> bool {
+        self.seen_job_failures.contains(id)
+    }
+
+    /// PL-97 C4: quittiert den Fehlschlag des Jobs `id` (Finished/Failed).
+    /// Liefert `true`, wenn er neu quittiert wurde.
+    pub(crate) fn mark_job_failure_seen(&mut self, id: &str) -> bool {
+        self.seen_job_failures.insert(id.to_owned())
     }
 
     /// Plan R9, Teil F: Kennung des ausgewählten Jobs (Detailansicht).
@@ -1309,13 +1421,19 @@ impl AgentMonitor {
     }
 
     /// Markiert den Fehlschlag eines Agenten als gesehen (Detailansicht).
-    pub(crate) fn mark_seen(&mut self, id: &str) {
-        if let Some(live) = self.agents.get_mut(id) {
-            live.failure_seen = true;
-        }
+    /// Liefert `true`, wenn damit ein ungesehener Fehlschlag quittiert wurde.
+    pub(crate) fn mark_seen(&mut self, id: &str) -> bool {
+        let Some(live) = self.agents.get_mut(id) else {
+            return false;
+        };
+        let newly = live.is_unseen_failure();
+        live.failure_seen = true;
+        newly
     }
 
-    /// `c`: alle Fehlschläge quittieren (sie wandern in die Sammelzeile).
+    /// `c`: alle Fehlschläge quittieren (sie wandern in die Sammelzeile);
+    /// PL-97 C4: auch die beendeter Jobs (`NEW` im Fenster Finished/Failed).
+    /// Nichts wird gelöscht.
     ///
     /// # Rückgabe
     /// `true`, wenn sich etwas geändert hat.
@@ -1325,6 +1443,11 @@ impl AgentMonitor {
             if live.is_unseen_failure() {
                 live.failure_seen = true;
                 changed = true;
+            }
+        }
+        for row in &self.jobs {
+            if !row.active && row.failed {
+                changed |= self.seen_job_failures.insert(row.id.clone());
             }
         }
         if changed {
@@ -2037,7 +2160,7 @@ fn panel_rows(
     let selected = monitor.selected.min(entries.len().saturating_sub(1));
     let mut rows: Vec<PanelRow> = Vec::new();
     let mut gauges: Vec<Option<Line<'static>>> = Vec::new();
-    let finished_jobs: Vec<&JobRow> = monitor.jobs.iter().filter(|row| !row.active).collect();
+    let finished_jobs: Vec<&JobRow> = monitor.listed_jobs().filter(|row| !row.active).collect();
     let mut jobs_header_done = false;
     for (index, entry) in entries.iter().enumerate() {
         let is_selected = focused && index == selected;
@@ -2045,11 +2168,11 @@ fn panel_rows(
         // Jobs-Gruppe.
         if !jobs_header_done && matches!(entry, PanelEntry::Job { .. } | PanelEntry::JobsFinished) {
             jobs_header_done = true;
-            let active = monitor.jobs.iter().filter(|row| row.active).count();
+            let active = monitor.listed_jobs().filter(|row| row.active).count();
             rows.push(PanelRow {
                 line: crate::jobs_panel::group_header_line(
                     active,
-                    monitor.jobs.len(),
+                    monitor.listed_jobs().count(),
                     width,
                     theme,
                 ),
@@ -2256,20 +2379,27 @@ pub(crate) fn render_agents_panel(
     theme: Theme,
     focused: bool,
 ) {
+    monitor.scope.set(PanelScope::All);
+    render_agents_list(monitor, area, buf, theme, focused);
+}
+
+/// Zeichnet die Agentenliste im aktuellen [`PanelScope`]: im Seitenpanel
+/// alles, im Fenster „Active Agents“ nur laufende Agenten (dann ohne
+/// Fehler- und Fertig-Zähler im Titel; die zeigt Finished/Failed).
+fn render_agents_list(
+    monitor: &AgentMonitor,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: Theme,
+    focused: bool,
+) {
     let area = area.intersection(buf.area);
     if area.width < 3 || area.height < 3 {
         return;
     }
-    let (active, failed, finished) = monitor.panel_counts();
-    let mut title = format!(" Agenten · {active} aktiv ");
-    if failed > 0 {
-        title.push_str(&format!("· ✗ {failed} "));
-    }
-    if finished > 0 {
-        title.push_str(&format!("· {finished} fertig "));
-    }
+    let mut title = agents_title(monitor);
     // Plan R9, Teil F: laufende Hintergrund-Jobs im Titel.
-    let running_jobs = monitor.jobs.iter().filter(|row| row.active).count();
+    let running_jobs = monitor.listed_jobs().filter(|row| row.active).count();
     if running_jobs > 0 {
         title.push_str(&format!("· ⚙ {running_jobs} Jobs "));
     }
@@ -2369,16 +2499,25 @@ fn dock_follow_column(entries: &[PanelEntry<'_>], selected: usize) -> Option<(bo
 /// Jobs-Spalte liegt —, denn [`render_agents_only_panel`]/
 /// [`render_jobs_only_panel`] werten `follow_selection` selbst nicht mehr
 /// aus (siehe [`render_dock_rows`]).
+///
+/// PL-97 C4: das Dock sind die Karten der Mission-Fenster („Active
+/// Agents“) im [`PanelScope`], den die Komposition wählt
+/// ([`PanelScope::for_cards`]): nur laufende Agenten, wenn im selben Bild
+/// ein Fenster Finished/Failed die Fertigen zeigt, sonst die volle Liste
+/// (ungesehene Fehlschläge, Sammelzeile und Zähler bleiben sichtbar). Der
+/// Scope wird für die Tasten gemerkt.
 pub(crate) fn render_dock(
     monitor: &AgentMonitor,
     areas: crate::panes::DockAreas,
+    scope: PanelScope,
     buf: &mut Buffer,
     theme: Theme,
     focused: bool,
 ) {
+    monitor.scope.set(scope);
     match areas {
         crate::panes::DockAreas::Combined(area) => {
-            render_agents_panel(monitor, area, buf, theme, focused);
+            render_agents_list(monitor, area, buf, theme, focused);
         }
         crate::panes::DockAreas::Split { agents, jobs } => {
             let agents = agents.intersection(buf.area);
@@ -2407,6 +2546,22 @@ pub(crate) fn render_dock(
     }
 }
 
+/// Titel der Agentenliste: `Agenten · 1 aktiv · ✗ 1 · 6 fertig`; im Fenster
+/// „Active Agents“ ([`PanelScope::ActiveOnly`]) nur die laufenden.
+fn agents_title(monitor: &AgentMonitor) -> String {
+    let (active, failed, finished) = monitor.panel_counts();
+    let mut title = format!(" Agenten · {active} aktiv ");
+    if monitor.scope.get() == PanelScope::All {
+        if failed > 0 {
+            title.push_str(&format!("· ✗ {failed} "));
+        }
+        if finished > 0 {
+            title.push_str(&format!("· {finished} fertig "));
+        }
+    }
+    title
+}
+
 /// Zeichnet nur die Agenten-Spalte des geteilten Docks (ohne Jobs), mit
 /// eigenem Rahmen und Titel; nutzt dieselben Einzelzeilen-Renderer wie
 /// [`panel_rows`] (`agent_line`/`failure_line`/`finished_summary_line`), also
@@ -2421,14 +2576,7 @@ fn render_agents_only_panel(
     if area.width < 3 || area.height < 3 {
         return 0;
     }
-    let (active, failed, finished) = monitor.panel_counts();
-    let mut title = format!(" Agenten · {active} aktiv ");
-    if failed > 0 {
-        title.push_str(&format!("· ✗ {failed} "));
-    }
-    if finished > 0 {
-        title.push_str(&format!("· {finished} fertig "));
-    }
+    let title = agents_title(monitor);
     let inner_width = usize::from(area.width.saturating_sub(2));
     let title = fit_width(&title, inner_width);
     let border = if focused {
@@ -2565,7 +2713,7 @@ fn render_jobs_only_panel(
     if area.width < 3 || area.height < 3 {
         return 0;
     }
-    let running = monitor.jobs.iter().filter(|row| row.active).count();
+    let running = monitor.listed_jobs().filter(|row| row.active).count();
     let title = fit_width(
         &format!(" Jobs · {running} aktiv "),
         usize::from(area.width.saturating_sub(2)),
@@ -2584,7 +2732,7 @@ fn render_jobs_only_panel(
     let inner_width = usize::from(inner.width);
     let entries = monitor.panel_entries();
     let selected = monitor.selected.min(entries.len().saturating_sub(1));
-    let finished_jobs: Vec<&JobRow> = monitor.jobs.iter().filter(|row| !row.active).collect();
+    let finished_jobs: Vec<&JobRow> = monitor.listed_jobs().filter(|row| !row.active).collect();
     let mut rows: Vec<PanelRow> = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         let is_selected = focused && index == selected;
@@ -3520,11 +3668,11 @@ mod tests {
             id: id.to_owned(),
             name: name.to_owned(),
             state: if active {
-                "läuft"
+                harw_tool_job::JobState::Running
             } else if failed {
-                "fehlgeschlagen"
+                harw_tool_job::JobState::Failed
             } else {
-                "fertig"
+                harw_tool_job::JobState::Succeeded
             },
             progress: if active {
                 "ninja 120/900 13%".to_owned()
@@ -3537,6 +3685,8 @@ mod tests {
             reason: None,
             origin: None,
             cgroup: None,
+            ended_at: None,
+            child_link: ChildRunLink::NotAChild,
         }
     }
 
@@ -3792,6 +3942,7 @@ mod tests {
         render_dock(
             &monitor,
             crate::panes::DockAreas::Combined(area),
+            PanelScope::ActiveOnly,
             &mut buf,
             Theme::Dark,
             false,
@@ -3822,6 +3973,7 @@ mod tests {
         render_dock(
             &monitor,
             crate::panes::DockAreas::Split { agents, jobs },
+            PanelScope::ActiveOnly,
             &mut buf,
             Theme::Dark,
             false,
@@ -3880,6 +4032,7 @@ mod tests {
         render_dock(
             &monitor,
             crate::panes::DockAreas::Split { agents, jobs },
+            PanelScope::ActiveOnly,
             &mut buf,
             Theme::Dark,
             false,
@@ -3921,6 +4074,7 @@ mod tests {
         render_dock(
             &monitor,
             crate::panes::DockAreas::Split { agents, jobs },
+            PanelScope::ActiveOnly,
             &mut buf,
             Theme::Dark,
             false,
@@ -3955,6 +4109,7 @@ mod tests {
         render_dock(
             &monitor,
             crate::panes::DockAreas::Split { agents, jobs },
+            PanelScope::ActiveOnly,
             &mut buf,
             Theme::Dark,
             true,
@@ -3997,6 +4152,7 @@ mod tests {
         render_dock(
             &monitor,
             crate::panes::DockAreas::Split { agents, jobs },
+            PanelScope::ActiveOnly,
             &mut buf,
             Theme::Dark,
             true,
@@ -4008,6 +4164,247 @@ mod tests {
             .join("\n");
         assert!(right.contains("job7"), "{right}");
         assert!(!monitor.follow_selection.get());
+        Ok(())
+    }
+
+    /// Zeilen eines Fensters „Active Agents“ (Karten der Mission-Fenster
+    /// neben Finished/Failed).
+    fn dock_screen(monitor: &AgentMonitor, split: bool) -> Vec<String> {
+        dock_screen_in(monitor, split, None)
+    }
+
+    /// Wie [`dock_screen`], mit dem Scope der Komposition (`None`: der
+    /// neben Finished/Failed, [`PanelScope::ActiveOnly`]).
+    fn dock_screen_in(
+        monitor: &AgentMonitor,
+        split: bool,
+        scope: Option<PanelScope>,
+    ) -> Vec<String> {
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buf = Buffer::empty(area);
+        let areas = if split {
+            crate::panes::DockAreas::Split {
+                agents: Rect::new(0, 0, 40, 12),
+                jobs: Rect::new(40, 0, 40, 12),
+            }
+        } else {
+            crate::panes::DockAreas::Combined(area)
+        };
+        let scope = scope.unwrap_or(PanelScope::for_cards(true));
+        render_dock(monitor, areas, scope, &mut buf, Theme::Dark, true);
+        buffer_rows(&buf)
+    }
+
+    /// PL-97 C4 (C2-Übergabe 1): das Fenster „Active Agents“ zeigt nur
+    /// laufende Agenten — ungesehene Fehlschläge, fertige Läufe, ihre
+    /// Sammelzeile und die Fertig-Zähler gehören in Finished/Failed. Das
+    /// Seitenpanel behält die volle Liste; Tasten folgen der zuletzt
+    /// gezeichneten Liste.
+    #[test]
+    fn active_agents_window_lists_only_running_agents() -> TestResult {
+        let mut monitor = busy_monitor()?;
+        monitor.apply(&ev(
+            "f1",
+            Some("root"),
+            "uia-tester",
+            TurnEvent::TurnFailed {
+                turn_id: t1()?,
+                reason: "Budget erschöpft".into(),
+                retryable: false,
+            },
+        )?);
+        assert_eq!(
+            monitor.panel_entries().len(),
+            3,
+            "alle: w7, f1, Sammelzeile"
+        );
+        for split in [true, false] {
+            let shown = dock_screen(&monitor, split).join("\n");
+            assert!(shown.contains("Agenten · 1 aktiv"), "{shown}");
+            assert!(!shown.contains("fertig"), "keine Fertig-Zähler: {shown}");
+            assert!(!shown.contains("Budget erschöpft"), "{shown}");
+            assert!(!shown.contains("✗"), "{shown}");
+            assert_eq!(monitor.scope.get(), PanelScope::ActiveOnly);
+            let entries = monitor.panel_entries();
+            assert_eq!(entries.len(), 1, "nur der laufende Worker");
+            assert!(
+                matches!(entries.first(), Some(PanelEntry::Agent { live, .. }) if live.id == "w7")
+            );
+        }
+        monitor.select_next();
+        assert_eq!(
+            monitor.selected_agent().map(|id| id.0),
+            Some("w7".to_owned()),
+            "die Auswahl bleibt auf dem einzigen laufenden Agenten"
+        );
+        assert!(!monitor.selected_is_summary());
+
+        let side = panel_screen(&monitor, 60, 20, false)?.join("\n");
+        assert_eq!(monitor.scope.get(), PanelScope::All);
+        assert!(side.contains("✗ uia-tester · Budget erschöpft"), "{side}");
+        assert!(side.contains("fertig"), "{side}");
+        assert_eq!(monitor.panel_entries().len(), 3);
+        Ok(())
+    }
+
+    /// PL-97 C4: ohne Fenster Finished/Failed im selben Bild (Karten allein,
+    /// z. B. flaches Querformat 100x12 oder `chat_first` mit Budget 4)
+    /// behalten die Karten die volle Liste: der ungesehene Fehlschlag, die
+    /// Sammelzeile und die Zähler verschwinden nie vom Bildschirm. Die Tasten
+    /// folgen dem gezeichneten Scope.
+    #[test]
+    fn cards_without_a_finished_window_keep_failures_and_counts() -> TestResult {
+        let mut monitor = busy_monitor()?;
+        monitor.apply(&ev(
+            "f1",
+            Some("root"),
+            "uia-tester",
+            TurnEvent::TurnFailed {
+                turn_id: t1()?,
+                reason: "Budget erschöpft".into(),
+                retryable: false,
+            },
+        )?);
+        assert_eq!(PanelScope::for_cards(true), PanelScope::ActiveOnly);
+        assert_eq!(PanelScope::for_cards(false), PanelScope::All);
+        for split in [true, false] {
+            let shown =
+                dock_screen_in(&monitor, split, Some(PanelScope::for_cards(false))).join("\n");
+            assert!(
+                shown.contains("Agenten · 1 aktiv · ✗ 1 · 6 fertig"),
+                "{shown}"
+            );
+            assert!(shown.contains("Budget erschöpft"), "{shown}");
+            assert_eq!(monitor.scope.get(), PanelScope::All);
+            assert_eq!(monitor.panel_entries().len(), 3, "w7, f1, Sammelzeile");
+
+            let beside_finished =
+                dock_screen_in(&monitor, split, Some(PanelScope::for_cards(true))).join("\n");
+            assert!(
+                !beside_finished.contains("Budget erschöpft"),
+                "{beside_finished}"
+            );
+            assert!(!beside_finished.contains("fertig"), "{beside_finished}");
+            assert_eq!(monitor.scope.get(), PanelScope::ActiveOnly);
+            assert_eq!(monitor.panel_entries().len(), 1);
+        }
+        Ok(())
+    }
+
+    /// Ein Job, der einen Kind-Agenten ausführt (`AgentChild`).
+    fn child_job(id: &str, child: &str, active: bool, failed: bool) -> JobRow {
+        JobRow {
+            origin: Some(harw_tool_job::ManagedJobOrigin::AgentChild {
+                child_session_id: child.to_owned(),
+            }),
+            child_link: ChildRunLink::Pending,
+            ..job_row(id, &format!("agent-child-{child}"), active, failed)
+        }
+    }
+
+    /// PL-97 C4 (C2-Übergabe 2): ein Kind-Agent, der als Job läuft, steht
+    /// nicht doppelt da — sein Lauf vertritt den Job, solange der Monitor
+    /// ihn kennt; ein Job ohne bekannten Lauf bleibt sichtbar, ebenso einer,
+    /// der seinen beendeten Lauf überlebt. Agent-Ereignisse führen die
+    /// Verknüpfung nach.
+    #[test]
+    fn job_backed_child_agent_is_listed_once() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        monitor.apply(&context("c1", "uia-explorer")?);
+        assert!(monitor.set_jobs(vec![
+            child_job("job-1", "c1", true, false),
+            child_job("job-2", "c-unknown", true, false),
+            job_row("job-3", "build", true, false),
+        ]));
+        let links: Vec<ChildRunLink> = monitor.jobs().iter().map(|row| row.child_link).collect();
+        assert_eq!(
+            links,
+            vec![
+                ChildRunLink::RunActive,
+                ChildRunLink::Pending,
+                ChildRunLink::NotAChild
+            ]
+        );
+        let listed: Vec<&str> = monitor
+            .panel_entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                PanelEntry::Job { row } => Some(row.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(listed, vec!["job-2", "job-3"]);
+        let shown = dock_screen(&monitor, true).join("\n");
+        assert!(shown.contains("Jobs · 2 aktiv"), "{shown}");
+        assert!(!shown.contains("agent-child-c1"), "{shown}");
+
+        // Der Lauf endet, sein Prozess läuft noch: der Job taucht auf.
+        assert!(monitor.apply(&orch(
+            "c1",
+            "uia-explorer",
+            AgentOrchestrationStatus::Completed
+        )?));
+        assert_eq!(
+            monitor.jobs().first().map(|row| row.child_link),
+            Some(ChildRunLink::RunEnded)
+        );
+        assert!(
+            dock_screen(&monitor, true)
+                .join("\n")
+                .contains("agent-child-c1")
+        );
+        // Beide beendet: gezählt wird der Lauf, nicht der Job.
+        let mut jobs = monitor.jobs().to_vec();
+        if let Some(first) = jobs.first_mut() {
+            first.active = false;
+            first.state = harw_tool_job::JobState::Succeeded;
+        }
+        assert!(monitor.set_jobs(jobs));
+        assert!(
+            !dock_screen(&monitor, true)
+                .join("\n")
+                .contains("agent-child-c1")
+        );
+        assert_eq!(monitor.jobs().len(), 3, "nichts wird gelöscht");
+        Ok(())
+    }
+
+    /// PL-97 C4: endet der Job eines Kind-Agenten, während sein Lauf noch
+    /// als aktiv gilt (Endereignis verspätet oder verloren), bleibt der Job
+    /// in der Jobs-Gruppe sichtbar — er verschwindet nie aus allen Ansichten.
+    #[test]
+    fn ended_job_of_a_still_active_child_run_stays_listed() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        monitor.apply(&context("c1", "uia-explorer")?);
+        assert!(monitor.set_jobs(vec![child_job("job-1", "c1", false, true)]));
+        assert_eq!(
+            monitor.jobs().first().map(|row| row.child_link),
+            Some(ChildRunLink::RunActive)
+        );
+        let shown = dock_screen(&monitor, true).join("\n");
+        assert!(shown.contains("agent-child-c1"), "{shown}");
+        assert!(shown.contains("Jobs · 0 aktiv"), "{shown}");
+        Ok(())
+    }
+
+    /// PL-97 C4: `c` quittiert auch die Fehlschläge beendeter Jobs; nichts
+    /// wird gelöscht, und ein neu gebauter Schnappschuss behält die Quittung.
+    #[test]
+    fn acknowledge_failures_covers_failed_jobs() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        monitor.set_jobs(vec![
+            job_row("job-1", "tests", false, true),
+            job_row("job-2", "build", true, false),
+        ]);
+        assert!(!monitor.job_failure_seen("job-1"));
+        assert!(monitor.acknowledge_failures());
+        assert!(monitor.job_failure_seen("job-1"));
+        assert!(!monitor.job_failure_seen("job-2"), "läuft noch");
+        assert!(!monitor.acknowledge_failures(), "schon quittiert");
+        monitor.set_jobs(vec![job_row("job-1", "tests", false, true)]);
+        assert!(monitor.job_failure_seen("job-1"));
+        assert!(!monitor.mark_job_failure_seen("job-1"));
+        assert!(monitor.mark_job_failure_seen("job-9"));
         Ok(())
     }
 }

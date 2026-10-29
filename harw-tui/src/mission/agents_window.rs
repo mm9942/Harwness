@@ -15,7 +15,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use crate::agent_monitor::{AgentMonitor, PanelEntry};
+use crate::agent_monitor::{AgentMonitor, PanelEntry, PanelScope};
 use crate::panes::DockAreas;
 use crate::style::Theme;
 
@@ -28,10 +28,13 @@ pub(crate) enum AgentsArea {
     AgentsOnly(Rect),
 }
 
-/// Draws the Agents window with the legacy monitor state.
+/// Draws the Agents window with the legacy monitor state, in `scope`
+/// (PL-97 C4: active runs only when a Finished / Failed window is drawn in
+/// the same frame, see [`PanelScope::for_cards`]).
 pub(crate) fn render(
     monitor: &AgentMonitor,
     area: AgentsArea,
+    scope: PanelScope,
     buf: &mut Buffer,
     theme: Theme,
     focused: bool,
@@ -47,7 +50,7 @@ pub(crate) fn render(
             jobs: Rect::new(rect.x.saturating_add(rect.width), rect.y, 0, 0),
         },
     };
-    crate::agent_monitor::render_dock(monitor, areas, buf, theme, focused);
+    crate::agent_monitor::render_dock(monitor, areas, scope, buf, theme, focused);
 }
 
 /// `true` for entries that belong to the jobs group of the legacy list.
@@ -103,7 +106,16 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 4))
             .map_err(ctx("test terminal"))?;
         terminal
-            .draw(|frame| render(monitor, area, frame.buffer_mut(), Theme::Dark, true))
+            .draw(|frame| {
+                render(
+                    monitor,
+                    area,
+                    PanelScope::ActiveOnly,
+                    frame.buffer_mut(),
+                    Theme::Dark,
+                    true,
+                )
+            })
             .map_err(ctx("draw"))?;
         let buffer = terminal.backend().buffer();
         Ok((0..buffer.area.height)

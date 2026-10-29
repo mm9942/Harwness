@@ -73,13 +73,33 @@ const FIXED_KEYS: &[(&str, &str)] = &[
     ),
     ("Jobs-Fenster (fokussiert): Job-Details öffnen", "Enter"),
     (
+        "Jobs-Fenster (fokussiert): gewählten Job stoppen (Rückfrage, dann /jobs stop)",
+        "x",
+    ),
+    (
         "Finished/Failed (fokussiert): Kategorien auf-/zuklappen",
-        "Enter, f",
+        "f (Enter klappt auf)",
+    ),
+    (
+        "Finished/Failed (aufgeklappt/Querformat): Einzelläufe öffnen und quittieren",
+        "Enter",
+    ),
+    (
+        "Finished/Failed (fokussiert): gewählte Kategorie quittieren (eingeklappt: alle)",
+        "a",
     ),
     ("Finished/Failed (fokussiert): Fehlschläge quittieren", "c"),
     (
-        "LIVE-Fenster (Hochformat)",
+        "LIVE-Streifen (Hochformat, flaches Querformat)",
         "nur Anzeige: nie fokussiert, nie gescrollt, nimmt keine Tasten",
+    ),
+    (
+        "LIVE-Fenster (Querformat, fokussiert): scrollen / Details",
+        "↑/↓, k/j, Bild↑/Bild↓, Pos1/g, Ende/G, Enter (Details), r (Reasoning)",
+    ),
+    (
+        "Linksklick",
+        "fokussiert Agenten-, Jobs-, Finished- oder LIVE-Fenster (Querformat) unter dem Zeiger",
     ),
     (
         "Composer mit Text: Wort zurück / vor",
@@ -91,7 +111,7 @@ const FIXED_KEYS: &[(&str, &str)] = &[
     ),
     (
         "Mausrad",
-        "scrollt Dialog, Agenten-, Jobs-, Finished-Fenster oder Verlauf unter dem Zeiger",
+        "scrollt Dialog, Agenten-, Jobs-, Finished-, LIVE-Fenster (Querformat) oder Verlauf unter dem Zeiger",
     ),
 ];
 
@@ -806,6 +826,21 @@ mod tests {
         assert!(text.contains("alt+l"), "{text}");
         assert!(text.contains("an LIVE anheften"), "{text}");
         assert!(text.contains("Finished/Failed (fokussiert)"), "{text}");
+        // PL-97 C4: Stopp im Jobs-Fenster und Quittieren in Finished/Failed.
+        assert!(text.contains("gewählten Job stoppen"), "{text}");
+        assert!(text.contains("Einzelläufe öffnen und quittieren"), "{text}");
+        // PL-97 C3: LIVE-Fenster des Querformats und Klick-Fokus.
+        assert!(
+            text.contains("LIVE-Fenster (Querformat, fokussiert)"),
+            "{text}"
+        );
+        assert!(text.contains("Pos1/g, Ende/G, Enter (Details)"), "{text}");
+        assert!(text.contains("LIVE-Streifen (Hochformat"), "{text}");
+        assert!(text.contains("Linksklick"), "{text}");
+        assert!(
+            text.contains("Finished-, LIVE-Fenster (Querformat)"),
+            "{text}"
+        );
         assert!(text.contains("Composer mit Text"), "{text}");
         Ok(())
     }
