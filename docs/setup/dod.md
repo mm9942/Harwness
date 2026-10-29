@@ -446,11 +446,31 @@ step.)
 is **not** a member of `harw-dod-readers`; the shipped unit grants no
 supplementary group, so the group stays memberless by default. Until you
 grant it, the hub cannot even traverse `/var/lib/harw-dod`: reading its
-default `[findings] path` (`/var/lib/harw-dod/export/findings.jsonl`) fails
-with `EACCES`, and `GET /v1/posture` reports its DoD part as
-`"status": "unavailable"` with no findings. To grant
-read access to the hub service only (not to the hub account at large), add
-a drop-in and restart the hub:
+export fails with `EACCES`, and `GET /v1/posture` reports its DoD part as
+`"status": "unavailable"` with no findings.
+
+The hub has no built-in findings source: `[findings]` is off unless
+`/etc/harw-security-hub/config.toml` names it, `path` is required, and
+validation refuses `[findings]` without `[server] host`, the correlation key
+that must equal the `host` field the sentinel writes (its `--findings-host`,
+or the kernel hostname from `/proc/sys/kernel/hostname` when that flag is
+not set). Add both before the drop-in, then check the file:
+
+```toml
+# /etc/harw-security-hub/config.toml (excerpt)
+[server]
+host = "host-a"   # same value as the sentinel's `host` field
+
+[findings]
+path = "/var/lib/harw-dod/export/findings.jsonl"
+```
+
+```sh
+sudo harw-security-hub --config /etc/harw-security-hub/config.toml --check
+```
+
+To grant read access to the hub service only (not to the hub account at
+large), add a drop-in and restart the hub:
 
 ```sh
 sudo mkdir -p /etc/systemd/system/harw-security-hub.service.d
