@@ -61,7 +61,7 @@
 //! [`FindingsExporter`] lebt ausschließlich im Sammelthread (`&mut self`),
 //! wie `crate::poll_once`.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -294,6 +294,225 @@ fn restrict_mode(file: &File) -> io::Result<()> {
 #[cfg(not(unix))]
 fn restrict_mode(_file: &File) -> io::Result<()> {
     Ok(())
+}
+
+/// Why an export destination was refused at startup (PL-97, PR #154 P1).
+///
+/// # Description
+/// Returned by [`validate_export_path`] and
+/// [`check_distinct_destinations`]; the sentinel refuses to start on any of
+/// these (fail-closed) instead of letting the atomic health rename replace
+/// the visible findings file while [`FindingsExporter`] keeps appending to
+/// the then unlinked inode.
+#[derive(Debug)]
+pub enum ExportPathError {
+    /// The path is not absolute or carries a non-normal component (`.`,
+    /// `..`, an empty component from `//`, or a trailing `/`), or has no
+    /// file name.
+    NonNormal {
+        /// Which export the path belongs to (`findings` or `health`).
+        role: &'static str,
+        /// The refused path as given.
+        path: PathBuf,
+    },
+    /// The parent directories differ lexically and at least one of them
+    /// could not be resolved, so distinct identities cannot be proven.
+    Unresolved {
+        /// The parent directory that could not be canonicalised.
+        parent: PathBuf,
+        /// The underlying resolution error.
+        source: io::Error,
+    },
+    /// Both exports resolve to the same file (same canonical parent and
+    /// same file name).
+    Collision {
+        /// The findings export path as given.
+        findings: PathBuf,
+        /// The health export path as given.
+        health: PathBuf,
+        /// The common resolved destination.
+        resolved: PathBuf,
+    },
+    /// Both exports live in the same resolved directory and a file the
+    /// health writer touches (its destination or its temporary sibling
+    /// `.<name>.tmp`) is the findings export or one of its rotated
+    /// generations `<findings>.N`.
+    SiblingOverlap {
+        /// The findings export path as given.
+        findings: PathBuf,
+        /// The health export path as given.
+        health: PathBuf,
+        /// The resolved file both writers would touch.
+        resolved: PathBuf,
+    },
+}
+
+impl std::fmt::Display for ExportPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonNormal { role, path } => write!(
+                f,
+                "{role} export path '{}' must be absolute with only normal components (no '.', '..', '//' or trailing '/')",
+                path.display()
+            ),
+            Self::Unresolved { parent, source } => write!(
+                f,
+                "cannot resolve export directory '{}' to prove the findings and health exports are distinct: {source}",
+                parent.display()
+            ),
+            Self::Collision {
+                findings,
+                health,
+                resolved,
+            } => write!(
+                f,
+                "findings export '{}' and health export '{}' resolve to the same file '{}'",
+                findings.display(),
+                health.display(),
+                resolved.display()
+            ),
+            Self::SiblingOverlap {
+                findings,
+                health,
+                resolved,
+            } => write!(
+                f,
+                "health export '{}' (or its temporary sibling) and findings export '{}' (or a rotated generation) would both touch '{}'",
+                health.display(),
+                findings.display(),
+                resolved.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExportPathError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unresolved { source, .. } => Some(source),
+            Self::NonNormal { .. } | Self::Collision { .. } | Self::SiblingOverlap { .. } => None,
+        }
+    }
+}
+
+/// Checks that `path` is absolute and spelled with normal components only.
+///
+/// # Description
+/// Works on the raw bytes, not on [`Path::components`], because the latter
+/// silently drops interior `.` components, repeated separators and a
+/// trailing `/` — exactly the spellings that alias another path lexically.
+/// Refused: a relative path, any `.` or `..` component, an empty component
+/// (`//` or a trailing `/`), and a path without a file name.
+///
+/// # Errors
+/// [`ExportPathError::NonNormal`] naming `role` and the path.
+pub fn validate_export_path(role: &'static str, path: &Path) -> Result<(), ExportPathError> {
+    let refuse = || ExportPathError::NonNormal {
+        role,
+        path: path.to_path_buf(),
+    };
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let Some(rest) = bytes.strip_prefix(b"/") else {
+        return Err(refuse());
+    };
+    let normal = rest
+        .split(|byte| *byte == b'/')
+        .all(|part| !part.is_empty() && part != b"." && part != b"..");
+    if normal && path.file_name().is_some() {
+        Ok(())
+    } else {
+        Err(refuse())
+    }
+}
+
+/// Refuses a findings and a health export that resolve to the same file.
+///
+/// # Description
+/// Both paths are first checked by [`validate_export_path`]. Then the
+/// parent directories are compared by resolved identity: equal lexical
+/// parents are the same directory; otherwise both are canonicalised
+/// ([`fs::canonicalize`], which resolves symlinked parent aliases). If the
+/// parents differ lexically and either cannot be resolved (for example it
+/// does not exist yet), distinctness cannot be proven and the check fails
+/// closed. Finally, within one resolved directory, the file names are
+/// compared: an equal name is a collision; a health name or health
+/// temporary sibling (`.<name>.tmp`) that is the findings name or a rotated
+/// generation `<findings>.N` is a sibling overlap. The final component
+/// itself is never followed: both writers already refuse a symlink there.
+///
+/// # Errors
+/// [`ExportPathError::NonNormal`], [`ExportPathError::Unresolved`],
+/// [`ExportPathError::Collision`] or [`ExportPathError::SiblingOverlap`].
+pub fn check_distinct_destinations(findings: &Path, health: &Path) -> Result<(), ExportPathError> {
+    validate_export_path("findings", findings)?;
+    validate_export_path("health", health)?;
+    let (Some(findings_parent), Some(health_parent)) = (findings.parent(), health.parent()) else {
+        // Nach `validate_export_path` hat jeder Pfad einen Elternteil; ohne
+        // ihn lässt sich nichts beweisen — also ablehnen.
+        return Err(ExportPathError::NonNormal {
+            role: "findings",
+            path: findings.to_path_buf(),
+        });
+    };
+    let (findings_dir, health_dir) = if findings_parent == health_parent {
+        (findings_parent.to_path_buf(), health_parent.to_path_buf())
+    } else {
+        let resolve = |parent: &Path| {
+            fs::canonicalize(parent).map_err(|source| ExportPathError::Unresolved {
+                parent: parent.to_path_buf(),
+                source,
+            })
+        };
+        (resolve(findings_parent)?, resolve(health_parent)?)
+    };
+    if findings_dir != health_dir {
+        return Ok(());
+    }
+    let (Some(findings_name), Some(health_name)) = (findings.file_name(), health.file_name())
+    else {
+        return Err(ExportPathError::NonNormal {
+            role: "findings",
+            path: findings.to_path_buf(),
+        });
+    };
+    let resolved = |name: &OsStr| findings_dir.join(name);
+    if findings_name == health_name {
+        return Err(ExportPathError::Collision {
+            findings: findings.to_path_buf(),
+            health: health.to_path_buf(),
+            resolved: resolved(findings_name),
+        });
+    }
+    // Der Gesundheitsschreiber berührt neben seinem Ziel auch die temporäre
+    // Geschwisterdatei `.<name>.tmp` (entfernen, neu anlegen, umbenennen);
+    // der Befundschreiber neben seinem Ziel die Generationen `<name>.N`.
+    // Keine der Mengen darf die andere schneiden.
+    let mut health_temporary = OsString::from(".");
+    health_temporary.push(health_name);
+    health_temporary.push(".tmp");
+    for touched in [health_name, health_temporary.as_os_str()] {
+        if is_findings_file(findings_name, touched) {
+            return Err(ExportPathError::SiblingOverlap {
+                findings: findings.to_path_buf(),
+                health: health.to_path_buf(),
+                resolved: resolved(touched),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `name` is the findings export `findings_name` itself or one of
+/// its rotated generations `<findings_name>.<digits>`.
+fn is_findings_file(findings_name: &OsStr, name: &OsStr) -> bool {
+    let findings = findings_name.as_encoded_bytes();
+    let name = name.as_encoded_bytes();
+    if name == findings {
+        return true;
+    }
+    name.strip_prefix(findings)
+        .and_then(|rest| rest.strip_prefix(b"."))
+        .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
 }
 
 /// Append-only JSON-Lines-Schreiber für zertifizierte Befunde.
@@ -1028,5 +1247,153 @@ mod tests {
             rotated_path(Path::new("/var/lib/harw-sentinel/findings.jsonl")),
             PathBuf::from("/var/lib/harw-sentinel/findings.jsonl.1")
         );
+    }
+
+    #[test]
+    fn test_validate_export_path_rejects_non_normal_components() {
+        for raw in [
+            "relative/findings.jsonl",
+            "/var/lib/./export/findings.jsonl",
+            "/var/lib/../lib/export/findings.jsonl",
+            "/var/lib//export/findings.jsonl",
+            "/var/lib/export/findings.jsonl/",
+            "/var/lib/export/.",
+            "/",
+        ] {
+            assert!(
+                matches!(
+                    validate_export_path("findings", Path::new(raw)),
+                    Err(ExportPathError::NonNormal { .. })
+                ),
+                "{raw} must be refused"
+            );
+        }
+        assert!(
+            validate_export_path("findings", Path::new("/var/lib/export/findings.jsonl")).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_distinct_destinations_in_one_directory_pass() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        check_distinct_destinations(
+            &dir.path().join("findings.jsonl"),
+            &dir.path().join("health.json"),
+        )
+        .map_err(ctx("distinct names"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_identical_destinations_are_a_collision() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        assert!(matches!(
+            check_distinct_destinations(&path, &path),
+            Err(ExportPathError::Collision { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_dot_component_alias_of_the_findings_path_is_refused() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let findings = dir.path().join("findings.jsonl");
+        let mut alias = dir.path().as_os_str().to_owned();
+        alias.push("/./findings.jsonl");
+        let error = check_distinct_destinations(&findings, Path::new(&alias))
+            .err()
+            .ok_or(TestError::Missing("refusal of the dot alias"))?;
+        assert!(matches!(
+            error,
+            ExportPathError::NonNormal { role: "health", .. }
+        ));
+        let mut parent_alias = dir.path().as_os_str().to_owned();
+        parent_alias.push("/sub/../findings.jsonl");
+        assert!(check_distinct_destinations(&findings, Path::new(&parent_alias)).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_parent_alias_of_the_findings_path_is_refused() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let real = dir.path().join("real");
+        fs::create_dir(&real).map_err(ctx("real dir"))?;
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).map_err(ctx("symlink"))?;
+        let error =
+            check_distinct_destinations(&real.join("findings.jsonl"), &link.join("findings.jsonl"))
+                .err()
+                .ok_or(TestError::Missing("refusal of the symlinked parent"))?;
+        assert!(matches!(error, ExportPathError::Collision { .. }));
+        assert!(error.to_string().contains("resolve to the same file"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_findings_on_the_health_temporary_sibling_is_refused() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let error = check_distinct_destinations(
+            &dir.path().join(".health.json.tmp"),
+            &dir.path().join("health.json"),
+        )
+        .err()
+        .ok_or(TestError::Missing("refusal of the temporary sibling"))?;
+        assert!(matches!(error, ExportPathError::SiblingOverlap { .. }));
+        assert!(error.to_string().contains(".health.json.tmp"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_health_on_a_rotated_findings_generation_is_refused() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let findings = dir.path().join("findings.jsonl");
+        for name in ["findings.jsonl.1", "findings.jsonl.12"] {
+            assert!(
+                matches!(
+                    check_distinct_destinations(&findings, &dir.path().join(name)),
+                    Err(ExportPathError::SiblingOverlap { .. })
+                ),
+                "{name} must be refused"
+            );
+        }
+        // Kein Generationsname: Ziffern fehlen oder sind keine Ziffern.
+        for name in ["findings.jsonl.json", "findings.jsonl.", "findings.jsonl1"] {
+            check_distinct_destinations(&findings, &dir.path().join(name))
+                .map_err(ctx("not a rotated generation"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_parent_alias_of_a_rotated_generation_is_refused() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let real = dir.path().join("real");
+        fs::create_dir(&real).map_err(ctx("real dir"))?;
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).map_err(ctx("symlink"))?;
+        assert!(matches!(
+            check_distinct_destinations(
+                &real.join("findings.jsonl"),
+                &link.join("findings.jsonl.2")
+            ),
+            Err(ExportPathError::SiblingOverlap { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_unresolvable_distinct_parent_fails_closed() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let error = check_distinct_destinations(
+            &dir.path().join("findings.jsonl"),
+            &dir.path().join("missing").join("health.json"),
+        )
+        .err()
+        .ok_or(TestError::Missing("fail-closed refusal"))?;
+        assert!(matches!(error, ExportPathError::Unresolved { .. }));
+        Ok(())
     }
 }

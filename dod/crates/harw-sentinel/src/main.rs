@@ -227,6 +227,13 @@
 //! findings export and is replaced atomically at the end of every
 //! [`poll_once`] cycle. Both directories are added as read-write Landlock
 //! roots before [`sandbox::restrict_self`]; neither needs a capability.
+//! Before either writer starts, [`check_export_destinations`] refuses
+//! startup (fail-closed) when the two destinations alias each other by
+//! resolved identity, including the health temporary sibling and rotated
+//! findings generations. When the two exports name different parent
+//! directories, both directories must already exist at startup: an
+//! unresolvable parent cannot be proven distinct, so the sentinel refuses
+//! to start instead of retrying later.
 //! Without both flags nothing is written and the cycle is unchanged (the
 //! health snapshots around `poll_all` are only taken when the health export
 //! is enabled).
@@ -607,6 +614,15 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // Export-Ziele vor jedem Schreiber prüfen: ein Alias der beiden
+        // Pfade verweigert den Start (fail-closed, PR #154 P1).
+        if let Err(err) = check_export_destinations(&cli) {
+            tracing::error!(
+                error = %err,
+                "refusing to start: findings and health export destinations are unsafe"
+            );
+            return ExitCode::FAILURE;
+        }
         run(cli, settings)
     };
 
@@ -925,22 +941,16 @@ fn poll_once(
 /// default next to `--findings-export`, see [`Cli::resolved_health_export`]).
 ///
 /// # Description
-/// `None` when neither flag is set. A path that equals the findings export
-/// path is refused with a warning (the atomic rename would replace the
-/// findings file). The configuration identity (digest, profile) is taken
-/// from the already resolved `settings`.
+/// `None` when neither flag is set. That the path does not alias the
+/// findings export is checked before startup by
+/// [`check_export_destinations`] (resolved identity, fail-closed). The
+/// configuration identity (digest, profile) is taken from the already
+/// resolved `settings`.
 fn build_health_exporter(
     cli: &Cli,
     settings: &DodSettings,
 ) -> Option<health_export::HealthExporter> {
     let path = cli.resolved_health_export()?;
-    if cli.findings_export.as_deref() == Some(path.as_path()) {
-        tracing::warn!(
-            path = %path.display(),
-            "health export disabled: its path equals --findings-export"
-        );
-        return None;
-    }
     let identity = health_export::ConfigIdentity {
         config_digest: settings
             .profile
@@ -957,6 +967,32 @@ fn build_health_exporter(
         "health export enabled"
     );
     Some(health_export::HealthExporter::new(path, identity))
+}
+
+/// Checks the findings and health export destinations before either writer
+/// starts.
+///
+/// # Description
+/// Each configured path must be absolute with normal components only
+/// ([`export::validate_export_path`]). When both are configured (the health
+/// path explicitly or by its default next to the findings export), they are
+/// compared by resolved identity — canonical parent plus file name — via
+/// [`export::check_distinct_destinations`], so a `.`/`..` spelling or a
+/// symlinked parent cannot make the atomic health rename replace the
+/// findings file while the findings writer appends to the unlinked inode;
+/// the health temporary sibling and rotated findings generations are
+/// covered too.
+///
+/// # Errors
+/// [`export::ExportPathError`]; `main` refuses to start on it.
+fn check_export_destinations(cli: &Cli) -> Result<(), export::ExportPathError> {
+    let health = cli.resolved_health_export();
+    match (cli.findings_export.as_deref(), health.as_deref()) {
+        (Some(findings), Some(health)) => export::check_distinct_destinations(findings, health),
+        (Some(findings), None) => export::validate_export_path("findings", findings),
+        (None, Some(health)) => export::validate_export_path("health", health),
+        (None, None) => Ok(()),
+    }
 }
 
 /// Reads the receive-path counters for the health export.
@@ -1367,7 +1403,7 @@ egress_allow_cidrs = []
     }
 
     #[test]
-    fn test_health_exporter_refuses_the_findings_export_path() -> TestResult {
+    fn test_startup_check_refuses_the_findings_export_path() -> TestResult {
         let cli = Cli::try_parse_from([
             "harw-sentinel",
             "--findings-export",
@@ -1376,7 +1412,84 @@ egress_allow_cidrs = []
             "/var/lib/harw-dod/export/findings.jsonl",
         ])
         .map_err(ctx("valid cli"))?;
-        assert!(build_health_exporter(&cli, &DodSettings::builtin_defaults()).is_none());
+        assert!(matches!(
+            check_export_destinations(&cli),
+            Err(export::ExportPathError::Collision { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_startup_check_refuses_a_dot_component_alias() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let base = dir.path().to_str().ok_or(TestError::Missing("utf8 path"))?;
+        let findings = format!("{base}/findings.jsonl");
+        let alias = format!("{base}/./findings.jsonl");
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            findings.as_str(),
+            "--health-export",
+            alias.as_str(),
+        ])
+        .map_err(ctx("valid cli"))?;
+        assert!(check_export_destinations(&cli).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_startup_check_refuses_a_symlinked_parent_alias() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).map_err(ctx("real dir"))?;
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).map_err(ctx("symlink"))?;
+        let findings = real.join("findings.jsonl");
+        let alias = link.join("findings.jsonl");
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            findings.to_str().ok_or(TestError::Missing("utf8 path"))?,
+            "--health-export",
+            alias.to_str().ok_or(TestError::Missing("utf8 path"))?,
+        ])
+        .map_err(ctx("valid cli"))?;
+        assert!(matches!(
+            check_export_destinations(&cli),
+            Err(export::ExportPathError::Collision { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_startup_check_refuses_findings_on_the_health_temporary_sibling() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            "/var/lib/harw-dod/export/.health.json.tmp",
+            "--health-export",
+            "/var/lib/harw-dod/export/health.json",
+        ])
+        .map_err(ctx("valid cli"))?;
+        assert!(matches!(
+            check_export_destinations(&cli),
+            Err(export::ExportPathError::SiblingOverlap { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_startup_check_accepts_the_default_health_sibling() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let findings = dir.path().join("findings.jsonl");
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            findings.to_str().ok_or(TestError::Missing("utf8 path"))?,
+        ])
+        .map_err(ctx("valid cli"))?;
+        check_export_destinations(&cli).map_err(ctx("default sibling is distinct"))?;
         Ok(())
     }
 
