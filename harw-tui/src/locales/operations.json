@@ -96,16 +96,16 @@
     "hi": "संदर्भ प्रस्तावों की समीक्षा करें: list, view, accept, reject; उन्हें कभी लागू न करें"
   },
   "operations.summary.deny": {
-    "en": "Reject a job permanently, cancelling it unless it is already Blocked",
-    "de": "Job endgültig ablehnen und abbrechen, sofern er nicht bereits Blocked ist",
-    "es": "Rechazar un trabajo definitivamente y cancelarlo salvo que ya esté Blocked",
-    "fr": "Rejeter définitivement une tâche et l’annuler sauf si elle est déjà Blocked",
-    "pt": "Rejeitar um trabalho definitivamente e cancelá-lo, exceto se já estiver Blocked",
-    "ja": "ジョブを最終的に拒否し、すでに Blocked でない限りキャンセル",
-    "zh-CN": "永久拒绝任务，除非已处于 Blocked 状态，否则将其取消",
-    "ko": "작업을 최종 거부하고 이미 Blocked 상태가 아니면 취소",
-    "vi": "Từ chối công việc vĩnh viễn, hủy nếu chưa ở trạng thái Blocked",
-    "hi": "कार्य को स्थायी रूप से अस्वीकार करें; पहले से Blocked न हो तो रद्द करें"
+    "en": "Permanently reject a job by cancelling it, including a Blocked job",
+    "de": "Job endgültig ablehnen und abbrechen, auch einen Job im Zustand Blocked",
+    "es": "Rechazar definitivamente un trabajo y cancelarlo, incluido uno en estado Blocked",
+    "fr": "Rejeter définitivement une tâche et l’annuler, y compris une tâche à l’état Blocked",
+    "pt": "Rejeitar definitivamente um trabalho e cancelá-lo, inclusive um no estado Blocked",
+    "ja": "Blocked 状態のジョブも含め、ジョブを最終的に拒否してキャンセル",
+    "zh-CN": "永久拒绝并取消任务，包括处于 Blocked 状态的任务",
+    "ko": "작업을 최종 거부하고 취소; Blocked 상태의 작업도 포함",
+    "vi": "Từ chối công việc vĩnh viễn và hủy, kể cả công việc ở trạng thái Blocked",
+    "hi": "Blocked स्थिति वाले कार्य सहित, कार्य को स्थायी रूप से अस्वीकार और रद्द करें"
   },
   "operations.summary.diary": {
     "en": "Read, search, and add agent diary entries",

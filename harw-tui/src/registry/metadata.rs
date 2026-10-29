@@ -119,7 +119,7 @@ fn summary(meta: &OperationMeta) -> Option<&'static str> {
         ),
         "deny" => tr(
             "operations.summary.deny",
-            "Reject a job permanently, cancelling it unless it is already Blocked",
+            "Permanently reject a job by cancelling it, including a Blocked job",
         ),
         "diary" => tr(
             "operations.summary.diary",
@@ -367,6 +367,42 @@ mod tests {
         harw_ops::gateway_ops::register_gateway_diagnostics(&mut operations)
             .map_err(ctx("diagnostics"))?;
         Ok(operations)
+    }
+
+    #[test]
+    fn deny_summary_includes_blocked_jobs_in_cancellation() -> TestResult {
+        // deny.rs selects deny_blocked for Blocked jobs and cancel otherwise;
+        // both successful transitions persist Cancelled. Do not copy the
+        // outdated shared summary's claim that Blocked jobs are excluded.
+        let inclusion = [
+            (UiLanguage::English, "including a Blocked job"),
+            (UiLanguage::German, "auch einen Job im Zustand Blocked"),
+            (UiLanguage::Spanish, "incluido uno en estado Blocked"),
+            (UiLanguage::French, "y compris une tâche à l’état Blocked"),
+            (UiLanguage::Portuguese, "inclusive um no estado Blocked"),
+            (UiLanguage::Japanese, "Blocked 状態のジョブも含め"),
+            (UiLanguage::ChineseSimplified, "包括处于 Blocked 状态的任务"),
+            (UiLanguage::Korean, "Blocked 상태의 작업도 포함"),
+            (
+                UiLanguage::Vietnamese,
+                "kể cả công việc ở trạng thái Blocked",
+            ),
+            (UiLanguage::Hindi, "Blocked स्थिति वाले कार्य सहित"),
+        ];
+        assert_eq!(inclusion.len(), UiLanguage::ALL.len());
+        for (language, blocked_inclusion) in inclusion {
+            with_language(language, || -> TestResult {
+                let registry = CommandRegistry::built_in().map_err(ctx("deny registry"))?;
+                let deny = registry.find("deny").ok_or(TestError::Missing("deny"))?;
+                assert!(
+                    deny.summary.contains(blocked_inclusion),
+                    "Blocked jobs must be included in cancellation ({language:?}): {}",
+                    deny.summary
+                );
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]
