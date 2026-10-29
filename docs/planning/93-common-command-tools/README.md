@@ -1,7 +1,7 @@
 # PL-93 — Typisierte Werkzeuge für häufige Kommandos
 
-> **Status:** PARTIALLY LANDED — PL-97 B4 (`../97-harw-dod-mission-control-chain/README.md` §4 B4) registers `fsread.*` and `git.*` (profiles `Full` + `ReadOnlyExplore`, auto-approved) and `sys.*` (`Full` only, `ExecuteProcess`, asks like `process.list`), and bundles the four usage skills with a `triggers.toml` each (§9); still open: the `cargo.*` tools other than `cargo.test_one` are not registered (§8, §10).  
-> **Baseline:** `origin/dev@ee1bb10`, Branch `feat/common-command-tools`  
+> **Status:** PARTIALLY LANDED — PL-97 B4 (`../97-harw-dod-mission-control-chain/README.md` §4 B4) registers `fsread.*` and `git.*` (profiles `Full` + `ReadOnlyExplore`, auto-approved) and `sys.*` (`Full` only, `ExecuteProcess`, asks like `process.list`), and bundles the four usage skills with a `triggers.toml` each (§9); still open: the `cargo.*` tools other than `cargo.test_one` are not registered (§8, §10).
+> **Baseline:** `origin/dev@ee1bb10`, Branch `feat/common-command-tools`
 > **Regel:** Code ist die Quelle der Wahrheit (`../README.md` §2). Dieses Dokument beschreibt, was im Code steht; was dort nicht steht, steht in §10 „Nicht gebaut / Lücken“.
 
 ## 1. Ziel
