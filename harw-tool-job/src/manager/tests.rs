@@ -726,7 +726,7 @@ mod recovery {
         // start. `detach_all` records the last observation, so the next
         // session still proves the identity (exe included) and may stop it.
         let env = Env::new()?;
-        let prepared = env.prepare("exec sleep 30").await?;
+        let prepared = env.prepare("exec /bin/sleep 30").await?;
         let started = env
             .manager
             .start(request("exec", "agent-a", &[]), prepared)
@@ -734,15 +734,17 @@ mod recovery {
             .map_err(ctx("start"))?;
         let id = started.meta.job_id.clone();
         let pid = started.meta.pid.ok_or(TestError::Missing("pid"))?;
-        let shell = fs::canonicalize("/bin/sh")
-            .map_err(ctx("resolve /bin/sh"))?
+        // The runtime may first exec a launcher such as prlimit. Merely
+        // observing an executable other than the shell is not completion.
+        let sleep_exe = fs::canonicalize("/bin/sleep")
+            .map_err(ctx("resolve /bin/sleep"))?
             .display()
             .to_string();
         let mut current = None;
         let execed = eventually(LIMIT, || {
             current = capture_identity(pid)
                 .and_then(|identity| identity.executable)
-                .filter(|exe| exe != &shell);
+                .filter(|exe| exe == &sleep_exe);
             current.is_some()
         })
         .await;
@@ -760,8 +762,15 @@ mod recovery {
             .ok_or(TestError::Missing("persisted exe"))?;
         assert_eq!(persisted, current);
 
-        let (manager, _recorder) = restart(&env)?;
-        assert_eq!(state_of(&manager, &id)?, JobState::Detached);
+        let (manager, recorder) = restart(&env)?;
+        assert_eq!(
+            state_of(&manager, &id)?,
+            JobState::Detached,
+            "recovery warnings: {:?}; persisted: {:?}; current: {:?}",
+            warnings(&recorder, &id),
+            on_disk.identity,
+            capture_identity(pid),
+        );
         let stopped = manager
             .stop(&id, Caller::Agent("agent-a"), JobSignal::Term)
             .await
