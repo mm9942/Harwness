@@ -427,7 +427,7 @@ fn free_uname_id_date_which_uptime_env_match_the_gnu_tools() -> TestResult {
     } else {
         eprintln!("skipped: uptime");
     }
-    // env: gleiche Namen, nicht maskierte Werte identisch
+    // env: gleiche Namen, unmaskierte Werte identisch bis auf das Zeichenlimit
     if let Some(expected) = gnu("env", &[]) {
         let got = value(harw_tool_sys::env::run(
             std::env::vars_os().collect(),
@@ -446,7 +446,25 @@ fn free_uname_id_date_which_uptime_env_match_the_gnu_tools() -> TestResult {
                 && entry["masked"] == false
                 && !val.contains('\n')
             {
-                assert_eq!(entry["value"].as_str(), Some(val), "{name}");
+                // sys.env deliberately bounds long values; GNU env does not.
+                // Compare that documented projection instead of requiring the
+                // unbounded value (e.g. a host's long LS_COLORS) verbatim.
+                if val.chars().count() > harw_tool_sys::env::MAX_VALUE_CHARS {
+                    let shown = entry["value"].as_str().unwrap_or_default();
+                    assert_eq!(entry["value_truncated"], true, "{name}");
+                    assert_eq!(
+                        shown.chars().count(),
+                        harw_tool_sys::env::MAX_VALUE_CHARS,
+                        "{name}"
+                    );
+                    assert!(
+                        shown.strip_suffix('…').is_some_and(|s| val.starts_with(s)),
+                        "{name}: expected the original prefix with a truncation marker"
+                    );
+                } else {
+                    assert_ne!(entry["value_truncated"], true, "{name}");
+                    assert_eq!(entry["value"].as_str(), Some(val), "{name}");
+                }
             }
         }
     } else {
