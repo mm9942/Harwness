@@ -106,7 +106,7 @@ impl ChatApp {
             crate::i18n::tr_args(
                 "agents.stream_set",
                 "Child-agent live stream for this session: {p0}",
-                &[("p0", &(mode.as_str()).to_string())],
+                &[("p0", mode.as_str())],
             )
         } else {
             crate::i18n::tr_args(

@@ -340,6 +340,37 @@ impl OverlayView for SettingsView {
     }
 }
 
+/// Project only allowlisted operation data; preserve payload and durability status.
+pub(crate) fn present_output(language: UiLanguage, output: &harw_operations::OpOutput) -> String {
+    crate::i18n::with_language(language, || {
+        let mut lines =
+            vec![tr("settings.scope", "Active profile · applies immediately").to_owned()];
+        let mut view = SettingsView::default();
+        if let Some(data) = &output.data {
+            view.apply_data(data);
+        }
+        for (index, key) in KEYS.iter().enumerate() {
+            if let Some(value) = &view.values[index] {
+                lines.push(format!("{}: {}", label(key), value_label(value)));
+            }
+        }
+        if output
+            .data
+            .as_ref()
+            .is_some_and(|data| data["warning"] == "durability_uncertain")
+        {
+            lines.push(
+                tr(
+                    "settings.durability",
+                    "Settings were saved and applied, but durability across a crash is uncertain.",
+                )
+                .to_owned(),
+            );
+        }
+        lines.join("\n")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,35 +487,4 @@ mod tests {
         }
         assert_eq!(view.editing, Some(1));
     }
-}
-
-/// Project only allowlisted operation data; preserve payload and durability status.
-pub(crate) fn present_output(language: UiLanguage, output: &harw_operations::OpOutput) -> String {
-    crate::i18n::with_language(language, || {
-        let mut lines =
-            vec![tr("settings.scope", "Active profile · applies immediately").to_owned()];
-        let mut view = SettingsView::default();
-        if let Some(data) = &output.data {
-            view.apply_data(data);
-        }
-        for (index, key) in KEYS.iter().enumerate() {
-            if let Some(value) = &view.values[index] {
-                lines.push(format!("{}: {}", label(key), value_label(value)));
-            }
-        }
-        if output
-            .data
-            .as_ref()
-            .is_some_and(|data| data["warning"] == "durability_uncertain")
-        {
-            lines.push(
-                tr(
-                    "settings.durability",
-                    "Settings were saved and applied, but durability across a crash is uncertain.",
-                )
-                .to_owned(),
-            );
-        }
-        lines.join("\n")
-    })
 }

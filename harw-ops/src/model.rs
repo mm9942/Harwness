@@ -818,7 +818,7 @@ fn handle_uia_worker_model_switch(
     match note.as_deref() {
         Some(note) => {
             text.push('\n');
-            text.push_str(&note);
+            text.push_str(note);
         }
         None => text.push_str("\n(gespeichert für die nächste Sitzung)"),
     }

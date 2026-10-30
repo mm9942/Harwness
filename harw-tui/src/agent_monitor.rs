@@ -836,7 +836,7 @@ impl AgentMonitor {
                         live.trace.push_status(&crate::i18n::tr_args(
                             "agents.status",
                             "Status: {p0}",
-                            &[("p0", &(live.phase.label()).to_string())],
+                            &[("p0", live.phase.label())],
                         ));
                     }
                 }
@@ -1584,7 +1584,7 @@ impl AgentMonitor {
                 " Agent · {p0} · Esc back · r Reasoning {reasoning_hint} ",
                 &[
                     ("p0", &(sanitize_inline(&live.role)).to_string()),
-                    ("reasoning_hint", &(reasoning_hint).to_string()),
+                    ("reasoning_hint", reasoning_hint),
                 ],
             ));
         let inner = block.inner(area);
@@ -2034,9 +2034,9 @@ fn finished_summary_line(
         "agents.finished_summary",
         "{marker}✓ {p0} finished {arrow}",
         &[
-            ("marker", &(marker).to_string()),
+            ("marker", marker),
             ("p0", &(finished.len()).to_string()),
-            ("arrow", &(arrow).to_string()),
+            ("arrow", arrow),
         ],
     );
     let total: u64 = finished.iter().map(|live| live.usage().total()).sum();
@@ -2183,7 +2183,7 @@ pub(crate) fn render_collapsed_summary(
         crate::i18n::tr_args(
             "agents.agents_prefix",
             "{marker}Agents: ",
-            &[("marker", &(marker).to_string())],
+            &[("marker", marker)],
         ),
         style::dim_style(theme),
     )];

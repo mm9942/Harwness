@@ -439,9 +439,9 @@ pub(crate) fn finished_jobs_line(
         "mission.finished_jobs",
         "{marker}✓ {p0} jobs finished {arrow}",
         &[
-            ("marker", &(marker).to_string()),
+            ("marker", marker),
             ("p0", &(finished.len()).to_string()),
-            ("arrow", &(arrow).to_string()),
+            ("arrow", arrow),
         ],
     );
     let tail = if failed > 0 {
@@ -617,12 +617,11 @@ impl JobHeaderData {
                 &[
                     (
                         "p0",
-                        &(if meta.executed_on_host {
+                        if meta.executed_on_host {
                             crate::i18n::tr("mission.host", "Host")
                         } else {
                             crate::i18n::tr("mission.sandbox", "Sandbox")
-                        })
-                        .to_string(),
+                        },
                     ),
                     (
                         "p1",
@@ -730,7 +729,7 @@ pub(crate) fn render_job_detail(
             " Job · {p0} · {p1} · {p2} · Esc back ",
             &[
                 ("p0", &(detail.row.name).to_string()),
-                ("p1", &(detail.row.state_label()).to_string()),
+                ("p1", detail.row.state_label()),
                 ("p2", &(detail.row.runtime).to_string()),
             ],
         ));
@@ -764,10 +763,7 @@ pub(crate) fn render_job_detail(
             crate::i18n::tr_args(
                 "mission.stream_lines",
                 "── {label} ({p0} lines) ──",
-                &[
-                    ("label", &(label).to_string()),
-                    ("p0", &(stream.len()).to_string()),
-                ],
+                &[("label", label), ("p0", &(stream.len()).to_string())],
             ),
             dim,
         ));

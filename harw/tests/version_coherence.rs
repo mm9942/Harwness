@@ -1,13 +1,13 @@
 //! Slice 14 — Workspace version coherence integration test.
 //!
 //! Spec source: "Workspace-Versionen, interne Dependency-Versionen und
-//! Lockfile sind konsistent." (Slice 14; seit 0.9.0, aktuell gegen 0.9.1).
+//! Lockfile sind konsistent." (Slice 14; seit 0.9.0, aktuell gegen 0.10.0).
 //!
 //! Asserts:
 //!   1. Every workspace-owned package (`harw` or `harw-*`) reports version
-//!      `0.9.1` (resolved from its own `Cargo.toml`).
+//!      `0.10.0` (resolved from its own `Cargo.toml`).
 //!   2. No workspace package is still on the previous `0.3.0`.
-//!   3. `Cargo.lock` confirms every internal package resolves to `0.9.1`.
+//!   3. `Cargo.lock` confirms every internal package resolves to `0.10.0`.
 //!   4. The workspace root `Cargo.toml` contains the version string exactly
 //!      once; no member `Cargo.toml` contains it at all (they inherit via
 //!      `version.workspace = true`).
@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const EXPECTED_VERSION: &str = "0.9.1";
+const EXPECTED_VERSION: &str = "0.10.0";
 const OLD_VERSION: &str = "0.3.0";
 
 /// Walk up from `start` until a directory contains a `Cargo.toml` that has

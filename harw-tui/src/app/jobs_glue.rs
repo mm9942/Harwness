@@ -336,12 +336,11 @@ fn system_line(event: &JobEvent) -> Option<String> {
                     ("name", &(name).to_string()),
                     (
                         "p0",
-                        &(if *executed_on_host {
+                        if *executed_on_host {
                             crate::i18n::tr("mission.host", "Host")
                         } else {
                             crate::i18n::tr("mission.sandbox", "Sandbox")
-                        })
-                        .to_string(),
+                        },
                     ),
                     ("origin", &(origin).to_string()),
                 ],
@@ -362,10 +361,7 @@ fn system_line(event: &JobEvent) -> Option<String> {
                 &[
                     ("job_id", &(job_id).to_string()),
                     ("name", &(name).to_string()),
-                    (
-                        "p0",
-                        &(crate::jobs_panel::job_state_label(*state)).to_string(),
-                    ),
+                    ("p0", crate::jobs_panel::job_state_label(*state)),
                     (
                         "p1",
                         &(harw_tool_job::format_duration(*duration_secs)).to_string(),
@@ -1403,8 +1399,10 @@ mod tests {
             .ok_or(TestError::Missing("stop dialog"))?,
         ));
         for language in UiLanguage::ALL {
-            let mut preferences = harw_config::TuiSection::default();
-            preferences.language = language;
+            let preferences = harw_config::TuiSection {
+                language,
+                ..Default::default()
+            };
             app.apply_display_preferences(&preferences);
             let shown = screen_text(&app, 180, 40)?;
             assert!(
@@ -1435,8 +1433,10 @@ mod tests {
             dialog.handle_key(press(KeyCode::Down));
         }
         for language in UiLanguage::ALL {
-            let mut preferences = harw_config::TuiSection::default();
-            preferences.language = language;
+            let preferences = harw_config::TuiSection {
+                language,
+                ..Default::default()
+            };
             app.apply_display_preferences(&preferences);
             let shown = screen_text(&app, 180, 40)?;
             assert!(

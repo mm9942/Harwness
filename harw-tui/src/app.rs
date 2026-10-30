@@ -10046,8 +10046,8 @@ fn start_busy_work(app: &mut ChatApp) {
 /// Wendet ein Ergebnis aus [`ChatApp::busy_jobs`] an.
 ///
 /// # Beschreibung
-/// - Befehl: Ausgabe als Systemzeilen mit „(während Turn)“ (bei `Staged`
-///   zusätzlich „gilt ab nächstem Turn“, aber nur bei Erfolg); danach wie
+/// - Befehl: Ausgabe mit neutralem lokalisiertem Busy-Kopf; das validierte
+///   Operationsergebnis beschreibt den Wirkungszeitpunkt. Danach wie
 ///   im Idle-Pfad eine offene
 ///   Ansicht neu laden und die Werkbank bei `/workbench …` als veraltet
 ///   markieren.
@@ -10074,7 +10074,7 @@ fn apply_busy_job_done(app: &mut ChatApp, done: BusyJobDone) {
             tracing::debug!(command = %command.raw, succeeded, "tui.busy.command_finished");
             // Runde 6, Teil C: Busy-Ergebnis auch in den Export.
             app.push_lines_exported(crate::i18n::with_language(language, || {
-                busy_queue::command_result_lines(&command, &output.text, succeeded)
+                busy_queue::command_result_lines(&command, &output.text)
             }));
             app.queue_overlay_refresh();
             if is_workbench_command(&command.raw) {
@@ -11038,7 +11038,7 @@ fn render_viewport_scoped(
         tr_args(
             "chrome.thinking",
             "{spinner} thinking… · ",
-            &[("spinner", &spinner.glyph().to_string())],
+            &[("spinner", spinner.glyph())],
         )
     } else {
         String::new()
@@ -15901,12 +15901,14 @@ forbidden = [{forbidden}]
             .as_ref()
             .and_then(CommandPopup::selected_name)
             .map(str::to_owned);
-        let mut tui = harw_config::TuiSection::default();
-        tui.language = harw_config::UiLanguage::Japanese;
-        tui.theme = "light".to_owned();
-        tui.reasoning = ReasoningDisplayMode::Hidden;
-        tui.child_stream = harw_config::harness_config::ChildStreamModeToml::Off;
-        tui.status_expiry = harw_config::StatusExpiryMode::Hide;
+        let tui = harw_config::TuiSection {
+            language: harw_config::UiLanguage::Japanese,
+            theme: "light".to_owned(),
+            reasoning: ReasoningDisplayMode::Hidden,
+            child_stream: harw_config::harness_config::ChildStreamModeToml::Off,
+            status_expiry: harw_config::StatusExpiryMode::Hide,
+            ..Default::default()
+        };
         app.apply_display_preferences(&tui);
         assert_eq!(app.language, harw_config::UiLanguage::Japanese);
         assert_eq!(app.theme, style::Theme::Light);
@@ -16178,6 +16180,120 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
+    #[tokio::test]
+    async fn busy_uia_controls_keep_next_session_timing_and_payloads() -> TestResult {
+        use harw_config::UiLanguage::{English, German, Japanese};
+        for language in [English, German, Japanese] {
+            let fixture = crate::runtime_root::tests::runtime_backed_app()?;
+            let services = fixture
+                .assembly
+                .services()
+                .service_map(harw_runtime::ServiceSurface::Slash);
+            let live = services
+                .get::<harw_ops::live_config::SharedLiveConfig>()
+                .ok_or(TestError::Missing("live config"))?;
+            live.update(|config| {
+                config.models.insert(
+                    "claude-mythos-preview".to_owned(),
+                    serde_json::from_value(serde_json::json!({
+                        "id": "claude-mythos-preview", "provider": "anthropic"
+                    }))
+                    .expect("model fixture"),
+                );
+            });
+            let mut app = fixture.app;
+            app.language = language;
+            app.active_cancel = Some(CancelToken::new());
+            let before = app.session_controller.snapshot();
+            for raw in [
+                "/uia-effort high",
+                "/uia-worker-model switch claude-mythos-preview",
+            ] {
+                app.input.insert_str(raw);
+                assert_eq!(
+                    queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    BusyKeyOutcome::Dispatch(BusyAvailability::Staged)
+                );
+                assert!(app.deferred_input.is_empty());
+                start_busy_work(&mut app);
+                let done = tokio::time::timeout(Duration::from_secs(5), app.busy_jobs.recv())
+                    .await
+                    .map_err(ctx("busy control completion"))?
+                    .ok_or(TestError::Missing("busy control result"))?;
+                let BusyJobDone::Command {
+                    command,
+                    text,
+                    data,
+                    succeeded,
+                    language: captured,
+                } = &done
+                else {
+                    return Err(TestError::Missing("command completion"));
+                };
+                assert!(*succeeded, "{raw}: {text}");
+                assert_eq!(*captured, language);
+                assert_eq!(command.raw, raw);
+                assert_eq!(command.class, BusyAvailability::Staged);
+                let payload = data.as_ref().ok_or(TestError::Missing("control payload"))?;
+                assert_eq!(payload["ui_feedback"]["effective"], "next_session");
+                assert!(text.contains(crate::i18n::tr_for(
+                    language,
+                    "operation_feedback.next_session",
+                    "Applies to the next session if the configuration is saved; see any save note below.",
+                )), "{raw}: {text}");
+                if raw.starts_with("/uia-worker-model") {
+                    assert_eq!(payload["ui_feedback"]["model"], "claude-mythos-preview");
+                    let warning = payload["ui_feedback"]["warning"]
+                        .as_str()
+                        .ok_or(TestError::Missing("lifecycle warning"))?;
+                    assert!(text.contains(warning), "{text}");
+                } else {
+                    assert_eq!(payload["ui_feedback"]["level"], "high");
+                }
+                if let Some(note) = payload["ui_feedback"]["note"].as_str() {
+                    assert!(text.ends_with(note), "{text}");
+                }
+                let output_text = text.clone();
+                let lines = crate::i18n::with_language(language, || {
+                    busy_queue::command_result_lines(command, text)
+                });
+                let expected_header = crate::i18n::tr_args_for(
+                    language,
+                    "dispatch.during_turn",
+                    "{command} (during turn)",
+                    &[("command", raw)],
+                );
+                assert_eq!(lines[0].to_string(), expected_header);
+                assert_eq!(
+                    lines[1..]
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    output_text
+                );
+                app.language = harw_config::UiLanguage::Hindi;
+                apply_busy_job_done(&mut app, done);
+                let history = history_plain(&app);
+                assert!(
+                    history.contains(&output_text),
+                    "history preserves completion text"
+                );
+                assert!(
+                    history.contains(&expected_header),
+                    "history preserves captured locale: {history}"
+                );
+                app.language = language;
+            }
+            assert_eq!(
+                app.session_controller.snapshot(),
+                before,
+                "config-only controls must not stage live session state"
+            );
+        }
+        Ok(())
+    }
+
     /// Ein Picker-Accept während eines Turns (Effort-Auswahl) wird als
     /// `Staged` eingestuft, läuft sofort und merkt die Änderung nur im
     /// Controller vor — die Session selbst ändert sich erst an der
@@ -16229,7 +16345,7 @@ forbidden = [{forbidden}]
         apply_busy_job_done(&mut app, done);
 
         let history = history_plain(&app);
-        assert!(history.contains("gilt ab nächstem Turn"), "{history}");
+        assert!(history.contains("(during turn)"), "{history}");
         assert!(
             history.contains("Reasoning effort (session): minimal."),
             "{history}"
@@ -16333,7 +16449,7 @@ forbidden = [{forbidden}]
         apply_busy_job_done(&mut app, done);
         assert_eq!(app.busy_jobs.running(), 0);
         let history = history_plain(&app);
-        assert!(history.contains("/slow (während Turn)"), "{history}");
+        assert!(history.contains("/slow (during turn)"), "{history}");
         assert!(history.contains("langsam fertig"), "{history}");
         Ok(())
     }

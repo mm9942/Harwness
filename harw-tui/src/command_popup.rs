@@ -183,16 +183,16 @@ impl CommandPopup {
         };
         if let Some(mut refreshed) = refreshed {
             refreshed.on_query_change(&self.query);
-            if let Some((name, usage)) = selected {
-                if let Some(index) = refreshed.filtered.iter().position(|index| {
+            if let Some((name, usage)) = selected
+                && let Some(index) = refreshed.filtered.iter().position(|index| {
                     let item = &refreshed.items[*index];
                     // Subcommand usage is invariant parent/name/argument grammar;
                     // command usage may also contain localized explanatory prose.
                     item.name == name
                         && (matches!(self.mode, PopupMode::CommandName) || item.usage == usage)
-                }) {
-                    refreshed.selected = index;
-                }
+                })
+            {
+                refreshed.selected = index;
             }
             refreshed.selection_moved = self.selection_moved;
             *self = refreshed;

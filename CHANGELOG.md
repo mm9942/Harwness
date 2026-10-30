@@ -6,9 +6,23 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+## [0.10.0] — Upcoming
+
+PRs #154–#157 have merged into `dev`; these notes describe upcoming changes
+since published v0.9.1, not a published 0.10.0 release.
+
 ### Added
 
-- PL-97 (draft PR #154 against `dev`; ledger `MIG-016` … `MIG-020`):
+- Profile-scoped `/settings` panel and typed `show|set|reset` interface preferences
+  for language, theme, reasoning, child streaming and status expiry. English is
+  the default; catalogs support `en`, `de`, `es`, `fr`, `pt`, `ja`, `zh-CN`, `ko`,
+  `vi` and `hi`. Settings, dialogs/pickers/help/setup, main chrome, typed control
+  feedback, history/tool/activity wrappers and agent/Mission Control views are
+  localized. Remaining app/async/background/view translation groups are open;
+  backend details and historical/user/model/tool content retain their language.
+  See [TUI interface settings](docs/cli.md#tui-interface-settings-settings).
+
+- PL-97 (merged PR #154; ledger `MIG-016` … `MIG-020`):
   - **Harw-DoD through harw.** `harw dod status|doctor|findings|sensors|config check|config suggest|enable|disable|restart|warden …`
     (`--json`; exit code 3 = refused: not root or no valid `active_profile`),
     the `/dod` command and the read-only, auto-approved model tools
@@ -86,18 +100,23 @@ Semantic Versioning within the 0.x pre-release range.
 
 ### Fixed
 
+- Busy command completion now uses a neutral localized header; configuration-only
+  UIA effort/worker model results retain their next-session timing, warnings and
+  save details without an incorrect next-turn claim.
+- Interface updates preserve unrelated TOML/comments and profile boundaries;
+  pre-commit failures retain old live state, while post-commit durability warnings
+  keep disk/live preferences consistent.
 - The shared `MemoryPitfallAdvisor` keeps resolved pitfall hints per session
   (`SessionResolvedSet`, bounded); a success in one session no longer hides
   the hint in another. The default `PitfallAdvisor::resolved_in_session` no
   longer forwards to the unbound `resolved`.
-- The seemingly contradictory host-lease approval was triggered by Mia's own
-  confirmation click; a supplementary guardian notice is not, by itself, to be
-  read as a rejection by Mia.
 
-## [0.9.1] — Unreleased
+## [0.9.1] — 2026-10-06
 
 ### Fixed
 
+- Clarified host-lease approval: the confirmation click grants approval; a
+  supplementary guardian notice alone is not a rejection.
 - Packaging metadata now states the workspace license (`MIT OR Apache-2.0`)
   instead of a stale single `MIT`: the Homebrew formula uses
   `license any_of: ["MIT", "Apache-2.0"]`, `webui/package.json` carries the

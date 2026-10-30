@@ -284,12 +284,14 @@ mod tests {
             row("child", Some("uia"), 1),
             row("leaf", Some("child"), 2),
         ];
-        let mut tree = AgentTree::default();
-        tree.selected = Some("child".to_owned());
+        let mut tree = AgentTree {
+            selected: Some("child".to_owned()),
+            details: true,
+            detail_scroll: 3,
+            ..Default::default()
+        };
         tree.collapsed.insert("child".to_owned());
         tree.requested.insert("child".to_owned());
-        tree.details = true;
-        tree.detail_scroll = 3;
         let before = format!("{tree:?}");
         for language in UiLanguage::ALL {
             crate::i18n::with_language(language, || {

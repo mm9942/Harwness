@@ -84,6 +84,60 @@ default paths of `dod/scripts/install.sh`. Without `UNIT` it prints every
 unit, each after a `# ---- deploy/systemd/<name> ----` header. It writes,
 enables and starts nothing.
 
+## TUI interface settings (`/settings`)
+
+In an interactive chat, `/settings` opens the keyboard settings panel. Use arrow
+keys or Tab to navigate, Enter to select/edit, and Escape to cancel.
+`/settings show` prints the safe interface preference summary. These slash commands are
+separate from the CLI `harw settings` alias for `harw config`.
+
+```text
+/settings set tui.language ja
+/settings set tui.theme light
+/settings reset tui.language
+```
+
+| Interface key | Accepted values |
+| --- | --- |
+| `tui.language` | `en`, `de`, `es`, `fr`, `pt`, `ja`, `zh-CN`, `ko`, `vi`, `hi` |
+| `tui.theme` | `auto`, `dark`, `light` |
+| `tui.reasoning` | `message`, `collapsed`, `hidden` |
+| `tui.child_stream` | `orchestrators`, `all`, `none` |
+| `tui.status_expiry` | `consolidate`, `hide` |
+
+With no configured language the interface defaults to English (`en`); the English
+activation label is exactly **Activated** (German: **Aktiviert**). The language
+picker shows native language names. Language codes are case-sensitive; unsupported
+codes are rejected.
+
+These five interface preferences are operator-only and persist in the active
+profile's `config.toml` under `[tui]`. They do not write the home-global config,
+another profile or project settings. Successful changes update the current TUI
+immediately and survive restart in that profile. Reset removes the profile key
+and applies its inherited value or built-in default; it does not always mean
+English. Invalid values and failures before the file commit leave disk and live
+preferences unchanged. A directory-sync failure after the atomic rename reports
+durability uncertainty while reconciling live preferences with the committed file.
+Cooperating writers serialize updates; external editors that ignore the lock
+remain outside that guarantee.
+
+The Models and Behavior/Approvals controls delegate to the existing validated
+model, effort, mode and permission commands. Their displayed session/profile scope
+and apply timing remain authoritative: for example, UIA effort and UIA worker
+model changes are configuration for the next session. Fixed-agent restrictions,
+busy-turn staging and approval rules still apply. Provider controls show safe
+summaries and existing configuration actions rather than credentials.
+
+Localization is incremental. Settings, dialogs, pickers, help/setup, main chrome,
+structured control feedback, history/tool/activity wrappers and agent/Mission
+Control views have catalogs for all ten languages. Remaining app/async notices,
+background-agent presentation and other pending view zones can still show German
+or English. Backend/freeform operation errors and supplied warning/save details
+retain their original language. User/model messages, historical transcript text,
+code, paths, command tokens, provider/model IDs and tool payloads are preserved.
+A language change redraws implemented live interface labels and affects future
+notices; it does not translate completed historical content.
+
 ## Provider (`harw provider`)
 
 `harw provider add NAME --api DIALECT --base-url URL` creates

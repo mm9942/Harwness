@@ -790,7 +790,7 @@ pub(crate) fn handle_switch_core(
     match note.as_deref() {
         Some(note) => {
             text.push('\n');
-            text.push_str(&note);
+            text.push_str(note);
         }
         None => text.push_str("\n(als Standard für künftige Sitzungen gespeichert)"),
     }
@@ -944,7 +944,7 @@ pub(crate) fn handle_uia_switch_core(
     match note.as_deref() {
         Some(note) => {
             text.push('\n');
-            text.push_str(&note);
+            text.push_str(note);
         }
         None => text.push_str("\n(UIA-Auswahl für künftige Sitzungen gespeichert)"),
     }

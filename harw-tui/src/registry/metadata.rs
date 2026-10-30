@@ -622,7 +622,7 @@ mod tests {
             for language in UiLanguage::ALL {
                 let registry =
                     with_language(language, || CommandRegistry::new(vec![supplied.clone()]));
-                assert_eq!(registry.specs(), &[supplied.clone()]);
+                assert_eq!(registry.specs(), std::slice::from_ref(&supplied));
             }
         }
         Ok(())

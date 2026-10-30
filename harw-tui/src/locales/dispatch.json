@@ -130,5 +130,17 @@
     "ko": "⚠ /btw 실패: {error}",
     "vi": "⚠ /btw thất bại: {error}",
     "hi": "⚠ /btw विफल: {error}"
+  },
+  "dispatch.during_turn": {
+    "en": "{command} (during turn)",
+    "de": "{command} (während Turn)",
+    "es": "{command} (durante el turno)",
+    "fr": "{command} (pendant le tour)",
+    "pt": "{command} (durante o turno)",
+    "ja": "{command}（ターン中）",
+    "zh-CN": "{command}（回合期间）",
+    "ko": "{command} (턴 중)",
+    "vi": "{command} (trong lượt)",
+    "hi": "{command} (टर्न के दौरान)"
   }
 }

@@ -101,11 +101,9 @@ impl AgentRowLive {
             AgentPhase::Admitted | AgentPhase::Thinking | AgentPhase::Tool | AgentPhase::Waiting
         );
         let state = match (live.phase, live.current_tool.as_deref()) {
-            (AgentPhase::Tool, Some(tool)) => crate::i18n::tr_args(
-                "agents.tool_named",
-                "Tool {tool}",
-                &[("tool", &(tool).to_string())],
-            ),
+            (AgentPhase::Tool, Some(tool)) => {
+                crate::i18n::tr_args("agents.tool_named", "Tool {tool}", &[("tool", tool)])
+            }
             (phase, _) => phase.label().to_owned(),
         };
         let preview = Some(live.preview.trim())
@@ -349,12 +347,12 @@ pub(crate) fn detail_lines(row: &AgentRow) -> Vec<String> {
         crate::i18n::tr_args(
             "agents.parent",
             "Parent: {p0}",
-            &[("p0", &(row.parent.as_deref().unwrap_or("—")).to_string())],
+            &[("p0", row.parent.as_deref().unwrap_or("—"))],
         ),
         crate::i18n::tr_args(
             "agents.tree_task",
             "Task: {p0}",
-            &[("p0", &(row.task.as_deref().unwrap_or("—")).to_string())],
+            &[("p0", row.task.as_deref().unwrap_or("—"))],
         ),
         crate::i18n::tr_args(
             "agents.tree_stats",

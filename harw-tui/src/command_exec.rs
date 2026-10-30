@@ -723,6 +723,8 @@ pub(crate) struct CommandDispatchOutcome {
 }
 
 /// Dispatch with a captured locale and structured slash-command result.
+// Preserve the established dispatch inputs while capturing session locale explicitly.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_command_with_shell_result_for<F>(
     language: harw_config::UiLanguage,
     adapters: &[CommandAdapter],

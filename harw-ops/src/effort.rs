@@ -281,7 +281,7 @@ fn handle_uia_effort_switch(
     match note.as_deref() {
         Some(note) => {
             text.push('\n');
-            text.push_str(&note);
+            text.push_str(note);
         }
         None => text.push_str(" (gespeichert für die nächste Sitzung)"),
     }
@@ -307,7 +307,7 @@ fn handle_uia_effort_clear(persist: impl FnOnce(Option<&str>) -> Option<String>)
     match note.as_deref() {
         Some(note) => {
             text.push('\n');
-            text.push_str(&note);
+            text.push_str(note);
         }
         None => text.push_str(" (gespeichert für die nächste Sitzung)"),
     }

@@ -15,8 +15,9 @@
 //! # Nebenläufigkeit
 //! Die Tasks teilen nur unveränderliche Daten (Montage, Adapter, Sandbox,
 //! Session-ID). Session-Mutationen laufen weiterhin ausschließlich an
-//! Turn-Grenzen (`ChatApp::apply_pending_controller_state`); `Staged`-Befehle
-//! merken ihre Änderung nur im Controller vor.
+//! Turn-Grenzen (`ChatApp::apply_pending_controller_state`). Die Busy-Klasse
+//! allein legt keinen Wirkungszeitpunkt fest: Config-only-Operationen können
+//! beispielsweise erst für die nächste Sitzung gelten.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -79,8 +80,7 @@ pub(super) enum BusyJobDone {
         /// Anzeigetext (auch Fehlermeldung oder Zeitlimit-Hinweis).
         text: String,
         /// `false`, wenn der Befehl scheiterte (Fehler, Ablehnung,
-        /// Zeitlimit) — dann gilt auch ein `Staged`-Befehl nicht „ab nächstem
-        /// Turn“.
+        /// Zeitlimit). Erfolg und Busy-Klasse belegen keinen Wirkungszeitpunkt.
         succeeded: bool,
         data: Option<serde_json::Value>,
         language: harw_config::UiLanguage,
@@ -396,21 +396,15 @@ impl BusyJobs {
 /// Anzeigezeilen eines Befehlsergebnisses, das während eines Turns lief.
 ///
 /// # Beschreibung
-/// Kopfzeile `"<befehl> (während Turn)"`, bei einem **erfolgreichen**
-/// `Staged`-Befehl ergänzt um „— gilt ab nächstem Turn“ (ein gescheiterter
-/// gilt nie), danach die Ausgabe zeilenweise.
-pub(super) fn command_result_lines(
-    command: &BusyCommand,
-    text: &str,
-    succeeded: bool,
-) -> Vec<Line<'static>> {
-    let staged = if succeeded && command.class == BusyAvailability::Staged {
-        " — gilt ab nächstem Turn"
-    } else {
-        ""
-    };
+/// A neutral command header records completion during a turn. The operation's
+/// validated presentation owns apply timing; a Staged class alone cannot prove it.
+pub(super) fn command_result_lines(command: &BusyCommand, text: &str) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        format!("{} (während Turn){staged}", command.raw.trim()),
+        crate::i18n::tr_args(
+            "dispatch.during_turn",
+            "{command} (during turn)",
+            &[("command", command.raw.trim())],
+        ),
         Style::default().add_modifier(Modifier::DIM),
     ))];
     lines.extend(text.split('\n').map(|line| Line::from(line.to_owned())));
@@ -574,17 +568,26 @@ mod tests {
     }
 
     #[test]
-    fn staged_result_header_mentions_next_turn() {
+    fn staged_result_header_is_neutral_in_every_locale() {
         let command = BusyCommand {
             raw: "/effort high".to_owned(),
             class: BusyAvailability::Staged,
         };
-        let lines = plain(&command_result_lines(&command, "ok", true));
-        assert_eq!(
-            lines[0],
-            "/effort high (während Turn) — gilt ab nächstem Turn"
-        );
-        assert_eq!(lines[1], "ok");
+        for language in harw_config::UiLanguage::ALL {
+            let lines = crate::i18n::with_language(language, || {
+                plain(&command_result_lines(&command, "payload {raw}\nwarning"))
+            });
+            assert_eq!(
+                lines[0],
+                crate::i18n::tr_args_for(
+                    language,
+                    "dispatch.during_turn",
+                    "{command} (during turn)",
+                    &[("command", "/effort high")],
+                )
+            );
+            assert_eq!(&lines[1..], &["payload {raw}", "warning"]);
+        }
     }
 
     #[test]
@@ -594,8 +597,8 @@ mod tests {
             class: BusyAvailability::Staged,
         };
         let text = "Fehler: ungültiger Effort";
-        let lines = plain(&command_result_lines(&command, text, false));
-        assert_eq!(lines[0], "/effort ultra (während Turn)");
+        let lines = plain(&command_result_lines(&command, text));
+        assert_eq!(lines[0], "/effort ultra (during turn)");
         assert_eq!(lines[1], text);
     }
 }

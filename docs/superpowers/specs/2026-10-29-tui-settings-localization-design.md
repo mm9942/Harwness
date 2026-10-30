@@ -4,9 +4,9 @@
 
 User requests English by default (including **Activated**, not **Aktiviert**), a `/settings` interface for language and user/model configuration, and additional European and Asian languages. Implementation uses subagents as requested. Baseline: `dev@df08fc77baacacd085e6f5c6a7824f2aa391dedf` after PRs #154–#157; validated merge tree `4462e0c7d99b881b8e0421c9c94546694822a974`.
 
-## Current
+## Original baseline
 
-TUI text is largely hard-coded German. There is no locale field or `/settings` surface. Existing OverlayView returns actions to the normal command path. RuntimeAssembly.current_config()/SharedLiveConfig expose live persisted preferences. Existing model/effort/mode/permissions operations enforce their own policies and must remain the authority for those changes. Generic ConfigWriter alone does not fully validate arbitrary settings. CLI “global” and permissions “global” target different locations.
+Before this work, TUI text was largely hard-coded German, with no locale field or `/settings` surface. Existing OverlayView returns actions to the normal command path. RuntimeAssembly.current_config()/SharedLiveConfig expose live persisted preferences. Existing model/effort/mode/permissions operations enforce their own policies and must remain the authority for those changes. Generic ConfigWriter alone does not fully validate arbitrary settings. CLI “global” and permissions “global” target different locations.
 
 ## Target
 
@@ -15,7 +15,7 @@ TUI text is largely hard-coded German. There is no locale field or `/settings` s
 - `/settings` opens a keyboard-driven category/row panel. Arrow keys/Tab navigate; Enter selects/edits; Escape cancels; reset restores inherited/default values.
 - Interface controls: language, theme (auto/dark/light), reasoning display, child streaming, status-expiry display. Wire each exposed setting to a real live consumer. Do not expose inert configuration.
 - Model controls open existing root/UIA/internal-role pickers; reasoning effort, interaction mode and approvals use existing governed command paths. Show current/session versus persisted/profile scope and when effects apply. Provider settings expose safe summaries and existing configuration actions, never secret values.
-- Settings mutations validate typed allowlisted values before persistence, target the active profile, preserve unrelated TOML/comments, and leave file/live state unchanged on failure. Never dump ResolvedConfig or environment/auth state. Keep mutation operator-only rather than adding model tools.
+- Settings mutations validate typed allowlisted values before persistence, target the active profile, preserve unrelated TOML/comments, and leave file/live state unchanged on pre-commit failure. If rename commits but directory synchronization fails, reconcile live state to the committed file and report durability uncertainty explicitly. Never dump ResolvedConfig or environment/auth state. Keep mutation operator-only rather than adding model tools.
 
 ## Approaches and implementation choices
 
@@ -46,13 +46,35 @@ No new privileged service or security policy is introduced. Existing model admis
 
 - Empty config boots English; explicit German boots German; each listed language is selectable and persists in only the active profile.
 - “Activated” is the English activation label; German uses “Aktiviert”.
-- Settings reopen with live values; language/theme/display changes actually apply; invalid inputs and failed writes do not partially mutate state.
+- Settings reopen with live values; language/theme/display changes actually apply; invalid inputs and pre-commit write failures do not partially mutate state; post-commit durability uncertainty is reported truthfully with disk/live state reconciled.
 - Model actions honor existing model lifecycle/capability/agent constraints and busy-turn behavior.
 - Catalog keys/placeholders agree across supported locales; missing translations fall back to English, never display internal keys.
 - Rendering in narrow, portrait and landscape terminals keeps controls reachable and handles Unicode terminal columns/graphemes.
 - User/model text, code, paths, provider IDs and secrets are never rewritten by localization.
 - Two independently localized apps do not affect one another; scoped locale is restored after nested calls and panics.
 
+## Version and release consistency
+
+The user additionally requested version/release bumps. Target workspace version is `0.10.0`: synchronize internal dependency pins and workspace lockfile records, reconcile changelog entries against published `v0.9.1`, and check tag/Cargo version equality before release builds. The private webui package version remains independent. Creating release tags is separate from updating release metadata.
+
 ## Implementation status
 
-Planned; not implemented or merged. Language set is user-directed; UI/backend decomposition and localization mechanism are engineering choices. Original PR integration is complete and independently verified.
+Integration checkpoint locally verified with CI/default features (2026-10-30): Tasks 1–4 and 5A–D are
+implemented and independently reviewed. These cover the typed settings backend,
+catalogs, native settings UI, dialogs/pickers/help/setup, main chrome, typed
+control feedback, history/tool/activity presentation, and agent/Mission Control
+views. A bounded checkpoint adds neutral busy completion wording, the Japanese
+no-longer-listed correction, synchronized 0.10.0 release metadata and user docs.
+Remaining translation groups 5E–I stay open; backend/freeform output and remaining
+app/view zones can still display German or English. Default-feature workspace
+Clippy and 18,519 tests/doctests passed (202 explicitly ignored); a fresh
+whole-branch review and remote CI are still required before integration is
+claimed verified. Language set is user-directed; UI/backend decomposition and localization
+mechanism are engineering choices. Original PRs #154–#157 are merged and their
+integration is independently verified. No transcript translation is introduced.
+
+The canonical all-features workspace gate exposes a pre-existing optional cloud
+proxy placeholder build failure (`ProxyHttp` is unavailable with the current
+Pingora feature declaration). The coordinator leaves that future PL-90 work out
+of this checkpoint. Default-feature workspace checks are tracked separately;
+all-features workspace validation remains blocked.

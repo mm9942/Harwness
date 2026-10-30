@@ -311,12 +311,10 @@ pub(crate) fn project(
             if changed.is_null() != (target == "uia" || action == "show") {
                 return None;
             }
-            if !changed.is_null() {
-                if !changed.as_bool()? {
-                    lines.push(
-                        tr_for(language, "operation_feedback.already", "Already set.").to_owned(),
-                    );
-                }
+            if !changed.is_null() && !changed.as_bool()? {
+                lines.push(
+                    tr_for(language, "operation_feedback.already", "Already set.").to_owned(),
+                );
             }
             let level = nullable(data, "level")?;
             if let Some(level) = level {
@@ -414,31 +412,31 @@ pub(crate) fn project(
         }
         _ => return None,
     }
-    if kind == "model_selection" && matches!(meta.name, "model" | "uia-model") {
-        if !data.get("changed")?.as_bool()? {
-            lines.push(tr_for(language, "operation_feedback.already", "Already set.").to_owned());
-        }
+    if kind == "model_selection"
+        && matches!(meta.name, "model" | "uia-model")
+        && !data.get("changed")?.as_bool()?
+    {
+        lines.push(tr_for(language, "operation_feedback.already", "Already set.").to_owned());
     }
     if timing != EffectiveTiming::Current {
         lines.push(timing.text(language).to_owned());
     }
     // These optional values are required, nullable fields on their schemas.
-    if matches!(kind, "model_selection" | "role_model" | "worker_model") {
-        if let Some(warning) = nullable(data, "warning")? {
-            lines.push(t(
-                "operation_feedback.warning",
-                "Warning: {detail}",
-                &[("detail", warning)],
-            ));
-        }
+    if matches!(kind, "model_selection" | "role_model" | "worker_model")
+        && let Some(warning) = nullable(data, "warning")?
+    {
+        lines.push(t(
+            "operation_feedback.warning",
+            "Warning: {detail}",
+            &[("detail", warning)],
+        ));
     }
     if matches!(
         kind,
         "model_selection" | "role_model" | "worker_model" | "effort" | "mode"
-    ) {
-        if let Some(note) = nullable(data, "note")? {
-            lines.push(note.to_owned());
-        }
+    ) && let Some(note) = nullable(data, "note")?
+    {
+        lines.push(note.to_owned());
     }
     Some(Presentation {
         text: lines.join("\n"),
