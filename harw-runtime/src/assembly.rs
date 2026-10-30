@@ -7246,6 +7246,28 @@ mod tests {
         );
     }
 
+    /// A new GPT-6.1 model must not reject the first request under the 32k fallback.
+    #[test]
+    fn gpt_6_1_uses_known_limits_for_first_turn_budget() {
+        let config = ResolvedConfig::default();
+        for id in [
+            "gpt-6.1-sol",
+            "openai/gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "openai/gpt-6.1-terra",
+        ] {
+            let limits = model_limits_for(&config, id);
+            assert!(limits.known, "{id} must not use the unknown-model fallback");
+            assert_eq!(limits.context_window, 1_050_000, "{id}");
+            assert_eq!(limits.catalog_max_output, Some(128_000), "{id}");
+            let reserve = limits.output_reserve_tokens();
+            assert!(
+                50_899 + reserve < limits.context_window,
+                "the reported first request must fit with its output reserve: {id}"
+            );
+        }
+    }
+
     /// Runde 5, Teil H: der echte Aufrufpfad (`model_limits_for` →
     /// `match_catalog_key` über den eingebauten Katalog) kennt Opus 5.5 in
     /// beiden Schreibweisen und liefert dessen Fenster, nicht das

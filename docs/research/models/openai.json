@@ -16,6 +16,99 @@
   "records": [
     {
       "vendor": "openai",
+      "canonical_id": "gpt-6.1-sol",
+      "aliases": [],
+      "family": "gpt",
+      "release_version": "6.1",
+      "variant": "sol",
+      "lifecycle": "ga",
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "prompt_caching": "explicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": true,
+        "code_execution": true,
+        "built_in_search": true,
+        "file_search": true
+      },
+      "knowledge_cutoff": "2026-04-30",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+          "title": "GPT-6.1 Sol \u2014 OpenAI API model card",
+          "fetched_at": "2026-10-29T00:00:00Z"
+        }
+      ],
+      "notes": "Tool calling requires Responses API. Public API limits; the local Codex model cache may specify a smaller default context window."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-6.1-terra",
+      "aliases": [],
+      "family": "gpt",
+      "release_version": "6.1",
+      "variant": "terra",
+      "lifecycle": "ga",
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "prompt_caching": "explicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": true,
+        "code_execution": true,
+        "built_in_search": true,
+        "file_search": true
+      },
+      "knowledge_cutoff": "2026-06-01",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
+          "title": "GPT-6.1 Terra \u2014 OpenAI API model card",
+          "fetched_at": "2026-10-29T00:00:00Z"
+        }
+      ],
+      "notes": "Tool calling requires Responses API. Public API limits; the local Codex model cache may specify a smaller default context window."
+    },
+    {
+      "vendor": "openai",
       "canonical_id": "gpt-6-sol",
       "aliases": [],
       "family": "gpt",

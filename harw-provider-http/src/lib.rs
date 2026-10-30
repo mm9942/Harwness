@@ -1711,6 +1711,7 @@ pub struct OpenAiResponsesProvider {
 ///
 /// `blocks` sind die unveränderten `reasoning`-Output-Items mit
 /// `encrypted_content`; `call_ids` die `function_call`s derselben Antwort.
+/// Eine leere Blockliste bindet eine Tool-Runde ohne Reasoning-Items.
 #[derive(Debug, Clone, PartialEq)]
 struct ReplayEntry {
     call_ids: Vec<String>,
@@ -3032,7 +3033,9 @@ fn extract_responses_refusal(body: &Value) -> Option<String> {
 /// - sonst: Tool-Calls → `ToolUse`; nur Refusal-Parts → `Refusal`; Text → `EndTurn`;
 ///   gar nichts → `EmptyResponse`.
 /// - `reasoning`-Items → `OpaqueReasoning{provider, model, blocks}` (verbatim);
-///   Items mit `encrypted_content` einer Tool-Call-Runde → [`ReplayEntry`].
+///   Tool-Runden mit verschlüsseltem Reasoning oder ohne Reasoning-Items
+///   erhalten eine [`ReplayEntry`]-Bindung. Eine leere Blockliste bestätigt,
+///   dass der Provider in dieser Runde kein Reasoning geliefert hat.
 ///
 /// # Errors
 /// `RequestFailed` bei `failed`/`cancelled` oder defekten Tool-Calls;
@@ -3105,15 +3108,18 @@ fn interpret_responses(
         })
         .cloned()
         .collect();
-    let replay = (!tool_calls.is_empty() && !replayable.is_empty()).then(|| ReplayEntry {
-        call_ids: tool_calls
-            .iter()
-            .map(|call| call.id.as_str().to_owned())
-            .collect(),
-        provider: provider.to_owned(),
-        model: model.to_owned(),
-        blocks: replayable,
-    });
+    let replay =
+        (!tool_calls.is_empty() && (blocks.is_empty() || !replayable.is_empty())).then(|| {
+            ReplayEntry {
+                call_ids: tool_calls
+                    .iter()
+                    .map(|call| call.id.as_str().to_owned())
+                    .collect(),
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+                blocks: replayable,
+            }
+        });
     let reasoning = (!blocks.is_empty()).then(|| OpaqueReasoning {
         provider: provider.to_owned(),
         model: model.to_owned(),
