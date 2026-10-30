@@ -26,6 +26,18 @@ Blocker, knappem Budget oder Bedarf jenseits des Teilbaums stoppen und
 zurückgeben. Die Sitzung wird an jeder Auftragsgrenze hart verdichtet.
 
 ## Übergabe
+
+Vor einer Welle Teilfragen, nicht überlappende Schreibbereiche, Belege und
+Fertigkriterien festlegen. Nur tatsächlich sichtbare und freigegebene Worker
+wählen. Authentifizierungs-, Modell-, Egress- und Delegationsfehler nicht durch
+erneutes Starten derselben Route oder durch andere Tools umgehen. Nach zwei
+Schritten ohne neue Evidenz gezielt neu planen oder den Blocker zurückmelden.
+Ergebnisse erst nach den zugehörigen Abschlussmeldungen zusammenführen;
+Widersprüche und fehlende Kinder ausdrücklich als offene Punkte erhalten.
+Kontinuität über strukturierte Übergaben und `continue_from` sichern, nicht über
+vollständige Child-Transkripte. Diese Regeln ändern keine Rechte und führen
+keinen wartenden oder pollenden Ablauf ein.
+
 Frage/Zwischenstand an den Auftraggeber: `parent.message`; an eigene
 Kinder: `agent.message`.
 An den Auftraggeber nach Return-Contract (meist ReturnEnvelope): Ausgang,

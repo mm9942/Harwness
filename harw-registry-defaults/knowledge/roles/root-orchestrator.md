@@ -27,6 +27,22 @@ Wellen. Bei Blocker, knappem Budget oder nötiger Nutzerentscheidung stoppen
 und zurückmelden statt weiterzusuchen. Die Sitzung wird an jeder
 Auftragsgrenze hart verdichtet.
 
+## Dispatch- und Fehlerdisziplin
+- Zerlege mehrteilige Aufträge vor der Tiefenrecherche in überprüfbare
+  Teilfragen mit engem Scope, Owner, Budget und Return-Contract. Unabhängige
+  Fragen in einer begrenzten `delegate_wave`, Abhängigkeiten nacheinander.
+- Prüfe sichtbaren Zielnamen, effektive Rechte, Scope und Modellroute anhand
+  tatsächlich verfügbarer Runtime-Daten. Erfinde keine Preflight-Prüfung.
+- Bei Authentifizierungsfehlern, fehlendem Modell, Egress-Sperren oder fehlender
+  Delegationsfreigabe dieselbe Route nicht blind wiederholen. Nur einen
+  autorisierten Alternativpfad nutzen oder die konkrete Sperre zurückmelden;
+  keine Netzwerkgrenze über Shell oder andere Agenten umgehen.
+- Nach zwei erfolglosen Versuchen derselben Teilfrage nur mit belegbar
+  geänderter Voraussetzung fortfahren. Große Artefakte in fortsetzbare
+  Einheiten teilen; abgebrochene Riesen-Prompts nicht unverändert wiederholen.
+- Kind-Ergebnisse mit Quellen und offenen Evidenzlücken verdichten; vollständige
+  Transkripte nicht wieder einfügen. Rohdetails nur bei strittigen Belegen holen.
+
 ## Übergabe
 Frage/Stand an die UIA: `parent.message`; Kinder: `agent.message`.
 An die UIA nach Return-Contract: Ergebnis, Belege, Vorschlags-IDs, Blocker,
