@@ -91,12 +91,86 @@
     "GNU environment compatibility expected unbounded values. Corrected test contract; full seven-test target passed."
   ],
   "history_preservation": {
-    "status": "pending"
+    "status": "verified",
+    "content_commit": "6fdf0ef575494f05eea188001881efac4f707b4f",
+    "history_merge_commit": "02eddce300eec94ea6231e4076a9456ae2653f83",
+    "tree_unchanged": true,
+    "source_tips_verified": 174,
+    "additional_merge_parents": 40,
+    "parents": [
+      "02a96c3cdc01e35351850f0e0df759340a71c2e6",
+      "17c50c0d070f2b7419bfba14bfebfeedcf949f27",
+      "197c9667c433416aec72791de38f13e12f510aaa",
+      "2b662fffda90b553d4196fb5a6a685de79047b2d",
+      "2c4fbc68cad1ba8d3eb2e587059cba6033f38c53",
+      "2de19c8a60614dc398a73f0326ea033637863e27",
+      "315b80f287552e8cde614782330a27fee4e90d6a",
+      "3983e115cd12541d9eb52170cdcb8fca8c01ee39",
+      "42bd77123e52befbf58f02afc7e617af1a7262b3",
+      "4794da952c2c309bd7dfd066bba39f80a873387b",
+      "51ad032cbea5bd83a4cf1cedfb4c1af881da83e1",
+      "543efdb60d135bd657f9bebc9da63f365243a174",
+      "571e8aa90cba3e232b576a3537987ef0e5647e88",
+      "5ac080f6d01803a43bd0fe6afa8f7dc356529cdd",
+      "5ef7f0e4587ca22c3e6820224db10632541d355a",
+      "62effc18d2951e9083e2b7121e7f0d066a8ed721",
+      "6695311a72e8dba5f923c5f1330d269c0d8deeb2",
+      "7ddfc63b7868c3fd4712509075c95ec320d67f93",
+      "7e96cba627a421be8521c5fbd5b6fc1dc03f51a3",
+      "83fd33f864b2efc53a1bddf07d75fe6cef1c43fe",
+      "843054a35b7eb0297ca26973a4c58cad2ff624af",
+      "858c3db06c9498bb7774ccb8f2e3969e2663078b",
+      "919b91e91b11a5dd8c933a4fd88a95c79837029c",
+      "922b12a84396768257c383dce142478b5eea49fb",
+      "92a9f61eeaa14bf92e28787f626c3bd078f38bcd",
+      "94b957aafe14b025bfe900289d3dd3d4d1f4ed7d",
+      "99dd650fb4917084a7ff8fb7fa35f11059b10cc5",
+      "a4a174e35bb6cad523826b985ff537dcbf932421",
+      "a8bfb6bd0d34057f3ea006a195f4bfaab937d45e",
+      "acc575e67268dff60048bf27ded27f807590e7e7",
+      "b4ab7ac99f871b0fdc029925a73b3947b094fe95",
+      "b7bcb91d1c6e4574a3d09c13e05491ab2ba467a8",
+      "cd5535c42fbfc7fedfee63570a46cd5276c4111f",
+      "d111f605abb049be34a150feceb10a30e1233be4",
+      "e1e2bb8885ac9ba09d76a4d097a3c8d10bf505be",
+      "e7768d5e9cd494f22feef151acce36d3ea327320",
+      "e9443bc0539657bc3ec076ced9f2d704bb230907",
+      "f22e67ac54f24772db2f013506b7bd54c45c7bf5",
+      "f2698d744b26b41b860b997c307a2451b508e8fd",
+      "f9b1e303b7f9a6f54f7f208a7d7e4f3c4edea871"
+    ],
+    "pre_cleanup_bundle": "/root/harw-release/branch-consolidation-20261030/consolidated-before-local-ref-cleanup.bundle",
+    "pre_cleanup_bundle_verified": true
   },
   "remote_actions": {
     "push": false,
     "delete_branch": false,
     "close_pull_request": false
   },
-  "evidence_directory": "/root/harw-release/branch-consolidation-20261030/evidence"
+  "evidence_directory": "/root/harw-release/branch-consolidation-20261030/evidence",
+  "local_cleanup": {
+    "status": "performed",
+    "checked_commit": "02eddce300eec94ea6231e4076a9456ae2653f83",
+    "deleted_tracking_and_audit_refs": 240,
+    "retained_local_branches": [
+      "main",
+      "dev"
+    ],
+    "retained_remote_tracking_refs": [
+      "origin/main",
+      "origin/dev"
+    ],
+    "fetch_refspecs": [
+      "+refs/heads/main:refs/remotes/origin/main",
+      "+refs/heads/dev:refs/remotes/origin/dev"
+    ],
+    "all_removed_tips_ancestor_checked": true,
+    "guarded_atomic_ref_transaction": true
+  },
+  "remote_verification": {
+    "checked_utc": "2026-10-30T09:32:22.007800+00:00",
+    "branch_count": 79,
+    "all_heads_match_inventory": true,
+    "open_pull_requests": 0
+  }
 }

@@ -81,15 +81,27 @@ unverändert.
 
 ## Erhalt der Historie und spätere Bereinigung
 
-Nach der Inhaltsabstimmung werden die geprüften Heads durch ausdrücklich als
-solche bezeichnete **History-only-Merges** in der lokalen Historie gehalten.
+Nach der Inhaltsabstimmung wurden die geprüften Heads durch einen ausdrücklich
+als solchen bezeichneten **History-only-Merge** in der lokalen Historie erhalten.
 Diese Merges erhalten die Herkunft und Wiederherstellbarkeit; sie behaupten
 nicht, dass jeder alte Prototyp Teil der aktiven Software ist.
 
 Das zusätzliche, geprüfte Vorher-Bundle liegt auf diesem Host unter
 `/root/harw-release/branch-consolidation-20261030/before-consolidation.bundle`.
-Die endgültige Prüfung muss für jeden inventarisierten Branch- und PR-Head
-bestätigen, dass er ein Vorfahr des konsolidierten lokalen Commits ist.
+Die Prüfung bestätigt für alle **174 unterschiedlichen Quellstände**, dass sie
+Vorfahren von `02eddce300eec94ea6231e4076a9456ae2653f83` sind. Dieser Merge
+hat den Dateiinhalt unverändert gelassen. Die abschließenden Dokumentations-
+Commits bauen darauf auf.
+
+Lokal bleiben nur `main` und `dev` sowie deren `origin/main`-/`origin/dev`-
+Tracking-Referenzen. 240 zusätzlich importierte lokale Tracking-/Audit-Refs
+wurden erst nach Vorfahrenprüfung und geprüftem vollständigem Bundle mit
+erwarteten alten SHAs atomar entfernt. Die Fetch-Konfiguration verfolgt nun
+`main` und `dev`. **Auf GitHub bleiben unverändert alle 79 Branches bestehen.**
+
+Prüflogs, Review und Git-Nachweise liegen dauerhaft unter
+`/root/harw-release/branch-consolidation-20261030/evidence/`. Das abschließende
+Bundle heißt dort im übergeordneten Verzeichnis `final-main-dev.bundle`.
 
 [remote-cleanup-proposal.json](remote-cleanup-proposal.json) ist nur ein
 Vorschlag für 77 spätere Remote-Löschungen. Er bewahrt `main` und `dev`.

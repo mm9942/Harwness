@@ -66,9 +66,9 @@ docs/planning/92-web-research-fabric/README.md.
 - [x] Commit per-head decisions and a non-executing remote-cleanup manifest.
 - [x] Run canonical workspace clippy/tests/gates and resolve actual failures.
 - [x] Obtain independent final review of recovered code and integration.
-- [ ] Preserve all reviewed heads in final ancestry with documented history-only merges.
-- [ ] Point local main and dev to the verified result; leave only these local branches.
-- [ ] Verify clean working tree, equal main/dev content, head coverage, and unchanged remote state.
+- [x] Preserve all reviewed heads in final ancestry with documented history-only merges.
+- [x] Point local main and dev to the verified result; leave only these local branches.
+- [x] Verify clean working tree, equal main/dev content, head coverage, and unchanged remote state.
 
 ## Execution rulings
 
@@ -98,3 +98,8 @@ docs/planning/92-web-research-fabric/README.md.
   failed GNU target was corrected to honor existing truncation semantics and
   passed all7 tests on rerun; no production code changed for that correction.
   All other targets/doc-tests, gates and final formatting pass.
+
+- History merge02eddce3 preserves all174 audited tips using40 independent
+  parents, with identical tree before/after. Complete pre-cleanup bundle
+  verified;240 local tracking/audit refs deleted atomically with expected SHAs.
+  Only main/dev plus origin/main/origin/dev remain; GitHub79heads unchanged.
