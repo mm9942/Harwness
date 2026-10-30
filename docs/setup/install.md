@@ -169,8 +169,8 @@ make install BINDIR=/usr/local/bin   # or PREFIX=/usr/local (BINDIR wins if both
 | `clippy` | Clippy, warnings as errors |
 | `tests` | Test suite |
 | `clippy-tests` | Canonical verification: clippy + tests + gates |
-| `gates` | Dependency-edge, privilege, Warden structure and architecture-layer (`arch`, policy in `xtask/arch-policy.toml`) gates (`xtask gates`, reads the root workspace including the DoD crates under `dod/crates/`) |
-| `dod-build` / `dod-install` / `dod-enable` / `dod-uninstall` | Delegate to `dod/Makefile` — see [`docs/setup/dod.md`](dod.md) |
+| `gates` | Dependency-edge, privilege, Warden structure and architecture-layer (`arch`, policy in `xtask/arch-policy.toml`) gates (`xtask gates`, reads the root workspace including the DoD crates under `harw-dod/crates/`) |
+| `dod-build` / `dod-install` / `dod-enable` / `dod-uninstall` | Delegate to `harw-dod/Makefile` — see [`docs/setup/dod.md`](dod.md) |
 
 ## First run
 
@@ -249,12 +249,12 @@ warns when the trampoline is missing (at `[jobs] trampoline`, else next to
 
 Harwness ships a separate, privileged, opt-in observation subsystem ("DoD")
 that watches host activity around agent execution. It is a distinct
-system-level install (own crates under `dod/crates/` in the root workspace,
+system-level install (own crates under `harw-dod/crates/` in the root workspace,
 own Makefile, root-owned service accounts) and is never installed or enabled by `make install`/`make
 service`. See [`docs/setup/dod.md`](dod.md) for what it is and how to set
 it up; `make dod-build`, `make dod-install` (run unprivileged: the build
 refuses root, and `install` asks for sudo itself) and `make dod-enable` are
-thin delegations to `dod/Makefile` from the repository root.
+thin delegations to `harw-dod/Makefile` from the repository root.
 
 All system units (DoD and the infrastructure daemons), the `sysusers.d`
 accounts and the `tmpfiles.d` directories live in one canonical tree,

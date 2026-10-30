@@ -1,7 +1,7 @@
 # harw-probe-fs.service -- DoD fanotify probe, class CAP_SYS_ADMIN.
 #
 # Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Rendered
-# by dod/scripts/install.sh (LIBEXECDIR).
+# by harw-dod/scripts/install.sh (LIBEXECDIR).
 #
 # Installed, but NOT pulled in by harw-dod.target: --scope-root is mandatory
 # and site-specific. Set it through a drop-in

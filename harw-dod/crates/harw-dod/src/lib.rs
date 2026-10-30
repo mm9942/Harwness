@@ -4,7 +4,7 @@
 //! dieser Crate (siehe `docs/design/harw-dod-charter.md` §2).
 //!
 //! # Warum dieser Knoten existiert
-//! Der DoD-Teilbaum (`dod/crates/`) umfasst 34 Crates: diese Fassade, die
+//! Der DoD-Teilbaum (`harw-dod/crates/`) umfasst 34 Crates: diese Fassade, die
 //! vier Binaries (`harw-sentinel`, `harw-probe-fs`, `harw-probe-bpf`,
 //! `harw-warden`), den gemeinsamen Systemkonfigurationsvertrag
 //! (`harw-dod-config`), den Container-Sensor `harw-dod-container`, die

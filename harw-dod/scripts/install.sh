@@ -24,14 +24,14 @@ packaging_dir=$(CDPATH= cd -- "$(dirname "$0")/../packaging" && pwd)
 # The one canonical source of every unit, sysusers and tmpfiles snippet
 # (Crypto Masterplan v2 §22, H10): deploy/ at the repository root. The same
 # files are embedded byte-identically into harw-install
-# (`harw install --print-systemd`); there is no second copy under dod/.
+# (`harw install --print-systemd`); there is no second copy under harw-dod/.
 deploy_dir=${DEPLOY_DIR:-$(CDPATH= cd -- "$(dirname "$0")/../../deploy" && pwd)}
 
 # DoD units installed from $deploy_dir/systemd. The infrastructure units
 # (harw-infra.target, harw-auth-hub.*, ...) in the same directory are not
 # part of the DoD package.
 dod_units='harw-dod.target harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service harw-warden.service harw-warden.socket'
-# Files of the pre-H10 layout (the old dod/packaging unit, sysusers and tmpfiles trees). Removed on
+# Files of the pre-H10 layout (the old harw-dod/packaging unit, sysusers and tmpfiles trees). Removed on
 # install and uninstall so an upgraded host never keeps two unit sets.
 legacy_files='systemd/harw-dod-sentinel.service systemd/harw-dod-bpf.service systemd/harw-dod-warden.service systemd/harw-dod-warden.socket sysusers/harw-dod.conf tmpfiles/harw-dod.conf'
 

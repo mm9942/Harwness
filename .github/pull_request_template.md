@@ -26,7 +26,7 @@
 - [ ] `cargo clippy --workspace --tests -- -D warnings` passes
 - [ ] Tests pass locally (`cargo nextest run --workspace` or `cargo test
       --workspace`), including doc tests (`cargo test --workspace --doc`)
-- [ ] If this touches `dod/`: `make -C dod test` passes (package-scoped checks)
+- [ ] If this touches `harw-dod/`: `make -C harw-dod test` passes (package-scoped checks)
 - [ ] If this changes dependencies: `cargo deny check` passes
 - [ ] Documentation (crate docs, `README.md`, `docs/`) is updated for any
       user-visible or configuration change

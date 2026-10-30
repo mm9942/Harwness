@@ -80,7 +80,7 @@ hyphen. They correspond to the chat commands `/skills`, `/plugins`,
 --print-systemd`) prints the systemd system units that are embedded from
 `deploy/systemd/` (the single canonical source, see
 [DoD setup](setup/dod.md#systemd-units-and-the-deploy-tree)), rendered with the
-default paths of `dod/scripts/install.sh`. Without `UNIT` it prints every
+default paths of `harw-dod/scripts/install.sh`. Without `UNIT` it prints every
 unit, each after a `# ---- deploy/systemd/<name> ----` header. It writes,
 enables and starts nothing.
 
@@ -369,16 +369,16 @@ agree.
 | Action | Effect |
 | --- | --- |
 | `status` | Install state, system config and active profile, the six units, Warden state, sentinel health and the high/critical finding counts of the `[dod] findings_window_hours` window. Counts are prefixed `≥` and marked "partial" when older export data was not read (`lower_bound: true` in `--json`). |
-| `doctor` | Read-only prerequisites: cgroup v2, kernel BTF, tracefs, Landlock, `systemctl`/`systemd-sysusers`/`systemd-tmpfiles`, the daemons, the unit files, the config and both exports, plus three warning-only cgroup-root checks (`cgroup-root`, `profile-root`, `allowed-prefixes`, see [DoD setup](setup/dod.md#observe-harw-jobs-pl-97-e3)) and the execution chain table (below). Exit 1 when a prerequisite is missing. The build toolchain checks stay with `make -C dod doctor`. |
+| `doctor` | Read-only prerequisites: cgroup v2, kernel BTF, tracefs, Landlock, `systemctl`/`systemd-sysusers`/`systemd-tmpfiles`, the daemons, the unit files, the config and both exports, plus three warning-only cgroup-root checks (`cgroup-root`, `profile-root`, `allowed-prefixes`, see [DoD setup](setup/dod.md#observe-harw-jobs-pl-97-e3)) and the execution chain table (below). Exit 1 when a prerequisite is missing. The build toolchain checks stay with `make -C harw-dod doctor`. |
 | `findings [-n N] [--severity S] [--rule ID] [--since SPAN] [--job ID]` | The newest findings of the bounded export tail (default 50, at most 200), at or above severity `S`, of one rule, observed within `SPAN` (`90m`, `24h`, `7d`). `--job ID` keeps only findings whose `scope` lies within that job's own cgroup (path-component prefix, read from the job records of the project in the working directory); a job without a dedicated cgroup (no delegated cgroup root) gets none. |
 | `sensors` | The sentinel health report (`health.json`): per-sensor state, readings, errors, last success, IPC counters; flagged stale after 2 minutes without an update. |
 | `config check [--config PATH]` | Validates `/etc/harw-dod/config.toml` (or `PATH`) exactly like the daemons do (no symlinks, root-owned, not group/world-writable). Exit 0 only for a valid config that selects an `active_profile`. |
 | `config suggest [--drop-in]` | Prints the DoD profile for harw's job cgroups under the resolved delegated cgroup root (`[jobs] cgroup_root`, `HARW_CGROUP_ROOT`, own delegated cgroup) plus the matching `[dod] allowed_cgroup_prefixes`; without a root, the template and a hint. `--drop-in` prints the sentinel `--cgroup-root` drop-in and the `harw-probe-bpf` ordering drop-in instead (see `docs/setup/dod.md`). |
-| `enable` | Root only. Checks the config, then `systemctl daemon-reload` and `systemctl enable --now harw-dod.target` (`make -C dod enable`). The Warden stays disabled. |
-| `disable` | Root only. `systemctl disable --now harw-dod.target harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service`, then disables `harw-warden.socket` and `harw-warden.service` (errors there are ignored), like `make -C dod disable`. |
+| `enable` | Root only. Checks the config, then `systemctl daemon-reload` and `systemctl enable --now harw-dod.target` (`make -C harw-dod enable`). The Warden stays disabled. |
+| `disable` | Root only. `systemctl disable --now harw-dod.target harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service`, then disables `harw-warden.socket` and `harw-warden.service` (errors there are ignored), like `make -C harw-dod disable`. |
 | `restart` | Root only. Checks the config, `systemctl daemon-reload`, `systemctl restart harw-dod.target`. |
 | `warden status` | Warden state, guard file and socket unit. |
-| `warden enable` | Root only. Creates `/etc/harw-dod` (mode `0750`, only when missing) and the guard file `/etc/harw-dod/warden.enable`, then `systemctl daemon-reload` and `systemctl enable --now harw-warden.socket` (`make -C dod enable-warden`). `kill_requires_human` stays true. |
+| `warden enable` | Root only. Creates `/etc/harw-dod` (mode `0750`, only when missing) and the guard file `/etc/harw-dod/warden.enable`, then `systemctl daemon-reload` and `systemctl enable --now harw-warden.socket` (`make -C harw-dod enable-warden`). `kill_requires_human` stays true. |
 | `warden disable` | Root only. `systemctl disable --now harw-warden.socket harw-warden.service`, then removes the guard file. |
 | `install --print-systemd [UNIT]` | Prints the embedded units (see above). |
 

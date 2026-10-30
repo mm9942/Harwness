@@ -135,8 +135,8 @@ The mapping/research input has four errors that this note corrects:
 - **M6** (`:85-93`): log pumps and watches run as supervised tasks with an owner, and cancellation propagates to them.
 
 ## 6. DoD integration
-- **The sensor** implements `Sensor` (`dod/crates/harw-dod-signals/src/sensor.rs:139`), following the `harw-dod-cgroup` pattern.
-  - It enumerates `docker-<id>.scope`, `libpod-<id>.scope` and `kubepods*` scopes (`dod/crates/harw-dod-cgroup/src/lib.rs:17`).
+- **The sensor** implements `Sensor` (`harw-dod/crates/harw-dod-signals/src/sensor.rs:139`), following the `harw-dod-cgroup` pattern.
+  - It enumerates `docker-<id>.scope`, `libpod-<id>.scope` and `kubepods*` scopes (`harw-dod/crates/harw-dod-cgroup/src/lib.rs:17`).
   - It caps the number of scopes the way `MAX_CGROUPS` does (`sensor.rs:82`).
   - It reads `CapEff`, `NoNewPrivs`, `Seccomp` and the namespace IDs from `/proc/<pid>`.
 - **It emits:**
@@ -144,11 +144,11 @@ The mapping/research input has four errors that this note corrects:
   - seccomp off,
   - sharing the host network namespace,
   - instances without harw ownership.
-- **New closed vocabulary:** one `Capability` variant (`dod/crates/harw-dod-cap/src/capability.rs:40`), plus EventKinds following the procedure in `docs/design/harw-dod-sensor-extensibility-plan.md`.
+- **New closed vocabulary:** one `Capability` variant (`harw-dod/crates/harw-dod-cap/src/capability.rs:40`), plus EventKinds following the procedure in `docs/design/harw-dod-sensor-extensibility-plan.md`.
 - **Ownership:** matching a finding to a harw instance needs an "expected instances" set as I-ring data (`harw-container-model`) in the sentinel configuration.
 - **Flow:** sensor → sentinel → rules → escalate → warden. There is no sensor-to-warden edge (`gate_edges.rs:128-165`).
-- **Actions:** a container's scope is a cgroup, so the existing `FreezeCgroup`, `IsolateNetwork` and `KillProcessTree` actions (`dod/crates/harw-dod-warden-proto/src/action.rs:100`) already apply. There is no new `WardenAction`, and the warden's dependency hull is unchanged.
-- **Engine-level cleanup:** the executor sees the attempt as `Exited` or `Lost`, finalizes it, and garbage collection removes the container. This follows the rule in `dod/crates/harw-dod-warden/src/executor.rs:40-66` that real mechanisms stay outside the warden.
+- **Actions:** a container's scope is a cgroup, so the existing `FreezeCgroup`, `IsolateNetwork` and `KillProcessTree` actions (`harw-dod/crates/harw-dod-warden-proto/src/action.rs:100`) already apply. There is no new `WardenAction`, and the warden's dependency hull is unchanged.
+- **Engine-level cleanup:** the executor sees the attempt as `Exited` or `Lost`, finalizes it, and garbage collection removes the container. This follows the rule in `harw-dod/crates/harw-dod-warden/src/executor.rs:40-66` that real mechanisms stay outside the warden.
 
 ## 7. Placement integration
 - **RuntimeOffer kinds:** `oci-podman-rootless`, `oci-podman-rootful`, `oci-docker`, `k8s-pod`, plus one offer per `RuntimeClass`. Each carries a per-dimension `EnforcementState` (`README.md:119`).

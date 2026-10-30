@@ -5,20 +5,20 @@
 This document was originally written on 2026-09-18 as a forward-looking
 implementation plan, not yet verified against a running host. As of this
 review, substantial parts of it are implemented: `harw-authority` exists as
-a crate in the product workspace, `dod/crates/harw-dod-config` exists,
-`dod/Makefile` implements the FHS-layout install targets described in §5,
+a crate in the product workspace, `harw-dod/crates/harw-dod-config` exists,
+`harw-dod/Makefile` implements the FHS-layout install targets described in §5,
 and the systemd units described in §5.2 exist under the canonical
 `deploy/systemd/` tree (`harw-dod.target`, `harw-sentinel.service`,
 `harw-probe-bpf.service`, `harw-probe-fs.service`, `harw-warden.service`,
-`harw-warden.socket`; the former duplicate `dod/packaging/systemd/` was
+`harw-warden.socket`; the former duplicate `harw-dod/packaging/systemd/` was
 removed by Crypto Masterplan v2 H10). The `permission_request!` macro
 described in §6.3 has since landed in `harw-macros` (PL-97 M2). The rest of
 this document's many detailed acceptance
 criteria (§8) have not been individually re-verified for this pass — treat
 sections below as the original plan's intent, cross-check specifics against
-the code before relying on them, and see `dod/Makefile`,
+the code before relying on them, and see `harw-dod/Makefile`,
 `deploy/systemd/`, `harw-authority/src/lib.rs`, and
-`dod/crates/harw-dod-config` for current ground truth.
+`harw-dod/crates/harw-dod-config` for current ground truth.
 
 ## 1. Goal and binding decisions
 
@@ -35,7 +35,7 @@ wiring; actual authorization stays in the authority core.
 
 Binding decisions from the original review:
 
-- A dedicated `dod/Makefile`, including installation of every DoD runtime
+- A dedicated `harw-dod/Makefile`, including installation of every DoD runtime
   component and systemd service file.
 - System-wide systemd services on this machine; no user units and no file
   capabilities on personally-writable binaries.
@@ -89,7 +89,7 @@ rights.
 ### 3.1 One system contract
 
 A new, small DoD crate, `harw-dod-config` (**implemented** —
-`dod/crates/harw-dod-config`): parsing, validation and resolution of system
+`harw-dod/crates/harw-dod-config`): parsing, validation and resolution of system
 configuration. No dependency on `harw-runtime`, the registry, or tool
 crates. Every participating service uses the same contract.
 
@@ -173,7 +173,7 @@ filtering only in the sentinel does not satisfy the observation boundary.
 
 ### 4.1 Build domain
 
-A standalone `dod/bpf/` with its own toolchain file and lockfile, separate
+A standalone `harw-dod/bpf/` with its own toolchain file and lockfile, separate
 from the host workspace. Rust/`no_std` and aya-eBPF; no nightly requirement
 for normal host crates. An isolated build step produces the exec and TCP
 objects. Toolchain, `aya-ebpf` and `bpf-linker` versions get validated
@@ -258,7 +258,7 @@ payload.
 
 ### 5.1 Install layout — implemented
 
-Confirmed present in `dod/Makefile`:
+Confirmed present in `harw-dod/Makefile`:
 
 | Path | Content and ownership |
 |---|---|
@@ -285,7 +285,7 @@ back into a personal HARW tree.
 
 Install supports `PREFIX`, `LIBEXECDIR`, `LIBDIR`, `SYSCONFDIR`,
 `LOCALSTATEDIR`, `SYSTEMD_UNITDIR` and `DESTDIR` — confirmed as knobs in
-`dod/Makefile`. Default is a local admin install under `/usr/local`;
+`harw-dod/Makefile`. Default is a local admin install under `/usr/local`;
 distributions can set `/usr`. Runtime/data paths stay FHS-compliant.
 
 ### 5.2 systemd contract — implemented
@@ -311,7 +311,7 @@ infinite loops on invalid configuration. Readiness requires working IPC
 receipt and successfully attached configured sensors, not just a live
 process.
 
-### 5.3 Targets — implemented (`dod/Makefile`)
+### 5.3 Targets — implemented (`harw-dod/Makefile`)
 
 Confirmed present: `help`, `doctor`, `check-config`, `build-bpf`, `build`,
 `check`/`fmt`/`clippy`/`test`, `verify`, `install`, `enable`, `disable`,
@@ -517,9 +517,9 @@ acceptance passes. No automatic commits of unrelated changes.
   rotation, queue/ring losses and memory use — a silent failure does not
   count as successful operation.
 
-Canonical verification once the targets exist: `make -C dod verify`, then
+Canonical verification once the targets exist: `make -C harw-dod verify`, then
 for delivery B the existing root target `make clippy-tests`. Live
-acceptance separately with `make -C dod smoke`. Baseline failures must be
+acceptance separately with `make -C harw-dod smoke`. Baseline failures must be
 reported separately; no green overall acceptance with missing required
 checks.
 

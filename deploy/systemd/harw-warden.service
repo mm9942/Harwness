@@ -1,11 +1,11 @@
 # harw-warden.service -- DoD enforcement binary, socket-activated, no IP.
 #
 # Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Rendered
-# by dod/scripts/install.sh (LIBEXECDIR, SYSCONFDIR).
+# by harw-dod/scripts/install.sh (LIBEXECDIR, SYSCONFDIR).
 #
 # Shipped DISABLED: no [Install] section, no edge from harw-dod.target, and
 # the ConditionPathExists= guard below. Opt in with
-# `make -C dod enable-warden` (creates SYSCONFDIR/warden.enable).
+# `make -C harw-dod enable-warden` (creates SYSCONFDIR/warden.enable).
 #
 # Identity (H10 reconciliation): a dedicated system user, never root. The
 # earlier DoD-installer variant ran as root with an unrestricted bounding

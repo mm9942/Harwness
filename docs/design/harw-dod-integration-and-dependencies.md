@@ -105,7 +105,7 @@ two-block boundary had to land before the triage agents, because a triage
 agent without it would be an injection target.
 
 Phases 0–6 are implemented in the current codebase (`harw-context`,
-`harw-observe*`, the DoD sensor/rules/escalate/warden (`dod/crates/`)
+`harw-observe*`, the DoD sensor/rules/escalate/warden (`harw-dod/crates/`)
 crates). Phase 7 operational items (off-host mirroring, out-of-band
 alerting) are Open — see `docs/design/harw-security-observability-plan.md`
 for current operational status.
@@ -119,7 +119,7 @@ for current operational status.
 **D1. Pure Rust only on the privileged path.** The warden and everything it
 links contains no C code, no `*-sys` crate, no `bindgen`, no `pkg-config`. A
 C library in the warden would be exactly the memory-safety hole the whole
-system is built against. **Implemented** — verified: `dod/crates/harw-warden/Cargo.toml`
+system is built against. **Implemented** — verified: `harw-dod/crates/harw-warden/Cargo.toml`
 depends only on Rust crates (`rustix`, `landlock`, `sd-listen-fds`, `serde`,
 `clap`, `tracing`) plus in-house crates; network enforcement shells out to
 the `nft` binary as a subprocess rather than linking a C netfilter library
@@ -146,14 +146,14 @@ low-traffic or unmaintained crate means: build it on `rustix`.
 **D7. The warden's dependency count is a number with a ceiling**, documented
 and checked in CI. A enforcer that can be fully read should have a
 dependency tree that can be fully read too. **Status: Open as an enforced
-CI check** — `dod/crates/harw-warden/Cargo.toml` currently lists roughly a
+CI check** — `harw-dod/crates/harw-warden/Cargo.toml` currently lists roughly a
 dozen direct dependencies, consistent with the doctrine's intent, but no CI
 step currently counts and gates the transitive total.
 
 **D8. Supply-chain gates in CI.** `cargo deny` for advisories, sources,
 licenses and bans as the baseline gate — **implemented**
 (`deny.toml`, `.github/workflows/ci.yml` `cargo-deny` job). `cargo vet`,
-scoped to the `dod/` subtree only — **Open**, not yet wired into CI (no
+scoped to the `harw-dod/` subtree only — **Open**, not yet wired into CI (no
 `vet` config or audit store in the repository as of this review). `cargo
 auditable` for shipped binaries — **Open**, not found in the build/release
 tooling.
@@ -173,7 +173,7 @@ dependencies change.
 | Purpose | Crate | Status |
 |---|---|---|
 | Syscalls | `rustix` (`linux_raw`) | Implemented, used throughout the privileged binaries |
-| eBPF | `aya` | Implemented — `dod/crates/harw-dod-bpf` |
+| eBPF | `aya` | Implemented — `harw-dod/crates/harw-dod-bpf` |
 | Path confinement | `landlock` | Implemented — `harw-sentinel`, `harw-probe-fs`, `harw-warden` all apply a landlock rule |
 | Netlink transport | `netlink-*` family | Implemented — `harw-dod-netlink`, `harw-dod-authlog` |
 | procfs | in-house parsing | Implemented per-sensor (see `harw-dod-crate-decomposition.md` §4/§5), rather than an external `procfs` crate |
@@ -183,7 +183,7 @@ dependencies change.
 
 | Purpose | Original candidate | Current status |
 |---|---|---|
-| Netfilter | `rustables` (pure-Rust netlink) | **Not used.** `dod/crates/harw-warden/src/isolation.rs` instead shells out to the `nft` CLI binary as a child process, with a fixed argument grammar and no shell interpolation. This is a deliberate deviation from the original doctrine's D1 preference for pure Rust over an external binary; it avoids depending on a less-mature netlink-nftables crate at the cost of a subprocess dependency. Worth revisiting once/if the nftables Rust ecosystem matures. |
+| Netfilter | `rustables` (pure-Rust netlink) | **Not used.** `harw-dod/crates/harw-warden/src/isolation.rs` instead shells out to the `nft` CLI binary as a child process, with a fixed argument grammar and no shell interpolation. This is a deliberate deviation from the original doctrine's D1 preference for pure Rust over an external binary; it avoids depending on a less-mature netlink-nftables crate at the cost of a subprocess dependency. Worth revisiting once/if the nftables Rust ecosystem matures. |
 | seccomp | `seccompiler` | **Not implemented.** No seccomp filtering was found in the codebase; process confinement currently relies on landlock plus capability dropping, not syscall filtering. Open. |
 | GPU | `nvml-wrapper` | Behind a feature/trait as planned; AMD/Intel go through sysfs with no extra dependency (`harw-dod-gpu`). |
 
@@ -202,7 +202,7 @@ system only reads their reports.
 ### 3.3 The warden as the hard case
 
 The warden is where the doctrine applies most strictly. Confirmed in
-`dod/crates/harw-warden/Cargo.toml`: `rustix` for syscalls, no async
+`harw-dod/crates/harw-warden/Cargo.toml`: `rustix` for syscalls, no async
 runtime (no tokio — a blocking socket loop is sufficient), a
 systemd-activated `SOCK_SEQPACKET` socket via `sd-listen-fds` (0 further
 dependencies of its own), `landlock` for path confinement, and network

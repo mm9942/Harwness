@@ -279,7 +279,7 @@ pub const WARDEN_ROOT: &str = "harw-warden";
 ///   `FindingId`, `ApprovalActor` und `ContentDigest`. Die Kante ist für den
 ///   Warden also unnötig, aber nicht mit einer Zeile lösbar: ein
 ///   abschaltbares Feature in `harw-types` würde beim gemeinsamen Bau der
-///   vier DoD-Binaries (`dod/Makefile`, `build`) durch Feature-Vereinigung
+///   vier DoD-Binaries (`harw-dod/Makefile`, `build`) durch Feature-Vereinigung
 ///   wieder eingeschaltet, dieses Gate zählte dann weniger, als tatsächlich
 ///   gebaut wird. Die ehrliche Lösung ist, `CancelToken` aus `harw-types`
 ///   herauszulösen (rund fünfzehn Verwender). Danach sinkt diese Zahl um
@@ -2023,7 +2023,7 @@ fn evaluate_c_build(result: &ClosureResult) -> GateReport {
 /// Hülle einmalig — gemeinsame Grundlage für beide `run()`-Funktionen.
 ///
 /// # Description
-/// `harw-warden` liegt unter `dod/crates/` und ist seit PL-60 Member des
+/// `harw-warden` liegt unter `harw-dod/crates/` und ist seit PL-60 Member des
 /// Wurzel-Workspace. Maßgeblich für seine Hülle ist deshalb das
 /// Wurzel-`Cargo.lock` — das einzige Lockfile, mit dem das Binary gebaut
 /// wird. Der Graph ist der Wurzel-Workspace

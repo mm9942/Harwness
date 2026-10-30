@@ -142,7 +142,7 @@
 //!   ([`network_scope`]); leer meldet jede ausgehende Verbindung.
 //! - `scope = "host"`: `BpfScope::Host`, kein Rescan, Landlock-Regelsatz
 //!   unverändert — exakt das Verhalten vor E3c (die ausgelieferte
-//!   `dod/config.toml` wählt genau dieses Profil mit beiden Sensoren).
+//!   `harw-dod/config.toml` wählt genau dieses Profil mit beiden Sensoren).
 //! - `scope = "cgroups"`: jede konfigurierte Wurzel wird vor Landlock unter
 //!   `--cgroup-root` aufgelöst. Eine fehlende Wurzel wird geloggt und als
 //!   degradierter Start gemeldet (genau ein `SensorDegraded` je geladenem
@@ -168,7 +168,7 @@
 //! - [x] E3c: Profil auflösen, Scope vor Landlock bauen, Sensoren und CIDRs
 //!   aus dem Profil, `--cgroup-root` als nur auflistende Landlock-Wurzel.
 //! - [ ] Kernelseitiger Vorfahrenabgleich
-//!   (`bpf_get_current_ancestor_cgroup_id` unter `dod/bpf/`, ABI-Bump): ein
+//!   (`bpf_get_current_ancestor_cgroup_id` unter `harw-dod/bpf/`, ABI-Bump): ein
 //!   eigener Folgeschritt; er schlösse das Fenster von bis zu einem
 //!   Rescan-Intervall, in dem eine brandneue cgroup noch nicht beobachtet
 //!   wird.

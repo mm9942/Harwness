@@ -59,7 +59,7 @@ pub mod spawn;
 /// eigene `[workspace.dependencies]`, in der Wurzel unter `exclude`), und
 /// diese Funktion führte beide Workspaces per
 /// [`WorkspaceGraph::load_many`] zusammen. Seit PL-60 stehen alle Crates
-/// unter `dod/crates/` explizit in den `members` der Wurzel-`Cargo.toml`
+/// unter `harw-dod/crates/` explizit in den `members` der Wurzel-`Cargo.toml`
 /// (siehe `docs/architecture/dod-workspace-merge-plan.md`); ein einziger
 /// [`WorkspaceGraph::load`] enthält deshalb alle vier Binaries, alle
 /// Sensoren und die Pfad-Kanten DoD → Produkt als interne Kanten.
@@ -254,7 +254,7 @@ mod tests {
     }
 
     /// PL-60: DoD ist kein verschachtelter Workspace mehr. Ein
-    /// wiederauftauchendes `dod/Cargo.toml` (oder `dod/Cargo.lock`) würde
+    /// wiederauftauchendes `harw-dod/Cargo.toml` (oder `harw-dod/Cargo.lock`) würde
     /// wieder eine zweite Builddomäne mit eigenem Lockfile aufmachen, die
     /// die Wurzel nicht sieht; ein DoD-Crate, das in den Wurzel-`members`
     /// fehlt, fiele still aus jedem Gate.
@@ -262,21 +262,21 @@ mod tests {
     fn test_dod_crates_are_root_workspace_members() -> TestResult {
         let root = repo_root()?;
         assert!(
-            !root.join("dod").join("Cargo.toml").exists(),
-            "dod/Cargo.toml darf nicht wieder entstehen (PL-60: ein Workspace)"
+            !root.join("harw-dod").join("Cargo.toml").exists(),
+            "harw-dod/Cargo.toml darf nicht wieder entstehen (PL-60: ein Workspace)"
         );
         assert!(
-            !root.join("dod").join("Cargo.lock").exists(),
-            "dod/Cargo.lock darf nicht wieder entstehen (PL-60: ein Lockfile)"
+            !root.join("harw-dod").join("Cargo.lock").exists(),
+            "harw-dod/Cargo.lock darf nicht wieder entstehen (PL-60: ein Lockfile)"
         );
 
         let graph = super::load_all_workspaces(root).map_err(TestError::Unexpected)?;
-        let crates_dir = root.join("dod").join("crates");
-        let entries =
-            std::fs::read_dir(&crates_dir).map_err(|_| TestError::Missing("dod/crates lesbar"))?;
+        let crates_dir = root.join("harw-dod").join("crates");
+        let entries = std::fs::read_dir(&crates_dir)
+            .map_err(|_| TestError::Missing("harw-dod/crates lesbar"))?;
         let mut seen = 0usize;
         for entry in entries {
-            let entry = entry.map_err(|_| TestError::Missing("dod/crates-Eintrag"))?;
+            let entry = entry.map_err(|_| TestError::Missing("harw-dod/crates-Eintrag"))?;
             if !entry.path().join("Cargo.toml").is_file() {
                 continue;
             }
@@ -287,7 +287,7 @@ mod tests {
                 "DoD-Crate '{name}' fehlt in den members der Wurzel-Cargo.toml"
             );
         }
-        assert!(seen > 0, "keine DoD-Crates unter dod/crates gefunden");
+        assert!(seen > 0, "keine DoD-Crates unter harw-dod/crates gefunden");
         Ok(())
     }
 

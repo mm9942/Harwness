@@ -11,7 +11,7 @@
 # Datei.
 #
 # Was das Gate prüft (Details in xtask/src/gate_arch.rs):
-# - Jedes Paket im Graphen (seit PL-60 ein Workspace, `dod/crates/*`
+# - Jedes Paket im Graphen (seit PL-60 ein Workspace, `harw-dod/crates/*`
 #   eingeschlossen) steht unter `[packages]`. Ein neues, nicht
 #   klassifiziertes Paket ist ein Verstoß.
 #   Hier gelistete, aber (noch) nicht existierende Pakete sind zulässig.
@@ -36,7 +36,7 @@ F = "foundation — breit konsumierbar, kaum Wissen nach außen (§7, §42)"
 I = "shared infrastructure — wiederverwendbare Mechanismen (§13, §17, §42)"
 C = "compiler domain — DSL, Artefakt, Compiler (§11)"
 J = "job infrastructure — ohne Harwness- und DoD-Semantik (§14)"
-D = "DoD domain — dod/crates/* (§18)"
+D = "DoD domain — harw-dod/crates/* (§18)"
 A = "application/composition — darf breit zusammensetzen (§24)"
 
 # Wer auf welche Schicht zeigen darf. Eine Schicht darf immer nur nach
@@ -200,7 +200,7 @@ layer = "J"
 [packages."harw-command"]
 layer = "J"
 
-# --- D: DoD domain (dod/crates/*) -----------------------------------------
+# --- D: DoD domain (harw-dod/crates/*) -----------------------------------------
 [packages."harw-dod"]
 layer = "D"
 [packages."harw-dod-authlog"]

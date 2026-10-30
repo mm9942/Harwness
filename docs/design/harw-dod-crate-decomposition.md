@@ -7,7 +7,7 @@ single-responsibility crates; their dependencies, error types, wiring, and
 who is allowed to do what, how, and where.
 **Related:** `harw-dod-charter.md`, `harw-dod-integration-and-dependencies.md`
 
-The DoD domain under `dod/crates/` now has 32 crates implementing this
+The DoD domain under `harw-dod/crates/` now has 32 crates implementing this
 decomposition. Until PL-60 they formed a separate, nested Cargo workspace
 (`dod/Cargo.toml`, own `Cargo.lock`); they are now explicit members of the
 root workspace (see `docs/architecture/dod-workspace-merge-plan.md`). Illustrative code in this document uses representative
@@ -49,11 +49,11 @@ on `harw-dod-authlog`.)
 **C2.** The permission is proven at bind time, not assumed.
 `SensorHandle<Unbound>::bind()` performs a real probe access; only
 `SensorHandle<Bound>` exposes `poll`/`subscribe`.
-Implemented: `dod/crates/harw-dod-cap/src/handle.rs`.
+Implemented: `harw-dod/crates/harw-dod-cap/src/handle.rs`.
 
 **C3.** Scope is a value, not a convention. A sensor reads exclusively
 through a `ReadScope` it receives in its constructor, which can only shrink.
-Implemented: `dod/crates/harw-dod-cap/src/scope.rs` (a semilattice with only
+Implemented: `harw-dod/crates/harw-dod-cap/src/scope.rs` (a semilattice with only
 `intersection`, no `add`/union; symlinks are resolved before the scope check,
 including a dedicated alias-root mechanism for sysfs class directories whose
 entries are themselves symlinks into `/sys/devices/...`).
@@ -220,7 +220,7 @@ them, fans results into streams, and manages degradation.
 
 Four binaries, one privilege class each (implements C4/C8 at the operational
 level), confirmed present: `harw-sentinel`, `harw-probe-bpf`,
-`harw-probe-fs`, `harw-warden` (`dod/crates/{harw-sentinel,harw-probe-bpf,harw-probe-fs,harw-warden}`).
+`harw-probe-fs`, `harw-warden` (`harw-dod/crates/{harw-sentinel,harw-probe-bpf,harw-probe-fs,harw-warden}`).
 
 | Binary | Kernel rights | Contains | Landlock scope |
 |---|---|---|---|
@@ -334,7 +334,7 @@ Bottom-up, each stage independently useful and testable:
 8. **Facade and agents.** `harw-dod`, the security agent family, triage
    specializations, plan attachment.
 
-All 8 stages are now present in the `dod/` workspace; stages 1–5 need no
+All 8 stages are now present in the `harw-dod/` workspace; stages 1–5 need no
 kernel permission and no VM to develop or test.
 
 ---
@@ -345,7 +345,7 @@ kernel permission and no VM to develop or test.
   declarations across its dependency graph and compares it to the unit's
   declared ceiling. Implemented: `xtask/src/gate_privileges.rs`.
 - **Isolation test.** No sensor crate may depend on another sensor crate
-  (C7). Implemented via `dod/crates/harw-dod/tests/facade.rs` and workspace
+  (C7). Implemented via `harw-dod/crates/harw-dod/tests/facade.rs` and workspace
   dependency-graph checks.
 - **Scope test.** A fixture directory containing a symlink pointing outside
   the scope; `ReadScope::open` must return `OutsideScope`.

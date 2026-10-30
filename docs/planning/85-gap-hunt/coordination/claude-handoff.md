@@ -9,9 +9,9 @@ This note makes Harw the only writer for R16 integration. From here I do not pus
 ### `blocker-a` / `blocker-b`: no code from me
 I did not start either one; there is no local diff and no branch. These are the entry points I had mapped:
 - **A:**
-  - `dod/crates/harw-dod-warden/src/warden.rs` (`Warden::handle` → `request.proof.verify`) and `lib.rs`
+  - `harw-dod/crates/harw-dod-warden/src/warden.rs` (`Warden::handle` → `request.proof.verify`) and `lib.rs`
   - `harw-warden/src/{ipc,protocol,warden_factory}.rs`
-  - `dod/crates/harw-dod-warden-proto/src/{proof,signed}.rs`
+  - `harw-dod/crates/harw-dod-warden-proto/src/{proof,signed}.rs`
 - **B:**
   - `harw-ops/src/sandbox_lease.rs::handle_revoke`, which sweeps only the caller's session in the ledger.
   - `harw-sandbox/src/process_permit.rs`, which has `revoke_session` but no `revoke_all`.

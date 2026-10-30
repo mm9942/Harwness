@@ -79,7 +79,7 @@ One work package may produce several small commits, but each reviewable slice en
 
 ## W02 — Versioned lifecycle facts and identity contract
 
-**Files:** add `harw-host-model/src/{lib,identity,observation,workload,query}.rs`; change `dod/crates/harw-dod-bpf/src/{abi,contract,profile}.rs`, relevant `dod/bpf/src/` programs and minimal signal/sink DTO code. Shared manifests/gates are edited only by the integrator.
+**Files:** add `harw-host-model/src/{lib,identity,observation,workload,query}.rs`; change `harw-dod/crates/harw-dod-bpf/src/{abi,contract,profile}.rs`, relevant `harw-dod/bpf/src/` programs and minimal signal/sink DTO code. Shared manifests/gates are edited only by the integrator.
 
 **Consumes:** existing v1 ABI and process observations. **Produces:** the proposed ProcessInstanceRef, SourceCursor, CoverageState and validated lifecycle envelopes; no control authority.
 

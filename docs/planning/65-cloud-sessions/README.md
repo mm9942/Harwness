@@ -38,7 +38,7 @@ Build rule (binding, verbatim, for every agent prompt): Subagents and parallel a
 | `harw gateway` daemon | `harw-cli/src/gateway.rs`: a persistent daemon that keeps the long-lived runtime alive and already runs model turns for Telegram. "`harw` (ohne Subcommand) bleibt der TUI-Client; der Daemon läuft getrennt." | The natural home for the session host (DEC-011). |
 | `harw-web` | UDS only, SO_PEERCRED (`peer.rs`), `LocalPeerIdentityResolver` → `ResolvedPeer{tier, tenant, …}` (`identity.rs`). Routes come only from `OperationRegistry` (`router.rs`). `GET /events` is SSE with `sequence: u64` but **no replay** and one stream for the whole process (`events.rs`). The web entry runs **no model turns** (`runtime_web.rs`: `EntryKind::Web`, `ModelSource::Echo`). | Reuse `peer.rs` and the identity modules as a library. Do not build sessions into the web op table. |
 | `harw-node-transport` (A) | TLS 1.3 restricted to X25519MLKEM768 + mutual ML-DSA-65 transcripts bound to the TLS exporter; replay cache. `NodeTransportServer::new(local, verifier: Arc<dyn NodeVerifier>, options)`; `NodeVerifier::is_known` refuses unknown clients before the server signs anything; `AuthenticatedPeer{node_id, protocol_version}` is attached as a request extension; `AuthHubNodeSigner` is hard-wired to `HarwKeyPurpose::NodeIdentity`. NDJSON uplink with `UplinkLimits`. | A dynamic device verifier is possible **without** changing the transport. Enrollment (client not yet known) **does** need a transport change (RS2-05). |
-| KMS purposes | `dod/crates/harw-dod-encrypt/src/purpose.rs`: `HarwKeyPurpose::DeviceIdentity` → `SignPurpose::DeviceHandshake` (`"harw:device-handshake:v1"`) already exists. | Device keys fit the existing purpose table. Nothing new to invent. |
+| KMS purposes | `harw-dod/crates/harw-dod-encrypt/src/purpose.rs`: `HarwKeyPurpose::DeviceIdentity` → `SignPurpose::DeviceHandshake` (`"harw:device-handshake:v1"`) already exists. | Device keys fit the existing purpose table. Nothing new to invent. |
 | `harw-channel` | `PairingCode`: Crockford 8 characters, 40 bits, single use, TTL 15 min, scoped to one channel (`pairing.rs`); `SessionKey{tenant, channel, peer, thread}`. | Reuse `PairingCode` for device enrollment. |
 | `harw-session-store` | `TranscriptRecord{session_id, thread, sequence (monotonic, 0-based), recorded_at, kind, payload}`, JSONL, fs4 lock. `TranscriptStateStore::save_history` **appends** a `history_replaced` marker instead of rewriting; `TranscriptStore::rewrite` exists for retention. `ApprovalRecord{…, tenant: Option<TenantId>}`. | The durable cursor is the transcript `sequence`. A new `generation` is needed only after a `rewrite`. |
 | `harw-protocol` (F) | `RequestEnvelope/ResponseEnvelope/NotificationEnvelope`; `ProtocolVersion{major, minor}` rejects any major ≠ 1; `methods.rs` already has `turn.submit`, `turn.interrupt`, `approval.respond`, `session.close`, `event.session`, `event.turn`, `approval.request`. None of these is used anywhere outside the crate. `TurnEvent`/`SessionEvent` are internally tagged and have no unknown-variant fallback. | Reuse the envelopes. Wrap events in a frame type that has an `Unknown` fallback. |
@@ -591,7 +591,7 @@ Conventions:
   3. `cargo test --workspace` (including doc tests)
   4. `cargo run -q -p xtask -- gates`
   5. `cargo deny check`
-  6. `make -C dod clippy test`
+  6. `make -C harw-dod clippy test`
   7. `actionlint`
 
   Rounds that add crates: the first build must update `Cargo.lock` (no `--locked`) before the DoD step, which uses `--locked`.
@@ -942,7 +942,7 @@ model = "claude-haiku-…"   # placeholder; DEC-002: cheap reads, 256 output tok
 
 **DEC-004**
 - The verify list runs only centrally and holds `verify.lock`.
-- The end-of-round central build (including `cargo deny`, `make -C dod`, `actionlint`, which are not in `verify`) is run by the main session by hand.
+- The end-of-round central build (including `cargo deny`, `make -C harw-dod`, `actionlint`, which are not in `verify`) is run by the main session by hand.
 
 ### 11.5 Copilot items (backlog format, separate from the orchestrator)
 | ID | Task | Size | Depends on |
@@ -960,7 +960,7 @@ The orchestrator keeps every security-relevant item (RS2-04/05, RS4-04, RS5-04, 
 ---
 
 ### Summary for the central build (per round)
-The commands the main session runs are in §9 (in order: fmt, clippy `-D warnings`, test, `xtask gates`, `cargo deny`, `make -C dod clippy test`, `actionlint`, with the cloud disk flags in the container). Tests to be added are named in each item. No tests have been written yet; this is a plan.
+The commands the main session runs are in §9 (in order: fmt, clippy `-D warnings`, test, `xtask gates`, `cargo deny`, `make -C harw-dod clippy test`, `actionlint`, with the cloud disk flags in the container). Tests to be added are named in each item. No tests have been written yet; this is a plan.
 
 ### Critical Files for Implementation
 - /home/user/Harwness/harw-protocol/src/wire.rs (with `events.rs`, `methods.rs`; the new `session_wire.rs` builds on them)

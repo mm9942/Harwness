@@ -115,5 +115,5 @@ No tests were added. Once W11 lands, the central build runs, with `CARGO_INCREME
 3. `cargo test --workspace` (including doc tests)
 4. `cargo run -q -p xtask -- gates`
 5. `cargo deny check`
-6. `make -C dod clippy test` (`--locked`, so commit the `Cargo.lock` first)
+6. `make -C harw-dod clippy test` (`--locked`, so commit the `Cargo.lock` first)
 7. `actionlint`

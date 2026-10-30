@@ -6,7 +6,7 @@ This compartment exists so the DoD workspace merge is not hidden inside the gene
 
 ## Current (after PL-60)
 
-- DoD crates under `dod/crates/` are explicit members of the root workspace
+- DoD crates under `harw-dod/crates/` are explicit members of the root workspace
   (separate commented block in the root `members`); `exclude = ["dod"]` is gone.
 - `dod/Cargo.toml` and `dod/Cargo.lock` are retired; the root `Cargo.lock` is
   the single resolution record.
@@ -39,7 +39,7 @@ ledger `MIG-016` and `MIG-019`):
 Not landed: E4 (jobs ↔ findings correlation; only the client half
 `harw-dod-client/src/correlate.rs`), `harw dod enable --grant-read`, the
 Warden v2 proof path (PL-96 W01), and the "no silent services" question for
-`make -C dod install`/`stage` (PL-97 §8.4). Operator flow:
+`make -C harw-dod install`/`stage` (PL-97 §8.4). Operator flow:
 [`docs/setup/dod.md`](../../setup/dod.md#operator-flow-pl-97); CLI:
 [`docs/cli.md`](../../cli.md#harw-dod-harw-dod).
 
@@ -63,7 +63,7 @@ Warden v2 proof path (PL-96 W01), and the "no silent services" question for
 ## Current repository references
 
 - `../../../Cargo.toml`
-- `../../../dod/Makefile` (packaging; `-p` builds against the root manifest)
+- `../../../harw-dod/Makefile` (packaging; `-p` builds against the root manifest)
 - `../../../docs/design/harw-dod-charter.md`
 - `../../../docs/design/harw-dod-crate-decomposition.md`
 - `../../../docs/design/harw-dod-integration-and-dependencies.md`

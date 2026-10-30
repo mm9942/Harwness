@@ -46,8 +46,8 @@
 //! Sensor zugeordnet wird. Diese Datei erfindet keine zweite Fähigkeit.
 //!
 //! # Woher die Programmobjekte kommen
-//! `make build-bpf` (bzw. `scripts/build-bpf.sh` → `dod/bpf/Makefile`)
-//! übersetzt `dod/bpf/src/*.bpf.c` zu genau vier ELF-Objekten —
+//! `make build-bpf` (bzw. `scripts/build-bpf.sh` → `harw-dod/bpf/Makefile`)
+//! übersetzt `harw-dod/bpf/src/*.bpf.c` zu genau vier ELF-Objekten —
 //! `exec.bpf.o`, `exit.bpf.o`, `tcp_v4_connect.bpf.o`,
 //! `tcp_v6_connect.bpf.o` — und `scripts/install.sh` legt sie unter
 //! `$(BPFDIR)` ab (Vorgabe `/usr/local/lib/harw-dod/bpf`). Diese Datei löst
@@ -57,7 +57,7 @@
 //! 1. der explizite Kommandozeilenpfad (`--exec-program-path` usw., so wie
 //!    `harw-dod-bpf.service` ihn setzt);
 //! 2. `$HARW_DOD_BPF_DIR/<name>.bpf.o` ([`BPF_OBJECT_DIR_ENV`]) — für einen
-//!    Entwicklungsaufbau, der direkt gegen `BPF_ARTIFACT_DIR` (`dod/bpf`)
+//!    Entwicklungsaufbau, der direkt gegen `BPF_ARTIFACT_DIR` (`harw-dod/bpf`)
 //!    läuft;
 //! 3. [`DEFAULT_BPF_OBJECT_DIR`]`/<name>.bpf.o`.
 //!
@@ -167,14 +167,14 @@ fn empty_scope() -> ReadScope {
 /// Programmobjekte kommen"): ein expliziter Kommandozeilenpfad gewinnt
 /// immer. Ein leerer Wert gilt als nicht gesetzt. Typische Verwendung:
 /// `HARW_DOD_BPF_DIR=$PWD/bpf` nach `make build-bpf` (dessen Vorgabe für
-/// `BPF_ARTIFACT_DIR` genau `dod/bpf` ist).
+/// `BPF_ARTIFACT_DIR` genau `harw-dod/bpf` ist).
 pub const BPF_OBJECT_DIR_ENV: &str = "HARW_DOD_BPF_DIR";
 
 /// Vorgabe-Objektverzeichnis: `/usr/local/lib/harw-dod/bpf`.
 ///
 /// # Description
 /// Entspricht `BPFDIR = $(LIBDIR)/bpf` mit `LIBDIR = $(PREFIX)/lib/harw-dod`
-/// und `PREFIX = /usr/local` aus `dod/Makefile` — genau der Ort, an den
+/// und `PREFIX = /usr/local` aus `harw-dod/Makefile` — genau der Ort, an den
 /// `scripts/install.sh` die vier Objekte installiert. Ein Paketbau mit
 /// anderem `PREFIX` setzt die Pfade ohnehin explizit über die
 /// systemd-Unit (`@BPFDIR@`).

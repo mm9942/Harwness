@@ -434,7 +434,7 @@ pub(crate) mod test_tree {
     use crate::test_support::{TestResult, ctx};
 
     /// A host profile with both sensors and no egress CIDR: the shipped
-    /// `dod/config.toml`.
+    /// `harw-dod/config.toml`.
     pub(crate) const HOST_PROFILE: &str = r#"
 schema_version = 1
 mode = "observe"

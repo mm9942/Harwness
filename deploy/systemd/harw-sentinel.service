@@ -1,7 +1,7 @@
 # harw-sentinel.service -- Harw-DoD collection point, class "unprivileged".
 #
 # Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Embedded
-# byte-identically into harw-install and rendered by dod/scripts/install.sh,
+# byte-identically into harw-install and rendered by harw-dod/scripts/install.sh,
 # which replaces the LIBEXECDIR/SYSCONFDIR/STATEDIR/LOGDIR
 # placeholders. `harw install --print-systemd harw-sentinel.service` prints
 # the rendered default.

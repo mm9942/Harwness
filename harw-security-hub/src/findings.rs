@@ -9,7 +9,7 @@
 //! # Export format
 //! The DoD workspace has no JSON findings export today: `harw-sentinel`
 //! reports each `Finding<RuleChecked>` via `tracing` and a telemetry counter
-//! (see `dod/crates/harw-sentinel/src/findings.rs`, "Bruch 2"). This module
+//! (see `harw-dod/crates/harw-sentinel/src/findings.rs`, "Bruch 2"). This module
 //! therefore defines the minimal line format a DoD-side exporter has to
 //! write — one JSON object per line:
 //!
@@ -471,7 +471,7 @@ mod tests {
     }
 
     /// The canonical v2 export line (`V2_FIXTURE_LINE` in
-    /// `dod/crates/harw-sentinel/src/export.rs`, PL-97 D1/E4): additive
+    /// `harw-dod/crates/harw-sentinel/src/export.rs`, PL-97 D1/E4): additive
     /// `schema_version` and `scope` must not break the hub reader.
     const V2_FIXTURE_LINE: &str = r#"{"schema_version":2,"finding_id":"f-1","host":"host-a","rule_id":"structure-drift","severity":"high","summary":"s","observed_at":"2026-09-27T10:00:00Z","scope":"/sys/fs/cgroup/harw.slice"}"#;
 

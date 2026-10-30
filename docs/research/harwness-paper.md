@@ -1278,7 +1278,7 @@ The following matrix summarizes the repository baseline used by this draft.
 | Long-term memory | **Implemented** | `docs/design/harw-memory.md`, `harw-memory` |
 | Unified interaction contract | **Implemented** | `docs/design/interaction-contract.md` |
 | MCP integration | **Implemented surfaces** | README, `harw-mcp-server`, `harw-mcp-client` |
-| DoD host-security plane | **Partially implemented** | `docs/design/dod-system-operations-authority.md`, `dod/` |
+| DoD host-security plane | **Partially implemented** | `docs/design/dod-system-operations-authority.md`, `harw-dod/` |
 | Secrets and audit | **Partially implemented** | `docs/design/secrets-and-audit.md`, `harw-secrets` |
 | Wargaming / analytical workflows | **Partially implemented to implemented by component** | `docs/design/matrix-game.md`, `wargaming-and-analysis.md` |
 
@@ -1475,7 +1475,7 @@ Implementation areas referenced:
 - `harw-mcp-client`
 - `harw-mcp-server`
 - `harw-secrets`
-- `dod/crates/harw-dod-*`
+- `harw-dod/crates/harw-dod-*`
 - `harw-sentinel`
 - `harw-warden`
 

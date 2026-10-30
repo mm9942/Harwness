@@ -9,9 +9,9 @@
   "docs/planning/66-placement/README.md",
   "docs/planning/67-containers/README.md",
   "docs/planning/67-containers/cell.md",
-  "dod/crates/harw-dod-warden/src/error.rs",
-  "dod/crates/harw-dod-warden/src/executor.rs",
-  "dod/crates/harw-warden/src/isolation.rs",
+  "harw-dod/crates/harw-dod-warden/src/error.rs",
+  "harw-dod/crates/harw-dod-warden/src/executor.rs",
+  "harw-dod/crates/harw-warden/src/isolation.rs",
   "harw-catalog/src/skill_index.rs",
   "harw-config/src/discovery.rs",
   "harw-config/src/lib.rs",
@@ -84,7 +84,7 @@
   {
    "id": "F-89bbbd3489c9",
    "cluster": "c23",
-   "file": "dod/crates/harw-dod-warden/src/executor.rs",
+   "file": "harw-dod/crates/harw-dod-warden/src/executor.rs",
    "line": 167,
    "severity": "medium",
    "pattern": "NEW:cgroup-addressing",
@@ -135,7 +135,7 @@
   "cargo test --workspace (including doc tests)",
   "cargo run -q -p xtask -- gates",
   "cargo deny check",
-  "make -C dod clippy test",
+  "make -C harw-dod clippy test",
   "actionlint"
  ],
  "note": "Backfilled after the merge (kit-4); the wave predates the manifest. c33 was re-reviewed by a separate Opus agent after its repair (ok); planning-doc line citations fixed by hand; foreign files from misplaced agents (P14) were excluded."

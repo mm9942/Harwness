@@ -23,7 +23,7 @@
 | Wave | Priority | Single primary owner / files | Output and explicit pass criterion |
 |---|---|---|---|
 | W00 | P0 | release/cargo; `main/Cargo.lock`, root `Cargo.toml` and tracked cloud package inventory | main lock valid; dev clean checkout with real members, no stubs; `cargo metadata --locked` green |
-| W01 | P0 | DoD Warden TCB; `dod/crates/harw-dod-warden{,-proto}`, Escalator + privileged binary | v2 signed request on actual enforcement call path; no v1 executable ingress; nonce persists across restart; failed proof never executes |
+| W01 | P0 | DoD Warden TCB; `harw-dod/crates/harw-dod-warden{,-proto}`, Escalator + privileged binary | v2 signed request on actual enforcement call path; no v1 executable ingress; nonce persists across restart; failed proof never executes |
 | W02 | P0 | provider/context; `harw-provider-http/src/anthropic.rs` and shared wire fixture tests | `data_block` retained correctly across provider transport schemas; zero duplicate/untrusted elevation |
 | W03 | P1 | `harw-catalog`, `harw-core`, `harw-context`; no registry file ownership | enabled triggered skill fragments delivered within budget at model call; exact source and omission recorded |
 | W04 | P1 | `harw-registry-defaults`, native tool crates and `harw-agent-runner`; one scribe for common registry files | all 42 supported tools are actually registered under intended profiles; allowed/denied model calls and bwrap Cargo path verified |

@@ -126,7 +126,7 @@
   "cargo test --workspace (including doc tests)",
   "cargo run -q -p xtask -- gates",
   "cargo deny check",
-  "make -C dod clippy test",
+  "make -C harw-dod clippy test",
   "actionlint"
  ],
  "note": "Out-of-cluster doc edits in dependency-review.md and dod-workspace-merge-plan.md were kept (they describe this wave's rustix edge); an unreviewed code repair in harw-project-discovery was dropped."

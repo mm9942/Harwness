@@ -1,14 +1,14 @@
 #!/bin/sh
 # ensure-bpf-toolchain.sh — locate (and, when explicitly allowed, install)
-# the three external tools the standalone C BPF build domain (dod/bpf/)
+# the three external tools the standalone C BPF build domain (harw-dod/bpf/)
 # needs: clang, bpftool, llvm-objdump.  This lives in the dod Makefile's
-# domain, not in dod/bpf/, because installing dependencies is deliberately
-# the dod package Makefile's job; dod/bpf/Makefile has no dependency-install
+# domain, not in harw-dod/bpf/, because installing dependencies is deliberately
+# the dod package Makefile's job; harw-dod/bpf/Makefile has no dependency-install
 # target by design and stays a self-contained build description.
 #
 # This script never checks *versions*.  Version pinning stays exclusively
-# the job of dod/bpf/scripts/verify-toolchain.sh against
-# dod/bpf/toolchain.lock.toml; an apt-installed tool that does not match the
+# the job of harw-dod/bpf/scripts/verify-toolchain.sh against
+# harw-dod/bpf/toolchain.lock.toml; an apt-installed tool that does not match the
 # lock still fails the build there, fail-closed, exactly as before.
 #
 # Modes:

@@ -826,8 +826,8 @@ egress_allow_cidrs = []
             "active_profile = \"selected-services\"",
         );
         for (name, input) in [
-            ("dod/config.toml", include_str!("../../../config.toml")),
-            ("dod/packaging/config.example.toml", selected.as_str()),
+            ("harw-dod/config.toml", include_str!("../../../config.toml")),
+            ("harw-dod/packaging/config.example.toml", selected.as_str()),
         ] {
             let config = Config::from_toml(input).map_err(ctx(name))?;
             config.resolve_active().map_err(ctx(name))?;

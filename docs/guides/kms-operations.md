@@ -495,7 +495,7 @@ connection refused, or 503), `Timeout`, `Protocol` and
 - `harw-auth-hub/README.md`, `src/config.rs`, `src/guard.rs`, `src/meta.rs`
 - `harw-infra-client/README.md`, `src/auth.rs`, `src/dek.rs`
 - `harw-secrets/src/dek_wrapper.rs`, `src/store.rs` (`migrate_all_to_v3`)
-- `dod/crates/harw-dod-encrypt/src/cg.rs`, `src/transcript.rs`,
+- `harw-dod/crates/harw-dod-encrypt/src/cg.rs`, `src/transcript.rs`,
   `src/policy.rs`, `src/purpose.rs`
 - `deploy/systemd/harw-auth-hub.{socket,service}`,
   `deploy/sysusers.d/harw.conf`, `deploy/tmpfiles.d/harw.conf`

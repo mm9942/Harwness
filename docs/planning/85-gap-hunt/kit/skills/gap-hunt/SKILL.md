@@ -18,7 +18,7 @@ The pattern catalog is `docs/planning/85-gap-hunt/patterns.md`. The run logs are
   goes to `dev`.
 
 ## Steps
-1. **Scout.** List the crates (`ls -d */ dod/crates/*/`) and cut them into 6–10
+1. **Scout.** List the crates (`ls -d */ harw-dod/crates/*/`) and cut them into 6–10
    **disjoint** areas. Paths that another process is working on right now go
    into `exclude`.
 2. **Parallel cut** (catalog P6). The concurrency cap applies per workflow, at

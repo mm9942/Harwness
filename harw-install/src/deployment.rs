@@ -9,12 +9,12 @@
 //! - `harw install --print-systemd [UNIT]` prints exactly what is shipped,
 //! - the unit checks in [`crate::dod_units`] inspect the same text that
 //!   production uses, and
-//! - the DoD installer (`dod/scripts/install.sh`), which installs the same
+//! - the DoD installer (`harw-dod/scripts/install.sh`), which installs the same
 //!   files straight from `deploy/`, cannot drift from what this crate knows.
 //!
 //! The parity test below walks `deploy/` at test time and fails when a file
 //! exists there without being embedded here, when an embedded file is gone,
-//! or when the bytes differ. There is no second copy under `dod/packaging/`
+//! or when the bytes differ. There is no second copy under `harw-dod/packaging/`
 //! any more (H10 deleted it).
 //!
 //! # Placeholders
@@ -152,12 +152,12 @@ pub const DEPLOYMENT_ASSETS: &[EmbeddedDeploymentAsset] = &[
     deployment_asset!("deploy/tmpfiles.d/harw.conf", AssetKind::Tmpfiles),
 ];
 
-/// The assets the DoD installer (`dod/scripts/install.sh`) installs, as paths
+/// The assets the DoD installer (`harw-dod/scripts/install.sh`) installs, as paths
 /// relative to the repository root.
 ///
 /// # Description
 /// Mirrors the `systemd/`, `sysusers/` and `tmpfiles/` entries of
-/// `dod/packaging/manifest`; the parity tests check both directions. The
+/// `harw-dod/packaging/manifest`; the parity tests check both directions. The
 /// infrastructure units (`harw-infra.target`, `harw-auth-hub.*`, …) are
 /// embedded but not part of the DoD package.
 pub const DOD_PACKAGE_ASSETS: &[&str] = &[
@@ -197,7 +197,7 @@ pub struct RenderPaths {
 }
 
 impl Default for RenderPaths {
-    /// The defaults of `dod/scripts/install.sh` (`PREFIX=/usr/local`).
+    /// The defaults of `harw-dod/scripts/install.sh` (`PREFIX=/usr/local`).
     fn default() -> Self {
         Self {
             libexecdir: "/usr/local/libexec/harw-dod".to_owned(),

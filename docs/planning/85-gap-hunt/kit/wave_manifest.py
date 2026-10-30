@@ -47,7 +47,7 @@ CENTRAL_BUILD = [
     "cargo test --workspace (including doc tests)",
     "cargo run -q -p xtask -- gates",
     "cargo deny check",
-    "make -C dod clippy test",
+    "make -C harw-dod clippy test",
     "actionlint",
 ]
 

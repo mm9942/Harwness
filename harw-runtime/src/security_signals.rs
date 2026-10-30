@@ -281,7 +281,7 @@ mod tests {
     }
 
     /// The canonical v2 export line (`V2_FIXTURE_LINE` in
-    /// `dod/crates/harw-sentinel/src/export.rs`).
+    /// `harw-dod/crates/harw-sentinel/src/export.rs`).
     const V2_FIXTURE_LINE: &str = r#"{"schema_version":2,"finding_id":"f-1","host":"host-a","rule_id":"structure-drift","severity":"high","summary":"s","observed_at":"2026-09-27T10:00:00Z","scope":"/sys/fs/cgroup/harw.slice"}"#;
 
     fn fixture_now() -> OffsetDateTime {

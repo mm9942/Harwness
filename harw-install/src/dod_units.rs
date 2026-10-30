@@ -6,9 +6,9 @@
 //! eingebettet (`include_str!`, nicht nur unter `cfg(test)`). Dieses Modul
 //! trägt die Rechtematrix ([`UNIT_CLASSES`]) und einen minimalen Parser
 //! ([`parse_unit`]); seine Tests prüfen genau den eingebetteten Text, den
-//! `harw install --print-systemd` ausgibt und `dod/scripts/install.sh` aus
+//! `harw install --print-systemd` ausgibt und `harw-dod/scripts/install.sh` aus
 //! `deploy/` installiert. Die frühere zweite Quelle
-//! `dod/packaging/systemd/*` ist mit H10 entfallen.
+//! `harw-dod/packaging/systemd/*` ist mit H10 entfallen.
 //!
 //! # Die vier Klassen
 //! | Binary | Klasse | Fähigkeiten dieser Unit |
@@ -45,7 +45,7 @@
 //! `$prefix/lib/systemd/system/`): eine Nutzerinstanz kann keine
 //! Capabilities vergeben und keinen für mehrere Systemnutzer gemeinsamen
 //! `/run/harw`-Pfad bereitstellen. [`crate::service_systemd`] kennt nur
-//! Nutzerunits; die Systeminstallation übernimmt `dod/scripts/install.sh`
+//! Nutzerunits; die Systeminstallation übernimmt `harw-dod/scripts/install.sh`
 //! (DoD) bzw. der Betreiber mit `harw install --print-systemd` (Infra).
 //!
 //! # Warum diese Units nicht über [`crate::service::ServiceSpec`] gerendert

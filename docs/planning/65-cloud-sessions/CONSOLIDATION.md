@@ -12,7 +12,7 @@ not touched without explicit per-PR approval.
    remove now-redundant duplicates, align naming, update this log.
 4. **Gates on a frozen SHA** (any later commit invalidates): `cargo fmt --check`,
    `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
-   xtask gates, `cargo deny`, `make -C dod clippy test`, actionlint. Record results below;
+   xtask gates, `cargo deny`, `make -C harw-dod clippy test`, actionlint. Record results below;
    gates that cannot run in the sandbox are listed as NOT RUN, never as passed.
 5. **Publish**: push `consolidate/main`; draft PR only on request.
 
@@ -61,7 +61,7 @@ not touched without explicit per-PR approval.
 - `cargo test --workspace --no-fail-fast`: 14163 passed, 1 failed, plus 1 hang.
   - FAILED `harw-registry-defaults::auto_approved_tools_are_a_subset_of_the_read_only_surface` (`tunnel.status`): cause is a test-surface omission, `AUTO_APPROVED_TOOLS` lists `tunnel.status`/`tunnel.list` but the test's read-only surface did not (commit a953d85 added the entries only). Fixed in the test (read-only tunnel tools added to the surface). It is not caused by any worker branch.
   - HANG `harw-tui attach` tests (S09): test helper `drive` kept the input sender alive, the loop never saw EOF. Fixed (7c633f3); 10 attach tests pass.
-- NOT RUN here: `cargo deny` and `actionlint` (not installed), `make -C dod clippy test`, `cargo xtask gates` on the final SHA.
+- NOT RUN here: `cargo deny` and `actionlint` (not installed), `make -C harw-dod clippy test`, `cargo xtask gates` on the final SHA.
 
 ## Decisions applied (user)
 - Remote `approve` is a per-device opt-in (PL-68 §13): `DeviceRecord.approve_optin`, registry line gets an optional 7th field `approve` (any other seventh field fails closed); `identity_of` strips `approve` from the tier ceiling unless opted in; session/gateway caps stay by tier. Tests: `remote_approve_needs_the_per_device_opt_in_not_the_tier`, `opt_in_marker_round_trips_and_other_seventh_fields_fail_closed`.
@@ -81,8 +81,8 @@ Review follow-up (independent review by the research session, composition root):
 | `cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_nested_refdefs` | clean (the allowed lint is the pre-existing `harw-ops` doc lint on dev) |
 | `cargo test --workspace --no-fail-fast` | 15,512 passed, 0 failed |
 | `cargo xtask gates` | edges 2999, privileges 6, warden-dependency-budget 52, warden-no-c-build 52 (documented blake3/cc exception), arch 2134: all green |
-| `make -C dod stage-test` | passed (static packaging checks) |
-| NOT RUN here | `cargo deny`, `actionlint`, `make -C dod clippy test` (tools not installed) |
+| `make -C harw-dod stage-test` | passed (static packaging checks) |
+| NOT RUN here | `cargo deny`, `actionlint`, `make -C harw-dod clippy test` (tools not installed) |
 
 Fixes made during the central run: proc-macro cache (`cargo clean -p harw-macros` once), `tunnel.status` test surface, attach test hang (test helper kept the input sender alive), `WsDecision::Allow` boxed (clippy), `harw-retention` privileges entry, redundant closure, `cargo fmt` on 21 agent-written files, session-host approval actor fail-closed, doctor assembly session-event channel.
 
@@ -95,7 +95,7 @@ Fixes made during the central run: proc-macro cache (`cargo clean -p harw-macros
 
 ## Retention (R0-R3, wave 3)
 
-`harw-retention` + `retention_classes!` + `[retention]`; telemetry pair pruning, tui.log rotation, bug-report cap, sentinel `--telemetry-max-files`; DoD spool age/bytes limits (opt-in); session/freeze stores (opt-in); `retention_sweep` job kind and `harw cleanup` (dry run by default, async job, deadline, cooperative cancel); `harw doctor` retention checks; `dod/Makefile clean-ephemeral` (dry run by default); `deploy/tmpfiles.d` deliberately sets no age on security directories.
+`harw-retention` + `retention_classes!` + `[retention]`; telemetry pair pruning, tui.log rotation, bug-report cap, sentinel `--telemetry-max-files`; DoD spool age/bytes limits (opt-in); session/freeze stores (opt-in); `retention_sweep` job kind and `harw cleanup` (dry run by default, async job, deadline, cooperative cancel); `harw doctor` retention checks; `harw-dod/Makefile clean-ephemeral` (dry run by default); `deploy/tmpfiles.d` deliberately sets no age on security directories.
 Sentinel export rotation is now configurable (`--findings-export-keep N`, default 1, max 64; disk bound `(N+1) x 16 MiB`). Open: DoD spool is not yet used by the product (limits apply once wired); `retention_sweep` worker handler is covered by driver unit tests, not by a live worker run.
 
 ## Still open (needs the user or a later round)

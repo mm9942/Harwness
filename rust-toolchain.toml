@@ -1,7 +1,7 @@
 # Gepinnte Rust-Toolchain für lokale Builds und die CI.
 #
 # rustup liest diese Datei im Repo-Wurzelverzeichnis und in jedem
-# Unterordner (auch unter `dod/`, dessen Crates seit PL-60 Members des
+# Unterordner (auch unter `harw-dod/`, dessen Crates seit PL-60 Members des
 # Wurzel-Workspace sind und deshalb keine eigene Datei brauchen). Lokal und
 # in der CI prüfen damit dieselbe Compiler-, rustfmt- und clippy-Version.
 # Updates kommen bewusst über Dependabot (Ökosystem `rust-toolchain`,

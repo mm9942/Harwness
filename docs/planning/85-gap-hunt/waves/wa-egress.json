@@ -192,7 +192,7 @@
   "cargo test --workspace (including doc tests)",
   "cargo run -q -p xtask -- gates",
   "cargo deny check",
-  "make -C dod clippy test",
+  "make -C harw-dod clippy test",
   "actionlint"
  ],
  "note": "Backfilled after the merge (kit-4); the wave predates the manifest. Merged before its ripple items were resolved; they are handled by wave ripple-egress and ripple-egress-2."

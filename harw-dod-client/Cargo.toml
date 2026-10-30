@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-harw-dod-config = { path = "../dod/crates/harw-dod-config" }
+harw-dod-config = { path = "../harw-dod/crates/harw-dod-config" }
 harw-types = { path = "../harw-types" }
 # One `open(O_NOFOLLOW | O_NONBLOCK)` per export read (no lstat/open race, a
 # swapped-in FIFO cannot block); already in the tree via harw-dod-config.

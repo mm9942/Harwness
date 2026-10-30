@@ -14,7 +14,7 @@ source change. `cargo build -p harw-cli --bin harw` rewrites `Cargo.lock`:
 - **Cause:** `ripple-authz` (`6b340b4`, review item C) added the `fs4`
   dependency to `harw-oauth/Cargo.toml` but not its entry in the lockfile.
 - **Effect:** every `--locked` step of the central build fails at this SHA,
-  including `make -C dod clippy test`. Without `--locked`, cargo silently
+  including `make -C harw-dod clippy test`. Without `--locked`, cargo silently
   changes a tracked file during the build. The build would then run over a
   tree other than the frozen SHA, and `gate_record.py record` would refuse the
   dirty tree.

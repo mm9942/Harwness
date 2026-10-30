@@ -32,7 +32,7 @@ STEPS = {
     "test": "cargo test --workspace (including doc tests)",
     "gates": "cargo run -q -p xtask -- gates",
     "deny": "cargo deny check",
-    "dod": "make -C dod clippy test",
+    "dod": "make -C harw-dod clippy test",
     "actionlint": "actionlint",
     "workflow-gates": "node docs/planning/85-gap-hunt/kit/tests/workflow-gates.test.js",
 }

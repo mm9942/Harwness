@@ -40,7 +40,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 clap = { version = "4.6.1", features = ["derive"] }
 # systemd socket activation without `unsafe` in this crate: the same leaf
-# crate and the same approach as `dod/crates/harw-warden/src/systemd.rs`.
+# crate and the same approach as `harw-dod/crates/harw-warden/src/systemd.rs`.
 sd-listen-fds = "0.2.0"
 # Sealed, persistent key provider (`src/sealed/`): the CryptGuard facade for
 # the ML-DSA `SignAlgorithm` impls and `OsRng` (same workspace dependency and
@@ -59,7 +59,7 @@ fs4 = { workspace = true }
 # Purpose-bound signing (`HarwUsageAuthorizer`: sign/verify only over a
 # `SignTranscript`, no signing oracle) and `MAX_SIGNABLE_TRANSCRIPT_LEN`
 # for the sign body limit. Layer A → D, allowed by the arch policy.
-harw-dod-encrypt = { path = "../dod/crates/harw-dod-encrypt" }
+harw-dod-encrypt = { path = "../harw-dod/crates/harw-dod-encrypt" }
 
 [dev-dependencies]
 harw-test-support = { path = "../harw-test-support" }

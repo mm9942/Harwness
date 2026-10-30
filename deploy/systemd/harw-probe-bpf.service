@@ -1,10 +1,10 @@
 # harw-probe-bpf.service -- DoD eBPF probe, class CAP_BPF + CAP_PERFMON.
 #
 # Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Rendered
-# by dod/scripts/install.sh (LIBEXECDIR, SYSCONFDIR, BPFDIR).
+# by harw-dod/scripts/install.sh (LIBEXECDIR, SYSCONFDIR, BPFDIR).
 #
 # Capability decision (H10): CAP_BPF alone is not enough. The real loader
-# (dod/crates/harw-dod-bpf/src/real.rs, has_attach_capabilities) refuses to
+# (harw-dod/crates/harw-dod-bpf/src/real.rs, has_attach_capabilities) refuses to
 # attach unless BOTH CAP_BPF and CAP_PERFMON are effective: the programs are
 # attached as sched tracepoints (perf_event_open) and FEntry/KProbe hooks,
 # which the kernel gates on CAP_PERFMON since 5.8. No CAP_SYS_ADMIN fallback,

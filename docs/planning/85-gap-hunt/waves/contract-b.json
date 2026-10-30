@@ -7,8 +7,8 @@
  "files": [
   "Cargo.lock",
   "docs/design/crates-inventory.md",
-  "dod/crates/harw-dod-escalate/src/freeze_ops.rs",
-  "dod/crates/harw-dod-escalate/src/lib.rs",
+  "harw-dod/crates/harw-dod-escalate/src/freeze_ops.rs",
+  "harw-dod/crates/harw-dod-escalate/src/lib.rs",
   "harw-agent-artifact/src/embed.rs",
   "harw-agent-compiler/src/commands.rs",
   "harw-channel-telegram-transport/Cargo.toml",
@@ -67,7 +67,7 @@
   {
    "id": "F-febce9bd3e3b",
    "cluster": "c22",
-   "file": "dod/crates/harw-dod-escalate/src/freeze_ops.rs",
+   "file": "harw-dod/crates/harw-dod-escalate/src/freeze_ops.rs",
    "line": 211,
    "severity": "medium",
    "pattern": "M1",
@@ -118,7 +118,7 @@
   "cargo test --workspace (including doc tests)",
   "cargo run -q -p xtask -- gates",
   "cargo deny check",
-  "make -C dod clippy test",
+  "make -C harw-dod clippy test",
   "actionlint"
  ],
  "note": "Backfilled after the merge (kit-4); the wave predates the manifest. c32 and c36 were re-reviewed by separate Opus agents after their repairs (ok); harw-agent-compiler/src/testing.rs moved to wave r16-w7, which owns that file."

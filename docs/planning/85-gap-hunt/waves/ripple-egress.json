@@ -6,7 +6,7 @@
  "head_sha": "d60e57bfe9bf152fb78d944696862e355996ea10",
  "files": [
   "docs/planning/85-gap-hunt/findings/web-authz.md",
-  "dod/crates/harw-dod-netpolicy/src/rule.rs",
+  "harw-dod/crates/harw-dod-netpolicy/src/rule.rs",
   "harw-browser/src/policy.rs",
   "harw-egress/Cargo.toml",
   "harw-egress/src/client.rs",
@@ -134,7 +134,7 @@
   "cargo test --workspace (including doc tests)",
   "cargo run -q -p xtask -- gates",
   "cargo deny check",
-  "make -C dod clippy test",
+  "make -C harw-dod clippy test",
   "actionlint"
  ],
  "note": "Two rounds. Round 1 (script ripple-egress.js, run wf_c640370e-831, old gap-fix logic, all 10 files ok) fixed the 11 ripple items of wa-egress; its own ripple check found 9 items, fixed by round 2 (this manifest's findings and disposition). A comment-only repair in relay.rs after ok=true (catalog P18) was checked by hand."

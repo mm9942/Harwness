@@ -7,7 +7,7 @@
 "harw-sandbox" = "sandbox launcher"
 
 [files]
-"dod/crates/harw-warden/src/isolation.rs" = "warden isolation helper"
+"harw-dod/crates/harw-warden/src/isolation.rs" = "warden isolation helper"
 "harw-agent-compiler/src/backend/native.rs" = "build tooling (cargo), not a workload"
 "harw-agent-compiler/src/backend/runner.rs" = "build tooling (cargo), not a workload"
 "harw-agent-compiler/src/commands.rs" = "build tooling (cargo), not a workload"

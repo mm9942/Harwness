@@ -366,7 +366,7 @@ Central build after each round, in cloud settings (`CARGO_INCREMENTAL=0 CARGO_PR
 3. tests including doc tests
 4. `cargo run -q -p xtask -- gates` (the `arch` gate must pass for the new crate)
 5. `cargo deny check`
-6. `make -C dod clippy test`
+6. `make -C harw-dod clippy test`
 7. `actionlint`
 
 **Open questions**

@@ -84,7 +84,7 @@ const PLAN = {
         properties: {
           id: { type: 'string', description: '[a-z0-9._-], unique' },
           kind: { type: 'string', enum: ['leaf', 'wiring'] },
-          crate: { type: 'string', description: 'leaf only: the crate directory, e.g. harw-tui or dod/crates/harw-dod-x (new crates included)' },
+          crate: { type: 'string', description: 'leaf only: the crate directory, e.g. harw-tui or harw-dod/crates/harw-dod-x (new crates included)' },
           files: { type: 'array', items: { type: 'string' }, description: 'every repo-relative file the unit may create or change, Cargo.toml included' },
           depends_on: { type: 'array', items: { type: 'string' } },
           spec: { type: 'string', description: 'what to build: public signatures verbatim, behaviour, errors, docs' },

@@ -252,7 +252,7 @@ impl WorkspaceGraph {
     /// klassifiziert eine Abhängigkeit nur dann als intern, wenn sie ein
     /// Member *desselben* Workspace ist. Zeigt ein Crate per `path` auf ein
     /// Member eines anderen geladenen Workspace (etwa ein DoD-Crate unter
-    /// `dod/` auf `harw-types` im Produkt-Workspace), landet die Kante dort
+    /// `harw-dod/` auf `harw-types` im Produkt-Workspace), landet die Kante dort
     /// in `external_deps` und die Hülle endet an ihr. Diese Funktion
     /// verschiebt solche Einträge nach `deps`, setzt `is_leaf` neu und
     /// berechnet die Ebenen über den zusammengeführten Graphen.

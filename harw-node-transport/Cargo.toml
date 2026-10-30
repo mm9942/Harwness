@@ -17,7 +17,7 @@ harw-types = { path = "../harw-types" }
 # `harw.node-identity/<node>` key naming the AuthHub signer uses
 # (`authhub_signer`). Workspace member already in `Cargo.lock`; its only
 # external dependency is `crypt_guard_service`, also already locked.
-harw-dod-encrypt = { path = "../dod/crates/harw-dod-encrypt" }
+harw-dod-encrypt = { path = "../harw-dod/crates/harw-dod-encrypt" }
 
 # TLS 1.3 channel. The workspace already locks rustls 0.23.45 with the
 # aws-lc-rs provider (reqwest 0.13 `rustls`) — reused, not a new stack.

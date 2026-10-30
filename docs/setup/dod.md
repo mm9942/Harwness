@@ -7,7 +7,7 @@ what is happening on the host around agent activity (process starts,
 network connections, file writes, authentication, resource pressure, …)
 and — behind an explicit, disabled-by-default enforcement path — can act on
 what it observes. It is a **separate, privileged, opt-in install**: a
-set of crates under `dod/` (members of the root Cargo workspace since
+set of crates under `harw-dod/` (members of the root Cargo workspace since
 PL-60, built with `-p` selections — one `Cargo.lock`, no nested workspace)
 with its own Makefile, its own system accounts, and its own FHS layout. Nothing in `make install`/`make service`
 (the ordinary Harwness install described in
@@ -36,7 +36,7 @@ harw-aware suite. Each step links to the details further down.
    invoking user and then escalates by itself (`sudo -E`) for the file
    install and the enable step; `build` refuses to run as root, so
    `sudo make dod-install` fails. Alternatively `make dod-build`, then
-   `sudo make -C dod install-existing`, which installs the already built
+   `sudo make -C harw-dod install-existing`, which installs the already built
    artifacts and skips the enable step. `install` ends
    by running `scripts/service.sh enable`, which validates
    `/etc/harw-dod/config.toml` first; on a fresh host without a chosen
@@ -61,7 +61,7 @@ harw-aware suite. Each step links to the details further down.
    not group/world-writable) and check it with
    `sudo harw dod config check`.
 4. **Enable**: `sudo harw dod enable` (the same steps as
-   `make -C dod enable`: config check, `systemctl daemon-reload`,
+   `make -C harw-dod enable`: config check, `systemctl daemon-reload`,
    `systemctl enable --now harw-dod.target`). The Warden stays disabled.
 5. **Read the posture**: add the operator to `harw-dod-readers`
    ([Exports read by harw](#exports-read-by-harw)), log in again, then
@@ -111,7 +111,7 @@ answer, split into two halves:
 
 ## Components
 
-The DoD domain (`dod/crates/`, part of the root workspace) has 34 crates.
+The DoD domain (`harw-dod/crates/`, part of the root workspace) has 34 crates.
 Grouped by role, with what each one is responsible for (the list below
 names the main ones):
 
@@ -499,17 +499,17 @@ the home fallback. Only the system export counts as verified; findings from
 
 ## Installation
 
-DoD is built and installed from `dod/`, or via the root `Makefile`'s
+DoD is built and installed from `harw-dod/`, or via the root `Makefile`'s
 delegation targets (`make dod-build`, `make dod-install`, `make
-dod-enable`, `make dod-uninstall` — thin wrappers around `make -C dod
-<target>`; run `make -C dod help` or `dod/README.md` for the complete
+dod-enable`, `make dod-uninstall` — thin wrappers around `make -C harw-dod
+<target>`; run `make -C harw-dod help` or `harw-dod/README.md` for the complete
 target list).
 
-1. **Prerequisites.** `make -C dod doctor` gives a read-only report of what
+1. **Prerequisites.** `make -C harw-dod doctor` gives a read-only report of what
    is present. Building the eBPF artifacts needs `clang`, `bpftool`, and
-   `llvm-objdump` at versions pinned in `dod/bpf/toolchain.lock.toml`
-   (checked fail-closed by `dod/bpf/scripts/verify-toolchain.sh`), plus a
-   kernel exposing BTF (`/sys/kernel/btf/vmlinux`). `make -C dod
+   `llvm-objdump` at versions pinned in `harw-dod/bpf/toolchain.lock.toml`
+   (checked fail-closed by `harw-dod/bpf/scripts/verify-toolchain.sh`), plus a
+   kernel exposing BTF (`/sys/kernel/btf/vmlinux`). `make -C harw-dod
    ensure-bpf-toolchain` locates these tools (searching `PATH`, then
    `/usr/sbin`, `/sbin`) and, only when one is genuinely missing and
    `apt-get`/root privileges are available, installs it — this is the
@@ -517,7 +517,7 @@ target list).
 
 2. **Build.**
    ```sh
-   make dod-build         # from the repo root, or: make -C dod build
+   make dod-build         # from the repo root, or: make -C harw-dod build
    ```
    Builds the release host binaries (`harw-sentinel`, `harw-probe-bpf`,
    `harw-probe-fs`, `harw-warden`) and the pinned eBPF artifacts
@@ -527,7 +527,7 @@ target list).
 
 3. **Install.**
    ```sh
-   make dod-install   # unprivileged, from the repo root, or: make -C dod install
+   make dod-install   # unprivileged, from the repo root, or: make -C harw-dod install
    ```
    Run it as the unprivileged operator, not with `sudo`: `install` depends
    on `build`, which refuses to run as root, and escalates by itself
@@ -543,8 +543,8 @@ target list).
    (`scripts/service.sh enable`), which validates the config first: without
    a chosen `active_profile` it refuses, so on a fresh host nothing is
    started and `install` reports that failure after the files are in
-   place. `sudo make -C dod install-existing` installs already built
-   artifacts without the enable step. `DESTDIR=/path/to/stage make -C dod
+   place. `sudo make -C harw-dod install-existing` installs already built
+   artifacts without the enable step. `DESTDIR=/path/to/stage make -C harw-dod
    stage` runs the same `install` target into a staging root; it, too,
    ends with the enable step (flagged in PL-97 §8.4 against the "no silent
    services" policy, still open).
@@ -557,19 +557,19 @@ target list).
    Add exactly one `active_profile = "…"` under `[profiles.<name>]`.
    `scope = "host"` (observe the whole machine) is never selected
    implicitly — you must write it explicitly if that's what you want.
-   Shipped example profiles (`dod/packaging/config.example.toml`):
+   Shipped example profiles (`harw-dod/packaging/config.example.toml`):
    - `selected-services` — `scope = "cgroups"` over named systemd service
      cgroups.
    - `user-workloads` — `scope = "cgroups"` over `/user.slice`.
    - `host` — `scope = "host"`, the entire machine.
    All three default to `sensors = ["exec", "tcp-connect"]` and an empty
-   egress allowlist. `make -C dod install` preserves an existing
+   egress allowlist. `make -C harw-dod install` preserves an existing
    `/etc/harw-dod/config.toml`; only `config.toml.example` is
    installed/replaced.
 
 5. **Enable.**
    ```sh
-   sudo harw dod enable    # or: make dod-enable / make -C dod enable (as root)
+   sudo harw dod enable    # or: make dod-enable / make -C harw-dod enable (as root)
    ```
    Runs the explicit configuration/profile validation first and refuses to
    enable without a chosen `active_profile` (`harw dod enable` exits `3`). This starts and enables
@@ -589,7 +589,7 @@ enable, restart, and observation-target operations never start or enable
 either unit. To opt into enforcement explicitly:
 
 ```sh
-sudo harw dod warden enable   # or: sudo make -C dod enable-warden
+sudo harw dod warden enable   # or: sudo make -C harw-dod enable-warden
 ```
 
 This creates `/etc/harw-dod/warden.enable`, reloads systemd, and enables
@@ -616,14 +616,14 @@ turned off.
   `/etc/harw-dod/config.toml` does not exist, with a warning. The planned
   separate `--state-dir --telemetry-dir --runtime-dir` flags do not exist;
   `--home` is the state directory. Verify current behavior against
-  `dod/crates/harw-sentinel/src/{cli,main}.rs` and
-  `dod/crates/harw-probe-bpf/src/main.rs` before relying on a specific CLI
+  `harw-dod/crates/harw-sentinel/src/{cli,main}.rs` and
+  `harw-dod/crates/harw-probe-bpf/src/main.rs` before relying on a specific CLI
   surface.
 - **eBPF artifacts are never checked into the repository**; they must be
   built locally (or by your packaging pipeline) with the pinned toolchain
   before `install` will proceed — `install` refuses to run until they
   exist.
-- **`stage-test`** (`make -C dod stage-test`) checks the packaging
+- **`stage-test`** (`make -C harw-dod stage-test`) checks the packaging
   contract statically, without building or installing anything — useful
   for CI that can't run eBPF builds.
 
@@ -631,11 +631,11 @@ turned off.
 
 `deploy/` at the repository root is the **single** source of every Harwness
 system unit (Crypto Masterplan v2 §22, H10); there is no second copy under
-`dod/`:
+`harw-dod/`:
 
 | Path | Content |
 |---|---|
-| `deploy/systemd/harw-dod.target`, `harw-sentinel.service`, `harw-probe-bpf.service`, `harw-probe-fs.service`, `harw-warden.service`, `harw-warden.socket` | DoD (installed by `make -C dod install`) |
+| `deploy/systemd/harw-dod.target`, `harw-sentinel.service`, `harw-probe-bpf.service`, `harw-probe-fs.service`, `harw-warden.service`, `harw-warden.socket` | DoD (installed by `make -C harw-dod install`) |
 | `deploy/systemd/harw-infra.target`, `harw-control.{socket,service}`, `harw-auth-hub.{socket,service}`, `harw-netsec.{socket,service}`, `harw-security-hub.{socket,service}` | infrastructure daemons (not installed by the DoD package) |
 | `deploy/sysusers.d/harw.conf` | all system accounts and groups |
 | `deploy/tmpfiles.d/harw.conf` | `/run/harw`, `/run/harw/infra`, DoD state/log directories, the sentinel export directory |
@@ -649,7 +649,7 @@ harw install --print-systemd                      # every unit
 harw install --print-systemd harw-warden.socket   # one unit
 ```
 
-`dod/scripts/install.sh` substitutes the `@LIBEXECDIR@`, `@BPFDIR@`,
+`harw-dod/scripts/install.sh` substitutes the `@LIBEXECDIR@`, `@BPFDIR@`,
 `@SYSCONFDIR@`, `@STATEDIR@` and `@LOGDIR@` placeholders from its own
 variables and refuses to install a unit with an unresolved placeholder.
 Runtime sockets live at fixed paths: `/run/harw/` for DoD,
@@ -664,10 +664,10 @@ access is set per socket unit (mode `0660` plus a client group such as
 ## Uninstalling
 
 ```sh
-sudo make dod-uninstall   # from the repo root, or: sudo make -C dod uninstall
+sudo make dod-uninstall   # from the repo root, or: sudo make -C harw-dod uninstall
 ```
 
-Removes only the files listed in `dod/packaging/manifest` (binaries, eBPF
+Removes only the files listed in `harw-dod/packaging/manifest` (binaries, eBPF
 objects, systemd units, sysusers/tmpfiles config snippets, and the
 `config.toml.example`). It deliberately leaves `/etc/harw-dod/config.toml`,
 state, logs, runtime data, and the system accounts in place, so an upgrade or a rollback never silently discards
@@ -686,18 +686,18 @@ sudo groupdel harw-dod-config; sudo groupdel harw-ipc; sudo groupdel harw-warden
 
 ## Troubleshooting
 
-- `make -C dod doctor` — read-only report of what prerequisites are
+- `make -C harw-dod doctor` — read-only report of what prerequisites are
   present/missing.
-- `make -C dod check-config` — validates `/etc/harw-dod/config.toml`
+- `make -C harw-dod check-config` — validates `/etc/harw-dod/config.toml`
   (or `CONFIG=<path>`) and prints the selected profile without touching
   any service.
-- `make -C dod status` / `make -C dod logs` — inspect the observation
+- `make -C harw-dod status` / `make -C harw-dod logs` — inspect the observation
   services (`CONFIG=<path>` to check a non-default config file first).
 - `install refuses to run` — most commonly means the eBPF artifacts
-  haven't been built yet (`make -C dod build-bpf`) or a pinned toolchain
-  tool is missing/wrong-version (`make -C dod doctor`,
+  haven't been built yet (`make -C harw-dod build-bpf`) or a pinned toolchain
+  tool is missing/wrong-version (`make -C harw-dod doctor`,
   `bpf/scripts/verify-toolchain.sh`).
 - `enable refuses to run` — no `active_profile` selected in
   `/etc/harw-dod/config.toml`; see [Configure](#installation) above.
-- `make -C dod smoke` — an explicit, operator-triggered live smoke check
+- `make -C harw-dod smoke` — an explicit, operator-triggered live smoke check
   (`SMOKE_CONFIRM=1`); it is never part of ordinary install/enable/tests.

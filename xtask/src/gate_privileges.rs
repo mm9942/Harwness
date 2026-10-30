@@ -112,7 +112,7 @@
 //! # `harw-agent-runner`: unprivilegiert, aber außerhalb der DoD-Tabelle
 //! `harw-agent-runner` (R10 Wave 4, `docs/adr/0001-agent-compiler.md`) ist
 //! kein DoD-Sensorbinary: es liegt im Produkt-Workspace, hängt an keiner
-//! Stelle von `dod/` oder einer `harw-dod-*`-Crate ab (geprüft: sein
+//! Stelle von `harw-dod/` oder einer `harw-dod-*`-Crate ab (geprüft: sein
 //! einziger Pfad zu `harw-core-bridge`/`harw-runtime` führt nie über
 //! `harw-dod-signals` oder eine andere DoD-Crate — siehe die Kommentare in
 //! `harw-runtime/Cargo.toml`), und seine Hülle zieht dutzende gewöhnliche
@@ -143,7 +143,7 @@
 //! nie die Prüftiefe für die DoD-Capability-Domäne.
 //!
 //! # Fehlendes Binary
-//! Die vier DoD-Binaries liegen unter `dod/crates/`, `harw-agent-runner`
+//! Die vier DoD-Binaries liegen unter `harw-dod/crates/`, `harw-agent-runner`
 //! an der Repo-Wurzel; seit PL-60 sind alle Members **eines** Workspace,
 //! den [`run`] über [`super::load_all_workspaces`] lädt. Fehlt eines der vier trotzdem im
 //! Graphen, ist das ein **Verstoß**, kein Hinweis: ein Binary, das das Gate
