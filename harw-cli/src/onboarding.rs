@@ -90,8 +90,7 @@ fn run_wizard_with_interaction_mode(home: &Path, interactive: bool) -> Result<()
         // Der Setup-Picker bleibt deterministisch. Die konto-spezifische
         // Quelle ist `harw models scan`, nicht ein impliziter Drittanbieter-
         // Download, der die Auswahl unerwartet aufbläht.
-        let catalog = harw_model_catalog::embedded_catalog();
-        if let Some(outcome) = harw_tui::run_setup(catalog).map_err(|e| e.to_string())? {
+        if let Some(outcome) = run_terminal_setup_with(home, harw_tui::run_setup_for)? {
             persist_outcome(home, &outcome)?;
             return maybe_recommend_openrouter(home, interactive);
         }
@@ -141,6 +140,55 @@ fn run_wizard_with_interaction_mode(home: &Path, interactive: bool) -> Result<()
     };
     persist_outcome(home, &outcome)?;
     maybe_recommend_openrouter(home, interactive)
+}
+
+/// Resolve the active profile on the production terminal-call boundary. The
+/// callback allows a headless regression without changing TTY or locale globals.
+fn run_terminal_setup_with(
+    home: &Path,
+    run: impl FnOnce(
+        harw_config::UiLanguage,
+        Vec<harw_model_catalog::ProviderSpec>,
+    ) -> Result<Option<harw_tui::SetupOutcome>, harw_tui::TuiError>,
+) -> Result<Option<harw_tui::SetupOutcome>, String> {
+    run(
+        setup_language(home)?,
+        harw_model_catalog::embedded_catalog(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Read only the language preference: onboarding must remain able to replace a
+/// malformed provider before full discovery/validation in `persist_outcome`.
+/// Trusted layers match normal discovery; `tui.language` uses ProfileReplaces,
+/// so each explicit value replaces the previous one, and omission preserves it.
+fn setup_language(home: &Path) -> Result<harw_config::UiLanguage, String> {
+    #[derive(serde::Deserialize)]
+    struct Preferences {
+        tui: Option<LanguagePreference>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LanguagePreference {
+        language: Option<harw_config::UiLanguage>,
+    }
+
+    let mut language = harw_config::UiLanguage::English;
+    for layer in harw_home::config_layers(home).map_err(|error| error.to_string())? {
+        let path = layer.join("config.toml");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("config lesen ({}): {error}", path.display())),
+        };
+        // Ignore unrelated settings, but preserve typed rejection of invalid
+        // language values instead of silently falling back to English.
+        let preferences: Preferences = toml::from_str(&content)
+            .map_err(|error| format!("config parsen ({}): {error}", path.display()))?;
+        if let Some(selected) = preferences.tui.and_then(|tui| tui.language) {
+            language = selected;
+        }
+    }
+    Ok(language)
 }
 
 /// Empfiehlt nach erfolgreicher Ersteinrichtung eines Providers, zusätzlich
@@ -952,6 +1000,153 @@ mod tests {
             auth_header: None,
         };
         persist_outcome(home, &outcome).map_err(ctx("persist_outcome"))
+    }
+
+    #[test]
+    fn terminal_setup_receives_resolved_profile_language_and_defaults_to_english() -> TestResult {
+        for (setting, expected) in [
+            (None, harw_config::UiLanguage::English),
+            (Some("ja"), harw_config::UiLanguage::Japanese),
+        ] {
+            let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            harw_home::ensure_home(home.path()).map_err(ctx("ensure home"))?;
+            let profile_name = harw_home::active_profile_name(home.path());
+            let profile =
+                harw_home::profile_dir(home.path(), &profile_name).map_err(ctx("profile"))?;
+            if let Some(language) = setting {
+                std::fs::write(
+                    profile.join("config.toml"),
+                    format!("[tui]\nlanguage = \"{language}\"\n"),
+                )
+                .map_err(ctx("write profile language"))?;
+            }
+            let mut called = false;
+            let outcome = run_terminal_setup_with(home.path(), |language, providers| {
+                called = true;
+                assert_eq!(language, expected);
+                assert_eq!(providers, harw_model_catalog::embedded_catalog());
+                Ok(None)
+            })
+            .map_err(ctx("terminal setup boundary"))?;
+            assert!(called);
+            assert!(outcome.is_none(), "cancellation remains cancellation");
+            let layers = harw_home::config_layers(home.path()).map_err(ctx("config layers"))?;
+            let config = harw_config::discover_config(&layers).map_err(ctx("reload"))?;
+            assert_eq!(config.harness.tui.language, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_setup_repairs_malformed_provider_with_profile_language() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("ensure home"))?;
+        let profile_name = harw_home::active_profile_name(home.path());
+        let profile = harw_home::profile_dir(home.path(), &profile_name).map_err(ctx("profile"))?;
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[tui]\nlanguage = \"de\"\n",
+        )
+        .map_err(ctx("write home language"))?;
+        std::fs::write(profile.join("config.toml"), "[tui]\nlanguage = \"ja\"\n")
+            .map_err(ctx("write profile language"))?;
+        let provider = profile.join("providers/openai.toml");
+        std::fs::write(&provider, "name = [broken provider")
+            .map_err(ctx("break selected provider"))?;
+        let layers = harw_home::config_layers(home.path()).map_err(ctx("config layers"))?;
+        assert!(harw_config::discover_config(&layers).is_err());
+        let mut called = false;
+        let outcome = run_terminal_setup_with(home.path(), |language, providers| {
+            called = true;
+            assert_eq!(language, harw_config::UiLanguage::Japanese);
+            assert!(providers.iter().any(|provider| provider.id == "openai"));
+            Ok(Some(harw_tui::SetupOutcome {
+                provider_id: "openai".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                api: "openai-responses".into(),
+                model: "gpt-5.4".into(),
+                secret_ref: Some("env:OPENAI_API_KEY".into()),
+                auth_header: None,
+            }))
+        })
+        .map_err(ctx("setup must reach repair callback"))?;
+        assert!(called);
+        let outcome = outcome.ok_or(TestError::Missing("setup outcome"))?;
+        persist_outcome(home.path(), &outcome).map_err(ctx("repair selected provider"))?;
+        let repaired: ProviderToml = toml::from_str(
+            &std::fs::read_to_string(&provider).map_err(ctx("read repaired provider"))?,
+        )
+        .map_err(ctx("parse repaired provider"))?;
+        assert_eq!(repaired.api, "openai-responses");
+        assert!(repaired.enabled);
+        let config =
+            harw_config::discover_config(&layers).map_err(ctx("discover repaired config"))?;
+        config.validate().map_err(ctx("validate repaired config"))?;
+        assert_eq!(
+            config.harness.tui.language,
+            harw_config::UiLanguage::Japanese
+        );
+        assert_eq!(config.harness.default_provider.as_deref(), Some("openai"));
+        assert_eq!(config.harness.default_model.as_deref(), Some("gpt-5.4"));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_setup_language_keeps_trusted_values_when_profile_omits_language() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("ensure home"))?;
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[tui]\nlanguage = \"de\"\n",
+        )
+        .map_err(ctx("write home language"))?;
+        let profile_name = harw_home::active_profile_name(home.path());
+        let profile = harw_home::profile_dir(home.path(), &profile_name).map_err(ctx("profile"))?;
+        std::fs::write(profile.join("config.toml"), "[tui]\ntheme = \"dark\"\n")
+            .map_err(ctx("write profile without language"))?;
+        run_terminal_setup_with(home.path(), |language, _| {
+            assert_eq!(language, harw_config::UiLanguage::German);
+            Ok(None)
+        })
+        .map_err(ctx("preserve omitted preference"))?;
+        std::fs::write(
+            profile.join("config.toml"),
+            "[tui]\nlanguage = \"unsupported\"\n",
+        )
+        .map_err(ctx("write invalid language"))?;
+        let error = run_terminal_setup_with(home.path(), |_, _| {
+            panic!("invalid explicit language must not reach the terminal")
+        })
+        .expect_err("invalid language remains an error");
+        assert!(error.contains("unsupported"));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_setup_still_rejects_unrepaired_provider_at_final_validation() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("ensure home"))?;
+        let profile_name = harw_home::active_profile_name(home.path());
+        let profile = harw_home::profile_dir(home.path(), &profile_name).map_err(ctx("profile"))?;
+        std::fs::write(profile.join("providers/broken.toml"), "name = [broken")
+            .map_err(ctx("break unrelated provider"))?;
+        let outcome = run_terminal_setup_with(home.path(), |_, _| {
+            Ok(Some(harw_tui::SetupOutcome {
+                provider_id: "openai".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                api: "openai-responses".into(),
+                model: "gpt-5.4".into(),
+                secret_ref: Some("env:OPENAI_API_KEY".into()),
+                auth_header: None,
+            }))
+        })
+        .map_err(ctx("reach terminal despite unrelated provider"))?
+        .ok_or(TestError::Missing("setup outcome"))?;
+        assert!(
+            persist_outcome(home.path(), &outcome).is_err(),
+            "post-persistence discovery still rejects the unrepaired file"
+        );
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

@@ -920,6 +920,10 @@ impl InputEditor {
     /// assert_eq!(lines.len(), 2); // "abc" + "de"
     /// ```
     pub fn visible_lines(&self, width: usize) -> Vec<String> {
+        self.presentation().visible_lines_raw(width)
+    }
+
+    fn visible_lines_raw(&self, width: usize) -> Vec<String> {
         let mut result = Vec::new();
         // Harte Zeilenumbrüche zuerst
         for hard_line in self.buffer.split('\n') {
@@ -971,6 +975,11 @@ impl InputEditor {
     /// # Nebenläufigkeit
     /// Nicht thread-safe; Aufrufer serialisiert Zugriff.
     pub fn cursor_position(&self, width: usize) -> (usize, usize) {
+        self.presentation().cursor_position_raw(width)
+    }
+
+    /// Geometry of the unchanged edit buffer for byte-coordinate consumers.
+    pub(crate) fn cursor_position_raw(&self, width: usize) -> (usize, usize) {
         let cursor_line_start = match self.buffer[..self.cursor].rfind('\n') {
             Some(pos) => pos + 1,
             None => 0,
@@ -983,7 +992,7 @@ impl InputEditor {
         } else {
             let mut preceding = Self::new();
             preceding.buffer = self.buffer[..cursor_line_start - 1].to_owned();
-            preceding.visible_lines(width).len()
+            preceding.visible_lines_raw(width).len()
         };
 
         let line_before_cursor = &self.buffer[cursor_line_start..self.cursor];
@@ -1371,7 +1380,56 @@ impl InputEditor {
 
     // -- Paste-Platzhalter (siehe Moduldoku "Paste-Platzhalter") -----------
 
-    /// Baut den sichtbaren Platzhaltertext für einen [`PendingPaste`].
+    /// Localize presentation over stable editor markers; never mutate the draft,
+    /// paste IDs, original text, history, or byte-based edit coordinates.
+    fn presentation(&self) -> std::borrow::Cow<'_, Self> {
+        if self.pastes.is_empty() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut projection = None;
+        for paste in &self.pastes {
+            let marker = Self::placeholder_text(paste);
+            let label = crate::i18n::tr_args(
+                "chrome.paste_marker",
+                "[Pasted text #{id} +{lines} lines]",
+                &[
+                    ("id", &paste.id.to_string()),
+                    ("lines", &paste.line_count.to_string()),
+                ],
+            );
+            if marker == label {
+                continue;
+            }
+            let projected = projection.get_or_insert_with(|| {
+                let mut editor = Self::new();
+                editor.buffer = self.buffer.clone();
+                editor.cursor = self.cursor;
+                editor
+            });
+            let mut search = 0;
+            while let Some(offset) = projected.buffer[search..].find(&marker) {
+                let start = search + offset;
+                let end = start + marker.len();
+                projected.cursor = if projected.cursor >= end {
+                    projected.cursor - marker.len() + label.len()
+                } else if projected.cursor > start {
+                    let chars = projected.buffer[start..projected.cursor].chars().count();
+                    start
+                        + label
+                            .char_indices()
+                            .nth(chars)
+                            .map_or(label.len(), |(index, _)| index)
+                } else {
+                    projected.cursor
+                };
+                projected.buffer.replace_range(start..end, &label);
+                search = start + label.len();
+            }
+        }
+        projection.map_or(std::borrow::Cow::Borrowed(self), std::borrow::Cow::Owned)
+    }
+
+    /// Stable marker in the edit buffer, independent of the display locale.
     fn placeholder_text(paste: &PendingPaste) -> String {
         format!("[Pasted text #{} +{} lines]", paste.id, paste.line_count)
     }
@@ -1677,6 +1735,53 @@ mod tests {
     }
 
     // 1. new_empty
+    #[test]
+    fn paste_marker_locale_projection_preserves_identity_editing_and_payload() {
+        let text = "payload 漢字 नमस्ते e\u{301} 👩‍💻\n".repeat(20);
+        let mut ed = InputEditor::new();
+        ed.insert_str("before ");
+        ed.insert_paste(&text);
+        ed.insert_str(" after");
+        let draft = ed.text().to_owned();
+        let cursor = ed.cursor();
+        let pastes = ed.pastes().to_vec();
+        let expected = format!("before {text} after");
+        for language in harw_config::UiLanguage::ALL {
+            crate::i18n::with_language(language, || {
+                let display = ed.visible_lines(0).join("\n");
+                assert!(display.contains(&crate::i18n::tr_args(
+                    "chrome.paste_marker",
+                    "[Pasted text #{id} +{lines} lines]",
+                    &[("id", "1"), ("lines", &pastes[0].line_count.to_string())]
+                )));
+                for width in [1, 8, 20, 24, 40, 60, 80] {
+                    let rows = ed.visible_lines(width);
+                    let (row, col) = ed.cursor_position(width);
+                    assert!(row < rows.len(), "{language:?}/{width}: {row} {rows:?}");
+                    assert!(
+                        col <= UnicodeWidthStr::width(rows[row].as_str()),
+                        "{language:?}/{width}: {col} {rows:?}"
+                    );
+                }
+                assert_eq!(ed.text(), draft);
+                assert_eq!(ed.cursor(), cursor);
+                assert_eq!(ed.pastes(), pastes);
+                assert_eq!(ed.expand_pastes(), expected);
+                let mut submitted = ed.clone();
+                assert_eq!(
+                    submitted.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    InputAction::Submit(expected.clone())
+                );
+                // Atomic backspace still resolves the stable marker in another locale.
+                let mut deleted = InputEditor::new();
+                deleted.insert_paste(&text);
+                deleted.backspace();
+                assert!(deleted.is_empty());
+                assert!(deleted.pastes().is_empty());
+            });
+        }
+    }
+
     #[test]
     fn test_new_empty() {
         let ed = InputEditor::new();

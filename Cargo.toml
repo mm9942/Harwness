@@ -205,7 +205,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.10.0"
 # Kein Crate wird auf crates.io veröffentlicht; `cargo deny` behandelt sie
 # damit als privat (keine Lizenzpflicht ohne Entscheidung, Pfad-Abhängigkeiten
 # ohne Versionsangabe erlaubt).

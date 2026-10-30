@@ -51,6 +51,21 @@ jobs:
         with:
           ref: ${{ env.TAG }}
 
+      - name: Verify tag matches workspace version
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
+          expected = f"v{version}"
+          tag = os.environ["TAG"]
+          if tag != expected:
+              raise SystemExit(f"Release tag {tag!r} does not match workspace version {expected!r}")
+          print(f"Release tag matches workspace version: {tag}")
+          PY
+
       # The OS-keyring backend of harw-secrets links libdbus (keyring
       # `sync-secret-service` -> libdbus-sys), as in ci.yml. Cross targets
       # get it through Cross.toml.

@@ -44,7 +44,11 @@ pub(crate) const FINISHED_TITLE: &str = "FINISHED / FAILED";
 #[must_use]
 pub(crate) fn dod_suffix(mark: Option<DodMark>) -> Option<String> {
     let mark = mark.filter(|mark| mark.is_alert())?;
-    let unverified = if mark.verified { "" } else { " unverified" };
+    let unverified = if mark.verified {
+        ""
+    } else {
+        crate::i18n::tr("mission.unverified", " unverified")
+    };
     Some(format!(" · ⛨ DoD {}{unverified}", mark.count_text()))
 }
 
@@ -146,7 +150,7 @@ pub(crate) fn apply_failure_bursts(rows: &mut [TerminalRow], badges: &[FailureBu
 /// `⚠n`.
 #[must_use]
 pub(crate) fn row_text(row: &TerminalRow) -> String {
-    let mut text = format!("{} ×{}", row.label, row.total);
+    let mut text = format!("{} ×{}", row.category.label(), row.total);
     if row.ok > 0 {
         text.push_str(&format!(" ✓{}", row.ok));
     }
@@ -158,9 +162,13 @@ pub(crate) fn row_text(row: &TerminalRow) -> String {
     }
     if row.unseen_failures > 0 {
         if row.unseen_failures >= row.failed {
-            text.push_str(" NEW");
+            text.push_str(crate::i18n::tr("mission.new", " NEW"));
         } else {
-            text.push_str(&format!(" ({} NEW)", row.unseen_failures));
+            text.push_str(&crate::i18n::tr_args(
+                "mission.new_count",
+                " ({p0} NEW)",
+                &[("p0", &(row.unseen_failures).to_string())],
+            ));
         }
     }
     if let Some(TerminalBadge::OutcomeDiverges { runs }) = row.badge {
@@ -198,9 +206,12 @@ fn header_line(
         .add_modifier(Modifier::BOLD);
     let mut spans = vec![
         Span::styled(if focused { "▸ " } else { "─ " }, rule_style),
-        Span::styled(FINISHED_TITLE, title_style),
+        Span::styled(
+            crate::i18n::tr("mission.finished", FINISHED_TITLE),
+            title_style,
+        ),
     ];
-    let mut used = 2 + display_width(FINISHED_TITLE);
+    let mut used = 2 + display_width(crate::i18n::tr("mission.finished", FINISHED_TITLE));
     for span in detail {
         let room = width.saturating_sub(used);
         if room == 0 {
@@ -272,7 +283,13 @@ pub(crate) fn render(
         // Eingeklappt: alle Kategorien in der Kopfzeile.
         let mut detail: Vec<Span<'static>> = dod_span(dod, theme).into_iter().collect();
         if rows.is_empty() {
-            detail.push(Span::styled(format!(" · {NOTHING_FINISHED}"), dim));
+            detail.push(Span::styled(
+                format!(
+                    " · {}",
+                    crate::i18n::tr("mission.none_finished", NOTHING_FINISHED)
+                ),
+                dim,
+            ));
         }
         for row in rows {
             detail.push(Span::styled(" · ", dim));
@@ -306,7 +323,13 @@ pub(crate) fn render(
     if rows.is_empty() {
         ui.window_start(&keys, height);
         Paragraph::new(Line::styled(
-            fit_width(&format!("  {NOTHING_FINISHED}"), width),
+            fit_width(
+                &format!(
+                    "  {}",
+                    crate::i18n::tr("mission.none_finished", NOTHING_FINISHED)
+                ),
+                width,
+            ),
             dim,
         ))
         .render(body, buf);
@@ -335,7 +358,7 @@ pub(crate) fn render(
 }
 
 /// Footer of the constituent list.
-const CONSTITUENTS_FOOTER: &str = "j/k scrollen · Esc schließen";
+const CONSTITUENTS_FOOTER: &str = "j/k scroll · Esc close";
 
 /// Page size of the constituent list for `Bild↑`/`Bild↓`.
 const CONSTITUENTS_PAGE: usize = 10;
@@ -345,9 +368,20 @@ const CONSTITUENTS_PAGE: usize = 10;
 #[must_use]
 pub(crate) fn listing_text(row: &TerminalRow) -> String {
     if row.listed() < row.total {
-        format!("{} total, {} listed", row.total, row.listed())
+        crate::i18n::tr_args(
+            "mission.listed",
+            "{p0} total, {p1} listed",
+            &[
+                ("p0", &(row.total).to_string()),
+                ("p1", &(row.listed()).to_string()),
+            ],
+        )
     } else {
-        format!("{} total", row.total)
+        crate::i18n::tr_args(
+            "mission.total",
+            "{p0} total",
+            &[("p0", &(row.total).to_string())],
+        )
     }
 }
 
@@ -357,14 +391,23 @@ fn constituent_text(constituent: &TerminalConstituent) -> String {
     if constituent.kind == ConstituentKind::Job {
         text.push_str(&format!(" ({})", constituent.id));
     }
-    if let Some(reason) = &constituent.reason {
+    if let Some(reason) = constituent
+        .reason_source
+        .as_ref()
+        .map(crate::jobs_panel::JobFailure::render)
+        .or_else(|| constituent.reason.clone())
+    {
         text.push_str(&format!(" · {reason}"));
     }
     if let Some(job) = constituent.diverged {
-        text.push_str(&format!(" · ⚠ job {}", job.glyph()));
+        text.push_str(&crate::i18n::tr_args(
+            "mission.diverged_job",
+            " · ⚠ job {outcome}",
+            &[("outcome", job.glyph())],
+        ));
     }
     if constituent.unseen {
-        text.push_str(" · NEW");
+        text.push_str(crate::i18n::tr("mission.new_dot", " · NEW"));
     }
     text
 }
@@ -380,6 +423,8 @@ pub(crate) struct ConstituentsView {
     header: String,
     /// One line per listed constituent, with its outcome.
     lines: Vec<(String, TerminalOutcome)>,
+    /// Semantic snapshot, never a lookup inferred from cached text.
+    source: TerminalRow,
     /// First visible line.
     scroll: usize,
 }
@@ -394,10 +439,18 @@ impl ConstituentsView {
             row.ok, row.failed, row.cancelled
         ));
         if !row.category.is_counted() {
-            header.push_str(" · not counted until its run has ended");
+            header.push_str(crate::i18n::tr(
+                "mission.pending_uncounted",
+                " · not counted until its run has ended",
+            ));
         }
         Self {
-            title: format!(" {FINISHED_TITLE} · {} ", row.label),
+            title: format!(
+                " {} · {} ",
+                crate::i18n::tr("mission.finished", FINISHED_TITLE),
+                row.category.label()
+            ),
+            source: row.clone(),
             header,
             lines: row
                 .constituents
@@ -415,7 +468,8 @@ impl ConstituentsView {
 
 impl OverlayView for ConstituentsView {
     fn render(&self, area: Rect, buf: &mut Buffer, theme: Theme) {
-        let lines: Vec<Line<'_>> = self
+        let fresh = Self::new(&self.source);
+        let lines: Vec<Line<'_>> = fresh
             .lines
             .iter()
             .map(|(text, outcome)| {
@@ -431,11 +485,11 @@ impl OverlayView for ConstituentsView {
             area,
             buf,
             theme,
-            &self.title,
-            Some(Line::styled(self.header.as_str(), style::dim_style(theme))),
+            &fresh.title,
+            Some(Line::styled(fresh.header.as_str(), style::dim_style(theme))),
             &lines,
             self.scroll,
-            CONSTITUENTS_FOOTER,
+            crate::i18n::tr("mission.constituents_footer", CONSTITUENTS_FOOTER),
         );
     }
 
@@ -790,6 +844,7 @@ mod tests {
             at: None,
             unseen: outcome == TerminalOutcome::Failed,
             reason: (outcome == TerminalOutcome::Failed).then(|| "Exit-Code 1".to_owned()),
+            reason_source: None,
             diverged: None,
         }
     }
@@ -864,5 +919,46 @@ mod tests {
         assert_eq!(view.scroll, 49, "clamped");
         assert_eq!(view.on_key(key(KeyCode::Esc)), OverlayOutcome::Close);
         Ok(())
+    }
+
+    #[test]
+    fn constituent_snapshot_refreshes_labels_and_keeps_scroll_keys_and_counts() {
+        use crate::i18n::{tr, with_language};
+        use harw_config::UiLanguage;
+        let mut row = row("raw-role", 0, 60, 60);
+        row.category = TerminalCategory::UnknownJob;
+        row.key = row.category.key();
+        row.constituents = (0..50)
+            .rev()
+            .map(|index| constituent(index, TerminalOutcome::Failed))
+            .collect();
+        let mut view = with_language(UiLanguage::German, || ConstituentsView::new(&row));
+        view.scroll = 7;
+        let before = view.source.clone();
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                for width in [1, 8, 20, 40, 160] {
+                    let area = Rect::new(0, 0, width, 12);
+                    let mut buf = Buffer::empty(area);
+                    view.render(area, &mut buf, Theme::Dark);
+                    if width == 160 {
+                        let shown = crate::test_support::display_buffer_text(&buf);
+                        assert!(
+                            shown.contains(tr("mission.finished", FINISHED_TITLE)),
+                            "{shown}"
+                        );
+                        assert!(shown.contains(&row.category.label()), "{shown}");
+                        assert!(shown.contains("build-42"), "scroll preserved: {shown}");
+                    }
+                }
+            });
+            assert_eq!(view.scroll, 7);
+            assert_eq!(view.source, before);
+        }
+        assert_eq!(view.source.key, "unknown-job");
+        assert_eq!(
+            (view.source.total, view.source.failed, view.source.listed()),
+            (60, 60, 50)
+        );
     }
 }

@@ -727,6 +727,18 @@ fn delete_model(home: &Path, target: &str) -> Result<(), ModelsError> {
 }
 
 fn run_model_picker(home: &Path) -> Result<(), ModelsError> {
+    run_model_picker_with(home, harw_tui::run_model_picker_for)
+}
+
+/// Keep config loading, lifecycle filtering, and profile persistence on the same
+/// path when exercising the terminal entry-point boundary in headless tests.
+fn run_model_picker_with(
+    home: &Path,
+    pick: impl FnOnce(
+        harw_config::UiLanguage,
+        Vec<harw_tui::ModelPickerProvider>,
+    ) -> Result<Option<harw_tui::ModelPickerOutcome>, harw_tui::TuiError>,
+) -> Result<(), ModelsError> {
     let (config, profile) = load_config_and_profile(home)?;
     let now = lifecycle_now();
     let mut deprecated_warnings: Vec<String> = Vec::new();
@@ -768,7 +780,7 @@ fn run_model_picker(home: &Path) -> Result<(), ModelsError> {
     for warning in &deprecated_warnings {
         println!("{warning}");
     }
-    let picked = harw_tui::run_model_picker(providers);
+    let picked = pick(config.harness.tui.language, providers);
     // Die Hinweise zu abgeschalteten Modellen stehen nach dem Picker, damit
     // sie nicht vom Alternativbildschirm der TUI verdeckt werden.
     for note in &retired_notes {
@@ -1333,6 +1345,49 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ModelsError> {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx, some_or};
+
+    #[test]
+    fn standalone_picker_receives_resolved_profile_language_and_defaults_to_english() -> TestResult
+    {
+        for (setting, expected) in [
+            (None, harw_config::UiLanguage::English),
+            (Some("ja"), harw_config::UiLanguage::Japanese),
+        ] {
+            let (_guard, home) = temp_home()?;
+            let profile = global_config_path(&home).map_err(ctx("profile config path"))?;
+            if let Some(language) = setting {
+                fs::write(&profile, format!("[tui]\nlanguage = \"{language}\"\n"))
+                    .map_err(ctx("write chosen language"))?;
+            }
+            let provider = provider_path(
+                profile
+                    .parent()
+                    .ok_or(TestError::Missing("profile directory"))?,
+                "local",
+            );
+            fs::create_dir_all(
+                provider
+                    .parent()
+                    .ok_or(TestError::Missing("provider directory"))?,
+            )
+            .map_err(ctx("create provider directory"))?;
+            fs::write(&provider, "name = \"local\"\napi = \"openai-chat\"\nbase_url = \"http://localhost:1234/v1\"\nmodels = [\"payload-model\"]\n")
+                .map_err(ctx("write provider"))?;
+            let mut called = false;
+            run_model_picker_with(&home, |language, providers| {
+                called = true;
+                assert_eq!(language, expected);
+                assert_eq!(providers.len(), 1);
+                assert_eq!(providers[0].id, "local");
+                assert_eq!(providers[0].models, ["payload-model"]);
+                assert!(providers[0].selected.contains("payload-model"));
+                Ok(None)
+            })
+            .map_err(ctx("run standalone picker boundary"))?;
+            assert!(called, "configured provider must reach the picker");
+        }
+        Ok(())
+    }
 
     /// Fester Prüfzeitpunkt der Lebenszyklus-Tests: 2026-10-15 00:00 UTC.
     fn lifecycle_test_now() -> TestResult<Timestamp> {

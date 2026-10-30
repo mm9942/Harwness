@@ -967,6 +967,14 @@ fn merge_tui(
 ) {
     let present = |field: &str| field_present(raw, &["tui", field]);
     profile_replaces(
+        &mut trusted.tui.language,
+        incoming.language,
+        present("language"),
+        role,
+        "tui.language",
+        layer_path,
+    );
+    profile_replaces(
         &mut trusted.tui.theme,
         incoming.theme,
         present("theme"),

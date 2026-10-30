@@ -3,9 +3,11 @@
 //! Reine Textfunktionen ohne Zustand; `app.rs` setzt die Segmente zur
 //! eigentlichen Statuszeile zusammen.
 
+use crate::i18n::{tr, tr_args};
 use harw_core::InteractionMode;
 use harw_extension_api::approval_mode::ApprovalMode;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Platzhalter für einen unbekannten Wert.
 const UNKNOWN: &str = "–";
@@ -33,23 +35,18 @@ pub(crate) fn child_info_segment(
     max_chars: usize,
 ) -> String {
     let age = match age_secs {
-        0 => "jetzt".to_owned(),
-        secs => format!("{secs}s"),
+        0 => tr("chrome.now", "now").to_owned(),
+        secs => tr_args(
+            "chrome.seconds",
+            "{seconds}s",
+            &[("seconds", &secs.to_string())],
+        ),
     };
     let info = match latest_info.map(str::trim) {
-        None | Some("") => "keine Meldung".to_owned(),
+        None | Some("") => tr("chrome.no_message", "no message").to_owned(),
         Some(text) => {
             let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            if collapsed.chars().count() > max_chars {
-                let mut kept: String = collapsed
-                    .chars()
-                    .take(max_chars.saturating_sub(1))
-                    .collect();
-                kept.push(ELLIPSIS);
-                kept
-            } else {
-                collapsed
-            }
+            shorten(&collapsed, max_chars)
         }
     };
     format!("{child} · {info} · {age}")
@@ -63,11 +60,11 @@ mod child_info_tests {
     fn none_and_empty_info_show_no_message() {
         assert_eq!(
             child_info_segment("researcher", None, 12, 40),
-            "researcher · keine Meldung · 12s"
+            "researcher · no message · 12s"
         );
         assert_eq!(
             child_info_segment("researcher", Some("   "), 0, 40),
-            "researcher · keine Meldung · jetzt"
+            "researcher · no message · now"
         );
     }
 
@@ -88,7 +85,7 @@ mod child_info_tests {
     fn normal_info_is_collapsed_and_kept() {
         assert_eq!(
             child_info_segment("analyst", Some(" scanne  Dateien\nim Ordner "), 0, 40),
-            "analyst · scanne Dateien im Ordner · jetzt"
+            "analyst · scanne Dateien im Ordner · now"
         );
     }
 }
@@ -107,11 +104,19 @@ pub(crate) fn mode_segment(
     pending: bool,
 ) -> String {
     let approval = approval.map_or(UNKNOWN, ApprovalMode::as_str);
-    let mut text = format!("Modus: {} · Freigabe: {approval}", mode.as_str());
     if pending {
-        text.push_str(" (ausstehend)");
+        tr_args(
+            "chrome.mode_pending",
+            "Mode: {mode} · Approval: {approval} (pending)",
+            &[("mode", mode.as_str()), ("approval", approval)],
+        )
+    } else {
+        tr_args(
+            "chrome.mode",
+            "Mode: {mode} · Approval: {approval}",
+            &[("mode", mode.as_str()), ("approval", approval)],
+        )
     }
-    text
 }
 
 /// Kurzform von [`mode_segment`] für schmale Fenster: `chat · full`.
@@ -122,11 +127,15 @@ pub(crate) fn mode_segment_short(
     pending: bool,
 ) -> String {
     let approval = approval.map_or(UNKNOWN, ApprovalMode::as_str);
-    let mut text = format!("{} · {approval}", mode.as_str());
     if pending {
-        text.push_str(" (ausst.)");
+        tr_args(
+            "chrome.mode_short_pending",
+            "{mode} · {approval} (pend.)",
+            &[("mode", mode.as_str()), ("approval", approval)],
+        )
+    } else {
+        format!("{} · {approval}", mode.as_str())
     }
-    text
 }
 
 /// Segment mit dem aktiven Modell, höchstens `max_chars` Zeichen lang.
@@ -135,7 +144,7 @@ pub(crate) fn mode_segment_short(
 /// Vollform `provider/model`; ohne Anbieter nur `model`, ohne Modell
 /// `kein Modell`. Passt die Vollform nicht, wird zuerst der Anbieter
 /// weggelassen; passt auch das Modell nicht, wird es zeichensicher (nach
-/// Unicode-Skalaren, nie mitten in einem UTF-8-Zeichen) gekürzt und mit `…`
+/// Graphemgrenzen und Terminalspalten) gekürzt und mit `…`
 /// abgeschlossen. `max_chars == 0` liefert einen leeren Text.
 #[must_use]
 pub(crate) fn model_segment(
@@ -148,9 +157,9 @@ pub(crate) fn model_segment(
     let full = match (provider, model) {
         (Some(provider), Some(model)) => format!("{provider}/{model}"),
         (None, Some(model)) => model.to_owned(),
-        (_, None) => "kein Modell".to_owned(),
+        (_, None) => tr("chrome.no_model", "no model").to_owned(),
     };
-    if full.chars().count() <= max_chars {
+    if display_width(&full) <= max_chars {
         return full;
     }
     let fallback = model.unwrap_or(full.as_str());
@@ -159,15 +168,7 @@ pub(crate) fn model_segment(
 
 /// Kürzt `text` auf höchstens `max_chars` Zeichen inklusive `…`.
 fn shorten(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_owned();
-    }
-    if max_chars == 0 {
-        return String::new();
-    }
-    let mut shortened: String = text.chars().take(max_chars - 1).collect();
-    shortened.push(ELLIPSIS);
-    shortened
+    fit_width(text, max_chars)
 }
 
 /// Anzeigebreite von `text` in Terminalspalten.
@@ -188,13 +189,13 @@ pub(crate) fn fit_width(text: &str, max: usize) -> String {
     }
     let mut out = String::new();
     let mut used = 0;
-    for ch in text.chars() {
-        let width = ch.width().unwrap_or(0);
+    for grapheme in text.graphemes(true) {
+        let width = grapheme.width();
         if used + width + 1 > max {
             break;
         }
         used += width;
-        out.push(ch);
+        out.push_str(grapheme);
     }
     out.push(ELLIPSIS);
     out
@@ -216,10 +217,17 @@ pub(crate) fn fit_width(text: &str, max: usize) -> String {
 #[must_use]
 pub(crate) fn dod_mark_text(count: &str, verified: bool) -> (String, String) {
     if verified {
-        (format!(" ⛨ {count} high "), format!(" ⛨ {count} "))
+        (
+            tr_args("chrome.dod_high", " ⛨ {count} high ", &[("count", count)]),
+            format!(" ⛨ {count} "),
+        )
     } else {
         (
-            format!(" ⛨ {count} high (unverified) "),
+            tr_args(
+                "chrome.dod_unverified",
+                " ⛨ {count} high (unverified) ",
+                &[("count", count)],
+            ),
             format!(" ⛨ {count}? "),
         )
     }
@@ -309,6 +317,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clipping_respects_graphemes_and_cell_budgets() {
+        for text in [
+            "漢字漢字漢字",
+            "नमस्ते क्षि हिन्दी",
+            "e\u{301}e\u{301}e\u{301}",
+            "👩‍💻👨‍👩‍👧‍👦👍🏽",
+            "a漢e\u{301}क्षि👩‍💻",
+        ] {
+            for budget in [0, 1, 8, 20, 40] {
+                let clipped = fit_width(text, budget);
+                assert!(
+                    display_width(&clipped) <= budget,
+                    "{text:?}: {budget}: {clipped:?}"
+                );
+                if clipped != text && !clipped.is_empty() {
+                    let prefix = clipped.strip_suffix('…').expect("ellipsis");
+                    assert!(
+                        text.grapheme_indices(true)
+                            .any(|(index, _)| index == prefix.len()),
+                        "split grapheme: {clipped:?}"
+                    );
+                }
+                assert_eq!(model_segment(None, Some(text), budget), clipped);
+            }
+        }
+        assert_eq!(fit_width("e\u{301}abc", 2), "e\u{301}…");
+        assert_eq!(fit_width("👩‍💻abc", 3), "👩‍💻…");
+        // Provider is discarded before clipping the model, measured in cells.
+        assert_eq!(model_segment(Some("provider"), Some("漢字"), 4), "漢字");
+        crate::i18n::with_language(harw_config::UiLanguage::Hindi, || {
+            assert!(
+                mode_segment(InteractionMode::Work, Some(ApprovalMode::FullAccess), true)
+                    .contains("लंबित")
+            );
+            assert!(child_info_segment("payload-child", None, 0, 20).contains("कोई संदेश नहीं"));
+        });
+    }
+
+    #[test]
     fn fit_width_counts_display_columns() {
         assert_eq!(fit_width("abc", 3), "abc");
         assert_eq!(fit_width("abcdef", 4), "abc…");
@@ -373,15 +420,15 @@ mod tests {
     fn mode_segment_shows_mode_and_approval() {
         assert_eq!(
             mode_segment(InteractionMode::Plan, Some(ApprovalMode::Delegated), false),
-            "Modus: plan · Freigabe: auto"
+            "Mode: plan · Approval: auto"
         );
         assert_eq!(
             mode_segment(InteractionMode::Work, Some(ApprovalMode::FullAccess), true),
-            "Modus: work · Freigabe: full (ausstehend)"
+            "Mode: work · Approval: full (pending)"
         );
         assert_eq!(
             mode_segment(InteractionMode::Chat, None, false),
-            "Modus: chat · Freigabe: –"
+            "Mode: chat · Approval: –"
         );
     }
 
@@ -392,8 +439,8 @@ mod tests {
             "anthropic/claude-x"
         );
         assert_eq!(model_segment(None, Some("gpt"), 40), "gpt");
-        assert_eq!(model_segment(Some("openai"), None, 40), "kein Modell");
-        assert_eq!(model_segment(Some(" "), Some(" "), 40), "kein Modell");
+        assert_eq!(model_segment(Some("openai"), None, 40), "no model");
+        assert_eq!(model_segment(Some(" "), Some(" "), 40), "no model");
     }
 
     #[test]

@@ -4689,6 +4689,78 @@ mod tests {
         Ok((base_url, handle))
     }
 
+    #[tokio::test]
+    async fn identityless_responses_tool_results_require_identity_only_for_reasoning() -> TestResult
+    {
+        for (case, effort, encrypted, identity, succeeds) in [
+            ("ordinary tool round", None, false, None, true),
+            (
+                "explicit reasoning",
+                Some(harw_types::ReasoningEffort::High),
+                false,
+                None,
+                false,
+            ),
+            ("encrypted reasoning", None, true, None, false),
+            (
+                "invalid provided identity",
+                None,
+                false,
+                Some(test_identity("", "", "reader")),
+                false,
+            ),
+        ] {
+            let mut output = Vec::new();
+            if encrypted {
+                output.push(serde_json::json!({
+                    "type": "reasoning", "encrypted_content": "opaque-raw-block", "summary": []
+                }));
+            }
+            output.push(serde_json::json!({
+                "type": "function_call", "call_id": "a", "name": "lookup", "arguments": "{}"
+            }));
+            let (base_url, server) = mock_json_response_server(serde_json::json!({
+                "status": "completed", "output": output
+            }))?;
+            let provider = OpenAiResponsesProvider::new(
+                base_url,
+                "gpt-test",
+                SecretString::new("sk-test".into()),
+            )
+            .map_err(ctx("Responses provider"))?;
+            let mut request = request_with_ids(None, None);
+            request.history.push_user_text("Find context");
+            request.tools = vec![ToolSpec::Function(harw_tools::FunctionToolSpec {
+                name: ToolName::new("lookup"),
+                description: "Lookup context".to_owned(),
+                parameters: harw_tools::JsonSchema {
+                    schema_type: Some(harw_tools::JsonSchemaType::Object),
+                    ..Default::default()
+                },
+                strict: false,
+            })];
+            request.identity = identity;
+            request.reasoning_effort = effort;
+            let result = provider.respond(request).await;
+            server.join().map_err(join_thread_error)??;
+            if succeeds {
+                let response = result.map_err(ctx("ordinary identity-less tool result"))?;
+                assert_eq!(response.stop, StopReason::ToolUse);
+                assert_eq!(response.tool_calls.len(), 1);
+                assert_eq!(response.tool_calls[0].id.as_str(), "a");
+                assert_eq!(response.tool_calls[0].name.as_str(), "lookup");
+                assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
+                assert!(response.reasoning.is_none());
+            } else {
+                assert!(
+                    matches!(result, Err(ModelError::RequestFailed(ref detail)) if detail.contains("request identity is missing")),
+                    "{case} must retain its identity requirement: {result:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Startet einen Mock-HTTP-Server, der pro Verbindung einen eigenen
     /// Thread spawnt (statt seriell zu akzeptieren wie [`mock_chat_server`]),
     /// die aktuell gleichzeitig offenen Verbindungen zählt, den beobachteten

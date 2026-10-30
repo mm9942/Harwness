@@ -395,6 +395,15 @@ pub(crate) fn luminance(r: u8, g: u8, b: u8) -> u16 {
     ((luma + 500) / 1000) as u16
 }
 
+/// Resolve explicit profile theme values, including legacy aliases.
+pub(crate) fn configured_theme(value: &str) -> Theme {
+    match value {
+        "dark" | "default-dark" => Theme::Dark,
+        "light" | "default-light" => Theme::Light,
+        _ => detect_theme(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -138,7 +138,10 @@ impl AgentTree {
         let row = visible.get(selected).copied();
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Agenten · ↑↓ wählen · ←→ Baum · Enter Details · s stoppen · Esc zurück ");
+            .title(crate::i18n::tr(
+                "agents.tree_title",
+                " Agents · ↑↓ select · ←→ tree · Enter details · s stop · Esc back ",
+            ));
         let inner = block.inner(area);
         block.render(area, buffer);
         let lines: Vec<Line<'static>> = if self.details {
@@ -161,7 +164,7 @@ impl AgentTree {
                 .enumerate()
                 .map(|(index, row)| {
                     let status = if self.requested.contains(&row.id) && row.can_stop {
-                        "Abbruch angefordert"
+                        crate::i18n::tr("agents.cancel_requested", "Cancellation requested")
                     } else {
                         &row.status
                     };
@@ -272,5 +275,39 @@ mod tests {
             AgentTree::default().handle_key(key(KeyCode::Char('s')), &[node]),
             AgentTreeAction::Stay
         );
+    }
+    #[test]
+    fn locale_refresh_keeps_tree_selection_expansion_confirmation_and_scroll() {
+        use harw_config::UiLanguage;
+        let rows = vec![
+            row("uia", None, 0),
+            row("child", Some("uia"), 1),
+            row("leaf", Some("child"), 2),
+        ];
+        let mut tree = AgentTree {
+            selected: Some("child".to_owned()),
+            details: true,
+            detail_scroll: 3,
+            ..Default::default()
+        };
+        tree.collapsed.insert("child".to_owned());
+        tree.requested.insert("child".to_owned());
+        let before = format!("{tree:?}");
+        for language in UiLanguage::ALL {
+            crate::i18n::with_language(language, || {
+                for width in [1, 8, 20, 40, 160] {
+                    let area = Rect::new(0, 0, width, 20);
+                    let mut buffer = Buffer::empty(area);
+                    tree.render(area, &mut buffer, Theme::Dark, &rows);
+                    if width == 160 {
+                        let shown = crate::test_support::display_buffer_text(&buffer);
+                        assert!(shown.contains(crate::i18n::tr("agents.tree_title", " Agents · ↑↓ select · ←→ tree · Enter details · s stop · Esc back ").trim()), "{shown}");
+                    }
+                }
+            });
+            assert_eq!(format!("{tree:?}"), before);
+            assert_eq!(tree.visible(&rows).len(), 2);
+            assert_eq!(rows[1].status, "running");
+        }
     }
 }

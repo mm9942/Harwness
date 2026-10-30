@@ -252,15 +252,15 @@ fn assert_five_windows(
         .collect::<TestResult<Vec<_>>>()?
         .join("\n");
     assert!(
-        live_body.starts_with("∴ Prüfe Lens") && live_body.contains("● fs.read · läuft · "),
+        live_body.starts_with("∴ Prüfe Lens") && live_body.contains("● fs.read · running · "),
         "{shown}"
     );
     assert!(
-        cells(rows, agents.x + 1, 0, agents.width - 2)?.starts_with(" Agenten · 2 aktiv"),
+        cells(rows, agents.x + 1, 0, agents.width - 2)?.starts_with(" Agents · 2 active"),
         "{shown}"
     );
     assert!(
-        cells(rows, jobs.x + 1, jobs.y, jobs.width - 2)?.starts_with(" Jobs · 1 aktiv "),
+        cells(rows, jobs.x + 1, jobs.y, jobs.width - 2)?.starts_with(" Jobs · 1 active "),
         "{shown}"
     );
     assert!(
@@ -357,7 +357,7 @@ fn render_viewport_at_200x50_with_workbench_and_explorer_keeps_the_anchors() -> 
     assert!(
         !rows
             .iter()
-            .any(|row| row.contains("Werkbank: zu wenig Platz")),
+            .any(|row| row.contains("Workbench: not enough space")),
         "no hint while the workbench is drawn: {shown}"
     );
 
@@ -372,7 +372,7 @@ fn render_viewport_at_200x50_with_workbench_and_explorer_keeps_the_anchors() -> 
         Some(Rect::new(0, 0, 200, 46)),
         "{shown}"
     );
-    assert!(cells(&rows, 0, 0, 10)?.starts_with("┌ Agenten"), "{shown}");
+    assert!(cells(&rows, 0, 0, 10)?.starts_with("┌ Agents"), "{shown}");
     assert_eq!(handle_panel_key(&mut app, key(KeyCode::F(11))), Some(true));
     let _ = rendered(&app, 200, 50)?;
     assert_eq!(app.last_regions.get().agents, Some(agents));
@@ -803,7 +803,7 @@ fn render_viewport_alt_l_shows_the_live_detail_in_place_at_160x45() -> TestResul
         "{shown}"
     );
     assert!(
-        cells(&rows, 129, 0, 30)?.starts_with(" Agenten"),
+        cells(&rows, 129, 0, 30)?.starts_with(" Agents"),
         "the other windows stay: {shown}"
     );
 
@@ -843,14 +843,14 @@ fn render_viewport_names_a_workbench_without_room_in_the_status_line() -> TestRe
     let shown = rows.join("\n");
     assert!(
         rows.iter()
-            .any(|row| row.contains("Werkbank: zu wenig Platz")),
+            .any(|row| row.contains("Workbench: not enough space")),
         "{shown}"
     );
     let rows = rendered(&app, 160, 45)?;
     assert!(
         !rows
             .iter()
-            .any(|row| row.contains("Werkbank: zu wenig Platz")),
+            .any(|row| row.contains("Workbench: not enough space")),
         "{}",
         rows.join("\n")
     );

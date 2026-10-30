@@ -755,6 +755,8 @@ pub(crate) fn handle_switch_core(
     // fails, the switch is rejected and the previous model stays active.
     crate::live_model::ensure_provider_ready(ctx, &canonical_target)?;
 
+    let before = controller.snapshot();
+
     // ── Step 4: mutate the controller ─────────────────────────────────────────
     controller
         .set_active_provider(canonical_target.clone())
@@ -781,18 +783,24 @@ pub(crate) fn handle_switch_core(
         text.push_str("\nWarnung: ");
         text.push_str(warning);
     }
-    match persist(
+    let note = persist(
         Some(canonical_target.as_str()),
         snap_after.active_model.as_deref(),
-    ) {
+    );
+    match note.as_deref() {
         Some(note) => {
             text.push('\n');
-            text.push_str(&note);
+            text.push_str(note);
         }
         None => text.push_str("\n(als Standard für künftige Sitzungen gespeichert)"),
     }
 
-    Ok(OpOutput::from(text))
+    Ok(OpOutput {
+        text,
+        data: Some(
+            serde_json::json!({"ui_feedback": {"kind":"model_selection", "target":"session", "changed":before.active_provider != snap_after.active_provider || before.active_model != snap_after.active_model, "provider":canonical_target, "model":snap_after.active_model, "effective":"next_turn", "warning":lifecycle_warning, "note":note}}),
+        ),
+    })
 }
 
 /// Wechselt ausschließlich die UIA-Auswahl.
@@ -917,7 +925,7 @@ pub(crate) fn handle_uia_switch_core(
             "UIA provider switched to {canonical_target}; UIA model is {model_id}; \
              next UIA turn will use it"
         ),
-        None => match cleared_incompatible_model {
+        None => match &cleared_incompatible_model {
             Some(previous_model) => format!(
                 "UIA provider switched to {canonical_target}; incompatible UIA model \
                  {previous_model} was cleared; use `/uia-model list` to choose a compatible model"
@@ -932,15 +940,21 @@ pub(crate) fn handle_uia_switch_core(
         text.push_str("\nWarnung: ");
         text.push_str(warning);
     }
-    match persist(selection.provider.as_deref(), selection.model.as_deref()) {
+    let note = persist(selection.provider.as_deref(), selection.model.as_deref());
+    match note.as_deref() {
         Some(note) => {
             text.push('\n');
-            text.push_str(&note);
+            text.push_str(note);
         }
         None => text.push_str("\n(UIA-Auswahl für künftige Sitzungen gespeichert)"),
     }
 
-    Ok(OpOutput::from(text))
+    Ok(OpOutput {
+        text,
+        data: Some(
+            serde_json::json!({"ui_feedback": {"kind":"model_selection", "target":"uia", "changed":current != selection, "provider":canonical_target, "model":resolved_model, "cleared_model":cleared_incompatible_model, "effective":"next_uia_turn", "warning":lifecycle_warning, "note":note}}),
+        ),
+    })
 }
 
 /// Beschreibt die konfigurierte Auth-Methode eines Providers — nur den

@@ -75,13 +75,21 @@ pub(super) fn report_rejected_route(app: &mut ChatApp, rejected: &RejectedRoute)
         "tui.live_model.route_refused"
     );
     let label = route_label(rejected.provider.as_deref(), rejected.model.as_deref())
-        .unwrap_or_else(|| "(keine Angabe)".to_owned());
+        .unwrap_or_else(|| {
+            crate::i18n::tr_for(
+                app.interface_language(),
+                "operation_feedback.unspecified",
+                "(unspecified)",
+            )
+            .to_owned()
+        });
     app.push_line(
         Role::System,
-        format!(
-            "Modellwechsel auf {label} abgelehnt: {reason}. \
-             Die Sitzung bleibt beim bisherigen Modell.",
-            reason = rejected.reason
+        crate::i18n::tr_args_for(
+            app.interface_language(),
+            "operation_feedback.route_refused",
+            "Model switch to {label} refused: {reason}. The session keeps its previous model.",
+            &[("label", &label), ("reason", &rejected.reason)],
         ),
     );
 }
@@ -265,7 +273,7 @@ mod tests {
         assert!(
             notices
                 .iter()
-                .any(|text| text.contains("abgelehnt") && text.contains("mistral-ocr-4-1")),
+                .any(|text| text.contains("refused") && text.contains("mistral-ocr-4-1")),
             "die Ablehnung ist sichtbar und nennt den Ersatz: {notices:?}"
         );
 
@@ -331,6 +339,62 @@ mod tests {
             resolved_root_route(&app),
             (Some("openai".to_owned()), Some("gpt-5".to_owned()))
         );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn command_feedback_interleaves_app_locales_and_keeps_completed_history() -> TestResult {
+        use harw_config::UiLanguage::{English, German};
+        use harw_operations::{ServiceMap, SharedSessionController};
+        use std::sync::Arc;
+        let mut en = test_chat_app()?;
+        let mut de = test_chat_app()?;
+        en.language = English;
+        de.language = German;
+        let adapters = harw_operations::adapter::CommandAdapter::from_operation(Arc::new(
+            harw_ops::effort::EffortOperation,
+        ));
+        let en_controller: SharedSessionController = en.session_controller.clone();
+        let de_controller: SharedSessionController = de.session_controller.clone();
+        let en_job = crate::command_data::execute_command_with_data_for(
+            en.interface_language(),
+            &adapters,
+            en.sandbox(),
+            en.session_id(),
+            crate::PermissionTier::Operator,
+            "/effort high",
+            || {
+                let mut services = ServiceMap::new();
+                services.insert(en_controller);
+                services
+            },
+        );
+        let de_job = crate::command_data::execute_command_with_data_for(
+            de.interface_language(),
+            &adapters,
+            de.sandbox(),
+            de.session_id(),
+            crate::PermissionTier::Operator,
+            "/effort high",
+            || {
+                let mut services = ServiceMap::new();
+                services.insert(de_controller);
+                services
+            },
+        );
+        tokio::task::yield_now().await;
+        let (en_output, de_output) = tokio::join!(en_job, de_job);
+        let en_output = en_output.map_err(crate::test_support::TestError::Unexpected)?;
+        let de_output = de_output.map_err(crate::test_support::TestError::Unexpected)?;
+        assert!(en_output.text.contains("Reasoning effort (session): high."));
+        assert!(de_output.text.contains("Reasoning-Effort (session): high."));
+        assert!(en_output.text.contains("next turn"));
+        assert!(de_output.text.contains("nächsten Turn"));
+        en.push_line(super::Role::System, en_output.text.clone());
+        de.push_line(super::Role::System, de_output.text.clone());
+        en.language = German;
+        de.language = English;
+        assert_eq!(system_notices(&en).last(), Some(&en_output.text));
+        assert_eq!(system_notices(&de).last(), Some(&de_output.text));
         Ok(())
     }
 }

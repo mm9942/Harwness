@@ -62,7 +62,7 @@ pub mod walk;
 #[cfg(test)]
 mod test_support;
 
-pub use atomic::{AtomicWriteOptions, write_atomic};
+pub use atomic::{AtomicWriteOptions, AtomicWriteOutcome, write_atomic, write_atomic_with_outcome};
 pub use open::{OpenMode, is_symlink_loop, open_beneath, open_dir_nofollow, open_nofollow};
 pub use perm::ensure_private_regular;
 pub use walk::{EntryType, WalkBeneath, WalkEntry, WalkLimits, WalkStop, walk_beneath};

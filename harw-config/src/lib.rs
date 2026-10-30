@@ -59,7 +59,8 @@ pub use browser_toml::BrowserSection;
 pub use channel_toml::{ChannelFileToml, ChannelSectionToml, ChannelToml, TelegramChannelToml};
 pub use discovery::{
     HasName, ResolvedConfig, default_config_layers, default_config_layers_named, discover_config,
-    discover_config_with_restricted, discover_config_with_restricted_and_project_settings,
+    discover_config_with_override, discover_config_with_restricted,
+    discover_config_with_restricted_and_project_settings,
 };
 pub use dod_toml::DodSection;
 pub use dotenv::{
@@ -72,7 +73,7 @@ pub use harness_config::{
     DEFAULT_DREAM_IDLE_MINUTES, DEFAULT_SUDO_SESSION_MINUTES, DiaryToml, DreamToml, HarnessConfig,
     HostToml, KnowledgeToml, LoggingSection, MAX_SUDO_SESSION_MINUTES, McpJobCapabilityToml,
     McpListenerSection, McpPrincipalToml, PolicySection, SandboxSection, SessionSection,
-    TmuxOperationModeToml, TmuxSandboxToml, TuiSection,
+    TmuxOperationModeToml, TmuxSandboxToml, TuiSection, UiLanguage,
 };
 // Runde 5, Teil N: `[shell] max_timeout_secs`.
 pub use shell_limits::ShellToml;
@@ -122,7 +123,7 @@ pub use uia_worker_models::{
     resolve_uia_worker_model, resolve_uia_worker_models,
 };
 pub use web_toml::{WebIdentityModeToml, WebIdentityToml, WebSearchToml, WebSection};
-pub use writer::{ConfigWriter, RuleKind};
+pub use writer::{ConfigSaveOutcome, ConfigWriter, RuleKind};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

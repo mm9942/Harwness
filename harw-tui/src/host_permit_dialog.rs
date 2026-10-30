@@ -58,6 +58,8 @@
 //! );
 //! ```
 
+use crate::i18n::{tr, tr_args};
+
 use harw_core::InteractionMode;
 
 pub use harw_tool_shell::host_permit_prompt::{
@@ -111,7 +113,7 @@ pub fn preselected_variant_for_mode(mode: InteractionMode) -> HostPermitVariant 
 /// bewusst. Diese Funktion liefert dann die Zeile, die die TUI anzeigt.
 ///
 /// # Rückgabe
-/// `Some("Host-Modus beendet (neue Sitzung).")`, wenn `previous_session` in
+/// `Some("Host mode ended (new session).")`, wenn `previous_session` in
 /// `registry` noch eine Phase hatte, sonst `None`.
 #[must_use]
 pub fn session_switch_host_notice(
@@ -120,7 +122,7 @@ pub fn session_switch_host_notice(
 ) -> Option<&'static str> {
     registry
         .is_session_approved(previous_session)
-        .then_some("Host-Modus beendet (neue Sitzung).")
+        .then(|| tr("dialogs.host_ended", "Host mode ended (new session)."))
 }
 
 /// Titel und einzeiliger Hinweis für eine Host-Mode-Anfrage aus dem
@@ -140,15 +142,26 @@ pub fn session_switch_host_notice(
 #[must_use]
 pub fn escalation_dialog_text(prompt: &HostPermitPrompt) -> Option<(String, String)> {
     let requester = prompt.requester()?;
-    let title = format!("Host-Mode angefragt: {}", requester.path);
-    let hint = format!(
-        "Rolle {} · Kind {} · Grund: {} · Befehl: {} · cwd: {} · Host-Arbeitsphase gilt für die \
-         ganze harw-Sitzung inkl. aller Kind-Agenten; sudo bleibt verboten.",
-        requester.role,
-        requester.session,
-        prompt.reason().unwrap_or("(kein Grund angegeben)"),
-        prompt.command(),
-        prompt.workspace().display(),
+    let title = tr_args(
+        "dialogs.host_request",
+        "Host mode requested: {path}",
+        &[("path", &requester.path)],
+    );
+    let hint = tr_args(
+        "dialogs.host_details",
+        "Role {role} · Child {child} · Reason: {reason} · Command: {command} · cwd: {cwd} · Host access applies to the entire harw session including all child agents; sudo remains forbidden.",
+        &[
+            ("role", &requester.role),
+            ("child", &requester.session),
+            (
+                "reason",
+                prompt
+                    .reason()
+                    .unwrap_or_else(|| tr("dialogs.host_no_reason", "(no reason provided)")),
+            ),
+            ("command", prompt.command()),
+            ("cwd", &prompt.workspace().display().to_string()),
+        ],
     );
     Some((title, hint))
 }
@@ -164,7 +177,7 @@ mod tests {
         registry.mark_global_approval();
         assert_eq!(
             session_switch_host_notice(&registry, "old"),
-            Some("Host-Modus beendet (neue Sitzung).")
+            Some("Host mode ended (new session).")
         );
     }
 
@@ -197,8 +210,8 @@ mod tests {
             "{title}"
         );
         for needle in [
-            "Rolle executor",
-            "Kind child-7",
+            "Role executor",
+            "Child child-7",
             "braucht Netz für crates.io",
             "cargo fetch",
             "/workspace/shared/proj",

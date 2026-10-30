@@ -1614,7 +1614,12 @@ async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> 
                     outcome.manifest.display()
                 )
             };
-            Ok(OpOutput::from(text))
+            Ok(OpOutput {
+                text,
+                data: Some(
+                    serde_json::json!({"ui_feedback": {"kind":"skill_state", "name":target, "enabled":enabled, "changed":outcome.changed, "manifest":outcome.manifest.display().to_string(), "effective":"next_config_load"}}),
+                ),
+            })
         }
         unknown => Err(OpError::InvalidArguments(format!(
             "unknown /skills action '{unknown}'"
@@ -1907,6 +1912,48 @@ mod tests {
         Ok(())
     }
 
+    struct FailedSkillPersistence;
+    impl SkillStatePersistence for FailedSkillPersistence {
+        fn set_skill_enabled(
+            &self,
+            _name: &str,
+            _enabled: bool,
+        ) -> Result<SkillStateOutcome, OpError> {
+            Err(OpError::Execution("manifest save refused".to_owned()))
+        }
+    }
+    #[tokio::test]
+    async fn activation_save_failure_returns_error_before_mirroring_or_success_data() -> TestResult
+    {
+        let (base, root) = test_context()?;
+        let live: crate::live_config::SharedLiveConfig = Arc::new(
+            crate::live_config::LiveConfig::new(Arc::new(review_config())),
+        );
+        let mut services = ServiceMap::new();
+        services.insert(Arc::new(review_config()));
+        services.insert(Arc::clone(&live));
+        let persistence: Arc<dyn SkillStatePersistence> = Arc::new(FailedSkillPersistence);
+        services.insert(persistence);
+        let context = OpContext::new(
+            base.session_id().clone(),
+            base.turn_id().clone(),
+            base.sandbox().clone(),
+            services,
+        );
+        let result = super::skills(&context, args("deactivate", Some("review"))).await;
+        assert!(
+            matches!(result,Err(OpError::Execution(message)) if message=="manifest save refused")
+        );
+        assert!(
+            live.current()
+                .skills
+                .get("review")
+                .is_some_and(|skill| skill.enabled)
+        );
+        std::fs::remove_dir_all(root).map_err(ctx("remove workspace"))?;
+        Ok(())
+    }
+
     fn args(action: &str, target: Option<&str>) -> SkillsArgs {
         SkillsArgs {
             action: Some(action.to_owned()),
@@ -1973,6 +2020,27 @@ mod tests {
         assert!(deactivated.text.contains("'review' deaktiviert"));
         let activated = activated.map_err(ctx("activate"))?;
         assert!(activated.text.contains("'review' aktiviert"));
+        let activated_data = activated
+            .data
+            .as_ref()
+            .ok_or(TestError::Missing("activation data"))?;
+        assert_eq!(activated_data["ui_feedback"]["enabled"], true);
+        assert_eq!(activated_data["ui_feedback"]["changed"], true);
+        assert_eq!(
+            activated_data["ui_feedback"]["manifest"],
+            "/recorded/skills/review/skill.toml"
+        );
+        assert_eq!(
+            activated_data["ui_feedback"]["effective"],
+            "next_config_load"
+        );
+        assert_eq!(
+            deactivated
+                .data
+                .as_ref()
+                .ok_or(TestError::Missing("deactivation data"))?["ui_feedback"]["enabled"],
+            false
+        );
         let calls = recorder.calls.lock().map_err(ctx("lock calls"))?;
         assert_eq!(
             *calls,
@@ -2065,6 +2133,20 @@ mod tests {
         assert!(first.text.contains("nächsten Config-Laden"));
         let second = second.map_err(ctx("second deactivate"))?;
         assert!(second.text.contains("bereits deaktiviert"));
+        assert_eq!(
+            first
+                .data
+                .as_ref()
+                .ok_or(TestError::Missing("first data"))?["ui_feedback"]["changed"],
+            true
+        );
+        assert_eq!(
+            second
+                .data
+                .as_ref()
+                .ok_or(TestError::Missing("second data"))?["ui_feedback"]["changed"],
+            false
+        );
         assert!(!read_enabled(&manifest)?);
         Ok(())
     }

@@ -50,6 +50,8 @@ pub(crate) struct JobRow {
     /// Grund des Fehlschlags (R18 F9), nur bei `failed`; siehe
     /// [`failure_reason`].
     pub reason: Option<String>,
+    /// Semantic owned reason for current-locale presentation.
+    pub reason_source: Option<JobFailure>,
     /// W20-A: typed provenance (`AgentChild`, `Tool`, `Operator`) from
     /// [`harw_tool_job::JobMeta::resolved_origin`]; `None` = unknown
     /// provenance (a legacy record without origin fields), never guessed
@@ -117,6 +119,7 @@ impl JobRow {
             active: !state.is_terminal(),
             failed: matches!(state, JobState::Failed | JobState::Unknown),
             reason: failure_reason(status),
+            reason_source: JobFailure::from_status(status),
             origin,
             cgroup: status.job_cgroup_path().map(sanitize_inline),
             ended_at: status.meta.ended_at,
@@ -127,7 +130,7 @@ impl JobRow {
     /// Kurzer, lokalisierter Zustand (`läuft`, `fertig`, …) zur Anzeige.
     #[must_use]
     pub(crate) fn state_label(&self) -> &'static str {
-        harw_ops::jobs::state_label(self.state)
+        job_state_label(self.state)
     }
 
     /// Session id of the child agent run this job backs, if it is a
@@ -191,53 +194,132 @@ const REASON_LINE_CHARS: usize = 120;
 /// `None` für Jobs, die nicht fehlgeschlagen sind (auch gestoppte Jobs).
 #[must_use]
 pub(crate) fn failure_reason(status: &JobStatus) -> Option<String> {
-    let meta = &status.meta;
-    if !matches!(meta.state, JobState::Failed | JobState::Unknown) {
-        return None;
+    JobFailure::from_status(status).map(|reason| reason.render())
+}
+
+/// Display labels only; protocol state tokens stay in harw-ops.
+pub(crate) fn job_state_label(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued => crate::i18n::tr("mission.queued", "queued"),
+        JobState::Running => crate::i18n::tr("mission.running", "running"),
+        JobState::Succeeded => crate::i18n::tr("mission.succeeded", "succeeded"),
+        JobState::Failed => crate::i18n::tr("agents.failed", "failed"),
+        JobState::Stopped => crate::i18n::tr("mission.stopped", "stopped"),
+        JobState::Detached => crate::i18n::tr("mission.detached", "detached"),
+        JobState::Unknown => crate::i18n::tr("mission.unknown_state", "unknown"),
     }
-    if let Some(error) = &meta.launch_error {
-        let first = error.lines().next().unwrap_or_default().trim();
-        return Some(sanitize_inline(&format!("Startfehler: {first}")));
+}
+
+/// Captured semantic failure data. Never infer a key from an arbitrary reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JobFailure {
+    kind: FailureKind,
+    tail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FailureKind {
+    Launch(String),
+    Timeout,
+    Signal(String),
+    Exit(String),
+    Stopped,
+    LaunchUnknown,
+    UnknownPrevious,
+    Unknown,
+}
+
+impl JobFailure {
+    fn from_status(status: &JobStatus) -> Option<Self> {
+        let meta = &status.meta;
+        if !matches!(meta.state, JobState::Failed | JobState::Unknown) {
+            return None;
+        }
+        let (kind, with_tail) = if let Some(error) = &meta.launch_error {
+            (
+                FailureKind::Launch(sanitize_inline(
+                    error.lines().next().unwrap_or_default().trim(),
+                )),
+                false,
+            )
+        } else {
+            match meta.end_reason() {
+                Some(JobEndReason::Timeout) => (FailureKind::Timeout, true),
+                Some(JobEndReason::Signal) => (
+                    FailureKind::Signal(
+                        meta.signal
+                            .map_or_else(|| "?".to_owned(), |n| n.to_string()),
+                    ),
+                    true,
+                ),
+                Some(JobEndReason::Exited) => (
+                    FailureKind::Exit(
+                        meta.exit_code
+                            .map_or_else(|| "?".to_owned(), |n| n.to_string()),
+                    ),
+                    true,
+                ),
+                Some(JobEndReason::Stopped) => (FailureKind::Stopped, true),
+                Some(JobEndReason::LaunchError) => (FailureKind::LaunchUnknown, true),
+                Some(JobEndReason::Unknown) => (FailureKind::UnknownPrevious, false),
+                None => (FailureKind::Unknown, false),
+            }
+        };
+        let tail = with_tail
+            .then(|| {
+                status
+                    .last_lines
+                    .iter()
+                    .rev()
+                    .map(|line| line.trim())
+                    .find(|line| !line.is_empty())
+                    .map(|line| {
+                        sanitize_inline(&crate::history_cell::truncate_chars(
+                            line,
+                            REASON_LINE_CHARS,
+                        ))
+                    })
+            })
+            .flatten();
+        Some(Self { kind, tail })
     }
-    let base = match meta.end_reason() {
-        Some(JobEndReason::Timeout) => "CPU-Budget erschöpft".to_owned(),
-        Some(JobEndReason::Signal) => format!(
-            "Signal {}",
-            meta.signal
-                .map_or_else(|| "?".to_owned(), |signal| signal.to_string())
-        ),
-        Some(JobEndReason::Exited) => format!(
-            "Exit-Code {}",
-            meta.exit_code
-                .map_or_else(|| "?".to_owned(), |code| code.to_string())
-        ),
-        Some(JobEndReason::Stopped) => "gestoppt".to_owned(),
-        Some(JobEndReason::LaunchError) => "Startfehler".to_owned(),
-        Some(JobEndReason::Unknown) => {
-            return Some("Ausgang unbekannt (Job einer früheren Sitzung)".to_owned());
+
+    pub(crate) fn render(&self) -> String {
+        use crate::i18n::{tr, tr_args};
+        let base = match &self.kind {
+            FailureKind::Launch(first) => tr_args(
+                "mission.launch_error",
+                "Launch error: {first}",
+                &[("first", first)],
+            ),
+            FailureKind::Timeout => tr("mission.timeout", "CPU budget exhausted").to_owned(),
+            FailureKind::Signal(value) => {
+                tr_args("mission.signal", "Signal {p0}", &[("p0", value)])
+            }
+            FailureKind::Exit(value) => tr_args("mission.exit", "Exit code {p0}", &[("p0", value)]),
+            FailureKind::Stopped => tr("mission.stopped", "stopped").to_owned(),
+            FailureKind::LaunchUnknown => tr("mission.launch_failed", "Launch error").to_owned(),
+            FailureKind::UnknownPrevious => tr(
+                "mission.unknown_previous",
+                "Unknown outcome (job from an earlier session)",
+            )
+            .to_owned(),
+            FailureKind::Unknown => tr("mission.unknown_outcome", "Unknown outcome").to_owned(),
+        };
+        match &self.tail {
+            Some(tail) => format!("{base}: {tail}"),
+            None => base,
         }
-        None => return Some("Ausgang unbekannt".to_owned()),
-    };
-    let last_line = status
-        .last_lines
-        .iter()
-        .rev()
-        .map(|line| line.trim())
-        .find(|line| !line.is_empty());
-    let text = match last_line {
-        Some(line) => {
-            let clipped: String = if line.chars().count() > REASON_LINE_CHARS {
-                let mut head: String = line.chars().take(REASON_LINE_CHARS - 1).collect();
-                head.push('…');
-                head
-            } else {
-                line.to_owned()
-            };
-            format!("{base}: {clipped}")
-        }
-        None => base,
-    };
-    Some(sanitize_inline(&text))
+    }
+}
+
+impl JobRow {
+    pub(crate) fn reason_text(&self) -> Option<String> {
+        self.reason_source
+            .as_ref()
+            .map(JobFailure::render)
+            .or_else(|| self.reason.clone())
+    }
 }
 
 /// PL-97 E4: die Zeile korreliert über ihre **eigene** Job-cgroup
@@ -312,7 +394,8 @@ pub(crate) fn job_line_with_badge(
         .saturating_sub(name_width);
     // R18 F9: ein fehlgeschlagener Job zeigt seinen Grund statt des
     // (dann bedeutungslosen) Fortschritts.
-    let (detail, detail_style) = match (&row.reason, row.failed) {
+    let reason = row.reason_text();
+    let (detail, detail_style) = match (reason.as_ref(), row.failed) {
         (Some(reason), true) => (reason.as_str(), style::error_style(theme)),
         _ => (row.progress.as_str(), style::dim_style(theme)),
     };
@@ -352,9 +435,21 @@ pub(crate) fn finished_jobs_line(
     let marker = if selected { "▸" } else { " " };
     let arrow = if expanded { "▾" } else { "▸" };
     let failed = finished.iter().filter(|row| row.failed).count();
-    let head = format!("{marker}✓ {} Jobs beendet {arrow}", finished.len());
+    let head = crate::i18n::tr_args(
+        "mission.finished_jobs",
+        "{marker}✓ {p0} jobs finished {arrow}",
+        &[
+            ("marker", marker),
+            ("p0", &(finished.len()).to_string()),
+            ("arrow", arrow),
+        ],
+    );
     let tail = if failed > 0 {
-        format!(" · {failed} fehlgeschlagen")
+        crate::i18n::tr_args(
+            "mission.failed_jobs",
+            " · {failed} failed",
+            &[("failed", &(failed).to_string())],
+        )
     } else {
         String::new()
     };
@@ -375,9 +470,17 @@ pub(crate) fn group_header_line(
     theme: Theme,
 ) -> Line<'static> {
     let label = if active > 0 {
-        format!("── Jobs · {active} aktiv ")
+        crate::i18n::tr_args(
+            "mission.jobs_group",
+            "── Jobs · {active} active ",
+            &[("active", &(active).to_string())],
+        )
     } else {
-        format!("── Jobs · {total} ")
+        crate::i18n::tr_args(
+            "mission.jobs_group_total",
+            "── Jobs · {total} ",
+            &[("total", &(total).to_string())],
+        )
     };
     let fill = width.saturating_sub(display_width(&label));
     Line::styled(
@@ -420,70 +523,166 @@ pub(crate) struct JobDetail {
     /// Kopfzeilen: startender Werkzeugaufruf zuerst, dann Grund eines
     /// Fehlschlags, Ort, Zähler, Logs; der Befehl zuletzt (R18 D-D).
     pub header: Vec<String>,
+    header_source: JobHeaderData,
     /// Letzte stdout-Zeilen.
     pub stdout: Vec<String>,
     /// Letzte stderr-Zeilen.
     pub stderr: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobHeaderData {
+    origin_tool: Option<String>,
+    origin_call_id: Option<String>,
+    agent: String,
+    reason: Option<JobFailure>,
+    executed_on_host: bool,
+    pid: Option<u32>,
+    warnings: u64,
+    errors: u64,
+    lines: u64,
+    exit_code: Option<i32>,
+    log_dir: String,
+    launch_error: Option<String>,
+    command: String,
+}
+
+impl JobHeaderData {
+    fn from_status(status: &JobStatus) -> Self {
+        let meta = &status.meta;
+        Self {
+            origin_tool: meta.origin_tool.as_deref().map(sanitize_inline),
+            origin_call_id: meta.origin_call_id.as_deref().map(sanitize_inline),
+            agent: sanitize_inline(meta.owner_agent.as_deref().unwrap_or(&meta.owner.session)),
+            reason: JobFailure::from_status(status),
+            executed_on_host: meta.executed_on_host,
+            pid: meta.pid,
+            warnings: meta.warnings,
+            errors: meta.errors,
+            lines: status.stdout_lines + status.stderr_lines,
+            exit_code: meta.exit_code,
+            log_dir: status.log_dir.display().to_string(),
+            launch_error: meta.launch_error.as_deref().map(sanitize_inline),
+            command: sanitize_inline(&meta.command),
+        }
+    }
+
+    fn render(&self) -> Vec<String> {
+        let meta = self;
+        let agent = &self.agent;
+        let origin = match (&meta.origin_tool, &meta.origin_call_id) {
+            (Some(tool), Some(call_id)) => crate::i18n::tr_args(
+                "mission.origin_full",
+                "Call: {p0} · {p1} · Agent {p2}",
+                &[
+                    ("p0", &(sanitize_inline(tool)).to_string()),
+                    ("p1", &(sanitize_inline(call_id)).to_string()),
+                    ("p2", &(sanitize_inline(agent)).to_string()),
+                ],
+            ),
+            (Some(tool), None) => crate::i18n::tr_args(
+                "mission.origin",
+                "Call: {p0} · Agent {p1}",
+                &[
+                    ("p0", &(sanitize_inline(tool)).to_string()),
+                    ("p1", &(sanitize_inline(agent)).to_string()),
+                ],
+            ),
+            (None, Some(call_id)) => crate::i18n::tr_args(
+                "mission.origin",
+                "Call: {p0} · Agent {p1}",
+                &[
+                    ("p0", &(sanitize_inline(call_id)).to_string()),
+                    ("p1", &(sanitize_inline(agent)).to_string()),
+                ],
+            ),
+            (None, None) => crate::i18n::tr_args(
+                "mission.origin_unknown",
+                "Call: unknown · Agent {p0}",
+                &[("p0", &(sanitize_inline(agent)).to_string())],
+            ),
+        };
+        let mut header = vec![origin];
+        if let Some(reason) = self.reason.as_ref().map(JobFailure::render) {
+            header.push(crate::i18n::tr_args(
+                "mission.reason",
+                "Reason: {reason}",
+                &[("reason", &(reason).to_string())],
+            ));
+        }
+        header.extend([
+            crate::i18n::tr_args(
+                "mission.location",
+                "Location: {p0} · PID: {p1}",
+                &[
+                    (
+                        "p0",
+                        if meta.executed_on_host {
+                            crate::i18n::tr("mission.host", "Host")
+                        } else {
+                            crate::i18n::tr("mission.sandbox", "Sandbox")
+                        },
+                    ),
+                    (
+                        "p1",
+                        &(meta
+                            .pid
+                            .map_or_else(|| "—".to_owned(), |pid| pid.to_string()))
+                        .to_string(),
+                    ),
+                ],
+            ),
+            crate::i18n::tr_args(
+                "mission.counts",
+                "{p0} warnings · {p1} errors · {p2} lines{p3}",
+                &[
+                    ("p0", &(meta.warnings).to_string()),
+                    ("p1", &(meta.errors).to_string()),
+                    ("p2", &(self.lines).to_string()),
+                    (
+                        "p3",
+                        &(meta
+                            .exit_code
+                            .map(|code| {
+                                crate::i18n::tr_args(
+                                    "mission.exit_suffix",
+                                    " · Exit code {code}",
+                                    &[("code", &(code).to_string())],
+                                )
+                            })
+                            .unwrap_or_default())
+                        .to_string(),
+                    ),
+                ],
+            ),
+            crate::i18n::tr_args(
+                "mission.logs",
+                "Logs: {p0}",
+                &[("p0", &(self.log_dir).to_string())],
+            ),
+        ]);
+        if let Some(error) = &meta.launch_error {
+            header.push(crate::i18n::tr_args(
+                "mission.launch_error_full",
+                "Launch error: {p0}",
+                &[("p0", &(sanitize_inline(error)).to_string())],
+            ));
+        }
+        header.push(crate::i18n::tr_args(
+            "mission.command",
+            "Command: {p0}",
+            &[("p0", &(sanitize_inline(&meta.command)).to_string())],
+        ));
+        header
+    }
+}
+
 impl JobDetail {
     /// Baut die Detailansicht aus dem Zustand und den Logdateien.
     #[must_use]
     pub(crate) fn from_status(status: &JobStatus) -> Self {
-        let meta = &status.meta;
-        // R18: zuerst der Werkzeugaufruf, der den Job startete (Werkzeug,
-        // `call_id`, Agent), dann ggf. der Grund des Fehlschlags; der Befehl
-        // rückt ans Ende.
-        let agent = meta.owner_agent.as_deref().unwrap_or(&meta.owner.session);
-        let origin = match (&meta.origin_tool, &meta.origin_call_id) {
-            (Some(tool), Some(call_id)) => format!(
-                "Aufruf: {} · {} · Agent {}",
-                sanitize_inline(tool),
-                sanitize_inline(call_id),
-                sanitize_inline(agent)
-            ),
-            (Some(tool), None) => format!(
-                "Aufruf: {} · Agent {}",
-                sanitize_inline(tool),
-                sanitize_inline(agent)
-            ),
-            (None, Some(call_id)) => format!(
-                "Aufruf: {} · Agent {}",
-                sanitize_inline(call_id),
-                sanitize_inline(agent)
-            ),
-            (None, None) => format!("Aufruf: unbekannt · Agent {}", sanitize_inline(agent)),
-        };
-        let mut header = vec![origin];
-        if let Some(reason) = failure_reason(status) {
-            header.push(format!("Grund: {reason}"));
-        }
-        header.extend([
-            format!(
-                "Ort: {} · PID: {}",
-                if meta.executed_on_host {
-                    "Host"
-                } else {
-                    "Sandbox"
-                },
-                meta.pid
-                    .map_or_else(|| "—".to_owned(), |pid| pid.to_string()),
-            ),
-            format!(
-                "{} Warnungen · {} Fehler · {} Zeilen{}",
-                meta.warnings,
-                meta.errors,
-                status.stdout_lines + status.stderr_lines,
-                meta.exit_code
-                    .map(|code| format!(" · Exit-Code {code}"))
-                    .unwrap_or_default()
-            ),
-            format!("Logs: {}", status.log_dir.display()),
-        ]);
-        if let Some(error) = &meta.launch_error {
-            header.push(format!("Startfehler: {}", sanitize_inline(error)));
-        }
-        header.push(format!("Befehl: {}", sanitize_inline(&meta.command)));
+        let header_source = JobHeaderData::from_status(status);
+        let header = header_source.render();
         let tail = |file: &str| {
             harw_tool_job::logs::tail_of_file(&status.log_dir.join(file), DETAIL_LOG_LINES)
                 .into_iter()
@@ -493,6 +692,7 @@ impl JobDetail {
         Self {
             row: JobRow::from_status(status),
             header,
+            header_source,
             stdout: tail(harw_tool_job::model::STDOUT_LOG),
             stderr: tail(harw_tool_job::model::STDERR_LOG),
         }
@@ -510,13 +710,13 @@ pub(crate) fn render_job_detail(
 ) {
     let Some(detail) = detail else {
         Paragraph::new(Line::styled(
-            "Job nicht gefunden.",
+            crate::i18n::tr("mission.not_found", "Job not found."),
             Style::default().add_modifier(Modifier::DIM),
         ))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Job · Esc zurück "),
+                .title(crate::i18n::tr("mission.detail_back", " Job · Esc back ")),
         )
         .render(area, buf);
         return;
@@ -524,11 +724,14 @@ pub(crate) fn render_job_detail(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(format!(
-            " Job · {} · {} · {} · Esc zurück ",
-            detail.row.name,
-            detail.row.state_label(),
-            detail.row.runtime
+        .title(crate::i18n::tr_args(
+            "mission.detail_title",
+            " Job · {p0} · {p1} · {p2} · Esc back ",
+            &[
+                ("p0", &(detail.row.name).to_string()),
+                ("p1", detail.row.state_label()),
+                ("p2", &(detail.row.runtime).to_string()),
+            ],
         ));
     let inner = block.inner(area);
     block.render(area, buf);
@@ -538,18 +741,30 @@ pub(crate) fn render_job_detail(
     let dim = style::dim_style(theme);
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::styled(
-        format!("{} · Fortschritt: {}", detail.row.id, detail.row.progress),
+        crate::i18n::tr_args(
+            "mission.progress",
+            "{p0} · Progress: {p1}",
+            &[
+                ("p0", &(detail.row.id).to_string()),
+                ("p1", &(detail.row.progress).to_string()),
+            ],
+        ),
         Style::default().add_modifier(Modifier::BOLD),
     ));
     lines.extend(
         detail
-            .header
+            .header_source
+            .render()
             .iter()
             .map(|line| Line::styled(line.clone(), dim)),
     );
     for (label, stream) in [("stdout", &detail.stdout), ("stderr", &detail.stderr)] {
         lines.push(Line::styled(
-            format!("── {label} ({} Zeilen) ──", stream.len()),
+            crate::i18n::tr_args(
+                "mission.stream_lines",
+                "── {label} ({p0} lines) ──",
+                &[("label", label), ("p0", &(stream.len()).to_string())],
+            ),
             dim,
         ));
         let line_style = if label == "stderr" {
@@ -588,6 +803,7 @@ mod tests {
             active,
             failed,
             reason: None,
+            reason_source: None,
             origin: None,
             cgroup: None,
             ended_at: None,
@@ -629,7 +845,7 @@ mod tests {
         let row = JobRow::from_status(&failed);
         assert_eq!(
             row.reason.as_deref(),
-            Some("Exit-Code 101: error: could not compile `x`")
+            Some("Exit code 101: error: could not compile `x`")
         );
         let line = job_line(&row, false, 120, Theme::Dark);
         let text: String = line
@@ -638,7 +854,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert!(
-            text.contains("Exit-Code 101: error: could not compile"),
+            text.contains("Exit code 101: error: could not compile"),
             "{text}"
         );
         assert!(line.width() <= 120, "{text}");
@@ -653,7 +869,7 @@ mod tests {
         )?;
         assert_eq!(
             failure_reason(&launch).as_deref(),
-            Some("Startfehler: bwrap: No such file")
+            Some("Launch error: bwrap: No such file")
         );
 
         let signal = status_of(
@@ -686,25 +902,25 @@ mod tests {
         let detail = JobDetail::from_status(&status);
         assert_eq!(
             detail.header.first().map(String::as_str),
-            Some("Aufruf: job.start · call-42 · Agent uia")
+            Some("Call: job.start · call-42 · Agent uia")
         );
         assert_eq!(
             detail.header.get(1).map(String::as_str),
-            Some("Grund: Exit-Code 1: boom")
+            Some("Reason: Exit code 1: boom")
         );
         assert_eq!(
             detail.header.last().map(String::as_str),
-            Some("Befehl: cargo test --workspace")
+            Some("Command: cargo test --workspace")
         );
 
         let legacy = status_of(&meta_json("running", "", r#"{"session":"worker"}"#), &[])?;
         let detail = JobDetail::from_status(&legacy);
         assert_eq!(
             detail.header.first().map(String::as_str),
-            Some("Aufruf: unbekannt · Agent worker")
+            Some("Call: unknown · Agent worker")
         );
         assert!(
-            !detail.header.iter().any(|line| line.starts_with("Grund:")),
+            !detail.header.iter().any(|line| line.starts_with("Reason:")),
             "{:?}",
             detail.header
         );
@@ -850,7 +1066,7 @@ mod tests {
         assert_eq!(row.state, JobState::Stopped);
         assert_eq!(
             row.state_label(),
-            harw_ops::jobs::state_label(JobState::Stopped)
+            crate::jobs_panel::job_state_label(JobState::Stopped)
         );
         assert!(!row.active && !row.failed);
         assert_eq!(
@@ -922,7 +1138,78 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert!(text.contains("läuft 12m03s"), "{text}");
+        assert!(text.contains("running 12m03s"), "{text}");
         assert!(text.contains('…'), "langer Name wird gekürzt: {text}");
+    }
+
+    #[test]
+    fn cached_job_semantics_follow_locale_without_changing_payloads() -> TestResult {
+        use crate::i18n::{tr, tr_args, with_language};
+        use harw_config::UiLanguage;
+        let status = status_of(
+            &meta_json(
+                "failed",
+                r#""exit_code":101,"origin_call_id":"call-raw","origin_tool":"job.start","#,
+                r#"{"session":"agent-raw"}"#,
+            ),
+            &["raw stderr {p0}: विफल 中文 👩🏽‍💻 é"],
+        )?;
+        let raw = serde_json::to_value(&status.meta).map_err(ctx("meta"))?;
+        let detail = with_language(UiLanguage::German, || JobDetail::from_status(&status));
+        let cached = detail.header.clone();
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                let headers = detail.header_source.render();
+                assert_eq!(
+                    headers[0],
+                    tr_args(
+                        "mission.origin_full",
+                        "Call: {p0} · {p1} · Agent {p2}",
+                        &[("p0", "job.start"), ("p1", "call-raw"), ("p2", "agent-raw")]
+                    )
+                );
+                let reason = detail.row.reason_text().unwrap_or_default();
+                assert!(reason.starts_with(&tr_args(
+                    "mission.exit",
+                    "Exit code {p0}",
+                    &[("p0", "101")]
+                )));
+                assert!(reason.ends_with(&sanitize_inline("raw stderr {p0}: विफल 中文 👩🏽‍💻 é")));
+                for width in [0, 1, 8, 20, 40, 160] {
+                    assert!(job_line(&detail.row, true, width, Theme::Dark).width() <= width);
+                    let area = Rect::new(0, 0, u16::try_from(width).unwrap_or(160), 20);
+                    let mut buf = Buffer::empty(area);
+                    render_job_detail(
+                        Some(&detail),
+                        area,
+                        &mut buf,
+                        &ChatScroll::new(),
+                        Theme::Dark,
+                    );
+                    if width == 160 {
+                        let shown = crate::test_support::display_buffer_text(&buf);
+                        assert!(
+                            shown.contains(
+                                tr("mission.logs", "Logs: {p0}")
+                                    .split('{')
+                                    .next()
+                                    .unwrap_or_default()
+                            )
+                        );
+                        assert!(shown.contains("cargo test --workspace"));
+                        assert!(shown.contains("call-raw"));
+                    }
+                }
+            });
+        }
+        assert_eq!(
+            detail.header, cached,
+            "rendering does not rewrite the snapshot"
+        );
+        assert_eq!(
+            serde_json::to_value(&status.meta).map_err(ctx("meta"))?,
+            raw
+        );
+        Ok(())
     }
 }

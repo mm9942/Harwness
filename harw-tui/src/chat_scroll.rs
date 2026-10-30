@@ -379,6 +379,7 @@ impl ChatScroll {
     ///
     /// # Returns
     /// `None` beim Folgen, sonst z. B. `"↓ 12 neue Zeilen · Strg+Ende springt ans Ende"`.
+    #[cfg_attr(not(test), allow(dead_code))] // Legacy formatter retained for compatibility tests.
     pub fn indicator_text(&self, jump_key: &str) -> Option<String> {
         if self.is_following() {
             return None;

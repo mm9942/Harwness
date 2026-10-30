@@ -24,6 +24,7 @@
 //! Keine — ungültige Eingaben werden als [`LocalIntercept::System`] mit
 //! deutscher Meldung zurückgegeben.
 
+use crate::i18n::{tr, tr_args};
 use std::path::Path;
 
 use harw_config::{ModelRole, ResolvedConfig};
@@ -154,7 +155,12 @@ pub(crate) enum LocalIntercept {
 }
 
 /// Runde 5, Teil I: Hinweis auf den entfallenen Befehl `/agents`.
-pub(crate) const AGENTS_REMOVED_HINT: &str = "/agents gibt es nicht mehr – nutze /agent";
+pub(crate) fn agents_removed_hint() -> &'static str {
+    tr(
+        "command_feedback.removed",
+        "/agents has been removed – use /agent",
+    )
+}
 
 /// Erkennt die bare Form eines Befehls **oder** dessen argloses `switch`
 /// (Welle 4a/7b: `/model`, `/model switch`, `/uia-effort switch`, …).
@@ -233,8 +239,10 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
         .iter()
         .any(|hidden| hidden.eq_ignore_ascii_case(name))
     {
-        return Some(LocalIntercept::System(format!(
-            "/{name} ist in diesem Agenten nicht verfügbar."
+        return Some(LocalIntercept::System(tr_args(
+            "command_feedback.hidden",
+            "/{name} is not available in this agent.",
+            &[("name", name)],
         )));
     }
     // R10 Welle 3B: `/model switch <ziel>` gegen die erlaubten Modelle des
@@ -251,8 +259,10 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
             && let Some(target) = target
             && !model_switch_target_allowed(target, allowlist)
         {
-            return Some(LocalIntercept::System(format!(
-                "/model switch {target}: Modell ist für diesen Agenten nicht zugelassen."
+            return Some(LocalIntercept::System(tr_args(
+                "command_feedback.model_denied",
+                "/model switch {target}: model is not allowed for this agent.",
+                &[("target", target)],
             )));
         }
     }
@@ -275,6 +285,11 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
     }
 
     match name {
+        "settings" if bare && ctx.tier >= PermissionTier::Operator => {
+            Some(LocalIntercept::OpenOverlay(Box::new(
+                crate::settings_view::SettingsView::new(ctx.hidden_commands),
+            )))
+        }
         "resume" if bare => Some(LocalIntercept::OpenSessionPicker),
         "agent" if bare => Some(LocalIntercept::OpenAgentTree),
         // Runde 5, Teil K: Hintergrund-Agenten — Liste und Abbruch, vor der
@@ -292,7 +307,7 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
             ))
         }
         // Runde 5, Teil I: `/agents` entfällt; keine stille Weiterleitung.
-        "agents" => Some(LocalIntercept::System(AGENTS_REMOVED_HINT.to_owned())),
+        "agents" => Some(LocalIntercept::System(agents_removed_hint().to_owned())),
         "models" => models_intercept(args, ctx),
         "mode" if bare => Some(LocalIntercept::OpenOverlay(Box::new(ModePicker::new(
             ctx.active_mode,
@@ -312,13 +327,13 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
         "verbose" => Some(LocalIntercept::ToggleVerbose),
         "whoami" => Some(LocalIntercept::System(whoami_text(ctx))),
         "rename" if bare => Some(LocalIntercept::System(
-            "Bitte einen Namen angeben: /rename <titel>".to_owned(),
+            tr("command_feedback.rename", "Provide a name: /rename <title>").to_owned(),
         )),
         "rename" => Some(LocalIntercept::RenameSession(args.to_owned())),
         "image" => Some(LocalIntercept::AttachImage(args.to_owned())),
         // Runde 5, Teil L: `/btw` ohne Frage → Nutzungshinweis.
         "btw" if bare => Some(LocalIntercept::System(
-            crate::app::btw::BTW_USAGE_HINT.to_owned(),
+            tr("command_feedback.btw_usage", "Usage: /btw <question> — asks a temporary side question about the conversation without interrupting the running agent. The question and answer are not added to history.").to_owned(),
         )),
         "btw" => Some(LocalIntercept::Btw(args.to_owned())),
         "sessions" if bare => Some(LocalIntercept::Rewrite("/resume".to_owned())),
@@ -331,9 +346,10 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
             crate::plan_dialog::parse_plan_command(args).map(LocalIntercept::Plan)
         }
         "plan" | "goal" if ctx.registry.find(name).is_none() => {
-            Some(LocalIntercept::System(format!(
-                "/{name} ist nicht verfügbar: Die Plan-Werkzeuge sind deaktiviert \
-                 ([tools.plan] enabled = false)."
+            Some(LocalIntercept::System(tr_args(
+                "command_feedback.plan_unavailable",
+                "/{name} is unavailable: plan tools are disabled ([tools.plan] enabled = false).",
+                &[("name", name)],
             )))
         }
         _ => None,
@@ -345,7 +361,13 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
 fn note_intercept(note: &str, registry: &CommandRegistry) -> LocalIntercept {
     let note = note.trim();
     if note.is_empty() {
-        return LocalIntercept::System("Leere Notiz: bitte Text nach „#“ angeben.".to_owned());
+        return LocalIntercept::System(
+            tr(
+                "command_feedback.empty_note",
+                "Empty note: enter text after “#”.",
+            )
+            .to_owned(),
+        );
     }
     let diary_op = registry
         .find("diary")
@@ -388,9 +410,10 @@ fn models_intercept(args: &str, ctx: &LocalCommandContext<'_>) -> Option<LocalIn
         }
         Some("pick") => {
             let (Some(role), None) = (words.next(), words.next()) else {
-                return Some(LocalIntercept::System(format!(
-                    "Nutzung: /models pick <rolle> — bekannte Rollen: {}",
-                    role_keys()
+                return Some(LocalIntercept::System(tr_args(
+                    "command_feedback.pick_usage",
+                    "Usage: /models pick <role> — known roles: {roles}",
+                    &[("roles", &role_keys())],
                 )));
             };
             // Runde 5, Teil G: jede UIA-Worker-Rolle (auch `uia-worker`)
@@ -405,9 +428,10 @@ fn models_intercept(args: &str, ctx: &LocalCommandContext<'_>) -> Option<LocalIn
             match ModelRole::parse(role) {
                 Some(ModelRole::Uia) => Some(LocalIntercept::OpenUiaPickerThenWorkers),
                 Some(role) => Some(LocalIntercept::OpenModelPicker(PickerTarget::Role { role })),
-                None => Some(LocalIntercept::System(format!(
-                    "Unbekannte Rolle „{role}“ — bekannte Rollen: {}",
-                    role_keys()
+                None => Some(LocalIntercept::System(tr_args(
+                    "command_feedback.unknown_role",
+                    "Unknown role “{role}” — known roles: {roles}",
+                    &[("role", role), ("roles", &role_keys())],
                 ))),
             }
         }
@@ -456,19 +480,26 @@ fn knowledge(kind: KnowledgeKind) -> LocalIntercept {
 fn whoami_text(ctx: &LocalCommandContext<'_>) -> String {
     let approval = ctx
         .approval
-        .map_or("unbekannt", |approval| approval.as_str());
+        .map_or(tr("command_feedback.unknown", "unknown"), |approval| {
+            approval.as_str()
+        });
     let model = match (ctx.live_provider, ctx.live_model) {
         (Some(provider), Some(model)) => format!("{provider}/{model}"),
         (None, Some(model)) => model.to_owned(),
         (Some(provider), None) => format!("{provider}/—"),
-        (None, None) => "unbekannt".to_owned(),
+        (None, None) => tr("command_feedback.unknown", "unknown").to_owned(),
     };
-    format!(
-        "Sitzung: {}\nBerechtigungsstufe: {:?}\nModus: {} — {}\nFreigabe: {approval}\nModell: {model}",
-        ctx.session_id.as_str(),
-        ctx.tier,
-        ctx.active_mode.as_str(),
-        ctx.active_mode.summary_de(),
+    tr_args(
+        "command_feedback.whoami",
+        "Session: {session}\nPermission tier: {tier}\nMode: {mode} — {summary}\nApproval: {approval}\nModel: {model}",
+        &[
+            ("session", ctx.session_id.as_str()),
+            ("tier", &format!("{:?}", ctx.tier)),
+            ("mode", ctx.active_mode.as_str()),
+            ("summary", crate::mode_picker::mode_summary(ctx.active_mode)),
+            ("approval", approval),
+            ("model", &model),
+        ],
     )
 }
 
@@ -543,6 +574,20 @@ mod tests {
         fn run(&self, raw: &str) -> Option<LocalIntercept> {
             intercept(raw, &self.ctx())
         }
+    }
+
+    #[test]
+    fn settings_projection_requires_operator_and_preserves_explicit_dispatch() {
+        let fixture = Fixture::new(CommandRegistry::new(Vec::new()));
+        assert!(matches!(
+            fixture.run("/settings"),
+            Some(LocalIntercept::OpenOverlay(_))
+        ));
+        assert!(fixture.run("/settings show").is_none());
+        assert!(fixture.run("/settings set tui.language ja").is_none());
+        let mut observer = fixture.ctx();
+        observer.tier = PermissionTier::Observer;
+        assert!(intercept("/settings", &observer).is_none());
     }
 
     fn spec(name: &str) -> TestResult<CommandSpec> {
@@ -732,7 +777,7 @@ mod tests {
         for raw in ["/agents", "/agents stream all"] {
             assert!(matches!(
                 fx.run(raw),
-                Some(LocalIntercept::System(ref text)) if text == AGENTS_REMOVED_HINT
+                Some(LocalIntercept::System(ref text)) if text == agents_removed_hint()
             ));
         }
         // `/agent stream <modus>` schaltet den Live-Stream.
@@ -794,8 +839,8 @@ mod tests {
                 role: ModelRole::Explorer
             }))
         ));
-        assert!(system(fx.run("/models pick quatsch"))?.contains("Unbekannte Rolle"));
-        assert!(system(fx.run("/models pick"))?.contains("Nutzung"));
+        assert!(system(fx.run("/models pick quatsch"))?.contains("Unknown role"));
+        assert!(system(fx.run("/models pick"))?.contains("Usage"));
         Ok(())
     }
 
@@ -883,7 +928,7 @@ mod tests {
         let local_only = Fixture::new(CommandRegistry::new(vec![spec("diary")?.local()]));
         assert_eq!(rewrite(local_only.run("#Idee"))?, "/memory record Idee");
         assert_eq!(rewrite(empty().run("#Idee"))?, "/memory record Idee");
-        assert!(system(empty().run("#   "))?.contains("Leere Notiz"));
+        assert!(system(empty().run("#   "))?.contains("Empty note"));
         Ok(())
     }
 
@@ -940,6 +985,32 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+    #[test]
+    fn local_feedback_and_commands_use_separate_semantics() -> TestResult {
+        let fx = empty();
+        for language in harw_config::UiLanguage::ALL {
+            crate::i18n::with_language(language, || -> TestResult {
+                assert_eq!(
+                    rewrite(fx.run("/sessions keep-this-ID"))?,
+                    "/resume keep-this-ID"
+                );
+                assert_eq!(
+                    rewrite(fx.run("#user aktiviert {name}"))?,
+                    "/memory record user aktiviert {name}"
+                );
+                assert!(fx.run("/model switch forbidden").is_none());
+                Ok(())
+            })?;
+        }
+        let german = crate::i18n::with_language(harw_config::UiLanguage::German, || {
+            system(fx.run("/whoami"))
+        })?;
+        assert!(german.contains("Sitzung:"));
+        let japanese =
+            crate::i18n::with_language(harw_config::UiLanguage::Japanese, || system(fx.run("#")))?;
+        assert!(japanese.contains("メモが空です"));
         Ok(())
     }
 }

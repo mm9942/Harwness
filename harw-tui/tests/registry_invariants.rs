@@ -372,6 +372,8 @@ fn all_registered_ops_are_reachable_by_name() {
         "model",
         "provider",
         "permissions",
+        // Operator-only, profile-scoped interface preferences.
+        "settings",
         "compact",
         "memory",
         "effort",

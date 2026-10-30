@@ -36,27 +36,23 @@ use ratatui::{
     text::{Line, Span},
 };
 
+use crate::i18n::{tr, tr_args};
 use crate::overlay_view::{
     OverlayOutcome, OverlayView, content_height, is_down, is_up, json_str, plain, render_panel,
     scroll_offset_for,
 };
 use crate::sanitize::sanitize_inline;
 use crate::style::{self, Theme};
+use unicode_width::UnicodeWidthStr;
 
 /// Befehl, der aktiven und Standardmodus liefert.
 pub(crate) const REFRESH_COMMAND: &str = "/mode show";
 
-/// Wirkungshinweis des Abschnitts „Modus“.
-const MODE_HINT: &str = "Wirkt ab nächster Turn-Grenze.";
-
-/// Wirkungshinweis des Abschnitts „Freigabe“.
-const APPROVAL_HINT: &str = "Wirkt sofort; laufende Kinder folgen, höchstens auto.";
-
 /// Fußzeile des Abschnitts „Modus“.
-const FOOTER_MODE: &str = "Tab Abschnitt · j/k wählen · Enter setzen · d als Standard · Esc";
+const FOOTER_MODE: &str = "Tab section · j/k select · Enter set · d set default · Esc";
 
 /// Fußzeile des Abschnitts „Freigabe“.
-const FOOTER_APPROVAL: &str = "Tab Abschnitt · j/k wählen · Enter setzen · Esc schließen";
+const FOOTER_APPROVAL: &str = "Tab section · j/k select · Enter set · Esc close";
 
 /// Abschnitt des Pickers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,8 +68,8 @@ impl ModeSection {
     /// Deutsche Beschriftung.
     fn label(self) -> &'static str {
         match self {
-            Self::Mode => "Modus",
-            Self::Approval => "Freigabe",
+            Self::Mode => tr("pickers.mode_section", "Mode"),
+            Self::Approval => tr("pickers.approval_section", "Approval"),
         }
     }
 
@@ -206,9 +202,18 @@ impl ModePicker {
             Style::default()
         };
         Line::from(vec![
-            Span::styled(format!("{marker}{name:<8}"), name_style),
             Span::styled(
-                format!("{tags:<22}"),
+                format!(
+                    "{marker}{name}{}",
+                    " ".repeat(8usize.saturating_sub(UnicodeWidthStr::width(name)))
+                ),
+                name_style,
+            ),
+            Span::styled(
+                format!(
+                    "{tags}{}",
+                    " ".repeat(22usize.saturating_sub(UnicodeWidthStr::width(tags)))
+                ),
                 Style::default().fg(style::accent_color(theme)),
             ),
             Span::raw(summary.to_owned()),
@@ -217,12 +222,15 @@ impl ModePicker {
 
     /// Inhaltszeilen und Index der Cursorzeile.
     fn body_lines(&self, theme: Theme) -> (Vec<Line<'static>>, usize) {
-        let approval_text = self.approval.map_or("unbekannt", ApprovalMode::as_str);
+        let approval_text = self
+            .approval
+            .map_or(tr("pickers.unknown", "unknown"), ApprovalMode::as_str);
         let mut lines = vec![
             Line::styled(
-                format!(
-                    "Aktuell: Modus {} · Freigabe {approval_text}",
-                    self.current.as_str()
+                tr_args(
+                    "pickers.current",
+                    "Current: mode {mode} · approval {approval}",
+                    &[("mode", self.current.as_str()), ("approval", approval_text)],
                 ),
                 style::dim_style(theme),
             ),
@@ -234,10 +242,10 @@ impl ModePicker {
                 for (index, mode) in InteractionMode::ALL.into_iter().enumerate() {
                     let mut tags = Vec::new();
                     if mode == self.current {
-                        tags.push("aktiv");
+                        tags.push(tr("pickers.active", "active"));
                     }
                     if self.is_default(mode) {
-                        tags.push("Standard");
+                        tags.push(tr("pickers.default", "default"));
                     }
                     let tags = if tags.is_empty() {
                         String::new()
@@ -249,7 +257,7 @@ impl ModePicker {
                         index == self.mode_cursor,
                         mode.as_str(),
                         &tags,
-                        mode.summary_de(),
+                        mode_summary(mode),
                     ));
                 }
                 first_option + self.mode_cursor
@@ -257,16 +265,16 @@ impl ModePicker {
             ModeSection::Approval => {
                 for (index, mode) in ApprovalMode::ALL.into_iter().enumerate() {
                     let tags = if Some(mode) == self.approval {
-                        "[aktiv]"
+                        format!("[{}]", tr("pickers.active", "active"))
                     } else {
-                        ""
+                        String::new()
                     };
                     lines.push(Self::option_line(
                         theme,
                         index == self.approval_cursor,
                         mode.as_str(),
-                        tags,
-                        mode.description(),
+                        &tags,
+                        approval_summary(mode),
                     ));
                 }
                 first_option + self.approval_cursor
@@ -276,14 +284,26 @@ impl ModePicker {
         let hint = match self.section {
             ModeSection::Mode => {
                 let default = self.configured_default.as_deref().unwrap_or("—");
-                format!("{MODE_HINT} Standard: {}", sanitize_inline(default))
+                tr_args(
+                    "pickers.mode_hint",
+                    "Applies at the next turn boundary. Default: {default}",
+                    &[("default", &sanitize_inline(default))],
+                )
             }
-            ModeSection::Approval => APPROVAL_HINT.to_owned(),
+            ModeSection::Approval => tr(
+                "pickers.approval_hint",
+                "Applies immediately; running children follow, capped at auto.",
+            )
+            .to_owned(),
         };
         lines.push(Line::styled(hint, style::dim_style(theme)));
         if let Some(error) = &self.error {
             lines.push(Line::styled(
-                format!("Aktualisieren fehlgeschlagen: {}", sanitize_inline(error)),
+                tr_args(
+                    "pickers.refresh_error",
+                    "Refresh failed: {error}",
+                    &[("error", &sanitize_inline(error))],
+                ),
                 style::error_style(theme),
             ));
         }
@@ -319,14 +339,14 @@ impl OverlayView for ModePicker {
         let (lines, focus) = self.body_lines(theme);
         let scroll = scroll_offset_for(focus, content_height(area, true));
         let footer = match self.section {
-            ModeSection::Mode => FOOTER_MODE,
-            ModeSection::Approval => FOOTER_APPROVAL,
+            ModeSection::Mode => tr("pickers.mode_footer", FOOTER_MODE),
+            ModeSection::Approval => tr("pickers.approval_footer", FOOTER_APPROVAL),
         };
         render_panel(
             area,
             buf,
             theme,
-            "Modus & Freigabe",
+            tr("pickers.mode_title", "Mode & approval"),
             Some(self.section_bar(theme)),
             &lines,
             scroll,
@@ -399,12 +419,53 @@ impl OverlayView for ModePicker {
     }
 }
 
+pub(crate) fn mode_summary(mode: InteractionMode) -> &'static str {
+    match mode {
+        InteractionMode::Chat => tr(
+            "pickers.summary_chat",
+            "Conversation without tool restrictions",
+        ),
+        InteractionMode::Plan => tr(
+            "pickers.summary_plan",
+            "Plan and research without making changes",
+        ),
+        InteractionMode::Explore => {
+            tr("pickers.summary_explore", "Read-only tools for exploration")
+        }
+        InteractionMode::Work => tr(
+            "pickers.summary_work",
+            "Execute with all tools, including writing and shell",
+        ),
+        InteractionMode::Shell => tr(
+            "pickers.summary_shell",
+            "Like work; host tools require user-approved sandbox access",
+        ),
+    }
+}
+
+fn approval_summary(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::AlwaysAsk => tr(
+            "pickers.approval_ask",
+            "Confirm every tool call individually",
+        ),
+        ApprovalMode::Delegated => tr(
+            "pickers.approval_auto",
+            "harw approves read tools; the auto classifier judges the rest and asks when unsure",
+        ),
+        ApprovalMode::FullAccess => tr(
+            "pickers.approval_full",
+            "No tool call requires confirmation",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyModifiers;
 
     use super::*;
-    use crate::overlay_view::buffer_text;
+    use crate::test_support::display_buffer_text as buffer_text;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -416,6 +477,35 @@ mod tests {
             Some("plan"),
             Some(ApprovalMode::Delegated),
         )
+    }
+
+    #[test]
+    fn locale_changes_preserve_section_and_canonical_commands_at_narrow_widths() {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let mut picker = picker();
+        picker.on_key(key(KeyCode::Tab));
+        picker.on_key(key(KeyCode::Down));
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                for width in [1, 8, 24, 80] {
+                    let area = Rect::new(0, 0, width, 12);
+                    picker.render(area, &mut Buffer::empty(area), Theme::Dark);
+                }
+            });
+        }
+        let area = Rect::new(0, 0, 100, 16);
+        let mut buf = Buffer::empty(area);
+        with_language(UiLanguage::Japanese, || {
+            picker.render(area, &mut buf, Theme::Dark)
+        });
+        assert!(buffer_text(&buf).contains("モードと承認"));
+        assert!(buffer_text(&buf).contains("ツール呼び出しの確認なし"));
+        assert_eq!(picker.section(), ModeSection::Approval);
+        assert_eq!(
+            picker.on_key(key(KeyCode::Enter)),
+            OverlayOutcome::RunAndClose("/permissions mode full".into())
+        );
     }
 
     #[test]
@@ -523,17 +613,17 @@ mod tests {
         let mut buf = Buffer::empty(area);
         picker.render(area, &mut buf, Theme::Dark);
         let text = buffer_text(&buf);
-        assert!(text.contains("Modus"));
-        assert!(text.contains("Freigabe"));
-        assert!(text.contains("[aktiv]"));
-        assert!(text.contains("[Standard]"));
-        assert!(text.contains("ab nächster Turn-Grenze"));
+        assert!(text.contains("Mode"));
+        assert!(text.contains("Approval"));
+        assert!(text.contains("[active]"));
+        assert!(text.contains("[default]"));
+        assert!(text.contains("next turn boundary"));
 
         picker.on_key(key(KeyCode::Tab));
         let mut buf = Buffer::empty(area);
         picker.render(area, &mut buf, Theme::Dark);
         let text = buffer_text(&buf);
-        assert!(text.contains("höchstens auto"));
+        assert!(text.contains("capped at auto"));
         assert!(text.contains("full"));
     }
 }

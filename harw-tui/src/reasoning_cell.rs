@@ -30,7 +30,7 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::history_cell::{truncate_chars, wrap_plain, wrap_styled};
+use crate::history_cell::{wrap_plain, wrap_styled};
 use crate::sanitize::{sanitize_display, sanitize_inline};
 use crate::style;
 
@@ -43,27 +43,27 @@ const LIVE_SUFFIX: &str = " …";
 /// Dim left gutter in front of every body line.
 pub(crate) const REASONING_GUTTER: &str = "│ ";
 
-/// Upper bound (chars) of the `[role]` origin before it is truncated.
-const ORIGIN_MAX_CHARS: usize = 24;
+/// Terminal-column budget of the `[role]` origin before it is clipped.
+const ORIGIN_MAX_COLUMNS: usize = 24;
 
 /// Builds the header line: `∴ Reasoning`, the optional dimmed `[role]`
 /// origin and, for the live preview, a trailing ` …`.
 ///
 /// # Arguments
 /// - `origin` (`Option<&str>`): raw role of the originating child agent;
-///   truncated to [`ORIGIN_MAX_CHARS`] and sanitised. `None` for the root.
+///   truncated to [`ORIGIN_MAX_COLUMNS`] and sanitised. `None` for the root.
 /// - `live` (`bool`): `true` appends ` …` (reasoning still streaming).
 /// - `theme` ([`style::Theme`]): colour scheme.
 #[must_use]
 pub(crate) fn header_line(origin: Option<&str>, live: bool, theme: style::Theme) -> Line<'static> {
     let dim = style::dim_style(theme);
     let mut spans = vec![Span::styled(
-        REASONING_HEADER,
+        crate::i18n::tr("history.reasoning", REASONING_HEADER),
         dim.add_modifier(Modifier::BOLD),
     )];
     if let Some(role) = origin {
         // Truncate before sanitising (module docs, W1-08).
-        let shown = sanitize_inline(&truncate_chars(role, ORIGIN_MAX_CHARS));
+        let shown = sanitize_inline(&crate::status_line::fit_width(role, ORIGIN_MAX_COLUMNS));
         spans.push(Span::styled(format!(" [{shown}]"), dim));
     }
     if live {
@@ -137,7 +137,11 @@ pub(crate) fn display_lines(
         return out;
     }
     out.extend(body.into_iter().take(1));
-    let hint = format!("… ({total} Zeilen · Ctrl+O)");
+    let hint = crate::i18n::tr_args(
+        "history.collapsed",
+        "… ({count} lines · Ctrl+O)",
+        &[("count", &total.to_string())],
+    );
     let dim = style::dim_style(theme);
     let hint_width = u16::try_from(body_width(width)).unwrap_or(u16::MAX);
     for piece in wrap_plain(&hint, hint_width) {
@@ -261,7 +265,7 @@ mod tests {
         let expected = vec![
             "∴ Reasoning".to_owned(),
             "│ Erste Zeile".to_owned(),
-            "│ … (3 Zeilen · Ctrl+O)".to_owned(),
+            "│ … (3 lines · Ctrl+O)".to_owned(),
         ];
         if lines != expected {
             return Err(TestError::Unexpected(format!("war: {lines:?}")));
@@ -299,7 +303,7 @@ mod tests {
         if origin.style.fg != Some(style::dim_color(style::Theme::Dark)) {
             return Err(TestError::Unexpected(format!("{:?}", origin.style)));
         }
-        if origin.content.chars().count() > ORIGIN_MAX_CHARS + " []".len() + 8 {
+        if origin.content.chars().count() > ORIGIN_MAX_COLUMNS + " []".len() + 8 {
             return Err(TestError::Unexpected(format!(
                 "nicht gekürzt: {}",
                 origin.content

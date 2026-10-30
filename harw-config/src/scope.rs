@@ -308,6 +308,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "logging.target_module_paths", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "logging.json", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.3 [tui] (2)
+    FieldScope { path: "tui.language", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "tui.theme", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "tui.keybindings_file", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // Runde 5, Teil I: Live-Stream der Kind-Agenten im Verlauf.
@@ -562,7 +563,7 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_202_entries() {
+    fn test_field_table_has_exactly_206_entries() {
         // Runde 5, Teil B: +1 für `host.sudo_session_minutes`.
         // Runde 5, Teil E: +1 für `internal_models.auto_classifier`.
         // Runde 5, Teil G: +5 für `uia_worker_models.*`.
@@ -587,7 +588,8 @@ mod merge_rule_tests {
         // PL-97 E2: +1 für `sandbox.execution`.
         // PL-97 R1: +1 für `tui.reasoning`.
         // PL-97 E3: +2 für `jobs.cgroup_root`, `jobs.trampoline`.
-        assert_eq!(FIELD_TABLE.len(), 205);
+        // Interface localization: +1 for `tui.language`.
+        assert_eq!(FIELD_TABLE.len(), 206);
     }
 
     #[test]
@@ -615,7 +617,8 @@ mod merge_rule_tests {
         // +1 for `internal_models.image_understanding`.
         // PL-97 R1: +1 (`tui.reasoning`).
         // PL-97 E3: +2 (`jobs.cgroup_root`, `jobs.trampoline`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 106);
+        // Interface localization: +1 for `tui.language`.
+        assert_eq!(count(MergeRule::ProfileReplaces), 107);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

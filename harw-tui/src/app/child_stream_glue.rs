@@ -85,22 +85,34 @@ impl ChatApp {
     /// # Argumente
     /// - `args` (`&str`): Text hinter `stream` (leer = aktuellen Modus zeigen).
     pub(super) fn apply_child_stream_command(&mut self, args: &str) {
+        crate::i18n::with_language(self.language, || {
+            self.apply_child_stream_command_scoped(args)
+        });
+    }
+
+    fn apply_child_stream_command_scoped(&mut self, args: &str) {
         let args = args.trim();
         let text = if args.is_empty() {
-            format!(
-                "Live-Stream der Kind-Agenten: {} (ändern: /agent stream <orchestrators|all|none>)",
-                self.child_stream.mode().as_str()
+            crate::i18n::tr_args(
+                "agents.stream_current",
+                "Child-agent live stream: {mode} (change: {syntax})",
+                &[
+                    ("mode", self.child_stream.mode().as_str()),
+                    ("syntax", "/agent stream <orchestrators|all|none>"),
+                ],
             )
         } else if let Some(mode) = ChildStreamMode::parse(args) {
             self.child_stream.set_mode(mode);
-            format!(
-                "Live-Stream der Kind-Agenten für diese Sitzung: {}",
-                mode.as_str()
+            crate::i18n::tr_args(
+                "agents.stream_set",
+                "Child-agent live stream for this session: {p0}",
+                &[("p0", mode.as_str())],
             )
         } else {
-            format!(
-                "Unbekannter Modus „{}“ — erlaubt: orchestrators, all, none",
-                sanitize_inline(args)
+            crate::i18n::tr_args(
+                "agents.stream_unknown",
+                "Unknown mode “{p0}” — allowed: orchestrators, all, none",
+                &[("p0", &(sanitize_inline(args)).to_string())],
             )
         };
         self.push_lines(vec![Line::from(text)]);

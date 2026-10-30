@@ -25,6 +25,7 @@
 //! overlay → body → status → composer, and records the mouse regions of the
 //! frame ([`scroll_routing::FrameRegions`]).
 
+use crate::i18n::{tr, tr_args};
 use std::time::Instant;
 
 use harw_tui_layout::MissionPlacement;
@@ -46,7 +47,7 @@ use crate::style::{self, Theme};
 
 /// Status hint while the workbench is switched on (`F5`) but the current
 /// placement has no room for it (PL-97 C3).
-pub(super) const WORKBENCH_HIDDEN_HINT: &str = " · Werkbank: zu wenig Platz";
+pub(super) const WORKBENCH_HIDDEN_HINT: &str = " · Workbench: not enough space";
 
 /// Title of the chat window in the three-column landscape.
 const CHAT_TITLE: &str = " Chat ";
@@ -202,7 +203,7 @@ fn revealed_presence(
 /// Status hint when the workbench is on but `drawn` says it got no area.
 fn workbench_hint(app: &ChatApp, drawn: bool) -> &'static str {
     if app.panels.workbench_visible && !drawn {
-        WORKBENCH_HIDDEN_HINT
+        tr("chrome.workbench_hidden", WORKBENCH_HIDDEN_HINT)
     } else {
         ""
     }
@@ -417,7 +418,7 @@ fn compose_columns(
             .borders(Borders::ALL)
             .border_style(window_border(theme, focus == PaneFocus::Chat))
             .title(fit_width(
-                CHAT_TITLE,
+                tr("chrome.chat_title", CHAT_TITLE),
                 usize::from(areas.chat.width.saturating_sub(2)),
             ));
         let inner = block.inner(areas.chat);
@@ -654,9 +655,15 @@ fn compact_summary_line(
     };
     let mut spans = vec![
         Span::styled(
-            format!(
-                "{marker}Agents {} · Jobs {running} · Done {ok}/",
-                monitor.active_count()
+            tr_args(
+                "chrome.mission_counts",
+                "{marker}Agents {agents} · Jobs {jobs} · Done {done}/",
+                &[
+                    ("marker", marker),
+                    ("agents", &monitor.active_count().to_string()),
+                    ("jobs", &running.to_string()),
+                    ("done", &ok.to_string()),
+                ],
             ),
             Style::default().fg(style::accent_color(theme)),
         ),

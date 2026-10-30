@@ -64,7 +64,14 @@ pub(crate) fn render(
     let rows = job_window_rows(jobs);
     let running = running_job_count(jobs);
     let inner_width = usize::from(area.width.saturating_sub(2));
-    let title = fit_width(&format!(" Jobs · {running} aktiv "), inner_width);
+    let title = fit_width(
+        &crate::i18n::tr_args(
+            "mission.jobs_title",
+            " Jobs · {running} active ",
+            &[("running", &(running).to_string())],
+        ),
+        inner_width,
+    );
     let border = if focused {
         Style::default().fg(style::accent_color(theme))
     } else {
@@ -82,7 +89,7 @@ pub(crate) fn render(
     if rows.is_empty() {
         ui.window_start(&keys, height);
         Paragraph::new(Line::styled(
-            fit_width("Keine Jobs.", inner_width),
+            fit_width(crate::i18n::tr("mission.no_jobs", "No jobs."), inner_width),
             style::dim_style(theme),
         ))
         .render(inner, buf);
@@ -209,7 +216,7 @@ mod tests {
         };
         let mut ui = WindowUi::default();
         let rows = screen(&jobs, &ui, true)?;
-        assert!(row(&rows, 0)?.contains("Jobs · 2 aktiv"), "{rows:?}");
+        assert!(row(&rows, 0)?.contains("Jobs · 2 active"), "{rows:?}");
         let first = row(&rows, 1)?;
         assert!(first.contains("▸") && first.contains("name-j1"), "{rows:?}");
         assert!(row(&rows, 2)?.contains("name-j2"), "{rows:?}");
@@ -230,7 +237,7 @@ mod tests {
             "no marker without focus: {rows:?}"
         );
         let empty = screen(&[], &WindowUi::default(), false)?;
-        assert!(row(&empty, 1)?.contains("Keine Jobs."), "{empty:?}");
+        assert!(row(&empty, 1)?.contains("No jobs."), "{empty:?}");
         Ok(())
     }
 

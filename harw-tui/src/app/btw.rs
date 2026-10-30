@@ -301,6 +301,7 @@ fn is_thinking(cell: &SharedBtwCell) -> bool {
 /// Abschlussmeldung eines Nebenfrage-Tasks.
 #[derive(Debug)]
 struct BtwDone {
+    language: harw_config::UiLanguage,
     /// Kennung des Auftrags.
     id: u64,
     /// Fehlertext, falls der Aufruf scheiterte.
@@ -484,6 +485,7 @@ impl ChatApp {
         let timeout = self.btw.timeout;
         let task_cell = Arc::clone(&cell);
         let task_cancel = cancel.clone();
+        let language = self.language;
         tracing::debug!(id, "tui.btw.started");
         let handle = tokio::spawn(async move {
             let outcome = tokio::time::timeout(timeout, provider.respond(request)).await;
@@ -491,12 +493,24 @@ impl ChatApp {
                 return;
             }
             let error = match outcome {
-                Err(_) => Some(format!("Zeitlimit überschritten ({} s)", timeout.as_secs())),
+                Err(_) => Some(crate::i18n::tr_args_for(
+                    language,
+                    "dispatch.timeout",
+                    "Time limit exceeded ({seconds} s).",
+                    &[("seconds", &timeout.as_secs().to_string())],
+                )),
                 Ok(Err(error)) => Some(error.to_string()),
                 Ok(Ok(response)) => {
                     let text = response.message.unwrap_or_default().trim().to_owned();
                     if text.is_empty() {
-                        Some("das Modell hat keine Antwort geliefert".to_owned())
+                        Some(
+                            crate::i18n::tr_for(
+                                language,
+                                "dispatch.empty_reply",
+                                "The model returned no reply",
+                            )
+                            .to_owned(),
+                        )
                     } else {
                         set_phase(&task_cell, BtwPhase::Answered(text));
                         None
@@ -506,7 +520,11 @@ impl ChatApp {
             if error.is_some() {
                 set_phase(&task_cell, BtwPhase::Failed);
             }
-            let _ = tx.send(BtwDone { id, error });
+            let _ = tx.send(BtwDone {
+                id,
+                error,
+                language,
+            });
             if let Some(waker) = waker {
                 waker.schedule_frame();
             }
@@ -575,9 +593,11 @@ impl ChatApp {
             }
             if let Some(error) = done.error {
                 tracing::debug!(id = done.id, "tui.btw.failed");
-                self.push_lines(vec![Line::from(format!(
-                    "⚠ /btw fehlgeschlagen: {}",
-                    sanitize_inline(&error)
+                self.push_lines(vec![Line::from(crate::i18n::tr_args_for(
+                    done.language,
+                    "dispatch.btw_failed",
+                    "⚠ /btw failed: {error}",
+                    &[("error", &sanitize_inline(&error))],
                 ))]);
             }
         }
@@ -780,7 +800,7 @@ mod tests {
         let (mut app, _turn) = busy_app(recording.clone(), None)?;
         let _ = route_busy_command(&mut app, "/btw".to_owned());
         assert!(!app.btw.is_pending());
-        assert!(rendered(&app).contains("Nutzung: /btw <frage>"));
+        assert!(rendered(&app).contains("Usage: /btw <question>"));
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(recording.recorded().is_empty());
         Ok(())
@@ -835,7 +855,7 @@ mod tests {
         app.start_btw("zu langsam");
         wait_until_done(&mut app).await?;
         let text = rendered(&app);
-        assert!(text.contains("⚠ /btw fehlgeschlagen: Zeitlimit"), "{text}");
+        assert!(text.contains("⚠ /btw failed: Time limit"), "{text}");
         assert!(text.contains("btw fehlgeschlagen"), "{text}");
         Ok(())
     }

@@ -132,11 +132,11 @@ mod tests {
         let monitor = monitor_with_jobs();
         let only = rows(&monitor, AgentsArea::AgentsOnly(Rect::new(0, 0, 30, 4)), 40)?;
         let shown = only.join("\n");
-        assert!(shown.contains("Agenten"), "{shown}");
+        assert!(shown.contains("Agents"), "{shown}");
         assert!(!shown.contains("name-j1"), "{shown}");
         let combined = rows(&monitor, AgentsArea::Combined(Rect::new(0, 0, 40, 4)), 40)?;
         assert!(
-            combined.iter().any(|row| row.contains("Agenten")),
+            combined.iter().any(|row| row.contains("Agents")),
             "{combined:?}"
         );
         Ok(())

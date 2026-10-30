@@ -529,12 +529,18 @@ fn set_mode(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     };
 
     if flags.scope == SettingScope::Session {
+        let changed = cell.get() != mode;
         cell.set(mode);
-        return Ok(OpOutput::from(format!(
-            "Freigabemodus: {} — {}. Gilt ab dem nächsten Werkzeugaufruf (nur für diese Sitzung).",
-            mode.as_str(),
-            mode.description()
-        )));
+        return Ok(OpOutput {
+            text: format!(
+                "Freigabemodus: {} — {}. Gilt ab dem nächsten Werkzeugaufruf (nur für diese Sitzung).",
+                mode.as_str(),
+                mode.description()
+            ),
+            data: Some(
+                serde_json::json!({"ui_feedback": {"kind":"approval", "mode":mode.as_str(), "changed":changed, "effective":"next_tool_call"}}),
+            ),
+        });
     }
 
     if mode == ApprovalMode::FullAccess && !flags.confirmed {

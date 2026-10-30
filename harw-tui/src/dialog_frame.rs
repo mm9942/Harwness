@@ -45,6 +45,8 @@
 //! Optionsauswahl vorbehalten; `Bild↑`/`Bild↓` scrollen weiterhin den
 //! Verlauf (bzw. beim Plan-Fenster den Plan) — keine Doppelbelegung.
 
+use crate::i18n::tr;
+
 use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
@@ -69,7 +71,7 @@ pub(crate) const MIN_LAYOUT_HEIGHT: u16 = 12;
 /// Zeilen je Mausrad-Raste.
 pub(crate) const WHEEL_LINES: usize = 3;
 /// Hinweis auf dem unteren Rahmen, solange der Körper überläuft.
-const SCROLL_HINT: &str = " Strg+↑↓/Rad: mehr ";
+const SCROLL_HINT: &str = " Ctrl+↑↓/wheel: more ";
 /// Kurzform von [`SCROLL_HINT`] für schmale Fenster.
 const SCROLL_HINT_SHORT: &str = " ↕ ";
 
@@ -375,7 +377,7 @@ pub(crate) fn render_dialog(
             &mut state,
         );
         let hint = pick_fitting(
-            &[SCROLL_HINT, SCROLL_HINT_SHORT],
+            &[tr("dialogs.scroll_more", SCROLL_HINT), SCROLL_HINT_SHORT],
             area.width.saturating_sub(4),
         );
         let hint_width = u16::try_from(UnicodeWidthStr::width(hint)).unwrap_or(u16::MAX);

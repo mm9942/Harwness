@@ -667,6 +667,93 @@ impl Default for LoggingSection {
     }
 }
 
+/// Supported interface languages. Codes are strict, stable configuration tokens.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum UiLanguage {
+    #[default]
+    #[serde(rename = "en")]
+    English,
+    #[serde(rename = "de")]
+    German,
+    #[serde(rename = "es")]
+    Spanish,
+    #[serde(rename = "fr")]
+    French,
+    #[serde(rename = "pt")]
+    Portuguese,
+    #[serde(rename = "ja")]
+    Japanese,
+    #[serde(rename = "zh-CN")]
+    ChineseSimplified,
+    #[serde(rename = "ko")]
+    Korean,
+    #[serde(rename = "vi")]
+    Vietnamese,
+    #[serde(rename = "hi")]
+    Hindi,
+}
+
+impl UiLanguage {
+    /// All supported languages in picker order.
+    pub const ALL: [Self; 10] = [
+        Self::English,
+        Self::German,
+        Self::Spanish,
+        Self::French,
+        Self::Portuguese,
+        Self::Japanese,
+        Self::ChineseSimplified,
+        Self::Korean,
+        Self::Vietnamese,
+        Self::Hindi,
+    ];
+
+    /// Stable language code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::English => "en",
+            Self::German => "de",
+            Self::Spanish => "es",
+            Self::French => "fr",
+            Self::Portuguese => "pt",
+            Self::Japanese => "ja",
+            Self::ChineseSimplified => "zh-CN",
+            Self::Korean => "ko",
+            Self::Vietnamese => "vi",
+            Self::Hindi => "hi",
+        }
+    }
+
+    /// Language name in its own language, for the language picker.
+    #[must_use]
+    pub const fn native_name(self) -> &'static str {
+        match self {
+            Self::English => "English",
+            Self::German => "Deutsch",
+            Self::Spanish => "Español",
+            Self::French => "Français",
+            Self::Portuguese => "Português",
+            Self::Japanese => "日本語",
+            Self::ChineseSimplified => "简体中文",
+            Self::Korean => "한국어",
+            Self::Vietnamese => "Tiếng Việt",
+            Self::Hindi => "हिन्दी",
+        }
+    }
+}
+
+impl std::str::FromStr for UiLanguage {
+    type Err = crate::ConfigError;
+
+    fn from_str(code: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|language| language.as_str() == code)
+            .ok_or_else(|| crate::ConfigError::Invalid("unsupported interface language".to_owned()))
+    }
+}
+
 /// Verhalten abgelaufener Kind-Statusmeldungen (`[tui] status_expiry`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -684,6 +771,9 @@ pub enum StatusExpiryMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TuiSection {
+    /// Profile interface language; older configurations default to English.
+    #[serde(default)]
+    pub language: UiLanguage,
     #[serde(default = "default_theme")]
     pub theme: String,
     #[serde(default = "default_keybindings_file")]
@@ -712,6 +802,7 @@ pub struct TuiSection {
 impl Default for TuiSection {
     fn default() -> Self {
         Self {
+            language: UiLanguage::default(),
             theme: default_theme(),
             keybindings_file: default_keybindings_file(),
             child_stream: ChildStreamModeToml::default(),

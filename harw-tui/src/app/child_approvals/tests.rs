@@ -73,7 +73,7 @@ fn a_child_request_appears_in_the_approval_dialog_with_its_sender() -> TestResul
     assert!(is_open(&app));
     let text = dialog_text(&app)?;
     assert!(
-        text.contains("angefragt von: uia-worker (Wurzel › root-orchestrator › uia-worker)"),
+        text.contains("requested by: uia-worker (Wurzel › root-orchestrator › uia-worker)"),
         "{text}"
     );
     assert!(text.contains("src/lib.rs"), "{text}");

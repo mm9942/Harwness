@@ -2821,6 +2821,7 @@ impl RuntimeAssemblyBuilder {
                 profile_name.clone(),
                 home_project_root.clone(),
             )
+            .and_then(|context| context.with_config_discovery_cwd(&spec.cwd))
             .map_err(|error| RuntimeError::Config {
                 detail: error.to_string(),
             })?,

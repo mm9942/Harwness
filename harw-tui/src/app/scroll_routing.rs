@@ -442,11 +442,11 @@ mod tests {
             let rows = screen(&app, width, height)?;
             let shown = rows.join("\n");
             assert!(
-                rows.iter().any(|row| row.contains("❯ 1. Ja")),
+                rows.iter().any(|row| row.contains("❯ 1. Yes")),
                 "{width}x{height}: {shown}"
             );
             assert!(
-                rows.iter().any(|row| row.contains("Nein (Esc)")),
+                rows.iter().any(|row| row.contains("No (Esc)")),
                 "{width}x{height}: {shown}"
             );
             assert!(
@@ -455,7 +455,7 @@ mod tests {
                 "{width}x{height}: Hinweiszeile fehlt: {shown}"
             );
             assert!(
-                rows.iter().any(|row| row.contains("Befehl ausführen?")),
+                rows.iter().any(|row| row.contains("Execute command?")),
                 "{width}x{height}: Titel/oberer Rahmen fehlt: {shown}"
             );
             let last = rows.last().ok_or(TestError::Missing("letzte Zeile"))?;
@@ -483,8 +483,8 @@ mod tests {
         for (width, height) in SIZES {
             let rows = screen(&app, width, height)?;
             let shown = rows.join("\n");
-            let panel = rows.iter().any(|row| row.contains("Agenten · 1 aktiv"));
-            let summary = rows.iter().any(|row| row.contains("Agenten: ● 1 aktiv"));
+            let panel = rows.iter().any(|row| row.contains("Agents · 1 active"));
+            let summary = rows.iter().any(|row| row.contains("Agents: ● 1 active"));
             if width >= crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH {
                 assert!(panel && !summary, "{width}x{height}: {shown}");
                 assert!(
@@ -512,7 +512,7 @@ mod tests {
                 .iter()
                 .find(|row| row.contains("Shift+Tab"))
                 .ok_or(TestError::Missing("Statuszeile"))?;
-            assert!(status.contains("Freigabe:"), "{width}: {status}");
+            assert!(status.contains("Approval:"), "{width}: {status}");
             assert!(!status.contains("(in "), "{width}: {status}");
         }
         let wide = screen(&app, 200, 50)?;
@@ -604,7 +604,7 @@ mod tests {
         assert!(app.scroll.is_following(), "der Verlauf bleibt stehen");
         let after = screen(&app, 80, 24)?;
         assert_ne!(before, after);
-        for needle in ["❯ 1. Ja", "Nein (Esc)"] {
+        for needle in ["❯ 1. Yes", "No (Esc)"] {
             assert!(
                 after.iter().any(|row| row.contains(needle)),
                 "{needle}: {after:?}"
@@ -620,7 +620,7 @@ mod tests {
         assert_eq!(offset, Some(WHEEL_LINES + 1));
         let shown = screen(&app, 80, 24)?;
         assert!(
-            shown.iter().any(|row| row.contains("❯ 1. Ja")),
+            shown.iter().any(|row| row.contains("❯ 1. Yes")),
             "Scrollen ändert die Auswahl nicht: {shown:?}"
         );
         Ok(())

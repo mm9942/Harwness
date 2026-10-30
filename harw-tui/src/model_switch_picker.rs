@@ -45,14 +45,16 @@ use ratatui::{buffer::Buffer, layout::Rect};
 use harw_config::ModelRole;
 
 use crate::choice_dialog::{ChoiceAction, ChoiceDialog};
+use crate::i18n::{tr, tr_args};
+use crate::model_roles_view::role_label;
 use crate::style;
 
 /// Titel der Provider-Auswahlstufe.
-const PROVIDER_DIALOG_TITLE: &str = "Provider wählen";
+const PROVIDER_DIALOG_TITLE: &str = "Choose provider";
 
 /// Fußzeilen-Hinweis für die Modell-Stufe, wenn ein Rücksprung zur
 /// Provider-Stufe möglich ist (`Left`).
-const MODEL_FOOTER_WITH_BACK: &str = "↑↓ wählen · ← zurück · Enter bestätigen · Esc abbrechen";
+const MODEL_FOOTER_WITH_BACK: &str = "↑↓ select · ← back · Enter confirm · Esc cancel";
 
 /// Für welchen Umschalt-Kontext der Picker instanziiert wurde.
 ///
@@ -115,20 +117,30 @@ impl PickerTarget {
     #[must_use]
     pub(crate) fn context_label(&self) -> String {
         match self {
-            Self::Orchestrator => "Sitzungs-/Standardmodell (/model)".to_owned(),
-            Self::Uia => "UIA-Modell".to_owned(),
-            Self::UiaWorker { .. } => "UIA-Worker-Modell".to_owned(),
+            Self::Orchestrator => {
+                tr("pickers.context_session", "Session/default model (/model)").to_owned()
+            }
+            Self::Uia => tr("pickers.context_uia", "UIA model").to_owned(),
+            Self::UiaWorker { .. } => tr("pickers.context_worker", "UIA worker model").to_owned(),
             Self::Role { role } => {
                 // Live-Modellwechsel: Kind-Rollen gelten sofort für neue
                 // Agenten, alle übrigen erst ab der nächsten Sitzung.
                 let effect = if role.applies_to_new_agents_live() {
-                    "neue Agenten sofort"
+                    tr("pickers.effect_agents", "new agents immediately")
                 } else {
-                    "ab nächster Sitzung"
+                    tr("pickers.effect_session", "from next session")
                 };
-                format!("Modell für {} ({effect})", role.label())
+                tr_args(
+                    "pickers.context_role",
+                    "Model for {role} ({effect})",
+                    &[("role", role_label(*role)), ("effect", effect)],
+                )
             }
-            Self::UiaWorkerRole { role } => format!("UIA-Worker-Modell für {role}"),
+            Self::UiaWorkerRole { role } => tr_args(
+                "pickers.context_worker_role",
+                "UIA worker model for {role}",
+                &[("role", role)],
+            ),
         }
     }
 }
@@ -509,11 +521,38 @@ impl ModelSwitchPicker {
     /// # Nebenläufigkeit
     /// Rein synchron; kein Locking erforderlich.
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: style::Theme) {
+        let prompt = self.target.context_label();
         match self.stage {
-            PickerStage::Provider => self.provider_dialog.render(area, buf, theme),
+            PickerStage::Provider => self.provider_dialog.render_with_presentation(
+                area,
+                buf,
+                theme,
+                tr("pickers.provider_title", PROVIDER_DIALOG_TITLE),
+                Some(&prompt),
+                tr(
+                    "dialogs.choice_footer",
+                    "↑↓ select · Enter confirm · Esc cancel",
+                ),
+            ),
             PickerStage::Model => {
                 if let Some(model_dialog) = self.model_dialog.as_ref() {
-                    model_dialog.render(area, buf, theme);
+                    let title = model_dialog_title(self.selected_provider.as_deref().unwrap_or(""));
+                    let footer = if can_go_back(&self.target) {
+                        tr("pickers.back_footer", MODEL_FOOTER_WITH_BACK)
+                    } else {
+                        tr(
+                            "dialogs.choice_footer",
+                            "↑↓ select · Enter confirm · Esc cancel",
+                        )
+                    };
+                    model_dialog.render_with_presentation(
+                        area,
+                        buf,
+                        theme,
+                        &title,
+                        Some(&prompt),
+                        footer,
+                    );
                 }
             }
         }
@@ -528,7 +567,11 @@ impl ModelSwitchPicker {
 /// Provider-ID (Label-Auflösung ist Sache des app.rs-Umsetzers, der die
 /// vollständige Provider-Config kennt).
 fn model_dialog_title(provider_id: &str) -> String {
-    format!("Modell wählen ({provider_id})")
+    tr_args(
+        "pickers.model_title",
+        "Choose model ({provider})",
+        &[("provider", provider_id)],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +630,69 @@ mod tests {
             ),
             ("empty-provider".to_owned(), vec![]),
         ]
+    }
+
+    #[test]
+    fn locale_changes_refresh_both_stages_without_changing_selection() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let mut picker = ModelSwitchPicker::new(
+            PickerTarget::Orchestrator,
+            providers_fixture(),
+            models_fixture(),
+            None,
+            None,
+        )
+        .ok_or(TestError::Missing("picker"))?;
+        let area = Rect::new(0, 0, 100, 12);
+        let mut buf = Buffer::empty(area);
+        picker.on_key(make_key(KeyCode::Down));
+        with_language(UiLanguage::Japanese, || {
+            picker.render(area, &mut buf, style::Theme::Dark)
+        });
+        assert!(crate::test_support::display_buffer_text(&buf).contains("プロバイダーを選択"));
+        picker.on_key(make_key(KeyCode::Enter));
+        with_language(UiLanguage::Hindi, || {
+            picker.render(area, &mut buf, style::Theme::Dark)
+        });
+        assert!(crate::test_support::display_buffer_text(&buf).contains("मॉडल चुनें (openai)"));
+        assert_eq!(picker.stage, PickerStage::Model);
+        assert_eq!(picker.selected_provider.as_deref(), Some("openai"));
+        assert_eq!(
+            picker.on_key(make_key(KeyCode::Enter)),
+            PickerAction::Accept {
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+            }
+        );
+        let mut picker = ModelSwitchPicker::new(
+            PickerTarget::UiaWorker {
+                fixed_provider: "anthropic".into(),
+            },
+            providers_fixture(),
+            models_fixture(),
+            Some("anthropic"),
+            Some("claude-opus"),
+        )
+        .ok_or(TestError::Missing("worker picker"))?;
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                for width in [1, 8, 24, 80] {
+                    let area = Rect::new(0, 0, width, 10);
+                    picker.render(area, &mut Buffer::empty(area), style::Theme::Dark);
+                }
+            });
+        }
+        assert_eq!(picker.on_key(make_key(KeyCode::Left)), PickerAction::Stay);
+        assert_eq!(picker.stage, PickerStage::Model);
+        assert_eq!(
+            picker.on_key(make_key(KeyCode::Enter)),
+            PickerAction::Accept {
+                provider: "anthropic".into(),
+                model: "claude-opus".into(),
+            }
+        );
+        Ok(())
     }
 
     /// `providers` leer → `new` liefert `None`.
@@ -874,19 +980,19 @@ mod tests {
     fn test_context_label_per_target() {
         assert_eq!(
             PickerTarget::Orchestrator.context_label(),
-            "Sitzungs-/Standardmodell (/model)"
+            "Session/default model (/model)"
         );
         let label = PickerTarget::Role {
             role: ModelRole::Explorer,
         }
         .context_label();
-        assert!(label.contains(ModelRole::Explorer.label()));
-        assert!(label.contains("neue Agenten sofort"));
+        assert!(label.contains(role_label(ModelRole::Explorer)));
+        assert!(label.contains(tr("pickers.effect_agents", "new agents immediately")));
         let label = PickerTarget::Role {
             role: ModelRole::SessionTitle,
         }
         .context_label();
-        assert!(label.contains("ab nächster Sitzung"));
+        assert!(label.contains(tr("pickers.effect_session", "from next session")));
     }
 
     /// `Role` durchläuft die Provider-Stufe (inkl. `Left` zurück) und liefert

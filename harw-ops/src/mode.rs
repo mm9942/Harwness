@@ -253,6 +253,7 @@ fn render_show(current: Option<&str>, configured_default: Option<&str>) -> OpOut
         text: lines.join("\n"),
         data: Some(json!({
             "action": "show",
+            "ui_feedback": {"kind":"mode", "action":"show", "mode":current, "default":configured_default, "effective":"current", "note":null},
             "mode": current,
             "known": current.is_some(),
             "default": configured_default,
@@ -291,6 +292,7 @@ fn handle_set_default(
         text,
         data: Some(json!({
             "action": "default",
+            "ui_feedback": {"kind":"mode", "action":"default", "mode":mode.as_str(), "effective":"next_session", "note":note},
             "default": mode.as_str(),
             "persisted": note.is_none(),
             "note": note,
@@ -375,6 +377,7 @@ async fn mode(ctx: &OpContext, args: ModeArgs) -> Result<OpOutput, OpError> {
                 ),
                 data: Some(json!({
                     "action": "switch",
+                    "ui_feedback": {"kind":"mode", "action":"switch", "mode":mode.as_str(), "effective":"next_turn", "note":null},
                     "mode": mode.as_str(),
                     "requested": true,
                     "available_modes": available_modes_json(),

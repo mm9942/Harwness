@@ -14,3 +14,20 @@ pub(crate) fn install_host_port() {
         }
     });
 }
+
+/// Visible buffer text, skipping continuation cells of wide graphemes.
+pub(crate) fn display_buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+    let area = buffer.area();
+    let mut text = String::new();
+    for y in area.top()..area.bottom() {
+        let mut x = area.left();
+        while x < area.right() {
+            let symbol = buffer[(x, y)].symbol();
+            text.push_str(symbol);
+            let width = unicode_width::UnicodeWidthStr::width(symbol).max(1);
+            x = x.saturating_add(u16::try_from(width).unwrap_or(u16::MAX));
+        }
+        text.push('\n');
+    }
+    text
+}

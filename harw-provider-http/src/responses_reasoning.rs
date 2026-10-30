@@ -53,6 +53,14 @@ impl ReasoningReplay {
         if replay.call_ids.is_empty() {
             return Ok(());
         }
+        // Callers outside the turn loop may omit identity for ordinary requests.
+        // An empty binding is optional there; encrypted/explicit reasoning is not.
+        if replay.blocks.is_empty()
+            && request.reasoning_effort.is_none()
+            && request.identity().is_none()
+        {
+            return Ok(());
+        }
         let identity = request
             .identity()
             .filter(|identity| !identity.session.is_empty() && !identity.agent.is_empty())
@@ -382,7 +390,13 @@ mod tests {
                 &next,
             )
             .map_err(ctx("continue legitimate round without reasoning blocks"))?;
-        assert!(replay.iter().all(|entry| entry.blocks.is_empty()));
+        assert_eq!(
+            replay.len(),
+            1,
+            "the identity-bound empty round is retained"
+        );
+        assert_eq!(replay[0].call_ids, vec!["a"]);
+        assert!(replay[0].blocks.is_empty());
         let body = crate::build_responses_body("thinking-model", &next, &replay)
             .map_err(ctx("build next request"))?;
         assert_eq!(body["input"].as_array().map(Vec::len), Some(4));

@@ -22,6 +22,7 @@ pub(crate) mod chat_scroll;
 mod live_ranker;
 mod recency;
 mod recency_view;
+mod settings_view;
 // h22: read-only StepList-Ansicht für das Explorer-Fenster.
 pub(crate) mod step_list_view;
 // Runde 5, Teil I: Live-Stream der Kind-Agenten im Verlauf.
@@ -34,6 +35,7 @@ pub(crate) mod command_data;
 pub(crate) mod command_exec;
 pub(crate) mod command_popup;
 mod image_attach;
+pub(crate) mod operation_feedback;
 // Gemeinsames Dialog-Layout: angeheftete Optionen, scrollbarer Körper.
 pub(crate) mod dialog_frame;
 // PL-97 D5: Harw-DoD-Ansicht (`/dod view`) und DoD-Marke der Statuszeile.
@@ -52,6 +54,7 @@ pub(crate) mod hard_kill;
 pub(crate) mod help_overlay;
 pub(crate) mod history_cell;
 pub mod host_permit_dialog;
+pub mod i18n;
 mod input;
 pub(crate) mod input_editor;
 pub(crate) mod input_history;
@@ -120,7 +123,9 @@ pub use export::{
 };
 pub use gateway::{ChatGateway, LocalGateway};
 pub use input::{Invocation, classify_input};
-pub use model_picker::{ModelPickerOutcome, ModelPickerProvider, run_model_picker};
+pub use model_picker::{
+    ModelPickerOutcome, ModelPickerProvider, run_model_picker, run_model_picker_for,
+};
 pub use registry::{
     CapabilitySet, CommandAction, CommandRegistry, DispatchContext, InvocationSurface,
     ShellCapability,
@@ -131,7 +136,7 @@ pub use runtime_root::{
     run_tui,
 };
 pub use session_picker::{PickerAction, SessionEntry, SessionPicker};
-pub use setup::{SetupApp, SetupOutcome, SetupStage, run_setup};
+pub use setup::{SetupApp, SetupOutcome, SetupStage, run_setup, run_setup_for};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]
