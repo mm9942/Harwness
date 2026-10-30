@@ -1,0 +1,868 @@
+{
+  "schema": "harwness.paper-source-audit/v1",
+  "repository": "https://github.com/mm9942/Harwness",
+  "reviewed_commit": "14082d16b5e21f920acd2dc0b84ebd42f32ac859",
+  "review_date": "2026-10-30",
+  "method": "Selected-path static review through GitHub contents API plus baseline-to-current compare; no compilation, tests, deployments, privileged activation or runtime experiments performed.",
+  "fetched_paths": [
+    "harw-authority/src/lib.rs",
+    "harw-types/src/principal.rs",
+    "harw-agent-compiler/src/compiler.rs",
+    "harw-agent-compiler/src/passes/rights.rs",
+    "harw-cli/src/job_worker_work_driver_writer.rs",
+    "harw-tools/src/sandbox_guard.rs",
+    "dod/crates/harw-warden/src/ipc.rs",
+    "dod/crates/harw-dod-warden/src/warden.rs",
+    "harw-agent-dsl/src/ir_v2.rs",
+    "harw-agent-dsl/src/roles.rs",
+    "harw-agent-compiler/src/backend/mod.rs",
+    "harw-plan-bridge/src/cycle_spec.rs",
+    "harw-plan-bridge/src/cycle_runtime.rs",
+    "harw-plan-bridge/src/cycle_write_admission.rs",
+    "harw-job-linux/src/sandbox.rs",
+    "harw-job-runtime/src/coordinator/linux.rs",
+    "harw-job-runtime/src/host.rs",
+    "harw-job-darwin/src/report.rs",
+    "dod/crates/harw-dod-bpf/src/real.rs",
+    "dod/crates/harw-probe-bpf/src/main.rs",
+    "deploy/systemd/harw-probe-bpf.service",
+    "deploy/systemd/harw-warden.service",
+    "dod/crates/harw-dod-warden-proto/src/signed.rs",
+    "harw-cli/src/job_worker_intent_cycle.rs",
+    "harw-cli/src/job_worker_work_driver.rs",
+    "harw-runtime/src/agent_job_wiring.rs",
+    "harw-plan-bridge/src/intent_cycle.rs",
+    "harw-plan-bridge/src/work_driver.rs",
+    "harw-runtime/src/spec.rs",
+    "harw-job-exec/src/lib.rs",
+    "harw-job-executor-bwrap/src/lib.rs",
+    "harw-sandbox/src/bwrap.rs",
+    "harw-runtime/src/embedded.rs",
+    "dod/crates/harw-dod-bpf/src/contract.rs",
+    "dod/bpf/src/tcp_v4_connect.bpf.c",
+    "dod/bpf/src/tcp_v6_connect.bpf.c",
+    "harw-runtime/src/assembly.rs",
+    "harw-agent-dsl/src/lib.rs"
+  ],
+  "claims": [
+    {
+      "id": "A1",
+      "section": "3.1",
+      "claim": "EntryKind has thirteen variants; SessionHost has a read/write/process ceiling without network, and CompiledAgent has an empty fallback derived from an embedded manifest in normal use.",
+      "sources": [
+        {
+          "path": "harw-runtime/src/spec.rs",
+          "start_line": 64,
+          "end_line": 100,
+          "symbol": "EntryKind",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/spec.rs#L64-L100"
+        },
+        {
+          "path": "harw-runtime/src/spec.rs",
+          "start_line": 314,
+          "end_line": 348,
+          "symbol": "EntryKind::profile",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/spec.rs#L314-L348"
+        }
+      ],
+      "qualification": "Source-observed entry profiles; not proof of every call path.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "A2",
+      "section": "3.3",
+      "claim": "Principal fields are private, Principal is Serialize but not Deserialize, and child_of caps tier at min(parent, Operator).",
+      "sources": [
+        {
+          "path": "harw-types/src/principal.rs",
+          "start_line": 90,
+          "end_line": 181,
+          "symbol": "Principal; Principal::child_of",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-types/src/principal.rs#L90-L181"
+        }
+      ],
+      "qualification": "Trusted Rust code can construct principals; this is not isolation from compromised runtime code.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "A3",
+      "section": "3.3",
+      "claim": "Same-workspace restriction intersects permissions, network scope and write scope. HarnessReadView explicitly allows a same-tenant workspace rebinding with parent-derived read permission and empty network.",
+      "sources": [
+        {
+          "path": "harw-authority/src/lib.rs",
+          "start_line": 985,
+          "end_line": 1033,
+          "symbol": "AuthorityContext::restrict; AuthorityContext::is_subset_of",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-authority/src/lib.rs#L985-L1033"
+        },
+        {
+          "path": "harw-authority/src/lib.rs",
+          "start_line": 1225,
+          "end_line": 1268,
+          "symbol": "SandboxSpec::harness_read_view",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-authority/src/lib.rs#L1225-L1268"
+        }
+      ],
+      "qualification": "Ordinary literal resource-set attenuation is not a complete formal model of the read-view rebinding exception.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "C1",
+      "section": "4.1",
+      "claim": "The role enumeration contains six fixed variants.",
+      "sources": [
+        {
+          "path": "harw-agent-dsl/src/roles.rs",
+          "start_line": 25,
+          "end_line": 65,
+          "symbol": "AgentRoleId",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/roles.rs#L25-L65"
+        }
+      ],
+      "qualification": "Specialization does not define a new authority role.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "C2",
+      "section": "4.1",
+      "claim": "AgentIr snapshot domain is harwness.agent-ir.snapshot/v7; canonicalization removes trace and snapshot and sorts capabilities and admitted/forbidden tools.",
+      "sources": [
+        {
+          "path": "harw-agent-dsl/src/ir_v2.rs",
+          "start_line": 18,
+          "end_line": 50,
+          "symbol": "AGENT_IR_SNAPSHOT_DOMAIN",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/ir_v2.rs#L18-L50"
+        },
+        {
+          "path": "harw-agent-dsl/src/ir_v2.rs",
+          "start_line": 1223,
+          "end_line": 1278,
+          "symbol": "AgentIr::canonical_form; compute_snapshot; verify_snapshot",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/ir_v2.rs#L1223-L1278"
+        }
+      ],
+      "qualification": "Hash integrity is distinct from author authentication, model determinism or supply-chain provenance.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "C3",
+      "section": "4.2",
+      "claim": "The pipeline contains eight ordered passes: ValidateRoles, RightsCheck, ResolveSkills, ReachableTools, PruneUnusedTools, ResolveModels, DeriveRequirements, ChildClosure.",
+      "sources": [
+        {
+          "path": "harw-agent-compiler/src/compiler.rs",
+          "start_line": 214,
+          "end_line": 239,
+          "symbol": "Compiler::passes",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/compiler.rs#L214-L239"
+        }
+      ],
+      "qualification": "Implementation observed; not a correctness proof.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "C4",
+      "section": "4.2",
+      "claim": "A work_driver section adds exactly three tools to the base-role tool ceiling, while the optional author ceiling remains restrictive.",
+      "sources": [
+        {
+          "path": "harw-agent-compiler/src/passes/rights.rs",
+          "start_line": 16,
+          "end_line": 23,
+          "symbol": "RightsCheck contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/passes/rights.rs#L16-L23"
+        },
+        {
+          "path": "harw-agent-compiler/src/passes/rights.rs",
+          "start_line": 70,
+          "end_line": 146,
+          "symbol": "RightsCheck::run; limit_with_work_driver",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/passes/rights.rs#L70-L146"
+        }
+      ],
+      "qualification": "Use an effective role ceiling in any mathematical attenuation statement.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "C5",
+      "section": "4.3",
+      "claim": "Backend A appends an artifact to a compatible runner or emits artifact-only output; backend B generates a native Rust build. Embedded loading validates snapshots and referenced content.",
+      "sources": [
+        {
+          "path": "harw-agent-compiler/src/backend/mod.rs",
+          "start_line": 1,
+          "end_line": 10,
+          "symbol": "Backend design",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/backend/mod.rs#L1-L10"
+        },
+        {
+          "path": "harw-agent-compiler/src/backend/mod.rs",
+          "start_line": 209,
+          "end_line": 284,
+          "symbol": "Backend dispatch",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/backend/mod.rs#L209-L284"
+        },
+        {
+          "path": "harw-runtime/src/embedded.rs",
+          "start_line": 45,
+          "end_line": 90,
+          "symbol": "EmbeddedAgent::from_bundle",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/embedded.rs#L45-L90"
+        },
+        {
+          "path": "harw-runtime/src/embedded.rs",
+          "start_line": 219,
+          "end_line": 231,
+          "symbol": "IR snapshot validation",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/embedded.rs#L219-L231"
+        }
+      ],
+      "qualification": "No bit-identical cross-toolchain native builds or deterministic model behavior established.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "D1",
+      "section": "5.1",
+      "claim": "WorkDriver persists rounds under a live job lease; this is neither a cross-store/effect transaction nor same-claim CAS. Missing typed reports become Partial. ProposeAchieved does not accept the goal.",
+      "sources": [
+        {
+          "path": "harw-cli/src/job_worker_work_driver.rs",
+          "start_line": 3,
+          "end_line": 80,
+          "symbol": "Module contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver.rs#L3-L80"
+        },
+        {
+          "path": "harw-cli/src/job_worker_work_driver.rs",
+          "start_line": 1295,
+          "end_line": 1320,
+          "symbol": "WorkDriveStep::ProposeAchieved",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver.rs#L1295-L1320"
+        },
+        {
+          "path": "harw-cli/src/job_worker_work_driver.rs",
+          "start_line": 1594,
+          "end_line": 1606,
+          "symbol": "WorkerReply::Completed",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver.rs#L1594-L1606"
+        }
+      ],
+      "qualification": "Legacy owned_paths checks are post-hoc scope checks, not isolation between parallel workers.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "D2",
+      "section": "5.1",
+      "claim": "Nested inline handoff pauses lack a durable resume owner and terminate with a documented blocked outcome.",
+      "sources": [
+        {
+          "path": "harw-runtime/src/agent_job_wiring.rs",
+          "start_line": 831,
+          "end_line": 861,
+          "symbol": "RunOutcome inline handoff handling",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/agent_job_wiring.rs#L831-L861"
+        }
+      ],
+      "qualification": "Do not generalize durable delegation to every nested continuation.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "D3",
+      "section": "5.2",
+      "claim": "Patch admission is read-only, checks trusted preimages, and requires a future writer to revalidate at mutation time.",
+      "sources": [
+        {
+          "path": "harw-plan-bridge/src/cycle_write_admission.rs",
+          "start_line": 1,
+          "end_line": 73,
+          "symbol": "Patch admission contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_write_admission.rs#L1-L73"
+        },
+        {
+          "path": "harw-plan-bridge/src/cycle_write_admission.rs",
+          "start_line": 494,
+          "end_line": 565,
+          "symbol": "admit_patch",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_write_admission.rs#L494-L565"
+        }
+      ],
+      "qualification": "Admission is not durable authority for an arbitrary later filesystem write.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "D4",
+      "section": "5.3",
+      "claim": "CycleStore journals steps before dispatch, fences updates by lease epoch, supports a live-lease hold, and escalates uncertain effects; the live CLI cycle explicitly installs the hold.",
+      "sources": [
+        {
+          "path": "harw-plan-bridge/src/cycle_runtime.rs",
+          "start_line": 1,
+          "end_line": 76,
+          "symbol": "Durability and recovery contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_runtime.rs#L1-L76"
+        },
+        {
+          "path": "harw-plan-bridge/src/cycle_runtime.rs",
+          "start_line": 390,
+          "end_line": 417,
+          "symbol": "CycleStore::new; with_lease_liveness",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_runtime.rs#L390-L417"
+        },
+        {
+          "path": "harw-plan-bridge/src/cycle_runtime.rs",
+          "start_line": 518,
+          "end_line": 549,
+          "symbol": "Step journaling",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_runtime.rs#L518-L549"
+        },
+        {
+          "path": "harw-cli/src/job_worker_intent_cycle.rs",
+          "start_line": 237,
+          "end_line": 279,
+          "symbol": "Live cycle construction",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_intent_cycle.rs#L237-L279"
+        }
+      ],
+      "qualification": "Default CycleStore without with_lease_liveness has epoch fencing only; external effects are not made transactional.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "D5",
+      "section": "5.4",
+      "claim": "ReadOnlyCycleSpec admits read targets with default-empty write/child/recipe targets.",
+      "sources": [
+        {
+          "path": "harw-plan-bridge/src/cycle_spec.rs",
+          "start_line": 1,
+          "end_line": 20,
+          "symbol": "ReadOnlyCycleSpec contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_spec.rs#L1-L20"
+        },
+        {
+          "path": "harw-plan-bridge/src/cycle_spec.rs",
+          "start_line": 170,
+          "end_line": 215,
+          "symbol": "ReadOnlyCycleSpec::plan",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_spec.rs#L170-L215"
+        }
+      ],
+      "qualification": "Broader typed proposals do not establish a live write-capable recipe.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "D6",
+      "section": "5.4",
+      "claim": "The exact-file pilot stages review artifacts, with at most eight existing regular single-link UTF-8 targets, 64 KiB each, and 24 replacements; normal checkout topology remains blocked for publication.",
+      "sources": [
+        {
+          "path": "harw-cli/src/job_worker_work_driver_writer.rs",
+          "start_line": 1,
+          "end_line": 24,
+          "symbol": "Module contract; MAX_*",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver_writer.rs#L1-L24"
+        },
+        {
+          "path": "harw-cli/src/job_worker_work_driver_writer.rs",
+          "start_line": 60,
+          "end_line": 124,
+          "symbol": "Target validation",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver_writer.rs#L60-L124"
+        },
+        {
+          "path": "harw-cli/src/job_worker_work_driver_writer.rs",
+          "start_line": 350,
+          "end_line": 369,
+          "symbol": "Candidate scope restriction",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver_writer.rs#L350-L369"
+        },
+        {
+          "path": "harw-cli/src/job_worker_work_driver_writer.rs",
+          "start_line": 439,
+          "end_line": 459,
+          "symbol": "Blocked receipt",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver_writer.rs#L439-L459"
+        }
+      ],
+      "qualification": "No live checkout mutation, shell/tests, children, create/delete/rename or automatic continuation/recovery in this pilot.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "S1",
+      "section": "6.2",
+      "claim": "Tool-level exact-file writes fail closed even for admitted targets until an isolated writer backend exists.",
+      "sources": [
+        {
+          "path": "harw-tools/src/sandbox_guard.rs",
+          "start_line": 113,
+          "end_line": 155,
+          "symbol": "require_file_write",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-tools/src/sandbox_guard.rs#L113-L155"
+        }
+      ],
+      "qualification": "Separate from legacy workspace-wide writers and the per-job JobSpec path.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "S2",
+      "section": "6.1",
+      "claim": "The Landlock adapter targets ABI 5. Denying network controls remain Partial because they cover TCP bind/connect rather than all network mechanisms.",
+      "sources": [
+        {
+          "path": "harw-job-linux/src/sandbox.rs",
+          "start_line": 31,
+          "end_line": 40,
+          "symbol": "Enforcement contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-linux/src/sandbox.rs#L31-L40"
+        },
+        {
+          "path": "harw-job-linux/src/sandbox.rs",
+          "start_line": 335,
+          "end_line": 367,
+          "symbol": "landlock_filesystem_state; landlock_network_state",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-linux/src/sandbox.rs#L335-L367"
+        },
+        {
+          "path": "harw-job-linux/src/sandbox.rs",
+          "start_line": 1062,
+          "end_line": 1084,
+          "symbol": "landlock_states",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-linux/src/sandbox.rs#L1062-L1084"
+        }
+      ],
+      "qualification": "Full no-network claims require the complete executor boundary, including network namespaces where used.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "S3",
+      "section": "6.2",
+      "claim": "Per-job write scopes require canonical in-workspace targets or an explicitly granted existing ancestor for missing targets, reject incidental wider writable ancestors, and require supported Required enforcement.",
+      "sources": [
+        {
+          "path": "harw-job-runtime/src/coordinator/linux.rs",
+          "start_line": 54,
+          "end_line": 80,
+          "symbol": "Per-job write-scope contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-runtime/src/coordinator/linux.rs#L54-L80"
+        },
+        {
+          "path": "harw-job-runtime/src/coordinator/linux.rs",
+          "start_line": 1916,
+          "end_line": 2051,
+          "symbol": "scoped_policy; resolve_write_scope",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-runtime/src/coordinator/linux.rs#L1916-L2051"
+        }
+      ],
+      "qualification": "Directory grants remain directory-granular; this is not identical to exact-file candidate publication.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "S4",
+      "section": "12",
+      "claim": "Darwin reports sandbox-exec filesystem/network enforcement as Partial and does not satisfy Required jobs.",
+      "sources": [
+        {
+          "path": "harw-job-darwin/src/report.rs",
+          "start_line": 1,
+          "end_line": 25,
+          "symbol": "Darwin enforcement contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-darwin/src/report.rs#L1-L25"
+        },
+        {
+          "path": "harw-job-darwin/src/report.rs",
+          "start_line": 81,
+          "end_line": 108,
+          "symbol": "DarwinSandbox::report_for",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-darwin/src/report.rs#L81-L108"
+        }
+      ],
+      "qualification": "Cross-platform compilation is not enforcement parity.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "O1",
+      "section": "7.1",
+      "claim": "Sensor contracts use sched process exec/exit tracepoints and tcp_v4_connect/tcp_v6_connect function-entry probes.",
+      "sources": [
+        {
+          "path": "dod/crates/harw-dod-bpf/src/contract.rs",
+          "start_line": 19,
+          "end_line": 28,
+          "symbol": "Attach point constants",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-bpf/src/contract.rs#L19-L28"
+        },
+        {
+          "path": "dod/crates/harw-dod-bpf/src/contract.rs",
+          "start_line": 82,
+          "end_line": 102,
+          "symbol": "is_exact_program_contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-bpf/src/contract.rs#L82-L102"
+        },
+        {
+          "path": "dod/bpf/src/tcp_v4_connect.bpf.c",
+          "start_line": 9,
+          "end_line": 24,
+          "symbol": "fentry/tcp_v4_connect",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/bpf/src/tcp_v4_connect.bpf.c#L9-L24"
+        }
+      ],
+      "qualification": "Function-entry observations describe connection attempts, not successful connections or all traffic.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "O2",
+      "section": "7.1",
+      "claim": "The eBPF systemd unit requires CAP_BPF and CAP_PERFMON without a CAP_SYS_ADMIN fallback.",
+      "sources": [
+        {
+          "path": "deploy/systemd/harw-probe-bpf.service",
+          "start_line": 1,
+          "end_line": 12,
+          "symbol": "Capability contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/deploy/systemd/harw-probe-bpf.service#L1-L12"
+        },
+        {
+          "path": "deploy/systemd/harw-probe-bpf.service",
+          "start_line": 66,
+          "end_line": 67,
+          "symbol": "CapabilityBoundingSet; AmbientCapabilities",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/deploy/systemd/harw-probe-bpf.service#L66-L67"
+        }
+      ],
+      "qualification": "Deployment permissions do not guarantee successful attachment or complete observations.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "O3",
+      "section": "7.1",
+      "claim": "Descendant cgroup membership is refreshed through a userspace rescan nominally every two seconds; kernel ancestor matching is documented as pending.",
+      "sources": [
+        {
+          "path": "dod/crates/harw-probe-bpf/src/main.rs",
+          "start_line": 153,
+          "end_line": 175,
+          "symbol": "Dynamic cgroup scope contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-probe-bpf/src/main.rs#L153-L175"
+        }
+      ],
+      "qualification": "Two seconds is the polling interval, not a measured universal upper bound on visibility delay.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "W1",
+      "section": "7.2",
+      "claim": "Warden is gated by a warden.enable systemd condition and is not automatically activated.",
+      "sources": [
+        {
+          "path": "deploy/systemd/harw-warden.service",
+          "start_line": 4,
+          "end_line": 8,
+          "symbol": "Opt-in contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/deploy/systemd/harw-warden.service#L4-L8"
+        },
+        {
+          "path": "deploy/systemd/harw-warden.service",
+          "start_line": 29,
+          "end_line": 35,
+          "symbol": "ConditionPathExists",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/deploy/systemd/harw-warden.service#L29-L35"
+        }
+      ],
+      "qualification": "The service path is templated as @SYSCONFDIR@/warden.enable; /etc/harw-dod is the default deployment location.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "W2",
+      "section": "7.2",
+      "claim": "Warden IPC reads and logs SO_PEERCRED but does not perform a UID/PID admission allowlist check; the legacy handler calls Warden::handle with a decoded WardenRequestEnvelope.",
+      "sources": [
+        {
+          "path": "dod/crates/harw-warden/src/ipc.rs",
+          "start_line": 17,
+          "end_line": 33,
+          "symbol": "Peer-identity contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-warden/src/ipc.rs#L17-L33"
+        },
+        {
+          "path": "dod/crates/harw-warden/src/ipc.rs",
+          "start_line": 190,
+          "end_line": 212,
+          "symbol": "accept_connection; handle_connection",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-warden/src/ipc.rs#L190-L212"
+        },
+        {
+          "path": "dod/crates/harw-warden/src/ipc.rs",
+          "start_line": 261,
+          "end_line": 284,
+          "symbol": "recv_envelope",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-warden/src/ipc.rs#L261-L284"
+        }
+      ],
+      "qualification": "A deployment socket boundary is not equivalent to the richer signed protocol being integrated.",
+      "evidence_level": "source-observed; not independently executed"
+    },
+    {
+      "id": "W3",
+      "section": "7.2",
+      "claim": "The legacy Warden handler explicitly omits freshness and authorized_by ACL checks, although a separate SignedAuthorization type implements MAC, lifetime and nonce verification.",
+      "sources": [
+        {
+          "path": "dod/crates/harw-dod-warden/src/warden.rs",
+          "start_line": 38,
+          "end_line": 59,
+          "symbol": "Legacy authorization limitations",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-warden/src/warden.rs#L38-L59"
+        },
+        {
+          "path": "dod/crates/harw-dod-warden-proto/src/signed.rs",
+          "start_line": 1,
+          "end_line": 25,
+          "symbol": "Signed authorization contract",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-warden-proto/src/signed.rs#L1-L25"
+        },
+        {
+          "path": "dod/crates/harw-dod-warden-proto/src/signed.rs",
+          "start_line": 592,
+          "end_line": 647,
+          "symbol": "SignedAuthorization::verify",
+          "url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-warden-proto/src/signed.rs#L592-L647"
+        }
+      ],
+      "qualification": "The signed protocol's existence must not be described as complete replay-protected live enforcement.",
+      "evidence_level": "source-observed; not independently executed"
+    }
+  ],
+  "fetched_files": [
+    {
+      "path": "harw-authority/src/lib.rs",
+      "size_bytes": 87587,
+      "git_blob_sha1": "94c3c3bfce5cfe7ff1d2a66447133eb7cd64a48a",
+      "sha256": "dfea22ab4cf4c3d317ffa193e622e43207733d15645000c007aa4653b9ffe26c"
+    },
+    {
+      "path": "harw-types/src/principal.rs",
+      "size_bytes": 16969,
+      "git_blob_sha1": "330a1be4d9f41cca5f490c7914d1733266ffbadf",
+      "sha256": "8c58e301a8a5b0e025a7218053df02ecf44cd1e8304c520fad38555fc3e3302e"
+    },
+    {
+      "path": "harw-agent-compiler/src/compiler.rs",
+      "size_bytes": 14897,
+      "git_blob_sha1": "d1acbf11b1bdba56d205f4ae903806de6ce36d2c",
+      "sha256": "a15174f06948de701d962f09349053215726679129bc7cb8b7a95bb0a32b653c"
+    },
+    {
+      "path": "harw-agent-compiler/src/passes/rights.rs",
+      "size_bytes": 7510,
+      "git_blob_sha1": "038df5012d7b7bce354747c8e36b5f078b1030b2",
+      "sha256": "1c646209951d0e241ee0aa44a5657f126341008b967ef469503d062865bd5c8c"
+    },
+    {
+      "path": "harw-cli/src/job_worker_work_driver_writer.rs",
+      "size_bytes": 36515,
+      "git_blob_sha1": "b2c9483ec2f1acc69573776815e3357f1f0c80c8",
+      "sha256": "5416058a411358e944cea4572e283d5d0e15860ddc96328695fb80827c09386a"
+    },
+    {
+      "path": "harw-tools/src/sandbox_guard.rs",
+      "size_bytes": 29061,
+      "git_blob_sha1": "24d1ec994470601418b6417652006dc3880ba69a",
+      "sha256": "31cf70938459220b90f5a26876915e790a2fb1bc1ca5a2cae7dbbb6e7132e018"
+    },
+    {
+      "path": "dod/crates/harw-warden/src/ipc.rs",
+      "size_bytes": 15468,
+      "git_blob_sha1": "140477dd2d9755fcc7f6d289c799b6b7d1924d2b",
+      "sha256": "ecf247183cfbc5db353be42f9740d78f4aa7727e53f318d2d3725ceb10c1e1ee"
+    },
+    {
+      "path": "dod/crates/harw-dod-warden/src/warden.rs",
+      "size_bytes": 25373,
+      "git_blob_sha1": "d665ffc6bc817f71b8fafd12948a67adf42ab3d3",
+      "sha256": "6b8ccfc5ef4a1306e4338a69f92337baaed831c2c807c62a1bbee97fedbdf746"
+    },
+    {
+      "path": "harw-agent-dsl/src/ir_v2.rs",
+      "size_bytes": 59299,
+      "git_blob_sha1": "e9e7cb22bc4bb226c741a0bfd5e564aa76dc7287",
+      "sha256": "72bc1ad2e985df1d3fbd171b5f50104c013bfd671f0d297912cb55f25aa0d7f6"
+    },
+    {
+      "path": "harw-agent-dsl/src/roles.rs",
+      "size_bytes": 14593,
+      "git_blob_sha1": "0587035916e640022ba262d8d613dc9171b57554",
+      "sha256": "349e6f59fb7a0641bba9e9e98d113570457cfb0178cff5f7f152cdf3538b2860"
+    },
+    {
+      "path": "harw-agent-compiler/src/backend/mod.rs",
+      "size_bytes": 12039,
+      "git_blob_sha1": "b17adf548509b9344df90b40832bdeea6f42a956",
+      "sha256": "f73db6a1fcefe3478e20cc9b1696f31bf8309d049790f219bc46e4298eee8a80"
+    },
+    {
+      "path": "harw-plan-bridge/src/cycle_spec.rs",
+      "size_bytes": 11799,
+      "git_blob_sha1": "c11e80b351af99b91dec1d6682460638c1ebd3f7",
+      "sha256": "1cebb171c39b85c7d08d2b9eb9727fbcc87bd4c89aa19e75bef5287f1eeb79af"
+    },
+    {
+      "path": "harw-plan-bridge/src/cycle_runtime.rs",
+      "size_bytes": 155576,
+      "git_blob_sha1": "dff41410176ca942df729fcce07198cef85bac87",
+      "sha256": "98bdcb0ecfce24f3de9158670533b82d9c4e04264efa6a59cca76df6ec3fea33"
+    },
+    {
+      "path": "harw-plan-bridge/src/cycle_write_admission.rs",
+      "size_bytes": 59858,
+      "git_blob_sha1": "42a26e9251d9e417d9f8775a5e0c75b236ddec16",
+      "sha256": "689a31a399c867a9d440b93101de2365a0ee2dba48ab98f2758ac14d9dc35057"
+    },
+    {
+      "path": "harw-job-linux/src/sandbox.rs",
+      "size_bytes": 85064,
+      "git_blob_sha1": "3dc58105a76bd65b3f3115aef1f368add8a42c23",
+      "sha256": "e6771a72a072f33fb8e7007c6479b67012cdf9aee5931eb0f07c7b768b8a4307"
+    },
+    {
+      "path": "harw-job-runtime/src/coordinator/linux.rs",
+      "size_bytes": 176661,
+      "git_blob_sha1": "7bc6f1a148835d6c9891a9cb3531baa7219592e8",
+      "sha256": "e8d6060966568c614b0837a4a92d8ee99f5279faf75c6ee5605f8a301339770d"
+    },
+    {
+      "path": "harw-job-runtime/src/host.rs",
+      "size_bytes": 82157,
+      "git_blob_sha1": "0524df577a6b069b58208c55521425accd808c41",
+      "sha256": "462b8402283cb9f099e71da3e0232ff91c06a3a6a0a523f31a3ca24716e35326"
+    },
+    {
+      "path": "harw-job-darwin/src/report.rs",
+      "size_bytes": 9034,
+      "git_blob_sha1": "2fd8d0b1f810a696f8e4f2e03838b5fbb75d5bab",
+      "sha256": "521df937acad95b4d2930c6b44dce3168360b4f1062b4b2475bf2b8a81a7662a"
+    },
+    {
+      "path": "dod/crates/harw-dod-bpf/src/real.rs",
+      "size_bytes": 39631,
+      "git_blob_sha1": "d6f6d8d345e2a5ef050b47cd099a594fe5907785",
+      "sha256": "f7607f86b6067c016c9338595e2e016fcb4d213bf94b386f8fdf8f7978a90244"
+    },
+    {
+      "path": "dod/crates/harw-probe-bpf/src/main.rs",
+      "size_bytes": 49134,
+      "git_blob_sha1": "5cf338057f3139cbca959acc5603e77c3a162dd1",
+      "sha256": "eda45efb1bac11a7b50113f5fa7e08dacfe8d515620cefa2d194883875b97649"
+    },
+    {
+      "path": "deploy/systemd/harw-probe-bpf.service",
+      "size_bytes": 2770,
+      "git_blob_sha1": "490190f85c40c8e0c264da47b2a441e2854f742a",
+      "sha256": "ec7b8fcafcf2510e74fc76235578d2f28b75d9520395ed7fd5086af1da1be57f"
+    },
+    {
+      "path": "deploy/systemd/harw-warden.service",
+      "size_bytes": 3457,
+      "git_blob_sha1": "d2a8a01aacee3735606b6fc3c12491cbe370924a",
+      "sha256": "3e15f089c22275c3fae41edf29248a586e40438b126ff53295600882ba3f9650"
+    },
+    {
+      "path": "dod/crates/harw-dod-warden-proto/src/signed.rs",
+      "size_bytes": 53044,
+      "git_blob_sha1": "c932963e74abb34d79386dfb3d1f4c8af085965a",
+      "sha256": "eca8e4537769546644a8923f4089ccd3b302444073398c53973488bd8f5465f1"
+    },
+    {
+      "path": "harw-cli/src/job_worker_intent_cycle.rs",
+      "size_bytes": 64319,
+      "git_blob_sha1": "ba70e901b353c3737d3af46f54ed3719af220933",
+      "sha256": "75d5a6a013965e9b55908d4dc7dd34e1c85e65ae3e2affe4f0a4ad1989cbb509"
+    },
+    {
+      "path": "harw-cli/src/job_worker_work_driver.rs",
+      "size_bytes": 283771,
+      "git_blob_sha1": "a6f4782a04f8e8b56f4458bebc090faea714d1fc",
+      "sha256": "3c544cd388148fea6c8ac19602986c1705aae392ef15064df6459f467554361b"
+    },
+    {
+      "path": "harw-runtime/src/agent_job_wiring.rs",
+      "size_bytes": 43454,
+      "git_blob_sha1": "e1bfa51f5132d1f0cf06125c3d00a85cff00197a",
+      "sha256": "1aace79cefe3d4202b86988e1fdb48a95247681f1b998e9ce0aecef549f244bf"
+    },
+    {
+      "path": "harw-plan-bridge/src/intent_cycle.rs",
+      "size_bytes": 74811,
+      "git_blob_sha1": "95a74ced7c8e4506a787a73265afee7aea053f7f",
+      "sha256": "0e34ce4254130554046639940f2cc1f6acf2807099c5fd1e5485e4b972f269ad"
+    },
+    {
+      "path": "harw-plan-bridge/src/work_driver.rs",
+      "size_bytes": 130294,
+      "git_blob_sha1": "006223d0098f838cdf026012e848759c55c56f76",
+      "sha256": "ebb66b4eaaace5b1d5497dfac22ed4e4ed344f170ed18746394869870d23f7bf"
+    },
+    {
+      "path": "harw-runtime/src/spec.rs",
+      "size_bytes": 42662,
+      "git_blob_sha1": "162f2dc709f2a142d2be136ea62b48609a23018f",
+      "sha256": "a1f8a920610fb3a88754f6aadd782cd46e6669b27ad9afd90bc1791cb6bdc081"
+    },
+    {
+      "path": "harw-job-exec/src/lib.rs",
+      "size_bytes": 4997,
+      "git_blob_sha1": "94a665e7db4f938745717b47e1856b3a17745e5d",
+      "sha256": "6ab0c7a9a8682516cd1d97d9bd55094e8dcdf88544187dd6f86a10537058f1a3"
+    },
+    {
+      "path": "harw-job-executor-bwrap/src/lib.rs",
+      "size_bytes": 4168,
+      "git_blob_sha1": "1a673cd66c31fcf0d36177f80ee579435eb7d378",
+      "sha256": "1e4248ba40e4396a7b0a9b4683e3387a1ec3f5b39f2fa46953b88f3399840959"
+    },
+    {
+      "path": "harw-sandbox/src/bwrap.rs",
+      "size_bytes": 111225,
+      "git_blob_sha1": "32c83874d4370ac9bc05e84e383cada68faa769c",
+      "sha256": "dd2029dc854093e1e698991baa4e10917269cd2fa7321d4fde9fe53489e2610e"
+    },
+    {
+      "path": "harw-runtime/src/embedded.rs",
+      "size_bytes": 34455,
+      "git_blob_sha1": "61abb4a3bdb7a48c6d75b2d5793b8906ee19927b",
+      "sha256": "228d415c4898688120f0d0cc994104f8fe94b6d9fa7bf3dff4741382c6bf1495"
+    },
+    {
+      "path": "dod/crates/harw-dod-bpf/src/contract.rs",
+      "size_bytes": 5836,
+      "git_blob_sha1": "8ff0d35a32fa3332a73223543016b5d65d7e6a59",
+      "sha256": "73870ad682d2156e2e38354c77b2c4ebffa1bb1e6c125d161825165b72d1ec0a"
+    },
+    {
+      "path": "dod/bpf/src/tcp_v4_connect.bpf.c",
+      "size_bytes": 881,
+      "git_blob_sha1": "ab98428f57756fb0a944ddd11864d26d356b4efe",
+      "sha256": "6e5612aa1ffa6871e52b6f7376631a04067e129ecc9c8191846df2d2bef52859"
+    },
+    {
+      "path": "dod/bpf/src/tcp_v6_connect.bpf.c",
+      "size_bytes": 600,
+      "git_blob_sha1": "d0027e4db4005e09f279a933cc727c9bceba822f",
+      "sha256": "75f9f99c538111548647dec8be768d73eae79b1ad8b67c1f1dfc6781dab7860c"
+    },
+    {
+      "path": "harw-runtime/src/assembly.rs",
+      "size_bytes": 467072,
+      "git_blob_sha1": "e97723becb89972bd1159df734fbb3e118f329de",
+      "sha256": "60ffbcbe1da964a783eeccb87fb1b20777beeed58a52633d5cef9505ef659cd7"
+    },
+    {
+      "path": "harw-agent-dsl/src/lib.rs",
+      "size_bytes": 4876,
+      "git_blob_sha1": "4769d74b95b49af149fc18f2c7e5a9459730e373",
+      "sha256": "f24aea956ed795b45ab2a57f6f8c5dd02a705a1723470fd6d0d096dfc8561148"
+    }
+  ],
+  "previous_manuscript_commit": "df08fc77baacacd085e6f5c6a7824f2aa391dedf",
+  "baseline_commit": "14082d16b5e21f920acd2dc0b84ebd42f32ac859"
+}

@@ -1,0 +1,21 @@
+{
+  "schema": "harwness.paper-validation/v1",
+  "date": "2026-10-30",
+  "scope": "Document build, static artifact identity checks and visual review; no Harwness runtime execution",
+  "pdf_pages": 20,
+  "bibliography_entries": 60,
+  "clean_source_build": "passed",
+  "clean_build_text_equals_reviewed_pdf": true,
+  "undefined_references": 0,
+  "overfull_boxes": 0,
+  "underfull_boxes": 2,
+  "underfull_box_review": "minor bibliography spacing only; no clipping or overlap",
+  "http_link_annotations": 130,
+  "unique_link_targets": 71,
+  "pinned_source_links": 96,
+  "all_source_links_use_reviewed_commit": true,
+  "source_blob_identities_checked": 47,
+  "fonts": "all fonts embedded, as checked with pdffonts",
+  "visual_review": "all pages reviewed across main and independent reviews; latest changed appendix and reference pages rechecked",
+  "pdf_sha256": "15b34242b6980c26e4106958dd065bd11c2314356547d610275f7ce3f59bbf7a"
+}

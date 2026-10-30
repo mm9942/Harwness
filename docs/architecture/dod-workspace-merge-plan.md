@@ -25,7 +25,7 @@ graph and the `xtask` gates, not by a second `Cargo.lock`.
 
 | Aspect | Before PL-60 | After PL-60 |
 |---|---|---|
-| Cargo workspaces | 2: root (82 members, `exclude = ["dod"]`) and `dod/` (32 members, `harw-dod/crates/*`) | 1: root, 82 + 32 members; DoD block listed explicitly (no glob, §19) |
+| Cargo workspaces | 2: root (82 members, `exclude = ["dod"]`) and `dod/` (32 members, `dod/crates/*`) | 1: root, 82 + 32 members; DoD block listed explicitly (no glob, §19) |
 | Lockfiles | `Cargo.lock` + `dod/Cargo.lock` | `Cargo.lock` only |
 | `[workspace.package]` | duplicated in both (identical values) | root only |
 | `[workspace.dependencies]` | duplicated; `semver` only in `dod/` | root only; `semver` added to root |
@@ -182,7 +182,7 @@ These must hold after the lock regeneration, measured by the central build:
    under any Warden package.
 5. **One workspace, all DoD crates in the graph.** New xtask test
    `gates::tests::test_dod_crates_are_root_workspace_members` fails if
-   `dod/Cargo.toml` or `dod/Cargo.lock` reappears or a directory under
+   `harw-dod/Cargo.toml` or `harw-dod/Cargo.lock` reappears or a directory under
    `harw-dod/crates/` is missing from the root `members`.
 
 ## 6. Files touched by PL-60

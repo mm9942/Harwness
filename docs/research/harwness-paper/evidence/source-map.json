@@ -1,0 +1,429 @@
+{
+  "repository": "https://github.com/mm9942/Harwness",
+  "commit": "14082d16b5e21f920acd2dc0b84ebd42f32ac859",
+  "files": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "git_blob_sha1": "53850cbda204ee0a0d6ab2c2b313bcb84772c7c0",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/.github/workflows/ci.yml",
+      "bytes": 14156,
+      "sha256": "c5bdcfcb4c9d88210addd6465404aa87b4aad30dd82c3560ea22363ddb614a9f",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "Cargo.toml",
+      "git_blob_sha1": "52e11af7bf0e2020d8aed13e8f3ad3fb7eea1603",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/Cargo.toml",
+      "bytes": 10165,
+      "sha256": "d3bb3d689c6ad2d38fb04c3f718b063003c9e1e7d6a2a106f1c7fa2ab30d5f01",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "deploy/systemd/harw-probe-bpf.service",
+      "git_blob_sha1": "490190f85c40c8e0c264da47b2a441e2854f742a",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/deploy/systemd/harw-probe-bpf.service",
+      "bytes": 2770,
+      "sha256": "ec7b8fcafcf2510e74fc76235578d2f28b75d9520395ed7fd5086af1da1be57f",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "deploy/systemd/harw-warden.service",
+      "git_blob_sha1": "d2a8a01aacee3735606b6fc3c12491cbe370924a",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/deploy/systemd/harw-warden.service",
+      "bytes": 3457,
+      "sha256": "3e15f089c22275c3fae41edf29248a586e40438b126ff53295600882ba3f9650",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "docs/design/harw-memory.md",
+      "git_blob_sha1": "ec7f348f6cc432a4983bb21234df3d6bf6497174",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/design/harw-memory.md",
+      "bytes": 4864,
+      "sha256": "1ad059a01984fbf7aa00262270ca86f2e88df78674fb75616459ce1618837329",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "docs/design/model-registry.md",
+      "git_blob_sha1": "f4ad0b12a9e232e8607ef9daef49a92d009c55e7",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/design/model-registry.md",
+      "bytes": 3985,
+      "sha256": "45ece0759067147b841ca6e5c7e8a201702b3d32ca103ed69549bfae768ade32",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "docs/research/harwness-paper.md",
+      "git_blob_sha1": "f918fc576d048db71d8e9b1327c88e53930d3cec",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/research/harwness-paper.md",
+      "bytes": 59897,
+      "sha256": "38790405ddec4e2850a7b6f03b9824fbec072c37a74ebdd07aca288e4b9cce96",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "dod/README.md",
+      "git_blob_sha1": "ee7bb6a89c42deffb328531bad4198d2d8cba0f9",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/README.md",
+      "bytes": 6126,
+      "sha256": "de60dd9b19297654a945bb092b7ba4eea98a585b5193d3ab283f14a120171445",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "dod/bpf/src/tcp_v4_connect.bpf.c",
+      "git_blob_sha1": "ab98428f57756fb0a944ddd11864d26d356b4efe",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/bpf/src/tcp_v4_connect.bpf.c",
+      "bytes": 881,
+      "sha256": "6e5612aa1ffa6871e52b6f7376631a04067e129ecc9c8191846df2d2bef52859",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "dod/crates/harw-dod-bpf/src/contract.rs",
+      "git_blob_sha1": "8ff0d35a32fa3332a73223543016b5d65d7e6a59",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-bpf/src/contract.rs",
+      "bytes": 5836,
+      "sha256": "73870ad682d2156e2e38354c77b2c4ebffa1bb1e6c125d161825165b72d1ec0a",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "dod/crates/harw-dod-bpf/src/real.rs",
+      "git_blob_sha1": "d6f6d8d345e2a5ef050b47cd099a594fe5907785",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-bpf/src/real.rs",
+      "bytes": 39631,
+      "sha256": "f7607f86b6067c016c9338595e2e016fcb4d213bf94b386f8fdf8f7978a90244",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "dod/crates/harw-dod-warden-proto/src/signed.rs",
+      "git_blob_sha1": "c932963e74abb34d79386dfb3d1f4c8af085965a",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-warden-proto/src/signed.rs",
+      "bytes": 53044,
+      "sha256": "eca8e4537769546644a8923f4089ccd3b302444073398c53973488bd8f5465f1",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "dod/crates/harw-dod-warden/src/warden.rs",
+      "git_blob_sha1": "d665ffc6bc817f71b8fafd12948a67adf42ab3d3",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-warden/src/warden.rs",
+      "bytes": 25373,
+      "sha256": "6b8ccfc5ef4a1306e4338a69f92337baaed831c2c807c62a1bbee97fedbdf746",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "dod/crates/harw-probe-bpf/src/main.rs",
+      "git_blob_sha1": "5cf338057f3139cbca959acc5603e77c3a162dd1",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-probe-bpf/src/main.rs",
+      "bytes": 49134,
+      "sha256": "eda45efb1bac11a7b50113f5fa7e08dacfe8d515620cefa2d194883875b97649",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "dod/crates/harw-warden/src/ipc.rs",
+      "git_blob_sha1": "140477dd2d9755fcc7f6d289c799b6b7d1924d2b",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-warden/src/ipc.rs",
+      "bytes": 15468,
+      "sha256": "ecf247183cfbc5db353be42f9740d78f4aa7727e53f318d2d3725ceb10c1e1ee",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-agent-compiler/src/backend/mod.rs",
+      "git_blob_sha1": "b17adf548509b9344df90b40832bdeea6f42a956",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/backend/mod.rs",
+      "bytes": 12039,
+      "sha256": "f73db6a1fcefe3478e20cc9b1696f31bf8309d049790f219bc46e4298eee8a80",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-agent-compiler/src/compiler.rs",
+      "git_blob_sha1": "d1acbf11b1bdba56d205f4ae903806de6ce36d2c",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/compiler.rs",
+      "bytes": 14897,
+      "sha256": "a15174f06948de701d962f09349053215726679129bc7cb8b7a95bb0a32b653c",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-agent-compiler/src/passes/mod.rs",
+      "git_blob_sha1": "c14a68c5ab97e89af9948f2f4bea2f76504d777e",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/passes/mod.rs",
+      "bytes": 2402,
+      "sha256": "387eef338679eddebb6a805fa4987b39b1f475ecc4d55111b83a9498276163d4",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-agent-compiler/src/passes/rights.rs",
+      "git_blob_sha1": "038df5012d7b7bce354747c8e36b5f078b1030b2",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/passes/rights.rs",
+      "bytes": 7510,
+      "sha256": "1c646209951d0e241ee0aa44a5657f126341008b967ef469503d062865bd5c8c",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-agent-dsl/src/ir_v2.rs",
+      "git_blob_sha1": "e9e7cb22bc4bb226c741a0bfd5e564aa76dc7287",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/ir_v2.rs",
+      "bytes": 59299,
+      "sha256": "72bc1ad2e985df1d3fbd171b5f50104c013bfd671f0d297912cb55f25aa0d7f6",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-agent-dsl/src/lib.rs",
+      "git_blob_sha1": "4769d74b95b49af149fc18f2c7e5a9459730e373",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/lib.rs",
+      "bytes": 4876,
+      "sha256": "f24aea956ed795b45ab2a57f6f8c5dd02a705a1723470fd6d0d096dfc8561148",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-agent-dsl/src/roles.rs",
+      "git_blob_sha1": "0587035916e640022ba262d8d613dc9171b57554",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/roles.rs",
+      "bytes": 14593,
+      "sha256": "349e6f59fb7a0641bba9e9e98d113570457cfb0178cff5f7f152cdf3538b2860",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-authority/src/lib.rs",
+      "git_blob_sha1": "94c3c3bfce5cfe7ff1d2a66447133eb7cd64a48a",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-authority/src/lib.rs",
+      "bytes": 87587,
+      "sha256": "dfea22ab4cf4c3d317ffa193e622e43207733d15645000c007aa4653b9ffe26c",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-cli/src/job_worker_intent_cycle.rs",
+      "git_blob_sha1": "ba70e901b353c3737d3af46f54ed3719af220933",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_intent_cycle.rs",
+      "bytes": 64319,
+      "sha256": "75d5a6a013965e9b55908d4dc7dd34e1c85e65ae3e2affe4f0a4ad1989cbb509",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-cli/src/job_worker_work_driver.rs",
+      "git_blob_sha1": "a6f4782a04f8e8b56f4458bebc090faea714d1fc",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver.rs",
+      "bytes": 283771,
+      "sha256": "3c544cd388148fea6c8ac19602986c1705aae392ef15064df6459f467554361b",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-cli/src/job_worker_work_driver_writer.rs",
+      "git_blob_sha1": "b2c9483ec2f1acc69573776815e3357f1f0c80c8",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver_writer.rs",
+      "bytes": 36515,
+      "sha256": "5416058a411358e944cea4572e283d5d0e15860ddc96328695fb80827c09386a",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-cloud/harw-cloud-gateway/src/proxy.rs",
+      "git_blob_sha1": "614d86e7f8f423eddefda3ad78604d2e34a61ed5",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cloud/harw-cloud-gateway/src/proxy.rs",
+      "bytes": 808,
+      "sha256": "4c0af8374f8c1691ece11fdb61a557fa158ec29f99288cf0c1ccb0986b4fc394",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-job-darwin/src/report.rs",
+      "git_blob_sha1": "2fd8d0b1f810a696f8e4f2e03838b5fbb75d5bab",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-darwin/src/report.rs",
+      "bytes": 9034,
+      "sha256": "521df937acad95b4d2930c6b44dce3168360b4f1062b4b2475bf2b8a81a7662a",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-job-exec/src/lib.rs",
+      "git_blob_sha1": "94a665e7db4f938745717b47e1856b3a17745e5d",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-exec/src/lib.rs",
+      "bytes": 4997,
+      "sha256": "6ab0c7a9a8682516cd1d97d9bd55094e8dcdf88544187dd6f86a10537058f1a3",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-job-executor-bwrap/src/lib.rs",
+      "git_blob_sha1": "1a673cd66c31fcf0d36177f80ee579435eb7d378",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-executor-bwrap/src/lib.rs",
+      "bytes": 4168,
+      "sha256": "1e4248ba40e4396a7b0a9b4683e3387a1ec3f5b39f2fa46953b88f3399840959",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-job-linux/src/sandbox.rs",
+      "git_blob_sha1": "3dc58105a76bd65b3f3115aef1f368add8a42c23",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-linux/src/sandbox.rs",
+      "bytes": 85064,
+      "sha256": "e6771a72a072f33fb8e7007c6479b67012cdf9aee5931eb0f07c7b768b8a4307",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-job-runtime/src/coordinator/linux.rs",
+      "git_blob_sha1": "7bc6f1a148835d6c9891a9cb3531baa7219592e8",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-runtime/src/coordinator/linux.rs",
+      "bytes": 176661,
+      "sha256": "e8d6060966568c614b0837a4a92d8ee99f5279faf75c6ee5605f8a301339770d",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-job-runtime/src/host.rs",
+      "git_blob_sha1": "0524df577a6b069b58208c55521425accd808c41",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-runtime/src/host.rs",
+      "bytes": 82157,
+      "sha256": "462b8402283cb9f099e71da3e0232ff91c06a3a6a0a523f31a3ca24716e35326",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-plan-bridge/src/cycle_runtime.rs",
+      "git_blob_sha1": "dff41410176ca942df729fcce07198cef85bac87",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_runtime.rs",
+      "bytes": 155576,
+      "sha256": "98bdcb0ecfce24f3de9158670533b82d9c4e04264efa6a59cca76df6ec3fea33",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-plan-bridge/src/cycle_spec.rs",
+      "git_blob_sha1": "c11e80b351af99b91dec1d6682460638c1ebd3f7",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_spec.rs",
+      "bytes": 11799,
+      "sha256": "1cebb171c39b85c7d08d2b9eb9727fbcc87bd4c89aa19e75bef5287f1eeb79af",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-plan-bridge/src/cycle_write_admission.rs",
+      "git_blob_sha1": "42a26e9251d9e417d9f8775a5e0c75b236ddec16",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_write_admission.rs",
+      "bytes": 59858,
+      "sha256": "689a31a399c867a9d440b93101de2365a0ee2dba48ab98f2758ac14d9dc35057",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-plan-bridge/src/intent_cycle.rs",
+      "git_blob_sha1": "95a74ced7c8e4506a787a73265afee7aea053f7f",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/intent_cycle.rs",
+      "bytes": 74811,
+      "sha256": "0e34ce4254130554046639940f2cc1f6acf2807099c5fd1e5485e4b972f269ad",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-plan-bridge/src/work_driver.rs",
+      "git_blob_sha1": "006223d0098f838cdf026012e848759c55c56f76",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/work_driver.rs",
+      "bytes": 130294,
+      "sha256": "ebb66b4eaaace5b1d5497dfac22ed4e4ed344f170ed18746394869870d23f7bf",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-runtime/src/agent_job_wiring.rs",
+      "git_blob_sha1": "e1bfa51f5132d1f0cf06125c3d00a85cff00197a",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/agent_job_wiring.rs",
+      "bytes": 43454,
+      "sha256": "1aace79cefe3d4202b86988e1fdb48a95247681f1b998e9ce0aecef549f244bf",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-runtime/src/assembly.rs",
+      "git_blob_sha1": "e97723becb89972bd1159df734fbb3e118f329de",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/assembly.rs",
+      "bytes": 467072,
+      "sha256": "60ffbcbe1da964a783eeccb87fb1b20777beeed58a52633d5cef9505ef659cd7",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-runtime/src/embedded.rs",
+      "git_blob_sha1": "61abb4a3bdb7a48c6d75b2d5793b8906ee19927b",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/embedded.rs",
+      "bytes": 34455,
+      "sha256": "228d415c4898688120f0d0cc994104f8fe94b6d9fa7bf3dff4741382c6bf1495",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-runtime/src/model.rs",
+      "git_blob_sha1": "e882305585ec34289e9d43280cac5b5ff8cdab2b",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/model.rs",
+      "bytes": 61354,
+      "sha256": "76d75bbb762dd6f57a2c1a23dc86e38cce3cfc84abb59541238c8993107d5a1b",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-runtime/src/spec.rs",
+      "git_blob_sha1": "162f2dc709f2a142d2be136ea62b48609a23018f",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/spec.rs",
+      "bytes": 42662,
+      "sha256": "a1f8a920610fb3a88754f6aadd782cd46e6669b27ad9afd90bc1791cb6bdc081",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-sandbox/src/bwrap.rs",
+      "git_blob_sha1": "32c83874d4370ac9bc05e84e383cada68faa769c",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-sandbox/src/bwrap.rs",
+      "bytes": 111225,
+      "sha256": "dd2029dc854093e1e698991baa4e10917269cd2fa7321d4fde9fe53489e2610e",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-tools/src/sandbox_guard.rs",
+      "git_blob_sha1": "24d1ec994470601418b6417652006dc3880ba69a",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-tools/src/sandbox_guard.rs",
+      "bytes": 29061,
+      "sha256": "31cf70938459220b90f5a26876915e790a2fb1bc1ca5a2cae7dbbb6e7132e018",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "harw-types/src/principal.rs",
+      "git_blob_sha1": "330a1be4d9f41cca5f490c7914d1733266ffbadf",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-types/src/principal.rs",
+      "bytes": 16969,
+      "sha256": "8c58e301a8a5b0e025a7218053df02ecf44cd1e8304c520fad38555fc3e3302e",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "git_blob_sha1": "1393932939c95205b6582c46f1e34e9cee785d23",
+      "repository_url": "https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/rust-toolchain.toml",
+      "bytes": 609,
+      "sha256": "6ce991f26933c21310c45060f8dd0b79d3f9a48cfc5edb1e017863e7a004f35e",
+      "locally_inspected_source": true,
+      "local_git_blob_matches": true
+    }
+  ]
+}
