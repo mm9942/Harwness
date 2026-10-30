@@ -1054,12 +1054,14 @@ mod tests {
     async fn job_managed_path_completes_through_job_manager() -> TestResult {
         let dir = tempfile::tempdir()?;
         let config = harw_tool_job::JobManagerConfig::new(dir.path());
-        let job_manager =
-            harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))?;
-        harw_command::install_host_default(&std::env::temp_dir().join(format!(
-            "harw-agent-runner-command-jobs-{}",
-            std::process::id()
-        )));
+        // Keep the command store local to this fixture: SDK tests may install
+        // a global port whose temporary directory has already been removed.
+        let port = harw_command::JobCommandPort::host(&dir.path().join("command-jobs"))?;
+        let job_manager = harw_tool_job::JobManager::with_command_port(
+            config,
+            Arc::new(harw_tool_job::NoopNotifier),
+            Arc::new(port),
+        )?;
         let backend = JobChildBackend::with_spawner_and_job_manager(
             ShellSpawner {
                 script: hello_then_result_script(),
@@ -1084,14 +1086,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let config = harw_tool_job::JobManagerConfig::new(dir.path());
         let recorder = Arc::new(harw_tool_job::RecordingNotifier::default());
-        let job_manager = harw_tool_job::JobManager::new(
+        let port = harw_command::JobCommandPort::host(&dir.path().join("command-jobs"))?;
+        let job_manager = harw_tool_job::JobManager::with_command_port(
             config,
             Arc::clone(&recorder) as Arc<dyn harw_tool_job::JobNotifier>,
+            Arc::new(port),
         )?;
-        harw_command::install_host_default(&std::env::temp_dir().join(format!(
-            "harw-agent-runner-command-jobs-{}",
-            std::process::id()
-        )));
         let backend = JobChildBackend::with_spawner_and_job_manager(
             ShellSpawner {
                 script: hello_then_result_script(),
@@ -1201,12 +1201,14 @@ mod tests {
     async fn job_managed_path_refuses_an_oversized_frame() -> TestResult {
         let dir = tempfile::tempdir()?;
         let config = harw_tool_job::JobManagerConfig::new(dir.path());
-        let job_manager =
-            harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))?;
-        harw_command::install_host_default(&std::env::temp_dir().join(format!(
-            "harw-agent-runner-command-jobs-{}",
-            std::process::id()
-        )));
+        // Keep the command store local to this fixture: SDK tests may install
+        // a global port whose temporary directory has already been removed.
+        let port = harw_command::JobCommandPort::host(&dir.path().join("command-jobs"))?;
+        let job_manager = harw_tool_job::JobManager::with_command_port(
+            config,
+            Arc::new(harw_tool_job::NoopNotifier),
+            Arc::new(port),
+        )?;
         // This variant ends its oversized line; the job tee refuses it by
         // length before the `\n` arrives, like the unterminated one below.
         let script = format!(
@@ -1242,12 +1244,14 @@ mod tests {
     async fn job_managed_path_refuses_an_unterminated_oversized_frame() -> TestResult {
         let dir = tempfile::tempdir()?;
         let config = harw_tool_job::JobManagerConfig::new(dir.path());
-        let job_manager =
-            harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))?;
-        harw_command::install_host_default(&std::env::temp_dir().join(format!(
-            "harw-agent-runner-command-jobs-{}",
-            std::process::id()
-        )));
+        // Keep the command store local to this fixture: SDK tests may install
+        // a global port whose temporary directory has already been removed.
+        let port = harw_command::JobCommandPort::host(&dir.path().join("command-jobs"))?;
+        let job_manager = harw_tool_job::JobManager::with_command_port(
+            config,
+            Arc::new(harw_tool_job::NoopNotifier),
+            Arc::new(port),
+        )?;
         let backend = JobChildBackend::with_spawner_and_job_manager(
             ShellSpawner {
                 script: oversized_frame_script(),
