@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "code_commit": "699857b168e0a8765e33fbe5040899626a196bb3",
+  "recorded_utc": "2026-10-30T09:29:52.690444+00:00",
+  "scope": {
+    "github_branches": 79,
+    "pull_request_heads": 158,
+    "distinct_preserved_source_tips": 174,
+    "workspace_members": 168
+  },
+  "test_environment": {
+    "CARGO_BUILD_JOBS": "1",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+    "CARGO_PROFILE_TEST_DEBUG": "line-tables-only"
+  },
+  "checks": {
+    "workspace_tests": {
+      "command": "cargo test --workspace --all-features --no-fail-fast",
+      "exit_code": 101,
+      "passed": 18545,
+      "failed": 1,
+      "ignored": 202,
+      "log": "workspace-tests-complete.log",
+      "resolution": "Sole failed target was a test-only mismatch with documented environment-value truncation; corrected target rerun below. All other test targets and doc-tests completed successfully. No claim of a single zero-exit full-suite run after that correction."
+    },
+    "gnu_compat_followup": {
+      "command": "cargo test --workspace --all-features --test compat_gnu",
+      "exit_code": 0,
+      "passed": 7,
+      "failed": 0,
+      "log": "compat-gnu-green.log"
+    },
+    "verified_unique_test_results": {
+      "passed_after_target_correction": 18546,
+      "ignored": 202,
+      "unresolved_failures": 0
+    },
+    "gates": {
+      "command": "make gates",
+      "exit_code": 0,
+      "log": "workspace-gates.log",
+      "output": [
+        "/root/.cargo/bin/cargo run -q -p xtask -- gates",
+        "edges: grün (3423 geprüft)",
+        "privileges: grün (6 geprüft)",
+        "warden-dependency-budget: grün (52 geprüft)",
+        "warden-no-c-build: Ausnahme blake3/cc seit 2026-09-13: blake3 kompiliert optional C/Assembler-SIMD; kein Laufzeit-Netz/Privileg",
+        "warden-no-c-build: grün (52 geprüft)",
+        "arch: grün (2568 geprüft)",
+        "spawn: grün (1775 geprüft)"
+      ]
+    },
+    "format": {
+      "command": "cargo fmt --all --check",
+      "exit_code": 0,
+      "log": "final-fmt.log"
+    },
+    "clippy": {
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "log": "workspace-clippy-final.log",
+      "exit_code": 0,
+      "duration": "11m09s"
+    },
+    "paper_scripts": {
+      "passed": 11,
+      "exit_code": 0,
+      "log": "paper-final-tests.log"
+    },
+    "deployment_profile": {
+      "passed": 6,
+      "exit_code": 0,
+      "log": "deployment-profile-tests.log"
+    },
+    "atomic_admission": {
+      "red": "pr116-red-retry.log",
+      "green": "pr116-green.log",
+      "package_tests_passed": 110,
+      "package_log": "pr116-full-lib.log"
+    },
+    "review": {
+      "status": "No unresolved critical or important findings; two minor wording omissions corrected",
+      "artifact": "final-review.json"
+    }
+  },
+  "failed_attempts_and_recovery": [
+    "Initial all-features Clippy exposed optional gateway trait/feature wiring; repaired with fail-closed HTTP501 routing and six package tests.",
+    "Full-debug workspace linking exhausted disk. Removed only regenerable debug build artifacts and used CI debug settings; later stripped only debug symbols from completed generated executables.",
+    "Four agent-runner tests depended on a deleted global test store. Injected per-fixture ports; full library163 tests then passed.",
+    "Recovered role prose exceeded existing1700-byte budgets. Compacted to1633/1683 bytes; full registry375 tests then passed.",
+    "GNU environment compatibility expected unbounded values. Corrected test contract; full seven-test target passed."
+  ],
+  "history_preservation": {
+    "status": "pending"
+  },
+  "remote_actions": {
+    "push": false,
+    "delete_branch": false,
+    "close_pull_request": false
+  },
+  "evidence_directory": "/root/harw-release/branch-consolidation-20261030/evidence"
+}

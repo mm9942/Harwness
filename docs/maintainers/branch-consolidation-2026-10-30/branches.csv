@@ -1,0 +1,80 @@
+branch,sha,review_disposition,local_resolution
+alice/consolidate-20261029,22d325f49effc341fdf436afe94ebc0e98f3f740,history_already_included,Already included in dev ancestry.
+arch/unify-process-runtime,b7bcb91d1c6e4574a3d09c13e05491ab2ba467a8,incorporated_and_superseded,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+ccr-9d1aabdf-v191ts,f2698d744b26b41b860b997c307a2451b508e8fd,mostly_incorporated_with_unintegrated_prototypes,Recover deployment/paper additions through their source branches; preserve current runtime and intentionally replaced OCI architecture.
+ccr-29d4325b-884ntu,571e8aa90cba3e232b576a3537987ef0e5647e88,missing_documentation_translations,Preserve English translations in Git history; do not replace newer documents/configuration for a translation-only branch.
+ccr-54aa3dfd-o46he2,5b33618792620c8c30a7f9a5d35db131175347e5,history_already_included,Already included in dev ancestry.
+ccr-163653c3-ezvkn6,315b80f287552e8cde614782330a27fee4e90d6a,superseded_hard_stop_design,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+ccr-78958671-rsyh1i,2fc72349965f9b31bd0cbd85d2b6674878e0efd3,history_already_included,Already included in dev ancestry.
+ccr-c2654e2c-284ibb,969f3faed3650d8dc8000b0f66dbde54f5e22c39,history_already_included,Already included in dev ancestry.
+ccr-d0359234-af3m9p,a405008f8a61c57c38e468c8408a3265f3d0145a,history_already_included,Already included in dev ancestry.
+ccr-dd5245a1-502ua4,c7ff325fa7f60a95e1f6f4e3ed3536045285460d,history_already_included,Already included in dev ancestry.
+ccr-fe134f37-xdezhn,1d7c4e8b5630b4c062b9cc9e2ac29a1e4e1f7f1f,history_already_included,Already included in dev ancestry.
+chatgpt/async-job-runtime-default,2c4fbc68cad1ba8d3eb2e587059cba6033f38c53,incorporated_and_superseded,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+chatgpt/cloud-home-hub-profiles-v2,6c256cfcf9a5074f05c1da5a17afeff8ac98947c,incorporated_with_newer_review_edits,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+chatgpt/cycle-composed-agents-20261008,2de19c8a60614dc398a73f0326ea033637863e27,partially_incorporated_missing_instruction_improvements,Adapt failure/evidence discipline into current nonblocking role instructions.
+chatgpt/linux-user-cloud-control-20261016,f609f178f5e083deae7b3c8581dafbfe0fc01348,history_already_included,Already included in dev ancestry.
+chatgpt/on-demand-worker-boot,b3d6a779418413be6afc1e654607890ea8c2d143,plan_incorporated_stacked_prototype_missing,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+chatgpt/pl94-chat-first-mini-live-20261009,9dea6a95b3b5d8a7b1c8e95c49f4acffe5d37126,history_already_included,Already included in dev ancestry.
+chatgpt/pl96-capability-closure-20261009,db8c07116a167a121ff9ccfc3f3bf1e3f7f35a93,history_already_included,Already included in dev ancestry.
+chatgpt/pl99-interactive-plan-mode,5d1853a3d94b66034382777ee332ecd0bf352590,history_already_included,Already included in dev ancestry.
+chatgpt/semantic-activity-patterns,2cc179b9c7522ef3ce9ec4896aa1e1a6aa45d581,incorporated_and_implemented,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+chatgpt/tui-control-deck-v2,b3d649137bfb475803206d88d13150a1a9f898e3,incorporated_and_partially_implemented,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+ci-diag/dev-no-failfast,94b957aafe14b025bfe900289d3dd3d4d1f4ed7d,diagnostic_only_not_for_merge,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+codex/assist-153-integration-plan,88653ff81016baeab22ab849f833b777715f82c1,history_already_included,Already included in dev ancestry.
+codex/assist-154-cancelled-rebases,e9443bc0539657bc3ec076ced9f2d704bb230907,already_equivalent,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+codex/assist-156-consumer-provenance,3983e115cd12541d9eb52170cdcb8fca8c01ee39,semantically_superseded_by_broader_fix,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+codex/assist-156-dod-unknown-state,5bb503bcf65cf7e07bd8b4cf69f66e61d713be92,already_equivalent,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+codex/harw-cloud-implementation,4dc053c319c8757809322b9d20fcdd5c5e1553ed,history_already_included,Already included in dev ancestry.
+codex/harw-cloud-integration-plan,d457549a6469b56812fe60d78d11b9cdc8ac267e,history_already_included,Already included in dev ancestry.
+codex/reasoning-tool-context,95aa4f253bd286e082d0d005d1fb131a44b48e98,history_already_included,Already included in dev ancestry.
+consolidate/main,8cdd6b2c8b90a31a60444d85a62d9ca9d81ef6b2,history_already_included,Already included in dev ancestry.
+consolidate-merge-0.9.1,c01749f610c8847f4f127d7fbcb33d1a07c04d60,obsolete_release_merge,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+coop/deployment-profile,3ec23e56cda301d6c5f8a0eec2e2378fc2a288ab,missing_additive_policy_model,Restore pure composition contract and tests; explicitly not runtime enforcement.
+coop/hub-daemon,4d129830725a1889ee967f8eadf60396b5373eff,history_already_included,Already included in dev ancestry.
+coop/pr68-activity-patterns,d9d4bade3dcfd5b493e9c196a1bdd752e0f13d4b,present_and_superseded,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+coop/pr80-worker-boot,8e150a2bdd6cf82397f0e6e414861f92e0adb00e,plan_present_code_prototype_missing_unsafe_to_import,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+coop/pr81-control-deck,5a54c1f01b8237417668648a30cbbad6070c4380,present_and_superseded,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+coop/pr82-cloud-home,1d11c78d9306e1844020ff424740eb045c138de5,present_exact_content,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+coop/proxy-plan,918b5c85643baa33cec329e39a0a6801a5700d07,history_already_included,Already included in dev ancestry.
+coop/tool-index,586cebaf6ee389f4c289dbf856047bc8db402b95,present_and_extended,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+coop/tools-gap,006afe0040b448e6d7e6cde3379f8b9ec1e20926,code_present_historical_document_missing,Restore historical PL87 gap report with dated notice; retain current tunnel implementation.
+copilot/dev-integration-20261004,7b1543aeffe50ca1e85ac9894147260face14100,history_already_included,Already included in dev ancestry.
+copilot/fix-blocking-handoff,ffcd8d09df48e93216cf50bcba3fd5f308b050e2,missing_patch_not_recommended_semantically_wrong,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+dev,287777ba50d1ea02b51951d75823d0ca5c23d6a5,history_already_included,Already included in dev ancestry.
+dev-integrate,66181ffcf849116e8612c9183072446f9c427b3c,history_already_included,Already included in dev ancestry.
+docs/cloud-connect-plan,663b226d8f068b1991a2695933ac2fabeae621dc,history_already_included,Already included in dev ancestry.
+docs/finalize-paper-2026-10-30,3a91be1d80fbee8cec187b22b701e2848191f702,history_already_included,Already included in dev ancestry.
+docs/intent-driven-composed-agents-20261008,5ad86b0c24e14d99d530154061ccfce30444464f,history_already_included,Already included in dev ancestry.
+docs/pl94-adaptive-tui-progress-20261008,4794da952c2c309bd7dfd066bba39f80a873387b,present_and_intentionally_superseded,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+docs/research-paper,543efdb60d135bd657f9bebc9da63f365243a174,present_and_rewritten,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+docs/tool-skill-plan,0eee5dbbb43c8cd33affedc5419cbe6d1bb99078,present_and_updated,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+feat/cloudflare-adaptive-lanes-20261008,51ad032cbea5bd83a4cf1cedfb4c1af881da83e1,present_exact_content,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+feat/common-command-tools,e1e2bb8885ac9ba09d76a4d097a3c8d10bf505be,present_and_extended,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+feat/cycle-coding-wiring,919b91e91b11a5dd8c933a4fd88a95c79837029c,present_and_hardened,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+feat/mias-lab-worker,62effc18d2951e9083e2b7121e7f0d066a8ed721,integrated_and_superseded,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+feat/node-device-cli,7ddfc63b7868c3fd4712509075c95ec320d67f93,integrated_stale_lockfile_only,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+feat/qwen-tool-expert-seed-20261008,5ac080f6d01803a43bd0fe6afa8f7dc356529cdd,integrated_blob_identical,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+feat/skill-triggers,197c9667c433416aec72791de38f13e12f510aaa,integrated_stale_lockfile_only,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+feat/tui-activity-rendering,676b84738baf4dbb1068e8f6a6839dcdab15a976,tui_integrated_builder_intentionally_excluded,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+feat/tui-settings-languages,5ebeffc87bac7e3bac4fdaac1ee81de2fca08c91,history_already_included,Already included in dev ancestry.
+feat/worker-builder-p2,e5aa9cc27a122a8e630bd744307e9684263fc2f3,missing_but_intentionally_superseded_unsafe_to_port,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+feature/telegram-bot-api-10-3-command-registry,91db7b5904de8a0dc200e7945bbf834fe6ab2001,history_already_included,Already included in dev ancestry.
+fix/bug-report-doc-lint,17c50c0d070f2b7419bfba14bfebfeedcf949f27,integrated_blob_identical,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+fix/dev-ci-coherence,3b3fd2fa15156798e0880ff71b9bd052f5eab01b,history_already_included,Already included in dev ancestry.
+fix/pl93-test-portability,ab33dedd54583e2f6572007f91e5610e6b94b1ff,history_already_included,Already included in dev ancestry.
+integration/alice-merge,589d24d10ecb5d23cb0d396affacf41b7ff6821c,history_already_included,Already included in dev ancestry.
+main,843054a35b7eb0297ca26973a4c58cad2ff624af,release_merge_no_unique_tree_content,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+paper/harw-runtime-paper,0a90f12e049a65faad9e263af4be4de46452940a,partly_superseded_docs_genuinely_missing_automation,Restore nine opt-in historical workflow files; preserve newer canonical manuscript and activate nothing.
+pl97/review-fixes,7e96cba627a421be8521c5fbd5b6fc1dc03f51a3,obsolete_coordination_only,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+planning/cycle-coding-orchestration,88653ff81016baeab22ab849f833b777715f82c1,history_already_included,Already included in dev ancestry.
+pr/obsidian-vault-tools,cd5535c42fbfc7fedfee63570a46cd5276c4111f,integrated_and_refined,Retain current dev implementation; preserve this reviewed history without replaying obsolete deltas.
+pr136-coop,c7ff325fa7f60a95e1f6f4e3ed3536045285460d,history_already_included,Already included in dev ancestry.
+pr/136,6c228e017ac74e2420b043559bb2869df4deebb0,history_already_included,Already included in dev ancestry.
+refactor/rename-dod-directory,60592639ad0b7b0094457969c346f071529def1f,genuine_missing_directory_refactor,Included by fast-forward to refreshed online dev 287777ba after PR163 merged externally.
+research/provider-lifecycle-2026-10-14,9291a84d93aac7345205997dd88f8e74255e7245,history_already_included,Already included in dev ancestry.
+research/provider-lifecycle-2026-10-28,4738d41efeb1388f0ceb968b7e96d317bc208375,history_already_included,Already included in dev ancestry.
+sdk/remote-sessions,cf53f73f3b4d8b5d2717a6d8c98bfda059e13655,history_already_included,Already included in dev ancestry.
+security/pl97-review-findings,22b0a27557cc41b22f0789b4a691d770a1485605,history_already_included,Already included in dev ancestry.
+session-client/shared-logic,dd97157f5187acd7a0d96a4082819407bf8806d9,history_already_included,Already included in dev ancestry.
+work/harw-code-and-plans-20261001,20af202b2075acd0f88428f74ee76c165e911afe,history_already_included,Already included in dev ancestry.

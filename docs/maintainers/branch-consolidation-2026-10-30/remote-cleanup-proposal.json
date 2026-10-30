@@ -1,0 +1,325 @@
+{
+  "status": "proposal_only_not_executed",
+  "requires_separate_user_authorization": true,
+  "keep": [
+    "main",
+    "dev"
+  ],
+  "preconditions": [
+    "Verify local consolidated checks and push result separately after user authorization.",
+    "Re-fetch and compare EVERY expected SHA before remote deletion; re-review any moved/new head.",
+    "Retain verified Git bundle and verify every removed head is reachable from accepted main/dev.",
+    "Review PR closure decisions; ancestry-only preservation is not proof that obsolete code was activated."
+  ],
+  "branches_to_delete": [
+    {
+      "name": "alice/consolidate-20261029",
+      "expected_sha": "22d325f49effc341fdf436afe94ebc0e98f3f740"
+    },
+    {
+      "name": "arch/unify-process-runtime",
+      "expected_sha": "b7bcb91d1c6e4574a3d09c13e05491ab2ba467a8"
+    },
+    {
+      "name": "ccr-9d1aabdf-v191ts",
+      "expected_sha": "f2698d744b26b41b860b997c307a2451b508e8fd"
+    },
+    {
+      "name": "ccr-29d4325b-884ntu",
+      "expected_sha": "571e8aa90cba3e232b576a3537987ef0e5647e88"
+    },
+    {
+      "name": "ccr-54aa3dfd-o46he2",
+      "expected_sha": "5b33618792620c8c30a7f9a5d35db131175347e5"
+    },
+    {
+      "name": "ccr-163653c3-ezvkn6",
+      "expected_sha": "315b80f287552e8cde614782330a27fee4e90d6a"
+    },
+    {
+      "name": "ccr-78958671-rsyh1i",
+      "expected_sha": "2fc72349965f9b31bd0cbd85d2b6674878e0efd3"
+    },
+    {
+      "name": "ccr-c2654e2c-284ibb",
+      "expected_sha": "969f3faed3650d8dc8000b0f66dbde54f5e22c39"
+    },
+    {
+      "name": "ccr-d0359234-af3m9p",
+      "expected_sha": "a405008f8a61c57c38e468c8408a3265f3d0145a"
+    },
+    {
+      "name": "ccr-dd5245a1-502ua4",
+      "expected_sha": "c7ff325fa7f60a95e1f6f4e3ed3536045285460d"
+    },
+    {
+      "name": "ccr-fe134f37-xdezhn",
+      "expected_sha": "1d7c4e8b5630b4c062b9cc9e2ac29a1e4e1f7f1f"
+    },
+    {
+      "name": "chatgpt/async-job-runtime-default",
+      "expected_sha": "2c4fbc68cad1ba8d3eb2e587059cba6033f38c53"
+    },
+    {
+      "name": "chatgpt/cloud-home-hub-profiles-v2",
+      "expected_sha": "6c256cfcf9a5074f05c1da5a17afeff8ac98947c"
+    },
+    {
+      "name": "chatgpt/cycle-composed-agents-20261008",
+      "expected_sha": "2de19c8a60614dc398a73f0326ea033637863e27"
+    },
+    {
+      "name": "chatgpt/linux-user-cloud-control-20261016",
+      "expected_sha": "f609f178f5e083deae7b3c8581dafbfe0fc01348"
+    },
+    {
+      "name": "chatgpt/on-demand-worker-boot",
+      "expected_sha": "b3d6a779418413be6afc1e654607890ea8c2d143"
+    },
+    {
+      "name": "chatgpt/pl94-chat-first-mini-live-20261009",
+      "expected_sha": "9dea6a95b3b5d8a7b1c8e95c49f4acffe5d37126"
+    },
+    {
+      "name": "chatgpt/pl96-capability-closure-20261009",
+      "expected_sha": "db8c07116a167a121ff9ccfc3f3bf1e3f7f35a93"
+    },
+    {
+      "name": "chatgpt/pl99-interactive-plan-mode",
+      "expected_sha": "5d1853a3d94b66034382777ee332ecd0bf352590"
+    },
+    {
+      "name": "chatgpt/semantic-activity-patterns",
+      "expected_sha": "2cc179b9c7522ef3ce9ec4896aa1e1a6aa45d581"
+    },
+    {
+      "name": "chatgpt/tui-control-deck-v2",
+      "expected_sha": "b3d649137bfb475803206d88d13150a1a9f898e3"
+    },
+    {
+      "name": "ci-diag/dev-no-failfast",
+      "expected_sha": "94b957aafe14b025bfe900289d3dd3d4d1f4ed7d"
+    },
+    {
+      "name": "codex/assist-153-integration-plan",
+      "expected_sha": "88653ff81016baeab22ab849f833b777715f82c1"
+    },
+    {
+      "name": "codex/assist-154-cancelled-rebases",
+      "expected_sha": "e9443bc0539657bc3ec076ced9f2d704bb230907"
+    },
+    {
+      "name": "codex/assist-156-consumer-provenance",
+      "expected_sha": "3983e115cd12541d9eb52170cdcb8fca8c01ee39"
+    },
+    {
+      "name": "codex/assist-156-dod-unknown-state",
+      "expected_sha": "5bb503bcf65cf7e07bd8b4cf69f66e61d713be92"
+    },
+    {
+      "name": "codex/harw-cloud-implementation",
+      "expected_sha": "4dc053c319c8757809322b9d20fcdd5c5e1553ed"
+    },
+    {
+      "name": "codex/harw-cloud-integration-plan",
+      "expected_sha": "d457549a6469b56812fe60d78d11b9cdc8ac267e"
+    },
+    {
+      "name": "codex/reasoning-tool-context",
+      "expected_sha": "95aa4f253bd286e082d0d005d1fb131a44b48e98"
+    },
+    {
+      "name": "consolidate/main",
+      "expected_sha": "8cdd6b2c8b90a31a60444d85a62d9ca9d81ef6b2"
+    },
+    {
+      "name": "consolidate-merge-0.9.1",
+      "expected_sha": "c01749f610c8847f4f127d7fbcb33d1a07c04d60"
+    },
+    {
+      "name": "coop/deployment-profile",
+      "expected_sha": "3ec23e56cda301d6c5f8a0eec2e2378fc2a288ab"
+    },
+    {
+      "name": "coop/hub-daemon",
+      "expected_sha": "4d129830725a1889ee967f8eadf60396b5373eff"
+    },
+    {
+      "name": "coop/pr68-activity-patterns",
+      "expected_sha": "d9d4bade3dcfd5b493e9c196a1bdd752e0f13d4b"
+    },
+    {
+      "name": "coop/pr80-worker-boot",
+      "expected_sha": "8e150a2bdd6cf82397f0e6e414861f92e0adb00e"
+    },
+    {
+      "name": "coop/pr81-control-deck",
+      "expected_sha": "5a54c1f01b8237417668648a30cbbad6070c4380"
+    },
+    {
+      "name": "coop/pr82-cloud-home",
+      "expected_sha": "1d11c78d9306e1844020ff424740eb045c138de5"
+    },
+    {
+      "name": "coop/proxy-plan",
+      "expected_sha": "918b5c85643baa33cec329e39a0a6801a5700d07"
+    },
+    {
+      "name": "coop/tool-index",
+      "expected_sha": "586cebaf6ee389f4c289dbf856047bc8db402b95"
+    },
+    {
+      "name": "coop/tools-gap",
+      "expected_sha": "006afe0040b448e6d7e6cde3379f8b9ec1e20926"
+    },
+    {
+      "name": "copilot/dev-integration-20261004",
+      "expected_sha": "7b1543aeffe50ca1e85ac9894147260face14100"
+    },
+    {
+      "name": "copilot/fix-blocking-handoff",
+      "expected_sha": "ffcd8d09df48e93216cf50bcba3fd5f308b050e2"
+    },
+    {
+      "name": "dev-integrate",
+      "expected_sha": "66181ffcf849116e8612c9183072446f9c427b3c"
+    },
+    {
+      "name": "docs/cloud-connect-plan",
+      "expected_sha": "663b226d8f068b1991a2695933ac2fabeae621dc"
+    },
+    {
+      "name": "docs/finalize-paper-2026-10-30",
+      "expected_sha": "3a91be1d80fbee8cec187b22b701e2848191f702"
+    },
+    {
+      "name": "docs/intent-driven-composed-agents-20261008",
+      "expected_sha": "5ad86b0c24e14d99d530154061ccfce30444464f"
+    },
+    {
+      "name": "docs/pl94-adaptive-tui-progress-20261008",
+      "expected_sha": "4794da952c2c309bd7dfd066bba39f80a873387b"
+    },
+    {
+      "name": "docs/research-paper",
+      "expected_sha": "543efdb60d135bd657f9bebc9da63f365243a174"
+    },
+    {
+      "name": "docs/tool-skill-plan",
+      "expected_sha": "0eee5dbbb43c8cd33affedc5419cbe6d1bb99078"
+    },
+    {
+      "name": "feat/cloudflare-adaptive-lanes-20261008",
+      "expected_sha": "51ad032cbea5bd83a4cf1cedfb4c1af881da83e1"
+    },
+    {
+      "name": "feat/common-command-tools",
+      "expected_sha": "e1e2bb8885ac9ba09d76a4d097a3c8d10bf505be"
+    },
+    {
+      "name": "feat/cycle-coding-wiring",
+      "expected_sha": "919b91e91b11a5dd8c933a4fd88a95c79837029c"
+    },
+    {
+      "name": "feat/mias-lab-worker",
+      "expected_sha": "62effc18d2951e9083e2b7121e7f0d066a8ed721"
+    },
+    {
+      "name": "feat/node-device-cli",
+      "expected_sha": "7ddfc63b7868c3fd4712509075c95ec320d67f93"
+    },
+    {
+      "name": "feat/qwen-tool-expert-seed-20261008",
+      "expected_sha": "5ac080f6d01803a43bd0fe6afa8f7dc356529cdd"
+    },
+    {
+      "name": "feat/skill-triggers",
+      "expected_sha": "197c9667c433416aec72791de38f13e12f510aaa"
+    },
+    {
+      "name": "feat/tui-activity-rendering",
+      "expected_sha": "676b84738baf4dbb1068e8f6a6839dcdab15a976"
+    },
+    {
+      "name": "feat/tui-settings-languages",
+      "expected_sha": "5ebeffc87bac7e3bac4fdaac1ee81de2fca08c91"
+    },
+    {
+      "name": "feat/worker-builder-p2",
+      "expected_sha": "e5aa9cc27a122a8e630bd744307e9684263fc2f3"
+    },
+    {
+      "name": "feature/telegram-bot-api-10-3-command-registry",
+      "expected_sha": "91db7b5904de8a0dc200e7945bbf834fe6ab2001"
+    },
+    {
+      "name": "fix/bug-report-doc-lint",
+      "expected_sha": "17c50c0d070f2b7419bfba14bfebfeedcf949f27"
+    },
+    {
+      "name": "fix/dev-ci-coherence",
+      "expected_sha": "3b3fd2fa15156798e0880ff71b9bd052f5eab01b"
+    },
+    {
+      "name": "fix/pl93-test-portability",
+      "expected_sha": "ab33dedd54583e2f6572007f91e5610e6b94b1ff"
+    },
+    {
+      "name": "integration/alice-merge",
+      "expected_sha": "589d24d10ecb5d23cb0d396affacf41b7ff6821c"
+    },
+    {
+      "name": "paper/harw-runtime-paper",
+      "expected_sha": "0a90f12e049a65faad9e263af4be4de46452940a"
+    },
+    {
+      "name": "pl97/review-fixes",
+      "expected_sha": "7e96cba627a421be8521c5fbd5b6fc1dc03f51a3"
+    },
+    {
+      "name": "planning/cycle-coding-orchestration",
+      "expected_sha": "88653ff81016baeab22ab849f833b777715f82c1"
+    },
+    {
+      "name": "pr/obsidian-vault-tools",
+      "expected_sha": "cd5535c42fbfc7fedfee63570a46cd5276c4111f"
+    },
+    {
+      "name": "pr136-coop",
+      "expected_sha": "c7ff325fa7f60a95e1f6f4e3ed3536045285460d"
+    },
+    {
+      "name": "pr/136",
+      "expected_sha": "6c228e017ac74e2420b043559bb2869df4deebb0"
+    },
+    {
+      "name": "refactor/rename-dod-directory",
+      "expected_sha": "60592639ad0b7b0094457969c346f071529def1f"
+    },
+    {
+      "name": "research/provider-lifecycle-2026-10-14",
+      "expected_sha": "9291a84d93aac7345205997dd88f8e74255e7245"
+    },
+    {
+      "name": "research/provider-lifecycle-2026-10-28",
+      "expected_sha": "4738d41efeb1388f0ceb968b7e96d317bc208375"
+    },
+    {
+      "name": "sdk/remote-sessions",
+      "expected_sha": "cf53f73f3b4d8b5d2717a6d8c98bfda059e13655"
+    },
+    {
+      "name": "security/pl97-review-findings",
+      "expected_sha": "22b0a27557cc41b22f0789b4a691d770a1485605"
+    },
+    {
+      "name": "session-client/shared-logic",
+      "expected_sha": "dd97157f5187acd7a0d96a4082819407bf8806d9"
+    },
+    {
+      "name": "work/harw-code-and-plans-20261001",
+      "expected_sha": "20af202b2075acd0f88428f74ee76c165e911afe"
+    }
+  ],
+  "open_pull_requests_to_review": []
+}
