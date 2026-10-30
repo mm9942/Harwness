@@ -1,0 +1,74 @@
+% SPDX-License-Identifier: MIT OR Apache-2.0
+% Copyright (c) 2026 Mia
+\documentclass[11pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=25mm,headheight=14pt]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,array,tabularx,longtable}
+\usepackage{enumitem}
+\usepackage{graphicx,xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\usepackage[font=small,labelfont=bf]{caption}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[hyphens]{url}
+\usepackage{xurl}
+\usepackage{needspace,etoolbox,titlesec,fancyhdr,fancyvrb}
+\usepackage[colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue!45!black,bookmarksnumbered=true]{hyperref}
+\hypersetup{
+  pdftitle={Harwness: Policy-First Composition and Durable Execution for Model-Heterogeneous Agents},
+  pdfauthor={Mia},
+  pdfsubject={Architecture and implementation report; preprint version 1.0},
+  pdfkeywords={agent runtime, authority attenuation, durable execution, sandboxing, agent compilation, Rust},
+  pdfcreator={LaTeX with hyperref}
+}
+\newcommand{\artifactshort}{14082d16}
+\newcommand{\artifactcommit}{14082d16b5e21f920acd2dc0b84ebd42f32ac859}
+\newcommand{\artifacttree}{5948efdd459252f70b165e31c4bb6b3f779d94b5}
+\newcommand{\artifactversion}{0.10.0}
+\newcommand{\sourcepath}[1]{\href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/#1}{\nolinkurl{#1}}}
+\urlstyle{tt}
+\setlength{\emergencystretch}{3em}
+\setlength{\parskip}{0.2em}
+\setlength{\parindent}{1em}
+\setlength{\textfloatsep}{15pt plus 3pt minus 2pt}
+\setlist{itemsep=0.25em,topsep=0.4em,leftmargin=*}
+\renewcommand{\arraystretch}{1.16}
+\titleformat{\section}{\large\bfseries}{\thesection}{0.65em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.65em}{}
+\titlespacing*{\section}{0pt}{1.25em}{0.5em}
+\titlespacing*{\subsection}{0pt}{0.95em}{0.35em}
+\pretocmd{\section}{\Needspace{5\baselineskip}}{}{}
+\pretocmd{\subsection}{\Needspace{4\baselineskip}}{}{}
+\clubpenalty=10000
+\widowpenalty=10000
+\displaywidowpenalty=10000
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small Harwness: policy-first agent runtime}
+\fancyhead[R]{\small Preprint v1.0}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.2pt}
+\setlength{\bibsep}{0.25em}
+\title{\vspace{-1.5em}\LARGE\bfseries Harwness: Policy-First Composition and Durable Execution for Model-Heterogeneous Agents}
+\author{Mia\thanks{Copyright \textcopyright\ 2026 Mia. This manuscript and its preparation package are dual-licensed under the MIT License or the Apache License, Version 2.0, at the recipient's option (SPDX: MIT OR Apache-2.0). Third-party works retain their own terms.}}
+\date{\normalsize Architecture and implementation report\\Preprint v1.0 \quad 30 October 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{plain}
+\begin{abstract}
+Tool-using language models can propose actions, but a proposal does not establish the identity, authority, isolation, or durable state required to execute it responsibly. Harwness is a Rust-based agent runtime that places these responsibilities outside the model. This paper presents a source-grounded analysis of its architecture at a fixed repository revision. The system combines ingress-derived runtime profiles, typed principals, compiled agent definitions, attenuated delegation, governed process execution, and persistent work coordination. Its agent compiler lowers versioned definitions into a typed intermediate representation, performs eight ordered validation and resolution passes, and emits portable artifacts or native executables. Its adaptive execution substrate separates model proposals from trusted admission, journals effects before dispatch, fences stale workers, and treats completion as a candidate requiring a distinct acceptance decision. Linux execution uses backend-specific isolation and reports achieved enforcement rather than assuming that requested policy was enforced. An optional host-security subsystem adds eBPF observation, with a separately gated privileged enforcement path whose authorization integration remains incomplete. We distinguish source-observed mechanisms, limited integrations, attributed validation reports, and proposed experiments. The live adaptive-cycle recipe is read-only, while a bounded exact-file editing pilot produces review artifacts; other governed coding paths remain available. No new benchmark results are claimed. The contribution is a traceable systems account and falsifiable evaluation protocol for composing model-independent authority and lifecycle boundaries.
+\end{abstract}
+\noindent\textbf{Artifact:} \href{https://github.com/mm9942/Harwness/commit/14082d16b5e21f920acd2dc0b84ebd42f32ac859}{\texttt{mm9942/Harwness@\artifactshort}} (workspace \artifactversion).\\
+\textbf{Keywords:} agent runtime; authority attenuation; durable execution; agent compilation; Linux isolation.\\
+\textbf{Status:} technical preprint; not peer reviewed.
+
+\input{body.tex}
+\input{endmatter.tex}
+\bibliographystyle{unsrt}
+\bibliography{references}
+\end{document}

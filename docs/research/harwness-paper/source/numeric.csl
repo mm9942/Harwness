@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0" default-locale="en-US">
+  <info>
+    <title>Harwness numeric manuscript references</title>
+    <id>https://github.com/mm9942/Harwness/docs/research/harwness-paper</id>
+    <updated>2026-10-30T00:00:00+00:00</updated>
+  </info>
+  <citation collapse="citation-number">
+    <sort><key variable="citation-number"/></sort>
+    <layout prefix="[" suffix="]" delimiter=", "><text variable="citation-number"/></layout>
+  </citation>
+  <bibliography entry-spacing="1">
+    <layout>
+      <text variable="citation-number" prefix="[" suffix="] "/>
+      <names variable="author" suffix=". "><name delimiter=", " and="text"/></names>
+      <text variable="title" suffix=". "/>
+      <group delimiter=", " suffix=". ">
+        <text variable="container-title" font-style="italic"/>
+        <text variable="volume"/>
+        <text variable="issue" prefix="(" suffix=")"/>
+        <text variable="page" prefix="pp. "/>
+      </group>
+      <date variable="issued" suffix=". "><date-part name="year"/></date>
+      <text variable="note" suffix=" "/>
+      <text variable="URL"/>
+    </layout>
+  </bibliography>
+</style>

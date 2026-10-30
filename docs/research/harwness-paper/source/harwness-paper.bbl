@@ -1,0 +1,433 @@
+\begin{thebibliography}{10}
+
+\bibitem{ref1}
+Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan,
+  and Yuan Cao.
+\newblock {ReAct: Synergizing Reasoning and Acting in Language Models}.
+\newblock arXiv:2210.03629v3, 2023.
+\newblock Version 3, 10 March 2023; first submitted in 2022.
+  \url{https://arxiv.org/abs/2210.03629v3}.
+
+\bibitem{ref2}
+Xingyao Wang, Yangyi Chen, Lifan Yuan, Yizhe Zhang, Yunzhu Li, Hao Peng, and
+  Heng Ji.
+\newblock {Executable Code Actions Elicit Better LLM Agents}.
+\newblock arXiv:2402.01030v4, 2024.
+\newblock Version 4, 7 June 2024. \url{https://arxiv.org/abs/2402.01030v4}.
+
+\bibitem{ref3}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/Cargo.toml}{\nolinkurl{Cargo.toml}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref4}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/assembly.rs}{\nolinkurl{harw-runtime/src/assembly.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref5}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/compiler.rs}{\nolinkurl{harw-agent-compiler/src/compiler.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref6}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/intent_cycle.rs}{\nolinkurl{harw-plan-bridge/src/intent_cycle.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref7}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/README.md}{\nolinkurl{dod/README.md}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref8}
+Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang Zhu,
+  Li~Jiang, Xiaoyun Zhang, Shaokun Zhang, Jiale Liu, Ahmed~Hassan Awadallah,
+  Ryen~W. White, Doug Burger, and Chi Wang.
+\newblock {AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent
+  Conversation}.
+\newblock arXiv:2308.08155v2, 2023.
+\newblock Version 2, 3 October 2023. \url{https://arxiv.org/abs/2308.08155v2}.
+
+\bibitem{ref9}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/research/harwness-paper.md}{\nolinkurl{docs/research/harwness-paper.md}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref10}
+{Harwness contributors}.
+\newblock {Harwness pull request 154: integration and local validation report},
+  2026.
+\newblock Mutable report inspected 2026-10-30; attributed execution, not
+  independently reproduced. \url{https://github.com/mm9942/Harwness/pull/154}.
+
+\bibitem{ref11}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/spec.rs}{\nolinkurl{harw-runtime/src/spec.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref12}
+Jerome~H. Saltzer and Michael~D. Schroeder.
+\newblock {The Protection of Information in Computer Systems}.
+\newblock {\em Proceedings of the IEEE}, 63(9):1278--1308, September 1975.
+\newblock \url{https://web.mit.edu/Saltzer/www/publications/protection/}.
+
+\bibitem{ref13}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-types/src/principal.rs}{\nolinkurl{harw-types/src/principal.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref14}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-authority/src/lib.rs}{\nolinkurl{harw-authority/src/lib.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref15}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/roles.rs}{\nolinkurl{harw-agent-dsl/src/roles.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref16}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/ir_v2.rs}{\nolinkurl{harw-agent-dsl/src/ir_v2.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref17}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/passes/rights.rs}{\nolinkurl{harw-agent-compiler/src/passes/rights.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref18}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/backend/mod.rs}{\nolinkurl{harw-agent-compiler/src/backend/mod.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref19}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/embedded.rs}{\nolinkurl{harw-runtime/src/embedded.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref20}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver.rs}{\nolinkurl{harw-cli/src/job_worker_work_driver.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref21}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/agent_job_wiring.rs}{\nolinkurl{harw-runtime/src/agent_job_wiring.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref22}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_write_admission.rs}{\nolinkurl{harw-plan-bridge/src/cycle_write_admission.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref23}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_runtime.rs}{\nolinkurl{harw-plan-bridge/src/cycle_runtime.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref24}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_spec.rs}{\nolinkurl{harw-plan-bridge/src/cycle_spec.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref25}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver_writer.rs}{\nolinkurl{harw-cli/src/job_worker_work_driver_writer.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref26}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-exec/src/lib.rs}{\nolinkurl{harw-job-exec/src/lib.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref27}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-executor-bwrap/src/lib.rs}{\nolinkurl{harw-job-executor-bwrap/src/lib.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref28}
+{The Linux Kernel Development Community}.
+\newblock {Seccomp BPF (SECure COMPuting with filters)}.
+\newblock Linux 6.12 documentation.
+\newblock Accessed 2026-10-30.
+  \url{https://docs.kernel.org/6.12/userspace-api/seccomp_filter.html}.
+
+\bibitem{ref29}
+Tejun Heo.
+\newblock {Control Group v2}.
+\newblock Linux 6.12 documentation.
+\newblock Accessed 2026-10-30.
+  \url{https://docs.kernel.org/6.12/admin-guide/cgroup-v2.html}.
+
+\bibitem{ref30}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-linux/src/sandbox.rs}{\nolinkurl{harw-job-linux/src/sandbox.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref31}
+Micka{\"e}l Sala{\"u}n and {The Linux Kernel Development Community}.
+\newblock {Landlock: unprivileged access control}.
+\newblock Linux 6.12 documentation, 2024.
+\newblock Dated October 2024; accessed 2026-10-30.
+  \url{https://www.kernel.org/doc/html/v6.12/userspace-api/landlock.html}.
+
+\bibitem{ref32}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-tools/src/sandbox_guard.rs}{\nolinkurl{harw-tools/src/sandbox_guard.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref33}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-sandbox/src/bwrap.rs}{\nolinkurl{harw-sandbox/src/bwrap.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref34}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-runtime/src/coordinator/linux.rs}{\nolinkurl{harw-job-runtime/src/coordinator/linux.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref35}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-runtime/src/host.rs}{\nolinkurl{harw-job-runtime/src/host.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref36}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-bpf/src/real.rs}{\nolinkurl{dod/crates/harw-dod-bpf/src/real.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref37}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/deploy/systemd/harw-probe-bpf.service}{\nolinkurl{deploy/systemd/harw-probe-bpf.service}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref38}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-probe-bpf/src/main.rs}{\nolinkurl{dod/crates/harw-probe-bpf/src/main.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref39}
+{The Linux Kernel Development Community}.
+\newblock {eBPF verifier}.
+\newblock Linux 6.12 documentation.
+\newblock Accessed 2026-10-30.
+  \url{https://docs.kernel.org/6.12/bpf/verifier.html}.
+
+\bibitem{ref40}
+{The Linux Kernel Development Community}.
+\newblock {LSM BPF Programs}.
+\newblock Linux 6.12 documentation.
+\newblock Accessed 2026-10-30.
+  \url{https://docs.kernel.org/6.12/bpf/prog_lsm.html}.
+
+\bibitem{ref41}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-warden/src/ipc.rs}{\nolinkurl{dod/crates/harw-warden/src/ipc.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref42}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-warden/src/warden.rs}{\nolinkurl{dod/crates/harw-dod-warden/src/warden.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref43}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/model.rs}{\nolinkurl{harw-runtime/src/model.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref44}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/design/harw-memory.md}{\nolinkurl{docs/design/harw-memory.md}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref45}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/design/model-registry.md}{\nolinkurl{docs/design/model-registry.md}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref59}
+{Harwness contributors}.
+\newblock {Harwness pull request 161: integration and local validation report},
+  2026.
+\newblock Mutable report inspected 2026-10-30; attributed execution, not
+  independently reproduced. \url{https://github.com/mm9942/Harwness/pull/161}.
+
+\bibitem{ref60}
+{Harwness contributors}.
+\newblock {Harwness: reviewed merge commit and source-tree identity}, 2026.
+\newblock Immutable commit 14082d16b5e21f920acd2dc0b84ebd42f32ac859; tree
+  5948efdd459252f70b165e31c4bb6b3f779d94b5.
+  \url{https://github.com/mm9942/Harwness/commit/14082d16b5e21f920acd2dc0b84ebd42f32ac859}.
+
+\bibitem{ref46}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/.github/workflows/ci.yml}{\nolinkurl{.github/workflows/ci.yml}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref47}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cloud/harw-cloud-gateway/src/proxy.rs}{\nolinkurl{harw-cloud/harw-cloud-gateway/src/proxy.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\bibitem{ref48}
+Edoardo Debenedetti, Jie Zhang, Mislav Balunovi{\'c}, Luca Beurer-Kellner, Marc
+  Fischer, and Florian Tram{\`e}r.
+\newblock {AgentDojo: A Dynamic Environment to Evaluate Prompt Injection
+  Attacks and Defenses for LLM Agents}.
+\newblock arXiv:2406.13352v3, 2024.
+\newblock Version 3, 24 November 2024.
+  \url{https://arxiv.org/abs/2406.13352v3}.
+
+\bibitem{ref49}
+Carlos~E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir
+  Press, and Karthik Narasimhan.
+\newblock {SWE-bench: Can Language Models Resolve Real-World GitHub Issues?}
+\newblock arXiv:2310.06770v3, 2024.
+\newblock ICLR 2024; arXiv version 3, 11 November 2024.
+  \url{https://arxiv.org/abs/2310.06770v3}.
+
+\bibitem{ref50}
+Shunyu Yao, Noah Shinn, Pedram Razavi, and Karthik Narasimhan.
+\newblock {$\tau$-bench: A Benchmark for Tool-Agent-User Interaction in
+  Real-World Domains}.
+\newblock arXiv:2406.12045v1, 2024.
+\newblock Version 1, 17 June 2024. \url{https://arxiv.org/abs/2406.12045v1}.
+
+\bibitem{ref51}
+Sayash Kapoor, Benedikt Stroebl, Zachary~S. Siegel, Nitya Nadgir, and Arvind
+  Narayanan.
+\newblock {AI Agents That Matter}.
+\newblock arXiv:2407.01502v1, 2024.
+\newblock Version 1, 1 July 2024. \url{https://arxiv.org/abs/2407.01502v1}.
+
+\bibitem{ref52}
+Eric Wallace, Kai Xiao, Reimar Leike, Lilian Weng, Johannes Heidecke, and Alex
+  Beutel.
+\newblock {The Instruction Hierarchy: Training LLMs to Prioritize Privileged
+  Instructions}.
+\newblock arXiv:2404.13208v1, 2024.
+\newblock Version 1, 19 April 2024. \url{https://arxiv.org/abs/2404.13208v1}.
+
+\bibitem{ref53}
+Edoardo Debenedetti, Ilia Shumailov, Tianqi Fan, Jamie Hayes, Nicholas Carlini,
+  Daniel Fabian, Christoph Kern, Chongyang Shi, Andreas Terzis, and Florian
+  Tram{\`e}r.
+\newblock {Defeating Prompt Injections by Design}.
+\newblock arXiv:2503.18813v2, 2025.
+\newblock Version 2, 24 June 2025. \url{https://arxiv.org/abs/2503.18813v2}.
+
+\bibitem{ref54}
+{Model Context Protocol contributors}.
+\newblock {Model Context Protocol: Architecture}.
+\newblock Versioned specification, 2025-11-25, 2025.
+\newblock Accessed 2026-10-30; cited for the host responsibility model.
+  \url{https://modelcontextprotocol.io/specification/2025-11-25/architecture}.
+
+\bibitem{ref55}
+{Temporal Technologies}.
+\newblock {What is Temporal?}
+\newblock Documentation.
+\newblock Undated; accessed 2026-10-30.
+  \url{https://docs.temporal.io/temporal}.
+
+\bibitem{ref56}
+Alexandru Agache, Marc Brooker, Andreea Florescu, Alexandra Iordache, Anthony
+  Liguori, Rolf Neugebauer, Phil Piwonka, and Diana-Maria Popa.
+\newblock {Firecracker: Lightweight Virtualization for Serverless
+  Applications}.
+\newblock In {\em 17th USENIX Symposium on Networked Systems Design and
+  Implementation (NSDI 20)}, pages 419--434, Santa Clara, CA, February 2020.
+  USENIX Association.
+\newblock \url{https://www.usenix.org/conference/nsdi20/presentation/agache}.
+
+\bibitem{ref57}
+{gVisor Authors}.
+\newblock {gVisor Security Model}.
+\newblock Documentation.
+\newblock Undated; accessed 2026-10-30.
+  \url{https://gvisor.dev/docs/architecture_guide/security/}.
+
+\bibitem{ref58}
+{Harwness contributors}.
+\newblock {{Harwness}:
+  \href{https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-darwin/src/report.rs}{\nolinkurl{harw-job-darwin/src/report.rs}}}.
+\newblock Immutable repository source, 2026.
+\newblock Commit \texttt{14082d16}; full artifact identifier in Appendix~A.
+
+\end{thebibliography}

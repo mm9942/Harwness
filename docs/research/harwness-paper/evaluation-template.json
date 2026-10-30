@@ -1,0 +1,18 @@
+{
+  "schema": "harwness.paper-evaluation-proposal/v1",
+  "repository_commit": "14082d16b5e21f920acd2dc0b84ebd42f32ac859",
+  "experiment_id": null,
+  "task_fixture_commit": null,
+  "agent_snapshot": null,
+  "toolchain_and_features": null,
+  "kernel_and_sandbox_report": null,
+  "entry_and_effective_authority": null,
+  "model_provider_revision": null,
+  "budget_and_retry_policy": null,
+  "approval_and_failure_injection": null,
+  "useful_completion": null,
+  "prohibited_effect_observed": null,
+  "terminal_state_and_acceptance": null,
+  "cost_latency_tokens_resources": null,
+  "redacted_trace_and_evidence": []
+}

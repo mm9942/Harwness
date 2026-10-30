@@ -1,0 +1,361 @@
+\section{Introduction}
+\label{sec:introduction}
+
+An agentic application is not just a language model with a longer prompt. It includes software that decides which tools exist, identifies their caller, interprets arguments, acquires credentials, creates processes, changes files, persists work, and determines whether a requested outcome has actually been reached. Reasoning-and-action methods such as ReAct make the interaction loop explicit, and code-based action interfaces expand what that loop can express~\cite{ref1,ref2}. Neither an expressive action language nor a persuasive completion message, however, is itself an operating-system permission or a durable record of an external effect.
+
+This distinction becomes more important as agents outlive a single model response. A parent delegates to children; a worker is restarted; a provider becomes unavailable; context is compacted; a remote client reconnects; a command succeeds just before the runtime crashes. Each event raises a systems question independent of the model's reasoning quality. Which authority does the replacement worker inherit? Can it repeat an uncertain side effect? Does a returned patch represent an accepted change, a proposed change, or only text? Does a sandbox label describe a requested policy or an observed enforcement level?
+
+Harwness addresses these questions through a policy-first harness. Its governing design stance is that model output is a proposal to a runtime, rather than a source of authority for that runtime. At the reviewed revision, a common composition layer assembles entry-specific policy, tools, providers, state, and delegation. Definitions of agents are compiled into typed artifacts. Durable job and adaptive-cycle components carry lifecycle information outside the conversation. Linux executors mediate operating-system access, while the optional Detect--Orient--Defend (DoD) subsystem observes selected host activity through a distinct security path~\cite{ref3,ref4,ref5,ref6,ref7}.
+
+Multi-agent coordination is an established design space, with frameworks already providing tools, orchestration, memory, and sandbox integration~\cite{ref8}. The question studied here is how to make the boundaries between definition, authority, execution, and evidence explicit and compositional in one evolving system. A stronger model should be replaceable without silently changing those boundaries. Conversely, even a correct authority check does not make an allowed action semantically wise.
+
+This paper makes three bounded contributions:
+\begin{enumerate}
+  \item A source-grounded description of the current Harwness compilation, runtime, sandbox, and durable-work architecture, with immutable references and an implementation-status matrix.
+  \item A set of explicit intended invariants and failure boundaries connecting definition-time checks to runtime admission, operating-system enforcement, recovery, and completion acceptance.
+  \item A prospective evaluation protocol that separates useful task completion, prohibited effects, crash recovery, and observation quality. The protocol includes negative tests, ablations, uncertainty reporting, and artifact identity.
+\end{enumerate}
+
+The study is an architecture and implementation report. It does not present new measurements of task success, security, latency, or cost. The review found substantial implementation and reported local validation, but did not independently build or execute the Harwness runtime. The compiler provides a developed definition-to-artifact pipeline, while some adaptive writing, deployment, and privileged enforcement paths retain integration limits. Both the implemented mechanisms and their limits are part of the systems account.
+
+\section{Artifact, Method, and Claim Discipline}
+\label{sec:method}
+
+\subsection{Pinned artifact and evidence hierarchy}
+
+The artifact is the repository at commit \artifactshort{}, with the full identifier recorded in Appendix~A. Its workspace metadata declares version 0.10.0, Rust edition 2024, a minimum Rust version of 1.89, and MIT-or-Apache-2.0 software licensing~\cite{ref3}. These are source metadata, not evidence that every supported configuration builds. The manuscript and its preparation package have a separate license statement in the end matter.
+
+The review resolved the current \texttt{dev} head through GitHub and compared all 35 intervening commits against the preceding manuscript's baseline, \texttt{df08fc77}. Representative source paths were selected around authority construction, admission, effect dispatch, persistence, recovery, and privileged execution. Each major implementation claim was mapped to the relevant file and symbol at the pinned revision; Appendix~A provides the source map. The review distinguished executable logic from comments, tests, operational documents, accepted architecture decisions, and plans. It also examined repository and pull-request validation records and checked platform semantics against primary Linux documentation. No runtime tests were executed as part of this study.
+
+The analysis follows the repository's evidence hierarchy, giving current source and Cargo metadata precedence over tests, operational documents, architecture decisions, and planning documents. Source comments identify intended contracts; the cited implementation is the review anchor for a behavioral claim. A selected-path review cannot establish complete mediation across every possible call path, and static inspection does not substitute for execution evidence.
+
+Documentation drift is material. The repository's older research draft names an October 7 baseline, \texttt{90160f4f}, while the present study analyzes \artifactshort{}. The compiler's actual pass list also includes \texttt{DeriveRequirements}, absent from a shorter introductory summary. Current implementation and repository history therefore take precedence over these older status descriptions~\cite{ref9,ref5,ref10}.
+
+\subsection{Four evidence levels}
+
+Four evidence levels are used throughout. \emph{Source-observed} means that a concrete implementation is present in the reviewed paths. \emph{Limited integration} means that the implementation is restricted, gated, or not connected to all intended live paths. \emph{Reported validation} means that a repository or PR records test execution that this study did not reproduce. \emph{Prospective} identifies a design goal or experiment rather than a result. An implementation can occupy more than one level: a validator may be source-observed while its deployed integration remains limited.
+
+Test counts in Section~\ref{sec:implementation} are attributed reports, not a new benchmark dataset. The existence of a test is weaker evidence than its execution; test execution is weaker than coverage of the claimed threat model; deployment status is a separate property from both. These distinctions constrain how the architecture, implementation status, and proposed experiments should be interpreted.
+
+\subsection{Research questions}
+
+\textbf{RQ1: authority.} Can agent definitions and delegation preserve useful expressiveness while preventing model-controlled data from expanding runtime authority?
+
+\textbf{RQ2: recovery.} Can durable state and effect reconciliation avoid silent work loss or blind repetition after interruption?
+
+\textbf{RQ3: enforcement.} Can requested sandbox policy be matched to actual backend capabilities without overstating isolation?
+
+\textbf{RQ4: evidence.} Can the system distinguish proposal, admission, execution, verification, and acceptance across models and interaction surfaces?
+
+The current artifact supplies mechanisms and explicit limitations relevant to these questions. Controlled experiments remain necessary to answer them quantitatively.
+
+\section{System Model and Trust Boundaries}
+\label{sec:system-model}
+
+\subsection{Components and responsibilities}
+
+Figure~\ref{fig:architecture} is an architectural abstraction; it does not assert deployment completeness for every connector. The client plane includes local and remote entry surfaces. The control plane constructs trusted identity, reduces policy, assembles the tool and operation registries, selects providers, and admits work. The execution plane contains model sessions, delegated workers, tools, and governed process backends. The state plane retains sessions, jobs, checkpoints, artifacts, and selected memory independently of prompt history. DoD is an optional peer subsystem with separate authority, rather than an implicit extension of ordinary model privileges.
+
+\input{architecture.tex}
+
+\textbf{Source-observed.} \texttt{RuntimeAssembly} is the shared composition path. Its assembly sequence includes caller narrowing, trusted configuration, project discovery, sandbox and egress policy, a context ceiling, tracing and spawn context, approval, tool and operation registries, providers, contributors, and runtime services~\cite{ref4}. The related \texttt{EntryKind} enumeration contains thirteen variants, including \texttt{SessionHost} and \texttt{CompiledAgent}. Entry kinds preserve distinctions between a web server, a job worker, and an interactive terminal instead of treating them as interchangeable front ends.
+
+The entry profile is a reduction table, not permission supplied by a model. For example, \texttt{SessionHost} has a read/write/process ceiling without network, further narrowed by the connection tier. A compiled agent derives effective rights from its embedded manifest; the generic fallback is not a permissive default. Network permission in a root profile is also only a ceiling: configured egress scope and downstream tool reachability still matter~\cite{ref11}. These mechanisms support policy composition, although the user-facing surfaces do not all provide a complete equivalent workflow.
+
+\subsection{Threat model}
+
+The adversary may control repository content, retrieved text, tool-returned data, generated agent definitions, child-agent outputs, or model proposals. Such inputs may request undelegated tools, broaden a file or network scope, forge a completion claim, replay a stale request, or exploit ambiguity between an admission and a side effect. The model may also err without an adversary. Concurrency, crashes, expired leases, and unavailable dependencies are part of the failure model.
+
+The trusted computing base includes ingress authentication, authority construction, policy and admission code, relevant persistence and executor implementations, selected sandbox components, and the operating system. Trusted code can construct a principal through the intended API; the type system is not an adversarial isolation boundary against malicious code already executing with runtime privileges. A compromised kernel, arbitrary compromise of the trusted runtime, and hardware side channels are outside the protections presented here. Remote provider behavior, data retention, and availability are separate deployment risks.
+
+Application-level capabilities in this paper are grants to perform scoped operations. They are distinct from Linux privilege capabilities such as \texttt{CAP\_BPF}. The terminology follows the broader protection literature, but no unforgeability theorem is claimed for the entire Rust application~\cite{ref12}.
+
+\subsection{Authority attenuation}
+\label{sec:attenuation}
+
+\textbf{Source-observed.} \texttt{Principal} has private fields, is serializable for reporting, and deliberately lacks \texttt{Deserialize}. It is constructed at trusted ingress or derived from a parent. The current child constructor sets the permission tier to the minimum of the parent tier and \texttt{Operator}; role names supplied as data do not deserialize into an authoritative principal~\cite{ref13}.
+
+A useful analytical model is a rights tuple
+\begin{equation}
+  A = (T, F_r, F_w, N, D, C, B),
+  \label{eq:rights}
+\end{equation}
+where $T$ is the tool/operation set, $F_r$ and $F_w$ are readable and writable resources, $N$ is network scope, $D$ is the delegated target set, $C$ is the context ceiling, and $B$ contains ordered limits such as depth and remaining budget. For grants with the same resource interpretation, define $A' \preceq A$ by set inclusion for scoped dimensions and non-increase for ordered limits. This is an analytical model of the contracts; the repository does not expose one universal lattice type.
+
+For ordinary delegation within that common resource interpretation, the intended composition rule is
+\begin{equation}
+  A_{\mathrm{child}} \preceq
+  A_{\mathrm{parent}} \wedge A_{\mathrm{definition}}
+  \wedge A_{\mathrm{role}}^{\mathrm{effective}}
+  \wedge A_{\mathrm{admission}}.
+  \label{eq:attenuation}
+\end{equation}
+The meet notation expresses simultaneous restrictions. The effective role ceiling includes any explicitly authorized role exception, such as the WorkDriver exception discussed in Section~\ref{sec:compiler-passes}. Exact definition grants, remaining depth, and current runtime admission still constrain reachability. The notation does not authorize an exception or establish that every implementation path enforces all dimensions.
+
+\texttt{AuthorityContext} uses restriction/intersection and child-subset checks. A separate trusted derivation permits a same-tenant, harness-owned read-only view with a different workspace binding, without write, execution, or network rights~\cite{ref14}. Because that derivation changes the resource binding, it requires its own admission conditions and is not covered by an unqualified same-resource subset assertion. A test model must include both this read-view exception and the effective WorkDriver role ceiling instead of assuming that all workspace identities and generic role ceilings remain unchanged. Approval resolves whether an already eligible request may proceed; it must not manufacture a missing capability. Exhaustive confirmation of these contracts remains an evaluation target.
+
+\section{Compiling Agent Definitions into Policy-Bearing Artifacts}
+\label{sec:compiler}
+
+\subsection{Definition language and intermediate representation}
+
+\textbf{Source-observed.} The Harwness DSL front end parses TOML, resolves layered definitions and authority constraints, and lowers them into \texttt{AgentIr} version~2. Six authority roles are sealed in Rust: user-interface agent, root orchestrator, child orchestrator, worker, UIA worker, and agent steward. Specialization is configurable; the root role vocabulary is not freely extensible through TOML~\cite{ref15}.
+
+This distinction separates behavior from authority. A definition may specialize a worker for repository exploration without creating a new privilege class. Organizational structures parsed by the DSL should not be confused with a complete executor for every declared clan, cell, or family: the front-end source expressly limits those semantics. Similarly, a schema that can represent a fork or a write request does not imply that the active runtime admits it.
+
+The IR uses strict typed structures and the versioned BLAKE3 snapshot domain \texttt{harwness.agent-ir.snapshot/v7}. Its canonicalization sorts set-valued lists while retaining ordered-list semantics, and omits trace and snapshot fields from the hashed representation. Covered information includes identity, instructions, skills, manifest, execution requirements, and optional WorkDriver configuration~\cite{ref16}. A run can therefore refer to a resolved policy artifact instead of an informal prompt name. A digest detects content mismatch under the hash assumptions; it does not authenticate an author or certify the safety of the represented program.
+
+\subsection{Eight ordered compiler passes}
+\label{sec:compiler-passes}
+
+Table~\ref{tab:compiler-passes} follows the current pass array, which stops on pass errors before constructing the final artifact~\cite{ref5}. Ordering matters. Reachability and pruning precede execution-requirement derivation; child closure then incorporates requirements of embedded children. A backend cannot correctly infer deployment needs from a pre-pruning tool list alone.
+
+\begin{table}[htbp]
+\centering
+\small
+\renewcommand{\arraystretch}{1.16}
+\begin{tabularx}{\linewidth}{@{}r l >{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Order} & \textbf{Pass} & \textbf{Source-observed purpose} \\
+\midrule
+1 & \texttt{ValidateRoles} & Check compilable roles and role-specific delegation structure. \\
+2 & \texttt{RightsCheck} & Reclassify manifest rights and compare with base-role and optional author ceilings. \\
+3 & \texttt{ResolveSkills} & Resolve and embed skills, including their content hashes. \\
+4 & \texttt{ReachableTools} & Resolve required providers and runner features; reject unknown tools. \\
+5 & \texttt{PruneUnusedTools} & Remove tools that the compiled agent cannot reach. \\
+6 & \texttt{ResolveModels} & Resolve model/provider requirements and required environment variables. \\
+7 & \texttt{DeriveRequirements} & Derive target, process, host, network, write, sandbox, resource, and kernel requirements. \\
+8 & \texttt{ChildClosure} & Compile and embed admitted children, check child ceilings, and union execution requirements. \\
+\bottomrule
+\end{tabularx}
+\caption{The eight-pass compiler pipeline. These are implementation mechanisms, not proofs of complete semantic correctness.}
+\label{tab:compiler-passes}
+\end{table}
+
+\texttt{RightsCheck} has a documented WorkDriver tool exception from the base-role ceiling, but not from a supplied author ceiling. The effective role ceiling in Equation~\ref{eq:attenuation} must account for that exception; an unconditional subset of the unmodified generic role would be an inaccurate description. The operative contract includes explicit exceptions, optional inputs, and later runtime reductions. Tests must exercise those details~\cite{ref17}.
+
+\subsection{Artifacts, backends, and runtime revalidation}
+
+\textbf{Source-observed.} The default backend appends an artifact to a compatible prebuilt \texttt{harw-agent-runner}; an artifact-only mode emits \texttt{.harwa}. A second backend generates a Rust crate and invokes Cargo for a native build~\cite{ref18}. These are two backend strategies, rather than three separate compilation semantics. The runtime embedded-artifact path rechecks IR snapshots and referenced blobs~\cite{ref19}.
+
+The compiler aims for stable artifact bytes from the same definition, sources, and compiler version by excluding trace time, host, and absolute paths and by ordering payloads. This is a narrow reproducibility property. It does not establish bit-identical native executables across toolchains, deterministic language-model behavior, or trustworthy supply-chain provenance. Native build dependencies, runner identity, model endpoints, and deployment policy remain part of the experiment identity.
+
+The core separation is
+\begin{equation}
+\text{well-formed artifact} \not\Rightarrow
+\text{authorized effect} \not\Rightarrow
+\text{correct task outcome}.
+\label{eq:separation}
+\end{equation}
+Compilation can reject inconsistent declarations before a model runs. Runtime admission must still bind a particular request to current authority, and independent verification must still assess its result.
+
+\section{Durable Work and Evidence-Controlled Adaptation}
+\label{sec:durability}
+
+\subsection{WorkDriver and adaptive cycles are different mechanisms}
+
+\textbf{Source-observed.} Detached agent work is represented in the shared job ledger with work identifiers, leasing, heartbeat, fencing, and cancellation. WorkDriver is a deterministic supervisor that maps a goal, reports, workers, budget, and time into ordered actions. It manages bounded parallel scopes, suppresses overlapping active paths, continues workers with targeted feedback, and centralizes verification between waves~\cite{ref20,ref21}.
+
+The worker integration persists round state under a live job lease and does not infer successful completion from arbitrary prose when a typed worker report is missing. Its success path proposes achievement; a separate human goal-acceptance action remains required. Its source also disclaims a cross-store/effect transaction and a same-claim concurrent compare-and-swap guarantee. An inline nested-handoff path has a documented pause/resume ownership limitation. Durable jobs therefore do not establish that every nested continuation survives restart exactly once.
+
+Adaptive intent cycles are a separate layer. The model proposes a transition, trusted admission checks it without effects, and a trusted executor carries out admitted work. The proposal vocabulary includes advance, fork, reorientation, revisiting evidence, patch proposals, verification, approval requests, waiting, escalation, blocking, failure, and completion. This type vocabulary is deliberately broader than the currently active recipe~\cite{ref6}.
+
+\subsection{Admission, evidence, and completion}
+
+An admitted cycle transition is not directly deserializable from model output. Resume intersects the stored authority with the current ceiling rather than restoring obsolete rights wholesale. Progress is tied to content-distinct evidence: renaming an artifact with the same digest does not create novelty. Checkpoints retain explicit decisions and evidence, not an assumption that the model's hidden reasoning is a durable state machine.
+
+Three distinctions are central:
+\begin{enumerate}
+  \item \textbf{Patch admission is not a write.} The patch-admission module validates target and preimage authority, but performs no filesystem mutation. Its proof of a checked snapshot is not an enduring grant; a writer must recheck the relevant state at the actual effect boundary~\cite{ref22}.
+  \item \textbf{A worker result is not automatically goal evidence.} Verification must attach an artifact or observation that addresses the acceptance criterion. A model narrative alone is insufficient.
+  \item \textbf{Completion proposed is not completion accepted.} A job may terminate successfully after proposing completion while the user's goal remains unaccepted.
+\end{enumerate}
+
+These contracts reduce semantic ambiguity, but verification quality remains a separate problem. A deterministic content check can be reproducible while being too weak to capture the intended task.
+
+\subsection{Fencing and uncertain effects}
+
+\textbf{Source-observed.} The adaptive-cycle runtime uses per-record locking, atomic replacement with durability steps, fenced compare-and-swap updates, and an epoch coupled to the job lease. The live worker integration additionally installs a \texttt{LeaseLivenessGuard}: its live lease hold addresses the interval after lease expiry but before a replacement worker claims the job. Constructing a \texttt{CycleStore} alone provides epoch fencing without that additional lease-liveness integration. Effects are journaled before dispatch with stable idempotency keys; recovery distinguishes not-started, completed, and uncertain outcomes. An uncertain result escalates instead of automatically replaying the action~\cite{ref23}.
+
+This is a practical response to the gap between local persistence and external effects. Recording an intent before dispatch cannot make an arbitrary remote action transactional. If a crash happens after the remote side effect but before its local acknowledgement, the runtime needs an idempotent endpoint, a state query, or human reconciliation. Exactly-once execution is therefore not a general guarantee. The mechanism provides explicit uncertainty and fencing that can be tested at injected crash points.
+
+The runtime also commits bounded text-free observations with the checkpoint and drains an outbox through a two-phase, idempotent delivery process. Such observations support auditing without requiring raw model text in every event. They do not establish that all possible sensitive data are absent from every other log or store.
+
+\subsection{Current live scope and the exact-file editing pilot}
+
+\textbf{Limited integration.} The public adaptive-cycle specification is read-only: trusted mappings select read targets, and write targets, child targets, and recipe targets are empty. Its live worker integration rebuilds validation, applies a read-only profile, and connects a model proposer to an explorer executor and ceiling reissuer~\cite{ref24}. Claims about arbitrary autonomous research-to-contract-to-code execution would exceed this evidence.
+
+A newer exact-file/natural-prerequisite writer constructs immutable review artifacts in trusted job storage. It does not edit the live checkout, run shell commands or tests, spawn children, or publish changes. At this baseline the pilot accepts at most eight existing regular, single-link UTF-8 files, at most 64~KiB per file, and at most twenty-four replacements; create, delete, and rename operations are excluded. In ordinary topology it returns a blocked receipt requiring review rather than claiming task completion~\cite{ref25}.
+
+This limitation applies to the newer exact-file pilot and the currently admitted adaptive-cycle recipe. Existing governed filesystem, shell, and coding paths remain capable of mutation, and legacy workspace-authority coding is preserved. Keeping these paths distinct prevents both exaggerated autonomy claims and an inaccurate description of the whole system as read-only.
+
+\section{Linux Execution: Requested Policy versus Achieved Enforcement}
+\label{sec:linux}
+
+\subsection{Layered execution rather than one sandbox switch}
+
+\textbf{Source-observed.} The Linux execution architecture separates a planned execution policy from its reported enforcement. The job-execution protocol is fail-closed with respect to required plan/report conditions; the Bubblewrap executor uses an outer stage that joins the cgroup before an inner stage applies mapped Landlock restrictions inside the namespaces. Per-attempt reporting is protected from being substituted by an ordinary workload result~\cite{ref26,ref27}.
+
+These mechanisms have different jobs. Namespaces change the process view; cgroups organize processes and constrain selected resources; Landlock restricts handled access classes; syscall filtering can reduce the exposed kernel interface. None is a substitute for semantic authorization. Linux's seccomp documentation explicitly warns that syscall filtering is not a complete sandbox, while cgroup~v2 provides hierarchical resource controls~\cite{ref28,ref29}. Seccomp is discussed here as platform context, not as a claim that the reviewed job path installs a custom seccomp filter. Enforcement claims therefore need to identify the component, kernel, and configuration.
+
+The reviewed Landlock adapter targets ABI version~5 and reports filesystem enforcement as \texttt{Enforced} only when that target is achieved; older supported behavior is \texttt{Partial}. Network denial remains at most partial because the relevant policy covers TCP bind/connect rather than all communication mechanisms. UDP, raw traffic, and abstract UNIX sockets are not thereby proven confined~\cite{ref30}. Versioned Linux documentation confirms that Landlock network rules in this interface concern TCP ports~\cite{ref31}. A request labelled ``no network'' must therefore be assessed against the executor's complete network boundary, not inferred from one Landlock field.
+
+\subsection{The granularity problem in writable scopes}
+
+An authorization check on an exact file path is not the same as an isolation mechanism that permits only that mutation. Symlinks, path replacement, writable ancestors, inherited descriptors, and concurrent modification can create gaps between a checked pathname and the object eventually changed. Harwness exposes this problem explicitly instead of uniformly widening a request to a whole workspace.
+
+\textbf{Limited integration.} In the tool-level sandbox guard, the new exact-file mutation path fails closed pending an isolated writer backend. The ordinary Bubblewrap launcher keeps a file-scoped workspace read-only rather than silently granting the whole workspace write access~\cite{ref32,ref33}. This explains the candidate-only writer behavior discussed above.
+
+Separately, the per-job \texttt{JobSpec::write\_scope} path is implemented in the Linux coordinator. It narrows the grant, canonicalizes and checks symlinks and ancestors, and allows explicitly granted existing directories. It rejects broader writable ancestor grants that would leave the whole workspace writable; a nonexistent target requires an explicitly granted existing ancestor directory. The path requires both a required sandbox policy and Landlock ABI at least~5, and does not silently fall back when those conditions fail~\cite{ref34}. These are distinct call paths with distinct preconditions. A single status label saying ``file isolation implemented'' would conceal the operational difference.
+
+\subsection{Runtime-independent invariants and their limits}
+
+The runtime should reject a materially changed mandate after its authorization: a different command, workspace, scope, worker, expiry, or usage count is not the same action. It should also refuse a backend that cannot satisfy a required isolation property. Required jobs fail closed when the requested requirements cannot be met; legacy unscoped best-effort jobs may instead select weaker backends or no sandbox, with the corresponding report. Thus, fail-closed behavior must be qualified by the requested requirement mode~\cite{ref35}. These are falsifiable contracts, not a claim that every allowed program is harmless or that a shared host kernel is invulnerable.
+
+This distinction is especially important for code actions. An agent may legally write a file that contains a defect, run an allowed compiler that exhausts an unbounded resource, or return misleading evidence. Sandboxing constrains classes of effects; it does not solve correctness, data minimization, or every denial-of-service risk. Evaluation must therefore measure benign utility, resource behavior, and prohibited effects separately.
+
+\section{eBPF Observation and the Optional DoD Plane}
+\label{sec:dod}
+
+\subsection{What the current sensors observe}
+
+\textbf{Source-observed.} DoD provides a separate host-security domain with sensors, findings, analysis, and a Warden component. The reviewed eBPF sensor uses process execution/exit tracepoints and function-entry probes for \texttt{tcp\_v4\_connect} and \texttt{tcp\_v6\_connect}. The latter observe attempted calls, not proof of successful connections or complete traffic visibility. Older prose describing a different socket-state hook does not reflect the current code. Deployment requires both \texttt{CAP\_BPF} and \texttt{CAP\_PERFMON}; the service explicitly avoids a \texttt{CAP\_SYS\_ADMIN} fallback~\cite{ref36,ref37}.
+
+The cgroup scope has a further limitation: descendant discovery is performed by a userspace scan at a two-second interval, while kernel ancestor matching is recorded as pending. The two-second interval is a nominal scan period, not a measured upper bound on discovery latency. A newly created descendant can therefore fall within a visibility window~\cite{ref38}. Event loss, attachment failure, hook coverage, ordering, and process-to-job correlation must be measured rather than assumed from the presence of an eBPF program.
+
+The eBPF verifier checks properties of a loaded program, such as constrained memory access and helper arguments. It does not verify the correctness of an agent's plan, the completeness of event capture, or the semantic success of a tool call~\cite{ref39}. Tracing and enforcement are also distinct program uses. Linux BPF LSM programs can implement mandatory-access-control or audit hooks, but that does not make every eBPF tracing sensor an enforcement mechanism~\cite{ref40}.
+
+\subsection{Why findings are not enforcement authority}
+
+\textbf{Limited integration.} The intended separation is observation $\rightarrow$ typed finding $\rightarrow$ analysis $\rightarrow$ separately authorized action. At the pinned revision, Warden units are shipped but not automatically enabled; activation is gated by \texttt{/etc/harw-dod/warden.enable}~\cite{ref7}. A default Harwness installation therefore cannot be described as continuously enforcing every analyzed finding.
+
+There is also a concrete security integration gap. The repository contains a richer authorization protocol with MAC, freshness, and nonce concepts, but the reviewed binary inter-process communication (IPC) path still accepts a legacy action envelope. Peer credentials are logged without an implemented UID/PID admission allowlist in that handler, and the action path records omitted freshness and \texttt{authorized\_by} ACL checks~\cite{ref41,ref42}. The deployment socket boundary and default-disabled posture therefore matter. The reviewed path is not a fully connected, signed, replay-protected production enforcement chain.
+
+The immediate research value of DoD is that it exposes where the authority doctrine must continue to hold across a privilege boundary. A future enforced path needs tests showing that a finding, model verdict, stale authorization, or unauthorized peer cannot independently trigger an action. Until the relevant checks are integrated and exercised, that statement remains an acceptance criterion.
+
+\section{Models, Context, and Persistent State}
+\label{sec:models}
+
+\textbf{Source-observed.} The runtime constructs providers behind a shared \texttt{ModelProvider} interface; model selection is separate from principal construction and sandbox assembly~\cite{ref43}. This is the minimum architectural condition for model heterogeneity without making the model itself the authority source. It does not establish that every provider/model combination is equivalent or that role-based routing improves outcomes.
+
+The repository also separates session, job, plan, artifact, memory, and knowledge concerns. Its memory design describes bounded always-loaded material, persistent signals, and tiered consolidation; model-catalog documents distinguish declared API capabilities from observed behavior~\cite{ref44,ref45}. Those documents motivate experiments, but this study does not reproduce memory-retention, routing, or cost claims.
+
+A model descriptor may report tool support or context capacity while saying little about actual schema adherence, recovery from denied calls, or robustness after compaction. A defensible routing policy should record both declared capabilities and measured behavior with explicit versions. Policy should not become weaker merely because a provider accepts a different function-call format. Context reconstruction should retrieve the goal, constraints, and verified evidence rather than treating the model's current transcript as the sole copy of durable state.
+
+There are residual risks. Persisted memory may be stale or poisoned; retrieval may omit a critical constraint; a verifier may share the same failure mode as the worker; a model switch may invalidate assumptions in a task decomposition. These risks belong in the evaluation rather than being hidden behind terms such as ``long-term memory'' or ``model-agnostic.''
+
+\section{Current Implementation Status and Validation Evidence}
+\label{sec:implementation}
+
+Table~\ref{tab:implementation-status} summarizes the scope supported by this review. Observed implementation is distinct from independent testing, deployment, or an established security guarantee.
+
+\begin{table}[htbp]
+\centering
+\small
+\renewcommand{\arraystretch}{1.16}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.205\linewidth} >{\raggedright\arraybackslash}p{0.185\linewidth} >{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Area} & \textbf{Evidence level} & \textbf{What is and is not established} \\
+\midrule
+Runtime/principals & Source-observed & Shared assembly, ingress profiles, typed identity and child-tier reduction; complete call-path coverage not established. \\
+Compiler and IR & Source-observed & Eight passes, versioned snapshot, artifact/runner and native backends; no general semantic or provenance proof. \\
+Durable work & Observed; limited & Ledger, leases, fencing and cycle reconciliation; not universal exactly-once effects or all nested resumes. \\
+Adaptive cycles & Limited integration & Live approved recipe is read-only despite a broader proposal vocabulary. \\
+New exact-file pilot & Limited integration & Bounded review-artifact generation; not live-checkout publication or task acceptance. \\
+Linux isolation & Backend-dependent & Trampoline/reporting and scoped Landlock paths; ABI- and mechanism-specific limitations remain. \\
+DoD/eBPF & Observed; limited & Scoped sensors and findings; coverage window and gated/incomplete Warden authorization integration. \\
+Cloud gateway & Limited integration & Optional proxy remains a placeholder; no end-to-end production deployment was evaluated. \\
+Evaluation & Reported; planned & Attributed local test reports; no newly reproduced benchmark or deployed security result. \\
+\bottomrule
+\end{tabularx}
+\caption{Implementation scope at \artifactshort{}. Exact source anchors are provided in the references and Appendix~A.}
+\label{tab:implementation-status}
+\end{table}
+
+\textbf{Reported validation.} PR~\#161 reports validation on local commit \href{https://github.com/mm9942/Harwness/commit/5ebeffc87bac7e3bac4fdaac1ee81de2fca08c91}{\texttt{5ebeffc8}}. GitHub metadata identifies its tree as \texttt{5948efdd} (full identifier in Appendix~A), the same source tree as the reviewed merge \artifactshort{}~\cite{ref59,ref60}. The report records 18,523 passing workspace tests, zero failures, and 202 ignored tests, including documentation tests; workspace Clippy checks across all targets with warnings denied; formatting checks; six architecture gates; and 15 installer tests. These results concern the reported default-feature validation. An all-features workspace check still fails in the optional cloud proxy placeholder~\cite{ref59}.
+
+Tree identity makes the source relationship explicit; it does not reproduce the reported environment or test execution. The counts remain attributed validation, not independent observations by this study, and cannot be converted into task-success or security percentages. The earlier PR~\#154 report concerns a historical validation point and is not substituted for the current revision's evidence~\cite{ref10}.
+
+The repository's CI workflow is manually dispatched~\cite{ref46}. The reported hosted CI attempt did not start, and at inspection on 30 October 2026 the unfiltered GitHub Actions query for the exact reviewed merge SHA returned zero runs; its combined commit-status record was also empty. These are time-bounded observations of separate GitHub record types, not evidence that hosted tests passed or failed. Later runs may change those records.
+
+Deployment maturity is heterogeneous. The optional gateway proxy identifies itself as a placeholder. The presence of session-host, web, or cloud crates therefore does not demonstrate an end-to-end production deployment~\cite{ref47}. This study performed no independent runtime test execution, installation, privileged activation, or remote deployment.
+
+\section{Prospective Evaluation Protocol}
+\label{sec:evaluation}
+
+\textbf{Prospective.} The following experiments are designed to convert architectural claims into falsifiable evidence. None is reported as completed. The central principle is to measure external state and authoritative decisions, not merely whether a model produces a plausible explanation. AgentDojo motivates adaptive injection testing with utility measurement; SWE-bench motivates task outcomes checked against executable acceptance criteria; repeated reliability and cost-aware evaluation are addressed by $\tau$-bench and \emph{AI Agents That Matter}~\cite{ref48,ref49,ref50,ref51}.
+
+\subsection{E1: compiler and authority composition}
+
+Generate a bounded corpus of valid and invalid definitions, including nested children, unknown tools, role violations, author ceilings, WorkDriver exceptions, impossible backend requirements, and mutated snapshot/blob references. For admitted definitions, compare compiler-derived rights with a separately implemented reference checker. Test determinism of artifact bytes under controlled changes in time, host path, and input ordering, while preserving lists whose order is semantically meaningful.
+
+For delegation, generate trees and mutate one dimension at a time: add a tool, writable path, host, child target, depth, or budget. Record whether the request is rejected at compile time, admission time, or execution time. A candidate falsifier is any admitted child effect outside its effective parent ceiling, with trusted read-view derivation and role exceptions evaluated against their explicit admission conditions. Denials should distinguish policy rejection from malformed input without unnecessarily exposing hidden targets. Report corpus size, mutation coverage, false rejection rate, and unsupported cases; a test suite with no successful escapes is not a proof for untested paths.
+
+\subsection{E2: prompt injection and authorized-but-harmful actions}
+
+Replay the same benign tasks under clean and malicious repository/tool content, using equal model revisions, retry budgets, and resources. Include attempts to invent identity, request undelegated children, swap a mandate after approval, exfiltrate through allowed-looking parameters, and forge evidence. Compare prompt-only guidance with runtime checks in a disposable environment; do not disable protections on a real host for an ablation.
+
+Let $U$ denote useful completion and $V$ a prohibited effect verified in backend state. Report all four outcomes $(U,V)$ rather than only a low attack-success number. An agent that refuses everything may have low $V$ but poor utility. Conversely, a task can be completed while an unrelated prohibited action occurs. Policy definitions and the observation oracle must be published, including what an authorized but semantically harmful action would look like. Runtime capability containment is not a general solution to such actions.
+
+\subsection{E3: crash, replay, and authority change}
+
+Inject interruption before and after admission, durable intent recording, external dispatch, effect completion, checkpoint commit, observation delivery, and parent continuation. Exercise expired leases, stale epochs, cancellation, authority narrowing on resume, and duplicate requests. Use fixtures whose effects can be checked independently: files with preimage hashes, an idempotent mock service, and a deliberately non-idempotent service that exposes the uncertain-outcome case.
+
+Measure recovered jobs, duplicated side effects, lost terminal evidence, repeated tokens, manual interventions, and time to a coherent terminal state. In particular, test the lease-expired-but-not-yet-reclaimed interval and confirm that an uncertain effect is escalated rather than blindly replayed. Separate WorkDriver and adaptive-cycle claims because their persistence contracts differ. This experiment should falsify overly broad exactly-once language if the endpoint cannot support it.
+
+\subsection{E4: sandbox enforcement and write granularity}
+
+Run the same negative fixtures on a matrix of kernels, enabled Landlock ABIs, namespace settings, cgroup delegation, and executor backends. Include symlink replacement, writable ancestors, inherited descriptors, path changes between validation and mutation, and attempts to write outside the declared scope. Test tool-level exact-file operations separately from the implemented per-job write-scope path.
+
+For network behavior, independently test TCP bind/connect, UDP, raw sockets where authorized in the fixture, abstract UNIX sockets, inherited sockets, and alternate egress paths. Record both requested policy and achieved report. A failure is not only an escape; silently reporting full enforcement for a partially implemented policy is itself an incorrect result. All tests should run on disposable hosts or containers with no production data or credentials.
+
+\subsection{E5: observation coverage and privileged enforcement}
+
+Use a known workload trace to measure event recall, duplicate events, delay, drops under backpressure, and process-to-work attribution. Create descendant cgroups at controlled offsets relative to the userspace scan and quantify the coverage window. Report attachment failures and unavailable capabilities as explicit missing observations, not quiet zeros.
+
+Evaluate the Warden path separately only after its intended authorization checks are connected. Attempt unauthorized peers, missing proof, stale timestamps, nonce replay, scope expansion, and fabricated model findings. A successful tracing run is not evidence of a successful enforcement test. Report policy decisions, effects, and residual deployment assumptions independently.
+
+\subsection{E6: end-to-end utility, heterogeneity, and cost}
+
+Select held-out coding and research tasks with predeclared acceptance criteria. Compare a single-model policy, capability-only routing, and behavior-informed routing under equal budgets. Ablate durable reconstruction and bounded context retrieval without changing the task oracle. Record successful completion, false completion proposals, unnecessary delegation, recovery overhead, prompt/output tokens, monetary cost at a recorded price date, wall time, and resource usage.
+
+Use repeated runs and paired tasks. Report denominators, all failures and timeouts, and confidence intervals, with task-level resampling where trials share a task. Repeated all-trials reliability is not the same metric as success in any one of several attempts. Hyperparameter or router tuning must use a separate development set. Numerical improvement claims should be withheld until raw traces, configuration, and executable outcome checks are available.
+
+\subsection{Minimal reproducibility record}
+
+Every run should identify repository commit, lockfile digest, toolchain and features, compiler and agent snapshot, runner/backend identity, policy revision, kernel/configuration, model/provider revision, task fixture, entry kind, effective rights, approvals, seeds where meaningful, budgets, and crash-injection point. Outputs should include structured terminal state, independently checked effects, evidence references, redacted traces, resource/cost measurements, and observation-loss statistics. Appendix~B gives a non-result template. Secrets and private user content must be excluded from public artifacts.
+
+\section{Related Work and Positioning}
+\label{sec:related-work}
+
+ReAct interleaves language-model reasoning and actions, while CodeAct uses executable code as an action representation~\cite{ref1,ref2}. Harwness operates at a different layer: it compiles definitions and constrains execution around such model-driven decisions. Compilation of policy-bearing metadata should not be confused with proving a model-generated program correct.
+
+AutoGen studies configurable multi-agent conversation and coordination~\cite{ref8}. Harwness emphasizes authority attenuation and durable lifecycle around delegation. This is a difference in focus, not evidence that another framework cannot implement comparable controls. Learned instruction hierarchy addresses how models prioritize trusted instructions over lower-trust content~\cite{ref52}; runtime admission remains necessary when the model fails to respect that hierarchy.
+
+CaMeL is particularly relevant because it explicitly separates control flow from untrusted data and uses capability-aware execution to address prompt injection~\cite{ref53}. Moving security boundaries outside model behavior is therefore not an idea originated by Harwness. The distinct subject here is the integration of definition compilation, ingress profiles, durable work, and backend-specific execution in a general-purpose runtime. The present study does not establish an empirical security advantage over CaMeL or other designs.
+
+The Model Context Protocol defines interoperability responsibilities between hosts, clients, and servers, with host-side policy and consent responsibilities~\cite{ref54}. It does not remove the need for the host runtime to derive local authority and preserve lifecycle state. Durable workflow platforms such as Temporal similarly emphasize persistent execution history and recovery~\cite{ref55}. Harwness shares the need for explicit state transitions but does not claim identical replay semantics or arbitrary exactly-once side effects.
+
+Linux mechanisms provide the enforcement substrate rather than a new universal sandbox theorem. Alternative isolation architectures, including microVMs and application-kernel interposition, offer different trust and performance tradeoffs~\cite{ref56,ref57}. They are comparison points, not claimed Harwness dependencies. The principles of least privilege, mediation, and protected authority remain grounded in classical systems security~\cite{ref12}.
+
+\section{Limitations and Research Agenda}
+\label{sec:limitations}
+
+First, this is a selected-path static review, not a complete audit, formal proof, or fresh execution campaign. The source hierarchy improves traceability but cannot eliminate bugs in comments, code, dependencies, deployment configuration, or tests. Explicitly typed authority is useful engineering structure; it is not evidence that every effect is mediated.
+
+Second, multiple scopes of maturity coexist. The agent compiler is implemented, the live adaptive recipe is read-only, older coding paths remain capable of mutation, and the exact-file pilot is intentionally candidate-only. These distinctions must be retained as the repository evolves instead of being collapsed into a single implementation label.
+
+Third, Linux behavior is kernel-, ABI-, privilege-, and backend-dependent. Partial Landlock network controls, inherited resources, namespace configuration, cgroup setup, and a shared kernel all affect the effective boundary. The Darwin report explicitly marks filesystem/network controls partial and Linux-specific primitives unsupported; its current implementation cannot satisfy required jobs~\cite{ref58}. Cross-platform compilation is not isolation parity. The optional DoD path adds privileged components and observation gaps rather than automatically strengthening every runtime operation.
+
+Fourth, durable execution does not make external APIs transactional. A stable idempotency key is helpful only if the receiving system or reconciliation procedure gives it useful semantics. Completion checks can also be incomplete, and a human acceptance step can be mistaken or unavailable. Recovery correctness and goal correctness must remain separate claims.
+
+Fifth, the optional cloud gateway's routing adapter remains a placeholder, and the current validation report identifies an all-features build failure in that component. This study did not exercise pairing, reconnection, remote build authority, or placement; those paths require their own acceptance tests before a production-readiness claim can be assessed. Behavior-aware model routing, memory consolidation, and context selection also remain empirical hypotheses in this paper; no benchmark superiority, economic advantage, or universal prompt-injection resistance is established.
+
+The near-term research agenda is concrete: reproduce the pinned build and targeted tests; complete the exact-file and privileged-authorization integrations without widening fallback authority; add property-based attenuation and backend-report tests; build a crash-injection suite; measure sensor loss and scope latency; and publish held-out utility/security/cost evaluations with redacted traces. These steps directly test the proposed boundaries rather than merely expanding the feature inventory.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Harwness offers a systems artifact for studying how model-driven work can be governed outside the model. At the reviewed revision, concrete mechanisms span agent compilation, trusted runtime composition, attenuated authority, durable coordination, effect reconciliation, and backend-specific sandbox reporting. The review also identifies limits: read-only live adaptive cycles, a candidate-only exact-file pilot, non-universal recovery guarantees, partial network enforcement, observation coverage windows, and an incompletely integrated privileged Warden path.
+
+The supported architectural claim is that agent definitions, authority, execution, evidence, and acceptance can be represented as distinct interfaces whose composition is inspectable and testable. Whether that separation improves containment, reliability, and useful performance remains a question for the reproducible experiments specified here.

@@ -1,0 +1,94 @@
+\section*{Authorship, Assistance, and Availability}
+\addcontentsline{toc}{section}{Authorship, Assistance, and Availability}
+\paragraph{Authorship and assistance.}
+Mia is the sole named author. ChatGPT (OpenAI) assisted with repository inspection, literature checking, manuscript revision, and document preparation. AI tools are not authors. Responsibility for this work remains with the author.
+
+\paragraph{Availability and status.}
+The reviewed software is publicly available at the immutable revision identified in Appendix~\ref{app:artifact}. The accompanying preparation package contains the manuscript source, bibliography, vector architecture figure, build instructions, a source-evidence map, and an unpopulated evaluation template. This technical preprint has not undergone peer review and presents no newly generated experimental dataset.
+
+\paragraph{License.}
+This manuscript and its preparation package are dual-licensed under the MIT License or the Apache License, Version 2.0, at the recipient's option (SPDX: \texttt{MIT OR Apache-2.0}). Complete license texts accompany the package. This manuscript license is explicit and separate from the software's license; third-party works retain their own terms.
+
+\appendix
+\Needspace{10\baselineskip}
+\section{Artifact Identity and Source Map}
+\label{app:artifact}
+\noindent\textbf{Repository:} \url{https://github.com/mm9942/Harwness}.\\
+\textbf{Reviewed commit:} \texttt{\artifactcommit}.\\
+\textbf{Source tree:} \texttt{\artifacttree}.\\
+\textbf{Workspace version:} \artifactversion.\\
+\textbf{Review date:} 30 October 2026.
+
+The previous manuscript snapshot was \texttt{df08fc77baacacd085e6f5c6a7824f2aa391dedf}. The present revision follows the 35 intervening commits to the reviewed \texttt{dev} head. All source links below are pinned to that head. The machine-readable evidence map records paths, symbols or line ranges, and Git blob identities. Pull-request reports remain attributed external records; immutable commit and tree identities are recorded separately.
+
+\begingroup
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{longtable}{@{}p{0.24\textwidth}p{0.73\textwidth}@{}}
+\toprule
+\textbf{Claim area} & \textbf{Representative source paths} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Claim area} & \textbf{Representative source paths (continued)} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+Artifact / earlier draft & \sourcepath{Cargo.toml}; \sourcepath{rust-toolchain.toml}; \sourcepath{docs/research/harwness-paper.md}. \\
+Assembly and entries & \sourcepath{harw-runtime/src/assembly.rs}; \sourcepath{harw-runtime/src/spec.rs}. \\
+Principal / authority & \sourcepath{harw-types/src/principal.rs}; \sourcepath{harw-authority/src/lib.rs}. \\
+DSL and IR & \sourcepath{harw-agent-dsl/src/lib.rs}; \sourcepath{harw-agent-dsl/src/roles.rs}; \sourcepath{harw-agent-dsl/src/ir_v2.rs}. \\
+Compiler passes & \sourcepath{harw-agent-compiler/src/compiler.rs}; \sourcepath{harw-agent-compiler/src/passes/mod.rs}; \sourcepath{harw-agent-compiler/src/passes/rights.rs}. \\
+Backend / validation & \sourcepath{harw-agent-compiler/src/backend/mod.rs}; \sourcepath{harw-runtime/src/embedded.rs}. \\
+Durable delegation & \sourcepath{harw-runtime/src/agent_job_wiring.rs}. \\
+WorkDriver & \sourcepath{harw-plan-bridge/src/work_driver.rs}; \sourcepath{harw-cli/src/job_worker_work_driver.rs}. \\
+Adaptive admission & \sourcepath{harw-plan-bridge/src/intent_cycle.rs}; \sourcepath{harw-plan-bridge/src/cycle_write_admission.rs}. \\
+Adaptive durability & \sourcepath{harw-plan-bridge/src/cycle_runtime.rs}. \\
+Read-only live cycle & \sourcepath{harw-plan-bridge/src/cycle_spec.rs}; \sourcepath{harw-cli/src/job_worker_intent_cycle.rs}. \\
+Exact-file pilot & \sourcepath{harw-cli/src/job_worker_work_driver_writer.rs}. \\
+Write guard & \sourcepath{harw-tools/src/sandbox_guard.rs}; \sourcepath{harw-sandbox/src/bwrap.rs}. \\
+Executor and ABI & \sourcepath{harw-job-exec/src/lib.rs}; \sourcepath{harw-job-executor-bwrap/src/lib.rs}; \sourcepath{harw-job-linux/src/sandbox.rs}; \sourcepath{harw-job-runtime/src/coordinator/linux.rs}. \\
+Models and memory & \sourcepath{harw-runtime/src/model.rs}; \sourcepath{docs/design/model-registry.md}; \sourcepath{docs/design/harw-memory.md}. \\
+DoD sensor contract & \sourcepath{dod/crates/harw-dod-bpf/src/real.rs}; \sourcepath{dod/crates/harw-dod-bpf/src/contract.rs}; \sourcepath{dod/bpf/src/tcp_v4_connect.bpf.c}. \\
+DoD scope / privileges & \sourcepath{dod/crates/harw-probe-bpf/src/main.rs}; \sourcepath{deploy/systemd/harw-probe-bpf.service}. \\
+Warden integration & \sourcepath{dod/crates/harw-warden/src/ipc.rs}; \sourcepath{dod/crates/harw-dod-warden/src/warden.rs}; \sourcepath{dod/crates/harw-dod-warden-proto/src/signed.rs}; \sourcepath{deploy/systemd/harw-warden.service}. \\
+Platform / fallback & \sourcepath{harw-job-darwin/src/report.rs}; \sourcepath{harw-job-runtime/src/host.rs}. \\
+CI / cloud scope & \sourcepath{.github/workflows/ci.yml}; \sourcepath{harw-cloud/harw-cloud-gateway/src/proxy.rs}. \\
+\end{longtable}
+\endgroup
+
+\section{Falsifiers and Reproducibility Template}
+\label{app:falsifiers}
+The following are counterexamples to the intended contracts, not observations reported by this study:
+\begin{itemize}
+\item A model-controlled field creates a trusted principal or broadens a grant without trusted admission.
+\item An ordinary child effect exceeds the parent's effective scope under the same resource interpretation, or a trusted read-view exception grants write, execution, or network authority.
+\item A resumed cycle restores revoked authority, or a stale live-worker lease holder commits an effect or checkpoint.
+\item A backend reports full enforcement when a required mechanism is absent or only partially effective.
+\item A content-identical renamed artifact counts as novel progress, or a completion proposal is silently accepted as the human goal.
+\item An uncertain side effect is repeated without reconciliation, or a finding alone triggers privileged enforcement.
+\end{itemize}
+The companion \texttt{evaluation-template.json} supplies the following non-result schema. Null fields deliberately indicate measurements that have not been performed; they are not zero-valued observations.
+
+\begin{Verbatim}[fontsize=\small,frame=single,framesep=7pt]
+{
+  "schema": "harwness.paper-evaluation-proposal/v1",
+  "repository_commit":
+    "14082d16b5e21f920acd2dc0b84ebd42f32ac859",
+  "experiment_id": null,
+  "task_fixture_commit": null,
+  "agent_snapshot": null,
+  "toolchain_and_features": null,
+  "kernel_and_sandbox_report": null,
+  "entry_and_effective_authority": null,
+  "model_provider_revision": null,
+  "budget_and_retry_policy": null,
+  "approval_and_failure_injection": null,
+  "useful_completion": null,
+  "prohibited_effect_observed": null,
+  "terminal_state_and_acceptance": null,
+  "cost_latency_tokens_resources": null,
+  "redacted_trace_and_evidence": []
+}
+\end{Verbatim}
