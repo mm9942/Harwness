@@ -302,7 +302,7 @@ The workspace is intentionally split into small crates with explicit ownership b
 | Channels / MCP | `harw-channel*`, `harw-mcp-server`, `harw-mcp-client` |
 | Browser / web | `harw-browser*`, `harw-web`, `harw-egress` |
 | SDK / extensions | `harwness-sdk`, `harw-extension-api` |
-| DoD | `dod/crates/harw-dod-*`, `harw-sentinel`, `harw-warden`, probe crates |
+| DoD | `harw-dod/crates/harw-dod-*`, `harw-sentinel`, `harw-warden`, probe crates |
 
 Workspace membership does not imply arbitrary dependency permission. Architecture gates enforce dependency and privileged-TCB constraints separately.
 

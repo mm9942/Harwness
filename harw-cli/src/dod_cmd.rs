@@ -32,7 +32,7 @@
 //! code of `doctor`.
 //!
 //! # Service control (root only)
-//! The mutating actions mirror `dod/Makefile` and `dod/scripts/service.sh`
+//! The mutating actions mirror `harw-dod/Makefile` and `harw-dod/scripts/service.sh`
 //! step by step; they only call `systemctl` and write the one Warden flag
 //! file, and never run `cargo` or `make`:
 //!
@@ -1500,7 +1500,7 @@ fn warden_disable(env: &DodEnv, system: &mut dyn System) -> Outcome {
 fn install(print_systemd: Option<Option<String>>) -> Outcome {
     let Some(unit) = print_systemd else {
         let text = "`harw dod install`: only `--print-systemd [UNIT]` exists; the Harw-DoD units \
-                    are installed by `sudo make -C dod install`.";
+                    are installed by `sudo make -C harw-dod install`.";
         return Outcome::new(EXIT_USAGE, text, json!({ "error": text }));
     };
     match harw_install::print_systemd(unit.as_deref(), &RenderPaths::default()) {

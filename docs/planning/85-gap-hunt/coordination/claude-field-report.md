@@ -229,7 +229,7 @@ So the UIA sent host work to the two read-only children. That is a model routing
 
 **Where the fixes live.** Both crates are layer A in `xtask/arch-policy.toml` (`harw-ops` at :324, `harw-registry-defaults` at :336). Only text and data change; there is no new API.
 
-**Build rule.** I ran no cargo or rustc and added no tests. The central build must run: `cargo fmt --all`; `cargo clippy --workspace -D warnings`; `cargo test -p harw-ops -p harw-registry-defaults` (including the golden IR test `tests/context_program_golden.rs` and `embedded_agents` tests) plus the full workspace tests and doctests; `cargo run -q -p xtask -- gates`; `cargo deny check`; `make -C dod clippy test`; `actionlint`.
+**Build rule.** I ran no cargo or rustc and added no tests. The central build must run: `cargo fmt --all`; `cargo clippy --workspace -D warnings`; `cargo test -p harw-ops -p harw-registry-defaults` (including the golden IR test `tests/context_program_golden.rs` and `embedded_agents` tests) plus the full workspace tests and doctests; `cargo run -q -p xtask -- gates`; `cargo deny check`; `make -C harw-dod clippy test`; `actionlint`.
 
 ### F6-delegate-refused: defect
 
@@ -393,6 +393,6 @@ Tests I added: none (read-only). The central build must run, in this order:
 3. `cargo test --workspace` (including doc tests), in particular `-p harw-core guard` and `-p harw-config --test config_scope_merge`
 4. `cargo run -q -p xtask -- gates`
 5. `cargo deny check`
-6. `make -C dod clippy test`
+6. `make -C harw-dod clippy test`
 7. `actionlint`
 

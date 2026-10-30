@@ -3,7 +3,7 @@
 //!
 //! The file-system side is read at test time from
 //! `CARGO_MANIFEST_DIR/..` (the repository root), so these tests compare the
-//! compiled-in text with the tree that `dod/scripts/install.sh` installs from.
+//! compiled-in text with the tree that `harw-dod/scripts/install.sh` installs from.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -300,8 +300,8 @@ fn test_assets_are_sorted_unique_and_kinded_by_extension() {
 
 #[test]
 fn test_dod_manifest_matches_the_dod_package_assets() -> TestResult {
-    let manifest = fs::read_to_string(repo_root().join("dod/packaging/manifest"))
-        .map_err(ctx("read dod/packaging/manifest"))?;
+    let manifest = fs::read_to_string(repo_root().join("harw-dod/packaging/manifest"))
+        .map_err(ctx("read harw-dod/packaging/manifest"))?;
     let mut manifested = BTreeSet::new();
     for line in manifest.lines().map(str::trim) {
         let mapped = if let Some(name) = line.strip_prefix("systemd/") {
@@ -318,7 +318,7 @@ fn test_dod_manifest_matches_the_dod_package_assets() -> TestResult {
     let package: BTreeSet<String> = DOD_PACKAGE_ASSETS.iter().map(|p| (*p).to_owned()).collect();
     assert_eq!(
         manifested, package,
-        "dod/packaging/manifest and DOD_PACKAGE_ASSETS disagree"
+        "harw-dod/packaging/manifest and DOD_PACKAGE_ASSETS disagree"
     );
     for path in DOD_PACKAGE_ASSETS {
         assert!(
@@ -331,8 +331,8 @@ fn test_dod_manifest_matches_the_dod_package_assets() -> TestResult {
 
 #[test]
 fn test_dod_installer_installs_exactly_the_package_units_from_deploy() -> TestResult {
-    let script = fs::read_to_string(repo_root().join("dod/scripts/install.sh"))
-        .map_err(ctx("read dod/scripts/install.sh"))?;
+    let script = fs::read_to_string(repo_root().join("harw-dod/scripts/install.sh"))
+        .map_err(ctx("read harw-dod/scripts/install.sh"))?;
     let line = script
         .lines()
         .find_map(|l| l.strip_prefix("dod_units='"))
@@ -361,18 +361,18 @@ fn test_dod_installer_installs_exactly_the_package_units_from_deploy() -> TestRe
     }
     assert!(
         !script.contains("packaging_dir/systemd") && !script.contains("packaging/systemd"),
-        "install.sh must not read the deleted dod/packaging/systemd tree"
+        "install.sh must not read the deleted harw-dod/packaging/systemd tree"
     );
     Ok(())
 }
 
 #[test]
 fn test_no_duplicate_unit_tree_remains_under_dod_packaging() {
-    let packaging = repo_root().join("dod/packaging");
+    let packaging = repo_root().join("harw-dod/packaging");
     for stale in ["systemd", "sysusers.d", "tmpfiles.d"] {
         assert!(
             !packaging.join(stale).exists(),
-            "dod/packaging/{stale} must not exist: deploy/ is the only source"
+            "harw-dod/packaging/{stale} must not exist: deploy/ is the only source"
         );
     }
 }

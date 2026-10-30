@@ -247,7 +247,7 @@ The CryptGuard side is handled by the separate CryptGuard plan. Harwness should 
 Recommended new Harwness-side crates:
 
 ```text
-dod/crates/harw-dod-encrypt/
+harw-dod/crates/harw-dod-encrypt/
     Harw crypto profiles
     Harw key-purpose vocabulary
     secure-frame / binding protocol
@@ -1387,7 +1387,7 @@ The current repository has both:
 
 ```text
 deploy/systemd/*
-dod/packaging/systemd/*
+harw-dod/packaging/systemd/*
 ```
 
 and the files already differ materially in path/user/group/runtime behavior.
@@ -1888,7 +1888,7 @@ Deliverables:
 - record CryptGuard service API version/commit used by the branch
 - re-run `harw-secrets` KATs
 - document stale 3.0.1 references
-- document current `deploy/systemd` vs `dod/packaging/systemd` divergence
+- document current `deploy/systemd` vs `harw-dod/packaging/systemd` divergence
 - assert no existing DoD privilege boundary is changed
 
 Exit:
@@ -2113,7 +2113,7 @@ harw-runtime/src/services.rs
 harw-runtime/src/contributors.rs
 harw-secrets/src/*
 harw-types/src/principal.rs
-dod/packaging/*
+harw-dod/packaging/*
 deploy/systemd/*
 ```
 

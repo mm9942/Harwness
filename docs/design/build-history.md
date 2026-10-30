@@ -70,7 +70,7 @@ crates with one responsibility:
   family: `harw-tool-shell`, `harw-tool-fs`, `harw-tool-web`, `harw-tool-browser`,
   `harw-tool-process`, `harw-tool-plan`, `harw-tool-lens`, `harw-tool-doc`,
   `harw-tool-explorer`, `harw-tool-deps`.
-- **Security / DoD (Defense-of-Depth)** — the crates under `dod/crates/`
+- **Security / DoD (Defense-of-Depth)** — the crates under `harw-dod/crates/`
   (27 sensor, rule, and escalation crates prefixed `harw-dod-*`, the
   `harw-dod` facade, plus the binaries `harw-sentinel`, `harw-probe-bpf`,
   `harw-probe-fs` and `harw-warden`). Originally a separate, excluded

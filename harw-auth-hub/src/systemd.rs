@@ -1,6 +1,6 @@
 //! systemd socket activation (`LISTEN_PID`/`LISTEN_FDS`), without `unsafe`.
 //!
-//! Same approach as `dod/crates/harw-warden/src/systemd.rs`: the two
+//! Same approach as `harw-dod/crates/harw-warden/src/systemd.rs`: the two
 //! environment variables are validated by hand in pure, testable functions
 //! ([`verify_listen_pid`], [`verify_listen_fds_count`]); only the final
 //! integer → `OwnedFd` conversion, which cannot be written without `unsafe`,

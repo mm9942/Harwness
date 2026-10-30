@@ -39,7 +39,7 @@ rustix = { workspace = true, features = ["process", "event", "thread", "fs"] }
 # 0.18: first release on rustix 1.x (0.17 still pulls rustix 0.38), declared
 # MSRV 1.70. No default features: no chrono, no flate2.
 procfs = { workspace = true, optional = true }
-# Same version as the dod/ crates (harw-probe-fs, harw-sentinel, harw-warden).
+# Same version as the harw-dod/ crates (harw-probe-fs, harw-sentinel, harw-warden).
 landlock = { workspace = true, optional = true }
 cap-std = { workspace = true, optional = true }
 

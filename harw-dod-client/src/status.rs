@@ -24,7 +24,7 @@ use crate::health::{HealthReport, read_health};
 use crate::paths::{ExportPaths, SYSTEM_EXPORT_DIR, resolve_export_paths_with};
 use crate::units::{UnitState, UnitStatus, unit_states_in};
 
-/// Where `make -C dod install` puts the daemons.
+/// Where `make -C harw-dod install` puts the daemons.
 pub const LIBEXEC_DIR: &str = "/usr/local/libexec/harw-dod";
 
 /// The Warden guard file (`ConditionPathExists=` of the Warden units).
@@ -90,7 +90,7 @@ impl DodClientContext {
 
 /// Whether the daemons are installed in the checked libexec directory.
 ///
-/// Only the configured directory is looked at (`dod/Makefile` lets
+/// Only the configured directory is looked at (`harw-dod/Makefile` lets
 /// `PREFIX`/`LIBEXECDIR` move it); [`DodStatus::suite_installed`] also
 /// counts the units systemd knows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,7 +329,7 @@ pub fn install_state(libexec_dir: &Path) -> InstallState {
 ///   without the guard file (`ConditionPathExists=` is evaluated only when
 ///   the unit starts, so removing the flag leaves a listening socket up);
 /// - socket enabled (`UnitFileState=enabled`/`enabled-runtime`) and the
-///   guard file present ⇒ [`WardenState::Enabled`] (`make -C dod
+///   guard file present ⇒ [`WardenState::Enabled`] (`make -C harw-dod
 ///   enable-warden` state); an uncheckable guard ⇒ [`WardenState::Unknown`];
 /// - any other reported socket state ⇒ [`WardenState::Disabled`].
 ///

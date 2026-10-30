@@ -1667,12 +1667,12 @@ fn tool_check(env: &DoctorEnv, name: &str) -> DoctorCheck {
     }
 }
 
-/// Runs the read-only prerequisite checks of `dod/scripts/doctor.sh` that
+/// Runs the read-only prerequisite checks of `harw-dod/scripts/doctor.sh` that
 /// matter for running the suite, plus the install, unit, config and export
 /// state of `snapshot`.
 ///
 /// The build-from-source toolchain checks of `doctor.sh` (rustc, cargo,
-/// clang, bpftool, python3) are left to `make -C dod doctor`. Nothing is
+/// clang, bpftool, python3) are left to `make -C harw-dod doctor`. Nothing is
 /// changed or started.
 #[must_use]
 pub fn doctor(env: &DoctorEnv, snapshot: &DodSnapshot) -> DoctorReport {
@@ -1717,7 +1717,7 @@ pub fn doctor(env: &DoctorEnv, snapshot: &DodSnapshot) -> DoctorReport {
             "daemons",
             CheckLevel::Miss,
             format!(
-                "no daemons in {} (install with `sudo make -C dod install`)",
+                "no daemons in {} (install with `sudo make -C harw-dod install`)",
                 libexec_dir.to_string_lossy()
             ),
         ),

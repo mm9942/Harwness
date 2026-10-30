@@ -12,7 +12,7 @@ merge counts as done.
 
 **Related:** `docs/planning/10-ecosystem-workspace/HARW_ECOSYSTEM_WORKSPACE_ARCHITECTURE.md`
 §19–§23 and §49–§51, `docs/planning/50-dod-integration/README.md`,
-`xtask/src/gates.rs`, `xtask/src/gate_warden.rs`, `dod/Makefile`.
+`xtask/src/gates.rs`, `xtask/src/gate_warden.rs`, `harw-dod/Makefile`.
 
 The rule behind the merge (architecture §21): *same lockfile does not mean
 same TCB*. Workspace membership is build governance, not dependency
@@ -31,12 +31,12 @@ graph and the `xtask` gates, not by a second `Cargo.lock`.
 | `[workspace.dependencies]` | duplicated; `semver` only in `dod/` | root only; `semver` added to root |
 | `[workspace.lints.rust]` | `unsafe_code = "forbid"` in both | root only (same rule) |
 | Profiles | `release`, `dev` in both; `release-runner` root only | root only (unchanged values) |
-| Build of DoD binaries | `cd dod && cargo …` / `--manifest-path dod/Cargo.toml` | root manifest with `-p` selections (`dod/Makefile`, CI job `dod`) |
+| Build of DoD binaries | `cd dod && cargo …` / `--manifest-path dod/Cargo.toml` | root manifest with `-p` selections (`harw-dod/Makefile`, CI job `dod`) |
 | `xtask gates` graph | `WorkspaceGraph::load_many(&[".", "dod"])` | `WorkspaceGraph::load(".")` (same function `load_all_workspaces`) |
 | Warden budget lockfile | `dod/Cargo.lock` | `Cargo.lock` |
 | Dependabot | two `cargo` entries (`/`, `/dod`) | one (`/`) |
 
-The 32 DoD packages keep their directories under `dod/crates/`; path
+The 32 DoD packages keep their directories under `harw-dod/crates/`; path
 dependencies DoD → product (`../../../harw-types` etc.) and product → DoD
 (`harw-knowledge`, `harw-plan-bridge`, `harw-core-bridge`, `harw-macros`
 [dev]) are unchanged and remain valid.
@@ -140,10 +140,10 @@ sets:
 
 Mitigations in this change:
 
-- The packaged binaries are built package-scoped: `dod/Makefile` `build`
+- The packaged binaries are built package-scoped: `harw-dod/Makefile` `build`
   runs `cargo build -p harw-sentinel -p harw-probe-bpf -p harw-probe-fs
   -p harw-warden` against the root manifest and keeps its own target
-  directory `dod/target`, so `install`/`install-existing` never pick up a
+  directory `harw-dod/target`, so `install`/`install-existing` never pick up a
   binary produced by a `--workspace` build in the root `target/`.
 - CI job `dod` builds the four binaries and tests all DoD crates with `-p`
   selections only (no product features unified in), in addition to the
@@ -182,8 +182,8 @@ These must hold after the lock regeneration, measured by the central build:
    under any Warden package.
 5. **One workspace, all DoD crates in the graph.** New xtask test
    `gates::tests::test_dod_crates_are_root_workspace_members` fails if
-   `dod/Cargo.toml` or `dod/Cargo.lock` reappears or a directory under
-   `dod/crates/` is missing from the root `members`.
+   `harw-dod/Cargo.toml` or `harw-dod/Cargo.lock` reappears or a directory under
+   `harw-dod/crates/` is missing from the root `members`.
 
 ## 6. Files touched by PL-60
 
@@ -198,7 +198,7 @@ These must hold after the lock regeneration, measured by the central build:
 - `.github/workflows/ci.yml` — removed `cargo fetch --manifest-path
   dod/Cargo.toml`; job `dod` runs from the root with `-p` selections.
 - `.github/dependabot.yml` — removed the `/dod` cargo entry.
-- `dod/Makefile` — all Cargo calls via the root manifest with `-p`.
+- `harw-dod/Makefile` — all Cargo calls via the root manifest with `-p`.
 - `deny.toml` — comment on the expected `nix` 0.29/0.31 pair.
 - Docs: `CLAUDE.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `Makefile` comment,
   `rust-toolchain.toml` comment, `docs/setup/{build-prerequisites,install,dod}.md`,
@@ -233,7 +233,7 @@ for c in harw-dod-warden harw-dod-sentinel harw-warden harw-sentinel harw-probe-
 cargo tree -i libbpf-sys ; cargo tree -i openssl-sys
 cargo tree -p harw-warden -i openssl-sys ; cargo tree -p harw-warden -i libbpf-sys
 cargo deny check
-make -C dod clippy test          # package-scoped DoD run, --locked
+make -C harw-dod clippy test          # package-scoped DoD run, --locked
 cargo build --locked -p harw-sentinel -p harw-probe-bpf -p harw-probe-fs -p harw-warden
 actionlint
 ```

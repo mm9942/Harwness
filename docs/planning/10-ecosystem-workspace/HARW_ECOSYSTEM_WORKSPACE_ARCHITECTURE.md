@@ -724,10 +724,10 @@ Possible membership style:
 ```toml
 members = [
     ...
-    "dod/crates/harw-dod-authlog",
-    "dod/crates/harw-dod-blockio",
+    "harw-dod/crates/harw-dod-authlog",
+    "harw-dod/crates/harw-dod-blockio",
     ...
-    "dod/crates/harw-dod-warden",
+    "harw-dod/crates/harw-dod-warden",
     ...
 ]
 ```
@@ -1478,7 +1478,7 @@ harw-job-*
 ## DoD domain
 
 ```text
-dod/crates/*
+harw-dod/crates/*
 ```
 
 ## Harwness application/composition
@@ -1742,7 +1742,7 @@ crates/foundation/*
 crates/compiler/*
 crates/jobs/*
 crates/infrastructure/*
-dod/crates/*
+harw-dod/crates/*
 apps/harwness/*
 ```
 

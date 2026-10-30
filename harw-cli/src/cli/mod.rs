@@ -532,7 +532,7 @@ pub enum Command {
     /// Ältere Schreibweise von `harw dod install --print-systemd`: zeigt die
     /// eingebetteten systemd-Systemunits aus `deploy/`.
     ///
-    /// Die DoD-Units installiert `make -C dod install` aus derselben Quelle;
+    /// Die DoD-Units installiert `make -C harw-dod install` aus derselben Quelle;
     /// dieser Befehl installiert nichts, er gibt nur aus.
     #[command(hide = true)]
     Install {

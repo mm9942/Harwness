@@ -175,7 +175,7 @@ const SERVICE_RESTART_SEC: u32 = 5;
 /// Die Units stammen aus `deploy/systemd/` und sind über
 /// [`harw_install::deployment`] byte-identisch eingebettet (Crypto-Masterplan
 /// v2 §22/§40, H10). Platzhalter werden mit den Vorgaben von
-/// `dod/scripts/install.sh` gerendert ([`RenderPaths::default`]). Ohne
+/// `harw-dod/scripts/install.sh` gerendert ([`RenderPaths::default`]). Ohne
 /// `UNIT` folgen alle Units nacheinander, jede mit einer Kopfzeile. Der
 /// Befehl schreibt, aktiviert und startet nichts.
 ///
@@ -186,7 +186,7 @@ pub fn install(print_systemd: Option<Option<String>>) -> Result<(), String> {
     let Some(unit) = print_systemd else {
         return Err(
             "harw install: derzeit nur `--print-systemd [UNIT]`. Die DoD-Systemunits \
-             installiert `sudo make -C dod install` aus deploy/; die Infrastruktur-Units \
+             installiert `sudo make -C harw-dod install` aus deploy/; die Infrastruktur-Units \
              gibt `harw install --print-systemd` zur Übernahme nach /etc/systemd/system aus."
                 .to_owned(),
         );

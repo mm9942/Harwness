@@ -26,7 +26,7 @@ TMPFILESDIR ?= $(PREFIX)/lib/tmpfiles.d
 # not leak into DoD builds). check/fmt/clippy/test share the root `target/`.
 #
 # `build` (the packaged, privileged release binaries) deliberately keeps its
-# own target directory `dod/target`: install/install-existing copy from
+# own target directory `harw-dod/target`: install/install-existing copy from
 # $(BINARY_DIR), and a shared root `target/release` could hold a binary last
 # built by an unrelated `cargo build --release --workspace` with
 # product-crate features unified in. A separate directory guarantees the
@@ -109,7 +109,7 @@ check-config:
 # Locate (and, if genuinely missing and explicitly allowed, install via
 # apt-get) the standalone C BPF build domain's external tools: clang,
 # bpftool, llvm-objdump. There is no Rust eBPF toolchain here (the DoD BPF
-# programs are plain C, built by dod/bpf/Makefile with clang/bpftool/
+# programs are plain C, built by harw-dod/bpf/Makefile with clang/bpftool/
 # llvm-objdump directly) — no bpf-linker is involved anywhere in this repo.
 #
 # This is the first step of `install` (and of `build`, via `build-bpf`'s own
@@ -117,7 +117,7 @@ check-config:
 # which is outside an unprivileged user's PATH; earlier a plain `command -v
 # bpftool` in doctor/verify-toolchain silently reported it missing even when
 # installed. Installing the missing apt package(s) is deliberately this dod
-# Makefile's responsibility, not dod/bpf/Makefile's: that Makefile is a
+# Makefile's responsibility, not harw-dod/bpf/Makefile's: that Makefile is a
 # self-contained, standalone build domain with no dependency-install target
 # by design, and stays that way (unchanged).
 #
@@ -134,7 +134,7 @@ ensure-bpf-toolchain:
 # These recipes are deliberately explicit.  The installer never invokes any
 # of them as root; missing artifacts produce an actionable error instead.
 # CLANG/BPFTOOL/LLVM_OBJDUMP are resolved to absolute paths (searching PATH,
-# then /usr/sbin, /sbin) so dod/bpf/Makefile's tools are found even when a
+# then /usr/sbin, /sbin) so harw-dod/bpf/Makefile's tools are found even when a
 # package (e.g. bpftool) installs outside PATH; the standalone BPF Makefile
 # itself is untouched, it just receives these as ordinary variable overrides.
 build-bpf: ensure-bpf-toolchain

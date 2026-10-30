@@ -8,7 +8,7 @@
 # `gates` invokes `xtask gates` — the dependency-graph, privilege and warden
 # structure gates, built on top of `WorkspaceGraph::load` over the root
 # workspace (which, since PL-60, includes the DoD crates under
-# `dod/crates/`). It does NOT
+# `harw-dod/crates/`). It does NOT
 # hang off `check`: `check` is meant to stay a fast type check that can be
 # run repeatedly on its own, and a gate that slows down every `check` gets
 # bypassed in practice (e.g. by calling `cargo check` directly). It hangs
@@ -143,13 +143,13 @@ service: install ## Install and enable the user systemd services, incl. the gate
 	@echo "Harw services installed and enabled."
 
 dod-build: ## DoD: build the system package (host binaries + eBPF artifacts)
-	$(MAKE) -C dod build
+	$(MAKE) -C harw-dod build
 
 dod-install: ## DoD: install the system package onto the host (root; see docs/setup/dod.md)
-	$(MAKE) -C dod install
+	$(MAKE) -C harw-dod install
 
 dod-enable: ## DoD: explicitly validate config and enable observation
-	$(MAKE) -C dod enable
+	$(MAKE) -C harw-dod enable
 
 dod-uninstall: ## DoD: remove only manifest-owned files (config/state/logs are preserved)
-	$(MAKE) -C dod uninstall
+	$(MAKE) -C harw-dod uninstall

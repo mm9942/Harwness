@@ -1,14 +1,14 @@
 # harw-warden.socket -- activation socket of harw-warden.service.
 #
 # Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Rendered
-# by dod/scripts/install.sh (SYSCONFDIR).
+# by harw-dod/scripts/install.sh (SYSCONFDIR).
 #
 # Exactly ONE Listen*= line: harw-warden/src/systemd.rs::acquire_listen_socket()
 # fails hard unless LISTEN_FDS == 1. A second socket would be a start error,
 # not a harmless addition.
 #
 # Shipped DISABLED: no [Install] section and the same opt-in guard as the
-# service. `make -C dod enable-warden` starts it explicitly.
+# service. `make -C harw-dod enable-warden` starts it explicitly.
 
 [Unit]
 Description=Harw-DoD Warden activation socket (SOCK_SEQPACKET, disabled by default)

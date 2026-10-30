@@ -9,7 +9,7 @@
 //! DoD- und Infrastruktur-Daemons, `sysusers.d`, `tmpfiles.d`) per
 //! `include_str!` im Produktionscode ein — `deploy/` ist die einzige Quelle.
 //! `harw install --print-systemd [UNIT]` gibt die eingebetteten Units aus;
-//! `dod/scripts/install.sh` installiert dieselben Dateien direkt aus
+//! `harw-dod/scripts/install.sh` installiert dieselben Dateien direkt aus
 //! `deploy/`. Paritätstests prüfen `deploy/` ↔ Einbettung ↔ DoD-Manifest.
 //!
 //! # Die vier DoD-Systemunits (Knoten AW7-03, abgeglichen in H10)

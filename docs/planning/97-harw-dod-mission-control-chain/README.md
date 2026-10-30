@@ -83,7 +83,7 @@ cargo clippy --workspace --tests -- -D warnings
 cargo nextest run --workspace            # or cargo test --workspace
 cargo test --workspace --doc
 cargo run -q -p xtask -- gates
-make -C dod test                         # DoD crates, -p selection
+make -C harw-dod test                         # DoD crates, -p selection
 cargo deny check
 python3 -m unittest discover -s scripts/tests -v
 ```
@@ -124,7 +124,7 @@ Harwness has three big pieces of designed-but-unbuilt work that the owner has
 asked to be finished properly, together, and for a different model session to
 execute without re-deriving anything:
 
-1. **DoD ("Detect · Orient · Defend", `dod/crates/*`, 34 crates, ~1,400 tests)**
+1. **DoD ("Detect · Orient · Defend", `harw-dod/crates/*`, 34 crates, ~1,400 tests)**
    is real and shipped as system services, but **nothing in `harw` can see or
    drive it**: no `harw dod` command, no operation, no model tool, no TUI
    surface; the findings export is not even written by the shipped unit. The
@@ -170,17 +170,17 @@ activity reducer.
 All paths relative to repo root. Line numbers are approximate on dev.
 
 ### 2.1 DoD
-- Workspace: DoD crates are root-workspace members (PL-60); `dod/Makefile`
+- Workspace: DoD crates are root-workspace members (PL-60); `harw-dod/Makefile`
   builds with `-p`; CI job `dod` (`.github/workflows/ci.yml:172`) tests them;
   `xtask gates` enforces `edges`, `privileges`, `warden-deps`, `warden-cbuild`, `arch`.
-- Facade `dod/crates/harw-dod/src/lib.rs:349-422` re-exports cap/signals/sentinel/
+- Facade `harw-dod/crates/harw-dod/src/lib.rs:349-422` re-exports cap/signals/sentinel/
   rules + 9 unprivileged sensors; privileged sensors behind feature `privileged`;
   **no escalate/warden path** (charter §4). Facade has **no consumer** anywhere.
-- Binaries: `harw-sentinel` (unprivileged; CLI in `dod/crates/harw-sentinel/src/cli.rs`
+- Binaries: `harw-sentinel` (unprivileged; CLI in `harw-dod/crates/harw-sentinel/src/cli.rs`
   — `--config <PATH>` **exists** at `cli.rs:148-151` (docs claiming otherwise are
   stale); optional `--findings-export <abs path>` at `cli.rs:214-227`),
   `harw-probe-fs`, `harw-probe-bpf`, `harw-warden` (v1 protocol only:
-  `dod/crates/harw-warden/src/protocol.rs`, `harw-dod-warden/src/warden.rs:230`).
+  `harw-dod/crates/harw-warden/src/protocol.rs`, `harw-dod-warden/src/warden.rs:230`).
 - Shipped unit `deploy/systemd/harw-sentinel.service:42` runs
   `--log info --home @STATEDIR@ --socket /run/harw/sentinel.sock` — **no
   `--config`, no `--findings-export`**.
@@ -208,7 +208,7 @@ All paths relative to repo root. Line numbers are approximate on dev.
 - Stale docs to fix: `harw-dod/src/lib.rs:259-264` and its Cargo.toml call
   `harw-dod-cgroup` an "empty scaffold" (it is implemented, 1,111 lines);
   facade header says "27 crates" (34); `docs/setup/dod.md:299-332` and
-  `dod/README.md` say `--config` is missing.
+  `harw-dod/README.md` say `--config` is missing.
 - Open per PL-96 (`docs/planning/96-capability-closure/README.md`): E12/P0 Warden
   must move to v2 `SignedAuthorization` before any privileged rollout; E05 skill
   trigger selection "not production-wired".
@@ -460,7 +460,7 @@ All paths relative to repo root. Line numbers are approximate on dev.
   `[jobs] max_running` (default 16), `[shell] max_timeout_secs`; **no config key
   for `cgroup_root`, the sandbox backend, Landlock or bwrap** (env only:
   `HARW_VERIFY_CGROUP_ROOT`, tests `HARW_TEST_CGROUP_ROOT`). No `[execution]`.
-- **DoD side:** profiles (`dod/crates/harw-dod-config/src/lib.rs:205-617`) select
+- **DoD side:** profiles (`harw-dod/crates/harw-dod-config/src/lib.rs:205-617`) select
   `scope = "cgroups"` with absolute `cgroup_paths = [CgroupPath]` + explicit
   `include_descendants` (`CgroupPath::is_same_or_ancestor_of`, no bare prefix
   matching), or `scope = "host"`; sensors `exec`, `tcp-connect`. `harw-dod-cgroup`
@@ -468,12 +468,12 @@ All paths relative to repo root. Line numbers are approximate on dev.
   **direct children** of its scope root only, max 16 cgroups (`sensor.rs:82`).
   **BPF scope is static:** `harw-dod-bpf/src/profile.rs:24-83` expands
   descendants **once at attach time** into the `SCOPE_CGROUP_IDS` map (kernel
-  side `bpf_get_current_cgroup_id` lookup, `dod/bpf/include/harw_dod_wire_v1.h:117-120`)
+  side `bpf_get_current_cgroup_id` lookup, `harw-dod/bpf/include/harw_dod_wire_v1.h:117-120`)
   — a `harw-job-<attempt>` cgroup created after the probe started is **not
   observed** until a restart. **No attribution:** the wire header carries
   `cgroup_id`, but `harw-probe-bpf/src/collect.rs:329-332` emits
   `Actor.cgroup = None` for exec events. Warden executor
-  (`dod/crates/harw-dod-warden/src/executor.rs:194-252`, `CgroupV2Executor`)
+  (`harw-dod/crates/harw-dod-warden/src/executor.rs:194-252`, `CgroupV2Executor`)
   writes `<root>/<relative id>/cgroup.freeze|cgroup.kill` (e.g. `harw.slice/job-1`);
   `harw-warden/src/isolation.rs` has a real nft isolator (`socket cgroupv2 level N`).
   **Two prefix allowlists with mismatched formats and no verified consumer:**
@@ -494,7 +494,7 @@ See §6 — port candidates are listed there with their WP.
 
 **Naming decision.** "Harw-DoD" becomes the *product/suite name* in all
 human-facing text (README, `docs/setup/dod.md` → title "Harw-DoD (Detect ·
-Orient · Defend)", `dod/README.md`, CLI `about`, systemd `Description=` lines in
+Orient · Defend)", `harw-dod/README.md`, CLI `about`, systemd `Description=` lines in
 `deploy/systemd/harw-*.service|socket|target`, `deploy/sysusers.d/harw.conf`
 comments, planning READMEs). **Crate names, binary names, FHS paths, socket
 paths, groups, config keys, unit file names stay unchanged** (charter §2 fixes
@@ -546,7 +546,7 @@ listed in §2.1 in the same commit.
 In `harw-cli/src/cli/dod.rs` + `harw-cli/src/dod_cmd.rs`:
 ```
 harw dod status                 # DodStatus (text table / --json)
-harw dod doctor                 # read-only prerequisites (wraps the checks of dod/scripts/doctor.sh in Rust: tools, BTF, units installed, config present/valid, export readable)
+harw dod doctor                 # read-only prerequisites (wraps the checks of harw-dod/scripts/doctor.sh in Rust: tools, BTF, units installed, config present/valid, export readable)
 harw dod findings [-n 50] [--severity high|critical|..] [--rule <id>] [--since 24h]
 harw dod sensors                # health.json table
 harw dod config check [--config PATH]
@@ -557,7 +557,7 @@ harw dod install --print-systemd [UNIT] # move/alias of today's `harw install --
 ```
 Exit codes: 0 ok, 1 failure, 2 usage, 3 refused by policy/not root (PL-95 §3.4).
 Mutating subcommands never run cargo/make; they call `systemctl` and write the
-one flag file, matching `dod/Makefile` `enable`/`enable-warden` semantics (read
+one flag file, matching `harw-dod/Makefile` `enable`/`enable-warden` semantics (read
 them first and keep the behaviour identical). `harw completions --all-binaries`
 already covers the DoD binaries; add the new subcommand to the clap tree test.
 
@@ -963,7 +963,7 @@ on `cgroup.events`/directory create where available) and updates
 size with a counted overflow); (2) optional, separate commit — kernel-side
 ancestor match: for roots with descendants, store `(root_cgroup_id, level)`
 and compare `bpf_get_current_ancestor_cgroup_id(level)` in the exec/connect
-programs (`dod/bpf/src`, own build domain; bump the wire/ABI version) so no
+programs (`harw-dod/bpf/src`, own build domain; bump the wire/ABI version) so no
 rescan window exists. Tests: a fixture loader (`FixtureBpfLoader`) sees a
 cgroup created after attach within one rescan; map overflow counted, never
 silent. Also fill `Actor.cgroup` (E4) so the observation is attributable.
@@ -1109,20 +1109,20 @@ Recommended execution order:
   admission produces no second path; NEW badge ack; retention constant test.
 
 ### D1 — Harw-DoD naming + stale-doc fixes + export pipeline
-- Files: `README.md` (DoD section), `docs/setup/dod.md`, `dod/README.md`,
+- Files: `README.md` (DoD section), `docs/setup/dod.md`, `harw-dod/README.md`,
   `docs/design/harw-dod-charter.md` (§2 note: "Harw-DoD" is the suite name,
-  `harw-dod` the crate), `dod/crates/harw-dod/{src/lib.rs,Cargo.toml}` (cgroup
+  `harw-dod` the crate), `harw-dod/crates/harw-dod/{src/lib.rs,Cargo.toml}` (cgroup
   not a scaffold; 34 crates), `deploy/systemd/harw-sentinel.service` (`--config`,
   `--findings-export`, `--health-export`), `deploy/tmpfiles.d/harw.conf`,
   `deploy/sysusers.d/harw.conf` (`harw-dod-readers`), `harw-install` fixtures/
-  parity tests, `dod/packaging/manifest`, `dod/crates/harw-sentinel/src/{cli,main,export}.rs`
+  parity tests, `harw-dod/packaging/manifest`, `harw-dod/crates/harw-sentinel/src/{cli,main,export}.rs`
   (`--health-export`), `harw-config/src/dod_toml.rs` (`export_dir`,
   `findings_window_hours`, doc fix, scope table in `scope.rs` + `merge.rs`),
   `harw-runtime/src/security_signals.rs` (path resolver),
-  `dod/crates/harw-sentinel/src/export.rs` (export line `schema_version: 2` +
+  `harw-dod/crates/harw-sentinel/src/export.rs` (export line `schema_version: 2` +
   optional `scope`, additive; see E4).
 - Tests: sentinel health export round-trip (tempdir), atomic write; export v1
-  lines still parse by every reader; install parity; `dod/scripts/stage-test.sh`
+  lines still parse by every reader; install parity; `harw-dod/scripts/stage-test.sh`
   still passes; config scope exhaustive test updated
   (`harw-config/tests/config_scope_exhaustive.rs`).
 
@@ -1334,16 +1334,16 @@ Recommended execution order:
 - Tests: §3.4 E3.
 
 ### E3b — DoD sees new cgroups (dynamic BPF scope)
-- Files: `dod/crates/harw-probe-bpf/src/{profile,collect,main}.rs`,
-  `dod/crates/harw-dod-bpf/src/profile.rs` (incremental map updates), tests with
-  `FixtureBpfLoader`; optional second commit in `dod/bpf/src` + `harw_dod_wire_v1.h`
-  (ancestor match, ABI bump, `dod/bpf/toolchain.lock.toml` unchanged).
-- Gate: `make -C dod test`, `xtask gates` (privileges unchanged: no new capability).
+- Files: `harw-dod/crates/harw-probe-bpf/src/{profile,collect,main}.rs`,
+  `harw-dod/crates/harw-dod-bpf/src/profile.rs` (incremental map updates), tests with
+  `FixtureBpfLoader`; optional second commit in `harw-dod/bpf/src` + `harw_dod_wire_v1.h`
+  (ancestor match, ABI bump, `harw-dod/bpf/toolchain.lock.toml` unchanged).
+- Gate: `make -C harw-dod test`, `xtask gates` (privileges unchanged: no new capability).
 
 ### E4 — jobs ↔ findings correlation
 - Files: `harw-tool-job/src/model.rs` (`cgroup_path` surfaced in `JobStatus`),
-  `harw-tui/src/jobs_panel.rs` (`JobRow.cgroup`), `dod/crates/harw-probe-bpf/src/collect.rs`
-  (forward `cgroup_id`), `dod/crates/harw-sentinel/src/{sensors,findings,export}.rs`
+  `harw-tui/src/jobs_panel.rs` (`JobRow.cgroup`), `harw-dod/crates/harw-probe-bpf/src/collect.rs`
+  (forward `cgroup_id`), `harw-dod/crates/harw-sentinel/src/{sensors,findings,export}.rs`
   (id→path resolver, `Actor.cgroup`, export v2 `scope`),
   `harw-dod-client/src/correlate.rs`, `harw-ops/src/dod.rs` (`job_id` filter),
   `harw-tui/src/mission/jobs_window.rs` (`⛨ n` badge).
@@ -1384,7 +1384,7 @@ Gate sequence §0.3. Additionally per area:
 - Layout matrix tests in `harw-tui-layout` (C1) and render-matrix tests in
   `harw-tui` (C2/C3) — the sizes listed in §3.3.2/§4 are mandatory test names.
 - `cargo test -p harw-macros` includes trybuild compile-fail (M2).
-- `make -C dod test` + `dod/scripts/stage-test.sh` (D1).
+- `make -C harw-dod test` + `harw-dod/scripts/stage-test.sh` (D1).
 - `cargo run -q -p xtask -- gates` must stay green after adding `harw-dod-client`
   and `harw-activity` (layer I; no `*-sys` crates; no warden edge).
 
@@ -1467,7 +1467,7 @@ stray root `uia-mailbox.md`.
 | `feat/common-command-tools` (#127), `coop/tool-index` (#89), `feat/skill-triggers` (#126), `pr/obsidian-vault-tools` (#130), `coop/tools-gap` (#88) code | PL-93 crates, `tool_index.rs`, `triggers.toml` engine, obsidian tools, tunnel policy cores | **Yes** (rebased under other SHAs; dev is a superset incl. `harw-tool-cargo/src/guard.rs`) | nothing to port; **use `pr/obsidian-vault-tools`' registration as the template** for B4/D3: `provider!(OBSIDIAN, "obsidian", "harw-tool-obsidian", "tool-obsidian")` (`capability_catalog.rs:~202`), `row!` rows with the write tool as `Write` (~344–349), read-only entries in `AUTO_APPROVED_TOOLS` (`lib.rs:~217–225`), `OBSIDIAN_READ_TOOLS` in `profile.rs` + `authority.rs`, parity test (~638) |
 | `ccr-9d1aabdf-v191ts` | `job.wait` in `AUTO_APPROVED_TOOLS`; `harw worker` CLI | deliberately **not** on dev (`harw-tool-job/src/tools/tests.rs:103` asserts no `job.wait` executor; `embedded_agents.rs:3844`) | do **not** port |
 | `coop/tools-gap` | `docs/planning/87-tool-gaps/README.md` (PL-87 gap report), `.cargo/config.toml` `xtask` alias | **No** | port the README in **X1** (docs); alias only if it does not collide with the Makefile |
-| `ccr-29d4325b-884ntu` (#133 "Translate docs and config comments to English 1/4", commit `571e8aa9`) | translates 30 `dod/` + 34 `docs/` files (German → English); dev still has the German text in all 64 (≈32 changed since) | **No** | **X1b** (optional, docs-only, own commit): re-apply the translation for the DoD files touched by D1 at minimum (`dod/config.toml`, `dod/README.md`, `dod/packaging/config.example.toml`); the rest is a separate follow-up PR |
+| `ccr-29d4325b-884ntu` (#133 "Translate docs and config comments to English 1/4", commit `571e8aa9`) | translates 30 `dod/` + 34 `docs/` files (German → English); dev still has the German text in all 64 (≈32 changed since) | **No** | **X1b** (optional, docs-only, own commit): re-apply the translation for the DoD files touched by D1 at minimum (`harw-dod/config.toml`, `harw-dod/README.md`, `harw-dod/packaging/config.example.toml`); the rest is a separate follow-up PR |
 | main vs dev | nothing DoD/registry/CLI that dev lacks (28 differing files are older variants); one unverified string: main's `job_worker.rs:1167` "prompt job exceeded its token budget" | — | ignore |
 
 **Caution for the executor:** two sweeps disagreed on whether `harw-tool-sys` /
@@ -1584,13 +1584,13 @@ work packages above. Where they disagree with §3 or §4, this section wins.
   `harw-ops/tests/approval_declaration_gate.rs`. Registry edits in B2/D3 are
   sequenced with PR #153 W1.
 - `harw dod warden enable` does not exist before D3. Today the toggle is
-  `make -C dod enable-warden`, which does not persist because
+  `make -C harw-dod enable-warden`, which does not persist because
   `harw-warden.socket` has no `[Install]` section.
 - Invariant S1 in `harw-ops/src/approval.rs` is file-scoped. `harw-plan-bridge`
   depends on the `harw-dod-escalate` library, but no harw crate depends on
   `harw-dod-warden`.
 - `docs/setup/dod.md` claims there is "no enable/start action". That is
-  stale: the `dod/Makefile` `install` and `stage` targets both run
+  stale: the `harw-dod/Makefile` `install` and `stage` targets both run
   `scripts/service.sh enable` (`systemctl enable --now harw-dod.target`). The
   `DESTDIR` stage path starting services conflicts with PR #153's "no silent
   services" policy and is flagged for D3/X1.
@@ -1696,7 +1696,7 @@ carry no content of their own and are not listed.
   the remaining `cargo.*` tools).
 - **D3:** `harw dod enable --grant-read <user>` does not exist; membership
   in `harw-dod-readers` is granted by hand.
-- **D1/§8.4:** `make -C dod install` and the `DESTDIR` `stage` target both
+- **D1/§8.4:** `make -C harw-dod install` and the `DESTDIR` `stage` target both
   end with `scripts/service.sh enable`; the stage path starting services
   conflicts with PR #153's "no silent services" policy and is still open.
 - **M2:** `permission_request!` has no consumption point in the operation

@@ -12,7 +12,7 @@ units=$(CDPATH= cd -- "$(dirname "$0")/../../deploy/systemd" && pwd)
 [ -x "$root/scripts/doctor.sh" ]
 [ -x "$root/scripts/service.sh" ]
 [ -f "$packaging/manifest" ]
-[ ! -e "$packaging/systemd" ] || { printf '%s\n' 'dod/packaging/systemd must not exist; deploy/ is the only unit source.' >&2; exit 1; }
+[ ! -e "$packaging/systemd" ] || { printf '%s\n' 'harw-dod/packaging/systemd must not exist; deploy/ is the only unit source.' >&2; exit 1; }
 
 # This target is intentionally static: it must remain safe on a checkout with
 # no release artifacts and must not invoke Cargo or any compiler.

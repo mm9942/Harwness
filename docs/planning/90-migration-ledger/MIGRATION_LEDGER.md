@@ -59,12 +59,12 @@
 **Planning compartment:** PL-60
 **Baseline commit:** `d3e0b96`
 **Implementation commit / PR:** branch `claude/r11-harw-ecosystem` (R11)
-**Affected crates:** all 32 `dod/crates/*`, `xtask`
+**Affected crates:** all 32 `harw-dod/crates/*`, `xtask`
 
 **Before:** `exclude = ["dod"]`, separate `dod/Cargo.toml` and `dod/Cargo.lock`.
 **Target:** one workspace and one lockfile; isolation through gates.
 **Landed delta:** nested workspace removed, DoD crates listed explicitly in root `members`, `semver` joins `[workspace.dependencies]`, xtask gates read one graph, CI/Makefile/Dependabot run DoD package-scoped from the root.
-**Compatibility retained:** `dod/Makefile` still builds the privileged binaries package-scoped into `dod/target`.
+**Compatibility retained:** `harw-dod/Makefile` still builds the privileged binaries package-scoped into `harw-dod/target`.
 **Tests added/changed:** `test_dod_crates_are_root_workspace_members`.
 **Architecture gates changed:** `warden-deps` stays at 54. `cargo tree -e normal` before/after: harw-warden 88→88, harw-dod-warden 41→41, harw-dod-sentinel 70→70, harw-sentinel 182→182, harw-probe-bpf 159→159, harw-probe-fs 101→100. No `libbpf-sys`, `openssl-sys` or `libseccomp` in the graph.
 **Documentation updated:** DoD design docs, setup docs, `CHANGELOG.md`.
@@ -100,20 +100,20 @@
 **Planning compartment:** PL-70 (Crypto Masterplan v2 §22, §23, §34 H10, §40)
 **Baseline commit:** `140ab6a`
 **Implementation commit / PR:** R12 round (number to be fixed at merge)
-**Affected crates:** `harw-install`, `harw-cli`; DoD packaging (`dod/scripts`, `dod/Makefile`, `dod/packaging`)
+**Affected crates:** `harw-install`, `harw-cli`; DoD packaging (`harw-dod/scripts`, `harw-dod/Makefile`, `harw-dod/packaging`)
 
-**Before:** two diverging unit trees (`deploy/systemd/*`, embedded only under `cfg(test)`; `dod/packaging/systemd/*`, actually installed) — see `docs/architecture/crypto-drift-report.md` §5.
+**Before:** two diverging unit trees (`deploy/systemd/*`, embedded only under `cfg(test)`; `harw-dod/packaging/systemd/*`, actually installed) — see `docs/architecture/crypto-drift-report.md` §5.
 **Target:** one canonical service/socket definition per daemon, embedded and tested.
-**Landed delta:** `deploy/` is the only source: DoD units (`harw-dod.target`, `harw-sentinel`, `harw-probe-bpf`, `harw-probe-fs`, `harw-warden.{service,socket}`), infra units (`harw-infra.target`, `harw-control.service`, `harw-auth-hub.{socket,service}`, `harw-netsec.{socket,service}`, `harw-security-hub.service`), `deploy/sysusers.d/harw.conf`, `deploy/tmpfiles.d/harw.conf`. Stricter variant per unit: warden on its own user with `CAP_DAC_OVERRIDE CAP_NET_ADMIN` (not root, not `CAP_SYS_ADMIN`), BPF probe `CAP_BPF CAP_PERFMON` (loader requires both), `SystemCallFilter=@system-service` everywhere. `harw-install::deployment` embeds every `deploy/` file in production code (`EmbeddedDeploymentAsset { path, contents, kind }`); new CLI `harw install --print-systemd [UNIT]`. `dod/scripts/install.sh` installs from `deploy/`, rejects unresolved `@PLACEHOLDER@`s and removes the pre-H10 `harw-dod-*` unit files. `dod/packaging/{systemd,sysusers.d,tmpfiles.d}` deleted.
+**Landed delta:** `deploy/` is the only source: DoD units (`harw-dod.target`, `harw-sentinel`, `harw-probe-bpf`, `harw-probe-fs`, `harw-warden.{service,socket}`), infra units (`harw-infra.target`, `harw-control.service`, `harw-auth-hub.{socket,service}`, `harw-netsec.{socket,service}`, `harw-security-hub.service`), `deploy/sysusers.d/harw.conf`, `deploy/tmpfiles.d/harw.conf`. Stricter variant per unit: warden on its own user with `CAP_DAC_OVERRIDE CAP_NET_ADMIN` (not root, not `CAP_SYS_ADMIN`), BPF probe `CAP_BPF CAP_PERFMON` (loader requires both), `SystemCallFilter=@system-service` everywhere. `harw-install::deployment` embeds every `deploy/` file in production code (`EmbeddedDeploymentAsset { path, contents, kind }`); new CLI `harw install --print-systemd [UNIT]`. `harw-dod/scripts/install.sh` installs from `deploy/`, rejects unresolved `@PLACEHOLDER@`s and removes the pre-H10 `harw-dod-*` unit files. `harw-dod/packaging/{systemd,sysusers.d,tmpfiles.d}` deleted.
 **Compatibility retained:** DoD install knobs (`PREFIX`, `LIBEXECDIR`, `BPFDIR`, `SYSCONFDIR`, `STATEDIR`, `LOGDIR`, `DESTDIR`) unchanged; `RUNSTATEDIR`/`RUNTIMEDIR` removed (runtime is fixed `/run/harw`). Unit names change (`harw-dod-sentinel` → `harw-sentinel`, `harw-dod-bpf` → `harw-probe-bpf`, `harw-dod-warden` → `harw-warden`), accounts change (`harw-dod`/`harw-dod-bpf`/`harw-dod-ipc` → per-binary accounts and `harw-ipc`); old accounts are not deleted automatically.
 **Tests added/changed:** `harw-install/src/deployment/tests.rs` (parity deploy/ ↔ embedded ↔ manifest ↔ install.sh, INI shape, ExecStart binaries are workspace binaries, socket/service/target references, sysusers coverage, socket directories from tmpfiles, hardening, `print_systemd`); `dod_units` tests now read the embedded assets; `harw-cli` parse and `lifecycle::install` tests.
 **Architecture gates changed:** none.
-**Documentation updated:** `docs/setup/dod.md`, `docs/cli.md`, `dod/README.md`, `docs/design/dod-system-operations-authority.md`, `docs/architecture/crypto-drift-report.md`.
+**Documentation updated:** `docs/setup/dod.md`, `docs/cli.md`, `harw-dod/README.md`, `docs/design/dod-system-operations-authority.md`, `docs/architecture/crypto-drift-report.md`.
 **Remaining plan items:**
 - ~~TODO(H9): `harw web` socket activation~~ done: `harw web --systemd-socket` takes the LISTEN_FDS=1 descriptor; `deploy/systemd/harw-control.socket` (`/run/harw/infra/control.sock`, `0660 harw-control:harw-control-clients`) ships and `harw-control.service` is socket-activated (no `[Install]`, no `ReadWritePaths=/run/harw/infra`). All infra daemons are socket-activated, so `/run/harw/infra` is `0755 root:root` and the `harw-infra` group is gone. Still open, TODO(H9): verify bubblewrap tool sandboxing under the unit's `SystemCallFilter=`.
 - `harw-auth-hub` and `harw-netsec` use their real `--systemd-socket` flag. The three infra crates landed in parallel with H10; `PLANNED_BINARIES` in the parity test tolerates them until they are root workspace members, then the list can be emptied.
 - Verify the warden capability set (`CAP_DAC_OVERRIDE CAP_NET_ADMIN`) and the per-unit `SystemCallFilter=` additions on a real host (`systemd-analyze verify`, `systemd-analyze security`).
-- `dod/crates/harw-probe-bpf` still names `/run/harw-dod/sentinel.sock` in CLI tests and `harw-dod-bpf.service` in `src/sensors.rs` docs (cosmetic; owned by the DoD crates).
+- `harw-dod/crates/harw-probe-bpf` still names `/run/harw-dod/sentinel.sock` in CLI tests and `harw-dod-bpf.service` in `src/sensors.rs` docs (cosmetic; owned by the DoD crates).
 
 ## MIG-008 — Compiler ↔ execution contract (PL-90)
 
@@ -309,12 +309,12 @@
 - `/dod` operation and the read-only, auto-approved model tools `dod.status`, `dod.findings`, `dod.sensors` (5 s cache, bounded, sanitized). The four security triage roles admit exactly these tools; their child sessions get them through a role-bound read-only provider (`harw-runtime/src/children.rs`).
 - Bundled skill `harw-dod` with the first real `triggers.toml` (tools `dod.*`, keywords such as `egress`, `sentinel`, `warden`, `cgroup`).
 - TUI: `/dod view` overlay, status-line mark `⛨ n high`, Finished/Failed title suffix `· ⛨ DoD n`.
-**What changed for operators:** `make -C dod install` run unprivileged (it builds, then asks for sudo for the file install and the enable step; or `make -C dod build` followed by `sudo make -C dod install-existing`), then `harw dod config suggest`, edit `/etc/harw-dod/config.toml`, `sudo harw dod enable`, `harw dod status`; add users to `harw-dod-readers` by hand to read the exports; `security_signals` now uses the same resolver.
+**What changed for operators:** `make -C harw-dod install` run unprivileged (it builds, then asks for sudo for the file install and the enable step; or `make -C harw-dod build` followed by `sudo make -C harw-dod install-existing`), then `harw dod config suggest`, edit `/etc/harw-dod/config.toml`, `sudo harw dod enable`, `harw dod status`; add users to `harw-dod-readers` by hand to read the exports; `security_signals` now uses the same resolver.
 **Compatibility retained:** v1 export lines parse in every reader; no harw crate links the Warden or the escalation ladder; the Warden stays disabled by default.
 **Tests added/changed:** see PL-97 §9.1 rows D1–D5 (harw-sentinel, harw-install, harw-dod-client, harw-cli `dod_cmd`, harw-ops `dod`, harw-tui `dod_view`).
 **Architecture gates changed:** `harw-dod-client` in `xtask/arch-policy.toml` (layer A, forbidden from the Warden/escalation/daemons); spawn policy allows the `systemctl` status query.
-**Documentation updated:** `README.md`, `dod/README.md`, `docs/setup/dod.md`, `docs/cli.md`, `docs/design/harw-dod-charter.md`, `docs/security/pl97-security-review.md`.
-**Remaining plan items:** E4 landed in `0bababe2` (DoD side) and `b58fcd13` (harw side: `--job` filter, `⛨ n` badge); multi-cgroup rule findings stay without scope; `harw dod enable --grant-read`; the `make -C dod install`/`stage` enable step versus "no silent services" (PL-97 §8.4); Warden v2 proofs (PL-96 W01).
+**Documentation updated:** `README.md`, `harw-dod/README.md`, `docs/setup/dod.md`, `docs/cli.md`, `docs/design/harw-dod-charter.md`, `docs/security/pl97-security-review.md`.
+**Remaining plan items:** E4 landed in `0bababe2` (DoD side) and `b58fcd13` (harw side: `--job` filter, `⛨ n` badge); multi-cgroup rule findings stay without scope; `harw dod enable --grant-read`; the `make -C harw-dod install`/`stage` enable step versus "no silent services" (PL-97 §8.4); Warden v2 proofs (PL-96 W01).
 
 ## MIG-017 — Skill triggers and the tool landscape (PL-97 B1–B5, PL-95 S2–S6, PL-93)
 
@@ -367,7 +367,7 @@
 **Planning compartment:** `docs/planning/97-harw-dod-mission-control-chain` (§3.4, §4 E1–E5, §8.2), `docs/planning/90-intent-driven-composed-agents/07-coding-cycles-orchestration-plan.md` (PR #153 contract)
 **Baseline commit:** `dev@fcb12b41`
 **Implementation commit / PR:** draft PR #154: E1a `2cfd4e7a`, E1b `a07f7f6f`, E2a `0922d70e`, E2c `08aaecd8`, E2d `93471a44`, E2b `05d2d5b7`, E3b `1b63871c`, E3c `a214d590`, E2e + E3 + E5 `f31d639f`; E2f (RLIMIT_NPROC through `ResourceRequest` and the trampoline) `7b9e23e3`; E2g (RLIMIT_NPROC refused or reported not enforced for an exempt uid 0 / `CAP_SYS_ADMIN` / `CAP_SYS_RESOURCE` identity unless `pids.max` covers it) `97804cbb`
-**Affected crates:** `harw-job-exec`, `harw-job-linux`, `harw-job-core`, `harw-job-runtime`, `harw-job-executor-{bwrap,oci,k8s,darwin}`, `harw-command`, `harw-sandbox`, `harw-tool-shell`, `harw-tool-job`, `harw-agent-runner`, `harw-config`, `harw-install`, `harw-dod-client`, `harw-cli`, `dod/crates/{harw-dod-bpf,harw-probe-bpf}`
+**Affected crates:** `harw-job-exec`, `harw-job-linux`, `harw-job-core`, `harw-job-runtime`, `harw-job-executor-{bwrap,oci,k8s,darwin}`, `harw-command`, `harw-sandbox`, `harw-tool-shell`, `harw-tool-job`, `harw-agent-runner`, `harw-config`, `harw-install`, `harw-dod-client`, `harw-cli`, `harw-dod/crates/{harw-dod-bpf,harw-probe-bpf}`
 
 **Before:** bwrap, the Landlock trampoline and cgroups were alternative backends; `shell.exec` ran a `prlimit … -- bwrap …` argv as an unsandboxed host job; the probe always attached with host scope.
 **Target:** every sandboxed job runs in its cgroup, inside a Bubblewrap namespace, with Landlock, NNP, capability drop and rlimits; DoD observes the job cgroups; one honest readiness report.

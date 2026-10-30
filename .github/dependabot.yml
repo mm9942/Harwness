@@ -7,7 +7,7 @@
 version: 2
 updates:
   # Rust-Workspace (Cargo.toml im Wurzelverzeichnis, inkl. aller Mitglieder;
-  # seit PL-60 auch die DoD-Crates unter dod/crates — ein Lockfile).
+  # seit PL-60 auch die DoD-Crates unter harw-dod/crates — ein Lockfile).
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -39,7 +39,7 @@ updates:
         patterns: ["*"]
 
   # Gepinnte Rust-Toolchain (rust-toolchain.toml im Wurzelverzeichnis, gilt
-  # für das ganze Repo einschließlich dod/). Ein Update ändert lokal und in der CI zugleich die Version.
+  # für das ganze Repo einschließlich harw-dod/). Ein Update ändert lokal und in der CI zugleich die Version.
   - package-ecosystem: "rust-toolchain"
     directory: "/"
     schedule:

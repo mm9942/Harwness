@@ -190,7 +190,7 @@ evidence:
 | R10 | Hyper-based alternative: cost of owning upgrade, pooling, hop-by-hop handling, health checks | **not estimated** |
 
 Verified in the code while writing this note: `HarwKeyPurpose` (10 purposes,
-including `RequestAuthentication`) lives in `dod/crates/harw-dod-encrypt`; there
+including `RequestAuthentication`) lives in `harw-dod/crates/harw-dod-encrypt`; there
 is **no** TLS-server purpose; `SecurityContext` is mint-only as described above.
 
 ## 6. Work order (replaces section 8 of `README.md` where it differs)

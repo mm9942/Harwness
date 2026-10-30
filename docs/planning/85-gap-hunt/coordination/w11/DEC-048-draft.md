@@ -644,5 +644,5 @@ After all W11 coders have finished, the central build runs once. In the cloud co
 3. `cargo test --workspace`, including doc tests. The crates that matter are harw-protocol, harw-session-store, harw-operations, harw-session-host, harw-web, harw-ops and harw-cli.
 4. `cargo run -q -p xtask -- gates`
 5. `cargo deny check`
-6. `make -C dod clippy test`. This runs with `--locked`, so the `Cargo.lock` from step 2 must be committed first.
+6. `make -C harw-dod clippy test`. This runs with `--locked`, so the `Cargo.lock` from step 2 must be committed first.
 7. `actionlint`

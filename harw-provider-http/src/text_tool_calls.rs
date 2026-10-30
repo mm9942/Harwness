@@ -432,8 +432,8 @@ mod tests {
     #[test]
     fn test_parse_text_tool_calls_example_2_paren_form_strips_stray_think_close() -> TestResult {
         let content = concat!(
-            "</think><tool_call>fs.list({\"path\":\"dod/crates/harw-probe-bpf/src\"})",
-            "<tool_call>fs.list({\"path\":\"dod/crates/harw-probe-fs/src\"})"
+            "</think><tool_call>fs.list({\"path\":\"harw-dod/crates/harw-probe-bpf/src\"})",
+            "<tool_call>fs.list({\"path\":\"harw-dod/crates/harw-probe-fs/src\"})"
         );
         let offered = ["fs.list"];
         let (remaining, calls) = parse_text_tool_calls(content, &offered)
@@ -443,11 +443,11 @@ mod tests {
         assert_eq!(calls[0].name, "fs.list");
         assert_eq!(
             calls[0].arguments,
-            serde_json::json!({"path": "dod/crates/harw-probe-bpf/src"})
+            serde_json::json!({"path": "harw-dod/crates/harw-probe-bpf/src"})
         );
         assert_eq!(
             calls[1].arguments,
-            serde_json::json!({"path": "dod/crates/harw-probe-fs/src"})
+            serde_json::json!({"path": "harw-dod/crates/harw-probe-fs/src"})
         );
         Ok(())
     }

@@ -12,7 +12,7 @@ is, what it may do and what it explicitly may not do.
 ## 1. Why a facade at all
 
 The security subsystem is split across roughly thirty crates under
-`dod/crates/` (members of the root workspace since PL-60), at several layers: capability/data vocabulary
+`harw-dod/crates/` (members of the root workspace since PL-60), at several layers: capability/data vocabulary
 (`harw-dod-cap`, `harw-dod-signals`, `harw-dod-readfs`, `harw-dod-fixtures`),
 thirteen `Sensor`-implementing crates (`harw-dod-cpu`, `-thermal`, `-memory`,
 `-blockio`, `-netcounters`, `-gpu`, `-cgroup`, `-listener`, `-scanreport`,
@@ -24,7 +24,7 @@ escalation/enforcement chain (`harw-dod-escalate`, `harw-dod-warden-proto`,
 
 Without a facade, every consumer would need to know this layering: which
 crate `Finding` comes from, which crate `WardenAction` comes from, which
-schema version currently applies. `harw-dod` (`dod/crates/harw-dod`) is that
+schema version currently applies. `harw-dod` (`harw-dod/crates/harw-dod`) is that
 facade: a curated re-export surface, modeled on the same discipline as
 `harw-lens`'s facade, with no logic of its own.
 
@@ -84,7 +84,7 @@ editorial only.
 
 ## 3. What the facade is
 
-`harw-dod` (`dod/crates/harw-dod/src/lib.rs`) re-exports individual, named
+`harw-dod` (`harw-dod/crates/harw-dod/src/lib.rs`) re-exports individual, named
 items — no `pub use *`, no phase-shaped sub-modules (`detect`/`orient`/
 `defend`). The admission test the module doc states for every re-export:
 
@@ -110,7 +110,7 @@ items — no `pub use *`, no phase-shaped sub-modules (`detect`/`orient`/
 `observe`) sit behind this crate's `privileged` Cargo feature as optional
 path dependencies, so a consumer that writes plain `harw-dod` in its
 `Cargo.toml` gets none of those privilege classes on its dependency edge
-(checked by `dod/crates/harw-dod/tests/facade.rs`).
+(checked by `harw-dod/crates/harw-dod/tests/facade.rs`).
 
 **"Assess a finding"** — from `harw-dod-rules`: `run_rules`,
 `run_rules_checked`, `Rule`, `RuleContext`, the three shipped rules

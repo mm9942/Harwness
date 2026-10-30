@@ -4,7 +4,7 @@
 > refreshed in R12 for the crates added since (the `harw-job-*` family, `harw-auth-hub`,
 > `harw-infra-client`, `harw-netsec`, `harw-node-transport`, `harw-security-hub`,
 > `harw-dod-encrypt`). Derived from every member `Cargo.toml` of the root workspace. Since
-> PL-60 the DoD crates under `dod/crates/` are ordinary root members (one `Cargo.lock`).
+> PL-60 the DoD crates under `harw-dod/crates/` are ordinary root members (one `Cargo.lock`).
 > Plan reference: Eco-Doc §43–§47, §67. Third-party dependency tiers:
 > [dependency-review.md](dependency-review.md).
 >
@@ -32,17 +32,17 @@
 | I | 37 | authority, sandbox, fsutil, observe(+file/prom/otlp), extension-api, operations, egress, secrets, oauth, home, config, completions, killer, code-graph, explorer, context, tools, catalog, research, browser(+thirtyfour), lens-*, provider, model-catalog, mcp-client, infra-client |
 | C | 4 | agent-dsl, agent-artifact, agent-compiler, agent-runner |
 | J | 9 | job-core, job-store, job-linux, job-darwin, job-exec, job-tokio, job-executor-bwrap, job-runtime, job (facade) |
-| D / D+T | 23 / 10 | all `dod/crates/*` (incl. `harw-dod-encrypt`, D) |
+| D / D+T | 23 / 10 | all `harw-dod/crates/*` (incl. `harw-dod-encrypt`, D) |
 | A | 40 | core, runtime, cli, tui, `harw`, harwness-sdk, ops, web, tool-*, channel-*, knowledge, memory, plan, plan-bridge, core-bridge, session-store, mcp-server, registry-defaults, install, provider-http, auth-hub, netsec, security-hub, node-transport, … |
 
-Total: 128 packages (all root members since PL-60: 95 outside `dod/`, incl. `xtask`, and
-33 under `dod/crates/`).
+Total: 128 packages (all root members since PL-60: 95 outside `harw-dod/`, incl. `xtask`, and
+33 under `harw-dod/crates/`).
 
 ## Column notes
 
 - **WS:** workspace membership *before* the DoD merge (PL-60, see
   `dod-workspace-merge-plan.md`). After the merge every package is a root member. The column
-  then only records origin (`dod/crates/*`).
+  then only records origin (`harw-dod/crates/*`).
 
 - **Internal deps:** normal `[dependencies]` (incl. target-specific) on workspace packages,
   `harw-` prefix stripped. Dev/build deps are excluded (e.g. `harw-macros` has dev-dep cycles
@@ -126,39 +126,39 @@ Total: 128 packages (all root members since PL-60: 95 outside `dod/`, incl. `xta
 | `harw-job-runtime` | `harw-job-runtime` | root | **J** | job-core, job-darwin, job-exec, job-executor-bwrap (opt.), job-linux, job-store, job-tokio, types | 6 | — | portable (linux/macos backends, target deps) | forbid (ws + attr) | — |
 | `harw-job-store` | `harw-job-store` | root | **J** | job-core | 3 | — | unix cfg (cap-std, fs4 locks) | forbid (ws + attr) | — |
 | `harw-job-tokio` | `harw-job-tokio` | root | **J** | job-core, job-linux (all linux-only) | 1 | — | linux-only (AsyncFd over pidfd) | forbid (ws + attr) | — |
-| `harw-dod` | `dod/crates/harw-dod` | dod | **D** | authority, dod-authlog, dod-blockio, dod-bpf, dod-cap, dod-cpu, dod-flow, dod-fsmon, dod-gpu, dod-listener, dod-memory, dod-netcounters, dod-procmon, dod-rules, dod-scanreport, dod-sentinel, dod-signals, dod-thermal, dod-workspace | 0 | — | linux (facade over sensors) | forbid (ws) | — |
-| `harw-dod-authlog` | `dod/crates/harw-dod-authlog` | dod | **D+T** | dod-cap, dod-netlink, dod-signals, macros, types | 1 | Netlink | linux-only (netlink) | forbid (ws) | — |
-| `harw-dod-blockio` | `dod/crates/harw-dod-blockio` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs/sysfs) | forbid (ws) | — |
-| `harw-dod-bpf` | `dod/crates/harw-dod-bpf` | dod | **D+T** | dod-cap, macros, types | 4 | Bpf | linux-only (aya) | forbid (ws) | none in cargo; loads C BPF objects built by clang (dod/bpf) |
-| `harw-dod-cap` | `dod/crates/harw-dod-cap` | dod | **D** | authority, macros, types | 25 | Unpriv (listed) | unix cfg | forbid (ws) | — |
-| `harw-dod-cgroup` | `dod/crates/harw-dod-cgroup` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 1 | Unpriv (listed) | linux-only (cgroup v2) | forbid (ws) | — |
-| `harw-dod-config` | `dod/crates/harw-dod-config` | dod | **D** | — | 2 | Unpriv (listed) | unix (rustix) | forbid (ws + attr) | blake3 (cc) |
-| `harw-dod-cpu` | `dod/crates/harw-dod-cpu` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs) | forbid (ws) | — |
-| `harw-dod-encrypt` | `dod/crates/harw-dod-encrypt` | dod | **D** | macros | 0 | — | portable | forbid (ws) | — (lockfile: `cc`/`bindgen` via cfg-gated `crabgrind` in `crypt_guard_service`) |
-| `harw-dod-escalate` | `dod/crates/harw-dod-escalate` | dod | **D** | authority, dod-rules, dod-signals, dod-warden-proto, macros, session-store, types | 1 | Unpriv (listed) | portable | forbid (ws + attr) | — |
-| `harw-dod-fixtures` | `dod/crates/harw-dod-fixtures` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 0 | — | linux (fixture fs trees) | forbid (ws) | — |
-| `harw-dod-flow` | `dod/crates/harw-dod-flow` | dod | **D+T** | authority, dod-bpf, dod-cap, dod-signals, macros, sandbox, types | 2 | Bpf | linux-only (bpf) | forbid (ws) | — |
-| `harw-dod-fsmon` | `dod/crates/harw-dod-fsmon` | dod | **D+T** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | FileWatch | linux-only (fanotify) | forbid (ws) | — |
-| `harw-dod-gpu` | `dod/crates/harw-dod-gpu` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (sysfs) | forbid (ws) | — |
-| `harw-dod-listener` | `dod/crates/harw-dod-listener` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs; unix cfg) | forbid (ws) | — |
-| `harw-dod-memory` | `dod/crates/harw-dod-memory` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs) | forbid (ws) | — |
-| `harw-dod-netcounters` | `dod/crates/harw-dod-netcounters` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs) | forbid (ws) | — |
-| `harw-dod-netlink` | `dod/crates/harw-dod-netlink` | dod | **D** | dod-cap, macros | 1 | Unpriv (listed) | linux-only | forbid (ws) | — |
-| `harw-dod-netpolicy` | `dod/crates/harw-dod-netpolicy` | dod | **D** | authority, dod-cap, macros, sandbox | 0 | Unpriv (listed) | portable | forbid (ws + attr) | — |
-| `harw-dod-procmon` | `dod/crates/harw-dod-procmon` | dod | **D+T** | dod-bpf, dod-cap, dod-signals, macros, types | 2 | Bpf | linux-only (bpf) | forbid (ws) | — |
-| `harw-dod-readfs` | `dod/crates/harw-dod-readfs` | dod | **D** | dod-cap, macros | 11 | Unpriv (listed) | linux (procfs/sysfs reader; unix cfg) | forbid (ws) | — |
-| `harw-dod-rules` | `dod/crates/harw-dod-rules` | dod | **D** | authority, code-graph, dod-signals, research, types | 5 | Unpriv (listed) | portable | forbid (ws + attr) | — |
-| `harw-dod-scanreport` | `dod/crates/harw-dod-scanreport` | dod | **D** | dod-cap, dod-readfs, dod-signals, home, macros, types | 2 | Unpriv (listed) | portable | forbid (ws) | — |
-| `harw-dod-sentinel` | `dod/crates/harw-dod-sentinel` | dod | **D** | authority, dod-cap, dod-rules, dod-signals, fsutil, macros, observe, types | 2 | Unpriv (listed) | linux (procfs) | forbid (ws) | — |
-| `harw-dod-signals` | `dod/crates/harw-dod-signals` | dod | **D** | dod-cap, macros, observe, types | 25 | Unpriv (listed) | portable | forbid (ws) | — |
-| `harw-dod-thermal` | `dod/crates/harw-dod-thermal` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (sysfs) | forbid (ws) | — |
-| `harw-dod-warden` | `dod/crates/harw-dod-warden` | dod | **D+T** | dod-warden-proto, macros, types | 1 | Unpriv (listed) | linux-only (cgroup v2) | forbid (ws + attr) | — |
-| `harw-dod-warden-proto` | `dod/crates/harw-dod-warden-proto` | dod | **D+T** | macros, types | 3 | Unpriv (listed) | portable | forbid (ws) | blake3 (cc) |
-| `harw-dod-workspace` | `dod/crates/harw-dod-workspace` | dod | **D** | code-graph, dod-cap, dod-signals, macros, types | 2 | Unpriv (listed) | portable | forbid (ws + attr) | — |
-| `harw-probe-bpf` | `dod/crates/harw-probe-bpf` | dod | **D+T** | authority, completions, dod-bpf, dod-cap, dod-config, dod-flow, dod-procmon, dod-signals, sandbox, types | 0 | bin budget CapBpf | linux-only (aya, landlock) | forbid (ws + attr) | — |
-| `harw-probe-fs` | `dod/crates/harw-probe-fs` | dod | **D+T** | completions, dod-cap, dod-fsmon, dod-signals, types | 0 | bin budget CapSysAdmin | linux-only (fanotify, landlock) | forbid (ws + attr) | — |
-| `harw-sentinel` | `dod/crates/harw-sentinel` | dod | **D** | authority, completions, dod-blockio, dod-cap, dod-cgroup, dod-config, dod-cpu, dod-gpu, dod-listener, dod-memory, dod-netcounters, dod-rules, dod-scanreport, dod-sentinel, dod-signals, dod-thermal, dod-workspace, home, macros, observe, observe-file, sandbox, types | 0 | bin budget Unprivileged | linux (landlock; non-linux stub) | forbid (ws + attr) | — |
-| `harw-warden` | `dod/crates/harw-warden` | dod | **D+T** | completions, dod-warden, dod-warden-proto, macros, types | 0 | bin budget SystemdSocketNoNet | linux (landlock, socket act.; non-linux stub) | forbid (ws + attr) | — |
+| `harw-dod` | `harw-dod/crates/harw-dod` | dod | **D** | authority, dod-authlog, dod-blockio, dod-bpf, dod-cap, dod-cpu, dod-flow, dod-fsmon, dod-gpu, dod-listener, dod-memory, dod-netcounters, dod-procmon, dod-rules, dod-scanreport, dod-sentinel, dod-signals, dod-thermal, dod-workspace | 0 | — | linux (facade over sensors) | forbid (ws) | — |
+| `harw-dod-authlog` | `harw-dod/crates/harw-dod-authlog` | dod | **D+T** | dod-cap, dod-netlink, dod-signals, macros, types | 1 | Netlink | linux-only (netlink) | forbid (ws) | — |
+| `harw-dod-blockio` | `harw-dod/crates/harw-dod-blockio` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs/sysfs) | forbid (ws) | — |
+| `harw-dod-bpf` | `harw-dod/crates/harw-dod-bpf` | dod | **D+T** | dod-cap, macros, types | 4 | Bpf | linux-only (aya) | forbid (ws) | none in cargo; loads C BPF objects built by clang (harw-dod/bpf) |
+| `harw-dod-cap` | `harw-dod/crates/harw-dod-cap` | dod | **D** | authority, macros, types | 25 | Unpriv (listed) | unix cfg | forbid (ws) | — |
+| `harw-dod-cgroup` | `harw-dod/crates/harw-dod-cgroup` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 1 | Unpriv (listed) | linux-only (cgroup v2) | forbid (ws) | — |
+| `harw-dod-config` | `harw-dod/crates/harw-dod-config` | dod | **D** | — | 2 | Unpriv (listed) | unix (rustix) | forbid (ws + attr) | blake3 (cc) |
+| `harw-dod-cpu` | `harw-dod/crates/harw-dod-cpu` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs) | forbid (ws) | — |
+| `harw-dod-encrypt` | `harw-dod/crates/harw-dod-encrypt` | dod | **D** | macros | 0 | — | portable | forbid (ws) | — (lockfile: `cc`/`bindgen` via cfg-gated `crabgrind` in `crypt_guard_service`) |
+| `harw-dod-escalate` | `harw-dod/crates/harw-dod-escalate` | dod | **D** | authority, dod-rules, dod-signals, dod-warden-proto, macros, session-store, types | 1 | Unpriv (listed) | portable | forbid (ws + attr) | — |
+| `harw-dod-fixtures` | `harw-dod/crates/harw-dod-fixtures` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 0 | — | linux (fixture fs trees) | forbid (ws) | — |
+| `harw-dod-flow` | `harw-dod/crates/harw-dod-flow` | dod | **D+T** | authority, dod-bpf, dod-cap, dod-signals, macros, sandbox, types | 2 | Bpf | linux-only (bpf) | forbid (ws) | — |
+| `harw-dod-fsmon` | `harw-dod/crates/harw-dod-fsmon` | dod | **D+T** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | FileWatch | linux-only (fanotify) | forbid (ws) | — |
+| `harw-dod-gpu` | `harw-dod/crates/harw-dod-gpu` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (sysfs) | forbid (ws) | — |
+| `harw-dod-listener` | `harw-dod/crates/harw-dod-listener` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs; unix cfg) | forbid (ws) | — |
+| `harw-dod-memory` | `harw-dod/crates/harw-dod-memory` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs) | forbid (ws) | — |
+| `harw-dod-netcounters` | `harw-dod/crates/harw-dod-netcounters` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs) | forbid (ws) | — |
+| `harw-dod-netlink` | `harw-dod/crates/harw-dod-netlink` | dod | **D** | dod-cap, macros | 1 | Unpriv (listed) | linux-only | forbid (ws) | — |
+| `harw-dod-netpolicy` | `harw-dod/crates/harw-dod-netpolicy` | dod | **D** | authority, dod-cap, macros, sandbox | 0 | Unpriv (listed) | portable | forbid (ws + attr) | — |
+| `harw-dod-procmon` | `harw-dod/crates/harw-dod-procmon` | dod | **D+T** | dod-bpf, dod-cap, dod-signals, macros, types | 2 | Bpf | linux-only (bpf) | forbid (ws) | — |
+| `harw-dod-readfs` | `harw-dod/crates/harw-dod-readfs` | dod | **D** | dod-cap, macros | 11 | Unpriv (listed) | linux (procfs/sysfs reader; unix cfg) | forbid (ws) | — |
+| `harw-dod-rules` | `harw-dod/crates/harw-dod-rules` | dod | **D** | authority, code-graph, dod-signals, research, types | 5 | Unpriv (listed) | portable | forbid (ws + attr) | — |
+| `harw-dod-scanreport` | `harw-dod/crates/harw-dod-scanreport` | dod | **D** | dod-cap, dod-readfs, dod-signals, home, macros, types | 2 | Unpriv (listed) | portable | forbid (ws) | — |
+| `harw-dod-sentinel` | `harw-dod/crates/harw-dod-sentinel` | dod | **D** | authority, dod-cap, dod-rules, dod-signals, fsutil, macros, observe, types | 2 | Unpriv (listed) | linux (procfs) | forbid (ws) | — |
+| `harw-dod-signals` | `harw-dod/crates/harw-dod-signals` | dod | **D** | dod-cap, macros, observe, types | 25 | Unpriv (listed) | portable | forbid (ws) | — |
+| `harw-dod-thermal` | `harw-dod/crates/harw-dod-thermal` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (sysfs) | forbid (ws) | — |
+| `harw-dod-warden` | `harw-dod/crates/harw-dod-warden` | dod | **D+T** | dod-warden-proto, macros, types | 1 | Unpriv (listed) | linux-only (cgroup v2) | forbid (ws + attr) | — |
+| `harw-dod-warden-proto` | `harw-dod/crates/harw-dod-warden-proto` | dod | **D+T** | macros, types | 3 | Unpriv (listed) | portable | forbid (ws) | blake3 (cc) |
+| `harw-dod-workspace` | `harw-dod/crates/harw-dod-workspace` | dod | **D** | code-graph, dod-cap, dod-signals, macros, types | 2 | Unpriv (listed) | portable | forbid (ws + attr) | — |
+| `harw-probe-bpf` | `harw-dod/crates/harw-probe-bpf` | dod | **D+T** | authority, completions, dod-bpf, dod-cap, dod-config, dod-flow, dod-procmon, dod-signals, sandbox, types | 0 | bin budget CapBpf | linux-only (aya, landlock) | forbid (ws + attr) | — |
+| `harw-probe-fs` | `harw-dod/crates/harw-probe-fs` | dod | **D+T** | completions, dod-cap, dod-fsmon, dod-signals, types | 0 | bin budget CapSysAdmin | linux-only (fanotify, landlock) | forbid (ws + attr) | — |
+| `harw-sentinel` | `harw-dod/crates/harw-sentinel` | dod | **D** | authority, completions, dod-blockio, dod-cap, dod-cgroup, dod-config, dod-cpu, dod-gpu, dod-listener, dod-memory, dod-netcounters, dod-rules, dod-scanreport, dod-sentinel, dod-signals, dod-thermal, dod-workspace, home, macros, observe, observe-file, sandbox, types | 0 | bin budget Unprivileged | linux (landlock; non-linux stub) | forbid (ws + attr) | — |
+| `harw-warden` | `harw-dod/crates/harw-warden` | dod | **D+T** | completions, dod-warden, dod-warden-proto, macros, types | 0 | bin budget SystemdSocketNoNet | linux (landlock, socket act.; non-linux stub) | forbid (ws + attr) | — |
 | `harw` | `harw` | root | **A** | agent-dsl, authority, code-graph, core, extension-api, model-catalog, operations, ops, plan, plan-bridge, provider, registry-defaults, research, sandbox, types | 0 | — | portable | forbid (ws) | — |
 | `harw-auth-hub` | `harw-auth-hub` | root | **A** | — | 0 | — (daemon binary, not a monitored binary) | unix (UDS, SO_PEERCRED, socket activation) | forbid (ws + attr) | — (lockfile: `cc`/`bindgen` via cfg-gated `crabgrind` in `crypt_guard_service`) |
 | `harw-channel` | `harw-channel` | root | **A** | macros, secrets, session-store, types | 3 | — | portable | forbid (ws + attr) | — |

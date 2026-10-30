@@ -193,7 +193,7 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
 # Nur Test: ML-DSA-65-Testschlüssel für die Loopback-Tests des Remote-Ingress.
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 # Nur Test: bindet den Hub-Namespace an `HarwKeyPurpose::SecretsKek` (Ring D nur als dev-dependency).
-harw-dod-encrypt = { path = "../dod/crates/harw-dod-encrypt" }
+harw-dod-encrypt = { path = "../harw-dod/crates/harw-dod-encrypt" }
 
 [lints]
 workspace = true

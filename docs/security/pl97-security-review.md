@@ -56,7 +56,7 @@ authoritative.
 | `harw-dod-client/src/findings.rs:210` | P1 | `reaches_window_start` treats the minimum `observed_at` in the read tail as proof that unread older records are outside the window; a truncated or unordered export can be marked complete. |
 | `harw-dod-client/src/status.rs:328` | P1 | Warden can be reported `Enabled` with an inactive socket and an unreadable guard file (`flag_absent` is false for every error except `ENOENT`). |
 | `harw-dod-client/Cargo.toml:21` | P2 | `time` 0.3.53 requires Rust 1.88, above the crate's inherited `rust-version`. |
-| `dod/crates/harw-sentinel/src/main.rs:936` | P1 | Export destinations are compared lexically; `.`/`..` components or symlinked parents let findings and health aliases collide. |
+| `harw-dod/crates/harw-sentinel/src/main.rs:936` | P1 | Export destinations are compared lexically; `.`/`..` components or symlinked parents let findings and health aliases collide. |
 | `harw-home/src/bundle.rs:1001` | P1 | `include_str!` paths escape the publishable `harw-home` package into sibling crates. |
 | `harw-tool-job/src/model.rs:617` | P2 | A `harw-job-*` leaf name is not proof of a dedicated job cgroup without a delegated root. |
 | `harw-activity/src/reducer.rs:619` | P2 | A cancelled `Call → Job` rebase binds the job and injects a running constituent. |
@@ -67,13 +67,13 @@ authoritative.
 | `harw-core/src/turn_loop.rs:6128` | P2 | An injection delivery is acknowledged before its event is durable. |
 | `harw-tools/src/provider_macro.rs:511` | P1 | `TOOL_ACTIVITIES` is not reachable after provider registration (type erasure). |
 | `docs/design/dod-system-operations-authority.md:413` | P2 | `permission_request!` has no productive consumer yet; status should stay partial. |
-| `dod/crates/harw-probe-bpf/src/scope_rescan.rs:231` | P1 | Partial per-handle scope updates are declared recovered (E3b, outside this pass's range). |
+| `harw-dod/crates/harw-probe-bpf/src/scope_rescan.rs:231` | P1 | Partial per-handle scope updates are declared recovered (E3b, outside this pass's range). |
 
 **Updates after the report (PR #154 branch).**
 
 - `harw-dod-client/src/status.rs:328` is fixed in `64d3831c`.
 - `harw-activity/src/reducer.rs:619` is fixed in `ff7ca74a`.
-- `dod/crates/harw-probe-bpf/src/scope_rescan.rs:231` is fixed in the E3c
+- `harw-dod/crates/harw-probe-bpf/src/scope_rescan.rs:231` is fixed in the E3c
   commit. Every handle's map converges before recovery is reported. The
   regression tests are
   `partial_insert_converges_when_the_descendant_vanishes_before_the_retry`

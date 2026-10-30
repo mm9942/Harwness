@@ -1,7 +1,7 @@
 //! systemd socket activation (`--systemd-socket`).
 //!
 //! # Contract
-//! Same pattern as `harw-warden` (`dod/crates/harw-warden/src/systemd.rs`):
+//! Same pattern as `harw-warden` (`harw-dod/crates/harw-warden/src/systemd.rs`):
 //! the activation environment is checked explicitly first — `LISTEN_PID`
 //! must name this process and `LISTEN_FDS` must be exactly `1` — and only
 //! then does `sd_listen_fds::get()` turn descriptor 3 into an owned fd, so

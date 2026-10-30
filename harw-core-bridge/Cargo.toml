@@ -20,7 +20,7 @@ harw-research = { path = "../harw-research" }
 # (`harwness.security-verdict/v1`, AW6-02). Bewusst NICHT
 # `harw-dod-warden-proto`: dieser Adapter darf aus einem Verdikt keine
 # `WardenAction` bauen können (siehe `agent_tool.rs`, `ChildReturnContract`).
-harw-dod-signals = { path = "../dod/crates/harw-dod-signals" }
+harw-dod-signals = { path = "../harw-dod/crates/harw-dod-signals" }
 # #22 Welle 1B: das geschlossene Vokabular der Return-Contracts und
 # -Validatoren der Agent-IR v2 (`ChildReturnContract::parse` ist strikt).
 harw-agent-dsl = { path = "../harw-agent-dsl" }

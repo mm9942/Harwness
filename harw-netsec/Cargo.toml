@@ -45,7 +45,7 @@ bytes = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time", "signal", "io-util"] }
 
 # systemd socket activation without `unsafe` in this crate — the same crate
-# and version `harw-warden` uses (`dod/crates/harw-warden/src/systemd.rs`).
+# and version `harw-warden` uses (`harw-dod/crates/harw-warden/src/systemd.rs`).
 sd-listen-fds = "0.2.0"
 
 # Daemon logging to stderr (journald picks it up), same line as harw-sentinel.

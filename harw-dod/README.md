@@ -28,10 +28,10 @@ canonical tree `../deploy/` (Crypto Masterplan v2 §22, H10), the same files
 `harw install --print-systemd` prints. `packaging/` holds only the install
 manifest and the example configuration.
 
-`make -C dod install` installs files and performs no start or enable action.
+`make -C harw-dod install` installs files and performs no start or enable action.
 It preserves an existing `/etc/harw-dod/config.toml`; only
 `config.toml.example` is installed or replaced (mode `0640`).
-`DESTDIR=/tmp/stage make -C dod stage` is pure staging: it does not create
+`DESTDIR=/tmp/stage make -C harw-dod stage` is pure staging: it does not create
 accounts, call systemd, or touch host runtime state. A host install requires
 root and calls only the already-installed `systemd-sysusers`,
 `systemd-tmpfiles`, and `systemctl daemon-reload` helpers; it never invokes
@@ -45,7 +45,7 @@ a member either; it reads `findings.jsonl` only after the drop-in described
 in `docs/setup/dod.md` ("Letting `harw-security-hub` read the findings").
 
 Before enabling observation, copy the example to `/etc/harw-dod/config.toml`
-and add exactly one `active_profile`. `make -C dod enable` runs the explicit
+and add exactly one `active_profile`. `make -C harw-dod enable` runs the explicit
 configuration/profile check first and refuses to enable without that choice.
 `scope = "host"` is never an implicit fallback.
 
@@ -63,7 +63,7 @@ The units in `../deploy/systemd/` pass the configuration explicitly:
 --health-export <STATEDIR>/export/health.json` and `harw-probe-bpf --config
 /etc/harw-dod/config.toml`. With `--config`, a missing, untrusted or invalid
 configuration is fail closed for both binaries, so enable only after
-`/etc/harw-dod/config.toml` exists with an `active_profile` (`make -C dod
+`/etc/harw-dod/config.toml` exists with an `active_profile` (`make -C harw-dod
 enable` checks this first). There are no separate `--state-dir
 --telemetry-dir --runtime-dir` flags; `--home` is the sentinel's state
 directory, and packaging never substitutes a personal home path.
@@ -102,6 +102,6 @@ with the exact command to run by hand. It never checks tool *versions* —
 that stays `bpf/scripts/verify-toolchain.sh`'s fail-closed job against
 `bpf/toolchain.lock.toml`, unchanged.
 
-`make -C dod uninstall` removes only files listed in `packaging/manifest`.
+`make -C harw-dod uninstall` removes only files listed in `packaging/manifest`.
 It leaves `config.toml`, state, logs, runtime data, and system accounts in
 place so upgrades and rollbacks cannot silently discard operator evidence.

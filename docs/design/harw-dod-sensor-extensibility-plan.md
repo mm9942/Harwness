@@ -82,7 +82,7 @@ not" line is often more informative than the "delivers" line.
 
 ## 3. The fixture harness
 
-**Implemented:** `dod/crates/harw-dod-fixtures` is a dev-dependency shared
+**Implemented:** `harw-dod/crates/harw-dod-fixtures` is a dev-dependency shared
 by the sensor crates, providing the `sensor_suite!` macro
 (`src/macros.rs`) and the underlying assertion functions (`src/harness.rs`).
 The harness currently runs **nine** checks per sensor, more than originally
@@ -91,7 +91,7 @@ appears in a `SensorError`), scope containment, scope tightness, correct
 behavior on an empty scope, redaction, label cardinality, a declared error
 case, and — importantly — that an adversarial fixture "survives" as a
 `Data`-trust fragment rather than being treated as an instruction. See
-`dod/crates/harw-dod-fixtures/src/harness.rs` for the current, authoritative
+`harw-dod/crates/harw-dod-fixtures/src/harness.rs` for the current, authoritative
 list; §3.2 below is illustrative and may not match every macro parameter
 name.
 

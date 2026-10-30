@@ -137,7 +137,7 @@ are measured.
 ### 4.1 Layout
 
 Implemented as eleven crates (`dod`-style prefix discipline, but under the
-product workspace, not `dod/`):
+product workspace, not `harw-dod/`):
 
 | Crate | Responsibility |
 |---|---|

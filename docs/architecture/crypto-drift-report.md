@@ -51,10 +51,10 @@ Rule (§17): update comments and docs only. Do **not** reinterpret persisted rec
 
 ## 5. systemd drift: two sources of truth (§22)
 
-| Aspect | `deploy/systemd/*` | `dod/packaging/systemd/*` |
+| Aspect | `deploy/systemd/*` | `harw-dod/packaging/systemd/*` |
 |---|---|---|
 | Files | `harw-sentinel.service`, `harw-probe-fs.service`, `harw-probe-bpf.service`, `harw-warden.service`, `harw-warden.socket` | `harw-dod-sentinel.service`, `harw-dod-bpf.service`, `harw-dod-warden.service`, `harw-dod-warden.socket`, `harw-dod.target` |
-| Consumer | `harw-install/src/dod_units.rs`: `UNIT_CLASSES` names these files. `include_str!` of all five is **test-only** (`#[cfg(test)]`, lines 292–296). | `dod/Makefile` + `dod/scripts/install.sh` via `dod/packaging/manifest` (`@LIBEXECDIR@`/`@RUNTIMEDIR@` templating) |
+| Consumer | `harw-install/src/dod_units.rs`: `UNIT_CLASSES` names these files. `include_str!` of all five is **test-only** (`#[cfg(test)]`, lines 292–296). | `harw-dod/Makefile` + `harw-dod/scripts/install.sh` via `harw-dod/packaging/manifest` (`@LIBEXECDIR@`/`@RUNTIMEDIR@` templating) |
 | Runtime dir | `/run/harw` (`RuntimeDirectory=harw` on sentinel). Sockets `/run/harw/sentinel.sock` and `/run/harw/warden.sock`. | `@RUNTIMEDIR@` = `$(RUNSTATEDIR)/harw-dod` → `/run/harw-dod/{sentinel,warden}.sock` (matches §22.3) |
 | Users | `harw-sentinel`, `harw-probe-fs`, `harw-probe-bpf`, `harw-warden`; group `harw-ipc` | `harw-dod`, `harw-dod-bpf`; groups `harw-dod-ipc`, `harw-dod-config` (`sysusers.d`) |
 | Warden | `User=harw-warden` + `CAP_SYS_ADMIN` | **`User=root`** |
@@ -68,13 +68,13 @@ The DoD installer ships a warden running as root and a BPF probe with an extra c
 and neither is covered by the `dod_units.rs` checks. **H0 changes nothing here.** The merge to one
 canonical, embedded source (§22.1) is DoD-integration work (`50-dod-integration`, R12+).
 
-**Resolved in H10.** `deploy/` is the only source; `dod/packaging/{systemd,sysusers.d,tmpfiles.d}`
+**Resolved in H10.** `deploy/` is the only source; `harw-dod/packaging/{systemd,sysusers.d,tmpfiles.d}`
 are deleted. For each unit the stricter variant was kept and justified from the code:
 
 | Aspect | H10 result |
 |---|---|
 | Files | `deploy/systemd/`: `harw-dod.target`, `harw-sentinel.service`, `harw-probe-bpf.service`, `harw-probe-fs.service`, `harw-warden.{service,socket}`; infra: `harw-infra.target`, `harw-control.{socket,service}`, `harw-auth-hub.{socket,service}`, `harw-netsec.{socket,service}`, `harw-security-hub.{socket,service}`. `deploy/sysusers.d/harw.conf`, `deploy/tmpfiles.d/harw.conf`. |
-| Consumer | `harw-install::deployment::DEPLOYMENT_ASSETS` embeds every `deploy/` file with `include_str!` in production code; `harw install --print-systemd [UNIT]`; `dod/scripts/install.sh` installs from `deploy/` and renders `@LIBEXECDIR@ @BPFDIR@ @SYSCONFDIR@ @STATEDIR@ @LOGDIR@`. Parity tests: `deploy/` ↔ embedded ↔ `dod/packaging/manifest` ↔ `install.sh`. |
+| Consumer | `harw-install::deployment::DEPLOYMENT_ASSETS` embeds every `deploy/` file with `include_str!` in production code; `harw install --print-systemd [UNIT]`; `harw-dod/scripts/install.sh` installs from `deploy/` and renders `@LIBEXECDIR@ @BPFDIR@ @SYSCONFDIR@ @STATEDIR@ @LOGDIR@`. Parity tests: `deploy/` ↔ embedded ↔ `harw-dod/packaging/manifest` ↔ `install.sh`. |
 | Runtime dir | `/run/harw` for the DoD sockets (kept, overriding D1's `/run/harw-dod`), `/run/harw/infra/{control,secure,network,security}.sock` for the infra sockets, all four socket-activated (`harw-{control,auth-hub,netsec,security-hub}.socket`), so `/run/harw/infra` is `0755 root:root`. Both directories come from `tmpfiles.d` (no shared `RuntimeDirectory=`). |
 | Users | one per binary: `harw-sentinel`, `harw-probe-fs`, `harw-probe-bpf`, `harw-warden`; infra `harw-auth`, `harw-netsec`, `harw-security-hub`, `harw-control`. Groups `harw-ipc`, `harw-dod-config`, `harw-warden-clients`, `harw-secure`, `harw-network`, `harw-security`, `harw-control-clients` (socket client groups). The former `harw-infra` group for self-binding daemons is gone: no infra daemon binds its own socket any more. |
 | Warden | own user, `CAP_DAC_OVERRIDE CAP_NET_ADMIN` (cgroup file writes; `nft` child), `AF_UNIX AF_NETLINK`, no `[Install]`, `warden.enable` guard. |

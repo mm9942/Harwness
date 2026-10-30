@@ -285,7 +285,7 @@ Run per new or touched crate, against `origin/dev` at `4e49a17`:
 - `cargo run -q -p xtask -- gates edges`, `gates privileges`
 
 Known environment limits: `cargo deny check`, the `warden-*` gates,
-`make -C dod clippy test` and `actionlint` are not run in the worker sandbox;
+`make -C harw-dod clippy test` and `actionlint` are not run in the worker sandbox;
 they belong to the central gate on the frozen integration SHA (W00 section
 11). `cargo clippy` on `harw-cli` additionally needs
 `-A clippy::doc_nested_refdefs`, because `harw-ops/src/bug_report.rs` already

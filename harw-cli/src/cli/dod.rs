@@ -1,7 +1,7 @@
 //! Grammar of `harw dod` (PL-97 D3): the Harw-DoD suite from the command
 //! line — read-only status, findings, sensor health, doctor and config
 //! check, plus the root-only service control that mirrors
-//! `make -C dod enable|disable|restart|enable-warden`.
+//! `make -C harw-dod enable|disable|restart|enable-warden`.
 //!
 //! The help texts are German like the rest of the `harw` grammar.
 

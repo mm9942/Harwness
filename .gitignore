@@ -60,8 +60,8 @@ docs/archive/
 **/*transcript*
 # Source files that merely have "transcript" in their name (signing
 # transcripts in harw-dod-encrypt) are code, not session transcripts.
-!dod/crates/harw-dod-encrypt/src/transcript.rs
-!dod/crates/harw-dod-encrypt/tests/transcript.rs
+!harw-dod/crates/harw-dod-encrypt/src/transcript.rs
+!harw-dod/crates/harw-dod-encrypt/tests/transcript.rs
 **/codex-session-*
 auth.toml
 *.key

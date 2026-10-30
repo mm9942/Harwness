@@ -8,7 +8,7 @@ contributions must not weaken, see [SECURITY.md](SECURITY.md).
 
 The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
 (currently `1.98.1`, with `rustfmt` and `clippy`). `rustup` picks this version
-up automatically everywhere in the repository (including `dod/`), so your
+up automatically everywhere in the repository (including `harw-dod/`), so your
 local build uses the same compiler, `rustfmt` and `clippy` as CI.
 
 ```bash
@@ -23,7 +23,7 @@ two domains:
 
 - the product crates at the repository root (`harw`, `harw-cli`, `harw-tui`,
   `harw-core`, and friends);
-- the Detect · Orient · Defend (DoD) crates under `dod/crates/`, listed explicitly
+- the Detect · Orient · Defend (DoD) crates under `harw-dod/crates/`, listed explicitly
   in a separate block of the root `members`.
 
 Until PL-60 `dod/` was a separate, nested workspace with its own lockfile; see
@@ -110,7 +110,7 @@ cargo clippy --workspace --tests -- -D warnings
 cargo nextest run --workspace   # or: cargo test --workspace
 cargo test --workspace --doc
 cargo run -q -p xtask -- gates
-make -C dod test   # DoD crates only, -p selection against the root workspace
+make -C harw-dod test   # DoD crates only, -p selection against the root workspace
 cargo deny check
 # Linux-arm64 cross-check (rustup target add aarch64-unknown-linux-gnu,
 # apt install gcc-aarch64-linux-gnu):

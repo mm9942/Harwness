@@ -42,7 +42,7 @@ case "$action" in
         ;;
     smoke)
         if [ "${SMOKE_CONFIRM:-0}" != 1 ]; then
-            printf '%s\n' 'smoke is an explicit live action; rerun with SMOKE_CONFIRM=1 make -C dod smoke' >&2
+            printf '%s\n' 'smoke is an explicit live action; rerun with SMOKE_CONFIRM=1 make -C harw-dod smoke' >&2
             exit 2
         fi
         require_root

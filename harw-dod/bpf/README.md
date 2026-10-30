@@ -11,7 +11,7 @@ toolchain validated on the target host. A different distribution or tool
 upgrade can change any of these lines; a mismatch reports the expected and
 actual versions and stops the build. Use the locked tools, or record the
 installed versions in a candidate lock and validate them with
-`make -C dod/bpf TOOLCHAIN_LOCK=/path/to/candidate.lock.toml OUT=/tmp/dod-bpf-check`
+`make -C harw-dod/bpf TOOLCHAIN_LOCK=/path/to/candidate.lock.toml OUT=/tmp/dod-bpf-check`
 before updating the committed lock. The build:
 
 - derives `vmlinux.h` from the target BTF;
