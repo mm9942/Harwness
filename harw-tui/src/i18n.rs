@@ -11,6 +11,8 @@ use std::sync::OnceLock;
 
 // Register each new component zone here; every JSON key starts with that zone.
 const CATALOG_SOURCES: &[(&str, &str)] = &[
+    ("agents", include_str!("locales/agents.json")),
+    ("mission", include_str!("locales/mission.json")),
     ("history", include_str!("locales/history.json")),
     ("tool_chrome", include_str!("locales/tool_chrome.json")),
     (

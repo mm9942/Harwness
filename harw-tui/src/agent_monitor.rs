@@ -437,13 +437,13 @@ pub(crate) enum AgentPhase {
 impl AgentPhase {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Admitted => "zugelassen",
-            Self::Thinking => "denkt",
-            Self::Tool => "Werkzeug",
-            Self::Waiting => "wartet",
-            Self::Done => "fertig",
-            Self::Failed => "fehlgeschlagen",
-            Self::Cancelled => "abgebrochen",
+            Self::Admitted => crate::i18n::tr("agents.admitted", "admitted"),
+            Self::Thinking => crate::i18n::tr("agents.thinking", "thinking"),
+            Self::Tool => crate::i18n::tr("agents.tool", "tool"),
+            Self::Waiting => crate::i18n::tr("agents.waiting", "waiting"),
+            Self::Done => crate::i18n::tr("agents.done", "done"),
+            Self::Failed => crate::i18n::tr("agents.failed", "failed"),
+            Self::Cancelled => crate::i18n::tr("agents.cancelled", "cancelled"),
         }
     }
 
@@ -768,7 +768,11 @@ impl AgentMonitor {
                     && live.task.as_deref() != Some(task.as_str())
                 {
                     live.task = Some(task.clone());
-                    live.trace.push_status(&format!("Aufgabe: {task}"));
+                    live.trace.push_status(&crate::i18n::tr_args(
+                        "agents.task",
+                        "Task: {task}",
+                        &[("task", &(task).to_string())],
+                    ));
                 }
                 if let Some(calls) = orch.tool_calls {
                     live.tool_calls = live.tool_calls.max(calls);
@@ -791,7 +795,8 @@ impl AgentMonitor {
                 // Ereignis darf einen fertigen Agenten nicht „laufen“ lassen).
                 if orch.status == AgentOrchestrationStatus::Running && !before.is_active() {
                     live.begin_run();
-                    live.trace.push_status("Neuer Lauf");
+                    live.trace
+                        .push_status(crate::i18n::tr("agents.new_run", "New run"));
                 }
                 live.phase = match orch.status {
                     AgentOrchestrationStatus::Admitted => AgentPhase::Admitted,
@@ -828,8 +833,11 @@ impl AgentMonitor {
                     live.current_tool = None;
                     live.trace.close_streams();
                     if before != live.phase {
-                        live.trace
-                            .push_status(&format!("Status: {}", live.phase.label()));
+                        live.trace.push_status(&crate::i18n::tr_args(
+                            "agents.status",
+                            "Status: {p0}",
+                            &[("p0", &(live.phase.label()).to_string())],
+                        ));
                     }
                 }
                 true
@@ -919,12 +927,18 @@ impl AgentMonitor {
                     );
                 }
                 TurnItem::Error(error) => {
-                    live.trace
-                        .push_status(&format!("Fehler: {}", error.message));
+                    live.trace.push_status(&crate::i18n::tr_args(
+                        "agents.error",
+                        "Error: {p0}",
+                        &[("p0", &(error.message).to_string())],
+                    ));
                 }
                 TurnItem::UserMessage(message) => {
-                    live.trace
-                        .push_status(&format!("Eingabe: {}", content_text(&message.content)));
+                    live.trace.push_status(&crate::i18n::tr_args(
+                        "agents.input",
+                        "Input: {p0}",
+                        &[("p0", &(content_text(&message.content)).to_string())],
+                    ));
                 }
             },
             TurnEvent::UsageUpdated { turn_total, .. } => {
@@ -949,8 +963,13 @@ impl AgentMonitor {
                 ..
             } => {
                 live.compactions = live.compactions.saturating_add(1);
-                live.trace.push_status(&format!(
-                    "Kontext verdichtet: {items_before} → {items_after} Einträge"
+                live.trace.push_status(&crate::i18n::tr_args(
+                    "agents.compacted",
+                    "Context compacted: {items_before} → {items_after} entries",
+                    &[
+                        ("items_before", &(items_before).to_string()),
+                        ("items_after", &(items_after).to_string()),
+                    ],
                 ));
             }
             TurnEvent::ToolCallRequested {
@@ -984,8 +1003,19 @@ impl AgentMonitor {
             TurnEvent::ChildSpawned { role, question, .. } => {
                 live.phase = AgentPhase::Waiting;
                 let status = match question {
-                    Some(question) => format!("⇢ Kind {role} gestartet: {question}"),
-                    None => format!("⇢ Kind {role} gestartet"),
+                    Some(question) => crate::i18n::tr_args(
+                        "agents.child_started_task",
+                        "⇢ Child {role} started: {question}",
+                        &[
+                            ("role", &(role).to_string()),
+                            ("question", &(question).to_string()),
+                        ],
+                    ),
+                    None => crate::i18n::tr_args(
+                        "agents.child_started",
+                        "⇢ Child {role} started",
+                        &[("role", &(role).to_string())],
+                    ),
                 };
                 live.trace.push_status(&status);
             }
@@ -998,8 +1028,15 @@ impl AgentMonitor {
                 let label = child_label.unwrap_or_default();
                 #[allow(clippy::cast_precision_loss)]
                 let secs = *duration_ms as f64 / 1000.0;
-                live.trace
-                    .push_status(&format!("⇠ Kind {label} beendet: {outcome} ({secs:.1}s)"));
+                live.trace.push_status(&crate::i18n::tr_args(
+                    "agents.child_ended",
+                    "⇠ Child {label} ended: {outcome} ({secs}s)",
+                    &[
+                        ("label", &(label).to_string()),
+                        ("outcome", &(outcome).to_string()),
+                        ("secs", &format!("{:.1}", secs)),
+                    ],
+                ));
             }
             TurnEvent::TurnCompleted { usage, .. } => {
                 let turn_usage = usage.clone().unwrap_or_else(|| live.usage_turn.clone());
@@ -1009,7 +1046,8 @@ impl AgentMonitor {
                 live.current_tool = None;
                 live.finished = Some(Instant::now());
                 live.trace.close_streams();
-                live.trace.push_status("Turn abgeschlossen");
+                live.trace
+                    .push_status(crate::i18n::tr("agents.turn_done", "Turn completed"));
             }
             TurnEvent::TurnFailed { reason, .. } => {
                 live.usage_done.add(&live.usage_turn.clone());
@@ -1019,8 +1057,11 @@ impl AgentMonitor {
                 live.failure_seen = false;
                 live.finished = Some(Instant::now());
                 live.trace.close_streams();
-                live.trace
-                    .push_status(&format!("Turn fehlgeschlagen: {reason}"));
+                live.trace.push_status(&crate::i18n::tr_args(
+                    "agents.turn_failed",
+                    "Turn failed: {reason}",
+                    &[("reason", &(reason).to_string())],
+                ));
             }
             TurnEvent::TurnAborted { .. } => {
                 live.usage_done.add(&live.usage_turn.clone());
@@ -1028,7 +1069,8 @@ impl AgentMonitor {
                 live.phase = AgentPhase::Cancelled;
                 live.finished = Some(Instant::now());
                 live.trace.close_streams();
-                live.trace.push_status("Turn abgebrochen");
+                live.trace
+                    .push_status(crate::i18n::tr("agents.turn_cancelled", "Turn cancelled"));
             }
             _ => return false,
         }
@@ -1518,24 +1560,32 @@ impl AgentMonitor {
     ) {
         let Some(live) = self.agents.get(agent.as_str()) else {
             Paragraph::new(Line::styled(
-                "Agent nicht gefunden.",
+                crate::i18n::tr("agents.not_found", "Agent not found."),
                 Style::default().add_modifier(Modifier::DIM),
             ))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Agent · Esc zurück "),
+                    .title(crate::i18n::tr("agents.detail_back", " Agent · Esc back ")),
             )
             .render(area, buf);
             return;
         };
-        let reasoning_hint = if show_reasoning { "an" } else { "aus" };
+        let reasoning_hint = if show_reasoning {
+            crate::i18n::tr("agents.on", "on")
+        } else {
+            crate::i18n::tr("agents.off", "off")
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
-            .title(format!(
-                " Agent · {} · Esc zurück · r Reasoning {reasoning_hint} ",
-                sanitize_inline(&live.role)
+            .title(crate::i18n::tr_args(
+                "agents.detail_title",
+                " Agent · {p0} · Esc back · r Reasoning {reasoning_hint} ",
+                &[
+                    ("p0", &(sanitize_inline(&live.role)).to_string()),
+                    ("reasoning_hint", &(reasoning_hint).to_string()),
+                ],
             ));
         let inner = block.inner(area);
         block.render(area, buf);
@@ -1560,7 +1610,11 @@ impl AgentMonitor {
         if rest == 0 {
             return;
         }
-        let separator = format!("── Verlauf ({} Einträge) ", live.trace.len());
+        let separator = crate::i18n::tr_args(
+            "agents.trace_header",
+            "── Trace ({p0} entries) ",
+            &[("p0", &(live.trace.len()).to_string())],
+        );
         let separator_width = usize::from(inner.width);
         let fill = separator_width.saturating_sub(separator.chars().count());
         Line::styled(
@@ -1594,9 +1648,9 @@ impl AgentMonitor {
             .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
             .render(trace_area, buf);
         // Hinweis, solange die Spur nicht folgt (unterste Zeile, rechtsbündig).
-        if let Some(text) = scroll.indicator_text("G") {
+        if let Some(text) = crate::app::scroll_indicator_text(scroll, "G") {
             let label = format!(" {text} ");
-            let label_width = u16::try_from(label.chars().count())
+            let label_width = u16::try_from(display_width(&label))
                 .unwrap_or(u16::MAX)
                 .min(trace_area.width);
             let indicator_area = Rect {
@@ -1655,13 +1709,13 @@ fn detail_header_lines(live: &AgentLive, width: usize) -> Vec<Line<'static>> {
     ])];
     if let Some(route) = live.model_route() {
         lines.push(Line::from(vec![
-            Span::styled("Modell: ", dim),
+            Span::styled(crate::i18n::tr("agents.model", "Model: "), dim),
             Span::raw(sanitize_inline(&route)),
         ]));
     }
     if let Some(task) = &live.task {
         lines.push(Line::from(vec![
-            Span::styled("Aufgabe: ", dim),
+            Span::styled(crate::i18n::tr("agents.task_prefix", "Task: "), dim),
             Span::raw(sanitize_inline(task)),
         ]));
     }
@@ -1674,7 +1728,11 @@ fn detail_header_lines(live: &AgentLive, width: usize) -> Vec<Line<'static>> {
     if let Some(cached) = usage.cached_tokens.filter(|c| *c > 0) {
         stats.push_str(&format!(" ⟳{}", human_tokens(cached)));
     }
-    stats.push_str(&format!(" · {} Tools", live.tool_calls));
+    stats.push_str(&crate::i18n::tr_args(
+        "agents.tools_count",
+        " · {p0} tools",
+        &[("p0", &(live.tool_calls).to_string())],
+    ));
     if live.phase.is_active() && live.tokens_per_sec > 0.5 {
         stats.push_str(&format!(" · {:.0} tok/s", live.tokens_per_sec));
     }
@@ -1694,10 +1752,18 @@ fn detail_header_lines(live: &AgentLive, width: usize) -> Vec<Line<'static>> {
             human_tokens(live.context_window)
         );
         if live.compactions > 0 {
-            ctx.push_str(&format!(" · {}× verdichtet", live.compactions));
+            ctx.push_str(&crate::i18n::tr_args(
+                "agents.compactions",
+                " · {p0}× compacted",
+                &[("p0", &(live.compactions).to_string())],
+            ));
         }
         if live.history_dropped > 0 {
-            ctx.push_str(&format!(" · {} ausgelassen", live.history_dropped));
+            ctx.push_str(&crate::i18n::tr_args(
+                "agents.dropped",
+                " · {p0} omitted",
+                &[("p0", &(live.history_dropped).to_string())],
+            ));
         }
         lines.push(Line::styled(ctx, ctx_style));
     }
@@ -1717,7 +1783,10 @@ fn trace_lines(trace: &AgentTrace, show_reasoning: bool) -> Vec<Line<'static>> {
     let call_style = Style::default().fg(Color::Cyan);
     let mut lines: Vec<Line<'static>> = Vec::new();
     if trace.is_empty() {
-        lines.push(Line::styled("Noch keine Aktivität.", dim));
+        lines.push(Line::styled(
+            crate::i18n::tr("agents.no_activity", "No activity yet."),
+            dim,
+        ));
         return lines;
     }
     for entry in trace.entries() {
@@ -1738,7 +1807,11 @@ fn trace_lines(trace: &AgentTrace, show_reasoning: bool) -> Vec<Line<'static>> {
                 } else {
                     let count = clean.lines().count();
                     lines.push(Line::styled(
-                        format!("∴ Reasoning ({count} Zeilen, r zeigt)"),
+                        crate::i18n::tr_args(
+                            "agents.reasoning_hidden",
+                            "∴ Reasoning ({count} lines, r to show)",
+                            &[("count", &(count).to_string())],
+                        ),
                         reasoning_style,
                     ));
                 }
@@ -1833,7 +1906,7 @@ fn phase_style(phase: AgentPhase, theme: Theme) -> Style {
 fn state_label(live: &AgentLive) -> String {
     match (live.phase, live.current_tool.as_deref()) {
         (AgentPhase::Tool, Some(tool)) => fit_width(&sanitize_inline(tool), 14),
-        (AgentPhase::Admitted, _) => "startet".to_owned(),
+        (AgentPhase::Admitted, _) => crate::i18n::tr("agents.starting", "starting").to_owned(),
         (phase, _) => phase.label().to_owned(),
     }
 }
@@ -1957,7 +2030,15 @@ fn finished_summary_line(
 ) -> Line<'static> {
     let marker = if selected { "▸" } else { " " };
     let arrow = if expanded { "▾" } else { "▸" };
-    let head = format!("{marker}✓ {} fertig {arrow}", finished.len());
+    let head = crate::i18n::tr_args(
+        "agents.finished_summary",
+        "{marker}✓ {p0} finished {arrow}",
+        &[
+            ("marker", &(marker).to_string()),
+            ("p0", &(finished.len()).to_string()),
+            ("arrow", &(arrow).to_string()),
+        ],
+    );
     let total: u64 = finished.iter().map(|live| live.usage().total()).sum();
     let sigma = format!(" · Σ {} Tok", human_tokens(total));
     let mut roles: Vec<(String, usize)> = Vec::new();
@@ -2035,7 +2116,11 @@ fn gauge_line(live: &AgentLive, depth: usize, width: usize, theme: Theme) -> Opt
     };
     let mut text = format!("{indent}ctx {}{tail}", gauge(pct, bar_width));
     if live.compactions > 0 {
-        text.push_str(&format!(" · {}× verdichtet", live.compactions));
+        text.push_str(&crate::i18n::tr_args(
+            "agents.compactions",
+            " · {p0}× compacted",
+            &[("p0", &(live.compactions).to_string())],
+        ));
     }
     Some(Line::styled(fit_width(&text, width), ctx_style))
 }
@@ -2095,10 +2180,18 @@ pub(crate) fn render_collapsed_summary(
         .collect();
     let marker = if focused { "▸ " } else { "" };
     let mut spans = vec![Span::styled(
-        format!("{marker}Agenten: "),
+        crate::i18n::tr_args(
+            "agents.agents_prefix",
+            "{marker}Agents: ",
+            &[("marker", &(marker).to_string())],
+        ),
         style::dim_style(theme),
     )];
-    let mut text = format!("● {active} aktiv");
+    let mut text = crate::i18n::tr_args(
+        "agents.active_count",
+        "● {active} active",
+        &[("active", &(active).to_string())],
+    );
     if !running.is_empty() {
         text.push_str(&format!(" ({})", running.join(", ")));
     }
@@ -2108,18 +2201,26 @@ pub(crate) fn render_collapsed_summary(
     ));
     if failed > 0 {
         spans.push(Span::styled(
-            format!(" · ✗ {failed} fehlgeschlagen"),
+            crate::i18n::tr_args(
+                "agents.failed_count",
+                " · ✗ {failed} failed",
+                &[("failed", &(failed).to_string())],
+            ),
             style::error_style(theme),
         ));
     }
     if finished > 0 {
         spans.push(Span::styled(
-            format!(" · ✓ {finished} fertig"),
+            crate::i18n::tr_args(
+                "agents.done_count",
+                " · ✓ {finished} done",
+                &[("finished", &(finished).to_string())],
+            ),
             style::success_style(theme),
         ));
     }
     spans.push(Span::styled(
-        " · breiteres Fenster für das Panel",
+        crate::i18n::tr("agents.wider", " · widen the window for the panel"),
         style::dim_style(theme),
     ));
     Some(clip_line(Line::from(spans), width))
@@ -2241,7 +2342,10 @@ fn panel_rows(
     if entries.is_empty() {
         rows.push(PanelRow {
             line: Line::styled(
-                fit_width("Noch keine Agenten aktiv.", width),
+                fit_width(
+                    crate::i18n::tr("agents.no_agents", "No active agents yet."),
+                    width,
+                ),
                 style::dim_style(theme),
             ),
             entry: None,
@@ -2272,7 +2376,10 @@ fn panel_rows(
             entry: None,
         });
         rows.push(PanelRow {
-            line: Line::styled("intern", style::dim_style(theme)),
+            line: Line::styled(
+                crate::i18n::tr("agents.internal", "internal"),
+                style::dim_style(theme),
+            ),
             entry: None,
         });
         for (purpose, usage) in internal {
@@ -2321,7 +2428,11 @@ fn panel_rows(
             rows.push(PanelRow {
                 line: Line::styled(
                     fit_width(
-                        &format!("── {} live · Enter Details ──", sanitize_inline(&live.role)),
+                        &crate::i18n::tr_args(
+                            "agents.live_detail",
+                            "── {p0} live · Enter details ──",
+                            &[("p0", &(sanitize_inline(&live.role)).to_string())],
+                        ),
                         width,
                     ),
                     style::dim_style(theme),
@@ -2401,7 +2512,11 @@ fn render_agents_list(
     // Plan R9, Teil F: laufende Hintergrund-Jobs im Titel.
     let running_jobs = monitor.listed_jobs().filter(|row| row.active).count();
     if running_jobs > 0 {
-        title.push_str(&format!("· ⚙ {running_jobs} Jobs "));
+        title.push_str(&crate::i18n::tr_args(
+            "mission.jobs_badge",
+            "· ⚙ {running_jobs} Jobs ",
+            &[("running_jobs", &running_jobs.to_string())],
+        ));
     }
     let inner_width = usize::from(area.width.saturating_sub(2));
     let title = fit_width(&title, inner_width);
@@ -2550,13 +2665,21 @@ pub(crate) fn render_dock(
 /// „Active Agents“ ([`PanelScope::ActiveOnly`]) nur die laufenden.
 fn agents_title(monitor: &AgentMonitor) -> String {
     let (active, failed, finished) = monitor.panel_counts();
-    let mut title = format!(" Agenten · {active} aktiv ");
+    let mut title = crate::i18n::tr_args(
+        "agents.dock_title",
+        " Agents · {active} active ",
+        &[("active", &(active).to_string())],
+    );
     if monitor.scope.get() == PanelScope::All {
         if failed > 0 {
             title.push_str(&format!("· ✗ {failed} "));
         }
         if finished > 0 {
-            title.push_str(&format!("· {finished} fertig "));
+            title.push_str(&crate::i18n::tr_args(
+                "agents.dock_done",
+                "· {finished} done ",
+                &[("finished", &(finished).to_string())],
+            ));
         }
     }
     title
@@ -2637,7 +2760,10 @@ fn render_agents_only_panel(
     if rows.is_empty() {
         rows.push(PanelRow {
             line: Line::styled(
-                fit_width("Noch keine Agenten aktiv.", inner_width),
+                fit_width(
+                    crate::i18n::tr("agents.no_agents", "No active agents yet."),
+                    inner_width,
+                ),
                 style::dim_style(theme),
             ),
             entry: None,
@@ -2715,7 +2841,11 @@ fn render_jobs_only_panel(
     }
     let running = monitor.listed_jobs().filter(|row| row.active).count();
     let title = fit_width(
-        &format!(" Jobs · {running} aktiv "),
+        &crate::i18n::tr_args(
+            "mission.jobs_title",
+            " Jobs · {running} active ",
+            &[("running", &(running).to_string())],
+        ),
         usize::from(area.width.saturating_sub(2)),
     );
     let border = if focused {
@@ -2757,7 +2887,7 @@ fn render_jobs_only_panel(
     if rows.is_empty() {
         rows.push(PanelRow {
             line: Line::styled(
-                fit_width("Keine Jobs.", inner_width),
+                fit_width(crate::i18n::tr("mission.no_jobs", "No jobs."), inner_width),
                 style::dim_style(theme),
             ),
             entry: None,
@@ -3288,7 +3418,7 @@ mod tests {
             .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
             .collect();
         assert!(
-            header.contains("Modell: anthropic/claude-sonnet-4-5-20250929"),
+            header.contains("Model: anthropic/claude-sonnet-4-5-20250929"),
             "{header}"
         );
     }
@@ -3360,20 +3490,20 @@ mod tests {
 
         let shown = render_to_string(&monitor, 70, 20, 0, true)?;
         assert!(shown.contains("explorer"), "{shown}");
-        assert!(shown.contains("Aufgabe: Finde die Config"), "{shown}");
+        assert!(shown.contains("Task: Finde die Config"), "{shown}");
         assert!(shown.contains("ctx"), "{shown}");
         assert!(shown.contains("25%"), "{shown}");
         assert!(shown.contains("∴ geheimer Gedanke"), "{shown}");
         assert!(shown.contains("⚙ Search(\"cfg\" in .)"), "{shown}");
         assert!(
-            shown.contains("✓ Search(\"cfg\" in .) 1ms · 3 Treffer"),
+            shown.contains("✓ Search(\"cfg\" in .) 1ms · 3 hits"),
             "{shown}"
         );
         assert!(shown.contains("Gefunden in harw.toml"), "{shown}");
 
         let hidden = render_to_string(&monitor, 70, 20, 0, false)?;
         assert!(!hidden.contains("geheimer Gedanke"), "{hidden}");
-        assert!(hidden.contains("∴ Reasoning (1 Zeilen"), "{hidden}");
+        assert!(hidden.contains("∴ Reasoning (1 lines"), "{hidden}");
 
         // Stile: Werkzeugaufruf cyan, Ergebnis grün.
         let id = SessionId::try_from_str("a")?;
@@ -3451,12 +3581,12 @@ mod tests {
         let after = render_with_state(&monitor, 50, 16, &reading, true)?;
         assert_eq!(first_entry(&after), Some(first_before), "{after}");
         assert!(!after.contains("Eintrag-45"), "{after}");
-        assert!(after.contains("neue Zeilen"), "{after}");
-        assert!(after.contains("G springt ans Ende"), "{after}");
+        assert!(after.contains("new lines"), "{after}");
+        assert!(after.contains("G jumps to end"), "{after}");
 
         let tail = render_with_state(&monitor, 50, 16, &following, true)?;
         assert!(tail.contains("Eintrag-45"), "{tail}");
-        assert!(!tail.contains("springt ans Ende"), "{tail}");
+        assert!(!tail.contains("jumps to end"), "{tail}");
         Ok(())
     }
 
@@ -3464,7 +3594,7 @@ mod tests {
     fn detail_view_for_unknown_agent_does_not_panic() -> TestResult {
         let monitor = AgentMonitor::default();
         let shown = render_to_string(&monitor, 40, 5, 0, true)?;
-        assert!(shown.contains("Agent nicht gefunden"), "{shown}");
+        assert!(shown.contains("Agent not found"), "{shown}");
         Ok(())
     }
 
@@ -3629,17 +3759,17 @@ mod tests {
         let mut monitor = busy_monitor()?;
         let rows = panel_screen(&monitor, 44, 20, false)?;
         let shown = rows.join("\n");
-        assert!(rows[0].contains("1 aktiv"), "{shown}");
-        assert!(rows[0].contains("6 fertig"), "{shown}");
+        assert!(rows[0].contains("1 active"), "{shown}");
+        assert!(rows[0].contains("6 done"), "{shown}");
         let summary: Vec<&String> = rows
             .iter()
-            .filter(|row| row.contains("✓ 6 fertig"))
+            .filter(|row| row.contains("✓ 6 finished"))
             .collect();
         assert_eq!(summary.len(), 1, "{shown}");
         assert!(summary[0].contains("uia-worker×3"), "{shown}");
         assert_eq!(
             rows.iter()
-                .filter(|row| row.contains("uia-explorer") && !row.contains("fertig"))
+                .filter(|row| row.contains("uia-explorer") && !row.contains("done"))
                 .count(),
             0,
             "fertige Explorer stehen nur in der Sammelzeile: {shown}"
@@ -3647,11 +3777,11 @@ mod tests {
         // Der laufende Worker steht zuerst, mit Modell und Zustand.
         let running = rows
             .iter()
-            .position(|row| row.contains("uia-worker") && row.contains("denkt"))
+            .position(|row| row.contains("uia-worker") && row.contains("thinking"))
             .ok_or("laufender Worker fehlt")?;
         let summary_row = rows
             .iter()
-            .position(|row| row.contains("✓ 6 fertig"))
+            .position(|row| row.contains("✓ 6 finished"))
             .ok_or("Sammelzeile fehlt")?;
         assert!(running < summary_row, "{shown}");
         // Genug Platz: dünner Kontextbalken unter dem laufenden Agenten.
@@ -3683,6 +3813,7 @@ mod tests {
             active,
             failed,
             reason: None,
+            reason_source: None,
             origin: None,
             cgroup: None,
             ended_at: None,
@@ -3724,15 +3855,15 @@ mod tests {
         assert!(rows[0].contains("⚙ 1 Jobs"), "{shown}");
         let header = rows
             .iter()
-            .position(|row| row.contains("── Jobs · 1 aktiv"))
+            .position(|row| row.contains("── Jobs · 1 active"))
             .ok_or("Kopfzeile der Jobs-Gruppe fehlt")?;
         let running = rows
             .iter()
-            .position(|row| row.contains("ladybird build") && row.contains("läuft"))
+            .position(|row| row.contains("ladybird build") && row.contains("running"))
             .ok_or("laufender Job fehlt")?;
         let summary = rows
             .iter()
-            .position(|row| row.contains("✓ 2 Jobs beendet"))
+            .position(|row| row.contains("✓ 2 jobs finished"))
             .ok_or("Sammelzeile der Jobs fehlt")?;
         assert!(header < running && running < summary, "{shown}");
         assert!(!shown.contains("vcpkg restore"), "eingeklappt: {shown}");
@@ -3806,7 +3937,7 @@ mod tests {
         monitor.mark_seen("f1");
         let seen = panel_screen(&monitor, 60, 20, false)?.join("\n");
         assert!(!seen.contains("Budget erschöpft"), "{seen}");
-        assert!(seen.contains("✓ 7 fertig"), "{seen}");
+        assert!(seen.contains("✓ 7 finished"), "{seen}");
         Ok(())
     }
 
@@ -3823,10 +3954,10 @@ mod tests {
         )?);
         let rows = panel_screen(&monitor, 44, 6, false)?;
         let shown = rows.join("\n");
-        assert!(rows[0].contains("2 aktiv"), "{shown}");
+        assert!(rows[0].contains("2 active"), "{shown}");
         assert!(
             rows.iter()
-                .any(|row| row.contains("root-orchestrator") && row.contains("denkt")),
+                .any(|row| row.contains("root-orchestrator") && row.contains("thinking")),
             "{shown}"
         );
         assert_eq!(
@@ -4220,8 +4351,8 @@ mod tests {
         );
         for split in [true, false] {
             let shown = dock_screen(&monitor, split).join("\n");
-            assert!(shown.contains("Agenten · 1 aktiv"), "{shown}");
-            assert!(!shown.contains("fertig"), "keine Fertig-Zähler: {shown}");
+            assert!(shown.contains("Agents · 1 active"), "{shown}");
+            assert!(!shown.contains("done"), "keine Fertig-Zähler: {shown}");
             assert!(!shown.contains("Budget erschöpft"), "{shown}");
             assert!(!shown.contains("✗"), "{shown}");
             assert_eq!(monitor.scope.get(), PanelScope::ActiveOnly);
@@ -4242,7 +4373,7 @@ mod tests {
         let side = panel_screen(&monitor, 60, 20, false)?.join("\n");
         assert_eq!(monitor.scope.get(), PanelScope::All);
         assert!(side.contains("✗ uia-tester · Budget erschöpft"), "{side}");
-        assert!(side.contains("fertig"), "{side}");
+        assert!(side.contains("done"), "{side}");
         assert_eq!(monitor.panel_entries().len(), 3);
         Ok(())
     }
@@ -4271,7 +4402,7 @@ mod tests {
             let shown =
                 dock_screen_in(&monitor, split, Some(PanelScope::for_cards(false))).join("\n");
             assert!(
-                shown.contains("Agenten · 1 aktiv · ✗ 1 · 6 fertig"),
+                shown.contains("Agents · 1 active · ✗ 1 · 6 done"),
                 "{shown}"
             );
             assert!(shown.contains("Budget erschöpft"), "{shown}");
@@ -4284,7 +4415,7 @@ mod tests {
                 !beside_finished.contains("Budget erschöpft"),
                 "{beside_finished}"
             );
-            assert!(!beside_finished.contains("fertig"), "{beside_finished}");
+            assert!(!beside_finished.contains("done"), "{beside_finished}");
             assert_eq!(monitor.scope.get(), PanelScope::ActiveOnly);
             assert_eq!(monitor.panel_entries().len(), 1);
         }
@@ -4335,7 +4466,7 @@ mod tests {
             .collect();
         assert_eq!(listed, vec!["job-2", "job-3"]);
         let shown = dock_screen(&monitor, true).join("\n");
-        assert!(shown.contains("Jobs · 2 aktiv"), "{shown}");
+        assert!(shown.contains("Jobs · 2 active"), "{shown}");
         assert!(!shown.contains("agent-child-c1"), "{shown}");
 
         // Der Lauf endet, sein Prozess läuft noch: der Job taucht auf.
@@ -4383,7 +4514,7 @@ mod tests {
         );
         let shown = dock_screen(&monitor, true).join("\n");
         assert!(shown.contains("agent-child-c1"), "{shown}");
-        assert!(shown.contains("Jobs · 0 aktiv"), "{shown}");
+        assert!(shown.contains("Jobs · 0 active"), "{shown}");
         Ok(())
     }
 
@@ -4405,6 +4536,51 @@ mod tests {
         assert!(monitor.job_failure_seen("job-1"));
         assert!(!monitor.mark_job_failure_seen("job-1"));
         assert!(monitor.mark_job_failure_seen("job-9"));
+        Ok(())
+    }
+
+    #[test]
+    fn generated_trace_notices_keep_creation_locale_and_raw_reason() -> TestResult {
+        use crate::i18n::{tr_args_for, with_language};
+        use harw_config::UiLanguage;
+        let mut monitor = AgentMonitor::default();
+        let reason = "原文 {reason} · Rohfehler 👩🏽‍💻";
+        let event = ev(
+            "child-raw",
+            Some("root"),
+            "role-raw",
+            TurnEvent::TurnFailed {
+                turn_id: TurnId::new(),
+                reason: reason.to_owned(),
+                retryable: false,
+            },
+        )?;
+        with_language(UiLanguage::Japanese, || monitor.apply(&event));
+        let expected = sanitize_inline(&tr_args_for(
+            UiLanguage::Japanese,
+            "agents.turn_failed",
+            "Turn failed: {reason}",
+            &[("reason", reason)],
+        ));
+        let trace = monitor.agent("child-raw").ok_or("child")?.trace.clone();
+        assert!(
+            trace
+                .entries()
+                .any(|entry| matches!(entry, TraceEntry::Status(text) if text == &expected))
+        );
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                let live = monitor.agent("child-raw").expect("known child");
+                assert_eq!(live.failure_reason.as_deref(), Some(reason));
+                assert_eq!(live.phase, AgentPhase::Failed);
+                let rendered: String = trace_lines(&live.trace, false)
+                    .iter()
+                    .map(|line| line.to_string())
+                    .collect();
+                assert!(rendered.contains(&expected));
+                assert!(!live.phase.label().is_empty());
+            });
+        }
         Ok(())
     }
 }

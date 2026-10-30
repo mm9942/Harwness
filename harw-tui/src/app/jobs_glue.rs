@@ -78,6 +78,8 @@ pub(crate) struct JobsUi {
     /// Im Beenden-Dialog getroffene Wahl (wird beim nächsten Beenden
     /// eingelöst).
     pub(crate) quit_choice: Option<JobsQuitChoice>,
+    /// Semantic snapshot behind the open quit dialog.
+    quit_prompt: Option<JobsQuitPrompt>,
     /// Nur Tests: Verwaltung ohne Runtime-Montage.
     #[cfg(test)]
     pub(crate) test_manager: Option<Arc<JobManager>>,
@@ -125,6 +127,10 @@ pub(crate) fn has_running(app: &ChatApp) -> bool {
 /// # Returns
 /// `true`, wenn sich Sichtbares änderte.
 pub(crate) fn refresh(app: &mut ChatApp, force: bool) -> bool {
+    crate::i18n::with_language(app.language, || refresh_scoped(app, force))
+}
+
+fn refresh_scoped(app: &mut ChatApp, force: bool) -> bool {
     let Some(manager) = manager(app) else {
         return false;
     };
@@ -186,12 +192,17 @@ fn report_stop_state(app: &mut ChatApp, now: Instant) -> bool {
     let due = now.saturating_duration_since(pending.requested) >= STOP_STATE_REPORT_AFTER;
     let state = match row {
         Some(row) if row.state != pending.state || due => row.state_label().to_owned(),
-        None if due => "nicht mehr gelistet".to_owned(),
+        None if due => crate::i18n::tr("mission.not_listed", "no longer listed").to_owned(),
         _ => return false,
     };
-    let line = format!(
-        "⚙ Job {} „{}“ – Zustand jetzt: {state}",
-        pending.id, pending.name
+    let line = crate::i18n::tr_args(
+        "mission.observed_stop",
+        "⚙ Job {p0} “{p1}” – observed state now: {state}",
+        &[
+            ("p0", &(pending.id).to_string()),
+            ("p1", &(pending.name).to_string()),
+            ("state", &(state).to_string()),
+        ],
     );
     app.jobs_ui.pending_stop = None;
     app.push_line(Role::System, line);
@@ -217,6 +228,10 @@ fn detail_of(manager: &JobManager, job: &str) -> Option<JobDetail> {
 /// # Returns
 /// `true`, wenn ein Job gewählt war (Redraw nötig).
 pub(crate) fn open_detail(app: &mut ChatApp) -> bool {
+    crate::i18n::with_language(app.language, || open_detail_scoped(app))
+}
+
+fn open_detail_scoped(app: &mut ChatApp) -> bool {
     let Some(job) = app.agent_monitor.selected_job() else {
         return false;
     };
@@ -242,6 +257,10 @@ pub(crate) fn open_detail(app: &mut ChatApp) -> bool {
 /// # Returns
 /// `true`, wenn neu gezeichnet werden soll.
 pub(crate) fn poll(app: &mut ChatApp) -> bool {
+    crate::i18n::with_language(app.language, || poll_scoped(app))
+}
+
+fn poll_scoped(app: &mut ChatApp) -> bool {
     let Some(router) = waker(app) else {
         return false;
     };
@@ -289,14 +308,43 @@ fn system_line(event: &JobEvent) -> Option<String> {
             ..
         } => {
             let origin = match (origin_tool, origin_call_id) {
-                (Some(tool), Some(call_id)) => format!(" · Aufruf {tool} {call_id}"),
-                (Some(tool), None) => format!(" · Aufruf {tool}"),
-                (None, Some(call_id)) => format!(" · Aufruf {call_id}"),
+                (Some(tool), Some(call_id)) => crate::i18n::tr_args(
+                    "mission.origin_suffix",
+                    " · Call {tool} {call_id}",
+                    &[
+                        ("tool", &(tool).to_string()),
+                        ("call_id", &(call_id).to_string()),
+                    ],
+                ),
+                (Some(tool), None) => crate::i18n::tr_args(
+                    "mission.origin_tool_suffix",
+                    " · Call {tool}",
+                    &[("tool", &(tool).to_string())],
+                ),
+                (None, Some(call_id)) => crate::i18n::tr_args(
+                    "mission.origin_call_suffix",
+                    " · Call {call_id}",
+                    &[("call_id", &(call_id).to_string())],
+                ),
                 (None, None) => String::new(),
             };
-            Some(format!(
-                "⚙ Job {job_id} „{name}“ gestartet ({}){origin}",
-                if *executed_on_host { "Host" } else { "Sandbox" }
+            Some(crate::i18n::tr_args(
+                "mission.started",
+                "⚙ Job {job_id} “{name}” started ({p0}){origin}",
+                &[
+                    ("job_id", &(job_id).to_string()),
+                    ("name", &(name).to_string()),
+                    (
+                        "p0",
+                        &(if *executed_on_host {
+                            crate::i18n::tr("mission.host", "Host")
+                        } else {
+                            crate::i18n::tr("mission.sandbox", "Sandbox")
+                        })
+                        .to_string(),
+                    ),
+                    ("origin", &(origin).to_string()),
+                ],
             ))
         }
         JobEvent::Finished {
@@ -308,17 +356,42 @@ fn system_line(event: &JobEvent) -> Option<String> {
             duration_secs,
             tail,
         } => {
-            let mut line = format!(
-                "⚙ Job {job_id} „{name}“ beendet: {} nach {}{}",
-                harw_ops::jobs::state_label(*state),
-                harw_tool_job::format_duration(*duration_secs),
-                exit_code
-                    .map(|code| format!(", Exit-Code {code}"))
-                    .unwrap_or_default()
+            let mut line = crate::i18n::tr_args(
+                "mission.ended",
+                "⚙ Job {job_id} “{name}” ended: {p0} after {p1}{p2}",
+                &[
+                    ("job_id", &(job_id).to_string()),
+                    ("name", &(name).to_string()),
+                    (
+                        "p0",
+                        &(crate::jobs_panel::job_state_label(*state)).to_string(),
+                    ),
+                    (
+                        "p1",
+                        &(harw_tool_job::format_duration(*duration_secs)).to_string(),
+                    ),
+                    (
+                        "p2",
+                        &(exit_code
+                            .map(|code| {
+                                crate::i18n::tr_args(
+                                    "mission.exit_comma",
+                                    ", exit code {code}",
+                                    &[("code", &(code).to_string())],
+                                )
+                            })
+                            .unwrap_or_default())
+                        .to_string(),
+                    ),
+                ],
             );
             if matches!(state, JobState::Failed | JobState::Unknown) {
                 if let Some(signal) = signal {
-                    line.push_str(&format!(", Signal {signal}"));
+                    line.push_str(&crate::i18n::tr_args(
+                        "mission.signal_comma",
+                        ", signal {signal}",
+                        &[("signal", &(signal).to_string())],
+                    ));
                 }
                 let last = tail
                     .iter()
@@ -338,7 +411,15 @@ fn system_line(event: &JobEvent) -> Option<String> {
             job_id,
             name,
             message,
-        } => Some(format!("⚙ Job {job_id} „{name}“: {message}")),
+        } => Some(crate::i18n::tr_args(
+            "mission.warning",
+            "⚙ Job {job_id} “{name}”: {message}",
+            &[
+                ("job_id", &job_id.to_string()),
+                ("name", name),
+                ("message", message),
+            ],
+        )),
         JobEvent::Progress { .. } | JobEvent::ErrorLines { .. } => None,
     }
 }
@@ -346,47 +427,82 @@ fn system_line(event: &JobEvent) -> Option<String> {
 // ── Beenden ──────────────────────────────────────────────────────────────────
 
 /// Optionen des Beenden-Dialogs (Index = Wahl).
-const QUIT_OPTIONS: [&str; 3] = ["Jobs stoppen", "Weiterlaufen lassen", "Abbrechen"];
+#[derive(Debug, Clone)]
+struct JobsQuitPrompt {
+    names: Vec<String>,
+    count: usize,
+    sandboxed: usize,
+}
+
+impl JobsQuitPrompt {
+    fn from_statuses(running: &[JobStatus]) -> Self {
+        Self {
+            names: running
+                .iter()
+                .take(5)
+                .map(|status| {
+                    format!(
+                        "“{}” ({})",
+                        crate::sanitize::sanitize_inline(&status.meta.name),
+                        status.meta.job_id
+                    )
+                })
+                .collect(),
+            count: running.len(),
+            sandboxed: running
+                .iter()
+                .filter(|status| !status.meta.executed_on_host)
+                .count(),
+        }
+    }
+
+    fn dialog(&self) -> ChoiceDialog {
+        let names = &self.names;
+        let sandboxed = self.sandboxed;
+        let mut prompt = crate::i18n::tr_args(
+            "mission.quit_prompt",
+            "{p0} job(s) still running: {p1}{p2}.",
+            &[
+                ("p0", &self.count.to_string()),
+                ("p1", &names.join(", ")),
+                (
+                    "p2",
+                    if self.count > names.len() {
+                        ", …"
+                    } else {
+                        ""
+                    },
+                ),
+            ],
+        );
+        if sandboxed > 0 {
+            prompt.push_str(&crate::i18n::tr_args("mission.quit_sandbox", "\nWarning: {sandboxed} run in the sandbox and end with harw, even with “Keep running”.", &[("sandboxed", &sandboxed.to_string())]));
+        }
+        prompt.push_str(crate::i18n::tr("mission.quit_explanation", "\nDetached jobs keep running; their logs and state are available through /jobs after the next start."));
+        ChoiceDialog::new(
+            crate::i18n::tr("mission.quit_title", "Running jobs"),
+            Some(prompt),
+            vec![
+                crate::i18n::tr("mission.quit_stop", "Stop jobs").to_owned(),
+                crate::i18n::tr("mission.quit_detach", "Keep running").to_owned(),
+                crate::i18n::tr("mission.quit_cancel", "Cancel").to_owned(),
+            ],
+        )
+    }
+}
+
+pub(crate) fn refresh_quit_presentation(app: &mut ChatApp) {
+    if let (Some(source), Some(Overlay::JobsQuitChoice(dialog))) =
+        (&app.jobs_ui.quit_prompt, &mut app.overlay)
+    {
+        dialog.refresh_owned_presentation(source.dialog());
+    }
+}
 
 /// Baut den Beenden-Dialog für die laufenden Jobs.
+#[cfg(test)]
 fn quit_dialog(running: &[JobStatus]) -> ChoiceDialog {
-    let names: Vec<String> = running
-        .iter()
-        .take(5)
-        .map(|status| format!("„{}“ ({})", status.meta.name, status.meta.job_id))
-        .collect();
-    let mut prompt = format!(
-        "{} Job(s) laufen noch: {}{}.",
-        running.len(),
-        names.join(", "),
-        if running.len() > names.len() {
-            ", …"
-        } else {
-            ""
-        }
-    );
-    let sandboxed = running
-        .iter()
-        .filter(|status| !status.meta.executed_on_host)
-        .count();
-    if sandboxed > 0 {
-        prompt.push_str(&format!(
-            "\nAchtung: {sandboxed} davon laufen in der Sandbox und enden trotzdem mit harw, \
-             auch bei „Weiterlaufen lassen“."
-        ));
-    }
-    prompt.push_str(
-        "\nAbgelöste Jobs laufen weiter; ihre Logs und ihr Zustand sind nach dem nächsten \
-         Start über /jobs sichtbar.",
-    );
-    ChoiceDialog::new(
-        "Laufende Jobs",
-        Some(prompt),
-        QUIT_OPTIONS
-            .iter()
-            .map(|option| (*option).to_owned())
-            .collect(),
-    )
+    JobsQuitPrompt::from_statuses(running).dialog()
 }
 
 /// Entscheidet vor dem Beenden über laufende Jobs.
@@ -426,7 +542,12 @@ pub(crate) async fn before_quit(app: &mut ChatApp) -> bool {
                 .into_iter()
                 .filter(|status| !status.meta.state.is_terminal())
                 .collect();
-            app.overlay = Some(Overlay::JobsQuitChoice(quit_dialog(&running)));
+            let source = JobsQuitPrompt::from_statuses(&running);
+            app.overlay = Some(Overlay::JobsQuitChoice(crate::i18n::with_language(
+                app.language,
+                || source.dialog(),
+            )));
+            app.jobs_ui.quit_prompt = Some(source);
             false
         }
     }
@@ -447,9 +568,14 @@ pub(crate) fn detach_for_exit(app: &mut ChatApp) {
         );
         app.push_line(
             Role::System,
-            format!(
-                "{} von {} abgelösten Job(s) laufen in der Sandbox und enden mit harw.",
-                summary.ends_with_harw, summary.detached
+            crate::i18n::tr_args_for(
+                app.language,
+                "mission.detached_sandbox",
+                "{p0} of {p1} detached job(s) run in the sandbox and end with harw.",
+                &[
+                    ("p0", &summary.ends_with_harw.to_string()),
+                    ("p1", &summary.detached.to_string()),
+                ],
             ),
         );
     } else if summary.detached > 0 {
@@ -579,7 +705,7 @@ mod tests {
             matches!(
                 entry,
                 crate::export::ExportEntry::System(text)
-                    if text.contains("in der Sandbox und enden mit harw")
+                    if text.contains("run in the sandbox and end with harw")
             )
         });
         assert!(warned, "Warnung für Sandbox-Jobs");
@@ -824,9 +950,12 @@ mod tests {
         .await;
         assert!(output.contains("TERM"), "{output}");
         assert!(refresh(&mut app, true));
-        let label = harw_ops::jobs::state_label(JobState::Stopped);
+        let label = crate::jobs_panel::job_state_label(JobState::Stopped);
         assert!(
-            system_text(&app, &format!("„ladybird build“ – Zustand jetzt: {label}")),
+            system_text(
+                &app,
+                &format!("“ladybird build” – observed state now: {label}")
+            ),
             "{:?}",
             app.export_entries
         );
@@ -906,9 +1035,9 @@ mod tests {
         assert!(app.jobs_ui.pending_stop.is_some(), "noch nichts zu melden");
         let later = Instant::now() + STOP_STATE_REPORT_AFTER;
         assert!(report_stop_state(&mut app, later));
-        let label = harw_ops::jobs::state_label(JobState::Running);
+        let label = crate::jobs_panel::job_state_label(JobState::Running);
         assert!(
-            system_text(&app, &format!("Zustand jetzt: {label}")),
+            system_text(&app, &format!("observed state now: {label}")),
             "{:?}",
             app.export_entries
         );
@@ -1000,15 +1129,9 @@ mod tests {
                 super::super::render_viewport(frame, app, &crate::spinner::Spinner::new(), None);
             })
             .map_err(ctx("draw"))?;
-        let buffer = terminal.backend().buffer();
-        Ok((0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n"))
+        Ok(crate::test_support::display_buffer_text(
+            terminal.backend().buffer(),
+        ))
     }
 
     /// PR #154 (P2): eine Agentenrolle „Unknown job“ trägt dieselbe
@@ -1212,7 +1335,7 @@ mod tests {
         .ok_or(TestError::Missing("Startzeile"))?;
         assert_eq!(
             started,
-            "⚙ Job job-9 „tests“ gestartet (Sandbox) · Aufruf job.start call-9"
+            "⚙ Job job-9 “tests” started (Sandbox) · Call job.start call-9"
         );
         assert!(!started.contains("cargo test"), "{started}");
 
@@ -1227,7 +1350,7 @@ mod tests {
         })
         .ok_or(TestError::Missing("Endzeile"))?;
         assert!(
-            failed.ends_with(", Exit-Code 101 – error: test failed"),
+            failed.ends_with(", exit code 101 – error: test failed"),
             "{failed}"
         );
 
@@ -1263,5 +1386,93 @@ mod tests {
         let mut dialog = quit_dialog(&[]);
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(handle_quit_choice(&mut dialog, esc), Some(None));
+    }
+
+    #[test]
+    fn settings_refreshes_open_stop_and_quit_dialogs_with_stable_actions() -> TestResult {
+        use crate::i18n::{tr_args_for, tr_for, with_language};
+        use harw_config::UiLanguage;
+        let mut app = super::super::tests::test_chat_app()?;
+        let mut row = crate::mission::projection::tests::job_in("job-raw", JobState::Running);
+        row.name = "raw name {name} 👩🏽‍💻".repeat(12);
+        app.language = UiLanguage::German;
+        app.overlay = Some(Overlay::StopJob(
+            with_language(app.language, || {
+                crate::mission::stop_job::StopJobDialog::for_row(&row)
+            })
+            .ok_or(TestError::Missing("stop dialog"))?,
+        ));
+        for language in UiLanguage::ALL {
+            let mut preferences = harw_config::TuiSection::default();
+            preferences.language = language;
+            app.apply_display_preferences(&preferences);
+            let shown = screen_text(&app, 180, 40)?;
+            assert!(
+                shown.contains(tr_for(language, "mission.stop_title", "Stop job")),
+                "{language:?}: {shown}"
+            );
+            assert!(shown.contains("job-raw"), "{shown}");
+        }
+        let (bus, mut receiver) = crate::events::harw_event_channel();
+        super::super::handle_key(&mut app, press(KeyCode::Enter), &bus);
+        assert!(
+            matches!(receiver.try_recv(), Ok(crate::events::HarwEvent::Command(line)) if line == "/jobs stop job-raw")
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            app.export_entries.is_empty(),
+            "confirmation never reports stop success"
+        );
+        app.jobs_ui.quit_prompt = Some(JobsQuitPrompt {
+            names: vec!["“raw job” (job-raw)".to_owned()],
+            count: 1,
+            sandboxed: 1,
+        });
+        app.overlay = Some(Overlay::JobsQuitChoice(with_language(app.language, || {
+            app.jobs_ui.quit_prompt.as_ref().expect("source").dialog()
+        })));
+        if let Some(Overlay::JobsQuitChoice(dialog)) = app.overlay.as_mut() {
+            dialog.handle_key(press(KeyCode::Down));
+        }
+        for language in UiLanguage::ALL {
+            let mut preferences = harw_config::TuiSection::default();
+            preferences.language = language;
+            app.apply_display_preferences(&preferences);
+            let shown = screen_text(&app, 180, 40)?;
+            assert!(
+                shown.contains(tr_for(language, "mission.quit_title", "Running jobs")),
+                "{shown}"
+            );
+            assert!(shown.contains("job-raw"), "{shown}");
+        }
+        if let Some(Overlay::JobsQuitChoice(dialog)) = app.overlay.as_mut() {
+            assert_eq!(
+                handle_quit_choice(dialog, press(KeyCode::Enter)),
+                Some(Some(JobsQuitChoice::Detach))
+            );
+        } else {
+            return Err(TestError::Missing("quit dialog"));
+        }
+        app.agent_monitor.set_jobs(vec![row]);
+        app.language = UiLanguage::French;
+        let pending = app
+            .jobs_ui
+            .pending_stop
+            .as_ref()
+            .ok_or(TestError::Missing("pending stop"))?;
+        let raw_name = pending.name.clone();
+        let later = pending.requested + STOP_STATE_REPORT_AFTER;
+        let reported = with_language(app.language, || report_stop_state(&mut app, later));
+        assert!(reported);
+        let state = tr_for(UiLanguage::French, "mission.running", "running");
+        let expected = tr_args_for(
+            UiLanguage::French,
+            "mission.observed_stop",
+            "⚙ Job {p0} “{p1}” – observed state now: {state}",
+            &[("p0", "job-raw"), ("p1", &raw_name), ("state", state)],
+        );
+        assert!(system_text(&app, &expected));
+        assert_eq!(app.agent_monitor.jobs()[0].state, JobState::Running);
+        Ok(())
     }
 }

@@ -39,7 +39,8 @@ use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
     Widget, Wrap,
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::MissionUi;
 use crate::agent_monitor::{AgentLive, AgentPhase, TraceEntry, compact_elapsed};
@@ -130,9 +131,9 @@ fn tail_fit(prefix: &str, text: &str, cols: usize) -> String {
     }
     let room = cols.saturating_sub(display_width(prefix)).saturating_sub(1);
     let mut used = 0usize;
-    let mut tail: Vec<char> = Vec::new();
-    for ch in text.chars().rev() {
-        let width = ch.width().unwrap_or(0);
+    let mut tail: Vec<&str> = Vec::new();
+    for ch in text.graphemes(true).rev() {
+        let width = ch.width();
         if used + width > room {
             break;
         }
@@ -140,7 +141,7 @@ fn tail_fit(prefix: &str, text: &str, cols: usize) -> String {
         tail.push(ch);
     }
     tail.reverse();
-    let tail: String = tail.into_iter().collect();
+    let tail = tail.concat();
     fit_width(&format!("{prefix}…{tail}"), cols)
 }
 
@@ -237,7 +238,11 @@ pub(crate) fn view(
     if let Some((live, pinned)) = source {
         let role = sanitize_inline(live.role.trim());
         label = Some(if pinned {
-            format!("{role} · pinned")
+            crate::i18n::tr_args(
+                "mission.pinned",
+                "{role} · pinned",
+                &[("role", &(role).to_string())],
+            )
         } else {
             role
         });
@@ -259,10 +264,13 @@ pub(crate) fn view(
             lines.push(LiveLine {
                 kind: LineKind::Tool,
                 text: fit_width(
-                    &format!(
-                        "● {} · läuft · {}",
-                        sanitize_inline(tool),
-                        compact_elapsed(elapsed)
+                    &crate::i18n::tr_args(
+                        "mission.tool_running",
+                        "● {p0} · running · {p1}",
+                        &[
+                            ("p0", &(sanitize_inline(tool)).to_string()),
+                            ("p1", &(compact_elapsed(elapsed)).to_string()),
+                        ],
                     ),
                     cols,
                 ),
@@ -306,7 +314,7 @@ pub(crate) fn render(view: &LiveView, area: Rect, buf: &mut Buffer, theme: Theme
     let mut spans = vec![
         Span::styled("─ ", rule_style),
         Span::styled(
-            LIVE_TITLE,
+            crate::i18n::tr("mission.live", LIVE_TITLE),
             Style::default()
                 .fg(style::accent_color(theme))
                 .add_modifier(Modifier::BOLD),
@@ -330,7 +338,13 @@ pub(crate) fn render(view: &LiveView, area: Rect, buf: &mut Buffer, theme: Theme
                 ));
             }
             Some(line) => spans.push(Span::styled(format!(" · {}", line.text), line.style)),
-            None => spans.push(Span::styled(format!(" · {NO_VISIBLE_EVENTS}"), dim)),
+            None => spans.push(Span::styled(
+                format!(
+                    " · {}",
+                    crate::i18n::tr("mission.no_events", NO_VISIBLE_EVENTS)
+                ),
+                dim,
+            )),
         }
     }
     let mut header: Vec<Span<'static>> = Vec::new();
@@ -373,7 +387,13 @@ pub(crate) fn render(view: &LiveView, area: Rect, buf: &mut Buffer, theme: Theme
         .collect();
     if body.is_empty() {
         body.push(Line::styled(
-            fit_width(&format!("{indent}{NO_VISIBLE_EVENTS}"), width),
+            fit_width(
+                &format!(
+                    "{indent}{}",
+                    crate::i18n::tr("mission.no_events", NO_VISIBLE_EVENTS)
+                ),
+                width,
+            ),
             dim,
         ));
     }
@@ -404,8 +424,11 @@ pub(crate) fn render_window(
     }
     let inner_width = usize::from(area.width.saturating_sub(2));
     let title = match &view.label {
-        Some(label) => format!(" {LIVE_TITLE} · {label} "),
-        None => format!(" {LIVE_TITLE} "),
+        Some(label) => format!(
+            " {} · {label} ",
+            crate::i18n::tr("mission.live", LIVE_TITLE)
+        ),
+        None => format!(" {} ", crate::i18n::tr("mission.live", LIVE_TITLE)),
     };
     let border = if focused {
         Style::default().fg(style::accent_color(theme))
@@ -437,7 +460,10 @@ pub(crate) fn render_window(
     );
     if lines.is_empty() {
         lines.push(Line::styled(
-            fit_width(NO_VISIBLE_EVENTS, inner_width),
+            fit_width(
+                crate::i18n::tr("mission.no_events", NO_VISIBLE_EVENTS),
+                inner_width,
+            ),
             style::dim_style(theme),
         ));
     }
@@ -597,7 +623,7 @@ mod tests {
             "{rows:?}"
         );
         assert!(
-            screen_row(&rows, 2)?.starts_with("  ● fs.read · läuft · "),
+            screen_row(&rows, 2)?.starts_with("  ● fs.read · running · "),
             "{rows:?}"
         );
         assert!(
@@ -651,7 +677,7 @@ mod tests {
         );
         assert_eq!(
             screen_row(&rows, 2)?.trim_end(),
-            "  ✗ fehlgeschlagen · Zeitlimit",
+            "  ✗ failed · Zeitlimit",
             "{rows:?}"
         );
         // Ohne Werkzeug trägt die Kopfzeile den Status vor dem Reasoning.
@@ -859,7 +885,7 @@ mod tests {
         assert_eq!(shown.len(), 2, "{shown:?}");
         assert!(screen_row(&shown, 0)?.starts_with("  ∴ lese"), "{shown:?}");
         assert!(
-            screen_row(&shown, 1)?.starts_with("  ● fs.read · läuft · "),
+            screen_row(&shown, 1)?.starts_with("  ● fs.read · running · "),
             "{shown:?}"
         );
 
@@ -904,7 +930,7 @@ mod tests {
         ));
         let shown = body(&monitor, &ui, "w1", 46)?;
         assert!(
-            screen_row(&shown, 1)?.starts_with("  ✓ fertig · "),
+            screen_row(&shown, 1)?.starts_with("  ✓ done · "),
             "the honest end-of-run summary: {shown:?}"
         );
         Ok(())
@@ -931,7 +957,7 @@ mod tests {
         let running = body(&monitor, &ui, "w2", 46)?;
         assert_eq!(running.len(), 1, "{running:?}");
         assert!(
-            screen_row(&running, 0)?.starts_with("  ● fs.grep · läuft · "),
+            screen_row(&running, 0)?.starts_with("  ● fs.grep · running · "),
             "{running:?}"
         );
         monitor.apply(&turn_event(
@@ -952,5 +978,28 @@ mod tests {
             assert!(!row.contains('∴'), "no invented reasoning: {row:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn live_tail_preserves_unicode_graphemes_in_every_locale_and_width() {
+        use harw_config::UiLanguage;
+        let payload = "prefix 👩🏽‍💻 é हिंदी 中文 τέλος";
+        for language in UiLanguage::ALL {
+            crate::i18n::with_language(language, || {
+                for width in [0, 1, 2, 8, 20, 40, 160] {
+                    let text = tail_fit("∴ ", payload, width);
+                    assert!(display_width(&text) <= width, "{width}: {text}");
+                    if let Some(tail) = text.split('…').nth(1).filter(|tail| !tail.is_empty()) {
+                        assert!(payload.ends_with(tail));
+                        let offset = payload.len() - tail.len();
+                        assert!(
+                            payload
+                                .grapheme_indices(true)
+                                .any(|(start, _)| start == offset)
+                        );
+                    }
+                }
+            });
+        }
     }
 }

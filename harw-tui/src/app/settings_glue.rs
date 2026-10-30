@@ -63,8 +63,10 @@ impl ChatApp {
                     Some(Overlay::EffortChoice { target, dialog }) => {
                         dialog.refresh_owned_presentation(effort_choice_dialog(*target))
                     }
+                    Some(Overlay::StopJob(dialog)) => dialog.refresh_presentation(),
                     _ => {}
                 }
+                jobs_glue::refresh_quit_presentation(self);
                 if let (Some(prompt), Some(dialog)) = (
                     &self.pending_host_permit,
                     &mut self.pending_host_permit_dialog,

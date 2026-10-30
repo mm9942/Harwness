@@ -101,7 +101,11 @@ impl AgentRowLive {
             AgentPhase::Admitted | AgentPhase::Thinking | AgentPhase::Tool | AgentPhase::Waiting
         );
         let state = match (live.phase, live.current_tool.as_deref()) {
-            (AgentPhase::Tool, Some(tool)) => format!("Werkzeug {tool}"),
+            (AgentPhase::Tool, Some(tool)) => crate::i18n::tr_args(
+                "agents.tool_named",
+                "Tool {tool}",
+                &[("tool", &(tool).to_string())],
+            ),
             (phase, _) => phase.label().to_owned(),
         };
         let preview = Some(live.preview.trim())
@@ -149,7 +153,11 @@ fn step_text(entry: &TraceEntry) -> String {
     let text = match entry {
         TraceEntry::ToolCall { name, args_preview } => format!("→ {name} {args_preview}"),
         TraceEntry::ToolResult { name, ok, preview } => {
-            let outcome = if *ok { "ok" } else { "Fehler" };
+            let outcome = if *ok {
+                "ok"
+            } else {
+                crate::i18n::tr("agents.error_short", "error")
+            };
             format!("← {name} {outcome}: {preview}")
         }
         TraceEntry::Text(text) => return format!("» {}", tail_chars(text.trim(), LAST_STEP_CHARS)),
@@ -251,14 +259,24 @@ pub(crate) fn budget_text(row: &AgentRow) -> Option<String> {
     };
     Some(format!(
         "{} · {} · {}",
-        part("Tokens", limits.tokens, row.tokens, ""),
         part(
-            "Tools",
+            crate::i18n::tr("agents.tokens", "Tokens"),
+            limits.tokens,
+            row.tokens,
+            ""
+        ),
+        part(
+            crate::i18n::tr("agents.tools", "Tools"),
             limits.tool_calls.map(u64::from),
             row.tool_calls.map(u64::from),
             ""
         ),
-        part("Dauer", limits.wall_ms, row.duration_ms, " ms"),
+        part(
+            crate::i18n::tr("agents.duration", "Duration"),
+            limits.wall_ms,
+            row.duration_ms,
+            " ms"
+        ),
     ))
 }
 
@@ -268,6 +286,22 @@ pub(crate) fn percent(used: u64, limit: u64) -> Option<u64> {
         let pct = u128::from(used) * 100 / u128::from(limit);
         u64::try_from(pct).unwrap_or(u64::MAX)
     })
+}
+
+/// Known controller protocol tokens have owned display labels; unknown values
+/// remain caller payload and never become translation keys.
+pub(crate) fn status_text(status: &str) -> &str {
+    match status {
+        "admitted" => crate::i18n::tr("agents.admitted", "admitted"),
+        "running" => crate::i18n::tr("mission.running", "running"),
+        "completed" | "done" => crate::i18n::tr("agents.done", "done"),
+        "failed" => crate::i18n::tr("agents.failed", "failed"),
+        "cancelled" => crate::i18n::tr("agents.cancelled", "cancelled"),
+        "interrupted" => crate::i18n::tr("agents.interrupted", "interrupted"),
+        "paused" => crate::i18n::tr("agents.paused", "paused"),
+        "progress" => crate::i18n::tr("agents.progress", "progress"),
+        _ => status,
+    }
 }
 
 /// `true` für abgeschlossene Zustände (dauerhaft oder live).
@@ -293,7 +327,14 @@ pub(crate) fn detail_lines(row: &AgentRow) -> Vec<String> {
         .map(|live| format!(" · {}", live.state))
         .unwrap_or_default();
     let tokens = match &row.live {
-        Some(live) => format!("{} (gesamt {})", live.tokens_label(), live.total_tokens),
+        Some(live) => crate::i18n::tr_args(
+            "agents.tokens_total",
+            "{p0} (total {p1})",
+            &[
+                ("p0", &(live.tokens_label()).to_string()),
+                ("p1", &(live.total_tokens).to_string()),
+            ],
+        ),
         None => known(row.tokens),
     };
     let duration = match &row.live {
@@ -303,30 +344,48 @@ pub(crate) fn detail_lines(row: &AgentRow) -> Vec<String> {
             .map_or_else(|| "—".to_owned(), |ms| format!("{} s", ms / 1000)),
     };
     let mut lines = vec![
-        format!("{} · {}{state}", row.role, row.status),
+        format!("{} · {}{state}", row.role, status_text(&row.status)),
         format!("ID: {}", row.id),
-        format!("Eltern: {}", row.parent.as_deref().unwrap_or("—")),
-        format!("Auftrag: {}", row.task.as_deref().unwrap_or("—")),
-        format!(
-            "Tokens: {tokens} · Tools: {} · Dauer: {duration}",
-            known(row.tool_calls)
+        crate::i18n::tr_args(
+            "agents.parent",
+            "Parent: {p0}",
+            &[("p0", &(row.parent.as_deref().unwrap_or("—")).to_string())],
         ),
-        format!(
-            "Budget: {}",
-            budget_text(row).unwrap_or_else(|| row.budget.clone())
+        crate::i18n::tr_args(
+            "agents.tree_task",
+            "Task: {p0}",
+            &[("p0", &(row.task.as_deref().unwrap_or("—")).to_string())],
+        ),
+        crate::i18n::tr_args(
+            "agents.tree_stats",
+            "Tokens: {tokens} · Tools: {p0} · Duration: {duration}",
+            &[
+                ("tokens", &(tokens).to_string()),
+                ("p0", &(known(row.tool_calls)).to_string()),
+                ("duration", &(duration).to_string()),
+            ],
+        ),
+        crate::i18n::tr_args(
+            "agents.budget",
+            "Budget: {p0}",
+            &[(
+                "p0",
+                &(budget_text(row).unwrap_or_else(|| row.budget.clone())).to_string(),
+            )],
         ),
         String::new(),
     ];
     if let Some(result) = &row.result {
-        lines.push("Ergebnis:".to_owned());
+        lines.push(crate::i18n::tr("agents.result", "Result:").to_owned());
         lines.push(result.clone());
     } else if is_finished(row) {
         match row.live.as_ref().and_then(|live| live.preview.clone()) {
             Some(preview) => {
-                lines.push("Ergebnis (Ausschnitt):".to_owned());
+                lines
+                    .push(crate::i18n::tr("agents.result_excerpt", "Result (excerpt):").to_owned());
                 lines.push(preview);
             }
-            None => lines.push("Noch kein Ergebnis.".to_owned()),
+            None => lines.push(crate::i18n::tr("agents.no_result", "No result yet.").to_owned()),
         }
     } else {
         let live = row.live.as_ref();
@@ -334,16 +393,28 @@ pub(crate) fn detail_lines(row: &AgentRow) -> Vec<String> {
         let preview = live.and_then(|live| live.preview.clone());
         let reasoning = live.and_then(|live| live.reasoning_preview.clone());
         if let Some(step) = step.clone() {
-            lines.push(format!("Letzter Schritt: {step}"));
+            lines.push(crate::i18n::tr_args(
+                "agents.last_step",
+                "Last step: {step}",
+                &[("step", &(step).to_string())],
+            ));
         }
         if let Some(reasoning) = reasoning.clone() {
-            lines.push(format!("Reasoning: ∴ {reasoning}"));
+            lines.push(crate::i18n::tr_args(
+                "agents.reasoning",
+                "Reasoning: ∴ {reasoning}",
+                &[("reasoning", &(reasoning).to_string())],
+            ));
         }
         if let Some(preview) = preview.clone() {
-            lines.push(format!("Zwischenstand: {preview}"));
+            lines.push(crate::i18n::tr_args(
+                "agents.preview",
+                "Progress: {preview}",
+                &[("preview", &(preview).to_string())],
+            ));
         }
         if step.is_none() && reasoning.is_none() && preview.is_none() {
-            lines.push("Läuft …".to_owned());
+            lines.push(crate::i18n::tr("agents.running", "Running …").to_owned());
         }
     }
     lines
@@ -352,23 +423,32 @@ pub(crate) fn detail_lines(row: &AgentRow) -> Vec<String> {
 /// Baumzeile ohne Marker/Einrückung: Rolle, Status, Zustand, Tokens, Tools,
 /// Dauer und gekürzter Auftrag.
 pub(crate) fn tree_text(row: &AgentRow, status: &str) -> String {
-    let mut text = format!("{} · {status}", row.role);
+    let mut text = format!("{} · {}", row.role, status_text(status));
     match &row.live {
         Some(live) => {
             if live.active {
                 text.push_str(&format!(" · {}", live.state));
             }
-            text.push_str(&format!(
-                " · {} · Tools {} · {}",
-                live.tokens_label(),
-                live.tool_calls.max(row.tool_calls.unwrap_or(0)),
-                live.elapsed_label()
+            text.push_str(&crate::i18n::tr_args(
+                "agents.tree_tools",
+                " · {p0} · Tools {p1} · {p2}",
+                &[
+                    ("p0", &(live.tokens_label()).to_string()),
+                    (
+                        "p1",
+                        &(live.tool_calls.max(row.tool_calls.unwrap_or(0))).to_string(),
+                    ),
+                    ("p2", &(live.elapsed_label()).to_string()),
+                ],
             ));
         }
-        None => text.push_str(&format!(
-            " · Tokens {} · Tools {}",
-            known(row.tokens),
-            known(row.tool_calls)
+        None => text.push_str(&crate::i18n::tr_args(
+            "agents.tree_totals",
+            " · Tokens {p0} · Tools {p1}",
+            &[
+                ("p0", &(known(row.tokens)).to_string()),
+                ("p1", &(known(row.tool_calls)).to_string()),
+            ],
         )),
     }
     if let Some(task) = &row.task {
@@ -494,7 +574,7 @@ mod tests {
             "{details}"
         );
         assert!(
-            details.contains("Zwischenstand: Zwischenstand vorhanden"),
+            details.contains("Progress: Zwischenstand vorhanden"),
             "{details}"
         );
         Ok(())
@@ -517,8 +597,8 @@ mod tests {
         assert!(details.contains("Tools: 1"), "{details}");
         assert!(details.contains(" s"), "{details}");
         assert!(details.contains("(10 %)"), "Tools-Auslastung: {details}");
-        assert!(!details.contains("Noch kein Ergebnis"), "{details}");
-        assert!(details.contains("Letzter Schritt"), "{details}");
+        assert!(!details.contains("No result yet"), "{details}");
+        assert!(details.contains("Last step"), "{details}");
         Ok(())
     }
 
@@ -562,22 +642,14 @@ mod tests {
         done.status = "completed".to_owned();
         done.result = Some("Bericht: alles konsistent.".to_owned());
         let details = detail_lines(&done).join("\n");
-        assert!(details.contains("Ergebnis:"), "{details}");
+        assert!(details.contains("Result:"), "{details}");
         assert!(details.contains("alles konsistent"), "{details}");
 
         done.result = None;
-        assert!(
-            detail_lines(&done)
-                .join("\n")
-                .contains("Noch kein Ergebnis.")
-        );
+        assert!(detail_lines(&done).join("\n").contains("No result yet."));
 
         let running = row("child-4", Some("uia"));
-        assert!(
-            !detail_lines(&running)
-                .join("\n")
-                .contains("Noch kein Ergebnis.")
-        );
+        assert!(!detail_lines(&running).join("\n").contains("No result yet."));
     }
 
     /// Ein Orchestrierungs-Auftrag im Monitor füllt eine fehlende Zeile auf;

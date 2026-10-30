@@ -154,9 +154,11 @@ impl TerminalCategory {
             Self::Role(role) => role.clone(),
             Self::Tool(tool) if tool.trim().is_empty() => format!("{TOOL_PREFIX}{UNNAMED_TOOL}"),
             Self::Tool(tool) => format!("{TOOL_PREFIX}{tool}"),
-            Self::Operator => OPERATOR_JOB_LABEL.to_owned(),
-            Self::UnknownJob => UNKNOWN_JOB_LABEL.to_owned(),
-            Self::AgentChildPending => PENDING_CHILD_LABEL.to_owned(),
+            Self::Operator => crate::i18n::tr("mission.operator", OPERATOR_JOB_LABEL).to_owned(),
+            Self::UnknownJob => crate::i18n::tr("mission.unknown", UNKNOWN_JOB_LABEL).to_owned(),
+            Self::AgentChildPending => {
+                crate::i18n::tr("mission.pending_child", PENDING_CHILD_LABEL).to_owned()
+            }
         }
     }
 
@@ -257,6 +259,8 @@ pub(crate) struct TerminalConstituent {
     pub(crate) unseen: bool,
     /// Failure reason, if any (terminal-safe).
     pub(crate) reason: Option<String>,
+    /// Typed job failure wrapper; raw agent failure reasons remain verbatim.
+    pub(crate) reason_source: Option<crate::jobs_panel::JobFailure>,
     /// Outcome of the run's job when it differs from the run's own.
     pub(crate) diverged: Option<TerminalOutcome>,
 }
@@ -413,6 +417,7 @@ fn agent_member(
             at: live.finished.and_then(|at| as_of.wall_of(at)),
             unseen: live.is_unseen_failure(),
             reason: live.failure_reason.as_deref().map(sanitize_inline),
+            reason_source: None,
             diverged: job_outcome.filter(|job| *job != outcome),
         },
         category: TerminalCategory::Role(role),
@@ -484,6 +489,7 @@ fn members(monitor: &AgentMonitor, jobs: &[JobRow], as_of: &AsOf) -> Vec<Member>
                 at: job.ended_at,
                 unseen,
                 reason: job.reason.clone(),
+                reason_source: job.reason_source.clone(),
                 diverged: None,
             },
         });
@@ -583,6 +589,7 @@ pub(crate) mod tests {
             active: !state.is_terminal(),
             failed: matches!(state, JobState::Failed | JobState::Unknown),
             reason: None,
+            reason_source: None,
             origin: None,
             cgroup: None,
             ended_at: None,

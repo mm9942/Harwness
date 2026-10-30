@@ -40,9 +40,10 @@ const FOOTER: &str = "Enter stop · Esc cancel";
 /// Confirmation text for the job `name` (`id`).
 #[must_use]
 pub(crate) fn prompt(name: &str, id: &JobId) -> String {
-    format!(
-        "Stop job \"{name}\" ({id})? TERM, then the existing job stop policy. \
-         [Enter] stop [Esc] cancel"
+    crate::i18n::tr_args(
+        "mission.stop_prompt",
+        "Stop job \"{name}\" ({id})? TERM, then the existing job stop policy. [Enter] stop [Esc] cancel",
+        &[("name", name), ("id", id.as_str())],
     )
 }
 
@@ -93,20 +94,33 @@ impl StopJobDialog {
             return None;
         }
         let job = JobId::parse(&row.id)?;
-        let dialog = ChoiceDialog::new(
-            TITLE,
-            Some(prompt(&row.name, &job)),
-            vec![STOP_OPTION.to_owned()],
-        )
-        .with_footer_hint(FOOTER);
         Some(Self {
-            dialog,
+            dialog: Self::presentation(&StopTarget {
+                job: job.clone(),
+                name: row.name.clone(),
+                state: row.state,
+            }),
             target: StopTarget {
                 job,
                 name: row.name.clone(),
                 state: row.state,
             },
         })
+    }
+
+    fn presentation(target: &StopTarget) -> ChoiceDialog {
+        ChoiceDialog::new(
+            crate::i18n::tr("mission.stop_title", TITLE),
+            Some(prompt(&target.name, &target.job)),
+            vec![crate::i18n::tr("mission.stop_option", STOP_OPTION).to_owned()],
+        )
+        .with_footer_hint(crate::i18n::tr("mission.stop_footer", FOOTER))
+    }
+
+    /// Refresh only owned text; target, choice and body scroll are unchanged.
+    pub(crate) fn refresh_presentation(&mut self) {
+        self.dialog
+            .refresh_owned_presentation(Self::presentation(&self.target));
     }
 
     /// Handles one key (see the module docs).

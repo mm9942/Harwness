@@ -2304,6 +2304,10 @@ impl ChatApp {
     /// Admittierung und Status; unbekannte Telemetrie bleibt für die Anzeige
     /// bewusst `None` statt als Nullwert erfunden zu werden.
     fn agent_tree_rows(&self) -> Vec<AgentRow> {
+        crate::i18n::with_language(self.language, || self.agent_tree_rows_scoped())
+    }
+
+    fn agent_tree_rows_scoped(&self) -> Vec<AgentRow> {
         let root = self.session_id().clone();
         let mut rows = vec![AgentRow {
             id: root.as_str().to_owned(),
@@ -4530,11 +4534,23 @@ fn append_agent_tree_rows(
             record.budget.max_wall_time_ms,
         ) {
             (None, None, None) => "—".to_owned(),
-            (tokens, tools, wall) => format!(
-                "Tokens {} · Tools {} · Dauer {} ms",
-                tokens.map_or_else(|| "—".to_owned(), |value| value.to_string()),
-                tools.map_or_else(|| "—".to_owned(), |value| value.to_string()),
-                wall.map_or_else(|| "—".to_owned(), |value| value.to_string()),
+            (tokens, tools, wall) => crate::i18n::tr_args(
+                "agents.budget_caps",
+                "Tokens {tokens} · Tools {tools} · Duration {wall} ms",
+                &[
+                    (
+                        "tokens",
+                        &tokens.map_or_else(|| "—".to_owned(), |value| value.to_string()),
+                    ),
+                    (
+                        "tools",
+                        &tools.map_or_else(|| "—".to_owned(), |value| value.to_string()),
+                    ),
+                    (
+                        "wall",
+                        &wall.map_or_else(|| "—".to_owned(), |value| value.to_string()),
+                    ),
+                ],
             ),
         };
         let child = record.child.clone();
@@ -7340,7 +7356,12 @@ fn handle_agent_tree_key(app: &mut ChatApp, key: KeyEvent) {
             if !cancelled {
                 app.push_line(
                     Role::System,
-                    format!("Abbruch für Agent {target} konnte nicht angefordert werden."),
+                    crate::i18n::tr_args_for(
+                        app.language,
+                        "agents.cancel_failed",
+                        "Could not request cancellation for agent {target}.",
+                        &[("target", &target)],
+                    ),
                 );
             }
         }
@@ -10690,7 +10711,7 @@ fn child_info_expired_segment(child: &str, age_secs: u64) -> String {
 
 /// Own the scroll hint at the app presentation boundary; ChatScroll retains
 /// its geometry/state API and compatibility formatter.
-fn scroll_indicator_text(scroll: &ChatScroll, key: &str) -> Option<String> {
+pub(crate) fn scroll_indicator_text(scroll: &ChatScroll, key: &str) -> Option<String> {
     if scroll.is_following() {
         return None;
     }
@@ -17112,6 +17133,7 @@ forbidden = [{forbidden}]
             active: true,
             failed: false,
             reason: None,
+            reason_source: None,
             origin: None,
             cgroup: None,
             ended_at: None,
@@ -17491,7 +17513,7 @@ forbidden = [{forbidden}]
         let live = regions.live.ok_or(TestError::Missing("LIVE-Streifen"))?;
         assert_eq!((live.x, live.y, live.width), (0, 5, 46), "{shown}");
         assert!(
-            screen_row(&rows, 0)?.starts_with('┌') && screen_row(&rows, 0)?.contains("Agenten"),
+            screen_row(&rows, 0)?.starts_with('┌') && screen_row(&rows, 0)?.contains("Agents"),
             "{shown}"
         );
         assert!(
@@ -17511,7 +17533,7 @@ forbidden = [{forbidden}]
             "{shown}"
         );
         assert!(
-            screen_row(&rows, 7)?.starts_with("  ● fs.read · läuft · "),
+            screen_row(&rows, 7)?.starts_with("  ● fs.read · running · "),
             "{shown}"
         );
         let history_row = mission_history_row(&rows)?;
@@ -17586,7 +17608,7 @@ forbidden = [{forbidden}]
         assert_eq!(regions.jobs, Some(Rect::new(35, 0, 35, 4)), "{shown}");
         let top: String = screen_row(&rows, 0)?.chars().collect();
         assert!(
-            top.starts_with("┌ Agenten") && top.contains("┐┌ Jobs · 1 aktiv"),
+            top.starts_with("┌ Agents") && top.contains("┐┌ Jobs · 1 active"),
             "zwei eigene Rahmen: {shown}"
         );
         let jobs_rows: Vec<String> = rows
@@ -18123,7 +18145,7 @@ forbidden = [{forbidden}]
         assert!(
             rows[..usize::from(dock.height)]
                 .iter()
-                .any(|row| row.contains("Agenten")),
+                .any(|row| row.contains("Agents")),
             "Dock-Titel fehlt in den oberen Zeilen: {shown}"
         );
 
@@ -18209,7 +18231,7 @@ forbidden = [{forbidden}]
         assert!(
             rows[..usize::from(dock.height)]
                 .iter()
-                .any(|row| row.contains("Agenten")),
+                .any(|row| row.contains("Agents")),
             "Dock-Titel fehlt weiterhin: {shown}"
         );
 

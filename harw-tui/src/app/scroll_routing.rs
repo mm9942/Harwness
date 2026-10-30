@@ -483,8 +483,8 @@ mod tests {
         for (width, height) in SIZES {
             let rows = screen(&app, width, height)?;
             let shown = rows.join("\n");
-            let panel = rows.iter().any(|row| row.contains("Agenten · 1 aktiv"));
-            let summary = rows.iter().any(|row| row.contains("Agenten: ● 1 aktiv"));
+            let panel = rows.iter().any(|row| row.contains("Agents · 1 active"));
+            let summary = rows.iter().any(|row| row.contains("Agents: ● 1 active"));
             if width >= crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH {
                 assert!(panel && !summary, "{width}x{height}: {shown}");
                 assert!(
