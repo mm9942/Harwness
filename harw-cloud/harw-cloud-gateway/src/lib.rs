@@ -1,6 +1,7 @@
 //! Harwness cloud gateway: configuration loading and status probing.
 //!
-//! The optional `proxy` feature enables the pingora-based reverse proxy.
+//! The optional `proxy` feature exposes a fail-closed Pingora proxy placeholder;
+//! forwarding is not implemented.
 
 pub mod config;
 pub mod status;
