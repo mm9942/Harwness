@@ -16,6 +16,8 @@
 //! # Nebenläufigkeit
 //! Lebt exklusiv in `crate::plan_dialog::PlanUi` (Renderer-Thread).
 
+use crate::i18n::{tr, tr_args};
+
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -387,7 +389,14 @@ impl AskUserDialog {
         let mut pinned = Vec::new();
         let total = self.questions.len();
         let mut tabs: Vec<Span<'static>> = vec![Span::styled(
-            format!("Frage {}/{total}  ", self.index + 1),
+            tr_args(
+                "dialogs.question_progress",
+                "Question {current}/{total}  ",
+                &[
+                    ("current", &(self.index + 1).to_string()),
+                    ("total", &total.to_string()),
+                ],
+            ),
             dim,
         )];
         for (i, (question, state)) in self.questions.iter().zip(&self.states).enumerate() {
@@ -410,7 +419,10 @@ impl AskUserDialog {
             Style::default().add_modifier(Modifier::BOLD),
         ));
         if question.multi_select {
-            body.push(Line::styled("(Mehrfachauswahl)", dim));
+            body.push(Line::styled(
+                tr("dialogs.multiple_selection", "(multiple selection)"),
+                dim,
+            ));
         }
         for (i, option) in question.options.iter().enumerate() {
             let chosen = state.selected.get(i).copied().unwrap_or(false);
@@ -457,7 +469,7 @@ impl AskUserDialog {
         let text = if state.editing {
             format!("{}▏", sanitize_inline(&state.other))
         } else if state.other.is_empty() {
-            "eigene Antwort eingeben …".to_owned()
+            tr("dialogs.custom_answer", "type your answer …").to_owned()
         } else {
             sanitize_inline(&state.other)
         };
@@ -468,28 +480,54 @@ impl AskUserDialog {
         };
         pinned.push(PinnedRow::content(Line::from(vec![
             Span::styled(
-                format!("{pointer} {}. {marker} Andere: ", other_index + 1),
+                tr_args(
+                    "dialogs.other_option",
+                    "{pointer} {number}. {marker} Other: ",
+                    &[
+                        ("pointer", pointer),
+                        ("number", &(other_index + 1).to_string()),
+                        ("marker", marker),
+                    ],
+                ),
                 style,
             ),
             Span::styled(text, if state.editing { Style::default() } else { dim }),
         ])));
         let footers: &[&str] = if !self.armed(now) {
             &[
-                "Fenster wird gleich scharf … · Esc bricht ab",
-                "gleich scharf … · Esc",
+                tr("dialogs.arming", "Window ready shortly … · Esc cancels"),
+                tr("dialogs.arming_short", "Ready shortly … · Esc"),
             ]
         } else if state.editing {
-            &["Tippen · Enter übernehmen · Esc zurück", "Enter · Esc"]
+            &[
+                tr(
+                    "dialogs.edit_answer_footer",
+                    "Type · Enter accept · Esc back",
+                ),
+                "Enter · Esc",
+            ]
         } else if question.multi_select {
             &[
-                "↑↓ wählen · Leertaste/Ziffer markieren · Enter bestätigen · Tab nächste Frage · Esc abbrechen",
-                "↑↓ · Leertaste markieren · Enter · Tab · Esc",
+                tr(
+                    "dialogs.multi_answer_footer",
+                    "↑↓ select · Space/digit mark · Enter confirm · Tab next question · Esc cancel",
+                ),
+                tr(
+                    "dialogs.multi_answer_short",
+                    "↑↓ · Space mark · Enter · Tab · Esc",
+                ),
                 "↑↓ · ␣ · Enter · Tab · Esc",
             ]
         } else {
             &[
-                "↑↓ wählen · Ziffer/Enter übernehmen · Tab nächste Frage · Esc abbrechen",
-                "↑↓ · Enter übernehmen · Tab · Esc",
+                tr(
+                    "dialogs.single_answer_footer",
+                    "↑↓ select · Digit/Enter accept · Tab next question · Esc cancel",
+                ),
+                tr(
+                    "dialogs.single_answer_short",
+                    "↑↓ · Enter accept · Tab · Esc",
+                ),
                 "↑↓ · Enter · Tab · Esc",
             ]
         };
@@ -517,7 +555,7 @@ impl AskUserDialog {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(style::accent_color(theme)))
-            .title(" Rückfrage des Agenten · ask_user ");
+            .title(tr("dialogs.ask_title", " Agent question · ask_user "));
         let width = block.inner(area.intersection(buf.area)).width.max(1);
         dialog_frame::render_dialog(
             block,
@@ -647,7 +685,61 @@ mod tests {
         assert!(text.contains("Welche?"));
         assert!(text.contains("1. ( ) Alpha — erste"));
         assert!(text.contains("2. ( ) Beta"));
-        assert!(text.contains("3. ( ) Andere"));
+        assert!(text.contains("3. ( ) Other"));
         assert!(dialog.desired_height(80, style::Theme::Dark) >= MIN_DIALOG_HEIGHT);
+    }
+
+    #[tokio::test]
+    async fn localized_chrome_keeps_questions_navigation_and_answers_verbatim() -> TestResult {
+        use crate::i18n::{tr_for, with_language};
+        use harw_config::UiLanguage;
+
+        let payload = "प्रश्न e\u{301} 日本語 {language}";
+        let (prompt, answer) = AskUserPrompt::new(vec![question(payload, false)]);
+        let shown = Instant::now();
+        let mut dialog = AskUserDialog::new(prompt, shown);
+        let now = armed(shown);
+        // The default is explicitly English, regardless of the host locale.
+        assert!(
+            dialog.lines(style::Theme::Dark, now)[0]
+                .to_string()
+                .contains("Question 1/1")
+        );
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                let lines = dialog.lines(style::Theme::Dark, now);
+                let text = lines
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(text.contains(payload), "{language:?}: {text}");
+                assert!(text.contains("Alpha — erste"), "{language:?}: {text}");
+                assert!(text.contains(tr_for(
+                    language,
+                    "dialogs.custom_answer",
+                    "type your answer …"
+                )));
+                // Narrow CJK and combining-mark text is measured by the existing
+                // dialog wrapper; every render must remain within its buffer.
+                for width in [1, 8, 20, 40, 80] {
+                    let area = Rect::new(0, 0, width, 12);
+                    let mut buffer = Buffer::empty(area);
+                    dialog.render(area, &mut buffer, style::Theme::Dark);
+                    assert_eq!(buffer.area, area);
+                }
+            });
+        }
+        with_language(UiLanguage::Japanese, || {
+            dialog.handle_event(key(KeyCode::Down), now);
+        });
+        let step = with_language(UiLanguage::Hindi, || {
+            dialog.handle_event(key(KeyCode::Enter), now)
+        });
+        assert!(matches!(step, AskStep::Submitted(_)));
+        let received = answer.await.map_err(|_| TestError::Missing("answer"))?;
+        assert_eq!(received.answers[0].selected, vec!["Beta".to_owned()]);
+        assert_eq!(received.answers[0].other, None);
+        Ok(())
     }
 }

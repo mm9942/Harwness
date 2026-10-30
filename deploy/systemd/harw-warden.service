@@ -25,7 +25,7 @@
 # writable root (--cgroup-root).
 
 [Unit]
-Description=HARW DoD Warden -- enforcement at the systemd socket (disabled by default)
+Description=Harw-DoD Warden -- enforcement at the systemd socket (disabled by default)
 Documentation=man:harw-warden(1)
 Requires=harw-warden.socket
 After=harw-warden.socket

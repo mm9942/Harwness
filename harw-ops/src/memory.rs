@@ -473,19 +473,17 @@ fn render_fact_recall(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpEr
     let keywords: Vec<&str> = tail.iter().map(String::as_str).collect();
     let mut hits: Vec<(FactScope, Fact)> = Vec::new();
 
-    if let Ok(root) = project_memories_root(ctx) {
-        if let Ok(store) = FactStore::open(&root, FactScope::Project) {
-            if let Ok(found) = store.search(&keywords, RECALL_LIMIT) {
-                hits.extend(found.into_iter().map(|fact| (FactScope::Project, fact)));
-            }
-        }
+    if let Ok(root) = project_memories_root(ctx)
+        && let Ok(store) = FactStore::open(&root, FactScope::Project)
+        && let Ok(found) = store.search(&keywords, RECALL_LIMIT)
+    {
+        hits.extend(found.into_iter().map(|fact| (FactScope::Project, fact)));
     }
-    if let Ok(root) = global_memories_root(ctx) {
-        if let Ok(store) = FactStore::open(&root, FactScope::Global) {
-            if let Ok(found) = store.search(&keywords, RECALL_LIMIT) {
-                hits.extend(found.into_iter().map(|fact| (FactScope::Global, fact)));
-            }
-        }
+    if let Ok(root) = global_memories_root(ctx)
+        && let Ok(store) = FactStore::open(&root, FactScope::Global)
+        && let Ok(found) = store.search(&keywords, RECALL_LIMIT)
+    {
+        hits.extend(found.into_iter().map(|fact| (FactScope::Global, fact)));
     }
 
     if hits.is_empty() {
@@ -1393,6 +1391,7 @@ mod tests {
         let agent = crate::knowledge_common::KnowledgeCaller {
             agent: AgentId::new("explorer"),
             viewer: VisibilityScope::SelfOnly,
+            identity: None,
         };
         let hidden = list_provisional_topics(&store, &agent).map_err(ctx("topics as agent"))?;
         let data = hidden.data.ok_or(TestError::Missing("agent topics data"))?;

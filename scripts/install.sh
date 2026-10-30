@@ -26,7 +26,7 @@ the mirror publishes none, Harwness-main.zip. It installs Rustup with the
 stable default toolchain when needed, installs missing Linux build
 dependencies including Bubblewrap, then runs make install.
 
---binary (opt-in) installs harw, killer and harw-agent-runner from a
+--binary (opt-in) installs harw, killer, harw-job-exec and harw-agent-runner from a
 prebuilt release and fails instead of falling back to a source build (no
 Rust toolchain): it needs glibc (x86_64 or aarch64 Linux) or Termux,
 downloads harw-<tag>-<target>.tar.gz and SHA256SUMS, refuses a tarball whose
@@ -395,6 +395,19 @@ install_binary_release() {
   for binary in $binaries; do
     [ -f "$unpacked/$binary" ] || die "$name.tar.gz has no $binary; nothing installed"
   done
+  # harw-job-exec (job sandbox trampoline, Linux-only) sits next to harw.
+  # Releases before it shipped lack it: install it when present, otherwise
+  # say so (harw doctor reports the missing trampoline as well).
+  case "$target" in
+    *-android) ;;
+    *)
+      if [ -f "$unpacked/harw-job-exec" ]; then
+        binaries="$binaries harw-job-exec"
+      else
+        log "$name.tar.gz has no harw-job-exec; sandboxed jobs run without the Landlock trampoline (harw doctor reports it)"
+      fi
+      ;;
+  esac
   # Run the new harw from the staging directory first: a release that cannot
   # execute here (missing loader, wrong libc) must not replace a working
   # installation.

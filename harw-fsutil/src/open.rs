@@ -796,14 +796,22 @@ mod tests {
     }
 
     /// R2-10: Geräte werden ebenfalls abgelehnt.
+    ///
+    /// In manchen Sandboxen ist `/dev/null` eine reguläre Datei; deshalb wird
+    /// das erste echte Zeichengerät aus einer kleinen Kandidatenliste genommen
+    /// und ohne Gerät übersprungen.
     #[test]
     fn zeichengeraet_wird_abgelehnt() -> TestResult {
-        let null = Path::new("/dev/null");
-        if !null.exists() {
-            eprintln!("übersprungen: /dev/null fehlt");
+        let devices = ["/dev/null", "/dev/zero", "/dev/urandom"];
+        let Some(device) = devices.iter().map(|name| Path::new(*name)).find(|path| {
+            std::fs::symlink_metadata(path)
+                .map(|meta| meta.file_type().is_char_device())
+                .unwrap_or(false)
+        }) else {
+            eprintln!("übersprungen: kein Zeichengerät verfügbar");
             return Ok(());
-        }
-        let Err(err) = open_nofollow(null, OpenMode::read_only()) else {
+        };
+        let Err(err) = open_nofollow(device, OpenMode::read_only()) else {
             return Err(TestError::Unexpected("Err erwartet".into()));
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);

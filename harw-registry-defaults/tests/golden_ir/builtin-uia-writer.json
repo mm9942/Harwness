@@ -18,6 +18,7 @@
   "tools": {
     "admitted": [
       "fs.read",
+      "fs.view_image",
       "fs.list",
       "fs.search",
       "fs.glob",
@@ -123,6 +124,7 @@
       "fs.list",
       "fs.read",
       "fs.search",
+      "fs.view_image",
       "fs.write",
       "palace.recall",
       "palace.search",
@@ -220,6 +222,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "621ae3e5325add54159374f0758fb6a604840f6ded2c20bf22c1f19b7469de05"
+    "digest": "cd36d84e47bec2760b01ccfcde14f0e2cadb6c96d6dfa42e7ea28162c0da31b7"
   }
 }

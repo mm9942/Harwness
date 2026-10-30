@@ -1,4 +1,4 @@
-//! `FsToolProvider` — aggregierter ToolProvider für alle sieben FS-Tools.
+//! `FsToolProvider` — aggregierter ToolProvider für alle acht FS-Tools.
 //!
 //! # Verantwortung
 //! Dieses Modul fasst `fs.read`, `fs.write`, `fs.edit`, `fs.list`,
@@ -57,7 +57,7 @@ use std::sync::Arc;
 /// Standard-Maximum für lesbare Bytes in `fs.read`.
 pub const DEFAULT_MAX_READ_BYTES: u64 = 65_536;
 
-/// Aggregierter ToolProvider für alle sieben Filesystem-Tools.
+/// Aggregierter ToolProvider für alle acht Filesystem-Tools.
 ///
 /// # Description
 /// Stellt `fs.read`, `fs.write`, `fs.edit`, `fs.list`, `fs.search`, `fs.glob`
@@ -90,6 +90,37 @@ pub struct FsToolProvider {
 }
 
 impl FsToolProvider {
+    /// Names of the eight tools, in [`ToolProvider::tools`] order (the same
+    /// table `harw_tools::tool_provider!` generates for macro providers).
+    pub const TOOL_NAMES: &'static [&'static str] = &[
+        "fs.read",
+        "fs.view_image",
+        "fs.write",
+        "fs.edit",
+        "fs.list",
+        "fs.search",
+        FsGlobTool::NAME,
+        FsGrepTool::NAME,
+    ];
+
+    /// Activity descriptors of the tools (PL-71, PL-97 M2), index-aligned with
+    /// [`Self::TOOL_NAMES`], in the shape of `tool_provider!`'s
+    /// `TOOL_ACTIVITIES`: reads, listings and searches are `observe`,
+    /// `fs.write`/`fs.edit` are `mutate`; the resource key is always the `path`
+    /// argument.
+    ///
+    /// Descriptive only: never a permission, never part of a `ToolSpec`.
+    pub const TOOL_ACTIVITIES: &'static [Option<harw_tools::ActivityDescriptor>] = &[
+        FsReadExecutor::ACTIVITY,
+        crate::FsViewImageExecutor::ACTIVITY,
+        FsWriteExecutor::ACTIVITY,
+        FsEditExecutor::ACTIVITY,
+        FsListExecutor::ACTIVITY,
+        FsSearchExecutor::ACTIVITY,
+        FsGlobTool::ACTIVITY,
+        FsGrepTool::ACTIVITY,
+    ];
+
     /// Erstellt einen neuen `FsToolProvider` mit Standard-Konfiguration.
     ///
     /// # Returns
@@ -128,10 +159,10 @@ impl Default for FsToolProvider {
 }
 
 impl ToolProvider for FsToolProvider {
-    /// Gibt die Liste aller sieben FS-Tools zurück.
+    /// Gibt die Liste aller acht FS-Tools zurück.
     ///
     /// # Returns
-    /// `Vec<ToolSpec>` mit sieben Einträgen: `fs.read`, `fs.write`, `fs.edit`,
+    /// `Vec<ToolSpec>` mit acht Einträgen: `fs.read`, `fs.view_image`, `fs.write`, `fs.edit`,
     /// `fs.list`, `fs.search`, `fs.glob`, `fs.grep`.
     ///
     /// # Concurrency
@@ -139,6 +170,7 @@ impl ToolProvider for FsToolProvider {
     fn tools(&self) -> Vec<ToolSpec> {
         vec![
             fs_read_spec(),
+            fs_view_image_spec(),
             fs_write_spec(),
             fs_edit_spec(),
             fs_list_spec(),
@@ -163,6 +195,7 @@ impl ToolProvider for FsToolProvider {
             "fs.read" => Some(Arc::new(FsReadExecutor {
                 max_bytes: self.max_read_bytes,
             })),
+            "fs.view_image" => Some(Arc::new(crate::FsViewImageExecutor)),
             "fs.write" => Some(Arc::new(FsWriteExecutor)),
             "fs.edit" => Some(Arc::new(FsEditExecutor)),
             "fs.list" => Some(Arc::new(FsListExecutor {
@@ -193,7 +226,7 @@ impl ToolProvider for FsToolProvider {
     fn parallel_safe(&self, name: &ToolName) -> bool {
         matches!(
             name.as_str(),
-            "fs.read" | "fs.list" | "fs.search" | "fs.glob" | "fs.grep"
+            "fs.read" | "fs.view_image" | "fs.list" | "fs.search" | "fs.glob" | "fs.grep"
         )
     }
 }
@@ -214,6 +247,44 @@ fn protected_areas_description() -> String {
     } else {
         format!(".git/, .harw/ and {named}/")
     }
+}
+
+fn fs_view_image_spec() -> ToolSpec {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "path".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some("Image file path relative to the workspace root.".to_owned()),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "detail".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Image detail: low, high, or auto. Omit for provider default.".to_owned(),
+            ),
+            enum_values: Some(vec![
+                serde_json::json!("low"),
+                serde_json::json!("high"),
+                serde_json::json!("auto"),
+            ]),
+            ..Default::default()
+        },
+    );
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new("fs.view_image"),
+        description: "Opens a PNG, JPEG, GIF or WebP image from the workspace to inspect its actual visual content. The next request receives native image input, then you can continue reasoning and tool use. Uses existing read permissions, image size and pixel limits; GIF uses its first frame. Text-only models receive an explicit vision_unavailable result; never infer visual observations from image metadata. No model switching occurs.".to_owned(),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object), properties: Some(props),
+            required: Some(vec!["path".to_owned()]),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..Default::default()
+        },
+        strict: true,
+    })
 }
 
 fn fs_read_spec() -> ToolSpec {
@@ -299,7 +370,7 @@ fn fs_read_spec() -> ToolSpec {
              Zeilen, z. B. für Logs (`limit` begrenzt zusätzlich). (3) Byte-Modus (Rückfall): \
              `offset`/`max_bytes`. Für bestimmte Stellen zuerst `fs.grep` (liefert \
              Zeilennummern), dann `fs.read` mit `line`. Kein `sed`/`head`/`tail`/`grep` über \
-             `shell.exec` nötig. Für PDFs `doc.read_pdf` verwenden."
+             `shell.exec` nötig. Für PDFs `doc.read_pdf`, für Bilder `fs.view_image` verwenden."
                 .to_owned(),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
@@ -577,10 +648,11 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_tool_provider_lists_seven_tools() -> TestResult {
+    fn test_fs_tool_provider_lists_eight_tools() -> TestResult {
         let provider = FsToolProvider::new();
         let tools = provider.tools();
-        assert_eq!(tools.len(), 7, "expected exactly 7 tools");
+        assert_eq!(tools.len(), 8, "expected exactly 8 tools");
+        assert!(tools.iter().any(|tool| tool.name() == "fs.view_image"));
 
         let names: HashSet<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains("fs.read"), "missing fs.read");
@@ -693,6 +765,90 @@ mod tests {
             "{}",
             write.description
         );
+    }
+
+    /// PL-97 M2: `TOOL_NAMES` folgt der Reihenfolge von `tools()`.
+    #[test]
+    fn test_fs_tool_names_follow_tools_order() {
+        let tools = FsToolProvider::new().tools();
+        let names: Vec<&str> = tools.iter().map(ToolSpec::name).collect();
+        assert_eq!(names, FsToolProvider::TOOL_NAMES);
+        assert_eq!(
+            FsToolProvider::TOOL_ACTIVITIES.len(),
+            FsToolProvider::TOOL_NAMES.len()
+        );
+    }
+
+    /// PL-97 M2 (erste Migrationswelle, PL-71 §Migration): jedes `fs.*`-Tool
+    /// trägt einen bekannten `filesystem`-Deskriptor; Lesen/Listen/Suchen ist
+    /// `observe`, Schreiben/Editieren `mutate`, und das Ressourcenfeld ist ein
+    /// Argument der modell-sichtbaren Spezifikation.
+    #[test]
+    fn test_fs_tool_activities_are_annotated() -> TestResult {
+        let specs = FsToolProvider::new().tools();
+        for ((name, activity), spec) in FsToolProvider::TOOL_NAMES
+            .iter()
+            .zip(FsToolProvider::TOOL_ACTIVITIES)
+            .zip(&specs)
+        {
+            let activity = activity
+                .as_ref()
+                .ok_or(TestError::Missing("every fs.* tool declares an activity"))?;
+            assert!(activity.is_known(), "{name}: {activity}");
+            assert_eq!(activity.domain, "filesystem", "{name}");
+            let verb = name
+                .strip_prefix("fs.")
+                .ok_or(TestError::Missing("fs. prefix"))?;
+            assert_eq!(activity.verb, verb, "{name}");
+            let expected = if matches!(*name, "fs.write" | "fs.edit") {
+                harw_tools::Effect::Mutate
+            } else {
+                harw_tools::Effect::Observe
+            };
+            assert_eq!(activity.effect, expected, "{name}");
+            assert_eq!(activity.resource_field.as_deref(), Some("path"), "{name}");
+            let ToolSpec::Function(function) = spec;
+            let properties = function.parameters.properties.clone().unwrap_or_default();
+            assert!(
+                properties.contains_key("path"),
+                "{name}: the resource field must be an argument of the spec"
+            );
+        }
+        // Die makro-generierten Tools liefern denselben Deskriptor wie die Tabelle.
+        assert_eq!(FsGlobTool::ACTIVITY, FsToolProvider::TOOL_ACTIVITIES[6]);
+        assert_eq!(FsGrepTool::ACTIVITY, FsToolProvider::TOOL_ACTIVITIES[7]);
+        assert_eq!(FsGlobTool::SKILL, None);
+        Ok(())
+    }
+
+    /// PL-97 M2: Die Activity-Metadaten ändern die modell-sichtbaren
+    /// Spezifikationen nicht. Die Golden-Datei wurde **vor** der Annotation
+    /// erfasst; absichtliche Änderungen werden mit
+    /// `HARW_UPDATE_GOLDEN=1 cargo test -p harw-tool-fs` neu geschrieben.
+    #[test]
+    fn test_fs_tool_specs_match_golden() -> TestResult {
+        let actual = serde_json::to_value(FsToolProvider::new().tools())?;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join("fs_tool_specs.json");
+        if std::env::var_os("HARW_UPDATE_GOLDEN").is_some() {
+            let parent = path
+                .parent()
+                .ok_or(TestError::Missing("golden file has a parent directory"))?;
+            fs::create_dir_all(parent)?;
+            let mut text = serde_json::to_string_pretty(&actual)?;
+            text.push('\n');
+            fs::write(&path, text)?;
+            return Ok(());
+        }
+        let expected: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        if expected != actual {
+            return Err(TestError::Unexpected(format!(
+                "fs tool specs differ from golden\nexpected: {expected:#}\nactual: {actual:#}"
+            )));
+        }
+        Ok(())
     }
 
     #[test]

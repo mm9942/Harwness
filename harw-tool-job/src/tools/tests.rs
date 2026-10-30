@@ -138,6 +138,14 @@ async fn test_job_start_records_its_origin() -> TestResult {
             .as_deref()
             .is_some_and(|id| !id.is_empty())
     );
+    // W20-A: `job.start` records the typed `Tool` origin as well.
+    assert_eq!(
+        status.meta.origin,
+        Some(crate::model::ManagedJobOrigin::Tool {
+            tool: JOB_START_TOOL.to_owned(),
+            call_id: status.meta.origin_call_id.clone(),
+        })
+    );
     Ok(())
 }
 

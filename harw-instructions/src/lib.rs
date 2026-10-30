@@ -16,8 +16,10 @@
 #![forbid(unsafe_code)]
 pub mod baseline;
 pub mod trust_boundary;
+mod workflow;
 pub use baseline::{AgentIdentity, BaselineInstructionsProvider};
 pub use trust_boundary::{DATA_BLOCK_NOTICE, context_blocks_section};
+pub use workflow::workflow_capabilities;
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

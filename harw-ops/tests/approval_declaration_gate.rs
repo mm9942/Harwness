@@ -46,6 +46,13 @@ fn full_registry() -> OperationRegistry {
         harw_ops::WORK_DRIVER_TOOL_COUNT,
         "WorkDriver-Fläche muss registriert sein"
     );
+    let added =
+        harw_ops::register_intent_cycle_tools(&mut registry, &PlanToolConfig::enabled_defaults());
+    assert_eq!(
+        added,
+        harw_ops::INTENT_CYCLE_TOOL_COUNT,
+        "Intent-Zyklus-Fläche muss registriert sein"
+    );
     // R18: die `gateway.*`-Fläche einer UIA-Wurzel (mit und ohne Port).
     let added = harw_ops::gateway_ops::register_gateway(&mut registry);
     assert_eq!(added.ok(), Some(harw_ops::gateway_ops::GATEWAY_OP_COUNT));
@@ -106,7 +113,13 @@ fn no_model_tool_with_a_declared_approval_is_auto_approved() {
 
     // Gegen einen leeren Durchlauf absichern: verschwänden die Deklarationen
     // (etwa durch ein geändertes Makro), wäre der Test sonst still grün.
-    for expected in ["plan", "goal", "stop"] {
+    for expected in [
+        "plan",
+        "goal",
+        "stop",
+        "intent_cycle.start",
+        "intent_cycle.stop",
+    ] {
         assert!(
             gated.contains(&expected),
             "{expected} muss eine ModelTool-Fläche mit approval != None deklarieren \
@@ -160,4 +173,38 @@ fn every_auto_approved_operation_declares_a_read_only_model_tool_without_approva
             );
         }
     }
+}
+
+#[test]
+fn dod_model_tools_are_read_only_auto_approved_and_the_dod_command_is_no_model_tool() {
+    // PL-97 D3: die drei Harw-DoD-Werkzeuge lesen nur (Export, Health,
+    // Systemkonfiguration, `systemctl show`) und laufen ohne Rückfrage; die
+    // Operator-Fläche `/dod` ist für das Modell unerreichbar (Invariante S1:
+    // kein Pfad vom Modell zu Warden oder Eskalation).
+    let registry = full_registry();
+    let surfaces = model_tool_surfaces(&registry);
+    for tool in harw_ops::dod::DOD_MODEL_TOOLS {
+        let declared: Vec<_> = surfaces
+            .iter()
+            .filter(|(name, _, _)| *name == tool)
+            .collect();
+        assert_eq!(
+            declared,
+            [&(tool, true, ApprovalPolicy::None)],
+            "{tool} muss genau eine lesende ModelTool-Fläche ohne Freigabe deklarieren"
+        );
+        assert!(AUTO_APPROVED_TOOLS.contains(&tool), "{tool}");
+        assert!(
+            !DefaultApprovalPolicy::requires_explicit_approval(&model_call(tool)),
+            "{tool} muss ohne Rückfrage laufen"
+        );
+    }
+    let command = registry
+        .find_by_command(harw_ops::dod::DOD_COMMAND_PATH)
+        .map(|op| op.meta().name);
+    assert_eq!(command, Some("dod"));
+    assert!(
+        !surfaces.iter().any(|(name, _, _)| *name == "dod"),
+        "/dod darf keine ModelTool-Fläche tragen"
+    );
 }

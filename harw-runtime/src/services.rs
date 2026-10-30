@@ -491,6 +491,7 @@ pub struct RuntimeServicesParts {
 /// `Send + Sync`; typischerweise hinter einem `Arc` geteilt.
 pub struct RuntimeServices {
     parts: RuntimeServicesParts,
+    image_inspector: Option<harw_ops::image::SharedImageInspector>,
     home_context: Option<Arc<harw_home::ResolvedHomeContext>>,
     knowledge: Option<Arc<KnowledgeStore>>,
     agent_events: Option<Arc<AgentEventHub>>,
@@ -549,6 +550,7 @@ impl RuntimeServices {
     pub fn new(parts: RuntimeServicesParts) -> Self {
         Self {
             parts,
+            image_inspector: None,
             home_context: None,
             knowledge: None,
             agent_events: None,
@@ -560,6 +562,16 @@ impl RuntimeServices {
             job_manager: None,
             work_driver_caller: None,
         }
+    }
+
+    /// Binds the explicitly routed auxiliary vision service to model tools.
+    #[must_use]
+    pub fn with_image_inspector(
+        mut self,
+        inspector: harw_ops::image::SharedImageInspector,
+    ) -> Self {
+        self.image_inspector = Some(inspector);
+        self
     }
 
     /// Plan R9, Teil F: legt die Job-Verwaltung der Sitzung als
@@ -936,6 +948,11 @@ impl RuntimeServices {
     fn assemble(&self, surface: ServiceSurface) -> (ServiceMap, Vec<&'static str>) {
         let mut map = ServiceMap::new();
         let mut names = Vec::new();
+        if surface == ServiceSurface::ModelTool
+            && let Some(inspector) = &self.image_inspector
+        {
+            insert_service(&mut map, &mut names, Arc::clone(inspector));
+        }
         if let Some(context) = &self.home_context {
             insert_service(&mut map, &mut names, Arc::clone(context));
         }
@@ -1322,7 +1339,7 @@ mod tests {
         }
     }
 
-    /// Die Namen der acht immer vorhandenen Dienste.
+    /// Die Namen der neun immer vorhandenen Dienste.
     fn always_present() -> Vec<&'static str> {
         vec![
             type_name::<OperationRegistry>(),
@@ -1663,13 +1680,21 @@ mod tests {
         Ok(())
     }
 
+    /// Ohne optionale Teile liegen die neun Pflichtdienste auf jeder Fläche;
+    /// dazu kommt der unbedingte [`JobMutationScope`]-Marker (Slash:
+    /// `TenantVisible`, Modell-Werkzeug: `BoundWorkspace`), den die Montage
+    /// unabhängig von `job_store` ablegt. Web und Job tragen ihn nicht.
     #[test]
-    fn minimal_parts_register_only_the_mandatory_eight() {
+    fn minimal_parts_register_only_the_mandatory_nine_and_the_job_scope() {
         let services = RuntimeServices::new(minimal_parts());
         for surface in ServiceSurface::ALL {
+            let mut expected = always_present();
+            if matches!(surface, ServiceSurface::Slash | ServiceSurface::ModelTool) {
+                expected.push(type_name::<JobMutationScope>());
+            }
             assert_eq!(
                 services.registered(surface),
-                sorted(always_present()),
+                sorted(expected),
                 "Fläche {} ohne optionale Dienste",
                 surface.as_str()
             );
@@ -1962,6 +1987,8 @@ mod tests {
                     type_name::<Arc<ManagedAgentSpawner>>(),
                     type_name::<SharedSessionController>(),
                     type_name::<Arc<AgentEventHub>>(),
+                    type_name::<Arc<JobExecutionRegistry>>(),
+                    type_name::<JobMutationScope>(),
                     type_name::<HostLeaseUserControl>(),
                 ]),
                 "Fläche {}",
@@ -1972,10 +1999,12 @@ mod tests {
     }
 
     /// Mit Speicher (und `JobStore` samt Freigabe-Akteur) unterscheiden sich
-    /// Web/Job vom Slash-Pfad um genau die drei deklarierten Einträge plus das
-    /// davon abgeleitete Kanban-Ledger.
+    /// Web/Job vom Slash-Pfad um genau die sieben deklarierten Einträge:
+    /// Spawner, Sitzungs-Controller, Wissensspeicher, das davon abgeleitete
+    /// Kanban-Ledger, Live-Job-Registry, Job-Mutations-Scope und den
+    /// Host-Lease-Nutzer-Marker.
     #[test]
-    fn with_a_store_surfaces_differ_only_in_the_three_declared_entries() {
+    fn with_a_store_surfaces_differ_only_in_the_seven_declared_entries() {
         let store = Arc::new(KnowledgeStore::new(Path::new("/nonexistent/l6/knowledge")));
         let services = RuntimeServices::new(full_parts()).with_knowledge_store(store);
         let slash = services.registered(ServiceSurface::Slash);
@@ -1993,6 +2022,8 @@ mod tests {
                     type_name::<SharedSessionController>(),
                     type_name::<Arc<KnowledgeStore>>(),
                     type_name::<Arc<dyn JobTransitions>>(),
+                    type_name::<Arc<JobExecutionRegistry>>(),
+                    type_name::<JobMutationScope>(),
                     type_name::<HostLeaseUserControl>(),
                 ]),
                 "Fläche {}",

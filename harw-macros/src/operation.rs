@@ -83,6 +83,13 @@ pub(crate) struct OperationArgs {
     /// `Operation::busy_subcommands` (see `parse_busy_subcommands`). Absent ⇒
     /// no override (every invocation inherits `busy`).
     cmd_busy_subcommands: Option<LitStr>,
+    /// Explizite Remote-Unterbefehle für `visibility = "channel_reduced"`.
+    /// `-` bezeichnet die bare Form, `*` alle Argumentformen.
+    cmd_channel_subcommands: Option<LitStr>,
+    /// Explizite Tokens, die auf einer `channel_reduced`-Fläche nirgends in der
+    /// Argumentliste vorkommen dürfen (mutierende verschachtelte Verben).
+    /// Optional; `-` und `*` sind hier nicht erlaubt.
+    cmd_channel_denied_subcommands: Option<LitStr>,
     has_model_tool: bool,
     mt_readonly: bool,
     mt_approval: Option<LitStr>,
@@ -149,6 +156,8 @@ pub(crate) fn parse_operation_args(attr: proc_macro2::TokenStream) -> syn::Resul
     let mut cmd_visibility: Option<LitStr> = None;
     let mut cmd_busy: Option<LitStr> = None;
     let mut cmd_busy_subcommands: Option<LitStr> = None;
+    let mut cmd_channel_subcommands: Option<LitStr> = None;
+    let mut cmd_channel_denied_subcommands: Option<LitStr> = None;
     let mut has_command = false;
     // model_tool(...) fields
     let mut mt_readonly = false;
@@ -204,10 +213,19 @@ pub(crate) fn parse_operation_args(attr: proc_macro2::TokenStream) -> syn::Resul
                     let lit: LitStr = nested.value()?.parse()?;
                     cmd_busy_subcommands = Some(lit);
                     Ok(())
+                } else if nested.path.is_ident("channel_subcommands") {
+                    let lit: LitStr = nested.value()?.parse()?;
+                    cmd_channel_subcommands = Some(lit);
+                    Ok(())
+                } else if nested.path.is_ident("channel_denied_subcommands") {
+                    let lit: LitStr = nested.value()?.parse()?;
+                    cmd_channel_denied_subcommands = Some(lit);
+                    Ok(())
                 } else {
                     Err(nested.error(
                         "unsupported `operation` `command` key \
-                         (expected `path`, `visibility`, `busy`, or `busy_subcommands`)",
+                         (expected `path`, `visibility`, `busy`, `busy_subcommands`, \
+                         `channel_subcommands`, or `channel_denied_subcommands`)",
                     ))
                 }
             })
@@ -311,6 +329,8 @@ pub(crate) fn parse_operation_args(attr: proc_macro2::TokenStream) -> syn::Resul
         cmd_visibility,
         cmd_busy,
         cmd_busy_subcommands,
+        cmd_channel_subcommands,
+        cmd_channel_denied_subcommands,
         has_model_tool,
         mt_readonly,
         mt_approval,
@@ -361,6 +381,8 @@ pub(crate) fn expand_operation(
         cmd_visibility,
         cmd_busy,
         cmd_busy_subcommands,
+        cmd_channel_subcommands,
+        cmd_channel_denied_subcommands,
         has_model_tool,
         mt_readonly,
         mt_approval,
@@ -437,6 +459,52 @@ pub(crate) fn expand_operation(
                         #( #entries ),*
                     ];
                     TABLE
+                }
+            }
+        }
+        None => quote! {},
+    };
+
+    let is_channel_reduced = cmd_visibility
+        .as_ref()
+        .is_some_and(|visibility| visibility.value() == "channel_reduced");
+    if is_channel_reduced && cmd_channel_subcommands.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`visibility = \"channel_reduced\"` requires `channel_subcommands = \"...\"`",
+        ));
+    }
+    if !is_channel_reduced && cmd_channel_subcommands.is_some() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`channel_subcommands` is only valid with `visibility = \"channel_reduced\"`",
+        ));
+    }
+    if !is_channel_reduced && cmd_channel_denied_subcommands.is_some() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`channel_denied_subcommands` is only valid with `visibility = \"channel_reduced\"`",
+        ));
+    }
+    let channel_subcommands_tokens = match cmd_channel_subcommands.as_ref() {
+        Some(lit) => {
+            let entries = parse_channel_subcommands(lit)?;
+            quote! {
+                fn channel_subcommands(&self) -> &'static [&'static str] {
+                    const TABLE: &[&str] = &[ #( #entries ),* ];
+                    TABLE
+                }
+            }
+        }
+        None => quote! {},
+    };
+    // Optional: ohne `channel_denied_subcommands` bleibt der Trait-Default (`&[]`).
+    let channel_denied_tokens = match cmd_channel_denied_subcommands.as_ref() {
+        Some(lit) => {
+            let entries = parse_channel_denied_subcommands(lit)?;
+            quote! {
+                fn channel_denied_tokens(&self) -> &'static [&'static str] {
+                    &[ #( #entries ),* ]
                 }
             }
         }
@@ -726,6 +794,8 @@ pub(crate) fn expand_operation(
             }
 
             #busy_subcommands_tokens
+            #channel_subcommands_tokens
+            #channel_denied_tokens
 
             fn run<'a>(
                 &'a self,
@@ -882,6 +952,91 @@ fn busy_class_tokens(value: &str) -> Option<proc_macro2::TokenStream> {
 /// # Errors
 /// `syn::Error` bei leerer Liste, fehlendem `=`, leerem Namen, unbekannter
 /// Klasse oder doppeltem Unterbefehl.
+fn parse_channel_subcommands(lit: &LitStr) -> syn::Result<Vec<LitStr>> {
+    let value = lit.value();
+    let mut seen: Vec<String> = Vec::new();
+    let mut entries = Vec::new();
+    for raw in value.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name.chars().any(char::is_whitespace) || name.contains('=') {
+            return Err(syn::Error::new_spanned(
+                lit,
+                format!("channel_subcommands: ungültiger Unterbefehl '{name}'"),
+            ));
+        }
+        if seen.iter().any(|prior| prior == name) {
+            return Err(syn::Error::new_spanned(
+                lit,
+                format!("channel_subcommands: Unterbefehl '{name}' doppelt"),
+            ));
+        }
+        seen.push(name.to_owned());
+        entries.push(LitStr::new(name, lit.span()));
+    }
+    if entries.is_empty() {
+        return Err(syn::Error::new_spanned(
+            lit,
+            "channel_subcommands: mindestens ein Unterbefehl, '-' oder '*' nötig",
+        ));
+    }
+    Ok(entries)
+}
+
+/// Parse `channel_denied_subcommands = "set,delete"` into string-literal
+/// entries for `Operation::channel_denied_tokens`.
+///
+/// # Beschreibung
+/// Einträge sind komma-getrennt; Leerraum um Einträge wird ignoriert. Anders
+/// als bei [`parse_channel_subcommands`] sind `-` (bare Form) und `*` (alle
+/// Argumentformen) hier bedeutungslos und werden abgewiesen: die Liste nennt
+/// konkrete Tokens, die auf einer `channel_reduced`-Fläche nirgends in der
+/// Argumentliste vorkommen dürfen.
+///
+/// # Errors
+/// `syn::Error` bei leerer Liste, `-`/`*`, ungültigem Namen (Leerraum oder `=`)
+/// oder doppeltem Eintrag.
+fn parse_channel_denied_subcommands(lit: &LitStr) -> syn::Result<Vec<LitStr>> {
+    let value = lit.value();
+    let mut seen: Vec<String> = Vec::new();
+    let mut entries = Vec::new();
+    for raw in value.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name == "-" || name == "*" {
+            return Err(syn::Error::new_spanned(
+                lit,
+                "channel_denied_subcommands: '-' und '*' sind hier nicht erlaubt",
+            ));
+        }
+        if name.chars().any(char::is_whitespace) || name.contains('=') {
+            return Err(syn::Error::new_spanned(
+                lit,
+                format!("channel_denied_subcommands: ungültiger Unterbefehl '{name}'"),
+            ));
+        }
+        if seen.iter().any(|prior| prior == name) {
+            return Err(syn::Error::new_spanned(
+                lit,
+                format!("channel_denied_subcommands: Unterbefehl '{name}' doppelt"),
+            ));
+        }
+        seen.push(name.to_owned());
+        entries.push(LitStr::new(name, lit.span()));
+    }
+    if entries.is_empty() {
+        return Err(syn::Error::new_spanned(
+            lit,
+            "channel_denied_subcommands: mindestens ein Unterbefehl nötig",
+        ));
+    }
+    Ok(entries)
+}
+
 fn parse_busy_subcommands(lit: &LitStr) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let value = lit.value();
     let mut seen: Vec<String> = Vec::new();
@@ -986,7 +1141,9 @@ fn map_web_method(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
 
 #[cfg(test)]
 mod operation_tests {
-    use super::{expand_operation, map_domain, parse_operation_args};
+    use super::{
+        expand_operation, map_domain, parse_channel_denied_subcommands, parse_operation_args,
+    };
     use crate::test_support::{TestError, TestResult, ctx};
     use quote::quote;
     use syn::ItemFn;
@@ -1124,6 +1281,146 @@ mod operation_tests {
         let tokens =
             expand_operation(func, args).map_err(ctx("eine gültige Operation muss expandieren"))?;
         Ok(normalize(&tokens))
+    }
+
+    #[test]
+    fn channel_reduced_requires_explicit_remote_subcommands() -> TestResult {
+        let attr = quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(path = "/demo", visibility = "channel_reduced")
+        };
+        let args = parse_operation_args(attr)
+            .map_err(ctx("channel_reduced muss syntaktisch parsbar bleiben"))?;
+        let func: ItemFn = syn::parse_quote! {
+            async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
+                let _ = (ctx, args);
+                Ok(OpOutput { text: String::new() })
+            }
+        };
+        let Err(error) = expand_operation(func, args) else {
+            return Err(TestError::Unexpected(
+                "channel_reduced ohne channel_subcommands muss fehlschlagen".to_owned(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains(r#"requires `channel_subcommands = "..."`"#)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn channel_reduced_emits_remote_subcommand_allowlist() -> TestResult {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(
+                path = "/demo",
+                visibility = "channel_reduced",
+                channel_subcommands = "-,show,list"
+            )
+        })?;
+
+        assert!(flat.contains("fnchannel_subcommands(&self)->&'static[&'staticstr]"));
+        assert!(flat.contains("constTABLE:&[&str]=&[\"-\",\"show\",\"list\"]"));
+        Ok(())
+    }
+
+    #[test]
+    fn channel_denied_subcommands_requires_channel_reduced() -> TestResult {
+        let attr = quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(
+                path = "/demo",
+                visibility = "tui_only",
+                channel_denied_subcommands = "set,delete"
+            )
+        };
+        let args = parse_operation_args(attr).map_err(ctx(
+            "channel_denied_subcommands muss syntaktisch parsbar bleiben",
+        ))?;
+        let func: ItemFn = syn::parse_quote! {
+            async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
+                let _ = (ctx, args);
+                Ok(OpOutput { text: String::new() })
+            }
+        };
+        let Err(error) = expand_operation(func, args) else {
+            return Err(TestError::Unexpected(
+                "channel_denied_subcommands mit tui_only muss fehlschlagen".to_owned(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("`channel_denied_subcommands` is only valid with"),
+            "unerwartete Fehlermeldung: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn channel_reduced_emits_denied_tokens_override() -> TestResult {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(
+                path = "/demo",
+                visibility = "channel_reduced",
+                channel_subcommands = "-,show,list",
+                channel_denied_subcommands = "set,delete"
+            )
+        })?;
+
+        assert!(flat.contains("fnchannel_denied_tokens(&self)->&'static[&'staticstr]"));
+        assert!(flat.contains("&[\"set\",\"delete\"]"));
+        Ok(())
+    }
+
+    #[test]
+    fn channel_reduced_without_denied_subcommands_keeps_trait_default() -> TestResult {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(
+                path = "/demo",
+                visibility = "channel_reduced",
+                channel_subcommands = "-,show,list"
+            )
+        })?;
+
+        assert!(!flat.contains("channel_denied_tokens"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_channel_denied_subcommands_rejects_malformed_values() -> TestResult {
+        for (value, needle) in [
+            ("set,*", "'-' und '*' sind hier nicht erlaubt"),
+            ("-", "'-' und '*' sind hier nicht erlaubt"),
+            ("set,delete,set", "doppelt"),
+            ("", "mindestens ein Unterbefehl"),
+            (" , ", "mindestens ein Unterbefehl"),
+            ("set,a b", "ungültiger Unterbefehl"),
+        ] {
+            let lit = syn::LitStr::new(value, proc_macro2::Span::call_site());
+            let Err(error) = parse_channel_denied_subcommands(&lit) else {
+                return Err(TestError::Unexpected(format!(
+                    "'{value}' muss abgewiesen werden"
+                )));
+            };
+            assert!(error.to_string().contains(needle), "{value}: {error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_channel_denied_subcommands_accepts_trimmed_names() -> TestResult {
+        let lit = syn::LitStr::new(" set , delete ", proc_macro2::Span::call_site());
+        let entries = parse_channel_denied_subcommands(&lit)
+            .map_err(ctx("gültige Namen müssen akzeptiert werden"))?;
+        let names: Vec<String> = entries.iter().map(syn::LitStr::value).collect();
+
+        assert_eq!(names, ["set", "delete"]);
+        Ok(())
     }
 
     #[test]

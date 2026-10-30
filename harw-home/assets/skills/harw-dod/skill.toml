@@ -1,0 +1,4 @@
+name = "harw-dod"
+description = "Use when the host security posture, Harw-DoD findings or sentinel health matter: read them with dod.status, dod.findings and dod.sensors, as evidence only."
+instructions_file = "instructions.md"
+tools = ["dod.status", "dod.findings", "dod.sensors"]

@@ -39,19 +39,31 @@
 //! itself takes the node, verifier and listener as parameters so the chain is
 //! tested over a real loopback socket with in-process keys.
 //!
+//! # Live owner policy
+//!
+//! Registry rights and retained creator identities are revalidated every
+//! `revocation_poll` (default five seconds). Device removal, ambiguous or
+//! unreadable policy invalidates existing authority without banning a future
+//! valid authentication. Explicit `revoked` rows remain permanent host bans.
+//! Peer pins are bound to the verifier's exact owner file at startup. Any pin
+//! file edit or read failure cuts retained authority and blocks authentication
+//! until the ingress restarts with verified fresh pins.
+//!
 //! # Jobs rule
 //! Everything on the serve path is async on the caller's runtime.
 
 use std::collections::HashSet;
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use harw_core::ModelProvider;
 use harw_node_listener::{
-    DeviceRegistry, HostRevoker, IdentityMapper, NodeListener, RegistryIdentityMapper,
-    RevocationSink,
+    DeviceRecord, DeviceRegistry, HostRevoker, IdentityMapper, NodeListener,
+    RegistryIdentityMapper, RevocationSink,
 };
 use harw_node_transport::{LocalNode, NodeTransportServer, NodeVerifier, ServerOptions};
 use harw_session_daemon::DaemonServices;
@@ -105,9 +117,13 @@ pub struct RemoteServeConfig {
     /// The one device allowed to resolve approvals of remote sessions (it must
     /// also carry the registry `approve` opt-in). `None`: approvals park.
     pub approval_device: Option<DeviceId>,
-    /// How often `node-devices.conf` is scanned for newly revoked devices
-    /// (live revocation). Default 5 s.
+    /// How often registry and pin policy is revalidated (live invalidation).
+    /// Default 5 s; values below 10 ms are clamped to 10 ms.
     pub revocation_poll: Duration,
+    /// Digest of the exact owner pin file used to build the transport verifier.
+    pub(crate) peer_pins_digest: Option<[u8; 32]>,
+    #[cfg(test)]
+    injected_peer_trust: bool,
 }
 
 impl RemoteServeConfig {
@@ -121,6 +137,9 @@ impl RemoteServeConfig {
             tier: PermissionTier::Observer,
             approval_device: None,
             revocation_poll: Duration::from_secs(5),
+            peer_pins_digest: None,
+            #[cfg(test)]
+            injected_peer_trust: false,
         }
     }
 
@@ -134,6 +153,123 @@ impl RemoteServeConfig {
             |device| format!("device:{}", device.as_str()),
         );
         ApprovalActor::Operator { id }
+    }
+}
+
+/// Owner policy files are bounded regular files and are never followed through
+/// symlinks. Pin changes require restart because the verifier is immutable.
+const POLICY_MAX_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn read_peer_pins(path: &Path) -> Result<String, String> {
+    let file = harw_fsutil::open_nofollow(path, harw_fsutil::OpenMode::read_only())
+        .map_err(|error| format!("remote peer pins unavailable: {error}"))?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > POLICY_MAX_BYTES as u64 {
+        return Err("remote peer pins exceed their read limit or are not a regular file".into());
+    }
+    let mut text = String::new();
+    file.take(POLICY_MAX_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| error.to_string())?;
+    if text.len() > POLICY_MAX_BYTES {
+        return Err("remote peer pins exceed their read limit".into());
+    }
+    let (peers, skipped) = crate::session_listener::parse_peers(&text);
+    let lines = text
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('#')
+        })
+        .count();
+    if skipped != 0 || peers.len() != lines {
+        return Err("remote peer pins are malformed or ambiguous".into());
+    }
+    Ok(text)
+}
+
+struct PeerPolicyGate {
+    path: PathBuf,
+    expected: Option<[u8; 32]>,
+    fingerprints: std::collections::BTreeMap<String, [u8; 32]>,
+    stale: AtomicBool,
+}
+
+impl PeerPolicyGate {
+    fn open(config: &RemoteServeConfig) -> Result<Self, String> {
+        let path = config
+            .remote_dir()
+            .join(crate::session_listener::PEERS_FILE);
+        #[cfg(test)]
+        if config.injected_peer_trust {
+            return Ok(Self {
+                path,
+                expected: None,
+                fingerprints: Default::default(),
+                stale: AtomicBool::new(false),
+            });
+        }
+        let text = read_peer_pins(&path)?;
+        let digest = *blake3::hash(text.as_bytes()).as_bytes();
+        if config.peer_pins_digest != Some(digest) {
+            return Err("remote peer pins are not bound to the transport verifier".into());
+        }
+        Ok(Self {
+            path,
+            expected: Some(digest),
+            fingerprints: crate::session_listener::peer_key_fingerprints(&text),
+            stale: AtomicBool::new(false),
+        })
+    }
+
+    fn current(&self) -> bool {
+        self.current_with(|| read_peer_pins(&self.path))
+    }
+
+    fn current_with(&self, read: impl FnOnce() -> Result<String, String>) -> bool {
+        if self.stale.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(expected) = self.expected else {
+            // Only an explicit cfg(test) fixture can omit disk trust.
+            return true;
+        };
+        let current =
+            read().is_ok_and(|text| *blake3::hash(text.as_bytes()).as_bytes() == expected);
+        if !current {
+            self.stale.store(true, Ordering::Release);
+        }
+        current && !self.stale.load(Ordering::Acquire)
+    }
+}
+
+struct PolicyIdentityMapper {
+    mapper: RegistryIdentityMapper,
+    pins: Arc<PeerPolicyGate>,
+}
+
+impl IdentityMapper for PolicyIdentityMapper {
+    fn map(
+        &self,
+        peer: &harw_node_transport::AuthenticatedPeer,
+        connection: harw_session_host::ConnectionId,
+    ) -> harw_node_listener::MapFuture<'_> {
+        if !self.pins.current() {
+            return Box::pin(async { Err(harw_node_listener::ListenerError::UnknownPeer) });
+        }
+        let fingerprint = self.pins.fingerprints.get(peer.node_id.as_str()).copied();
+        if self.pins.expected.is_some() && fingerprint.is_none() {
+            return Box::pin(async { Err(harw_node_listener::ListenerError::UnknownPeer) });
+        }
+        let mapped = self.mapper.map(peer, connection);
+        Box::pin(async move {
+            let mut identity = mapped.await?;
+            if !self.pins.current() {
+                return Err(harw_node_listener::ListenerError::UnknownPeer);
+            }
+            identity.authenticated_key_fingerprint = fingerprint;
+            Ok(identity)
+        })
     }
 }
 
@@ -222,12 +358,22 @@ pub async fn start_remote_with_driver(
     private_dir(&remote_dir.join("host"))?;
     let transcripts = DurableTranscripts::open(&sessions_root)
         .map_err(|error| format!("remote transcripts: {error}"))?;
+    let host_dir = remote_dir.join("host");
+    let persisted_ids: Vec<_> = harw_session_host::record::RecordStore::new(&host_dir)
+        .list()
+        .map_err(|error| format!("remote hosted session records: {error}"))?
+        .into_iter()
+        .map(|record| record.session_id)
+        .collect();
+    transcripts
+        .repair_tails(&persisted_ids)
+        .map_err(|error| format!("remote transcript startup recovery: {error}"))?;
     let approvals = DurableApprovals::open(&sessions_root)
         .map_err(|error| format!("remote approvals: {error}"))?;
     let services = DaemonServices::new(driver, Arc::new(transcripts), Arc::new(approvals));
     let host = Arc::new(
         SessionHost::open(
-            HostConfig::new(remote_dir.join("host")),
+            HostConfig::new(host_dir),
             services.driver,
             services.transcripts,
             services.approvals,
@@ -239,7 +385,15 @@ pub async fn start_remote_with_driver(
         .map_err(|error| format!("remote listener address: {error}"))?;
     let server = NodeTransportServer::new(local, verifier, ServerOptions::default())
         .map_err(|error| format!("node transport: {error}"))?;
-    let mapper: Arc<dyn IdentityMapper> = Arc::new(RegistryIdentityMapper::new(&remote_dir));
+    let pins = Arc::new(PeerPolicyGate::open(config)?);
+    // Validate bounded owner policy before accepting authenticated connections.
+    DeviceRegistry::new(&remote_dir)
+        .scan_bounded(POLICY_MAX_BYTES)
+        .map_err(|error| format!("remote device policy: {error}"))?;
+    let mapper: Arc<dyn IdentityMapper> = Arc::new(PolicyIdentityMapper {
+        mapper: RegistryIdentityMapper::new(&remote_dir),
+        pins: Arc::clone(&pins),
+    });
     let node_listener = NodeListener::new(server, host, mapper, WsLimits::default());
     let revoker = node_listener.revoker().with_registry(&remote_dir);
     let (shutdown, mut rx) = watch::channel(false);
@@ -248,6 +402,7 @@ pub async fn start_remote_with_driver(
         remote_dir.clone(),
         config.revocation_poll,
         shutdown.subscribe(),
+        pins,
     ));
     let task = tokio::spawn(async move {
         let stop = async move {
@@ -265,16 +420,16 @@ pub async fn start_remote_with_driver(
     })
 }
 
-/// Live revocation: a device whose record in `node-devices.conf` is marked
-/// `revoked` loses its authority in the host at once and its open connections
-/// are closed. The file is the operator's control surface (the same file
-/// refuses the device's next handshake); no network endpoint is involved.
-/// Devices already revoked at start are applied on the first scan.
+/// Revalidate owner policy on a bounded poll. Policy edits cut old connection
+/// authority, including detached creators; fresh authentication uses the new
+/// registry. Explicit revocation remains permanent. Immutable pin changes latch
+/// closed until restart, including for future mappings.
 async fn watch_revocations(
     revoker: HostRevoker,
     registry_dir: PathBuf,
     every: Duration,
     mut stop: watch::Receiver<bool>,
+    pins: Arc<PeerPolicyGate>,
 ) {
     let registry = DeviceRegistry::new(&registry_dir);
     let mut applied: HashSet<DeviceId> = HashSet::new();
@@ -284,27 +439,62 @@ async fn watch_revocations(
             _ = ticker.tick() => {}
             _ = stop.wait_for(|stop| *stop) => return,
         }
-        let records = match registry.records() {
-            Ok(records) => records,
-            Err(error) => {
-                tracing::warn!(%error, "revocation scan: device registry unreadable");
+        let identities = revoker.authenticated_identities();
+        let scan = registry.scan_bounded(POLICY_MAX_BYTES);
+        // Extract explicit revocations even if another row is malformed.
+        if let Ok(scan) = &scan {
+            for record in scan.records.iter().filter(|record| record.revoked) {
+                if applied.insert(record.device.clone())
+                    && let Err(error) = revoker.revoke_device(&record.device)
+                {
+                    tracing::warn!(%error, "device revocation incomplete");
+                }
+            }
+        }
+        let records = match scan {
+            Ok(scan) if scan.rejected.is_empty() && pins.current() => scan.records,
+            _ => {
+                for identity in &identities {
+                    if let Some(device) = &identity.device {
+                        revoker.invalidate_device_policy(device);
+                    }
+                }
+                tracing::warn!(
+                    "remote policy unavailable or changed pins; cached authority invalidated"
+                );
                 continue;
             }
         };
-        for record in records.into_iter().filter(|record| record.revoked) {
-            if !applied.insert(record.device.clone()) {
-                continue;
-            }
-            match revoker.revoke_device(&record.device) {
-                Ok(report) => tracing::info!(
-                    device = record.device.as_str(),
-                    connections_closed = report.connections_closed,
-                    "device revoked"
-                ),
-                Err(error) => tracing::warn!(%error, "device revocation incomplete"),
-            }
+        let invalid = invalidated_devices(&records, &identities);
+        for device in invalid {
+            revoker.invalidate_device_policy(&device);
         }
     }
+}
+
+fn invalidated_devices(
+    records: &[DeviceRecord],
+    identities: &[harw_session_host::ClientIdentity],
+) -> HashSet<DeviceId> {
+    let mut invalid = HashSet::new();
+    for identity in identities {
+        let Some(device) = &identity.device else {
+            continue;
+        };
+        let mut matching = records.iter().filter(|record| &record.device == device);
+        let valid = matching.next().is_some_and(|record| {
+            record.authorizes_identity(identity)
+                && records
+                    .iter()
+                    .filter(|other| other.node_id == record.node_id)
+                    .count()
+                    == 1
+        }) && matching.next().is_none();
+        if !valid {
+            invalid.insert(device.clone());
+        }
+    }
+    invalid
 }
 
 #[cfg(test)]
@@ -324,6 +514,12 @@ mod tests {
     use harw_types::{NodeId, SessionId, TenantId};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn injected_config(path: &Path) -> RemoteServeConfig {
+        let mut config = RemoteServeConfig::new(path, path, path);
+        config.injected_peer_trust = true;
+        config
+    }
 
     struct SeedSigner(PqdsaKeyPair);
 
@@ -367,6 +563,15 @@ mod tests {
     struct NoopDriver;
 
     impl TurnDriver for NoopDriver {
+        // This test double performs no privileged runtime/tool effects.
+        fn prepare_execution(
+            &self,
+            _: &harw_types::SessionId,
+            _: harw_session_host::driver::ExecutionAdmission,
+        ) -> harw_session_host::driver::DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
         fn create_session(&self, _: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
             Box::pin(async { Ok(()) })
         }
@@ -443,10 +648,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_start_repairs_torn_transcript_for_its_host_record() -> TestResult {
+        use harw_session_host::record::{HostedSessionRecord, RecordStore};
+        use harw_session_store::{RecordKind, TranscriptRecord, TranscriptStore};
+        use harw_types::ThreadRef;
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir()?;
+        let config = injected_config(temp.path());
+        let remote_dir = config.remote_dir();
+        let id = SessionId::try_from_str("repair-remote")?;
+        let now = jiff::Timestamp::now();
+        RecordStore::new(&remote_dir.join("host")).save(&HostedSessionRecord {
+            session_id: id.clone(),
+            tenant: None,
+            owner_principal: "operator".to_owned(),
+            creator_execution: None,
+            workspace: None,
+            title: None,
+            created_at: now,
+            updated_at: now,
+            state: harw_protocol::HostedState::Idle,
+            host_epoch: 0,
+            generation: 0,
+            owner_agent: None,
+            tool_agents: Vec::new(),
+        })?;
+        let sessions = remote_dir.join("sessions");
+        std::fs::create_dir_all(&sessions)?;
+        let store = TranscriptStore::new(&sessions);
+        store.append(&TranscriptRecord::new(
+            id.clone(),
+            ThreadRef::from_str("root"),
+            0,
+            now,
+            RecordKind::Item,
+            serde_json::json!({"type":"user_message","id":"i","content":[]}),
+        ))?;
+        let path = store.transcript_path(&id)?;
+        let valid = std::fs::read(&path)?;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        file.write_all(b"{\"torn\"")?;
+        drop(file);
+        let gateway = node("gateway-repair", 1)?;
+        let phone = node("phone-repair", 2)?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let ingress = start_remote_with_driver(
+            &config,
+            Arc::new(NoopDriver),
+            gateway.local,
+            Arc::new(pinned(&phone.identity)?),
+            listener,
+        )
+        .await?;
+        assert_eq!(std::fs::read(&path)?, valid);
+        assert!(
+            std::fs::read_dir(&sessions)?.any(|entry| entry.ok().is_some_and(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("repair-remote.jsonl.corrupt-")))
+        );
+        ingress.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn an_enrolled_device_lists_sessions_over_the_node_transport_and_revocation_cuts_it()
     -> TestResult {
         let temp = tempfile::tempdir()?;
-        let mut config = RemoteServeConfig::new(temp.path(), temp.path(), temp.path());
+        let mut config = injected_config(temp.path());
         config.revocation_poll = Duration::from_millis(50);
         let gateway = node("gateway", 1)?;
         let phone = node("phone", 2)?;
@@ -497,6 +767,291 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn live_policy_edits_cut_old_authority_and_valid_registry_recovery_reconnects()
+    -> TestResult {
+        for change in [
+            "tier",
+            "tenant",
+            "approval",
+            "removed",
+            "ambiguous-device",
+            "ambiguous-node",
+            "unreadable",
+            "malformed",
+            "node",
+        ] {
+            let temp = tempfile::tempdir()?;
+            let mut config = injected_config(temp.path());
+            config.revocation_poll = Duration::from_millis(10);
+            let gateway = node("gateway-policy", 1)?;
+            let phone = node("phone-policy", 2)?;
+            let remote_dir = config.remote_dir();
+            std::fs::create_dir_all(&remote_dir)?;
+            let registry = DeviceRegistry::new(&remote_dir);
+            let original = DeviceRecord {
+                node_id: phone.id.clone(),
+                device: DeviceId::try_from_str("dev-policy")?,
+                tenant: TenantId::try_from_str("tenant-a")?,
+                tier: PermissionTier::Owner,
+                revoked: false,
+                label: "phone".into(),
+                approve_optin: true,
+            };
+            registry.enroll(&original)?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let ingress = start_remote_with_driver(
+                &config,
+                Arc::new(NoopDriver),
+                gateway.local.clone(),
+                Arc::new(pinned(&phone.identity)?),
+                listener,
+            )
+            .await?;
+            let port = dial(ingress.addr(), &gateway, &phone).await?;
+            assert!(port.list().await?.is_empty());
+            let path = remote_dir.join("node-devices.conf");
+            let mut changed = original.clone();
+            match change {
+                "tier" => changed.tier = PermissionTier::Observer,
+                "tenant" => changed.tenant = TenantId::try_from_str("tenant-b")?,
+                "approval" => changed.approve_optin = false,
+                "node" => changed.node_id = NodeId::try_from_str("replacement-node")?,
+                _ => {}
+            }
+            match change {
+                "removed" => std::fs::remove_file(&path)?,
+                "ambiguous-device" => {
+                    changed.node_id = NodeId::try_from_str("another-node")?;
+                    registry.enroll(&changed)?;
+                }
+                "ambiguous-node" => {
+                    changed.device = DeviceId::try_from_str("another-device")?;
+                    registry.enroll(&changed)?;
+                }
+                "unreadable" => {
+                    std::fs::remove_file(&path)?;
+                    std::fs::create_dir(&path)?;
+                }
+                "malformed" => {
+                    std::fs::write(&path, format!("{}\nmalformed-row\n", original.render()))?
+                }
+                _ => std::fs::write(&path, format!("{}\n", changed.render()))?,
+            }
+            let cut = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if port.list().await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(cut.is_ok(), "stale authority survived {change}");
+            drop(port);
+            // Errors/removal are temporary policy invalidation, never a device ban.
+            if path.is_dir() {
+                std::fs::remove_dir(&path)?;
+            }
+            let mut recovered = original.clone();
+            recovered.tier = PermissionTier::Observer;
+            recovered.approve_optin = false;
+            std::fs::write(&path, format!("{}\n", recovered.render()))?;
+            let fresh = dial(ingress.addr(), &gateway, &phone).await?;
+            assert!(
+                fresh.list().await?.is_empty(),
+                "fresh recovery failed after {change}"
+            );
+            ingress.shutdown().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pin_removal_cuts_live_authority_and_rejects_reconnect_until_restart() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let mut config = RemoteServeConfig::new(temp.path(), temp.path(), temp.path());
+        config.revocation_poll = Duration::from_millis(10);
+        let remote_dir = config.remote_dir();
+        std::fs::create_dir_all(&remote_dir)?;
+        let gateway = node("gateway-pins", 1)?;
+        let phone = node("phone-pins", 2)?;
+        DeviceRegistry::new(&remote_dir).enroll(&DeviceRecord {
+            node_id: phone.id.clone(),
+            device: DeviceId::try_from_str("dev-pins")?,
+            tenant: TenantId::try_from_str("tenant-a")?,
+            tier: PermissionTier::Observer,
+            revoked: false,
+            label: "phone".into(),
+            approve_optin: false,
+        })?;
+        let key: String = phone
+            .identity
+            .public_key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let text = format!("{}|{key}\n", phone.id.as_str());
+        let path = remote_dir.join(crate::session_listener::PEERS_FILE);
+        std::fs::write(&path, &text)?;
+        config.peer_pins_digest = Some(*blake3::hash(text.as_bytes()).as_bytes());
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let ingress = start_remote_with_driver(
+            &config,
+            Arc::new(NoopDriver),
+            gateway.local.clone(),
+            Arc::new(pinned(&phone.identity)?),
+            listener,
+        )
+        .await?;
+        let port = dial(ingress.addr(), &gateway, &phone).await?;
+        assert!(port.list().await?.is_empty());
+        std::fs::remove_file(&path)?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if port.list().await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        std::fs::write(&path, &text)?;
+        assert!(dial(ingress.addr(), &gateway, &phone).await.is_err());
+        ingress.shutdown().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let restarted = start_remote_with_driver(
+            &config,
+            Arc::new(NoopDriver),
+            gateway.local.clone(),
+            Arc::new(pinned(&phone.identity)?),
+            listener,
+        )
+        .await?;
+        assert!(
+            dial(restarted.addr(), &gateway, &phone)
+                .await?
+                .list()
+                .await?
+                .is_empty()
+        );
+        restarted.shutdown().await;
+        Ok(())
+    }
+
+    #[test]
+    fn owner_pin_gate_requires_exact_bounded_unambiguous_file_and_latches_until_restart()
+    -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let mut config = RemoteServeConfig::new(temp.path(), temp.path(), temp.path());
+        std::fs::create_dir_all(config.remote_dir())?;
+        let path = config
+            .remote_dir()
+            .join(crate::session_listener::PEERS_FILE);
+        assert!(
+            PeerPolicyGate::open(&config).is_err(),
+            "missing pins must fail closed"
+        );
+        let phone = node("phone-pin", 2)?;
+        let key: String = phone
+            .identity
+            .public_key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let text = format!("{}|{key}\n", phone.id.as_str());
+        std::fs::write(&path, &text)?;
+        assert!(
+            PeerPolicyGate::open(&config).is_err(),
+            "unbound verifier must fail closed"
+        );
+        config.peer_pins_digest = Some(*blake3::hash(text.as_bytes()).as_bytes());
+        let gate = PeerPolicyGate::open(&config)?;
+        assert!(gate.current());
+        let concurrent = PeerPolicyGate::open(&config)?;
+        assert!(!concurrent.current_with(|| {
+            // Another lookup detects a change while this lookup is reading.
+            concurrent.stale.store(true, Ordering::Release);
+            Ok(text.clone())
+        }));
+        std::fs::write(&path, format!("{text}{text}"))?;
+        assert!(
+            read_peer_pins(&path).is_err(),
+            "duplicate node pins are ambiguous"
+        );
+        assert!(!gate.current());
+        std::fs::write(&path, &text)?;
+        assert!(!gate.current(), "restoring static trust requires a restart");
+        let restarted = PeerPolicyGate::open(&config)?;
+        assert!(restarted.current());
+        let replacement = node("phone-pin", 3)?;
+        let key: String = replacement
+            .identity
+            .public_key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        std::fs::write(&path, format!("{}|{key}\n", phone.id.as_str()))?;
+        assert!(
+            !restarted.current(),
+            "changed key cannot keep static verifier authority"
+        );
+        std::fs::write(&path, vec![b'x'; POLICY_MAX_BYTES + 1])?;
+        assert!(read_peer_pins(&path).is_err());
+        std::fs::remove_file(&path)?;
+        std::fs::create_dir(&path)?;
+        assert!(read_peer_pins(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn creator_key_fingerprint_survives_unrelated_pin_addition_but_changes_on_rotation()
+    -> TestResult {
+        let phone = node("phone-history", 2)?;
+        let other = node("other-history", 3)?;
+        let replacement = node("phone-history", 4)?;
+        let row = |identity: &NodeIdentity| {
+            let key: String = identity
+                .public_key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("{}|{key}\n", identity.node_id.as_str())
+        };
+        let original = crate::session_listener::peer_key_fingerprints(&row(&phone.identity));
+        let unrelated = crate::session_listener::peer_key_fingerprints(&format!(
+            "{}{}",
+            row(&phone.identity),
+            row(&other.identity)
+        ));
+        let rotated = crate::session_listener::peer_key_fingerprints(&row(&replacement.identity));
+        assert_eq!(
+            original.get(phone.id.as_str()),
+            unrelated.get(phone.id.as_str())
+        );
+        assert_ne!(
+            original.get(phone.id.as_str()),
+            rotated.get(phone.id.as_str())
+        );
+        assert_eq!(
+            original.get(phone.id.as_str()),
+            Some(blake3::hash(&phone.identity.public_key).as_bytes())
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_pins_refuse_symlinks() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let target = temp.path().join("target");
+        std::fs::write(&target, "")?;
+        let link = temp.path().join("pins");
+        std::os::unix::fs::symlink(&target, &link)?;
+        assert!(read_peer_pins(&link).is_err());
+        Ok(())
+    }
+
     /// A node whose key signs wrapped transcripts (what `AuthHubNodeSigner`
     /// produces in production).
     fn wrapped_node(name: &str, seed: u8) -> TestResult<TestNode> {
@@ -521,7 +1076,7 @@ mod tests {
     #[tokio::test]
     async fn a_wrapped_fleet_connects_and_a_plain_peer_is_refused() -> TestResult {
         let temp = tempfile::tempdir()?;
-        let config = RemoteServeConfig::new(temp.path(), temp.path(), temp.path());
+        let config = injected_config(temp.path());
         let gateway = wrapped_node("gateway", 1)?;
         let phone = wrapped_node("phone", 2)?;
         let plain = node("plain", 3)?;
@@ -567,6 +1122,30 @@ mod tests {
             }
         };
         assert!(connect(&phone).await?.list().await?.is_empty());
+        // Exercise the attach connector with the pinned identity and a wrong alias pin.
+        let endpoint = ingress.addr().to_string();
+        let attached = crate::attach_cmd::connect_authenticated_node(
+            "lab",
+            &endpoint,
+            gateway.id.as_str(),
+            &phone.local,
+            &client_verifier,
+            ConnectOptions::new("attach test"),
+        )
+        .await?;
+        assert!(RemotePort::new(attached).list().await?.is_empty());
+        assert!(
+            crate::attach_cmd::connect_authenticated_node(
+                "lab",
+                &endpoint,
+                "different-gateway",
+                &phone.local,
+                &client_verifier,
+                ConnectOptions::new("wrong identity"),
+            )
+            .await
+            .is_err()
+        );
         // A key that signs the raw (unwrapped) transcript is refused in a
         // wrapped fleet, although it is pinned and enrolled.
         assert!(connect(&plain).await.is_err());
@@ -577,7 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn an_unenrolled_node_is_refused() -> TestResult {
         let temp = tempfile::tempdir()?;
-        let config = RemoteServeConfig::new(temp.path(), temp.path(), temp.path());
+        let config = injected_config(temp.path());
         let gateway = node("gateway", 1)?;
         let stranger = node("stranger", 3)?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;

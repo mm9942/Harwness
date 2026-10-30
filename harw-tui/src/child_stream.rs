@@ -403,6 +403,8 @@ pub(crate) struct ChildStreamBlock {
     live_reasoning: String,
     /// Das Kind ist beendet; weitere Ereignisse werden ignoriert.
     finished: bool,
+    /// Locale of this historical block after it finishes.
+    language: harw_config::UiLanguage,
 }
 
 impl ChildStreamBlock {
@@ -421,6 +423,7 @@ impl ChildStreamBlock {
             live_text: String::new(),
             live_reasoning: String::new(),
             finished: false,
+            language: crate::i18n::current_language(),
         }
     }
 
@@ -522,7 +525,11 @@ impl ChildStreamBlock {
         let had_open_tools = !self.pending_tools.is_empty();
         for (_, cell) in self.pending_tools.drain() {
             if let Ok(mut guard) = cell.lock() {
-                guard.mark_incomplete_with("unvollständig (Agent beendet)");
+                guard.mark_incomplete_with(crate::i18n::tr_for(
+                    self.language,
+                    "agents.incomplete",
+                    "incomplete (agent ended)",
+                ));
             }
         }
         self.children.clear();
@@ -645,6 +652,7 @@ impl ChildStreamBlock {
                     return false;
                 }
                 let summary = Arc::new(Mutex::new(SubAgentCell {
+                    language: crate::i18n::current_language(),
                     child_id: child_id.clone(),
                     role: role.clone(),
                     question: question.as_deref().map(redact_text),
@@ -708,6 +716,17 @@ impl HistoryCell for ChildStreamBlock {
     /// dann die Einträge (Werkzeug-, Reasoning-, Text-, Enkelzeilen) und
     /// zuletzt den Live-Schwanz. Abgeschaltet oder leer: keine Zeile.
     fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+        let language = if self.finished {
+            self.language
+        } else {
+            crate::i18n::current_language()
+        };
+        crate::i18n::with_language(language, || self.display_lines_scoped(width, theme))
+    }
+}
+
+impl ChildStreamBlock {
+    fn display_lines_scoped(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
         if !self.is_streaming() {
             return Vec::new();
         }
@@ -716,7 +735,11 @@ impl HistoryCell for ChildStreamBlock {
         let mut body: Vec<Line<'static>> = Vec::new();
         if self.dropped > 0 {
             body.push(Line::from(Span::styled(
-                format!("… {} frühere Schritte", self.dropped),
+                crate::i18n::tr_args(
+                    "agents.earlier",
+                    "… {p0} earlier steps",
+                    &[("p0", &(self.dropped).to_string())],
+                ),
                 dim,
             )));
         }
@@ -779,7 +802,11 @@ fn render_assistant(text: &str, width: u16, theme: style::Theme) -> Vec<Line<'st
         let hidden = lines.len() - ASSISTANT_MAX_LINES;
         lines.truncate(ASSISTANT_MAX_LINES);
         lines.push(Line::from(Span::styled(
-            format!("  … ({hidden} weitere Zeilen)"),
+            crate::i18n::tr_args(
+                "agents.hidden_lines",
+                "  … ({hidden} more lines)",
+                &[("hidden", &(hidden).to_string())],
+            ),
             style::dim_style(theme),
         )));
     }
@@ -824,7 +851,7 @@ fn prefix_line(line: Line<'static>, dim: Style) -> Line<'static> {
 /// Ersatzzeile für eine vergiftete Sperre (kein Panic).
 fn poisoned(theme: style::Theme) -> Vec<Line<'static>> {
     vec![Line::from(Span::styled(
-        "⚠ Zelle nicht lesbar (Sperre vergiftet)".to_owned(),
+        crate::i18n::tr("agents.unreadable", "⚠ Cell unreadable (poisoned lock)").to_owned(),
         style::warning_style(theme),
     ))]
 }
@@ -844,7 +871,9 @@ fn visible_text(content: &[ContentPart]) -> String {
     for part in content {
         match part {
             ContentPart::Text { text } => visible.push_str(text),
-            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => visible.push_str("[Bild]"),
+            ContentPart::ImageUrl { .. } | ContentPart::Media { .. } => {
+                visible.push_str(crate::i18n::tr("agents.image", "[Image]"))
+            }
         }
     }
     visible
@@ -1481,7 +1510,7 @@ mod tests {
             assert_eq!(guard.dropped(), 7);
         }
         let rendered = text(&render(&block)?);
-        assert!(rendered.contains("… 7 frühere Schritte"), "{rendered}");
+        assert!(rendered.contains("… 7 earlier steps"), "{rendered}");
         Ok(())
     }
 
@@ -1524,7 +1553,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "genau eine Zusammenfassungszeile");
         let rendered = text(&lines);
         assert!(rendered.contains(role_names::EXECUTOR), "{rendered}");
-        assert!(rendered.contains("4 Tools · 900 Tok"), "{rendered}");
+        assert!(rendered.contains("4 tools · 900 tokens"), "{rendered}");
         assert_eq!(reg.take_new_handles().len(), 0);
         Ok(())
     }
@@ -1742,5 +1771,39 @@ mod tests {
         );
         assert!(!rendered.contains("sk-geheim-123"), "{rendered}");
         Ok(())
+    }
+    #[test]
+    fn live_block_chrome_refreshes_and_finished_block_keeps_creation_locale() {
+        use crate::i18n::{tr_args_for, with_language};
+        use harw_config::UiLanguage;
+        let mut block = with_language(UiLanguage::German, || {
+            ChildStreamBlock::new("child", true, 1, SharedMode::new(ChildStreamMode::All), 2)
+        });
+        block.dropped = 7;
+        for language in UiLanguage::ALL {
+            let shown = with_language(language, || {
+                text(&block.display_lines(WIDTH, style::Theme::Dark))
+            });
+            assert!(shown.contains(&tr_args_for(
+                language,
+                "agents.earlier",
+                "… {p0} earlier steps",
+                &[("p0", "7")]
+            )));
+        }
+        block.finish();
+        let expected = tr_args_for(
+            UiLanguage::German,
+            "agents.earlier",
+            "… {p0} earlier steps",
+            &[("p0", "7")],
+        );
+        for language in UiLanguage::ALL {
+            let shown = with_language(language, || {
+                text(&block.display_lines(WIDTH, style::Theme::Dark))
+            });
+            assert!(shown.contains(&expected));
+            assert_eq!(block.dropped, 7);
+        }
     }
 }

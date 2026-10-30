@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 harw-protocol = { path = "../harw-protocol" }
 harw-digest = { path = "../harw-digest" }
 harw-fsutil = { path = "../harw-fsutil" }

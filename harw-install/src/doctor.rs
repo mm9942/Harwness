@@ -14,6 +14,10 @@
 //! # Exportierte Typen
 //! - [`CheckOutcome`]: Ergebnis eines einzelnen Checks (Ok/Warn/Fail).
 //! - [`DoctorCheck`]: Trait für einen benannten, ausführbaren Check.
+//! - [`TrampolineCheck`]: reports a missing `harw-job-exec` trampoline
+//!   (PL-97 E3).
+//! - [`ExecutionChainCheck`] / [`execution_chain_checks`]: one check per
+//!   readiness stage of the execution chain report (PL-97 E5).
 //! - [`default_checks`]: baut die Standard-Check-Liste.
 //! - [`RuntimeCompositionEvidence`]: beobachtbare Evidenz der Tool-Komposition.
 //! - [`PlaintextSecretRefCheck`]: warnt vor unverschlüsselten Secret-Referenzen
@@ -157,6 +161,159 @@ impl DoctorCheck for SandboxCheck {
             ),
         }
     }
+}
+
+/// File name of the job sandbox trampoline shipped next to `harw`
+/// (`harw_job_runtime::host::TRAMPOLINE_NAME`).
+pub const TRAMPOLINE_NAME: &str = "harw-job-exec";
+
+/// Reports whether the `harw-job-exec` trampoline is installed (PL-97 E3).
+///
+/// # Description
+/// The sandboxed job backends (Landlock trampoline, Bubblewrap ∘
+/// trampoline) need `harw-job-exec`: at `[jobs] trampoline` when the trusted
+/// config sets it, otherwise next to the running `harw`. Missing is a
+/// [`CheckOutcome::Warn`] (jobs still run, but only with Bubblewrap alone
+/// or without a sandbox backend). Off Linux (including Android) the
+/// trampoline is not shipped and the check passes. Read-only: it loads the
+/// config layers below `home` like [`PlaintextSecretRefCheck`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrampolineCheck {
+    /// harw home whose trusted config layers may set `[jobs] trampoline`.
+    home: PathBuf,
+    /// Directory of the running `harw` (`None`: unknown).
+    exe_dir: Option<PathBuf>,
+}
+
+impl TrampolineCheck {
+    /// The check for `home` and the directory of the running executable.
+    #[must_use]
+    pub fn new(home: &Path) -> Self {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
+        Self::with_exe_dir(home, exe_dir)
+    }
+
+    /// The check with an explicit executable directory (tests, installers).
+    #[must_use]
+    pub fn with_exe_dir(home: &Path, exe_dir: Option<PathBuf>) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            exe_dir,
+        }
+    }
+}
+
+impl DoctorCheck for TrampolineCheck {
+    /// Returns `"install/harw-job-exec"`.
+    fn id(&self) -> &str {
+        "install/harw-job-exec"
+    }
+
+    fn run(&self) -> CheckOutcome {
+        if !cfg!(target_os = "linux") {
+            return CheckOutcome::Ok(format!(
+                "{TRAMPOLINE_NAME} wird auf diesem System nicht benötigt"
+            ));
+        }
+        // Nur vertraute Layer: ein nicht vertrautes Projekt kann
+        // `[jobs] trampoline` ohnehin nicht setzen (harw-config).
+        let configured = harw_home::config_layers(&self.home)
+            .ok()
+            .and_then(|layers| harw_config::discover_config(&layers).ok())
+            .and_then(|config| config.harness.jobs.trampoline);
+        trampoline_outcome(configured.as_deref(), self.exe_dir.as_deref())
+    }
+}
+
+/// The outcome of [`TrampolineCheck`] for a configured path or the
+/// executable directory (pure apart from file metadata).
+fn trampoline_outcome(configured: Option<&Path>, exe_dir: Option<&Path>) -> CheckOutcome {
+    let (candidate, origin) = match (configured, exe_dir) {
+        (Some(path), _) => (path.to_path_buf(), "[jobs] trampoline"),
+        (None, Some(dir)) => (dir.join(TRAMPOLINE_NAME), "neben harw"),
+        (None, None) => {
+            return CheckOutcome::Warn(format!(
+                "{TRAMPOLINE_NAME} nicht prüfbar: Verzeichnis des laufenden harw unbekannt"
+            ));
+        }
+    };
+    if candidate.is_absolute() && is_executable_file(&candidate) {
+        CheckOutcome::Ok(format!(
+            "{TRAMPOLINE_NAME} gefunden ({origin}): {}",
+            candidate.display()
+        ))
+    } else {
+        CheckOutcome::Warn(format!(
+            "{TRAMPOLINE_NAME} fehlt ({origin}: {}): gesandboxte Jobs laufen ohne Landlock-\
+             Trampolin (nur Bubblewrap oder ohne Sandbox). Neu installieren (`make install`, \
+             `harw update` oder `scripts/install.sh --binary`) oder `[jobs] trampoline` setzen",
+            candidate.display()
+        ))
+    }
+}
+
+/// One readiness stage of a [`harw_dod_client::ExecutionChainReport`] as a
+/// doctor check (PL-97 E5).
+///
+/// # Description
+/// The id is `chain/<stage>` (`installed`, `configured`, `running`,
+/// `ready`). A stage without warnings or missing items is
+/// [`CheckOutcome::Ok`]; otherwise [`CheckOutcome::Warn`] naming the
+/// items. Never [`CheckOutcome::Fail`]: harw runs without the full chain
+/// (weaker sandbox, no cgroup limits, no DoD), the report only says so
+/// honestly. The report is collected by the caller (`harw doctor`); this
+/// check is pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionChainCheck {
+    id: String,
+    stage: harw_dod_client::ChainStage,
+    report: harw_dod_client::ExecutionChainReport,
+}
+
+impl ExecutionChainCheck {
+    /// The check of `stage` in `report`.
+    #[must_use]
+    pub fn new(
+        report: harw_dod_client::ExecutionChainReport,
+        stage: harw_dod_client::ChainStage,
+    ) -> Self {
+        Self {
+            id: format!("chain/{stage}"),
+            stage,
+            report,
+        }
+    }
+}
+
+impl DoctorCheck for ExecutionChainCheck {
+    /// Returns `"chain/<stage>"`.
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn run(&self) -> CheckOutcome {
+        use harw_dod_client::ChainLevel;
+        let summary = self.report.stage_summary(self.stage);
+        match self.report.stage_level(self.stage) {
+            ChainLevel::Ok | ChainLevel::Skip => CheckOutcome::Ok(summary),
+            ChainLevel::Warn | ChainLevel::Miss => CheckOutcome::Warn(summary),
+        }
+    }
+}
+
+/// One [`ExecutionChainCheck`] per readiness stage of `report`, in order.
+#[must_use]
+pub fn execution_chain_checks(
+    report: &harw_dod_client::ExecutionChainReport,
+) -> Vec<Box<dyn DoctorCheck>> {
+    harw_dod_client::ChainStage::ALL
+        .into_iter()
+        .map(|stage| {
+            Box::new(ExecutionChainCheck::new(report.clone(), stage)) as Box<dyn DoctorCheck>
+        })
+        .collect()
 }
 
 /// Sucht ein ausführbares Programm namens `bin` in den `PATH`-Einträgen.
@@ -715,10 +872,10 @@ pub fn plaintext_secret_refs(config: &ResolvedConfig) -> Vec<String> {
     let mut found = Vec::new();
 
     for (key, provider) in &config.providers {
-        if let Some(auth) = &provider.auth {
-            if is_plaintext(auth) {
-                found.push(format!("providers.{key}.auth={}", auth.as_ref_string()));
-            }
+        if let Some(auth) = &provider.auth
+            && is_plaintext(auth)
+        {
+            found.push(format!("providers.{key}.auth={}", auth.as_ref_string()));
         }
         for (name, value) in &provider.headers {
             if !ProviderToml::is_sensitive_header_name(name) {
@@ -740,10 +897,10 @@ pub fn plaintext_secret_refs(config: &ResolvedConfig) -> Vec<String> {
     }
 
     for (key, mcp) in &config.mcps {
-        if let Some(auth) = &mcp.auth {
-            if is_plaintext(auth) {
-                found.push(format!("mcps.{key}.auth={}", auth.as_ref_string()));
-            }
+        if let Some(auth) = &mcp.auth
+            && is_plaintext(auth)
+        {
+            found.push(format!("mcps.{key}.auth={}", auth.as_ref_string()));
         }
     }
 
@@ -756,13 +913,13 @@ pub fn plaintext_secret_refs(config: &ResolvedConfig) -> Vec<String> {
                         t.bot_token_ref.as_ref_string()
                     ));
                 }
-                if let Some(webhook) = &t.transport_webhook {
-                    if is_plaintext(&webhook.secret_token_ref) {
-                        found.push(format!(
-                            "channels.{key}.transport_webhook.secret_token_ref={}",
-                            webhook.secret_token_ref.as_ref_string()
-                        ));
-                    }
+                if let Some(webhook) = &t.transport_webhook
+                    && is_plaintext(&webhook.secret_token_ref)
+                {
+                    found.push(format!(
+                        "channels.{key}.transport_webhook.secret_token_ref={}",
+                        webhook.secret_token_ref.as_ref_string()
+                    ));
                 }
             }
         }
@@ -845,12 +1002,13 @@ fn plaintext_refs_outcome(found: &[String]) -> CheckOutcome {
 /// use harw_install::doctor::default_checks;
 ///
 /// let checks = default_checks(Path::new("/home/u/.harw"));
-/// assert_eq!(checks.len(), 7);
+/// assert_eq!(checks.len(), 8);
 /// ```
 pub fn default_checks(home: &Path) -> Vec<Box<dyn DoctorCheck>> {
     vec![
         Box::new(SystemCheck),
         Box::new(SandboxCheck),
+        Box::new(TrampolineCheck::new(home)),
         Box::new(RuntimeCompositionCheck::new(
             RuntimeCompositionEvidence::not_configured(),
         )),
@@ -883,7 +1041,7 @@ pub fn default_checks(home: &Path) -> Vec<Box<dyn DoctorCheck>> {
 ///
 /// let checks = default_checks(Path::new("/home/u/.harw"));
 /// let results = run_all(&checks);
-/// assert_eq!(results.len(), 7);
+/// assert_eq!(results.len(), 8);
 /// ```
 pub fn run_all(checks: &[Box<dyn DoctorCheck>]) -> Vec<(String, CheckOutcome)> {
     checks
@@ -963,9 +1121,13 @@ mod tests {
     }
 
     #[test]
-    fn test_default_checks_len_is_seven() -> TestResult {
+    fn test_default_checks_len_is_eight() -> TestResult {
         let checks = default_checks(Path::new("/tmp/harw-doctor-test"));
-        assert_eq!(checks.len(), 7);
+        assert_eq!(checks.len(), 8);
+        checks
+            .iter()
+            .find(|check| check.id() == "install/harw-job-exec")
+            .ok_or(TestError::Missing("trampoline check"))?;
         checks
             .iter()
             .find(|check| check.id() == "secrets/plaintext-refs")
@@ -986,6 +1148,104 @@ mod tests {
             matches!(result, CheckOutcome::Warn(message) if message.contains("nicht konfiguriert"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn doctor_reports_a_missing_trampoline_and_finds_an_installed_one() -> TestResult {
+        let dir = temp_dir("trampoline")?;
+        // Fehlt neben harw: Warnung mit Pfad und Abhilfe.
+        let missing = trampoline_outcome(None, Some(&dir));
+        assert!(
+            matches!(&missing, CheckOutcome::Warn(message)
+                if message.contains("harw-job-exec fehlt") && message.contains("[jobs] trampoline")),
+            "{missing:?}"
+        );
+        // Nicht ausführbar zählt als fehlend.
+        let binary = dir.join(TRAMPOLINE_NAME);
+        std::fs::write(&binary, "#!/bin/sh\n").map_err(ctx("trampoline schreiben"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o644))
+                .map_err(ctx("0644"))?;
+            assert!(matches!(
+                trampoline_outcome(None, Some(&dir)),
+                CheckOutcome::Warn(_)
+            ));
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+                .map_err(ctx("0755"))?;
+        }
+        let found = trampoline_outcome(None, Some(&dir));
+        assert!(
+            matches!(&found, CheckOutcome::Ok(message) if message.contains("neben harw")),
+            "{found:?}"
+        );
+        // `[jobs] trampoline` geht vor; ein fehlender konfigurierter Pfad warnt.
+        let configured = dir.join("elsewhere").join(TRAMPOLINE_NAME);
+        let outcome = trampoline_outcome(Some(&configured), Some(&dir));
+        assert!(
+            matches!(&outcome, CheckOutcome::Warn(message) if message.contains("[jobs] trampoline")),
+            "{outcome:?}"
+        );
+        let outcome = trampoline_outcome(Some(&binary), None);
+        assert!(matches!(outcome, CheckOutcome::Ok(_)), "{outcome:?}");
+        assert!(matches!(
+            trampoline_outcome(None, None),
+            CheckOutcome::Warn(_)
+        ));
+        assert_eq!(
+            TrampolineCheck::with_exe_dir(&dir, None).id(),
+            "install/harw-job-exec"
+        );
+        std::fs::remove_dir_all(&dir).map_err(ctx("aufräumen"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn execution_chain_checks_report_one_stage_each_and_never_fail() {
+        use harw_dod_client::{
+            ChainBinary, ChainHost, ChainInputs, ExecutionChainReport, ServeWorkspace,
+        };
+        let report = ExecutionChainReport::build(&ChainInputs {
+            binaries: vec![ChainBinary {
+                name: "harw".to_owned(),
+                found: Ok(PathBuf::from("/usr/local/bin/harw")),
+                required: true,
+            }],
+            config: Ok(()),
+            root: Err("cgroup root 'x' from config is not an absolute path".to_owned()),
+            host: ChainHost {
+                target_os: "linux".to_owned(),
+                bwrap: Err("no trusted bwrap".to_owned()),
+                trampoline: Ok(PathBuf::from("/usr/local/bin/harw-job-exec")),
+                landlock_abi: Some(6),
+            },
+            serve: None,
+            dod: None,
+            serve_workspace: ServeWorkspace::default(),
+        });
+        let results = run_all(&execution_chain_checks(&report));
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "chain/installed",
+                "chain/configured",
+                "chain/running",
+                "chain/ready"
+            ]
+        );
+        assert!(matches!(&results[0].1, CheckOutcome::Ok(_)), "{results:?}");
+        assert!(
+            matches!(&results[1].1, CheckOutcome::Warn(message)
+                if message.contains("cgroup-root miss") && message.contains("not an absolute path")),
+            "{results:?}"
+        );
+        assert!(matches!(&results[2].1, CheckOutcome::Ok(_)), "{results:?}");
+        assert!(
+            matches!(&results[3].1, CheckOutcome::Warn(message) if message.contains("bwrap warn")),
+            "{results:?}"
+        );
     }
 
     #[test]

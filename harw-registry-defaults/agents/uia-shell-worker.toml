@@ -66,6 +66,7 @@ admitted = [
   "job.stop",
   "job.list",
   "fs.read",
+  "fs.view_image",
   "fs.list",
   "fs.search",
   "fs.glob",

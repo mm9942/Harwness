@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 harw-protocol = { path = "../harw-protocol" }
 harw-types = { path = "../harw-types" }
+harw-fsutil = { path = "../harw-fsutil" }
 harw-node-transport = { path = "../harw-node-transport" }
 harw-session-host = { path = "../harw-session-host" }
 harw-session-ws = { path = "../harw-session-ws" }

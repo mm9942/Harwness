@@ -69,19 +69,47 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use harw_config::UiLanguage;
 use harw_model_catalog::{AuthMethod, DetectedCredential, ProviderApi, ProviderSpec};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+use crate::i18n::{tr_args_for, tr_for};
 
 use crate::app::TuiError;
 use crate::style;
 
-/// Warnhinweis, wenn im Anthropic-Auth-Schritt eine Abo-OAuth-/Setup-Token-
-/// Authentifizierung (statt eines API-Keys) gewählt oder eingefügt wird.
-///
-/// # Description
-/// Wortgleich vorgegebener Hinweistext (siehe WARN-TUI-Auftrag). `harw-tui`
-/// hängt nicht von `harw-provider-http` ab, daher ist der Text hier als
-/// lokale Konstante dupliziert statt importiert.
-const ANTHROPIC_OAUTH_WARNING: &str = "Hinweis: Du nutzt ein Abo-OAuth-/Setup-Token (Claude Free/Pro/Max) statt eines API-Keys. Laut Anthropics Nutzungsbedingungen ist Abo-OAuth für Claude Code und native Anthropic-Apps vorgesehen; Drittanbieter-Tools sollen API-Keys aus der Claude Console nutzen. Anthropic hat eine geplante Abrechnungsänderung für Drittanbieter-Nutzung im Juni 2026 vorerst pausiert, behält sich Durchsetzung aber ohne Vorankündigung vor – Anfragen können jederzeit abgelehnt werden. Nutzung auf eigene Gefahr. Stabil: API-Key (platform.claude.com). Quelle: https://code.claude.com/docs/en/legal-and-compliance";
+/// Complete policy warning; translated as one message, including dates and source.
+const ANTHROPIC_OAUTH_WARNING: &str = "Notice: You are using a subscription OAuth/setup token (Claude Free/Pro/Max) instead of an API key. Under Anthropic’s terms, subscription OAuth is intended for Claude Code and native Anthropic apps; third-party tools should use API keys from the Claude Console. Anthropic has temporarily paused a billing change planned for third-party use in June 2026, but reserves the right to enforce restrictions without notice — requests may be rejected at any time. Use at your own risk. Stable option: API key (platform.claude.com). Source: https://code.claude.com/docs/en/legal-and-compliance";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValidationError {
+    Endpoint,
+    Secret,
+    Model,
+}
+
+impl ValidationError {
+    fn label(self, language: UiLanguage) -> &'static str {
+        match self {
+            Self::Endpoint => tr_for(
+                language,
+                "setup.endpoint_invalid",
+                "Enter a complete HTTP(S) base URL without placeholders.",
+            ),
+            Self::Secret => tr_for(
+                language,
+                "setup.secret_required",
+                "An API key or secret reference is required.",
+            ),
+            Self::Model => tr_for(
+                language,
+                "setup.model_required",
+                "A model ID / deployment name is required.",
+            ),
+        }
+    }
+}
 
 /// Phase des Ersteinrichtungs-Assistenten.
 ///
@@ -151,8 +179,8 @@ enum AuthOption {
     /// der OAuth-Weg sichtbar ist; der Token wird via Paste eingegeben und
     /// landet als Raw-Token in `secret_ref`.
     OAuth {
-        /// Anzeige-Label (Quelle + Hinweis).
-        label: String,
+        /// Stable source ID; presentation is generated in the current language.
+        source_id: String,
         /// Referenz-String, der als Fallback dient wenn kein Token eingegeben.
         secret_ref: String,
     },
@@ -160,15 +188,30 @@ enum AuthOption {
 
 impl AuthOption {
     /// Gibt das Anzeige-Label der Auth-Option zurück.
-    fn label(&self) -> String {
+    fn label(&self, language: UiLanguage) -> String {
         match self {
-            AuthOption::ApiKey => "API-Key eingeben".to_owned(),
-            AuthOption::LocalBaseUrl => "Lokal (nur Basis-URL)".to_owned(),
-            AuthOption::Custom => "Benutzerdefiniert".to_owned(),
-            AuthOption::Detected(detected) => {
-                format!("Erkannt: {} ({})", detected.source.id, detected.secret_ref)
+            AuthOption::ApiKey => {
+                tr_for(language, "setup.auth_api_key", "Enter an API key").to_owned()
             }
-            AuthOption::OAuth { label, .. } => label.clone(),
+            AuthOption::LocalBaseUrl => {
+                tr_for(language, "setup.auth_local", "Local (base URL only)").to_owned()
+            }
+            AuthOption::Custom => tr_for(language, "setup.auth_custom", "Custom").to_owned(),
+            AuthOption::Detected(detected) => tr_args_for(
+                language,
+                "setup.auth_detected",
+                "Detected: {source} ({reference})",
+                &[
+                    ("source", &detected.source.id),
+                    ("reference", &detected.secret_ref),
+                ],
+            ),
+            AuthOption::OAuth { source_id, .. } => tr_args_for(
+                language,
+                "setup.auth_oauth",
+                "OAuth/setup token: {source} (via `harw auth login`)",
+                &[("source", source_id)],
+            ),
         }
     }
 
@@ -195,10 +238,11 @@ impl AuthOption {
 pub struct SetupApp {
     /// Vollständiger Provider-Katalog.
     providers: Vec<ProviderSpec>,
+    language: UiLanguage,
     endpoint_input: String,
     model_input: String,
     auth_header: Option<String>,
-    validation_error: String,
+    validation_error: Option<ValidationError>,
     /// Aktuelle Phase.
     stage: SetupStage,
     /// Tipp-Filter der Provider-Liste (case-insensitiv).
@@ -245,12 +289,19 @@ impl SetupApp {
     /// Rein; startet keine Threads.
     #[must_use]
     pub fn new(catalog: Vec<ProviderSpec>) -> Self {
+        Self::new_for(UiLanguage::English, catalog)
+    }
+
+    /// Build a setup session with an explicit resolved profile language.
+    #[must_use]
+    pub fn new_for(language: UiLanguage, catalog: Vec<ProviderSpec>) -> Self {
         Self {
+            language,
             providers: catalog,
             endpoint_input: String::new(),
             model_input: String::new(),
             auth_header: None,
-            validation_error: String::new(),
+            validation_error: None,
             stage: SetupStage::Provider,
             filter: String::new(),
             selected: 0,
@@ -264,6 +315,16 @@ impl SetupApp {
             outcome: None,
             theme: style::detect_theme(),
         }
+    }
+
+    /// Change presentation without resetting selection, drafts, or validation state.
+    pub fn set_language(&mut self, language: UiLanguage) {
+        self.language = language;
+    }
+
+    fn validation_message(&self) -> &'static str {
+        self.validation_error
+            .map_or("", |error| error.label(self.language))
     }
 
     /// Gibt die aktuelle Phase zurück.
@@ -394,7 +455,7 @@ impl SetupApp {
                     self.chosen_provider = Some(provider);
                     self.stage = SetupStage::Endpoint;
                     self.selected = 0;
-                    self.validation_error.clear();
+                    self.validation_error = None;
                 }
             }
             _ => {}
@@ -413,15 +474,14 @@ impl SetupApp {
                     || endpoint.contains(['<', '>', ' ', '?', '#'])
                     || endpoint.ends_with("://")
                 {
-                    self.validation_error =
-                        "Vollständige HTTP(S)-Basis-URL ohne Platzhalter eingeben.".into();
+                    self.validation_error = Some(ValidationError::Endpoint);
                     return;
                 }
                 let Some(provider) = self.chosen_provider.as_mut() else {
                     return;
                 };
                 provider.base_url = endpoint.to_owned();
-                self.validation_error.clear();
+                self.validation_error = None;
                 if provider.id == "foundry" || provider.id == "custom" {
                     self.stage = SetupStage::Api;
                     self.selected = 0;
@@ -632,14 +692,18 @@ impl SetupApp {
     /// (Setup-Warnung bei Anthropic-Bearer-/OAuth-Auswahl).
     ///
     /// # Returns
-    /// `Some(text)` mit dem wortgleich vorgegebenen Warnhinweis, sonst `None`.
+    /// `Some(text)` with the complete warning in the session language, otherwise `None`.
     ///
     /// # Concurrency
     /// Rein; liest nur den eigenen Zustand.
     #[must_use]
     pub fn oauth_warning(&self) -> Option<&'static str> {
         if self.is_anthropic_oauth_selection() {
-            Some(ANTHROPIC_OAUTH_WARNING)
+            Some(tr_for(
+                self.language,
+                "setup.oauth_warning",
+                ANTHROPIC_OAUTH_WARNING,
+            ))
         } else {
             None
         }
@@ -731,10 +795,10 @@ impl SetupApp {
                 .as_deref()
                 .is_none_or(|s| s.trim().is_empty())
         {
-            self.validation_error = "API-Key oder Secret-Referenz erforderlich.".into();
+            self.validation_error = Some(ValidationError::Secret);
             return;
         }
-        self.validation_error.clear();
+        self.validation_error = None;
         self.auth_editing = false;
         self.begin_model();
     }
@@ -764,7 +828,7 @@ impl SetupApp {
             self.model_input.trim().to_owned()
         };
         if model.is_empty() {
-            self.validation_error = "Modell-ID / Deployment-Name erforderlich.".into();
+            self.validation_error = Some(ValidationError::Model);
             return;
         }
         self.outcome = Some(SetupOutcome {
@@ -834,12 +898,8 @@ fn build_auth_options(provider: &ProviderSpec) -> Vec<AuthOption> {
     //    Zwang wurde entfernt, damit anthropic/openai und zukünftige Provider
     //    OAuth-Quellen auch ohne LocalImport-Deklaration anzeigen.
     for source in detected.iter().filter(|d| !d.exists) {
-        let label = format!(
-            "OAuth/Setup-Token: {} (via `harw auth login`)",
-            source.source.id
-        );
         let option = AuthOption::OAuth {
-            label,
+            source_id: source.source.id.clone(),
             secret_ref: source.secret_ref.clone(),
         };
         if !options.contains(&option) {
@@ -968,7 +1028,15 @@ impl Drop for TerminalGuard {
 /// # Concurrency
 /// Läuft synchron im aufrufenden Thread; startet keine weiteren Threads.
 pub fn run_setup(catalog: Vec<ProviderSpec>) -> Result<Option<SetupOutcome>, TuiError> {
-    let mut app = SetupApp::new(catalog);
+    run_setup_for(UiLanguage::English, catalog)
+}
+
+/// Run setup with the resolved profile language; no thread-local scope is held.
+pub fn run_setup_for(
+    language: UiLanguage,
+    catalog: Vec<ProviderSpec>,
+) -> Result<Option<SetupOutcome>, TuiError> {
+    let mut app = SetupApp::new_for(language, catalog);
     let mut guard = TerminalGuard::enter()?;
     let result = setup_loop(&mut guard, &mut app);
     drop(guard);
@@ -1030,35 +1098,51 @@ fn setup_loop(
 fn draw(guard: &mut TerminalGuard, app: &mut SetupApp) -> Result<(), TuiError> {
     guard
         .terminal()
-        .draw(|frame| {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(1)])
-                .split(frame.area());
-
-            let header = Paragraph::new(format!("harw setup — {:?}  (Esc bricht ab)", app.stage))
-                .block(Block::default().borders(Borders::ALL).title("Einrichtung"));
-            frame.render_widget(header, chunks[0]);
-
-            let lines = body_lines(app);
-            let mut body = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
-            // Listen-Phasen: eine Zeile je Eintrag (kein Umbruch), damit der
-            // Zeilenindex der Markierung stimmt und der Offset ihr folgen kann.
-            if let Some(line) = selected_line_index(app) {
-                // Rahmen oben/unten abziehen.
-                let viewport = usize::from(chunks[1].height.saturating_sub(2)).max(1);
-                app.scroll = follow_scroll(usize::from(app.scroll), line, viewport);
-            } else {
-                app.scroll = 0;
-                body = body.wrap(Wrap { trim: false });
-            }
-            frame.render_widget(body.scroll((app.scroll, 0)), chunks[1]);
-        })
+        .draw(|frame| render_frame(frame, app))
         .map_err(TuiError::from)?;
     Ok(())
 }
 
-/// Zeilenindex der markierten Zeile in [`body_lines`], falls die Phase eine Liste ist.
+/// Shared production/headless rendering boundary; the app owns its language.
+fn render_frame(frame: &mut ratatui::Frame<'_>, app: &mut SetupApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(frame.area());
+    let language = app.language;
+    let stage = match app.stage {
+        SetupStage::Provider => tr_for(language, "setup.stage_provider", "Provider"),
+        SetupStage::Endpoint => tr_for(language, "setup.stage_endpoint", "Endpoint"),
+        SetupStage::Api => tr_for(language, "setup.stage_api", "API"),
+        SetupStage::Auth => tr_for(language, "setup.stage_auth", "Authentication"),
+        SetupStage::Model => tr_for(language, "setup.stage_model", "Model"),
+        SetupStage::Done => tr_for(language, "setup.stage_done", "Done"),
+    };
+    let header = Paragraph::new(tr_args_for(
+        language,
+        "setup.header",
+        "harw setup — {stage}  (Esc cancels)",
+        &[("stage", stage)],
+    ))
+    .block(Block::default().borders(Borders::ALL).title(tr_for(
+        language,
+        "setup.title",
+        "Setup",
+    )));
+    frame.render_widget(header, chunks[0]);
+    let lines = body_lines_at_width(app, usize::from(chunks[1].width.saturating_sub(2)));
+    let mut body = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+    if let Some(line) = selected_line_index(app) {
+        let viewport = usize::from(chunks[1].height.saturating_sub(2)).max(1);
+        app.scroll = follow_scroll(usize::from(app.scroll), line, viewport);
+    } else {
+        app.scroll = 0;
+        body = body.wrap(Wrap { trim: false });
+    }
+    frame.render_widget(body.scroll((app.scroll, 0)), chunks[1]);
+}
+
+/// Zeilenindex der markierten Zeile in [`body_lines_at_width`], falls die Phase eine Liste ist.
 fn selected_line_index(app: &SetupApp) -> Option<usize> {
     match app.stage {
         // Kopfzeile „Filter: …“.
@@ -1092,11 +1176,17 @@ fn follow_scroll(current: usize, line: usize, viewport: usize) -> u16 {
 /// ist. Das Label unterscheidet zwischen ApiKey und OAuth. Auswahl-Hervorhebung
 /// und Hinweiszeilen werden über [`crate::style`] theme-abhängig aufgelöst
 /// (SLICE 8). Contract-Quelle: Redesign-Spec SLICE 1, Punkt g.
-fn body_lines(app: &SetupApp) -> Vec<Line<'static>> {
+fn body_lines_at_width(app: &SetupApp, width: usize) -> Vec<Line<'static>> {
     let theme = app.theme;
+    let language = app.language;
     match app.stage {
         SetupStage::Provider => {
-            let mut lines = vec![Line::from(format!("Filter: {}", app.filter))];
+            let mut lines = vec![Line::from(tr_args_for(
+                language,
+                "setup.filter",
+                "Filter: {filter}",
+                &[("filter", &app.filter)],
+            ))];
             let filtered = app.filtered_indices();
             for (row, &index) in filtered.iter().enumerate() {
                 let provider = &app.providers[index];
@@ -1109,18 +1199,50 @@ fn body_lines(app: &SetupApp) -> Vec<Line<'static>> {
             lines
         }
         SetupStage::Endpoint => vec![
-            Line::from("Ressourcen-/Gateway-Basis-URL (bearbeiten oder einfügen):"),
+            Line::from(tr_for(
+                language,
+                "setup.endpoint_prompt",
+                "Resource/gateway base URL (edit or paste):",
+            )),
             Line::from(app.endpoint_input.clone()),
-            Line::from("Foundry: https://<ressource>.services.ai.azure.com — keine Projekt-URL"),
-            Line::from(app.validation_error.clone()),
+            Line::from(tr_for(
+                language,
+                "setup.foundry_hint",
+                "Foundry: https://<resource>.services.ai.azure.com — use a resource URL, not a project URL",
+            )),
+            Line::from(app.validation_message()),
         ],
         SetupStage::Api => [
-            "Chat Completions — API-Key (GPT, Llama, Mistral, DeepSeek, …)",
-            "Responses — API-Key (unterstützte GPT-Deployments)",
-            "Anthropic Messages — API-Key (Claude)",
-            "Chat Completions — Entra/Bearer-Token-Referenz",
-            "Responses — Entra/Bearer-Token-Referenz",
-            "Anthropic Messages — Entra/Bearer-Token-Referenz",
+            tr_for(
+                language,
+                "setup.api_chat_key",
+                "Chat Completions — API key (GPT, Llama, Mistral, DeepSeek, …)",
+            ),
+            tr_for(
+                language,
+                "setup.api_responses_key",
+                "Responses — API key (supported GPT deployments)",
+            ),
+            tr_for(
+                language,
+                "setup.api_anthropic_key",
+                "Anthropic Messages — API key (Claude)",
+            ),
+            tr_for(
+                language,
+                "setup.api_chat_bearer",
+                "Chat Completions — Entra/Bearer token reference",
+            ),
+            tr_for(
+                language,
+                "setup.api_responses_bearer",
+                "Responses — Entra/Bearer token reference",
+            ),
+            tr_for(
+                language,
+                "setup.api_anthropic_bearer",
+                "Anthropic Messages — Entra/Bearer token reference",
+            ),
         ]
         .iter()
         .enumerate()
@@ -1131,12 +1253,20 @@ fn body_lines(app: &SetupApp) -> Vec<Line<'static>> {
 
             // Direktwahl-Hinweis — gedimmter Stil via style::dim_style().
             lines.push(Line::from(Span::styled(
-                "  [1-9] Direktwahl",
+                tr_for(language, "setup.direct_choice", "  [1-9] Select directly"),
                 style::dim_style(theme),
             )));
 
             for (row, option) in app.auth_options.iter().enumerate() {
-                lines.push(selectable_line(row == app.selected, option.label(), theme));
+                lines.push(selectable_line(
+                    row == app.selected,
+                    option.label(language),
+                    theme,
+                ));
+            }
+
+            if app.validation_error.is_some() {
+                lines.push(Line::from(app.validation_message()));
             }
 
             // Eingabefeld anzeigen wenn Editing-Modus aktiv ODER Secret-Option gewählt.
@@ -1148,11 +1278,21 @@ fn body_lines(app: &SetupApp) -> Vec<Line<'static>> {
 
             if app.auth_editing || selected_is_secret {
                 let label: &str = match app.auth_options.get(app.selected) {
-                    Some(AuthOption::OAuth { .. }) => "Setup-Token (einfügen mit Ctrl+V):",
-                    _ if app.auth_header.as_deref() == Some("bearer") => {
-                        "Token / Referenz (z.B. env:AZURE_AUTH_TOKEN):"
-                    }
-                    _ => "API-Key / Secret-Referenz:",
+                    Some(AuthOption::OAuth { .. }) => tr_for(
+                        language,
+                        "setup.token_prompt",
+                        "Setup token (paste with Ctrl+V):",
+                    ),
+                    _ if app.auth_header.as_deref() == Some("bearer") => tr_for(
+                        language,
+                        "setup.bearer_prompt",
+                        "Token / reference (e.g. env:AZURE_AUTH_TOKEN):",
+                    ),
+                    _ => tr_for(
+                        language,
+                        "setup.secret_prompt",
+                        "API key / secret reference:",
+                    ),
                 };
                 // Eingabefeld in der Akzentfarbe des aktiven Themes.
                 lines.push(Line::from(Span::styled(
@@ -1161,7 +1301,11 @@ fn body_lines(app: &SetupApp) -> Vec<Line<'static>> {
                 )));
                 // Hint-Zeile gedimmt.
                 lines.push(Line::from(Span::styled(
-                    "  (tippen oder Ctrl+V zum Einfügen, Enter zum Bestätigen)",
+                    tr_for(
+                        language,
+                        "setup.input_hint",
+                        "  (type or paste with Ctrl+V, Enter to confirm)",
+                    ),
                     style::dim_style(theme),
                 )));
             }
@@ -1173,7 +1317,7 @@ fn body_lines(app: &SetupApp) -> Vec<Line<'static>> {
             // Text selbst bleibt dabei wortgleich.
             if let Some(warning) = app.oauth_warning() {
                 let warn_style = Style::default().fg(style::warning_color(theme));
-                for chunk in wrap_warning(warning, 76) {
+                for chunk in wrap_warning(warning, width) {
                     lines.push(Line::from(Span::styled(chunk, warn_style)));
                 }
             }
@@ -1182,9 +1326,18 @@ fn body_lines(app: &SetupApp) -> Vec<Line<'static>> {
         }
         SetupStage::Model => {
             let mut lines = vec![
-                Line::from("Modell wählen oder eigene Modell-ID / Azure-Deployment-Namen tippen:"),
-                Line::from(format!("Eigene Auswahl: {}", app.model_input)),
-                Line::from(app.validation_error.clone()),
+                Line::from(tr_for(
+                    language,
+                    "setup.model_prompt",
+                    "Select a model or type a model ID / Azure deployment name:",
+                )),
+                Line::from(tr_args_for(
+                    language,
+                    "setup.custom_model",
+                    "Custom selection: {model}",
+                    &[("model", &app.model_input)],
+                )),
+                Line::from(app.validation_message()),
             ];
             lines.extend(
                 app.model_options
@@ -1194,7 +1347,11 @@ fn body_lines(app: &SetupApp) -> Vec<Line<'static>> {
             );
             lines
         }
-        SetupStage::Done => vec![Line::from("Einrichtung abgeschlossen.")],
+        SetupStage::Done => vec![Line::from(tr_for(
+            language,
+            "setup.done",
+            "Setup complete.",
+        ))],
     }
 }
 
@@ -1227,25 +1384,32 @@ fn mask(key: &str) -> String {
     "*".repeat(key.chars().count())
 }
 
-/// Bricht `text` auf Leerzeichen-Grenzen in Zeilen von höchstens `width`
-/// Zeichen um, ohne einzelne Wörter zu verändern.
+/// Wrap a warning by terminal cells, preserving graphemes and preferring spaces.
 ///
 /// # Description
 /// Reine Anzeigehilfe für lange Hinweiszeilen in den nicht umbrechenden
 /// Listen-Phasen (siehe [`selected_line_index`]). Der Ursprungstext bleibt
-/// wortgleich erhalten — es werden nur Zeilenumbrüche eingefügt.
+/// inhaltlich erhalten; lange Wörter werden nur an Graphemgrenzen umgebrochen.
 fn wrap_warning(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
         let extra = usize::from(!current.is_empty());
-        if !current.is_empty() && current.chars().count() + extra + word.chars().count() > width {
+        if !current.is_empty() && current.width() + extra + word.width() > width {
             lines.push(std::mem::take(&mut current));
         }
         if !current.is_empty() {
             current.push(' ');
         }
-        current.push_str(word);
+        // Split long CJK runs/URLs only at grapheme boundaries. A grapheme wider
+        // than the entire viewport is retained intact for ratatui to clip.
+        for grapheme in word.graphemes(true) {
+            if !current.is_empty() && current.width() + grapheme.width() > width {
+                lines.push(std::mem::take(&mut current));
+            }
+            current.push_str(grapheme);
+        }
     }
     if !current.is_empty() {
         lines.push(current);
@@ -1262,6 +1426,204 @@ mod tests {
     /// Erzeugt einen `Press`-Tastenanschlag ohne Modifier.
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn rendered(app: &mut SetupApp, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| render_frame(frame, app))
+            .expect("draw setup");
+        crate::test_support::display_buffer_text(terminal.backend().buffer())
+    }
+
+    fn body_text(app: &SetupApp) -> String {
+        body_lines_at_width(app, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn explicit_setup_language_renders_english_japanese_and_hindi_without_a_scope() {
+        let mut app =
+            crate::i18n::with_language(UiLanguage::German, || SetupApp::new(vec![groq_provider()]));
+        let english = rendered(&mut app, 100, 18);
+        assert!(english.contains("Setup"));
+        assert!(english.contains("Provider  (Esc cancels)"));
+        app.set_language(UiLanguage::Japanese);
+        let japanese = rendered(&mut app, 100, 18);
+        assert!(japanese.contains("セットアップ"));
+        assert!(japanese.contains("絞り込み:"));
+        assert!(japanese.contains("Groq (groq)"));
+        app.set_language(UiLanguage::Hindi);
+        let hindi = rendered(&mut app, 100, 18);
+        assert!(hindi.contains("सेटअप"));
+        assert!(hindi.contains("फ़िल्टर:"));
+        assert_eq!(crate::i18n::tr("setup.title", "Setup"), "Setup");
+    }
+
+    #[test]
+    fn cached_validation_and_auth_choices_retranslate_without_resetting_payload_or_state() {
+        let mut app = SetupApp::new_for(UiLanguage::Japanese, vec![anthropic_provider()]);
+        app.on_key(press(KeyCode::Enter));
+        app.endpoint_input = "invalid-{model}".into();
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.validation_error, Some(ValidationError::Endpoint));
+        assert!(body_text(&app).contains("プレースホルダー"));
+        app.set_language(UiLanguage::German);
+        assert!(body_text(&app).contains("Vollständige HTTP(S)"));
+        assert_eq!(app.endpoint_input, "invalid-{model}");
+        app.on_paste("https://api.anthropic.com/v1".into());
+        app.on_key(press(KeyCode::Enter));
+        force_anthropic_options(&mut app);
+        app.on_key(press(KeyCode::Down));
+        app.on_paste("sk-ant-oat-secret-{source}-नमस्ते".into());
+        app.scroll = 1;
+        let before = (
+            app.auth_options.clone(),
+            app.selected,
+            app.scroll,
+            app.auth_editing,
+            app.api_key.clone(),
+        );
+        app.set_language(UiLanguage::Japanese);
+        let text = body_text(&app);
+        assert!(text.contains("セットアップトークン"));
+        assert!(text.contains("claude-setup-token"));
+        assert!(text.contains("harw auth login"));
+        assert!(!text.contains("sk-ant-oat-secret"));
+        assert!(app.oauth_warning().expect("warning").contains("2026年6月"));
+        assert_eq!(
+            before,
+            (
+                app.auth_options.clone(),
+                app.selected,
+                app.scroll,
+                app.auth_editing,
+                app.api_key.clone()
+            )
+        );
+        app.on_key(press(KeyCode::Enter));
+        app.on_paste("@cf/model-{source}-模型".into());
+        app.set_language(UiLanguage::Hindi);
+        assert!(body_text(&app).contains("@cf/model-{source}-模型"));
+        app.on_key(press(KeyCode::Enter));
+        let outcome = app.outcome().expect("completed");
+        assert_eq!(outcome.model, "@cf/model-{source}-模型");
+        assert_eq!(
+            outcome.secret_ref.as_deref(),
+            Some("sk-ant-oat-secret-{source}-नमस्ते")
+        );
+        assert_eq!(outcome.api, "anthropic-messages");
+        assert_eq!(outcome.base_url, "https://api.anthropic.com/v1");
+        assert!(body_text(&app).contains("सेटअप पूरा हुआ।"));
+    }
+
+    #[test]
+    fn detected_source_payload_and_validation_semantics_survive_locale_changes() {
+        let detected = DetectedCredential {
+            source: harw_model_catalog::sources::CredentialSource {
+                id: "source-{reference}-模型".into(),
+                provider: "groq".into(),
+                path: "/payload/{source}".into(),
+                extract: harw_model_catalog::sources::ExtractRule::WholeFile,
+                kind: harw_model_catalog::sources::SourceKind::ApiKey,
+            },
+            exists: true,
+            secret_ref: "file:/payload/秘密-{source}".into(),
+        };
+        let mut app = SetupApp::new(vec![groq_provider()]);
+        app.on_key(press(KeyCode::Enter));
+        app.on_key(press(KeyCode::Enter));
+        app.auth_options = vec![AuthOption::Detected(detected.clone()), AuthOption::ApiKey];
+        for language in UiLanguage::ALL {
+            app.set_language(language);
+            let text = body_text(&app);
+            assert!(text.contains(&detected.source.id));
+            assert!(text.contains(&detected.secret_ref));
+        }
+        app.selected = 1;
+        app.on_paste("  ".into());
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.stage, SetupStage::Auth);
+        assert_eq!(app.validation_error, Some(ValidationError::Secret));
+        app.set_language(UiLanguage::Japanese);
+        assert!(body_text(&app).contains("シークレット参照が必要"));
+        app.selected = 0;
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(
+            app.secret_ref.as_deref(),
+            Some(detected.secret_ref.as_str())
+        );
+        app.model_options.clear();
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.stage, SetupStage::Model);
+        assert_eq!(app.validation_error, Some(ValidationError::Model));
+        app.set_language(UiLanguage::English);
+        assert!(body_text(&app).contains("A model ID / deployment name is required."));
+    }
+
+    #[test]
+    fn every_language_renders_all_stages_in_narrow_buffers_and_keeps_navigation() {
+        for language in UiLanguage::ALL {
+            let mut app = SetupApp::new_for(language, vec![groq_provider(), ollama_provider()]);
+            app.on_key(press(KeyCode::Down));
+            for stage in [
+                SetupStage::Provider,
+                SetupStage::Endpoint,
+                SetupStage::Api,
+                SetupStage::Auth,
+                SetupStage::Model,
+                SetupStage::Done,
+            ] {
+                app.stage = stage;
+                app.auth_options = vec![AuthOption::ApiKey, AuthOption::Custom];
+                app.model_options = vec!["模型-a".into(), "नमस्ते-b".into()];
+                for width in [1, 2, 8, 24, 80, 120] {
+                    let _ = rendered(&mut app, width, 12);
+                    assert_eq!(app.stage, stage);
+                    assert_eq!(app.selected, 1);
+                }
+            }
+            app.stage = SetupStage::Model;
+            app.on_key(press(KeyCode::Up));
+            assert_eq!(app.selected, 0);
+            app.on_key(press(KeyCode::Down));
+            assert_eq!(app.selected, 1);
+            let _ = rendered(&mut app, 24, 7);
+            assert_eq!(app.scroll, follow_scroll(0, 4, 2));
+        }
+    }
+
+    #[test]
+    fn warning_wrap_measures_cells_and_keeps_graphemes() {
+        for text in [
+            "日本語の長い警告文です",
+            "नमस्ते दुनिया",
+            "e\u{301}e\u{301}e\u{301}",
+            "https://example.test/long",
+        ] {
+            for width in [1, 2, 8, 24, 80] {
+                let lines = wrap_warning(text, width);
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| line.width() <= width || line.graphemes(true).count() == 1)
+                );
+                // Wrapping may replace word separators with newlines, but never
+                // changes or splits the original visible grapheme sequence.
+                let visible = |value: &str| {
+                    value
+                        .graphemes(true)
+                        .filter(|g| !g.chars().all(char::is_whitespace))
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(visible(&lines.join("")), visible(text));
+            }
+        }
     }
 
     #[test]
@@ -1442,7 +1804,7 @@ mod tests {
         app.auth_options = vec![
             AuthOption::ApiKey,
             AuthOption::OAuth {
-                label: "OAuth/Setup-Token: claude-setup-token".to_owned(),
+                source_id: "claude-setup-token".to_owned(),
                 secret_ref: "env:CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
             },
         ];
@@ -1659,7 +2021,7 @@ mod tests {
         // selben Modul zugänglich).
         app.stage = SetupStage::Auth;
         app.auth_options = vec![AuthOption::OAuth {
-            label: "OAuth/Setup-Token: test-source (via `harw auth login`)".to_owned(),
+            source_id: "test-source".to_owned(),
             secret_ref: "env:TEST_OAUTH_TOKEN".to_owned(),
         }];
         app.selected = 0;
@@ -1691,7 +2053,7 @@ mod tests {
         let mut app = SetupApp::new(vec![groq_provider()]);
         app.stage = SetupStage::Auth;
         app.auth_options = vec![AuthOption::OAuth {
-            label: "OAuth/Setup-Token: fallback".to_owned(),
+            source_id: "fallback".to_owned(),
             secret_ref: "env:FALLBACK_TOKEN".to_owned(),
         }];
         app.selected = 0;

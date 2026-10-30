@@ -110,7 +110,8 @@ pub fn run(path_var: Option<OsString>, args: &WhichArgs) -> ToolOutput {
     name = "sys.which",
     description = "Locates executables in the agent's PATH like which: for each plain command name the first match (or every match with all=true, -a) that is an executable regular file. Use when you need to know whether and where a tool is installed instead of running which or command -v. Returns JSON {results:[{name, found, paths}], missing}. Relative PATH entries are skipped; names with '/' are rejected. Read-only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_which(
     _context: &ToolExecutionContext,

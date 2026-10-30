@@ -133,6 +133,7 @@ pub struct ToolExecutionContext {
     turn_id: TurnId,
     sandbox: SandboxSpec,
     cancel: Option<CancelToken>,
+    lifetime_guard: Option<crate::ToolLifetimeGuard>,
 }
 
 impl ToolExecutionContext {
@@ -143,6 +144,7 @@ impl ToolExecutionContext {
             turn_id,
             sandbox,
             cancel: None,
+            lifetime_guard: None,
         }
     }
 
@@ -160,6 +162,21 @@ impl ToolExecutionContext {
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = Some(cancel);
         self
+    }
+
+    /// Retains an admitted effect's lease across cloned execution contexts.
+    /// This does not grant authority; executors must copy it into detached or
+    /// blocking work rather than releasing it when an async future is aborted.
+    #[must_use]
+    pub fn with_lifetime_guard(mut self, guard: Option<crate::ToolLifetimeGuard>) -> Self {
+        self.lifetime_guard = guard;
+        self
+    }
+
+    /// The opaque lifetime guard, if this call was admitted with one.
+    #[must_use]
+    pub fn lifetime_guard(&self) -> Option<&crate::ToolLifetimeGuard> {
+        self.lifetime_guard.as_ref()
     }
 
     #[must_use]
@@ -190,7 +207,7 @@ impl ToolExecutionContext {
     }
 }
 
-/// Compares every field except [`ToolExecutionContext::cancel`].
+/// Compares identity/authority fields, excluding cancellation and lifetime guards.
 ///
 /// `cancel` is a volatile per-call handle (a live [`CancelToken`], which
 /// itself has no `PartialEq` impl — it wraps a
@@ -216,6 +233,12 @@ pub trait ToolExecutor: Send + Sync {
     /// The context is mandatory so an executor cannot accidentally run with
     /// ambient host authority. Callers must fail closed when they have not
     /// established a server-side sandbox for the active session.
+    ///
+    /// Work that may outlive this future (especially `spawn_blocking`) must
+    /// retain a cloned context or its [`ToolExecutionContext::lifetime_guard`]
+    /// until its final side effect. Dropping an async future does not stop a
+    /// blocking closure. The guard preserves an existing admission lifetime;
+    /// it is not new authority, a cancellation mechanism or a quiescence receipt.
     fn execute<'a>(
         &'a self,
         context: &'a ToolExecutionContext,

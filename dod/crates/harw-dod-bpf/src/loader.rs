@@ -22,7 +22,8 @@
 //!   `CAP_BPF`, statt zu scheitern.
 //!
 //! # Exportierte Typen
-//! [`BpfLoader`].
+//! [`BpfLoader`], [`BpfScopeWriter`] (incremental updates of the scope map of
+//! objects that are already attached, PL-97 E3b).
 //!
 //! # Nebenläufigkeit
 //! `BpfLoader: Send + Sync`: ein Sentinel hält Lader hinter `Arc` und ruft
@@ -67,6 +68,7 @@ use std::time::Duration;
 use crate::error::BpfError;
 use crate::event::RawBpfEvent;
 use crate::handle::BpfHandle;
+use crate::profile::ScopeDelta;
 use crate::spec::BpfProgramSpec;
 
 /// Ein Ziel, in das eBPF-Programme geladen und aus dem Ereignisse gelesen werden.
@@ -122,6 +124,36 @@ pub trait BpfLoader: Send + Sync {
         handle: &BpfHandle,
         timeout: Duration,
     ) -> Result<Vec<RawBpfEvent>, BpfError>;
+}
+
+/// Incremental writer for the `SCOPE_CGROUP_IDS` map of an attached object.
+///
+/// # Description
+/// Separate from [`BpfLoader`] because only loaders that attach
+/// contract objects with a cgroup scope ([`crate::real::RealBpfLoader`],
+/// [`crate::fixture::FixtureBpfLoader`]) can honour it. A probe that rescans
+/// a profile's `include_descendants = true` roots applies the same
+/// [`ScopeDelta`] to every handle it loaded with that scope.
+///
+/// # Concurrency
+/// `Send + Sync`, `&self`, like [`BpfLoader`].
+pub trait BpfScopeWriter: Send + Sync {
+    /// Applies `delta` to the scope map of the object behind `handle`:
+    /// removals first, then insertions. Removing an absent id and inserting
+    /// a present id are no-ops, so a delta can be re-applied as a whole.
+    ///
+    /// # Errors
+    /// - [`BpfError::InvalidProgramContract`]: `delta` fails
+    ///   [`ScopeDelta::validate`]; the object was attached with a fixed
+    ///   scope, i.e. [`crate::BpfScope::Host`] or a
+    ///   [`crate::BpfScope::Cgroups`] without `include_descendants` (a fixed
+    ///   scope is never narrowed or widened incrementally, not even by an
+    ///   empty delta); or `delta` removes one of the explicit roots (the
+    ///   scope's `groups`). Nothing is changed in these cases.
+    /// - [`BpfError::UnknownHandle`]: `handle` is not loaded here.
+    /// - [`BpfError::ScopeMapUpdateFailed`]: the kernel rejected an update;
+    ///   entries applied before it stay applied.
+    fn apply_scope_delta(&self, handle: &BpfHandle, delta: &ScopeDelta) -> Result<(), BpfError>;
 }
 
 #[cfg(test)]

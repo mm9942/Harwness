@@ -352,6 +352,19 @@ pub enum PlanError {
         actual: String,
     },
 
+    /// Another process/instance owns the nonblocking root lock; retry later.
+    #[msg("Plan store is contended")]
+    StoreContended,
+
+    /// Publication or its rollback could not be durably established. Do not
+    /// retry blindly; reopen under the root lock and inspect the revision.
+    #[msg("Plan commit outcome is indeterminate for '{path}'; recover before retry")]
+    CommitIndeterminate { path: String },
+
+    /// This instance observed an indeterminate commit and must be reopened.
+    #[msg("Plan store requires locked recovery before further operations")]
+    StoreRecoveryRequired,
+
     /// I/O-Fehler (für `FilePlanStore`).
     #[msg("I/O-Fehler: {0}")]
     #[from]

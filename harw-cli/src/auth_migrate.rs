@@ -206,15 +206,15 @@ pub(crate) fn migrate(
             remaining.push(reference.clone());
             continue;
         }
-        if let Location::Pool { provider, .. } = &occurrence.location {
-            if provider.contains('.') {
-                report.lines.push(format!(
-                    "{} — bleibt (Providername mit '.' kann nicht umgeschrieben werden)",
-                    occurrence.describe()
-                ));
-                remaining.push(reference.clone());
-                continue;
-            }
+        if let Location::Pool { provider, .. } = &occurrence.location
+            && provider.contains('.')
+        {
+            report.lines.push(format!(
+                "{} — bleibt (Providername mit '.' kann nicht umgeschrieben werden)",
+                occurrence.describe()
+            ));
+            remaining.push(reference.clone());
+            continue;
         }
         let key = reference.as_ref_string();
         if sources.contains_key(&key) {

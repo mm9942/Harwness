@@ -92,6 +92,11 @@ pub const KANBAN_JOB_KIND: &str = "kanban_card";
 /// liegt im Sidecar `<jobs>/work_driver/<work-id>.json`.
 pub const WORK_DRIVER_JOB_KIND: &str = "work_driver";
 
+/// `JobKind::Custom`-Diskriminator der Intent-Zyklus-Jobs (PL-90),
+/// wortgleich zu `harw_plan_bridge::INTENT_CYCLE_JOB_KIND`; ausgeführt vom
+/// Job-Worker in `harw-cli` (`job_worker_intent_cycle.rs`).
+pub const INTENT_CYCLE_JOB_KIND: &str = harw_plan_bridge::INTENT_CYCLE_JOB_KIND;
+
 /// Präfix des `JobOutcome::Blocked`-Grunds, hinter dem das [`BlockKind`]-Label steht.
 pub const KANBAN_BLOCK_REASON_PREFIX: &str = "kanban:";
 
@@ -246,6 +251,7 @@ impl JobTransitions for JobStoreTransitions {
                 base_delay: SignedDuration::ZERO,
                 factor: 1.0,
                 max_delay: SignedDuration::ZERO,
+                jitter: 0.0,
             },
             now,
         );
@@ -546,6 +552,7 @@ mod tests {
                 base_delay: SignedDuration::ZERO,
                 factor: 1.0,
                 max_delay: SignedDuration::ZERO,
+                jitter: 0.0,
             },
             now,
         );

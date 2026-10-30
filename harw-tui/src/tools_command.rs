@@ -35,6 +35,7 @@
 //! assert!(matches!(outcome, ToolsCommandOutcome::Listing(_)));
 //! ```
 
+use crate::i18n::{tr, tr_args};
 use harw_core::activation::{SessionActivation, ToolProfile};
 use harw_extension_api::ToolName;
 
@@ -81,7 +82,11 @@ impl ToolsCommandOutcome {
         match self {
             Self::Listing(lines) => lines,
             Self::Confirmation(msg) => vec![msg],
-            Self::Error(msg) => vec![format!("[tools error] {msg}")],
+            Self::Error(msg) => vec![tr_args(
+                "command_feedback.tools_error",
+                "[tools error] {message}",
+                &[("message", &msg)],
+            )],
         }
     }
 }
@@ -181,9 +186,7 @@ pub fn dispatch_tools_command_bounded(
         ["reset", name] => bounded_reset_one(activation, ceiling, name),
         ["profile", p] => bounded_set_profile(activation, ceiling, tool_snapshot, p),
         _ => ToolsCommandOutcome::Error(
-            "usage: /tools | /tools on <name> | /tools off <name> \
-             | /tools reset [<name>] | /tools profile <minimal|coding|full>"
-                .to_string(),
+            tr("command_feedback.tools_usage", "Usage: /tools | /tools on <name> | /tools off <name> | /tools reset [<name>] | /tools profile <minimal|coding|full>").to_owned(),
         ),
     }
 }
@@ -214,14 +217,22 @@ fn list_from_snapshot(
     activation: &SessionActivation,
 ) -> ToolsCommandOutcome {
     let mut lines = Vec::new();
-    lines.push(format!("profile: {:?}", activation.profile()));
+    lines.push(tr_args(
+        "command_feedback.profile",
+        "Profile: {profile}",
+        &[("profile", &format!("{:?}", activation.profile()))],
+    ));
 
     if snapshot.is_empty() {
-        lines.push("  (no tools registered)".to_string());
+        lines.push(tr("command_feedback.no_tools", "  (no tools registered)").to_owned());
     } else {
         for (name, enabled) in snapshot {
-            let mark = if *enabled { "on " } else { "off" };
-            lines.push(format!("  [{}] {}", mark, name));
+            let mark = if *enabled {
+                tr("command_feedback.on", "on")
+            } else {
+                tr("command_feedback.off", "off")
+            };
+            lines.push(format!("  [{mark:<3}] {name}"));
         }
     }
 
@@ -245,10 +256,18 @@ fn set_tool(activation: &mut SessionActivation, name: &str, on: bool) -> ToolsCo
     let tool_name = ToolName::new(name.to_string());
     if on {
         activation.enable_tool(tool_name);
-        ToolsCommandOutcome::Confirmation(format!("enabled {name}"))
+        ToolsCommandOutcome::Confirmation(tr_args(
+            "command_feedback.enabled",
+            "Enabled {name}",
+            &[("name", name)],
+        ))
     } else {
         activation.disable_tool(tool_name);
-        ToolsCommandOutcome::Confirmation(format!("disabled {name}"))
+        ToolsCommandOutcome::Confirmation(tr_args(
+            "command_feedback.disabled",
+            "Disabled {name}",
+            &[("name", name)],
+        ))
     }
 }
 
@@ -277,7 +296,7 @@ fn bounded_set_tool(
     if let Err(err) =
         crate::runtime_commands::validate_tool_toggle(ceiling, known_tools, name, enable)
     {
-        return ToolsCommandOutcome::Error(err.to_string());
+        return ToolsCommandOutcome::Error(err.present());
     }
     set_tool(activation, name, enable)
 }
@@ -298,7 +317,13 @@ fn bounded_reset_all(
     ceiling: &SessionActivation,
 ) -> ToolsCommandOutcome {
     *activation = ceiling.clone();
-    ToolsCommandOutcome::Confirmation("reset all tool overrides to the session ceiling".to_string())
+    ToolsCommandOutcome::Confirmation(
+        tr(
+            "command_feedback.reset_all",
+            "Reset all tool overrides to the session ceiling",
+        )
+        .to_owned(),
+    )
 }
 
 /// Resets one named tool to the state the session ceiling gives it
@@ -329,8 +354,16 @@ fn bounded_reset_one(
             activation.disable_tool(tool_name);
         }
     }
-    let state = if allowed { "on" } else { "off" };
-    ToolsCommandOutcome::Confirmation(format!("reset {name} to session ceiling ({state})"))
+    let state = if allowed {
+        tr("command_feedback.on", "on")
+    } else {
+        tr("command_feedback.off", "off")
+    };
+    ToolsCommandOutcome::Confirmation(tr_args(
+        "command_feedback.reset_one",
+        "Reset {name} to session ceiling ({state})",
+        &[("name", name), ("state", state)],
+    ))
 }
 
 /// Applies a `profile <name>` switch, then cuts the resulting activation down
@@ -367,8 +400,10 @@ fn bounded_set_profile(
         "coding" => ToolProfile::Coding,
         "full" => ToolProfile::Full,
         other => {
-            return ToolsCommandOutcome::Error(format!(
-                "unknown profile '{other}' — choose: minimal, coding, full"
+            return ToolsCommandOutcome::Error(tr_args(
+                "command_feedback.unknown_profile",
+                "Unknown profile '{profile}' — choose: minimal, coding, full",
+                &[("profile", other)],
             ));
         }
     };
@@ -393,12 +428,20 @@ fn bounded_set_profile(
 
     *activation = effective;
     if withheld.is_empty() {
-        ToolsCommandOutcome::Confirmation(format!("profile set to {p}"))
+        ToolsCommandOutcome::Confirmation(tr_args(
+            "command_feedback.profile_set",
+            "Profile set to {profile}",
+            &[("profile", p)],
+        ))
     } else {
-        ToolsCommandOutcome::Confirmation(format!(
-            "profile {p} limited by session ceiling: effective profile {:?}, withheld: {}",
-            activation.profile(),
-            withheld.join(", ")
+        ToolsCommandOutcome::Confirmation(tr_args(
+            "command_feedback.profile_limited",
+            "Profile {profile} limited by session ceiling: effective profile {effective}, withheld: {tools}",
+            &[
+                ("profile", p),
+                ("effective", &format!("{:?}", activation.profile())),
+                ("tools", &withheld.join(", ")),
+            ],
         ))
     }
 }
@@ -460,7 +503,7 @@ mod tests {
         };
         assert!(!lines.is_empty(), "should have at least a profile line");
         assert!(
-            lines[0].contains("profile:"),
+            lines[0].contains("Profile:"),
             "first line should be profile header"
         );
         assert!(
@@ -519,7 +562,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            ToolsCommandOutcome::Confirmation("enabled test.alpha".to_string())
+            ToolsCommandOutcome::Confirmation("Enabled test.alpha".to_string())
         );
         assert!(activation.is_tool_enabled(&ToolName::new("test.alpha")));
     }
@@ -559,7 +602,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            ToolsCommandOutcome::Confirmation("profile set to coding".to_string())
+            ToolsCommandOutcome::Confirmation("Profile set to coding".to_string())
         );
         assert!(
             activation.is_tool_enabled(&ToolName::new("fs.read")),
@@ -586,7 +629,7 @@ mod tests {
 
         assert!(
             matches!(outcome, ToolsCommandOutcome::Error(ref msg) if msg.contains("turbo")),
-            "error should name the unknown profile"
+            "error should name the Unknown profile"
         );
         assert_eq!(activation.profile(), ToolProfile::Full);
     }
@@ -700,7 +743,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            ToolsCommandOutcome::Confirmation("disabled test.alpha".to_string())
+            ToolsCommandOutcome::Confirmation("Disabled test.alpha".to_string())
         );
         assert!(!activation.is_tool_enabled(&alpha));
     }
@@ -720,7 +763,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            ToolsCommandOutcome::Confirmation("profile set to full".to_string())
+            ToolsCommandOutcome::Confirmation("Profile set to full".to_string())
         );
         assert!(
             activation.is_tool_enabled(&ToolName::new("test.alpha")),
@@ -749,7 +792,11 @@ mod tests {
         assert_eq!(
             outcome,
             ToolsCommandOutcome::Confirmation(
-                "reset all tool overrides to the session ceiling".to_string()
+                tr(
+                    "command_feedback.reset_all",
+                    "Reset all tool overrides to the session ceiling"
+                )
+                .to_owned()
             )
         );
         assert!(
@@ -762,7 +809,7 @@ mod tests {
         );
     }
 
-    /// T2: `reset test.beta` adopts the ceiling's state for that tool — the
+    /// T2: `Reset test.beta` adopts the ceiling's state for that tool — the
     /// override that disables it (from the ceiling itself) must not be cleared
     /// into the `Full` profile default.
     #[test]
@@ -778,7 +825,7 @@ mod tests {
         assert_eq!(
             outcome,
             ToolsCommandOutcome::Confirmation(
-                "reset test.beta to session ceiling (off)".to_string()
+                "Reset test.beta to session ceiling (off)".to_string()
             )
         );
         assert!(
@@ -788,8 +835,8 @@ mod tests {
         assert!(activation.is_tool_enabled(&ToolName::new("test.alpha")));
     }
 
-    /// T2: after a full `reset` followed by `reset test.beta`, `test.beta`
-    /// is still off, and `reset test.alpha` restores a disabled but allowed
+    /// T2: after a full `reset` followed by `Reset test.beta`, `test.beta`
+    /// is still off, and `Reset test.alpha` restores a disabled but allowed
     /// tool to on.
     #[test]
     fn test_dispatch_tools_command_bounded_reset_then_reset_one_stays_within_ceiling() {
@@ -812,7 +859,7 @@ mod tests {
         assert_eq!(
             third,
             ToolsCommandOutcome::Confirmation(
-                "reset test.alpha to session ceiling (on)".to_string()
+                "Reset test.alpha to session ceiling (on)".to_string()
             )
         );
         assert!(!activation.is_tool_enabled(&beta), "test.beta stays off");
@@ -832,7 +879,7 @@ mod tests {
         let expected = crate::runtime_commands::ToolToggleError::BeyondCeiling {
             name: "test.beta".to_string(),
         }
-        .to_string();
+        .present();
 
         let outcome =
             dispatch_tools_command_bounded("on test.beta", &known, &mut activation, &ceiling);
@@ -844,7 +891,7 @@ mod tests {
     /// T7/T9(b): `profile full` under a `Minimal` + allowlist ceiling stays a
     /// subset of the ceiling for every registered tool, and the confirmation
     /// names the effective profile and the withheld tool instead of claiming
-    /// "profile set to full".
+    /// "Profile set to full".
     #[test]
     fn test_dispatch_tools_command_bounded_profile_full_reports_withheld_tools() {
         let known = both_known();
@@ -857,7 +904,7 @@ mod tests {
         assert_eq!(
             outcome,
             ToolsCommandOutcome::Confirmation(
-                "profile full limited by session ceiling: effective profile Minimal, \
+                "Profile full limited by session ceiling: effective profile Minimal, \
                  withheld: test.beta"
                     .to_string()
             )
@@ -870,5 +917,39 @@ mod tests {
             );
         }
         assert!(activation.is_tool_enabled(&ToolName::new("test.alpha")));
+    }
+    #[test]
+    fn localized_denials_keep_error_variant_and_do_not_mutate() {
+        for language in [
+            harw_config::UiLanguage::German,
+            harw_config::UiLanguage::Japanese,
+        ] {
+            let known = both_known();
+            let ceiling = bounded_ceiling();
+            let mut activation = ceiling.clone();
+            let before = activation.is_tool_enabled(&ToolName::new("test.beta"));
+            crate::i18n::with_language(language, || {
+                let outcome = dispatch_tools_command_bounded(
+                    "on test.beta",
+                    &known,
+                    &mut activation,
+                    &ceiling,
+                );
+                assert!(matches!(outcome, ToolsCommandOutcome::Error(_)));
+                let text = outcome.into_lines().join("\n");
+                assert!(text.contains("test.beta"));
+                if language == harw_config::UiLanguage::German {
+                    assert!(text.contains("Sitzungsgrenze"));
+                    assert!(text.starts_with("[Werkzeugfehler]"));
+                } else {
+                    assert!(text.contains("セッション上限"));
+                    assert!(text.starts_with("[ツールエラー]"));
+                }
+            });
+            assert_eq!(
+                activation.is_tool_enabled(&ToolName::new("test.beta")),
+                before
+            );
+        }
     }
 }

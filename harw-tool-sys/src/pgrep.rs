@@ -197,7 +197,8 @@ fn build(procfs: &ProcFs, own_pid: i32, args: &PgrepArgs) -> Result<ToolOutput, 
     name = "sys.pgrep",
     description = "Finds process IDs by regular expression like pgrep: against the name or, with full=true (-f), the masked command line; -x exact, -i ignore_case, -u user, -P ppids, -n newest, -o oldest. Use when you need the PIDs of a program instead of running pgrep. Returns JSON {pids:[...], matches:[{pid,name,ppid}], count, truncated}; the calling process is excluded, patterns are length- and size-limited. Read-only, Linux only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_pgrep(
     _context: &ToolExecutionContext,

@@ -82,6 +82,42 @@ impl TelegramClient {
         .await
     }
 
+    /// Stream a temporary partial reply in a private chat.
+    ///
+    /// Telegram treats this as an ephemeral ~30-second preview. The final
+    /// answer must still be persisted with `send_message`. Bot API 10.3
+    /// exposes the stop button through `can_stop` / `keep_on_stop`.
+    pub async fn send_message_draft(
+        &self,
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+        draft_id: i64,
+        text: &str,
+        can_stop: bool,
+        keep_on_stop: bool,
+    ) -> TransportResult<()> {
+        if chat_id <= 0 || draft_id == 0 {
+            return Err(TelegramTransportError::ApiRejected {
+                method: "sendMessageDraft",
+                code: 0,
+                description: "sendMessageDraft requires a private chat id and non-zero draft_id"
+                    .to_owned(),
+            });
+        }
+        self.call_ok(
+            "sendMessageDraft",
+            SendMessageDraftRequest {
+                chat_id,
+                message_thread_id,
+                draft_id,
+                text,
+                can_stop,
+                keep_on_stop,
+            },
+        )
+        .await
+    }
+
     /// Replace the text of an existing message.
     pub async fn edit_message_text(
         &self,
@@ -211,6 +247,15 @@ impl TelegramClient {
         .await
     }
 
+    /// Liest die von Telegram aktuell gespeicherte Befehlsliste eines Scopes.
+    pub async fn get_my_commands(
+        &self,
+        scope: &BotCommandScope,
+    ) -> TransportResult<Vec<BotCommand>> {
+        self.call("getMyCommands", GetMyCommandsRequest { scope })
+            .await
+    }
+
     /// Entfernt die Befehlsliste eines [`BotCommandScope`]; Telegram fällt
     /// danach auf den nächstallgemeineren Scope zurück.
     pub async fn delete_my_commands(&self, scope: &BotCommandScope) -> TransportResult<()> {
@@ -277,16 +322,16 @@ impl TelegramClient {
         allowed_updates: &[&str],
         drop_pending_updates: bool,
     ) -> TransportResult<()> {
-        if let Some(secret_token) = secret_token {
-            if !is_valid_webhook_secret(secret_token) {
-                return Err(TelegramTransportError::ApiRejected {
-                    method: "setWebhook",
-                    code: 0,
-                    description:
-                        "webhook secret token must be 1-256 ASCII characters from [A-Za-z0-9_-]"
-                            .to_owned(),
-                });
-            }
+        if let Some(secret_token) = secret_token
+            && !is_valid_webhook_secret(secret_token)
+        {
+            return Err(TelegramTransportError::ApiRejected {
+                method: "setWebhook",
+                code: 0,
+                description:
+                    "webhook secret token must be 1-256 ASCII characters from [A-Za-z0-9_-]"
+                        .to_owned(),
+            });
         }
         self.call_ok(
             "setWebhook",
@@ -425,6 +470,19 @@ struct SendMessageRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct SendMessageDraftRequest<'a> {
+    chat_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_thread_id: Option<i64>,
+    draft_id: i64,
+    // Bot API 10.3: ein explizites `""` zeigt den nativen
+    // "Thinking…"-Platzhalter; daher nicht per serde auslassen.
+    text: &'a str,
+    can_stop: bool,
+    keep_on_stop: bool,
+}
+
+#[derive(Serialize)]
 struct EditMessageTextRequest<'a> {
     chat_id: i64,
     message_id: i64,
@@ -454,6 +512,11 @@ struct SetMyCommandsRequest<'a> {
 #[derive(Serialize)]
 struct SetMyCommandsScopedRequest<'a> {
     commands: &'a [BotCommand],
+    scope: &'a BotCommandScope,
+}
+
+#[derive(Serialize)]
+struct GetMyCommandsRequest<'a> {
     scope: &'a BotCommandScope,
 }
 

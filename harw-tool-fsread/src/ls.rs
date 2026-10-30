@@ -480,7 +480,8 @@ pub fn run(root: &Path, args: &LsArgs) -> ToolOutput {
     name = "fsread.ls",
     description = "Lists a directory or entry inside the workspace like ls: -a/-A, -l (type, permissions, owner, size, mtime), -h, -R with max_depth, -S/-t/--sort, -r, --group-directories-first, -L. Use when you need names, sizes or timestamps of directory contents instead of running ls. Returns JSON {entries:[{path,name,type,...}], count, truncated}; output is bounded (default 200 entries, hard 5000) and sorted by name unless told otherwise. Never leaves the workspace and never follows symlinks out of it.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_ls(context: &ToolExecutionContext, args: LsArgs) -> Result<ToolOutput, ToolsError> {
     let root = workspace_root(context);

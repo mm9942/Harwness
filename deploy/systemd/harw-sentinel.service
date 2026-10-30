@@ -1,4 +1,4 @@
-# harw-sentinel.service -- DoD collection point, class "unprivileged".
+# harw-sentinel.service -- Harw-DoD collection point, class "unprivileged".
 #
 # Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Embedded
 # byte-identically into harw-install and rendered by dod/scripts/install.sh,
@@ -14,9 +14,18 @@
 # Landlock asymmetry (decision no. 4): this binary DEGRADES without Landlock
 # (SensorDegraded event, harw-sentinel/src/sandbox.rs); the unit does not
 # enforce a Landlock precondition.
+#
+# Configuration and exports (PL-97 D1): --config names the system DoD
+# configuration explicitly, so a missing or untrusted config.toml is fail
+# closed (as for harw-probe-bpf). --findings-export appends certified
+# findings as JSON lines (schema version 2) and --health-export rewrites the
+# sentinel's health document atomically every poll cycle; both live in the
+# export directory below the state directory, which tmpfiles.d/harw.conf
+# creates as 2750 harw-sentinel:harw-dod-readers (setgid, so the files are
+# group-readable by harw-dod-readers members). No capability is involved.
 
 [Unit]
-Description=HARW DoD sentinel -- unprivileged collection point
+Description=Harw-DoD sentinel -- unprivileged collection point
 Documentation=man:harw-sentinel(1)
 PartOf=harw-dod.target
 After=local-fs.target
@@ -31,7 +40,7 @@ Type=simple
 User=harw-sentinel
 Group=harw-sentinel
 # harw-ipc: create sentinel.sock in /run/harw (see tmpfiles.d/harw.conf).
-# harw-dod-config: read-only access to SYSCONFDIR/config.toml.
+# harw-dod-config: read-only access to the DoD config.toml (--config).
 SupplementaryGroups=harw-ipc harw-dod-config
 UMask=0007
 # harw-sentinel/src/ipc.rs binds the SOCK_SEQPACKET socket without an
@@ -39,10 +48,11 @@ UMask=0007
 # (tmpfiles.d/harw.conf), so the socket is created as
 # harw-sentinel:harw-ipc; UMask=0007 yields 0770 -- the probes (members of
 # harw-ipc) may connect, nobody else may.
-ExecStart=@LIBEXECDIR@/harw-sentinel --log info --home @STATEDIR@ --socket /run/harw/sentinel.sock
+ExecStart=@LIBEXECDIR@/harw-sentinel --log info --config @SYSCONFDIR@/config.toml --home @STATEDIR@ --socket /run/harw/sentinel.sock --findings-export @STATEDIR@/export/findings.jsonl --health-export @STATEDIR@/export/health.json
 ReadWritePaths=@STATEDIR@ @LOGDIR@ /run/harw
 # ProtectSystem=strict makes /run read-only as well; these three paths are
-# the only writable locations (state, telemetry, socket). The directories are
+# the only writable locations (state including the export directory,
+# telemetry, socket). The directories are
 # created by tmpfiles.d/harw.conf, not by RuntimeDirectory=: /run/harw is
 # shared with harw-warden.socket and the infra daemons and must not vanish
 # when this one service stops.

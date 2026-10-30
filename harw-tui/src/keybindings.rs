@@ -19,8 +19,24 @@
 //! show_help = "F1"
 //! scroll_panel_up = "ctrl+up"
 //! scroll_panel_down = "ctrl+down"
+//! focus_jobs = "alt+j"
+//! focus_finished = "alt+f"
+//! toggle_live_detail = "alt+l"
 //! end_host_mode = []
 //! ```
+//!
+//! Mission Control (PL-97 C2): `focus_jobs` (Standard `Alt+J`) und
+//! `focus_finished` (`Alt+F`) fokussieren das Jobs- bzw.
+//! Finished/Failed-Fenster (ohne eigenes Fenster das Agenten-Panel),
+//! `toggle_live_detail` (`Alt+L`) öffnet/schließt die Detailansicht des
+//! Agenten, den das LIVE-Fenster zeigt. `Ctrl+J` bleibt der Zeilenumbruch.
+//! Diese drei Voreinstellungen kamen nach bestehenden Keybindings-Dateien
+//! hinzu ([`KeyAction::default_yields`]): belegt eine Datei einen ihrer
+//! Chords für eine andere Aktion (etwa `scroll_panel_down = "alt+j"`),
+//! gewinnt die Datei und die nicht genannte Mission-Aktion verliert nur
+//! diesen Chord — die Datei bleibt gültig. Mit leerem Composer gilt `Alt+F`
+//! als `focus_finished`; enthält der fokussierte Composer Text, bleibt
+//! `Alt+F` dort „Wort vorwärts“.
 //!
 //! `scroll_panel_up`/`scroll_panel_down` (Standard `Ctrl+↑`/`Ctrl+↓`)
 //! scrollen ohne Fokuswechsel: bei offenem Dialog (Freigabe, sudo,
@@ -32,8 +48,12 @@
 //! Fest (nicht umbelegbar) im fokussierten Agenten-Panel (`F4`): `↑`/`↓`,
 //! `k`/`j` und `w`/`s` wählen, `Bild↑`/`Bild↓` blättern, `Pos1`/`Ende`
 //! springen, `Enter` öffnet Details bzw. klappt die Sammelzeile der
-//! fertigen Agenten auf, `f` klappt sie auf/zu, `c` quittiert Fehlschläge.
-//! `w`/`s` gelten nur dort — im Composer bleiben es normale Buchstaben.
+//! fertigen Agenten auf, `f` klappt sie auf/zu, `c` quittiert Fehlschläge,
+//! `p` heftet den gewählten Agenten an das LIVE-Fenster (erneut: lösen).
+//! `w`/`s` gelten nur dort — im Composer bleiben es normale Buchstaben. Im
+//! fokussierten Jobs-Fenster wählen `↑`/`↓`/`k`/`j` (Bild↑↓, Pos1/Ende),
+//! `Enter` öffnet die Job-Details; im Finished/Failed-Fenster klappen
+//! `Enter`/`f` die Kategorien auf/zu, `c` quittiert Fehlschläge.
 //!
 //! Nicht genannte Aktionen behalten ihre Voreinstellung
 //! ([`KeyBindings::default`], identisch zur bisher fest verdrahteten
@@ -49,7 +69,8 @@
 //! einzelnes Zeichen (`ctrl++` ist `ctrl` + `+`). `shift+tab` wird wie
 //! `backtab` behandelt, weil Terminals diese Kombination so melden.
 //!
-//! Nicht umbelegbar sind bewusst: `Ctrl+C`/`Ctrl+D` (Notausstieg), `Esc`
+//! Nicht umbelegbar sind bewusst: `Ctrl+C`/`Ctrl+D` (Notausstieg; 2× `Ctrl+C`
+//! ist der feste Not-Aus, siehe `crate::hard_kill`), `Esc`
 //! (kontextabhängiges Schließen/Zurück), `Enter` samt `Shift/Alt+Enter`
 //! sowie Tasten innerhalb von Dialogen und Overlays.
 
@@ -121,11 +142,18 @@ pub(crate) enum KeyAction {
     /// Bildschirm vollständig neu zeichnen (Standard `Ctrl+L`), falls der
     /// Terminal-Emulator Zeichenbreiten anders zählt und Reste stehen bleiben.
     RedrawScreen,
+    /// Focus the Active Jobs window (default `Alt+J`; PL-97 C2).
+    FocusJobs,
+    /// Focus the Finished / Failed window (default `Alt+F`; PL-97 C2).
+    FocusFinished,
+    /// Open or close the detail view of the agent the LIVE window shows
+    /// (default `Alt+L`; PL-97 C2).
+    ToggleLiveDetail,
 }
 
 impl KeyAction {
     /// Alle Aktionen in fester Reihenfolge (auch Vorrang bei Gleichstand).
-    pub(crate) const ALL: [Self; 19] = [
+    pub(crate) const ALL: [Self; 22] = [
         Self::ToggleExplorer,
         Self::ToggleAgents,
         Self::CycleFocus,
@@ -145,6 +173,9 @@ impl KeyAction {
         Self::ScrollPanelUp,
         Self::ScrollPanelDown,
         Self::RedrawScreen,
+        Self::FocusJobs,
+        Self::FocusFinished,
+        Self::ToggleLiveDetail,
     ];
 
     /// Name der Aktion in der Keybindings-Datei.
@@ -169,32 +200,72 @@ impl KeyAction {
             Self::ScrollPanelUp => "scroll_panel_up",
             Self::ScrollPanelDown => "scroll_panel_down",
             Self::RedrawScreen => "redraw_screen",
+            Self::FocusJobs => "focus_jobs",
+            Self::FocusFinished => "focus_finished",
+            Self::ToggleLiveDetail => "toggle_live_detail",
         }
     }
 
-    /// Deutsche Kurzbeschreibung für Hilfe und Tastenübersicht.
-    pub(crate) const fn label_de(self) -> &'static str {
+    /// Localized short description for help and key binding summaries.
+    pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::ToggleExplorer => "Explorer ein-/ausblenden",
-            Self::ToggleAgents => "Agenten-Panel ein-/ausblenden",
-            Self::CycleFocus => "Fokus reihum wechseln",
-            Self::MaximizePanel => "Fokussiertes Panel im Vollbild",
-            Self::FocusExplorer => "Explorer fokussieren",
-            Self::ToggleToolCells => "Werkzeugzellen auf-/zuklappen",
-            Self::EndHostMode => "Host-Arbeitsphase beenden",
-            Self::DeleteLine => "Eingabezeile löschen",
-            Self::InsertNewline => "Neue Zeile in der Eingabe",
-            // Runde 5, Teil F: die vierte Stufe ist der Plan-Modus.
-            Self::CyclePermissionMode => "Freigabe wechseln: ask → auto → full → plan",
-            Self::ToggleWorkbench => "Workbench ein-/ausblenden",
-            Self::OpenKanban => "Kanban-Board öffnen",
-            Self::OpenModePicker => "Modus und Freigabe wählen",
-            Self::OpenModels => "Modelle je Rolle anzeigen",
-            Self::ShowHelp => "Hilfe anzeigen",
-            Self::OpenMatrix => "Matrix-Game-Panel öffnen",
-            Self::ScrollPanelUp => "Agenten-Panel/Dialogtext nach oben scrollen",
-            Self::ScrollPanelDown => "Agenten-Panel/Dialogtext nach unten scrollen",
-            Self::RedrawScreen => "Bildschirm vollständig neu zeichnen",
+            Self::ToggleExplorer => {
+                crate::i18n::tr("help.action.toggle_explorer", "Show/hide explorer")
+            }
+            Self::ToggleAgents => {
+                crate::i18n::tr("help.action.toggle_agents", "Show/hide agent panel")
+            }
+            Self::CycleFocus => crate::i18n::tr("help.action.cycle_focus", "Cycle focus"),
+            Self::MaximizePanel => {
+                crate::i18n::tr("help.action.maximize_panel", "Maximize focused panel")
+            }
+            Self::FocusExplorer => crate::i18n::tr("help.action.focus_explorer", "Focus explorer"),
+            Self::ToggleToolCells => crate::i18n::tr(
+                "help.action.toggle_tool_cells",
+                "Expand/collapse tool cells",
+            ),
+            Self::EndHostMode => {
+                crate::i18n::tr("help.action.end_host_mode", "End host work phase")
+            }
+            Self::DeleteLine => crate::i18n::tr("help.action.delete_line", "Delete input line"),
+            Self::InsertNewline => {
+                crate::i18n::tr("help.action.insert_newline", "Insert input newline")
+            }
+            Self::CyclePermissionMode => crate::i18n::tr(
+                "help.action.cycle_permission_mode",
+                "Cycle approval: ask → auto → full → plan",
+            ),
+            Self::ToggleWorkbench => {
+                crate::i18n::tr("help.action.toggle_workbench", "Show/hide workbench")
+            }
+            Self::OpenKanban => crate::i18n::tr("help.action.open_kanban", "Open Kanban board"),
+            Self::OpenModePicker => {
+                crate::i18n::tr("help.action.open_mode_picker", "Choose mode and approval")
+            }
+            Self::OpenModels => crate::i18n::tr("help.action.open_models", "Show models by role"),
+            Self::ShowHelp => crate::i18n::tr("help.action.show_help", "Show help"),
+            Self::OpenMatrix => {
+                crate::i18n::tr("help.action.open_matrix", "Open Matrix game panel")
+            }
+            Self::ScrollPanelUp => crate::i18n::tr(
+                "help.action.scroll_panel_up",
+                "Scroll agent panel/dialog text up",
+            ),
+            Self::ScrollPanelDown => crate::i18n::tr(
+                "help.action.scroll_panel_down",
+                "Scroll agent panel/dialog text down",
+            ),
+            Self::RedrawScreen => {
+                crate::i18n::tr("help.action.redraw_screen", "Redraw entire screen")
+            }
+            Self::FocusJobs => crate::i18n::tr("help.action.focus_jobs", "Focus Jobs window"),
+            Self::FocusFinished => {
+                crate::i18n::tr("help.action.focus_finished", "Focus Finished/Failed window")
+            }
+            Self::ToggleLiveDetail => crate::i18n::tr(
+                "help.action.toggle_live_detail",
+                "LIVE agent: open/close details",
+            ),
         }
     }
 
@@ -225,8 +296,26 @@ impl KeyAction {
             Self::ScrollPanelUp => (KeyCode::Up, KeyModifiers::CONTROL),
             Self::ScrollPanelDown => (KeyCode::Down, KeyModifiers::CONTROL),
             Self::RedrawScreen => (KeyCode::Char('l'), KeyModifiers::CONTROL),
+            Self::FocusJobs => (KeyCode::Char('j'), KeyModifiers::ALT),
+            Self::FocusFinished => (KeyCode::Char('f'), KeyModifiers::ALT),
+            Self::ToggleLiveDetail => (KeyCode::Char('l'), KeyModifiers::ALT),
         };
         vec![KeyChord { code, modifiers }]
+    }
+}
+
+impl KeyAction {
+    /// `true` for actions whose default chords were added after keybinding
+    /// files were already in use (PL-97 C2): a chord a file binds to another
+    /// action wins over such a default, so an older file that uses
+    /// `alt+j`/`alt+f`/`alt+l` elsewhere stays valid. Chords set explicitly
+    /// on both sides still conflict.
+    #[must_use]
+    pub(crate) fn default_yields(self) -> bool {
+        matches!(
+            self,
+            Self::FocusJobs | Self::FocusFinished | Self::ToggleLiveDetail
+        )
     }
 }
 
@@ -355,9 +444,53 @@ impl fmt::Display for KeyChord {
 /// Eine lesbare Beschreibung bei leerem Chord, unbekanntem Modifikator,
 /// unbekannter Taste, doppeltem Modifikator oder fehlender Taste.
 pub(crate) fn parse_chord(raw: &str) -> Result<KeyChord, String> {
+    parse_chord_diagnostic(raw).map_err(|error| error.to_string())
+}
+
+#[derive(Debug)]
+pub(crate) struct BindingProblem {
+    key: &'static str,
+    english: &'static str,
+    args: Vec<(&'static str, String)>,
+    action: Option<String>,
+}
+impl BindingProblem {
+    fn new(key: &'static str, english: &'static str, args: &[(&'static str, &str)]) -> Self {
+        Self {
+            key,
+            english,
+            args: args.iter().map(|(k, v)| (*k, (*v).to_owned())).collect(),
+            action: None,
+        }
+    }
+    fn present_for(&self, language: harw_config::UiLanguage) -> String {
+        let args: Vec<_> = self.args.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let text = crate::i18n::tr_args_for(language, self.key, self.english, &args);
+        self.action
+            .as_ref()
+            .map_or(text.clone(), |action| format!("{action}: {text}"))
+    }
+}
+impl fmt::Display for BindingProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.present_for(harw_config::UiLanguage::English))
+    }
+}
+fn problem(
+    key: &'static str,
+    english: &'static str,
+    args: &[(&'static str, &str)],
+) -> BindingProblem {
+    BindingProblem::new(key, english, args)
+}
+fn parse_chord_diagnostic(raw: &str) -> Result<KeyChord, BindingProblem> {
     let lowered = raw.trim().to_lowercase();
     if lowered.is_empty() {
-        return Err("empty key chord".to_owned());
+        return Err(problem(
+            "command_feedback.key_empty",
+            "Empty key chord",
+            &[],
+        ));
     }
     // `ctrl++` bzw. `+` meint die Plus-Taste selbst.
     let (modifier_part, key_part) = if lowered == "+" {
@@ -371,7 +504,11 @@ pub(crate) fn parse_chord(raw: &str) -> Result<KeyChord, String> {
         }
     };
     if key_part.is_empty() {
-        return Err(format!("key chord '{raw}' has no key after '+'"));
+        return Err(problem(
+            "command_feedback.key_missing",
+            "Key chord '{raw}' has no key after '+'",
+            &[("raw", raw)],
+        ));
     }
 
     let mut modifiers = KeyModifiers::NONE;
@@ -382,18 +519,39 @@ pub(crate) fn parse_chord(raw: &str) -> Result<KeyChord, String> {
                 "alt" | "option" | "meta" => KeyModifiers::ALT,
                 "shift" => KeyModifiers::SHIFT,
                 "super" | "cmd" | "win" => KeyModifiers::SUPER,
-                "" => return Err(format!("key chord '{raw}' contains an empty modifier")),
-                other => return Err(format!("unknown modifier '{other}' in key chord '{raw}'")),
+                "" => {
+                    return Err(problem(
+                        "command_feedback.key_empty_modifier",
+                        "Key chord '{raw}' contains an empty modifier",
+                        &[("raw", raw)],
+                    ));
+                }
+                other => {
+                    return Err(problem(
+                        "command_feedback.key_modifier",
+                        "Unknown modifier '{modifier}' in key chord '{raw}'",
+                        &[("modifier", other), ("raw", raw)],
+                    ));
+                }
             };
             if modifiers.contains(flag) {
-                return Err(format!("duplicate modifier '{token}' in key chord '{raw}'"));
+                return Err(problem(
+                    "command_feedback.key_duplicate_modifier",
+                    "Duplicate modifier '{modifier}' in key chord '{raw}'",
+                    &[("modifier", token), ("raw", raw)],
+                ));
             }
             modifiers.insert(flag);
         }
     }
 
-    let code = parse_key_name(key_part.trim())
-        .ok_or_else(|| format!("unknown key '{key_part}' in key chord '{raw}'"))?;
+    let code = parse_key_name(key_part.trim()).ok_or_else(|| {
+        problem(
+            "command_feedback.key_unknown",
+            "Unknown key '{key}' in key chord '{raw}'",
+            &[("key", key_part), ("raw", raw)],
+        )
+    })?;
     Ok(KeyChord::normalized(code, modifiers))
 }
 
@@ -451,8 +609,43 @@ pub(crate) enum KeyBindingsError {
     /// einzelnen (unbekannte Aktion, ungültiger Chord, Werttyp, Konflikt).
     Invalid {
         path: PathBuf,
-        problems: Vec<String>,
+        problems: Vec<BindingProblem>,
     },
+}
+
+impl KeyBindingsError {
+    pub(crate) fn present_for(&self, language: harw_config::UiLanguage) -> String {
+        let (key, english, path, detail) = match self {
+            Self::Read { path, source } => (
+                "command_feedback.key_read",
+                "Cannot read keybindings file {path}: {detail}",
+                path,
+                source.to_string(),
+            ),
+            Self::Parse { path, message } => (
+                "command_feedback.key_parse",
+                "Invalid TOML in keybindings file {path}: {detail}",
+                path,
+                message.clone(),
+            ),
+            Self::Invalid { path, problems } => (
+                "command_feedback.key_invalid",
+                "Invalid keybindings in {path}: {detail}",
+                path,
+                problems
+                    .iter()
+                    .map(|p| p.present_for(language))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        };
+        crate::i18n::tr_args_for(
+            language,
+            key,
+            english,
+            &[("path", &path.display().to_string()), ("detail", &detail)],
+        )
+    }
 }
 
 impl fmt::Display for KeyBindingsError {
@@ -476,7 +669,11 @@ impl fmt::Display for KeyBindingsError {
                 formatter,
                 "invalid keybindings in {}: {}",
                 path.display(),
-                problems.join("; ")
+                problems
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
         }
     }
@@ -570,9 +767,14 @@ impl KeyBindings {
 
         let mut bindings = Self::default();
         let mut problems = Vec::new();
+        let mut named: Vec<KeyAction> = Vec::new();
         for (name, value) in &table {
             let Some(action) = KeyAction::from_name(name) else {
-                problems.push(format!("unknown action '{name}'"));
+                problems.push(problem(
+                    "command_feedback.key_action",
+                    "Unknown action '{name}'",
+                    &[("name", name)],
+                ));
                 continue;
             };
             let raw_chords: Vec<&toml::Value> = match value.as_array() {
@@ -582,18 +784,24 @@ impl KeyBindings {
             let mut chords = Vec::with_capacity(raw_chords.len());
             for raw in raw_chords {
                 match raw.as_str() {
-                    Some(text) => match parse_chord(text) {
+                    Some(text) => match parse_chord_diagnostic(text) {
                         Ok(chord) => chords.push(chord),
-                        Err(problem) => problems.push(format!("{name}: {problem}")),
+                        Err(mut problem) => {
+                            problem.action = Some(name.clone());
+                            problems.push(problem);
+                        }
                     },
-                    None => problems.push(format!(
-                        "{name}: expected a key chord string or an array of strings, found {}",
-                        raw.type_str()
+                    None => problems.push(problem(
+                        "command_feedback.key_type",
+                        "{name}: expected a key chord string or an array of strings, found {type}",
+                        &[("name", name), ("type", raw.type_str())],
                     )),
                 }
             }
             bindings.bindings.insert(action, chords);
+            named.push(action);
         }
+        bindings.yield_new_defaults(&named);
         problems.extend(bindings.conflicts());
 
         if problems.is_empty() {
@@ -606,19 +814,49 @@ impl KeyBindings {
         }
     }
 
+    /// Nachgereichte Voreinstellungen ([`KeyAction::default_yields`]) einer in
+    /// der Datei nicht genannten Aktion geben jeden Chord frei, den die Datei
+    /// (`named`) einer anderen Aktion zuordnet.
+    fn yield_new_defaults(&mut self, named: &[KeyAction]) {
+        let explicit: Vec<KeyChord> = named
+            .iter()
+            .filter_map(|action| self.bindings.get(action))
+            .flatten()
+            .copied()
+            .collect();
+        for (action, chords) in &mut self.bindings {
+            if action.default_yields() && !named.contains(action) {
+                chords.retain(|chord| !explicit.contains(chord));
+            }
+        }
+    }
+
     /// Chords, die mehr als einer Aktion (oder einer Aktion doppelt)
     /// zugeordnet sind.
-    fn conflicts(&self) -> Vec<String> {
+    fn conflicts(&self) -> Vec<BindingProblem> {
         let mut seen: Vec<(KeyChord, KeyAction)> = Vec::new();
         let mut problems = Vec::new();
         for (action, chords) in &self.bindings {
             for chord in chords {
                 match seen.iter().find(|(other, _)| other == chord) {
                     Some((_, owner)) if owner == action => {
-                        problems.push(format!("{action}: key chord '{chord}' listed twice"));
+                        problems.push(problem(
+                            "command_feedback.key_twice",
+                            "{action}: key chord '{chord}' listed twice",
+                            &[
+                                ("action", &action.to_string()),
+                                ("chord", &chord.to_string()),
+                            ],
+                        ));
                     }
-                    Some((_, owner)) => problems.push(format!(
-                        "key chord '{chord}' is bound to both '{owner}' and '{action}'"
+                    Some((_, owner)) => problems.push(problem(
+                        "command_feedback.key_conflict",
+                        "Key chord '{chord}' is bound to both '{owner}' and '{action}'",
+                        &[
+                            ("chord", &chord.to_string()),
+                            ("owner", &owner.to_string()),
+                            ("action", &action.to_string()),
+                        ],
                     )),
                     None => seen.push((*chord, *action)),
                 }
@@ -667,7 +905,9 @@ mod tests {
 
     fn invalid_problems(result: Result<KeyBindings, KeyBindingsError>) -> Vec<String> {
         match result {
-            Err(KeyBindingsError::Invalid { problems, .. }) => problems,
+            Err(KeyBindingsError::Invalid { problems, .. }) => {
+                problems.iter().map(ToString::to_string).collect()
+            }
             other => vec![format!("unexpected result: {other:?}")],
         }
     }
@@ -829,6 +1069,18 @@ mod tests {
                 event(KeyCode::Down, KeyModifiers::CONTROL),
                 KeyAction::ScrollPanelDown,
             ),
+            (
+                event(KeyCode::Char('j'), KeyModifiers::ALT),
+                KeyAction::FocusJobs,
+            ),
+            (
+                event(KeyCode::Char('f'), KeyModifiers::ALT),
+                KeyAction::FocusFinished,
+            ),
+            (
+                event(KeyCode::Char('l'), KeyModifiers::ALT),
+                KeyAction::ToggleLiveDetail,
+            ),
         ];
         for (key, expected) in cases {
             assert_eq!(bindings.action_for(&key), Some(expected), "{key:?}");
@@ -862,6 +1114,9 @@ mod tests {
 
     #[test]
     fn scroll_panel_actions_are_rebindable() -> TestResult {
+        // `alt+j` ist ab PL-97 C2 die Voreinstellung von `focus_jobs`; eine
+        // ältere Datei, die es anders belegt, bleibt gültig (die Datei
+        // gewinnt, siehe `old_files_using_the_new_default_chords_still_load`).
         let bindings = KeyBindings::from_toml_str(
             "scroll_panel_up = \"alt+k\"\nscroll_panel_down = [\"alt+j\", \"ctrl+down\"]\n",
             Path::new("kb.toml"),
@@ -890,6 +1145,100 @@ mod tests {
         Ok(())
     }
 
+    /// PL-97 C2: `Ctrl+J` bleibt der Zeilenumbruch, `Alt+J` fokussiert die
+    /// Jobs; die drei neuen Aktionen sind umbelegbar und kollidieren nicht
+    /// mit der Voreinstellung.
+    #[test]
+    fn mission_actions_are_rebindable_and_ctrl_j_stays_newline() -> TestResult {
+        let defaults = KeyBindings::default();
+        assert_eq!(
+            defaults.action_for(&event(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            Some(KeyAction::InsertNewline)
+        );
+        assert_eq!(
+            defaults.action_for(&event(KeyCode::Char('j'), KeyModifiers::ALT)),
+            Some(KeyAction::FocusJobs)
+        );
+        assert_eq!(
+            defaults.action_for(&event(KeyCode::Char('j'), KeyModifiers::NONE)),
+            None,
+            "plain j stays a letter / list key"
+        );
+        let bindings = KeyBindings::from_toml_str(
+            "focus_jobs = \"F13\"\nfocus_finished = [\"F14\", \"alt+x\"]\ntoggle_live_detail = []\n",
+            Path::new("kb.toml"),
+        )?;
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::F(13), KeyModifiers::NONE)),
+            Some(KeyAction::FocusJobs)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('x'), KeyModifiers::ALT)),
+            Some(KeyAction::FocusFinished)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('j'), KeyModifiers::ALT)),
+            None
+        );
+        assert!(bindings.chords(KeyAction::ToggleLiveDetail).is_empty());
+        for (name, action) in [
+            ("focus_jobs", KeyAction::FocusJobs),
+            ("focus_finished", KeyAction::FocusFinished),
+            ("toggle_live_detail", KeyAction::ToggleLiveDetail),
+        ] {
+            assert_eq!(KeyAction::from_name(name), Some(action));
+        }
+        // Zwei ausdrücklich gesetzte Chords kollidieren weiterhin.
+        let problems = invalid_problems(KeyBindings::from_toml_str(
+            "cycle_focus = \"alt+l\"\ntoggle_live_detail = \"alt+l\"\n",
+            Path::new("kb.toml"),
+        ));
+        assert_eq!(problems.len(), 1, "alt+l is set twice: {problems:?}");
+        Ok(())
+    }
+
+    /// PL-97 C2 regression: a keybindings file that was valid before the
+    /// Mission Control defaults existed still loads. The file wins over the
+    /// new default of an action it does not mention (that action only loses
+    /// the chord); older defaults keep conflicting as before.
+    #[test]
+    fn old_files_using_the_new_default_chords_still_load() -> TestResult {
+        let bindings = KeyBindings::from_toml_str(
+            "scroll_panel_down = [\"alt+j\", \"ctrl+down\"]\ncycle_focus = \"alt+l\"\nshow_help = \"alt+f\"\n",
+            Path::new("kb.toml"),
+        )?;
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('j'), KeyModifiers::ALT)),
+            Some(KeyAction::ScrollPanelDown)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('l'), KeyModifiers::ALT)),
+            Some(KeyAction::CycleFocus)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('f'), KeyModifiers::ALT)),
+            Some(KeyAction::ShowHelp)
+        );
+        assert!(bindings.chords(KeyAction::FocusJobs).is_empty());
+        assert!(bindings.chords(KeyAction::FocusFinished).is_empty());
+        assert!(bindings.chords(KeyAction::ToggleLiveDetail).is_empty());
+        // Unberührte neue Aktionen behalten ihre Voreinstellung.
+        let only_one =
+            KeyBindings::from_toml_str("scroll_panel_down = \"alt+j\"\n", Path::new("kb.toml"))?;
+        assert!(only_one.chords(KeyAction::FocusJobs).is_empty());
+        assert_eq!(
+            only_one.action_for(&event(KeyCode::Char('f'), KeyModifiers::ALT)),
+            Some(KeyAction::FocusFinished)
+        );
+        // Ältere Voreinstellungen geben nicht nach (unverändert seit vor C2).
+        let problems = invalid_problems(KeyBindings::from_toml_str(
+            r#"show_help = "F2""#,
+            Path::new("kb.toml"),
+        ));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        Ok(())
+    }
+
     #[test]
     fn action_names_round_trip() {
         for action in KeyAction::ALL {
@@ -909,9 +1258,9 @@ mod tests {
     }
 
     #[test]
-    fn every_action_has_a_german_label_and_a_default() {
+    fn every_action_has_a_localized_label_and_a_default() {
         for action in KeyAction::ALL {
-            assert!(!action.label_de().is_empty(), "{action}");
+            assert!(!action.label().is_empty(), "{action}");
             assert_eq!(action.default_chords().len(), 1, "{action}");
         }
         assert!(
@@ -1109,9 +1458,32 @@ cycle_focus = 5
         std::fs::write(&missing, "bogus = \"F1\"\n")?;
         let error = load(&missing).err().ok_or("expected an error")?;
         assert!(
-            error.to_string().contains("unknown action 'bogus'"),
+            error.to_string().contains("Unknown action 'bogus'"),
             "{error}"
         );
+        Ok(())
+    }
+    #[test]
+    fn diagnostics_render_in_display_locale_without_parsing_cached_text() -> TestResult {
+        let error = KeyBindings::from_toml_str(
+            "toggle_explorer = \"hyper+q\"",
+            Path::new("/user/keys.toml"),
+        )
+        .err()
+        .ok_or("expected diagnostic")?;
+        let german = error.present_for(harw_config::UiLanguage::German);
+        let japanese = error.present_for(harw_config::UiLanguage::Japanese);
+        assert!(
+            german.contains("Unbekannter Modifikator 'hyper'"),
+            "{german}"
+        );
+        assert!(japanese.contains("不明な修飾キー 'hyper'"), "{japanese}");
+        for text in [german, japanese] {
+            assert!(text.contains("toggle_explorer"));
+            assert!(text.contains("/user/keys.toml"));
+            assert!(text.contains("hyper+q"));
+        }
+        assert!(error.to_string().contains("Unknown modifier 'hyper'"));
         Ok(())
     }
 }

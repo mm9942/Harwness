@@ -80,16 +80,20 @@
 
 pub mod anthropic;
 mod anthropic_caps;
+mod anthropic_replay;
 pub mod budget;
 pub mod cache_strategy;
+mod chat_reasoning;
 pub mod discovery;
 mod error;
 mod images;
 pub mod rate_limiter;
+mod responses_reasoning;
 pub mod retry;
 pub mod routing;
 mod sse;
 mod text_tool_calls;
+mod thinking_profiles;
 mod tool_call_ids;
 mod tool_names;
 
@@ -107,10 +111,9 @@ use harw_tools::{FunctionToolSpec, JsonSchema, ToolCall, ToolName, ToolSpec};
 use harw_types::{TokenUsage, ToolCallId};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 pub use anthropic::{
@@ -1639,6 +1642,8 @@ pub struct OpenAiResponsesProvider {
     transport: Transport,
     request_timeout: Duration,
     reasoning_replay: ReasoningReplay,
+    chat_reasoning_cache: chat_reasoning::ChatReasoningCache,
+    chat_reasoning_overrides: std::collections::HashMap<String, harw_config::ChatReasoningReplay>,
     /// Modell-ID → Prompt-Caching-Override (`ModelToml::prompt_caching`),
     /// befüllt aus `config.models` beim Bau über [`Self::from_named_config`].
     /// Leer, wenn der Provider über [`Self::new`]/[`Self::with_transport`]
@@ -1706,6 +1711,7 @@ pub struct OpenAiResponsesProvider {
 ///
 /// `blocks` sind die unveränderten `reasoning`-Output-Items mit
 /// `encrypted_content`; `call_ids` die `function_call`s derselben Antwort.
+/// Eine leere Blockliste bindet eine Tool-Runde ohne Reasoning-Items.
 #[derive(Debug, Clone, PartialEq)]
 struct ReplayEntry {
     call_ids: Vec<String>,
@@ -1714,65 +1720,7 @@ struct ReplayEntry {
     blocks: Vec<Value>,
 }
 
-/// Provider-lokaler, begrenzter Speicher für zurückzuspielende Reasoning-Items.
-///
-/// # Description
-/// `ConversationHistory` hat (Stand W3) keinen Träger für opake
-/// Reasoning-Blöcke; bis A-LOOP `ModelResponse::reasoning` persistiert, merkt
-/// sich der Provider die Blöcke je Tool-Call-Runde und spielt sie zurück,
-/// sobald der Verlauf die zugehörigen `function_call`s enthält. Nur Einträge
-/// desselben Providers **und** Modells werden verwendet.
-///
-/// # Concurrency
-/// `Mutex` nur für kurze Kopier-/Einfügeoperationen, nie über `await` gehalten;
-/// Poisoning wird toleriert (reiner Cache).
-#[derive(Debug, Default)]
-struct ReasoningReplay {
-    entries: Mutex<VecDeque<ReplayEntry>>,
-}
-
-impl ReasoningReplay {
-    // Merkt eine Runde; älteste Einträge fallen bei Überlauf heraus.
-    fn remember(&self, entry: ReplayEntry) {
-        if entry.call_ids.is_empty() || entry.blocks.is_empty() {
-            return;
-        }
-        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        while entries.len() >= MAX_REASONING_REPLAY_ENTRIES {
-            entries.pop_front();
-        }
-        entries.push_back(entry);
-    }
-
-    // Liefert die Runden, deren Tool-Calls im Verlauf von `request` stehen.
-    fn for_request(&self, provider: &str, model: &str, request: &ModelRequest) -> Vec<ReplayEntry> {
-        let call_ids: BTreeSet<&str> = request
-            .history
-            .items()
-            .iter()
-            .filter_map(|item| match item {
-                TurnItem::ToolCall(call) => Some(call.call_id.as_str()),
-                _ => None,
-            })
-            .collect();
-        if call_ids.is_empty() {
-            return Vec::new();
-        }
-        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        entries
-            .iter()
-            .filter(|entry| {
-                entry.provider == provider
-                    && entry.model == model
-                    && entry
-                        .call_ids
-                        .iter()
-                        .any(|id| call_ids.contains(id.as_str()))
-            })
-            .cloned()
-            .collect()
-    }
-}
+use responses_reasoning::ReasoningReplay;
 
 impl OpenAiResponsesProvider {
     /// Baut einen Provider aus expliziten Werten.
@@ -1830,6 +1778,8 @@ impl OpenAiResponsesProvider {
             transport,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             reasoning_replay: ReasoningReplay::default(),
+            chat_reasoning_cache: chat_reasoning::ChatReasoningCache::default(),
+            chat_reasoning_overrides: std::collections::HashMap::new(),
             cache_overrides: std::collections::HashMap::new(),
             stream_policy: sse::StreamPolicy::default(),
             rate_limiter: std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(None)),
@@ -2093,6 +2043,22 @@ impl OpenAiResponsesProvider {
         http_provider.stream_idle_timeout =
             Duration::from_secs(provider.effective_stream_idle_timeout_secs());
         http_provider.chat_compat = ChatCompat::from_provider(provider);
+        for configured in config
+            .models
+            .values()
+            .filter(|model| model.provider == provider_name)
+        {
+            if let Some(mode) = configured.capabilities.chat_reasoning_replay {
+                http_provider
+                    .chat_reasoning_overrides
+                    .insert(configured.id.clone(), mode);
+                for alias in &configured.aliases {
+                    http_provider
+                        .chat_reasoning_overrides
+                        .insert(alias.clone(), mode);
+                }
+            }
+        }
         http_provider.toolless_models = toolless_models(provider_name, config);
         http_provider.imageless_models = imageless_models(provider_name, config);
         Ok(http_provider)
@@ -2336,12 +2302,12 @@ pub(crate) fn parse_retry_after(
     const DEFAULT_SECS: u64 = 30;
 
     // 1. Retry-After-Header als numerischer Sekundenwert.
-    if let Some(header_val) = retry_after_header {
-        if let Ok(secs) = header_val.trim().parse::<u64>() {
-            return std::time::Duration::from_secs(secs);
-        }
-        // HTTP-Date-Format: ignoriert, Fallback auf Body.
+    if let Some(header_val) = retry_after_header
+        && let Ok(secs) = header_val.trim().parse::<u64>()
+    {
+        return std::time::Duration::from_secs(secs);
     }
+    // HTTP-Date-Format: ignoriert, Fallback auf Body.
 
     // 2. Body-Extraktion: suche "wait N seconds" (case-insensitive).
     //    Einfache Variante ohne externe Regex-Crate:
@@ -2353,10 +2319,10 @@ pub(crate) fn parse_retry_after(
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .collect();
-        if let Ok(secs) = num_str.parse::<u64>() {
-            if secs > 0 {
-                return std::time::Duration::from_secs(secs);
-            }
+        if let Ok(secs) = num_str.parse::<u64>()
+            && secs > 0
+        {
+            return std::time::Duration::from_secs(secs);
         }
     }
 
@@ -3001,25 +2967,25 @@ fn build_responses_body(
     replay: &[ReplayEntry],
 ) -> Result<Value, serde_json::Error> {
     let mut body = serde_json::to_value(build_request(model, request))?;
-    if !replay.is_empty() {
-        if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
-            let items = std::mem::take(input);
-            let mut emitted = vec![false; replay.len()];
-            for item in items {
-                let function_call_id = (item.get("type").and_then(Value::as_str)
-                    == Some("function_call"))
-                .then(|| item.get("call_id").and_then(Value::as_str))
-                .flatten();
-                if let Some(call_id) = function_call_id {
-                    for (entry, done) in replay.iter().zip(emitted.iter_mut()) {
-                        if !*done && entry.call_ids.iter().any(|id| id == call_id) {
-                            *done = true;
-                            input.extend(entry.blocks.iter().cloned());
-                        }
+    if !replay.is_empty()
+        && let Some(input) = body.get_mut("input").and_then(Value::as_array_mut)
+    {
+        let items = std::mem::take(input);
+        let mut emitted = vec![false; replay.len()];
+        for item in items {
+            let function_call_id = (item.get("type").and_then(Value::as_str)
+                == Some("function_call"))
+            .then(|| item.get("call_id").and_then(Value::as_str))
+            .flatten();
+            if let Some(call_id) = function_call_id {
+                for (entry, done) in replay.iter().zip(emitted.iter_mut()) {
+                    if !*done && entry.call_ids.iter().any(|id| id == call_id) {
+                        *done = true;
+                        input.extend(entry.blocks.iter().cloned());
                     }
                 }
-                input.push(item);
             }
+            input.push(item);
         }
     }
     if let Some(max_output_tokens) = request.max_output_tokens {
@@ -3067,7 +3033,9 @@ fn extract_responses_refusal(body: &Value) -> Option<String> {
 /// - sonst: Tool-Calls → `ToolUse`; nur Refusal-Parts → `Refusal`; Text → `EndTurn`;
 ///   gar nichts → `EmptyResponse`.
 /// - `reasoning`-Items → `OpaqueReasoning{provider, model, blocks}` (verbatim);
-///   Items mit `encrypted_content` einer Tool-Call-Runde → [`ReplayEntry`].
+///   Tool-Runden mit verschlüsseltem Reasoning oder ohne Reasoning-Items
+///   erhalten eine [`ReplayEntry`]-Bindung. Eine leere Blockliste bestätigt,
+///   dass der Provider in dieser Runde kein Reasoning geliefert hat.
 ///
 /// # Errors
 /// `RequestFailed` bei `failed`/`cancelled` oder defekten Tool-Calls;
@@ -3140,15 +3108,18 @@ fn interpret_responses(
         })
         .cloned()
         .collect();
-    let replay = (!tool_calls.is_empty() && !replayable.is_empty()).then(|| ReplayEntry {
-        call_ids: tool_calls
-            .iter()
-            .map(|call| call.id.as_str().to_owned())
-            .collect(),
-        provider: provider.to_owned(),
-        model: model.to_owned(),
-        blocks: replayable,
-    });
+    let replay =
+        (!tool_calls.is_empty() && (blocks.is_empty() || !replayable.is_empty())).then(|| {
+            ReplayEntry {
+                call_ids: tool_calls
+                    .iter()
+                    .map(|call| call.id.as_str().to_owned())
+                    .collect(),
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+                blocks: replayable,
+            }
+        });
     let reasoning = (!blocks.is_empty()).then(|| OpaqueReasoning {
         provider: provider.to_owned(),
         model: model.to_owned(),
@@ -3415,10 +3386,10 @@ fn extract_assistant_text(body: &Value) -> Option<String> {
             continue;
         };
         for part in parts {
-            if part.get("type").and_then(Value::as_str) == Some("output_text") {
-                if let Some(chunk) = part.get("text").and_then(Value::as_str) {
-                    text.push_str(chunk);
-                }
+            if part.get("type").and_then(Value::as_str) == Some("output_text")
+                && let Some(chunk) = part.get("text").and_then(Value::as_str)
+            {
+                text.push_str(chunk);
             }
         }
     }
@@ -4172,11 +4143,21 @@ impl OpenAiResponsesProvider {
         // [`Self::gateway_identity_headers`]) — geliehen von `request`, das
         // bis nach dem Response-Parsing im Scope bleibt.
         let identity = request.identity();
+        // Credential-pool endpoint overrides are distinct replay namespaces.
+        let chat_replay_namespace = format!("{}@{}", self.provider_id, base_url);
+        let chat_reasoning_mode = chat_reasoning::resolve_mode(
+            base_url,
+            model,
+            self.chat_reasoning_overrides.get(model).copied(),
+        );
         let (url, mut wire) = match self.transport {
             Transport::Responses => {
-                let replay = self
-                    .reasoning_replay
-                    .for_request(&self.provider_id, model, &request);
+                let replay = self.reasoning_replay.for_request(
+                    &self.provider_id,
+                    model,
+                    base_url,
+                    &request,
+                )?;
                 tracing::debug!(
                     model,
                     replayed_reasoning_rounds = replay.len(),
@@ -4194,6 +4175,14 @@ impl OpenAiResponsesProvider {
                     self.cache_overrides.get(model).copied(),
                 );
                 let mut body = build_chat_body_with(&request, model, self.chat_compat);
+                if chat_reasoning_mode == harw_config::ChatReasoningReplay::ReasoningContent {
+                    self.chat_reasoning_cache.apply(
+                        &chat_replay_namespace,
+                        model,
+                        &request,
+                        &mut body,
+                    )?;
+                }
                 cache_strategy::apply_chat_cache_control(&mut body, strategy);
                 tracing::debug!(model, strategy = strategy.label(), "sending chat request");
                 (format!("{base_url}/chat/completions"), body)
@@ -4213,6 +4202,17 @@ impl OpenAiResponsesProvider {
             if self.transport == Transport::Chat {
                 wire["stream_options"] = serde_json::json!({ "include_usage": true });
             }
+        }
+
+        if self.transport == Transport::Chat {
+            thinking_profiles::apply_options(
+                &mut wire,
+                base_url,
+                model,
+                request.reasoning_effort,
+                stream_sink.is_some(),
+                !request.tools.is_empty(),
+            )?;
         }
 
         // Client-seitige RPM/TPM-Budgets (siehe [`budget`]) und
@@ -4343,12 +4343,11 @@ impl OpenAiResponsesProvider {
             serde_json::from_str(&body)?
         };
         let names = tool_names::ToolNameCodec::for_request(&request);
+        let mut response_replay = None;
         let mut response = match self.transport {
             Transport::Responses => {
                 let (response, replay) = interpret_responses(&value, &self.provider_id, model)?;
-                if let Some(entry) = replay {
-                    self.reasoning_replay.remember(entry);
-                }
+                response_replay = replay;
                 response
             }
             Transport::Chat => {
@@ -4373,6 +4372,27 @@ impl OpenAiResponsesProvider {
             call.name = ToolName::new(names.decode(call.name.as_str()));
         }
         budget_permit.reconcile(&response.usage);
+        if let Some(replay) = response_replay {
+            self.reasoning_replay
+                .remember(replay, base_url, &request, &response)?;
+        }
+        if self.transport == Transport::Chat
+            && chat_reasoning_mode == harw_config::ChatReasoningReplay::ReasoningContent
+            && !matches!(
+                response.stop,
+                StopReason::MaxTokens
+                    | StopReason::ContentFilter
+                    | StopReason::ContextWindowExceeded
+            )
+        {
+            self.chat_reasoning_cache.remember(
+                &chat_replay_namespace,
+                model,
+                &request,
+                &response,
+                &value,
+            )?;
+        }
         Ok(response)
     }
 }
@@ -4667,6 +4687,78 @@ mod tests {
             Ok(())
         });
         Ok((base_url, handle))
+    }
+
+    #[tokio::test]
+    async fn identityless_responses_tool_results_require_identity_only_for_reasoning() -> TestResult
+    {
+        for (case, effort, encrypted, identity, succeeds) in [
+            ("ordinary tool round", None, false, None, true),
+            (
+                "explicit reasoning",
+                Some(harw_types::ReasoningEffort::High),
+                false,
+                None,
+                false,
+            ),
+            ("encrypted reasoning", None, true, None, false),
+            (
+                "invalid provided identity",
+                None,
+                false,
+                Some(test_identity("", "", "reader")),
+                false,
+            ),
+        ] {
+            let mut output = Vec::new();
+            if encrypted {
+                output.push(serde_json::json!({
+                    "type": "reasoning", "encrypted_content": "opaque-raw-block", "summary": []
+                }));
+            }
+            output.push(serde_json::json!({
+                "type": "function_call", "call_id": "a", "name": "lookup", "arguments": "{}"
+            }));
+            let (base_url, server) = mock_json_response_server(serde_json::json!({
+                "status": "completed", "output": output
+            }))?;
+            let provider = OpenAiResponsesProvider::new(
+                base_url,
+                "gpt-test",
+                SecretString::new("sk-test".into()),
+            )
+            .map_err(ctx("Responses provider"))?;
+            let mut request = request_with_ids(None, None);
+            request.history.push_user_text("Find context");
+            request.tools = vec![ToolSpec::Function(harw_tools::FunctionToolSpec {
+                name: ToolName::new("lookup"),
+                description: "Lookup context".to_owned(),
+                parameters: harw_tools::JsonSchema {
+                    schema_type: Some(harw_tools::JsonSchemaType::Object),
+                    ..Default::default()
+                },
+                strict: false,
+            })];
+            request.identity = identity;
+            request.reasoning_effort = effort;
+            let result = provider.respond(request).await;
+            server.join().map_err(join_thread_error)??;
+            if succeeds {
+                let response = result.map_err(ctx("ordinary identity-less tool result"))?;
+                assert_eq!(response.stop, StopReason::ToolUse);
+                assert_eq!(response.tool_calls.len(), 1);
+                assert_eq!(response.tool_calls[0].id.as_str(), "a");
+                assert_eq!(response.tool_calls[0].name.as_str(), "lookup");
+                assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
+                assert!(response.reasoning.is_none());
+            } else {
+                assert!(
+                    matches!(result, Err(ModelError::RequestFailed(ref detail)) if detail.contains("request identity is missing")),
+                    "{case} must retain its identity requirement: {result:?}"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Startet einen Mock-HTTP-Server, der pro Verbindung einen eigenen

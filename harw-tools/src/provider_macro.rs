@@ -8,7 +8,8 @@
 //! Entscheidungen an die Tool-Typen selbst — Name, Spezifikation und
 //! Parallelitäts-Zusage stammen ausschließlich aus den Consts, die
 //! `#[harw_macros::tool]` erzeugt (`NAME`, `PERMISSION`, `PARALLEL_SAFE`,
-//! `spec()`).
+//! `spec()`), die beschreibenden Metadaten aus `ACTIVITY` und `SKILL`
+//! (PL-97 M2; `TOOL_ACTIVITIES`, `TOOL_SKILLS`).
 //!
 //! # Schlüsseltypen
 //! - [`crate::tool_provider!`] — Provider inklusive `impl ToolProvider`.
@@ -101,6 +102,24 @@ pub mod __private {
         }
         false
     }
+
+    /// Fallback for `TOOL_ACTIVITIES`/`TOOL_SKILLS` of forms 1 and 2.
+    ///
+    /// `#[harw_macros::tool]` generates inherent `ACTIVITY` and `SKILL`
+    /// consts; hand-written tool types (for example in `harw-tool-doc`) do not
+    /// have them. The macros bring this trait into scope anonymously, and only
+    /// inside the two table consts: `<T>::ACTIVITY` then resolves the inherent
+    /// const first (inherent items take precedence over trait items) and falls
+    /// back to `None` only when there is none. `None` means "no metadata",
+    /// i.e. unknown semantics (a standalone activity), never a permission.
+    pub trait ToolMetadataFallback {
+        /// No activity descriptor.
+        const ACTIVITY: ::core::option::Option<crate::ActivityDescriptor> = None;
+        /// No skill binding.
+        const SKILL: ::core::option::Option<&'static str> = None;
+    }
+
+    impl<T: ?Sized> ToolMetadataFallback for T {}
 }
 
 /// Compile-Zeit-Duplikatprüfung der Tool-Namen (intern, von
@@ -175,7 +194,8 @@ macro_rules! __harw_assert_parallel_listed {
     };
 }
 
-/// Intern: optionale `permission:`-Angabe der Impl-Form (`None`, wenn sie fehlt).
+/// Intern: optionale Angabe der Impl-Form (`permission:`, `activity:`,
+/// `skill:`) als `Option` — `None`, wenn sie fehlt.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __harw_permission_of {
@@ -212,6 +232,10 @@ macro_rules! __harw_permission_of {
 /// - `T::spec() -> `[`crate::ToolSpec`],
 /// - `impl Default for T` und `impl `[`crate::ToolExecutor`]` for T`.
 ///
+/// Optional sind `T::ACTIVITY: Option<`[`crate::ActivityDescriptor`]`>` und
+/// `T::SKILL: Option<&'static str>`; fehlen sie (handgeschriebene Tool-Typen),
+/// steht `None` in `TOOL_ACTIVITIES`/`TOOL_SKILLS`.
+///
 /// Genau diese Menge erzeugt `#[harw_macros::tool]`. Generiert werden
 /// `$name::new()`, `$name::tool_specs()`, `$name::tool_executor(&str)` und
 /// `$name::tool_parallel_safe(&str)` (alle ohne `self`).
@@ -241,15 +265,21 @@ macro_rules! __harw_permission_of {
 ///         PLAN_WRITE_TOOL => {
 ///             spec: provider.write_spec(),           // ToolSpec, beliebiger Ausdruck
 ///             permission: Permission::ReadWorkspace, // optional; fehlt es: None
+///             activity: PLAN_WRITE_ACTIVITY,         // optional (const-Ausdruck); fehlt es: None
+///             skill: "plan-tools",                   // optional; fehlt es: None
 ///             executor: PlanToolExecutor::new(provider.clone()),
 ///         },
 ///     }
 /// }
 /// ```
+/// Die optionalen Angaben stehen in dieser Reihenfolge (`permission`,
+/// `activity`, `skill`) zwischen `spec` und `executor`.
+///
 /// Für Provider, die schon als eigene Struktur mit Feldern und Buildern
 /// existieren und deren Spezifikationen nicht aus einem `#[tool]`-Args-Typ
 /// stammen (`schema_from`, dynamisch gebaute Schemata). Das Makro erzeugt
-/// **nur** `TOOL_NAMES`, `TOOL_PERMISSIONS`, `tool_specs(&self)`,
+/// **nur** `TOOL_NAMES`, `TOOL_PERMISSIONS`, `TOOL_ACTIVITIES`, `TOOL_SKILLS`,
+/// `tool_specs(&self)`,
 /// `tool_executor(&self, &str)` und `tool_parallel_safe(&str)`; die
 /// Struktur bleibt handgeschrieben. `provider` ist `&Self`. `executor:` ist
 /// der Executor-Wert (wird in `Arc` gelegt). `parallel_safe: all` bedeutet
@@ -262,6 +292,10 @@ macro_rules! __harw_permission_of {
 /// - `$name::TOOL_PERMISSIONS: &'static [Option<Permission>]` — parallel dazu die
 ///   deklarierten Berechtigungen, damit ein Crate per Test auditieren kann, dass
 ///   jedes registrierte Tool eine Berechtigung deklariert.
+/// - `$name::TOOL_ACTIVITIES: &'static [Option<ActivityDescriptor>]` und
+///   `$name::TOOL_SKILLS: &'static [Option<&'static str>]` — ebenfalls
+///   indexgleich: die beschreibenden Activity-Metadaten (PL-71) und die
+///   gebündelten Skills der Tools. Keines von beiden fließt in `tool_specs()`.
 /// - eine anonyme `const`-Assertion, die doppelte Tool-Namen zum Compile-Fehler macht.
 ///
 /// # Doppelte Tool-Namen
@@ -300,6 +334,23 @@ macro_rules! tool_provider_core {
             /// [`Self::TOOL_NAMES`].
             pub const TOOL_PERMISSIONS: &'static [::core::option::Option<$crate::Permission>] =
                 &[ $( <$tool>::PERMISSION ),+ ];
+
+            /// Activity descriptors of the tools (PL-71), index-aligned with
+            /// [`Self::TOOL_NAMES`]. `None`: no activity metadata. Descriptive
+            /// only, never a permission.
+            pub const TOOL_ACTIVITIES: &'static [::core::option::Option<$crate::ActivityDescriptor>] = {
+                #[allow(unused_imports)]
+                use $crate::provider_macro::__private::ToolMetadataFallback as _;
+                &[ $( <$tool>::ACTIVITY ),+ ]
+            };
+
+            /// Bundled skills of the tools, index-aligned with
+            /// [`Self::TOOL_NAMES`]. `None`: no skill binding.
+            pub const TOOL_SKILLS: &'static [::core::option::Option<&'static str>] = {
+                #[allow(unused_imports)]
+                use $crate::provider_macro::__private::ToolMetadataFallback as _;
+                &[ $( <$tool>::SKILL ),+ ]
+            };
 
             /// Erzeugt den Provider über dem gemeinsamen Zustand.
             #[must_use]
@@ -360,6 +411,8 @@ macro_rules! tool_provider_core {
                 $name:expr => {
                     spec: $spec:expr,
                     $( permission: $perm:expr, )?
+                    $( activity: $act:expr, )?
+                    $( skill: $skill:expr, )?
                     executor: $exec:expr $(,)?
                 }
             ),+ $(,)?
@@ -372,6 +425,16 @@ macro_rules! tool_provider_core {
             /// Die deklarierten Berechtigungen, indexgleich zu [`Self::TOOL_NAMES`].
             pub const TOOL_PERMISSIONS: &'static [::core::option::Option<$crate::Permission>] =
                 &[ $( $crate::__harw_permission_of!($($perm)?) ),+ ];
+
+            /// Declared activity descriptors (PL-71), index-aligned with
+            /// [`Self::TOOL_NAMES`]; `None` without an `activity:` entry.
+            pub const TOOL_ACTIVITIES: &'static [::core::option::Option<$crate::ActivityDescriptor>] =
+                &[ $( $crate::__harw_permission_of!($($act)?) ),+ ];
+
+            /// Declared skill bindings, index-aligned with
+            /// [`Self::TOOL_NAMES`]; `None` without a `skill:` entry.
+            pub const TOOL_SKILLS: &'static [::core::option::Option<&'static str>] =
+                &[ $( $crate::__harw_permission_of!($($skill)?) ),+ ];
 
             /// Die Spezifikationen aller Tools, in Deklarationsreihenfolge.
             #[must_use]
@@ -440,6 +503,24 @@ macro_rules! tool_provider_core {
             /// Makro-Prolog zur Berechtigungsprüfung erzeugen lässt.
             pub const TOOL_PERMISSIONS: &'static [::core::option::Option<$crate::Permission>] =
                 &[ $( <$tool>::PERMISSION ),+ ];
+
+            /// Activity descriptors of the tools (PL-71), index-aligned with
+            /// [`Self::TOOL_NAMES`]. `None`: no activity metadata (the tool
+            /// stays a standalone activity). Descriptive only, never a
+            /// permission.
+            pub const TOOL_ACTIVITIES: &'static [::core::option::Option<$crate::ActivityDescriptor>] = {
+                #[allow(unused_imports)]
+                use $crate::provider_macro::__private::ToolMetadataFallback as _;
+                &[ $( <$tool>::ACTIVITY ),+ ]
+            };
+
+            /// Bundled skills of the tools, index-aligned with
+            /// [`Self::TOOL_NAMES`]. `None`: no skill binding.
+            pub const TOOL_SKILLS: &'static [::core::option::Option<&'static str>] = {
+                #[allow(unused_imports)]
+                use $crate::provider_macro::__private::ToolMetadataFallback as _;
+                &[ $( <$tool>::SKILL ),+ ]
+            };
 
             /// Erzeugt den Provider. Zustandslos; alle Entscheidungen fallen pro Aufruf.
             #[must_use]
@@ -587,6 +668,8 @@ macro_rules! tool_provider {
                 $name:expr => {
                     spec: $spec:expr,
                     $( permission: $perm:expr, )?
+                    $( activity: $act:expr, )?
+                    $( skill: $skill:expr, )?
                     executor: $exec:expr $(,)?
                 }
             ),+ $(,)?
@@ -598,6 +681,8 @@ macro_rules! tool_provider {
                     $name => {
                         spec: $spec,
                         $( permission: $perm, )?
+                        $( activity: $act, )?
+                        $( skill: $skill, )?
                         executor: $exec
                     }
                 ),+
@@ -656,9 +741,14 @@ mod tests {
     use crate::schema::{JsonSchema, JsonSchemaType};
     use crate::spec::FunctionToolSpec;
     use crate::{
-        Permission, ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName,
-        ToolOutput, ToolSpec,
+        ActivityDescriptor, Effect, Permission, ToolCall, ToolExecutionContext, ToolExecutor,
+        ToolExecutorFuture, ToolName, ToolOutput, ToolSpec,
     };
+
+    /// Activity-Deskriptor des lesenden Dummy-Tools (wie ihn
+    /// `#[tool(activity(...))]` erzeugen würde).
+    const ALPHA_ACTIVITY: ActivityDescriptor =
+        ActivityDescriptor::new("filesystem", "read", Some("path"), Effect::Observe);
 
     /// Baut die Minimal-Spezifikation, die ein `#[tool]`-erzeugtes `spec()`
     /// liefern würde. Die Dummies sind handgeschrieben, weil `#[harw_macros::tool]`
@@ -684,6 +774,10 @@ mod tests {
         const NAME: &'static str = "test.alpha";
         const PARALLEL_SAFE: bool = true;
         const PERMISSION: Option<Permission> = Some(Permission::ReadWorkspace);
+        // Wie von `#[tool(activity(..), skill = "..")]` erzeugt; Beta- und
+        // Unguarded-Tool haben diese Consts nicht (Rückfall auf `None`).
+        const ACTIVITY: Option<ActivityDescriptor> = Some(ALPHA_ACTIVITY);
+        const SKILL: Option<&'static str> = Some("alpha-tools");
 
         fn spec() -> ToolSpec {
             dummy_spec(Self::NAME, "reads something")
@@ -829,6 +923,41 @@ mod tests {
                 Some(Permission::WriteWorkspace),
             ]
         );
+    }
+
+    /// PL-97 M2: `TOOL_ACTIVITIES`/`TOOL_SKILLS` stehen indexgleich zu den
+    /// Namen; inhärente Consts gewinnen, Tool-Typen ohne sie liefern `None`.
+    #[test]
+    fn test_tool_provider_core_exposes_activities_and_skills_in_name_order() {
+        assert_eq!(
+            TestToolProvider::TOOL_ACTIVITIES,
+            &[Some(ALPHA_ACTIVITY), None],
+            "AlphaTool's inherent ACTIVITY wins, BetaTool falls back to None"
+        );
+        assert_eq!(TestToolProvider::TOOL_SKILLS, &[Some("alpha-tools"), None]);
+        assert_eq!(
+            TestToolProvider::TOOL_ACTIVITIES.len(),
+            TestToolProvider::TOOL_NAMES.len()
+        );
+        assert_eq!(
+            TestToolProvider::TOOL_SKILLS.len(),
+            TestToolProvider::TOOL_NAMES.len()
+        );
+        assert_eq!(
+            MixedToolProvider::TOOL_ACTIVITIES,
+            &[Some(ALPHA_ACTIVITY), None]
+        );
+        assert_eq!(MixedToolProvider::TOOL_SKILLS, &[Some("alpha-tools"), None]);
+    }
+
+    /// Die Activity-Metadaten erreichen die Spezifikationen nicht.
+    #[test]
+    fn test_tool_provider_core_activities_never_enter_specs() -> Result<(), serde_json::Error> {
+        let specs = serde_json::to_string(&TestToolProvider::tool_specs())?;
+        assert!(!specs.contains("filesystem"), "{specs}");
+        assert!(!specs.contains("alpha-tools"), "{specs}");
+        assert!(!specs.contains("observe"), "{specs}");
+        Ok(())
     }
 
     /// Beispiel für den Audit-Test, den ein Tool-Crate über seinen Provider
@@ -982,6 +1111,8 @@ mod tests {
         let specs = StatefulProvider::tool_specs();
         let names: Vec<&str> = specs.iter().map(ToolSpec::name).collect();
         assert_eq!(names, vec!["test.stateful", "test.beta"]);
+        assert_eq!(StatefulProvider::TOOL_ACTIVITIES, &[None, None]);
+        assert_eq!(StatefulProvider::TOOL_SKILLS, &[None, None]);
     }
 
     // ── Form 3: bestehender Typ, externe Spezifikationen ─────────────────────
@@ -1010,11 +1141,14 @@ mod tests {
             EXT_READ => {
                 spec: dummy_spec(EXT_READ, provider.description),
                 permission: Permission::ReadWorkspace,
+                activity: ALPHA_ACTIVITY,
+                skill: "ext-tools",
                 executor: AlphaTool,
             },
             EXT_WRITE => {
                 spec: dummy_spec(EXT_WRITE, "writes"),
                 permission: Permission::WriteWorkspace,
+                skill: "ext-tools",
                 executor: BetaTool,
             },
             EXT_PLAIN => {
@@ -1076,6 +1210,25 @@ mod tests {
                 None
             ]
         );
+    }
+
+    /// `activity:`/`skill:` sind optional; fehlen sie, steht `None` an der Stelle.
+    #[test]
+    fn test_tool_provider_core_impl_form_activities_and_skills_default_to_none() {
+        assert_eq!(
+            ConfiguredProvider::TOOL_ACTIVITIES,
+            &[Some(ALPHA_ACTIVITY), None, None]
+        );
+        assert_eq!(
+            ConfiguredProvider::TOOL_SKILLS,
+            &[Some("ext-tools"), Some("ext-tools"), None]
+        );
+        assert_eq!(ParallelAll::TOOL_ACTIVITIES, &[None, None]);
+        assert_eq!(ParallelAll::TOOL_SKILLS, &[None, None]);
+        assert_eq!(ParallelDefault::TOOL_ACTIVITIES, &[None]);
+        assert_eq!(ParallelDefault::TOOL_SKILLS, &[None]);
+        assert_eq!(ParallelNone::TOOL_ACTIVITIES, &[None]);
+        assert_eq!(ParallelNone::TOOL_SKILLS, &[None]);
     }
 
     /// Executor lösen bekannte Namen auf, unbekannte nicht.

@@ -1,0 +1,7 @@
+error[E0609]: no field `file` on type `&Args`
+  --> tests/compile_fail/41_tool_activity_resource_not_a_field.rs:13:63
+   |
+13 |     activity(domain = "filesystem", verb = "read", resource = "file", effect = "observe")
+   |                                                               ^^^^^^ unknown field
+   |
+   = note: available field is: `path`

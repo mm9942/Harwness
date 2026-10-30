@@ -169,6 +169,7 @@ mod tests {
                 base_delay: SignedDuration::from_secs(1),
                 factor,
                 max_delay: SignedDuration::from_secs(30),
+                jitter: 0.0,
             };
 
             assert!(matches!(
@@ -185,6 +186,7 @@ mod tests {
             base_delay: SignedDuration::from_secs(1),
             factor: 2.0,
             max_delay: SignedDuration::from_secs(30),
+            jitter: 0.0,
         };
 
         assert_eq!(

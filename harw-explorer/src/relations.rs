@@ -432,10 +432,10 @@ fn npm_dep_ref(name: &str, spec: &str) -> DepRef {
             return DepRef::Path(path.to_owned());
         }
     }
-    if let Some(rest) = spec.strip_prefix("workspace:") {
-        if rest.starts_with("./") || rest.starts_with("../") || rest.starts_with('/') {
-            return DepRef::Path(rest.to_owned());
-        }
+    if let Some(rest) = spec.strip_prefix("workspace:")
+        && (rest.starts_with("./") || rest.starts_with("../") || rest.starts_with('/'))
+    {
+        return DepRef::Path(rest.to_owned());
     }
     DepRef::Name(name.to_owned())
 }
@@ -757,11 +757,11 @@ fn inline_links(line: &str, links: &mut Vec<(String, String)>) {
             }
         }
         let Some(close) = close else { break };
-        if chars.get(close + 1) == Some(&'(') {
-            if let Some(target) = link_destination(&chars, close + 2) {
-                let text: String = chars[i + 1..close].iter().collect();
-                links.push((text, target));
-            }
+        if chars.get(close + 1) == Some(&'(')
+            && let Some(target) = link_destination(&chars, close + 2)
+        {
+            let text: String = chars[i + 1..close].iter().collect();
+            links.push((text, target));
         }
         // Weiter im Linktext, damit verschachtelte Links/Bilder gefunden werden.
         i += 1;

@@ -1,6 +1,6 @@
 # 04 — Implementation waves, review gates, metrics and migration ledger
 
-> Status: **proposal only**, documented on the pinned `dev@197a92e92d438bf6bf93b129bb964f4852686149` baseline. This documentation PR does not implement a runtime, does not widen admission rights, and must not be presented as a passed build.
+> Status: **proposal** (§§1–6), documented on the pinned `dev@197a92e92d438bf6bf93b129bb964f4852686149` baseline. §7 records what is implemented so far (partial W01–W03; the read-only recipe is wired). The W01–W03 waves are merged on `dev` via PR #148 (ledger entry `MIG-PL90-W03w`); the rest of this document remains proposal.
 
 ## 1. Implementation ownership principles
 
@@ -38,10 +38,10 @@ Proof: fake README versus source truth, surprise dependency boundary, symlink/ou
 
 Before widening orchestration, implement [05 — Error Learning & Agent Run Isolation](05-error-learning-and-run-isolation.md) as **two small separate waves**:
 
-- **W03c (PLANNED):** classify admission, executor, provider and reconciliation failures into typed non-secret run observations; atomically persist a bounded, epoch-fenced outbox **in the same CycleStore transaction as a committed checkpoint**. Do not write global memory from CycleDriver, do not count unverified fixes, and never retry an uncertain external effect blindly.
-- **W03d (PLANNED):** trusted run/agent/session principal through the job/child boundary; enforce per-session STM and independently assembled per-run context. A parent receives only an authorized bounded return, siblings receive no private history. Audit MemoryContextProvider session matching and bulk project/global fact injection; make child retrieval explicit and policy checked, with root compatibility governed separately.
+- **W03c (IN PR (PR #151): library and `CycleDriver` integration; the consumer is the W09a drain in the `harw-cli` intent-cycle worker):** classify admission, executor, provider and reconciliation failures into typed non-secret run observations; atomically persist a bounded, epoch-fenced outbox **in the same CycleStore transaction as a committed checkpoint**. Do not write global memory from CycleDriver, do not count unverified fixes, and never retry an uncertain external effect blindly. `CycleDriver` builds the observations (`build_observation`) at refusal, permanent proposer failure, executor failure, uncertain reconciliation and verification, and commits them through `CycleStore::commit_step_observed` into `CycleRecord.outbox` (`harw-plan-bridge/src/cycle_runtime.rs`).
+- **W03d (IN PR (PR #151) for identity, recall and the parent boundary; per-session STM enforcement is a library contract; limitations in 05 §4):** trusted run/agent/session principal through the job/child boundary; enforce per-session STM and independently assembled per-run context. A parent receives only an authorized bounded return, siblings receive no private history. Audit MemoryContextProvider session matching and bulk project/global fact injection; make child retrieval explicit and policy checked, with root compatibility governed separately.
 
-The existing W03 code and tests do **not** implement these subwaves. Cross-run learning consumption and promotion remain W09a–W09c.
+The W03c pieces live in `harw-plan-bridge` (`cycle_runtime.rs`, `cycle_observation.rs`, `cycle_outbox.rs`); the W03d pieces live in `harw-knowledge`, `harw-ops`, `harw-research`, `harw-core-bridge` and `harw-runtime`. Cross-run learning consumption (W09a) and top-k lesson recall (W09b) are IN PR (PR #151) in the intent-cycle worker (§7.7, [05 §4](05-error-learning-and-run-isolation.md)); reviewed global promotion remains W09c (PLANNED).
 
 Proof: different agents cannot share STM/transcripts via provider reuse or the same trace; stale lease cannot append or ack learning; a crash between commit/delivery is idempotent; forbidden actions never become learned permissions; no context growth with sibling count. Keep current W01–W03 tests and arch gates green.
 
@@ -133,11 +133,15 @@ Each delivered wave records `MIG-PL90-Wxx`: baseline commit, planning compartmen
 11. How intent-driven writes request expansion of path scope without silently violating original acceptance contract.
 12. Trace/event schema that makes graph evolution understandable in TUI/Web/Telegram while hiding secret material.
 
-**Additional PL-90 status note (2026-10-08):** W03c, W03d and W09a–W09c are **PLANNED ONLY**; this PR currently contains no durable learning outbox or production cross-run memory consumer. The new [05 addendum](05-error-learning-and-run-isolation.md) introduces evidence-based gates, not a tested feature.\n\n## 7. Implementation status
+**Additional PL-90 status note (2026-10-08, updated 2026-10-27):** W09a (job-local learning drain) and W09b (top-k lesson recall for the intent-cycle proposer) are **IN PR (PR #151)** in the intent-cycle worker; only W09c (reviewed global promotion, expiry/supersession/revocation) is **PLANNED ONLY**, so there is still no global or cross-agent memory consumer. W03c is **IN PR (PR #151)**: `CycleDriver` builds typed observations (`cycle_observation.rs`) at refusal, permanent proposer failure (`ProviderUnavailable` / `ProposerFailed`, `classify_proposer_failure`), executor failure, uncertain reconciliation and verification, and persists them in the same `CycleStore` commit as the checkpoint (`commit_step_observed` into `CycleRecord.outbox`, `cycle_outbox.rs`, §7.7); the consumer is the `harw-cli` learning drain, which reads pending observations only lease-fenced (`CycleStore::pending_observations(cycle_id, token)`). W03d is **IN PR (PR #151)** with documented limitations (identity-bound recall, parent envelope sanitizer, root-only facts pinned by test; see [05 §4](05-error-learning-and-run-isolation.md)). The [05 addendum](05-error-learning-and-run-isolation.md) still introduces evidence-based gates for the unfinished parts, not a tested learning feature.
+
+**Status labels (PR #151):** everything labelled **IN PR (PR #151)** in this document and in [05](05-error-learning-and-run-isolation.md) / [06](06-live-session-dream-diary-learning-wiring.md) is **IN PR — static/unverified**: the Rust suite was not runnable in the authoring session and the exact head has no reported CI status, so these rows do not even meet the `IN PR` vocabulary below (locally green tests). Promotion to CURRENT is not automatic. It becomes merely *eligible* once #151 merges with green CI on the exact head, the MIG-PL90 ledger entries drafted in the PR body are recorded with that evidence, and every mandatory acceptance item and open review blocker of the row is closed with its named test (for W09a: 05 §5 items 6/7 — barrier-controlled reclaim between lease check and cycle commit, and crash/open/write-failure recovery of accepted observations).
+
+## 7. Implementation status
 
 Status vocabulary as in the dossier: `CURRENT` = merged and checked, `IN PR` = code in this PR with locally green tests, `PLANNED` = design only.
 
-### 7.1 `harw-plan-bridge/src/intent_cycle.rs` — IN PR
+### 7.1 `harw-plan-bridge/src/intent_cycle.rs` — CURRENT (MIG-PL90-W03w, PR #148)
 
 Verified locally with `cargo test -p harw-plan-bridge` (222 lib + 20 `intent_cycle` tests green) and `cargo clippy -p harw-plan-bridge --all-targets -- -D warnings` (clean). The original seven source-only tests had never been run; running them found one real defect: `{"kind":"complete","permission":"full_access"}` deserialized, because serde does not enforce `deny_unknown_fields` on unit variants of internally tagged enums. All proposal and join variants are now struct variants and the test covers four injection shapes.
 
@@ -152,7 +156,7 @@ Verified locally with `cargo test -p harw-plan-bridge` (222 lib + 20 `intent_cyc
 | Durable fence | `CycleCheckpoint` (schema v1) with `CheckpointFence { epoch, sequence }`; `check_commit` is the CAS rule: same epoch → sequence + 1, new epoch → never rewind, stale epoch refused, intent/authority/ceiling immutable across commits | — |
 | Resume | checkpoint stores the non-authorizing `AuthoritySnapshot` and `AdmissionCeiling`; `resume_admission` takes the context from `PolicyBootstrap::reissue`, refuses another workspace or any permission the snapshot never held, intersects stored ceiling × current admission × reissued permissions (write targets need `WriteWorkspace`, reads need `ReadWorkspace`), narrows limits, re-fences under the new epoch; test covers a policy + role upgrade between crash and resume | R01 |
 
-### 7.2 `harw-plan-bridge/src/cycle_runtime.rs` — IN PR (W02 runtime binding)
+### 7.2 `harw-plan-bridge/src/cycle_runtime.rs` — CURRENT (MIG-PL90-W03w, PR #148; W02 runtime binding)
 
 Verified locally: `cargo test -p harw-plan-bridge` (235 lib tests incl. 13 `cycle_runtime`), clippy `-D warnings` clean, `xtask gates arch` without violations for `harw-plan-bridge` (new edges A → J `harw-job-core`/`harw-job-store` are permitted by `A.may_depend_on = ["*"]`).
 
@@ -168,35 +172,85 @@ Verified locally: `cargo test -p harw-plan-bridge` (235 lib tests incl. 13 `cycl
 
 Covered failure injections: stale epoch / zombie executor, foreign job, double journal, crash with completed / uncertain / not-started step, tampered or widened rebind, policy downgrade between submit and claim, unavailable proposer, executor capability failure, cancellation, end-to-end through a real `JobStore` + `DurableJobRunner`.
 
-### 7.3 `cycle_explorer.rs` / `cycle_proposer.rs` — IN PR (W03 building blocks)
+### 7.3 `cycle_explorer.rs` / `cycle_proposer.rs` — CURRENT (MIG-PL90-W03w, PR #148; W03 building blocks)
 
 Intermediate state: the two halves of the W03 explorer exist as independently tested modules and are now merged together with one cross-module test (`cycle_w03_tests.rs`: `CycleDriver` + `ModelCycleProposer` over a scripted fake `ModelProvider` + `ReadOnlyExplorerExecutor` over a temp workspace; Advance(read) -> digest-bound `Observed` evidence -> Reorient on that evidence -> read -> Escalate; it also asserts the turn-2 prompt contains the evidence id and locator but no file content and no digest). Verified locally: `cargo test -p harw-plan-bridge` (271 lib + 20 `intent_cycle` tests green), clippy `-D warnings` clean, `rustfmt --edition 2024 --check` clean, `xtask gates arch` shows only the 6 pre-existing violations (`harw-cloud*`, `harw-tool-obsidian`). New edge: `harw-plan-bridge` -> `harw-tool-fsread`.
 
 | Module | What it does | Key decisions |
 |---|---|---|
 | `cycle_explorer.rs` (`ReadOnlyExplorerExecutor`) | First trusted `CycleStepExecutor`: turns admitted `Segment::Read` segments into `EvidenceRecord`s (source `Repository`, digest of the bytes, workspace-relative locator). Refuses child/nested segments and every non-read proposal. Reads go through `harw-tool-fsread` `Scope` (no symlink escape, regular files only, secret paths denied) and need `ReadWorkspace` | Target ids map to paths only via a trusted, non-`Deserialize` `ReadTargetMap`. All-or-nothing step: any failing read returns `Err(StepFailure)` (no partial evidence); the driver counts it as a stall. `reconcile` always returns `NotStarted` (reads are idempotent; a recovered digest could be stale). Oversized files are refused, never truncated or digested as a prefix. Optional bounded in-memory `ExplorerReadCache` (oldest-first eviction, filled only when the whole step succeeded, lost on restart). It only ever produces `Observed` evidence |
-| `cycle_proposer.rs` (`ModelCycleProposer`) | `CycleProposer` over a `ModelProvider`: pure `render_prompt` -> one JSON object -> `serde` parse (`deny_unknown_fields`) -> `CycleProposal`; admission and executor still decide everything | Route policy: deterministic default/escalation route chosen from refusal streak and `stall_transitions`, never by the model. One repair re-prompt with the bounded parse error, then `Err` -> `Blocked` (no synthesized `Escalate`). Retryable provider errors retried up to `max_retries` without sleeping. Auth circuit breaker: after `auth_trip_after` consecutive `Auth` failures a route is no longer used. Prompt exclusions: no authority snapshot, ceiling, permissions, digests, file contents or claim bodies; ids and locators are sanitized and capped |
+| `cycle_proposer.rs` (`ModelCycleProposer`) | `CycleProposer` over a `ModelProvider`: pure `render_prompt` -> one JSON object -> `serde` parse (`deny_unknown_fields`) -> `CycleProposal`; admission and executor still decide everything | Route policy: deterministic default/escalation route chosen from refusal streak and `stall_transitions`, never by the model. One repair re-prompt with the bounded parse error, then `Err` -> `Blocked` (no synthesized `Escalate`). Retryable provider errors retried up to `max_retries` times with bounded waits (`retry_wait`; a provider wait above `retry_max_wait` fails at once). Auth circuit breaker: after `auth_trip_after` consecutive `Auth` failures a route is no longer used. Prompt exclusions: no authority snapshot, ceiling, permissions, digests, file contents or claim bodies; ids and locators are sanitized and capped |
 
 What is NOT done:
 
-- No runtime caller builds a `ReadTargetMap`, and there is no tool or registry entry that starts a cycle with these modules.
-- No real verifier: `Verify` is refused by the explorer, so `Complete` (which needs `Verified` evidence) is unreachable for a pure explorer cycle; the cross-module test therefore ends in `Escalate`, and the in-module `Verified` stand-in in `cycle_explorer` tests is a test double.
+- ~~No runtime caller builds a `ReadTargetMap`, and there is no tool or registry entry that starts a cycle with these modules.~~ Done in 7.4.
+- ~~No real verifier: `Verify` is refused by the explorer, so `Complete` is unreachable.~~ Done in 7.4 (`cycle_verifier`); the in-module `Verified` stand-in in `cycle_explorer` tests is still a test double.
 - No `CancelToken` in the proposer (`CycleProposer::propose` does not receive one; requests carry `cancel: None`).
-- No retry backoff (the provider layer owns pacing and `Retry-After`).
+- ~~No retry backoff.~~ The proposer now sleeps bounded waits (see the table above); the provider layer still owns pacing.
 - No small-model benchmark (the W03 exit criterion in section 2 is still open).
 
-### 7.4 Not done (PLANNED)
+### 7.4 Production wiring of the read-only recipe — CURRENT (MIG-PL90-W03w, PR #148)
 
-- No production caller yet: no tool (`intent_cycle.start/status/stop`), no registry entry, no concrete proposer (model route, `(model, effort)` per turn) or executor (tools, child spawn, nested recipes). W03 now has its building blocks (7.3) but no wiring or benchmark; W04 is open.
-- Network-scope widening on resume is checked but not covered by a test (the public test constructors cannot build a non-empty `NetworkScope` from this crate).
+The W03 building blocks are now reachable end to end:
 
-- W03 wiring and W04–W10: no wired explorer, orchestrator, write-wave, research, Matrix, paper/LaTeX, memory or DoD adapter is wired; review threads R03–R05 and R07–R12 remain documentation/contract findings for those waves.
+| Layer | What | Where |
+|---|---|---|
+| Verifier | `ContentCheck` per acceptance criterion; `Verify` re-reads the observed file, requires the same digest, yields `Verified` evidence (source `Verification`) or an `unmet:`/`stale:` claim. `Complete` is now reachable without trusting the model | `harw-plan-bridge/src/cycle_verifier.rs` |
+| Executor | `ExplorerCycleExecutor` = read-only explorer (read, wait) + verifier (verify); everything else refused | same |
+| Spec | `ReadOnlyCycleSpec` (objective, read targets, checks, limits ≤ `MAX_CYCLE_LIMITS`), one canonical intent digest, `plan()` = the single validation of operation and worker | `harw-plan-bridge/src/cycle_spec.rs` |
+| Reissue | `CeilingReissuer`: persisted snapshot ∩ current trusted ceiling of the same workspace (never widens) | `cycle_runtime.rs` |
+| Tools | `intent_cycle.start` (approval always), `.status` and `.list` (observer tier, read-only model tools; `GET /api/intent-cycle/status` / `GET /api/intent-cycle/list`; `.list` and its route are IN PR (PR #151), the rest of this row is CURRENT), `.stop` (approval always); behind `[tools.plan]`; `ReadWorkspace` right; catalog class `Read`/`Meta` | `harw-ops/src/intent_cycle.rs`, `harw-registry-defaults` |
+| Operator surfaces | IN PR (PR #151): `/cycle list\|status\|stop` (TUI-only command, operator tier, no model-tool surface) and the `harw cycle list\|status\|stop` CLI, both dispatching to the same operation | `harw-ops/src/intent_cycle.rs`, `harw-cli/src/cli/cycle.rs` |
+| Job | kind `intent_cycle`, long-run lane, claim fence, read-only explore sandbox as ceiling, record created on first claim (epoch 0 → first lease rebinds), budgeted proposer, job cancel → driver cancel, wall budget | `harw-cli/src/job_worker_intent_cycle.rs` |
+
+Verified locally: `cargo test -p harw-plan-bridge` (cycle tests incl. `spec_read_verify_complete_reaches_completion_proposed`), `cargo test -p harw-ops`, `cargo test -p harw-registry-defaults`, `cargo test -p harw-cli --lib intent_cycle` (worker e2e: admitted job → `Succeeded { terminal: completion_proposed, requires_owner_acceptance: true }`).
+
+Proposer cancellation: the driver races every `propose` against the job's cancel token (`tokio::select!`), so a stop or lease loss drops an in-flight model request; the trait itself still takes no token.
+
+### 7.5 Not done (PLANNED)
+
+- No concrete executor for tools beyond file reads, waits and the content verifier; no child spawn or nested recipes.
+- W05 is PARTIAL (IN PR (PR #151)) — `harw-plan-bridge::cycle_write_admission` (trusted `PatchProposal::from_admitted` + `admit_patch`: WriteWorkspace right, admitted target, scope-safe path, target→path re-check, preimage re-read; `from_admitted` takes a `&JournaledStep`, so a proposal is minted only from a step the store journaled under the current lease via the fenced `CycleStore::journaled_step`, never from caller-built steps or checkpoints) and `harw-plan-bridge::file_lease` (per-job, epoch-fenced, all-or-nothing file reservations) exist in PR #151; there is still no write executor, `ReadOnlyCycleSpec` still forces empty write targets, and no production caller grants WriteWorkspace to a cycle. W04 is PARTIAL (compact offers, IN PR (PR #151)), see §7.7.
+- No small-model benchmark (W03 exit criterion).
+- Network-scope widening on resume is checked; the test is scheduled with the proposer-correctness wave (`resume_refuses_widened_network_scope`).
+
+- W04–W10: no wired orchestrator, write-wave, research, Matrix, paper/LaTeX or DoD adapter is wired; review threads R03–R05 and R07–R12 remain documentation/contract findings for those waves. Exception: W09a (job-local learning consumer) and W09b (`learning_recall` top-k lesson recall) are IN PR (PR #151) in the intent-cycle worker (§7.7, [05 §4](05-error-learning-and-run-isolation.md)); W09c (reviewed global promotion, expiry/revocation) stays PLANNED.
 - Crate ownership: both modules stay in `harw-plan-bridge` (layer A). `intent_cycle` adds no dependency edge; `cycle_runtime` adds A → J edges to `harw-job-core`/`harw-job-store` and a direct `tokio` dependency already in the graph. Moving the pure core into a dedicated chain crate needs the ring analysis from W00.
 
-### 7.5 Base-branch notes found while verifying
+### 7.6 Base-branch notes found while verifying
 
 - `dev@197a92e` did not compile `harw-core` (missing `WorkId` import, missing `&` in a `ReferencedSnapshotId::confirm` call, both from the merge `9ae603a`/`2fc7234`); this PR carries the three-line fix because nothing downstream could be built otherwise.
 - The root `Cargo.toml` lists `harw-cloud/*` workspace members that are not in the repository; local verification used untracked stub manifests (not committed).
 - Two `harw-core` lib tests fail on the base once it compiles (`child_controller::tests::teil_o::without_a_relay_the_child_still_fails_closed`, `turn_loop::tests::uia_keeps_transfer_tools_with_one_line_descriptions`); unrelated to this PR and left for a separate fix.
+
+### 7.7 Library modules added in PR #151 and their production callers (audit)
+
+| Module | Contract | Missing integration step |
+|---|---|---|
+| `harw-plan-bridge/src/cycle_observation.rs` (`RunObservationV1`, typed classifiers) + `cycle_outbox.rs` (epoch-fenced `Outbox<T>`, 64 pending / 128 acked tail) | W03c (05 §3) — **IN PR (PR #151) (wired: `CycleDriver` calls `build_observation` at refusal, permanent proposer failure (`classify_proposer_failure`: `ProviderUnavailable` / `ProposerFailed`), executor failure, uncertain reconciliation and verification, and commits through `CycleStore::commit_step_observed` into `CycleRecord.outbox` in the same CAS write as the checkpoint; `harw-plan-bridge/src/cycle_runtime.rs`)** | consumer = the W09a learning drain of the intent-cycle worker in `harw-cli`, which reads pending observations only through the lease-fenced `CycleStore::pending_observations(cycle_id, token)`; fence refusals cannot be recorded in the record they are refused for and are only logged; no other consumer |
+| `harw-plan-bridge/src/child_return_envelope.rs` | W03d-3 (05 §2.2) — **IN PR (PR #151) (wired: the production child→parent path is `harw-research::return_envelope::sanitize_for_parent`, called from the `ReturnEnvelope` contract arm in `harw-core-bridge/src/agent_tool.rs`; limit violations are content-free contract violations, an over-long summary is truncated and flagged)** | this module stays the contract for future `Segment::Child` steps and has no production caller; its caps are pinned equal to the research gate by `caps_match_harw_research_envelope_caps` |
+| `harw-extension-api/src/target_offer.rs` | W04 (top-k role offers) — **PARTIAL (IN PR (PR #151))** | PARTIAL — compact offers rendered for large target lists (`DelegationTargets::offers` feeds the `delegation.targets` block in `harw-core/src/turn_loop.rs`; the tool schema and admission are unchanged); DAG-change tool, reconciliation, capability snapshot still PLANNED |
+| `harw-plan-bridge/src/cycle_benchmark.rs` | W03 exit (small-model benchmark scoring) | benchmark harness and fixtures |
+| `harw-knowledge/src/caller_identity.rs` | W03d-2 (05 §1) — **IN PR (PR #151) (wired: `RecallQuery::with_caller_identity` and `artifact_visible` decide recall and index visibility by identity; `KnowledgeCaller::from_context` reads the `Arc<CallerIdentity>` service; `RuntimeChildRegistryFactory::build_registry` derives one per child from the announced child session (`ChildRegistryFactory::announce_child_session`) into the `OpContext` services of its operation tools)** | limitations (05 §4): `ancestors` stay empty because `SpawnInput` has no parent role (needs a trusted spawn record); ids are run-bound (`<role>.<escaped child session id>` via `run_agent_id`, derived once per child in `build_registry`, stable across durable recovery, and shared by diary authorship and `CallerIdentity`); the root `ServiceMap` carries no identity; child knowledge readers (`diary.read`, `palace.*`, …) run outside `OpContext` |
+| `harw-knowledge/src/learning_recall.rs` | W09b (05 §2.3) — **IN PR (PR #151) (wired: `harw-cli/src/job_worker_intent_cycle_learning.rs::lesson_lines` keeps only project-scoped `pl90` lessons before any limit, ranks them by objective keywords and calls `select_lessons` with top-k ≤ 8 / ≤ 1024 tokens; the intent-cycle worker passes the lines to `ModelCycleProposer::with_lessons`, rendered as low-trust data. The lessons come from the W09a drain of the same worker, which reads the outbox through the lease-fenced `CycleStore::pending_observations(cycle_id, token)` and writes only under the trusted `IntentCycleJobInput::learning_root`)** | only the intent-cycle proposer recalls; keyword matching only, `require_verified` off, no expiry/supersession/revocation (W09c PLANNED) |
+| `harw-memory/src/context_provider.rs::with_session_gate` | W03d-1 (05 §1) — **IN PR (PR #151) (library contract; root-only facts policy wired and pinned)**: with the opt-in gate a foreign session's STM contributes nothing | no production caller: `MemoryContextProvider` is not mounted (the root uses the facts-only `MemoryFactsContextProvider`, root-only by explicit policy and pinned by `child_registry_has_no_memory_facts_provider`; children mount none); a future STM mount must enable the gate |
+| `harw-model-catalog/src/lifecycle.rs` | PL-86 D1/D5 — **IN PR (PR #151) (wired: explicit selection via `enforce_explicit` in `harw-runtime/src/live_model.rs`, `harw-ops/src/live_model.rs` and `harw-cli/src/models.rs`; internal model points via `implicitly_selectable_bundled` in `harw-runtime/src/live_model.rs`)** | PL-86 D3 beyond these callers (router) not audited here |
+| `harw-tui-layout/src/mini_live.rs`, `harw-tui/src/{live_ranker,recency_view}.rs` | PL-94 W02 U0 / W01 M2b — **IN PR (PR #151) (wired in `harw-tui`: `panes::portrait_live_strip` calls `harw_tui_layout::chat_first`, the renderer in `app.rs` uses `recency_view::slot_lines`, `app/live_order_glue.rs` ranks child activity with `LiveActivityRanker`)** | none found |
+| `harw-job-linux/src/inventory.rs` | linux-user-cloud-control H04/H05 | procfs/DoD source |
+
+Rows marked IN PR (PR #151) (wired …) have a production caller in that PR. Still without one (no use outside their own module and `lib.rs`): `cycle_benchmark.rs`, `child_return_envelope.rs` (contract only; the production child→parent path is `harw-research::return_envelope::sanitize_for_parent`), `harw-memory::context_provider::MemoryContextProvider` with its `with_session_gate` (not mounted) and `harw-job-linux/src/inventory.rs`. `target_offer.rs` has a caller but W04 stays PARTIAL. A wired module is not evidence of the corresponding wave being complete.
+
+### 7.8 W05 crosswalk (draft): Gap-Hunt gates → cycle transitions
+
+This is the state-to-transition crosswalk that §2 W05 requires before porting, and it is a draft.
+
+| Gap-Hunt gate | Cycle transition / check |
+|---|---|
+| `gap-fix` single file | `ProposePatch` + `admit_patch` |
+| `contract-wave` | `MultiFile` refused in slice 1 |
+| `change=false` entries | future `WriteTargetMap` entries with no patch |
+| ripple `clear\|skipped\|findings\|missing` | future `Verify` / `Reorient` |
+| frozen-SHA central gate | future `Verify` with pinned digest |
+| human-only achievement | `CompletionProposed` stays owner-accepted |
 
 The comparison to Claude Code remains limited to repository-visible workflows (Gap-Hunt kit), **not a claim about Anthropic's internal implementation**.

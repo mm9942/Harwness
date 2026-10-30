@@ -245,6 +245,26 @@ impl PlanStore for ScopedPlanStore<'_> {
         }
     }
 
+    fn reconcile_parent_progress(
+        &self,
+        admission: &crate::parent_progress::ParentAdmission,
+    ) -> PlanResult<crate::parent_progress::ParentProgressView> {
+        if self.scope.is_some() {
+            self.admitted_by_id(&admission.plan_id)?;
+        }
+        self.inner.reconcile_parent_progress(admission)
+    }
+    fn commit_parent_progress_checked(
+        &self,
+        request: &crate::parent_progress::CollectSourcesProgress,
+        before_publish: &dyn Fn() -> PlanResult<()>,
+    ) -> PlanResult<crate::parent_progress::ParentProgressReceipt> {
+        if self.scope.is_some() {
+            self.admitted_by_id(&request.admission.plan_id)?;
+        }
+        self.inner
+            .commit_parent_progress_checked(request, before_publish)
+    }
     fn apply_batch(
         &self,
         plan: &PlanId,
@@ -263,6 +283,28 @@ impl PlanStore for ScopedPlanStore<'_> {
             }
         }
         self.inner.apply_batch(plan, actions, actor, expected_rev)
+    }
+
+    fn apply_batch_checked(
+        &self,
+        plan: &PlanId,
+        actions: Vec<PlanAction>,
+        actor: &str,
+        expected_rev: RevisionId,
+        before_publish: &dyn Fn() -> PlanResult<()>,
+    ) -> PlanResult<PlanRevision> {
+        if self.scope.is_some() {
+            // Der Mandant eines Plans ist unveränderlich; `apply_batch` prüft
+            // die Plan-ID unter dem Schreib-Lock. Unsichtbar ⇒ wie „kein bzw.
+            // ein anderer Plan aktiv“.
+            match self.admitted_by_id(plan) {
+                Ok(_) => {}
+                Err(PlanError::PlanUnknown { .. }) => return Err(PlanError::PlanNotFound),
+                Err(error) => return Err(error),
+            }
+        }
+        self.inner
+            .apply_batch_checked(plan, actions, actor, expected_rev, before_publish)
     }
 
     fn list_plans(&self) -> PlanResult<Vec<PlanSummary>> {
@@ -615,6 +657,32 @@ mod tests {
         );
         assert!(matches!(result, Err(PlanError::CatalogUnsupported { .. })));
         assert!(matches!(store.current(), Err(PlanError::PlanNotFound)));
+        // A foreign store without the optional fenced-publication API still
+        // supports its ordinary batch contract through the scope wrapper.
+        create(&store, "p-legacy")?;
+        let scoped = ScopedPlanStore::new(&store, None);
+        let before = scoped.current()?;
+        scoped.apply_batch(
+            &before.id,
+            vec![PlanAction::Inspect],
+            ACTOR,
+            before.revision,
+        )?;
+        let after = scoped.current()?;
+        assert!(after.revision > before.revision);
+        assert!(matches!(
+            scoped.apply_batch_checked(
+                &after.id,
+                vec![PlanAction::Inspect],
+                ACTOR,
+                after.revision,
+                &|| Ok(()),
+            ),
+            Err(PlanError::CatalogUnsupported {
+                operation: "apply_batch_checked"
+            })
+        ));
+        assert_eq!(scoped.revision(), after.revision);
         Ok(())
     }
 

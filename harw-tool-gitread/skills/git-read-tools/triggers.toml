@@ -1,0 +1,21 @@
+# When the `git-read-tools` skill is injected (PL-95 trigger manifest, format:
+# harw-catalog/src/skill_triggers.rs). Bundled by harw-home (PL-97 B4).
+when = "Inspecting repository state or history (status, diff, log, show, branch, blame): use the read-only git.* tools instead of running git."
+
+[triggers]
+tools = [
+  "git.status",
+  "git.diff",
+  "git.log",
+  "git.show",
+  "git.branch",
+  "git.blame",
+]
+commands = [
+  "git status",
+  "git diff",
+  "git log",
+  "git show",
+  "git branch",
+  "git blame",
+]

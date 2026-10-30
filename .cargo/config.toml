@@ -1,5 +1,0 @@
-# `cargo xtask <befehl>` statt `cargo run -p xtask --`. Der Aufruf steht so in
-# jedem CI-Schritt und im Makefile; ohne den Alias müsste die längere Form an
-# jeder dieser Stellen wiederholt werden.
-[alias]
-xtask = "run --package xtask --quiet --"

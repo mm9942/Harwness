@@ -20,6 +20,8 @@
 //! # Fehlertypen
 //! Keine — alle Operationen sind infallibel.
 
+use crate::i18n::tr;
+
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
@@ -31,14 +33,15 @@ use ratatui::{
         Widget, Wrap,
     },
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::dialog_frame::{BodyScroll, wrapped_rows};
 use crate::sanitize::sanitize_inline;
 use crate::style;
 
 /// Fußzeilen-Hinweis mit der Tastaturbelegung des Dialogs.
-const FOOTER_HINT: &str = "↑↓ wählen · Enter bestätigen · Esc abbrechen";
+const FOOTER_HINT: &str = "↑↓ select · Enter confirm · Esc cancel";
 
 /// Aktionssignal, das [`ChoiceDialog::handle_key`] zurückgibt.
 ///
@@ -122,6 +125,16 @@ impl ChoiceDialog {
             footer_hint: None,
             body_scroll: BodyScroll::default(),
         }
+    }
+
+    /// Replace caller-owned semantic presentation, preserving selected action and
+    /// body scroll. Only the owner may use this with the same ordered actions.
+    pub(crate) fn refresh_owned_presentation(&mut self, fresh: Self) {
+        debug_assert_eq!(self.options.len(), fresh.options.len());
+        self.title = fresh.title;
+        self.prompt = fresh.prompt;
+        self.options = fresh.options;
+        self.footer_hint = fresh.footer_hint;
     }
 
     /// Setzt die anfänglich markierte Option und gibt `self` für
@@ -236,7 +249,9 @@ impl ChoiceDialog {
     }
 
     fn footer_text(&self) -> &str {
-        self.footer_hint.as_deref().unwrap_or(FOOTER_HINT)
+        self.footer_hint
+            .as_deref()
+            .unwrap_or_else(|| tr("dialogs.choice_footer", FOOTER_HINT))
     }
 
     fn prompt_lines(&self, theme: style::Theme) -> Option<Vec<Line<'static>>> {
@@ -331,8 +346,29 @@ impl ChoiceDialog {
     /// # Nebenläufigkeit
     /// Rein synchron; kein Locking erforderlich.
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: style::Theme) {
+        self.render_with_presentation(
+            area,
+            buf,
+            theme,
+            &self.title,
+            self.prompt.as_deref(),
+            self.footer_text(),
+        );
+    }
+
+    /// Render caller-owned semantic chrome without replacing navigation, scroll,
+    /// or supplied option labels. Callers resolve these labels in the current locale.
+    pub(crate) fn render_with_presentation(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: style::Theme,
+        title: &str,
+        prompt: Option<&str>,
+        footer: &str,
+    ) {
         let area = area.intersection(buf.area);
-        let title = sanitize_inline(&self.title);
+        let title = sanitize_inline(title);
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         Widget::render(block, area, buf);
@@ -344,10 +380,7 @@ impl ChoiceDialog {
         let height = usize::from(inner.height);
 
         // Fußzeile: angeheftet unten, umgebrochen statt abgeschnitten.
-        let footer = vec![Line::styled(
-            self.footer_text().to_owned(),
-            style::dim_style(theme),
-        )];
+        let footer = vec![Line::styled(footer.to_owned(), style::dim_style(theme))];
         let footer_rows = if height >= 2 {
             wrapped_rows(&footer, width).min(height - 1)
         } else {
@@ -357,7 +390,8 @@ impl ChoiceDialog {
 
         // Hinweistext: bekommt, was die Optionen übrig lassen (mindestens
         // eine Zeile), und scrollt darüber hinaus.
-        let prompt = self.prompt_lines(theme);
+        let prompt =
+            prompt.map(|text| vec![Line::styled(sanitize_inline(text), style::dim_style(theme))]);
         let prompt_rows = prompt
             .as_ref()
             .map_or(0, |lines| wrapped_rows(lines, width));
@@ -454,19 +488,19 @@ impl ChoiceDialog {
 
 /// Kürzt `text` auf `width` Spalten (mit `…`), ohne Zeichen zu zerteilen.
 fn fit_to_width(text: &str, width: usize) -> String {
-    let total: usize = text.chars().map(|ch| ch.width().unwrap_or(0)).sum();
+    let total = UnicodeWidthStr::width(text);
     if total <= width {
         return text.to_owned();
     }
     let mut out = String::new();
     let mut used = 0;
-    for ch in text.chars() {
-        let w = ch.width().unwrap_or(0);
+    for grapheme in text.graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
         if used + w + 1 > width {
             break;
         }
         used += w;
-        out.push(ch);
+        out.push_str(grapheme);
     }
     if width > 0 {
         out.push('…');
@@ -500,6 +534,66 @@ mod tests {
                 "Abbrechen".to_owned(),
             ],
         )
+    }
+
+    #[test]
+    fn owned_refresh_keeps_selected_action_and_body_scroll() {
+        let mut dialog = ChoiceDialog::new(
+            "old",
+            Some("prompt ".repeat(200)),
+            vec!["first".into(), "second".into()],
+        )
+        .with_selected(1);
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        dialog.render(area, &mut buf, style::Theme::Dark);
+        dialog.scroll_body(false, 3);
+        let offset = dialog.body_scroll.offset();
+        assert!(offset > 0);
+        dialog.refresh_owned_presentation(ChoiceDialog::new(
+            "新しいタイトル",
+            Some("説明文 ".repeat(200)),
+            vec!["最初".into(), "次".into()],
+        ));
+        assert_eq!(dialog.body_scroll.offset(), offset);
+        dialog.render(area, &mut buf, style::Theme::Dark);
+        assert_eq!(dialog.body_scroll.offset(), offset);
+        assert_eq!(
+            dialog.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ChoiceAction::Chosen(1)
+        );
+    }
+
+    #[test]
+    fn presentation_override_preserves_selected_option_and_prompt_scroll() {
+        let mut dialog = ChoiceDialog::new(
+            "payload title",
+            Some("original".repeat(200)),
+            vec!["payload-one".into(), "payload-two".into()],
+        )
+        .with_selected(1);
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        dialog.render(area, &mut buf, style::Theme::Dark);
+        dialog.scroll_body(false, 3);
+        let offset = dialog.body_scroll.offset();
+        assert!(offset > 0);
+        dialog.render_with_presentation(
+            area,
+            &mut buf,
+            style::Theme::Dark,
+            "モデルを選択",
+            Some(&"説明文です。".repeat(200)),
+            "Enter 確定",
+        );
+        assert_eq!(dialog.body_scroll.offset(), offset);
+        assert!(crate::overlay_view::buffer_text(&buf).contains("payload-two"));
+        assert_eq!(
+            dialog.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ChoiceAction::Chosen(1)
+        );
+        assert_eq!(dialog.title, "payload title");
+        assert_eq!(dialog.options[1], "payload-two");
     }
 
     /// `Esc` liefert `ChoiceAction::Cancel`.
@@ -609,7 +703,7 @@ mod tests {
         assert!(rendered.contains("In die Zwischenablage kopieren"));
         assert!(rendered.contains("Als Datei speichern"));
         assert!(rendered.contains("Abbrechen"));
-        assert!(rendered.contains("wählen"));
+        assert!(rendered.contains("select"));
     }
 
     /// `desired_height` zählt Rahmen, Hinweiszeile plus Leerzeile, eine Zeile
@@ -719,5 +813,30 @@ mod tests {
             ChoiceAction::Chosen(1),
             "Scrollen hat die Auswahl nicht verändert"
         );
+    }
+    #[test]
+    fn non_latin_labels_fit_display_cells_without_splitting_graphemes() {
+        for text in [
+            "日本語の選択肢",
+            "e\u{301}e\u{301}e\u{301}",
+            "क्षिक्षिक्षि",
+            "👩‍💻👩‍💻",
+        ] {
+            for width in 0..16 {
+                let fitted = fit_to_width(text, width);
+                assert!(
+                    UnicodeWidthStr::width(fitted.as_str()) <= width,
+                    "{width}: {fitted:?}"
+                );
+                if let Some(prefix) = fitted.strip_suffix('…') {
+                    assert!(
+                        text.grapheme_indices(true).any(|(i, _)| i == prefix.len()),
+                        "{text:?}: {prefix:?}"
+                    );
+                } else if width > 0 {
+                    assert_eq!(fitted, text);
+                }
+            }
+        }
     }
 }

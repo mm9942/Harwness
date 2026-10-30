@@ -596,12 +596,12 @@ const KIND_KEYWORDS: &[(&str, &[&str])] = &[
 #[must_use]
 pub fn action_kind(action: &str, kinds: &[String]) -> Option<String> {
     let trimmed = action.trim_start();
-    if let Some(rest) = trimmed.strip_prefix('[') {
-        if let Some((kind, _)) = rest.split_once(']') {
-            let kind = kind.trim().to_lowercase();
-            if kinds.contains(&kind) {
-                return Some(kind);
-            }
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some((kind, _)) = rest.split_once(']')
+    {
+        let kind = kind.trim().to_lowercase();
+        if kinds.contains(&kind) {
+            return Some(kind);
         }
     }
     let lower = action.to_lowercase();

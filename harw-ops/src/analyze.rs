@@ -593,19 +593,17 @@ fn assign_levels(units: &mut [AnalysisUnit]) {
         if !pending {
             break;
         }
-        if !progressed {
-            if let Some(blocked) = levels.iter().position(Option::is_none) {
-                tracing::warn!(
-                    unit = units[blocked].name.as_str(),
-                    "analyze.graph.cycle — offene Kanten verworfen"
-                );
-                let resolved: BTreeSet<String> = index
-                    .iter()
-                    .filter(|&(_, &other)| levels[other].is_some())
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                units[blocked].deps.retain(|dep| resolved.contains(dep));
-            }
+        if !progressed && let Some(blocked) = levels.iter().position(Option::is_none) {
+            tracing::warn!(
+                unit = units[blocked].name.as_str(),
+                "analyze.graph.cycle — offene Kanten verworfen"
+            );
+            let resolved: BTreeSet<String> = index
+                .iter()
+                .filter(|&(_, &other)| levels[other].is_some())
+                .map(|(name, _)| name.clone())
+                .collect();
+            units[blocked].deps.retain(|dep| resolved.contains(dep));
         }
     }
     for (unit, level) in units.iter_mut().zip(levels) {

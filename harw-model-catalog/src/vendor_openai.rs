@@ -2,7 +2,7 @@
 //! OpenAI-Modellkatalog — aus verifizierter Vendor-Research 2026-07-16.
 //!
 //! Quelle: `docs/research/models/openai.json`, verifiziert am 2026-07-16;
-//! GPT-6 Sol und GPT-6 Luna ergänzt am 2026-09-24 (Modellkarten der OpenAI-API).
+//! GPT-6 Sol/Luna ergänzt 2026-09-24, GPT-6.1 Sol/Terra 2026-10-29 (OpenAI-Modellkarten).
 //!
 //! ## Verantwortung
 //! Deklariert alle aktuellen OpenAI-Modelle als [`ModelDescriptor`]-Einträge sowie
@@ -10,7 +10,7 @@
 //! `Score::HALF`, kein Evidenz-Stand).
 //!
 //! ## Wichtigste Typen
-//! - [`openai_descriptors`] — liefert 19 `ModelDescriptor`-Einträge laut Vendor-JSON.
+//! - [`openai_descriptors`] — liefert 21 `ModelDescriptor`-Einträge laut Vendor-JSON.
 //! - [`openai_observations`] — liefert je einen Bootstrap-Beobachtungs-Eintrag pro Modell.
 //!
 //! ## Nebenläufigkeit
@@ -24,7 +24,7 @@
 //! ```rust,no_run
 //! use harw_model_catalog::vendor_openai::openai_descriptors;
 //! let catalog = openai_descriptors();
-//! assert_eq!(catalog.len(), 19);
+//! assert_eq!(catalog.len(), 21);
 //! ```
 
 use crate::descriptor::{
@@ -37,8 +37,8 @@ use crate::observed::ObservedModelBehavior;
 /// Gibt deklarierte [`ModelDescriptor`]-Einträge aller aktuellen OpenAI-Modelle zurück.
 ///
 /// # Beschreibung
-/// Alle 19 Einträge werden direkt aus `docs/research/models/openai.json` (Stand
-/// 2026-07-16, GPT-6 Sol/Luna ergänzt 2026-09-24) abgeschrieben. Es wird kein JSON zur Laufzeit geparst; die Werte
+/// Alle 21 Einträge werden direkt aus `docs/research/models/openai.json` (Stand
+/// 2026-07-16, GPT-6 Sol/Luna ergänzt 2026-09-24, GPT-6.1 Sol/Terra 2026-10-29) abgeschrieben. Es wird kein JSON zur Laufzeit geparst; die Werte
 /// sind hardcodiert und mit der Quelldatei verifiziert.
 ///
 /// Mapping-Regeln (gemäß Orchestrator-Brief):
@@ -56,7 +56,7 @@ use crate::observed::ObservedModelBehavior;
 /// - `pricing`: `None` (Preise leben in `harw-provider`).
 ///
 /// # Rückgabe
-/// `Vec<ModelDescriptor>` mit genau 19 Einträgen.
+/// `Vec<ModelDescriptor>` mit genau 21 Einträgen.
 ///
 /// # Concurrency
 /// Rein deterministisch, keine Seiteneffekte.
@@ -65,11 +65,42 @@ use crate::observed::ObservedModelBehavior;
 /// ```rust,no_run
 /// use harw_model_catalog::vendor_openai::openai_descriptors;
 /// let catalog = openai_descriptors();
-/// assert_eq!(catalog.len(), 19);
+/// assert_eq!(catalog.len(), 21);
 /// assert!(catalog.iter().any(|d| d.model == "gpt-5.6-sol"));
 /// ```
 pub fn openai_descriptors() -> Vec<ModelDescriptor> {
-    let mut out = Vec::with_capacity(19);
+    let mut out = Vec::with_capacity(21);
+
+    // GPT-6.1 Sol/Terra: official model cards verified 2026-10-29.
+    // https://developers.openai.com/api/docs/models/gpt-6.1-sol
+    // https://developers.openai.com/api/docs/models/gpt-6.1-terra
+    // These are public API limits; configured account/server limits take precedence.
+    for id in ["gpt-6.1-sol", "gpt-6.1-terra"] {
+        out.push(ModelDescriptor {
+            provider: ProviderId::from("openai"),
+            model: ModelId::from(id),
+            context_window: 1_050_000,
+            max_output_tokens: Some(128_000),
+            modalities: ModalitySet::new(vec![Modality::Text, Modality::Image]),
+            capabilities: ModelCapabilities {
+                tool_calling: ToolCallingSupport::Parallel,
+                parallel_tools: true,
+                structured_output: StructuredOutputSupport::JsonSchema,
+                reasoning: ReasoningSupport::Effort,
+                prompt_caching: PromptCachingSupport::Explicit,
+                streaming: StreamingSupport::ServerSent,
+                image_input: true,
+                native_agent_features: AgentFeatureSet {
+                    computer_use: true,
+                    code_execution: true,
+                    built_in_search: true,
+                    file_search: true,
+                },
+            },
+            pricing: None,
+            lifecycle: ModelLifecycle::Ga,
+        });
+    }
 
     // ── GPT-6-sol ───────────────────────────────────────────────────────────────
     // lifecycle: ga (2026-09-22) | context: 1_050_000 | max_output: 128_000
@@ -616,7 +647,7 @@ pub fn openai_descriptors() -> Vec<ModelDescriptor> {
 /// Die Einträge werden durch echte Harness-Runs befüllt.
 ///
 /// # Rückgabe
-/// `Vec<ObservedModelBehavior>` mit genau 19 Einträgen.
+/// `Vec<ObservedModelBehavior>` mit genau 21 Einträgen.
 ///
 /// # Concurrency
 /// Rein deterministisch, keine Seiteneffekte.
@@ -636,12 +667,12 @@ mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult};
 
-    /// GPT-6 Sol und GPT-6 Luna (API seit 2026-09-22) sind mit ihren
+    /// GPT-6 Sol/Luna und GPT-6.1 Sol/Terra sind mit ihren
     /// Kerndaten aus der OpenAI-Modellkarte im Katalog.
     #[test]
     fn gpt6_sol_and_luna_are_described() -> TestResult {
         let descriptors = openai_descriptors();
-        for id in ["gpt-6-sol", "gpt-6-luna"] {
+        for id in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"] {
             let d = descriptors
                 .iter()
                 .find(|d| d.model == id)

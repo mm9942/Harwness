@@ -83,13 +83,17 @@ fn enabled(feature: &str) -> bool {
         "tool-doc" => cfg!(feature = "tool-doc"),
         "tool-explorer" => cfg!(feature = "tool-explorer"),
         "tool-fs" => cfg!(feature = "tool-fs"),
+        "tool-fsread" => cfg!(feature = "tool-fsread"),
+        "tool-gitread" => cfg!(feature = "tool-gitread"),
         "tool-job" => cfg!(feature = "tool-job"),
         "tool-latex" => cfg!(feature = "tool-latex"),
         "tool-lens" => cfg!(feature = "tool-lens"),
+        "tool-obsidian" => cfg!(feature = "tool-obsidian"),
         "tool-plan" => cfg!(feature = "tool-plan"),
         "tool-process" => cfg!(feature = "tool-process"),
         "tool-shell" => cfg!(feature = "tool-shell"),
         "tool-sudo" => cfg!(feature = "tool-sudo"),
+        "tool-sys" => cfg!(feature = "tool-sys"),
         "tool-web" => cfg!(feature = "tool-web"),
         // A provider feature named after `PROVIDER_FEATURES` this crate
         // does not yet know: report it as absent rather than fail closed
@@ -239,13 +243,17 @@ mod tests {
                         | "tool-doc"
                         | "tool-explorer"
                         | "tool-fs"
+                        | "tool-fsread"
+                        | "tool-gitread"
                         | "tool-job"
                         | "tool-latex"
                         | "tool-lens"
+                        | "tool-obsidian"
                         | "tool-plan"
                         | "tool-process"
                         | "tool-shell"
                         | "tool-sudo"
+                        | "tool-sys"
                         | "tool-web"
                 )
             })

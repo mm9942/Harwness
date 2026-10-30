@@ -288,10 +288,10 @@ impl KeyTable {
             .keys
             .get(&name_of(key))
             .ok_or(CryptoServiceError::NotFound)?;
-        if let Some(expected) = key.version {
-            if expected != entry.primary {
-                return Err(CryptoServiceError::Conflict);
-            }
+        if let Some(expected) = key.version
+            && expected != entry.primary
+        {
+            return Err(CryptoServiceError::Conflict);
         }
         Ok(entry.algorithm)
     }
@@ -576,10 +576,10 @@ impl StoreFile {
     /// wrong KEK → `Authentication`; inconsistent body → `Corrupt`.
     pub(super) fn open(path: &Path, kek: &Kek) -> Result<(Self, KeyTable), SealedStoreError> {
         let lock = acquire_lock(path)?;
-        if let Err(error) = std::fs::symlink_metadata(path) {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Err(SealedStoreError::NotFound(path.to_path_buf()));
-            }
+        if let Err(error) = std::fs::symlink_metadata(path)
+            && error.kind() == std::io::ErrorKind::NotFound
+        {
+            return Err(SealedStoreError::NotFound(path.to_path_buf()));
         }
         let file_key = kek.file_key();
         let bytes = read_store_file(path)?;

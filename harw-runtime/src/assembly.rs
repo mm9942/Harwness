@@ -66,8 +66,8 @@ use std::time::Duration;
 use harw_agent_dsl::ExecutableAgentIr;
 use harw_agent_dsl::roles::AgentRoleId;
 use harw_authority::{
-    NetworkScope, PermissionRequest, PermissionSet, SandboxSpec, WorkspaceRegistration,
-    WorkspaceRegistry,
+    FileWriteScope, NetworkScope, PermissionRequest, PermissionSet, SandboxSpec,
+    WorkspaceRegistration, WorkspaceRegistry,
 };
 use harw_config::{PermissionsSection, PlanSection, ResolvedConfig};
 use harw_context::ContextCeiling;
@@ -89,7 +89,7 @@ use harw_home::paths::{active_profile_name, profile_dir};
 use harw_home::project::{ProjectHome, ProjectRoot, discover_project as discover_home_project};
 use harw_memory::Memory;
 use harw_operations::adapter::ModelToolProvider;
-use harw_operations::operation::{Operation, Surface};
+use harw_operations::operation::Surface;
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{OpContext, SharedSessionController};
 use harw_plan::{
@@ -831,6 +831,45 @@ fn root_activation(ir: Option<&ExecutableAgentIr>) -> SessionActivation {
     activation
 }
 
+/// What every root session's triggered skill injector is built from
+/// (PL-95 S3): the assembly's skill index (its `TriggerIndex` is built once
+/// with it) and the `[skills]` settings.
+#[derive(Debug, Clone)]
+struct SkillInjectionSeed {
+    index: Arc<harw_catalog::SkillIndex>,
+    settings: harw_core::SkillInjectionSettings,
+}
+
+/// The L0 skill catalog of the root's instruction fragments (PL-95 S3): the
+/// count line of [`harw_registry_defaults::skill_catalog_hint`] followed by
+/// [`harw_catalog::catalog_lines`] (`name — when`, at most `l0_bytes`).
+/// Without task text the lines are ordered by priority and name, so the
+/// fragment is identical in every turn (cache-stable prefix).
+fn skill_catalog_fragment(index: &harw_catalog::SkillIndex, l0_bytes: usize) -> String {
+    let mut text = harw_registry_defaults::skill_catalog_hint(index.len());
+    let lines = harw_catalog::catalog_lines(index, "", l0_bytes);
+    if !lines.is_empty() {
+        text.push('\n');
+        text.push_str(&lines.join("\n"));
+    }
+    text
+}
+
+/// The `security_signals` context source of a root (PL-97 D4): the findings
+/// export resolved from the trusted `[dod] export_dir` of `config` and the
+/// harw `home`, through the same resolver as `harw dod` and the `dod.*`
+/// tools. Counts from a configured `export_dir` are marked unverified in
+/// the fragment (`ExportSource::Override`).
+fn security_signals_provider(
+    home: &Path,
+    config: &ResolvedConfig,
+) -> crate::security_signals::SecuritySignalsContextProvider {
+    crate::security_signals::SecuritySignalsContextProvider::with_export_dir(
+        home,
+        config.dod.export_dir.as_deref(),
+    )
+}
+
 /// Das Kontextprogramm der Wurzel-IR, geprüft gegen die Wurzeldecke
 /// (#22 Welle 1B).
 ///
@@ -913,6 +952,8 @@ fn root_context_program(
 ///   Agentennamen.
 /// - `permissions`: Obergrenze der Sandbox-Rechte; die Wurzel-Sandbox wird mit
 ///   ihr **geschnitten** ([`SandboxSpec::restrict`]), nie ersetzt.
+/// - `write_scope`: intersects exact workspace-relative writable files with
+///   the root authority. Scoped writers cannot regain unrestricted process execution.
 /// - `workspace_root`: bindet die Wurzel-Sandbox an genau dieses Verzeichnis
 ///   statt an den erkannten Projekt-Root. Der kanonische Pfad muss gleich dem
 ///   kanonischen Projekt-Root oder ein Nachfahre davon sein (Vergleich über
@@ -931,6 +972,9 @@ pub struct RuntimeNarrowing {
     pub identity: IdentityOverrides,
     /// Obergrenze der Sandbox-Rechte; wird mit den Profilrechten geschnitten.
     pub permissions: PermissionSet,
+    /// Workspace-relative exact-file write ceiling. Intersected with existing
+    /// authority; never grants writes or restores process execution rights.
+    pub write_scope: FileWriteScope,
     /// Bindet die Root-Sandbox an genau dieses Verzeichnis statt an den erkannten Projekt-Root.
     /// Muss kanonisch gleich dem erkannten Root oder ein Nachfahre davon sein (nur enger), sonst
     /// [`RuntimeError::Sandbox`].
@@ -1298,7 +1342,7 @@ fn narrowed_registry_profile(
 ///
 /// # Beschreibung
 /// Ohne Verengung bleibt `sandbox` unverändert. Mit Verengung entsteht
-/// `sandbox.restrict(&narrowing.permissions)`; das Ergebnis wird zusätzlich
+/// `sandbox.restrict` over permissions and the file-write scope; the result is also checked
 /// gegen die Profilrechte geprüft, damit auch eine künftige Änderung an
 /// [`crate::sandbox::root_sandbox`] oder [`SandboxSpec::restrict`] nie still mehr Rechte
 /// ergibt, als die Tabelle dem Einstieg zuspricht.
@@ -1325,7 +1369,8 @@ fn narrowed_sandbox(
             };
             let narrowed = sandbox.restrict(
                 &PermissionRequest::from_permissions(narrowing.permissions.iter())
-                    .with_network_scope(scope),
+                    .with_network_scope(scope)
+                    .with_write_scope(narrowing.write_scope.clone()),
             );
             if narrowed.network_scope().is_empty()
                 && narrowed
@@ -1343,6 +1388,13 @@ fn narrowed_sandbox(
         }
         None => sandbox,
     };
+    if narrowing
+        .is_some_and(|requested| !sandbox.write_scope().is_subset_of(&requested.write_scope))
+    {
+        return Err(RuntimeError::Sandbox {
+            detail: "runtime sandbox widened the requested file write scope".to_owned(),
+        });
+    }
     if sandbox.permissions().is_subset_of(&profile.permissions) {
         Ok(sandbox)
     } else {
@@ -1823,6 +1875,16 @@ impl RuntimeAssemblyBuilder {
             }
             None => load_config_with_agents(&spec)?,
         };
+        // Explicit trusted opt-in changes only task topology. Reuse the same
+        // durable root session, tool registry, approval chain and budgets.
+        // No managed spawner also means no background-agent tools or durable
+        // child submitter (both are mounted only when a spawner exists).
+        let spawner_policy = if config.harness.single_agent_mode {
+            tracing::info!("runtime.single_agent_mode: managed child delegation disabled");
+            SpawnerPolicy::None
+        } else {
+            profile.spawner
+        };
         let config = Arc::new(config);
         let config_agents = Arc::new(config_agents);
         // Netz-Werkzeuge (web.fetch/web.search/…) einmal je Prozess mit der
@@ -2282,13 +2344,35 @@ impl RuntimeAssemblyBuilder {
             || harw_registry_defaults::profile::SKILL_CATALOG_TOOLS
                 .iter()
                 .all(|tool| activation.is_tool_enabled(&ToolName::new((*tool).to_owned()))));
-        if skill_catalog_at_root {
-            overrides
-                .extra_context
-                .push(harw_registry_defaults::skill_catalog_hint(
-                    skill_index.len(),
-                ));
-        }
+        // PL-95 S3 / PL-97 B1: statt der einen Zahlzeile die budgetierten
+        // L0-Katalogzeilen `name — when` (ohne Aufgabentext: nach Priorität
+        // und Name, damit der Präfix cache-stabil bleibt). Der Injektor jeder
+        // Wurzelsitzung wählt aus demselben, einmal je Montage gebauten Index
+        // (samt `TriggerIndex`).
+        let skill_injection_settings =
+            harw_core::SkillInjectionSettings::from_config(&config.harness.skills);
+        let skill_injection = if skill_catalog_at_root {
+            // PL-97 H8: die Katalogzeilen sind Autorentext und landen in der
+            // Instruktionsebene — importierte Skills stehen dort nur mit
+            // `[skills] inject_imported`.
+            let catalog_index = if skill_injection_settings.inject_imported {
+                std::borrow::Cow::Borrowed(skill_index.as_ref())
+            } else {
+                std::borrow::Cow::Owned(skill_index.without_imported())
+            };
+            overrides.extra_context.push(skill_catalog_fragment(
+                &catalog_index,
+                skill_injection_settings.l0_bytes,
+            ));
+            skill_injection_settings
+                .enabled
+                .then(|| SkillInjectionSeed {
+                    index: Arc::clone(&skill_index),
+                    settings: skill_injection_settings,
+                })
+        } else {
+            None
+        };
         let narrowed_root = narrowing
             .as_ref()
             .and_then(|narrowing| narrowing.workspace_root.as_ref())
@@ -2369,7 +2453,10 @@ impl RuntimeAssemblyBuilder {
             ))
             // Runde 5, Teil N: `[shell] max_timeout_secs` für jeden
             // Shell-Provider (Wurzel und Kinder).
-            .with_shell_max_timeout_secs(config.harness.shell.effective_max_timeout_secs());
+            .with_shell_max_timeout_secs(config.harness.shell.effective_max_timeout_secs())
+            // PL-97 E2b: `[sandbox] execution` (Vorgabe `chain`) für jeden
+            // Shell-Provider und `job.start` (Wurzel und Kinder).
+            .with_sandbox_execution(config.harness.sandbox.effective_execution());
         // Plan R9, Teil F: eine Job-Verwaltung je interaktiver TUI-Sitzung
         // (`<projekt>/.harw/state/jobs/`). Sie reist mit der Host-Permit-
         // Verdrahtung zu Wurzel und Kind-Fabriken: `job.*` neben jedem
@@ -2378,9 +2465,11 @@ impl RuntimeAssemblyBuilder {
         // bekommen keine Jobs.
         let (session_jobs, job_notifications) = if spec.entry == EntryKind::Tui {
             // `[jobs] max_running` — Höchstzahl laufender Jobs dieser Sitzung.
-            match crate::job_wiring::SessionJobs::open(
+            // PL-97 E3: `[jobs] cgroup_root`/`trampoline` erreichen den Befehls-Port.
+            match crate::job_wiring::SessionJobs::open_with_port(
                 &home_project.state_dir(),
                 config.harness.jobs.effective_max_running(),
+                &crate::job_wiring::host_port_options(&config.harness.jobs),
             ) {
                 Ok((jobs, receiver)) => (Some(jobs), Some(receiver)),
                 Err(error) => {
@@ -2732,6 +2821,7 @@ impl RuntimeAssemblyBuilder {
                 profile_name.clone(),
                 home_project_root.clone(),
             )
+            .and_then(|context| context.with_config_discovery_cwd(&spec.cwd))
             .map_err(|error| RuntimeError::Config {
                 detail: error.to_string(),
             })?,
@@ -2750,7 +2840,7 @@ impl RuntimeAssemblyBuilder {
             })
             .transpose()?;
         let (spawner, spawner_roles, agent_job_submitter_slot) = build_spawner(
-            profile.spawner,
+            spawner_policy,
             SpawnerInputs {
                 config: &config,
                 project: &project,
@@ -2979,6 +3069,17 @@ impl RuntimeAssemblyBuilder {
             // R18 D-B: nur mit `RuntimeAssemblyBuilder::gateway_port`.
             gateway: gateway_port,
         });
+        let services = services.with_image_inspector(Arc::new(
+            crate::image_model::RuntimeImageInspector::new(
+                Arc::clone(&config),
+                Arc::clone(&live_models),
+                Arc::clone(&default_tree_model),
+                effective_root_provider_id(&config, uia_ir.is_some()),
+                root_model_id.clone(),
+                budget.max_total_tokens.min(2048) as u32,
+                budget.max_total_tokens,
+            ),
+        ));
         // Plan Teil D: dieselbe Speicher-Instanz wie die Kind-Registries;
         // `with_home_context` legt nur dann einen eigenen an, wenn hier
         // keiner gesetzt wurde.
@@ -3080,6 +3181,11 @@ impl RuntimeAssemblyBuilder {
             profile.operations,
             &operations,
             &services,
+            (spec.entry == EntryKind::Tui)
+                .then(|| {
+                    harw_cloud_ops::context::LocalProfileOperator::from_principal(&spec.principal)
+                })
+                .flatten(),
         );
         // Runde 5, Teil H: `agent.result` an der Wurzel — nur mit Spawner und
         // Modell-Werkzeugfläche; ein expliziter Wurzel-Agent nur, wenn seine
@@ -3326,6 +3432,16 @@ impl RuntimeAssemblyBuilder {
         //      dies **nicht** über
         //      `harw_memory::context_provider::MemoryContextProvider`
         //      läuft).
+        //      W03d-1-Audit: „nur Wurzel“ ist hier ausdrückliche Politik, kein
+        //      Versehen. Dieser Provider hängt allein an der Wurzel-Registry;
+        //      `children.rs::build_registry` registriert ihn für kein Kind
+        //      (gepinnt durch `child_registry_has_no_memory_facts_provider`).
+        //      Die Fakten (`harw_memory::Fact`) tragen weder Autor noch
+        //      Sichtbarkeitsbereich; ein Kind könnte sie nicht nach Identität
+        //      filtern lassen. Eine Ausweitung auf Kinder wäre deshalb eine
+        //      Politikänderung samt identitätsgebundener Sicht
+        //      (`harw_knowledge::caller_identity::CallerIdentity`), nicht bloß
+        //      ein weiterer `context_provider`-Aufruf.
         let registry_builder = if config.harness.memory.enabled
             && (project_facts.is_some() || global_facts.is_some())
         {
@@ -3362,12 +3478,12 @@ impl RuntimeAssemblyBuilder {
         };
 
         // 12c2. Sicherheits-Signale (`[memory] security_signals`, Standard aus):
-        //       nur Zähler aus dem DoD-Export, Evidenz, nie Anweisung.
+        //       nur Zähler aus dem DoD-Export, Evidenz, nie Anweisung. Ein
+        //       gesetztes `[dod] export_dir` erreicht die Quelle (PL-97 D4) und
+        //       bleibt dort als unverifiziert markiert.
         let registry_builder = if config.harness.memory.security_signals {
             registry_builder
-                .context_provider(Arc::new(
-                    crate::security_signals::SecuritySignalsContextProvider::new(&spec.home),
-                ))
+                .context_provider(Arc::new(security_signals_provider(&spec.home, &config)))
                 .map_err(|error| RuntimeError::Registry {
                     detail: format!("could not register the security signals provider: {error}"),
                 })?
@@ -3443,27 +3559,27 @@ impl RuntimeAssemblyBuilder {
         // Hintergrund-Thread reine Verschwendung wäre (siehe
         // `entry_wants_startup_sweep`); harmlos best-effort, kein Fehler
         // dieses Schritts bricht die Montage ab.
-        if let Some(capture) = memory_capture.as_ref() {
-            if entry_wants_startup_sweep(spec.entry) {
-                // Als `memory_maintenance`-Job im Ledger des Profils (Frist
-                // aus `[memory] sweep_deadline_secs`), nie inline im
-                // Build-Pfad.
-                let ledger = stores.job_store.clone().or_else(|| {
-                    profile_dir(&spec.home, &profile_name)
-                        .ok()
-                        .map(|dir| Arc::new(JobStore::new(&dir)))
-                });
-                crate::memory_wiring::enqueue_learning_extract(
-                    capture.memories_root(),
-                    ledger.as_deref(),
-                    &config.harness.memory,
-                );
-                let _ = crate::memory_wiring::spawn_startup_sweep_job(
-                    Arc::clone(capture),
-                    ledger,
-                    &config.harness.memory,
-                );
-            }
+        if let Some(capture) = memory_capture.as_ref()
+            && entry_wants_startup_sweep(spec.entry)
+        {
+            // Als `memory_maintenance`-Job im Ledger des Profils (Frist
+            // aus `[memory] sweep_deadline_secs`), nie inline im
+            // Build-Pfad.
+            let ledger = stores.job_store.clone().or_else(|| {
+                profile_dir(&spec.home, &profile_name)
+                    .ok()
+                    .map(|dir| Arc::new(JobStore::new(&dir)))
+            });
+            crate::memory_wiring::enqueue_learning_extract(
+                capture.memories_root(),
+                ledger.as_deref(),
+                &config.harness.memory,
+            );
+            let _ = crate::memory_wiring::spawn_startup_sweep_job(
+                Arc::clone(capture),
+                ledger,
+                &config.harness.memory,
+            );
         }
 
         let registry_builder = if let Some(embedded) = spec.embedded.as_ref() {
@@ -3516,6 +3632,7 @@ impl RuntimeAssemblyBuilder {
             approval_timeout,
             agent_ir,
             root_context_program,
+            skill_injection,
             activation,
             operations,
             services,
@@ -3916,6 +4033,11 @@ fn build_operations(surface: OperationSurface, plan: Option<&PlanServices>) -> O
             // `ServiceMap`.
             let _registered =
                 harw_ops::register_work_driver_tools(&mut registry, &plan.plan_config);
+            // PL-90: Intent-Zyklen hängen am selben Gate (siehe
+            // `harw_ops::register_intent_cycle_tools`); der Job-Worker in
+            // `harw-cli` führt die zugelassenen `intent_cycle`-Jobs aus.
+            let _registered =
+                harw_ops::register_intent_cycle_tools(&mut registry, &plan.plan_config);
         }
         registry
     }
@@ -3977,38 +4099,49 @@ fn build_operations(surface: OperationSurface, plan: Option<&PlanServices>) -> O
 /// (z. B. in einem Test-Fixture ohne `TurnControl`), bleibt
 /// `OpContext::cancel_token` `None`.
 fn install_operation_model_tools(
-    builder: ExtensionRegistryBuilder,
+    mut builder: ExtensionRegistryBuilder,
     surface: OperationSurface,
     operations: &Arc<OperationRegistry>,
     services: &Arc<RuntimeServices>,
+    local_cloud_operator: Option<harw_cloud_ops::context::LocalProfileOperator>,
 ) -> ExtensionRegistryBuilder {
-    match surface {
-        OperationSurface::CommandsOnly | OperationSurface::None => builder,
-        OperationSurface::AllWithModelTools => {
-            let exposed: Vec<Arc<dyn Operation>> = operations.iter().map(Arc::clone).collect();
-            let services = Arc::clone(services);
-            let provider = ModelToolProvider::new(exposed, move |execution_context| {
-                let ctx = OpContext::new(
-                    execution_context.session_id().clone(),
-                    execution_context.turn_id().clone(),
-                    execution_context.sandbox().clone(),
-                    services.service_map(ServiceSurface::ModelTool),
-                );
-                // Der Turn-Loop hängt seinen `CancelToken` an jeden
-                // `ToolExecutionContext` (`control.cancel_token()`, siehe
-                // `harw-core::turn_loop`); ohne diesen Schritt bekäme jede
-                // Operation — u. a. `AgentToolAdapter::invoke` und
-                // `fanout_children` in `harw-core-bridge` — nie den echten
-                // Turn-Abbruch zu sehen und müsste immer auf einen frischen,
-                // nie abgebrochenen Token zurückfallen.
-                match execution_context.cancel() {
-                    Some(cancel) => ctx.with_cancel_token(cancel.clone()),
-                    None => ctx,
-                }
-            });
-            builder.tool_provider(Arc::new(provider))
-        }
+    if surface != OperationSurface::AllWithModelTools {
+        return builder;
     }
+    // Local profile administration is a separate read-only capability, not
+    // a synthetic workspace tenant. All other operations keep their existing
+    // caller semantics. Hosted/remote turns receive no local capability.
+    let (cloud_read, other): (Vec<_>, Vec<_>) = operations.iter().cloned().partition(|operation| {
+        matches!(
+            operation.meta().name,
+            "cloud.status" | "cloud.enrollments.list"
+        )
+    });
+    for (exposed, local_operator) in [(other, None), (cloud_read, local_cloud_operator)] {
+        if exposed.is_empty() {
+            continue;
+        }
+        let services = Arc::clone(services);
+        let provider = ModelToolProvider::new(exposed, move |execution_context| {
+            let mut service_map = services.service_map(ServiceSurface::ModelTool);
+            if let Some(operator) = local_operator {
+                service_map.insert(operator);
+            }
+            let ctx = OpContext::new(
+                execution_context.session_id().clone(),
+                execution_context.turn_id().clone(),
+                execution_context.sandbox().clone(),
+                service_map,
+            );
+            // Preserve turn cancellation for both provider groups.
+            match execution_context.cancel() {
+                Some(cancel) => ctx.with_cancel_token(cancel.clone()),
+                None => ctx,
+            }
+        });
+        builder = builder.tool_provider(Arc::new(provider));
+    }
+    builder
 }
 
 /// Die Namen aller in `registry` sichtbaren Werkzeuge, sortiert und
@@ -4665,10 +4798,8 @@ fn effective_root_model_id(config: &ResolvedConfig, uia_root: bool) -> Option<St
                         .get(provider_id)
                         .is_some_and(|provider| provider.enabled)
                 });
-        if uia_provider_usable {
-            if let Some(model) = config.harness.uia_model.as_deref() {
-                return Some(model.to_owned());
-            }
+        if uia_provider_usable && let Some(model) = config.harness.uia_model.as_deref() {
+            return Some(model.to_owned());
         }
     }
     config.harness.default_model.clone()
@@ -4780,10 +4911,10 @@ fn normalize_model_id(model_id: &str) -> String {
             id = stripped.to_owned();
         }
         // `@YYYYMMDD` (Vertex-Schreibweise) bzw. jede `@`-Version.
-        if let Some((head, _)) = id.rsplit_once('@') {
-            if !head.is_empty() {
-                id = head.to_owned();
-            }
+        if let Some((head, _)) = id.rsplit_once('@')
+            && !head.is_empty()
+        {
+            id = head.to_owned();
         }
         // `-YYYY-MM-DD`: nur ASCII-Bytes geprüft, `truncate` trifft deshalb
         // immer eine Zeichengrenze.
@@ -4808,10 +4939,8 @@ fn normalize_model_id(model_id: &str) -> String {
                 && (tail.len() == 8 || tail.len() == 4)
                 && tail.bytes().all(|byte| byte.is_ascii_digit())
         });
-        if strip_numeric {
-            if let Some((head, _)) = id.rsplit_once('-') {
-                id = head.to_owned();
-            }
+        if strip_numeric && let Some((head, _)) = id.rsplit_once('-') {
+            id = head.to_owned();
         }
         if id.len() == before {
             return id;
@@ -5357,7 +5486,9 @@ fn build_spawner(
         std::sync::OnceLock<std::sync::Weak<dyn harw_extension_api::AgentJobSubmitter>>,
     > = Arc::new(std::sync::OnceLock::new());
     // Runde 5, Teil C: ein gemeinsamer Diary-Recorder für die Kinder beider
-    // Fabriken (Agent-Id = Rollenname, Einträge bei Verdichtung und
+    // Fabriken (Agent-Id = laufgebundene Id `<rolle>.<uuid>` je Kind, von der
+    // Fabrik in `build_registry` gemintet — PL-90 W03d; die Id "child" hier
+    // ist nur der Vorgabewert ohne Zuordnung; Einträge bei Verdichtung und
     // Kind-Freigabe); nur mit Wissensspeicher.
     let child_diary = knowledge.as_ref().map(|(store, _)| {
         Arc::new(
@@ -5687,6 +5818,10 @@ pub struct RuntimeAssembly {
     /// Agent, sonst UIA), bereits gegen die Wurzeldecke geprüft; `None` ohne
     /// deklariertes Programm.
     root_context_program: Option<harw_agent_dsl::executable::ContextProgram>,
+    /// PL-95 S3: Grundlage des Skill-Injektors jeder Wurzelsitzung; `None`
+    /// ohne Skill-Katalog an der Wurzel oder mit
+    /// `[skills] triggered_injection = false`.
+    skill_injection: Option<SkillInjectionSeed>,
     activation: SessionActivation,
     operations: Arc<OperationRegistry>,
     /// Hinter einem `Arc`, weil die Modell-Tool-Fläche der Operationen
@@ -6589,6 +6724,25 @@ impl RuntimeAssembly {
                     }
                 })
                 .with_context_ledger(self.context_ledger.clone())
+                // PL-95 S3: je Sitzung ein frischer Injektor-Zustand über dem
+                // gemeinsamen Index der Montage. PL-97 H7: nimmt die Sitzung
+                // eine gespeicherte wieder auf, stellt
+                // `AgentSession::hydrate_from_store` Auszüge, Dedupe und
+                // verbrauchtes Budget aus den Injektions-Datensätzen wieder
+                // her — vor dem nächsten Turn.
+                .with_skill_injector(self.skill_injection.as_ref().map(|seed| {
+                    // PL-97 B2: ein Skill, dessen deklarierte Werkzeuge diese
+                    // Sitzung alle nicht registriert, wird nicht eingespielt.
+                    Arc::new(
+                        harw_core::SkillInjector::new(Arc::clone(&seed.index), seed.settings)
+                            .with_tool_availability(
+                                harw_core::skill_injection::ToolAvailability::new(
+                                    self.tools.iter().cloned(),
+                                    harw_registry_defaults::tool_index::catalog_tool_names(),
+                                ),
+                            ),
+                    )
+                }))
                 // Addendum F+G: Wächter-Verdrahtung der Wurzel-(UIA-)Sitzung.
                 .with_guard_policy(Some(self.guard_policy))
                 .with_drift_observer(Some(
@@ -7091,6 +7245,28 @@ mod tests {
             normalize_model_id("llama-3.3-70b-versatile"),
             "llama-3.3-70b-versatile"
         );
+    }
+
+    /// A new GPT-6.1 model must not reject the first request under the 32k fallback.
+    #[test]
+    fn gpt_6_1_uses_known_limits_for_first_turn_budget() {
+        let config = ResolvedConfig::default();
+        for id in [
+            "gpt-6.1-sol",
+            "openai/gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "openai/gpt-6.1-terra",
+        ] {
+            let limits = model_limits_for(&config, id);
+            assert!(limits.known, "{id} must not use the unknown-model fallback");
+            assert_eq!(limits.context_window, 1_050_000, "{id}");
+            assert_eq!(limits.catalog_max_output, Some(128_000), "{id}");
+            let reserve = limits.output_reserve_tokens();
+            assert!(
+                50_899 + reserve < limits.context_window,
+                "the reported first request must fit with its output reserve: {id}"
+            );
+        }
     }
 
     /// Runde 5, Teil H: der echte Aufrufpfad (`model_limits_for` →
@@ -8217,6 +8393,428 @@ mod tests {
         Ok(())
     }
 
+    /// PL-95 S3: der L0-Katalog der Wurzel ist die Zahlzeile, danach
+    /// höchstens `l0_bytes` an `name — when`-Zeilen — ohne Aufgabentext nach
+    /// Priorität und Name, also in jeder Runde byte-identisch.
+    #[test]
+    fn test_skill_catalog_fragment_is_the_hint_plus_bounded_catalog_lines() -> TestResult {
+        let l0 = harw_catalog::DEFAULT_L0_BYTES;
+        let index = harw_catalog::SkillIndex::build(&[]);
+        let hint = harw_registry_defaults::skill_catalog_hint(index.len());
+        let fragment = skill_catalog_fragment(&index, l0);
+        let lines = fragment
+            .strip_prefix(hint.as_str())
+            .and_then(|rest| rest.strip_prefix('\n'))
+            .ok_or(TestError::Missing("Zahlzeile vor den Katalogzeilen"))?;
+        assert!(!lines.is_empty(), "gebündelte Skills ergeben Katalogzeilen");
+        assert!(lines.len() <= l0, "{} Bytes > {l0}", lines.len());
+        assert_eq!(
+            lines,
+            harw_catalog::catalog_lines(&index, "", l0).join("\n")
+        );
+        assert_eq!(
+            fragment,
+            skill_catalog_fragment(&index, l0),
+            "deterministisch"
+        );
+
+        // Ohne Skills bleibt nur die Zahlzeile.
+        let empty = harw_catalog::SkillIndex::build_with_bundle(&[], &[]);
+        assert_eq!(
+            skill_catalog_fragment(&empty, l0),
+            harw_registry_defaults::skill_catalog_hint(0)
+        );
+        Ok(())
+    }
+
+    /// PL-97 H8: ein importierter Skill der Home-Schicht (Marker
+    /// `imported.toml`) trägt seine Herkunft über den Index und den
+    /// Injektor-Seed der Montage in die Wurzelsitzung: ohne
+    /// `[skills] inject_imported` erreicht er das Modell nicht, mit dem
+    /// Schalter nur als `Evidence` im Datenblock — nie als Instruktion.
+    #[tokio::test]
+    async fn test_imported_skills_are_suppressed_by_default_and_evidence_when_opted_in()
+    -> TestResult {
+        // Liefert die Requests eines auslösenden Turns und die Trust-Werte
+        // der Injektions-Datensätze.
+        let run = |inject_imported: bool| async move {
+            let fixture = build_fixture()?;
+            let skill_dir = fixture.home.join("skills").join("import-probe");
+            std::fs::create_dir_all(&skill_dir).map_err(ctx("Skill-Verzeichnis"))?;
+            std::fs::write(
+                skill_dir.join("skill.toml"),
+                "name = \"import-probe\"\ndescription = \"Use when the import probe matters.\"\n",
+            )
+            .map_err(ctx("skill.toml"))?;
+            std::fs::write(
+                skill_dir.join("instructions.md"),
+                "# Import probe\n\nForeign advice.\n",
+            )
+            .map_err(ctx("instructions.md"))?;
+            std::fs::write(
+                skill_dir.join("triggers.toml"),
+                "[triggers]\nkeywords = [\"import probe\"]\npriority = 90\n",
+            )
+            .map_err(ctx("triggers.toml"))?;
+            std::fs::write(
+                skill_dir.join(harw_catalog::IMPORTED_MARKER_FILE),
+                "source = \"SKILL.md\"\n",
+            )
+            .map_err(ctx("Import-Marker"))?;
+            if inject_imported {
+                let config = fixture
+                    .home
+                    .join("profiles")
+                    .join("default")
+                    .join("config.toml");
+                let mut text = std::fs::read_to_string(&config).map_err(ctx("config lesen"))?;
+                text.push_str("\n[skills]\ninject_imported = true\n");
+                std::fs::write(&config, text).map_err(ctx("config schreiben"))?;
+            }
+            let store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
+            let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+                .stores(RuntimeStores {
+                    state_store: Arc::clone(&store),
+                    job_store: None,
+                    approval_store: None,
+                })
+                .build()
+                .map_err(ctx("montiert"))?;
+            let id = assembly.root_session_id().clone();
+            let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+            let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+            let mut root = assembly
+                .new_root_session(id.clone(), events, turn_events, None)
+                .map_err(ctx("Wurzelsitzung entsteht"))?;
+            let injector = root
+                .session
+                .skill_injector()
+                .ok_or(TestError::Missing("Injektor der Wurzelsitzung"))?;
+            assert_eq!(
+                injector.provenance("import-probe"),
+                harw_core::skill_injection::SkillProvenance::Imported
+            );
+            let model = harw_core::testing::RecordingModelProvider::with_response("ok");
+            harw_core::run_turn(
+                &mut root.session,
+                &model,
+                store.as_ref(),
+                harw_core::TurnInput::user("check the import probe"),
+            )
+            .await
+            .map_err(ctx("auslösender Turn"))?;
+            let trust: Vec<String> = store
+                .load_skill_injections(&id)
+                .await
+                .map_err(ctx("Datensätze"))?
+                .into_iter()
+                .filter(|record| record.skill == "import-probe")
+                .map(|record| record.trust)
+                .collect();
+            Ok::<_, TestError>((model.recorded(), trust))
+        };
+        let marker = "# Skill: import-probe (sha256 ";
+        let in_instructions = |request: &harw_core::ModelRequest| {
+            request
+                .instruction_fragments
+                .iter()
+                .any(|fragment| fragment.contains(marker))
+        };
+        let in_data = |request: &harw_core::ModelRequest| {
+            request
+                .data_block
+                .as_deref()
+                .is_some_and(|block| block.contains(marker))
+        };
+
+        let (requests, trust) = run(false).await?;
+        assert!(!requests.is_empty());
+        assert!(
+            requests.iter().all(|request| !request
+                .instruction_fragments
+                .iter()
+                .any(|fragment| fragment.contains("import-probe"))),
+            "ohne inject_imported nennt auch der L0-Katalog den importierten Skill nicht"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !in_instructions(request) && !in_data(request)),
+            "ohne inject_imported erreicht der importierte Skill das Modell nicht"
+        );
+        assert!(trust.is_empty(), "keine Lieferung: {trust:?}");
+
+        let (requests, trust) = run(true).await?;
+        assert!(
+            requests.iter().any(in_data),
+            "mit inject_imported liegt der Auszug im Datenblock"
+        );
+        assert!(
+            !requests.iter().any(in_instructions),
+            "ein importierter Skill wird nie Instruktion"
+        );
+        assert_eq!(trust, vec!["evidence".to_owned()]);
+        Ok(())
+    }
+
+    /// PL-97 D4: ein gesetztes `[dod] export_dir` erreicht die Quelle
+    /// `security_signals` der Wurzel; ihre Zähler tragen den Vermerk
+    /// „unverifizierte Quelle“ samt Hinweis des Resolvers.
+    #[tokio::test]
+    async fn security_signals_follow_the_configured_dod_export_dir() -> TestResult {
+        use harw_extension_api::ContextProvider as _;
+        use time::format_description::well_known::Rfc3339;
+
+        let scratch = tempfile::tempdir()?;
+        let home = scratch.path().join("home");
+        let export = scratch.path().join("export");
+        std::fs::create_dir_all(&export)?;
+        let observed_at = time::OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(ctx("Zeitstempel"))?;
+        std::fs::write(
+            export.join(harw_dod_client::FINDINGS_FILE),
+            format!(
+                "{{\"schema_version\":2,\"finding_id\":\"f-1\",\"host\":\"h\",\"rule_id\":\"egress-flow\",\"severity\":\"high\",\"summary\":\"s\",\"observed_at\":\"{observed_at}\"}}\n"
+            ),
+        )?;
+        let mut config = ResolvedConfig::default();
+        config.dod.export_dir = Some(export.clone());
+
+        let provider = security_signals_provider(&home, &config);
+        assert_eq!(
+            provider.export_path(),
+            export.join(harw_dod_client::FINDINGS_FILE)
+        );
+        let fragments = provider
+            .contribute(&TurnInputContext {
+                session_id: harw_types::SessionId::new(),
+                turn_id: harw_types::TurnId::new(),
+                metadata: serde_json::Value::Null,
+            })
+            .await;
+        let content = fragments
+            .first()
+            .map(|fragment| fragment.content.as_str())
+            .ok_or(TestError::Missing("security.signals-Fragment"))?;
+        let header = content.lines().next().unwrap_or_default();
+        assert!(header.contains("UNVERIFIZIERTE Quelle"), "{content}");
+        let hint = harw_dod_client::ExportSource::Override
+            .hint()
+            .ok_or(TestError::Missing("Override-Hinweis"))?;
+        assert!(header.contains(hint), "{content}");
+        assert!(content.contains("egress-flow: 1"), "{content}");
+
+        // Ohne `export_dir` liest die Quelle das konfigurierte Verzeichnis nie.
+        let plain = security_signals_provider(&home, &ResolvedConfig::default());
+        assert_ne!(
+            plain.export_path(),
+            export.join(harw_dod_client::FINDINGS_FILE)
+        );
+        Ok(())
+    }
+
+    /// PL-95 S3: eine Wurzelsitzung mit Skill-Katalog bekommt einen
+    /// Injektor mit den `[skills]`-Werten; `triggered_injection = false` und
+    /// ein werkzeugloser Einstieg (`NoTools`) bekommen keinen.
+    #[test]
+    fn test_root_skill_injector_follows_the_catalog_and_the_skills_switch() -> TestResult {
+        let injector_of = |fixture: &BuildFixture,
+                           entry: EntryKind|
+         -> TestResult<Option<harw_core::SkillInjectionSettings>> {
+            let assembly = fixture_builder(entry, fixture)
+                .build()
+                .map_err(ctx("montiert"))?;
+            let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+            let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+            let root = assembly
+                .new_root_session(
+                    assembly.root_session_id().clone(),
+                    events,
+                    turn_events,
+                    None,
+                )
+                .map_err(ctx("Wurzelsitzung entsteht"))?;
+            Ok(root
+                .session
+                .skill_injector()
+                .map(|injector| *injector.settings()))
+        };
+        let append_config = |fixture: &BuildFixture, extra: &str| -> TestResult {
+            let config = fixture
+                .home
+                .join("profiles")
+                .join("default")
+                .join("config.toml");
+            let mut text = std::fs::read_to_string(&config).map_err(ctx("config lesen"))?;
+            text.push_str(extra);
+            std::fs::write(&config, text).map_err(ctx("config schreiben"))?;
+            Ok(())
+        };
+
+        let default = build_fixture()?;
+        assert_eq!(
+            injector_of(&default, EntryKind::LocalEcho)?,
+            Some(harw_core::SkillInjectionSettings::default())
+        );
+        assert_eq!(
+            injector_of(&default, EntryKind::JobPrompt)?,
+            None,
+            "NoTools: kein Skill-Katalog, kein Injektor"
+        );
+
+        let tuned = build_fixture()?;
+        append_config(&tuned, "\n[skills]\nper_turn_bytes = 2048\n")?;
+        let settings = injector_of(&tuned, EntryKind::LocalEcho)?
+            .ok_or(TestError::Missing("Injektor mit eigenen Werten"))?;
+        assert_eq!(settings.per_turn_cap_bytes, 2048);
+
+        let off = build_fixture()?;
+        append_config(&off, "\n[skills]\ntriggered_injection = false\n")?;
+        assert_eq!(injector_of(&off, EntryKind::LocalEcho)?, None);
+        Ok(())
+    }
+
+    /// PL-97 H7: eine neue Montage über demselben dauerhaften Store nimmt die
+    /// Wurzelsitzung mit gleicher `SessionId` wieder auf — ihr Injektor
+    /// übernimmt den aktiven Auszug und das verbrauchte Sitzungsbudget, ein
+    /// folgender `continue`-Turn ohne Treffer schickt den Auszug
+    /// byte-identisch weiter an das Modell.
+    #[tokio::test]
+    async fn test_resumed_root_session_restores_the_skill_injector_state() -> TestResult {
+        let fixture = build_fixture()?;
+        // Ein Skill der Home-Schicht, den ein Schlüsselwort im User-Text
+        // auslöst und der keine Werkzeuge braucht.
+        let skill_dir = fixture.home.join("skills").join("resume-probe");
+        std::fs::create_dir_all(&skill_dir).map_err(ctx("Skill-Verzeichnis"))?;
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            "name = \"resume-probe\"\ndescription = \"Use when the resume probe matters.\"\n",
+        )
+        .map_err(ctx("skill.toml"))?;
+        std::fs::write(
+            skill_dir.join("instructions.md"),
+            "# Resume probe\n\nKeep the probe steady.\n",
+        )
+        .map_err(ctx("instructions.md"))?;
+        std::fs::write(
+            skill_dir.join("triggers.toml"),
+            "[triggers]\nkeywords = [\"resume probe\"]\npriority = 90\n",
+        )
+        .map_err(ctx("triggers.toml"))?;
+        let transcripts = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store: Arc<dyn StateStore> = Arc::new(crate::dream_run::build_dream_state_store(
+            transcripts.path(),
+        ));
+        let id = SessionId::new();
+        let assemble = || -> TestResult<(RuntimeAssembly, RootSession)> {
+            let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+                .stores(RuntimeStores {
+                    state_store: Arc::clone(&store),
+                    job_store: None,
+                    approval_store: None,
+                })
+                .root_session_id(id.clone())
+                .build()
+                .map_err(ctx("montiert"))?;
+            let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+            let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+            let root = assembly
+                .new_root_session(id.clone(), events, turn_events, None)
+                .map_err(ctx("Wurzelsitzung entsteht"))?;
+            Ok((assembly, root))
+        };
+        // Der Skill-Auszug unter den Instruktions-Fragmenten eines Requests.
+        let skill_fragment = |request: &harw_core::ModelRequest| -> Option<String> {
+            request
+                .instruction_fragments
+                .iter()
+                .find(|fragment| fragment.contains("# Skill: resume-probe (sha256 "))
+                .cloned()
+        };
+
+        // Erster Lauf: ein echter Turn löst den Skill per Schlüsselwort aus;
+        // der Turn-Loop hält die Lieferung im Store fest.
+        let (charged, first_excerpt) = {
+            let (_assembly, mut first) = assemble()?;
+            let injector = Arc::clone(
+                first
+                    .session
+                    .skill_injector()
+                    .ok_or(TestError::Missing("Injektor der Wurzelsitzung"))?,
+            );
+            let model = harw_core::testing::RecordingModelProvider::with_response("ok");
+            harw_core::run_turn(
+                &mut first.session,
+                &model,
+                store.as_ref(),
+                harw_core::TurnInput::user("check the resume probe"),
+            )
+            .await
+            .map_err(ctx("auslösender Turn"))?;
+            let excerpt = model
+                .recorded()
+                .last()
+                .and_then(skill_fragment)
+                .ok_or(TestError::Missing("Auszug im ersten Request"))?;
+            assert_eq!(injector.active_count(), 1);
+            (injector.session_bytes(), excerpt)
+        };
+        assert!(charged > 0);
+        assert_eq!(
+            store
+                .load_skill_injections(&id)
+                .await
+                .map_err(ctx("Datensätze"))?
+                .len(),
+            1
+        );
+
+        // Neustart: neue Montage, gleiche Sitzung, frischer Injektor.
+        let (_assembly, mut resumed) = assemble()?;
+        let hydration = resumed
+            .session
+            .hydrate_from_store(store.as_ref())
+            .await
+            .map_err(ctx("hydriert"))?;
+        assert_eq!(hydration.skill_excerpts_restored, 1);
+        let injector = Arc::clone(
+            resumed
+                .session
+                .skill_injector()
+                .ok_or(TestError::Missing("Injektor nach Neustart"))?,
+        );
+        assert_eq!(injector.active_count(), 1);
+        assert_eq!(injector.session_bytes(), charged);
+
+        let model = harw_core::testing::RecordingModelProvider::with_response("ok");
+        harw_core::run_turn(
+            &mut resumed.session,
+            &model,
+            store.as_ref(),
+            harw_core::TurnInput::user("continue"),
+        )
+        .await
+        .map_err(ctx("continue-Turn"))?;
+        assert_eq!(
+            model.recorded().last().and_then(skill_fragment),
+            Some(first_excerpt),
+            "der aktive Auszug erreicht das Modell byte-identisch"
+        );
+        assert_eq!(injector.active_count(), 1, "der Auszug bleibt aktiv");
+        assert_eq!(injector.session_bytes(), charged);
+        assert_eq!(
+            store
+                .load_skill_injections(&id)
+                .await
+                .map_err(ctx("Datensätze"))?
+                .len(),
+            1,
+            "kein zweiter Datensatz für den wiederhergestellten Auszug"
+        );
+        Ok(())
+    }
+
     /// `[tools.container]` (global-only, Standard aus): `container.images` und
     /// `container.run` erscheinen nur mit Schalter, gültigem Katalog und für
     /// einen Einstieg mit Container-Recht (nur `Tui`).
@@ -8306,6 +8904,42 @@ mod tests {
             echo.take_sudo_prompts().is_none(),
             "Nicht-TUI-Einstiege haben keinen sudo-Kanal"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_agent_mode_keeps_governed_tools_without_child_spawner() -> TestResult {
+        for entry in [EntryKind::Tui, EntryKind::OneShot] {
+            let fixture = build_fixture()?;
+            let config_path = fixture.home.join("profiles/default/config.toml");
+            let existing =
+                std::fs::read_to_string(&config_path).map_err(ctx("read fixture config"))?;
+            std::fs::write(
+                &config_path,
+                format!("{existing}\nsingle_agent_mode = true\n"),
+            )
+            .map_err(ctx("enable single agent mode"))?;
+            // Deliberately no event sender: a managed spawner would reject
+            // this build, so the real production assembly path is exercised.
+            let mut builder = fixture_builder(entry, &fixture);
+            builder.spec.approval_override = Some(ApprovalMode::AlwaysAsk);
+            let assembly = builder.build().map_err(ctx("single agent assembly"))?;
+            assert!(assembly.spawner().is_none());
+            assert_eq!(
+                assembly.services().approval_mode().get(),
+                ApprovalMode::AlwaysAsk,
+            );
+            let rights = assembly.rights_snapshot();
+            for tool in ["fs.read", "fs.write", "fs.edit", "shell.exec"] {
+                assert!(
+                    rights.tools.iter().any(|name| name == tool),
+                    "missing {tool}",
+                );
+            }
+            for tool in harw_core_bridge::AGENT_BACKGROUND_TOOLS {
+                assert!(!rights.tools.iter().any(|name| name == *tool));
+            }
+        }
         Ok(())
     }
 
@@ -8527,6 +9161,68 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_narrowing_preserves_exact_file_write_scope() -> TestResult {
+        use harw_authority::Permission;
+        let fixture = build_fixture()?;
+        let scope =
+            FileWriteScope::exact_files(["src/owned.rs"]).map_err(ctx("exact file scope"))?;
+        let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .narrowing(RuntimeNarrowing {
+                registry_profile: RegistryProfile::Full,
+                identity: IdentityOverrides::default(),
+                permissions: PermissionSet::from_policy([
+                    Permission::ReadWorkspace,
+                    Permission::WriteWorkspace,
+                    Permission::ExecuteProcess,
+                ]),
+                write_scope: scope.clone(),
+                workspace_root: Some(fixture.project.clone()),
+            })
+            .build()
+            .map_err(ctx("exact-file runtime assembly"))?;
+        assert_eq!(assembly.sandbox().write_scope(), &scope);
+        assert!(
+            assembly
+                .sandbox()
+                .write_scope()
+                .allows_path(Path::new("src/owned.rs"))
+        );
+        assert!(
+            !assembly
+                .sandbox()
+                .write_scope()
+                .allows_path(Path::new("src/other.rs"))
+        );
+        assert!(
+            assembly
+                .sandbox()
+                .permissions()
+                .contains(Permission::WriteWorkspace)
+        );
+        assert!(
+            !assembly
+                .sandbox()
+                .permissions()
+                .contains(Permission::ExecuteProcess)
+        );
+        // A later broad request cannot restore write authority lost above.
+        let restricted_again = assembly
+            .sandbox()
+            .restrict(&PermissionRequest::from_permissions([
+                Permission::ReadWorkspace,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+            ]));
+        assert_eq!(restricted_again.write_scope(), &scope);
+        assert!(
+            !restricted_again
+                .permissions()
+                .contains(Permission::ExecuteProcess)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_narrowing_readonly_on_full_entry_drops_write_tools() -> TestResult {
         let fixture = build_fixture()?;
         let baseline = fixture_builder(EntryKind::LocalEcho, &fixture)
@@ -8540,6 +9236,7 @@ mod tests {
 
         let narrowed = fixture_builder(EntryKind::LocalEcho, &fixture)
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::ReadOnlyExplore,
                 identity: IdentityOverrides::default(),
                 permissions: PermissionSet::from_policy([
@@ -8597,6 +9294,7 @@ mod tests {
         let fixture = build_fixture()?;
         let Err(error) = fixture_builder(EntryKind::JobPrompt, &fixture)
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::Full,
                 identity: IdentityOverrides::default(),
                 permissions: every_permission(),
@@ -8670,6 +9368,7 @@ mod tests {
         // NoTools → NoTools montiert und bleibt werkzeuglos.
         let same = fixture_builder(EntryKind::JobPrompt, &fixture)
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: NoTools,
                 identity: IdentityOverrides::default(),
                 permissions: every_permission(),
@@ -8695,6 +9394,7 @@ mod tests {
             let profile = entry.profile();
             let assembly = fixture_builder(entry, &fixture)
                 .narrowing(RuntimeNarrowing {
+                    write_scope: FileWriteScope::workspace(),
                     registry_profile: profile.registry_profile,
                     identity: IdentityOverrides::default(),
                     permissions: every_permission(),
@@ -8718,6 +9418,7 @@ mod tests {
         // Eine engere Obergrenze schneidet; ein fremdes Recht kommt nie hinzu.
         let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::Full,
                 identity: IdentityOverrides::default(),
                 permissions: PermissionSet::from_policy([
@@ -8740,6 +9441,7 @@ mod tests {
         let fixture = build_fixture()?;
         let mut spec = fixture_builder(EntryKind::LocalEcho, &fixture).spec;
         let narrowing = RuntimeNarrowing {
+            write_scope: FileWriteScope::workspace(),
             registry_profile: RegistryProfile::ReadOnlyExplore,
             identity: IdentityOverrides {
                 agent_name: Some("plan-node".to_owned()),
@@ -8788,6 +9490,7 @@ mod tests {
         builder.spec.cwd.clone_from(&workspace);
         let assembly = builder
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::ReadOnlyExplore,
                 identity: IdentityOverrides::default(),
                 permissions: PermissionSet::from_policy([
@@ -8825,6 +9528,7 @@ mod tests {
         // Gleichheit mit dem Projekt-Root ist ebenfalls zugelassen.
         let same = fixture_builder(EntryKind::LocalEcho, &fixture)
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::Full,
                 identity: IdentityOverrides::default(),
                 permissions: every_permission(),
@@ -8851,6 +9555,7 @@ mod tests {
         std::fs::create_dir_all(&sibling).map_err(ctx("sibling"))?;
 
         let narrowing_to = |root: PathBuf| RuntimeNarrowing {
+            write_scope: FileWriteScope::workspace(),
             registry_profile: RegistryProfile::Full,
             identity: IdentityOverrides::default(),
             permissions: every_permission(),
@@ -9071,6 +9776,7 @@ mod tests {
         builder.spec.cwd.clone_from(&workspace);
         let assembly = builder
             .narrowing(RuntimeNarrowing {
+                write_scope: FileWriteScope::workspace(),
                 registry_profile: RegistryProfile::ReadOnlyExplore,
                 identity: IdentityOverrides::default(),
                 permissions: PermissionSet::from_policy([
@@ -9159,6 +9865,7 @@ mod tests {
             OperationSurface::AllWithModelTools
         );
         let narrowing_to = |registry_profile: RegistryProfile| RuntimeNarrowing {
+            write_scope: FileWriteScope::workspace(),
             registry_profile,
             identity: IdentityOverrides::default(),
             permissions: every_permission(),

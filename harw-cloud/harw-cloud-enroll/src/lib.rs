@@ -2,8 +2,10 @@
 //!
 //! This crate models the enrollment record kept per device, the short-lived
 //! pairing code exchanged during enrollment, and the validation of pairing
-//! codes.
+//! codes. Validation does not consume an invitation or commit a device/key
+//! binding; durable enrollment is a separate integration boundary.
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -36,7 +38,7 @@ pub struct EnrollmentRecord {
 }
 
 /// A short-lived pairing code issued for device enrollment.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingCode {
     /// The pairing code string presented to the device owner.
@@ -45,13 +47,24 @@ pub struct PairingCode {
     pub expires_at: String,
 }
 
+impl fmt::Debug for PairingCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PairingCode")
+            .field("code", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 /// Errors that can occur during pairing validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnrollmentError {
     /// The presented code does not match the expected one.
     WrongCode,
-    /// The expected code has expired.
+    /// The expected code has reached or passed its expiry.
     Expired,
+    /// Expiry is not a valid absolute timestamp with a UTC offset.
+    InvalidExpiry,
 }
 
 impl fmt::Display for EnrollmentError {
@@ -59,20 +72,40 @@ impl fmt::Display for EnrollmentError {
         match self {
             EnrollmentError::WrongCode => write!(f, "pairing code does not match"),
             EnrollmentError::Expired => write!(f, "pairing code has expired"),
+            EnrollmentError::InvalidExpiry => write!(f, "pairing code expiry is invalid"),
         }
     }
 }
 
 impl std::error::Error for EnrollmentError {}
 
-/// Validate a presented pairing code against the expected one.
+/// Validate a presented code using the current clock.
 ///
-/// Expiry is determined by comparing the expected `expires_at` timestamp
-/// (ISO-8601) lexicographically with the current UTC time, which is
-/// sufficient for consistently formatted timestamps.
+/// See [`validate_pairing_at`] for deterministic validation and exact expiry
+/// semantics. No code is consumed by this helper.
 pub fn validate_pairing(code: &str, expected: &PairingCode) -> Result<(), EnrollmentError> {
-    let now = iso8601_now_utc();
-    if expected.expires_at < now {
+    validate_pairing_at(code, expected, Timestamp::now())
+}
+
+/// Validate using an injected current instant.
+///
+/// Expiry is parsed as an absolute timestamp, so UTC offsets and fractional
+/// seconds compare by instant. A code is invalid at its expiry, not just after
+/// it. Invalid expiry fails closed before comparing the presented code.
+///
+/// # Errors
+/// [`EnrollmentError::InvalidExpiry`], [`EnrollmentError::Expired`], or
+/// [`EnrollmentError::WrongCode`].
+pub fn validate_pairing_at(
+    code: &str,
+    expected: &PairingCode,
+    now: Timestamp,
+) -> Result<(), EnrollmentError> {
+    let expires_at: Timestamp = expected
+        .expires_at
+        .parse()
+        .map_err(|_| EnrollmentError::InvalidExpiry)?;
+    if now >= expires_at {
         return Err(EnrollmentError::Expired);
     }
     if !constant_time_eq(code.as_bytes(), expected.code.as_bytes()) {
@@ -81,39 +114,7 @@ pub fn validate_pairing(code: &str, expected: &PairingCode) -> Result<(), Enroll
     Ok(())
 }
 
-/// Current UTC time formatted as ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`).
-fn iso8601_now_utc() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    iso8601_from_unix(secs)
-}
-
-/// Convert a UNIX timestamp to ISO-8601 UTC (proleptic Gregorian, no leap seconds).
-fn iso8601_from_unix(secs: u64) -> String {
-    let days = secs / 86_400;
-    let rem = secs % 86_400;
-    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let (y, m, d) = civil_from_days(days as i64);
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
-}
-
-/// Days since 1970-01-01 to (year, month, day); Howard Hinnant's algorithm.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
-}
-
-/// Length-checking, timing-attack-resistant byte comparison.
+/// Existing length-checking comparison; no cryptographic timing guarantee is claimed.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -191,5 +192,107 @@ mod tests {
             validate_pairing("abc123", &expected),
             Err(EnrollmentError::Expired)
         );
+    }
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn pairing(expires_at: &str) -> PairingCode {
+        PairingCode {
+            code: "one-time-secret".into(),
+            expires_at: expires_at.into(),
+        }
+    }
+
+    #[test]
+    fn expiry_equality_is_expired_and_fractional_seconds_are_preserved() -> TestResult {
+        let expected = pairing("2026-10-29T12:00:00.500Z");
+        assert_eq!(
+            validate_pairing_at(
+                "one-time-secret",
+                &expected,
+                "2026-10-29T12:00:00.500Z".parse()?
+            ),
+            Err(EnrollmentError::Expired)
+        );
+        assert!(
+            validate_pairing_at(
+                "one-time-secret",
+                &expected,
+                "2026-10-29T12:00:00.499999999Z".parse()?
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            validate_pairing_at(
+                "one-time-secret",
+                &expected,
+                "2026-10-29T12:00:00.500000001Z".parse()?
+            ),
+            Err(EnrollmentError::Expired)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn utc_offsets_compare_by_instant_in_both_directions() -> TestResult {
+        let now: Timestamp = "2026-10-29T12:00:00Z".parse()?;
+        assert_eq!(
+            validate_pairing_at(
+                "one-time-secret",
+                &pairing("2026-10-29T13:00:00+01:00"),
+                now
+            ),
+            Err(EnrollmentError::Expired)
+        );
+        assert!(
+            validate_pairing_at(
+                "one-time-secret",
+                &pairing("2026-10-29T11:00:01-01:00"),
+                now
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            validate_pairing_at(
+                "one-time-secret",
+                &pairing("2026-10-29T13:00:00+02:00"),
+                now
+            ),
+            Err(EnrollmentError::Expired)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_expiry_and_wrong_code_are_explicit_failures() -> TestResult {
+        let now: Timestamp = "2026-10-29T12:00:00Z".parse()?;
+        for expiry in [
+            "",
+            "not-a-timestamp",
+            "2026-10-29T13:00:00",
+            "2026-02-30T13:00:00Z",
+        ] {
+            assert_eq!(
+                validate_pairing_at("one-time-secret", &pairing(expiry), now),
+                Err(EnrollmentError::InvalidExpiry)
+            );
+        }
+        assert_eq!(
+            validate_pairing_at("wrong", &pairing("2026-10-29T12:00:01Z"), now),
+            Err(EnrollmentError::WrongCode)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn debug_redacts_secret_but_preserves_wire_representation() -> TestResult {
+        let expected = pairing("2026-10-29T12:00:01Z");
+        let debug = format!("{expected:?}");
+        assert!(!debug.contains("one-time-secret"));
+        assert!(debug.contains("REDACTED"));
+        let wire = serde_json::to_string(&expected)?;
+        let restored: PairingCode = serde_json::from_str(&wire)?;
+        assert_eq!(restored.code, expected.code);
+        assert_eq!(restored.expires_at, expected.expires_at);
+        Ok(())
     }
 }

@@ -1,0 +1,5 @@
+error: `skill = "Fsread_Tools"` is not a valid skill name (1 to 64 lowercase ASCII letters, digits or `-`, e.g. "fsread-tools")
+ --> tests/compile_fail/44_tool_skill_invalid_name.rs:9:46
+  |
+9 | #[harw_macros::tool(name = "t.read", skill = "Fsread_Tools")]
+  |                                              ^^^^^^^^^^^^^^

@@ -350,22 +350,20 @@ pub fn prefilter_with_lease(
     lease_active: bool,
 ) -> Option<PrefilterHit> {
     let tool = call.name.as_str();
-    if tool == "shell.exec" {
-        if let Some(command) = call.arguments.get("command").and_then(|v| v.as_str()) {
-            if let Some(hit) = prefilter_shell(command, ctx, lease_active) {
-                return Some(hit);
-            }
-        }
+    if tool == "shell.exec"
+        && let Some(command) = call.arguments.get("command").and_then(|v| v.as_str())
+        && let Some(hit) = prefilter_shell(command, ctx, lease_active)
+    {
+        return Some(hit);
     }
     // Plan R9, Teil F: `job.start` führt einen Shell-Befehl aus wie
     // `shell.exec` — dieselben Prüfungen über `command` bzw. das gequotete
     // `argv`, mit den gesetzten Umgebungsvariablen als `NAME=wert`-Präfix.
-    if tool == harw_tool_job::JOB_START_TOOL {
-        if let Some(command) = job_start_prefilter_text(&call.arguments) {
-            if let Some(hit) = prefilter_shell(&command, ctx, lease_active) {
-                return Some(hit);
-            }
-        }
+    if tool == harw_tool_job::JOB_START_TOOL
+        && let Some(command) = job_start_prefilter_text(&call.arguments)
+        && let Some(hit) = prefilter_shell(&command, ctx, lease_active)
+    {
+        return Some(hit);
     }
     if is_write_tool(tool) {
         for raw in path_arguments(&call.arguments) {
@@ -387,13 +385,13 @@ pub fn prefilter_with_lease(
             } else {
                 Some(raw.trim().to_ascii_lowercase()).filter(|host| looks_like_host(host))
             };
-            if let Some(host) = host {
-                if !ctx.network.allows(&host) {
-                    return Some(PrefilterHit::new(
-                        "egress-outside-policy",
-                        format!("Netzziel {host} liegt außerhalb der Netz-Policy"),
-                    ));
-                }
+            if let Some(host) = host
+                && !ctx.network.allows(&host)
+            {
+                return Some(PrefilterHit::new(
+                    "egress-outside-policy",
+                    format!("Netzziel {host} liegt außerhalb der Netz-Policy"),
+                ));
             }
         }
     }
@@ -610,59 +608,58 @@ fn prefilter_shell(
                 return Some(privilege_escalation_hit(name));
             }
 
-            if matches!(name, "curl" | "wget") {
-                if let Some(next) = pipeline.get(index + 1) {
-                    let next_tokens = effective_tokens(next);
-                    let next_name = next_tokens
-                        .first()
+            if matches!(name, "curl" | "wget")
+                && let Some(next) = pipeline.get(index + 1)
+            {
+                let next_tokens = effective_tokens(next);
+                let next_name = next_tokens
+                    .first()
+                    .map(|token| command_name(token))
+                    .unwrap_or_default();
+                let next_name = if PRIVILEGE_COMMANDS.contains(&next_name) {
+                    next_tokens
+                        .get(1)
                         .map(|token| command_name(token))
-                        .unwrap_or_default();
-                    let next_name = if PRIVILEGE_COMMANDS.contains(&next_name) {
-                        next_tokens
-                            .get(1)
-                            .map(|token| command_name(token))
-                            .unwrap_or_default()
-                    } else {
-                        next_name
-                    };
-                    if PIPE_INTERPRETERS.contains(&next_name) {
-                        return Some(PrefilterHit::new(
-                            "remote-code-exec",
-                            format!("`{name} … | {next_name}` führt heruntergeladenen Code aus"),
-                        ));
-                    }
-                }
-            }
-
-            if name == "rm" {
-                if let Some(hit) = check_rm(tokens, ctx) {
-                    return Some(hit);
-                }
-            }
-
-            if name == "git" {
-                if let Some(hit) = check_git(tokens) {
-                    return Some(hit);
-                }
-            }
-
-            if NETWORK_COMMANDS.contains(&name) || name == "git" {
-                if let Some(host) = network_hosts(name, tokens)
-                    .into_iter()
-                    .find(|host| !ctx.network.allows(host))
-                {
+                        .unwrap_or_default()
+                } else {
+                    next_name
+                };
+                if PIPE_INTERPRETERS.contains(&next_name) {
                     return Some(PrefilterHit::new(
-                        "egress-outside-policy",
-                        format!("Netzziel {host} liegt außerhalb der Netz-Policy"),
+                        "remote-code-exec",
+                        format!("`{name} … | {next_name}` führt heruntergeladenen Code aus"),
                     ));
                 }
             }
 
+            if name == "rm"
+                && let Some(hit) = check_rm(tokens, ctx)
+            {
+                return Some(hit);
+            }
+
+            if name == "git"
+                && let Some(hit) = check_git(tokens)
+            {
+                return Some(hit);
+            }
+
+            if (NETWORK_COMMANDS.contains(&name) || name == "git")
+                && let Some(host) = network_hosts(name, tokens)
+                    .into_iter()
+                    .find(|host| !ctx.network.allows(host))
+            {
+                return Some(PrefilterHit::new(
+                    "egress-outside-policy",
+                    format!("Netzziel {host} liegt außerhalb der Netz-Policy"),
+                ));
+            }
+
             // Runde 6, Teil A4: Kopieren/Verschieben nach außen.
-            if TRANSFER_COMMANDS.contains(&name) {
-                if let Some(hit) = check_transfer(name, tokens, ctx, lease_active) {
-                    return Some(hit);
-                }
+            if TRANSFER_COMMANDS.contains(&name)
+                && let Some(hit) = check_transfer(name, tokens, ctx, lease_active)
+            {
+                return Some(hit);
             }
 
             if let Some(hit) = check_redirections(tokens, ctx, lease_active) {
@@ -783,21 +780,19 @@ fn network_hosts(name: &str, tokens: &[String]) -> Vec<String> {
         }
         let remote_login = matches!(name, "ssh" | "scp" | "rsync" | "sftp" | "git");
         // `user@host:pfad` (ssh/scp/rsync/sftp/git).
-        if remote_login {
-            if let Some((user, rest)) = token.split_once('@') {
-                let host = rest.split(':').next().unwrap_or(rest);
-                if !user.is_empty() && !host.is_empty() {
-                    hosts.push(host.to_ascii_lowercase());
-                }
-                continue;
+        if remote_login && let Some((user, rest)) = token.split_once('@') {
+            let host = rest.split(':').next().unwrap_or(rest);
+            if !user.is_empty() && !host.is_empty() {
+                hosts.push(host.to_ascii_lowercase());
             }
+            continue;
         }
         // `host:pfad` bei scp/rsync.
         if matches!(name, "scp" | "rsync") {
-            if let Some((host, _)) = token.split_once(':') {
-                if looks_like_host(host) {
-                    hosts.push(host.to_ascii_lowercase());
-                }
+            if let Some((host, _)) = token.split_once(':')
+                && looks_like_host(host)
+            {
+                hosts.push(host.to_ascii_lowercase());
             }
             continue;
         }

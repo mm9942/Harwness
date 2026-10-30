@@ -73,7 +73,10 @@
 //! [`write_state_sidecar`], [`read_state_sidecar`]) — the same
 //! `<kind>/<id>.json` layout the job store uses for its own sidecars.
 //! `work_driver.status` reads it; a missing sidecar just means the driver has
-//! not finished its first round yet.
+//! not finished its first round yet. Publication requires the current live
+//! job claim and uses cap-relative atomic replacement with directory sync.
+//! Observation is lock-free; recovery reads separately require a live claim.
+//! Legacy JSON state is readable, but never grants execution authority.
 //!
 //! # Concurrency
 //! The operation structs are stateless (`Send + Sync`). Job mutations go
@@ -86,12 +89,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use harw_agent_dsl::ir_v2::{AgentIr, WorkDriverSpec};
-use harw_job_runtime::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy, StoredJob, WorkId};
+use harw_job_runtime::{
+    Budget, Job, JobKind, JobScope, JobState, LeaseToken, RetryPolicy, StoredJob, WorkId,
+};
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
 use harw_plan::error::PlanError;
 use harw_plan::goal::{GoalStatus, GoalStore};
-use harw_plan::tenant_scope::ScopedGoalStore;
+use harw_plan::store::PlanStore;
+use harw_plan::tenant_scope::{ScopedGoalStore, ScopedPlanStore};
 use harw_plan_bridge::{JudgeVerdict, OpContextPlanExt, VerificationState, WorkerState};
 use harw_session_store::{CancelRequest, JobListQuery, JobStore, SessionStoreError};
 use harw_types::{ApprovalActor, Principal, TenantId};
@@ -382,12 +388,23 @@ pub struct WorkDriverJobInput {
     pub goal_id: String,
     /// The plan to drive against, if any.
     pub plan_id: Option<String>,
-    /// Frozen plan revision at the time of the human approval: proves later
-    /// which scope was actually approved. Validated by `work_driver.enqueue`
-    /// against the current sealed revision when `frozen_scope` is set (h23
-    /// gap 1; mismatch fails closed).
+    /// Runtime-observed plan revision at admission. New plan-bound jobs always
+    /// pin it; legacy jobs may only have a caller-supplied frozen approval pin.
+    /// A supplied `frozen_scope` must match this observed revision. Runtime
+    /// capture is not itself proof of human approval or additional authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_revision: Option<u64>,
+    /// Runtime-captured snapshot identity, never accepted from enqueue arguments.
+    /// Missing on legacy inputs; grants no execution rights.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_plan: Option<AdmittedPlanBaseline>,
+    /// Explicit runtime-captured source collection; absent preserves legacy jobs.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_prerequisites"
+    )]
+    pub prerequisites: Option<Vec<harw_plan_bridge::source_collection::SourceCollectionContract>>,
     /// Registry role of the orchestrator that enqueued the run.
     pub orchestrator_role: String,
     /// Principal id that requested the run.
@@ -406,6 +423,68 @@ pub struct WorkDriverJobInput {
     /// `#[serde(default)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<TenantId>,
+}
+
+fn deserialize_prerequisites<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<harw_plan_bridge::source_collection::SourceCollectionContract>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let contracts =
+        Vec::<harw_plan_bridge::source_collection::SourceCollectionContract>::deserialize(
+            deserializer,
+        )?;
+    if contracts.is_empty() || contracts.len() > 64 {
+        return Err(serde::de::Error::custom(
+            "prerequisites must contain 1..=64 contracts",
+        ));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    if contracts
+        .iter()
+        .any(|contract| !ids.insert(&contract.node_id))
+    {
+        return Err(serde::de::Error::custom("duplicate prerequisite node"));
+    }
+    Ok(Some(contracts))
+}
+
+/// Immutable identity of the exact plan observed at admission.
+///
+/// Only digests are retained: no plan or model text is duplicated into the job.
+/// Version 1 hashes the complete typed Plan JSON (including progress). Its
+/// structs, ordered vectors and scalar fields contain no unordered maps.
+/// A serialization change across upgrades may require re-enqueueing. This is
+/// a snapshot guard, not a receipt, authorization or execution-time lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedPlanBaseline {
+    /// Digest representation version; unsupported versions fail closed.
+    pub schema_version: u32,
+    /// Exact selected plan identity.
+    pub plan_id: String,
+    /// Exact observed revision.
+    pub plan_revision: u64,
+    /// Domain-separated digest of the full typed snapshot.
+    pub snapshot_digest: harw_types::ContentDigest,
+}
+
+impl AdmittedPlanBaseline {
+    /// Captures a trusted store snapshot. This value alone grants no authority.
+    ///
+    /// # Errors
+    /// Returns serialization failures rather than admitting an unchecked plan.
+    pub fn capture(plan: &harw_plan::Plan) -> serde_json::Result<Self> {
+        let mut bytes = b"harw/work-driver/admitted-plan/v1\0".to_vec();
+        serde_json::to_writer(&mut bytes, plan)?;
+        Ok(Self {
+            schema_version: 1,
+            plan_id: plan.id.as_str().to_owned(),
+            plan_revision: plan.revision.value(),
+            snapshot_digest: harw_types::ContentDigest::of(&bytes),
+        })
+    }
 }
 
 /// Frozen, human-approved plan/TODO scope of a WorkDriver run (h23 gap 4,
@@ -433,8 +512,43 @@ impl WorkDriverJobInput {
                 format!("job {} is not a {WORK_DRIVER_JOB_KIND} job", record.job.id),
             ));
         }
-        serde_json::from_value(record.input.clone())
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        let input: Self = serde_json::from_value(record.input.clone())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        input
+            .validate_prerequisites_binding()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(input)
+    }
+
+    /// Checks immutable descriptor binding, not authority or current plan state.
+    pub fn validate_prerequisites_binding(&self) -> Result<(), String> {
+        let Some(contracts) = &self.prerequisites else {
+            return Ok(());
+        };
+        let baseline = self
+            .admitted_plan
+            .as_ref()
+            .ok_or("prerequisites require an admitted plan")?;
+        if baseline.schema_version != 1
+            || contracts.is_empty()
+            || contracts.len() > 64
+            || self.plan_id.as_deref() != Some(baseline.plan_id.as_str())
+            || self.plan_revision != Some(baseline.plan_revision)
+        {
+            return Err("prerequisite baseline binding mismatch".into());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for contract in contracts {
+            contract.validate()?;
+            if contract.plan_id != baseline.plan_id
+                || contract.plan_revision != baseline.plan_revision
+                || contract.admission_digest != baseline.snapshot_digest
+                || !ids.insert(&contract.node_id)
+            {
+                return Err("prerequisite contract differs from immutable admission".into());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -519,51 +633,63 @@ pub fn read_state_sidecar(
     store: &JobStore,
     work_id: &WorkId,
 ) -> io::Result<Option<WorkDriverState>> {
-    let path = state_sidecar_path(store, work_id)?;
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if !metadata.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "work_driver state sidecar is not a regular file",
-        ));
-    }
-    let bytes = std::fs::read(&path)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    state_sidecar_path(store, work_id)?;
+    decode_state_sidecar(
+        store
+            .read_work_driver_state(work_id)
+            .map_err(io::Error::other)?,
+    )
 }
 
-/// Atomically writes (or replaces) the state sidecar of `state.work_id`
-/// (temp file + fsync + rename).
+fn decode_state_sidecar(bytes: Option<Vec<u8>>) -> io::Result<Option<WorkDriverState>> {
+    bytes
+        .map(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        })
+        .transpose()
+}
+
+/// Reads a checkpoint only for the current live claim; the returned data
+/// remains state, never authority. Blocking; use a blocking worker.
 ///
 /// # Errors
-/// [`io::ErrorKind::InvalidInput`] (unsafe id), serialization or I/O errors.
-pub fn write_state_sidecar(store: &JobStore, state: &WorkDriverState) -> io::Result<()> {
-    use std::io::Write as _;
-    let path = state_sidecar_path(store, &state.work_id)?;
-    let Some(dir) = path.parent() else {
+/// Lease, decoding and I/O failures.
+pub fn read_claimed_state_sidecar(
+    store: &JobStore,
+    token: &LeaseToken,
+) -> io::Result<Option<WorkDriverState>> {
+    state_sidecar_path(store, &token.work_id)?;
+    decode_state_sidecar(
+        store
+            .read_claimed_work_driver_state(token)
+            .map_err(io::Error::other)?,
+    )
+}
+
+/// Publishes the state under a live job claim, with a final lease deadline
+/// check after temp sync and before atomic rename, followed by directory sync.
+/// Keeps the existing JSON layout. No cross-store/side-effect transaction or
+/// same-claim checkpoint CAS is implied. Blocking; use a blocking worker.
+///
+/// # Errors
+/// Mismatched state/token IDs, revoked/expired lease, serialization or I/O errors.
+pub fn write_state_sidecar(
+    store: &JobStore,
+    token: &LeaseToken,
+    state: &WorkDriverState,
+) -> io::Result<()> {
+    state_sidecar_path(store, &state.work_id)?;
+    if state.work_id != token.work_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "sidecar path has no parent",
+            "state and claim belong to different jobs",
         ));
-    };
-    std::fs::create_dir_all(dir)?;
-    let bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
-    let temp = dir.join(format!(
-        ".{}.json.tmp-{}",
-        state.work_id.as_str(),
-        std::process::id()
-    ));
-    {
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
     }
-    std::fs::rename(&temp, &path)
+    let bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
+    store
+        .write_work_driver_state(token, &bytes)
+        .map_err(io::Error::other)
 }
 
 /// `true` for a job of kind [`WORK_DRIVER_JOB_KIND`].
@@ -1006,13 +1132,56 @@ async fn work_driver_enqueue(
     // If the plan has moved on since the approval, the enqueue fails closed;
     // the caller must re-approve against the current sealed revision.
     let frozen_scope = args.frozen_scope.clone();
-    let plan_revision = frozen_scope.as_ref().map(|scope| scope.plan_revision);
-    if let Some(scope) = &frozen_scope {
-        let plans = ctx.plan_store();
-        let current_revision = plans
-            .as_ref()
-            .map(|store| store.revision().value())
+    // Fallible current() refreshes FilePlanStore's WAL. revision() alone is
+    // advisory and cannot identify the snapshot that was actually admitted.
+    let mut prerequisites = None;
+    let admitted_plan = if let Some(selected) = plan_id.as_deref() {
+        let handle = ctx
+            .plan_store()
             .ok_or_else(|| OpError::NotAvailable("plan store is not configured".to_owned()))?;
+        let plans = ScopedPlanStore::new(handle.as_ref(), ctx.tenant().cloned());
+        let plan = plans
+            .current()
+            .map_err(|error| OpError::Execution(format!("plan store: {error}")))?;
+        if plan.id.as_str() != selected
+            || plan.goal_id.as_deref().is_some_and(|id| id != goal_id)
+            || goal
+                .plan_revision
+                .is_some_and(|revision| revision != plan.revision)
+        {
+            return Err(OpError::InvalidArguments(
+                "selected plan or goal binding changed; review and re-bind before enqueue"
+                    .to_owned(),
+            ));
+        }
+        let baseline = AdmittedPlanBaseline::capture(&plan)
+            .map_err(|error| OpError::Execution(format!("plan baseline: {error}")))?;
+        let captured = harw_plan_bridge::source_collection::SourceCollectionContract::capture_all(
+            &plan,
+            baseline.snapshot_digest,
+        )
+        .map_err(|error| OpError::InvalidArguments(format!("source collection: {error}")))?;
+        if !captured.is_empty() {
+            if goal.plan_id.as_ref() != Some(&plan.id)
+                || goal.plan_revision != Some(plan.revision)
+                || plan.goal_id.as_deref() != Some(goal.id.as_str())
+                || plan.tenant != goal.tenant
+            {
+                return Err(OpError::InvalidArguments(
+                    "source collection requires an exact reciprocal goal/plan binding; bind the selected revision before enqueue".to_owned(),
+                ));
+            }
+            prerequisites = Some(captured);
+        }
+        Some(baseline)
+    } else {
+        None
+    };
+    let plan_revision = admitted_plan.as_ref().map(|plan| plan.plan_revision);
+    if let Some(scope) = &frozen_scope {
+        let current_revision = plan_revision.ok_or_else(|| {
+            OpError::NotAvailable("frozen scope requires a bound plan".to_owned())
+        })?;
         if scope.plan_revision != current_revision {
             return Err(OpError::InvalidArguments(format!(
                 "plan revision changed after approval: frozen scope is revision {}, but the \
@@ -1028,12 +1197,17 @@ async fn work_driver_enqueue(
         goal_id: goal_id.clone(),
         plan_id,
         plan_revision,
+        admitted_plan,
+        prerequisites,
         orchestrator_role: caller.role.clone(),
         requested_by: principal.id().to_owned(),
         spec,
         frozen_scope,
         tenant: ctx.tenant().cloned(),
     };
+    input
+        .validate_prerequisites_binding()
+        .map_err(OpError::InvalidArguments)?;
     let record = admission_record(ctx, principal, &input)?;
     let work_id = record.job.id.clone();
     jobs.admit(&record).map_err(|error| {
@@ -1078,6 +1252,7 @@ fn admission_record(
             base_delay: SignedDuration::from_secs(30),
             factor: 2.0,
             max_delay: SignedDuration::from_secs(300),
+            jitter: 0.0,
         },
         now,
     );
@@ -1492,6 +1667,14 @@ mod tests {
 
     /// Like [`fixture`], with an explicit caller service (or none).
     fn fixture_with(caller: Option<WorkDriverCaller>, status: GoalStatus) -> TestResult<Fixture> {
+        fixture_with_plan(caller, status, None)
+    }
+
+    fn fixture_with_plan(
+        caller: Option<WorkDriverCaller>,
+        status: GoalStatus,
+        plans: Option<Arc<dyn PlanStore>>,
+    ) -> TestResult<Fixture> {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         std::fs::create_dir_all(dir.path().join("ws")).map_err(ctx("workspace"))?;
         let registry = WorkspaceRegistry::build(
@@ -1520,6 +1703,9 @@ mod tests {
         let mut services = ServiceMap::new();
         services.insert(Arc::clone(&jobs));
         services.insert(goals);
+        if let Some(plans) = plans {
+            services.insert(plans);
+        }
         services.insert(PlanToolConfig::enabled_defaults());
         services.insert(Principal::trusted_ingress(
             PrincipalKind::Model,
@@ -1544,6 +1730,15 @@ mod tests {
         status: GoalStatus,
         goal_tenant: Option<&str>,
         caller_tenant: Option<&str>,
+    ) -> TestResult<Fixture> {
+        fixture_scoped_with_plan(status, goal_tenant, caller_tenant, None)
+    }
+
+    fn fixture_scoped_with_plan(
+        status: GoalStatus,
+        goal_tenant: Option<&str>,
+        caller_tenant: Option<&str>,
+        plans: Option<Arc<dyn PlanStore>>,
     ) -> TestResult<Fixture> {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         std::fs::create_dir_all(dir.path().join("ws")).map_err(ctx("workspace"))?;
@@ -1575,6 +1770,9 @@ mod tests {
         let mut services = ServiceMap::new();
         services.insert(Arc::clone(&jobs));
         services.insert(goals);
+        if let Some(plans) = plans {
+            services.insert(plans);
+        }
         services.insert(PlanToolConfig::enabled_defaults());
         services.insert(Principal::trusted_ingress(
             PrincipalKind::Model,
@@ -1846,6 +2044,227 @@ judge_role = "critic"
         Ok(())
     }
 
+    #[tokio::test]
+    async fn enqueue_captures_fresh_plan_baseline_not_advisory_revision() -> TestResult {
+        use harw_plan::{FilePlanStore, PlanAction, PlanId};
+        let dir = tempfile::tempdir().map_err(ctx("plan dir"))?;
+        let plans = Arc::new(FilePlanStore::new(dir.path()).map_err(ctx("plan store"))?);
+        let id = PlanId::new("p-baseline");
+        plans
+            .apply(
+                PlanAction::Create {
+                    plan_id: id.clone(),
+                    goal: "private objective".to_owned(),
+                },
+                "test",
+            )
+            .map_err(ctx("create"))?;
+        let old_revision = plans.revision();
+        // A second writer advances WAL without refreshing the first instance's cache.
+        let other = FilePlanStore::new(dir.path()).map_err(ctx("second store"))?;
+        other
+            .apply(
+                PlanAction::BindGoal {
+                    goal_id: GOAL.to_owned(),
+                },
+                "test",
+            )
+            .map_err(ctx("bind goal"))?;
+        assert_eq!(plans.revision(), old_revision);
+        let expected = other.current().map_err(ctx("fresh snapshot"))?;
+        let fx = fixture_with_plan(
+            Some(WorkDriverCaller {
+                role: "driver".to_owned(),
+                spec: spec(),
+            }),
+            GoalStatus::Active,
+            Some(plans),
+        )?;
+        let output = run_model(
+            &WorkDriverEnqueueOperation,
+            &fx.ctx,
+            serde_json::json!({ "goal_id": GOAL, "plan_id": id.as_str() }),
+        )
+        .await
+        .map_err(ctx("enqueue"))?;
+        let record = fx.jobs.get(&job_id_of(&output)?).map_err(ctx("job"))?;
+        let input = WorkDriverJobInput::from_job(&record).map_err(ctx("input"))?;
+        assert_eq!(input.plan_revision, Some(expected.revision.value()));
+        let expected_baseline = AdmittedPlanBaseline::capture(&expected).map_err(ctx("capture"))?;
+        assert_eq!(input.admitted_plan, Some(expected_baseline.clone()));
+        let roundtrip: harw_plan::Plan =
+            serde_json::from_slice(&serde_json::to_vec(&expected).map_err(ctx("serialize"))?)
+                .map_err(ctx("deserialize"))?;
+        assert_eq!(
+            AdmittedPlanBaseline::capture(&roundtrip).map_err(ctx("recapture"))?,
+            expected_baseline
+        );
+        assert!(!record.input.to_string().contains("private objective"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collection_enqueue_requires_reciprocal_binding_and_captures_contract() -> TestResult {
+        use harw_plan::{Criterion, InMemoryPlanStore, PlanAction, PlanId, VerificationStep};
+        let plans = Arc::new(InMemoryPlanStore::new());
+        let id = PlanId::new("collection-plan");
+        plans
+            .apply(
+                PlanAction::Create {
+                    plan_id: id.clone(),
+                    goal: "collect docs".into(),
+                },
+                "test",
+            )
+            .map_err(ctx("create"))?;
+        let mut node = harw_plan::testing::base_node("collect");
+        node.kind = harw_plan::PlanNodeKind::Research;
+        node.write_scope.clear();
+        node.read_scope = vec![harw_plan::ids::PathOrSymbol::Path("docs/a.md".into())];
+        node.acceptance_criteria = vec![Criterion {
+            description: "exact source coverage".into(),
+            verification: vec![VerificationStep::CollectSources {
+                sources: vec!["docs/a.md".into()],
+            }],
+        }];
+        plans
+            .apply(PlanAction::AddNode { node }, "test")
+            .map_err(ctx("add"))?;
+        plans
+            .apply(
+                PlanAction::BindGoal {
+                    goal_id: GOAL.into(),
+                },
+                "test",
+            )
+            .map_err(ctx("bind goal"))?;
+        let fx = fixture_with_plan(
+            Some(WorkDriverCaller {
+                role: "driver".into(),
+                spec: spec(),
+            }),
+            GoalStatus::Active,
+            Some(plans.clone()),
+        )?;
+        let args = serde_json::json!({"goal_id":GOAL,"plan_id":id.as_str()});
+        assert!(
+            matches!(run_model(&WorkDriverEnqueueOperation, &fx.ctx, args.clone()).await,
+            Err(OpError::InvalidArguments(message)) if message.contains("reciprocal"))
+        );
+        fx.ctx
+            .goal_store()
+            .ok_or(TestError::Missing("goal store"))?
+            .apply(
+                GoalAction::BindPlan {
+                    plan_id: id,
+                    revision: plans.revision(),
+                },
+                "test",
+            )
+            .map_err(ctx("bind plan"))?;
+        let output = run_model(&WorkDriverEnqueueOperation, &fx.ctx, args)
+            .await
+            .map_err(ctx("enqueue"))?;
+        let record = fx.jobs.get(&job_id_of(&output)?).map_err(ctx("job"))?;
+        let input = WorkDriverJobInput::from_job(&record).map_err(ctx("input"))?;
+        let contracts = input
+            .prerequisites
+            .as_ref()
+            .ok_or(TestError::Missing("contracts"))?;
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].required_sources(), vec!["docs/a.md"]);
+        let mut forged = input;
+        forged.admitted_plan = None;
+        assert!(forged.validate_prerequisites_binding().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_wrong_plan_and_foreign_goal_binding() -> TestResult {
+        use harw_plan::{InMemoryPlanStore, PlanAction, PlanId};
+        let plans = Arc::new(InMemoryPlanStore::new());
+        plans
+            .apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new("p-baseline"),
+                    goal: "objective".to_owned(),
+                },
+                "test",
+            )
+            .map_err(ctx("create"))?;
+        plans
+            .apply(
+                PlanAction::BindGoal {
+                    goal_id: "foreign-goal".to_owned(),
+                },
+                "test",
+            )
+            .map_err(ctx("bind"))?;
+        let fx = fixture_with_plan(
+            Some(WorkDriverCaller {
+                role: "driver".to_owned(),
+                spec: spec(),
+            }),
+            GoalStatus::Active,
+            Some(plans),
+        )?;
+        for selected in ["p-other", "p-baseline"] {
+            let result = run_model(
+                &WorkDriverEnqueueOperation,
+                &fx.ctx,
+                serde_json::json!({ "goal_id": GOAL, "plan_id": selected }),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(OpError::InvalidArguments(_))),
+                "{result:?}"
+            );
+        }
+        assert!(
+            fx.jobs
+                .list(&JobListQuery::default())
+                .map_err(ctx("list"))?
+                .jobs
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_baseline_cannot_capture_foreign_tenant_plan() -> TestResult {
+        use harw_plan::{InMemoryPlanStore, PlanId};
+        let plans = Arc::new(InMemoryPlanStore::new());
+        plans
+            .create_for_tenant(
+                PlanId::new("p-foreign"),
+                "foreign".to_owned(),
+                Some(TenantId::from_str("tenant-b")),
+                "test",
+            )
+            .map_err(ctx("create foreign"))?;
+        let fx = fixture_scoped_with_plan(
+            GoalStatus::Active,
+            Some("tenant-a"),
+            Some("tenant-a"),
+            Some(plans),
+        )?;
+        let result = run_model(
+            &WorkDriverEnqueueOperation,
+            &fx.ctx,
+            serde_json::json!({ "goal_id": GOAL, "plan_id": "p-foreign" }),
+        )
+        .await;
+        assert!(matches!(result, Err(OpError::Execution(_))), "{result:?}");
+        assert!(
+            fx.jobs
+                .list(&JobListQuery::default())
+                .map_err(ctx("list"))?
+                .jobs
+                .is_empty()
+        );
+        Ok(())
+    }
+
     /// h23 gap 1: without a plan store, a frozen scope cannot be validated
     /// and the enqueue fails closed (NotAvailable, no job admitted).
     #[tokio::test]
@@ -1892,6 +2311,8 @@ judge_role = "critic"
             goal_id: "g-1".to_owned(),
             plan_id: None,
             plan_revision: Some(scope.plan_revision),
+            admitted_plan: None,
+            prerequisites: None,
             orchestrator_role: "work-orchestrator".to_owned(),
             requested_by: "model:orchestrator".to_owned(),
             spec: spec(),
@@ -1904,6 +2325,8 @@ judge_role = "critic"
             goal_id: "g-1".to_owned(),
             plan_id: None,
             plan_revision: None,
+            admitted_plan: None,
+            prerequisites: None,
             orchestrator_role: "work-orchestrator".to_owned(),
             requested_by: "model:orchestrator".to_owned(),
             spec: spec(),
@@ -1923,6 +2346,11 @@ judge_role = "critic"
             serde_json::from_value(encoded).map_err(ctx("decode input"))?;
         assert_eq!(decoded.frozen_scope, Some(scope));
         assert_eq!(decoded.plan_revision, Some(174));
+        for invalid in [serde_json::Value::Null, serde_json::json!([])] {
+            let mut bad = serde_json::to_value(&input).map_err(ctx("encode bad input"))?;
+            bad["prerequisites"] = invalid;
+            assert!(serde_json::from_value::<WorkDriverJobInput>(bad).is_err());
+        }
         Ok(())
     }
 
@@ -2105,7 +2533,22 @@ judge_role = "critic"
             last_rationale: Vec::new(),
             updated_at: Timestamp::now(),
         };
-        write_state_sidecar(&fx.jobs, &state).map_err(ctx("write sidecar"))?;
+        write_state_sidecar(
+            &fx.jobs,
+            &fx.jobs
+                .claim(
+                    &work_id,
+                    &harw_session_store::ClaimRequest {
+                        worker_id: "sidecar-test".to_owned(),
+                        lease_ttl: SignedDuration::from_secs(60),
+                        now: Timestamp::now(),
+                    },
+                )
+                .map_err(ctx("claim sidecar writer"))?
+                .token,
+            &state,
+        )
+        .map_err(ctx("write sidecar"))?;
         let read_back = read_state_sidecar(&fx.jobs, &work_id).map_err(ctx("read sidecar"))?;
         assert_eq!(read_back.as_ref(), Some(&state));
 
@@ -2169,6 +2612,7 @@ judge_role = "critic"
                 base_delay: SignedDuration::from_secs(1),
                 factor: 1.0,
                 max_delay: SignedDuration::from_secs(1),
+                jitter: 0.0,
             },
             now,
         );
@@ -2338,6 +2782,7 @@ judge_role = "critic"
                 base_delay: SignedDuration::from_secs(1),
                 factor: 1.0,
                 max_delay: SignedDuration::from_secs(1),
+                jitter: 0.0,
             },
             now,
         );

@@ -1150,6 +1150,15 @@ const PLAN_TOOL_NAMES: &[&str] = &[
     "work_driver.enqueue",
     "work_driver.status",
     "work_driver.stop",
+    // PL-90: die Intent-Zyklus-Fläche hängt am selben Gate
+    // (`harw_ops::register_intent_cycle_tools`).
+    "intent_cycle.start",
+    "intent_cycle.status",
+    "intent_cycle.stop",
+    // Welle 7: `intent_cycle.list` (Modell-Tool, readonly) und die
+    // `/cycle`-Befehlsfläche `intent_cycle` hängen am selben Gate.
+    "intent_cycle.list",
+    "intent_cycle",
 ];
 
 /// Runde 5, Teil H: `agent.result` steht an der Wurzel genau dann, wenn sie

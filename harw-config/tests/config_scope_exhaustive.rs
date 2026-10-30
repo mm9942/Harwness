@@ -61,6 +61,7 @@ fn test_field_table_exhaustive_harness_config() {
         active_uia_definition,
         uia_provider,
         uia_model,
+        single_agent_mode,
         uia_worker_model,
         policy_profile,
         logging: _,
@@ -91,6 +92,8 @@ fn test_field_table_exhaustive_harness_config() {
         jobs: _,
         // `[memory]`, eigener Abschnittstest unten.
         memory: _,
+        // PL-97 B1: `[skills]`, eigener Abschnittstest unten.
+        skills: _,
         // `[retention]`, eigener Abschnittstest unten.
         retention: _,
         // `[session_listener]`, eigener Abschnittstest unten.
@@ -110,6 +113,7 @@ fn test_field_table_exhaustive_harness_config() {
         active_uia_definition,
         uia_provider,
         uia_model,
+        single_agent_mode,
         uia_worker_model,
         policy_profile,
         project_root_markers,
@@ -123,6 +127,7 @@ fn test_field_table_exhaustive_harness_config() {
         "active_uia_definition",
         "uia_provider",
         "uia_model",
+        "single_agent_mode",
         "uia_worker_model",
         "policy_profile",
         "project_root_markers",
@@ -153,18 +158,38 @@ fn test_field_table_exhaustive_logging_section() {
 }
 
 // ---------------------------------------------------------------------
-// [tui] (Abschnitt 1.3, 3 Felder; Runde 5, Teil I: +`child_stream`)
+// [tui] (Abschnitt 1.3, 5 Felder; Runde 5, Teil I: +`child_stream`; h7/h9: +`status_expiry`, `goal_mode`)
 // ---------------------------------------------------------------------
 
 #[test]
 fn test_field_table_exhaustive_tui_section() {
     let TuiSection {
+        language,
         theme,
         keybindings_file,
         child_stream,
+        status_expiry,
+        goal_mode,
+        reasoning,
     } = TuiSection::default();
-    let _ = (theme, keybindings_file, child_stream);
-    for path in ["tui.theme", "tui.keybindings_file", "tui.child_stream"] {
+    let _ = (
+        language,
+        theme,
+        keybindings_file,
+        child_stream,
+        status_expiry,
+        goal_mode,
+        reasoning,
+    );
+    for path in [
+        "tui.language",
+        "tui.theme",
+        "tui.keybindings_file",
+        "tui.child_stream",
+        "tui.status_expiry",
+        "tui.goal_mode",
+        "tui.reasoning",
+    ] {
         assert_path_in_field_table_exactly_once(path);
     }
 }
@@ -508,16 +533,35 @@ fn test_field_table_exhaustive_rule_toml() {
 }
 
 // ---------------------------------------------------------------------
-// [sandbox] (Abschnitt 1.12, 2 Container-Felder + Cargo 4 + Tmux 2)
+// [sandbox] (Abschnitt 1.12, 2 Container-Felder + Cargo 4 + Tmux 2 +
+// `execution`, PL-97 E2)
 // ---------------------------------------------------------------------
 
 #[test]
 fn test_field_table_exhaustive_sandbox_section() {
-    let SandboxSection { cargo, tmux } = SandboxSection::default();
-    let _ = (cargo, tmux);
-    for path in ["sandbox.cargo", "sandbox.tmux"] {
+    let SandboxSection {
+        cargo,
+        tmux,
+        execution,
+    } = SandboxSection::default();
+    let _ = (cargo, tmux, execution);
+    for path in ["sandbox.cargo", "sandbox.tmux", "sandbox.execution"] {
         assert_path_in_field_table_exactly_once(path);
     }
+}
+
+// PL-97 E2: `sandbox.execution` ist Profil-Ebene und sicherheitsrelevant; ein
+// nicht vertrautes Projekt darf ihn nicht setzen (`ProfileReplaces`).
+#[test]
+fn test_sandbox_execution_is_profile_scoped_and_security_critical() -> TestResult {
+    let entry = FIELD_TABLE
+        .iter()
+        .find(|f| f.path == "sandbox.execution")
+        .ok_or(common::TestError::Missing("sandbox.execution"))?;
+    assert_eq!(entry.scope, harw_config::Scope::Profile);
+    assert_eq!(entry.merge, harw_config::MergeRule::ProfileReplaces);
+    assert!(entry.security_critical);
+    Ok(())
 }
 
 #[test]
@@ -578,6 +622,7 @@ fn test_field_table_exhaustive_internal_models_toml() {
         sub_orchestrator,
         auto_classifier,
         work_driver_judge,
+        image_understanding,
     } = InternalModelsToml::default();
     let _ = (
         use_openrouter_defaults,
@@ -593,6 +638,7 @@ fn test_field_table_exhaustive_internal_models_toml() {
         sub_orchestrator,
         auto_classifier,
         work_driver_judge,
+        image_understanding,
     );
     for path in [
         "internal_models.use_openrouter_defaults",
@@ -609,6 +655,7 @@ fn test_field_table_exhaustive_internal_models_toml() {
         // Runde 5, Teil E.
         "internal_models.auto_classifier",
         "internal_models.work_driver_judge",
+        "internal_models.image_understanding",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }
@@ -803,15 +850,40 @@ fn test_field_table_exhaustive_shell_toml() {
 }
 
 // ---------------------------------------------------------------------
-// [jobs] (1 Feld) — Höchstzahl laufender Hintergrund-Jobs
+// [jobs] (3 Felder) — Höchstzahl laufender Jobs, cgroup-Wurzel, Trampolin
 // ---------------------------------------------------------------------
 
 #[test]
 fn test_field_table_exhaustive_jobs_toml() {
-    let harw_config::harness_config::JobsToml { max_running } =
-        harw_config::harness_config::JobsToml::default();
-    let _ = max_running;
-    assert_path_in_field_table_exactly_once("jobs.max_running");
+    let harw_config::harness_config::JobsToml {
+        max_running,
+        cgroup_root,
+        trampoline,
+    } = harw_config::harness_config::JobsToml::default();
+    let _ = (max_running, cgroup_root, trampoline);
+    for path in ["jobs.max_running", "jobs.cgroup_root", "jobs.trampoline"] {
+        assert_path_in_field_table_exactly_once(path);
+    }
+}
+
+// PL-97 E3: `jobs.cgroup_root` und `jobs.trampoline` sind Profil-Ebene und
+// sicherheitsrelevant; ein nicht vertrautes Projekt darf sie nicht setzen.
+#[test]
+fn test_jobs_cgroup_root_and_trampoline_are_profile_scoped_and_security_critical() -> TestResult {
+    for path in ["jobs.cgroup_root", "jobs.trampoline"] {
+        let entry = FIELD_TABLE
+            .iter()
+            .find(|f| f.path == path)
+            .ok_or(common::TestError::Missing("jobs path"))?;
+        assert_eq!(entry.scope, harw_config::Scope::Profile, "{path}");
+        assert_eq!(
+            entry.merge,
+            harw_config::MergeRule::ProfileReplaces,
+            "{path}"
+        );
+        assert!(entry.security_critical, "{path}");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -864,6 +936,34 @@ fn test_field_table_exhaustive_memory_section() {
         "memory.context_ledger",
         "memory.security_signals",
         "memory.llm_extraction",
+    ] {
+        assert_path_in_field_table_exactly_once(path);
+    }
+}
+
+// ---------------------------------------------------------------------
+// [skills] (4 Felder) — PL-97 B1: getriggerte Skill-Auszüge
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_skills_section() {
+    let harw_config::SkillsSection {
+        triggered_injection,
+        inject_imported,
+        per_turn_bytes,
+        per_session_bytes,
+    } = harw_config::SkillsSection::default();
+    let _ = (
+        triggered_injection,
+        inject_imported,
+        per_turn_bytes,
+        per_session_bytes,
+    );
+    for path in [
+        "skills.triggered_injection",
+        "skills.inject_imported",
+        "skills.per_turn_bytes",
+        "skills.per_session_bytes",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }
@@ -952,4 +1052,150 @@ fn test_field_table_exhaustive_uia_worker_models_toml() {
     ] {
         assert_path_in_field_table_exactly_once(path);
     }
+}
+
+// ---------------------------------------------------------------------
+// [dod] — außerhalb von `HarnessConfig` (kein FIELD_TABLE-Eintrag, siehe
+// `FIELD_TABLE`-Doku). Die Destrukturierung ohne `..` erzwingt trotzdem für
+// jedes künftige Feld eine bewusste Entscheidung über den nicht vertrauten
+// Repo-Layer (`discovery::merge_restricted_dod`); der Laufzeitteil pinnt die
+// Regel je Feld über die öffentliche Discovery-API (PL-97 D1).
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_dod_section_fields_are_exhaustively_classified() {
+    let harw_config::DodSection {
+        // In jeder Layer fest `true` (`DodSection::validate`).
+        kill_requires_human,
+        // Repo-Layer: nur Richtung `true` (ODER).
+        auto_freeze,
+        // Repo-Layer: nie übernommen.
+        proof_key_dir,
+        // Repo-Layer: nur Schnittmenge.
+        allowed_cgroup_prefixes,
+        // Repo-Layer: nie übernommen (gleiche Regel wie `proof_key_dir`).
+        export_dir,
+        // Repo-Layer: nie übernommen.
+        findings_window_hours,
+    } = harw_config::DodSection::default();
+    assert!(kill_requires_human);
+    assert!(auto_freeze);
+    assert_eq!(proof_key_dir, None);
+    assert!(allowed_cgroup_prefixes.is_empty());
+    assert_eq!(export_dir, None);
+    assert_eq!(
+        findings_window_hours,
+        harw_config::dod_toml::DEFAULT_FINDINGS_WINDOW_HOURS
+    );
+}
+
+#[test]
+fn test_dod_export_keys_are_profile_scoped_and_ignored_from_an_untrusted_repo() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("Home-Layer anlegen"))?;
+    let profile = tempfile::tempdir().map_err(ctx("Profil-Layer anlegen"))?;
+    let repo = tempfile::tempdir().map_err(ctx("Repo-Layer anlegen"))?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[dod]\nexport_dir = \"/srv/home/export\"\nfindings_window_hours = 12\n",
+    )
+    .map_err(ctx("Home-config schreiben"))?;
+    std::fs::write(
+        profile.path().join("config.toml"),
+        "[dod]\nexport_dir = \"/var/lib/harw-dod/export\"\nfindings_window_hours = 48\n",
+    )
+    .map_err(ctx("Profil-config schreiben"))?;
+    std::fs::write(
+        repo.path().join("config.toml"),
+        "[dod]\nexport_dir = \"/tmp/evil-export\"\nfindings_window_hours = 1\n\
+         proof_key_dir = \"/tmp/evil-keys\"\n",
+    )
+    .map_err(ctx("Repo-config schreiben"))?;
+
+    // Vertraute Layer: das aktive Profil ersetzt den Home-Wert.
+    let layers = [home.path().to_path_buf(), profile.path().to_path_buf()];
+    let trusted = harw_config::discover_config(&layers).map_err(ctx("vertraute Discovery"))?;
+    assert_eq!(
+        trusted.dod.export_dir.as_deref(),
+        Some(std::path::Path::new("/var/lib/harw-dod/export"))
+    );
+    assert_eq!(trusted.dod.findings_window_hours, 48);
+    assert!(trusted.dod.validate().is_ok());
+
+    // Nicht vertrauter Repo-Layer: weder `export_dir` noch
+    // `findings_window_hours` noch `proof_key_dir` werden übernommen.
+    let restricted = harw_config::discover_config_with_restricted(&layers, Some(repo.path()))
+        .map_err(ctx("eingeschränkte Discovery"))?;
+    assert_eq!(
+        restricted.dod.export_dir.as_deref(),
+        Some(std::path::Path::new("/var/lib/harw-dod/export"))
+    );
+    assert_eq!(restricted.dod.findings_window_hours, 48);
+    assert_eq!(restricted.dod.proof_key_dir, None);
+
+    // Auch ohne vertrauten Wert gilt die eingebaute Vorgabe, nicht der Repo-Wert.
+    let bare = tempfile::tempdir().map_err(ctx("leerer Home-Layer"))?;
+    let defaults = harw_config::discover_config_with_restricted(
+        std::slice::from_ref(&bare.path().to_path_buf()),
+        Some(repo.path()),
+    )
+    .map_err(ctx("Discovery ohne vertrauten [dod]"))?;
+    assert_eq!(defaults.dod.export_dir, None);
+    assert_eq!(
+        defaults.dod.findings_window_hours,
+        harw_config::dod_toml::DEFAULT_FINDINGS_WINDOW_HOURS
+    );
+    Ok(())
+}
+
+/// Discovery fails when a layer's `[dod]` table violates
+/// `DodSection::validate` — the check runs while the table is
+/// deserialized, so production discovery cannot skip it.
+#[test]
+fn test_invalid_dod_section_in_any_layer_fails_discovery() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("Home-Layer anlegen"))?;
+    for (src, field) in [
+        (
+            "[dod]\nfindings_window_hours = 0\n",
+            "findings_window_hours",
+        ),
+        ("[dod]\nexport_dir = \"dod/export\"\n", "export_dir"),
+        (
+            "[dod]\nkill_requires_human = false\n",
+            "kill_requires_human",
+        ),
+    ] {
+        // Vertrauter Profil-Layer.
+        let profile = tempfile::tempdir().map_err(ctx("Profil-Layer anlegen"))?;
+        std::fs::write(profile.path().join("config.toml"), src)
+            .map_err(ctx("Profil-config schreiben"))?;
+        let layers = [home.path().to_path_buf(), profile.path().to_path_buf()];
+        let Err(error) = harw_config::discover_config(&layers) else {
+            return Err(common::TestError::Unexpected(format!(
+                "profile `{src}` must make discovery fail"
+            )));
+        };
+        assert!(
+            error.to_string().contains(field),
+            "profile error names `{field}`: {error}"
+        );
+
+        // Nicht vertrauter Repo-Layer: ebenfalls abgelehnt, nicht still
+        // ignoriert.
+        let repo = tempfile::tempdir().map_err(ctx("Repo-Layer anlegen"))?;
+        std::fs::write(repo.path().join("config.toml"), src)
+            .map_err(ctx("Repo-config schreiben"))?;
+        let Err(error) = harw_config::discover_config_with_restricted(
+            std::slice::from_ref(&home.path().to_path_buf()),
+            Some(repo.path()),
+        ) else {
+            return Err(common::TestError::Unexpected(format!(
+                "repository `{src}` must make discovery fail"
+            )));
+        };
+        assert!(
+            error.to_string().contains(field),
+            "repository error names `{field}`: {error}"
+        );
+    }
+    Ok(())
 }

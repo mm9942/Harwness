@@ -645,19 +645,18 @@ fn diff_versions(
     }
 
     for (version, current_dep) in &current_by_version {
-        if let Some(previous_dep) = previous_by_version.get(version) {
-            if previous_dep.source != current_dep.source
-                || previous_dep.checksum != current_dep.checksum
-            {
-                changes.push(StructureChange::ProvenanceChanged {
-                    name: name.to_owned(),
-                    version: (*version).to_owned(),
-                    from_source: previous_dep.source.clone(),
-                    to_source: current_dep.source.clone(),
-                    from_checksum: previous_dep.checksum.clone(),
-                    to_checksum: current_dep.checksum.clone(),
-                });
-            }
+        if let Some(previous_dep) = previous_by_version.get(version)
+            && (previous_dep.source != current_dep.source
+                || previous_dep.checksum != current_dep.checksum)
+        {
+            changes.push(StructureChange::ProvenanceChanged {
+                name: name.to_owned(),
+                version: (*version).to_owned(),
+                from_source: previous_dep.source.clone(),
+                to_source: current_dep.source.clone(),
+                from_checksum: previous_dep.checksum.clone(),
+                to_checksum: current_dep.checksum.clone(),
+            });
         }
     }
 

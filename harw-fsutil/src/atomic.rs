@@ -148,6 +148,39 @@ impl AtomicWriteOptions {
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub fn write_atomic(path: &Path, bytes: &[u8], opts: AtomicWriteOptions) -> io::Result<()> {
+    match write_atomic_with_outcome(path, bytes, opts)? {
+        AtomicWriteOutcome::Committed => Ok(()),
+        AtomicWriteOutcome::DurabilityUncertain(error) => Err(error),
+    }
+}
+
+/// A successful rename, with an explicit warning if directory syncing failed.
+#[derive(Debug)]
+pub enum AtomicWriteOutcome {
+    /// The replacement committed without a reported synchronization failure.
+    Committed,
+    /// The replacement committed, but its durability across a crash is uncertain.
+    DurabilityUncertain(io::Error),
+}
+
+/// Atomically replace a file and distinguish pre-commit errors from sync warnings.
+///
+/// An error means rename did not commit. Both successful outcomes mean the new
+/// bytes are visible; callers must publish them even if directory syncing failed.
+pub fn write_atomic_with_outcome(
+    path: &Path,
+    bytes: &[u8],
+    opts: AtomicWriteOptions,
+) -> io::Result<AtomicWriteOutcome> {
+    write_atomic_with_sync(path, bytes, opts, sync_parent)
+}
+
+fn write_atomic_with_sync(
+    path: &Path,
+    bytes: &[u8],
+    opts: AtomicWriteOptions,
+    sync: impl FnOnce(BorrowedFd<'_>) -> io::Result<()>,
+) -> io::Result<AtomicWriteOutcome> {
     let name = match path.components().next_back() {
         Some(Component::Normal(name)) => name,
         _ => return Err(invalid_input("write_atomic: Pfad ohne Dateinamen")),
@@ -188,13 +221,19 @@ pub fn write_atomic(path: &Path, bytes: &[u8], opts: AtomicWriteOptions) -> io::
         remove_temp(dir, &temp_name);
         return Err(errno.into());
     }
-    if opts.fsync_dir {
-        match retry_on_intr(|| rustix::fs::fsync(dir)) {
-            Ok(()) | Err(Errno::INVAL) => {}
-            Err(errno) => return Err(errno.into()),
-        }
+    if opts.fsync_dir
+        && let Err(error) = sync(dir)
+    {
+        return Ok(AtomicWriteOutcome::DurabilityUncertain(error));
     }
-    Ok(())
+    Ok(AtomicWriteOutcome::Committed)
+}
+
+fn sync_parent(dir: BorrowedFd<'_>) -> io::Result<()> {
+    match retry_on_intr(|| rustix::fs::fsync(dir)) {
+        Ok(()) | Err(Errno::INVAL) => Ok(()),
+        Err(errno) => Err(errno.into()),
+    }
 }
 
 /// Lehnt ein für alle beschreibbares Verzeichnis ohne Sticky-Bit ab.
@@ -293,6 +332,25 @@ mod tests {
             .collect::<io::Result<Vec<_>>>()?;
         names.sort();
         Ok(names)
+    }
+
+    #[test]
+    fn directory_sync_failure_reports_committed_replacement() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, b"old")?;
+        let outcome = write_atomic_with_sync(&path, b"new", AtomicWriteOptions::private(), |_| {
+            // This callback runs at the actual directory-sync boundary, after rename.
+            assert_eq!(std::fs::read(&path)?, b"new");
+            Err(io::Error::other("injected parent-directory fsync failure"))
+        })?;
+        assert!(matches!(
+            outcome,
+            AtomicWriteOutcome::DurabilityUncertain(_)
+        ));
+        assert_eq!(std::fs::read(&path)?, b"new");
+        assert_eq!(dir_names(tmp.path())?, vec![OsString::from("config.toml")]);
+        Ok(())
     }
 
     #[test]

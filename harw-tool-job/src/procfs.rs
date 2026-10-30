@@ -201,6 +201,7 @@ pub(crate) fn capture_identity(pid: u32) -> Option<JobProcessIdentity> {
         start_ticks: snap.start_time_ticks,
         executable: snap.executable,
         cgroup_path: snap.cgroup_v2_path,
+        dedicated_cgroup: None,
     })
 }
 
@@ -265,10 +266,10 @@ impl OwnLeader {
     #[cfg(target_os = "linux")]
     #[must_use]
     pub(crate) fn has_exited(&self) -> bool {
-        if let Some(process) = &self.process {
-            if let Ok(exited) = process.has_exited() {
-                return exited;
-            }
+        if let Some(process) = &self.process
+            && let Ok(exited) = process.has_exited()
+        {
+            return exited;
         }
         match snapshot(self.pgid) {
             Ok(snap) => {

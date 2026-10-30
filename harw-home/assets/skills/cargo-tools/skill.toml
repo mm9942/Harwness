@@ -1,0 +1,4 @@
+name = "cargo-tools"
+description = "Use the typed cargo.* tools (check, build, clippy, test, fmt_check, tree, doc, metadata) and read their summarised diagnostics instead of raw cargo output."
+instructions_file = "instructions.md"
+tools = ["cargo.check", "cargo.build", "cargo.clippy", "cargo.test", "cargo.fmt_check", "cargo.tree", "cargo.doc", "cargo.metadata"]

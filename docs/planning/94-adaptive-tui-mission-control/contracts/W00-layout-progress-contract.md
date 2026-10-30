@@ -1,12 +1,25 @@
 ---
 id: W00-PL94-ADAPTIVE-MISSION-CONTROL
 title: "W00 Contract — three status cards, responsive mission rail and Progress Agent"
-status: proposed
+status: PARTIALLY LANDED
 date: 2026-10-08
 parent: ../README.md
 ---
 
 # W00 — Adaptive Mission Control acceptance contract
+
+> **Status: PARTIALLY LANDED** (2026-10-29, PL-97 X1). The shared
+> status/geometry invariants of this contract (three separately bordered
+> status views, chat stays dominant, no overlap or panic at any size) landed
+> with W02 through PL-97 C1 `ca2dfd6c`, C2 `6db6745a` and C3 `3d98064d`
+> (tests `portrait_stack_at_46x78_48x65_70x90_60x60_80x40`,
+> `exhaustive_0x0_to_250x120_keeps_every_invariant_and_the_spec_placement`,
+> `render_viewport_at_46x78_shows_three_windows_live_and_chat`,
+> `render_viewport_at_160x45_shows_five_windows_at_the_landscape_anchors`).
+> The Progress Agent, progress strip and synthetic WIP of this contract are
+> superseded by W02 and were not built.
+
+> **CURRENT UX DIRECTION (2026-10-09):** [W02 chat-first mini-live](W02-chat-first-mini-live.md) supersedes W00's model-backed Progress Agent, progress-only strip and expanded synthetic WIP as the primary TUI target. This W00 is kept for historical rationale and shared status/geometry invariants. New implementation must follow W02 for the compact real agent reasoning/tool preview and Chat-first capacity, without a second model invocation. No code was implemented by this documentation change.
 
 > **DESIGN ONLY**, rooted in dev@197a92e92d438bf6bf93b129bb964f4852686149. See the [parent design](../README.md). No renderer, agent or new runtime listener is claimed as implemented.
 

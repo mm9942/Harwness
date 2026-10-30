@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use harw_types::SessionId;
 
+use crate::caller_identity::{ArtifactOwner, CallerIdentity, is_visible};
 use crate::error::{KnowledgeError, KnowledgeResult};
 use crate::visibility::{AgentId, VisibilityScope};
 
@@ -161,7 +162,17 @@ pub struct RecallQuery {
     /// How far to traverse palace backlinks from a hit.
     pub max_hops: u8,
     /// Caller's visibility scope; out-of-scope artifacts are invisible.
+    ///
+    /// Only consulted when [`Self::caller_identity`] is `None`: it feeds the
+    /// conservative scope heuristic ([`VisibilityScope::visible_to_caller`]).
     pub caller_scope: VisibilityScope,
+    /// Trusted identity of the caller, as established by admission (PL-90
+    /// W03d). When set, [`artifact_visible`] decides visibility by identity
+    /// ([`is_visible`]: author, spawn ancestors, role, operator flag) and
+    /// `caller_scope` is ignored; when `None` the scope heuristic applies and
+    /// `SelfOnly`/`DescendantTree`/`ExplicitlyGranted` fail closed. Must
+    /// never be built from agent-controlled input.
+    pub caller_identity: Option<CallerIdentity>,
 }
 
 impl RecallQuery {
@@ -176,7 +187,17 @@ impl RecallQuery {
             max_artifacts: MAX_RECALL_ARTIFACTS,
             max_hops: MAX_RECALL_HOPS,
             caller_scope,
+            caller_identity: None,
         }
+    }
+
+    /// Bind a trusted [`CallerIdentity`] to the query, switching visibility
+    /// from the scope heuristic to the identity-based decision (see
+    /// [`artifact_visible`]).
+    #[must_use]
+    pub fn with_caller_identity(mut self, identity: CallerIdentity) -> Self {
+        self.caller_identity = Some(identity);
+        self
     }
 
     /// Verify the query's bounds sit within the hard maxima (§2.3).
@@ -218,6 +239,47 @@ impl RecallQuery {
             });
         }
         Ok(())
+    }
+}
+
+/// Visibility decision for one artifact: identity-based when the query
+/// carries a trusted [`CallerIdentity`], else the scope heuristic.
+///
+/// # Description
+/// With `query.caller_identity == Some(..)` the artifact is judged by
+/// [`is_visible`] over an [`ArtifactOwner`] built from `author` and
+/// `visibility`; `query.caller_scope` is not consulted. Without an identity
+/// this is exactly [`VisibilityScope::visible_to_caller`] against
+/// `query.caller_scope` (fail-closed for `SelfOnly`, `DescendantTree` and
+/// `ExplicitlyGranted`), and `author` is unused.
+///
+/// `visibility` and `author` must come from the index entry itself (the
+/// stored [`Frontmatter::visibility`] / [`Frontmatter::author_agent_id`]),
+/// never from `Frontmatter::extra` or the artifact body, which an author can
+/// fill with arbitrary claims.
+///
+/// # Arguments
+/// - `visibility` (`&VisibilityScope`): the scope the author assigned.
+/// - `author` (`&AgentId`): the authoring agent of the artifact.
+/// - `query` (`&RecallQuery`): the query carrying the caller context.
+///
+/// # Returns
+/// `true` when the caller may read the artifact.
+#[must_use]
+pub fn artifact_visible(
+    visibility: &VisibilityScope,
+    author: &AgentId,
+    query: &RecallQuery,
+) -> bool {
+    match &query.caller_identity {
+        Some(identity) => {
+            let owner = ArtifactOwner {
+                author: author.clone(),
+                scope: visibility.clone(),
+            };
+            is_visible(&owner, identity)
+        }
+        None => visibility.visible_to_caller(&query.caller_scope),
     }
 }
 
@@ -367,5 +429,113 @@ mod tests {
             "exceeding max_hops must trip the ceiling counter"
         );
         Ok(())
+    }
+}
+
+/// PL-90 W03d: identity-bound visibility via [`artifact_visible`].
+#[cfg(test)]
+mod identity_visibility_tests {
+    use super::{RecallQuery, artifact_visible};
+    use crate::caller_identity::CallerIdentity;
+    use crate::visibility::{AgentId, AgentRoleRef, VisibilityScope};
+
+    /// A caller spawned by `parent`, as admission would describe it.
+    fn child_identity(agent: &str) -> CallerIdentity {
+        CallerIdentity::new(AgentId::new(agent)).with_ancestors(vec![AgentId::new("parent")])
+    }
+
+    /// A query whose scope heuristic would deny every restricted scope, so a
+    /// positive answer can only come from the bound identity.
+    fn query_with(identity: Option<CallerIdentity>) -> RecallQuery {
+        let query = RecallQuery::new("", VisibilityScope::SelfOnly);
+        match identity {
+            Some(identity) => query.with_caller_identity(identity),
+            None => query,
+        }
+    }
+
+    #[test]
+    fn identity_recall_sees_self_only_artifacts_of_the_author() {
+        let query = query_with(Some(child_identity("a")));
+        let author = AgentId::new("a");
+
+        assert!(artifact_visible(
+            &VisibilityScope::SelfOnly,
+            &author,
+            &query
+        ));
+        assert!(artifact_visible(
+            &VisibilityScope::DescendantTree,
+            &author,
+            &query
+        ));
+        // OperatorOnly stays closed: the identity is an agent, not an operator.
+        assert!(!artifact_visible(
+            &VisibilityScope::OperatorOnly,
+            &author,
+            &query
+        ));
+    }
+
+    #[test]
+    fn sibling_identity_never_sees_sibling_self_only() {
+        let query = query_with(Some(child_identity("b")));
+        let author = AgentId::new("a");
+
+        assert!(!artifact_visible(
+            &VisibilityScope::SelfOnly,
+            &author,
+            &query
+        ));
+        // The shared parent is not the author, so the tree stays closed too.
+        assert!(!artifact_visible(
+            &VisibilityScope::DescendantTree,
+            &author,
+            &query
+        ));
+        // A child still sees the tree of its real ancestor.
+        assert!(artifact_visible(
+            &VisibilityScope::DescendantTree,
+            &AgentId::new("parent"),
+            &query
+        ));
+        // A granted role is honoured only for the identity's own role.
+        let granted = VisibilityScope::ExplicitlyGranted(vec![AgentRoleRef::new("reader")]);
+        assert!(!artifact_visible(&granted, &author, &query));
+        let reader = query_with(Some(
+            child_identity("b").with_role(AgentRoleRef::new("reader")),
+        ));
+        assert!(artifact_visible(&granted, &author, &reader));
+    }
+
+    #[test]
+    fn query_without_identity_keeps_scope_heuristic() {
+        let author = AgentId::new("a");
+        let operator = RecallQuery::new("", VisibilityScope::OperatorOnly);
+        assert!(operator.caller_identity.is_none());
+
+        // The scope heuristic: OperatorOnly opens for an operator scope ...
+        assert!(artifact_visible(
+            &VisibilityScope::OperatorOnly,
+            &author,
+            &operator
+        ));
+        // ... and everything else fails closed, even for the author itself.
+        for scope in [
+            VisibilityScope::SelfOnly,
+            VisibilityScope::DescendantTree,
+            VisibilityScope::ExplicitlyGranted(vec![AgentRoleRef::new("reader")]),
+        ] {
+            assert!(
+                !artifact_visible(&scope, &author, &operator),
+                "{scope:?} must fail closed without an identity"
+            );
+        }
+        let agent = query_with(None);
+        assert!(!artifact_visible(
+            &VisibilityScope::OperatorOnly,
+            &author,
+            &agent
+        ));
     }
 }

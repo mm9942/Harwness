@@ -1,7 +1,7 @@
 ---
 id: PL-94-ADAPTIVE-TUI-MISSION-CONTROL
 title: "Adaptive TUI Mission Control — three pinned status cards and an isolated Progress Agent"
-status: proposed
+status: PARTIALLY LANDED
 date: 2026-10-08
 tags: [tui, responsive, portrait, landscape, agent-monitor, jobs, plans, progress]
 related:
@@ -10,11 +10,24 @@ related:
   - ../90-intent-driven-composed-agents/README.md
   - ../../design/interaction-contract.md
   - contracts/W00-layout-progress-contract.md
+  - contracts/W02-chat-first-mini-live.md
 ---
 
 # PL-94 — Adaptive TUI Mission Control
 
-> PLANNING ONLY, not production implementation.
+> **LATEST OPERATOR-APPROVED UX REVISION (2026-10-09): [W02 — Chat-first mini-live](contracts/W02-chat-first-mini-live.md) supersedes the *primary TUI* Progress Agent / portrait progress-bar / large second-output assumptions below. Preserve the three separately bordered status views but replace the portrait progress strip's **content** with a tiny, bounded **existing live-agent stream** (available displayable reasoning, current tool/status); keep main Chat much larger, full-width and the primary interaction. No new model, observer job or generated todo is a dependency of this UX. The older W00/README model-observer sections below are *historical alternatives, not the active implementation target*; see W02 for actual proposed behavior and acceptance. This is a planning revision; no Ratatui code was changed by W02.
+
+> **Status: PARTIALLY LANDED** (2026-10-29, PL-97 X1). The W02 chat-first
+> target (three bordered status windows + LIVE, portrait and landscape) and
+> the W01 inline live cells landed on `ccr-54aa3dfd-o46he2` (draft PR #154
+> against `dev`) through PL-97 C1–C5:
+> C1 `ca2dfd6c` (`harw-tui-layout::classify_mission`), C2 `6db6745a`
+> (portrait windows, LIVE), C3 + C4 `3d98064d` (landscape anchors, terminal
+> aggregates, `x` job stop), C5 `654b2677` (W01 M2a + M2c). Test names:
+> [PL-97 §9.1](../97-harw-dod-mission-control-chain/README.md#9-landed-state-x1-2026-10-29).
+> **Not built, by decision** (PL-97 §7): the model-backed Progress Agent,
+> the progress bar and todo synthesis (M3+ below). The text below is the
+> original planning record.
 > Code baseline: mm9942/Harwness dev@197a92e92d438bf6bf93b129bb964f4852686149 (2026-10-08).
 > Concurrent work: PL-90 PR #135 and implementation PR #136 (Harw-owned). This new, separate branch modifies only PL-94 planning files. Harw retains ownership of PR #136 and its runtime implementation.
 
@@ -266,6 +279,12 @@ Also test non-overlapping rects and **five independently bordered windows in lan
 
 A real Harw TUI viewport in portrait or landscape distinguishes **active agents**, **active jobs** and **completed/failed**. **Landscape** additionally shows the expanded WIP/second-output window. **Portrait** keeps the Progress Agent running but renders **only a compact verified progress strip**, not a second agent output or narrative. Both stay accurate during active root turns and background jobs. The WIP agent may propose todos from the last three user messages/current turn/progress signals but cannot share other agents' private context or treat proposals as verified outcomes.
 
-**Current status: M0 design only.** The audited existing PL-68 dock, goal marker, AgentMonitor, JobRow and /btw are implemented foundations. M1–M6 are PROPOSED until independently tested code and corresponding hashes are attached in this Draft PR. No Cargo, TUI render test or real-device test has run as a result of this document.
+**Original status (2026-10-08): M0 design only.** The audited existing PL-68 dock, goal marker, AgentMonitor, JobRow and /btw are existing foundations. M1–M6 are PROPOSED until independently tested code and corresponding hashes are attached in this Draft PR. No Cargo, TUI render test or real-device test has run as a result of this document.
+
+**Update 2026-10-29 (PL-97 X1):** the W02 layout (U0–U3) and W01 M2a/M2c
+landed as listed in the status block at the top; U4 (manual device
+verification with screenshots at the exact SHA) is recorded in the PR
+description of #154, not here. The Progress Agent, todo proposals and the
+landscape "second output" window stay unbuilt (superseded by W02).
 
 See [W00 contract](contracts/W00-layout-progress-contract.md) for acceptance invariants and schema details.

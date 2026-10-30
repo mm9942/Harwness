@@ -89,6 +89,8 @@ use crate::LensResult;
 ///     source: SourceRef::File { path: "intro.md".to_owned() },
 ///     text: "# Intro\n\nText.\n".to_owned(),
 ///     visibility: DEFAULT_VISIBILITY.to_owned(),
+///     is_binary: false,
+///     content_hash: None,
 /// }];
 /// let descriptor = EmbeddingDescriptor {
 ///     document_prefix: "passage: ".to_owned(),

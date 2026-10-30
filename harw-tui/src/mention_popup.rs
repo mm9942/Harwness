@@ -20,6 +20,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style, text::Line, widgets::Widget};
 
+use crate::i18n::tr;
 use crate::style;
 
 // ---------------------------------------------------------------------------
@@ -36,11 +37,11 @@ pub(crate) enum MentionKind {
 }
 
 impl MentionKind {
-    /// Deutsche Kurzbezeichnung für die Beschreibungsspalte.
-    fn label_de(self) -> &'static str {
+    /// Localized kind description; candidate labels remain supplied content.
+    fn label(self) -> &'static str {
         match self {
-            Self::File => "Datei",
-            Self::Role => "Rolle · Delegationswunsch an die UIA",
+            Self::File => tr("help.file", "File"),
+            Self::Role => tr("help.role", "Role · delegation request to UIA"),
         }
     }
 }
@@ -223,7 +224,8 @@ impl MentionPopup {
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: style::Theme) {
         if self.filtered.is_empty() {
             if area.height > 0 {
-                let line = Line::styled("Keine Treffer", style::dim_style(theme));
+                let line =
+                    Line::styled(tr("help.no_matches", "No matches"), style::dim_style(theme));
                 Widget::render(line, Rect::new(area.left(), area.top(), area.width, 1), buf);
             }
             return;
@@ -249,7 +251,7 @@ impl MentionPopup {
             if desc_x < area.right() {
                 let desc_area = Rect::new(desc_x, y, area.right() - desc_x, 1);
                 Widget::render(
-                    Line::styled(item.kind.label_de(), style::dim_style(theme)),
+                    Line::styled(item.kind.label(), style::dim_style(theme)),
                     desc_area,
                     buf,
                 );
@@ -414,7 +416,7 @@ mod tests {
             .map(|x| buf[(x, 1)].symbol().to_owned())
             .collect();
         assert!(row.starts_with("@src/research.rs"), "{row}");
-        assert!(row.contains("Datei"), "{row}");
+        assert!(row.contains("File"), "{row}");
     }
 
     #[test]
@@ -446,5 +448,48 @@ mod tests {
         assert_eq!(current_mention_query(input, 999), Some((at, "dätei.rs")));
         // Nicht-ASCII-Leerraum trennt ebenfalls.
         assert_eq!(current_mention_query("a\u{3000}@ü", 6), Some((4, "ü")));
+    }
+    #[test]
+    fn locale_switch_preserves_supplied_candidates_query_and_navigation() {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let mut popup = MentionPopup::new(vec![
+            MentionCandidate::file("src/日本.rs"),
+            MentionCandidate::role("研究者"),
+        ]);
+        assert_eq!(MentionKind::File.label(), "File");
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                popup.filter("");
+                assert_eq!(
+                    popup.selected().map(|item| item.insert.as_str()),
+                    Some("研究者")
+                );
+                popup.move_down();
+                for width in [1, 8, 20, 80] {
+                    let area = Rect::new(0, 0, width, 3);
+                    popup.render(area, &mut Buffer::empty(area), style::Theme::Dark);
+                }
+                assert_eq!(
+                    popup.handle_key(key(KeyCode::Enter)),
+                    MentionPopupAction::Accept("src/日本.rs".to_owned())
+                );
+            });
+        }
+        popup.filter("日本");
+        with_language(UiLanguage::Japanese, || {
+            let area = Rect::new(0, 0, 80, 2);
+            let mut buf = Buffer::empty(area);
+            popup.render(area, &mut buf, style::Theme::Dark);
+            let text = crate::test_support::display_buffer_text(&buf);
+            assert!(text.contains("@src/日本.rs"), "{text}");
+            assert!(text.contains("ファイル"), "{text}");
+            assert_eq!(popup.query, "日本");
+            popup.filter("missing");
+            popup.render(area, &mut buf, style::Theme::Dark);
+            assert!(
+                crate::test_support::display_buffer_text(&buf).contains("一致する項目がありません")
+            );
+        });
     }
 }

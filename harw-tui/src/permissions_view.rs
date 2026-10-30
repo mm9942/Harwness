@@ -24,8 +24,10 @@
 //! Kategorie und Grund stammen vom Klassifizierer-Modell; sie laufen durch
 //! [`crate::sanitize::sanitize_inline`] und werden gekürzt.
 
+use crate::i18n::tr_args;
+
 use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
-use harw_extension_api::auto_mode::{AUTO_DENIAL_PREFIX, AutoDecision, AutoVerdict};
+use harw_extension_api::auto_mode::{AutoDecision, AutoVerdict};
 use harw_runtime::LearnOffer;
 
 use crate::sanitize::sanitize_inline;
@@ -78,14 +80,17 @@ impl LearnOfferView {
     /// Die Beschriftung der Dialog-Option.
     #[must_use]
     pub fn option_label(&self, scope: LearnScope) -> String {
-        let suffix = match scope {
-            LearnScope::Session => "nur diese Sitzung",
-            LearnScope::Project => "dauerhaft im Projekt",
+        let (key, english) = match scope {
+            LearnScope::Session => (
+                "dialogs.learn_session",
+                "Yes, and allow in future: {rule} (this session only)",
+            ),
+            LearnScope::Project => (
+                "dialogs.learn_project",
+                "Yes, and allow in future: {rule} (persist in project)",
+            ),
         };
-        format!(
-            "Ja, und künftig erlauben: {} ({suffix})",
-            sanitize_inline(&self.display)
-        )
+        tr_args(key, english, &[("rule", &sanitize_inline(&self.display))])
     }
 
     /// Die anzulegende Allow-Regel.
@@ -131,9 +136,13 @@ pub fn auto_note_for(verdict: &AutoVerdict) -> Option<String> {
             "auto ✓ {}",
             truncate(&sanitize_inline(&verdict.reason), MAX_NOTE_REASON_CHARS)
         )),
-        AutoDecision::Deny => Some(format!(
-            "{AUTO_DENIAL_PREFIX} · {}",
-            truncate(&sanitize_inline(&verdict.category), MAX_NOTE_REASON_CHARS)
+        AutoDecision::Deny => Some(tr_args(
+            "dialogs.auto_denied",
+            "Denied by auto mode · {category}",
+            &[(
+                "category",
+                &truncate(&sanitize_inline(&verdict.category), MAX_NOTE_REASON_CHARS),
+            )],
         )),
         AutoDecision::Ask => None,
     }
@@ -208,7 +217,7 @@ mod tests {
         );
         assert_eq!(
             auto_note_for(&deny).as_deref(),
-            Some("Vom Auto-Modus abgelehnt · exfiltration")
+            Some("Denied by auto mode · exfiltration")
         );
         let ask = AutoVerdict::fallback_ask("x");
         assert_eq!(auto_note_for(&ask), None);
@@ -255,7 +264,7 @@ mod tests {
         let view = offer("shell.exec", Some("cargo test"));
         assert_eq!(
             view.option_label(LearnScope::Session),
-            "Ja, und künftig erlauben: shell.exec cargo test * (nur diese Sitzung)"
+            "Yes, and allow in future: shell.exec cargo test * (this session only)"
         );
         assert_eq!(view.rule(LearnScope::Project).scope, RuleScope::Project);
         assert_eq!(view.rule(LearnScope::Session).decision, RuleDecision::Allow);

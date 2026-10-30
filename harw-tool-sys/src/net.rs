@@ -135,7 +135,7 @@ fn udp_state(code: &str) -> &'static str {
 
 /// Wortweise Hex-Adresse → Bytes (die Wörter stehen in Host-Reihenfolge).
 fn words_to_bytes(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 8 != 0 || hex.is_empty() {
+    if !hex.len().is_multiple_of(8) || hex.is_empty() {
         return None;
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
@@ -300,13 +300,13 @@ pub fn run(procfs: &ProcFs, args: &SsArgs) -> ToolOutput {
     if flag(args.ipv4) && flag(args.ipv6) {
         return fail(TOOL, "ipv4 and ipv6 are mutually exclusive");
     }
-    if let Some(port) = args.port {
-        if !(1..=65_535).contains(&port) {
-            return fail(
-                TOOL,
-                format!("port must be between 1 and 65535, got {port}"),
-            );
-        }
+    if let Some(port) = args.port
+        && !(1..=65_535).contains(&port)
+    {
+        return fail(
+            TOOL,
+            format!("port must be between 1 and 65535, got {port}"),
+        );
     }
     let (want_tcp, want_udp) = if !tcp && !udp && !unix {
         (true, true)
@@ -403,7 +403,8 @@ pub fn run(procfs: &ProcFs, args: &SsArgs) -> ToolOutput {
     name = "sys.ss",
     description = "Lists network sockets like ss/netstat from /proc/net: -t tcp, -u udp, -x unix, -l listening only, -a all, -4/-6 address family, port filter (local or remote). Use when you need to know which ports are listening or which connections exist instead of running ss or netstat. Returns JSON {sockets:[{proto,state,local_addr,local_port,remote_addr,remote_port,uid,user,inode}], count, matched, truncated}. No process names (-p needs root); read-only, Linux only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_ss(_context: &ToolExecutionContext, args: SsArgs) -> Result<ToolOutput, ToolsError> {
     run_blocking(TOOL, move || run(&ProcFs::real(), &args)).await

@@ -180,6 +180,20 @@ pub struct FsSearchExecutor {
 }
 
 impl FsSearchExecutor {
+    /// Descriptive activity metadata of `fs.search` (PL-71, PL-97 M2), written by
+    /// hand in the form `#[harw_macros::tool(activity(...))]` generates: domain
+    /// `filesystem`, verb `search`, resource field `path`, effect `observe`.
+    ///
+    /// It grants, implies or checks no permission and is not part of the
+    /// model-facing `ToolSpec`.
+    pub const ACTIVITY: Option<harw_tools::ActivityDescriptor> =
+        Some(harw_tools::ActivityDescriptor::new(
+            "filesystem",
+            "search",
+            Some("path"),
+            harw_tools::Effect::Observe,
+        ));
+
     /// Führt die rekursive Suche synchron (blockierend) aus.
     ///
     /// # Errors

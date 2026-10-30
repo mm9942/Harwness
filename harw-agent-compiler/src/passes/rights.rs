@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use harw_agent_dsl::Diagnostics;
 use harw_agent_dsl::classify::reclassify_permissions;
 use harw_agent_dsl::diagnostics::DiagnosticCode;
+use harw_agent_dsl::lower_v2::WORK_DRIVER_TOOLS;
 
 use super::Pass;
 use crate::builtins::builtin_defaults;
@@ -14,6 +15,12 @@ use crate::unit::{CompileUnit, RightsFlow};
 
 /// Re-classifies the permission manifest from the capability catalog and
 /// checks it against the base role and the optional author ceiling.
+///
+/// # Description
+/// One exemption from the base role: a definition whose IR carries a
+/// `[work_driver]` section may hold `work_driver.enqueue`, `.status` and
+/// `.stop` (the tools lowering grants it). The author ceiling has no such
+/// exemption.
 #[derive(Debug, Clone, Copy)]
 pub struct RightsCheck<'a> {
     /// The built-in roles and bases.
@@ -69,7 +76,9 @@ impl Pass for RightsCheck<'_> {
                 ),
             )),
             Some(base) => {
-                flow.over_base = delta(&known, &base.rights, &handoffs);
+                let limit_rights =
+                    limit_with_work_driver(&base.rights, unit.ir.work_driver.is_some());
+                flow.over_base = delta(&known, &limit_rights, &handoffs);
                 flow.narrowed_tools = base
                     .rights
                     .tools
@@ -113,6 +122,30 @@ impl Pass for RightsCheck<'_> {
         unit.rights = Some(flow);
         diagnostics
     }
+}
+
+/// The rights a definition may claim from its base role: the base role's
+/// own rights, plus the three WorkDriver tools if the definition has a
+/// `[work_driver]` section.
+///
+/// # Description
+/// Lowering appends [`WORK_DRIVER_TOOLS`] to `tools.admitted` of every
+/// definition with a `[work_driver]` section, and no base role carries them.
+/// The runtime roster makes the same exemption when it clamps a custom agent
+/// under its base role (`harw_registry_defaults::roster`); without it here,
+/// this pass would reject every WorkDriver orchestrator with HARW-BUILD-004
+/// although the table is the way to ask for these tools. Only these three
+/// names are exempt, only with the section; classes, depth, budget and
+/// effort of the base stay as they are, so a class entering through another
+/// tool is still reported.
+fn limit_with_work_driver(base: &RightsSet, has_work_driver: bool) -> RightsSet {
+    let mut limit = base.clone();
+    if has_work_driver {
+        limit
+            .tools
+            .extend(WORK_DRIVER_TOOLS.iter().map(|tool| (*tool).to_owned()));
+    }
+    limit
 }
 
 /// One diagnostic per widening, located at the offending value.

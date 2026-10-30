@@ -64,10 +64,15 @@ check: ## Fast type check of the whole workspace
 
 # killer needs Linux procfs and pidfd (compile_error! elsewhere). Termux on
 # Android reports `uname -o` = Android and builds harw + the runner only.
+# harw-job-exec is the job sandbox trampoline (Landlock, cgroup join,
+# rlimits; PL-97 E1). The job runtime looks for it next to the running
+# harw, so it is built and installed next to harw; it only works on Linux.
 HOST_IS_ANDROID := $(filter Android,$(shell uname -o 2>/dev/null))
-HOST_BINS = --bin harw $(if $(HOST_IS_ANDROID),,--bin killer)
+HOST_BINS = --bin harw $(if $(HOST_IS_ANDROID),,--bin killer --bin harw-job-exec)
+# A literal comma inside $(if ...) arguments.
+comma := ,
 
-build: ## Release-build harw, killer (not on Android) and the agent runner
+build: ## Release-build harw, killer and harw-job-exec (both not on Android) and the agent runner
 	$(CARGO) build --release $(HOST_BINS)
 	$(CARGO) build --profile release-runner --bin harw-agent-runner
 
@@ -89,13 +94,14 @@ HARW_HOST_TARGET = $(shell rustc -vV | sed -n 's/^host: //p')
 # subprocess to know it.
 HARW_VERSION = $(shell awk -F'"' '/^version = /{print $$2; exit}' Cargo.toml)
 
-install: build ## Install harw, killer and the agent runner into BINDIR (default ~/.local/bin)
+install: build ## Install harw, killer, harw-job-exec and the agent runner into BINDIR (default ~/.local/bin)
 	install -Dm755 target/release/harw $(BINDIR)/harw
 	$(if $(HOST_IS_ANDROID),,install -Dm755 target/release/killer $(BINDIR)/killer)
+	$(if $(HOST_IS_ANDROID),,install -Dm755 target/release/harw-job-exec $(BINDIR)/harw-job-exec)
 	install -Dm755 target/release-runner/harw-agent-runner $(BINDIR)/harw-agent-runner
 	install -Dm755 target/release-runner/harw-agent-runner \
 		"$(HARW_HOME)/bin/.runners/$(HARW_HOST_TARGET)/$(HARW_VERSION)/harw-agent-runner"
-	@echo "Installed $(BINDIR)/harw, $(if $(HOST_IS_ANDROID),,$(BINDIR)/killer and )$(BINDIR)/harw-agent-runner"
+	@echo "Installed $(BINDIR)/harw, $(if $(HOST_IS_ANDROID),,$(BINDIR)/killer$(comma) $(BINDIR)/harw-job-exec and )$(BINDIR)/harw-agent-runner"
 	@echo "Runner copy: $(HARW_HOME)/bin/.runners/$(HARW_HOST_TARGET)/$(HARW_VERSION)/harw-agent-runner"
 	@case ":$$PATH:" in \
 		*":$(BINDIR):"*) ;; \
@@ -113,7 +119,8 @@ RELEASE_TAG ?= v$(HARW_VERSION)
 DIST ?= dist
 
 # killer needs Linux procfs and pidfd; Android targets build harw only.
-RELEASE_PACKAGES = -p harw-cli $(if $(findstring android,$(RELEASE_TARGET)),,-p harw-killer)
+# harw-job-exec (job sandbox trampoline) ships next to harw like killer.
+RELEASE_PACKAGES = -p harw-cli $(if $(findstring android,$(RELEASE_TARGET)),,-p harw-killer -p harw-job-exec)
 
 release: ## Build and package a release tarball + SHA256SUMS into $(DIST)/ (RELEASE_TARGET, RELEASE_TAG)
 	$(CARGO) build --release --locked $(RELEASE_PACKAGES) --target $(RELEASE_TARGET)
@@ -125,11 +132,11 @@ release-publish: ## Create the GitHub release $(RELEASE_TAG) from $(DIST)/ (need
 	gh release create $(RELEASE_TAG) $(DIST)/*.tar.gz $(DIST)/SHA256SUMS \
 		--title "harw $(RELEASE_TAG)" --notes "See CHANGELOG.md for $(RELEASE_TAG)."
 
-uninstall: ## Remove harw, killer and the agent runner from BINDIR, plus the regenerable agent-build cache
-	rm -f $(BINDIR)/harw $(BINDIR)/killer $(BINDIR)/harw-agent-runner
+uninstall: ## Remove harw, killer, harw-job-exec and the agent runner from BINDIR, plus the regenerable agent-build cache
+	rm -f $(BINDIR)/harw $(BINDIR)/killer $(BINDIR)/harw-job-exec $(BINDIR)/harw-agent-runner
 	rm -rf "$${HARW_HOME:-$$HOME/.harw}/cache/agent-builds"
 	rm -f "$${HARW_HOME:-$$HOME/.harw}/install.toml"
-	@echo "Removed $(BINDIR)/harw, killer, harw-agent-runner and the agent-build cache (the rest of ~/.harw was left untouched)"
+	@echo "Removed $(BINDIR)/harw, killer, harw-job-exec, harw-agent-runner and the agent-build cache (the rest of ~/.harw was left untouched)"
 
 service: install ## Install and enable the user systemd services, incl. the gateway
 	$(BINDIR)/harw service install

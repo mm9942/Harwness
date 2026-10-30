@@ -14,14 +14,23 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 47 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 54 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `work.result`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
 //! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
 //! `approval.resolve`, `add-workdir`, `export`, `usage`, `bug-report`,
 //! `approve`, `deny`, `review`, `cancel`, `retry`, `provider-concurrency`,
 //! `uia-worker-model`, `uia-effort`, `sandbox-lease`, `models`, `workbench`,
-//! `kanban`, `diary`, `palace`, `dream`, `learn`, `matrix`, `jobs`.
+//! `kanban`, `diary`, `palace`, `dream`, `learn`, `matrix`, `jobs`, `dod`,
+//! `dod.status`, `dod.findings`, `dod.sensors`, `tool.index`, `image.inspect`.
+//! `dod` (PL-97 D3, siehe `crate::dod`-Moduldoku) ist die Operator-Fläche
+//! `/dod` über die Harw-DoD-Suite; `dod.status`/`dod.findings`/`dod.sensors`
+//! sind ihre lesenden Modell-Werkzeuge ohne Freigabe. Keine davon schreibt
+//! DoD-Zustand oder erreicht Warden bzw. Eskalation (Invariante S1); die
+//! Dienststeuerung gibt es nur als root-CLI `harw dod`.
+//! `tool.index` (PL-97 B2, siehe `crate::tool_index_op`) ist das lesende
+//! Modell-Werkzeug über den Werkzeug-Index (Familien, Klassen, verknüpfte
+//! Skills, erste Sätze der echten Beschreibungen) ohne Freigabe.
 //! `uia-worker-model` (Welle 2, harw-ops/src/model.rs) und `uia-effort`
 //! (harw-ops/src/effort.rs) waren implementiert, aber bis zu diesem Knoten
 //! nicht in `register_all` eingetragen — dadurch existierten `/uia-worker-model`
@@ -117,6 +126,14 @@
 //! Controller-Kreis — Recherche erzeugt Findings, `plan reconcile` macht
 //! Evidenz daraus, `goal check` wertet sie gegen die Kriterien aus.
 //!
+//! **Intent-Zyklus-Fläche** ([`register_intent_cycle_tools`], 5 Ops, hinter
+//! demselben Gate): `intent_cycle.start`, `intent_cycle.status`,
+//! `intent_cycle.list`, `intent_cycle.stop` (PL-90, siehe
+//! `intent_cycle`-Moduldoku) mit Modell-Tool- und Web-Flächen sowie die
+//! reine Befehls-Operation `intent_cycle` (`/cycle list|status|stop`, nur
+//! TUI/CLI, Operator-Stufe). Das Modell stoppt einen Zyklus weiterhin nur über
+//! das freigabepflichtige `intent_cycle.stop`.
+//!
 //! **WorkDriver-Fläche** ([`register_work_driver_tools`], 3 Ops, hinter
 //! demselben Gate): `work_driver.enqueue`, `work_driver.status`,
 //! `work_driver.stop`. Nur Modell-Tool- und Web-Flächen, bewusst kein
@@ -188,6 +205,7 @@ pub mod context_proposal;
 pub mod deny;
 pub mod diary;
 pub mod diff;
+pub mod dod;
 pub mod dream;
 pub mod dream_run;
 pub mod effort;
@@ -208,6 +226,7 @@ pub mod infra;
 // Server-derived reach for durable job mutations (Slash vs model tool).
 pub mod job_authority;
 // H12: Mandanten-Sichtbarkeit durabler Jobs (gemeinsam für ps/work/attach/…).
+pub mod image;
 pub(crate) mod job_tenant;
 pub mod jobs;
 pub mod kanban;
@@ -244,6 +263,7 @@ pub mod retention_job;
 pub mod retry;
 pub mod review;
 pub mod sandbox_lease;
+pub mod settings;
 pub mod skills;
 pub mod status;
 pub mod stop;
@@ -251,7 +271,11 @@ pub mod stop;
 pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod tool_index_op;
 pub mod usage;
+// PL-90: `intent_cycle.*` (start/status/list/stop) und `/cycle` — dauerhafte,
+// nur lesende Intent-Zyklen; registriert über `register_intent_cycle_tools`.
+pub mod intent_cycle;
 pub mod work;
 pub mod work_result;
 // R14: `work_driver.*` (enqueue/status/stop) — nur Tool- und Web-Flächen,
@@ -328,7 +352,7 @@ macro_rules! register_ops {
     };
 }
 
-/// Registriert alle 47 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Registriert alle 54 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
@@ -358,7 +382,10 @@ macro_rules! register_ops {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 47);
+/// assert_eq!(registry.len(), 54);
+/// assert!(registry.find_by_command("/dod").is_some());
+/// assert!(registry.find_by_name("dod.findings").is_some());
+/// assert!(registry.find_by_name("tool.index").is_some());
 /// assert!(registry.find_by_name("help").is_some());
 /// assert!(registry.find_by_name("work.result").is_some());
 /// assert!(registry.find_by_command("/uia-provider").is_some());
@@ -402,6 +429,7 @@ register_ops! {
 
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
+        Arc::new(settings::SettingsOperation),
         Arc::new(quit::QuitOperation),
         Arc::new(new::NewOperation),
         Arc::new(work::WorkOperation),
@@ -414,6 +442,7 @@ register_ops! {
         Arc::new(skills::SkillsOperation),
         Arc::new(plugins::PluginsOperation),
         Arc::new(model::ModelOperation),
+        Arc::new(image::ImageInspectOperation),
         Arc::new(provider::ProviderOperation),
         // UIA-specific pinned provider/model selection (`uia_provider`/
         // `uia_model`), independent of `default_provider`/`default_model` —
@@ -502,6 +531,16 @@ register_ops! {
         // Plan R9, Teil F: Hintergrund-Jobs der Sitzung (`/jobs`, nur TUI,
         // handelt als Bedienerin; kein Modell-Werkzeug).
         Arc::new(jobs::JobsOperation),
+        // PL-97 D3: Harw-DoD — `/dod` (Operator, Kanäle nur lesende
+        // Unterbefehle) und die drei lesenden Modell-Werkzeuge ohne Freigabe.
+        // Kein Gate: ohne installierte Suite melden sie das ehrlich.
+        Arc::new(dod::DodCommandOperation),
+        Arc::new(dod::DodStatusOperation),
+        Arc::new(dod::DodFindingsOperation),
+        Arc::new(dod::DodSensorsOperation),
+        // PL-97 B2: der lesende Werkzeug-Index für das Modell (ohne Freigabe,
+        // ohne Sandbox-Recht; statische Daten dieses Binaries).
+        Arc::new(tool_index_op::ToolIndexOperation),
     ];
 }
 
@@ -651,6 +690,62 @@ register_ops! {
     ];
 }
 
+/// Registriert die Intent-Zyklus-Operationen (PL-90) — hinter demselben
+/// Gate wie die Planungsfläche.
+///
+/// # Beschreibung
+/// Fügt `intent_cycle.start`, `intent_cycle.status`, `intent_cycle.list`,
+/// `intent_cycle.stop` und die Befehls-Operation `intent_cycle` (`/cycle`)
+/// hinzu (siehe [`intent_cycle`]-Moduldoku). Ist `[tools.plan] enabled` aus,
+/// wird nichts registriert. Die Runtime ruft diese Funktion direkt nach
+/// [`register_work_driver_tools`] auf.
+///
+/// # Rückgabe
+/// [`INTENT_CYCLE_TOOL_COUNT`] oder `0`.
+///
+/// # Beispiel
+/// ```rust
+/// use harw_operations::registry::OperationRegistry;
+/// use harw_plan::config::PlanToolConfig;
+///
+/// let mut registry = OperationRegistry::new();
+/// assert_eq!(
+///     harw_ops::register_intent_cycle_tools(&mut registry, &PlanToolConfig::default()),
+///     0
+/// );
+/// let added = harw_ops::register_intent_cycle_tools(
+///     &mut registry,
+///     &PlanToolConfig::enabled_defaults(),
+/// );
+/// assert_eq!(added, harw_ops::INTENT_CYCLE_TOOL_COUNT);
+/// assert!(registry.find_by_name("intent_cycle.start").is_some());
+/// ```
+pub fn register_intent_cycle_tools(
+    registry: &mut OperationRegistry,
+    config: &PlanToolConfig,
+) -> usize {
+    if !config.enabled {
+        return 0;
+    }
+    for op in intent_cycle_ops() {
+        registry.register(op);
+    }
+    INTENT_CYCLE_TOOL_COUNT
+}
+
+register_ops! {
+    /// Anzahl der Operationen, die [`register_intent_cycle_tools`] bei aktivem Gate hinzufügt
+    /// (fünf: `intent_cycle.start`/`.status`/`.list`/`.stop` und `intent_cycle` für `/cycle`).
+    pub const INTENT_CYCLE_TOOL_COUNT;
+    fn intent_cycle_ops = [
+        Arc::new(intent_cycle::IntentCycleStartOperation),
+        Arc::new(intent_cycle::IntentCycleStatusOperation),
+        Arc::new(intent_cycle::IntentCycleListOperation),
+        Arc::new(intent_cycle::IntentCycleStopOperation),
+        Arc::new(intent_cycle::IntentCycleCommandOperation),
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::{compact_unavailable_output, register_all};
@@ -667,6 +762,7 @@ mod tests {
         register_all(&mut reg);
         super::register_plan_tools(&mut reg, &PlanToolConfig::enabled_defaults());
         super::register_work_driver_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        super::register_intent_cycle_tools(&mut reg, &PlanToolConfig::enabled_defaults());
         reg
     }
 
@@ -766,6 +862,30 @@ mod tests {
             WebMethod::Post,
             ApprovalPolicy::Always,
         ),
+        (
+            "intent_cycle.start",
+            "/api/intent-cycle/start",
+            WebMethod::Post,
+            ApprovalPolicy::Always,
+        ),
+        (
+            "intent_cycle.status",
+            "/api/intent-cycle/status",
+            WebMethod::Get,
+            ApprovalPolicy::None,
+        ),
+        (
+            "intent_cycle.list",
+            "/api/intent-cycle/list",
+            WebMethod::Get,
+            ApprovalPolicy::None,
+        ),
+        (
+            "intent_cycle.stop",
+            "/api/intent-cycle/stop",
+            WebMethod::Post,
+            ApprovalPolicy::Always,
+        ),
     ];
 
     #[test]
@@ -787,10 +907,11 @@ mod tests {
                     method: m,
                     approval: a,
                 } = surface
+                    && *p == *path
+                    && *m == *method
+                    && *a == *approval
                 {
-                    if *p == *path && *m == *method && *a == *approval {
-                        found = true;
-                    }
+                    found = true;
                 }
             }
             assert!(
@@ -824,6 +945,8 @@ mod tests {
                     | "analyze"
                     | "work_driver.enqueue"
                     | "work_driver.stop"
+                    | "intent_cycle.start"
+                    | "intent_cycle.stop"
             );
             let expected = if is_mutating {
                 WebMethod::Post
@@ -864,6 +987,12 @@ mod tests {
             ("work_driver.enqueue", PermissionTier::Operator),
             ("work_driver.status", PermissionTier::Observer),
             ("work_driver.stop", PermissionTier::Operator),
+            ("intent_cycle.start", PermissionTier::Operator),
+            ("intent_cycle.status", PermissionTier::Observer),
+            ("intent_cycle.list", PermissionTier::Observer),
+            ("intent_cycle.stop", PermissionTier::Operator),
+            // Reine Befehls-Operation (`/cycle`): ohne Web-Fläche, daher nur hier.
+            ("intent_cycle", PermissionTier::Operator),
         ];
         for (name, tier) in expected_permissions {
             let op = reg.find_by_name(name.trim()).ok_or_else(|| {
@@ -927,10 +1056,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_adds_forty_six_operations() {
+    fn register_all_adds_fifty_four_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 47);
+        assert_eq!(reg.len(), 54);
     }
 
     #[test]
@@ -1010,6 +1139,62 @@ mod tests {
     }
 
     #[test]
+    fn register_intent_cycle_tools_follows_the_plan_gate_and_only_the_cycle_op_has_a_command() {
+        let mut reg = OperationRegistry::new();
+        register_all(&mut reg);
+        let before = reg.len();
+
+        let closed = super::register_intent_cycle_tools(&mut reg, &PlanToolConfig::default());
+        assert_eq!(closed, 0, "geschlossenes Gate darf nichts registrieren");
+        assert_eq!(reg.len(), before);
+        assert!(
+            reg.find_by_command("/cycle").is_none(),
+            "/cycle darf bei geschlossenem Gate nicht auffindbar sein"
+        );
+
+        let added =
+            super::register_intent_cycle_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        assert_eq!(added, super::INTENT_CYCLE_TOOL_COUNT);
+        assert_eq!(super::INTENT_CYCLE_TOOL_COUNT, 5);
+        assert_eq!(reg.len(), before + super::INTENT_CYCLE_TOOL_COUNT);
+
+        // `/cycle` löst auf die Befehls-Operation `intent_cycle` auf ...
+        assert_eq!(
+            reg.find_by_command("/cycle").map(|op| op.meta().name),
+            Some("intent_cycle")
+        );
+        // ... die übrigen vier Zyklus-Operationen tragen keine Befehlsfläche ...
+        for name in [
+            "intent_cycle.start",
+            "intent_cycle.status",
+            "intent_cycle.list",
+            "intent_cycle.stop",
+        ] {
+            let op = reg.find_by_name(name);
+            assert!(op.is_some(), "{name} wurde nicht registriert");
+            assert!(
+                op.is_some_and(|op| !op
+                    .meta()
+                    .surfaces
+                    .iter()
+                    .any(|surface| matches!(surface, Surface::Command { .. }))),
+                "{name} darf keine Command-Fläche tragen"
+            );
+        }
+        // ... und die Befehls-Operation ist für das Modell unerreichbar: nur
+        // Befehlsfläche, kein Modell-Tool, keine Web-Route.
+        let command = reg.find_by_name("intent_cycle");
+        assert!(
+            command.is_some_and(|op| op
+                .meta()
+                .surfaces
+                .iter()
+                .all(|surface| matches!(surface, Surface::Command { .. }))),
+            "intent_cycle darf nur eine Command-Fläche tragen"
+        );
+    }
+
+    #[test]
     fn mode_is_registered_unconditionally_not_behind_the_plan_gate() {
         // `/mode` steuert die Session, nicht die Planungsfläche. Läge es hinter
         // dem Gate, könnte eine Laufzeit ohne Plan-Store den Modus nicht mehr
@@ -1062,6 +1247,7 @@ mod tests {
             "/dream",
             "/learn",
             "/matrix",
+            "/dod",
         ] {
             assert!(
                 reg.find_by_command(path).is_some(),
@@ -1113,6 +1299,7 @@ mod tests {
         register_all(&mut reg);
         super::register_plan_tools(&mut reg, &PlanToolConfig::enabled_defaults());
         super::register_work_driver_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        super::register_intent_cycle_tools(&mut reg, &PlanToolConfig::enabled_defaults());
 
         let registered_names: std::collections::BTreeSet<&str> =
             reg.iter().map(|op| op.meta().name).collect();
@@ -1179,6 +1366,13 @@ mod tests {
             "learn",
             "matrix",
             "jobs",
+            // PL-97 D3: Harw-DoD-Befehl und seine drei lesenden Modell-Werkzeuge.
+            "dod",
+            "dod.status",
+            "dod.findings",
+            "dod.sensors",
+            // PL-97 B2: der lesende Werkzeug-Index.
+            "tool.index",
             "plan",
             "goal",
             "explore",
@@ -1189,6 +1383,11 @@ mod tests {
             "work_driver.enqueue",
             "work_driver.status",
             "work_driver.stop",
+            "intent_cycle.start",
+            "intent_cycle.status",
+            "intent_cycle.list",
+            "intent_cycle.stop",
+            "intent_cycle",
         ];
 
         for name in declared_names {
@@ -1232,8 +1431,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            47,
-            "first register_all must produce exactly 47 ops"
+            54,
+            "first register_all must produce exactly 54 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -1247,8 +1446,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            47,
-            "registry must stay at 47 after a rejected duplicate"
+            54,
+            "registry must stay at 54 after a rejected duplicate"
         );
     }
 }

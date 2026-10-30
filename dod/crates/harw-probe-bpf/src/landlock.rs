@@ -50,11 +50,40 @@
 //! auf einer Einzeldatei passten diese Rechte nicht (siehe
 //! `main::KERNEL_INTERFACE_ROOTS`).
 //!
+//! # Die cgroup2-Wurzel (PL-97 E3c): bewusste, nur auflistende Erweiterung
+//! Ist ein Profil mit `scope = "cgroups"` und `include_descendants = true`
+//! aktiv, läuft nach `restrict_self` der Nachfahren-Rescan
+//! (`crate::scope_rescan`): er listet die Verzeichnisse unter
+//! `--cgroup-root` auf und liest ihre Kennungen per `lstat`. Nur dann nimmt
+//! `main::fs_scope_roots` **eine** zusätzliche Wurzel auf: `--cgroup-root`
+//! mit [`RootAccess::ListDirectories`] — ausschließlich
+//! `AccessFs::ReadDir` (Verzeichnis öffnen und auflisten). Das ist eine
+//! **bewusste** Erweiterung der Dateisystemsicht dieser Sonde auf die
+//! cgroup2-Hierarchie unter `--cgroup-root`, und zwar die engste, die der
+//! Rescan braucht:
+//!
+//! - kein `ReadFile`: keine Schnittstellendatei (`cgroup.procs` usw.) wird
+//!   lesbar — der Walk liest keine Datei, `lstat` ist unter ABI V1 kein von
+//!   Landlock behandeltes Recht;
+//! - kein `Execute`: `AccessFs::from_read` der Kernel-Wurzeln enthielte es,
+//!   diese Wurzel bekommt es ausdrücklich nicht;
+//! - kein Schreibrecht: dieses Regelwerk vergibt nirgends eines;
+//! - **keine neue Fähigkeit**: das Auflisten braucht weder `CAP_BPF` noch
+//!   `CAP_PERFMON` noch irgendein anderes Privileg; die systemd-Unit hält
+//!   den cgroup-Baum ohnehin schreibgeschützt (`ProtectControlGroups=yes`).
+//!
+//! Ein Host-Profil und ein cgroup-Profil ohne Nachfahren (kein Rescan)
+//! erzeugen dagegen exakt den bisherigen Regelsatz: nur die
+//! Kernel-Schnittstellen mit [`RootAccess::Read`]. `main::run` lehnt ein
+//! `--cgroup-root` ab, das nicht absolut ist, `/` ist oder `..` enthält
+//! (`crate::profile`), damit die Erweiterung nie den ganzen Baum erfasst.
+//!
 //! # Was die Regel beschränkt
 //! Behandelt werden die lesenden Zugriffsrechte der ABI-Stufe V1
 //! (`AccessFs::from_read`: Lesen von Dateien, Auflisten von Verzeichnissen,
 //! Ausführen). Außerhalb der Wurzeln ist danach jeder lesende Zugriff
-//! gesperrt; schreibende Rechte behandelt dieses Regelwerk nicht.
+//! gesperrt, unterhalb einer Wurzel genau das, was ihr [`RootAccess`] nicht
+//! gewährt; schreibende Rechte behandelt dieses Regelwerk nicht.
 //!
 //! # Warum diese Sonde Landlock bauen kann, obwohl der ursprüngliche Auftrag
 //! das Gegenteil vermutete
@@ -96,7 +125,7 @@
 //! zusätzlich erlaubt.
 //!
 //! # Exportierte Typen
-//! Keine — nur die Funktion [`enforce_fs_scope`].
+//! [`FsRoot`], [`RootAccess`] und die Funktion [`enforce_fs_scope`].
 //!
 //! # Nebenläufigkeit
 //! [`enforce_fs_scope`] muss vor jedem weiteren Thread aus dem Hauptthread
@@ -112,18 +141,76 @@
 //! use std::path::PathBuf;
 //!
 //! // Objekte sind zu diesem Zeitpunkt bereits eingelesen.
-//! let roots = vec![PathBuf::from("/proc/self"), PathBuf::from("/sys/kernel/btf")];
+//! let roots = vec![
+//!     FsRoot::read("/proc/self"),
+//!     FsRoot::read("/sys/kernel/btf"),
+//! ];
 //! enforce_fs_scope(&roots)?;
 //! ```
 
 use std::path::{Path, PathBuf};
 
 use landlock::{
-    ABI, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, RestrictionStatus, Ruleset,
-    RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    ABI, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, RestrictionStatus,
+    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
 };
 
 use crate::error::ProbeError;
+
+/// The rights granted beneath one Landlock root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootAccess {
+    /// `AccessFs::from_read`: read files, list directories, execute (ABI V1).
+    /// Used for the kernel interface directories (`main::KERNEL_INTERFACE_ROOTS`).
+    Read,
+    /// `AccessFs::ReadDir` only: open and list directories. Used for
+    /// `--cgroup-root` while a descendant rescan is active (see the module
+    /// docs, "Die cgroup2-Wurzel").
+    ListDirectories,
+}
+
+impl RootAccess {
+    /// The access rights a `PathBeneath` rule grants for this kind of root.
+    ///
+    /// # Arguments
+    /// - `abi` (`landlock::ABI`): the ABI level of the ruleset.
+    #[must_use]
+    pub fn rights(self, abi: ABI) -> BitFlags<AccessFs> {
+        match self {
+            Self::Read => AccessFs::from_read(abi),
+            Self::ListDirectories => AccessFs::from_read(abi) & AccessFs::ReadDir,
+        }
+    }
+}
+
+/// One root of the Landlock ruleset: a directory and the rights beneath it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsRoot {
+    /// The directory the rule applies to (and everything beneath it).
+    pub path: PathBuf,
+    /// The rights granted beneath `path`.
+    pub access: RootAccess,
+}
+
+impl FsRoot {
+    /// A kernel interface root with [`RootAccess::Read`].
+    #[must_use]
+    pub fn read(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            access: RootAccess::Read,
+        }
+    }
+
+    /// A list-only root with [`RootAccess::ListDirectories`].
+    #[must_use]
+    pub fn list_directories(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            access: RootAccess::ListDirectories,
+        }
+    }
+}
 
 /// Erzwingt den übergebenen Dateisystem-Ausschnitt über Landlock, bevor
 /// diese Sonde ein einziges Ereignis liest.
@@ -134,16 +221,18 @@ use crate::error::ProbeError;
 /// `landlock`-Crate selbst liefert — diese Funktion entscheidet danach
 /// selbst, siehe Moduldoku, dass auch das nicht genügt), nimmt für jede
 /// erreichbare Wurzel aus `roots` eine lesende `PathBeneath`-Regel unter
-/// [`landlock::ABI::V1`] auf und ruft `restrict_self()` auf. Nur
+/// [`landlock::ABI::V1`] auf (mit den Rechten aus [`RootAccess::rights`])
+/// und ruft `restrict_self()` auf. Nur
 /// [`RulesetStatus::FullyEnforced`] gilt als Erfolg — auch bei einer leeren
 /// `roots`-Liste (dann eine Regel, die kein Dateisystemziel erlaubt).
 ///
 /// # Arguments
-/// - `roots` (`&[std::path::PathBuf]`): die einzigen danach noch lesbaren
-///   Wurzeln — ausschließlich Kernel-Schnittstellenverzeichnisse
+/// - `roots` (`&[FsRoot]`): die einzigen danach noch lesbaren Wurzeln —
+///   Kernel-Schnittstellenverzeichnisse und, nur bei aktivem
+///   Nachfahren-Rescan, `--cgroup-root` zum Auflisten
 ///   (`main::fs_scope_roots`), nie das eBPF-Objektverzeichnis (siehe
-///   Moduldoku, Abschnitt „Welche Wurzeln"). Nicht öffenbare Einträge werden
-///   ausgelassen (fail-closed).
+///   Moduldoku, Abschnitte „Welche Wurzeln" und „Die cgroup2-Wurzel"). Nicht
+///   öffenbare Einträge werden ausgelassen (fail-closed).
 ///
 /// # Returns
 /// `Ok(())` ausschließlich bei `RulesetStatus::FullyEnforced`.
@@ -152,7 +241,7 @@ use crate::error::ProbeError;
 /// - [`ProbeError::LandlockUnavailable`]: bei jedem Aufbaufehler
 ///   (`handle_access`, `create`, `add_rules`, `restrict_self`) und bei
 ///   jedem Ausgang außer `FullyEnforced`.
-pub fn enforce_fs_scope(roots: &[PathBuf]) -> Result<(), ProbeError> {
+pub fn enforce_fs_scope(roots: &[FsRoot]) -> Result<(), ProbeError> {
     let abi = ABI::V1;
 
     let ruleset = Ruleset::default().set_compatibility(CompatLevel::BestEffort);
@@ -173,7 +262,7 @@ pub fn enforce_fs_scope(roots: &[PathBuf]) -> Result<(), ProbeError> {
 
     let rules: Vec<Result<PathBeneath<PathFd>, landlock::RulesetError>> = roots
         .iter()
-        .filter_map(|root| open_rule(root, abi))
+        .filter_map(|root| open_rule(&root.path, root.access.rights(abi)))
         .collect();
 
     let created = created.add_rules(rules).map_err(|error| {
@@ -201,13 +290,21 @@ pub fn enforce_fs_scope(roots: &[PathBuf]) -> Result<(), ProbeError> {
 /// Baut, falls möglich, eine lesende `PathBeneath`-Regel für eine einzelne
 /// Wurzel.
 ///
+/// # Arguments
+/// - `root` (`&Path`): die Wurzel.
+/// - `rights` (`BitFlags<AccessFs>`): die gewährten Rechte
+///   ([`RootAccess::rights`]).
+///
 /// # Returns
 /// `None`, wenn der Pfad nicht als `PathFd` geöffnet werden kann (fehlt,
 /// keine Berechtigung) — geloggt, aber kein Abbruch des gesamten Aufbaus
 /// (siehe Moduldoku, Abschnitt „Fail-closed"). Sonst `Some(Ok(rule))`.
-fn open_rule(root: &Path, abi: ABI) -> Option<Result<PathBeneath<PathFd>, landlock::RulesetError>> {
+fn open_rule(
+    root: &Path,
+    rights: BitFlags<AccessFs>,
+) -> Option<Result<PathBeneath<PathFd>, landlock::RulesetError>> {
     match PathFd::new(root) {
-        Ok(fd) => Some(Ok(PathBeneath::new(fd, AccessFs::from_read(abi)))),
+        Ok(fd) => Some(Ok(PathBeneath::new(fd, rights))),
         Err(error) => {
             tracing::warn!(
                 path = %root.display(),
@@ -219,16 +316,46 @@ fn open_rule(root: &Path, abi: ABI) -> Option<Result<PathBeneath<PathFd>, landlo
     }
 }
 
-// Bewusst kein `#[cfg(test)] mod tests` in dieser Datei: jeder denkbare Test
-// müsste entweder `enforce_fs_scope` (echtes `restrict_self`) oder
-// `open_rule` (das seinerseits `PathFd::new` aufruft) ausführen. Ein
-// `PathFd::new`-Aufruf öffnet zwar nur einen gewöhnlichen Dateideskriptor und
-// bindet keine Landlock-Regel, aber dieser Knoten hält sich an dieselbe,
-// striktere Disziplin wie `harw-sentinel::sandbox` und
-// `harw-probe-fs::landlock` (dort ebenfalls kein Test, der irgendeine
-// Funktion der `landlock`-Crate aufruft) — nach Aufgabenstellung
-// ausdrücklich untersagt ("binde kein echtes Landlock"). Die
-// Entscheidungslogik dieser Datei (Fail-closed bei nicht öffenbaren
-// Wurzeln, „nur `FullyEnforced` zählt als Erfolg") ist in der Moduldoku
-// begründet statt durch einen Test belegt, der einen Kernel-Zustand
-// voraussetzen würde.
+// Kein Test in dieser Datei ruft `enforce_fs_scope` (echtes `restrict_self`)
+// oder `open_rule` (das `PathFd::new` aufruft) auf — dieselbe strikte
+// Disziplin wie `harw-sentinel::sandbox` und `harw-probe-fs::landlock`
+// ("binde kein echtes Landlock"). Geprüft wird nur die reine Abbildung
+// `RootAccess::rights` (Bitmengen, kein Systemaufruf); die übrige
+// Entscheidungslogik (Fail-closed bei nicht öffenbaren Wurzeln, „nur
+// `FullyEnforced` zählt als Erfolg") ist in der Moduldoku begründet. Welche
+// Wurzeln mit welchen Rechten entstehen, prüft `main::tests` über die reine
+// Funktion `main::landlock_roots`.
+#[cfg(test)]
+mod tests {
+    use landlock::{ABI, AccessFs, BitFlags};
+
+    use super::{FsRoot, RootAccess};
+
+    #[test]
+    fn read_roots_keep_exactly_the_v1_read_rights() {
+        assert_eq!(
+            RootAccess::Read.rights(ABI::V1),
+            AccessFs::from_read(ABI::V1)
+        );
+    }
+
+    #[test]
+    fn list_only_roots_grant_read_dir_and_nothing_else() {
+        let rights = RootAccess::ListDirectories.rights(ABI::V1);
+        assert_eq!(rights, BitFlags::from(AccessFs::ReadDir));
+        assert!(!rights.contains(AccessFs::Execute));
+        assert!(!rights.contains(AccessFs::ReadFile));
+        assert!((rights & AccessFs::from_write(ABI::V1)).is_empty());
+        // Nie mehr als das, was der Regelsatz überhaupt behandelt.
+        assert_eq!(rights & AccessFs::from_read(ABI::V1), rights);
+    }
+
+    #[test]
+    fn constructors_pick_the_matching_access() {
+        assert_eq!(FsRoot::read("/proc/self").access, RootAccess::Read);
+        assert_eq!(
+            FsRoot::list_directories("/sys/fs/cgroup").access,
+            RootAccess::ListDirectories
+        );
+    }
+}

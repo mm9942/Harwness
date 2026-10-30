@@ -83,9 +83,10 @@ const BROWSER: &[&str] = &[
 ];
 
 /// Die Werkzeuge von `RegistryProfile::MatrixReader` in
-/// Registrierungsreihenfolge: die fünf lesenden `fs.*` plus `doc.read_pdf`.
+/// Registrierungsreihenfolge: die sechs lesenden `fs.*` plus `doc.read_pdf`.
 const MATRIX_READ_TOOLS: &[&str] = &[
     "fs.read",
+    "fs.view_image",
     "fs.list",
     "fs.search",
     "fs.glob",
@@ -668,6 +669,7 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
         .collect();
     for tool in [
         "fs.read",
+        "fs.view_image",
         "fs.list",
         "fs.search",
         "fs.glob",
@@ -693,7 +695,14 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
 /// sie registriert — dieselbe Liste wie `crate::profile::FS_READ_ONLY_TOOLS`
 /// (`pub(crate)`, hier deshalb als eigene Kopie, wie schon in
 /// `harw-registry-defaults/src/profile.rs::test_read_only_explore_exposes_exact_tool_set`).
-const FS_READ_ONLY: &[&str] = &["fs.read", "fs.list", "fs.search", "fs.glob", "fs.grep"];
+const FS_READ_ONLY: &[&str] = &[
+    "fs.read",
+    "fs.view_image",
+    "fs.list",
+    "fs.search",
+    "fs.glob",
+    "fs.grep",
+];
 
 /// Das lesende Doc-Werkzeug, wie `RegistryProfile::AgentStewardship` es
 /// registriert — dieselbe Liste wie `crate::profile::DOC_TOOLS` (`pub(crate)`,

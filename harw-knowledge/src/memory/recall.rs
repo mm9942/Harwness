@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use crate::artifact::{ArtifactId, ArtifactKind, KnowledgeArtifact, RecallQuery};
+use crate::artifact::{ArtifactId, ArtifactKind, KnowledgeArtifact, RecallQuery, artifact_visible};
 use crate::error::KnowledgeResult;
 use crate::index::{ArtifactRef, KnowledgeIndex};
 
@@ -205,10 +205,14 @@ pub fn search_with(
                 .all(|tag| artifact.frontmatter.tags.contains(tag))
         })
         .filter(|artifact| {
-            artifact
-                .frontmatter
-                .visibility
-                .visible_to_caller(&query.caller_scope)
+            // Author and scope are the index entry's own fields; with a bound
+            // `CallerIdentity` this is the identity-based decision (W03d),
+            // else the fail-closed scope heuristic.
+            artifact_visible(
+                &artifact.frontmatter.visibility,
+                &artifact.frontmatter.author_agent_id,
+                query,
+            )
         })
         .collect();
     candidates.sort_by(|a, b| a.id.cmp(&b.id));
@@ -232,7 +236,7 @@ pub fn search_with(
         expand_backlinks(index, query, &mut hits, &mut seen);
     }
 
-    verify_no_steward_domain_leak(&hits, query);
+    verify_no_steward_domain_leak(index, &hits, query);
 
     Ok(RecallResult { hits, truncated })
 }
@@ -243,8 +247,9 @@ pub fn search_with(
 /// # Description
 /// The direct-candidate filter above and the per-hop check in
 /// [`expand_backlinks`] already make it structurally impossible for a hit
-/// whose own visibility does not clear `query.caller_scope` to reach `hits`
-/// — this is the same guarantee K35 fixed for backlinks. This function does
+/// whose own visibility does not clear the caller (`query.caller_scope`, or
+/// the bound `query.caller_identity`, see [`artifact_ref_visible`]) to reach
+/// `hits` — this is the same guarantee K35 fixed for backlinks. This function does
 /// not add a new read path or change that guarantee; it re-verifies it on
 /// the assembled result, scoped to the two `ArtifactKind`s the Context
 /// Steward curates ([`ArtifactKind::ContextProposal`],
@@ -265,33 +270,55 @@ pub fn search_with(
 /// yet reached by any registered operation (no `/model-behavior-proposal`
 /// command exists), which is why the module doc calls this counter's
 /// coverage partial rather than fully proven.
-fn verify_no_steward_domain_leak(hits: &[RecallHit], query: &RecallQuery) {
+fn verify_no_steward_domain_leak(index: &KnowledgeIndex, hits: &[RecallHit], query: &RecallQuery) {
     for hit in hits {
         let is_steward_domain = matches!(
             hit.artifact.kind,
             ArtifactKind::ContextProposal | ArtifactKind::ModelBehaviorProposal
         );
-        if is_steward_domain
-            && !hit
-                .artifact
-                .visibility
-                .visible_to_caller(&query.caller_scope)
-        {
+        if is_steward_domain && !artifact_ref_visible(index, &hit.artifact, query) {
             crate::context_steward::STEWARD_LEAK_VIOLATION.violated(&harw_observe::NullSink, &[]);
         }
     }
 }
 
+/// Visibility of an already-projected [`ArtifactRef`] for `query`'s caller.
+///
+/// `ArtifactRef` carries no author, so the identity-based decision (W03d)
+/// resolves the full indexed artifact: author *and* scope are read from the
+/// index entry, never from the projection or from `Frontmatter::extra`. An id
+/// the index does not know is denied (fail closed). Without a bound
+/// `CallerIdentity` the projection's own scope is checked with the scope
+/// heuristic, exactly as before.
+fn artifact_ref_visible(
+    index: &KnowledgeIndex,
+    artifact: &ArtifactRef,
+    query: &RecallQuery,
+) -> bool {
+    if query.caller_identity.is_none() {
+        return artifact.visibility.visible_to_caller(&query.caller_scope);
+    }
+    index.get(&artifact.id).is_some_and(|indexed| {
+        artifact_visible(
+            &indexed.frontmatter.visibility,
+            &indexed.frontmatter.author_agent_id,
+            query,
+        )
+    })
+}
+
 /// Breadth-first palace-backlink expansion from the direct hits (§2.2, §2.3).
 ///
-/// Each traversed backlink is re-checked against `query.caller_scope` (§7)
-/// before it is added or traversed further: `KnowledgeIndex::backlinks`
-/// returns every linking artifact regardless of its own visibility, so
-/// without this check a restricted artifact that merely links to (or is
-/// linked from) an already-visible hit would leak into the result set even
-/// though it would never pass the direct-candidate filter in [`search_with`]
-/// on its own (AW4-05 finding; see the module-level doc and the
-/// `test_backlink_expansion_does_not_leak_a_self_only_note` regression test).
+/// Each traversed backlink is re-checked against the caller (§7; the
+/// identity-based decision when `query.caller_identity` is set, else
+/// `query.caller_scope`) before it is added or traversed further:
+/// `KnowledgeIndex::backlinks` returns every linking artifact regardless of
+/// its own visibility, so without this check a restricted artifact that
+/// merely links to (or is linked from) an already-visible hit would leak into
+/// the result set even though it would never pass the direct-candidate filter
+/// in [`search_with`] on its own (AW4-05 finding; see the module-level doc and
+/// the `test_backlink_expansion_does_not_leak_a_self_only_note` regression
+/// test).
 fn expand_backlinks(
     index: &KnowledgeIndex,
     query: &RecallQuery,
@@ -323,7 +350,7 @@ fn expand_backlinks(
                 continue;
             }
             seen.push(backref.id.clone());
-            if !backref.visibility.visible_to_caller(&query.caller_scope) {
+            if !artifact_ref_visible(index, &backref, query) {
                 // Restricted artifact reached only via the link graph: it
                 // would not have passed the direct-candidate filter above,
                 // so it must not be added, and must not be traversed
@@ -672,7 +699,7 @@ mod tests {
         };
         let query = RecallQuery::new("", VisibilityScope::OperatorOnly);
 
-        super::verify_no_steward_domain_leak(&[leaking_hit], &query);
+        super::verify_no_steward_domain_leak(&KnowledgeIndex::new(), &[leaking_hit], &query);
 
         assert!(
             STEWARD_LEAK_VIOLATION.count() > before,
@@ -708,12 +735,116 @@ mod tests {
         };
         let query = RecallQuery::new("", VisibilityScope::OperatorOnly);
 
-        super::verify_no_steward_domain_leak(&[unrelated_hit], &query);
+        super::verify_no_steward_domain_leak(&KnowledgeIndex::new(), &[unrelated_hit], &query);
 
         assert_eq!(
             STEWARD_LEAK_VIOLATION.count(),
             before,
             "a non-Steward-domain kind must never trip this counter"
         );
+    }
+
+    /// Build a test artifact with an explicit author, so the author recorded
+    /// in the index can differ from what the artifact claims about itself.
+    fn authored(
+        id: &str,
+        author: &str,
+        visibility: VisibilityScope,
+        links: Vec<ArtifactId>,
+    ) -> KnowledgeArtifact {
+        let mut frontmatter = Frontmatter::new(
+            AgentId::new(author),
+            visibility,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+        frontmatter.links = links;
+        KnowledgeArtifact::new(
+            ArtifactId::new(id),
+            ArtifactKind::TopicMemory,
+            frontmatter,
+            "canary deploy notes",
+        )
+    }
+
+    /// Ids of all hits, in result order.
+    fn hit_ids(result: &super::RecallResult) -> Vec<ArtifactId> {
+        result
+            .hits
+            .iter()
+            .map(|hit| hit.artifact.id.clone())
+            .collect()
+    }
+
+    /// W03d: identity claims smuggled into `Frontmatter::extra` (another
+    /// author, a wider visibility, an ancestor id) never widen access — the
+    /// index values of `author_agent_id` and `visibility` alone decide, for
+    /// direct hits and for hits reached through the link graph.
+    #[test]
+    fn forged_identity_metadata_in_frontmatter_does_not_grant_access() -> TestResult {
+        use crate::caller_identity::CallerIdentity;
+
+        let forge = |artifact: &mut KnowledgeArtifact, author: &str| {
+            let extra = &mut artifact.frontmatter.extra;
+            extra.insert("author_agent_id".to_owned(), serde_json::json!(author));
+            extra.insert(
+                "visibility".to_owned(),
+                serde_json::json!("descendant_tree"),
+            );
+            extra.insert("ancestors".to_owned(), serde_json::json!(["parent"]));
+        };
+
+        let mut index = KnowledgeIndex::new();
+        // b's own note; the pretended author in `extra` is irrelevant.
+        let mut own = authored("topic/own", "b", VisibilityScope::SelfOnly, Vec::new());
+        forge(&mut own, "a");
+        index.insert(own);
+        // a's SelfOnly note claims it was written by b, and links to b's note
+        // so it is also reachable as a backlink hop.
+        let mut forged_author = authored(
+            "topic/forged-author",
+            "a",
+            VisibilityScope::SelfOnly,
+            vec![ArtifactId::new("topic/own")],
+        );
+        forge(&mut forged_author, "b");
+        index.insert(forged_author);
+        // a's DescendantTree note claims the shared parent as author, which
+        // would open the tree for `b` if the claim were believed.
+        let mut forged_tree = authored(
+            "topic/forged-tree",
+            "a",
+            VisibilityScope::DescendantTree,
+            vec![ArtifactId::new("topic/own")],
+        );
+        forge(&mut forged_tree, "parent");
+        index.insert(forged_tree);
+
+        let sibling_b =
+            CallerIdentity::new(AgentId::new("b")).with_ancestors(vec![AgentId::new("parent")]);
+        let mut query_b =
+            RecallQuery::new("canary", VisibilityScope::SelfOnly).with_caller_identity(sibling_b);
+        query_b.max_hops = 2;
+        let result = search(&index, &query_b)
+            .map_err(crate::test_support::ctx("bounded recall query succeeds"))?;
+        assert_eq!(hit_ids(&result), vec![ArtifactId::new("topic/own")]);
+
+        // The recorded author sees both of its own notes (and the forged
+        // visibility claim in `extra` changes nothing for it either).
+        let author_a =
+            CallerIdentity::new(AgentId::new("a")).with_ancestors(vec![AgentId::new("parent")]);
+        let query_a =
+            RecallQuery::new("canary", VisibilityScope::SelfOnly).with_caller_identity(author_a);
+        let result = search(&index, &query_a)
+            .map_err(crate::test_support::ctx("bounded recall query succeeds"))?;
+        let mut ids = hit_ids(&result);
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                ArtifactId::new("topic/forged-author"),
+                ArtifactId::new("topic/forged-tree"),
+            ]
+        );
+        Ok(())
     }
 }

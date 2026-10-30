@@ -19,7 +19,10 @@ pub mod attach;
 // Runde 5, Teil F: Auswahlfenster für `ask_user`.
 pub(crate) mod ask_user_dialog;
 pub(crate) mod chat_scroll;
+mod live_ranker;
 mod recency;
+mod recency_view;
+mod settings_view;
 // h22: read-only StepList-Ansicht für das Explorer-Fenster.
 pub(crate) mod step_list_view;
 // Runde 5, Teil I: Live-Stream der Kind-Agenten im Verlauf.
@@ -32,8 +35,11 @@ pub(crate) mod command_data;
 pub(crate) mod command_exec;
 pub(crate) mod command_popup;
 mod image_attach;
+pub(crate) mod operation_feedback;
 // Gemeinsames Dialog-Layout: angeheftete Optionen, scrollbarer Körper.
 pub(crate) mod dialog_frame;
+// PL-97 D5: Harw-DoD-Ansicht (`/dod view`) und DoD-Marke der Statuszeile.
+pub(crate) mod dod_view;
 mod error;
 pub(crate) mod events;
 pub(crate) mod explorer_panel;
@@ -43,9 +49,12 @@ pub mod export;
 pub mod fixed_agent;
 pub(crate) mod frame_requester;
 pub mod gateway;
+// PL-97 C4b: fester Not-Aus (2× Ctrl+C) und seine Prozessbaum-Rückfallebene.
+pub(crate) mod hard_kill;
 pub(crate) mod help_overlay;
 pub(crate) mod history_cell;
 pub mod host_permit_dialog;
+pub mod i18n;
 mod input;
 pub(crate) mod input_editor;
 pub(crate) mod input_history;
@@ -60,6 +69,8 @@ pub(crate) mod markdown;
 pub(crate) mod matrix_view;
 pub(crate) mod mention;
 pub(crate) mod mention_popup;
+// PL-97 C2: Mission-Control-Fenster (Agenten, Jobs, Finished/Failed, LIVE).
+pub(crate) mod mission;
 pub(crate) mod mode_picker;
 pub mod model_picker;
 pub(crate) mod model_roles_view;
@@ -71,8 +82,11 @@ pub(crate) mod panes;
 pub mod permissions_view;
 // Runde 5, Teil F: Plan-Freigabe (`plan.exit`), Plan-Vorschlag (`plan.enter`), `/plan …`.
 pub(crate) mod plan_dialog;
+pub(crate) mod process_tree;
 // Runde 5, Teil P: Goal-Marke der Statuszeile und Goal-/Schritt-Verlaufszeilen.
 pub(crate) mod goal_marker;
+// PL-97 R1: Renderer der Reasoning-Zellen (Kopfzeile + Markdown-Körper).
+pub(crate) mod reasoning_cell;
 mod registry;
 pub mod relative_time;
 pub(crate) mod runtime_commands;
@@ -109,7 +123,9 @@ pub use export::{
 };
 pub use gateway::{ChatGateway, LocalGateway};
 pub use input::{Invocation, classify_input};
-pub use model_picker::{ModelPickerOutcome, ModelPickerProvider, run_model_picker};
+pub use model_picker::{
+    ModelPickerOutcome, ModelPickerProvider, run_model_picker, run_model_picker_for,
+};
 pub use registry::{
     CapabilitySet, CommandAction, CommandRegistry, DispatchContext, InvocationSurface,
     ShellCapability,
@@ -120,7 +136,7 @@ pub use runtime_root::{
     run_tui,
 };
 pub use session_picker::{PickerAction, SessionEntry, SessionPicker};
-pub use setup::{SetupApp, SetupOutcome, SetupStage, run_setup};
+pub use setup::{SetupApp, SetupOutcome, SetupStage, run_setup, run_setup_for};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

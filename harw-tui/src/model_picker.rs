@@ -7,8 +7,10 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::i18n::{tr, tr_args, with_language};
 use crate::setup::TerminalGuard;
 use crate::{TuiError, style};
+use harw_config::UiLanguage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPickerProvider {
@@ -75,10 +77,10 @@ impl PickerApp {
                         }
                     }
                     KeyCode::Char(' ') => {
-                        if let Some(model) = provider.models.get(self.model_index) {
-                            if !provider.selected.remove(model) {
-                                provider.selected.insert(model.clone());
-                            }
+                        if let Some(model) = provider.models.get(self.model_index)
+                            && !provider.selected.remove(model)
+                        {
+                            provider.selected.insert(model.clone());
                         }
                     }
                     KeyCode::Left => self.stage = Stage::Providers,
@@ -99,10 +101,19 @@ impl PickerApp {
 pub fn run_model_picker(
     providers: Vec<ModelPickerProvider>,
 ) -> Result<Option<ModelPickerOutcome>, TuiError> {
+    run_model_picker_for(UiLanguage::English, providers)
+}
+
+/// Run the standalone picker in the active profile's explicit interface language.
+/// The compatibility entry point defaults to English regardless of ambient scope.
+pub fn run_model_picker_for(
+    language: UiLanguage,
+    providers: Vec<ModelPickerProvider>,
+) -> Result<Option<ModelPickerOutcome>, TuiError> {
     let mut app = PickerApp::new(providers);
     let mut terminal = TerminalGuard::enter()?;
     let result = loop {
-        draw(&mut terminal, &app)?;
+        draw(language, &mut terminal, &app)?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
@@ -113,7 +124,7 @@ pub fn run_model_picker(
             if key.code == KeyCode::Esc {
                 break Ok(None);
             }
-            if let Some(outcome) = app.on_key(key) {
+            if let Some(outcome) = with_language(language, || app.on_key(key)) {
                 break Ok(Some(outcome));
             }
         }
@@ -122,39 +133,156 @@ pub fn run_model_picker(
     result
 }
 
-fn draw(terminal: &mut TerminalGuard, app: &PickerApp) -> Result<(), TuiError> {
-    terminal.terminal().draw(|frame| {
-        let chunks = Layout::default().direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1)]).split(frame.area());
-        let title = match app.stage { Stage::Providers => "Provider wählen", Stage::Models => "Modelle wählen" };
-        frame.render_widget(Paragraph::new("↑/↓ navigieren · Enter/→ öffnen · Leertaste markieren · Enter bestätigen · Esc abbrechen")
-            .block(Block::default().borders(Borders::ALL).title(title)), chunks[0]);
-        let theme = style::detect_theme();
-        let lines = match app.stage {
-            Stage::Providers => app.providers.iter().enumerate().map(|(i, provider)| {
-                let prefix = if i == app.provider_index { "› " } else { "  " };
-                let count = provider.models.len();
-                ratatui::text::Line::styled(format!("{prefix}{} ({count} Modelle)", provider.id), if i == app.provider_index { style::selected_style(theme) } else { ratatui::style::Style::default() })
-            }).collect::<Vec<_>>(),
-            Stage::Models => app.providers.get(app.provider_index).map(|provider| provider.models.iter().enumerate().map(|(i, model)| {
-                let checked = if provider.selected.contains(model) { "☑" } else { "☐" };
-                let prefix = if i == app.model_index { "›" } else { " " };
-                ratatui::text::Line::styled(format!("{prefix} {checked} {model}"), if i == app.model_index { style::selected_style(theme) } else { ratatui::style::Style::default() })
-            }).collect()).unwrap_or_default(),
-        };
-        frame.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL)), chunks[1]);
-    }).map_err(TuiError::from)?;
+fn draw(
+    language: UiLanguage,
+    terminal: &mut TerminalGuard,
+    app: &PickerApp,
+) -> Result<(), TuiError> {
+    terminal
+        .terminal()
+        .draw(|frame| render_for(language, frame, app))
+        .map_err(TuiError::from)?;
     Ok(())
+}
+
+fn render_for(language: UiLanguage, frame: &mut ratatui::Frame<'_>, app: &PickerApp) {
+    with_language(language, || render(frame, app));
+}
+
+fn render(frame: &mut ratatui::Frame<'_>, app: &PickerApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(frame.area());
+    let title = match app.stage {
+        Stage::Providers => tr("pickers.provider_title", "Choose provider"),
+        Stage::Models => tr("pickers.models_title", "Choose models"),
+    };
+    frame.render_widget(
+        Paragraph::new(tr(
+            "pickers.add_hint",
+            "↑/↓ navigate · Enter/→ open · Space mark · Enter confirm · Esc cancel",
+        ))
+        .block(Block::default().borders(Borders::ALL).title(title)),
+        chunks[0],
+    );
+    let theme = style::detect_theme();
+    let lines = match app.stage {
+        Stage::Providers => app
+            .providers
+            .iter()
+            .enumerate()
+            .map(|(i, provider)| {
+                let prefix = if i == app.provider_index {
+                    "› "
+                } else {
+                    "  "
+                };
+                let count = provider.models.len();
+                ratatui::text::Line::styled(
+                    format!(
+                        "{prefix}{}",
+                        tr_args(
+                            "pickers.model_count",
+                            "{provider} ({count} models)",
+                            &[("provider", &provider.id), ("count", &count.to_string())]
+                        )
+                    ),
+                    if i == app.provider_index {
+                        style::selected_style(theme)
+                    } else {
+                        ratatui::style::Style::default()
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+        Stage::Models => app
+            .providers
+            .get(app.provider_index)
+            .map(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .enumerate()
+                    .map(|(i, model)| {
+                        let checked = if provider.selected.contains(model) {
+                            "☑"
+                        } else {
+                            "☐"
+                        };
+                        let prefix = if i == app.model_index { "›" } else { " " };
+                        ratatui::text::Line::styled(
+                            format!("{prefix} {checked} {model}"),
+                            if i == app.model_index {
+                                style::selected_style(theme)
+                            } else {
+                                ratatui::style::Style::default()
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
+        chunks[1],
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError, TestResult};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crossterm::event::KeyModifiers;
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
+    #[test]
+    fn standalone_render_uses_explicit_language_and_preserves_model_selection() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let mut app = PickerApp::new(vec![ModelPickerProvider {
+            id: "提供方-{provider}".into(),
+            models: vec!["模型".into()],
+            selected: BTreeSet::new(),
+        }]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10))
+            .map_err(ctx("test terminal"))?;
+        with_language(UiLanguage::German, || {
+            terminal.draw(|frame| render_for(UiLanguage::English, frame, &app))
+        })
+        .map_err(ctx("draw"))?;
+        assert!(
+            crate::test_support::display_buffer_text(terminal.backend().buffer())
+                .contains("(1 models)")
+        );
+        terminal
+            .draw(|frame| render_for(UiLanguage::Japanese, frame, &app))
+            .map_err(ctx("localized draw"))?;
+        let japanese = crate::test_support::display_buffer_text(terminal.backend().buffer());
+        assert!(japanese.contains("プロバイダーを選択"));
+        assert!(japanese.contains("1 モデル"));
+        assert!(japanese.contains("移動"));
+        assert_eq!(
+            tr("pickers.provider_title", "Choose provider"),
+            "Choose provider"
+        );
+        app.on_key(key(KeyCode::Enter));
+        terminal
+            .draw(|frame| render_for(UiLanguage::Japanese, frame, &app))
+            .map_err(ctx("model-stage draw"))?;
+        let japanese = crate::test_support::display_buffer_text(terminal.backend().buffer());
+        assert!(japanese.contains("モデルを選択"));
+        assert!(japanese.contains("模型"));
+        app.on_key(key(KeyCode::Char(' ')));
+        let outcome = with_language(UiLanguage::Hindi, || app.on_key(key(KeyCode::Enter)))
+            .ok_or(TestError::Missing("selected model"))?;
+        assert_eq!(outcome.provider, "提供方-{provider}");
+        assert_eq!(outcome.models, ["模型"]);
+        Ok(())
+    }
+
     #[test]
     fn space_toggles_and_enter_confirms() -> TestResult {
         let mut app = PickerApp::new(vec![ModelPickerProvider {

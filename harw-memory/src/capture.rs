@@ -922,10 +922,10 @@ fn dedupe_existing(
     }
     // Commit-Punkt: ab hier kein Abbruch mehr.
     deadline.check("dedupe-apply")?;
-    if !conflicts.is_empty() {
-        if let Err(err) = write_conflicts(memories_root, &conflicts, now) {
-            tracing::warn!(error = %err, "memory: widersprüche konnten nicht geschrieben werden");
-        }
+    if !conflicts.is_empty()
+        && let Err(err) = write_conflicts(memories_root, &conflicts, now)
+    {
+        tracing::warn!(error = %err, "memory: widersprüche konnten nicht geschrieben werden");
     }
     let mut written = 0usize;
     for fact in kept.iter().filter(|k| changed.contains(&k.name)) {
@@ -995,10 +995,10 @@ fn run_consolidation(
     let existing = fact_store.list()?;
     let plan = plan_consolidation(&existing, &taken);
 
-    if !plan.conflicts.is_empty() {
-        if let Err(err) = write_conflicts(memories_root, &plan.conflicts, now) {
-            tracing::warn!(error = %err, "memory: widersprüche konnten nicht geschrieben werden");
-        }
+    if !plan.conflicts.is_empty()
+        && let Err(err) = write_conflicts(memories_root, &plan.conflicts, now)
+    {
+        tracing::warn!(error = %err, "memory: widersprüche konnten nicht geschrieben werden");
     }
 
     let mut report = apply_plan(&fact_store, &plan)?;
@@ -1006,10 +1006,10 @@ fn run_consolidation(
     if let Ok(after) = fact_store.list() {
         let hints =
             crate::fact_signals::conflicts_from_feedback(&after, &fact_store.feedback_all());
-        if !hints.is_empty() {
-            if let Err(err) = write_conflicts(memories_root, &hints, now) {
-                tracing::warn!(error = %err, "memory: rückmeldungs-widersprüche nicht geschrieben");
-            }
+        if !hints.is_empty()
+            && let Err(err) = write_conflicts(memories_root, &hints, now)
+        {
+            tracing::warn!(error = %err, "memory: rückmeldungs-widersprüche nicht geschrieben");
         }
     }
     report.merged += dedupe.merged;

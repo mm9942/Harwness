@@ -20,7 +20,7 @@
 //! [`ConversationHistory::to_model_messages`]: crate::history::ConversationHistory::to_model_messages
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use harw_media::MediaSource;
 use harw_protocol::{ImageDetail, MediaRef};
@@ -54,14 +54,6 @@ impl ModelImage {
     }
 }
 
-/// The installed sources, tried in order. More than one can exist in a
-/// process (two embedded runtimes with different homes); every image is
-/// verified against its digest by the source that supplies it, so asking
-/// them all in turn is safe.
-static SOURCES: RwLock<Vec<Arc<dyn MediaSource>>> = RwLock::new(Vec::new());
-
-/// How many sources a process may install.
-const MAX_SOURCES: usize = 16;
 static CACHE: Mutex<Cache> = Mutex::new(Cache::new());
 
 struct Cache {
@@ -104,47 +96,22 @@ impl Cache {
     }
 }
 
-/// Adds a media source to the process (an `Arc` already installed is not added
-/// twice; at most 16 are kept, the oldest is dropped beyond that). The runtime
-/// installs its media store once at start-up; tests install a map.
+/// Registers a source shared with image-producing tools.
 pub fn install_media_source(source: Arc<dyn MediaSource>) {
-    if let Ok(mut sources) = SOURCES.write() {
-        if sources.iter().any(|known| Arc::ptr_eq(known, &source)) {
-            return;
-        }
-        if sources.len() >= MAX_SOURCES {
-            sources.remove(0);
-        }
-        sources.push(source);
-    }
+    harw_media::install_media_source(source);
 }
 
-/// Asks the installed sources in order; the first that has the image wins.
-struct Chain(Vec<Arc<dyn MediaSource>>);
-
-impl MediaSource for Chain {
+struct Installed;
+impl MediaSource for Installed {
     fn load(&self, media: &MediaRef) -> Result<Vec<u8>, harw_media::MediaError> {
-        let mut last = harw_media::MediaError::NotFound;
-        for source in &self.0 {
-            match source.load(media) {
-                Ok(bytes) => return Ok(bytes),
-                Err(error) => last = error,
-            }
-        }
-        Err(last)
+        harw_media::load_installed_media(media)
     }
-}
-
-fn current_source() -> Option<Chain> {
-    let sources = SOURCES.read().ok()?.clone();
-    (!sources.is_empty()).then_some(Chain(sources))
 }
 
 /// Resolves one image through the process media sources.
 #[must_use]
 pub fn resolve_media(media: &MediaRef, detail: Option<ImageDetail>) -> ModelImage {
-    let chain = current_source();
-    resolve_media_with(chain.as_ref().map(|c| c as &dyn MediaSource), media, detail)
+    resolve_media_with(Some(&Installed), media, detail)
 }
 
 /// Resolves one image through `source` (no cache). `None` means no source.
@@ -284,10 +251,6 @@ mod tests {
             Some(&[1, 2, 3, 4][..]),
             "the second source answers"
         );
-        let count = SOURCES
-            .read()
-            .map_or(0, |s| s.iter().filter(|k| Arc::ptr_eq(k, &first)).count());
-        assert_eq!(count, 1, "an installed source is not added twice");
         Ok(())
     }
 }

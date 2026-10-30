@@ -149,10 +149,10 @@ impl fmt::Display for HttpProviderError {
                 message,
             } => {
                 write!(f, "provider returned HTTP {status}")?;
-                if let Some(request_id) = request_id.as_deref().filter(|id| !id.is_empty()) {
-                    if let Some(request_id) = sanitize_diagnostic(request_id) {
-                        write!(f, " (request_id: {request_id})")?;
-                    }
+                if let Some(request_id) = request_id.as_deref().filter(|id| !id.is_empty())
+                    && let Some(request_id) = sanitize_diagnostic(request_id)
+                {
+                    write!(f, " (request_id: {request_id})")?;
                 }
                 if let Some(message) = message.as_deref().and_then(sanitize_diagnostic) {
                     write!(f, ": {message}")?;

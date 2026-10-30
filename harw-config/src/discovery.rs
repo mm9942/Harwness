@@ -243,34 +243,34 @@ impl ResolvedConfig {
     pub fn compute_diagnostics(&self) -> Vec<ConfigDiagnostic> {
         let mut diagnostics = Vec::new();
 
-        if let Some(provider) = &self.harness.default_provider {
-            if !self.providers.contains_key(provider) {
-                diagnostics.push(ConfigDiagnostic::new(
-                    "default_provider",
-                    "provider",
-                    provider,
-                ));
-            }
+        if let Some(provider) = &self.harness.default_provider
+            && !self.providers.contains_key(provider)
+        {
+            diagnostics.push(ConfigDiagnostic::new(
+                "default_provider",
+                "provider",
+                provider,
+            ));
         }
-        if let Some(model) = &self.harness.default_model {
-            if !self.models.contains_key(model) {
-                diagnostics.push(ConfigDiagnostic::new("default_model", "model", model));
-            }
+        if let Some(model) = &self.harness.default_model
+            && !self.models.contains_key(model)
+        {
+            diagnostics.push(ConfigDiagnostic::new("default_model", "model", model));
         }
-        if let Some(provider) = &self.harness.uia_provider {
-            if !self.providers.contains_key(provider) {
-                diagnostics.push(ConfigDiagnostic::new("uia_provider", "provider", provider));
-            }
+        if let Some(provider) = &self.harness.uia_provider
+            && !self.providers.contains_key(provider)
+        {
+            diagnostics.push(ConfigDiagnostic::new("uia_provider", "provider", provider));
         }
-        if let Some(model) = &self.harness.uia_model {
-            if !self.models.contains_key(model) {
-                diagnostics.push(ConfigDiagnostic::new("uia_model", "model", model));
-            }
+        if let Some(model) = &self.harness.uia_model
+            && !self.models.contains_key(model)
+        {
+            diagnostics.push(ConfigDiagnostic::new("uia_model", "model", model));
         }
-        if let Some(model) = &self.harness.uia_worker_model {
-            if !self.models.contains_key(model) {
-                diagnostics.push(ConfigDiagnostic::new("uia_worker_model", "model", model));
-            }
+        if let Some(model) = &self.harness.uia_worker_model
+            && !self.models.contains_key(model)
+        {
+            diagnostics.push(ConfigDiagnostic::new("uia_worker_model", "model", model));
         }
 
         for provider_name in sorted_keys(&self.providers) {
@@ -672,6 +672,40 @@ pub fn discover_config_with_restricted_and_project_settings(
     restricted_repo: Option<&Path>,
     project_settings: Option<&Path>,
 ) -> ConfigResult<ResolvedConfig> {
+    discover_config_inner(layers, restricted_repo, project_settings, None)
+}
+
+/// Resolve a candidate config document before committing it to disk.
+///
+/// The override must name a `config.toml` in an explicitly supplied trusted
+/// layer. No files are written and the usual discovery/merge rules apply.
+/// Callers must authorize the chosen layer before invoking this helper.
+pub fn discover_config_with_override(
+    layers: &[PathBuf],
+    restricted_repo: Option<&Path>,
+    project_settings: Option<&Path>,
+    path: &Path,
+    document: &str,
+) -> ConfigResult<ResolvedConfig> {
+    if !layers.iter().any(|layer| layer.join("config.toml") == path) {
+        return Err(ConfigError::Invalid(
+            "candidate path is not a trusted config layer".to_owned(),
+        ));
+    }
+    discover_config_inner(
+        layers,
+        restricted_repo,
+        project_settings,
+        Some((path, document)),
+    )
+}
+
+fn discover_config_inner(
+    layers: &[PathBuf],
+    restricted_repo: Option<&Path>,
+    project_settings: Option<&Path>,
+    candidate: Option<(&Path, &str)>,
+) -> ConfigResult<ResolvedConfig> {
     let mut resolved = ResolvedConfig::default();
 
     // Env-Layer aus allen Layer-Verzeichnissen laden (letzte gewinnt).
@@ -692,8 +726,14 @@ pub fn discover_config_with_restricted_and_project_settings(
             .filter(|path| path.parent() == Some(base.as_path()) && path.is_file())
             .map(PathBuf::from)
             .unwrap_or_else(|| base.join("config.toml"));
-        if config_path.exists() {
-            let content = read_file(&config_path)?;
+        let override_document = candidate
+            .filter(|(path, _)| *path == config_path)
+            .map(|(_, document)| document);
+        if config_path.exists() || override_document.is_some() {
+            let content = match override_document {
+                Some(document) => document.to_owned(),
+                None => read_file(&config_path)?,
+            };
             // A repository config must not erase profile setup merely by
             // omitting these fields. Explicit values still override the profile.
             let fields: toml::Value =
@@ -794,10 +834,10 @@ pub fn discover_config_with_restricted_and_project_settings(
         discover_channels(base, &mut resolved.channels)?;
     }
 
-    if let Some(repo) = restricted_repo {
-        if !layers.iter().any(|layer| layer == repo) {
-            apply_restricted_layer(repo, &mut resolved)?;
-        }
+    if let Some(repo) = restricted_repo
+        && !layers.iter().any(|layer| layer == repo)
+    {
+        apply_restricted_layer(repo, &mut resolved)?;
     }
 
     compose_legacy_provider_registry(&mut resolved);

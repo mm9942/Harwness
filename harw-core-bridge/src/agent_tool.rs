@@ -1430,7 +1430,10 @@ pub enum ChildReturnContract {
     Text,
     /// Validiertes [`harw_research::ResearchFinding`] als JSON.
     ResearchFinding,
-    /// Validierter [`harw_research::ReturnEnvelope`].
+    /// Validierter [`harw_research::ReturnEnvelope`], zusätzlich durch
+    /// [`harw_research::sanitize_for_parent`] begrenzt: Grenzverstöße sind
+    /// inhaltsfreie Vertragsbrüche, eine zu lange Zusammenfassung wird
+    /// gekürzt und mit `"summary_truncated": true` markiert.
     ReturnEnvelope,
     /// Validiertes [`harw_dod_signals::SecurityVerdict`]
     /// (`harwness.security-verdict/v1`, AW6-02). Siehe Moduldoku oben,
@@ -1563,10 +1566,13 @@ const RAW_EXCERPT_CHARS: usize = 512;
 
 /// Ein gebrochener Return-Contract, aufbereitet für zwei Zielgruppen.
 ///
-/// `raw` ist `None` für [`ChildReturnContract::SecurityVerdict`] (siehe
-/// [`Self::content_free`]): ein Verdikt kann Text tragen, den ein
-/// Triage-Agent aus angreiferkontrollierten Sensorfeldern abgeleitet hat —
-/// eine Ablehnung dieses Arms sagt **dass**, nicht **was** (AW6-02-Auftrag,
+/// `raw` ist `None` für [`ChildReturnContract::SecurityVerdict`] und für
+/// die Grenzverletzungen des [`ChildReturnContract::ReturnEnvelope`]-Arms
+/// (siehe [`Self::content_free`]): ein Verdikt kann Text tragen, den ein
+/// Triage-Agent aus angreiferkontrollierten Sensorfeldern abgeleitet hat,
+/// und ein Kind-Envelope, der die Eltern-Grenze verletzt, darf seinen
+/// Inhalt nicht über den Fehlertext an den Elternagenten tragen — eine
+/// Ablehnung dieser Arme sagt **dass**, nicht **was** (AW6-02-Auftrag,
 /// „Inhaltsfreie Fehlermeldungen").
 struct ContractViolation {
     contract: ChildReturnContract,
@@ -1755,6 +1761,16 @@ fn evaluate_child_return(
             })
         }
         ChildReturnContract::ReturnEnvelope => {
+            // Eltern-Grenze (PL-90 W03d): Nach dem Parsen läuft die Envelope
+            // durch `harw_research::sanitize_for_parent` — Bezeichner,
+            // Listen und Nutzlast sind begrenzt, Steuerzeichen abgelehnt. Der
+            // Parent sieht nur die geprüfte Kopie, nie den Rohtext.
+            // - Verstoß gegen eine Grenze: **inhaltsfreier** Vertragsbruch
+            //   (`content_free`, kein Rohtext-Auszug); die Meldung nennt nur
+            //   Feldnamen und Zählwerte.
+            // - Zu lange Zusammenfassung: kein Vertragsbruch, sondern gekürzt
+            //   (Größen-, kein Vertrauensproblem); das Ergebnis trägt dann
+            //   `"summary_truncated": true`.
             let envelope = harw_research::parse_return_envelope(text).map_err(|error| {
                 ContractViolation::new(
                     contract,
@@ -1762,16 +1778,28 @@ fn evaluate_child_return(
                     text,
                 )
             })?;
-            serde_json::to_value(&envelope).map_err(|error| {
-                ContractViolation::new(
+            let sanitized = harw_research::sanitize_for_parent(envelope).map_err(|error| {
+                ContractViolation::content_free(
+                    contract,
+                    format!("Kind-ReturnEnvelope verletzt die Eltern-Grenze: {error}"),
+                )
+            })?;
+            let mut value = serde_json::to_value(&sanitized.envelope).map_err(|error| {
+                ContractViolation::content_free(
                     contract,
                     format!(
                         "werkzeugseitig: die kanonische Serialisierung des validierten \
                          ReturnEnvelopes schlug fehl: {error}"
                     ),
-                    text,
                 )
-            })
+            })?;
+            match &mut value {
+                Value::Object(fields) if sanitized.summary_truncated => {
+                    fields.insert("summary_truncated".to_owned(), Value::Bool(true));
+                }
+                _ => {}
+            }
+            Ok(value)
         }
         ChildReturnContract::SecurityVerdict => {
             // Inhaltsfrei (siehe `ContractViolation::content_free`): weder
@@ -2437,10 +2465,10 @@ pub(crate) async fn fanout_children_with(
                 winner_decided = true;
                 winner.store(true, Ordering::SeqCst);
                 for (sibling, _) in &running {
-                    if let Some(child) = admitted[*sibling].get() {
-                        if !spawner.request_cancellation(child) {
-                            tracing::warn!(child = %child, "agent_fanout.cancel_channel_missing");
-                        }
+                    if let Some(child) = admitted[*sibling].get()
+                        && !spawner.request_cancellation(child)
+                    {
+                        tracing::warn!(child = %child, "agent_fanout.cancel_channel_missing");
                     }
                 }
             }
@@ -3795,6 +3823,78 @@ specialization = "bridge-contract-test"
         )?;
         assert_eq!(value["agent_id"], "explorer-1");
         assert_eq!(value["outcome"], "success");
+        Ok(())
+    }
+
+    #[test]
+    fn return_envelope_with_oversized_payload_is_a_content_free_violation() -> TestResult {
+        let marker = "GEHEIMER-KIND-INHALT";
+        let blob = format!("{marker}{}", "x".repeat(harw_research::MAX_PAYLOAD_BYTES));
+        let envelope = serde_json::json!({
+            "agent_id": "explorer-1",
+            "outcome": "success",
+            "summary": "fertig",
+            "payload": { "blob": blob },
+        });
+        let output = contract_output(ChildReturnContract::ReturnEnvelope, &envelope.to_string());
+        let value: serde_json::Value = serde_json::from_str(&output.text)
+            .map_err(crate::test_support::ctx("auch der Fehlerfall ist JSON"))?;
+
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("Eltern-Grenze") && m.contains("payload")),
+            "der Vertragsbruch muss die Grenze und das Feld benennen: {value}"
+        );
+        assert_eq!(value["contract"], "harwness.return.envelope@1");
+        assert!(
+            value.get("raw").is_none(),
+            "ein Grenzverstoß darf keinen Rohtext-Auszug tragen: {value}"
+        );
+        assert!(
+            !output.text.contains(marker),
+            "der Report darf keinen Kind-Inhalt wiedergeben: {}",
+            output.text
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn return_envelope_summary_is_truncated_not_refused() -> TestResult {
+        let long_summary = "ä".repeat(harw_research::MAX_SUMMARY_CHARS + 50);
+        let envelope = serde_json::json!({
+            "agent_id": "explorer-1",
+            "outcome": "success",
+            "summary": long_summary,
+            "payload": { "k": 1 },
+        });
+        let output = contract_output(ChildReturnContract::ReturnEnvelope, &envelope.to_string());
+        let value: serde_json::Value = serde_json::from_str(&output.text).map_err(
+            crate::test_support::ctx("die Ausgabe muss gültiges JSON sein"),
+        )?;
+
+        assert!(
+            value.get("error").is_none(),
+            "eine zu lange Zusammenfassung ist kein Vertragsbruch: {value}"
+        );
+        assert_eq!(value["summary_truncated"], serde_json::Value::Bool(true));
+        let summary = value["summary"]
+            .as_str()
+            .ok_or(TestError::Missing("summary muss ein String sein"))?;
+        assert_eq!(summary.chars().count(), harw_research::MAX_SUMMARY_CHARS);
+        assert!(summary.ends_with('…'));
+        assert_eq!(value["agent_id"], "explorer-1");
+        assert_eq!(value["outcome"], "success");
+
+        // Eine kurze Zusammenfassung bleibt unmarkiert.
+        let short = r#"{"agent_id":"explorer-1","outcome":"success",
+            "summary":"fertig","payload":{"k":1}}"#;
+        let short_output = contract_output(ChildReturnContract::ReturnEnvelope, short);
+        let short_value: serde_json::Value = serde_json::from_str(&short_output.text).map_err(
+            crate::test_support::ctx("die Ausgabe muss gültiges JSON sein"),
+        )?;
+        assert!(short_value.get("summary_truncated").is_none());
+        assert_eq!(short_value["summary"], "fertig");
         Ok(())
     }
 

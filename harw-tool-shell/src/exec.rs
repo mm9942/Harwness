@@ -54,11 +54,30 @@
 //!   Fortschrittsbalken), kann dann nicht mehr die Terminalmodi der harw-TUI
 //!   (z. B. Maus-Reporting) verändern. Ohne `setsid` bleibt der bisherige Pfad
 //!   unverändert (`tracing::debug!` einmalig).
+//!
+//! # Sandbox chain (PL-97 E2b)
+//! With [`SandboxExecution::Chain`] (config `[sandbox] execution`, default
+//! `chain`; the runtime assembly passes it through
+//! `HostPermitWiring::with_sandbox_execution`, and
+//! [`SandboxExecution::Legacy`] is only the safe fallback of a provider
+//! built without config, see [`crate::job_spec`]) the sandboxed path
+//! submits `/bin/sh -c <command>` as a workspace sandbox
+//! request to the command port instead of the pre-built `prlimit … --
+//! bwrap …` argv above; see [`crate::job_spec`] for what is submitted and
+//! when a call keeps the legacy path or is refused. The host path is
+//! unchanged and stays the only [`CommandSandbox::Host`] submission of a
+//! model call outside the legacy fallback. A provider with a write scope
+//! ([`ShellToolProvider::with_write_scope`]) never takes the host path: a
+//! call that would run on the host is refused before anything starts.
 
 use crate::host_permit_prompt::{HostPermitPrompt, HostPermitPromptSender, HostPermitVariant};
+use crate::job_spec::{ChainRoute, FallbackNotice, SandboxExecution};
 use crate::limits::{ShellLimits, ShellLimitsError, launch_command};
 use harw_authority::{Permission, SandboxSpec};
-use harw_command::{CommandEnd, CommandRequest, CommandSandbox, Persistence, ResourceRequest};
+use harw_command::{
+    CommandEnd, CommandPort, CommandRequest, CommandSandbox, JobWriteScope, OutputStream,
+    Persistence, ResourceRequest,
+};
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_sandbox::{
     BwrapLauncher, HostApprovalScope, HostPathBinding, HostPermitSessionRegistry,
@@ -304,9 +323,100 @@ pub struct ShellExecutor {
     /// Rückfrage. `None` verhält sich wie jeder andere Modus (Rückfrage
     /// nötig). Auf [`ExecPlatform::Sandboxed`] wirkungslos.
     approval_mode: Option<ApprovalModeCell>,
+    /// PL-97 E2b: Sandbox-Kette oder bisheriger Weg (siehe [`crate::job_spec`]).
+    execution: SandboxExecution,
+    /// Kommando-Port dieses Providers; `None`: der installierte
+    /// ([`harw_command::installed`]).
+    command_port: Option<Arc<dyn CommandPort>>,
+    /// Zugelassener Schreibbereich je Job (vertrauenswürdige Runtime-Eingabe,
+    /// nie ein Tool-Argument); nur die Sandbox-Kette setzt ihn durch.
+    write_scope: Option<JobWriteScope>,
+    /// Einmal-je-Sitzung-Meldung des Rückfalls auf den bisherigen Weg.
+    fallback_notice: Arc<FallbackNotice>,
 }
 
 impl ShellExecutor {
+    /// Der Kommando-Port: der dieses Providers, sonst der installierte.
+    fn port(&self) -> Option<Arc<dyn CommandPort>> {
+        self.command_port.clone().or_else(harw_command::installed)
+    }
+
+    /// Wohin ein Sandbox-Aufruf mit `sandbox` geht (PL-97 E2b): `None` für
+    /// den bisherigen Weg, sonst das Backend der Kette. Ein Aufruf mit
+    /// Schreibbereich, den die Kette nicht durchsetzen kann, wird mit einer
+    /// Fehlermeldung abgelehnt (fail-closed); ein unbeschränkter fällt auf
+    /// den bisherigen Weg zurück (einmal je Sitzung gemeldet).
+    pub(crate) fn chain_route(
+        &self,
+        sandbox: &SandboxSpec,
+        session_id: &str,
+        tool: &str,
+    ) -> Result<Option<harw_command::BackendKind>, String> {
+        // Ein Schreibbereich ohne Schreibrecht auf den Workspace lehnt die
+        // Job-Spezifikation ab; hier mit klarer Meldung, bevor etwas startet.
+        if self.write_scope.is_some()
+            && let Some(reason) = crate::job_spec::scoped_permission_refusal(sandbox)
+        {
+            return Err(crate::job_spec::scoped_refusal(tool, reason));
+        }
+        if self.execution == SandboxExecution::Legacy {
+            if self.write_scope.is_some() {
+                return Err(crate::job_spec::scoped_refusal(
+                    tool,
+                    "[sandbox] execution is \"legacy\"",
+                ));
+            }
+            return Ok(None);
+        }
+        let port = self.port();
+        match crate::job_spec::route(port.as_deref(), crate::job_spec::chain_profile(sandbox)) {
+            ChainRoute::Chain(kind) => {
+                // Ein Schreibbereich braucht `bwrap-trampoline`; jedes andere
+                // Backend würde ihn erst nach der Übergabe ablehnen.
+                if self.write_scope.is_some()
+                    && let Some(reason) = crate::job_spec::scoped_backend_refusal(kind)
+                {
+                    return Err(crate::job_spec::scoped_refusal(tool, &reason));
+                }
+                Ok(Some(kind))
+            }
+            ChainRoute::Fallback(reason) => {
+                if self.write_scope.is_some() {
+                    return Err(crate::job_spec::scoped_refusal(tool, &reason));
+                }
+                self.fallback_notice.note(session_id, tool, &reason);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Die Ablehnung eines Host-Aufrufs mit Schreibbereich (PL-97 E2b,
+    /// fail-closed): der Host-Weg kann keinen Schreibbereich durchsetzen.
+    /// `None` ohne Schreibbereich oder ohne Host-Ausführung.
+    pub(crate) fn host_scope_refusal(&self, effective_host: bool, tool: &str) -> Option<String> {
+        (effective_host && self.write_scope.is_some())
+            .then(|| crate::job_spec::scoped_refusal(tool, crate::job_spec::SCOPED_HOST_REASON))
+    }
+
+    /// Die Ketten-Übergabe eines Aufrufs (PL-97 E2b, [`crate::job_spec`]).
+    pub(crate) fn sandboxed_launch(
+        &self,
+        sandbox: &SandboxSpec,
+        limits: &ShellLimits,
+        tmpfs_size: NonZeroU64,
+        backend: harw_command::BackendKind,
+    ) -> crate::job_spec::SandboxedLaunch {
+        crate::job_spec::sandboxed_launch(
+            sandbox,
+            &self.sandbox_profile,
+            self.host_path.as_ref(),
+            limits,
+            tmpfs_size,
+            self.write_scope.as_ref(),
+            backend,
+        )
+    }
+
     /// Validates caller-controlled arguments and computes the effective timeout.
     ///
     /// Explicit zero values are rejected instead of being passed to the timeout
@@ -384,6 +494,35 @@ impl ShellExecutor {
         (stdout, stderr, stdout_truncated || stderr_truncated)
     }
 
+    /// Hängt den Marker an einen Strom, den der Port bereits gekürzt hat, und
+    /// hält das Ergebnis in `limit` Bytes.
+    ///
+    /// # Description
+    /// [`Self::truncate_output`] hängt den Marker nur an, wenn noch etwas zu
+    /// kürzen ist. Hat der Kommando-Port den Strom selbst gestutzt
+    /// (`CommandEnd::OutputLimit`, oder `truncated` eines nachgelesenen
+    /// Job-Ergebnisses), bleibt nichts zu kürzen, der Leser sähe aber auch
+    /// keinen Schnitt. Welcher Strom das ist, bestimmt der Aufrufer anhand der
+    /// vom Port gemeldeten Herkunft ([`OutputStream`], siehe
+    /// [`Self::completed_output`]), nicht anhand der Länge; diese Funktion
+    /// bekommt nur die Bytes dieses einen Stroms. Passt der Marker hinter den
+    /// vollständigen Strom, wird nichts entfernt; sonst weicht der Präfix um
+    /// die Markerlänge zurück (an einer UTF-8-Grenze); ist `limit` kleiner als
+    /// der Marker, bleibt es beim größten gültigen Präfix ohne Marker.
+    fn cut_with_marker(bytes: &[u8], limit: usize) -> String {
+        if limit < TRUNCATION_MARKER.len() {
+            return Self::truncate_output(bytes, limit).0;
+        }
+        let prefix_limit = (limit - TRUNCATION_MARKER.len()).min(bytes.len());
+        let prefix_end = match std::str::from_utf8(&bytes[..prefix_limit]) {
+            Ok(_) => prefix_limit,
+            Err(error) => error.valid_up_to(),
+        };
+        let mut clipped = String::from_utf8_lossy(&bytes[..prefix_end]).into_owned();
+        clipped.push_str(TRUNCATION_MARKER);
+        clipped
+    }
+
     /// Prüft für Host-Profil-Ausführung, dass ein gültiger Permit den
     /// konkreten Antrag trägt, stellt bei Bedarf einen neuen Permit für
     /// einen bereits sitzungsweit zugestimmten Auftrag aus, oder fragt —
@@ -443,14 +582,14 @@ impl ShellExecutor {
             environment: ProcessEnvironment::LocalHost,
         };
 
-        if let Some(id) = registry.lookup_permit(&request) {
-            if ledger.authorize(id, &request).is_ok() {
-                return Ok(());
-            }
-            // Gemerkter Permit ist abgelaufen oder wurde widerrufen; fällt
-            // unten zur Neubeantragung durch, falls die Sitzung weiterhin
-            // zugestimmt hat oder jetzt gefragt werden kann.
+        if let Some(id) = registry.lookup_permit(&request)
+            && ledger.authorize(id, &request).is_ok()
+        {
+            return Ok(());
         }
+        // Gemerkter Permit ist abgelaufen oder wurde widerrufen; fällt
+        // unten zur Neubeantragung durch, falls die Sitzung weiterhin
+        // zugestimmt hat oder jetzt gefragt werden kann.
 
         if registry.is_session_approved(session_id) {
             return Self::issue_and_remember(
@@ -714,6 +853,16 @@ impl ShellExecutor {
             }
         };
 
+        // PL-97 E2b, fail-closed: ein Aufruf mit Schreibbereich läuft nie
+        // auf dem Host, auch nicht mit Freigabe.
+        if let Some(message) = self.host_scope_refusal(effective_host, TOOL_NAME) {
+            warn!(
+                session_id,
+                "shell.exec refused: write scope on the host path"
+            );
+            return Ok(ToolOutput::error(message));
+        }
+
         if effective_host {
             return self
                 .run_host_command(args, sandbox, effective_timeout, session_id, cancel)
@@ -727,8 +876,62 @@ impl ShellExecutor {
             "shell.exec preparing isolated process"
         );
 
-        let (tmpfs_size, prlimit) = match self.resolve_limits() {
-            Ok(resolved) => resolved,
+        let tmpfs_size = match self.resolve_sandbox_limits() {
+            Ok(tmpfs_size) => tmpfs_size,
+            Err(err) => {
+                let err = ShellExecError::ResourceLimits(err);
+                warn!(error = %err, "shell.exec resource limits unavailable");
+                return Ok(ToolOutput::error(err.to_string()));
+            }
+        };
+
+        // PL-97 E2b: Sandbox-Kette, sofern sie nicht schwächer ist als der
+        // bisherige Weg; ein Aufruf mit Schreibbereich ohne Kette läuft nie.
+        // Erst danach `prlimit`: das Trampolin setzt die rlimits selbst, ein
+        // fehlendes `prlimit` darf diesen Weg nicht versperren.
+        match self.chain_route(sandbox, session_id, TOOL_NAME) {
+            Ok(Some(backend)) => {
+                // Reines Bubblewrap: das Job-Runtime stellt sein `prlimit` vor
+                // `bwrap`; dieselbe Prüfung und Warnung wie bisher. Die
+                // RLIMIT_NPROC-Identität prüft das Job-Runtime selbst, mit
+                // Blick auf das pids.max der Job-Cgroup (PL-97 E2g).
+                if !backend.uses_trampoline() {
+                    match self.limits.resolve_prlimit_without_nproc_identity() {
+                        Ok(Some(_)) => {}
+                        Ok(None) => warn!(
+                            "shell.exec runs WITHOUT rlimits: prlimit missing and require_rlimits=false"
+                        ),
+                        Err(err) => {
+                            let err = ShellExecError::ResourceLimits(err);
+                            warn!(error = %err, "shell.exec resource limits unavailable");
+                            return Ok(ToolOutput::error(err.to_string()));
+                        }
+                    }
+                }
+                return self
+                    .run_chain(
+                        args,
+                        sandbox,
+                        effective_timeout,
+                        tmpfs_size,
+                        backend,
+                        session_id,
+                        cancel,
+                    )
+                    .await;
+            }
+            Ok(None) => {}
+            Err(message) => {
+                warn!(
+                    session_id,
+                    "shell.exec refused: write scope without an enforcing sandbox"
+                );
+                return Ok(ToolOutput::error(message));
+            }
+        }
+
+        let prlimit = match self.limits.resolve_prlimit() {
+            Ok(prlimit) => prlimit,
             Err(err) => {
                 let err = ShellExecError::ResourceLimits(err);
                 warn!(error = %err, "shell.exec resource limits unavailable");
@@ -793,6 +996,55 @@ impl ShellExecutor {
                 cwd: sandbox.workspace().canonical_root().to_path_buf(),
                 limits: ResourceRequest::default(),
                 context: "Bubblewrap",
+                sandbox: CommandSandbox::Host,
+                inherit_env: true,
+            },
+            effective_timeout,
+            session_id,
+            cancel,
+            false,
+        )
+        .await
+    }
+
+    /// Runs `args.command` through the job runtime's sandbox chain (PL-97
+    /// E2b, [`crate::job_spec`]): `/bin/sh -c <command>` as one workspace
+    /// sandbox request on `backend`, with the call's limits as resources
+    /// and the effective timeout as deadline. Output caps, truncation,
+    /// cancel and the result shape are those of [`Self::run_on_port`], as
+    /// for the legacy path.
+    ///
+    /// # Errors
+    /// See [`Self::run_command`].
+    #[allow(clippy::too_many_arguments)]
+    async fn run_chain(
+        &self,
+        args: &ShellExecArgs,
+        sandbox: &SandboxSpec,
+        effective_timeout: u64,
+        tmpfs_size: NonZeroU64,
+        backend: harw_command::BackendKind,
+        session_id: &str,
+        cancel: Option<&CancelToken>,
+    ) -> Result<ToolOutput, ToolsError> {
+        // Runde 5, Teil N: RLIMIT_CPU wächst mit dem gewährten Zeitlimit.
+        let limits = timeouts::limits_for(self.limits, effective_timeout);
+        let (request_sandbox, resources) = self
+            .sandboxed_launch(sandbox, &limits, tmpfs_size, backend)
+            .into_parts();
+        debug!(%backend, "shell.exec submits to the sandbox chain");
+        let shell_args = [OsString::from("-c"), OsString::from(&args.command)];
+        self.run_on_port(
+            PortLaunch {
+                program: std::ffi::OsStr::new(CHAIN_SHELL),
+                args: &shell_args,
+                cwd: sandbox.workspace().canonical_root().to_path_buf(),
+                limits: resources,
+                context: "the sandboxed job",
+                sandbox: request_sandbox,
+                // Die Sandbox setzt ihre eigene Grundumgebung (wie der
+                // bisherige bwrap-Plan mit `--clearenv`).
+                inherit_env: false,
             },
             effective_timeout,
             session_id,
@@ -895,6 +1147,8 @@ impl ShellExecutor {
                     limits.require_rlimits && self.exec_platform == ExecPlatform::Sandboxed,
                 ),
                 context: "host shell",
+                sandbox: CommandSandbox::Host,
+                inherit_env: true,
             },
             effective_timeout,
             session_id,
@@ -922,7 +1176,7 @@ impl ShellExecutor {
         cancel: Option<&CancelToken>,
         executed_on_host: bool,
     ) -> Result<ToolOutput, ToolsError> {
-        let Some(port) = harw_command::installed() else {
+        let Some(port) = self.port() else {
             return Ok(ToolOutput::error(
                 "shell.exec: no job runtime is installed; commands run only through the job runtime",
             ));
@@ -937,10 +1191,14 @@ impl ShellExecutor {
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        request.env = std::env::vars().collect();
+        request.env = if launch.inherit_env {
+            std::env::vars().collect()
+        } else {
+            Vec::new()
+        };
         request.max_output_bytes = self.max_output_bytes;
         request.limits = launch.limits;
-        request.sandbox = CommandSandbox::Host;
+        request.sandbox = launch.sandbox;
         request.persistence = Persistence::Ephemeral;
 
         let done = port.run(request, cancel.cloned().unwrap_or_default()).await;
@@ -970,13 +1228,21 @@ impl ShellExecutor {
                     max_output_bytes = self.max_output_bytes,
                     "shell.exec output limit exceeded; process tree killed"
                 );
-                Ok(self.completed_output(None, &done.stdout, &done.stderr, true, executed_on_host))
+                Ok(self.completed_output(
+                    None,
+                    &done.stdout,
+                    &done.stderr,
+                    true,
+                    done.truncated_stream,
+                    executed_on_host,
+                ))
             }
             CommandEnd::Exited => Ok(self.completed_output(
                 Some(done.exit_code),
                 &done.stdout,
                 &done.stderr,
                 done.truncated,
+                done.truncated_stream,
                 executed_on_host,
             )),
             CommandEnd::Signaled(_) => Ok(self.completed_output(
@@ -984,6 +1250,7 @@ impl ShellExecutor {
                 &done.stdout,
                 &done.stderr,
                 done.truncated,
+                done.truncated_stream,
                 executed_on_host,
             )),
         }
@@ -995,10 +1262,18 @@ impl ShellExecutor {
     /// tmpfs-Größe für bwrap `--size` und den `prlimit`-Pfad (`None` nur, wenn
     /// `require_rlimits == false` und `prlimit` fehlt).
     fn resolve_limits(&self) -> Result<(NonZeroU64, Option<PathBuf>), ShellLimitsError> {
-        self.limits.validate()?;
-        let tmpfs_size = self.limits.tmpfs_size()?;
+        let tmpfs_size = self.resolve_sandbox_limits()?;
         let prlimit = self.limits.resolve_prlimit()?;
         Ok((tmpfs_size, prlimit))
+    }
+
+    /// Wie [`Self::resolve_limits`] ohne die Suche nach `prlimit`: prüft die
+    /// Grenzwerte und liefert die tmpfs-Größe. PL-97 E2b: der Sandbox-Pfad
+    /// sucht `prlimit` erst, wenn feststeht, dass er es braucht (nicht auf
+    /// den Trampolin-Backends der Sandbox-Kette).
+    pub(crate) fn resolve_sandbox_limits(&self) -> Result<NonZeroU64, ShellLimitsError> {
+        self.limits.validate()?;
+        self.limits.tmpfs_size()
     }
 
     /// Wie [`Self::resolve_limits`], aber für den Host-Pfad
@@ -1013,7 +1288,25 @@ impl ShellExecutor {
     /// verhält sich dies byte-identisch zu [`Self::resolve_limits`].
     fn resolve_host_limits(&self) -> Result<(NonZeroU64, Option<PathBuf>), ShellLimitsError> {
         match self.exec_platform {
-            ExecPlatform::Sandboxed => self.resolve_limits(),
+            ExecPlatform::Sandboxed => {
+                // PL-97 E2g: der Host-Pfad ist eine ausdrücklich genehmigte
+                // Ausführung auf dem Host (Host-Permit), wie host.sudo_exec.
+                // Läuft harw als uid 0 oder mit CAP_SYS_RESOURCE/CAP_SYS_ADMIN,
+                // bindet RLIMIT_NPROC dort nie; statt die genehmigte Ausführung
+                // abzulehnen, wird gewarnt und kein Prozessdeckel behauptet.
+                let tmpfs_size = self.resolve_sandbox_limits()?;
+                let prlimit = self.limits.resolve_prlimit_without_nproc_identity()?;
+                let exemption = crate::limits::current_nproc_exemption();
+                if self.limits.nproc != crate::limits::RLIMIT_UNLIMITED
+                    && let Some(reason) = exemption
+                {
+                    warn!(
+                        reason,
+                        "shell.exec host run: RLIMIT_NPROC (nproc) caps nothing for this harw identity"
+                    );
+                }
+                Ok((tmpfs_size, prlimit))
+            }
             ExecPlatform::NoSandbox => {
                 let limits = ShellLimits {
                     require_rlimits: false,
@@ -1031,6 +1324,11 @@ impl ShellExecutor {
     ///
     /// `killed_by_output_limit` ist der Kürzungshinweis für den Aufrufer: Die Ausgabe ist
     /// gekappt **und** das Kommando lief nicht zu Ende; `exit_code` ist dann `-1` (Signal).
+    /// `cut` ist die Herkunft dieses Hinweises: der Strom, den der Kommando-Port als
+    /// erstes gekappt hat (`CommandOutcome::truncated_stream`, ein [`OutputStream`]). Nur
+    /// dieser Strom bekommt den Marker, wenn der Port die Ausgabe selbst auf das Budget
+    /// gestutzt hat; bei `None` (nichts gekürzt oder Herkunft unbekannt) erzwingt die
+    /// Funktion keinen Marker, `truncated` bleibt aber gesetzt.
     /// `executed_on_host` fügt (nur wenn `true`, Plan Teil B1) das Feld
     /// `"executed_on": "host"` hinzu — die bestehende Sandbox-Ausgabe (`false`) bleibt
     /// byte-identisch zu vorher, ohne dieses Feld.
@@ -1040,12 +1338,42 @@ impl ShellExecutor {
         stdout: &[u8],
         stderr: &[u8],
         killed_by_output_limit: bool,
+        cut: Option<OutputStream>,
         executed_on_host: bool,
     ) -> ToolOutput {
         let exit_code = exit_code.unwrap_or(-1);
-        let (stdout_str, stderr_str, truncated) =
+        let (stdout_str, stderr_str, clipped) =
             Self::truncate_combined_output(stdout, stderr, self.max_output_bytes);
-        let truncated = truncated || killed_by_output_limit;
+        let (stdout_str, stderr_str) = if killed_by_output_limit && !clipped {
+            // Der Port hat die Ausgabe selbst gekürzt: hier war nichts mehr zu
+            // kürzen, der Marker fehlte sonst. Das Budget gilt für beide Ströme
+            // zusammen und wird in der Reihenfolge der eintreffenden Frames
+            // verbraucht; die Längen verraten deshalb nicht, welcher Strom
+            // gekappt wurde (ein vollständiger stdout kann länger sein als der
+            // gekappte stderr). Der Port meldet den Strom selbst (`cut`), nur
+            // er trägt den Marker. Ohne Angabe (`None`) bleibt die Ausgabe
+            // unverändert: ein geratener Träger würde einen vollständigen
+            // Strom als gekappt ausgeben; `truncated` bleibt trotzdem gesetzt.
+            // Noch freies Budget wird genutzt, bevor Ausgabe für den Marker
+            // weicht.
+            let spare = self
+                .max_output_bytes
+                .saturating_sub(stdout.len() + stderr.len());
+            match cut {
+                Some(OutputStream::Stdout) => (
+                    Self::cut_with_marker(stdout, stdout.len() + spare),
+                    stderr_str,
+                ),
+                Some(OutputStream::Stderr) => (
+                    stdout_str,
+                    Self::cut_with_marker(stderr, stderr.len() + spare),
+                ),
+                None => (stdout_str, stderr_str),
+            }
+        } else {
+            (stdout_str, stderr_str)
+        };
+        let truncated = clipped || killed_by_output_limit;
 
         info!(
             exit_code,
@@ -1093,7 +1421,15 @@ struct PortLaunch<'a> {
     cwd: PathBuf,
     limits: ResourceRequest,
     context: &'static str,
+    /// [`CommandSandbox::Host`] for the host and legacy paths, a workspace
+    /// sandbox for the chain (PL-97 E2b).
+    sandbox: CommandSandbox,
+    /// Pass harw's own environment (host and legacy paths) instead of none.
+    inherit_env: bool,
 }
+
+/// The shell of the sandbox chain (inside the sandbox; PL-97 E2b).
+const CHAIN_SHELL: &str = "/bin/sh";
 
 /// [`ShellLimits`] as the job runtime's per-process rlimits. `RLIMIT_NPROC`
 /// has no counterpart there (a user-wide ceiling, see [`ShellLimits::nproc`]).
@@ -1330,6 +1666,16 @@ pub struct ShellToolProvider {
     /// Build-/Test-Befehle bekommen ohne Angabe
     /// [`BUILD_COMMAND_DEFAULT_TIMEOUT_SECS`], ebenfalls gedeckelt.
     pub max_timeout_secs: u64,
+    /// PL-97 E2b: Startweg des Sandbox-Pfads ([`Self::with_execution`]).
+    execution: SandboxExecution,
+    /// Eigener Kommando-Port ([`Self::with_command_port`]); `None`: der
+    /// installierte.
+    command_port: Option<Arc<dyn CommandPort>>,
+    /// Schreibbereich je Job ([`Self::with_write_scope`]).
+    write_scope: Option<JobWriteScope>,
+    /// Gemeinsam mit jedem gebauten Executor und `job.start` (Klon des
+    /// Providers): Rückfall-Meldung einmal je Sitzung.
+    fallback_notice: Arc<FallbackNotice>,
 }
 
 impl ShellToolProvider {
@@ -1476,6 +1822,48 @@ impl ShellToolProvider {
         self
     }
 
+    /// Wählt, wie der Sandbox-Pfad Prozesse startet (Konfig `[sandbox]
+    /// execution`, PL-97 E2b, siehe [`crate::job_spec`]). Vorgabe
+    /// [`SandboxExecution::Legacy`] (der bisherige `prlimit … -- bwrap …`-Weg
+    /// für jeden Aufruf) als sichere Rückfallebene eines Providers ohne
+    /// Konfig; die Laufzeit-Komposition reicht `[sandbox] execution`
+    /// (Vorgabe `chain`) über `HostPermitWiring::with_sandbox_execution`
+    /// durch. [`SandboxExecution::Chain`] nimmt die Sandbox-Kette. Der
+    /// Host-Pfad ist davon nicht betroffen.
+    #[must_use]
+    pub fn with_execution(mut self, execution: SandboxExecution) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    /// Der gewählte Startweg ([`Self::with_execution`]).
+    #[must_use]
+    pub fn execution(&self) -> SandboxExecution {
+        self.execution
+    }
+
+    /// Verwendet `port` statt des prozessweit installierten Kommando-Ports
+    /// ([`harw_command::installed`]) für `shell.exec` und die
+    /// Backend-Abfrage von `job.start` (Einbettung, Tests).
+    #[must_use]
+    pub fn with_command_port(mut self, port: Arc<dyn CommandPort>) -> Self {
+        self.command_port = Some(port);
+        self
+    }
+
+    /// Setzt den zugelassenen Schreibbereich je Job (PL-97 E2b, PR #153 W2):
+    /// vertrauenswürdige Runtime-Eingabe, nie ein Tool-Argument. Er reist
+    /// unverändert mit jeder Übergabe von `shell.exec` und `job.start` an
+    /// die Sandbox-Kette und macht sie `required`. Wo die Kette ihn nicht
+    /// durchsetzen kann (kein Bubblewrap-Backend, `legacy`, kein
+    /// Schreibrecht auf den Workspace, Host-Ausführung), wird der Aufruf
+    /// abgelehnt; es startet nichts.
+    #[must_use]
+    pub fn with_write_scope(mut self, scope: JobWriteScope) -> Self {
+        self.write_scope = Some(scope);
+        self
+    }
+
     /// Die Zeitlimit-Politik dieses Providers.
     fn timeout_policy(&self) -> timeouts::TimeoutPolicy {
         timeouts::TimeoutPolicy {
@@ -1502,6 +1890,10 @@ impl ShellToolProvider {
             host_path: self.host_path.clone(),
             exec_platform: self.exec_platform,
             approval_mode: self.approval_mode.clone(),
+            execution: self.execution,
+            command_port: self.command_port.clone(),
+            write_scope: self.write_scope.clone(),
+            fallback_notice: Arc::clone(&self.fallback_notice),
         }
     }
 
@@ -1590,6 +1982,10 @@ impl Default for ShellToolProvider {
             approval_mode: None,
             host_escalation: None,
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
+            execution: SandboxExecution::default(),
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
         }
     }
 }
@@ -1782,6 +2178,10 @@ mod tests {
             host_path: None,
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
+            execution: SandboxExecution::Chain,
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
         };
 
         for command in ["", " ", "\t\n"] {
@@ -1813,6 +2213,10 @@ mod tests {
             host_path: None,
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
+            execution: SandboxExecution::Chain,
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -1842,6 +2246,10 @@ mod tests {
             host_path: None,
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
+            execution: SandboxExecution::Chain,
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -1960,8 +2368,12 @@ mod tests {
             host_path: None,
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
+            execution: SandboxExecution::Chain,
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
         };
-        match executor.completed_output(None, b"", b"", true, false) {
+        match executor.completed_output(None, b"", b"", true, None, false) {
             ToolOutput::Json { content } => {
                 assert_eq!(content["exit_code"], -1);
                 assert_eq!(content["truncated"], true);
@@ -1972,6 +2384,244 @@ mod tests {
                     "expected Json output, got: {other:?}"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// Der Port stutzt die Ausgabe selbst genau auf das Budget: nichts bleibt
+    /// zu kürzen, der Marker muss trotzdem im Budget stehen — auf dem Strom,
+    /// den der Port als gekappt meldet (`cut`); ein kurzer, vollständiger
+    /// stdout bleibt dabei unangetastet, und freies Budget wird vor dem
+    /// Kürzen genutzt.
+    #[test]
+    fn test_completed_output_marks_a_port_cut_with_the_marker() -> TestResult {
+        let limit = TRUNCATION_MARKER.len() + 10;
+        let executor = ShellExecutor {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_bytes: limit,
+            limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
+            execution: SandboxExecution::Chain,
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
+        };
+        let sample = b"this_is_a_longer_string_than_ten_bytes";
+        let cut: Vec<u8> = sample
+            .get(..limit)
+            .ok_or(TestError::Missing("a sample longer than the limit"))?
+            .to_vec();
+        let short = b"ready\n";
+        let flood: Vec<u8> = sample
+            .get(..limit - short.len())
+            .ok_or(TestError::Missing("a flood that fills the rest"))?
+            .to_vec();
+        let cases: [(&[u8], &[u8], OutputStream); 3] = [
+            (cut.as_slice(), b"", OutputStream::Stdout),
+            (b"", cut.as_slice(), OutputStream::Stderr),
+            // Kurzer, vollständiger stdout und eine stderr-Flut: der Marker
+            // gehört auf stderr, stdout bleibt ganz.
+            (short, flood.as_slice(), OutputStream::Stderr),
+        ];
+        for (stdout, stderr, stream) in cases {
+            let ToolOutput::Json { content } =
+                executor.completed_output(None, stdout, stderr, true, Some(stream), false)
+            else {
+                return Err(TestError::Missing("Json output"));
+            };
+            let on_stdout = stream == OutputStream::Stdout;
+            assert_eq!(content["truncated"], true);
+            assert_eq!(content["killed_by_output_limit"], true);
+            let out = content["stdout"].as_str().unwrap_or("");
+            let err = content["stderr"].as_str().unwrap_or("");
+            let (marked, intact, source) = if on_stdout {
+                (out, err, stdout)
+            } else {
+                (err, out, stderr)
+            };
+            // Der gekappte Strom endet mit dem Marker, davor steht ein echter,
+            // nicht leerer Präfix seiner Bytes.
+            let kept = marked
+                .strip_suffix(TRUNCATION_MARKER)
+                .ok_or(TestError::Missing(
+                    "the marker at the end of the cut stream",
+                ))?;
+            assert!(
+                !kept.is_empty() && source.starts_with(kept.as_bytes()),
+                "a prefix of the cut stream: {out:?} / {err:?}"
+            );
+            assert_eq!(
+                intact.as_bytes(),
+                if on_stdout { stderr } else { stdout },
+                "the other stream is untouched"
+            );
+            assert!(
+                out.len() + err.len() <= limit,
+                "within the budget: {out:?} / {err:?}"
+            );
+        }
+        // Freies Budget (z. B. ein nachgelesenes Job-Ergebnis unter dem
+        // Budget): der Marker wird angehängt, ohne Ausgabe zu opfern.
+        let ToolOutput::Json { content } =
+            executor.completed_output(None, b"hello", b"", true, Some(OutputStream::Stdout), false)
+        else {
+            return Err(TestError::Missing("Json output"));
+        };
+        assert_eq!(
+            content["stdout"].as_str().unwrap_or(""),
+            format!("hello{TRUNCATION_MARKER}")
+        );
+        Ok(())
+    }
+
+    /// Ein [`ShellExecutor`] mit dem gegebenen Ausgabe-Budget für die reinen
+    /// `completed_output`-Tests; alles andere bleibt auf den Vorgaben.
+    fn executor_with_output_budget(max_output_bytes: usize) -> ShellExecutor {
+        ShellExecutor {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_bytes,
+            limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
+            exec_platform: ExecPlatform::Sandboxed,
+            approval_mode: None,
+            execution: SandboxExecution::Chain,
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
+        }
+    }
+
+    /// Der Port verbraucht das gemeinsame Budget in der Reihenfolge der
+    /// eintreffenden Frames: ein vollständiger, längerer Strom neben einem
+    /// kürzeren, gekappten Strom ist möglich, in beiden Richtungen. Der Marker
+    /// gehört auf den vom Port gemeldeten Strom (`cut`), nicht auf den
+    /// längeren; der vollständige Strom bleibt Byte für Byte erhalten.
+    #[test]
+    fn test_completed_output_marks_the_reported_stream_not_the_longer_one() -> TestResult {
+        let short_len = TRUNCATION_MARKER.len() + 10;
+        let long_len = short_len + 2;
+        let limit = long_len + short_len;
+        let executor = executor_with_output_budget(limit);
+        let sample = b"this_is_a_longer_string_than_ten_bytes".repeat(2);
+        let long: Vec<u8> = sample
+            .get(..long_len)
+            .ok_or(TestError::Missing("a sample for the complete stream"))?
+            .to_vec();
+        let short: Vec<u8> = sample
+            .get(..short_len)
+            .ok_or(TestError::Missing("a sample for the cut stream"))?
+            .to_vec();
+        // (stdout, stderr, vom Port als gekappt gemeldeter Strom)
+        let cases: [(&[u8], &[u8], OutputStream); 2] = [
+            // Vollständiger, längerer stdout; der Port hat stderr gekappt.
+            (long.as_slice(), short.as_slice(), OutputStream::Stderr),
+            // Gekappter, kürzerer stdout; stderr ist vollständig und länger.
+            (short.as_slice(), long.as_slice(), OutputStream::Stdout),
+        ];
+        for (stdout, stderr, stream) in cases {
+            let ToolOutput::Json { content } =
+                executor.completed_output(None, stdout, stderr, true, Some(stream), false)
+            else {
+                return Err(TestError::Missing("Json output"));
+            };
+            assert_eq!(content["truncated"], true);
+            assert_eq!(content["killed_by_output_limit"], true);
+            let out = content["stdout"]
+                .as_str()
+                .ok_or(TestError::Missing("the stdout string"))?;
+            let err = content["stderr"]
+                .as_str()
+                .ok_or(TestError::Missing("the stderr string"))?;
+            let (marked, intact, cut_bytes, intact_bytes) = match stream {
+                OutputStream::Stdout => (out, err, stdout, stderr),
+                OutputStream::Stderr => (err, out, stderr, stdout),
+            };
+            assert!(
+                intact_bytes.len() > cut_bytes.len(),
+                "the premise: the complete stream is the longer one"
+            );
+            let kept = marked
+                .strip_suffix(TRUNCATION_MARKER)
+                .ok_or(TestError::Missing(
+                    "the marker at the end of the reported stream",
+                ))?;
+            assert!(
+                !kept.is_empty() && cut_bytes.starts_with(kept.as_bytes()),
+                "a prefix of the reported stream: {out:?} / {err:?}"
+            );
+            assert_eq!(
+                intact.as_bytes(),
+                intact_bytes,
+                "the complete stream is byte-identical"
+            );
+            assert!(
+                out.len() + err.len() <= limit,
+                "within the budget: {out:?} / {err:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Meldet der Port keinen Strom (`cut == None`: Herkunft unbekannt), rät
+    /// `completed_output` keinen Träger: kein Marker, beide Ströme bleiben
+    /// unangetastet, `truncated` bleibt wahr.
+    #[test]
+    fn test_completed_output_without_provenance_forces_no_marker() -> TestResult {
+        let limit = TRUNCATION_MARKER.len() + 10;
+        let executor = executor_with_output_budget(limit);
+        let sample = b"this_is_a_longer_string_than_ten_bytes";
+        let full: Vec<u8> = sample
+            .get(..limit)
+            .ok_or(TestError::Missing("a sample that fills the budget"))?
+            .to_vec();
+        let head: Vec<u8> = sample
+            .get(..limit - 8)
+            .ok_or(TestError::Missing("a sample for the larger stream"))?
+            .to_vec();
+        let tail: Vec<u8> = sample
+            .get(..8)
+            .ok_or(TestError::Missing("a sample for the smaller stream"))?
+            .to_vec();
+        let cases: [(&[u8], &[u8]); 2] = [
+            // Ein Strom füllt das ganze Budget.
+            (full.as_slice(), b""),
+            // Beide Ströme teilen sich das volle Budget.
+            (head.as_slice(), tail.as_slice()),
+        ];
+        for (stdout, stderr) in cases {
+            let ToolOutput::Json { content } =
+                executor.completed_output(None, stdout, stderr, true, None, false)
+            else {
+                return Err(TestError::Missing("Json output"));
+            };
+            assert_eq!(content["truncated"], true);
+            assert_eq!(content["killed_by_output_limit"], true);
+            let out = content["stdout"]
+                .as_str()
+                .ok_or(TestError::Missing("the stdout string"))?;
+            let err = content["stderr"]
+                .as_str()
+                .ok_or(TestError::Missing("the stderr string"))?;
+            assert_eq!(out.as_bytes(), stdout, "stdout is untouched");
+            assert_eq!(err.as_bytes(), stderr, "stderr is untouched");
+            assert!(
+                !out.contains(TRUNCATION_MARKER) && !err.contains(TRUNCATION_MARKER),
+                "no marker without a reported stream: {out:?} / {err:?}"
+            );
         }
         Ok(())
     }
@@ -1991,6 +2641,10 @@ mod tests {
             host_path: None,
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
+            execution: SandboxExecution::Chain,
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
         };
         let stdout = b"partial-output-longer-than-budget";
 
@@ -2030,6 +2684,10 @@ mod tests {
             host_path: None,
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
+            execution: SandboxExecution::Chain,
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
         };
         let args = ShellExecArgs {
             command: "echo must_not_run".to_owned(),
@@ -2103,6 +2761,11 @@ mod tests {
     fn sandbox_runtime_available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         *AVAILABLE.get_or_init(|| {
+            // PL-97 E2g: als uid 0 bzw. mit CAP_SYS_ADMIN/CAP_SYS_RESOURCE
+            // deckelt RLIMIT_NPROC nichts; ohne Job-Cgroup lehnt die Kette ab.
+            if crate::limits::real_nproc_exemption().is_some() {
+                return false;
+            }
             let Ok(launcher) = BwrapLauncher::discover() else {
                 return false;
             };
@@ -2226,6 +2889,7 @@ mod tests {
             approval_mode: None,
             host_escalation: None,
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
+            ..ShellToolProvider::default()
         };
         let call = make_call_with_timeout("echo partial_before_timeout; sleep 5", 1);
         let started = std::time::Instant::now();
@@ -2329,6 +2993,7 @@ mod tests {
             approval_mode: None,
             host_escalation: None,
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
+            ..ShellToolProvider::default()
         };
         // Generate more than the configured output cap.
         let call = make_call("echo 'this_is_a_longer_string_than_ten_bytes'");
@@ -2375,6 +3040,7 @@ mod tests {
             approval_mode: None,
             host_escalation: None,
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
+            ..ShellToolProvider::default()
         };
         let started = std::time::Instant::now();
 
@@ -2423,6 +3089,7 @@ mod tests {
             approval_mode: None,
             host_escalation: None,
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
+            ..ShellToolProvider::default()
         };
         // Mit geerbtem Terminal-stdin würde `cat` bis zum Timeout blockieren.
         let call = make_call("cat; echo stdin_reached_eof");
@@ -2447,10 +3114,36 @@ mod tests {
         stdin_is_closed_inside_sandbox
     );
 
+    /// Bisheriger Weg: `prlimit` vor `bwrap` setzt alle fünf rlimits,
+    /// einschließlich `RLIMIT_NPROC`.
     async fn rlimits_and_tmpfs_size_apply_inside_sandbox() -> TestResult {
+        let provider = ShellToolProvider::new().with_execution(SandboxExecution::Legacy);
+        check_rlimits_and_tmpfs(&provider, true).await
+    }
+
+    /// PL-97 E2b/E2f: in der Sandbox-Kette setzen Trampolin oder `prlimit`
+    /// des Job-Runtimes dieselben fünf rlimits, einschließlich
+    /// `RLIMIT_NPROC` (4096, auch ohne Cgroup-Wurzel); `pids.max` der
+    /// Job-Cgroup deckelt die Prozesszahl zusätzlich je Job. Die
+    /// tmpfs-Grenze gilt unverändert.
+    async fn chain_rlimits_and_tmpfs_size_apply_inside_sandbox() -> TestResult {
+        if !chain_available() {
+            eprintln!("übersprungen: der Kommando-Port hat kein Bubblewrap-Backend");
+            return Ok(());
+        }
+        let provider = ShellToolProvider::new().with_execution(SandboxExecution::Chain);
+        check_rlimits_and_tmpfs(&provider, true).await
+    }
+    sandbox_test!(
+        test_exec_chain_rlimits_and_tmpfs_size_apply,
+        test_exec_chain_rlimits_and_tmpfs_size_apply_required,
+        chain_rlimits_and_tmpfs_size_apply_inside_sandbox
+    );
+
+    async fn check_rlimits_and_tmpfs(provider: &ShellToolProvider, nproc: bool) -> TestResult {
         let call = make_call("cat /proc/self/limits; df -B1 /tmp");
 
-        match run_with(&ShellToolProvider::new(), &call).await? {
+        match run_with(provider, &call).await? {
             ToolOutput::Json { content } => {
                 assert_eq!(content["exit_code"], 0, "{content}");
                 let stdout = content["stdout"].as_str().unwrap_or("");
@@ -2459,13 +3152,15 @@ mod tests {
                 let cpu =
                     timeouts::limits_for(ShellLimits::default(), DEFAULT_TIMEOUT_SECS).cpu_secs;
                 let cpu = cpu.to_string();
-                let expected = [
+                let mut expected = vec![
                     ("Max cpu time", cpu.as_str()),
                     ("Max file size", "268435456"),
-                    ("Max processes", "4096"),
                     ("Max open files", "256"),
                     ("Max address space", "2147483648"),
                 ];
+                if nproc {
+                    expected.push(("Max processes", "4096"));
+                }
                 for (label, value) in expected {
                     let line = stdout
                         .lines()
@@ -2517,6 +3212,10 @@ mod tests {
             host_path: None,
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
+            execution: SandboxExecution::Chain,
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
         }
     }
 
@@ -3106,6 +3805,10 @@ mod tests {
             host_path: None,
             exec_platform,
             approval_mode,
+            execution: SandboxExecution::Chain,
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
         }
     }
 
@@ -3213,6 +3916,10 @@ mod tests {
             host_path: None,
             exec_platform: ExecPlatform::Sandboxed,
             approval_mode: None,
+            execution: SandboxExecution::Chain,
+            command_port: None,
+            write_scope: None,
+            fallback_notice: Arc::default(),
         }
     }
 
@@ -3621,6 +4328,666 @@ mod tests {
         );
         Ok(())
     }
+
+    // ── PL-97 E2b: Sandbox-Kette ─────────────────────────────────────────
+
+    use harw_command::{
+        BackendKind, CommandOutcome, CommandPort, RunFuture, SandboxProfileName, StartFuture,
+    };
+    use std::sync::Mutex;
+
+    /// Ein Kommando-Port, der jede Anfrage aufzeichnet, das konfigurierte
+    /// Backend meldet und ein festes Ergebnis liefert.
+    #[derive(Debug)]
+    struct RecordingPort {
+        backend: Option<BackendKind>,
+        outcome: CommandOutcome,
+        requests: Mutex<Vec<CommandRequest>>,
+    }
+
+    impl RecordingPort {
+        fn new(backend: Option<BackendKind>) -> Arc<Self> {
+            Self::with_outcome(backend, exited(0, b"ok\n", b""))
+        }
+
+        fn with_outcome(backend: Option<BackendKind>, outcome: CommandOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                backend,
+                outcome,
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requests(&self) -> TestResult<Vec<CommandRequest>> {
+            self.requests
+                .lock()
+                .map(|requests| requests.clone())
+                .map_err(|_| TestError::Missing("request log"))
+        }
+    }
+
+    impl CommandPort for RecordingPort {
+        fn run(&self, request: CommandRequest, _cancel: CancelToken) -> RunFuture<'_> {
+            if let Ok(mut requests) = self.requests.lock() {
+                requests.push(request);
+            }
+            let outcome = self.outcome.clone();
+            Box::pin(async move { outcome })
+        }
+
+        fn start(&self, request: CommandRequest) -> StartFuture<'_> {
+            if let Ok(mut requests) = self.requests.lock() {
+                requests.push(request);
+            }
+            Box::pin(async { Err("the recording port starts nothing".to_owned()) })
+        }
+
+        fn workspace_backend(&self, _profile: SandboxProfileName) -> Option<BackendKind> {
+            self.backend
+        }
+    }
+
+    fn exited(code: i32, stdout: &[u8], stderr: &[u8]) -> CommandOutcome {
+        CommandOutcome {
+            end: CommandEnd::Exited,
+            exit_code: code,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+            combined: [stdout, stderr].concat(),
+            truncated: false,
+            truncated_stream: None,
+            lagged: 0,
+            elapsed: Duration::from_millis(1),
+        }
+    }
+
+    /// `true`, wenn der installierte Kommando-Port Workspace-Anfragen auf
+    /// einem Bubblewrap-Backend ausführt (dann nimmt `shell.exec` hier die
+    /// Kette).
+    fn chain_available() -> bool {
+        crate::test_support::install_host_port();
+        harw_command::installed()
+            .and_then(|port| port.workspace_backend(SandboxProfileName::NoNetwork))
+            .is_some_and(BackendKind::uses_bwrap)
+    }
+
+    /// Ein Provider ohne `prlimit`-Pflicht, damit die Aufzeichnung nicht vom
+    /// Host abhängt.
+    fn recording_provider(port: &Arc<RecordingPort>) -> ShellToolProvider {
+        let mut provider = ShellToolProvider::new()
+            .with_command_port(Arc::clone(port) as Arc<dyn CommandPort>)
+            .with_execution(SandboxExecution::Chain);
+        provider.limits.require_rlimits = false;
+        provider
+    }
+
+    async fn execute(
+        provider: &ShellToolProvider,
+        permissions: Vec<Permission>,
+        command: &str,
+    ) -> TestResult<(ToolOutput, SandboxSpec)> {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(&tmp, permissions)?;
+        let executor = provider
+            .executor(&ToolName::new(TOOL_NAME))
+            .ok_or(TestError::Missing("executor"))?;
+        let output = executor
+            .execute(&make_ctx(sandbox.clone()), &make_call(command))
+            .await
+            .map_err(ctx("execute"))?;
+        Ok((output, sandbox))
+    }
+
+    #[tokio::test]
+    async fn test_chain_submits_exactly_one_job_spec() -> TestResult {
+        let port = RecordingPort::new(Some(BackendKind::BwrapTrampoline));
+        let provider = recording_provider(&port);
+        let (output, sandbox) = execute(
+            &provider,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+            "echo hi",
+        )
+        .await?;
+        let requests = port.requests()?;
+        let [request] = requests.as_slice() else {
+            return Err(TestError::Unexpected(format!(
+                "expected one request, got {requests:?}"
+            )));
+        };
+        let root = sandbox.workspace().canonical_root();
+        assert_eq!(request.program, "/bin/sh");
+        assert_eq!(request.args, ["-c", "echo hi"]);
+        assert_eq!(request.cwd, root);
+        assert!(
+            request.env.is_empty(),
+            "the sandbox sets its own environment"
+        );
+        assert_eq!(request.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert_eq!(request.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
+        assert_eq!(request.persistence, Persistence::Ephemeral);
+        let limits = timeouts::limits_for(provider.limits, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(request.limits, limits.job_resources());
+        let CommandSandbox::Workspace(workspace) = &request.sandbox else {
+            return Err(TestError::Unexpected(format!("{:?}", request.sandbox)));
+        };
+        assert_eq!(workspace.root, root);
+        assert_eq!(workspace.profile, SandboxProfileName::NoNetwork);
+        assert_eq!(
+            workspace.requirement,
+            harw_command::SandboxRequirement::BestEffort
+        );
+        assert_eq!(workspace.modules, SandboxProfile::Strict);
+        assert_eq!(
+            workspace.tmpfs_size,
+            Some(limits.tmpfs_size().map_err(ctx("tmpfs"))?)
+        );
+        assert_eq!(workspace.write_scope, None);
+
+        let spec = request.job_spec().map_err(TestError::Unexpected)?;
+        assert_eq!(spec.program, "/bin/sh");
+        assert_eq!(spec.args, ["-c", "echo hi"]);
+        assert_eq!(spec.working_dir.as_str(), ".");
+        assert!(spec.env.is_empty());
+        assert_eq!(spec.sandbox_profile, SandboxProfileName::NoNetwork);
+        assert_eq!(spec.sandbox, harw_command::SandboxRequirement::BestEffort);
+        // Kein jobweiter Speicherdeckel (wie bisher nur RLIMIT_AS).
+        assert_eq!(spec.resources.memory_max, None);
+        assert_eq!(spec.resources.address_space_max, Some(limits.as_bytes));
+        assert_eq!(spec.resources.pids_max, Some(4096));
+        // RLIMIT_NPROC wie auf dem bisherigen prlimit-Weg (PL-97 E2f).
+        assert_eq!(spec.resources.process_count_max, Some(4096));
+        assert_eq!(spec.resources.cpu_time_max, Some(limits.cpu_secs));
+        assert_eq!(
+            spec.resources.wall_timeout,
+            Some(jiff::SignedDuration::from_secs(
+                i64::try_from(DEFAULT_TIMEOUT_SECS).map_err(ctx("secs"))?
+            ))
+        );
+
+        // Same result shape as before (no `executed_on`).
+        match output {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["exit_code"], 0);
+                assert_eq!(content["stdout"], "ok\n");
+                assert_eq!(content["truncated"], false);
+                assert!(content.get("executed_on").is_none(), "{content}");
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+
+        // A read-only workspace keeps the network denied as well.
+        let port = RecordingPort::new(Some(BackendKind::Bwrap));
+        execute(
+            &recording_provider(&port),
+            vec![Permission::ExecuteProcess],
+            "true",
+        )
+        .await?;
+        let requests = port.requests()?;
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [request] if matches!(&request.sandbox, CommandSandbox::Workspace(workspace)
+                    if workspace.profile == SandboxProfileName::ReadOnlyAnalysis)
+            ),
+            "{requests:?}"
+        );
+        Ok(())
+    }
+
+    /// PL-97 E2g: on the plain-bwrap chain route `shell.exec` does not check
+    /// harw's own RLIMIT_NPROC identity; the job runtime does, with the job
+    /// cgroup's `pids.max` in view. An exempt harw reaches the runtime.
+    #[tokio::test]
+    async fn test_chain_plain_bwrap_route_leaves_the_nproc_identity_to_the_runtime() -> TestResult {
+        if ShellLimits::default()
+            .resolve_prlimit_without_nproc_identity()
+            .is_err()
+        {
+            eprintln!("skipped: no trusted prlimit at the fixed paths");
+            return Ok(());
+        }
+        let _exempt = crate::limits::test_seam::ExemptIdentity::install(
+            "der harw-Prozess läuft mit realer uid 0",
+        );
+        let port = RecordingPort::new(Some(BackendKind::Bwrap));
+        let mut provider = recording_provider(&port);
+        provider.limits.require_rlimits = true;
+        assert!(provider.limits.resolve_prlimit().is_err());
+        let (output, _sandbox) = execute(
+            &provider,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+            "echo hi",
+        )
+        .await?;
+        match &output {
+            ToolOutput::Json { content } => assert_eq!(content["exit_code"], 0, "{content}"),
+            other => return Err(TestError::Unexpected(format!("refused: {other:?}"))),
+        }
+        assert_eq!(port.requests()?.len(), 1);
+        Ok(())
+    }
+
+    /// PL-97 E2b (PR #154 review): the route is chosen before `prlimit` is
+    /// looked up. On a host without a fixed-path `prlimit` and with
+    /// `require_rlimits = true`, a `bwrap-trampoline` route is not refused
+    /// (the trampoline sets the rlimits itself) and the job spec carries
+    /// the rlimits; a plain Bubblewrap route still needs `prlimit`.
+    #[tokio::test]
+    async fn test_chain_trampoline_route_runs_without_a_fixed_path_prlimit() -> TestResult {
+        let _hidden = crate::limits::test_seam::HiddenPrlimit::install();
+        let required = ShellLimits::default();
+        assert!(required.require_rlimits);
+        assert!(
+            required.resolve_prlimit().is_err(),
+            "the seam must hide prlimit with require_rlimits = true"
+        );
+
+        let port = RecordingPort::new(Some(BackendKind::BwrapTrampoline));
+        let mut provider = recording_provider(&port);
+        provider.limits.require_rlimits = true;
+        let (output, _sandbox) = execute(
+            &provider,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+            "echo hi",
+        )
+        .await?;
+        match &output {
+            ToolOutput::Json { content } => assert_eq!(content["exit_code"], 0, "{content}"),
+            other => return Err(TestError::Unexpected(format!("refused: {other:?}"))),
+        }
+        let requests = port.requests()?;
+        let [request] = requests.as_slice() else {
+            return Err(TestError::Unexpected(format!(
+                "expected one request, got {requests:?}"
+            )));
+        };
+        let limits = timeouts::limits_for(provider.limits, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(request.limits, limits.job_resources());
+        let spec = request.job_spec().map_err(TestError::Unexpected)?;
+        assert!(spec.resources.require_rlimits);
+        assert_eq!(spec.resources.address_space_max, Some(limits.as_bytes));
+        assert_eq!(spec.resources.cpu_time_max, Some(limits.cpu_secs));
+        assert_eq!(spec.resources.file_size_max, Some(limits.fsize_bytes));
+        assert_eq!(
+            spec.resources.open_files_max,
+            u32::try_from(limits.nofile).ok()
+        );
+
+        // Plain Bubblewrap: the runtime puts `prlimit` in front of `bwrap`,
+        // so a missing one still refuses the call before anything starts.
+        let port = RecordingPort::new(Some(BackendKind::Bwrap));
+        let mut provider = recording_provider(&port);
+        provider.limits.require_rlimits = true;
+        let (output, _sandbox) = execute(
+            &provider,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+            "echo hi",
+        )
+        .await?;
+        match &output {
+            ToolOutput::Error { message } => assert!(message.contains("prlimit"), "{message}"),
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        assert!(port.requests()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_chain_results_keep_the_timeout_and_truncation_shape() -> TestResult {
+        let budget = TRUNCATION_MARKER.len() + 4;
+        let cases = [
+            CommandOutcome {
+                end: CommandEnd::TimedOut,
+                exit_code: -1,
+                ..exited(-1, b"partial", b"")
+            },
+            CommandOutcome {
+                end: CommandEnd::OutputLimit,
+                truncated: true,
+                truncated_stream: Some(OutputStream::Stdout),
+                ..exited(-1, b"0123456789012345678901234567890123", b"")
+            },
+        ];
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let args = ShellExecArgs {
+            command: "true".to_owned(),
+            timeout_secs: None,
+        };
+        for outcome in cases {
+            let port = RecordingPort::with_outcome(Some(BackendKind::Bwrap), outcome.clone());
+            let mut provider = recording_provider(&port);
+            provider.max_output_bytes = budget;
+            let reference = provider.build_executor();
+            let output = reference
+                .run_command(&args, &sandbox, "shape-session", None)
+                .await
+                .map_err(ctx("run"))?;
+            assert_eq!(port.requests()?.len(), 1);
+            let expected = match outcome.end {
+                CommandEnd::TimedOut => reference.timeout_output(
+                    reference.timeout_secs,
+                    &outcome.stdout,
+                    &outcome.stderr,
+                    false,
+                ),
+                _ => reference.completed_output(
+                    None,
+                    &outcome.stdout,
+                    &outcome.stderr,
+                    true,
+                    outcome.truncated_stream,
+                    false,
+                ),
+            };
+            assert_eq!(
+                serde_json::to_value(&output).map_err(ctx("output"))?,
+                serde_json::to_value(&expected).map_err(ctx("expected"))?,
+                "{:?}",
+                outcome.end
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_mode_submits_the_prebuilt_bwrap_argv() -> TestResult {
+        if BwrapLauncher::discover().is_err() {
+            eprintln!("übersprungen: kein vertrauenswürdiges bwrap");
+            return Ok(());
+        }
+        let port = RecordingPort::new(Some(BackendKind::BwrapTrampoline));
+        let provider = recording_provider(&port).with_execution(SandboxExecution::Legacy);
+        assert_eq!(provider.execution(), SandboxExecution::Legacy);
+        execute(&provider, vec![Permission::ExecuteProcess], "echo legacy").await?;
+        let requests = port.requests()?;
+        let [request] = requests.as_slice() else {
+            return Err(TestError::Unexpected(format!("{requests:?}")));
+        };
+        assert_eq!(request.sandbox, CommandSandbox::Host);
+        assert!(
+            request.program.ends_with("prlimit") || request.program.ends_with("bwrap"),
+            "{}",
+            request.program
+        );
+        assert!(request.args.iter().any(|arg| arg == "--unshare-all"));
+        assert!(request.args.iter().any(|arg| arg == "echo legacy"));
+        assert!(
+            !request.env.is_empty(),
+            "the legacy request carries harw's env"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_scoped_call_without_an_enforcing_backend_starts_nothing() -> TestResult {
+        let scope = JobWriteScope::new(["/nonexistent/src"]).map_err(ctx("scope"))?;
+        let cases = [
+            (
+                Some(BackendKind::LandlockTrampoline),
+                SandboxExecution::Chain,
+            ),
+            (Some(BackendKind::None), SandboxExecution::Chain),
+            (None, SandboxExecution::Chain),
+            (Some(BackendKind::BwrapTrampoline), SandboxExecution::Legacy),
+        ];
+        let writable = vec![Permission::ExecuteProcess, Permission::WriteWorkspace];
+        for (backend, execution) in cases {
+            let port = RecordingPort::new(backend);
+            let provider = recording_provider(&port)
+                .with_write_scope(scope.clone())
+                .with_execution(execution);
+            let (output, _) = execute(&provider, writable.clone(), "touch x").await?;
+            assert_scoped_refusal(&output, "write scope")?;
+            assert!(port.requests()?.is_empty(), "{backend:?} {execution:?}");
+        }
+        // Ohne Schreibrecht auf den Workspace: abgelehnt, auch auf
+        // `bwrap-trampoline` (die Job-Spezifikation verlangt es).
+        let port = RecordingPort::new(Some(BackendKind::BwrapTrampoline));
+        let provider = recording_provider(&port).with_write_scope(scope);
+        let (output, _) = execute(&provider, vec![Permission::ExecuteProcess], "touch x").await?;
+        assert_scoped_refusal(&output, "no workspace write access")?;
+        assert!(port.requests()?.is_empty());
+        Ok(())
+    }
+
+    fn assert_scoped_refusal(output: &ToolOutput, reason: &str) -> TestResult {
+        match output {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("write scope"), "{message}");
+                assert!(message.contains(reason), "{message}");
+                assert!(message.contains("nothing was started"), "{message}");
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    /// PL-97 E2b, fail-closed: ein Anbieter mit Schreibbereich läuft nie auf
+    /// dem Host — weder mit Sitzungsfreigabe noch auf `NoSandbox` mit
+    /// `FullAccess`; der Port bekommt keine Anfrage.
+    #[tokio::test]
+    async fn test_scoped_call_never_takes_the_host_path() -> TestResult {
+        let scope = JobWriteScope::new(["/nonexistent/src"]).map_err(ctx("scope"))?;
+        let writable = vec![Permission::ExecuteProcess, Permission::WriteWorkspace];
+
+        // Sitzungsfreigabe (Host-Phase) auf einer Sandbox-Plattform.
+        let port = RecordingPort::new(Some(BackendKind::BwrapTrampoline));
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(&tmp, writable.clone())?;
+        let context = make_ctx(sandbox);
+        registry.mark_session_approved(context.session_id().as_str());
+        let provider = recording_provider(&port)
+            .with_host_permit_registry(Arc::clone(&registry))
+            .with_write_scope(scope.clone());
+        let executor = provider
+            .executor(&ToolName::new(TOOL_NAME))
+            .ok_or(TestError::Missing("executor"))?;
+        let output = executor
+            .execute(&context, &make_call("touch x"))
+            .await
+            .map_err(ctx("execute"))?;
+        assert_scoped_refusal(&output, "host execution")?;
+        assert!(port.requests()?.is_empty());
+
+        // `NoSandbox` mit `FullAccess`: Host ohne Rückfrage.
+        let port = RecordingPort::new(Some(BackendKind::BwrapTrampoline));
+        let provider = recording_provider(&port)
+            .with_exec_platform(ExecPlatform::NoSandbox)
+            .with_approval_mode(ApprovalModeCell::new(ApprovalMode::FullAccess))
+            .with_write_scope(scope);
+        let (output, _) = execute(&provider, writable, "touch x").await?;
+        assert_scoped_refusal(&output, "host execution")?;
+        assert!(port.requests()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_scoped_call_carries_its_scope_as_required() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(
+            &tmp,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+        )?;
+        let scope = JobWriteScope::new([sandbox.workspace().canonical_root().join("src")])
+            .map_err(ctx("scope"))?;
+        let port = RecordingPort::new(Some(BackendKind::BwrapTrampoline));
+        let provider = recording_provider(&port).with_write_scope(scope.clone());
+        let executor = provider
+            .executor(&ToolName::new(TOOL_NAME))
+            .ok_or(TestError::Missing("executor"))?;
+        executor
+            .execute(&make_ctx(sandbox), &make_call("true"))
+            .await
+            .map_err(ctx("execute"))?;
+        let requests = port.requests()?;
+        let [request] = requests.as_slice() else {
+            return Err(TestError::Unexpected(format!("{requests:?}")));
+        };
+        let CommandSandbox::Workspace(workspace) = &request.sandbox else {
+            return Err(TestError::Unexpected(format!("{:?}", request.sandbox)));
+        };
+        assert_eq!(workspace.write_scope.as_ref(), Some(&scope));
+        let spec = request.job_spec().map_err(TestError::Unexpected)?;
+        assert_eq!(spec.sandbox, harw_command::SandboxRequirement::Required);
+        assert_eq!(spec.write_scope, Some(scope));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unscoped_call_without_bwrap_backend_keeps_the_legacy_path() -> TestResult {
+        if BwrapLauncher::discover().is_err() {
+            eprintln!("übersprungen: kein vertrauenswürdiges bwrap");
+            return Ok(());
+        }
+        let port = RecordingPort::new(Some(BackendKind::LandlockTrampoline));
+        let provider = recording_provider(&port);
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let context = make_ctx(sandbox);
+        let executor = provider
+            .executor(&ToolName::new(TOOL_NAME))
+            .ok_or(TestError::Missing("executor"))?;
+        for _ in 0..2 {
+            executor
+                .execute(&context, &make_call("true"))
+                .await
+                .map_err(ctx("execute"))?;
+        }
+        let requests = port.requests()?;
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.sandbox == CommandSandbox::Host),
+            "{requests:?}"
+        );
+        // Logged for the first call of the session only.
+        assert!(
+            !provider
+                .fallback_notice
+                .note(context.session_id().as_str(), TOOL_NAME, "again")
+        );
+        Ok(())
+    }
+
+    /// Dieselben Befehle über die echte Kette und den bisherigen Weg liefern
+    /// dasselbe Ergebnis (Exit-Code, Ausgabe, Kürzung).
+    async fn chain_and_legacy_results_match() -> TestResult {
+        if !chain_available() {
+            eprintln!("übersprungen: der Kommando-Port hat kein Bubblewrap-Backend");
+            return Ok(());
+        }
+        let small = ShellToolProvider {
+            max_output_bytes: TRUNCATION_MARKER.len() + 10,
+            ..ShellToolProvider::default()
+        }
+        .with_execution(SandboxExecution::Chain);
+        let chain = || ShellToolProvider::new().with_execution(SandboxExecution::Chain);
+        let cases = [
+            (chain(), "echo out; echo err >&2; exit 3"),
+            (chain(), "pwd; ls -a | head -1"),
+            (small, "echo 'this_is_a_longer_string_than_ten_bytes'"),
+        ];
+        for (provider, command) in cases {
+            let chain = run_with(&provider, &make_call(command)).await?;
+            let legacy = run_with(
+                &provider.clone().with_execution(SandboxExecution::Legacy),
+                &make_call(command),
+            )
+            .await?;
+            match (&chain, &legacy) {
+                (ToolOutput::Json { content: a }, ToolOutput::Json { content: b }) => {
+                    for key in ["exit_code", "stderr", "truncated", "killed_by_output_limit"] {
+                        assert_eq!(a[key], b[key], "{command}: {key}");
+                    }
+                    // `pwd` names each call's own temporary workspace.
+                    if !command.starts_with("pwd") {
+                        assert_eq!(a["stdout"], b["stdout"], "{command}");
+                    }
+                }
+                other => return Err(TestError::Unexpected(format!("{command}: {other:?}"))),
+            }
+        }
+        Ok(())
+    }
+    sandbox_test!(
+        test_exec_chain_and_legacy_results_match,
+        test_exec_chain_and_legacy_results_match_required,
+        chain_and_legacy_results_match
+    );
+
+    /// PL-97 E2 (Plan §3.4): zwei Worker mit Schreibbereich über
+    /// Geschwister-Verzeichnissen auf `bwrap-trampoline`. Ein Schreibversuch
+    /// von A auf B's Datei scheitert vor jeder Änderung; innerhalb von A's
+    /// Bereich gelingt er.
+    async fn scoped_worker_cannot_write_its_siblings_file() -> TestResult {
+        crate::test_support::install_host_port();
+        let backend = harw_command::installed()
+            .and_then(|port| port.workspace_backend(SandboxProfileName::NoNetwork));
+        if backend != Some(BackendKind::BwrapTrampoline) {
+            eprintln!("übersprungen: der Kommando-Port hat kein bwrap-trampoline ({backend:?})");
+            return Ok(());
+        }
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(
+            &tmp,
+            vec![Permission::ExecuteProcess, Permission::WriteWorkspace],
+        )?;
+        let root = sandbox.workspace().canonical_root().to_path_buf();
+        for worker in ["a", "b"] {
+            fs::create_dir_all(root.join(worker)).map_err(ctx("worker dir"))?;
+        }
+        let sibling = root.join("b").join("file");
+        fs::write(&sibling, "original").map_err(ctx("sibling file"))?;
+        let worker = |dir: &str| -> TestResult<ShellToolProvider> {
+            let scope = JobWriteScope::new([root.join(dir)]).map_err(ctx("scope"))?;
+            Ok(ShellToolProvider::new()
+                .with_execution(SandboxExecution::Chain)
+                .with_write_scope(scope))
+        };
+        let context = make_ctx(sandbox.clone());
+        let run = |provider: ShellToolProvider, command: &'static str| {
+            let context = context.clone();
+            async move {
+                let executor = provider
+                    .executor(&ToolName::new(TOOL_NAME))
+                    .ok_or(TestError::Missing("executor"))?;
+                executor
+                    .execute(&context, &make_call(command))
+                    .await
+                    .map_err(ctx("execute"))
+            }
+        };
+        let exit_code = |output: &ToolOutput| match output {
+            ToolOutput::Json { content } => content["exit_code"].as_i64(),
+            _ => None,
+        };
+
+        let denied = run(worker("a")?, "echo changed > b/file").await?;
+        assert_ne!(exit_code(&denied), Some(0), "{denied:?}");
+        assert_eq!(
+            fs::read_to_string(&sibling).map_err(ctx("read sibling"))?,
+            "original"
+        );
+        let allowed = run(worker("a")?, "echo mine > a/file").await?;
+        assert_eq!(exit_code(&allowed), Some(0), "{allowed:?}");
+        assert_eq!(
+            fs::read_to_string(root.join("a").join("file")).map_err(ctx("read own"))?,
+            "mine\n"
+        );
+        // B darf seine eigene Datei schreiben.
+        let own = run(worker("b")?, "echo b > b/file").await?;
+        assert_eq!(exit_code(&own), Some(0), "{own:?}");
+        Ok(())
+    }
+    sandbox_test!(
+        test_exec_chain_scoped_sibling_write_is_denied,
+        test_exec_chain_scoped_sibling_write_is_denied_required,
+        scoped_worker_cannot_write_its_siblings_file
+    );
 }
 
 #[cfg(test)]

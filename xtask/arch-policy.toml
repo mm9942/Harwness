@@ -105,6 +105,9 @@ layer = "F"
 layer = "F"
 [packages."harw-tui-layout"]
 layer = "F"
+# Reines Step-/TODO-Datenmodell (nur serde und serde_json), von harw-tui gelesen (h21).
+[packages."harw-step-list"]
+layer = "F"
 
 # --- C: compiler domain ----------------------------------------------------
 [packages."harw-agent-dsl"]
@@ -147,6 +150,12 @@ layer = "I"
 layer = "I"
 [packages."harw-catalog"]
 layer = "I"
+# PL-97 M1: reine Vokabular-/Reducer-Crate (serde, serde_json), von TUI/Registry konsumiert.
+[packages."harw-activity"]
+layer = "I"
+# PL-97 D2: lesender Harw-DoD-Client (harw-dod-config ist Ring D, daher Ring A).
+[packages."harw-dod-client"]
+layer = "A"
 [packages."harw-config"]
 layer = "I"
 [packages."harw-home"]
@@ -393,6 +402,20 @@ layer = "A"
 layer = "A"
 [packages."harw-tool-tunnel"]
 layer = "A"
+# Obsidian-Vault-Werkzeuge (Tool-Provider wie die übrigen harw-tool-*).
+[packages."harw-tool-obsidian"]
+layer = "A"
+# Cloud-Home-Stack (Enrollment, Gateway, Ops, Steuer-CLI): Anwendung.
+[packages."harw-cloud"]
+layer = "A"
+[packages."harw-cloud-enroll"]
+layer = "A"
+[packages."harw-cloud-gateway"]
+layer = "A"
+[packages."harw-cloud-ops"]
+layer = "A"
+[packages."harw-cloudctl"]
+layer = "A"
 [packages."harw-tool-web"]
 layer = "A"
 [packages."harw-tui"]
@@ -402,6 +425,8 @@ layer = "A"
 [packages."harw-tool-remote"]
 layer = "A"
 [packages."harw-session-ws"]
+layer = "A"
+[packages."harw-session-com"]
 layer = "A"
 [packages."harw-session-remote"]
 layer = "A"
@@ -414,6 +439,10 @@ layer = "A"
 [packages."harw-mobile-core"]
 layer = "A"
 [packages."harw-mobile-term"]
+layer = "A"
+[packages."harw-reverse-proxy"]
+layer = "A"
+[packages."harw-session-daemon"]
 layer = "A"
 [packages."harw-tailscale"]
 layer = "A"
@@ -489,14 +518,10 @@ names = ["hyper", "tungstenite", "tokio-tungstenite", "harw-node-transport", "ha
 packages = ["harw-protocol"]
 reason = "W00 §2.1/ARC-01: harw-protocol has no async runtime or network transport dependency"
 
-[packages."harw-session-com"]
-layer = "A"
-
-[packages."harw-session-daemon"]
-layer = "A"
-
-[packages."harw-reverse-proxy"]
-layer = "A"
+[[forbidden_crates]]
+names = ["harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs"]
+packages = ["harw-dod-client"]
+reason = "PL-97 §3.1 / S1: the read-only Harw-DoD client never links the Warden, the escalation ladder or a DoD daemon"
 
 [packages."harw-context-ledger"]
 layer = "I"

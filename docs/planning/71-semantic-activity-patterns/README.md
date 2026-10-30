@@ -1,6 +1,6 @@
 # PL-71 — Semantic Activity Patterns
 
-> **Status:** DRAFT / planning only  
+> **Status:** PARTIALLY LANDED (2026-10-29, PL-97 X1) — the `harw-activity` crate with the v1 patterns `file-read-burst@1`, `file-edit-read-loop@1`, `job-lifecycle@1`, `agent-role-failure-burst@1` and `standalone@1` (PL-97 M1 `27ea6e10`, fixtures `a7111029`), `#[tool(activity(...), skill = "...")]` and `permission_request!` (M2 `47a0720e`, first migration wave: `harw-tool-fs`), `activity_for(tool)` in the registry and the TUI adapter `harw-tui/src/app/activity_glue.rs` (M3 `703d9745` + `2ce5b2fd`) on draft PR #154; test names in [PL-97 §9.1](../97-harw-dod-mission-control-chain/README.md#9-landed-state-x1-2026-10-29). Open: further descriptor migration waves, the `permission_request!` call site in the operation framework, derivation/skills (05) and the integrations of 06 beyond the TUI history.
 > **Pinned baseline:** `mm9942/Harwness@153da05518cfd2cceb2cda738f9417cdf1653035` (`dev`)  
 > **Scope:** semantic activity patterns, derivation graph, live projections, macro metadata, job/agent/tool/chain integration  
 > **Non-goal:** changing runtime authority or deleting raw events

@@ -198,6 +198,31 @@ impl<R> RecordStore<R> {
         Ok(())
     }
 
+    /// Publishes a sidecar after a last-moment authority check.
+    ///
+    /// The caller must hold the owning record lock for the entire call.
+    /// `commit_ok` runs after the temporary file is synced, immediately
+    /// before rename. Refusal leaves the previous sidecar unchanged.
+    /// This is not a transaction with the owning record.
+    ///
+    /// # Errors
+    /// Invalid kind/id, I/O errors, or the caller's commit refusal.
+    pub fn write_sidecar_checked<E: From<StoreError>>(
+        &self,
+        kind: &str,
+        id: &str,
+        bytes: &[u8],
+        commit_ok: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let kind = sidecar_kind(kind)?;
+        let id = validate_id(id)?;
+        self.root.create_dir_all(kind).map_err(StoreError::from)?;
+        // Persist a newly created sidecar directory before publishing into it.
+        fsops::sync_dir(&self.root).map_err(StoreError::from)?;
+        let dir = self.root.open_dir(kind).map_err(StoreError::from)?;
+        fsops::replace_atomic_checked(&dir, &record_name(id), id, bytes, "sidecar", commit_ok)
+    }
+
     /// Reads sidecar `<kind>/<id>.json`; `Ok(None)` if absent. Lock-free.
     ///
     /// # Errors
@@ -316,17 +341,43 @@ impl<R: StoreRecord> RecordStore<R> {
         E: From<StoreError>,
         F: FnOnce(&mut R) -> Result<T, E>,
     {
-        let id = validate_id(id)?;
-        self.ensure_layout()?;
-        let lock = self.lock_valid(id)?;
-        let result = self.update_under_lock(id, operation);
-        lock.finish(result)
+        self.update_locked_checked(id, operation, || Ok(()))
     }
 
-    fn update_under_lock<T, E, F>(&self, id: &str, operation: F) -> Result<T, E>
+    /// [`RecordStore::update_locked`] with a commit authority checked at the
+    /// last possible moment: `commit_ok` runs after `operation` succeeded and
+    /// after the new record is written to its temp file and `sync_all`ed,
+    /// immediately before the rename that publishes it. A refusal (e.g. a
+    /// lease deadline that a slow fsync crossed) removes the temp file,
+    /// leaves the record unchanged and is returned. After `commit_ok`
+    /// returns `Ok` nothing can be refused any more: the rename is atomic.
+    ///
+    /// # Errors
+    /// Whatever `operation` or `commit_ok` returns, plus every error of
+    /// [`RecordStore::update_locked`].
+    pub fn update_locked_checked<T, E, F, C>(
+        &self,
+        id: &str,
+        operation: F,
+        commit_ok: C,
+    ) -> Result<T, E>
     where
         E: From<StoreError>,
         F: FnOnce(&mut R) -> Result<T, E>,
+        C: FnOnce() -> Result<(), E>,
+    {
+        let id = validate_id(id)?;
+        self.ensure_layout()?;
+        let lock = self.lock_valid(id)?;
+        let result = self.update_under_lock(id, operation, commit_ok);
+        lock.finish(result)
+    }
+
+    fn update_under_lock<T, E, F, C>(&self, id: &str, operation: F, commit_ok: C) -> Result<T, E>
+    where
+        E: From<StoreError>,
+        F: FnOnce(&mut R) -> Result<T, E>,
+        C: FnOnce() -> Result<(), E>,
     {
         let records = self.records_dir()?;
         let mut record = match read_record::<R>(&records, id) {
@@ -339,8 +390,7 @@ impl<R: StoreRecord> RecordStore<R> {
         };
         let output = operation(&mut record)?;
         let bytes = encode(id, &record)?;
-        fsops::replace_atomic(&records, &record_name(id), id, &bytes, "record")
-            .map_err(StoreError::Io)?;
+        fsops::replace_atomic_checked(&records, &record_name(id), id, &bytes, "record", commit_ok)?;
         Ok(output)
     }
 
@@ -562,5 +612,140 @@ fn quarantine_logged(records: &Dir, id: &str) {
             error = %error,
             "corrupt record could not be quarantined"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::path::Path;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{RECORDS_DIR, RecordStore, StoreRecord};
+    use crate::error::StoreError;
+    use crate::fsops::temp_owner;
+    use crate::test_support::{TestError, TestResult};
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Counter {
+        id: String,
+        value: u64,
+    }
+
+    impl StoreRecord for Counter {
+        fn record_id(&self) -> &str {
+            &self.id
+        }
+    }
+
+    /// Error of a checked update in these tests: the store's own, or the
+    /// commit authority's refusal, returned verbatim.
+    #[derive(Debug)]
+    enum Outcome {
+        Store(StoreError),
+        Refused(&'static str),
+    }
+
+    impl From<StoreError> for Outcome {
+        fn from(error: StoreError) -> Self {
+            Self::Store(error)
+        }
+    }
+
+    fn entry_names(dir: &Path) -> TestResult<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    #[test]
+    fn sidecar_commit_veto_keeps_previous_bytes_and_cleans_temp() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store: RecordStore<Counter> = RecordStore::create_ambient(temp.path())?;
+        store.write_sidecar("state", "c-1", b"old")?;
+        let dir = temp.path().join("state");
+        let before = entry_names(&dir)?;
+        let refused: Result<(), Outcome> =
+            store.write_sidecar_checked("state", "c-1", b"new", || {
+                let names = entry_names(&dir).map_err(|_| Outcome::Refused("read failed"))?;
+                assert!(names.iter().any(|name| temp_owner(name) == Some("c-1")));
+                Err(Outcome::Refused("expired after sync"))
+            });
+        assert!(matches!(
+            refused,
+            Err(Outcome::Refused("expired after sync"))
+        ));
+        assert_eq!(store.read_sidecar("state", "c-1")?, Some(b"old".to_vec()));
+        assert_eq!(entry_names(&dir)?, before);
+        store.write_sidecar_checked::<StoreError>("state", "c-1", b"new", || Ok(()))?;
+        assert_eq!(store.read_sidecar("state", "c-1")?, Some(b"new".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_commit_refused_after_the_temp_sync_publishes_nothing() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store: RecordStore<Counter> =
+            RecordStore::create_ambient(&temp.path().join("counters"))?;
+        store.create(&Counter {
+            id: "c-1".to_owned(),
+            value: 1,
+        })?;
+        let records = temp.path().join("counters").join(RECORDS_DIR);
+        let before = entry_names(&records)?;
+        let mutated = Cell::new(false);
+        let temp_seen = Cell::new(false);
+
+        let refused: Result<(), Outcome> = store.update_locked_checked(
+            "c-1",
+            |counter| {
+                counter.value = 2;
+                mutated.set(true);
+                Ok(())
+            },
+            || {
+                // The closure ran and the new record sits synced in its temp
+                // file; the commit authority is gone now.
+                let names = entry_names(&records).map_err(|_| Outcome::Refused("unreadable"))?;
+                temp_seen.set(names.iter().any(|name| temp_owner(name) == Some("c-1")));
+                Err(Outcome::Refused("deadline passed during the fsync"))
+            },
+        );
+
+        assert!(
+            matches!(
+                refused,
+                Err(Outcome::Refused("deadline passed during the fsync"))
+            ),
+            "{refused:?}"
+        );
+        assert!(mutated.get(), "the refusal came after the mutation");
+        assert!(
+            temp_seen.get(),
+            "the hook ran after the temp file was written"
+        );
+        assert_eq!(store.load("c-1")?.value, 1, "nothing was published");
+        assert_eq!(entry_names(&records)?, before, "no temp file remains");
+
+        // The lock was released; an accepting authority publishes as before.
+        let accepted: Result<(), Outcome> = store.update_locked_checked(
+            "c-1",
+            |counter| {
+                counter.value = 3;
+                Ok(())
+            },
+            || Ok(()),
+        );
+        accepted.map_err(|error| match error {
+            Outcome::Store(error) => TestError::Store(error),
+            Outcome::Refused(reason) => TestError::Unexpected(reason.to_owned()),
+        })?;
+        assert_eq!(store.load("c-1")?.value, 3);
+        assert_eq!(entry_names(&records)?, before);
+        Ok(())
     }
 }

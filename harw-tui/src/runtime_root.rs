@@ -651,6 +651,11 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         None => (crate::keybindings::KeyBindings::default(), None),
     };
     app.set_key_bindings(key_bindings.clone());
+    // PL-97 C4b: fester Not-Aus (2× Ctrl+C). Ein Griff für den Eingabe-Thread
+    // und die ganze Sitzungskette; er stoppt Jobs über den Job-Pfad, beendet
+    // den übrigen Prozessbaum und erzwingt Exit-Code 130 (`crate::hard_kill`).
+    let hard_kill = crate::hard_kill::HardKill::live();
+    bind_hard_kill(&hard_kill, &assembly);
     let hydration =
         match runtime.block_on(session.hydrate_from_store(assembly.state_store().as_ref())) {
             Ok(hydration) => hydration,
@@ -700,7 +705,13 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
     }
     if let Some(error) = key_bindings_error {
         tracing::warn!(%error, "tui.keybindings.load_failed");
-        push_system_text(&mut app, &format!("{error}; using default key bindings"));
+        let message = crate::i18n::tr_args_for(
+            app.interface_language(),
+            "command_feedback.key_defaults",
+            "{error}; using default key bindings",
+            &[("error", &error.present_for(app.interface_language()))],
+        );
+        push_system_text(&mut app, &message);
     }
     let mut gateway = ResumableGateway::new(
         session,
@@ -741,26 +752,35 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         let (harw_tx, mut harw_rx) = harw_event_channel();
         let (frame_req, frame_rx) = frame_channel();
         tokio::spawn(frame_scheduler(frame_rx, tui_tx.clone()));
-        let _reader = spawn_input_reader(tui_tx);
+        let _reader = spawn_input_reader(tui_tx, hard_kill.clone());
         frame_req.schedule_frame();
 
         loop {
-            match run_loop(
-                &mut guard,
-                &mut app,
-                &mut gateway,
-                &mut event_rx,
-                &mut turn_event_rx,
-                &mut tui_rx,
-                &harw_tx,
-                &mut harw_rx,
-                &frame_req,
-                &approval_driver,
-                &mut approvals,
-                &mut host_permit_prompts,
-            )
-            .await?
-            {
+            // PL-97 C4b: der Not-Aus verlässt die Event-Schleife in jedem
+            // Zustand (laufender Turn, offener Dialog, ein Druck, den die App
+            // nicht als Beenden wertet) — danach folgt der geordnete Abgang
+            // unten: Terminal zurück, Sitzung speichern, Exit-Code 130. Ein
+            // laufender Turn wird dabei an seinem nächsten `await` verworfen;
+            // seine Arbeit hat der Not-Aus da schon beendet.
+            let step = tokio::select! {
+                biased;
+                () = hard_kill.tripped() => Ok(TuiRunOutcome::Quit),
+                step = run_loop(
+                    &mut guard,
+                    &mut app,
+                    &mut gateway,
+                    &mut event_rx,
+                    &mut turn_event_rx,
+                    &mut tui_rx,
+                    &harw_tx,
+                    &mut harw_rx,
+                    &frame_req,
+                    &approval_driver,
+                    &mut approvals,
+                    &mut host_permit_prompts,
+                ) => step,
+            };
+            match step? {
                 TuiRunOutcome::Quit => return Ok(()),
                 TuiRunOutcome::Resume { selector: None } => {
                     match resume.as_ref() {
@@ -845,6 +865,9 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
                             approvals = next_runtime.approvals;
                             host_permit_prompts = next_runtime.host_permit_prompts;
                             let previous = std::mem::replace(&mut current, next_assembly);
+                            // Der Eingabe-Thread hält denselben Not-Aus: er muss
+                            // ab jetzt Spawner und Jobs der neuen Sitzung kennen.
+                            bind_hard_kill(&hard_kill, &current);
                             // Runde 5, Teil K: laufende Hintergrund-Agenten der
                             // alten Sitzung werden abgebrochen und protokolliert.
                             let cancelled = crate::app::background_agents::cancel_all(
@@ -904,13 +927,37 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
     crate::gateway::ChatGateway::session_mut(&mut gateway)
         .announce_closed(Some("tui exited".to_owned()));
     current.close_session(current.root_session_id());
-    match (result, persistence) {
+    let outcome = match (result, persistence) {
         (Err(error), _) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(error)) => Err(TuiError::Core(format!(
             "could not persist session state on exit: {error}"
         ))),
+    };
+    // PL-97 C4b: nach dem Not-Aus endet der Prozess hier mit Exit-Code 130 —
+    // Terminal zurückgestellt, Sitzung gespeichert. Ein Fehler dieses Abgangs
+    // (z. B. beim Speichern) geht vorher auf stderr, weil der Aufrufer ihn
+    // nach dem Exit nie sieht.
+    if hard_kill.is_tripped()
+        && let Err(error) = &outcome
+    {
+        tracing::error!(%error, "tui.hard_kill.exit_after_error");
+        hard_kill.exit_if_tripped(Some(error));
     }
+    hard_kill.exit_if_tripped(None);
+    outcome
+}
+
+/// Bindet den Not-Aus an Spawner, Wurzelsitzung und Job-Verwaltung von
+/// `assembly` (Start und jeder Sitzungswechsel).
+fn bind_hard_kill(hard_kill: &crate::hard_kill::HardKill, assembly: &RuntimeAssembly) {
+    hard_kill.bind_runtime(
+        assembly.spawner().cloned(),
+        assembly.root_session_id().clone(),
+        assembly
+            .session_jobs()
+            .map(|jobs| Arc::clone(&jobs.manager)),
+    );
 }
 
 /// Klont einen [`TuiApprovalHandler`]-Zeiger als Trait-Objekt.
@@ -1083,6 +1130,8 @@ fn build_root_runtime(
         assembly.take_sudo_prompts(),
         std::time::Duration::from_secs(u64::from(sudo_minutes) * 60),
     );
+    // PL-97 R1: Darstellung der Reasoning-Zusammenfassungen (`[tui] reasoning`).
+    app = app.with_reasoning_mode(assembly.config().harness.tui.reasoning);
     // Runde 5, Teil I: Live-Stream der Kind-Agenten (`[tui] child_stream`);
     // Orchestrator-Erkennung über die Rollendefinitionen (eingebaut + lokal).
     app = app.with_child_stream(
@@ -1091,6 +1140,7 @@ fn build_root_runtime(
             assembly.config_agents().executable_agents.values(),
         ),
     );
+    app.refresh_display_preferences();
     // Runde 5, Teil F: Plan-Fragekanal (`plan.exit`/`plan.enter`/`ask_user`,
     // nur TUI-Montage) und geteilter Plan-Zustand (Sperre, `/plan …`).
     app = app.with_plan_ui(
@@ -1653,6 +1703,70 @@ pub(crate) mod tests {
                 Some("default-model".to_owned())
             )
         );
+    }
+
+    /// PL-97 R1 (PR #154 P2): `[tui] reasoning` aus der Profil-Config
+    /// erreicht die App der Wurzelsitzung über [`build_root_runtime`].
+    #[test]
+    fn test_build_root_runtime_applies_tui_reasoning_mode() -> TestResult {
+        let fixture = fixture()?;
+        let config_path = fixture
+            .home
+            .join("profiles")
+            .join("default")
+            .join("config.toml");
+        let mut config = std::fs::read_to_string(&config_path).map_err(ctx("read config"))?;
+        config.push_str("\n[tui]\nreasoning = \"hidden\"\n");
+        std::fs::write(&config_path, config).map_err(ctx("write config"))?;
+        let (assembly, wiring) = tui_assembly(&fixture, None)?;
+
+        let runtime = build_root_runtime(&assembly, wiring, None, false)
+            .map_err(ctx("root runtime builds"))?;
+
+        assert_eq!(
+            runtime.app.reasoning_mode(),
+            harw_config::harness_config::ReasoningDisplayMode::Hidden
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_persist_and_reopen_in_the_active_profile() -> TestResult {
+        let fixture = fixture()?;
+        {
+            let (assembly, wiring) = tui_assembly(&fixture, None)?;
+            let mut runtime =
+                build_root_runtime(&assembly, wiring, None, false).map_err(ctx("root runtime"))?;
+            let result = crate::command_exec::dispatch_slash_command_for(
+                runtime.app.interface_language(),
+                Some(&assembly),
+                runtime.app.adapters(),
+                runtime.app.sandbox(),
+                runtime.app.session_id(),
+                "/settings set tui.language ja",
+            )
+            .await
+            .map_err(ctx("settings set"))?;
+            assert!(
+                result
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["language"] == "ja")
+            );
+            runtime.app.refresh_display_preferences();
+            assert_eq!(
+                runtime.app.interface_language(),
+                harw_config::UiLanguage::Japanese
+            );
+        }
+        let (assembly, wiring) = tui_assembly(&fixture, None)?;
+        let runtime =
+            build_root_runtime(&assembly, wiring, None, false).map_err(ctx("reopen runtime"))?;
+        assert_eq!(
+            runtime.app.interface_language(),
+            harw_config::UiLanguage::Japanese
+        );
+        Ok(())
     }
 
     #[test]

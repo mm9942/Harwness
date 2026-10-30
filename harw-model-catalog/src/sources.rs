@@ -290,15 +290,15 @@ fn probe_source(source: CredentialSource) -> DetectedCredential {
 /// If `$HOME` is unset or the path does not start with `~`, the path is used
 /// verbatim.
 fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
     }
-    if path == "~" {
-        if let Some(home) = home_dir() {
-            return home;
-        }
+    if path == "~"
+        && let Some(home) = home_dir()
+    {
+        return home;
     }
     PathBuf::from(path)
 }

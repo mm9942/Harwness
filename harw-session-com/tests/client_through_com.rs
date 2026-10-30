@@ -42,6 +42,15 @@ struct CountingDriver {
 }
 
 impl TurnDriver for CountingDriver {
+    // This test double performs no privileged runtime/tool effects.
+    fn prepare_execution(
+        &self,
+        _: &harw_types::SessionId,
+        _: harw_session_host::driver::ExecutionAdmission,
+    ) -> harw_session_host::driver::DriverFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn create_session(&self, _: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -142,10 +151,10 @@ async fn wait_delta(frames: &mut Box<dyn FrameSource>, expected: &str) -> TestRe
         let frame = tokio::time::timeout(WAIT, frames.next())
             .await??
             .ok_or("frame stream ended")?;
-        if let SessionFrame::Turn(TurnEvent::AssistantDelta { text, .. }) = &frame.frame {
-            if text == expected {
-                return Ok(());
-            }
+        if let SessionFrame::Turn(TurnEvent::AssistantDelta { text, .. }) = &frame.frame
+            && text == expected
+        {
+            return Ok(());
         }
     }
     Err(format!("delta {expected:?} never arrived").into())

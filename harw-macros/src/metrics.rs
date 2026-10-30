@@ -327,12 +327,12 @@ fn validate_metric_name(name: &str, kind: ParsedKind, unit: ParsedUnit) -> Resul
     if kind == ParsedKind::Counter && !name.ends_with("_total") {
         return Err(format!("counter-Metrik `{name}` muss auf `_total` enden"));
     }
-    if let Some(suffix) = unit.required_substring() {
-        if !name.contains(suffix) {
-            return Err(format!(
-                "Metrikname `{name}` mit dieser Einheit muss `{suffix}` im Namen enthalten"
-            ));
-        }
+    if let Some(suffix) = unit.required_substring()
+        && !name.contains(suffix)
+    {
+        return Err(format!(
+            "Metrikname `{name}` mit dieser Einheit muss `{suffix}` im Namen enthalten"
+        ));
     }
     Ok(())
 }

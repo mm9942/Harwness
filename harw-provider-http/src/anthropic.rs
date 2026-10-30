@@ -166,6 +166,8 @@ pub struct AnthropicMessagesProvider {
     /// Wirkung) bis `build_named_provider` sie über
     /// [`Self::configure_budgets`] setzt.
     budgets: crate::budget::ProviderBudgets,
+    /// Exact, identity-bound native assistant rounds; never exposed in logs.
+    thinking_replay: crate::anthropic_replay::AnthropicReplayCache,
 }
 
 impl AnthropicMessagesProvider {
@@ -203,6 +205,7 @@ impl AnthropicMessagesProvider {
             credential_pool: None,
             stream_policy: crate::sse::StreamPolicy::default(),
             budgets: crate::budget::ProviderBudgets::default(),
+            thinking_replay: crate::anthropic_replay::AnthropicReplayCache::default(),
         })
     }
 
@@ -522,6 +525,12 @@ fn push_content_block(messages: &mut Vec<Value>, role: &str, block: Value) {
 ///   `Untrusted`, Byte-Deckel `request.tool_result_max_bytes`, sonst
 ///   [`DEFAULT_TOOL_RESULT_MAX_BYTES`]).
 ///
+/// - `request.data_block` (sofern nicht leer bzw. nicht nur Whitespace) →
+///   `{"type":"text","text":<data_block>}` als letzter Content-Block einer
+///   `user`-Message: hängt hinter den `tool_result`-Blöcken eines
+///   abschließenden `user`-Turns an, sonst eröffnet er eine neue
+///   `user`-Message. Der Datenblock fließt nie in `system`.
+///
 /// `request.tools` wird — sofern nicht leer — via [`build_anthropic_tools`]
 /// auf `body["tools"]` abgebildet; bei leerem Tool-Set bleibt das Feld unset
 /// (bestehendes Verhalten für Requests ohne Tools). Rein und I/O-frei, daher
@@ -618,6 +627,14 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
         }
     }
 
+    if let Some(data_block) = super::non_empty_data_block(request) {
+        push_content_block(
+            &mut messages,
+            "user",
+            serde_json::json!({ "type": "text", "text": data_block }),
+        );
+    }
+
     let requested = request
         .max_output_tokens
         .filter(|tokens| *tokens > 0)
@@ -664,10 +681,10 @@ pub fn extract_anthropic_text(body: &Value) -> Option<String> {
     let content = body.get("content")?.as_array()?;
     let mut text = String::new();
     for block in content {
-        if block.get("type").and_then(Value::as_str) == Some("text") {
-            if let Some(chunk) = block.get("text").and_then(Value::as_str) {
-                text.push_str(chunk);
-            }
+        if block.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(chunk) = block.get("text").and_then(Value::as_str)
+        {
+            text.push_str(chunk);
         }
     }
     if text.is_empty() { None } else { Some(text) }
@@ -1095,6 +1112,9 @@ impl AnthropicMessagesProvider {
             crate::cache_strategy::resolve_cache_strategy(&self.provider_id, model, None);
         let mut wire = build_messages_body(model, self.max_tokens, &request);
         crate::cache_strategy::apply_messages_cache_control(&mut wire, strategy);
+        // Restore after cache decoration so signed native content stays untouched.
+        self.thinking_replay
+            .apply(&self.provider_id, &messages_url, model, &request, &mut wire)?;
         let stream_sink = request
             .stream
             .as_ref()
@@ -1214,6 +1234,14 @@ impl AnthropicMessagesProvider {
             .await?;
             let value = accumulator.finish()?;
             let response = self.interpret_body(&request, model, &value)?;
+            self.thinking_replay.remember(
+                &self.provider_id,
+                &messages_url,
+                model,
+                &request,
+                &response,
+                &value,
+            )?;
             budget_permit.reconcile(&response.usage);
             return Ok(response);
         }
@@ -1283,6 +1311,14 @@ impl AnthropicMessagesProvider {
 
         let value: Value = serde_json::from_str(&body)?;
         let response = self.interpret_body(&request, model, &value)?;
+        self.thinking_replay.remember(
+            &self.provider_id,
+            &messages_url,
+            model,
+            &request,
+            &response,
+            &value,
+        )?;
         budget_permit.reconcile(&response.usage);
         Ok(response)
     }
@@ -2219,6 +2255,123 @@ mod tests {
             cancel: None,
             identity: None,
         }
+    }
+
+    fn body_messages(body: &Value) -> TestResult<&[Value]> {
+        body.get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .ok_or(TestError::Missing("messages"))
+    }
+
+    #[test]
+    fn data_block_none_adds_nothing() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("hi");
+        let request = request_with_history(history);
+        let body = build_messages_body("m", 256, &request);
+        let messages = body_messages(&body)?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].get("content").and_then(Value::as_str),
+            Some("hi")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn data_block_whitespace_only_adds_nothing() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("hi");
+        let mut request = request_with_history(history);
+        request.data_block = Some(" \n\t ".to_owned());
+        let body = build_messages_body("m", 256, &request);
+        let messages = body_messages(&body)?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].get("content").and_then(Value::as_str),
+            Some("hi")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn data_block_after_tool_result_joins_same_user_message() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_tool_result(
+            harw_types::ToolCallId::from_str("call_1"),
+            ToolCallResult::success(serde_json::json!({"temp": 20})),
+            5,
+        );
+        let mut request = request_with_history(history);
+        request.data_block = Some("DATA-BLOCK".to_owned());
+        let body = build_messages_body("m", 256, &request);
+        let messages = body_messages(&body)?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("user")
+        );
+        let content = messages[0]
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or(TestError::Missing("content array"))?;
+        assert_eq!(content.len(), 2);
+        assert_eq!(
+            content[0].get("type").and_then(Value::as_str),
+            Some("tool_result")
+        );
+        assert_eq!(content[1].get("type").and_then(Value::as_str), Some("text"));
+        assert_eq!(
+            content[1].get("text").and_then(Value::as_str),
+            Some("DATA-BLOCK")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn data_block_after_assistant_text_opens_new_user_message() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("hi");
+        history.push_assistant_text("hello", None);
+        let mut request = request_with_history(history);
+        request.data_block = Some("DATA-BLOCK".to_owned());
+        let body = build_messages_body("m", 256, &request);
+        let messages = body_messages(&body)?;
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[1].get("role").and_then(Value::as_str),
+            Some("assistant")
+        );
+        assert_eq!(
+            messages[2].get("role").and_then(Value::as_str),
+            Some("user")
+        );
+        let content = messages[2]
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or(TestError::Missing("content array"))?;
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].get("type").and_then(Value::as_str), Some("text"));
+        assert_eq!(
+            content[0].get("text").and_then(Value::as_str),
+            Some("DATA-BLOCK")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn data_block_text_is_not_duplicated_into_system() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("hi");
+        let mut request = request_with_history(history);
+        request.system_prompt = "SYS".to_owned();
+        request.data_block = Some("DATA-BLOCK".to_owned());
+        let body = build_messages_body("m", 256, &request);
+        assert_eq!(body.get("system").and_then(Value::as_str), Some("SYS"));
+        let occurrences = body.to_string().matches("DATA-BLOCK").count();
+        assert_eq!(occurrences, 1);
+        Ok(())
     }
 
     fn first_tool_result_content(body: &Value) -> TestResult<String> {

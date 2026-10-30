@@ -173,15 +173,14 @@ impl BrowserHost for FirefoxHost {
             }
         };
 
-        if let Some(viewport) = request.viewport {
-            if let Err(error) = driver
+        if let Some(viewport) = request.viewport
+            && let Err(error) = driver
                 .webdriver()
                 .set_window_rect(0, 0, viewport.width, viewport.height)
                 .await
-            {
-                quit_after_failed_open(&mut driver).await;
-                return Err(driver_error("set initial Firefox viewport", error));
-            }
+        {
+            quit_after_failed_open(&mut driver).await;
+            return Err(driver_error("set initial Firefox viewport", error));
         }
         if let Err(error) = driver.webdriver().goto(request.start_url.as_str()).await {
             quit_after_failed_open(&mut driver).await;

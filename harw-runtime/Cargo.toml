@@ -13,6 +13,10 @@ default = ["browser"]
 browser = ["harw-registry-defaults/browser"]
 
 [dependencies]
+# Native image inspection uses the production tool executor/context boundary.
+harw-tools = { path = "../harw-tools" }
+harw-media = { path = "../harw-media" }
+harw-tool-fs = { path = "../harw-tool-fs" }
 harw-explorer = { path = "../harw-explorer" }
 harw-command = { path = "../harw-command" }
 harw-authority = { path = "../harw-authority" }
@@ -35,6 +39,13 @@ harw-core = { path = "../harw-core" }
 # nicht von `harw-runtime` ab (nur harw-authority/-types/-sandbox/-operations/
 # -core/-extension-api/-research und `harw-dod-signals`).
 harw-core-bridge = { path = "../harw-core-bridge" }
+# PL-97 D3: `security_signals.rs` löst den Harw-DoD-Export über denselben
+# Resolver auf wie `harw dod`, `/dod` und die `dod.*`-Werkzeuge
+# (`[dod] export_dir` → `/var/lib/harw-dod/export`, falls lesbar; ein
+# vorhandener, unlesbarer Systemexport liefert nichts, nie den Home-Fallback;
+# fehlt er → `<home>/dod/export`). Der Client zieht weder Warden noch
+# Eskalation (S1).
+harw-dod-client = { path = "../harw-dod-client" }
 harw-extension-api = { path = "../harw-extension-api" }
 # `handoff.rs` (Agent OPS): symlinkfestes, atomares Schreiben der
 # `handoff.json` (Tempdatei im Zielverzeichnis + `rename`), analog zu
@@ -90,7 +101,7 @@ harw-tool-container-run = { path = "../harw-tool-container-run" }
 harw-tool-remote = { path = "../harw-tool-remote" }
 harw-types = { path = "../harw-types" }
 # Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock.
-tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 harw-mcp-client = { path = "../harw-mcp-client" }
 tracing = { workspace = true }
 # secrecy 0.10 wie harw-provider-http/harw-model-catalog (Version = Cargo.lock)
@@ -112,7 +123,6 @@ tempfile = { workspace = true }
 # `tests/remote_tools.rs`: `#[tokio::test]` über den entfernten Proxy und
 # `harw_tools::executor::ExecutionPlacement`/Spezifikationen der Test-Attrappen.
 tokio = { version = "1.53.0", features = ["rt", "macros"] }
-harw-tools = { path = "../harw-tools" }
 # `embedded.rs` tests: `compile_agent(..., now: OffsetDateTime, ...)`
 # (`harw-agent-dsl`), Version wie dort (kein `[workspace.dependencies]`-Eintrag).
 

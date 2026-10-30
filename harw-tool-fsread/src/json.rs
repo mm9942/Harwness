@@ -311,7 +311,8 @@ impl ClassifyLabel for serde_json::Error {
     name = "fsread.json",
     description = "Reads one value out of a workspace JSON file by path expression like jq's path access: '.a.b[0]', '.[\"key with space\"]', negative indexes, plus op=keys|length|type. Use when you need a single field of a large JSON file (package metadata, reports, configs) instead of running jq or reading the file. Returns JSON {found, type, value}; a missing path gives found=false. No filter language. File up to 8 MiB, value capped at 32 KiB with a preview beyond that.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_json(
     context: &ToolExecutionContext,

@@ -72,21 +72,20 @@ struct Input {
 
 fn parse_limit(input: ParseStream<'_>) -> syn::Result<Limit> {
     let expr: Expr = input.parse()?;
-    if let Expr::Path(path) = &expr {
-        if path.path.is_ident("none") {
-            return Ok(Limit(None));
-        }
+    if let Expr::Path(path) = &expr
+        && path.path.is_ident("none")
+    {
+        return Ok(Limit(None));
     }
     if let Expr::Lit(ExprLit {
         lit: Lit::Int(lit), ..
     }) = &expr
+        && lit.base10_parse::<u64>()? == 0
     {
-        if lit.base10_parse::<u64>()? == 0 {
-            return Err(syn::Error::new_spanned(
-                lit,
-                "a limit of 0 would delete everything; use `none` for no limit",
-            ));
-        }
+        return Err(syn::Error::new_spanned(
+            lit,
+            "a limit of 0 would delete everything; use `none` for no limit",
+        ));
     }
     Ok(Limit(Some(expr)))
 }

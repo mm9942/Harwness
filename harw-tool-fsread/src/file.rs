@@ -495,7 +495,8 @@ pub fn run(root: &Path, args: &FileArgs) -> ToolOutput {
     name = "fsread.file",
     description = "Identifies file types by magic bytes like file(1): ELF (class/arch), PNG/GIF dimensions, JPEG, PDF, archives, SQLite, WebAssembly, scripts via shebang, XML/HTML/JSON and text encodings. Use when you need to know what a file is before reading or hashing it instead of running file. Returns JSON {results:[{path, description, mime, kind}], failed}. Reads at most 8 KiB per file, never follows symlinks, never reads secret files.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_file(
     context: &ToolExecutionContext,

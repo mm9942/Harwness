@@ -41,6 +41,10 @@ members = [
     "harw-extension-api",
     "harw-sandbox",
     "harw-catalog",
+    # PL-97 D2: read-only Harw-DoD client (export paths, findings/health, config, units, status).
+    "harw-dod-client",
+    # PL-97 M1: semantic activity vocabulary and deterministic pattern reducer (PL-71).
+    "harw-activity",
     "harw-core",
     "harw-provider",
     "harw-provider-http",
@@ -52,15 +56,13 @@ members = [
     "harw-session-store",
     "harw-session-host",
     "harw-session-ws",
-    # W00 WebSocket control plane skeleton (docs/planning/65-cloud-sessions/
-    # contracts/W00-ws-integration-map.md): client, production TurnDriver
-    # bridge, own-cloud node listener.
     "harw-session-remote",
     "harw-session-client",
     "harw-session-driver",
     "harw-node-listener",
     "harw-mobile-core",
     "harw-mobile-term",
+    "harw-reverse-proxy",
     "harw-tool-remote",
     "harw-memory",
     "harw-core-bridge",
@@ -68,7 +70,6 @@ members = [
     "harw-infra-client",
     "harw-netsec",
     "harw-node-transport",
-    "harw-reverse-proxy",
     "harw-session-daemon",
     "harw-session-com",
     "harw-security-hub",
@@ -204,13 +205,17 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.10.0"
 # Kein Crate wird auf crates.io veröffentlicht; `cargo deny` behandelt sie
 # damit als privat (keine Lizenzpflicht ohne Entscheidung, Pfad-Abhängigkeiten
 # ohne Versionsangabe erlaubt).
 publish = false
 edition = "2024"
-rust-version = "1.85"
+# MSRV = höchste `rust-version` im aufgelösten Baum: `uuid` 1.27 (über
+# harw-types in fast jedem Crate) und `aes` 0.9 verlangen 1.89, `time` 0.3.46+
+# (harw-dod-client) 1.88. 1.85 war nicht mehr baubar. Gebaut wird mit der in
+# `rust-toolchain.toml` gepinnten Toolchain.
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mm9942/harwness"
 

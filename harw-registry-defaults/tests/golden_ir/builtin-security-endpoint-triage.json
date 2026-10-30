@@ -16,7 +16,11 @@
     "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
   },
   "tools": {
-    "admitted": [],
+    "admitted": [
+      "dod.status",
+      "dod.findings",
+      "dod.sensors"
+    ],
     "forbidden": [
       "fs.write",
       "fs.edit",
@@ -109,7 +113,12 @@
   "research": null,
   "verification": null,
   "skills": {
-    "entries": []
+    "entries": [
+      {
+        "name": "harw-dod",
+        "hash": null
+      }
+    ]
   },
   "binary": {
     "name": "security-endpoint-triage",
@@ -119,7 +128,11 @@
     "default_interface": "cli"
   },
   "permissions": {
-    "tools": [],
+    "tools": [
+      "dod.findings",
+      "dod.sensors",
+      "dod.status"
+    ],
     "forbidden_tools": [
       "fs.edit",
       "fs.write",
@@ -206,7 +219,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/security-endpoint-triage.toml",
-          "line": 140,
+          "line": 151,
           "column": 11
         },
         "path": "context.program"
@@ -215,6 +228,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "e2fcddaac762bf4d8efe730ff1751229f538ac95ba13632b49ef7bc4a3286a00"
+    "digest": "7fe18565935e8e67413b81c1c8cced1bd5aa8458ba3100ee3e7cf5ba95bcebdf"
   }
 }

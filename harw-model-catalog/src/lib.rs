@@ -11,6 +11,7 @@ pub mod descriptor;
 pub mod embedded;
 pub mod error;
 pub mod family;
+pub mod lifecycle;
 pub mod models_dev;
 pub mod observed;
 pub mod provenance;

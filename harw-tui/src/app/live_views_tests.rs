@@ -51,13 +51,62 @@ fn seed_catalog(env: &RuntimeBackedApp) -> TestResult {
     Ok(())
 }
 
+/// Ein in der eingebetteten Lebenszyklus-Tabelle abgeschaltetes Angebot
+/// (Mistral OCR 4.0, retired 2026-09-30 — für die echte Uhr sicher in der
+/// Vergangenheit; Ersatz `mistral-ocr-4-1`).
+const RETIRED_PROVIDER: &str = "mistral";
+const RETIRED_MODEL: &str = "mistral-ocr-4-0";
+
+/// Legt den Provider des abgeschalteten Angebots samt Katalogmodell in den
+/// Live-Stand der Montage — so erreicht `/model switch` die Lebenszyklus-Prüfung
+/// statt schon an „unbekanntes Modell“ zu scheitern.
+fn seed_retired_offering(env: &RuntimeBackedApp) -> TestResult {
+    let provider: harw_config::ProviderToml = serde_json::from_value(json!({
+        "name": RETIRED_PROVIDER,
+        "api": "openai-chat",
+        "base_url": "https://mistral.example.test",
+        "api_key": "test-key",
+        "enabled": true,
+    }))
+    .map_err(ctx("retired provider fixture"))?;
+    let model: harw_config::ModelToml = serde_json::from_value(json!({
+        "id": RETIRED_MODEL, "provider": RETIRED_PROVIDER, "aliases": [],
+    }))
+    .map_err(ctx("retired model fixture"))?;
+    let live = env
+        .assembly
+        .services()
+        .live_config()
+        .ok_or(TestError::Missing("the assembly binds a live config"))?;
+    live.update(|config| {
+        config
+            .providers
+            .insert(RETIRED_PROVIDER.to_owned(), provider);
+        config.models.insert(RETIRED_MODEL.to_owned(), model);
+    });
+    Ok(())
+}
+
+/// Eine Wurzelsitzung ohne Spawn-Kontext (generische Route): an ihr zeigt
+/// sich, was die Turn-Grenze tatsächlich in die Sitzung schreibt.
+fn bare_root_session() -> harw_core::AgentSession {
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    harw_core::AgentSession::new(
+        harw_types::AgentRole::Assistant,
+        None,
+        harw_extension_api::ExtensionRegistryBuilder::default().build(),
+        event_tx,
+    )
+}
+
 /// Führt `raw` wie die TUI über die echte Slash-Fläche der Montage aus —
-/// nur die Persistenz ist aufzeichnend statt dateibasiert.
-async fn run_op(
+/// nur die Persistenz ist aufzeichnend statt dateibasiert. Ein Fehler der
+/// Operation kommt als Anzeigetext zurück (so, wie die TUI ihn zeigt).
+async fn try_op(
     env: &RuntimeBackedApp,
     recorder: &Arc<RecordingSelectionPersistence>,
     raw: &str,
-) -> TestResult<Option<Value>> {
+) -> Result<Option<Value>, String> {
     let rt = Arc::clone(&env.assembly);
     let persistence: Arc<dyn SelectionPersistence> = recorder.clone();
     let output = command_data::execute_command_with_data(
@@ -72,9 +121,19 @@ async fn run_op(
             services
         },
     )
-    .await
-    .map_err(|error| TestError::Unexpected(format!("{raw}: {error}")))?;
+    .await?;
     Ok(output.data)
+}
+
+/// Wie [`try_op`], aber ein Fehler der Operation ist ein Testfehler.
+async fn run_op(
+    env: &RuntimeBackedApp,
+    recorder: &Arc<RecordingSelectionPersistence>,
+    raw: &str,
+) -> TestResult<Option<Value>> {
+    try_op(env, recorder, raw)
+        .await
+        .map_err(|error| TestError::Unexpected(format!("{raw}: {error}")))
 }
 
 /// Drückt `code` im App-Zustand (wie der echte Tastaturpfad).
@@ -235,12 +294,12 @@ async fn mode_default_change_is_shown_after_reopening_the_mode_picker() -> TestR
     let env = runtime_backed_app()?;
     let recorder = Arc::new(RecordingSelectionPersistence::new());
     let before = view_text(&env.app.mode_picker_view());
-    assert!(!before.contains("Standard: work"), "{before}");
+    assert!(!before.contains("Default: work"), "{before}");
 
     run_op(&env, &recorder, "/mode default work").await?;
 
     let after = view_text(&env.app.mode_picker_view());
-    assert!(after.contains("Standard: work"), "{after}");
+    assert!(after.contains("Default: work"), "{after}");
     Ok(())
 }
 
@@ -287,5 +346,68 @@ async fn uia_worker_model_change_is_shown_after_reopening() -> TestResult {
             )));
         }
     }
+    Ok(())
+}
+
+/// `/model switch <abgeschaltet>` Ende zu Ende auf der echten Montage: die
+/// Operation lehnt vor jeder Mutation ab (mit Ersatzhinweis), und danach sind
+/// Controller, Wurzelsitzung (auch nach der Turn-Grenze), Kind-Route und
+/// aufgezeichnete Persistenz unverändert.
+#[tokio::test]
+async fn model_switch_to_a_retired_model_changes_nothing_end_to_end() -> TestResult {
+    let mut env = runtime_backed_app()?;
+    seed_catalog(&env)?;
+    seed_retired_offering(&env)?;
+    let recorder = Arc::new(RecordingSelectionPersistence::new());
+    let mut session = bare_root_session();
+
+    // Ausgangslage: ein zulässiger Wechsel, an der Turn-Grenze übernommen.
+    run_op(&env, &recorder, "/model switch model-b-2026").await?;
+    assert!(env.app.apply_pending_controller_state(&mut session));
+    assert_eq!(
+        session.active_model(),
+        Some(&harw_types::ModelId::from("model-b-2026"))
+    );
+    assert_eq!(
+        session.active_provider(),
+        Some(&harw_types::ProviderId::from("provider-a"))
+    );
+    let live_before = env.assembly.live_models().live_main();
+    assert_eq!(
+        live_before,
+        Some((Some("provider-a".to_owned()), "model-b-2026".to_owned()))
+    );
+    let controller_before = env.app.session_controller.snapshot();
+    let persisted_before = recorder.calls();
+
+    // Der Wechsel auf das abgeschaltete Modell wird abgelehnt.
+    match try_op(&env, &recorder, &format!("/model switch {RETIRED_MODEL}")).await {
+        Err(message) => {
+            assert!(message.contains("retired"), "{message}");
+            assert!(message.contains("mistral-ocr-4-1"), "{message}");
+        }
+        Ok(data) => {
+            return Err(TestError::Unexpected(format!(
+                "a retired model must be refused, got {data:?}"
+            )));
+        }
+    }
+
+    // Controller: unverändert.
+    assert_eq!(env.app.session_controller.snapshot(), controller_before);
+    // Wurzelsitzung: an der nächsten Turn-Grenze steht nichts an, nichts ändert sich.
+    assert!(!env.app.apply_pending_controller_state(&mut session));
+    assert_eq!(
+        session.active_model(),
+        Some(&harw_types::ModelId::from("model-b-2026"))
+    );
+    assert_eq!(
+        session.active_provider(),
+        Some(&harw_types::ProviderId::from("provider-a"))
+    );
+    // Kind-Route: unverändert.
+    assert_eq!(env.assembly.live_models().live_main(), live_before);
+    // Persistenz: kein weiterer Schreibaufruf.
+    assert_eq!(recorder.calls(), persisted_before);
     Ok(())
 }

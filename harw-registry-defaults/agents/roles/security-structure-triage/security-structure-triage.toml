@@ -25,15 +25,22 @@
 # bekommt bereits ausgewertete `Finding<RuleChecked>`-Batches als Parameter
 # übergeben; sie ruft `StructureDriftRule::evaluate` nicht selbst auf.
 #
-# ── Warum genau diese Werkzeuge (keine) ──────────────────────────────────────
-# `[tools].admitted` bleibt leer, exakt wie bei `context-steward` und aus
-# demselben Grund: die heutige Implementierung nimmt bereits abgerufene
-# `Finding`-/`SecurityEvent`-Batches als Eingabeparameter entgegen, statt
-# selbst ein Werkzeug aufzurufen. `forbidden` benennt trotzdem jedes
-# Schreib- und Netzwerkzeug ausdrücklich. Da `admitted` leer ist, ist die
-# Auflage "jedes admittierte Werkzeug muss von `AUTO_APPROVED_TOOLS`
-# gedeckt sein" (`harw-registry-defaults/src/lib.rs`) hier trivial erfüllt —
-# nichts einzutragen, nichts zu melden.
+# ── Warum genau diese Werkzeuge (nur die lesenden `dod.*`) ─────────────────
+# Die Rolle bekommt bereits abgerufene `Finding`-/`SecurityEvent`-Batches als
+# Eingabeparameter. Zusätzlich darf sie Harw-DoD selbst LESEN (PL-97 D3):
+# `dod.status` (Zustand der Suite), `dod.findings` (jüngste Befunde,
+# begrenzt und bereinigt) und `dod.sensors` (Sensor-Gesundheit). Alle drei
+# sind lesende Operationen ohne Freigabe (`AUTO_APPROVED_TOOLS` in
+# `harw-registry-defaults/src/lib.rs`), ohne Sandbox-Recht, ohne Netz, ohne
+# Schreib- oder Prozesspfad, und keine erreicht Warden oder Eskalation
+# (Invariante S1). Ein Triage-Agent liest angreiferkontrollierte
+# Sensorfelder — er bekommt deshalb weiterhin KEIN Werkzeug, mit dem er
+# Netzverkehr erzeugen, ein Ziel anfragen, schreiben oder etwas durchsetzen
+# könnte; ein Befund bleibt Evidenz, nie Anweisung. `forbidden` benennt
+# jedes Schreib- und Netzwerkzeug ausdrücklich, damit eine Ablehnung
+# nachvollziehbar ist statt nur "nicht in admitted". Profil bleibt `NoTools`;
+# bereitgestellt werden sie vom rollengebundenen Provider in
+# `harw-runtime/src/children.rs` (`dod_tools_for_role`, PL-97 D4).
 #
 # ── Was sie ausdrücklich NICHT tut ──────────────────────────────────────────
 #   - sie leitet keine Schwere aus `detail`-Freitext ab — nur aus
@@ -82,6 +89,10 @@ version = "1.0.0"
 extends = { id = "harwness.agent.worker-base@1" }
 role = "worker"
 specialization = "security-structure-triage"
+# PL-97 D4: der gebündelte Skill `harw-dod` (welches `dod.*`-Werkzeug wann,
+# Befunde lesen, was ein Befund belegt, Grenzen) ist fest eingebunden; ohne
+# Skill-Katalog startet das Kind fail-closed nicht.
+skills = ["harw-dod"]
 
 name = "Security Structure Triage"
 description = "Sichtet Struktur-Abweichungen (StructureDrift/DriftSeverity) gegen bereits ausgewertete StructureDriftRule-Funde; schlägt ein Verdikt vor, committet nie."
@@ -91,9 +102,9 @@ mode = "structure-drift-triage"
 may_write_code = false
 may_research_web = false
 
-# Keine Werkzeugoberfläche beansprucht — siehe Begründung oben.
+# Nur die lesenden Harw-DoD-Werkzeuge — siehe Begründung oben.
 [tools]
-admitted = []
+admitted = ["dod.status", "dod.findings", "dod.sensors"]
 forbidden = ["fs.write", "fs.edit", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
 
 # Ein reiner Sichtungs-/Vorschlags-Job braucht keine Kind-Agenten.

@@ -123,11 +123,11 @@ pub(crate) fn top_k_ranked<I: Iterator<Item = Ranked>>(items: I, k: usize) -> Ve
         let candidate = HeapRanked(item);
         if heap.len() < k {
             heap.push(candidate);
-        } else if let Some(worst) = heap.peek() {
-            if candidate < *worst {
-                heap.pop();
-                heap.push(candidate);
-            }
+        } else if let Some(worst) = heap.peek()
+            && candidate < *worst
+        {
+            heap.pop();
+            heap.push(candidate);
         }
     }
 

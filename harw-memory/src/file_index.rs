@@ -260,10 +260,10 @@ fn extract_symbols(language: Option<&str>, content: &str) -> Vec<String> {
         if out.len() >= MAX_SYMBOLS {
             break;
         }
-        if let Some(sym) = symbol_from_line(language, line) {
-            if seen.insert(sym.clone()) {
-                out.push(sym);
-            }
+        if let Some(sym) = symbol_from_line(language, line)
+            && seen.insert(sym.clone())
+        {
+            out.push(sym);
         }
     }
     out

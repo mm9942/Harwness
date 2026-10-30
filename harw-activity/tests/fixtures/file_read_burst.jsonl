@@ -1,0 +1,15 @@
+# file-read-burst@1: repeated and overlapping reads of one path in one turn.
+# Read(A)#1 and Read(A)#2 overlap; a second path stays a separate instance;
+# a search of A joins the A burst; the turn end seals both bursts; the next
+# turn opens a fresh burst for A.
+{"ingest_seq":1,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"started"}
+{"ingest_seq":2,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"started"}
+{"ingest_seq":3,"owner":{"session":"root","turn":1,"call":"c1"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":4,"owner":{"session":"root","turn":1,"call":"c3"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/main.rs"},"lifecycle":"started"}
+{"ingest_seq":5,"owner":{"session":"root","turn":1,"call":"c2"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"finished","outcome":{"failed":{"class":"not-found"}}}
+{"ingest_seq":6,"owner":{"session":"root","turn":1,"call":"c3"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/main.rs"},"lifecycle":"finished","outcome":"succeeded"}
+{"ingest_seq":7,"owner":{"session":"root","turn":1,"call":"c4"},"descriptor":{"domain":"filesystem","verb":"search","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"finished","outcome":"succeeded"}
+# turn 1 ends
+{"ingest_seq":8,"owner":{"session":"root","turn":1},"descriptor":{"domain":"scope","verb":"boundary","effect":"control"},"lifecycle":{"boundary":"turn_end"}}
+{"ingest_seq":9,"owner":{"session":"root","turn":2,"call":"c5"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"started"}
+{"ingest_seq":10,"owner":{"session":"root","turn":2,"call":"c5"},"descriptor":{"domain":"filesystem","verb":"read","resource_field":"path","effect":"observe"},"resource":{"path":"src/lib.rs"},"lifecycle":"finished","outcome":"succeeded"}

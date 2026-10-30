@@ -12,10 +12,12 @@
 > concurrent runs (§6). R18 (contract
 > `docs/planning/65-cloud-sessions/contracts/R18-tool-gateway.md` §8) replaced
 > the free-text status line of workers by the report tool (§4), and lets
-> the UIA start a run (§2). Open: a custom orchestrator that extends
-> `child-orchestrator-base@1` inherits the base's `[tools]`, and the runtime
-> clamps it under that base — whether `work_driver.*` reaches its tool list
-> depends on that base.
+> the UIA start a run (§2). A custom orchestrator that extends
+> `child-orchestrator-base@1` inherits the base's `[tools]` and is held under
+> that base by the compiler's rights check and by the runtime's clamp. The
+> `[work_driver]` table lowers to the three `work_driver.*` tools, and both
+> checks let exactly these three through for a definition that has the table
+> (§1).
 
 The WorkDriver is a supervisor loop. Given the current `Active` goal, it
 hands small, isolated pieces of work to worker agents, runs one central
@@ -44,13 +46,24 @@ Otherwise lowering fails with `HARW-DRIVER-004`. The other diagnostics:
 `HARW-DRIVER-001` unknown key, `-002` value out of range, `-003` missing or
 malformed role name, `-005` blank `verify` entry.
 
+The table also adds `work_driver.enqueue`, `.status` and `.stop` (§2) to the
+definition's tool list. A definition on `child-orchestrator-base@1` does not
+get them from its base; the compiler's rights check and the runtime's clamp
+under the base role let these three through, and only with the table.
+
+Compiling the definition (`harw agent check`) adds one more rule: a spawn
+target's own `max_depth` must stay below the orchestrator's. The base's
+`max_depth = 1` therefore admits only targets with `max_depth = 0`; the
+built-in `explorer` (1) and `analyst` (2) are rejected with `HARW-BUILD-013`.
+`executor` and the bundled `evidence-critic` have `max_depth = 0`.
+
 ```toml
 [delegation]
-targets = ["explorer", "executor", "analyst"]
+targets = ["executor", "evidence-critic"]
 
 [work_driver]
 worker_role = "executor"          # required; must be a spawn target
-judge_role = "analyst"            # optional; must be a spawn target
+judge_role = "evidence-critic"    # optional; must be a spawn target
 max_iterations = 8                # 1..=1000, default 8
 max_parallel_workers = 3          # 1..=64, default 4
 max_attempts_per_worker = 3       # 1..=100, default [lifecycle] max_attempts, else 4
@@ -322,8 +335,16 @@ evidence:
   `SandboxRequirement::Required`; the
   coordinator refuses to start it if the backend cannot enforce every
   dimension. Under `harw serve` the job worker builds this coordinator
-  itself: backend is the Landlock trampoline `harw-job-exec` (next to the
-  `harw` binary or on `PATH`), else `bwrap`; job records go to
+  itself. The backend comes from the shared resolver
+  `harw_job_runtime::select_backend`: in practice the Landlock trampoline
+  `harw-job-exec`, looked up next to the `harw` binary only (never on
+  `PATH`). The Bubblewrap backends are skipped for these jobs, because
+  `WorkspaceBuild` needs network and this path configures no egress
+  relay. `HARW_VERIFY_BACKEND=auto|bwrap-trampoline|bwrap|landlock|none`
+  chooses the request (default `auto`); an unknown value fails closed,
+  and an explicit `bwrap-trampoline` or `bwrap` ends in no backend (an
+  explicit request has no fallback). The choice, every skipped backend
+  and a per-dimension table are logged once. Job records go to
   `<home>/jobs/verify`, the workspace root is the `serve` working
   directory, and the environment is reduced to `PATH`, `HOME`,
   `CARGO_HOME` and `RUSTUP_HOME`. Without a sandbox backend every command
@@ -368,9 +389,10 @@ escalates (`work_driver:NeedsInput`) with the reason and the last answer.
 [`examples/agents/driven-orchestrator/`](../../examples/agents/driven-orchestrator/)
 is a child orchestrator on `child-orchestrator-base@1` with a
 `[work_driver]` table. `worker_role = "executor"` and
-`judge_role = "analyst"` are both listed in `[delegation] targets`, and the
-base's `max_depth = 1` provides the spawn depth, so it lowers without
-`HARW-DRIVER-004`:
+`judge_role = "evidence-critic"` are both listed in `[delegation] targets`,
+and the base's `max_depth = 1` provides the spawn depth, so it lowers without
+`HARW-DRIVER-004`. Both targets have `max_depth = 0`, so it also compiles
+without `HARW-BUILD-013`:
 
 ```sh
 harw agent check ./examples/agents/driven-orchestrator

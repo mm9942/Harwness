@@ -264,3 +264,144 @@
 - Merge to `dev` once the central build above is green.
 - Preventive path-level write rights (DEC-009 proposal, C-08).
 - A cloud home proposal (DEC-010, C-10).
+
+---
+
+## MIG-PL90-W03w — Intent cycles wired end to end (read-only explorer recipe)
+
+**Planning compartment:** `docs/planning/90-intent-driven-composed-agents` (04 §7)
+**Baseline commit:** `dev@6e34f2e3` plus PR branches #141, #143, #144, #145/#146/#147 and the newest docs branches (provider lifecycle 2026-10-14, Linux user cloud control 2026-10-16), merged on the integration branch
+**Implementation commit / PR:** integration branch `ccr-c2654e2c-284ibb` → `dev`
+**Affected crates:** `harw-plan-bridge`, `harw-ops`, `harw-registry-defaults`, `harw-runtime`, `harw-cli`
+
+**Before:** W01–W03 building blocks existed (`intent_cycle`, `cycle_runtime`, `cycle_explorer`, `cycle_proposer`), but nothing called them: no tool, no job kind, no worker, no verifier. `Complete` was unreachable because nothing produced `Verified` evidence.
+**Target:** a durable, human-approved, read-only intent cycle that can be started, observed and stopped as a tool and runs as a fenced job.
+**Landed delta:**
+- `harw-plan-bridge::cycle_verifier` — deterministic `ContentCheck` per acceptance criterion; `Verify` re-reads the observed file, requires an unchanged digest, emits `Verified` evidence of source `Verification` or an `unmet:`/`stale:` claim. `ExplorerCycleExecutor` = explorer (read/wait) + verifier (verify).
+- `harw-plan-bridge::cycle_spec` — `ReadOnlyCycleSpec` (objective, read targets, checks, limits ≤ host ceiling) with one canonical intent digest; `plan()` is the single validation used by the operation and the worker.
+- `CeilingReissuer` — narrowing-only reissue of the persisted `AuthoritySnapshot` against the worker's current trusted ceiling; `INTENT_CYCLE_JOB_KIND`, `CycleStore::open_in_job_root`.
+- `harw-ops::intent_cycle` — `intent_cycle.start` (operator, `approval = "always"`), `intent_cycle.status` (observer, read-only), `intent_cycle.stop` (operator, `approval = "always"`); registered by `register_intent_cycle_tools` behind the `[tools.plan]` gate and mounted by the runtime assembly.
+- `harw-registry-defaults` — catalog rows (`start` = `Read`, `status`/`stop` = `Meta`) and `ReadWorkspace` as the tool right of all three.
+- `harw-cli` job worker — `intent_cycle` jobs run in the long-run lane: fence + scope check, spec re-validation, read-only explore sandbox as ceiling, record creation on first claim, `CycleDriver` with `ModelCycleProposer` (budgeted provider, `Explorer` internal model or default model), job cancel → driver cancel, wall budget.
+**Compatibility retained:** no existing tool, job kind or permission changed; the cycle is read-only (no write targets, children or recipes).
+**Tests added/changed:** verifier (pass, unmet, stale, permission, non-repository evidence, explorer contract), spec validation and digest, W03 cross-module test `spec_read_verify_complete_reaches_completion_proposed`, ops start/refusal/status/stop tests, worker e2e `worker_drives_a_cycle_to_completion_proposed` and malformed-input test; registry completeness lists updated.
+**Architecture gates changed:** none (no new crate edges: `harw-ops → harw-plan-bridge` and `harw-cli → harw-plan-bridge` already existed).
+**Documentation updated:** PL-90 README and 04 §7.
+**Remaining plan items:** W03c learning outbox, W03d run isolation, small-model benchmark, W04+ (orchestrator, write waves, research, Matrix, LaTeX, DoD).
+
+---
+
+## MIG-016 — Harw-DoD suite reachable through harw (PL-97 D1–D5)
+
+**Planning compartment:** `docs/planning/97-harw-dod-mission-control-chain` (§3.1, §4 D1–D5), `docs/planning/50-dod-integration`
+**Baseline commit:** `dev@fcb12b41`
+**Implementation commit / PR:** branch `ccr-54aa3dfd-o46he2`, draft PR #154 → `dev`: D1 `30b44321`, D2 `7903df02`, D3 `af2b53a0`, D4 `703d9745`, D5 `2ce5b2fd`; security fixes from the wave-1 review `4b080e50`, `3eaccea2`, `64d3831c` (PR #156)
+**Affected crates:** new `harw-dod-client` (layer A); `harw-sentinel`, `harw-config`, `harw-install`, `harw-runtime`, `harw-ops`, `harw-cli`, `harw-registry-defaults`, `harw-home`, `harw-tui`
+
+**Before:** the DoD daemons ran as a separate install; harw read at most `<home>/dod/export/findings.jsonl` through the opt-in `security_signals` source; no CLI, operation, model tool or TUI surface; the sentinel unit passed neither `--config` nor exports.
+**Target:** one read-only path from harw to the suite's posture, the same on every surface; enforcement stays human-only (invariant S1).
+**Landed delta:**
+- "Harw-DoD (Detect · Orient · Defend)" is the suite name in human-facing text; crate, binary, unit and path names are unchanged.
+- `harw-sentinel.service` runs with `--config`, `--findings-export` and the new atomic `--health-export` (`health.json`); findings line `schema_version: 2` with optional `scope` (additive). New empty group `harw-dod-readers`; export dir `2750 harw-sentinel:harw-dod-readers`.
+- `[dod] export_dir` (trusted layers only) and `findings_window_hours` (default 24); an invalid `[dod]` table fails config loading.
+- `harw-dod-client`: export resolution, bounded tail reader (256 KiB, 16 KiB lines, no symlinks), `health.json`, config check, `systemctl show` unit state, `DodStatus`. Only the system export (`source: system`) is verified; home fallback, `export_dir` override and an unreadable system export carry an `UNVERIFIED` hint and are never silently replaced.
+- `harw dod status|doctor|findings|sensors|config check|config suggest|enable|disable|restart|warden status|enable|disable|install --print-systemd`, `--json`, exit codes 0/1/2/3 (3 = refused: not euid 0, or no valid `active_profile`).
+- `/dod` operation and the read-only, auto-approved model tools `dod.status`, `dod.findings`, `dod.sensors` (5 s cache, bounded, sanitized). The four security triage roles admit exactly these tools; their child sessions get them through a role-bound read-only provider (`harw-runtime/src/children.rs`).
+- Bundled skill `harw-dod` with the first real `triggers.toml` (tools `dod.*`, keywords such as `egress`, `sentinel`, `warden`, `cgroup`).
+- TUI: `/dod view` overlay, status-line mark `⛨ n high`, Finished/Failed title suffix `· ⛨ DoD n`.
+**What changed for operators:** `make -C dod install` run unprivileged (it builds, then asks for sudo for the file install and the enable step; or `make -C dod build` followed by `sudo make -C dod install-existing`), then `harw dod config suggest`, edit `/etc/harw-dod/config.toml`, `sudo harw dod enable`, `harw dod status`; add users to `harw-dod-readers` by hand to read the exports; `security_signals` now uses the same resolver.
+**Compatibility retained:** v1 export lines parse in every reader; no harw crate links the Warden or the escalation ladder; the Warden stays disabled by default.
+**Tests added/changed:** see PL-97 §9.1 rows D1–D5 (harw-sentinel, harw-install, harw-dod-client, harw-cli `dod_cmd`, harw-ops `dod`, harw-tui `dod_view`).
+**Architecture gates changed:** `harw-dod-client` in `xtask/arch-policy.toml` (layer A, forbidden from the Warden/escalation/daemons); spawn policy allows the `systemctl` status query.
+**Documentation updated:** `README.md`, `dod/README.md`, `docs/setup/dod.md`, `docs/cli.md`, `docs/design/harw-dod-charter.md`, `docs/security/pl97-security-review.md`.
+**Remaining plan items:** E4 landed in `0bababe2` (DoD side) and `b58fcd13` (harw side: `--job` filter, `⛨ n` badge); multi-cgroup rule findings stay without scope; `harw dod enable --grant-read`; the `make -C dod install`/`stage` enable step versus "no silent services" (PL-97 §8.4); Warden v2 proofs (PL-96 W01).
+
+## MIG-017 — Skill triggers and the tool landscape (PL-97 B1–B5, PL-95 S2–S6, PL-93)
+
+**Planning compartment:** `docs/planning/97-harw-dod-mission-control-chain` (§3.2, §4 B1–B5), `docs/planning/95-cli-tools-skills`, `docs/planning/93-common-command-tools`, `docs/planning/87-tool-gaps`
+**Baseline commit:** `dev@fcb12b41` (PL-95 S1 `triggers.toml` engine already on `dev`, `3df91189`)
+**Implementation commit / PR:** draft PR #154: B4 `6f33d09a`, B1 `765d6e9d`, B2 + B3 `af2b53a0`, B5 + G1 `703d9745`; review fix `8c39f26b` (unknown skills fail closed to Imported), `87d7fa45` (git read cap)
+**Affected crates:** `harw-core`, `harw-catalog`, `harw-context`, `harw-config`, `harw-session-store`, `harw-runtime`, `harw-registry-defaults`, `harw-ops`, `harw-instructions`, `harw-cli`, `harw-home`, `harw-agent-runner`, `harw-tool-{sys,gitread,fsread}`
+
+**Before:** `triggers.toml` was parsed but nothing injected it; `fsread.*`, `git.*` and `sys.*` were not registered; no tool index CLI, no tool→skill link, no description lint.
+**Target:** the right skill excerpt reaches the model when a trigger fires, within budget, with provenance; the internal tools are registered and discoverable.
+**Landed delta:**
+- Per-session `SkillInjector` in the turn loop: `skills.triggered` fragments after the cache-stable prefix, dedupe across rounds, per-turn and per-session budgets with typed drop reasons, reset after compaction, `injection` records in the session store; skills whose tools the session lacks are skipped. New `[skills]` (`triggered_injection`, `inject_imported`, `per_turn_bytes`, `per_session_bytes`; profile scope).
+- `fsread.*` (16) and `git.*` (6) in `Full` + `ReadOnlyExplore` (auto-approved), `sys.*` (12) in `Full` only (asks like `process.list`); the four tool skills bundled with `triggers.toml`.
+- `ToolIndexEntry::skill`, read-only model tool `tool.index`, `harw tool list|describe`, the cache-stable `## Tool families` prompt block, one registry lint (≥ 60 chars, start pattern, every argument described; allowlists with reasons).
+- `harw skill list|show|preview|validate` and `/skills preview|validate` (same selection code as the injector, no model call).
+- B5: clap-tree walk (help text everywhere; `--json` or an explicit text-only allowlist). G1: pinned Full-root tool-spec budget test.
+**What changed for operators:** sessions now receive triggered skill excerpts by default (`[skills] triggered_injection = false` turns it off); `harw skill preview …` shows what would be injected; `harw tool list|describe` lists every tool of the build; `git.*`/`fsread.*` calls are auto-approved, `sys.*` asks.
+**Compatibility retained:** the stable instruction prefix is byte-identical across turns; imported skills are `Evidence` and off unless `[skills] inject_imported = true`.
+**Tests added/changed:** PL-97 §9.1 rows B1–B5, G1.
+**Architecture gates changed:** none beyond the new registrations (catalog, `tool_permission`, approval lists).
+**Documentation updated:** `docs/cli.md` (`harw skill`, `harw tool`), `docs/design/config-structure.md` (`[skills]`), PL-93 and PL-95 status.
+**Remaining plan items:** G1 small-window refusal of a Full root (**owner decision**); the eight remaining `cargo.*` tools and `cargo-tools` command/error-code triggers; synthetic first-use `Tool` trigger; the root's real tool set in `## Tool families`; `job.*` lint; `SkillInjector` for child sessions; `harw tool call`, `harw skill new|import|stats` (PL-95 S7–S9).
+
+## MIG-018 — TUI Mission Control (PL-97 C1–C5, C4b, R1; PL-94 W00–W02, PL-68 W20)
+
+**Planning compartment:** `docs/planning/97-harw-dod-mission-control-chain` (§3.3, §4 C1–C5, C4b), `docs/planning/94-adaptive-tui-mission-control`, `docs/planning/68-mobile-tui`
+**Baseline commit:** `dev@fcb12b41`
+**Implementation commit / PR:** draft PR #154: C1 `ca2dfd6c`, C4a `d21fc698`, C2 `6db6745a`, C3 + C4 `3d98064d`, M3 + D5 + C4b + R1 `2ce5b2fd`, C5 `654b2677`, spawn allow-list `86867b59`
+**Affected crates:** `harw-tui-layout`, `harw-tui`, `harw-tool-job`, `harw-agent-runner`, `harw-config`, `xtask`
+
+**Before:** one portrait dock and strip; agents and jobs in one panel; no terminal aggregates, no job stop from the panel, no hard stop, reasoning as a dim aside.
+**Target:** chat-first Mission Control with separately bordered windows in portrait and landscape (W02), bounded live projections, operator stop through the command path.
+**Landed delta:**
+- `harw_tui_layout::classify_mission`: PortraitStack / LandscapeThreeColumns / ShallowLandscape / CompactSummary.
+- `harw-tui/src/mission/`: Active Agents, Active Jobs, Finished/Failed and LIVE windows, each with its own focus, scroll and selection; landscape anchors (Chat left, Finished top-centre, LIVE below, Agents over Jobs right); click-to-focus; wheel scrolls only the window under the pointer.
+- Keys: `Alt+J` (`focus_jobs`), `Alt+F` (`focus_finished`), `Alt+L` (`toggle_live_detail`), `p` pins the selected agent to LIVE, `x` in the Jobs window opens a confirmation and dispatches `/jobs stop <id>` through the regular command path.
+- Terminal aggregates by typed provenance (`ManagedJobOrigin`; agent+job of one child counted once; `Unknown job`; `Agent child (pending)`), `✗ n NEW` badge, retention 50 per category.
+- 2×Ctrl+C hard stop while work runs: managed jobs via `JobManager::stop`, `harw-job-*` cgroups via `cgroup.kill`, process-tree fallback only without a known cgroup; exit 130.
+- `[tui] reasoning = "message" | "collapsed" | "hidden"` (default `message`).
+- C5: inline activity-ranked live cells (`app/live_slots.rs`), at most two virtual cells at slot #2/#3, `+N weitere aktiv`, identity anchor while scrolled up.
+**What changed for operators:** the TUI layout changes at every size (portrait windows, three landscape columns, compact counters at the smallest sizes, e.g. 39×60 and 48×19); new default chords `Alt+J/F/L` yield to chords a keybindings file already uses; reasoning summaries are expanded by default (`[tui] reasoning = "collapsed"` restores a compact view); a second Ctrl+C during a turn or a running job is now an emergency stop (exit code 130).
+**Compatibility retained:** R19 portrait tests unchanged; canonical history cells, export, persistence and model context are untouched by the live projections; `ManagedJobOrigin` is provenance only.
+**Tests added/changed:** PL-97 §9.1 rows C1–C5, C4b, R1 (harw-tui 1426 lib tests at `654b2677`).
+**Architecture gates changed:** spawn policy allow-lists the read-only `ps` snapshot of the hard stop.
+**Documentation updated:** `docs/design/tui-command-contract.md` §8, `docs/design/tui-architecture.md`, PL-94/PL-68 status.
+**Remaining plan items:** durable-job stop from the Jobs window (PL-97 §8.3); a TUI mark for the execution chain report (E5); window title language.
+
+## MIG-019 — Execution chain: Bubblewrap ∘ Landlock ∘ cgroup v2 ∘ DoD (PL-97 E1–E5)
+
+**Planning compartment:** `docs/planning/97-harw-dod-mission-control-chain` (§3.4, §4 E1–E5, §8.2), `docs/planning/90-intent-driven-composed-agents/07-coding-cycles-orchestration-plan.md` (PR #153 contract)
+**Baseline commit:** `dev@fcb12b41`
+**Implementation commit / PR:** draft PR #154: E1a `2cfd4e7a`, E1b `a07f7f6f`, E2a `0922d70e`, E2c `08aaecd8`, E2d `93471a44`, E2b `05d2d5b7`, E3b `1b63871c`, E3c `a214d590`, E2e + E3 + E5 `f31d639f`; E2f (RLIMIT_NPROC through `ResourceRequest` and the trampoline) `7b9e23e3`; E2g (RLIMIT_NPROC refused or reported not enforced for an exempt uid 0 / `CAP_SYS_ADMIN` / `CAP_SYS_RESOURCE` identity unless `pids.max` covers it) `97804cbb`
+**Affected crates:** `harw-job-exec`, `harw-job-linux`, `harw-job-core`, `harw-job-runtime`, `harw-job-executor-{bwrap,oci,k8s,darwin}`, `harw-command`, `harw-sandbox`, `harw-tool-shell`, `harw-tool-job`, `harw-agent-runner`, `harw-config`, `harw-install`, `harw-dod-client`, `harw-cli`, `dod/crates/{harw-dod-bpf,harw-probe-bpf}`
+
+**Before:** bwrap, the Landlock trampoline and cgroups were alternative backends; `shell.exec` ran a `prlimit … -- bwrap …` argv as an unsandboxed host job; the probe always attached with host scope.
+**Target:** every sandboxed job runs in its cgroup, inside a Bubblewrap namespace, with Landlock, NNP, capability drop and rlimits; DoD observes the job cgroups; one honest readiness report.
+**Landed delta:**
+- `BwrapTrampoline` backend: `harw-job-exec` joins the job cgroup, execs bwrap; the inner stage verifies `/proc/self/cgroup` (`CgroupJoin::Verify`), applies NNP, capability drop and the Landlock policy mapped through `PathMap`; the job can never rewrite its report. `select_backend` picks BwrapTrampoline, Bwrap, LandlockTrampoline or none and records why.
+- Versioned per-job write scope in `JobSpec` (unknown version or out-of-workspace path refused); scoped and `SandboxRequirement::Required` jobs fail closed without an enforcing backend; Landlock hard mode for scoped policies.
+- `shell.exec`, `job.start` and child agents submit a `JobSpec` to the chain (child agents receive the parent workspace root but stay unconfined); **`[sandbox] execution` defaults to `chain`, `legacy` is the opt-out** (profile scope; an untrusted project layer cannot set it); the no-config fallback inside the providers stays `Legacy`.
+- `resolve_delegated_root`: `[jobs] cgroup_root` → `HARW_CGROUP_ROOT` → own delegated cgroup (never as euid 0) → none with hint; `[jobs] trampoline` override (trusted layers only); `harw-control.service` and the `harw-serve` user unit set `Delegate=yes` and `DelegateSubgroup=harw-main`; `harw-job-exec` ships in every release path and `harw doctor` reports it missing.
+- DoD: incremental BPF descendant scope with 2 s rescans; the probe loads its profile before opening a socket and refuses a missing/untrusted/invalid config; `harw dod config suggest [--drop-in]` prints the profile, `[dod] allowed_cgroup_prefixes` and the sentinel/probe drop-ins.
+- `harw_dod_client::chain::ExecutionChainReport` (Installed / Configured / Running / Ready) in `harw doctor` (`chain/<stage>` checks, warnings only), `harw dod doctor` (table, `execution_chain` in `--json`) and the verify runner.
+- OCI, K8s and Darwin executors never over-report the new resource fields and refuse `require_rlimits`.
+**What changed for operators:** jobs and `shell.exec` now run through the chain by default; set `[sandbox] execution = "legacy"` to keep the previous path; start harw under a delegated cgroup (`harw service install`, `harw-control.service`, or `systemd-run --user --scope -p Delegate=yes`) or set `[jobs] cgroup_root`; check with `harw doctor` / `harw dod doctor`.
+**Compatibility retained:** jobs without a sandbox requirement and unscoped BestEffort jobs behave as before when no backend is available; old plan JSON and job records parse.
+**Tests added/changed:** PL-97 §9.1 rows E1a–E5.
+**Architecture gates changed:** `harw-job-exec` stays in `gate_privileges`; no `*-sys` crate in layer J; no new DoD capability; `harw-cli` drops its unused `harw-job-executor-bwrap` dependency.
+**Documentation updated:** `docs/design/mediated-process-execution.md`, `docs/design/config-scopes.md`, `docs/setup/install.md`, `docs/setup/dod.md`, `docs/cli.md`.
+**Remaining plan items:** a separate rlimit (`process_count`) dimension in `SandboxReport` (E2f/E2g follow-up); child agents stay unconfined on the chain path; `harw serve`/`harw web` do not build their command port from the `[jobs]` options; kernel-side ancestor matching; TUI chain mark. Note: the `f31d639f` message says `DelegateSubgroup=harw.slice`; the tree uses `harw-main`.
+
+## MIG-020 — Semantic activity and macro metadata (PL-97 M1–M3, PL-71)
+
+**Planning compartment:** `docs/planning/97-harw-dod-mission-control-chain` (§3.5, §4 M1–M3), `docs/planning/71-semantic-activity-patterns`
+**Baseline commit:** `dev@fcb12b41`
+**Implementation commit / PR:** draft PR #154: M1 `27ea6e10` (fixtures `a7111029`), M2 `47a0720e`, M3 registry side `703d9745`, M3 TUI side `2ce5b2fd`; review fix `ff7ca74a`
+**Affected crates:** new `harw-activity` (layer I); `harw-macros`, `harw-tools`, `harw-tool-fs`, `harw-tool-fsread`, `harw-tool-sys`, `harw-registry-defaults`, `harw-tui`
+
+**Before:** PL-71 was planning only; tool cells were grouped by ad-hoc rules in the TUI.
+**Target:** a deterministic activity vocabulary and reducer, declared in the tool macros, driving the TUI history without carrying authority.
+**Landed delta:**
+- `harw-activity`: descriptors, events with a total order, the v1 patterns `file-read-burst@1`, `file-edit-read-loop@1`, `job-lifecycle@1`, `agent-role-failure-burst@1`, `standalone@1`, deterministic reducer with explicit anomalies and bounded retention (`evict_closed`).
+- `#[tool(activity(...), skill = "...")]`, `TOOL_ACTIVITIES`/`TOOL_SKILLS`, `permission_request!` (compile-time validated); `ToolSpec` JSON unchanged. First migration wave: `harw-tool-fs` read/edit tools.
+- `activity_for(tool)` in the registry; `app/activity_glue.rs` feeds tool, job and agent lifecycles into the reducer (`A · Edit ×1 · Read ×3`, one updating job cell, unknown job ends count as failed); `ToolVerbosity::Activity` salvaged from PR #76 (`Compact` stays the default).
+**What changed for operators:** edit/read loops and job lifecycles in the chat history update one cell in place; `/verbose` cycles Compact → Verbose → Activity; failure bursts back the Finished window's `NEW` badge.
+**Compatibility retained:** existing `ToolGroupCell` tally lines; activity data feeds no permission, approval or sandbox decision.
+**Tests added/changed:** PL-97 §9.1 rows M1–M3 (harw-activity 51 unit + 11 replay tests, harw-macros trybuild 40–47).
+**Architecture gates changed:** `harw-activity` in `xtask/arch-policy.toml` (layer I); `harw-macros` stays layer F.
+**Documentation updated:** PL-71 status, `docs/design/tui-architecture.md`.
+**Remaining plan items:** `permission_request!` call site in the operation framework; further migration waves of tool descriptors (PL-71 §Migration).

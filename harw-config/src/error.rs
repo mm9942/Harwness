@@ -42,6 +42,11 @@ pub enum ConfigError {
     )]
     WriterShapeMismatch { key: String, expected: &'static str },
 
+    #[msg(
+        "configuration was committed, but directory sync failed and crash durability is uncertain: {0}"
+    )]
+    CommittedDurabilityUncertain(std::io::Error),
+
     #[from]
     Io(std::io::Error),
 }

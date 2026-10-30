@@ -1,0 +1,12 @@
+[Unit]
+Description=harw DoD sentinel (sentinel.sock, SOCK_SEQPACKET)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.harw/bin/harw-sentinel --socket %h/.harw/sentinel.sock
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

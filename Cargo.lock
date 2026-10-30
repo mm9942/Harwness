@@ -204,7 +204,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -215,7 +215,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -647,7 +647,7 @@ dependencies = [
  "maybe-owned",
  "rustix 1.1.5",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -1350,9 +1350,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "a2376ffd6f96d8a9db59875b4b6b0237d6900b5baf64279714e05493ce64828a"
 dependencies = [
  "cmov",
 ]
@@ -1724,7 +1724,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "harw"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-agent-dsl",
  "harw-authority",
@@ -2142,8 +2142,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-activity"
+version = "0.10.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harw-agent-artifact"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2153,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "harw-agent-compiler"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-agent-artifact",
  "harw-agent-dsl",
@@ -2170,7 +2178,7 @@ dependencies = [
 
 [[package]]
 name = "harw-agent-dsl"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "harw-context",
@@ -2183,7 +2191,7 @@ dependencies = [
 
 [[package]]
 name = "harw-agent-runner"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "futures-core",
@@ -2213,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "harw-auth-hub"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -2244,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "harw-authority"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "harw-types",
@@ -2257,7 +2265,7 @@ dependencies = [
 
 [[package]]
 name = "harw-browser"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "harw-test-support",
@@ -2271,7 +2279,7 @@ dependencies = [
 
 [[package]]
 name = "harw-browser-thirtyfour"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2293,7 +2301,7 @@ dependencies = [
 
 [[package]]
 name = "harw-catalog"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-config",
  "harw-context",
@@ -2310,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "harw-channel"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "fs4",
  "harw-macros",
@@ -2326,7 +2334,7 @@ dependencies = [
 
 [[package]]
 name = "harw-channel-telegram"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-channel",
@@ -2345,7 +2353,7 @@ dependencies = [
 
 [[package]]
 name = "harw-channel-telegram-transport"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "axum",
  "fs4",
@@ -2368,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "harw-cli"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "blake3",
@@ -2387,12 +2395,13 @@ dependencies = [
  "harw-config",
  "harw-context",
  "harw-core",
+ "harw-dod-client",
  "harw-dod-encrypt",
  "harw-extension-api",
+ "harw-fsutil",
  "harw-home",
  "harw-infra-client",
  "harw-install",
- "harw-job-executor-bwrap",
  "harw-job-runtime",
  "harw-job-store",
  "harw-killer",
@@ -2431,6 +2440,7 @@ dependencies = [
  "harw-tailscale",
  "harw-tool-doc",
  "harw-tool-lens",
+ "harw-tools",
  "harw-tui",
  "harw-types",
  "harw-web",
@@ -2444,6 +2454,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tikv-jemallocator",
+ "time",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "toml_edit",
@@ -2453,7 +2464,7 @@ dependencies = [
 
 [[package]]
 name = "harw-cloud"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-cloud-enroll",
  "harw-cloud-gateway",
@@ -2462,9 +2473,10 @@ dependencies = [
 
 [[package]]
 name = "harw-cloud-enroll"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-types",
+ "jiff",
  "serde",
  "serde_json",
  "tracing",
@@ -2472,7 +2484,7 @@ dependencies = [
 
 [[package]]
 name = "harw-cloud-gateway"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "pingora",
@@ -2484,29 +2496,35 @@ dependencies = [
 
 [[package]]
 name = "harw-cloud-ops"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
+ "harw-authority",
  "harw-cloud-gateway",
+ "harw-home",
  "harw-macros",
+ "harw-node-listener",
  "harw-operations",
  "harw-tools",
+ "harw-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
 [[package]]
 name = "harw-cloudctl"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-cloud-gateway",
+ "harw-install",
  "serde_json",
  "tokio",
 ]
 
 [[package]]
 name = "harw-code-graph"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-macros",
  "harw-test-support",
@@ -2517,9 +2535,13 @@ dependencies = [
 
 [[package]]
 name = "harw-command"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-job",
+ "harw-job-core",
+ "harw-job-executor-bwrap",
+ "harw-job-runtime",
+ "harw-sandbox",
  "harw-test-support",
  "harw-types",
  "jiff",
@@ -2529,7 +2551,7 @@ dependencies = [
 
 [[package]]
 name = "harw-completions"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2540,7 +2562,7 @@ dependencies = [
 
 [[package]]
 name = "harw-config"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-fsutil",
  "harw-macros",
@@ -2557,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "harw-container-model"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2565,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "harw-context"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-lens-types",
@@ -2579,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "harw-context-ledger"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-test-support",
  "serde",
@@ -2589,7 +2611,7 @@ dependencies = [
 
 [[package]]
 name = "harw-core"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-agent-dsl",
  "harw-authority",
@@ -2620,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "harw-core-bridge"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-agent-dsl",
  "harw-authority",
@@ -2640,7 +2662,7 @@ dependencies = [
 
 [[package]]
 name = "harw-digest"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2649,7 +2671,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-dod-authlog",
@@ -2679,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-authlog"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2694,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-blockio"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2709,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-bpf"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "aya",
  "harw-dod-cap",
@@ -2723,7 +2745,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-cap"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-macros",
@@ -2736,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-cgroup"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2751,8 +2773,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-dod-client"
+version = "0.10.0"
+dependencies = [
+ "harw-dod-config",
+ "harw-types",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+]
+
+[[package]]
 name = "harw-dod-config"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "harw-test-support",
@@ -2765,7 +2800,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-container"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-container-model",
  "harw-dod-cap",
@@ -2779,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-cpu"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2794,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-encrypt"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "crypt_guard_service",
  "harw-macros",
@@ -2803,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-escalate"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-dod-rules",
@@ -2822,7 +2857,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-fixtures"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-readfs",
@@ -2838,7 +2873,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-flow"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-dod-bpf",
@@ -2856,7 +2891,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-fsmon"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2872,7 +2907,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-gpu"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2887,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-listener"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2902,7 +2937,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-memory"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2917,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-netcounters"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -2933,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-netlink"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-macros",
@@ -2943,7 +2978,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-netpolicy"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-dod-cap",
@@ -2957,7 +2992,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-procmon"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-bpf",
  "harw-dod-cap",
@@ -2971,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-readfs"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-macros",
@@ -2981,7 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-rules"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-code-graph",
@@ -2999,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-scanreport"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -3017,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-sentinel"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-code-graph",
@@ -3038,7 +3073,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-signals"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-macros",
@@ -3052,7 +3087,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-thermal"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-cap",
  "harw-dod-fixtures",
@@ -3067,7 +3102,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-warden"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-dod-warden-proto",
  "harw-macros",
@@ -3080,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-warden-proto"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "harw-macros",
@@ -3093,7 +3128,7 @@ dependencies = [
 
 [[package]]
 name = "harw-dod-workspace"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-code-graph",
  "harw-dod-cap",
@@ -3111,7 +3146,7 @@ dependencies = [
 
 [[package]]
 name = "harw-egress"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "harw-authority",
@@ -3126,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "harw-explorer"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "globset",
  "ignore",
@@ -3140,7 +3175,7 @@ dependencies = [
 
 [[package]]
 name = "harw-extension-api"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-catalog",
@@ -3158,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "harw-fsutil"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "rustix 1.1.5",
  "tempfile",
@@ -3166,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "harw-home"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "harw-agent-dsl",
@@ -3181,7 +3216,7 @@ dependencies = [
 
 [[package]]
 name = "harw-infra-client"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "crypt_guard",
@@ -3201,11 +3236,12 @@ dependencies = [
 
 [[package]]
 name = "harw-install"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "harw-config",
+ "harw-dod-client",
  "harw-home",
  "harw-test-support",
  "jiff",
@@ -3217,7 +3253,7 @@ dependencies = [
 
 [[package]]
 name = "harw-instructions"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-extension-api",
  "harw-macros",
@@ -3228,7 +3264,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-job-core",
  "harw-job-executor-oci",
@@ -3241,7 +3277,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-core"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-macros",
  "harw-observe",
@@ -3254,7 +3290,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-darwin"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-job-core",
  "rustix 1.1.5",
@@ -3265,7 +3301,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-exec"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-job-core",
  "harw-job-linux",
@@ -3278,7 +3314,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-executor-bwrap"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-job-core",
@@ -3291,7 +3327,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-executor-k8s"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-container-model",
  "harw-job-core",
@@ -3307,7 +3343,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-executor-oci"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-container-model",
  "harw-job-core",
@@ -3325,7 +3361,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-linux"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "cap-std",
  "harw-job-core",
@@ -3340,7 +3376,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-runtime"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-job-core",
  "harw-job-darwin",
@@ -3350,18 +3386,21 @@ dependencies = [
  "harw-job-store",
  "harw-job-tokio",
  "harw-placement-model",
+ "harw-provider",
  "harw-types",
  "jiff",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
 name = "harw-job-store"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "cap-std",
  "fs4",
@@ -3376,7 +3415,7 @@ dependencies = [
 
 [[package]]
 name = "harw-job-tokio"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "harw-job-core",
@@ -3387,7 +3426,7 @@ dependencies = [
 
 [[package]]
 name = "harw-killer"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "clap",
  "rustix 1.1.5",
@@ -3399,7 +3438,7 @@ dependencies = [
 
 [[package]]
 name = "harw-knowledge"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "fs4",
  "harw-agent-dsl",
@@ -3423,7 +3462,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-lens-embed",
  "harw-lens-query",
@@ -3436,7 +3475,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-chunk"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-lens-types",
  "harw-macros",
@@ -3446,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-embed"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "harw-lens-types",
@@ -3462,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-federation"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-knowledge",
  "harw-lens-embed",
@@ -3480,7 +3519,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-index"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-lens-rank",
  "harw-lens-store",
@@ -3495,7 +3534,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-query"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-home",
  "harw-knowledge",
@@ -3514,7 +3553,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-rank"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-lens-types",
  "harw-types",
@@ -3522,7 +3561,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-source"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-home",
  "harw-knowledge",
@@ -3542,7 +3581,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-store"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "fs4",
  "harw-home",
@@ -3557,7 +3596,7 @@ dependencies = [
 
 [[package]]
 name = "harw-lens-types"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-digest",
  "harw-macros",
@@ -3568,9 +3607,10 @@ dependencies = [
 
 [[package]]
 name = "harw-macros"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
+ "harw-authority",
  "harw-dod-cap",
  "harw-dod-readfs",
  "harw-dod-signals",
@@ -3593,7 +3633,7 @@ dependencies = [
 
 [[package]]
 name = "harw-matrix-game"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "jiff",
  "rand_chacha 0.10.0",
@@ -3605,7 +3645,7 @@ dependencies = [
 
 [[package]]
 name = "harw-mcp-client"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-extension-api",
  "harw-tools",
@@ -3619,7 +3659,7 @@ dependencies = [
 
 [[package]]
 name = "harw-mcp-server"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "harw-job-core",
@@ -3638,19 +3678,20 @@ dependencies = [
 
 [[package]]
 name = "harw-media"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-digest",
  "harw-fsutil",
  "harw-protocol",
  "harw-test-support",
  "rustix 1.1.5",
+ "serde",
  "tempfile",
 ]
 
 [[package]]
 name = "harw-memory"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-context",
  "harw-extension-api",
@@ -3668,7 +3709,7 @@ dependencies = [
 
 [[package]]
 name = "harw-mobile-core"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-protocol",
  "harw-session-client",
@@ -3685,7 +3726,7 @@ dependencies = [
 
 [[package]]
 name = "harw-mobile-term"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-mobile-core",
  "harw-protocol",
@@ -3702,7 +3743,7 @@ dependencies = [
 
 [[package]]
 name = "harw-model-catalog"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-config",
  "harw-context",
@@ -3719,7 +3760,7 @@ dependencies = [
 
 [[package]]
 name = "harw-netsec"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "fs4",
@@ -3741,10 +3782,11 @@ dependencies = [
 
 [[package]]
 name = "harw-node-listener"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "futures-util",
+ "harw-fsutil",
  "harw-node-transport",
  "harw-protocol",
  "harw-session-host",
@@ -3765,7 +3807,7 @@ dependencies = [
 
 [[package]]
 name = "harw-node-transport"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -3788,7 +3830,7 @@ dependencies = [
 
 [[package]]
 name = "harw-oauth"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "base64 0.23.1",
  "fs4",
@@ -3805,7 +3847,7 @@ dependencies = [
 
 [[package]]
 name = "harw-observe"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-macros",
  "harw-test-support",
@@ -3815,7 +3857,7 @@ dependencies = [
 
 [[package]]
 name = "harw-observe-file"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "harw-macros",
@@ -3829,7 +3871,7 @@ dependencies = [
 
 [[package]]
 name = "harw-observe-otlp"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "harw-macros",
@@ -3846,7 +3888,7 @@ dependencies = [
 
 [[package]]
 name = "harw-observe-prom"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-macros",
  "harw-observe",
@@ -3856,7 +3898,7 @@ dependencies = [
 
 [[package]]
 name = "harw-operations"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-extension-api",
@@ -3873,7 +3915,7 @@ dependencies = [
 
 [[package]]
 name = "harw-ops"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-agent-compiler",
  "harw-agent-dsl",
@@ -3884,6 +3926,7 @@ dependencies = [
  "harw-config",
  "harw-core",
  "harw-core-bridge",
+ "harw-dod-client",
  "harw-explorer",
  "harw-extension-api",
  "harw-home",
@@ -3925,7 +3968,7 @@ dependencies = [
 
 [[package]]
 name = "harw-placement-model"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3933,8 +3976,9 @@ dependencies = [
 
 [[package]]
 name = "harw-plan"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
+ "fs4",
  "harw-macros",
  "harw-types",
  "serde",
@@ -3946,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "harw-plan-bridge"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "fs4",
  "harw-agent-dsl",
@@ -3984,7 +4028,7 @@ dependencies = [
 
 [[package]]
 name = "harw-probe-bpf"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "clap",
  "harw-authority",
@@ -4010,7 +4054,7 @@ dependencies = [
 
 [[package]]
 name = "harw-probe-fs"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "clap",
  "harw-completions",
@@ -4031,7 +4075,7 @@ dependencies = [
 
 [[package]]
 name = "harw-project-discovery"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-extension-api",
  "harw-macros",
@@ -4044,7 +4088,7 @@ dependencies = [
 
 [[package]]
 name = "harw-protocol"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-test-support",
  "harw-types",
@@ -4055,7 +4099,7 @@ dependencies = [
 
 [[package]]
 name = "harw-provider"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-macros",
  "harw-types",
@@ -4068,7 +4112,7 @@ dependencies = [
 
 [[package]]
 name = "harw-provider-http"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "base64 0.23.1",
  "harw-config",
@@ -4093,7 +4137,7 @@ dependencies = [
 
 [[package]]
 name = "harw-registry-defaults"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-agent-compiler",
  "harw-agent-dsl",
@@ -4118,12 +4162,15 @@ dependencies = [
  "harw-tool-doc",
  "harw-tool-explorer",
  "harw-tool-fs",
+ "harw-tool-fsread",
+ "harw-tool-gitread",
  "harw-tool-job",
  "harw-tool-lens",
  "harw-tool-obsidian",
  "harw-tool-plan",
  "harw-tool-process",
  "harw-tool-shell",
+ "harw-tool-sys",
  "harw-tool-web",
  "harw-tools",
  "harw-types",
@@ -4140,7 +4187,7 @@ dependencies = [
 
 [[package]]
 name = "harw-research"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-macros",
  "harw-test-support",
@@ -4152,7 +4199,7 @@ dependencies = [
 
 [[package]]
 name = "harw-retention"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-macros",
  "harw-test-support",
@@ -4163,7 +4210,7 @@ dependencies = [
 
 [[package]]
 name = "harw-reverse-proxy"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-egress",
  "harw-netsec",
@@ -4171,7 +4218,7 @@ dependencies = [
 
 [[package]]
 name = "harw-runtime"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-agent-artifact",
  "harw-agent-dsl",
@@ -4184,6 +4231,7 @@ dependencies = [
  "harw-context-ledger",
  "harw-core",
  "harw-core-bridge",
+ "harw-dod-client",
  "harw-explorer",
  "harw-extension-api",
  "harw-fsutil",
@@ -4195,6 +4243,7 @@ dependencies = [
  "harw-lens-types",
  "harw-macros",
  "harw-mcp-client",
+ "harw-media",
  "harw-memory",
  "harw-model-catalog",
  "harw-observe",
@@ -4211,6 +4260,7 @@ dependencies = [
  "harw-session-store",
  "harw-tool-container",
  "harw-tool-container-run",
+ "harw-tool-fs",
  "harw-tool-job",
  "harw-tool-plan",
  "harw-tool-remote",
@@ -4230,7 +4280,7 @@ dependencies = [
 
 [[package]]
 name = "harw-sandbox"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-test-support",
@@ -4242,7 +4292,7 @@ dependencies = [
 
 [[package]]
 name = "harw-secrets"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "aes-gcm-siv 0.12.1",
  "chacha20poly1305 0.11.0",
@@ -4263,7 +4313,7 @@ dependencies = [
 
 [[package]]
 name = "harw-security-hub"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "clap",
@@ -4285,7 +4335,7 @@ dependencies = [
 
 [[package]]
 name = "harw-sentinel"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "clap",
  "harw-authority",
@@ -4325,7 +4375,7 @@ dependencies = [
 
 [[package]]
 name = "harw-session-client"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-protocol",
  "harw-test-support",
@@ -4336,7 +4386,7 @@ dependencies = [
 
 [[package]]
 name = "harw-session-com"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -4363,7 +4413,7 @@ dependencies = [
 
 [[package]]
 name = "harw-session-daemon"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4385,9 +4435,10 @@ dependencies = [
 
 [[package]]
 name = "harw-session-driver"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-core",
+ "harw-extension-api",
  "harw-protocol",
  "harw-session-host",
  "harw-session-store",
@@ -4400,8 +4451,9 @@ dependencies = [
 
 [[package]]
 name = "harw-session-host"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
+ "fs4",
  "harw-authority",
  "harw-fsutil",
  "harw-protocol",
@@ -4419,7 +4471,7 @@ dependencies = [
 
 [[package]]
 name = "harw-session-remote"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4443,7 +4495,7 @@ dependencies = [
 
 [[package]]
 name = "harw-session-store"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "fs4",
  "harw-fsutil",
@@ -4462,7 +4514,7 @@ dependencies = [
 
 [[package]]
 name = "harw-session-ws"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4484,7 +4536,7 @@ dependencies = [
 
 [[package]]
 name = "harw-step-list"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4492,7 +4544,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tailscale"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4503,11 +4555,11 @@ dependencies = [
 
 [[package]]
 name = "harw-test-support"
-version = "0.9.1"
+version = "0.10.0"
 
 [[package]]
 name = "harw-tool-browser"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "harw-authority",
@@ -4525,7 +4577,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-cargo"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-extension-api",
@@ -4543,11 +4595,11 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-container"
-version = "0.9.1"
+version = "0.10.0"
 
 [[package]]
 name = "harw-tool-container-run"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-command",
@@ -4565,7 +4617,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-deps"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-code-graph",
@@ -4582,7 +4634,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-doc"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "base64 0.23.1",
  "harw-authority",
@@ -4603,7 +4655,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-explorer"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-explorer",
@@ -4621,7 +4673,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-fs"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "globset",
  "harw-authority",
@@ -4629,6 +4681,8 @@ dependencies = [
  "harw-fsutil",
  "harw-home",
  "harw-macros",
+ "harw-media",
+ "harw-protocol",
  "harw-sandbox",
  "harw-tools",
  "harw-types",
@@ -4643,7 +4697,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-fsread"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "globset",
  "harw-authority",
@@ -4665,7 +4719,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-gitread"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "flate2",
  "harw-authority",
@@ -4686,7 +4740,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-job"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-command",
@@ -4709,7 +4763,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-lens"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-extension-api",
@@ -4730,7 +4784,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-obsidian"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-extension-api",
@@ -4746,7 +4800,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-plan"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-extension-api",
@@ -4763,7 +4817,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-process"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-extension-api",
@@ -4780,7 +4834,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-remote"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-extension-api",
@@ -4796,7 +4850,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-shell"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "harw-authority",
@@ -4819,7 +4873,7 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-sys"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-authority",
  "harw-extension-api",
@@ -4838,11 +4892,11 @@ dependencies = [
 
 [[package]]
 name = "harw-tool-tunnel"
-version = "0.9.1"
+version = "0.10.0"
 
 [[package]]
 name = "harw-tool-web"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "blake3",
  "harw-authority",
@@ -4865,9 +4919,10 @@ dependencies = [
 
 [[package]]
 name = "harw-tools"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "async-trait",
+ "harw-activity",
  "harw-authority",
  "harw-context",
  "harw-lens-types",
@@ -4883,9 +4938,10 @@ dependencies = [
 
 [[package]]
 name = "harw-tui"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "crossterm 0.29.0",
+ "harw-activity",
  "harw-agent-artifact",
  "harw-agent-dsl",
  "harw-authority",
@@ -4922,6 +4978,7 @@ dependencies = [
  "harw-types",
  "jiff",
  "ratatui",
+ "rustix 1.1.5",
  "secrecy 0.8.0",
  "serde_json",
  "tempfile",
@@ -4936,11 +4993,11 @@ dependencies = [
 
 [[package]]
 name = "harw-tui-layout"
-version = "0.9.1"
+version = "0.10.0"
 
 [[package]]
 name = "harw-types"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-digest",
  "jiff",
@@ -4953,7 +5010,7 @@ dependencies = [
 
 [[package]]
 name = "harw-warden"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "clap",
  "harw-completions",
@@ -4974,7 +5031,7 @@ dependencies = [
 
 [[package]]
 name = "harw-web"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "harw-authority",
@@ -5001,7 +5058,7 @@ dependencies = [
 
 [[package]]
 name = "harwness-sdk"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "futures-core",
  "harw-agent-artifact",
@@ -5303,7 +5360,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -6208,7 +6265,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6924,7 +6981,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7140,7 +7197,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -7244,7 +7301,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7259,9 +7316,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -7312,7 +7369,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7323,9 +7380,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -7828,7 +7885,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8002,10 +8059,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8196,9 +8253,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -8566,7 +8623,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8842,9 +8899,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -8855,14 +8912,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -8889,7 +8946,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9193,7 +9250,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "harw-code-graph",
  "harw-test-support",
@@ -9375,14 +9432,15 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
+version = "9.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+checksum = "a954114b47a54df49f83d2722814e86b23d4bb1b54a1b90fb7d92b41619ddc22"
 dependencies = [
  "crc32fast",
  "flate2",
  "indexmap",
  "memchr",
+ "nix 0.31.3",
  "typed-path",
  "zopfli",
 ]
@@ -9413,27 +9471,27 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.14.0"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf06bd8162af0734b344780deb55b42a2429ae430870d13fcc12f238e880fe6e"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "8.0.0"
+version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae42c0555055784c70058d19ba8e275528e8a99a706684868ace5da4e716a4ab"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.0+zstd.1.5.7"
+version = "2.1.2+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",

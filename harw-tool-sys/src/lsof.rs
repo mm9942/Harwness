@@ -212,7 +212,8 @@ pub fn run(procfs: &ProcFs, own_uid: u32, args: &LsofArgs) -> ToolOutput {
     name = "sys.lsof",
     description = "Lists the open file descriptors of one of your own processes like lsof -p: fd number, type (file, dir, socket, pipe, device, anon_inode), target path, access mode, offset and, for sockets, the matching connection; plus the cwd, exe and root links. Use when you need to know which files or sockets a process holds open (for example before killing it or when a file is busy) instead of running lsof. Only processes of the current user are inspected. Returns JSON {descriptors:[...], links, count, total, truncated}. Names and modes only, never contents. Linux only.",
     permission = "execute_process",
-    parallel_safe
+    parallel_safe,
+    skill = "sys-tools"
 )]
 async fn sys_lsof(
     _context: &ToolExecutionContext,

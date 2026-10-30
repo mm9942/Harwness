@@ -18,19 +18,25 @@
 //!
 //! # Nebenläufigkeit
 //! Ein [`ConfigWriter`] hält das Dokument exklusiv im Prozessspeicher, bis
-//! `save()` läuft. Parallele Schreiber auf denselben Pfad sind nicht
-//! abgesichert (keine Dateisperren), analog zu `MigrationRunner`.
+//! `save()` läuft. Parallele Schreiber auf denselben Pfad sind
+//! durch eine kooperierende Sidecar-Dateisperre geschützt. Normale Writer
+//! verweigern veraltete Snapshots; `open_locked` hält die Sperre bis Drop.
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use serde::Deserialize;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value, value};
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::permissions_toml::{PermissionsSection, RuleToml};
+
+/// Committed write, optionally carrying a post-rename durability warning.
+pub use harw_fsutil::AtomicWriteOutcome as ConfigSaveOutcome;
 
 /// Höchste Anzahl aufbewahrter Backups (`<datei>.bak.<n>`); ältere werden
 /// nach jedem `save()` gelöscht.
@@ -66,6 +72,9 @@ impl RuleKind {
 pub struct ConfigWriter {
     path: PathBuf,
     doc: DocumentMut,
+    original: Mutex<Option<String>>,
+    // The stable sidecar inode survives atomic replacement of the TOML file.
+    lock: Option<fs::File>,
 }
 
 impl ConfigWriter {
@@ -82,27 +91,42 @@ impl ConfigWriter {
     /// - [`ConfigError::Io`]: das Elternverzeichnis konnte nicht angelegt
     ///   oder nicht auf `0700` gesetzt werden.
     pub fn open(path: &Path) -> ConfigResult<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                ensure_private_dir(parent)?;
-            }
+        Self::open_inner(path, false)
+    }
+
+    /// Open a fresh document and retain the cooperating lock until drop.
+    ///
+    /// Returns a busy error immediately if another writer holds the lock.
+    /// Use this for transactions that publish live state after saving.
+    pub fn open_locked(path: &Path) -> ConfigResult<Self> {
+        Self::open_inner(path, true)
+    }
+
+    fn open_inner(path: &Path, retain_lock: bool) -> ConfigResult<Self> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            ensure_private_dir(parent)?;
         }
-        let doc = match fs::read_to_string(path) {
-            Ok(content) => content
-                .parse::<DocumentMut>()
-                .map_err(|err| ConfigError::TomlParse(err.to_string()))?,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => DocumentMut::new(),
-            Err(source) => {
-                return Err(ConfigError::ReadFailed {
-                    path: path.display().to_string(),
-                    reason: source.to_string(),
-                });
-            }
-        };
+        let lock = acquire_lock(path)?;
+        let original = read_document(path)?;
+        let doc = original
+            .as_deref()
+            .unwrap_or_default()
+            .parse::<DocumentMut>()
+            .map_err(|err| ConfigError::TomlParse(err.to_string()))?;
         Ok(Self {
             path: path.to_path_buf(),
             doc,
+            original: Mutex::new(original),
+            lock: retain_lock.then_some(lock),
         })
+    }
+
+    /// Candidate document for typed validation and resolution before save.
+    #[must_use]
+    pub fn document(&self) -> String {
+        self.doc.to_string()
     }
 
     /// Setzt `[permissions] default_mode`.
@@ -262,8 +286,45 @@ impl ConfigWriter {
     /// - [`ConfigError::Invalid`]: die resultierende `[permissions]`-Sektion
     ///   verletzt [`PermissionsSection::validate`] — die Datei bleibt
     ///   unverändert (fail closed).
-    /// - [`ConfigError::Io`]: Backup oder atomares Schreiben schlugen fehl.
+    /// - [`ConfigError::Io`]: Backup oder Schreiben vor dem Commit schlugen fehl.
+    /// - [`ConfigError::CommittedDurabilityUncertain`]: bereits geschrieben,
+    ///   aber Verzeichnis-Synchronisierung fehlgeschlagen.
     pub fn save(&self) -> ConfigResult<()> {
+        match self.save_with_outcome()? {
+            ConfigSaveOutcome::Committed => Ok(()),
+            ConfigSaveOutcome::DurabilityUncertain(error) => {
+                Err(ConfigError::CommittedDurabilityUncertain(error))
+            }
+        }
+    }
+
+    /// Save and distinguish pre-commit errors from committed durability warnings.
+    ///
+    /// Both successful outcomes advance the writer snapshot. Callers publishing
+    /// live state must publish both outcomes and surface any durability warning.
+    pub fn save_with_outcome(&self) -> ConfigResult<ConfigSaveOutcome> {
+        self.save_with_write(harw_fsutil::write_atomic_with_outcome)
+    }
+
+    fn save_with_write(
+        &self,
+        write: impl FnOnce(
+            &Path,
+            &[u8],
+            harw_fsutil::AtomicWriteOptions,
+        ) -> io::Result<ConfigSaveOutcome>,
+    ) -> ConfigResult<ConfigSaveOutcome> {
+        let _lock = if self.lock.is_none() {
+            Some(acquire_lock(&self.path)?)
+        } else {
+            None
+        };
+        let mut original = self.original.lock().unwrap_or_else(PoisonError::into_inner);
+        if read_document(&self.path)? != *original {
+            return Err(ConfigError::Invalid(
+                "configuration conflict: reopen the file before saving".to_owned(),
+            ));
+        }
         let rendered = self.doc.to_string();
 
         let parsed: PermissionsOnlyDocument =
@@ -274,12 +335,13 @@ impl ConfigWriter {
             .map_err(ConfigError::Invalid)?;
 
         rotate_backups(&self.path)?;
-        harw_fsutil::write_atomic(
+        let outcome = write(
             &self.path,
             rendered.as_bytes(),
             harw_fsutil::AtomicWriteOptions::with_mode(0o600),
         )?;
-        Ok(())
+        *original = Some(rendered);
+        Ok(outcome)
     }
 
     /// Liefert `[permissions]` als veränderliche Tabelle, legt sie bei
@@ -311,6 +373,37 @@ impl ConfigWriter {
     fn extra_roots_array(&mut self) -> ConfigResult<&mut Array> {
         let permissions = ensure_table(self.doc.as_table_mut(), "permissions")?;
         ensure_array(permissions, "extra_roots")
+    }
+}
+
+// Never delete the sidecar: unlinking would allow separate lock inodes.
+fn acquire_lock(path: &Path) -> ConfigResult<fs::File> {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(Path::new(&lock_path))?;
+    lock.try_lock().map_err(|error| match error {
+        fs::TryLockError::WouldBlock => ConfigError::Invalid(
+            "configuration busy: another writer holds the lock; retry".to_owned(),
+        ),
+        fs::TryLockError::Error(error) => ConfigError::Io(error),
+    })?;
+    Ok(lock)
+}
+
+fn read_document(path: &Path) -> ConfigResult<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ConfigError::ReadFailed {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        }),
     }
 }
 
@@ -396,7 +489,16 @@ fn set_value_in_table(table: &mut Table, segments: &[&str], item: Item) -> Confi
     match segments {
         [] => Ok(()),
         [last] => {
-            table.insert(last, item);
+            if let Some(existing) = table.get_mut(last) {
+                let mut item = item;
+                if let (Some(old), Some(new)) = (existing.as_value(), item.as_value_mut()) {
+                    *new.decor_mut() = old.decor().clone();
+                }
+                // Updating the Item preserves the original key's comments and format.
+                *existing = item;
+            } else {
+                table.insert(last, item);
+            }
             Ok(())
         }
         [head, rest @ ..] => {
@@ -546,12 +648,11 @@ fn collect_backup_numbers(path: &Path) -> ConfigResult<Vec<u32>> {
     let mut numbers = Vec::new();
     for entry in entries {
         let entry = entry.map_err(ConfigError::from)?;
-        if let Some(name) = entry.file_name().to_str() {
-            if let Some(suffix) = name.strip_prefix(&prefix) {
-                if let Ok(n) = suffix.parse::<u32>() {
-                    numbers.push(n);
-                }
-            }
+        if let Some(name) = entry.file_name().to_str()
+            && let Some(suffix) = name.strip_prefix(&prefix)
+            && let Ok(n) = suffix.parse::<u32>()
+        {
+            numbers.push(n);
         }
     }
     Ok(numbers)
@@ -564,6 +665,39 @@ mod tests {
 
     fn temp_config_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         dir.path().join(name)
+    }
+
+    #[test]
+    fn post_commit_sync_warning_advances_writer_snapshot() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("config.toml");
+        let mut writer = ConfigWriter::open_locked(&path).map_err(ctx("locked writer"))?;
+        writer
+            .set_value("tui.language", value("de"))
+            .map_err(ctx("set German"))?;
+        let outcome = writer
+            .save_with_write(|path, bytes, options| {
+                harw_fsutil::write_atomic_with_outcome(path, bytes, options)?;
+                Ok(ConfigSaveOutcome::DurabilityUncertain(io::Error::other(
+                    "injected directory fsync error",
+                )))
+            })
+            .map_err(ctx("save with post-commit warning"))?;
+        assert!(matches!(outcome, ConfigSaveOutcome::DurabilityUncertain(_)));
+        assert_eq!(
+            read_document(&path).map_err(ctx("read committed"))?,
+            Some(writer.document())
+        );
+        writer
+            .set_value("tui.language", value("ja"))
+            .map_err(ctx("set Japanese"))?;
+        // This would conflict if the writer retained its pre-commit snapshot.
+        writer.save().map_err(ctx("save after uncertain commit"))?;
+        assert_eq!(
+            read_document(&path).map_err(ctx("read final"))?,
+            Some(writer.document())
+        );
+        Ok(())
     }
 
     #[test]

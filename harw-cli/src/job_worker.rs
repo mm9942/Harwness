@@ -54,6 +54,12 @@
 //!   neben den übrigen Arten, statt sie für die ganze Laufdauer zu
 //!   blockieren.
 //!
+//! * [`JobKind::Custom`] named `intent_cycle`
+//!   (`harw_plan_bridge::INTENT_CYCLE_JOB_KIND`) — ein nur lesender
+//!   PL-90-Intent-Zyklus (Modul [`intent_cycle_job`]): `CycleDriver` mit
+//!   Modell-Proposer, Explorer und deterministischem Verifier; läuft in der
+//!   Lane der langen Läufe neben den Arbeitstreibern.
+//!
 //! # Runtime assembly (W2d-2 J1, docs/design/runtime-contracts.md §extension)
 //! Every executed job is assembled through
 //! `crate::runtime_jobs::job_assembly` and gets its root session from
@@ -71,6 +77,77 @@
 //! principal (`IngressSurface::JobWorker`) yields no approval actor, so the
 //! session's `SpawnContext::approval_actor` is `None` and no identity is even
 //! eligible to answer; no responder is mounted.
+//!
+//! # Usage accounting
+//! Jede Modell-Runde eines Jobs wird über den [`PromptTokenLedger`] verbucht und
+//! per `JobStore::record_usage` lease-gesichert festgeschrieben. Schlägt das
+//! Festschreiben aus einem anderen Grund als einem Lease-Verlust fehl
+//! ([`UsageFlushError::NotRecorded`]), wäre der Verbrauch real, aber nur im
+//! Speicher des Workers: ein Reclaim nach einem Absturz lüde die ältere
+//! `job.usage` und gäbe dasselbe Budget ein zweites Mal frei. Deshalb gilt:
+//!
+//! 1. der Ledger wird geschlossen, die nächste Runde scheitert fail closed und
+//!    die Antwort der laufenden Runde wird nicht weitergereicht;
+//! 2. der offene Verbrauch wird als durabler Marker neben dem Job-Store
+//!    abgelegt (`usage_marker`, `<job-root>/usage-unresolved/<work-id>.json`);
+//! 3. jeder Claim verrechnet einen vorhandenen Marker zuerst mit der
+//!    gespeicherten Usage ([`settle_unresolved_usage`]), bevor Wanduhr-Fenster,
+//!    Ledger oder Modell-Runde daraus Budget ableiten; ein nicht lesbarer oder
+//!    nicht verrechenbarer Marker beendet den Job endgültig als
+//!    `Failed{usage accounting unresolved: …}` ohne Modellaufruf;
+//! 4. der Ausgang eines Jobs, dessen letzte Usage nicht festgeschrieben werden
+//!    konnte, wird zu `Failed` ([`PromptTokenLedger::finish`]).
+//!
+//! Scheitern Festschreiben UND Marker (volles oder schreibgeschütztes
+//! Job-Dateisystem, Review B2 zu #151), hilft der Marker nicht. Deshalb wird
+//! jede Modell-Runde vorab durabel reserviert
+//! (`<job-root>/usage-inflight/<work-id>.json`, `usage_marker::InFlightUsage`):
+//! lässt sich die Reservierung nicht schreiben, startet die Runde nicht (es
+//! wurde nichts ausgegeben); nach dem Festschreiben wird sie entfernt (eine
+//! Runde, deren gemeldete Usage der Ledger nicht verbuchen durfte, bleibt
+//! reserviert). Findet
+//! [`settle_unresolved_usage`] die Reservierung eines früheren Versuchs, gilt
+//! deren Runde nur als verbucht, wenn die verrechnete Usage in Tokens oder
+//! Werkzeugaufrufen echt über dem reservierten Stand liegt; sonst endet der
+//! Job als `Failed{usage accounting unresolved: …}` ohne Modellaufruf
+//! (konservativ: kein Reclaim mit unbewiesenem Budget).
+//!
+//! Ist der Provider einer Runde einmal aufgerufen, beweist ein Fehler, ein
+//! Timeout oder ein Abbruch nicht mehr, dass nichts ausgegeben wurde (Review
+//! P1 4394111159, 4394114784: ein Stream kann Teile geliefert haben, bevor er
+//! abriss). Freigegeben wird die Runde deshalb nur nach dem Verbuchen ihrer
+//! Usage, die durable Reservierung erst nach deren Festschreiben; endet sie
+//! anders, bleibt sie reserviert und trägt `unproven_spend`, und ein Reclaim
+//! gilt sie nie als verbucht. Nur Fehler, die nachweislich vor dem Aufruf
+//! liegen (Abweisung durch den Ledger, gescheiterte Reservierung), geben sie
+//! frei.
+//!
+//! Jede Reservierung wird unter der Job-Lease angelegt, angehoben und entfernt
+//! (Review P1 4394111166, P2 4394114795): der Ledger hält dabei die Job-Sperre
+//! (`JobStore::hold_live_lease`), die auch Claim, Reclaim und Ablauf nehmen.
+//! Ein Worker mit abgelaufener oder zurückgeforderter Lease reserviert nicht
+//! und ruft den Provider nicht auf; ein Aufräumen oder Anheben einer älteren
+//! Epoche läuft entweder ganz vor dem Reclaim oder wird abgewiesen und kann
+//! die Reservierung der neuen Epoche weder überschreiben noch entfernen. Die
+//! Verrechnung beim Claim läuft unmittelbar nach `JobStore::claim` unter
+//! derselben Disziplin ([`settle_unresolved_usage`]).
+//!
+//! Werkzeugaufrufe werden beim Dispatch gebucht (Review P1-b zu #151): der
+//! `harw_core::ToolCallMeter` jedes Job-Turns ([`LedgerToolMeter`]) bucht den
+//! Aufruf gegen `max_tool_calls` und schreibt ihn unter der aktuellen Lease
+//! fest, BEVOR das Werkzeug läuft; scheitert das (Budget, Lease, Speicher),
+//! läuft das Werkzeug nicht. Danach hält der zurückgegebene
+//! `harw_core::ToolCallPermit` die Job-Sperre, bis die Ausführung des Aufrufs
+//! zurückgekehrt ist (Lease-Zaun, Review P1 4394111171, [`LeaseHold`]): ein
+//! Reclaim läuft nie zwischen Buchung und Seiteneffekt, sondern danach, und
+//! der nächste Flush des alten Workers scheitert geschlossen. Gleichzeitige
+//! Aufrufe teilen sich den Halt; was der Ledger währenddessen festschreibt,
+//! bucht er unter dem Halt als Marker. Folge für den Heartbeat: das Renew des
+//! Runners scheitert, solange der Halt lebt, und wird in kurzen Abständen
+//! wiederholt (`harw_core::DurableJobRunner` behandelt eine belegte Sperre
+//! als vorübergehend). Hält ein Werkzeugaufruf länger als die verbleibende
+//! Lease, endet der Job mit verlorener Lease, statt einen veralteten Worker
+//! weiterlaufen zu lassen.
 //!
 //! # Concurrency
 //! Every entry point is `async` and `Send`.  All shared state travels as
@@ -120,6 +197,12 @@ mod kanban_card;
 #[path = "job_worker_work_driver.rs"]
 mod work_driver_job;
 
+#[path = "job_worker_intent_cycle.rs"]
+mod intent_cycle_job;
+
+#[path = "job_worker_intent_cycle_learning.rs"]
+mod intent_cycle_learning;
+
 #[path = "job_worker_verify_diagnostics.rs"]
 mod verify_diagnostics;
 
@@ -131,6 +214,17 @@ mod retention_job;
 
 #[path = "job_worker_learning.rs"]
 mod learning_job;
+
+#[path = "job_usage_marker.rs"]
+mod usage_marker;
+
+#[cfg(test)]
+#[path = "job_worker_usage_tests.rs"]
+mod usage_tests;
+
+#[cfg(test)]
+#[path = "job_worker_tool_call_tests.rs"]
+mod tool_call_tests;
 
 const WORKER_ID: &str = "harw-serve-job-worker";
 const LEASE_TTL_SECONDS: i64 = 120;
@@ -665,6 +759,15 @@ pub async fn run_job_worker_once(
 // its commit in list order. Returns the jobs that reached a terminal state.
 async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -> usize {
     let mut completed = lane.reap();
+    if let Some(plan) = services.plan_services.as_ref()
+        && let Err(error) = PlanJobBridge::recover_pending_admissions(
+            plan.plan(),
+            &services.store,
+            Timestamp::now(),
+        )
+    {
+        tracing::warn!(error = %error, "could not publish staged plan-node admissions");
+    }
     let page = match services.store.list(&JobListQuery {
         states: Some(vec![JobState::Ready]),
         ..JobListQuery::default()
@@ -686,6 +789,7 @@ async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -
         // weil sie bis zu ihrer Frist (30–120 s) blockierende Dateiarbeit
         // leistet und die übrigen Arten nicht aufhalten darf.
         if work_driver_job::is_work_driver_kind(&record.job.kind)
+            || intent_cycle_job::is_intent_cycle_kind(&record.job.kind)
             || memory_job::is_memory_kind(&record.job.kind)
             || retention_job::is_retention_kind(&record.job.kind)
             || learning_job::is_learning_kind(&record.job.kind)
@@ -820,6 +924,7 @@ fn is_supported_kind(kind: &JobKind) -> bool {
                 || name == harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND
                 || name == harw_runtime::job_ledger::KANBAN_JOB_KIND
                 || name == harw_runtime::job_ledger::WORK_DRIVER_JOB_KIND
+                || name == harw_runtime::job_ledger::INTENT_CYCLE_JOB_KIND
                 || name == harw_ops::memory_job::MEMORY_MAINTENANCE_JOB_KIND
                 || name == harw_ops::retention_job::RETENTION_SWEEP_JOB_KIND
                 || name == harw_ops::learning_job::LEARNING_EXTRACT_JOB_KIND
@@ -880,6 +985,16 @@ async fn execute_claim(task: ClaimTask) -> JobOutcome {
             provider,
             job_store,
             Arc::clone(&control),
+        )
+        .await
+    } else if intent_cycle_job::is_intent_cycle_kind(&claim.job.kind) {
+        intent_cycle_job::execute_intent_cycle_claim(
+            claim,
+            input,
+            provider,
+            job_store,
+            Arc::clone(&control),
+            &context,
         )
         .await
     } else if work_driver_job::is_work_driver_kind(&claim.job.kind) {
@@ -1096,7 +1211,7 @@ fn telegram_submitter_id(submitter: &harw_types::ApprovalActor) -> Result<String
 // Wanduhr, Runtime-Montage (`JobEntry::Prompt`) und Ausführung. Aufrufer haben
 // Zaun und Eingabe bereits geprüft.
 async fn run_prompt_turn(
-    claim: JobClaim,
+    mut claim: JobClaim,
     submitter_id: &str,
     prompt: String,
     provider: Arc<dyn ModelProvider>,
@@ -1105,6 +1220,13 @@ async fn run_prompt_turn(
     context: &JobWorkerContext,
 ) -> JobOutcome {
     let work_id = claim.job.id.as_str().to_owned();
+
+    // Offene Usage eines früheren Versuchs zuerst verrechnen, vor Wanduhr-
+    // Fenster und Ledger: ein Reclaim startet nie mit frischem Budget.
+    if let Err(reason) = settle_claim_usage(&job_store, &mut claim).await {
+        tracing::error!(work_id = %work_id, reason = %reason, "prompt job usage accounting unresolved");
+        return JobOutcome::Failed { reason };
+    }
 
     let budget = effective_prompt_budget(&claim.job.budget);
     let wall = match prompt_wall_allowance(
@@ -1127,7 +1249,13 @@ async fn run_prompt_turn(
         };
     };
 
-    let ledger = PromptTokenLedger::new(budget, claim.job.usage.clone());
+    let ledger = PromptTokenLedger::persisted(
+        budget,
+        claim.job.usage.clone(),
+        Arc::clone(&job_store),
+        claim.token.clone(),
+    );
+    let _flusher = ledger.spawn_flusher(USAGE_FLUSH_INTERVAL);
     let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
         inner: provider,
         ledger: Arc::clone(&ledger),
@@ -1156,15 +1284,22 @@ async fn run_prompt_turn(
         }
     };
 
-    let turn = execute_turn(claim, prompt, model, Arc::clone(&control), setup);
-    match tokio::time::timeout(wall.duration, turn).await {
+    let turn = execute_turn(
+        claim,
+        prompt,
+        model,
+        Arc::clone(&control),
+        setup,
+        ledger_tool_meter(&ledger),
+    );
+    let outcome = match tokio::time::timeout(wall.duration, turn).await {
         // Ein Abbruch durch den Supervisor bleibt ein Abbruch; jeder andere
         // Ausgang eines Turns, der das Token-Budget gerissen hat, ist ein
         // Budget-Fehlschlag — auch wenn das Modell noch geantwortet hat.
         Ok(outcome @ JobOutcome::Cancelled { .. }) => outcome,
         Ok(outcome) => match ledger.exceeded() {
             Some(reason) => {
-                tracing::warn!(work_id = %work_id, reason = %reason, "prompt job exceeded its token budget");
+                tracing::warn!(work_id = %work_id, reason = %reason, "prompt job stopped by its ledger (budget, lease or usage accounting)");
                 JobOutcome::Failed { reason }
             }
             None => outcome,
@@ -1182,7 +1317,9 @@ async fn run_prompt_turn(
                 reason: wall.reason,
             }
         }
-    }
+    };
+    // Letzter Stand vor dem Festschreiben des Ausgangs durch den Runner.
+    ledger.finish(outcome).await
 }
 
 /// Sicherheitsabstand zwischen dem Ende des Wanduhr-Fensters eines Prompt-Jobs
@@ -1291,12 +1428,12 @@ fn check_declared_scope_fields(
         ("tenant", scope.tenant().as_str()),
         ("workspace", scope.workspace().as_str()),
     ] {
-        if let Some(declared) = object.get(key) {
-            if declared.as_str() != Some(expected) {
-                return Err(format!(
-                    "scope: the {origin} declares a {key} other than the job's server-resolved {key}"
-                ));
-            }
+        if let Some(declared) = object.get(key)
+            && declared.as_str() != Some(expected)
+        {
+            return Err(format!(
+                "scope: the {origin} declares a {key} other than the job's server-resolved {key}"
+            ));
         }
     }
     Ok(())
@@ -1404,22 +1541,1041 @@ fn prompt_wall_allowance(
 struct PromptTokenLedger {
     budget: harw_job_runtime::Budget,
     state: Mutex<PromptTokenState>,
+    // Ziel der Persistierung (`flush`); `None` für einen rein flüchtigen Ledger.
+    sink: Option<UsageSink>,
+    // Start des Turns und die beim Claim bereits persistierte Wanduhr; daraus
+    // ergibt sich die laufende Wanduhr in `snapshot`.
+    started: std::time::Instant,
+    base_wall: SignedDuration,
+    // Serialisiert `flush`, die Rundenreservierung und das Nehmen des
+    // Lease-Halts: ein älterer Stand wird nie nach einem neueren geschrieben
+    // (der Store lehnt Rückschritte ab), und ob ein Schritt unter einem
+    // laufenden Halt läuft, ändert sich nicht, während er läuft.
+    flush_gate: tokio::sync::Mutex<()>,
+    // Lease-Halt laufender Werkzeugaufrufe ([`LeaseHold`]); lebt, solange ein
+    // Permit lebt. Neu genommen nur unter `flush_gate`.
+    lease_hold: Mutex<std::sync::Weak<LeaseHold>>,
 }
 
 struct PromptTokenState {
     usage: harw_job_runtime::BudgetUsage,
     exceeded: Option<String>,
+    // Reservierte Modell-Runden, deren Usage noch nicht verbucht ist
+    // ([`RoundReservation`]); mehrere Worker-Turns können sich einen Ledger
+    // teilen (WorkDriver).
+    rounds_in_flight: u32,
+    // Ob eine Rundenreservierung dieses Ledgers auf der Platte liegen kann.
+    reservation_marked: bool,
+    // Eine Runde endete nach dem Aufruf des Providers ohne verbuchte Usage
+    // (Fehler, Abbruch, nicht verbuchbare Usage; Review P1 4394111159): ihr
+    // Verbrauch ist unbewiesen. Jede weitere Reservierung dieses Ledgers
+    // trägt das (`usage_marker::InFlightUsage::unproven_spend`) und wird nie
+    // entfernt.
+    unproven_spend: bool,
+    // Ob ein unter gehaltener Lease gebuchter Stand als Marker liegen kann
+    // (`UsageWrite::Booked`); der nächste Flush ohne Halt entfernt ihn nach
+    // dem Festschreiben.
+    booking_marked: bool,
+}
+
+// Job-Store und Lease-Token, unter denen der Ledger seine Usage festschreibt,
+// sowie der Marker-Speicher für Usage, die sich nicht festschreiben ließ.
+struct UsageSink {
+    store: Arc<JobStore>,
+    token: harw_job_runtime::LeaseToken,
+    markers: usage_marker::UsageMarkerStore,
+}
+
+/// Intervall, in dem ein laufender Turn seine Usage zusätzlich zu den
+/// Runden-Flushes in den Job-Store schreibt.
+pub(super) const USAGE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hält den periodischen Usage-Flush eines Ledgers am Leben; das Verwerfen
+/// bricht den Task ab.
+pub(super) struct UsageFlusher(tokio::task::JoinHandle<()>);
+
+impl Drop for UsageFlusher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+// Schließgrund des Ledgers nach verlorener Lease.
+const USAGE_LEASE_LOST_REASON: &str = "lease: job lease lost; usage could not be recorded";
+
+// Schließgrund des Ledgers, wenn die Usage nicht durabel festgeschrieben werden
+// konnte.
+const USAGE_UNRECORDED_REASON: &str =
+    "usage: job usage could not be recorded durably; no further model rounds";
+
+// Schließgrund des Ledgers, wenn eine Modell-Runde nicht durabel reserviert
+// werden konnte (Review B2 zu #151); die Runde hat nichts ausgegeben.
+const USAGE_RESERVATION_FAILED_REASON: &str =
+    "usage: the model round could not be reserved durably; no further model rounds";
+
+// Schließgrund des Ledgers, wenn sich die Lease für einen gebuchten
+// Werkzeugaufruf nicht halten ließ (Lease-Zaun, Review P1 4394111171); das
+// Werkzeug lief nicht.
+const USAGE_LEASE_HOLD_FAILED_REASON: &str =
+    "lease: the job lease could not be held for the tool call; no further tool call";
+
+// Grund eines Markers, der einen Stand unter dem Lease-Halt eines laufenden
+// Werkzeugaufrufs bucht (`UsageWrite::Booked`).
+const USAGE_BOOKED_UNDER_HOLD_REASON: &str =
+    "usage booked while a running tool call held the job lease";
+
+// Präfix aller `Failed`-Gründe, die aus nicht verbuchter Usage entstehen.
+const USAGE_UNRESOLVED_PREFIX: &str = "usage accounting unresolved: ";
+
+// Wiederholungen und Pause (je Versuch verlängert) bei kurzzeitig belegter
+// Job-Sperre: ein gleichzeitiger Heartbeat oder Abbruch ist kein Speicherfehler.
+const USAGE_LOCK_RETRIES: u32 = 5;
+const USAGE_LOCK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Grund, aus dem [`PromptTokenLedger::flush`] die Usage nicht festschreiben
+/// konnte.
+///
+/// # Description
+/// In beiden Fällen ist der Ledger danach geschlossen: es folgt keine weitere
+/// Modell-Runde.
+#[derive(Debug)]
+pub(super) enum UsageFlushError {
+    /// Die Lease des Jobs ist verloren (Token passt nicht mehr, Lease
+    /// abgelaufen oder Job bereits terminal); ein anderer Worker besitzt den
+    /// Job.
+    LeaseLost,
+    /// Das Festschreiben scheiterte an einem Speicherfehler. Die Usage ist als
+    /// Marker abgelegt, soweit das gelang (siehe Moduldoku, "Usage
+    /// accounting"); der Text nennt den Grund.
+    NotRecorded(String),
+}
+
+impl std::fmt::Display for UsageFlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LeaseLost => f.write_str(USAGE_LEASE_LOST_REASON),
+            Self::NotRecorded(reason) => write!(f, "{USAGE_UNRESOLVED_PREFIX}{reason}"),
+        }
+    }
+}
+
+impl std::error::Error for UsageFlushError {}
+
+// Was ein Flush mit der Rundenreservierung tun muss (Review B2 zu #151).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationStep {
+    // Keine Reservierung dieses Ledgers liegt auf der Platte.
+    Untouched,
+    // Runden sind offen (oder eine Runde mit unbewiesenem Verbrauch): die
+    // Reservierung VOR dem Festschreiben auf den festzuschreibenden Stand
+    // anheben. Sonst bewiese der neue Stand beim Reclaim eine Runde, die noch
+    // gar nicht verbucht ist.
+    Advance,
+    // Keine Runde offen: die Reservierung NACH erfolgreichem Festschreiben
+    // entfernen.
+    Clear,
+}
+
+// Was ein Flush außer dem Festschreiben tun muss; aus derselben Sperre gelesen
+// wie der festzuschreibende Stand.
+#[derive(Debug, Clone, Copy)]
+struct FlushPlan {
+    reservation: ReservationStep,
+    // Die angehobene Reservierung trägt `unproven_spend`.
+    unproven_spend: bool,
+    // Ein unter gehaltener Lease gebuchter Marker kann noch liegen.
+    booking_marked: bool,
+}
+
+// Ergebnis eines Festschreib-Versuchs auf dem Blocking-Thread.
+enum UsageWrite {
+    // Festgeschrieben; `cleared`: die Rundenreservierung wurde entfernt;
+    // `unbooked`: kein unter gehaltener Lease gebuchter Marker liegt mehr.
+    Recorded {
+        cleared: bool,
+        unbooked: bool,
+    },
+    // Unter dem Lease-Halt eines laufenden Werkzeugaufrufs in den Marker
+    // gebucht: die Job-Sperre gehört diesem Prozess, `record_usage` käme
+    // nicht an sie heran. Ein Reclaim verrechnet den Marker zuerst; der
+    // nächste Flush ohne Halt schreibt den Stand in den Job-Datensatz.
+    Booked,
+    LeaseLost,
+    // Anderer Speicherfehler: `reason` nennt ihn, `marker` ist das Ergebnis des
+    // Marker-Schreibens.
+    Failed {
+        reason: String,
+        marker: Result<(), String>,
+    },
+    // Die Reservierung ließ sich nicht anheben; bewusst nichts
+    // festgeschrieben und kein Marker geschrieben: die liegende Reservierung
+    // (älterer, höchstens gleich großer Stand) sperrt jeden Reclaim, während
+    // ein Marker mit dem neuen Stand eine offene Runde als verbucht ausgäbe.
+    Unreserved {
+        reason: String,
+    },
+}
+
+/// Prozesslokaler, geteilter Halt der Job-Lease, solange zugelassene
+/// Werkzeugaufrufe laufen (Lease-Zaun, Review P1 4394111171).
+///
+/// # Description
+/// Hält den Guard aus `JobStore::hold_live_lease`: die Lease ist beim Nehmen
+/// um eine volle TTL erneuert, und der Guard hält die Job-Sperre — dieselbe
+/// Sperre, die Claim, Renew, `record_usage`, Reclaim und der Ablauf-Scan
+/// nehmen. Solange der Halt lebt, kann niemand die Lease ersetzen: ein
+/// Reclaim wird hinter den Seiteneffekt des Werkzeugs serialisiert. Nach der
+/// Wanduhr läuft die Lease trotzdem ab (`JobLeaseGuard::deadline`); was unter
+/// dem Halt noch geschrieben wird, prüft vorher [`Self::live`].
+///
+/// [`LedgerToolMeter`] legt ihn als `Arc` in jeden `harw_core::ToolCallPermit`;
+/// der Ledger kennt ihn nur als `Weak`. Gleichzeitige Permits teilen sich einen
+/// Halt, der letzte fallende gibt die Sperre frei (das Schließen der
+/// Sperrdatei blockiert nicht).
+///
+/// # Concurrency
+/// `Send + Sync`; wird nur gehalten, nie gesperrt.
+#[derive(Debug)]
+struct LeaseHold {
+    guard: harw_session_store::job_store::JobLeaseGuard,
+}
+
+impl LeaseHold {
+    // Ob die gehaltene Lease nach der Wanduhr noch gilt.
+    fn live(&self) -> bool {
+        self.guard.still_live().is_ok()
+    }
+}
+
+// Wie ein lease-gebundener Schritt des Ledgers die Lease hält; unter
+// `flush_gate` bestimmt.
+#[derive(Clone)]
+enum LeaseAccess {
+    // Ein laufender Werkzeugaufruf hält die Lease ([`LeaseHold`]).
+    Held(Arc<LeaseHold>),
+    // Kein Halt: der Schritt nimmt die Job-Sperre kurz selbst.
+    Free,
+}
+
+// Warum ein lease-gebundener Schritt nicht laufen durfte.
+#[derive(Debug)]
+enum LeaseRefusal {
+    // Der Token ist nicht mehr die gültige Lease des Jobs (anderer Halter,
+    // abgelaufen, Job terminal).
+    Lost,
+    // Die Lease ließ sich nicht halten (Speicherfehler, dauerhaft belegte
+    // Sperre); der Text nennt den Grund.
+    Unavailable(String),
+}
+
+// Lease-Verlust im Sinne des Ledgers: der Token ist nicht mehr die gültige
+// Lease des Jobs.
+fn is_lease_loss(error: &harw_session_store::SessionStoreError) -> bool {
+    matches!(
+        error,
+        harw_session_store::SessionStoreError::LeaseTokenMismatch { .. }
+            | harw_session_store::SessionStoreError::JobLeaseExpired { .. }
+            | harw_session_store::SessionStoreError::JobAlreadyTerminal { .. }
+    )
+}
+
+fn lease_refusal(error: &harw_session_store::SessionStoreError) -> LeaseRefusal {
+    if is_lease_loss(error) {
+        LeaseRefusal::Lost
+    } else {
+        LeaseRefusal::Unavailable(error.to_string())
+    }
+}
+
+// Führt `operation` aus, während die Lease `token` nachweislich gilt und
+// niemand sie ersetzen kann (Review P1 4394111166, P2 4394114795): unter dem
+// laufenden Halt (`LeaseAccess::Held`) oder unter der kurz genommenen
+// Job-Sperre (`JobStore::hold_live_lease`, wiederholt bei kurz belegter
+// Sperre); in beiden Fällen unmittelbar davor nach der Wanduhr geprüft
+// (`JobLeaseGuard::still_live`). Claim, Reclaim und Ablauf nehmen dieselbe
+// Sperre: ein veralteter Schreiber wird abgewiesen, statt nach einem Reclaim die
+// Reservierung der neuen Epoche zu überschreiben oder zu entfernen, und ein
+// Reclaim wartet, bis ein laufender Schritt fertig ist. Blockierend.
+fn under_live_lease<T>(
+    store: &JobStore,
+    token: &harw_job_runtime::LeaseToken,
+    access: &LeaseAccess,
+    operation: impl FnOnce() -> T,
+) -> Result<T, LeaseRefusal> {
+    match access {
+        LeaseAccess::Held(hold) => {
+            if hold.live() {
+                Ok(operation())
+            } else {
+                Err(LeaseRefusal::Lost)
+            }
+        }
+        LeaseAccess::Free => {
+            let guard = store
+                .hold_live_lease(token)
+                .map_err(|error| lease_refusal(&error))?;
+            guard.still_live().map_err(|error| lease_refusal(&error))?;
+            let result = operation();
+            drop(guard);
+            Ok(result)
+        }
+    }
+}
+
+// Nimmt den Lease-Halt für `token` (`JobStore::hold_live_lease`: erneuert die
+// Lease, hält die Job-Sperre und kennt den Ablauf). Blockierend.
+fn acquire_lease_hold(
+    store: &JobStore,
+    token: &harw_job_runtime::LeaseToken,
+) -> Result<LeaseHold, LeaseRefusal> {
+    let guard = store
+        .hold_live_lease(token)
+        .map_err(|error| lease_refusal(&error))?;
+    Ok(LeaseHold { guard })
+}
+
+// `JobStore::record_usage`, wiederholt bei kurzzeitig belegter Job-Sperre.
+// Blockierend.
+fn record_usage_retrying(
+    store: &JobStore,
+    token: &harw_job_runtime::LeaseToken,
+    usage: &harw_job_runtime::BudgetUsage,
+) -> Result<harw_job_runtime::BudgetUsage, harw_session_store::SessionStoreError> {
+    let mut attempt = 0_u32;
+    loop {
+        match store.record_usage(&token.work_id, token, usage) {
+            Err(harw_session_store::SessionStoreError::JobLockContended { .. })
+                if attempt < USAGE_LOCK_RETRIES =>
+            {
+                attempt += 1;
+                std::thread::sleep(USAGE_LOCK_RETRY_PAUSE * attempt);
+            }
+            other => return other,
+        }
+    }
+}
+
+// Schreibt `usage` fest; scheitert das aus einem anderen Grund als einem
+// Lease-Verlust, wird der Verbrauch im selben (nicht abbrechbaren)
+// Blocking-Aufruf als Marker abgelegt. `plan` sagt, was dabei mit der
+// Rundenreservierung geschieht (vorher anheben bzw. nachher entfernen) und ob
+// ein gebuchter Marker aufzuräumen ist; jeder Zugriff auf die Reservierung
+// läuft unter der Lease (`under_live_lease`). Unter einem laufenden Halt
+// (`access`) wird statt festzuschreiben gebucht (`book_under_hold`).
+// Blockierend.
+fn write_usage_or_mark(
+    store: &JobStore,
+    markers: &usage_marker::UsageMarkerStore,
+    token: &harw_job_runtime::LeaseToken,
+    usage: &harw_job_runtime::BudgetUsage,
+    plan: FlushPlan,
+    access: &LeaseAccess,
+) -> UsageWrite {
+    if plan.reservation == ReservationStep::Advance {
+        let advanced =
+            usage_marker::InFlightUsage::new(token.work_id.as_str(), token.epoch, usage.clone())
+                .with_unproven_spend(plan.unproven_spend);
+        match under_live_lease(store, token, access, || markers.write_in_flight(&advanced)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return UsageWrite::Unreserved {
+                    reason: format!("the in-flight reservation could not be advanced: {error}"),
+                };
+            }
+            Err(LeaseRefusal::Lost) => return UsageWrite::LeaseLost,
+            Err(LeaseRefusal::Unavailable(reason)) => {
+                return UsageWrite::Unreserved {
+                    reason: format!(
+                        "the job lease could not be held to advance the in-flight reservation: {reason}"
+                    ),
+                };
+            }
+        }
+    }
+    if let LeaseAccess::Held(hold) = access {
+        return book_under_hold(markers, token, usage, hold);
+    }
+    match record_usage_retrying(store, token, usage) {
+        Ok(stored) => {
+            let (cleared, unbooked) = clean_up_after_record(store, markers, token, &stored, plan);
+            UsageWrite::Recorded { cleared, unbooked }
+        }
+        Err(error) if is_lease_loss(&error) => UsageWrite::LeaseLost,
+        Err(error) => {
+            let reason = format!("record_usage failed: {error}");
+            // Ohne Job-Sperre: der Marker entsteht gerade, wenn der Job-Store
+            // nicht beschreibbar ist; er wird nur feldweise vereinigt.
+            let marker = usage_marker::UnresolvedUsage::new(
+                token.work_id.as_str(),
+                token.epoch,
+                usage.clone(),
+                &reason,
+            );
+            UsageWrite::Failed {
+                reason,
+                marker: markers.write(&marker),
+            }
+        }
+    }
+}
+
+// Bucht `usage` unter dem laufenden Lease-Halt `hold` als Marker (siehe
+// `UsageWrite::Booked`). Die Lease kann niemand ersetzen, solange der Halt
+// lebt; abgelaufen sein kann sie trotzdem. Blockierend.
+fn book_under_hold(
+    markers: &usage_marker::UsageMarkerStore,
+    token: &harw_job_runtime::LeaseToken,
+    usage: &harw_job_runtime::BudgetUsage,
+    hold: &LeaseHold,
+) -> UsageWrite {
+    if !hold.live() {
+        return UsageWrite::LeaseLost;
+    }
+    let booking = usage_marker::UnresolvedUsage::new(
+        token.work_id.as_str(),
+        token.epoch,
+        usage.clone(),
+        USAGE_BOOKED_UNDER_HOLD_REASON,
+    );
+    match markers.write(&booking) {
+        Ok(()) => UsageWrite::Booked,
+        Err(error) => UsageWrite::Failed {
+            reason: format!("usage could not be booked under the held job lease: {error}"),
+            marker: Err(error),
+        },
+    }
+}
+
+// Nach erfolgreichem Festschreiben von `stored`: entfernt unter der Lease die
+// Rundenreservierung (`ReservationStep::Clear`) und einen gebuchten Marker,
+// den `stored` abdeckt. Liefert `(cleared, unbooked)`. Ein Fehler ist nur eine
+// Warnung: Reservierung bzw. Marker liegen dann unter dem festgeschriebenen
+// Stand, der nächste Flush oder Claim räumt sie auf. Blockierend.
+fn clean_up_after_record(
+    store: &JobStore,
+    markers: &usage_marker::UsageMarkerStore,
+    token: &harw_job_runtime::LeaseToken,
+    stored: &harw_job_runtime::BudgetUsage,
+    plan: FlushPlan,
+) -> (bool, bool) {
+    let clear = plan.reservation == ReservationStep::Clear;
+    if !clear && !plan.booking_marked {
+        return (false, false);
+    }
+    let cleaned = under_live_lease(store, token, &LeaseAccess::Free, || {
+        let cleared = clear && clear_reservation(markers, token);
+        let unbooked = plan.booking_marked && remove_booking(markers, token, stored);
+        (cleared, unbooked)
+    });
+    match cleaned {
+        Ok(cleaned) => cleaned,
+        Err(refusal) => {
+            tracing::warn!(
+                work_id = %token.work_id.as_str(),
+                refusal = ?refusal,
+                "usage recorded, but the job lease could not be held to clean up the reservation"
+            );
+            (false, false)
+        }
+    }
+}
+
+// Entfernt die Rundenreservierung nach erfolgreichem Festschreiben; der
+// Aufrufer hält die Lease. Ein Fehler ist nur eine Warnung: die
+// festgeschriebene Usage liegt dann über dem reservierten Stand, der nächste
+// Claim erkennt die Reservierung als verbucht und entfernt sie selbst.
+// Blockierend.
+fn clear_reservation(
+    markers: &usage_marker::UsageMarkerStore,
+    token: &harw_job_runtime::LeaseToken,
+) -> bool {
+    match markers.remove_in_flight(token.work_id.as_str(), token.epoch) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                work_id = %token.work_id.as_str(),
+                error = %error,
+                "in-flight usage reservation could not be removed after recording"
+            );
+            false
+        }
+    }
+}
+
+// Entfernt einen unter gehaltener Lease gebuchten Marker, sobald `stored` ihn
+// abdeckt; der Aufrufer hält die Lease. `true`, wenn keiner mehr liegt.
+// Blockierend.
+fn remove_booking(
+    markers: &usage_marker::UsageMarkerStore,
+    token: &harw_job_runtime::LeaseToken,
+    stored: &harw_job_runtime::BudgetUsage,
+) -> bool {
+    match markers.remove_if_covered(token.work_id.as_str(), stored) {
+        Ok(None) => true,
+        Ok(Some(_uncovered)) => false,
+        Err(error) => {
+            tracing::warn!(
+                work_id = %token.work_id.as_str(),
+                error = %error,
+                "booked usage marker could not be removed after recording"
+            );
+            false
+        }
+    }
+}
+
+// Grund eines `Failed`-Ausgangs wegen nicht verbuchter Usage; wie jeder
+// Ausgangsgrund auf die erste Zeile und `MAX_REASON_BYTES` begrenzt.
+fn unresolved_usage_reason(detail: &str) -> String {
+    sanitize_failure(&format!("{USAGE_UNRESOLVED_PREFIX}{detail}"))
+}
+
+/// Verrechnet einen offenen Usage-Marker mit einem frisch geclaimten Job und
+/// prüft die Rundenreservierung eines früheren Versuchs.
+///
+/// # Description
+/// Muss vor jeder Budget-Ableitung und jeder Modell-Runde eines Claims laufen
+/// (Review P1 zu #151). Ohne Marker ist die Ausgangs-Usage `claim.job.usage`.
+/// Mit Marker wird das Feld-Maximum aus Marker und gespeicherter Usage unter
+/// `claim.token` lease-gesichert festgeschrieben und erst danach der Marker
+/// entfernt, soweit der festgeschriebene Stand ihn abdeckt; ein seither
+/// gewachsener Marker bleibt liegen und geht in die gelieferte Usage ein. Ein
+/// verbliebener Marker wird beim nächsten Claim unschädlich erneut verrechnet.
+///
+/// Danach die Rundenreservierung (Review B2 zu #151, siehe Moduldoku "Usage
+/// accounting"): stammt sie aus einer älteren Epoche als `claim.token`, gilt
+/// ihre Runde nur als verbucht, wenn sie keinen unbewiesenen Verbrauch trägt
+/// (`usage_marker::InFlightUsage::unproven_spend`) und die verrechnete Usage
+/// in Tokens oder Werkzeugaufrufen echt über dem reservierten Stand liegt —
+/// dann wird sie entfernt. Sonst ist der Verbrauch der Runde unbewiesen
+/// (Festschreiben und Marker sind gescheitert, oder die Runde endete nach dem
+/// Aufruf des Providers ohne verbuchte Usage), und der Claim scheitert
+/// (konservativ: kein Reclaim mit unbewiesenem Budget). Eine Reservierung
+/// derselben oder einer jüngeren Epoche gehört nicht zu einem früheren
+/// Versuch und bleibt unberührt.
+///
+/// Reihenfolge zur Lease (Review P1 4394111166, P2 4394114795): die Claim-API
+/// lässt keinen Code unter ihrer Sperre laufen; `JobStore::claim` hat die
+/// Job-Sperre wieder freigegeben, wenn die Verrechnung beginnt. Sie läuft
+/// deshalb unmittelbar danach unter derselben Sperrdisziplin: das
+/// Festschreiben des Markers nimmt die Sperre über `record_usage`, Prüfen und
+/// Entfernen von Marker und Reservierung laufen unter
+/// `JobStore::hold_live_lease(&claim.token)`. Ein Schreiber einer älteren
+/// Epoche nimmt für jeden Zugriff auf die Reservierung dieselbe Sperre unter
+/// seinem eigenen Token: Er war entweder vor dem Claim fertig (der Claim
+/// wartet auf die Sperre) oder wird danach abgewiesen, weil seine Lease nicht
+/// mehr gilt. Er kann deshalb weder seit dem Claim eine Reservierung anlegen
+/// noch die dieser Verrechnung oder des neuen Versuchs überschreiben oder
+/// entfernen.
+///
+/// # Returns
+/// Die Usage, von der der Claim auszugehen hat.
+///
+/// # Errors
+/// `usage accounting unresolved: …`, wenn Marker oder Reservierung nicht
+/// lesbar sind, der Marker sich nicht festschreiben lässt, die Lease des
+/// Claims sich für das Aufräumen nicht halten lässt oder die Runde einer
+/// Reservierung nicht als verbucht bewiesen ist. Der Aufrufer beendet den Job
+/// dann als `Failed` (endgültig, also ohne automatischen Reclaim) und ruft
+/// kein Modell auf.
+///
+/// # Concurrency
+/// Blockierend (Dateizugriff, Job-Sperre); aus `async`-Code über
+/// [`settle_claim_usage`] aufrufen.
+pub(super) fn settle_unresolved_usage(
+    store: &JobStore,
+    claim: &JobClaim,
+) -> Result<harw_job_runtime::BudgetUsage, String> {
+    let markers = usage_marker::UsageMarkerStore::in_job_root(store.root());
+    let work_id = claim.job.id.as_str();
+    let marked = markers
+        .read(work_id)
+        .map_err(|detail| unresolved_usage_reason(&detail))?;
+    let settled = match &marked {
+        Some(marker) => {
+            let merged = usage_marker::UsageMarkerStore::merged(&marker.usage, &claim.job.usage);
+            record_usage_retrying(store, &claim.token, &merged).map_err(|error| {
+                unresolved_usage_reason(&format!(
+                    "the unresolved usage could not be recorded: {error}"
+                ))
+            })?
+        }
+        None => claim.job.usage.clone(),
+    };
+    // Ohne Marker und ohne Reservierung ist nichts zu prüfen oder zu
+    // entfernen; seit dem Claim legt kein älterer Schreiber mehr eine an.
+    let reserved = markers
+        .read_in_flight(work_id)
+        .map_err(|detail| unresolved_usage_reason(&detail))?
+        .is_some();
+    if marked.is_none() && !reserved {
+        return Ok(settled);
+    }
+    let held = under_live_lease(store, &claim.token, &LeaseAccess::Free, || {
+        let settled = if marked.is_some() {
+            fold_remaining_marker(&markers, work_id, settled)
+        } else {
+            settled
+        };
+        settle_in_flight_reservation(&markers, claim, &settled).map(|()| settled)
+    });
+    match held {
+        Ok(result) => result,
+        Err(LeaseRefusal::Lost) => Err(unresolved_usage_reason(
+            "the job lease was lost during the settlement",
+        )),
+        Err(LeaseRefusal::Unavailable(reason)) => Err(unresolved_usage_reason(&format!(
+            "the job lease could not be held for the settlement: {reason}"
+        ))),
+    }
+}
+
+// Entfernt den eben verrechneten Marker, soweit `settled` ihn abdeckt; ein
+// seither (ohne Job-Sperre) gewachsener Marker bleibt liegen und geht in den
+// gelieferten Stand ein. Der Aufrufer hält die Lease. Blockierend.
+fn fold_remaining_marker(
+    markers: &usage_marker::UsageMarkerStore,
+    work_id: &str,
+    settled: harw_job_runtime::BudgetUsage,
+) -> harw_job_runtime::BudgetUsage {
+    match markers.remove_if_covered(work_id, &settled) {
+        Ok(None) => settled,
+        Ok(Some(remaining)) => {
+            tracing::warn!(work_id = %work_id, "usage marker grew during the settlement; it stays and is counted");
+            usage_marker::UsageMarkerStore::merged(&remaining, &settled)
+        }
+        Err(error) => {
+            tracing::warn!(work_id = %work_id, error = %error, "settled usage marker could not be removed");
+            settled
+        }
+    }
+}
+
+// Prüft die Rundenreservierung eines früheren Versuchs gegen die verrechnete
+// Usage `settled` (siehe `settle_unresolved_usage`); der Aufrufer hält die
+// Lease des Claims. Blockierend.
+fn settle_in_flight_reservation(
+    markers: &usage_marker::UsageMarkerStore,
+    claim: &JobClaim,
+    settled: &harw_job_runtime::BudgetUsage,
+) -> Result<(), String> {
+    let work_id = claim.job.id.as_str();
+    let reservation = match markers.read_in_flight(work_id) {
+        Ok(Some(reservation)) => reservation,
+        Ok(None) => return Ok(()),
+        Err(detail) => return Err(unresolved_usage_reason(&detail)),
+    };
+    if reservation.epoch >= claim.token.epoch {
+        return Ok(());
+    }
+    if !reservation.superseded_by(settled) {
+        tracing::error!(
+            work_id = %work_id,
+            reservation_epoch = reservation.epoch,
+            claim_epoch = claim.token.epoch,
+            unproven_spend = reservation.unproven_spend,
+            "in-flight model round of an earlier attempt was never recorded; refusing the reclaim"
+        );
+        let detail = if reservation.unproven_spend {
+            format!(
+                "an in-flight model round of epoch {} was dispatched but never accounted; refusing to reclaim with an unproven budget",
+                reservation.epoch
+            )
+        } else {
+            format!(
+                "an in-flight model round started at epoch {} with {} tokens was never recorded; refusing to reclaim with an unproven budget",
+                reservation.epoch, reservation.usage_before.tokens
+            )
+        };
+        return Err(unresolved_usage_reason(&detail));
+    }
+    if let Err(error) = markers.remove_in_flight(work_id, reservation.epoch) {
+        tracing::warn!(work_id = %work_id, error = %error, "recorded in-flight usage reservation could not be removed");
+    }
+    Ok(())
+}
+
+/// Async-Hülle um [`settle_unresolved_usage`]: läuft auf einem Blocking-Thread
+/// und trägt die verrechnete Usage in `claim.job.usage` ein, damit
+/// Wanduhr-Fenster und Ledger des Claims davon ausgehen.
+///
+/// # Errors
+/// Wie [`settle_unresolved_usage`]; auch ein abgestürzter Blocking-Task zählt
+/// als nicht verrechnet.
+pub(super) async fn settle_claim_usage(
+    store: &Arc<JobStore>,
+    claim: &mut JobClaim,
+) -> Result<(), String> {
+    let store = Arc::clone(store);
+    let snapshot = claim.clone();
+    let joined =
+        tokio::task::spawn_blocking(move || settle_unresolved_usage(&store, &snapshot)).await;
+    match joined {
+        Ok(Ok(usage)) => {
+            claim.job.usage = usage;
+            Ok(())
+        }
+        Ok(Err(reason)) => Err(reason),
+        Err(error) => Err(unresolved_usage_reason(&format!(
+            "the settlement task failed: {error}"
+        ))),
+    }
 }
 
 impl PromptTokenLedger {
+    // Nur noch Tests bauen einen flüchtigen Ledger; Produktionspfade nutzen
+    // `persisted` (sonst schlägt `dead_code` an).
+    #[cfg(test)]
     fn new(budget: harw_job_runtime::Budget, usage: harw_job_runtime::BudgetUsage) -> Arc<Self> {
+        Self::build(budget, usage, None)
+    }
+
+    /// Ledger, der die Usage über [`Self::flush`] unter `token` in `store`
+    /// schreibt.
+    pub(super) fn persisted(
+        budget: harw_job_runtime::Budget,
+        usage: harw_job_runtime::BudgetUsage,
+        store: Arc<JobStore>,
+        token: harw_job_runtime::LeaseToken,
+    ) -> Arc<Self> {
+        let markers = usage_marker::UsageMarkerStore::in_job_root(store.root());
+        Self::build(
+            budget,
+            usage,
+            Some(UsageSink {
+                store,
+                token,
+                markers,
+            }),
+        )
+    }
+
+    fn build(
+        budget: harw_job_runtime::Budget,
+        usage: harw_job_runtime::BudgetUsage,
+        sink: Option<UsageSink>,
+    ) -> Arc<Self> {
+        let base_wall = usage.wall;
         Arc::new(Self {
             budget,
             state: Mutex::new(PromptTokenState {
                 usage,
                 exceeded: None,
+                rounds_in_flight: 0,
+                reservation_marked: false,
+                unproven_spend: false,
+                booking_marked: false,
             }),
+            sink,
+            started: std::time::Instant::now(),
+            base_wall,
+            flush_gate: tokio::sync::Mutex::new(()),
+            lease_hold: Mutex::new(std::sync::Weak::new()),
         })
+    }
+
+    /// Aktuelle Usage: Tokens und Tool-Aufrufe aus dem Ledger, Wanduhr als
+    /// Startwert plus verstrichene Zeit. Nie kleiner als der Startwert.
+    pub(super) fn snapshot(&self) -> harw_job_runtime::BudgetUsage {
+        let state = self.state();
+        self.snapshot_of(&state)
+    }
+
+    // Wie `snapshot`, aus einem bereits gesperrten Zustand: `flush` braucht
+    // Stand und offene Runden aus derselben Sperre.
+    fn snapshot_of(&self, state: &PromptTokenState) -> harw_job_runtime::BudgetUsage {
+        let mut usage = state.usage.clone();
+        let elapsed =
+            SignedDuration::try_from(self.started.elapsed()).unwrap_or(SignedDuration::MAX);
+        let running = self.base_wall.saturating_add(elapsed);
+        usage.wall = usage.wall.max(running).max(self.base_wall);
+        usage
+    }
+
+    // Was der nächste Flush außer dem Festschreiben tun muss. Eine Runde mit
+    // unbewiesenem Verbrauch bleibt offen: ihre Reservierung wird nur noch
+    // angehoben, nie entfernt.
+    fn flush_plan(state: &PromptTokenState) -> FlushPlan {
+        let reservation = if !state.reservation_marked {
+            ReservationStep::Untouched
+        } else if state.rounds_in_flight > 0 || state.unproven_spend {
+            ReservationStep::Advance
+        } else {
+            ReservationStep::Clear
+        };
+        FlushPlan {
+            reservation,
+            unproven_spend: state.unproven_spend,
+            booking_marked: state.booking_marked,
+        }
+    }
+
+    // Weak-Slot des Lease-Halts; ein vergifteter Mutex hält nur eine
+    // Referenz.
+    fn hold_slot(&self) -> std::sync::MutexGuard<'_, std::sync::Weak<LeaseHold>> {
+        match self.lease_hold.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    // Ob gerade ein Werkzeugaufruf die Lease hält.
+    fn lease_held(&self) -> bool {
+        self.hold_slot().strong_count() > 0
+    }
+
+    // Unter `flush_gate`: der laufende Halt, falls ein Werkzeugaufruf die
+    // Lease gerade hält. Ein neuer Halt entsteht nur unter dem Gate, ein
+    // gelieferter lebt mindestens so lange wie der Schritt, der ihn nutzt.
+    fn lease_access(&self) -> LeaseAccess {
+        let hold = self.hold_slot().upgrade();
+        match hold {
+            Some(hold) => LeaseAccess::Held(hold),
+            None => LeaseAccess::Free,
+        }
+    }
+
+    /// Schreibt [`Self::snapshot`] unter dem Lease-Token in den Job-Store.
+    ///
+    /// # Description
+    /// Ohne Sink ein No-op. In jedem Fehlerfall wird der Ledger geschlossen,
+    /// damit keine weitere Modell-Runde auf nicht verbuchte Kosten läuft:
+    /// - Verliert der Job seine Lease (Token passt nicht mehr, Lease
+    ///   abgelaufen, Job bereits terminal), ist das [`UsageFlushError::LeaseLost`].
+    /// - Jeder andere Speicherfehler (nach einigen Wiederholungen bei belegter
+    ///   Job-Sperre) lässt den Verbrauch real, aber nicht im Job-Datensatz
+    ///   zurück; ein Reclaim sähe dann ältere Zahlen. Er wird deshalb als
+    ///   durabler Marker abgelegt (`usage_marker`), den der nächste Claim
+    ///   zuerst verrechnet ([`settle_unresolved_usage`]), und als
+    ///   [`UsageFlushError::NotRecorded`] gemeldet — auch wenn sich der Marker
+    ///   nicht schreiben ließ (dann steht die Buchhaltung offen UND ohne
+    ///   Marker, was auf Fehlerstufe protokolliert wird; die
+    ///   Rundenreservierung sperrt dann den Reclaim, Review B2 zu #151).
+    ///
+    /// Die Rundenreservierung ([`Self::reserve_round`]) wird dabei nachgeführt,
+    /// jeweils unter der Lease (Review P1 4394111166, P2 4394114795): sind
+    /// Runden offen oder trägt der Ledger unbewiesenen Verbrauch, wird sie vor
+    /// dem Festschreiben auf den festzuschreibenden Stand angehoben und trägt
+    /// `unproven_spend` mit (scheitert das, wird bewusst nichts
+    /// festgeschrieben, siehe [`UsageFlushError::NotRecorded`]); ist keine
+    /// Runde offen, wird sie nach erfolgreichem Festschreiben entfernt.
+    ///
+    /// Hält gerade ein Werkzeugaufruf die Lease ([`LeaseHold`]), gehört die
+    /// Job-Sperre diesem Prozess und `record_usage` käme nicht an sie heran:
+    /// der Stand wird dann unter dem Halt als Marker gebucht (ein Reclaim
+    /// verrechnet ihn zuerst) und erst vom nächsten Flush ohne Halt
+    /// festgeschrieben, der den Marker danach entfernt.
+    ///
+    /// # Errors
+    /// Siehe oben; der Aufrufer darf den Fehler nicht ignorieren, wenn er
+    /// Arbeit auf Grundlage dieser Usage fortsetzen würde.
+    pub(super) async fn flush(self: &Arc<Self>) -> Result<(), UsageFlushError> {
+        let Some(sink) = &self.sink else {
+            return Ok(());
+        };
+        let _gate = self.flush_gate.lock().await;
+        let access = self.lease_access();
+        self.flush_gated(sink, access).await
+    }
+
+    // Rumpf von `flush`: der Aufrufer hält `flush_gate` und hat `access`
+    // darunter bestimmt.
+    async fn flush_gated(
+        &self,
+        sink: &UsageSink,
+        access: LeaseAccess,
+    ) -> Result<(), UsageFlushError> {
+        // Stand, offene Runden und Merkmale aus derselben Sperre: eine Runde
+        // ist darin entweder noch offen oder schon verbucht, nie keines von
+        // beiden.
+        let (usage, plan) = {
+            let state = self.state();
+            (self.snapshot_of(&state), Self::flush_plan(&state))
+        };
+        let store = Arc::clone(&sink.store);
+        let token = sink.token.clone();
+        let markers = sink.markers.clone();
+        let work_id = token.work_id.as_str().to_owned();
+        let write_usage = usage.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            write_usage_or_mark(&store, &markers, &token, &write_usage, plan, &access)
+        })
+        .await;
+        let write = match joined {
+            Ok(write) => write,
+            Err(error) if plan.reservation == ReservationStep::Advance => {
+                // Offene Runden: kein Marker mit dem neuen Stand (er gäbe eine
+                // offene Runde als verbucht aus); die liegende Reservierung
+                // sperrt den Reclaim.
+                UsageWrite::Unreserved {
+                    reason: format!("usage flush task failed: {error}"),
+                }
+            }
+            Err(error) => {
+                // Der Blocking-Task selbst ist abgestürzt (Panik, Shutdown):
+                // Marker in einem frischen Task nachholen.
+                let reason = format!("usage flush task failed: {error}");
+                let marker =
+                    usage_marker::UnresolvedUsage::new(&work_id, sink.token.epoch, usage, &reason);
+                let markers = sink.markers.clone();
+                let written = tokio::task::spawn_blocking(move || markers.write(&marker)).await;
+                let marker =
+                    written.unwrap_or_else(|join| Err(format!("usage marker task failed: {join}")));
+                UsageWrite::Failed { reason, marker }
+            }
+        };
+        match write {
+            UsageWrite::Recorded { cleared, unbooked } => {
+                let mut state = self.state();
+                if cleared {
+                    state.reservation_marked = false;
+                }
+                if unbooked {
+                    state.booking_marked = false;
+                }
+                Ok(())
+            }
+            UsageWrite::Booked => {
+                self.state().booking_marked = true;
+                Ok(())
+            }
+            UsageWrite::LeaseLost => {
+                tracing::warn!(work_id = %work_id, "job lease lost while recording usage");
+                self.close(USAGE_LEASE_LOST_REASON.to_owned());
+                Err(UsageFlushError::LeaseLost)
+            }
+            UsageWrite::Failed { reason, marker } => {
+                let reason = match marker {
+                    Ok(()) => {
+                        tracing::error!(
+                            work_id = %work_id,
+                            reason = %reason,
+                            "job usage could not be recorded; unresolved-usage marker written, no further model rounds"
+                        );
+                        reason
+                    }
+                    Err(marker_error) => {
+                        tracing::error!(
+                            work_id = %work_id,
+                            reason = %reason,
+                            marker_error = %marker_error,
+                            "job usage could not be recorded and the unresolved-usage marker could not be written: accounting is unresolved AND unmarked"
+                        );
+                        format!("{reason}; marker not written: {marker_error}")
+                    }
+                };
+                self.close(USAGE_UNRECORDED_REASON.to_owned());
+                Err(UsageFlushError::NotRecorded(reason))
+            }
+            UsageWrite::Unreserved { reason } => {
+                tracing::error!(
+                    work_id = %work_id,
+                    reason = %reason,
+                    "job usage left unrecorded: the in-flight reservation could not be advanced; it blocks any reclaim, no further model rounds"
+                );
+                self.close(USAGE_UNRECORDED_REASON.to_owned());
+                Err(UsageFlushError::NotRecorded(reason))
+            }
+        }
+    }
+
+    // Für einen eben gebuchten Werkzeugaufruf (Review P1-b zu #151, P1
+    // 4394111171): schreibt den Stand fest und liefert den Lease-Halt, den
+    // der Permit bis zum Ende der Ausführung hält. Läuft schon ein Halt
+    // (parallele Aufrufe einer Antwort, gleichzeitige Turns eines Ledgers),
+    // wird unter ihm gebucht und er geteilt; sonst wird nach dem
+    // Festschreiben ein neuer genommen. Beides unter dem Flush-Gate: kein
+    // Schritt ohne Halt trifft so die Sperre, die dieser Prozess selbst hält.
+    // Ohne Sink gibt es nichts zu halten (`None`). Jeder Fehler weist den
+    // Aufruf ab (feste, pfadfreie Gründe: sie gehen an das Modell); ein
+    // gebuchter, aber abgewiesener Aufruf bleibt gebucht (konservativ).
+    async fn book_and_hold(&self) -> Result<Option<Arc<LeaseHold>>, String> {
+        let Some(sink) = &self.sink else {
+            return Ok(None);
+        };
+        let _gate = self.flush_gate.lock().await;
+        let access = self.lease_access();
+        self.flush_gated(sink, access.clone())
+            .await
+            .map_err(|error| match error {
+                UsageFlushError::LeaseLost => USAGE_LEASE_LOST_REASON.to_owned(),
+                UsageFlushError::NotRecorded(_) => USAGE_UNRECORDED_REASON.to_owned(),
+            })?;
+        if let LeaseAccess::Held(hold) = access {
+            return Ok(Some(hold));
+        }
+        let store = Arc::clone(&sink.store);
+        let token = sink.token.clone();
+        let acquired =
+            tokio::task::spawn_blocking(move || acquire_lease_hold(&store, &token)).await;
+        let detail = match acquired {
+            Ok(Ok(hold)) => {
+                let hold = Arc::new(hold);
+                *self.hold_slot() = Arc::downgrade(&hold);
+                return Ok(Some(hold));
+            }
+            Ok(Err(LeaseRefusal::Lost)) => {
+                tracing::warn!(
+                    work_id = %sink.token.work_id.as_str(),
+                    "tool call refused before it ran: the job lease was lost after booking"
+                );
+                self.close(USAGE_LEASE_LOST_REASON.to_owned());
+                return Err(USAGE_LEASE_LOST_REASON.to_owned());
+            }
+            Ok(Err(LeaseRefusal::Unavailable(reason))) => reason,
+            Err(join) => format!("lease hold task failed: {join}"),
+        };
+        tracing::error!(
+            work_id = %sink.token.work_id.as_str(),
+            error = %detail,
+            "tool call refused before it ran: the job lease could not be held"
+        );
+        self.close(USAGE_LEASE_HOLD_FAILED_REASON.to_owned());
+        Err(USAGE_LEASE_HOLD_FAILED_REASON.to_owned())
+    }
+
+    /// Letzter Flush vor dem Festschreiben des Ausgangs durch den Runner.
+    ///
+    /// # Description
+    /// Ließ sich die Usage nicht festschreiben ([`UsageFlushError::NotRecorded`]),
+    /// ersetzt `Failed` den Ausgang: für nicht verbuchte Arbeit wird kein Erfolg
+    /// gemeldet. Unverändert bleiben der Ausgang bei verlorener Lease (der
+    /// Runner scheitert dann ohnehin am Lease-Zaun) und ein Abbruch durch den
+    /// Supervisor (`Cancelled` behauptet keinen Erfolg; der Marker deckt die
+    /// offene Usage ab).
+    pub(super) async fn finish(self: &Arc<Self>, outcome: JobOutcome) -> JobOutcome {
+        match self.flush().await {
+            Ok(()) | Err(UsageFlushError::LeaseLost) => outcome,
+            Err(error @ UsageFlushError::NotRecorded(_)) => {
+                if matches!(outcome, JobOutcome::Cancelled { .. }) {
+                    return outcome;
+                }
+                JobOutcome::Failed {
+                    reason: sanitize_failure(&error.to_string()),
+                }
+            }
+        }
+    }
+
+    /// Startet einen Task, der alle `every` die Usage persistiert; der
+    /// Rückgabewert beendet ihn beim Verwerfen.
+    pub(super) fn spawn_flusher(self: &Arc<Self>, every: std::time::Duration) -> UsageFlusher {
+        let ledger = Arc::clone(self);
+        UsageFlusher(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                // Solange ein Werkzeugaufruf die Lease hält, käme nur die
+                // Wanduhr hinzu, und sie ließe sich nur als Marker buchen:
+                // dieser Takt entfällt, der nächste Flush ohne Halt holt sie
+                // nach.
+                if ledger.lease_held() {
+                    continue;
+                }
+                // Fehler schließt `flush` selbst (Ledger geschlossen, Marker
+                // geschrieben); der periodische Flush hat nichts weiter zu tun.
+                let _ = ledger.flush().await;
+            }
+        }))
     }
 
     // Ein vergifteter Mutex hält nur Zählerstände; sie bleiben lesbar.
@@ -1437,15 +2593,117 @@ impl PromptTokenLedger {
         if let Some(reason) = &state.exceeded {
             return Err(reason.clone());
         }
-        if let Some(limit) = self.budget.max_tokens {
-            if state.usage.tokens >= limit {
-                let reason =
-                    format!("budget: token limit of {limit} is exhausted; no further model round");
-                state.exceeded = Some(reason.clone());
-                return Err(reason);
-            }
+        if let Some(limit) = self.budget.max_tokens
+            && state.usage.tokens >= limit
+        {
+            let reason =
+                format!("budget: token limit of {limit} is exhausted; no further model round");
+            state.exceeded = Some(reason.clone());
+            return Err(reason);
         }
         Ok(())
+    }
+
+    // Nach `admit_round`, BEVOR der Provider etwas ausgibt (Review B2 zu #151):
+    // zählt die Runde als offen und legt mit Sink die durable Reservierung mit
+    // dem Stand vor der Runde ab (`usage_marker::InFlightUsage`, mit dem
+    // unbewiesenen Verbrauch früherer Runden). Geschrieben wird unter der
+    // Lease (`under_live_lease`, Review P1 4394111166): ein Worker, dessen
+    // Lease abgelaufen oder zurückgefordert ist, reserviert nicht und ruft den
+    // Provider nicht auf; läuft die Lease erst danach ab, liegt die
+    // Reservierung schon und sperrt den Reclaim. Lässt sie sich nicht
+    // schreiben oder die Lease nicht halten, wird der Ledger geschlossen und
+    // die Runde abgewiesen — ausgegeben wurde nichts. Unter dem Flush-Gate,
+    // damit Reservierung und Festschreiben nie verschränkt auf die Platte
+    // gehen.
+    async fn reserve_round(&self) -> Result<RoundReservation<'_>, String> {
+        let _gate = self.flush_gate.lock().await;
+        let unproven_spend = {
+            let mut state = self.state();
+            if let Some(reason) = &state.exceeded {
+                return Err(reason.clone());
+            }
+            state.rounds_in_flight = state.rounds_in_flight.saturating_add(1);
+            // Ab hier kann eine Reservierung auf der Platte liegen — auch
+            // wenn dieses Future verworfen wird und der Schreib-Task allein
+            // zu Ende läuft.
+            if self.sink.is_some() {
+                state.reservation_marked = true;
+            }
+            state.unproven_spend
+        };
+        // Ab hier gibt jeder Rückweg vor dem Dispatch die Runde über `Drop`
+        // wieder frei.
+        let reservation = RoundReservation {
+            ledger: self,
+            phase: RoundPhase::Reserved,
+        };
+        let Some(sink) = &self.sink else {
+            return Ok(reservation);
+        };
+        // Ein gleichzeitig verbuchter Stand kann nur größer sein: das hebt die
+        // Schwelle, ab der ein Reclaim die Runde als verbucht ansieht.
+        let usage_before = self.snapshot();
+        let marker = usage_marker::InFlightUsage::new(
+            sink.token.work_id.as_str(),
+            sink.token.epoch,
+            usage_before,
+        )
+        .with_unproven_spend(unproven_spend);
+        let access = self.lease_access();
+        let store = Arc::clone(&sink.store);
+        let token = sink.token.clone();
+        let markers = sink.markers.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            under_live_lease(&store, &token, &access, || markers.write_in_flight(&marker))
+        })
+        .await;
+        let detail = match written {
+            Ok(Ok(Ok(()))) => return Ok(reservation),
+            Ok(Err(LeaseRefusal::Lost)) => {
+                tracing::warn!(
+                    work_id = %sink.token.work_id.as_str(),
+                    "model round refused before any spend: the job lease is lost"
+                );
+                self.close(USAGE_LEASE_LOST_REASON.to_owned());
+                return Err(USAGE_LEASE_LOST_REASON.to_owned());
+            }
+            Ok(Err(LeaseRefusal::Unavailable(reason))) => {
+                format!("the job lease could not be held: {reason}")
+            }
+            Ok(Ok(Err(error))) => error,
+            Err(join) => format!("usage reservation task failed: {join}"),
+        };
+        tracing::error!(
+            work_id = %sink.token.work_id.as_str(),
+            error = %detail,
+            "model round could not be reserved durably; refused before any spend"
+        );
+        self.close(USAGE_RESERVATION_FAILED_REASON.to_owned());
+        Err(USAGE_RESERVATION_FAILED_REASON.to_owned())
+    }
+
+    // Vor jedem Werkzeugaufruf (Review P1-b zu #151): bucht genau einen
+    // Aufruf gegen `max_tool_calls`. Ein geschlossener Ledger lässt keinen zu;
+    // ein erschöpftes Budget schließt ihn.
+    fn charge_tool_call(&self) -> Result<(), String> {
+        let mut state = self.state();
+        if let Some(reason) = &state.exceeded {
+            return Err(reason.clone());
+        }
+        match self.budget.charge_tool_call(&mut state.usage) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let reason = match error {
+                    harw_job_runtime::JobRuntimeError::BudgetExceeded { limit, .. } => format!(
+                        "budget: tool-call limit of {limit} is exhausted; no further tool call"
+                    ),
+                    other => format!("budget: {other}"),
+                };
+                state.exceeded = Some(reason.clone());
+                Err(reason)
+            }
+        }
     }
 
     // Nach jeder Modell-Runde: verbucht die gemeldete Usage.
@@ -1478,15 +2736,168 @@ impl PromptTokenLedger {
     }
 }
 
+/// Eine reservierte, noch nicht verbuchte Modell-Runde
+/// ([`PromptTokenLedger::reserve_round`]).
+///
+/// # Description
+/// Vor dem Aufruf des Providers gibt das Verwerfen die Runde frei: es wurde
+/// nichts ausgegeben. Ab [`Self::dispatched`] beweist kein Fehler, Timeout
+/// oder Abbruch mehr, dass nichts ausgegeben wurde (Review P1 4394111159,
+/// 4394114784: ein Stream kann Teile geliefert haben, bevor er abriss). Wird
+/// die Reservierung danach ohne [`Self::settle`] verworfen, bleibt die Runde
+/// für den Rest des Ledgers offen, und der Ledger merkt sich unbewiesenen
+/// Verbrauch (`PromptTokenState::unproven_spend`), den jeder weitere Flush in
+/// die durable Reservierung schreibt; dieser Ledger entfernt sie nie mehr,
+/// und sie sperrt jeden Reclaim. [`Self::settle`] schließt die Runde erst
+/// nach dem Verbuchen ihrer Usage; die durable Reservierung fällt danach erst
+/// mit einem Flush, der diesen Stand festgeschrieben hat. Eine Runde, deren
+/// gemeldete Usage der Ledger nicht verbuchen durfte, bleibt ebenso offen
+/// ([`Self::keep_unaccounted`]).
+struct RoundReservation<'a> {
+    ledger: &'a PromptTokenLedger,
+    phase: RoundPhase,
+}
+
+// Lebenslauf einer [`RoundReservation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundPhase {
+    // Reserviert, der Provider ist noch nicht aufgerufen.
+    Reserved,
+    // Der Provider ist aufgerufen: Verbrauch ist möglich.
+    Dispatched,
+    // Verbucht oder dauerhaft offen gelassen; das Verwerfen tut nichts mehr.
+    Done,
+}
+
+impl RoundReservation<'_> {
+    // Unmittelbar vor dem Aufruf des Providers.
+    fn dispatched(&mut self) {
+        if self.phase == RoundPhase::Reserved {
+            self.phase = RoundPhase::Dispatched;
+        }
+    }
+
+    // Die gemeldete Usage ist verbucht: die Runde ist nicht mehr offen. Ein
+    // gleichzeitiger Flush sieht sie so entweder offen oder verbucht, nie
+    // keines von beiden.
+    fn settle(mut self) {
+        self.phase = RoundPhase::Done;
+        let mut state = self.ledger.state();
+        state.rounds_in_flight = state.rounds_in_flight.saturating_sub(1);
+    }
+
+    // Die Runde hat Usage gemeldet, die der Ledger nicht verbuchen durfte
+    // (Budget überschritten oder Ledger inzwischen geschlossen): ihr Verbrauch
+    // ist real, aber nicht verbucht. Sie bleibt deshalb offen und gilt als
+    // unbewiesen; ihre Reservierung wird von diesem Ledger nie entfernt und
+    // sperrt jeden Reclaim (fail closed).
+    fn keep_unaccounted(mut self) {
+        self.phase = RoundPhase::Done;
+        self.ledger.state().unproven_spend = true;
+    }
+}
+
+impl Drop for RoundReservation<'_> {
+    fn drop(&mut self) {
+        match self.phase {
+            RoundPhase::Reserved => {
+                let mut state = self.ledger.state();
+                state.rounds_in_flight = state.rounds_in_flight.saturating_sub(1);
+            }
+            // Nach dem Dispatch ohne verbuchte Usage verworfen (Fehler des
+            // Providers, Timeout, Abbruch): die Runde bleibt offen.
+            RoundPhase::Dispatched => self.ledger.state().unproven_spend = true,
+            RoundPhase::Done => {}
+        }
+    }
+}
+
+/// Bucht jeden Werkzeugaufruf eines Job-Turns im [`PromptTokenLedger`],
+/// schreibt ihn unter der aktuellen Lease fest, BEVOR das Werkzeug läuft
+/// (Review P1-b zu #151), und hält die Lease bis zum Ende der Ausführung
+/// (Lease-Zaun, Review P1 4394111171).
+///
+/// # Description
+/// Registriert über `TurnControl::with_tool_call_meter` am Turn jedes
+/// Job-Pfads mit Ledger ([`ledger_tool_meter`]). Zugelassen wird nur, was
+/// gebucht ([`PromptTokenLedger::charge_tool_call`]) UND festgeschrieben
+/// ([`PromptTokenLedger::book_and_hold`]) ist; jeder Fehler weist den Aufruf
+/// ab (fail closed): erschöpftes Budget, geschlossener Ledger, verlorene
+/// Lease (ein Worker mit veralteter Epoche führt kein Werkzeug mehr aus),
+/// eine nicht haltbare Lease oder ein Speicherfehler (dann hat der Flush den
+/// Ledger geschlossen und den Marker geschrieben). Eine Rundenreservierung
+/// wie bei Modell-Runden braucht es nicht: der Aufruf ist festgeschrieben,
+/// bevor irgendetwas davon geschieht.
+///
+/// Der zurückgegebene `harw_core::ToolCallPermit` hält einen [`LeaseHold`] —
+/// die Job-Sperre, die auch jeder Reclaim braucht. Der Dispatcher lässt den
+/// Permit erst fallen, wenn die Ausführung des Aufrufs zurückgekehrt ist.
+/// Der ToolExecutionContext teilt dessen Guard; Blocking-Executoren müssen
+/// ihn bis zum Ende ihrer tatsächlichen Arbeit halten, auch nach Abbruch des
+/// wartenden Futures. Die lokalen FS-Executoren erfüllen diesen Vertrag.
+/// Ein Reclaim wird dadurch hinter den gehaltenen Seiteneffekt serialisiert
+/// und findet danach eine Lease, die
+/// dem alten Worker nicht mehr gehört (sein nächster Flush scheitert
+/// geschlossen). Gleichzeitige Permits (parallele Aufrufe einer Antwort)
+/// teilen sich einen Halt. Das ist kein Quieszenznachweis: externe Prozesse,
+/// entfernte Tools und fremde Executoren brauchen eigene Abschlussverträge.
+///
+/// Heartbeat: Der Halt erneuert die Lease beim Nehmen um eine volle TTL
+/// (`JobStore::hold_live_lease`). Solange er lebt, scheitert das Renew des
+/// Runners an der belegten Sperre; `harw_core::DurableJobRunner` behandelt
+/// das als vorübergehend und versucht es in kurzen Abständen erneut, bis die
+/// Lease nach seiner eigenen Rechnung abgelaufen ist. Ein Werkzeugaufruf
+/// (oder eine Kette sich überlappender Aufrufe), der länger hält als die
+/// verbleibende Lease, beendet den Job deshalb: der Runner meldet den
+/// Lease-Verlust und bricht ab, und der nächste Flush des Ledgers scheitert
+/// am Lease-Zaun, statt einen veralteten Worker weiterlaufen zu lassen.
+/// Bereits gestartete Blocking-Arbeit wird durch diesen Abbruch nicht gestoppt:
+/// ihre Context-Kopie hält den Reclaim-Zaun bis zum tatsächlichen Ende weiter,
+/// ohne die TTL zu erneuern. Der Halt ist weder Completion noch Retirement.
+///
+/// # Concurrency
+/// `Send + Sync`: nur ein `Arc`; der Turn-Loop ruft den Meter nacheinander,
+/// gleichzeitige Turns eines Ledgers serialisiert dessen Flush-Gate.
+struct LedgerToolMeter {
+    ledger: Arc<PromptTokenLedger>,
+}
+
+impl harw_core::ToolCallMeter for LedgerToolMeter {
+    fn admit_tool_call<'a>(&'a self, _tool: &'a str) -> harw_core::ToolCallAdmissionFuture<'a> {
+        Box::pin(async move {
+            self.ledger.charge_tool_call()?;
+            let permit = match self.ledger.book_and_hold().await? {
+                Some(hold) => harw_core::ToolCallPermit::guarded(Box::new(hold)),
+                None => harw_core::ToolCallPermit::unguarded(),
+            };
+            Ok::<harw_core::ToolCallPermit, String>(permit)
+        })
+    }
+}
+
+// Der `ToolCallMeter` für den `TurnControl` eines Job-Turns über `ledger`.
+fn ledger_tool_meter(ledger: &Arc<PromptTokenLedger>) -> Arc<dyn harw_core::ToolCallMeter> {
+    Arc::new(LedgerToolMeter {
+        ledger: Arc::clone(ledger),
+    })
+}
+
 /// Ein [`ModelProvider`], der jede Runde gegen einen [`PromptTokenLedger`]
 /// prüft und verbucht.
 ///
 /// # Description
 /// Vor der Runde wird zugelassen oder abgewiesen, ohne den inneren Provider zu
-/// berühren; nach der Runde wird die Usage verbucht. Überschreitet sie das
-/// Budget, endet der Turn mit einem Modellfehler, damit weder Tool-Runden noch
-/// weitere Modellaufrufe folgen. `execute_prompt_claim` ersetzt diesen Fehler
-/// durch den `budget:`-Grund des Ledgers.
+/// berühren, und die Runde unter der Lease durabel reserviert
+/// ([`PromptTokenLedger::reserve_round`]; scheitert das, wird der innere
+/// Provider nicht aufgerufen); nach der Runde wird die Usage verbucht und
+/// festgeschrieben. Überschreitet sie das Budget oder lässt sie sich nicht
+/// festschreiben, endet der Turn mit einem Modellfehler (die Antwort der Runde
+/// wird nicht weitergereicht), damit weder Tool-Runden noch weitere
+/// Modellaufrufe folgen. `execute_prompt_claim` ersetzt diesen Fehler durch
+/// den Schließgrund des Ledgers (`budget:`, `lease:` oder `usage:`). Endet die
+/// Runde nach dem Aufruf des inneren Providers ohne verbuchte Usage (Fehler,
+/// Timeout, Abbruch), bleibt sie reserviert und gilt als unbewiesen (siehe
+/// [`RoundReservation`]).
 ///
 /// # Concurrency
 /// `Send + Sync`: nur `Arc`s.
@@ -1501,10 +2912,55 @@ impl ModelProvider for BudgetedModelProvider {
             self.ledger
                 .admit_round()
                 .map_err(harw_core::ModelError::RequestFailed)?;
-            let response = self.inner.respond(request).await?;
-            self.ledger
-                .charge_round(&response.usage)
+            // Durable Reservierung unter der Lease, bevor der Provider etwas
+            // ausgibt (Review B2 zu #151, P1 4394111166); ein Fehler bis
+            // hierher gibt sie über `Drop` frei.
+            let mut reservation = self
+                .ledger
+                .reserve_round()
+                .await
                 .map_err(harw_core::ModelError::RequestFailed)?;
+            // Ab dem Aufruf beweist kein Fehler und kein Abbruch mehr, dass
+            // nichts ausgegeben wurde (Review P1 4394111159): wird dieses
+            // Future ab jetzt verworfen (Timeout, Abbruch), bleibt die Runde
+            // über `Drop` reserviert.
+            reservation.dispatched();
+            let response = match self.inner.respond(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    drop(reservation);
+                    // Den unbewiesenen Verbrauch sofort durabel machen (die
+                    // angehobene Reservierung trägt ihn). Scheitert das,
+                    // schließt `flush` den Ledger; die liegende Reservierung
+                    // sperrt den Reclaim auch so.
+                    if let Err(flush_error) = self.ledger.flush().await {
+                        tracing::warn!(
+                            error = %flush_error,
+                            "unproven model round could not be marked durably after a provider error"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            match self.ledger.charge_round(&response.usage) {
+                // Erst nach dem Verbuchen abschließen: ein gleichzeitiger
+                // Flush sieht die Runde so entweder offen oder verbucht, nie
+                // keines von beiden.
+                Ok(()) => reservation.settle(),
+                Err(reason) => {
+                    reservation.keep_unaccounted();
+                    return Err(harw_core::ModelError::RequestFailed(reason));
+                }
+            }
+            // Lässt sich die Usage dieser Runde nicht festschreiben, wird ihre
+            // Antwort nicht weitergereicht: nicht verbuchte Arbeit schreitet
+            // nicht fort (fail closed; `flush` hat den Ledger geschlossen).
+            // Die durable Reservierung fällt erst mit einem Flush, der den
+            // verbuchten Stand festgeschrieben hat.
+            self.ledger
+                .flush()
+                .await
+                .map_err(|error| harw_core::ModelError::RequestFailed(error.to_string()))?;
             Ok::<harw_core::ModelResponse, harw_core::ModelError>(response)
         })
     }
@@ -1561,8 +3017,17 @@ fn plan_node_submitter_id(claim: &JobClaim) -> String {
 // The plan-node path: typed payload, contract-derived permissions, role-derived
 // registry profile (both applied as a `RuntimeNarrowing` of
 // `EntryKind::JobPlanNode`), and a mandatory report back into the plan.
+//
+// Budget (Review P1-b zu #151): wie die übrigen Job-Arten läuft der Turn über
+// einen persistierten `PromptTokenLedger` — offene Usage eines früheren
+// Versuchs wird zuerst verrechnet (`settle_claim_usage`), jede Modell-Runde
+// reserviert und verbucht (`BudgetedModelProvider`), jeder Werkzeugaufruf vor
+// seiner Ausführung gebucht und festgeschrieben (`LedgerToolMeter`), und
+// `PromptTokenLedger::finish` schreibt den letzten Stand fest, bevor der
+// Ausgang an den Plan geht. Grenzen sind die des Jobs (`claim.job.budget`,
+// von der Plan-Brücke gesetzt), nicht die MCP-Obergrenzen der Prompt-Jobs.
 async fn execute_plan_node_claim(
-    claim: JobClaim,
+    mut claim: JobClaim,
     input: serde_json::Value,
     provider: Arc<dyn ModelProvider>,
     job_store: Arc<JobStore>,
@@ -1571,6 +3036,10 @@ async fn execute_plan_node_claim(
     context: &JobWorkerContext,
 ) -> JobOutcome {
     let work_id = claim.job.id.as_str().to_owned();
+    let callback_claim = PlanNodeCallbackClaim {
+        jobs: Arc::clone(&job_store),
+        token: claim.token.clone(),
+    };
 
     let Some(services) = plan_services else {
         tracing::error!(
@@ -1591,6 +3060,17 @@ async fn execute_plan_node_claim(
             return JobOutcome::Blocked { reason };
         }
     };
+    if let Err(error) = PlanJobBridge::validate_execution_binding(
+        services.plan(),
+        &payload.plan_id,
+        &payload.task_id,
+        &work_id,
+        payload.assignment_attempt,
+    ) {
+        return JobOutcome::Blocked {
+            reason: format!("plan-node admission binding rejected before execution: {error}"),
+        };
+    }
     let kind = match node_kind(services.plan(), &payload.task_id) {
         Ok(kind) => kind,
         Err(reason) => {
@@ -1622,7 +3102,13 @@ async fn execute_plan_node_claim(
                     reason = %reason,
                     "plan-node contract demands more authority than the job holds"
                 );
-                return fail_plan_node(&services, &payload.task_id, &work_id, reason);
+                return fail_plan_node(
+                    &services,
+                    &payload.task_id,
+                    &callback_claim,
+                    payload.assignment_attempt,
+                    reason,
+                );
             }
         };
 
@@ -1657,13 +3143,43 @@ async fn execute_plan_node_claim(
         return report_plan_node_outcome(
             &services,
             &payload.task_id,
-            &work_id,
+            &callback_claim,
+            payload.assignment_attempt,
             JobOutcome::Blocked {
                 reason: MISSING_RUNTIME_ROOT.to_owned(),
             },
             &admission,
         );
     };
+
+    // Offene Usage eines früheren Versuchs zuerst verrechnen, vor dem Ledger:
+    // ein Reclaim startet nie mit frischem Budget.
+    if let Err(reason) = settle_claim_usage(&job_store, &mut claim).await {
+        tracing::error!(
+            task = %payload.task_id,
+            work_id = %work_id,
+            reason = %reason,
+            "plan-node job usage accounting unresolved"
+        );
+        return fail_plan_node(
+            &services,
+            &payload.task_id,
+            &callback_claim,
+            payload.assignment_attempt,
+            reason,
+        );
+    }
+    let ledger = PromptTokenLedger::persisted(
+        claim.job.budget.clone(),
+        claim.job.usage.clone(),
+        Arc::clone(&job_store),
+        claim.token.clone(),
+    );
+    let _flusher = ledger.spawn_flusher(USAGE_FLUSH_INTERVAL);
+    let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
+        inner: provider,
+        ledger: Arc::clone(&ledger),
+    });
 
     let (entry, narrowing) = plan_node_narrowing(&payload, kind, &sandbox);
     let profile = narrowing.registry_profile;
@@ -1677,7 +3193,7 @@ async fn execute_plan_node_claim(
             session_id: durable_session_id(&claim),
             state_store: job_state_store(&context.transcript_root),
             job_store,
-            model: provider,
+            model: budgeted,
             narrowing: Some(narrowing),
         },
         PauseDisposition::Failed,
@@ -1695,7 +3211,13 @@ async fn execute_plan_node_claim(
                 reason = %reason,
                 "plan-node runtime assembly failed"
             );
-            return fail_plan_node(&services, &payload.task_id, &work_id, reason);
+            return fail_plan_node(
+                &services,
+                &payload.task_id,
+                &callback_claim,
+                payload.assignment_attempt,
+                reason,
+            );
         }
     };
 
@@ -1708,15 +3230,51 @@ async fn execute_plan_node_claim(
         "plan-node job starting"
     );
 
-    let outcome = execute_turn(claim, plan_node_prompt(&payload), model, control, setup).await;
+    let outcome = execute_turn(
+        claim,
+        plan_node_prompt(&payload),
+        model,
+        control,
+        setup,
+        ledger_tool_meter(&ledger),
+    )
+    .await;
+    // Wie beim Prompt-Job: ein Abbruch durch den Supervisor bleibt ein
+    // Abbruch; jeder andere Ausgang eines Turns, den der Ledger gestoppt hat
+    // (Budget, Lease, Buchhaltung), endet mit dessen Grund.
+    let outcome = match outcome {
+        outcome @ JobOutcome::Cancelled { .. } => outcome,
+        outcome => match ledger.exceeded() {
+            Some(reason) => {
+                tracing::warn!(
+                    task = %payload.task_id,
+                    work_id = %work_id,
+                    reason = %reason,
+                    "plan-node job stopped by its ledger (budget, lease or usage accounting)"
+                );
+                JobOutcome::Failed { reason }
+            }
+            None => outcome,
+        },
+    };
     let outcome = enforce_patch_admission(
         &payload.contract,
         &workspace_root,
         &before_snapshot,
         outcome,
     );
+    // Letzter Stand vor dem Bericht an den Plan: nicht festschreibbare Usage
+    // macht auch einen Erfolg zum Fehlschlag.
+    let outcome = ledger.finish(outcome).await;
 
-    report_plan_node_outcome(&services, &payload.task_id, &work_id, outcome, &admission)
+    report_plan_node_outcome(
+        &services,
+        &payload.task_id,
+        &callback_claim,
+        payload.assignment_attempt,
+        outcome,
+        &admission,
+    )
 }
 
 // Fail-closed check of a plan node's assembled sandbox (J1-F). Since R0-F the
@@ -1732,15 +3290,17 @@ fn ensure_same_workspace_root(
 ) -> Result<(), String> {
     let bound = assembled.workspace().canonical_root();
     let required = derived.workspace().canonical_root();
-    if bound == required {
-        Ok(())
-    } else {
-        Err(format!(
+    if bound != required {
+        return Err(format!(
             "plan node workspace root mismatch: assembly bound {}, contract requires {}",
             bound.display(),
             required.display()
-        ))
+        ));
     }
+    if !assembled.write_scope().is_subset_of(derived.write_scope()) {
+        return Err("plan node file authority exceeds derived contract scope".to_owned());
+    }
+    Ok(())
 }
 
 // Job-Art und Verengung eines Plan-Knotens (docs/design/runtime-contracts.md §extension):
@@ -1752,13 +3312,18 @@ fn plan_node_narrowing(
     sandbox: &SandboxSpec,
 ) -> (JobEntry, RuntimeNarrowing) {
     let may_write = sandbox.permissions().contains(Permission::WriteWorkspace);
-    let profile = profile_for_node_kind(kind, may_write);
+    let profile = if may_write && !sandbox.write_scope().is_workspace() {
+        RegistryProfile::WorkspaceEdit
+    } else {
+        profile_for_node_kind(kind, may_write)
+    };
     (
         JobEntry::PlanNode { kind, may_write },
         RuntimeNarrowing {
             registry_profile: profile,
             identity: plan_node_identity(payload, profile, kind),
             permissions: sandbox.permissions().clone(),
+            write_scope: sandbox.write_scope().clone(),
             // R0-F: bind the root sandbox to exactly the derived workspace root,
             // not to the project root discovered above it.
             workspace_root: Some(sandbox.workspace().canonical_root().to_path_buf()),
@@ -1933,12 +3498,16 @@ fn job_assembly_with_contributors(
     builder.build().map_err(|error| error.to_string())
 }
 
+// Führt einen Job-Turn aus. `tool_meter` (Review P1-b zu #151) sitzt am
+// `TurnControl` des Turns und bucht jeden Werkzeugaufruf unter der Lease,
+// bevor er läuft ([`LedgerToolMeter`]); ohne Meter läuft kein Job-Turn.
 async fn execute_turn(
     claim: JobClaim,
     prompt: String,
     provider: Arc<dyn ModelProvider>,
     control: Arc<WorkerExecutionControl>,
     setup: TurnSetup,
+    tool_meter: Arc<dyn harw_core::ToolCallMeter>,
 ) -> JobOutcome {
     let TurnSetup {
         mut session,
@@ -1948,16 +3517,13 @@ async fn execute_turn(
 
     let session_id = durable_session_id(&claim);
     let durable_store = Arc::clone(&state_store);
+    let input = TurnInput::user(prompt)
+        .with_control(harw_core::turn_loop::TurnControl::new().with_tool_call_meter(tool_meter));
 
     let mut turn = tokio::spawn(async move {
-        run_turn(
-            &mut session,
-            provider.as_ref(),
-            state_store.as_ref(),
-            TurnInput::user(prompt),
-        )
-        .await
-        .map(|outcome| (outcome, session))
+        run_turn(&mut session, provider.as_ref(), state_store.as_ref(), input)
+            .await
+            .map(|outcome| (outcome, session))
     });
     control.set_abort_handle(turn.abort_handle());
     let mut cancellation = control.cancellation();
@@ -2035,9 +3601,10 @@ fn paused_turn_outcome(outcome: &TurnOutcome, disposition: PauseDisposition) -> 
 ///
 /// # Description
 /// Mirrors exactly what `harw_plan_bridge::job_bridge::node_payload` writes.
-/// Every field is required: a plan job whose payload lost a field is a broken
-/// contract between bridge and worker, and guessing a default there would
-/// silently execute a node under an authority nobody wrote down.
+/// Execution fields are required: a plan job whose payload lost a field is a
+/// broken contract between bridge and worker. Only the new `dispatch_owner`
+/// field may be absent for existing legacy jobs; that routing default grants
+/// no authority and never relaxes the remaining contract checks.
 ///
 /// The node's *kind* is deliberately absent from the payload — it is read from
 /// the live plan instead (see [`node_kind`]), because the plan, not a stored
@@ -2049,6 +3616,8 @@ struct PlanNodePayload {
     task_id: TaskId,
     /// The plan revision the payload was produced from.
     plan_revision: u64,
+    /// Immutable assignment attempt captured at admission (not a JobClaim attempt).
+    assignment_attempt: u32,
     /// The mutation contract; the only source of the derived sandbox.
     contract: MutationContract,
     /// Human-readable objective of the node.
@@ -2074,9 +3643,17 @@ impl PlanNodePayload {
             ));
         };
 
+        harw_plan_bridge::job_bridge::PlanDispatchOwner::from_job_input(input)?
+            .require_legacy_execution()?;
+
         let plan_id = required_str(object, "plan_id")?.to_owned();
         let task_id = TaskId::new(required_str(object, "task_id")?);
         let plan_revision = required_u64(object, "plan_revision")?;
+        if !object.contains_key("assignment_attempt") {
+            return Err("legacy plan-node payload missing assignment_attempt; blocked without execution; cancel the old job, explicitly invalidate then reopen its unfinished plan node and re-admit it with the current runtime".to_owned());
+        }
+        let assignment_attempt = u32::try_from(required_u64(object, "assignment_attempt")?)
+            .map_err(|_| field_error("assignment_attempt", "must fit u32"))?;
         let contract: MutationContract =
             serde_json::from_value(required_field(object, "contract")?.clone())
                 .map_err(|error| field_error("contract", &error.to_string()))?;
@@ -2099,6 +3676,7 @@ impl PlanNodePayload {
             plan_id,
             task_id,
             plan_revision,
+            assignment_attempt,
             contract,
             objective,
             acceptance_criteria,
@@ -2324,9 +3902,28 @@ fn derive_plan_node_sandbox(
         ))
         .permissions()
         .clone();
+    // A legacy mutation contract is not opt-in to the unavailable scoped
+    // writer pilot. Only an already scoped trusted authority selects it.
+    let write_scope = if node_permissions.contains(Permission::WriteWorkspace)
+        && !inherited.write_scope().is_workspace()
+    {
+        let paths = contract.allowed_paths.iter().map(|rule| match rule {
+            PathRule::Exact(path) => Ok(path.clone()),
+            _ => Err("writable plan nodes require exact-file contracts; directory, suffix and glob rules are not isolated".to_owned()),
+        }).collect::<Result<Vec<_>, _>>()?;
+        let scope = harw_authority::FileWriteScope::exact_files(paths)
+            .map_err(|error| format!("invalid plan-node write scope: {error}"))?;
+        if !scope.is_subset_of(inherited.write_scope()) {
+            return Err("plan contract write paths exceed inherited file authority".to_owned());
+        }
+        scope
+    } else {
+        inherited.write_scope().clone()
+    };
     let derived = inherited.restrict(
         &PermissionRequest::from_permissions(node_permissions.iter())
-            .with_network_scope(node.network_scope().clone()),
+            .with_network_scope(node.network_scope().clone())
+            .with_write_scope(write_scope),
     );
     derived.ensure_child_of(inherited).map_err(|error| {
         format!(
@@ -2395,13 +3992,11 @@ struct FileFingerprint {
 ///
 /// # Description
 /// Der Schnappschuss deckt das **gesamte** Arbeitsverzeichnis ab, nicht nur
-/// die von `contract.allowed_paths` benannten Pfade. Grund: die abgeleitete
-/// Sandbox (`derive_plan_node_sandbox`) gewährt `WriteWorkspace` nur grob für
-/// den ganzen Workspace — sie kennt keine Durchsetzung auf Pfadebene. Ein
-/// Turn könnte also technisch überall im Workspace schreiben; würde der
-/// Schnappschuss nur die erlaubten Pfade beobachten, bliebe jede Datei
-/// außerhalb davon unsichtbar und `validate_patch` bekäme sie nie zu sehen —
-/// genau die Lücke, die diese Prüfung schließen soll (Befund K36).
+/// die von `contract.allowed_paths` benannten Pfade. Legacy-Worker besitzen
+/// Workspace-Schreibrechte; der Schnappschuss erkennt nachträgliche Änderungen,
+/// garantiert aber keine Isolation zwischen parallelen Workern. Explizit
+/// dateibeschränkte Autorität bleibt erhalten; ihr Schreib-Backend-Pilot ist
+/// bis zu einer isolierten Implementierung fail-closed.
 ///
 /// # Arguments
 /// - `workspace_root` (`&Path`): kanonische Wurzel der abgeleiteten Sandbox.
@@ -2626,6 +4221,28 @@ fn admit_newly_ready_nodes(
     admission: &ReadyNodeAdmission,
     work_id: &str,
 ) {
+    // Nicht allein dem Aufrufer vertrauen: der persistierte Quelljob entscheidet
+    // über das Routing. Prerequisites dürfen nie den Legacy-Coding-Pfad starten.
+    let source = WorkId::try_from_str(work_id)
+        .map_err(|error| error.to_string())
+        .and_then(|id| {
+            admission
+                .job_store
+                .get(&id)
+                .map_err(|error| error.to_string())
+        });
+    let allowed = source.and_then(|record| {
+        if !is_plan_node_kind(&record.job.kind) {
+            return Err("follow-up source is not a plan-node job".to_owned());
+        }
+        // Ein fehlender Owner ist nur mit einem vollständigen alten
+        // Ausführungsvertrag zulässig, nicht als Default für beliebige Jobs.
+        PlanNodePayload::parse(&record.input).map(|_| ())
+    });
+    if let Err(error) = allowed {
+        tracing::error!(work_id = %work_id, error = %error, "legacy plan follow-up refused");
+        return;
+    }
     let template = JobAdmissionTemplate::new(
         admission.scope.clone(),
         admission.budget.clone(),
@@ -2661,14 +4278,21 @@ fn admit_newly_ready_nodes(
     }
 }
 
+// Trusted claim credential retained separately from the model payload.
+struct PlanNodeCallbackClaim {
+    jobs: Arc<JobStore>,
+    token: harw_job_runtime::LeaseToken,
+}
+
 // Invalidates the node and returns the matching job outcome.
 fn fail_plan_node(
     services: &PlanNodeServices,
     task: &TaskId,
-    work_id: &str,
+    claim: &PlanNodeCallbackClaim,
+    assignment_attempt: u32,
     reason: String,
 ) -> JobOutcome {
-    report_plan_node_failure(services, task, work_id, &reason);
+    report_plan_node_failure(services, task, claim, assignment_attempt, &reason);
     JobOutcome::Failed { reason }
 }
 
@@ -2677,37 +4301,48 @@ fn fail_plan_node(
 fn report_plan_node_failure(
     services: &PlanNodeServices,
     task: &TaskId,
-    work_id: &str,
+    claim: &PlanNodeCallbackClaim,
+    assignment_attempt: u32,
     reason: &str,
 ) {
-    if let Err(error) =
-        PlanJobBridge::on_job_failed(services.plan(), task, work_id, reason, services.actor())
-    {
+    if let Err(error) = PlanJobBridge::on_job_failed_claimed(
+        services.plan(),
+        &claim.jobs,
+        &claim.token,
+        task,
+        assignment_attempt,
+        reason,
+        services.actor(),
+    ) {
         tracing::error!(
             task = %task,
-            work_id = %work_id,
+            work_id = %claim.token.work_id,
             error = %error,
             "could not invalidate the plan node of a failed job"
         );
     }
 }
 
-// Maps a terminal job outcome onto the plan. Every non-success path reports,
-// so no node is left `InProgress` by a finished job.
+// Maps a terminal job outcome onto the plan while its exact claim is live.
+// Revoked claims deliberately leave the plan untouched; a trusted recovery
+// path must reconcile a node left InProgress after cancellation or reclaim.
 fn report_plan_node_outcome(
     services: &PlanNodeServices,
     task: &TaskId,
-    work_id: &str,
+    claim: &PlanNodeCallbackClaim,
+    assignment_attempt: u32,
     outcome: JobOutcome,
     admission: &ReadyNodeAdmission,
 ) -> JobOutcome {
     match outcome {
         JobOutcome::Succeeded { result } => {
             let summary = plan_node_summary(&result);
-            match PlanJobBridge::on_job_completed(
+            match PlanJobBridge::on_job_completed_claimed(
                 services.plan(),
+                &claim.jobs,
+                &claim.token,
                 task,
-                work_id,
+                assignment_attempt,
                 &summary,
                 services.actor(),
                 offset_from_timestamp(Timestamp::now()),
@@ -2715,18 +4350,18 @@ fn report_plan_node_outcome(
                 Ok(()) => {
                     tracing::info!(
                         task = %task,
-                        work_id = %work_id,
+                        work_id = %claim.token.work_id,
                         "plan node completed by durable job"
                     );
                     // Befund K37: erst jetzt, mit dem Knoten sicher `Completed`,
                     // können Folgeknoten überhaupt bereit geworden sein.
-                    admit_newly_ready_nodes(services, admission, work_id);
+                    admit_newly_ready_nodes(services, admission, claim.token.work_id.as_str());
                     JobOutcome::Succeeded { result }
                 }
                 Err(error) => {
                     tracing::error!(
                         task = %task,
-                        work_id = %work_id,
+                        work_id = %claim.token.work_id,
                         error = %error,
                         "job succeeded but the plan node could not be completed"
                     );
@@ -2734,21 +4369,21 @@ fn report_plan_node_outcome(
                         "job succeeded but the plan node could not be completed: {}",
                         sanitize_failure(&error.to_string())
                     );
-                    report_plan_node_failure(services, task, work_id, &reason);
+                    report_plan_node_failure(services, task, claim, assignment_attempt, &reason);
                     JobOutcome::Failed { reason }
                 }
             }
         }
         JobOutcome::Failed { reason } => {
-            report_plan_node_failure(services, task, work_id, &reason);
+            report_plan_node_failure(services, task, claim, assignment_attempt, &reason);
             JobOutcome::Failed { reason }
         }
         JobOutcome::Blocked { reason } => {
-            report_plan_node_failure(services, task, work_id, &reason);
+            report_plan_node_failure(services, task, claim, assignment_attempt, &reason);
             JobOutcome::Blocked { reason }
         }
         JobOutcome::Cancelled { reason } => {
-            report_plan_node_failure(services, task, work_id, &reason);
+            report_plan_node_failure(services, task, claim, assignment_attempt, &reason);
             JobOutcome::Cancelled { reason }
         }
     }
@@ -2857,6 +4492,10 @@ fn verification_line(step: &VerificationStep) -> String {
         VerificationStep::Artifact { path } => format!("artifact `{path}` must exist"),
         VerificationStep::TraceEvent { name } => format!("trace event `{name}` must be emitted"),
         VerificationStep::Manual { note } => format!("manual check: {note}"),
+        VerificationStep::CollectSources { sources } => format!(
+            "collect {} admitted sources through the parent prerequisite runner",
+            sources.len()
+        ),
     }
 }
 
@@ -2968,10 +4607,10 @@ impl ExecutionControl for WorkerExecutionControl {
     }
 
     fn force_abort(&self) {
-        if let Ok(slot) = self.abort_handle.lock() {
-            if let Some(handle) = slot.as_ref() {
-                handle.abort();
-            }
+        if let Ok(slot) = self.abort_handle.lock()
+            && let Some(handle) = slot.as_ref()
+        {
+            handle.abort();
         }
     }
 
@@ -3016,6 +4655,7 @@ mod tests {
                 base_delay: SignedDuration::from_secs(1),
                 factor: 1.0,
                 max_delay: SignedDuration::from_secs(1),
+                jitter: 0.0,
             },
             now,
         );
@@ -3102,6 +4742,7 @@ mod tests {
             object.insert("task_id".to_owned(), serde_json::json!(task));
         }
         object.insert("plan_revision".to_owned(), serde_json::json!(2));
+        object.insert("assignment_attempt".to_owned(), serde_json::json!(0));
         object.insert("contract".to_owned(), contract_value);
         object.insert("objective".to_owned(), serde_json::json!("do the thing"));
         object.insert("acceptance_criteria".to_owned(), serde_json::json!([]));
@@ -3307,6 +4948,48 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_node_payload_rejects_missing_or_invalid_assignment_attempt() -> TestResult {
+        let contract = contract_for("t-1", &[]);
+        for value in [
+            None,
+            Some(serde_json::json!(-1)),
+            Some(serde_json::json!(4294967296_u64)),
+            Some(serde_json::json!("0")),
+        ] {
+            let mut input = plan_node_input(Some("t-1"), &contract)?;
+            let object = input.as_object_mut().ok_or(TestError::Missing("object"))?;
+            object.remove("assignment_attempt");
+            if let Some(value) = value {
+                object.insert("assignment_attempt".to_owned(), value);
+            }
+            assert!(PlanNodePayload::parse(&input).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_node_payload_rejects_nonlegacy_dispatch_owner() -> TestResult {
+        let contract = contract_for("t-1", &[]);
+        for owner in [
+            serde_json::json!({"kind": "work_driver_prerequisite", "parent_work_id": "parent", "parent_lease_epoch": 1}),
+            serde_json::json!({"kind": "unknown"}),
+            serde_json::Value::Null,
+            serde_json::json!({"kind": "legacy_plan_jobs", "parent_work_id": "forged"}),
+        ] {
+            let mut input = plan_node_input(Some("t-1"), &contract)?;
+            input
+                .as_object_mut()
+                .ok_or(TestError::Missing("object"))?
+                .insert("dispatch_owner".to_owned(), owner);
+            assert!(
+                PlanNodePayload::parse(&input).is_err(),
+                "owner must not authorize legacy execution"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_plan_node_payload_parse_accepts_a_bridge_payload() -> TestResult {
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
         let payload = PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)?)
@@ -3314,6 +4997,7 @@ mod tests {
         assert_eq!(payload.task_id, TaskId::new("t-1"));
         assert_eq!(payload.plan_id, "p-test");
         assert_eq!(payload.plan_revision, 2);
+        assert_eq!(payload.assignment_attempt, 0);
         assert_eq!(payload.objective, "do the thing");
         assert_eq!(payload.write_scope, vec!["src/lib.rs".to_owned()]);
         assert_eq!(payload.contract.allowed_paths.len(), 1);
@@ -3359,7 +5043,7 @@ mod tests {
                 Permission::NetworkAccess,
             ],
         )?;
-        let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
+        let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
 
         let derived = derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true)
             .map_err(ctx("derivation must succeed"))?;
@@ -3369,6 +5053,64 @@ mod tests {
         assert!(!derived.permissions().contains(Permission::ExecuteProcess));
         assert!(!derived.permissions().contains(Permission::NetworkAccess));
         assert!(derived.ensure_child_of(&inherited).is_ok());
+        assert!(
+            derived.write_scope().is_workspace(),
+            "a legacy contract is not pilot opt-in"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_plan_directory_contract_keeps_workspace_write_authority() -> TestResult {
+        let dir = temp_dir()?;
+        let inherited = sandbox_with(
+            dir.path(),
+            &[Permission::ReadWorkspace, Permission::WriteWorkspace],
+        )?;
+        let contract = contract_for("legacy", &[PathRule::DirectoryPrefix("src".to_owned())]);
+        let derived = derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true)
+            .map_err(ctx("legacy directory contract"))?;
+        assert!(derived.write_scope().is_workspace());
+        assert!(derived.permissions().contains(Permission::WriteWorkspace));
+        Ok(())
+    }
+
+    #[test]
+    fn writable_plan_nodes_reject_non_exact_contract_rules() -> TestResult {
+        let dir = temp_dir()?;
+        let inherited = sandbox_with(
+            dir.path(),
+            &[Permission::ReadWorkspace, Permission::WriteWorkspace],
+        )?;
+        let inherited = inherited.restrict(
+            &PermissionRequest::from_permissions(inherited.permissions().iter()).with_write_scope(
+                harw_authority::FileWriteScope::exact_files(["src/lib.rs"])
+                    .map_err(ctx("exact scope"))?,
+            ),
+        );
+        let exact_contract = contract_for("exact", &[PathRule::Exact("src/lib.rs".to_owned())]);
+        let exact =
+            derive_plan_node_sandbox(&inherited, &exact_contract, PlanNodeKind::Coding, true)
+                .map_err(ctx("explicit exact contract"))?;
+        assert!(!exact.write_scope().is_workspace());
+        assert!(exact.write_scope().allows_path(Path::new("src/lib.rs")));
+        assert!(!exact.write_scope().allows_path(Path::new("Cargo.toml")));
+        let payload = PlanNodePayload::parse(&plan_node_input(Some("exact"), &exact_contract)?)
+            .map_err(ctx("explicit exact payload"))?;
+        let (_, narrowing) = plan_node_narrowing(&payload, PlanNodeKind::Coding, &exact);
+        assert_eq!(narrowing.registry_profile, RegistryProfile::WorkspaceEdit);
+        assert_eq!(narrowing.write_scope, exact.write_scope().clone());
+        for rule in [
+            PathRule::DirectoryPrefix("src".to_owned()),
+            PathRule::Glob("src/*.rs".to_owned()),
+            PathRule::ExtensionSuffix(".rs".to_owned()),
+        ] {
+            let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned()), rule]);
+            assert!(
+                derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true)
+                    .is_err()
+            );
+        }
         Ok(())
     }
 
@@ -3619,7 +5361,7 @@ mod tests {
             snapshot.keys().cloned().collect::<Vec<_>>(),
             vec!["outside.rs".to_owned(), "src/lib.rs".to_owned()],
             "der ganze Workspace muss erfasst werden, nicht nur die erlaubten Pfade \
-             (Befund K36: die Sandbox schneidet nicht auf Pfadebene)"
+             (Befund K36: vollständige Erkennung unabhängig von Autorisierung)"
         );
         Ok(())
     }
@@ -3830,6 +5572,7 @@ mod tests {
                 base_delay: SignedDuration::from_secs(1),
                 factor: 1.0,
                 max_delay: SignedDuration::from_secs(1),
+                jitter: 0.0,
             },
             RepoRevision("sha".to_owned()),
             Timestamp::now(),
@@ -3864,10 +5607,25 @@ mod tests {
         // Simuliert den erfolgreichen Abschluss des `t-1`-Jobs — genau der
         // Aufruf, den `execute_plan_node_claim` nach einem erfolgreichen Turn
         // macht.
+        let live_claim = jobs
+            .claim(
+                &WorkId::from_str(&work_id),
+                &ClaimRequest {
+                    worker_id: "callback-test".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now: Timestamp::now(),
+                },
+            )
+            .map_err(ctx("callback claim"))?;
+        let callback_claim = PlanNodeCallbackClaim {
+            jobs: Arc::clone(&jobs),
+            token: live_claim.token,
+        };
         let outcome = report_plan_node_outcome(
             &services,
             &task,
-            &work_id,
+            &callback_claim,
+            0,
             JobOutcome::Succeeded {
                 result: serde_json::json!({"assistant": "t-1 done"}),
             },
@@ -3905,6 +5663,89 @@ mod tests {
             .map_err(ctx(
                 "der für t-2 admittierte Job muss im Job-Speicher stehen",
             ))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_followup_refuses_prerequisite_unknown_and_missing_source() -> TestResult {
+        for owner in [
+            serde_json::json!({"kind": "work_driver_prerequisite", "parent_work_id": "parent", "parent_lease_epoch": 1}),
+            serde_json::json!({"kind": "unknown"}),
+            serde_json::Value::Null,
+        ] {
+            let temp = temp_dir()?;
+            let plan = InMemoryPlanStore::new();
+            plan.apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new("p-test"),
+                    goal: "test".into(),
+                },
+                "test",
+            )
+            .map_err(ctx("create"))?;
+            plan.apply(
+                PlanAction::AddNode {
+                    node: harw_plan::plan_node!("ready", write: ["src/ready.rs"]),
+                },
+                "test",
+            )
+            .map_err(ctx("node"))?;
+            let plan: Arc<dyn PlanStore> = Arc::new(plan);
+            let revision = plan.revision();
+            let services = PlanNodeServices::new(
+                Arc::clone(&plan),
+                sandbox_with(temp.path(), &[Permission::ReadWorkspace])?,
+                "test".into(),
+            );
+            let jobs = Arc::new(JobStore::new(temp.path()));
+            let mut input =
+                plan_node_input(Some("source-task"), &contract_for("source-task", &[]))?;
+            input
+                .as_object_mut()
+                .ok_or(TestError::Missing("object"))?
+                .insert("dispatch_owner".into(), owner);
+            let record =
+                ready_record_of_kind("source", JobKind::Custom(PLAN_NODE_JOB_KIND.into()), input)?;
+            let admission = ReadyNodeAdmission {
+                job_store: Arc::clone(&jobs),
+                scope: record.scope.clone(),
+                budget: record.job.budget.clone(),
+                retry: record.job.retry.clone(),
+                base_revision: RepoRevision("sha".into()),
+            };
+            admit_newly_ready_nodes(&services, &admission, "missing-source");
+            assert_eq!(
+                plan.revision(),
+                revision,
+                "missing source must not dispatch"
+            );
+            admit(
+                &jobs,
+                &ready_record_of_kind(
+                    "malformed-ownerless",
+                    JobKind::Custom(PLAN_NODE_JOB_KIND.into()),
+                    serde_json::json!({}),
+                )?,
+            )?;
+            admit_newly_ready_nodes(&services, &admission, "malformed-ownerless");
+            assert_eq!(
+                plan.revision(),
+                revision,
+                "missing owner must not legitimize malformed source"
+            );
+            admit(&jobs, &record)?;
+            admit_newly_ready_nodes(&services, &admission, "source");
+            assert_eq!(
+                plan.revision(),
+                revision,
+                "nonlegacy owner must not dispatch coding"
+            );
+            assert!(
+                plan.current().map_err(ctx("current"))?.nodes[0]
+                    .assignment
+                    .is_none()
+            );
+        }
         Ok(())
     }
 
@@ -3949,6 +5790,7 @@ mod tests {
                 base_delay: SignedDuration::from_secs(1),
                 factor: 1.0,
                 max_delay: SignedDuration::from_secs(1),
+                jitter: 0.0,
             },
             RepoRevision("sha".to_owned()),
             Timestamp::now(),
@@ -3977,10 +5819,25 @@ mod tests {
 
         // Darf weder scheitern noch panicken, obwohl kein Folgeknoten bereit
         // wird.
+        let live_claim = jobs
+            .claim(
+                &WorkId::from_str(&work_id),
+                &ClaimRequest {
+                    worker_id: "callback-test".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now: Timestamp::now(),
+                },
+            )
+            .map_err(ctx("callback claim"))?;
+        let callback_claim = PlanNodeCallbackClaim {
+            jobs: Arc::clone(&jobs),
+            token: live_claim.token,
+        };
         let outcome = report_plan_node_outcome(
             &services,
             &task,
-            &work_id,
+            &callback_claim,
+            0,
             JobOutcome::Succeeded {
                 result: serde_json::json!({"assistant": "done"}),
             },
@@ -4088,6 +5945,223 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prerequisite_owner_blocks_before_model_without_parent_authority() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
+        admit(
+            &store,
+            &ready_record_of_kind(
+                "plan-job",
+                JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
+                {
+                    let mut input = plan_node_input(Some("t-1"), &contract)?;
+                    input.as_object_mut().ok_or(TestError::Missing("object"))?.insert("dispatch_owner".into(), serde_json::json!({"kind": "work_driver_prerequisite", "parent_work_id": "forged-parent", "parent_lease_epoch": 1}));
+                    input
+                },
+            )?,
+        )?;
+        let provider = Arc::new(RecordingModelProvider::new());
+        let services = plan_services(
+            temp.path(),
+            &[Permission::ReadWorkspace, Permission::WriteWorkspace],
+        )?;
+
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            Some(services),
+            job_context(temp.path())?,
+        )
+        .await;
+
+        assert_eq!(completed, 1, "the plan job must reach a terminal state");
+        assert!(
+            provider.recorded().is_empty(),
+            "a malformed plan payload must never reach the model"
+        );
+        let JobOutcome::Blocked { reason } = completion_of(&store, "plan-job")? else {
+            return Err(TestError::Unexpected(
+                "a prerequisite job must block".into(),
+            ));
+        };
+        assert!(reason.contains("parent-claim"), "unclear message: {reason}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_poller_recovers_bound_pending_plan_job_after_publication_gap() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        let plan = InMemoryPlanStore::new();
+        plan.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("p-test"),
+                goal: "test".to_owned(),
+            },
+            "test",
+        )
+        .map_err(ctx("create"))?;
+        let mut node = harw_plan::testing::base_node("t-1");
+        node.write_scope.clear();
+        node.assignment = Some(harw_plan::types::Assignment {
+            worker: "test".to_owned(),
+            attempt: 0,
+            job: Some("staged-plan-job".to_owned()),
+        });
+        let contract = harw_plan::admission::contract_from_node(
+            &node,
+            RepoRevision("sha".to_owned()),
+            RevisionId::new(2),
+        );
+        let input = serde_json::json!({
+            "plan_id": "p-test", "task_id": "t-1", "plan_revision": 2,
+            "assignment_attempt": 0, "contract": contract, "objective": node.objective,
+            "acceptance_criteria": [], "read_scope": [], "write_scope": [], "forbidden_scope": []
+        });
+        plan.apply(PlanAction::AddNode { node }, "test")
+            .map_err(ctx("add"))?;
+        for status in [PlanNodeStatus::Ready, PlanNodeStatus::InProgress] {
+            plan.apply(
+                PlanAction::SetStatus {
+                    id: TaskId::new("t-1"),
+                    status,
+                    reason: None,
+                },
+                "test",
+            )
+            .map_err(ctx("status"))?;
+        }
+        let mut record = ready_record_of_kind(
+            "staged-plan-job",
+            JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
+            input,
+        )?;
+        record.job.state = JobState::Pending;
+        admit(&store, &record)?;
+        let plan: Arc<dyn PlanStore> = Arc::new(plan);
+        let services = Arc::new(PlanNodeServices::new(
+            Arc::clone(&plan),
+            sandbox_with(temp.path(), &[Permission::ReadWorkspace])?,
+            "test".to_owned(),
+        ));
+        // Isolate recovery from first-use scaffold writes: project bootstrap
+        // otherwise adds .gitignore during assembly and the empty contract
+        // correctly rejects that unrelated write in the patch diff.
+        std::fs::write(
+            temp.path().join("workspace/.gitignore"),
+            format!("{}/\n", harw_home::paths::project_dir_name()),
+        )
+        .map_err(ctx("initialize ignore rule"))?;
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::new(EchoModelProvider::new("done")),
+            Some(services),
+            job_context(temp.path())?,
+        )
+        .await;
+        assert_eq!(completed, 1, "poll must publish and run the staged job");
+        let outcome = completion_of(&store, "staged-plan-job")?;
+        assert!(
+            matches!(outcome, JobOutcome::Succeeded { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            plan.current().map_err(ctx("current"))?.nodes[0].status,
+            PlanNodeStatus::Completed
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_node_legacy_or_stale_attempt_is_durably_blocked_before_model() -> TestResult
+    {
+        for attempt in [None, Some(1_u32)] {
+            let temp = temp_dir()?;
+            let store = Arc::new(JobStore::new(temp.path()));
+            let mut input = plan_node_input(Some("t-1"), &contract_for("t-1", &[]))?;
+            let object = input.as_object_mut().ok_or(TestError::Missing("object"))?;
+            object.remove("assignment_attempt");
+            if let Some(attempt) = attempt {
+                object.insert("assignment_attempt".to_owned(), serde_json::json!(attempt));
+            }
+            admit(
+                &store,
+                &ready_record_of_kind(
+                    "stale-plan-job",
+                    JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
+                    input,
+                )?,
+            )?;
+            let plan = InMemoryPlanStore::new();
+            plan.apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new("p-test"),
+                    goal: "test".to_owned(),
+                },
+                "test",
+            )
+            .map_err(ctx("create"))?;
+            let mut node = harw_plan::testing::base_node("t-1");
+            node.assignment = Some(harw_plan::types::Assignment {
+                worker: "test".to_owned(),
+                attempt: 2,
+                job: Some("stale-plan-job".to_owned()),
+            });
+            plan.apply(PlanAction::AddNode { node }, "test")
+                .map_err(ctx("add"))?;
+            for status in [PlanNodeStatus::Ready, PlanNodeStatus::InProgress] {
+                plan.apply(
+                    PlanAction::SetStatus {
+                        id: TaskId::new("t-1"),
+                        status,
+                        reason: None,
+                    },
+                    "test",
+                )
+                .map_err(ctx("status"))?;
+            }
+            let plan: Arc<dyn PlanStore> = Arc::new(plan);
+            let revision = plan.revision();
+            let services = Arc::new(PlanNodeServices::new(
+                Arc::clone(&plan),
+                sandbox_with(temp.path(), &[Permission::ReadWorkspace])?,
+                "test".to_owned(),
+            ));
+            let provider = Arc::new(RecordingModelProvider::new());
+            assert_eq!(
+                run_job_worker_once(
+                    Arc::clone(&store),
+                    Arc::new(JobExecutionRegistry::new()),
+                    Arc::clone(&provider) as Arc<dyn ModelProvider>,
+                    Some(services),
+                    job_context(temp.path())?
+                )
+                .await,
+                1
+            );
+            assert!(provider.recorded().is_empty());
+            assert_eq!(plan.revision(), revision);
+            let JobOutcome::Blocked { reason } = completion_of(&store, "stale-plan-job")? else {
+                return Err(TestError::Unexpected(
+                    "stale or legacy job must remain durably blocked".to_owned(),
+                ));
+            };
+            if attempt.is_none() {
+                assert!(
+                    reason.contains("assignment_attempt") && reason.contains("re-admit"),
+                    "{reason}"
+                );
+            } else {
+                assert!(reason.contains("attempt differs"), "{reason}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_run_job_worker_once_blocks_a_plan_node_without_plan_services() -> TestResult {
         let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
@@ -4190,6 +6264,344 @@ mod tests {
     }
 
     // ── Work-driver lane ──────────────────────────────────────────────────
+
+    mod intent_cycle_e2e {
+        use super::*;
+        use std::collections::{BTreeMap, VecDeque};
+
+        use harw_core::{ModelError, ModelFuture, ModelRequest, ModelResponse};
+        use harw_ops::intent_cycle::{INTENT_CYCLE_INPUT_SCHEMA_VERSION, IntentCycleJobInput};
+        use harw_plan_bridge::{
+            ContentCheck, CycleStore, CycleTerminal, INTENT_CYCLE_JOB_KIND, ReadOnlyCycleSpec,
+        };
+
+        /// Replays scripted proposals, one per model call, and records the
+        /// user prompt (the debug rendering of the request history) of every
+        /// call.
+        struct Scripted {
+            replies: Mutex<VecDeque<String>>,
+            prompts: Mutex<Vec<String>>,
+        }
+
+        impl Scripted {
+            fn new(replies: impl IntoIterator<Item = String>) -> Self {
+                Self {
+                    replies: Mutex::new(replies.into_iter().collect()),
+                    prompts: Mutex::new(Vec::new()),
+                }
+            }
+
+            fn prompts(&self) -> Vec<String> {
+                self.prompts
+                    .lock()
+                    .map_or_else(|_| Vec::new(), |prompts| prompts.clone())
+            }
+        }
+
+        impl ModelProvider for Scripted {
+            fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+                if let Ok(mut prompts) = self.prompts.lock() {
+                    prompts.push(format!("{:?}", request.history));
+                }
+                let next = self
+                    .replies
+                    .lock()
+                    .ok()
+                    .and_then(|mut queue| queue.pop_front())
+                    .ok_or_else(|| ModelError::RequestFailed("script exhausted".to_owned()));
+                Box::pin(async move { next.map(ModelResponse::text) })
+            }
+        }
+
+        /// [`Scripted`] that rewrites one workspace file right before the
+        /// reply with index `at`: the repository changes under the running
+        /// cycle, between two of its steps.
+        struct RewritingScripted {
+            inner: Scripted,
+            at: usize,
+            path: PathBuf,
+            content: &'static str,
+        }
+
+        impl ModelProvider for RewritingScripted {
+            fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+                if self.inner.prompts().len() == self.at {
+                    // A failed write surfaces as a missing completion below.
+                    if let Err(error) = std::fs::write(&self.path, self.content) {
+                        tracing::warn!(error = %error, "test workspace rewrite failed");
+                    }
+                }
+                self.inner.respond(request)
+            }
+        }
+
+        /// Objective of the marker cycle used by most tests.
+        const MARKER_OBJECTIVE: &str = "does lib.rs define the marker?";
+
+        /// Writes `src/lib.rs` into the job's cwd and configures the default
+        /// model the proposer runs on; returns the cwd.
+        fn cycle_workspace(context: &JobWorkerContext, lib: &str) -> TestResult<PathBuf> {
+            let root = context
+                .runtime_root
+                .as_ref()
+                .ok_or(TestError::Missing("runtime root"))?;
+            std::fs::create_dir_all(root.cwd.join("src")).map_err(ctx("mkdir src"))?;
+            std::fs::write(root.cwd.join("src/lib.rs"), lib).map_err(ctx("write lib"))?;
+            let config = root.home.join("config.toml");
+            // Top-level keys must precede the first table.
+            let text = std::fs::read_to_string(&config).map_err(ctx("read config"))?;
+            std::fs::write(
+                &config,
+                format!("default_model = \"cycle-test-model\"\n{text}"),
+            )
+            .map_err(ctx("write config"))?;
+            Ok(root.cwd.clone())
+        }
+
+        /// Contents of the `pl90-*.md` lesson files under `<root>/facts`.
+        fn lesson_files(root: &Path) -> TestResult<Vec<String>> {
+            let mut lessons = Vec::new();
+            for entry in std::fs::read_dir(root.join("facts")).map_err(ctx("read facts dir"))? {
+                let entry = entry.map_err(ctx("facts dir entry"))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("pl90-") && name.ends_with(".md") {
+                    lessons.push(std::fs::read_to_string(entry.path()).map_err(ctx("read fact"))?);
+                }
+            }
+            Ok(lessons)
+        }
+
+        fn cycle_record(
+            id: &str,
+            objective: &str,
+            workspace_root: &Path,
+            learning_root: Option<PathBuf>,
+        ) -> TestResult<StoredJob> {
+            let spec = ReadOnlyCycleSpec::new(
+                objective.to_owned(),
+                BTreeMap::from([("lib".to_owned(), "src/lib.rs".to_owned())]),
+                BTreeMap::from([(
+                    "marker-defined".to_owned(),
+                    ContentCheck {
+                        target: "lib".to_owned(),
+                        must_contain: vec!["fn cycle_marker".to_owned()],
+                        must_not_contain: Vec::new(),
+                    },
+                )]),
+                None,
+            );
+            let input = IntentCycleJobInput {
+                schema_version: INTENT_CYCLE_INPUT_SCHEMA_VERSION,
+                cycle_id: id.to_owned(),
+                intent_id: format!("intent-{id}"),
+                spec,
+                requested_by: "operator".to_owned(),
+                tenant: None,
+                workspace_root: Some(
+                    std::fs::canonicalize(workspace_root).map_err(ctx("canonical root"))?,
+                ),
+                learning_root,
+            };
+            ready_record_of_kind(
+                id,
+                JobKind::Custom(INTENT_CYCLE_JOB_KIND.to_owned()),
+                serde_json::to_value(input).map_err(ctx("input json"))?,
+            )
+        }
+
+        #[tokio::test]
+        async fn worker_drives_a_cycle_to_completion_proposed() -> TestResult {
+            let temp = temp_dir()?;
+            let context = job_context(temp.path())?;
+            // The second line is a sentinel only the file read can put into a
+            // prompt: the intent text and the checks never mention it.
+            let cwd = cycle_workspace(
+                &context,
+                "pub fn cycle_marker() {}\n// excerpt-sentinel-4711\n",
+            )?;
+            let store = Arc::new(JobStore::new(&temp.path().join("jobs")));
+            admit(
+                &store,
+                &cycle_record("cycle-e2e", MARKER_OBJECTIVE, &cwd, None)?,
+            )?;
+            let provider = Arc::new(Scripted::new([
+                r#"{"kind":"advance","segments":[{"kind":"read","target":"lib"}]}"#.to_owned(),
+                r#"{"kind":"verify","evidence_id":"cycle-e2e-0:lib"}"#.to_owned(),
+                r#"{"kind":"complete"}"#.to_owned(),
+            ]));
+            let completed = run_job_worker_once(
+                Arc::clone(&store),
+                Arc::new(JobExecutionRegistry::new()),
+                Arc::clone(&provider) as Arc<dyn ModelProvider>,
+                None,
+                context,
+            )
+            .await;
+            assert_eq!(completed, 1);
+            // The executor's read text reaches the proposer as an excerpt: the
+            // first prompt precedes any read, the second one shows the file.
+            let prompts = provider.prompts();
+            let first = prompts.first().ok_or(TestError::Missing("first prompt"))?;
+            let second = prompts.get(1).ok_or(TestError::Missing("second prompt"))?;
+            assert!(
+                !first.contains("excerpt-sentinel-4711"),
+                "nothing was read before the first prompt"
+            );
+            assert!(
+                second.contains("EXCERPT") && second.contains("excerpt-sentinel-4711"),
+                "the second prompt must carry the read file as an excerpt: {second}"
+            );
+            let outcome = completion_of(&store, "cycle-e2e")?;
+            let JobOutcome::Succeeded { result } = outcome else {
+                return Err(TestError::Unexpected(format!("{outcome:?}")));
+            };
+            assert_eq!(result["terminal"], "completion_proposed");
+            assert_eq!(result["requires_owner_acceptance"], true);
+            let cycles = CycleStore::open_existing_in_job_root(store.root())
+                .map_err(ctx("open cycle store"))?
+                .ok_or(TestError::Missing("cycle store"))?;
+            let status = cycles.load("cycle-e2e").map_err(ctx("cycle"))?.status();
+            assert_eq!(status.terminal, Some(CycleTerminal::CompletionProposed));
+            assert_eq!(status.criteria_covered, vec!["marker-defined".to_owned()]);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn worker_learns_project_pitfalls_from_failed_verifications() -> TestResult {
+            let temp = temp_dir()?;
+            let context = job_context(temp.path())?;
+            // The marker is missing at first, so verifying the first read fails.
+            let cwd = cycle_workspace(&context, "pub fn other() {}\n")?;
+            let learning_root = temp.path().join("project-memories");
+            let store = Arc::new(JobStore::new(&temp.path().join("jobs")));
+            admit(
+                &store,
+                &cycle_record(
+                    "cycle-learn",
+                    MARKER_OBJECTIVE,
+                    &cwd,
+                    Some(learning_root.clone()),
+                )?,
+            )?;
+            let provider = Arc::new(RewritingScripted {
+                inner: Scripted::new([
+                    r#"{"kind":"advance","segments":[{"kind":"read","target":"lib"}]}"#.to_owned(),
+                    // `unmet:` claim: committed as a VerificationFailed observation.
+                    r#"{"kind":"verify","evidence_id":"cycle-learn-0:lib"}"#.to_owned(),
+                    // The file gains the marker before this reply (see `at`).
+                    r#"{"kind":"advance","segments":[{"kind":"read","target":"lib"}]}"#.to_owned(),
+                    r#"{"kind":"verify","evidence_id":"cycle-learn-2:lib"}"#.to_owned(),
+                    r#"{"kind":"complete"}"#.to_owned(),
+                ]),
+                at: 2,
+                path: cwd.join("src/lib.rs"),
+                content: "pub fn cycle_marker() {}\n",
+            });
+            let completed = run_job_worker_once(
+                Arc::clone(&store),
+                Arc::new(JobExecutionRegistry::new()),
+                Arc::clone(&provider) as Arc<dyn ModelProvider>,
+                None,
+                Arc::clone(&context),
+            )
+            .await;
+            assert_eq!(completed, 1);
+            let outcome = completion_of(&store, "cycle-learn")?;
+            let JobOutcome::Succeeded { result } = outcome else {
+                return Err(TestError::Unexpected(format!("{outcome:?}")));
+            };
+            assert_eq!(result["terminal"], "completion_proposed");
+            let first = provider.inner.prompts();
+            assert!(
+                first.iter().all(|prompt| !prompt.contains("LESSONS")),
+                "nothing was learned before the first cycle"
+            );
+
+            // The failed verification became exactly one project pitfall ...
+            let lessons = lesson_files(&learning_root)?;
+            assert_eq!(lessons.len(), 1, "{lessons:?}");
+            let lesson = lessons.first().ok_or(TestError::Missing("lesson"))?;
+            assert!(
+                lesson.contains("verification_failed/verification_unmet"),
+                "{lesson}"
+            );
+            assert!(lesson.contains("scope: project"), "{lesson}");
+            // ... and the outbox was acknowledged under the job's lease.
+            let cycles = CycleStore::open_existing_in_job_root(store.root())
+                .map_err(ctx("open cycle store"))?
+                .ok_or(TestError::Missing("cycle store"))?;
+            let status = cycles.load("cycle-learn").map_err(ctx("cycle"))?.status();
+            assert_eq!(status.terminal, Some(CycleTerminal::CompletionProposed));
+            assert_eq!(status.pending_observations, 0);
+
+            // A later cycle of the project is shown the lesson as data.
+            admit(
+                &store,
+                &cycle_record(
+                    "cycle-recall",
+                    "verify that lib.rs defines the marker",
+                    &cwd,
+                    Some(learning_root.clone()),
+                )?,
+            )?;
+            let recall = Arc::new(Scripted::new([
+                r#"{"kind":"advance","segments":[{"kind":"read","target":"lib"}]}"#.to_owned(),
+                r#"{"kind":"verify","evidence_id":"cycle-recall-0:lib"}"#.to_owned(),
+                r#"{"kind":"complete"}"#.to_owned(),
+            ]));
+            let completed = run_job_worker_once(
+                Arc::clone(&store),
+                Arc::new(JobExecutionRegistry::new()),
+                Arc::clone(&recall) as Arc<dyn ModelProvider>,
+                None,
+                context,
+            )
+            .await;
+            assert_eq!(completed, 1);
+            let prompts = recall.prompts();
+            let opening = prompts.first().ok_or(TestError::Missing("recall prompt"))?;
+            assert!(
+                opening.contains("LESSONS")
+                    && opening.contains("verification_failed/verification_unmet"),
+                "the recalled lesson must reach the proposer: {opening}"
+            );
+            assert!(matches!(
+                completion_of(&store, "cycle-recall")?,
+                JobOutcome::Succeeded { .. }
+            ));
+            assert_eq!(lesson_files(&learning_root)?.len(), 1);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn malformed_cycle_input_fails_without_a_model_call() -> TestResult {
+            let temp = temp_dir()?;
+            let store = Arc::new(JobStore::new(&temp.path().join("jobs")));
+            admit(
+                &store,
+                &ready_record_of_kind(
+                    "cycle-bad",
+                    JobKind::Custom(INTENT_CYCLE_JOB_KIND.to_owned()),
+                    serde_json::json!({"objective": "x"}),
+                )?,
+            )?;
+            let provider = Arc::new(RecordingModelProvider::new());
+            run_job_worker_once(
+                Arc::clone(&store),
+                Arc::new(JobExecutionRegistry::new()),
+                Arc::clone(&provider) as Arc<dyn ModelProvider>,
+                None,
+                job_context(temp.path())?,
+            )
+            .await;
+            assert!(provider.recorded().is_empty());
+            assert!(matches!(
+                completion_of(&store, "cycle-bad")?,
+                JobOutcome::Failed { .. }
+            ));
+            Ok(())
+        }
+    }
 
     mod work_driver_lane {
         use super::*;
@@ -5065,6 +7477,11 @@ mod tests {
         // the store's current revision.
         let mut node = harw_plan::testing::base_node("t-1");
         node.kind = PlanNodeKind::Research;
+        node.assignment = Some(harw_plan::types::Assignment {
+            worker: "test-runtime".to_owned(),
+            attempt: 0,
+            job: Some("marked-parent-job".to_owned()),
+        });
         let node_id = node.id.clone();
         let expected_rev = plan.revision();
         plan.apply_batch(
@@ -5072,8 +7489,13 @@ mod tests {
             vec![
                 PlanAction::AddNode { node },
                 PlanAction::SetStatus {
-                    id: node_id,
+                    id: node_id.clone(),
                     status: PlanNodeStatus::Ready,
+                    reason: None,
+                },
+                PlanAction::SetStatus {
+                    id: node_id,
+                    status: PlanNodeStatus::InProgress,
                     reason: None,
                 },
             ],
@@ -5178,11 +7600,11 @@ mod prompt_claim_guard_tests {
 
     // ── Fixtures ──────────────────────────────────────────────────────────
 
-    fn temp_dir() -> TestResult<tempfile::TempDir> {
+    pub(super) fn temp_dir() -> TestResult<tempfile::TempDir> {
         tempfile::tempdir().map_err(ctx("temp directory"))
     }
 
-    fn operator_scope() -> JobScope {
+    pub(super) fn operator_scope() -> JobScope {
         JobScope::new(
             TenantId::from_str("tenant"),
             WorkspaceId::from_str("workspace"),
@@ -5192,7 +7614,7 @@ mod prompt_claim_guard_tests {
         )
     }
 
-    fn record(
+    pub(super) fn record(
         id: &str,
         input: serde_json::Value,
         budget: Budget,
@@ -5208,6 +7630,7 @@ mod prompt_claim_guard_tests {
                 base_delay: SignedDuration::from_secs(1),
                 factor: 1.0,
                 max_delay: SignedDuration::from_secs(1),
+                jitter: 0.0,
             },
             now,
         );
@@ -5227,12 +7650,12 @@ mod prompt_claim_guard_tests {
         })
     }
 
-    fn admit(store: &JobStore, record: &StoredJob) -> TestResult {
+    pub(super) fn admit(store: &JobStore, record: &StoredJob) -> TestResult {
         store.admit(record).map_err(ctx("admit"))?;
         Ok(())
     }
 
-    fn failure_reason(store: &JobStore, id: &str) -> TestResult<String> {
+    pub(super) fn failure_reason(store: &JobStore, id: &str) -> TestResult<String> {
         let stored = store.get(&WorkId::from_str(id)).map_err(ctx("get job"))?;
         match stored.completion.map(|completion| completion.outcome) {
             Some(JobOutcome::Failed { reason }) => Ok(reason),
@@ -5242,7 +7665,7 @@ mod prompt_claim_guard_tests {
         }
     }
 
-    async fn run_once(
+    pub(super) async fn run_once(
         store: &Arc<JobStore>,
         root: &Path,
         provider: Arc<dyn ModelProvider>,
@@ -5283,7 +7706,7 @@ mod prompt_claim_guard_tests {
     }
 
     // Claimt einen zugelassenen Job als dieser Worker (`WORKER_ID`).
-    fn claim_as_worker(store: &JobStore, id: &str) -> TestResult<JobClaim> {
+    pub(super) fn claim_as_worker(store: &JobStore, id: &str) -> TestResult<JobClaim> {
         store
             .claim(
                 &WorkId::from_str(id),
@@ -5296,7 +7719,7 @@ mod prompt_claim_guard_tests {
             .map_err(ctx("claim"))
     }
 
-    fn empty_request() -> harw_core::ModelRequest {
+    pub(super) fn empty_request() -> harw_core::ModelRequest {
         harw_core::ModelRequest::new(
             harw_extension_api::LoadedInstructions {
                 system_prompt: String::new(),
@@ -5309,9 +7732,9 @@ mod prompt_claim_guard_tests {
     }
 
     /// Antwortet sofort mit fester Usage und zählt die Aufrufe.
-    struct FixedUsageProvider {
-        calls: AtomicUsize,
-        tokens_per_call: u64,
+    pub(super) struct FixedUsageProvider {
+        pub(super) calls: AtomicUsize,
+        pub(super) tokens_per_call: u64,
     }
 
     impl ModelProvider for FixedUsageProvider {
@@ -5856,5 +8279,116 @@ mod prompt_claim_guard_tests {
         );
         assert!(matches!(expired, Err(ref reason) if reason.starts_with("lease:")));
         Ok(())
+    }
+
+    // ── Usage-Persistierung ───────────────────────────────────────────────
+
+    pub(super) fn tokens_used(total: u64) -> TokenUsage {
+        TokenUsage {
+            cache_separate: false,
+            input_tokens: total,
+            output_tokens: 0,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_ledger_flush_writes_usage_to_the_job_store() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &record(
+                "usage-flush",
+                serde_json::json!({"prompt": "hello"}),
+                Budget::unbounded(),
+                operator_scope(),
+            )?,
+        )?;
+        let claim = claim_as_worker(&store, "usage-flush")?;
+        let ledger = PromptTokenLedger::persisted(
+            Budget::unbounded(),
+            claim.job.usage.clone(),
+            Arc::clone(&store),
+            claim.token.clone(),
+        );
+
+        ledger
+            .charge_round(&tokens_used(7))
+            .map_err(TestError::Unexpected)?;
+        ledger.flush().await.map_err(ctx("flush"))?;
+
+        let stored = store
+            .get(&WorkId::from_str("usage-flush"))
+            .map_err(ctx("get job"))?;
+        assert_eq!(stored.job.usage.tokens, 7);
+        assert!(ledger.exceeded().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ledger_closes_when_the_lease_is_lost_during_flush() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &record(
+                "usage-lease-lost",
+                serde_json::json!({"prompt": "hello"}),
+                Budget::unbounded(),
+                operator_scope(),
+            )?,
+        )?;
+        let claim = claim_as_worker(&store, "usage-lease-lost")?;
+        let mut stale_token = claim.token.clone();
+        stale_token.nonce.push_str("-stale");
+        let ledger = PromptTokenLedger::persisted(
+            Budget::unbounded(),
+            claim.job.usage.clone(),
+            Arc::clone(&store),
+            stale_token,
+        );
+
+        ledger
+            .charge_round(&tokens_used(3))
+            .map_err(TestError::Unexpected)?;
+        let flushed = ledger.flush().await;
+        assert!(
+            matches!(flushed, Err(UsageFlushError::LeaseLost)),
+            "{flushed:?}"
+        );
+
+        let Some(reason) = ledger.exceeded() else {
+            return Err(TestError::Unexpected(
+                "a lost lease must close the ledger".into(),
+            ));
+        };
+        assert!(reason.starts_with("lease:"), "{reason}");
+        assert!(ledger.admit_round().is_err());
+        let stored = store
+            .get(&WorkId::from_str("usage-lease-lost"))
+            .map_err(ctx("get job"))?;
+        assert_eq!(stored.job.usage.tokens, 0, "a stale token must not write");
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_never_decreases_below_the_starting_usage() {
+        let start = BudgetUsage {
+            tokens: 5,
+            wall: SignedDuration::from_secs(10),
+            tool_calls: 2,
+        };
+        let ledger = PromptTokenLedger::new(Budget::unbounded(), start.clone());
+
+        let first = ledger.snapshot();
+        assert!(first.tokens >= start.tokens);
+        assert!(first.wall >= start.wall);
+        assert!(first.tool_calls >= start.tool_calls);
+
+        let second = ledger.snapshot();
+        assert!(second.wall >= first.wall);
     }
 }

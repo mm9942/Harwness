@@ -114,12 +114,11 @@ impl SeedSpec {
                 if text.is_empty() {
                     return None;
                 }
-                if text.len() == 64 {
-                    if let Some(bytes) = from_hex(text) {
-                        if let Ok(arr) = <[u8; 32]>::try_from(bytes) {
-                            return Some(arr);
-                        }
-                    }
+                if text.len() == 64
+                    && let Some(bytes) = from_hex(text)
+                    && let Ok(arr) = <[u8; 32]>::try_from(bytes)
+                {
+                    return Some(arr);
                 }
                 Some(sha256_parts(&[DOMAIN, b"/seed/text", text.as_bytes()]))
             }
@@ -1691,10 +1690,10 @@ impl Scenario {
             Self::Business(s) => validate_business(s, &mut errors, &mut warnings),
         }
         validate_rules(self.rules(), &mut errors);
-        if let Some(m) = self.materials() {
-            if m.dir.as_os_str().to_string_lossy().trim().is_empty() {
-                errors.push("materials.dir ist leer".to_owned());
-            }
+        if let Some(m) = self.materials()
+            && m.dir.as_os_str().to_string_lossy().trim().is_empty()
+        {
+            errors.push("materials.dir ist leer".to_owned());
         }
         self.validate_injects_effects(&mut errors);
         self.validate_extensions(&mut errors, &mut warnings);
@@ -2491,10 +2490,10 @@ fn validate_business(s: &BusinessScenario, errors: &mut Vec<String>, warnings: &
                 errors.push(format!("{ctx}: at.phase `{}` unbekannt", at.phase));
             }
         }
-        if let Some(when) = &i.when {
-            if !predicate_syntax_ok(when) {
-                errors.push(format!("{ctx}: when nicht parsebar"));
-            }
+        if let Some(when) = &i.when
+            && !predicate_syntax_ok(when)
+        {
+            errors.push(format!("{ctx}: when nicht parsebar"));
         }
         match i.kind {
             InjectKind::Scheduled if i.at.is_none() => {

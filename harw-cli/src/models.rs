@@ -40,6 +40,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use toml_edit::value;
 
 use harw_config::ConfigWriter;
+// Zeitpunkt-Typ der Lebenszyklus-API (re-exportiert vom Modellkatalog, damit
+// `harw-cli` keine eigene `time`-Abhängigkeit braucht).
+use harw_model_catalog::lifecycle::OffsetDateTime as Timestamp;
 use harw_provider_http::discovery::{self, DiscoveredModel};
 
 use crate::cli::{InternalAction, ModelsAction, OnOff};
@@ -462,10 +465,10 @@ fn protected_model_ids(
     }
 
     let uia_provider = harness.uia_provider.as_deref().or(default_provider);
-    if uia_provider == Some(provider_name) {
-        if let Some(id) = &harness.uia_model {
-            protected.insert(id.clone(), ProtectionReason::InUse);
-        }
+    if uia_provider == Some(provider_name)
+        && let Some(id) = &harness.uia_model
+    {
+        protected.insert(id.clone(), ProtectionReason::InUse);
     }
 
     // uia_worker_model ist an uia_provider gekoppelt (dieselbe Or-Kette wie
@@ -476,10 +479,10 @@ fn protected_model_ids(
     // Provider-Katalog-Modell, greift dieser Block nicht — das ist reine
     // Prune-Schutzlogik, die Ablehnung der Inkonsistenz selbst passiert an
     // anderer Stelle.
-    if uia_provider == Some(provider_name) {
-        if let Some(id) = &harness.uia_worker_model {
-            protected.insert(id.clone(), ProtectionReason::InUse);
-        }
+    if uia_provider == Some(provider_name)
+        && let Some(id) = &harness.uia_worker_model
+    {
+        protected.insert(id.clone(), ProtectionReason::InUse);
     }
 
     for point in harw_config::InternalModelPoint::ALL {
@@ -487,10 +490,10 @@ fn protected_model_ids(
             continue;
         };
         let choice_provider = choice.provider.as_deref().or(default_provider);
-        if choice_provider == Some(provider_name) {
-            if let Some(id) = &choice.model {
-                protected.insert(id.clone(), ProtectionReason::InUse);
-            }
+        if choice_provider == Some(provider_name)
+            && let Some(id) = &choice.model
+        {
+            protected.insert(id.clone(), ProtectionReason::InUse);
         }
     }
 
@@ -710,20 +713,36 @@ fn delete_model(home: &Path, target: &str) -> Result<(), ModelsError> {
     selected.remove(model_id);
     write_provider_model_list(&provider_path(&profile, provider_name), selected)?;
     let model_path = profile.join("models").join(model_filename(model_id));
-    if let Ok(metadata) = fs::symlink_metadata(&model_path) {
-        if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-            fs::remove_file(&model_path).map_err(|source| ModelsError::Io {
-                path: model_path,
-                source,
-            })?;
-        }
+    if let Ok(metadata) = fs::symlink_metadata(&model_path)
+        && metadata.file_type().is_file()
+        && !metadata.file_type().is_symlink()
+    {
+        fs::remove_file(&model_path).map_err(|source| ModelsError::Io {
+            path: model_path,
+            source,
+        })?;
     }
     println!("{provider_name}/{model_id} entfernt.");
     Ok(())
 }
 
 fn run_model_picker(home: &Path) -> Result<(), ModelsError> {
+    run_model_picker_with(home, harw_tui::run_model_picker_for)
+}
+
+/// Keep config loading, lifecycle filtering, and profile persistence on the same
+/// path when exercising the terminal entry-point boundary in headless tests.
+fn run_model_picker_with(
+    home: &Path,
+    pick: impl FnOnce(
+        harw_config::UiLanguage,
+        Vec<harw_tui::ModelPickerProvider>,
+    ) -> Result<Option<harw_tui::ModelPickerOutcome>, harw_tui::TuiError>,
+) -> Result<(), ModelsError> {
     let (config, profile) = load_config_and_profile(home)?;
+    let now = lifecycle_now();
+    let mut deprecated_warnings: Vec<String> = Vec::new();
+    let mut retired_notes: Vec<String> = Vec::new();
     let mut providers = config
         .providers
         .iter()
@@ -738,11 +757,14 @@ fn run_model_picker(home: &Path) -> Result<(), ModelsError> {
             if models.is_empty() {
                 models = provider.models.clone();
             }
-            harw_tui::ModelPickerProvider {
-                id: name.clone(),
-                models,
-                selected: provider.models.iter().cloned().collect(),
-            }
+            // Abgeschaltete Angebote gar nicht erst anbieten (weder als Zeile noch
+            // in der Anfangsauswahl); abgekündigte bleiben wählbar und werden
+            // einmal vor dem Picker gemeldet.
+            let (picker_provider, deprecated, retired) =
+                lifecycle_filtered_picker_provider(name, models, &provider.models, now);
+            deprecated_warnings.extend(deprecated);
+            retired_notes.extend(retired);
+            picker_provider
         })
         .collect::<Vec<_>>();
     providers.sort_by(|left, right| left.id.cmp(&right.id));
@@ -750,17 +772,96 @@ fn run_model_picker(home: &Path) -> Result<(), ModelsError> {
         println!("Keine aktivierten Provider konfiguriert.");
         return Ok(());
     }
-    if let Some(outcome) =
-        harw_tui::run_model_picker(providers).map_err(|error| ModelsError::Toml {
-            path: profile.join("providers"),
-            reason: error.to_string(),
-        })?
-    {
+    // Die Provider-Map ist ungeordnet: stabile Ausgabe, jede Meldung einmal.
+    deprecated_warnings.sort();
+    deprecated_warnings.dedup();
+    retired_notes.sort();
+    retired_notes.dedup();
+    for warning in &deprecated_warnings {
+        println!("{warning}");
+    }
+    let picked = pick(config.harness.tui.language, providers);
+    // Die Hinweise zu abgeschalteten Modellen stehen nach dem Picker, damit
+    // sie nicht vom Alternativbildschirm der TUI verdeckt werden.
+    for note in &retired_notes {
+        println!("{note}");
+    }
+    if let Some(outcome) = picked.map_err(|error| ModelsError::Toml {
+        path: profile.join("providers"),
+        reason: error.to_string(),
+    })? {
         let count = outcome.models.len();
         write_provider_model_list(&provider_path(&profile, &outcome.provider), outcome.models)?;
         println!("{}: {count} Modelle gewählt.", outcome.provider);
     }
     Ok(())
+}
+
+/// Aktueller Zeitpunkt (UTC) für die Lebenszyklus-Prüfung der Modellauswahl.
+fn lifecycle_now() -> Timestamp {
+    Timestamp::now_utc()
+}
+
+/// Teilt die Modelle eines Providers nach Lebenszyklus (zum Zeitpunkt `now`).
+///
+/// Rückgabe `(wählbar, Deprecation-Warnungen, Hinweise auf abgeschaltete
+/// Modelle)`. Abgekündigte Modelle bleiben in der wählbaren Liste (Reihenfolge
+/// unverändert) und erzeugen je eine Warnung `"{provider}/{modell}: {Text}"`;
+/// abgeschaltete Modelle fehlen in der wählbaren Liste und erscheinen als
+/// `"{provider}/{modell}: abgeschaltet — {Fehler}"`. Modelle ohne Eintrag in
+/// der Lebenszyklus-Tabelle bleiben unverändert wählbar.
+fn partition_lifecycle(
+    provider: &str,
+    models: Vec<String>,
+    now: Timestamp,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut selectable = Vec::with_capacity(models.len());
+    let mut deprecated_warnings = Vec::new();
+    let mut retired_notes = Vec::new();
+    for model in models {
+        match harw_model_catalog::lifecycle::enforce_explicit(provider, &model, now) {
+            Ok(None) => selectable.push(model),
+            Ok(Some(warning)) => {
+                deprecated_warnings.push(warning);
+                selectable.push(model);
+            }
+            Err(error) => retired_notes.push(format!("{provider}/{model}: abgeschaltet — {error}")),
+        }
+    }
+    (selectable, deprecated_warnings, retired_notes)
+}
+
+/// Baut den Picker-Eintrag eines Providers mit angewandtem Lebenszyklus-Filter.
+///
+/// `models` sind die angebotenen Zeilen, `configured` die bereits konfigurierte
+/// Auswahl (`provider.models`). Beide laufen durch [`partition_lifecycle`]:
+/// abgeschaltete Angebote fehlen sowohl in den Zeilen als auch in der
+/// Anfangsauswahl. Sonst bliebe ein ausgeblendeter, abgeschalteter Eintrag
+/// beim Bestätigen (Enter) erhalten und ließe sich nicht abwählen. Rückgabe
+/// `(Picker-Eintrag, Deprecation-Warnungen, Hinweise auf abgeschaltete
+/// Modelle)`; beide Listen sind sortiert und ohne Duplikate, weil ein Modell
+/// zugleich Zeile und Teil der Auswahl sein kann.
+fn lifecycle_filtered_picker_provider(
+    provider: &str,
+    models: Vec<String>,
+    configured: &[String],
+    now: Timestamp,
+) -> (harw_tui::ModelPickerProvider, Vec<String>, Vec<String>) {
+    let (models, mut deprecated, mut retired) = partition_lifecycle(provider, models, now);
+    let (selected, selected_deprecated, selected_retired) =
+        partition_lifecycle(provider, configured.to_vec(), now);
+    deprecated.extend(selected_deprecated);
+    retired.extend(selected_retired);
+    deprecated.sort();
+    deprecated.dedup();
+    retired.sort();
+    retired.dedup();
+    let picker_provider = harw_tui::ModelPickerProvider {
+        id: provider.to_owned(),
+        models,
+        selected: selected.into_iter().collect(),
+    };
+    (picker_provider, deprecated, retired)
 }
 
 /// `true`, wenn `model` als kostenlos gilt: `:free`-Suffix in der ID, oder
@@ -936,6 +1037,7 @@ fn write_discovered_model_file(
             // Unknown: images are sent and a model without image input answers
             // with a visible server error (see `ModelCapabilitiesToml::image_input`).
             image_input: None,
+            chat_reasoning_replay: None,
         },
         default_reasoning_effort: None,
     };
@@ -1242,7 +1344,195 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ModelsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError, TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx, some_or};
+
+    #[test]
+    fn standalone_picker_receives_resolved_profile_language_and_defaults_to_english() -> TestResult
+    {
+        for (setting, expected) in [
+            (None, harw_config::UiLanguage::English),
+            (Some("ja"), harw_config::UiLanguage::Japanese),
+        ] {
+            let (_guard, home) = temp_home()?;
+            let profile = global_config_path(&home).map_err(ctx("profile config path"))?;
+            if let Some(language) = setting {
+                fs::write(&profile, format!("[tui]\nlanguage = \"{language}\"\n"))
+                    .map_err(ctx("write chosen language"))?;
+            }
+            let provider = provider_path(
+                profile
+                    .parent()
+                    .ok_or(TestError::Missing("profile directory"))?,
+                "local",
+            );
+            fs::create_dir_all(
+                provider
+                    .parent()
+                    .ok_or(TestError::Missing("provider directory"))?,
+            )
+            .map_err(ctx("create provider directory"))?;
+            fs::write(&provider, "name = \"local\"\napi = \"openai-chat\"\nbase_url = \"http://localhost:1234/v1\"\nmodels = [\"payload-model\"]\n")
+                .map_err(ctx("write provider"))?;
+            let mut called = false;
+            run_model_picker_with(&home, |language, providers| {
+                called = true;
+                assert_eq!(language, expected);
+                assert_eq!(providers.len(), 1);
+                assert_eq!(providers[0].id, "local");
+                assert_eq!(providers[0].models, ["payload-model"]);
+                assert!(providers[0].selected.contains("payload-model"));
+                Ok(None)
+            })
+            .map_err(ctx("run standalone picker boundary"))?;
+            assert!(called, "configured provider must reach the picker");
+        }
+        Ok(())
+    }
+
+    /// Fester Prüfzeitpunkt der Lebenszyklus-Tests: 2026-10-15 00:00 UTC.
+    fn lifecycle_test_now() -> TestResult<Timestamp> {
+        Timestamp::from_unix_timestamp(1_792_022_400).map_err(ctx("fester Lebenszyklus-Zeitpunkt"))
+    }
+
+    /// Ein laut `bundled_lifecycles()` abgeschaltetes Angebot
+    /// (`mistral/mistral-ocr-4-0`, Retirement 2026-09-30) fehlt in der
+    /// wählbaren Liste und erscheint als Hinweis mit Ersatzmodell; ein Modell
+    /// ohne Tabelleneintrag bleibt unverändert wählbar.
+    #[test]
+    fn partition_lifecycle_excludes_retired_models() -> TestResult {
+        let entries = harw_model_catalog::lifecycle::bundled_lifecycles();
+        let retired = some_or(
+            harw_model_catalog::lifecycle::lookup(&entries, "mistral", "mistral-ocr-4-0"),
+            "mistral/mistral-ocr-4-0 in der Lebenszyklus-Tabelle",
+        )?;
+        let now = lifecycle_test_now()?;
+        let (selectable, deprecated, retired_notes) = partition_lifecycle(
+            retired.provider,
+            vec![retired.model.to_owned(), "unbekanntes-modell".to_owned()],
+            now,
+        );
+        assert_eq!(selectable, vec!["unbekanntes-modell".to_owned()]);
+        assert!(
+            deprecated.is_empty(),
+            "keine Deprecation erwartet: {deprecated:?}"
+        );
+        assert_eq!(retired_notes.len(), 1, "Hinweise: {retired_notes:?}");
+        let note = some_or(
+            retired_notes.first(),
+            "Hinweis auf das abgeschaltete Modell",
+        )?;
+        assert!(
+            note.starts_with("mistral/mistral-ocr-4-0: abgeschaltet — "),
+            "Hinweis: {note}"
+        );
+        assert!(
+            note.contains("mistral-ocr-4-1"),
+            "Ersatz fehlt im Hinweis: {note}"
+        );
+        Ok(())
+    }
+
+    /// Ein abgekündigtes, noch nicht abgeschaltetes Angebot
+    /// (`anthropic/claude-sonnet-4-5-20250929`: deprecated seit 2026-09-30,
+    /// retired ab 2026-11-30) bleibt wählbar und erzeugt genau eine Warnung.
+    #[test]
+    fn partition_lifecycle_keeps_deprecated_models_selectable() -> TestResult {
+        let now = lifecycle_test_now()?;
+        let (selectable, deprecated, retired_notes) = partition_lifecycle(
+            "anthropic",
+            vec!["claude-sonnet-4-5-20250929".to_owned()],
+            now,
+        );
+        assert_eq!(selectable, vec!["claude-sonnet-4-5-20250929".to_owned()]);
+        assert_eq!(deprecated.len(), 1, "Warnungen: {deprecated:?}");
+        assert!(
+            retired_notes.is_empty(),
+            "kein Retirement erwartet: {retired_notes:?}"
+        );
+        Ok(())
+    }
+
+    /// Review-Befund: Eine bereits konfigurierte, inzwischen abgeschaltete
+    /// Auswahl (`mistral/mistral-ocr-4-0`) darf nicht unsichtbar in der
+    /// Anfangsauswahl des Pickers bleiben. Bestätigen (Enter ohne Umschalten)
+    /// gibt genau `selected` zurück; dort darf keine abgeschaltete ID stehen.
+    /// Gilt auch, wenn die Zeile selbst gar nicht angeboten wird (Modelle
+    /// stammen aus `config.models`, die Auswahl aus `provider.models`).
+    #[test]
+    fn retired_models_are_dropped_from_the_initial_selection() -> TestResult {
+        let entries = harw_model_catalog::lifecycle::bundled_lifecycles();
+        let retired = some_or(
+            harw_model_catalog::lifecycle::lookup(&entries, "mistral", "mistral-ocr-4-0"),
+            "mistral/mistral-ocr-4-0 in der Lebenszyklus-Tabelle",
+        )?;
+        let now = lifecycle_test_now()?;
+        let live = "unbekanntes-modell".to_owned();
+        let configured = vec![live.clone(), retired.model.to_owned()];
+
+        // Zeile und Auswahl enthalten das abgeschaltete Angebot.
+        let (picker, deprecated, retired_notes) = lifecycle_filtered_picker_provider(
+            retired.provider,
+            configured.clone(),
+            &configured,
+            now,
+        );
+        assert_eq!(picker.id, retired.provider);
+        assert_eq!(picker.models, vec![live.clone()]);
+        assert_eq!(picker.selected, BTreeSet::from([live.clone()]));
+        let confirmed = picker.selected.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(confirmed, vec![live.clone()]);
+        assert!(
+            !confirmed.iter().any(|id| id == retired.model),
+            "abgeschaltete ID in der bestätigten Auswahl: {confirmed:?}"
+        );
+        assert!(
+            deprecated.is_empty(),
+            "keine Deprecation erwartet: {deprecated:?}"
+        );
+        // Zeile und Auswahl melden dasselbe Modell: der Hinweis kommt genau einmal.
+        assert_eq!(retired_notes.len(), 1, "Hinweise: {retired_notes:?}");
+        let note = some_or(
+            retired_notes.first(),
+            "Hinweis auf das abgeschaltete Modell",
+        )?;
+        assert!(
+            note.starts_with("mistral/mistral-ocr-4-0: abgeschaltet — "),
+            "Hinweis: {note}"
+        );
+
+        // Das abgeschaltete Angebot steht nur in der Auswahl, nicht in den Zeilen.
+        let (picker, _, retired_notes) = lifecycle_filtered_picker_provider(
+            retired.provider,
+            vec![live.clone()],
+            &configured,
+            now,
+        );
+        assert_eq!(picker.models, vec![live.clone()]);
+        assert_eq!(picker.selected, BTreeSet::from([live]));
+        assert_eq!(retired_notes.len(), 1, "Hinweise: {retired_notes:?}");
+        Ok(())
+    }
+
+    /// Ein abgekündigtes (noch nicht abgeschaltetes) Angebot bleibt in der
+    /// Anfangsauswahl erhalten und wird einmal gewarnt.
+    #[test]
+    fn deprecated_models_stay_in_the_initial_selection() -> TestResult {
+        let now = lifecycle_test_now()?;
+        let configured = vec!["claude-sonnet-4-5-20250929".to_owned()];
+        let (picker, deprecated, retired_notes) =
+            lifecycle_filtered_picker_provider("anthropic", configured.clone(), &configured, now);
+        assert_eq!(picker.models, configured);
+        assert_eq!(
+            picker.selected,
+            configured.iter().cloned().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(deprecated.len(), 1, "Warnungen: {deprecated:?}");
+        assert!(
+            retired_notes.is_empty(),
+            "kein Retirement erwartet: {retired_notes:?}"
+        );
+        Ok(())
+    }
 
     fn temp_home() -> TestResult<(tempfile::TempDir, PathBuf)> {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;

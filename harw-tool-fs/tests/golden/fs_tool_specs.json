@@ -1,0 +1,291 @@
+[
+  {
+    "description": "Liest eine Textdatei mit Zeilennummern. Genau ein Modus; alle nicht benutzten Parameter auf null setzen (null = nicht gesetzt): (1) Zeilenmodus, Standard: `line` (Vorgabe 1) + `limit` (Vorgabe 400, max 2000). (2) Tail: `tail` = letzte N Zeilen, z. B. für Logs (`limit` begrenzt zusätzlich). (3) Byte-Modus (Rückfall): `offset`/`max_bytes`. Für bestimmte Stellen zuerst `fs.grep` (liefert Zeilennummern), dann `fs.read` mit `line`. Kein `sed`/`head`/`tail`/`grep` über `shell.exec` nötig. Für PDFs `doc.read_pdf`, für Bilder `fs.view_image` verwenden.",
+    "name": "fs.read",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "description": "Line mode: number of lines (null = 400, max 2000). With 'tail' it caps the tail line count. Must be null in byte mode.",
+          "type": "integer"
+        },
+        "line": {
+          "description": "Line mode: 1-based first line. null = 1. With 'offset'/'max_bytes' or 'tail' it must be null (or 1).",
+          "type": "integer"
+        },
+        "max_bytes": {
+          "description": "Byte mode only: byte limit for this call (at most 65536). null (or 0) = not set.",
+          "type": "integer"
+        },
+        "offset": {
+          "description": "Byte mode only: byte offset to start at; use the offset from the truncation hint to continue. null = not set; 0 is ignored when line mode or tail is used.",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Path to the file to read, relative to the workspace root.",
+          "type": "string"
+        },
+        "tail": {
+          "description": "Tail mode: return the last N lines (e.g. logs) with real line numbers, max 2000. null (or 0) = not set. Requires 'offset'/'max_bytes' null and 'line' null (or 1).",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "strict": true,
+    "type": "function"
+  },
+  {
+    "description": "Opens a PNG, JPEG, GIF or WebP image from the workspace to inspect its actual visual content. The next request receives native image input, then you can continue reasoning and tool use. Uses existing read permissions, image size and pixel limits; GIF uses its first frame. Text-only models receive an explicit vision_unavailable result; never infer visual observations from image metadata. No model switching occurs.",
+    "name": "fs.view_image",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "description": "Image detail: low, high, or auto. Omit for provider default.",
+          "enum": [
+            "low",
+            "high",
+            "auto"
+          ],
+          "type": "string"
+        },
+        "path": {
+          "description": "Image file path relative to the workspace root.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "strict": true,
+    "type": "function"
+  },
+  {
+    "description": "Write content to a file relative to the workspace root, atomically. Creates the file if it does not exist; overwrites if it does. Parent directories are not created. Requires WriteWorkspace permission. Symlinks in the path are followed only when their target stays inside the workspace; path traversal, symlinks leading outside and the protected areas .git/ and .harw/ are rejected. Use fs.write to create a file or replace its whole content, and fs.edit for partial changes. Never write files through shell.exec heredocs (cat > file <<EOF), echo/printf redirection or python3 -.",
+    "name": "fs.write",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "description": "Content to write to the file (UTF-8).",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to the file to write, relative to the workspace root.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ],
+      "type": "object"
+    },
+    "strict": true,
+    "type": "function"
+  },
+  {
+    "description": "Replace text in an existing UTF-8 file relative to the workspace root, atomically. old_string must occur exactly once unless replace_all is true; otherwise the call fails and reports the match count. Returns {path, replacements, diff_excerpt}. Prefer fs.edit over fs.write for changes to existing files. Requires WriteWorkspace permission. Symlinks in the path are followed only inside the workspace; path traversal, symlinks leading outside and the protected areas .git/ and .harw/ are rejected; files larger than 8 MiB are not edited. Use fs.edit for every change to an existing file. Never edit files through shell.exec heredocs (cat <<EOF), sed -i, perl -i or python3 -: those bypass the workspace path checks and produce no reviewable diff.",
+    "name": "fs.edit",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "new_string": {
+          "description": "Replacement text (must differ from old_string).",
+          "type": "string"
+        },
+        "old_string": {
+          "description": "Exact text to replace (non-empty). Without replace_all it must occur exactly once; include enough surrounding context to make it unique.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to the existing file to edit, relative to the workspace root.",
+          "type": "string"
+        },
+        "replace_all": {
+          "description": "Replace every occurrence of old_string instead of exactly one. Default: false.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "old_string",
+        "new_string"
+      ],
+      "type": "object"
+    },
+    "strict": true,
+    "type": "function"
+  },
+  {
+    "description": "List the contents of a directory relative to the workspace root. Returns {entries: [{name, kind, size}], stopped?}, sorted by name. 'kind' is 'file', 'dir', or 'other' (symlinks inside the listing are reported as 'other'). A symlink in 'path' itself is followed: freely inside the workspace, after user approval outside it. 'stopped' names the limit that cut the listing short. Requires ReadWorkspace permission.",
+    "name": "fs.list",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "max_entries": {
+          "description": "Maximum number of directory entries to return. null (or 0) = default 200.",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Directory path to list, relative to the workspace root.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "strict": true,
+    "type": "function"
+  },
+  {
+    "description": "Recursively search files for a query string (case-sensitive substring match). Returns {matches: [{path, line, text}], stopped?, skipped_files?}. Symlinks are never followed. Skips .git, target, and node_modules directories. Depth defaults to 8 levels (hard maximum 32); at most 1000 matches, 50000 entries, 10 seconds and 64 KiB of output. Files larger than 8 MiB are skipped. 'stopped' names the limit that cut the search short. Requires ReadWorkspace permission.",
+    "name": "fs.search",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "max_matches": {
+          "description": "Maximum number of matching lines to return. Default: 100, maximum 1000.",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Start path for recursive search, relative to workspace root. Default: '.'.",
+          "type": "string"
+        },
+        "query": {
+          "description": "Search term (case-sensitive substring match against file lines).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "strict": true,
+    "type": "function"
+  },
+  {
+    "description": "Findet Dateien im Workspace über ein Glob-Muster.",
+    "name": "fs.glob",
+    "parameters": {
+      "properties": {
+        "max_results": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 200,
+          "description": "Obergrenze der Treffer (Default 200, Maximum 1000)."
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optionales Unterverzeichnis, ab dem gesucht wird."
+        },
+        "pattern": {
+          "description": "Glob-Muster relativ zur Workspace-Wurzel, z. B. `src/**/*.rs`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "type": "function"
+  },
+  {
+    "description": "Durchsucht eine Datei oder alle Dateien im Workspace mit einem regulären Ausdruck und liefert Treffer im GNU-grep-Stil. Die Suche ist intern, symlink-fest und startet keine externen Prozesse.",
+    "name": "fs.grep",
+    "parameters": {
+      "properties": {
+        "case_insensitive": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": false,
+          "description": "Groß-/Kleinschreibung ignorieren."
+        },
+        "context_lines": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0,
+          "description": "Kontextzeilen vor und nach dem Treffer (Default 0, Maximum 10)."
+        },
+        "glob": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optionales Glob-Muster zur Dateiauswahl, relativ zur Workspace-Wurzel (Default: alle Textdateien)."
+        },
+        "max_matches": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 100,
+          "description": "Obergrenze der Treffer (Default 100, Maximum 1000)."
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optionale Datei oder Unterverzeichnis (relativ zur Workspace-Wurzel)."
+        },
+        "pattern": {
+          "description": "Rust-Regex (crate `regex`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "type": "function"
+  }
+]

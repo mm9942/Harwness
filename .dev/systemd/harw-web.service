@@ -1,0 +1,12 @@
+[Unit]
+Description=harw web control plane (web.sock + tailnet 8443)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.harw/bin/harw --home %h/.harw web --socket %h/.harw/web.sock --tailnet
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

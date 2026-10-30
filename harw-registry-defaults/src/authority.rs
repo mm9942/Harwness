@@ -70,7 +70,7 @@
 use harw_authority::{Permission, PermissionSet};
 
 use crate::capability_catalog::{
-    WORK_DRIVER_ENQUEUE_TOOL, WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL,
+    INTENT_CYCLE_TOOLS, WORK_DRIVER_ENQUEUE_TOOL, WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL,
 };
 use crate::diary_tools::DiaryToolProvider;
 use crate::kanban_tools::KanbanReadToolProvider;
@@ -79,8 +79,8 @@ use crate::palace_tools::PalaceToolProvider;
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
     BROWSER_TOOLS, CARGO_TEST_ONE_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS,
-    EXPLORER_TOOLS, FS_READ_ONLY_TOOLS, LATEX_TOOLS, LENS_TOOLS, OBSIDIAN_READ_TOOLS,
-    PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
+    EXPLORER_TOOLS, FS_READ_ONLY_TOOLS, FSREAD_TOOLS, GIT_READ_TOOLS, LATEX_TOOLS, LENS_TOOLS,
+    OBSIDIAN_READ_TOOLS, PROCESS_TOOLS, SHELL_TOOLS, SYS_TOOLS, WEB_TOOLS, role_names,
 };
 use crate::skill_proposal_tools::{
     SKILL_PROPOSAL_DECIDE_TOOLS, SKILL_PROPOSAL_PROPOSE_TOOLS, SKILL_PROPOSAL_READ_TOOLS,
@@ -631,6 +631,11 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 ///   Operations-Registry, nicht dieser Rechtefilter. Jedes von
 ///   `delegate_wave` gestartete Kind bekommt seine Rechte über den
 ///   [`AuthorityReducer`] seiner eigenen Rolle.
+/// - `dod.status`, `dod.findings`, `dod.sensors` (PL-97 D3,
+///   [`crate::profile::DOD_READ_TOOLS`]) → `None`, wie `ps` und die lesenden
+///   `gateway.*`: lesende `harw-ops`-Operationen über den Harw-DoD-Export
+///   außerhalb des Workspace, ohne Sandbox-Recht; ihre Zulassung regeln
+///   [`crate::profile::dod_tools_for_role`] und die Operations-Registry.
 ///
 /// Die Deps- und Lens-Zuordnung prüft ein Test zusätzlich gegen die
 /// `TOOL_PERMISSIONS`-Konstanten der Provider (andere Quelle als diese Tabelle).
@@ -682,6 +687,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // dieser Rechtefilter (der pro Werkzeug nur ein Recht liefert).
         || tool == WORK_DRIVER_ENQUEUE_TOOL
         || listed(PROCESS_TOOLS)
+        // PL-97 B4: `sys.*` (`harw-tool-sys`) startet keinen Prozess, liest
+        // aber Host-Zustand außerhalb des Workspace (`/proc`, Umgebung) und
+        // deklariert deshalb wie `process.list` `ExecuteProcess`.
+        || listed(SYS_TOOLS)
         // `cargo.test_one` startet über `shell.exec` einen Testlauf; die
         // übrigen `cargo.*` haben bewusst kein Recht (nie registriert).
         || listed(CARGO_TEST_ONE_TOOLS)
@@ -703,6 +712,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || listed(PalaceToolProvider::TOOL_NAMES)
         // Obsidian vault reads (first four entries of the provider list).
         || listed(OBSIDIAN_READ_TOOLS)
+        // PL-97 B4: `fsread.*` und `git.*` lesen nur unterhalb der
+        // Workspace-Wurzel (bzw. `<workspace>/.git`), wie `fs.read`.
+        || listed(FSREAD_TOOLS)
+        || listed(GIT_READ_TOOLS)
         || listed(KanbanReadToolProvider::TOOL_NAMES)
         || tool == MEMORY_RECALL
         // Runde 5, Teil F: `plan.write` schreibt ausschließlich das
@@ -720,6 +733,11 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // `job.status`/`job.stop`.
         || tool == WORK_DRIVER_STATUS_TOOL
         || tool == WORK_DRIVER_STOP_TOOL
+        // PL-90: an intent cycle only reads the named workspace files
+        // (read-only explorer + deterministic verifier); start, status, stop,
+        // list and the `/cycle` command surface (`intent_cycle`) therefore
+        // need exactly the read right.
+        || listed(INTENT_CYCLE_TOOLS)
     {
         Some(Permission::ReadWorkspace)
     } else if listed(&CONTAINER_TOOLS) {
@@ -947,6 +965,41 @@ mod tests {
         }
     }
 
+    /// PL-97 B4: die Rechtetabelle stimmt mit den `TOOL_PERMISSIONS` der
+    /// drei PL-93-Crates überein (andere Quelle als diese Tabelle).
+    #[test]
+    fn test_tool_permission_matches_pl93_command_tool_declarations() {
+        for (names, declared) in [
+            (
+                harw_tool_fsread::FsreadToolProvider::TOOL_NAMES,
+                harw_tool_fsread::FsreadToolProvider::TOOL_PERMISSIONS,
+            ),
+            (
+                harw_tool_gitread::GitReadToolProvider::TOOL_NAMES,
+                harw_tool_gitread::GitReadToolProvider::TOOL_PERMISSIONS,
+            ),
+            (
+                harw_tool_sys::SysToolProvider::TOOL_NAMES,
+                harw_tool_sys::SysToolProvider::TOOL_PERMISSIONS,
+            ),
+        ] {
+            assert_eq!(names.len(), declared.len());
+            for (name, permission) in names.iter().zip(declared.iter()) {
+                assert!(permission.is_some(), "{name} deklariert kein Recht");
+                assert_eq!(tool_permission(name), *permission, "{name}");
+            }
+        }
+        assert_eq!(tool_permission("sys.env"), Some(Permission::ExecuteProcess));
+        assert_eq!(
+            tool_permission("fsread.cat"),
+            Some(Permission::ReadWorkspace)
+        );
+        assert_eq!(
+            tool_permission("git.status"),
+            Some(Permission::ReadWorkspace)
+        );
+    }
+
     #[test]
     fn test_tool_permission_covers_every_tool_of_every_profile() {
         for profile in RegistryProfile::ALL {
@@ -992,6 +1045,22 @@ mod tests {
         assert_eq!(tool_permission("agent.cancel"), None);
     }
 
+    /// PL-97 D3: die lesenden Harw-DoD-Werkzeuge tragen wie `ps` und die
+    /// lesenden `gateway.*` kein Sandbox-Recht.
+    #[test]
+    fn test_tool_permission_maps_dod_tools_like_other_read_only_operations() {
+        assert_eq!(crate::profile::DOD_READ_TOOLS.len(), 3);
+        for tool in crate::profile::DOD_READ_TOOLS {
+            assert_eq!(tool_permission(tool), None, "{tool}");
+            assert_eq!(tool_permission(tool), tool_permission("ps"), "{tool}");
+            assert_eq!(
+                tool_permission(tool),
+                tool_permission("gateway.status"),
+                "{tool}"
+            );
+        }
+    }
+
     /// R14: `work_driver.enqueue` startet einen dauerhaften Hintergrund-Job
     /// über denselben Startweg wie `job.start` und trägt daher dasselbe
     /// Recht (`ExecuteProcess`); `work_driver.status`/`work_driver.stop`
@@ -1009,6 +1078,30 @@ mod tests {
             Some(Permission::ExecuteProcess)
         );
         for tool in [WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL] {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ReadWorkspace),
+                "{tool}"
+            );
+        }
+    }
+
+    /// PL-90: alle fünf Intent-Zyklus-Werkzeuge (`start`, `status`, `stop`,
+    /// `list` und die `/cycle`-Befehlsfläche `intent_cycle`) lesen nur den
+    /// Workspace.
+    #[test]
+    fn test_tool_permission_maps_intent_cycle_tools_to_read_workspace() {
+        assert_eq!(INTENT_CYCLE_TOOLS.len(), 5);
+        for tool in [
+            "intent_cycle.start",
+            "intent_cycle.status",
+            "intent_cycle.stop",
+            "intent_cycle.list",
+            "intent_cycle",
+        ] {
+            assert!(INTENT_CYCLE_TOOLS.contains(&tool), "{tool}");
+        }
+        for tool in INTENT_CYCLE_TOOLS {
             assert_eq!(
                 tool_permission(tool),
                 Some(Permission::ReadWorkspace),

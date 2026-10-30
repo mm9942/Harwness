@@ -12,8 +12,8 @@
 //! - [`zai_observations`] — Vec<[`ObservedModelBehavior`]> (Bootstrap-Defaults).
 //!
 //! # Flagship
-//! GLM-5.2 ist das aktuelle Flagship-Modell mit 1 000 000 Tokens Context-Window
-//! (IndexShare sparse attention, 2.9× FLOP-Reduktion bei 1 M Kontext).
+//! GLM-5.3 ist das aktuelle Flagship-Modell mit 1 000 000 Tokens Context-Window
+//! mit nativem Tool-Calling und verpflichtendem Thinking.
 //!
 //! # Nebenläufigkeitsmodell
 //! Alle zurückgegebenen Typen sind `Clone + Send + Sync`. Keine Locks, keine
@@ -42,12 +42,13 @@ use crate::observed::ObservedModelBehavior;
 ///
 /// # Beschreibung
 /// Alle Werte basieren auf der Provider-Dokumentation (docs.z.ai, llmgateway.io),
-/// Stand 2026-07-16. GLM-5.2 ist das Flagship mit 1 000 000 Token Context-Window.
+/// Stand 2026-07-16; GLM-5.3 ergänzt anhand docs.z.ai/guides/llm/glm-5.3
+/// (2026-10-29), mit 1 000 000 Token Context-Window.
 /// Deaktivierte Modelle (`glm-4.7-flash-free`, `glm-4.6v-flash`, `glm-4.5-flash`)
 /// sind nicht enthalten.
 ///
 /// # Rückgabe
-/// `Vec<ModelDescriptor>` mit 14 aktiven GLM-Einträgen.
+/// `Vec<ModelDescriptor>` mit 15 aktiven GLM-Einträgen.
 ///
 /// # Concurrency
 /// Rein deterministisch, keine Seiteneffekte. Sicher aus mehreren Threads aufrufbar.
@@ -61,7 +62,30 @@ use crate::observed::ObservedModelBehavior;
 /// ```
 pub fn zai_descriptors() -> Vec<ModelDescriptor> {
     vec![
-        // ── GLM-5.2 ── Flagship; 1M-Token Context via IndexShare sparse attention.
+        // Source: https://docs.z.ai/guides/llm/glm-5.3 (2026-10-29).
+        // Thinking is mandatory; supported efforts are low/high/max (default max).
+        // No price is inferred from an older GLM model.
+        ModelDescriptor {
+            provider: ProviderId::from("zai"),
+            model: ModelId::from("glm-5.3"),
+            context_window: 1_000_000,
+            // Docs state 128K; use the catalog's existing binary-K output convention.
+            max_output_tokens: Some(131_072),
+            modalities: ModalitySet::new(vec![Modality::Text]),
+            capabilities: ModelCapabilities {
+                tool_calling: ToolCallingSupport::Native,
+                parallel_tools: false,
+                structured_output: StructuredOutputSupport::JsonMode,
+                reasoning: ReasoningSupport::Effort,
+                prompt_caching: PromptCachingSupport::Implicit,
+                streaming: StreamingSupport::ServerSent,
+                image_input: false,
+                native_agent_features: AgentFeatureSet::default(),
+            },
+            pricing: None,
+            lifecycle: ModelLifecycle::Ga,
+        },
+        // ── GLM-5.2 ── Previous flagship; 1M-Token Context via IndexShare sparse attention.
         // Quelle: docs.z.ai/guides/llm/glm-5.2, llmgateway.io 2026-07-16.
         ModelDescriptor {
             provider: ProviderId::from("zai"),
@@ -448,7 +472,7 @@ pub fn zai_descriptors() -> Vec<ModelDescriptor> {
 /// Die Reihenfolge entspricht exakt der von [`zai_descriptors`].
 ///
 /// # Rückgabe
-/// `Vec<ObservedModelBehavior>` mit 14 Einträgen.
+/// `Vec<ObservedModelBehavior>` mit 15 Einträgen.
 ///
 /// # Concurrency
 /// Rein deterministisch, keine Seiteneffekte.
@@ -458,11 +482,12 @@ pub fn zai_descriptors() -> Vec<ModelDescriptor> {
 /// use harw_model_catalog::vendor_zai::zai_observations;
 /// use harw_model_catalog::observed::Score;
 /// let obs = zai_observations();
-/// assert_eq!(obs.len(), 14);
+/// assert_eq!(obs.len(), 15);
 /// assert!(obs.iter().all(|o| o.tool_schema_reliability == Score::HALF));
 /// ```
 pub fn zai_observations() -> Vec<ObservedModelBehavior> {
     vec![
+        ObservedModelBehavior::bootstrap("zai", "glm-5.3"),
         ObservedModelBehavior::bootstrap("zai", "glm-5.2"),
         ObservedModelBehavior::bootstrap("zai", "glm-5.1"),
         ObservedModelBehavior::bootstrap("zai", "glm-5"),
@@ -491,7 +516,7 @@ mod tests {
     fn test_zai_descriptors_required_models_present() {
         // §spec: glm-5.2, glm-4.6, glm-4.5-air müssen enthalten sein.
         let descs = zai_descriptors();
-        for required in &["glm-5.2", "glm-4.6", "glm-4.5-air"] {
+        for required in &["glm-5.3", "glm-5.2", "glm-4.6", "glm-4.5-air"] {
             assert!(
                 descs.iter().any(|d| d.model == *required),
                 "Pflichtmodell fehlt: {required}"
@@ -534,6 +559,24 @@ mod tests {
                 d.model
             );
         }
+    }
+
+    #[test]
+    fn test_glm53_documented_capabilities_and_unknown_pricing() -> TestResult {
+        let descs = zai_descriptors();
+        let glm53 = descs
+            .iter()
+            .find(|d| d.model == "glm-5.3")
+            .ok_or(TestError::Missing("glm-5.3 descriptor"))?;
+        assert_eq!(glm53.context_window, 1_000_000);
+        assert_eq!(glm53.max_output_tokens, Some(131_072));
+        assert_eq!(glm53.modalities, ModalitySet::new(vec![Modality::Text]));
+        assert_eq!(glm53.capabilities.tool_calling, ToolCallingSupport::Native);
+        assert_eq!(glm53.capabilities.reasoning, ReasoningSupport::Effort);
+        assert_eq!(glm53.capabilities.streaming, StreamingSupport::ServerSent);
+        assert!(!glm53.capabilities.image_input);
+        assert!(glm53.pricing.is_none());
+        Ok(())
     }
 
     #[test]
@@ -581,7 +624,7 @@ mod tests {
     fn test_zai_observations_required_models_present() {
         // §spec: glm-5.2, glm-4.6, glm-4.5-air müssen in Observations enthalten sein.
         let obs = zai_observations();
-        for required in &["glm-5.2", "glm-4.6", "glm-4.5-air"] {
+        for required in &["glm-5.3", "glm-5.2", "glm-4.6", "glm-4.5-air"] {
             assert!(
                 obs.iter().any(|o| o.model == *required),
                 "Pflicht-Observation fehlt: {required}"

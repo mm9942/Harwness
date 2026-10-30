@@ -20,6 +20,12 @@
 //! 4. sidecar `Running` with the recovery identity → 5. on exit: job record
 //!    completion (fenced) → 6. sidecar with the terminal state.
 //!
+//! A fresh lease/token check after the Starting write refuses known stale
+//! attempts before executor invocation. This check is a snapshot, not an atomic
+//! fence across OS activation and recovery-identity publication; that remaining
+//! interval needs a backend activation protocol before remote activation can
+//! claim exclusive effects.
+//!
 //! A crash between any two steps leaves enough to decide deterministically
 //! in [`Coordinator::recover`]: no identity ⇒ `Lost`; identity ⇒ probe.
 //!
@@ -48,11 +54,11 @@ use std::time::Duration;
 
 use harw_job_core::{
     AttemptId, Budget, BudgetUsage, CancellationCause, Deadline, ExitOutcome, Job, JobClaim,
-    JobKind, JobOutcome, JobScope, JobSpec, JobSpecEnvelope, LifecycleEvent, LifecycleState,
-    LifecycleTransition, RetryPolicy, RunnerId, SandboxReport, SandboxRequirement, SpecError,
-    StoredJob,
+    JobKind, JobOutcome, JobScope, JobSpec, JobSpecEnvelope, JobState, LifecycleEvent,
+    LifecycleState, LifecycleTransition, RetryPolicy, RunnerId, SandboxReport, SandboxRequirement,
+    SpecError, StoredJob,
 };
-use harw_job_store::{ClaimTerms, JobTransition, StoreResult};
+use harw_job_store::{ClaimTerms, JobTransition, StaleLease, StoreError, StoreResult};
 use harw_types::{ApprovalActor, TenantId, WorkId, WorkspaceId};
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::{oneshot, watch};
@@ -120,6 +126,7 @@ impl CoordinatorConfig {
                 base_delay: SignedDuration::from_secs(1),
                 factor: 2.0,
                 max_delay: SignedDuration::from_secs(1),
+                jitter: 0.0,
             },
             output_capture: OutputCapture::default(),
             frame_buffer: DEFAULT_FRAME_BUFFER,
@@ -476,17 +483,17 @@ fn decide(
     if ending.exit.is_success() {
         return (LifecycleEvent::Succeed, None);
     }
-    if let Some(report) = sandbox {
-        if !report.satisfies(requirement) {
-            return (
-                LifecycleEvent::Fail,
-                Some(format!(
-                    "policy: sandbox requirement not met (not fully enforced: {}); {}",
-                    report.shortfalls().join(", "),
-                    ending.exit
-                )),
-            );
-        }
+    if let Some(report) = sandbox
+        && !report.satisfies(requirement)
+    {
+        return (
+            LifecycleEvent::Fail,
+            Some(format!(
+                "policy: sandbox requirement not met (not fully enforced: {}); {}",
+                report.shortfalls().join(", "),
+                ending.exit
+            )),
+        );
     }
     if ending.exit == ExitOutcome::Unknown {
         return (
@@ -614,18 +621,75 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
         let record = self.new_record_with(&envelope, now, options.persistence)?;
         let job_id = record.job.id.clone();
         blocking(&self.inner.store, move |store| store.create_job(record)).await?;
+        self.start_record(job_id, spec, options, None).await
+    }
+
+    /// Starts an existing, durable process job in this coordinator's store.
+    ///
+    /// The persisted record supplies the complete spec and retains its original
+    /// work id, scope, retry policy and lease history. No new record is created.
+    /// Only the configured scope and the `process` kind are accepted; input
+    /// supplied alongside an id can never replace the admitted command.
+    ///
+    /// This is a trusted composition API: the store namespace and configured
+    /// scope must be bound by the host, and only a trusted admission component
+    /// may write process envelopes there. Possession of a work id grants no
+    /// additional authority. This does not translate a Harwness task intent
+    /// into a process spec or enable remote execution.
+    ///
+    /// A replay against a running or terminal job fails with a store conflict,
+    /// without launching another process. An expired running job must go through
+    /// recovery/reconciliation first; this method never reclaims a lease.
+    ///
+    /// # Errors
+    /// Missing record, scope/kind mismatch, redacted or invalid persisted spec,
+    /// a changed record, unsupported atomic dispatch by the store, or a claim
+    /// conflict. Execution errors use [`JobHandle::wait`].
+    pub async fn start_existing(&self, job_id: &WorkId) -> Result<JobHandle, RuntimeError> {
+        let lookup = job_id.clone();
+        let stored = blocking(&self.inner.store, move |store| store.load_job(&lookup)).await?;
+        if stored.scope != self.inner.config.scope
+            || stored.job.kind != JobKind::Custom("process".to_owned())
+        {
+            return Err(RuntimeError::InvalidConfig {
+                detail: format!("job '{job_id}' is outside the configured process scope"),
+            });
+        }
+        let envelope: JobSpecEnvelope =
+            serde_json::from_value(stored.input.clone()).map_err(|error| {
+                RuntimeError::InvalidConfig {
+                    detail: format!(
+                        "job '{job_id}' has no valid durable process envelope: {error}"
+                    ),
+                }
+            })?;
+        let spec = envelope.into_spec()?;
+        self.start_record(job_id.clone(), spec, SubmitOptions::default(), Some(stored))
+            .await
+            .map(|(handle, _)| handle)
+    }
+
+    // Both fresh submission and durable dispatch pass through the same atomic
+    // claim, attempt identity allocation, registration and supervision path.
+    async fn start_record(
+        &self,
+        job_id: WorkId,
+        spec: JobSpec,
+        options: SubmitOptions,
+        expected: Option<StoredJob>,
+    ) -> Result<(JobHandle, Option<JobFrames>), RuntimeError> {
         let runner = self.inner.config.runner_id.clone();
         let terms_ttl = self.inner.lease_ttl;
         let claim_job = job_id.clone();
         let claim = blocking(&self.inner.store, move |store| {
-            store.claim_job(
-                &claim_job,
-                &runner,
-                ClaimTerms {
-                    lease_ttl: terms_ttl,
-                    now: Timestamp::now(),
-                },
-            )
+            let terms = ClaimTerms {
+                lease_ttl: terms_ttl,
+                now: Timestamp::now(),
+            };
+            match expected {
+                Some(record) => store.claim_existing_job(record, &runner, terms),
+                None => store.claim_job(&claim_job, &runner, terms),
+            }
         })
         .await?;
         let attempt_id = attempt_id_for(&job_id, claim.lease.epoch)?;
@@ -1418,7 +1482,19 @@ fn retry_delay(
     if !state.is_retryable() || reason.is_some_and(|reason| reason.starts_with(POLICY_PREFIX)) {
         return None;
     }
-    let delay = claim.job.retry.next_delay(attempt).ok()?;
+    // Jitter support: when the policy configures a non-zero jitter, scale the
+    // base delay by a deterministic sample derived from the attempt number and
+    // the job id, so retries spread out without breaking reproducibility.
+    let base = if claim.job.retry.jitter > 0.0 {
+        let sample = jitter_sample(&claim.job.id, attempt);
+        claim
+            .job
+            .retry
+            .next_delay_with_jitter(attempt, sample)
+            .ok()?
+    } else {
+        claim.job.retry.next_delay(attempt).ok()?
+    };
     let budget = &claim.job.budget;
     let ran = started_at.map_or(SignedDuration::ZERO, |started| {
         Timestamp::now()
@@ -1427,12 +1503,28 @@ fn retry_delay(
     });
     let charged = budget
         .charge_wall(usage, ran)
-        .and_then(|()| budget.charge_wall(usage, delay));
+        .and_then(|()| budget.charge_wall(usage, base));
     if let Err(error) = charged {
         tracing::info!(job = %claim.job.id, attempt, %error, "no retry: wall-time budget exhausted");
         return None;
     }
-    Some(delay)
+    Some(base)
+}
+
+/// Deterministic jitter sample in `0.0..=1.0` derived from the job id and the
+/// attempt number: retries spread out across the jitter window without making
+/// the schedule irreproducible. Uses a simple FNV-1a-style hash of the job id
+/// plus attempt so the same job+attempt always maps to the same sample.
+fn jitter_sample(job_id: &WorkId, attempt: u32) -> f64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in job_id.to_string().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= u64::from(attempt);
+    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    // Take the high 53 bits so the value fits exactly into an f64 fraction.
+    ((hash >> 11) as f64) / ((1u64 << 53) as f64)
 }
 
 fn attempt_context<S, E>(
@@ -1835,19 +1927,6 @@ where
     record.apply(LifecycleEvent::Start, Timestamp::now())?;
     persist(inner, &record).await?;
 
-    if *cancel.borrow_and_update() {
-        record.cancellation = Some(CancellationCause::User);
-        let reason = Some(CancellationCause::User.to_string());
-        return Ok(AttemptEnd {
-            ctx,
-            record,
-            output: Output::default(),
-            event: LifecycleEvent::Cancel,
-            reason,
-            write_record: true,
-        });
-    }
-
     let deadline = match spec.resources.wall_timeout {
         Some(timeout) => Some(Deadline::after(Timestamp::now(), timeout).map_err(|error| {
             RuntimeError::InvalidSpec(SpecError::InvalidResource {
@@ -1861,6 +1940,56 @@ where
         })?),
         None => None,
     };
+
+    // Sidecar I/O and scheduler delays may have outlived the claim. Refuse
+    // stale ownership before invoking the executor and preserve the Starting
+    // record for recovery; a stale runner must not finalize the job.
+    let checked_claim = claim.clone();
+    let lease = blocking(&inner.store, move |store| {
+        let mut current = store.load_job(&checked_claim.job.id)?;
+        if current.job.state != JobState::Running
+            || current.scope != checked_claim.scope
+            || current.job.kind != checked_claim.job.kind
+        {
+            return Err(StoreError::StaleLease {
+                id: checked_claim.job.id.as_str().to_owned(),
+                reason: StaleLease::TokenMismatch,
+            });
+        }
+        harw_job_store::mechanics::verify_lease(
+            &mut current,
+            &checked_claim.token,
+            Timestamp::now(),
+        )
+        .map(|lease| lease.clone())
+    })
+    .await?;
+    // Check again after the blocking-pool await in case rescheduling itself
+    // consumed the lease. This remains a snapshot guard: no store lock spans
+    // OS activation and durable identity publication, so atomic effect fencing
+    // still requires a backend activation protocol. Do not infer that guarantee.
+    if lease.is_expired(Timestamp::now()) {
+        return Err(RuntimeError::LeaseLost(StoreError::StaleLease {
+            id: claim.job.id.as_str().to_owned(),
+            reason: StaleLease::Expired {
+                expired_at: lease.expires_at,
+            },
+        }));
+    }
+
+    // Observe cancellation after the final asynchronous store read as well.
+    if *cancel.borrow_and_update() {
+        record.cancellation = Some(CancellationCause::User);
+        let reason = Some(CancellationCause::User.to_string());
+        return Ok(AttemptEnd {
+            ctx,
+            record,
+            output: Output::default(),
+            event: LifecycleEvent::Cancel,
+            reason,
+            write_record: true,
+        });
+    }
 
     let started = match inner.executor.start(spec, &ctx) {
         Ok(started) => started,
@@ -1892,24 +2021,24 @@ where
 
     // Defense in depth: never count an attempt as Running whose known
     // enforcement contradicts a hard requirement.
-    if let Some(report) = record.sandbox {
-        if !report.satisfies(spec.sandbox) {
-            run.cancel();
-            let exit = drain(&mut run).await;
-            record.exit = Some(exit);
-            let reason = format!(
-                "{POLICY_PREFIX} sandbox requirement not met (not fully enforced: {}); the job was killed before it counted as running",
-                report.shortfalls().join(", ")
-            );
-            return Ok(AttemptEnd {
-                ctx,
-                record,
-                output: Output::default(),
-                event: LifecycleEvent::Fail,
-                reason: Some(reason),
-                write_record: true,
-            });
-        }
+    if let Some(report) = record.sandbox
+        && !report.satisfies(spec.sandbox)
+    {
+        run.cancel();
+        let exit = drain(&mut run).await;
+        record.exit = Some(exit);
+        let reason = format!(
+            "{POLICY_PREFIX} sandbox requirement not met (not fully enforced: {}); the job was killed before it counted as running",
+            report.shortfalls().join(", ")
+        );
+        return Ok(AttemptEnd {
+            ctx,
+            record,
+            output: Output::default(),
+            event: LifecycleEvent::Fail,
+            reason: Some(reason),
+            write_record: true,
+        });
     }
 
     record.apply(LifecycleEvent::Spawned, Timestamp::now())?;
@@ -2059,10 +2188,10 @@ where
         record.sandbox = late_report;
     }
     let mut exit = exit;
-    if exit == ExitOutcome::Unknown {
-        if let Some(recorded) = inner.executor.recorded_exit(&ctx) {
-            exit = recorded;
-        }
+    if exit == ExitOutcome::Unknown
+        && let Some(recorded) = inner.executor.recorded_exit(&ctx)
+    {
+        exit = recorded;
     }
     record.exit = Some(exit);
     record.cancellation.clone_from(&cause);

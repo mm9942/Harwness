@@ -91,6 +91,35 @@ struct Inner {
     route_dirty: bool,
 }
 
+// ── Ergebnis des geprüften Apply ─────────────────────────────────────────────
+
+/// Eine Route (Provider/Modell), die der Wächter von
+/// [`TuiSessionController::apply_to_session_checked`] abgelehnt hat.
+///
+/// # Beschreibung
+/// Trägt, was der Controller in die Session schreiben wollte, und den Grund
+/// der Ablehnung — genug für eine sichtbare Meldung an die Nutzerin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedRoute {
+    /// Abgelehnter Provider (`None`: keiner gewählt).
+    pub provider: Option<String>,
+    /// Abgelehntes Modell (`None`: keines gewählt).
+    pub model: Option<String>,
+    /// Begründung des Wächters (Klartext, ohne Geheimnisse).
+    pub reason: String,
+}
+
+/// Ergebnis von [`TuiSessionController::apply_to_session_checked`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplyOutcome {
+    /// `true`, wenn die Session verändert wurde (wie die Rückgabe von
+    /// [`TuiSessionController::apply_to_session`]); eine allein abgelehnte
+    /// Route verändert sie nicht.
+    pub applied: bool,
+    /// Die vom Wächter abgelehnte Route, falls eine anstand.
+    pub rejected_route: Option<RejectedRoute>,
+}
+
 // ── TuiSessionController ─────────────────────────────────────────────────────
 
 /// Konkrete [`SessionController`]-Implementierung für den TUI-Laufzeit-Pfad.
@@ -264,17 +293,61 @@ impl TuiSessionController {
     /// harw-tui Design §session_controller — apply_to_session; W2A-01
     /// (`AgentSession::set_mode` schneidet ab jetzt immer von der Basis).
     pub fn apply_to_session(&self, session: &mut AgentSession) -> bool {
+        self.apply_to_session_checked(session, |_, _| Ok(()))
+            .applied
+    }
+
+    /// Wie [`Self::apply_to_session`], prüft aber die Route **vor** dem
+    /// Schreiben in die Session.
+    ///
+    /// # Beschreibung
+    /// Steht eine Modell-/Provider-Route an, ruft diese Methode `route_guard`
+    /// mit genau der Route auf, die in die Session geschrieben würde
+    /// (`provider`, `model`; bei einer UIA-Wurzel mit gesetzter UIA-Auswahl
+    /// diese als Ganzes, sonst die generische Auswahl) — bevor die
+    /// [`AgentSession`] verändert wird. Liefert der Wächter `Err(grund)` (z. B.
+    /// weil das Modell laut Provider-Lebenszyklus abgeschaltet ist), bleibt die
+    /// Session auf ihrer bisherigen Route und der Controller wird auf diese
+    /// Route zurückgesetzt: die abgelehnte Wahl steht weder im
+    /// [`SessionController::snapshot`] noch wird sie an jeder Turn-Grenze
+    /// erneut versucht. Reasoning-Effort und Modus werden unabhängig davon
+    /// angewendet. Die abgelehnte Route steht im Ergebnis
+    /// ([`ApplyOutcome::rejected_route`]), damit der Aufrufer sie melden kann.
+    ///
+    /// # Argumente
+    /// - `session` (`&mut AgentSession`): die lebende Session.
+    /// - `route_guard` (`FnOnce(Option<&str>, Option<&str>) -> Result<(), String>`):
+    ///   bekommt `(provider, model)` und wird höchstens einmal aufgerufen,
+    ///   nur bei ausstehender Route. Er läuft unter dem Controller-Lock und
+    ///   darf deshalb nicht auf diesen Controller zugreifen.
+    ///
+    /// # Rückgabe
+    /// [`ApplyOutcome`]: `applied` ist `true`, wenn die Session verändert
+    /// wurde; allein eine abgelehnte Route gilt nicht als Veränderung.
+    ///
+    /// # Nebenläufigkeit
+    /// Wie [`Self::apply_to_session`]: nur zwischen Turns aufrufen.
+    pub fn apply_to_session_checked(
+        &self,
+        session: &mut AgentSession,
+        route_guard: impl FnOnce(Option<&str>, Option<&str>) -> Result<(), String>,
+    ) -> ApplyOutcome {
         let Ok(mut inner) = self.inner.lock() else {
-            return false;
+            return ApplyOutcome::default();
         };
         if inner.generation == inner.applied_generation {
-            return false;
+            return ApplyOutcome::default();
         }
+        // Verändert ein anderes Feld als die Route die Session? Nur dann gilt
+        // ein Apply mit abgelehnter Route noch als „angewendet“.
+        let mut changed_besides_route = false;
+        let mut rejected_route = None;
         // Runde 5, Teil H: nur tatsächlich gesetzte Felder übertragen — wie
         // beim Modus unten. Sonst setzte jeder Moduswechsel Effort, Modell und
         // Provider der Session auf „nicht gesetzt“ zurück.
         if inner.effort_dirty {
             session.set_reasoning_effort(inner.reasoning_effort);
+            changed_besides_route = true;
         }
         if inner.route_dirty {
             let selection = if is_uia_root_session(session) {
@@ -286,29 +359,59 @@ impl TuiSessionController {
             // achsenweise mit der generischen Route mischen — sonst trägt ein
             // `/uia-provider switch` ohne Modell das Modell eines anderen
             // Providers weiter (Provider/Modell-Mismatch).
-            let (model, provider) = match selection {
+            let (model, provider, from_uia) = match selection {
                 Some(selection)
                     if selection.model().is_some() || selection.provider().is_some() =>
                 {
-                    (selection.model(), selection.provider())
+                    (
+                        selection.model().map(str::to_owned),
+                        selection.provider().map(str::to_owned),
+                        true,
+                    )
                 }
                 _ => (
-                    inner.active_model.as_deref(),
-                    inner.active_provider.as_deref(),
+                    inner.active_model.clone(),
+                    inner.active_provider.clone(),
+                    false,
                 ),
             };
-            session.set_active_model(model.map(ModelId::from));
-            session.set_active_provider(provider.map(ProviderId::from));
-        }
-        if let Some(mode) = inner.interaction_mode {
-            if session.mode() != mode {
-                session.set_mode(mode);
+            match route_guard(provider.as_deref(), model.as_deref()) {
+                Ok(()) => {
+                    session.set_active_model(model.map(ModelId::from));
+                    session.set_active_provider(provider.map(ProviderId::from));
+                }
+                Err(reason) => {
+                    // Die Session behält ihre Route; der Controller folgt ihr,
+                    // damit die abgelehnte Wahl nirgends stehen bleibt.
+                    let kept_provider = session.active_provider().map(|id| id.as_str().to_owned());
+                    let kept_model = session.active_model().map(|id| id.as_str().to_owned());
+                    if from_uia {
+                        inner.uia_selection = Some(UiaSelection::new(kept_provider, kept_model));
+                    } else {
+                        inner.active_provider = kept_provider;
+                        inner.active_model = kept_model;
+                    }
+                    rejected_route = Some(RejectedRoute {
+                        provider,
+                        model,
+                        reason,
+                    });
+                }
             }
+        }
+        if let Some(mode) = inner.interaction_mode
+            && session.mode() != mode
+        {
+            session.set_mode(mode);
+            changed_besides_route = true;
         }
         inner.applied_generation = inner.generation;
         inner.effort_dirty = false;
         inner.route_dirty = false;
-        true
+        ApplyOutcome {
+            applied: rejected_route.is_none() || changed_besides_route,
+            rejected_route,
+        }
     }
 }
 
@@ -1085,6 +1188,180 @@ mod tests {
             session.mode(),
             InteractionMode::Explore,
             "an actual mode change must still be applied via set_mode"
+        );
+        Ok(())
+    }
+
+    // ── 16. Route-Wächter: abgelehnte Route bleibt ohne Wirkung ──────────────
+
+    /// Lehnt der Wächter die ausstehende Route ab, bleibt die Session auf ihrer
+    /// Route, der Controller folgt ihr zurück, ein gleichzeitig ausstehender
+    /// Effort wird trotzdem angewendet und die Ablehnung steht im Ergebnis.
+    #[test]
+    fn test_apply_to_session_checked_rejected_route_keeps_session_and_restores_controller()
+    -> TestResult {
+        let ctrl = TuiSessionController::new();
+        let mut session = test_session();
+        ctrl.set_active_provider("openai".to_owned())
+            .map_err(ctx("seed provider"))?;
+        ctrl.set_active_model("gpt-5".to_owned())
+            .map_err(ctx("seed model"))?;
+        assert!(ctrl.apply_to_session(&mut session));
+
+        ctrl.set_active_provider("mistral".to_owned())
+            .map_err(ctx("retired provider"))?;
+        ctrl.set_active_model("mistral-ocr-4-0".to_owned())
+            .map_err(ctx("retired model"))?;
+        ctrl.set_reasoning_effort(Some(ReasoningEffort::High))
+            .map_err(ctx("effort"))?;
+
+        let mut guarded = None;
+        let outcome = ctrl.apply_to_session_checked(&mut session, |provider, model| {
+            guarded = Some((provider.map(str::to_owned), model.map(str::to_owned)));
+            Err("retired".to_owned())
+        });
+
+        assert_eq!(
+            guarded,
+            Some((
+                Some("mistral".to_owned()),
+                Some("mistral-ocr-4-0".to_owned())
+            )),
+            "the guard sees exactly the route that would be written"
+        );
+        assert!(outcome.applied, "the pending effort is still applied");
+        assert_eq!(
+            outcome.rejected_route,
+            Some(RejectedRoute {
+                provider: Some("mistral".to_owned()),
+                model: Some("mistral-ocr-4-0".to_owned()),
+                reason: "retired".to_owned(),
+            })
+        );
+        assert_eq!(session.reasoning_effort(), Some(ReasoningEffort::High));
+        assert_eq!(
+            session.active_model(),
+            Some(&ModelId::from("gpt-5")),
+            "the session keeps its previous model"
+        );
+        assert_eq!(
+            session.active_provider(),
+            Some(&ProviderId::from("openai")),
+            "the session keeps its previous provider"
+        );
+        let snap = ctrl.snapshot();
+        assert_eq!(snap.active_model.as_deref(), Some("gpt-5"));
+        assert_eq!(snap.active_provider.as_deref(), Some("openai"));
+        assert!(
+            !ctrl.apply_to_session(&mut session),
+            "the rejected route is dropped, nothing is retried at the next boundary"
+        );
+        Ok(())
+    }
+
+    /// Eine allein abgelehnte Route gilt nicht als Veränderung der Session
+    /// (`applied == false`); ohne ausstehende Route wird der Wächter nie
+    /// gefragt.
+    #[test]
+    fn test_apply_to_session_checked_only_rejected_route_is_not_applied() -> TestResult {
+        let ctrl = TuiSessionController::new();
+        let mut session = test_session();
+        ctrl.set_active_model("mistral-ocr-4-0".to_owned())
+            .map_err(ctx("retired model"))?;
+
+        let outcome = ctrl.apply_to_session_checked(&mut session, |_, _| Err("retired".to_owned()));
+        assert!(!outcome.applied);
+        assert!(outcome.rejected_route.is_some());
+        assert!(session.active_model().is_none());
+        assert!(ctrl.snapshot().active_model.is_none());
+
+        let untouched = ctrl.apply_to_session_checked(&mut session, |_, _| {
+            Err("never asked without a pending route".to_owned())
+        });
+        assert_eq!(untouched, ApplyOutcome::default());
+        Ok(())
+    }
+
+    /// Bei einer UIA-Wurzel gilt die UIA-Auswahl als Ganzes: wird sie
+    /// abgelehnt, folgt die UIA-Auswahl des Controllers der Session zurück und
+    /// die generische Auswahl bleibt unberührt.
+    #[test]
+    fn test_apply_to_session_checked_rejected_uia_selection_restores_the_uia_selection()
+    -> TestResult {
+        use harw_authority::{
+            Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+        };
+        use harw_core::SpawnContext;
+        use harw_types::{ApprovalActor, TenantId, WorkspaceId};
+
+        let dir = tempfile::tempdir().map_err(ctx("temp workspace root"))?;
+        std::fs::create_dir_all(dir.path().join("workspace")).map_err(ctx("workspace dir"))?;
+        let registry = WorkspaceRegistry::build(
+            dir.path(),
+            [WorkspaceRegistration {
+                tenant: TenantId::from_str("tui-controller-test"),
+                workspace: WorkspaceId::from_str("workspace"),
+                root: std::path::PathBuf::from("workspace"),
+            }],
+        )
+        .map_err(ctx("workspace registry"))?;
+        let binding = registry
+            .resolve(
+                &TenantId::from_str("tui-controller-test"),
+                &WorkspaceId::from_str("workspace"),
+            )
+            .map_err(ctx("workspace binding"))?;
+        let sandbox = SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy([Permission::ReadWorkspace]),
+        );
+        let (event_tx, _rx) = mpsc::unbounded_channel();
+        let mut session = AgentSession::new(
+            AgentRole::Assistant,
+            None,
+            ExtensionRegistryBuilder::default().build(),
+            event_tx,
+        )
+        .with_spawn_context(SpawnContext {
+            sandbox,
+            suggestions: None,
+            capability_snapshot: None,
+            approval_actor: Some(ApprovalActor::Operator {
+                id: "tui-controller-test".to_owned(),
+            }),
+            organizational_role: AgentRoleId::UserInterface,
+            allowed_child_orchestrators: Vec::new(),
+            trace: None,
+            ceiling: None,
+        });
+        assert!(is_uia_root_session(&session), "precondition: UIA root");
+
+        let ctrl = TuiSessionController::with_uia_selection(UiaSelection::new(
+            Some("openai".to_owned()),
+            Some("gpt-5".to_owned()),
+        ));
+        assert!(ctrl.apply_to_session(&mut session));
+        assert_eq!(session.active_model(), Some(&ModelId::from("gpt-5")));
+
+        ctrl.set_uia_selection(UiaSelection::new(
+            Some("mistral".to_owned()),
+            Some("mistral-ocr-4-0".to_owned()),
+        ))
+        .map_err(ctx("retired UIA selection"))?;
+        let outcome = ctrl.apply_to_session_checked(&mut session, |_, _| Err("retired".to_owned()));
+
+        assert!(!outcome.applied);
+        assert!(outcome.rejected_route.is_some());
+        assert_eq!(session.active_model(), Some(&ModelId::from("gpt-5")));
+        assert_eq!(session.active_provider(), Some(&ProviderId::from("openai")));
+        assert_eq!(
+            ctrl.uia_selection(),
+            UiaSelection::new(Some("openai".to_owned()), Some("gpt-5".to_owned())),
+            "the UIA selection follows the session back"
+        );
+        assert!(
+            ctrl.snapshot().active_model.is_none(),
+            "the generic selection is untouched"
         );
         Ok(())
     }

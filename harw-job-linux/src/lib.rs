@@ -9,7 +9,8 @@
 //!   with layered [`TerminationPolicy`] (graceful → grace → hard kill).
 //! - [`resources`]: [`JobResources`] (cgroup limits) and [`RlimitSet`].
 //! - [`capabilities`]: capability drop via rustix (no second cap crate).
-//! - [`sandbox`]: [`SandboxPolicy`] model, profiles, Landlock planning;
+//! - [`sandbox`]: [`SandboxPolicy`] model, profiles, Landlock planning
+//!   (also against a mount namespace's view through a [`PathMap`]);
 //!   enforcement with feature `linux-sandbox`; side-effect-free host
 //!   probes ([`LandlockSupport`], user namespaces).
 //! - `proc` *(feature `linux-basic`)*: `/proc` observation via `procfs`.
@@ -58,6 +59,7 @@ pub mod error;
 pub mod filesystem;
 #[cfg(target_os = "linux")]
 pub mod group;
+pub mod inventory;
 #[cfg(all(target_os = "linux", feature = "linux-basic"))]
 pub mod proc;
 #[cfg(target_os = "linux")]
@@ -90,7 +92,8 @@ pub use resources::{
 };
 #[cfg(target_os = "linux")]
 pub use sandbox::{
-    CapabilityPolicy, FilesystemPolicy, LandlockMode, LandlockSupport, NetworkPolicy, SandboxPolicy,
+    BindMode, CapabilityPolicy, FilesystemPolicy, LandlockMode, LandlockSupport, NetworkPolicy,
+    PathBind, PathMap, PathMapError, SandboxPolicy,
 };
 
 /// Job-Runtime-Doc §8 names the resource type `LinuxResources`.

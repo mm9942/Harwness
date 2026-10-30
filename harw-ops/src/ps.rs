@@ -121,13 +121,13 @@ fn parse_kind(value: &str) -> Option<Kind> {
 fn split_kind(args: PsArgs) -> Result<(Option<Kind>, Option<String>), OpError> {
     let PsArgs { status, kind } = args;
     if let Some(kind_from_status) = status.as_deref().and_then(parse_kind) {
-        if let Some(second) = kind.as_deref() {
-            if parse_kind(second).is_some() {
-                return Err(OpError::InvalidArguments(format!(
-                    "two job kinds given: `{}` and `{second}`",
-                    status.as_deref().unwrap_or_default()
-                )));
-            }
+        if let Some(second) = kind.as_deref()
+            && parse_kind(second).is_some()
+        {
+            return Err(OpError::InvalidArguments(format!(
+                "two job kinds given: `{}` and `{second}`",
+                status.as_deref().unwrap_or_default()
+            )));
         }
         return Ok((Some(kind_from_status), kind));
     }
@@ -187,7 +187,12 @@ fn split_kind(args: PsArgs) -> Result<(Option<Kind>, Option<String>), OpError> {
     summary = "Listet alle laufenden Jobs und Kindprozesse.",
     domain = "execution",
     permission = "observer",
-    command(path = "/ps", visibility = "channel_reduced", busy = "immediate"),
+    command(
+        path = "/ps",
+        visibility = "channel_reduced",
+        channel_subcommands = "*",
+        busy = "immediate"
+    ),
     model_tool(readonly, approval = "none"),
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: reines
     // Auflisten laufender Jobs, keine Mutation, keine Bestätigung nötig.
@@ -573,6 +578,7 @@ mod tests {
                 base_delay: SignedDuration::from_secs(1),
                 factor: 2.0,
                 max_delay: SignedDuration::from_secs(30),
+                jitter: 0.0,
             },
             now,
         );

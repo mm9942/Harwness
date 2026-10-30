@@ -104,7 +104,9 @@ fn render_workers(ctx: &OpContext, config: &ResolvedConfig) -> OpOutput {
 ///
 /// # Fehler
 /// [`OpError::InvalidArguments`] für eine unbekannte Rolle, ein fehlendes
-/// oder unauflösbares Ziel.
+/// oder unauflösbares Ziel — und für ein laut Provider-Lebenszyklus
+/// abgeschaltetes Modell (vor jeder Persistenz geprüft, mit Ersatzhinweis;
+/// ein abgekündigtes Modell hängt eine Warnung an die Bestätigung).
 pub(crate) fn handle_worker(
     ctx: &OpContext,
     config: &ResolvedConfig,
@@ -142,10 +144,15 @@ pub(crate) fn handle_worker(
         })?]
     };
 
+    let mut lifecycle_warning: Option<String> = None;
     let choice = match UiaWorkerModelChoice::parse(target) {
         Some(UiaWorkerModelChoice::FollowUia) => UiaWorkerModelChoice::FollowUia,
         _ => {
             let (provider, model) = crate::models::resolve_target(config, target)?;
+            // Lebenszyklus der ausdrücklichen Wahl vor jeder Persistenz: ein
+            // abgeschaltetes Modell wird abgelehnt, ein abgekündigtes nur
+            // mit Warnung gespeichert.
+            lifecycle_warning = crate::live_model::enforce_lifecycle(&provider, &model)?;
             UiaWorkerModelChoice::Fixed { provider, model }
         }
     };
@@ -174,9 +181,19 @@ pub(crate) fn handle_worker(
         ),
         note.as_deref(),
     );
-    if let UiaWorkerModelChoice::Fixed { provider, .. } = &choice
-        && !provider_is_logged_in(config, provider)
-    {
+    if let Some(warning) = &lifecycle_warning {
+        text.push_str("\nWarnung: ");
+        text.push_str(warning);
+    }
+    let fallback_provider = match &choice {
+        UiaWorkerModelChoice::Fixed { provider, .. }
+            if !provider_is_logged_in(config, provider) =>
+        {
+            Some(provider.as_str())
+        }
+        _ => None,
+    };
+    if let Some(provider) = fallback_provider {
         text.push_str(&format!(
             "\nHinweis: Provider „{provider}“ ist nicht angemeldet — bis zur Anmeldung folgt \
              die Rolle der UIA."
@@ -186,6 +203,7 @@ pub(crate) fn handle_worker(
         text,
         data: Some(json!({
             "action": "worker",
+            "ui_feedback": {"kind":"worker_model", "roles":roles, "choice":value, "effective":"routing_unconfirmed", "warning":lifecycle_warning, "note":note, "fallback_provider":fallback_provider},
             "roles": roles,
             "choice": value,
             "follows_uia": choice.follows_uia(),

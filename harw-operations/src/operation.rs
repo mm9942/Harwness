@@ -1134,6 +1134,26 @@ pub trait Operation: Send + Sync {
         &[]
     }
 
+    /// Unterbefehle, die eine `ChannelReduced`-Command-Fläche remote ausführen darf.
+    ///
+    /// `"-"` bezeichnet die bare Form ohne Argumente, `"*"` jede
+    /// Argumentform. Der Default ist leer und damit fail-closed.
+    fn channel_subcommands(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Tokens, die auf einer `ChannelReduced`-Command-Fläche an **keiner**
+    /// Position der Argumentliste erscheinen dürfen (mutierende Nebenverben
+    /// wie `accept`/`reject`).
+    ///
+    /// Die Liste ist additiv zu [`Self::channel_subcommands`]: auch ein per
+    /// `"*"` freigegebener Befehl bleibt für diese Tokens gesperrt. Der
+    /// Default ist leer. Das `#[operation]`-Makro überschreibt die Methode,
+    /// wenn `channel_denied_subcommands = "..."` gesetzt ist.
+    fn channel_denied_tokens(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Busy-Klasse eines konkreten Aufrufs.
     ///
     /// # Argumente

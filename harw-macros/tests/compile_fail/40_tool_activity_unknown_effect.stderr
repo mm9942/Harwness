@@ -1,0 +1,5 @@
+error: unknown activity `effect` value "observes" (allowed: "observe", "mutate", "execute", "communicate", "create", "delete", "control", "other")
+  --> tests/compile_fail/40_tool_activity_unknown_effect.rs:13:80
+   |
+13 |     activity(domain = "filesystem", verb = "read", resource = "path", effect = "observes")
+   |                                                                                ^^^^^^^^^^

@@ -1466,6 +1466,39 @@ mod tests {
         ))
     }
 
+    /// PL-97 E2g: die LaTeX-Werkzeuge laufen über `prlimit` ohne Job-Cgroup;
+    /// ist harw selbst von RLIMIT_NPROC ausgenommen, lehnt `require_rlimits`
+    /// den Start ab (`prlimit --nproc` deckelte nichts).
+    #[test]
+    fn test_sandboxed_command_refuses_an_nproc_exempt_harw() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("tempdir"))?;
+        let spec = sandbox(&dir, &full_rights())?;
+        let runner = SandboxRunner {
+            max_output_bytes: 4096,
+            limits: ShellLimits::default(),
+            extra_read_only: Vec::new(),
+            launch_directly: false,
+        };
+        let call = ProgramCall {
+            program: PathBuf::from("/usr/bin/true"),
+            args: Vec::new(),
+            cwd: dir.path().join("project"),
+        };
+        let env = ProgramEnv::of(&[call.program.as_path()]);
+        let _exempt = crate::limits::test_seam::ExemptIdentity::install(
+            "der harw-Prozess läuft mit realer uid 0",
+        );
+        match runner.sandboxed_command("latex.build", &spec, &env, &call) {
+            Err(message) if message.contains("RLIMIT_NPROC") => Ok(()),
+            // Kein vertrauenswürdiges prlimit an den festen Pfaden.
+            Err(message) if message.contains("prlimit fehlt") => Ok(()),
+            Err(message) => Err(TestError::Unexpected(message)),
+            Ok(_) => Err(TestError::Unexpected(
+                "exempt harw was not refused".to_owned(),
+            )),
+        }
+    }
+
     fn full_rights() -> [Permission; 3] {
         [
             Permission::ReadWorkspace,

@@ -1410,8 +1410,9 @@ specialization = "fake-lead"
     fn builtin_manifests_stay_within_their_registry_profiles() -> TestResult {
         use crate::profile::{
             child_message_tools_for_role, child_result_tools_for_role, composition_tools_for_role,
-            job_control_tools_for_role, knowledge_tools_for_role, matrix_tools_for_role,
-            parent_message_tools_for_role, skill_catalog_tools_for_role, sudo_tools_for_role,
+            dod_tools_for_role, job_control_tools_for_role, knowledge_tools_for_role,
+            matrix_tools_for_role, parent_message_tools_for_role, skill_catalog_tools_for_role,
+            sudo_tools_for_role,
         };
         let builtin = builtin()?;
         assert_eq!(builtin.len(), role_names::ALL.len());
@@ -1430,9 +1431,19 @@ specialization = "fake-lead"
                 .chain(matrix_tools_for_role(name).iter().copied())
                 .chain(skill_catalog_tools_for_role(name).iter().copied())
                 .chain(job_control_tools_for_role(name).iter().copied())
+                // PL-97 D4: die lesenden `dod.*` der Triage-Rollen, montiert
+                // vom rollengebundenen Provider in `harw-runtime/src/children.rs`.
+                .chain(dod_tools_for_role(name).iter().copied())
                 .collect();
             let granted = crate::authority::permissions_of(&surface);
             let manifest = &ir.permissions;
+            assert!(
+                crate::authority::permissions_of(dod_tools_for_role(name))
+                    .iter()
+                    .next()
+                    .is_none(),
+                "{name}: dod.* darf kein Sandbox-Recht tragen"
+            );
             for tool in &manifest.tools {
                 assert!(
                     surface.contains(&tool.as_str()),

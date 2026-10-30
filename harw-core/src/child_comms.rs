@@ -447,7 +447,7 @@ pub enum ChildEndCause {
 /// Formatiert eine Dauer in ms knapp auf Deutsch („15 min", „90 s").
 fn duration_de(ms: u64) -> String {
     let secs = ms / 1000;
-    if secs >= 60 && secs % 60 == 0 {
+    if secs >= 60 && secs.is_multiple_of(60) {
         format!("{} min", secs / 60)
     } else if secs >= 60 {
         format!("{} min {} s", secs / 60, secs % 60)

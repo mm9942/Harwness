@@ -12,11 +12,18 @@
 # and the driver settings. `[spawn] max_depth = 1` from the base is what
 # `[work_driver]` needs: a spawn depth above 0.
 #
-# `[work_driver]` grants no new right. Both roles it names must be listed as
-# spawn targets below, or lowering reports HARW-DRIVER-004. It also does not
-# admit the `work_driver.*` tools by itself: the tool list is the base's,
-# and the runtime clamps a custom agent under its base role. See the status
-# note at the top of docs/guides/work-driver.md for what is wired today.
+# `[work_driver]` grants no new right to delegate. Both roles it names must be
+# listed as spawn targets below, or lowering reports HARW-DRIVER-004. The
+# table does add the three tools `work_driver.enqueue`, `work_driver.status`
+# and `work_driver.stop` to the tool list, although the base does not carry
+# them: the compiler's rights check and the runtime's clamp under the base
+# role let exactly these three through, and only for a definition with a
+# `[work_driver]` table.
+#
+# Every spawn target must fit below this orchestrator's `max_depth = 1`: the
+# compiler rejects a target whose own `max_depth` is 1 or more
+# (HARW-BUILD-013), so only roles with `max_depth = 0` qualify. That rules
+# out the built-in `explorer` (1) and `analyst` (2).
 
 schema = "harwness.agent/v1"
 id = "harwness.example.driven-orchestrator@1"
@@ -30,18 +37,21 @@ description = "Drives worker agents toward the active goal with a bounded WorkDr
 instructions_file = "system.md"
 
 # Spawn targets. `worker_role` and `judge_role` of `[work_driver]` must both
-# appear here (or in `[spawn] child_orchestrators`). A profile that defines
-# its own code-writing worker names that role here and in `worker_role`.
+# appear here (or in `[spawn] child_orchestrators`), and each needs
+# `max_depth = 0`. `executor` is the built-in worker that runs tightly
+# scoped sandbox process jobs (`shell.exec`, `job.*`; it writes no code
+# itself); `evidence-critic` is a read-only reviewer bundled with harw. A
+# profile that defines its own code-writing worker names that role here and
+# in `worker_role`.
 [delegation]
 targets = [
-  "explorer",
   "executor",
-  "analyst",
+  "evidence-critic",
 ]
 
 [work_driver]
 worker_role = "executor"
-judge_role = "analyst"
+judge_role = "evidence-critic"
 max_iterations = 8
 max_parallel_workers = 3
 max_attempts_per_worker = 3

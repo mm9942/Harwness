@@ -541,15 +541,14 @@ async fn post(
         Err(error) => return Ok(session_error_response(&error)),
     };
     if notification {
-        if let (Some(id), Some(protocol)) = (session_id.as_deref(), protocol.as_deref()) {
-            if let Err(error) =
+        if let (Some(id), Some(protocol)) = (session_id.as_deref(), protocol.as_deref())
+            && let Err(error) =
                 state
                     .lock()
                     .await
                     .mark_initialized(id, protocol, jiff::Timestamp::now())
-            {
-                return Ok(session_error_response(&error));
-            }
+        {
+            return Ok(session_error_response(&error));
         }
         return Ok(empty_response(StatusCode::ACCEPTED));
     }
@@ -1098,10 +1097,10 @@ fn response(status: StatusCode, body: Value, session: Option<String>) -> McpResp
         .header(CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(body.to_string())).boxed())
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()));
-    if let Some(session) = session {
-        if let Ok(value) = HeaderValue::from_str(&session) {
-            response.headers_mut().insert(SESSION_HEADER, value);
-        }
+    if let Some(session) = session
+        && let Ok(value) = HeaderValue::from_str(&session)
+    {
+        response.headers_mut().insert(SESSION_HEADER, value);
     }
     response
 }
@@ -1780,6 +1779,7 @@ mod tests {
                 base_delay: SignedDuration::from_secs(1),
                 factor: 2.0,
                 max_delay: SignedDuration::from_secs(10),
+                jitter: 0.0,
             },
             now,
         );

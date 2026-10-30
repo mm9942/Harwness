@@ -955,17 +955,16 @@ fn validate_submission(submission: &McpJobSubmission) -> Result<(), McpSuperviso
             "input must be a JSON object".to_owned(),
         ));
     }
-    if let Some(budget) = &submission.budget {
-        if budget.max_tokens == Some(0)
+    if let Some(budget) = &submission.budget
+        && (budget.max_tokens == Some(0)
             || budget.max_tool_calls == Some(0)
             || budget
                 .max_wall
-                .is_some_and(|wall| wall <= jiff::SignedDuration::ZERO)
-        {
-            return Err(McpSupervisorError::InvalidSubmission(
-                "budget limits must be greater than zero when provided".to_owned(),
-            ));
-        }
+                .is_some_and(|wall| wall <= jiff::SignedDuration::ZERO))
+    {
+        return Err(McpSupervisorError::InvalidSubmission(
+            "budget limits must be greater than zero when provided".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -975,6 +974,7 @@ fn default_retry_policy() -> RetryPolicy {
         base_delay: jiff::SignedDuration::from_secs(1),
         factor: 2.0,
         max_delay: jiff::SignedDuration::from_secs(10),
+        jitter: 0.0,
     }
 }
 fn can_cancel(principal: &McpPrincipal, scope: &JobScope) -> bool {
@@ -1096,6 +1096,7 @@ mod tests {
                 base_delay: SignedDuration::from_secs(1),
                 factor: 2.0,
                 max_delay: SignedDuration::from_secs(10),
+                jitter: 0.0,
             },
             now,
         );

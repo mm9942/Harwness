@@ -283,8 +283,8 @@ pub(crate) fn load_bound_config(ctx: &OpContext, context: &str) -> Result<Resolv
 /// Nie.
 ///
 /// # Concurrency
-/// Rein synchron; kein Datei-Lock — parallele Aufrufe auf dieselbe Datei sind
-/// nicht abgesichert, analog zu [`harw_config::ConfigWriter`] selbst.
+/// Rein synchron; ConfigWriter verwendet eine kooperierende Dateisperre
+/// und verweigert veraltete Snapshots statt konkurrierende Änderungen zu verlieren.
 ///
 /// # Examples
 /// ```rust,ignore

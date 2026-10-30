@@ -15,6 +15,7 @@ pub mod contributors;
 pub mod error;
 pub mod lenient;
 pub mod registry;
+pub mod target_offer;
 pub mod types;
 pub mod v1_compat;
 

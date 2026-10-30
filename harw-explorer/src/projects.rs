@@ -245,10 +245,10 @@ fn detect_node(root: &Path, dir: &Path, tree: &Tree<'_>) -> Project {
             );
         }
     }
-    if tree.has_file(dir, "pnpm-workspace.yaml") {
-        if let Some(text) = read_manifest(root, &dir.join("pnpm-workspace.yaml")) {
-            patterns.extend(parse_pnpm_packages(&text));
-        }
+    if tree.has_file(dir, "pnpm-workspace.yaml")
+        && let Some(text) = read_manifest(root, &dir.join("pnpm-workspace.yaml"))
+    {
+        patterns.extend(parse_pnpm_packages(&text));
     }
 
     let (exclude, include): (Vec<String>, Vec<String>) =
@@ -352,11 +352,11 @@ fn parse_setup_cfg_name(text: &str) -> Option<String> {
         if !in_metadata {
             continue;
         }
-        if let Some((key, value)) = line.split_once(['=', ':']) {
-            if key.trim() == "name" {
-                let value = value.trim();
-                return (!value.is_empty()).then(|| value.to_owned());
-            }
+        if let Some((key, value)) = line.split_once(['=', ':'])
+            && key.trim() == "name"
+        {
+            let value = value.trim();
+            return (!value.is_empty()).then(|| value.to_owned());
         }
     }
     None
@@ -377,12 +377,10 @@ fn parse_pnpm_packages(text: &str) -> Vec<String> {
             in_packages = trimmed == "packages:";
             continue;
         }
-        if in_packages {
-            if let Some(item) = trimmed.strip_prefix('-') {
-                let item = item.trim().trim_matches(|c| c == '\'' || c == '"');
-                if !item.is_empty() {
-                    patterns.push(item.to_owned());
-                }
+        if in_packages && let Some(item) = trimmed.strip_prefix('-') {
+            let item = item.trim().trim_matches(|c| c == '\'' || c == '"');
+            if !item.is_empty() {
+                patterns.push(item.to_owned());
             }
         }
     }

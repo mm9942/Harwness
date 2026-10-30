@@ -266,15 +266,15 @@ impl LinuxJobGroup {
     /// caller falls back to the process group.
     #[cfg(feature = "linux-cgroup-v2")]
     fn kill_cgroup_best_effort(&self) {
-        if let Some(cgroup) = &self.cgroup {
-            if let Err(error) = cgroup.backend.kill(&cgroup.handle) {
-                tracing::warn!(
-                    pid = self.pgid,
-                    cgroup = cgroup.handle.proc_path(),
-                    %error,
-                    "cgroup kill failed; falling back to process group"
-                );
-            }
+        if let Some(cgroup) = &self.cgroup
+            && let Err(error) = cgroup.backend.kill(&cgroup.handle)
+        {
+            tracing::warn!(
+                pid = self.pgid,
+                cgroup = cgroup.handle.proc_path(),
+                %error,
+                "cgroup kill failed; falling back to process group"
+            );
         }
     }
 

@@ -800,6 +800,7 @@ impl<'a> LedgerJob<'a> {
                 base_delay: SignedDuration::from_secs(30),
                 factor: 2.0,
                 max_delay: SignedDuration::from_secs(300),
+                jitter: 0.0,
             },
             now,
         );
@@ -1200,12 +1201,12 @@ pub fn parse_dream_output(raw: &str) -> Result<ParsedDream, String> {
             .target
             .map(|target| target.trim().to_owned())
             .filter(|target| !target.is_empty());
-        if let Some(target) = &target {
-            if target.chars().count() > MAX_TARGET_CHARS || target.chars().any(char::is_control) {
-                problems.push(format!(
+        if let Some(target) = &target
+            && (target.chars().count() > MAX_TARGET_CHARS || target.chars().any(char::is_control))
+        {
+            problems.push(format!(
                     "Vorschlag {number}: target muss einzeilig und höchstens {MAX_TARGET_CHARS} Zeichen lang sein"
                 ));
-            }
         }
         suggestions.push(ParsedSuggestion {
             kind: suggestion.kind.into(),

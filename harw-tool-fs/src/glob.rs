@@ -115,11 +115,25 @@ fn is_hard_excluded(name: &OsStr, _is_dir: bool) -> bool {
     name = "fs.glob",
     description = "Findet Dateien im Workspace über ein Glob-Muster.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    activity(
+        domain = "filesystem",
+        verb = "glob",
+        resource = "path",
+        effect = "observe"
+    )
 )]
 async fn fs_glob(context: &ToolExecutionContext, args: GlobArgs) -> Result<ToolOutput, ToolsError> {
     let root = context.sandbox().workspace().canonical_root().to_path_buf();
-    run_blocking("fs.glob", move || Ok(glob_blocking(&root, &args))).await
+    // Keep the per-call lease in the actual blocking work even if the
+    // awaiting future is cancelled. A root PathBuf alone retains no guard.
+    let context = context.clone();
+    run_blocking("fs.glob", move || {
+        let output = glob_blocking(&root, &args);
+        drop(context);
+        Ok(output)
+    })
+    .await
 }
 
 /// Synchroner Kern von [`fs_glob`].

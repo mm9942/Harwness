@@ -1,12 +1,19 @@
 ---
 id: PL-95
 title: "An effective CLI, an internal tool landscape and skill injection that fires when it matters"
-status: proposed
+status: PARTIALLY LANDED
 date: 2026-10-05
 baseline: dev@ee1bb10
 ---
 
 # CLI, tool landscape and skill injection (PL-95)
+
+> **Status: PARTIALLY LANDED** (2026-10-29, PL-97 X1). S1 is on `dev`
+> (`3df91189`, PR #126); S2, S3 and S6 landed and S4 and S5 partly landed
+> through PL-97 B1–B5 on `ccr-54aa3dfd-o46he2` (draft PR #154), see the
+> State column; S7–S9 are open. Per-cycle state
+> in the **State** column of §4; test names in
+> [PL-97 §9.1](../97-harw-dod-mission-control-chain/README.md#9-landed-state-x1-2026-10-29).
 
 Goal: the same capabilities are reachable from the command line and from the
 agent as typed tools; the agent sees only the tools and skills it needs for
@@ -150,18 +157,18 @@ store.
 
 ## 4. Cycles
 
-| Cycle | Content | Decision needed |
-|---|---|---|
-| **S0** | This plan | no |
-| **S1** | Optional `triggers.toml` (`when`, `[triggers]`), parser and index in `harw-catalog`; `select(event, budget)` as a pure function with dedupe and budget; unit tests; no runtime wiring | no |
-| **S2** | `harw skill list|show|preview|validate` on top of S1 | no |
-| **S3** | Wire L0 and L1 into `assemble_round_request` as `Fragment`s (section `skills.triggered`, `Stability::Fresh`), fed by new history items; injection events | after a compaction the dedupe state is reset for dropped items |
-| **S4** | Tool -> skill link in the registry; first-use trigger; usage skills for the common-command tools | depends on #89 |
-| **S5** | `harw tool list|describe|call` and generated docs/completions | depends on #89 |
-| **S6** | CLI rules and the clap-tree test; `--json` gaps closed | which old spellings stay |
-| **S7** | Measurement join with the outcome tracker, `harw skill stats`, A/B switch | no |
-| **S8** | `harw skill new|import` | accepted import format |
-| **S9** | Back-fill triggers for the 75 bundled skills (error codes, paths, tools) | no |
+| Cycle | Content | Decision needed | State (2026-10-29) |
+|---|---|---|---|
+| **S0** | This plan | no | done |
+| **S1** | Optional `triggers.toml` (`when`, `[triggers]`), parser and index in `harw-catalog`; `select(event, budget)` as a pure function with dedupe and budget; unit tests; no runtime wiring | no | landed on `dev` (`3df91189`, PR #126) |
+| **S2** | `harw skill list|show|preview|validate` on top of S1 | no | landed: PL-97 B3 `af2b53a0` (also `/skills preview|validate`) |
+| **S3** | Wire L0 and L1 into `assemble_round_request` as `Fragment`s (section `skills.triggered`, `Stability::Fresh`), fed by new history items; injection events | after a compaction the dedupe state is reset for dropped items | landed: PL-97 B1 `765d6e9d` (`[skills]` config, `injection` records); child sessions have no injector yet |
+| **S4** | Tool -> skill link in the registry; first-use trigger; usage skills for the common-command tools | depends on #89 | partly landed: tool→skill link PL-97 B2 `af2b53a0`, usage skills with `triggers.toml` and the `fsread`/`git`/`sys` registration B4 `6f33d09a`; open: synthetic first-use trigger for skills without `triggers.toml`, the remaining `cargo.*` tools |
+| **S5** | `harw tool list|describe|call` and generated docs/completions | depends on #89 | partly landed: `harw tool list|describe` and `tool.index` (PL-97 B2 `af2b53a0`); `harw tool call` and generated docs/completions are out of PL-97's scope |
+| **S6** | CLI rules and the clap-tree test; `--json` gaps closed | which old spellings stay | landed (minimal): PL-97 B5 `703d9745`, text-only commands in two commented allowlists |
+| **S7** | Measurement join with the outcome tracker, `harw skill stats`, A/B switch | no | open |
+| **S8** | `harw skill new|import` | accepted import format | open |
+| **S9** | Back-fill triggers for the 75 bundled skills (error codes, paths, tools) | no | open (five bundled skills ship a `triggers.toml`: `harw-dod` and the four tool skills) |
 
 Each cycle: own branch and PR, tests without `unwrap`/`panic`, a mutation check
 on every budget and trust check, `xtask gates` green, an honest note on what

@@ -39,7 +39,9 @@ mod chat;
 mod cli;
 mod completions;
 mod connect;
+mod cycle_cmd;
 mod doc_ocr;
+mod dod_cmd;
 // #22: die personalisierte harw mit eingebetteter UIA (`--native`).
 mod cleanup_cmd;
 pub mod embedded_uia;
@@ -73,10 +75,12 @@ mod session_listener;
 mod session_serve;
 mod session_serve_remote;
 mod settings;
+mod skill_cmd;
 mod tailscale_cmd;
 mod telegram_launcher;
 #[cfg(test)]
 mod test_support;
+mod tool_cmd;
 mod uia_bootstrap;
 mod update_cmd;
 mod verify_sandbox;
@@ -704,6 +708,9 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Agent { .. } => "agent",
             Command::Knowledge { .. } => "knowledge",
             Command::Jobs { .. } => "jobs",
+            Command::Cycle { .. } => "cycle",
+            Command::Skill { .. } => "skill",
+            Command::Tool { .. } => "tool",
             Command::Cleanup { .. } => "cleanup",
             Command::PrReview(_) => "pr-review",
             Command::Gateway { .. } => "gateway",
@@ -720,6 +727,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Node { .. } => "node",
             Command::Tailscale { .. } => "tailscale",
             Command::Install { .. } => "install",
+            Command::Dod { .. } => "dod",
             Command::Uninstall { .. } => "uninstall",
             Command::Completions(_) => "completions",
             Command::BugReport { .. } => "bug-report",
@@ -787,8 +795,9 @@ fn reject_misplaced_session_flags(
 /// Lehnt `--json` bei Befehlen ohne JSON-Ausgabe ab.
 ///
 /// # Description
-/// JSON liefern `harw session list|show`, `harw jobs …`,
-/// `harw knowledge memory|proposals` und `harw agent skills|plugins`; diese
+/// JSON liefern `harw session list|show`, `harw jobs …`, `harw cycle …`,
+/// `harw skill …`, `harw dod …`, `harw tool …`, `harw knowledge memory|proposals` und
+/// `harw agent skills|plugins`; diese
 /// Befehle (und `provider`) prüfen ihre Unterfälle selbst. Jeder andere
 /// Befehl bricht mit `--json` ab, statt stillschweigend Text auszugeben.
 ///
@@ -806,12 +815,18 @@ fn reject_unsupported_json(command: Option<&Command>, global: &GlobalArgs) -> Re
         Some(
             Command::Session { .. }
             | Command::Jobs { .. }
+            | Command::Cycle { .. }
+            | Command::Skill { .. }
             | Command::Cleanup { .. }
             | Command::Knowledge { .. }
             | Command::Agent { .. }
             | Command::Device { .. }
             | Command::Node { .. }
-            | Command::Provider { .. },
+            | Command::Provider { .. }
+            // PL-97 D3: jede `harw dod`-Aktion liefert eine JSON-Form.
+            | Command::Dod { .. }
+            // PL-97 B2: `harw tool list|describe` ebenso.
+            | Command::Tool { .. },
         ) => Ok(()),
         other => printer.require_text(&command_label(other)),
     }
@@ -919,7 +934,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             ),
             None => Ok(()),
         },
-        Some(Command::Attach(args)) => attach_cmd::run(&args),
+        Some(Command::Attach(args)) => attach_cmd::run(&args, home_override),
         Some(Command::Init) => cmd_init(home_override),
         Some(Command::Onboard) => {
             let home = home::resolve_home(home_override)?;
@@ -985,6 +1000,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Agent { action }) => agent_cmd::run(&global, action),
         Some(Command::Knowledge { action }) => knowledge_cmd::run(&global, action),
         Some(Command::Jobs { action }) => jobs_cmd::run(&global, action),
+        Some(Command::Cycle { action }) => cycle_cmd::run(&global, action),
+        Some(Command::Skill { action }) => skill_cmd::run(&global, action),
         Some(Command::Cleanup {
             apply,
             classes,
@@ -1037,7 +1054,12 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 dismiss,
             },
         ),
-        Some(Command::Install { print_systemd }) => lifecycle::install(print_systemd),
+        Some(Command::Install { print_systemd }) => {
+            legacy_hint("install", "dod install");
+            lifecycle::install(print_systemd)
+        }
+        Some(Command::Dod { action }) => dod_cmd::run(&global, action),
+        Some(Command::Tool { action }) => tool_cmd::run(&global, action),
         Some(Command::Service { action }) => lifecycle::service(home_override, action),
         Some(Command::Catalog { refresh }) => {
             legacy_hint("catalog", "model catalog");
@@ -1113,6 +1135,10 @@ fn run_startup_migrations(
             }
             | Command::Session {
                 action: SessionAction::List { .. } | SessionAction::Show { .. },
+            }
+            // PL-97 B3: `harw skill validate` prüft nur ein Verzeichnis.
+            | Command::Skill {
+                action: cli::SkillAction::Validate { .. },
             },
         ) => return Ok(()),
         // `analyze` liest `[tools.plan]`, `[mode]` und `[policy]` — es gehört
@@ -1135,6 +1161,9 @@ fn run_startup_migrations(
             | Command::Agent { .. }
             | Command::Knowledge { .. }
             | Command::Jobs { .. }
+            | Command::Cycle { .. }
+            // PL-97 B3: `list`/`show`/`preview` montieren eine Laufzeit.
+            | Command::Skill { .. }
             | Command::Cleanup { .. }
             | Command::PrReview(_)
             | Command::Uia { .. }
@@ -1170,6 +1199,11 @@ fn run_startup_migrations(
             | Command::Tailscale { .. }
             | Command::Update { .. }
             | Command::Install { .. }
+            // PL-97 D3: `harw dod` liest die Config nur (auch als root via
+            // sudo) und darf dabei nichts migrieren oder anlegen.
+            | Command::Dod { .. }
+            // PL-97 B2: `harw tool` liest nur eingebaute Daten.
+            | Command::Tool { .. }
             | Command::Service { .. }
             | Command::Catalog { .. }
             | Command::Auth { .. }
@@ -1884,15 +1918,14 @@ fn open_serve_secret_resolver(
     };
     let mut needs_resolver = false;
 
-    if let Some(provider_id) = config.harness.default_provider.as_deref() {
-        if let Some(provider) = config.providers.get(provider_id) {
-            if secret_store::provider_uses_sealed_secret(provider_id, provider, &config.auth) {
-                resolver_config
-                    .providers
-                    .insert(provider_id.to_owned(), provider.clone());
-                needs_resolver = true;
-            }
-        }
+    if let Some(provider_id) = config.harness.default_provider.as_deref()
+        && let Some(provider) = config.providers.get(provider_id)
+        && secret_store::provider_uses_sealed_secret(provider_id, provider, &config.auth)
+    {
+        resolver_config
+            .providers
+            .insert(provider_id.to_owned(), provider.clone());
+        needs_resolver = true;
     }
 
     if config
@@ -3189,6 +3222,10 @@ fn run_doctor_checks(home: &Path, config: &ResolvedConfig) -> bool {
     checks.push(Box::new(harw_install::doctor::KekFilePermsCheck::new(
         kek_file_perms_evidence(config),
     )));
+    // PL-97 E5: je Bereitschaftsstufe der Ausführungskette ein Check.
+    checks.extend(harw_install::doctor::execution_chain_checks(
+        &dod_cmd::host_execution_chain(home),
+    ));
 
     let mut any_failed = false;
     for (id, outcome) in harw_install::doctor::run_all(&checks) {
@@ -4603,6 +4640,7 @@ mod tests {
         for argv in [
             vec!["harw", "session", "list", "--json"],
             vec!["harw", "jobs", "list", "--json"],
+            vec!["harw", "cycle", "list", "--json"],
             // Vor dem Befehl, weil `memory`/`skills` alle folgenden
             // Argumente unverändert weiterreichen.
             vec!["harw", "--json", "knowledge", "memory"],
@@ -4612,6 +4650,48 @@ mod tests {
             let cli = Cli::try_parse_from(argv).map_err(ctx("json-capable command parses"))?;
             reject_unsupported_json(cli.command.as_ref(), &cli.global)
                 .map_err(ctx("json-capable command accepts --json"))?;
+        }
+        Ok(())
+    }
+
+    /// PL-97 D3: jede `harw dod`-Aktion nimmt `--json` an (vor und hinter
+    /// dem Befehl), startet keine TUI und läuft ohne Config-Migration.
+    #[test]
+    fn dod_subcommands_accept_json_and_skip_startup_migrations() -> TestResult {
+        for argv in [
+            &["dod", "status"][..],
+            &["dod", "doctor"],
+            &["dod", "findings", "-n", "5"],
+            &["dod", "sensors"],
+            &["dod", "config", "check"],
+            &["dod", "config", "suggest"],
+            &["dod", "enable"],
+            &["dod", "disable"],
+            &["dod", "restart"],
+            &["dod", "warden", "status"],
+            &["dod", "warden", "enable"],
+            &["dod", "warden", "disable"],
+            &["dod", "install", "--print-systemd"],
+        ] {
+            for json_first in [false, true] {
+                let mut full = vec!["harw"];
+                if json_first {
+                    full.push("--json");
+                }
+                full.extend_from_slice(argv);
+                if !json_first {
+                    full.push("--json");
+                }
+                let cli =
+                    Cli::try_parse_from(full.iter().copied()).map_err(ctx("dod --json parses"))?;
+                assert!(cli.global.json, "{full:?}");
+                reject_unsupported_json(cli.command.as_ref(), &cli.global)
+                    .map_err(ctx("dod accepts --json"))?;
+                assert!(!starts_tui(&cli), "{full:?}");
+                assert_eq!(command_label(cli.command.as_ref()), "harw dod");
+                run_startup_migrations(&cli.command, Some(PathBuf::from("/nonexistent/harw")))
+                    .map_err(ctx("dod skips migrations"))?;
+            }
         }
         Ok(())
     }

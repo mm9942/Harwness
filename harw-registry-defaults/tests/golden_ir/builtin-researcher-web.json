@@ -27,6 +27,7 @@
     ],
     "forbidden": [
       "fs.read",
+      "fs.view_image",
       "fs.write",
       "fs.edit",
       "fs.list",
@@ -176,6 +177,7 @@
       "fs.list",
       "fs.read",
       "fs.search",
+      "fs.view_image",
       "fs.write",
       "lens.ask",
       "shell.exec"
@@ -263,7 +265,7 @@
         "help": "these sections stay named by the program but are not required at child start",
         "span": {
           "file": "builtin/researcher-web.toml",
-          "line": 92,
+          "line": 93,
           "column": 11
         },
         "path": "context.program"
@@ -272,6 +274,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "12dbe8c035c568bc2b0bab4da5fae869d8c442223bb94a5d56cbdb82e94a61f4"
+    "digest": "681536fbd70529cc5252704dff93a87b84fd1a8fab8dbbc6297a910fd9f62045"
   }
 }

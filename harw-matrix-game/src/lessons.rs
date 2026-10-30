@@ -214,10 +214,10 @@ fn dedup_rolls(journal: &Journal) -> Journal {
     let mut seen = BTreeSet::new();
     let mut out = Journal::new();
     for record in journal.records() {
-        if let EntryKind::DiceRolled { roll } = &record.entry.kind {
-            if !seen.insert((roll.argument_id.clone(), roll.attempt)) {
-                continue;
-            }
+        if let EntryKind::DiceRolled { roll } = &record.entry.kind
+            && !seen.insert((roll.argument_id.clone(), roll.attempt))
+        {
+            continue;
         }
         out.append(record.entry.clone(), None);
     }
@@ -260,13 +260,14 @@ pub fn design_lessons(loaded: &LoadedScenario, journal: &Journal) -> DesignLesso
         }
     }
 
-    if thresholds.rulings >= CLUSTER_MIN && thresholds.mode_share >= CLUSTER_SHARE {
-        if let Some(mode) = thresholds.mode {
-            notes.push(format!(
+    if thresholds.rulings >= CLUSTER_MIN
+        && thresholds.mode_share >= CLUSTER_SHARE
+        && let Some(mode) = thresholds.mode
+    {
+        notes.push(format!(
                 "Die Zielwerte klumpen: {:.0} % der gewürfelten Urteile lagen auf {mode}. Der Umpire unterscheidet kaum zwischen starken und schwachen Argumenten — Gewichte 0 und 2 und begründete Kontext-Modifikatoren bewusster einsetzen, oder die Leiter (`estimative_d100`) erwägen.",
                 thresholds.mode_share * 100.0
             ));
-        }
     }
     let judged = thresholds.rulings + thresholds.no_roll + thresholds.vetoes;
     if judged >= CLUSTER_MIN && thresholds.vetoes * 3 > judged {

@@ -51,11 +51,15 @@ pub mod pinned_model;
 pub mod policy;
 pub mod session;
 pub mod session_manager;
+// PL-95 S3 / PL-97 B1: getriggerte Skill-Auszüge je Modellrunde.
+pub mod skill_injection;
 pub mod state_store;
 pub mod stream;
 #[cfg(test)]
 mod test_support;
 pub mod testing;
+// Zulassung einzelner Werkzeugaufrufe vor ihrer Ausführung (Job-Budget).
+pub mod tool_call_meter;
 pub mod turn_loop;
 // Runde 9, Teil E4: vorab erteilte Freigaben der Nutzerin im Handoff.
 pub mod user_approval;
@@ -132,11 +136,15 @@ pub use session::{
     PendingHandoff, SessionState, SpawnContext, TurnHandle, TurnRejection,
 };
 pub use session_manager::SessionManager;
+pub use skill_injection::{
+    DeliveredSkill, RoundInjection, SkillInjectionSettings, SkillInjector, SkillProvenance,
+};
 pub use state_store::{
     InMemoryStateStore, SessionThreadMapper, StateStore, TranscriptStateStore, UsageRound,
 };
 pub use stream::{ModelStreamEvent, StreamSink};
 pub use testing::RecordingModelProvider;
+pub use tool_call_meter::{ToolCallAdmissionFuture, ToolCallMeter, ToolCallPermit};
 pub use turn_loop::{
     ApprovalResolution, TurnInput, TurnOutcome, TurnTokenBudget, resume_after_approval,
     resume_after_approval_durable, resume_after_child, resume_after_child_durable, run_turn,

@@ -333,16 +333,16 @@ pub fn save(root: &Path, meta: &SessionMeta) -> SessionStoreResult<()> {
 ///   Transcript selbst ist nicht lesbar (defekter Datensatz, Symlink, …).
 pub fn load_or_derive(root: &Path, id: &SessionId) -> SessionStoreResult<SessionMeta> {
     if let Some(mut meta) = load(root, id)? {
-        if meta.first_user_message.is_none() {
-            if let Some(text) = first_user_message_from_transcript(root, id)? {
-                meta.first_user_message = Some(text);
-                if let Err(error) = save(root, &meta) {
-                    tracing::warn!(
-                        session = %id,
-                        error = %error,
-                        "failed to persist self-healed session meta sidecar; continuing without it"
-                    );
-                }
+        if meta.first_user_message.is_none()
+            && let Some(text) = first_user_message_from_transcript(root, id)?
+        {
+            meta.first_user_message = Some(text);
+            if let Err(error) = save(root, &meta) {
+                tracing::warn!(
+                    session = %id,
+                    error = %error,
+                    "failed to persist self-healed session meta sidecar; continuing without it"
+                );
             }
         }
         return Ok(meta);
@@ -377,10 +377,10 @@ pub fn load_or_derive(root: &Path, id: &SessionId) -> SessionStoreResult<Session
 /// zurückgeben.
 pub fn peek(root: &Path, id: &SessionId) -> SessionStoreResult<SessionMeta> {
     if let Some(mut meta) = load(root, id)? {
-        if meta.first_user_message.is_none() {
-            if let Some(text) = first_user_message_from_transcript(root, id)? {
-                meta.first_user_message = Some(text);
-            }
+        if meta.first_user_message.is_none()
+            && let Some(text) = first_user_message_from_transcript(root, id)?
+        {
+            meta.first_user_message = Some(text);
         }
         return Ok(meta);
     }
@@ -462,10 +462,10 @@ fn first_user_message_from_transcript(
     };
     for record in reader {
         let record = record?;
-        if record.kind == RecordKind::Item {
-            if let Some(text) = extract_user_message_text(&record.payload) {
-                return Ok(Some(truncate_chars(&text, MAX_FIRST_USER_MESSAGE_CHARS)));
-            }
+        if record.kind == RecordKind::Item
+            && let Some(text) = extract_user_message_text(&record.payload)
+        {
+            return Ok(Some(truncate_chars(&text, MAX_FIRST_USER_MESSAGE_CHARS)));
         }
     }
     Ok(None)

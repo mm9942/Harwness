@@ -39,11 +39,11 @@
 //! Warten (`stop`, `wait`) läuft über einen `watch`-Kanal je Job.
 
 use crate::event::{JobEvent, JobNotification, JobNotifier};
-use crate::launcher::PreparedJob;
+use crate::launcher::{PreparedJob, PreparedLaunch};
 use crate::logs::{LogFollower, clip_line, tail_of_file};
 use crate::model::{
-    JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus, META_FILE, META_VERSION,
-    STDERR_LOG, STDOUT_LOG,
+    DedicatedCgroupProof, JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus,
+    META_FILE, META_VERSION, ManagedJobOrigin, STDERR_LOG, STDOUT_LOG,
 };
 use crate::procfs::{JobSignal, Liveness, OwnLeader, Recovered, SignalError};
 use crate::progress::{
@@ -206,8 +206,14 @@ pub struct StartRequest {
 /// Werkzeugzelle; `meta.json` und [`JobEvent::Started`] tragen sie.
 ///
 /// Ein eigener Typ statt neuer Felder in [`StartRequest`], damit die
-/// bestehenden Aufrufer (Operator-Wege, Kind-Backends) unverändert bleiben;
-/// sie starten ohne Herkunft (alle Felder `None`).
+/// bestehenden Aufrufer unverändert bleiben; wer [`JobManager::start`]
+/// nutzt, startet ohne Herkunft (alle Felder `None`).
+///
+/// Which origin to pass (W20-A): a model tool sets `tool` and `call_id`
+/// (e.g. `job.start`, `agents.build`), an operator command sets
+/// `kind: Some(ManagedJobOrigin::Operator)`, the job child backend uses
+/// [`JobOrigin::agent_child`]. A job started without any of them has
+/// unknown provenance.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobOrigin {
     /// Id des startenden Werkzeugaufrufs (`ToolCall::id`).
@@ -216,6 +222,34 @@ pub struct JobOrigin {
     pub tool: Option<String>,
     /// Anzeigename des besitzenden Agenten, falls bekannt.
     pub owner_agent: Option<String>,
+    /// W20-A: explicit typed provenance for starts that are not tool calls
+    /// (child agents, operator commands). `None` derives it from `tool` /
+    /// `call_id` (see [`JobOrigin::managed`]).
+    pub kind: Option<ManagedJobOrigin>,
+}
+
+impl JobOrigin {
+    /// Origin of a job that backs the child agent run `child_session_id`
+    /// (W20-A; `harw-agent-runner`'s job child backend).
+    #[must_use]
+    pub fn agent_child(child_session_id: impl Into<String>) -> Self {
+        Self {
+            kind: Some(ManagedJobOrigin::AgentChild {
+                child_session_id: child_session_id.into(),
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// The typed provenance this origin records ([`JobMeta::origin`]):
+    /// [`JobOrigin::kind`] if set, else `tool` / `call_id` mapped by
+    /// [`ManagedJobOrigin::from_legacy`]; `None` when nothing is known.
+    #[must_use]
+    pub fn managed(&self) -> Option<ManagedJobOrigin> {
+        self.kind.clone().or_else(|| {
+            ManagedJobOrigin::from_legacy(self.tool.as_deref(), self.call_id.as_deref())
+        })
+    }
 }
 
 /// Ergebnis von [`JobManager::start_piped`]: derselbe Job wie [`JobManager::start`]
@@ -345,17 +379,31 @@ impl Waiter {
 /// no wall limit of their own; stop is explicit).
 const JOB_RUNTIME_DEADLINE: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 
-/// Hands a prepared job to the installed command port: argv, working directory
-/// and environment from the prepared command, output appended to the job's
-/// log files.
+/// Hands a prepared job to `port`: argv, working directory and environment
+/// from the prepared command, output appended to the job's log files. With
+/// a chain submission (PL-97 E2b) the request carries its workspace sandbox
+/// and resources instead of running as a host command.
 async fn start_on_runtime(
+    port: Option<Arc<dyn harw_command::CommandPort>>,
     prepared: &PreparedJob,
+    sandboxed: Option<harw_tool_shell::SandboxedLaunch>,
     dir: &Path,
     piped: bool,
 ) -> Result<harw_command::StartedCommand, String> {
-    let Some(port) = harw_command::installed() else {
+    let Some(port) = port else {
         return Err("no job runtime is installed; jobs start only through it".to_owned());
     };
+    let request = command_request(prepared, sandboxed, dir, piped);
+    port.start(request).await
+}
+
+/// The command request of a prepared job ([`start_on_runtime`]).
+fn command_request(
+    prepared: &PreparedJob,
+    sandboxed: Option<harw_tool_shell::SandboxedLaunch>,
+    dir: &Path,
+    piped: bool,
+) -> harw_command::CommandRequest {
     let std = prepared.command.as_std();
     let mut request = harw_command::CommandRequest::new(
         std.get_program().to_string_lossy().into_owned(),
@@ -395,7 +443,12 @@ async fn start_on_runtime(
             stderr: dir.join(STDERR_LOG),
         };
     }
-    port.start(request).await
+    if let Some(sandboxed) = sandboxed {
+        let (sandbox, limits) = sandboxed.into_parts();
+        request.sandbox = sandbox;
+        request.limits = limits;
+    }
+    request
 }
 
 /// Veränderlicher Zustand eines Jobs.
@@ -527,6 +580,8 @@ pub struct JobManager {
     counter: AtomicU64,
     // Zur Laufzeit verstellbare Obergrenze (Start: `config.max_running_jobs`).
     max_running: AtomicUsize,
+    // Eigener Kommando-Port; `None`: der installierte (`harw_command::installed`).
+    command_port: Option<Arc<dyn harw_command::CommandPort>>,
 }
 
 impl fmt::Debug for JobManager {
@@ -544,6 +599,27 @@ impl JobManager {
     /// # Errors
     /// Wenn das Job-Verzeichnis nicht angelegt werden kann.
     pub fn new(config: JobManagerConfig, notifier: Arc<dyn JobNotifier>) -> io::Result<Arc<Self>> {
+        Self::build(config, notifier, None)
+    }
+
+    /// Wie [`JobManager::new`], startet Jobs aber über `port` statt über den
+    /// prozessweit installierten Kommando-Port (Einbettung, Tests).
+    ///
+    /// # Errors
+    /// Wenn das Job-Verzeichnis nicht angelegt werden kann.
+    pub fn with_command_port(
+        config: JobManagerConfig,
+        notifier: Arc<dyn JobNotifier>,
+        port: Arc<dyn harw_command::CommandPort>,
+    ) -> io::Result<Arc<Self>> {
+        Self::build(config, notifier, Some(port))
+    }
+
+    fn build(
+        config: JobManagerConfig,
+        notifier: Arc<dyn JobNotifier>,
+        command_port: Option<Arc<dyn harw_command::CommandPort>>,
+    ) -> io::Result<Arc<Self>> {
         let jobs_dir = config.jobs_dir();
         fs::create_dir_all(&jobs_dir)?;
         let instance = format!(
@@ -561,6 +637,7 @@ impl JobManager {
             jobs: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(0),
             max_running: AtomicUsize::new(config_max_running),
+            command_port,
         });
         manager.reload(&jobs_dir);
         Ok(manager)
@@ -570,6 +647,23 @@ impl JobManager {
     #[must_use]
     pub fn config(&self) -> &JobManagerConfig {
         &self.config
+    }
+
+    /// Der Kommando-Port, über den Jobs starten.
+    fn port(&self) -> Option<Arc<dyn harw_command::CommandPort>> {
+        self.command_port.clone().or_else(harw_command::installed)
+    }
+
+    /// The backend this manager's command port runs a workspace sandbox
+    /// request with `profile` on (PL-97 E2b,
+    /// [`harw_command::CommandPort::workspace_backend`]); `None`: there is
+    /// no port, or it runs no workspace requests.
+    #[must_use]
+    pub fn workspace_backend(
+        &self,
+        profile: harw_command::SandboxProfileName,
+    ) -> Option<harw_command::BackendKind> {
+        self.port().and_then(|port| port.workspace_backend(profile))
     }
 
     /// Kennung dieser harw-Instanz (steht in `meta.json`).
@@ -760,7 +854,13 @@ impl JobManager {
 
     /// Wie [`JobManager::start_with_warnings`], zusätzlich mit der Herkunft
     /// ([`JobOrigin`]): sie landet in `meta.json` (`origin_call_id`,
-    /// `origin_tool`, `owner_agent`) und im [`JobEvent::Started`].
+    /// `origin_tool`, `owner_agent`, typisiert in `origin`) und im
+    /// [`JobEvent::Started`].
+    ///
+    /// [`JobManager::start`] and [`JobManager::start_with_warnings`] record
+    /// no origin: their jobs have unknown provenance (W20-A), so every
+    /// producer that knows its origin (model tools, operator commands)
+    /// should start through this method (see [`JobOrigin`]).
     ///
     /// # Errors
     /// Wie [`JobManager::start`].
@@ -771,7 +871,45 @@ impl JobManager {
         warnings: Vec<String>,
         origin: JobOrigin,
     ) -> Result<JobStatus, JobError> {
+        self.start_prepared(request, prepared, None, warnings, origin)
+            .await
+    }
+
+    /// Wie [`JobManager::start_with_origin`] für einen ganzen
+    /// [`PreparedLaunch`] (`job.start`): nimmt er die Sandbox-Kette
+    /// ([`PreparedLaunch::sandboxed`], PL-97 E2b), geht der Job mit seiner
+    /// Workspace-Sandbox und seinen Ressourcen an den Kommando-Port statt
+    /// als Host-Job. Hinweise des Startwegs wie bei
+    /// [`JobManager::start_with_warnings`].
+    ///
+    /// # Errors
+    /// Wie [`JobManager::start`].
+    pub async fn start_launch_with_origin(
+        self: &Arc<Self>,
+        request: StartRequest,
+        launch: PreparedLaunch,
+        origin: JobOrigin,
+    ) -> Result<JobStatus, JobError> {
+        self.start_prepared(
+            request,
+            launch.job,
+            launch.sandboxed,
+            launch.warnings,
+            origin,
+        )
+        .await
+    }
+
+    async fn start_prepared(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+        sandboxed: Option<harw_tool_shell::SandboxedLaunch>,
+        warnings: Vec<String>,
+        origin: JobOrigin,
+    ) -> Result<JobStatus, JobError> {
         self.check_capacity()?;
+        let managed_origin = origin.managed();
         let (id, dir) = self.allocate()?;
         // The runtime appends the process output to these files (they outlive
         // this process); created here for the `O_EXCL` guarantee and the mode.
@@ -810,12 +948,13 @@ impl JobManager {
             origin_call_id: origin.call_id,
             origin_tool: origin.tool,
             owner_agent: origin.owner_agent,
+            origin: managed_origin,
         };
 
         // The job runtime starts the process (PL-93): session, pidfd, cgroup and
         // the output files are its business; this keeps ownership, logs,
         // progress and notifications.
-        let started = match start_on_runtime(&prepared, &dir, false).await {
+        let started = match start_on_runtime(self.port(), &prepared, sandboxed, &dir, false).await {
             Ok(started) => started,
             Err(message) => {
                 warn!(job_id = %id, error = %message, "job spawn failed");
@@ -830,7 +969,7 @@ impl JobManager {
         };
 
         let pid = started.pid;
-        let leader = adopt_child(&mut meta, pid);
+        let leader = adopt_child(&mut meta, pid, started.cgroup.as_ref());
         meta.state = JobState::Running;
         meta.started_at = Some(Timestamp::now());
         let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader));
@@ -849,6 +988,7 @@ impl JobManager {
                 origin_call_id: meta.origin_call_id.clone(),
                 origin_tool: meta.origin_tool.clone(),
                 owner_agent: meta.owner_agent.clone(),
+                origin: meta.resolved_origin(),
             },
         });
         for text in &meta.launch_warnings {
@@ -913,7 +1053,66 @@ impl JobManager {
         prepared: PreparedJob,
         max_line_bytes: usize,
     ) -> Result<PipedJob, JobError> {
+        self.start_piped_with_origin(request, prepared, max_line_bytes, JobOrigin::default())
+            .await
+    }
+
+    /// Like [`JobManager::start_piped_with_line_limit`], additionally with
+    /// the job's provenance ([`JobOrigin`], W20-A): it lands in `meta.json`
+    /// and in [`JobEvent::Started`] exactly as for
+    /// [`JobManager::start_with_origin`]. The job child backend passes
+    /// [`JobOrigin::agent_child`].
+    ///
+    /// # Errors
+    /// Like [`JobManager::start_piped`].
+    pub async fn start_piped_with_origin(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+        max_line_bytes: usize,
+        origin: JobOrigin,
+    ) -> Result<PipedJob, JobError> {
+        self.start_piped_prepared(request, prepared, None, max_line_bytes, origin)
+            .await
+    }
+
+    /// Like [`JobManager::start_piped_with_origin`] for a whole
+    /// [`PreparedLaunch`] (PL-97 E2b): with a chain submission
+    /// ([`PreparedLaunch::sandboxed`], e.g.
+    /// [`crate::launcher::child_agent_launch`]) the job goes to the command
+    /// port with its workspace sandbox and resources instead of as a host
+    /// command. The launch's warnings are not recorded (as for every piped
+    /// job).
+    ///
+    /// # Errors
+    /// Like [`JobManager::start_piped`].
+    pub async fn start_piped_launch_with_origin(
+        self: &Arc<Self>,
+        request: StartRequest,
+        launch: PreparedLaunch,
+        max_line_bytes: usize,
+        origin: JobOrigin,
+    ) -> Result<PipedJob, JobError> {
+        self.start_piped_prepared(
+            request,
+            launch.job,
+            launch.sandboxed,
+            max_line_bytes,
+            origin,
+        )
+        .await
+    }
+
+    async fn start_piped_prepared(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+        sandboxed: Option<harw_tool_shell::SandboxedLaunch>,
+        max_line_bytes: usize,
+        origin: JobOrigin,
+    ) -> Result<PipedJob, JobError> {
         self.check_capacity()?;
+        let managed_origin = origin.managed();
         let (id, dir) = self.allocate()?;
         let stdout_log_path = dir.join(STDOUT_LOG);
         let stdout_log = create_log(&stdout_log_path).map_err(io_err("create stdout.log"))?;
@@ -948,17 +1147,19 @@ impl JobManager {
             stragglers_reaped: false,
             log_truncated: false,
             launch_warnings: Vec::new(),
-            origin_call_id: None,
-            origin_tool: None,
-            owner_agent: None,
+            origin_call_id: origin.call_id,
+            origin_tool: origin.tool,
+            owner_agent: origin.owner_agent,
+            origin: managed_origin,
         };
 
         // The runtime starts the process and hands over its stdin/stdout pipes;
         // what flows through them never becomes part of a job record.
-        let mut started = match start_on_runtime(&prepared, &dir, true).await {
-            Ok(started) => started,
-            Err(message) => return Err(self.record_piped_launch_failure(dir, meta, message)),
-        };
+        let mut started =
+            match start_on_runtime(self.port(), &prepared, sandboxed, &dir, true).await {
+                Ok(started) => started,
+                Err(message) => return Err(self.record_piped_launch_failure(dir, meta, message)),
+            };
         let (Some(stdin), Some(stdout)) = (started.stdin.take(), started.stdout.take()) else {
             (started.cancel)();
             return Err(self.record_piped_launch_failure(
@@ -969,7 +1170,7 @@ impl JobManager {
         };
 
         let pid = started.pid;
-        let leader = adopt_child(&mut meta, pid);
+        let leader = adopt_child(&mut meta, pid, started.cgroup.as_ref());
         meta.state = JobState::Running;
         meta.started_at = Some(Timestamp::now());
         let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader));
@@ -988,6 +1189,7 @@ impl JobManager {
                 origin_call_id: meta.origin_call_id.clone(),
                 origin_tool: meta.origin_tool.clone(),
                 owner_agent: meta.owner_agent.clone(),
+                origin: meta.resolved_origin(),
             },
         });
 
@@ -1260,6 +1462,7 @@ impl JobManager {
                     // Letzte Beobachtung für den nächsten Start festhalten.
                     if let Some(fresh) = entry.leader.as_ref().and_then(OwnLeader::refresh_identity)
                     {
+                        let fresh = carry_cgroup_proof(state.meta.identity.as_ref(), fresh);
                         state.meta.proc_start_ticks = Some(fresh.start_ticks);
                         state.meta.identity = Some(fresh);
                     }
@@ -1344,8 +1547,14 @@ async fn wait_terminal(entry: &Arc<JobEntry>, limit: Duration) -> bool {
 }
 
 /// Übernimmt das eben gestartete Kind `pid` (pidfd, Identität) und trägt
-/// PID und Identität in `meta` ein.
-fn adopt_child(meta: &mut JobMeta, pid: Option<u32>) -> Option<OwnLeader> {
+/// PID und Identität in `meta` ein; `cgroup` ist die Bescheinigung der
+/// eigenen Job-cgroup aus genau diesem Start (PL-97 E4, siehe
+/// [`attach_cgroup_proof`]).
+fn adopt_child(
+    meta: &mut JobMeta,
+    pid: Option<u32>,
+    cgroup: Option<&harw_command::AttemptCgroup>,
+) -> Option<OwnLeader> {
     meta.pid = pid;
     let (leader, identity) = match pid {
         Some(pid) => {
@@ -1356,7 +1565,38 @@ fn adopt_child(meta: &mut JobMeta, pid: Option<u32>) -> Option<OwnLeader> {
     };
     meta.proc_start_ticks = identity.as_ref().map(|identity| identity.start_ticks);
     meta.identity = identity;
+    attach_cgroup_proof(meta, cgroup);
     leader
+}
+
+/// Records the runtime's dedicated-cgroup attestation of this job's own
+/// launch as [`DedicatedCgroupProof`], bound to `meta.job_id` (PL-97 E4).
+///
+/// # Description
+/// Fail-closed: without an attestation (no delegated root, no cgroup
+/// created) or without a captured identity nothing is written, and an
+/// earlier proof is cleared. Whether the proof matches the observed cgroup
+/// is decided when it is read ([`crate::JobStatus::job_cgroup_path`]).
+fn attach_cgroup_proof(meta: &mut JobMeta, cgroup: Option<&harw_command::AttemptCgroup>) {
+    let job_id = meta.job_id.clone();
+    if let Some(identity) = meta.identity.as_mut() {
+        identity.dedicated_cgroup = cgroup.map(|cgroup| DedicatedCgroupProof {
+            job_id: Some(job_id),
+            attempt_id: cgroup.attempt_id.clone(),
+            delegated_root: cgroup.delegated_root.clone(),
+        });
+    }
+}
+
+/// A freshly observed identity keeps the dedicated-cgroup proof of the
+/// launch (`/proc` cannot reproduce it); a moved process no longer matches
+/// it and is then not attributed ([`crate::JobStatus::job_cgroup_path`]).
+fn carry_cgroup_proof(
+    previous: Option<&JobProcessIdentity>,
+    mut fresh: JobProcessIdentity,
+) -> JobProcessIdentity {
+    fresh.dedicated_cgroup = previous.and_then(|identity| identity.dedicated_cgroup.clone());
+    fresh
 }
 
 /// Identitätsprüfung eines Jobs ohne eigenen pidfd (frühere Sitzung).
@@ -1849,6 +2089,7 @@ impl Monitor {
         };
         let changed = {
             let mut state = lock(&self.entry.state);
+            let fresh = carry_cgroup_proof(state.meta.identity.as_ref(), fresh);
             if state.meta.identity.as_ref() == Some(&fresh) {
                 false
             } else {

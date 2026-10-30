@@ -637,21 +637,7 @@ async fn pick_session(
     let sessions = port.list().await?;
     match sessions.as_slice() {
         [] => Ok(port.create(CreateParams::default()).await?.session_id),
-        [one] => {
-            write!(
-                out,
-                "attach to {} ({})? [y/N] ",
-                one.session_id.as_str(),
-                one.title.as_deref().unwrap_or("untitled")
-            )?;
-            out.flush()?;
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer)?;
-            match answer.trim().to_lowercase().as_str() {
-                "y" | "yes" => Ok(one.session_id.clone()),
-                _ => Err(AttachError::Ambiguous(one.session_id.as_str().to_owned())),
-            }
-        }
+        [one] => Ok(one.session_id.clone()),
         many => {
             for s in many {
                 writeln!(
@@ -863,6 +849,18 @@ mod tests {
         let (result, out) = drive(fake, None, &[]).await;
         assert!(matches!(result, Err(AttachError::Ambiguous(_))));
         assert!(out.contains('a') && out.contains('b'));
+    }
+
+    #[tokio::test]
+    async fn single_session_is_attached_without_prompt() {
+        let fake = Fake {
+            sessions: vec![summary("only")],
+            ..Fake::default()
+        };
+        let mut out = Vec::<u8>::new();
+        let picked = pick_session(&fake, &mut out).await;
+        assert_eq!(picked.map(|s| s.0).ok().as_deref(), Some("only"));
+        assert!(out.is_empty());
     }
 
     #[tokio::test]

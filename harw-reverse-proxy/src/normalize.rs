@@ -145,10 +145,10 @@ pub fn normalize_path(target: &str) -> Option<(String, Option<String>)> {
     {
         return None;
     }
-    if let Some(q) = &query {
-        if q.chars().any(|c| c.is_control() || c == '#') {
-            return None;
-        }
+    if let Some(q) = &query
+        && q.chars().any(|c| c.is_control() || c == '#')
+    {
+        return None;
     }
     // Canonical escapes: an escaped unreserved character (`%61`) is the same
     // character as its literal (`a`) to any decoder, so matching and forwarding

@@ -1960,6 +1960,33 @@ pub trait ChildRegistryFactory: Send + Sync {
         let _ = (role, child);
     }
 
+    /// Meldet der Fabrik die Sitzung, für die der unmittelbar folgende
+    /// `build_registry*`-Aufruf die Registry baut.
+    ///
+    /// # Description
+    /// Der Controller legt die Kind-ID **vor** dem Registry-Bau fest: für ein
+    /// neues Kind frisch, bei einer durablen Wiederherstellung
+    /// (`ManagedAgentSpawner::recover_root_child`) als die ursprüngliche
+    /// `ChildRecoveryView::child`. Eine Fabrik, die laufgebundene Identitäten
+    /// aus der Kind-ID ableitet (Wissens-/Diary-Autor), bekommt so nach einem
+    /// Neustart dieselbe Identität wie vor dem Absturz, ohne dass etwas
+    /// Neues persistiert werden müsste. Der Aufruf geschieht unter dem Lock
+    /// des `SessionManager`, unmittelbar vor dem Registry-Bau derselben
+    /// Admission und vor [`Self::child_session_observers`]; die Implementierung
+    /// darf den Controller deshalb nicht wieder betreten. Die ID ist
+    /// Identität, nie Berechtigung.
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): der exakte registrierte Rollenname.
+    /// - `child` (`&SessionId`): die Sitzung, die der Controller für dieses
+    ///   Kind anlegt.
+    ///
+    /// # Returns
+    /// Der Default tut nichts — bestehende Factories bleiben unverändert.
+    fn announce_child_session(&self, role: &str, child: &SessionId) {
+        let _ = (role, child);
+    }
+
     fn build_registry(
         &self,
         role: &str,
@@ -3607,14 +3634,14 @@ impl ManagedAgentSpawner {
         // dabei bricht die Verlängerung nicht ab — die In-Memory-Sicht bleibt
         // korrekt, nur die Durability hinkt bis zur nächsten Verlängerung
         // hinterher.
-        if let Some(lease_store) = &self.lease_store {
-            if let Err(error) = lease_store.renew(child, self.limits.lease_seconds, now) {
-                tracing::warn!(
-                    child = %child,
-                    error = %error,
-                    "child_lease_renew.durable_renew_failed"
-                );
-            }
+        if let Some(lease_store) = &self.lease_store
+            && let Err(error) = lease_store.renew(child, self.limits.lease_seconds, now)
+        {
+            tracing::warn!(
+                child = %child,
+                error = %error,
+                "child_lease_renew.durable_renew_failed"
+            );
         }
         Ok(())
     }
@@ -5193,12 +5220,11 @@ impl ManagedAgentSpawner {
             return false;
         };
         token.cancel(reason);
-        if let Ok(mut active) = self.active.lock() {
-            if let Some(record) = active.get_mut(child.as_str()) {
-                if matches!(record.status, ChildStatus::Admitted | ChildStatus::Paused) {
-                    record.status = ChildStatus::Cancelled;
-                }
-            }
+        if let Ok(mut active) = self.active.lock()
+            && let Some(record) = active.get_mut(child.as_str())
+            && matches!(record.status, ChildStatus::Admitted | ChildStatus::Paused)
+        {
+            record.status = ChildStatus::Cancelled;
         }
         true
     }
@@ -8231,16 +8257,15 @@ impl ManagedAgentSpawner {
         // A recovery envelope is evidence, never authority. Identity fields
         // must bind exactly to the fresh admission request before any mutable
         // controller state is created.
-        if let Some(recovery) = recovery {
-            if recovery.child.as_str().is_empty()
+        if let Some(recovery) = recovery
+            && (recovery.child.as_str().is_empty()
                 || recovery.parent != input.parent_session_id
                 || recovery.handoff_call_id != input.handoff_call_id
-                || recovery.role != role_name
-            {
-                return Err(AdmitRejection::Other(Self::reject(
-                    "agent recovery identity does not match the current admission",
-                )));
-            }
+                || recovery.role != role_name)
+        {
+            return Err(AdmitRejection::Other(Self::reject(
+                "agent recovery identity does not match the current admission",
+            )));
         }
 
         // W2-19: die Agent-IR dieser Rolle wird vor jeder Prüfung aufgelöst,
@@ -8480,9 +8505,10 @@ impl ManagedAgentSpawner {
             let entry = recent
                 .entry(input.parent_session_id.as_str().to_owned())
                 .or_default();
-            if entry.contains(&hash) {
-                if let Some(observer) = &self.drift_observer {
-                    observer.on_drift(&crate::guard::DriftEvent {
+            if entry.contains(&hash)
+                && let Some(observer) = &self.drift_observer
+            {
+                observer.on_drift(&crate::guard::DriftEvent {
                         kind: crate::guard::DriftKind::DuplicateDelegation,
                         session_id: input.parent_session_id.as_str().to_owned(),
                         detail: format!(
@@ -8491,7 +8517,6 @@ impl ManagedAgentSpawner {
                         tool_name: None,
                         child_role: Some(role_name.to_owned()),
                     });
-                }
             }
             entry.push_back(hash);
             if entry.len() > RECENT_DELEGATION_HASH_CAPACITY {
@@ -8645,15 +8670,15 @@ impl ManagedAgentSpawner {
         // Deckenschnitt, aus demselben Grund wie dieser selbst: ein
         // zweiter, separater Prüfschritt wäre eine Lücke, die vergessen
         // werden könnte.
-        if let Some(ir) = executable_ir {
-            if let Some(violation) = Self::describe_context_program_ceiling_violation(
+        if let Some(ir) = executable_ir
+            && let Some(violation) = Self::describe_context_program_ceiling_violation(
                 &child_ceiling,
                 ir.context_program(),
-            ) {
-                return Err(AdmitRejection::Other(Self::reject(format!(
-                    "child context program escalation rejected: {violation}"
-                ))));
-            }
+            )
+        {
+            return Err(AdmitRejection::Other(Self::reject(format!(
+                "child context program escalation rejected: {violation}"
+            ))));
         }
         // Wave 8: Reasoning-Effort wird monoton vom Parent geerbt (Kind ≤ Parent).
         // Der Default ist Gleichheit; ein Budget-Clamp oder Owner-Override wird
@@ -8754,6 +8779,14 @@ impl ManagedAgentSpawner {
                 .unwrap_or(0),
             reasoning_effort: parent_reasoning_effort.map(|effort| effort.to_string()),
         };
+        // Die Kind-ID steht vor dem Registry-Bau fest (neu oder die der
+        // Wiederherstellung), damit die Fabrik daraus eine über einen
+        // Neustart stabile Lauf-Identität ableiten kann. Der Aufruf liegt
+        // unmittelbar vor dem Bau, unter demselben Manager-Lock.
+        let child = recovery.map_or_else(SessionId::new, |recovery| recovery.child.clone());
+        definition
+            .registry_factory
+            .announce_child_session(role_name, &child);
         let registry = definition
             .registry_factory
             .build_registry_from_capability_snapshot_for_parent(
@@ -8794,30 +8827,19 @@ impl ManagedAgentSpawner {
             // geschnitten wurde — kein zweiter, separater Zustand.
             ceiling: Some(child_ceiling),
         };
-        let child = if let Some(recovery) = recovery {
-            let child = recovery.child.clone();
-            manager
-                .create_governed_session_with_id(
-                    child.clone(),
-                    definition.role.clone(),
-                    Some(input.parent_session_id.clone()),
-                    registry,
-                    spawn_context,
-                )
-                .map_err(|error| {
-                    Self::reject(format!(
-                        "could not restore governed child identity {child}: {error}"
-                    ))
-                })?;
-            child
-        } else {
-            manager.create_governed_session(
+        manager
+            .create_governed_session_with_id(
+                child.clone(),
                 definition.role.clone(),
                 Some(input.parent_session_id.clone()),
                 registry,
                 spawn_context,
             )
-        };
+            .map_err(|error| {
+                Self::reject(format!(
+                    "could not create governed child session {child}: {error}"
+                ))
+            })?;
         // W2-19: Tool-Aktivierung aus der Agent-IR. `with_executable_agent_ir`
         // ist ein verbrauchender Builder, deshalb wird die frisch angelegte
         // Session einmal entnommen und konfiguriert zurückgelegt — noch unter
@@ -10336,9 +10358,10 @@ specialization = "child-controller-test"
 
     // --- Runde 5, Teil C: Fabrik-Beobachter an der Kind-Sitzung ---
 
-    /// Zählt Beobachter-Anfragen und Freigaben je Rolle.
+    /// Zählt Meldungen, Beobachter-Anfragen und Freigaben je Rolle.
     #[derive(Default)]
     struct ObservingChildRegistry {
+        announced: Mutex<Vec<(String, SessionId)>>,
         observed: Mutex<Vec<(String, SessionId)>>,
         released: Mutex<Vec<(String, SessionId)>>,
     }
@@ -10368,6 +10391,13 @@ specialization = "child-controller-test"
                 kind: Default::default(),
                 message: "test registry does not run children".to_owned(),
             })
+        }
+
+        fn announce_child_session(&self, role: &str, child: &SessionId) {
+            self.announced
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((role.to_owned(), child.clone()));
         }
 
         fn child_session_observers(&self, role: &str, child: &SessionId) -> ChildSessionObservers {
@@ -10430,6 +10460,17 @@ specialization = "child-controller-test"
         assert_eq!(
             factory
                 .observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            vec![("worker".to_owned(), child.clone())]
+        );
+        // Die Fabrik erfährt die Kind-ID vor dem Registry-Bau — dieselbe, unter
+        // der danach die Sitzung entsteht (Grundlage der über einen Neustart
+        // stabilen Lauf-Identität).
+        assert_eq!(
+            factory
+                .announced
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),

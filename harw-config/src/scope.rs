@@ -280,6 +280,14 @@ pub struct FieldScope {
 /// gegen diese Tabelle prüft, lebt bewusst in Paket C
 /// (`harw-config/tests/config_scope_exhaustive.rs`), nicht hier (Abschnitt
 /// 7a der Spezifikation).
+///
+/// Sections parsed outside `HarnessConfig` (`[network]`, `[browser]`,
+/// `[dod]`, `[web]`, `[infrastructure]`) have no rows here: a trusted layer
+/// replaces such a section wholesale, and the untrusted repository layer is
+/// handled by the per-section `merge_restricted_*` functions in
+/// `crate::discovery`. For `[dod]` that means `proof_key_dir`, `export_dir`
+/// and `findings_window_hours` are profile-scoped and never taken from an
+/// untrusted layer; `config_scope_exhaustive.rs` pins that per field.
 #[rustfmt::skip]
 pub static FIELD_TABLE: &[FieldScope] = &[
     // 1.1 Top-Level (11)
@@ -290,6 +298,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "active_agent_definition", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "active_uia_definition", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "uia_provider", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "single_agent_mode", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "uia_model", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "uia_worker_model", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "policy_profile", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
@@ -299,10 +308,16 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "logging.target_module_paths", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "logging.json", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.3 [tui] (2)
+    FieldScope { path: "tui.language", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "tui.theme", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "tui.keybindings_file", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // Runde 5, Teil I: Live-Stream der Kind-Agenten im Verlauf.
     FieldScope { path: "tui.child_stream", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // h7/h9: Ablaufverhalten der Kind-Statusmeldungen und read-only Zielmodus.
+    FieldScope { path: "tui.status_expiry", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "tui.goal_mode", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // PL-97 R1: Darstellung der Reasoning-Zusammenfassungen (rein darstellend).
+    FieldScope { path: "tui.reasoning", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.4 [session] (5)
     FieldScope { path: "session.store_dir", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "session.journal_format", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -369,7 +384,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "permissions.extra_roots", scope: Scope::Global, merge: MergeRule::Intersection, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "RuleToml.tool", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "RuleToml.pattern", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
-    // 1.12 [sandbox] (8)
+    // 1.12 [sandbox] (9)
     FieldScope { path: "sandbox.cargo", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.cargo.mode", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.cargo.cargo_bin", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
@@ -378,6 +393,9 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "sandbox.tmux", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.tmux.mode", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.tmux.socket_path", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    // PL-97 E2: Ausführungspfad (`chain` | `legacy`); Profil-Ebene, ein nicht
+    // vertrautes Projekt darf ihn nie setzen (`merge_sandbox`).
+    FieldScope { path: "sandbox.execution", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
     // 1.13 [internal_models] (13)
     FieldScope { path: "internal_models.use_openrouter_defaults", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.session_title", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -393,6 +411,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // Runde 5, Teil E: Modell des Auto-Modus-Klassifizierers.
     FieldScope { path: "internal_models.auto_classifier", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.work_driver_judge", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.image_understanding", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "InternalModelChoice.provider/.model", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
     // 1.14 [compaction] (2)
     FieldScope { path: "compaction.absolute_ceiling_tokens", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
@@ -449,6 +468,11 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // setzen frei, ein nicht vertrautes Projekt senkt nur (`merge_jobs`);
     // 0 oder > 256 ist schon beim Parsen ein Fehler.
     FieldScope { path: "jobs.max_running", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    // PL-97 E3: delegierte cgroup-Wurzel und Trampolin-Pfad der Jobs. Nur
+    // vertraute Layer setzen sie (`merge_jobs`); ein nicht vertrautes Projekt
+    // könnte sonst Jobs in eine fremde cgroup oder ein fremdes Binary lenken.
+    FieldScope { path: "jobs.cgroup_root", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "jobs.trampoline", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
     // [agent_compiler] (3) — #22 Welle 2B: Build-Cache, Versionsaufbewahrung
     // und UIA-Autobuild. Reine Komfort-Grenzen ohne Rechtewirkung; ein nicht
     // vertrautes Projekt darf sie nicht setzen (`merge_agent_compiler`).
@@ -471,6 +495,13 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "memory.context_ledger", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "memory.security_signals", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "memory.llm_extraction", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // [skills] (4) — PL-95 S3 / PL-97 B1: triggered skill injection. Home and
+    // profile replace, an untrusted project sets none of them (`merge_skills`).
+    // `inject_imported` decides whether imported skill text reaches the model.
+    FieldScope { path: "skills.triggered_injection", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "skills.inject_imported", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "skills.per_turn_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "skills.per_session_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // [retention.<klasse>] (10 Klassen x 5 = 50) — Aufbewahrungsgrenzen. enabled/keep_newest:
     // ein nicht vertrautes Projekt darf sie nicht setzen; max_*: Home/Profil setzen frei,
     // das Projekt darf nur senken (merge_retention). Pfade folgen harw_retention::CLASSES.
@@ -532,7 +563,7 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_106_entries() {
+    fn test_field_table_has_exactly_206_entries() {
         // Runde 5, Teil B: +1 für `host.sudo_session_minutes`.
         // Runde 5, Teil E: +1 für `internal_models.auto_classifier`.
         // Runde 5, Teil G: +5 für `uia_worker_models.*`.
@@ -550,7 +581,15 @@ mod merge_rule_tests {
         // [memory]: +2 für `memory.security_signals`, `memory.llm_extraction`.
         // [tools.container]: +4 (`enabled`, `engine`, `connection`, `images`), alle GlobalOnly.
         // [session_listener]: +6, alle GlobalOnly.
-        assert_eq!(FIELD_TABLE.len(), 193);
+        // h7/h9: +2 für `tui.status_expiry`, `tui.goal_mode`.
+        // +1 for explicit trusted single-agent task topology.
+        // +1 for `internal_models.image_understanding`.
+        // PL-97 B1: +4 für `skills.*`.
+        // PL-97 E2: +1 für `sandbox.execution`.
+        // PL-97 R1: +1 für `tui.reasoning`.
+        // PL-97 E3: +2 für `jobs.cgroup_root`, `jobs.trampoline`.
+        // Interface localization: +1 for `tui.language`.
+        assert_eq!(FIELD_TABLE.len(), 206);
     }
 
     #[test]
@@ -571,7 +610,15 @@ mod merge_rule_tests {
         // R14: +1 (`internal_models.work_driver_judge`).
         // [memory]: +11 (`memory.*`).
         // [retention]: +20 ProfileReplaces, +30 MinBound.
-        assert_eq!(count(MergeRule::ProfileReplaces), 94);
+        // h7/h9: +2 (`tui.status_expiry`, `tui.goal_mode`).
+        // PL-97 B1: +4 (`skills.*`).
+        // PL-97 E2: +1 (`sandbox.execution`).
+        // +1 for explicit trusted single-agent task topology.
+        // +1 for `internal_models.image_understanding`.
+        // PL-97 R1: +1 (`tui.reasoning`).
+        // PL-97 E3: +2 (`jobs.cgroup_root`, `jobs.trampoline`).
+        // Interface localization: +1 for `tui.language`.
+        assert_eq!(count(MergeRule::ProfileReplaces), 107);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

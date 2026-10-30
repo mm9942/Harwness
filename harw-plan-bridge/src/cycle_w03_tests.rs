@@ -19,7 +19,9 @@ use harw_job_core::LeaseToken;
 use harw_job_store::RecordStore;
 use harw_types::{ContentDigest, ModelId, ReasoningEffort, TenantId, WorkId, WorkspaceId};
 
-use crate::cycle_explorer::{ReadOnlyExplorerExecutor, ReadTargetMap};
+use crate::cycle_explorer::{
+    DEFAULT_CACHE_BYTES, ExplorerReadCache, ReadOnlyExplorerExecutor, ReadTargetMap,
+};
 use crate::cycle_proposer::{ModelCycleProposer, ProposerRoute, RoutePolicy};
 use crate::cycle_runtime::{
     AuthorityReissuer, CycleDriver, CycleRecord, CycleRunOutcome, CycleStore,
@@ -273,5 +275,149 @@ async fn advance_read_then_reorient_on_evidence_then_escalate() -> TestResult {
             "debug digest leaked into the prompt"
         );
     }
+    Ok(())
+}
+
+/// Production composition: a [`ReadOnlyCycleSpec`] rebuilt into admission,
+/// target map and checks; the [`ExplorerCycleExecutor`] reads, the
+/// deterministic verifier turns the observation into `Verified` evidence,
+/// and the cycle reaches `CompletionProposed` — first resumed under a new
+/// lease through the narrowing-only [`CeilingReissuer`].
+#[tokio::test]
+async fn spec_read_verify_complete_reaches_completion_proposed() -> TestResult {
+    use std::collections::BTreeMap;
+
+    use crate::cycle_runtime::CeilingReissuer;
+    use crate::cycle_spec::ReadOnlyCycleSpec;
+    use crate::cycle_verifier::{ContentCheck, ExplorerCycleExecutor};
+
+    let ws = Workspace::new()?;
+    ws.write("src/one.rs", FILE_ONE)?;
+    let authority = ws.authority()?;
+    let spec = ReadOnlyCycleSpec::new(
+        "does the first file define its marker?".to_owned(),
+        BTreeMap::from([("source".to_owned(), "src/one.rs".to_owned())]),
+        BTreeMap::from([(
+            "marker-defined".to_owned(),
+            ContentCheck {
+                target: "source".to_owned(),
+                must_contain: vec!["fn first_file_body_marker".to_owned()],
+                must_not_contain: vec!["todo!()".to_owned()],
+            },
+        )]),
+        None,
+    );
+    let plan = spec.plan("intent-spec").map_err(ctx("spec plans"))?;
+
+    let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+    let records =
+        RecordStore::create_ambient(&temp.path().join("cycles")).map_err(ctx("record store"))?;
+    let store = Arc::new(CycleStore::new(records));
+    let work_id = WorkId::from_str("job-spec-it");
+    let record = CycleRecord::new(
+        "cycle-spec",
+        work_id.clone(),
+        CycleCheckpoint::initial(&plan.admission, &authority, 0),
+    )
+    .map_err(ctx("record builds"))?;
+    store.create(&record).map_err(ctx("record persists"))?;
+
+    let provider = Scripted::new(&[
+        r#"{"kind":"advance","segments":[{"kind":"read","target":"source"}]}"#,
+        r#"{"kind":"verify","evidence_id":"cycle-spec-0:source"}"#,
+        r#"{"kind":"complete"}"#,
+    ]);
+    let routes = RoutePolicy::new(ProposerRoute {
+        model: ModelId::from("m-default"),
+        effort: None,
+        max_output_tokens: 256,
+    });
+    // One cache shared by executor (writes read texts) and proposer (shows
+    // them back, bound to the recorded digest).
+    let cache = ExplorerReadCache::new(DEFAULT_CACHE_BYTES);
+    let proposer = ModelCycleProposer::new(Arc::clone(&provider) as Arc<dyn ModelProvider>, routes)
+        .with_excerpts(cache.clone());
+    let executor =
+        ExplorerCycleExecutor::new(authority.clone(), plan.targets, plan.checks).with_cache(cache);
+    let mut driver = CycleDriver::new(
+        Arc::clone(&store),
+        proposer,
+        executor,
+        Arc::new(CeilingReissuer::new(authority)),
+    );
+    let lease = LeaseToken {
+        work_id,
+        epoch: 1,
+        nonce: "nonce-1".to_owned(),
+    };
+    let outcome = driver
+        .run("cycle-spec", &lease, &plan.admission, &CancelToken::new())
+        .await
+        .map_err(ctx("driver runs"))?;
+    let CycleRunOutcome::Terminal {
+        terminal,
+        checkpoint,
+    } = outcome
+    else {
+        return Err(TestError::Missing("terminal outcome"));
+    };
+    assert_eq!(terminal, CycleTerminal::CompletionProposed);
+    assert_eq!(provider.calls(), 3);
+    let covering = checkpoint
+        .criteria_met
+        .get("marker-defined")
+        .ok_or(TestError::Missing("criterion covered"))?;
+    let evidence = checkpoint
+        .evidence
+        .get(covering)
+        .ok_or(TestError::Missing("covering evidence"))?;
+    assert_eq!(evidence.trust, EvidenceTrust::Verified);
+    assert_eq!(evidence.source, EvidenceSourceKind::Verification);
+    let stored = store.load("cycle-spec").map_err(ctx("reload"))?;
+    assert_eq!(
+        stored.status().terminal,
+        Some(CycleTerminal::CompletionProposed)
+    );
+    assert_eq!(stored.checkpoint.fence.epoch, 1);
+
+    // Turn 1 precedes any read: it carries the objective but no excerpt.
+    let turn1 = provider
+        .prompt(0)
+        .ok_or(TestError::Missing("request of turn 1"))?;
+    assert!(
+        turn1.contains("OBJECTIVE (data): does the first file define its marker?"),
+        "{turn1}"
+    );
+    assert!(!turn1.contains("EXCERPT"), "{turn1}");
+
+    // The prompt of the turn after the first read names the evidence, shows
+    // the objective and the file content as a digest-bound excerpt block
+    // line, and still never shows the digest itself.
+    let turn2 = provider
+        .prompt(1)
+        .ok_or(TestError::Missing("request of turn 2"))?;
+    assert!(turn2.contains("cycle-spec-0:source"), "{turn2}");
+    assert!(turn2.contains("locator=src/one.rs"), "{turn2}");
+    assert!(
+        turn2.contains("OBJECTIVE (data): does the first file define its marker?"),
+        "{turn2}"
+    );
+    assert!(
+        turn2.contains("EXCERPT cycle-spec-0:source (data, same digest as recorded):"),
+        "{turn2}"
+    );
+    assert!(
+        turn2.contains("| pub fn first_file_body_marker() {}"),
+        "{turn2}"
+    );
+    let digest = ContentDigest::of(FILE_ONE);
+    assert!(
+        !turn2.contains(&digest.to_string()),
+        "digest leaked into the prompt"
+    );
+    assert!(
+        !turn2.contains(&format!("{digest:?}")),
+        "debug digest leaked into the prompt"
+    );
     Ok(())
 }

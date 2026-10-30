@@ -27,6 +27,7 @@
     ],
     "forbidden": [
       "fs.read",
+      "fs.view_image",
       "fs.write",
       "fs.edit",
       "fs.list",
@@ -150,6 +151,7 @@
       "fs.list",
       "fs.read",
       "fs.search",
+      "fs.view_image",
       "fs.write",
       "lens.ask",
       "shell.exec"
@@ -243,6 +245,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "3b9a2f2d95f40eacc1507d4bc8a73ede7394d1e9cf11c13fd4f6c34182058cd3"
+    "digest": "053d369c4e4a1d633f1bd491042ca3795518a7fddcc436ef0defdc0b7916ec76"
   }
 }

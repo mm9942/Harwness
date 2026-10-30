@@ -472,10 +472,12 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
 ///   oder Config-Discovery fehlgeschlagen.
 /// - [`OpError::NotAvailable`]: weder ein Config-Dienst noch ein gebundener
 ///   Root-Space im Kontext.
-/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, oder der aufgelöste
-///   Zielprovider ist unbekannt/deaktiviert/ohne Zugangsdaten
+/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, der aufgelöste
+///   Zielprovider ist unbekannt/deaktiviert/ohne Zugangsdaten, oder das Modell
+///   ist laut Provider-Lebenszyklus abgeschaltet (retired)
 ///   ([`crate::provider::handle_switch_core`] validiert dies vollständig,
-///   bevor irgendetwas mutiert wird).
+///   bevor irgendetwas mutiert oder persistiert wird). Ein abgekündigtes
+///   (deprecated) Modell wechselt normal und trägt die Warnung im Antworttext.
 ///
 /// # Spec
 /// harwness Plan v2 — Task C; `/uia-model`-Folgeauftrag (UIA-spezifische gepinnte Auswahl);
@@ -533,8 +535,9 @@ fn handle_switch_core(
 /// - [`OpError::Execution`]: Katalog leer oder Config-Discovery fehlgeschlagen.
 /// - [`OpError::NotAvailable`]: weder ein Config-Dienst noch ein gebundener
 ///   Root-Space im Kontext.
-/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, oder der aufgelöste
-///   Zielprovider ist unbekannt/deaktiviert/ohne Zugangsdaten (siehe
+/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, der aufgelöste
+///   Zielprovider ist unbekannt/deaktiviert/ohne Zugangsdaten, oder das Modell
+///   ist laut Provider-Lebenszyklus abgeschaltet (siehe
 ///   [`crate::provider::handle_uia_switch_core`]).
 ///
 /// # Spec
@@ -768,8 +771,11 @@ async fn uia_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError
 ///   konfigurierte Modellkatalog ist leer.
 /// - [`OpError::NotAvailable`]: weder ein Config-Dienst noch ein gebundener
 ///   Root-Space im Kontext.
-/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID. Seit Runde 5,
-///   Teil G nicht mehr: ein Modell eines anderen Providers als der UIA.
+/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, oder das Modell ist
+///   laut Provider-Lebenszyklus abgeschaltet (vor der Persistenz geprüft, mit
+///   Ersatzhinweis; ein abgekündigtes Modell hängt eine Warnung an die
+///   Bestätigung). Seit Runde 5, Teil G nicht mehr: ein Modell eines anderen
+///   Providers als der UIA.
 ///
 /// # Spec
 /// harwness Plan v2 — Welle 2 (2d), Teil 2 — `/uia-worker-model`.
@@ -797,16 +803,32 @@ fn handle_uia_worker_model_switch(
         .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {target}")))?;
 
     let configured_id = configured.id.clone();
+    // Lebenszyklus der ausdrücklichen Wahl vor jeder Persistenz: ein
+    // abgeschaltetes Modell wird abgelehnt (Profil-Config bleibt unverändert),
+    // ein abgekündigtes nur mit Warnung gespeichert. Geprüft wird gegen den
+    // kanonischen Provider, dem das Modell im Katalog gehört.
+    let provider = crate::models::canonical_provider_name(&config, &configured.provider);
+    let lifecycle_warning = crate::live_model::enforce_lifecycle(&provider, &configured_id)?;
     let mut text = format!("UIA worker model set to {configured_id}");
-    match persist(Some(configured_id.as_str())) {
+    if let Some(warning) = &lifecycle_warning {
+        text.push_str("\nWarnung: ");
+        text.push_str(warning);
+    }
+    let note = persist(Some(configured_id.as_str()));
+    match note.as_deref() {
         Some(note) => {
             text.push('\n');
-            text.push_str(&note);
+            text.push_str(note);
         }
         None => text.push_str("\n(gespeichert für die nächste Sitzung)"),
     }
 
-    Ok(OpOutput::from(text))
+    Ok(OpOutput {
+        text,
+        data: Some(
+            serde_json::json!({"ui_feedback": {"kind":"model_selection", "target":"uia-worker", "provider":provider, "model":configured_id, "effective":"next_session", "warning":lifecycle_warning, "note":note}}),
+        ),
+    })
 }
 
 /// Formatiert das `/uia-worker-model show`-Sub-Kommando: zeigt das für
@@ -1788,6 +1810,316 @@ mod tests {
     /// Kurzform für `map_err` auf [`OpError`] in diesen Tests.
     fn ctx_err(context: &'static str) -> impl FnOnce(OpError) -> TestError {
         move |error| TestError::Unexpected(format!("{context}: {error:?}"))
+    }
+
+    // ── Provider-Lebenszyklus: abgeschaltete und abgekündigte Modelle ─────────
+
+    /// Ein in der eingebetteten Lebenszyklus-Tabelle abgeschaltetes Angebot
+    /// (Mistral OCR 4.0, retired 2026-09-30 — für die echte Uhr sicher in der
+    /// Vergangenheit; Ersatz `mistral-ocr-4-1`).
+    const RETIRED_PROVIDER: &str = "mistral";
+    const RETIRED_MODEL: &str = "mistral-ocr-4-0";
+
+    /// Ein abgekündigtes Angebot ohne angekündigtes Retirement (Claude Mythos
+    /// Preview; Ersatz `claude-mythos-5`) — bleibt für die echte Uhr wählbar.
+    const DEPRECATED_PROVIDER: &str = "anthropic";
+    const DEPRECATED_MODEL: &str = "claude-mythos-preview";
+
+    /// [`two_provider_config`] plus je ein vollständig konfigurierter Provider
+    /// mit seinem Katalogmodell für das abgeschaltete und das abgekündigte
+    /// Angebot (Zugangsdaten und Katalogeintrag von `provider-a`/`model-a`
+    /// abgeleitet).
+    fn lifecycle_config() -> TestResult<harw_config::ResolvedConfig> {
+        let mut config = two_provider_config();
+        let template_provider = config
+            .providers
+            .get("provider-a")
+            .cloned()
+            .ok_or(TestError::Missing("provider-a in the test fixture"))?;
+        let template_model = config
+            .models
+            .get("model-a")
+            .cloned()
+            .ok_or(TestError::Missing("model-a in the test fixture"))?;
+        for (provider, model) in [
+            (RETIRED_PROVIDER, RETIRED_MODEL),
+            (DEPRECATED_PROVIDER, DEPRECATED_MODEL),
+        ] {
+            let mut offering_provider = template_provider.clone();
+            offering_provider.name = provider.to_owned();
+            offering_provider.models = vec![model.to_owned()];
+            config
+                .providers
+                .insert(provider.to_owned(), offering_provider);
+            let mut offering_model = template_model.clone();
+            offering_model.id = model.to_owned();
+            offering_model.provider = provider.to_owned();
+            config.models.insert(model.to_owned(), offering_model);
+        }
+        Ok(config)
+    }
+
+    /// Profil-Config, die ein abgelehnter Wechsel byte-gleich lassen muss.
+    const SEEDED_PROFILE: &str = "default_provider = \"provider-a\"\ndefault_model = \"model-a\"\n";
+
+    /// Legt `<root>/profiles/default/config.toml` mit [`SEEDED_PROFILE`] an und
+    /// liefert den Pfad.
+    fn seed_profile_config(root: &std::path::Path) -> TestResult<std::path::PathBuf> {
+        let profile_dir = root.join("profiles").join("default");
+        std::fs::create_dir_all(&profile_dir).map_err(ctx("create profile dir"))?;
+        let config_path = profile_dir.join("config.toml");
+        std::fs::write(&config_path, SEEDED_PROFILE).map_err(ctx("seed profile config"))?;
+        Ok(config_path)
+    }
+
+    /// Seed für die Lifecycle-Tests: Controller auf `provider-a`/`model-a`.
+    fn seeded_controller() -> TestResult<Arc<NullSessionController>> {
+        let ctrl = Arc::new(NullSessionController::new());
+        ctrl.set_active_provider("provider-a".to_owned())
+            .map_err(ctx("seed active provider"))?;
+        ctrl.set_active_model("model-a".to_owned())
+            .map_err(ctx("seed active model"))?;
+        Ok(ctrl)
+    }
+
+    /// `/model switch <retired>` Ende zu Ende über die echte Operation: sie
+    /// lehnt mit `InvalidArguments` samt Ersatzhinweis ab, **bevor** der
+    /// Provider-Client gebaut, der Controller mutiert oder die Profil-Config
+    /// des gebundenen Root-Space angefasst wird — Controller-Snapshot und
+    /// Config-Datei bleiben unverändert.
+    #[tokio::test]
+    async fn model_switch_to_a_retired_model_changes_nothing() -> TestResult {
+        let ctrl = seeded_controller()?;
+
+        // Bestehende Standardwahl im Profil: muss byte-gleich bleiben.
+        let root = tempfile::tempdir().map_err(ctx("create root space"))?;
+        let config_path = seed_profile_config(root.path())?;
+        let home = crate::config_util::test_home_context(root.path())?;
+
+        let live = Arc::new(RecordingLiveControl {
+            failing: None,
+            checked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (base, _tmp) = make_test_ctx(None, None)?;
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(&ctrl) as SharedSessionController);
+        services.insert(Arc::new(lifecycle_config()?));
+        services.insert(home);
+        services.insert(Arc::clone(&live) as crate::live_model::SharedLiveModelControl);
+        let op_ctx = OpContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            base.sandbox().clone(),
+            services,
+        );
+
+        let before = ctrl.snapshot();
+        let args = ModelArgs {
+            action: Some("switch".to_owned()),
+            target: Some(RETIRED_MODEL.to_owned()),
+            value: None,
+        };
+        match super::model(&op_ctx, args).await {
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("retired"), "{message}");
+                assert!(message.contains(RETIRED_MODEL), "{message}");
+                assert!(message.contains("mistral-ocr-4-1"), "{message}");
+                assert!(message.contains("previous model stays active"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments for a retired model, got: {other:?}"
+                )));
+            }
+        }
+
+        assert_eq!(
+            ctrl.snapshot(),
+            before,
+            "a refused switch must not mutate the controller"
+        );
+        assert_eq!(
+            live.checked.lock().map(|checked| checked.clone()).ok(),
+            Some(Vec::new()),
+            "the lifecycle check must run before the provider client is rebuilt"
+        );
+        let persisted =
+            std::fs::read_to_string(&config_path).map_err(ctx("read the bound profile config"))?;
+        assert_eq!(
+            persisted, SEEDED_PROFILE,
+            "a refused switch must not touch the persisted default"
+        );
+        Ok(())
+    }
+
+    /// `/uia-worker-model switch <retired>` über die echte Operation: abgelehnt,
+    /// bevor `uia_worker_model` in die Profil-Config des gebundenen Root-Space
+    /// geschrieben wird — Controller und Datei bleiben unverändert.
+    #[tokio::test]
+    async fn uia_worker_model_switch_to_a_retired_model_changes_nothing() -> TestResult {
+        let ctrl = seeded_controller()?;
+        let root = tempfile::tempdir().map_err(ctx("create root space"))?;
+        let config_path = seed_profile_config(root.path())?;
+        let home = crate::config_util::test_home_context(root.path())?;
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (op_ctx, _tmp) = make_test_ctx_in(
+            Some(shared),
+            Some(Arc::new(lifecycle_config()?)),
+            Some(home),
+        )?;
+
+        let before = ctrl.snapshot();
+        let args = ModelArgs {
+            action: Some("switch".to_owned()),
+            target: Some(RETIRED_MODEL.to_owned()),
+            value: None,
+        };
+        match super::uia_worker_model(&op_ctx, args).await {
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("retired"), "{message}");
+                assert!(message.contains("mistral-ocr-4-1"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments for a retired UIA worker model, got: {other:?}"
+                )));
+            }
+        }
+
+        assert_eq!(
+            ctrl.snapshot(),
+            before,
+            "a refused switch must not mutate the controller"
+        );
+        let persisted =
+            std::fs::read_to_string(&config_path).map_err(ctx("read the bound profile config"))?;
+        assert_eq!(
+            persisted, SEEDED_PROFILE,
+            "a refused switch must not touch the persisted profile"
+        );
+        Ok(())
+    }
+
+    /// Ein abgekündigtes Modell wird als UIA-Worker-Modell gespeichert; die
+    /// Bestätigung trägt die Warnung samt Ersatzhinweis.
+    #[test]
+    fn uia_worker_model_switch_to_a_deprecated_model_persists_with_a_warning() -> TestResult {
+        let ctrl = seeded_controller()?;
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (op_ctx, _tmp) = make_test_ctx(Some(shared), Some(Arc::new(lifecycle_config()?)))?;
+
+        let mut persisted_with = None;
+        let output =
+            super::handle_uia_worker_model_switch(&op_ctx, DEPRECATED_MODEL.to_owned(), |model| {
+                persisted_with = Some(model.map(str::to_owned));
+                None
+            })
+            .map_err(ctx_err("a deprecated model must stay selectable"))?;
+
+        assert!(output.text.contains("Warnung"), "{}", output.text);
+        assert!(output.text.contains("claude-mythos-5"), "{}", output.text);
+        assert_eq!(persisted_with, Some(Some(DEPRECATED_MODEL.to_owned())));
+        Ok(())
+    }
+
+    /// UIA-Achse: `/uia-model switch <retired>` wird vor jeder Mutation und
+    /// Persistenz abgelehnt, die UIA-Auswahl bleibt unverändert.
+    #[test]
+    fn uia_model_switch_to_a_retired_model_changes_nothing() -> TestResult {
+        let ctrl = Arc::new(NullSessionController::new());
+        ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
+            Some("provider-a".to_owned()),
+            Some("model-a".to_owned()),
+        ))
+        .map_err(ctx("seed UIA selection"))?;
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (op_ctx, _tmp) = make_test_ctx(Some(shared), Some(Arc::new(lifecycle_config()?)))?;
+
+        let before = ctrl.snapshot();
+        let mut persisted = false;
+        let result = crate::provider::handle_uia_switch_core(
+            &op_ctx,
+            RETIRED_PROVIDER.to_owned(),
+            Some(RETIRED_MODEL.to_owned()),
+            |_, _| {
+                persisted = true;
+                None
+            },
+        );
+        match result {
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("retired"), "{message}");
+                assert!(message.contains("mistral-ocr-4-1"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments for a retired UIA model, got: {other:?}"
+                )));
+            }
+        }
+        assert!(!persisted, "a refused switch must not be persisted");
+        assert_eq!(
+            ctrl.snapshot(),
+            before,
+            "a refused UIA switch must not mutate the controller"
+        );
+        Ok(())
+    }
+
+    /// Ein abgekündigtes (deprecated) Modell wechselt normal: der Controller
+    /// übernimmt Provider und Modell, die Auswahl wird persistiert und die
+    /// Bestätigung trägt die Warnung samt Ersatzhinweis.
+    #[test]
+    fn model_switch_to_a_deprecated_model_succeeds_with_a_warning() -> TestResult {
+        let ctrl = seeded_controller()?;
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (op_ctx, _tmp) = make_test_ctx(Some(shared), Some(Arc::new(lifecycle_config()?)))?;
+
+        let mut persisted_with = None;
+        let output =
+            super::handle_switch_core(&op_ctx, DEPRECATED_MODEL.to_owned(), |provider, model| {
+                persisted_with = Some((provider.map(str::to_owned), model.map(str::to_owned)));
+                None
+            })
+            .map_err(ctx_err("a deprecated model must stay selectable"))?;
+
+        assert!(output.text.contains("Warnung"), "{}", output.text);
+        assert!(output.text.contains("abgekündigt"), "{}", output.text);
+        assert!(output.text.contains("claude-mythos-5"), "{}", output.text);
+        let snap = ctrl.snapshot();
+        assert_eq!(snap.active_provider.as_deref(), Some(DEPRECATED_PROVIDER));
+        assert_eq!(snap.active_model.as_deref(), Some(DEPRECATED_MODEL));
+        assert_eq!(
+            persisted_with,
+            Some((
+                Some(DEPRECATED_PROVIDER.to_owned()),
+                Some(DEPRECATED_MODEL.to_owned())
+            ))
+        );
+        Ok(())
+    }
+
+    /// UIA-Achse des abgekündigten Modells: Wechsel gelingt, Warnung im Text.
+    #[test]
+    fn uia_model_switch_to_a_deprecated_model_succeeds_with_a_warning() -> TestResult {
+        let ctrl = Arc::new(NullSessionController::new());
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (op_ctx, _tmp) = make_test_ctx(Some(shared), Some(Arc::new(lifecycle_config()?)))?;
+
+        let output = crate::provider::handle_uia_switch_core(
+            &op_ctx,
+            DEPRECATED_PROVIDER.to_owned(),
+            Some(DEPRECATED_MODEL.to_owned()),
+            |_, _| None,
+        )
+        .map_err(ctx_err("a deprecated UIA model must stay selectable"))?;
+
+        assert!(output.text.contains("Warnung"), "{}", output.text);
+        assert!(output.text.contains("claude-mythos-5"), "{}", output.text);
+        let after = ctrl.uia_selection();
+        assert_eq!(after.provider.as_deref(), Some(DEPRECATED_PROVIDER));
+        assert_eq!(after.model.as_deref(), Some(DEPRECATED_MODEL));
+        Ok(())
     }
 
     // ── Welle 2 (2d), Teil 2: `/uia-worker-model` ──────────────────────────────

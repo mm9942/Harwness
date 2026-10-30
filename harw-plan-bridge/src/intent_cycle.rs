@@ -146,6 +146,10 @@ impl CycleLimits {
 /// from the effective IR, role matrix and authority context. This type never
 /// encodes a permission grant itself, and it is intentionally not
 /// `Deserialize`, so neither a checkpoint nor model output can construct one.
+///
+/// The optional owner objective ([`CycleAdmission::with_objective`]) is prompt
+/// data only: it is never persisted in the [`AdmissionCeiling`] and is never
+/// an authority input, so it cannot widen anything.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CycleAdmission {
     intent: IntentBinding,
@@ -154,6 +158,33 @@ pub struct CycleAdmission {
     allowed_write_targets: BTreeSet<String>,
     allowed_children: BTreeSet<String>,
     allowed_recipes: BTreeSet<String>,
+    objective: String,
+}
+
+/// Upper bound (characters) of the objective text shown to the model.
+pub const MAX_OBJECTIVE_PROMPT_CHARS: usize = 1_200;
+
+/// Collapses whitespace runs to one space, removes control characters and
+/// caps the result at `max_chars` characters on a char boundary, marking a
+/// cut with a trailing `…`.
+fn sanitize_objective(raw: &str, max_chars: usize) -> String {
+    // Control characters that are not whitespace are dropped *before* the
+    // whitespace collapse, so `a <BEL> b` does not leave a double space.
+    let stripped: String = raw
+        .chars()
+        .filter(|c| c.is_whitespace() || !c.is_control())
+        .collect();
+    let clean = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    if max_chars == 0 {
+        return String::new();
+    }
+    if clean.chars().count() <= max_chars {
+        return clean;
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut capped: String = clean.chars().take(keep).collect();
+    capped.push('…');
+    capped
 }
 
 /// Trusted inputs for [`CycleAdmission::new`].
@@ -217,7 +248,25 @@ impl CycleAdmission {
             allowed_write_targets: targets.write,
             allowed_children: targets.children,
             allowed_recipes: targets.recipes,
+            objective: String::new(),
         })
+    }
+
+    /// Sets the owner's objective as sanitized prompt data: whitespace runs
+    /// collapsed to one space, control characters removed, capped at
+    /// [`MAX_OBJECTIVE_PROMPT_CHARS`] characters (char boundary, with a
+    /// trailing `…`). The objective never enters the ceiling and never
+    /// authorizes anything.
+    #[must_use]
+    pub fn with_objective(mut self, objective: &str) -> Self {
+        self.objective = sanitize_objective(objective, MAX_OBJECTIVE_PROMPT_CHARS);
+        self
+    }
+
+    /// The sanitized objective text (empty when none was set).
+    #[must_use]
+    pub fn objective(&self) -> &str {
+        &self.objective
     }
 
     #[must_use]
@@ -623,10 +672,10 @@ pub fn admit_cycle(
                 return Err(CycleRefusal::InvalidJoin);
             }
             check_segments(policy, state, branches)?;
-            if let JoinPolicy::Quorum { required } = join {
-                if *required == 0 || usize::from(*required) > branches.len() {
-                    return Err(CycleRefusal::InvalidJoin);
-                }
+            if let JoinPolicy::Quorum { required } = join
+                && (*required == 0 || usize::from(*required) > branches.len())
+            {
+                return Err(CycleRefusal::InvalidJoin);
             }
         }
         CycleProposal::Reorient {
@@ -1108,6 +1157,7 @@ pub fn resume_admission(
         ),
         allowed_children: keep(&ceiling.children, &current.allowed_children, None),
         allowed_recipes: keep(&ceiling.recipes, &current.allowed_recipes, None),
+        objective: current.objective.clone(),
     };
     let mut resumed = checkpoint.clone();
     resumed.authority = reissued.snapshot();
@@ -1121,7 +1171,8 @@ mod tests {
     use std::path::PathBuf;
 
     use harw_authority::{
-        PermissionSet, SandboxSpec, WorkspaceBinding, WorkspaceRegistration, WorkspaceRegistry,
+        NetworkScope, PermissionSet, SandboxSpec, WorkspaceBinding, WorkspaceRegistration,
+        WorkspaceRegistry,
     };
     use harw_types::{TenantId, WorkspaceId};
 
@@ -1970,6 +2021,79 @@ mod tests {
             resume_admission(&checkpoint, &policy, elsewhere.authority(), 2).map(|_| ()),
             Err(ResumeRefusal::WorkspaceMismatch)
         );
+        Ok(())
+    }
+
+    fn authority_with_hosts(
+        permissions: &[Permission],
+        hosts: &[&str],
+    ) -> TestResult<AuthorityContext> {
+        Ok(SandboxSpec::from_resolved_with_network(
+            binding("cycle-tests")?,
+            PermissionSet::from_policy(permissions.iter().copied()),
+            NetworkScope::from_hosts(hosts.iter().map(|host| (*host).to_owned())),
+        )
+        .authority()
+        .clone())
+    }
+
+    #[test]
+    fn objective_is_sanitized_and_capped() -> TestResult {
+        let policy = CycleAdmission::new(intent(), limits(), targets())
+            .map_err(|_| TestError::Missing("admission builds"))?;
+        assert_eq!(policy.objective(), "");
+        let cleaned = policy.clone().with_objective("  find\tthe\n marker\u{7}  ");
+        assert_eq!(cleaned.objective(), "find the marker");
+
+        let long = "x".repeat(2_000);
+        let capped = policy.with_objective(&long);
+        assert!(capped.objective().chars().count() <= MAX_OBJECTIVE_PROMPT_CHARS);
+        assert!(capped.objective().ends_with('…'));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_keeps_the_objective() -> TestResult {
+        let (policy, checkpoint) = fixture()?;
+        let current = policy.with_objective("goal");
+        let rights = authority(&[Permission::ReadWorkspace, Permission::WriteWorkspace])?;
+        let (resumed, _) = resume_admission(&checkpoint, &current, &rights, 2)
+            .map_err(|_| TestError::Missing("resume under unchanged authority works"))?;
+        assert_eq!(resumed.objective(), "goal");
+        // The objective is prompt data: it never reaches the persisted ceiling.
+        assert_eq!(resumed.ceiling(), current.ceiling());
+        Ok(())
+    }
+
+    #[test]
+    fn resume_refuses_widened_network_scope() -> TestResult {
+        let permissions = [Permission::ReadWorkspace];
+        let (policy, _) = fixture()?;
+        let recorded = authority_with_hosts(&permissions, &["a.example"])?;
+        let checkpoint = CycleCheckpoint::initial(&policy, &recorded, 1);
+
+        let widened = authority_with_hosts(&permissions, &["a.example", "b.example"])?;
+        assert_eq!(
+            resume_admission(&checkpoint, &policy, &widened, 2).map(|_| ()),
+            Err(ResumeRefusal::AuthorityWidened)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resume_accepts_narrowed_network_scope() -> TestResult {
+        let permissions = [Permission::ReadWorkspace];
+        let (policy, _) = fixture()?;
+        let recorded = authority_with_hosts(&permissions, &["a.example"])?;
+        let checkpoint = CycleCheckpoint::initial(&policy, &recorded, 1);
+
+        let same = authority_with_hosts(&permissions, &["a.example"])?;
+        assert!(resume_admission(&checkpoint, &policy, &same, 2).is_ok());
+
+        let none = authority_with_hosts(&permissions, &[])?;
+        let (_, resumed) = resume_admission(&checkpoint, &policy, &none, 3)
+            .map_err(|_| TestError::Missing("narrowed resume works"))?;
+        assert!(resumed.authority.request().network_scope().is_empty());
         Ok(())
     }
 }

@@ -127,6 +127,17 @@ pub enum BpfError {
     /// internen Register vorhanden.
     #[msg("bpf handle is unknown to this loader")]
     UnknownHandle,
+
+    /// The kernel rejected an incremental update of the `SCOPE_CGROUP_IDS`
+    /// map of an already attached object (for example because the map is
+    /// full).
+    ///
+    /// Content-free like every other variant. Entries applied before the
+    /// failure stay applied; a [`crate::profile::ScopeDelta`] is idempotent,
+    /// so the caller keeps its tracked scope unchanged and applies the
+    /// re-planned delta in its next rescan.
+    #[msg("bpf scope map update was rejected by the kernel")]
+    ScopeMapUpdateFailed,
 }
 
 /// Bildet einen [`BpfError`] auf die passende `SensorError`-Variante ab.
@@ -155,6 +166,9 @@ pub enum BpfError {
 ///   `SourceUnavailable` — die Quelle ist erreichbar, ihr Inhalt ist es
 ///   nicht. Die Unterscheidung entscheidet, ob ein Sentinel den Sensor
 ///   abschaltet oder nur dieses eine Ereignis verwirft.
+/// - [`BpfError::ScopeMapUpdateFailed`] → `SourceUnavailable`: the scope of
+///   an attached object can no longer be kept current; the rescan path
+///   reports it itself and never converts it into a `SensorError`.
 /// - [`BpfError::Io`] wird unverändert durchgereicht.
 ///
 /// # Arguments
@@ -181,7 +195,8 @@ impl From<BpfError> for harw_dod_cap::SensorError {
             | BpfError::UnsupportedWireVersion
             | BpfError::UnsupportedWireEvent
             | BpfError::InvalidProgramContract
-            | BpfError::AttachCapabilitiesUnavailable => Self::SourceUnavailable,
+            | BpfError::AttachCapabilitiesUnavailable
+            | BpfError::ScopeMapUpdateFailed => Self::SourceUnavailable,
             BpfError::MalformedEvent => Self::MalformedSource,
             BpfError::Io(io) => Self::Io(io),
         }
@@ -251,6 +266,15 @@ mod tests {
             BpfError::UnsupportedProgramKind.to_string(),
             "the real bpf loader does not support the SocketFilter program kind"
         );
+    }
+
+    #[test]
+    fn test_scope_map_update_failed_display_is_exact_and_content_free() {
+        assert_eq!(
+            BpfError::ScopeMapUpdateFailed.to_string(),
+            "bpf scope map update was rejected by the kernel"
+        );
+        assert!(std::error::Error::source(&BpfError::ScopeMapUpdateFailed).is_none());
     }
 
     #[test]

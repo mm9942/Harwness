@@ -26,6 +26,8 @@
 //!   `Running` → heartbeat every TTL/3 → deadline / cancel / lease loss →
 //!   finalize (`Succeeded`, `Failed`, `TimedOut`, `Cancelled`, `Lost`).
 //!   [`Coordinator::recover`] resumes after a restart.
+//!   [`Coordinator::start_existing`] dispatches an already persisted process
+//!   record through the same fenced lifecycle without allocating another id.
 //! - [`AttemptRecord`]: the per-attempt sidecar with lifecycle, recovery
 //!   identity and enforcement report.
 //! - [`RuntimeError`]: typed failures (§22).
@@ -45,6 +47,9 @@ pub mod store;
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests_lifecycle;
 
 pub use attempt::{ATTEMPT_RECORD_VERSION, ATTEMPTS_SIDECAR, AttemptRecord, attempt_id_for};
 pub use capture::{DEFAULT_OUTPUT_HEAD_BYTES, DEFAULT_OUTPUT_TAIL_BYTES, OutputCapture};

@@ -19,6 +19,14 @@
 //! Implementierungsdatei vor, schlägt der Test fehl — unabhängig davon, ob
 //! der Aufruf jemals ausgeführt würde.
 //!
+//! [`tests::test_every_implementation_file_is_scanned`] hält die Liste
+//! vollständig: es listet `src/` zur Testzeit auf und schlägt fehl, sobald
+//! eine `*.rs`-Datei außer dieser Datei und `test_support.rs` (reiner
+//! Testhelfer, nur unter `cfg(test)` gebaut) fehlt. Eine neue
+//! Implementierungsdatei — zuletzt `profile.rs` und `scope_rescan.rs`, die
+//! beide im privilegierten Laufpfad liegen (Konfiguration laden, cgroup-Walk,
+//! Map-Updates) — kann so nicht unbemerkt aus der Prüfung fallen.
+//!
 //! **Diese Datei selbst ist bewusst nicht Teil der durchsuchten Liste:** die
 //! beiden gesuchten Zeichenketten müssen hier als Zeichenkettenliterale
 //! auftauchen, damit der Test überhaupt danach suchen kann — würde diese
@@ -40,6 +48,11 @@
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use crate::test_support::{TestResult, ctx};
+
     /// Jede Implementierungsdatei dieser Crate außer dieser Testdatei selbst
     /// (siehe Moduldoku für die Begründung der Auslassung).
     const SOURCE_FILES: &[(&str, &str)] = &[
@@ -51,7 +64,14 @@ mod tests {
         ("sensors.rs", include_str!("sensors.rs")),
         ("collect.rs", include_str!("collect.rs")),
         ("sink.rs", include_str!("sink.rs")),
+        ("profile.rs", include_str!("profile.rs")),
+        ("scope_rescan.rs", include_str!("scope_rescan.rs")),
     ];
+
+    /// Files of `src/` that are deliberately not in [`SOURCE_FILES`]: this
+    /// guard itself (it must spell the forbidden identifiers) and the
+    /// `cfg(test)`-only test error helper.
+    const EXEMPT_FILES: &[&str] = &["push_only_guard.rs", "test_support.rs"];
 
     /// Die beiden Bezeichner, die zusammen einen Empfangspfad ausmachen
     /// würden: die Unix-Socket-Empfangsfunktion (`rustix::net::…`) und die
@@ -77,5 +97,34 @@ mod tests {
         // ohne irgendetwas zu prüfen — diese Absicherung hält die Liste
         // ehrlich, falls sie künftig versehentlich geleert wird.
         assert!(!SOURCE_FILES.is_empty());
+    }
+
+    /// Every `*.rs` file in `src/` except [`EXEMPT_FILES`] is scanned, and the
+    /// list names no file that does not exist, so a new implementation file
+    /// cannot silently escape [`test_no_socket_receive_path_exists_in_source`].
+    #[test]
+    fn test_every_implementation_file_is_scanned() -> TestResult {
+        let src = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut on_disk = BTreeSet::new();
+        for entry in std::fs::read_dir(src).map_err(ctx("list the crate's src directory"))? {
+            let entry = entry.map_err(ctx("read a src directory entry"))?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !EXEMPT_FILES.contains(&name.as_str()) {
+                    on_disk.insert(name);
+                }
+            }
+        }
+        let scanned: BTreeSet<String> = SOURCE_FILES
+            .iter()
+            .map(|&(name, _)| name.to_owned())
+            .collect();
+        // Beide Richtungen: keine Datei fehlt, und kein Listeneintrag ist veraltet.
+        assert_eq!(
+            on_disk, scanned,
+            "SOURCE_FILES muss jede Implementierungsdatei in src/ enthalten"
+        );
+        Ok(())
     }
 }

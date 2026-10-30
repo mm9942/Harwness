@@ -155,7 +155,8 @@ pub fn run(root: &Path, args: &DiffArgs) -> ToolOutput {
     name = "fsread.diff",
     description = "Compares two workspace text files and returns a unified diff like diff -u: -U/context (default 3), -w ignore_whitespace, -i ignore_case, -q brief. Use when you need to see how two files differ instead of running diff. Returns JSON {differ, additions, deletions, hunks, diff}; files up to 1 MiB / 20000 lines, binary files only compared for equality, diff text capped at 48 KiB.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_diff(
     context: &ToolExecutionContext,

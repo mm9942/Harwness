@@ -15,7 +15,7 @@ public API.
 | `resources` | §11 | `JobResources` becomes typed cgroup writes. `RlimitSet` is applied to the calling process. |
 | `cgroup` | §3.6, Phase 4 | The `CgroupBackend` trait and `CgroupV2Fs`, an in-house cgroupfs backend that is rooted at a delegated directory. |
 | `capabilities` | §4.2 | Drops capabilities through rustix. No second capability crate. |
-| `sandbox` | §3.5, §12 | `SandboxPolicy`, the profiles, Landlock planning and `apply_to_current_process`, which returns a `SandboxReport`. |
+| `sandbox` | §3.5, §12 | `SandboxPolicy`, the profiles, Landlock planning (also against a mount namespace's view: `PathMap`, `SandboxPolicy::mapped`, `plan_landlock_mapped`) and `apply_to_current_process`, which returns a `SandboxReport`. |
 | `filesystem` | §3.4 | `CapDir`: filesystem authority as a directory capability. |
 
 ## Features
@@ -56,6 +56,23 @@ compiles to an empty library.
     fills it in from the cgroup and rlimit steps.
 - **`NetworkRestricted`.** This profile maps to
   `NetworkPolicy::ConnectTcpPorts([80, 443])`.
+- **Landlock inside a mount namespace.** A trampoline inside Bubblewrap sees
+  bind destinations, not host paths. A `PathMap` describes that view
+  completely: binds (host path → destination, read-only or read-write) and
+  the mounts the namespace provides itself (`try_with_provided`, e.g. `/proc`,
+  `/dev`, `/tmp`). Entries must be absolute without `..`; the builder and
+  deserialization refuse anything else. `SandboxPolicy::mapped` rewrites the
+  policy to that view. Policy paths the map does not cover, and relative or
+  `..` paths, are dropped (fail-closed; `PathMap::unmapped_paths` lists
+  them). Policy entries beneath a read-only bind keep read access only and
+  lose execute except in the system exec trees (`/usr`, `/bin`, `/sbin`,
+  `/lib*`). A mount namespace cannot make that distinction; Landlock can.
+  Landlock rights are inherited, so a read-only bind nested beneath a kept
+  read-write or exec destination (a read-only `.git` inside the writable
+  workspace) still gets that ancestor's rights.
+  `PathMap::shadowed_read_only_binds` reports such binds so the launcher can
+  refuse the plan. Mapping never adds a path the policy does not name; a map
+  that binds `/` onto itself read-write yields the unmapped plan.
 - **In-house cgroup v2 backend.** It replaces Youki's `libcgroups`, which
   avoids MSRV risk and any optional BPF or C surface. Controllers that are
   not delegated are reported through `CgroupHandle::limits_enforcement`
@@ -67,7 +84,9 @@ compiles to an empty library.
   `exit 3`), `SIGTERM` through the pidfd, escalation from TERM to KILL,
   killing a grandchild through the group, `/proc` identity of the process
   itself and of PID 1, identity mismatch (PID reuse), exited identities,
-  profile mapping, building the Landlock ruleset without enforcing it, and
+  profile mapping, Landlock planning through a `PathMap` (identity map,
+  empty view, withheld and unmappable paths, invalid binds, shadowed
+  read-only binds), building the Landlock ruleset without enforcing it, and
   escape attempts against `CapDir`.
 - **cgroup tests** are `#[ignore = "needs delegated cgroup v2"]`. Run them
   with `HARW_TEST_CGROUP_ROOT=/sys/fs/cgroup/<delegated>`, for example

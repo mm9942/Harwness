@@ -71,17 +71,20 @@ pub trait ProviderInvoker: Send + Sync + 'static {
     fn invoke(&self, request: InvocationRequest) -> ProviderResult<InvocationResponse>;
 }
 
-/// Ruft den Primary der Registry über den Invoker auf.
+/// Ruft den in `request.provider` benannten Provider der Registry über den Invoker
+/// auf. Ein unbekannter Provider wird abgelehnt. Der Funktionsname bleibt aus
+/// Gründen der API-Kompatibilität erhalten.
 pub fn invoke_primary<I: ProviderInvoker>(
     registry: &impl ProviderRegistry,
     invoker: &I,
     request: InvocationRequest,
 ) -> ProviderResult<InvocationResponse> {
-    let primary = registry
-        .primary()
-        .ok_or(ProviderError::PrimaryProviderMissing)?;
-    let req = request.retarget(primary.name.clone());
-    invoker.invoke(req)
+    registry
+        .by_name(&request.provider)
+        .ok_or_else(|| ProviderError::ProviderNotRegistered {
+            name: request.provider.clone(),
+        })?;
+    invoker.invoke(request)
 }
 
 /// Läuft die Fallback-Kette durch und sammelt jeden Fehlversuch (Note 11 §7).

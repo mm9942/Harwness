@@ -611,6 +611,14 @@ fn handle_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
 ///      [`OpError::InvalidArguments`] with a message asking the operator to
 ///      use `/model switch` first. **Never silently falls back to another
 ///      model.**
+///
+///    An explicit `model` additionally passes the provider lifecycle
+///    ([`crate::live_model::enforce_lifecycle`]) **before** anything is
+///    mutated or persisted: a retired model is rejected with
+///    [`OpError::InvalidArguments`] (naming the suggested replacement) and
+///    leaves controller, root session, child route and the persisted default
+///    untouched; a deprecated model switches normally and the warning is
+///    appended to the confirmation text.
 /// 4. Only when all checks pass, calls `controller.set_active_provider(id)`
 ///    and, if a model argument was given, `controller.set_active_model(id)`.
 /// 5. Best-effort persists the resulting active provider/model as the
@@ -647,7 +655,7 @@ fn handle_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
 /// - [`OpError::Execution`]: controller not in context, or controller mutation failed.
 /// - [`OpError::NotAvailable`]: no configuration resolvable (see [`resolved_config`]).
 /// - [`OpError::InvalidArguments`]: unknown provider, missing credentials, unknown
-///   model, or provider/model incompatibility.
+///   model, provider/model incompatibility, or a retired model (lifecycle).
 ///
 /// # Spec Reference
 /// harwness Plan v2 — Task C; `/uia-provider` follow-up (UIA-specific pinned selection);
@@ -692,6 +700,7 @@ pub(crate) fn handle_switch_core(
     // An explicit model argument is validated against the catalog directly;
     // otherwise the *current* active model (if any) must already be
     // compatible with the target provider.
+    let mut lifecycle_warning: Option<String> = None;
     let resolved_model: Option<String> = match &model {
         Some(requested_model) => {
             let configured =
@@ -707,30 +716,35 @@ pub(crate) fn handle_switch_core(
                      (model belongs to provider '{model_provider}')"
                 )));
             }
+            // Lifecycle of the explicit choice: a retired offering is refused
+            // here, before the provider client is rebuilt, the controller is
+            // mutated or anything is persisted. A deprecated one only warns.
+            lifecycle_warning =
+                crate::live_model::enforce_lifecycle(&canonical_target, &configured.id)?;
             Some(configured.id.clone())
         }
         None => {
             let snap = controller.snapshot();
-            if let Some(ref active_model) = snap.active_model {
-                if let Some(model) = config.models.values().find(|model| {
+            if let Some(ref active_model) = snap.active_model
+                && let Some(model) = config.models.values().find(|model| {
                     model.id == *active_model
                         || model.aliases.iter().any(|alias| alias == active_model)
-                }) {
-                    let model_provider = configured_provider(&config, &model.provider)
-                        .map(|(canonical, _)| canonical)
-                        .unwrap_or(model.provider.as_str());
-                    if model_provider != canonical_target {
-                        return Err(OpError::InvalidArguments(format!(
-                            "active model '{active_model}' is not available on provider '{canonical_target}' \
+                })
+            {
+                let model_provider = configured_provider(&config, &model.provider)
+                    .map(|(canonical, _)| canonical)
+                    .unwrap_or(model.provider.as_str());
+                if model_provider != canonical_target {
+                    return Err(OpError::InvalidArguments(format!(
+                        "active model '{active_model}' is not available on provider '{canonical_target}' \
                              (model belongs to provider '{model_provider}'); \
                              use `/model switch` first or accept a provider-appropriate model."
-                        )));
-                    }
+                    )));
                 }
-                // An unknown active model is outside this operation's authority. Its runtime
-                // executor remains responsible for rejecting it; provider selection stays
-                // constrained to the configured provider catalog above.
             }
+            // An unknown active model is outside this operation's authority. Its runtime
+            // executor remains responsible for rejecting it; provider selection stays
+            // constrained to the configured provider catalog above.
             None
         }
     };
@@ -740,6 +754,8 @@ pub(crate) fn handle_switch_core(
     // credential was only resolvable later) is rebuilt now; if that still
     // fails, the switch is rejected and the previous model stays active.
     crate::live_model::ensure_provider_ready(ctx, &canonical_target)?;
+
+    let before = controller.snapshot();
 
     // ── Step 4: mutate the controller ─────────────────────────────────────────
     controller
@@ -763,18 +779,28 @@ pub(crate) fn handle_switch_core(
         ),
         None => format!("provider switched to {canonical_target}; next turn will use it"),
     };
-    match persist(
+    if let Some(warning) = &lifecycle_warning {
+        text.push_str("\nWarnung: ");
+        text.push_str(warning);
+    }
+    let note = persist(
         Some(canonical_target.as_str()),
         snap_after.active_model.as_deref(),
-    ) {
+    );
+    match note.as_deref() {
         Some(note) => {
             text.push('\n');
-            text.push_str(&note);
+            text.push_str(note);
         }
         None => text.push_str("\n(als Standard für künftige Sitzungen gespeichert)"),
     }
 
-    Ok(OpOutput::from(text))
+    Ok(OpOutput {
+        text,
+        data: Some(
+            serde_json::json!({"ui_feedback": {"kind":"model_selection", "target":"session", "changed":before.active_provider != snap_after.active_provider || before.active_model != snap_after.active_model, "provider":canonical_target, "model":snap_after.active_model, "effective":"next_turn", "warning":lifecycle_warning, "note":note}}),
+        ),
+    })
 }
 
 /// Wechselt ausschließlich die UIA-Auswahl.
@@ -800,7 +826,12 @@ pub(crate) fn handle_switch_core(
 /// - [`OpError::NotAvailable`]: keine Config auflösbar (siehe [`resolved_config`]).
 /// - [`OpError::Execution`]: Controller fehlt oder Mutation schlug fehl.
 /// - [`OpError::InvalidArguments`]: unbekannter oder deaktivierter Provider,
-///   fehlende Zugangsdaten, unbekanntes oder inkompatibles Modell.
+///   fehlende Zugangsdaten, unbekanntes oder inkompatibles Modell, oder ein
+///   abgeschaltetes (retired) Modell. Der Lebenszyklus einer ausdrücklich
+///   genannten Modell-Wahl wird wie beim generischen Wechsel
+///   ([`crate::live_model::enforce_lifecycle`]) vor jeder Mutation und
+///   Persistenz geprüft; ein abgekündigtes Modell hängt eine Warnung an die
+///   Bestätigung.
 pub(crate) fn handle_uia_switch_core(
     ctx: &OpContext,
     target: String,
@@ -835,6 +866,7 @@ pub(crate) fn handle_uia_switch_core(
     let current = crate::model::effective_uia_selection(Some(controller), &config);
 
     let mut cleared_incompatible_model = None;
+    let mut lifecycle_warning: Option<String> = None;
     let resolved_model = match model {
         Some(requested_model) => {
             let configured =
@@ -851,6 +883,10 @@ pub(crate) fn handle_uia_switch_core(
                      use `/uia-model switch <id>` for a compatible UIA model"
                 )));
             }
+            // Wie beim generischen Wechsel: ein abgeschaltetes Modell wird vor
+            // jeder Mutation abgelehnt, ein abgekündigtes nur mit Warnung.
+            lifecycle_warning =
+                crate::live_model::enforce_lifecycle(&canonical_target, &configured.id)?;
             Some(configured.id.clone())
         }
         None => match current.model() {
@@ -889,7 +925,7 @@ pub(crate) fn handle_uia_switch_core(
             "UIA provider switched to {canonical_target}; UIA model is {model_id}; \
              next UIA turn will use it"
         ),
-        None => match cleared_incompatible_model {
+        None => match &cleared_incompatible_model {
             Some(previous_model) => format!(
                 "UIA provider switched to {canonical_target}; incompatible UIA model \
                  {previous_model} was cleared; use `/uia-model list` to choose a compatible model"
@@ -900,15 +936,25 @@ pub(crate) fn handle_uia_switch_core(
             ),
         },
     };
-    match persist(selection.provider.as_deref(), selection.model.as_deref()) {
+    if let Some(warning) = &lifecycle_warning {
+        text.push_str("\nWarnung: ");
+        text.push_str(warning);
+    }
+    let note = persist(selection.provider.as_deref(), selection.model.as_deref());
+    match note.as_deref() {
         Some(note) => {
             text.push('\n');
-            text.push_str(&note);
+            text.push_str(note);
         }
         None => text.push_str("\n(UIA-Auswahl für künftige Sitzungen gespeichert)"),
     }
 
-    Ok(OpOutput::from(text))
+    Ok(OpOutput {
+        text,
+        data: Some(
+            serde_json::json!({"ui_feedback": {"kind":"model_selection", "target":"uia", "changed":current != selection, "provider":canonical_target, "model":resolved_model, "cleared_model":cleared_incompatible_model, "effective":"next_uia_turn", "warning":lifecycle_warning, "note":note}}),
+        ),
+    })
 }
 
 /// Beschreibt die konfigurierte Auth-Methode eines Providers — nur den

@@ -91,6 +91,7 @@ use crate::plan_toml::ToolsSection;
 use crate::research_toml::ResearchSection;
 use crate::retention_toml::RetentionSection;
 use crate::scope::{PERMISSIONS_DEFAULT_MODE_ORDER, POLICY_VISIBILITY_SCOPE_ORDER};
+use crate::skills_toml::SkillsSection;
 use crate::uia_worker_models::UiaWorkerModelsToml;
 
 /// Grober Vertrauens-/Ebenen-Kontext eines `merge_layer_into`-Aufrufs;
@@ -853,6 +854,15 @@ fn merge_top_level(
     let present = |field: &str| field_present(raw, &[field]);
 
     profile_replaces(
+        &mut trusted.single_agent_mode,
+        incoming.single_agent_mode,
+        present("single_agent_mode"),
+        role,
+        "single_agent_mode",
+        layer_path,
+    );
+
+    profile_replaces(
         &mut trusted.workspace_root,
         incoming.workspace_root.clone(),
         present("workspace_root"),
@@ -957,6 +967,14 @@ fn merge_tui(
 ) {
     let present = |field: &str| field_present(raw, &["tui", field]);
     profile_replaces(
+        &mut trusted.tui.language,
+        incoming.language,
+        present("language"),
+        role,
+        "tui.language",
+        layer_path,
+    );
+    profile_replaces(
         &mut trusted.tui.theme,
         incoming.theme,
         present("theme"),
@@ -979,6 +997,33 @@ fn merge_tui(
         present("child_stream"),
         role,
         "tui.child_stream",
+        layer_path,
+    );
+    // h7: `[tui] status_expiry` (rein darstellend, `ProfileReplaces`).
+    profile_replaces(
+        &mut trusted.tui.status_expiry,
+        incoming.status_expiry,
+        present("status_expiry"),
+        role,
+        "tui.status_expiry",
+        layer_path,
+    );
+    // h9: `[tui] goal_mode` (rein darstellende Zielansicht, `ProfileReplaces`).
+    profile_replaces(
+        &mut trusted.tui.goal_mode,
+        incoming.goal_mode,
+        present("goal_mode"),
+        role,
+        "tui.goal_mode",
+        layer_path,
+    );
+    // PL-97 R1: `[tui] reasoning` (rein darstellend, `ProfileReplaces`).
+    profile_replaces(
+        &mut trusted.tui.reasoning,
+        incoming.reasoning,
+        present("reasoning"),
+        role,
+        "tui.reasoning",
         layer_path,
     );
 }
@@ -1564,6 +1609,51 @@ fn merge_memory(
     );
 }
 
+// `[skills]` (PL-97 B1) — alle vier Felder `ProfileReplaces`: Home und Profil
+// ersetzen, ein nicht vertrautes Projekt darf keines setzen (wird gemeldet und
+// verworfen) — insbesondere nicht `inject_imported` einschalten.
+fn merge_skills(
+    trusted: &mut HarnessConfig,
+    incoming: SkillsSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+) {
+    let present = |field: &str| field_present(raw, &["skills", field]);
+    profile_replaces(
+        &mut trusted.skills.triggered_injection,
+        incoming.triggered_injection,
+        present("triggered_injection"),
+        role,
+        "skills.triggered_injection",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.skills.inject_imported,
+        incoming.inject_imported,
+        present("inject_imported"),
+        role,
+        "skills.inject_imported",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.skills.per_turn_bytes,
+        incoming.per_turn_bytes,
+        present("per_turn_bytes"),
+        role,
+        "skills.per_turn_bytes",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.skills.per_session_bytes,
+        incoming.per_session_bytes,
+        present("per_session_bytes"),
+        role,
+        "skills.per_session_bytes",
+        layer_path,
+    );
+}
+
 // `[permissions]` (Abschnitt 1.11) — alle fuenf direkten Felder sowie
 // `RuleToml.tool`/`.pattern` sicherheitskritisch (🔒).
 fn merge_permissions(
@@ -1642,7 +1732,9 @@ fn merge_permissions(
 // sind Pflichtfeld-Structs: alle Unterfelder werden gemeinsam gesetzt oder
 // gar nicht, ein whole-struct-Vergleich ist daher aequivalent zu acht
 // unabhaengigen Einzelfeld-Vergleichen, die `FIELD_TABLE` fuer
-// Exhaustivitaets-Zwecke dennoch einzeln auflistet).
+// Exhaustivitaets-Zwecke dennoch einzeln auflistet). `execution` (PL-97 E2)
+// ist `ProfileReplaces`: Home und Profil setzen ihn, ein nicht vertrautes
+// Projekt nie.
 fn merge_sandbox(
     trusted: &mut HarnessConfig,
     incoming: SandboxSection,
@@ -1668,6 +1760,14 @@ fn merge_sandbox(
         "sandbox.tmux",
         layer_path,
         out,
+    );
+    profile_replaces(
+        &mut trusted.sandbox.execution,
+        incoming.execution,
+        field_present(raw, &["sandbox", "execution"]),
+        role,
+        "sandbox.execution",
+        layer_path,
     );
 }
 
@@ -1984,7 +2084,10 @@ fn merge_shell_limits(
 // (Home und Profil) setzen frei, auch nach oben; ein nicht vertrautes
 // Projekt darf die Obergrenze nur senken (Vergleichswert: der bisher
 // gesetzte Wert, sonst die Vorgabe 16). Der Bereich 1–256 ist schon beim
-// Parsen geprüft (`harness_config::JobsToml`).
+// Parsen geprüft (`harness_config::JobsToml`). `cgroup_root` und
+// `trampoline` (PL-97 E3) sind `ProfileReplaces`: Home und Profil setzen
+// sie, ein nicht vertrautes Projekt nie (es könnte sonst Jobs in eine
+// fremde cgroup oder durch ein fremdes Trampolin lenken).
 fn merge_jobs(
     trusted: &mut HarnessConfig,
     incoming: crate::harness_config::JobsToml,
@@ -1994,6 +2097,22 @@ fn merge_jobs(
     out: &mut Vec<ScopeDiagnostic>,
 ) {
     const FIELD: &str = "jobs.max_running";
+    profile_replaces(
+        &mut trusted.jobs.cgroup_root,
+        incoming.cgroup_root,
+        field_present(raw, &["jobs", "cgroup_root"]),
+        role,
+        "jobs.cgroup_root",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.jobs.trampoline,
+        incoming.trampoline,
+        field_present(raw, &["jobs", "trampoline"]),
+        role,
+        "jobs.trampoline",
+        layer_path,
+    );
     if !field_present(raw, &["jobs", "max_running"]) {
         return;
     }
@@ -2355,6 +2474,7 @@ pub(crate) fn merge_layer_into(
     merge_mode(trusted, incoming.mode, raw, role, layer_path);
     merge_research(trusted, incoming.research, raw, role, layer_path, &mut out);
     merge_memory(trusted, incoming.memory, raw, role, layer_path);
+    merge_skills(trusted, incoming.skills, raw, role, layer_path);
     merge_session_listener(
         trusted,
         incoming.session_listener.clone(),
@@ -2967,6 +3087,52 @@ mod tests {
     }
 
     #[test]
+    fn test_skills_trusted_layers_replace_untrusted_project_is_ignored() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(trusted.skills.triggered_injection);
+        assert!(!trusted.skills.inject_imported);
+
+        let home = "[skills]\ntriggered_injection = false\nper_turn_bytes = 2048";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert!(!trusted.skills.triggered_injection);
+        assert_eq!(trusted.skills.per_turn_bytes, 2048);
+
+        let profile = "[skills]\ntriggered_injection = true";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert!(trusted.skills.triggered_injection);
+        // Ein Profil ohne `per_turn_bytes` lässt den Home-Wert stehen.
+        assert_eq!(trusted.skills.per_turn_bytes, 2048);
+
+        // Ein nicht vertrauter Projekt-Layer darf nichts davon ändern.
+        let project = "[skills]\ninject_imported = true\nper_session_bytes = 65536";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(project).map_err(ctx("parse project"))?,
+            &raw_from(project)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert!(!trusted.skills.inject_imported);
+        assert_eq!(
+            trusted.skills.per_session_bytes,
+            crate::DEFAULT_SKILLS_PER_SESSION_BYTES
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_memory_trusted_layers_replace_untrusted_project_is_ignored() -> TestResult {
         let mut trusted = HarnessConfig::default();
         assert!(trusted.memory.global_enabled);
@@ -3114,9 +3280,118 @@ mod tests {
         Ok(())
     }
 
+    // [tui] status_expiry / goal_mode (h7/h9): ProfileReplaces; vor dieser
+    // Verdrahtung wurden Profilwerte beim Zusammenführen still verworfen.
+    #[test]
+    fn test_tui_status_expiry_and_goal_mode_profile_replace() -> TestResult {
+        use crate::StatusExpiryMode;
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.tui.status_expiry, StatusExpiryMode::Consolidate);
+        assert!(!trusted.tui.goal_mode);
+
+        let profile = "[tui]\nstatus_expiry = \"hide\"\ngoal_mode = true";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.status_expiry, StatusExpiryMode::Hide);
+        assert!(trusted.tui.goal_mode);
+
+        let project = "[tui]\nstatus_expiry = \"consolidate\"\ngoal_mode = false";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(project).map_err(ctx("parse project"))?,
+            &raw_from(project)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.status_expiry, StatusExpiryMode::Hide);
+        assert!(
+            trusted.tui.goal_mode,
+            "nicht vertrautes Projekt bleibt wirkungslos"
+        );
+        Ok(())
+    }
+
+    // [tui] reasoning (PL-97 R1): ProfileReplaces; Vorgabe `message`, ein
+    // nicht vertrautes Projekt wird ignoriert.
+    #[test]
+    fn test_tui_reasoning_profile_replaces() -> TestResult {
+        use crate::harness_config::ReasoningDisplayMode;
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.tui.reasoning, ReasoningDisplayMode::Message);
+
+        let collapsed = "[tui]\nreasoning = \"collapsed\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(collapsed).map_err(ctx("parse collapsed"))?,
+            &raw_from(collapsed)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.reasoning, ReasoningDisplayMode::Collapsed);
+
+        let hidden = "[tui]\nreasoning = \"hidden\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(hidden).map_err(ctx("parse hidden"))?,
+            &raw_from(hidden)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.tui.reasoning,
+            ReasoningDisplayMode::Collapsed,
+            "nicht vertrautes Projekt bleibt wirkungslos"
+        );
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(hidden).map_err(ctx("parse hidden"))?,
+            &raw_from(hidden)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.reasoning, ReasoningDisplayMode::Hidden);
+        Ok(())
+    }
+
     // [tui] child_stream (Runde 5, Teil I): ProfileReplaces; Vorgabe
     // `orchestrators`, ein nicht vertrautes Projekt wird ignoriert, ein
     // unbekannter Wert parst nicht.
+    #[test]
+    fn test_single_agent_mode_trusted_precedence() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(!trusted.single_agent_mode);
+        for (value, role, expected) in [
+            ("single_agent_mode = true", LayerRole::Baseline, true),
+            ("", LayerRole::Refinement, true),
+            (
+                "single_agent_mode = false",
+                LayerRole::UntrustedProject,
+                true,
+            ),
+            ("single_agent_mode = false", LayerRole::Refinement, false),
+            (
+                "single_agent_mode = true",
+                LayerRole::UntrustedProject,
+                false,
+            ),
+        ] {
+            merge_layer_into(
+                &mut trusted,
+                toml::from_str(value).map_err(ctx("parse single agent config"))?,
+                &raw_from(value)?,
+                role,
+                &layer_path(),
+            );
+            assert_eq!(trusted.single_agent_mode, expected);
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_tui_child_stream_profile_replaces() -> TestResult {
         use crate::ChildStreamModeToml;
@@ -3303,6 +3578,128 @@ mod tests {
             .ok_or(TestError::Missing("sandbox.cargo after merge"))?;
         assert_eq!(cargo.cargo_bin, "/opt/harw/cargo");
         assert!(diagnostics.iter().any(|d| d.field == "sandbox.cargo"));
+        Ok(())
+    }
+
+    // PL-97 E2: `sandbox.execution` ist `ProfileReplaces` — Home und Profil
+    // setzen ihn, ein nicht vertrautes Projekt kann ihn nie umschalten.
+    #[test]
+    fn test_sandbox_execution_trusted_layers_set_it_untrusted_project_cannot() -> TestResult {
+        use crate::harness_config::SandboxExecutionToml;
+
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(
+            trusted.sandbox.effective_execution(),
+            SandboxExecutionToml::Chain
+        );
+        let legacy = "[sandbox]\nexecution = \"legacy\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(legacy).map_err(ctx("parse legacy"))?,
+            &raw_from(legacy)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.sandbox.execution,
+            Some(SandboxExecutionToml::Legacy)
+        );
+
+        let chain = "[sandbox]\nexecution = \"chain\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(chain).map_err(ctx("parse chain"))?,
+            &raw_from(chain)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.execution, Some(SandboxExecutionToml::Chain));
+
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(legacy).map_err(ctx("parse untrusted"))?,
+            &raw_from(legacy)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.execution, Some(SandboxExecutionToml::Chain));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        // A layer without the key keeps the value.
+        let other = "[jobs]\nmax_running = 8";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(other).map_err(ctx("parse other"))?,
+            &raw_from(other)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.execution, Some(SandboxExecutionToml::Chain));
+        Ok(())
+    }
+
+    // PL-97 E3: `jobs.cgroup_root` und `jobs.trampoline` sind
+    // `ProfileReplaces` — ein nicht vertrautes Projekt setzt keinen von beiden.
+    #[test]
+    fn test_jobs_cgroup_root_and_trampoline_only_from_trusted_layers() -> TestResult {
+        use std::path::PathBuf;
+
+        let mut trusted = HarnessConfig::default();
+        let home = "[jobs]\ncgroup_root = \"/sys/fs/cgroup/harw.slice\"\n\
+                    trampoline = \"/opt/harw/harw-job-exec\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.jobs.cgroup_root,
+            Some(PathBuf::from("/sys/fs/cgroup/harw.slice"))
+        );
+        assert_eq!(
+            trusted.jobs.trampoline,
+            Some(PathBuf::from("/opt/harw/harw-job-exec"))
+        );
+
+        let profile = "[jobs]\ncgroup_root = \"/sys/fs/cgroup/profile.slice\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.jobs.cgroup_root,
+            Some(PathBuf::from("/sys/fs/cgroup/profile.slice"))
+        );
+        // Not named in the profile layer: kept.
+        assert_eq!(
+            trusted.jobs.trampoline,
+            Some(PathBuf::from("/opt/harw/harw-job-exec"))
+        );
+
+        let untrusted = "[jobs]\ncgroup_root = \"/sys/fs/cgroup/evil.slice\"\n\
+                         trampoline = \"/tmp/evil\"\nmax_running = 4";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(untrusted).map_err(ctx("parse untrusted"))?,
+            &raw_from(untrusted)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.jobs.cgroup_root,
+            Some(PathBuf::from("/sys/fs/cgroup/profile.slice"))
+        );
+        assert_eq!(
+            trusted.jobs.trampoline,
+            Some(PathBuf::from("/opt/harw/harw-job-exec"))
+        );
+        // The rest of the table still merges by its own rule.
+        assert_eq!(trusted.jobs.max_running, Some(4));
         Ok(())
     }
 

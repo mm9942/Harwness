@@ -1025,6 +1025,9 @@ docs/
     │   ├── R15-patterns.md      (run log)
     │   └── kit/                 (workflows, skill, agent types)
     │
+    ├── 97-harw-dod-mission-control-chain/
+    │   └── README.md            (Harw-DoD suite, triggers, Mission Control TUI, execution chain)
+    │
     └── 90-migration-ledger/
         └── MIGRATION_LEDGER.md
 ```

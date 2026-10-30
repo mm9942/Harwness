@@ -9,7 +9,7 @@ use std::time::Duration;
 use harw_container_model::{
     LABEL_ATTEMPT, LABEL_EPOCH, LABEL_OWNER, LABEL_TENANT, LABEL_WORK_ID, OwnerLabels, PodInstance,
 };
-use harw_job_core::{ExitOutcome, JobSpec, SandboxProfileName};
+use harw_job_core::{ExitOutcome, JobSpec, ResourceRequest, SandboxProfileName};
 use harw_job_runtime::RuntimeError;
 use harw_job_runtime::coordinator::{
     AttemptContext, AttemptControl, AttemptEvent, AttemptEventSender, AttemptEvents, AttemptRun,
@@ -241,6 +241,66 @@ fn profile_name(profile: SandboxProfileName) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// Whether `resources` asks for a limit the pod manifest does not carry:
+/// only `memory_max` becomes a container limit; a CPU weight or bandwidth
+/// (`cpu_weight`, `cpu_max`), a pids ceiling, a memory throttling threshold
+/// (`memory_high`), an I/O weight (`io_weight`) and the per-process rlimits
+/// (`address_space_max`, `process_count_max`, `cpu_time_max`,
+/// `file_size_max`, `open_files_max`; a pod spec has no ulimit field) are
+/// not set, so the report never claims the resource dimension `Enforced`.
+///
+/// The request is destructured without a rest pattern, so a new
+/// [`ResourceRequest`] field does not compile until it is classified here.
+fn inexpressible_limits(resources: &ResourceRequest) -> bool {
+    let ResourceRequest {
+        // A container limit (`pod::manifest`), read back as `Requested::memory`.
+        memory_max: _,
+        // Not in the pod manifest.
+        memory_high,
+        cpu_weight,
+        cpu_max,
+        pids_max,
+        io_weight,
+        // Enforced by the coordinator's attempt deadline, not by the pod.
+        wall_timeout: _,
+        // Per-process rlimits: not in the pod manifest either.
+        address_space_max,
+        process_count_max,
+        cpu_time_max,
+        file_size_max,
+        open_files_max,
+        // Checked before the create (`refuse_required_rlimits`).
+        require_rlimits: _,
+    } = resources;
+    memory_high.is_some()
+        || cpu_weight.is_some()
+        || cpu_max.is_some()
+        || pids_max.is_some()
+        || io_weight.is_some()
+        || address_space_max.is_some()
+        || process_count_max.is_some()
+        || cpu_time_max.is_some()
+        || file_size_max.is_some()
+        || open_files_max.is_some()
+}
+
+/// Refuses a job that demands per-process rlimits (`require_rlimits` with
+/// any rlimit set): a pod cannot carry them, and such a job must not run
+/// without them, whatever its [`harw_job_core::SandboxRequirement`].
+///
+/// # Errors
+/// [`RuntimeError::Unsupported`] with the operation `rlimits`.
+fn refuse_required_rlimits(resources: &ResourceRequest) -> Result<(), RuntimeError> {
+    if resources.require_rlimits && resources.requests_rlimits() {
+        return Err(RuntimeError::Unsupported {
+            operation: "rlimits",
+            detail: "the job requires per-process rlimits, which a Kubernetes pod does not carry"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn exit_outcome(code: Option<i64>) -> ExitOutcome {
     code.and_then(|c| i32::try_from(c).ok())
         .map_or(ExitOutcome::Unknown, ExitOutcome::Exited)
@@ -377,12 +437,15 @@ pub(crate) struct Prepared {
 impl K8sExecutor {
     /// Creates the pod behind its scheduling gate and reads the admitted pod
     /// back. Nothing is scheduled; a failed internal check deletes the pod.
+    /// A job that requires per-process rlimits is refused before the pod is
+    /// created.
     pub(crate) fn create_and_readback(
         &self,
         spec: &JobSpec,
         ctx: &AttemptContext,
     ) -> Result<Prepared, RuntimeError> {
         spec.validate()?;
+        refuse_required_rlimits(&spec.resources)?;
         let inner = &self.inner;
         let cfg = &inner.cfg;
         let image = cfg.image_for(spec.sandbox_profile).ok_or_else(|| {
@@ -405,8 +468,7 @@ impl K8sExecutor {
         let requested = Requested {
             network: pod::intent(spec.sandbox_profile),
             memory: spec.resources.memory_max,
-            inexpressible_limits: spec.resources.cpu_weight.is_some()
-                || spec.resources.pids_max.is_some(),
+            inexpressible_limits: inexpressible_limits(&spec.resources),
         };
         let manifest = pod::manifest(cfg, spec, &name, &image.reference(), &labels)?;
 

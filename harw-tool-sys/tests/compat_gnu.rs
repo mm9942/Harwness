@@ -121,31 +121,40 @@ fn ps_matches_procps_for_a_real_child() -> TestResult {
 
 #[test]
 fn ps_process_set_matches_procps() -> TestResult {
-    let Some(expected) = gnu("ps", &["-e", "-o", "pid="]) else {
-        eprintln!("skipped: ps");
-        return Ok(());
-    };
-    let theirs: std::collections::BTreeSet<i64> = expected
-        .split_whitespace()
-        .filter_map(|p| p.parse().ok())
-        .collect();
-    let got = value(harw_tool_sys::ps::run(
-        &ProcFs::real(),
-        &serde_json::from_value(json!({"fields": ["pid"], "limit": 2000}))?,
-    ))?;
-    let ours: std::collections::BTreeSet<i64> = got["processes"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|p| p["pid"].as_i64()).collect())
-        .unwrap_or_default();
-    // Prozesse kommen und gehen (ps selbst, Aufräumen): kleine Abweichungen sind normal.
-    let only_theirs = theirs.difference(&ours).count();
-    let only_ours = ours.difference(&theirs).count();
-    assert!(
-        only_theirs <= 3 && only_ours <= 3,
-        "ours {} / theirs {}: only_theirs {only_theirs}, only_ours {only_ours}",
-        ours.len(),
-        theirs.len()
-    );
+    // Prozesse kommen und gehen (ps selbst, parallel laufende Testprozesse):
+    // beide Momentaufnahmen sind nie exakt gleichzeitig. Kleine Abweichungen
+    // sind normal; auf einem ausgelasteten Runner wird bis zu fünfmal neu
+    // gemessen, bevor eine Abweichung als echter Fehler gilt.
+    let mut last = String::new();
+    for _ in 0..5 {
+        let Some(expected) = gnu("ps", &["-e", "-o", "pid="]) else {
+            eprintln!("skipped: ps");
+            return Ok(());
+        };
+        let theirs: std::collections::BTreeSet<i64> = expected
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        let got = value(harw_tool_sys::ps::run(
+            &ProcFs::real(),
+            &serde_json::from_value(json!({"fields": ["pid"], "limit": 2000}))?,
+        ))?;
+        let ours: std::collections::BTreeSet<i64> = got["processes"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|p| p["pid"].as_i64()).collect())
+            .unwrap_or_default();
+        let only_theirs = theirs.difference(&ours).count();
+        let only_ours = ours.difference(&theirs).count();
+        if only_theirs <= 3 && only_ours <= 3 {
+            return Ok(());
+        }
+        last = format!(
+            "ours {} / theirs {}: only_theirs {only_theirs}, only_ours {only_ours}",
+            ours.len(),
+            theirs.len()
+        );
+    }
+    assert!(last.is_empty(), "{last}");
     Ok(())
 }
 
@@ -164,13 +173,24 @@ fn pgrep_matches_procps() -> TestResult {
         return Ok(());
     };
     assert_eq!(expected.trim(), pid.to_string());
-    let by_name = value(harw_tool_sys::pgrep::run(
-        &ProcFs::real(),
-        0,
-        &serde_json::from_value(json!({"pattern": "sleep", "exact": true, "newest": true}))?,
-    ))?;
-    let theirs = gnu("pgrep", &["-x", "-n", "sleep"]).unwrap_or_default();
-    assert_eq!(by_name["pids"][0].to_string(), theirs.trim());
+    // Der jüngste `sleep` kann zwischen den beiden Messungen wechseln (parallel
+    // laufende Testprozesse starten eigene `sleep`s): wie beim Prozess-Set wird
+    // bis zu fünfmal neu gemessen, bevor eine Abweichung als echter Fehler gilt.
+    let mut last = String::new();
+    for _ in 0..5 {
+        let by_name = value(harw_tool_sys::pgrep::run(
+            &ProcFs::real(),
+            0,
+            &serde_json::from_value(json!({"pattern": "sleep", "exact": true, "newest": true}))?,
+        ))?;
+        let ours = by_name["pids"][0].to_string();
+        let theirs = gnu("pgrep", &["-x", "-n", "sleep"]).unwrap_or_default();
+        if ours == theirs.trim() {
+            return Ok(());
+        }
+        last = format!("newest sleep: ours {ours} / theirs {}", theirs.trim());
+    }
+    assert!(last.is_empty(), "{last}");
     Ok(())
 }
 
@@ -219,15 +239,14 @@ fn lsof_sees_the_same_files_as_lsof() -> TestResult {
         eprintln!("skipped: lsof");
     }
     drop(held);
-    // Fremde Prozesse (PID 1 gehört root) werden abgelehnt, sofern wir nicht root sind.
-    if uid != 0 {
-        let foreign = harw_tool_sys::lsof::run(
-            &ProcFs::real(),
-            uid,
-            &serde_json::from_value(json!({"pid": 1}))?,
-        );
-        assert!(matches!(foreign, ToolOutput::Error { .. }));
-    }
+    // A different caller UID cannot inspect this known live process. PID 1
+    // may belong to our own user in a container, so it is not a foreign fixture.
+    let foreign = harw_tool_sys::lsof::run(
+        &ProcFs::real(),
+        uid.wrapping_add(1),
+        &serde_json::from_value(json!({"pid": pid}))?,
+    );
+    assert!(matches!(foreign, ToolOutput::Error { .. }));
     Ok(())
 }
 
@@ -423,10 +442,11 @@ fn free_uname_id_date_which_uptime_env_match_the_gnu_tools() -> TestResult {
             {
                 continue;
             }
-            if let Some(entry) = ours.iter().find(|e| e["name"] == name) {
-                if entry["masked"] == false && !val.contains('\n') {
-                    assert_eq!(entry["value"].as_str(), Some(val), "{name}");
-                }
+            if let Some(entry) = ours.iter().find(|e| e["name"] == name)
+                && entry["masked"] == false
+                && !val.contains('\n')
+            {
+                assert_eq!(entry["value"].as_str(), Some(val), "{name}");
             }
         }
     } else {

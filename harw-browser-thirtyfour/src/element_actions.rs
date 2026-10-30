@@ -23,10 +23,10 @@ impl FirefoxRuntime {
             .ok_or_else(|| Error::InvalidArgument {
                 detail: "unknown browser context".to_owned(),
             })?;
-        if let Some(expected) = request.expected_revision {
-            if expected != current {
-                return Err(Error::StaleRevision { expected, current });
-            }
+        if let Some(expected) = request.expected_revision
+            && expected != current
+        {
+            return Err(Error::StaleRevision { expected, current });
         }
         let target = action_target(&request.action)?;
         let candidates = target_candidates(target)?;

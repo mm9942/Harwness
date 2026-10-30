@@ -331,13 +331,13 @@ impl JobResources {
                 });
             }
         }
-        if let (Some(high), Some(max)) = (self.memory_high, self.memory_max) {
-            if high > max {
-                return Err(CgroupError::InvalidLimit {
-                    field: "memory_high",
-                    reason: format!("{high} exceeds memory_max {max}"),
-                });
-            }
+        if let (Some(high), Some(max)) = (self.memory_high, self.memory_max)
+            && high > max
+        {
+            return Err(CgroupError::InvalidLimit {
+                field: "memory_high",
+                reason: format!("{high} exceeds memory_max {max}"),
+            });
         }
         if let Some(io) = &self.io {
             if let Some(weight) = io.weight.filter(|weight| !(1..=10_000).contains(weight)) {

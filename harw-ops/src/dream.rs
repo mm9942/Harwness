@@ -127,6 +127,11 @@ impl harw_operations::FromRawArgs for DreamArgs {
 
 /// Führt `/dream` aus.
 ///
+/// Kanal-Policy: Auf Channel-Flächen (Telegram) ist `review` lesend erlaubt,
+/// die mutierenden Nebenverben `accept`/`reject` sind jedoch an jeder
+/// Position gesperrt (`channel_denied_subcommands`, PL-96 E10/W06).
+/// `run_review_as` bleibt als zweite Verteidigungslinie unverändert.
+///
 /// # Fehler
 /// Siehe Moduldoku.
 #[operation(
@@ -137,6 +142,8 @@ impl harw_operations::FromRawArgs for DreamArgs {
     command(
         path = "/dream",
         visibility = "channel_reduced",
+        channel_subcommands = "-,list,show,status,review",
+        channel_denied_subcommands = "accept,reject",
         busy_subcommands = "-=immediate, list=immediate, show=immediate, status=immediate"
     )
 )]
@@ -1057,6 +1064,7 @@ mod tests {
     use harw_knowledge::KnowledgeStore;
     use harw_knowledge::artifact::ArtifactId;
     use harw_knowledge::dream::{DreamProposal, DreamReport};
+    use harw_operations::adapter::CommandAdapter;
     use harw_operations::operation::{CommandVisibility, Surface};
     use harw_operations::{FromRawArgs, OpError, Operation};
 
@@ -1102,6 +1110,56 @@ mod tests {
                 visibility: CommandVisibility::ChannelReduced,
             }
         )));
+    }
+
+    #[test]
+    fn dream_review_accept_is_refused_on_channel_reduced() -> TestResult {
+        // Trait-Ebene: `review` ist lesend erlaubt, `accept`/`reject` sind
+        // weder erlaubt noch als Deny-Token vergessen worden.
+        let allowed = super::DreamOperation.channel_subcommands();
+        assert!(allowed.contains(&"review"));
+        assert!(!allowed.contains(&"accept"));
+        assert!(!allowed.contains(&"reject"));
+        assert_eq!(
+            super::DreamOperation.channel_denied_tokens().to_vec(),
+            vec!["accept", "reject"]
+        );
+
+        // Adapter-Ebene: die Deny-Tokens greifen an jeder Position der
+        // Argumentliste, nicht nur beim ersten Token (PL-96 E10/W06).
+        let adapter = CommandAdapter::from_operation(Arc::new(super::DreamOperation))
+            .into_iter()
+            .next()
+            .ok_or(TestError::Missing("command adapter"))?;
+        let safe_calls: [&[&str]; 6] = [
+            &[],
+            &["list"],
+            &["show", "d-1"],
+            &["status"],
+            &["review"],
+            &["review", "d-1"],
+        ];
+        for safe in safe_calls {
+            assert!(
+                adapter.allows_channel_invocation(&toks(safe)),
+                "lesender Aufruf muss erlaubt bleiben: {safe:?}"
+            );
+        }
+        let mutating_calls: [&[&str]; 6] = [
+            &["accept"],
+            &["review", "accept", "p-1"],
+            &["review", "d-1", "accept", "p-1"],
+            &["review", "d-1", "reject", "p-1", "kein", "grund"],
+            &["review", "d-1", "p-1", "accept"],
+            &["run"],
+        ];
+        for mutating in mutating_calls {
+            assert!(
+                !adapter.allows_channel_invocation(&toks(mutating)),
+                "mutierender Aufruf muss gesperrt sein: {mutating:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

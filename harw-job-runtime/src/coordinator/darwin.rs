@@ -141,7 +141,10 @@ impl Executor for DarwinExecutor {
         ctx: &AttemptContext,
     ) -> Result<StartedAttempt<Self::Identity>, RuntimeError> {
         spec.validate()?;
-        let resource_limits = if requests_resource_limits(spec) {
+        // No resource domain and no trampoline: neither the job limits nor
+        // the per-process rlimits are applied.
+        let resource_limits = if requests_resource_limits(spec) || spec.resources.requests_rlimits()
+        {
             EnforcementState::NotEnforced
         } else {
             EnforcementState::Enforced
@@ -304,5 +307,54 @@ impl Executor for DarwinExecutor {
             pid: identity.pid,
             detail: "Darwin cannot verify a recovered process identity".to_owned(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use harw_job_core::{
+        AttemptId, EnforcementState, JobSpec, ResourceRequest, RunnerId, SandboxProfileName,
+        SandboxRequirement,
+    };
+    use harw_types::WorkId;
+
+    use super::DarwinExecutor;
+    use crate::coordinator::error::RuntimeError;
+    use crate::coordinator::executor::{AttemptContext, Executor as _};
+    use crate::test_support::{TestError, TestResult, ctx};
+
+    /// PL-97 E2d: a job that asks only for a per-process rlimit never reports
+    /// `resource_limits` enforced, because nothing applies it on Darwin.
+    #[test]
+    fn rlimit_only_job_reports_resource_limits_not_enforced() -> TestResult {
+        let spec = JobSpec::command("/usr/bin/true")
+            .resources(ResourceRequest {
+                cpu_time_max: Some(60),
+                ..ResourceRequest::default()
+            })
+            .sandbox(SandboxProfileName::NoNetwork)
+            .sandbox_requirement(SandboxRequirement::Required)
+            .build()
+            .map_err(ctx("spec"))?;
+        let context = AttemptContext {
+            job_id: WorkId::from_str("j"),
+            attempt_id: AttemptId::new("j-e1").map_err(ctx("attempt"))?,
+            runner_id: RunnerId::new("r").map_err(ctx("runner"))?,
+            lease_epoch: 1,
+            workspace_root: PathBuf::from("/"),
+            output_files: None,
+            stdio_handoff: None,
+        };
+        match DarwinExecutor::default().start(&spec, &context) {
+            Err(RuntimeError::SandboxRequirementNotMet { report, shortfalls }) => {
+                assert_eq!(report.resource_limits, EnforcementState::NotEnforced);
+                assert!(shortfalls.contains(&"resource_limits"), "{shortfalls:?}");
+                Ok(())
+            }
+            Err(other) => Err(TestError::Unexpected(format!("{other}"))),
+            Ok(_) => Err(TestError::Unexpected("required job started".to_owned())),
+        }
     }
 }

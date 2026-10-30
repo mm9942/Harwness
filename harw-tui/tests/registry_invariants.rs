@@ -94,14 +94,14 @@ fn alias_uniqueness_across_all_ops() -> TestResult {
             let alias_s = alias.to_string();
 
             // Check: alias must not equal a *different* op's primary name.
-            if let Some(&other_name) = name_to_op.get(&alias_s) {
-                if other_name != meta.name {
-                    return Err(TestError::Unexpected(format!(
-                        "alias '{alias}' of op '{}' clashes with the primary command \
+            if let Some(&other_name) = name_to_op.get(&alias_s)
+                && other_name != meta.name
+            {
+                return Err(TestError::Unexpected(format!(
+                    "alias '{alias}' of op '{}' clashes with the primary command \
                          name of op '{other_name}'",
-                        meta.name,
-                    )));
-                }
+                    meta.name,
+                )));
             }
 
             // Check: alias must not already be claimed by a different op.
@@ -372,6 +372,8 @@ fn all_registered_ops_are_reachable_by_name() {
         "model",
         "provider",
         "permissions",
+        // Operator-only, profile-scoped interface preferences.
+        "settings",
         "compact",
         "memory",
         "effort",
@@ -456,6 +458,8 @@ fn all_registered_ops_are_reachable_by_name() {
         "matrix",
         // Plan R9, Teil F: `/jobs` (`tui_only`, Surface::Command).
         "jobs",
+        // PL-97 D3: `/dod` (Harw-DoD, lesend, `channel_reduced`).
+        "dod",
     ];
 
     // Jede Operation muss mindestens eine Fläche tragen. Eine ohne wäre über

@@ -147,11 +147,11 @@ impl InputHistoryStore {
         let Some(path) = self.path.as_ref() else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                tracing::warn!(%error, path = %parent.display(), "tui.input_history.mkdir_failed");
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(%error, path = %parent.display(), "tui.input_history.mkdir_failed");
+            return;
         }
         let opened = OpenOptions::new().create(true).append(true).open(path);
         match opened {

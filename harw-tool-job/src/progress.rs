@@ -370,13 +370,13 @@ fn cargo(line: &str) -> Option<ProgressUpdate> {
             });
         }
     }
-    if let Some(rest) = line.strip_prefix("Running ") {
-        if rest.starts_with("unittests") || rest.starts_with('`') || rest.contains("target/") {
-            return Some(ProgressUpdate::Phase {
-                source: ProgressSource::Cargo,
-                phase: phase_text(&format!("running {rest}")),
-            });
-        }
+    if let Some(rest) = line.strip_prefix("Running ")
+        && (rest.starts_with("unittests") || rest.starts_with('`') || rest.contains("target/"))
+    {
+        return Some(ProgressUpdate::Phase {
+            source: ProgressSource::Cargo,
+            phase: phase_text(&format!("running {rest}")),
+        });
     }
     None
 }
@@ -384,21 +384,19 @@ fn cargo(line: &str) -> Option<ProgressUpdate> {
 /// vcpkg: `Installing 3/42 zlib:x64-linux@1.3.1...`, `Building zlib:x64-linux...`,
 /// `Computing installation plan...`, `Restored 12 package(s) …`.
 fn vcpkg(line: &str) -> Option<ProgressUpdate> {
-    if let Some(rest) = line.strip_prefix("Installing ") {
-        if let Some((done, after)) = leading_number(rest) {
-            if let Some(after) = after.strip_prefix('/') {
-                if let Some((total, after)) = leading_number(after) {
-                    if total > 0 && done <= total {
-                        return Some(ProgressUpdate::Fraction {
-                            source: ProgressSource::Vcpkg,
-                            done,
-                            total,
-                            phase: Some(phase_text(&format!("installing{after}"))),
-                        });
-                    }
-                }
-            }
-        }
+    if let Some(rest) = line.strip_prefix("Installing ")
+        && let Some((done, after)) = leading_number(rest)
+        && let Some(after) = after.strip_prefix('/')
+        && let Some((total, after)) = leading_number(after)
+        && total > 0
+        && done <= total
+    {
+        return Some(ProgressUpdate::Fraction {
+            source: ProgressSource::Vcpkg,
+            done,
+            total,
+            phase: Some(phase_text(&format!("installing{after}"))),
+        });
     }
     if let Some(rest) = line.strip_prefix("Building ") {
         let package = rest.split_whitespace().next().unwrap_or_default();

@@ -132,7 +132,8 @@ pub fn run_realpath(root: &Path, args: &RealpathArgs) -> ToolOutput {
     name = "fsread.readlink",
     description = "Shows the raw target of a symbolic link inside the workspace like readlink, and with canonicalize=true (-f) the fully resolved path if the whole chain stays inside the workspace. Use when you need to know where a link points instead of running readlink. Returns JSON {path, target, target_inside_workspace, resolved}. Links pointing outside are reported as text and never opened.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_readlink(
     context: &ToolExecutionContext,
@@ -147,7 +148,8 @@ async fn fsread_readlink(
     name = "fsread.realpath",
     description = "Resolves a workspace path to its canonical form like realpath: symlinks and '..' are resolved, the result must exist and stay inside the workspace. Use when you need the canonical location of a path instead of running realpath. Returns JSON {relative, absolute}; any chain leaving the workspace is an error.",
     permission = "read_workspace",
-    parallel_safe
+    parallel_safe,
+    skill = "fsread-tools"
 )]
 async fn fsread_realpath(
     context: &ToolExecutionContext,

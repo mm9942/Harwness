@@ -148,11 +148,10 @@ pub async fn run(
         tokio::select! {
             line = input.recv() => {
                 let Some(line) = line else { return Ok(RunEnd::InputClosed) };
-                if let Some(command) = parse(&line) {
-                    if handle(controller, command, out).await? {
+                if let Some(command) = parse(&line)
+                    && handle(controller, command, out).await? {
                         return Ok(RunEnd::Quit);
                     }
-                }
                 say(out, &printer.update(controller.view()))?;
             }
             frame = controller.next() => match frame {

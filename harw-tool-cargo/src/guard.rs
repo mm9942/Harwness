@@ -329,10 +329,10 @@ pub fn parse_porcelain_z(output: &str, prefix: &str) -> Vec<String> {
             continue;
         }
         let Some(path) = entry.get(3..) else { continue };
-        if let Some(rel) = path.strip_prefix(prefix) {
-            if !rel.is_empty() {
-                paths.insert(rel.to_owned());
-            }
+        if let Some(rel) = path.strip_prefix(prefix)
+            && !rel.is_empty()
+        {
+            paths.insert(rel.to_owned());
         }
     }
     paths.into_iter().collect()

@@ -106,6 +106,7 @@ impl harw_operations::FromRawArgs for WorkbenchArgs {
     command(
         path = "/workbench",
         visibility = "channel_reduced",
+        channel_subcommands = "note,hypothesis",
         busy_subcommands = "-=immediate, show=immediate"
     )
 )]

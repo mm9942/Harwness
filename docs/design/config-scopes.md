@@ -105,6 +105,9 @@ see Section 2 for the field's current, implemented rule.
 | `tui.theme` | `String` | `"default-dark"` | `harness_config.rs:292` | RESET |
 | `tui.keybindings_file` | `String` | `"keybindings.toml"` | `harness_config.rs:294` | RESET |
 | `tui.child_stream` | `ChildStreamModeToml` (`orchestrators`/`all`/`none`) | `orchestrators` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
+| `tui.status_expiry` | `StatusExpiryMode` (`consolidate`/`hide`) | `consolidate` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
+| `tui.goal_mode` | `bool` | `false` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
+| `tui.reasoning` | `ReasoningDisplayMode` (`message`/`collapsed`/`hidden`) | `message` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
 
 ### 1.4 `[session]` (`harness_config.rs:306-343`, Defaults `429-437`)
 
@@ -226,6 +229,7 @@ remote_ocr = "ask"   # "off" (default) | "ask" | "on"
 | `sandbox.tmux` | `Option<TmuxSandboxToml>` | `None` | `harness_config.rs:186` | RESET |
 | `sandbox.tmux.mode` | `TmuxOperationModeToml` (`inspect`/`write`) | — (required field) | `harness_config.rs:220` | Part of `sandbox.tmux`, see above |
 | `sandbox.tmux.socket_path` | `String` (absolute path) | — (required field) | `harness_config.rs:221` | Part of `sandbox.tmux`, see above |
+| `sandbox.execution` | `Option<SandboxExecutionToml>` (`chain`/`legacy`) | `None` → `chain` (`SandboxSection::effective_execution`) | `harness_config.rs` (`SandboxSection`) | `ProfileReplaces` via `merge_sandbox` (PL-97 E2) |
 
 ### 1.13 `[internal_models]` (`internal_models.rs:139-193`)
 
@@ -426,7 +430,7 @@ analysis: 111** — leaf fields including nested types such as
 `InternalModelChoice`, `OnboardingSeen`; plus `base_dir` as an extra table row
 in Section 1.1, which is **not a TOML field** (`#[serde(skip)]`, so not
 counted). The current, authoritative count is `FIELD_TABLE.len()` in
-`harw-config/src/scope.rs` (120 at last check; it grows as fields are added
+`harw-config/src/scope.rs` (195 at the time of the h7/h9 wiring; it grows as fields are added
 and this document is not re-counted on every addition).
 
 Parsed from the same `config.toml`, with the same layer mechanics, but
@@ -481,6 +485,9 @@ This table now matches `FIELD_TABLE` in `harw-config/src/scope.rs`.
 | `tui.theme` | PROFILE | last explicitly set value wins | Pure UI preference. | |
 | `tui.keybindings_file` | PROFILE | last explicitly set value wins | see above | |
 | `tui.child_stream` | PROFILE | `ProfileReplaces` | Purely presentational (live stream of child agents), not a restriction. | |
+| `tui.status_expiry` | PROFILE | `ProfileReplaces` | Purely presentational (expired child status lines), not a restriction. | |
+| `tui.goal_mode` | PROFILE | `ProfileReplaces` | Purely presentational (read-only goal view), not a restriction. | |
+| `tui.reasoning` | PROFILE | `ProfileReplaces` | Purely presentational (how reasoning summaries are shown), not a restriction. | |
 | `session.store_dir` | PROFILE | last explicitly set value wins | Storage path is profile-local. | |
 | `session.journal_format` | PROFILE | last explicitly set value wins | Pure format choice. | |
 | `session.retention_days` | **GLOBAL as an upper bound (minimum)** (decided 2026-09-21) | `MinBound` | An admin enforces a maximum retention as a compliance guardrail; the profile may only retain for less time, never longer than globally allowed. | |
@@ -515,6 +522,7 @@ This table now matches `FIELD_TABLE` in `harw-config/src/scope.rs`.
 | `permissions.extra_roots` | **GLOBAL, intersection** (decided 2026-09-21) | `Intersection` | Extends allowed working roots — like `permissions.allow`, a potential rights expansion; same intersection logic: a profile can only reference a subset of the globally set roots, never open a new one. | 🔒 |
 | `sandbox.cargo.*` | GLOBAL exclusive | profile may not set/override | Trust anchor for the cargo sandbox; module docs (`harness_config.rs:70-74`) explicitly require these values to be read only from the trusted configuration at runtime setup. Direct analogy to `browser.geckodriver_path`/`geckodriver_sha256` and `dod.proof_key_dir`, which are already never taken from a repo layer (`browser_toml.rs:18-25`, `dod_toml.rs:22-31`). | 🔒 |
 | `sandbox.tmux.*` | GLOBAL exclusive | profile may not set/override | see above | 🔒 |
+| `sandbox.execution` | **PROFILE** (PL-97 E2) | `ProfileReplaces` | Chooses how `shell.exec`, `job.start` and child agents start their processes: `chain` (the job runtime's sandbox chain, the default) or `legacy` (the previous host-job path). Home and profile set it; the untrusted project layer cannot set it (`merge_sandbox`), so a cloned repository can never switch a session to the weaker path. | 🔒 |
 | `internal_models.*` (all 12 fields, including `auto_classifier`) | PROFILE | last explicitly set value wins (already correctly implemented) | Model routing for auxiliary tasks is user preference/cost control, not an access restriction. | |
 | `compaction.absolute_ceiling_tokens` | **GLOBAL as an upper bound (minimum)** (decided 2026-09-21) | `MinBound` | An admin enforces a cost ceiling; the profile may only lower it, never exceed the global limit. | |
 | `reasoning.*` (all 6 fields) | PROFILE | last explicitly set value wins | Reasoning effort is a cost/speed trade-off, not an access restriction. | |
@@ -812,7 +820,7 @@ subsection numbers, so the table can be checked 1:1 against Section 1.
 **1.2 `[logging]`** (3): `logging.level`, `logging.target_module_paths`,
 `logging.json` — all Profile / `ProfileReplaces`.
 
-**1.3 `[tui]`** (3): `tui.theme`, `tui.keybindings_file`, `tui.child_stream`
+**1.3 `[tui]`** (6): `tui.theme`, `tui.keybindings_file`, `tui.child_stream`, `tui.status_expiry`, `tui.goal_mode`, `tui.reasoning`
 — all Profile / `ProfileReplaces`.
 
 **1.4 `[session]`** (5 fields)
@@ -896,10 +904,12 @@ subsection numbers, so the table can be checked 1:1 against Section 1.
 | `RuleToml.tool` (field of `allow[]`/`deny[]`) | — | `CompositeMember` (travels as part of the `RuleToml` list element under the respective list's rule — `Intersection` for `allow`, `Union` for `deny`; the comparison key is the full `(tool, pattern)` tuple) |
 | `RuleToml.pattern` | — | `CompositeMember` |
 
-**1.12 `[sandbox]`** (8 fields) — all Global / `GlobalOnly`:
+**1.12 `[sandbox]`** (9 fields) — eight Global / `GlobalOnly`:
 `sandbox.cargo`, `sandbox.cargo.mode`, `sandbox.cargo.cargo_bin`,
 `sandbox.cargo.rustup_home`, `sandbox.cargo.cargo_home`, `sandbox.tmux`,
-`sandbox.tmux.mode`, `sandbox.tmux.socket_path`.
+`sandbox.tmux.mode`, `sandbox.tmux.socket_path`; and `sandbox.execution` —
+Profile / `ProfileReplaces`, security-critical (PL-97 E2; the untrusted
+project layer cannot set it).
 
 **1.13 `[internal_models]`** (13 fields, including `auto_classifier`)
 

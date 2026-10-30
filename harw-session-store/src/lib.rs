@@ -31,6 +31,7 @@ pub mod approval;
 pub mod child_lease;
 pub mod error;
 pub mod freeze;
+pub mod injection;
 pub mod job_store;
 pub mod meta;
 pub mod reader;
@@ -42,6 +43,7 @@ pub use approval::{ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, DEFA
 pub use child_lease::{ChildLeaseCompletionRecord, ChildLeaseRecord, ChildLeaseStore};
 pub use error::{SessionStoreError, SessionStoreResult};
 pub use freeze::{Freeze, FreezeResolution, FreezeResolutionOutcome, FreezeStore};
+pub use injection::{INJECTION_MARKER, InjectionRecord, is_injection_payload};
 pub use job_store::{
     CancelRequest, CancellationTransition, ClaimRequest, CompleteRequest, ExpiredJob, JobApproval,
     JobEventSink, JobLifecycleEvent, JobListQuery, JobPage, JobStore, NoopJobEventSink,

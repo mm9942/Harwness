@@ -286,11 +286,12 @@ impl TelegramAttachmentIntake {
                 .file_name()
                 .map(display_name)
                 .unwrap_or_else(|| label.clone());
-            if mime == "text/plain" && downloaded.bytes().len() <= INLINE_TEXT_MAX_BYTES {
-                if let Ok(text) = std::str::from_utf8(downloaded.bytes()) {
-                    report.inline_text.push((name, text.to_owned()));
-                    continue;
-                }
+            if mime == "text/plain"
+                && downloaded.bytes().len() <= INLINE_TEXT_MAX_BYTES
+                && let Ok(text) = std::str::from_utf8(downloaded.bytes())
+            {
+                report.inline_text.push((name, text.to_owned()));
+                continue;
             }
             match self
                 .cache
@@ -406,9 +407,9 @@ fn user_reason(error: &TelegramTransportError, max_bytes: usize) -> String {
 fn human_size(bytes: usize) -> String {
     const MIB: usize = 1024 * 1024;
     const KIB: usize = 1024;
-    if bytes >= MIB && bytes % MIB == 0 {
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
         format!("{} MB", bytes / MIB)
-    } else if bytes >= KIB && bytes % KIB == 0 {
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
         format!("{} KB", bytes / KIB)
     } else {
         format!("{bytes} Bytes")

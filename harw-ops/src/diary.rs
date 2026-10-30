@@ -107,6 +107,7 @@ impl harw_operations::FromRawArgs for DiaryArgs {
     command(
         path = "/diary",
         visibility = "channel_reduced",
+        channel_subcommands = "-,show,today,search,note,agents",
         busy_subcommands = "-=immediate, show=immediate, today=immediate, search=immediate, agents=immediate"
     )
 )]
@@ -663,6 +664,7 @@ mod tests {
         let agent = KnowledgeCaller {
             agent: AgentId::new("root-explorer"),
             viewer: VisibilityScope::SelfOnly,
+            identity: None,
         };
         let shown = super::run_diary_as(&store, &agent, &toks(&["show", "operator"]), now)
             .map_err(ctx("show as agent"))?;
@@ -698,6 +700,7 @@ mod tests {
         let agent = KnowledgeCaller {
             agent: AgentId::new("explorer"),
             viewer: VisibilityScope::SelfOnly,
+            identity: None,
         };
         let own = super::run_diary_as(&store, &agent, &toks(&["agents"]), now)
             .map_err(ctx("agents as agent"))?;
@@ -828,6 +831,7 @@ mod tests {
         let agent = KnowledgeCaller {
             agent: AgentId::new("explorer"),
             viewer: VisibilityScope::SelfOnly,
+            identity: None,
         };
         let hidden = super::run_diary_as(&store, &agent, &toks(&["search", "parser"]), now)
             .map_err(ctx("agent search"))?;

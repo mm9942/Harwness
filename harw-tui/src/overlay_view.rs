@@ -86,6 +86,22 @@ pub(crate) trait OverlayView: std::fmt::Debug {
     /// Übernimmt eine Fehlermeldung des [`Self::refresh_command`]-Befehls.
     fn apply_error(&mut self, _text: &str) {}
 
+    /// Report a typed command completion separately from a later data refresh.
+    fn apply_command_result(
+        &mut self,
+        _language: harw_config::UiLanguage,
+        _result: Result<&harw_operations::OpOutput, &str>,
+    ) {
+    }
+
+    /// Refresh cached interface labels without changing the view's selection.
+    fn refresh_presentation(
+        &mut self,
+        _registry: &crate::CommandRegistry,
+        _keys: &crate::keybindings::KeyBindings,
+    ) {
+    }
+
     /// Übernimmt ein Live-Ereignis vom Agenten-Bus (z. B. ein Matrix-Spiel-
     /// Ereignis als `{"run_id", "event"}`). Standard: ignorieren.
     fn apply_event(&mut self, _event: &serde_json::Value) {}

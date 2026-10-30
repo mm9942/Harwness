@@ -49,8 +49,9 @@ pub use deployment::{
     UnknownUnitError, print_systemd,
 };
 pub use doctor::{
-    AuditIntegrityCheck, AuditIntegrityEvidence, CheckOutcome, DoctorCheck, KekFilePermsCheck,
-    KekFilePermsEvidence, default_checks, run_all,
+    AuditIntegrityCheck, AuditIntegrityEvidence, CheckOutcome, DoctorCheck, ExecutionChainCheck,
+    KekFilePermsCheck, KekFilePermsEvidence, TrampolineCheck, default_checks,
+    execution_chain_checks, run_all,
 };
 pub use dod_units::{ParsedUnit, UNIT_CLASSES, UnitClass};
 pub use error::{DoctorError, InstallError, MigrationError, PathError, ServiceError, UpdateError};

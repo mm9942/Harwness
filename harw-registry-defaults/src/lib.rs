@@ -60,6 +60,9 @@
 
 mod error;
 
+// PL-97 M3: Werkzeugname → Aktivitätsdeskriptor (PL-71), über die
+// Typlöschung der Provider hinweg.
+pub mod activity_map;
 pub mod agent_definition_tools;
 pub mod authority;
 // #22 wave 2B: tool name → provider, capability class, runner feature.
@@ -105,6 +108,7 @@ use harw_project_discovery::ProjectContext;
 // Freigabe-Hinweis ohne eigene `harw-tool-doc`-Kante testen kann.
 pub use harw_tool_doc::{RemoteOcrApproval, RemoteOcrTarget, remote_ocr_target};
 
+pub use activity_map::activity_for;
 pub use agent_definition_tools::{
     AgentDefinitionToolProvider, DefinitionAuthorCeiling, DefinitionWriteMode,
     UiaSelfDocumentToolProvider,
@@ -146,7 +150,8 @@ pub use workbench_tools::{
 /// Dependency-Werkzeuge, `lens.ask`, die Web-Recherche (deren Netzgrenze die
 /// Host-Allowlist der Sandbox zieht, nicht die Freigabe) und die lesenden
 /// Status-Operationen `status`/`ps`. `process.list`/`process.kill` gehören
-/// nie dazu (`ExecuteProcess`, nur im Profil `Full`).
+/// nie dazu (`ExecuteProcess`, nur im Profil `Full`), ebenso wenig die
+/// lesenden `sys.*`-Werkzeuge (PL-97 B4: gleiche Rechteklasse, nur `Full`).
 ///
 /// Alles Mutierende — `fs.write`, `shell.exec`, `stop`, `plan`, `goal` —, alles
 /// mit Nebenwirkung über einen anderen Weg (`diff`, `explore`, `research_*`,
@@ -182,6 +187,7 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // (Kinder laufen mit `allow_pause = false`), ohne den Escape im
     // `FullAccess`-Modus zu schließen.
     "fs.read",
+    "fs.view_image",
     "fs.list",
     "fs.search",
     "fs.glob",
@@ -223,6 +229,35 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     "obsidian.read",
     "obsidian.search",
     "obsidian.links",
+    // PL-97 B4: die lesenden Kommando-Werkzeuge aus PL-93
+    // (`profile::FSREAD_TOOLS`, `profile::GIT_READ_TOOLS`), registriert in
+    // `Full` und `ReadOnlyExplore`. Beide Familien deklarieren
+    // `Permission::ReadWorkspace`, lösen Pfade nur unterhalb der
+    // Workspace-Wurzel auf, lesen bzw. zeigen keine Geheimnis-Pfade und
+    // starten keinen Prozess (`git.*` liest `.git` selbst, ohne `git`).
+    // `sys.*` fehlt hier bewusst: `ExecuteProcess` wie `process.list`.
+    "fsread.ls",
+    "fsread.stat",
+    "fsread.find",
+    "fsread.du",
+    "fsread.df",
+    "fsread.wc",
+    "fsread.head",
+    "fsread.tail",
+    "fsread.cat",
+    "fsread.file",
+    "fsread.tree",
+    "fsread.readlink",
+    "fsread.realpath",
+    "fsread.hash",
+    "fsread.diff",
+    "fsread.json",
+    "git.status",
+    "git.diff",
+    "git.log",
+    "git.show",
+    "git.branch",
+    "git.blame",
     // Web-Recherche (`harw-tool-web`) — alle vier im Profil `Research` (Rolle
     // `researcher-web`, ohne `fs.*`/`deps.*`); `web.fetch`/`web.search`
     // zusätzlich in den Erkundungsprofilen (`explorer`, `uia-explorer`,
@@ -366,6 +401,21 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     "gateway.channels.connect_info",
     "gateway.health",
     "gateway.logs",
+    // PL-97 D3: die lesenden Harw-DoD-Werkzeuge (`profile::DOD_READ_TOOLS`,
+    // `model_tool(readonly, approval = "none")`, `harw-ops/src/dod.rs`). Sie
+    // lesen nur den begrenzten, bereinigten Export, den Health-Bericht, die
+    // Systemkonfiguration und `systemctl show`; nie DoD-Zustand schreibend,
+    // nie Warden oder Eskalation (S1). Die Triage-Rollen laufen mit
+    // `allow_pause = false` und könnten eine Rückfrage nie beantworten.
+    "dod.status",
+    "dod.findings",
+    "dod.sensors",
+    // PL-97 B2: der Werkzeug-Index (`profile::TOOL_INDEX_TOOLS`,
+    // `model_tool(readonly, approval = "none")`, `harw-ops/src/tool_index_op.rs`).
+    // Liest nur statische Daten dieses Binaries (Katalog, Profile,
+    // Werkzeug-Spezifikationen, gebündelte Skill-Manifeste); kein Workspace,
+    // kein Netz, kein Sitzungszustand, kein Sandbox-Recht.
+    "tool.index",
     // Bewusst entfernt (W1-05, Register F-014, G-003, G-004, F-043, G-068):
     // - `plan`, `goal`: deklarieren `model_tool(approval = "always")` und
     //   mutieren PlanStore bzw. Ziel; die Auto-Freigabe überstimmte die
@@ -1046,6 +1096,7 @@ mod tests {
         // Ohne Browser — auch unter Feature `browser` (W5 RD: nur mit Grant).
         let expected_tools = vec![
             "fs.read".to_owned(),
+            "fs.view_image".to_owned(),
             "fs.write".to_owned(),
             "fs.edit".to_owned(),
             "fs.list".to_owned(),
@@ -1069,6 +1120,16 @@ mod tests {
             "obsidian.links".to_owned(),
             "obsidian.write".to_owned(),
         ];
+        // PL-97 B4: die PL-93-Kommando-Werkzeuge hinter Obsidian, in
+        // Provider-Reihenfolge (`fsread.*`, `git.*`, dann `sys.*`).
+        let mut expected_tools = expected_tools;
+        expected_tools.extend(
+            profile::FSREAD_TOOLS
+                .iter()
+                .chain(profile::GIT_READ_TOOLS.iter())
+                .chain(profile::SYS_TOOLS.iter())
+                .map(|name| (*name).to_owned()),
+        );
 
         let advertised_tools = registered_names(&ar);
         assert_eq!(advertised_tools, expected_tools);
@@ -1176,6 +1237,10 @@ mod tests {
         // WorkDriver-Worker (schreibt nur den eigenen Berichts-Slot).
         read_only_surface.extend_from_slice(crate::profile::GATEWAY_READ_TOOLS);
         read_only_surface.extend_from_slice(crate::profile::WORK_DRIVER_REPORT_TOOLS);
+        // PL-97 D3: die lesenden Harw-DoD-Werkzeuge (nur Lesen des Exports).
+        read_only_surface.extend_from_slice(crate::profile::DOD_READ_TOOLS);
+        // PL-97 B2: der Werkzeug-Index (nur statische Daten).
+        read_only_surface.extend_from_slice(crate::profile::TOOL_INDEX_TOOLS);
         // harw-tool-tunnel-v1: die lesenden Tunnel-Werkzeuge stehen in
         // `AUTO_APPROVED_TOOLS` (Besitzprüfung im Tool selbst, `tunnel.stop`
         // beendet nur einen eigenen Tunnel), aber kein read-only Profil
@@ -1228,6 +1293,150 @@ mod tests {
         }
     }
 
+    /// PL-97 B4: `fsread.*`/`git.*` laufen ohne Rückfrage (lesend,
+    /// `ReadWorkspace`); `sys.*` fragt wie `process.list` (`ExecuteProcess`),
+    /// aber nie „immer“ — eine Allow-Regel greift.
+    #[test]
+    fn pl93_read_tools_are_auto_approved_and_sys_tools_ask_like_process_list() {
+        for tool in profile::FSREAD_TOOLS
+            .iter()
+            .chain(profile::GIT_READ_TOOLS.iter())
+        {
+            assert!(AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(
+                !DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                "{tool} muss ohne Rückfrage laufen"
+            );
+        }
+        for tool in profile::SYS_TOOLS {
+            assert!(!AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+            assert_eq!(
+                DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                DefaultApprovalPolicy::requires_explicit_approval(&call("process.list")),
+                "{tool}"
+            );
+        }
+    }
+
+    /// PL-97 B4: die vier Nutzungs-Skills der PL-93-Kommando-Werkzeuge
+    /// kommen aus dem eingebetteten Bündel in den `SkillIndex` — ohne
+    /// Überspringen und ohne Trigger-Warnung, mit gültiger `triggers.toml`
+    /// (`when`, `tools` = die Werkzeugnamen der Crate, `commands`) —, sind
+    /// über die Suche auffindbar und feuern auf Befehl bzw. erste Nutzung.
+    ///
+    /// `cargo-tools` trägt bewusst noch keine `commands`: solange kein Profil
+    /// `cargo.check`/`cargo.test`/… registriert (nur `cargo.test_one`), darf
+    /// ein `cargo test` über `shell.exec` nicht auf fehlende Werkzeuge
+    /// verweisen. Der Skill feuert nur auf die erste Nutzung eines `cargo.*`.
+    #[test]
+    fn pl93_tool_skills_load_from_the_bundle_with_valid_triggers() -> TestResult {
+        use harw_catalog::{
+            InjectionBudget, InjectionState, SkillIndex, SkillSource, TRIGGERS_FILE, TriggerEvent,
+            parse_triggers_file,
+        };
+
+        let skills: [(&str, &[&str]); 4] = [
+            (
+                "cargo-tools",
+                harw_tool_cargo::CargoToolProvider::TOOL_NAMES,
+            ),
+            ("fsread-tools", profile::FSREAD_TOOLS),
+            ("git-read-tools", profile::GIT_READ_TOOLS),
+            ("sys-tools", profile::SYS_TOOLS),
+        ];
+        let index = SkillIndex::build(&[]);
+        for (skill, crate_tools) in skills {
+            let entry = index.get(skill).ok_or(TestError::Unexpected(format!(
+                "{skill} fehlt im SkillIndex"
+            )))?;
+            assert_eq!(entry.source, SkillSource::Bundled, "{skill}");
+            assert!(
+                !index.skipped().iter().any(|s| s.location.contains(skill)),
+                "{skill} übersprungen: {:?}",
+                index.skipped()
+            );
+            assert!(
+                !index.warnings().iter().any(|w| w.skill == skill),
+                "{skill}: {:?}",
+                index.warnings()
+            );
+            assert!(entry.when.is_some(), "{skill}: kein when");
+            assert_eq!(entry.triggers.tools, crate_tools, "{skill}: tools-Trigger");
+            assert_eq!(
+                entry.triggers.commands.is_empty(),
+                skill == "cargo-tools",
+                "{skill}: commands (nur cargo-tools ohne, bis cargo.* in Full liegt)"
+            );
+            for tool in &entry.tools {
+                assert!(
+                    crate_tools.contains(&tool.as_str()),
+                    "{skill}: skill.toml nennt fremdes Werkzeug {tool}"
+                );
+            }
+            let path = format!("skills/{skill}/{TRIGGERS_FILE}");
+            let source = harw_home::bundled_files()
+                .iter()
+                .find(|file| file.relative_path == path)
+                .map(|file| file.contents)
+                .ok_or(TestError::Unexpected(format!("{path} fehlt im Bündel")))?;
+            let (spec, warnings) = parse_triggers_file(source);
+            assert!(warnings.is_empty(), "{path}: {warnings:?}");
+            assert_eq!(spec.triggers, entry.triggers, "{path}");
+            assert_eq!(
+                index
+                    .search(skill)
+                    .first()
+                    .map(|hit| hit.entry.name.as_str()),
+                Some(skill),
+                "{skill}: per Suche auffindbar"
+            );
+        }
+
+        let budget = InjectionBudget::default();
+        for (event, skill) in [
+            (
+                TriggerEvent::Command("cd x && git status --short"),
+                "git-read-tools",
+            ),
+            (TriggerEvent::Command("ls -la src"), "fsread-tools"),
+            (TriggerEvent::Command("ps aux"), "sys-tools"),
+            (TriggerEvent::ToolFirstUse("cargo.test_one"), "cargo-tools"),
+            (TriggerEvent::ToolFirstUse("git.blame"), "git-read-tools"),
+            (TriggerEvent::ToolFirstUse("fsread.tree"), "fsread-tools"),
+            (TriggerEvent::ToolFirstUse("sys.top"), "sys-tools"),
+        ] {
+            let mut state = InjectionState::new();
+            let selection = index.select(&[event], &mut state, &budget);
+            assert!(
+                selection
+                    .injections
+                    .iter()
+                    .any(|injection| injection.skill == skill),
+                "{event:?} feuert {skill} nicht: {selection:?}"
+            );
+        }
+        // Wortgrenze: `psql` ist kein `ps`. `cargo test` feuert `cargo-tools`
+        // (noch) nicht — siehe oben, kein Befehls-Trigger ohne `cargo.*` in Full.
+        for command in [
+            "psql -c 1",
+            "cargo test -p harw-home",
+            "cargo clippy --tests",
+        ] {
+            let mut state = InjectionState::new();
+            let selection = index.select(&[TriggerEvent::Command(command)], &mut state, &budget);
+            assert!(
+                !selection
+                    .injections
+                    .iter()
+                    .any(|injection| injection.skill == "sys-tools"
+                        || injection.skill == "cargo-tools"),
+                "{command}: {selection:?}"
+            );
+        }
+        Ok(())
+    }
+
     /// Plan D2, Entscheidung der Nutzerin „Kanban nur auf ausdrücklichen
     /// Wunsch“: die lesenden Kanban-Werkzeuge fragen bei jedem Aufruf.
     #[test]
@@ -1263,6 +1472,10 @@ mod tests {
             "matrix.start",
             "matrix.run",
             "matrix.finish",
+            // PL-90: Intent-Zyklen deklarieren `approval = "always"`
+            // (`harw-ops/src/intent_cycle.rs`).
+            "intent_cycle.start",
+            "intent_cycle.stop",
         ] {
             assert!(
                 DefaultApprovalPolicy::requires_explicit_approval(&call(name)),
@@ -1327,6 +1540,24 @@ mod tests {
             assert!(
                 DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
                 "{tool} darf nie auto-freigegeben sein"
+            );
+        }
+    }
+
+    /// PL-97 D3: die lesenden Harw-DoD-Werkzeuge laufen ohne Rückfrage und
+    /// stehen nie in `ALWAYS_ASK_TOOLS`.
+    #[test]
+    fn dod_read_tools_are_auto_approved_and_never_always_ask() {
+        assert_eq!(
+            crate::profile::DOD_READ_TOOLS,
+            ["dod.status", "dod.findings", "dod.sensors"]
+        );
+        for tool in crate::profile::DOD_READ_TOOLS {
+            assert!(AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+            assert!(
+                !DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                "{tool} muss ohne Rückfrage laufen"
             );
         }
     }

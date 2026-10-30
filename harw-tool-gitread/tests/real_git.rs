@@ -384,12 +384,11 @@ fn assert_history_matches(real: &Real, layout: &str) -> TestResult {
         for line in porcelain.lines() {
             let mut parts = line.split(' ');
             if let (Some(sha), Some(_orig), Some(fin)) = (parts.next(), parts.next(), parts.next())
+                && sha.len() == 40
+                && sha.bytes().all(|b| b.is_ascii_hexdigit())
+                && let Ok(n) = fin.parse::<u64>()
             {
-                if sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    if let Ok(n) = fin.parse::<u64>() {
-                        expected.insert(n, sha.to_owned());
-                    }
-                }
+                expected.insert(n, sha.to_owned());
             }
         }
         let ours = blame(real, json!({"path": path, "max_lines": 2000}))?;

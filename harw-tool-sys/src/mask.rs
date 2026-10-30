@@ -220,14 +220,13 @@ pub fn mask_cmdline(args: &[String]) -> Vec<String> {
             }
         }
         // HTTP-Kopfzeilen wie `Authorization: Bearer …`.
-        if let Some((name, _)) = arg.split_once(':') {
-            if !name.is_empty()
-                && name.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
-                && is_secret_name(name)
-            {
-                out.push(format!("{name}: {MASK}"));
-                continue;
-            }
+        if let Some((name, _)) = arg.split_once(':')
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+            && is_secret_name(name)
+        {
+            out.push(format!("{name}: {MASK}"));
+            continue;
         }
         if looks_like_secret_value(arg) {
             out.push(MASK.to_owned());
