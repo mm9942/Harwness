@@ -1,0 +1,34 @@
+{
+  "title": "Harwness: Policy-First Composition and Durable Execution for Model-Heterogeneous Agents",
+  "creators": [
+    {
+      "name": "Mia"
+    }
+  ],
+  "prepared_date": "2026-10-30",
+  "version": "1.0",
+  "language": "eng",
+  "resource_type": "technical preprint / architecture and implementation report",
+  "license_expression": "MIT OR Apache-2.0",
+  "license_choice": "at the recipient’s option",
+  "abstract": "Tool-using language models can propose actions, but a proposal does not establish the identity, authority, isolation, or durable state required to execute it responsibly. Harwness is a Rust-based agent runtime that places these responsibilities outside the model. This paper presents a source-grounded analysis of its architecture at a fixed repository revision. The system combines ingress-derived runtime profiles, typed principals, compiled agent definitions, attenuated delegation, governed process execution, and persistent work coordination. Its agent compiler lowers versioned definitions into a typed intermediate representation, performs eight ordered validation and resolution passes, and emits portable artifacts or native executables. Its adaptive execution substrate separates model proposals from trusted admission, journals effects before dispatch, fences stale workers, and treats completion as a candidate requiring a distinct acceptance decision. Linux execution uses backend-specific isolation and reports achieved enforcement rather than assuming that requested policy was enforced. An optional host-security subsystem adds eBPF observation, with a separately gated privileged enforcement path whose authorization integration remains incomplete. We distinguish source-observed mechanisms, limited integrations, attributed validation reports, and proposed experiments. The live adaptive-cycle recipe is read-only, while a bounded exact-file editing pilot produces review artifacts; other governed coding paths remain available. No new benchmark results are claimed. The contribution is a traceable systems account and falsifiable evaluation protocol for composing model-independent authority and lifecycle boundaries.",
+  "keywords": [
+    "agent runtime",
+    "authority attenuation",
+    "durable execution",
+    "agent compilation",
+    "Linux sandboxing",
+    "Rust",
+    "model heterogeneity"
+  ],
+  "software_artifact": {
+    "repository": "https://github.com/mm9942/Harwness",
+    "version": "0.10.0",
+    "commit": "14082d16b5e21f920acd2dc0b84ebd42f32ac859",
+    "tree": "5948efdd459252f70b165e31c4bb6b3f779d94b5"
+  },
+  "ai_assistance": "ChatGPT (OpenAI) assisted with repository inspection, literature checking, manuscript revision and document preparation. Responsibility for this work remains with the author.",
+  "peer_reviewed": false,
+  "external_submission_performed": false,
+  "doi_reserved": false
+}

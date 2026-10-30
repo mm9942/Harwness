@@ -1,0 +1,41 @@
+% Conceptual architecture, drawn as vector geometry rather than a measured result.
+\begin{figure}[tbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw=black!55,fill=black!2,rounded corners=1pt,align=left,inner sep=7pt,font=\small},
+  flow/.style={-{Stealth[length=2.2mm]},draw=black!70,line width=0.65pt},
+  observation/.style={flow,dashed}
+]
+\node[box,text width=13.1cm] (client) at (0,0) {
+  \textbf{Client plane}\\
+  Local CLI/TUI; session, channel and protocol entry surfaces
+};
+\node[box,text width=13.1cm,below=6mm of client] (control) {
+  \textbf{Control plane}\\
+  Trusted principal and entry profile; compiled manifest; approvals;\\
+  runtime assembly, provider selection, delegation and effect admission
+};
+\node[box,text width=5.95cm,minimum height=1.5cm,below=8mm of control.south,xshift=-3.57cm] (execution) {
+  \textbf{Execution plane}\\
+  Model sessions; governed tools;\\
+  workers and OS sandbox backends
+};
+\node[box,text width=5.95cm,minimum height=1.5cm,below=8mm of control.south,xshift=3.57cm] (state) {
+  \textbf{State plane}\\
+  Jobs, leases and checkpoints;\\
+  artifacts, evidence and memory
+};
+\node[box,text width=13.1cm,below=10mm of execution.south,xshift=3.57cm] (security) {
+  \textbf{Optional host-security plane}\\
+  Scoped sensors $\rightarrow$ typed findings $\rightarrow$ analysis\\
+  Separate, gated Warden path; incomplete authorization integration
+};
+\draw[flow] (client.south) -- (control.north);
+\draw[flow] (control.south) -- ++(0,-0.35) -| (execution.north);
+\draw[flow] (control.south) -- ++(0,-0.35) -| (state.north);
+\draw[draw=black!70,line width=0.65pt,{Stealth[length=2.2mm]}-{Stealth[length=2.2mm]}] (execution.east) -- (state.west);
+\draw[observation] (execution.south) -- node[right,font=\scriptsize,fill=white,inner sep=2pt] {scoped observations} ([xshift=-3.57cm]security.north);
+\end{tikzpicture}
+\caption{Conceptual separation of planes. Solid arrows indicate ordinary coordination or state flow; the dashed arrow indicates scoped observation. The drawing does not assert equivalent integration across entry surfaces or active privileged enforcement.}
+\label{fig:architecture}
+\end{figure}

@@ -1,0 +1,862 @@
+{
+  "schema": "harwness.paper-source-review/v1",
+  "repository": "https://github.com/mm9942/Harwness",
+  "review_date": "2026-10-30",
+  "baseline_commit": "14082d16b5e21f920acd2dc0b84ebd42f32ac859",
+  "baseline_tree": "5948efdd459252f70b165e31c4bb6b3f779d94b5",
+  "workspace_version": "0.10.0",
+  "previous_manuscript_commit": "df08fc77baacacd085e6f5c6a7824f2aa391dedf",
+  "comparison": {
+    "status": "ahead",
+    "ahead_by": 35,
+    "changed_files": [
+      {
+        "path": ".github/workflows/release.yml",
+        "status": "modified",
+        "additions": 15,
+        "deletions": 0
+      },
+      {
+        "path": "CHANGELOG.md",
+        "status": "modified",
+        "additions": 24,
+        "deletions": 5
+      },
+      {
+        "path": "Cargo.lock",
+        "status": "modified",
+        "additions": 168,
+        "deletions": 168
+      },
+      {
+        "path": "Cargo.toml",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 1
+      },
+      {
+        "path": "docs/cli.md",
+        "status": "modified",
+        "additions": 54,
+        "deletions": 0
+      },
+      {
+        "path": "docs/research/models/openai.json",
+        "status": "modified",
+        "additions": 93,
+        "deletions": 0
+      },
+      {
+        "path": "docs/superpowers/plans/2026-10-29-tui-settings-localization.md",
+        "status": "added",
+        "additions": 131,
+        "deletions": 0
+      },
+      {
+        "path": "docs/superpowers/specs/2026-10-29-tui-settings-localization-design.md",
+        "status": "added",
+        "additions": 80,
+        "deletions": 0
+      },
+      {
+        "path": "harw-cli/src/models.rs",
+        "status": "modified",
+        "additions": 56,
+        "deletions": 1
+      },
+      {
+        "path": "harw-cli/src/onboarding.rs",
+        "status": "modified",
+        "additions": 197,
+        "deletions": 2
+      },
+      {
+        "path": "harw-config/src/discovery.rs",
+        "status": "modified",
+        "additions": 42,
+        "deletions": 2
+      },
+      {
+        "path": "harw-config/src/error.rs",
+        "status": "modified",
+        "additions": 5,
+        "deletions": 0
+      },
+      {
+        "path": "harw-config/src/harness_config.rs",
+        "status": "modified",
+        "additions": 91,
+        "deletions": 0
+      },
+      {
+        "path": "harw-config/src/lib.rs",
+        "status": "modified",
+        "additions": 4,
+        "deletions": 3
+      },
+      {
+        "path": "harw-config/src/merge.rs",
+        "status": "modified",
+        "additions": 8,
+        "deletions": 0
+      },
+      {
+        "path": "harw-config/src/scope.rs",
+        "status": "modified",
+        "additions": 6,
+        "deletions": 3
+      },
+      {
+        "path": "harw-config/src/writer.rs",
+        "status": "modified",
+        "additions": 153,
+        "deletions": 18
+      },
+      {
+        "path": "harw-config/tests/config_scope_exhaustive.rs",
+        "status": "modified",
+        "additions": 3,
+        "deletions": 0
+      },
+      {
+        "path": "harw-config/tests/ui_language.rs",
+        "status": "added",
+        "additions": 130,
+        "deletions": 0
+      },
+      {
+        "path": "harw-fsutil/src/atomic.rs",
+        "status": "modified",
+        "additions": 64,
+        "deletions": 6
+      },
+      {
+        "path": "harw-fsutil/src/lib.rs",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 1
+      },
+      {
+        "path": "harw-home/src/lib.rs",
+        "status": "modified",
+        "additions": 39,
+        "deletions": 0
+      },
+      {
+        "path": "harw-model-catalog/src/embedded.rs",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 1
+      },
+      {
+        "path": "harw-model-catalog/src/providers.toml",
+        "status": "modified",
+        "additions": 2,
+        "deletions": 0
+      },
+      {
+        "path": "harw-model-catalog/src/vendor_openai.rs",
+        "status": "modified",
+        "additions": 42,
+        "deletions": 11
+      },
+      {
+        "path": "harw-ops/src/config_util.rs",
+        "status": "modified",
+        "additions": 2,
+        "deletions": 2
+      },
+      {
+        "path": "harw-ops/src/effort.rs",
+        "status": "modified",
+        "additions": 57,
+        "deletions": 10
+      },
+      {
+        "path": "harw-ops/src/lib.rs",
+        "status": "modified",
+        "additions": 11,
+        "deletions": 9
+      },
+      {
+        "path": "harw-ops/src/mode.rs",
+        "status": "modified",
+        "additions": 3,
+        "deletions": 0
+      },
+      {
+        "path": "harw-ops/src/model.rs",
+        "status": "modified",
+        "additions": 9,
+        "deletions": 3
+      },
+      {
+        "path": "harw-ops/src/models.rs",
+        "status": "modified",
+        "additions": 2,
+        "deletions": 0
+      },
+      {
+        "path": "harw-ops/src/models_workers.rs",
+        "status": "modified",
+        "additions": 10,
+        "deletions": 3
+      },
+      {
+        "path": "harw-ops/src/permissions.rs",
+        "status": "modified",
+        "additions": 11,
+        "deletions": 5
+      },
+      {
+        "path": "harw-ops/src/provider.rs",
+        "status": "modified",
+        "additions": 22,
+        "deletions": 8
+      },
+      {
+        "path": "harw-ops/src/settings.rs",
+        "status": "added",
+        "additions": 652,
+        "deletions": 0
+      },
+      {
+        "path": "harw-ops/src/skills.rs",
+        "status": "modified",
+        "additions": 83,
+        "deletions": 1
+      },
+      {
+        "path": "harw-provider-http/src/lib.rs",
+        "status": "modified",
+        "additions": 88,
+        "deletions": 10
+      },
+      {
+        "path": "harw-provider-http/src/responses_reasoning.rs",
+        "status": "modified",
+        "additions": 116,
+        "deletions": 4
+      },
+      {
+        "path": "harw-registry-defaults/Cargo.toml",
+        "status": "modified",
+        "additions": 2,
+        "deletions": 2
+      },
+      {
+        "path": "harw-runtime/src/assembly.rs",
+        "status": "modified",
+        "additions": 23,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/Cargo.toml",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 1
+      },
+      {
+        "path": "harw-tui/src/agent_monitor.rs",
+        "status": "modified",
+        "additions": 261,
+        "deletions": 85
+      },
+      {
+        "path": "harw-tui/src/agent_tree.rs",
+        "status": "modified",
+        "additions": 39,
+        "deletions": 2
+      },
+      {
+        "path": "harw-tui/src/agent_tree_live.rs",
+        "status": "modified",
+        "additions": 116,
+        "deletions": 46
+      },
+      {
+        "path": "harw-tui/src/app.rs",
+        "status": "modified",
+        "additions": 1104,
+        "deletions": 240
+      },
+      {
+        "path": "harw-tui/src/app/activity_glue.rs",
+        "status": "modified",
+        "additions": 27,
+        "deletions": 14
+      },
+      {
+        "path": "harw-tui/src/app/btw.rs",
+        "status": "modified",
+        "additions": 28,
+        "deletions": 8
+      },
+      {
+        "path": "harw-tui/src/app/busy_queue.rs",
+        "status": "modified",
+        "additions": 57,
+        "deletions": 73
+      },
+      {
+        "path": "harw-tui/src/app/child_approvals/tests.rs",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 1
+      },
+      {
+        "path": "harw-tui/src/app/child_stream_glue.rs",
+        "status": "modified",
+        "additions": 21,
+        "deletions": 9
+      },
+      {
+        "path": "harw-tui/src/app/chrome_localization_tests.rs",
+        "status": "added",
+        "additions": 233,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/app/goal_marker_glue.rs",
+        "status": "modified",
+        "additions": 6,
+        "deletions": 2
+      },
+      {
+        "path": "harw-tui/src/app/history_localization_tests.rs",
+        "status": "added",
+        "additions": 185,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/app/jobs_glue.rs",
+        "status": "modified",
+        "additions": 288,
+        "deletions": 77
+      },
+      {
+        "path": "harw-tui/src/app/live_model.rs",
+        "status": "modified",
+        "additions": 70,
+        "deletions": 6
+      },
+      {
+        "path": "harw-tui/src/app/live_slots.rs",
+        "status": "modified",
+        "additions": 47,
+        "deletions": 18
+      },
+      {
+        "path": "harw-tui/src/app/live_views_tests.rs",
+        "status": "modified",
+        "additions": 2,
+        "deletions": 2
+      },
+      {
+        "path": "harw-tui/src/app/mission_landscape_tests.rs",
+        "status": "modified",
+        "additions": 8,
+        "deletions": 8
+      },
+      {
+        "path": "harw-tui/src/app/operator_shell.rs",
+        "status": "modified",
+        "additions": 8,
+        "deletions": 2
+      },
+      {
+        "path": "harw-tui/src/app/render.rs",
+        "status": "modified",
+        "additions": 13,
+        "deletions": 6
+      },
+      {
+        "path": "harw-tui/src/app/scroll_routing.rs",
+        "status": "modified",
+        "additions": 8,
+        "deletions": 8
+      },
+      {
+        "path": "harw-tui/src/app/settings_glue.rs",
+        "status": "added",
+        "additions": 129,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/approval_dialog.rs",
+        "status": "modified",
+        "additions": 166,
+        "deletions": 89
+      },
+      {
+        "path": "harw-tui/src/ask_user_dialog.rs",
+        "status": "modified",
+        "additions": 105,
+        "deletions": 13
+      },
+      {
+        "path": "harw-tui/src/chat_scroll.rs",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/child_stream.rs",
+        "status": "modified",
+        "additions": 70,
+        "deletions": 7
+      },
+      {
+        "path": "harw-tui/src/choice_dialog.rs",
+        "status": "modified",
+        "additions": 133,
+        "deletions": 14
+      },
+      {
+        "path": "harw-tui/src/command_catalog.rs",
+        "status": "modified",
+        "additions": 1182,
+        "deletions": 316
+      },
+      {
+        "path": "harw-tui/src/command_data.rs",
+        "status": "modified",
+        "additions": 414,
+        "deletions": 44
+      },
+      {
+        "path": "harw-tui/src/command_exec.rs",
+        "status": "modified",
+        "additions": 254,
+        "deletions": 2
+      },
+      {
+        "path": "harw-tui/src/command_popup.rs",
+        "status": "modified",
+        "additions": 331,
+        "deletions": 34
+      },
+      {
+        "path": "harw-tui/src/dialog_frame.rs",
+        "status": "modified",
+        "additions": 4,
+        "deletions": 2
+      },
+      {
+        "path": "harw-tui/src/error.rs",
+        "status": "modified",
+        "additions": 74,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/goal_marker.rs",
+        "status": "modified",
+        "additions": 66,
+        "deletions": 39
+      },
+      {
+        "path": "harw-tui/src/help_overlay.rs",
+        "status": "modified",
+        "additions": 475,
+        "deletions": 161
+      },
+      {
+        "path": "harw-tui/src/history_cell.rs",
+        "status": "modified",
+        "additions": 836,
+        "deletions": 263
+      },
+      {
+        "path": "harw-tui/src/history_cell_localization_tests.rs",
+        "status": "added",
+        "additions": 340,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/host_permit_dialog.rs",
+        "status": "modified",
+        "additions": 27,
+        "deletions": 14
+      },
+      {
+        "path": "harw-tui/src/i18n.rs",
+        "status": "added",
+        "additions": 416,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/input_editor.rs",
+        "status": "modified",
+        "additions": 107,
+        "deletions": 2
+      },
+      {
+        "path": "harw-tui/src/jobs_panel.rs",
+        "status": "modified",
+        "additions": 401,
+        "deletions": 114
+      },
+      {
+        "path": "harw-tui/src/keybindings.rs",
+        "status": "modified",
+        "additions": 236,
+        "deletions": 48
+      },
+      {
+        "path": "harw-tui/src/lib.rs",
+        "status": "modified",
+        "additions": 7,
+        "deletions": 2
+      },
+      {
+        "path": "harw-tui/src/local_commands.rs",
+        "status": "modified",
+        "additions": 101,
+        "deletions": 30
+      },
+      {
+        "path": "harw-tui/src/locales/README.md",
+        "status": "added",
+        "additions": 104,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/activity_chrome.json",
+        "status": "added",
+        "additions": 746,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/agents.json",
+        "status": "added",
+        "additions": 938,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/app_notices.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/chrome.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/command_feedback.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/commands.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/common.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/dialogs.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/dispatch.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/help.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/history.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/mission.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/operation_feedback.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/operations.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/pickers.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/settings.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/setup.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/locales/tool_chrome.json",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/mention_popup.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/mission/agents_window.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/mission/finished_window.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/mission/jobs_window.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/mission/live_window.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/mission/projection.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/mission/stop_job.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/mode_picker.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/model_picker.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/model_roles_view.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/model_switch_picker.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/operation_feedback.rs",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/overlay_view.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/permissions_view.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/plan_dialog.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/reasoning_cell.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/registry.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/registry/metadata.rs",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/relative_time.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/runtime_commands.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/runtime_root.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/session_picker.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/settings_view.rs",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/setup.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/status_line.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/style.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/sudo_dialog.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/test_support.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/src/tools_command.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw-tui/tests/registry_invariants.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "path": "harw/tests/version_coherence.rs",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 0
+      }
+    ]
+  },
+  "validation_report": {
+    "source": "https://github.com/mm9942/Harwness/pull/161",
+    "source_is_mutable": true,
+    "reported_tested_commit": "5ebeffc87bac7e3bac4fdaac1ee81de2fca08c91",
+    "reported_tree": "5948efdd459252f70b165e31c4bb6b3f779d94b5",
+    "reviewed_merge_commit": "14082d16b5e21f920acd2dc0b84ebd42f32ac859",
+    "workspace_passed": 18523,
+    "workspace_failed": 0,
+    "workspace_ignored": 202,
+    "includes_doctests": true,
+    "installer_tests_passed": 15,
+    "scope": "CI/default features; all-features workspace is reported blocked by optional cloud proxy placeholder",
+    "independently_reproduced": false,
+    "source_tree_identity_independently_checked": true,
+    "tree_check_sources": [
+      "https://api.github.com/repos/mm9942/Harwness/git/commits/5ebeffc87bac7e3bac4fdaac1ee81de2fca08c91",
+      "https://api.github.com/repos/mm9942/Harwness/branches/dev"
+    ]
+  },
+  "hosted_ci_observation": {
+    "queried_head": "14082d16b5e21f920acd2dc0b84ebd42f32ac859",
+    "actions_total_count": 0,
+    "combined_status_total_count": 0,
+    "combined_status_state": "pending",
+    "interpretation": "No hosted Actions run or commit-status entry was returned for this merge SHA at review time. This is not a passing or failing test result."
+  },
+  "execution_scope": {
+    "repository_compilation": false,
+    "rust_tests": false,
+    "privileged_activation": false,
+    "remote_deployment": false,
+    "manuscript_compilation": true
+  },
+  "assistance": {
+    "tool": "ChatGPT (OpenAI)",
+    "purposes": [
+      "repository inspection",
+      "literature checking",
+      "manuscript revision",
+      "document preparation"
+    ],
+    "human_final_approval_claimed": false
+  }
+}

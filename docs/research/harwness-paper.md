@@ -1,1495 +1,625 @@
-# Harwness: A Policy-First Runtime Architecture for Long-Lived, Model-Heterogeneous AI Agents
+# Harwness: Policy-First Composition and Durable Execution for Model-Heterogeneous Agents
 
-> **Working research paper — artifact-grounded draft**
->
-> **Project:** Harwness (`harw`)  
-> **Baseline repository commit:** `90160f4f2b88f80c6721c20469ed8322ddc8861a`  
-> **Baseline date:** 2026-10-07  
-> **Paper status:** working draft, not peer reviewed  
-> **Claim discipline:** every architectural claim in this paper is labeled as **implemented**, **partially implemented**, or **proposed** according to the repository documentation and the pinned source baseline. Where a design document and code disagree, the code is the intended source of truth.
+**Mia**[^1]  
+**Architecture and implementation report — Preprint v1.0 — 30 October 2026**
+
+[Read the typeset paper](harwness-paper/harwness-paper.pdf) · [Editable LaTeX source](harwness-paper/source/harwness-paper.tex)
 
 ## Abstract
 
-Large language models are increasingly embedded in systems that can invoke tools, modify files, execute processes, delegate work, retain state, and interact through local or remote interfaces. In such systems, the primary engineering problem is no longer only model capability. It is the design of the runtime that converts probabilistic model outputs into bounded, durable, observable, and recoverable actions.
+Tool-using language models can propose actions, but a proposal does not establish the identity, authority, isolation, or durable state required to execute it responsibly. Harwness is a Rust-based agent runtime that places these responsibilities outside the model. This paper presents a source-grounded analysis of its architecture at a fixed repository revision. The system combines ingress-derived runtime profiles, typed principals, compiled agent definitions, attenuated delegation, governed process execution, and persistent work coordination. Its agent compiler lowers versioned definitions into a typed intermediate representation, performs eight ordered validation and resolution passes, and emits portable artifacts or native executables. Its adaptive execution substrate separates model proposals from trusted admission, journals effects before dispatch, fences stale workers, and treats completion as a candidate requiring a distinct acceptance decision. Linux execution uses backend-specific isolation and reports achieved enforcement rather than assuming that requested policy was enforced. An optional host-security subsystem adds eBPF observation, with a separately gated privileged enforcement path whose authorization integration remains incomplete. We distinguish source-observed mechanisms, limited integrations, attributed validation reports, and proposed experiments. The live adaptive-cycle recipe is read-only, while a bounded exact-file editing pilot produces review artifacts; other governed coding paths remain available. No new benchmark results are claimed. The contribution is a traceable systems account and falsifiable evaluation protocol for composing model-independent authority and lifecycle boundaries.
 
-This paper presents **Harwness**, an open-source Rust agent harness designed around the thesis that model output is **untrusted intent**, while authority, process ownership, persistence, admission, and enforcement belong to a typed runtime outside the model context. Harwness separates the client, control, execution, and state planes; assembles entry points through a single runtime composition boundary; derives trusted principals at ingress; narrows authority monotonically across child-agent delegation; compiles user-extensible agent definitions into typed intermediate representations; mediates process execution through sandbox and permit boundaries; persists sessions, jobs, plans, memory, and knowledge outside transient model context; separates declared model capabilities from observed model behavior; and optionally integrates a host-security plane, **Detect · Orient · Defend (DoD)**, whose observation and enforcement path remains distinct from ordinary model execution.
-
-The paper makes three kinds of contribution. First, it documents a concrete systems architecture for long-lived, model-heterogeneous agent operation. Second, it formulates a set of security and reliability invariants that can be tested independently of model quality. Third, it proposes an evaluation methodology for measuring capability escape, crash recovery, model-routing effectiveness, context efficiency, and delegation overhead. The present artifact demonstrates that many of these mechanisms are implemented in the repository, while other parts — notably portions of the agent-definition compiler, selected DoD enforcement paths, and full audit integration — remain partial. The goal of this paper is therefore not to claim a finished autonomous operating system, but to make the design boundaries, implementation evidence, limitations, and future experiments explicit enough to be falsifiable.
-
----
+**Artifact:** [`mm9942/Harwness@14082d16`](https://github.com/mm9942/Harwness/commit/14082d16b5e21f920acd2dc0b84ebd42f32ac859) (workspace 0.10.0).  
+**Keywords:** agent runtime; authority attenuation; durable execution; agent compilation; Linux isolation.  
+**Status:** technical preprint; not peer reviewed.
 
 ## 1. Introduction
 
-Agentic AI systems are often evaluated as if the model were the system. Model benchmarks ask whether a model can reason, code, call tools, or maintain performance over long contexts. Those properties matter, but they are only one factor in an autonomous or semi-autonomous software system.
+An agentic application is not just a language model with a longer prompt. It includes software that decides which tools exist, identifies their caller, interprets arguments, acquires credentials, creates processes, changes files, persists work, and determines whether a requested outcome has actually been reached. Reasoning-and-action methods such as ReAct make the interaction loop explicit, and code-based action interfaces expand what that loop can express \[1, 2\]. Neither an expressive action language nor a persuasive completion message, however, is itself an operating-system permission or a durable record of an external effect.
 
-A language model does not itself own a process, filesystem, network socket, job queue, credential, approval state, durable memory, or child process. It produces output that another program interprets. The surrounding runtime decides whether a tool exists, whether a call is valid, which identity issued it, what resource it may touch, whether it should be approved, whether its state survives a crash, and whether a child agent may receive the same rights.
+This distinction becomes more important as agents outlive a single model response. A parent delegates to children; a worker is restarted; a provider becomes unavailable; context is compacted; a remote client reconnects; a command succeeds just before the runtime crashes. Each event raises a systems question independent of the model’s reasoning quality. Which authority does the replacement worker inherit? Can it repeat an uncertain side effect? Does a returned patch represent an accepted change, a proposed change, or only text? Does a sandbox label describe a requested policy or an observed enforcement level?
 
-This leads to the central thesis of Harwness:
+Harwness addresses these questions through a policy-first harness. Its governing design stance is that model output is a proposal to a runtime, rather than a source of authority for that runtime. At the reviewed revision, a common composition layer assembles entry-specific policy, tools, providers, state, and delegation. Definitions of agents are compiled into typed artifacts. Durable job and adaptive-cycle components carry lifecycle information outside the conversation. Linux executors mediate operating-system access, while the optional Detect–Orient–Defend (DoD) subsystem observes selected host activity through a distinct security path \[3–7\].
 
-> **A model has agentic potential; the harness determines whether that potential becomes controlled, durable, and verifiable work.**
+Multi-agent coordination is an established design space, with frameworks already providing tools, orchestration, memory, and sandbox integration \[8\]. The question studied here is how to make the boundaries between definition, authority, execution, and evidence explicit and compositional in one evolving system. A stronger model should be replaceable without silently changing those boundaries. Conversely, even a correct authority check does not make an allowed action semantically wise.
 
-A useful conceptual approximation is:
+This paper makes three bounded contributions:
 
-```text
-effective agent performance
-  = model capability
-  × interface quality
-  × context quality
-  × runtime reliability
-  × verification quality
-```
+1.  A source-grounded description of the current Harwness compilation, runtime, sandbox, and durable-work architecture, with immutable references and an implementation-status matrix.
 
-The multiplicative form is deliberate. If a system loses state after a crash, exposes an unreliable tool interface, silently broadens authority during delegation, or cannot verify completion, a stronger model may not compensate for the system failure.
+2.  A set of explicit intended invariants and failure boundaries connecting definition-time checks to runtime admission, operating-system enforcement, recovery, and completion acceptance.
 
-The Harwness repository is built around a related security statement:
+3.  A prospective evaluation protocol that separates useful task completion, prohibited effects, crash recovery, and observation quality. The protocol includes negative tests, ablations, uncertainty reporting, and artifact identity.
 
-> **Model output is intent, not authority.**
+The study is an architecture and implementation report. It does not present new measurements of task success, security, latency, or cost. The review found substantial implementation and reported local validation, but did not independently build or execute the Harwness runtime. The compiler provides a developed definition-to-artifact pipeline, while some adaptive writing, deployment, and privileged enforcement paths retain integration limits. Both the implemented mechanisms and their limits are part of the systems account.
 
-The model may propose an operation. It may choose among tools that the runtime exposes. It may ask for delegation. It may request host access. None of those outputs are, by themselves, permission to perform the action.
+## 2. Artifact, Method, and Claim Discipline
 
-This paper turns that architectural stance into research questions, system invariants, implementation evidence, and an evaluation plan.
+### 2.1 Pinned artifact and evidence hierarchy
 
----
+The artifact is the repository at commit 14082d16, with the full identifier recorded in Appendix A. Its workspace metadata declares version 0.10.0, Rust edition 2024, a minimum Rust version of 1.89, and MIT-or-Apache-2.0 software licensing \[3\]. These are source metadata, not evidence that every supported configuration builds. The manuscript and its preparation package have a separate license statement in the end matter.
 
-## 2. Research questions
+The review resolved the current `dev` head through GitHub and compared all 35 intervening commits against the preceding manuscript’s baseline, `df08fc77`. Representative source paths were selected around authority construction, admission, effect dispatch, persistence, recovery, and privileged execution. Each major implementation claim was mapped to the relevant file and symbol at the pinned revision; Appendix A provides the source map. The review distinguished executable logic from comments, tests, operational documents, accepted architecture decisions, and plans. It also examined repository and pull-request validation records and checked platform semantics against primary Linux documentation. No runtime tests were executed as part of this study.
 
-The paper studies five primary questions.
+The analysis follows the repository’s evidence hierarchy, giving current source and Cargo metadata precedence over tests, operational documents, architecture decisions, and planning documents. Source comments identify intended contracts; the cited implementation is the review anchor for a behavioral claim. A selected-path review cannot establish complete mediation across every possible call path, and static inspection does not substitute for execution evidence.
 
-### RQ1 — Can an agent runtime preserve useful autonomy while treating model output as untrusted intent?
+Documentation drift is material. The repository’s older research draft names an October 7 baseline, `90160f4f`, while the present study analyzes 14082d16. The compiler’s actual pass list also includes `DeriveRequirements`, absent from a shorter introductory summary. Current implementation and repository history therefore take precedence over these older status descriptions \[5, 9, 10\].
 
-The core tension is that an autonomous agent must be able to act without asking for every trivial operation, yet the model must not be able to mint identity or authority through prompt text, generated JSON, configuration, or an invented tool argument.
+### 2.2 Four evidence levels
 
-Harwness addresses this by moving authority to typed runtime objects, entry profiles, operation contexts, approval policy, and explicit capability derivation.
+Four evidence levels are used throughout. *Source-observed* means that a concrete implementation is present in the reviewed paths. *Limited integration* means that the implementation is restricted, gated, or not connected to all intended live paths. *Reported validation* means that a repository or PR records test execution that this study did not reproduce. *Prospective* identifies a design goal or experiment rather than a result. An implementation can occupy more than one level: a validator may be source-observed while its deployed integration remains limited.
 
-### RQ2 — Can multi-agent delegation be made monotonic and compositional?
+Test counts in Section 9 are attributed reports, not a new benchmark dataset. The existence of a test is weaker evidence than its execution; test execution is weaker than coverage of the claimed threat model; deployment status is a separate property from both. These distinctions constrain how the architecture, implementation status, and proposed experiments should be interpreted.
 
-Delegation is useful because specialized workers can operate in parallel or with narrower contexts. It is dangerous if every child can rediscover or reconstruct the parent’s authority.
+### 2.3 Research questions
 
-Harwness defines delegation as an intersection of ceilings: role, explicitly declared target, parent grant, remaining depth, remaining budget, authority, context, and read/write scope.
+**RQ1: authority.** Can agent definitions and delegation preserve useful expressiveness while preventing model-controlled data from expanding runtime authority?
 
-The desired property is:
+**RQ2: recovery.** Can durable state and effect reconciliation avoid silent work loss or blind repetition after interruption?
 
-```text
-rights(child) ⊆ rights(parent)
-```
+**RQ3: enforcement.** Can requested sandbox policy be matched to actual backend capabilities without overstating isolation?
 
-for every authority dimension that can affect execution.
+**RQ4: evidence.** Can the system distinguish proposal, admission, execution, verification, and acceptance across models and interaction surfaces?
 
-### RQ3 — Can long-lived agent work survive model changes, compaction, retries, and process failure without conflating durable state with prompt context?
+The current artifact supplies mechanisms and explicit limitations relevant to these questions. Controlled experiments remain necessary to answer them quantitatively.
 
-A long-running agent must distinguish desired state, current plan, job state, session history, memory, knowledge artifacts, and transient working context. Putting all state into the prompt is neither reliable nor economical.
+## 3. System Model and Trust Boundaries
 
-Harwness therefore persists multiple state classes independently and reconstructs context from those stores.
+### 3.1 Components and responsibilities
 
-### RQ4 — Can model heterogeneity be exploited without weakening runtime invariants?
-
-Models differ in context limits, tool behavior, schema adherence, latency, cost, long-context retention, delegation discipline, and error recovery. Harwness separates declared provider capabilities from observed runtime behavior and uses the runtime — rather than model self-selection — to route work.
-
-### RQ5 — Can host-security observation and enforcement remain separate from model reasoning?
-
-A model may classify a situation as suspicious, but a verdict should not equal a privileged host action. Harwness treats DoD as a peer security plane with separate sensors, typed findings, escalation, and privileged enforcement boundaries.
-
----
-
-## 3. Scope and non-claims
-
-This paper describes **Harwness as an evolving systems artifact**, not as a finished product whose entire design has been empirically validated.
-
-The baseline is commit `90160f4f2b88f80c6721c20469ed8322ddc8861a`. Repository documents use three implementation labels:
-
-- **implemented** — the documented contract has a current implementation path;
-- **partially implemented** — substantial code exists, but parts of the contract remain open or have not been fully re-verified;
-- **proposal** — the document describes intended architecture rather than a present runtime guarantee.
-
-This paper preserves those distinctions.
-
-Important non-claims:
-
-1. The paper does **not** claim that Harwness prevents arbitrary compromise by malicious native code running with the same operating-system rights.
-2. It does **not** claim that every documented design item is implemented.
-3. It does **not** claim that model behavior is deterministic.
-4. It does **not** claim that a large context window removes the need for retrieval, memory, or durable state.
-5. It does **not** claim that a model-generated security verdict is sufficient authorization for host enforcement.
-6. It does **not** claim that prompt instructions are an adequate security boundary.
-7. It does **not** claim final benchmark superiority over other agent runtimes; the evaluation protocol in this draft is a plan for producing such evidence.
-
----
-
-## 4. Methodology
-
-### 4.1 Artifact-based architecture analysis
-
-The first version of this paper is based on static analysis of the Harwness repository at the pinned baseline. The primary evidence consists of:
-
-- workspace source code;
-- executable tests and architecture gates;
-- design and architecture documents marked with implementation status;
-- security invariants in `SECURITY.md`;
-- the public README and documentation index;
-- agent definitions, role contracts, and tool schemas.
-
-The repository itself defines the following evidence order:
-
-1. current source and Cargo metadata;
-2. tests and executable architecture gates;
-3. implemented operational/design documentation;
-4. accepted ADRs;
-5. planning documents.
-
-The paper follows the same order.
-
-### 4.2 Claim classification
-
-Every major claim belongs to one of four classes:
-
-| Class | Meaning in this paper |
-|---|---|
-| **I — Implemented** | A documented runtime path exists and the relevant design document is marked implemented. |
-| **P — Partial** | A runtime path exists but the design document explicitly lists missing or unverified pieces. |
-| **D — Design** | The mechanism is described normatively but remains only partially implemented. |
-| **E — Evaluation target** | The paper proposes an experiment; no result is claimed yet. |
-
-### 4.3 External positioning
-
-The design is compared with current public work on agent orchestration, standardized tool interfaces, and durable execution. These sources are used for positioning rather than as evidence that Harwness itself is correct.
-
-Relevant external references include:
-
-- Anthropic’s discussion of simple, composable agent patterns and agent-computer interface quality;
-- the OpenAI Agents SDK’s agent loop, handoffs/agents-as-tools, guardrails, sessions, sandbox agents, human-in-the-loop controls, and tracing;
-- the Model Context Protocol (MCP), which standardizes tools, resources, and prompts between hosts and servers;
-- Temporal’s durable-execution model, in which workflow progress survives process and infrastructure failures;
-- classical least-privilege and protection principles from operating-system security.
-
----
-
-## 5. System model
-
-Harwness can be understood as four interacting planes.
+Figure 1 is an architectural abstraction; it does not assert deployment completeness for every connector. The client plane includes local and remote entry surfaces. The control plane constructs trusted identity, reduces policy, assembles the tool and operation registries, selects providers, and admits work. The execution plane contains model sessions, delegated workers, tools, and governed process backends. The state plane retains sessions, jobs, checkpoints, artifacts, and selected memory independently of prompt history. DoD is an optional peer subsystem with separate authority, rather than an implicit extension of ordinary model privileges.
 
 ```mermaid
 flowchart TB
-    subgraph Client["Client plane"]
-      TUI[TUI]
-      CLI[CLI]
-      WEB[Web]
-      TG[Telegram / channels]
-      MCPCLI[MCP clients]
-    end
-
-    subgraph Control["Control plane"]
-      RA[RuntimeAssembly]
-      PR[Principal + entry profile]
-      REG[Tool / operation registry]
-      AP[Approval + policy]
-      SP[Spawner / delegation]
-      MR[Model routing]
-    end
-
-    subgraph Exec["Execution plane"]
-      AG[Agent sessions]
-      TOOLS[Governed tools]
-      JOBS[Workers / jobs]
-      SB[Sandbox / permits]
-      MCP[MCP server/client]
-    end
-
-    subgraph State["State plane"]
-      SS[Sessions / transcripts]
-      PS[Plans / goals]
-      JS[Job state]
-      MEM[Memory / knowledge]
-      AUD[Audit / artifacts]
-    end
-
-    subgraph DoD["Optional host-security plane"]
-      SEN[Sensors]
-      FIND[Typed findings]
-      ESC[Escalation]
-      WAR[Warden]
-    end
-
-    Client --> RA
-    RA --> PR
-    PR --> REG
-    REG --> AP
-    AP --> AG
-    SP --> AG
-    MR --> AG
-    AG --> TOOLS
-    TOOLS --> SB
-    AG --> JOBS
-    AG <--> State
-    SEN --> FIND --> ESC --> WAR
-    AG -. observations / governed requests .-> DoD
+    client["Client plane: CLI, TUI and protocol surfaces"]
+    control["Control plane: identity, policy and admission"]
+    execution["Execution plane: sessions, tools and sandbox"]
+    state["State plane: jobs, checkpoints and evidence"]
+    security["Optional DoD: observation and gated Warden"]
+    client --> control
+    control --> execution
+    control --> state
+    execution <--> state
+    execution -. "scoped observations" .-> security
 ```
 
-The key design choice is that the model is not the control plane. It is one execution component inside a runtime that owns admission, authority, durable state, and policy.
+**Figure 1.** Conceptual separation of planes. Solid arrows indicate ordinary coordination or state flow; the dashed arrow indicates scoped observation. The drawing does not assert equivalent integration across entry surfaces or active privileged enforcement.
 
----
 
-## 6. One runtime assembly boundary
+**Source-observed.** `RuntimeAssembly` is the shared composition path. Its assembly sequence includes caller narrowing, trusted configuration, project discovery, sandbox and egress policy, a context ceiling, tracing and spawn context, approval, tool and operation registries, providers, contributors, and runtime services \[4\]. The related `EntryKind` enumeration contains thirteen variants, including `SessionHost` and `CompiledAgent`. Entry kinds preserve distinctions between a web server, a job worker, and an interactive terminal instead of treating them as interchangeable front ends.
 
-**Claim class: I — Implemented**
+The entry profile is a reduction table, not permission supplied by a model. For example, `SessionHost` has a read/write/process ceiling without network, further narrowed by the connection tier. A compiled agent derives effective rights from its embedded manifest; the generic fallback is not a permissive default. Network permission in a root profile is also only a ceiling: configured egress scope and downstream tool reachability still matter \[11\]. These mechanisms support policy composition, although the user-facing surfaces do not all provide a complete equivalent workflow.
 
-The document `docs/design/runtime-contracts.md` defines `harw-runtime` as the one composition boundary for all principal entry paths. TUI, one-shot CLI, web, MCP server, durable jobs, and gateways are assembled into a `RuntimeAssembly`.
+### 3.2 Threat model
 
-The architectural purpose is to prevent each front-end from manually wiring its own interpretation of:
+The adversary may control repository content, retrieved text, tool-returned data, generated agent definitions, child-agent outputs, or model proposals. Such inputs may request undelegated tools, broaden a file or network scope, forge a completion claim, replay a stale request, or exploit ambiguity between an admission and a side effect. The model may also err without an adversary. Concurrency, crashes, expired leases, and unavailable dependencies are part of the failure model.
 
-- permissions;
-- sandbox policy;
-- tool registry;
-- approval handlers;
-- model selection;
-- session stores;
-- child spawning;
-- context ceilings.
+The trusted computing base includes ingress authentication, authority construction, policy and admission code, relevant persistence and executor implementations, selected sandbox components, and the operating system. Trusted code can construct a principal through the intended API; the type system is not an adversarial isolation boundary against malicious code already executing with runtime privileges. A compromised kernel, arbitrary compromise of the trusted runtime, and hardware side channels are outside the protections presented here. Remote provider behavior, data retention, and availability are separate deployment risks.
 
-A simplified shape is:
+Application-level capabilities in this paper are grants to perform scoped operations. They are distinct from Linux privilege capabilities such as `CAP_BPF`. The terminology follows the broader protection literature, but no unforgeability theorem is claimed for the entire Rust application \[12\].
 
-```rust
-pub struct RuntimeAssembly {
-    spec: RuntimeSpec,
-    profile: EntryProfile,
-    config: Arc<ResolvedConfig>,
-    trust_report: ConfigTrustReport,
-    project: ProjectContext,
-    sandbox: SandboxSpec,
-    ceiling: ContextCeiling,
-    spawn_context: SpawnContext,
-    budget: RootBudget,
-    // registry, services, stores, approval chain, spawner, model, ...
-}
-```
+### 3.3 Authority attenuation
 
-This is a systems-level defense against **policy drift**. If Telegram, the TUI, a job worker, and the MCP server each assembled their own runtime independently, then every new security rule would need to be replicated across entry points. Harwness instead makes entry kind a parameter to one assembly process.
+**Source-observed.** `Principal` has private fields, is serializable for reporting, and deliberately lacks `Deserialize`. It is constructed at trusted ingress or derived from a parent. The current child constructor sets the permission tier to the minimum of the parent tier and `Operator`; role names supplied as data do not deserialize into an authoritative principal \[13\].
 
-### 6.1 Entry profiles as reduction tables
+A useful analytical model is a rights tuple $$A = (T, F_r, F_w, N, D, C, B),
+  \tag{1}$$ where $T$ is the tool/operation set, $F_r$ and $F_w$ are readable and writable resources, $N$ is network scope, $D$ is the delegated target set, $C$ is the context ceiling, and $B$ contains ordered limits such as depth and remaining budget. For grants with the same resource interpretation, define $A' \preceq A$ by set inclusion for scoped dimensions and non-increase for ordered limits. This is an analytical model of the contracts; the repository does not expose one universal lattice type.
 
-An `EntryKind` maps to exactly one `EntryProfile`. That profile determines the permission ceiling, tool-registry profile, approval behavior, spawner policy, context ceiling, and whether local project context is visible.
+For ordinary delegation within that common resource interpretation, the intended composition rule is $$A_{\mathrm{child}} \preceq
+  A_{\mathrm{parent}} \wedge A_{\mathrm{definition}}
+  \wedge A_{\mathrm{role}}^{\mathrm{effective}}
+  \wedge A_{\mathrm{admission}}.
+  \tag{2}$$ The meet notation expresses simultaneous restrictions. The effective role ceiling includes any explicitly authorized role exception, such as the WorkDriver exception discussed in Section 4.2. Exact definition grants, remaining depth, and current runtime admission still constrain reachability. The notation does not authorize an exception or establish that every implementation path enforces all dimensions.
 
-This supports a useful invariant:
+`AuthorityContext` uses restriction/intersection and child-subset checks. A separate trusted derivation permits a same-tenant, harness-owned read-only view with a different workspace binding, without write, execution, or network rights \[14\]. Because that derivation changes the resource binding, it requires its own admission conditions and is not covered by an unqualified same-resource subset assertion. A test model must include both this read-view exception and the effective WorkDriver role ceiling instead of assuming that all workspace identities and generic role ceilings remain unchanged. Approval resolves whether an already eligible request may proceed; it must not manufacture a missing capability. Exhaustive confirmation of these contracts remains an evaluation target.
 
-> A remote or non-interactive entry point is not a second authority system. It is a narrower projection of the same runtime.
+## 4. Compiling Agent Definitions into Policy-Bearing Artifacts
 
-For example, the current documented reduction table gives the local TUI a much broader ceiling than web, MCP-server, dream, or Telegram entry paths. Network access is not treated as an implicit property of “being an agent”; it is an explicit permission with an egress scope.
+### 4.1 Definition language and intermediate representation
 
-### 6.2 Why a single assembly matters experimentally
+**Source-observed.** The Harwness DSL front end parses TOML, resolves layered definitions and authority constraints, and lowers them into `AgentIr` version 2. Six authority roles are sealed in Rust: user-interface agent, root orchestrator, child orchestrator, worker, UIA worker, and agent steward. Specialization is configurable; the root role vocabulary is not freely extensible through TOML \[15\].
 
-A future evaluation can inject the same operation request through different ingress surfaces and inspect the resulting `RightsSnapshot`. If the architecture is correct, the difference between surfaces should be explainable entirely by their reduction profiles, not by duplicated ad-hoc checks.
+This distinction separates behavior from authority. A definition may specialize a worker for repository exploration without creating a new privilege class. Organizational structures parsed by the DSL should not be confused with a complete executor for every declared clan, cell, or family: the front-end source expressly limits those semantics. Similarly, a schema that can represent a fork or a write request does not imply that the active runtime admits it.
 
----
+The IR uses strict typed structures and the versioned BLAKE3 snapshot domain `harwness.agent-ir.snapshot/v7`. Its canonicalization sorts set-valued lists while retaining ordered-list semantics, and omits trace and snapshot fields from the hashed representation. Covered information includes identity, instructions, skills, manifest, execution requirements, and optional WorkDriver configuration \[16\]. A run can therefore refer to a resolved policy artifact instead of an informal prompt name. A digest detects content mismatch under the hash assumptions; it does not authenticate an author or certify the safety of the represented program.
 
-## 7. Trusted principals: identity is minted, not parsed
+### 4.2 Eight ordered compiler passes
 
-**Claim class: I — Implemented**
+Table 1 follows the current pass array, which stops on pass errors before constructing the final artifact \[5\]. Ordering matters. Reachability and pruning precede execution-requirement derivation; child closure then incorporates requirements of embedded children. A backend cannot correctly infer deployment needs from a pre-pruning tool list alone.
 
-A core Harwness distinction is between **data that describes an actor** and a **trusted principal**.
 
-The runtime contract defines a `Principal` with:
+| **Order** | **Pass** | **Source-observed purpose** |
+| ----------: | :--------------------- | :--------------------------------------------------------------------------------------------- |
+| 1 | `ValidateRoles` | Check compilable roles and role-specific delegation structure. |
+| 2 | `RightsCheck` | Reclassify manifest rights and compare with base-role and optional author ceilings. |
+| 3 | `ResolveSkills` | Resolve and embed skills, including their content hashes. |
+| 4 | `ReachableTools` | Resolve required providers and runner features; reject unknown tools. |
+| 5 | `PruneUnusedTools` | Remove tools that the compiled agent cannot reach. |
+| 6 | `ResolveModels` | Resolve model/provider requirements and required environment variables. |
+| 7 | `DeriveRequirements` | Derive target, process, host, network, write, sandbox, resource, and kernel requirements. |
+| 8 | `ChildClosure` | Compile and embed admitted children, check child ceilings, and union execution requirements. |
 
-- principal kind;
-- identifier;
-- ingress surface;
-- permission tier.
+The eight-pass compiler pipeline. These are implementation mechanisms, not proofs of complete semantic correctness.
 
-The important property is not merely its fields. It is its construction boundary.
 
-The documented `Principal` is deliberately serializable for reporting but not deserializable as authority. It is created at a trusted ingress boundary or derived from a parent.
+`RightsCheck` has a documented WorkDriver tool exception from the base-role ceiling, but not from a supplied author ceiling. The effective role ceiling in Equation 2 must account for that exception; an unconditional subset of the unmodified generic role would be an inaccurate description. The operative contract includes explicit exceptions, optional inputs, and later runtime reductions. Tests must exercise those details \[17\].
 
-Conceptually:
+### 4.3 Artifacts, backends, and runtime revalidation
 
-```text
-authenticated ingress
-    ↓
-trusted principal
-    ↓ derive
-child principal
-```
+**Source-observed.** The default backend appends an artifact to a compatible prebuilt `harw-agent-runner`; an artifact-only mode emits `.harwa`. A second backend generates a Rust crate and invokes Cargo for a native build \[18\]. These are two backend strategies, rather than three separate compilation semantics. The runtime embedded-artifact path rechecks IR snapshots and referenced blobs \[19\].
 
-not:
+The compiler aims for stable artifact bytes from the same definition, sources, and compiler version by excluding trace time, host, and absolute paths and by ordering payloads. This is a narrow reproducibility property. It does not establish bit-identical native executables across toolchains, deterministic language-model behavior, or trustworthy supply-chain provenance. Native build dependencies, runner identity, model endpoints, and deployment policy remain part of the experiment identity.
 
-```text
-model JSON / TOML / network payload
-    ↓ parse
-principal
-```
+The core separation is $$\text{well-formed artifact} \not\Rightarrow
+\text{authorized effect} \not\Rightarrow
+\text{correct task outcome}.
+\tag{3}$$ Compilation can reject inconsistent declarations before a model runs. Runtime admission must still bind a particular request to current authority, and independent verification must still assess its result.
 
-This avoids a common class of confused-deputy errors where a lower-trust component can reconstruct a higher-trust identity by supplying a role name, owner identifier, or permission tier as data.
+## 5. Durable Work and Evidence-Controlled Adaptation
 
-### 7.1 Monotonic derivation
+### 5.1 WorkDriver and adaptive cycles are different mechanisms
 
-Child-principal construction can reduce a tier but cannot increase it. This principle recurs throughout Harwness:
+**Source-observed.** Detached agent work is represented in the shared job ledger with work identifiers, leasing, heartbeat, fencing, and cancellation. WorkDriver is a deterministic supervisor that maps a goal, reports, workers, budget, and time into ordered actions. It manages bounded parallel scopes, suppresses overlapping active paths, continues workers with targeted feedback, and centralizes verification between waves \[20, 21\].
 
-```text
-derived authority ≤ source authority
-```
+The worker integration persists round state under a live job lease and does not infer successful completion from arbitrary prose when a typed worker report is missing. Its success path proposes achievement; a separate human goal-acceptance action remains required. Its source also disclaims a cross-store/effect transaction and a same-claim concurrent compare-and-swap guarantee. An inline nested-handoff path has a documented pause/resume ownership limitation. Durable jobs therefore do not establish that every nested continuation survives restart exactly once.
 
-The system therefore aims to make privilege escalation structurally difficult: rights are derived from trusted runtime state rather than from language-model claims.
+Adaptive intent cycles are a separate layer. The model proposes a transition, trusted admission checks it without effects, and a trusted executor carries out admitted work. The proposal vocabulary includes advance, fork, reorientation, revisiting evidence, patch proposals, verification, approval requests, waiting, escalation, blocking, failure, and completion. This type vocabulary is deliberately broader than the currently active recipe \[6\].
 
----
+### 5.2 Admission, evidence, and completion
 
-## 8. Agent definitions as compiled policy
+An admitted cycle transition is not directly deserializable from model output. Resume intersects the stored authority with the current ceiling rather than restoring obsolete rights wholesale. Progress is tied to content-distinct evidence: renaming an artifact with the same digest does not create novelty. Checkpoints retain explicit decisions and evidence, not an assumption that the model’s hidden reasoning is a durable state machine.
 
-**Claim class: P/D — Partially implemented design with implemented compiler components**
+Three distinctions are central:
 
-Harwness does not treat an agent definition as a free-form prompt plus arbitrary tool names. The agent-definition DSL describes roles, specializations, tool policy, context policy, budgets, spawn constraints, and return contracts in a versioned TOML format.
+1.  **Patch admission is not a write.** The patch-admission module validates target and preimage authority, but performs no filesystem mutation. Its proof of a checked snapshot is not an enduring grant; a writer must recheck the relevant state at the actual effect boundary \[22\].
 
-The intended compilation pipeline is:
+2.  **A worker result is not automatically goal evidence.** Verification must attach an artifact or observation that addresses the acceptance criterion. A model narrative alone is insufficient.
 
-```text
-discover
-→ parse
-→ resolve versions
-→ load base definition
-→ apply ordered mixins
-→ apply explicit patches
-→ validate schemas
-→ validate role compatibility
-→ validate authority monotonicity
-→ validate organization graph
-→ resolve policies
-→ freeze snapshot
-→ hash definition
-→ compile typed definition / IR
-```
+3.  **Completion proposed is not completion accepted.** A job may terminate successfully after proposing completion while the user’s goal remains unaccepted.
 
-The repository documentation is explicit that this pipeline is **partially implemented**, and that the current compiler/IR work is split across `harw-agent-dsl`, `harw-agent-compiler`, and related crates.
+These contracts reduce semantic ambiguity, but verification quality remains a separate problem. A deterministic content check can be reproducible while being too weak to capture the intended task.
 
-### 8.1 Closed authority roles
+### 5.3 Fencing and uncertain effects
 
-The DSL is extensible in specialization but not in root authority categories. Users may define new workers, coding styles, context policies, families, verification profiles, and organization templates. They may not introduce a new authority role that bypasses the runtime role matrix.
+**Source-observed.** The adaptive-cycle runtime uses per-record locking, atomic replacement with durability steps, fenced compare-and-swap updates, and an epoch coupled to the job lease. The live worker integration additionally installs a `LeaseLivenessGuard`: its live lease hold addresses the interval after lease expiry but before a replacement worker claims the job. Constructing a `CycleStore` alone provides epoch fencing without that additional lease-liveness integration. Effects are journaled before dispatch with stable idempotency keys; recovery distinguishes not-started, completed, and uncertain outcomes. An uncertain result escalates instead of automatically replaying the action \[23\].
 
-This separates:
+This is a practical response to the gap between local persistence and external effects. Recording an intent before dispatch cannot make an arbitrary remote action transactional. If a crash happens after the remote side effect but before its local acknowledgement, the runtime needs an idempotent endpoint, a state query, or human reconciliation. Exactly-once execution is therefore not a general guarantee. The mechanism provides explicit uncertainty and fencing that can be tested at injected crash points.
 
-```text
-what work is this agent specialized for?
-```
+The runtime also commits bounded text-free observations with the checkpoint and drains an outbox through a two-phase, idempotent delivery process. Such observations support auditing without requiring raw model text in every event. They do not establish that all possible sensitive data are absent from every other log or store.
 
-from:
+### 5.4 Current live scope and the exact-file editing pilot
 
-```text
-what authority class may this agent occupy?
-```
+**Limited integration.** The public adaptive-cycle specification is read-only: trusted mappings select read targets, and write targets, child targets, and recipe targets are empty. Its live worker integration rebuilds validation, applies a read-only profile, and connects a model proposer to an explorer executor and ceiling reissuer \[24\]. Claims about arbitrary autonomous research-to-contract-to-code execution would exceed this evidence.
 
-That distinction is essential for safe extensibility. A plugin or user project can introduce behavior without inventing a new privilege class.
+A newer exact-file/natural-prerequisite writer constructs immutable review artifacts in trusted job storage. It does not edit the live checkout, run shell commands or tests, spawn children, or publish changes. At this baseline the pilot accepts at most eight existing regular, single-link UTF-8 files, at most 64 KiB per file, and at most twenty-four replacements; create, delete, and rename operations are excluded. In ordinary topology it returns a blocked receipt requiring review rather than claiming task completion \[25\].
 
-### 8.2 Frozen executable snapshots
+This limitation applies to the newer exact-file pilot and the currently admitted adaptive-cycle recipe. Existing governed filesystem, shell, and coding paths remain capable of mutation, and legacy workspace-authority coding is preserved. Keeping these paths distinct prevents both exaggerated autonomy claims and an inaccurate description of the whole system as read-only.
 
-A compiled agent snapshot can be content-addressed. The research value is that an experiment can identify not only the model and prompt, but the exact resolved policy artifact under which the model ran.
+## 6. Linux Execution: Requested Policy versus Achieved Enforcement
 
-A reproducible agent run should therefore identify at least:
+### 6.1 Layered execution rather than one sandbox switch
 
-```text
-repository commit
-agent-definition hash
-model descriptor/version
-runtime profile
-tool-policy version
-task input
-state baseline
-```
+**Source-observed.** The Linux execution architecture separates a planned execution policy from its reported enforcement. The job-execution protocol is fail-closed with respect to required plan/report conditions; the Bubblewrap executor uses an outer stage that joins the cgroup before an inner stage applies mapped Landlock restrictions inside the namespaces. Per-attempt reporting is protected from being substituted by an ordinary workload result \[26, 27\].
 
----
+These mechanisms have different jobs. Namespaces change the process view; cgroups organize processes and constrain selected resources; Landlock restricts handled access classes; syscall filtering can reduce the exposed kernel interface. None is a substitute for semantic authorization. Linux’s seccomp documentation explicitly warns that syscall filtering is not a complete sandbox, while cgroup v2 provides hierarchical resource controls \[28, 29\]. Seccomp is discussed here as platform context, not as a claim that the reviewed job path installs a custom seccomp filter. Enforcement claims therefore need to identify the component, kernel, and configuration.
 
-## 9. Delegation capabilities instead of role-name spawning
+The reviewed Landlock adapter targets ABI version 5 and reports filesystem enforcement as `Enforced` only when that target is achieved; older supported behavior is `Partial`. Network denial remains at most partial because the relevant policy covers TCP bind/connect rather than all communication mechanisms. UDP, raw traffic, and abstract UNIX sockets are not thereby proven confined \[30\]. Versioned Linux documentation confirms that Landlock network rules in this interface concern TCP ports \[31\]. A request labelled “no network” must therefore be assessed against the executor’s complete network boundary, not inferred from one Landlock field.
 
-**Claim class: I — Implemented, with documented future role cleanup**
+### 6.2 The granularity problem in writable scopes
 
-The delegation contract is one of the strongest Harwness-specific design choices.
+An authorization check on an exact file path is not the same as an isolation mechanism that permits only that mutation. Symlinks, path replacement, writable ancestors, inherited descriptors, and concurrent modification can create gaps between a checked pathname and the object eventually changed. Harwness exposes this problem explicitly instead of uniformly widening a request to a whole workspace.
 
-An organizational role is only an upper bound. It is not a model-facing catalog of everything that role might theoretically spawn.
+**Limited integration.** In the tool-level sandbox guard, the new exact-file mutation path fails closed pending an isolated writer backend. The ordinary Bubblewrap launcher keeps a file-scoped workspace read-only rather than silently granting the whole workspace write access \[32, 33\]. This explains the candidate-only writer behavior discussed above.
 
-The visible delegation set is defined as an intersection:
+Separately, the per-job `JobSpec::write_scope` path is implemented in the Linux coordinator. It narrows the grant, canonicalizes and checks symlinks and ancestors, and allows explicitly granted existing directories. It rejects broader writable ancestor grants that would leave the whole workspace writable; a nonexistent target requires an explicitly granted existing ancestor directory. The path requires both a required sandbox policy and Landlock ABI at least 5, and does not silently fall back when those conditions fail \[34\]. These are distinct call paths with distinct preconditions. A single status label saying “file isolation implemented” would conceal the operational difference.
 
-```text
-DefinitionDeclaredTargets
-∩ RoleMatrixTargets
-∩ ParentGrantedTargets
-∩ RemainingDepth
-∩ RemainingBudget
-∩ AuthorityCeiling
-∩ ContextCeiling
-∩ ReadWriteScopeCeiling
-```
+### 6.3 Runtime-independent invariants and their limits
 
-Only the resulting concrete set is exposed to the model.
+The runtime should reject a materially changed mandate after its authorization: a different command, workspace, scope, worker, expiry, or usage count is not the same action. It should also refuse a backend that cannot satisfy a required isolation property. Required jobs fail closed when the requested requirements cannot be met; legacy unscoped best-effort jobs may instead select weaker backends or no sandbox, with the corresponding report. Thus, fail-closed behavior must be qualified by the requested requirement mode \[35\]. These are falsifiable contracts, not a claim that every allowed program is harmless or that a shared host kernel is invulnerable.
 
-This yields two security properties.
+This distinction is especially important for code actions. An agent may legally write a file that contains a defect, run an allowed compiler that exhausts an unbounded resource, or return misleading evidence. Sandboxing constrains classes of effects; it does not solve correctness, data minimization, or every denial-of-service risk. Evaluation must therefore measure benign utility, resource behavior, and prohibited effects separately.
 
-### 9.1 Non-enumerability
+## 7. eBPF Observation and the Optional DoD Plane
 
-A model should not be able to guess hidden agent names and learn, from error messages, which ones exist. If a target is not delegated, it is intended to be invisible rather than merely forbidden.
+### 7.1 What the current sensors observe
 
-### 9.2 Monotonic subtrees
+**Source-observed.** DoD provides a separate host-security domain with sensors, findings, analysis, and a Warden component. The reviewed eBPF sensor uses process execution/exit tracepoints and function-entry probes for `tcp_v4_connect` and `tcp_v6_connect`. The latter observe attempted calls, not proof of successful connections or complete traffic visibility. Older prose describing a different socket-state hook does not reflect the current code. Deployment requires both `CAP_BPF` and `CAP_PERFMON`; the service explicitly avoids a `CAP_SYS_ADMIN` fallback \[36, 37\].
 
-A child cannot widen its own subtree merely because its global role class is theoretically allowed to spawn other agents. Recursive orchestration requires an exact delegated target plus remaining depth and budget.
+The cgroup scope has a further limitation: descendant discovery is performed by a userspace scan at a two-second interval, while kernel ancestor matching is recorded as pending. The two-second interval is a nominal scan period, not a measured upper bound on discovery latency. A newly created descendant can therefore fall within a visibility window \[38\]. Event loss, attachment failure, hook coverage, ordering, and process-to-job correlation must be measured rather than assumed from the presence of an eBPF program.
 
-The intended relationship is:
+The eBPF verifier checks properties of a loaded program, such as constrained memory access and helper arguments. It does not verify the correctness of an agent’s plan, the completeness of event capture, or the semantic success of a tool call \[39\]. Tracing and enforcement are also distinct program uses. Linux BPF LSM programs can implement mandatory-access-control or audit hooks, but that does not make every eBPF tracing sensor an enforcement mechanism \[40\].
 
-```mermaid
-flowchart LR
-  U[UIA] -->|explicit root capability| R[Root orchestrator]
-  R -->|bounded capability| C[Child orchestrator]
-  R -->|bounded capability| W1[Worker]
-  C -->|passed-down subset only| W2[Worker]
+### 7.2 Why findings are not enforcement authority
 
-  style U stroke-width:2px
-  style R stroke-width:2px
-```
+**Limited integration.** The intended separation is observation $\rightarrow$ typed finding $\rightarrow$ analysis $\rightarrow$ separately authorized action. At the pinned revision, Warden units are shipped but not automatically enabled; activation is gated by `/etc/harw-dod/warden.enable` \[7\]. A default Harwness installation therefore cannot be described as continuously enforcing every analyzed finding.
 
-A worker has no persistent delegation catalog.
+There is also a concrete security integration gap. The repository contains a richer authorization protocol with MAC, freshness, and nonce concepts, but the reviewed binary inter-process communication (IPC) path still accepts a legacy action envelope. Peer credentials are logged without an implemented UID/PID admission allowlist in that handler, and the action path records omitted freshness and `authorized_by` ACL checks \[41, 42\]. The deployment socket boundary and default-disabled posture therefore matter. The reviewed path is not a fully connected, signed, replay-protected production enforcement chain.
 
-### 9.3 Delegation as capability transfer
+The immediate research value of DoD is that it exposes where the authority doctrine must continue to hold across a privilege boundary. A future enforced path needs tests showing that a finding, model verdict, stale authorization, or unauthorized peer cannot independently trigger an action. Until the relevant checks are integrated and exercised, that statement remains an acceptance criterion.
 
-The research framing is important: “start agent X” is not a direct command. It is a request to consume a runtime-issued capability. The lease or child execution exists only after admission.
+## 8. Models, Context, and Persistent State
 
-This makes delegation comparable to capability systems in operating-system design: possession of a specific, bounded capability matters more than knowledge of a global name.
+**Source-observed.** The runtime constructs providers behind a shared `ModelProvider` interface; model selection is separate from principal construction and sandbox assembly \[43\]. This is the minimum architectural condition for model heterogeneity without making the model itself the authority source. It does not establish that every provider/model combination is equivalent or that role-based routing improves outcomes.
 
----
+The repository also separates session, job, plan, artifact, memory, and knowledge concerns. Its memory design describes bounded always-loaded material, persistent signals, and tiered consolidation; model-catalog documents distinguish declared API capabilities from observed behavior \[44, 45\]. Those documents motivate experiments, but this study does not reproduce memory-retention, routing, or cost claims.
 
-## 10. Governed process execution
+A model descriptor may report tool support or context capacity while saying little about actual schema adherence, recovery from denied calls, or robustness after compaction. A defensible routing policy should record both declared capabilities and measured behavior with explicit versions. Policy should not become weaker merely because a provider accepts a different function-call format. Context reconstruction should retrieve the goal, constraints, and verified evidence rather than treating the model’s current transcript as the sole copy of durable state.
 
-**Claim class: I — Implemented**
+There are residual risks. Persisted memory may be stale or poisoned; retrieval may omit a critical constraint; a verifier may share the same failure mode as the worker; a model switch may invalidate assumptions in a task decomposition. These risks belong in the evaluation rather than being hidden behind terms such as “long-term memory” or “model-agnostic.”
 
-Shell access is often the point at which an otherwise structured agent system collapses into “the model can run arbitrary commands.”
+## 9. Current Implementation Status and Validation Evidence
 
-Harwness explicitly rejects that simplification.
+Table 2 summarizes the scope supported by this review. Observed implementation is distinct from independent testing, deployment, or an established security guarantee.
 
-The process-execution design separates:
 
-1. **delegation authority** — may the parent ask for a specific execution worker?
-2. **execution authority** — may that worker carry out this concrete mandate?
+| **Area** | **Evidence level** | **What is and is not established** |
+| :--------------------- | :-------------------- | :------------------------------------------------------------------------------------------------------------------------- |
+| Runtime/principals | Source-observed | Shared assembly, ingress profiles, typed identity and child-tier reduction; complete call-path coverage not established. |
+| Compiler and IR | Source-observed | Eight passes, versioned snapshot, artifact/runner and native backends; no general semantic or provenance proof. |
+| Durable work | Observed; limited | Ledger, leases, fencing and cycle reconciliation; not universal exactly-once effects or all nested resumes. |
+| Adaptive cycles | Limited integration | Live approved recipe is read-only despite a broader proposal vocabulary. |
+| New exact-file pilot | Limited integration | Bounded review-artifact generation; not live-checkout publication or task acceptance. |
+| Linux isolation | Backend-dependent | Trampoline/reporting and scoped Landlock paths; ABI- and mechanism-specific limitations remain. |
+| DoD/eBPF | Observed; limited | Scoped sensors and findings; coverage window and gated/incomplete Warden authorization integration. |
+| Cloud gateway | Limited integration | Optional proxy remains a placeholder; no end-to-end production deployment was evaluated. |
+| Evaluation | Reported; planned | Attributed local test reports; no newly reproduced benchmark or deployed security result. |
 
-Dedicated worker classes include sandbox shell workers, Cargo workers, tmux inspection workers, and separately gated host workers.
+Implementation scope at 14082d16. Exact source anchors are provided in the references and Appendix A.
 
-An `ExecutionPermit` is bound to a concrete request:
 
-```text
-ExecutionPermit {
-  parent_session,
-  worker_definition,
-  command_digest,
-  sandbox_profile,
-  approved_modules,
-  workspace_and_scope,
-  expires_at,
-  remaining_uses,
-  approval_proof,
-}
-```
+**Reported validation.** PR #161 reports validation on local commit [`5ebeffc8`](https://github.com/mm9942/Harwness/commit/5ebeffc87bac7e3bac4fdaac1ee81de2fca08c91). GitHub metadata identifies its tree as `5948efdd` (full identifier in Appendix A), the same source tree as the reviewed merge 14082d16 \[46, 47\]. The report records 18,523 passing workspace tests, zero failures, and 202 ignored tests, including documentation tests; workspace Clippy checks across all targets with warnings denied; formatting checks; six architecture gates; and 15 installer tests. These results concern the reported default-feature validation. An all-features workspace check still fails in the optional cloud proxy placeholder \[46\].
 
-The model cannot construct such a permit merely by emitting the same fields.
+Tree identity makes the source relationship explicit; it does not reproduce the reported environment or test execution. The counts remain attributed validation, not independent observations by this study, and cannot be converted into task-success or security percentages. The earlier PR #154 report concerns a historical validation point and is not substituted for the current revision’s evidence \[10\].
 
-### 10.1 Permit binding
+The repository’s CI workflow is manually dispatched \[48\]. The reported hosted CI attempt did not start, and at inspection on 30 October 2026 the unfiltered GitHub Actions query for the exact reviewed merge SHA returned zero runs; its combined commit-status record was also empty. These are time-bounded observations of separate GitHub record types, not evidence that hosted tests passed or failed. Later runs may change those records.
 
-A permit is expected to fail closed if:
+Deployment maturity is heterogeneous. The optional gateway proxy identifies itself as a placeholder. The presence of session-host, web, or cloud crates therefore does not demonstrate an end-to-end production deployment \[49\]. This study performed no independent runtime test execution, installation, privileged activation, or remote deployment.
 
-- the command changes;
-- the workspace changes;
-- the worker definition changes;
-- the permit expires;
-- its use count is exhausted;
-- the requested sandbox is broader;
-- the parent does not already possess the requested ceiling.
+## 10. Prospective Evaluation Protocol
 
-The research principle is:
+**Prospective.** The following experiments are designed to convert architectural claims into falsifiable evidence. None is reported as completed. The central principle is to measure external state and authoritative decisions, not merely whether a model produces a plausible explanation. AgentDojo motivates adaptive injection testing with utility measurement; SWE-bench motivates task outcomes checked against executable acceptance criteria; repeated reliability and cost-aware evaluation are addressed by $\tau$-bench and *AI Agents That Matter* \[50–53\].
 
-> **Process execution is a capability-bearing operation, not a text channel.**
+### 10.1 E1: compiler and authority composition
 
-### 10.2 Host access
+Generate a bounded corpus of valid and invalid definitions, including nested children, unknown tools, role violations, author ceilings, WorkDriver exceptions, impossible backend requirements, and mutated snapshot/blob references. For admitted definitions, compare compiler-derived rights with a separately implemented reference checker. Test determinism of artifact bytes under controlled changes in time, host path, and input ordering, while preserving lists whose order is semantically meaningful.
 
-Harwness also supports a governed host-mode path for cases where strict isolation is insufficient. The important architectural point for this paper is not the UI detail of each host-mode variant; it is that a model request can trigger a structured human decision, but cannot turn the request itself into the grant.
+For delegation, generate trees and mutate one dimension at a time: add a tool, writable path, host, child target, depth, or budget. Record whether the request is rejected at compile time, admission time, or execution time. A candidate falsifier is any admitted child effect outside its effective parent ceiling, with trusted read-view derivation and role exceptions evaluated against their explicit admission conditions. Denials should distinguish policy rejection from malformed input without unnecessarily exposing hidden targets. Report corpus size, mutation coverage, false rejection rate, and unsupported cases; a test suite with no successful escapes is not a proof for untested paths.
 
-The paper flags one item for future formalization: current documentation contains multiple host-mode pathways and historical semantics. Before publication-quality security claims, the experiment artifact should pin the exact implemented host-lease state machine directly from source and tests.
+### 10.2 E2: prompt injection and authorized-but-harmful actions
 
----
+Replay the same benign tasks under clean and malicious repository/tool content, using equal model revisions, retry budgets, and resources. Include attempts to invent identity, request undelegated children, swap a mandate after approval, exfiltrate through allowed-looking parameters, and forge evidence. Compare prompt-only guidance with runtime checks in a disposable environment; do not disable protections on a real host for an ablation.
 
-## 11. Approval is not authority
+Let $U$ denote useful completion and $V$ a prohibited effect verified in backend state. Report all four outcomes $(U,V)$ rather than only a low attack-success number. An agent that refuses everything may have low $V$ but poor utility. Conversely, a task can be completed while an unrelated prohibited action occurs. Policy definitions and the observation oracle must be published, including what an authorized but semantically harmful action would look like. Runtime capability containment is not a general solution to such actions.
 
-**Claim class: I — Implemented**
+### 10.3 E3: crash, replay, and authority change
 
-Approval systems are frequently misunderstood. A confirmation dialog is not itself the permission model.
+Inject interruption before and after admission, durable intent recording, external dispatch, effect completion, checkpoint commit, observation delivery, and parent continuation. Exercise expired leases, stale epochs, cancellation, authority narrowing on resume, and duplicate requests. Use fixtures whose effects can be checked independently: files with preimage hashes, an idempotent mock service, and a deliberately non-idempotent service that exposes the uncertain-outcome case.
 
-Harwness distinguishes:
+Measure recovered jobs, duplicated side effects, lost terminal evidence, repeated tokens, manual interventions, and time to a coherent terminal state. In particular, test the lease-expired-but-not-yet-reclaimed interval and confirm that an uncertain effect is escalated rather than blindly replayed. Separate WorkDriver and adaptive-cycle claims because their persistence contracts differ. This experiment should falsify overly broad exactly-once language if the endpoint cannot support it.
 
-- **capability / permission ceiling** — whether the action is reachable at all;
-- **policy** — whether it is allowed, denied, or requires approval;
-- **approval mode** — how an eligible request is resolved.
+### 10.4 E4: sandbox enforcement and write granularity
 
-This distinction matters in modes such as “Full Access.” Removing confirmation prompts must not invent a tool, filesystem scope, network scope, child capability, or trusted principal that the runtime did not otherwise grant.
+Run the same negative fixtures on a matrix of kernels, enabled Landlock ABIs, namespace settings, cgroup delegation, and executor backends. Include symlink replacement, writable ancestors, inherited descriptors, path changes between validation and mutation, and attempts to write outside the declared scope. Test tool-level exact-file operations separately from the implemented per-job write-scope path.
 
-A useful formalization is:
+For network behavior, independently test TCP bind/connect, UDP, raw sockets where authorized in the fixture, abstract UNIX sockets, inherited sockets, and alternate egress paths. Record both requested policy and achieved report. A failure is not only an escape; silently reporting full enforcement for a partially implemented policy is itself an incorrect result. All tests should run on disposable hosts or containers with no production data or credentials.
 
-```text
-reachable(action)
-  = capability(action)
-  ∧ scope(action)
-  ∧ policy_not_denied(action)
+### 10.5 E5: observation coverage and privileged enforcement
 
-execute(action)
-  = reachable(action)
-  ∧ approval_resolution(action)
-```
+Use a known workload trace to measure event recall, duplicate events, delay, drops under backpressure, and process-to-work attribution. Create descendant cgroups at controlled offsets relative to the userspace scan and quantify the coverage window. Report attachment failures and unavailable capabilities as explicit missing observations, not quiet zeros.
 
-Changing approval mode can affect the final predicate. It should not redefine the preceding authority terms.
+Evaluate the Warden path separately only after its intended authorization checks are connected. Attempt unauthorized peers, missing proof, stale timestamps, nonce replay, scope expansion, and fabricated model findings. A successful tracing run is not evidence of a successful enforcement test. Report policy decisions, effects, and residual deployment assumptions independently.
 
----
+### 10.6 E6: end-to-end utility, heterogeneity, and cost
 
-## 12. Durable work: goal, plan, job, and session are different objects
+Select held-out coding and research tasks with predeclared acceptance criteria. Compare a single-model policy, capability-only routing, and behavior-informed routing under equal budgets. Ablate durable reconstruction and bounded context retrieval without changing the task oracle. Record successful completion, false completion proposals, unnecessary delegation, recovery overhead, prompt/output tokens, monetary cost at a recorded price date, wall time, and resource usage.
 
-**Claim class: I/P — Core durable stores implemented; some higher-level workflows continue evolving**
+Use repeated runs and paired tasks. Report denominators, all failures and timeouts, and confidence intervals, with task-level resampling where trials share a task. Repeated all-trials reliability is not the same metric as success in any one of several attempts. Hyperparameter or router tuning must use a separate development set. Numerical improvement claims should be withheld until raw traces, configuration, and executable outcome checks are available.
 
-Long-lived agent systems need more than a chat transcript.
+### 10.7 Minimal reproducibility record
 
-Harwness distinguishes at least:
+Every run should identify repository commit, lockfile digest, toolchain and features, compiler and agent snapshot, runner/backend identity, policy revision, kernel/configuration, model/provider revision, task fixture, entry kind, effective rights, approvals, seeds where meaningful, budgets, and crash-injection point. Outputs should include structured terminal state, independently checked effects, evidence references, redacted traces, resource/cost measurements, and observation-loss statistics. Appendix B gives a non-result template. Secrets and private user content must be excluded from public artifacts.
 
-- **goal** — desired end state and acceptance criteria;
-- **plan** — current strategy for reaching the goal;
-- **job** — a durable unit of work with lifecycle and execution state;
-- **session** — conversational/run history and runtime identity;
-- **workbench/artifacts** — concrete working outputs;
-- **memory/knowledge** — selectively retained cross-turn or cross-session information.
+## 11. Related Work and Positioning
 
-This decomposition prevents a context compaction from becoming a state-loss event.
+ReAct interleaves language-model reasoning and actions, while CodeAct uses executable code as an action representation \[1, 2\]. Harwness operates at a different layer: it compiles definitions and constrains execution around such model-driven decisions. Compilation of policy-bearing metadata should not be confused with proving a model-generated program correct.
 
-### 12.1 Desired state vs. strategy
+AutoGen studies configurable multi-agent conversation and coordination \[8\]. Harwness emphasizes authority attenuation and durable lifecycle around delegation. This is a difference in focus, not evidence that another framework cannot implement comparable controls. Learned instruction hierarchy addresses how models prioritize trusted instructions over lower-trust content \[54\]; runtime admission remains necessary when the model fails to respect that hierarchy.
 
-The conceptual relationship is:
+CaMeL is particularly relevant because it explicitly separates control flow from untrusted data and uses capability-aware execution to address prompt injection \[55\]. Moving security boundaries outside model behavior is therefore not an idea originated by Harwness. The distinct subject here is the integration of definition compilation, ingress profiles, durable work, and backend-specific execution in a general-purpose runtime. The present study does not establish an empirical security advantage over CaMeL or other designs.
 
-```text
-Goal
-  ↓ drives
-Plan vN
-  ↓ decomposes into
-Jobs / tasks
-  ↓ produce
-Evidence
-  ↓ verifies
-Goal completion
-```
+The Model Context Protocol defines interoperability responsibilities between hosts, clients, and servers, with host-side policy and consent responsibilities \[56\]. It does not remove the need for the host runtime to derive local authority and preserve lifecycle state. Durable workflow platforms such as Temporal similarly emphasize persistent execution history and recovery \[57\]. Harwness shares the need for explicit state transitions but does not claim identical replay semantics or arbitrary exactly-once side effects.
 
-A model switch may alter the implementation strategy. A retry may replace a failed worker. Neither should silently rewrite the goal.
+Linux mechanisms provide the enforcement substrate rather than a new universal sandbox theorem. Alternative isolation architectures, including microVMs and application-kernel interposition, offer different trust and performance tradeoffs \[58, 59\]. They are comparison points, not claimed Harwness dependencies. The principles of least privilege, mediation, and protected authority remain grounded in classical systems security \[12\].
 
-### 12.2 Durable job execution
+## 12. Limitations and Research Agenda
 
-The repository contains separate crates for core job state, persistence, runtime execution, platform integration, and higher-level orchestration. Jobs carry lifecycle state independently from the transient language-model turn.
+First, this is a selected-path static review, not a complete audit, formal proof, or fresh execution campaign. The source hierarchy improves traceability but cannot eliminate bugs in comments, code, dependencies, deployment configuration, or tests. Explicitly typed authority is useful engineering structure; it is not evidence that every effect is mediated.
 
-This architecture resembles durable-execution systems such as Temporal in one important sense: control-flow state must be recoverable after failure. Harwness does not claim to be Temporal, nor to provide identical semantics, but it applies the same systems principle to agent work: state transitions should be persisted at explicit commit boundaries rather than inferred from whether a model “remembers” what happened.
+Second, multiple scopes of maturity coexist. The agent compiler is implemented, the live adaptive recipe is read-only, older coding paths remain capable of mutation, and the exact-file pilot is intentionally candidate-only. These distinctions must be retained as the repository evolves instead of being collapsed into a single implementation label.
 
----
+Third, Linux behavior is kernel-, ABI-, privilege-, and backend-dependent. Partial Landlock network controls, inherited resources, namespace configuration, cgroup setup, and a shared kernel all affect the effective boundary. The Darwin report explicitly marks filesystem/network controls partial and Linux-specific primitives unsupported; its current implementation cannot satisfy required jobs \[60\]. Cross-platform compilation is not isolation parity. The optional DoD path adds privileged components and observation gaps rather than automatically strengthening every runtime operation.
 
-## 13. Memory as governed state, not unlimited context
+Fourth, durable execution does not make external APIs transactional. A stable idempotency key is helpful only if the receiving system or reconciliation procedure gives it useful semantics. Completion checks can also be incomplete, and a human acceptance step can be mistaken or unavailable. Recovery correctness and goal correctness must remain separate claims.
 
-**Claim class: I — Implemented**
+Fifth, the optional cloud gateway’s routing adapter remains a placeholder, and the current validation report identifies an all-features build failure in that component. This study did not exercise pairing, reconnection, remote build authority, or placement; those paths require their own acceptance tests before a production-readiness claim can be assessed. Behavior-aware model routing, memory consolidation, and context selection also remain empirical hypotheses in this paper; no benchmark superiority, economic advantage, or universal prompt-injection resistance is established.
 
-`harw-memory` implements a tiered persistent memory system with HOT/WARM/COLD storage, append-only signals, and periodic consolidation.
+The near-term research agenda is concrete: reproduce the pinned build and targeted tests; complete the exact-file and privileged-authorization integrations without widening fallback authority; add property-based attenuation and backend-report tests; build a crash-injection suite; measure sensor loss and scope latency; and publish held-out utility/security/cost evaluations with redacted traces. These steps directly test the proposed boundaries rather than merely expanding the feature inventory.
 
-The documented design emphasizes four principles:
+## 13. Conclusion
 
-1. bounded token budget for always-loaded memory;
-2. explicit signals over silent inference;
-3. append-only recording plus idempotent maintenance;
-4. local-first storage.
+Harwness offers a systems artifact for studying how model-driven work can be governed outside the model. At the reviewed revision, concrete mechanisms span agent compilation, trusted runtime composition, attenuated authority, durable coordination, effect reconciliation, and backend-specific sandbox reporting. The review also identifies limits: read-only live adaptive cycles, a candidate-only exact-file pilot, non-universal recovery guarantees, partial network enforcement, observation coverage windows, and an incompletely integrated privileged Warden path.
 
-This reflects a broader context-engineering claim:
+The supported architectural claim is that agent definitions, authority, execution, evidence, and acceptance can be represented as distinct interfaces whose composition is inspectable and testable. Whether that separation improves containment, reliability, and useful performance remains a question for the reproducible experiments specified here.
 
-> **Context should be constructed for the current decision, not accumulated without bound.**
+## Authorship, Assistance, and Availability
 
-A long-lived system can store more information than it should inject into each model call.
+#### Authorship and assistance.
 
-### 13.1 State classes
+Mia is the sole named author. ChatGPT (OpenAI) assisted with repository inspection, literature checking, manuscript revision, and document preparation. AI tools are not authors. Responsibility for this work remains with the author.
 
-A useful Harwness decomposition is:
+#### Availability and status.
 
-| State class | Typical use | Should always be in prompt? |
-|---|---|---|
-| Working context | current decision | usually |
-| Session history | conversational continuity | selectively |
-| Job state | lifecycle/recovery | no |
-| Plan | current strategy | selectively |
-| Workbench | intermediate artifacts | by relevance |
-| Diary | time-oriented record | no |
-| Memory | curated durable knowledge | by retrieval |
-| Skills | reusable procedure | only when needed |
-| Artifacts | concrete files/results | by reference |
+The reviewed software is publicly available at the immutable revision identified in Appendix 14. The accompanying preparation package contains the manuscript source, bibliography, vector architecture figure, build instructions, a source-evidence map, and an unpopulated evaluation template. This technical preprint has not undergone peer review and presents no newly generated experimental dataset.
 
-This separation reduces the temptation to use the prompt as a database.
+#### License.
 
----
+This manuscript and its preparation package are dual-licensed under the MIT License or the Apache License, Version 2.0, at the recipient’s option (SPDX: `MIT OR Apache-2.0`). Complete license texts accompany the package. This manuscript license is explicit and separate from the software’s license; third-party works retain their own terms.
 
-## 14. Model heterogeneity as a runtime resource
+## Appendix A. Artifact Identity and Source Map
 
-**Claim class: I — Implemented architecture**
+**Repository:** <https://github.com/mm9942/Harwness>.  
+**Reviewed commit:** `14082d16b5e21f920acd2dc0b84ebd42f32ac859`.  
+**Source tree:** `5948efdd459252f70b165e31c4bb6b3f779d94b5`.  
+**Workspace version:** 0.10.0.  
+**Review date:** 30 October 2026.
 
-Harwness separates two properties of a model.
+The previous manuscript snapshot was `df08fc77baacacd085e6f5c6a7824f2aa391dedf`. The present revision follows the 35 intervening commits to the reviewed `dev` head. All source links below are pinned to that head. The machine-readable evidence map records paths, symbols or line ranges, and Git blob identities. Pull-request reports remain attributed external records; immutable commit and tree identities are recorded separately.
 
-### 14.1 Declared capabilities
+| **Claim area** | **Representative source paths** |
+| :------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Claim area** | **Representative source paths (continued)** |
+| Artifact / earlier draft | [`Cargo.toml`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/Cargo.toml); [`rust-toolchain.toml`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/rust-toolchain.toml); [`docs/research/harwness-paper.md`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/research/harwness-paper.md). |
+| Assembly and entries | [`harw-runtime/src/assembly.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/assembly.rs); [`harw-runtime/src/spec.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/spec.rs). |
+| Principal / authority | [`harw-types/src/principal.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-types/src/principal.rs); [`harw-authority/src/lib.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-authority/src/lib.rs). |
+| DSL and IR | [`harw-agent-dsl/src/lib.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/lib.rs); [`harw-agent-dsl/src/roles.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/roles.rs); [`harw-agent-dsl/src/ir_v2.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/ir_v2.rs). |
+| Compiler passes | [`harw-agent-compiler/src/compiler.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/compiler.rs); [`harw-agent-compiler/src/passes/mod.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/passes/mod.rs); [`harw-agent-compiler/src/passes/rights.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/passes/rights.rs). |
+| Backend / validation | [`harw-agent-compiler/src/backend/mod.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/backend/mod.rs); [`harw-runtime/src/embedded.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/embedded.rs). |
+| Durable delegation | [`harw-runtime/src/agent_job_wiring.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/agent_job_wiring.rs). |
+| WorkDriver | [`harw-plan-bridge/src/work_driver.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/work_driver.rs); [`harw-cli/src/job_worker_work_driver.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver.rs). |
+| Adaptive admission | [`harw-plan-bridge/src/intent_cycle.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/intent_cycle.rs); [`harw-plan-bridge/src/cycle_write_admission.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_write_admission.rs). |
+| Adaptive durability | [`harw-plan-bridge/src/cycle_runtime.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_runtime.rs). |
+| Read-only live cycle | [`harw-plan-bridge/src/cycle_spec.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_spec.rs); [`harw-cli/src/job_worker_intent_cycle.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_intent_cycle.rs). |
+| Exact-file pilot | [`harw-cli/src/job_worker_work_driver_writer.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver_writer.rs). |
+| Write guard | [`harw-tools/src/sandbox_guard.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-tools/src/sandbox_guard.rs); [`harw-sandbox/src/bwrap.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-sandbox/src/bwrap.rs). |
+| Executor and ABI | [`harw-job-exec/src/lib.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-exec/src/lib.rs); [`harw-job-executor-bwrap/src/lib.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-executor-bwrap/src/lib.rs); [`harw-job-linux/src/sandbox.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-linux/src/sandbox.rs); [`harw-job-runtime/src/coordinator/linux.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-runtime/src/coordinator/linux.rs). |
+| Models and memory | [`harw-runtime/src/model.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/model.rs); [`docs/design/model-registry.md`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/design/model-registry.md); [`docs/design/harw-memory.md`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/design/harw-memory.md). |
+| DoD sensor contract | [`dod/crates/harw-dod-bpf/src/real.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-bpf/src/real.rs); [`dod/crates/harw-dod-bpf/src/contract.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-bpf/src/contract.rs); [`dod/bpf/src/tcp_v4_connect.bpf.c`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/bpf/src/tcp_v4_connect.bpf.c). |
+| DoD scope / privileges | [`dod/crates/harw-probe-bpf/src/main.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-probe-bpf/src/main.rs); [`deploy/systemd/harw-probe-bpf.service`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/deploy/systemd/harw-probe-bpf.service). |
+| Warden integration | [`dod/crates/harw-warden/src/ipc.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-warden/src/ipc.rs); [`dod/crates/harw-dod-warden/src/warden.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-warden/src/warden.rs); [`dod/crates/harw-dod-warden-proto/src/signed.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-warden-proto/src/signed.rs); [`deploy/systemd/harw-warden.service`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/deploy/systemd/harw-warden.service). |
+| Platform / fallback | [`harw-job-darwin/src/report.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-darwin/src/report.rs); [`harw-job-runtime/src/host.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-runtime/src/host.rs). |
+| CI / cloud scope | [`.github/workflows/ci.yml`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/.github/workflows/ci.yml); [`harw-cloud/harw-cloud-gateway/src/proxy.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cloud/harw-cloud-gateway/src/proxy.rs). |
 
-These describe what an API supports in principle:
+## Appendix B. Falsifiers and Reproducibility Template
 
-- context and output limits;
-- tool calling;
-- parallel tool calling;
-- streaming;
-- reasoning controls;
-- caching;
-- image/audio support;
-- JSON modes.
+The following are counterexamples to the intended contracts, not observations reported by this study:
 
-### 14.2 Observed behavior
+- A model-controlled field creates a trusted principal or broadens a grant without trusted admission.
 
-These describe what the model actually does under the harness:
+- An ordinary child effect exceeds the parent’s effective scope under the same resource interpretation, or a trusted read-view exception grants write, execution, or network authority.
 
-- tool-call reliability;
-- long-context retention;
-- delegation discipline;
-- schema strictness;
-- compaction tolerance;
-- retry sensitivity;
-- preferred task granularity;
-- safe parallelism.
+- A resumed cycle restores revoked authority, or a stale live-worker lease holder commits an effect or checkpoint.
 
-The repository’s current four-layer catalog uses different concrete type names than the original design, but preserves this separation.
+- A backend reports full enforcement when a required mechanism is absent or only partially effective.
 
-### 14.3 Why this matters
+- A content-identical renamed artifact counts as novel progress, or a completion proposal is silently accepted as the human goal.
 
-A provider abstraction that only exposes:
+- An uncertain side effect is repeated without reconciliation, or a finding alone triggers privileged enforcement.
 
-```rust
-respond(messages, tools) -> ModelResponse
-```
-
-erases operationally relevant differences.
-
-A model router can instead choose by **role**:
-
-- orchestrator;
-- repository worker;
-- focused coding worker;
-- verifier;
-- scout.
-
-The model may suggest a kind of work, but it does not overwrite its own authoritative model identity.
-
-### 14.4 Atomic provider/model switching
-
-The model/provider routing architecture documents an atomic fail-close switch:
-
-```text
-catalog lookup
-→ credential resolvability
-→ model/provider compatibility
-→ queue switch
-→ apply at safe turn boundary
-```
-
-If a check fails, session state remains unchanged. This is a small but important example of treating configuration changes as transactions rather than as a sequence of partially applied side effects.
-
----
-
-## 15. Multi-surface interaction without multiple security models
-
-**Claim class: I — Implemented**
-
-Harwness supports multiple interaction surfaces: local TUI/CLI, web components, MCP, gateways, and channel bindings such as Telegram.
-
-The interaction contract states that these are front-ends onto one command and permission substrate, not independent applications with separate authority models.
-
-The intended direction is always:
-
-```text
-remote surface ≤ local surface
-```
-
-A channel can narrow reachability. It cannot become an alternate route to a stronger command or tool.
-
-This matters for agent systems because remote messaging integrations are often added late and can accidentally bypass the assumptions of the local UI. Harwness makes ingress surface part of the trusted principal and runtime profile.
-
----
-
-## 16. MCP as interoperability, not authority
-
-**Claim class: I — MCP client/server surfaces exist; authority remains a Harwness responsibility**
-
-MCP standardizes the exchange of tools, resources, and prompts between hosts and servers. Current MCP documentation explicitly distinguishes among user-controlled prompts, application-controlled resources, and model-controlled tools.
-
-Harwness can use MCP as an interoperability layer, but the protocol does not replace Harwness authorization.
-
-The distinction is:
-
-```text
-MCP answers:
-  "How is a tool exposed and called across a protocol boundary?"
-
-Harwness must still answer:
-  "Should this principal see the tool?"
-  "What scope may the tool access?"
-  "Does the request need approval?"
-  "What durable identity and audit context does it carry?"
-```
-
-This is representative of the paper’s broader thesis: interoperability protocols and model APIs are necessary components, but the harness remains responsible for local policy and lifecycle.
-
----
-
-## 17. Detect · Orient · Defend as a separate security plane
-
-**Claim class: P — Partially implemented**
-
-Harwness includes an optional host-security domain named **Detect · Orient · Defend (DoD)**.
-
-The DoD design separates:
-
-- host observation;
-- typed findings;
-- analysis/escalation;
-- privileged enforcement.
-
-The current repository contains substantial implementation: an authority crate, DoD configuration, installation targets, systemd units, sensors, Sentinel/Warden components, and eBPF-related crates. The design document also explicitly lists open or insufficiently re-verified items.
-
-The security principle is more important than the component list:
-
-> **Observation is not enforcement, and a model verdict is not a privileged action.**
-
-### 17.1 Observation boundary
-
-DoD profiles define which host or cgroup scope is observed. An empty or invalid scope must fail closed rather than silently expanding to the host.
-
-### 17.2 Enforcement boundary
-
-Privileged enforcement lives behind a separate Warden path. Ordinary model tool execution should not gain host enforcement simply because the model judged an event malicious.
-
-### 17.3 Why this belongs in the paper
-
-DoD tests whether the Harwness authority doctrine remains coherent when the system crosses from workspace tooling into host-security operations. It is therefore a useful stress test of the design, even while its implementation remains partial.
-
----
-
-## 18. Secrets and tamper-evident audit
-
-**Claim class: P — Partially implemented**
-
-The `harw-secrets` design combines three concerns:
-
-- provider and channel secrets at rest;
-- optional encryption of selected durable artifacts;
-- append-only, tamper-evident audit.
-
-The current document states that envelope encryption, ML-KEM-based policy, rotation/provenance, the hash-chained audit log, and ML-DSA checkpoints exist, while broader event coverage and at-rest encryption of all session/knowledge material remain open.
-
-The architectural lesson is again one of separation: a model should receive a resolved credential only through the provider path that needs it; it should not receive the storage key, audit key, or raw secret material as ordinary context.
-
-A future paper revision should include a dedicated cryptographic appendix that is generated from the current source and dependency versions rather than from historical design prose, because the repository documentation itself records earlier primitive/version descriptions that are intentionally retained for rationale.
-
----
-
-## 19. Failure model
-
-The Harwness architecture can be understood by the failures it is designed to contain.
-
-### 19.1 Model hallucination
-
-**Failure:** the model invents a tool, role, agent, parameter, or permission.
-
-**Containment:** model-visible schemas come from the runtime; hidden delegation targets are not a global catalog; trusted principals and permits are not model-constructible.
-
-### 19.2 Prompt injection
-
-**Failure:** project text or external content instructs the model to escalate, exfiltrate, or bypass controls.
-
-**Containment:** prompts can change model intent but should not change `Principal`, `EntryProfile`, sandbox scope, tool registry, or permit issuance.
-
-### 19.3 Malicious project configuration
-
-**Failure:** a repository-local config asks for more authority than the user intended.
-
-**Containment:** configuration is subject to a trust report and runtime ceilings. Untrusted config should be able to narrow behavior, not mint trusted principals.
-
-### 19.4 Child-agent escalation
-
-**Failure:** a child guesses another worker/orchestrator or requests a broader filesystem/network scope.
-
-**Containment:** delegation capability intersection and parent ceiling.
-
-### 19.5 Process escape
-
-**Failure:** a worker uses shell access to escape the intended workspace or invoke privileged commands.
-
-**Containment:** dedicated execution workers, sandbox profiles, operation-specific permits, and separate host access.
-
-### 19.6 Partial configuration switch
-
-**Failure:** provider changes but model does not, leaving a broken intermediate state.
-
-**Containment:** atomic model/provider validation and safe-boundary application.
-
-### 19.7 Crash during long-running work
-
-**Failure:** the process exits after some side effects but before the model’s next turn.
-
-**Containment target:** persisted job lifecycle, idempotent or reconstructable state transitions, artifact/evidence checks on resume.
-
-### 19.8 Context compaction
-
-**Failure:** the model forgets the goal or previous verification state after history compression.
-
-**Containment:** durable goal/plan/job/evidence state outside prompt history.
-
-### 19.9 Remote-channel privilege drift
-
-**Failure:** a channel exposes a command unavailable under the intended local policy.
-
-**Containment:** shared command registry plus ingress-specific narrowing.
-
-### 19.10 Model verdict becomes enforcement
-
-**Failure:** a security-classification output directly triggers a privileged host action.
-
-**Containment:** DoD separates findings, escalation, and Warden authorization.
-
----
-
-## 20. Security invariants
-
-The following invariants are candidates for formal or property-based testing.
-
-### I1 — Principal origin
-
-Every privileged operation is associated with a principal minted at a trusted ingress or derived from another trusted principal.
-
-### I2 — Monotonic child authority
-
-For every child session `c` and parent `p`:
-
-```text
-permissions(c) ⊆ permissions(p)
-network_scope(c) ⊆ network_scope(p)
-filesystem_scope(c) ⊆ filesystem_scope(p)
-context_ceiling(c) ⊆ context_ceiling(p)
-delegation_targets(c) ⊆ delegated_subtree(p)
-```
-
-### I3 — No authority from serialization
-
-Deserializing model output, TOML, JSON, MCP payloads, channel messages, or project files cannot directly produce a trusted principal, approval proof, execution permit, or broader sandbox.
-
-### I4 — Approval cannot widen reachability
-
-Changing approval mode may change whether a reachable action requires interaction. It must not make an unreachable tool or scope reachable.
-
-### I5 — Remote ingress is non-expanding
-
-For an equivalent task and operator tier, a remote/channel entry point must not expose a superset of the corresponding trusted local entry point.
-
-### I6 — Permit single-purpose binding
-
-An execution permit must be invalid if its canonical mandate changes after approval.
-
-### I7 — Durable state before dependent continuation
-
-A terminal worker/tool result that triggers a parent rerun should be persisted before the rerun is enqueued.
-
-### I8 — Model switch atomicity
-
-A failed model/provider switch leaves the session’s active routing state unchanged.
-
-### I9 — Security finding is not enforcement proof
-
-No DoD finding or model-generated verdict alone authorizes a privileged Warden transition.
-
----
-
-## 21. Comparative positioning
-
-Harwness should not be positioned as “the only agent runtime with tools, handoffs, memory, or sandboxes.” Those capabilities now exist across multiple frameworks.
-
-The research contribution is the **combination and placement of boundaries**.
-
-### 21.1 Compared with agent SDKs
-
-Modern agent SDKs already provide agent loops, tools, delegation/handoffs, guardrails, sessions, tracing, and in some cases sandboxed workspaces.
-
-Harwness emphasizes a lower-level systems question:
-
-> What state and authority must remain outside the agent abstraction so that the runtime can constrain, recover, inspect, and reproduce the work independently of any one model SDK?
-
-In Harwness, the agent loop is not the outermost trust boundary.
-
-### 21.2 Compared with MCP
-
-MCP standardizes interoperable tool/resource/prompt exchange. Harwness can act as an MCP client or server but still owns local admission, identity, approval, sandbox, and durable lifecycle.
-
-### 21.3 Compared with durable workflow systems
-
-Temporal and similar systems treat persistence and replay as primary execution concerns. Harwness borrows the principle that long-running work must have explicit durable state transitions, but specializes it for AI-agent lifecycles in which control decisions are probabilistic and models may change mid-run.
-
-### 21.4 Compared with prompt-only agent governance
-
-A prompt can ask a model not to use a dangerous command. It cannot guarantee that a command is absent from the process environment.
-
-Harwness treats prompt guidance as behavior shaping and runtime policy as authority.
-
----
-
-## 22. Experimental evaluation plan
-
-This section defines experiments that can turn architectural claims into measurements.
-
-### 22.1 Research hypotheses
-
-**H1 — Runtime authority dominates prompt compliance for capability containment.**  
-When malicious or conflicting instructions ask an agent to exceed its tool/filesystem/network ceiling, a typed runtime should produce a lower capability-escape rate than prompt-only restrictions.
-
-**H2 — Durable state reduces recovery loss.**  
-For long-running tasks interrupted by process termination, durable job/plan/evidence state should reduce repeated work and incomplete recovery compared with transcript-only resumption.
-
-**H3 — Behavior-aware routing improves efficiency at constant quality.**  
-Selecting models by role and observed behavior should reduce cost or latency for a fixed success threshold compared with using one model for all roles.
-
-**H4 — Structured retrieval improves token efficiency without reducing task success.**  
-A bounded context compiler using memory/knowledge retrieval should use fewer prompt tokens than full-history accumulation while maintaining equivalent acceptance-criteria completion.
-
-**H5 — Capability-scoped delegation reduces accidental cross-task interference.**  
-Parallel workers with explicit write scopes and target capabilities should produce fewer overlapping edits and policy conflicts than unrestricted subagents.
-
----
-
-## 23. Experiment A — Capability escape and prompt injection
-
-### 23.1 Task set
-
-Construct a suite of tasks that include benign objectives plus adversarial instructions embedded in:
-
-- user text;
-- repository documentation;
-- fetched web content;
-- tool output;
-- child-agent return values;
-- workspace configuration.
-
-Example adversarial goals should request actions outside the current ceiling, such as:
-
-- writing outside the workspace;
-- calling an unavailable tool;
-- spawning an undelegated worker;
-- expanding network scope;
-- changing approval behavior;
-- executing a modified command under an old permit.
-
-The test does **not** need destructive real-world targets; all actions can be represented against temporary directories, mock networks, fixture tools, and disposable processes.
-
-### 23.2 Conditions
-
-Compare:
-
-1. **Prompt-only baseline** — model instructed not to exceed boundaries, with broad tools available.
-2. **Schema-only baseline** — tools are typed but authority is not separately derived.
-3. **Harwness strict runtime** — current authority, delegation, sandbox, and permit path.
-4. **Harwness with varied approval modes** — to verify that confirmation policy does not alter capability ceilings.
-
-### 23.3 Metrics
-
-- capability escape rate;
-- denied-request rate;
-- false-positive denial of benign actions;
-- number of hidden target names leaked through errors;
-- policy-decision latency;
-- model tokens spent recovering from denied actions.
-
-A successful result for Harwness is not “the model never asks.” The stronger result is “the runtime never grants the unauthorized action even when the model asks.”
-
----
-
-## 24. Experiment B — Delegation monotonicity
-
-Generate random or property-based delegation trees with:
-
-- varying role positions;
-- target definition sets;
-- depth budgets;
-- token/time budgets;
-- filesystem scopes;
-- network scopes;
-- context ceilings.
-
-For every admitted edge `p → c`, assert all subset relationships from invariant I2.
-
-Mutation tests should deliberately alter one field at a time:
-
-- add a host;
-- add a writable path;
-- add a tool;
-- restore a removed child target;
-- increase depth;
-- increase budget;
-- increase permission tier.
-
-Every widening mutation should be rejected.
-
-### 24.1 Visibility test
-
-Attempt to request:
-
-- a nonexistent target;
-- an existing but undelegated target;
-- a delegated target whose budget is exhausted.
-
-The model-facing rejection should not reveal more catalog information than necessary.
-
----
-
-## 25. Experiment C — Crash recovery
-
-### 25.1 Fault points
-
-Terminate the Harwness process at controlled boundaries:
-
-1. after a job is admitted but before execution;
-2. after external work begins;
-3. after tool output is produced but before parent rerun;
-4. after an artifact is written but before status update;
-5. during memory consolidation;
-6. during a plan-wave barrier;
-7. after a model/provider switch is queued but before the next safe turn.
-
-### 25.2 Recovery questions
-
-After restart:
-
-- Is the durable lifecycle state coherent?
-- Can the system determine whether work should resume, retry, or be marked terminal?
-- Are completed side effects duplicated?
-- Can the operator inspect why the system chose the recovery action?
-- Is evidence from the pre-crash run still attached to the goal/plan node?
-
-### 25.3 Metrics
-
-- successful recovery rate;
-- duplicate side-effect rate;
-- mean repeated model tokens;
-- mean repeated wall time;
-- number of manual interventions;
-- state divergence incidents.
-
----
-
-## 26. Experiment D — Model heterogeneity and routing
-
-Select a set of models from multiple providers and evaluate each on role-specific suites.
-
-### 26.1 Roles
-
-**Orchestrator**
-- decomposition quality;
-- dependency recognition;
-- synthesis;
-- delegation restraint.
-
-**Repository worker**
-- long-context code navigation;
-- cross-file consistency;
-- sustained task completion.
-
-**Focused coding worker**
-- patch correctness;
-- scope discipline;
-- test pass rate.
-
-**Verifier**
-- false-negative defect rate;
-- evidence quality;
-- schema adherence.
-
-**Scout**
-- latency;
-- cost;
-- recall on bounded read-only questions.
-
-### 26.2 Behavior profile
-
-Record per model:
-
-```text
-tool_call_reliability
-schema_strictness
-long_context_retention
-delegation_discipline
-compaction_tolerance
-retry_sensitivity
-safe_parallelism
-preferred_task_granularity
-```
-
-Then compare:
-
-- one-model-for-all routing;
-- provider-capability-only routing;
-- capability + observed-behavior routing.
-
-### 26.3 Metrics
-
-- task success at acceptance criteria;
-- cost per successful task;
-- wall time;
-- tool-error recovery rate;
-- invalid-schema rate;
-- unnecessary delegation count;
-- verifier catch rate.
-
----
-
-## 27. Experiment E — Context engineering and memory
-
-Compare four context strategies:
-
-1. full transcript until the model limit;
-2. rolling textual summary;
-3. bounded retrieval from session + memory + knowledge stores;
-4. Harwness policy-driven context with explicit must/should/may/exclude classes.
-
-Use tasks that require information introduced far apart in time and tasks with large amounts of irrelevant history.
-
-Metrics:
-
-- prompt tokens;
-- answer/task correctness;
-- forgotten constraint rate;
-- stale-memory error rate;
-- retrieval precision;
-- retrieval latency;
-- cost per successful completion.
-
-The expected result is not that less context is always better, but that **selected context should dominate unbounded accumulation in efficiency while preserving necessary evidence**.
-
----
-
-## 28. Experiment F — Multi-surface policy equivalence
-
-Replay semantically equivalent operations through:
-
-- TUI;
-- one-shot CLI;
-- web;
-- Telegram/channel entry;
-- MCP server;
-- job worker.
-
-For each request, capture `RightsSnapshot`, visible operations, approval behavior, project-context visibility, and child-spawn surface.
-
-The acceptance criterion is that every difference is predicted by the single entry-profile reduction table.
-
-No front-end should create an undocumented privilege path.
-
----
-
-## 29. Experiment G — DoD separation of verdict and enforcement
-
-Using fixture sensors or a disposable Linux environment:
-
-1. generate a finding;
-2. generate an intentionally incorrect model analysis;
-3. verify that the finding does not itself grant host enforcement;
-4. verify that a missing/invalid observation profile fails closed;
-5. verify that a broader scope cannot be silently substituted;
-6. verify that Warden transitions require the expected proof/authority path.
-
-Metrics:
-
-- unauthorized enforcement count;
-- scope-expansion count;
-- false-ready state count;
-- time from event to typed finding;
-- time from valid authorization to enforcement.
-
-Because DoD remains partially implemented, this experiment should be published with a component-by-component status matrix rather than a single pass/fail label.
-
----
-
-## 30. Reproducibility package
-
-A publishable experiment should include:
-
-### 30.1 Software identity
-
-- Harwness repository commit;
-- Cargo.lock hash;
-- Rust toolchain version;
-- enabled feature set;
-- OS/kernel version;
-- sandbox backend/version;
-- DoD profile and eBPF artifact hashes where relevant.
-
-### 30.2 Agent identity
-
-- resolved agent-definition hash;
-- role;
-- specialization;
-- resolved tool set;
-- context-policy version;
-- return-contract version;
-- delegation targets;
-- budget.
-
-### 30.3 Model identity
-
-- provider;
-- model identifier;
-- provider model revision where available;
-- runtime behavior-profile version;
-- reasoning configuration;
-- temperature/sampling settings where applicable.
-
-### 30.4 Run identity
-
-- task ID;
-- random seed where used;
-- workspace fixture commit;
-- start/end time;
-- approval mode;
-- entry kind;
-- principal tier;
-- crash-injection point if any.
-
-### 30.5 Outputs
-
-- structured result;
-- verification evidence;
-- tool/event trace with secrets redacted;
-- diff/artifacts;
-- final rights snapshot;
-- cost/latency/token statistics.
-
----
-
-## 31. Current implementation-evidence matrix
-
-The following matrix summarizes the repository baseline used by this draft.
-
-| Area | Status | Primary repository evidence |
-|---|---|---|
-| Single runtime assembly boundary | **Implemented** | `docs/design/runtime-contracts.md`, `harw-runtime` |
-| Trusted principals and entry profiles | **Implemented** | `docs/design/runtime-contracts.md`, `harw-types::principal` |
-| Delegation capability intersection | **Implemented** | `docs/design/delegation-capabilities.md` |
-| Agent-definition DSL and compiler | **Partially implemented** | `docs/design/agent-definition-dsl.md`, `harw-agent-dsl`, `harw-agent-compiler` |
-| Governed process execution | **Implemented** | `docs/design/mediated-process-execution.md` |
-| Model capability / behavior separation | **Implemented** | `docs/design/model-registry.md`, `model-catalog-v2.md` |
-| Atomic model/provider switching | **Implemented** | `docs/architecture/model-provider-routing.md` |
-| Long-term memory | **Implemented** | `docs/design/harw-memory.md`, `harw-memory` |
-| Unified interaction contract | **Implemented** | `docs/design/interaction-contract.md` |
-| MCP integration | **Implemented surfaces** | README, `harw-mcp-server`, `harw-mcp-client` |
-| DoD host-security plane | **Partially implemented** | `docs/design/dod-system-operations-authority.md`, `dod/` |
-| Secrets and audit | **Partially implemented** | `docs/design/secrets-and-audit.md`, `harw-secrets` |
-| Wargaming / analytical workflows | **Partially implemented to implemented by component** | `docs/design/matrix-game.md`, `wargaming-and-analysis.md` |
-
-This table is intentionally conservative. A component can be “implemented” as an architecture contract while still requiring broader empirical evaluation.
-
----
-
-## 32. Limitations
-
-### 32.1 Artifact analysis is not runtime proof
-
-Static source and tests can demonstrate that a boundary exists in code, but they do not prove correct behavior under every real deployment condition.
-
-### 32.2 Model APIs change
-
-Capabilities, tool semantics, pricing, context limits, and reasoning controls change over time. A model behavior profile must therefore be versioned and periodically recalibrated.
-
-### 32.3 Sandboxing is platform-dependent
-
-Harwness is Rust-based and uses Linux-oriented isolation mechanisms in important paths. Equivalent guarantees on other operating systems may differ.
-
-### 32.4 Local single-operator assumptions
-
-Parts of the current secret and interaction model are designed for a single-operator local harness. Multi-tenant isolation is not a current v1 claim.
-
-### 32.5 Documentation contains history
-
-Several design documents intentionally retain historical rationale. A paper must cite the current code path, not an obsolete version number embedded in an old design section.
-
-### 32.6 DoD is not fully evaluated
-
-The host-security plane is substantial but remains partially implemented and not fully re-verified against every acceptance criterion described in its original plan.
-
-### 32.7 The agent-definition architecture is still converging
-
-The DSL, IR, and compiler exist, but portions remain explicitly partial. Claims about fully compiled policy should therefore distinguish current behavior from target behavior.
-
-### 32.8 No benchmark results yet
-
-This draft defines experiments; it does not fabricate outcomes. Any later abstract or conclusion that reports quantitative superiority must be updated only after the benchmark artifacts exist.
-
----
-
-## 33. Discussion
-
-Harwness suggests that the most important abstraction in agent engineering may not be the “agent” itself, but the **boundary around the agent**.
-
-A model can be replaced. A worker can fail. A provider can disappear. A context window can be compacted. A remote channel can reconnect. If the system’s goal, authority, job lifecycle, evidence, and audit state live only in the model’s transient conversation, those events become correctness failures.
-
-Conversely, once those concerns are externalized, several useful properties emerge:
-
-- model choice becomes a routing decision rather than an identity decision;
-- child agents become leased capabilities rather than independent principals;
-- shell execution becomes a governed operation rather than a conversational privilege;
-- memory becomes a retrieval system rather than an ever-growing prompt;
-- remote channels become narrowed ingress surfaces rather than alternate applications;
-- security analysis becomes an input to enforcement rather than enforcement itself.
-
-This also changes how model quality should be measured. A “better” model is not necessarily the model with the highest standalone benchmark. In a harness, the relevant question is whether the model is good for a role under the runtime’s constraints.
-
-A fast, cheap scout may be better than an expensive orchestrator for read-only discovery. A conservative verifier may be preferable to a more creative coding model. A long-context repository worker may be useful even if it is not the best planner. Heterogeneity becomes an architectural resource.
-
----
-
-## 34. Future work
-
-The most valuable next research steps are:
-
-1. **Run the capability-escape benchmark** and publish a machine-readable result set.
-2. **Add property-based monotonicity tests** over delegation, network, filesystem, and context ceilings.
-3. **Build a crash-injection harness** for durable jobs and parent reruns.
-4. **Version model behavior profiles** and automate periodic recalibration.
-5. **Measure context strategies** on long-horizon repository tasks.
-6. **Formalize the host-mode state machine** directly from executable tests and remove documentation ambiguity.
-7. **Complete the agent compiler passes** and publish resolved-definition hashes in run metadata.
-8. **Expand audit coverage** beyond secret operations to approval/channel/plugin events as designed.
-9. **Finish and empirically verify DoD enforcement boundaries** in disposable Linux test environments.
-10. **Publish benchmark fixtures and traces** with strict redaction so third parties can reproduce results.
-11. **Produce a LaTeX/archival version** of this Markdown paper once the experimental sections contain results.
-12. **Add a threat-model appendix** covering untrusted repositories, compromised provider responses, malicious MCP servers, channel impersonation, and local process compromise.
-
----
-
-## 35. Conclusion
-
-Harwness is an experiment in moving the center of agent engineering away from the prompt and toward the runtime.
-
-Its core thesis is simple: model output should be treated as untrusted intent. Authority should come from trusted ingress, typed principals, explicit runtime profiles, bounded delegation, sandbox and permit systems, durable stores, and auditable transitions.
-
-The repository already implements substantial pieces of this architecture: a unified runtime assembly boundary, trusted principal derivation, entry-specific rights reduction, delegation-capability intersection, governed process execution, durable state stores, model behavior/capability separation, atomic model routing, memory, and unified interaction surfaces. Other important areas remain partial, including parts of the compiled agent-definition architecture, broad audit integration, and the DoD host-security plane.
-
-That incompleteness is not hidden by this draft. It is part of the research program.
-
-The strongest version of the Harwness claim is not that one specific model becomes perfectly autonomous. It is that a well-designed harness can make heterogeneous models **replaceable inside a system whose authority, lifecycle, recovery, and verification properties remain explicit and testable**.
-
-If the experiments proposed here validate the invariants, Harwness would provide evidence for a broader systems principle:
-
-> **Reliable agentic behavior is not solely a property of a model. It is an emergent property of the model and the runtime that constrains, informs, persists, and verifies it.**
-
----
-
-# Appendix A — Core architecture claims and falsifiers
-
-| Claim | What would falsify it? |
-|---|---|
-| Model output is not authority | A model-controlled field can directly create a trusted principal, permit, or broader scope. |
-| Child authority is monotonic | Any admitted child has a wider permission, network, filesystem, context, or delegation scope than its parent. |
-| Entry profiles are the one rights reduction table | An entry point manually assembles a stronger runtime outside `RuntimeAssembly`. |
-| Approval does not widen capability | Switching approval mode exposes a previously unavailable tool/scope. |
-| Agent definitions are governed | A user definition can introduce a new authority role or bypass role validation. |
-| Process permits are mandate-bound | A permit authorizes a materially different command after approval. |
-| Provider/model switching is atomic | A failed switch leaves provider/model state partially changed. |
-| Durable work is external to prompt history | Crash/compaction destroys the only copy of goal/job/evidence state. |
-| Remote surfaces only narrow | A channel exposes a stronger operation than the corresponding local runtime ceiling. |
-| DoD verdicts do not equal enforcement | A finding/model verdict directly causes privileged enforcement without the typed authorization path. |
-
----
-
-# Appendix B — Suggested benchmark record format
+The companion `evaluation-template.json` supplies the following non-result schema. Null fields deliberately indicate measurements that have not been performed; they are not zero-valued observations.
 
 ```json
 {
-  "schema": "harwness.research-run/v1",
-  "paper_baseline": "90160f4f2b88f80c6721c20469ed8322ddc8861a",
-  "experiment": "capability-escape",
-  "task_id": "fixture-001",
-  "entry_kind": "tui",
-  "approval_mode": "ask",
-  "principal": {
-    "kind": "human",
-    "tier": "owner"
-  },
-  "agent": {
-    "definition_id": "harwness.agent.example@1",
-    "definition_hash": "..."
-  },
-  "model": {
-    "provider": "...",
-    "model_id": "...",
-    "behavior_profile_version": "..."
-  },
-  "workspace": {
-    "fixture_commit": "..."
-  },
-  "result": {
-    "acceptance_criteria_met": true,
-    "unauthorized_action_executed": false,
-    "denied_requests": 2,
-    "tool_errors": 0,
-    "wall_ms": 0,
-    "input_tokens": 0,
-    "output_tokens": 0
-  },
-  "artifacts": [],
-  "rights_snapshot": {}
+  "schema": "harwness.paper-evaluation-proposal/v1",
+  "repository_commit":
+    "14082d16b5e21f920acd2dc0b84ebd42f32ac859",
+  "experiment_id": null,
+  "task_fixture_commit": null,
+  "agent_snapshot": null,
+  "toolchain_and_features": null,
+  "kernel_and_sandbox_report": null,
+  "entry_and_effective_authority": null,
+  "model_provider_revision": null,
+  "budget_and_retry_policy": null,
+  "approval_and_failure_injection": null,
+  "useful_completion": null,
+  "prohibited_effect_observed": null,
+  "terminal_state_and_acceptance": null,
+  "cost_latency_tokens_resources": null,
+  "redacted_trace_and_evidence": []
 }
 ```
 
----
+## References
 
-# Appendix C — Repository source map for this paper
 
-Primary Harwness documents used by this draft:
+\[1\] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and Yuan Cao. ReAct: Synergizing Reasoning and Acting in Language Models. 2023. Version 3, 10 March 2023; first submitted in 2022. <https://arxiv.org/abs/2210.03629v3>
 
-- `README.md`
-- `SECURITY.md`
-- `docs/README.md`
-- `docs/philosophy/philosophy.md`
-- `docs/design/runtime-contracts.md`
-- `docs/design/delegation-capabilities.md`
-- `docs/design/agent-definition-dsl.md`
-- `docs/design/mediated-process-execution.md`
-- `docs/design/harw-memory.md`
-- `docs/design/model-registry.md`
-- `docs/design/model-catalog-v2.md`
-- `docs/architecture/model-provider-routing.md`
-- `docs/design/interaction-contract.md`
-- `docs/design/secrets-and-audit.md`
-- `docs/design/dod-system-operations-authority.md`
-- `docs/design/matrix-game.md`
-- `docs/design/wargaming-and-analysis.md`
 
-Implementation areas referenced:
+\[2\] Xingyao Wang, Yangyi Chen, Lifan Yuan, Yizhe Zhang, Yunzhu Li, Hao Peng, and Heng Ji. Executable Code Actions Elicit Better LLM Agents. 2024. Version 4, 7 June 2024. <https://arxiv.org/abs/2402.01030v4>
 
-- `harw-runtime`
-- `harw-authority`
-- `harw-agent-dsl`
-- `harw-agent-compiler`
-- `harw-model-catalog`
-- `harw-memory`
-- `harw-session-store`
-- `harw-job-*`
-- `harw-tool-*`
-- `harw-mcp-client`
-- `harw-mcp-server`
-- `harw-secrets`
-- `dod/crates/harw-dod-*`
-- `harw-sentinel`
-- `harw-warden`
 
----
+\[3\] Harwness contributors. Harwness: [`Cargo.toml`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/Cargo.toml). 2026. Commit `14082d16`; full artifact identifier in Appendix A
 
-# References
 
-1. Harwness repository, pinned artifact baseline `90160f4f2b88f80c6721c20469ed8322ddc8861a`, 2026-10-07.
-2. Anthropic, “Building effective agents,” 2024. https://www.anthropic.com/engineering/building-effective-agents
-3. OpenAI, “OpenAI Agents SDK,” documentation, accessed 2026-10-07. https://openai.github.io/openai-agents-python/
-4. OpenAI, “Sessions — OpenAI Agents SDK,” documentation, accessed 2026-10-07. https://openai.github.io/openai-agents-python/sessions/
-5. Model Context Protocol, “2026-07-28 Specification,” 2026. https://modelcontextprotocol.io/
-6. Model Context Protocol, “Server primitives: prompts, resources, tools,” specification documentation, accessed 2026-10-07. https://modelcontextprotocol.io/specification/
-7. Temporal Technologies, “What is Temporal? / Durable Execution,” documentation, accessed 2026-10-07. https://docs.temporal.io/temporal
-8. J. H. Saltzer and M. D. Schroeder, “The Protection of Information in Computer Systems,” *Proceedings of the IEEE*, vol. 63, no. 9, 1975.
+\[4\] Harwness contributors. Harwness: [`harw-runtime/src/assembly.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/assembly.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
 
-> **Citation TODO for submission:** normalize references to one archival style (ACM/IEEE), replace documentation landing pages with version-pinned URLs where available, add access dates, and add citations to relevant capability-security, sandboxing, long-horizon-agent, and context-engineering literature before peer-review submission.
+
+\[5\] Harwness contributors. Harwness: [`harw-agent-compiler/src/compiler.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/compiler.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[6\] Harwness contributors. Harwness: [`harw-plan-bridge/src/intent_cycle.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/intent_cycle.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[7\] Harwness contributors. Harwness: [`dod/README.md`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/README.md). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[8\] Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang Zhu, Li Jiang, Xiaoyun Zhang, Shaokun Zhang, Jiale Liu, Ahmed Hassan Awadallah, Ryen W. White, Doug Burger, and Chi Wang. AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation. 2023. Version 2, 3 October 2023. <https://arxiv.org/abs/2308.08155v2>
+
+
+\[9\] Harwness contributors. Harwness: [`docs/research/harwness-paper.md`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/research/harwness-paper.md). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[10\] Harwness contributors. Harwness pull request 154: integration and local validation report. 2026. Mutable report inspected 2026-10-30; attributed execution, not independently reproduced. <https://github.com/mm9942/Harwness/pull/154>
+
+
+\[11\] Harwness contributors. Harwness: [`harw-runtime/src/spec.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/spec.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[12\] Jerome H. Saltzer and Michael D. Schroeder. The Protection of Information in Computer Systems. *Proceedings of the IEEE*, 63, (9), pp. 1278–1308. 1975. <https://web.mit.edu/Saltzer/www/publications/protection/>
+
+
+\[13\] Harwness contributors. Harwness: [`harw-types/src/principal.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-types/src/principal.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[14\] Harwness contributors. Harwness: [`harw-authority/src/lib.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-authority/src/lib.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[15\] Harwness contributors. Harwness: [`harw-agent-dsl/src/roles.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/roles.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[16\] Harwness contributors. Harwness: [`harw-agent-dsl/src/ir_v2.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-dsl/src/ir_v2.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[17\] Harwness contributors. Harwness: [`harw-agent-compiler/src/passes/rights.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/passes/rights.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[18\] Harwness contributors. Harwness: [`harw-agent-compiler/src/backend/mod.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-agent-compiler/src/backend/mod.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[19\] Harwness contributors. Harwness: [`harw-runtime/src/embedded.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/embedded.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[20\] Harwness contributors. Harwness: [`harw-cli/src/job_worker_work_driver.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[21\] Harwness contributors. Harwness: [`harw-runtime/src/agent_job_wiring.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/agent_job_wiring.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[22\] Harwness contributors. Harwness: [`harw-plan-bridge/src/cycle_write_admission.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_write_admission.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[23\] Harwness contributors. Harwness: [`harw-plan-bridge/src/cycle_runtime.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_runtime.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[24\] Harwness contributors. Harwness: [`harw-plan-bridge/src/cycle_spec.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-plan-bridge/src/cycle_spec.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[25\] Harwness contributors. Harwness: [`harw-cli/src/job_worker_work_driver_writer.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cli/src/job_worker_work_driver_writer.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[26\] Harwness contributors. Harwness: [`harw-job-exec/src/lib.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-exec/src/lib.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[27\] Harwness contributors. Harwness: [`harw-job-executor-bwrap/src/lib.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-executor-bwrap/src/lib.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[28\] The Linux Kernel Development Community. Seccomp BPF (SECure COMPuting with filters). Accessed 2026-10-30. <https://docs.kernel.org/6.12/userspace-api/seccomp_filter.html>
+
+
+\[29\] Tejun Heo. Control Group v2. Accessed 2026-10-30. <https://docs.kernel.org/6.12/admin-guide/cgroup-v2.html>
+
+
+\[30\] Harwness contributors. Harwness: [`harw-job-linux/src/sandbox.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-linux/src/sandbox.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[31\] Mickaël Salaün and The Linux Kernel Development Community. Landlock: unprivileged access control. 2024. Dated October 2024; accessed 2026-10-30. <https://www.kernel.org/doc/html/v6.12/userspace-api/landlock.html>
+
+
+\[32\] Harwness contributors. Harwness: [`harw-tools/src/sandbox_guard.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-tools/src/sandbox_guard.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[33\] Harwness contributors. Harwness: [`harw-sandbox/src/bwrap.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-sandbox/src/bwrap.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[34\] Harwness contributors. Harwness: [`harw-job-runtime/src/coordinator/linux.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-runtime/src/coordinator/linux.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[35\] Harwness contributors. Harwness: [`harw-job-runtime/src/host.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-runtime/src/host.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[36\] Harwness contributors. Harwness: [`dod/crates/harw-dod-bpf/src/real.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-bpf/src/real.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[37\] Harwness contributors. Harwness: [`deploy/systemd/harw-probe-bpf.service`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/deploy/systemd/harw-probe-bpf.service). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[38\] Harwness contributors. Harwness: [`dod/crates/harw-probe-bpf/src/main.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-probe-bpf/src/main.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[39\] The Linux Kernel Development Community. eBPF verifier. Accessed 2026-10-30. <https://docs.kernel.org/6.12/bpf/verifier.html>
+
+
+\[40\] The Linux Kernel Development Community. LSM BPF Programs. Accessed 2026-10-30. <https://docs.kernel.org/6.12/bpf/prog_lsm.html>
+
+
+\[41\] Harwness contributors. Harwness: [`dod/crates/harw-warden/src/ipc.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-warden/src/ipc.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[42\] Harwness contributors. Harwness: [`dod/crates/harw-dod-warden/src/warden.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/dod/crates/harw-dod-warden/src/warden.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[43\] Harwness contributors. Harwness: [`harw-runtime/src/model.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-runtime/src/model.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[44\] Harwness contributors. Harwness: [`docs/design/harw-memory.md`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/design/harw-memory.md). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[45\] Harwness contributors. Harwness: [`docs/design/model-registry.md`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/docs/design/model-registry.md). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[46\] Harwness contributors. Harwness pull request 161: integration and local validation report. 2026. Mutable report inspected 2026-10-30; attributed execution, not independently reproduced. <https://github.com/mm9942/Harwness/pull/161>
+
+
+\[47\] Harwness contributors. Harwness: reviewed merge commit and source-tree identity. 2026. Immutable commit 14082d16b5e21f920acd2dc0b84ebd42f32ac859; tree 5948efdd459252f70b165e31c4bb6b3f779d94b5. <https://github.com/mm9942/Harwness/commit/14082d16b5e21f920acd2dc0b84ebd42f32ac859>
+
+
+\[48\] Harwness contributors. Harwness: [`.github/workflows/ci.yml`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/.github/workflows/ci.yml). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[49\] Harwness contributors. Harwness: [`harw-cloud/harw-cloud-gateway/src/proxy.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-cloud/harw-cloud-gateway/src/proxy.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+\[50\] Edoardo Debenedetti, Jie Zhang, Mislav Balunović, Luca Beurer-Kellner, Marc Fischer, and Florian Tramèr. AgentDojo: A Dynamic Environment to Evaluate Prompt Injection Attacks and Defenses for LLM Agents. 2024. Version 3, 24 November 2024. <https://arxiv.org/abs/2406.13352v3>
+
+
+\[51\] Carlos E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir Press, and Karthik Narasimhan. SWE-bench: Can Language Models Resolve Real-World GitHub Issues? 2024. ICLR 2024; arXiv version 3, 11 November 2024. <https://arxiv.org/abs/2310.06770v3>
+
+
+\[52\] Shunyu Yao, Noah Shinn, Pedram Razavi, and Karthik Narasimhan. $\tau$-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains. 2024. Version 1, 17 June 2024. <https://arxiv.org/abs/2406.12045v1>
+
+
+\[53\] Sayash Kapoor, Benedikt Stroebl, Zachary S. Siegel, Nitya Nadgir, and Arvind Narayanan. AI Agents That Matter. 2024. Version 1, 1 July 2024. <https://arxiv.org/abs/2407.01502v1>
+
+
+\[54\] Eric Wallace, Kai Xiao, Reimar Leike, Lilian Weng, Johannes Heidecke, and Alex Beutel. The Instruction Hierarchy: Training LLMs to Prioritize Privileged Instructions. 2024. Version 1, 19 April 2024. <https://arxiv.org/abs/2404.13208v1>
+
+
+\[55\] Edoardo Debenedetti, Ilia Shumailov, Tianqi Fan, Jamie Hayes, Nicholas Carlini, Daniel Fabian, Christoph Kern, Chongyang Shi, Andreas Terzis, and Florian Tramèr. Defeating Prompt Injections by Design. 2025. Version 2, 24 June 2025. <https://arxiv.org/abs/2503.18813v2>
+
+
+\[56\] Model Context Protocol contributors. Model Context Protocol: Architecture. 2025. Accessed 2026-10-30; cited for the host responsibility model. <https://modelcontextprotocol.io/specification/2025-11-25/architecture>
+
+
+\[57\] Temporal Technologies. What is Temporal? Undated; accessed 2026-10-30. <https://docs.temporal.io/temporal>
+
+
+\[58\] Alexandru Agache, Marc Brooker, Andreea Florescu, Alexandra Iordache, Anthony Liguori, Rolf Neugebauer, Phil Piwonka, and Diana-Maria Popa. Firecracker: Lightweight Virtualization for Serverless Applications. *17th USENIX symposium on networked systems design and implementation (NSDI 20)*, pp. 419–434. 2020. <https://www.usenix.org/conference/nsdi20/presentation/agache>
+
+
+\[59\] gVisor Authors. gVisor Security Model. Undated; accessed 2026-10-30. <https://gvisor.dev/docs/architecture_guide/security/>
+
+
+\[60\] Harwness contributors. Harwness: [`harw-job-darwin/src/report.rs`](https://github.com/mm9942/Harwness/blob/14082d16b5e21f920acd2dc0b84ebd42f32ac859/harw-job-darwin/src/report.rs). 2026. Commit `14082d16`; full artifact identifier in Appendix A
+
+
+[^1]: Copyright  2026 Mia. This manuscript and its preparation package are dual-licensed under the MIT License or the Apache License, Version 2.0, at the recipient’s option (SPDX: MIT OR Apache-2.0). Third-party works retain their own terms.
