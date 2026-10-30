@@ -11,6 +11,164 @@ use tokio::io::AsyncWriteExt;
 
 const LIMIT: Duration = Duration::from_secs(10);
 
+/// Hold the first command submission before it can create a process. This
+/// exposes the admission window deterministically without timing a real spawn.
+mod start_capacity {
+    use super::*;
+    use harw_command::{CommandPort, CommandRequest, RunFuture, StartFuture};
+    use std::sync::atomic::AtomicBool;
+
+    #[derive(Debug)]
+    struct GatedPort {
+        inner: Arc<dyn CommandPort>,
+        first: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        fail_first: bool,
+    }
+
+    impl CommandPort for GatedPort {
+        fn run(
+            &self,
+            request: CommandRequest,
+            cancel: harw_types::cancel::CancelToken,
+        ) -> RunFuture<'_> {
+            self.inner.run(request, cancel)
+        }
+
+        fn start(&self, request: CommandRequest) -> StartFuture<'_> {
+            Box::pin(async move {
+                if self.first.swap(false, Ordering::SeqCst) {
+                    self.entered.notify_one();
+                    self.release
+                        .acquire()
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .forget();
+                    if self.fail_first {
+                        return Err("injected launch failure".to_owned());
+                    }
+                }
+                self.inner.start(request).await
+            })
+        }
+    }
+
+    fn manager(env: &Env, fail_first: bool) -> TestResult<(Arc<JobManager>, Arc<GatedPort>)> {
+        let port = Arc::new(GatedPort {
+            inner: harw_command::installed().ok_or(TestError::Missing("host port"))?,
+            first: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            fail_first,
+        });
+        let manager = JobManager::with_command_port(
+            crate::test_support::fast_config(&env.dir.path().join("gated")),
+            Arc::new(crate::NoopNotifier),
+            Arc::clone(&port) as Arc<dyn CommandPort>,
+        )
+        .map_err(ctx("gated manager"))?;
+        // Deliberately differs from config.max_running_jobs: admission must
+        // honor the live setting, including while another start is pending.
+        manager.set_max_running(1);
+        Ok((manager, port))
+    }
+
+    async fn start(
+        manager: &Arc<JobManager>,
+        prepared: PreparedJob,
+        piped: bool,
+    ) -> Result<JobId, JobError> {
+        if piped {
+            manager
+                .start_piped(request("capacity", "agent-a", &[]), prepared)
+                .await
+                .map(|job| job.job_id)
+        } else {
+            manager
+                .start(request("capacity", "agent-a", &[]), prepared)
+                .await
+                .map(|job| job.meta.job_id)
+        }
+    }
+
+    /// Removing the reservation lets the second path start while the first
+    /// is awaiting its command port, exceeding the live limit of one.
+    #[tokio::test]
+    async fn mixed_starts_share_capacity_during_command_submission() -> TestResult {
+        for first_piped in [false, true] {
+            let env = Env::new()?;
+            let (manager, port) = manager(&env, false)?;
+            let first_job = env.prepare_piped(&["sleep", "30"]).await?;
+            let second_job = env.prepare_piped(&["sleep", "30"]).await?;
+            let first = tokio::spawn({
+                let manager = Arc::clone(&manager);
+                async move { start(&manager, first_job, first_piped).await }
+            });
+            tokio::time::timeout(LIMIT, port.entered.notified())
+                .await
+                .map_err(ctx("first submission entered"))?;
+            let early_check = manager.check_capacity();
+            let second = start(&manager, second_job, !first_piped).await;
+            port.release.add_permits(1);
+            let admitted = first.await.map_err(ctx("join first start"))?;
+            let running = manager.running_count();
+            let after_insertion = manager.check_capacity();
+            manager.stop_all().await;
+            assert!(
+                matches!(second, Err(JobError::Capacity { max: 1 })),
+                "{second:?}"
+            );
+            assert!(matches!(early_check, Err(JobError::Capacity { max: 1 })));
+            assert!(matches!(
+                after_insertion,
+                Err(JobError::Capacity { max: 1 })
+            ));
+            admitted.map_err(ctx("admitted start"))?;
+            assert_eq!(running, 1);
+        }
+        Ok(())
+    }
+
+    /// Every unsuccessful start releases admission, including cancellation
+    /// while the port future is pending; normal and piped starts share it.
+    #[tokio::test]
+    async fn failed_or_cancelled_submission_releases_capacity() -> TestResult {
+        for piped in [false, true] {
+            for abort in [false, true] {
+                let env = Env::new()?;
+                let (manager, port) = manager(&env, true)?;
+                let prepared = env.prepare_piped(&["sleep", "30"]).await?;
+                let first = tokio::spawn({
+                    let manager = Arc::clone(&manager);
+                    async move { start(&manager, prepared, piped).await }
+                });
+                tokio::time::timeout(LIMIT, port.entered.notified())
+                    .await
+                    .map_err(ctx("first submission entered"))?;
+                if abort {
+                    first.abort();
+                    assert!(first.await.is_err_and(|error| error.is_cancelled()));
+                } else {
+                    port.release.add_permits(1);
+                    assert!(matches!(
+                        first.await.map_err(ctx("join failed start"))?,
+                        Err(JobError::Spawn(_))
+                    ));
+                }
+                manager.check_capacity().map_err(ctx("released capacity"))?;
+                let prepared = env.prepare_piped(&["sleep", "30"]).await?;
+                let next = start(&manager, prepared, !piped).await;
+                let running = manager.running_count();
+                manager.stop_all().await;
+                next.map_err(ctx("start after failure/cancellation"))?;
+                assert_eq!(running, 1);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn events_of(env: &Env, id: &JobId) -> Vec<JobEvent> {
     env.recorder
         .notifications()

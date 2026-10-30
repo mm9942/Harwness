@@ -580,8 +580,24 @@ pub struct JobManager {
     counter: AtomicU64,
     // Zur Laufzeit verstellbare Obergrenze (Start: `config.max_running_jobs`).
     max_running: AtomicUsize,
+    // Starts admitted but not yet inserted into `jobs`; reservations and
+    // running entries share the same capacity and are counted under `jobs`.
+    starting: AtomicUsize,
     // Eigener Kommando-Port; `None`: der installierte (`harw_command::installed`).
     command_port: Option<Arc<dyn harw_command::CommandPort>>,
+}
+
+/// Releases admission on every early return, including cancellation while
+/// awaiting the command port. A successful start releases it under the jobs
+/// lock, after inserting its running entry, so capacity never has a gap.
+struct StartSlot<'a> {
+    starting: &'a AtomicUsize,
+}
+
+impl Drop for StartSlot<'_> {
+    fn drop(&mut self) {
+        self.starting.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl fmt::Debug for JobManager {
@@ -637,6 +653,7 @@ impl JobManager {
             jobs: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(0),
             max_running: AtomicUsize::new(config_max_running),
+            starting: AtomicUsize::new(0),
             command_port,
         });
         manager.reload(&jobs_dir);
@@ -771,8 +788,11 @@ impl JobManager {
     /// Zahl der Jobs, die diese Sitzung gerade beaufsichtigt.
     #[must_use]
     pub fn running_count(&self) -> usize {
-        lock(&self.jobs)
-            .values()
+        Self::count_running(&lock(&self.jobs))
+    }
+
+    fn count_running(jobs: &BTreeMap<JobId, Arc<JobEntry>>) -> usize {
+        jobs.values()
             .filter(|entry| {
                 let state = lock(&entry.state);
                 state.monitored && !state.meta.state.is_terminal()
@@ -782,14 +802,32 @@ impl JobManager {
 
     /// Prüft vorab, ob noch ein Job starten darf (vor einer Host-Freigabe).
     ///
+    /// Advisory only: the start itself reserves capacity atomically. Pending
+    /// command submissions already occupy capacity even before they run.
+    ///
     /// # Errors
     /// [`JobError::Capacity`].
     pub fn check_capacity(&self) -> Result<(), JobError> {
+        let jobs = lock(&self.jobs);
         let max = self.max_running();
-        if self.running_count() >= max {
+        if Self::count_running(&jobs) + self.starting.load(Ordering::SeqCst) >= max {
             return Err(JobError::Capacity { max });
         }
         Ok(())
+    }
+
+    /// Count and reserve under the insertion lock; never hold that lock
+    /// across the asynchronous command submission.
+    fn reserve_slot(&self) -> Result<StartSlot<'_>, JobError> {
+        let jobs = lock(&self.jobs);
+        let max = self.max_running();
+        if Self::count_running(&jobs) + self.starting.load(Ordering::SeqCst) >= max {
+            return Err(JobError::Capacity { max });
+        }
+        self.starting.fetch_add(1, Ordering::SeqCst);
+        Ok(StartSlot {
+            starting: &self.starting,
+        })
     }
 
     fn allocate(&self) -> Result<(JobId, PathBuf), JobError> {
@@ -908,7 +946,7 @@ impl JobManager {
         warnings: Vec<String>,
         origin: JobOrigin,
     ) -> Result<JobStatus, JobError> {
-        self.check_capacity()?;
+        let slot = self.reserve_slot()?;
         let managed_origin = origin.managed();
         let (id, dir) = self.allocate()?;
         // The runtime appends the process output to these files (they outlive
@@ -974,7 +1012,11 @@ impl JobManager {
         meta.started_at = Some(Timestamp::now());
         let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader));
         entry.persist();
-        lock(&self.jobs).insert(id.clone(), Arc::clone(&entry));
+        {
+            let mut jobs = lock(&self.jobs);
+            jobs.insert(id.clone(), Arc::clone(&entry));
+            drop(slot);
+        }
         info!(job_id = %id, pid, executed_on_host = meta.executed_on_host, "job started");
 
         self.notifier.notify(JobNotification {
@@ -1111,7 +1153,7 @@ impl JobManager {
         max_line_bytes: usize,
         origin: JobOrigin,
     ) -> Result<PipedJob, JobError> {
-        self.check_capacity()?;
+        let slot = self.reserve_slot()?;
         let managed_origin = origin.managed();
         let (id, dir) = self.allocate()?;
         let stdout_log_path = dir.join(STDOUT_LOG);
@@ -1175,7 +1217,11 @@ impl JobManager {
         meta.started_at = Some(Timestamp::now());
         let entry = Arc::new(JobEntry::new(dir, meta.clone(), true, leader));
         entry.persist();
-        lock(&self.jobs).insert(id.clone(), Arc::clone(&entry));
+        {
+            let mut jobs = lock(&self.jobs);
+            jobs.insert(id.clone(), Arc::clone(&entry));
+            drop(slot);
+        }
         info!(job_id = %id, pid, executed_on_host = meta.executed_on_host, "piped job started");
 
         self.notifier.notify(JobNotification {
