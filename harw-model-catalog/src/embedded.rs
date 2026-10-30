@@ -75,7 +75,7 @@ mod tests {
             .find(|p| p.id == "openai")
             .ok_or(TestError::Missing("openai provider"))?;
         assert!(openai.models.iter().any(|id| id == "gpt-6-astra"));
-        for id in ["gpt-6-sol", "gpt-6-luna"] {
+        for id in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"] {
             assert!(openai.models.iter().any(|m| m == id), "{id} fehlt");
         }
         let cloudflare = catalog

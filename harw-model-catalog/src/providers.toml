@@ -45,6 +45,8 @@ models = [
   "gpt-6-astra",
   "gpt-6-sol",
   "gpt-6-luna",
+  "gpt-6.1-sol",
+  "gpt-6.1-terra",
   "gpt-image-1-mini",
   "gpt-image-1.5",
   "gpt-realtime-2.1",

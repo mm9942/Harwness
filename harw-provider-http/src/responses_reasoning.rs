@@ -1,4 +1,7 @@
-//! Bounded exact-round bindings for encrypted Responses reasoning replay.
+//! Bounded exact-round bindings for Responses reasoning continuity.
+//!
+//! A tool round may legitimately contain no reasoning items. Retain its binding
+//! too, so absence at the source is distinct from an evicted or changed round.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, PoisonError};
@@ -47,7 +50,7 @@ impl ReasoningReplay {
         request: &ModelRequest,
         response: &ModelResponse,
     ) -> Result<(), ModelError> {
-        if replay.call_ids.is_empty() || replay.blocks.is_empty() {
+        if replay.call_ids.is_empty() {
             return Ok(());
         }
         let identity = request
@@ -157,8 +160,28 @@ impl ReasoningReplay {
             )
             .to_model_messages()
             .len();
-            let end = offset + bound.expected.len();
-            if historical.get(offset..end) != Some(bound.expected.as_slice()) {
+            // Sequential dispatch persists call/result pairs; parallel dispatch
+            // persists all calls before their results. Both describe the same
+            // native response. Only skip results for calls already matched.
+            let mut end = offset;
+            let mut matched_calls = Vec::new();
+            let matches = bound.expected.iter().all(|expected| {
+                while let Some(ModelMessage::ToolResult { call_id, .. }) = historical.get(end) {
+                    if !matched_calls.contains(call_id) {
+                        return false;
+                    }
+                    end += 1;
+                }
+                if historical.get(end) != Some(expected) {
+                    return false;
+                }
+                if let ModelMessage::ToolCall { call_id, .. } = expected {
+                    matched_calls.push(call_id.clone());
+                }
+                end += 1;
+                true
+            });
+            if !matches {
                 continue;
             }
             if matches!(historical.get(end), Some(ModelMessage::ToolCall { .. })) {
@@ -329,6 +352,81 @@ mod tests {
             };
             assert!(selected.is_err(), "must refuse {mismatch}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn reasoning_enabled_tool_round_without_reasoning_blocks_can_continue() -> TestResult {
+        let initial = request();
+        let body = json!({"status": "completed", "output": [
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"Checking the project."}]},
+            {"type":"function_call", "call_id":"a", "name":"lookup", "arguments":"{\"query\":\"one\"}"}
+        ]});
+        let (response, binding) = crate::interpret_responses(&body, "responses", "thinking-model")
+            .map_err(ctx("parse tool round without reasoning"))?;
+        let cache = ReasoningReplay::default();
+        if let Some(binding) = binding {
+            cache
+                .remember(binding, "https://official.example/v1", &initial, &response)
+                .map_err(ctx("bind native round"))?;
+        }
+        let mut next = initial.clone();
+        next.history
+            .push_assistant_text("Checking the project.", None);
+        append(&mut next, &response);
+        let replay = cache
+            .for_request(
+                "responses",
+                "thinking-model",
+                "https://official.example/v1",
+                &next,
+            )
+            .map_err(ctx("continue legitimate round without reasoning blocks"))?;
+        assert!(replay.iter().all(|entry| entry.blocks.is_empty()));
+        let body = crate::build_responses_body("thinking-model", &next, &replay)
+            .map_err(ctx("build next request"))?;
+        assert_eq!(body["input"].as_array().map(Vec::len), Some(4));
+        assert!(
+            ReasoningReplay::default()
+                .for_request(
+                    "responses",
+                    "thinking-model",
+                    "https://official.example/v1",
+                    &next
+                )
+                .is_err(),
+            "losing the round binding must still fail explicitly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn interleaved_results_preserve_native_round() -> TestResult {
+        let initial = request();
+        let (response, replay) = response()?;
+        let cache = ReasoningReplay::default();
+        cache
+            .remember(replay.clone(), "endpoint", &initial, &response)
+            .map_err(ctx("remember"))?;
+        let mut next = initial;
+        for call in &response.tool_calls {
+            next.history.push_tool_call(
+                call.id.clone(),
+                call.name.as_str(),
+                call.arguments.clone(),
+            );
+            next.history.push_tool_result(
+                call.id.clone(),
+                harw_protocol::ToolCallResult::success(json!({})),
+                1,
+            );
+        }
+        assert_eq!(
+            cache
+                .for_request("responses", "thinking-model", "endpoint", &next)
+                .map_err(ctx("interleaved continuation"))?,
+            vec![replay]
+        );
         Ok(())
     }
 

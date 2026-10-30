@@ -3238,11 +3238,29 @@ impl ChatApp {
         // verspätetes Hub-Ereignis.
         let tool_calls = cell.tool_calls.max(live.tool_calls);
         let tokens = cell.tokens.max(tokens);
-        if tool_calls == cell.tool_calls && tokens == cell.tokens {
-            return false;
+        let counters_changed = tool_calls != cell.tool_calls || tokens != cell.tokens;
+        let outcome = match live.phase {
+            crate::agent_monitor::AgentPhase::Done => Some("completed"),
+            crate::agent_monitor::AgentPhase::Failed => Some("failed"),
+            crate::agent_monitor::AgentPhase::Cancelled => Some("cancelled"),
+            _ => None,
+        };
+        let status_changed = outcome.is_some() && matches!(cell.status, SubAgentStatus::Running);
+        if counters_changed {
+            cell.apply_progress(tool_calls, tokens);
         }
-        cell.apply_progress(tool_calls, tokens);
-        true
+        if status_changed && let Some(outcome) = outcome {
+            let duration_ms = live
+                .finished
+                .unwrap_or(live.last_meaningful)
+                .saturating_duration_since(live.started)
+                .as_millis();
+            cell.apply_completion(
+                outcome.to_owned(),
+                u64::try_from(duration_ms).unwrap_or(u64::MAX),
+            );
+        }
+        counters_changed || status_changed
     }
 
     pub(crate) fn host_mode_active(&self) -> bool {
@@ -17213,6 +17231,26 @@ forbidden = [{forbidden}]
         assert!(!app.sync_child_cell(child), "never counts backwards");
         let calls = cell.lock().map_err(ctx("cell lock"))?.tool_calls;
         assert_eq!(calls, 5);
+        app.agent_monitor.apply(&harw_core::AgentEvent {
+            agent: SessionId::from_str(child),
+            parent: None,
+            role: "root-orchestrator".to_owned(),
+            kind: harw_core::AgentEventKind::Turn(TurnEvent::TurnFailed {
+                turn_id: harw_types::TurnId::new(),
+                reason: "provider failure".to_owned(),
+                retryable: false,
+            }),
+        });
+        assert!(
+            app.sync_child_cell(child),
+            "terminal status changes without new counters"
+        );
+        assert!(matches!(&cell.lock().map_err(ctx("cell lock"))?.status,
+            SubAgentStatus::Done { outcome, .. } if outcome == "failed"));
+        assert!(
+            !app.sync_child_cell(child),
+            "terminal synchronization is idempotent"
+        );
         Ok(())
     }
 
