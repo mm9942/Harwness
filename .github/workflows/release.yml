@@ -2,168 +2,256 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
-  # Re-run the release for an existing tag by hand (Actions tab or API).
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag, e.g. v0.8.0"
+        description: "Existing tag to validate, e.g. v0.10.0"
         required: true
+        type: string
+      publish:
+        description: "Publish only after exact-commit evidence gates pass"
+        default: false
+        type: boolean
+      ci_run_id:
+        description: "Successful full manual CI run on the exact tagged commit"
         type: string
 
 env:
   CARGO_TERM_COLOR: always
-  BIN_NAME: harw
-  # The tag being released: the pushed tag, or the dispatch input.
   TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
-  contents: write
+  contents: read
+  actions: read
+
+concurrency:
+  group: harw-release-publication
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build (${{ matrix.target }})
+  preflight:
+    name: Metadata and evidence gates
     runs-on: ubuntu-latest
-    # An experimental target may fail without holding back the release of
-    # the others.
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - name: Resolve candidate
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Metadata and offline tests
+        run: |
+          python3 scripts/release_gate.py "$TAG"
+          python3 -m unittest discover -s scripts/tests -v
+      # Tag pushes NEVER publish. Missing, skipped or other-commit CI cannot pass.
+      - name: Require exact-commit CI and dated release notes
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          EVENT_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          test "$EVENT_SHA" = "$(git rev-parse HEAD)"
+          test "$WORKFLOW_SHA" = "$(git rev-parse HEAD)"
+          python3 scripts/release_gate.py "$TAG" --publish \
+            --ci-run-id "$CI_RUN_ID" --sha "$(git rev-parse HEAD)"
+      - name: Require all mirror credentials before GitHub publication
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          test -n "$R2_ACCOUNT_ID" && test -n "$R2_ACCESS_KEY_ID" && test -n "$R2_SECRET_ACCESS_KEY" || {
+            echo 'All three R2 secrets are required; no release was published.' >&2
+            exit 1
+          }
+
+  build:
+    name: Build and smoke (${{ matrix.target }})
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    # Android is a build experiment, never promoted without native Termux proof.
     continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Native build on the runner.
           - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
             use_cross: false
-          # Cross-compiled for the maintainer's Raspberry Pi (64-bit).
           - target: aarch64-unknown-linux-gnu
-            use_cross: true
-          # Termux on Android phones. No killer: harw-killer needs Linux
-          # procfs and pidfd and refuses other target OSes at compile time.
-          # No harw-job-exec either (the Linux job sandbox trampoline).
+            runner: ubuntu-24.04-arm
+            use_cross: false
           - target: aarch64-linux-android
+            runner: ubuntu-latest
             use_cross: true
-            packages: -p harw-cli
             experimental: true
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
-          ref: ${{ env.TAG }}
-
-      - name: Verify tag matches workspace version
-        run: |
-          python3 - <<'PY'
-          import os
-          import tomllib
-          from pathlib import Path
-
-          version = tomllib.loads(Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
-          expected = f"v{version}"
-          tag = os.environ["TAG"]
-          if tag != expected:
-              raise SystemExit(f"Release tag {tag!r} does not match workspace version {expected!r}")
-          print(f"Release tag matches workspace version: {tag}")
-          PY
-
-      # The OS-keyring backend of harw-secrets links libdbus (keyring
-      # `sync-secret-service` -> libdbus-sys), as in ci.yml. Cross targets
-      # get it through Cross.toml.
-      - name: Install build dependencies
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - name: Install native build dependencies
         if: ${{ !matrix.use_cross }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config
-
-      # Gepinnte Toolchain aus rust-toolchain.toml (wie in ci.yml). Ein
-      # `dtolnay/rust-toolchain@stable` würde hier ins Leere laufen: rustup
-      # nimmt ohnehin die Datei, das Ziel landete dann in der falschen Toolchain.
-      - name: Install pinned Rust (rust-toolchain.toml)
+          sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
+      - name: Install pinned Rust
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           rustup toolchain install
-          rustup target add ${{ matrix.target }}
+          rustup target add "$TARGET"
           rustc --version
-
       - name: Install cross
         if: matrix.use_cross
         uses: taiki-e/install-action@v2
         with:
           tool: cross
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
-
-      - name: Build (cargo)
+          key: release-${{ matrix.target }}
+      - name: Build native Linux packages
         if: ${{ !matrix.use_cross }}
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          cargo build --release --locked ${{ matrix.packages || '-p harw-cli -p harw-killer -p harw-job-exec' }} --target ${{ matrix.target }}
-          cargo build --profile release-runner --locked -p harw-agent-runner --target ${{ matrix.target }}
-
-      - name: Build (cross)
+          cargo build --release --locked -p harw-cli -p harw-killer -p harw-job-exec --target "$TARGET"
+          cargo build --profile release-runner --locked -p harw-agent-runner --target "$TARGET"
+      - name: Build experimental Android packages
         if: matrix.use_cross
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          cross build --release --locked ${{ matrix.packages || '-p harw-cli -p harw-killer -p harw-job-exec' }} --target ${{ matrix.target }}
-          cross build --profile release-runner --locked -p harw-agent-runner --target ${{ matrix.target }}
-
-      # Same layout as `make release` (scripts/package-release.sh): one
-      # directory harw-<tag>-<target>/ with harw, killer, harw-job-exec and the
-      # `release-runner` harw-agent-runner (fat LTO, `panic = "abort"`),
-      # which `harw agent build` needs next to `harw`.
+          cross build --release --locked -p harw-cli --target "$TARGET"
+          cross build --profile release-runner --locked -p harw-agent-runner --target "$TARGET"
       - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          set -euo pipefail
-          stage="harw-${TAG}-${{ matrix.target }}"
-          scripts/package-release.sh "${TAG}" "${{ matrix.target }}" .
-          sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
-          rm -f SHA256SUMS
-
-      - name: Upload artifact
+          scripts/package-release.sh "$TAG" "$TARGET" dist
+          (cd dist && sha256sum "harw-$TAG-$TARGET.tar.gz" > "harw-$TAG-$TARGET.tar.gz.sha256")
+      - name: Execute packaged installer and agent runner on native architecture
+        if: ${{ !matrix.experimental }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash scripts/smoke-release.sh "$TAG" "$TARGET" dist
+      - name: Upload smoke-tested Linux artifact
+        if: ${{ !matrix.experimental }}
         uses: actions/upload-artifact@v7
         with:
           name: harw-${{ matrix.target }}
           path: |
-            harw-*.tar.gz
-            harw-*.tar.gz.sha256
+            dist/harw-*.tar.gz
+            dist/harw-*.tar.gz.sha256
           if-no-files-found: error
 
-  release:
-    name: Publish release
-    needs: build
+  bundle:
+    name: Finalize and verify release bundle
+    needs: [preflight, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v8
+      - uses: actions/checkout@v7
         with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: harw-*
           path: dist
           merge-multiple: true
-
-      - name: Build combined SHA256SUMS
-        working-directory: dist
-        run: |
-          set -euo pipefail
-          sha256sum -- *.tar.gz > SHA256SUMS
-          rm -f -- *.tar.gz.sha256
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
+      - name: Verify build checksums and prepare source once
+        run: python3 scripts/release_bundle.py prepare "$TAG" dist
+      - uses: actions/upload-artifact@v7
         with:
-          tag_name: ${{ env.TAG }}
-          name: harw ${{ env.TAG }}
-          files: |
+          name: release-bundle
+          path: |
             dist/*.tar.gz
             dist/SHA256SUMS
-          fail_on_unmatched_files: true
+          if-no-files-found: error
+
+  source-smoke:
+    name: Build through default source installer
+    needs: [preflight, bundle]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-bundle
+          path: dist
+      - name: Install source build dependencies and pinned Rust
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config cmake build-essential
+          rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-source
+      - name: Install from the final versioned source tarball
+        run: bash scripts/smoke-source-release.sh "$TAG" dist
+
+  release:
+    name: Publish verified GitHub assets
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: [preflight, bundle, source-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-bundle
+          path: dist
+      - name: Recheck evidence, assets and tag before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          CANDIDATE_SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          python3 scripts/release_gate.py "$TAG" --publish --ci-run-id "$CI_RUN_ID" --sha "$CANDIDATE_SHA"
+          python3 scripts/release_bundle.py verify "$TAG" dist
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$CANDIDATE_SHA"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" > releases.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          decoder = json.JSONDecoder()
+          text = Path('releases.json').read_text().strip()
+          while text:
+              page, offset = decoder.raw_decode(text)
+              if any(r['tag_name'] == os.environ['TAG'] for r in page):
+                  raise SystemExit('Release already exists; refusing to overwrite')
+              text = text[offset:].lstrip()
+          PY
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+        run: |
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS --verify-tag \
+            --title "harw $TAG" --notes "See CHANGELOG.md. Exact-commit CI: https://github.com/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID. Android assets are excluded pending native Termux validation. R2 verification follows in this workflow."
 
   mirror:
-    # Mirrors the release to the R2 bucket behind https://get.harw.dev/harw,
-    # the default source of `curl -fsSL https://get.harw.dev/harw/install.sh | sh`.
-    # Skipped (not failed) until the R2 secrets are configured.
-    name: Mirror to get.harw.dev
-    needs: release
+    name: Mirror GitHub bytes and verify public R2 delivery
+    needs: [preflight, release]
     runs-on: ubuntu-latest
     env:
+      GH_TOKEN: ${{ github.token }}
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -171,48 +259,19 @@ jobs:
       R2_BUCKET: harw
       R2_PREFIX: harw
     steps:
-      - name: Checkout
-        if: env.R2_ACCOUNT_ID != ''
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
-          ref: ${{ env.TAG }}
-
-      - name: Download artifacts
-        if: env.R2_ACCOUNT_ID != ''
-        uses: actions/download-artifact@v8
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
         with:
-          path: dist
-          merge-multiple: true
-
-      - name: Upload to R2
-        if: env.R2_ACCOUNT_ID != ''
+          name: release-bundle
+          path: expected
+      - name: Download published GitHub assets and prove identity
         run: |
-          set -euo pipefail
-          tag="${TAG}"
-          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          s3() { aws s3 cp --endpoint-url "$endpoint" --only-show-errors "$@"; }
-          cd dist
-          # Versioned source tarball of the tag: the installer's source path
-          # prefers it (checked against SHA256SUMS) over Harwness-main.zip.
-          version="${tag#v}"
-          git -C .. archive --format=tar.gz --prefix="harwness-${version}/" \
-            -o "$PWD/harwness-${version}-source.tar.gz" HEAD
-          sha256sum -- *.tar.gz > SHA256SUMS
-          for file in *.tar.gz SHA256SUMS; do
-            s3 "$file" "s3://${R2_BUCKET}/${R2_PREFIX}/${tag}/${file}"
-          done
-          # Source archive of the tag for the installer's source path
-          # (install.sh without a release for this machine).
-          git -C .. archive --format=zip --prefix=Harwness-main/ -o "$PWD/Harwness-main.zip" HEAD
-          s3 Harwness-main.zip "s3://${R2_BUCKET}/${R2_PREFIX}/Harwness-main.zip" \
-            --content-type "application/zip" --cache-control "no-cache"
-          s3 ../scripts/install.sh "s3://${R2_BUCKET}/${R2_PREFIX}/install.sh" \
-            --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
-          # version.json (release manifest) and `latest` last, so neither
-          # points at a half-uploaded tag.
-          ../scripts/release-manifest.sh "$tag" . > version.json
-          s3 version.json "s3://${R2_BUCKET}/${R2_PREFIX}/version.json" \
-            --content-type "application/json; charset=utf-8" --cache-control "no-cache"
-          printf '%s\n' "$tag" > latest
-          s3 latest "s3://${R2_BUCKET}/${R2_PREFIX}/latest" \
-            --content-type "text/plain; charset=utf-8" --cache-control "no-cache"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist \
+            --pattern '*.tar.gz' --pattern SHA256SUMS
+          cmp expected/SHA256SUMS dist/SHA256SUMS
+          python3 scripts/release_bundle.py verify "$TAG" dist
+      - name: Mirror and verify before promoting discovery files
+        run: bash scripts/mirror-release.sh "$TAG" dist

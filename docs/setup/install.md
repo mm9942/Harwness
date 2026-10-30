@@ -80,8 +80,16 @@ directory, so a release that cannot execute here leaves an existing
 installation untouched. It adds `~/.local/bin` to `.bashrc`/`.zshrc` like
 the source installer.
 Releases are built by `.github/workflows/release.yml` when a `v*` tag is
-pushed (or by hand for an existing tag); `make release` builds the same
-tarball locally.
+pushed (or by hand for an existing tag). Tag pushes and the default dispatch
+only validate/build; they never publish. Publication requires a dispatch **from
+the tag itself** with `publish=true` and `ci_run_id` naming a successful full
+manual CI run on that exact commit. A dated changelog, both native Linux
+package/installer/runner smoke checks and all three R2 credentials are mandatory.
+Android cross-builds remain experimental and are excluded from published assets
+until native Termux execution becomes an enforced gate. `make release` builds a
+local tarball; `make release-publish` refuses unverified publication.
+See [v0.10.0 release readiness](../releases/0.10.0-readiness.md) for the evidence
+limits and required gates.
 
 ### (b) Source installer
 
