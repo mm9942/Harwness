@@ -246,9 +246,11 @@ CLI, Web-UI und MCP sie ohne eigene Pfade bekommen:
   2. Elternverzeichnis relativ dazu per `openat2(RESOLVE_BENEATH |
      RESOLVE_NO_SYMLINKS)` öffnen.
   3. **Unbenannte** Staging-Inode im Eltern-fd:
-     `openat(parent, ".", O_TMPFILE | O_WRONLY | O_CLOEXEC, 0600)`. Der Modus
-     ist explizit `0600`, unabhängig von der umask, und es gibt keinen
-     Verzeichniseintrag. Hineinschreiben, dann `fsync`.
+     `openat(parent, ".", O_TMPFILE | O_WRONLY | O_CLOEXEC, 0600)`. Es gibt
+     keinen Verzeichniseintrag. Weil die umask auch bei `O_TMPFILE` gilt
+     (wirksam `0600 & ~umask`), folgt **vor dem ersten Schreiben**
+     `fchmod(staging_fd, 0600)`. Schlägt das fehl, wird abgebrochen.
+     Danach hineinschreiben und `fsync`.
   4. Commit **nur auf das zugelassene Ziel**:
      `linkat(AT_FDCWD, "/proc/self/fd/<n>", parent, "<name>", AT_SYMLINK_FOLLOW)`.
      Das läuft im Prozess des Nutzers, wo `/proc/self` sichtbar ist.
@@ -349,7 +351,7 @@ ist für Harwness optional und nicht Teil der ersten Wellen.
 - Exakter Scope: Session mit `exact_files(["out/result"])`; während und nach der Operation zeigt das Verzeichnis-Listing keinen weiteren Namen als `out/result`.
 - Absturz beim Entschlüsseln: Prozess wird mitten im Schreiben per `SIGKILL` beendet → kein neuer Verzeichniseintrag, `out/result` existiert nicht, kein Klartext-Rest im Workspace.
 - Dateisystem ohne `O_TMPFILE` → Operation abgelehnt, keine benannte Temporärdatei angelegt.
-- Modus: Ausgabe hat `0600` auch bei umask `000`.
+- Modus: Ausgabe hat genau `0600`, sowohl bei umask `000` als auch bei umask `0777`; scheitert `fchmod`, wird abgebrochen, bevor geschrieben oder verlinkt wird.
 - Unit-Integrationstest: Hub läuft mit genau den Sandbox-Einstellungen der ausgelieferten `harw-auth-hub.service`, Peer unter **anderer** uid. Grant mit passender cgroup-Bedingung → zugelassen; andere cgroup → abgelehnt; Peer beendet → abgelehnt. Kein `EPERM`-Pfad führt zur Zulassung.
 - Nutzer-Operationen: Roundtrip encrypt/decrypt für große Dateien (streamend); `sign` außerhalb von `harw.user-sign/*` wird abgelehnt.
 - Kompatibilität: bestehende `HAKS`-Stores und V1/V2/V3-Secrets bleiben lesbar.
