@@ -162,28 +162,49 @@ diese Sequenz, jeder Fehlschritt lehnt ab (fail closed):
    cgroup-Bedingung abgelehnt.
 2. Nichtblockierendes `poll(pidfd, POLLIN, 0)`: lesbar heißt beendet,
    also ablehnen. Dafür braucht es keine Berechtigung (`pidfd_open(2)`).
-3. `C` ist der kanonische Pfad aus dem Grant. Per `stat` wird geprüft, dass
-   `/sys/fs/cgroup/C` nicht delegiert ist (Eigentümer root). Dann wird
-   `/sys/fs/cgroup/C/cgroup.procs` mit Größenlimit gelesen, und `pid` muss
-   darin stehen (exakte cgroup, keine Kinder).
-4. Erneut `poll(pidfd, POLLIN, 0)`: lebt der Prozess noch, hält der pidfd
-   die PID fest, und sie kann zwischen 1 und 3 nicht neu vergeben worden
-   sein. Ist er beendet, wird abgelehnt.
-5. Das Ergebnis gilt nur für diese Verbindung und wird nicht gecacht.
+3. Die Grant-Bedingung nennt eine **systemd-Unit**, keinen rohen Pfad
+   (`unit = "harw-session@alice.service"`). Der Hub fragt den
+   systemd-Manager über den System-Bus (D-Bus auf `AF_UNIX`, unter
+   `RestrictAddressFamilies=AF_UNIX` erlaubt, `harw-auth-hub.service:52`)
+   nach `ControlGroup` und `Delegate` der Unit. Akzeptiert wird nur eine
+   geladene Unit mit `Delegate=no`. Ihr `ControlGroup` ist `C`.
+4. **Nicht delegiert heißt: effektiv nicht beschreibbar**, nicht nur
+   „Eigentümer root“ (cgroup-v2-Delegation ist über Schreibrechte auf
+   Verzeichnis und `cgroup.procs` definiert, siehe Kernel-Doku
+   „cgroup-v2 → Delegation“). Für `C` **und jeden Vorfahren bis zur Wurzel**
+   gilt:
+   - Verzeichnis, `cgroup.procs`, `cgroup.threads` und
+     `cgroup.subtree_control` gehören root und haben keine Schreibbits für
+     Gruppe oder andere;
+   - es gibt keine POSIX-ACL (`system.posix_acl_access` bzw.
+     `system.posix_acl_default` fehlen);
+   - es gibt kein systemd-Delegationsmerkmal (`user.delegate` bzw.
+     `trusted.delegate` fehlen).
 
-Restrisiko, bewusst akzeptiert: Ein Prozess, der nach Schritt 4 in eine
-andere cgroup wechselt. Nicht delegierte cgroups kann aber nur
-root bzw. systemd umhängen.
+   Weil der Kernel für eine Migration Schreibrecht auf `cgroup.procs` des
+   Ziels **und** des gemeinsamen Vorfahren verlangt, kann der Peer dann
+   weder hinein- noch hinauswechseln. Das gilt auch innerhalb eines
+   cgroup-Namespace.
+5. `/sys/fs/cgroup/C/cgroup.procs` mit Größenlimit lesen; `pid` muss darin
+   stehen (exakte cgroup, keine Kinder).
+6. Erneut `poll(pidfd, POLLIN, 0)`: lebt der Prozess noch, hält der pidfd
+   die PID fest, und sie kann zwischen 1 und 5 nicht neu vergeben worden
+   sein. Ist er beendet, wird abgelehnt.
+7. Das Ergebnis gilt nur für diese Verbindung und wird nicht gecacht.
+
+Restrisiko, bewusst akzeptiert: Nach Schritt 6 kann nur root bzw. systemd den
+Prozess umhängen, weil Schritt 4 jedes Schreibrecht anderer ausschließt.
+Ist der System-Bus nicht erreichbar, werden Grants mit Unit-Bedingung
+abgelehnt.
 
 Verworfen: `CAP_KILL` für `pidfd_send_signal`, `ProtectProc=default` für den
 Hub, `/proc/<pid>/cgroup` über die numerische PID.
 
-- cgroup-Merkmale werden nur ausgewertet, wenn der Pfad **nicht an den Nutzer
-  delegiert** ist (Eigentümer root bzw. Hub-User). In einem delegierten
-  Unterbaum kann der Nutzer Prozesse frei verschieben.
-- Grants dürfen eine cgroup-Bedingung tragen
-  (`cgroup = "/system.slice/harw-session@alice.service"`). Sie engt die
-  uid-Freigabe nur ein und erweitert sie nie.
+- Grants dürfen eine Unit-Bedingung tragen
+  (`unit = "harw-session@alice.service"`). Sie engt die uid-Freigabe nur
+  ein und erweitert sie nie. Eine Unit mit `Delegate=yes` oder ein
+  beschreibbarer Pfad (Schritt 4) macht den Grant unbrauchbar und wird
+  beim Laden der Config **und** bei jeder Prüfung abgelehnt.
 
 ### 2.4 Nutzer-Operationen
 
@@ -217,15 +238,36 @@ CLI, Web-UI und MCP sie ohne eigene Pfade bekommen:
   (`harw-authority/src/lib.rs:34-43`). `FileWriteScope` ist rein lexikalisch;
   Aufrufer müssen zusätzlich unterhalb des Workspace auflösen und
   Symlink-Races verhindern (`harw-authority/src/file_write_scope.rs:1-3`).
+  `FileWriteScope::exact_files` ist eine exakte Pfadobergrenze
+  (`harw-authority/src/file_write_scope.rs:13-18,40-52`). Es darf also
+  **kein zweiter Pfadname** entstehen, auch keine benannte Temporärdatei.
   Deshalb wird jede Ausgabe so geschrieben:
   1. Workspace-Root einmal als Verzeichnis-fd öffnen und festhalten.
   2. Elternverzeichnis relativ dazu per `openat2(RESOLVE_BENEATH |
      RESOLVE_NO_SYMLINKS)` öffnen.
-  3. Temporärdatei im Eltern-fd mit `O_CREAT | O_EXCL | O_NOFOLLOW` anlegen,
-     schreiben, `fsync`.
-  4. `renameat2` innerhalb desselben Eltern-fd, mit `RENAME_NOREPLACE`,
-     außer bei explizitem `--force`. Danach `fsync` auf den Eltern-fd.
-  5. Bei Fehler wird die Temporärdatei per `unlinkat` im selben fd entfernt.
+  3. **Unbenannte** Staging-Inode im Eltern-fd:
+     `openat(parent, ".", O_TMPFILE | O_WRONLY | O_CLOEXEC, 0600)`. Der Modus
+     ist explizit `0600`, unabhängig von der umask, und es gibt keinen
+     Verzeichniseintrag. Hineinschreiben, dann `fsync`.
+  4. Commit **nur auf das zugelassene Ziel**:
+     `linkat(AT_FDCWD, "/proc/self/fd/<n>", parent, "<name>", AT_SYMLINK_FOLLOW)`.
+     Das läuft im Prozess des Nutzers, wo `/proc/self` sichtbar ist.
+     `linkat` ersetzt nie: Existiert das Ziel, schlägt es mit `EEXIST` fehl,
+     und die Operation lehnt ab. Danach `fsync` auf den Eltern-fd.
+  5. Bei Fehler oder Absturz verschwindet die unbenannte Inode beim Schließen.
+     Es bleibt kein Klartext-Eintrag zurück, und nichts muss aufgeräumt werden.
+  - **Kein `--force`** in Welle K4: Ein bestehendes Ziel löscht der Nutzer
+    vorher selbst. Ein atomares Ersetzen bräuchte einen zweiten Pfadnamen
+    und damit eine eigene, eng abgeleitete Staging-Autorität. Das ist ein
+    offener Punkt (§4).
+  - Unterstützt das Dateisystem kein `O_TMPFILE` (`EOPNOTSUPP`/`EISDIR`),
+    wird abgelehnt. Es gibt keinen Rückfall auf benannte Temporärdateien.
+  - Die Zieldatei behält `0600`. Ein weiterer Modus nur, wenn die Config ihn
+    ausdrücklich erlaubt, und nie für Entschlüsselungs-Ausgaben.
+  - Restrisiko: Datenblöcke einer abgebrochenen Inode werden vom
+    Dateisystem freigegeben, aber nicht überschrieben (kein Secure-Erase).
+  - macOS und Windows haben kein `O_TMPFILE`. Die Ausgabe-Operationen sind
+    dort bis zu einer eigenen Spezifikation nicht verfügbar (§4).
   Alle Schritte arbeiten auf festgehaltenen fds, nie auf Pfadstrings. Wird
   ein Pfadteil später durch einen Symlink ersetzt, ändert das das Ziel
   nicht.
@@ -286,6 +328,8 @@ ist für Harwness optional und nicht Teil der ersten Wellen.
 3. `when_locked = "queue"`: maximale Wartezeit und Verhalten beim Neustart des Hubs.
 4. Format des Rollback-Ankers je Provider (TPM-NV vs. Keychain vs. Datei).
 5. Windows- und macOS-Hub: gleicher Daemon mit Named Pipe bzw. launchd-Socket, oder vorerst nur Client-Seite?
+6. Atomares Überschreiben (`--force`) bei exaktem Scope: eng abgeleitete Staging-Autorität mit Crash-Recovery, oder dauerhaft nicht anbieten?
+7. Sichere Ausgabe auf macOS und Windows ohne `O_TMPFILE` (z. B. eigene Staging-Autorität mit Recovery).
 
 ---
 
@@ -297,10 +341,15 @@ ist für Harwness optional und nicht Teil der ersten Wellen.
 - `migrate-kek`: Audit-Ereignis vor der Wirkung; Abbruch in der Mitte lässt den alten Store lesbar.
 - Rollback: Zurückspielen einer älteren Store-Datei wird erkannt.
 - cgroup: Grant mit cgroup-Bedingung lehnt Aufrufe aus anderer Unit ab; delegierte cgroups werden ignoriert.
-- cgroup-Bindung: Peer beendet sich zwischen Schritt 2 und 4 → abgelehnt; PID-Wiederverwendung (neuer Prozess unter derselben PID in `cgroup.procs`) → abgelehnt, weil der pidfd das Ende meldet; delegierte cgroup in einem Grant → abgelehnt; Kernel ohne `SO_PEERPIDFD` → Grants mit cgroup-Bedingung abgelehnt.
+- Delegation: root-eigene cgroup mit Gruppen-Schreibbit, mit ACL für den Peer, mit `user.delegate`-xattr oder Unit mit `Delegate=yes` → Grant abgelehnt; zur Gegenprobe ein Test, in dem der Peer in einer solchen cgroup sich nach dem zweiten `poll` selbst verschiebt, was die Ablehnung gerade verhindern soll; System-Bus nicht erreichbar → abgelehnt.
+- cgroup-Bindung: Peer beendet sich zwischen Schritt 2 und 6 → abgelehnt; PID-Wiederverwendung (neuer Prozess unter derselben PID in `cgroup.procs`) → abgelehnt, weil der pidfd das Ende meldet; delegierte cgroup in einem Grant → abgelehnt; Kernel ohne `SO_PEERPIDFD` → Grants mit cgroup-Bedingung abgelehnt.
 - Eingabe-Zulassung: Eingabe außerhalb der Workspace-Root → abgelehnt; Symlink im Workspace, der hinauszeigt → abgelehnt; Session ohne `ReadWorkspace` → abgelehnt, auch nach Nutzerfreigabe.
 - Ausgabe-Zulassung: Ziel außerhalb von `FileWriteScope` oder ohne `WriteWorkspace` → abgelehnt, auch nach Nutzerfreigabe; gleiches Ergebnis über CLI, Web und MCP.
-- Ausgabe-Symlinks: Elternverzeichnis ist ein Symlink nach außen → abgelehnt; Zieldatei ist ein Symlink → abgelehnt, nichts außerhalb wird überschrieben; Elternverzeichnis wird zwischen Öffnen und `renameat2` gegen einen Symlink getauscht → Datei landet im festgehaltenen Verzeichnis oder der Vorgang schlägt fehl, nie außerhalb; vorhandenes Ziel ohne `--force` → abgelehnt.
+- Ausgabe-Symlinks: Elternverzeichnis ist ein Symlink nach außen → abgelehnt; Zieldatei ist ein Symlink → abgelehnt (`linkat` meldet `EEXIST`), nichts außerhalb wird überschrieben; Elternverzeichnis wird zwischen Öffnen und `linkat` gegen einen Symlink getauscht → Datei landet im festgehaltenen Verzeichnis oder der Vorgang schlägt fehl, nie außerhalb; vorhandenes Ziel → abgelehnt.
+- Exakter Scope: Session mit `exact_files(["out/result"])`; während und nach der Operation zeigt das Verzeichnis-Listing keinen weiteren Namen als `out/result`.
+- Absturz beim Entschlüsseln: Prozess wird mitten im Schreiben per `SIGKILL` beendet → kein neuer Verzeichniseintrag, `out/result` existiert nicht, kein Klartext-Rest im Workspace.
+- Dateisystem ohne `O_TMPFILE` → Operation abgelehnt, keine benannte Temporärdatei angelegt.
+- Modus: Ausgabe hat `0600` auch bei umask `000`.
 - Unit-Integrationstest: Hub läuft mit genau den Sandbox-Einstellungen der ausgelieferten `harw-auth-hub.service`, Peer unter **anderer** uid. Grant mit passender cgroup-Bedingung → zugelassen; andere cgroup → abgelehnt; Peer beendet → abgelehnt. Kein `EPERM`-Pfad führt zur Zulassung.
 - Nutzer-Operationen: Roundtrip encrypt/decrypt für große Dateien (streamend); `sign` außerhalb von `harw.user-sign/*` wird abgelehnt.
 - Kompatibilität: bestehende `HAKS`-Stores und V1/V2/V3-Secrets bleiben lesbar.
