@@ -869,8 +869,10 @@ kein Crate.
 
 - dass `comnet-arti` heute existiert oder bezogen werden kann (der Split und
   die Veröffentlichung sind comnet-Arbeit nach
-  `comnet/docs/plans/arti-bootstrap-crate-contract.md`; bis dahin ist W3
-  blockiert);
+  `comnet/docs/plans/arti-bootstrap-crate-contract.md`; bis `0.1.0`
+  veröffentlicht und die MSRV 1.92 gemerged ist, sind **W2 und W3**
+  blockiert; aus W2 darf vorher nur die abhängigkeitsfreie Design- und
+  Testvektor-Vorarbeit aus §15 laufen, kein Crate);
 - dass Cloudflare „Onion Routing“ oder der Tor-Browser-Umgang mit
   `Onion-Location`/`Alt-Svc` in Zukunft unverändert bleibt (Stand der
   Recherche am 2026-11-01, Quellen in `01-recherche…`; Auto-Redirect ist
