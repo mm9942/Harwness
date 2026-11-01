@@ -99,14 +99,32 @@ hostexterner Weg neben Telegram, mit derselben Fire-and-forget-Semantik.
 
 Mit diesem Channel wird die agentd-REST/SSE/WS-API für comnet zu einer
 **Grenze nach comnet-Regeln** (Impact-Liste vor Änderungen, Contract-Tests
-auf beiden Seiten). Das muss im comnet-Repo festgehalten werden, bevor die
-Implementierung beginnt.
+auf beiden Seiten).
+
+Zusage der comnet-Seite (Orchestrator-Session, 2026-11-01), Vertragsdatei
+`docs/plans/agentd-api-contract.md` im comnet-Repo folgt nach dem laufenden
+agentd-Nachzug von Wave C:
+
+- Die agentd-API ist als **v1** eingefroren: REST `/v1/*`, SSE `/v1/events`,
+  WS-Subprotokoll `comnet.agent.v1` und die MCP-Tools.
+- `GET /v1/healthz` meldet `api: 1` plus Minor. Jede Antwort trägt den
+  Header `comnet-agent-api: 1.<minor>` (Name geplant).
+- Innerhalb von v1 nur additive Änderungen. Brüche gehen nach `/v2`, mit
+  vorheriger Impact-Liste (inklusive Harwness) und Parallelbetrieb.
+- In v1 garantiert: `sender_verified`, `sender_username`,
+  `untrusted_content`, `conversation_id`, `msg_id`; Dateizugriff bleibt auf
+  `file_root` beschränkt.
+- comnet liefert Golden-JSON-Fixtures für alle v1-Payloads. Harwness
+  spiegelt dieselben Dateien für seine Contract-Tests.
+
+Der Transport prüft beim Start `api == 1` und lehnt eine andere Major-Version
+ab (fail closed).
 
 ---
 
 ## 3. Offene Punkte
 
-1. Einfrieren der agentd-API (Version, z. B. über `/v1/healthz` oder einen Header).
+1. Endgültiger Name des Versions-Headers und Ablageort der gespiegelten Fixtures, sobald `agentd-api-contract.md` in comnet vorliegt.
 2. Gruppenkonversationen: Mention-Gate wie bei Telegram oder nur 1:1?
 3. Ob SSE oder WebSocket der Standard-Ingress ist.
 4. Formatierung (Markdown) in comnet-Nachrichten.
