@@ -139,9 +139,24 @@ Regeln:
 
 | Plattform | Anker | Zusätzliches, nur einschränkendes Merkmal |
 |---|---|---|
-| Linux | `SO_PEERCRED`-uid (heute, F1) | PID per `SO_PEERPIDFD` (Linux ≥ 6.5, statt PID-Lookup mit Wiederverwendungs-Race), daraus cgroup-v2-Pfad (`/proc/<pid>/cgroup` über den pidfd) → systemd-Unit / Agent-Slice |
+| Linux | `SO_PEERCRED`-uid (heute, F1) | cgroup-v2-Pfad → systemd-Unit / Agent-Slice, gebunden über die Sequenz unten (`SO_PEERPIDFD`, Linux ≥ 6.5) |
 | macOS | `getpeereid` / `LOCAL_PEERCRED` | Audit-Token → Code-Signing-Identität |
 | Windows | Named Pipe → Client-Token-SID | `GetNamedPipeClientProcessId` → Image-Pfad / Signatur |
+
+**Bindung des cgroup-Merkmals an den Peer (Linux).** Ein pidfd ist nur eine
+stabile Prozessreferenz; procfs-Dateien liest man weiter über die numerische
+PID. Deshalb gilt genau diese Sequenz, und jeder Fehlschritt lehnt ab (fail
+closed):
+
+1. `SO_PEERCRED` liefert uid und `pid`; `SO_PEERPIDFD` liefert `pidfd`.
+   Fehlt `SO_PEERPIDFD` (Kernel < 6.5), werden cgroup-Bedingungen nicht
+   ausgewertet und Grants **mit** cgroup-Bedingung abgelehnt.
+2. `/proc/<pid>/cgroup` lesen (Zeile `0::<pfad>`).
+3. `pidfd_send_signal(pidfd, 0)` muss gelingen, sonst ist der Peer beendet.
+4. `/proc/<pid>/cgroup` erneut lesen; der Pfad muss identisch sein. Zusätzlich
+   muss `/proc/<pid>/status` (`Uid:`) zur `SO_PEERCRED`-uid passen.
+5. Erst dann gilt der Pfad als Merkmal dieses Aufrufs. Er wird nicht
+   gecacht, sondern pro Verbindung neu ermittelt.
 
 - cgroup-Merkmale werden nur ausgewertet, wenn der Pfad **nicht an den Nutzer
   delegiert** ist (Eigentümer root bzw. Hub-User). In einem delegierten
@@ -166,9 +181,23 @@ CLI, Web-UI und MCP sie ohne eigene Pfade bekommen:
 | `harw kms unlock / lock` | `kms.unlock` / `kms.lock` | nur `per-user` (§2.2) |
 
 - Agents arbeiten nur mit `KeyRef`, sehen also nie Schlüsselbytes.
-  Dateipfade laufen über `harw-authority::FileWriteScope`.
-- Signieren oder Entschlüsseln, das ein Agent auslöst, braucht eine
-  Freigabe des Nutzers (Approval über die Session bzw. den Channel).
+- **Eingabe-Zulassung** (alle Pfade, die gelesen werden: `<in>`, `--sig`):
+  verlangt `Permission::ReadWorkspace`, Einschluss in die Workspace-Root und
+  symlink-sichere Auflösung (kanonisieren relativ zu einem geöffneten
+  Root-Verzeichnis, `O_NOFOLLOW` je Segment bzw. `openat2` mit
+  `RESOLVE_BENEATH`; ein Symlink, der hinausführt, wird abgelehnt).
+  `FileWriteScope` ist nur eine Schreibobergrenze und gilt hier nicht
+  (`harw-authority/src/file_write_scope.rs:13-15`).
+- **Ausgabe-Zulassung** (`-o <out>`, Detached-Signatur): verlangt
+  `Permission::WriteWorkspace` **und** `FileWriteScope`
+  (`harw-authority/src/lib.rs:34-43`).
+- CLI, Web und MCP rufen dieselbe Operation mit derselben effektiven
+  Autorität der Session auf; kein Einstiegspunkt hat eigene Pfadregeln.
+- Signieren oder Entschlüsseln, das ein Agent auslöst, braucht zusätzlich
+  eine Freigabe des Nutzers (Approval über die Session bzw. den Channel).
+  Die Freigabe **erteilt keine Autorität**, die die Session nicht schon hat:
+  Sie kann eine zugelassene Operation nur bestätigen, nie eine abgelehnte
+  Ein- oder Ausgabe erlauben.
 
 ### 2.5 Transport
 
@@ -208,7 +237,7 @@ ist für Harwness optional und nicht Teil der ersten Wellen.
 | K4 | Nutzer-Operationen §2.4 (CLI, MCP, Web) | K2, K3 |
 | K5 | Hub als Container §2.6, Rollback-Anker | K2 |
 | K6 | öffentliche Schlüssel über LAN/Tor §2.5 | K4, arti-DEC |
-| K7 | comnet-Channel (`../../design/channel-ingress-comnet.md`), unabhängig vom KMS-Umbau | eingefrorene agentd-API |
+| K7 | comnet-Channel (`../../design/channel-ingress-comnet.md`), unabhängig vom KMS-Umbau | gemergter comnet-Commit/Tag mit agentd-v1-Vertrag (siehe dortiges §2.5) |
 
 ---
 
@@ -230,5 +259,8 @@ ist für Harwness optional und nicht Teil der ersten Wellen.
 - `migrate-kek`: Audit-Ereignis vor der Wirkung; Abbruch in der Mitte lässt den alten Store lesbar.
 - Rollback: Zurückspielen einer älteren Store-Datei wird erkannt.
 - cgroup: Grant mit cgroup-Bedingung lehnt Aufrufe aus anderer Unit ab; delegierte cgroups werden ignoriert.
+- cgroup-Bindung: Peer beendet sich zwischen Schritt 2 und 3 → abgelehnt; PID-Wiederverwendung (neuer Prozess unter derselben PID) → abgelehnt; Peer wechselt die cgroup zwischen den Lesevorgängen → abgelehnt; Kernel ohne `SO_PEERPIDFD` → Grants mit cgroup-Bedingung abgelehnt.
+- Eingabe-Zulassung: Eingabe außerhalb der Workspace-Root → abgelehnt; Symlink im Workspace, der hinauszeigt → abgelehnt; Session ohne `ReadWorkspace` → abgelehnt, auch nach Nutzerfreigabe.
+- Ausgabe-Zulassung: Ziel außerhalb von `FileWriteScope` oder ohne `WriteWorkspace` → abgelehnt, auch nach Nutzerfreigabe; gleiches Ergebnis über CLI, Web und MCP.
 - Nutzer-Operationen: Roundtrip encrypt/decrypt für große Dateien (streamend); `sign` außerhalb von `harw.user-sign/*` wird abgelehnt.
 - Kompatibilität: bestehende `HAKS`-Stores und V1/V2/V3-Secrets bleiben lesbar.

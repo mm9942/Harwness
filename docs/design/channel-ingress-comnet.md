@@ -68,8 +68,27 @@ harw-channel (Core)
 | Approvals | comnet-Nachricht mit einmaligem Token und TTL (Muster `harw-channel-telegram/src/approval_tokens.rs`) |
 | Anhänge | `/v1/files/*`; lokale Pfade über `FileWriteScope` **und** agentd-`file_root` |
 | `untrusted_content` | wird in den Prompt-Injection-Schutz der Session übernommen |
-| `run_ingress` | SSE `/v1/events` oder WebSocket `comnet.agent.v1`, mit Reconnect und Jitter |
+| `run_ingress` | SSE `/v1/events` oder WebSocket `comnet.agent.v1`, mit Reconnect, Jitter und Nachholen (§2.2a) |
 | `render_outbound` | Klartext; `ChannelCapabilities` ohne Markdown, bis comnet Formatierung festlegt |
+
+### 2.2a Keine Ereignisse verlieren
+
+agentd spielt Ereignisse **nicht** nach: Ein Reconnect mit `Last-Event-ID`
+liefert `event: lagged` mit `missed: null`, ein Überlauf (Broadcast oder
+Stream-Queue) ebenfalls `lagged` mit Anzahl; danach muss der Konsument den
+Zustand über REST neu lesen (comnet: `crates/comnet-agentd/src/sse.rs:1-15`).
+Daher:
+
+- Der Transport hält je Konversation einen dauerhaften Cursor (letzte
+  verarbeitete `msg_id`) im Session-Store.
+- Nach **jedem** `lagged`-Ereignis und nach **jedem** Reconnect wird die
+  Live-Zustellung angehalten. Für jede bekannte Konversation (und neu über
+  `/v1/conversations`) holt `/v1/messages/list` alles nach dem Cursor nach.
+  Erst danach geht es live weiter.
+- Live-Ereignisse, die während des Nachholens eintreffen, werden gepuffert
+  und über `msg_id` dedupliziert.
+- Ein unbekannter Ereignistyp oder ein `lagged`, das nicht verarbeitet werden
+  kann, führt zum vollständigen Nachholen, nie zum Überspringen.
 
 ### 2.3 Konfiguration
 
@@ -101,11 +120,16 @@ Mit diesem Channel wird die agentd-REST/SSE/WS-API für comnet zu einer
 **Grenze nach comnet-Regeln** (Impact-Liste vor Änderungen, Contract-Tests
 auf beiden Seiten).
 
-Zusage der comnet-Seite (Orchestrator-Session, 2026-11-01), Vertragsdatei
-`docs/plans/agentd-api-contract.md` im comnet-Repo folgt nach dem laufenden
-agentd-Nachzug von Wave C:
+**Vorschlag, noch nicht verifiziert.** Die comnet-Orchestrator-Session hat
+am 2026-11-01 Folgendes zugesagt. Im comnet-Repo existiert dazu noch kein
+Vertrag: Es gibt keine `docs/plans/agentd-api-contract.md` und keinen
+Versions-Header, und `/v1/healthz` liefert nur `{"ok":true}`
+(comnet: `crates/comnet-agentd/src/rest.rs`). Eine Absprache zwischen
+Sessions ist kein reproduzierbarer Beleg.
 
-- Die agentd-API ist als **v1** eingefroren: REST `/v1/*`, SSE `/v1/events`,
+Vorgeschlagen:
+
+- Die agentd-API wird als **v1** eingefroren: REST `/v1/*`, SSE `/v1/events`,
   WS-Subprotokoll `comnet.agent.v1` und die MCP-Tools.
 - `GET /v1/healthz` meldet `api: 1` plus Minor. Jede Antwort trägt den
   Header `comnet-agent-api: 1.<minor>` (Name geplant).
@@ -120,11 +144,23 @@ agentd-Nachzug von Wave C:
 Der Transport prüft beim Start `api == 1` und lehnt eine andere Major-Version
 ab (fail closed).
 
+**Gate für die Implementierung (K7).** Begonnen wird erst, wenn ein
+**gemergter comnet-Commit oder Tag** feststeht, der Folgendes enthält:
+
+1. `docs/plans/agentd-api-contract.md`;
+2. die finale Versionsaushandlung (`/v1/healthz` mit `api`/Minor und den
+   Header-Namen);
+3. Golden-JSON-Fixtures für REST, SSE und WS;
+4. grüne Producer-Contract-Tests in comnet.
+
+Dieser Commit wird hier mit SHA eingetragen; Harwness spiegelt die Fixtures
+von genau diesem Stand.
+
 ---
 
 ## 3. Offene Punkte
 
-1. Endgültiger Name des Versions-Headers und Ablageort der gespiegelten Fixtures, sobald `agentd-api-contract.md` in comnet vorliegt.
+1. comnet-Commit/Tag für das Gate in §2.5 (noch offen), daraus Header-Name und Ablageort der gespiegelten Fixtures.
 2. Gruppenkonversationen: Mention-Gate wie bei Telegram oder nur 1:1?
 3. Ob SSE oder WebSocket der Standard-Ingress ist.
 4. Formatierung (Markdown) in comnet-Nachrichten.
@@ -140,3 +176,6 @@ ab (fail closed).
 - Datei-Download außerhalb von `FileWriteScope` → abgelehnt, auch wenn agentd es erlauben würde.
 - Contract-Test gegen aufgezeichnete agentd-Antworten (Golden Files), inklusive `deny_unknown_fields`-Verhalten.
 - Reconnect: Abbruch des Event-Streams führt zu Wiederaufnahme ohne doppelte Zustellung (Dedup über Nachrichten-ID).
+- Nachricht trifft **während** eines Verbindungsabbruchs ein → wird nach dem Reconnect über REST nachgeholt und genau einmal zugestellt.
+- Queue-Überlauf (`EVENTS_QUEUE` voll, `lagged` mit Anzahl) → vollständiges Nachholen ab Cursor, keine Lücke.
+- `lagged` mit `missed: null` nach `Last-Event-ID` → Nachholen, bevor die Live-Zustellung weiterläuft.
