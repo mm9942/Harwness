@@ -58,7 +58,31 @@ Harwness heute nachbaut:
 - Plattform-Adapter für Peer-Identität (§2.3);
 - optional: HTTPS+mTLS-, Streamable-HTTP-MCP- und arti-Frontends.
 
-Harwness bindet `crypt_guard_kms` **als Bibliothek** ein, nicht als fertiges
+Abgestimmt mit der crypt_guard-Session (2026-11-01, Vertrag
+`docs/plans/crypt-guard-kms-contract.md` in mm9942/crypt_guard#25):
+
+- **`crypt_guard_keystore`** (eigene Crate): `KekProvider { backend(), open() -> Box<dyn Kek>, create(), destroy(), capabilities() }`
+  und `Kek { id(), seal(&FileKey, aad), unseal(&WrappedFileKey, aad), derive(label) }`.
+  Capabilities: `AtRestOnDisk`, `BoundToUser`, `BoundToMachine`, `HardwareBacked`,
+  `RequiresPresence`, `SurvivesReboot`, `Exportable`. OS-Backends hinter
+  Features (keyring 4.x, linux-keyutils, DPAPI, tss-esapi, Argon2-Passphrase).
+  Die KEK muss nicht exportierbar sein; nur Software-KEKs bieten
+  `ExportableKek::seed()` für Backups.
+- **`crypt_guard_service`** bekommt additiv `SeedStore` und `SeedProvider<S>`
+  (`InMemoryProvider` wird Alias); die Speicherlogik ist damit nicht mehr privat.
+- **`crypt_guard_kms`**: `SealedProvider` über den Container `CGKS`
+  (XChaCha20-Poly1305 oder AES-256-GCM-SIV, Rollback-Guard-Datei,
+  atomares Schreiben, CAS-Rotation), Daemon, mTLS, MCP, arti.
+- Mindestversion **3.2.0** auf crates.io; keine Git-Quelle nötig (F9).
+
+Abbildung auf Harwness: `hub-derived` = `Kek::derive(principal)`;
+`per-user` = `open()` unter der uid des Nutzers, `Kek` im RAM bis
+`unlock_ttl`. Der Pflicht-`mode` bleibt eine Harwness-Config-Entscheidung.
+`pkcs11` und `command` registriert Harwness selbst als eigene Provider
+(`Arc<dyn KekProvider>`). Ein Leser für bestehende `HAKS`-Stores bleibt in
+Harwness; neues Format ist `CGKS`.
+
+Harwness bindet `crypt_guard_keystore` und `crypt_guard_kms` **als Bibliotheken** ein, nicht als fertiges
 Binary. `harw-auth-hub` behält nur das Harwness-Spezifische:
 `harw.<purpose>/<owner>`-Namespaces, `SignTranscript`, SecurityHub-Contexts,
 Audit über `harw-secrets`. Voraussetzung ist ein crates.io-Release (F9).
@@ -178,8 +202,8 @@ ist für Harwness optional und nicht Teil der ersten Wellen.
 | Welle | Inhalt | Abhängigkeit |
 |---|---|---|
 | K0 | Doku-Drift F6 beheben, `KekSource` und `KekProvenance` gegenüberstellen | keine |
-| K1 | gemeinsames KEK-Schema §2.2 mit Pflicht-`mode` | crypt_guard-Release mit `KekProvider` |
-| K2 | `SealedProvider` gegen den Upstream-Provider tauschen; Kompatibilitätstests (HAKS lesbar) bleiben | K1 |
+| K1 | gemeinsames KEK-Schema §2.2 mit Pflicht-`mode` | crypt_guard 3.2.0 (`crypt_guard_keystore`) |
+| K2 | `SealedProvider` gegen `crypt_guard_kms::SealedProvider` (`CGKS`) tauschen; `HAKS`-Leser und Kompatibilitätstests bleiben | K1 |
 | K3 | Identität §2.3 (`SO_PEERPIDFD`, cgroup v2, macOS, Windows) | K1 |
 | K4 | Nutzer-Operationen §2.4 (CLI, MCP, Web) | K2, K3 |
 | K5 | Hub als Container §2.6, Rollback-Anker | K2 |
@@ -190,7 +214,7 @@ ist für Harwness optional und nicht Teil der ersten Wellen.
 
 ## 4. Offene Punkte
 
-1. Welche Mindestversion von crypt_guard trägt `KekProvider` (3.2.0?). Abzustimmen mit dem crypt_guard-Chat.
+1. Migration `HAKS` → `CGKS`: einmalig beim Start oder per `harw keys migrate-store`; Rollback-Anker im TPM-NV ist upstream noch offen.
 2. Soll `harw-secrets` direkt `crypt_guard_kms::KekProvider` nutzen oder weiter über `DekWrapper` (V3) an den Hub delegieren?
 3. `when_locked = "queue"`: maximale Wartezeit und Verhalten beim Neustart des Hubs.
 4. Format des Rollback-Ankers je Provider (TPM-NV vs. Keychain vs. Datei).
