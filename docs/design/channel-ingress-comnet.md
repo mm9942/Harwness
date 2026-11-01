@@ -79,12 +79,23 @@ Stream-Queue) ebenfalls `lagged` mit Anzahl; danach muss der Konsument den
 Zustand über REST neu lesen (comnet: `crates/comnet-agentd/src/sse.rs:1-15`).
 Daher:
 
-- Der Transport hält je Konversation einen dauerhaften Cursor (letzte
-  verarbeitete `msg_id`) im Session-Store.
+- **Die heutige API reicht dafür nicht.** `ListMessagesArgs` kennt nur
+  `conversation_id`, `before` (Sender-Zeitstempel in ms) und `limit`
+  (höchstens 200). Ergebnisse kommen neueste zuerst, und weder `msg_id`
+  noch der Event-Cursor werden akzeptiert (comnet:
+  `crates/comnet-agentd/src/tools.rs`, `ListMessagesArgs`). Paging über
+  Zeitstempel kann Nachrichten mit gleichem Zeitstempel überspringen.
+  Deshalb ist ein lückenloser Cursor Teil des Upstream-Gates (§2.5, Punkt 5).
+- Der Transport hält je Konversation einen dauerhaften Cursor (den
+  stabilen Server-Cursor aus §2.5, nicht den Zeitstempel) im Session-Store.
 - Nach **jedem** `lagged`-Ereignis und nach **jedem** Reconnect wird die
   Live-Zustellung angehalten. Für jede bekannte Konversation (und neu über
-  `/v1/conversations`) holt `/v1/messages/list` alles nach dem Cursor nach.
-  Erst danach geht es live weiter.
+  `/v1/conversations`) holt `/v1/messages/list` mit `after = <cursor>`
+  aufsteigend und seitenweise alles nach, bis `has_more = false`. Erst danach
+  geht es live weiter.
+- Unbekannter oder abgelaufener Cursor (Retention): Der Transport liest die
+  Konversation vollständig neu ein. Danach meldet er der Session ein
+  sichtbares Ereignis „mögliche Lücke“. Er macht nie still weiter.
 - Live-Ereignisse, die während des Nachholens eintreffen, werden gepuffert
   und über `msg_id` dedupliziert.
 - Ein unbekannter Ereignistyp oder ein `lagged`, das nicht verarbeitet werden
@@ -151,7 +162,15 @@ ab (fail closed).
 2. die finale Versionsaushandlung (`/v1/healthz` mit `api`/Minor und den
    Header-Namen);
 3. Golden-JSON-Fixtures für REST, SSE und WS;
-4. grüne Producer-Contract-Tests in comnet.
+4. grüne Producer-Contract-Tests in comnet;
+5. ein lückenloser Nachrichten-Cursor in `/v1/messages/list`:
+   - `after: Option<cursor>` mit einem stabilen, serverseitig monotonen
+     Cursor pro Konversation (kein Zeitstempel);
+   - aufsteigende Reihenfolge, `next_cursor` und `has_more`;
+   - Live-Events tragen denselben Cursor;
+   - unbekannter oder abgelaufener Cursor → expliziter Fehler (z. B.
+     `cursor_unknown`) statt einer leeren Seite;
+   - die Retention-Dauer ist dokumentiert.
 
 Dieser Commit wird hier mit SHA eingetragen; Harwness spiegelt die Fixtures
 von genau diesem Stand.
@@ -179,3 +198,6 @@ von genau diesem Stand.
 - Nachricht trifft **während** eines Verbindungsabbruchs ein → wird nach dem Reconnect über REST nachgeholt und genau einmal zugestellt.
 - Queue-Überlauf (`EVENTS_QUEUE` voll, `lagged` mit Anzahl) → vollständiges Nachholen ab Cursor, keine Lücke.
 - `lagged` mit `missed: null` nach `Last-Event-ID` → Nachholen, bevor die Live-Zustellung weiterläuft.
+- Mehrere Nachrichten mit identischem Sender-Zeitstempel → alle genau einmal nachgeholt.
+- Lücke größer als eine Seite (≥ 201 Nachrichten) → vollständig über mehrere Seiten nachgeholt, keine fehlt.
+- Abgelaufener oder unbekannter Cursor → vollständiges Neueinlesen und sichtbares „mögliche Lücke“-Ereignis, kein stilles Weiterlaufen.

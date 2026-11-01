@@ -143,20 +143,40 @@ Regeln:
 | macOS | `getpeereid` / `LOCAL_PEERCRED` | Audit-Token → Code-Signing-Identität |
 | Windows | Named Pipe → Client-Token-SID | `GetNamedPipeClientProcessId` → Image-Pfad / Signatur |
 
-**Bindung des cgroup-Merkmals an den Peer (Linux).** Ein pidfd ist nur eine
-stabile Prozessreferenz; procfs-Dateien liest man weiter über die numerische
-PID. Deshalb gilt genau diese Sequenz, und jeder Fehlschritt lehnt ab (fail
-closed):
+**Bindung des cgroup-Merkmals an den Peer (Linux).** Die Prüfung muss unter
+der ausgelieferten Unit laufen: `harw-auth-hub` läuft als `harw-auth` mit
+`ProtectProc=invisible`, `ProcSubset=pid` und leeren Capability-Mengen
+(`deploy/systemd/harw-auth-hub.service:27,49-50,61-62`). Fremde
+`/proc/<pid>/`-Einträge sind damit unsichtbar, und `pidfd_send_signal`
+liefert für fremde uids `EPERM`. Beides wird **nicht** aufgeweicht: kein
+`CAP_KILL`, keine Proc-Sichtbarkeit nur für diese Prüfung.
+
+Stattdessen prüft der Hub die **Bedingung des Grants** und liest nicht den
+cgroup-Pfad des Peers. cgroupfs ist unter `ProtectControlGroups=yes`
+nur schreibgeschützt, bleibt aber lesbar (`harw-auth-hub.service:46`). Die
+Unit hat kein `PrivatePIDs`, PIDs sind also die des Host-Namespace. Genau
+diese Sequenz, jeder Fehlschritt lehnt ab (fail closed):
 
 1. `SO_PEERCRED` liefert uid und `pid`; `SO_PEERPIDFD` liefert `pidfd`.
-   Fehlt `SO_PEERPIDFD` (Kernel < 6.5), werden cgroup-Bedingungen nicht
-   ausgewertet und Grants **mit** cgroup-Bedingung abgelehnt.
-2. `/proc/<pid>/cgroup` lesen (Zeile `0::<pfad>`).
-3. `pidfd_send_signal(pidfd, 0)` muss gelingen, sonst ist der Peer beendet.
-4. `/proc/<pid>/cgroup` erneut lesen; der Pfad muss identisch sein. Zusätzlich
-   muss `/proc/<pid>/status` (`Uid:`) zur `SO_PEERCRED`-uid passen.
-5. Erst dann gilt der Pfad als Merkmal dieses Aufrufs. Er wird nicht
-   gecacht, sondern pro Verbindung neu ermittelt.
+   Fehlt `SO_PEERPIDFD` (Kernel < 6.5), werden Grants **mit**
+   cgroup-Bedingung abgelehnt.
+2. Nichtblockierendes `poll(pidfd, POLLIN, 0)`: lesbar heißt beendet,
+   also ablehnen. Dafür braucht es keine Berechtigung (`pidfd_open(2)`).
+3. `C` ist der kanonische Pfad aus dem Grant. Per `stat` wird geprüft, dass
+   `/sys/fs/cgroup/C` nicht delegiert ist (Eigentümer root). Dann wird
+   `/sys/fs/cgroup/C/cgroup.procs` mit Größenlimit gelesen, und `pid` muss
+   darin stehen (exakte cgroup, keine Kinder).
+4. Erneut `poll(pidfd, POLLIN, 0)`: lebt der Prozess noch, hält der pidfd
+   die PID fest, und sie kann zwischen 1 und 3 nicht neu vergeben worden
+   sein. Ist er beendet, wird abgelehnt.
+5. Das Ergebnis gilt nur für diese Verbindung und wird nicht gecacht.
+
+Restrisiko, bewusst akzeptiert: Ein Prozess, der nach Schritt 4 in eine
+andere cgroup wechselt. Nicht delegierte cgroups kann aber nur
+root bzw. systemd umhängen.
+
+Verworfen: `CAP_KILL` für `pidfd_send_signal`, `ProtectProc=default` für den
+Hub, `/proc/<pid>/cgroup` über die numerische PID.
 
 - cgroup-Merkmale werden nur ausgewertet, wenn der Pfad **nicht an den Nutzer
   delegiert** ist (Eigentümer root bzw. Hub-User). In einem delegierten
@@ -181,16 +201,34 @@ CLI, Web-UI und MCP sie ohne eigene Pfade bekommen:
 | `harw kms unlock / lock` | `kms.unlock` / `kms.lock` | nur `per-user` (§2.2) |
 
 - Agents arbeiten nur mit `KeyRef`, sehen also nie Schlüsselbytes.
+- **Wo die Datei-I/O läuft:** im aufrufenden Harwness-Prozess unter der uid
+  des Nutzers, nie im Hub. Der Hub sieht keine Nutzerdateien. Er wrappt
+  nur den DEK (Verschlüsseln) bzw. signiert ein `SignTranscript` mit dem
+  Digest der Datei (Signieren).
 - **Eingabe-Zulassung** (alle Pfade, die gelesen werden: `<in>`, `--sig`):
   verlangt `Permission::ReadWorkspace`, Einschluss in die Workspace-Root und
   symlink-sichere Auflösung (kanonisieren relativ zu einem geöffneten
-  Root-Verzeichnis, `O_NOFOLLOW` je Segment bzw. `openat2` mit
-  `RESOLVE_BENEATH`; ein Symlink, der hinausführt, wird abgelehnt).
+  Root-Verzeichnis per `openat2` mit `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`;
+  jeder Symlink im Pfad wird abgelehnt).
   `FileWriteScope` ist nur eine Schreibobergrenze und gilt hier nicht
   (`harw-authority/src/file_write_scope.rs:13-15`).
 - **Ausgabe-Zulassung** (`-o <out>`, Detached-Signatur): verlangt
   `Permission::WriteWorkspace` **und** `FileWriteScope`
-  (`harw-authority/src/lib.rs:34-43`).
+  (`harw-authority/src/lib.rs:34-43`). `FileWriteScope` ist rein lexikalisch;
+  Aufrufer müssen zusätzlich unterhalb des Workspace auflösen und
+  Symlink-Races verhindern (`harw-authority/src/file_write_scope.rs:1-3`).
+  Deshalb wird jede Ausgabe so geschrieben:
+  1. Workspace-Root einmal als Verzeichnis-fd öffnen und festhalten.
+  2. Elternverzeichnis relativ dazu per `openat2(RESOLVE_BENEATH |
+     RESOLVE_NO_SYMLINKS)` öffnen.
+  3. Temporärdatei im Eltern-fd mit `O_CREAT | O_EXCL | O_NOFOLLOW` anlegen,
+     schreiben, `fsync`.
+  4. `renameat2` innerhalb desselben Eltern-fd, mit `RENAME_NOREPLACE`,
+     außer bei explizitem `--force`. Danach `fsync` auf den Eltern-fd.
+  5. Bei Fehler wird die Temporärdatei per `unlinkat` im selben fd entfernt.
+  Alle Schritte arbeiten auf festgehaltenen fds, nie auf Pfadstrings. Wird
+  ein Pfadteil später durch einen Symlink ersetzt, ändert das das Ziel
+  nicht.
 - CLI, Web und MCP rufen dieselbe Operation mit derselben effektiven
   Autorität der Session auf; kein Einstiegspunkt hat eigene Pfadregeln.
 - Signieren oder Entschlüsseln, das ein Agent auslöst, braucht zusätzlich
@@ -259,8 +297,10 @@ ist für Harwness optional und nicht Teil der ersten Wellen.
 - `migrate-kek`: Audit-Ereignis vor der Wirkung; Abbruch in der Mitte lässt den alten Store lesbar.
 - Rollback: Zurückspielen einer älteren Store-Datei wird erkannt.
 - cgroup: Grant mit cgroup-Bedingung lehnt Aufrufe aus anderer Unit ab; delegierte cgroups werden ignoriert.
-- cgroup-Bindung: Peer beendet sich zwischen Schritt 2 und 3 → abgelehnt; PID-Wiederverwendung (neuer Prozess unter derselben PID) → abgelehnt; Peer wechselt die cgroup zwischen den Lesevorgängen → abgelehnt; Kernel ohne `SO_PEERPIDFD` → Grants mit cgroup-Bedingung abgelehnt.
+- cgroup-Bindung: Peer beendet sich zwischen Schritt 2 und 4 → abgelehnt; PID-Wiederverwendung (neuer Prozess unter derselben PID in `cgroup.procs`) → abgelehnt, weil der pidfd das Ende meldet; delegierte cgroup in einem Grant → abgelehnt; Kernel ohne `SO_PEERPIDFD` → Grants mit cgroup-Bedingung abgelehnt.
 - Eingabe-Zulassung: Eingabe außerhalb der Workspace-Root → abgelehnt; Symlink im Workspace, der hinauszeigt → abgelehnt; Session ohne `ReadWorkspace` → abgelehnt, auch nach Nutzerfreigabe.
 - Ausgabe-Zulassung: Ziel außerhalb von `FileWriteScope` oder ohne `WriteWorkspace` → abgelehnt, auch nach Nutzerfreigabe; gleiches Ergebnis über CLI, Web und MCP.
+- Ausgabe-Symlinks: Elternverzeichnis ist ein Symlink nach außen → abgelehnt; Zieldatei ist ein Symlink → abgelehnt, nichts außerhalb wird überschrieben; Elternverzeichnis wird zwischen Öffnen und `renameat2` gegen einen Symlink getauscht → Datei landet im festgehaltenen Verzeichnis oder der Vorgang schlägt fehl, nie außerhalb; vorhandenes Ziel ohne `--force` → abgelehnt.
+- Unit-Integrationstest: Hub läuft mit genau den Sandbox-Einstellungen der ausgelieferten `harw-auth-hub.service`, Peer unter **anderer** uid. Grant mit passender cgroup-Bedingung → zugelassen; andere cgroup → abgelehnt; Peer beendet → abgelehnt. Kein `EPERM`-Pfad führt zur Zulassung.
 - Nutzer-Operationen: Roundtrip encrypt/decrypt für große Dateien (streamend); `sign` außerhalb von `harw.user-sign/*` wird abgelehnt.
 - Kompatibilität: bestehende `HAKS`-Stores und V1/V2/V3-Secrets bleiben lesbar.
