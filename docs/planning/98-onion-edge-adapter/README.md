@@ -26,8 +26,9 @@ related:
 >
 > Grundlage ist der Onion-Mechanismus von **comnet v2** (`comnet-transport`,
 > Feature `arti`, und der apicon-Ingress). **Entscheidung des Owners
-> (2026-11-01): harw-edge setzt als Adapter auf `comnet-transport` auf**, es
-> kopiert den arti-Code nicht (§4.4). comnet schaltet hinter die Onion einen
+> (2026-11-01): harw-edge setzt als Adapter auf comnets Bootstrap-Element
+> auf, das als installierbares Crate `comnet-arti` aus `comnet-transport`
+> herausgelöst wird**; Harwness kopiert den arti-Code nicht (§4.4). comnet schaltet hinter die Onion einen
 > Pingora-Proxy. Dieser Plan tut das **nicht**: Der Byte-Pfad ist
 > `Dienst ⇄ TLS ⇄ arti-DataStream ⇄ Tor`, ohne Reverse Proxy, mit
 > `bytes::Bytes` als Puffertyp. Die Recherche zu Cloudflare, Tor-Browser,
@@ -43,8 +44,8 @@ related:
 | Was wird gebaut | Ein Adapter-Stack (`harw-edge-*`), der einen in Rust geschriebenen Dienst (hyper/tower-`Service` **oder** roher Byte-Stream-Handler) gleichzeitig auf drei Wegen erreichbar macht: ① HTTPS + mTLS auf IP/Hostname (eigene DNS, Tailscale-MagicDNS), ② Onion-Service über arti in-process mit TLS + mTLS **innerhalb** des Onion-Streams, ③ eine Cloudflare-verwaltete Domain, die auf ① zeigt und die Onion über `Onion-Location`, `Alt-Svc`, einen signierten `/.well-known/`-Datensatz und einen TXT-Record bekannt gibt. |
 | Was wird **nicht** gebaut | Kein Pingora, kein Reverse Proxy, kein `cloudflared`, kein Tor-Exit-Verkehr, kein zweiter Adressklassifizierer, keine zweite Geräte-Registry, kein Hot-Reload im ersten Schnitt. |
 | CLI | `harw-edge` (clap derive): `init`, `serve`, `onion`, `cert`, `unit`, `config`, `domain`, `doctor`. `unit` und `config` **prüfen und reparieren** systemd-Units und TOML-Dateien (Dry-Run mit Diff, Backup, atomarer Schreibpfad). |
-| Grundlage | `comnet-transport` (Features `direct`, `arti`) liefert `ArtiRuntime`, `OnionListener`, `ArtiDialer`, `TlsListener`, den PQ-only-Provider und die mTLS-Builder. harw-edge ist der Adapter darüber: Dienst-Anschluss (hyper/`Vec<Bytes>`), CA/Leaf-Ausstellung, Domain-Bindung, CLI, Units. Nur comnet pinnt arti; Harwness erbt den Pin (§4.4). |
-| Harte Voraussetzung | comnet und arti verlangen Rust 1.92 (comnet `Cargo.toml:20`, DEC-004). Harwness steht auf MSRV 1.89 (`Cargo.toml:218`), baut aber mit 1.98.1 (`rust-toolchain.toml:11`). Die MSRV muss angehoben werden (DEC-A). Außerdem ist comnet heute `publish = false` (`Cargo.toml:21`) und Harwness verbietet Git-Quellen (`deny.toml:90-92`); der Bezugsweg braucht eine Entscheidung (DEC-G, §4.4). |
+| Grundlage | Das Bootstrap-Element von comnet als **installierbares Crate** `comnet-arti` (Owner-Entscheidung 2026-11-01; aus `comnet-transport` herausgelöst, comnet-seitiger Vertrag `comnet/docs/plans/arti-bootstrap-crate-contract.md`): `ArtiRuntime`, `OnionListener`, `ArtiDialer`, `TlsListener`, PQ-only-Provider, mTLS-Builder, `Conn`/`PeerInfo`. harw-edge ist der Adapter darüber: Dienst-Anschluss (hyper/`Vec<Bytes>`), CA/Leaf-Ausstellung, Domain-Bindung, CLI, Units. Nur comnet pinnt arti; Harwness pinnt `comnet-arti` exakt (§4.4). |
+| Harte Voraussetzung | comnet und arti verlangen Rust 1.92 (comnet `Cargo.toml:20`, DEC-004). Harwness steht auf MSRV 1.89 (`Cargo.toml:218`), baut aber mit 1.98.1 (`rust-toolchain.toml:11`). Die MSRV muss angehoben werden (DEC-A). `comnet-arti` existiert noch nicht: der Split und die Veröffentlichung auf crates.io sind comnet-Arbeit (Vertrag oben, Entscheidungen U1–U7) und laufen **vor** W3. |
 | Erste Lieferung | W0 (Spike + DECs) und W1 (`harw-unitfile`, `harw-edge-config`: reine Parser/Validierer/Reparierer, ohne Netz) sind sofort startbar und bringen schon ohne Tor Nutzen (PL-94 R1/R3: Units, die 18 400-mal am Tag neu starten, `README.md:37`). |
 
 ---
@@ -247,15 +248,15 @@ Regeln:
 |---|---|---|---|
 | `harw-unitfile` | **F** | Reiner systemd-Unit-Parser (`systemd.syntax(7)`: Sektionen, `Key=Value`, Fortsetzungszeilen mit `\`, Kommentare `#`/`;`, Mehrfachschlüssel, Leerzuweisung als Reset), Direktiven-Tabelle (`[Unit]`, `[Service]`, `[Socket]`, `[Install]`, Exec-Direktiven aus `systemd.exec(5)`), Typprüfung (bool, Zeitspanne, Pfad, Capability-Liste, Syscall-Set), Hardening-Lint mit Score, formaterhaltende Reparatur, Renderer. Keine Prozesse, kein I/O. | keine |
 | `harw-edge-config` | **I** | TOML-Schema `edge.toml` (§8), `Deserialize` mit `deny_unknown_fields`, `validate()`, `toml_edit`-Reparatur (Schlüssel-Vorschläge per Levenshtein gegen das Schema, fehlende Pflichtfelder mit Platzhalter + Kommentar, Typkorrekturen nur wo eindeutig), Diff-Erzeugung, Backup + atomares Schreiben über `harw-fsutil`. | `toml`, `toml_edit` (beide im Lock), `serde`, `harw-fsutil` |
-| `harw-edge-tls` | **A** | X.509-Profil **über** `comnet_transport::tls`: eigene Edge-CA (Ed25519 **oder** ECDSA P-256, DEC-C), Leaf-Ausstellung mit SAN-Pflicht (`DNS:`/`IP:` für Server, `URI:urn:harw:device:<id>` für Clients), `ClientCertVerifier` als Hülle um comnets `webpki_client_verifier` (+ genau eine Pflicht-SAN + SPKI-Revocation-Set), Provider-Profile `pq-strict` = `comnet_transport::crypto_provider()` und `pq-preferred` = `comnet_transport::process_default_provider()` (hybrid zuerst, klassischer Fallback für Browser), Resumption aus (comnet-Default), PEM/Credential-Laden. | `comnet-transport` (Feature `direct`), *`rcgen`*, *`x509-parser`*, `rustls`, `rustls-pki-types` |
-| `harw-onion` | **A** | **Adapter** über `comnet-transport` mit Feature `arti`: re-exportiert `ArtiConfig`, `ArtiRuntime`, `OnionListener`, `ArtiDialer`, `Isolation`; implementiert `harw_edge_serve::EdgeListener` für `comnet_transport::Listener`-Typen und bildet `comnet_transport::PeerInfo` (C10) auf `harw_edge_serve::PeerInfo` ab (`client_cert: Vec<u8>` → `CertificateDer`, SPKI-Hash berechnen, Peer-Key ableiten). Enthält **keinen** arti-Code. Optionale Features `restricted-discovery`, `pow` nur, wenn comnet-transport sie anbietet (sonst Feature-Request an comnet, §4.4). | `comnet-transport` (Features `direct`, `arti`; arti-Pin und `safelog` kommen transitiv, DEC-B) |
+| `harw-edge-tls` | **A** | X.509-Profil **über** `comnet_arti::tls`: eigene Edge-CA (Ed25519 **oder** ECDSA P-256, DEC-C), Leaf-Ausstellung mit SAN-Pflicht (`DNS:`/`IP:` für Server, `URI:urn:harw:device:<id>` für Clients), `ClientCertVerifier` als Hülle um comnets `webpki_client_verifier` (+ genau eine Pflicht-SAN + SPKI-Revocation-Set), Provider-Profile `pq-strict` = `comnet_transport::crypto_provider()` und `pq-preferred` = `comnet_transport::process_default_provider()` (hybrid zuerst, klassischer Fallback für Browser), Resumption aus (comnet-Default), PEM/Credential-Laden. | *`comnet-arti`* (Feature `direct`), *`rcgen`*, *`x509-parser`*, `rustls`, `rustls-pki-types` |
+| `harw-onion` | **A** | **Adapter** über `comnet-arti` mit Feature `arti`: re-exportiert `ArtiConfig`, `ArtiRuntime`, `OnionListener`, `ArtiDialer`, `IsolationKey`; implementiert `harw_edge_serve::EdgeListener` für `comnet_arti::Listener`-Typen und bildet `comnet_arti::PeerInfo` (C10) auf `harw_edge_serve::PeerInfo` ab (`client_cert: Vec<u8>` → `CertificateDer`, SPKI-Hash berechnen, Peer-Key ableiten). Enthält **keinen** arti-Code. Feature `restricted-discovery` sobald `comnet-arti 0.2` es anbietet (Vertrag U5); PoW nie. | *`comnet-arti`* (Features `direct`, `arti`; arti-Pin und `safelog` kommen transitiv, DEC-B) |
 | `harw-edge-serve` | **A** | `Listener`-Trait (`direct`, `onion`, `uds`), `TlsAcceptorLayer` (Handshake-Timeout 10 s, begrenzte parallele Handshakes), `serve_http(listener, service)` über hyper 1.x `http1::Builder` (+ `http2` optional) mit `hyper_util::rt::TokioIo`, `serve_stream(listener, handler)` für `Vec<Bytes>`-Handler, Verbindungslimits, Peer-Key für Rate-Limits (pro Stream, C6-Lücke dokumentiert), `PeerInfo` als `http::Extensions`-Eintrag. Pro Weg `tokio::select!` mit Shutdown-Watch. | `hyper`, `hyper-util`, `tower-service`, `http`, `http-body-util`, `bytes`, `tokio` |
 | `harw-edge-domain` | **A** | Domain-Bindung: `Onion-Location`/`Alt-Svc`-Middleware (nur bei `https`-Request mit passendem `Host`), `/.well-known/harw-onion` (JSON, mit ML-DSA-65 über AuthHub signiert, Felder: `domain`, `onion`, `issued_at`, `expires_at`, `ca_spki_sha256`), TXT-Record-Konvention `_harw-onion.<domain>` = `v=harw1; onion=<56 chars>.onion; spki=<b64>`, Client-seitige Verifikation (Signatur **und** Domain-Match). Optional (Feature `cloudflare-api`): DNS-Records über die Cloudflare-API mit `harw_egress::build_client`, Token nur als Dateireferenz, nie in argv/Logs (Regel 4 aus `tunnel-policy-v2`). | `harw-egress`, `harw-infra-client` (Signer), `serde_json` |
 | `harw-edge-cli` → Binary `harw-edge` | **A** | clap derive, Unterbefehle §9, `tracing` mit `--log`, `ExitCode`. Nutzt `harw-install::service::ServiceManager` für User-Units und schreibt System-Units nur als Datei (Installation durch den Operator oder `--system` mit explizitem Pfad), nie `systemctl enable` implizit (Vertrag §2 Nr. 2: Lebenszyklus ≠ Enrollment). | `clap 4.6.1`, alle oben |
 
 Begründung für Ring A bei `harw-onion`/`harw-edge-tls`/`harw-edge-serve`:
 Netz-, TLS- und Cloud-Crates stehen heute in A (H10); arti (über
-`comnet-transport`) bringt `libsqlite3-sys` und wäre in J/TCB verboten. `harw-unitfile` als **F** ist
+`comnet-arti`) bringt `libsqlite3-sys` und wäre in J/TCB verboten. `harw-unitfile` als **F** ist
 Absicht: harw-install (A), harw-netsec (A), PL-94 `node doctor` und die
 DoD-Installer sollen denselben Parser nutzen können; ein F-Crate ohne
 Abhängigkeiten ist dafür die einzige Stelle, die alle erreichen.
@@ -281,11 +282,13 @@ Abhängigkeiten ist dafür die einzige Stelle, die alle erreichen.
 
 ### 4.4 Kopplung an comnet (Owner-Entscheidung: Adapter, keine Kopie)
 
-harw-edge **konsumiert** `comnet-transport` und baut nichts davon nach.
+harw-edge **konsumiert** comnets Bootstrap-Element (künftig `comnet-arti`,
+heute Teil von `comnet-transport`) und baut nichts davon nach.
 Das hat drei Seiten:
 
-**a) Was Harwness aus comnet nimmt (C11):** `Listener`/`Dialer`/`BoxConn`/
-`PeerInfo`, `TlsListener`, `ArtiRuntime`/`OnionListener`/`ArtiDialer`,
+**a) Was Harwness aus comnet nimmt (C11), künftig aus `comnet-arti`:**
+`Listener`/`Dialer`/`BoxConn`/`PeerInfo`, `TlsListener`,
+`ArtiRuntime`/`OnionListener`/`ArtiDialer`/`IsolationKey`,
 `crypto_provider()`, `process_default_provider()`, `install_default_provider()`,
 `server_config(..)`, `webpki_client_verifier(..)`, `load_pem_chain`/`load_pem_key`.
 Damit entfallen in Harwness: der arti-Pin, der Provider-Code, der
@@ -294,15 +297,19 @@ Harwness ergänzt nur, was comnet nicht hat: Dienst-Anschluss über
 hyper/`Vec<Bytes>`, CA/Leaf-Ausstellung, SAN-/Revocation-Hülle,
 Domain-Bindung, CLI, Units, TOML-/Unit-Reparatur.
 
-**b) Bezugsweg (DEC-G).** comnet ist `publish = false` (C12) und Harwness
-erlaubt nur crates.io (`deny.toml:90-92`, `unknown-git = "deny"`). Drei
-Wege, in dieser Reihenfolge empfohlen:
+**b) Bezugsweg (DEC-G): entschieden, installierbares Crate.** Der User hat
+am 2026-11-01 festgelegt, dass das Bootstrap-Element als **installierbare
+Abhängigkeit** für den Harw-Adapter bereitsteht. comnet ist heute
+`publish = false` (C12) und Harwness erlaubt nur crates.io
+(`deny.toml:90-92`); also wird veröffentlicht, und zwar **nicht** ganz
+`comnet-transport`, sondern ein herausgelöstes Leaf-Crate:
 
-| Weg | Was zu tun ist | Bewertung |
+| Weg | Was zu tun ist | Status |
 |---|---|---|
-| G1 **Veröffentlichen** | comnet setzt `publish = true` für `comnet-proto` und `comnet-transport` (nur diese zwei; proto hat vier externe Abhängigkeiten), Version `0.1.x`, `cargo deny`-Lizenzen prüfen. Harwness pinnt `comnet-transport = "=0.1.x"`. | Sauber gegenüber beiden Regelwerken; comnet-API wird damit **öffentlicher Vertrag** (c). Erste Wahl, sobald comnet M2 (arti-Spike) abgeschlossen ist. |
-| G2 **Git-Rev befristet** | Harwness `deny.toml`: `allow-git = ["https://github.com/mm9942/comnet"]`, Manifest mit voller Rev und Kommentar, DEC-G mit Ablaufdatum (Vorbild comnet DEC-003 für crypt_guard). | Zulässig als Übergang bis G1; jede comnet-Änderung braucht einen Rev-Bump in Harwness. |
-| G3 Pfad-Abhängigkeit | – | **Nein**: zwei Repos, zwei Lockdateien; bricht `cargo deny` und jede CI, die nur ein Repo auscheckt. |
+| **G1b `comnet-arti`** (gewählt) | comnet löst aus `comnet-transport` das Leaf-Crate `comnet-arti` heraus: `arti.rs`, `conn.rs`, `listener.rs`, `dialer.rs`, `tls.rs`, `direct.rs`, eigener `BoxFuture`-Alias, eigenes Fehler-Enum ohne `ToErrorCode`, `IsolationKey([u8; 16])` statt comnets `Isolation`; `comnet-transport` re-exportiert alles unter den heutigen Pfaden; nur `comnet-arti` wird `publish = true`. Harwness pinnt `comnet-arti = "=0.1.x"`. Vertrag mit Impact-Liste und Entscheidungen U1–U7: `comnet/docs/plans/arti-bootstrap-crate-contract.md`. | Entwurf auf der comnet-Seite, wartet auf U1–U7 und auf den grünen M2-Build |
+| G1a ganz `comnet-transport` + `comnet-proto` veröffentlichen | nur `publish = true` setzen | Verworfen: `comnet-proto` trägt Wire-Typen, Fehlercodes und `App`, die Harwness nichts angehen; die Isolation aus Principal × `App` ist comnet-Semantik |
+| G2 Git-Rev befristet | `deny.toml` `allow-git`, volle Rev, Ablaufdatum | Nur als **Spike-Hilfe** in W0 (Scratch-Crate außerhalb des Repos), nie im Harwness-Baum |
+| G3 Pfad-Abhängigkeit | – | Nein: zwei Repos, zwei Lockdateien |
 
 **c) Rückwirkung auf comnet (Pflicht laut comnet `CLAUDE.md`, „App-Grenzen
 … vor jeder Änderung prüfen“).** Mit Harwness als Konsument wird die
@@ -320,9 +327,9 @@ Wege, in dieser Reihenfolge empfohlen:
   comnet“).
 - Features, die harw-edge zusätzlich braucht (Restricted Discovery, PoW,
   Circuit-Kennung für Rate-Limits, HS-Key-Export), werden als
-  **Feature-Requests an comnet-transport** gestellt, mit Impact-Liste, und
-  dort umgesetzt, nicht in Harwness nachgebaut.
-- `comnet-transport` bleibt frei von `harw-*`-Abhängigkeiten (Richtung nur
+  **Feature-Requests an `comnet-arti`** gestellt, mit Impact-Liste, und
+  dort umgesetzt, nicht in Harwness nachgebaut (Vertrag U5: `0.2.0`).
+- `comnet-arti` bleibt frei von `harw-*`-Abhängigkeiten (Richtung nur
   Harwness → comnet). comnets Edge-Gates (G1–G7) sind davon unberührt, weil
   Harwness außerhalb des comnet-Workspace liegt; comnets Verbot von
   `anyhow`/`thiserror` im eigenen Code bleibt, Harwness-Altcrates mit
@@ -377,8 +384,8 @@ Normalfall für `domain`).
   deshalb die Keystore-Dateien `hss/<nickname>/ks_hs_id` (OpenSSH-Format)
   mit `0600` und ausdrücklichem Hinweis, dass die Datei die Onion-Identität
   **ist**. `onion import` geht programmatisch über
-  `launch_onion_service_with_hsid` (F2.4; braucht eine Erweiterung von
-  `comnet-transport`, §4.4 c) oder über artis read-only C-Tor-Keystore.
+  `launch_onion_service_with_hsid` (F2.4; `comnet-arti` Feature
+  `onion-import`, Vertrag §2.1) oder über artis read-only C-Tor-Keystore.
 - **TLS-Server-Key**: über systemd `LoadCredential=tls-key:<pfad>` in
   `$CREDENTIALS_DIRECTORY`, gelesen über eine Deskriptor-Prüfung (comnet
   `load_tls_key`-Muster, kein zweites Öffnen des Pfads). Alternativ Datei mit
@@ -408,8 +415,9 @@ Normalfall für `domain`).
 - Rate-Limit-Schlüssel pro Onion-Stream (SHA-256 aus Nickname + Zähler) ist
   eine **bekannte Schwäche** (C6): mehrere Streams eines Circuits teilen
   keinen Schlüssel. arti 0.47 bietet `max_concurrent_streams_per_circuit`
-  und `rate_limit_at_intro` (F2.5); beide werden über eine Erweiterung von
-  `comnet-transport` in `edge.toml` `[onion]` verfügbar und schließen die
+  und `rate_limit_at_intro` (F2.5); beide werden über
+  `comnet_arti::OnionServiceOptions` (Vertrag §2.1, ab `0.2.0`) in
+  `edge.toml` `[onion]` verfügbar und schließen die
   Lücke auf Circuit-Ebene. PoW bleibt aus (experimentell, F2.7).
 - `direct`: Quell-IP nur für Vor-Authentisierungs-Limits, nie für Identität.
 
@@ -465,13 +473,13 @@ pub async fn serve_stream<H: StreamHandler>(
     limits: ServeLimits,
 ) -> Result<ServeReport>;
 
-// harw-onion — Adapter über comnet-transport (kein eigener arti-Code).
-pub use comnet_transport::{ArtiConfig, ArtiRuntime, ArtiDialer, Isolation, OnionListener};
+// harw-onion — Adapter über comnet-arti (kein eigener arti-Code).
+pub use comnet_arti::{ArtiConfig, ArtiRuntime, ArtiDialer, IsolationKey, OnionListener};
 
-/// Hülle, die einen comnet-Listener (OnionListener, DirectListener, UdsListener)
-/// als Harwness-EdgeListener anbietet und comnets PeerInfo in Harwness-PeerInfo übersetzt.
-pub struct ComnetListener<L: comnet_transport::Listener>(L);
-impl<L: comnet_transport::Listener> EdgeListener for ComnetListener<L> { /* accept → map PeerInfo */ }
+/// Hülle, die einen comnet-arti-Listener (OnionListener, DirectListener)
+/// als Harwness-EdgeListener anbietet und dessen PeerInfo in Harwness-PeerInfo übersetzt.
+pub struct ComnetListener<L: comnet_arti::Listener>(L);
+impl<L: comnet_arti::Listener> EdgeListener for ComnetListener<L> { /* accept → map PeerInfo */ }
 
 pub async fn launch_onion(rt: &Arc<ArtiRuntime>, nickname: &str, port: u16)
     -> Result<(OnionAddress, ComnetListener<OnionListener>)>;      // BEGIN :port → accept; sonst END DONE (comnet)
@@ -757,17 +765,17 @@ WantedBy=multi-user.target
 | # | Frage | Empfehlung |
 |---|---|---|
 | O1 | MSRV 1.89 → 1.92 (arti). Betrifft alle Crates, nicht nur harw-edge. | Anheben; die Toolchain ist 1.98.1, Dependabot pflegt sie. DEC-A. |
-| O2 | arti-Version | **Entfällt als eigene Frage**: Harwness erbt comnets Pin (`=0.47.0`, DEC-004) über `comnet-transport`. Ein Bump passiert in comnet; Harwness zieht nach (§4.4 c). |
+| O2 | arti-Version | **Entfällt als eigene Frage**: Harwness erbt comnets Pin (`=0.47.0`, DEC-004) über `comnet-arti`. Ein Bump passiert in comnet (Minor-Bump von `comnet-arti`); Harwness zieht nach (§4.4 c). |
 | O3 | `pq-strict` als Default? Browser (auch Tor Browser) können `X25519MLKEM768`-only verweigern, je nach Version. | Default `pq-strict` für `client_auth.mode = "required"` (nur harw-Clients), `pq-preferred` sonst. |
 | O4 | Edge-CA-Key im AuthHub (neuer `HarwKeyPurpose`) oder offline? | AuthHub, weil Revocation/Audit dort sind; offline als Übergang. DEC-C. |
 | O5 | Kurve der Edge-CA: Ed25519 (klein, schnell; rustls-Clients ok, Browser-Support gemischt) oder ECDSA P-256 (überall)? | P-256 für Server-Leafs, Ed25519 nur, wenn ausschließlich harw-Clients. In `edge.toml` wählbar. |
-| O6 | **Entschieden (Owner, 2026-11-01): Adapter auf comnet, keine Kopie.** Offen bleibt der Bezugsweg: G1 (comnet veröffentlicht `comnet-proto` + `comnet-transport`) oder G2 (Git-Rev befristet mit `deny.toml`-Ausnahme)? | G1 anstreben; G2 nur als Übergang mit Ablaufdatum im DEC-G. Die Entscheidung liegt auf comnet-Seite (`publish`), nicht in Harwness. |
+| O6 | **Entschieden (Owner, 2026-11-01): Adapter auf comnet, keine Kopie; das Bootstrap-Element wird ein installierbares Crate (`comnet-arti`, G1b).** Offen sind nur noch die comnet-seitigen Detailfragen U1–U7 im Vertrag `comnet/docs/plans/arti-bootstrap-crate-contract.md` (Name, Schnitt, Publish-Weg, Lizenz, Zeitpunkt). | Schnitt B (mit TLS), Name `comnet-arti`, Trusted Publishing, erst nach grünem M2-Build. |
 | O7 | Öffentliche DV-Zertifikate für die `.onion` (HARICA o. ä.) für Tor-Browser-Nutzer ohne Client-Cert? | Später; erst wenn ein öffentliches Profil ohne mTLS gebraucht wird. |
 | O8 | Restricted Discovery in der ersten Lieferung? | Nur, wenn der Spike zeigt, dass die gepinnte arti-Version es ohne Zusatz-Feature-Explosion kann; sonst W5. |
 | O9 | `harw-unitfile` als F-Crate: darf `harw-install` (A) sofort darauf umgestellt werden? | Ja, aber als eigener PR nach W1, mit Golden-Test, dass `render_unit` byte-gleich bleibt, außer Quoting-Fixes. |
 | O10 | Soll `harw-edge` ein eigenes Binary bleiben oder Unterbefehl `harw edge` werden? | Eigenes Binary (thin nodes ohne `harw`, PL-94 R2); `harw-cli` kann später delegieren. |
 | O11 | arti stuft seine Onion-Services offiziell als „testing and experimentation only“ ein (F2.11); comnet trägt das Risiko bereits (DEC-004 „Konsequenzen“). Für harw-cloud akzeptieren? | Ja, mit derselben Kompensation wie comnet (TLS 1.3 PQ + mTLS im Stream); `onion` nie als **einziger** Weg für Hub-Verwaltung ohne `direct`-Fallback über Tailnet. |
-| O12 | Welche Erweiterungen werden bei comnet-transport beantragt: `OnionServiceConfig`-Durchreichung (`rate_limit_at_intro`, `max_concurrent_streams_per_circuit`, `num_intro_points`, `restricted_discovery`) und `launch_onion_with_hsid` (Import)? | Alle vier als **ein** Feature-Request mit Impact-Liste (apicon, Fuzz, Harwness); Umsetzung in comnet, Harwness zieht nach. Bis dahin laufen `onion-mtls` ohne Rate-Knobs und `onion-restricted` **nicht**. |
+| O12 | Welche Erweiterungen werden bei `comnet-arti` beantragt: `OnionServiceOptions` (`rate_limit_at_intro`, `max_concurrent_streams_per_circuit`, `num_intro_points`, `restricted_discovery`) und `import_onion_identity` (Import)? | Im comnet-Vertrag bereits als `0.2.0` vorgesehen (U5); `0.1.0` ist der reine Split. Bis `0.2.0` laufen `onion-mtls` ohne Rate-Knobs und `onion-restricted` **nicht**. |
 | O13 | Server-Zertifikat im Profil `tailnet`: `tailscale cert` (öffentlich, Maschinenname landet in CT-Logs, F5.2) oder Edge-CA-Leaf (nur harw-Clients)? | Edge-CA-Leaf als Default; `tailscale cert` nur, wenn Browser im Tailnet den Dienst öffnen sollen, mit Hinweis auf CT. |
 
 ---
@@ -777,8 +785,8 @@ WantedBy=multi-user.target
 | DEC | Inhalt |
 |---|---|
 | DEC-A | MSRV `rust-version = "1.92"` (arti); Prüfung aller Crates; CI-MSRV-Job. |
-| DEC-B | arti kommt **nur** transitiv über `comnet-transport` (Pin, Feature-Liste ohne `full`, Bump-Rhythmus und Security-Watch gehören comnet DEC-004). Harwness-seitig: `libsqlite3-sys` in Ring A, nie J/TCB; `[[forbidden_crates]]`: `comnet-transport`, `arti-client`, `tor-*` nur über `harw-onion`/`harw-edge-tls`. |
-| DEC-G | Bezugsweg für comnet-Crates: G1 crates.io (Ziel) oder G2 Git-Rev befristet (`deny.toml` `allow-git`, volle Rev, Ablaufdatum); Contract-Test gegen die genutzte API; Rückwirkung auf comnets Impact-Liste (§4.4 c). |
+| DEC-B | arti kommt **nur** transitiv über `comnet-arti` (Pin, Feature-Liste ohne `full`, Bump-Rhythmus und Security-Watch gehören comnet DEC-004). Harwness-seitig: `libsqlite3-sys` in Ring A, nie J/TCB; `[[forbidden_crates]]`: `comnet-arti`, `arti-client`, `tor-*` nur über `harw-onion`/`harw-edge-tls`. |
+| DEC-G | Bezugsweg: `comnet-arti` von crates.io, exakt gepinnt (`=0.1.x`), Minor-Bump je arti-Bump; Contract-Test gegen die genutzte API; Rückwirkung auf comnets Impact-Liste (§4.4 c). Gegenstück auf comnet-Seite: DEC-042-Entwurf im Vertrag. |
 | DEC-C | Edge-CA-Custody (AuthHub-Purpose `EdgeCa` oder offline), Leaf-Laufzeiten (Server 90 Tage, Client 365 Tage), Revocation-Set-Format. |
 | DEC-D | Fehlerstil neuer Crates: handgeschriebene Enums ohne `thiserror`/`anyhow`; `Bytes` für öffentliche Puffer, `Zeroizing` für Geheimnisse (Übernahme comnet DEC-041 für harw-edge-Crates). |
 | DEC-E | Domain-Bindung: `/.well-known/harw-onion`-Format, TXT-Konvention, Signaturschlüssel-Name, Ablauf, TOFU-Grenze. |
@@ -793,7 +801,7 @@ Alle Records nach `docs/planning/70-decisions/` im dortigen Format
 
 | Abhängigkeit | Version | Status | Bemerkung |
 |---|---|---|---|
-| `comnet-transport` (Features `direct`, `arti`) + `comnet-proto` | `=0.1.x` (G1) oder volle Git-Rev (G2) | **neu** | Bringt arti `=0.47.0` samt `tor-*`, `safelog`, `libsqlite3-sys` transitiv; `cargo tree -i anyhow`, `-i ring`, `-i openssl-sys`, `-i libsqlite3-sys` im Spike protokollieren; `deny.toml` `[sources]` je nach G1/G2 |
+| `comnet-arti` (Features `direct`, `arti`, später `restricted-discovery`) | `=0.1.x` von crates.io | **neu**, Crate existiert noch nicht | Bringt arti `=0.47.0` samt `tor-*`, `safelog`, `libsqlite3-sys` transitiv; kein `comnet-proto`; `cargo tree -i anyhow`, `-i ring`, `-i openssl-sys`, `-i libsqlite3-sys` im Spike protokollieren; `deny.toml` bleibt unverändert (crates.io) |
 | `rcgen` | 0.14.10 (MSRV 1.88, F4) | **neu** | CA/Leaf-Erzeugung; Backend `aws_lc_rs` (kein zweiter Provider); nur in `harw-edge-tls` und CLI |
 | `x509-parser` | 0.18.1 (F4) | **neu** | SAN-Prüfung im Verifier (comnet nutzt dafür `certinfo`); rcgen `from_ca_cert_der` |
 | `hyper-util` Features `server-auto`, `service` | 0.1.x (Lock) | vorhanden | `auto::Builder` (HTTP/1.1 oder h2 pro Verbindung) und `TowerToHyperService` ersetzen eigenen Adapter-Code (F4) |
@@ -815,10 +823,10 @@ Disjunkte Dateimengen pro Worker; Verifikation ausschließlich zentral über
 
 | Welle | Lieferung | Dateien (Owner) | Abnahme |
 |---|---|---|---|
-| **W0** Spike + DECs | Scratch-Crate außerhalb des Repos mit `comnet-transport` (Features `direct`, `arti`) als Abhängigkeit (G2-Form für den Spike): Baum messen (`anyhow`, `ring`, `openssl`, `*-sys`, Paketzahl), Bootstrap-Zeit, `TlsListener` über `OnionListener`, Restricted-Discovery/PoW-Verfügbarkeit in arti 0.47, Lizenzen. Bezugsweg G1/G2 mit dem Owner klären (comnet-Seite: `publish`). DEC-A…G schreiben. MSRV-Bump. | `docs/planning/70-decisions/DEC-*.md`, `Cargo.toml` (MSRV), `deny.toml` (nur bei G2), `docs/planning/98-…/02-spike-report.md`; comnet-Seite: Impact-Zeile in `crate-api-contract.md` | Spike-Report mit Messwerten; `make clippy-tests` nach MSRV-Bump grün; `cargo deny check` grün |
+| **W0** Spike + DECs | Scratch-Crate außerhalb des Repos mit `comnet-transport` per Git-Rev (nur im Spike): Baum messen (`anyhow`, `ring`, `openssl`, `*-sys`, Paketzahl), Bootstrap-Zeit, `TlsListener` über `OnionListener`, Restricted Discovery in arti 0.47, Lizenzen. DEC-A…G schreiben. MSRV-Bump. **Parallel auf comnet-Seite:** U1–U7 entscheiden, `comnet-arti` herauslösen und `0.1.0` veröffentlichen (Vertrag `arti-bootstrap-crate-contract.md`). | Harwness: `docs/planning/70-decisions/DEC-*.md`, `Cargo.toml` (MSRV), `docs/planning/98-…/02-spike-report.md`; comnet: eigener PR nach dem Vertrag | Spike-Report mit Messwerten; `make clippy-tests` nach MSRV-Bump grün; `cargo deny check` grün; `comnet-arti 0.1.0` auf crates.io sichtbar (Voraussetzung für W3) |
 | **W1** Reine Prüfer | `harw-unitfile` (Parser, Direktiven-Tabelle, Typen, Lint, Repair, Render) und `harw-edge-config` (Schema, Validierung, Repair, Diff, Backup/atomar). Golden-Korpus `deploy/systemd/*`. | `harw-unitfile/**`, `harw-edge-config/**`, `xtask/arch-policy.toml` (2 Einträge) | Alle Units in `deploy/systemd/` parsen ohne Befund; Fuzz-Targets für beide Parser; Repair-Dry-Run ist idempotent (zweiter Lauf: leerer Diff); jede Reparaturklasse §8 hat einen Test |
 | **W2** TLS/mTLS | `harw-edge-tls`: Provider-Profile, CA/Leaf (rcgen), Verifier (WebPKI + Pflicht-SAN + Revocation-Set), PEM/Credential-Laden, Resumption aus. | `harw-edge-tls/**`, `arch-policy.toml` | Loopback-Tests: Client ohne Cert → `required` lehnt ab / `optional` lässt durch mit `client_cert = None`; widerrufene SPKI → Handshake-Fehler; `pq-strict` lehnt klassischen Client ab; Debug-Ausgaben enthalten kein Schlüsselmaterial |
-| **W3** Onion + Serve | `harw-onion` (Adapter über `comnet-transport`: `ComnetListener`, PeerInfo-Brücke, `launch_onion`, Contract-Test gegen die genutzte comnet-API) und `harw-edge-serve` (Listener-Trait, TLS-Layer, hyper- und Stream-Pfad, Limits, Shutdown). | `harw-onion/**`, `harw-edge-serve/**`, `arch-policy.toml`, `deny.toml` (nur G2) | Duplex-/UDS-Tests ohne Netz für Serve (HTTP/1.1, h2, Stream-Framing, Limits, Shutdown); PeerInfo-Brücke (DER → SPKI-Hash, Peer-Key) getestet; `#[ignore]`-Smoke-Test mit echtem Tor (`dial(own onion)` ↔ `accept`), wie comnet; Fehlerpfade `Ok(None)`, fehlender HS-Key, fremder Port kommen typisiert aus comnet durch |
+| **W3** Onion + Serve (**blockiert bis `comnet-arti 0.1.0` auf crates.io**) | `harw-onion` (Adapter über `comnet-arti`: `ComnetListener`, PeerInfo-Brücke, `launch_onion`, Contract-Test gegen die genutzte comnet-API) und `harw-edge-serve` (Listener-Trait, TLS-Layer, hyper- und Stream-Pfad, Limits, Shutdown). | `harw-onion/**`, `harw-edge-serve/**`, `arch-policy.toml` | Duplex-/UDS-Tests ohne Netz für Serve (HTTP/1.1, h2, Stream-Framing, Limits, Shutdown); PeerInfo-Brücke (DER → SPKI-Hash, Peer-Key) getestet; `#[ignore]`-Smoke-Test mit echtem Tor (`dial(own onion)` ↔ `accept`), wie comnet; Fehlerpfade `Ok(None)`, fehlender HS-Key, fremder Port kommen typisiert aus comnet durch |
 | **W4** CLI + Units | `harw-edge-cli`: alle Unterbefehle außer `domain`; Unit-Vorlagen (§10), `--systemd-socket`, `sd_notify`, `doctor`. | `harw-edge-cli/**`, `deploy/systemd/harw-edge@.service`, `harw-edge@.socket`, `deploy/sysusers.d`, `deploy/tmpfiles.d`, `Makefile` (Ziel `edge-install`) | `unit lint` der eigenen Vorlage ≥ 90; `config check` auf allen `init`-Profilen grün; `doctor --json` liefert die Stufen aus H2; CLI-Tests mit `clap`-Parser (`try_parse_from`), kein Prozessstart in Unit-Tests |
 | **W5** Domain | `harw-edge-domain`: Header-Middleware, `.well-known`-Datensatz (Signatur via AuthHub), TXT-Konvention, Client-Verifikation; Feature `cloudflare-api` (plan/apply, Token-Datei, `harw_egress::build_client`). `harw-edge domain …`. | `harw-edge-domain/**`, `harw-edge-cli/src/domain_cmd.rs` | Header nur bei `https` + passendem Host; Signaturprüfung schlägt bei fremder Domain/abgelaufen fehl; `dns plan` zeigt Diff, `apply` ohne `--confirm` tut nichts; Token nie in Debug/Fehlern |
 | **W6** Cloud-Integration + Doku | `harw-cloud-ops::status` mit Wegen/Stufen; `GatewayConfig → EdgeConfig`-Migration; `harw-cloud/README.md`, `docs/planning/94-cloud-onboarding` (R1/R3 erfüllt durch `harw-unitfile`/`unit write`), `07-harw-cloud-integration.md` §3 um HC-Zeile ergänzt; `harw-install::service_systemd` auf `harw-unitfile` (O9). | `harw-cloud/**`, `harw-install/src/service_systemd.rs`, Doku | Migrationstest YAML→TOML; `cloud.status`-Schema v3 mit nullbaren Stufen; Golden-Test `render_unit` |
@@ -850,14 +858,15 @@ unabhängig voneinander und von arti; sie können vor dem MSRV-Bump beginnen.
 
 ## 17. Was dieser Plan **nicht** behauptet
 
-- dass `comnet-transport` in Harwness heute bezogen werden kann (comnet ist
-  `publish = false`, Harwness verbietet Git-Quellen; DEC-G löst das, nicht
-  dieser Plan);
+- dass `comnet-arti` heute existiert oder bezogen werden kann (der Split und
+  die Veröffentlichung sind comnet-Arbeit nach
+  `comnet/docs/plans/arti-bootstrap-crate-contract.md`; bis dahin ist W3
+  blockiert);
 - dass Cloudflare „Onion Routing“ oder der Tor-Browser-Umgang mit
   `Onion-Location`/`Alt-Svc` in Zukunft unverändert bleibt (Stand der
   Recherche am 2026-11-01, Quellen in `01-recherche…`; Auto-Redirect ist
   bereits 2024 entfallen);
-- dass `onion-restricted` vor der comnet-transport-Erweiterung (O12)
+- dass `onion-restricted` vor `comnet-arti 0.2.0` (O12)
   funktioniert;
 - dass `pq-strict` mit Browsern funktioniert (es ist für harw-Clients
   gedacht);
