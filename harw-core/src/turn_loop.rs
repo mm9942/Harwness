@@ -1567,14 +1567,17 @@ async fn await_background_results(
         return Ok(BackgroundWait::Idle);
     };
     loop {
-        // Erst der Stopp-Prüfpunkt, dann die Zustellung: eine bereits
-        // vorliegende Meldung wird auch bei einem Abbruch noch geschrieben
-        // und bestätigt (sie geht nicht verloren), der Turn endet aber als
-        // `Stopped`. Die noch laufenden Geschwister bricht `cancel_turn` ab.
+        // Erst der Stopp-Prüfpunkt, dann die Zustellung. Bei einem Stopp
+        // werden die noch laufenden Geschwister *vor* dem fehlbaren
+        // Schreibversuch abgebrochen — ein Schreibfehler darf sie nicht
+        // weiterlaufen lassen. Eine bereits vorliegende Meldung wird danach
+        // noch geschrieben und bestätigt; scheitert das, bleibt sie
+        // unbestätigt im Register (siehe `inject_background_notices`).
         if let Some(reason) = control
             .model_checkpoint()
             .or_else(|| control.tool_checkpoint(0))
         {
+            cancel_owned_background_children(session, reason);
             inject_background_notices(session, store).await?;
             tracing::info!(
                 session = %session.id(),
@@ -11207,11 +11210,24 @@ mod tests {
         Ok(())
     }
 
-    /// Ein Kind ist fertig (Meldung wartet), ein Geschwister läuft noch.
+    /// Ein Kind ist fertig (Meldung wartet, sobald `ready`), ein Geschwister
+    /// läuft noch.
     struct TwoChildrenSpawner {
         finished: harw_types::SessionId,
+        ready: std::sync::atomic::AtomicBool,
         acknowledged: AtomicUsize,
         cancelled: AtomicUsize,
+    }
+
+    impl TwoChildrenSpawner {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                finished: harw_types::SessionId::new(),
+                ready: std::sync::atomic::AtomicBool::new(false),
+                acknowledged: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+            })
+        }
     }
 
     impl AgentSpawner for TwoChildrenSpawner {
@@ -11229,7 +11245,7 @@ mod tests {
             &self,
             _parent: &harw_types::SessionId,
         ) -> Vec<harw_extension_api::PendingBackgroundNotice> {
-            if self.acknowledged.load(Ordering::SeqCst) == 0 {
+            if self.ready.load(Ordering::SeqCst) && self.acknowledged.load(Ordering::SeqCst) == 0 {
                 vec![harw_extension_api::PendingBackgroundNotice {
                     child: self.finished.clone(),
                     text: "[Hintergrund-Agent explorer k1 fertig nach 3 s]\nBefund Y".to_owned(),
@@ -11266,11 +11282,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_parent_keeps_a_finished_result_and_cancels_the_running_sibling()
     -> TestResult {
-        let spawner = Arc::new(TwoChildrenSpawner {
-            finished: harw_types::SessionId::new(),
-            acknowledged: AtomicUsize::new(0),
-            cancelled: AtomicUsize::new(0),
-        });
+        let spawner = TwoChildrenSpawner::new();
         let (tx, _rx) = mpsc::unbounded_channel();
         let registry = ExtensionRegistryBuilder::default()
             .spawner(Arc::clone(&spawner) as Arc<dyn AgentSpawner>)
@@ -11286,10 +11298,11 @@ mod tests {
         // Der Token ist schon abgebrochen, wenn das Turn-Ende erreicht wird:
         // der Abbruch kommt nach der Modellantwort, vor dem Warten.
         let token = crate::cancel::CancelToken::new();
-        let model = CancelAfterReplyModel {
-            token: token.clone(),
-        };
-        let control = TurnControl::new().with_cancel(token);
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("warte auf Kinder")]);
+        let control = TurnControl::new().with_cancel(token.clone());
+        // Während das Turn-Ende wartet: ein Kind wird fertig, dann kommt der
+        // Abbruch — die nächste Prüfung sieht beides zugleich.
+        let _finisher = finish_then_cancel(Arc::clone(&spawner), token);
 
         let outcome = run_turn(
             &mut session,
@@ -11323,16 +11336,69 @@ mod tests {
         Ok(())
     }
 
-    /// Antwortet mit einem Text und bricht danach den Turn-Token ab.
-    struct CancelAfterReplyModel {
-        token: crate::cancel::CancelToken,
+    #[tokio::test]
+    async fn a_failed_write_on_cancel_still_cancels_the_sibling_and_keeps_the_notice() -> TestResult
+    {
+        let spawner = TwoChildrenSpawner::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::clone(&spawner) as Arc<dyn AgentSpawner>)
+            .build();
+        let mut session = AgentSession::new(
+            AgentRole::Assistant,
+            Some(harw_types::SessionId::new()),
+            registry,
+            tx,
+        )
+        .with_spawn_context(test_spawn_context()?);
+        let store = FailOnceStore {
+            inner: crate::state_store::InMemoryStateStore::new(),
+            needle: "Befund Y",
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let token = crate::cancel::CancelToken::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("warte auf Kinder")]);
+        let control = TurnControl::new().with_cancel(token.clone());
+        // Während das Turn-Ende wartet: ein Kind wird fertig, dann kommt der
+        // Abbruch — die nächste Prüfung sieht beides zugleich.
+        let _finisher = finish_then_cancel(Arc::clone(&spawner), token);
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("auftrag").with_control(control),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "der Schreibfehler bleibt sichtbar: {outcome:?}"
+        );
+        assert_eq!(
+            spawner.cancelled.load(Ordering::SeqCst),
+            1,
+            "das laufende Geschwister wird trotz Schreibfehler genau einmal abgebrochen"
+        );
+        assert_eq!(
+            spawner.acknowledged.load(Ordering::SeqCst),
+            0,
+            "die nicht geschriebene Meldung bleibt unbestätigt im Register"
+        );
+        assert_eq!(user_texts_containing(&session, "Befund Y"), 0);
+        Ok(())
     }
 
-    impl ModelProvider for CancelAfterReplyModel {
-        fn respond<'a>(&'a self, _request: ModelRequest) -> crate::model::ModelFuture<'a> {
-            self.token.cancel(CancelReason::User);
-            Box::pin(async { Ok(crate::model::ModelResponse::text("warte auf Kinder")) })
-        }
+    /// Macht nach kurzer Zeit ein Kind fertig und bricht dann den Token ab.
+    fn finish_then_cancel(
+        spawner: Arc<TwoChildrenSpawner>,
+        token: crate::cancel::CancelToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            spawner.ready.store(true, Ordering::SeqCst);
+            token.cancel(CancelReason::User);
+        })
     }
 
     #[tokio::test]
