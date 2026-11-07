@@ -142,7 +142,7 @@ harw_types::limits_struct! {
         /// Gleichzeitig laufende Orchestratoren der UIA-Wurzel.
         pub max_root_orchestrators: usize = DEFAULT_MAX_ROOT_ORCHESTRATORS = 1,
         /// Gleichzeitig laufende Sub-Orchestratoren je Root-Orchestrator-Baum.
-        pub max_sub_orchestrators: usize = DEFAULT_MAX_SUB_ORCHESTRATORS = 2,
+        pub max_sub_orchestrators: usize = DEFAULT_MAX_SUB_ORCHESTRATORS = 3,
         /// Höchste Verschachtelung der Sub-Orchestratoren (direkt unter dem
         /// Root-Orchestrator = 1; `0` = keine Sub-Orchestratoren).
         pub max_sub_orchestrator_depth: u32 = DEFAULT_MAX_SUB_ORCHESTRATOR_DEPTH = 2,
@@ -1094,8 +1094,29 @@ mod tests {
     }
 
     #[test]
+    fn the_default_admits_all_three_child_orchestrators_of_the_root() -> TestResult {
+        let nodes = [
+            node("root-1", UIA, AgentRoleId::RootOrchestrator),
+            node("coding", "root-1", AgentRoleId::ChildOrchestrator),
+            node("research", "root-1", AgentRoleId::ChildOrchestrator),
+        ];
+        check_orchestration_admission(
+            &nodes,
+            "root-1",
+            AgentRoleId::RootOrchestrator,
+            AgentRoleId::ChildOrchestrator,
+            OrchestrationLimits::default(),
+        )
+        .map_err(|error| TestError::Unexpected(error.message))?;
+        Ok(())
+    }
+
+    #[test]
     fn the_sub_orchestrator_count_is_per_root_tree() -> TestResult {
-        let limits = OrchestrationLimits::default(); // max 2
+        let limits = OrchestrationLimits {
+            max_sub_orchestrators: 2,
+            ..OrchestrationLimits::default()
+        };
         let nodes = [
             node("root-1", UIA, AgentRoleId::RootOrchestrator),
             node("sub-a", "root-1", AgentRoleId::ChildOrchestrator),

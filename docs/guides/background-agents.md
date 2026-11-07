@@ -189,7 +189,7 @@ Children follow the root's approval mode, at most `auto` (see
 | Limit | Value | Configurable |
 |---|---|---|
 | concurrent orchestrators of the UIA | 1 (1-4) | `[agents] max_root_orchestrators` |
-| concurrent sub-orchestrators per tree | 2 (1-6) | `[agents] max_sub_orchestrators` |
+| concurrent sub-orchestrators per tree | 3 (1-6) | `[agents] max_sub_orchestrators` |
 | sub-orchestrator nesting | 2 (1-3) | `[agents] max_sub_orchestrator_depth` |
 | general child depth | 4 (1-6) | `[agents] max_spawn_depth` |
 | wall-clock limit of an orchestrator | 3600 s | `[spawn.budget] max_wall_secs` of the definition |
