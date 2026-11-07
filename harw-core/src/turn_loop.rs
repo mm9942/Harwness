@@ -1500,6 +1500,36 @@ async fn inject_background_notices(
     Ok(true)
 }
 
+/// Bricht die noch laufenden Hintergrund-Kinder einer abgebrochenen
+/// Kind-Sitzung ab.
+///
+/// # Description
+/// Zentral in [`cancel_turn`] (auch über `cancel_turn_with_pending_calls`),
+/// damit **jeder** abgebrochene Ausgang eines Orchestrator-Kindes seine
+/// Hintergrund-Kinder mitnimmt — auch wenn der Abbruch erst nach einer
+/// zugestellten Meldung in der nächsten Runde greift. Ihre Ergebnisse
+/// erreichten sonst nie mehr einen Elternteil. Die UIA-Wurzel ist
+/// ausgenommen: dort verwaltet die TUI ihre Hintergrund-Agenten selbst
+/// (`/new`, `/resume`, Beenden), ein abgebrochener UIA-Turn beendet sie nicht.
+fn cancel_owned_background_children(session: &AgentSession, reason: CancelReason) {
+    if session.parent_session_id().is_none() {
+        return;
+    }
+    let Some(spawner) = session.registry().spawner() else {
+        return;
+    };
+    if spawner.running_background_children(session.id()) == 0 {
+        return;
+    }
+    let cancelled = spawner.cancel_background_children(session.id(), "parent turn cancelled");
+    tracing::info!(
+        session = %session.id(),
+        ?reason,
+        cancelled,
+        "turn_loop.background_children_cancelled_with_parent"
+    );
+}
+
 /// Ergebnis des Wartens auf Hintergrund-Kinder am Turn-Ende.
 #[derive(Debug)]
 enum BackgroundWait {
@@ -1507,8 +1537,9 @@ enum BackgroundWait {
     Delivered,
     /// Kein Kind läuft (mehr) oder keine Kind-Sitzung: der Turn endet normal.
     Idle,
-    /// Abbruch oder Budget-/Zeitende während des Wartens; die laufenden
-    /// Hintergrund-Kinder wurden mit abgebrochen.
+    /// Abbruch oder Budget-/Zeitende während des Wartens; bereits
+    /// vorliegende Meldungen sind zugestellt, die laufenden Hintergrund-Kinder
+    /// bricht [`cancel_turn`] ab.
     Stopped(CancelReason),
 }
 
@@ -1518,9 +1549,9 @@ enum BackgroundWait {
 /// # Description
 /// Gewartet wird ohne Modellaufruf ([`BACKGROUND_RESULT_POLL`]). Ein
 /// Abbruch, ein erschöpftes Budget oder die Wanduhr des Turns beenden das
-/// Warten als [`BackgroundWait::Stopped`] — nie als Erfolg — und brechen die
-/// noch laufenden Hintergrund-Kinder dieser Sitzung ab, damit keine Waisen
-/// weiterlaufen.
+/// Warten als [`BackgroundWait::Stopped`] — nie als Erfolg. Der Aufrufer
+/// endet dann über [`cancel_turn`], das die noch laufenden Hintergrund-Kinder
+/// dieser Sitzung abbricht ([`cancel_owned_background_children`]).
 ///
 /// # Errors
 /// Fehler des [`StateStore`] beim Zustellen.
@@ -1536,25 +1567,27 @@ async fn await_background_results(
         return Ok(BackgroundWait::Idle);
     };
     loop {
+        // Erst der Stopp-Prüfpunkt, dann die Zustellung: eine bereits
+        // vorliegende Meldung wird auch bei einem Abbruch noch geschrieben
+        // und bestätigt (sie geht nicht verloren), der Turn endet aber als
+        // `Stopped`. Die noch laufenden Geschwister bricht `cancel_turn` ab.
+        if let Some(reason) = control
+            .model_checkpoint()
+            .or_else(|| control.tool_checkpoint(0))
+        {
+            inject_background_notices(session, store).await?;
+            tracing::info!(
+                session = %session.id(),
+                ?reason,
+                "turn_loop.background_wait_stopped"
+            );
+            return Ok(BackgroundWait::Stopped(reason));
+        }
         if inject_background_notices(session, store).await? {
             return Ok(BackgroundWait::Delivered);
         }
         if spawner.running_background_children(session.id()) == 0 {
             return Ok(BackgroundWait::Idle);
-        }
-        if let Some(reason) = control
-            .model_checkpoint()
-            .or_else(|| control.tool_checkpoint(0))
-        {
-            let cancelled = spawner
-                .cancel_background_children(session.id(), "parent turn stopped while waiting");
-            tracing::info!(
-                session = %session.id(),
-                ?reason,
-                cancelled,
-                "turn_loop.background_wait_stopped"
-            );
-            return Ok(BackgroundWait::Stopped(reason));
         }
         tokio::time::sleep(BACKGROUND_RESULT_POLL).await;
     }
@@ -6765,6 +6798,7 @@ async fn cancel_turn(
     total_usage: harw_types::TokenUsage,
     reason: CancelReason,
 ) -> CoreResult<TurnOutcome> {
+    cancel_owned_background_children(session, reason);
     emit(
         session,
         TurnEvent::TurnAborted {
@@ -11171,6 +11205,134 @@ mod tests {
             "die wartenden Hintergrund-Kinder werden mit abgebrochen"
         );
         Ok(())
+    }
+
+    /// Ein Kind ist fertig (Meldung wartet), ein Geschwister läuft noch.
+    struct TwoChildrenSpawner {
+        finished: harw_types::SessionId,
+        acknowledged: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    impl AgentSpawner for TwoChildrenSpawner {
+        fn spawn_child<'a>(
+            &'a self,
+            _role: &'a str,
+            _input: SpawnInput,
+            _sandbox: SandboxSpec,
+            _suggestions: Option<AgentSuggestions>,
+        ) -> SpawnFuture<'a> {
+            Box::pin(async move { Err(harw_extension_api::AgentSpawnError::new("unused")) })
+        }
+
+        fn pending_background_notices(
+            &self,
+            _parent: &harw_types::SessionId,
+        ) -> Vec<harw_extension_api::PendingBackgroundNotice> {
+            if self.acknowledged.load(Ordering::SeqCst) == 0 {
+                vec![harw_extension_api::PendingBackgroundNotice {
+                    child: self.finished.clone(),
+                    text: "[Hintergrund-Agent explorer k1 fertig nach 3 s]\nBefund Y".to_owned(),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn acknowledge_background_notices(
+            &self,
+            _parent: &harw_types::SessionId,
+            children: &[harw_types::SessionId],
+        ) {
+            if children.contains(&self.finished) {
+                self.acknowledged.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn running_background_children(&self, _parent: &harw_types::SessionId) -> usize {
+            usize::from(self.cancelled.load(Ordering::SeqCst) == 0)
+        }
+
+        fn cancel_background_children(
+            &self,
+            _parent: &harw_types::SessionId,
+            _reason: &str,
+        ) -> usize {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+            1
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_parent_keeps_a_finished_result_and_cancels_the_running_sibling()
+    -> TestResult {
+        let spawner = Arc::new(TwoChildrenSpawner {
+            finished: harw_types::SessionId::new(),
+            acknowledged: AtomicUsize::new(0),
+            cancelled: AtomicUsize::new(0),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::clone(&spawner) as Arc<dyn AgentSpawner>)
+            .build();
+        let mut session = AgentSession::new(
+            AgentRole::Assistant,
+            Some(harw_types::SessionId::new()),
+            registry,
+            tx,
+        )
+        .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        // Der Token ist schon abgebrochen, wenn das Turn-Ende erreicht wird:
+        // der Abbruch kommt nach der Modellantwort, vor dem Warten.
+        let token = crate::cancel::CancelToken::new();
+        let model = CancelAfterReplyModel {
+            token: token.clone(),
+        };
+        let control = TurnControl::new().with_cancel(token);
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("auftrag").with_control(control),
+        )
+        .await
+        .map_err(ctx("der Turn endet mit Abbruch"))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            spawner.acknowledged.load(Ordering::SeqCst),
+            1,
+            "das fertige Ergebnis wird geschrieben und bestätigt"
+        );
+        assert_eq!(user_texts_containing(&session, "Befund Y"), 1);
+        assert_eq!(
+            spawner.cancelled.load(Ordering::SeqCst),
+            1,
+            "das laufende Geschwister wird mit abgebrochen"
+        );
+        Ok(())
+    }
+
+    /// Antwortet mit einem Text und bricht danach den Turn-Token ab.
+    struct CancelAfterReplyModel {
+        token: crate::cancel::CancelToken,
+    }
+
+    impl ModelProvider for CancelAfterReplyModel {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> crate::model::ModelFuture<'a> {
+            self.token.cancel(CancelReason::User);
+            Box::pin(async { Ok(crate::model::ModelResponse::text("warte auf Kinder")) })
+        }
     }
 
     #[tokio::test]
