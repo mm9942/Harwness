@@ -126,7 +126,7 @@ pub use media::{ModelImage, install_media_source, resolve_media, resolve_media_w
 pub use mode::InteractionMode;
 pub use model::{
     EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse,
-    RequestIdentity,
+    REPLAY_UNAVAILABLE_CODE, RequestIdentity,
 };
 pub use one_shot::{OneShotError, complete_text};
 pub use pinned_model::PinnedModelProvider;

@@ -168,6 +168,9 @@ pub struct AnthropicMessagesProvider {
     budgets: crate::budget::ProviderBudgets,
     /// Exact, identity-bound native assistant rounds; never exposed in logs.
     thinking_replay: crate::anthropic_replay::AnthropicReplayCache,
+    /// Modelle mit `[capabilities] reasoning_replay = "strict"` (siehe
+    /// [`crate::replay_bounds`]); alle übrigen degradieren.
+    strict_replay_models: std::collections::BTreeSet<String>,
 }
 
 impl AnthropicMessagesProvider {
@@ -206,6 +209,7 @@ impl AnthropicMessagesProvider {
             stream_policy: crate::sse::StreamPolicy::default(),
             budgets: crate::budget::ProviderBudgets::default(),
             thinking_replay: crate::anthropic_replay::AnthropicReplayCache::default(),
+            strict_replay_models: std::collections::BTreeSet::new(),
         })
     }
 
@@ -277,6 +281,15 @@ impl AnthropicMessagesProvider {
     pub(crate) fn configure_rate_limit(&mut self, rate_limit: Option<harw_config::RateLimitToml>) {
         self.rate_limiter =
             std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(rate_limit));
+    }
+
+    /// Setzt die Modelle, deren Thinking-Replay bei verlorener Kontinuität
+    /// hart abbricht (`[capabilities] reasoning_replay = "strict"`).
+    pub(crate) fn configure_strict_replay_models(
+        &mut self,
+        models: std::collections::BTreeSet<String>,
+    ) {
+        self.strict_replay_models = models;
     }
 
     /// Installiert einen [`crate::DynamicConcurrencyLimiter`] aus
@@ -1113,8 +1126,14 @@ impl AnthropicMessagesProvider {
         let mut wire = build_messages_body(model, self.max_tokens, &request);
         crate::cache_strategy::apply_messages_cache_control(&mut wire, strategy);
         // Restore after cache decoration so signed native content stays untouched.
-        self.thinking_replay
-            .apply(&self.provider_id, &messages_url, model, &request, &mut wire)?;
+        self.thinking_replay.apply(
+            &self.provider_id,
+            &messages_url,
+            model,
+            &request,
+            &mut wire,
+            crate::replay_bounds::ReplayPolicy::for_model(&self.strict_replay_models, model),
+        )?;
         let stream_sink = request
             .stream
             .as_ref()
@@ -1234,14 +1253,18 @@ impl AnthropicMessagesProvider {
             .await?;
             let value = accumulator.finish()?;
             let response = self.interpret_body(&request, model, &value)?;
-            self.thinking_replay.remember(
-                &self.provider_id,
-                &messages_url,
+            crate::replay_bounds::remember_or_warn(
+                "anthropic",
                 model,
-                &request,
-                &response,
-                &value,
-            )?;
+                self.thinking_replay.remember(
+                    &self.provider_id,
+                    &messages_url,
+                    model,
+                    &request,
+                    &response,
+                    &value,
+                ),
+            );
             budget_permit.reconcile(&response.usage);
             return Ok(response);
         }
@@ -1311,14 +1334,18 @@ impl AnthropicMessagesProvider {
 
         let value: Value = serde_json::from_str(&body)?;
         let response = self.interpret_body(&request, model, &value)?;
-        self.thinking_replay.remember(
-            &self.provider_id,
-            &messages_url,
+        crate::replay_bounds::remember_or_warn(
+            "anthropic",
             model,
-            &request,
-            &response,
-            &value,
-        )?;
+            self.thinking_replay.remember(
+                &self.provider_id,
+                &messages_url,
+                model,
+                &request,
+                &response,
+                &value,
+            ),
+        );
         budget_permit.reconcile(&response.usage);
         Ok(response)
     }

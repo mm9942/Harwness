@@ -31,10 +31,10 @@ pub(crate) struct ReasoningReplay {
     entries: Mutex<VecDeque<BoundEntry>>,
 }
 
+const FAMILY: &str = "responses";
+
 fn unavailable(detail: &str) -> ModelError {
-    ModelError::RequestFailed(format!(
-        "Responses reasoning continuity unavailable ({detail}); start a fresh conversation or rebuild its context before retrying"
-    ))
+    crate::replay_bounds::unavailable(FAMILY, detail)
 }
 
 fn digest(items: &[TurnItem]) -> Result<ContentDigest, ModelError> {
@@ -116,11 +116,14 @@ impl ReasoningReplay {
                 && old.replay.model == bound.replay.model
                 && old.prefix_digest == bound.prefix_digest)
         });
-        while entries.len() >= crate::MAX_REASONING_REPLAY_ENTRIES
-            || entries.iter().map(|entry| entry.bytes).sum::<usize>() + bytes > MAX_BYTES
-        {
-            entries.pop_front();
-        }
+        crate::replay_bounds::evict_for(
+            &mut entries,
+            |entry| &entry.identity,
+            |entry| entry.bytes,
+            &bound.identity,
+            bytes,
+            MAX_BYTES,
+        );
         entries.push_back(bound);
         Ok(())
     }
@@ -131,6 +134,7 @@ impl ReasoningReplay {
         model: &str,
         endpoint: &str,
         request: &ModelRequest,
+        policy: crate::replay_bounds::ReplayPolicy,
     ) -> Result<Vec<ReplayEntry>, ModelError> {
         let historical = request.history.to_model_messages();
         if !historical
@@ -143,11 +147,16 @@ impl ReasoningReplay {
             .identity()
             .filter(|identity| !identity.session.is_empty() && !identity.agent.is_empty());
         let Some(identity) = identity else {
-            return if request.reasoning_effort.is_some() {
-                Err(unavailable("request identity is missing"))
-            } else {
-                Ok(Vec::new())
-            };
+            if request.reasoning_effort.is_some() {
+                crate::replay_bounds::on_missing(
+                    policy,
+                    FAMILY,
+                    model,
+                    "request identity is missing",
+                    0,
+                )?;
+            }
+            return Ok(Vec::new());
         };
         let mut covered = vec![false; historical.len()];
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
@@ -201,12 +210,24 @@ impl ReasoningReplay {
         // Explicit reasoning requests must not silently send tool history whose
         // opaque continuation was evicted or changed. Ordinary non-reasoning
         // Responses models may legitimately have no encrypted reasoning blocks.
-        if request.reasoning_effort.is_some()
-            && historical.iter().zip(covered).any(|(message, covered)| {
+        // Degrade (Vorgabe) sendet solche Calls ohne Reasoning-Items: ein
+        // `function_call` mit `call_id` (ohne Item-ID) ist auch ohne sein
+        // Reasoning gültig; nur die Modellqualität dieser Runde sinkt.
+        let uncovered = historical
+            .iter()
+            .zip(covered)
+            .filter(|(message, covered)| {
                 !covered && matches!(message, ModelMessage::ToolCall { .. })
             })
-        {
-            return Err(unavailable("original reasoning round was lost or changed"));
+            .count();
+        if request.reasoning_effort.is_some() && uncovered > 0 {
+            crate::replay_bounds::on_missing(
+                policy,
+                FAMILY,
+                model,
+                "original reasoning round was lost or changed",
+                uncovered,
+            )?;
         }
         Ok(replay)
     }
@@ -218,6 +239,8 @@ mod tests {
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::ReasoningEffort;
     use serde_json::json;
+
+    const STRICT: crate::replay_bounds::ReplayPolicy = crate::replay_bounds::ReplayPolicy::Strict;
 
     fn request() -> ModelRequest {
         let mut history = ConversationHistory::new();
@@ -298,6 +321,7 @@ mod tests {
                 "thinking-model",
                 "https://official.example/v1",
                 &next,
+                STRICT,
             )
             .map_err(ctx("exact replay"))?;
         assert_eq!(selected, vec![replay]);
@@ -354,9 +378,9 @@ mod tests {
                 _ => {}
             }
             let selected = if mismatch == "restart" {
-                ReasoningReplay::default().for_request(provider, model, endpoint, &changed)
+                ReasoningReplay::default().for_request(provider, model, endpoint, &changed, STRICT)
             } else {
-                cache.for_request(provider, model, endpoint, &changed)
+                cache.for_request(provider, model, endpoint, &changed, STRICT)
             };
             assert!(selected.is_err(), "must refuse {mismatch}");
         }
@@ -388,6 +412,7 @@ mod tests {
                 "thinking-model",
                 "https://official.example/v1",
                 &next,
+                STRICT,
             )
             .map_err(ctx("continue legitimate round without reasoning blocks"))?;
         assert_eq!(
@@ -406,7 +431,8 @@ mod tests {
                     "responses",
                     "thinking-model",
                     "https://official.example/v1",
-                    &next
+                    &next,
+                    STRICT
                 )
                 .is_err(),
             "losing the round binding must still fail explicitly"
@@ -437,7 +463,7 @@ mod tests {
         }
         assert_eq!(
             cache
-                .for_request("responses", "thinking-model", "endpoint", &next)
+                .for_request("responses", "thinking-model", "endpoint", &next, STRICT)
                 .map_err(ctx("interleaved continuation"))?,
             vec![replay]
         );
@@ -462,9 +488,74 @@ mod tests {
                 "thinking-model",
                 "https://official.example/v1",
                 &other,
+                STRICT,
             )
             .map_err(ctx("no cross-session replay"))?;
         assert!(selected.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn degrade_sends_lost_rounds_without_reasoning_instead_of_failing() -> TestResult {
+        let cache = ReasoningReplay::default();
+        let initial = request();
+        let (response, replay) = response()?;
+        cache
+            .remember(replay, "endpoint", &initial, &response)
+            .map_err(ctx("remember"))?;
+        let mut next = initial;
+        append(&mut next, &response);
+        // Kompaktierung/Neustart: der Präfix stimmt nicht mehr.
+        let mut items = next.history.items().to_vec();
+        items.remove(0);
+        next.history = ConversationHistory::from_items(items);
+        let degrade = crate::replay_bounds::ReplayPolicy::Degrade;
+        assert!(
+            cache
+                .for_request("responses", "thinking-model", "endpoint", &next, degrade)
+                .map_err(ctx("degraded replay"))?
+                .is_empty()
+        );
+        assert!(
+            ReasoningReplay::default()
+                .for_request("responses", "thinking-model", "endpoint", &next, degrade)
+                .map_err(ctx("degraded after restart"))?
+                .is_empty()
+        );
+        let error = ReasoningReplay::default()
+            .for_request("responses", "thinking-model", "endpoint", &next, STRICT)
+            .err()
+            .ok_or(TestError::Missing("strict refusal"))?;
+        assert!(matches!(error, ModelError::ReplayUnavailable { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn many_child_rounds_do_not_evict_the_root_round() -> TestResult {
+        let cache = ReasoningReplay::default();
+        let root = request();
+        let (response, replay) = response()?;
+        cache
+            .remember(replay.clone(), "endpoint", &root, &response)
+            .map_err(ctx("remember root"))?;
+        for index in 0..(crate::replay_bounds::MAX_ROUNDS_PER_IDENTITY * 2) {
+            let mut child = request();
+            child.history.push_user_text(format!("child task {index}"));
+            if let Some(identity) = child.identity.as_mut() {
+                identity.agent = format!("child-{}", index % 3);
+            }
+            cache
+                .remember(replay.clone(), "endpoint", &child, &response)
+                .map_err(ctx("remember child"))?;
+        }
+        let mut next = root;
+        append(&mut next, &response);
+        assert_eq!(
+            cache
+                .for_request("responses", "thinking-model", "endpoint", &next, STRICT)
+                .map_err(ctx("root round survives"))?,
+            vec![replay]
+        );
         Ok(())
     }
 }
