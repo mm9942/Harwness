@@ -14353,6 +14353,15 @@ mod tests {
         parent: Option<harw_types::SessionId>,
         organizational_role: harw_agent_dsl::roles::AgentRoleId,
     ) -> TestResult<(usize, Vec<ToolCallResult>)> {
+        run_reads(6, parent, organizational_role).await
+    }
+
+    /// Sitzung mit `count` verschiedenen `fs.read`-Aufrufen in einer Antwort.
+    async fn run_reads(
+        count: usize,
+        parent: Option<harw_types::SessionId>,
+        organizational_role: harw_agent_dsl::roles::AgentRoleId,
+    ) -> TestResult<(usize, Vec<ToolCallResult>)> {
         let executions = Arc::new(AtomicUsize::new(0));
         let provider = StubParallelProvider::instant(&["fs.read"], Arc::clone(&executions));
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -14364,7 +14373,7 @@ mod tests {
         let mut session = AgentSession::new(AgentRole::Assistant, parent, registry, tx)
             .with_spawn_context(context);
         let store = crate::state_store::InMemoryStateStore::new();
-        let calls: Vec<ToolCall> = (0..6)
+        let calls: Vec<ToolCall> = (0..count)
             .map(|index| ToolCall {
                 id: ToolCallId::new(),
                 name: ToolName::new("fs.read"),
@@ -14394,27 +14403,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_sixth_read_of_an_orchestrator_child_is_denied() -> TestResult {
-        let (executed, results) = run_six_reads(
+    async fn the_thirteenth_read_of_an_orchestrator_child_is_denied() -> TestResult {
+        let (executed, results) = run_reads(
+            13,
             Some(harw_types::SessionId::new()),
             harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
         )
         .await?;
-        assert_eq!(executed, 5, "only five own reads may run");
-        assert_eq!(results.len(), 6);
+        assert_eq!(executed, 12, "only twelve own reads may run");
+        assert_eq!(results.len(), 13);
         let Some(ToolCallResult::Error { message }) = results.last() else {
             return Err(TestError::Unexpected(format!(
-                "the sixth read must be an error: {results:?}"
+                "the thirteenth read must be an error: {results:?}"
             )));
         };
         assert!(message.contains("Lesebudget erschöpft"), "{message}");
         assert!(message.contains("delegate_wave"), "{message}");
-        let Some(ToolCallResult::Success { value }) = results.get(3) else {
-            return Err(TestError::Unexpected("the fourth read runs".to_owned()));
+        let Some(ToolCallResult::Success { value }) = results.get(9) else {
+            return Err(TestError::Unexpected("the tenth read runs".to_owned()));
         };
         assert!(
-            value.to_string().contains("Lesezugriff 4 von 5"),
-            "the fourth read carries a warning: {value}"
+            value.to_string().contains("Lesezugriff 10 von 12"),
+            "the tenth read carries a warning: {value}"
         );
         Ok(())
     }

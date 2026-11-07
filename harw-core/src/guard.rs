@@ -362,8 +362,9 @@ pub struct GuardPolicy {
 impl Default for GuardPolicy {
     /// Nutzerentscheidung (Addendum F+G): aktiviert, 2/3 für wiederholte
     /// Fehler, 4/8 für fehlenden Fortschritt, 6 Runden bis `PlanStale`.
-    /// Runde 7, Teil A2: Orchestratoren lesen höchstens 5-mal selbst
-    /// (Hinweis ab dem 4. Zugriff).
+    /// Runde 7, Teil A2: Orchestratoren lesen höchstens 12-mal selbst
+    /// (Hinweis ab dem 10. Zugriff; Feldbericht F10: mit 5 blieb dem
+    /// Root-Orchestrator kaum Überblick, bevor er delegieren musste).
     fn default() -> Self {
         Self {
             enabled: true,
@@ -372,8 +373,8 @@ impl Default for GuardPolicy {
             no_progress_rounds_warn: 4,
             no_progress_rounds_abort: 8,
             plan_stale_rounds: 6,
-            orchestrator_read_warn: 4,
-            orchestrator_read_limit: 5,
+            orchestrator_read_warn: 10,
+            orchestrator_read_limit: 12,
         }
     }
 }
@@ -723,15 +724,20 @@ impl TurnGuard {
 /// Lese-Werkzeuge, die auf das Lesebudget eines Orchestrators zählen
 /// (Runde 7, Teil A2). Dazu kommen alle Werkzeuge mit einem Präfix aus
 /// [`ORCHESTRATOR_READ_TOOL_PREFIXES`].
+///
+/// Reine Orientierung (`fs.list`, `explore.tree`) zählt nicht: sie liefert
+/// Struktur, keine Inhalte, und ist die Grundlage guter Delegationsaufträge.
 pub const ORCHESTRATOR_READ_TOOLS: &[&str] = &[
     "fs.read",
     "fs.search",
     "fs.grep",
     "fs.glob",
-    "fs.list",
     "lens.ask",
     "doc.read_pdf",
 ];
+
+/// Orientierungs-Werkzeuge, die trotz passendem Präfix nicht zählen.
+pub const ORCHESTRATOR_ORIENTATION_TOOLS: &[&str] = &["fs.list", "explore.tree"];
 
 /// Präfixe von Lese-Werkzeugfamilien, die auf das Lesebudget zählen
 /// (`explore.*`, `deps.source_*`).
@@ -764,6 +770,9 @@ pub const STATUS_POLLING_HINT: &str = "[harw-Wächter] `agent.status` für dense
 /// [`ORCHESTRATOR_READ_TOOL_PREFIXES`].
 #[must_use]
 pub fn is_orchestrator_read_tool(tool_name: &str) -> bool {
+    if ORCHESTRATOR_ORIENTATION_TOOLS.contains(&tool_name) {
+        return false;
+    }
     ORCHESTRATOR_READ_TOOLS.contains(&tool_name)
         || ORCHESTRATOR_READ_TOOL_PREFIXES
             .iter()
@@ -1180,12 +1189,16 @@ mod tests {
     #[test]
     fn the_sixth_orchestrator_read_is_denied_after_a_warning_from_the_fourth() -> TestResult {
         let session_id = sid();
-        let policy = GuardPolicy::default();
+        let policy = GuardPolicy {
+            orchestrator_read_warn: 4,
+            orchestrator_read_limit: 5,
+            ..GuardPolicy::default()
+        };
         let mut state = SessionGuardState::default();
         let tools = [
             "fs.read",
-            "fs.list",
-            "explore.tree",
+            "fs.search",
+            "explore.find",
             "fs.grep",
             "deps.source_read",
             "fs.read",
@@ -1249,7 +1262,6 @@ mod tests {
             "fs.search",
             "fs.grep",
             "fs.glob",
-            "fs.list",
             "explore.find",
             "lens.ask",
             "deps.source_search",
@@ -1257,7 +1269,15 @@ mod tests {
         ] {
             assert!(is_orchestrator_read_tool(tool), "{tool}");
         }
-        for tool in ["fs.write", "delegate_wave", "agent.status", "shell.exec"] {
+        for tool in [
+            "fs.write",
+            "delegate_wave",
+            "agent.status",
+            "shell.exec",
+            // Orientierung zählt nicht (Feldbericht F10).
+            "fs.list",
+            "explore.tree",
+        ] {
             assert!(!is_orchestrator_read_tool(tool), "{tool}");
         }
     }

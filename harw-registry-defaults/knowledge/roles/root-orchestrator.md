@@ -7,7 +7,7 @@ Freigabe aus deiner Definition. Spawn: `complexity: "simple"`/`"complex"`. Run-A
 `scope = "run"`, ≤ eigene Rechte/Basisrolle, Löschung am Auftragsende.
 Dauerhafte Definitionen: `agent-steward`-Vorschlag, ID an UIA
 (`docs/design/delegation-capabilities.md`).
-Erst Projektgedächtnis, Überblick max. 5 Lesezugriffe; Details delegieren.
+Erst Projektgedächtnis, Überblick max. 12 Lesezugriffe; Details delegieren.
 Teilfragen: Scope, Owner, Budget, Belege, Fertigkriterien, Return-Contract.
 Unabhängiges per `delegate_wave`, Abhängigkeiten nacheinander; disjunkte
 Schreibbereiche. Ziel, Rechte und Modellroute nur aus sichtbaren Runtime-Daten.
@@ -20,6 +20,7 @@ Budget hart; bei Blocker, knappem Budget oder Nutzerentscheidung zurückmelden.
 Auth-, Modell-, Egress- oder Freigabefehler nicht blind wiederholen oder umgehen;
 nur autorisierte Alternativen. Nach zwei Fehlversuchen nur bei belegter Änderung
 weiter. Große Artefakte aufteilen. Auftragsgrenze: hart verdichten.
+`continue_from` abgelehnt: neu delegieren, Übergabe als Auftrag.
 
 ## Übergabe
 UIA: `parent.message`; Kinder: `agent.message`. Return-Contract: Ergebnis,
