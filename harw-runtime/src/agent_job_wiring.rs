@@ -548,6 +548,30 @@ impl RuntimeAgentJobSubmitter {
     }
 }
 
+/// Hängt an die Fehlermeldung eines gescheiterten Hintergrund-Kindes den
+/// `continue_from`-Hinweis, sofern seine Übergabe im Fortsetzungsbuch liegt.
+///
+/// # Description
+/// Der Elternteil (oft der Root-Orchestrator) bekam bisher nur
+/// `JobOutcome::Failed { reason }` zu sehen — ohne Hinweis, dass und wie er
+/// das Kind samt Übergabe fortsetzen kann. Ohne vorgehaltene Übergabe bleibt
+/// der Text unverändert.
+fn with_continuation_hint(
+    spawner: &ManagedAgentSpawner,
+    child: &harw_types::SessionId,
+    reason: &str,
+) -> String {
+    match spawner.budget_handoff_record(child) {
+        Some(record) if !reason.contains("continue_from") => format!(
+            "{reason}\n\n[HARW-CONT-010] Fortsetzbar mit Übergabe: transfer_to_{role} mit \
+             {{\"continue_from\": \"{child}\"}} oder ein delegate_wave-Ziel \
+             {{\"role\": \"{role}\", \"continue_from\": \"{child}\"}}.",
+            role = record.role,
+        ),
+        _ => reason.to_owned(),
+    }
+}
+
 impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
     fn submit_child<'a>(
         &'a self,
@@ -774,7 +798,16 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
             let runner = Arc::clone(&self.runner);
             let work_id_for_run = work_id.clone();
             let child_for_run = child.clone();
-            let task_for_run = task.clone();
+            // Der bei der Admission hinterlegte Auftrag (bei `continue_from`
+            // die Fortsetzung samt Übergabe des Vorgängers) hat Vorrang vor
+            // dem rohen Auftragstext des Modells; früher verdrängte
+            // `TurnInput::user(task)` ihn, und die Fortsetzung begann ohne
+            // Übergabe von vorn (HARW-CONT-002).
+            let input_for_run = if self.spawner.has_pending_task(&child) {
+                TurnInput::default()
+            } else {
+                TurnInput::user(task.clone())
+            };
 
             tokio::spawn(async move {
                 let request = ClaimRequest {
@@ -802,7 +835,7 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                                         &child_for_run,
                                         state_store.as_ref(),
                                         approvals.as_deref(),
-                                        TurnInput::user(task_for_run),
+                                        input_for_run,
                                     )
                                     .await;
 
@@ -891,9 +924,10 @@ impl AgentJobSubmitter for RuntimeAgentJobSubmitter {
                                     .unwrap_or("agent completed")
                                     .to_owned(),
                             )),
-                            JobOutcome::Failed { reason } => {
-                                Some((BackgroundStatus::Failed, reason.clone()))
-                            }
+                            JobOutcome::Failed { reason } => Some((
+                                BackgroundStatus::Failed,
+                                with_continuation_hint(&spawner, &child_for_cleanup, reason),
+                            )),
                             JobOutcome::Cancelled { reason } => {
                                 Some((BackgroundStatus::Cancelled, reason.clone()))
                             }
