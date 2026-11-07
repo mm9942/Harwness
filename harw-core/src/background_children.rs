@@ -463,6 +463,31 @@ pub struct BackgroundNotice {
     pub model_route: Option<String>,
 }
 
+impl BackgroundNotice {
+    /// Die Abschlussmeldung, wie das Modell des Elternteils sie liest
+    /// (dasselbe Format wie die UIA-Meldungen der TUI).
+    #[must_use]
+    pub fn model_text(&self) -> String {
+        let verb = match self.status {
+            BackgroundStatus::Completed | BackgroundStatus::Running => "fertig",
+            BackgroundStatus::Failed => "fehlgeschlagen",
+            BackgroundStatus::Cancelled => "abgebrochen",
+        };
+        let route = self
+            .model_route
+            .as_deref()
+            .map(|route| format!(" ({route})"))
+            .unwrap_or_default();
+        format!(
+            "[Hintergrund-Agent {} {}{route} {verb} nach {} s]\n{}",
+            self.role,
+            self.child,
+            self.elapsed.as_secs(),
+            self.text
+        )
+    }
+}
+
 #[derive(Debug, Default)]
 struct BackgroundState {
     runs: BTreeMap<String, BackgroundRun>,

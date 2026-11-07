@@ -1441,6 +1441,77 @@ fn delegation_targets_fragment(
     })
 }
 
+/// Abstand, in dem ein wartendes Orchestrator-Kind nach Ergebnissen seiner
+/// Hintergrund-Kinder sieht (kein Modellaufruf, keine Tokens).
+const BACKGROUND_RESULT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Legt die Abschlussmeldungen der Hintergrund-Kinder dieser Sitzung als
+/// Nutzer-Nachricht in den Verlauf.
+///
+/// # Description
+/// Nur für Kind-Sitzungen (Orchestratoren unter der UIA): die UIA-Wurzel
+/// holt ihre Meldungen über die TUI (Auto-Turn). Früher blieben die
+/// Meldungen der Enkel im Register liegen — ein Orchestrator-Kind erfuhr nie,
+/// was seine Hintergrund-Kinder geliefert hatten.
+///
+/// # Returns
+/// `true`, wenn mindestens eine Meldung eingefügt wurde.
+async fn inject_background_notices(
+    session: &mut AgentSession,
+    store: &dyn StateStore,
+) -> CoreResult<bool> {
+    if session.parent_session_id().is_none() {
+        return Ok(false);
+    }
+    let Some(spawner) = session.registry().spawner().cloned() else {
+        return Ok(false);
+    };
+    let notices = spawner.take_background_notices(session.id());
+    if notices.is_empty() {
+        return Ok(false);
+    }
+    tracing::info!(
+        session = %session.id(),
+        notices = notices.len(),
+        "turn_loop.background_notices_delivered"
+    );
+    session.history_mut().push_user_text(notices.join("\n\n"));
+    persist_last(session, store).await?;
+    Ok(true)
+}
+
+/// Wartet am Ende eines Orchestrator-Kind-Turns auf Ergebnisse noch
+/// laufender Hintergrund-Kinder.
+///
+/// # Description
+/// Gibt `true` zurück, sobald eine Meldung im Verlauf liegt (der Turn läuft
+/// dann mit einer weiteren Modellrunde weiter), `false`, wenn kein Kind mehr
+/// läuft, die Sitzung keine Kind-Sitzung ist oder ein Prüfpunkt (Abbruch,
+/// Budget) greift. Gewartet wird ohne Modellaufruf.
+async fn await_background_results(
+    session: &mut AgentSession,
+    store: &dyn StateStore,
+    control: &TurnControl,
+) -> CoreResult<bool> {
+    if session.parent_session_id().is_none() {
+        return Ok(false);
+    }
+    let Some(spawner) = session.registry().spawner().cloned() else {
+        return Ok(false);
+    };
+    loop {
+        if inject_background_notices(session, store).await? {
+            return Ok(true);
+        }
+        if spawner.running_background_children(session.id()) == 0
+            || control.model_checkpoint().is_some()
+        {
+            return Ok(false);
+        }
+        tokio::time::sleep(BACKGROUND_RESULT_POLL).await;
+    }
+}
+
 /// Text der Werkzeug-Antwort auf eine abgelehnte Delegation.
 ///
 /// # Description
@@ -4497,6 +4568,9 @@ async fn drive_turn(
         // 1./2./4a. Context + Instructions + Request-Montage (siehe
         // `assemble_round_request`). Eine Wiederholung nach Notfall-
         // Kompaktierung baut den Request über denselben Weg neu.
+        // Abschlussmeldungen von Hintergrund-Kindern eines Orchestrator-Kindes
+        // gehen in diese Runde (die UIA-Wurzel bekommt ihre über die TUI).
+        inject_background_notices(session, store).await?;
         let continuation = continuation_instruction;
         let mut request = assemble_round_request(
             session,
@@ -5015,7 +5089,15 @@ async fn drive_turn(
                     )
                     .await;
                 }
-                _ => break,
+                _ => {
+                    // Ein Orchestrator-Kind endet nicht vor seinen eigenen
+                    // Hintergrund-Kindern: deren Ergebnisse kämen sonst nie an
+                    // (die TUI liefert sie nur der UIA-Wurzel).
+                    if await_background_results(session, store, &control).await? {
+                        continue;
+                    }
+                    break;
+                }
             }
         }
 
@@ -10863,6 +10945,92 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// Ein Spawner mit genau einem laufenden Hintergrund-Kind, dessen
+    /// Abschlussmeldung nach `ready_after` Abfragen bereitliegt.
+    struct BackgroundResultSpawner {
+        polls: AtomicUsize,
+        ready_after: usize,
+        delivered: std::sync::atomic::AtomicBool,
+    }
+
+    impl AgentSpawner for BackgroundResultSpawner {
+        fn spawn_child<'a>(
+            &'a self,
+            _role: &'a str,
+            _input: SpawnInput,
+            _sandbox: SandboxSpec,
+            _suggestions: Option<AgentSuggestions>,
+        ) -> SpawnFuture<'a> {
+            Box::pin(async move { Err(harw_extension_api::AgentSpawnError::new("unused")) })
+        }
+
+        fn take_background_notices(&self, _parent: &harw_types::SessionId) -> Vec<String> {
+            let polls = self.polls.fetch_add(1, Ordering::SeqCst);
+            if polls >= self.ready_after && !self.delivered.swap(true, Ordering::SeqCst) {
+                vec!["[Hintergrund-Agent explorer k1 fertig nach 3 s]\nBefund X".to_owned()]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn running_background_children(&self, _parent: &harw_types::SessionId) -> usize {
+            usize::from(!self.delivered.load(Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_orchestrator_child_waits_for_its_background_children_before_finishing() -> TestResult
+    {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let spawner = Arc::new(BackgroundResultSpawner {
+            polls: AtomicUsize::new(0),
+            // Abfrage 0: Rundenbeginn, 1: Turn-Ende (läuft noch, eine
+            // Warteschleife), 2: Ergebnis da.
+            ready_after: 2,
+            delivered: std::sync::atomic::AtomicBool::new(false),
+        });
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::clone(&spawner) as Arc<dyn AgentSpawner>)
+            .build();
+        let mut session = AgentSession::new(
+            AgentRole::Assistant,
+            Some(harw_types::SessionId::new()),
+            registry,
+            tx,
+        )
+        .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            crate::model::ModelResponse::text("Welle gestartet, warte auf Ergebnisse."),
+            crate::model::ModelResponse::text("Synthese mit Befund X."),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("auftrag"))
+            .await
+            .map_err(ctx("der Turn läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        let users: Vec<String> = session
+            .history()
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::UserMessage(message) => Some(format!("{:?}", message.content)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            users.iter().any(|text| text.contains("Befund X")),
+            "die Meldung des Hintergrund-Kindes landet im Verlauf: {users:?}"
+        );
+        assert_eq!(
+            spawner.running_background_children(session.id()),
+            0,
+            "alle Ergebnisse zugestellt"
+        );
+        Ok(())
     }
 
     /// Runde 5, Teil K: eine Orchestrierungsgrenze bricht den Turn nicht ab,

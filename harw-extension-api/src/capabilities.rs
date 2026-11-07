@@ -126,6 +126,19 @@ pub trait AgentSpawner: Send + Sync {
         None
     }
 
+    /// Nimmt die für das Modell formatierten Abschlussmeldungen der
+    /// Hintergrund-Kinder von `parent` (verbrauchend). Der Kern legt sie
+    /// einem Orchestrator-*Kind* in die nächste Runde; die UIA-Wurzel holt
+    /// ihre Meldungen weiterhin selbst (TUI). Default: keine.
+    fn take_background_notices(&self, _parent: &SessionId) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Zahl der noch laufenden Hintergrund-Kinder von `parent`. Default `0`.
+    fn running_background_children(&self, _parent: &SessionId) -> usize {
+        0
+    }
+
     /// Plan R9, Teil C/E1: die sichtbaren Delegationsziele von
     /// `parent_session_id` samt Katalogdaten, gefiltert nach Plan-Modus.
     ///

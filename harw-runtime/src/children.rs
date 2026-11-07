@@ -1465,6 +1465,34 @@ impl RuntimeChildRegistryFactory {
     /// (`Arc<CallerIdentity>`, siehe [`Self::child_caller_identity`]), damit
     /// Wissens-Operationen, die über diesen Kontext laufen, identitätsgebunden
     /// lesen ([`delegate_wave_services`]).
+    /// Gibt der Kind-Registry den durablen Job-Submitter der Wurzel — aber
+    /// nur, wenn die Wurzel einen hat.
+    ///
+    /// # Description
+    /// Früher bekam jede Kind-Registry den aufgeschobenen Submitter, auch
+    /// ohne Job-Store oder Freigabe-Akteur an der Wurzel. Die frühe Ablehnung
+    /// „kein Hintergrund-Ausführer" griff dann nie; ein Kind wurde
+    /// admittiert und scheiterte erst danach mit „durable agent job
+    /// submitter is not available". Ohne Submitter lehnt der Turn-Loop die
+    /// Delegation jetzt *vor* der Admission ab.
+    fn with_deferred_job_submitter(
+        &self,
+        builder: harw_extension_api::ExtensionRegistryBuilder,
+    ) -> harw_extension_api::ExtensionRegistryBuilder {
+        if self
+            .agent_job_submitter_slot
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some()
+        {
+            builder.agent_job_submitter(Arc::new(DeferredAgentJobSubmitter {
+                slot: Arc::clone(&self.agent_job_submitter_slot),
+            }))
+        } else {
+            builder
+        }
+    }
+
     fn delegate_wave_provider(&self, identity: Arc<CallerIdentity>) -> ModelToolProvider {
         let policy = delegate_wave_policy(&self.custom_agents);
         let operation: Arc<dyn Operation> =
@@ -2180,13 +2208,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // registriert (harw-registry-defaults/src/profile.rs, `approval_handler`
         // in der letzten Stufe der Delegationskette). Eine zweite wäre
         // wirkungsgleich, aber eine Dublette (Befund Z2c-06).
-        let mut registry_builder = child_chain
-            .install_over_default(assembled.registry)
+        let mut registry_builder = self
+            .with_deferred_job_submitter(child_chain.install_over_default(assembled.registry))
             .spawner(Arc::new(DeferredManagedSpawner {
                 slot: Arc::clone(&self.spawner_slot),
-            }))
-            .agent_job_submitter(Arc::new(DeferredAgentJobSubmitter {
-                slot: Arc::clone(&self.agent_job_submitter_slot),
             }))
             // Plan R9, offenes Recherche-Netz (`[network].research_web =
             // "open"`): erste Anfrage je Domain fragt (unter `full` nicht),
@@ -2639,13 +2664,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 message: format!("could not assemble child registry for role '{role}': {error}"),
             })?;
         // `install_over_default`: siehe Begründung in `build_registry`.
-        let registry_builder = child_chain
-            .install_over_default(assembled.registry)
+        let registry_builder = self
+            .with_deferred_job_submitter(child_chain.install_over_default(assembled.registry))
             .spawner(Arc::new(DeferredManagedSpawner {
                 slot: Arc::clone(&self.spawner_slot),
-            }))
-            .agent_job_submitter(Arc::new(DeferredAgentJobSubmitter {
-                slot: Arc::clone(&self.agent_job_submitter_slot),
             }));
         // Plan R9, Teil A: auch der Steward findet und lädt Skills.
         let registry = self
@@ -3023,6 +3045,21 @@ impl AgentSpawner for DeferredManagedSpawner {
             .get()
             .and_then(Weak::upgrade)
             .and_then(|spawner| spawner.resumable_child_role(caller, child_id))
+    }
+
+    // Abschlussmeldungen der Hintergrund-Kinder eines Orchestrator-Kindes.
+    fn take_background_notices(&self, parent: &harw_types::SessionId) -> Vec<String> {
+        self.slot
+            .get()
+            .and_then(Weak::upgrade)
+            .map_or_else(Vec::new, |spawner| spawner.take_background_notices(parent))
+    }
+
+    fn running_background_children(&self, parent: &harw_types::SessionId) -> usize {
+        self.slot
+            .get()
+            .and_then(Weak::upgrade)
+            .map_or(0, |spawner| spawner.running_background_children(parent))
     }
 }
 

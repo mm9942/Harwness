@@ -9463,6 +9463,18 @@ impl AgentSpawner for ManagedAgentSpawner {
     fn resumable_child_role(&self, caller: &SessionId, child_id: &str) -> Option<String> {
         ManagedAgentSpawner::resumable_child_role(self, caller, child_id)
     }
+
+    fn take_background_notices(&self, parent: &SessionId) -> Vec<String> {
+        self.background
+            .take_notices(parent)
+            .iter()
+            .map(crate::background_children::BackgroundNotice::model_text)
+            .collect()
+    }
+
+    fn running_background_children(&self, parent: &SessionId) -> usize {
+        self.background.running_for(parent).len()
+    }
 }
 
 #[cfg(test)]
