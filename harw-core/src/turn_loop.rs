@@ -1530,7 +1530,7 @@ fn spawn_rejection_text(role: &str, error: &harw_extension_api::AgentSpawnError)
         code = "HARW-ORCH-001",
         role,
         kind = ?error.kind,
-        message = %error.message,
+        reason = %error.message,
         "turn_loop.delegation_rejected"
     );
     if known {
