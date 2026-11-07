@@ -667,6 +667,29 @@ impl BackgroundChildren {
         })
     }
 
+    /// Die wartenden Benachrichtigungen für `parent`, ohne sie zu entnehmen
+    /// (bestätigt werden sie mit [`Self::ack_notices`]).
+    #[must_use]
+    pub fn peek_notices(&self, parent: &SessionId) -> Vec<BackgroundNotice> {
+        self.with_state(|state| {
+            state
+                .notices
+                .iter()
+                .filter(|notice| &notice.parent == parent)
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// Entfernt die Benachrichtigungen der Kinder `children` von `parent`.
+    pub fn ack_notices(&self, parent: &SessionId, children: &[SessionId]) {
+        self.with_state(|state| {
+            state
+                .notices
+                .retain(|notice| !(&notice.parent == parent && children.contains(&notice.child)));
+        });
+    }
+
     /// `true`, wenn für `parent` Benachrichtigungen warten.
     #[must_use]
     pub fn has_notices(&self, parent: &SessionId) -> bool {

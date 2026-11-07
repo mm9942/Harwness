@@ -9464,16 +9464,30 @@ impl AgentSpawner for ManagedAgentSpawner {
         ManagedAgentSpawner::resumable_child_role(self, caller, child_id)
     }
 
-    fn take_background_notices(&self, parent: &SessionId) -> Vec<String> {
+    fn pending_background_notices(
+        &self,
+        parent: &SessionId,
+    ) -> Vec<harw_extension_api::PendingBackgroundNotice> {
         self.background
-            .take_notices(parent)
+            .peek_notices(parent)
             .iter()
-            .map(crate::background_children::BackgroundNotice::model_text)
+            .map(|notice| harw_extension_api::PendingBackgroundNotice {
+                child: notice.child.clone(),
+                text: notice.model_text(),
+            })
             .collect()
+    }
+
+    fn acknowledge_background_notices(&self, parent: &SessionId, children: &[SessionId]) {
+        self.background.ack_notices(parent, children);
     }
 
     fn running_background_children(&self, parent: &SessionId) -> usize {
         self.background.running_for(parent).len()
+    }
+
+    fn cancel_background_children(&self, parent: &SessionId, reason: &str) -> usize {
+        self.cancel_all_background(parent, reason).len()
     }
 }
 

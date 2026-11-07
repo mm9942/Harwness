@@ -3048,11 +3048,26 @@ impl AgentSpawner for DeferredManagedSpawner {
     }
 
     // Abschlussmeldungen der Hintergrund-Kinder eines Orchestrator-Kindes.
-    fn take_background_notices(&self, parent: &harw_types::SessionId) -> Vec<String> {
+    fn pending_background_notices(
+        &self,
+        parent: &harw_types::SessionId,
+    ) -> Vec<harw_extension_api::PendingBackgroundNotice> {
         self.slot
             .get()
             .and_then(Weak::upgrade)
-            .map_or_else(Vec::new, |spawner| spawner.take_background_notices(parent))
+            .map_or_else(Vec::new, |spawner| {
+                spawner.pending_background_notices(parent)
+            })
+    }
+
+    fn acknowledge_background_notices(
+        &self,
+        parent: &harw_types::SessionId,
+        children: &[harw_types::SessionId],
+    ) {
+        if let Some(spawner) = self.slot.get().and_then(Weak::upgrade) {
+            spawner.acknowledge_background_notices(parent, children);
+        }
     }
 
     fn running_background_children(&self, parent: &harw_types::SessionId) -> usize {
@@ -3060,6 +3075,15 @@ impl AgentSpawner for DeferredManagedSpawner {
             .get()
             .and_then(Weak::upgrade)
             .map_or(0, |spawner| spawner.running_background_children(parent))
+    }
+
+    fn cancel_background_children(&self, parent: &harw_types::SessionId, reason: &str) -> usize {
+        self.slot
+            .get()
+            .and_then(Weak::upgrade)
+            .map_or(0, |spawner| {
+                spawner.cancel_background_children(parent, reason)
+            })
     }
 }
 
