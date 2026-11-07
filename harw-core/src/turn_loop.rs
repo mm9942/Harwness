@@ -1441,6 +1441,38 @@ fn delegation_targets_fragment(
     })
 }
 
+/// Text der Werkzeug-Antwort auf eine abgelehnte Delegation.
+///
+/// # Description
+/// Bekannte Ablehnungen (Orchestrierungsgrenze, abgelehnte Fortsetzung,
+/// Plan-Modus, typisierte Kapazitäts-/Tiefengrenzen) behalten ihren Text.
+/// Alle übrigen (z. B. nicht registrierte Rolle, fehlende Sandbox, ein nach
+/// `prepare` gescheiterter Fortsetzungsschritt) bekommen den stabilen Code
+/// `HARW-ORCH-001` und einen Hinweis — früher brachen sie als
+/// `CoreError::HandoffFailed` den ganzen Turn des Orchestrators ab.
+fn spawn_rejection_text(role: &str, error: &harw_extension_api::AgentSpawnError) -> String {
+    let known = crate::background_children::is_orchestration_limit_rejection(&error.message)
+        || crate::child_handoff::is_continuation_rejection(&error.message)
+        || crate::delegation_visibility::is_plan_mode_refusal(&error.message)
+        || error.kind != harw_extension_api::SpawnRejectionKind::Other;
+    tracing::warn!(
+        code = "HARW-ORCH-001",
+        role,
+        kind = ?error.kind,
+        message = %error.message,
+        "turn_loop.delegation_rejected"
+    );
+    if known {
+        error.message.clone()
+    } else {
+        format!(
+            "[HARW-ORCH-001] Delegation an '{role}' abgelehnt: {}. Dein Turn läuft weiter: \
+             prüfe Rolle, Sandbox und Grenzen, oder schneide den Auftrag neu zu.",
+            error.message
+        )
+    }
+}
+
 /// Wickelt eine Fortsetzungs-Instruktion nach einem `MaxTokens`-Abbruch in
 /// einen [`harw_context::Fragment`]-Block (Trust-Klasse `Instruction`), damit
 /// sie wie die übrigen Instructions in die Kontextmontage eingeht. Ein
@@ -4117,33 +4149,21 @@ async fn resume_after_approval_with_store(
                         .await
                     {
                         Ok(child) => child,
-                        // Runde 5, Teil K: eine Orchestrierungsgrenze ist eine
-                        // Antwort an das Modell, kein Turn-Abbruch.
-                        // Runde 5, Teil J: ebenso eine abgelehnte Fortsetzung.
-                        Err(error)
-                            if crate::background_children::is_orchestration_limit_rejection(
-                                &error.message,
-                            ) || crate::child_handoff::is_continuation_rejection(
-                                &error.message,
-                            ) || crate::delegation_visibility::is_plan_mode_refusal(
-                                &error.message,
-                            ) =>
-                        {
+                        // Runde 5, Teile J/K: eine Orchestrierungsgrenze oder
+                        // abgelehnte Fortsetzung ist eine Antwort an das Modell,
+                        // kein Turn-Abbruch — ebenso jede andere abgelehnte
+                        // Admission (HARW-ORCH-001), damit ein Orchestrator
+                        // nachsteuern kann statt seinen ganzen Turn zu verlieren.
+                        Err(error) => {
                             drop(permit);
                             session.history_mut().push_tool_result(
                                 pending.call.id,
-                                ToolCallResult::error(error.message),
+                                ToolCallResult::error(spawn_rejection_text(&role, &error)),
                                 0,
                             );
                             persist_last(session, store).await?;
                             return drive_turn(session, model, store, approvals, &ctx, handle, control)
                                 .await;
-                        }
-                        Err(error) => {
-                            return Err(CoreError::HandoffFailed {
-                                role: role.clone(),
-                                reason: error.to_string(),
-                            });
                         }
                     };
                     // Ein genehmigungspflichtiger Handoff wird ausschließlich hier
@@ -4371,9 +4391,17 @@ async fn drive_turn(
     // ehrlichen `Truncated`-Ausgang mitsamt bereits persistiertem Teiltext.
     const MAX_AUTOMATIC_CONTINUATIONS: u32 = 3;
     const CONTINUATION_INSTRUCTION: &str = "Die unmittelbar vorherige Assistant-Antwort wurde wegen eines Ausgabelimits abgeschnitten. Setze exakt an ihrer letzten Stelle fort, ohne Text zu wiederholen oder neu anzufangen. Schließe den ursprünglichen Auftrag eigenständig ab.";
+    const TOOL_CALL_SPLIT_INSTRUCTION: &str = "Deine unmittelbar vorherigen Werkzeugaufrufe wurden wegen des Ausgabelimits abgeschnitten und NICHT ausgeführt. Wiederhole sie kleiner: weniger Aufrufe pro Antwort, weniger Ziele pro delegate_wave, kürzere Aufträge und Argumente.";
 
     let mut total_usage = harw_types::TokenUsage::default();
+    // Zählt *aufeinanderfolgende* Abschneidungen: jede angenommene Runde, die
+    // nicht mit `MaxTokens` endet, setzt Zähler und Anweisung zurück. Früher
+    // galt die Grenze pro Turn und die Fortsetzungsanweisung hing ab der
+    // ersten Abschneidung an *jeder* weiteren Runde — lange
+    // Orchestrator-Turns endeten so grundlos als `Truncated`, und das Modell
+    // las in normalen Tool-Runden „setze exakt an der letzten Stelle fort".
     let mut automatic_continuations = 0u32;
+    let mut continuation_instruction: Option<&'static str> = None;
     // Fortlaufende Modell-Runden-Nummer dieses `drive_turn`-Aufrufs, für
     // `UsageRound::round` — bei jedem Modellaufruf inkrementiert, bevor die
     // Runde persistiert wird.
@@ -4469,7 +4497,7 @@ async fn drive_turn(
         // 1./2./4a. Context + Instructions + Request-Montage (siehe
         // `assemble_round_request`). Eine Wiederholung nach Notfall-
         // Kompaktierung baut den Request über denselben Weg neu.
-        let continuation = (automatic_continuations > 0).then_some(CONTINUATION_INSTRUCTION);
+        let continuation = continuation_instruction;
         let mut request = assemble_round_request(
             session,
             ctx,
@@ -4753,6 +4781,10 @@ async fn drive_turn(
                 continue;
             }
         }
+        if !matches!(response.stop, crate::model::StopReason::MaxTokens) {
+            automatic_continuations = 0;
+            continuation_instruction = None;
+        }
         // Antwort angenommen: die Einmal-Wiederholungen gelten wieder für
         // den nächsten Request, das angehobene Ausgabelimit nur für die
         // eine wiederholte Runde.
@@ -4839,6 +4871,33 @@ async fn drive_turn(
         // nicht verliert.
         if !response_had_no_tool_calls {
             match response_stop {
+                // Auch nach der Wiederholung mit verdoppeltem Limit zu lang:
+                // die Calls werden verworfen (nie ausgeführt) und das Modell
+                // aufgefordert, sie kleiner zu schneiden — statt den ganzen
+                // (Orchestrator-)Turn als `Truncated` zu beenden.
+                crate::model::StopReason::MaxTokens
+                    if automatic_continuations < MAX_AUTOMATIC_CONTINUATIONS =>
+                {
+                    automatic_continuations += 1;
+                    continuation_instruction = Some(TOOL_CALL_SPLIT_INSTRUCTION);
+                    tracing::info!(
+                        continuation = automatic_continuations,
+                        dropped_tool_calls = response.tool_calls.len(),
+                        "turn_loop.auto_continue_after_truncated_tool_calls"
+                    );
+                    let appended_tokens = appended_tokens_since(session, history_mark);
+                    maybe_compact(
+                        session,
+                        model,
+                        store,
+                        &last_round_usage,
+                        appended_tokens,
+                        false,
+                        &mut last_compaction_tokens_after,
+                    )
+                    .await;
+                    continue;
+                }
                 crate::model::StopReason::MaxTokens
                 | crate::model::StopReason::ContextWindowExceeded => {
                     return finish_model_stop(
@@ -4907,6 +4966,7 @@ async fn drive_turn(
                     if automatic_continuations < MAX_AUTOMATIC_CONTINUATIONS =>
                 {
                     automatic_continuations += 1;
+                    continuation_instruction = Some(CONTINUATION_INSTRUCTION);
                     tracing::info!(
                         continuation = automatic_continuations,
                         "turn_loop.auto_continue_after_max_tokens"
@@ -5289,15 +5349,11 @@ async fn drive_turn(
                 // Runde 5, Teil K: eine Orchestrierungsgrenze (`[agents]`) ist
                 // eine Antwort an das Modell — Werkzeugfehler statt Turn-Abbruch.
                 // Runde 5, Teil J: ebenso eine abgelehnte Fortsetzung
-                // (`continue_from`), damit das Modell nachsteuern kann.
-                if let Err(error) = &spawned
-                    && (crate::background_children::is_orchestration_limit_rejection(
-                        &error.message,
-                    ) || crate::child_handoff::is_continuation_rejection(&error.message)
-                        || crate::delegation_visibility::is_plan_mode_refusal(&error.message))
-                {
+                // (`continue_from`), damit das Modell nachsteuern kann; und
+                // jede andere abgelehnte Admission (HARW-ORCH-001).
+                if let Err(error) = &spawned {
                     drop(permit);
-                    let mut result = ToolCallResult::error(error.message.clone());
+                    let mut result = ToolCallResult::error(spawn_rejection_text(&role, error));
                     let abort_reason = apply_tool_guard(
                         session,
                         store,
@@ -5329,10 +5385,10 @@ async fn drive_turn(
                     }
                     continue;
                 }
-                let child = spawned.map_err(|e| CoreError::HandoffFailed {
-                    role: role.clone(),
-                    reason: e.to_string(),
-                })?;
+                // Jeder Fehler wurde oben als Werkzeug-Antwort beantwortet.
+                let Ok(child) = spawned else {
+                    continue;
+                };
                 let question = child_question(&handoff_arguments);
                 emit(
                     session,
@@ -13842,6 +13898,8 @@ mod tests {
         >,
         /// Je Turn-Request: geschätzte Bytes und gesetztes Ausgabelimit.
         requests: Mutex<Vec<(u64, Option<u32>)>>,
+        /// Je Turn-Request: die Debug-Darstellung (für Anweisungs-Prüfungen).
+        rendered: Mutex<Vec<String>>,
     }
 
     impl GuardModel {
@@ -13849,7 +13907,15 @@ mod tests {
             Self {
                 script: Mutex::new(script.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
+                rendered: Mutex::new(Vec::new()),
             }
+        }
+
+        fn rendered(&self) -> Vec<String> {
+            self.rendered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         fn requests(&self) -> Vec<(u64, Option<u32>)> {
@@ -13876,6 +13942,10 @@ mod tests {
                     crate::context_budget::estimate_request_bytes(&request),
                     request.max_output_tokens,
                 ));
+            self.rendered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("{request:?}"));
             let next = self
                 .script
                 .lock()
@@ -14091,6 +14161,158 @@ mod tests {
                 .any(|item| matches!(item, TurnItem::ToolCall(_))),
             "abgeschnittene Tool-Calls dürfen nie in den Verlauf gelangen"
         );
+        Ok(())
+    }
+
+    /// Ein eindeutiger `lookup`-Aufruf (andere Argumente je `part`), damit
+    /// der Schleifen-Wächter wiederholte Runden nicht als Stillstand wertet.
+    fn distinct_lookup(part: usize) -> crate::model::ModelResponse {
+        response_with(vec![ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("lookup"),
+            arguments: serde_json::json!({"part": part}),
+        }])
+    }
+
+    fn truncated_text(text: &str) -> crate::model::ModelResponse {
+        crate::model::ModelResponse {
+            stop: crate::model::StopReason::MaxTokens,
+            ..crate::model::ModelResponse::text(text)
+        }
+    }
+
+    #[test]
+    fn unknown_spawn_rejections_get_a_stable_code_and_known_ones_keep_their_text() {
+        let unknown =
+            harw_extension_api::AgentSpawnError::new("child role 'ghost' is not registered");
+        let text = spawn_rejection_text("ghost", &unknown);
+        assert!(text.starts_with("[HARW-ORCH-001]"), "{text}");
+        assert!(text.contains("not registered"));
+        let continuation = harw_extension_api::AgentSpawnError::new(
+            "continue_from: kein eigenes, beendetes Kind mit der ID x",
+        );
+        assert_eq!(
+            spawn_rejection_text("explorer", &continuation),
+            continuation.message
+        );
+    }
+
+    const TEXT_CONTINUATION_MARK: &str = "Setze exakt an ihrer letzten Stelle fort";
+    const SPLIT_MARK: &str = "NICHT ausgeführt";
+
+    #[tokio::test]
+    async fn the_continuation_instruction_is_sent_only_right_after_a_truncation() -> TestResult {
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new(vec![
+            Ok(truncated_text("Teil eins")),
+            Ok(distinct_lookup(1)),
+            Ok(distinct_lookup(2)),
+            Ok(crate::model::ModelResponse::text("fertig")),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der Turn läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        let marks: Vec<bool> = model
+            .rendered()
+            .iter()
+            .map(|request| request.contains(TEXT_CONTINUATION_MARK))
+            .collect();
+        assert_eq!(marks, vec![false, true, false, false]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn separate_truncations_in_a_long_turn_do_not_end_it() -> TestResult {
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let mut script = Vec::new();
+        for part in 0..5 {
+            script.push(Ok(truncated_text("Zwischenstand")));
+            script.push(Ok(distinct_lookup(part)));
+        }
+        script.push(Ok(crate::model::ModelResponse::text("fertig")));
+        let model = GuardModel::new(script);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der lange Turn läuft durch"))?;
+
+        assert!(
+            matches!(outcome, TurnOutcome::Completed),
+            "fünf getrennte Abschneidungen sind kein Grund für Truncated: {outcome:?}"
+        );
+        assert_eq!(model.requests().len(), 11);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consecutive_truncations_still_stop_after_the_limit() -> TestResult {
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new((0..6).map(|_| Ok(truncated_text("…"))).collect());
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der Turn endet ehrlich"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Truncated), "{outcome:?}");
+        assert_eq!(model.requests().len(), 4, "1 + 3 Fortsetzungen");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_calls_after_the_retry_ask_for_smaller_calls() -> TestResult {
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000);
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        )
+        .with_auto_compact(Some(policy));
+        session.set_max_output_tokens(Some(1_000));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let truncated = || {
+            Ok(crate::model::ModelResponse {
+                stop: crate::model::StopReason::MaxTokens,
+                ..distinct_lookup(9)
+            })
+        };
+        let model = GuardModel::new(vec![
+            truncated(),
+            truncated(),
+            Ok(distinct_lookup(1)),
+            Ok(crate::model::ModelResponse::text("kleiner erledigt")),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der Turn läuft mit kleineren Aufrufen weiter"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        let rendered = model.rendered();
+        assert_eq!(rendered.len(), 4);
+        assert!(!rendered[1].contains(SPLIT_MARK));
+        assert!(rendered[2].contains(SPLIT_MARK));
+        assert!(!rendered[3].contains(SPLIT_MARK));
+        let executed = session
+            .history()
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TurnItem::ToolCall(_)))
+            .count();
+        assert_eq!(executed, 1, "nur der kleinere Aufruf wird ausgeführt");
         Ok(())
     }
 
