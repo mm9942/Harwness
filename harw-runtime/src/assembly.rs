@@ -3234,6 +3234,32 @@ impl RuntimeAssemblyBuilder {
             }
             None => registry_builder,
         };
+        // `delegate_wave` an der Wurzel: nur für einen expliziten
+        // Orchestrator-Wurzelagenten (`--agent root-orchestrator` o. ä.),
+        // dessen Definition das Werkzeug admittiert. Vorher bekamen es nur
+        // Kind-Registries — der Wurzel-Orchestrator sah es freigeschaltet,
+        // konnte es aber nicht ausführen.
+        let delegate_wave_root = spawner.as_ref().filter(|_| {
+            profile.operations == OperationSurface::AllWithModelTools
+                && agent_ir.as_ref().is_some_and(|ir| {
+                    matches!(
+                        ir.role(),
+                        AgentRoleId::RootOrchestrator | AgentRoleId::ChildOrchestrator
+                    ) && activation.is_tool_enabled(&ToolName::new(
+                        harw_core_bridge::DELEGATE_WAVE_TOOL.to_owned(),
+                    ))
+                })
+        });
+        let registry_builder = match delegate_wave_root {
+            Some(spawner) => registry_builder.tool_provider(Arc::new(
+                crate::children::root_delegate_wave_provider(
+                    Arc::clone(spawner),
+                    Arc::clone(&stores.state_store),
+                    &agent_roster.custom_wiring(),
+                ),
+            )),
+            None => registry_builder,
+        };
         // Runde 5, Teil K: `agent.status`/`agent.cancel` nur an der
         // TUI-Wurzel (Hintergrund-Agenten gibt es nur dort) — mit Spawner und
         // Modell-Werkzeugfläche; ein expliziter Wurzel-Agent nur, wenn seine

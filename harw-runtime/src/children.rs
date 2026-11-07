@@ -1466,35 +1466,7 @@ impl RuntimeChildRegistryFactory {
     /// Wissens-Operationen, die über diesen Kontext laufen, identitätsgebunden
     /// lesen ([`delegate_wave_services`]).
     fn delegate_wave_provider(&self, identity: Arc<CallerIdentity>) -> ModelToolProvider {
-        // Plan R9, Teil B: ein benutzerdefinierter Agent (als Ziel oder als
-        // Aufrufer) gilt mit Reducer und Delegationszielen seiner Basisrolle.
-        // Eigene `[delegation].targets` eines benutzerdefinierten Aufrufers
-        // gehen vor (sie filtern nur, was sichtbar und registriert ist).
-        let custom: Arc<HashMap<String, harw_registry_defaults::CustomAgentWiring>> =
-            Arc::new(self.custom_agents.clone());
-        let custom_names: Arc<std::collections::HashSet<String>> =
-            Arc::new(self.custom_agents.keys().cloned().collect());
-        let target_custom = Arc::clone(&custom);
-        let policy = harw_core_bridge::DelegateWavePolicy::new(
-            move |role: &str| {
-                let role = target_custom
-                    .get(role)
-                    .map_or(role, |wiring| wiring.base_role.as_str());
-                harw_registry_defaults::authority_reducer_for_role(role).map(|reducer| reducer.id())
-            },
-            move |role: &str| match custom.get(role) {
-                Some(wiring) => wiring.delegation_targets.clone().or_else(|| {
-                    harw_registry_defaults::authority::delegation_targets_for_role(
-                        &wiring.base_role,
-                    )
-                }),
-                None => harw_registry_defaults::authority::delegation_targets_for_role(role),
-            },
-        );
-        // Plan R9, Teil C: benutzerdefinierte Agenten bleiben sichtbar, wenn
-        // eine eingebaute Deklaration nur eingebaute Rollen nennt.
-        let custom_targets = Arc::clone(&custom_names);
-        let policy = policy.with_custom_targets(move |role: &str| custom_targets.contains(role));
+        let policy = delegate_wave_policy(&self.custom_agents);
         let operation: Arc<dyn Operation> =
             Arc::new(harw_core_bridge::DelegateWaveOperation::new(policy));
         let slot = Arc::clone(&self.spawner_slot);
@@ -1866,6 +1838,75 @@ fn dod_services(
     }
     services.insert(Arc::clone(identity));
     services
+}
+
+/// Die `delegate_wave`-Policy: Reducer und Delegationsziele je Rolle, mit
+/// benutzerdefinierten Agenten über ihre Basisrolle (Plan R9, Teile B/C).
+fn delegate_wave_policy(
+    custom_agents: &HashMap<String, harw_registry_defaults::CustomAgentWiring>,
+) -> harw_core_bridge::DelegateWavePolicy {
+    // Plan R9, Teil B: ein benutzerdefinierter Agent (als Ziel oder als
+    // Aufrufer) gilt mit Reducer und Delegationszielen seiner Basisrolle.
+    // Eigene `[delegation].targets` eines benutzerdefinierten Aufrufers
+    // gehen vor (sie filtern nur, was sichtbar und registriert ist).
+    let custom: Arc<HashMap<String, harw_registry_defaults::CustomAgentWiring>> =
+        Arc::new(custom_agents.clone());
+    let custom_names: Arc<std::collections::HashSet<String>> =
+        Arc::new(custom_agents.keys().cloned().collect());
+    let target_custom = Arc::clone(&custom);
+    let policy = harw_core_bridge::DelegateWavePolicy::new(
+        move |role: &str| {
+            let role = target_custom
+                .get(role)
+                .map_or(role, |wiring| wiring.base_role.as_str());
+            harw_registry_defaults::authority_reducer_for_role(role).map(|reducer| reducer.id())
+        },
+        move |role: &str| match custom.get(role) {
+            Some(wiring) => wiring.delegation_targets.clone().or_else(|| {
+                harw_registry_defaults::authority::delegation_targets_for_role(&wiring.base_role)
+            }),
+            None => harw_registry_defaults::authority::delegation_targets_for_role(role),
+        },
+    );
+    // Plan R9, Teil C: benutzerdefinierte Agenten bleiben sichtbar, wenn
+    // eine eingebaute Deklaration nur eingebaute Rollen nennt.
+    let custom_targets = Arc::clone(&custom_names);
+    policy.with_custom_targets(move |role: &str| custom_targets.contains(role))
+}
+
+/// `delegate_wave` für einen Orchestrator, der selbst die Wurzelsitzung ist
+/// (`--agent root-orchestrator`).
+///
+/// # Description
+/// Bisher bekamen nur Kind-Registries das Werkzeug; ein Root-Orchestrator
+/// als Wurzel sah es in seiner Aktivierung, konnte es aber nicht ausführen,
+/// während ihn der Lesewächter nach dem Lesebudget genau dorthin schickte.
+/// Die Wurzel hält den Spawner ohnehin stark; eine Lauf-Identität für
+/// Wissens-Operationen hat sie (noch) nicht (PL-90/05), `delegate_wave`
+/// braucht keine.
+pub(crate) fn root_delegate_wave_provider(
+    spawner: Arc<ManagedAgentSpawner>,
+    state_store: Arc<dyn StateStore>,
+    custom_agents: &HashMap<String, harw_registry_defaults::CustomAgentWiring>,
+) -> ModelToolProvider {
+    let policy = delegate_wave_policy(custom_agents);
+    let operation: Arc<dyn Operation> =
+        Arc::new(harw_core_bridge::DelegateWaveOperation::new(policy));
+    ModelToolProvider::new([operation], move |execution_context| {
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(&spawner));
+        services.insert(Arc::clone(&state_store));
+        let ctx = OpContext::new(
+            execution_context.session_id().clone(),
+            execution_context.turn_id().clone(),
+            execution_context.sandbox().clone(),
+            services,
+        );
+        match execution_context.cancel() {
+            Some(cancel) => ctx.with_cancel_token(cancel.clone()),
+            None => ctx,
+        }
+    })
 }
 
 /// Die Dienste des `OpContext` von `delegate_wave` (PL-90 W03d).
