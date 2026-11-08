@@ -637,6 +637,23 @@ struct RoundScratch {
     dropped: Vec<Dropped>,
 }
 
+/// What one selection pass decided for one selected injection
+/// ([`SkillInjector::decide_injection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionOutcome {
+    /// Already decided in this round (and reopened since): released,
+    /// reopened after the round, the earlier result stands.
+    Forgotten,
+    /// Excluded or unavailable for its tools: released, stays marked, takes
+    /// no room (a further pass may follow).
+    Skipped,
+    /// More bytes than the room left: released, reopened after the round,
+    /// reported as a `TurnBudget` drop.
+    OverRoom,
+    /// Fits the room left: the caller charges the room and delivers it.
+    Fits,
+}
+
 /// How far the injector has read the history: its length and the id of the
 /// last item read. A shorter history or another id at that position means
 /// the history was rewritten (compaction, truncation).
@@ -1124,52 +1141,25 @@ impl SkillInjector {
             select_drops = selection.dropped;
             let mut skipped_for_tools = false;
             for injection in selection.injections {
-                if !decided.insert(injection.skill.clone()) {
-                    // Schon entschieden und seither wieder geöffnet: das
-                    // Ergebnis des früheren Durchlaufs bleibt.
-                    state.release(injection.bytes);
-                    scratch.forget.push(injection.skill);
-                    continue;
+                let outcome = self.decide_injection(
+                    state,
+                    &injection,
+                    &mut decided,
+                    room,
+                    round,
+                    &mut scratch,
+                );
+                match outcome {
+                    InjectionOutcome::Forgotten | InjectionOutcome::OverRoom => {}
+                    InjectionOutcome::Skipped => skipped_for_tools = true,
+                    InjectionOutcome::Fits => {
+                        // Charged before `deliver`, and kept when `deliver`
+                        // releases the bytes again. Cannot saturate: `Fits`
+                        // means `injection.bytes <= room`.
+                        room = room.saturating_sub(injection.bytes);
+                        self.deliver(state, injection, produced_at, admit, round, &mut scratch);
+                    }
                 }
-                if self.excluded.contains(&injection.skill) {
-                    // PL-100 WP 1.5: already part of the session's fixed
-                    // context. Stays marked (no re-selection until the next
-                    // compaction), costs no bytes and frees its room like a
-                    // skill skipped for its tools.
-                    tracing::debug!(
-                        skill = %injection.skill,
-                        "skill_injection.fixed_skill_skipped"
-                    );
-                    state.release(injection.bytes);
-                    skipped_for_tools = true;
-                    continue;
-                }
-                if !self.tools_admit(&injection.skill) {
-                    // The session has none of the tools the skill explains:
-                    // stays marked (no re-selection until the next
-                    // compaction), costs no bytes and takes no room.
-                    tracing::debug!(skill = %injection.skill, "skill_injection.tools_unavailable");
-                    state.release(injection.bytes);
-                    state.unavailable.insert(injection.skill.clone());
-                    round.unavailable.push(injection.skill);
-                    skipped_for_tools = true;
-                    continue;
-                }
-                if injection.bytes > room {
-                    // Only in a repeated pass: `select` judged the hit
-                    // against the whole per-round budget, the round has less
-                    // left (exactly the check of a single pass).
-                    state.release(injection.bytes);
-                    scratch.forget.push(injection.skill.clone());
-                    scratch.dropped.push(Dropped {
-                        skill: injection.skill,
-                        section: injection.section,
-                        reason: DropReason::TurnBudget,
-                    });
-                    continue;
-                }
-                room -= injection.bytes;
-                self.deliver(state, injection, produced_at, admit, round, &mut scratch);
             }
             let dropped_for_budget = select_drops.iter().any(|dropped| {
                 matches!(
@@ -1186,6 +1176,81 @@ impl SkillInjector {
         for skill in &scratch.forget {
             state.injection.forget_skill(skill);
         }
+        self.report_drops(state, &decided, select_drops, round);
+        round.dropped.append(&mut scratch.dropped);
+    }
+
+    /// The decision chain of one selected injection in a selection pass of
+    /// [`Self::select_into`], in this order: already decided in this round,
+    /// excluded, unavailable for its tools, more bytes than `room`, else it
+    /// fits. Every outcome but [`InjectionOutcome::Fits`] has released the
+    /// injection's bytes; the caller charges `room` and delivers a fit.
+    fn decide_injection(
+        &self,
+        state: &mut InjectorState,
+        injection: &Injection,
+        decided: &mut BTreeSet<String>,
+        room: usize,
+        round: &mut RoundInjection,
+        scratch: &mut RoundScratch,
+    ) -> InjectionOutcome {
+        if !decided.insert(injection.skill.clone()) {
+            // Schon entschieden und seither wieder geöffnet: das
+            // Ergebnis des früheren Durchlaufs bleibt.
+            state.release(injection.bytes);
+            scratch.forget.push(injection.skill.clone());
+            return InjectionOutcome::Forgotten;
+        }
+        if self.excluded.contains(&injection.skill) {
+            // PL-100 WP 1.5: already part of the session's fixed
+            // context. Stays marked (no re-selection until the next
+            // compaction), costs no bytes and frees its room like a
+            // skill skipped for its tools.
+            tracing::debug!(
+                skill = %injection.skill,
+                "skill_injection.fixed_skill_skipped"
+            );
+            state.release(injection.bytes);
+            return InjectionOutcome::Skipped;
+        }
+        if !self.tools_admit(&injection.skill) {
+            // The session has none of the tools the skill explains:
+            // stays marked (no re-selection until the next
+            // compaction), costs no bytes and takes no room.
+            tracing::debug!(skill = %injection.skill, "skill_injection.tools_unavailable");
+            state.release(injection.bytes);
+            state.unavailable.insert(injection.skill.clone());
+            round.unavailable.push(injection.skill.clone());
+            return InjectionOutcome::Skipped;
+        }
+        if injection.bytes > room {
+            // Only in a repeated pass: `select` judged the hit
+            // against the whole per-round budget, the round has less
+            // left (exactly the check of a single pass).
+            state.release(injection.bytes);
+            scratch.forget.push(injection.skill.clone());
+            scratch.dropped.push(Dropped {
+                skill: injection.skill.clone(),
+                section: injection.section.clone(),
+                reason: DropReason::TurnBudget,
+            });
+            return InjectionOutcome::OverRoom;
+        }
+        InjectionOutcome::Fits
+    }
+
+    /// Reports the drops of the last selection pass of
+    /// [`Self::select_into`] (`select_drops`) into `round`: an "already
+    /// delivered" drop of a skill decided in this round or excluded is not
+    /// reported, that of a skill skipped for its tools is reported as
+    /// unavailable (once per round).
+    fn report_drops(
+        &self,
+        state: &InjectorState,
+        decided: &BTreeSet<String>,
+        select_drops: Vec<Dropped>,
+        round: &mut RoundInjection,
+    ) {
         // Die Verwürfe des letzten Durchlaufs beschreiben jeden Treffer, den
         // er nicht ausgewählt hat. „Schon geliefert“ eines in dieser Runde
         // entschiedenen Skills ist ein Artefakt der Wiederholung; das eines
@@ -1211,7 +1276,6 @@ impl SkillInjector {
             }
             round.dropped.push(dropped);
         }
-        round.dropped.append(&mut scratch.dropped);
     }
 
     /// The path of one selected injection that fits the round: imported
@@ -2231,7 +2295,7 @@ mod availability_tests {
     use harw_protocol::ToolCallResult;
     use harw_types::ToolCallId;
 
-    use super::{SkillInjectionSettings, SkillInjector, ToolAvailability};
+    use super::{RoundInjection, SkillInjectionSettings, SkillInjector, ToolAvailability};
     use crate::history::ConversationHistory;
     use crate::test_support::{TestError, TestResult};
 
@@ -2521,6 +2585,153 @@ mod availability_tests {
         assert_eq!(round.unavailable, vec!["high".to_owned()]);
         assert!(round.dropped.is_empty(), "{:?}", round.dropped);
         assert_eq!(filtered.session_bytes(), low);
+        Ok(())
+    }
+
+    /// The delivered skill names of `round`, in delivery order.
+    fn delivered_names(round: &RoundInjection) -> Vec<&str> {
+        round
+            .delivered
+            .iter()
+            .map(|delivered| delivered.skill.as_str())
+            .collect()
+    }
+
+    /// The `(skill, reason)` pairs of the drops of `round`, in report order.
+    fn drop_reasons(round: &RoundInjection) -> Vec<(&str, DropReason)> {
+        round
+            .dropped
+            .iter()
+            .map(|dropped| (dropped.skill.as_str(), dropped.reason))
+            .collect()
+    }
+
+    /// The room check of a repeated pass (`InjectionOutcome::OverRoom`):
+    /// `first` is delivered and `tooled`, skipped for its tools, frees its
+    /// share, so a second pass runs for `later`, which the first `select`
+    /// dropped for the per-round budget. The second `select` judges `later`
+    /// against the whole per-round budget and picks it, but it does not fit
+    /// the room `first` left: the injector releases it, reports a
+    /// `TurnBudget` drop and reopens it after the round.
+    #[test]
+    fn a_repeated_pass_drops_a_hit_beyond_the_room_left_and_reopens_it() -> TestResult {
+        let mut files = fixture_files(
+            "first",
+            &[],
+            "[triggers]\nkeywords = [\"zebrafoo\"]\npriority = 90\n",
+            "# First\n\nRun the first check.\n",
+        );
+        files.extend(fixture_files(
+            "tooled",
+            &["sys.ps"],
+            "[triggers]\nkeywords = [\"zebrafoo\"]\npriority = 50\n",
+            "# Tooled\n\nUse sys.ps.\n",
+        ));
+        let later_body = format!(
+            "# Later\n\n{}",
+            "Run the later check after the first one.\n".repeat(4)
+        );
+        files.extend(fixture_files(
+            "later",
+            &[],
+            "[triggers]\nkeywords = [\"zebrafoo\"]\npriority = 10\n",
+            &later_body,
+        ));
+        let index = index_of(&files, false);
+        let mut history = ConversationHistory::new();
+        history.push_user_text("zebrafoo");
+
+        // The sizes as delivered with the full budget (whole skills, no cut;
+        // every one fits the cap below, so the cap selects the same texts).
+        let alone = SkillInjector::new(Arc::clone(&index), SkillInjectionSettings::default())
+            .prepare_round(&history, 0);
+        let size = |name: &'static str| -> TestResult<usize> {
+            alone
+                .delivered
+                .iter()
+                .find(|delivered| delivered.skill == name)
+                .map(|delivered| delivered.bytes)
+                .ok_or(TestError::Missing(name))
+        };
+        let (first, tooled, later) = (size("first")?, size("tooled")?, size("later")?);
+        let first_and_tooled = first
+            .checked_add(tooled)
+            .ok_or(TestError::Missing("first + tooled"))?;
+        let first_and_later = first
+            .checked_add(later)
+            .ok_or(TestError::Missing("first + later"))?;
+        let tooled_and_later = tooled
+            .checked_add(later)
+            .ok_or(TestError::Missing("tooled + later"))?;
+        let all_three = first_and_tooled
+            .checked_add(later)
+            .ok_or(TestError::Missing("first + tooled + later"))?;
+        // Room for `first` and `tooled` together and for `later` alone, never
+        // for `first` and `later` together.
+        let cap = first_and_tooled.max(later);
+        assert!(
+            first_and_later > cap,
+            "later must not fit beside first: {first} + {later} <= {cap}"
+        );
+        let settings = SkillInjectionSettings {
+            per_turn_cap_bytes: cap,
+            ..SkillInjectionSettings::default()
+        };
+
+        // Control: without the filter one pass delivers `first` and `tooled`
+        // and `select` drops `later` for the per-round budget.
+        let control = SkillInjector::new(Arc::clone(&index), settings).prepare_round(&history, 0);
+        assert_eq!(delivered_names(&control), ["first", "tooled"]);
+        assert_eq!(
+            drop_reasons(&control),
+            [("later", DropReason::TurnBudget)],
+            "{:?}",
+            control.dropped
+        );
+
+        let filtered = SkillInjector::new(index, settings)
+            .with_tool_availability(ToolAvailability::new(["shell.exec"], ["sys.ps"]));
+        let round = filtered.prepare_round(&history, 0);
+        assert_eq!(delivered_names(&round), ["first"]);
+        assert_eq!(round.unavailable, vec!["tooled".to_owned()]);
+        // Exactly one drop: `later` for the per-round budget; the repeated
+        // pass reports no "already delivered" drop of `first` or `tooled`.
+        assert_eq!(
+            drop_reasons(&round),
+            [("later", DropReason::TurnBudget)],
+            "{:?}",
+            round.dropped
+        );
+        assert_eq!(filtered.session_bytes(), first);
+        // The drop is the injector's (second pass), not that of the first
+        // `select`: the second `select` booked `later` as well and the
+        // injector released it again, beside `tooled`. A single pass would
+        // have booked `first + tooled` and released `tooled` only.
+        let (booked, released, later_marked, tooled_marked) = {
+            let state = filtered.lock();
+            (
+                state.injection.session_bytes(),
+                state.released_bytes,
+                state.injection.has_delivered("later", None),
+                state.injection.has_delivered("tooled", None),
+            )
+        };
+        assert_eq!(booked, all_three);
+        assert_eq!(released, tooled_and_later);
+        // `later` is reopened after the round, `tooled` stays marked.
+        assert!(!later_marked, "later reopened");
+        assert!(tooled_marked, "tooled stays marked");
+
+        // The next matching message selects `later` again: reopened, never
+        // reported as "already delivered".
+        history.push_user_text("zebrafoo");
+        let next = filtered.prepare_round(&history, 0);
+        assert_eq!(delivered_names(&next), ["later"], "{:?}", next.dropped);
+        assert!(
+            !next.dropped.iter().any(|dropped| dropped.skill == "later"),
+            "{:?}",
+            next.dropped
+        );
         Ok(())
     }
 
