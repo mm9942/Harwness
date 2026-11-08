@@ -219,10 +219,10 @@ jobs:
       - name: BPF manifest writer and BTF stamp checks
         run: make -C harw-dod/bpf check-manifest-writer check-btf-stamp
 
-      # Die vier DoD-Binaries gemeinsam, wie `harw-dod/Makefile` (`build`) sie
+      # Die fünf DoD-Binaries gemeinsam, wie `harw-dod/Makefile` (`build`) sie
       # baut — ohne Produkt-Binaries im selben Feature-Graphen.
       - name: Build DoD binaries (package-scoped)
-        run: cargo build --locked -p harw-sentinel -p harw-probe-bpf -p harw-probe-fs -p harw-warden
+        run: cargo build --locked -p harw-sentinel -p harw-probe-bpf -p harw-probe-fs -p harw-probe-netlink -p harw-warden
 
       # Warden-TCB fürs Log: die Laufzeit-Hülle, die `xtask gates`
       # (warden-dependency-budget) gegen `MAX_WARDEN_RUNTIME_DEPS` zählt.

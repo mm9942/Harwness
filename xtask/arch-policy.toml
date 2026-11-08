@@ -215,6 +215,11 @@ layer = "J"
 # --- D: DoD domain (harw-dod/crates/*) -----------------------------------------
 [packages."harw-dod"]
 layer = "D"
+# PL-100 WP1.8 (O11): Offline-RustSec-Sensor (Cargo.lock gegen einen lokalen
+# advisory-db-Checkout, `Capability::ReadWorkspaceGraph`, unprivilegiert);
+# ein Sensor wie die übrigen harw-dod-* (gate_edges.rs `SENSOR_CRATES`).
+[packages."harw-dod-advisory"]
+layer = "D"
 [packages."harw-dod-authlog"]
 layer = "D"
 [packages."harw-dod-blockio"]
@@ -301,6 +306,10 @@ layer = "D"
 [packages."harw-probe-fs"]
 layer = "D"
 [packages."harw-probe-bpf"]
+layer = "D"
+# PL-100 WP1.8 (O11): privilegierte Audit-Netlink-Sonde (genau
+# `CAP_AUDIT_READ`), push-only zum Sentinel wie `harw-probe-bpf`.
+[packages."harw-probe-netlink"]
 layer = "D"
 [packages."harw-warden"]
 layer = "D"
@@ -531,12 +540,12 @@ packages = ["harw-protocol"]
 reason = "W00 §2.1/ARC-01: harw-protocol has no async runtime or network transport dependency"
 
 [[forbidden_crates]]
-names = ["harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs"]
+names = ["harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs", "harw-probe-netlink"]
 packages = ["harw-dod-client"]
 reason = "PL-97 §3.1 / S1: the read-only Harw-DoD client never links the Warden, the escalation ladder or a DoD daemon"
 
 [[forbidden_crates]]
-names = ["tokio", "async-std", "mio", "hyper", "reqwest", "tungstenite", "tokio-tungstenite", "harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs", "harw-dod-client", "harw-node-transport"]
+names = ["tokio", "async-std", "mio", "hyper", "reqwest", "tungstenite", "tokio-tungstenite", "harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs", "harw-probe-netlink", "harw-dod-client", "harw-node-transport"]
 packages = ["harw-dod-dispatch"]
 reason = "PL-100 WP2.1 / I8: the dispatch core is pure (no IO, clock, runtime or network) and never links signing code, the escalation ladder or a DoD daemon"
 

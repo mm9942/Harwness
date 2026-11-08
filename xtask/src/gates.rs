@@ -30,6 +30,7 @@
 //! Verteiler aus Knoten AW0-00/AW0-10; die drei Gates entstehen in AW0-10a,
 //! AW0-10b und AW0-10c.
 
+use std::io::Write as _;
 use std::path::Path;
 
 use harw_code_graph::WorkspaceGraph;
@@ -65,7 +66,7 @@ pub mod operator_decision;
 /// [`WorkspaceGraph::load_many`] zusammen. Seit PL-60 stehen alle Crates
 /// unter `harw-dod/crates/` explizit in den `members` der Wurzel-`Cargo.toml`
 /// (siehe `docs/architecture/dod-workspace-merge-plan.md`); ein einziger
-/// [`WorkspaceGraph::load`] enthält deshalb alle vier Binaries, alle
+/// [`WorkspaceGraph::load`] enthält deshalb alle DoD-Binaries, alle
 /// Sensoren und die Pfad-Kanten DoD → Produkt als interne Kanten.
 ///
 /// Name und Signatur bleiben, damit alle Gates unverändert aufrufen. Dass
@@ -186,7 +187,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "operator-decision" => operator_decision::run()?,
             other => return Err(format!("unbekanntes Gate '{other}'")),
         };
-        println!("{}", report.summary());
+        writeln!(std::io::stdout(), "{}", report.summary())
+            .map_err(|e| format!("Gate-Bericht nicht ausgebbar: {e}"))?;
         reports.push(report);
     }
 
@@ -227,7 +229,7 @@ fn failure_message(failures: &[&GateReport]) -> String {
 #[cfg(test)]
 mod tests {
     use super::GateReport;
-    use crate::test_support::{TestError, TestResult};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Wurzel des Repositorys, unabhängig vom Arbeitsverzeichnis des
     /// Testlaufs (Cargo startet Tests im Paketverzeichnis `xtask/`).
@@ -238,7 +240,7 @@ mod tests {
     }
 
     /// Der Befund, der diese Tests ausgelöst hat: die Gates luden nur `.`,
-    /// fanden die vier DoD-Binaries nicht und prüften still nichts. Gegen
+    /// fanden die DoD-Binaries nicht und prüften still nichts. Gegen
     /// den **echten** Graphen, nicht gegen ein Fixture.
     #[test]
     fn test_load_all_workspaces_finds_all_monitored_binaries() -> TestResult {
@@ -246,7 +248,7 @@ mod tests {
 
         assert!(
             super::privileges::missing_binaries(&graph).is_empty(),
-            "alle vier Binaries müssen im zusammengeführten Graphen liegen: fehlend {:?}",
+            "alle überwachten Binaries müssen im zusammengeführten Graphen liegen: fehlend {:?}",
             super::privileges::missing_binaries(&graph)
         );
         let warden = graph
@@ -327,6 +329,7 @@ mod tests {
             "harw-dod-warden-proto",
             "harw-probe-fs",
             "harw-probe-bpf",
+            "harw-probe-netlink",
             "harw-dod-encrypt",
         ] {
             assert!(
@@ -340,8 +343,77 @@ mod tests {
         Ok(())
     }
 
+    /// PL-100 WP1.8: `harw-probe-netlink` steht in `xtask/arch-policy.toml`
+    /// wie `harw-probe-bpf` (Schicht D, keine TCB-Zeile), `harw-dod-advisory`
+    /// wie die übrigen `harw-dod-*`-Sensoren (Schicht D), und weder der
+    /// lesende Client noch der Dispatch-Kern dürfen die Sonde erreichen.
     #[test]
-    fn test_privileges_on_real_graph_checks_all_four_binaries() -> TestResult {
+    fn test_arch_policy_classifies_the_netlink_probe_and_the_advisory_sensor() -> TestResult {
+        let text = std::fs::read_to_string(repo_root()?.join(super::arch::POLICY_PATH))
+            .map_err(ctx("xtask/arch-policy.toml lesen"))?;
+        super::arch::Policy::parse(&text).map_err(TestError::Unexpected)?;
+        let root: toml::Table = toml::from_str(&text).map_err(ctx("arch-policy parsen"))?;
+        let packages = root
+            .get("packages")
+            .and_then(toml::Value::as_table)
+            .ok_or(TestError::Missing("[packages]"))?;
+        let class = |name: &str| {
+            packages.get(name).and_then(toml::Value::as_table).map(|t| {
+                (
+                    t.get("layer")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
+                    t.get("tcb").and_then(toml::Value::as_bool).unwrap_or(false),
+                )
+            })
+        };
+
+        let bpf = class("harw-probe-bpf").ok_or(TestError::Missing("harw-probe-bpf"))?;
+        let netlink =
+            class("harw-probe-netlink").ok_or(TestError::Missing("harw-probe-netlink"))?;
+        assert_eq!(
+            netlink, bpf,
+            "die Netlink-Sonde ist eingeordnet wie die BPF-Sonde"
+        );
+        assert_eq!(netlink, (Some("D".to_owned()), false));
+
+        let scanreport =
+            class("harw-dod-scanreport").ok_or(TestError::Missing("harw-dod-scanreport"))?;
+        let advisory = class("harw-dod-advisory").ok_or(TestError::Missing("harw-dod-advisory"))?;
+        assert_eq!(
+            advisory, scanreport,
+            "der Advisory-Sensor ist ein Sensor wie scanreport"
+        );
+        assert_eq!(advisory, (Some("D".to_owned()), false));
+
+        let rules = root
+            .get("forbidden_crates")
+            .and_then(toml::Value::as_array)
+            .ok_or(TestError::Missing("[[forbidden_crates]]"))?;
+        for guarded in ["harw-dod-client", "harw-dod-dispatch"] {
+            let names_of_rule = rules
+                .iter()
+                .filter_map(toml::Value::as_table)
+                .find(|rule| {
+                    rule.get("packages")
+                        .and_then(toml::Value::as_array)
+                        .is_some_and(|p| p.iter().any(|v| v.as_str() == Some(guarded)))
+                })
+                .and_then(|rule| rule.get("names"))
+                .and_then(toml::Value::as_array)
+                .ok_or(TestError::Missing("forbidden_crates-Regel des Pakets"))?;
+            for probe in ["harw-probe-bpf", "harw-probe-netlink"] {
+                assert!(
+                    names_of_rule.iter().any(|v| v.as_str() == Some(probe)),
+                    "{guarded} darf {probe} nicht erreichen"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_privileges_on_real_graph_checks_all_monitored_binaries() -> TestResult {
         let graph = super::load_all_workspaces(repo_root()?).map_err(TestError::Unexpected)?;
 
         let report = super::privileges::evaluate(&graph);
@@ -351,6 +423,34 @@ mod tests {
             super::privileges::MONITORED_BINARIES.len(),
             "{report:?}"
         );
+        Ok(())
+    }
+
+    /// PL-100 WP1.8: gegen den **echten** Graphen liegt die Hülle von
+    /// `harw-probe-netlink` vollständig in `CRATE_PRIVILEGE` und im Budget
+    /// `CAP_AUDIT_READ`; seit die Socket-Crate `harw-dod-netlink` selbst als
+    /// Netlink gilt, erreicht sie kein anderes überwachtes Binary, und
+    /// `harw-dod-advisory` ist eingetragen.
+    #[test]
+    fn test_privileges_on_real_graph_has_no_netlink_or_advisory_violation() -> TestResult {
+        let graph = super::load_all_workspaces(repo_root()?).map_err(TestError::Unexpected)?;
+
+        let report = super::privileges::evaluate(&graph);
+
+        let offending: Vec<&String> = report
+            .violations
+            .iter()
+            .filter(|v| {
+                [
+                    "harw-probe-netlink",
+                    "harw-dod-netlink",
+                    "harw-dod-advisory",
+                ]
+                .iter()
+                .any(|name| v.contains(name))
+            })
+            .collect();
+        assert!(offending.is_empty(), "{offending:?}");
         Ok(())
     }
 

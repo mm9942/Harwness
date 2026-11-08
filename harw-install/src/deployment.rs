@@ -129,6 +129,10 @@ pub const DEPLOYMENT_ASSETS: &[EmbeddedDeploymentAsset] = &[
         AssetKind::SystemdService
     ),
     deployment_asset!(
+        "deploy/systemd/harw-probe-netlink.service",
+        AssetKind::SystemdService
+    ),
+    deployment_asset!(
         "deploy/systemd/harw-security-hub.service",
         AssetKind::SystemdService
     ),

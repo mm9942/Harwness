@@ -691,7 +691,11 @@ fn test_probes_and_sentinel_agree_on_the_sentinel_socket() -> TestResult {
         .ok_or(TestError::Missing("sentinel ExecStart"))?;
     let socket = exec_flag(exec, "--socket").ok_or(TestError::Missing("sentinel --socket"))?;
     assert_eq!(socket, "/run/harw/sentinel.sock");
-    for probe in ["harw-probe-bpf.service", "harw-probe-fs.service"] {
+    for probe in [
+        "harw-probe-bpf.service",
+        "harw-probe-fs.service",
+        "harw-probe-netlink.service",
+    ] {
         let unit = parsed(embedded_unit(probe)?);
         let exec = unit
             .last_value("Service", "ExecStart")
@@ -869,6 +873,7 @@ fn test_dod_units_use_the_harw_dod_suite_name() -> TestResult {
         "harw-sentinel.service",
         "harw-probe-bpf.service",
         "harw-probe-fs.service",
+        "harw-probe-netlink.service",
         "harw-warden.service",
         "harw-warden.socket",
     ] {
@@ -881,6 +886,43 @@ fn test_dod_units_use_the_harw_dod_suite_name() -> TestResult {
             "{name}: Description={description} must name the Harw-DoD suite"
         );
     }
+    Ok(())
+}
+
+/// PL-100 WP1.8: the audit netlink probe unit is embedded and printable like
+/// every other DoD unit, but stays opt-in (`harw-dod.target` does not pull it
+/// in until the sentinel accepts its uid). Whether `install.sh` ships it is
+/// decided by `DOD_PACKAGE_ASSETS`, `harw-dod/packaging/manifest` and
+/// `install.sh` together; the parity tests above keep those three in step,
+/// so this test deliberately makes no claim about it.
+#[test]
+fn test_netlink_probe_unit_is_embedded_printable_and_opt_in() -> TestResult {
+    let path = "deploy/systemd/harw-probe-netlink.service";
+    let unit = asset(path).ok_or(TestError::Missing("embedded netlink probe unit"))?;
+    assert_eq!(unit.kind, AssetKind::SystemdService);
+
+    let printed = print_systemd(Some("harw-probe-netlink"), &RenderPaths::default())
+        .map_err(ctx("print netlink probe"))?;
+    assert_eq!(printed, rendered(unit));
+    assert!(printed.contains("/usr/local/libexec/harw-dod/harw-probe-netlink "));
+
+    let service = parsed(unit);
+    assert_eq!(
+        service.last_value("Service", "User"),
+        Some("harw-probe-netlink")
+    );
+    assert_eq!(
+        service
+            .last_value("Service", "CapabilityBoundingSet")
+            .map(capability_set),
+        Some(capability_set("CAP_AUDIT_READ"))
+    );
+    let target = parsed(embedded_unit("harw-dod.target")?);
+    let wants = words(&target.values("Unit", "Wants"));
+    assert!(
+        !wants.iter().any(|w| w == "harw-probe-netlink.service"),
+        "harw-dod.target must not pull in the netlink probe by default: {wants:?}"
+    );
     Ok(())
 }
 

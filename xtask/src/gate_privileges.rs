@@ -6,9 +6,10 @@
 //! unprivilegiertes Binary darf nichts erreichen, das eine erhöhte Fähigkeit
 //! braucht.
 //!
-//! Die vier DoD-Binaries: `harw-sentinel` (unprivilegiert), `harw-probe-fs`
-//! (`CAP_SYS_ADMIN`), `harw-probe-bpf` (`CAP_BPF`), `harw-warden`
-//! (systemd-Socket, kein Netz). Dazu seit R10 Wave 4 ein fünftes,
+//! Die DoD-Binaries: `harw-sentinel` (unprivilegiert), `harw-probe-fs`
+//! (`CAP_SYS_ADMIN`), `harw-probe-bpf` (`CAP_BPF`), seit PL-100 WP1.8
+//! `harw-probe-netlink` (`CAP_AUDIT_READ`) und `harw-warden`
+//! (systemd-Socket, kein Netz). Dazu seit R10 Wave 4 ein
 //! Produkt-Workspace-Binary außerhalb der DoD-Capability-Domäne:
 //! `harw-agent-runner` — siehe Abschnitt „`harw-agent-runner`: unprivilegiert,
 //! aber außerhalb der DoD-Tabelle" weiter unten.
@@ -63,7 +64,7 @@
 //! das Gegenteil zur Regel: [`lookup_privilege`] liefert `None` für jede
 //! nicht eingetragene Crate, und [`evaluate`] behandelt `None` **immer** als
 //! Verstoß, nie als Freigabe. Eine neue Sensor-Crate, die in der Hülle eines
-//! der vier Binaries auftaucht, ohne hier eingetragen zu sein, macht das
+//! der DoD-Binaries auftaucht, ohne hier eingetragen zu sein, macht das
 //! Gate rot — nicht grün. Die Tabelle darf unvollständig sein; sie darf nur
 //! nicht **schweigend** unvollständig sein.
 //!
@@ -89,7 +90,7 @@
 //!   Workspace* eine erhöhte `Capability`?", und `Capability` ist
 //!   ausschließlich internes Vokabular. Externe Crates wie `rustix`,
 //!   `landlock` oder `clap` nehmen an diesem Vokabular nicht teil; sie hier
-//!   pauschal als "unbekannt = Verstoß" zu behandeln, würde jedes der vier
+//!   pauschal als "unbekannt = Verstoß" zu behandeln, würde jedes der
 //!   Binaries allein durch seine Laufzeitbibliotheken rot färben, ohne dass
 //!   das etwas über die *Sensor*-Fähigkeit aussagt, um die es hier geht. Für
 //!   die Lieferketten-Frage ("ist eine externe Crate an sich riskant?")
@@ -126,7 +127,7 @@
 //! des DoD-Workspace sind, in dem `Capability` überhaupt existiert. Deshalb
 //! trägt [`MonitoredBinary`] ein zweites Feld, [`UnlistedCratePolicy`]:
 //! - [`UnlistedCratePolicy::Violation`] (unverändertes Verhalten, für die
-//!   vier DoD-Binaries): eine nicht eingetragene Crate ist ein Verstoß —
+//!   DoD-Binaries): eine nicht eingetragene Crate ist ein Verstoß —
 //!   siehe Abschnitt „Warum eine unbekannte Crate ein Verstoß ist".
 //! - [`UnlistedCratePolicy::DefaultUnprivileged`] (nur `harw-agent-runner`):
 //!   eine nicht eingetragene Crate zählt als [`RequiredPrivilege::Unprivileged`]
@@ -143,9 +144,9 @@
 //! nie die Prüftiefe für die DoD-Capability-Domäne.
 //!
 //! # Fehlendes Binary
-//! Die vier DoD-Binaries liegen unter `harw-dod/crates/`, `harw-agent-runner`
+//! Die DoD-Binaries liegen unter `harw-dod/crates/`, `harw-agent-runner`
 //! an der Repo-Wurzel; seit PL-60 sind alle Members **eines** Workspace,
-//! den [`run`] über [`super::load_all_workspaces`] lädt. Fehlt eines der vier trotzdem im
+//! den [`run`] über [`super::load_all_workspaces`] lädt. Fehlt eines davon trotzdem im
 //! Graphen, ist das ein **Verstoß**, kein Hinweis: ein Binary, das das Gate
 //! nicht sieht, kann es nicht prüfen, und genau dieser Zustand hat das Gate
 //! früher rot-ohne-Befund bzw. mit „Gerüst"-Hinweisen stehen lassen, als nur
@@ -239,7 +240,7 @@ impl RequiredPrivilege {
     }
 }
 
-/// Die deklarierte Berechtigungsklasse eines der vier überwachten Binaries —
+/// Die deklarierte Berechtigungsklasse eines der überwachten Binaries —
 /// die Spalte „Klasse" aus dem Auftrag dieses Knotens.
 ///
 /// # Description
@@ -257,6 +258,10 @@ pub enum BinaryBudget {
     CapSysAdmin,
     /// `harw-probe-bpf`: `CAP_BPF` allein.
     CapBpf,
+    /// `harw-probe-netlink`: `CAP_AUDIT_READ` allein — die Fähigkeit, die
+    /// der lesenden Audit-Multicast-Gruppe (`AUDIT_NLGRP_READLOG`) beitreten
+    /// lässt; weder `CAP_AUDIT_CONTROL` noch `CAP_AUDIT_WRITE`.
+    CapAuditRead,
     /// `harw-warden`: authentifiziert über einen systemd-Socket
     /// (`SO_PEERCRED`), kein Netz, keine der vierzehn Sensor-Fähigkeiten.
     SystemdSocketNoNet,
@@ -286,6 +291,7 @@ impl BinaryBudget {
             Self::Unprivileged => "unprivilegiert",
             Self::CapSysAdmin => "CAP_SYS_ADMIN",
             Self::CapBpf => "CAP_BPF",
+            Self::CapAuditRead => "CAP_AUDIT_READ",
             Self::SystemdSocketNoNet => "systemd-Socket, kein Netz",
         }
     }
@@ -296,12 +302,17 @@ impl BinaryBudget {
     /// Jedes Budget erlaubt [`RequiredPrivilege::Unprivileged`] uneingeschränkt.
     /// `CapSysAdmin` erlaubt zusätzlich [`RequiredPrivilege::FileWatch`] (die
     /// Fähigkeit, für die `harw-probe-fs` existiert); `CapBpf` zusätzlich
-    /// [`RequiredPrivilege::Bpf`]. `SystemdSocketNoNet` erlaubt ausschließlich
-    /// `Unprivileged` — `harw-warden` hält keine der vierzehn
-    /// Sensor-Fähigkeiten, und „kein Netz" schließt insbesondere
-    /// [`RequiredPrivilege::Netlink`] aus. `RequiredPrivilege::Netlink` ist in
-    /// keinem der vier Budgets enthalten: keines der vier Binaries deklariert
-    /// eine Netlink-Fähigkeit als seine eigene.
+    /// [`RequiredPrivilege::Bpf`]; `CapAuditRead` zusätzlich
+    /// [`RequiredPrivilege::Netlink`] (die Fähigkeit, für die
+    /// `harw-probe-netlink` existiert: die Socket-Crate `harw-dod-netlink`,
+    /// deren `socket::NetlinkAuditSource::open` an `AUDIT_NLGRP_READLOG`
+    /// bindet, und `harw-dod-authlog` mit `Capability::ReadAuditNetlink`).
+    /// `SystemdSocketNoNet` erlaubt ausschließlich `Unprivileged` —
+    /// `harw-warden` hält keine der vierzehn Sensor-Fähigkeiten, und „kein
+    /// Netz" schließt insbesondere [`RequiredPrivilege::Netlink`] aus.
+    /// `RequiredPrivilege::Netlink` liegt in genau einem Budget,
+    /// `CapAuditRead`; kein anderes Binary deklariert eine Netlink-Fähigkeit
+    /// als seine eigene.
     ///
     /// # Arguments
     /// - `required` (`RequiredPrivilege`): die Fähigkeit, die eine erreichte
@@ -317,6 +328,7 @@ impl BinaryBudget {
     /// ```text
     /// BinaryBudget::CapSysAdmin.allows(RequiredPrivilege::FileWatch) == true
     /// BinaryBudget::CapSysAdmin.allows(RequiredPrivilege::Bpf) == false
+    /// BinaryBudget::CapAuditRead.allows(RequiredPrivilege::Netlink) == true
     /// ```
     #[must_use]
     pub const fn allows(&self, required: RequiredPrivilege) -> bool {
@@ -332,6 +344,10 @@ impl BinaryBudget {
                 required,
                 RequiredPrivilege::Unprivileged | RequiredPrivilege::Bpf
             ),
+            Self::CapAuditRead => matches!(
+                required,
+                RequiredPrivilege::Unprivileged | RequiredPrivilege::Netlink
+            ),
         }
     }
 }
@@ -342,7 +358,7 @@ impl BinaryBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnlistedCratePolicy {
     /// Unverändertes Verhalten: eine fehlende Zeile ist immer ein Verstoß,
-    /// nie eine stille Freigabe. Gilt für die vier DoD-Binaries.
+    /// nie eine stille Freigabe. Gilt für die DoD-Binaries.
     Violation,
     /// Nur für Binaries außerhalb der DoD-Capability-Domäne, deren Hülle
     /// strukturell keine `harw-dod-*`-Crate erreichen kann: eine fehlende
@@ -369,8 +385,9 @@ pub struct MonitoredBinary {
     pub unlisted_policy: UnlistedCratePolicy,
 }
 
-/// Die Binaries dieses Knotens samt ihrer Klasse aus dem Auftrag: die vier
-/// DoD-Binaries plus, seit R10 Wave 4, `harw-agent-runner` und, seit R11,
+/// Die Binaries dieses Knotens samt ihrer Klasse aus dem Auftrag: die
+/// DoD-Binaries (seit PL-100 WP1.8 einschließlich `harw-probe-netlink`)
+/// plus, seit R10 Wave 4, `harw-agent-runner` und, seit R11,
 /// `harw-job-exec`.
 pub const MONITORED_BINARIES: &[MonitoredBinary] = &[
     MonitoredBinary {
@@ -386,6 +403,15 @@ pub const MONITORED_BINARIES: &[MonitoredBinary] = &[
     MonitoredBinary {
         name: "harw-probe-bpf",
         budget: BinaryBudget::CapBpf,
+        unlisted_policy: UnlistedCratePolicy::Violation,
+    },
+    // PL-100 WP1.8 (O11): Audit-Netlink-Sonde, push-only zum Sentinel wie
+    // `harw-probe-bpf`. Hülle: `harw-dod-netlink` (Socket-Crate) und
+    // `harw-dod-authlog` (beide Netlink) plus Vokabular — keine BPF- oder
+    // FileWatch-Crate.
+    MonitoredBinary {
+        name: "harw-probe-netlink",
+        budget: BinaryBudget::CapAuditRead,
         unlisted_policy: UnlistedCratePolicy::Violation,
     },
     MonitoredBinary {
@@ -432,6 +458,11 @@ pub const CRATE_PRIVILEGE: &[(&str, RequiredPrivilege)] = &[
     ("harw-dod-listener", RequiredPrivilege::Unprivileged),
     ("harw-dod-scanreport", RequiredPrivilege::Unprivileged),
     ("harw-dod-workspace", RequiredPrivilege::Unprivileged),
+    // PL-100 WP1.8 (O11): Offline-RustSec-Sensor; bindet
+    // `Capability::ReadWorkspaceGraph` (Klasse Unprivileged,
+    // `harw-dod-cap/src/capability.rs`) und liest nur Lockfiles und einen
+    // lokalen advisory-db-Checkout im übergebenen `ReadScope`.
+    ("harw-dod-advisory", RequiredPrivilege::Unprivileged),
     // --- Zugriffs-/Vokabularschichten (keine eigene Capability) ---
     ("harw-dod-cap", RequiredPrivilege::Unprivileged),
     // Reine Vokabularschicht (Netzbereiche, Egress-Ziele) ohne eigene
@@ -442,12 +473,6 @@ pub const CRATE_PRIVILEGE: &[(&str, RequiredPrivilege)] = &[
     ("harw-dod-signals", RequiredPrivilege::Unprivileged),
     ("harw-dod-readfs", RequiredPrivilege::Unprivileged),
     ("harw-dod-sentinel", RequiredPrivilege::Unprivileged),
-    // Keine eigene `Capability::`-Deklaration im Quelltext gefunden (Stand
-    // dieses Knotens); als Zugriffs-/Protokollschicht ohne eigenen
-    // Sensor-Handle vorläufig unprivilegiert eingestuft. Niedrigere
-    // Sicherheit als die obigen Zeilen — siehe Abschlussbericht dieses
-    // Knotens.
-    ("harw-dod-netlink", RequiredPrivilege::Unprivileged),
     ("harw-dod-netpolicy", RequiredPrivilege::Unprivileged),
     ("harw-dod-warden", RequiredPrivilege::Unprivileged),
     ("harw-dod-warden-proto", RequiredPrivilege::Unprivileged),
@@ -517,6 +542,15 @@ pub const CRATE_PRIVILEGE: &[(&str, RequiredPrivilege)] = &[
     // höhere Fähigkeit anfordern, und genau das prüft dieses Gate ("was sie
     // anfordern könnte", nicht was sie im Standardfall tut).
     ("harw-dod-authlog", RequiredPrivilege::Netlink),
+    // Die Socket-Crate selbst: `socket::NetlinkAuditSource::open` bindet
+    // einen `AUDIT`-Netlink-Socket an `AUDIT_NLGRP_READLOG` und braucht dafür
+    // `CAP_AUDIT_READ` (`harw-dod-netlink/src/socket.rs`). Wie
+    // `harw-dod-bpf` für `harw-probe-bpf` trägt die Crate mit der
+    // privilegierten Operation die Klasse — nicht nur ihr Abbildungs-Nutzer
+    // `harw-dod-authlog`. Vor PL-100 WP1.8 vorläufig unprivilegiert
+    // eingestuft; damit hätte ein unprivilegiertes Binary den Audit-Socket
+    // öffnen können, ohne dass das Gate es bemerkt.
+    ("harw-dod-netlink", RequiredPrivilege::Netlink),
     // --- FileWatch (Capability::class() == FileWatch) ---
     ("harw-dod-fsmon", RequiredPrivilege::FileWatch),
     // --- Bpf (Capability::class() == Bpf) ---
@@ -598,7 +632,7 @@ pub fn missing_binaries(graph: &WorkspaceGraph) -> Vec<&'static str> {
 /// der Ergebnisliste, wohl aber als erstes Glied jeder Kette.
 ///
 /// # Arguments
-/// - `binary` (`&str`): Name des Wurzel-Crates (eines der vier Binaries).
+/// - `binary` (`&str`): Name des Wurzel-Crates (eines der überwachten Binaries).
 /// - `by_name` (`&HashMap<&str, &CrateNode>`): alle Crates des Graphen,
 ///   indiziert nach Name, für O(1)-Nachschlagen während der Suche.
 ///
@@ -805,7 +839,7 @@ mod tests {
     /// Graph aus `crates`, ergänzt um jedes nicht genannte Binary aus
     /// [`MONITORED_BINARIES`] als Knoten ohne Abhängigkeiten. Ein fehlendes
     /// Binary ist ein Verstoß; die Tests, die eine einzelne Kante prüfen,
-    /// brauchen deshalb alle vier im Graphen.
+    /// brauchen deshalb alle im Graphen.
     fn graph(mut crates: Vec<CrateNode>) -> WorkspaceGraph {
         for spec in MONITORED_BINARIES {
             if !crates.iter().any(|c| c.name == spec.name) {
@@ -872,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_missing_binary_is_a_violation_and_not_counted() {
-        // Nur harw-sentinel ist im Graphen; die anderen vier Binaries fehlen
+        // Nur harw-sentinel ist im Graphen; alle anderen Binaries fehlen
         // vollständig — genau der Zustand, als die Gates nur `.` luden.
         let g = bare_graph(vec![
             node("harw-sentinel", &["harw-dod-cpu"]),
@@ -894,12 +928,13 @@ mod tests {
             vec![
                 "harw-probe-fs",
                 "harw-probe-bpf",
+                "harw-probe-netlink",
                 "harw-warden",
                 "harw-agent-runner",
                 "harw-job-exec"
             ]
         );
-        assert_eq!(report.violations.len(), 5, "{:?}", report.violations);
+        assert_eq!(report.violations.len(), 6, "{:?}", report.violations);
         assert!(
             report
                 .violations
@@ -1158,6 +1193,7 @@ mod tests {
         assert_eq!(BinaryBudget::Unprivileged.label(), "unprivilegiert");
         assert_eq!(BinaryBudget::CapSysAdmin.label(), "CAP_SYS_ADMIN");
         assert_eq!(BinaryBudget::CapBpf.label(), "CAP_BPF");
+        assert_eq!(BinaryBudget::CapAuditRead.label(), "CAP_AUDIT_READ");
         assert_eq!(
             BinaryBudget::SystemdSocketNoNet.label(),
             "systemd-Socket, kein Netz"
@@ -1170,14 +1206,18 @@ mod tests {
             BinaryBudget::Unprivileged,
             BinaryBudget::CapSysAdmin,
             BinaryBudget::CapBpf,
+            BinaryBudget::CapAuditRead,
             BinaryBudget::SystemdSocketNoNet,
         ] {
             assert!(budget.allows(RequiredPrivilege::Unprivileged));
         }
     }
 
+    /// Netlink liegt nur im Budget der Audit-Netlink-Sonde; jedes andere
+    /// Budget lehnt es weiterhin ab.
     #[test]
-    fn test_binary_budget_no_budget_allows_netlink() {
+    fn test_binary_budget_only_cap_audit_read_allows_netlink() {
+        assert!(BinaryBudget::CapAuditRead.allows(RequiredPrivilege::Netlink));
         for budget in [
             BinaryBudget::Unprivileged,
             BinaryBudget::CapSysAdmin,
@@ -1186,5 +1226,181 @@ mod tests {
         ] {
             assert!(!budget.allows(RequiredPrivilege::Netlink));
         }
+    }
+
+    /// `CAP_AUDIT_READ` ist genau Netlink: weder BPF noch fanotify.
+    #[test]
+    fn test_binary_budget_cap_audit_read_allows_only_unprivileged_and_netlink() {
+        let budget = BinaryBudget::CapAuditRead;
+        assert!(budget.allows(RequiredPrivilege::Unprivileged));
+        assert!(budget.allows(RequiredPrivilege::Netlink));
+        assert!(!budget.allows(RequiredPrivilege::Bpf));
+        assert!(!budget.allows(RequiredPrivilege::FileWatch));
+    }
+
+    /// PL-100 WP1.8: die Audit-Netlink-Sonde wird überwacht, mit genau
+    /// `CAP_AUDIT_READ` und ohne stilles Durchwinken unbekannter Crates.
+    #[test]
+    fn test_monitored_binaries_list_the_netlink_probe_with_cap_audit_read() {
+        assert!(
+            MONITORED_BINARIES.iter().any(|spec| {
+                spec.name == "harw-probe-netlink"
+                    && spec.budget == BinaryBudget::CapAuditRead
+                    && spec.unlisted_policy == UnlistedCratePolicy::Violation
+            }),
+            "harw-probe-netlink fehlt oder trägt das falsche Budget"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_cap_audit_read_allows_authlog_is_green() {
+        // Die reale Form der Sonde: Netlink-Zugriff, Authlog-Abbildung,
+        // Vokabular.
+        let g = graph(vec![
+            node(
+                "harw-probe-netlink",
+                &[
+                    "harw-dod-netlink",
+                    "harw-dod-authlog",
+                    "harw-dod-cap",
+                    "harw-dod-signals",
+                    "harw-types",
+                    "harw-completions",
+                ],
+            ),
+            node("harw-dod-netlink", &["harw-dod-cap", "harw-macros"]),
+            node(
+                "harw-dod-authlog",
+                &["harw-dod-netlink", "harw-dod-cap", "harw-dod-signals"],
+            ),
+            node("harw-dod-cap", &["harw-authority", "harw-types"]),
+            node("harw-dod-signals", &["harw-observe", "harw-types"]),
+            node("harw-authority", &["harw-types"]),
+            node("harw-observe", &["harw-macros"]),
+            node("harw-types", &["harw-digest"]),
+            node("harw-completions", &["harw-macros"]),
+            node("harw-digest", &[]),
+            node("harw-macros", &[]),
+        ]);
+
+        let report = evaluate(&g);
+
+        assert!(report.is_green(), "{:?}", report.violations);
+        assert_eq!(report.checked, MONITORED_BINARIES.len());
+    }
+
+    #[test]
+    fn test_evaluate_cap_audit_read_reaching_bpf_or_filewatch_is_a_violation() {
+        let g = graph(vec![
+            node("harw-probe-netlink", &["harw-dod-bpf", "harw-dod-fsmon"]),
+            node("harw-dod-bpf", &[]),
+            node("harw-dod-fsmon", &[]),
+        ]);
+
+        let report = evaluate(&g);
+
+        assert!(!report.is_green());
+        for capability in ["CAP_BPF", "CAP_SYS_ADMIN"] {
+            assert!(
+                report.violations.iter().any(|v| {
+                    v.contains("harw-probe-netlink (CAP_AUDIT_READ)") && v.contains(capability)
+                }),
+                "{capability}: {:?}",
+                report.violations
+            );
+        }
+    }
+
+    /// Die Socket-Crate trägt die Klasse selbst (wie `harw-dod-bpf`), nicht
+    /// erst ihr Abbildungs-Nutzer `harw-dod-authlog`.
+    #[test]
+    fn test_lookup_privilege_classifies_the_netlink_socket_crate_as_netlink() {
+        assert_eq!(
+            lookup_privilege("harw-dod-netlink"),
+            Some(RequiredPrivilege::Netlink)
+        );
+        assert_eq!(
+            lookup_privilege("harw-dod-authlog"),
+            Some(RequiredPrivilege::Netlink)
+        );
+    }
+
+    /// Ein unprivilegiertes Binary, das direkt auf die Socket-Crate zeigt,
+    /// könnte den Audit-Socket öffnen — Verstoß, auch ohne `harw-dod-authlog`.
+    #[test]
+    fn test_evaluate_sentinel_reaching_netlink_socket_crate_is_a_violation() {
+        let g = graph(vec![
+            node("harw-sentinel", &["harw-dod-netlink"]),
+            node("harw-dod-netlink", &[]),
+        ]);
+
+        let report = evaluate(&g);
+
+        assert!(!report.is_green());
+        assert!(
+            report.violations.iter().any(|v| {
+                v.contains("harw-sentinel (unprivilegiert)")
+                    && v.contains("harw-dod-netlink (CAP_AUDIT_READ)")
+            }),
+            "{:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_evaluate_systemd_socket_reaching_netlink_socket_crate_is_a_violation() {
+        let g = graph(vec![
+            node("harw-warden", &["harw-dod-netlink"]),
+            node("harw-dod-netlink", &[]),
+        ]);
+
+        let report = evaluate(&g);
+
+        assert!(!report.is_green());
+        assert!(
+            report.violations.iter().any(|v| {
+                v.contains("harw-warden (systemd-Socket, kein Netz)")
+                    && v.contains("harw-dod-netlink (CAP_AUDIT_READ)")
+            }),
+            "{:?}",
+            report.violations
+        );
+    }
+
+    /// Die Sonde braucht `harw-dod-authlog` nicht, um im Budget zu liegen:
+    /// schon die Socket-Crate allein ist genau `CAP_AUDIT_READ`.
+    #[test]
+    fn test_evaluate_cap_audit_read_allows_netlink_socket_crate_alone() {
+        let g = graph(vec![
+            node("harw-probe-netlink", &["harw-dod-netlink"]),
+            node("harw-dod-netlink", &["harw-dod-cap"]),
+            node("harw-dod-cap", &[]),
+        ]);
+
+        let report = evaluate(&g);
+
+        assert!(report.is_green(), "{:?}", report.violations);
+        assert_eq!(report.checked, MONITORED_BINARIES.len());
+    }
+
+    #[test]
+    fn test_lookup_privilege_classifies_advisory_as_unprivileged_sensor() {
+        assert_eq!(
+            lookup_privilege("harw-dod-advisory"),
+            Some(RequiredPrivilege::Unprivileged)
+        );
+        // Wie die übrigen unprivilegierten Sensoren: im Sentinel zulässig.
+        let g = graph(vec![
+            node("harw-sentinel", &["harw-dod-advisory"]),
+            node(
+                "harw-dod-advisory",
+                &["harw-dod-cap", "harw-dod-readfs", "harw-untrusted-text"],
+            ),
+            node("harw-dod-cap", &[]),
+            node("harw-dod-readfs", &[]),
+            node("harw-untrusted-text", &[]),
+        ]);
+        let report = evaluate(&g);
+        assert!(report.is_green(), "{:?}", report.violations);
     }
 }
