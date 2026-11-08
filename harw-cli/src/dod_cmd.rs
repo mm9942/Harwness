@@ -2613,7 +2613,10 @@ egress_allow_cidrs = []
 
         // Triage with allowed networks passes.
         assert_eq!(
-            levels(&egress_allowlist_checks(DodWatchMode::Triage, &with_cidrs(2))),
+            levels(&egress_allowlist_checks(
+                DodWatchMode::Triage,
+                &with_cidrs(2)
+            )),
             [("egress-allowlist".to_owned(), CheckLevel::Ok)]
         );
 

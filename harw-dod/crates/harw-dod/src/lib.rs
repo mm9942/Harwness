@@ -59,7 +59,8 @@
 //!   verlangt.
 //! - **Datenvokabular** ([`harw_dod_signals`]): [`Sensor`] (der eine Trait,
 //!   den jeder Sensor implementiert), [`SensorReading`], [`SecurityEvent`],
-//!   [`EventKind`], [`Actor`], [`AuthOutcome`], [`DriftSeverity`],
+//!   [`EventKind`], [`Actor`], [`ProcessContext`] (Feldtyp von
+//!   `Actor::process`, PL-100 WP0.15), [`AuthOutcome`], [`DriftSeverity`],
 //!   [`HostSample`], [`Severity`], [`Hardness`], [`SecurityEvidence`] —
 //!   Rückgabe- bzw. Feldtypen von [`Sensor::poll`]/[`Sensor::handle`] und
 //!   von [`RuleContext`] unten.
@@ -384,8 +385,8 @@ pub use harw_dod_cap::{
 
 // --- harw-dod-signals: Datenvokabular (siehe Begründung oben) ---
 pub use harw_dod_signals::{
-    Actor, AuthOutcome, DriftSeverity, EventKind, Hardness, HostSample, SecurityEvent,
-    SecurityEvidence, Sensor, SensorReading, Severity,
+    Actor, AuthOutcome, DriftSeverity, EventKind, Hardness, HostSample, ProcessContext,
+    SecurityEvent, SecurityEvidence, Sensor, SensorReading, Severity,
 };
 
 // --- harw-dod-sentinel: der Aggregator (siehe Begründung oben) ---

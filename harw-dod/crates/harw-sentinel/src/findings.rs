@@ -96,7 +96,8 @@
 //! bereits Sensor-Zähler schreibt, ergänzt um eine inhaltsarme
 //! `tracing`-Meldung je gemeldetem Befund (PL-100 WP0.6: nur Kennungen,
 //! Schwere, Härte und Dedup-Schlüssel auf `warn`). Der Findings-Export und
-//! der Spool (siehe unten) sind die einzigen weiteren Ausgabewege.
+//! der Spool (siehe oben, „Spool-Record und Export v3") sind die einzigen
+//! weiteren Ausgabewege.
 //!
 //! # Was zwischen einem Befund und einer durchgesetzten Aktion weiterhin fehlt
 //! **Das ist Bruch 2, ausdrücklich benannt, nicht gebaut:** ein
