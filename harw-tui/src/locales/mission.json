@@ -275,6 +275,30 @@
     "vi": "đã tạm dừng (chưa giải quyết)",
     "hi": "निलंबित (अनसुलझा)"
   },
+  "mission.suspension_unresolved_short": {
+    "en": "⏸?",
+    "de": "⏸?",
+    "es": "⏸?",
+    "fr": "⏸?",
+    "pt": "⏸?",
+    "ja": "⏸?",
+    "zh-CN": "⏸?",
+    "ko": "⏸?",
+    "vi": "⏸?",
+    "hi": "⏸?"
+  },
+  "mission.suspension_unresolved_hint": {
+    "en": "job.resume refuses. Resolve by hand: job.stop (kills without thawing), or re-issue job.suspend only while the cgroup is not frozen.",
+    "de": "job.resume lehnt ab. Von Hand klären: job.stop (beendet ohne Auftauen) oder job.suspend erneut senden, nur solange die cgroup nicht eingefroren ist.",
+    "es": "job.resume se rechaza. Resuélvalo a mano: job.stop (termina sin descongelar) o vuelva a enviar job.suspend solo mientras el cgroup no esté congelado.",
+    "fr": "job.resume refuse. Résolvez à la main : job.stop (termine sans dégeler) ou renvoyez job.suspend, uniquement tant que le cgroup n’est pas gelé.",
+    "pt": "job.resume é recusado. Resolva manualmente: job.stop (encerra sem descongelar) ou reenvie job.suspend somente enquanto o cgroup não estiver congelado.",
+    "ja": "job.resume は拒否されます。手動で解決してください: job.stop（解凍せずに終了）、または cgroup が凍結されていない間に限り job.suspend を再送信します。",
+    "zh-CN": "job.resume 会被拒绝。请手动处理：job.stop（不解冻直接结束），或仅在 cgroup 未冻结时重新发出 job.suspend。",
+    "ko": "job.resume은 거부됩니다. 직접 해결하세요: job.stop(해동 없이 종료) 또는 cgroup이 동결되지 않은 동안에만 job.suspend 재전송.",
+    "vi": "job.resume bị từ chối. Hãy xử lý thủ công: job.stop (kết thúc mà không rã đông) hoặc gửi lại job.suspend chỉ khi cgroup chưa bị đóng băng.",
+    "hi": "job.resume अस्वीकार होता है। हाथ से सुलझाएँ: job.stop (बिना अनफ़्रीज़ किए समाप्त करता है) या job.suspend दोबारा भेजें, केवल तब जब cgroup फ़्रीज़ न हो।"
+  },
   "mission.succeeded": {
     "en": "succeeded",
     "de": "erfolgreich",
@@ -634,6 +658,18 @@
     "ko": " 작업 · {p0} · {p1} · {p2} · Esc 뒤로 ",
     "vi": " Công việc · {p0} · {p1} · {p2} · Esc quay lại ",
     "hi": " जॉब · {p0} · {p1} · {p2} · Esc वापस "
+  },
+  "mission.detail_state": {
+    "en": "State: {p0}",
+    "de": "Zustand: {p0}",
+    "es": "Estado: {p0}",
+    "fr": "État : {p0}",
+    "pt": "Estado: {p0}",
+    "ja": "状態: {p0}",
+    "zh-CN": "状态：{p0}",
+    "ko": "상태: {p0}",
+    "vi": "Trạng thái: {p0}",
+    "hi": "स्थिति: {p0}"
   },
   "mission.progress": {
     "en": "{p0} · Progress: {p1}",

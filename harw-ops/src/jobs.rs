@@ -362,7 +362,8 @@ fn list_text(manager: &JobManager) -> String {
 /// ([`JobMeta::is_suspension_unresolved`], PL-100 WP 3.5): harw kann nicht
 /// belegen, dass ein Freeze der cgroup sein eigener ist.
 const UNRESOLVED_SUSPENSION: &str = "Anhalten ungeklärt: nur die Absicht ist vermerkt; \
-     job.resume lehnt ab, job.stop beendet ohne Auftauen";
+     job.resume lehnt ab. Von Hand klären: job.stop (beendet ohne Auftauen) oder \
+     job.suspend erneut senden, nur solange die cgroup nicht eingefroren ist";
 
 fn show_text(status: &JobStatus) -> String {
     let meta = &status.meta;
