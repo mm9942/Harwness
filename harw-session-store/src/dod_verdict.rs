@@ -22,8 +22,10 @@
 //! `<state_dir>/dod/verdicts/` (Verzeichnis `0700`), darin:
 //! - `verdicts-<erste seq, 20 Stellen>.jsonl`: Segmente, je Zeile ein
 //!   [`VerdictRecord`] als JSON, Dateirechte `0600`;
-//! - `anchor.json` (`0600`): der Anker der Kette nach einer Retention;
-//! - `.lock` (`0600`): die `fs4`-Sperre für Schreiber.
+//! - `anchor.json` (`0600`): der Anker der Kette nach einer Retention
+//!   (geschrieben über die Tempdatei `anchor.json.tmp`);
+//! - `.lock` (`0600`): die `fs4`-Sperre für Schreiber. Sie gilt nur, solange
+//!   der Name auf die gesperrte Inode zeigt (siehe „Nebenläufigkeit“).
 //!
 //! Ein neues Segment beginnt, sobald das aktive Segment mit dem nächsten
 //! Datensatz [`VERDICT_SEGMENT_BYTES`] (4 MiB) überschreiten würde **oder**
@@ -32,6 +34,35 @@
 //! auf etwa einen Tag; so löscht die Retention auch auf Hosts mit wenigen
 //! Verdicts (die die 4 MiB nie erreichen) im 90-Tage-Takt statt nie. Eine
 //! Zeile ist höchstens [`MAX_VERDICT_RECORD_BYTES`] (8 KiB) lang.
+//!
+//! # Verzeichnisgrenze (Symlinks)
+//! `state_dir` gibt der Aufrufer vor; es gilt als vertraut und darf selbst
+//! ein Symlink sein (etwa `~/.harw` → `/data/harw`). Darunter öffnet jeder
+//! öffentliche Aufruf den Store **Glied für Glied**, jeweils relativ zum
+//! Deskriptor des Elternverzeichnisses: `dod` unter `state_dir`, `verdicts`
+//! unter `dod`, beide mit `O_DIRECTORY | O_NOFOLLOW`
+//! (`harw_fsutil::open_dir_at`; ein FIFO oder Gerät an ihrer Stelle wird gar
+//! nicht erst geöffnet). `state_dir` selbst wird als `<state_dir>/.` geöffnet,
+//! damit auch dort nur ein Verzeichnis in Frage kommt. Fehlt
+//! ein Glied, legt nur [`VerdictStore::append`] es per `mkdirat` an; ein
+//! vorhandener Eintrag, auch ein Symlink, wird dabei nie verfolgt, und am
+//! Ziel eines Symlinks entsteht nichts. Jedes Glied muss ein Verzeichnis
+//! sein, der effektiven uid gehören und darf weder für die Gruppe noch für
+//! Andere beschreibbar sein, sonst [`VerdictStoreError::UnsafeDirectory`];
+//! ein zu offenes Verzeichnis wird nicht stillschweigend repariert (nur das
+//! Lese-/Durchsuchrecht von `verdicts` nimmt ein Schreiber per `fchmod` auf
+//! `0700` zurück).
+//!
+//! Danach geschieht **alles** relativ zum Deskriptor von `verdicts`: Sperre,
+//! Anker (lesen; schreiben über eine Tempdatei und `renameat`), Segmente
+//! (öffnen, anlegen, anhängen, abschneiden), Auflisten (`readdir` auf einer
+//! Kopie des Deskriptors, Typen per `fstatat` ohne Symlink-Folge), Löschen
+//! in der Retention (`unlinkat`) und der Verzeichnis-`fsync`. Der Pfad
+//! [`VerdictStore::root`] wird dafür nie wieder aufgelöst. Wird das geprüfte
+//! Verzeichnis während eines Aufrufs umbenannt und durch einen Symlink oder
+//! ein anderes Verzeichnis ersetzt, sperrt, schreibt und löscht der Aufruf
+//! weiter im ursprünglichen Verzeichnis; der nächste Aufruf steigt neu ab
+//! und verweigert einen Symlink.
 //!
 //! # Kette
 //! Jeder Datensatz trägt `seq` (lückenlos, ab [`FIRST_VERDICT_SEQ`]),
@@ -42,6 +73,59 @@
 //! [`VerdictStore::verify_chain`] rechnet jede Verknüpfung und jeden Hash nach
 //! und erkennt so jede Änderung, Löschung oder Umordnung, die nicht den
 //! gesamten Rest der Kette neu schreibt.
+//!
+//! Angehängt wird nur hinter eine Kette, die **als Ganzes** stimmt:
+//! [`VerdictStore::append`] prüft unter der Schreibsperre die gesamte
+//! lebende Kette vorwärts (Anker → jedes Segment → letzter Datensatz) mit
+//! derselben Logik wie [`VerdictStore::verify_chain`] und leitet `seq` und
+//! `prev_hash` des neuen Datensatzes ausschließlich aus dieser Prüfung ab.
+//! Eine Verletzung an beliebiger Stelle (auch weit vor dem Ende, etwa ein neu
+//! versiegelter Datensatz in einem älteren Segment, dessen Nachfolger dann
+//! nicht mehr verknüpft) liefert denselben Fehler wie `verify_chain`; kein
+//! Segment wird dann geändert, nichts angehängt. Die Prüfung läuft, bevor
+//! irgendein Segment angefasst wird (kein `fchmod`, kein Abschneiden).
+//!
+//! Kosten: jedes Anhängen liest und hasht alle lebenden Segmente, also
+//! O(Größe der lebenden Kette), dasselbe, was jeder Leser ohnehin bezahlt.
+//! Die Größe begrenzt die Retention auf etwa 91 Tage plus höchstens ein
+//! Segment (Rotation täglich bzw. bei 4 MiB), und zwar ohne eigenen Aufruf:
+//! [`VerdictStore::append`] lässt sie bei jedem neuen Segment selbst
+//! mitlaufen (siehe „Retention“). Wie groß die Kette werden darf, bevor
+//! gleichzeitige Schreiber an der Sperre scheitern, steht unter
+//! „Nebenläufigkeit“. Ein zwischengespeichertes,
+//! „schon geprüftes“ Ende gibt es bewusst nicht: es müsste bei jeder
+//! Änderung irgendeines Segments verworfen werden, und jeder Fehler in dieser
+//! Invalidierung öffnete genau die Lücke, die die Vorwärtsprüfung schließt.
+//!
+//! # Wiederherstellung nach einem Kettenbruch
+//! Eine Verletzung der Kette ([`VerdictStoreError::ChainBroken`],
+//! [`VerdictStoreError::CorruptRecord`], [`VerdictStoreError::SegmentTooLarge`],
+//! [`VerdictStoreError::AnchorCorrupt`]) heilt nicht von selbst: Leser
+//! verweigern den Stand, [`VerdictStore::append`] verweigert jedes weitere
+//! Verdict, und die Retention endet vor dem betroffenen Segment, entfernt es
+//! also nie. Das ist Absicht (ein Bruch ist von einer Manipulation nicht zu
+//! unterscheiden und bleibt sichtbar), heißt aber: bis jemand eingreift,
+//! speichert der Host keine Verdicts mehr (`harw-core-bridge` gibt den
+//! Fehler von `persist` an den Aufrufer weiter). Ursachen sind Manipulation,
+//! ein Werkzeug, das Dateien im Store entfernt (siehe „Retention“), oder
+//! selten ein Absturz, nach dem eine nie quittierte letzte Zeile zwar mit
+//! `\n` endet, aber nicht lesbar ist (ungeordnetes Zurückschreiben von
+//! Seiten).
+//!
+//! Wiederherstellen, ohne Beweise zu verlieren:
+//! 1. Schreiber anhalten (oder hinnehmen, dass ihre Verdicts in dieser Zeit
+//!    scheitern).
+//! 2. `<state_dir>/dod/verdicts` als Ganzes beiseitelegen, etwa in
+//!    `<state_dir>/dod/verdicts.broken-<Datum>` umbenennen, nicht löschen:
+//!    dort lässt sich die Stelle des Bruchs (Segment und `seq` aus dem
+//!    Fehler) später untersuchen.
+//! 3. Das nächste [`VerdictStore::append`] legt `verdicts/` neu an und
+//!    beginnt eine neue Kette ab Genesis (`seq` [`FIRST_VERDICT_SEQ`]).
+//!
+//! Ein [`VerdictRef::verdict_digest`] aus der alten Kette lässt sich danach
+//! nur noch gegen die beiseitegelegte Kopie prüfen. Der Store selbst legt nie
+//! etwas beiseite: das ist eine Operator-Entscheidung, kein automatischer
+//! Weg, Beweise zu verwerfen.
 //!
 //! # Retention
 //! [`VerdictStore::apply_retention`] löscht nur **ganze** Segmente vom Anfang
@@ -63,14 +147,52 @@
 //! gelten als „ausgemustert“, werden beim Prüfen übersprungen und vom
 //! nächsten Lauf entfernt.
 //!
+//! **Automatisch beim Anhängen:** beginnt [`VerdictStore::append`] ein neues
+//! Segment (Rotation nach Größe oder Zeitspanne, oder das erste Segment eines
+//! leeren bzw. verankerten Stores), läuft nach dem quittierten Schreiben unter
+//! derselben Sperre dieselbe Retention, mit `created_at` des neuen Datensatzes
+//! als Jetzt-Zeit und auf der Prüfung, die das Anhängen ohnehin gemacht hat
+//! (kein zweiter Durchlauf). In Frage kommen nur Segmente **vor dem bisher
+//! aktiven** (dem, das den bisher letzten Datensatz hält), nie dieses und nie
+//! das gerade beschriebene; das bisher aktive Segment geht erst beim nächsten
+//! Segmentwechsel oder in einem expliziten Lauf. Grund: die Jetzt-Zeit stammt
+//! hier vom Aufrufer, und ein einzelnes Verdict mit weit vorgestellter Uhr
+//! (RTC-Fehler, NTP-Sprung) soll nicht den gesamten bisherigen Stand löschen;
+//! es entfernt höchstens die Segmente vor dem jüngsten. Weil Segmente
+//! höchstens etwa einen Tag umfassen, bleibt die lebende Kette so auf etwa 91
+//! Tage plus dieses eine Segment begrenzt, solange angehängt wird, auch wenn
+//! niemand [`VerdictStore::apply_retention`] aufruft. Scheitert diese
+//! Retention, bleibt der Datensatz quittiert; der Fehler erscheint
+//! inhaltsfrei auf `warn`, und der nächste Segmentwechsel (oder ein
+//! expliziter Lauf) holt sie nach. [`VerdictStore::apply_retention`] bleibt
+//! für explizite Läufe, etwa auf einem Host, der nicht mehr anhängt; sie
+//! kennt keine solche Grenze.
+//!
+//! Nur diese API darf Segmente, den Anker oder `.lock` entfernen. Ein
+//! Werkzeug, das das Verzeichnis dateiweise nach Alter oder Größe ausdünnt
+//! (etwa ein generischer Retention-Sweep), löscht Segmente ohne neuen Anker
+//! oder `anchor.json` selbst; das ist von einer Manipulation nicht zu
+//! unterscheiden, und danach verweigern [`VerdictStore::verify_chain`] und
+//! [`VerdictStore::append`] die Kette dauerhaft (siehe „Wiederherstellung nach
+//! einem Kettenbruch“). Entfernt es `.lock` (deren mtime sich nie ändert),
+//! können zwei Schreiber verschiedene Inodes sperren; davor schützt der Store
+//! sich nur teilweise (siehe „Nebenläufigkeit“). Solche Werkzeuge müssen
+//! `dod/verdicts` auslassen oder [`VerdictStore::apply_retention`] aufrufen.
+//!
 //! # Dauerhaftigkeit
 //! Ein Anhängen schreibt die vollständige Zeile mit einem `write_all` auf
-//! einen `O_APPEND`-Deskriptor und ruft danach `sync_data`; ein neu
-//! angelegtes oder ein leer wiederverwendetes Segment bekommt zusätzlich
-//! einen `fsync` des Verzeichnisses, bevor das Anhängen quittiert wird. Legt
-//! der Store `dod/`, `dod/verdicts/` (oder fehlende Glieder darüber) neu an,
-//! synchronisiert er das Elternverzeichnis jedes neuen Glieds, bevor er
-//! schreibt. Eine durch einen Absturz abgerissene letzte Zeile wurde nie
+//! einen `O_APPEND`-Deskriptor und ruft danach `sync_data`; jedes vor dem
+//! Schreiben leere Ziel-Segment (neu angelegt, oder ein leerer Rest eines
+//! gescheiterten Anhängens, fortgesetzt oder als Rotationsziel
+//! wiederverwendet) bekommt zusätzlich einen `fsync` des Verzeichnisses,
+//! bevor das Anhängen quittiert wird. Legt der Store fehlende Glieder von
+//! `state_dir` oder `dod/`, `dod/verdicts/`
+//! neu an, synchronisiert er das Elternverzeichnis jedes neuen Glieds (für
+//! `dod` und `verdicts` über den Deskriptor des Elternverzeichnisses), bevor
+//! er schreibt. Den Anker schreibt
+//! die Retention vollständig in `anchor.json.tmp` (`write_all`, `fsync`),
+//! benennt ihn per `renameat` um und synchronisiert danach das Verzeichnis.
+//! Eine durch einen Absturz abgerissene letzte Zeile wurde nie
 //! quittiert: Leser überspringen sie, und das nächste Anhängen schneidet sie
 //! unter der Sperre ab.
 //!
@@ -79,23 +201,59 @@
 //! ([`VerdictStore::append`], [`VerdictStore::apply_retention`]) nehmen die
 //! exklusive `fs4`-Sperre `.lock`; ist sie belegt, versuchen sie es bis zu
 //! etwa einer Sekunde lang erneut und melden dann
-//! [`VerdictStoreError::LockContended`]. Leser nehmen keine Sperre; eine
-//! halb geschriebene letzte Zeile wird übersprungen. Leser **listen zuerst
+//! [`VerdictStoreError::LockContended`]. Die Sperre zählt nur, solange `.lock`
+//! auf die gesperrte Inode zeigt: nach dem `flock` vergleicht der Schreiber
+//! das per `fstatat` (ohne Symlink-Folge); wurde `.lock` inzwischen entfernt
+//! oder ersetzt, öffnet und sperrt er die aktuelle Datei neu. Direkt vor
+//! seiner ersten Änderung prüft er das noch einmal und bricht sonst mit
+//! `LockContended` ab, ohne etwas geändert zu haben. Ganz ausschließen lässt
+//! sich ein zweiter Schreiber nur, wenn niemand außer dieser API `.lock`
+//! entfernt (siehe „Retention“).
+//!
+//! Sperr-Budget und Kettengröße: der Halter der Sperre prüft beim Anhängen
+//! die ganze lebende Kette, ein zweiter Schreiber wartet also mindestens so
+//! lange. Dauert die Prüfung länger als das Budget von etwa einer Sekunde,
+//! bekommt er `LockContended`, und sein Verdict wird nicht gespeichert
+//! (Verdicts sind Annotation, kein Audit; der Aufrufer darf es erneut
+//! versuchen). Je Datensatz kostet die Prüfung eine JSON-Dekodierung, BLAKE3
+//! über höchstens 8 KiB und die Escape-Prüfung der Begründung, also wenige
+//! Mikrosekunden. Nach dieser groben, nicht gemessenen Schätzung reicht das
+//! Budget für eine lebende Kette in der Größenordnung von 100 000 Datensätzen,
+//! gut 1 000 Verdicts pro Tag über die 90 Tage der Retention. Ein einzelner
+//! Schreiber ist davon nicht betroffen; nur gleichzeitige Schreiber auf einer
+//! deutlich größeren Kette brauchten ein mit der Kette wachsendes Budget.
+//!
+//! Leser nehmen keine Sperre; eine halb geschriebene letzte Zeile wird
+//! übersprungen. Leser **listen zuerst
 //! die Segmente und lesen danach den Anker**. Weil die Retention den Anker
 //! schreibt, bevor sie löscht, ist der gelesene Anker damit mindestens so
 //! neu wie jede Löschung, die die Liste schon zeigt: ein Leser sieht nie
 //! einen alten Anker zu einer bereits ausgedünnten Liste (das wäre ein
 //! falscher Kettenbruch, also ein falscher Manipulationsalarm). Höchstens
 //! stehen Segmente vor dem neuen Anker noch in der Liste (ausgemustert,
-//! übersprungen), oder eine spätere Retention löscht ein gelistetes Segment,
-//! bevor der Leser es öffnet: dann scheitert der Leser mit einem
-//! vorübergehenden [`VerdictStoreError::Io`] (`NotFound`), und ein erneuter
-//! Aufruf sieht den neuen Stand. Alle Aufrufe sind blockierende Datei-I/O
-//! und gehören in async-Kontexten in `spawn_blocking`.
+//! übersprungen), oder eine spätere Retention (auch die beim Segmentwechsel
+//! in [`VerdictStore::append`]) löscht ein gelistetes Segment, bevor der Leser
+//! es öffnet. Dann verwirft der Leser alles bisher Gesammelte und läuft die
+//! Kette neu ab (neue Liste, neuer Anker), insgesamt höchstens dreimal; erst
+//! danach meldet er [`VerdictStoreError::Io`] (`NotFound`). Alle Aufrufe sind
+//! blockierende Datei-I/O und gehören in async-Kontexten in `spawn_blocking`.
+//!
+//! Jeder öffentliche Aufruf steigt neu bis `verdicts` ab (siehe
+//! „Verzeichnisgrenze“) und hält dessen Deskriptor bis zu seiner Rückkehr;
+//! der Handle selbst hält keinen Deskriptor. Ein Schreiber sperrt `.lock` in
+//! genau dem Verzeichnis, in das er schreibt und aus dem er löscht.
+//! Restrisiko: ersetzt jemand das Verzeichnis **zwischen** zwei Aufrufen
+//! durch ein anderes echtes Verzeichnis, arbeiten Aufrufe davor und danach
+//! auf verschiedenen Verzeichnissen (und Schreiber sperren nicht mehr
+//! gegeneinander). Dafür braucht er Schreibrecht auf `dod/`, das der
+//! eigenen uid gehört und für Gruppe und Andere nicht beschreibbar ist; das
+//! liegt innerhalb der „Grenzen“ unten.
 //!
 //! # Fehler
 //! [`VerdictStoreError`]; alle Meldungen sind inhaltsfrei (keine Begründung,
-//! keine Pfade), damit sie auch auf `warn`-Ebene geloggt werden dürfen.
+//! keine Pfade), damit sie auch auf `warn`-Ebene geloggt werden dürfen. Was
+//! nach einer Verletzung der Kette zu tun ist, steht unter
+//! „Wiederherstellung nach einem Kettenbruch“.
 //!
 //! # Grenzen
 //! Die Kette hat keinen Schlüssel. Wer den Schreibbereich der harw-uid
@@ -103,6 +261,12 @@
 //! gelten deshalb als Bequemlichkeit, nicht als Audit (THREAT-MODEL §1); wer
 //! einen bestimmten Stand festhalten will, merkt sich den
 //! [`VerdictRef::verdict_digest`] außerhalb dieses Stores.
+//!
+//! # Plattform
+//! Nur Unix. Das Modul benutzt `std::os::unix` und `std::os::fd` ohne
+//! `cfg`-Gate, weil die Crate ohnehin unbedingt von `harw-fsutil` abhängt, das
+//! selbst Unix-only ist; ein Gate nur dieses Moduls machte die Crate nicht
+//! auf anderen Plattformen baubar.
 //!
 //! # Examples
 //! ```rust,no_run
@@ -137,14 +301,16 @@ use std::borrow::Cow;
 use std::fmt;
 use std::fs::{DirBuilder, File, Permissions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fs4::FileExt;
 use harw_fsutil::{
-    AtomicWriteOptions, OpenMode, ensure_private_regular, is_symlink_loop, open_dir_nofollow,
-    open_nofollow, write_atomic,
+    EntryType, OpenMode, ensure_owned_directory, ensure_private_regular, entry_type_at,
+    is_symlink_loop, mkdir_at, open_beneath, open_dir_at, read_dir_names, rename_at, same_file_at,
+    unlink_at,
 };
 use harw_macros::HarwError;
 use harw_types::{Confidence, ContentDigest, FindingId};
@@ -183,13 +349,17 @@ pub const VERDICT_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 /// Die Retention löscht nur ganze Segmente. Ohne Rotation nach Alter bliebe
 /// auf einem Host mit wenigen Verdicts alles in einem Segment, dessen
 /// jüngster Datensatz nie [`VERDICT_RETENTION`] alt wird. Mit dieser Spanne
-/// ist kein gelöschter Datensatz jünger als 90 Tage und kein verbliebener
-/// älter als etwa 91 Tage (bei monotoner Uhr). Läuft die Uhr zurück, rotiert
-/// nur die Größe.
+/// ist kein gelöschter Datensatz jünger als 90 Tage und, nach einem
+/// expliziten [`VerdictStore::apply_retention`], kein verbliebener älter als
+/// etwa 91 Tage (bei monotoner Uhr). Die Retention beim Anhängen lässt
+/// zusätzlich das bisher aktive Segment bis zum nächsten Segmentwechsel
+/// stehen. Läuft die Uhr zurück, rotiert nur die Größe.
 pub const VERDICT_SEGMENT_SPAN: SignedDuration = SignedDuration::from_secs(86_400);
 
 /// Aufbewahrungsdauer: ganze Segmente, deren jüngster Datensatz älter ist,
-/// entfernt [`VerdictStore::apply_retention`] (90 Tage).
+/// entfernt [`VerdictStore::apply_retention`] und, beim Beginn jedes neuen
+/// Segments und ohne das bisher aktive Segment, [`VerdictStore::append`]
+/// selbst (90 Tage).
 pub const VERDICT_RETENTION: SignedDuration = SignedDuration::from_secs(90 * 86_400);
 
 /// Höchstlänge des Modellbezeichners in Zeichen (nach dem Escapen).
@@ -219,6 +389,8 @@ const VERDICTS_DIR: &str = "verdicts";
 // Dateinamen innerhalb des Store-Verzeichnisses.
 const LOCK_FILE: &str = ".lock";
 const ANCHOR_FILE: &str = "anchor.json";
+// Tempdatei für das atomare Schreiben von `anchor.json` (nur unter der Sperre).
+const ANCHOR_TEMP_FILE: &str = "anchor.json.tmp";
 const SEGMENT_PREFIX: &str = "verdicts-";
 const SEGMENT_SUFFIX: &str = ".jsonl";
 const SEGMENT_DIGITS: usize = 20;
@@ -232,9 +404,21 @@ const MAX_ANCHOR_BYTES: u64 = 4 * 1024;
 // Leselimit eines Segments: Rotationsgrenze plus Spielraum für eine Zeile.
 const MAX_SEGMENT_READ_BYTES: u64 = VERDICT_SEGMENT_BYTES.saturating_add(16 * 1024);
 
-// Begrenztes Warten auf die Schreibsperre: 200 Versuche im Abstand von 5 ms.
+// Begrenztes Warten auf die Schreibsperre: 200 Versuche im Abstand von 5 ms
+// (Budget gegen die Kettengröße: Moduldoku „Nebenläufigkeit“).
 const LOCK_ATTEMPTS: u32 = 200;
 const LOCK_BACKOFF: Duration = Duration::from_millis(5);
+
+// Durchläufe eines Lesers, wenn ein gelistetes Segment vor dem Öffnen
+// verschwindet (`retry_vanished`). Eine Retention läuft höchstens bei jedem
+// Segmentwechsel, zwei Durchläufe reichen also praktisch immer.
+const READ_ATTEMPTS: u32 = 3;
+
+// Feste, inhaltsfreie Gründe für `UnsafeDirectory` (keine Pfade).
+const NOT_A_REAL_DIRECTORY: &str = "store directory is not a real directory";
+const NOT_A_PRIVATE_DIRECTORY: &str =
+    "store directory is not owned by the current user or is writable by group or others";
+const STATE_DIR_NOT_A_DIRECTORY: &str = "state directory is not a directory";
 
 /// Fehler des [`VerdictStore`] (erzeugt `VerdictStoreResult<T>`).
 ///
@@ -255,7 +439,10 @@ pub enum VerdictStoreError {
     #[msg("verdict store lock is contended")]
     LockContended,
 
-    /// Das Store-Verzeichnis ist kein echtes Verzeichnis (z. B. ein Symlink).
+    /// Ein Glied unterhalb von `state_dir` (`dod`, `verdicts`) ist kein
+    /// echtes Verzeichnis (z. B. ein Symlink), gehört nicht der effektiven
+    /// uid oder ist für Gruppe/Andere beschreibbar; oder `.lock` ist ein
+    /// Symlink; oder `state_dir` selbst ist kein Verzeichnis.
     #[msg("verdict store directory is unsafe: {detail}")]
     UnsafeDirectory {
         /// Fester, inhaltsfreier Grund.
@@ -562,7 +749,10 @@ pub struct NewVerdict {
     pub rationale: String,
     /// Bezeichner des Modells, das das Verdict verfasst hat, falls bekannt.
     pub model: Option<String>,
-    /// Zeitpunkt der Annahme (vom Aufrufer über seine `Clock` ermittelt).
+    /// Zeitpunkt der Annahme (vom Aufrufer über seine `Clock` ermittelt, nie
+    /// aus Modellausgabe). [`VerdictStore::append`] benutzt ihn auch als
+    /// Jetzt-Zeit der Retention beim Segmentwechsel: ein Wert weit in der
+    /// Zukunft ließe alles verfallen, was mehr als 90 Tage davor liegt.
     pub created_at: Timestamp,
 }
 
@@ -799,6 +989,11 @@ pub struct VerdictChainSummary {
 
 /// Ergebnis von [`VerdictStore::apply_retention`].
 ///
+/// # Description
+/// Die Retention, die [`VerdictStore::append`] beim Segmentwechsel selbst
+/// ausführt, liefert keinen Bericht; sie meldet entfernte Segmente nur auf
+/// `info`.
+///
 /// # Examples
 /// ```rust,no_run
 /// # fn demo(store: &harw_session_store::dod_verdict::VerdictStore, now: jiff::Timestamp)
@@ -912,13 +1107,14 @@ pub fn sanitize_rationale(raw: &str) -> String {
 /// Append-only, verkettete Ablage der Modell-Verdicts.
 ///
 /// # Description
-/// Siehe Moduldoku für Format, Kette, Rotation, Retention und Rechte. Der
-/// Handle ist billig und zustandslos; das Verzeichnis entsteht beim ersten
-/// Schreiben.
+/// Siehe Moduldoku für Format, Kette, Rotation, Retention, Rechte und die
+/// Verzeichnisgrenze. Der Handle ist billig und zustandslos (er hält nur
+/// Pfade, keinen Deskriptor); das Verzeichnis entsteht beim ersten Schreiben.
 ///
 /// # Concurrency
 /// `Send + Sync`; Schreiber serialisieren sich über `.lock`, Leser nehmen
-/// keine Sperre (siehe Moduldoku).
+/// keine Sperre. Jeder Aufruf öffnet das Store-Verzeichnis selbst und hält
+/// den Deskriptor nur bis zu seiner Rückkehr (siehe Moduldoku).
 ///
 /// # Examples
 /// ```rust,no_run
@@ -929,10 +1125,18 @@ pub fn sanitize_rationale(raw: &str) -> String {
 /// ```
 #[derive(Debug, Clone)]
 pub struct VerdictStore {
-    // `<state_dir>/dod/verdicts`.
+    // Das vertraute Zustandsverzeichnis des Aufrufers: Ausgangspunkt jedes
+    // Abstiegs (`open_root`/`create_root`).
+    state_dir: PathBuf,
+    // `<state_dir>/dod/verdicts`, nur für `root()`; der Store öffnet nie über
+    // diesen Pfad.
     root: PathBuf,
     // Rotationsgrenze in Bytes; außerhalb von Tests immer `VERDICT_SEGMENT_BYTES`.
     segment_limit: u64,
+    // Ob `append` beim Beginn eines neuen Segments die Retention mitlaufen
+    // lässt; außerhalb von Tests immer `true` (Tests von `apply_retention`
+    // bauen abgelaufene Segmente auf, ohne dass sie schon beim Anhängen gehen).
+    auto_retention: bool,
 }
 
 impl VerdictStore {
@@ -941,7 +1145,9 @@ impl VerdictStore {
     /// # Description
     /// Greift nicht auf das Dateisystem zu. `state_dir` ist die harw-Heimat
     /// (`~/.harw` oder ein Override); dieselbe Wurzel, die die
-    /// Retention-Resolver (`roots.home.join("dod")`) verwenden.
+    /// Retention-Resolver (`roots.home.join("dod")`) verwenden. Der Aufrufer
+    /// verbürgt sich für `state_dir` (es darf ein Symlink sein); ab `dod`
+    /// abwärts prüft der Store jedes Glied selbst.
     ///
     /// # Arguments
     /// - `state_dir` (`&Path`): das Zustandsverzeichnis.
@@ -965,12 +1171,19 @@ impl VerdictStore {
     #[must_use]
     pub fn new(state_dir: &Path) -> Self {
         Self {
+            state_dir: state_dir.to_path_buf(),
             root: state_dir.join(DOD_DIR).join(VERDICTS_DIR),
             segment_limit: VERDICT_SEGMENT_BYTES,
+            auto_retention: true,
         }
     }
 
     /// Das Store-Verzeichnis (`<state_dir>/dod/verdicts`).
+    ///
+    /// # Description
+    /// Nur zur Anzeige und für Werkzeuge: der Store selbst öffnet nie über
+    /// diesen Pfad, sondern steigt je Aufruf Glied für Glied ab (siehe
+    /// Moduldoku, „Verzeichnisgrenze“).
     ///
     /// # Returns
     /// Den Pfad, unter dem Segmente, Anker und Sperre liegen.
@@ -994,21 +1207,41 @@ impl VerdictStore {
         self
     }
 
+    // Nur für Tests: `append` lässt beim Segmentwechsel keine Retention
+    // mitlaufen, damit Tests von `apply_retention` abgelaufene Segmente
+    // anlegen können.
+    #[cfg(test)]
+    fn without_auto_retention(mut self) -> Self {
+        self.auto_retention = false;
+        self
+    }
+
     /// Hängt ein Verdict an die Kette an.
     ///
     /// # Description
-    /// Prüft und bereinigt die Eingabe (siehe [`NewVerdict`]), nimmt die
-    /// Sperre, schneidet eine abgerissene letzte Zeile ab, ermittelt den
-    /// Vorgänger (dessen `record_hash` erneut nachgerechnet wird; an einen
-    /// manipulierten Vorgänger wird nie angehängt), vergibt `seq` und
-    /// `prev_hash`, setzt `model_authored = true`, berechnet `record_hash`
-    /// und schreibt die Zeile mit einem `write_all` plus `sync_data` in das
+    /// Prüft und bereinigt die Eingabe (siehe [`NewVerdict`]) und nimmt die
+    /// Sperre. Unter der Sperre prüft es zuerst die **gesamte** lebende Kette
+    /// vorwärts wie [`VerdictStore::verify_chain`]: Anker, jedes Segment in
+    /// Reihenfolge, lückenlose `seq`, jede `prev_hash`-Verknüpfung, jedes
+    /// Siegel (`record_hash`, `model_authored`, Invarianten) und jeden
+    /// Segmentnamen. Erst danach ändert es etwas: es schneidet eine
+    /// abgerissene letzte Zeile ab, vergibt `seq` und `prev_hash` aus der
+    /// Prüfung, setzt `model_authored = true`, berechnet `record_hash` und
+    /// schreibt die Zeile mit einem `write_all` plus `sync_data` in das
     /// aktive oder ein neues Segment (`0600`, Verzeichnis `0700`). Ein neues
-    /// Segment beginnt bei [`VERDICT_SEGMENT_BYTES`], nach
+    /// Segment beginnt bei [`VERDICT_SEGMENT_BYTES`] oder nach
     /// [`VERDICT_SEGMENT_SPAN`] (gemessen am ersten Datensatz des aktiven
-    /// Segments) oder wenn dessen erste Zeile unlesbar ist (die Verletzung
-    /// bleibt in einem geschlossenen Segment und für
-    /// [`VerdictStore::verify_chain`] sichtbar).
+    /// Segments). An eine verletzte Kette wird nie angehängt, auch wenn die
+    /// Verletzung weit vor dem Ende liegt und der letzte Datensatz für sich
+    /// genommen intakt ist.
+    ///
+    /// Beginnt es ein neues Segment, läuft danach unter derselben Sperre die
+    /// Retention wie bei [`VerdictStore::apply_retention`], mit `created_at`
+    /// als Jetzt-Zeit und auf derselben Prüfung; nur Segmente vor dem bisher
+    /// aktiven kommen in Frage (eine weit vorgestellte Uhr löscht so nie den
+    /// jüngsten bisherigen Stand, siehe Moduldoku „Retention“). Ein Fehler
+    /// dabei erscheint nur auf `warn`; der Datensatz ist dann schon quittiert
+    /// und das Ergebnis bleibt `Ok`.
     ///
     /// # Arguments
     /// - `verdict` (`&NewVerdict`): das angenommene, gebundene Verdict.
@@ -1019,17 +1252,35 @@ impl VerdictStore {
     /// # Errors
     /// - [`VerdictStoreError::FindingIdInvalid`]: ungültige `finding_id`.
     /// - [`VerdictStoreError::RecordTooLarge`]: Zeile über 8 KiB.
-    /// - [`VerdictStoreError::LockContended`]: Sperre länger belegt.
-    /// - [`VerdictStoreError::ChainBroken`]: der Vorgänger ist manipuliert.
-    /// - [`VerdictStoreError::UnsafeDirectory`],
-    ///   [`VerdictStoreError::UnsafeSegment`]: Symlinks im Store.
-    /// - [`VerdictStoreError::CorruptRecord`],
-    ///   [`VerdictStoreError::AnchorCorrupt`],
-    ///   [`VerdictStoreError::SequenceExhausted`],
+    /// - [`VerdictStoreError::LockContended`]: Sperre länger belegt, oder
+    ///   `.lock` wurde ersetzt, während sie gehalten war (nichts geändert;
+    ///   ein erneuter Versuch sperrt die aktuelle Datei).
+    /// - [`VerdictStoreError::ChainBroken`],
+    ///   [`VerdictStoreError::CorruptRecord`],
+    ///   [`VerdictStoreError::SegmentTooLarge`]: die Kette ist an
+    ///   irgendeiner Stelle verletzt; derselbe Fehler, den
+    ///   [`VerdictStore::verify_chain`] meldet. Kein Segment wurde geändert.
+    ///   Der Zustand hält an, bis ein Operator den Store beiseitelegt
+    ///   (Moduldoku „Wiederherstellung nach einem Kettenbruch“).
+    /// - [`VerdictStoreError::AnchorCorrupt`]: `anchor.json` ist unlesbar
+    ///   oder ein Symlink.
+    /// - [`VerdictStoreError::UnsafeDirectory`]: `dod` oder `verdicts` ist ein
+    ///   Symlink, kein Verzeichnis, nicht das eigene oder für Gruppe/Andere
+    ///   beschreibbar, oder `.lock` ist ein Symlink. Am Ziel eines Symlinks
+    ///   wird nichts angelegt.
+    /// - [`VerdictStoreError::UnsafeSegment`]: ein Segment ist keine
+    ///   reguläre Datei (z. B. ein Symlink).
+    /// - [`VerdictStoreError::SequenceExhausted`],
     ///   [`VerdictStoreError::Io`], [`VerdictStoreError::Serde`].
     ///
     /// # Concurrency
     /// Blockierende Datei-I/O unter der exklusiven Sperre (siehe Moduldoku).
+    /// Das Store-Verzeichnis wird zu Beginn Glied für Glied geöffnet; Sperre,
+    /// Prüfung und Schreiben laufen danach nur relativ zu diesem Deskriptor.
+    /// Kosten: O(Größe der lebenden Kette) je Aufruf, weil jedes Anhängen
+    /// die ganze Kette liest und prüft; die Retention beim Segmentwechsel
+    /// begrenzt diese Größe auf etwa 91 Tage plus höchstens ein Segment
+    /// (Sperr-Budget gleichzeitiger Schreiber: Moduldoku „Nebenläufigkeit“).
     ///
     /// # Examples
     /// ```rust,no_run
@@ -1057,10 +1308,8 @@ impl VerdictStore {
     /// ```
     pub fn append(&self, verdict: &NewVerdict) -> VerdictStoreResult<VerdictRef> {
         let prepared = prepare(verdict)?;
-        let dir = self.ensure_dir()?;
-        let lock = self.acquire_lock()?;
-        let result = self.append_locked(prepared, &dir);
-        release(lock, result)
+        let root = self.create_root()?;
+        self.append_at(&root, prepared)
     }
 
     /// Prüft die gesamte Kette.
@@ -1076,7 +1325,8 @@ impl VerdictStore {
     /// geschrieben und wird übersprungen.
     ///
     /// # Returns
-    /// [`VerdictChainSummary`]; leer, wenn der Store noch nicht existiert.
+    /// [`VerdictChainSummary`]; leer, wenn der Store noch nicht existiert
+    /// (ein Leser legt nichts an).
     ///
     /// # Errors
     /// - [`VerdictStoreError::ChainBroken`]: eine Prüfung scheiterte.
@@ -1084,10 +1334,14 @@ impl VerdictStore {
     ///   [`VerdictStoreError::AnchorCorrupt`],
     ///   [`VerdictStoreError::SegmentTooLarge`],
     ///   [`VerdictStoreError::UnsafeDirectory`],
-    ///   [`VerdictStoreError::UnsafeSegment`], [`VerdictStoreError::Io`].
+    ///   [`VerdictStoreError::UnsafeSegment`], [`VerdictStoreError::Io`]
+    ///   (`NotFound` erst, wenn auch der dritte Durchlauf ein gelistetes
+    ///   Segment nicht mehr fand).
     ///
     /// # Concurrency
-    /// Nur lesend, ohne Sperre (siehe Moduldoku).
+    /// Nur lesend, ohne Sperre. Entfernt eine gleichzeitige Retention ein
+    /// gelistetes Segment, läuft die Kette mit neuer Liste und neuem Anker
+    /// noch einmal ab (höchstens drei Durchläufe; siehe Moduldoku).
     ///
     /// # Examples
     /// ```rust,no_run
@@ -1099,7 +1353,8 @@ impl VerdictStore {
     /// # }
     /// ```
     pub fn verify_chain(&self) -> VerdictStoreResult<VerdictChainSummary> {
-        self.walk_verified(|_| {}).map(|walk| walk.summary)
+        self.read_verified(|| (), |_, _| {})
+            .map(|(summary, ())| summary)
     }
 
     /// Der jüngste Datensatz zu einem Befund.
@@ -1134,13 +1389,15 @@ impl VerdictStore {
     /// # }
     /// ```
     pub fn latest_for(&self, finding_id: &FindingId) -> VerdictStoreResult<Option<VerdictRecord>> {
-        let mut latest = None;
-        self.walk_verified(|record| {
-            if record.finding_id == *finding_id {
-                latest = Some(record.clone());
-            }
-        })?;
-        Ok(latest)
+        self.read_verified(
+            || None::<VerdictRecord>,
+            |latest, record| {
+                if record.finding_id == *finding_id {
+                    *latest = Some(record.clone());
+                }
+            },
+        )
+        .map(|(_, latest)| latest)
     }
 
     /// Alle geprüften Datensätze in Kettenreihenfolge.
@@ -1169,9 +1426,10 @@ impl VerdictStore {
     /// # }
     /// ```
     pub fn records(&self) -> VerdictStoreResult<Vec<VerdictRecord>> {
-        let mut records = Vec::new();
-        self.walk_verified(|record| records.push(record.clone()))?;
-        Ok(records)
+        self.read_verified(Vec::<VerdictRecord>::new, |records, record| {
+            records.push(record.clone());
+        })
+        .map(|(_, records)| records)
     }
 
     /// Entfernt abgelaufene Segmente, ohne die Prüfbarkeit der Kette zu
@@ -1192,6 +1450,14 @@ impl VerdictStore {
     /// meldet dann `first_seq` = letzte `seq` + 1 und null Datensätze, und
     /// das nächste Anhängen setzt die Kette ab dem Anker fort.
     ///
+    /// [`VerdictStore::append`] führt denselben Lauf beim Beginn jedes neuen
+    /// Segments selbst aus (mit `created_at` als Jetzt-Zeit, ohne das bisher
+    /// aktive Segment); diese Methode ist für explizite Läufe, etwa einen
+    /// Wartungsjob oder einen Host, der nicht mehr anhängt, und kennt diese
+    /// Grenze nicht. Sie ist der einzige zulässige Weg für ein Werkzeug, das
+    /// den Store ausdünnen will (kein dateiweises Löschen, Moduldoku
+    /// „Retention“).
+    ///
     /// # Arguments
     /// - `now` (`Timestamp`): die Jetzt-Zeit aus der `Clock` des Aufrufers.
     ///
@@ -1199,16 +1465,21 @@ impl VerdictStore {
     /// [`VerdictRetentionReport`]; nichts entfernt, wenn der Store fehlt.
     ///
     /// # Errors
-    /// [`VerdictStoreError::LockContended`],
+    /// [`VerdictStoreError::LockContended`] (wie bei
+    /// [`VerdictStore::append`], auch für ein ersetztes `.lock`),
     /// [`VerdictStoreError::AnchorCorrupt`],
-    /// [`VerdictStoreError::UnsafeDirectory`],
+    /// [`VerdictStoreError::UnsafeDirectory`] (wie bei
+    /// [`VerdictStore::append`]),
     /// [`VerdictStoreError::UnsafeSegment`], [`VerdictStoreError::Io`],
     /// [`VerdictStoreError::Serde`]. Eine Verletzung der Kette ist kein
     /// Fehler dieser Methode (siehe oben). Bei einem Fehler vor dem Anker
     /// wird nichts gelöscht.
     ///
     /// # Concurrency
-    /// Blockierende Datei-I/O unter der exklusiven Sperre.
+    /// Blockierende Datei-I/O unter der exklusiven Sperre. Prüfen, Verankern
+    /// und Löschen (`unlinkat`) laufen nur relativ zum zu Beginn geöffneten
+    /// Store-Verzeichnis; ein Löschen kann also nie ein anderes Verzeichnis
+    /// treffen, auch wenn der Pfad inzwischen woanders hinzeigt.
     ///
     /// # Examples
     /// ```rust,no_run
@@ -1220,357 +1491,702 @@ impl VerdictStore {
     /// # }
     /// ```
     pub fn apply_retention(&self, now: Timestamp) -> VerdictStoreResult<VerdictRetentionReport> {
-        if !self.root_exists()? {
+        let Some(root) = self.open_root()? else {
             return Ok(VerdictRetentionReport {
                 removed_segments: 0,
                 removed_records: 0,
                 first_seq: FIRST_VERDICT_SEQ,
                 fault_segment: None,
             });
-        }
-        let dir = self.ensure_dir()?;
-        let lock = self.acquire_lock()?;
-        let result = self.retention_locked(now, &dir);
+        };
+        root.set_permissions(Permissions::from_mode(DIR_MODE))?;
+        retention_at(&root, now)
+    }
+
+    // Anhängen relativ zum schon geöffneten und geprüften Store-Verzeichnis
+    // `root` (aus `create_root`): Sperre in `root`, dann `append_locked`.
+    // Getrennt von `append`, damit Tests ein Verzeichnis zwischen Abstieg und
+    // Schreiben austauschen können.
+    fn append_at(&self, root: &File, prepared: NewVerdict) -> VerdictStoreResult<VerdictRef> {
+        let lock = acquire_lock(root)?;
+        let result = self.append_locked(prepared, root, &lock);
         release(lock, result)
     }
 
-    // Kern von `append`; Vorbedingung: die Sperre ist gehalten.
-    fn append_locked(&self, prepared: NewVerdict, dir: &File) -> VerdictStoreResult<VerdictRef> {
-        let anchor = self.read_anchor()?;
-        let (first_seq, start_prev) = chain_start(anchor.as_ref());
-        let live: Vec<Segment> = self
-            .list_segments()?
-            .into_iter()
-            .filter(|segment| segment.first_seq >= first_seq)
-            .collect();
-
-        // Rückwärts bis zum ersten Segment mit einem Datensatz; das letzte
-        // (aktive) Segment wird dabei repariert und für das Schreiben behalten,
-        // samt Länge und der Frage, ob seine Zeitspanne erschöpft ist.
-        let mut active: Option<(u64, File, u64, bool)> = None;
-        let mut predecessor = None;
-        for (position, segment) in live.iter().enumerate().rev() {
-            let is_active = position.saturating_add(1) == live.len();
-            let mut file = if is_active {
-                let mut file = open_segment_append(&segment.path)?;
-                repair_torn_tail(&mut file, segment.first_seq)?;
-                file
-            } else {
-                open_segment_read(&segment.path)?
-            };
-            let found = read_last_record(&mut file, segment.first_seq)?;
-            if is_active {
-                let len = file.metadata()?.len();
-                let span_exhausted =
-                    segment_span_exhausted(&mut file, segment.first_seq, prepared.created_at)?;
-                active = Some((segment.first_seq, file, len, span_exhausted));
-            }
-            if let Some(record) = found {
-                predecessor = Some(record);
-                break;
-            }
+    // Kern von `append`; Vorbedingung: die Sperre `lock` in `root` ist
+    // gehalten (`acquire_lock`).
+    //
+    // Reihenfolge (Review-Befund zu PL-100 WP 2.3): **erst** die gesamte
+    // lebende Kette vorwärts prüfen (`walk_root`: Anker → jedes Segment →
+    // Ende), **dann** etwas ändern. Früher wurde nur das Siegel des letzten
+    // Datensatzes nachgerechnet; ein neu versiegelter Datensatz weiter vorn
+    // bricht aber die Verknüpfung seines Nachfolgers, während der letzte
+    // Datensatz für sich intakt bleibt. `seq` und `prev_hash` stammen deshalb
+    // nur aus dem Cursor der Prüfung, und bei einer Verletzung irgendwo in
+    // der Kette wird kein Segment zum Schreiben geöffnet, per `fchmod`
+    // geändert, abgeschnitten oder angelegt. Weil die Schreibsperre gehalten
+    // ist, ändert kein anderer Schreiber die Kette zwischen Prüfung und
+    // Schreiben; `ensure_lock_held` stellt direkt vor der ersten Änderung
+    // sicher, dass `.lock` noch die gesperrte Datei ist. Alles läuft relativ
+    // zu `root` (Moduldoku „Verzeichnisgrenze“).
+    //
+    // Beginnt das Anhängen ein neues Segment, läuft danach unter derselben
+    // Sperre die Retention (`prune_expired`) auf demselben Durchlauf, mit
+    // `created_at` als Jetzt-Zeit (Moduldoku „Retention“), begrenzt durch
+    // `auto_retention_limit`. Sie hält die lebende Kette und damit die Kosten
+    // der Vorwärtsprüfung begrenzt, auch wenn nie jemand `apply_retention`
+    // aufruft. Der Datensatz ist zu diesem Zeitpunkt schon quittiert; ein
+    // Fehler der Retention wird nur gemeldet.
+    fn append_locked(
+        &self,
+        prepared: NewVerdict,
+        root: &File,
+        lock: &File,
+    ) -> VerdictStoreResult<VerdictRef> {
+        let mut walk = walk_root(root, |_| {})?;
+        if let Some((segment_seq, error)) = walk.fault.take() {
+            tracing::warn!(
+                segment = segment_seq,
+                error = %error,
+                "verdict chain fault: append refused until the store directory is moved aside"
+            );
+            return Err(error);
         }
+        ensure_lock_held(root, lock)?;
 
-        let (seq, prev_hash) = match predecessor {
-            Some(record) => {
-                ensure_sealed(&record, first_seq)?;
-                let next = record
-                    .seq
-                    .checked_add(1)
-                    .ok_or(VerdictStoreError::SequenceExhausted)?;
-                (next, record.record_hash)
-            }
-            None => (first_seq, start_prev),
-        };
-        let record = seal(seq, prev_hash, prepared);
+        let seq = walk.next.seq;
+        let created_at = prepared.created_at;
+        let record = seal(seq, walk.next.prev, prepared);
         let line = encode_line(&record)?;
         let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
 
-        // `created`: der Verzeichniseintrag des Ziel-Segments ist womöglich
-        // noch nicht dauerhaft. Ein leeres Segment, das wiederverwendet wird,
-        // stammt aus einem früheren Anhängen, das nach dem Anlegen scheiterte
-        // (`write_all`/`sync_data`), und hat seinen Verzeichnis-`fsync` nie
-        // bekommen; es zählt deshalb wie ein neu angelegtes. Ein nicht leeres
-        // Segment wird fortgesetzt, solange Größe und Zeitspanne reichen.
-        let (mut file, created) = match active {
+        // Das aktive (letzte geprüfte) Segment: eine abgerissene letzte Zeile
+        // (nie quittiert, von der Prüfung schon übersprungen) wird
+        // abgeschnitten; danach Länge und die Frage, ob seine Zeitspanne
+        // (ab dem ersten Datensatz) erschöpft ist. Ein leeres Segment hat
+        // keine Spanne; läuft die Uhr zurück (negative Dauer), rotiert nichts.
+        let active = match walk.live.last() {
+            Some(stats) => {
+                let mut file = open_segment_append(root, &stats.name)?;
+                repair_torn_tail(&mut file, stats.first_seq)?;
+                let len = file.metadata()?.len();
+                let span_exhausted = stats
+                    .first_created
+                    .is_some_and(|first| created_at.duration_since(first) >= VERDICT_SEGMENT_SPAN);
+                Some((stats.first_seq, file, len, span_exhausted))
+            }
+            None => None,
+        };
+
+        // Ein nicht leeres Segment wird fortgesetzt, solange Größe und
+        // Zeitspanne reichen; ein leeres aktives Segment nur, wenn sein Name
+        // zu `seq` passt. `new_segment`: das Ziel ist ein anderes Segment als
+        // das aktive (Rotation, oder das erste Segment eines leeren bzw.
+        // verankerten Stores); es wird angelegt oder, als leerer Rest eines
+        // gescheiterten Anhängens, wiederverwendet.
+        let (mut file, new_segment) = match active {
             Some((segment_seq, file, len, span_exhausted))
                 if (len == 0 && segment_seq == seq)
                     || (len > 0
                         && !span_exhausted
                         && len.saturating_add(line_len) <= self.segment_limit) =>
             {
-                (file, len == 0)
+                (file, false)
             }
-            _ => {
-                let path = self.root.join(segment_file_name(seq));
-                let created = !entry_exists(&path)?;
-                (open_segment_append(&path)?, created)
-            }
+            _ => (open_segment_append(root, &segment_file_name(seq))?, true),
         };
+        // `created`: der Verzeichniseintrag des Ziels ist womöglich noch nicht
+        // dauerhaft. Das gilt für jedes **leere** Ziel, auf beiden Wegen: ein
+        // gerade angelegtes Segment ebenso wie ein leerer Rest aus einem
+        // früheren Anhängen, das nach dem Anlegen scheiterte
+        // (`write_all`/`sync_data`) und seinen Verzeichnis-`fsync` nie bekam,
+        // ob es nun als aktives Segment fortgesetzt oder als Rotationsziel
+        // wiederverwendet wird. Ein nicht leeres Ziel stammt aus einem
+        // quittierten Anhängen und ist schon dauerhaft eingetragen.
+        let created = file.metadata()?.len() == 0;
         file.write_all(line.as_bytes())?;
         file.sync_data()?;
         if created {
-            dir.sync_all()?;
+            root.sync_all()?;
         }
         tracing::debug!(seq, "verdict record appended");
+
+        // Retention beim Segmentwechsel, auf dem Durchlauf von oben (die
+        // Sperre ist noch gehalten; geändert hat sich seither nur das
+        // Ziel-Segment, und das liegt nie vor der Grenze aus
+        // `auto_retention_limit`).
+        if new_segment
+            && self.auto_retention
+            && let Err(error) = prune_expired(
+                root,
+                lock,
+                &walk,
+                created_at,
+                Some(auto_retention_limit(&walk, seq)),
+            )
+        {
+            tracing::warn!(
+                seq,
+                error = %error,
+                "verdict retention after segment rotation failed; the record is stored"
+            );
+        }
         Ok(record.reference())
     }
 
-    // Kern von `apply_retention`; Vorbedingung: die Sperre ist gehalten.
-    fn retention_locked(
-        &self,
-        now: Timestamp,
-        dir: &File,
-    ) -> VerdictStoreResult<VerdictRetentionReport> {
-        // Erst die Kette prüfen. `walk.live` enthält nur vollständig geprüfte
-        // Segmente vor einer etwaigen Verletzung; eine verletzte Stelle wird
-        // nie neu verankert.
-        let walk = self.walk(|_| {})?;
-        let fault_segment = walk.fault.as_ref().map(|(segment_seq, _)| *segment_seq);
-        // Kandidaten sind alle Segmente in `live`, auch das letzte (aktive):
-        // ist es ganz abgelaufen, bleibt nur der Anker. Das ist sicher, weil
-        // die Sperre gehalten ist und `append_locked` eine leere `live`-Liste
-        // ab dem Anker fortsetzt (`seq = first_seq`, `prev = prev_hash`, neues
-        // Segment `first_seq`); `walk_listed` prüft eine leere Liste gegen
-        // den Anker. Bei einer Verletzung steht das verletzte Segment (und
-        // alles dahinter) gar nicht in `live`.
-        if let Some((segment_seq, error)) = &walk.fault {
-            tracing::warn!(
-                segment = *segment_seq,
-                error = %error,
-                "verdict chain fault: retention limited to the verified prefix"
-            );
+    // Läuft die Kette eines Lesers ab; fehlt ein Glied bis `verdicts`, ist
+    // die Kette leer (ab Genesis). Ein Leser legt nichts an und ändert nichts.
+    fn walk(&self, visit: impl FnMut(&VerdictRecord)) -> VerdictStoreResult<Walk> {
+        match self.open_root()? {
+            Some(root) => walk_root(&root, visit),
+            None => {
+                let (first_seq, prev) = chain_start(None);
+                Ok(Walk::empty(first_seq, prev))
+            }
         }
-        let removable = walk
-            .live
-            .iter()
-            .take_while(|stats| {
-                stats
+    }
+
+    // Die Kette für einen Leser: `visit` sammelt je gültigem Datensatz in
+    // einen Zustand aus `fresh`. Eine Verletzung der Kette ist ein Fehler
+    // (Leser bekommen nie einen womöglich manipulierten Stand). Verschwindet
+    // ein gelistetes Segment, bevor der Leser es öffnet (eine gleichzeitige
+    // Retention), beginnt der Durchlauf mit neuem Zustand von vorn
+    // (`retry_vanished`); was der abgebrochene Versuch gesammelt hat, geht nie
+    // in das Ergebnis ein.
+    fn read_verified<T>(
+        &self,
+        mut fresh: impl FnMut() -> T,
+        mut visit: impl FnMut(&mut T, &VerdictRecord),
+    ) -> VerdictStoreResult<(VerdictChainSummary, T)> {
+        retry_vanished(|| {
+            let mut state = fresh();
+            let mut walk = self.walk(|record| visit(&mut state, record))?;
+            match walk.fault.take() {
+                Some((_, error)) => Err(error),
+                None => Ok((walk.summary, state)),
+            }
+        })
+    }
+
+    // Öffnet das vorhandene Store-Verzeichnis Glied für Glied (Moduldoku
+    // „Verzeichnisgrenze“): `state_dir` (vertraut), darunter `dod` und
+    // `verdicts`, je relativ zum Eltern-Deskriptor mit `O_DIRECTORY |
+    // O_NOFOLLOW` geöffnet (`open_dir_at`) und geprüft. Legt nichts an und
+    // ändert nichts; `None`, wenn ein Glied fehlt.
+    fn open_root(&self) -> VerdictStoreResult<Option<File>> {
+        let Some(state) = open_state_dir(&self.state_dir)? else {
+            return Ok(None);
+        };
+        let Some(dod) = open_store_dir(&state, DOD_DIR)? else {
+            return Ok(None);
+        };
+        open_store_dir(&dod, VERDICTS_DIR)
+    }
+
+    // Wie `open_root`, legt aber fehlende Glieder an (`state_dir` samt
+    // Eltern über den vertrauten Pfad, `dod` und `verdicts` per `mkdirat`
+    // relativ zum Eltern-Deskriptor; jedes neue Glied mit `fsync` seines
+    // Elternverzeichnisses) und setzt `verdicts` per `fchmod` auf `0700`
+    // (umask-unabhängig). Geliefert wird der Deskriptor von `verdicts`; ab
+    // hier wird kein Pfad mehr aufgelöst. Dauerhaftigkeit: ohne den `fsync`
+    // des Elternverzeichnisses könnte nach einem Stromausfall `verdicts/`
+    // samt quittiertem Segment fehlen.
+    fn create_root(&self) -> VerdictStoreResult<File> {
+        let state = create_state_dir(&self.state_dir)?;
+        let dod = create_store_dir(&state, DOD_DIR)?;
+        let root = create_store_dir(&dod, VERDICTS_DIR)?;
+        root.set_permissions(Permissions::from_mode(DIR_MODE))?;
+        Ok(root)
+    }
+}
+
+// Retention relativ zum schon geöffneten und geprüften Store-Verzeichnis
+// `root`: Sperre in `root`, dann `retention_locked`. Getrennt von
+// `apply_retention`, damit Tests ein Verzeichnis zwischen Abstieg und
+// Löschen austauschen können.
+fn retention_at(root: &File, now: Timestamp) -> VerdictStoreResult<VerdictRetentionReport> {
+    let lock = acquire_lock(root)?;
+    let result = retention_locked(root, &lock, now);
+    release(lock, result)
+}
+
+// Kern von `apply_retention`; Vorbedingung: die Sperre `lock` in `root` ist
+// gehalten. Prüfen, Verankern und Löschen laufen nur relativ zu `root`.
+fn retention_locked(
+    root: &File,
+    lock: &File,
+    now: Timestamp,
+) -> VerdictStoreResult<VerdictRetentionReport> {
+    // Erst die Kette prüfen. `walk.live` enthält nur vollständig geprüfte
+    // Segmente vor einer etwaigen Verletzung; eine verletzte Stelle wird
+    // nie neu verankert. Der neue Anker (`first_seq`, `prev_hash`) stammt
+    // nur aus diesem vorwärts geprüften Präfix.
+    let walk = walk_root(root, |_| {})?;
+    if let Some((segment_seq, error)) = &walk.fault {
+        tracing::warn!(
+            segment = *segment_seq,
+            error = %error,
+            "verdict chain fault: retention limited to the verified prefix"
+        );
+    }
+    prune_expired(root, lock, &walk, now, None)
+}
+
+// Der verankernde und löschende Teil der Retention, auf einem schon unter der
+// Sperre gemachten Durchlauf `walk` von `root` (`retention_locked` und, beim
+// Segmentwechsel, `append_locked`). Vorbedingung: die Sperre `lock` in `root`
+// ist gehalten, und seit `walk` hat sich höchstens ein Segment ab `before_seq`
+// geändert. `before_seq`: nur Segmente, deren erste `seq` davor liegt, kommen
+// in Frage (`None`: alle in `walk.live`). Anker und Löschen laufen nur relativ
+// zu `root`, und erst nach `ensure_lock_held`.
+fn prune_expired(
+    root: &File,
+    lock: &File,
+    walk: &Walk,
+    now: Timestamp,
+    before_seq: Option<u64>,
+) -> VerdictStoreResult<VerdictRetentionReport> {
+    let fault_segment = walk.fault.as_ref().map(|(segment_seq, _)| *segment_seq);
+    // Kandidaten sind alle Segmente in `live` vor `before_seq`, auch das
+    // letzte (aktive):
+    // ist es ganz abgelaufen, bleibt nur der Anker. Das ist sicher, weil
+    // die Sperre gehalten ist und `append_locked` eine leere `live`-Liste
+    // ab dem Anker fortsetzt (`seq = first_seq`, `prev = prev_hash`, neues
+    // Segment `first_seq`); `walk_listed` prüft eine leere Liste gegen
+    // den Anker. Bei einer Verletzung steht das verletzte Segment (und
+    // alles dahinter) gar nicht in `live`.
+    let removable = walk
+        .live
+        .iter()
+        .take_while(|stats| {
+            before_seq.is_none_or(|limit| stats.first_seq < limit)
+                && stats
                     .newest
                     .is_none_or(|newest| now.duration_since(newest) > VERDICT_RETENTION)
-            })
-            .count();
-        let removed_records = walk
-            .live
-            .iter()
-            .take(removable)
-            .fold(0_u64, |sum, stats| sum.saturating_add(stats.records));
+        })
+        .count();
+    let removed_records = walk
+        .live
+        .iter()
+        .take(removable)
+        .fold(0_u64, |sum, stats| sum.saturating_add(stats.records));
+    if removable > 0 || !walk.retired.is_empty() {
+        ensure_lock_held(root, lock)?;
+    }
 
-        let mut first_seq = walk.summary.first_seq;
-        if let Some(last_removed) = walk
-            .live
-            .iter()
-            .take(removable)
-            .rev()
-            .find_map(|stats| stats.last)
-        {
-            let next = last_removed
-                .seq
-                .checked_add(1)
-                .ok_or(VerdictStoreError::SequenceExhausted)?;
-            self.write_anchor(&VerdictAnchor {
+    let mut first_seq = walk.summary.first_seq;
+    if let Some(last_removed) = walk
+        .live
+        .iter()
+        .take(removable)
+        .rev()
+        .find_map(|stats| stats.last)
+    {
+        let next = last_removed
+            .seq
+            .checked_add(1)
+            .ok_or(VerdictStoreError::SequenceExhausted)?;
+        write_anchor(
+            root,
+            &VerdictAnchor {
                 version: ANCHOR_VERSION,
                 first_seq: next,
                 prev_hash: last_removed.verdict_digest,
                 anchored_at: now,
-            })?;
-            first_seq = next;
-        }
+            },
+        )?;
+        first_seq = next;
+    }
 
-        let mut removed_segments = 0_usize;
-        let expired = walk.live.iter().take(removable).map(|stats| &stats.path);
-        for path in walk.retired.iter().chain(expired) {
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(VerdictStoreError::Io(error)),
-            }
-            removed_segments = removed_segments.saturating_add(1);
+    // `unlinkat` relativ zu `root`: auch wenn der Pfad des Store-Verzeichnisses
+    // inzwischen auf etwas anderes zeigt, wird nur hier gelöscht.
+    let mut removed_segments = 0_usize;
+    let expired = walk
+        .live
+        .iter()
+        .take(removable)
+        .map(|stats| stats.name.as_str());
+    for name in walk.retired.iter().map(String::as_str).chain(expired) {
+        match unlink_at(root.as_fd(), Path::new(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(VerdictStoreError::Io(error)),
         }
-        if removed_segments > 0 {
-            dir.sync_all()?;
-            tracing::info!(
-                removed_segments,
-                removed_records,
-                first_seq,
-                "verdict retention applied"
-            );
-        }
-        Ok(VerdictRetentionReport {
+        removed_segments = removed_segments.saturating_add(1);
+    }
+    if removed_segments > 0 {
+        root.sync_all()?;
+        tracing::info!(
             removed_segments,
             removed_records,
             first_seq,
-            fault_segment,
+            "verdict retention applied"
+        );
+    }
+    Ok(VerdictRetentionReport {
+        removed_segments,
+        removed_records,
+        first_seq,
+        fault_segment,
+    })
+}
+
+// Grenze (`before_seq`) der Retention, die `append_locked` beim Segmentwechsel
+// mitlaufen lässt: nur Segmente **vor** dem, das den bisher letzten Datensatz
+// der Kette hält, kommen in Frage, und nie das Ziel `seq` des neuen
+// Datensatzes (auch nicht als leerer Rest in `walk.live`). Das bisher aktive
+// Segment bleibt also stehen, bis der nächste Segmentwechsel oder ein
+// expliziter Lauf es entfernt.
+//
+// Grund: die Jetzt-Zeit ist hier das `created_at` des Aufrufers. Ein einzelner
+// Datensatz mit weit vorgestellter Uhr (RTC-Fehler, NTP-Sprung) entfernt so
+// höchstens die Segmente davor, nie den jüngsten bisherigen Stand, und eine
+// Kette ohne Datensatz verliert gar nichts. Preis: die lebende Kette umfasst
+// etwa 91 Tage plus höchstens dieses eine Segment.
+fn auto_retention_limit(walk: &Walk, seq: u64) -> u64 {
+    walk.live
+        .iter()
+        .rev()
+        .find(|stats| stats.last.is_some())
+        .map_or(seq, |stats| stats.first_seq.min(seq))
+}
+
+// Läuft die Kette des Store-Verzeichnisses `root` vorwärts ab (siehe
+// `walk_listed`); die eine Prüflogik für Leser (`VerdictStore::walk`),
+// `append_locked` und `retention_locked`. Nimmt selbst keine Sperre:
+// Schreiber rufen sie unter ihrer schon gehaltenen Sperre auf, Leser ohne.
+// Reihenfolge: **erst die Segmente listen, dann den Anker lesen.** Die
+// Retention schreibt den Anker, bevor sie löscht; der hier gelesene Anker ist
+// damit mindestens so neu wie jede Löschung, die die Liste schon zeigt.
+// Umgekehrt (alter Anker, ausgedünnte Liste) sähe ein Leser ohne Sperre
+// einen falschen Kettenbruch (Test
+// `stale_anchor_with_a_fresh_listing_would_look_broken`).
+fn walk_root(root: &File, visit: impl FnMut(&VerdictRecord)) -> VerdictStoreResult<Walk> {
+    let segments = list_segments(root)?;
+    let anchor = read_anchor(root)?;
+    walk_listed(root, segments, anchor.as_ref(), visit)
+}
+
+// Führt den Leser-Durchlauf `attempt` aus und wiederholt ihn (insgesamt
+// höchstens `READ_ATTEMPTS` Durchläufe), solange er mit `Io(NotFound)`
+// scheitert. Leser nehmen keine Sperre: zwischen dem Auflisten und dem Öffnen
+// eines Segments kann eine Retention (auch die beim Segmentwechsel in
+// `append`) es entfernt haben, nachdem sie den Anker geschrieben hat. Unterhalb
+// des geöffneten Store-Verzeichnisses entsteht `NotFound` nur beim Öffnen
+// eines gelisteten Segments (fehlender Anker und verschwundene Listeneinträge
+// gelten als „nicht da“). Jeder neue Durchlauf listet neu und liest den Anker
+// neu, sieht also den neuen Stand; ein ohne Anker entferntes Segment meldet er
+// als Kettenbruch. Nur für Leser: unter der Schreibsperre verschwindet kein
+// Segment, ein `NotFound` dort ist ein echter Fehler.
+fn retry_vanished<T>(mut attempt: impl FnMut() -> VerdictStoreResult<T>) -> VerdictStoreResult<T> {
+    let mut tries = 1_u32;
+    loop {
+        match attempt() {
+            Err(VerdictStoreError::Io(error))
+                if error.kind() == io::ErrorKind::NotFound && tries < READ_ATTEMPTS =>
+            {
+                tracing::debug!(
+                    attempt = tries,
+                    "verdict segment vanished during a read; walking again"
+                );
+                tries = tries.saturating_add(1);
+            }
+            result => return result,
+        }
+    }
+}
+
+// Nimmt die exklusive Schreibsperre `.lock` in `root`; wartet begrenzt (siehe
+// `LOCK_ATTEMPTS`). Ein Symlink an der Stelle von `.lock` wird nie verfolgt
+// (`UnsafeDirectory`).
+//
+// Die Sperre gilt nur, wenn `.lock` nach dem `flock` noch genau die gesperrte
+// Inode ist (`lock_is_current`). Hat jemand die Datei inzwischen entfernt oder
+// ersetzt (etwa ein dateiweiser Retention-Sweep, der sie nach ihrer mtime für
+// alt hält; `fchmod` ändert nur die ctime), hält der Aufrufer sonst eine
+// Sperre auf einer verwaisten Inode, während ein anderer Schreiber die neue
+// Datei sperrt, und beide hängen dieselbe `seq` an. Dann öffnet
+// `acquire_lock` den aktuellen Namen neu und sperrt dort (zählt als Versuch).
+// Restrisiko: wird `.lock` entfernt, **während** ein Schreiber sie hält, kann
+// ein zweiter die neue Datei sperren; davor schützt `ensure_lock_held` vor
+// jeder Änderung (der erste bricht dann ab), ganz ausschließen lässt es sich
+// nur, indem niemand außer dieser API Dateien im Store entfernt (Moduldoku
+// „Retention“).
+fn acquire_lock(root: &File) -> VerdictStoreResult<File> {
+    let mut lock = open_lock_file(root)?;
+    for attempt in 0..LOCK_ATTEMPTS {
+        match FileExt::try_lock(&lock) {
+            Ok(()) => {
+                if lock_is_current(root, &lock)? {
+                    return Ok(lock);
+                }
+                // Die alte Datei wird beim Ersetzen geschlossen; das gibt
+                // ihren `flock` frei.
+                tracing::debug!(
+                    attempt,
+                    "verdict store lock file was replaced; locking it again"
+                );
+                lock = open_lock_file(root)?;
+            }
+            Err(fs4::TryLockError::WouldBlock) => {
+                if attempt.saturating_add(1) < LOCK_ATTEMPTS {
+                    std::thread::sleep(LOCK_BACKOFF);
+                }
+            }
+            Err(fs4::TryLockError::Error(error)) => return Err(VerdictStoreError::Io(error)),
+        }
+    }
+    Err(VerdictStoreError::LockContended)
+}
+
+// Ob `.lock` in `root` (ohne Symlink-Folge) noch die gesperrte Datei `lock`
+// ist; `false`, wenn der Name fehlt oder auf etwas anderes zeigt.
+fn lock_is_current(root: &File, lock: &File) -> VerdictStoreResult<bool> {
+    same_file_at(root.as_fd(), Path::new(LOCK_FILE), lock).map_err(VerdictStoreError::Io)
+}
+
+// Vor der ersten Änderung eines Schreibers (Segment, Anker, Löschen): ist
+// `.lock` seit dem Sperren entfernt oder ersetzt worden, kann ein anderer
+// Schreiber inzwischen die neue Datei gesperrt haben. Dann bricht dieser
+// Schreiber ab (`LockContended`, nichts geändert); der Aufrufer darf es erneut
+// versuchen und sperrt dann die aktuelle Datei. Vorbedingung: `lock` ist von
+// `acquire_lock`.
+fn ensure_lock_held(root: &File, lock: &File) -> VerdictStoreResult<()> {
+    if lock_is_current(root, lock)? {
+        return Ok(());
+    }
+    tracing::warn!("verdict store lock file was replaced while held; write aborted");
+    Err(VerdictStoreError::LockContended)
+}
+
+// Öffnet (bzw. legt an) `.lock` in `root` ohne Symlink-Folge und setzt die
+// Rechte per `fchmod` auf `0600`.
+fn open_lock_file(root: &File) -> VerdictStoreResult<File> {
+    let lock = open_beneath(
+        root.as_fd(),
+        Path::new(LOCK_FILE),
+        OpenMode {
+            read: false,
+            write: true,
+            create: true,
+            create_new: false,
+            truncate: false,
+            append: false,
+            mode: FILE_MODE,
+        },
+    )
+    .map_err(|error| {
+        if is_symlink_loop(&error) {
+            VerdictStoreError::UnsafeDirectory {
+                detail: "lock file is a symbolic link",
+            }
+        } else {
+            VerdictStoreError::Io(error)
+        }
+    })?;
+    lock.set_permissions(Permissions::from_mode(FILE_MODE))?;
+    Ok(lock)
+}
+
+// Liest `anchor.json` aus `root`; `None`, solange keine Retention gelöscht
+// hat. Ein Symlink an seiner Stelle ist `AnchorCorrupt`.
+fn read_anchor(root: &File) -> VerdictStoreResult<Option<VerdictAnchor>> {
+    let file = match open_beneath(root.as_fd(), Path::new(ANCHOR_FILE), OpenMode::read_only()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if is_symlink_loop(&error) => {
+            return Err(VerdictStoreError::AnchorCorrupt);
+        }
+        Err(error) => return Err(VerdictStoreError::Io(error)),
+    };
+    ensure_private_regular(&file)?;
+    let mut bytes = Vec::new();
+    (&file)
+        .take(MAX_ANCHOR_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_ANCHOR_BYTES {
+        return Err(VerdictStoreError::AnchorCorrupt);
+    }
+    let anchor: VerdictAnchor =
+        serde_json::from_slice(&bytes).map_err(|_| VerdictStoreError::AnchorCorrupt)?;
+    if anchor.version != ANCHOR_VERSION || anchor.first_seq < FIRST_VERDICT_SEQ {
+        return Err(VerdictStoreError::AnchorCorrupt);
+    }
+    Ok(Some(anchor))
+}
+
+// Schreibt `anchor.json` in `root` atomar: Tempdatei `anchor.json.tmp`
+// (`O_CREAT | O_EXCL | O_NOFOLLOW`, `0600` per `fchmod`), `write_all`,
+// `fsync`, dann `renameat` auf den endgültigen Namen und `fsync` des
+// Verzeichnisses. Ein Rest der Tempdatei aus einem abgebrochenen Lauf (auch
+// ein Symlink) wird vorher entfernt, nie verfolgt; das ist sicher, weil nur
+// Schreiber unter der Sperre diesen Namen benutzen. `renameat` ersetzt ein
+// vorhandenes `anchor.json` (auch einen Symlink) selbst, nie dessen Ziel.
+// Vorbedingung: die Sperre in `root` ist gehalten.
+fn write_anchor(root: &File, anchor: &VerdictAnchor) -> VerdictStoreResult<()> {
+    let bytes = serde_json::to_vec(anchor)?;
+    let temp = Path::new(ANCHOR_TEMP_FILE);
+    match unlink_at(root.as_fd(), temp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(VerdictStoreError::Io(error)),
+    }
+    let written = open_beneath(root.as_fd(), temp, OpenMode::write_create_new(FILE_MODE))
+        .and_then(|mut file| {
+            file.set_permissions(Permissions::from_mode(FILE_MODE))?;
+            file.write_all(&bytes)?;
+            file.sync_all()
         })
-    }
-
-    // Läuft die Kette ab (siehe `walk_listed`). Reihenfolge: **erst die
-    // Segmente listen, dann den Anker lesen.** Die Retention schreibt den
-    // Anker, bevor sie löscht; der hier gelesene Anker ist damit mindestens
-    // so neu wie jede Löschung, die die Liste schon zeigt. Umgekehrt (alter
-    // Anker, ausgedünnte Liste) sähe ein Leser ohne Sperre einen falschen
-    // Kettenbruch (Test `stale_anchor_with_a_fresh_listing_would_look_broken`).
-    fn walk(&self, visit: impl FnMut(&VerdictRecord)) -> VerdictStoreResult<Walk> {
-        if !self.root_exists()? {
-            return Ok(Walk::empty(FIRST_VERDICT_SEQ));
+        .and_then(|()| rename_at(root.as_fd(), temp, Path::new(ANCHOR_FILE)));
+    if let Err(error) = written {
+        // Aufräumen nach bestem Bemühen: der ursprüngliche Fehler zählt, und
+        // der nächste Schreiber entfernt einen Rest ohnehin vorher.
+        if let Err(cleanup) = unlink_at(root.as_fd(), temp)
+            && cleanup.kind() != io::ErrorKind::NotFound
+        {
+            tracing::debug!(error = %cleanup, "verdict anchor temp file not removed");
         }
-        let segments = self.list_segments()?;
-        let anchor = self.read_anchor()?;
-        walk_listed(segments, anchor.as_ref(), visit)
+        return Err(VerdictStoreError::Io(error));
     }
+    root.sync_all()?;
+    Ok(())
+}
 
-    // Wie `walk`, aber eine Verletzung der Kette ist ein Fehler (Leser
-    // bekommen nie einen womöglich manipulierten Stand).
-    fn walk_verified(&self, visit: impl FnMut(&VerdictRecord)) -> VerdictStoreResult<Walk> {
-        let mut walk = self.walk(visit)?;
-        match walk.fault.take() {
-            Some((_, error)) => Err(error),
-            None => Ok(walk),
+// Alle Segmente in `root`, aufsteigend nach erster `seq`. Fremde Namen
+// werden ignoriert; ein Segmentname auf etwas anderem als einer regulären
+// Datei (Symlink, Verzeichnis, FIFO …) ist ein Fehler. Gelistet wird per
+// `readdir` auf einer Kopie des Deskriptors, geprüft per `fstatat` ohne
+// Symlink-Folge relativ zu `root`. Ein zwischen Auflisten und Prüfen
+// verschwundener Eintrag (eine gleichzeitige Retention) gilt als nie
+// gelistet.
+fn list_segments(root: &File) -> VerdictStoreResult<Vec<Segment>> {
+    let mut segments = Vec::new();
+    for entry in read_dir_names(root.as_fd())? {
+        let Some(name) = entry.to_str() else {
+            continue;
+        };
+        let Some(first_seq) = parse_segment_name(name) else {
+            continue;
+        };
+        match entry_type_at(root.as_fd(), Path::new(name))? {
+            Some(EntryType::File) => {}
+            None => continue,
+            Some(_) => return Err(VerdictStoreError::UnsafeSegment),
         }
+        segments.push(Segment {
+            first_seq,
+            name: name.to_owned(),
+        });
     }
+    segments.sort_by_key(|segment| segment.first_seq);
+    Ok(segments)
+}
 
-    // `true`, wenn das Store-Verzeichnis existiert; ein Symlink oder eine
-    // Datei an seiner Stelle ist ein Fehler.
-    fn root_exists(&self) -> VerdictStoreResult<bool> {
-        match std::fs::symlink_metadata(&self.root) {
-            Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
-            Ok(_) => Err(VerdictStoreError::UnsafeDirectory {
-                detail: "store root is not a directory",
-            }),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(VerdictStoreError::Io(error)),
+// Öffnet `state_dir`. Es ist vom Aufrufer vorgegeben und vertraut und darf
+// ein Symlink sein (etwa `~/.harw` → `/data/harw`); die Symlink-Grenze
+// beginnt darunter. Geöffnet wird `<state_dir>/.`: die Auflösung von `.`
+// verlangt ein Verzeichnis, ein FIFO oder Gerät an dieser Stelle scheitert
+// also mit `ENOTDIR`, bevor es geöffnet wird (kein Blockieren, kein
+// Wettlauf zwischen einer Typprüfung und dem Öffnen); Symlinks im vertrauten
+// Pfad werden dabei wie gewollt aufgelöst. Danach prüft `fstat` den Typ am
+// Deskriptor noch einmal. `None`, wenn es fehlt (auch für einen leeren Pfad,
+// der sonst als `.` das Arbeitsverzeichnis öffnete).
+fn open_state_dir(state_dir: &Path) -> VerdictStoreResult<Option<File>> {
+    if state_dir.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let state = match File::open(state_dir.join(".")) {
+        Ok(state) => state,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+            return Err(VerdictStoreError::UnsafeDirectory {
+                detail: STATE_DIR_NOT_A_DIRECTORY,
+            });
         }
+        Err(error) => return Err(VerdictStoreError::Io(error)),
+    };
+    if !state.metadata()?.is_dir() {
+        return Err(VerdictStoreError::UnsafeDirectory {
+            detail: STATE_DIR_NOT_A_DIRECTORY,
+        });
     }
+    Ok(Some(state))
+}
 
-    // Legt das Verzeichnis an (fehlende Glieder `0700`), öffnet es ohne
-    // Symlink-Folge und setzt `0700` per `fchmod` (umask-unabhängig). Der
-    // Deskriptor dient danach dem Verzeichnis-`fsync`. Ein Symlink an der
-    // Stelle des Verzeichnisses liefert bei `O_DIRECTORY | O_NOFOLLOW` je nach
-    // Kernel `ELOOP` oder `ENOTDIR`; beides wird `UnsafeDirectory`.
-    // Dauerhaftigkeit: für jedes Glied, das dieser Aufruf neu anlegt, wird
-    // das Elternverzeichnis synchronisiert, bevor irgendetwas quittiert wird;
-    // sonst könnte nach einem Stromausfall `verdicts/` samt quittiertem
-    // Segment fehlen. Legt ein anderer Prozess die Glieder gleichzeitig an,
-    // synchronisiert er sie selbst.
-    fn ensure_dir(&self) -> VerdictStoreResult<File> {
-        let missing = missing_directories(&self.root)?;
+// Wie `open_state_dir`, legt `state_dir` aber an, falls es fehlt (fehlende
+// Glieder `0700`; das Elternverzeichnis jedes neuen Glieds wird
+// synchronisiert, bevor etwas quittiert wird). Legt ein anderer Prozess die
+// Glieder gleichzeitig an, synchronisiert er sie selbst.
+fn create_state_dir(state_dir: &Path) -> VerdictStoreResult<File> {
+    let missing = missing_directories(state_dir)?;
+    if !missing.is_empty() {
         DirBuilder::new()
             .recursive(true)
             .mode(DIR_MODE)
-            .create(&self.root)?;
+            .create(state_dir)?;
         for created in &missing {
             sync_directory(parent_or_current(created))?;
         }
-        let fd = open_dir_nofollow(&self.root).map_err(|error| {
-            if is_symlink_loop(&error) || error.kind() == io::ErrorKind::NotADirectory {
-                VerdictStoreError::UnsafeDirectory {
-                    detail: "store root is not a real directory",
-                }
-            } else {
-                VerdictStoreError::Io(error)
-            }
-        })?;
-        let dir = File::from(fd);
-        dir.set_permissions(Permissions::from_mode(DIR_MODE))?;
-        Ok(dir)
     }
+    open_state_dir(state_dir)?
+        .ok_or_else(|| VerdictStoreError::Io(io::Error::from(io::ErrorKind::NotFound)))
+}
 
-    // Nimmt die exklusive Schreibsperre; wartet begrenzt (siehe `LOCK_ATTEMPTS`).
-    fn acquire_lock(&self) -> VerdictStoreResult<File> {
-        let lock = open_nofollow(
-            &self.root.join(LOCK_FILE),
-            OpenMode {
-                read: false,
-                write: true,
-                create: true,
-                create_new: false,
-                truncate: false,
-                append: false,
-                mode: FILE_MODE,
+// Öffnet das Glied `name` direkt unter `parent` ohne Symlink-Folge
+// (`open_dir_at`: `O_DIRECTORY | O_NOFOLLOW`, ein Nicht-Verzeichnis wie ein
+// FIFO oder Gerät wird gar nicht erst geöffnet) und prüft es
+// (`verified_store_dir`). `None`, wenn es fehlt.
+fn open_store_dir(parent: &File, name: &str) -> VerdictStoreResult<Option<File>> {
+    match open_dir_at(parent.as_fd(), Path::new(name)) {
+        Ok(dir) => verified_store_dir(dir).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(map_dir_open_error(error)),
+    }
+}
+
+// Legt `name` direkt unter `parent` an, falls dort noch kein Eintrag liegt
+// (`mkdirat`, `0700`; ein vorhandener Eintrag, auch ein Symlink, bleibt
+// unberührt und wird nicht verfolgt, am Ziel eines Symlinks entsteht also
+// nichts), synchronisiert bei einem neuen Glied `parent` und öffnet und
+// prüft das Glied wie `open_store_dir`.
+fn create_store_dir(parent: &File, name: &str) -> VerdictStoreResult<File> {
+    if mkdir_at(parent.as_fd(), Path::new(name), DIR_MODE)? {
+        parent.sync_all()?;
+    }
+    let dir = open_dir_at(parent.as_fd(), Path::new(name)).map_err(map_dir_open_error)?;
+    verified_store_dir(dir)
+}
+
+// Ein Glied der Grenze muss ein Verzeichnis sein, der effektiven uid gehören
+// und darf für Gruppe/Andere nicht beschreibbar sein: sonst könnte ein
+// Dritter darin Einträge vertauschen, etwa ein anderes eigenes Verzeichnis
+// an die Stelle von `verdicts` setzen. Ein zu offenes Verzeichnis wird nicht
+// repariert, sondern abgelehnt.
+fn verified_store_dir(dir: File) -> VerdictStoreResult<File> {
+    match ensure_owned_directory(&dir) {
+        Ok(()) => Ok(dir),
+        Err(error) => Err(match error.kind() {
+            io::ErrorKind::NotADirectory => VerdictStoreError::UnsafeDirectory {
+                detail: NOT_A_REAL_DIRECTORY,
             },
-        )
-        .map_err(|error| {
-            if is_symlink_loop(&error) {
-                VerdictStoreError::UnsafeDirectory {
-                    detail: "lock file is a symbolic link",
-                }
-            } else {
-                VerdictStoreError::Io(error)
-            }
-        })?;
-        lock.set_permissions(Permissions::from_mode(FILE_MODE))?;
-        for attempt in 0..LOCK_ATTEMPTS {
-            match FileExt::try_lock(&lock) {
-                Ok(()) => return Ok(lock),
-                Err(fs4::TryLockError::WouldBlock) => {
-                    if attempt.saturating_add(1) < LOCK_ATTEMPTS {
-                        std::thread::sleep(LOCK_BACKOFF);
-                    }
-                }
-                Err(fs4::TryLockError::Error(error)) => return Err(VerdictStoreError::Io(error)),
-            }
-        }
-        Err(VerdictStoreError::LockContended)
+            io::ErrorKind::PermissionDenied => VerdictStoreError::UnsafeDirectory {
+                detail: NOT_A_PRIVATE_DIRECTORY,
+            },
+            _ => VerdictStoreError::Io(error),
+        }),
     }
+}
 
-    // Liest `anchor.json`; `None`, solange keine Retention gelöscht hat.
-    fn read_anchor(&self) -> VerdictStoreResult<Option<VerdictAnchor>> {
-        let file = match open_nofollow(&self.root.join(ANCHOR_FILE), OpenMode::read_only()) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) if is_symlink_loop(&error) => {
-                return Err(VerdictStoreError::AnchorCorrupt);
-            }
-            Err(error) => return Err(VerdictStoreError::Io(error)),
-        };
-        ensure_private_regular(&file)?;
-        let mut bytes = Vec::new();
-        (&file)
-            .take(MAX_ANCHOR_BYTES.saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_ANCHOR_BYTES {
-            return Err(VerdictStoreError::AnchorCorrupt);
+// Fehler beim Öffnen eines Glieds (`open_dir_at`): ein Symlink (`ELOOP` bzw.
+// `ENOTDIR`, je nach Kernel) oder ein Nicht-Verzeichnis (`ENOTDIR`, auch ein
+// FIFO oder Gerät) an seiner Stelle ist `UnsafeDirectory`, alles andere I/O.
+fn map_dir_open_error(error: io::Error) -> VerdictStoreError {
+    if is_symlink_loop(&error) || error.kind() == io::ErrorKind::NotADirectory {
+        VerdictStoreError::UnsafeDirectory {
+            detail: NOT_A_REAL_DIRECTORY,
         }
-        let anchor: VerdictAnchor =
-            serde_json::from_slice(&bytes).map_err(|_| VerdictStoreError::AnchorCorrupt)?;
-        if anchor.version != ANCHOR_VERSION || anchor.first_seq < FIRST_VERDICT_SEQ {
-            return Err(VerdictStoreError::AnchorCorrupt);
-        }
-        Ok(Some(anchor))
-    }
-
-    // Schreibt `anchor.json` atomar (`0600`, Datei- und Verzeichnis-`fsync`).
-    fn write_anchor(&self, anchor: &VerdictAnchor) -> VerdictStoreResult<()> {
-        let bytes = serde_json::to_vec(anchor)?;
-        write_atomic(
-            &self.root.join(ANCHOR_FILE),
-            &bytes,
-            AtomicWriteOptions::private(),
-        )?;
-        Ok(())
-    }
-
-    // Alle Segmente, aufsteigend nach erster `seq`. Fremde Namen werden
-    // ignoriert, ein Segmentname auf etwas anderem als einer regulären
-    // Datei ist ein Fehler.
-    fn list_segments(&self) -> VerdictStoreResult<Vec<Segment>> {
-        let mut segments = Vec::new();
-        for entry in std::fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let Some(first_seq) = file_name.to_str().and_then(parse_segment_name) else {
-                continue;
-            };
-            if !entry.file_type()?.is_file() {
-                return Err(VerdictStoreError::UnsafeSegment);
-            }
-            segments.push(Segment {
-                first_seq,
-                path: entry.path(),
-            });
-        }
-        segments.sort_by_key(|segment| segment.first_seq);
-        Ok(segments)
+    } else {
+        VerdictStoreError::Io(error)
     }
 }
 
@@ -1578,16 +2194,21 @@ impl VerdictStore {
 struct Segment {
     // Erste `seq`, aus dem Dateinamen.
     first_seq: u64,
-    // Vollständiger Pfad.
-    path: PathBuf,
+    // Dateiname im Store-Verzeichnis; geöffnet wird nur relativ zu dessen
+    // Deskriptor.
+    name: String,
 }
 
-// Kennzahlen eines geprüften Segments für die Retention.
+// Kennzahlen eines geprüften Segments für die Retention und das Anhängen.
 struct SegmentStats {
-    // Vollständiger Pfad.
-    path: PathBuf,
+    // Erste `seq`, aus dem Dateinamen.
+    first_seq: u64,
+    // Dateiname im Store-Verzeichnis.
+    name: String,
     // Anzahl Datensätze.
     records: u64,
+    // `created_at` des ersten Datensatzes (Rotation nach Alter).
+    first_created: Option<Timestamp>,
     // Jüngstes `created_at` im Segment.
     newest: Option<Timestamp>,
     // Referenz auf den letzten Datensatz.
@@ -1600,16 +2221,21 @@ struct Walk {
     summary: VerdictChainSummary,
     // Vollständig geprüfte Segmente in Reihenfolge; endet vor `fault`.
     live: Vec<SegmentStats>,
-    // Segmente vor dem Anker (aus einer unterbrochenen Retention).
-    retired: Vec<PathBuf>,
+    // Dateinamen der Segmente vor dem Anker (aus einer unterbrochenen
+    // Retention).
+    retired: Vec<String>,
     // Erste Verletzung: erste `seq` (Name) des betroffenen Segments und der
     // inhaltsfreie Fehler. Der Durchlauf endete dort.
     fault: Option<(u64, VerdictStoreError)>,
+    // Die Position hinter dem letzten geprüften Datensatz (bzw. Anker oder
+    // Genesis): `seq` und `prev_hash` des nächsten Datensatzes. Nur ohne
+    // `fault` die Fortsetzung der Kette; `append_locked` schreibt nur dann.
+    next: ChainCursor,
 }
 
 impl Walk {
-    // Ein leerer Durchlauf, dessen Kette bei `first_seq` beginnt.
-    fn empty(first_seq: u64) -> Self {
+    // Ein leerer Durchlauf, dessen Kette bei `first_seq` mit `prev` beginnt.
+    fn empty(first_seq: u64, prev: ContentDigest) -> Self {
         Self {
             summary: VerdictChainSummary {
                 records: 0,
@@ -1619,6 +2245,10 @@ impl Walk {
             live: Vec::new(),
             retired: Vec::new(),
             fault: None,
+            next: ChainCursor {
+                seq: first_seq,
+                prev,
+            },
         }
     }
 }
@@ -1637,28 +2267,34 @@ struct ChainCursor {
 // Segments (`is_chain_fault`) beendet den Durchlauf und steht in
 // `Walk::fault`; `Walk::live` enthält dann nur die vollständig geprüften
 // Segmente davor. Andere Fehler (I/O, Rechte, Symlinks) brechen ab.
-// Getrennt von `VerdictStore::walk`, damit Tests eine Liste und einen Anker
-// aus verschiedenen Zeitpunkten kombinieren können.
+// Ohne Verletzung steht `Walk::next` danach hinter dem letzten Datensatz.
+// Segmente werden nur relativ zu `root` geöffnet. Getrennt von `walk_root`,
+// damit Tests eine Liste und einen Anker aus verschiedenen Zeitpunkten
+// kombinieren können.
 fn walk_listed(
+    root: &File,
     segments: Vec<Segment>,
     anchor: Option<&VerdictAnchor>,
     mut visit: impl FnMut(&VerdictRecord),
 ) -> VerdictStoreResult<Walk> {
     let (first_seq, prev) = chain_start(anchor);
-    let mut cursor = ChainCursor {
-        seq: first_seq,
-        prev,
-    };
-    let mut walk = Walk::empty(first_seq);
+    let mut walk = Walk::empty(first_seq, prev);
     let last_position = segments.len().checked_sub(1);
     for (position, segment) in segments.into_iter().enumerate() {
         if segment.first_seq < first_seq {
-            walk.retired.push(segment.path);
+            walk.retired.push(segment.name);
             continue;
         }
         let segment_seq = segment.first_seq;
         let is_last = Some(position) == last_position;
-        match verify_segment(segment, is_last, &mut cursor, &mut walk.summary, &mut visit) {
+        match verify_segment(
+            root,
+            segment,
+            is_last,
+            &mut walk.next,
+            &mut walk.summary,
+            &mut visit,
+        ) {
             Ok(stats) => walk.live.push(stats),
             Err(error) if is_chain_fault(&error) => {
                 walk.fault = Some((segment_seq, error));
@@ -1670,16 +2306,18 @@ fn walk_listed(
     Ok(walk)
 }
 
-// Prüft ein Segment ab der Position `cursor`, schreibt `cursor` und
-// `summary` fort und liefert die Kennzahlen des Segments.
+// Prüft ein Segment (geöffnet relativ zu `root`) ab der Position `cursor`,
+// schreibt `cursor` und `summary` fort und liefert die Kennzahlen des
+// Segments.
 fn verify_segment(
+    root: &File,
     segment: Segment,
     is_last: bool,
     cursor: &mut ChainCursor,
     summary: &mut VerdictChainSummary,
     visit: &mut impl FnMut(&VerdictRecord),
 ) -> VerdictStoreResult<SegmentStats> {
-    let records = read_segment(&segment.path, segment.first_seq, is_last)?;
+    let records = read_segment(root, &segment.name, segment.first_seq, is_last)?;
     if let Some(first) = records.first()
         && first.seq != segment.first_seq
     {
@@ -1689,8 +2327,10 @@ fn verify_segment(
         });
     }
     let mut stats = SegmentStats {
-        path: segment.path,
+        first_seq: segment.first_seq,
+        name: segment.name,
         records: 0,
+        first_created: records.first().map(|first| first.created_at),
         newest: None,
         last: None,
     };
@@ -1728,12 +2368,14 @@ const fn is_chain_fault(error: &VerdictStoreError) -> bool {
     )
 }
 
-// Die Glieder von `root` aufwärts, die noch nicht existieren, das oberste
-// zuerst. Ein Eintrag beliebiger Art (auch ein Symlink) gilt als vorhanden;
-// `ensure_dir` prüft den Typ danach selbst.
-fn missing_directories(root: &Path) -> VerdictStoreResult<Vec<PathBuf>> {
+// Die Glieder des vertrauten `state_dir` aufwärts, die noch nicht
+// existieren, das oberste zuerst (nur für `create_state_dir`; unterhalb von
+// `state_dir` legt der Store per `mkdirat` an). Ein Eintrag beliebiger Art
+// (auch ein Symlink) gilt als vorhanden; `open_state_dir` prüft den Typ
+// danach selbst.
+fn missing_directories(state_dir: &Path) -> VerdictStoreResult<Vec<PathBuf>> {
     let mut missing = Vec::new();
-    let mut current = Some(root);
+    let mut current = Some(state_dir);
     while let Some(path) = current {
         if path.as_os_str().is_empty() || entry_exists(path)? {
             break;
@@ -1952,25 +2594,6 @@ fn check_record(
     }
 }
 
-// Prüft den Vorgänger eines neuen Datensatzes: Hash, Markierung, Invarianten,
-// Lage hinter dem Anker.
-fn ensure_sealed(record: &VerdictRecord, first_seq: u64) -> VerdictStoreResult<()> {
-    let reason = if record.seq < first_seq {
-        Some(ChainBreak::SequenceMismatch {
-            expected: first_seq,
-        })
-    } else {
-        seal_violation(record)
-    };
-    match reason {
-        Some(reason) => Err(VerdictStoreError::ChainBroken {
-            seq: record.seq,
-            reason,
-        }),
-        None => Ok(()),
-    }
-}
-
 // Was an einem Datensatz selbst (ohne Nachbarn) nicht stimmt.
 fn seal_violation(record: &VerdictRecord) -> Option<ChainBreak> {
     if compute_record_hash(record) != record.record_hash {
@@ -2006,7 +2629,9 @@ fn parse_segment_name(name: &str) -> Option<u64> {
         .filter(|seq| *seq >= FIRST_VERDICT_SEQ)
 }
 
-// `true`, wenn an `path` irgendein Eintrag liegt (auch ein Symlink).
+// `true`, wenn an `path` irgendein Eintrag liegt (auch ein Symlink). Nur für
+// den vertrauten Teil oberhalb der Grenze (`missing_directories`); darunter
+// gilt `entry_type_at` relativ zum Deskriptor.
 fn entry_exists(path: &Path) -> VerdictStoreResult<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -2024,11 +2649,13 @@ fn map_open_error(error: io::Error) -> VerdictStoreError {
     }
 }
 
-// Öffnet ein Segment lesend und anhängend (anlegen mit `0600`), setzt die
-// Rechte per `fchmod` auf `0600` und prüft Eigentümer und Typ.
-fn open_segment_append(path: &Path) -> VerdictStoreResult<File> {
-    let file = open_nofollow(
-        path,
+// Öffnet das Segment `name` in `root` lesend und anhängend (anlegen mit
+// `0600`, ohne Symlink-Folge), setzt die Rechte per `fchmod` auf `0600` und
+// prüft Eigentümer und Typ.
+fn open_segment_append(root: &File, name: &str) -> VerdictStoreResult<File> {
+    let file = open_beneath(
+        root.as_fd(),
+        Path::new(name),
         OpenMode {
             read: true,
             ..OpenMode::append_create(FILE_MODE)
@@ -2040,20 +2667,24 @@ fn open_segment_append(path: &Path) -> VerdictStoreResult<File> {
     Ok(file)
 }
 
-// Öffnet ein Segment nur lesend und prüft `0600`, Eigentümer und Typ.
-fn open_segment_read(path: &Path) -> VerdictStoreResult<File> {
-    let file = open_nofollow(path, OpenMode::read_only()).map_err(map_open_error)?;
+// Öffnet das Segment `name` in `root` nur lesend (ohne Symlink-Folge) und
+// prüft `0600`, Eigentümer und Typ.
+fn open_segment_read(root: &File, name: &str) -> VerdictStoreResult<File> {
+    let file = open_beneath(root.as_fd(), Path::new(name), OpenMode::read_only())
+        .map_err(map_open_error)?;
     ensure_private_regular(&file)?;
     Ok(file)
 }
 
-// Liest ein ganzes Segment (begrenzt) und dekodiert alle vollständigen Zeilen.
+// Liest das Segment `name` aus `root` ganz (begrenzt) und dekodiert alle
+// vollständigen Zeilen.
 fn read_segment(
-    path: &Path,
+    root: &File,
+    name: &str,
     segment_seq: u64,
     allow_torn_tail: bool,
 ) -> VerdictStoreResult<Vec<VerdictRecord>> {
-    let file = open_segment_read(path)?;
+    let file = open_segment_read(root, name)?;
     let mut bytes = Vec::new();
     (&file)
         .take(MAX_SEGMENT_READ_BYTES.saturating_add(1))
@@ -2178,84 +2809,12 @@ fn repair_torn_tail(file: &mut File, segment_seq: u64) -> VerdictStoreResult<()>
     Ok(())
 }
 
-// Liest den letzten Datensatz eines Segments, das leer ist oder auf `\n`
-// endet; sonst `CorruptRecord`.
-fn read_last_record(
-    file: &mut File,
-    segment_seq: u64,
-) -> VerdictStoreResult<Option<VerdictRecord>> {
-    let corrupt = VerdictStoreError::CorruptRecord {
-        segment_seq,
-        line: 0,
-    };
-    let len = file.metadata()?.len();
-    if len == 0 {
-        return Ok(None);
-    }
-    let window = len.min(record_window());
-    let start = len.saturating_sub(window);
-    let buffer = read_window(file, start, window)?;
-    let Some(body) = buffer.strip_suffix(b"\n") else {
-        return Err(corrupt);
-    };
-    let line = match body.iter().rposition(|byte| *byte == b'\n') {
-        Some(index) => body.get(index.saturating_add(1)..).ok_or(corrupt)?,
-        None if start == 0 => body,
-        None => return Err(corrupt),
-    };
-    decode_line(line, segment_seq, 0).map(Some)
-}
-
-// Liest den ersten Datensatz eines Segments, das leer ist oder auf `\n`
-// endet: `None` für ein leeres Segment, `CorruptRecord` (Zeile 1), wenn die
-// erste Zeile fehlt oder unlesbar ist. Eine Zeile ist höchstens
-// `MAX_VERDICT_RECORD_BYTES` lang und passt deshalb in `record_window()`.
-fn read_first_record(
-    file: &mut File,
-    segment_seq: u64,
-) -> VerdictStoreResult<Option<VerdictRecord>> {
-    let corrupt = || VerdictStoreError::CorruptRecord {
-        segment_seq,
-        line: 1,
-    };
-    let len = file.metadata()?.len();
-    if len == 0 {
-        return Ok(None);
-    }
-    let buffer = read_window(file, 0, len.min(record_window()))?;
-    let end = buffer
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .ok_or_else(corrupt)?;
-    let (line, _) = buffer.split_at_checked(end).ok_or_else(corrupt)?;
-    decode_line(line, segment_seq, 1).map(Some)
-}
-
-// `true`, wenn das aktive Segment nicht mehr fortgesetzt werden soll, weil
-// sein erster Datensatz `VERDICT_SEGMENT_SPAN` oder länger vor `created_at`
-// liegt (Rotation nach Alter). Ein leeres Segment hat keine Spanne. Eine
-// unlesbare erste Zeile (Kettenverletzung) schließt das Segment ebenfalls:
-// neue Datensätze landen dann in einem frischen Segment, die Verletzung
-// bleibt sichtbar. Läuft die Uhr zurück (negative Dauer), rotiert nichts.
-fn segment_span_exhausted(
-    file: &mut File,
-    segment_seq: u64,
-    created_at: Timestamp,
-) -> VerdictStoreResult<bool> {
-    match read_first_record(file, segment_seq) {
-        Ok(Some(first)) => Ok(created_at.duration_since(first.created_at) >= VERDICT_SEGMENT_SPAN),
-        Ok(None) => Ok(false),
-        Err(error) if is_chain_fault(&error) => Ok(true),
-        Err(error) => Err(error),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
     use std::fs::OpenOptions;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, symlink};
 
     // Feste Basiszeit (2030-03-17), unabhängig von der Wanduhr.
     const BASE_SECOND: i64 = 1_900_000_000;
@@ -2288,14 +2847,17 @@ mod tests {
     }
 
     // Store mit `count` Ein-Datensatz-Segmenten; `old` davon 100 Tage alt,
-    // der Rest einen Tag alt.
+    // der Rest einen Tag alt. Ohne Retention beim Anhängen, damit die alten
+    // Segmente für `apply_retention` liegen bleiben.
     fn store_with_segments(
         temp: &Path,
         old: usize,
         count: usize,
         now: Timestamp,
     ) -> TestResult<VerdictStore> {
-        let store = VerdictStore::new(temp).with_segment_limit(1);
+        let store = VerdictStore::new(temp)
+            .with_segment_limit(1)
+            .without_auto_retention();
         let finding_a = finding("finding-a")?;
         let old_at = days_before(now, 100)?;
         let recent_at = days_before(now, 1)?;
@@ -2324,13 +2886,56 @@ mod tests {
         Ok(())
     }
 
-    fn segment_paths(store: &VerdictStore) -> TestResult<Vec<PathBuf>> {
-        Ok(store
-            .list_segments()
+    // Das Store-Verzeichnis als Deskriptor, so wie jeder öffentliche Aufruf
+    // es öffnet (Glied für Glied, ohne Symlink-Folge).
+    fn root_of(store: &VerdictStore) -> TestResult<File> {
+        store
+            .open_root()
+            .map_err(ctx("open store root"))?
+            .ok_or(TestError::Missing("store root"))
+    }
+
+    // Die Segmente als (erste `seq`, Pfad), aufsteigend; leer ohne Store.
+    fn listed_segments(store: &VerdictStore) -> TestResult<Vec<(u64, PathBuf)>> {
+        let Some(root) = store.open_root().map_err(ctx("open store root"))? else {
+            return Ok(Vec::new());
+        };
+        Ok(list_segments(&root)
             .map_err(ctx("list segments"))?
             .into_iter()
-            .map(|segment| segment.path)
+            .map(|segment| (segment.first_seq, store.root().join(segment.name)))
             .collect())
+    }
+
+    fn segment_paths(store: &VerdictStore) -> TestResult<Vec<PathBuf>> {
+        Ok(listed_segments(store)?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect())
+    }
+
+    // Legt `<state_dir>/dod/verdicts` vorab an, wie es ein früherer Lauf
+    // getan hätte (`0700` abzüglich umask, also nie für Gruppe/Andere
+    // beschreibbar).
+    fn precreate_root(store: &VerdictStore) -> TestResult {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(DIR_MODE)
+            .create(store.root())?;
+        Ok(())
+    }
+
+    // Erwartet `UnsafeDirectory` (beliebiger Grund).
+    fn expect_unsafe_directory<T: fmt::Debug>(result: VerdictStoreResult<T>) -> TestResult {
+        match result {
+            Err(VerdictStoreError::UnsafeDirectory { .. }) => Ok(()),
+            other => Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    // Anzahl der Einträge eines Verzeichnisses (per Pfad, nur im Test).
+    fn entry_count(dir: &Path) -> TestResult<usize> {
+        Ok(std::fs::read_dir(dir)?.count())
     }
 
     fn only_segment(store: &VerdictStore) -> TestResult<PathBuf> {
@@ -2367,8 +2972,17 @@ mod tests {
         Ok(())
     }
 
-    fn expect_chain_broken(
-        result: VerdictStoreResult<VerdictChainSummary>,
+    // Inhalt jeder Datei in `paths`, um „nichts geändert“ zu prüfen.
+    fn snapshot(paths: &[PathBuf]) -> TestResult<Vec<Vec<u8>>> {
+        paths
+            .iter()
+            .map(|path| std::fs::read(path).map_err(TestError::from))
+            .collect()
+    }
+
+    // Erwartet `ChainBroken { seq, reason }` aus `verify_chain` oder `append`.
+    fn expect_chain_broken<T: fmt::Debug>(
+        result: VerdictStoreResult<T>,
         seq: u64,
         reason: ChainBreak,
     ) -> TestResult {
@@ -2807,16 +3421,16 @@ mod tests {
                 .append(&verdict(&finding_a, &format!("Begründung {index}"), now))
                 .map_err(ctx("append"))?;
         }
-        let segments = store.list_segments().map_err(ctx("segments"))?;
+        let segments = listed_segments(&store)?;
         assert!(segments.len() >= 2);
-        for segment in &segments {
-            assert!(std::fs::metadata(&segment.path)?.len() <= 1_500);
-            let text = std::fs::read_to_string(&segment.path)?;
+        for (first_seq, path) in &segments {
+            assert!(std::fs::metadata(path)?.len() <= 1_500);
+            let text = std::fs::read_to_string(path)?;
             let first = parse_lines(&text)?
                 .into_iter()
                 .next()
                 .ok_or(TestError::Missing("first record of segment"))?;
-            assert_eq!(first.seq(), segment.first_seq);
+            assert_eq!(first.seq(), *first_seq);
         }
         let summary = store.verify_chain().map_err(ctx("verify"))?;
         assert_eq!(summary.records, 8);
@@ -2826,8 +3440,13 @@ mod tests {
     #[test]
     fn retention_removes_expired_segments_and_keeps_the_chain_verifiable() -> TestResult {
         let temp = tempfile::tempdir()?;
-        // Grenze 1: jedes Segment fasst genau einen Datensatz.
-        let store = VerdictStore::new(temp.path()).with_segment_limit(1);
+        // Grenze 1: jedes Segment fasst genau einen Datensatz. Ohne Retention
+        // beim Anhängen (die hätte die alten Segmente schon beim fünften
+        // Anhängen entfernt; siehe
+        // `append_applies_retention_when_it_starts_a_new_segment`).
+        let store = VerdictStore::new(temp.path())
+            .with_segment_limit(1)
+            .without_auto_retention();
         let finding_a = finding("finding-a")?;
         let now = at(BASE_SECOND)?;
         let old = days_before(now, 100)?;
@@ -3009,11 +3628,11 @@ mod tests {
                 .map_err(ctx("append"))?;
         }
 
-        let segments = store.list_segments().map_err(ctx("segments"))?;
-        let names: Vec<u64> = segments.iter().map(|segment| segment.first_seq).collect();
+        let segments = listed_segments(&store)?;
+        let names: Vec<u64> = segments.iter().map(|(first_seq, _)| *first_seq).collect();
         assert_eq!(names, [1_u64, 3]);
-        for segment in &segments {
-            let records = parse_lines(&std::fs::read_to_string(&segment.path)?)?;
+        for (_, path) in &segments {
+            let records = parse_lines(&std::fs::read_to_string(path)?)?;
             assert_eq!(records.len(), 2);
         }
         let summary = store.verify_chain().map_err(ctx("verify"))?;
@@ -3025,8 +3644,10 @@ mod tests {
     fn retention_tracks_the_window_on_a_low_volume_store() -> TestResult {
         // Ein Verdict etwa alle 30 Tage: ohne Rotation nach Alter läge alles
         // in einem Segment, dessen jüngster Datensatz nie 90 Tage alt würde.
+        // Ohne Retention beim Anhängen; dieselbe Folge mit ihr prüft
+        // `append_retention_tracks_the_window_without_apply_retention`.
         let temp = tempfile::tempdir()?;
-        let store = VerdictStore::new(temp.path());
+        let store = VerdictStore::new(temp.path()).without_auto_retention();
         let finding_a = finding("finding-a")?;
         let now = at(BASE_SECOND)?;
         for days in [150, 120, 95, 60, 30, 0] {
@@ -3049,7 +3670,264 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_first_line_of_the_active_segment_closes_it() -> TestResult {
+    fn append_applies_retention_when_it_starts_a_new_segment() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        // Standardgrenzen: drei alte Datensätze in einem Segment, und niemand
+        // ruft `apply_retention` auf.
+        let store = VerdictStore::new(temp.path());
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        let old = days_before(now, 120)?;
+        let mut last = None;
+        for rationale in ["eins", "zwei", "drei"] {
+            last = Some(
+                store
+                    .append(&verdict(&finding_a, rationale, old))
+                    .map_err(ctx("append old"))?,
+            );
+        }
+        let last = last.ok_or(TestError::Missing("last reference"))?;
+        let old_segment = only_segment(&store)?;
+
+        // Das nächste Anhängen beginnt nach der Zeitspanne ein neues Segment.
+        // Die mitlaufende Retention lässt das bisher aktive Segment stehen,
+        // obwohl es abgelaufen ist: nur Segmente davor kommen in Frage.
+        let next = store
+            .append(&verdict(&finding_a, "vier", now))
+            .map_err(ctx("append now"))?;
+        assert_eq!(next.seq, 4);
+        assert!(old_segment.exists());
+        assert!(!store.root().join(ANCHOR_FILE).exists());
+        assert_eq!(
+            store
+                .verify_chain()
+                .map_err(ctx("verify after the first rotation"))?
+                .records,
+            4
+        );
+
+        // Ohne Segmentwechsel läuft keine Retention.
+        let fifth = store
+            .append(&verdict(&finding_a, "fünf", now))
+            .map_err(ctx("append into the same segment"))?;
+        assert_eq!(fifth.seq, 5);
+        assert!(old_segment.exists());
+
+        // Der nächste Segmentwechsel entfernt es (`created_at` als Jetzt);
+        // jetzt ist Segment 4 das bisher aktive und bleibt.
+        let later = now
+            .checked_add(VERDICT_SEGMENT_SPAN)
+            .map_err(ctx("later"))?;
+        let sixth = store
+            .append(&verdict(&finding_a, "sechs", later))
+            .map_err(ctx("append later"))?;
+        assert_eq!(sixth.seq, 6);
+        assert!(!old_segment.exists());
+        let names: Vec<u64> = listed_segments(&store)?
+            .iter()
+            .map(|(first_seq, _)| *first_seq)
+            .collect();
+        assert_eq!(names, [4_u64, 6]);
+        assert_eq!(mode_of(&store.root().join(ANCHOR_FILE))?, 0o600);
+        let anchor = read_anchor(&root_of(&store)?)
+            .map_err(ctx("anchor"))?
+            .ok_or(TestError::Missing("anchor"))?;
+        assert_eq!(anchor.first_seq, 4);
+        assert_eq!(anchor.prev_hash, last.verdict_digest);
+        assert_eq!(anchor.anchored_at, later);
+        let summary = store.verify_chain().map_err(ctx("verify"))?;
+        assert_eq!(summary.first_seq, 4);
+        assert_eq!(summary.records, 3);
+        assert_eq!(summary.last, Some(sixth));
+        Ok(())
+    }
+
+    #[test]
+    fn append_retention_after_a_forward_clock_jump_keeps_the_newest_prior_segment() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = VerdictStore::new(temp.path());
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        // Drei junge Segmente (je ein Tag).
+        let mut newest = None;
+        for days in [3, 2, 1] {
+            newest = Some(
+                store
+                    .append(&verdict(&finding_a, "Begründung", days_before(now, days)?))
+                    .map_err(ctx("append"))?,
+            );
+        }
+        let newest = newest.ok_or(TestError::Missing("newest reference"))?;
+        assert_eq!(segment_paths(&store)?.len(), 3);
+
+        // Ein einzelnes Verdict mit einer um zehn Jahre vorgestellten Uhr: aus
+        // seiner Sicht ist alles abgelaufen.
+        let jump = now
+            .checked_add(SignedDuration::from_secs(10 * 365 * 86_400))
+            .map_err(ctx("clock jump"))?;
+        let jumped = store
+            .append(&verdict(&finding_a, "Uhrsprung", jump))
+            .map_err(ctx("append with a jumped clock"))?;
+        assert_eq!(jumped.seq, 4);
+
+        // Entfernt wurden nur die Segmente vor dem bisher aktiven; der jüngste
+        // bisherige Stand (Segment 3) bleibt und verknüpft weiter.
+        let names: Vec<u64> = listed_segments(&store)?
+            .iter()
+            .map(|(first_seq, _)| *first_seq)
+            .collect();
+        assert_eq!(names, [3_u64, 4]);
+        let records = store.records().map_err(ctx("records"))?;
+        assert_eq!(records.len(), 2);
+        let first = records.first().ok_or(TestError::Missing("record 3"))?;
+        assert_eq!(first.reference(), newest);
+        assert_eq!(first.created_at(), days_before(now, 1)?);
+        let summary = store.verify_chain().map_err(ctx("verify"))?;
+        assert_eq!(summary.first_seq, 3);
+        assert_eq!(summary.last, Some(jumped));
+        Ok(())
+    }
+
+    #[test]
+    fn append_retention_tracks_the_window_without_apply_retention() -> TestResult {
+        // Dieselbe Folge wie `retention_tracks_the_window_on_a_low_volume_store`,
+        // aber nur mit `append`: jedes Anhängen beginnt ein neues Segment und
+        // entfernt dabei, was mehr als 90 Tage vor seinem `created_at` liegt.
+        let temp = tempfile::tempdir()?;
+        let store = VerdictStore::new(temp.path());
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        for days in [150, 120, 95, 60, 30, 0] {
+            store
+                .append(&verdict(&finding_a, "Begründung", days_before(now, days)?))
+                .map_err(ctx("append"))?;
+        }
+        let names: Vec<u64> = listed_segments(&store)?
+            .iter()
+            .map(|(first_seq, _)| *first_seq)
+            .collect();
+        assert_eq!(names, [4_u64, 5, 6]);
+        let summary = store.verify_chain().map_err(ctx("verify"))?;
+        assert_eq!(summary.first_seq, 4);
+        assert_eq!(summary.records, 3);
+        for record in &store.records().map_err(ctx("records"))? {
+            assert!(now.duration_since(record.created_at()) <= VERDICT_RETENTION);
+        }
+        // Ein expliziter Lauf findet danach nichts mehr.
+        let report = store.apply_retention(now).map_err(ctx("retention"))?;
+        assert_eq!(report.removed_segments, 0);
+        assert_eq!(report.first_seq, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn append_keeps_the_record_when_retention_after_rotation_fails() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = VerdictStore::new(temp.path());
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        // Zwei alte Segmente: beim nächsten Segmentwechsel ist das ältere ein
+        // Kandidat (das jüngere bleibt als bisher aktives stehen).
+        store
+            .append(&verdict(&finding_a, "älter", days_before(now, 200)?))
+            .map_err(ctx("append older"))?;
+        store
+            .append(&verdict(&finding_a, "alt", days_before(now, 120)?))
+            .map_err(ctx("append old"))?;
+        let segments = segment_paths(&store)?;
+        let older_segment = segments
+            .first()
+            .ok_or(TestError::Missing("older segment"))?
+            .clone();
+        let old_segment = segments
+            .get(1)
+            .ok_or(TestError::Missing("old segment"))?
+            .clone();
+        // Ein Verzeichnis an der Stelle der Anker-Tempdatei: `unlinkat`
+        // scheitert, die Retention bricht vor dem Anker ab.
+        let obstacle = store.root().join(ANCHOR_TEMP_FILE);
+        DirBuilder::new().mode(DIR_MODE).create(&obstacle)?;
+
+        let next = store
+            .append(&verdict(&finding_a, "neu", now))
+            .map_err(ctx("append despite a failed retention"))?;
+        assert_eq!(next.seq, 3);
+        // Der Datensatz ist quittiert; nichts gelöscht, nichts verankert.
+        assert!(older_segment.exists());
+        assert!(old_segment.exists());
+        assert!(!store.root().join(ANCHOR_FILE).exists());
+        let summary = store.verify_chain().map_err(ctx("verify"))?;
+        assert_eq!(summary.records, 3);
+        assert_eq!(summary.last, Some(next));
+
+        // Ohne das Hindernis holt der nächste Segmentwechsel sie nach (jetzt
+        // ist Segment 3 das bisher aktive).
+        std::fs::remove_dir(&obstacle)?;
+        let later = now
+            .checked_add(VERDICT_SEGMENT_SPAN)
+            .map_err(ctx("later"))?;
+        let fourth = store
+            .append(&verdict(&finding_a, "später", later))
+            .map_err(ctx("append later"))?;
+        assert_eq!(fourth.seq, 4);
+        assert!(!older_segment.exists());
+        assert!(!old_segment.exists());
+        let summary = store.verify_chain().map_err(ctx("verify after catch-up"))?;
+        assert_eq!(summary.first_seq, 3);
+        assert_eq!(summary.records, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn append_retention_never_removes_the_segment_it_just_wrote() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = VerdictStore::new(temp.path());
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        let first = store
+            .append(&verdict(&finding_a, "älter", days_before(now, 200)?))
+            .map_err(ctx("append older"))?;
+        let previous = store
+            .append(&verdict(&finding_a, "alt", days_before(now, 120)?))
+            .map_err(ctx("append old"))?;
+        assert_eq!(previous.seq, 2);
+        // Zwei leere Reste gescheiterter Anhängevorgänge: `seq` 3 (das Ziel
+        // des nächsten Datensatzes, als leeres Segment schon „abgelaufen“)
+        // und `seq` 7 (zuletzt gelistet, also kein Kandidat zum Fortsetzen;
+        // das nächste Anhängen rotiert deshalb und verwendet Segment 3 als
+        // Ziel wieder).
+        for seq in [3, 7] {
+            let path = store.root().join(segment_file_name(seq));
+            std::fs::write(&path, b"")?;
+            std::fs::set_permissions(&path, Permissions::from_mode(FILE_MODE))?;
+        }
+
+        let third = store
+            .append(&verdict(&finding_a, "neu", now))
+            .map_err(ctx("append"))?;
+        assert_eq!(third.seq, 3);
+        // Das abgelaufene Segment 1 ging. Das bisher aktive Segment 2, das
+        // gerade beschriebene Segment 3 und alles dahinter kamen für die
+        // Retention nicht in Frage.
+        let names: Vec<u64> = listed_segments(&store)?
+            .iter()
+            .map(|(first_seq, _)| *first_seq)
+            .collect();
+        assert_eq!(names, [2_u64, 3, 7]);
+        let records = store.records().map_err(ctx("records"))?;
+        assert_eq!(records.len(), 2);
+        let kept = records.first().ok_or(TestError::Missing("record 2"))?;
+        assert_eq!(kept.reference(), previous);
+        assert_eq!(kept.prev_hash(), first.verdict_digest);
+        let written = records.get(1).ok_or(TestError::Missing("record 3"))?;
+        assert_eq!(written.reference(), third);
+        assert_eq!(written.prev_hash(), previous.verdict_digest);
+        assert_eq!(store.verify_chain().map_err(ctx("verify"))?.first_seq, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn append_refuses_an_unreadable_line_in_the_active_segment() -> TestResult {
         let temp = tempfile::tempdir()?;
         let store = VerdictStore::new(temp.path());
         let finding_a = finding("finding-a")?;
@@ -3066,17 +3944,19 @@ mod tests {
             .nth(1)
             .ok_or(TestError::Missing("second line"))?;
         std::fs::write(&path, format!("{{\"not\":\"a record\"}}\n{second}\n"))?;
+        let before = std::fs::read(&path)?;
 
-        // Der Vorgänger (Datensatz 2) ist intakt; geschrieben wird in ein
-        // neues Segment, nicht hinter die unlesbare Zeile.
-        let third = store
-            .append(&verdict(&finding_a, "drei", now))
-            .map_err(ctx("append after corruption"))?;
-        assert_eq!(third.seq, 3);
-        assert_eq!(
-            segment_paths(&store)?,
-            [path, store.root().join(segment_file_name(3))]
-        );
+        // Der letzte Datensatz (2) ist für sich intakt, die Kette davor
+        // nicht: nichts wird angehängt, auch kein neues Segment begonnen.
+        assert!(matches!(
+            store.append(&verdict(&finding_a, "drei", now)),
+            Err(VerdictStoreError::CorruptRecord {
+                segment_seq: 1,
+                line: 1
+            })
+        ));
+        assert_eq!(std::fs::read(&path)?, before);
+        assert_eq!(segment_paths(&store)?, [path]);
         // Die Verletzung bleibt sichtbar.
         assert!(matches!(
             store.verify_chain(),
@@ -3089,9 +3969,160 @@ mod tests {
     }
 
     #[test]
+    fn append_refuses_a_resealed_middle_record_and_leaves_the_file_unchanged() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = VerdictStore::new(temp.path());
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        for rationale in ["eins", "zwei", "drei"] {
+            store
+                .append(&verdict(&finding_a, rationale, now))
+                .map_err(ctx("append"))?;
+        }
+        let path = only_segment(&store)?;
+        let mut records = parse_lines(&std::fs::read_to_string(&path)?)?;
+        // Datensatz 2 (nicht das Ende) ändern und neu versiegeln: jeder
+        // Datensatz ist für sich intakt, nur die Verknüpfung 2 → 3 bricht.
+        let second = records.get_mut(1).ok_or(TestError::Missing("second"))?;
+        second.classification = StoredClassification::Benign;
+        let resealed = compute_record_hash(second);
+        second.record_hash = resealed;
+        write_lines(&path, &records)?;
+        for record in &records {
+            assert_eq!(seal_violation(record), None);
+        }
+        let before = std::fs::read(&path)?;
+
+        expect_chain_broken(
+            store.append(&verdict(&finding_a, "vier", now)),
+            3,
+            ChainBreak::PrevHashMismatch,
+        )?;
+        // Nichts angehängt, nichts abgeschnitten, kein neues Segment.
+        assert_eq!(std::fs::read(&path)?, before);
+        assert_eq!(segment_paths(&store)?, [path]);
+        expect_chain_broken(store.verify_chain(), 3, ChainBreak::PrevHashMismatch)
+    }
+
+    #[test]
+    fn append_refuses_a_break_in_an_older_segment() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let now = at(BASE_SECOND)?;
+        let finding_a = finding("finding-a")?;
+        // Vier Ein-Datensatz-Segmente. Datensatz 2 in Segment 2 wird geändert
+        // und neu versiegelt: der Bruch liegt an der Verknüpfung zu Datensatz
+        // 3 (Segment 3); das aktive Segment 4 ist für sich und zu 3 intakt.
+        let store = store_with_segments(temp.path(), 0, 4, now)?;
+        let paths = segment_paths(&store)?;
+        assert_eq!(paths.len(), 4);
+        let second = paths.get(1).ok_or(TestError::Missing("second segment"))?;
+        let mut records = parse_lines(&std::fs::read_to_string(second)?)?;
+        let record = records.first_mut().ok_or(TestError::Missing("record 2"))?;
+        record.severity = StoredSeverity::Low;
+        let resealed = compute_record_hash(record);
+        record.record_hash = resealed;
+        write_lines(second, &records)?;
+        let before = snapshot(&paths)?;
+
+        expect_chain_broken(
+            store.append(&verdict(&finding_a, "danach", now)),
+            3,
+            ChainBreak::PrevHashMismatch,
+        )?;
+        assert_eq!(segment_paths(&store)?, paths);
+        assert_eq!(snapshot(&paths)?, before);
+        expect_chain_broken(store.verify_chain(), 3, ChainBreak::PrevHashMismatch)?;
+
+        // Ohne Neuversiegelung (Inhalt von Segment 1 geändert) meldet das
+        // Anhängen den Hash-Bruch an Datensatz 1 und schreibt ebenfalls nichts.
+        let temp_plain = tempfile::tempdir()?;
+        let plain = store_with_segments(temp_plain.path(), 0, 3, now)?;
+        let plain_paths = segment_paths(&plain)?;
+        let first = plain_paths
+            .first()
+            .ok_or(TestError::Missing("first segment"))?;
+        tamper_segment(first, "Begründung 0", "Begründung X")?;
+        let plain_before = snapshot(&plain_paths)?;
+        expect_chain_broken(
+            plain.append(&verdict(&finding_a, "danach", now)),
+            1,
+            ChainBreak::RecordHashMismatch,
+        )?;
+        assert_eq!(segment_paths(&plain)?, plain_paths);
+        assert_eq!(snapshot(&plain_paths)?, plain_before);
+
+        // Gegenprobe: ist die Kette wieder intakt, wird angehängt.
+        tamper_segment(first, "Begründung X", "Begründung 0")?;
+        let next = plain
+            .append(&verdict(&finding_a, "danach", now))
+            .map_err(ctx("append after restore"))?;
+        assert_eq!(next.seq, 4);
+        assert_eq!(segment_paths(&plain)?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn append_refuses_a_torn_line_in_a_closed_segment() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let now = at(BASE_SECOND)?;
+        let store = store_with_segments(temp.path(), 0, 2, now)?;
+        let paths = segment_paths(&store)?;
+        let first = paths.first().ok_or(TestError::Missing("first segment"))?;
+        // Nur im letzten Segment gilt eine Zeile ohne `\n` als abgerissen.
+        OpenOptions::new()
+            .append(true)
+            .open(first)?
+            .write_all(b"{\"seq\":9")?;
+        let before = snapshot(&paths)?;
+
+        assert!(matches!(
+            store.append(&verdict(&finding("finding-a")?, "danach", now)),
+            Err(VerdictStoreError::CorruptRecord {
+                segment_seq: 1,
+                line: 0
+            })
+        ));
+        assert_eq!(segment_paths(&store)?, paths);
+        assert_eq!(snapshot(&paths)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn append_refuses_an_anchor_that_does_not_link_to_the_first_live_record() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let now = at(BASE_SECOND)?;
+        // Vier Segmente, 1–2 alt: die Retention verankert bei `seq` 3.
+        let store = store_with_segments(temp.path(), 2, 4, now)?;
+        let report = store.apply_retention(now).map_err(ctx("retention"))?;
+        assert_eq!(report.first_seq, 3);
+        let anchor = read_anchor(&root_of(&store)?)
+            .map_err(ctx("anchor"))?
+            .ok_or(TestError::Missing("anchor"))?;
+        let forged = VerdictAnchor {
+            prev_hash: ContentDigest::of(b"forged anchor"),
+            ..anchor
+        };
+        std::fs::write(store.root().join(ANCHOR_FILE), serde_json::to_vec(&forged)?)?;
+        let paths = segment_paths(&store)?;
+        let before = snapshot(&paths)?;
+
+        // Der letzte Datensatz ist intakt; gebrochen ist nur der Anfang.
+        expect_chain_broken(
+            store.append(&verdict(&finding("finding-a")?, "danach", now)),
+            3,
+            ChainBreak::PrevHashMismatch,
+        )?;
+        assert_eq!(segment_paths(&store)?, paths);
+        assert_eq!(snapshot(&paths)?, before);
+        expect_chain_broken(store.verify_chain(), 3, ChainBreak::PrevHashMismatch)
+    }
+
+    #[test]
     fn retention_recovers_from_a_crash_between_anchor_and_delete() -> TestResult {
         let temp = tempfile::tempdir()?;
-        let store = VerdictStore::new(temp.path()).with_segment_limit(1);
+        let store = VerdictStore::new(temp.path())
+            .with_segment_limit(1)
+            .without_auto_retention();
         let finding_a = finding("finding-a")?;
         let now = at(BASE_SECOND)?;
         let old = days_before(now, 100)?;
@@ -3216,15 +4247,16 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let now = at(BASE_SECOND)?;
         let store = store_with_segments(temp.path(), 4, 6, now)?;
-        // Ordnung von `walk`: erst listen …
-        let listed_before = store.list_segments().map_err(ctx("list"))?;
+        let root = root_of(&store)?;
+        // Ordnung von `walk_root`: erst listen …
+        let listed_before = list_segments(&root).map_err(ctx("list"))?;
         // … dann läuft eine Retention in einem anderen Prozess …
         store.apply_retention(now).map_err(ctx("retention"))?;
         // … und erst danach liest der Leser den (neuen) Anker.
-        let anchor_after = store.read_anchor().map_err(ctx("anchor"))?;
+        let anchor_after = read_anchor(&root).map_err(ctx("anchor"))?;
 
-        let walk =
-            walk_listed(listed_before, anchor_after.as_ref(), |_| {}).map_err(ctx("walk"))?;
+        let walk = walk_listed(&root, listed_before, anchor_after.as_ref(), |_| {})
+            .map_err(ctx("walk"))?;
         assert!(walk.fault.is_none(), "no false tamper alarm");
         assert_eq!(walk.summary.first_seq, 5);
         assert_eq!(walk.summary.records, 2);
@@ -3241,12 +4273,13 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let now = at(BASE_SECOND)?;
         let store = store_with_segments(temp.path(), 4, 6, now)?;
-        let anchor_before = store.read_anchor().map_err(ctx("anchor"))?;
+        let root = root_of(&store)?;
+        let anchor_before = read_anchor(&root).map_err(ctx("anchor"))?;
         store.apply_retention(now).map_err(ctx("retention"))?;
-        let listed_after = store.list_segments().map_err(ctx("list"))?;
+        let listed_after = list_segments(&root).map_err(ctx("list"))?;
 
-        let walk =
-            walk_listed(listed_after, anchor_before.as_ref(), |_| {}).map_err(ctx("walk"))?;
+        let walk = walk_listed(&root, listed_after, anchor_before.as_ref(), |_| {})
+            .map_err(ctx("walk"))?;
         assert!(matches!(
             walk.fault,
             Some((
@@ -3260,6 +4293,102 @@ mod tests {
         // Der echte Leser (Liste vor Anker) sieht den Stand korrekt.
         let summary = store.verify_chain().map_err(ctx("verify"))?;
         assert_eq!(summary.first_seq, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn reader_walks_again_when_a_listed_segment_vanishes() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let now = at(BASE_SECOND)?;
+        let store = store_with_segments(temp.path(), 4, 6, now)?;
+        let root = root_of(&store)?;
+        // Ein Leser listet und liest den (noch fehlenden) Anker …
+        let listed = list_segments(&root).map_err(ctx("list"))?;
+        let listed_for_retry = list_segments(&root).map_err(ctx("list again"))?;
+        let anchor_before = read_anchor(&root).map_err(ctx("anchor"))?;
+        assert!(anchor_before.is_none());
+        // … dann verankert und löscht eine Retention (anderer Prozess) …
+        store.apply_retention(now).map_err(ctx("retention"))?;
+        // … bevor der Leser das erste Segment öffnet: ein einzelner Durchlauf
+        // scheitert mit `NotFound`.
+        match walk_listed(&root, listed, anchor_before.as_ref(), |_| {}) {
+            Err(VerdictStoreError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(other) => return Err(TestError::Unexpected(format!("{other:?}"))),
+            Ok(walk) => return Err(TestError::Unexpected(format!("{:?}", walk.summary))),
+        }
+
+        // Mit `retry_vanished` läuft der Leser neu ab (neue Liste, neuer
+        // Anker) und sieht den Stand nach der Retention ohne Fehlalarm.
+        let mut stale = Some(listed_for_retry);
+        let mut attempts = 0_u32;
+        let walk = retry_vanished(|| {
+            attempts = attempts.saturating_add(1);
+            match stale.take() {
+                Some(segments) => walk_listed(&root, segments, anchor_before.as_ref(), |_| {}),
+                None => walk_root(&root, |_| {}),
+            }
+        })
+        .map_err(ctx("walk with retry"))?;
+        assert_eq!(attempts, 2);
+        assert!(walk.fault.is_none());
+        assert_eq!(walk.summary.first_seq, 5);
+        assert_eq!(walk.summary.records, 2);
+        // Die öffentlichen Leser sehen denselben Stand.
+        assert_eq!(store.records().map_err(ctx("records"))?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn retry_vanished_is_bounded_and_repeats_only_not_found() -> TestResult {
+        // Ein dauerhaft fehlendes Segment: höchstens `READ_ATTEMPTS` Durchläufe.
+        let mut calls = 0_u32;
+        let result: VerdictStoreResult<()> = retry_vanished(|| {
+            calls = calls.saturating_add(1);
+            Err(VerdictStoreError::Io(io::Error::from(
+                io::ErrorKind::NotFound,
+            )))
+        });
+        assert!(matches!(
+            result,
+            Err(VerdictStoreError::Io(ref error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert_eq!(calls, READ_ATTEMPTS);
+
+        // Andere I/O-Fehler und Kettenbrüche werden nie wiederholt.
+        let mut calls = 0_u32;
+        let result: VerdictStoreResult<()> = retry_vanished(|| {
+            calls = calls.saturating_add(1);
+            Err(VerdictStoreError::Io(io::Error::from(
+                io::ErrorKind::PermissionDenied,
+            )))
+        });
+        assert!(matches!(result, Err(VerdictStoreError::Io(_))));
+        assert_eq!(calls, 1);
+        let mut calls = 0_u32;
+        let result: VerdictStoreResult<()> = retry_vanished(|| {
+            calls = calls.saturating_add(1);
+            Err(VerdictStoreError::ChainBroken {
+                seq: 3,
+                reason: ChainBreak::PrevHashMismatch,
+            })
+        });
+        expect_chain_broken(result, 3, ChainBreak::PrevHashMismatch)?;
+        assert_eq!(calls, 1);
+
+        // Ein zweiter Durchlauf, der gelingt, liefert sein Ergebnis.
+        let mut calls = 0_u32;
+        let result = retry_vanished(|| {
+            calls = calls.saturating_add(1);
+            if calls == 1 {
+                Err(VerdictStoreError::Io(io::Error::from(
+                    io::ErrorKind::NotFound,
+                )))
+            } else {
+                Ok(calls)
+            }
+        })
+        .map_err(ctx("second attempt"))?;
+        assert_eq!(result, 2);
         Ok(())
     }
 
@@ -3344,25 +4473,177 @@ mod tests {
         Ok(())
     }
 
+    // Entfernt `.lock` und legt an seiner Stelle eine neue, leere Datei an
+    // (wie ein dateiweiser Sweep, nach dem der nächste Schreiber neu anlegt).
+    fn replace_lock_file(lock_path: &Path) -> io::Result<()> {
+        std::fs::remove_file(lock_path)?;
+        std::fs::write(lock_path, b"")
+    }
+
     #[test]
-    fn missing_directories_lists_only_new_components_top_down() -> TestResult {
+    fn lock_on_a_replaced_lock_file_is_taken_again_on_the_current_one() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = VerdictStore::new(temp.path());
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        store
+            .append(&verdict(&finding_a, "eins", now))
+            .map_err(ctx("append first"))?;
+        let lock_path = store.root().join(LOCK_FILE);
+
+        // Ein Schreiber hält die Sperre. Währenddessen wird `.lock` ersetzt;
+        // erst danach gibt er die alte, nun verwaiste Inode frei.
+        let holder = File::options().write(true).open(&lock_path)?;
+        FileExt::try_lock(&holder).map_err(ctx("take lock"))?;
+        let replace_path = lock_path.clone();
+        let releaser = std::thread::spawn(move || -> io::Result<()> {
+            std::thread::sleep(Duration::from_millis(50));
+            replace_lock_file(&replace_path)?;
+            FileExt::unlock(&holder)
+        });
+
+        // Der Wartende öffnet zuerst die alte Datei und bekommt deren Sperre,
+        // sobald sie frei wird; weil `.lock` inzwischen eine andere Inode ist,
+        // sperrt er die aktuelle Datei neu.
+        let root = root_of(&store)?;
+        let lock = acquire_lock(&root).map_err(ctx("acquire"))?;
+        releaser
+            .join()
+            .map_err(|_| TestError::Unexpected("lock holder thread panicked".to_owned()))?
+            .map_err(ctx("replace and release"))?;
+        let held = lock.metadata()?;
+        let current = std::fs::symlink_metadata(&lock_path)?;
+        assert_eq!((held.dev(), held.ino()), (current.dev(), current.ino()));
+        assert!(lock_is_current(&root, &lock).map_err(ctx("lock is current"))?);
+        // Ein weiterer Schreiber auf der aktuellen Datei muss also warten.
+        let other = File::options().write(true).open(&lock_path)?;
+        assert!(matches!(
+            FileExt::try_lock(&other),
+            Err(fs4::TryLockError::WouldBlock)
+        ));
+        release(lock, Ok(())).map_err(ctx("release"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn replaced_lock_file_keeps_two_writers_apart() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = VerdictStore::new(temp.path());
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        store
+            .append(&verdict(&finding_a, "eins", now))
+            .map_err(ctx("append first"))?;
+        let lock_path = store.root().join(LOCK_FILE);
+
+        // Schreiber A hält die alte Inode. `.lock` wird ersetzt, Schreiber B
+        // sperrt die neue Datei, und erst dann gibt A die alte frei.
+        let holder = File::options().write(true).open(&lock_path)?;
+        FileExt::try_lock(&holder).map_err(ctx("take lock"))?;
+        let replace_path = lock_path.clone();
+        let releaser = std::thread::spawn(move || -> io::Result<File> {
+            std::thread::sleep(Duration::from_millis(50));
+            replace_lock_file(&replace_path)?;
+            let newer = File::options().write(true).open(&replace_path)?;
+            FileExt::try_lock(&newer)?;
+            FileExt::unlock(&holder)?;
+            Ok(newer)
+        });
+
+        // Ein dritter Schreiber, der auf die alte Inode gewartet hat, hält sich
+        // nicht an ihr fest, sondern wartet auf B und meldet dann `LockContended`.
+        let root = root_of(&store)?;
+        assert!(matches!(
+            acquire_lock(&root),
+            Err(VerdictStoreError::LockContended)
+        ));
+        let newer = releaser
+            .join()
+            .map_err(|_| TestError::Unexpected("lock holder thread panicked".to_owned()))?
+            .map_err(ctx("replace, lock and release"))?;
+        // Nichts wurde geschrieben, solange B hielt.
+        assert_eq!(store.verify_chain().map_err(ctx("verify"))?.records, 1);
+        FileExt::unlock(&newer)?;
+        let next = store
+            .append(&verdict(&finding_a, "zwei", now))
+            .map_err(ctx("append after release"))?;
+        assert_eq!(next.seq, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn writers_abort_when_the_lock_file_is_replaced_while_held() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = VerdictStore::new(temp.path());
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        store
+            .append(&verdict(&finding_a, "eins", now))
+            .map_err(ctx("append first"))?;
+        let segment = only_segment(&store)?;
+        let before = std::fs::read(&segment)?;
+
+        // Die Sperre ist gehalten; danach ersetzt ein fremdes Werkzeug `.lock`,
+        // und ein anderer Schreiber könnte die neue Datei sperren.
+        let root = root_of(&store)?;
+        let lock = acquire_lock(&root).map_err(ctx("acquire"))?;
+        replace_lock_file(&store.root().join(LOCK_FILE))?;
+
+        // Anhängen bricht vor der ersten Änderung ab …
+        let prepared = prepare(&verdict(&finding_a, "zwei", now)).map_err(ctx("prepare"))?;
+        assert!(matches!(
+            store.append_locked(prepared, &root, &lock),
+            Err(VerdictStoreError::LockContended)
+        ));
+        assert_eq!(std::fs::read(&segment)?, before);
+        assert_eq!(segment_paths(&store)?, [segment.clone()]);
+        // … und die Retention verankert und löscht nichts, obwohl das Segment
+        // aus ihrer Sicht abgelaufen ist.
+        let far = now
+            .checked_add(SignedDuration::from_secs(100 * 86_400))
+            .map_err(ctx("far"))?;
+        assert!(matches!(
+            retention_locked(&root, &lock, far),
+            Err(VerdictStoreError::LockContended)
+        ));
+        assert!(segment.exists());
+        assert!(!store.root().join(ANCHOR_FILE).exists());
+        release(lock, Ok(())).map_err(ctx("release"))?;
+
+        // Ein neuer Aufruf sperrt die aktuelle Datei und hängt an.
+        let second = store
+            .append(&verdict(&finding_a, "zwei", now))
+            .map_err(ctx("append after the replacement"))?;
+        assert_eq!(second.seq, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_components_are_created_private_and_only_by_writers() -> TestResult {
         let temp = tempfile::tempdir()?;
         let state = temp.path().join("state");
         let store = VerdictStore::new(&state);
-        let missing = missing_directories(store.root()).map_err(ctx("missing"))?;
+        // Oberhalb der Grenze (das vertraute `state_dir` samt Eltern): die
+        // fehlenden Glieder, das oberste zuerst.
+        let nested = state.join("a").join("b");
         assert_eq!(
-            missing,
-            [
-                state.clone(),
-                state.join(DOD_DIR),
-                state.join(DOD_DIR).join(VERDICTS_DIR),
-            ]
+            missing_directories(&nested).map_err(ctx("missing"))?,
+            [state.clone(), state.join("a"), nested.clone()]
         );
         assert_eq!(parent_or_current(Path::new("dod")), Path::new("."));
         assert_eq!(parent_or_current(&state), temp.path());
 
+        // Leser und Retention legen nichts an.
+        assert_eq!(store.verify_chain().map_err(ctx("verify"))?.records, 0);
+        let report = store
+            .apply_retention(at(BASE_SECOND)?)
+            .map_err(ctx("retention"))?;
+        assert_eq!(report.removed_segments, 0);
+        assert!(!state.exists());
+
         // Anhängen legt alle Glieder ohne Gruppen-/Fremdrechte an (`0700`
-        // abzüglich umask); danach fehlt keines mehr.
+        // abzüglich umask; `dod` und `verdicts` per `mkdirat`); danach fehlt
+        // keines mehr.
         store
             .append(&verdict(&finding("finding-a")?, "eins", at(BASE_SECOND)?))
             .map_err(ctx("append"))?;
@@ -3375,6 +4656,8 @@ mod tests {
         assert_eq!(mode_of(&state)? & 0o077, 0);
         assert_eq!(mode_of(&dod)? & 0o077, 0);
         assert_eq!(mode_of(store.root())?, 0o700);
+        assert!(std::fs::symlink_metadata(&dod)?.is_dir());
+        assert!(std::fs::symlink_metadata(store.root())?.is_dir());
         Ok(())
     }
 
@@ -3386,7 +4669,7 @@ mod tests {
         let now = at(BASE_SECOND)?;
         // Ein früheres Anhängen hat das Segment angelegt und ist dann
         // gescheitert: leere Datei, benannt nach der nächsten `seq`.
-        std::fs::create_dir_all(store.root())?;
+        precreate_root(&store)?;
         let path = store.root().join(segment_file_name(FIRST_VERDICT_SEQ));
         std::fs::write(&path, b"")?;
         std::fs::set_permissions(&path, Permissions::from_mode(FILE_MODE))?;
@@ -3404,8 +4687,9 @@ mod tests {
     fn files_are_0600_and_the_directory_is_0700() -> TestResult {
         let temp = tempfile::tempdir()?;
         let store = VerdictStore::new(temp.path()).with_segment_limit(1);
-        // Ein zu offenes, vorhandenes Verzeichnis wird auf 0700 gesetzt.
-        std::fs::create_dir_all(store.root())?;
+        // Ein lesbares, vorhandenes Verzeichnis (nicht beschreibbar für
+        // Gruppe/Andere) wird auf 0700 gesetzt.
+        precreate_root(&store)?;
         std::fs::set_permissions(store.root(), Permissions::from_mode(0o755))?;
 
         let finding_a = finding("finding-a")?;
@@ -3475,19 +4759,369 @@ mod tests {
         ));
 
         let other = tempfile::tempdir()?;
-        std::fs::create_dir_all(other.path().join(DOD_DIR))?;
+        DirBuilder::new()
+            .mode(DIR_MODE)
+            .create(other.path().join(DOD_DIR))?;
         let target = other.path().join("real");
-        std::fs::create_dir_all(&target)?;
+        DirBuilder::new().mode(DIR_MODE).create(&target)?;
         symlink(&target, other.path().join(DOD_DIR).join(VERDICTS_DIR))?;
         let linked = VerdictStore::new(other.path());
+        expect_unsafe_directory(linked.append(&verdict(&finding_a, "eins", at(BASE_SECOND)?)))?;
+        expect_unsafe_directory(linked.verify_chain())?;
+        expect_unsafe_directory(linked.apply_retention(at(BASE_SECOND)?))?;
+        // Am Ziel des Symlinks wurde nichts angelegt.
+        assert_eq!(entry_count(&target)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn intermediate_dod_symlink_is_refused_without_creating_anything() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        // `state/dod` ist ein Symlink auf ein fremdes (hier: eigenes) Verzeichnis.
+        let state = temp.path().join("state");
+        let target = temp.path().join("elsewhere");
+        DirBuilder::new().mode(DIR_MODE).create(&state)?;
+        DirBuilder::new().mode(DIR_MODE).create(&target)?;
+        symlink(&target, state.join(DOD_DIR))?;
+        let store = VerdictStore::new(&state);
+
+        expect_unsafe_directory(store.append(&verdict(&finding_a, "eins", now)))?;
+        expect_unsafe_directory(store.verify_chain())?;
+        expect_unsafe_directory(store.records())?;
+        expect_unsafe_directory(store.latest_for(&finding_a))?;
+        expect_unsafe_directory(store.apply_retention(now))?;
+        // Nichts wurde am Ziel angelegt (früher: `create_dir_all` folgte dem
+        // Symlink und legte `elsewhere/verdicts` an), der Symlink blieb.
+        assert_eq!(entry_count(&target)?, 0);
+        assert!(
+            std::fs::symlink_metadata(state.join(DOD_DIR))?
+                .file_type()
+                .is_symlink()
+        );
+
+        // Auch ein Store, der hinter dem Symlink schon vollständig liegt, wird
+        // nicht benutzt.
+        let real = VerdictStore::new(&target);
+        real.append(&verdict(&finding_a, "dort", now))
+            .map_err(ctx("append behind the link"))?;
+        let linked_dod = temp.path().join("linked");
+        DirBuilder::new().mode(DIR_MODE).create(&linked_dod)?;
+        symlink(target.join(DOD_DIR), linked_dod.join(DOD_DIR))?;
+        let linked = VerdictStore::new(&linked_dod);
+        expect_unsafe_directory(linked.verify_chain())?;
+        expect_unsafe_directory(linked.append(&verdict(&finding_a, "hier", now)))?;
+        assert_eq!(real.verify_chain().map_err(ctx("verify real"))?.records, 1);
+
+        // Eine reguläre Datei an der Stelle von `dod` ist kein Verzeichnis.
+        let plain_state = temp.path().join("plain");
+        DirBuilder::new().mode(DIR_MODE).create(&plain_state)?;
+        std::fs::write(plain_state.join(DOD_DIR), b"")?;
+        let plain = VerdictStore::new(&plain_state);
+        expect_unsafe_directory(plain.append(&verdict(&finding_a, "eins", now)))?;
+        expect_unsafe_directory(plain.verify_chain())?;
+        assert!(std::fs::read(plain_state.join(DOD_DIR))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn symlinked_state_dir_is_trusted_but_links_below_it_are_not() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        // `state` → `real`, wie `~/.harw` → `/data/harw`: erlaubt.
+        let real = temp.path().join("real");
+        DirBuilder::new().mode(DIR_MODE).create(&real)?;
+        let state = temp.path().join("state");
+        symlink(&real, &state)?;
+        let store = VerdictStore::new(&state);
+        let appended = store
+            .append(&verdict(&finding_a, "eins", now))
+            .map_err(ctx("append through a linked state_dir"))?;
+        let summary = store.verify_chain().map_err(ctx("verify"))?;
+        assert_eq!(summary.records, 1);
+        assert_eq!(summary.last, Some(appended));
+        let segment = real
+            .join(DOD_DIR)
+            .join(VERDICTS_DIR)
+            .join(segment_file_name(FIRST_VERDICT_SEQ));
+        assert!(std::fs::symlink_metadata(&segment)?.is_file());
+        assert!(std::fs::symlink_metadata(&state)?.file_type().is_symlink());
+
+        // Unter einem verlinkten `state_dir` gilt die Grenze unverändert: ein
+        // Symlink an der Stelle von `dod` wird verweigert, am Ziel entsteht
+        // nichts.
+        let real_two = temp.path().join("real-two");
+        let elsewhere = temp.path().join("elsewhere");
+        DirBuilder::new().mode(DIR_MODE).create(&real_two)?;
+        DirBuilder::new().mode(DIR_MODE).create(&elsewhere)?;
+        symlink(&elsewhere, real_two.join(DOD_DIR))?;
+        let state_two = temp.path().join("state-two");
+        symlink(&real_two, &state_two)?;
+        let linked = VerdictStore::new(&state_two);
+        expect_unsafe_directory(linked.append(&verdict(&finding_a, "zwei", now)))?;
+        expect_unsafe_directory(linked.verify_chain())?;
+        assert_eq!(entry_count(&elsewhere)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn state_dir_that_is_not_a_directory_is_refused() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let state = temp.path().join("state");
+        std::fs::write(&state, b"kein Verzeichnis")?;
+        let store = VerdictStore::new(&state);
+        let now = at(BASE_SECOND)?;
+        expect_unsafe_directory(store.verify_chain())?;
+        expect_unsafe_directory(store.append(&verdict(&finding("finding-a")?, "eins", now)))?;
+        expect_unsafe_directory(store.apply_retention(now))?;
+        assert_eq!(std::fs::read(&state)?, b"kein Verzeichnis");
+        Ok(())
+    }
+
+    // Legt per `mkfifo(1)` ein FIFO an; `false`, wenn das Programm fehlt.
+    fn make_fifo(path: &Path) -> bool {
+        std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn fifos_in_place_of_store_directories_are_refused_without_blocking() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        // Ein FIFO als `state_dir` und ein FIFO als `dod`: beide werden nie
+        // geöffnet (ein `open(2)` darauf blockierte ohne Schreiber).
+        let fifo_state = temp.path().join("fifo-state");
+        let state = temp.path().join("state");
+        DirBuilder::new().mode(DIR_MODE).create(&state)?;
+        if !make_fifo(&fifo_state) || !make_fifo(&state.join(DOD_DIR)) {
+            // Ohne `mkfifo` lässt sich der Fall hier nicht herstellen.
+            return Ok(());
+        }
+        let now = at(BASE_SECOND)?;
+        let candidate = verdict(&finding("finding-a")?, "eins", now);
+        for state_dir in [fifo_state, state] {
+            let store = VerdictStore::new(&state_dir);
+            let attempt = candidate.clone();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let refused = |result: Result<(), VerdictStoreError>| {
+                    matches!(result, Err(VerdictStoreError::UnsafeDirectory { .. }))
+                };
+                let outcome = (
+                    refused(store.verify_chain().map(|_| ())),
+                    refused(store.append(&attempt).map(|_| ())),
+                );
+                // Ohne Empfänger ist der Test schon an der Frist gescheitert.
+                let _ = sender.send(outcome);
+            });
+            let outcome = receiver
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(ctx("store call blocked on a FIFO"))?;
+            assert_eq!(outcome, (true, true));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn group_or_world_writable_store_directories_are_refused() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = VerdictStore::new(temp.path());
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        let dod = temp.path().join(DOD_DIR);
+        DirBuilder::new().mode(DIR_MODE).create(&dod)?;
+
+        // Ein für Gruppe oder Andere beschreibbares `dod` ist keine Grenze:
+        // abgelehnt, nichts darunter angelegt, nichts repariert.
+        for mode in [0o770, 0o703, 0o777] {
+            std::fs::set_permissions(&dod, Permissions::from_mode(mode))?;
+            expect_unsafe_directory(store.append(&verdict(&finding_a, "eins", now)))?;
+            expect_unsafe_directory(store.verify_chain())?;
+            expect_unsafe_directory(store.apply_retention(now))?;
+            assert!(!store.root().exists());
+            assert_eq!(mode_of(&dod)?, mode);
+        }
+
+        // Lesbar für andere ist erlaubt (`dod` bleibt, wie es ist); das
+        // Store-Verzeichnis selbst wird `0700`.
+        std::fs::set_permissions(&dod, Permissions::from_mode(0o755))?;
+        store
+            .append(&verdict(&finding_a, "eins", now))
+            .map_err(ctx("append"))?;
+        assert_eq!(mode_of(&dod)?, 0o755);
+        assert_eq!(mode_of(store.root())?, 0o700);
+
+        // Ein beschreibbares `verdicts` wird ebenso abgelehnt, auch von Lesern.
+        std::fs::set_permissions(store.root(), Permissions::from_mode(0o770))?;
+        expect_unsafe_directory(store.append(&verdict(&finding_a, "zwei", now)))?;
+        expect_unsafe_directory(store.records())?;
+        assert_eq!(mode_of(store.root())?, 0o770);
+
+        std::fs::set_permissions(store.root(), Permissions::from_mode(DIR_MODE))?;
+        assert_eq!(store.verify_chain().map_err(ctx("verify"))?.records, 1);
+        // Grenze dieses Tests: ein fremder Eigentümer lässt sich ohne
+        // Root-Rechte nicht herstellen; `ensure_owned_directory` prüft ihn
+        // (Test in `harw-fsutil`).
+        Ok(())
+    }
+
+    #[test]
+    fn symlinked_lock_and_anchor_files_are_never_followed() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let now = at(BASE_SECOND)?;
+        let finding_a = finding("finding-a")?;
+        let store = store_with_segments(temp.path(), 2, 3, now)?;
+
+        // `.lock` → fremde Datei: weder angelegt, noch beschrieben, noch per
+        // `fchmod` geändert.
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"fremd")?;
+        std::fs::set_permissions(&elsewhere, Permissions::from_mode(0o644))?;
+        let lock = store.root().join(LOCK_FILE);
+        std::fs::remove_file(&lock)?;
+        symlink(&elsewhere, &lock)?;
+        expect_unsafe_directory(store.append(&verdict(&finding_a, "danach", now)))?;
+        expect_unsafe_directory(store.apply_retention(now))?;
+        assert_eq!(std::fs::read(&elsewhere)?, b"fremd");
+        assert_eq!(mode_of(&elsewhere)?, 0o644);
+        assert_eq!(segment_paths(&store)?.len(), 3);
+        std::fs::remove_file(&lock)?;
+
+        // `anchor.json` → Kopie eines gültigen Ankers: trotzdem `AnchorCorrupt`.
+        store.apply_retention(now).map_err(ctx("retention"))?;
+        let anchor = store.root().join(ANCHOR_FILE);
+        let anchor_copy = temp.path().join("anchor-copy.json");
+        std::fs::copy(&anchor, &anchor_copy)?;
+        std::fs::remove_file(&anchor)?;
+        symlink(&anchor_copy, &anchor)?;
         assert!(matches!(
-            linked.append(&verdict(&finding_a, "eins", at(BASE_SECOND)?)),
-            Err(VerdictStoreError::UnsafeDirectory { .. })
+            store.verify_chain(),
+            Err(VerdictStoreError::AnchorCorrupt)
         ));
         assert!(matches!(
-            linked.verify_chain(),
-            Err(VerdictStoreError::UnsafeDirectory { .. })
+            store.append(&verdict(&finding_a, "danach", now)),
+            Err(VerdictStoreError::AnchorCorrupt)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn anchor_is_written_through_a_fresh_temp_file_inside_the_root() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let now = at(BASE_SECOND)?;
+        let store = store_with_segments(temp.path(), 2, 3, now)?;
+        // Ein Rest der Tempdatei aus einem abgebrochenen Lauf, sogar als
+        // Symlink auf eine fremde Datei: wird entfernt, nie verfolgt.
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"fremd")?;
+        let stale = store.root().join(ANCHOR_TEMP_FILE);
+        symlink(&elsewhere, &stale)?;
+
+        let report = store.apply_retention(now).map_err(ctx("retention"))?;
+        assert_eq!(report.removed_segments, 2);
+        assert_eq!(report.first_seq, 3);
+        assert!(std::fs::symlink_metadata(&stale).is_err());
+        assert_eq!(std::fs::read(&elsewhere)?, b"fremd");
+        let anchor = store.root().join(ANCHOR_FILE);
+        assert!(std::fs::symlink_metadata(&anchor)?.is_file());
+        assert_eq!(mode_of(&anchor)?, 0o600);
+        let summary = store.verify_chain().map_err(ctx("verify"))?;
+        assert_eq!(summary.first_seq, 3);
+        assert_eq!(summary.records, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn swapped_root_does_not_redirect_an_append_in_flight() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = VerdictStore::new(temp.path());
+        let finding_a = finding("finding-a")?;
+        let now = at(BASE_SECOND)?;
+        store
+            .append(&verdict(&finding_a, "eins", now))
+            .map_err(ctx("append"))?;
+
+        // Der Aufruf hat sein Store-Verzeichnis schon geöffnet und geprüft …
+        let root = store.create_root().map_err(ctx("root"))?;
+        // … dann wird es umbenannt und durch einen Symlink auf einen Köder
+        // ersetzt.
+        let moved = temp.path().join(DOD_DIR).join("verdicts.moved");
+        std::fs::rename(store.root(), &moved)?;
+        let decoy = temp.path().join("decoy");
+        DirBuilder::new().mode(DIR_MODE).create(&decoy)?;
+        symlink(&decoy, store.root())?;
+
+        let prepared = prepare(&verdict(&finding_a, "zwei", now)).map_err(ctx("prepare"))?;
+        let second = store
+            .append_at(&root, prepared)
+            .map_err(ctx("append in flight"))?;
+        assert_eq!(second.seq, 2);
+        // Sperre, Prüfung und Schreiben blieben im ursprünglichen Verzeichnis.
+        assert_eq!(entry_count(&decoy)?, 0);
+        let moved_segment = moved.join(segment_file_name(FIRST_VERDICT_SEQ));
+        assert_eq!(
+            parse_lines(&std::fs::read_to_string(&moved_segment)?)?.len(),
+            2
+        );
+        assert!(moved.join(LOCK_FILE).exists());
+
+        // Ein neuer Aufruf steigt neu ab und verweigert den Symlink.
+        expect_unsafe_directory(store.append(&verdict(&finding_a, "drei", now)))?;
+        expect_unsafe_directory(store.verify_chain())?;
+        assert_eq!(entry_count(&decoy)?, 0);
+
+        // Ein echtes, leeres Verzeichnis an der alten Stelle: der laufende
+        // Aufruf schreibt weiter in das ursprüngliche.
+        std::fs::remove_file(store.root())?;
+        DirBuilder::new().mode(DIR_MODE).create(store.root())?;
+        let prepared = prepare(&verdict(&finding_a, "drei", now)).map_err(ctx("prepare"))?;
+        let third = store
+            .append_at(&root, prepared)
+            .map_err(ctx("append in flight after swap"))?;
+        assert_eq!(third.seq, 3);
+        assert_eq!(entry_count(store.root())?, 0);
+        assert_eq!(
+            parse_lines(&std::fs::read_to_string(&moved_segment)?)?.len(),
+            3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_deletes_only_inside_the_established_root() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let now = at(BASE_SECOND)?;
+        // Drei Segmente, 1–2 abgelaufen.
+        let store = store_with_segments(temp.path(), 2, 3, now)?;
+        let root = root_of(&store)?;
+
+        // Zwischen Abstieg und Löschen wird das Verzeichnis gegen einen
+        // Symlink auf einen Köder mit gleichnamigen Dateien getauscht.
+        let moved = temp.path().join(DOD_DIR).join("verdicts.moved");
+        std::fs::rename(store.root(), &moved)?;
+        let decoy = temp.path().join("decoy");
+        DirBuilder::new().mode(DIR_MODE).create(&decoy)?;
+        let decoy_names = [segment_file_name(1), segment_file_name(2)];
+        for name in &decoy_names {
+            std::fs::write(decoy.join(name), b"decoy\n")?;
+        }
+        symlink(&decoy, store.root())?;
+
+        let report = retention_at(&root, now).map_err(ctx("retention in flight"))?;
+        assert_eq!(report.removed_segments, 2);
+        assert_eq!(report.first_seq, 3);
+        // Gelöscht und verankert wurde nur im ursprünglichen Verzeichnis.
+        for name in &decoy_names {
+            assert_eq!(std::fs::read(decoy.join(name))?, b"decoy\n");
+            assert!(!moved.join(name).exists());
+        }
+        assert!(moved.join(segment_file_name(3)).exists());
+        assert!(moved.join(ANCHOR_FILE).exists());
+        assert!(!decoy.join(ANCHOR_FILE).exists());
+        assert_eq!(entry_count(&decoy)?, 2);
         Ok(())
     }
 
