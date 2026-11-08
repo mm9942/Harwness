@@ -150,6 +150,19 @@
 //! keine stille Lücke: das Feld ist hier benannt, zusammen mit der
 //! Konsequenz.
 //!
+//! # Zähler → Raten vor den Regeln (PL-100 WP0.14)
+//! cpu, netcounters und blockio melden kumulative Zähler. [`RuleCycle`]
+//! hält deshalb eine [`crate::rates::RateStage`]: `evaluate` leitet aus den
+//! Samples jedes Deltas, bevor die Regeln laufen, je kumulativem Zähler eine
+//! Rate je Sekunde ab (`"<metric>.rate"`, erste Beobachtung und Zählerreset
+//! ohne Rate), und [`report_findings`] gibt den Regeln die rohen Samples
+//! **und** diese Raten als `RuleContext::samples`. Die Attribution (unten)
+//! läuft nur über Ereignisse und bleibt davon unberührt. Solange
+//! `baselines` leer ist (vorheriger Abschnitt), wertet keine Regel die Raten
+//! aus; sie erzeugen also keinen Befund. Siehe `crate::rates` für die
+//! kumulativen Metriken, die Reset-Behandlung und die Obergrenze des
+//! Zustands.
+//!
 //! # Cgroup attribution of a finding (PL-97 E4)
 //! A `Finding<RuleChecked>` does not name the event it came from. The
 //! export's optional `scope` is therefore derived without touching the
@@ -185,13 +198,16 @@ use harw_dod_config::ResolvedObservationProfile;
 use harw_dod_rules::rule::RuleContext;
 use harw_dod_rules::{FindingKind, run_rules, run_rules_checked};
 use harw_dod_sentinel::{BufferMark, EvidenceBuffer};
-use harw_dod_signals::{EventKind, Hardness, SecurityEvent, SecurityEvidence, Severity};
+use harw_dod_signals::{
+    EventKind, Hardness, HostSample, SecurityEvent, SecurityEvidence, Severity,
+};
 use harw_observe::{FieldValue, MetricValue, TelemetrySink};
 use jiff::Timestamp;
 
 use crate::cgroup_resolve::CgroupKids;
 use crate::export::FindingsExporter;
 use crate::health_export::RingCounters;
+use crate::rates::{RateStage, with_rates};
 use crate::throttle::{
     CoarseSubject, DedupKey, FindingThrottle, ThrottleDecision, ThrottleVerdict,
 };
@@ -915,6 +931,7 @@ mod tests {
         let reported = report_findings(
             &harw_observe::NullSink,
             &evidence,
+            &[],
             Timestamp::UNIX_EPOCH,
             &NetworkScope::empty(),
             &CgroupKids::default(),
@@ -937,6 +954,7 @@ mod tests {
         let reported = report_findings(
             &harw_observe::NullSink,
             &evidence,
+            &[],
             Timestamp::UNIX_EPOCH,
             &NetworkScope::empty(),
             &CgroupKids::default(),
@@ -964,6 +982,7 @@ mod tests {
         let reported = report_findings(
             &harw_observe::NullSink,
             &evidence,
+            &[],
             Timestamp::UNIX_EPOCH,
             &NetworkScope::empty(),
             &CgroupKids::default(),
@@ -1017,6 +1036,7 @@ mod tests {
         let reported = report_findings(
             &harw_observe::NullSink,
             &evidence,
+            &[],
             Timestamp::UNIX_EPOCH,
             &NetworkScope::empty(),
             &CgroupKids::default(),
@@ -1673,6 +1693,7 @@ mod tests {
             report_findings(
                 &harw_observe::NullSink,
                 &evidence,
+                &[],
                 Timestamp::UNIX_EPOCH,
                 &NetworkScope::empty(),
                 &CgroupKids::default(),
