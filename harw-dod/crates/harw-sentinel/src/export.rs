@@ -157,7 +157,12 @@ pub const MAX_EVIDENCE_PATH_CHARS: usize = 256;
 
 /// Longest `evidence_card.process.comm`, in characters (escapes and `…`
 /// included).
-pub const MAX_EVIDENCE_COMM_CHARS: usize = 32;
+///
+/// The same bound as `harw_dod_signals::ProcessContext::COMM_MAX_CHARS`
+/// (PL-100 WP0.15): a `comm` the producing sensor already escaped and
+/// bounded fits unchanged; escaping it again here is idempotent and only
+/// guards against a producer that did not.
+pub const MAX_EVIDENCE_COMM_CHARS: usize = harw_dod_signals::ProcessContext::COMM_MAX_CHARS;
 
 /// Longest event kind key of `evidence_card.event_counts`, in characters.
 const MAX_EVENT_KIND_CHARS: usize = 64;
@@ -306,12 +311,18 @@ pub struct EvidenceCard {
     /// [`MAX_EVIDENCE_PATH_CHARS`] Zeichen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Der handelnde Prozess.
+    /// Der handelnde Prozess, aus `Actor::process` der auslösenden
+    /// Ereignisse (PL-100 WP0.15).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process: Option<EvidenceProcess>,
 }
 
 /// Der handelnde Prozess einer [`EvidenceCard`].
+///
+/// # Description
+/// Abgeleitet aus `harw_dod_signals::ProcessContext` (`Actor::process`):
+/// nur `pid` und `comm`; `ppid` und `euid` bleiben im Spool-Record und
+/// erreichen die Exportzeile nicht.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EvidenceProcess {
     /// Prozess-ID zum Beobachtungszeitpunkt.
@@ -328,7 +339,12 @@ impl EvidenceCard {
     /// `event_counts` zählt jedes Ereignis unter seiner Art. `uid`,
     /// `destination` (nur `EgressFlow` mit IP-Literal), `path` (`ProcessExec`,
     /// `FileWrite`) und `process` werden gesetzt, wenn sich alle Ereignisse,
-    /// die das Merkmal tragen, auf einen Wert einigen. Wäre die Karte größer
+    /// die das Merkmal tragen, auf einen Wert einigen. `process` stammt aus
+    /// `Actor::process` (PL-100 WP0.15): `pid` und `comm` müssen bei allen
+    /// Ereignissen mit Prozesskontext gleich sein, Ereignisse ohne zählen
+    /// nicht mit; ein fehlender `comm` wird zur leeren Zeichenkette, jeder
+    /// andere wird escapt und auf [`MAX_EVIDENCE_COMM_CHARS`] Zeichen
+    /// begrenzt. Wäre die Karte größer
     /// als [`MAX_EVIDENCE_CARD_BYTES`], fällt zuerst `path` weg; reicht das
     /// nicht, gibt es keine Karte.
     ///
@@ -1782,6 +1798,115 @@ mod tests {
         assert_eq!(named.destination, None, "only IP literals are ip:port");
 
         assert_eq!(EvidenceCard::from_events(&[]), None);
+        Ok(())
+    }
+
+    /// Ein Egress-Ereignis von uid 1000 mit dem Prozesskontext `process`.
+    fn egress_with_process(
+        process: Option<harw_dod_signals::ProcessContext>,
+    ) -> SecurityEvent {
+        SecurityEvent {
+            actor: Some(harw_dod_signals::Actor {
+                uid: 1000,
+                auid: None,
+                cgroup: None,
+                process,
+            }),
+            ..egress_event(None, "203.0.113.9", 443)
+        }
+    }
+
+    /// Ein Prozesskontext mit Elternprozess und effektiver uid.
+    fn process_context(pid: u32, comm: Option<&str>) -> harw_dod_signals::ProcessContext {
+        harw_dod_signals::ProcessContext {
+            pid,
+            ppid: Some(1),
+            comm: comm.map(str::to_owned),
+            euid: Some(0),
+        }
+    }
+
+    /// PL-100 WP0.15: `evidence_card.process` kommt aus `Actor::process` —
+    /// nur `pid` und `comm`, ein fehlender `comm` wird leer, Ereignisse ohne
+    /// Prozesskontext zählen nicht mit, widersprüchliche Prozesse ergeben
+    /// keinen.
+    #[test]
+    fn test_evidence_card_process_comes_from_the_actor_process_context() -> TestResult {
+        let unnamed = egress_with_process(Some(process_context(77, None)));
+        let card = EvidenceCard::from_events(&[&unnamed])
+            .ok_or(TestError::Missing("card of an unnamed process"))?;
+        assert_eq!(
+            card.process,
+            Some(EvidenceProcess {
+                pid: 77,
+                comm: String::new(),
+            }),
+            "a missing comm is exported empty"
+        );
+
+        let named = egress_with_process(Some(process_context(77, Some("sshd"))));
+        let bare = egress_with_process(None);
+        let card = EvidenceCard::from_events(&[&named, &bare])
+            .ok_or(TestError::Missing("card of named and bare events"))?;
+        assert_eq!(
+            card.process,
+            Some(EvidenceProcess {
+                pid: 77,
+                comm: "sshd".to_owned(),
+            }),
+            "an event without process context does not veto"
+        );
+        assert_eq!(card.uid, Some(1000));
+
+        let only_bare = EvidenceCard::from_events(&[&bare])
+            .ok_or(TestError::Missing("card of a bare event"))?;
+        assert_eq!(only_bare.process, None, "no process context, no process");
+
+        let other_pid = egress_with_process(Some(process_context(78, Some("sshd"))));
+        let card = EvidenceCard::from_events(&[&named, &other_pid])
+            .ok_or(TestError::Missing("card of two pids"))?;
+        assert_eq!(card.process, None, "disagreeing pids are not guessed");
+
+        let other_comm = egress_with_process(Some(process_context(77, Some("bash"))));
+        let card = EvidenceCard::from_events(&[&named, &other_comm])
+            .ok_or(TestError::Missing("card of two names"))?;
+        assert_eq!(card.process, None, "disagreeing names are not guessed");
+
+        let encoded = serde_json::to_value(
+            EvidenceCard::from_events(&[&named])
+                .ok_or(TestError::Missing("card of one process"))?,
+        )
+        .map_err(ctx("card encodes"))?;
+        assert_eq!(
+            encoded["process"],
+            serde_json::json!({ "pid": 77, "comm": "sshd" }),
+            "ppid and euid stay out of the export line"
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP0.8/WP0.15: ein feindlicher `comm`, den die Sonde nicht
+    /// escapt hat, wird hier escapt und begrenzt.
+    #[test]
+    fn test_evidence_card_escapes_and_bounds_a_hostile_comm() -> TestResult {
+        let hostile = format!("{}\u{202E}gpj", "\u{1}".repeat(40));
+        let event = egress_with_process(Some(process_context(9, Some(&hostile))));
+        let card =
+            EvidenceCard::from_events(&[&event]).ok_or(TestError::Missing("card of a process"))?;
+        let process = card.process.ok_or(TestError::Missing("process"))?;
+        assert_eq!(process.pid, 9);
+        assert!(process.comm.chars().count() <= MAX_EVIDENCE_COMM_CHARS);
+        assert!(process.comm.starts_with("\\u{0001}"), "{}", process.comm);
+        assert!(is_clean(&process.comm), "{}", process.comm);
+
+        let escaped = egress_with_process(Some(process_context(9, Some("curl\\u{202e}"))));
+        let card =
+            EvidenceCard::from_events(&[&escaped]).ok_or(TestError::Missing("card of a process"))?;
+        assert_eq!(
+            card.process.map(|process| process.comm).as_deref(),
+            Some("curl\\u{202e}"),
+            "an already escaped comm passes unchanged"
+        );
         Ok(())
     }
 
