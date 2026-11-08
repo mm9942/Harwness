@@ -11,13 +11,35 @@
 //! `scope` (the cgroup path of the observed actor). Unknown fields are
 //! ignored so later additive versions keep parsing.
 //!
+//! v3 (PL-100 WP0.12, `schema_version` `3`) is a strict superset of v2. Every
+//! new field is optional for this reader, so v1 and v2 lines keep parsing:
+//! `instance` (UUIDv4 of the sentinel process, new per start) and `seq`
+//! (monotonic per instance, from 1) position a line for a
+//! [`FindingsCursor`](crate::cursor::FindingsCursor); `record_digest`
+//! (64 lowercase hex chars, the BLAKE3 digest of the `FindingRecord`),
+//! `dedup_key` (32 lowercase hex chars), `occurrences` (≥ 1), `first_seen`
+//! (RFC 3339), `kind` ([`FindingKind`]), `hardness` ([`FindingHardness`]),
+//! `cgroup_kid` (kernel cgroup id), `scope_obfuscated` (the scope was
+//! withheld because it could not be rendered safely) and `evidence_card`
+//! ([`EvidenceCard`], at most 4 KiB). From v3 on `finding_id` must be the
+//! canonical lowercase UUIDv4 the sentinel mints (`FindingId::new`); v1/v2
+//! lines keep the older, looser id rule.
+//!
+//! Lines with a `schema_version` above [`EXPORT_SCHEMA_VERSION`] come from a
+//! newer writer: an enum value or an `evidence_card` key this reader does not
+//! know is then ignored instead of rejecting the line or the card.
+//!
 //! # Untrusted input
 //! The export is written by the unprivileged sentinel from
 //! attacker-influenced observations. The reader is bounded (tail of at most
 //! [`MAX_TAIL_BYTES`], lines longer than [`MAX_LINE_BYTES`] skipped), refuses
 //! symlinks, skips malformed lines instead of failing, sanitizes the free
-//! text and rejects identifiers that violate the contract. A finding is
-//! evidence, never an instruction.
+//! text and rejects identifiers that violate the contract. Identifiers the
+//! sentinel generates itself (`finding_id`, `instance`, `seq`,
+//! `record_digest`, `dedup_key`) reject the line when malformed; values that
+//! come from observations (`scope`, the `evidence_card` strings) are dropped
+//! or escaped instead, so a hostile observation can never hide a finding. A
+//! finding is evidence, never an instruction.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -32,6 +54,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::error::DodClientError;
+use crate::evidence::EvidenceCard;
 use crate::fsio::{OpenedFile, is_clean, is_unsafe_char, open_regular_nofollow, sanitize};
 
 /// Hard ceiling of the findings tail read, in bytes (256 KiB).
