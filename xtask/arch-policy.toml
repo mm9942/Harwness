@@ -283,6 +283,12 @@ layer = "D"
 layer = "D"
 [packages."harw-dod-netpolicy"]
 layer = "D"
+# PL-100 WP 3.1 (O10): eigene nf_tables-Kodierung über rustix und
+# NETLINK_NETFILTER statt des `nft`-Subprozesses. TCB, weil der Warden damit
+# Netz-Isolation setzt; keine interne Laufzeitabhängigkeit.
+[packages."harw-dod-nft"]
+layer = "D"
+tcb = true
 [packages."harw-dod-procmon"]
 layer = "D"
 [packages."harw-dod-readfs"]
@@ -515,6 +521,11 @@ allowed_internal = ["harw-dod-warden-types", "harw-macros", "harw-types"]
 # Grundausstattung, keine neue Kante.
 [tcb."harw-dod-warden-types"]
 allowed_internal = ["harw-macros", "harw-types"]
+
+# PL-100 WP 3.1 (O10): reine Kodierung plus rustix-Socket; keine interne
+# Abhängigkeit (harw-test-support nur als Dev-Abhängigkeit).
+[tcb."harw-dod-nft"]
+allowed_internal = []
 
 [tcb."harw-dod-readfs"]
 allowed_internal = ["harw-dod-cap", "harw-macros"]

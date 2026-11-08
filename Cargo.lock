@@ -3048,6 +3048,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-dod-nft"
+version = "0.10.0"
+dependencies = [
+ "harw-test-support",
+ "rustix 1.1.5",
+]
+
+[[package]]
 name = "harw-dod-procmon"
 version = "0.10.0"
 dependencies = [

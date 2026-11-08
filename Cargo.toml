@@ -198,6 +198,7 @@ members = [
     "harw-dod/crates/harw-dod-netcounters",
     "harw-dod/crates/harw-dod-netlink",
     "harw-dod/crates/harw-dod-netpolicy",
+    "harw-dod/crates/harw-dod-nft",
     "harw-dod/crates/harw-dod-procmon",
     "harw-dod/crates/harw-dod-readfs",
     "harw-dod/crates/harw-dod-rules",
