@@ -155,7 +155,7 @@ use std::fmt;
 
 use harw_dod_signals::{EventKind, SecurityEvent};
 use jiff::Timestamp;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::rule::RuleConfig;
 
@@ -455,23 +455,37 @@ pub struct ListenerHistory {
 struct ListenerHistoryWire {
     // Siehe `ListenerHistory::version`.
     version: u32,
-    // Siehe `ListenerHistory::primed_at`. Pflichtfeld (`null` erlaubt): ohne
-    // `deserialize_with` machte serde ein fehlendes `Option`-Feld still zu
-    // `None`, und eine abgeschnittene Datei lernte im nächsten Zyklus jeden
-    // gerade offenen Listener ungeprüft.
-    #[serde(deserialize_with = "required_primed_at")]
-    primed_at: Option<Timestamp>,
+    // Siehe `ListenerHistory::primed_at`. Pflichtfeld (`null` erlaubt): ein
+    // `Option`-Feld machte serde bei fehlendem Schlüssel still zu `None`, und
+    // eine abgeschnittene Datei lernte im nächsten Zyklus jeden gerade offenen
+    // Listener ungeprüft. Der Wire-Typ ist deshalb kein `Option`, sondern
+    // [`PrimedAtWire`]; ein fehlender Schlüssel ist ein Fehler.
+    primed_at: PrimedAtWire,
     // Siehe `ListenerHistory::entries`.
     entries: Vec<ListenerEntry>,
 }
 
-// Liest `primed_at` als `Option`; über `deserialize_with` ist ein fehlendes
-// Feld ein Fehler statt `None` (siehe `ListenerHistoryWire::primed_at`).
-fn required_primed_at<'de, D>(deserializer: D) -> Result<Option<Timestamp>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<Timestamp>::deserialize(deserializer)
+// Wire-Form von `primed_at`: ein Zeitstempel oder ausdrücklich `null`.
+// Ungetaggt, damit das Dateiformat (`to_json` schreibt `Option<Timestamp>`)
+// gleich bleibt; anders als ein `Option`-Feld wird ein fehlender Schlüssel
+// nicht zu `None`, sondern zu „missing field“.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PrimedAtWire {
+    // Gelernt seit diesem Zeitpunkt.
+    At(Timestamp),
+    // `null`: noch nicht geprimt.
+    Unprimed(()),
+}
+
+impl PrimedAtWire {
+    // Zurück in die Form von `ListenerHistory::primed_at`.
+    fn into_option(self) -> Option<Timestamp> {
+        match self {
+            Self::At(at) => Some(at),
+            Self::Unprimed(()) => None,
+        }
+    }
 }
 
 impl TryFrom<ListenerHistoryWire> for ListenerHistory {
@@ -492,7 +506,7 @@ impl TryFrom<ListenerHistoryWire> for ListenerHistory {
         }
         Ok(Self {
             version: wire.version,
-            primed_at: wire.primed_at,
+            primed_at: wire.primed_at.into_option(),
             entries: wire.entries,
             index,
         })

@@ -274,7 +274,7 @@ impl RuleConfig {
     /// (`bin` → `/bin`, `daemon` → `/usr/sbin`, `sys` → `/dev`), und jeder
     /// Programmstart aus `/bin` würde sonst zum Start aus einem
     /// Home-Verzeichnis.
-    pub const SYSTEM_TOP_DIRS: &'static [&'static str] = &[
+    pub const SYSTEM_TOP_DIRS: &[&str] = &[
         "bin", "boot", "dev", "etc", "lib", "lib32", "lib64", "libx32", "proc", "sbin", "sys",
         "usr",
     ];

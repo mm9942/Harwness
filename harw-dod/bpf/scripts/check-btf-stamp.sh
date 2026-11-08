@@ -36,7 +36,8 @@ fail() {
 }
 
 sha256_hex() {
-    sha256sum "$1" | awk '{print $1}'
+    hash_file=$1
+    sha256sum "$hash_file" | awk '{print $1}'
 }
 
 # Every file aged with `touch -t 200001010000` or `-t 200101010000` and not
@@ -251,7 +252,8 @@ run_make() {
 
 # How often a fake tool was called since $FAKE_CALLS was last emptied.
 count_calls() {
-    grep -c "^$1" "$FAKE_CALLS" || true
+    call_prefix=$1
+    grep -c "^$call_prefix" "$FAKE_CALLS" || true
 }
 
 # How many compilations the last dry run would have run.
@@ -262,9 +264,10 @@ dry_compiles() {
 # Checks stamp, header, objects and manifest against the current BTF.
 expect_built_from() {
     label=$1
+    header_marker=$2
     btf_hash=$(sha256_hex "$target_btf")
     [ "$(cat "$out/vmlinux.btf.sha256")" = "$btf_hash" ] || fail "$label: the stamp does not hold the BTF digest"
-    grep -Fqx "$2" "$out/include/vmlinux.h" || fail "$label: vmlinux.h was not generated from this BTF"
+    grep -Fqx "$header_marker" "$out/include/vmlinux.h" || fail "$label: vmlinux.h was not generated from this BTF"
     header_hash=$(sha256_hex "$out/include/vmlinux.h")
     grep -Fqx "vmlinux_btf_sha256 = \"$btf_hash\"" "$out/manifest.json" \
         || fail "$label: the manifest does not record the BTF digest"

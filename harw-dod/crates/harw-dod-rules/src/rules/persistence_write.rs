@@ -364,7 +364,7 @@ fn is_systemd_unit_location(components: &[&str]) -> bool {
     SYSTEMD_ROOTS.iter().any(|root| {
         components
             .strip_prefix(*root)
-            .and_then(|rest| rest.first())
+            .and_then(<[&str]>::first)
             .is_some_and(|dir| SYSTEMD_UNIT_DIRS.contains(dir))
     })
 }
