@@ -674,11 +674,14 @@ fn receive_events(connection: &IpcConnection, peer: PeerCredentials, inbox: &Mut
                 break;
             }
             Err(IpcError::Malformed(error)) => {
+                // PL-100 WP0.6: ein Serde-Fehler kann Text der Sonde
+                // wiedergeben (unbekannte Feldnamen, Wertausschnitte) — auf
+                // `warn` nur der Umstand, das Detail auf `debug`.
                 tracing::warn!(
                     ?peer,
-                    error = %error,
                     "ipc peer sent a message that could not be decoded; discarding it and continuing"
                 );
+                tracing::debug!(?peer, error = %error, "ipc decode error detail");
             }
             Err(IpcError::Oversized) => {
                 // Nachrichtengrenze bei `SOCK_SEQPACKET`: der Rest dieses
