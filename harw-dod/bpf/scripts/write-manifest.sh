@@ -39,11 +39,13 @@ lock_value() {
 # trailing newline. Inside a pipeline sha256sum's own status is lost, so an
 # unreadable file shows up as an empty or malformed digest and fails here.
 sha256_of() {
-    digest=$(sha256sum "$1" | awk '{print $1}')
+    file=$1
+    digest=$(sha256sum "$file" | awk '{print $1}')
     case $digest in
-        '' | *[!0-9a-f]*) fail "no sha256 digest for $1" ;;
+        '' | *[!0-9a-f]*) fail "no sha256 digest for $file" ;;
+        *) : ;;
     esac
-    [ "${#digest}" -eq 64 ] || fail "no sha256 digest for $1"
+    [ "${#digest}" -eq 64 ] || fail "no sha256 digest for $file"
     printf '%s' "$digest"
 }
 

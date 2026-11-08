@@ -857,11 +857,12 @@ impl JobManager {
                 };
                 match (&liveness, meta.pid) {
                     (Liveness::Mismatch(reason), Some(pid)) => {
-                        let message = if meta.process_identity().is_some() {
-                            format!("PID {pid} reused, not controlled: {reason}")
-                        } else {
-                            format!("PID {pid} not controlled: {reason}")
-                        };
+                        // Closures carry no cognitive-complexity increment; the
+                        // wording depends on whether an identity was recorded.
+                        let message = meta.process_identity().map_or_else(
+                            || format!("PID {pid} not controlled: {reason}"),
+                            |_| format!("PID {pid} reused, not controlled: {reason}"),
+                        );
                         warn!(job_id = %meta.job_id, pid, %reason, "previous job: identity mismatch");
                         warnings.push(JobNotification {
                             owner: meta.owner.clone(),
