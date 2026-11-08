@@ -14,8 +14,8 @@
 //! 1. [`screen_security_verdict`]: parse → validate (unverändert
 //!    `harw_dod_signals::parse_and_validate_verdict`) → modellverfasste
 //!    Textfelder kappen und escapen. Ohne Bindung und ohne Ablage. Diese Stufe
-//!    nutzt der Wave-Pfad: er kennt weder den erwarteten Befund noch den
-//!    exportierten Digest noch eine Senke (siehe „Wave-Pfad“).
+//!    nutzt der Wave-Pfad, solange ein Ziel keine Bindung trägt (siehe
+//!    „Wave-Pfad“).
 //! 2. [`accept_security_verdict`]: parse → validate → **binden**
 //!    (`SecurityVerdict::binds` gegen die `finding_id` und den exportierten
 //!    `record_digest`, die der Aufrufer selbst hält) → Begründung auf 2 KiB
@@ -52,17 +52,35 @@
 //! [`MAX_PARENT_FINDING_CHARS`] Zeichen, sonst entfällt es und
 //! `"finding_withheld": true` steht da), `issued_by` nur als Rollenname
 //! (`[a-z0-9-]`, höchstens [`MAX_PARENT_ROLE_CHARS`] Zeichen, sonst die feste
-//! Marke [`ISSUED_BY_WITHHELD`]). Binden und Ablegen bleiben DodWatch
-//! vorbehalten, bis der Wave-Pfad eine Erwartung ([`VerdictBinding`]) und
-//! eine [`VerdictSink`] bekommt; dann gibt er
+//! Marke [`ISSUED_BY_WITHHELD`]).
+//!
+//! Gebunden und abgelegt wird im Wave-Pfad nur, wenn vertrauenswürdiger Code
+//! ein `delegate_wave`-Ziel mit einer [`VerdictBinding`] versehen hat
+//! (`WaveTarget::verdict_binding`; ein Modell kann das Feld nicht senden)
+//! und eine [`VerdictSink`] im Kontext liegt
+//! (`OpContextCoreExt::verdict_sink`). Dann ruft der Wave-Pfad
+//! [`accept_security_verdict`] auf (außerhalb des Executors) und gibt
 //! [`AcceptedVerdict::to_parent_value`] zurück, die exakte I4-Form
 //! `{finding_id, classification, severity, suggested_response, verdict_ref}`
-//! (mit `"bound": true`).
+//! (mit `"bound": true`); ein ungebundenes Verdict ist ein inhaltsfreier
+//! Vertragsbruch, auch wenn das Kind am Token-Budget endet
+//! (`agent_tool.rs`, `bound_budget_exhausted_value`). Eine Bindung an einer
+//! Rolle ohne diesen Vertrag startet nicht.
 //!
-//! Nicht abgeschirmt (offen, außerhalb dieses Moduls): ein verdichtetes oder
-//! ungültiges Budget-Teilergebnis (`agent_tool.rs`, `budget_exhausted_value`:
-//! `partial_result` als Rohtext) und `agent.result` (voller Rohtext des
-//! Kindes auf Anfrage).
+//! Die übrigen Rohtext-Wege der Crate sind für Triage-Kinder geschlossen:
+//! ein verdichtetes oder ungültiges Budget-Teilergebnis geht nur als
+//! `partial_result_withheld` zurück (`agent_tool.rs`,
+//! `budget_exhausted_value`), `agent.result` gibt nur die I4-Sicht heraus
+//! (mit registrierter Senke gar keine) und nie das Journal
+//! (`agent_result.rs`), der Endbericht eines nicht
+//! regulär beendeten Kindes nur Kopfzeile und Marke
+//! (`agent_tool.rs`, `child_end_report_text`), Ablehnungs-, Fehlschlags- und
+//! Ausgangstexte nur die Art des Ausgangs. Alles hängt am Vertrag aus der
+//! Agent-IR, also an einer Registry-Factory im Kontext (siehe
+//! `ChildReturnContract`, „Voraussetzung im Betrieb“). In dieser Crate noch
+//! offen (außerhalb dieses Arbeitspakets): `agent.status`
+//! (`agent_messaging.rs::journal_status_fields`: `last_text`, `recent`).
+//! Außerhalb dieser Crate offen: die TUI-Übergabe (`harw-tui`).
 //!
 //! # Abhängigkeitsrichtung
 //! `harw-core-bridge` liegt in Schicht A, `harw-session-store` in Schicht I

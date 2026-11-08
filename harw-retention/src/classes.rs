@@ -22,8 +22,22 @@
 //!   Covers the harw-side copy under `<home>/dod/spool`; the system
 //!   sentinel sweeps its own `@STATEDIR@/spool` with the same limits.
 //! - `sentinel_export`: 90 days, unchanged.
-//! - `dod_verdicts`: triage verdicts of the future `VerdictStore`
-//!   (`<home>/dod/verdicts`), 90 days like the export they annotate.
+//! - `dod_verdicts`: triage verdicts of the `VerdictStore`
+//!   (`harw_session_store::dod_verdict`, `<home>/dod/verdicts`), 90 days like
+//!   the export they annotate. Only the chain segments
+//!   (`verdicts-<seq>.jsonl`) belong to the class; `anchor.json` and `.lock`
+//!   never match. The segments form a hash chain, so this class must **never**
+//!   be swept file by file (that would cut the chain without re-anchoring it
+//!   and make every later check report tampering): its apply step goes only
+//!   through `harw_session_store::retention::StoreClass::DodVerdicts`, which
+//!   calls `VerdictStore::apply_retention` (PL-100 WP 2.3). To make that hold
+//!   for every generic sweeper, the class **resolves no directory**:
+//!   [`ResolvedClass::sweep`](crate::ResolvedClass::sweep) (the `harw cleanup`
+//!   job) finds nothing to delete, even opted in, and reports no directory
+//!   for the class. A sweeper that should apply verdict retention routes the
+//!   class to the store sweep instead. Its limits are exactly those the store
+//!   enforces (90 days by age, no byte, count or `keep_newest` limit); the
+//!   store sweep refuses an override instead of ignoring it.
 //! - `dod_labels`: human-signed labels (`<home>/dod/labels`). No age limit —
 //!   a label ends by its own expiry, never by file age — but a bounded count.
 //!   Dropping a label can only re-enable notices, never suppress one.
@@ -61,9 +75,13 @@ fn sentinel_export_dirs(roots: &Roots) -> Vec<PathBuf> {
     vec![roots.home.join("dod").join("export")]
 }
 
-// Triage verdicts (`VerdictStore`, PL-100 Phase 2) below the harw home.
-fn dod_verdict_dirs(roots: &Roots) -> Vec<PathBuf> {
-    vec![roots.home.join("dod").join("verdicts")]
+// Triage verdicts (`VerdictStore`, PL-100 Phase 2) live in
+// `<home>/dod/verdicts`, but the class is store-owned: the generic sweeper
+// gets no directory, so it can never delete a chain segment file by file
+// (PL-100 WP 2.3). `harw_session_store::retention::StoreClass::DodVerdicts`
+// finds the store itself (`VerdictStore::new(home)`).
+fn dod_verdict_dirs(_roots: &Roots) -> Vec<PathBuf> {
+    Vec::new()
 }
 
 // Human-signed DoD labels (PL-100 I3) below the harw home.
@@ -109,6 +127,11 @@ fn session_dirs(roots: &Roots) -> Vec<PathBuf> {
 // - `freeze_resolved`: `FreezeStore::new(home)` writes `<home>/freeze/
 //   <cgroup>.<finding>.<ts>.{active,resolved}.json`; the suffix matcher below
 //   is exact.
+// - `dod_verdicts`: `VerdictStore::new(home)` writes `<home>/dod/verdicts/
+//   verdicts-<20-digit seq>.jsonl` plus `anchor.json` and `.lock`; the
+//   matcher below selects the segments only. Store-owned: the resolver
+//   returns no directory, applied only via
+//   `harw_session_store::retention::StoreClass::DodVerdicts`.
 
 harw_macros::retention_classes! {
     config = RetentionConfig;
@@ -173,13 +196,21 @@ harw_macros::retention_classes! {
         max_files = none,
     }
     /// DoD triage verdicts under `<home>/dod/verdicts` (security evidence;
-    /// opt-in). 90 days, like the findings export they annotate.
+    /// opt-in). 90 days, like the findings export they annotate. Chain
+    /// segments `verdicts-<seq>.jsonl` only; store-owned: no directory for
+    /// the generic sweeper, applied only via
+    /// `harw_session_store::retention::StoreClass::DodVerdicts`
+    /// (`VerdictStore::apply_retention`), never file by file. The limits are
+    /// the store's own: age only, and once every segment has expired the
+    /// store keeps none (only its chain anchor), hence `keep_newest = 0`. An
+    /// override is refused there.
     dod_verdicts: security_relevant {
         dir = dod_verdict_dirs,
-        name = any,
+        name = prefix_suffix("verdicts-", ".jsonl"),
         max_age_secs = 90 * 86_400,
-        max_bytes = 256 * 1_048_576,
+        max_bytes = none,
         max_files = none,
+        keep_newest = 0,
     }
     /// Human-signed DoD labels under `<home>/dod/labels` (security evidence;
     /// opt-in). No age limit (a label ends by its own expiry), bounded count.
@@ -262,6 +293,66 @@ mod tests {
         Ok(())
     }
 
+    /// PL-100 WP 2.3: only the chain segments belong to `dod_verdicts`; the
+    /// chain anchor and the writer lock never match.
+    #[test]
+    fn test_dod_verdicts_match_only_chain_segments() -> TestResult {
+        let verdicts = class(&RetentionConfig::default(), "dod_verdicts")?;
+        let name = &verdicts.class.name_match;
+        assert_eq!(name.suffix.as_deref(), Some(".jsonl"));
+        assert!(name.matches("verdicts-00000000000000000001.jsonl"));
+        assert!(name.matches("verdicts-00000000000000000042.jsonl"));
+        for kept in [
+            "anchor.json",
+            ".lock",
+            "verdicts-00000000000000000001.json",
+            "other.jsonl",
+        ] {
+            assert!(!name.matches(kept), "{kept} must not match");
+        }
+        assert_eq!(verdicts.max_age_secs, Some(90 * DAY));
+        // Exactly what `VerdictStore::apply_retention` enforces: age only.
+        assert_eq!(verdicts.max_bytes, None);
+        assert_eq!(verdicts.max_files, None);
+        assert_eq!(verdicts.keep_newest, 0);
+        Ok(())
+    }
+
+    /// PL-100 WP 2.3: the generic sweeper (`ResolvedClass::sweep`, the
+    /// `harw cleanup` job) never deletes a verdict segment, not even an old
+    /// one with the class opted in: the class resolves no directory.
+    #[test]
+    fn test_dod_verdicts_generic_sweep_never_touches_the_chain() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let dir = home.path().join("dod").join("verdicts");
+        std::fs::create_dir_all(&dir).map_err(ctx("mkdir"))?;
+        let now = std::time::SystemTime::now();
+        let old = now
+            .checked_sub(std::time::Duration::from_secs(400 * DAY))
+            .ok_or(TestError::Missing("a time 400 days ago"))?;
+        let segment = dir.join("verdicts-00000000000000000001.jsonl");
+        let file = std::fs::File::create(&segment).map_err(ctx("create"))?;
+        file.set_modified(old).map_err(ctx("mtime"))?;
+        let roots = Roots {
+            home: home.path().to_path_buf(),
+            project: None,
+        };
+        assert!(dod_verdict_dirs(&roots).is_empty());
+
+        let opted: RetentionConfig =
+            toml::from_str("[dod_verdicts]\nenabled = true\n").map_err(ctx("toml"))?;
+        let verdicts = class(&opted, "dod_verdicts")?;
+        assert!(verdicts.doctor_warning().is_none(), "bounded by age");
+        for mode in [SweepMode::DryRun, SweepMode::Apply] {
+            let outcomes = verdicts
+                .sweep(&roots, mode, None, now)
+                .map_err(ctx("generic sweep"))?;
+            assert!(outcomes.is_empty(), "no directory for the generic sweeper");
+        }
+        assert!(segment.exists(), "the chain segment stays");
+        Ok(())
+    }
+
     #[test]
     fn test_dod_classes_resolve_below_the_home_dod_directory() -> TestResult {
         let roots = Roots {
@@ -272,7 +363,6 @@ mod tests {
         for (id, sub) in [
             ("dod_spool", "spool"),
             ("sentinel_export", "export"),
-            ("dod_verdicts", "verdicts"),
             ("dod_labels", "labels"),
         ] {
             let resolved = class(&RetentionConfig::default(), id)?;
@@ -282,6 +372,10 @@ mod tests {
                 "{id}"
             );
         }
+        // Store-owned (PL-100 WP 2.3): `<home>/dod/verdicts` is found by the
+        // `VerdictStore`, never by the generic sweeper.
+        let verdicts = class(&RetentionConfig::default(), "dod_verdicts")?;
+        assert!((verdicts.class.resolve_dirs)(&roots).is_empty());
         Ok(())
     }
 }
