@@ -17702,6 +17702,8 @@ forbidden = [{forbidden}]
             id: "job-1".to_owned(),
             name: "build".to_owned(),
             state: harw_tool_job::JobState::Running,
+            suspended: false,
+            suspension_unresolved: false,
             progress: "13%".to_owned(),
             runtime: "1m15s".to_owned(),
             active: true,

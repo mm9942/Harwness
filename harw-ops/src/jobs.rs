@@ -358,6 +358,12 @@ fn list_text(manager: &JobManager) -> String {
     text
 }
 
+/// Zeile der Detailansicht für ein ungeklärtes Anhalten
+/// ([`JobMeta::is_suspension_unresolved`], PL-100 WP 3.5): harw kann nicht
+/// belegen, dass ein Freeze der cgroup sein eigener ist.
+const UNRESOLVED_SUSPENSION: &str = "Anhalten ungeklärt: nur die Absicht ist vermerkt; \
+     job.resume lehnt ab, job.stop beendet ohne Auftauen";
+
 fn show_text(status: &JobStatus) -> String {
     let meta = &status.meta;
     let mut lines = vec![
@@ -397,6 +403,10 @@ fn show_text(status: &JobStatus) -> String {
         ),
         format!("Logs: {}", status.log_dir.display()),
     ];
+    // PL-100 WP 3.5: nur die Absicht vermerkt, harws Freeze nicht belegt.
+    if meta.is_suspension_unresolved() {
+        lines.push(UNRESOLVED_SUSPENSION.to_owned());
+    }
     if let Some(error) = &meta.launch_error {
         lines.push(format!("Startfehler: {error}"));
     }
@@ -564,7 +574,19 @@ mod tests {
 
         let suspended = status("suspended", frozen_at)?;
         assert_eq!(meta_state_label(&suspended.meta), "angehalten");
-        assert!(show_text(&suspended).contains("Zustand: angehalten ·"));
+        let suspended_show = show_text(&suspended);
+        assert!(suspended_show.contains("Zustand: angehalten ·"));
+        // Ohne vermerkte Phase ist das Anhalten ungeklärt (fail closed), auch
+        // bei einem abgelösten Job; ein belegtes (`applied`) bekommt keinen
+        // Hinweis.
+        assert!(
+            suspended_show.contains(UNRESOLVED_SUSPENSION),
+            "{suspended_show}"
+        );
+        assert!(show.contains(UNRESOLVED_SUSPENSION), "{show}");
+        let mut applied = status("suspended", frozen_at)?;
+        applied.meta.suspend_phase = Some(harw_tool_job::SuspendPhase::Applied);
+        assert!(!show_text(&applied).contains(UNRESOLVED_SUSPENSION));
 
         let detached = status("detached", None)?;
         assert_eq!(meta_state_label(&detached.meta), "abgelöst");

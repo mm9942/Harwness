@@ -21,9 +21,17 @@
 //!   keine Warden-Eindämmung, die nach harws Anhalten dazukam
 //!   ([`ContainmentHolds`], geprüft vor und nach dem Auftauen, nach
 //!   bestem Bemühen unter der geteilten Sperre [`ContainmentLease`]);
-//!   `job.suspend` friert erst ein, wenn das
-//!   Anhalten dauerhaft in `meta.json` vermerkt ist (`fsync` der Datei,
-//!   `rename`, danach `fsync` des Job-Verzeichnisses);
+//!   `job.suspend` friert erst ein, wenn die Absicht dauerhaft in
+//!   `meta.json` vermerkt ist (`fsync` der Datei, `rename`, danach `fsync`
+//!   des Job-Verzeichnisses) und eine erneute Prüfung direkt davor keinen
+//!   Freeze außerhalb von harw zeigt, und vermerkt danach ebenso
+//!   dauerhaft, dass der Freeze harws eigener ist ([`SuspendPhase`]).
+//!   Nur ein so belegtes
+//!   Anhalten (`applied`) taut `job.resume` auf, auch nach einem Neustart;
+//!   eines, von dem nur die Absicht vermerkt ist (`intent`, auch ältere
+//!   Einträge ohne Phase), ist ungeklärt: `job.resume` lehnt ab
+//!   ([`JobError::SuspensionUnresolved`]), ein erneutes `job.suspend` friert
+//!   nur eine nicht eingefrorene cgroup selbst ein und klärt es so;
 //!   `job.stop` beendet einen angehaltenen Job eingefroren (SIGKILL).
 //!   Haltezeit zählt nicht als aktive Laufzeit (Wanduhr-Semantik in
 //!   [`model`]).
@@ -62,7 +70,8 @@
 //! R18-Feldern, sonst unbekannt).
 //!
 //! # Module
-//! - [`model`] — [`JobId`], [`JobState`], [`JobOwner`], [`JobMeta`], [`JobStatus`]
+//! - [`model`] — [`JobId`], [`JobState`], [`SuspendPhase`], [`JobOwner`],
+//!   [`JobMeta`], [`JobStatus`]
 //! - [`progress`] — reine Fortschritts-/Fehlererkennung
 //! - [`throttle`] — reine Drosselung der Meldungen
 //! - [`event`] — [`JobEvent`], [`JobNotifier`] und Standard-Notifier
@@ -110,6 +119,7 @@ pub use manager::{
 };
 pub use model::{
     JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus, ManagedJobOrigin,
+    SuspendPhase,
 };
 pub use procfs::JobSignal;
 pub use progress::{

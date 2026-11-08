@@ -733,6 +733,7 @@ fn previous_meta_with(
         origin: None,
         suspended_at: None,
         suspended_secs: 0,
+        suspend_phase: None,
     })
 }
 

@@ -47,6 +47,12 @@ pub(crate) struct JobRow {
     /// and selection logic are unchanged (THREAT-MODEL B13: a freeze stays
     /// visible).
     pub suspended: bool,
+    /// PL-100 WP 3.5: the freeze is only recorded as intent
+    /// ([`harw_tool_job::JobMeta::is_suspension_unresolved`]): harw cannot
+    /// prove that the cgroup's freeze is its own, so `job.resume` refuses and
+    /// the operator must resolve it by hand. [`Self::state_label`] shows
+    /// `mission.suspension_unresolved` instead of `mission.suspended`.
+    pub suspension_unresolved: bool,
     /// Erkannter Fortschritt (`ninja 120/900 13%`) oder `—`.
     pub progress: String,
     /// Laufzeit (`1m15s`) oder `—`.
@@ -123,6 +129,7 @@ impl JobRow {
             name: sanitize_inline(&status.meta.name),
             state,
             suspended: status.meta.is_suspended(),
+            suspension_unresolved: status.meta.is_suspension_unresolved(),
             progress: sanitize_inline(&harw_ops::jobs::progress_label(status)),
             runtime: harw_ops::jobs::runtime_label(status),
             active: !state.is_terminal(),
@@ -141,7 +148,9 @@ impl JobRow {
     /// abgelöst ist ([`Self::suspended`]).
     #[must_use]
     pub(crate) fn state_label(&self) -> &'static str {
-        if self.suspended {
+        if self.suspension_unresolved {
+            crate::i18n::tr("mission.suspension_unresolved", "suspended (unresolved)")
+        } else if self.suspended {
             job_state_label(JobState::Suspended)
         } else {
             job_state_label(self.state)
@@ -815,6 +824,7 @@ mod tests {
             name: name.to_owned(),
             state,
             suspended: state == JobState::Suspended,
+            suspension_unresolved: false,
             progress: "ninja 120/900 13%".to_owned(),
             runtime: "12m03s".to_owned(),
             active,
@@ -1141,7 +1151,7 @@ mod tests {
         let suspended = status_of(
             &meta_json(
                 "suspended",
-                r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z","#,
+                r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z","suspend_phase":"applied","#,
                 r#"{"session":"uia"}"#,
             ),
             &[],
@@ -1171,7 +1181,7 @@ mod tests {
         let frozen = status_of(
             &meta_json(
                 "detached",
-                r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z","#,
+                r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z","suspend_phase":"applied","#,
                 r#"{"session":"uia"}"#,
             ),
             &[],
@@ -1179,6 +1189,7 @@ mod tests {
         let row = JobRow::from_status(&frozen);
         assert_eq!(row.state, JobState::Detached);
         assert!(row.suspended && row.active && !row.failed, "{row:?}");
+        assert!(!row.suspension_unresolved, "{row:?}");
         assert_eq!(row.state_label(), job_state_label(JobState::Suspended));
         let line = job_line(&row, false, 120, Theme::Dark);
         let text: String = line
@@ -1200,6 +1211,35 @@ mod tests {
         let row = JobRow::from_status(&detached);
         assert!(!row.suspended, "{row:?}");
         assert_eq!(row.state_label(), job_state_label(JobState::Detached));
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5: ein Anhalten, von dem nur die Absicht vermerkt ist
+    /// (oder ein alter Datensatz ohne Phase), heißt `suspended (unresolved)`
+    /// und nie schlicht `suspended`: `job.resume` lehnt es ab, bis der
+    /// Operator es von Hand klärt.
+    #[test]
+    fn unresolved_suspension_has_its_own_label() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        for phase in [r#""suspend_phase":"intent","#, ""] {
+            let fields = format!(
+                r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z",{phase}"#
+            );
+            let unresolved = status_of(
+                &meta_json("suspended", &fields, r#"{"session":"uia"}"#),
+                &[],
+            )?;
+            let row = JobRow::from_status(&unresolved);
+            assert!(row.suspended && row.suspension_unresolved, "{row:?}");
+            assert!(row.active && !row.failed, "{row:?}");
+            assert_eq!(row.state_label(), "suspended (unresolved)");
+            assert_ne!(row.state_label(), job_state_label(JobState::Suspended));
+            assert_eq!(
+                with_language(UiLanguage::German, || row.state_label()),
+                "angehalten (ungeklärt)"
+            );
+        }
         Ok(())
     }
 

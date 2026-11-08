@@ -263,6 +263,18 @@
     "vi": "đã tạm dừng",
     "hi": "निलंबित"
   },
+  "mission.suspension_unresolved": {
+    "en": "suspended (unresolved)",
+    "de": "angehalten (ungeklärt)",
+    "es": "suspendido (sin resolver)",
+    "fr": "suspendu (non résolu)",
+    "pt": "suspenso (não resolvido)",
+    "ja": "一時停止中（未解決）",
+    "zh-CN": "已暂停（未解决）",
+    "ko": "일시 중지됨(미해결)",
+    "vi": "đã tạm dừng (chưa giải quyết)",
+    "hi": "निलंबित (अनसुलझा)"
+  },
   "mission.succeeded": {
     "en": "succeeded",
     "de": "erfolgreich",

@@ -624,6 +624,8 @@ async fn test_suspend_and_resume_tools_report_transition_and_finding_id() -> Tes
     assert_eq!(suspended.get("changed"), Some(&json!(true)));
     assert_eq!(suspended.get("frozen"), Some(&json!(true)));
     assert_eq!(suspended.get("suspended"), Some(&json!(true)));
+    // harw's own freeze is recorded: job.resume may thaw it.
+    assert_eq!(suspended.get("suspend_phase"), Some(&json!("applied")));
     assert_eq!(suspended.get("finding_id"), Some(&json!(FINDING)));
 
     let again = json_of(
@@ -656,6 +658,7 @@ async fn test_suspend_and_resume_tools_report_transition_and_finding_id() -> Tes
     assert_eq!(resumed.get("transition"), Some(&json!("resumed")));
     assert_eq!(resumed.get("frozen"), Some(&json!(false)));
     assert_eq!(resumed.get("suspended"), Some(&json!(false)));
+    assert_eq!(resumed.get("suspend_phase"), Some(&Value::Null));
 
     let idle = json_of(
         run(

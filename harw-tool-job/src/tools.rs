@@ -19,8 +19,13 @@
 //!   (`ApprovalMode::FullAccess`). Eingefroren bzw. aufgetaut wird
 //!   ausschließlich die von der Runtime bewiesene eigene cgroup des Jobs
 //!   ([`crate::JobManager::suspend`]); ohne sie, und bei einem Freeze, den
-//!   harw nicht vermerkt hat, wird typisiert abgelehnt. `job.stop` taut
-//!   einen angehaltenen Job nie auf (SIGKILL eingefroren).
+//!   harw nicht vermerkt hat, wird typisiert abgelehnt. `job.resume` taut
+//!   nur auf, wenn `meta.json` dauerhaft belegt, dass der Freeze harws
+//!   eigener ist (`suspend_phase` = `applied`); ein ungeklärtes Anhalten
+//!   (`intent`, auch ältere Einträge ohne Phase) lehnt es ab
+//!   ([`crate::JobError::SuspensionUnresolved`]), ohne die cgroup
+//!   anzufassen. `job.status` zeigt die Phase. `job.stop` taut einen
+//!   angehaltenen Job nie auf (SIGKILL eingefroren).
 //!   Eine optionale `finding_id` (UUIDv4, streng geprüft, nur kleine
 //!   Hex-Ziffern zurückgegeben) landet nur im Log und im Ergebnis und wählt
 //!   nie das Ziel. Wiederholtes Anhalten bzw. Fortsetzen ist idempotent
@@ -88,7 +93,7 @@ pub const JOB_RESUME_TOOL: &str = "job.resume";
 /// dem verlangten Signal eingefroren mit SIGKILL beendet wurde.
 const SUSPENDED_STOP_NOTE: &str = "the job was suspended: it was killed while frozen \
      (SIGKILL) instead of being resumed for the requested signal; job.resume it first for a \
-     graceful stop";
+     graceful stop (refused while its suspension is unresolved)";
 
 /// Alle Job-Werkzeuge in Registrierungsreihenfolge (`job.suspend` und
 /// `job.resume` hinten, damit die Positionen der älteren gleich bleiben).
@@ -478,7 +483,8 @@ fn job_stop_spec() -> ToolSpec {
          whole process group, then SIGKILL after a grace period. Also kills processes the \
          job left behind in its process group. A suspended job is never resumed by a stop: \
          it gets KILL at once and ends while frozen (`signal_sent` says SIGKILL); for a \
-         graceful stop, job.resume it first.",
+         graceful stop, job.resume it first (refused while its suspension is unresolved, \
+         `suspend_phase: \"intent\"`).",
         object(
             vec![
                 ("job_id", job_id_prop()),
@@ -524,8 +530,10 @@ fn job_suspend_spec() -> ToolSpec {
          Freezing is asynchronous: `frozen: false` right after a suspend means the \
          processes are still stopping. Suspended time does not count as active runtime \
          and uses no CPU budget; the job keeps its running slot. Suspending an already \
-         suspended job only re-applies the freeze. job.stop kills a suspended job \
-         without resuming it.",
+         suspended job only re-applies the freeze. If harw could not record that its \
+         freeze took effect (`suspend_phase: \"intent\"`, an unresolved suspension), a \
+         new suspend freezes the job again only while its cgroup is not frozen. \
+         job.stop kills a suspended job without resuming it.",
         object(
             vec![("job_id", job_id_prop()), ("finding_id", finding_id_prop())],
             &["job_id"],
@@ -541,8 +549,10 @@ fn job_resume_spec() -> ToolSpec {
          where they stopped and the remaining runtime budget continues. Needs approval \
          unless the session runs with full access. Never lifts a freeze someone else set \
          (refused); `frozen: true` after a resume means such a freeze (e.g. of a parent \
-         cgroup) still holds the job. Resuming a job that is not suspended changes \
-         nothing.",
+         cgroup) still holds the job. Only a suspension recorded as harw's own \
+         (`suspend_phase: \"applied\"`) is resumed; an unresolved one (`\"intent\"`) is \
+         refused without touching the job (job.stop still kills it). Resuming a job that \
+         is not suspended changes nothing.",
         object(
             vec![("job_id", job_id_prop()), ("finding_id", finding_id_prop())],
             &["job_id"],
@@ -918,6 +928,9 @@ fn status_json_at(status: &JobStatus, now: Timestamp) -> Value {
         &mut value,
         [
             ("suspended", json!(meta.is_suspended())),
+            // `applied`: harw's own freeze, job.resume thaws it; `intent`:
+            // unresolved, job.resume refuses it; `null`: not suspended.
+            ("suspend_phase", json!(meta.suspension_phase())),
             (
                 "suspended_at",
                 json!(meta.suspended_at.map(|ts| ts.to_string())),
@@ -1610,6 +1623,21 @@ mod list_view_tests {
         assert_eq!(value.get("suspended_secs"), Some(&json!(65)));
         assert_eq!(value.get("active_secs"), Some(&json!(5)));
         assert_eq!(value.get("end_reason"), Some(&Value::Null));
+        // Review thread 4505015304: a record without a phase is an
+        // unresolved intent (fail closed); a recorded effect is `applied`.
+        assert_eq!(value.get("suspend_phase"), Some(&json!("intent")));
+        let applied = status_of(
+            "job-frozen-applied",
+            "suspended",
+            json!({
+                "suspended_at": "2026-01-01T00:00:10Z",
+                "suspend_phase": "applied",
+            }),
+        )?;
+        assert_eq!(
+            status_json_at(&applied, now).get("suspend_phase"),
+            Some(&json!("applied"))
+        );
 
         // A job that was detached (or loaded after a restart) while
         // suspended stays visible as suspended in both list views (B13).
@@ -1656,6 +1684,7 @@ mod list_view_tests {
             now,
         );
         assert_eq!(plain.get("suspended"), Some(&json!(false)));
+        assert_eq!(plain.get("suspend_phase"), Some(&Value::Null));
         assert_eq!(plain.get("suspended_at"), Some(&Value::Null));
         assert_eq!(plain.get("suspended_secs"), Some(&json!(0)));
         assert_eq!(plain.get("active_secs"), Some(&json!(70)));

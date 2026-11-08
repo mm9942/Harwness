@@ -595,5 +595,6 @@ pub(crate) fn stub_job_meta(
         origin: None,
         suspended_at: None,
         suspended_secs: 0,
+        suspend_phase: None,
     })
 }

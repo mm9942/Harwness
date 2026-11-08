@@ -586,6 +586,7 @@ pub(crate) mod tests {
             name: format!("name-{id}"),
             state,
             suspended: state == JobState::Suspended,
+            suspension_unresolved: false,
             progress: "—".to_owned(),
             runtime: "1s".to_owned(),
             active: !state.is_terminal(),
