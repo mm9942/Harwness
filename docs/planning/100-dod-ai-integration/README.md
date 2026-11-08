@@ -85,8 +85,9 @@ Details und Belege stehen in [INVENTORY.md](INVENTORY.md).
 | A0 | Anreichern | automatisch (`mode = "triage"`, Standard nach Entscheidung) |
 | A1 | Triage-Verdict + Hinweis | automatisch |
 | A2 | eigenen harw-Job anhalten (`job.suspend`) | durch den Menschen, immer mit Nachfrage |
-| A3 | Warden-Freeze einer Cgroup | Freigabe durch den Operator (polkit, Kurz-Hash, explizite Haltedauer) |
-| A4 | Kill oder Netzwerk-Isolation | für den Escalator-Schlüssel unerreichbar |
+| A3 | Warden-Freeze einer Cgroup | Freigabe durch den Operator (polkit, Kurz-Hash); gefroren bleibt gefroren bis zur Aufhebung (O3) |
+| A3-auto | Eigenen harw-Job anhalten durch ein Playbook | zuerst nur Shadow; nach einer Bewährungsphase automatisch, aber nur für eigene harw-Jobs (O2) |
+| A4 | Kill oder Netzwerk-Isolation | über denselben Freigabeweg wie ein Freeze (polkit + Kurz-Hash), zusätzlich mit einer ausdrücklichen Bestätigung „nicht umkehrbar" (O4) |
 
 ## 3. Zielarchitektur
 
@@ -112,9 +113,10 @@ harw-escalator (eigene uid; ohne LLM/HTTP/harw-runtime; Policy aus /etc/harw-dod
   Spool lesen + prüfen → ActionProposal (Prüffrist, Erinnerung, nie Auto-Release)
   ◄─ Freigabe A: harw-dod-approve (polkit auth_admin, ohne keep)
   ◄─ Freigabe B: TUI „Freigeben" → pkexec harw-dod-approve (Passwort nur im polkit-Agenten)
-     beide: Peer-Cgroup nicht unter einer harw-Session oder einem harw-job-Scope; Operator tippt Kurz-Hash; Haltedauer explizit
+     beide: Peer-Cgroup nicht unter einer harw-Session oder einem harw-job-Scope; Operator tippt Kurz-Hash; Hold optional (Vorgabe: bis zur Aufhebung)
   → triage_record_operator → Ladder → authorize_freeze(Operator = Peer) → SignedAuthorization v2
-  → harw-warden (Peer = Escalator-uid; Allowlist Freeze|Thaw; Deny-Liste; persistente Nonces; Hold-Timer taut nur auf)
+  → harw-warden (Peer = Escalator-uid; Allowlist Freeze|Thaw|Kill|Isolate|LiftIsolation je nach Freigabe; Deny-Liste;
+                 persistente Nonces; optionaler Hold-Timer taut nur auf; nftables über Rust-Crate; seccomp)
   → Ack → Escalator gleicht den FreezeStore ab
 ```
 
@@ -123,13 +125,18 @@ harw-escalator (eigene uid; ohne LLM/HTTP/harw-runtime; Policy aus /etc/harw-dod
 - **Kommandozeile:** `harw-dod-approve` ist ein Binary im harw-dod-Workspace, nicht in harw-cli.
   - polkit-Action mit `auth_admin` (ohne keep).
   - Das Binary zeigt typisierte, escapte Felder: Cgroup-Kid, Pfad, Regel, Severity, Kurz-Hash. Der Operator tippt den Hash ab.
-  - Die Haltedauer muss gewählt werden, es gibt keine Vorgabe.
+  - Die Haltedauer ist optional. Ohne Angabe bleibt die Cgroup **bis zur Aufhebung** gefroren (O3).
+  - **Menü „Eingriffe":** In der TUI (Mission Control) und per `harw dod frozen` werden alle aktiven Freezes und Isolationen angezeigt:
+    Cgroup, Grund (Befund), seit wann, wer freigegeben hat, Hold. Von dort aus lassen sie sich wieder **freigeben** (Thaw bzw. LiftIsolation),
+    über denselben polkit-Weg.
+  - Kill und Isolation (A4) laufen über denselben Weg. Zusätzlich muss „nicht umkehrbar" bestätigt werden.
 - **TUI:**
   - Mission Control zeigt die offenen Vorschläge (Liste, Details, Kurz-Hash, Ablauf).
   - Der Knopf **„Freigeben"** startet `pkexec harw-dod-approve --proposal <id>`. Die Authentisierung läuft im polkit-Agenten der Desktop-Sitzung, nicht im
     harw-Prozess.
-  - Im Terminal ohne grafischen Agenten läuft `pkttyagent` in einem **separaten** TTY. Ein Hilfsmodus im selben TTY ist abschaltbar
-    (`[dod.approve] tui_tty = false` ist die Vorgabe). Er ist ausdrücklich schwächer, siehe Bedrohungsmodell B17.
+  - Im Terminal ohne grafischen Agenten läuft `pkttyagent` **im selben TTY wie die TUI** (O12). Das ist per `[dod.approve] tui_tty`
+    abschaltbar. Die Vorgabe ist `true`, und der Wert wird bei `install` und `update` automatisch in die globale Config `~/.harw/config.toml`
+    geschrieben, falls er fehlt. Der Modus ist schwächer als ein separates Terminal, siehe Bedrohungsmodell B17.
 - **Schutz vor Selbstfreigabe:**
   - `harw-dod-approve` lehnt Peers ab, deren Cgroup unter einer harw-Agenten-Session oder einem `harw-job-*`-Scope liegt.
   - `isatty` gilt nicht als Beweis für einen Menschen.
@@ -261,7 +268,9 @@ Voraussetzung ist PL-96 W01. 3.0 und 3.5 können sofort starten.
   - `ThawCgroup` (ab RuleTriggered) und `LiftIsolation` (nur Escalated) als getrennte Aktionen; `ReleaseCgroup` entfällt (`harw-dod-warden/src/warden.rs:281-285`);
   - eigene `ProofPolicy` und Deny-Liste aus `/etc`. Die Deny-Liste umfasst Warden, Escalator, Sentinel, Probes, `harw-dod.slice`, `system.slice`,
     `init.scope` und User-Session-Scopes;
-  - Kill/Isolate für den Escalator-Schlüssel gesperrt; der Hold-Timer taut nur auf;
+  - Kill/Isolate nur mit einem Operator-Entscheid, der `irreversible_ack` trägt (O4); der optionale Hold-Timer taut nur auf;
+  - nftables über eine Rust-nftables-Crate statt des `nft`-Subprozesses, plus ein seccomp-Filter für den Warden (O10; die Crate braucht ein
+    Abhängigkeits-Review und `cargo deny`);
   - **StateDirectory + Landlock-Regel** für Ledger und Timer (heute ist nur `/sys/fs/cgroup` beschreibbar, `harw-warden.service:50`);
   - **immer eine Antwort**, auch bei `ExecutionFailed`/`VerificationFailed` (`warden.rs:117-124`, `ipc.rs:218-224`);
   - **Schlüssel:** Erzeugung, Rotation, Modi, gemeinsame Ablage für Escalator und Warden (`proof_key_dir`, `KeyRing`), mit Bedrohungsangabe zum
@@ -322,29 +331,29 @@ Voraussetzung ist PL-96 W01. 3.0 und 3.5 können sofort starten.
    5. Gebunden und gespeichert. Der Job-Store trifft den eigenen Job, deshalb erscheint ein Hinweis „`job.suspend` empfohlen", und der Mensch bestätigt im Dialog.
 2. **Prozesssteuerung (fremde Cgroup):**
    1. Bei `Contain` entsteht eine `TriageSubmission`. Der Escalator prüft den Spool und erzeugt einen Vorschlag.
-   2. In der TUI: Freigeben → polkit → Hash eintippen → Haltedauer wählen.
+   2. In der TUI: Freigeben → polkit → Hash eintippen → optional Haltedauer (sonst bis zur Aufhebung).
    3. Danach: v2-Signatur → Warden friert ein → Ack → Ledger. Der Timer taut auf, sofern du keine Verlängerung freigibst.
 3. **Datenabruf:**
    - Menschen nutzen `harw dod findings|verdicts|proposals`.
    - Agenten nutzen in Root-Sessions `dod.findings` (3 Werkzeuge) und in Triage-Kindern `DOD_TRIAGE_TOOLS`.
    - Den Spool liest nur der Escalator.
 
-## 6. Offene Entscheidungen
+## 6. Entscheidungen (getroffen am 2026-11-08)
 
-| ID | Frage | Empfehlung |
-|---|---|---|
-| O1 | Taint-Regel für Prozesswerkzeuge unter Full | ja |
-| O2 | automatische A3-Playbooks | vorerst nie, nur Shadow |
-| O3 | Standard-Haltedauer eines Freeze | keine Vorgabe, Operator wählt |
-| O4 | A4 (Kill/Isolation) | unerreichbar; später höchstens mit zweitem, menschlichem Schlüssel |
-| O5 | Ort des Dispatchers | Gateway-Task als Standard, TUI nur ohne Gateway |
-| O6 | Eigentum an `Actor`-pid/comm und neuen `EventKind`-Varianten | harw-dod-signals, Änderungen nur über DoD-Review |
-| O7 | Format der Cgroup-Präfixe | relativ in `/etc`, Doctor normalisiert |
-| O8 | G1-Lösung (Tool-Budget) | Root behält 3 Werkzeuge, Triage-Werkzeuge separat |
-| O9 | Loopback-Egress | Low |
-| O10 | nft als Subprozess oder Rust-Crate; seccomp | Subprozess beibehalten, seccomp nachziehen |
-| O11 | Advisory-Feed, intel-scout, context-steward, authlog | Advisory über structure-triage; authlog nach Parser-Fix |
-| O12 | TUI-Freigabe im selben TTY | abschaltbar, Vorgabe aus |
+| ID | Frage | Entscheidung | Folge im Design |
+|---|---|---|---|
+| O1 | Taint-Regel für Prozesswerkzeuge | **nur außerhalb von Full Access** | Nach `dod.*` im Turn fragen `process.kill`, `host.sudo_exec` und `job.*` nach, außer unter Full Access (Phase 4) |
+| O2 | automatische Eingriffe | **später für eigene harw-Jobs** | Zuerst Shadow-Playbooks; nach einer Bewährungsphase dürfen sie eigene harw-Jobs automatisch anhalten (`job.suspend`), nie fremde Cgroups |
+| O3 | Haltedauer eines Freeze | **bis zur Aufhebung** | Hold ist optional. Neues Menü „Eingriffe" (TUI + `harw dod frozen`) zeigt aktive Freezes/Isolationen und erlaubt die Freigabe |
+| O4 | Kill/Isolation | **wie Freeze mit Freigabe** | Gleicher polkit-Weg, zusätzlich die Bestätigung „nicht umkehrbar"; der Warden erlaubt Kill/Isolate nur mit `irreversible_ack` |
+| O5 | Ort des Dispatchers | **eigene User-Unit, mit dem Gateway verbunden** | `harw-dod-watch.service` (systemd --user) verbindet sich beim Start automatisch mit dem Gateway; die TUI zeigt „DoD-Watch verbunden/getrennt" |
+| O6 | Eigentum am Schema | **nur harw-dod-signals mit DoD-Review** | wie empfohlen |
+| O7 | Format der Cgroup-Präfixe | **relativ in /etc, der Doctor normalisiert** | wie empfohlen |
+| O8 | Tool-Budget G1 | **3 Werkzeuge in Root, der Rest nur für Triage** | wie empfohlen |
+| O9 | Loopback-Egress | **den Nutzer interaktiv im Chat fragen** | Ein Loopback-Befund erzeugt eine Rückfrage in der TUI („erlauben / als Low / normal behandeln"). Die Antwort wird als signiertes Label bzw. Allowlist-Vorschlag gemerkt |
+| O10 | nftables und seccomp | **Rust-nftables-Crate + seccomp** | Phase 3.1 ersetzt den `nft`-Subprozess; Abhängigkeits-Review im TCB |
+| O11 | zusätzliche Quellen | **Advisory, Auth-Log, Container-Sensor, intel-scout/context-steward** | Alle werden angebunden (Phase 1.8 erweitert; die Rollen kommen in `role_names::ALL` mit `[return]`) |
+| O12 | polkit im selben TTY | **erlaubt, per Einstellung, Vorgabe an** | `[dod.approve] tui_tty = true`, wird bei `install` und `update` in `~/.harw/config.toml` geschrieben |
 
 ## 7. Verifikation
 

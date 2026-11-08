@@ -41,12 +41,12 @@
 | B9 | Unterdrückung von Befunden über Labels oder Verdicts | A3/A4 | — | Verdicts unterdrücken nie (I3); Labels signiert, mit Ablauf, außerhalb des harw-Schreibbereichs (2.5) |
 | B10 | Sturm erschöpft das Budget und verdeckt echte Angriffe | A1 | — | partitionierte Budgets, Priorität, reservierte Kapazität, Trip als High-Befund (2.1, I10) |
 | B11 | Rückkopplung: ein Eingriff erzeugt neue Anomalien | — | — | Gruppierung je Cgroup, ReTriage nur bei echter Änderung, Grenze für aktive Freezes (2.1, 3.2) |
-| B12 | Kill oder Isolation kritischer Prozesse | A3 | geschützt (kein Pfad) | Deny-Liste im Warden, Kill/Isolate für den Escalator-Schlüssel gesperrt (3.1) |
-| B13 | Freeze ohne Ende (Verfügbarkeit) | — | — | explizite Haltedauer, Timer taut auf, Erinnerung, Ledger-Abgleich (3.1/3.2) |
+| B12 | Kill oder Isolation kritischer Prozesse | A3 | geschützt (kein Pfad) | Nur mit Operator-Freigabe über polkit + `irreversible_ack` (O4); Deny-Liste im Warden; nie durch ein Modell oder Playbook (3.1) |
+| B13 | Freeze ohne Ende (Verfügbarkeit) | — | — | Vorgabe „bis zur Aufhebung" (O3) ist bewusst; das Menü „Eingriffe" zeigt alle aktiven Freezes dauerhaft an und hebt sie per Freigabe auf; Erinnerungen; Ledger-Abgleich (3.1–3.3) |
 | B14 | Sicherheitsdaten gehen an einen Remote-Provider | A5 | — | eigenes Triage-Modell, bewusste Wahl, Doctor zeigt die Lokalität; Evidence-Cards begrenzt und escaped; der Spool verlässt den Host nie (1.9, §3.2) |
 | B15 | Projekt-Config ändert Triage-Modell oder Policy | A1 | — | `[dod.triage]` nur aus vertrauten Ebenen; TCB-Policy nur in `/etc` (I6) |
 | B16 | Signier-Code in einem modellnahen Prozess | A3/A6 | — | Abhängigkeiten aufgeteilt, Verbots-Zeilen, `cargo tree`-Gate (3.0, I8) |
-| B17 | TUI-Freigabe im selben TTY wird abgehört | A4 | — | Hilfsmodus abschaltbar und standardmäßig aus; in der Doku als schwächer markiert (§3.1) |
+| B17 | TUI-Freigabe im selben TTY wird abgehört | A4 | — | **akzeptiertes Restrisiko (O12):** Der Modus ist standardmäßig an. Er ist per `[dod.approve] tui_tty = false` abschaltbar; der Doctor weist darauf hin; ein grafischer polkit-Agent wird bevorzugt, wenn vorhanden |
 | B18 | Sensibles Journal | A1 (Leser) | **offen** | Journal-Hygiene (0.6) |
 | B19 | Blinde Sensoren ohne Hinweis | A1 | **offen** | Health mit Fenstern, `sensor_degraded`-Regel, Host-Verifikation (0.13, 1.6, 1.10) |
 | B20 | Umgehung durch alphabetische Kürzung oder fehlende pid | A1 | **offen** | Kennzeichen bei Kürzung, Korrelationsfelder (0.15) |
@@ -59,7 +59,10 @@
 
 - Ein Modell kann falsch annotieren. Das wird gemildert, weil Hinweise unabhängig davon immer erscheinen (I3) und Eingriffe einen Menschen brauchen.
 - Kleine Modelle sind anfälliger für Injection. Durch I4 und I5 bleibt der Schaden auf eine falsche Annotation begrenzt.
-- Die symmetrische v2-MAC: Wer den Schlüssel kompromittiert, kann Freeze/Thaw auslösen, aber nie Kill oder Isolation (Allowlist im Warden).
+- Die symmetrische v2-MAC: Wer den Schlüssel kompromittiert, kann Freeze/Thaw auslösen. Kill/Isolation verlangen zusätzlich `irreversible_ack`
+  im MAC-gebundenen Operator-Entscheid. Das schützt nicht gegen einen kompromittierten Schlüssel, deshalb liegen die Schlüssel root-eigen in `/etc`.
+- Same-TTY-polkit (O12, Vorgabe an): Ein kompromittierter harw-Prozess derselben uid könnte die Passworteingabe mitlesen.
+- Automatische Playbooks für eigene harw-Jobs (O2, später): ein Fehlalarm kann einen eigenen Job anhalten; begrenzt auf `job.suspend`, umkehrbar.
 - Ein globaler Angreifer mit root bleibt außerhalb des Modells.
 - Bei einem Remote-Triage-Modell sieht der Provider begrenzte Evidence-Cards. Das ist eine bewusste Entscheidung des Owners.
 - Die DoD-Erkennung selbst kann umgangen werden (Kernel-Rootkits, Verkehr ohne TCP-Connect).
@@ -68,8 +71,8 @@
 
 1. N Zyklen über einen konstanten Ring erzeugen genau einen Befund pro Key.
 2. Ein Modell-`Confirmed` ergibt nie `Ladder::stage_for = Some`.
-3. Der Warden lehnt v1-Belege, fremde Peers, wiederholte Nonces (auch nach einem Neustart), Ziele auf der Deny-Liste sowie Kill/Isolate mit dem Escalator-Schlüssel ab.
-4. `harw-dod-approve` lehnt Peers in harw-Session- oder harw-job-Scopes ab, ebenso einen falschen Hash und eine fehlende Haltedauer.
+3. Der Warden lehnt v1-Belege, fremde Peers, wiederholte Nonces (auch nach einem Neustart), Ziele auf der Deny-Liste sowie Kill/Isolate ohne `irreversible_ack` ab.
+4. `harw-dod-approve` lehnt Peers in harw-Session- oder harw-job-Scopes ab, ebenso einen falschen Hash und bei Kill/Isolation eine fehlende Bestätigung „nicht umkehrbar".
 5. Kein untrusted Byte erscheint in Templates, Hinweisen oder auf dem Approver-Bildschirm; DoD-Daten lösen keinen Auto-Turn aus.
 6. Ein Triage-Kind hat genau `DOD_TRIAGE_TOOLS`, Tiefe 0, und steht nicht in `BackgroundChildren`.
 7. Ohne `[dod.triage].model` läuft keine automatische Triage, und es gibt keinen Rückfall auf das Session-Modell.
