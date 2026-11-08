@@ -42,12 +42,29 @@
 //! - Eine Phase wird nie stillschweigend verlängert. Ein erneutes Markieren
 //!   einer noch aktiven Phase ändert nichts; erst nach dem Ablauf (oder nach
 //!   einem Widerruf) beginnt mit einer neuen Zustimmung ein neues Fenster.
-//! - Ein gemerkter Permit, der unter einer Phase entstand, wird nach deren
-//!   Ende von [`HostPermitSessionRegistry::lookup_permit`] nicht mehr
-//!   geliefert. Neue Permits unter einer Phase stellt
-//!   [`crate::ProcessPermitLedger::issue_for_lease`] mit dem Fenster aus
-//!   [`HostPermitSessionRegistry::covering_lease`] aus; sie enden mit der
-//!   Phase.
+//! - Ein Permit unter einer Phase ist an genau die Phase gebunden, die ihn
+//!   autorisiert hat. Der Aufrufer liest die Phase einmal über
+//!   [`HostPermitSessionRegistry::covering_binding`] (eine [`LeaseBinding`]:
+//!   Fenster, [`LeaseScope`] und Identität der Phase), stellt mit
+//!   [`crate::ProcessPermitLedger::issue_for_lease`] und
+//!   [`LeaseBinding::window`] aus und merkt den Permit mit derselben Bindung
+//!   über [`HostPermitSessionRegistry::remember_lease_permit`]. Die Bindung
+//!   wird nie aus dem Zustand zum Zeitpunkt des Merkens abgeleitet; ist die
+//!   Phase bis dahin abgelaufen, widerrufen oder neu erteilt, wird nichts
+//!   gemerkt.
+//! - [`HostPermitSessionRegistry::lookup_permit`] liefert einen gemerkten
+//!   Lease-Permit nur, solange sein Fenster läuft (`jetzt < expires_at`) und
+//!   genau diese Phase noch eingetragen ist. Ablauf, Widerruf (Strg+H,
+//!   `/sandbox-lease revoke`) und eine danach neu erteilte Phase beenden ihn.
+//!   Eine Phase des anderen Geltungsbereichs (sitzungseigen bzw.
+//!   prozessweit) trägt ihn nicht weiter.
+//! - Ein Widerruf entfernt die an die widerrufene Phase gebundenen Einträge
+//!   und liefert ihre Kennungen
+//!   ([`HostPermitSessionRegistry::revoke_global_approval_taking_ids`],
+//!   [`HostPermitSessionRegistry::revoke_session_approval_taking_ids`]); der
+//!   Aufrufer widerruft sie beim [`crate::ProcessPermitLedger`], damit auch
+//!   ein Permit, den eine Kind-Sitzung kurz vorher nachgeschlagen hat, nicht
+//!   mehr autorisiert wird.
 //! - Der Nutzer kann eine Phase weiterhin jederzeit selbst beenden: Strg+H in
 //!   der TUI (`ChatApp::end_host_mode`) oder das getippte
 //!   `/sandbox-lease revoke`. Das Modell kann eine Phase weder beenden noch
@@ -89,29 +106,139 @@
 //! ```
 
 use crate::process_permit::{
-    DEFAULT_SESSION_LEASE_TTL, LeaseInstant, LeaseWindow, ProcessPermitError, ProcessPermitId,
-    ProcessPermitRequest,
+    DEFAULT_SESSION_LEASE_TTL, GrantedProcessPermit, HostApprovalScope, LeaseInstant, LeaseWindow,
+    ProcessPermitError, ProcessPermitId, ProcessPermitRequest,
 };
 use std::sync::Mutex;
 use std::time::Duration;
+
+/// Geltungsbereich einer Host-Arbeitsphase.
+///
+/// # Description
+/// [`LeaseScope::Session`] ist die sitzungseigene Phase aus
+/// [`HostPermitSessionRegistry::mark_session_approved`]; sie deckt nur ihre
+/// eigene Sitzung ab. [`LeaseScope::Global`] ist die prozessweite Phase aus
+/// [`HostPermitSessionRegistry::mark_global_approval`]; sie deckt jede
+/// Sitzung desselben `harw`-Prozesses ab. Ein gemerkter Lease-Permit gilt
+/// nur, solange die Phase **seines** Geltungsbereichs besteht; die Phase des
+/// anderen Geltungsbereichs trägt ihn nicht weiter.
+///
+/// # Examples
+/// ```rust
+/// use harw_sandbox::{HostPermitSessionRegistry, LeaseScope};
+///
+/// let registry = HostPermitSessionRegistry::default();
+/// registry.mark_global_approval();
+/// assert!(registry
+///     .covering_binding("session-1")
+///     .is_some_and(|binding| binding.scope() == LeaseScope::Global));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LeaseScope {
+    /// Sitzungseigene Phase; deckt nur ihre Sitzung ab.
+    Session,
+    /// Prozessweite Phase; deckt jede Sitzung des Prozesses ab.
+    Global,
+}
+
+/// Die Host-Arbeitsphase, die einen Permit autorisiert: ihr Fenster, ihr
+/// Geltungsbereich und ihre Identität.
+///
+/// # Description
+/// Nur die Registry erzeugt eine Bindung
+/// ([`HostPermitSessionRegistry::covering_binding_at`]); die Felder sind
+/// privat. Der Aufrufer reicht sie unverändert weiter: [`Self::window`] an
+/// [`crate::ProcessPermitLedger::issue_for_lease_at`] und die Bindung selbst
+/// an [`HostPermitSessionRegistry::remember_lease_permit_at`]. So trägt der
+/// gemerkte Eintrag genau die Phase, unter der der Permit ausgestellt wurde.
+///
+/// Die Identität ist eine Generation, die die Registry bei jeder neu
+/// eröffneten Phase vergibt. Eine Phase, die nach einem Widerruf neu erteilt
+/// wird, ist eine andere Phase, auch wenn ihr Fenster dem alten gleicht; sie
+/// trägt die Permits der alten Phase nicht weiter.
+///
+/// # Concurrency
+/// `Copy`; ein reiner Wert ohne Verweis auf die Registry. Ob die Phase noch
+/// gilt, prüft die Registry bei jedem Merken und Nachschlagen erneut.
+///
+/// # Examples
+/// ```rust
+/// use harw_sandbox::{HostPermitSessionRegistry, LeaseScope};
+///
+/// let registry = HostPermitSessionRegistry::default();
+/// registry.mark_session_approved("session-1");
+/// if let Some(binding) = registry.covering_binding("session-1") {
+///     assert_eq!(binding.scope(), LeaseScope::Session);
+///     assert_eq!(registry.session_lease("session-1"), Some(binding.window()));
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseBinding {
+    scope: LeaseScope,
+    window: LeaseWindow,
+    generation: u64,
+}
+
+impl LeaseBinding {
+    /// Geltungsbereich der Phase (sitzungseigen oder prozessweit).
+    #[must_use]
+    pub fn scope(&self) -> LeaseScope {
+        self.scope
+    }
+
+    /// Fenster der Phase; geht an
+    /// [`crate::ProcessPermitLedger::issue_for_lease_at`].
+    #[must_use]
+    pub fn window(&self) -> LeaseWindow {
+        self.window
+    }
+}
+
+// Eine eingetragene Phase: ihr Fenster und ihre eindeutige Generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GrantedLease {
+    window: LeaseWindow,
+    generation: u64,
+}
+
+impl GrantedLease {
+    // Die Bindung an diese Phase im Geltungsbereich `scope`.
+    fn binding(self, scope: LeaseScope) -> LeaseBinding {
+        LeaseBinding {
+            scope,
+            window: self.window,
+            generation: self.generation,
+        }
+    }
+}
+
+// Was einen gemerkten Permit trägt; immer vom Aufrufer übergeben, nie aus
+// dem Zustand zum Zeitpunkt des Merkens abgeleitet.
+#[derive(Debug, Clone, Copy)]
+enum PermitAuthority {
+    // Unter genau dieser Phase ausgestellt: gilt nur, solange ihr Fenster
+    // läuft und sie eingetragen ist.
+    Lease(LeaseBinding),
+    // Einmalfreigabe, beim Merken bereits vom Ledger verbraucht; keine
+    // Phase, die Gültigkeit prüft allein der Ledger.
+    SingleExecution,
+}
 
 /// Ein Eintrag: welcher exakte Antrag bereits einen ausgestellten Permit hat.
 #[derive(Debug, Clone)]
 struct RememberedPermit {
     request: ProcessPermitRequest,
     id: ProcessPermitId,
-    /// `true`, wenn beim Merken eine aktive Host-Arbeitsphase die Sitzung des
-    /// Antrags abdeckte. Dann liefert `lookup_permit` den Eintrag nur, solange
-    /// eine Phase die Sitzung weiterhin abdeckt (B22: kein Weiterleben nach
-    /// dem Ablauf).
-    lease_bound: bool,
+    /// Die Phase (oder Einmalfreigabe), die den Permit autorisiert hat (B22:
+    /// kein Weiterleben nach Ablauf oder Widerruf dieser Phase).
+    authority: PermitAuthority,
 }
 
 /// Eine sitzungseigene Host-Arbeitsphase.
 #[derive(Debug, Clone)]
 struct ApprovedSession {
     session: String,
-    window: LeaseWindow,
+    lease: GrantedLease,
 }
 
 #[derive(Debug, Default)]
@@ -123,7 +250,7 @@ struct RegistryState {
     /// nächsten Zustimmung gespeichert, ist aber wirkungslos.
     approved_sessions: Vec<ApprovedSession>,
     /// Bereits ausgestellte Permits, um denselben Antrag ohne erneute
-    /// `issue_after_local_approval`-Ausstellung wiederzuverwenden.
+    /// Ausstellung wiederzuverwenden, je mit der Phase, die sie trägt.
     remembered: Vec<RememberedPermit>,
     /// Sitzungen mit einer noch nicht verbrauchten Einmal-Freigabe
     /// (`HostApprovalScope::SingleExecution`-Zustimmung im
@@ -135,45 +262,105 @@ struct RegistryState {
     /// Session-ID desselben `harw`-Prozesses (Root-Session und jede
     /// Kind-Session), bis [`HostPermitSessionRegistry::revoke_global_approval`]
     /// sie entfernt oder ihr Fenster abläuft (B22).
-    global_approval: Option<LeaseWindow>,
+    global_approval: Option<GrantedLease>,
     /// Prozessweite Einmal-Freigabe: der nächste
     /// [`HostPermitSessionRegistry::take_single_use`]-Aufruf **jeder**
     /// Session-ID verbraucht sie, genau wie `single_use` es für eine
     /// einzelne Sitzung tut.
     global_single_use: bool,
+    /// Generation der nächsten neu eröffneten Phase (sitzungseigen oder
+    /// prozessweit, ein gemeinsamer Zähler). Jede Phase bekommt eine eigene
+    /// Generation, damit eine nach einem Widerruf neu erteilte Phase mit
+    /// gleichem Fenster nie als die alte gilt.
+    next_generation: u64,
 }
 
 impl RegistryState {
-    // Gespeichertes (aktives oder abgelaufenes) Fenster der Sitzung.
-    fn session_window(&self, session: &str) -> Option<LeaseWindow> {
+    // Eingetragene (aktive oder abgelaufene) sitzungseigene Phase.
+    fn session_grant(&self, session: &str) -> Option<GrantedLease> {
         self.approved_sessions
             .iter()
             .find(|entry| entry.session == session)
-            .map(|entry| entry.window)
+            .map(|entry| entry.lease)
     }
 
-    // Alle zu `now` aktiven Fenster, die `session` abdecken (eigenes und
-    // prozessweites).
-    fn covering_windows(
+    // Gespeichertes (aktives oder abgelaufenes) Fenster der Sitzung.
+    fn session_window(&self, session: &str) -> Option<LeaseWindow> {
+        self.session_grant(session).map(|lease| lease.window)
+    }
+
+    // Die eingetragene Phase des Geltungsbereichs `scope`, die `session`
+    // betrifft (aktiv oder abgelaufen).
+    fn stored_grant(&self, session: &str, scope: LeaseScope) -> Option<GrantedLease> {
+        match scope {
+            LeaseScope::Session => self.session_grant(session),
+            LeaseScope::Global => self.global_approval,
+        }
+    }
+
+    // Bindungen aller zu `now` aktiven Phasen, die `session` abdecken
+    // (eigene, dann prozessweite).
+    fn covering_bindings(
         &self,
         session: &str,
         now: LeaseInstant,
-    ) -> impl Iterator<Item = LeaseWindow> {
-        self.session_window(session)
+    ) -> impl Iterator<Item = LeaseBinding> {
+        self.session_grant(session)
+            .map(|lease| lease.binding(LeaseScope::Session))
             .into_iter()
-            .chain(self.global_approval)
-            .filter(move |window| window.is_active_at(now))
+            .chain(
+                self.global_approval
+                    .map(|lease| lease.binding(LeaseScope::Global)),
+            )
+            .filter(move |binding| binding.window.is_active_at(now))
     }
 
     // `true`, wenn zu `now` eine aktive Phase `session` abdeckt.
     fn is_covered_at(&self, session: &str, now: LeaseInstant) -> bool {
-        self.covering_windows(session, now).next().is_some()
+        self.covering_bindings(session, now).next().is_some()
     }
 
-    // Das zu `now` aktive Fenster mit der längsten Restlaufzeit.
-    fn latest_covering(&self, session: &str, now: LeaseInstant) -> Option<LeaseWindow> {
-        self.covering_windows(session, now)
-            .max_by_key(|window| window.remaining_at(now))
+    // Die zu `now` aktive Phase mit der längsten Restlaufzeit.
+    fn latest_covering(&self, session: &str, now: LeaseInstant) -> Option<LeaseBinding> {
+        self.covering_bindings(session, now)
+            .max_by_key(|binding| binding.window.remaining_at(now))
+    }
+
+    // `true`, wenn das Fenster von `binding` zu `now` läuft und genau diese
+    // Phase (Geltungsbereich, Fenster, Generation) für `session` noch
+    // eingetragen ist. Ablauf, Widerruf und eine neu erteilte Phase ergeben
+    // `false`; die Phase des anderen Geltungsbereichs zählt nicht.
+    fn is_current(&self, session: &str, binding: LeaseBinding, now: LeaseInstant) -> bool {
+        binding.window.is_active_at(now)
+            && self
+                .stored_grant(session, binding.scope)
+                .is_some_and(|lease| lease.binding(binding.scope) == binding)
+    }
+
+    // Vergibt die Generation einer neu eröffneten Phase; `None`, wenn der
+    // Zähler erschöpft ist (fail-closed: die Phase wird nicht eingetragen).
+    fn allocate_generation(&mut self) -> Option<u64> {
+        let generation = self.next_generation;
+        self.next_generation = generation.checked_add(1)?;
+        Some(generation)
+    }
+
+    // Entfernt jeden gemerkten Lease-Permit, auf dessen Antrag und Bindung
+    // `selects` zutrifft, und liefert seine Kennungen (zum Widerruf beim
+    // Ledger). Einmal-Permits bleiben unberührt.
+    fn drop_lease_permits(
+        &mut self,
+        selects: impl Fn(&ProcessPermitRequest, LeaseBinding) -> bool,
+    ) -> Vec<ProcessPermitId> {
+        let mut removed = Vec::new();
+        self.remembered.retain(|entry| match entry.authority {
+            PermitAuthority::Lease(binding) if selects(&entry.request, binding) => {
+                removed.push(entry.id);
+                false
+            }
+            PermitAuthority::Lease(_) | PermitAuthority::SingleExecution => true,
+        });
+        removed
     }
 }
 
@@ -307,15 +494,18 @@ impl HostPermitSessionRegistry {
     /// Wird genau einmal pro Sitzung aufgerufen, ausgelöst durch den
     /// Bestätigungsdialog. Danach darf der Aufrufer für jeden neuen,
     /// abweichenden Befehl innerhalb derselben Sitzung ohne erneutes Fragen
-    /// einen eigenen Permit über [`crate::ProcessPermitLedger::issue_after_local_approval`]
-    /// ausstellen lassen — die Zustimmung des Menschen bezog sich auf die
-    /// Sitzung, nicht auf einen einzelnen Befehlstext.
+    /// einen eigenen Permit unter dieser Phase ausstellen lassen
+    /// ([`Self::covering_binding_at`],
+    /// [`crate::ProcessPermitLedger::issue_for_lease_at`],
+    /// [`Self::remember_lease_permit_at`]) — die Zustimmung des Menschen
+    /// bezog sich auf die Sitzung, nicht auf einen einzelnen Befehlstext.
     ///
     /// Ein erneuter Aufruf für dieselbe `session` legt keinen zweiten Eintrag
     /// an. Ist die Phase zu `now` noch aktiv, bleibt ihr Fenster unverändert
     /// (keine stillschweigende Verlängerung, B22). Ist sie abgelaufen, beginnt
     /// ein neues Fenster ab `now` (das ist die erneute Zustimmung nach dem
-    /// Nachfragen). Die Zustimmung endet mit dem Ablauf, über
+    /// Nachfragen); das ist eine neue Phase, unter der alten gemerkte Permits
+    /// gelten nicht weiter. Die Zustimmung endet mit dem Ablauf, über
     /// [`Self::forget_session`] bzw. [`Self::revoke_session_approval`]
     /// (Strg+H bzw. `/sandbox-lease revoke`) oder mit dem Prozess.
     ///
@@ -328,7 +518,8 @@ impl HostPermitSessionRegistry {
     /// paniert) wird über `if let Ok(..)` übersprungen, statt selbst zu
     /// paniken — die Zustimmung geht in diesem seltenen Fall verloren, aber
     /// der Aufrufer stürzt nicht ab. Ein nicht darstellbares Fensterende
-    /// (`now + lease_ttl`) wird ebenso nicht eingetragen.
+    /// (`now + lease_ttl`) wird ebenso nicht eingetragen, ebenso eine Phase,
+    /// für die der Generationszähler erschöpft ist.
     ///
     /// # Concurrency
     /// `Send + Sync`; die Änderung läuft unter demselben [`Mutex`], der den
@@ -361,19 +552,29 @@ impl HostPermitSessionRegistry {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        // Aktive Phase: nie stillschweigend verlängern (B22).
+        if state
+            .session_grant(&session)
+            .is_some_and(|lease| lease.window.is_active_at(now))
+        {
+            return;
+        }
+        let Some(generation) = state.allocate_generation() else {
+            tracing::warn!("host lease generation counter exhausted; approval not recorded");
+            return;
+        };
+        let lease = GrantedLease { window, generation };
         match state
             .approved_sessions
             .iter_mut()
             .find(|entry| entry.session == session)
         {
-            // Aktive Phase: nie stillschweigend verlängern (B22).
-            Some(entry) if entry.window.is_active_at(now) => {}
-            // Abgelaufene Phase: die erneute Zustimmung eröffnet ein neues
-            // Fenster.
-            Some(entry) => entry.window = window,
+            // Abgelaufene Phase: die erneute Zustimmung eröffnet eine neue
+            // Phase mit neuem Fenster und neuer Generation.
+            Some(entry) => entry.lease = lease,
             None => state
                 .approved_sessions
-                .push(ApprovedSession { session, window }),
+                .push(ApprovedSession { session, lease }),
         }
     }
 
@@ -482,11 +683,13 @@ impl HostPermitSessionRegistry {
     ///
     /// # Beschreibung
     /// Berücksichtigt die sitzungseigene und die prozessweite Phase; decken
-    /// beide ab, zählt die mit der längeren Restlaufzeit. Aufrufer, die unter
-    /// einer laufenden Phase einen Permit ausstellen, reichen das Fenster an
-    /// [`crate::ProcessPermitLedger::issue_for_lease_at`] weiter: der Permit
-    /// endet dann mit der Phase, und ohne Fenster (`None`) wird nichts
-    /// ausgestellt, statt still einen frischen 8-h-Permit zu erzeugen.
+    /// beide ab, zählt die mit der längeren Restlaufzeit. Das ist das
+    /// Fenster von [`Self::covering_binding_at`]. Aufrufer, die unter einer
+    /// laufenden Phase einen Permit ausstellen **und merken**, nehmen
+    /// [`Self::covering_binding_at`]: [`Self::remember_lease_permit_at`]
+    /// braucht die ganze Bindung, nicht nur das Fenster. Ohne Fenster
+    /// (`None`) wird nichts ausgestellt, statt still einen frischen
+    /// 8-h-Permit zu erzeugen.
     ///
     /// # Argumente
     /// - `session` (`&str`): die Sitzungs-ID.
@@ -513,6 +716,71 @@ impl HostPermitSessionRegistry {
     /// ```
     #[must_use]
     pub fn covering_lease_at(&self, session: &str, now: LeaseInstant) -> Option<LeaseWindow> {
+        self.state
+            .lock()
+            .ok()?
+            .latest_covering(session, now)
+            .map(|binding| binding.window)
+    }
+
+    /// Die Bindung an die Phase, die `session` abdeckt; „jetzt“ ist
+    /// [`LeaseInstant::now`]. Siehe [`Self::covering_binding_at`].
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_sandbox::HostPermitSessionRegistry;
+    ///
+    /// let registry = HostPermitSessionRegistry::default();
+    /// assert!(registry.covering_binding("session-1").is_none());
+    /// registry.mark_session_approved("session-1");
+    /// assert!(registry.covering_binding("session-1").is_some());
+    /// ```
+    #[must_use]
+    pub fn covering_binding(&self, session: &str) -> Option<LeaseBinding> {
+        self.covering_binding_at(session, LeaseInstant::now())
+    }
+
+    /// Die Bindung an die Host-Arbeitsphase, die `session` zu `now` abdeckt:
+    /// Fenster, Geltungsbereich und Identität der Phase.
+    ///
+    /// # Beschreibung
+    /// Dieselbe Auswahl wie [`Self::covering_lease_at`] (bei zwei
+    /// abdeckenden Phasen die mit der längeren Restlaufzeit). Der Aufrufer
+    /// liest die Phase genau einmal, stellt mit [`LeaseBinding::window`] über
+    /// [`crate::ProcessPermitLedger::issue_for_lease_at`] aus und merkt den
+    /// Permit mit derselben Bindung über [`Self::remember_lease_permit_at`].
+    /// Zwischen Prüfung, Ausstellung und Merken gibt es so keinen zweiten,
+    /// abweichenden Blick auf den Zustand.
+    ///
+    /// # Argumente
+    /// - `session` (`&str`): die Sitzungs-ID.
+    /// - `now` (`LeaseInstant`): der Bezugszeitpunkt.
+    ///
+    /// # Returns
+    /// `Some(binding)` mit `binding.window().is_active_at(now)`, wenn eine
+    /// aktive Phase `session` abdeckt; sonst `None` — auch bei vergiftetem
+    /// [`Mutex`] (fail-closed).
+    ///
+    /// # Concurrency
+    /// Sperrt kurz denselben [`Mutex`]; rein lesend. Die Bindung ist danach
+    /// ein reiner Wert: ob die Phase später noch gilt, prüft
+    /// [`Self::remember_lease_permit_at`] bzw. [`Self::lookup_permit_at`].
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_sandbox::{HostPermitSessionRegistry, LeaseScope};
+    ///
+    /// let registry = HostPermitSessionRegistry::default();
+    /// registry.mark_session_approved("session-1");
+    /// if let Some(window) = registry.session_lease("session-1") {
+    ///     let t0 = window.granted_at();
+    ///     let binding = registry.covering_binding_at("session-1", t0);
+    ///     assert!(binding.is_some_and(|b| b.scope() == LeaseScope::Session && b.window() == window));
+    ///     assert!(registry.covering_binding_at("session-1", window.expires_at()).is_none());
+    /// }
+    /// ```
+    #[must_use]
+    pub fn covering_binding_at(&self, session: &str, now: LeaseInstant) -> Option<LeaseBinding> {
         self.state.lock().ok()?.latest_covering(session, now)
     }
 
@@ -528,8 +796,10 @@ impl HostPermitSessionRegistry {
     /// # Beschreibung
     /// Für Anzeigen („endet in …“). Zum Ausstellen eines Permits unter der
     /// Phase nicht als `ttl` verwenden (ein `None` würde dort einen vollen
-    /// Permit ergeben), sondern [`Self::covering_lease_at`] mit
-    /// [`crate::ProcessPermitLedger::issue_for_lease_at`].
+    /// Permit ergeben), sondern die Bindung aus [`Self::covering_binding_at`]:
+    /// [`crate::ProcessPermitLedger::issue_for_lease_at`] mit
+    /// [`LeaseBinding::window`] und danach [`Self::remember_lease_permit_at`]
+    /// mit derselben Bindung.
     ///
     /// # Argumente
     /// - `session` (`&str`): die Sitzungs-ID.
@@ -580,10 +850,11 @@ impl HostPermitSessionRegistry {
     ///   nur geliehen.
     ///
     /// # Returns
-    /// `Some(id)`, wenn [`Self::remember_permit`] bereits für einen identischen
-    /// `request` aufgerufen wurde und — falls der Permit unter einer
-    /// Host-Arbeitsphase gemerkt wurde — weiterhin eine aktive Phase die
-    /// Sitzung abdeckt; sonst `None` — auch bei vergiftetem [`Mutex`]
+    /// `Some(id)`, wenn für einen identischen `request` ein Permit gemerkt
+    /// wurde ([`Self::remember_lease_permit`] bzw.
+    /// [`Self::remember_single_execution_permit`]) und — bei einem
+    /// Lease-Permit — die Phase, an die er gebunden ist, noch läuft und
+    /// eingetragen ist; sonst `None` — auch bei vergiftetem [`Mutex`]
     /// (fail-closed).
     ///
     /// # Concurrency
@@ -592,7 +863,7 @@ impl HostPermitSessionRegistry {
     ///
     /// # Examples
     /// ```rust
-    /// use harw_sandbox ::{HostPermitSessionRegistry, ProcessEnvironment, request_for_workspace};
+    /// use harw_sandbox::{HostPermitSessionRegistry, ProcessEnvironment, request_for_workspace};
     /// use std::path::Path;
     ///
     /// let registry = HostPermitSessionRegistry::default();
@@ -614,13 +885,20 @@ impl HostPermitSessionRegistry {
     /// zu `now`.
     ///
     /// # Beschreibung
-    /// Wie [`Self::lookup_permit`]. Ein Eintrag, der unter einer
-    /// Host-Arbeitsphase gemerkt wurde, wird nur geliefert, solange zu `now`
-    /// eine aktive Phase (sitzungseigen oder prozessweit) seine Sitzung
-    /// abdeckt. Nach dem Ablauf oder Widerruf der Phase liefert diese Methode
-    /// `None`; der Aufrufer prüft dann die Phase und fragt erneut (B22). Ein
-    /// ohne Phase gemerkter Eintrag (Einmalfreigabe) bleibt unberührt; seine
-    /// Gültigkeit prüft allein der [`crate::ProcessPermitLedger`].
+    /// Wie [`Self::lookup_permit`]. Ein Lease-Permit wird nur geliefert,
+    /// solange
+    /// - das Fenster seiner Bindung zu `now` läuft (`now < expires_at` auf
+    ///   beiden Uhren; `now == expires_at` gilt bereits als abgelaufen) und
+    /// - genau die Phase seiner Bindung (Geltungsbereich, Fenster,
+    ///   Generation) für seine Sitzung noch eingetragen ist.
+    ///
+    /// Nach Ablauf, Widerruf (Strg+H, `/sandbox-lease revoke`) oder einer
+    /// danach neu erteilten Phase liefert diese Methode `None`; der Aufrufer
+    /// prüft dann die Phase und fragt erneut (B22). Eine Phase des anderen
+    /// Geltungsbereichs, die die Sitzung ebenfalls abdeckt, trägt den Permit
+    /// nicht weiter. Ein Einmal-Permit
+    /// ([`Self::remember_single_execution_permit`]) hängt an keiner Phase;
+    /// seine Gültigkeit prüft allein der [`crate::ProcessPermitLedger`].
     ///
     /// # Argumente
     /// - `request` (`&ProcessPermitRequest`): der exakt zu findende Antrag.
@@ -662,91 +940,24 @@ impl HostPermitSessionRegistry {
             .remembered
             .iter()
             .find(|entry| &entry.request == request)?;
-        if entry.lease_bound && !state.is_covered_at(&entry.request.session, now) {
-            return None;
-        }
-        Some(entry.id)
+        let valid = match entry.authority {
+            PermitAuthority::Lease(binding) => {
+                state.is_current(&entry.request.session, binding, now)
+            }
+            PermitAuthority::SingleExecution => true,
+        };
+        valid.then_some(entry.id)
     }
 
-    /// Merkt sich eine frisch ausgestellte Permit-Kennung für ihren exakten
-    /// Antrag, damit derselbe Antrag später ohne erneute Ausstellung
-    /// autorisiert werden kann; „jetzt“ ist [`LeaseInstant::now`]. Siehe
-    /// [`Self::remember_permit_at`].
-    ///
-    /// # Beschreibung
-    /// Ein bereits gemerkter Eintrag für einen identischen `request` wird
-    /// vollständig durch den neuen ersetzt (kein Anhäufen mehrerer Kennungen
-    /// für denselben Antrag). Der Aufrufer ist dafür verantwortlich, dass
-    /// `id` tatsächlich zu `request` passt — diese Methode prüft das nicht,
-    /// das übernimmt [`crate::ProcessPermitLedger::authorize`] beim
-    /// nächsten [`Self::lookup_permit`]-gestützten Aufruf.
-    ///
-    /// # Argumente
-    /// - `request` (`ProcessPermitRequest`): der Antrag, dessen Kennung
-    ///   gemerkt wird; Eigentum geht über.
-    /// - `id` (`ProcessPermitId`): die bereits beim Ledger ausgestellte
-    ///   Kennung für genau diesen Antrag.
-    ///
-    /// # Concurrency
-    /// `Send + Sync`; sperrt kurz denselben [`Mutex`] wie jede andere Methode
-    /// dieses Typs. Bei vergiftetem `Mutex` verwirft dieser Aufruf sich
-    /// selbst, statt zu paniken — die Kennung geht dann verloren und ein
-    /// späterer [`Self::lookup_permit`] liefert `None`.
+    /// Merkt sich einen unter der Phase `binding` ausgestellten Permit für
+    /// seinen exakten Antrag; „jetzt“ ist [`LeaseInstant::now`]. Siehe
+    /// [`Self::remember_lease_permit_at`].
     ///
     /// # Examples
     /// ```rust
     /// use harw_sandbox::{
-    ///     HostApprovalScope, HostPermitSessionRegistry, ProcessEnvironment, ProcessPermitError,
-    ///     ProcessPermitLedger, request_for_workspace,
-    /// };
-    /// use std::path::Path;
-    ///
-    /// # fn main() -> Result<(), ProcessPermitError> {
-    /// let ledger = ProcessPermitLedger::default();
-    /// let registry = HostPermitSessionRegistry::default();
-    /// let request = request_for_workspace(
-    ///     "session-1",
-    ///     "host-process-worker@1",
-    ///     "echo hi",
-    ///     Path::new("/workspace"),
-    ///     ProcessEnvironment::LocalHost,
-    /// );
-    /// let id = ledger.issue_after_local_approval(
-    ///     request.clone(),
-    ///     HostApprovalScope::SessionLease,
-    ///     None,
-    /// )?;
-    /// registry.remember_permit(request.clone(), id);
-    /// assert_eq!(registry.lookup_permit(&request), Some(id));
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn remember_permit(&self, request: ProcessPermitRequest, id: ProcessPermitId) {
-        self.remember_permit_at(request, id, LeaseInstant::now());
-    }
-
-    /// Merkt sich eine Permit-Kennung für ihren exakten Antrag zu `now`.
-    ///
-    /// # Beschreibung
-    /// Wie [`Self::remember_permit`]. Deckt zu `now` eine aktive
-    /// Host-Arbeitsphase die Sitzung von `request` ab, wird der Eintrag an
-    /// Phasen gebunden: [`Self::lookup_permit_at`] liefert ihn nur, solange
-    /// eine Phase die Sitzung abdeckt (B22).
-    ///
-    /// # Argumente
-    /// - `request` (`ProcessPermitRequest`): der Antrag; Eigentum geht über.
-    /// - `id` (`ProcessPermitId`): die beim Ledger ausgestellte Kennung.
-    /// - `now` (`LeaseInstant`): der Zeitpunkt des Merkens.
-    ///
-    /// # Concurrency
-    /// Sperrt kurz denselben [`Mutex`]. Bei vergiftetem `Mutex` geht die
-    /// Kennung verloren (keine Panik).
-    ///
-    /// # Examples
-    /// ```rust
-    /// use harw_sandbox::{
-    ///     HostApprovalScope, HostPermitSessionRegistry, ProcessEnvironment, ProcessPermitError,
-    ///     ProcessPermitLedger, request_for_workspace,
+    ///     HostPermitSessionRegistry, ProcessEnvironment, ProcessPermitError, ProcessPermitLedger,
+    ///     request_for_workspace,
     /// };
     /// use std::path::Path;
     ///
@@ -761,34 +972,208 @@ impl HostPermitSessionRegistry {
     ///     ProcessEnvironment::LocalHost,
     /// );
     /// registry.mark_session_approved("session-1");
-    /// // Ohne aktive Phase gibt es kein Fenster und damit keinen Permit.
-    /// let window = registry
-    ///     .covering_lease("session-1")
+    /// // Ohne aktive Phase gibt es keine Bindung und damit keinen Permit.
+    /// let binding = registry
+    ///     .covering_binding("session-1")
     ///     .ok_or(ProcessPermitError::Expired)?;
-    /// let t0 = window.granted_at();
-    /// let id = ledger.issue_for_lease_at(request.clone(), window, t0)?;
-    /// registry.remember_permit_at(request.clone(), id, t0);
-    /// assert_eq!(registry.lookup_permit_at(&request, t0), Some(id));
-    /// // Nach dem Ende der Phase liefert die Registry den Permit nicht mehr.
-    /// assert_eq!(registry.lookup_permit_at(&request, window.expires_at()), None);
+    /// let id = ledger.issue_for_lease(request.clone(), binding.window())?;
+    /// assert!(registry.remember_lease_permit(request.clone(), id, binding));
+    /// assert_eq!(registry.lookup_permit(&request), Some(id));
     /// # Ok(())
     /// # }
     /// ```
-    pub fn remember_permit_at(
+    #[must_use]
+    pub fn remember_lease_permit(
         &self,
         request: ProcessPermitRequest,
         id: ProcessPermitId,
+        binding: LeaseBinding,
+    ) -> bool {
+        self.remember_lease_permit_at(request, id, binding, LeaseInstant::now())
+    }
+
+    /// Merkt sich einen unter der Phase `binding` ausgestellten Permit für
+    /// seinen exakten Antrag, zu `now`.
+    ///
+    /// # Beschreibung
+    /// `binding` ist dieselbe Bindung aus [`Self::covering_binding_at`], mit
+    /// deren Fenster der Permit über
+    /// [`crate::ProcessPermitLedger::issue_for_lease_at`] ausgestellt wurde.
+    /// Der Eintrag trägt genau diese Phase; [`Self::lookup_permit_at`]
+    /// liefert ihn nur, solange sie läuft und eingetragen ist. Nichts davon
+    /// wird aus dem Zustand zu `now` abgeleitet.
+    ///
+    /// Gemerkt wird nur, wenn die Bindung zu `now` noch gilt: ihr Fenster
+    /// läuft, und genau diese Phase ist für die Sitzung von `request` noch
+    /// eingetragen (bei [`LeaseScope::Session`] die Phase dieser Sitzung,
+    /// bei [`LeaseScope::Global`] die prozessweite). Endete die Phase
+    /// zwischen dem Abruf der Bindung und diesem Aufruf, wurde sie widerrufen
+    /// oder neu erteilt, oder gehört die Bindung zu einer anderen Sitzung,
+    /// wird nichts gemerkt und `false` geliefert. Der Aufrufer verwendet den
+    /// Permit dann nicht und widerruft ihn beim Ledger.
+    ///
+    /// Ein bereits gemerkter Eintrag für einen identischen `request` wird bei
+    /// Erfolg vollständig ersetzt (kein Anhäufen mehrerer Kennungen für
+    /// denselben Antrag). Ob `id` zu `request` passt, prüft
+    /// [`crate::ProcessPermitLedger::authorize`] bei jeder Verwendung.
+    ///
+    /// # Argumente
+    /// - `request` (`ProcessPermitRequest`): der Antrag; Eigentum geht über.
+    /// - `id` (`ProcessPermitId`): die beim Ledger unter `binding`
+    ///   ausgestellte Kennung.
+    /// - `binding` (`LeaseBinding`): die Phase, die den Permit autorisiert.
+    /// - `now` (`LeaseInstant`): der Zeitpunkt des Merkens.
+    ///
+    /// # Returns
+    /// `true`, wenn der Eintrag gemerkt wurde; `false`, wenn die Bindung zu
+    /// `now` nicht (mehr) gilt oder der [`Mutex`] vergiftet ist (fail-closed:
+    /// nichts gemerkt, auch kein ungebundener Eintrag).
+    ///
+    /// # Concurrency
+    /// Prüfen und Merken laufen unter derselben Sperre; ein gleichzeitiger
+    /// Widerruf liegt entweder ganz davor (`false`) oder ganz danach (dann
+    /// liefert [`Self::lookup_permit_at`] den Eintrag nicht mehr).
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_sandbox::{
+    ///     HostPermitSessionRegistry, ProcessEnvironment, ProcessPermitError, ProcessPermitLedger,
+    ///     request_for_workspace,
+    /// };
+    /// use std::path::Path;
+    ///
+    /// # fn main() -> Result<(), ProcessPermitError> {
+    /// let ledger = ProcessPermitLedger::default();
+    /// let registry = HostPermitSessionRegistry::default();
+    /// let request = request_for_workspace(
+    ///     "session-1",
+    ///     "host-process-worker@1",
+    ///     "echo hi",
+    ///     Path::new("/workspace"),
+    ///     ProcessEnvironment::LocalHost,
+    /// );
+    /// registry.mark_session_approved("session-1");
+    /// let window = registry
+    ///     .session_lease("session-1")
+    ///     .ok_or(ProcessPermitError::Expired)?;
+    /// let t0 = window.granted_at();
+    /// let binding = registry
+    ///     .covering_binding_at("session-1", t0)
+    ///     .ok_or(ProcessPermitError::Expired)?;
+    /// let id = ledger.issue_for_lease_at(request.clone(), binding.window(), t0)?;
+    /// assert!(registry.remember_lease_permit_at(request.clone(), id, binding, t0));
+    /// assert_eq!(registry.lookup_permit_at(&request, t0), Some(id));
+    /// // Mit dem Ende der Phase endet auch der gemerkte Permit.
+    /// assert_eq!(registry.lookup_permit_at(&request, window.expires_at()), None);
+    /// // Nach dem Ende wird unter der alten Bindung nichts mehr gemerkt.
+    /// assert!(!registry.remember_lease_permit_at(request, id, binding, window.expires_at()));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn remember_lease_permit_at(
+        &self,
+        request: ProcessPermitRequest,
+        id: ProcessPermitId,
+        binding: LeaseBinding,
         now: LeaseInstant,
-    ) {
-        if let Ok(mut state) = self.state.lock() {
-            let lease_bound = state.is_covered_at(&request.session, now);
-            state.remembered.retain(|entry| entry.request != request);
-            state.remembered.push(RememberedPermit {
-                request,
-                id,
-                lease_bound,
-            });
+    ) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if !state.is_current(&request.session, binding, now) {
+            return false;
         }
+        state.remembered.retain(|entry| entry.request != request);
+        state.remembered.push(RememberedPermit {
+            request,
+            id,
+            authority: PermitAuthority::Lease(binding),
+        });
+        true
+    }
+
+    /// Merkt sich eine bereits verbrauchte Einmalfreigabe
+    /// ([`HostApprovalScope::SingleExecution`]) für ihren exakten Antrag,
+    /// ohne Bindung an eine Phase.
+    ///
+    /// # Beschreibung
+    /// Der klar getrennte Weg für Permits, die keine Host-Arbeitsphase
+    /// trägt. `granted` stammt aus [`crate::ProcessPermitLedger::authorize`];
+    /// nur der Ledger kann ein [`GrantedProcessPermit`] erzeugen, und sein
+    /// [`GrantedProcessPermit::scope`] muss `SingleExecution` sein. Ein
+    /// Lease-Permit wird hier abgewiesen (`false`): er lässt sich nur mit
+    /// seiner Phase merken ([`Self::remember_lease_permit_at`]).
+    ///
+    /// Der Ledger hat den Permit beim Autorisieren bereits verbraucht. Der
+    /// Eintrag dient deshalb nur dem Aufräumen: [`Self::forget_session`]
+    /// liefert seine Kennung zum Widerruf. Ein späterer identischer Antrag
+    /// findet die Kennung zwar, der Ledger lehnt sie aber ab
+    /// ([`crate::ProcessPermitError::AlreadyConsumed`] bzw. `Expired`), und
+    /// der Aufrufer fragt erneut. Ein Eintrag für einen identischen Antrag
+    /// wird ersetzt.
+    ///
+    /// # Argumente
+    /// - `granted` (`&GrantedProcessPermit`): das Ergebnis der
+    ///   Autorisierung des Einmal-Permits.
+    ///
+    /// # Returns
+    /// `true`, wenn der Eintrag gemerkt wurde; `false` für einen
+    /// Lease-Permit oder bei vergiftetem [`Mutex`] (fail-closed).
+    ///
+    /// # Concurrency
+    /// Sperrt kurz denselben [`Mutex`] wie jede andere Methode dieses Typs.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_sandbox::{
+    ///     HostApprovalScope, HostPermitSessionRegistry, ProcessEnvironment, ProcessPermitError,
+    ///     ProcessPermitLedger, request_for_workspace,
+    /// };
+    /// use std::path::Path;
+    ///
+    /// # fn main() -> Result<(), ProcessPermitError> {
+    /// let ledger = ProcessPermitLedger::default();
+    /// let registry = HostPermitSessionRegistry::default();
+    /// let request = request_for_workspace(
+    ///     "session-1",
+    ///     "host-process-worker@1",
+    ///     "echo once",
+    ///     Path::new("/workspace"),
+    ///     ProcessEnvironment::LocalHost,
+    /// );
+    /// let id = ledger.issue_after_local_approval(
+    ///     request.clone(),
+    ///     HostApprovalScope::SingleExecution,
+    ///     None,
+    /// )?;
+    /// let granted = ledger.authorize(id, &request)?;
+    /// assert!(registry.remember_single_execution_permit(&granted));
+    /// assert_eq!(registry.lookup_permit(&request), Some(id));
+    /// // Der Ledger hat die Einmalfreigabe bereits verbraucht.
+    /// assert_eq!(
+    ///     ledger.authorize(id, &request),
+    ///     Err(ProcessPermitError::AlreadyConsumed)
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn remember_single_execution_permit(&self, granted: &GrantedProcessPermit) -> bool {
+        if granted.scope() != HostApprovalScope::SingleExecution {
+            return false;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let request = granted.request();
+        state.remembered.retain(|entry| &entry.request != request);
+        state.remembered.push(RememberedPermit {
+            request: request.clone(),
+            id: granted.id(),
+            authority: PermitAuthority::SingleExecution,
+        });
+        true
     }
 
     /// Entfernt jede Zustimmung und jeden gemerkten Permit dieser Sitzung,
@@ -797,7 +1182,9 @@ impl HostPermitSessionRegistry {
     /// # Beschreibung
     /// Entfernt sowohl den Eintrag aus [`Self::mark_session_approved`] (die
     /// Sitzung muss danach erneut zustimmen) als auch jeden über
-    /// [`Self::remember_permit`] gemerkten Antrag dieser Sitzung. Diese
+    /// [`Self::remember_lease_permit`] bzw.
+    /// [`Self::remember_single_execution_permit`] gemerkten Antrag dieser
+    /// Sitzung, gleich unter welcher Phase er gemerkt wurde. Diese
     /// Registry widerruft dabei **nicht** selbst die zugehörigen Permits im
     /// [`crate::ProcessPermitLedger`] — sie kennt den Ledger nicht (siehe
     /// Moduldoku, Abschnitt „Verantwortungsgrenze“). Der Aufrufer muss die
@@ -990,19 +1377,16 @@ impl HostPermitSessionRegistry {
     /// Einmal-Freigabe (siehe [`Self::mark_single_use`]) von `session`.
     ///
     /// # Beschreibung
-    /// Idempotent: ein zweiter Aufruf für dieselbe oder eine unbekannte
-    /// `session` ändert nichts und liefert keinen Fehler. Im Unterschied zu
-    /// [`Self::forget_session`] rührt diese Methode keine gemerkten
-    /// [`ProcessPermitId`]s an — ausschließlich zum expliziten Widerruf einer
-    /// Host-Freigabe über `/sandbox-lease revoke`, nicht zum Aufräumen bei
-    /// Sitzungsende.
+    /// Wie [`Self::revoke_session_approval_taking_ids`], verwirft aber die
+    /// Kennungen der dabei entfernten Lease-Permits. Für Aufrufer, die
+    /// danach ohnehin alle Ledger-Permits der Sitzung widerrufen
+    /// ([`crate::ProcessPermitLedger::revoke_session`]).
     ///
     /// # Argumente
     /// - `session` (`&str`): die Sitzungs-ID, deren Freigaben entfernt werden.
     ///
     /// # Panics
-    /// Nie: ein vergifteter [`Mutex`] wird über `if let Ok(..)` übersprungen,
-    /// statt selbst zu paniken.
+    /// Nie, siehe [`Self::revoke_session_approval_taking_ids`].
     ///
     /// # Concurrency
     /// `Send + Sync`; sperrt kurz denselben [`Mutex`] wie jede andere Methode
@@ -1022,12 +1406,97 @@ impl HostPermitSessionRegistry {
     /// registry.revoke_session_approval("session-1");
     /// ```
     pub fn revoke_session_approval(&self, session: &str) {
-        if let Ok(mut state) = self.state.lock() {
-            state
-                .approved_sessions
-                .retain(|entry| entry.session != session);
-            state.single_use.retain(|existing| existing != session);
-        }
+        // Die Kennungen braucht dieser Aufrufer nicht (siehe Doku oben); die
+        // Einträge sind trotzdem entfernt.
+        let _removed = self.revoke_session_approval_taking_ids(session);
+    }
+
+    /// Entfernt die Sitzungsfreigabe, eine gemerkte Einmal-Freigabe und
+    /// jeden unter der sitzungseigenen Phase gemerkten Lease-Permit von
+    /// `session` und liefert dessen Kennungen.
+    ///
+    /// # Beschreibung
+    /// Für den expliziten Widerruf einer Host-Freigabe (`/sandbox-lease
+    /// revoke`), nicht zum Aufräumen bei Sitzungsende (dafür
+    /// [`Self::forget_session`]). Entfernt werden genau die Lease-Permits von
+    /// `session`, die an eine sitzungseigene Phase ([`LeaseScope::Session`])
+    /// gebunden sind: keiner davon kann nach dem Widerruf je wieder gelten,
+    /// denn eine spätere neue Zustimmung ist eine andere Phase. An die
+    /// prozessweite Phase gebundene Permits derselben Sitzung und
+    /// Einmal-Permits bleiben gemerkt.
+    ///
+    /// Diese Registry kennt den Ledger nicht (Moduldoku,
+    /// „Verantwortungsgrenze“). Der Aufrufer übergibt jede zurückgegebene
+    /// Kennung an [`crate::ProcessPermitLedger::revoke`]; erst dann ist ein
+    /// bereits nachgeschlagener Permit auch beim Ledger unbrauchbar und kann
+    /// einen Widerruf nicht mehr überholen.
+    ///
+    /// Idempotent: ein zweiter Aufruf für dieselbe oder eine unbekannte
+    /// `session` ändert nichts und liefert eine leere Liste.
+    ///
+    /// # Argumente
+    /// - `session` (`&str`): die Sitzungs-ID, deren Freigaben entfernt werden.
+    ///
+    /// # Returns
+    /// Die Kennungen der entfernten Lease-Permits; leer, wenn keiner gemerkt
+    /// war, und bei vergiftetem [`Mutex`] (dann bleibt auch der Zustand
+    /// unverändert).
+    ///
+    /// # Panics
+    /// Nie: ein vergifteter [`Mutex`] wird übersprungen, statt selbst zu
+    /// paniken.
+    ///
+    /// # Concurrency
+    /// Freigabe und gemerkte Permits werden unter derselben Sperre entfernt;
+    /// ein gleichzeitiges [`Self::remember_lease_permit_at`] liegt entweder
+    /// ganz davor (sein Eintrag wird hier entfernt und geliefert) oder ganz
+    /// danach (es merkt nichts mehr).
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_sandbox::{
+    ///     HostPermitSessionRegistry, ProcessEnvironment, ProcessPermitError, ProcessPermitLedger,
+    ///     request_for_workspace,
+    /// };
+    /// use std::path::Path;
+    ///
+    /// # fn main() -> Result<(), ProcessPermitError> {
+    /// let ledger = ProcessPermitLedger::default();
+    /// let registry = HostPermitSessionRegistry::default();
+    /// let request = request_for_workspace(
+    ///     "session-1",
+    ///     "host-process-worker@1",
+    ///     "echo hi",
+    ///     Path::new("/workspace"),
+    ///     ProcessEnvironment::LocalHost,
+    /// );
+    /// registry.mark_session_approved("session-1");
+    /// let binding = registry
+    ///     .covering_binding("session-1")
+    ///     .ok_or(ProcessPermitError::Expired)?;
+    /// let id = ledger.issue_for_lease(request.clone(), binding.window())?;
+    /// assert!(registry.remember_lease_permit(request.clone(), id, binding));
+    ///
+    /// for removed in registry.revoke_session_approval_taking_ids("session-1") {
+    ///     ledger.revoke(removed)?;
+    /// }
+    /// assert_eq!(registry.lookup_permit(&request), None);
+    /// assert_eq!(ledger.authorize(id, &request), Err(ProcessPermitError::UnknownPermit));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn revoke_session_approval_taking_ids(&self, session: &str) -> Vec<ProcessPermitId> {
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
+        };
+        state
+            .approved_sessions
+            .retain(|entry| entry.session != session);
+        state.single_use.retain(|existing| existing != session);
+        state.drop_lease_permits(|request, binding| {
+            binding.scope == LeaseScope::Session && request.session == session
+        })
     }
 
     /// Merkt sich eine prozessweite Host-Ausführungsfreigabe; „jetzt“ ist
@@ -1058,9 +1527,11 @@ impl HostPermitSessionRegistry {
     /// # Beschreibung
     /// Ist die prozessweite Freigabe zu `now` noch aktiv, ändert ein erneuter
     /// Aufruf nichts (keine stillschweigende Verlängerung, B22). Ist sie
-    /// abgelaufen oder widerrufen, beginnt ein neues Fenster ab `now`. Die
-    /// Freigabe endet mit dem Ablauf, über [`Self::revoke_global_approval`]
-    /// (Strg+H bzw. `/sandbox-lease revoke`) oder mit dem Prozess.
+    /// abgelaufen oder widerrufen, beginnt ein neues Fenster ab `now`; das
+    /// ist eine neue Phase, unter der alten gemerkte Permits gelten nicht
+    /// weiter. Die Freigabe endet mit dem Ablauf, über
+    /// [`Self::revoke_global_approval`] (Strg+H bzw. `/sandbox-lease revoke`)
+    /// oder mit dem Prozess.
     ///
     /// # Argumente
     /// - `now` (`LeaseInstant`): der Zeitpunkt der Zustimmung.
@@ -1069,7 +1540,8 @@ impl HostPermitSessionRegistry {
     /// Nie: ein vergifteter [`Mutex`] wird übersprungen, statt selbst zu
     /// paniken — die Freigabe geht in diesem seltenen Fall verloren, aber der
     /// Aufrufer stürzt nicht ab. Ein nicht darstellbares Fensterende wird
-    /// ebenso nicht eingetragen.
+    /// ebenso nicht eingetragen, ebenso eine Phase, für die der
+    /// Generationszähler erschöpft ist.
     ///
     /// # Concurrency
     /// `Send + Sync`; sperrt kurz denselben [`Mutex`] wie jede andere Methode
@@ -1098,11 +1570,15 @@ impl HostPermitSessionRegistry {
         // Aktive Phase: nie stillschweigend verlängern (B22).
         if state
             .global_approval
-            .is_some_and(|existing| existing.is_active_at(now))
+            .is_some_and(|existing| existing.window.is_active_at(now))
         {
             return;
         }
-        state.global_approval = Some(window);
+        let Some(generation) = state.allocate_generation() else {
+            tracing::warn!("host lease generation counter exhausted; approval not recorded");
+            return;
+        };
+        state.global_approval = Some(GrantedLease { window, generation });
     }
 
     /// `true`, solange die prozessweite Freigabe aktiv ist; „jetzt“ ist
@@ -1154,7 +1630,7 @@ impl HostPermitSessionRegistry {
         self.state.lock().is_ok_and(|state| {
             state
                 .global_approval
-                .is_some_and(|window| window.is_active_at(now))
+                .is_some_and(|lease| lease.window.is_active_at(now))
         })
     }
 
@@ -1184,7 +1660,11 @@ impl HostPermitSessionRegistry {
     /// ```
     #[must_use]
     pub fn global_lease(&self) -> Option<LeaseWindow> {
-        self.state.lock().ok()?.global_approval
+        self.state
+            .lock()
+            .ok()?
+            .global_approval
+            .map(|lease| lease.window)
     }
 
     /// Merkt sich eine prozessweite Einmal-Freigabe: der nächste
@@ -1254,16 +1734,16 @@ impl HostPermitSessionRegistry {
     /// Einmal-Freigabe (siehe [`Self::mark_global_single_use`]).
     ///
     /// # Beschreibung
-    /// Idempotent: ein zweiter Aufruf ändert nichts und liefert keinen
-    /// Fehler — dasselbe Verhalten wie [`Self::revoke_session_approval`], nur
-    /// für den globalen statt den sitzungseigenen Zustand. Rührt weder
-    /// `approved_sessions` noch `single_use` noch `remembered` an: eine
-    /// zusätzlich aktive sitzungseigene Freigabe bleibt nach diesem Aufruf
-    /// bestehen, nur die prozessweite Wirkung endet.
+    /// Wie [`Self::revoke_global_approval_taking_ids`], verwirft aber die
+    /// Kennungen der dabei entfernten Lease-Permits. Ihre Ledger-Permits
+    /// bleiben dann bis zum Ende ihres Fensters beim Ledger gültig, auch
+    /// wenn die Registry sie nicht mehr liefert; wer Strg+H bzw.
+    /// `/sandbox-lease revoke` umsetzt, nimmt deshalb
+    /// [`Self::revoke_global_approval_taking_ids`] und widerruft die
+    /// Kennungen.
     ///
     /// # Panics
-    /// Nie: ein vergifteter [`Mutex`] wird über `if let Ok(..)` übersprungen,
-    /// statt selbst zu paniken.
+    /// Nie, siehe [`Self::revoke_global_approval_taking_ids`].
     ///
     /// # Concurrency
     /// `Send + Sync`; sperrt kurz denselben [`Mutex`] wie jede andere Methode
@@ -1281,19 +1761,102 @@ impl HostPermitSessionRegistry {
     /// assert!(!registry.has_global_single_use());
     /// ```
     pub fn revoke_global_approval(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.global_approval = None;
-            state.global_single_use = false;
-        }
+        // Die Kennungen braucht dieser Aufrufer nicht (siehe Doku oben); die
+        // Einträge sind trotzdem entfernt.
+        let _removed = self.revoke_global_approval_taking_ids();
+    }
+
+    /// Entfernt die prozessweite Freigabe, eine prozessweite
+    /// Einmal-Freigabe und jeden an eine prozessweite Phase gebundenen
+    /// gemerkten Lease-Permit (gleich welcher Sitzung) und liefert dessen
+    /// Kennungen.
+    ///
+    /// # Beschreibung
+    /// Der Weg für Strg+H (`ChatApp::end_host_mode`) und `/sandbox-lease
+    /// revoke`: die prozessweite Phase deckt die Root-Sitzung **und** jede
+    /// Kind-Session ab, und Kind-Sitzungen haben unter ihr eigene Permits
+    /// ausgestellt. Entfernt werden alle Lease-Permits mit
+    /// [`LeaseScope::Global`]: keiner davon kann nach dem Widerruf je wieder
+    /// gelten, auch nicht über eine sitzungseigene Phase oder eine später neu
+    /// erteilte prozessweite Phase. Sitzungseigene Phasen, ihre Permits,
+    /// `single_use` und Einmal-Permits bleiben unberührt; eine zusätzlich
+    /// aktive sitzungseigene Freigabe besteht weiter.
+    ///
+    /// Diese Registry kennt den Ledger nicht (Moduldoku,
+    /// „Verantwortungsgrenze“). Der Aufrufer übergibt jede zurückgegebene
+    /// Kennung an [`crate::ProcessPermitLedger::revoke`]. Erst dann scheitert
+    /// auch ein Aufruf, der den Permit kurz vor dem Widerruf nachgeschlagen
+    /// hat, an [`crate::ProcessPermitLedger::authorize`].
+    ///
+    /// Idempotent: ein zweiter Aufruf ändert nichts und liefert eine leere
+    /// Liste.
+    ///
+    /// # Returns
+    /// Die Kennungen der entfernten Lease-Permits; leer, wenn keiner gemerkt
+    /// war, und bei vergiftetem [`Mutex`] (dann bleibt auch der Zustand
+    /// unverändert).
+    ///
+    /// # Panics
+    /// Nie: ein vergifteter [`Mutex`] wird übersprungen, statt selbst zu
+    /// paniken.
+    ///
+    /// # Concurrency
+    /// Freigabe und gemerkte Permits werden unter derselben Sperre entfernt;
+    /// ein gleichzeitiges [`Self::remember_lease_permit_at`] liegt entweder
+    /// ganz davor (sein Eintrag wird hier entfernt und geliefert) oder ganz
+    /// danach (es merkt nichts mehr).
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_sandbox::{
+    ///     HostPermitSessionRegistry, ProcessEnvironment, ProcessPermitError, ProcessPermitLedger,
+    ///     request_for_workspace,
+    /// };
+    /// use std::path::Path;
+    ///
+    /// # fn main() -> Result<(), ProcessPermitError> {
+    /// let ledger = ProcessPermitLedger::default();
+    /// let registry = HostPermitSessionRegistry::default();
+    /// let child = request_for_workspace(
+    ///     "child-1",
+    ///     "host-process-worker@1",
+    ///     "echo hi",
+    ///     Path::new("/workspace"),
+    ///     ProcessEnvironment::LocalHost,
+    /// );
+    /// registry.mark_global_approval();
+    /// let binding = registry
+    ///     .covering_binding("child-1")
+    ///     .ok_or(ProcessPermitError::Expired)?;
+    /// let id = ledger.issue_for_lease(child.clone(), binding.window())?;
+    /// assert!(registry.remember_lease_permit(child.clone(), id, binding));
+    ///
+    /// // Strg+H: Phase beenden und die Permits der Kinder beim Ledger widerrufen.
+    /// let removed = registry.revoke_global_approval_taking_ids();
+    /// assert_eq!(removed, vec![id]);
+    /// for removed_id in removed {
+    ///     ledger.revoke(removed_id)?;
+    /// }
+    /// assert_eq!(ledger.authorize(id, &child), Err(ProcessPermitError::UnknownPermit));
+    /// assert!(registry.revoke_global_approval_taking_ids().is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn revoke_global_approval_taking_ids(&self) -> Vec<ProcessPermitId> {
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
+        };
+        state.global_approval = None;
+        state.global_single_use = false;
+        state.drop_lease_permits(|_request, binding| binding.scope == LeaseScope::Global)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process_permit::{
-        HostApprovalScope, ProcessEnvironment, ProcessPermitLedger, request_for_workspace,
-    };
+    use crate::process_permit::{ProcessEnvironment, ProcessPermitLedger, request_for_workspace};
     use crate::test_support::{TestError, TestResult, ctx};
     use std::path::Path;
 
@@ -1332,17 +1895,36 @@ mod tests {
 
     // Kein Feld von `ProcessPermitId` ist außerhalb von `process_permit.rs`
     // sichtbar; Tests holen sich echte Kennungen deshalb über den echten
-    // Ledger statt sie zu konstruieren.
-    fn issue(
+    // Ledger statt sie zu konstruieren. Wie der Shell-Executor: die Phase,
+    // die die Sitzung von `request` zu `now` abdeckt, genau einmal lesen und
+    // den Permit an ihr Fenster binden.
+    fn issue_under_lease(
+        ledger: &ProcessPermitLedger,
+        registry: &HostPermitSessionRegistry,
+        request: &ProcessPermitRequest,
+        now: LeaseInstant,
+    ) -> TestResult<(LeaseBinding, ProcessPermitId)> {
+        let binding = registry
+            .covering_binding_at(&request.session, now)
+            .ok_or(TestError::Missing("covering lease binding"))?;
+        let id = ledger
+            .issue_for_lease_at(request.clone(), binding.window(), now)
+            .map_err(ctx("issuing under an active lease must succeed"))?;
+        Ok((binding, id))
+    }
+
+    // Ein Einmal-Permit, den der Ledger soeben autorisiert (und damit
+    // verbraucht) hat.
+    fn granted_single_execution(
         ledger: &ProcessPermitLedger,
         request: &ProcessPermitRequest,
-    ) -> TestResult<ProcessPermitId> {
-        ledger
-            .issue_after_local_approval(request.clone(), HostApprovalScope::SessionLease, None)
-            .map_err(|e| TestError::Context {
-                context: "issuing a valid host request must succeed",
-                source: e.to_string(),
-            })
+    ) -> TestResult<GrantedProcessPermit> {
+        let id = ledger
+            .issue_after_local_approval(request.clone(), HostApprovalScope::SingleExecution, None)
+            .map_err(ctx("issuing a single-execution permit must succeed"))?;
+        ledger.authorize(id, request).map_err(ctx(
+            "authorizing a fresh single-execution permit must succeed",
+        ))
     }
 
     #[test]
@@ -1486,13 +2068,15 @@ mod tests {
         let ledger = ProcessPermitLedger::default();
         let registry = HostPermitSessionRegistry::default();
         let req = request("s1", "echo hi");
-        assert_eq!(registry.lookup_permit(&req), None);
-        let id = issue(&ledger, &req)?;
-        registry.remember_permit(req.clone(), id);
-        assert_eq!(registry.lookup_permit(&req), Some(id));
+        let t0 = LeaseInstant::now();
+        assert_eq!(registry.lookup_permit_at(&req, t0), None);
+        registry.mark_session_approved_at("s1", t0);
+        let (binding, id) = issue_under_lease(&ledger, &registry, &req, t0)?;
+        assert!(registry.remember_lease_permit_at(req.clone(), id, binding, t0));
+        assert_eq!(registry.lookup_permit_at(&req, t0), Some(id));
 
         let other = request("s1", "echo bye");
-        assert_eq!(registry.lookup_permit(&other), None);
+        assert_eq!(registry.lookup_permit_at(&other, t0), None);
         Ok(())
     }
 
@@ -1500,15 +2084,16 @@ mod tests {
     fn test_forget_session_clears_approval_and_returns_removed_ids() -> TestResult {
         let ledger = ProcessPermitLedger::default();
         let registry = HostPermitSessionRegistry::default();
-        registry.mark_session_approved("s1");
+        let t0 = LeaseInstant::now();
+        registry.mark_session_approved_at("s1", t0);
         let req = request("s1", "echo hi");
-        let id = issue(&ledger, &req)?;
-        registry.remember_permit(req.clone(), id);
+        let (binding, id) = issue_under_lease(&ledger, &registry, &req, t0)?;
+        assert!(registry.remember_lease_permit_at(req.clone(), id, binding, t0));
 
         let removed = registry.forget_session("s1");
         assert_eq!(removed, vec![id]);
-        assert!(!registry.is_session_approved("s1"));
-        assert_eq!(registry.lookup_permit(&req), None);
+        assert!(!registry.is_session_approved_at("s1", t0));
+        assert_eq!(registry.lookup_permit_at(&req, t0), None);
         Ok(())
     }
 
@@ -1678,16 +2263,11 @@ mod tests {
         let t0 = LeaseInstant::now();
         registry.mark_session_approved_at("s1", t0);
 
-        // Wie der Shell-Executor: Permit an das Fenster der laufenden Phase
-        // binden und merken.
+        // Wie der Shell-Executor: die Phase einmal lesen, den Permit an ihr
+        // Fenster binden und mit derselben Bindung merken.
         let t7 = later(t0, hours(7))?;
-        let window = registry
-            .covering_lease_at("s1", t7)
-            .ok_or(TestError::Missing("covering lease at t7"))?;
-        let id = ledger
-            .issue_for_lease_at(req.clone(), window, t7)
-            .map_err(ctx("issue under an active lease failed"))?;
-        registry.remember_permit_at(req.clone(), id, t7);
+        let (binding, id) = issue_under_lease(&ledger, &registry, &req, t7)?;
+        assert!(registry.remember_lease_permit_at(req.clone(), id, binding, t7));
         assert_eq!(registry.lookup_permit_at(&req, t7), Some(id));
 
         let boundary = later(t0, hours(8))?;
@@ -1713,19 +2293,414 @@ mod tests {
     }
 
     #[test]
-    fn test_remembered_permit_without_lease_is_not_lease_bound() -> TestResult {
-        // Ohne Phase gemerkt (Einmalfreigabe): die Registry liefert den
-        // Eintrag weiter, die Gültigkeit prüft allein der Ledger.
+    fn test_single_execution_permit_is_not_bound_to_a_window() -> TestResult {
+        // Einmalfreigabe: keine Phase trägt sie. Die Registry liefert den
+        // Eintrag weiter, die Gültigkeit prüft allein der Ledger (der den
+        // Permit beim Autorisieren bereits verbraucht hat).
         let ledger = ProcessPermitLedger::default();
         let registry = HostPermitSessionRegistry::default();
         let req = request("s1", "echo once");
         let t0 = LeaseInstant::now();
-        let id = issue(&ledger, &req)?;
-        registry.remember_permit_at(req.clone(), id, t0);
+        let granted = granted_single_execution(&ledger, &req)?;
+        assert!(registry.remember_single_execution_permit(&granted));
         assert_eq!(
             registry.lookup_permit_at(&req, later(t0, hours(100))?),
-            Some(id)
+            Some(granted.id())
         );
+        assert_eq!(
+            ledger.authorize(granted.id(), &req),
+            Err(ProcessPermitError::AlreadyConsumed)
+        );
+        assert_eq!(registry.forget_session("s1"), vec![granted.id()]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_remember_single_execution_permit_refuses_a_lease_permit() -> TestResult {
+        // Ein Lease-Permit lässt sich nur mit seiner Phase merken, nie über
+        // den phasenlosen Weg.
+        let ledger = ProcessPermitLedger::default();
+        let registry = HostPermitSessionRegistry::default();
+        let req = request("s1", "echo lease");
+        let t0 = LeaseInstant::now();
+        registry.mark_session_approved_at("s1", t0);
+        let (_binding, id) = issue_under_lease(&ledger, &registry, &req, t0)?;
+        let granted = ledger
+            .authorize_at(id, &req, t0)
+            .map_err(ctx("authorizing the lease permit must succeed"))?;
+        assert_eq!(granted.scope(), HostApprovalScope::SessionLease);
+        assert!(!registry.remember_single_execution_permit(&granted));
+        assert_eq!(registry.lookup_permit_at(&req, t0), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_lease_permit_boundary_at_window_end() -> TestResult {
+        // Owner-Review 4505015300: gemerkt bei `t0`, nachgeschlagen bei
+        // `expires_at - 1 ns` → `Some`, bei `expires_at` → `None`. Eine
+        // prozessweite Phase, die erst später endet, trägt den an die
+        // sitzungseigene Phase gebundenen Permit nicht über deren Ende hinaus.
+        let ledger = ProcessPermitLedger::default();
+        let registry = registry_with_ttl(hours(1))?;
+        let req = request("s1", "echo edge");
+        let t0 = LeaseInstant::now();
+        registry.mark_session_approved_at("s1", t0);
+        let (binding, id) = issue_under_lease(&ledger, &registry, &req, t0)?;
+        assert_eq!(binding.scope(), LeaseScope::Session);
+        assert!(registry.remember_lease_permit_at(req.clone(), id, binding, t0));
+
+        let end = binding.window().expires_at();
+        assert_eq!(end, later(t0, hours(1))?);
+        registry.mark_global_approval_at(later(t0, Duration::from_secs(30 * 60))?);
+        assert!(
+            registry.is_session_approved_at("s1", end),
+            "the global phase still covers s1"
+        );
+
+        assert_eq!(registry.lookup_permit_at(&req, just_before(end)?), Some(id));
+        assert_eq!(
+            registry.lookup_permit_at(&req, end),
+            None,
+            "now == expires_at must end the remembered permit"
+        );
+        assert_eq!(
+            registry.lookup_permit_at(&req, later(end, hours(100))?),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_remember_after_window_end_stores_nothing() -> TestResult {
+        // Owner-Review 4505015300 (Interleaving): die Phase endet zwischen
+        // Abruf/Ausstellung und Merken. Früher entstand daraus ein
+        // ungebundener Eintrag (`lease_bound = false`), der die Phase
+        // überlebte. Jetzt wird nichts gemerkt.
+        let ledger = ProcessPermitLedger::default();
+        let registry = registry_with_ttl(hours(1))?;
+        let req = request("s1", "echo late");
+        let t0 = LeaseInstant::now();
+        registry.mark_session_approved_at("s1", t0);
+        let end = later(t0, hours(1))?;
+
+        // Abruf und Ausstellung im letzten Augenblick der Phase ...
+        let (binding, id) = issue_under_lease(&ledger, &registry, &req, just_before(end)?)?;
+        // ... das Merken erst, als die Phase schon vorbei ist.
+        assert!(!registry.remember_lease_permit_at(req.clone(), id, binding, end));
+        assert_eq!(registry.lookup_permit_at(&req, just_before(end)?), None);
+        assert_eq!(registry.lookup_permit_at(&req, end), None);
+        assert_eq!(
+            registry.lookup_permit_at(&req, later(t0, hours(100))?),
+            None
+        );
+
+        // Auch eine neue Zustimmung danach trägt den alten Permit nicht.
+        registry.mark_session_approved_at("s1", end);
+        assert!(registry.is_session_approved_at("s1", end));
+        assert_eq!(registry.lookup_permit_at(&req, end), None);
+        // Der Ledger-Permit endet ebenfalls mit dem alten Fenster.
+        assert_eq!(
+            ledger.authorize_at(id, &req, end),
+            Err(ProcessPermitError::Expired)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_revoke_then_regrant_does_not_resurrect_old_session_permit() -> TestResult {
+        // Strg+H bzw. `/sandbox-lease revoke`, danach sofort erneut
+        // zugestimmt — bewusst zum selben Zeitpunkt, damit das neue Fenster
+        // dem alten gleicht. Die neue Phase ist trotzdem eine andere.
+        let ledger = ProcessPermitLedger::default();
+        let registry = HostPermitSessionRegistry::default();
+        let req = request("s1", "echo again");
+        let t0 = LeaseInstant::now();
+        registry.mark_session_approved_at("s1", t0);
+        let (old_binding, old_id) = issue_under_lease(&ledger, &registry, &req, t0)?;
+        assert!(registry.remember_lease_permit_at(req.clone(), old_id, old_binding, t0));
+
+        registry.revoke_session_approval("s1");
+        assert_eq!(registry.lookup_permit_at(&req, t0), None);
+
+        registry.mark_session_approved_at("s1", t0);
+        let new_binding = registry
+            .covering_binding_at("s1", t0)
+            .ok_or(TestError::Missing("binding of the re-granted phase"))?;
+        assert_eq!(new_binding.window(), old_binding.window());
+        assert_ne!(
+            new_binding, old_binding,
+            "a re-granted phase is a new phase"
+        );
+        assert_eq!(
+            registry.lookup_permit_at(&req, t0),
+            None,
+            "the re-granted phase must not resurrect the old permit"
+        );
+        assert!(
+            !registry.remember_lease_permit_at(req.clone(), old_id, old_binding, t0),
+            "the old binding must not be usable again"
+        );
+
+        // Erst ein unter der neuen Phase ausgestellter Permit gilt.
+        let new_id = ledger
+            .issue_for_lease_at(req.clone(), new_binding.window(), t0)
+            .map_err(ctx("issue under the re-granted phase failed"))?;
+        assert!(registry.remember_lease_permit_at(req.clone(), new_id, new_binding, t0));
+        assert_ne!(new_id, old_id);
+        assert_eq!(registry.lookup_permit_at(&req, t0), Some(new_id));
+        Ok(())
+    }
+
+    #[test]
+    fn test_revoke_then_regrant_does_not_resurrect_old_global_permit() -> TestResult {
+        let ledger = ProcessPermitLedger::default();
+        let registry = HostPermitSessionRegistry::default();
+        let req = request("child", "echo global");
+        let t0 = LeaseInstant::now();
+        registry.mark_global_approval_at(t0);
+        let (old_binding, old_id) = issue_under_lease(&ledger, &registry, &req, t0)?;
+        assert_eq!(old_binding.scope(), LeaseScope::Global);
+        assert!(registry.remember_lease_permit_at(req.clone(), old_id, old_binding, t0));
+
+        // Strg+H, dann dieselbe Zustimmung zum selben Zeitpunkt.
+        registry.revoke_global_approval();
+        registry.mark_global_approval_at(t0);
+        assert_eq!(registry.global_lease(), Some(old_binding.window()));
+        assert!(registry.is_session_approved_at("child", t0));
+        assert_eq!(
+            registry.lookup_permit_at(&req, t0),
+            None,
+            "a re-granted global phase must not resurrect the old permit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_session_bound_permit_is_not_carried_by_a_global_phase() -> TestResult {
+        let ledger = ProcessPermitLedger::default();
+        let registry = HostPermitSessionRegistry::default();
+        let req = request("s1", "echo own");
+        let t0 = LeaseInstant::now();
+        registry.mark_session_approved_at("s1", t0);
+        let (binding, id) = issue_under_lease(&ledger, &registry, &req, t0)?;
+        assert_eq!(binding.scope(), LeaseScope::Session);
+        assert!(registry.remember_lease_permit_at(req.clone(), id, binding, t0));
+
+        registry.mark_global_approval_at(t0);
+        assert_eq!(registry.lookup_permit_at(&req, t0), Some(id));
+
+        registry.revoke_session_approval("s1");
+        assert!(
+            registry.is_session_approved_at("s1", t0),
+            "the global phase still covers s1"
+        );
+        assert_eq!(
+            registry.lookup_permit_at(&req, t0),
+            None,
+            "a session-bound permit must not live on through the global phase"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_global_bound_permit_is_not_carried_by_a_session_phase() -> TestResult {
+        let ledger = ProcessPermitLedger::default();
+        let registry = HostPermitSessionRegistry::default();
+        let req = request("s1", "echo shared");
+        let t0 = LeaseInstant::now();
+        registry.mark_global_approval_at(t0);
+        let (binding, id) = issue_under_lease(&ledger, &registry, &req, t0)?;
+        assert_eq!(binding.scope(), LeaseScope::Global);
+        assert!(registry.remember_lease_permit_at(req.clone(), id, binding, t0));
+
+        registry.mark_session_approved_at("s1", t0);
+        registry.revoke_global_approval();
+        assert!(
+            registry.is_session_approved_at("s1", t0),
+            "the session-own phase still covers s1"
+        );
+        assert_eq!(
+            registry.lookup_permit_at(&req, t0),
+            None,
+            "a globally bound permit must not live on through a session phase"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_remember_lease_permit_rejects_a_foreign_or_revoked_binding() -> TestResult {
+        let ledger = ProcessPermitLedger::default();
+        let registry = HostPermitSessionRegistry::default();
+        let t0 = LeaseInstant::now();
+        registry.mark_session_approved_at("s1", t0);
+        registry.mark_session_approved_at("s2", t0);
+        let mine = request("s1", "echo mine");
+        let theirs = request("s2", "echo mine");
+        let (binding_s1, id) = issue_under_lease(&ledger, &registry, &mine, t0)?;
+
+        // Die Phase von s1 trägt keinen Antrag von s2, obwohl s2 eine eigene,
+        // gleich lange Phase hat.
+        assert!(!registry.remember_lease_permit_at(theirs.clone(), id, binding_s1, t0));
+        assert_eq!(registry.lookup_permit_at(&theirs, t0), None);
+
+        // Nach dem Widerruf der Phase wird unter ihr nichts mehr gemerkt.
+        registry.revoke_session_approval("s1");
+        assert!(!registry.remember_lease_permit_at(mine.clone(), id, binding_s1, t0));
+        assert_eq!(registry.lookup_permit_at(&mine, t0), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_covering_binding_reports_scope_and_matches_covering_lease() -> TestResult {
+        let registry = HostPermitSessionRegistry::default();
+        let t0 = LeaseInstant::now();
+        assert_eq!(registry.covering_binding_at("s1", t0), None);
+
+        registry.mark_session_approved_at("s1", t0);
+        let own = registry
+            .covering_binding_at("s1", t0)
+            .ok_or(TestError::Missing("session binding"))?;
+        assert_eq!(own.scope(), LeaseScope::Session);
+        assert_eq!(registry.covering_lease_at("s1", t0), Some(own.window()));
+        assert_eq!(registry.covering_binding_at("s2", t0), None);
+
+        // Die prozessweite Phase endet später und gewinnt deshalb.
+        let t2 = later(t0, hours(2))?;
+        registry.mark_global_approval_at(t2);
+        let global = registry
+            .covering_binding_at("s1", t2)
+            .ok_or(TestError::Missing("global binding"))?;
+        assert_eq!(global.scope(), LeaseScope::Global);
+        assert_eq!(registry.global_lease(), Some(global.window()));
+        assert_eq!(registry.covering_lease_at("s1", t2), Some(global.window()));
+        assert_eq!(
+            registry
+                .covering_binding_at("s2", t2)
+                .map(|binding| binding.scope()),
+            Some(LeaseScope::Global)
+        );
+
+        // Abgelaufen: keine Bindung.
+        assert_eq!(
+            registry.covering_binding_at("s2", later(t2, hours(8))?),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_remark_during_active_session_phase_keeps_binding_and_remembered_permit() -> TestResult {
+        // Ein erneutes Markieren der noch laufenden Phase (jede weitere
+        // Zustimmung im Dialog) ist dieselbe Phase: gleiche Bindung, und der
+        // unter ihr gemerkte Permit gilt weiter.
+        let ledger = ProcessPermitLedger::default();
+        let registry = HostPermitSessionRegistry::default();
+        let req = request("s1", "echo still");
+        let t0 = LeaseInstant::now();
+        registry.mark_session_approved_at("s1", t0);
+        let (binding, id) = issue_under_lease(&ledger, &registry, &req, t0)?;
+        assert!(registry.remember_lease_permit_at(req.clone(), id, binding, t0));
+
+        let t1 = later(t0, hours(3))?;
+        registry.mark_session_approved_at("s1", t1);
+        assert_eq!(registry.covering_binding_at("s1", t1), Some(binding));
+        assert_eq!(registry.lookup_permit_at(&req, t1), Some(id));
+        Ok(())
+    }
+
+    #[test]
+    fn test_remark_during_active_global_phase_keeps_binding_and_remembered_permit() -> TestResult {
+        let ledger = ProcessPermitLedger::default();
+        let registry = HostPermitSessionRegistry::default();
+        let req = request("child", "echo still");
+        let t0 = LeaseInstant::now();
+        registry.mark_global_approval_at(t0);
+        let (binding, id) = issue_under_lease(&ledger, &registry, &req, t0)?;
+        assert_eq!(binding.scope(), LeaseScope::Global);
+        assert!(registry.remember_lease_permit_at(req.clone(), id, binding, t0));
+
+        let t1 = later(t0, hours(3))?;
+        registry.mark_global_approval_at(t1);
+        assert_eq!(registry.covering_binding_at("child", t1), Some(binding));
+        assert_eq!(registry.lookup_permit_at(&req, t1), Some(id));
+        Ok(())
+    }
+
+    #[test]
+    fn test_revoke_global_approval_taking_ids_makes_child_ledger_permits_unusable() -> TestResult {
+        // Strg+H: die Kennungen der an die prozessweite Phase gebundenen
+        // Permits jeder Sitzung kommen zurück; nach dem Ledger-Widerruf
+        // scheitert auch ein Aufruf, der den Permit vorher nachgeschlagen hat.
+        let ledger = ProcessPermitLedger::default();
+        let registry = HostPermitSessionRegistry::default();
+        let t0 = LeaseInstant::now();
+        registry.mark_global_approval_at(t0);
+        let child = request("child", "echo child");
+        let (global_binding, child_id) = issue_under_lease(&ledger, &registry, &child, t0)?;
+        assert_eq!(global_binding.scope(), LeaseScope::Global);
+        assert!(registry.remember_lease_permit_at(child.clone(), child_id, global_binding, t0));
+        // Eine später eröffnete sitzungseigene Phase von s1 endet später und
+        // trägt deshalb den Permit von s1; er bleibt vom Widerruf unberührt.
+        let t1 = later(t0, hours(1))?;
+        registry.mark_session_approved_at("s1", t1);
+        let own = request("s1", "echo own");
+        let (own_binding, own_id) = issue_under_lease(&ledger, &registry, &own, t1)?;
+        assert_eq!(own_binding.scope(), LeaseScope::Session);
+        assert!(registry.remember_lease_permit_at(own.clone(), own_id, own_binding, t1));
+
+        assert_eq!(registry.lookup_permit_at(&child, t1), Some(child_id));
+        let removed = registry.revoke_global_approval_taking_ids();
+        assert_eq!(removed, vec![child_id]);
+        for id in removed {
+            ledger.revoke(id).map_err(ctx("ledger revoke failed"))?;
+        }
+
+        assert_eq!(registry.lookup_permit_at(&child, t1), None);
+        assert_eq!(
+            ledger.authorize_at(child_id, &child, t1),
+            Err(ProcessPermitError::UnknownPermit),
+            "the child's ledger permit must be unusable after the revoke"
+        );
+        assert_eq!(registry.lookup_permit_at(&own, t1), Some(own_id));
+        assert!(registry.is_session_approved_at("s1", t1));
+        // Nichts bleibt liegen: ein zweiter Widerruf und das Aufräumen der
+        // Kind-Sitzung liefern keine Kennung mehr.
+        assert!(registry.revoke_global_approval_taking_ids().is_empty());
+        assert!(registry.forget_session("child").is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_revoke_session_approval_taking_ids_returns_only_own_session_bound_permits() -> TestResult
+    {
+        let ledger = ProcessPermitLedger::default();
+        let registry = HostPermitSessionRegistry::default();
+        let t0 = LeaseInstant::now();
+        registry.mark_session_approved_at("s1", t0);
+        registry.mark_session_approved_at("s2", t0);
+        let mine = request("s1", "echo mine");
+        let theirs = request("s2", "echo theirs");
+        let (mine_binding, mine_id) = issue_under_lease(&ledger, &registry, &mine, t0)?;
+        let (theirs_binding, theirs_id) = issue_under_lease(&ledger, &registry, &theirs, t0)?;
+        assert!(registry.remember_lease_permit_at(mine.clone(), mine_id, mine_binding, t0));
+        assert!(registry.remember_lease_permit_at(theirs.clone(), theirs_id, theirs_binding, t0));
+        // Später erteilte prozessweite Phase: ein an sie gebundener Permit von
+        // s1 überlebt den Widerruf der sitzungseigenen Phase.
+        let t1 = later(t0, hours(1))?;
+        registry.mark_global_approval_at(t1);
+        let shared = request("s1", "echo shared");
+        let (shared_binding, shared_id) = issue_under_lease(&ledger, &registry, &shared, t1)?;
+        assert_eq!(shared_binding.scope(), LeaseScope::Global);
+        assert!(registry.remember_lease_permit_at(shared.clone(), shared_id, shared_binding, t1));
+
+        assert_eq!(
+            registry.revoke_session_approval_taking_ids("s1"),
+            vec![mine_id]
+        );
+        assert_eq!(registry.lookup_permit_at(&mine, t1), None);
+        assert_eq!(registry.lookup_permit_at(&theirs, t1), Some(theirs_id));
+        assert_eq!(registry.lookup_permit_at(&shared, t1), Some(shared_id));
+        assert!(registry.revoke_session_approval_taking_ids("s1").is_empty());
         Ok(())
     }
 
@@ -1858,13 +2833,13 @@ mod tests {
         let req = request("s1", "echo hi");
         let t0 = LeaseInstant::now();
         registry.mark_session_approved_at("s1", t0);
-        let window = registry
-            .covering_lease_at("s1", t0)
-            .ok_or(TestError::Missing("covering lease"))?;
-        let id = ledger
-            .issue_for_lease_at(req.clone(), window, t0)
-            .map_err(ctx("issue_for_lease_at failed"))?;
-        registry.remember_permit_at(req.clone(), id, t0);
+        let (binding, id) = issue_under_lease(&ledger, &registry, &req, t0)?;
+        assert!(registry.remember_lease_permit_at(req.clone(), id, binding, t0));
+        // Kurz vor der Grenze der Suspend-Uhr gilt der Permit noch.
+        assert_eq!(
+            registry.lookup_permit_at(&req, after_suspend(t0, hours(7))?),
+            Some(id)
+        );
         let resumed = after_suspend(later(t0, hours(1))?, hours(8))?;
         assert_eq!(registry.lookup_permit_at(&req, resumed), None);
         assert_eq!(

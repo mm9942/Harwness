@@ -3340,8 +3340,10 @@ impl ChatApp {
     /// - [`harw_sandbox::ProcessPermitLedger::revoke_session`] widerruft die
     ///   Ledger-Permits der Sitzung.
     ///
-    /// `revoke_global_approval` löscht auch eine offene prozessweite
-    /// Einmalfreigabe. Mit `keep_pending_single_use` (automatisches
+    /// [`harw_sandbox::HostPermitSessionRegistry::revoke_global_approval_taking_ids`]
+    /// beendet die globale Phase und liefert die unter ihr gemerkten Permits
+    /// (auch die von Kind-Sitzungen), die einzeln im Ledger widerrufen werden.
+    /// Es löscht auch eine offene prozessweite Einmalfreigabe. Mit `keep_pending_single_use` (automatisches
     /// Aufräumen nach dem Ablauf) wird sie danach wieder eingetragen: sie ist
     /// eine eigene Nutzerentscheidung (z. B. „einmalig“ auf ein
     /// `/sandbox-lease request` nach dem Ablauf) und darf nicht still
@@ -3380,7 +3382,13 @@ impl ChatApp {
         // Die zurückgegebenen Kennungen widerruft `revoke_session` unten
         // ohnehin (alle Permits dieser Sitzung), daher nicht einzeln.
         let _ = registry.forget_session(session);
-        registry.revoke_global_approval();
+        // Auch die unter der globalen Phase gemerkten Permits von
+        // Kind-Sitzungen enden im Ledger, nicht erst beim nächsten Lookup
+        // (Owner-Review 4505015300). Ein vergifteter Ledger ist hier nicht
+        // behebbar; die Registry-Einträge sind ohnehin entfernt.
+        for id in registry.revoke_global_approval_taking_ids() {
+            let _ = ledger.revoke(id);
+        }
         if restore_single_use {
             registry.mark_global_single_use();
         }

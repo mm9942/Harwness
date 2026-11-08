@@ -390,7 +390,8 @@ fn status_text(registry: &HostPermitSessionRegistry, session_id: &str) -> String
 /// trägt ihn, siehe Moduldoku); fehlt er, wird nichts verändert und
 /// [`OpError::NotAvailable`] mit [`REVOKE_USER_ONLY_MSG`] geliefert. Sonst
 /// entfernt sie die prozessweite Sitzungs- und Einmalfreigabe
-/// ([`harw_sandbox::HostPermitSessionRegistry::revoke_global_approval`]) —
+/// ([`harw_sandbox::HostPermitSessionRegistry::revoke_global_approval_taking_ids`],
+/// die unter ihr gemerkten Permits werden einzeln im Ledger widerrufen) —
 /// das beendet die Host-Ausführung für die Root-Session **und** jede
 /// Kind-Session, die dieselbe Registry teilt — sowie eine etwaige
 /// sitzungseigene Freigabe der aufrufenden Sitzung
@@ -406,7 +407,13 @@ fn handle_revoke(ctx: &OpContext) -> Result<OpOutput, OpError> {
     }
     let handles = resolve_handles(ctx)?;
     let session_id = ctx.session_id().as_str();
-    handles.registry.revoke_global_approval();
+    // Die unter der globalen Phase gemerkten Permits (auch die von
+    // Kind-Sitzungen) enden sofort im Ledger (Owner-Review 4505015300);
+    // die eigenen Permits der Sitzung widerruft `revoke_session` unten.
+    for id in handles.registry.revoke_global_approval_taking_ids() {
+        // Bestes Bemühen: ein vergifteter Ledger bricht den Widerruf nicht ab.
+        let _ = handles.ledger.revoke(id);
+    }
     handles.registry.revoke_session_approval(session_id);
     let _ = handles.ledger.revoke_session(session_id);
     Ok(OpOutput::from(

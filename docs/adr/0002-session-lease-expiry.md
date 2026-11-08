@@ -120,10 +120,11 @@ A permit issued under a running phase must not outlive it.
   window end, compared per clock. An expired window yields
   `ProcessPermitError::Expired`. It never yields a fresh full-length
   permit.
-- `shell.exec` (`ShellExecutor::authorize_host_command`) reads the window
-  once with `covering_lease(session)` and issues through
-  `issue_for_lease`. It does not first check `is_session_approved` and
-  then issue a free-standing permit.
+- `shell.exec` (`ShellExecutor::authorize_host_command`) reads the phase
+  once with `covering_binding(session)`, issues through
+  `issue_for_lease(request, binding.window())` and remembers the permit
+  with that same `LeaseBinding` (`remember_lease_permit`). It does not first
+  check `is_session_approved` and then issue a free-standing permit.
 - After a fresh approval, the executor records the process-wide phase
   (`mark_global_approval`), reads the covering window and binds the
   permit to it. If no active window covers the session at that point, no
@@ -136,9 +137,22 @@ A permit issued under a running phase must not outlive it.
   phase, so such a child window survived it, and the child kept running
   host commands without asking for up to the full lease. The global
   window already covers every session of the process.
-- A remembered lease-bound permit is not returned by `lookup_permit` once
-  no phase covers its session. The ledger entry itself has expired by then
-  as well.
+- A remembered permit carries the `LeaseBinding` that authorized it:
+  scope (session or global), window and a per-phase generation, passed in
+  by the caller and never derived from ambient state. `lookup_permit`
+  returns it only while `now` is before that window's end **and** that
+  exact phase is still stored in its own slot. Expiry, `Ctrl+H`,
+  `/sandbox-lease revoke` or a revoke followed by a new grant (a new
+  generation, even with an identical window) therefore never resurrect an
+  old permit, and a phase of the other scope never carries it.
+- Single-execution permits are remembered only through
+  `remember_single_execution_permit`, which accepts only a ledger grant with
+  scope `SingleExecution`; no production path can remember a lease permit
+  without its binding.
+- Revoking the global phase (`Ctrl+H`, `/sandbox-lease revoke`) uses
+  `revoke_global_approval_taking_ids` and revokes every permit remembered
+  under that phase in the ledger at once, including those of child
+  sessions.
 
 A remaining time (`lease_remaining`) is never used as a permit `ttl`. A
 `None` there would mean "full `lease_ttl`" and fail open.

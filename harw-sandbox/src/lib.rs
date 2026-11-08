@@ -41,7 +41,7 @@ pub use process_permit::{
 };
 
 mod host_permit_session;
-pub use host_permit_session::HostPermitSessionRegistry;
+pub use host_permit_session::{HostPermitSessionRegistry, LeaseBinding, LeaseScope};
 
 #[cfg(test)]
 mod test_support;

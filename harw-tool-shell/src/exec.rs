@@ -80,7 +80,7 @@ use harw_command::{
 };
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_sandbox::{
-    BwrapLauncher, HostApprovalScope, HostPathBinding, HostPermitSessionRegistry,
+    BwrapLauncher, HostApprovalScope, HostPathBinding, HostPermitSessionRegistry, LeaseBinding,
     ProcessEnvironment, ProcessPermitError, ProcessPermitId, ProcessPermitLedger,
     ProcessPermitRequest, SandboxProfile,
 };
@@ -153,8 +153,9 @@ const HOST_WORKER_DEFINITION: &str = "host-process-worker@1";
 const HOST_SINGLE_EXECUTION_TTL: Duration = Duration::from_secs(5 * 60);
 /// Ablehnungsnachricht, wenn nach einer gerade erteilten Zustimmung zur
 /// Host-Arbeitsphase kein aktives Zeitfenster die Sitzung abdeckt (etwa weil
-/// das Fensterende nicht darstellbar war oder die Phase sofort wieder endete):
-/// es wird kein Permit ausgestellt (fail-closed, B22).
+/// das Fensterende nicht darstellbar war oder die Phase sofort wieder endete)
+/// oder die Phase endete, bevor der Permit mit ihr gemerkt war: es wird kein
+/// Permit ausgestellt bzw. behalten (fail-closed, B22).
 const HOST_LEASE_UNAVAILABLE_MSG: &str = "shell.exec: host execution not authorized: the host \
      work phase is not active (expired or ended); approve it again";
 /// Vorgabe-Wartezeit auf **eine** Nutzerentscheidung auf eine offene
@@ -547,12 +548,15 @@ impl ShellExecutor {
     ///    (siehe [`HostPermitSessionRegistry::lookup_permit`]): er wird über
     ///    [`ProcessPermitLedger::authorize`] direkt verwendet.
     /// 2. Kein gemerkter Permit, aber eine aktive Host-Arbeitsphase deckt die
-    ///    Sitzung ab (siehe [`HostPermitSessionRegistry::covering_lease`]):
+    ///    Sitzung ab (siehe [`HostPermitSessionRegistry::covering_binding`]):
     ///    ein neuer Permit wird für genau diesen Antrag über
     ///    [`ProcessPermitLedger::issue_for_lease`] ausgestellt (er endet
-    ///    spätestens mit dem Fenster der Phase), gemerkt und sofort
-    ///    autorisiert — ohne erneute Frage. Eine abgelaufene Phase deckt
-    ///    nichts ab (B22): dann geht es mit Fall 3 weiter.
+    ///    spätestens mit dem Fenster der Phase), mit derselben Bindung
+    ///    gemerkt ([`HostPermitSessionRegistry::remember_lease_permit`]) und
+    ///    sofort autorisiert — ohne erneute Frage. Eine abgelaufene Phase
+    ///    deckt nichts ab (B22): dann geht es mit Fall 3 weiter, ebenso wenn
+    ///    die Phase zwischen Ausstellen und Merken endet oder widerrufen wird
+    ///    (der Permit wird dann widerrufen, nicht ungebunden gemerkt).
     /// 3. Weder ein gemerkter Permit noch eine Sitzungsphase, aber ein
     ///    Fragekanal ist angehängt ([`Self::host_permit_prompts`]): eine
     ///    [`HostPermitPrompt`] geht an die anzeigende Oberfläche und diese
@@ -609,11 +613,25 @@ impl ShellExecutor {
         // unten zur Neubeantragung durch, falls weiterhin eine aktive
         // Host-Arbeitsphase die Sitzung abdeckt oder jetzt gefragt werden kann.
 
-        // Ein einziger Abruf des Fensters (statt `is_session_approved` und
+        // Ein einziger Abruf der Phase (statt `is_session_approved` und
         // danach `covering_lease`): keine Lücke zwischen Prüfung und Bindung.
-        if let Some(window) = registry.covering_lease(session_id) {
-            match ledger.issue_for_lease(request.clone(), window) {
-                Ok(id) => return Self::remember_and_authorize(ledger, registry, request, id),
+        // Ausstellen und Merken nutzen dieselbe Bindung (Fenster,
+        // Geltungsbereich, Identität der Phase), nie den Zustand zum
+        // Zeitpunkt des Merkens.
+        if let Some(binding) = registry.covering_binding(session_id) {
+            match ledger.issue_for_lease(request.clone(), binding.window()) {
+                Ok(id) => {
+                    if Self::remember_or_revoke(ledger, registry, &request, id, binding) {
+                        return Self::authorize_issued(ledger, &request, id);
+                    }
+                    // Die Phase endete oder wurde widerrufen, bevor der
+                    // Permit gemerkt war; er ist bereits widerrufen. Wie
+                    // ohne Phase weiter (neu fragen).
+                    debug!(
+                        session_id = %session_id,
+                        "shell.exec: host lease ended before the permit was remembered; asking again"
+                    );
+                }
                 // Die Phase endete zwischen Abruf und Ausstellung: wie ohne
                 // Phase weiter (neu fragen), nie ein frischer 8-h-Permit.
                 Err(ProcessPermitError::Expired) => {
@@ -714,12 +732,16 @@ impl ShellExecutor {
     ///
     /// # Description
     /// - [`HostApprovalScope::SingleExecution`]: über
-    ///   [`ProcessPermitLedger::issue_after_local_approval`] mit `ttl`.
-    /// - [`HostApprovalScope::SessionLease`]: `ttl` wird ignoriert. Der
-    ///   Permit wird über [`ProcessPermitLedger::issue_for_lease`] an das
-    ///   Fenster aus [`HostPermitSessionRegistry::covering_lease`] gebunden
-    ///   und endet spätestens mit der Phase (PL-100 Phase 4, B22). Der
-    ///   Aufrufer muss die Phase vorher eingetragen haben
+    ///   [`ProcessPermitLedger::issue_after_local_approval`] mit `ttl`,
+    ///   sofort autorisiert (verbraucht) und danach ohne Phasenbindung
+    ///   gemerkt ([`HostPermitSessionRegistry::remember_single_execution_permit`]).
+    /// - [`HostApprovalScope::SessionLease`]: `ttl` wird ignoriert. Die Phase
+    ///   wird genau einmal gelesen
+    ///   ([`HostPermitSessionRegistry::covering_binding`]); der Permit wird
+    ///   über [`ProcessPermitLedger::issue_for_lease`] an ihr Fenster
+    ///   gebunden, endet spätestens mit der Phase (PL-100 Phase 4, B22) und
+    ///   wird mit derselben Bindung gemerkt. Der Aufrufer muss die Phase
+    ///   vorher eingetragen haben
     ///   ([`HostPermitSessionRegistry::mark_session_approved`] bzw.
     ///   [`HostPermitSessionRegistry::mark_global_approval`]). Deckt danach
     ///   kein aktives Fenster die Sitzung ab, wird nichts ausgestellt
@@ -727,8 +749,8 @@ impl ShellExecutor {
     ///
     /// # Errors
     /// Eine für das Modell lesbare Ablehnungsnachricht, wenn kein aktives
-    /// Fenster vorliegt oder der Ledger Ausstellung bzw. Autorisierung
-    /// ablehnt.
+    /// Fenster vorliegt, die Phase vor dem Merken endet oder der Ledger
+    /// Ausstellung bzw. Autorisierung ablehnt.
     fn issue_and_remember(
         ledger: &Arc<ProcessPermitLedger>,
         registry: &Arc<HostPermitSessionRegistry>,
@@ -736,43 +758,147 @@ impl ShellExecutor {
         scope: HostApprovalScope,
         ttl: Option<Duration>,
     ) -> Result<(), String> {
-        let issued = match scope {
+        match scope {
             HostApprovalScope::SingleExecution => {
-                ledger.issue_after_local_approval(request.clone(), scope, ttl)
+                let id = ledger
+                    .issue_after_local_approval(request.clone(), scope, ttl)
+                    .map_err(|err| format!("shell.exec: host execution not authorized: {err}"))?;
+                Self::authorize_and_remember_single_execution(ledger, registry, &request, id)
             }
             HostApprovalScope::SessionLease => {
-                let Some(window) = registry.covering_lease(&request.session) else {
+                let Some(binding) = registry.covering_binding(&request.session) else {
                     warn!(
                         session_id = %request.session,
                         "shell.exec: approved host lease has no active window; no permit issued"
                     );
                     return Err(HOST_LEASE_UNAVAILABLE_MSG.to_owned());
                 };
-                ledger.issue_for_lease(request.clone(), window)
+                let id = ledger
+                    .issue_for_lease(request.clone(), binding.window())
+                    .map_err(|err| format!("shell.exec: host execution not authorized: {err}"))?;
+                Self::remember_and_authorize(ledger, registry, request, id, binding)
             }
-        };
-        let id =
-            issued.map_err(|err| format!("shell.exec: host execution not authorized: {err}"))?;
-        Self::remember_and_authorize(ledger, registry, request, id)
+        }
     }
 
-    /// Merkt einen frisch ausgestellten Permit `id` für `request` in
-    /// `registry` und autorisiert ihn sofort für den auslösenden Aufruf.
+    /// Merkt einen frisch unter der Phase `binding` ausgestellten Permit `id`
+    /// für `request` in `registry` und autorisiert ihn sofort für den
+    /// auslösenden Aufruf.
+    ///
+    /// # Description
+    /// `binding` ist dieselbe Bindung, mit deren Fenster `id` über
+    /// [`ProcessPermitLedger::issue_for_lease`] ausgestellt wurde; der
+    /// gemerkte Eintrag trägt genau diese Phase. Gilt sie beim Merken nicht
+    /// mehr (abgelaufen, widerrufen oder neu erteilt), wird nichts gemerkt,
+    /// `id` beim Ledger widerrufen und nichts autorisiert.
     ///
     /// # Errors
-    /// Eine für das Modell lesbare Ablehnungsnachricht, wenn der Ledger die
-    /// Autorisierung ablehnt (etwa weil der Permit inzwischen abgelaufen ist).
+    /// [`HOST_LEASE_UNAVAILABLE_MSG`], wenn die Phase vor dem Merken endete;
+    /// sonst eine für das Modell lesbare Ablehnungsnachricht, wenn der Ledger
+    /// die Autorisierung ablehnt (etwa weil der Permit inzwischen abgelaufen
+    /// ist).
     fn remember_and_authorize(
         ledger: &Arc<ProcessPermitLedger>,
         registry: &Arc<HostPermitSessionRegistry>,
         request: ProcessPermitRequest,
         id: ProcessPermitId,
+        binding: LeaseBinding,
     ) -> Result<(), String> {
-        registry.remember_permit(request.clone(), id);
+        if !Self::remember_or_revoke(ledger, registry, &request, id, binding) {
+            warn!(
+                session_id = %request.session,
+                "shell.exec: host lease ended before the permit was remembered; permit revoked"
+            );
+            return Err(HOST_LEASE_UNAVAILABLE_MSG.to_owned());
+        }
+        Self::authorize_issued(ledger, &request, id)
+    }
+
+    // Merkt `id` mit der Phase `binding`. Gilt die Phase nicht mehr, wird
+    // `id` beim Ledger widerrufen, damit kein ungemerkter Permit liegen
+    // bleibt; dann `false`.
+    fn remember_or_revoke(
+        ledger: &ProcessPermitLedger,
+        registry: &HostPermitSessionRegistry,
+        request: &ProcessPermitRequest,
+        id: ProcessPermitId,
+        binding: LeaseBinding,
+    ) -> bool {
+        if registry.remember_lease_permit(request.clone(), id, binding) {
+            return true;
+        }
+        Self::revoke_unremembered(ledger, request, id);
+        false
+    }
+
+    // Widerruft einen ausgestellten, aber weder gemerkten noch verwendeten
+    // Permit `id` beim Ledger, damit er nicht bis zu seinem Ablauf liegen
+    // bleibt. Ein Fehlschlag (vergiftete Sperre) ist hier nicht behebbar und
+    // wird nur protokolliert.
+    fn revoke_unremembered(
+        ledger: &ProcessPermitLedger,
+        request: &ProcessPermitRequest,
+        id: ProcessPermitId,
+    ) {
+        if let Err(err) = ledger.revoke(id) {
+            warn!(
+                session_id = %request.session,
+                error = %err,
+                "shell.exec: revoking an unremembered host permit failed"
+            );
+        }
+    }
+
+    // Autorisiert einen soeben ausgestellten (und gemerkten) Permit für den
+    // auslösenden Aufruf.
+    fn authorize_issued(
+        ledger: &ProcessPermitLedger,
+        request: &ProcessPermitRequest,
+        id: ProcessPermitId,
+    ) -> Result<(), String> {
         ledger
-            .authorize(id, &request)
+            .authorize(id, request)
             .map(|_granted| ())
             .map_err(|err| format!("shell.exec: host execution not authorized: {err}"))
+    }
+
+    /// Autorisiert (und verbraucht damit) einen frisch ausgestellten
+    /// Einmal-Permit `id` für `request` und merkt ihn danach ohne
+    /// Phasenbindung.
+    ///
+    /// # Description
+    /// Gemerkt wird nur zum Aufräumen
+    /// ([`HostPermitSessionRegistry::forget_session`] liefert die Kennung zum
+    /// Widerruf): der Ledger hat die Einmalfreigabe bereits verbraucht, ein
+    /// späterer identischer Antrag wird erneut gefragt. Scheitert das Merken,
+    /// ändert das an der Autorisierung nichts. Lehnt der Ledger die
+    /// Autorisierung ab, wird `id` widerrufen statt ungemerkt liegen zu
+    /// bleiben (wie bei einem Lease-Permit, dessen Phase vor dem Merken
+    /// endete).
+    ///
+    /// # Errors
+    /// Eine für das Modell lesbare Ablehnungsnachricht, wenn der Ledger die
+    /// Autorisierung ablehnt.
+    fn authorize_and_remember_single_execution(
+        ledger: &ProcessPermitLedger,
+        registry: &HostPermitSessionRegistry,
+        request: &ProcessPermitRequest,
+        id: ProcessPermitId,
+    ) -> Result<(), String> {
+        let granted = match ledger.authorize(id, request) {
+            Ok(granted) => granted,
+            Err(err) => {
+                Self::revoke_unremembered(ledger, request, id);
+                return Err(format!("shell.exec: host execution not authorized: {err}"));
+            }
+        };
+        if !registry.remember_single_execution_permit(&granted) {
+            debug!(
+                session_id = %request.session,
+                "shell.exec: single-execution permit not remembered"
+            );
+        }
+        Ok(())
     }
 
     /// Determines whether this call runs directly on the host without `bwrap`
@@ -4072,6 +4198,15 @@ mod tests {
         let id = registry
             .lookup_permit(&request)
             .ok_or(TestError::Missing("permit remembered under the lease"))?;
+        let just_before_end = window
+            .expires_at()
+            .checked_sub(Duration::from_nanos(1))
+            .ok_or(TestError::Missing("instant before the lease end"))?;
+        assert_eq!(
+            registry.lookup_permit_at(&request, just_before_end),
+            Some(id),
+            "the remembered lease permit must hold until the window ends"
+        );
         assert_eq!(
             registry.lookup_permit_at(&request, window.expires_at()),
             None,
@@ -4130,16 +4265,17 @@ mod tests {
             .checked_sub(Duration::from_secs(5))
             .ok_or(TestError::Missing("instant five seconds ago"))?;
         registry.mark_session_approved_at("s1", past);
-        let window = registry
-            .session_lease("s1")
-            .ok_or(TestError::Missing("stored (expired) session lease window"))?;
         let request = host_request(&tmp, "s1", "echo repeat_me")?;
-        // Damals unter der Phase ausgestellt und gemerkt (wie Fall 2 von
-        // `authorize_host_command`, nur zum Zeitpunkt `past`).
+        // Damals unter der Phase ausgestellt und mit ihrer Bindung gemerkt
+        // (wie Fall 2 von `authorize_host_command`, nur zum Zeitpunkt `past`).
+        let binding = registry
+            .covering_binding_at("s1", past)
+            .ok_or(TestError::Missing("lease binding at `past`"))?;
+        assert_eq!(registry.session_lease("s1"), Some(binding.window()));
         let id = ledger
-            .issue_for_lease_at(request.clone(), window, past)
+            .issue_for_lease_at(request.clone(), binding.window(), past)
             .map_err(ctx("issue_for_lease_at"))?;
-        registry.remember_permit_at(request.clone(), id, past);
+        assert!(registry.remember_lease_permit_at(request.clone(), id, binding, past));
         assert_eq!(registry.lookup_permit_at(&request, past), Some(id));
 
         assert!(
@@ -4181,9 +4317,12 @@ mod tests {
         // PL-100 Phase 4, B22: ein `uia-shell-worker`-Kind beantwortet seine
         // eigene Frage mit „Host-Arbeitsphase“. Strg+H
         // (`ChatApp::end_host_mode`: `forget_session(root)`,
-        // `revoke_global_approval`, `revoke_session(root)`) muss auch dem Kind
-        // den Host-Zugang nehmen. Vorher bekam das Kind ein eigenes Fenster
-        // und arbeitete danach bis zu 8 h ohne Nachfrage weiter.
+        // `revoke_global_approval_taking_ids` samt Ledger-Widerruf jeder
+        // gelieferten Kennung, `revoke_session(root)`) muss auch dem Kind den
+        // Host-Zugang nehmen. Vorher bekam das Kind ein eigenes Fenster und
+        // arbeitete danach bis zu 8 h ohne Nachfrage weiter; und ohne den
+        // Ledger-Widerruf bliebe sein bereits ausgestellter Permit beim
+        // Ledger bis zum Fensterende gültig.
         let tmp = make_temp_workspace()?;
         let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
@@ -4215,14 +4354,33 @@ mod tests {
             None,
             "the asking child must not get a window of its own"
         );
+        let child_request = host_request(&tmp, "child", "echo child_lease")?;
+        let child_id = registry
+            .lookup_permit(&child_request)
+            .ok_or(TestError::Missing(
+                "child permit remembered under the phase",
+            ))?;
 
         // Strg+H in der TUI (Root-Sitzung „root“).
-        registry.forget_session("root");
-        registry.revoke_global_approval();
+        assert!(registry.forget_session("root").is_empty());
+        let removed = registry.revoke_global_approval_taking_ids();
+        assert_eq!(
+            removed,
+            vec![child_id],
+            "the revoke must hand back the child's permit bound to the global phase"
+        );
+        for id in removed {
+            ledger.revoke(id).map_err(ctx("revoke"))?;
+        }
         ledger
             .revoke_session("root")
             .map_err(ctx("revoke_session"))?;
 
+        assert_eq!(
+            ledger.authorize(child_id, &child_request),
+            Err(ProcessPermitError::UnknownPermit),
+            "a child call that looked the permit up just before Ctrl+H must not be authorized"
+        );
         assert!(!registry.is_session_approved("child"));
         let without_prompt = host_executor(&ledger, &registry);
         let after = without_prompt
@@ -4342,6 +4500,178 @@ mod tests {
             Err(ProcessPermitError::Expired),
             "the permit must not outlive the global lease window"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_remember_and_authorize_refuses_a_lease_that_ended_before_remembering() -> TestResult {
+        // Owner-Review 4505015300: die Phase endet zwischen Abruf/Ausstellung
+        // und Merken. Früher wurde der Permit dann ungebunden gemerkt
+        // (`lease_bound = false`) und überlebte die Phase. Jetzt wird nichts
+        // gemerkt, nichts autorisiert und der Permit beim Ledger widerrufen.
+        // Kein `sleep`: das Fenster liegt bereits in der Vergangenheit.
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        fs::create_dir_all(tmp.path().join("project")).map_err(ctx("project subdir"))?;
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(
+            HostPermitSessionRegistry::with_lease_ttl(Duration::from_secs(1))
+                .map_err(ctx("with_lease_ttl"))?,
+        );
+        let past = harw_sandbox::LeaseInstant::now()
+            .checked_sub(Duration::from_secs(5))
+            .ok_or(TestError::Missing("instant five seconds ago"))?;
+        registry.mark_session_approved_at("s1", past);
+        let binding = registry
+            .covering_binding_at("s1", past)
+            .ok_or(TestError::Missing("lease binding at `past`"))?;
+        let request = host_request(&tmp, "s1", "echo too_late")?;
+        let id = ledger
+            .issue_for_lease_at(request.clone(), binding.window(), past)
+            .map_err(ctx("issue_for_lease_at"))?;
+
+        let result =
+            ShellExecutor::remember_and_authorize(&ledger, &registry, request.clone(), id, binding);
+        assert_eq!(result, Err(HOST_LEASE_UNAVAILABLE_MSG.to_owned()));
+        assert_eq!(
+            registry.lookup_permit_at(&request, past),
+            None,
+            "nothing may be remembered, not even without a lease binding"
+        );
+        assert_eq!(
+            ledger.authorize_at(id, &request, past),
+            Err(ProcessPermitError::UnknownPermit),
+            "the unremembered permit must be revoked"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_global_lease_permit_is_not_resurrected_or_carried_by_a_session_phase() -> TestResult {
+        // Owner-Review 4505015300: der gemerkte Permit hängt an genau der
+        // prozessweiten Phase, die ihn autorisiert hat. Weder eine
+        // sitzungseigene Phase noch eine nach Strg+H neu erteilte
+        // prozessweite Phase trägt ihn weiter.
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        fs::create_dir_all(tmp.path().join("project")).map_err(ctx("project subdir"))?;
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let request = host_request(&tmp, "child-1", "echo bound_to_global")?;
+        registry.mark_global_approval();
+        assert_eq!(
+            ShellExecutor::issue_and_remember(
+                &ledger,
+                &registry,
+                request.clone(),
+                HostApprovalScope::SessionLease,
+                None,
+            ),
+            Ok(())
+        );
+        let old_id = registry.lookup_permit(&request).ok_or(TestError::Missing(
+            "permit remembered under the global lease",
+        ))?;
+
+        // Eine eigene Phase des Kinds deckt es weiter ab, trägt den global
+        // gebundenen Permit aber nicht.
+        registry.mark_session_approved("child-1");
+        registry.revoke_global_approval();
+        assert!(registry.is_session_approved("child-1"));
+        assert_eq!(
+            registry.lookup_permit(&request),
+            None,
+            "a globally bound permit must not live on through a session phase"
+        );
+
+        // Erneute prozessweite Zustimmung: der alte Permit kommt nicht zurück.
+        registry.revoke_session_approval("child-1");
+        registry.mark_global_approval();
+        assert_eq!(
+            registry.lookup_permit(&request),
+            None,
+            "a re-granted phase must not resurrect the old permit"
+        );
+
+        // Erst eine neue Ausstellung unter der neuen Phase gilt.
+        assert_eq!(
+            ShellExecutor::issue_and_remember(
+                &ledger,
+                &registry,
+                request.clone(),
+                HostApprovalScope::SessionLease,
+                None,
+            ),
+            Ok(())
+        );
+        let new_id = registry
+            .lookup_permit(&request)
+            .ok_or(TestError::Missing("permit remembered under the new phase"))?;
+        assert_ne!(new_id, old_id);
+        Ok(())
+    }
+
+    #[test]
+    fn test_issue_and_remember_single_execution_is_consumed_and_not_lease_bound() -> TestResult {
+        // Eine Einmalfreigabe hängt an keiner Phase: der Ledger verbraucht
+        // sie beim auslösenden Aufruf; gemerkt wird sie nur zum Aufräumen.
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        fs::create_dir_all(tmp.path().join("project")).map_err(ctx("project subdir"))?;
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let request = host_request(&tmp, "s1", "echo once")?;
+
+        let result = ShellExecutor::issue_and_remember(
+            &ledger,
+            &registry,
+            request.clone(),
+            HostApprovalScope::SingleExecution,
+            Some(HOST_SINGLE_EXECUTION_TTL),
+        );
+        assert_eq!(result, Ok(()));
+        let id = registry
+            .lookup_permit(&request)
+            .ok_or(TestError::Missing("single-execution permit remembered"))?;
+        assert_eq!(
+            ledger.authorize(id, &request),
+            Err(ProcessPermitError::AlreadyConsumed),
+            "the triggering call must have consumed the single-execution permit"
+        );
+        assert_eq!(registry.forget_session("s1"), vec![id]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_execution_permit_is_revoked_when_authorization_fails() -> TestResult {
+        // Lehnt der Ledger die Autorisierung des frisch ausgestellten
+        // Einmal-Permits ab (hier: ein abweichender Antrag), wird der Permit
+        // widerrufen, statt weder gemerkt noch widerrufen liegen zu bleiben.
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        fs::create_dir_all(tmp.path().join("project")).map_err(ctx("project subdir"))?;
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let issued_for = host_request(&tmp, "s1", "echo once")?;
+        let other = host_request(&tmp, "s1", "echo other")?;
+        let id = ledger
+            .issue_after_local_approval(
+                issued_for.clone(),
+                HostApprovalScope::SingleExecution,
+                Some(HOST_SINGLE_EXECUTION_TTL),
+            )
+            .map_err(ctx("issue_after_local_approval"))?;
+
+        let result =
+            ShellExecutor::authorize_and_remember_single_execution(&ledger, &registry, &other, id);
+        assert!(
+            result.is_err_and(|message| message.contains("not authorized")),
+            "a refused authorization must be reported to the model"
+        );
+        assert_eq!(registry.lookup_permit(&issued_for), None);
+        assert_eq!(registry.lookup_permit(&other), None);
+        assert_eq!(
+            ledger.authorize(id, &issued_for),
+            Err(ProcessPermitError::UnknownPermit),
+            "the unremembered single-execution permit must be revoked"
+        );
+        assert!(registry.forget_session("s1").is_empty());
         Ok(())
     }
 

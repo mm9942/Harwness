@@ -606,7 +606,9 @@ impl ProcessPermitLedger {
     /// zu `now` nicht mehr aktiv, wird nichts ausgestellt: ein abgelaufenes
     /// Fenster wird nie still zu einem frischen Permit (B22, kein
     /// fail-open über ein `None`). Das Fenster liefert
-    /// `HostPermitSessionRegistry::covering_lease_at`.
+    /// `HostPermitSessionRegistry::covering_binding_at` (`LeaseBinding::window`);
+    /// mit derselben Bindung wird der Permit danach über
+    /// `HostPermitSessionRegistry::remember_lease_permit_at` gemerkt.
     ///
     /// # Arguments
     /// - `request`: der exakt gebundene Antrag (`LocalHost`); Eigentum geht über.
