@@ -213,6 +213,9 @@ pub mod deny;
 pub mod diary;
 pub mod diff;
 pub mod dod;
+// PL-100 WP 1.9: `/dod model show|set|clear` (Subbefehl von `/dod`, nur für
+// Menschen) und die Lokalitätsregel des Triage-Providers.
+pub mod dod_model;
 pub mod dream;
 pub mod dream_run;
 pub mod effort;

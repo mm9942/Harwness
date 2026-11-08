@@ -2517,6 +2517,27 @@ fn dod_subcommands_parse_into_their_actions() -> TestResult {
     assert_eq!(dod_action(&["enable"])?, DodAction::Enable);
     assert_eq!(dod_action(&["disable"])?, DodAction::Disable);
     assert_eq!(dod_action(&["restart"])?, DodAction::Restart);
+    assert_eq!(dod_action(&["model"])?, DodAction::Model { action: None });
+    assert_eq!(
+        dod_action(&["model", "show"])?,
+        DodAction::Model {
+            action: Some(DodModelAction::Show)
+        }
+    );
+    assert_eq!(
+        dod_action(&["model", "set", "local/qwen2.5"])?,
+        DodAction::Model {
+            action: Some(DodModelAction::Set {
+                model: "local/qwen2.5".to_owned()
+            })
+        }
+    );
+    assert_eq!(
+        dod_action(&["model", "clear"])?,
+        DodAction::Model {
+            action: Some(DodModelAction::Clear)
+        }
+    );
     assert_eq!(
         dod_action(&["findings"])?,
         DodAction::Findings(DodFindingsArgs {
@@ -2662,6 +2683,10 @@ fn dod_every_subcommand_and_argument_has_help() -> TestResult {
         "harw dod warden enable",
         "harw dod warden disable",
         "harw dod install",
+        "harw dod model",
+        "harw dod model show",
+        "harw dod model set",
+        "harw dod model clear",
     ] {
         assert!(
             seen.iter().any(|path| path == expected),

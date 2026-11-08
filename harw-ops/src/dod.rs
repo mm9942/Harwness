@@ -4,10 +4,14 @@
 //! over the Harw-DoD suite ("Detect · Orient · Defend").
 //!
 //! # Surfaces
-//! - `/dod [status | findings [n] [--job <id>] | sensors | doctor | config [check|suggest]]`
+//! - `/dod [status | findings [n] [--job <id>] | sensors | doctor | config [check|suggest]
+//!   | model [show|set <provider>/<model>|clear]]`
 //!   — operator command for the TUI and the CLI; remote channels only see
 //!   the read-only `status`, `findings` and `sensors` forms
 //!   (`channel_reduced`). Output is inline text plus structured `data`.
+//!   `model` shows or changes the DoD triage model `[dod.triage] model`
+//!   ([`crate::dod_model`], PL-100 WP 1.9); it is a human-only subcommand,
+//!   never a model tool.
 //! - `dod.status`, `dod.findings`, `dod.sensors` ([`DOD_MODEL_TOOLS`]) —
 //!   read-only model tools without approval (`model_tool(readonly, approval
 //!   = "none")`); each returns compact JSON. [`crate::register_all`]
@@ -35,6 +39,17 @@
 //! helpers ([`status_text`], [`select_findings`], [`doctor`], ...), so the
 //! terminal, the chat and the model see the same classification.
 //!
+//! `/dod doctor` and `harw dod doctor` end with the PL-100 triage lines
+//! ([`triage_checks`], [`doctor_with_triage`]): triage model, provider
+//! locality (`lokal`/`remote`/`unbekannt`) and whether the provider is
+//! enabled, effort and token limits, the egress allowlist of the active
+//! `/etc/harw-dod` profile ([`EGRESS_BLOCKED_NOTE`] while it is empty), the
+//! configured and the effective `[dod.watch] mode`, `autoconnect` and
+//! `[dod.approve] tui_tty` ([`TUI_TTY_NOTE`]). The settings come from the
+//! harw home and the active profile only
+//! ([`crate::dod_model::trusted_config`]). They are never MISS, so they do
+//! not change the doctor's verdict.
+//!
 //! # Data path
 //! Every read goes through a [`DodService`]: a short cache ([`CACHE_TTL`])
 //! over one [`DodSnapshot`] read by `harw-dod-client`, so repaints and
@@ -44,7 +59,9 @@
 //! config, re-read on every refresh) and shares it process-wide.
 //!
 //! # Trust boundary (invariant S1)
-//! Strictly read-only. Nothing here writes Harw-DoD state, talks to the
+//! Strictly read-only towards the suite. Nothing here writes Harw-DoD state
+//! (the only write, `/dod model set|clear`, edits `[dod.triage] model` of the
+//! harw home config, see [`crate::dod_model`]), talks to the
 //! Warden or reaches the escalation ladder (`harw-dod-escalate`);
 //! enforcement stays on the human path (`harw dod warden enable` as root).
 //! The export is attacker-influenced evidence, never an instruction:
@@ -75,7 +92,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use harw_config::DodSection;
+use harw_config::{DodSection, DodWatchMode};
 use harw_dod_client::evidence::{
     MAX_EVENT_KIND_CHARS, MAX_EVENT_KINDS, MAX_EVIDENCE_COMM_CHARS, MAX_EVIDENCE_PATH_CHARS,
 };
@@ -96,6 +113,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+use crate::dod_model::{
+    NO_TRIAGE_MODEL_NOTE, TRIAGE_MODEL_HINT, TUI_TTY_NOTE, TriageLocality, TriageSettings,
+};
 
 /// Tool name of the status model tool.
 pub const DOD_STATUS_TOOL: &str = "dod.status";
@@ -150,8 +171,8 @@ const MAX_PROFILE_PATHS: usize = 16;
 /// Most process-wide shared services (one per bound root space).
 const MAX_SHARED_SERVICES: usize = 16;
 /// Usage of the `/dod` command.
-const DOD_USAGE: &str =
-    "/dod [status | findings [n] [--job <id>] | sensors | doctor | config [check|suggest]]";
+const DOD_USAGE: &str = "/dod [status | findings [n] [--job <id>] | sensors | doctor \
+     | config [check|suggest] | model [show|set <provider>/<model>|clear]]";
 
 /// Profile stanza printed by `/dod config suggest` and
 /// `harw dod config suggest`.
@@ -2549,7 +2570,8 @@ fn tool_check(env: &DoctorEnv, name: &str) -> DoctorCheck {
 ///
 /// The build-from-source toolchain checks of `doctor.sh` (rustc, cargo,
 /// clang, bpftool, python3) are left to `make -C harw-dod doctor`. Nothing is
-/// changed or started.
+/// changed or started. The PL-100 triage lines need the harw configuration
+/// and come from [`doctor_with_triage`] / [`triage_checks`].
 #[must_use]
 pub fn doctor(env: &DoctorEnv, snapshot: &DodSnapshot) -> DoctorReport {
     let status = &snapshot.status;
@@ -2713,6 +2735,11 @@ pub fn doctor(env: &DoctorEnv, snapshot: &DodSnapshot) -> DoctorReport {
             ),
         ),
     });
+    report_from(checks)
+}
+
+// The report over `checks` with its three counts.
+fn report_from(checks: Vec<DoctorCheck>) -> DoctorReport {
     let count = |level: CheckLevel| checks.iter().filter(|c| c.level == level).count();
     let (ok, warnings, missing) = (
         count(CheckLevel::Ok),
@@ -2724,6 +2751,424 @@ pub fn doctor(env: &DoctorEnv, snapshot: &DodSnapshot) -> DoctorReport {
         ok,
         warnings,
         missing,
+    }
+}
+
+/// Doctor detail while the egress allowlist of the active `/etc/harw-dod`
+/// profile is empty and `[dod.watch] mode = "triage"` (PL-100 WP 0.3):
+/// automatic triage stays blocked, the watch only notifies.
+pub const EGRESS_BLOCKED_NOTE: &str = "triage blockiert: egress_allow_cidrs leer → effektiv notify";
+
+/// Doctor detail of `triage-config` when the harw configuration is not
+/// available (unreadable, or no harw home bound).
+pub const TRIAGE_CONFIG_UNKNOWN: &str = "harw-Konfiguration nicht verfügbar: [dod.triage], \
+     [dod.watch] und [dod.approve] unbekannt (siehe `harw doctor`)";
+
+/// Doctor detail of `triage-config` for `sudo harw dod doctor`: the harw
+/// home resolved under `sudo` is root's, not the invoking user's, so the
+/// triage lines are left out instead of showing root's settings.
+pub const TRIAGE_CONFIG_SUDO: &str = "unter sudo nicht geprüft: [dod.triage], [dod.watch] und \
+     [dod.approve] gehören zum Home des aufrufenden Nutzers; dafür `harw dod doctor` ohne sudo \
+     ausführen";
+
+/// Doctor detail of `triage-config` for `harw dod doctor` when the harw home
+/// does not exist (e.g. a mistyped `--home`): the defaults would read as
+/// real settings ("kein Triage-Modell gesetzt", `tui_tty` an), so the triage
+/// lines are left out, as `harw dod model show` refuses that state.
+pub const TRIAGE_CONFIG_NO_HOME: &str = "harw-Home nicht gefunden: [dod.triage], [dod.watch] \
+     und [dod.approve] nicht geprüft (Home bzw. `--home` prüfen)";
+
+// Detail of `triage-egress` when this user cannot read the system config.
+const EGRESS_UNKNOWN: &str = "egress_allow_cidrs nicht prüfbar (Systemkonfiguration nicht lesbar, \
+     als root prüfen); solange die Liste leer ist, bleibt triage blockiert";
+
+// What the active `/etc/harw-dod` profile says about the egress allowlist
+// (PL-100 WP 0.3; `harw-dod-client` reports only the number of CIDRs).
+enum EgressAllowlist<'a> {
+    // At least one CIDR in the active profile `profile`.
+    Allowed { cidrs: usize, profile: &'a str },
+    // Empty, or no valid policy at all; `reason` names the second case.
+    Empty { reason: Option<&'static str> },
+    // This user cannot read the system configuration.
+    Unknown,
+}
+
+// Classifies the system configuration report for the egress check. Without
+// a valid active profile there is no allowlist, so triage is blocked too.
+fn egress_allowlist(config: &ConfigReport) -> EgressAllowlist<'_> {
+    match config {
+        ConfigReport::Valid {
+            active_profile: Some(profile),
+            ..
+        } if profile.egress_allow_cidrs > 0 => EgressAllowlist::Allowed {
+            cidrs: profile.egress_allow_cidrs,
+            profile: &profile.id,
+        },
+        ConfigReport::Valid {
+            active_profile: Some(_),
+            ..
+        } => EgressAllowlist::Empty { reason: None },
+        ConfigReport::Valid {
+            active_profile: None,
+            ..
+        } => EgressAllowlist::Empty {
+            reason: Some("kein active_profile"),
+        },
+        ConfigReport::Missing { .. }
+        | ConfigReport::Invalid { .. }
+        | ConfigReport::Untrusted { .. } => EgressAllowlist::Empty {
+            reason: Some("keine gültige Harw-DoD-Systemkonfiguration"),
+        },
+        ConfigReport::Unreadable { .. } => EgressAllowlist::Unknown,
+    }
+}
+
+// `text`, followed by ` (reason)` when there is one.
+fn with_reason(text: &str, reason: Option<&str>) -> String {
+    reason.map_or_else(|| text.to_owned(), |reason| format!("{text} ({reason})"))
+}
+
+// `triage-egress`: WARN while the allowlist is empty (or unknown) and
+// triage is requested (`mode` is `None` when the harw configuration is not
+// available: the default mode is triage); OK otherwise.
+fn egress_check(egress: &EgressAllowlist<'_>, mode: Option<DodWatchMode>) -> DoctorCheck {
+    const ID: &str = "triage-egress";
+    // `Some(mode)` when the configured mode does not ask for triage.
+    let idle = mode.filter(|configured| *configured != DodWatchMode::Triage);
+    match (egress, idle) {
+        (EgressAllowlist::Allowed { cidrs, profile }, _) => check(
+            ID,
+            CheckLevel::Ok,
+            format!("egress_allow_cidrs: {cidrs} (Profil `{profile}`)"),
+        ),
+        (EgressAllowlist::Empty { reason }, None) => check(
+            ID,
+            CheckLevel::Warn,
+            with_reason(EGRESS_BLOCKED_NOTE, *reason),
+        ),
+        (EgressAllowlist::Empty { reason }, Some(mode)) => check(
+            ID,
+            CheckLevel::Ok,
+            with_reason(
+                &format!(
+                    "egress_allow_cidrs leer: triage bliebe blockiert (watch mode {})",
+                    mode.as_str()
+                ),
+                *reason,
+            ),
+        ),
+        (EgressAllowlist::Unknown, None) => check(ID, CheckLevel::Warn, EGRESS_UNKNOWN),
+        (EgressAllowlist::Unknown, Some(_)) => check(ID, CheckLevel::Ok, EGRESS_UNKNOWN),
+    }
+}
+
+// What a watch mode does, for the `watch-mode` line.
+fn watch_mode_meaning(mode: DodWatchMode) -> &'static str {
+    match mode {
+        DodWatchMode::Off => "keine Hinweise, keine Triage",
+        DodWatchMode::Notify => "nur Hinweise, keine Triage",
+        DodWatchMode::Triage => "Hinweise und automatische Triage",
+        // `DodWatchMode` is `#[non_exhaustive]`.
+        _ => "unbekannter Modus",
+    }
+}
+
+// `triage-model`: the model, or the notify fallback (WARN only while triage
+// is requested; there is never a fallback to the session model).
+fn triage_model_check(settings: &TriageSettings) -> DoctorCheck {
+    const ID: &str = "triage-model";
+    match (&settings.model, settings.watch_mode) {
+        (Some(model), _) => check(ID, CheckLevel::Ok, model),
+        (None, DodWatchMode::Triage) => check(
+            ID,
+            CheckLevel::Warn,
+            format!(
+                "{NO_TRIAGE_MODEL_NOTE} (kein Rückfall auf das Session-Modell; setzen mit `{TRIAGE_MODEL_HINT}`)"
+            ),
+        ),
+        (None, mode) => check(
+            ID,
+            CheckLevel::Ok,
+            format!(
+                "kein Triage-Modell gesetzt (watch mode {}: keine automatische Triage)",
+                mode.as_str()
+            ),
+        ),
+    }
+}
+
+// `triage-provider`: the provider of the triage model and its locality
+// (shown, never enforced); WARN when the provider is disabled or unknown;
+// `None` without a model.
+fn triage_provider_check(settings: &TriageSettings) -> Option<DoctorCheck> {
+    const ID: &str = "triage-provider";
+    if settings.model.is_none() {
+        return None;
+    }
+    let provider = settings.provider.as_deref().unwrap_or("-");
+    let locality = settings.locality.unwrap_or(TriageLocality::Unknown);
+    let label = locality.label();
+    if settings.provider_enabled == Some(false) {
+        // Catalog-seeded providers start disabled; triage cannot call it.
+        return Some(check(
+            ID,
+            CheckLevel::Warn,
+            format!(
+                "{provider}: {label}, deaktiviert (keine Triage-Aufrufe; aktivieren mit `harw provider enable {provider}`)"
+            ),
+        ));
+    }
+    Some(match locality {
+        TriageLocality::Local => check(
+            ID,
+            CheckLevel::Ok,
+            format!("{provider}: {label} (Loopback oder Unix-Socket)"),
+        ),
+        TriageLocality::Remote => check(
+            ID,
+            CheckLevel::Ok,
+            format!(
+                "{provider}: {label} (Triage-Daten verlassen den Host; angezeigt, nicht erzwungen)"
+            ),
+        ),
+        TriageLocality::Unknown => check(
+            ID,
+            CheckLevel::Warn,
+            format!("{provider}: {label} (kein [providers]-Eintrag oder base_url ohne Host)"),
+        ),
+    })
+}
+
+// `triage-limits`: effort, max_tokens and max_parallel of `[dod.triage]`.
+fn triage_limits_check(settings: &TriageSettings) -> DoctorCheck {
+    let effort = settings.effort.as_deref().unwrap_or("Modellvorgabe");
+    let max_tokens = settings.max_tokens.map_or_else(
+        || "Dispatcher-Vorgabe".to_owned(),
+        |tokens| tokens.to_string(),
+    );
+    check(
+        "triage-limits",
+        CheckLevel::Ok,
+        format!(
+            "effort {effort}, max_tokens {max_tokens}, max_parallel {}",
+            settings.max_parallel
+        ),
+    )
+}
+
+// `watch-mode`: the configured mode and what it effectively does once the
+// triage model, its provider (configured and enabled) and the egress
+// allowlist are taken into account.
+fn watch_mode_check(settings: &TriageSettings, egress: &EgressAllowlist<'_>) -> DoctorCheck {
+    let mode = settings.watch_mode;
+    let mut blocked = Vec::new();
+    if mode == DodWatchMode::Triage {
+        if settings.model.is_none() {
+            blocked.push("kein Triage-Modell");
+        }
+        // There is no fallback to another provider or the session model:
+        // a model whose provider has no `[providers]` entry cannot run.
+        if settings.model.is_some() && settings.provider_enabled.is_none() {
+            blocked.push("Provider nicht konfiguriert");
+        }
+        if settings.provider_enabled == Some(false) {
+            blocked.push("Provider deaktiviert");
+        }
+        if matches!(egress, EgressAllowlist::Empty { .. }) {
+            blocked.push("egress_allow_cidrs leer");
+        }
+    }
+    let detail = if !blocked.is_empty() {
+        format!(
+            "{} → effektiv {} ({})",
+            mode.as_str(),
+            DodWatchMode::Notify.as_str(),
+            blocked.join("; ")
+        )
+    } else if mode == DodWatchMode::Triage && matches!(egress, EgressAllowlist::Unknown) {
+        format!("{} (egress_allow_cidrs nicht prüfbar)", mode.as_str())
+    } else {
+        format!(
+            "{} ({})",
+            mode.as_str(),
+            watch_mode_meaning(settings.effective_watch_mode)
+        )
+    };
+    check("watch-mode", CheckLevel::Ok, detail)
+}
+
+/// The PL-100 doctor lines for the DoD triage (WP 1.9) and the egress
+/// allowlist (WP 0.3).
+///
+/// # Description
+/// With `triage` (the settings of the harw configuration, see
+/// [`TriageSettings::from_config`]), in this order:
+/// - `triage-model`: the model; without one WARN
+///   [`NO_TRIAGE_MODEL_NOTE`] while `[dod.watch] mode = "triage"` (there is
+///   no fallback to the session model), else OK.
+/// - `triage-provider` (only with a model): provider and locality
+///   `lokal`/`remote` (OK, shown but not enforced) or `unbekannt` (WARN);
+///   WARN `… deaktiviert` when the provider has `enabled = false`.
+/// - `triage-limits`: `effort`, `max_tokens`, `max_parallel` (OK).
+/// - `triage-egress`: the egress allowlist of the active `/etc/harw-dod`
+///   profile; WARN [`EGRESS_BLOCKED_NOTE`] while it is empty (or there is
+///   no valid active profile) and triage is requested, WARN "nicht
+///   prüfbar" when the system config is unreadable.
+/// - `watch-mode`: configured mode and the effective one (`triage → effektiv
+///   notify (…)` without a model, with an unconfigured or disabled provider
+///   or with an empty allowlist), OK.
+/// - `watch-connect`: `[dod.watch] autoconnect` (OK).
+/// - `approve-tty`: `[dod.approve] tui_tty`, labelled [`TUI_TTY_NOTE`]
+///   while on (OK).
+///
+/// Without `triage` (the harw configuration is not available): one WARN
+/// `triage-config` ([`TRIAGE_CONFIG_UNKNOWN`]) and `triage-egress` as if
+/// triage were requested (the default mode), see
+/// [`triage_checks_without_config`]. No check here is ever MISS, so
+/// [`DoctorReport::passed`] and the exit code of `harw dod doctor` do not
+/// depend on them.
+///
+/// # Arguments
+/// - `triage` (`Option<&TriageSettings>`): the DoD settings, `None` when
+///   the harw configuration could not be read.
+/// - `config` (`&ConfigReport`): the system configuration report of the
+///   snapshot (`DodStatus::config`).
+///
+/// # Returns
+/// The checks in display order; details are escaped and bounded.
+///
+/// # Examples
+/// ```rust
+/// use std::collections::HashMap;
+/// use std::path::PathBuf;
+///
+/// use harw_config::DodSection;
+/// use harw_dod_client::ConfigReport;
+/// use harw_ops::dod::{CheckLevel, EGRESS_BLOCKED_NOTE, triage_checks};
+/// use harw_ops::dod_model::{NO_TRIAGE_MODEL_NOTE, TriageSettings};
+///
+/// let settings = TriageSettings::from_config(&DodSection::default(), &HashMap::new());
+/// let config = ConfigReport::Missing { path: PathBuf::from("/etc/harw-dod/config.toml") };
+/// let checks = triage_checks(Some(&settings), &config);
+/// assert!(checks.iter().any(|c| c.id == "triage-model"
+///     && c.level == CheckLevel::Warn
+///     && c.detail.contains(NO_TRIAGE_MODEL_NOTE)));
+/// assert!(checks.iter().any(|c| c.id == "triage-egress"
+///     && c.detail.contains(EGRESS_BLOCKED_NOTE)));
+/// assert!(checks.iter().all(|c| c.level != CheckLevel::Miss));
+/// ```
+#[must_use]
+pub fn triage_checks(triage: Option<&TriageSettings>, config: &ConfigReport) -> Vec<DoctorCheck> {
+    let Some(settings) = triage else {
+        return triage_checks_without_config(TRIAGE_CONFIG_UNKNOWN, config);
+    };
+    let egress = egress_allowlist(config);
+    let mut checks = vec![triage_model_check(settings)];
+    checks.extend(triage_provider_check(settings));
+    checks.push(triage_limits_check(settings));
+    checks.push(egress_check(&egress, Some(settings.watch_mode)));
+    checks.push(watch_mode_check(settings, &egress));
+    checks.push(if settings.autoconnect {
+        check(
+            "watch-connect",
+            CheckLevel::Ok,
+            "autoconnect an: harw-dod-watch verbindet sich beim Start mit dem Gateway",
+        )
+    } else {
+        check(
+            "watch-connect",
+            CheckLevel::Ok,
+            "autoconnect aus: harw-dod-watch verbindet sich nicht von selbst mit dem Gateway",
+        )
+    });
+    checks.push(if settings.tui_tty {
+        check(
+            "approve-tty",
+            CheckLevel::Ok,
+            format!("tui_tty an: {TUI_TTY_NOTE} (Kill und Isolation nur über Freigabe A oder B)"),
+        )
+    } else {
+        check(
+            "approve-tty",
+            CheckLevel::Ok,
+            "tui_tty aus: jeder Eingriff nur über Freigabe A oder B mit vertrauenswürdiger Anzeige",
+        )
+    });
+    checks
+}
+
+/// The triage lines when the DoD settings are not available: one WARN
+/// `triage-config` with `detail` and the `triage-egress` line as if triage
+/// were requested (the default mode; the system configuration is still
+/// read).
+///
+/// # Arguments
+/// - `detail` (`&str`): why the settings are missing, e.g.
+///   [`TRIAGE_CONFIG_UNKNOWN`], [`TRIAGE_CONFIG_NO_HOME`] or, for `sudo harw
+///   dod doctor`, [`TRIAGE_CONFIG_SUDO`].
+/// - `config` (`&ConfigReport`): the system configuration report of the
+///   snapshot.
+///
+/// # Returns
+/// `[triage-config, triage-egress]`; never MISS.
+///
+/// # Examples
+/// ```rust
+/// use std::path::PathBuf;
+///
+/// use harw_dod_client::ConfigReport;
+/// use harw_ops::dod::{CheckLevel, TRIAGE_CONFIG_SUDO, triage_checks_without_config};
+///
+/// let config = ConfigReport::Missing { path: PathBuf::from("/etc/harw-dod/config.toml") };
+/// let checks = triage_checks_without_config(TRIAGE_CONFIG_SUDO, &config);
+/// let ids: Vec<&str> = checks.iter().map(|c| c.id.as_str()).collect();
+/// assert_eq!(ids, ["triage-config", "triage-egress"]);
+/// assert!(checks.iter().all(|c| c.level == CheckLevel::Warn));
+/// ```
+#[must_use]
+pub fn triage_checks_without_config(detail: &str, config: &ConfigReport) -> Vec<DoctorCheck> {
+    vec![
+        check("triage-config", CheckLevel::Warn, detail),
+        egress_check(&egress_allowlist(config), None),
+    ]
+}
+
+/// [`doctor`] plus the PL-100 triage lines of [`triage_checks`], appended
+/// after the suite checks and counted in.
+///
+/// # Arguments
+/// - `env`, `snapshot`: as for [`doctor`].
+/// - `triage` (`Option<&TriageSettings>`): the DoD settings of the harw
+///   configuration; `None` when it could not be read (the report says so).
+///
+/// # Returns
+/// The report; its [`DoctorReport::passed`] equals that of [`doctor`]
+/// (the triage lines are never MISS).
+#[must_use]
+pub fn doctor_with_triage(
+    env: &DoctorEnv,
+    snapshot: &DodSnapshot,
+    triage: Option<&TriageSettings>,
+) -> DoctorReport {
+    let mut checks = doctor(env, snapshot).checks;
+    checks.extend(triage_checks(triage, &snapshot.status.config));
+    report_from(checks)
+}
+
+// The DoD settings for `/dod doctor`, re-read from disk like `/dod model
+// show`: the bound home and its active profile only, the layers
+// `[dod.triage]` and its provider count from (threats B14/B15), never the
+// session's project layer. `None` without a bound home or with an unreadable
+// configuration (the detail may name paths, so it goes to `debug` only).
+fn doctor_triage_settings(ctx: &OpContext) -> Option<TriageSettings> {
+    let settings =
+        crate::config_util::bound_home(ctx).and_then(crate::dod_model::bound_triage_settings);
+    match settings {
+        Ok(settings) => Some(settings),
+        Err(error) => {
+            tracing::debug!(error = %error, "dod doctor: harw configuration unavailable");
+            None
+        }
     }
 }
 
@@ -2785,7 +3230,7 @@ impl harw_operations::FromRawArgs for DodCommandArgs {
 }
 
 /// A parsed `/dod` subcommand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DodCommand {
     Status,
     Findings(usize),
@@ -2793,6 +3238,8 @@ enum DodCommand {
     Doctor,
     ConfigCheck,
     ConfigSuggest,
+    /// `/dod model …` (PL-100 WP 1.9), see [`crate::dod_model`].
+    Model(crate::dod_model::DodModelCommand),
 }
 
 /// Splits `--job <id>` (case kept) off the `/dod` tokens; allowed once
@@ -2825,6 +3272,18 @@ fn split_job_flag(tokens: &[String]) -> Result<(Vec<String>, Option<String>), Op
 }
 
 fn parse_command(tokens: &[String]) -> Result<DodCommand, OpError> {
+    // `model` takes its arguments in their original case (a model reference
+    // is case-sensitive); every other subcommand is matched lower-cased.
+    let trimmed: Vec<&str> = tokens
+        .iter()
+        .map(|token| token.trim())
+        .filter(|token| !token.is_empty())
+        .collect();
+    if let Some((first, rest)) = trimmed.split_first()
+        && first.eq_ignore_ascii_case("model")
+    {
+        return crate::dod_model::parse_model_args(rest).map(DodCommand::Model);
+    }
     let words: Vec<String> = tokens
         .iter()
         .map(|token| token.trim().to_ascii_lowercase())
@@ -2847,13 +3306,17 @@ fn parse_command(tokens: &[String]) -> Result<DodCommand, OpError> {
     }
 }
 
-/// `/dod`: Harw-DoD status, findings, sensor health, doctor and config.
+/// `/dod`: Harw-DoD status, findings, sensor health, doctor, config and the
+/// triage model.
 ///
-/// Read-only; the service control (`enable`, `disable`, `restart`,
-/// `warden …`) exists only as the root-only CLI `harw dod`.
+/// Read-only towards the suite; `model set|clear` only edits `[dod.triage]
+/// model` of the harw home config ([`crate::dod_model`]) and is not
+/// reachable from remote channels (`model` is no channel subcommand). The
+/// service control (`enable`, `disable`, `restart`, `warden …`) exists only
+/// as the root-only CLI `harw dod`.
 #[operation(
     name = "dod",
-    summary = "Harw-DoD: status, findings [n], sensors, doctor, config",
+    summary = "Harw-DoD: status, findings [n], sensors, doctor, config, model",
     domain = "security",
     permission = "operator",
     command(
@@ -2865,7 +3328,11 @@ fn parse_command(tokens: &[String]) -> Result<DodCommand, OpError> {
 )]
 async fn dod_command(ctx: &OpContext, args: DodCommandArgs) -> Result<OpOutput, OpError> {
     let (tokens, job) = split_job_flag(&args.tokens)?;
-    let command = parse_command(&tokens)?;
+    let command = match parse_command(&tokens)? {
+        // Needs neither the snapshot nor systemd: answered from the config.
+        DodCommand::Model(model) => return crate::dod_model::model_command(ctx, &model),
+        command => command,
+    };
     let job = match job {
         Some(raw) => Some(job_filter(ctx, &raw, JobLookup::Operator).await?),
         None => None,
@@ -2882,7 +3349,8 @@ async fn dod_command(ctx: &OpContext, args: DodCommandArgs) -> Result<OpOutput, 
     }
     let snapshot = fetch(ctx).await?;
     let (text, data) = match command {
-        DodCommand::Status | DodCommand::ConfigSuggest => {
+        // `config suggest` and `model` returned above.
+        DodCommand::Status | DodCommand::ConfigSuggest | DodCommand::Model(_) => {
             (status_text(&snapshot), status_view(&snapshot))
         }
         DodCommand::Findings(limit) => {
@@ -2898,7 +3366,8 @@ async fn dod_command(ctx: &OpContext, args: DodCommandArgs) -> Result<OpOutput, 
         }
         DodCommand::Sensors => (sensors_text(&snapshot), sensors_view(&snapshot)),
         DodCommand::Doctor => {
-            let report = doctor(&DoctorEnv::host(), &snapshot);
+            let triage = doctor_triage_settings(ctx);
+            let report = doctor_with_triage(&DoctorEnv::host(), &snapshot, triage.as_ref());
             (doctor_text(&report), doctor_view(&report))
         }
         DodCommand::ConfigCheck => (
@@ -4370,6 +4839,790 @@ mod tests {
         ] {
             assert!(split_job_flag(&tokens(bad)).is_err(), "{bad:?}");
         }
+        Ok(())
+    }
+
+    /// PL-100 WP 1.9: `/dod model …` keeps the case of the reference and
+    /// rejects malformed forms before anything is read or written.
+    #[test]
+    fn model_subcommand_parses_with_the_reference_case_kept() -> TestResult {
+        use crate::dod_model::DodModelCommand;
+        let tokens = |raw: &[&str]| raw.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        for (raw, expected) in [
+            (&["model"][..], DodModelCommand::Show),
+            (&["Model", "show"][..], DodModelCommand::Show),
+            (&["model", "clear"][..], DodModelCommand::Clear),
+            (
+                &[" MODEL ", "set", "OpenRouter/openai/GPT-4o"][..],
+                DodModelCommand::Set("OpenRouter/openai/GPT-4o".to_owned()),
+            ),
+            (
+                &["model", "SET", " local/qwen2.5 "][..],
+                DodModelCommand::Set("local/qwen2.5".to_owned()),
+            ),
+        ] {
+            let (rest, job) = split_job_flag(&tokens(raw)).map_err(ctx_err("split"))?;
+            assert_eq!(job, None);
+            assert_eq!(
+                parse_command(&rest).map_err(ctx_err("parse"))?,
+                DodCommand::Model(expected),
+                "{raw:?}"
+            );
+        }
+        for bad in [
+            &["model", "set"][..],
+            &["model", "set", "noslash"],
+            &["model", "set", "provider/"],
+            &["model", "set", "../x"],
+            &["model", "set", "a/b", "c"],
+            &["model", "clear", "x"],
+            &["model", "show", "x"],
+            &["model", "set", "a/b", "--job", "j"],
+            &["status", "model"],
+        ] {
+            let parsed = split_job_flag(&tokens(bad)).and_then(|(rest, _)| parse_command(&rest));
+            assert!(
+                matches!(parsed, Err(OpError::InvalidArguments(_))),
+                "{bad:?}: {parsed:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A `/dod` context bound to a fresh harw home below `dir`, with a live
+    /// configuration and no DoD service (`/dod model` needs none).
+    fn model_ctx(
+        dir: &Path,
+    ) -> TestResult<(
+        OpContext,
+        Arc<harw_home::ResolvedHomeContext>,
+        crate::live_config::SharedLiveConfig,
+    )> {
+        let home = crate::config_util::test_home_context(dir)?;
+        let (context, live) = model_ctx_for(Arc::clone(&home))?;
+        Ok((context, home, live))
+    }
+
+    /// A `/dod` context bound to `home`, with a live configuration of its
+    /// home and profile and no DoD service.
+    fn model_ctx_for(
+        home: Arc<harw_home::ResolvedHomeContext>,
+    ) -> TestResult<(OpContext, crate::live_config::SharedLiveConfig)> {
+        let config = harw_config::discover_config(&[home.home.clone(), home.profile_dir.clone()])
+            .map_err(ctx("discover"))?;
+        let live = Arc::new(crate::live_config::LiveConfig::new(Arc::new(config)));
+        let mut services = ServiceMap::new();
+        services.insert(home);
+        services.insert(Arc::clone(&live));
+        Ok((crate::knowledge_test_support::op_context(services)?, live))
+    }
+
+    /// Threats B14/B15: a trusted project layer that redefines the triage
+    /// provider changes neither `/dod model show` nor the locality the
+    /// doctor reads; both use the home and the active profile only.
+    #[tokio::test]
+    async fn dod_model_and_doctor_resolve_the_provider_from_home_and_profile_only() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home_path = dir.path().join("home");
+        let repo = dir.path().join("repo");
+        let repo_providers = repo.join(".harw").join("providers");
+        std::fs::create_dir_all(home_path.join("providers")).map_err(ctx("home providers"))?;
+        // No marker: the project root is the directory itself.
+        std::fs::create_dir_all(&repo_providers).map_err(ctx("repository providers"))?;
+        let provider =
+            |base_url: &str| format!("name = \"p\"\napi = \"openai\"\nbase_url = \"{base_url}\"\n");
+        std::fs::write(
+            home_path.join("providers").join("p.toml"),
+            provider("https://api.example.com/v1"),
+        )
+        .map_err(ctx("home provider"))?;
+        std::fs::write(
+            repo_providers.join("p.toml"),
+            provider("http://127.0.0.1:11434/v1"),
+        )
+        .map_err(ctx("repository provider"))?;
+        std::fs::write(
+            home_path.join("config.toml"),
+            "[dod.triage]\nmodel = \"p/m\"\n",
+        )
+        .map_err(ctx("home config"))?;
+        harw_home::trust_project(&home_path, &repo).map_err(ctx("trust repository"))?;
+        let project = harw_home::discover_project(&repo, &[]).map_err(ctx("project"))?;
+        let home = harw_home::ResolvedHomeContext::new(&home_path, "default".to_owned(), project)
+            .map(Arc::new)
+            .map_err(ctx("bind home"))?;
+        let layers =
+            crate::config_util::bound_config_layers(&home).map_err(ctx("session layers"))?;
+        let session = harw_config::discover_config(&layers).map_err(ctx("session config"))?;
+        assert_eq!(
+            crate::dod_model::provider_locality("p", &session.providers),
+            TriageLocality::Local,
+            "precondition: the trusted project layer redefines `p` for the session"
+        );
+
+        let (context, _live) = model_ctx_for(Arc::clone(&home))?;
+        let show = call_command(&context, &["model", "show"])
+            .await
+            .map_err(ctx_err("show"))?;
+        assert!(show.text.contains("p (remote)"), "{}", show.text);
+        let data = show.data.ok_or(TestError::Missing("show data"))?;
+        assert_eq!(data["triage"]["locality"], json!("remote"));
+        let doctor =
+            doctor_triage_settings(&context).ok_or(TestError::Missing("doctor settings"))?;
+        assert_eq!(doctor.model.as_deref(), Some("p/m"));
+        assert_eq!(doctor.locality, Some(TriageLocality::Remote));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dod_model_set_show_and_clear_write_only_the_home_layer() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let (context, home, live) = model_ctx(dir.path())?;
+        std::fs::create_dir_all(home.home.join("providers")).map_err(ctx("providers"))?;
+        std::fs::write(
+            home.home.join("providers").join("local.toml"),
+            "name = \"local\"\napi = \"openai\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n",
+        )
+        .map_err(ctx("provider"))?;
+        let config_path = home.home.join("config.toml");
+        std::fs::write(&config_path, "# operator comment\n").map_err(ctx("seed"))?;
+
+        let set = call_command(&context, &["model", "set", "local/Qwen2.5"])
+            .await
+            .map_err(ctx_err("set"))?;
+        let written = std::fs::read_to_string(&config_path).map_err(ctx("read"))?;
+        assert!(written.contains("# operator comment"), "{written}");
+        assert!(written.contains("model = \"local/Qwen2.5\""), "{written}");
+        assert!(!home.profile_dir.join("config.toml").exists());
+        let data = set.data.ok_or(TestError::Missing("set data"))?;
+        assert_eq!(data["action"], json!("set"));
+        assert_eq!(data["overridden"], json!(false));
+        assert_eq!(data["effective"]["triage"]["locality"], json!("local"));
+        assert_eq!(
+            live.current().dod.triage.model.as_deref(),
+            Some("local/Qwen2.5")
+        );
+
+        let show = call_command(&context, &["model", "show"])
+            .await
+            .map_err(ctx_err("show"))?;
+        assert!(show.text.contains("local (lokal)"), "{}", show.text);
+        let data = show.data.ok_or(TestError::Missing("show data"))?;
+        assert_eq!(data["action"], json!("show"));
+        assert_eq!(data["triage"]["model"], json!("local/Qwen2.5"));
+        assert_eq!(data["watch"]["effective_config"], json!("triage"));
+
+        let clear = call_command(&context, &["model", "clear"])
+            .await
+            .map_err(ctx_err("clear"))?;
+        assert!(
+            clear.text.contains(crate::dod_model::NO_TRIAGE_MODEL_NOTE),
+            "{}",
+            clear.text
+        );
+        let cleared = std::fs::read_to_string(&config_path).map_err(ctx("read cleared"))?;
+        assert!(!cleared.contains("Qwen2.5"), "{cleared}");
+        assert!(cleared.contains("# operator comment"), "{cleared}");
+        assert_eq!(live.current().dod.triage.model, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dod_model_reports_the_profile_precedence() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let (context, home, live) = model_ctx(dir.path())?;
+        std::fs::create_dir_all(&home.profile_dir).map_err(ctx("profile"))?;
+        std::fs::write(
+            home.profile_dir.join("config.toml"),
+            "[dod.triage]\nmodel = \"profile/model\"\n",
+        )
+        .map_err(ctx("profile config"))?;
+        let set = call_command(&context, &["model", "set", "local/x"])
+            .await
+            .map_err(ctx_err("set"))?;
+        assert!(
+            set.text.contains("active profile takes precedence"),
+            "{}",
+            set.text
+        );
+        let data = set.data.ok_or(TestError::Missing("set data"))?;
+        assert_eq!(data["overridden"], json!(true));
+        assert_eq!(data["effective"]["triage"]["model"], json!("profile/model"));
+        assert_eq!(data["effective"]["triage"]["locality"], json!("unknown"));
+        assert_eq!(
+            live.current().dod.triage.model.as_deref(),
+            Some("profile/model")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dod_model_rejects_bad_input_and_needs_a_bound_home() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let (context, home, _live) = model_ctx(dir.path())?;
+        let config_path = home.home.join("config.toml");
+        let seed = "[dod.triage]\nmodel = \"local/keep\" # chosen by hand\n";
+        std::fs::write(&config_path, seed).map_err(ctx("seed"))?;
+        for tokens in [
+            &["model", "set", "noslash"][..],
+            &["model", "set", "local/a b"],
+            &["model", "set", "a/b", "extra"],
+            &["model", "set"],
+            &["model", "clear", "now"],
+        ] {
+            let result = call_command(&context, tokens).await;
+            match result {
+                Err(OpError::InvalidArguments(message)) => {
+                    assert!(!message.contains("noslash"), "{message}");
+                }
+                other => return Err(TestError::Unexpected(format!("{tokens:?}: {other:?}"))),
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(&config_path).map_err(ctx("after"))?,
+            seed
+        );
+        let unbound = op_ctx(fixture_snapshot()?)?;
+        for tokens in [
+            &["model"][..],
+            &["model", "set", "local/x"],
+            &["model", "clear"],
+        ] {
+            let result = call_command(&unbound, tokens).await;
+            assert!(
+                matches!(result, Err(OpError::NotAvailable(_))),
+                "{tokens:?}: {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `/dod model` is human-only: no channel subcommand and no model tool.
+    #[test]
+    fn dod_model_is_neither_a_channel_subcommand_nor_a_model_tool() -> TestResult {
+        let adapters =
+            harw_operations::adapter::CommandAdapter::from_operation(Arc::new(DodCommandOperation));
+        let first = adapters
+            .first()
+            .ok_or(TestError::Missing("dod command adapter"))?;
+        assert!(first.allows_channel_invocation(&["status".to_owned()]));
+        for adapter in &adapters {
+            for raw in [
+                &["model"][..],
+                &["model", "show"],
+                &["model", "set", "local/x"],
+                &["model", "clear"],
+            ] {
+                let args: Vec<String> = raw.iter().map(|arg| (*arg).to_owned()).collect();
+                assert!(!adapter.allows_channel_invocation(&args), "{raw:?}");
+            }
+        }
+        let mut registry = harw_operations::registry::OperationRegistry::new();
+        crate::register_all(&mut registry);
+        assert!(registry.find_by_name("dod.model").is_none());
+        assert!(!DOD_MODEL_TOOLS.iter().any(|tool| tool.contains("model")));
+        Ok(())
+    }
+
+    // ── PL-100 WP 1.9 / WP 0.3: doctor triage lines ──
+
+    /// Configured providers by name, from `(name, base_url)` pairs.
+    fn triage_providers(
+        entries: &[(&str, &str)],
+    ) -> TestResult<HashMap<String, harw_config::ProviderToml>> {
+        let mut map = HashMap::new();
+        for (name, base_url) in entries {
+            let provider: harw_config::ProviderToml = toml::from_str(&format!(
+                "name = \"{name}\"\napi = \"openai\"\nbase_url = \"{base_url}\"\n"
+            ))
+            .map_err(ctx("provider toml"))?;
+            map.insert((*name).to_owned(), provider);
+        }
+        Ok(map)
+    }
+
+    /// A valid system config whose active profile `harw-jobs` allows
+    /// `cidrs` egress CIDRs.
+    fn profile_config(cidrs: usize) -> ConfigReport {
+        ConfigReport::Valid {
+            path: PathBuf::from("/etc/harw-dod/config.toml"),
+            config_digest: "0123456789abcdef0123".to_owned(),
+            active_profile: Some(ActiveProfile {
+                id: "harw-jobs".to_owned(),
+                scope: ProfileScope::Host,
+                sensors: vec!["tcp-connect".to_owned()],
+                egress_allow_cidrs: cidrs,
+            }),
+        }
+    }
+
+    /// Level and detail of the check `id`.
+    fn triage_line(checks: &[DoctorCheck], id: &str) -> TestResult<(CheckLevel, String)> {
+        checks
+            .iter()
+            .find(|check| check.id == id)
+            .map(|check| (check.level, check.detail.clone()))
+            .ok_or_else(|| TestError::Unexpected(format!("no `{id}` line in {checks:?}")))
+    }
+
+    /// The check `id` of a doctor JSON view.
+    fn view_check<'a>(view: &'a Value, id: &str) -> TestResult<&'a Value> {
+        view.get("checks")
+            .and_then(Value::as_array)
+            .and_then(|checks| {
+                checks
+                    .iter()
+                    .find(|check| check.get("id").and_then(Value::as_str) == Some(id))
+            })
+            .ok_or_else(|| TestError::Unexpected(format!("no `{id}` check in {view}")))
+    }
+
+    /// Defaults (no model, `mode = "triage"`) and an empty allowlist: both
+    /// blocking messages are WARN, the watch is effectively `notify`, and
+    /// `tui_tty` carries its label. Nothing is MISS.
+    #[test]
+    fn doctor_triage_lines_state_both_blocks_and_label_tui_tty() -> TestResult {
+        let settings = TriageSettings::from_config(&DodSection::default(), &HashMap::new());
+        let checks = triage_checks(Some(&settings), &profile_config(0));
+        let ids: Vec<&str> = checks.iter().map(|check| check.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "triage-model",
+                "triage-limits",
+                "triage-egress",
+                "watch-mode",
+                "watch-connect",
+                "approve-tty"
+            ],
+            "no provider line without a model"
+        );
+        let (level, detail) = triage_line(&checks, "triage-model")?;
+        assert_eq!(level, CheckLevel::Warn);
+        assert!(detail.starts_with(NO_TRIAGE_MODEL_NOTE), "{detail}");
+        assert!(
+            detail.contains("kein Rückfall auf das Session-Modell"),
+            "{detail}"
+        );
+        assert!(detail.contains(TRIAGE_MODEL_HINT), "{detail}");
+        let (level, detail) = triage_line(&checks, "triage-egress")?;
+        assert_eq!(level, CheckLevel::Warn);
+        assert_eq!(detail, EGRESS_BLOCKED_NOTE);
+        assert_eq!(
+            EGRESS_BLOCKED_NOTE,
+            "triage blockiert: egress_allow_cidrs leer → effektiv notify"
+        );
+        assert_eq!(
+            triage_line(&checks, "triage-limits")?,
+            (
+                CheckLevel::Ok,
+                "effort Modellvorgabe, max_tokens Dispatcher-Vorgabe, max_parallel 2".to_owned()
+            )
+        );
+        assert_eq!(
+            triage_line(&checks, "watch-mode")?,
+            (
+                CheckLevel::Ok,
+                "triage → effektiv notify (kein Triage-Modell; egress_allow_cidrs leer)".to_owned()
+            )
+        );
+        let (level, detail) = triage_line(&checks, "watch-connect")?;
+        assert_eq!(level, CheckLevel::Ok);
+        assert!(detail.starts_with("autoconnect an"), "{detail}");
+        let (level, detail) = triage_line(&checks, "approve-tty")?;
+        assert_eq!(level, CheckLevel::Ok);
+        assert!(detail.starts_with("tui_tty an: "), "{detail}");
+        assert!(detail.contains(TUI_TTY_NOTE), "{detail}");
+        assert_eq!(TUI_TTY_NOTE, "schwächere Bindung, nur Freeze/Thaw");
+        assert!(checks.iter().all(|check| check.level != CheckLevel::Miss));
+        Ok(())
+    }
+
+    /// A local model, explicit limits and a non-empty allowlist: every line
+    /// is OK and the watch runs triage.
+    #[test]
+    fn doctor_triage_lines_with_a_local_model_and_an_allowlist_are_ok() -> TestResult {
+        let mut dod = DodSection::default();
+        dod.triage.model = Some("local/qwen2.5".to_owned());
+        dod.triage.effort = Some("high".to_owned());
+        dod.triage.max_tokens = Some(4096);
+        let providers = triage_providers(&[("local", "http://127.0.0.1:11434/v1")])?;
+        let settings = TriageSettings::from_config(&dod, &providers);
+        let checks = triage_checks(Some(&settings), &profile_config(2));
+        assert!(
+            checks.iter().all(|check| check.level == CheckLevel::Ok),
+            "{checks:?}"
+        );
+        for (id, detail) in [
+            ("triage-model", "local/qwen2.5"),
+            (
+                "triage-provider",
+                "local: lokal (Loopback oder Unix-Socket)",
+            ),
+            (
+                "triage-limits",
+                "effort high, max_tokens 4096, max_parallel 2",
+            ),
+            (
+                "triage-egress",
+                "egress_allow_cidrs: 2 (Profil `harw-jobs`)",
+            ),
+            ("watch-mode", "triage (Hinweise und automatische Triage)"),
+        ] {
+            assert_eq!(triage_line(&checks, id)?.1, detail, "{id}");
+        }
+
+        dod.watch.autoconnect = false;
+        dod.approve.tui_tty = false;
+        let settings = TriageSettings::from_config(&dod, &providers);
+        let checks = triage_checks(Some(&settings), &profile_config(2));
+        let (level, connect) = triage_line(&checks, "watch-connect")?;
+        assert_eq!(level, CheckLevel::Ok);
+        assert!(connect.starts_with("autoconnect aus"), "{connect}");
+        let (level, tty) = triage_line(&checks, "approve-tty")?;
+        assert_eq!(level, CheckLevel::Ok);
+        assert!(tty.starts_with("tui_tty aus"), "{tty}");
+        assert!(!tty.contains(TUI_TTY_NOTE), "{tty}");
+        Ok(())
+    }
+
+    /// Locality: loopback and Unix sockets are `lokal`, every other host
+    /// `remote` (shown, not enforced: OK), a provider without a usable
+    /// entry `unbekannt` (WARN).
+    #[test]
+    fn doctor_triage_provider_is_lokal_remote_or_unbekannt() -> TestResult {
+        let mut dod = DodSection::default();
+        dod.triage.model = Some("p/m".to_owned());
+        for (base_url, level, lead) in [
+            ("http://127.0.0.1:11434/v1", CheckLevel::Ok, "p: lokal"),
+            ("http://localhost:8080/v1", CheckLevel::Ok, "p: lokal"),
+            // A `localhost` subdomain may resolve through DNS: remote.
+            ("http://foo.localhost/v1", CheckLevel::Ok, "p: remote"),
+            ("http://[::1]:8000/v1", CheckLevel::Ok, "p: lokal"),
+            ("unix:///run/x.sock", CheckLevel::Ok, "p: lokal"),
+            ("https://api.example.com/v1", CheckLevel::Ok, "p: remote"),
+            ("http://10.0.0.5:8000", CheckLevel::Ok, "p: remote"),
+            ("http://", CheckLevel::Warn, "p: unbekannt"),
+        ] {
+            let providers = triage_providers(&[("p", base_url)])?;
+            let settings = TriageSettings::from_config(&dod, &providers);
+            let checks = triage_checks(Some(&settings), &profile_config(1));
+            let (got, detail) = triage_line(&checks, "triage-provider")?;
+            assert_eq!(got, level, "{base_url}: {detail}");
+            assert!(detail.starts_with(lead), "{base_url}: {detail}");
+        }
+        let unconfigured = TriageSettings::from_config(&dod, &HashMap::new());
+        let checks = triage_checks(Some(&unconfigured), &profile_config(1));
+        let (level, detail) = triage_line(&checks, "triage-provider")?;
+        assert_eq!(level, CheckLevel::Warn);
+        assert!(detail.starts_with("p: unbekannt"), "{detail}");
+        assert!(detail.contains("[providers]"), "{detail}");
+        // No `[providers]` entry: triage cannot run (no fallback), the watch
+        // is effectively `notify` even with an allowlist.
+        assert_eq!(
+            triage_line(&checks, "watch-mode")?,
+            (
+                CheckLevel::Ok,
+                "triage → effektiv notify (Provider nicht konfiguriert)".to_owned()
+            )
+        );
+        // A configured provider whose `base_url` names no host is
+        // `unbekannt` but does not block the watch.
+        let hostless = TriageSettings::from_config(&dod, &triage_providers(&[("p", "http://")])?);
+        let checks = triage_checks(Some(&hostless), &profile_config(1));
+        assert_eq!(
+            triage_line(&checks, "watch-mode")?.1,
+            "triage (Hinweise und automatische Triage)"
+        );
+        // Without a triage request the missing provider blocks nothing.
+        let mut quiet = dod.clone();
+        quiet.watch.mode = DodWatchMode::Notify;
+        let quiet = TriageSettings::from_config(&quiet, &HashMap::new());
+        let checks = triage_checks(Some(&quiet), &profile_config(1));
+        assert_eq!(
+            triage_line(&checks, "watch-mode")?.1,
+            "notify (nur Hinweise, keine Triage)"
+        );
+        Ok(())
+    }
+
+    /// A disabled provider (`enabled = false`, the state of every
+    /// catalog-seeded provider) is a WARN with the command that enables it,
+    /// and the watch is effectively `notify`.
+    #[test]
+    fn doctor_triage_flags_a_disabled_provider() -> TestResult {
+        let mut dod = DodSection::default();
+        dod.triage.model = Some("lmstudio/qwen".to_owned());
+        let provider: harw_config::ProviderToml = toml::from_str(
+            "name = \"lmstudio\"\napi = \"openai\"\nbase_url = \"http://127.0.0.1:1234/v1\"\nenabled = false\n",
+        )
+        .map_err(ctx("provider toml"))?;
+        let providers = HashMap::from([("lmstudio".to_owned(), provider)]);
+        let settings = TriageSettings::from_config(&dod, &providers);
+        let checks = triage_checks(Some(&settings), &profile_config(1));
+        let (level, detail) = triage_line(&checks, "triage-provider")?;
+        assert_eq!(level, CheckLevel::Warn);
+        assert!(
+            detail.starts_with("lmstudio: lokal, deaktiviert"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("`harw provider enable lmstudio`"),
+            "{detail}"
+        );
+        assert_eq!(
+            triage_line(&checks, "watch-mode")?.1,
+            "triage → effektiv notify (Provider deaktiviert)"
+        );
+        assert_eq!(triage_line(&checks, "triage-model")?.0, CheckLevel::Ok);
+        Ok(())
+    }
+
+    /// Without settings (unreadable configuration, or `sudo harw dod
+    /// doctor`) only `triage-config` with the given detail and the egress
+    /// line remain.
+    #[test]
+    fn doctor_triage_lines_without_config_name_the_reason() -> TestResult {
+        for detail in [
+            TRIAGE_CONFIG_UNKNOWN,
+            TRIAGE_CONFIG_SUDO,
+            TRIAGE_CONFIG_NO_HOME,
+        ] {
+            let checks = triage_checks_without_config(detail, &profile_config(0));
+            let ids: Vec<&str> = checks.iter().map(|check| check.id.as_str()).collect();
+            assert_eq!(ids, ["triage-config", "triage-egress"]);
+            assert_eq!(
+                triage_line(&checks, "triage-config")?,
+                (CheckLevel::Warn, detail.to_owned())
+            );
+            assert_eq!(
+                triage_line(&checks, "triage-egress")?,
+                (CheckLevel::Warn, EGRESS_BLOCKED_NOTE.to_owned())
+            );
+        }
+        assert_eq!(
+            triage_checks(None, &profile_config(2)),
+            triage_checks_without_config(TRIAGE_CONFIG_UNKNOWN, &profile_config(2))
+        );
+        assert!(TRIAGE_CONFIG_SUDO.contains("ohne sudo"));
+        Ok(())
+    }
+
+    /// The egress line for every system-config state: no valid active
+    /// profile counts as an empty allowlist (blocked), an unreadable config
+    /// is "nicht prüfbar"; without a triage request nothing warns.
+    #[test]
+    fn doctor_triage_egress_covers_every_config_state_and_mode() -> TestResult {
+        let path = || PathBuf::from("/etc/harw-dod/config.toml");
+        let mut dod = DodSection::default();
+        dod.triage.model = Some("local/m".to_owned());
+        // A configured provider, so only the egress allowlist can block.
+        let providers = triage_providers(&[("local", "http://127.0.0.1:11434/v1")])?;
+        let settings = TriageSettings::from_config(&dod, &providers);
+        for (config, reason) in [
+            (profile_config(0), None),
+            (
+                ConfigReport::Valid {
+                    path: path(),
+                    config_digest: "ab".to_owned(),
+                    active_profile: None,
+                },
+                Some("kein active_profile"),
+            ),
+            (
+                ConfigReport::Missing { path: path() },
+                Some("keine gültige"),
+            ),
+            (
+                ConfigReport::Invalid {
+                    path: path(),
+                    reason: "bad".to_owned(),
+                },
+                Some("keine gültige"),
+            ),
+            (
+                ConfigReport::Untrusted {
+                    path: path(),
+                    reason: "symlink".to_owned(),
+                },
+                Some("keine gültige"),
+            ),
+        ] {
+            let checks = triage_checks(Some(&settings), &config);
+            let (level, detail) = triage_line(&checks, "triage-egress")?;
+            assert_eq!(level, CheckLevel::Warn, "{config:?}");
+            assert!(detail.starts_with(EGRESS_BLOCKED_NOTE), "{detail}");
+            match reason {
+                Some(reason) => assert!(detail.contains(reason), "{detail}"),
+                None => assert_eq!(detail, EGRESS_BLOCKED_NOTE),
+            }
+            assert!(!detail.contains("/etc/harw-dod"), "no path: {detail}");
+            assert_eq!(
+                triage_line(&checks, "watch-mode")?.1,
+                "triage → effektiv notify (egress_allow_cidrs leer)"
+            );
+            assert_eq!(triage_line(&checks, "triage-model")?.0, CheckLevel::Ok);
+        }
+
+        let unreadable = ConfigReport::Unreadable {
+            path: path(),
+            reason: "permission denied".to_owned(),
+        };
+        let checks = triage_checks(Some(&settings), &unreadable);
+        let (level, detail) = triage_line(&checks, "triage-egress")?;
+        assert_eq!(level, CheckLevel::Warn);
+        assert!(detail.contains("nicht prüfbar"), "{detail}");
+        assert!(!detail.contains(EGRESS_BLOCKED_NOTE), "{detail}");
+        assert_eq!(
+            triage_line(&checks, "watch-mode")?.1,
+            "triage (egress_allow_cidrs nicht prüfbar)"
+        );
+
+        for (mode, meaning) in [
+            (DodWatchMode::Notify, "notify (nur Hinweise, keine Triage)"),
+            (DodWatchMode::Off, "off (keine Hinweise, keine Triage)"),
+        ] {
+            let mut quiet = DodSection::default();
+            quiet.watch.mode = mode;
+            let settings = TriageSettings::from_config(&quiet, &HashMap::new());
+            let checks = triage_checks(Some(&settings), &profile_config(0));
+            assert!(
+                checks.iter().all(|check| check.level == CheckLevel::Ok),
+                "{checks:?}"
+            );
+            let (_, egress) = triage_line(&checks, "triage-egress")?;
+            assert!(egress.contains("triage bliebe blockiert"), "{egress}");
+            assert!(!egress.contains(EGRESS_BLOCKED_NOTE), "{egress}");
+            let (_, model) = triage_line(&checks, "triage-model")?;
+            assert!(
+                model.starts_with("kein Triage-Modell gesetzt (watch mode"),
+                "{model}"
+            );
+            assert!(!model.contains(NO_TRIAGE_MODEL_NOTE), "{model}");
+            assert_eq!(triage_line(&checks, "watch-mode")?.1, meaning);
+        }
+        Ok(())
+    }
+
+    /// The triage lines are appended after the suite checks; the verdict,
+    /// the MISS count and the JSON keys stay those of `doctor`.
+    #[test]
+    fn doctor_with_triage_appends_lines_without_changing_the_verdict() -> TestResult {
+        let env = DoctorEnv {
+            root: PathBuf::from("/nonexistent/doctor-root"),
+            search_path: None,
+        };
+        let snapshot = fixture_snapshot()?;
+        let base = doctor(&env, &snapshot);
+        let settings = TriageSettings::from_config(&DodSection::default(), &HashMap::new());
+        let full = doctor_with_triage(&env, &snapshot, Some(&settings));
+        assert_eq!(
+            full.checks.get(..base.checks.len()),
+            Some(base.checks.as_slice())
+        );
+        assert_eq!(full.passed(), base.passed());
+        assert_eq!(full.missing, base.missing);
+        assert_eq!(Some(full.warnings), base.warnings.checked_add(2));
+        assert_eq!(Some(full.ok), base.ok.checked_add(4));
+        let keys = |report: &DoctorReport| {
+            let mut keys: Vec<String> = doctor_view(report)
+                .as_object()
+                .map(|object| object.keys().cloned().collect())
+                .unwrap_or_default();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(&full), keys(&base));
+        assert_eq!(keys(&full), ["checks", "missing", "ok", "warnings"]);
+        let view = doctor_view(&full);
+        let egress = view_check(&view, "triage-egress")?;
+        assert_eq!(egress.get("level"), Some(&json!("warn")));
+        assert_eq!(egress.get("detail"), Some(&json!(EGRESS_BLOCKED_NOTE)));
+        let text = doctor_text(&full);
+        assert!(text.contains("WARN triage-model"), "{text}");
+        assert!(text.contains(EGRESS_BLOCKED_NOTE), "{text}");
+        assert!(text.contains(TUI_TTY_NOTE), "{text}");
+
+        let unknown = doctor_with_triage(&env, &snapshot, None);
+        let tail: Vec<&str> = unknown
+            .checks
+            .iter()
+            .skip(base.checks.len())
+            .map(|check| check.id.as_str())
+            .collect();
+        assert_eq!(tail, ["triage-config", "triage-egress"]);
+        assert_eq!(unknown.passed(), base.passed());
+        assert_eq!(Some(unknown.warnings), base.warnings.checked_add(2));
+        Ok(())
+    }
+
+    /// `/dod doctor` reads `[dod]` and the providers of the bound home; a
+    /// context without a home says the settings are unknown.
+    #[tokio::test]
+    async fn dod_doctor_command_shows_the_triage_settings_of_the_bound_home() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = crate::config_util::test_home_context(dir.path())?;
+        std::fs::create_dir_all(home.home.join("providers")).map_err(ctx("providers"))?;
+        std::fs::write(
+            home.home.join("providers").join("cloud.toml"),
+            "name = \"cloud\"\napi = \"openai\"\nbase_url = \"https://api.example.com/v1\"\n",
+        )
+        .map_err(ctx("provider"))?;
+        std::fs::write(
+            home.home.join("config.toml"),
+            "[dod.triage]\nmodel = \"cloud/gpt-x\"\nmax_tokens = 2048\n",
+        )
+        .map_err(ctx("config"))?;
+        let service = DodService::new(Arc::new(FakeBackend {
+            snapshot: fixture_snapshot()?,
+            reads: AtomicUsize::new(0),
+        }));
+        let mut services = ServiceMap::new();
+        services.insert(Arc::new(service));
+        services.insert(Arc::clone(&home));
+        let context = crate::knowledge_test_support::op_context(services)?;
+        let output = call_command(&context, &["doctor"])
+            .await
+            .map_err(ctx_err("/dod doctor"))?;
+        assert!(output.text.contains("summary:"), "{}", output.text);
+        assert!(output.text.contains(EGRESS_BLOCKED_NOTE), "{}", output.text);
+        let view = output.data.ok_or(TestError::Missing("doctor data"))?;
+        let model = view_check(&view, "triage-model")?;
+        assert_eq!(model.get("level"), Some(&json!("ok")));
+        assert_eq!(model.get("detail"), Some(&json!("cloud/gpt-x")));
+        let provider = view_check(&view, "triage-provider")?;
+        assert!(
+            provider
+                .get("detail")
+                .and_then(Value::as_str)
+                .is_some_and(|detail| detail.starts_with("cloud: remote")),
+            "{provider}"
+        );
+        let limits = view_check(&view, "triage-limits")?;
+        assert!(
+            limits
+                .get("detail")
+                .and_then(Value::as_str)
+                .is_some_and(|detail| detail.contains("max_tokens 2048")),
+            "{limits}"
+        );
+        let watch = view_check(&view, "watch-mode")?;
+        assert_eq!(
+            watch.get("detail"),
+            Some(&json!("triage → effektiv notify (egress_allow_cidrs leer)"))
+        );
+        assert!(view_check(&view, "triage-config").is_err());
+
+        let unbound = op_ctx(fixture_snapshot()?)?;
+        let output = call_command(&unbound, &["doctor"])
+            .await
+            .map_err(ctx_err("/dod doctor without a home"))?;
+        let view = output.data.ok_or(TestError::Missing("doctor data"))?;
+        assert_eq!(
+            view_check(&view, "triage-config")?.get("level"),
+            Some(&json!("warn"))
+        );
+        assert!(view_check(&view, "triage-model").is_err());
         Ok(())
     }
 

@@ -3,11 +3,29 @@
 //! A retained ConfigWriter lock covers fresh read, candidate resolution, save and
 //! live publication. Only the selected field is mirrored; other live/session
 //! choices keep their own governed mutation paths. Errors never echo config text.
+//!
+//! PL-100 WP 1.9: `dod.watch.mode` (`off|notify|triage`) is the only DoD key on
+//! the allow-list. `/settings show` also prints the read-only DoD values
+//! (`[dod.triage]` model/effort/max_tokens, the config-only effective watch
+//! mode, `autoconnect` and `[dod.approve] tui_tty`, see
+//! `crate::dod_model::TriageSettings`) as text and under `data.dod`; the triage
+//! model changes only through `/dod model set|clear`, `tui_tty` only in the
+//! config file. The values are the session's; the provider of the triage model
+//! (its locality in `data.dod.triage`) is looked up in the home and the active
+//! profile only (`crate::dod_model::trusted_config`, threat B15), like the
+//! doctor does. The WP 0.3 egress gate is the doctor's
+//! (`crate::dod_model::EGRESS_DOCTOR_HINT`). A DoD key is written only when
+//! `dod` and `dod.watch` are real tables in the profile config:
+//! `ConfigWriter::set_value` would replace an inline table with an empty one
+//! and drop its siblings (e.g. `tui_tty`).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use harw_config::{ConfigError, ConfigWriter, ResolvedConfig, TuiSection, UiLanguage};
+use harw_config::{
+    ConfigError, ConfigWriter, DodWatchMode, ProviderToml, ResolvedConfig, UiLanguage,
+};
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
 use serde_json::json;
@@ -37,15 +55,18 @@ enum Setting {
     Reasoning,
     ChildStream,
     StatusExpiry,
+    /// `[dod.watch] mode` (PL-100 WP 1.9).
+    WatchMode,
 }
 
 impl Setting {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Language,
         Self::Theme,
         Self::Reasoning,
         Self::ChildStream,
         Self::StatusExpiry,
+        Self::WatchMode,
     ];
 
     fn key(self) -> &'static str {
@@ -55,6 +76,7 @@ impl Setting {
             Self::Reasoning => "tui.reasoning",
             Self::ChildStream => "tui.child_stream",
             Self::StatusExpiry => "tui.status_expiry",
+            Self::WatchMode => "dod.watch.mode",
         }
     }
 
@@ -75,10 +97,21 @@ impl Setting {
             Self::Reasoning => vec!["message", "collapsed", "hidden"],
             Self::ChildStream => vec!["orchestrators", "all", "none"],
             Self::StatusExpiry => vec!["consolidate", "hide"],
+            Self::WatchMode => DodWatchMode::ALL
+                .into_iter()
+                .map(DodWatchMode::as_str)
+                .collect(),
         }
     }
 
-    fn value(self, tui: &TuiSection) -> &str {
+    // Whether the key's parent tables must already be real tables (or
+    // absent) before `set_value`/`remove_value` touch them.
+    fn requires_table_parents(self) -> bool {
+        matches!(self, Self::WatchMode)
+    }
+
+    fn value(self, config: &ResolvedConfig) -> &str {
+        let tui = &config.harness.tui;
         match self {
             Self::Language => tui.language.as_str(),
             // Legacy aliases remain valid on disk and in the live config.
@@ -93,22 +126,102 @@ impl Setting {
                 harw_config::StatusExpiryMode::Consolidate => "consolidate",
                 harw_config::StatusExpiryMode::Hide => "hide",
             },
+            Self::WatchMode => config.dod.watch.mode.as_str(),
         }
     }
 
-    fn publish(self, source: &TuiSection, target: &mut TuiSection) {
+    fn publish(self, source: &ResolvedConfig, target: &mut ResolvedConfig) {
+        let (from, to) = (&source.harness.tui, &mut target.harness.tui);
         match self {
-            Self::Language => target.language = source.language,
-            Self::Theme => target.theme.clone_from(&source.theme),
-            Self::Reasoning => target.reasoning = source.reasoning,
-            Self::ChildStream => target.child_stream = source.child_stream,
-            Self::StatusExpiry => target.status_expiry = source.status_expiry,
+            Self::Language => to.language = from.language,
+            Self::Theme => to.theme.clone_from(&from.theme),
+            Self::Reasoning => to.reasoning = from.reasoning,
+            Self::ChildStream => to.child_stream = from.child_stream,
+            Self::StatusExpiry => to.status_expiry = from.status_expiry,
+            Self::WatchMode => target.dod.watch.mode = source.dod.watch.mode,
         }
     }
 }
 
 fn usage() -> OpError {
-    OpError::InvalidArguments("Usage: /settings show | set <tui.language|tui.theme|tui.reasoning|tui.child_stream|tui.status_expiry> <value> | reset <key>".to_owned())
+    OpError::InvalidArguments("Usage: /settings show | set <tui.language|tui.theme|tui.reasoning|tui.child_stream|tui.status_expiry|dod.watch.mode> <value> | reset <key>".to_owned())
+}
+
+// Refusal when a DoD key's parent is an inline table or a plain value in the
+// profile config (writing would drop its sibling keys).
+const INLINE_PARENT: &str = "dod or dod.watch is not a plain table in the profile config; change dod.watch.mode there by hand";
+
+// Whether every parent of `key` in `document` is absent or a real (header or
+// dotted) table, so `set_value`/`remove_value` edit in place instead of
+// replacing an inline table.
+fn table_parents_are_plain(document: &str, key: &str) -> bool {
+    let Ok(document) = document.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    let segments: Vec<&str> = key.split('.').collect();
+    let Some((_, parents)) = segments.split_last() else {
+        return false;
+    };
+    let mut item = document.as_item();
+    for segment in parents {
+        match item.get(*segment) {
+            None => return true,
+            Some(child) if child.is_table() => item = child,
+            Some(_) => return false,
+        }
+    }
+    true
+}
+
+// Read-only DoD lines of `/settings show` (PL-100 WP 1.9).
+fn dod_lines(dod: &crate::dod_model::TriageSettings) -> Vec<String> {
+    let bounded = crate::dod::bounded;
+    // Config-only: an empty `egress_allow_cidrs` (WP 0.3) is the doctor's.
+    let egress = if dod.effective_watch_mode == DodWatchMode::Triage {
+        format!("; {}", crate::dod_model::EGRESS_DOCTOR_HINT)
+    } else {
+        String::new()
+    };
+    let mut lines = vec![format!(
+        "dod.watch.effective_config = {} (read-only{egress})",
+        dod.effective_watch_mode.as_str()
+    )];
+    lines.extend(
+        dod.notes()
+            .into_iter()
+            .map(|note| format!("dod.watch: {note}")),
+    );
+    lines.push(format!(
+        "dod.watch.autoconnect = {} (read-only)",
+        dod.autoconnect
+    ));
+    lines.push(if dod.tui_tty {
+        format!(
+            "dod.approve.tui_tty = true (read-only; {})",
+            crate::dod_model::TUI_TTY_NOTE
+        )
+    } else {
+        "dod.approve.tui_tty = false (read-only)".to_owned()
+    });
+    lines.push(format!(
+        "dod.triage.model = {} (read-only; {})",
+        dod.model
+            .as_deref()
+            .map_or_else(|| "(not set)".to_owned(), bounded),
+        crate::dod_model::TRIAGE_MODEL_HINT
+    ));
+    lines.push(format!(
+        "dod.triage.effort = {} (read-only)",
+        dod.effort
+            .as_deref()
+            .map_or_else(|| "(model default)".to_owned(), bounded)
+    ));
+    lines.push(format!(
+        "dod.triage.max_tokens = {} (read-only)",
+        dod.max_tokens
+            .map_or_else(|| "(dispatcher default)".to_owned(), |n| n.to_string())
+    ));
+    lines
 }
 
 // TOML parse diagnostics can contain source lines, including unrelated secrets.
@@ -165,23 +278,52 @@ fn current(ctx: &OpContext) -> Result<Arc<ResolvedConfig>, OpError> {
     .map_err(config_error)
 }
 
-fn output(tui: &TuiSection) -> OpOutput {
+// The providers of the bound home and its active profile, for the locality
+// of the triage provider in `data.dod` (never a project's, threat B15);
+// empty (locality `unknown`) without a bound home or with an unreadable
+// configuration.
+fn trusted_providers(ctx: &OpContext) -> HashMap<String, ProviderToml> {
+    let Ok(home) = crate::config_util::bound_home(ctx) else {
+        return HashMap::new();
+    };
+    match crate::dod_model::trusted_config(&home.home, &home.profile_dir) {
+        Ok(config) => config.providers,
+        Err(error) => {
+            tracing::debug!(error = %error, "settings: trusted providers unavailable");
+            HashMap::new()
+        }
+    }
+}
+
+fn output(config: &ResolvedConfig, providers: &HashMap<String, ProviderToml>) -> OpOutput {
     let rows: Vec<_> = Setting::ALL
         .into_iter()
         .map(|setting| {
             json!({
-                "key": setting.key(), "value": setting.value(tui), "choices": setting.choices(),
+                "key": setting.key(), "value": setting.value(config), "choices": setting.choices(),
                 "scope": "profile", "apply": "now",
             })
         })
         .collect();
+    let dod = crate::dod_model::TriageSettings::from_config(&config.dod, providers);
+    let mut lines: Vec<String> = Setting::ALL
+        .into_iter()
+        .map(|setting| {
+            format!(
+                "{} = {} (profile, now)",
+                setting.key(),
+                setting.value(config)
+            )
+        })
+        .collect();
+    lines.extend(dod_lines(&dod));
     OpOutput {
-        text: Setting::ALL
-            .into_iter()
-            .map(|setting| format!("{} = {} (profile, now)", setting.key(), setting.value(tui)))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        data: Some(json!({"language": tui.language.as_str(), "rows": rows})),
+        text: lines.join("\n"),
+        data: Some(json!({
+            "language": config.harness.tui.language.as_str(),
+            "rows": rows,
+            "dod": dod.view(),
+        })),
     }
 }
 
@@ -202,7 +344,7 @@ fn handle_settings_with_save(
         if args.key.is_some() || args.value.is_some() {
             return Err(usage());
         }
-        return Ok(output(&current(ctx)?.harness.tui));
+        return Ok(output(&current(ctx)?, &trusted_providers(ctx)));
     }
     let setting = Setting::parse(args.key.as_deref())?;
     match action {
@@ -218,6 +360,11 @@ fn handle_settings_with_save(
     let home = crate::config_util::bound_home(ctx)?;
     let path = home.profile_dir.join("config.toml");
     let mut writer = ConfigWriter::open_locked(&path).map_err(config_error)?;
+    if setting.requires_table_parents()
+        && !table_parents_are_plain(&writer.document(), setting.key())
+    {
+        return Err(OpError::Execution(INLINE_PARENT.to_owned()));
+    }
     match args.value.as_deref() {
         Some(value) => writer
             .set_value(setting.key(), toml_edit::value(value))
@@ -238,12 +385,11 @@ fn handle_settings_with_save(
     candidate.validate().map_err(config_error)?;
     // Resolve/validate reset inheritance before the first persistent change.
     let outcome = save(&writer).map_err(config_error)?;
-    crate::live_config::mirror(ctx, |config| {
-        setting.publish(&candidate.harness.tui, &mut config.harness.tui)
-    });
+    crate::live_config::mirror(ctx, |config| setting.publish(&candidate, config));
+    let providers = trusted_providers(ctx);
     let mut result = match ctx.service::<crate::live_config::SharedLiveConfig>() {
-        Some(live) => output(&live.current().harness.tui),
-        None => output(&candidate.harness.tui),
+        Some(live) => output(&live.current(), &providers),
+        None => output(&candidate, &providers),
     };
     if matches!(
         outcome,
@@ -621,7 +767,8 @@ mod tests {
             .ok_or(crate::test_support::TestError::Missing("settings data"))?;
         assert_eq!(data["language"], "en");
         assert_eq!(data["rows"][1]["value"], "dark");
-        assert_eq!(data["rows"].as_array().map(Vec::len), Some(5));
+        assert_eq!(data["rows"].as_array().map(Vec::len), Some(6));
+        assert_eq!(data["rows"][5]["key"], "dod.watch.mode");
         assert!(!data.to_string().contains("secret-marker"));
         assert!(!data.to_string().contains("private-model"));
         for row in data["rows"]
@@ -647,6 +794,219 @@ mod tests {
                 .iter()
                 .all(|surface| matches!(surface, harw_operations::Surface::Command { .. }))
         );
+        Ok(())
+    }
+
+    /// PL-100 WP 1.9: `dod.watch.mode` is allow-listed with its three
+    /// choices; `/settings show` prints the read-only DoD values.
+    #[test]
+    fn dod_watch_mode_is_allowlisted_and_dod_values_are_shown_read_only() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = crate::config_util::test_home_context(dir.path())?;
+        let (context, live) = fixture(&home)?;
+        let output = command(&context, "show").map_err(ctx("show"))?;
+        assert!(
+            output
+                .text
+                .contains("dod.watch.mode = triage (profile, now)")
+        );
+        assert!(
+            output
+                .text
+                .contains("dod.watch.effective_config = notify (read-only)")
+        );
+        assert!(!output.text.contains(crate::dod_model::EGRESS_DOCTOR_HINT));
+        assert!(output.text.contains(crate::dod_model::NO_TRIAGE_MODEL_NOTE));
+        assert!(output.text.contains(crate::dod_model::TUI_TTY_NOTE));
+        assert!(output.text.contains(crate::dod_model::TRIAGE_MODEL_HINT));
+        let data = output
+            .data
+            .ok_or(crate::test_support::TestError::Missing("settings data"))?;
+        let row = data["rows"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["key"] == "dod.watch.mode"))
+            .ok_or(crate::test_support::TestError::Missing("watch row"))?;
+        assert_eq!(row["value"], "triage");
+        assert_eq!(row["choices"], json!(["off", "notify", "triage"]));
+        assert_eq!(data["dod"]["approve"]["tui_tty"], true);
+        assert_eq!(
+            data["dod"]["approve"]["note"],
+            crate::dod_model::TUI_TTY_NOTE
+        );
+        assert_eq!(data["dod"]["triage"]["model"], serde_json::Value::Null);
+        assert_eq!(data["dod"]["watch"]["effective_config"], "notify");
+
+        command(&context, "set dod.watch.mode notify").map_err(ctx("set"))?;
+        assert_eq!(
+            live.current().dod.watch.mode,
+            harw_config::DodWatchMode::Notify
+        );
+        let path = home.profile_dir.join("config.toml");
+        let content = std::fs::read_to_string(&path).map_err(ctx("read"))?;
+        assert!(content.contains("mode = \"notify\""), "{content}");
+        command(&context, "reset dod.watch.mode").map_err(ctx("reset"))?;
+        assert_eq!(
+            live.current().dod.watch.mode,
+            harw_config::DodWatchMode::Triage
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dod_settings_outside_the_allowlist_are_rejected_and_change_nothing() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = crate::config_util::test_home_context(dir.path())?;
+        std::fs::create_dir_all(&home.profile_dir).map_err(ctx("profile"))?;
+        let path = home.profile_dir.join("config.toml");
+        let source = "[dod.approve]\ntui_tty = true\n";
+        std::fs::write(&path, source).map_err(ctx("seed"))?;
+        let (context, live) = fixture(&home)?;
+        for input in [
+            "set dod.watch.mode auto",
+            "set dod.watch.mode Triage",
+            "set dod.approve.tui_tty false",
+            "set dod.triage.model local/x",
+            "set dod.watch.autoconnect false",
+            "reset dod.triage.model",
+            "reset dod.approve.tui_tty",
+        ] {
+            assert!(command(&context, input).is_err(), "{input}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).map_err(ctx("after"))?,
+            source
+        );
+        assert_eq!(
+            live.current().dod.watch.mode,
+            harw_config::DodWatchMode::Triage
+        );
+        Ok(())
+    }
+
+    /// With header tables the write edits `[dod.watch]` in place: the
+    /// sibling keys `[dod.approve] tui_tty` and `[dod.watch] autoconnect`
+    /// stay, on disk and in the live configuration.
+    #[test]
+    fn dod_watch_mode_keeps_sibling_keys_of_header_tables() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = crate::config_util::test_home_context(dir.path())?;
+        std::fs::create_dir_all(&home.profile_dir).map_err(ctx("profile"))?;
+        let path = home.profile_dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[dod.approve]\ntui_tty = false\n[dod.watch]\nautoconnect = false\n",
+        )
+        .map_err(ctx("seed"))?;
+        let (context, live) = fixture(&home)?;
+        command(&context, "set dod.watch.mode notify").map_err(ctx("set"))?;
+        let content = std::fs::read_to_string(&path).map_err(ctx("read"))?;
+        assert!(content.contains("tui_tty = false"), "{content}");
+        assert!(content.contains("autoconnect = false"), "{content}");
+        assert!(content.contains("mode = \"notify\""), "{content}");
+        let config = harw_config::discover_config(&[home.home.clone(), home.profile_dir.clone()])
+            .map_err(ctx("reread"))?;
+        assert_eq!(config.dod.watch.mode, harw_config::DodWatchMode::Notify);
+        assert!(!config.dod.watch.autoconnect);
+        assert!(!config.dod.approve.tui_tty);
+        let current = live.current();
+        assert_eq!(current.dod.watch.mode, harw_config::DodWatchMode::Notify);
+        assert!(!current.dod.approve.tui_tty);
+        assert!(!current.dod.watch.autoconnect);
+        Ok(())
+    }
+
+    /// `data.dod` looks the triage provider up in home and profile only
+    /// (threat B15), not among the session's providers, which a trusted
+    /// project layer may redefine.
+    #[test]
+    fn dod_view_resolves_the_triage_provider_from_home_and_profile() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = crate::config_util::test_home_context(dir.path())?;
+        std::fs::create_dir_all(home.home.join("providers")).map_err(ctx("providers"))?;
+        std::fs::write(
+            home.home.join("providers").join("p.toml"),
+            "name = \"p\"\napi = \"openai\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n",
+        )
+        .map_err(ctx("provider"))?;
+        std::fs::write(
+            home.home.join("config.toml"),
+            "[dod.triage]\nmodel = \"p/m\"\n",
+        )
+        .map_err(ctx("home config"))?;
+        let (context, live) = fixture(&home)?;
+        let remote: ProviderToml = toml::from_str(
+            "name = \"p\"\napi = \"openai\"\nbase_url = \"https://api.example.com/v1\"\n",
+        )
+        .map_err(ctx("session provider"))?;
+        live.update(|config| {
+            config.providers.insert("p".to_owned(), remote);
+        });
+        let output = command(&context, "show").map_err(ctx("show"))?;
+        let data = output
+            .data
+            .ok_or(crate::test_support::TestError::Missing("settings data"))?;
+        assert_eq!(data["dod"]["triage"]["model"], "p/m");
+        assert_eq!(data["dod"]["triage"]["locality"], "local");
+        assert!(
+            output.text.contains(&format!(
+                "dod.watch.effective_config = triage (read-only; {})",
+                crate::dod_model::EGRESS_DOCTOR_HINT
+            )),
+            "{}",
+            output.text
+        );
+        Ok(())
+    }
+
+    /// `set_value` would replace an inline `dod` table and drop `tui_tty`;
+    /// the write is refused and the file stays byte-identical.
+    #[test]
+    fn dod_watch_mode_refuses_inline_parent_tables() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = crate::config_util::test_home_context(dir.path())?;
+        std::fs::create_dir_all(&home.profile_dir).map_err(ctx("profile"))?;
+        let path = home.profile_dir.join("config.toml");
+        let (context, live) = fixture(&home)?;
+        for source in [
+            "dod = { approve = { tui_tty = false } }\n",
+            "[dod]\nwatch = { autoconnect = false }\n",
+        ] {
+            std::fs::write(&path, source).map_err(ctx("seed"))?;
+            for input in ["set dod.watch.mode off", "reset dod.watch.mode"] {
+                match command(&context, input) {
+                    Err(OpError::Execution(message)) => {
+                        assert_eq!(message, INLINE_PARENT, "{input}");
+                    }
+                    other => {
+                        return Err(crate::test_support::TestError::Unexpected(format!(
+                            "{input}: {other:?}"
+                        )));
+                    }
+                }
+                assert_eq!(
+                    std::fs::read_to_string(&path).map_err(ctx("after"))?,
+                    source
+                );
+            }
+        }
+        assert_eq!(
+            live.current().dod.watch.mode,
+            harw_config::DodWatchMode::Triage
+        );
+        assert!(table_parents_are_plain("", "dod.watch.mode"));
+        assert!(table_parents_are_plain(
+            "[dod.watch]\nmode = 'off'\n",
+            "dod.watch.mode"
+        ));
+        assert!(table_parents_are_plain(
+            "dod.watch.mode = 'off'\n",
+            "dod.watch.mode"
+        ));
+        assert!(!table_parents_are_plain("dod = 1\n", "dod.watch.mode"));
+        assert!(!table_parents_are_plain(
+            "not toml = = \n",
+            "dod.watch.mode"
+        ));
         Ok(())
     }
 }
