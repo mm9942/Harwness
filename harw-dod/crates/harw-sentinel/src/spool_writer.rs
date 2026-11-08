@@ -743,6 +743,8 @@ mod tests {
             events: &evidence.events,
             baselines: &[],
             network_scope: &scope,
+            listener_history: None,
+            rule_config: None,
         };
         let records: Vec<FindingRecord> = run_rules_checked(&ctx_full)
             .iter()

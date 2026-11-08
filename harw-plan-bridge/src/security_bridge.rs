@@ -337,6 +337,8 @@ mod tests {
             events: &events,
             baselines: &[],
             network_scope: &scope,
+            listener_history: None,
+            rule_config: None,
         };
         // `run_rules` wertet seit der Engine-Überarbeitung intern immer
         // `ALL_RULES` aus (kein `&[&dyn Rule]`-Parameter mehr) und liefert

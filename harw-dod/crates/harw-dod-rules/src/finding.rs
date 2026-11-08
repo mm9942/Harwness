@@ -763,6 +763,10 @@ fn known_rule_id(candidate: &str) -> Option<&'static str> {
         crate::rules::EgressFlowRule.id(),
         crate::rules::StructureDriftRule.id(),
         crate::rules::BaselineDeviationRule.id(),
+        crate::rules::ListenerNewRule.id(),
+        crate::rules::ExecWritablePathRule.id(),
+        crate::rules::SensorDegradedRule.id(),
+        crate::rules::PersistenceWriteRule.id(),
         crate::advisory::RULE_ID,
     ]
     .into_iter()
@@ -1756,11 +1760,53 @@ mod tests {
             "egress-flow",
             "structure-drift",
             "baseline-deviation",
+            "listener-new",
+            "exec-writable-path",
+            "sensor-degraded",
+            "persistence-write",
             "advisory-correlate",
         ] {
             assert_eq!(known_rule_id(id), Some(id));
         }
         assert_eq!(known_rule_id("test-rule"), None);
+    }
+
+    /// Jede in `ALL_RULES` registrierte Regel ist auch eine bekannte
+    /// Regel-Kennung — sonst würde jeder Record dieser Regel beim Lesen
+    /// abgelehnt (PL-100 WP1.6).
+    #[test]
+    fn test_every_registered_rule_is_a_known_rule_id() {
+        for rule in crate::rules::ALL_RULES {
+            assert_eq!(known_rule_id(rule.id()), Some(rule.id()), "{}", rule.id());
+        }
+    }
+
+    /// Records der WP1.6-Regeln überstehen die Rundreise über JSON (die
+    /// Deserialisierung prüft die Regel-Kennung).
+    #[test]
+    fn test_record_of_new_rules_survives_json_roundtrip() -> TestResult {
+        for rule_id in [
+            "listener-new",
+            "exec-writable-path",
+            "sensor-degraded",
+            "persistence-write",
+        ] {
+            let record = Finding::raw(
+                known_rule_id(rule_id).ok_or(TestError::Missing("bekannte Regel"))?,
+                FindingKind::RuleTriggered,
+                Severity::High,
+                Hardness::Observed,
+                "new rule summary",
+                Timestamp::UNIX_EPOCH,
+            )
+            .check(FindingId::try_from_str("finding-w16").map_err(ctx("non-empty id"))?)
+            .record(evidence()?);
+            let json = serde_json::to_string(&record).map_err(ctx("record serializes"))?;
+            let back: FindingRecord =
+                serde_json::from_str(&json).map_err(ctx("record of a known rule deserializes"))?;
+            assert_eq!(back, record, "{rule_id}");
+        }
+        Ok(())
     }
 
     #[test]

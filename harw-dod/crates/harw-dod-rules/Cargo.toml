@@ -39,13 +39,19 @@ harw-code-graph = { path = "../../../harw-code-graph" }
 # Version) — siehe `src/advisory.rs` Moduldoku.
 semver = { workspace = true }
 rayon = "1.12.0"
+# PL-100 WP1.6: `ListenerHistory::from_json`/`to_json` (persistierter Zustand
+# der Regel `listener-new`). Die Tests bauen damit außerdem einen
+# `NetworkScope` mit einem `Cidr`-Ziel über dessen öffentliche
+# `Deserialize`-Implementierung (`harw_authority::NetworkScope` bietet keinen
+# anderen öffentlichen Konstruktor für ein `Cidr`-Ziel).
+serde_json = { workspace = true }
+# PL-100 WP0.8/WP1.6: der eine Escaper für angreiferkontrollierten Text
+# (Pfade, `comm`, Sensor-Kennungen) in Befund-Zusammenfassungen. Ring A,
+# Schicht `F`, ohne eigene Abhängigkeiten.
+harw-untrusted-text = { path = "../../../harw-untrusted-text" }
 
 [dev-dependencies]
 harw-test-support = { path = "../../../harw-test-support" }
-# Nur für Tests: baut einen `NetworkScope` mit einem `Cidr`-Ziel über dessen
-# öffentliche `Deserialize`-Implementierung (`harw_authority::NetworkScope`
-# bietet keinen anderen öffentlichen Konstruktor für ein `Cidr`-Ziel).
-serde_json = { workspace = true }
 # Nur für Tests/Doctest: `crate::rules::baseline_deviation` konstruiert dort
 # bequem einen `harw_knowledge::artifact::ArtifactId`, um zu zeigen, dass er
 # `Baseline::new`s `impl std::fmt::Display`-Schranke erfüllt (siehe

@@ -12,10 +12,16 @@
 //!   liefert ihre rohen Befunde (`Finding<Raw>`);
 //!   [`engine::run_rules_checked`] zertifiziert sie zusätzlich mit einer
 //!   stabilen Identität (`Finding<RuleChecked>`).
-//! - Drei konkrete Regeln (Modul [`rules`]): [`rules::EgressFlowRule`],
-//!   [`rules::StructureDriftRule`], [`rules::BaselineDeviationRule`] — siehe
-//!   [`rules`]-Moduldoku für die zwei Regeln, die hier absichtlich fehlen,
-//!   und warum.
+//! - Sieben konkrete Regeln (Modul [`rules`]): [`rules::EgressFlowRule`],
+//!   [`rules::StructureDriftRule`], [`rules::BaselineDeviationRule`] und
+//!   (PL-100 WP1.6) [`rules::ListenerNewRule`],
+//!   [`rules::ExecWritablePathRule`], [`rules::SensorDegradedRule`],
+//!   [`rules::PersistenceWriteRule`] — siehe [`rules`]-Moduldoku.
+//! - Den persistierten Zustand der Regel `listener-new`
+//!   ([`listener_history::ListenerHistory`], Modul [`listener_history`]):
+//!   die Regel liest ihn nur, der Aufrufer lädt, lernt und speichert ihn.
+//! - [`rule::RuleConfig`]: Konfiguration der Regeln (Workspace-Wurzeln,
+//!   zusätzliche Home-Verzeichnisse, flüchtiger Portbereich).
 //! - Den Baseline-Zugriff und die Baseline-Gate-Regel (Modul [`baseline`]).
 //! - Die eine echte Konfidenz-Konvertierung im Baum (Modul [`confidence`]).
 //! - [`advisory::correlate_advisories`] (Modul [`advisory`], Knoten AW7-06):
@@ -62,10 +68,16 @@
 //! unveränderlichen [`rule::RuleContext`] laufen lassen könnte, ohne Sperren.
 //!
 //! # Fehler
-//! Diese Crate definiert keinen eigenen Fehlertyp: jede Operation — Regeln,
-//! Typestate-Übergänge, die Konfidenz-Konvertierung, das Baseline-Gate — ist
-//! total. Wo eine Regel nichts findet, liefert sie einen leeren `Vec`, nie
-//! einen Fehler.
+//! Regeln, die Konfidenz-Konvertierung und das Baseline-Gate sind total. Wo
+//! eine Regel nichts findet, liefert sie einen leeren `Vec`, nie einen
+//! Fehler. Fehlertypen gibt es nur an den Rändern: beim Lesen und Triagieren
+//! eines Records ([`RecordError`], [`TriageError`]), beim Lesen des
+//! persistierten Listener-Zustands ([`ListenerHistoryError`]), beim
+//! Konfigurieren der Regeln ([`RuleConfigError`]) und beim Prüfen
+//! eines Baseline-Satzes ([`check_baselines`], [`BaselineError`]; eine
+//! doppelte Metrik ist ein Fehler, kein „die letzte gewinnt", PL-100 WP1.7 —
+//! die Regel selbst meldet einen solchen Satz als Befund, statt zu
+//! schweigen).
 //!
 //! # Examples
 //! ```rust
@@ -100,6 +112,8 @@
 //!     events: &events,
 //!     baselines: &[],
 //!     network_scope: &scope,
+//!     listener_history: None,
+//!     rule_config: None,
 //! };
 //! let raw = run_rules(&ctx)
 //!     .into_iter()
@@ -163,11 +177,14 @@ pub mod baseline;
 pub mod confidence;
 pub mod engine;
 pub mod finding;
+pub mod listener_history;
 pub mod rule;
 pub mod rules;
 
 pub use advisory::{Advisory, correlate_advisories};
-pub use baseline::{Baseline, PalaceStatus, finding_kind_for_status};
+pub use baseline::{
+    Baseline, BaselineError, PalaceStatus, check_baselines, finding_kind_for_status,
+};
 pub use confidence::epistemic_confidence_for;
 pub use engine::{run_rules, run_rules_checked};
 pub use finding::{
@@ -197,8 +214,15 @@ pub use finding::triage;
 // Invariante.
 #[cfg(any(test, feature = "test-support"))]
 pub use finding::triaged_finding_for_test;
-pub use rule::{Rule, RuleContext};
-pub use rules::{BaselineDeviationRule, EgressFlowRule, StructureDriftRule};
+pub use listener_history::{
+    BindClass, ListenerHistory, ListenerHistoryError, ListenerKey, ListenerOwner, ListenerPort,
+    ListenerProtocol,
+};
+pub use rule::{Rule, RuleConfig, RuleConfigError, RuleContext};
+pub use rules::{
+    BaselineDeviationRule, EgressFlowRule, ExecWritablePathRule, ListenerNewRule,
+    PersistenceWriteRule, SensorDegradedRule, StructureDriftRule,
+};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

@@ -73,6 +73,8 @@
 //!     events: &events,
 //!     baselines: &[],
 //!     network_scope: &scope,
+//!     listener_history: None,
+//!     rule_config: None,
 //! };
 //! assert!(EgressFlowRule.evaluate(&ctx).is_empty(), "docs.rs ist erlaubt");
 //! ```
@@ -205,6 +207,8 @@ mod tests {
             events,
             baselines: &[],
             network_scope: scope,
+            listener_history: None,
+            rule_config: None,
         }
     }
 

@@ -3041,6 +3041,7 @@ dependencies = [
  "harw-research",
  "harw-test-support",
  "harw-types",
+ "harw-untrusted-text",
  "jiff",
  "rayon",
  "semver",

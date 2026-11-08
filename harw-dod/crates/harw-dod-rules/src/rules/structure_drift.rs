@@ -213,6 +213,8 @@ mod tests {
             events: &[],
             baselines,
             network_scope: scope,
+            listener_history: None,
+            rule_config: None,
         }
     }
 
@@ -320,6 +322,8 @@ mod tests {
             events,
             baselines: &[],
             network_scope: scope,
+            listener_history: None,
+            rule_config: None,
         }
     }
 
@@ -500,6 +504,8 @@ mod tests {
             events: &events,
             baselines: &baselines,
             network_scope: &scope,
+            listener_history: None,
+            rule_config: None,
         };
 
         let stamps: Vec<(FindingKind, Timestamp)> = StructureDriftRule

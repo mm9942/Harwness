@@ -345,6 +345,8 @@
 //!     events: &events,
 //!     baselines: &[],
 //!     network_scope: &scope,
+//!     listener_history: None,
+//!     rule_config: None,
 //! };
 //! let findings = run_rules(&ctx);
 //! assert!(findings.iter().any(|finding| finding.rule_id() == EgressFlowRule.id()));

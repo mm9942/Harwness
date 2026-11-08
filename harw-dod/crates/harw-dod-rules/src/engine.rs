@@ -52,6 +52,8 @@
 //!     events: &[],
 //!     baselines: &[],
 //!     network_scope: &scope,
+//!     listener_history: None,
+//!     rule_config: None,
 //! };
 //! assert!(run_rules(&ctx).is_empty());
 //! ```
@@ -127,6 +129,8 @@ pub fn run_rules(ctx: &RuleContext<'_>) -> Vec<Finding<Raw>> {
 ///     events: &events,
 ///     baselines: &[],
 ///     network_scope: &scope,
+///     listener_history: None,
+///     rule_config: None,
 /// };
 /// let checked = run_rules_checked(&ctx);
 /// assert_eq!(checked.len(), 1);
@@ -144,7 +148,10 @@ pub fn run_rules_checked(ctx: &RuleContext<'_>) -> Vec<Finding<RuleChecked>> {
 mod tests {
     use super::*;
     use crate::rule::Rule;
-    use crate::rules::EgressFlowRule;
+    use crate::rules::{
+        EgressFlowRule, ExecWritablePathRule, ListenerNewRule, PersistenceWriteRule,
+        SensorDegradedRule,
+    };
     use harw_authority::NetworkScope;
     use harw_dod_signals::{EventKind, SecurityEvent};
     use harw_types::SensorId;
@@ -157,6 +164,8 @@ mod tests {
             events,
             baselines: &[],
             network_scope: scope,
+            listener_history: None,
+            rule_config: None,
         }
     }
 
@@ -169,13 +178,76 @@ mod tests {
 
     #[test]
     fn test_egress_flow_rule_is_included() {
-        // Keine Exhaustivität, nur ein Rauchtest, dass die Regelliste nicht
-        // leer ist und die Egress-Regel enthält.
-        assert_eq!(ALL_RULES.len(), 3);
+        // Die sieben Regeln (drei aus AW4-03, vier aus PL-100 WP1.6) und
+        // darunter die Egress-Regel.
+        assert_eq!(ALL_RULES.len(), 7);
         assert!(
             ALL_RULES
                 .iter()
                 .any(|rule| rule.id() == EgressFlowRule.id())
+        );
+    }
+
+    /// PL-100 WP1.6: alle vier neuen Regeln laufen über `run_rules` mit.
+    #[test]
+    fn test_wp16_rules_are_registered_with_distinct_ids() {
+        for id in [
+            ListenerNewRule.id(),
+            ExecWritablePathRule.id(),
+            SensorDegradedRule.id(),
+            PersistenceWriteRule.id(),
+        ] {
+            assert!(ALL_RULES.iter().any(|rule| rule.id() == id), "{id}");
+        }
+        let ids: std::collections::BTreeSet<&str> =
+            ALL_RULES.iter().map(|rule| rule.id()).collect();
+        assert_eq!(
+            ids.len(),
+            ALL_RULES.len(),
+            "jede Regel-Kennung ist einmalig"
+        );
+        assert_eq!(crate::rules::all_rules().len(), ALL_RULES.len());
+    }
+
+    /// Ein Zyklus mit Ereignissen aller WP1.6-Regeln: `run_rules` liefert je
+    /// Regel einen Befund (Listener-Historie vorbereitet, Port neu).
+    #[test]
+    fn test_run_rules_includes_wp16_findings() {
+        let scope = NetworkScope::empty();
+        let mut history = crate::listener_history::ListenerHistory::new();
+        history.observe(&[], Timestamp::UNIX_EPOCH);
+        let event = |kind| SecurityEvent {
+            sensor: SensorId::from_str("test-0"),
+            observed_at: Timestamp::UNIX_EPOCH,
+            actor: None,
+            kind,
+        };
+        let events = vec![
+            event(EventKind::ListenerOpened { port: 4444 }),
+            event(EventKind::ProcessExec {
+                path: "/dev/shm/x".to_owned(),
+                argv_digest: harw_types::ContentDigest::of(b"argv"),
+            }),
+            event(EventKind::SensorDegraded {
+                sensor: SensorId::from_str("listener-0"),
+            }),
+            event(EventKind::FileWrite {
+                path: "/etc/ld.so.preload".to_owned(),
+            }),
+        ];
+        let mut ctx = ctx_with(&events, &scope);
+        ctx.listener_history = Some(&history);
+
+        let mut ids: Vec<&str> = run_rules(&ctx).iter().map(|f| f.rule_id()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "exec-writable-path",
+                "listener-new",
+                "persistence-write",
+                "sensor-degraded",
+            ]
         );
     }
 

@@ -747,6 +747,8 @@ pub fn report_findings(
         events: &evidence.events,
         baselines: &[],
         network_scope,
+        listener_history: None,
+        rule_config: None,
     };
 
     let findings = run_rules_checked(&ctx);
@@ -973,6 +975,8 @@ fn attribute_provenance(
             events: std::slice::from_ref(event),
             baselines: &[],
             network_scope,
+            listener_history: None,
+            rule_config: None,
         };
         let raws = run_rules(&ctx);
         if raws.is_empty() {
@@ -1091,6 +1095,8 @@ fn attribute_scopes(
             events: group_events,
             baselines: &[],
             network_scope,
+            listener_history: None,
+            rule_config: None,
         };
         for raw in run_rules(&ctx) {
             pool.push((signature_of!(&raw), path));
@@ -1316,6 +1322,8 @@ mod tests {
             events: &evidence.events,
             baselines: &[],
             network_scope: &scope,
+            listener_history: None,
+            rule_config: None,
         };
         let findings = run_rules_checked(&ctx_full);
         Ok(attribute_scopes(
@@ -1732,6 +1740,8 @@ mod tests {
             events: &evidence.events,
             baselines: &[],
             network_scope: &scope,
+            listener_history: None,
+            rule_config: None,
         };
         Ok(run_rules_checked(&ctx_full))
     }

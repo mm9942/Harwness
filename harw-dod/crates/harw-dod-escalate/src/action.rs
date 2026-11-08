@@ -344,6 +344,8 @@ mod tests {
             events: &events,
             baselines: &[],
             network_scope: &scope,
+            listener_history: None,
+            rule_config: None,
         };
         let raw = run_rules(&ctx)
             .into_iter()
