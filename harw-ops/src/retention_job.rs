@@ -18,14 +18,67 @@
 //! Konfiguration wird bei `apply` nichts gelöscht und die Klasse als
 //! übersprungen gemeldet; der Probelauf meldet immer nur.
 //!
+//! # Store-eigene Klassen (PL-100 WP 2.3)
+//! Klassen, die der Session-Store besitzt
+//! ([`StoreClass::from_id`]: `session_transcripts`,
+//! `session_corrupt_backups`, `freeze_resolved`, `dod_verdicts`), laufen nie
+//! über den generischen Sweeper (`ResolvedClass::sweep`), sondern über
+//! [`retention_sweep`] des Stores, mit dessen Sicherheitsprüfungen:
+//!
+//! - `dod_verdicts`: [`VerdictStore::apply_retention`] mustert nur ganze,
+//!   abgelaufene Segmente des geprüften Präfixes aus und verankert die Kette
+//!   vor dem ersten Löschen neu. Der generische Sweeper bekommt für diese
+//!   Klasse kein Verzeichnis; ohne diese Weiche liefe die 90-Tage-Aufbewahrung
+//!   nie. Ein Override wird abgelehnt (Fehlereintrag, nichts gelöscht). Ein
+//!   Probelauf prüft nur Kette und Grenzwert-Overrides: der Store hat keine
+//!   Plan-API und kann nicht vorhersagen, welche Segmente `apply` ausmustern
+//!   würde. Das Ergebnis sagt dann „unbekannt“ statt 0: im Verzeichnis sind
+//!   `removed_segments` und `removed_records` `null` mit `planned: false`,
+//!   oben sind die beiden Summen `null`.
+//! - `session_transcripts`: nie gelöscht, solange die Sitzungssperre gehalten
+//!   wird, eine Freigabe offen ist oder sich die Datei seit der Planung
+//!   geändert hat. Den `is_attached`-Haken des Stores kennt der Job nicht: eine
+//!   angehängte Sitzung schützt hier allein ihre Sperre. Wurzel ist je Profil
+//!   das Sessions-Verzeichnis, das der Klassen-Resolver liefert.
+//! - `session_corrupt_backups`: nur reguläre, seit der Planung unveränderte
+//!   Dateien.
+//! - `freeze_resolved`: unter der Freeze-Sperre, nie ein `.active.json` und
+//!   kein Record, dessen `.active.json` noch existiert.
+//!
+//! Vor PL-100 WP 2.3 liefen die drei älteren Klassen über den generischen
+//! Sweeper ohne diese Prüfungen; ihre Auswahl (Alter, Anzahl, Bytes,
+//! `keep_newest`) und das Opt-in sind unverändert. Je Verzeichnis ergänzt das
+//! Ergebnis `protected`, `planned`, `removed_segments`, `removed_records` und
+//! `error_messages` (inhaltsfreie Meldungen des Stores, escapt, ohne Pfade
+//! einzelner Dateien, höchstens acht je Verzeichnis); oben stehen
+//! zusätzlich die Summen `removed_segments` und `removed_records`.
+//!
+//! # Fehler im Ergebnis
+//! Scheitert ein Verzeichnis bzw. eine Store-Wurzel als Ganzes (Sperre
+//! belegt, Symlink, I/O, Ablehnung durch den `VerdictStore`), erscheint das
+//! als `error` dieses Verzeichnisses, und der Job läuft weiter, wie im
+//! generischen Pfad: die Löschungen der übrigen Klassen bleiben so im
+//! Ergebnis sichtbar (ein `Failed`-Ausgang trüge nur einen Text). Damit ein
+//! solcher Teilausfall nicht hinter einem erfolgreichen Job verschwindet,
+//! stehen oben die Summen `failed_dirs` (als Ganzes gescheiterte
+//! Verzeichnisse) und `errors` (Einzelfehler aller Verzeichnisse,
+//! Kettenfehler und abgelehnte Overrides eingeschlossen); sind sie nicht 0,
+//! meldet der Job das zusätzlich auf `warn` (nur Zählwerte). Die Summen
+//! `removed*` zählen nur Verzeichnisse ohne `error`.
+//!
 //! # Frist und Abbruch
-//! Die Frist stammt aus der Payload und beginnt mit der Ausführung. Ablauf und
-//! Operator-Abbruch sind unterscheidbar (`timed_out` bzw. `cancelled`); jeder
-//! einzelne Löschvorgang ist unabhängig und idempotent, ein Abbruch lässt also
-//! keinen halben Zustand zurück. Der Abbruch wird zwischen Klassen geprüft; die
-//! Frist zusätzlich vor jedem Löschen (in `harw-retention`).
+//! Die Frist stammt aus der Payload und beginnt mit der Ausführung; eine
+//! Frist, die als [`Instant`] nicht darstellbar ist, wird als ungültige
+//! Payload abgelehnt (`Failed`). Ablauf und Operator-Abbruch sind
+//! unterscheidbar (`timed_out` bzw. `cancelled`); jeder einzelne
+//! Löschvorgang ist unabhängig und idempotent, ein Abbruch lässt also keinen
+//! halben Zustand zurück. Generische und store-eigene Klassen werden gleich
+//! behandelt: der Abbruch wird zwischen Klassen geprüft, die Frist ebenso und
+//! zusätzlich vor jedem Löschen (in `harw-retention` bzw. im Session-Store;
+//! `dod_verdicts` einmal vor dem Store-Schritt). Meldet ein Verzeichnis
+//! `timed_out`, endet der ganze Job als `timed_out`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -34,9 +87,13 @@ use harw_job_runtime::{
     Budget, Job, JobKind, JobOutcome, JobScope, RetryPolicy, StoredJob, WorkId,
 };
 use harw_operations::{OpContext, OpError, OpOutput};
-use harw_retention::{RetentionConfig, RetentionError, Roots, SweepMode, resolve_all};
-use harw_session_store::JobStore;
+use harw_retention::{
+    Report, ResolvedClass, RetentionConfig, RetentionError, Roots, SweepMode, resolve_all,
+};
+use harw_session_store::retention::{StoreClass, StoreSweepReport, retention_sweep};
+use harw_session_store::{FreezeStore, JobStore, VerdictStore};
 use harw_types::{ApprovalActor, Principal};
+use harw_untrusted_text::escape_line;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +107,12 @@ pub const RETENTION_SWEEP_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_SWEEP_DEADLINE_SECS: u64 = 60;
 /// Ein Sweep wird nie automatisch wiederholt.
 const SWEEP_MAX_ATTEMPTS: u32 = 1;
+/// Höchstzahl Fehlermeldungen (`error_messages`) je Verzeichnis im Ergebnis
+/// einer store-eigenen Klasse; der Zähler `errors` bleibt vollständig.
+const MAX_ERROR_MESSAGES_PER_DIR: usize = 8;
+/// Obergrenze in Zeichen für jede Meldung und Verzeichnisangabe im Ergebnis
+/// (nach dem Escapen, siehe [`harw_untrusted_text::escape_line`]).
+const MAX_RESULT_TEXT_CHARS: usize = 1_024;
 
 /// Payload eines `retention_sweep`-Jobs (alle Pfade absolut und beim
 /// Einreihen aufgelöst; der Worker kennt weder Home-Auflösung noch Projekt).
@@ -215,13 +278,48 @@ pub fn enqueue_retention_sweep(
 
 /// Handler-Kern: führt den Sweep aus und liefert das Ergebnis als JSON.
 ///
+/// # Description
+/// Store-eigene Klassen ([`StoreClass::from_id`]) laufen über
+/// [`retention_sweep`] des Session-Stores, alle anderen über den generischen
+/// Sweeper von `harw-retention` (siehe Moduldoku). Ergebnis:
+/// `{mode, removed, removed_bytes, removed_segments, removed_records,
+/// errors, failed_dirs, classes: [{id, kind, dirs: [..]} | {id, kind,
+/// skipped}]}`; `removed_segments`/`removed_records` sind `null`, wenn ein
+/// `dod_verdicts`-Probelauf sie nicht vorhersagen kann.
+///
 /// # Errors
-/// [`MaintenanceFailure`]: ungültige Payload (`Failed`), Abbruch
-/// (`Cancelled`) oder Fristablauf (`TimedOut`). Bereits erfolgte Löschungen
-/// bleiben gültig (jede ist unabhängig und idempotent).
+/// [`MaintenanceFailure`]: ungültige Payload (`Failed`, auch eine Frist
+/// außerhalb des darstellbaren Bereichs), Abbruch (`Cancelled`) oder
+/// Fristablauf (`TimedOut`). Bereits erfolgte Löschungen bleiben gültig
+/// (jede ist unabhängig und idempotent). Der Fehler eines einzelnen
+/// Verzeichnisses bzw. einer Store-Wurzel ist kein Job-Fehler, sondern ein
+/// `error`-Eintrag dieses Verzeichnisses, gezählt in `failed_dirs`.
+///
+/// # Concurrency
+/// Blockierende Datei-I/O; der Aufrufer führt den Kern in `spawn_blocking`
+/// aus ([`run_retention_sweep_job`]).
 pub fn execute_retention_sweep_with_cancel(
     spec: &RetentionSweepSpec,
     cancel: &SweepCancel,
+) -> Result<serde_json::Value, MaintenanceFailure> {
+    // Geprüft statt `+`: `deadline_secs` stammt aus der Payload (jeder `u64`),
+    // eine Überschreitung wäre sonst ein Panic im Blocking-Thread.
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(spec.deadline_secs))
+        .ok_or_else(|| {
+            MaintenanceFailure::Failed(
+                "deadline_secs liegt außerhalb des darstellbaren Bereichs".to_owned(),
+            )
+        })?;
+    execute_until(spec, cancel, deadline)
+}
+
+// Kern von `execute_retention_sweep_with_cancel` mit fester Frist `deadline`
+// (getrennt, damit Tests eine bereits abgelaufene Frist einsetzen können).
+fn execute_until(
+    spec: &RetentionSweepSpec,
+    cancel: &SweepCancel,
+    deadline: Instant,
 ) -> Result<serde_json::Value, MaintenanceFailure> {
     if spec.schema_version != RETENTION_SWEEP_SCHEMA_VERSION {
         return Err(MaintenanceFailure::Failed(format!(
@@ -256,7 +354,6 @@ pub fn execute_retention_sweep_with_cancel(
         })
         .collect();
 
-    let deadline = Instant::now() + Duration::from_secs(spec.deadline_secs);
     let mode = if spec.apply {
         SweepMode::Apply
     } else {
@@ -267,9 +364,7 @@ pub fn execute_retention_sweep_with_cancel(
         project: spec.project.clone(),
     };
     let mut classes = Vec::new();
-    let mut removed = 0_usize;
-    let mut removed_bytes = 0_u64;
-    let mut timed_out = false;
+    let mut totals = SweepCounts::default();
     for class in &selected {
         if cancel.is_cancelled() {
             return Err(MaintenanceFailure::Cancelled(
@@ -277,36 +372,28 @@ pub fn execute_retention_sweep_with_cancel(
             ));
         }
         if Instant::now() >= deadline {
-            timed_out = true;
+            totals.timed_out = true;
             break;
         }
         let id = class.class.id;
         let kind = class.class.kind.as_str();
-        match class.sweep(&roots, mode, Some(deadline), SystemTime::now()) {
-            Ok(outcomes) => {
-                let mut dirs = Vec::new();
-                for outcome in outcomes {
-                    match outcome.result {
-                        Ok(report) => {
-                            removed += report.removed.len();
-                            removed_bytes += report.removed_bytes();
-                            timed_out |= report.timed_out;
-                            dirs.push(serde_json::json!({
-                                "dir": outcome.dir,
-                                "removed": report.removed.len(),
-                                "removed_bytes": report.removed_bytes(),
-                                "kept": report.kept,
-                                "skipped": report.skipped,
-                                "errors": report.errors.len(),
-                                "timed_out": report.timed_out,
-                            }));
-                        }
-                        Err(error) => dirs.push(serde_json::json!({
-                            "dir": outcome.dir,
-                            "error": error.to_string(),
-                        })),
-                    }
-                }
+        // Store-eigene Klassen nie über den generischen Sweeper: ihre
+        // Sicherheitsprüfungen (für `dod_verdicts` die Kette) gehören dem
+        // Session-Store (PL-100 WP 2.3).
+        let swept = match StoreClass::from_id(id) {
+            Some(store_class) => sweep_store_class(
+                &spec.config,
+                class,
+                store_class,
+                &roots,
+                mode,
+                deadline,
+                &mut totals,
+            ),
+            None => sweep_generic_class(class, &roots, mode, deadline, &mut totals),
+        };
+        match swept {
+            Ok(dirs) => {
                 classes.push(serde_json::json!({"id": id, "kind": kind, "dirs": dirs}));
             }
             // Opt-in nicht erteilt oder Klasse abgeschaltet: überspringen,
@@ -328,17 +415,298 @@ pub fn execute_retention_sweep_with_cancel(
             "retention sweep cancelled".to_owned(),
         ));
     }
-    if timed_out {
+    if totals.timed_out {
         return Err(MaintenanceFailure::TimedOut(
             "the retention sweep did not finish in time; the rest stays untouched".to_owned(),
         ));
     }
+    if totals.failed_dirs > 0 || totals.errors > 0 {
+        // Nur Zählwerte: Pfade und Meldungen stehen im Job-Ergebnis.
+        tracing::warn!(
+            failed_dirs = totals.failed_dirs,
+            errors = totals.errors,
+            "retention sweep finished with failures; see the job result"
+        );
+    }
+    let (removed_segments, removed_records) = totals.segment_fields();
     Ok(serde_json::json!({
         "mode": if spec.apply { "apply" } else { "dry_run" },
-        "removed": removed,
-        "removed_bytes": removed_bytes,
+        "removed": totals.removed,
+        "removed_bytes": totals.removed_bytes,
+        "removed_segments": removed_segments,
+        "removed_records": removed_records,
+        "errors": totals.errors,
+        "failed_dirs": totals.failed_dirs,
         "classes": classes,
     }))
+}
+
+// Zählwerte eines Verzeichnisses bzw. die Summen über alle Klassen.
+#[derive(Clone, Copy, Debug, Default)]
+struct SweepCounts {
+    // Entfernte (Probelauf: entfernbare) Dateien.
+    removed: usize,
+    // Deren Bytes zum Planungszeitpunkt.
+    removed_bytes: u64,
+    // `dod_verdicts`: vom `VerdictStore` entfernte Segmente.
+    removed_segments: usize,
+    // `dod_verdicts`: Datensätze in den entfernten, abgelaufenen Segmenten.
+    removed_records: u64,
+    // `removed_segments`/`removed_records` sind unbekannt (ein
+    // `dod_verdicts`-Probelauf: der `VerdictStore` hat keine Plan-API).
+    segments_unplanned: bool,
+    // Einzelfehler (`ItemError`s) der Verzeichnisse, Kettenfehler und
+    // abgelehnte Overrides eingeschlossen.
+    errors: usize,
+    // Verzeichnisse bzw. Store-Wurzeln, deren Sweep als Ganzes scheiterte.
+    failed_dirs: usize,
+    // Die Frist lief ab; der Rest blieb unberührt.
+    timed_out: bool,
+}
+
+impl SweepCounts {
+    // Die Zählwerte eines generischen Verzeichnis-Sweeps.
+    fn of_report(report: &Report) -> Self {
+        Self {
+            removed: report.removed.len(),
+            removed_bytes: report
+                .removed
+                .iter()
+                .fold(0_u64, |sum, removal| sum.saturating_add(removal.bytes)),
+            errors: report.errors.len(),
+            timed_out: report.timed_out,
+            ..Self::default()
+        }
+    }
+
+    // Die Zählwerte eines Store-Sweeps (inklusive Verdict-Segmente);
+    // `segments_planned = false` markiert die Segmentzahlen als unbekannt.
+    fn of_store(report: &StoreSweepReport, segments_planned: bool) -> Self {
+        Self {
+            removed: report.removed.len(),
+            removed_bytes: report
+                .removed
+                .iter()
+                .fold(0_u64, |sum, removal| sum.saturating_add(removal.bytes)),
+            removed_segments: report.removed_segments,
+            removed_records: report.removed_records,
+            segments_unplanned: !segments_planned,
+            errors: report.errors.len(),
+            failed_dirs: 0,
+            timed_out: report.timed_out,
+        }
+    }
+
+    // Ein Verzeichnis, dessen Sweep als Ganzes scheiterte.
+    fn failed_dir(segments_planned: bool) -> Self {
+        Self {
+            segments_unplanned: !segments_planned,
+            failed_dirs: 1,
+            ..Self::default()
+        }
+    }
+
+    // Addiert `other` sättigend auf.
+    fn absorb(&mut self, other: Self) {
+        self.removed = self.removed.saturating_add(other.removed);
+        self.removed_bytes = self.removed_bytes.saturating_add(other.removed_bytes);
+        self.removed_segments = self.removed_segments.saturating_add(other.removed_segments);
+        self.removed_records = self.removed_records.saturating_add(other.removed_records);
+        self.segments_unplanned |= other.segments_unplanned;
+        self.errors = self.errors.saturating_add(other.errors);
+        self.failed_dirs = self.failed_dirs.saturating_add(other.failed_dirs);
+        self.timed_out |= other.timed_out;
+    }
+
+    // `removed_segments` und `removed_records` als JSON: `null`, solange sie
+    // unbekannt sind (nie eine 0, die `apply` widerlegen würde).
+    fn segment_fields(self) -> (serde_json::Value, serde_json::Value) {
+        if self.segments_unplanned {
+            (serde_json::Value::Null, serde_json::Value::Null)
+        } else {
+            (
+                serde_json::Value::from(self.removed_segments),
+                serde_json::Value::from(self.removed_records),
+            )
+        }
+    }
+}
+
+// Eine Klasse über den generischen Sweeper von `harw-retention` (Klassen, die
+// kein Store besitzt). `Err` nur für Opt-in bzw. Abschaltung (aus
+// `ResolvedClass::policy`); Verzeichnisfehler werden zu `error`-Einträgen.
+fn sweep_generic_class(
+    class: &ResolvedClass,
+    roots: &Roots,
+    mode: SweepMode,
+    deadline: Instant,
+    totals: &mut SweepCounts,
+) -> Result<Vec<serde_json::Value>, RetentionError> {
+    let outcomes = class.sweep(roots, mode, Some(deadline), SystemTime::now())?;
+    let mut dirs = Vec::with_capacity(outcomes.len());
+    for outcome in outcomes {
+        match outcome.result {
+            Ok(report) => {
+                let counts = SweepCounts::of_report(&report);
+                totals.absorb(counts);
+                dirs.push(serde_json::json!({
+                    "dir": display_dir(&outcome.dir),
+                    "removed": counts.removed,
+                    "removed_bytes": counts.removed_bytes,
+                    "kept": report.kept,
+                    "skipped": report.skipped,
+                    "errors": counts.errors,
+                    "timed_out": report.timed_out,
+                }));
+            }
+            Err(error) => {
+                totals.absorb(SweepCounts::failed_dir(true));
+                dirs.push(dir_error_json(&outcome.dir, &error));
+            }
+        }
+    }
+    Ok(dirs)
+}
+
+// Eine store-eigene Klasse über `harw_session_store::retention::retention_sweep`
+// je Store-Wurzel ([`store_targets`]).
+//
+// Opt-in und Abschaltung werden vorab einmal geprüft, wie in
+// `ResolvedClass::sweep`: auch eine Klasse ohne Wurzel (kein Profil) erscheint
+// dann als übersprungen. Der Fehler einer einzelnen Wurzel (Sperre belegt,
+// Symlink, I/O, Ablehnung durch den `VerdictStore`) wird zu deren
+// `error`-Eintrag und zählt in `failed_dirs`; die übrigen Wurzeln laufen
+// weiter.
+fn sweep_store_class(
+    config: &RetentionConfig,
+    class: &ResolvedClass,
+    store_class: StoreClass,
+    roots: &Roots,
+    mode: SweepMode,
+    deadline: Instant,
+    totals: &mut SweepCounts,
+) -> Result<Vec<serde_json::Value>, RetentionError> {
+    class.policy(mode, Some(deadline))?;
+    let id = class.class.id;
+    // `resolve_all` hat die Klasse aus genau dieser Tabelle aufgelöst; fehlt
+    // sie, wird nichts angefasst.
+    let cfg = config
+        .class_config(id)
+        .ok_or_else(|| RetentionError::UnknownClass(id.to_owned()))?;
+    // Der Probelauf von `dod_verdicts` prüft nur Kette und Overrides (der
+    // `VerdictStore` hat keine Plan-API): seine Segmentzahlen sind dann
+    // unbekannt, nicht 0. Alle anderen Store-Klassen planen echt.
+    let segments_planned = store_class != StoreClass::DodVerdicts || mode != SweepMode::DryRun;
+    let targets = store_targets(store_class, class, roots);
+    let mut dirs = Vec::with_capacity(targets.len());
+    for target in targets {
+        match retention_sweep(&target.root, store_class, cfg, mode, Some(deadline)) {
+            Ok(report) => {
+                let counts = SweepCounts::of_store(&report, segments_planned);
+                totals.absorb(counts);
+                tracing::debug!(
+                    class = id,
+                    removed = counts.removed,
+                    protected = report.protected.len(),
+                    errors = counts.errors,
+                    removed_segments = counts.removed_segments,
+                    removed_records = counts.removed_records,
+                    planned = segments_planned,
+                    timed_out = counts.timed_out,
+                    "store retention class swept"
+                );
+                dirs.push(store_dir_json(&target.dir, &report, counts));
+            }
+            Err(error) => {
+                tracing::debug!(class = id, error = %error, "store retention root refused");
+                totals.absorb(SweepCounts::failed_dir(segments_planned));
+                dirs.push(dir_error_json(&target.dir, &error));
+            }
+        }
+    }
+    Ok(dirs)
+}
+
+// Eine Wurzel für `retention_sweep` und das Verzeichnis, das das Ergebnis
+// dafür nennt.
+struct StoreTarget {
+    // Wurzel, mit der der besitzende Store gebaut wird.
+    root: PathBuf,
+    // Verzeichnis, das der Store darunter tatsächlich durchsucht.
+    dir: PathBuf,
+}
+
+// Die Store-Wurzeln einer Klasse (siehe `retention_sweep`): die
+// Sessions-Verzeichnisse aus dem Klassen-Resolver (je Profil) für Transkripte
+// und Backups, die Home für Freeze-Records und den `VerdictStore`.
+fn store_targets(
+    store_class: StoreClass,
+    class: &ResolvedClass,
+    roots: &Roots,
+) -> Vec<StoreTarget> {
+    match store_class {
+        StoreClass::SessionTranscripts | StoreClass::SessionCorruptBackups => {
+            (class.class.resolve_dirs)(roots)
+                .into_iter()
+                .map(|dir| StoreTarget {
+                    root: dir.clone(),
+                    dir,
+                })
+                .collect()
+        }
+        StoreClass::FreezeResolved => vec![StoreTarget {
+            root: roots.home.clone(),
+            dir: FreezeStore::new(&roots.home).root().to_path_buf(),
+        }],
+        StoreClass::DodVerdicts => vec![StoreTarget {
+            root: roots.home.clone(),
+            dir: VerdictStore::new(&roots.home).root().to_path_buf(),
+        }],
+    }
+}
+
+// Ergebnis-Eintrag eines Store-Verzeichnisses: die generischen Felder plus
+// `protected`, `planned` (ob `removed_segments`/`removed_records` bekannt
+// sind; sonst `null`), `removed_segments`, `removed_records` und die
+// inhaltsfreien Meldungen (`error_messages`, ohne Pfade einzelner Dateien:
+// Transkriptpfade tragen Session-Ids).
+fn store_dir_json(dir: &Path, report: &StoreSweepReport, counts: SweepCounts) -> serde_json::Value {
+    let error_messages: Vec<String> = report
+        .errors
+        .iter()
+        .take(MAX_ERROR_MESSAGES_PER_DIR)
+        .map(|error| escape_line(&error.message, MAX_RESULT_TEXT_CHARS))
+        .collect();
+    let (removed_segments, removed_records) = counts.segment_fields();
+    serde_json::json!({
+        "dir": display_dir(dir),
+        "removed": counts.removed,
+        "removed_bytes": counts.removed_bytes,
+        "kept": report.kept,
+        "skipped": report.skipped,
+        "protected": report.protected.len(),
+        "errors": counts.errors,
+        "error_messages": error_messages,
+        "timed_out": report.timed_out,
+        "planned": !counts.segments_unplanned,
+        "removed_segments": removed_segments,
+        "removed_records": removed_records,
+    })
+}
+
+// Ergebnis-Eintrag eines Verzeichnisses, dessen Sweep als Ganzes scheiterte.
+fn dir_error_json(dir: &Path, error: &RetentionError) -> serde_json::Value {
+    serde_json::json!({
+        "dir": display_dir(dir),
+        "error": escape_line(&error.to_string(), MAX_RESULT_TEXT_CHARS),
+    })
+}
+
+// Verzeichnisangabe für das Ergebnis: als Text (ein Nicht-UTF-8-Pfad wird
+// verlustbehaftet statt zum Serialisierungsfehler) und escapt, weil
+// Job-Ergebnisse im Terminal landen.
+fn display_dir(dir: &Path) -> String {
+    escape_line(&dir.to_string_lossy(), MAX_RESULT_TEXT_CHARS)
 }
 
 /// Gemeinsamer asynchroner Treiber: Handler-Kern in `spawn_blocking`, Abbruch
@@ -405,27 +773,73 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_retention::ClassConfig;
+    use harw_session_store::{Freeze, NewVerdict, StoredClassification, StoredSeverity};
+    use harw_types::{CgroupId, ContentDigest, FindingId};
 
-    type TestError = Box<dyn std::error::Error>;
-    type TestResult<T = ()> = Result<T, TestError>;
-
+    // Schlägt mit `what` fehl, wenn `condition` nicht gilt.
     fn ensure(condition: bool, what: &str) -> TestResult {
         if condition {
             Ok(())
         } else {
-            Err(what.to_owned().into())
+            Err(TestError::Unexpected(what.to_owned()))
         }
+    }
+
+    // Führt den Handler-Kern ohne Abbruch aus; ein Misserfolg wird zum
+    // Testfehler.
+    fn run(spec: &RetentionSweepSpec) -> TestResult<serde_json::Value> {
+        execute_retention_sweep_with_cancel(spec, &SweepCancel::new())
+            .map_err(|failure| TestError::Unexpected(failure.reason()))
+    }
+
+    // Der Wert unter dem JSON-Pointer `pointer`.
+    fn field<'a>(
+        value: &'a serde_json::Value,
+        pointer: &'static str,
+    ) -> TestResult<&'a serde_json::Value> {
+        value.pointer(pointer).ok_or(TestError::Missing(pointer))
+    }
+
+    // Die Zahl unter dem JSON-Pointer `pointer`.
+    fn number(value: &serde_json::Value, pointer: &'static str) -> TestResult<u64> {
+        field(value, pointer)?
+            .as_u64()
+            .ok_or(TestError::Missing(pointer))
+    }
+
+    // Der Text unter dem JSON-Pointer `pointer`.
+    fn text<'a>(value: &'a serde_json::Value, pointer: &'static str) -> TestResult<&'a str> {
+        field(value, pointer)?
+            .as_str()
+            .ok_or(TestError::Missing(pointer))
+    }
+
+    // Der Ergebnis-Eintrag der Klasse `id`.
+    fn class_entry<'a>(
+        value: &'a serde_json::Value,
+        id: &'static str,
+    ) -> TestResult<&'a serde_json::Value> {
+        field(value, "/classes")?
+            .as_array()
+            .and_then(|classes| {
+                classes
+                    .iter()
+                    .find(|class| class.get("id").and_then(serde_json::Value::as_str) == Some(id))
+            })
+            .ok_or(TestError::Missing(id))
     }
 
     /// `<home>/logs` mit vier `tui.log.N`-Dateien; Klasse `tui_log` auf
     /// `max_files = 1` begrenzt, damit drei fallen würden.
     fn setup() -> TestResult<(tempfile::TempDir, RetentionSweepSpec)> {
-        let home = tempfile::tempdir()?;
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
         let logs = home.path().join("logs");
-        std::fs::create_dir_all(&logs)?;
+        std::fs::create_dir_all(&logs).map_err(ctx("create logs dir"))?;
         for n in 1..=4 {
-            std::fs::write(logs.join(format!("tui.log.{n}")), b"x")?;
+            std::fs::write(logs.join(format!("tui.log.{n}")), b"x")
+                .map_err(ctx("write log file"))?;
         }
         let config = RetentionConfig {
             tui_log: ClassConfig {
@@ -441,16 +855,23 @@ mod tests {
     }
 
     fn count_logs(home: &tempfile::TempDir) -> TestResult<usize> {
-        Ok(std::fs::read_dir(home.path().join("logs"))?.count())
+        Ok(std::fs::read_dir(home.path().join("logs"))
+            .map_err(ctx("list logs dir"))?
+            .count())
     }
 
     #[test]
     fn dry_run_reports_but_deletes_nothing() -> TestResult {
         let (home, spec) = setup()?;
-        let value = execute_retention_sweep_with_cancel(&spec, &SweepCancel::new())
-            .map_err(|failure| failure.reason())?;
-        ensure(value["mode"] == "dry_run", "dry run mode")?;
-        ensure(value["removed"] == 3, "three files would fall")?;
+        let value = run(&spec)?;
+        ensure(text(&value, "/mode")? == "dry_run", "dry run mode")?;
+        ensure(number(&value, "/removed")? == 3, "three files would fall")?;
+        ensure(
+            number(&value, "/removed_segments")? == 0,
+            "a generic class retires no verdict segment",
+        )?;
+        ensure(number(&value, "/errors")? == 0, "no item errors")?;
+        ensure(number(&value, "/failed_dirs")? == 0, "no failed directory")?;
         ensure(count_logs(&home)? == 4, "nothing deleted in a dry run")
     }
 
@@ -458,26 +879,65 @@ mod tests {
     fn apply_deletes_only_what_the_policy_selects() -> TestResult {
         let (home, mut spec) = setup()?;
         spec.apply = true;
-        let value = execute_retention_sweep_with_cancel(&spec, &SweepCancel::new())
-            .map_err(|failure| failure.reason())?;
-        ensure(value["mode"] == "apply", "apply mode")?;
+        let value = run(&spec)?;
+        ensure(text(&value, "/mode")? == "apply", "apply mode")?;
+        // The generic directory entry exists with its own fields ...
+        ensure(
+            number(&value, "/classes/0/dirs/0/removed")? == 3,
+            "the generic directory entry reports its removals",
+        )?;
+        ensure(
+            number(&value, "/classes/0/dirs/0/errors")? == 0,
+            "the generic directory entry reports its errors",
+        )?;
+        // ... and none of the store-only fields.
+        for store_only in [
+            "/classes/0/dirs/0/protected",
+            "/classes/0/dirs/0/planned",
+            "/classes/0/dirs/0/removed_segments",
+            "/classes/0/dirs/0/removed_records",
+            "/classes/0/dirs/0/error_messages",
+        ] {
+            ensure(
+                field(&value, store_only).is_err(),
+                "generic directories keep their shape",
+            )?;
+        }
+        ensure(number(&value, "/failed_dirs")? == 0, "no failed directory")?;
         ensure(count_logs(&home)? == 1, "one file kept")
+    }
+
+    /// Eine Frist, die als `Instant` nicht darstellbar ist (`harw cleanup
+    /// --deadline-secs` nimmt jeden `u64`), ist eine typisierte Ablehnung,
+    /// kein Panic im Blocking-Thread.
+    #[test]
+    fn an_out_of_range_deadline_is_a_typed_failure_and_touches_nothing() -> TestResult {
+        let (home, mut spec) = setup()?;
+        spec.apply = true;
+        spec.deadline_secs = u64::MAX;
+        ensure(
+            matches!(
+                execute_retention_sweep_with_cancel(&spec, &SweepCancel::new()),
+                Err(MaintenanceFailure::Failed(_))
+            ),
+            "an unrepresentable deadline is rejected",
+        )?;
+        ensure(count_logs(&home)? == 4, "nothing touched")
     }
 
     #[test]
     fn security_classes_are_skipped_without_opt_in() -> TestResult {
-        let home = tempfile::tempdir()?;
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
         let mut spec =
             RetentionSweepSpec::new(home.path().to_path_buf(), None, RetentionConfig::default());
         spec.apply = true;
         spec.classes = vec!["session_transcripts".to_owned()];
-        let value = execute_retention_sweep_with_cancel(&spec, &SweepCancel::new())
-            .map_err(|failure| failure.reason())?;
+        let value = run(&spec)?;
         ensure(
-            value["classes"][0]["skipped"].is_string(),
+            field(&value, "/classes/0/skipped")?.is_string(),
             "security class is reported as skipped",
         )?;
-        ensure(value["removed"] == 0, "nothing removed")
+        ensure(number(&value, "/removed")? == 0, "nothing removed")
     }
 
     #[test]
@@ -522,11 +982,16 @@ mod tests {
     #[test]
     fn payload_round_trips_and_rejects_unknown_fields() -> TestResult {
         let (_home, spec) = setup()?;
-        let value = serde_json::to_value(&spec)?;
-        let back: RetentionSweepSpec = serde_json::from_value(value.clone())?;
+        let value = serde_json::to_value(&spec).map_err(ctx("serialize payload"))?;
+        let back: RetentionSweepSpec =
+            serde_json::from_value(value.clone()).map_err(ctx("deserialize payload"))?;
         ensure(back == spec, "round trip")?;
         let mut tampered = value;
-        tampered["extra"] = serde_json::json!(1);
+        let previous = tampered
+            .as_object_mut()
+            .ok_or(TestError::Missing("payload object"))?
+            .insert("extra".to_owned(), serde_json::json!(1));
+        ensure(previous.is_none(), "no `extra` field before tampering")?;
         ensure(
             serde_json::from_value::<RetentionSweepSpec>(tampered).is_err(),
             "unknown field rejected",
@@ -541,5 +1006,592 @@ mod tests {
         assert!(!is_retention_sweep_kind(&JobKind::Custom(
             "memory_maintenance".to_owned()
         )));
+    }
+
+    // ── store-eigene Klassen (PL-100 WP 2.3, Review 4505256692) ─────────────
+
+    // Ein Modell-Verdict zu einem exportierten Befund, verfasst um
+    // `created_at`.
+    fn new_verdict(rationale: &str, created_at: Timestamp) -> TestResult<NewVerdict> {
+        Ok(NewVerdict {
+            finding_id: FindingId::try_from_str("7f1c2a4e-0b8d-4c55-9a1e-3d2f6b7c8e90")
+                .map_err(ctx("finding id"))?,
+            record_digest: ContentDigest::of(b"exported finding record"),
+            classification: StoredClassification::Suspicious,
+            severity: StoredSeverity::High,
+            suggested_response: None,
+            confidence: None,
+            rationale: rationale.to_owned(),
+            model: None,
+            created_at,
+        })
+    }
+
+    // `days` Tage vor `now`.
+    fn days_ago(now: Timestamp, days: i64) -> TestResult<Timestamp> {
+        now.checked_sub(SignedDuration::from_secs(days.saturating_mul(86_400)))
+            .map_err(ctx("timestamp arithmetic"))
+    }
+
+    // Drei Ein-Datensatz-Segmente, 200 und 198 Tage alt und frisch: ein
+    // Segment endet, sobald der nächste Datensatz einen Tag jünger ist als
+    // sein erster.
+    fn verdict_store(home: &Path) -> TestResult<VerdictStore> {
+        let store = VerdictStore::new(home);
+        let now = Timestamp::now();
+        for (rationale, days) in [("reason-0", 200), ("reason-1", 198), ("reason-2", 0)] {
+            store
+                .append(&new_verdict(rationale, days_ago(now, days)?)?)
+                .map_err(ctx("append verdict"))?;
+        }
+        Ok(store)
+    }
+
+    // Die Kettensegmente (`*.jsonl`) des Stores, nach Name (= seq) sortiert.
+    fn verdict_segments(store: &VerdictStore) -> TestResult<Vec<PathBuf>> {
+        let mut out: Vec<PathBuf> = std::fs::read_dir(store.root())
+            .map_err(ctx("list verdict store"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    // `dod_verdicts` mit Opt-in und genau den Grenzen des Stores.
+    fn verdicts_enabled() -> ClassConfig {
+        ClassConfig {
+            enabled: Some(true),
+            ..ClassConfig::default()
+        }
+    }
+
+    // Ein Sweep nur über `dod_verdicts` mit `cfg`.
+    fn verdict_spec(home: &Path, cfg: ClassConfig, apply: bool) -> RetentionSweepSpec {
+        let config = RetentionConfig {
+            dod_verdicts: cfg,
+            ..RetentionConfig::default()
+        };
+        let mut spec = RetentionSweepSpec::new(home.to_path_buf(), None, config);
+        spec.classes = vec!["dod_verdicts".to_owned()];
+        spec.apply = apply;
+        spec
+    }
+
+    // Setzt die mtime von `path` auf `days` Tage vor jetzt.
+    fn age(path: &Path, days: u64) -> TestResult {
+        let then = SystemTime::now()
+            .checked_sub(Duration::from_secs(days.saturating_mul(86_400)))
+            .ok_or(TestError::Missing("a time in the past"))?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(ctx("open for mtime"))?;
+        file.set_modified(then).map_err(ctx("set mtime"))
+    }
+
+    /// Review 4505256692: `harw cleanup --class dod_verdicts --apply` mustert
+    /// die abgelaufenen Segmente über den `VerdictStore` aus (neu verankert,
+    /// nie Datei für Datei), meldet die Zählwerte und der Rest der Kette
+    /// bleibt prüfbar.
+    #[test]
+    fn dod_verdicts_apply_retires_expired_segments_and_the_rest_still_verifies() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let store = verdict_store(home.path())?;
+        let before = verdict_segments(&store)?;
+        assert_eq!(before.len(), 3, "one segment per day-separated record");
+
+        let value = run(&verdict_spec(home.path(), verdicts_enabled(), true))?;
+        assert_eq!(text(&value, "/mode")?, "apply");
+        assert_eq!(text(&value, "/classes/0/id")?, "dod_verdicts");
+        assert_eq!(number(&value, "/removed_segments")?, 2);
+        assert_eq!(number(&value, "/removed_records")?, 2);
+        assert_eq!(number(&value, "/removed")?, 0, "no file-by-file removal");
+        assert_eq!(number(&value, "/errors")?, 0);
+        assert_eq!(number(&value, "/failed_dirs")?, 0);
+        assert_eq!(
+            field(&value, "/classes/0/dirs/0/planned")?.as_bool(),
+            Some(true),
+            "apply reports real counts"
+        );
+        let dirs = field(&value, "/classes/0/dirs")?
+            .as_array()
+            .ok_or(TestError::Missing("dirs"))?;
+        assert_eq!(dirs.len(), 1, "one verdict store below the home");
+        assert_eq!(
+            Some(text(&value, "/classes/0/dirs/0/dir")?),
+            store.root().to_str()
+        );
+        assert_eq!(number(&value, "/classes/0/dirs/0/removed_segments")?, 2);
+        assert_eq!(number(&value, "/classes/0/dirs/0/removed_records")?, 2);
+        assert_eq!(number(&value, "/classes/0/dirs/0/errors")?, 0);
+        assert!(
+            field(&value, "/classes/0/dirs/0/error_messages")?
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "no error messages"
+        );
+
+        let after = verdict_segments(&store)?;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after.first(), before.last(), "the fresh segment stays");
+        assert!(
+            store.root().join("anchor.json").exists(),
+            "the chain is re-anchored, not cut"
+        );
+        let summary = store.verify_chain().map_err(ctx("verify chain"))?;
+        assert_eq!(summary.records, 1);
+        assert_eq!(summary.first_seq, 3);
+
+        // Idempotent: a second run finds nothing more to retire.
+        let again = run(&verdict_spec(home.path(), verdicts_enabled(), true))?;
+        assert_eq!(number(&again, "/removed_segments")?, 0);
+        assert_eq!(verdict_segments(&store)?, after);
+        Ok(())
+    }
+
+    /// Ein Probelauf über alle Klassen (`harw cleanup` ohne `--class`)
+    /// erreicht den `VerdictStore`, prüft die Kette nur und löscht nichts,
+    /// auch mit Opt-in. Der Store hat keine Plan-API: obwohl zwei Segmente
+    /// fällig sind, meldet der Probelauf ihre Zahl als unbekannt (`null`,
+    /// `planned: false`), nie als 0; andere Store-Klassen planen weiter echt.
+    #[test]
+    fn dod_verdicts_dry_run_reaches_the_store_and_deletes_nothing() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let store = verdict_store(home.path())?;
+        let before = verdict_segments(&store)?;
+        let config = RetentionConfig {
+            dod_verdicts: verdicts_enabled(),
+            ..RetentionConfig::default()
+        };
+        let spec = RetentionSweepSpec::new(home.path().to_path_buf(), None, config);
+
+        let value = run(&spec)?;
+        assert_eq!(text(&value, "/mode")?, "dry_run");
+        assert!(
+            field(&value, "/removed_segments")?.is_null(),
+            "unknown, not 0"
+        );
+        assert!(
+            field(&value, "/removed_records")?.is_null(),
+            "unknown, not 0"
+        );
+        assert_eq!(number(&value, "/errors")?, 0);
+        assert_eq!(number(&value, "/failed_dirs")?, 0);
+        let verdicts = class_entry(&value, "dod_verdicts")?;
+        assert_eq!(number(verdicts, "/dirs/0/errors")?, 0, "the chain verifies");
+        assert_eq!(field(verdicts, "/dirs/0/planned")?.as_bool(), Some(false));
+        assert!(field(verdicts, "/dirs/0/removed_segments")?.is_null());
+        assert!(field(verdicts, "/dirs/0/removed_records")?.is_null());
+        let freeze = class_entry(&value, "freeze_resolved")?;
+        assert_eq!(field(freeze, "/dirs/0/planned")?.as_bool(), Some(true));
+        assert_eq!(number(freeze, "/dirs/0/removed_segments")?, 0);
+        assert_eq!(verdict_segments(&store)?, before, "nothing was deleted");
+        assert!(!store.root().join("anchor.json").exists());
+        let summary = store.verify_chain().map_err(ctx("verify chain"))?;
+        assert_eq!(summary.records, 3);
+        Ok(())
+    }
+
+    /// Ohne Opt-in bzw. abgeschaltet wird die Klasse bei `apply`
+    /// übersprungen; der Store wird nicht einmal geöffnet.
+    #[test]
+    fn dod_verdicts_without_opt_in_or_disabled_do_nothing_on_apply() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let store = verdict_store(home.path())?;
+        let before = verdict_segments(&store)?;
+        let disabled = ClassConfig {
+            enabled: Some(false),
+            ..ClassConfig::default()
+        };
+        for cfg in [ClassConfig::default(), disabled] {
+            let value = run(&verdict_spec(home.path(), cfg, true))?;
+            let skipped = text(&value, "/classes/0/skipped")?;
+            assert!(skipped.contains("dod_verdicts"), "{skipped}");
+            assert!(field(&value, "/classes/0/dirs").is_err(), "no store swept");
+            assert_eq!(number(&value, "/removed_segments")?, 0);
+        }
+        assert_eq!(verdict_segments(&store)?, before, "nothing was deleted");
+        assert!(!store.root().join("anchor.json").exists());
+        Ok(())
+    }
+
+    /// Ein Kettenbruch erscheint als inhaltsfreier Fehler des Verzeichnisses
+    /// (Probelauf und `apply`); `apply` mustert nur das geprüfte Präfix davor
+    /// aus, das verletzte Segment bleibt sichtbar, der Job gelingt.
+    #[test]
+    fn dod_verdicts_report_a_broken_chain_content_free() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let store = verdict_store(home.path())?;
+        let second = verdict_segments(&store)?
+            .get(1)
+            .cloned()
+            .ok_or(TestError::Missing("second segment"))?;
+        let original = std::fs::read_to_string(&second).map_err(ctx("read segment"))?;
+        let tampered = original.replacen("reason-1", "reason-X", 1);
+        ensure(tampered != original, "the rationale must be found")?;
+        std::fs::write(&second, tampered).map_err(ctx("tamper segment"))?;
+        let home_text = home.path().to_string_lossy().into_owned();
+
+        let dry = run(&verdict_spec(home.path(), verdicts_enabled(), false))?;
+        assert_eq!(number(&dry, "/errors")?, 1, "visible at the top level");
+        assert_eq!(number(&dry, "/failed_dirs")?, 0);
+        assert_eq!(number(&dry, "/classes/0/dirs/0/errors")?, 1);
+        let dry_message = text(&dry, "/classes/0/dirs/0/error_messages/0")?;
+        assert!(
+            !dry_message.contains("reason"),
+            "content-free: {dry_message}"
+        );
+        assert_eq!(
+            verdict_segments(&store)?.len(),
+            3,
+            "a dry run deletes nothing"
+        );
+
+        let value = run(&verdict_spec(home.path(), verdicts_enabled(), true))?;
+        assert_eq!(
+            number(&value, "/removed_segments")?,
+            1,
+            "verified prefix only"
+        );
+        assert_eq!(number(&value, "/removed_records")?, 1);
+        assert_eq!(number(&value, "/errors")?, 1, "visible at the top level");
+        assert_eq!(number(&value, "/classes/0/dirs/0/errors")?, 1);
+        let message = text(&value, "/classes/0/dirs/0/error_messages/0")?;
+        assert!(message.contains("segment 2"), "{message}");
+        assert!(!message.contains("reason"), "content-free: {message}");
+        assert!(!message.contains(home_text.as_str()), "no path: {message}");
+        assert!(second.exists(), "the broken segment stays visible");
+        Ok(())
+    }
+
+    /// Ein Grenzwert-Override für `dod_verdicts` wird über den Job
+    /// abgelehnt statt ignoriert: Fehlereintrag mit dem Schlüssel, nichts
+    /// gelöscht.
+    #[test]
+    fn dod_verdicts_limit_override_is_refused_through_the_job() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let store = verdict_store(home.path())?;
+        let before = verdict_segments(&store)?;
+        let longer = ClassConfig {
+            // 365 days instead of the store's fixed 90.
+            max_age_secs: Some(31_536_000),
+            ..verdicts_enabled()
+        };
+        let value = run(&verdict_spec(home.path(), longer, true))?;
+        assert_eq!(number(&value, "/removed_segments")?, 0);
+        assert_eq!(number(&value, "/errors")?, 1, "visible at the top level");
+        assert_eq!(number(&value, "/classes/0/dirs/0/errors")?, 1);
+        let message = text(&value, "/classes/0/dirs/0/error_messages/0")?;
+        assert!(message.contains("max_age_secs"), "{message}");
+        assert_eq!(verdict_segments(&store)?, before, "nothing was deleted");
+        Ok(())
+    }
+
+    /// Transkripte laufen über den Store: Wurzel ist das Sessions-Verzeichnis
+    /// des Profils (nicht die Home), und eine gesperrte Sitzung bleibt, wo der
+    /// generische Sweeper sie gelöscht hätte.
+    #[test]
+    fn session_transcripts_route_through_the_store_and_spare_locked_sessions() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let sessions = home
+            .path()
+            .join("profiles")
+            .join("default")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).map_err(ctx("create sessions dir"))?;
+        for id in ["old-gone", "old-locked", "fresh"] {
+            std::fs::write(sessions.join(format!("{id}.jsonl")), b"{}\n")
+                .map_err(ctx("write transcript"))?;
+        }
+        for id in ["old-gone", "old-locked"] {
+            age(&sessions.join(format!("{id}.jsonl")), 400)?;
+        }
+        let held = std::fs::File::create(sessions.join("old-locked.jsonl.lock"))
+            .map_err(ctx("create transcript lock"))?;
+        held.try_lock().map_err(ctx("hold transcript lock"))?;
+
+        let config = RetentionConfig {
+            session_transcripts: ClassConfig {
+                enabled: Some(true),
+                keep_newest: Some(1),
+                ..ClassConfig::default()
+            },
+            ..RetentionConfig::default()
+        };
+        let mut spec = RetentionSweepSpec::new(home.path().to_path_buf(), None, config);
+        spec.classes = vec!["session_transcripts".to_owned()];
+        spec.apply = true;
+        let value = run(&spec)?;
+        held.unlock().map_err(ctx("release transcript lock"))?;
+
+        assert_eq!(
+            Some(text(&value, "/classes/0/dirs/0/dir")?),
+            sessions.to_str()
+        );
+        assert_eq!(number(&value, "/classes/0/dirs/0/removed")?, 1);
+        assert_eq!(
+            number(&value, "/classes/0/dirs/0/protected")?,
+            1,
+            "the locked session"
+        );
+        assert_eq!(number(&value, "/removed")?, 1);
+        assert!(!sessions.join("old-gone.jsonl").exists());
+        assert!(
+            sessions.join("old-locked.jsonl").exists(),
+            "a locked session is never deleted"
+        );
+        assert!(sessions.join("fresh.jsonl").exists());
+        Ok(())
+    }
+
+    /// Review 4505256692: eine abgelehnte Verdict-Retention (ein zweiter
+    /// Schreiber hält die Sperre länger als die Wartezeit des Stores)
+    /// verschwindet nicht hinter einem erfolgreichen Job: `failed_dirs` oben
+    /// zählt sie; nichts wurde gelöscht oder neu verankert.
+    #[test]
+    fn a_refused_dod_verdicts_apply_is_counted_at_the_top_level() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let store = verdict_store(home.path())?;
+        let before = verdict_segments(&store)?;
+        // flock gilt je offener Dateibeschreibung: ein eigener Handle sperrt
+        // auch im selben Prozess gegen den Store.
+        let holder = std::fs::File::options()
+            .write(true)
+            .open(store.root().join(".lock"))
+            .map_err(ctx("open verdict lock"))?;
+        holder.try_lock().map_err(ctx("hold verdict lock"))?;
+        let result = run(&verdict_spec(home.path(), verdicts_enabled(), true));
+        holder.unlock().map_err(ctx("release verdict lock"))?;
+        let value = result?;
+
+        assert_eq!(number(&value, "/failed_dirs")?, 1, "the refused store");
+        assert_eq!(number(&value, "/removed_segments")?, 0);
+        assert_eq!(number(&value, "/removed_records")?, 0);
+        let error = text(&value, "/classes/0/dirs/0/error")?;
+        assert!(error.contains("lock is contended"), "{error}");
+        assert!(!error.contains("reason"), "content-free: {error}");
+        assert_eq!(verdict_segments(&store)?, before, "nothing was deleted");
+        assert!(!store.root().join("anchor.json").exists());
+        Ok(())
+    }
+
+    /// Ein abgebrochener Job mit `dod_verdicts` endet als `Cancelled`, ohne
+    /// den Store anzufassen: alle Segmente bleiben, kein Anker entsteht.
+    #[test]
+    fn a_cancelled_dod_verdicts_apply_leaves_the_chain_untouched() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let store = verdict_store(home.path())?;
+        let before = verdict_segments(&store)?;
+        let cancel = SweepCancel::new();
+        cancel.cancel();
+
+        let outcome = execute_retention_sweep_with_cancel(
+            &verdict_spec(home.path(), verdicts_enabled(), true),
+            &cancel,
+        );
+        assert!(
+            matches!(outcome, Err(MaintenanceFailure::Cancelled(_))),
+            "cancelled"
+        );
+        assert_eq!(verdict_segments(&store)?, before, "nothing was deleted");
+        assert!(!store.root().join("anchor.json").exists());
+        assert_eq!(
+            store.verify_chain().map_err(ctx("verify chain"))?.records,
+            3
+        );
+        Ok(())
+    }
+
+    /// Die Frist gilt für `dod_verdicts` wie für generische Klassen: der Job
+    /// prüft sie vor der Klasse, der Store vor seinem gesperrten Schritt;
+    /// beides endet als `timed_out`, ohne Segment oder Anker anzufassen.
+    #[test]
+    fn an_expired_deadline_leaves_the_verdict_chain_untouched() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let store = verdict_store(home.path())?;
+        let before = verdict_segments(&store)?;
+        let spec = verdict_spec(home.path(), verdicts_enabled(), true);
+
+        // Job level: checked before the class starts.
+        let outcome = execute_until(&spec, &SweepCancel::new(), Instant::now());
+        assert!(
+            matches!(outcome, Err(MaintenanceFailure::TimedOut(_))),
+            "timed out"
+        );
+
+        // Store level: the class runs, the store sees the expired deadline.
+        let class = resolve_all(&spec.config)
+            .into_iter()
+            .find(|class| class.class.id == "dod_verdicts")
+            .ok_or(TestError::Missing("dod_verdicts class"))?;
+        let roots = Roots {
+            home: spec.home.clone(),
+            project: None,
+        };
+        let mut totals = SweepCounts::default();
+        let dirs = sweep_store_class(
+            &spec.config,
+            &class,
+            StoreClass::DodVerdicts,
+            &roots,
+            SweepMode::Apply,
+            Instant::now(),
+            &mut totals,
+        )
+        .map_err(ctx("sweep the verdict class"))?;
+        assert!(totals.timed_out, "the job would end as timed_out");
+        assert_eq!(totals.removed_segments, 0);
+        assert_eq!(totals.failed_dirs, 0);
+        let entry = dirs
+            .first()
+            .ok_or(TestError::Missing("verdict store entry"))?;
+        assert_eq!(
+            entry.get("timed_out").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        assert_eq!(verdict_segments(&store)?, before, "nothing was deleted");
+        assert!(!store.root().join("anchor.json").exists());
+        Ok(())
+    }
+
+    // Der `.resolved.json`-Record des Befunds `finding` unter dem Schlüssel
+    // `cg-1.<finding>.<frozen_at>`.
+    fn resolved_freeze_record(store: &FreezeStore, finding: &str) -> TestResult<PathBuf> {
+        let prefix = format!("cg-1.{finding}.");
+        std::fs::read_dir(store.root())
+            .map_err(ctx("list freeze store"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(prefix.as_str()) && name.ends_with(".resolved.json")
+                    })
+            })
+            .ok_or(TestError::Missing("resolved freeze record"))
+    }
+
+    /// `freeze_resolved` läuft über den Freeze-Store mit der Home als Wurzel
+    /// (Verzeichnis `<home>/freeze`, nicht `<home>/freeze/freeze`): ein alter
+    /// Record fällt, einer mit wieder vorhandenem `.active.json` bleibt
+    /// geschützt (sein Löschen ließe den Freeze wieder aufleben).
+    #[test]
+    fn freeze_resolved_routes_through_the_store_with_the_home_as_root() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let store = FreezeStore::new(home.path());
+        let now = Timestamp::now();
+        let cgroup = CgroupId::try_from_str("cg-1").map_err(ctx("cgroup id"))?;
+        let mut records = Vec::new();
+        for (finding, second) in [("f-old", 1_000), ("f-reopened", 2_000), ("f-fresh", 3_000)] {
+            let record = Freeze {
+                cgroup: cgroup.clone(),
+                finding: FindingId::try_from_str(finding).map_err(ctx("finding id"))?,
+                frozen_at: Timestamp::from_second(second).map_err(ctx("frozen_at"))?,
+                expires_at: None,
+            };
+            store.freeze(&record).map_err(ctx("freeze"))?;
+            store
+                .resolve(&record.cgroup, &record.finding, record.frozen_at, now)
+                .map_err(ctx("resolve"))?;
+            records.push(record);
+        }
+        let old = resolved_freeze_record(&store, "f-old")?;
+        let reopened = resolved_freeze_record(&store, "f-reopened")?;
+        let fresh = resolved_freeze_record(&store, "f-fresh")?;
+        age(&old, 400)?;
+        age(&reopened, 400)?;
+        // Crash simulation: the reopened key has its `.active.json` again.
+        let reopened_name = reopened
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(TestError::Missing("resolved record name"))?;
+        let active =
+            reopened.with_file_name(reopened_name.replace(".resolved.json", ".active.json"));
+        let active_record = records
+            .get(1)
+            .ok_or(TestError::Missing("reopened freeze"))?;
+        let active_bytes = serde_json::to_vec(active_record).map_err(ctx("encode freeze"))?;
+        std::fs::write(&active, active_bytes).map_err(ctx("write active record"))?;
+
+        let config = RetentionConfig {
+            freeze_resolved: ClassConfig {
+                enabled: Some(true),
+                ..ClassConfig::default()
+            },
+            ..RetentionConfig::default()
+        };
+        let mut spec = RetentionSweepSpec::new(home.path().to_path_buf(), None, config);
+        spec.classes = vec!["freeze_resolved".to_owned()];
+        spec.apply = true;
+        let value = run(&spec)?;
+
+        assert_eq!(
+            Some(text(&value, "/classes/0/dirs/0/dir")?),
+            store.root().to_str(),
+            "the store below the home, not <home>/freeze/freeze"
+        );
+        assert_eq!(number(&value, "/classes/0/dirs/0/removed")?, 1);
+        assert_eq!(
+            number(&value, "/classes/0/dirs/0/protected")?,
+            1,
+            "the record whose active freeze is back"
+        );
+        assert_eq!(number(&value, "/errors")?, 0);
+        assert_eq!(number(&value, "/failed_dirs")?, 0);
+        assert!(!old.exists(), "the old resolved record is gone");
+        assert!(reopened.exists(), "never resurrect a freeze");
+        assert!(active.exists(), "an active record is never touched");
+        assert!(fresh.exists(), "the fresh record stays");
+        Ok(())
+    }
+
+    /// `session_corrupt_backups` läuft über den Store im Sessions-Verzeichnis
+    /// des Profils: eine alte Quarantäne-Datei fällt, das Transkript daneben
+    /// bleibt (eine andere Klasse), die jüngste Kopie bleibt.
+    #[test]
+    fn session_corrupt_backups_route_through_the_store_and_spare_transcripts() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let sessions = home
+            .path()
+            .join("profiles")
+            .join("default")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).map_err(ctx("create sessions dir"))?;
+        let transcript = sessions.join("s1.jsonl");
+        let old = sessions.join("s1.jsonl.corrupt-100");
+        let recent = sessions.join("s1.jsonl.corrupt-200");
+        for path in [&transcript, &old, &recent] {
+            std::fs::write(path, b"{}\n").map_err(ctx("write session file"))?;
+        }
+        age(&transcript, 400)?;
+        age(&old, 100)?;
+
+        let config = RetentionConfig {
+            session_corrupt_backups: ClassConfig {
+                enabled: Some(true),
+                ..ClassConfig::default()
+            },
+            ..RetentionConfig::default()
+        };
+        let mut spec = RetentionSweepSpec::new(home.path().to_path_buf(), None, config);
+        spec.classes = vec!["session_corrupt_backups".to_owned()];
+        spec.apply = true;
+        let value = run(&spec)?;
+
+        assert_eq!(
+            Some(text(&value, "/classes/0/dirs/0/dir")?),
+            sessions.to_str()
+        );
+        assert_eq!(number(&value, "/classes/0/dirs/0/removed")?, 1);
+        assert_eq!(number(&value, "/classes/0/dirs/0/protected")?, 0);
+        assert_eq!(number(&value, "/failed_dirs")?, 0);
+        assert!(!old.exists(), "the aged backup is gone");
+        assert!(recent.exists(), "the newest backup stays");
+        assert!(transcript.exists(), "a transcript is never a backup");
+        Ok(())
     }
 }
