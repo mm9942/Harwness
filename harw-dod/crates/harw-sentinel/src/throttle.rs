@@ -1124,11 +1124,7 @@ mod tests {
             key_for("198.51.100.77", 443, Some(1000)),
             "same /24 and port"
         );
-        assert_ne!(
-            base,
-            key_for("198.51.101.5", 443, Some(1000)),
-            "other /24"
-        );
+        assert_ne!(base, key_for("198.51.101.5", 443, Some(1000)), "other /24");
         assert_ne!(base, key_for("198.51.100.5", 8443, Some(1000)), "new port");
         assert_ne!(base, key_for("198.51.100.5", 443, Some(1001)), "other uid");
         assert_ne!(base, key_for("198.51.100.5", 443, None), "unknown uid");
@@ -1262,7 +1258,10 @@ mod tests {
         assert_eq!(earlier.stamp.first_seen, at(400)?);
         assert_eq!(earlier.verdict, ThrottleVerdict::Suppress);
         let back = throttle.observe(key, Hardness::Observed, Severity::High, at(10)?, at(20)?);
-        assert_eq!(back.verdict, ThrottleVerdict::Emit(EmitReason::ClockWentBack));
+        assert_eq!(
+            back.verdict,
+            ThrottleVerdict::Emit(EmitReason::ClockWentBack)
+        );
         Ok(())
     }
 
@@ -1330,8 +1329,7 @@ mod tests {
         let path = dir.path().join(DEFAULT_STATE_FILE_NAME);
         let key = key_for("198.51.100.5", 443, Some(1000));
         {
-            let mut throttle =
-                FindingThrottle::open(ThrottleConfig::default(), Some(path.clone()));
+            let mut throttle = FindingThrottle::open(ThrottleConfig::default(), Some(path.clone()));
             throttle.observe(key, Hardness::Observed, Severity::High, at(100)?, at(100)?);
             throttle.observe(key, Hardness::Observed, Severity::High, at(101)?, at(101)?);
             assert!(throttle.persist_if_due(at(101)?), "an emission persists");
@@ -1405,8 +1403,7 @@ mod tests {
             FindingThrottle::open(ThrottleConfig::default(), Some(path.clone())).key_count(),
             0
         );
-        fs::write(&path, br#"{"schema_version":99,"entries":[]}"#)
-            .map_err(ctx("write foreign"))?;
+        fs::write(&path, br#"{"schema_version":99,"entries":[]}"#).map_err(ctx("write foreign"))?;
         assert_eq!(
             FindingThrottle::open(ThrottleConfig::default(), Some(path.clone())).key_count(),
             0

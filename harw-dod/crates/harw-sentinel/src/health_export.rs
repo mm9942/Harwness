@@ -662,15 +662,15 @@ impl HealthExporter {
             now,
         )
         .map_err(io::Error::other)
-            .and_then(|encoded| {
-                let temporary = temporary_path(&self.path).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "health export path has no file name",
-                    )
-                })?;
-                write_atomically(&self.path, &temporary, encoded.as_bytes(), HEALTH_FILE_MODE)
-            });
+        .and_then(|encoded| {
+            let temporary = temporary_path(&self.path).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "health export path has no file name",
+                )
+            })?;
+            write_atomically(&self.path, &temporary, encoded.as_bytes(), HEALTH_FILE_MODE)
+        });
         match result {
             Ok(()) => {
                 self.written = self.written.saturating_add(1);

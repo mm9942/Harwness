@@ -192,7 +192,9 @@ use jiff::Timestamp;
 use crate::cgroup_resolve::CgroupKids;
 use crate::export::FindingsExporter;
 use crate::health_export::RingCounters;
-use crate::throttle::{CoarseSubject, DedupKey, FindingThrottle, ThrottleDecision, ThrottleVerdict};
+use crate::throttle::{
+    CoarseSubject, DedupKey, FindingThrottle, ThrottleDecision, ThrottleVerdict,
+};
 
 /// Label-Feldname für die auslösende Regel ([`harw_dod_rules::Rule::id`]).
 const RULE_LABEL: harw_observe::FieldName = harw_macros::field!("rule_id");
@@ -625,13 +627,7 @@ pub fn report_findings(
         return 0;
     }
     let scopes = attribute_scopes(&findings, &evidence.events, now, network_scope);
-    let origins = attribute_origins(
-        &findings,
-        &evidence.events,
-        now,
-        network_scope,
-        cgroup_kids,
-    );
+    let origins = attribute_origins(&findings, &evidence.events, now, network_scope, cgroup_kids);
 
     let mut reported = 0_usize;
     for ((finding, finding_scope), origin) in findings.iter().zip(&scopes).zip(&origins) {
@@ -1664,7 +1660,10 @@ mod tests {
             vec![],
             vec![
                 egress_event("198.51.100.5", 443),
-                drift_in(Some("/sys/fs/cgroup/harw-job-1"), "drift at /etc/secret-file"),
+                drift_in(
+                    Some("/sys/fs/cgroup/harw-job-1"),
+                    "drift at /etc/secret-file",
+                ),
             ],
             Timestamp::UNIX_EPOCH,
         )

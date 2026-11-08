@@ -566,7 +566,10 @@ mod tests {
             cgroup: Actor::raw_cgroup(u64::MAX),
             process: None,
         };
-        assert_eq!(resolve_actor_cgroup(&mut unknown, Some(&mut resolver)), None);
+        assert_eq!(
+            resolve_actor_cgroup(&mut unknown, Some(&mut resolver)),
+            None
+        );
         assert_eq!(unknown.cgroup, None);
 
         let mut claimed = Actor {
@@ -575,7 +578,10 @@ mod tests {
             cgroup: Some(CgroupId::from_str("/claimed/by/probe")),
             process: None,
         };
-        assert_eq!(resolve_actor_cgroup(&mut claimed, Some(&mut resolver)), None);
+        assert_eq!(
+            resolve_actor_cgroup(&mut claimed, Some(&mut resolver)),
+            None
+        );
         assert_eq!(claimed.cgroup, None, "a probe-supplied path is not trusted");
 
         let mut no_resolver = Actor {
