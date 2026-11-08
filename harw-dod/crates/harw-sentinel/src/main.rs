@@ -1080,6 +1080,7 @@ fn ipc_counters(inbox: Option<&IpcInboxHandle>) -> health_export::IpcCounters {
         probes_connected: guard.connected(),
         events_total: guard.received_total(),
         dropped_total: guard.dropped(),
+        peers_rejected_total: guard.rejected_total(),
     }
 }
 

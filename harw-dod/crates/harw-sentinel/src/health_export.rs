@@ -26,6 +26,7 @@
 //!      "readings_total": 0, "errors_total": 1}
 //!   ],
 //!   "ipc": {"probes_connected": 1, "events_total": 40, "dropped_total": 0,
+//!           "peers_rejected_total": 0,
 //!           "events_last_cycle": 3, "dropped_last_cycle": 0,
 //!           "events_last_60s": 12, "dropped_last_60s": 0},
 //!   "ring": {"overflow_samples_total": 0, "overflow_events_total": 0,
@@ -42,6 +43,9 @@
 //!   present only for `degraded`; `last_ok_at` only after a successful poll.
 //! - `readings_total`/`errors_total` count successful and failed polls of
 //!   that sensor since process start ([`SensorTracker`]).
+//! - `ipc.peers_rejected_total` (PL-100 WP0.5, additive) counts probe
+//!   socket connections closed because their `SO_PEERCRED` uid is not on
+//!   the probe allowlist (`crate::peer_allow`). Expected: `0`.
 //! - `ring` counts entries the evidence ring evicted **before** the rules
 //!   evaluated them (`crate::findings::RuleCycle`): observations that were
 //!   never checked. Expected: `0`.
@@ -124,6 +128,9 @@ pub struct IpcCounters {
     pub events_total: u64,
     /// Events evicted from the full receive inbox since start.
     pub dropped_total: u64,
+    /// Connections closed since start because the peer uid is not on the
+    /// probe allowlist (PL-100 WP0.5).
+    pub peers_rejected_total: u64,
 }
 
 /// Cumulative counters of the evidence ring (`ring` object).
@@ -367,6 +374,7 @@ struct IpcLine {
     probes_connected: u64,
     events_total: u64,
     dropped_total: u64,
+    peers_rejected_total: u64,
     events_last_cycle: u64,
     dropped_last_cycle: u64,
     events_last_60s: u64,
@@ -465,6 +473,7 @@ pub fn encode_document(
             probes_connected: ipc.probes_connected,
             events_total: ipc.events_total,
             dropped_total: ipc.dropped_total,
+            peers_rejected_total: ipc.peers_rejected_total,
             events_last_cycle: windows.last_cycle.ipc_events,
             dropped_last_cycle: windows.last_cycle.ipc_dropped,
             events_last_60s: windows.last_60s.ipc_events,
@@ -750,6 +759,7 @@ mod tests {
         probes_connected: u64,
         events_total: u64,
         dropped_total: u64,
+        peers_rejected_total: u64,
         events_last_cycle: u64,
         dropped_last_cycle: u64,
         events_last_60s: u64,
@@ -817,6 +827,7 @@ mod tests {
             probes_connected: 1,
             events_total: 40,
             dropped_total: 2,
+            peers_rejected_total: 5,
         };
         let ring = RingCounters {
             overflow_samples_total: 3,
@@ -845,6 +856,7 @@ mod tests {
         assert_eq!(document.ipc.probes_connected, 1);
         assert_eq!(document.ipc.events_total, 40);
         assert_eq!(document.ipc.dropped_total, 2);
+        assert_eq!(document.ipc.peers_rejected_total, 5);
         // Erster Zyklus: die Fenster reichen bis zum Prozessstart zurück.
         assert_eq!(document.ipc.events_last_cycle, 40);
         assert_eq!(document.ipc.dropped_last_cycle, 2);
@@ -867,6 +879,7 @@ mod tests {
                 probes_connected: 1,
                 events_total: dropped.saturating_mul(10),
                 dropped_total: dropped,
+                peers_rejected_total: 0,
             },
             RingCounters {
                 overflow_samples_total: 0,

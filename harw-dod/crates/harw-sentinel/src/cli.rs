@@ -7,9 +7,19 @@
 //! eingebetteten Dateisystem-Sensoren (`--proc-root`, `--thermal-root`,
 //! `--workspace-root`, `--blockio-root`, `--gpu-root`, `--cgroup-root`), den
 //! Pfad des IPC-Empfangssockets, die Poll-Taktung, den expliziten
-//! Konfigurationspfad (`--config`) und die beiden optionalen Exporte
-//! (`--findings-export`, `--health-export`). Diese Datei parst
+//! Konfigurationspfad (`--config`), die beiden optionalen Exporte
+//! (`--findings-export`, `--health-export`), die Sonden-Konten der
+//! `SO_PEERCRED`-Zulassung (`--probe-peer-user`, PL-100 WP0.5) und den
+//! Diagnosemodus `--print-sandbox` (PL-100 WP0.7). Diese Datei parst
 //! nur — sie kennt weder `Sentinel` noch einen Sensor.
+//!
+//! # Kein Arbeitsverzeichnis als Lesewurzel (PL-100 WP0.7)
+//! `--workspace-root` hat **keine** Vorgabe mehr: früher stand sie auf `.`,
+//! und weil die Unit kein `WorkingDirectory=` setzte, lag das
+//! Arbeitsverzeichnis von systemd (`/`) als Leseregel in der
+//! Landlock-Sandbox — die Lese-Sandbox umfasste damit das ganze
+//! Dateisystem. Der Workspace-Sensor läuft jetzt nur, wenn
+//! `--workspace-root` ausdrücklich und absolut angegeben ist.
 //!
 //! # Nebenläufigkeit
 //! Reine Werttypen, `Send + Sync`.
@@ -23,6 +33,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use harw_types::HostId;
+
+use crate::peer_allow::DEFAULT_PROBE_PEER_USERS;
 
 /// Vorgabe: das IPC-Empfangssocket liegt unter `<home>/sentinel.sock`.
 ///
@@ -165,9 +177,12 @@ pub struct Cli {
     pub thermal_root: PathBuf,
 
     /// Wurzel des Cargo-Workspace, den
-    /// [`harw_dod_workspace::WorkspaceDriftSensor`] beobachtet.
-    #[arg(long, value_name = "DIR", default_value = ".")]
-    pub workspace_root: PathBuf,
+    /// [`harw_dod_workspace::WorkspaceDriftSensor`] beobachtet. Muss absolut
+    /// sein. Ohne Angabe läuft kein Workspace-Sensor und keine
+    /// Workspace-Leseregel entsteht (PL-100 WP0.7: nie das
+    /// Arbeitsverzeichnis).
+    #[arg(long, value_name = "DIR", value_parser = parse_absolute_path)]
+    pub workspace_root: Option<PathBuf>,
 
     /// Wurzel des `/sys/block`-Lesebereichs für
     /// [`harw_dod_blockio::BlockioSensor`]. Nur zum Testen gegen ein
@@ -248,6 +263,27 @@ pub struct Cli {
         value_parser = clap::value_parser!(u64).range(0..=crate::throttle::MAX_COOLDOWN_SECS)
     )]
     pub finding_cooldown_secs: u64,
+
+    /// Konto, dessen Prozesse Ereignisse über den IPC-Socket einreichen
+    /// dürfen (`SO_PEERCRED`, PL-100 WP0.5): ein Kontoname (aufgelöst beim
+    /// Start über `/etc/passwd`) oder eine numerische uid. Mehrfach
+    /// angebbar; eine Angabe ersetzt die Vorgabe vollständig. uid `0` ist
+    /// immer zugelassen. Vorgabe: die Sonden-Konten aus
+    /// `deploy/sysusers.d/harw.conf`.
+    #[arg(
+        long = "probe-peer-user",
+        value_name = "USER|UID",
+        default_values = DEFAULT_PROBE_PEER_USERS,
+        value_parser = parse_peer_user
+    )]
+    pub probe_peer_users: Vec<String>,
+
+    /// Gibt die wirksamen Landlock-Lese-/Schreibwurzeln, die abgewiesenen
+    /// Wurzeln und die zugelassenen IPC-Peer-uids auf stdout aus und beendet
+    /// sich, ohne Socket, Sink oder Landlock anzufassen (Host-Verifikation,
+    /// PL-100 WP0.7). Wertet dieselben Flags aus wie der normale Start.
+    #[arg(long, default_value_t = false)]
+    pub print_sandbox: bool,
 }
 
 impl Cli {
@@ -276,6 +312,32 @@ fn parse_absolute_path(raw: &str) -> Result<PathBuf, String> {
     } else {
         Err(format!("'{raw}' is not an absolute path"))
     }
+}
+
+/// Höchstlänge eines `--probe-peer-user`-Eintrags in Bytes.
+const MAX_PEER_USER_LEN: usize = 256;
+
+/// `clap`-Wertparser für `--probe-peer-user`: nicht leer, höchstens
+/// [`MAX_PEER_USER_LEN`] Bytes, kein `:` (Feldtrenner von `passwd(5)`),
+/// kein Leer- oder Steuerzeichen.
+fn parse_peer_user(raw: &str) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err("probe peer user must not be empty".to_owned());
+    }
+    if raw.len() > MAX_PEER_USER_LEN {
+        return Err(format!(
+            "probe peer user is longer than {MAX_PEER_USER_LEN} bytes"
+        ));
+    }
+    if raw
+        .chars()
+        .any(|c| c == ':' || c.is_whitespace() || c.is_control())
+    {
+        return Err(
+            "probe peer user must not contain ':', whitespace or control characters".to_owned(),
+        );
+    }
+    Ok(raw.to_owned())
 }
 
 /// `clap`-Wertparser für `--findings-host`: nicht leer, keine Steuerzeichen.
@@ -345,10 +407,77 @@ mod tests {
         Ok(())
     }
 
+    /// PL-100 WP0.7: ohne Flag gibt es keine Workspace-Wurzel — nie das
+    /// Arbeitsverzeichnis.
     #[test]
-    fn test_workspace_root_defaults_to_current_directory_marker() -> TestResult {
+    fn test_workspace_root_has_no_default() -> TestResult {
         let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
-        assert_eq!(cli.workspace_root, std::path::PathBuf::from("."));
+        assert_eq!(cli.workspace_root, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_workspace_root_accepts_an_absolute_path_only() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel", "--workspace-root", "/srv/harw/ws"])
+            .map_err(ctx("absolute workspace root"))?;
+        assert_eq!(
+            cli.workspace_root,
+            Some(std::path::PathBuf::from("/srv/harw/ws"))
+        );
+        for relative in [".", "ws", "./ws", ""] {
+            assert!(
+                Cli::try_parse_from(["harw-sentinel", "--workspace-root", relative]).is_err(),
+                "{relative:?} must not parse as a workspace root"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_probe_peer_users_default_to_the_probe_accounts() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert_eq!(
+            cli.probe_peer_users,
+            vec!["harw-probe-bpf".to_owned(), "harw-probe-fs".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_explicit_probe_peer_users_replace_the_default() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--probe-peer-user",
+            "harw-probe-netlink",
+            "--probe-peer-user",
+            "991",
+        ])
+        .map_err(ctx("explicit peer users"))?;
+        assert_eq!(
+            cli.probe_peer_users,
+            vec!["harw-probe-netlink".to_owned(), "991".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_probe_peer_user_rejects_empty_separator_and_control_characters() {
+        let too_long = "a".repeat(257);
+        for bad in ["", "a:b", "two words", "evil\n", too_long.as_str()] {
+            assert!(
+                Cli::try_parse_from(["harw-sentinel", "--probe-peer-user", bad]).is_err(),
+                "{bad:?} must not parse as a probe peer user"
+            );
+        }
+    }
+
+    #[test]
+    fn test_print_sandbox_is_off_by_default_and_parses() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert!(!cli.print_sandbox);
+        let cli = Cli::try_parse_from(["harw-sentinel", "--print-sandbox"])
+            .map_err(ctx("--print-sandbox"))?;
+        assert!(cli.print_sandbox);
         Ok(())
     }
 
