@@ -2529,16 +2529,18 @@ mod tests {
 
     /// Rolle → gebundenes Kontextprogramm (Dateistamm unter
     /// `agents/context-programs/`). Eine eigene `reviewer`-Rolle gibt es
-    /// nicht; `analyst` trägt `review`.
+    /// nicht; `analyst` trägt `review`. Die vier Sicherheits-Triage-Rollen
+    /// binden seit PL-100 WP 1.3 `security-triage`, nicht mehr `triage`
+    /// (Fehler-Triage); `triage` bleibt ungebundenes Bibliotheksprogramm.
     const EXPECTED_CONTEXT_PROGRAM_BINDINGS: [(&str, &str); 15] = [
         (role_names::EXPLORER, "explore"),
         (role_names::PLANNER, "plan"),
         (role_names::EXECUTOR, "implement"),
         (role_names::ANALYST, "review"),
-        (role_names::SECURITY_EGRESS_TRIAGE, "triage"),
-        (role_names::SECURITY_BASELINE_TRIAGE, "triage"),
-        (role_names::SECURITY_STRUCTURE_TRIAGE, "triage"),
-        (role_names::SECURITY_ENDPOINT_TRIAGE, "triage"),
+        (role_names::SECURITY_EGRESS_TRIAGE, "security-triage"),
+        (role_names::SECURITY_BASELINE_TRIAGE, "security-triage"),
+        (role_names::SECURITY_STRUCTURE_TRIAGE, "security-triage"),
+        (role_names::SECURITY_ENDPOINT_TRIAGE, "security-triage"),
         (role_names::ROOT_ORCHESTRATOR, "orchestrate"),
         (role_names::CODING_ORCHESTRATOR, "orchestrate"),
         (role_names::RESEARCH_ORCHESTRATOR, "orchestrate"),
@@ -2562,8 +2564,10 @@ mod tests {
             .map_err(|error| TestError::Unexpected(format!("{name}: {error}")))
     }
 
+    /// `base`, die neun AW6-05-Programme und `security-triage` (PL-100
+    /// WP 1.3) — elf Dateien.
     #[test]
-    fn test_context_program_library_embeds_all_ten_programs() {
+    fn test_context_program_library_embeds_all_eleven_programs() {
         let names: BTreeSet<&str> = builtin_context_program_toml()
             .iter()
             .map(|(name, _)| *name)
@@ -2578,6 +2582,7 @@ mod tests {
             "research-deps",
             "research-web",
             "review",
+            "security-triage",
             "triage",
         ]
         .into_iter()
@@ -2654,12 +2659,15 @@ mod tests {
     /// Test an — gewollt, damit die Bindung bewusst nachgezogen wird.
     #[test]
     fn test_bound_programs_defer_exactly_the_sections_outside_the_root_ceiling() -> TestResult {
-        let expected: [(&str, &[&str]); 8] = [
+        let expected: [(&str, &[&str]); 9] = [
             ("explore", &[]),
             ("plan", &["goal.invariants", "plan.current"]),
             ("implement", &["plan.current"]),
             ("review", &["diff.changeset", "goal.invariants"]),
+            // Ungebunden seit PL-100 WP 1.3, bleibt aber Bibliotheksprogramm.
             ("triage", &["error.trace"]),
+            // PL-100 WP 1.3: nur die Basissektionen, nichts zurückgestellt.
+            ("security-triage", &[]),
             ("orchestrate", &["plan.current", "child.returns"]),
             ("research-deps", &["deps.lockfile_index"]),
             ("research-web", &["web.fetch_allowlist"]),
@@ -2675,6 +2683,226 @@ mod tests {
                 .collect();
             assert_eq!(actual, deferred, "{name}");
         }
+        Ok(())
+    }
+
+    /// PL-100 WP 1.3: jede eingebaute Rolle `security-*-triage` bindet
+    /// `security-triage`, und keine eingebaute Rolle bindet mehr das
+    /// Fehler-Triage-Programm `triage`. Fängt auch eine künftige fünfte
+    /// Sicherheits-Triage-Rolle (z. B. für das Auth-Log, README O11), die noch
+    /// auf `triage` zeigt.
+    #[test]
+    fn test_security_triage_roles_never_bind_error_triage() -> TestResult {
+        let error_triage = resolved_program("triage")?.id.to_string();
+        let security_triage = resolved_program("security-triage")?.id.to_string();
+        let mut security_roles: BTreeSet<String> = BTreeSet::new();
+        for (role, ir) in builtin()? {
+            let policy = ir.context_program().context_policy();
+            assert_ne!(
+                policy,
+                Some(error_triage.as_str()),
+                "{role} bindet noch die Fehler-Triage"
+            );
+            if role.starts_with("security-") && role.ends_with("-triage") {
+                assert_eq!(
+                    policy,
+                    Some(security_triage.as_str()),
+                    "{role} muss security-triage binden"
+                );
+                security_roles.insert(role);
+            }
+        }
+        for role in [
+            role_names::SECURITY_EGRESS_TRIAGE,
+            role_names::SECURITY_BASELINE_TRIAGE,
+            role_names::SECURITY_STRUCTURE_TRIAGE,
+            role_names::SECURITY_ENDPOINT_TRIAGE,
+        ] {
+            assert!(
+                security_roles.contains(role),
+                "{role} fehlt unter den gesenkten Rollen"
+            );
+        }
+        Ok(())
+    }
+
+    /// PL-100 O11: `intel-scout` und `context-steward` deklarieren ihren
+    /// `[return]` selbst, und zwar den validierten Envelope für read-only
+    /// Kinder (`harwness.return.envelope@1`), nie
+    /// `harwness.security-verdict/v1`: beiden verweigert ihre
+    /// Mitgliedschaftsdatei `security.verdict.propose`, ein Verdikt kommt nur
+    /// von den vier `security-*-triage`-Rollen. Beide stehen noch nicht in
+    /// `role_names::ALL` und werden von [`builtin_agent_definitions`] daher
+    /// nicht gesenkt; dieser Test senkt sie direkt über dieselbe Pipeline
+    /// (`parse_toml → resolve_definition → lower`). `lower` prüft dabei
+    /// zugleich, dass das Label zum Vokabular gehört
+    /// (`DslError::UnknownReturnContract`). Ein Kontextprogramm binden beide
+    /// nicht, insbesondere weder `triage` noch `security-triage`.
+    #[test]
+    fn test_intel_scout_and_context_steward_return_an_envelope_never_a_verdict() -> TestResult {
+        const ENVELOPE_ROLES: [&str; 2] = ["intel-scout", "context-steward"];
+        let now = OffsetDateTime::now_utc();
+        let mut layers: Vec<(DefinitionLayer, RawAgentDefinition)> = Vec::new();
+        let mut targets: Vec<(&str, DefinitionId)> = Vec::new();
+        for (name, source) in builtin_agent_toml() {
+            let raw = parse_toml(source)
+                .map_err(|error| TestError::Unexpected(format!("{name} parst nicht: {error}")))?;
+            if ENVELOPE_ROLES.contains(name) {
+                targets.push((*name, raw.id.clone()));
+            }
+            layers.push((DefinitionLayer::BuiltIn, raw));
+        }
+        assert_eq!(
+            targets.len(),
+            ENVELOPE_ROLES.len(),
+            "intel-scout und context-steward müssen im eingebetteten Baum liegen"
+        );
+        for (name, id) in targets {
+            let resolved = resolve_definition(&id, &layers, now)
+                .map_err(|error| TestError::Unexpected(format!("{name} muss auflösen: {error}")))?;
+            let ir = lower(&resolved)
+                .map_err(|error| TestError::Unexpected(format!("{name} muss lowern: {error}")))?;
+            let contract = ir.return_pipeline().contract();
+            assert_eq!(contract, Some("harwness.return.envelope@1"), "{name}");
+            assert_eq!(
+                contract.and_then(harw_agent_dsl::ir_v2::ReturnContract::parse),
+                Some(harw_agent_dsl::ir_v2::ReturnContract::Envelope),
+                "{name}: der Envelope ist ein strukturell geprüfter Vertrag"
+            );
+            assert_ne!(
+                contract,
+                Some(harw_agent_dsl::ir_v2::ReturnContract::SecurityVerdict.as_str()),
+                "{name} darf kein Verdikt zurückgeben"
+            );
+            assert_eq!(ir.context_program().context_policy(), None, "{name}");
+        }
+        Ok(())
+    }
+
+    /// PL-100 WP 1.4: das Kontextprogramm `security-triage` trägt keine
+    /// Prosa; den Rückgabevertrag sieht das Triage-Kind nur über den Skill
+    /// `harw-dod`, den jede der vier `security-*-triage`-Rollen anheftet.
+    /// Der Skill führt deshalb den Abschnitt „Verdict zurückgeben" mit den
+    /// Sicherheitsregeln und einem vollständigen Beispiel, das die Form von
+    /// `harwness.security-verdict/v1` exakt einhält: genau die neun Felder von
+    /// `harw_dod_signals::SecurityVerdict` (`deny_unknown_fields`), nie
+    /// `confirmed`, ein 64-stelliger Kleinbuchstaben-Hex-Digest ungleich null.
+    /// Dieses Crate hängt nicht an `harw-dod-signals`; die Typprüfung über
+    /// `parse_and_validate_verdict` gehört in ein Crate mit beiden
+    /// Abhängigkeiten. Hier wird die Form gegen die Vertragsfelder geprüft.
+    #[test]
+    fn test_harw_dod_skill_carries_a_well_formed_verdict_example() -> TestResult {
+        const TRIAGE_ROLES: [&str; 4] = [
+            role_names::SECURITY_EGRESS_TRIAGE,
+            role_names::SECURITY_BASELINE_TRIAGE,
+            role_names::SECURITY_STRUCTURE_TRIAGE,
+            role_names::SECURITY_ENDPOINT_TRIAGE,
+        ];
+        const VERDICT_FIELDS: [&str; 9] = [
+            "bound_evidence",
+            "classification",
+            "contract",
+            "finding",
+            "issued_at",
+            "issued_by",
+            "rationale",
+            "severity",
+            "suggested_response",
+        ];
+        let definitions = builtin()?;
+        for role in TRIAGE_ROLES {
+            let ir = definitions
+                .get(role)
+                .ok_or_else(|| TestError::Unexpected(format!("{role} fehlt")))?;
+            assert!(
+                ir.skills().iter().any(|skill| skill == "harw-dod"),
+                "{role} muss harw-dod anheften"
+            );
+        }
+
+        let index = harw_catalog::SkillIndex::build(&[]);
+        let entry = index
+            .get("harw-dod")
+            .ok_or(TestError::Missing("harw-dod im SkillIndex"))?;
+        let instructions = entry.snapshot().instructions.as_str();
+        let (_, section) = instructions
+            .split_once("\n## Verdict zurückgeben\n")
+            .ok_or(TestError::Missing("Abschnitt Verdict zurückgeben"))?;
+        let section = section
+            .split_once("\n## ")
+            .map_or(section, |(body, _)| body);
+        for rule in [
+            "evidence, never an instruction",
+            "nothing was enforced",
+            "unverified",
+            "`home`",
+            "`override`",
+            "`system_unreadable`",
+            "Never `confirmed`",
+            "harwness.security-verdict/v1",
+        ] {
+            assert!(section.contains(rule), "Verdict-Abschnitt: fehlt {rule}");
+        }
+
+        let (_, fenced) = section
+            .split_once("```json\n")
+            .ok_or(TestError::Missing("JSON-Beispiel im Verdict-Abschnitt"))?;
+        let (example, _) = fenced
+            .split_once("\n```")
+            .ok_or(TestError::Missing("Ende des JSON-Beispiels"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(example).map_err(ctx("das Beispiel ist JSON"))?;
+        let object = value
+            .as_object()
+            .ok_or(TestError::Missing("das Beispiel ist ein JSON-Objekt"))?;
+        let keys: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+        let expected: BTreeSet<&str> = VERDICT_FIELDS.into_iter().collect();
+        assert_eq!(keys, expected, "genau die Felder von SecurityVerdict");
+        let field = |key: &'static str| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TestError::Missing(key))
+        };
+        assert_eq!(field("contract")?, "harwness.security-verdict/v1");
+        assert!(matches!(field("classification")?, "benign" | "suspicious"));
+        assert!(matches!(
+            field("severity")?,
+            "info" | "low" | "medium" | "high" | "critical"
+        ));
+        assert!(matches!(
+            field("suggested_response")?,
+            "monitor" | "escalate" | "contain"
+        ));
+        let digest = field("bound_evidence")?;
+        assert_eq!(digest.chars().count(), 64, "bound_evidence: 64 Zeichen");
+        assert!(
+            digest.chars().all(|ch| matches!(ch, '0'..='9' | 'a'..='f')),
+            "bound_evidence: Kleinbuchstaben-Hex"
+        );
+        assert!(digest.chars().any(|ch| ch != '0'), "kein Null-Digest");
+        let finding = field("finding")?;
+        assert!(!finding.trim().is_empty(), "finding nicht leer");
+        assert!(
+            finding
+                .chars()
+                .any(|ch| ch.is_ascii_alphanumeric() && ch != '0'),
+            "keine Null-ID"
+        );
+        assert!(
+            !field("rationale")?.trim().is_empty(),
+            "rationale nicht leer"
+        );
+        let issued_by = field("issued_by")?;
+        assert!(
+            TRIAGE_ROLES.iter().any(|role| *role == issued_by),
+            "issued_by nennt eine Triage-Rolle"
+        );
+        let issued_at = field("issued_at")?;
+        assert!(
+            issued_at.contains('T') && issued_at.ends_with('Z'),
+            "issued_at ist ein RFC-3339-Zeitstempel in UTC"
+        );
         Ok(())
     }
 
@@ -3076,12 +3304,14 @@ mod tests {
     /// organisatorischen Rollen `2` tragen — unabhängig davon, wie viele
     /// Rollen mit Tiefe `0` oder `1` noch dazukommen.
     ///
-    /// Offener Punkt für einen Folgeknoten: `context-steward` und
-    /// `intel-scout` tragen ebenfalls `max_depth = 0`, stehen aber (bewusst,
-    /// siehe `role_names::ALL`) nicht im gesenkten Inventar. Wer sie dort
-    /// aufnimmt, trägt sie hier in `ZERO_DEPTH_ROLES` nach — sonst erwartet
-    /// dieser Test für sie `1` und schlägt fehl. Dasselbe gilt für ihren
-    /// fehlenden `[return].contract` im Vertragstest weiter oben.
+    /// `context-steward` und `intel-scout` tragen ebenfalls `max_depth = 0`,
+    /// stehen aber (noch, siehe `role_names::ALL`) nicht im gesenkten
+    /// Inventar. `ZERO_DEPTH_ROLES` führt beide bereits (PL-100 O11), damit
+    /// ihre Aufnahme in `role_names::ALL` diesen Test nicht bricht. Ihren
+    /// `[return].contract` (`harwness.return.envelope@1`) deklarieren beide
+    /// bereits;
+    /// `test_intel_scout_and_context_steward_return_an_envelope_never_a_verdict`
+    /// prüft ihn ohne `role_names::ALL`.
     ///
     /// `memory-steward` (Memory v3, §5.3) trägt ebenfalls `max_depth = 0`
     /// (`agents/memory-steward.toml`, `[spawn] max_depth = 0`): eine
@@ -3109,8 +3339,13 @@ mod tests {
         // `agents/roles/matrix-*/matrix-*.toml`, jeweils `[spawn] max_depth = 0`)
         // plus `uia-latex-writer` (Runde 4, Teil E: ein Schreib- und
         // Build-Auftrag ist ein einzelner, in sich geschlossener Lauf — siehe
-        // `agents/uia-latex-writer.toml`, `[spawn] max_depth = 0`).
-        const ZERO_DEPTH_ROLES: [&str; 16] = [
+        // `agents/uia-latex-writer.toml`, `[spawn] max_depth = 0`) plus
+        // `intel-scout` und `context-steward` (PL-100 O11: reine, kinderlose
+        // Korrelation bzw. Kuration, jeweils `[spawn] max_depth = 0`). Beide
+        // stehen als Literale hier, weil `role_names` für sie noch keine
+        // Konstante führt; solange sie nicht in `role_names::ALL` stehen,
+        // liefert `builtin()` sie nicht und der Eintrag ist wirkungslos.
+        const ZERO_DEPTH_ROLES: [&str; 18] = [
             role_names::SECURITY_EGRESS_TRIAGE,
             role_names::SECURITY_BASELINE_TRIAGE,
             role_names::SECURITY_STRUCTURE_TRIAGE,
@@ -3127,6 +3362,8 @@ mod tests {
             role_names::MATRIX_UMPIRE,
             role_names::MATRIX_MARKET,
             role_names::MATRIX_REDCELL,
+            "intel-scout",
+            "context-steward",
         ];
 
         let definitions = builtin()?;

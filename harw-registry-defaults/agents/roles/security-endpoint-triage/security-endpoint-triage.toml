@@ -92,10 +92,10 @@
 # führt ebenfalls `[defaults].return_contract`, und trotzdem deklariert JEDE
 # ihrer drei Rollen (`explorer`, `researcher-deps`, `researcher-web`) ihren
 # `[return].contract` zusätzlich selbst — sonst trüge keine von ihnen einen.
-# `intel-scout` und `context-steward` machen es NICHT vor: beide deklarieren
-# keinen `[return]` und tragen folglich tatsächlich keinen Vertrag. Das fällt
-# nur nicht auf, weil sie nicht in `role_names::ALL` stehen und daher nie
-# gesenkt werden.
+# `intel-scout` und `context-steward` deklarieren seit PL-100 O11 ebenfalls
+# einen eigenen `[return]` (`harwness.return.envelope@1`, kein Verdikt);
+# gesenkt und damit geprüft wird er erst, sobald beide in `role_names::ALL`
+# stehen.
 #
 # `harwness.security-verdict/v1` ist der vierte Arm des `ChildReturnContract`,
 # eigens für Sicherheitsverdikte gebaut. Eine Triage-Rolle MUSS ihn tragen:
@@ -142,10 +142,14 @@ max_wall_secs = 120
 [return]
 contract = "harwness.security-verdict/v1"
 
-# Kontextprogramm (Runde 3, Welle C2): bindet `agents/context-programs/triage.toml`.
+# Kontextprogramm (Runde 3, Welle C2; PL-100 WP 1.3): bindet
+# `agents/context-programs/security-triage.toml` (Sicherheits-Triage: Auftrag
+# nur aus IDs/Enums, Fakten nur über `dod.*`, Rückgabe genau ein
+# `harwness.security-verdict/v1`). Früher stand hier `triage`, das Programm
+# der Fehler-Triage (`error.trace`, `task.read_scope`).
 # `embedded_agents::bind_context_program` liest diese Zeile aus der eigenen
 # Tabelle der Rolle (die Aufloesung verwirft das `[context]` des Kindes, weil
 # `worker-base` eines fuehrt) und ergaenzt das geerbte `[context]` um das
 # Programm. Ein unbekannter Name bricht das Laden der Rolle hart ab.
 [context]
-program = "triage"
+program = "security-triage"
