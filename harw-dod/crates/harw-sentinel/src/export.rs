@@ -12,25 +12,47 @@
 //! Flag existiert kein [`FindingsExporter`], und es wird nichts geschrieben.
 //!
 //! # Zeilenformat (Vertrag mit dem Hub)
-//! Eine Zeile je Befund, genau diese sechs Felder:
+//! Version 1 bestand aus genau diesen sechs Feldern:
 //!
 //! ```json
 //! {"finding_id":"…","host":"host-a","rule_id":"structure-drift","severity":"medium","summary":"…","observed_at":"2026-09-27T10:00:00Z"}
 //! ```
 //!
 //! ## Schema version 2 (additive, PL-97 D1)
-//! Every line written by this binary now also carries
-//! `"schema_version": 2` ([`EXPORT_SCHEMA_VERSION`]) and, when the finding
-//! can be attributed to a cgroup, an optional `"scope"` (the absolute cgroup
-//! path, see [`sanitize_scope`]). Both fields are additive: a line without
-//! `schema_version` is a version-1 line with exactly the six fields above,
-//! and every known reader (`harw-security-hub`'s `DodFinding`, harw's
-//! `security_signals` context source) ignores unknown fields, so v1 and v2
-//! lines parse alike. `scope` is set when the finding can be attributed to
-//! the resolved cgroup of the observed actor (PL-97 E4: the probe forwards
-//! the raw cgroup id, `crate::cgroup_resolve` maps it to the absolute path
-//! beneath `--cgroup-root`, `crate::findings` attributes the finding); it
-//! is omitted otherwise.
+//! Version 2 adds `"schema_version"` and, when the finding can be
+//! attributed to a cgroup, an optional `"scope"` (the absolute cgroup path,
+//! see [`sanitize_scope`]). `scope` is set when the finding can be
+//! attributed to the resolved cgroup of the observed actor (PL-97 E4: the
+//! probe forwards the raw cgroup id, `crate::cgroup_resolve` maps it to the
+//! absolute path beneath `--cgroup-root`, `crate::findings` attributes the
+//! finding); it is omitted otherwise.
+//!
+//! ## Schema version 3 (PL-100 WP0.12, written today)
+//! Every line now carries `"schema_version": 3`
+//! ([`EXPORT_SCHEMA_VERSION`]); v3 is a strict superset of v2. Readers
+//! (`harw-dod-client`, harw's `security_signals` through that client,
+//! `harw-security-hub`) treat every new field as optional, so v1, v2 and v3
+//! lines parse alike (reader-first rollout, PL-100 I11). The fields, in the
+//! order they are written after `scope`:
+//!
+//! - `instance`: UUIDv4 of this sentinel process, new per start;
+//! - `seq`: position of the line within `instance`, from 1, monotonic. Every
+//!   attempted line takes a number, so a gap marks a line that failed to
+//!   write;
+//! - `record_digest` (optional): lowercase hex of the BLAKE3 digest of the
+//!   `FindingRecord` handed to the finding spool (`crate::spool_writer`);
+//!   absent when no record was produced or it could not be queued;
+//! - `dedup_key`, `occurrences`, `first_seen`: the [`ThrottleStamp`] of the
+//!   finding (`crate::throttle`);
+//! - `kind` (`rule_triggered` | `anomaly`, [`kind_label`]) and `hardness`
+//!   (`observed` | `correlated` | `inferred`, [`hardness_label`]);
+//! - `cgroup_kid` (optional): kernel id of the actor's cgroup. Kernel ids are
+//!   reused; readers pair it with `scope` and `first_seen`;
+//! - `scope_obfuscated`: `true` when the finding had a scope that could not
+//!   be rendered safely (PL-100 WP0.9): the scope is then withheld instead of
+//!   silently dropped;
+//! - `evidence_card` (optional, [`EvidenceCard`]): a small summary of the
+//!   triggering events, at most [`MAX_EVIDENCE_CARD_BYTES`] serialized.
 //!
 //! Die Feldtypen sind dieselben, die der Hub deserialisiert:
 //! [`harw_types::FindingId`], [`harw_types::HostId`],
@@ -38,13 +60,15 @@
 //! `harw_dod_signals::Severity` wird über [`impact_severity`] erschöpfend auf
 //! `ImpactSeverity` abgebildet — keine String-Umwandlung dazwischen.
 //!
-//! # Keine Geheimnisse, bereinigter Freitext
-//! Exportiert werden ausschließlich die sechs Felder oben (plus
-//! `schema_version` und das optionale `scope`) — kein Beleg,
-//! keine Rohereignisse, keine Konfiguration. Der einzige Freitext,
-//! `summary`, wird von [`sanitize_summary`] bereinigt (Steuerzeichen und
-//! bidirektionale Formatzeichen durch Leerzeichen ersetzt) und auf
-//! [`MAX_SUMMARY_BYTES`] Bytes an einer Zeichengrenze gekürzt.
+//! # Keine Geheimnisse, escapter Freitext
+//! Exportiert werden ausschließlich die Felder oben — keine Rohereignisse,
+//! keine Konfiguration. Jede Zeichenkette, die aus Beobachtungen stammt,
+//! läuft durch den gemeinsamen Escaper `harw-untrusted-text` (PL-100
+//! WP0.8): `summary` über [`sanitize_summary`] (einzeilig, höchstens
+//! [`MAX_SUMMARY_BYTES`] Bytes), `scope` über [`sanitize_scope`] (wird nie
+//! umgeschrieben, nur zurückgehalten) und jede Zeichenkette der
+//! `evidence_card` über `harw_untrusted_text::escape_line`. Unsichtbare und
+//! steuernde Zeichen erscheinen als sichtbares `\u{…}`.
 //!
 //! # Datei
 //! - geöffnet mit `O_APPEND | O_CREAT`, neu angelegt mit Modus
@@ -65,26 +89,43 @@
 //! # Nebenläufigkeit
 //! [`FindingsExporter`] lebt ausschließlich im Sammelthread (`&mut self`),
 //! wie `crate::poll_once`.
+//!
+//! # Examples
+//! ```rust,ignore
+//! let fields = LineFields {
+//!     scope: Some("/sys/fs/cgroup/harw.slice"),
+//!     ..LineFields::of(&finding, stamp)
+//! };
+//! assert!(exporter.export(&sink, &fields));
+//! ```
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use harw_dod_rules::{Finding, RuleChecked};
-use harw_dod_signals::Severity;
+use harw_dod_rules::{Finding, FindingKind, RuleChecked};
+use harw_dod_signals::{EventKind, Hardness, SecurityEvent, Severity};
 use harw_observe::{MetricValue, TelemetrySink};
-use harw_types::{FindingId, HostId, ImpactSeverity};
+use harw_types::{ContentDigest, FindingId, HostId, ImpactSeverity};
+use harw_untrusted_text::{escape_line, is_clean};
 use jiff::Timestamp;
 use serde::Serialize;
+
+use crate::findings::event_kind_label;
+use crate::throttle::ThrottleStamp;
 
 /// Größenschwelle, ab der die Exportdatei nach `<pfad>.1` rotiert wird.
 pub const MAX_EXPORT_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Längste exportierte `summary` in Bytes (UTF-8, an Zeichengrenze gekürzt).
+/// Längste exportierte `summary` in Bytes (UTF-8, Escapes und `…`
+/// eingerechnet).
 ///
 /// Gleich `harw_security_hub::findings::FindingLimits::max_summary_chars`
-/// (512) — in Bytes gemessen ist das eine strengere Grenze.
+/// (512) — in Bytes gemessen ist das eine strengere Grenze; der lesende
+/// `harw-dod-client` kappt mit derselben Byte-Grenze.
 pub const MAX_SUMMARY_BYTES: usize = 512;
 
 /// Modus einer neu angelegten Exportdatei: Eigentümer lesen/schreiben,
@@ -97,14 +138,29 @@ pub const HOSTNAME_PATH: &str = "/proc/sys/kernel/hostname";
 /// Schema version written into every export line (`schema_version`).
 ///
 /// Version 1 is the original six-field line without this field; version 2
-/// adds `schema_version` itself and the optional `scope`. Both changes are
-/// additive (see the module documentation).
-pub const EXPORT_SCHEMA_VERSION: u32 = 2;
+/// adds `schema_version` itself and the optional `scope`; version 3 adds the
+/// PL-100 WP0.12 fields. Every change is additive (see the module
+/// documentation).
+pub const EXPORT_SCHEMA_VERSION: u32 = 3;
 
 /// Longest exported `scope` (cgroup path) in bytes; a longer value is
-/// omitted rather than truncated, because a cut path would name a
-/// different cgroup.
+/// withheld (`scope_obfuscated`) rather than truncated, because a cut path
+/// would name a different cgroup.
 pub const MAX_SCOPE_BYTES: usize = 4096;
+
+/// Largest exported `evidence_card`, serialized as compact JSON (4 KiB);
+/// the same limit the reading `harw-dod-client` enforces.
+pub const MAX_EVIDENCE_CARD_BYTES: usize = 4 * 1024;
+
+/// Longest `evidence_card.path`, in characters (escapes and `…` included).
+pub const MAX_EVIDENCE_PATH_CHARS: usize = 256;
+
+/// Longest `evidence_card.process.comm`, in characters (escapes and `…`
+/// included).
+pub const MAX_EVIDENCE_COMM_CHARS: usize = 32;
+
+/// Longest event kind key of `evidence_card.event_counts`, in characters.
+const MAX_EVENT_KIND_CHARS: usize = 64;
 
 harw_macros::metrics! {
     /// Wie oft eine Befundzeile seit Prozessstart nicht in die
@@ -116,7 +172,8 @@ harw_macros::metrics! {
 
 /// Eine Exportzeile — die ersten sechs Feldnamen und -typen spiegeln exakt
 /// `harw_security_hub::findings::DodFinding`; `schema_version` und `scope`
-/// sind die additiven Felder von Version 2 (siehe Moduldoku).
+/// kamen mit Version 2, alle Felder ab `instance` mit Version 3 (siehe
+/// Moduldoku; die Reihenfolge ist die Schreibreihenfolge).
 #[derive(Debug, Serialize)]
 struct ExportLine<'a> {
     schema_version: u32,
@@ -128,6 +185,225 @@ struct ExportLine<'a> {
     observed_at: Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<&'a str>,
+    instance: &'a str,
+    seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_digest: Option<ContentDigest>,
+    dedup_key: String,
+    occurrences: u64,
+    first_seen: Timestamp,
+    kind: &'static str,
+    hardness: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cgroup_kid: Option<u64>,
+    scope_obfuscated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_card: Option<&'a EvidenceCard>,
+}
+
+/// Alles, was eine Exportzeile über einen Befund trägt (Schema v3).
+///
+/// # Description
+/// [`Self::of`] füllt die Felder des Befundes und des Throttle-Stempels;
+/// Herkunft (`scope`, `cgroup_kid`), `record_digest` und `evidence_card`
+/// setzt der Aufrufer per Struct-Update, sobald er sie kennt
+/// (`crate::findings::report_findings`). `host`, `instance` und `seq` kommen
+/// vom [`FindingsExporter`].
+///
+/// # Concurrency
+/// Geliehener Werttyp ohne inneren Zustand.
+///
+/// # Examples
+/// ```rust,ignore
+/// let fields = LineFields {
+///     cgroup_kid: Some(4242),
+///     ..LineFields::of(&finding, stamp)
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct LineFields<'a> {
+    /// Kennung des Befundes (UUIDv4, `FindingId::new`).
+    pub finding_id: &'a FindingId,
+    /// Auslösende Regel.
+    pub rule_id: &'a str,
+    /// Art des Befundes (`kind`).
+    pub kind: FindingKind,
+    /// Schwere.
+    pub severity: Severity,
+    /// Härte des Nachweises (`hardness`).
+    pub hardness: Hardness,
+    /// Rohe Zusammenfassung; escapt erst [`encode_line`].
+    pub summary: &'a str,
+    /// Ereigniszeit des Befundes.
+    pub observed_at: Timestamp,
+    /// Rohe Cgroup-Zuordnung; geprüft erst [`encode_line`] (`scope`,
+    /// `scope_obfuscated`).
+    pub scope: Option<&'a str>,
+    /// Kernel-ID der Cgroup des Akteurs.
+    pub cgroup_kid: Option<u64>,
+    /// `dedup_key`, `occurrences`, `first_seen` aus dem Throttle.
+    pub stamp: ThrottleStamp,
+    /// Digest des an den Spool übergebenen `FindingRecord`.
+    pub record_digest: Option<ContentDigest>,
+    /// Zusammenfassung der auslösenden Ereignisse.
+    pub evidence_card: Option<&'a EvidenceCard>,
+}
+
+impl<'a> LineFields<'a> {
+    /// Die Felder eines geprüften Befundes mit seinem Throttle-Stempel; ohne
+    /// Scope, Cgroup, Record und Karte.
+    ///
+    /// # Arguments
+    /// - `finding` (`&Finding<RuleChecked>`): der gemeldete Befund.
+    /// - `stamp` (`ThrottleStamp`): seine Entscheidung im Throttle.
+    ///
+    /// # Returns
+    /// Die Felder; `scope`, `cgroup_kid`, `record_digest` und
+    /// `evidence_card` sind `None`.
+    #[must_use]
+    pub fn of(finding: &'a Finding<RuleChecked>, stamp: ThrottleStamp) -> Self {
+        Self {
+            finding_id: finding.id(),
+            rule_id: finding.rule_id(),
+            kind: finding.kind(),
+            severity: finding.severity(),
+            hardness: finding.hardness(),
+            summary: finding.summary(),
+            observed_at: finding.observed_at(),
+            scope: None,
+            cgroup_kid: None,
+            stamp,
+            record_digest: None,
+            evidence_card: None,
+        }
+    }
+}
+
+/// Kleine, escapte Zusammenfassung der auslösenden Ereignisse eines
+/// Befundes (`evidence_card`, Export v3).
+///
+/// # Description
+/// Gebaut von [`Self::from_events`]. Ein Feld ist nur gesetzt, wenn **alle**
+/// Ereignisse, die es tragen, denselben Wert haben — nie geraten. Jede
+/// Zeichenkette ist mit `harw_untrusted_text::escape_line` escapt und
+/// begrenzt; serialisiert ist die Karte höchstens
+/// [`MAX_EVIDENCE_CARD_BYTES`] groß. Die Feldreihenfolge ist die
+/// Schreibreihenfolge.
+///
+/// # Concurrency
+/// Reiner Werttyp, `Send + Sync`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct EvidenceCard {
+    /// Anzahl der auslösenden Ereignisse je Art (`crate::findings::event_kind_label`).
+    pub event_counts: BTreeMap<String, u64>,
+    /// uid des Akteurs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    /// Ziel eines ausgehenden Flusses als `ip:port` (nur mit IP-Literal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// Escapter Pfad (exec, Dateischreiben), höchstens
+    /// [`MAX_EVIDENCE_PATH_CHARS`] Zeichen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Der handelnde Prozess.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process: Option<EvidenceProcess>,
+}
+
+/// Der handelnde Prozess einer [`EvidenceCard`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceProcess {
+    /// Prozess-ID zum Beobachtungszeitpunkt.
+    pub pid: u32,
+    /// Escapter Prozessname, höchstens [`MAX_EVIDENCE_COMM_CHARS`] Zeichen;
+    /// leer, wenn die Quelle keinen kennt.
+    pub comm: String,
+}
+
+impl EvidenceCard {
+    /// Fasst die auslösenden Ereignisse eines Befundes zusammen.
+    ///
+    /// # Description
+    /// `event_counts` zählt jedes Ereignis unter seiner Art. `uid`,
+    /// `destination` (nur `EgressFlow` mit IP-Literal), `path` (`ProcessExec`,
+    /// `FileWrite`) und `process` werden gesetzt, wenn sich alle Ereignisse,
+    /// die das Merkmal tragen, auf einen Wert einigen. Wäre die Karte größer
+    /// als [`MAX_EVIDENCE_CARD_BYTES`], fällt zuerst `path` weg; reicht das
+    /// nicht, gibt es keine Karte.
+    ///
+    /// # Arguments
+    /// - `events` (`&[&SecurityEvent]`): die auslösenden Ereignisse.
+    ///
+    /// # Returns
+    /// `None` ohne Ereignisse oder wenn die Karte die Größengrenze sprengt.
+    #[must_use]
+    pub fn from_events(events: &[&SecurityEvent]) -> Option<Self> {
+        if events.is_empty() {
+            return None;
+        }
+        let mut event_counts: BTreeMap<String, u64> = BTreeMap::new();
+        for event in events {
+            let kind = escape_line(event_kind_label(&event.kind), MAX_EVENT_KIND_CHARS);
+            let count = event_counts.entry(kind).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+        let uid = agreed(
+            events
+                .iter()
+                .filter_map(|event| event.actor.as_ref().map(|actor| actor.uid)),
+        );
+        let destination = agreed(events.iter().filter_map(|event| match &event.kind {
+            EventKind::EgressFlow { destination, port } => Some((destination.as_str(), *port)),
+            _ => None,
+        }))
+        .and_then(|(destination, port)| {
+            destination
+                .parse::<IpAddr>()
+                .ok()
+                .map(|ip| SocketAddr::new(ip, port).to_string())
+        });
+        let path = agreed(events.iter().filter_map(|event| match &event.kind {
+            EventKind::ProcessExec { path, .. } | EventKind::FileWrite { path } => {
+                Some(path.as_str())
+            }
+            _ => None,
+        }))
+        .map(|path| escape_line(path, MAX_EVIDENCE_PATH_CHARS))
+        .filter(|path| !path.is_empty());
+        let process = agreed(events.iter().filter_map(|event| {
+            let process = event.actor.as_ref()?.process.as_ref()?;
+            Some((process.pid, process.comm.as_deref()))
+        }))
+        .map(|(pid, comm)| EvidenceProcess {
+            pid,
+            comm: escape_line(comm.unwrap_or_default(), MAX_EVIDENCE_COMM_CHARS),
+        });
+        let mut card = Self {
+            event_counts,
+            uid,
+            destination,
+            path,
+            process,
+        };
+        if card.encoded_len() > MAX_EVIDENCE_CARD_BYTES {
+            card.path = None;
+        }
+        (card.encoded_len() <= MAX_EVIDENCE_CARD_BYTES).then_some(card)
+    }
+
+    /// Länge der kompakten JSON-Form; `usize::MAX`, falls sie scheitert.
+    fn encoded_len(&self) -> usize {
+        serde_json::to_vec(self).map_or(usize::MAX, |bytes| bytes.len())
+    }
+}
+
+/// Der eine Wert, auf den sich alle Elemente einigen; `None` ohne Element
+/// oder bei einem Widerspruch.
+fn agreed<T: PartialEq>(values: impl IntoIterator<Item = T>) -> Option<T> {
+    let mut values = values.into_iter();
+    let first = values.next()?;
+    values.all(|value| value == first).then_some(first)
 }
 
 /// Bildet die DoD-Schwere erschöpfend auf die hub-seitige Skala ab.
@@ -145,83 +421,124 @@ pub const fn impact_severity(severity: Severity) -> ImpactSeverity {
     }
 }
 
-/// `true` für Zeichen, die in einer exportierten Zusammenfassung nichts
-/// verloren haben: Unicode-Steuerzeichen (`Cc`) sowie Zeichen, die die
-/// Darstellung umordnen oder verstecken (Bidi-Overrides/-Isolates,
-/// Nullbreiten, BOM, Zeilen-/Absatztrenner).
-fn is_unsafe_char(ch: char) -> bool {
-    ch.is_control()
-        || matches!(
-            ch,
-            '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{2069}'
-                | '\u{FEFF}'
-        )
+/// Die Export-Schreibweise von `kind` (snake_case, Export v3).
+///
+/// Erschöpfendes `match` ohne Wildcard, wie [`impact_severity`].
+#[must_use]
+pub const fn kind_label(kind: FindingKind) -> &'static str {
+    match kind {
+        FindingKind::RuleTriggered => "rule_triggered",
+        FindingKind::Anomaly => "anomaly",
+    }
 }
 
-/// Bereinigt eine Befund-Zusammenfassung für den Export.
+/// Die Export-Schreibweise von `hardness` (Export v3).
+///
+/// Erschöpfendes `match` ohne Wildcard, wie [`impact_severity`].
+#[must_use]
+pub const fn hardness_label(hardness: Hardness) -> &'static str {
+    match hardness {
+        Hardness::Observed => "observed",
+        Hardness::Correlated => "correlated",
+        Hardness::Inferred => "inferred",
+    }
+}
+
+/// Escapt eine Befund-Zusammenfassung für den Export.
 ///
 /// # Description
-/// Ersetzt jedes Zeichen aus [`is_unsafe_char`] durch ein Leerzeichen und
-/// kürzt das Ergebnis auf höchstens [`MAX_SUMMARY_BYTES`] Bytes, ohne ein
-/// UTF-8-Zeichen zu zerschneiden.
+/// Dünne Hülle um `harw_untrusted_text::escape_line`: jedes steuernde oder
+/// unsichtbare Zeichen (auch `\n`, `\r`, Bidi, Tag-Block, Variation
+/// Selectors) wird zu einem sichtbaren `\u{…}`, und das Ergebnis ist
+/// höchstens [`MAX_SUMMARY_BYTES`] Bytes lang. Gekürzt wird an einer
+/// Zeichengrenze, nie mitten in einer Ersatzform, mit `…` am Ende.
+///
+/// # Arguments
+/// - `raw` (`&str`): die rohe, erzeugerbeeinflusste Zusammenfassung.
+///
+/// # Returns
+/// Die einzeilige, escapte, begrenzte Zusammenfassung.
 #[must_use]
 pub fn sanitize_summary(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len().min(MAX_SUMMARY_BYTES));
-    for ch in raw.chars() {
-        let ch = if is_unsafe_char(ch) { ' ' } else { ch };
-        if out.len() + ch.len_utf8() > MAX_SUMMARY_BYTES {
-            break;
-        }
-        out.push(ch);
+    // `escape_line` begrenzt Zeichen, der Vertrag Bytes: so lange weniger
+    // Zeichen zulassen, bis die Bytes passen. Jedes Zeichen hat höchstens vier
+    // Bytes, also nähert sich das Budget in wenigen Schritten; bei `0` ist die
+    // Ausgabe leer und passt immer.
+    let mut budget = MAX_SUMMARY_BYTES;
+    loop {
+        let escaped = escape_line(raw, budget);
+        let Some(over) = escaped
+            .len()
+            .checked_sub(MAX_SUMMARY_BYTES)
+            .filter(|over| *over > 0)
+        else {
+            return escaped;
+        };
+        budget = budget.saturating_sub(over.div_ceil(4).max(1));
     }
-    out
 }
 
 /// Validates an optional `scope` (cgroup path) for the export.
 ///
 /// # Description
-/// Returns the value unchanged when it is non-empty, absolute, at most
-/// [`MAX_SCOPE_BYTES`] bytes long and free of the characters rejected by
-/// [`is_unsafe_char`]. Anything else yields `None`: the line is then written
-/// without `scope` instead of carrying a rewritten or truncated path that
-/// would name a different cgroup.
+/// Thin wrapper around `harw_untrusted_text::is_clean`: returns the value
+/// unchanged when it is non-empty, absolute, at most [`MAX_SCOPE_BYTES`]
+/// bytes long and free of every character the shared escaper would escape.
+/// Anything else yields `None` instead of a rewritten or truncated path that
+/// would name a different cgroup; [`encode_line`] then sets
+/// `scope_obfuscated` for a non-empty scope (PL-100 WP0.9).
 #[must_use]
 pub fn sanitize_scope(raw: Option<&str>) -> Option<&str> {
     let scope = raw?;
-    let acceptable = scope.starts_with('/')
-        && scope.len() <= MAX_SCOPE_BYTES
-        && !scope.chars().any(is_unsafe_char);
+    let acceptable = scope.starts_with('/') && scope.len() <= MAX_SCOPE_BYTES && is_clean(scope);
     acceptable.then_some(scope)
 }
 
-/// Kodiert eine Exportzeile inklusive abschließendem `\n`.
+/// Kodiert eine Exportzeile (Schema v3) inklusive abschließendem `\n`.
 ///
-/// `scope` is the optional cgroup attribution of version 2; it passes
-/// through [`sanitize_scope`] and is omitted when absent or unacceptable.
+/// # Description
+/// `summary` geht durch [`sanitize_summary`], `scope` durch
+/// [`sanitize_scope`]; ein nicht leerer, aber nicht darstellbarer Scope wird
+/// weggelassen und als `scope_obfuscated: true` gemeldet.
+///
+/// # Arguments
+/// - `fields` (`&LineFields`): der Befund samt Stempel, Herkunft, Record und
+///   Karte.
+/// - `host` (`&HostId`): das `host`-Feld.
+/// - `instance` (`&str`): UUIDv4 dieses Prozesses.
+/// - `seq` (`u64`): Position der Zeile in `instance`.
 ///
 /// # Errors
 /// `serde_json::Error`, falls die Serialisierung scheitert (für diese
 /// Feldtypen praktisch unerreichbar, aber nicht als Panik behandelt).
 pub fn encode_line(
-    finding_id: &FindingId,
+    fields: &LineFields<'_>,
     host: &HostId,
-    rule_id: &str,
-    severity: Severity,
-    summary: &str,
-    observed_at: Timestamp,
-    scope: Option<&str>,
+    instance: &str,
+    seq: u64,
 ) -> Result<String, serde_json::Error> {
+    let scope = sanitize_scope(fields.scope);
+    let scope_obfuscated = scope.is_none() && fields.scope.is_some_and(|raw| !raw.is_empty());
     let line = ExportLine {
         schema_version: EXPORT_SCHEMA_VERSION,
-        finding_id,
+        finding_id: fields.finding_id,
         host,
-        rule_id,
-        severity: impact_severity(severity),
-        summary: sanitize_summary(summary),
-        observed_at,
-        scope: sanitize_scope(scope),
+        rule_id: fields.rule_id,
+        severity: impact_severity(fields.severity),
+        summary: sanitize_summary(fields.summary),
+        observed_at: fields.observed_at,
+        scope,
+        instance,
+        seq,
+        record_digest: fields.record_digest,
+        dedup_key: fields.stamp.dedup_key.to_string(),
+        occurrences: fields.stamp.occurrences,
+        first_seen: fields.stamp.first_seen,
+        kind: kind_label(fields.kind),
+        hardness: hardness_label(fields.hardness),
+        cgroup_kid: fields.cgroup_kid,
+        scope_obfuscated,
+        evidence_card: fields.evidence_card,
     };
     let mut encoded = serde_json::to_string(&line)?;
     encoded.push('\n');
@@ -232,8 +549,9 @@ pub fn encode_line(
 /// Angabe, den Kernel-Hostnamen aus `hostname_path`.
 ///
 /// # Returns
-/// `None`, wenn weder eine Angabe vorliegt noch der Hostname lesbar und
-/// nicht leer ist — der Export bleibt dann aus (siehe `crate::run`).
+/// `None`, wenn weder eine Angabe vorliegt noch der Hostname lesbar, nicht
+/// leer und frei von zu escapenden Zeichen ist — der Export bleibt dann aus
+/// (siehe `crate::run`).
 #[must_use]
 pub fn resolve_host(explicit: Option<&HostId>, hostname_path: &Path) -> Option<HostId> {
     if let Some(host) = explicit {
@@ -241,7 +559,7 @@ pub fn resolve_host(explicit: Option<&HostId>, hostname_path: &Path) -> Option<H
     }
     let raw = fs::read_to_string(hostname_path).ok()?;
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.chars().any(is_unsafe_char) {
+    if trimmed.is_empty() || !is_clean(trimmed) {
         return None;
     }
     HostId::try_from_str(trimmed).ok()
@@ -523,9 +841,10 @@ fn is_findings_file(findings_name: &OsStr, name: &OsStr) -> bool {
 /// Append-only JSON-Lines-Schreiber für zertifizierte Befunde.
 ///
 /// # Description
-/// Hält die offene Datei, den `host`-Wert jeder Zeile und die Zähler für
-/// geschriebene und gescheiterte Zeilen. Siehe Moduldoku für Format,
-/// Rotation und Fehlerverhalten.
+/// Hält die offene Datei, den `host`-Wert jeder Zeile, die `instance` dieses
+/// Prozesses (UUIDv4, neu je Start), die nächste Folgenummer `seq` und die
+/// Zähler für geschriebene und gescheiterte Zeilen. Siehe Moduldoku für
+/// Format, Rotation und Fehlerverhalten.
 #[derive(Debug)]
 pub struct FindingsExporter {
     path: PathBuf,
@@ -533,6 +852,10 @@ pub struct FindingsExporter {
     /// Anzahl aufbewahrter rotierter Generationen (`<pfad>.1` … `<pfad>.N`).
     keep: u32,
     host: HostId,
+    /// UUIDv4 dieses Prozesses (`instance`, Export v3).
+    instance: String,
+    /// Folgenummer der nächsten Zeile (`seq`, ab 1).
+    next_seq: u64,
     max_bytes: u64,
     file: Option<File>,
     written: u64,
@@ -541,7 +864,8 @@ pub struct FindingsExporter {
 
 impl FindingsExporter {
     /// Baut einen Exporter für `path` mit der Rotationsschwelle
-    /// [`MAX_EXPORT_BYTES`]. Öffnet noch nichts — siehe [`Self::prepare`].
+    /// [`MAX_EXPORT_BYTES`] und einer frischen `instance`. Öffnet noch
+    /// nichts — siehe [`Self::prepare`].
     #[must_use]
     pub fn new(path: PathBuf, host: HostId) -> Self {
         Self::with_max_bytes(path, host, MAX_EXPORT_BYTES)
@@ -556,6 +880,8 @@ impl FindingsExporter {
             rotated,
             keep: 1,
             host,
+            instance: uuid::Uuid::new_v4().to_string(),
+            next_seq: 1,
             max_bytes,
             file: None,
             written: 0,
@@ -577,6 +903,13 @@ impl FindingsExporter {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Die `instance` dieses Exporters (UUIDv4).
+    #[cfg(test)]
+    #[must_use]
+    pub fn instance(&self) -> &str {
+        &self.instance
     }
 
     /// Verzeichnis der Exportdatei — muss für Rotation und Neuanlage
@@ -611,54 +944,29 @@ impl FindingsExporter {
         }
     }
 
-    /// Schreibt eine Zeile für `finding`.
+    /// Schreibt eine Zeile (Schema v3) für `fields`.
     ///
-    /// `scope` is the optional cgroup attribution (schema version 2; see
-    /// `crate::findings` for how it is derived).
+    /// # Description
+    /// Vergibt die nächste Folgenummer `seq` — auch dann, wenn die Zeile
+    /// danach scheitert: Nummern bleiben eindeutig, eine Lücke zeigt eine
+    /// verlorene Zeile —, kodiert über [`encode_line`] und hängt die Zeile
+    /// an (mit Rotation, siehe Moduldoku).
+    ///
+    /// # Arguments
+    /// - `sink` (`&dyn TelemetrySink`): erhält
+    ///   [`FINDINGS_EXPORT_FAILURE_TOTAL`] bei einem Fehler.
+    /// - `fields` (`&LineFields`): der Befund samt Stempel, Herkunft, Record
+    ///   und Karte.
     ///
     /// # Returns
     /// `true`, wenn die Zeile geschrieben wurde; `false` nach einem
     /// gezählten und geloggten Fehler.
-    pub fn export(
-        &mut self,
-        sink: &dyn TelemetrySink,
-        finding: &Finding<RuleChecked>,
-        scope: Option<&str>,
-    ) -> bool {
-        self.export_fields(
-            sink,
-            finding.id(),
-            finding.rule_id(),
-            finding.severity(),
-            finding.summary(),
-            finding.observed_at(),
-            scope,
-        )
-    }
-
-    /// Wie [`Self::export`], aus Einzelfeldern — der eigentliche Schreibweg.
-    ///
-    /// `scope` is the optional cgroup attribution (schema version 2).
-    #[allow(clippy::too_many_arguments)]
-    pub fn export_fields(
-        &mut self,
-        sink: &dyn TelemetrySink,
-        finding_id: &FindingId,
-        rule_id: &str,
-        severity: Severity,
-        summary: &str,
-        observed_at: Timestamp,
-        scope: Option<&str>,
-    ) -> bool {
-        let line = match encode_line(
-            finding_id,
-            &self.host,
-            rule_id,
-            severity,
-            summary,
-            observed_at,
-            scope,
-        ) {
+    pub fn export(&mut self, sink: &dyn TelemetrySink, fields: &LineFields<'_>) -> bool {
+        let seq = self.next_seq;
+        // 2^64 Zeilen je Prozess sind unerreichbar; die Sättigung verhindert
+        // nur einen Überlauf, keine realistische Wiederholung.
+        self.next_seq = self.next_seq.saturating_add(1);
+        let line = match encode_line(fields, &self.host, &self.instance, seq) {
             Ok(line) => line,
             Err(error) => {
                 self.record_failure(sink, &error, "encode");
@@ -753,14 +1061,16 @@ impl FindingsExporter {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use crate::throttle::{CoarseSubject, DedupKey};
     use harw_observe::NullSink;
     use serde::Deserialize;
 
     /// Spiegel von `harw_security_hub::findings::DodFinding` — derselbe
-    /// Feldsatz, dieselben Typen, und wie dort **ohne**
-    /// `deny_unknown_fields`: der Hub ignoriert die additiven Felder von
-    /// Version 2. Nur lokaler Rauchtest; verbindlich sind die Tests der
-    /// echten Leser gegen [`V2_FIXTURE_LINE`].
+    /// Feldsatz, dieselben Typen (inklusive der v3-Felder, die der Hub liest:
+    /// `schema_version`, `dedup_key`, `occurrences`), und wie dort **ohne**
+    /// `deny_unknown_fields`: der Hub ignoriert die übrigen Felder von
+    /// Version 2 und 3. Nur lokaler Rauchtest; verbindlich sind die Tests der
+    /// echten Leser gegen [`V3_FIXTURE_LINE`].
     #[derive(Debug, Deserialize)]
     struct HubDodFinding {
         finding_id: FindingId,
@@ -769,22 +1079,57 @@ mod tests {
         severity: ImpactSeverity,
         summary: String,
         observed_at: Timestamp,
+        #[serde(default)]
+        schema_version: Option<u32>,
+        #[serde(default)]
+        dedup_key: Option<String>,
+        #[serde(default)]
+        occurrences: Option<u64>,
     }
 
-    /// Spiegel der Zeile, die `harw-runtime/src/security_signals.rs`
-    /// (`Line`) liest — drei Strings, unbekannte Felder werden ignoriert.
+    /// Spiegel der Wire-Form, über die harw's `security_signals` liest: seit
+    /// PL-100 WP0.11 parst es mit `harw_dod_client::parse_finding_line`
+    /// (`RawFindingLine`) — jedes v3-Feld optional, unbekannte Felder
+    /// ignoriert. Die Regeln, die der Client zusätzlich prüft, prüft
+    /// [`assert_client_contract`].
     #[derive(Debug, Deserialize)]
     struct SecuritySignalsLine {
+        #[serde(default)]
+        schema_version: Option<u32>,
+        finding_id: String,
         rule_id: String,
         severity: String,
         observed_at: String,
+        #[serde(default)]
+        instance: Option<String>,
+        #[serde(default)]
+        seq: Option<u64>,
+        #[serde(default)]
+        record_digest: Option<String>,
+        #[serde(default)]
+        dedup_key: Option<String>,
+        #[serde(default)]
+        occurrences: Option<u64>,
+        #[serde(default)]
+        first_seen: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        hardness: Option<String>,
+        #[serde(default)]
+        cgroup_kid: Option<u64>,
+        #[serde(default)]
+        scope_obfuscated: bool,
+        #[serde(default)]
+        evidence_card: Option<serde_json::Value>,
     }
 
-    /// Strenger Spiegel einer Version-2-Zeile: `deny_unknown_fields`, damit
-    /// der Export **genau** diese Felder trägt und keines mehr.
+    /// Strenger Spiegel einer Zeile bis Version 3: `deny_unknown_fields`,
+    /// damit der Export **genau** diese Felder trägt und keines mehr; die
+    /// v2/v3-Felder sind optional, damit auch v1/v2-Zeilen passen.
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct ExportLineV2 {
+    struct ExportLineV3 {
         #[serde(default = "schema_v1")]
         schema_version: u32,
         finding_id: FindingId,
@@ -795,6 +1140,53 @@ mod tests {
         observed_at: Timestamp,
         #[serde(default)]
         scope: Option<String>,
+        #[serde(default)]
+        instance: Option<String>,
+        #[serde(default)]
+        seq: Option<u64>,
+        #[serde(default)]
+        record_digest: Option<String>,
+        #[serde(default)]
+        dedup_key: Option<String>,
+        #[serde(default)]
+        occurrences: Option<u64>,
+        #[serde(default)]
+        first_seen: Option<Timestamp>,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        hardness: Option<String>,
+        #[serde(default)]
+        cgroup_kid: Option<u64>,
+        #[serde(default)]
+        scope_obfuscated: bool,
+        #[serde(default)]
+        evidence_card: Option<EvidenceCardMirror>,
+    }
+
+    /// Strenger Spiegel der `evidence_card` (die Schlüssel, die der Client
+    /// bis Version 3 annimmt).
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct EvidenceCardMirror {
+        #[serde(default)]
+        event_counts: BTreeMap<String, u64>,
+        #[serde(default)]
+        uid: Option<u32>,
+        #[serde(default)]
+        destination: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        process: Option<ProcessMirror>,
+    }
+
+    /// Strenger Spiegel von `evidence_card.process`.
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct ProcessMirror {
+        pid: u32,
+        comm: String,
     }
 
     /// A line without `schema_version` is a version-1 line.
@@ -802,25 +1194,101 @@ mod tests {
         1
     }
 
+    /// `true` for a canonical lowercase UUIDv4 (the rule of
+    /// `harw_dod_client::findings::is_uuid_v4`).
+    fn is_uuid_v4(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        bytes.len() == 36
+            && bytes.iter().enumerate().all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => *byte == b'-',
+                14 => *byte == b'4',
+                19 => matches!(byte, b'8' | b'9' | b'a' | b'b'),
+                _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+            })
+    }
+
+    /// `true` for exactly `len` lowercase hex characters.
+    fn is_lower_hex(value: &str, len: usize) -> bool {
+        value.len() == len
+            && value
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    /// Die Regeln, mit denen `harw_dod_client` eine Zeile bis Version 3
+    /// annimmt oder verwirft (Kennungen, die der Sentinel selbst erzeugt).
+    fn assert_client_contract(line: &SecuritySignalsLine) {
+        let v3 = line.schema_version.is_some_and(|version| version >= 3);
+        assert!(
+            !v3 || is_uuid_v4(&line.finding_id),
+            "v3 finding_id is UUIDv4"
+        );
+        assert!(line.instance.as_deref().is_none_or(is_uuid_v4), "instance");
+        assert_ne!(line.seq, Some(0), "seq starts at 1");
+        assert!(
+            line.record_digest
+                .as_deref()
+                .is_none_or(|digest| is_lower_hex(digest, 64)),
+            "record_digest"
+        );
+        assert!(
+            line.dedup_key
+                .as_deref()
+                .is_none_or(|key| is_lower_hex(key, 32)),
+            "dedup_key"
+        );
+        assert_ne!(line.occurrences, Some(0), "occurrences >= 1");
+        assert!(
+            line.first_seen
+                .as_deref()
+                .is_none_or(|text| text.parse::<Timestamp>().is_ok()),
+            "first_seen is RFC 3339"
+        );
+        assert!(
+            line.kind
+                .as_deref()
+                .is_none_or(|kind| matches!(kind, "rule_triggered" | "anomaly")),
+            "kind"
+        );
+        assert!(
+            line.hardness
+                .as_deref()
+                .is_none_or(|hardness| matches!(hardness, "observed" | "correlated" | "inferred")),
+            "hardness"
+        );
+        assert!(
+            line.evidence_card.as_ref().is_none_or(|card| {
+                serde_json::to_vec(card).is_ok_and(|bytes| bytes.len() <= MAX_EVIDENCE_CARD_BYTES)
+            }),
+            "evidence_card <= 4 KiB"
+        );
+    }
+
     /// Eine Version-1-Zeile, wie sie vor PL-97 D1 geschrieben wurde.
     const V1_LINE: &str = r#"{"finding_id":"f-1","host":"host-a","rule_id":"structure-drift","severity":"high","summary":"s","observed_at":"2026-09-27T10:00:00Z"}"#;
 
-    /// Canonical version-2 fixture line: byte-for-byte what [`encode_line`]
-    /// writes for this finding (pinned by
-    /// `test_v2_fixture_line_is_byte_identical_to_encode_line`). The
-    /// reader-side tests in `harw-security-hub` (`findings::DodFinding`,
-    /// tail reader) and `harw-runtime` (`security_signals::count_recent`)
-    /// copy exactly this line, so a change to the encoder or to a reader
-    /// (`deny_unknown_fields`, a new required field) breaks a test on the
-    /// side that changed.
+    /// Eine Version-2-Zeile, wie sie bis PL-100 WP0.12 geschrieben wurde
+    /// (dieselbe Zeile steht in den Lesertests von `harw-security-hub` und
+    /// `harw-runtime`).
     const V2_FIXTURE_LINE: &str = r#"{"schema_version":2,"finding_id":"f-1","host":"host-a","rule_id":"structure-drift","severity":"high","summary":"s","observed_at":"2026-09-27T10:00:00Z","scope":"/sys/fs/cgroup/harw.slice"}"#;
+
+    /// Canonical version-3 fixture line: byte-for-byte what [`encode_line`]
+    /// writes for [`v3_fixture_fields`] (pinned by
+    /// `test_v3_fixture_line_is_byte_identical_to_encode_line`) and the same
+    /// line as `V3_FIXTURE_LINE` in `harw-security-hub/src/findings.rs`, so a
+    /// change to the encoder or to that reader breaks a test on the side that
+    /// changed.
+    const V3_FIXTURE_LINE: &str = r#"{"schema_version":3,"finding_id":"3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b","host":"host-a","rule_id":"egress-flow","severity":"critical","summary":"tcp connect","observed_at":"2026-09-27T11:00:00Z","scope":"/sys/fs/cgroup/harw.slice","instance":"a1b2c3d4-e5f6-4a7b-9c8d-0e1f2a3b4c5d","seq":7,"record_digest":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","dedup_key":"0123456789abcdef0123456789abcdef","occurrences":3,"first_seen":"2026-09-27T10:00:00Z","kind":"rule_triggered","hardness":"observed","cgroup_kid":4242,"scope_obfuscated":false,"evidence_card":{"event_counts":{"tcp_connect":3},"uid":1000,"destination":"203.0.113.9:443","path":"/usr/bin/curl","process":{"pid":4711,"comm":"curl"}}}"#;
+
+    /// `instance` of every test line encoded directly.
+    const INSTANCE: &str = "a1b2c3d4-e5f6-4a7b-9c8d-0e1f2a3b4c5d";
 
     fn host() -> TestResult<HostId> {
         HostId::try_from_str("host-a").map_err(ctx("host id"))
     }
 
     fn finding_id() -> TestResult<FindingId> {
-        FindingId::try_from_str("f-1").map_err(ctx("finding id"))
+        FindingId::try_from_str("3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b").map_err(ctx("finding id"))
     }
 
     fn read_lines(path: &Path) -> TestResult<Vec<String>> {
@@ -828,31 +1296,122 @@ mod tests {
         Ok(text.lines().map(str::to_owned).collect())
     }
 
+    /// Ein Throttle-Stempel ohne Wiederholung.
+    fn stamp_at(first_seen: Timestamp) -> ThrottleStamp {
+        ThrottleStamp {
+            dedup_key: DedupKey::derive(
+                "structure-drift",
+                None,
+                None,
+                &CoarseSubject::of_summary("s"),
+            ),
+            occurrences: 1,
+            first_seen,
+        }
+    }
+
+    /// Felder eines Befundes ohne Herkunft, Record und Karte.
+    fn fields<'a>(
+        finding_id: &'a FindingId,
+        rule_id: &'a str,
+        severity: Severity,
+        summary: &'a str,
+        observed_at: Timestamp,
+        scope: Option<&'a str>,
+    ) -> LineFields<'a> {
+        LineFields {
+            finding_id,
+            rule_id,
+            kind: FindingKind::RuleTriggered,
+            severity,
+            hardness: Hardness::Observed,
+            summary,
+            observed_at,
+            scope,
+            cgroup_kid: None,
+            stamp: stamp_at(observed_at),
+            record_digest: None,
+            evidence_card: None,
+        }
+    }
+
+    fn encode(fields: &LineFields<'_>) -> TestResult<String> {
+        encode_line(fields, &host()?, INSTANCE, 1).map_err(ctx("encode"))
+    }
+
+    fn at(text: &str) -> TestResult<Timestamp> {
+        text.parse().map_err(ctx("timestamp"))
+    }
+
+    /// Die Karte der Fixture-Zeile.
+    fn fixture_card() -> EvidenceCard {
+        EvidenceCard {
+            event_counts: BTreeMap::from([("tcp_connect".to_owned(), 3)]),
+            uid: Some(1000),
+            destination: Some("203.0.113.9:443".to_owned()),
+            path: Some("/usr/bin/curl".to_owned()),
+            process: Some(EvidenceProcess {
+                pid: 4711,
+                comm: "curl".to_owned(),
+            }),
+        }
+    }
+
+    /// Kodiert die Fixture-Zeile mit `seq = 7`.
+    fn encode_v3_fixture(id: &FindingId, card: &EvidenceCard) -> TestResult<String> {
+        let dedup_key = DedupKey::parse_hex("0123456789abcdef0123456789abcdef")
+            .ok_or(TestError::Missing("fixture dedup key"))?;
+        let record_digest: ContentDigest =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .parse()
+                .map_err(ctx("fixture record digest"))?;
+        let fields = LineFields {
+            finding_id: id,
+            rule_id: "egress-flow",
+            kind: FindingKind::RuleTriggered,
+            severity: Severity::Critical,
+            hardness: Hardness::Observed,
+            summary: "tcp connect",
+            observed_at: at("2026-09-27T11:00:00Z")?,
+            scope: Some("/sys/fs/cgroup/harw.slice"),
+            cgroup_kid: Some(4242),
+            stamp: ThrottleStamp {
+                dedup_key,
+                occurrences: 3,
+                first_seen: at("2026-09-27T10:00:00Z")?,
+            },
+            record_digest: Some(record_digest),
+            evidence_card: Some(card),
+        };
+        encode_line(&fields, &host()?, INSTANCE, 7).map_err(ctx("encode"))
+    }
+
     #[test]
     fn test_encoded_line_parses_as_the_hub_record() -> TestResult {
-        let observed_at: Timestamp = "2026-09-27T10:00:00Z".parse().map_err(ctx("timestamp"))?;
-        let line = encode_line(
-            &finding_id()?,
-            &host()?,
+        let observed_at = at("2026-09-27T10:00:00Z")?;
+        let id = finding_id()?;
+        let line = encode(&fields(
+            &id,
             "structure-drift",
             Severity::High,
             "new workspace member",
             observed_at,
             None,
-        )
-        .map_err(ctx("encode"))?;
+        ))?;
 
         assert!(line.ends_with('\n'), "one JSON object per line");
         assert_eq!(line.matches('\n').count(), 1, "exactly one newline");
 
         let parsed: HubDodFinding =
             serde_json::from_str(line.trim_end()).map_err(ctx("hub-shaped parse"))?;
-        assert_eq!(parsed.finding_id.as_str(), "f-1");
+        assert_eq!(parsed.finding_id, id);
         assert_eq!(parsed.host.as_str(), "host-a");
         assert_eq!(parsed.rule_id, "structure-drift");
         assert_eq!(parsed.severity, ImpactSeverity::High);
         assert_eq!(parsed.summary, "new workspace member");
         assert_eq!(parsed.observed_at, observed_at);
+        assert_eq!(parsed.schema_version, Some(EXPORT_SCHEMA_VERSION));
+        assert_eq!(parsed.occurrences, Some(1));
 
         let value: serde_json::Value =
             serde_json::from_str(line.trim_end()).map_err(ctx("raw parse"))?;
@@ -862,46 +1421,97 @@ mod tests {
     }
 
     #[test]
-    fn test_encoded_line_is_schema_version_2_without_scope_by_default() -> TestResult {
-        let line = encode_line(
-            &finding_id()?,
-            &host()?,
+    fn test_encoded_line_is_schema_version_3_without_optional_fields_by_default() -> TestResult {
+        let id = finding_id()?;
+        let line = encode(&fields(
+            &id,
             "structure-drift",
             Severity::High,
             "s",
             Timestamp::UNIX_EPOCH,
             None,
-        )
-        .map_err(ctx("encode"))?;
-        let strict: ExportLineV2 =
-            serde_json::from_str(line.trim_end()).map_err(ctx("strict v2 parse"))?;
+        ))?;
+        let strict: ExportLineV3 =
+            serde_json::from_str(line.trim_end()).map_err(ctx("strict v3 parse"))?;
         assert_eq!(strict.schema_version, EXPORT_SCHEMA_VERSION);
-        assert_eq!(strict.schema_version, 2);
+        assert_eq!(strict.schema_version, 3);
         assert_eq!(strict.scope, None);
+        assert!(!strict.scope_obfuscated);
+        assert_eq!(strict.instance.as_deref(), Some(INSTANCE));
+        assert_eq!(strict.seq, Some(1));
+        assert_eq!(strict.kind.as_deref(), Some("rule_triggered"));
+        assert_eq!(strict.hardness.as_deref(), Some("observed"));
+        assert_eq!(strict.occurrences, Some(1));
+        assert_eq!(strict.first_seen, Some(Timestamp::UNIX_EPOCH));
         let value: serde_json::Value =
             serde_json::from_str(line.trim_end()).map_err(ctx("raw parse"))?;
-        assert!(value.get("scope").is_none(), "absent scope is omitted");
+        for absent in ["scope", "record_digest", "cgroup_kid", "evidence_card"] {
+            assert!(
+                value.get(absent).is_none(),
+                "{absent} is omitted when unset"
+            );
+        }
+        assert_eq!(value["scope_obfuscated"], false, "always written");
         Ok(())
     }
 
     #[test]
     fn test_encoded_line_carries_an_acceptable_scope() -> TestResult {
-        let line = encode_line(
-            &finding_id()?,
-            &host()?,
+        let id = finding_id()?;
+        let line = encode(&fields(
+            &id,
             "egress-flow",
             Severity::Critical,
             "s",
             Timestamp::UNIX_EPOCH,
             Some("/sys/fs/cgroup/harw.slice/harw-job-1"),
-        )
-        .map_err(ctx("encode"))?;
-        let strict: ExportLineV2 =
-            serde_json::from_str(line.trim_end()).map_err(ctx("strict v2 parse"))?;
+        ))?;
+        let strict: ExportLineV3 =
+            serde_json::from_str(line.trim_end()).map_err(ctx("strict v3 parse"))?;
         assert_eq!(
             strict.scope.as_deref(),
             Some("/sys/fs/cgroup/harw.slice/harw-job-1")
         );
+        assert!(!strict.scope_obfuscated);
+        Ok(())
+    }
+
+    /// PL-100 WP0.9: ein nicht darstellbarer Scope wird zurückgehalten und
+    /// als `scope_obfuscated` gemeldet, statt still zu verschwinden.
+    #[test]
+    fn test_unrenderable_scope_is_withheld_and_marked_obfuscated() -> TestResult {
+        let id = finding_id()?;
+        for raw in [
+            "/sys/fs/cgroup/harw\u{200B}.slice",
+            "/sys/fs/cgroup/a\nb",
+            "/sys/fs/cgroup/\u{E0041}x",
+            "relative/cgroup",
+        ] {
+            let line = encode(&fields(
+                &id,
+                "egress-flow",
+                Severity::High,
+                "s",
+                Timestamp::UNIX_EPOCH,
+                Some(raw),
+            ))?;
+            let strict: ExportLineV3 =
+                serde_json::from_str(line.trim_end()).map_err(ctx("strict v3 parse"))?;
+            assert_eq!(strict.scope, None, "{raw:?} is not exported");
+            assert!(strict.scope_obfuscated, "{raw:?} is marked obfuscated");
+            assert!(!line.contains('\u{200B}') && !line.contains('\u{E0041}'));
+        }
+        let empty = encode(&fields(
+            &id,
+            "egress-flow",
+            Severity::High,
+            "s",
+            Timestamp::UNIX_EPOCH,
+            Some(""),
+        ))?;
+        let strict: ExportLineV3 =
+            serde_json::from_str(empty.trim_end()).map_err(ctx("strict v3 parse"))?;
+        assert!(!strict.scope_obfuscated, "an empty scope is no scope");
         Ok(())
     }
 
@@ -912,67 +1522,128 @@ mod tests {
         assert_eq!(sanitize_scope(Some("relative/cgroup")), None);
         assert_eq!(sanitize_scope(Some("/a\nb")), None);
         assert_eq!(sanitize_scope(Some("/a\u{202E}b")), None);
+        assert_eq!(sanitize_scope(Some("/a\u{E0041}b")), None, "tag block");
+        assert_eq!(
+            sanitize_scope(Some("/a\u{FE0F}b")),
+            None,
+            "variation selector"
+        );
         let long = format!("/{}", "x".repeat(MAX_SCOPE_BYTES));
         assert_eq!(sanitize_scope(Some(&long)), None);
         assert_eq!(sanitize_scope(Some("/harw.slice")), Some("/harw.slice"));
     }
 
     #[test]
-    fn test_v1_and_v2_lines_parse_for_every_known_reader() -> TestResult {
-        let v2 = encode_line(
-            &finding_id()?,
-            &host()?,
+    fn test_v1_v2_and_v3_lines_parse_for_every_known_reader() -> TestResult {
+        let id = finding_id()?;
+        let v3 = encode(&fields(
+            &id,
             "structure-drift",
             Severity::High,
             "s",
-            "2026-09-27T10:00:00Z".parse().map_err(ctx("timestamp"))?,
+            at("2026-09-27T10:00:00Z")?,
             Some("/sys/fs/cgroup/harw.slice"),
-        )
-        .map_err(ctx("encode"))?;
-        for raw in [V1_LINE, v2.trim_end()] {
+        ))?;
+        for raw in [V1_LINE, V2_FIXTURE_LINE, v3.trim_end(), V3_FIXTURE_LINE] {
             let hub: HubDodFinding = serde_json::from_str(raw).map_err(ctx("hub reader"))?;
-            assert_eq!(hub.rule_id, "structure-drift");
-            assert_eq!(hub.severity, ImpactSeverity::High);
+            assert!(!hub.rule_id.is_empty());
+            assert!(!hub.summary.is_empty());
             let signals: SecuritySignalsLine =
                 serde_json::from_str(raw).map_err(ctx("security_signals reader"))?;
-            assert_eq!(signals.rule_id, "structure-drift");
-            assert_eq!(signals.severity, "high");
-            assert_eq!(signals.observed_at, "2026-09-27T10:00:00Z");
+            assert_client_contract(&signals);
+            let strict: ExportLineV3 = serde_json::from_str(raw).map_err(ctx("strict v3 shape"))?;
+            assert!((1..=EXPORT_SCHEMA_VERSION).contains(&strict.schema_version));
         }
-        let v1: ExportLineV2 = serde_json::from_str(V1_LINE).map_err(ctx("v1 via v2 shape"))?;
+        let v1: ExportLineV3 = serde_json::from_str(V1_LINE).map_err(ctx("v1 via v3 shape"))?;
         assert_eq!(v1.schema_version, 1, "missing schema_version means v1");
         assert_eq!(v1.scope, None);
+        assert_eq!(v1.instance, None);
         assert_eq!(v1.finding_id.as_str(), "f-1");
         assert_eq!(v1.host.as_str(), "host-a");
         assert_eq!(v1.rule_id, "structure-drift");
         assert_eq!(v1.severity, ImpactSeverity::High);
         assert_eq!(v1.summary, "s");
-        assert_eq!(
-            v1.observed_at,
-            "2026-09-27T10:00:00Z"
-                .parse::<Timestamp>()
-                .map_err(ctx("timestamp"))?
-        );
+        assert_eq!(v1.observed_at, at("2026-09-27T10:00:00Z")?);
+        let v2: ExportLineV3 =
+            serde_json::from_str(V2_FIXTURE_LINE).map_err(ctx("v2 via v3 shape"))?;
+        assert_eq!(v2.schema_version, 2);
+        assert_eq!(v2.scope.as_deref(), Some("/sys/fs/cgroup/harw.slice"));
+        assert_eq!((v2.seq, v2.dedup_key), (None, None));
         Ok(())
     }
 
     #[test]
-    fn test_v2_fixture_line_is_byte_identical_to_encode_line() -> TestResult {
-        let encoded = encode_line(
-            &finding_id()?,
-            &host()?,
-            "structure-drift",
-            Severity::High,
-            "s",
-            "2026-09-27T10:00:00Z".parse().map_err(ctx("timestamp"))?,
-            Some("/sys/fs/cgroup/harw.slice"),
-        )
-        .map_err(ctx("encode"))?;
-        assert_eq!(encoded, format!("{V2_FIXTURE_LINE}\n"));
-        let strict: ExportLineV2 =
-            serde_json::from_str(V2_FIXTURE_LINE).map_err(ctx("strict v2 parse"))?;
-        assert_eq!(strict.schema_version, EXPORT_SCHEMA_VERSION);
+    fn test_v3_fixture_line_is_byte_identical_to_encode_line() -> TestResult {
+        let id = finding_id()?;
+        let card = fixture_card();
+        let encoded = encode_v3_fixture(&id, &card)?;
+        assert_eq!(encoded, format!("{V3_FIXTURE_LINE}\n"));
+        Ok(())
+    }
+
+    /// Rundreise v3: jedes geschriebene Feld kommt bei jedem Leser-Spiegel
+    /// unverändert an.
+    #[test]
+    fn test_v3_line_round_trips_through_every_reader_mirror() -> TestResult {
+        let id = finding_id()?;
+        let card = fixture_card();
+        let encoded = encode_v3_fixture(&id, &card)?;
+        let raw = encoded.trim_end();
+
+        let strict: ExportLineV3 = serde_json::from_str(raw).map_err(ctx("strict v3 parse"))?;
+        assert_eq!(strict.schema_version, 3);
+        assert_eq!(strict.finding_id, id);
+        assert_eq!(strict.rule_id, "egress-flow");
+        assert_eq!(strict.severity, ImpactSeverity::Critical);
+        assert_eq!(strict.summary, "tcp connect");
+        assert_eq!(strict.observed_at, at("2026-09-27T11:00:00Z")?);
         assert_eq!(strict.scope.as_deref(), Some("/sys/fs/cgroup/harw.slice"));
+        assert_eq!(strict.instance.as_deref(), Some(INSTANCE));
+        assert_eq!(strict.seq, Some(7));
+        assert_eq!(
+            strict.record_digest.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            strict.dedup_key.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(strict.occurrences, Some(3));
+        assert_eq!(strict.first_seen, Some(at("2026-09-27T10:00:00Z")?));
+        assert_eq!(strict.kind.as_deref(), Some("rule_triggered"));
+        assert_eq!(strict.hardness.as_deref(), Some("observed"));
+        assert_eq!(strict.cgroup_kid, Some(4242));
+        assert!(!strict.scope_obfuscated);
+        assert_eq!(
+            strict.evidence_card,
+            Some(EvidenceCardMirror {
+                event_counts: BTreeMap::from([("tcp_connect".to_owned(), 3)]),
+                uid: Some(1000),
+                destination: Some("203.0.113.9:443".to_owned()),
+                path: Some("/usr/bin/curl".to_owned()),
+                process: Some(ProcessMirror {
+                    pid: 4711,
+                    comm: "curl".to_owned(),
+                }),
+            })
+        );
+
+        let hub: HubDodFinding = serde_json::from_str(raw).map_err(ctx("hub reader"))?;
+        assert_eq!(hub.schema_version, Some(3));
+        assert_eq!(
+            hub.dedup_key.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(hub.occurrences, Some(3));
+
+        let signals: SecuritySignalsLine =
+            serde_json::from_str(raw).map_err(ctx("security_signals reader"))?;
+        assert_client_contract(&signals);
+        assert_eq!(signals.rule_id, "egress-flow");
+        assert_eq!(signals.severity, "critical");
+        assert_eq!(signals.observed_at, "2026-09-27T11:00:00Z");
+        assert_eq!(signals.cgroup_kid, Some(4242));
+        assert!(!signals.scope_obfuscated);
         Ok(())
     }
 
@@ -993,59 +1664,170 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_summary_replaces_control_and_bidi_characters() {
-        let cleaned = sanitize_summary("a\nb\r\tc\u{1b}[31md\u{202E}e\u{0}f");
-        assert_eq!(cleaned, "a b  c [31md e f");
-        assert!(!cleaned.chars().any(is_unsafe_char));
+    fn test_kind_and_hardness_labels_are_the_reader_spellings() {
+        assert_eq!(kind_label(FindingKind::RuleTriggered), "rule_triggered");
+        assert_eq!(kind_label(FindingKind::Anomaly), "anomaly");
+        assert_eq!(hardness_label(Hardness::Observed), "observed");
+        assert_eq!(hardness_label(Hardness::Correlated), "correlated");
+        assert_eq!(hardness_label(Hardness::Inferred), "inferred");
+    }
+
+    #[test]
+    fn test_sanitize_summary_escapes_control_and_bidi_characters() {
+        let cleaned = sanitize_summary("a\nb\r\tc\u{1b}[31md\u{202E}e\u{0}f\u{E0041}");
+        assert_eq!(
+            cleaned,
+            "a\\u{000a}b\\u{000d}\\u{0009}c\\u{001b}[31md\\u{202e}e\\u{0000}f\\u{e0041}"
+        );
+        assert!(is_clean(&cleaned));
     }
 
     #[test]
     fn test_sanitize_summary_caps_at_512_bytes_on_a_char_boundary() {
-        let ascii = "x".repeat(2 * MAX_SUMMARY_BYTES);
-        assert_eq!(sanitize_summary(&ascii).len(), MAX_SUMMARY_BYTES);
+        let ascii = sanitize_summary(&"x".repeat(2 * MAX_SUMMARY_BYTES));
+        assert!(ascii.len() <= MAX_SUMMARY_BYTES);
+        assert!(ascii.ends_with('…'), "a cut summary is marked");
+        assert!(ascii.len() >= MAX_SUMMARY_BYTES - 4, "the budget is used");
 
-        // 3-Byte-Zeichen: 512 ist nicht durch 3 teilbar, also 510 Bytes.
-        let wide = "€".repeat(MAX_SUMMARY_BYTES);
-        let cut = sanitize_summary(&wide);
-        assert_eq!(cut.len(), 510);
-        assert!(cut.chars().all(|ch| ch == '€'));
+        // 3-Byte-Zeichen: die Grenze gilt in Bytes, nicht in Zeichen.
+        let wide = sanitize_summary(&"€".repeat(MAX_SUMMARY_BYTES));
+        assert!(wide.len() <= MAX_SUMMARY_BYTES);
+        assert!(wide.ends_with('…'));
+        assert!(wide.trim_end_matches('…').chars().all(|ch| ch == '€'));
+
+        let short = sanitize_summary("unchanged");
+        assert_eq!(short, "unchanged");
+    }
+
+    #[test]
+    fn test_sanitize_summary_never_cuts_an_escape_sequence() {
+        let escapes = sanitize_summary(&"\u{202E}".repeat(MAX_SUMMARY_BYTES));
+        assert!(escapes.len() <= MAX_SUMMARY_BYTES);
+        let body = escapes.trim_end_matches('…');
+        assert_eq!(body.len() % "\\u{202e}".len(), 0, "{escapes}");
+        assert!(body.split("\\u{202e}").all(str::is_empty));
     }
 
     #[test]
     fn test_encoded_line_carries_the_sanitized_summary() -> TestResult {
-        let line = encode_line(
-            &finding_id()?,
-            &host()?,
+        let id = finding_id()?;
+        let summary = format!("evil\n{{\"injected\":1}}{}", "y".repeat(4096));
+        let line = encode(&fields(
+            &id,
             "structure-drift",
             Severity::Low,
-            &format!("evil\n{{\"injected\":1}}{}", "y".repeat(4096)),
+            &summary,
             Timestamp::UNIX_EPOCH,
             None,
-        )
-        .map_err(ctx("encode"))?;
+        ))?;
         assert_eq!(line.matches('\n').count(), 1, "no line injection");
         let parsed: HubDodFinding =
             serde_json::from_str(line.trim_end()).map_err(ctx("hub-shaped parse"))?;
         assert!(parsed.summary.len() <= MAX_SUMMARY_BYTES);
-        assert!(parsed.summary.starts_with("evil {"));
+        assert!(parsed.summary.starts_with("evil\\u{000a}{"));
+        Ok(())
+    }
+
+    fn egress_event(uid: Option<u32>, destination: &str, port: u16) -> SecurityEvent {
+        SecurityEvent {
+            sensor: harw_types::SensorId::from_str("probe-bpf-0"),
+            observed_at: Timestamp::UNIX_EPOCH,
+            actor: uid.map(|uid| harw_dod_signals::Actor {
+                uid,
+                auid: None,
+                cgroup: None,
+                process: Some(harw_dod_signals::ProcessContext {
+                    pid: 4711,
+                    ppid: None,
+                    comm: Some("curl\u{202E}".to_owned()),
+                    euid: None,
+                }),
+            }),
+            kind: EventKind::EgressFlow {
+                destination: destination.to_owned(),
+                port,
+            },
+        }
+    }
+
+    #[test]
+    fn test_evidence_card_summarizes_agreeing_events_only() -> TestResult {
+        let first = egress_event(Some(1000), "203.0.113.9", 443);
+        let second = egress_event(Some(1000), "203.0.113.9", 443);
+        let card = EvidenceCard::from_events(&[&first, &second])
+            .ok_or(TestError::Missing("card of two events"))?;
+        assert_eq!(card.event_counts.get("egress-flow"), Some(&2));
+        assert_eq!(card.uid, Some(1000));
+        assert_eq!(card.destination.as_deref(), Some("203.0.113.9:443"));
+        assert_eq!(card.path, None);
+        let process = card.process.as_ref().ok_or(TestError::Missing("process"))?;
+        assert_eq!(process.pid, 4711);
+        assert_eq!(process.comm, "curl\\u{202e}", "comm is escaped");
+
+        let other_uid = egress_event(Some(1001), "203.0.113.10", 443);
+        let mixed = EvidenceCard::from_events(&[&first, &other_uid])
+            .ok_or(TestError::Missing("card of mixed events"))?;
+        assert_eq!(mixed.uid, None, "disagreeing uids are not guessed");
+        assert_eq!(mixed.destination, None, "disagreeing destinations neither");
+
+        let v6 = egress_event(None, "2001:db8::1", 8443);
+        let v6_card =
+            EvidenceCard::from_events(&[&v6]).ok_or(TestError::Missing("card of v6 flow"))?;
+        assert_eq!(v6_card.destination.as_deref(), Some("[2001:db8::1]:8443"));
+        assert_eq!(v6_card.uid, None);
+
+        let hostname = egress_event(None, "example.invalid", 443);
+        let named = EvidenceCard::from_events(&[&hostname])
+            .ok_or(TestError::Missing("card of named flow"))?;
+        assert_eq!(named.destination, None, "only IP literals are ip:port");
+
+        assert_eq!(EvidenceCard::from_events(&[]), None);
         Ok(())
     }
 
     #[test]
-    fn test_exporter_appends_one_hub_parsable_line_per_finding() -> TestResult {
+    fn test_evidence_card_path_is_escaped_bounded_and_the_card_fits() -> TestResult {
+        let event = SecurityEvent {
+            sensor: harw_types::SensorId::from_str("probe-fs-0"),
+            observed_at: Timestamp::UNIX_EPOCH,
+            actor: None,
+            kind: EventKind::FileWrite {
+                path: format!("/tmp/{}\u{202E}gpj.exe", "\u{200B}".repeat(4096)),
+            },
+        };
+        let card =
+            EvidenceCard::from_events(&[&event]).ok_or(TestError::Missing("card of a write"))?;
+        let path = card
+            .path
+            .as_deref()
+            .ok_or(TestError::Missing("path kept"))?;
+        assert!(path.chars().count() <= MAX_EVIDENCE_PATH_CHARS);
+        assert!(path.ends_with('…'));
+        assert!(is_clean(path));
+        let encoded = serde_json::to_vec(&card).map_err(ctx("card encodes"))?;
+        assert!(encoded.len() <= MAX_EVIDENCE_CARD_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn test_exporter_appends_one_line_per_finding_with_increasing_seq() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = dir.path().join("findings.jsonl");
         let mut exporter = FindingsExporter::new(path.clone(), host()?);
+        assert!(is_uuid_v4(exporter.instance()), "instance is a UUIDv4");
 
+        let id = finding_id()?;
         for rule in ["structure-drift", "egress-flow"] {
-            let ok = exporter.export_fields(
+            let ok = exporter.export(
                 &NullSink,
-                &finding_id()?,
-                rule,
-                Severity::Medium,
-                "summary",
-                Timestamp::UNIX_EPOCH,
-                None,
+                &fields(
+                    &id,
+                    rule,
+                    Severity::Medium,
+                    "summary",
+                    Timestamp::UNIX_EPOCH,
+                    None,
+                ),
             );
             assert!(ok);
         }
@@ -1054,8 +1836,19 @@ mod tests {
 
         let lines = read_lines(&path)?;
         assert_eq!(lines.len(), 2);
-        let second: HubDodFinding = serde_json::from_str(&lines[1]).map_err(ctx("second line"))?;
+        let mut seqs = Vec::new();
+        for line in &lines {
+            let strict: ExportLineV3 = serde_json::from_str(line).map_err(ctx("line"))?;
+            assert_eq!(strict.instance.as_deref(), Some(exporter.instance()));
+            seqs.push(strict.seq);
+        }
+        assert_eq!(seqs, vec![Some(1), Some(2)]);
+        let second = lines.get(1).ok_or(TestError::Missing("second line"))?;
+        let second: HubDodFinding = serde_json::from_str(second).map_err(ctx("second line"))?;
         assert_eq!(second.rule_id, "egress-flow");
+
+        let other = FindingsExporter::new(path, host()?);
+        assert_ne!(other.instance(), exporter.instance(), "new per start");
         Ok(())
     }
 
@@ -1097,34 +1890,42 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_exporter_rotates_to_dot_one_when_the_cap_would_be_exceeded() -> TestResult {
-        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let path = dir.path().join("findings.jsonl");
-        let line_len = encode_line(
-            &finding_id()?,
-            &host()?,
+    /// Länge einer Zeile mit `seq` aus genau einer Ziffer.
+    fn one_digit_line_len() -> TestResult<u64> {
+        let id = finding_id()?;
+        let line = encode(&fields(
+            &id,
             "structure-drift",
             Severity::Info,
             "s",
             Timestamp::UNIX_EPOCH,
             None,
-        )
-        .map_err(ctx("encode"))?
-        .len();
-        // Platz für genau zwei Zeilen.
-        let cap = u64::try_from(2 * line_len).map_err(ctx("cap"))?;
+        ))?;
+        u64::try_from(line.len()).map_err(ctx("line length"))
+    }
+
+    #[test]
+    fn test_exporter_rotates_to_dot_one_when_the_cap_would_be_exceeded() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        // Platz für genau zwei Zeilen (`seq` 1 bis 3 haben je eine Ziffer).
+        let cap = one_digit_line_len()?
+            .checked_mul(2)
+            .ok_or(TestError::Missing("cap"))?;
         let mut exporter = FindingsExporter::with_max_bytes(path.clone(), host()?, cap);
 
+        let id = finding_id()?;
         for _ in 0..3 {
-            let ok = exporter.export_fields(
+            let ok = exporter.export(
                 &NullSink,
-                &finding_id()?,
-                "structure-drift",
-                Severity::Info,
-                "s",
-                Timestamp::UNIX_EPOCH,
-                None,
+                &fields(
+                    &id,
+                    "structure-drift",
+                    Severity::Info,
+                    "s",
+                    Timestamp::UNIX_EPOCH,
+                    None,
+                ),
             );
             assert!(ok);
         }
@@ -1142,30 +1943,23 @@ mod tests {
     fn test_keep_three_generations_shifts_older_files_and_drops_the_oldest() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = dir.path().join("findings.jsonl");
-        let line_len = encode_line(
-            &finding_id()?,
-            &host()?,
-            "structure-drift",
-            Severity::Info,
-            "s",
-            Timestamp::UNIX_EPOCH,
-            None,
-        )
-        .map_err(ctx("encode"))?
-        .len();
-        // Genau eine Zeile je Datei: jede weitere Zeile rotiert.
-        let cap = u64::try_from(line_len).map_err(ctx("cap"))?;
+        // Genau eine Zeile je Datei: jede weitere Zeile rotiert (`seq` 1
+        // bis 6 haben je eine Ziffer).
+        let cap = one_digit_line_len()?;
         let mut exporter =
             FindingsExporter::with_max_bytes(path.clone(), host()?, cap).with_keep(3);
+        let id = finding_id()?;
         for _ in 0..6 {
-            assert!(exporter.export_fields(
+            assert!(exporter.export(
                 &NullSink,
-                &finding_id()?,
-                "structure-drift",
-                Severity::Info,
-                "s",
-                Timestamp::UNIX_EPOCH,
-                None,
+                &fields(
+                    &id,
+                    "structure-drift",
+                    Severity::Info,
+                    "s",
+                    Timestamp::UNIX_EPOCH,
+                    None,
+                ),
             ));
         }
         for generation in 1..=3 {
@@ -1194,25 +1988,29 @@ mod tests {
     }
 
     #[test]
-    fn test_write_failure_is_counted_not_fatal() -> TestResult {
+    fn test_write_failure_is_counted_not_fatal_and_still_takes_a_seq() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         // Ein Verzeichnis am Zielpfad: jeder Versuch scheitert.
         let path = dir.path().join("is-a-dir");
         fs::create_dir(&path).map_err(ctx("mkdir"))?;
         let mut exporter = FindingsExporter::new(path, host()?);
         exporter.prepare(&NullSink);
-        let ok = exporter.export_fields(
+        let id = finding_id()?;
+        let ok = exporter.export(
             &NullSink,
-            &finding_id()?,
-            "structure-drift",
-            Severity::High,
-            "s",
-            Timestamp::UNIX_EPOCH,
-            None,
+            &fields(
+                &id,
+                "structure-drift",
+                Severity::High,
+                "s",
+                Timestamp::UNIX_EPOCH,
+                None,
+            ),
         );
         assert!(!ok);
         assert_eq!(exporter.failures(), 2, "prepare + export both counted");
         assert_eq!(exporter.written(), 0);
+        assert_eq!(exporter.next_seq, 2, "the failed line used seq 1");
         Ok(())
     }
 
@@ -1248,6 +2046,8 @@ mod tests {
 
         assert!(resolve_host(None, &dir.path().join("missing")).is_none());
         fs::write(&hostname, "  \n").map_err(ctx("blank hostname"))?;
+        assert!(resolve_host(None, &hostname).is_none());
+        fs::write(&hostname, "node\u{200B}-7\n").map_err(ctx("zero-width hostname"))?;
         assert!(resolve_host(None, &hostname).is_none());
         Ok(())
     }
