@@ -234,6 +234,20 @@ pub struct Cli {
     /// `sentinel_export` (`harw-retention`).
     #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
     pub findings_export_keep: u32,
+
+    /// Abklingzeit des Befund-Throttles in Sekunden (PL-100 WP0.4): ein
+    /// Befund mit demselben `dedup_key` (Regel, uid, Cgroup, grobes Subjekt)
+    /// wird innerhalb dieser Zeit nur gezählt, nicht erneut gemeldet — außer
+    /// bei stärkerer Härte oder höherer Schwere. Vorgabe 600 (10 min), `0`
+    /// meldet jede Wiederholung, höchstens 604800 (7 Tage). Siehe
+    /// `crate::throttle`.
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = crate::throttle::DEFAULT_COOLDOWN_SECS,
+        value_parser = clap::value_parser!(u64).range(0..=crate::throttle::MAX_COOLDOWN_SECS)
+    )]
+    pub finding_cooldown_secs: u64,
 }
 
 impl Cli {
@@ -315,6 +329,20 @@ mod tests {
             result.is_err(),
             "an unrecognised --log value must be a parse error, not a silent default"
         );
+    }
+
+    #[test]
+    fn test_finding_cooldown_defaults_to_ten_minutes_and_is_bounded() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert_eq!(cli.finding_cooldown_secs, 600);
+        let zero = Cli::try_parse_from(["harw-sentinel", "--finding-cooldown-secs", "0"])
+            .map_err(ctx("zero cooldown"))?;
+        assert_eq!(zero.finding_cooldown_secs, 0);
+        assert!(
+            Cli::try_parse_from(["harw-sentinel", "--finding-cooldown-secs", "604801"]).is_err(),
+            "more than seven days is rejected"
+        );
+        Ok(())
     }
 
     #[test]

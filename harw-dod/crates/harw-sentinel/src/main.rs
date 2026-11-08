@@ -182,6 +182,17 @@
 //! einer durchgesetzten Aktion weiterhin fehlt (Bruch 2, ausdrücklich nicht
 //! Teil dieses Knotens).
 //!
+//! # Entprellung, Journal-Hygiene, gefensterte Gesundheit (PL-100 WP0.4/0.6/0.13)
+//! [`run`] gibt der Regelauswertung einen [`throttle::FindingThrottle`]
+//! (`--finding-cooldown-secs`, Vorgabe 10 min; Zustand
+//! `<home>/finding-throttle.json`): Wiederholungen desselben `dedup_key`
+//! werden innerhalb der Abklingzeit nur gezählt. Ereignisinhalte (Pfade,
+//! Ziele, Erzeugertext) erscheinen nie im Journal; [`poll_once`] loggt nur
+//! die Anzahl je Ereignisart auf `debug`, und ein Befund steht auf `warn`
+//! nur mit Kennungen (siehe [`findings`]-Moduldoku). `health.json` trägt
+//! neben den kumulierten IPC- und Ringzählern deren Deltas des letzten
+//! Zyklus und der letzten 60 s (siehe [`health_export`]-Moduldoku).
+//!
 //! # DoD-Systemkonfiguration und Poll-Taktung
 //! [`main`] lädt vor jedem anderen Startschritt (Sink, Socket, Landlock) den
 //! gemeinsamen DoD-Vertrag aus [`harw_dod_config`] — denselben, den auch die
@@ -274,6 +285,7 @@ mod findings;
 mod health_export;
 mod sandbox;
 mod sensors;
+mod throttle;
 
 #[cfg(target_os = "linux")]
 mod ipc;
@@ -857,7 +869,19 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
             "egress allowlist loaded into the rule network scope"
         );
     }
-    let mut rules = findings::RuleCycle::new(network_scope);
+    // PL-100 WP0.4: Wiederholungen werden je `dedup_key` entprellt; der
+    // Zustand liegt im Zustandsverzeichnis (`--home`, Landlock-beschreibbar)
+    // und übersteht Neustarts.
+    let throttle = throttle::FindingThrottle::open(
+        throttle::ThrottleConfig::with_cooldown_secs(cli.finding_cooldown_secs),
+        Some(home.join(throttle::DEFAULT_STATE_FILE_NAME)),
+    );
+    tracing::info!(
+        cooldown_secs = cli.finding_cooldown_secs,
+        max_keys = throttle::MAX_KEYS,
+        "finding throttle enabled"
+    );
+    let mut rules = findings::RuleCycle::new(network_scope).with_throttle(throttle);
 
     if cli.once {
         poll_once(
@@ -915,8 +939,9 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
 ///   [`run`] beim Start geöffnet hat — der Ausgabeweg für gemeldete Befunde
 ///   (siehe [`findings`]-Moduldoku).
 /// - `rules` (`&mut findings::RuleCycle`): die über Zyklen gehaltene Marke
-///   der Delta-Auswertung samt erlaubtem Netzbereich; jeder Aufruf rückt sie
-///   vor.
+///   der Delta-Auswertung samt erlaubtem Netzbereich und Befund-Throttle
+///   (PL-100 WP0.4); jeder Aufruf rückt sie vor. Ihre Zähler verdrängter
+///   Einträge gehen in `health.json` (WP0.13).
 /// - `exporter` (`Option<&mut export::FindingsExporter>`): der optionale
 ///   JSON-Lines-Befundexport (`--findings-export`); `None` exportiert nichts.
 /// - `health` (`Option<&mut health_export::HealthExporter>`): the optional
@@ -926,7 +951,13 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
 /// - `resolver` (`Option<&mut cgroup_resolve::CgroupResolver>`): maps the raw
 ///   cgroup ids forwarded by the probes to cgroup paths beneath
 ///   `--cgroup-root` (PL-97 E4); `None` leaves every received actor without
-///   a cgroup.
+///   a cgroup. The kernel ids it resolved this cycle reach the rules as
+///   [`cgroup_resolve::CgroupKids`].
+///
+/// # Journal
+/// Sensor events are never logged with their content (paths, destinations,
+/// producer text); `poll_once` logs only their count per kind on `debug`
+/// (PL-100 WP0.6, see [`findings::event_kind_counts`]).
 fn poll_once(
     sentinel: &mut Sentinel,
     inbox: Option<&IpcInboxHandle>,
@@ -941,19 +972,19 @@ fn poll_once(
     // damit `SensorTracker` Erfolg/Fehlschlag dieses Zyklus ableiten kann.
     let before = health.as_ref().map(|_| sentinel.health_snapshot());
     let reading = sentinel.poll_all(now);
+    // Journal-Hygiene (PL-100 WP0.6): nie der Ereignisinhalt (Pfade, Ziele,
+    // erzeugerbestimmter Text), nur Anzahl je Art und nur auf `debug`.
     tracing::debug!(
         samples = reading.samples.len(),
         events = reading.events.len(),
+        event_kinds = ?findings::event_kind_counts(&reading.events),
         degraded_sensors = sentinel.degraded_count(),
         "poll cycle complete"
     );
-    for event in &reading.events {
-        tracing::warn!(?event, "security event observed");
-    }
 
-    drain_external_events(sentinel, inbox, resolver);
+    let cgroup_kids = drain_external_events(sentinel, inbox, resolver);
 
-    let reported = rules.evaluate(sentinel.buffer(), sink, now, exporter);
+    let reported = rules.evaluate(sentinel.buffer(), sink, now, &cgroup_kids, exporter);
     tracing::debug!(
         reported,
         "security rules evaluated against this cycle's evidence delta"
@@ -961,7 +992,14 @@ fn poll_once(
 
     if let (Some(health), Some(before)) = (health, before) {
         let after = sentinel.health_snapshot();
-        health.record_cycle(sink, &before, &after, ipc_counters(inbox), now);
+        health.record_cycle(
+            sink,
+            &before,
+            &after,
+            ipc_counters(inbox),
+            rules.ring_counters(),
+            now,
+        );
     }
 }
 
@@ -1108,6 +1146,14 @@ fn build_findings_exporter(
 /// - `sentinel` (`&mut harw_dod_sentinel::Sentinel`): Ziel jedes entleerten
 ///   Ereignisses.
 /// - `inbox` (`Option<&`[`IpcInboxHandle`]`>`): siehe [`poll_once`].
+/// - `resolver` (`Option<&mut cgroup_resolve::CgroupResolver>`): siehe
+///   [`poll_once`].
+///
+/// # Returns
+/// Die Kernel-IDs der in diesem Aufruf aufgelösten Cgroup-Pfade
+/// ([`cgroup_resolve::CgroupKids`]); [`findings::RuleCycle::evaluate`]
+/// braucht sie für `cgroup_kid` und den `dedup_key` (PL-100 WP0.4). Leer,
+/// wenn nichts ankam.
 ///
 /// # Concurrency
 /// Läuft ausschließlich aus dem Thread, der auch [`poll_once`]/`poll_all`
@@ -1119,9 +1165,10 @@ fn drain_external_events(
     sentinel: &mut Sentinel,
     inbox: Option<&IpcInboxHandle>,
     mut resolver: Option<&mut cgroup_resolve::CgroupResolver>,
-) {
+) -> cgroup_resolve::CgroupKids {
+    let mut cgroup_kids = cgroup_resolve::CgroupKids::default();
     let Some(inbox) = inbox else {
-        return;
+        return cgroup_kids;
     };
 
     let received = {
@@ -1137,7 +1184,7 @@ fn drain_external_events(
         // Der häufigste Fall: nichts angekommen. Dann gar nicht erst
         // entleeren -- `drain()` legt sonst je Zyklus einen leeren `Vec` an.
         if guard.is_empty() && guard.dropped() == 0 {
-            return;
+            return cgroup_kids;
         }
         // Auslastung und Verdrängung ablesen, solange die Sperre noch
         // gehalten wird -- danach ist die Inbox leer und beides wäre weg.
@@ -1173,8 +1220,13 @@ fn drain_external_events(
     for mut item in received {
         // Rohe cgroup-ID der Sonde -> Pfad unter `--cgroup-root`, oder
         // keine cgroup (PL-97 E4, siehe `cgroup_resolve`).
+        // Die Kernel-ID bleibt für diesen Zyklus neben dem Pfad erhalten
+        // (`cgroup_kid` der Befunde, PL-100 WP0.4/WP0.9).
         if let Some(actor) = item.event.actor.as_mut() {
-            cgroup_resolve::resolve_actor_cgroup(actor, resolver.as_deref_mut());
+            let kid = cgroup_resolve::resolve_actor_cgroup(actor, resolver.as_deref_mut());
+            if let (Some(kid), Some(path)) = (kid, actor.cgroup.as_ref()) {
+                cgroup_kids.record(path.as_str(), kid);
+            }
         }
         tracing::debug!(
             sensor = %item.event.sensor.as_str(),
@@ -1183,17 +1235,19 @@ fn drain_external_events(
         );
         sentinel.record_external_event(item.event);
     }
+    cgroup_kids
 }
 
 /// Siehe die Linux-Fassung. `inbox` ist auf dieser Plattform stets `None`
 /// (siehe [`IpcInboxHandle`], [`spawn_ipc_if_available`]) — diese Funktion
-/// ist entsprechend ein reines No-Op.
+/// ist entsprechend ein reines No-Op und liefert keine Kernel-IDs.
 #[cfg(not(target_os = "linux"))]
 fn drain_external_events(
     _sentinel: &mut Sentinel,
     _inbox: Option<&IpcInboxHandle>,
     _resolver: Option<&mut cgroup_resolve::CgroupResolver>,
-) {
+) -> cgroup_resolve::CgroupKids {
+    cgroup_resolve::CgroupKids::default()
 }
 
 /// Bindet den IPC-Empfangssocket, falls möglich, startet seine
