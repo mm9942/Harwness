@@ -40,7 +40,8 @@
 //!   ([`JobError::FrozenElsewhere`]), auch keine Eindämmung des Wardens,
 //!   die nach harws Anhalten auf dieselbe cgroup kam
 //!   ([`JobError::ContainmentHeld`]). Eingefroren wird erst, wenn das
-//!   Anhalten dauerhaft in `meta.json` steht
+//!   Anhalten dauerhaft in `meta.json` steht: die Datei und danach ihr
+//!   Eintrag im Job-Verzeichnis per `fsync` gesichert
 //!   ([`JobError::SuspendNotRecorded`]). Ein Stop taut einen angehaltenen Job
 //!   nie auf: er endet eingefroren mit SIGKILL. Haltezeit zählt nicht als
 //!   aktive Laufzeit ([`JobMeta::active_secs_at`], Wanduhr-Semantik in
@@ -391,17 +392,46 @@ pub enum JobError {
     )]
     ContainmentHeld(String),
     /// `job.suspend`: das Anhalten ließ sich nicht dauerhaft in `meta.json`
-    /// vermerken (Absicht vor Wirkung); es wurde nichts eingefroren, der
-    /// Job läuft weiter.
+    /// vermerken (Absicht vor Wirkung): Schreiben, `fsync` oder `rename` der
+    /// Datei scheiterte, oder danach der `fsync` des Job-Verzeichnisses, ohne
+    /// den die Umbenennung einen Stromausfall nicht sicher übersteht. Es
+    /// wurde nichts eingefroren, der Job läuft weiter.
     #[msg(
         "job `{job}` was not suspended: the suspension could not be recorded ({source}); nothing was frozen"
     )]
     SuspendNotRecorded {
         /// Kennung des Jobs.
         job: String,
-        /// Ursache des Schreibfehlers.
+        /// Ursache des Schreib- bzw. Sync-Fehlers.
         #[source]
         source: io::Error,
+    },
+    /// `job.suspend`: der Vermerk stand schon unter `meta.json` (die
+    /// Umbenennung war erfolgt), aber der `fsync` des Job-Verzeichnisses
+    /// scheiterte, und auch die Rücknahme des Vermerks ließ sich nicht
+    /// schreiben. Es wurde nichts eingefroren, im Speicher läuft der Job
+    /// weiter; `meta.json` sagt bis zum nächsten erfolgreichen
+    /// Schreibzugriff „angehalten“. In dieser Sitzung zählt der Speicher:
+    /// `job.resume` taut nichts auf ([`SuspendTransition::NotSuspended`],
+    /// bei einem Freeze außerhalb von harw [`JobError::FrozenElsewhere`]).
+    /// Restrisiko (dasselbe wie bei
+    /// [`JobError::RollbackNotRecorded`]): startet harw neu, bevor ein
+    /// Schreibzugriff die Datei berichtigt, lädt es den Job mit lebendem
+    /// Prozess als angehalten ([`JobState::Detached`], Hinweis „noch
+    /// angehalten“), obwohl nie eingefroren wurde; ein `job.resume` taut
+    /// dann auch einen Freeze auf, den nicht harw gesetzt hat und den kein
+    /// Marker im Eindämmungsindex schützt (etwa einen eines Operators).
+    #[msg(
+        "job `{job}` was not suspended: the suspension could not be recorded durably ({source}) and its record could not be taken back ({persist}); nothing was frozen"
+    )]
+    SuspendRollbackNotRecorded {
+        /// Kennung des Jobs.
+        job: String,
+        /// Warum der `fsync` des Job-Verzeichnisses scheiterte.
+        #[source]
+        source: io::Error,
+        /// Warum die Rücknahme nicht geschrieben wurde.
+        persist: io::Error,
     },
     /// `job.suspend`: das Einfrieren schlug fehl, und auch die Rücknahme
     /// des schon geschriebenen Vermerks ließ sich nicht speichern.
@@ -649,9 +679,10 @@ struct JobEntry {
     // last one carries the newest state) and never share `meta.json.tmp`.
     // Taken before `state`, never while `state` is held.
     persist_lock: Mutex<()>,
-    // Test seam: how many of the next durable writes (`try_persist`) fail
-    // before touching the disk (a deferred write error, e.g. ENOSPC at
-    // `fsync`, that no real directory reproduces on demand).
+    // Test seam: how many of the next durable writes (`try_persist`,
+    // `try_persist_durable`) fail before touching the disk (a deferred write
+    // error, e.g. ENOSPC at `fsync`, that no real directory reproduces on
+    // demand).
     #[cfg(test)]
     fail_durable_writes: AtomicUsize,
     changes: watch::Sender<u64>,
@@ -716,7 +747,10 @@ impl JobEntry {
     /// `fsync` vor dem `rename`, damit auch verzögerte Schreibfehler eines
     /// vollen oder entfernten Datenträgers hier ankommen) und meldet den
     /// Fehler. Scheitert es, liegt auf der Platte unverändert der vorige
-    /// Vermerk.
+    /// Vermerk. Das Job-Verzeichnis wird nicht synchronisiert: die
+    /// Umbenennung kann ein Stromausfall noch zurücknehmen. Wo das nicht
+    /// sein darf (die Absicht von `job.suspend`), gilt
+    /// [`JobEntry::try_persist_durable`].
     ///
     /// # Errors
     /// Der Schreib-, Sync- bzw. Umbenennungsfehler.
@@ -726,14 +760,54 @@ impl JobEntry {
     /// älterer Stand den Vermerk mehr überschreiben, jeder spätere
     /// Schreibzugriff nimmt den Stand von dann.
     fn try_persist(&self) -> io::Result<()> {
-        let _writing = lock(&self.persist_lock);
+        let writing = lock(&self.persist_lock);
+        self.write_synced(&writing)
+    }
+
+    /// Wie [`JobEntry::try_persist`], danach wird das Job-Verzeichnis mit
+    /// `dir_sync` synchronisiert (`fsync` auf das Verzeichnis): erst dann
+    /// ist auch die Umbenennung von `meta.json` dauerhaft, und ein
+    /// Stromausfall bringt den vorigen Vermerk nicht mehr zurück. Für den
+    /// Vermerk, von dem eine Wirkung abhängt (die Absicht von `job.suspend`
+    /// vor `cgroup.freeze` = 1).
+    ///
+    /// # Errors
+    /// [`DurableWriteError::NotWritten`], wenn Schreiben, `fsync` oder
+    /// `rename` der Datei scheiterte (auf der Platte liegt unverändert der
+    /// vorige Vermerk); [`DurableWriteError::NotDurable`], wenn der neue
+    /// Vermerk schon unter `meta.json` steht, der Sync des Verzeichnisses
+    /// aber scheiterte (ob er einen Absturz übersteht, ist offen).
+    ///
+    /// # Concurrency
+    /// Schreiben und Verzeichnis-Sync unter einer einzigen Haltung von
+    /// `persist_lock`: kein anderer Schreiber (die Überwachung, ohne
+    /// `fsync`) benennt dazwischen eine Datei um, deren Verzeichniseintrag
+    /// der Sync sonst dauerhaft machte, ohne dass ihr Inhalt es ist.
+    fn try_persist_durable(&self, dir_sync: &dyn DirSync) -> Result<(), DurableWriteError> {
+        let writing = lock(&self.persist_lock);
+        self.write_synced(&writing)
+            .map_err(DurableWriteError::NotWritten)?;
+        dir_sync
+            .sync_dir(&self.dir)
+            .map_err(DurableWriteError::NotDurable)
+    }
+
+    /// Gemeinsamer Kern von [`JobEntry::try_persist`] und
+    /// [`JobEntry::try_persist_durable`]: schreibt den aktuellen Stand mit
+    /// [`write_meta_synced`]. `_writing` belegt, dass der Aufrufer
+    /// `persist_lock` hält.
+    ///
+    /// # Errors
+    /// Der Schreib-, Sync- bzw. Umbenennungsfehler (in Tests auch ein
+    /// injizierter, `JobEntry::fail_next_durable_writes`).
+    fn write_synced(&self, _writing: &MutexGuard<'_, ()>) -> io::Result<()> {
         #[cfg(test)]
         self.injected_write_failure()?;
         write_meta_synced(&self.dir, &self.meta())
     }
 
-    /// Test seam: the next `count` durable writes ([`JobEntry::try_persist`])
-    /// fail without touching the disk.
+    /// Test seam: the next `count` durable writes ([`JobEntry::try_persist`],
+    /// [`JobEntry::try_persist_durable`]) fail without touching the disk.
     #[cfg(test)]
     fn fail_next_durable_writes(&self, count: usize) {
         self.fail_durable_writes.store(count, Ordering::SeqCst);
@@ -825,6 +899,59 @@ fn store_meta(dir: &Path, meta: &JobMeta, sync: bool) -> io::Result<()> {
     fs::rename(&tmp, dir.join(META_FILE))
 }
 
+/// Macht die Einträge eines Job-Verzeichnisses dauerhaft (PL-100 WP 3.5):
+/// nach dem `rename` von `meta.json` steht der neue Vermerk erst nach einem
+/// `fsync` des Verzeichnisses sicher auf der Platte; vorher kann ein
+/// Stromausfall den alten Eintrag zurückbringen.
+///
+/// # Description
+/// Naht für Tests (Fehlerinjektion, Aufrufzähler; `JobManager::set_dir_sync`
+/// nur unter `cfg(test)`); in Betrieb immer [`SyncDirectory`].
+///
+/// # Concurrency
+/// `Send + Sync`: der [`JobManager`] hält sie hinter einem `Arc` und ruft
+/// sie aus dem Thread von `job.suspend` auf.
+trait DirSync: Send + Sync {
+    /// Synchronisiert das Verzeichnis `dir` (`fsync` auf das Verzeichnis).
+    ///
+    /// # Errors
+    /// Der Öffnungs- bzw. Sync-Fehler.
+    fn sync_dir(&self, dir: &Path) -> io::Result<()>;
+}
+
+/// Die [`DirSync`] des Betriebs: öffnet `dir` nur lesend und ruft
+/// `sync_all` (`fsync`) auf dem Verzeichnis-Deskriptor.
+///
+/// # Description
+/// - Das Verzeichnis wird wie in [`store_meta`] über seinen Pfad geöffnet,
+///   ohne eigenen Symlink-Schutz: harw legt das Job-Verzeichnis selbst
+///   unter `<state>/jobs/` an, und kein Zugriff auf `meta.json` prüft es
+///   heute auf einen Symlink; ein solcher Schutz gehört zu allen Zugriffen,
+///   nicht nur zu diesem.
+/// - Jeder Fehler kommt beim Aufrufer an, auch `EINVAL` eines Dateisystems,
+///   das `fsync` auf Verzeichnissen nicht kann: `job.suspend` friert dann
+///   nicht ein (fail closed).
+struct SyncDirectory;
+
+impl DirSync for SyncDirectory {
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        File::open(dir)?.sync_all()
+    }
+}
+
+/// Warum [`JobEntry::try_persist_durable`] scheiterte: vor oder nach der
+/// Umbenennung von `meta.json`. Davon hängt ab, ob auf der Platte schon der
+/// neue Vermerk steht, den der Aufrufer zurücknehmen muss.
+#[derive(Debug)]
+enum DurableWriteError {
+    /// Schreiben, `fsync` oder `rename` der Datei scheiterte; `meta.json`
+    /// trägt unverändert den vorigen Vermerk.
+    NotWritten(io::Error),
+    /// `meta.json` trägt den neuen Vermerk, aber der `fsync` des
+    /// Job-Verzeichnisses scheiterte: ein Absturz kann ihn noch zurücknehmen.
+    NotDurable(io::Error),
+}
+
 fn read_meta(dir: &Path) -> Option<JobMeta> {
     let text = fs::read(dir.join(META_FILE)).ok()?;
     serde_json::from_slice(&text).ok()
@@ -856,6 +983,9 @@ pub struct JobManager {
     // eines Aufrufs verschränken sich nie mit denen eines anderen. Nie über
     // ein `await` gehalten (beide sind synchron).
     suspend_ops: Mutex<()>,
+    // Verzeichnis-Sync des Vermerks von `job.suspend` vor dem Einfrieren
+    // (`SyncDirectory`); nur Tests ersetzen ihn (`set_dir_sync`).
+    dir_sync: Mutex<Arc<dyn DirSync>>,
 }
 
 /// Releases admission on every early return, including cancellation while
@@ -917,6 +1047,7 @@ impl JobManager {
         let config_max_running = config
             .max_running_jobs
             .clamp(MIN_RUNNING_JOBS, MAX_RUNNING_JOBS);
+        let dir_sync: Arc<dyn DirSync> = Arc::new(SyncDirectory);
         let manager = Arc::new(Self {
             config,
             instance,
@@ -928,6 +1059,7 @@ impl JobManager {
             command_port,
             freezer: Mutex::new(None),
             suspend_ops: Mutex::new(()),
+            dir_sync: Mutex::new(dir_sync),
         });
         manager.reload(&jobs_dir);
         Ok(manager)
@@ -1673,6 +1805,20 @@ impl JobManager {
         lock(&self.freezer).as_ref().map(Arc::clone)
     }
 
+    /// Der Verzeichnis-Sync für den Vermerk von `job.suspend`
+    /// ([`SyncDirectory`], in Tests ersetzbar).
+    fn dir_sync(&self) -> Arc<dyn DirSync> {
+        Arc::clone(&lock(&self.dir_sync))
+    }
+
+    /// Test seam: replaces the directory sync that makes the rename of
+    /// `job.suspend`'s record durable before the freeze (fault injection,
+    /// call counting).
+    #[cfg(all(test, target_os = "linux"))]
+    fn set_dir_sync(&self, dir_sync: Arc<dyn DirSync>) {
+        *lock(&self.dir_sync) = dir_sync;
+    }
+
     /// Freezer und Blattname der bewiesenen eigenen cgroup von `entry`.
     ///
     /// # Errors
@@ -1715,14 +1861,24 @@ impl JobManager {
     ///   lesbar, wird trotzdem eingefroren (Warnung im Log): Anhalten ist
     ///   die sichere Richtung, und [`JobManager::resume`] fragt den Index
     ///   vor dem Auftauen erneut und taut ohne lesbaren Index nicht auf.
-    /// - Absicht vor Wirkung: das Anhalten wird dauerhaft (`fsync`) in
-    ///   `meta.json` vermerkt, bevor der Kernel einfriert; ein Schreiber mit
-    ///   älterem Stand (die Überwachung) kann den Vermerk danach nicht mehr
-    ///   überschreiben. Lässt sich der Vermerk nicht schreiben (volles oder
+    /// - Absicht vor Wirkung: das Anhalten wird dauerhaft in `meta.json`
+    ///   vermerkt, bevor der Kernel einfriert: `fsync` der Datei, `rename`,
+    ///   danach `fsync` des Job-Verzeichnisses (erst er macht die
+    ///   Umbenennung absturzsicher; ohne ihn könnte ein Stromausfall den
+    ///   vorigen Vermerk ohne `suspended_at` zurückbringen, während die
+    ///   cgroup eingefroren ist). Ein Schreiber mit älterem Stand (die
+    ///   Überwachung) kann den Vermerk danach nicht mehr überschreiben.
+    ///   Lässt sich der Vermerk nicht schreiben (volles oder
     ///   schreibgeschütztes Zustandsverzeichnis), wird nichts eingefroren
     ///   ([`JobError::SuspendNotRecorded`]); der zurückgenommene Stand wird
     ///   nach bestem Bemühen geschrieben (eine nicht synchronisierte
     ///   Schreibung der Überwachung kann „angehalten“ schon abgelegt haben).
+    ///   Scheitert erst der `fsync` des Verzeichnisses, steht „angehalten“
+    ///   schon unter `meta.json`: auch dann wird nichts eingefroren
+    ///   ([`JobError::SuspendNotRecorded`]), und der Vermerk wird wie nach
+    ///   einem gescheiterten Einfrieren zurückgenommen, im Speicher und auf
+    ///   der Platte; lässt sich die Rücknahme nicht schreiben, meldet das
+    ///   [`JobError::SuspendRollbackNotRecorded`].
     ///   Scheitert das Einfrieren, wird der Vermerk zurückgenommen, im
     ///   Speicher und auf der Platte; lässt sich die Rücknahme nicht
     ///   schreiben, meldet das [`JobError::RollbackNotRecorded`]. Ein
@@ -1740,13 +1896,16 @@ impl JobManager {
     /// [`JobError::NotFound`], [`JobError::NotSuspendable`],
     /// [`JobError::StopPending`], [`JobError::SuspendUnavailable`],
     /// [`JobError::NoJobCgroup`], [`JobError::FrozenElsewhere`],
-    /// [`JobError::SuspendNotRecorded`], [`JobError::RollbackNotRecorded`],
+    /// [`JobError::SuspendNotRecorded`],
+    /// [`JobError::SuspendRollbackNotRecorded`],
+    /// [`JobError::RollbackNotRecorded`],
     /// [`JobError::Freeze`] (auch `probe`, wenn der Kernel-Zustand nicht
     /// lesbar ist: ohne ihn wird nicht eingefroren).
     ///
     /// # Concurrency
     /// Synchron und blockierend (wenige cgroupfs-Zugriffe, ein `fsync` von
-    /// `meta.json`, beim Rücknehmen bis zu etwa 100 ms Warten auf die
+    /// `meta.json` und einer des Job-Verzeichnisses unter der Schreibsperre
+    /// des Jobs, beim Rücknehmen bis zu etwa 100 ms Warten auf die
     /// Sperre des Eindämmungsindex): asynchrone Aufrufer nehmen
     /// `spawn_blocking`. Aufrufe von `suspend` und `resume` laufen
     /// nacheinander, die Sperre des Jobs wird nie über
@@ -1811,22 +1970,60 @@ impl JobManager {
         }
         // The record must be durable before the kernel freezes: without it a
         // restart would find a frozen job with no record of harw's
-        // ownership. Nothing is frozen when it fails. The atomic rename
-        // usually leaves the previous record on disk, but a monitor write
-        // (not synced) that ran between the mark and this write may have
-        // stored "suspended" already; so the taken-back state is written
-        // too, best effort (a failure is only logged: nothing is frozen, and
-        // the next write corrects the record).
-        if let Err(source) = entry.try_persist() {
-            rollback_suspension(&entry, marked_at);
-            entry.persist();
-            entry.bump();
-            warn!(job_id = %id, "job.suspend aborted: the suspension could not be recorded; nothing frozen");
-            debug!(job_id = %id, error = %source, "job.suspend: meta.json not written");
-            return Err(JobError::SuspendNotRecorded {
-                job: id.to_string(),
-                source,
-            });
+        // ownership. Durable means the file (`fsync` before the rename) and
+        // its directory entry (`fsync` of the job directory after the
+        // rename): otherwise a power loss can bring back the previous
+        // record, without `suspended_at`, while `cgroup.freeze` = 1 holds.
+        // Nothing is frozen when either fails.
+        match entry.try_persist_durable(self.dir_sync().as_ref()) {
+            Ok(()) => {}
+            // Not renamed: the atomic rename usually leaves the previous
+            // record on disk, but a monitor write (not synced) that ran
+            // between the mark and this write may have stored "suspended"
+            // already; so the taken-back state is written too, best effort
+            // (a failure is only logged: nothing is frozen, and the next
+            // write corrects the record).
+            Err(DurableWriteError::NotWritten(source)) => {
+                rollback_suspension(&entry, marked_at);
+                entry.persist();
+                entry.bump();
+                warn!(job_id = %id, "job.suspend aborted: the suspension could not be recorded; nothing frozen");
+                debug!(job_id = %id, error = %source, "job.suspend: meta.json not written");
+                return Err(JobError::SuspendNotRecorded {
+                    job: id.to_string(),
+                    source,
+                });
+            }
+            // Renamed, but the directory entry may not survive a crash:
+            // `meta.json` says "suspended" while nothing is frozen. Take it
+            // back as after a failed freeze: in memory, then on disk with a
+            // synced write (`fsync` + `rename`), and say so when that fails
+            // (`SuspendRollbackNotRecorded`: in this session job.resume goes
+            // by memory and thaws nothing; its doc names the residual risk
+            // of a harw restart before the next write corrects the record).
+            // The rollback's own directory entry is not synced: only an OS
+            // crash or a power loss can lose it, and either one also ends
+            // the job's processes, so a reload finds them gone and closes
+            // the stale suspension (`JobState::Unknown`).
+            Err(DurableWriteError::NotDurable(source)) => {
+                rollback_suspension(&entry, marked_at);
+                entry.bump();
+                warn!(job_id = %id, "job.suspend aborted: the suspension record could not be made durable; nothing frozen");
+                debug!(job_id = %id, error = %source, "job.suspend: job directory not synced after writing meta.json");
+                if let Err(persist) = entry.try_persist() {
+                    warn!(job_id = %id, "job.suspend: the suspension record could not be taken back");
+                    debug!(job_id = %id, error = %persist, "job.suspend: rollback of meta.json not written");
+                    return Err(JobError::SuspendRollbackNotRecorded {
+                        job: id.to_string(),
+                        source,
+                        persist,
+                    });
+                }
+                return Err(JobError::SuspendNotRecorded {
+                    job: id.to_string(),
+                    source,
+                });
+            }
         }
         if let Err(source) = freezer.freeze(&leaf) {
             rollback_suspension(&entry, marked_at);
@@ -2394,9 +2591,11 @@ fn close_suspension(entry: &JobEntry) -> bool {
     true
 }
 
-/// Nimmt den Vermerk eines Anhaltens zurück, dessen Einfrieren scheiterte
-/// (nur den bei `marked_at` gesetzten; ein inzwischen beendeter Job hat ihn
-/// schon selbst geschlossen).
+/// Nimmt im Speicher den Vermerk eines Anhaltens zurück, der sich nicht
+/// schreiben oder nicht dauerhaft machen ließ (Verzeichnis-`fsync` nach dem
+/// `rename`) oder dessen Einfrieren scheiterte (nur den bei `marked_at`
+/// gesetzten; ein inzwischen beendeter Job hat ihn schon selbst
+/// geschlossen). Die Platte schreibt der Aufrufer.
 fn rollback_suspension(entry: &JobEntry, marked_at: Timestamp) {
     let mut guard = lock(&entry.state);
     if guard.meta.suspended_at == Some(marked_at) {
@@ -3304,6 +3503,21 @@ mod error_display_tests {
             "job `j1` was not suspended: the suspension could not be recorded (disk full); nothing was frozen"
         );
         assert!(not_recorded.source().is_some());
+        let not_taken_back = JobError::SuspendRollbackNotRecorded {
+            job: "j1".to_owned(),
+            source: std::io::Error::other("dir sync failed"),
+            persist: std::io::Error::other("read-only"),
+        };
+        assert_eq!(
+            not_taken_back.to_string(),
+            "job `j1` was not suspended: the suspension could not be recorded durably (dir sync failed) and its record could not be taken back (read-only); nothing was frozen"
+        );
+        // `source()` is the directory sync failure; the persist error is in
+        // the text.
+        assert_eq!(
+            not_taken_back.source().map(ToString::to_string),
+            Some("dir sync failed".to_owned())
+        );
         let rollback = JobError::RollbackNotRecorded {
             job: "j1".to_owned(),
             source: FreezeError::PermissionDenied,

@@ -8,11 +8,13 @@
 //! harws Anhalten dazukommt (auch über ein echtes Markerverzeichnis samt
 //! Sperre, die nach bestem Bemühen genommen wird), und mit veralteten
 //! Schreibzugriffen der Überwachung auf `meta.json`; dazu ein gescheitertes
-//! Wiedereinfrieren und eine nach dem Auftauen verschwundene cgroup.
+//! Wiedereinfrieren und eine nach dem Auftauen verschwundene cgroup, sowie
+//! ein nach dem `rename` des Vermerks gescheiterter `fsync` des
+//! Job-Verzeichnisses (Naht `DirSync`).
 
 use super::{
-    Caller, EntryState, JobEntry, JobError, JobManager, SUSPENDED_ON_RELOAD, SuspendTransition,
-    lock, read_meta, stop_signal_for, write_meta,
+    Caller, DirSync, EntryState, JobEntry, JobError, JobManager, SUSPENDED_ON_RELOAD,
+    SuspendTransition, SyncDirectory, lock, read_meta, stop_signal_for, write_meta,
 };
 use crate::event::RecordingNotifier;
 use crate::event::{JobEvent, JobNotifier};
@@ -26,8 +28,10 @@ use crate::test_support::fake_cgroup::{
 use crate::test_support::{Env, TestError, TestResult, ctx, request, stub_job_meta};
 use jiff::Timestamp;
 use std::fs;
+use std::io;
 use std::os::unix::process::CommandExt as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1271,12 +1275,14 @@ fn record_blocker(env: &Env, id: &JobId) -> TestResult<std::path::PathBuf> {
 /// Review finding B: an unwritable state directory (full or read-only
 /// volume) aborts `job.suspend` before anything is frozen: no durable
 /// record, no freeze. The disk keeps the previous record and the job runs
-/// on. Once the directory is writable again, `job.suspend` works.
+/// on; with nothing renamed, the job directory is not synced either. Once
+/// the directory is writable again, `job.suspend` works.
 #[test]
 fn an_unwritable_state_directory_aborts_suspend_before_freezing() -> TestResult {
     let fake = Arc::new(FakeCgroup::default());
     let env = env_with_freezer(&fake)?;
     let id = running_job(&env, "job-readonly", "y1")?;
+    let sync = ScriptedDirSync::new(&env, &fake, &id, 0)?.install(&env);
     let blocker = record_blocker(&env, &id)?;
     fs::create_dir(&blocker).map_err(ctx("block meta.json"))?;
 
@@ -1284,6 +1290,7 @@ fn an_unwritable_state_directory_aborts_suspend_before_freezing() -> TestResult 
         Err(JobError::SuspendNotRecorded { job, .. }) => assert_eq!(job, "job-readonly"),
         other => return Err(TestError::Unexpected(format!("{other:?}"))),
     }
+    assert!(sync.calls().is_empty(), "{:?}", sync.calls());
     assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     let status = status_of(&env, &id)?;
     assert_eq!(status.meta.state, JobState::Running);
@@ -1298,6 +1305,7 @@ fn an_unwritable_state_directory_aborts_suspend_before_freezing() -> TestResult 
         .suspend(&id, Caller::Agent("worker"))
         .map_err(ctx("suspend"))?;
     assert_eq!(suspended.transition, SuspendTransition::Suspended);
+    assert_eq!(sync.calls(), synced_after_rename());
     assert_eq!(fake.calls(), vec![call("freeze", "y1")]);
     assert!(on_disk(&env, &id)?.suspended_at.is_some());
     Ok(())
@@ -1911,5 +1919,337 @@ fn a_failed_intent_write_also_takes_back_a_mark_a_monitor_stored() -> TestResult
     let persisted = on_disk(&env, &id)?;
     assert_eq!(persisted.state, JobState::Running);
     assert_eq!(persisted.suspended_at, None);
+    Ok(())
+}
+
+// ── Durable directory entry of the record (review thread 4505015304) ───────
+
+/// The error a [`ScriptedDirSync`] injects.
+const INJECTED_DIR_SYNC_FAILURE: &str = "injected directory sync failure";
+
+/// One call of a [`ScriptedDirSync`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirSyncCall {
+    /// `meta.json` in the synced directory already carried `suspended_at`:
+    /// the rename the sync makes durable had happened.
+    record_suspended: bool,
+    /// The job's write lock (`persist_lock`) was held during the sync: no
+    /// other writer could rename a file in between.
+    write_lock_held: bool,
+    /// Freeze/thaw calls the fake kernel had seen before the sync.
+    kernel_calls: usize,
+}
+
+/// A [`DirSync`] that records every call, fails the first `failures` of
+/// them with an injected I/O error (as a lost directory write-back would)
+/// and otherwise delegates to the sync the manager had before (the one
+/// `JobManager::build` installs, [`SyncDirectory`]). A hook, if armed, runs
+/// once at the first injected failure (e.g. the state directory turning
+/// unwritable right then).
+struct ScriptedDirSync {
+    fake: Arc<FakeCgroup>,
+    entry: Arc<JobEntry>,
+    inner: Arc<dyn DirSync>,
+    failures: AtomicUsize,
+    calls: Mutex<Vec<DirSyncCall>>,
+    on_failure: Mutex<Option<Hook>>,
+}
+
+impl ScriptedDirSync {
+    /// Fails the first `failures` calls; `fake` is the kernel and `id` the
+    /// job of `env` whose state each sync notes. The other calls go to the
+    /// directory sync `env`'s manager has now.
+    fn new(env: &Env, fake: &Arc<FakeCgroup>, id: &JobId, failures: usize) -> TestResult<Self> {
+        let entry = env
+            .manager
+            .entry(id, Caller::Operator)
+            .map_err(ctx("entry"))?;
+        Ok(Self {
+            fake: Arc::clone(fake),
+            entry,
+            inner: env.manager.dir_sync(),
+            failures: AtomicUsize::new(failures),
+            calls: Mutex::new(Vec::new()),
+            on_failure: Mutex::new(None),
+        })
+    }
+
+    /// Runs `hook` once, at the first injected failure.
+    fn on_failure(self, hook: impl FnOnce() + Send + 'static) -> Self {
+        *lock(&self.on_failure) = Some(Box::new(hook));
+        self
+    }
+
+    /// Installs this seam as the directory sync of `env`'s manager.
+    fn install(self, env: &Env) -> Arc<Self> {
+        let sync = Arc::new(self);
+        env.manager
+            .set_dir_sync(Arc::clone(&sync) as Arc<dyn DirSync>);
+        sync
+    }
+
+    /// All calls so far, in order.
+    fn calls(&self) -> Vec<DirSyncCall> {
+        lock(&self.calls).clone()
+    }
+}
+
+impl DirSync for ScriptedDirSync {
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        let record_suspended = read_meta(dir).is_some_and(|meta| meta.suspended_at.is_some());
+        let write_lock_held = self.entry.persist_lock.try_lock().is_err();
+        let kernel_calls = self.fake.calls().len();
+        lock(&self.calls).push(DirSyncCall {
+            record_suspended,
+            write_lock_held,
+            kernel_calls,
+        });
+        let fail = self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if fail {
+            run_hook(&self.on_failure);
+            return Err(io::Error::other(INJECTED_DIR_SYNC_FAILURE));
+        }
+        self.inner.sync_dir(dir)
+    }
+}
+
+/// The one sync of a suspend that got as far as the rename: after it
+/// (`meta.json` already said suspended), under the job's write lock, before
+/// any kernel call.
+fn synced_after_rename() -> Vec<DirSyncCall> {
+    vec![DirSyncCall {
+        record_suspended: true,
+        write_lock_held: true,
+        kernel_calls: 0,
+    }]
+}
+
+/// Review thread 4505015304: the record was renamed into place, but the
+/// job directory cannot be synced, so a power loss could still bring back
+/// the previous record (no `suspended_at`) while `cgroup.freeze` = 1 holds.
+/// `job.suspend` fails typed before anything is frozen; the job runs on,
+/// in memory and on disk (the rename is taken back; that it goes through
+/// the synced writer shows
+/// `the_rollback_after_a_failed_directory_sync_uses_the_synced_writer`).
+/// Once the directory syncs again, `job.suspend` works.
+#[test]
+fn a_failed_directory_sync_after_the_rename_aborts_suspend_before_freezing() -> TestResult {
+    let fake = Arc::new(FakeCgroup::default());
+    let env = env_with_freezer(&fake)?;
+    let id = running_job(&env, "job-dirsync", "z1")?;
+    let sync = ScriptedDirSync::new(&env, &fake, &id, 1)?.install(&env);
+
+    match env.manager.suspend(&id, Caller::Agent("worker")) {
+        Err(JobError::SuspendNotRecorded { job, source }) => {
+            assert_eq!(job, "job-dirsync");
+            assert_eq!(source.to_string(), INJECTED_DIR_SYNC_FAILURE);
+        }
+        other => return Err(TestError::Unexpected(format!("{other:?}"))),
+    }
+    assert_eq!(sync.calls(), synced_after_rename());
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    let status = status_of(&env, &id)?;
+    assert_eq!(status.meta.state, JobState::Running);
+    assert_eq!(status.meta.suspended_at, None);
+    let persisted = on_disk(&env, &id)?;
+    assert_eq!(persisted.state, JobState::Running);
+    assert_eq!(persisted.suspended_at, None);
+
+    let suspended = env
+        .manager
+        .suspend(&id, Caller::Agent("worker"))
+        .map_err(ctx("suspend"))?;
+    assert_eq!(suspended.transition, SuspendTransition::Suspended);
+    assert_eq!(fake.calls(), vec![call("freeze", "z1")]);
+    assert!(on_disk(&env, &id)?.suspended_at.is_some());
+    Ok(())
+}
+
+/// The directory sync fails after the rename, and the state directory turns
+/// unwritable right then, so the rollback of the record cannot be written
+/// either: surfaced as its own typed error (with the sync failure as
+/// source). Nothing is frozen, in memory the job runs on, and the disk
+/// still says suspended until the next write corrects it. In this session
+/// memory counts: `job.resume` thaws nothing, not even a freeze set
+/// outside harw later (the stale record matters only after a restart, see
+/// `JobError::SuspendRollbackNotRecorded`).
+#[test]
+fn a_failed_rollback_after_a_failed_directory_sync_is_surfaced() -> TestResult {
+    let fake = Arc::new(FakeCgroup::default());
+    let env = env_with_freezer(&fake)?;
+    let id = running_job(&env, "job-dirsync-stuck", "z2")?;
+    let blocker = record_blocker(&env, &id)?;
+    let block = {
+        let blocker = blocker.clone();
+        move || {
+            // A failure here shows as a plain `SuspendNotRecorded` below,
+            // which the match rejects; nothing is lost by not returning it.
+            let _ = fs::create_dir(&blocker);
+        }
+    };
+    let sync = ScriptedDirSync::new(&env, &fake, &id, 1)?
+        .on_failure(block)
+        .install(&env);
+
+    match env.manager.suspend(&id, Caller::Agent("worker")) {
+        Err(JobError::SuspendRollbackNotRecorded { job, source, .. }) => {
+            assert_eq!(job, "job-dirsync-stuck");
+            assert_eq!(source.to_string(), INJECTED_DIR_SYNC_FAILURE);
+        }
+        other => return Err(TestError::Unexpected(format!("{other:?}"))),
+    }
+    assert!(blocker.is_dir());
+    assert_eq!(sync.calls(), synced_after_rename());
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    let status = status_of(&env, &id)?;
+    assert_eq!(status.meta.state, JobState::Running);
+    assert_eq!(status.meta.suspended_at, None);
+    let persisted = on_disk(&env, &id)?;
+    assert_eq!(persisted.state, JobState::Suspended);
+    assert!(persisted.suspended_at.is_some());
+
+    let worker = Caller::Agent("worker");
+    let resumed = env.manager.resume(&id, worker).map_err(ctx("resume"))?;
+    assert_eq!(resumed.transition, SuspendTransition::NotSuspended);
+    fake.set_outside("harw-job-z2", true, true);
+    match env.manager.resume(&id, worker) {
+        Err(JobError::FrozenElsewhere(job)) => assert_eq!(job, "job-dirsync-stuck"),
+        other => return Err(TestError::Unexpected(format!("{other:?}"))),
+    }
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+
+    fs::remove_dir(&blocker).map_err(ctx("unblock meta.json"))?;
+    env.manager
+        .entry(&id, Caller::Operator)
+        .map_err(ctx("entry"))?
+        .persist();
+    let corrected = on_disk(&env, &id)?;
+    assert_eq!(corrected.state, JobState::Running);
+    assert_eq!(corrected.suspended_at, None);
+    Ok(())
+}
+
+/// The rollback after a failed directory sync goes through the synced
+/// writer (`fsync` before the `rename`, `JobEntry::try_persist`), not the
+/// unsynced one of the monitor (`JobEntry::persist`): a durable write
+/// failure armed at the sync failure, which only the synced writer
+/// consumes, is what the rollback reports. Nothing is frozen, and the
+/// armed failure is used up, so the next `job.suspend` works.
+#[test]
+fn the_rollback_after_a_failed_directory_sync_uses_the_synced_writer() -> TestResult {
+    let fake = Arc::new(FakeCgroup::default());
+    let env = env_with_freezer(&fake)?;
+    let id = running_job(&env, "job-dirsync-synced-rollback", "z4")?;
+    let entry = env
+        .manager
+        .entry(&id, Caller::Operator)
+        .map_err(ctx("entry"))?;
+    // Armed at the injected sync failure, i.e. after the rename and before
+    // the rollback is written.
+    let arm = move || entry.fail_next_durable_writes(1);
+    let sync = ScriptedDirSync::new(&env, &fake, &id, 1)?
+        .on_failure(arm)
+        .install(&env);
+    let worker = Caller::Agent("worker");
+
+    match env.manager.suspend(&id, worker) {
+        Err(JobError::SuspendRollbackNotRecorded {
+            job,
+            source,
+            persist,
+        }) => {
+            assert_eq!(job, "job-dirsync-synced-rollback");
+            assert_eq!(source.to_string(), INJECTED_DIR_SYNC_FAILURE);
+            assert_eq!(persist.to_string(), "injected durable write failure");
+        }
+        other => return Err(TestError::Unexpected(format!("{other:?}"))),
+    }
+    assert_eq!(sync.calls(), synced_after_rename());
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    let status = status_of(&env, &id)?;
+    assert_eq!(status.meta.state, JobState::Running);
+    assert_eq!(status.meta.suspended_at, None);
+    assert!(on_disk(&env, &id)?.suspended_at.is_some());
+
+    let suspended = env.manager.suspend(&id, worker).map_err(ctx("suspend"))?;
+    assert_eq!(suspended.transition, SuspendTransition::Suspended);
+    assert_eq!(fake.calls(), vec![call("freeze", "z4")]);
+    assert!(on_disk(&env, &id)?.suspended_at.is_some());
+    Ok(())
+}
+
+/// The successful path syncs the job directory exactly once, after the
+/// rename of the record, under the job's write lock and before the kernel
+/// freezes, through the manager's own sync behind the counter (the real
+/// one, see `the_manager_installs_the_real_directory_sync`). A repeated
+/// suspend writes no new record and syncs nothing.
+#[test]
+fn suspend_syncs_the_job_directory_after_the_rename_and_before_the_freeze() -> TestResult {
+    let fake = Arc::new(FakeCgroup::default());
+    let env = env_with_freezer(&fake)?;
+    let id = running_job(&env, "job-dirsync-ok", "z3")?;
+    let sync = ScriptedDirSync::new(&env, &fake, &id, 0)?.install(&env);
+    let worker = Caller::Agent("worker");
+
+    let outcome = env.manager.suspend(&id, worker).map_err(ctx("suspend"))?;
+    assert_eq!(outcome.transition, SuspendTransition::Suspended);
+    assert_eq!(sync.calls(), synced_after_rename());
+    assert_eq!(fake.calls(), vec![call("freeze", "z3")]);
+    assert!(on_disk(&env, &id)?.suspended_at.is_some());
+
+    let again = env
+        .manager
+        .suspend(&id, worker)
+        .map_err(ctx("suspend again"))?;
+    assert_eq!(again.transition, SuspendTransition::AlreadySuspended);
+    assert_eq!(sync.calls(), synced_after_rename());
+    Ok(())
+}
+
+/// The production directory sync syncs a real directory and reports the
+/// error of one it cannot open (fail closed: `job.suspend` would not
+/// freeze).
+#[test]
+fn the_production_directory_sync_reports_its_errors() -> TestResult {
+    let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+    SyncDirectory
+        .sync_dir(temp.path())
+        .map_err(ctx("sync a real directory"))?;
+    match SyncDirectory.sync_dir(&temp.path().join("missing")) {
+        Err(err) => assert_eq!(err.kind(), io::ErrorKind::NotFound),
+        Ok(()) => {
+            return Err(TestError::Unexpected(
+                "synced a directory that does not exist".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `JobManager::build` installs the real directory sync, not a no-op: the
+/// manager's own seam syncs an existing directory and reports the error
+/// of a missing one. With the delegating `ScriptedDirSync`, this shows the
+/// production path of `job.suspend` syncs the job directory for real.
+#[test]
+fn the_manager_installs_the_real_directory_sync() -> TestResult {
+    let env = Env::new()?;
+    let dir_sync = env.manager.dir_sync();
+    let jobs_dir = env.manager.config().jobs_dir();
+    dir_sync
+        .sync_dir(&jobs_dir)
+        .map_err(ctx("sync the jobs directory"))?;
+    match dir_sync.sync_dir(&jobs_dir.join("missing")) {
+        Err(err) => assert_eq!(err.kind(), io::ErrorKind::NotFound),
+        Ok(()) => {
+            return Err(TestError::Unexpected(
+                "the default directory sync is a no-op".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }

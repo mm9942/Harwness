@@ -22,7 +22,8 @@
 //!   ([`ContainmentHolds`], geprüft vor und nach dem Auftauen, nach
 //!   bestem Bemühen unter der geteilten Sperre [`ContainmentLease`]);
 //!   `job.suspend` friert erst ein, wenn das
-//!   Anhalten dauerhaft (`fsync`) in `meta.json` vermerkt ist;
+//!   Anhalten dauerhaft in `meta.json` vermerkt ist (`fsync` der Datei,
+//!   `rename`, danach `fsync` des Job-Verzeichnisses);
 //!   `job.stop` beendet einen angehaltenen Job eingefroren (SIGKILL).
 //!   Haltezeit zählt nicht als aktive Laufzeit (Wanduhr-Semantik in
 //!   [`model`]).

@@ -1250,7 +1250,8 @@ impl JobToolExecutor {
     ///
     /// # Concurrency
     /// [`JobManager::suspend`] und [`JobManager::resume`] blockieren
-    /// (`fsync` von `meta.json`, bis zu etwa 100 ms Warten auf die Sperre
+    /// (`fsync` von `meta.json` und, beim Anhalten, des Job-Verzeichnisses;
+    /// bis zu etwa 100 ms Warten auf die Sperre
     /// des Eindämmungsindex, nacheinander hinter anderen Aufrufen); sie
     /// laufen deshalb über `spawn_blocking` und halten keinen
     /// tokio-Worker an.
