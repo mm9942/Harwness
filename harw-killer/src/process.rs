@@ -383,7 +383,7 @@ pub(crate) fn select(cli: &Cli) -> Result<Vec<Target>> {
 #[cfg(test)]
 mod tests {
     //! Pure procfs parser and selector tests without host process dependencies.
-    use super::{matches, stat};
+    use super::{matches, split_argv, stat};
     use crate::{cli::Cli, error::Error, types::Process};
     use clap::Parser;
 
