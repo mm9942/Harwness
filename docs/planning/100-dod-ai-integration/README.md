@@ -111,9 +111,13 @@ DodWatch (genau ein Dispatcher je Host; Gateway-Task oder TUI; mode = off | noti
                                                          │ Unix-Socket, Peer = harw-uid
 harw-escalator (eigene uid; ohne LLM/HTTP/harw-runtime; Policy aus /etc/harw-dod)
   Spool lesen + prüfen → ActionProposal (Prüffrist, Erinnerung, nie Auto-Release)
-  ◄─ Freigabe A: harw-dod-approve (polkit auth_admin, ohne keep)
-  ◄─ Freigabe B: TUI „Freigeben" → pkexec harw-dod-approve (Passwort nur im polkit-Agenten)
-     beide: Peer-Cgroup nicht unter einer harw-Session oder einem harw-job-Scope; Operator tippt Kurz-Hash; Hold optional (Vorgabe: bis zur Aufhebung)
+  ◄─ Freigabe A (unabhängig): Operator startet harw-dod-approve selbst in einer Sitzung, die harw nicht kontrolliert
+       (eigenes Terminal/Login/SSH) → Anzeige aus dem Escalator, Kurz-Hash, Hold, polkit auth_admin
+  ◄─ Freigabe B (aus der TUI angestoßen): TUI sendet nur „bitte Freigabe für <id> anfordern" an den Escalator
+       → der ESCALATOR (nicht harw) ruft polkit CheckAuthorization mit Details aus SEINEM Proposal
+         (Aktion, Cgroup, Regel, Kurz-Hash, Digest; Kill/Isolate als eigene Action „nicht umkehrbar")
+       → der grafische polkit-Agent der Desktop-Sitzung rendert diese Details → Entscheidung gebunden an den Proposal-Digest
+     A und B: Peer-Cgroup nicht unter einer harw-Session oder einem harw-job-Scope; Hold optional (Vorgabe: bis zur Aufhebung)
   → triage_record_operator → Ladder → authorize_freeze(Operator = Peer) → SignedAuthorization v2
   → harw-warden (Peer = Escalator-uid; Allowlist Freeze|Thaw|Kill|Isolate|LiftIsolation je nach Freigabe; Deny-Liste;
                  persistente Nonces; optionaler Hold-Timer taut nur auf; nftables über Rust-Crate; seccomp)
@@ -122,25 +126,43 @@ harw-escalator (eigene uid; ohne LLM/HTTP/harw-runtime; Policy aus /etc/harw-dod
 
 ### 3.1 Freigabe per polkit und TUI
 
-- **Kommandozeile:** `harw-dod-approve` ist ein Binary im harw-dod-Workspace, nicht in harw-cli.
-  - polkit-Action mit `auth_admin` (ohne keep).
-  - Das Binary zeigt typisierte, escapte Felder: Cgroup-Kid, Pfad, Regel, Severity, Kurz-Hash. Der Operator tippt den Hash ab.
-  - Die Haltedauer ist optional. Ohne Angabe bleibt die Cgroup **bis zur Aufhebung** gefroren (O3).
-  - **Menü „Eingriffe":** In der TUI (Mission Control) und per `harw dod frozen` werden alle aktiven Freezes und Isolationen angezeigt:
-    Cgroup, Grund (Befund), seit wann, wer freigegeben hat, Hold. Von dort aus lassen sie sich wieder **freigeben** (Thaw bzw. LiftIsolation),
-    über denselben polkit-Weg.
-  - Kill und Isolation (A4) laufen über denselben Weg. Zusätzlich muss „nicht umkehrbar" bestätigt werden.
-- **TUI:**
-  - Mission Control zeigt die offenen Vorschläge (Liste, Details, Kurz-Hash, Ablauf).
-  - Der Knopf **„Freigeben"** startet `pkexec harw-dod-approve --proposal <id>`. Die Authentisierung läuft im polkit-Agenten der Desktop-Sitzung, nicht im
-    harw-Prozess.
-  - Im Terminal ohne grafischen Agenten läuft `pkttyagent` **im selben TTY wie die TUI** (O12). Das ist per `[dod.approve] tui_tty`
-    abschaltbar. Die Vorgabe ist `true`, und der Wert wird bei `install` und `update` automatisch in die globale Config `~/.harw/config.toml`
-    geschrieben, falls er fehlt. Der Modus ist schwächer als ein separates Terminal, siehe Bedrohungsmodell B17.
+**Grundsatz (nach Review-Befund vom 2026-11-08):** Was der Operator bestätigt, muss von einer Oberfläche angezeigt werden, die harw nicht
+kontrolliert, und die Autorisierung muss an genau diesen Vorschlag gebunden sein (`proposal_digest` über Aktion, Ziel-Cgroup, Kernel-ID,
+Befund-ID, Regel, Severity und Hold). Ein kompromittierter harw-Prozess (Angreifer A4) kennt die Vorschlags-IDs und kontrolliert sein eigenes Terminal.
+Er darf deshalb weder die Anzeige noch die Bestätigungseingabe stellen.
+
+- **Freigabe A, unabhängig (immer verfügbar, volle Garantie):**
+  - Der Operator startet `harw-dod-approve` selbst, in einer Sitzung, die harw nicht kontrolliert: eigenes Terminal-Fenster, anderer Login, SSH.
+  - `harw-dod-approve` holt Vorschläge **vom Escalator** (nicht von harw).
+  - Es zeigt typisierte, escapte Felder: Aktion, Cgroup-Kid, Pfad, Regel, Severity, Kurz-Hash, Digest.
+  - Der Operator tippt den Kurz-Hash ab und wählt optional eine Haltedauer.
+  - Danach folgt polkit `auth_admin` ohne keep, mit Action-Details aus dem Escalator.
+  - Kill und Isolation (A4) verlangen eine eigene polkit-Action `org.harw.dod.irreversible` und die getippte Bestätigung „nicht umkehrbar".
+- **Freigabe B, aus der TUI angestoßen (bequem, gleiche Bindung):**
+  - Der Knopf „Freigeben" in Mission Control sendet nur eine Anfrage `RequestApproval{proposal_id}` an den Escalator. harw startet **kein**
+    `pkexec` und keinen Freigabedialog in seinem Terminal.
+  - Der **Escalator** ruft `CheckAuthorization` (polkit D-Bus) mit `details` aus **seinem** Proposal auf: Aktion, Cgroup, Regel, Kurz-Hash, Digest.
+    Der grafische polkit-Agent der Desktop-Sitzung zeigt diese Details an. Der Operator authentisiert also genau das, was der vertrauenswürdige Dialog anzeigt.
+  - Wählt ein kompromittiertes harw eine andere `proposal_id`, zeigt der Dialog eben diesen anderen Vorschlag. Der Operator sieht, was er
+    freigibt, und harw kann den Inhalt nicht fälschen.
+  - Weil der polkit-Dialog keine Freitexteingabe hat, gilt auf diesem Weg die Haltedauer „bis zur Aufhebung" (O3). Eine Haltedauer wird über Weg A gesetzt.
+  - Kill und Isolation laufen über die eigene Action `org.harw.dod.irreversible`. Deren Dialogtext nennt die Unumkehrbarkeit.
+- **Same-TTY-Modus (O12, `[dod.approve] tui_tty`):**
+  - Ohne grafischen polkit-Agenten müsste `pkttyagent` im Terminal der TUI laufen. Dort kann ein kompromittiertes harw die angezeigten Details
+    überschreiben, sodass die Bindung an den angezeigten Vorschlag **nicht** gilt.
+  - Deshalb erlaubt dieser Modus nur **umkehrbare** Eingriffe: Freeze und Thaw.
+  - Kill und Isolation bleiben in diesem Modus gesperrt und laufen nur über Weg A oder Weg B mit grafischem Agenten.
+  - Die Vorgabe `true` und das automatische Eintragen bei `install`/`update` bleiben (Owner-Entscheidung O12).
+  - Der Doctor und Mission Control kennzeichnen den Modus als „schwächere Bindung".
+- **Menü „Eingriffe":**
+  - In der TUI (Mission Control) und per `harw dod frozen` werden alle aktiven Freezes und Isolationen gezeigt: Cgroup, Grund, seit wann,
+    Freigebender, Hold.
+  - Das Aufheben (Thaw bzw. LiftIsolation) läuft über Weg A oder B.
 - **Schutz vor Selbstfreigabe:**
+  - Der Escalator nimmt `RequestApproval` nur von der harw-uid an. Die Entscheidung kommt immer aus polkit (Weg B) oder aus
+    `harw-dod-approve` (Weg A).
   - `harw-dod-approve` lehnt Peers ab, deren Cgroup unter einer harw-Agenten-Session oder einem `harw-job-*`-Scope liegt.
   - `isatty` gilt nicht als Beweis für einen Menschen.
-  - Ein Agent kann den Knopf weder „drücken" noch das polkit-Passwort sehen.
 - **harw-cli** bekommt nur ein lesendes `harw dod proposals`.
 
 ### 3.2 Triage-Modell
@@ -281,7 +303,15 @@ Voraussetzung ist PL-96 W01. 3.0 und 3.5 können sofort starten.
   - Grenze für aktive Freezes (Vorgabe 3, in `/etc`);
   - Kernel-ID beim Signieren erneut prüfen;
   - persistierte `OperatorDecision`, eigenes Ledger, neues xtask-Gate.
-- **3.3 `harw-dod-approve`:** gemäß §3.1 mit polkit-Policy, TUI-Start und `harw dod proposals`.
+- **3.3 Freigabe gemäß §3.1:**
+  - `harw-dod-approve` für Weg A;
+  - `RequestApproval` und `CheckAuthorization` mit Proposal-Details im Escalator für Weg B;
+  - polkit-Policy mit den Actions `org.harw.dod.freeze` und `org.harw.dod.irreversible`;
+  - Same-TTY-Modus nur für Freeze/Thaw;
+  - `harw dod proposals` und `harw dod frozen`.
+  - **Regressionstest „feindlicher Elternprozess bzw. feindliches TTY":** Ein kompromittierter TUI-Prozess schickt eine fremde `proposal_id`, fälscht
+    Terminalausgaben und versucht Kill im Same-TTY-Modus. Erwartet wird: Der polkit-Dialog bzw. der Escalator nennt den echten Vorschlag,
+    die Autorisierung gilt nur für dessen Digest, und Kill im Same-TTY-Modus wird abgelehnt.
 - **3.4 Deployment:**
   - sysusers für `harw-escalator`, die Approver-Gruppe und `harw-findings` (fehlt heute in `deploy/sysusers.d/harw.conf`);
   - tmpfiles für Spool und Escalator-Socket;
@@ -331,7 +361,8 @@ Voraussetzung ist PL-96 W01. 3.0 und 3.5 können sofort starten.
    5. Gebunden und gespeichert. Der Job-Store trifft den eigenen Job, deshalb erscheint ein Hinweis „`job.suspend` empfohlen", und der Mensch bestätigt im Dialog.
 2. **Prozesssteuerung (fremde Cgroup):**
    1. Bei `Contain` entsteht eine `TriageSubmission`. Der Escalator prüft den Spool und erzeugt einen Vorschlag.
-   2. In der TUI: Freigeben → polkit → Hash eintippen → optional Haltedauer (sonst bis zur Aufhebung).
+   2. In der TUI: „Freigeben" → der Escalator fordert polkit mit seinen Proposal-Details an → du prüfst den Dialog und authentisierst
+      (Haltedauer: bis zur Aufhebung; mit Haltedauer über `harw-dod-approve` in einem eigenen Terminal).
    3. Danach: v2-Signatur → Warden friert ein → Ack → Ledger. Der Timer taut auf, sofern du keine Verlängerung freigibst.
 3. **Datenabruf:**
    - Menschen nutzen `harw dod findings|verdicts|proposals`.
@@ -353,7 +384,7 @@ Voraussetzung ist PL-96 W01. 3.0 und 3.5 können sofort starten.
 | O9 | Loopback-Egress | **den Nutzer interaktiv im Chat fragen** | Ein Loopback-Befund erzeugt eine Rückfrage in der TUI („erlauben / als Low / normal behandeln"). Die Antwort wird als signiertes Label bzw. Allowlist-Vorschlag gemerkt |
 | O10 | nftables und seccomp | **Rust-nftables-Crate + seccomp** | Phase 3.1 ersetzt den `nft`-Subprozess; Abhängigkeits-Review im TCB |
 | O11 | zusätzliche Quellen | **Advisory, Auth-Log, Container-Sensor, intel-scout/context-steward** | Alle werden angebunden (Phase 1.8 erweitert; die Rollen kommen in `role_names::ALL` mit `[return]`) |
-| O12 | polkit im selben TTY | **erlaubt, per Einstellung, Vorgabe an** | `[dod.approve] tui_tty = true`, wird bei `install` und `update` in `~/.harw/config.toml` geschrieben |
+| O12 | polkit im selben TTY | **erlaubt, per Einstellung, Vorgabe an** | `[dod.approve] tui_tty = true`, wird bei `install` und `update` in `~/.harw/config.toml` geschrieben. Nach dem Review-Befund gilt der Modus nur für umkehrbare Eingriffe (Freeze/Thaw), Kill und Isolation nur mit vertrauenswürdiger Anzeige (§3.1) |
 
 ## 7. Verifikation
 
