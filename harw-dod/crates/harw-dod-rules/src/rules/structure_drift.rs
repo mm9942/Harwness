@@ -22,6 +22,14 @@
 //!    bekannte Struktur, von der abgewichen werden könnte — sonst löste jeder
 //!    Host-Sensor (CPU, Speicher, …) in einem Kontext ohne Baselines (z. B.
 //!    `harw-sentinel`) in jedem Zyklus einen Befund pro Metrik aus.
+//!    **Abgeleitete und Selbstdiagnose-Metriken zählen nicht** (Name mit
+//!    `.`, siehe `is_derived_metric`): die Raten der Zählerstufe
+//!    (`<metric>.rate`, `harw-sentinel`), die Kürzungsmarker
+//!    (`netcounters.truncated`, `cgroup.truncated`, `blockio.truncated`) und
+//!    `scanreport.malformed_reports` (PL-100 WP0.14/WP0.15). Bereinigte
+//!    Sensor-Metriken enthalten nie einen Punkt; eine Rate ist keine neue
+//!    Signalart (ihr Zähler wird selbst geprüft), ein Marker beschreibt den
+//!    Sensor, nicht die beobachtete Struktur.
 //!
 //! # Zeitstempel (PL-100 WP0.2)
 //! Ein Ereignis-Befund trägt das `observed_at` seines Ereignisses, ein
@@ -100,7 +108,7 @@ impl Rule for StructureDriftRule {
         let mut seen = HashSet::new();
 
         for sample in ctx.samples {
-            if expected.contains(sample.metric.as_ref()) {
+            if expected.contains(sample.metric.as_ref()) || is_derived_metric(&sample.metric) {
                 continue;
             }
             if !seen.insert(sample.metric.clone()) {
@@ -122,6 +130,13 @@ impl Rule for StructureDriftRule {
 
         findings
     }
+}
+
+/// `true` für eine abgeleitete oder Selbstdiagnose-Metrik, die nie als neue
+/// Signalart gilt: ihr Name enthält einen `.` (`<metric>.rate`,
+/// `<sensor>.truncated`, `scanreport.malformed_reports`) — siehe Moduldoku.
+fn is_derived_metric(metric: &str) -> bool {
+    metric.contains('.')
 }
 
 /// Die Härte, die diese Regel selbst beiträgt: ein Drift-Ereignis wird
@@ -240,6 +255,32 @@ mod tests {
         let ctx = ctx_with(&samples, &baselines, &scope);
 
         assert_eq!(StructureDriftRule.evaluate(&ctx).len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rates_and_sensor_markers_are_no_structure_drift() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).map_err(ctx("gültige Baseline"))?;
+        let samples = vec![
+            sample("user_jiffies.rate"),
+            sample("netcounters.truncated"),
+            sample("cgroup.truncated"),
+            sample("blockio.truncated"),
+            sample("scanreport.malformed_reports"),
+            sample("disk-queue"),
+        ];
+        let scope = NetworkScope::empty();
+        let baselines = [baseline];
+        let ctx = ctx_with(&samples, &baselines, &scope);
+
+        let findings = StructureDriftRule.evaluate(&ctx);
+        assert_eq!(findings.len(), 1, "only the real new metric drifts");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.summary.contains("disk-queue"))
+        );
         Ok(())
     }
 
