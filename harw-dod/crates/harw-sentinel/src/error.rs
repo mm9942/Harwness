@@ -75,6 +75,16 @@ pub enum SentinelBinError {
     #[msg("shell completions failed: {0}")]
     #[from]
     Completions(harw_completions::CompletionError),
+
+    /// `--print-sandbox` konnte seinen Bericht nicht auf stdout schreiben
+    /// (PL-100 WP0.7).
+    ///
+    /// # Arguments
+    /// - `0` (`std::io::Error`): der Schreibfehler (z. B. geschlossene
+    ///   Pipe).
+    #[msg("failed to write the sandbox report: {0}")]
+    #[from]
+    Report(std::io::Error),
 }
 
 #[cfg(test)]

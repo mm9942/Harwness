@@ -25,7 +25,7 @@
 //! | `harw-dod-listener` | [`harw_dod_listener::ListenerSensor`] | `ReadProcNet` | `proc_root` | `ListenerSensor::new(id, proc_root)` |
 //! | `harw-dod-cpu` | [`harw_dod_cpu::CpuSensor`] | `ReadProcStat` | `proc_root` | `SensorHandle::new(id, Capability::ReadProcStat).bind(scope).into()` |
 //! | `harw-dod-thermal` | [`harw_dod_thermal::ThermalSensor`] | `ReadSysfsThermal` | `thermal_root` | `SensorHandle::new(id, Capability::ReadSysfsThermal).bind(scope).into()` |
-//! | `harw-dod-workspace` | [`harw_dod_workspace::WorkspaceDriftSensor`] | `ReadWorkspaceGraph` | `workspace_root` | `WorkspaceDriftSensor::new(handle, workspace_root, baseline)` |
+//! | `harw-dod-workspace` | [`harw_dod_workspace::WorkspaceDriftSensor`] | `ReadWorkspaceGraph` | `workspace_root` (nur mit `--workspace-root`) | `WorkspaceDriftSensor::new(handle, workspace_root, baseline)` |
 //! | `harw-dod-memory` | [`harw_dod_memory::MemorySensor`] | `ReadProcMeminfo` | `proc_root` | `SensorHandle::new(id, Capability::ReadProcMeminfo).bind(scope).into()` |
 //! | `harw-dod-blockio` | [`harw_dod_blockio::BlockioSensor`] | `ReadSysfsBlock` | `blockio_root` | `SensorHandle::new(id, Capability::ReadSysfsBlock).bind(scope).into()` |
 //! | `harw-dod-netcounters` | [`harw_dod_netcounters::NetCountersSensor`] | `ReadProcNetDev` | `proc_root` | `SensorHandle::new(id, Capability::ReadProcNetDev).bind(scope).into()` |
@@ -48,6 +48,13 @@
 //! Jeder Eintrag der Vec in [`build_sensors`] ist genau eine Zeile — ein
 //! neuer unprivilegierter Sensor braucht keine zweite Änderung an dieser
 //! Datei.
+//!
+//! Der Workspace-Sensor ist der einzige bedingte Eintrag: er wird nur
+//! gebaut, wenn `--workspace-root` ausdrücklich angegeben ist
+//! ([`SensorRoots::workspace_root`] ist dann `Some`). Ohne das Flag gibt es
+//! weder den Sensor noch seine Landlock-Leseregel (PL-100 WP0.7: früher
+//! stand die Wurzel auf `.` und weitete die Sandbox über das
+//! Arbeitsverzeichnis auf `/`).
 //!
 //! # Warum `harw-dod-authlog` fehlt, obwohl es gebaut ist
 //! `harw-dod-authlog` ist gelandet, taucht hier aber bewusst **nicht** auf.
@@ -135,8 +142,9 @@ pub struct SensorRoots {
     /// `/sys/class/thermal`.
     pub thermal_root: PathBuf,
     /// Wurzel für [`harw_dod_workspace::WorkspaceDriftSensor`]: das
-    /// Cargo-Workspace-Verzeichnis, dessen Struktur beobachtet wird.
-    pub workspace_root: PathBuf,
+    /// Cargo-Workspace-Verzeichnis, dessen Struktur beobachtet wird. `None`
+    /// (kein `--workspace-root`) registriert keinen Workspace-Sensor.
+    pub workspace_root: Option<PathBuf>,
     /// Wurzel für [`harw_dod_blockio::BlockioSensor`]. In Produktion
     /// `/sys/block` — die Quelle, die
     /// [`harw_dod_cap::Capability::ReadSysfsBlock`]`::probe()` nennt.
@@ -201,10 +209,27 @@ fn initial_workspace_baseline(scope: &ReadScope, root: &Path) -> Option<Inventor
     }
 }
 
+/// Baut den [`harw_dod_workspace::WorkspaceDriftSensor`] für `root`, samt
+/// Startaufnahme als Baseline ([`initial_workspace_baseline`]).
+fn workspace_sensor(root: &Path) -> Arc<dyn Sensor> {
+    let scope = ReadScope::from_roots([root.to_path_buf()]);
+    let baseline = initial_workspace_baseline(&scope, root);
+    let handle = SensorHandle::new(
+        SensorId::from_str("workspace-drift-0"),
+        Capability::ReadWorkspaceGraph,
+    )
+    .bind(scope);
+    Arc::new(harw_dod_workspace::WorkspaceDriftSensor::new(
+        handle,
+        root.to_path_buf(),
+        baseline,
+    ))
+}
+
 /// Baut die vollständige Liste unprivilegierter Sensoren für diesen Prozess.
 ///
 /// # Description
-/// Siehe Moduldoku für die Tabelle der neun registrierten Sensoren und die
+/// Siehe Moduldoku für die Tabelle der registrierten Sensoren und die
 /// Begründung, warum `harw-dod-authlog`, `harw-dod-fsmon`,
 /// `harw-dod-procmon` und (vorerst) `harw-dod-scanreport` hier nicht
 /// erscheinen. Jeder Eintrag baut seinen eigenen `SensorHandle<Bound>`;
@@ -214,7 +239,8 @@ fn initial_workspace_baseline(scope: &ReadScope, root: &Path) -> Option<Inventor
 /// - `roots` (`&SensorRoots`): die sechs Lesewurzeln dieses Prozesses.
 ///
 /// # Returns
-/// Ein `Vec<Arc<dyn Sensor>>`, bereit für `Sentinel::new`. Nie leer, solange
+/// Ein `Vec<Arc<dyn Sensor>>`, bereit für `Sentinel::new`: zehn Sensoren mit
+/// `workspace_root`, neun ohne. Nie leer, solange
 /// mindestens ein Sensorpfad existiert — [`Sentinel::poll_all`] behandelt
 /// einen nicht vorhandenen Quellpfad ohnehin als
 /// `SensorError::SourceUnavailable` je Sensor, nicht als Konstruktionsfehler
@@ -228,14 +254,14 @@ fn initial_workspace_baseline(scope: &ReadScope, root: &Path) -> Option<Inventor
 /// let roots = SensorRoots {
 ///     proc_root: PathBuf::from("/proc"),
 ///     thermal_root: PathBuf::from("/sys/class/thermal"),
-///     workspace_root: PathBuf::from("."),
+///     workspace_root: None,
 ///     blockio_root: PathBuf::from("/sys/block"),
 ///     gpu_root: PathBuf::from("/sys/class/drm"),
 ///     cgroup_root: PathBuf::from("/sys/fs/cgroup"),
 ///     home: PathBuf::from("/tmp/harw-home"),
 /// };
 /// let sensors = build_sensors(&roots);
-/// assert_eq!(sensors.len(), 10);
+/// assert_eq!(sensors.len(), 9);
 /// ```
 #[must_use]
 pub fn build_sensors(roots: &SensorRoots) -> Vec<Arc<dyn Sensor>> {
@@ -257,18 +283,7 @@ pub fn build_sensors(roots: &SensorRoots) -> Vec<Arc<dyn Sensor>> {
     .bind(thermal_scope);
     let thermal: Arc<dyn Sensor> = Arc::new(harw_dod_thermal::ThermalSensor::from(thermal_handle));
 
-    let workspace_scope = ReadScope::from_roots([roots.workspace_root.clone()]);
-    let workspace_baseline = initial_workspace_baseline(&workspace_scope, &roots.workspace_root);
-    let workspace_handle = SensorHandle::new(
-        SensorId::from_str("workspace-drift-0"),
-        Capability::ReadWorkspaceGraph,
-    )
-    .bind(workspace_scope);
-    let workspace: Arc<dyn Sensor> = Arc::new(harw_dod_workspace::WorkspaceDriftSensor::new(
-        workspace_handle,
-        roots.workspace_root.clone(),
-        workspace_baseline,
-    ));
+    let workspace = roots.workspace_root.as_deref().map(workspace_sensor);
 
     let memory_scope = ReadScope::from_roots([roots.proc_root.clone()]);
     let memory_handle =
@@ -310,18 +325,10 @@ pub fn build_sensors(roots: &SensorRoots) -> Vec<Arc<dyn Sensor>> {
         &roots.home,
     ));
 
-    vec![
-        listener,
-        scanreport,
-        cpu,
-        thermal,
-        workspace,
-        memory,
-        blockio,
-        netcounters,
-        gpu,
-        cgroup,
-    ]
+    let mut sensors = vec![listener, scanreport, cpu, thermal];
+    sensors.extend(workspace);
+    sensors.extend([memory, blockio, netcounters, gpu, cgroup]);
+    sensors
 }
 
 /// Meldet, ob jeder übergebene Sensor [`harw_dod_cap::CapabilityClass::Unprivileged`]
@@ -358,7 +365,7 @@ mod tests {
         SensorRoots {
             proc_root: PathBuf::from("/proc"),
             thermal_root: PathBuf::from("/sys/class/thermal"),
-            workspace_root: PathBuf::from("."),
+            workspace_root: Some(PathBuf::from("/nonexistent-harw-sentinel-workspace")),
             blockio_root: PathBuf::from("/sys/block"),
             gpu_root: PathBuf::from("/sys/class/drm"),
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
@@ -375,6 +382,24 @@ mod tests {
         // stillschweigend herausfällt, ist genau der Befund, den die
         // Bottom-up-Analyse an dieser Stelle gefunden hat.
         assert_eq!(sensors.len(), 10);
+    }
+
+    /// PL-100 WP0.7: ohne `--workspace-root` kein Workspace-Sensor, die
+    /// übrigen neun bleiben.
+    #[test]
+    fn test_build_sensors_without_workspace_root_skips_only_the_workspace_sensor() {
+        let roots = SensorRoots {
+            workspace_root: None,
+            ..roots()
+        };
+        let sensors = build_sensors(&roots);
+        assert_eq!(sensors.len(), 9);
+        assert!(
+            sensors
+                .iter()
+                .all(|sensor| sensor.handle().id().as_str() != "workspace-drift-0")
+        );
+        assert!(all_unprivileged(&sensors));
     }
 
     #[test]
@@ -482,7 +507,7 @@ mod tests {
         let roots = SensorRoots {
             proc_root: PathBuf::from("/nonexistent-harw-sentinel-proc"),
             thermal_root: PathBuf::from("/nonexistent-harw-sentinel-thermal"),
-            workspace_root: PathBuf::from("/nonexistent-harw-sentinel-workspace"),
+            workspace_root: Some(PathBuf::from("/nonexistent-harw-sentinel-workspace")),
             blockio_root: PathBuf::from("/nonexistent-harw-sentinel-blockio"),
             gpu_root: PathBuf::from("/nonexistent-harw-sentinel-gpu"),
             cgroup_root: PathBuf::from("/nonexistent-harw-sentinel-cgroup"),
