@@ -25,7 +25,13 @@
 //!     {"id": "gpu-0", "health": "degraded", "degrade_reason": "permanent",
 //!      "readings_total": 0, "errors_total": 1}
 //!   ],
-//!   "ipc": {"probes_connected": 1, "events_total": 40, "dropped_total": 0}
+//!   "ipc": {"probes_connected": 1, "events_total": 40, "dropped_total": 0,
+//!           "events_last_cycle": 3, "dropped_last_cycle": 0,
+//!           "events_last_60s": 12, "dropped_last_60s": 0},
+//!   "ring": {"overflow_samples_total": 0, "overflow_events_total": 0,
+//!            "overflow_samples_last_cycle": 0, "overflow_events_last_cycle": 0,
+//!            "overflow_samples_last_60s": 0, "overflow_events_last_60s": 0},
+//!   "windows": {"last_cycle_ms": 5000, "last_60s_ms": 60000}
 //! }
 //! ```
 //!
@@ -36,6 +42,18 @@
 //!   present only for `degraded`; `last_ok_at` only after a successful poll.
 //! - `readings_total`/`errors_total` count successful and failed polls of
 //!   that sensor since process start ([`SensorTracker`]).
+//! - `ring` counts entries the evidence ring evicted **before** the rules
+//!   evaluated them (`crate::findings::RuleCycle`): observations that were
+//!   never checked. Expected: `0`.
+//! - Windowed deltas (PL-100 WP0.13, additive): every cumulative counter of
+//!   `ipc` and `ring` has a `*_last_cycle` delta (since the previous
+//!   document) and a `*_last_60s` delta (since the newest cycle at least
+//!   [`HEALTH_WINDOW_SECS`] seconds ago). `windows` reports the span each
+//!   delta actually covers in milliseconds; `null` means "since process
+//!   start" (the first cycle, or a process younger than the window). When
+//!   the bounded history ([`MAX_WINDOW_SNAPSHOTS`]) no longer reaches back
+//!   a full window, `last_60s_ms` is the shorter span actually covered.
+//!   Counters that go backwards yield `0`, never a wrapped value.
 //! - The document carries no evidence, no raw events, no paths, no secrets.
 //!
 //! # Atomic replacement
@@ -58,6 +76,7 @@
 //! Lives exclusively in the collection thread (`&mut self`), like
 //! `crate::export::FindingsExporter`.
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
@@ -66,7 +85,7 @@ use std::path::{Path, PathBuf};
 use harw_dod_sentinel::{DegradeReason, SensorHealth};
 use harw_observe::{MetricValue, TelemetrySink};
 use harw_types::SensorId;
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde::Serialize;
 
 /// Schema version of the health document (`schema_version`).
@@ -78,6 +97,16 @@ pub const DEFAULT_HEALTH_FILE_NAME: &str = "health.json";
 /// Mode of a newly created health document: owner read/write, group read
 /// (readers get access through the export directory's group), nothing else.
 pub const HEALTH_FILE_MODE: u32 = 0o640;
+
+/// Length of the sliding window behind the `*_last_60s` deltas, in seconds.
+pub const HEALTH_WINDOW_SECS: i64 = 60;
+
+/// [`HEALTH_WINDOW_SECS`] as a duration.
+const HEALTH_WINDOW: SignedDuration = SignedDuration::from_secs(HEALTH_WINDOW_SECS);
+
+/// Most per-cycle counter snapshots kept for the sliding window (bounds the
+/// memory even with a very short `--interval-secs`).
+pub const MAX_WINDOW_SNAPSHOTS: usize = 4096;
 
 harw_macros::metrics! {
     /// How often the health document could not be written since process
@@ -95,6 +124,143 @@ pub struct IpcCounters {
     pub events_total: u64,
     /// Events evicted from the full receive inbox since start.
     pub dropped_total: u64,
+}
+
+/// Cumulative counters of the evidence ring (`ring` object).
+///
+/// # Description
+/// Entries the ring evicted before the rules evaluated them, since process
+/// start (`crate::findings::RuleCycle::ring_counters`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RingCounters {
+    /// Samples evicted before evaluation.
+    pub overflow_samples_total: u64,
+    /// Events evicted before evaluation.
+    pub overflow_events_total: u64,
+}
+
+/// The counters that get windowed deltas, as one value.
+///
+/// # Description
+/// Used both for a cumulative snapshot and for the difference of two
+/// snapshots ([`Self::since`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealthCounters {
+    /// IPC events received (`ipc.events_*`).
+    pub ipc_events: u64,
+    /// IPC events evicted from the inbox (`ipc.dropped_*`).
+    pub ipc_dropped: u64,
+    /// Ring samples evicted before evaluation (`ring.overflow_samples_*`).
+    pub ring_overflow_samples: u64,
+    /// Ring events evicted before evaluation (`ring.overflow_events_*`).
+    pub ring_overflow_events: u64,
+}
+
+impl HealthCounters {
+    /// The cumulative snapshot of `ipc` and `ring`.
+    #[must_use]
+    pub const fn of(ipc: IpcCounters, ring: RingCounters) -> Self {
+        Self {
+            ipc_events: ipc.events_total,
+            ipc_dropped: ipc.dropped_total,
+            ring_overflow_samples: ring.overflow_samples_total,
+            ring_overflow_events: ring.overflow_events_total,
+        }
+    }
+
+    /// The per-counter difference `self - base`, `0` where a counter went
+    /// backwards.
+    #[must_use]
+    pub const fn since(self, base: Self) -> Self {
+        Self {
+            ipc_events: self.ipc_events.saturating_sub(base.ipc_events),
+            ipc_dropped: self.ipc_dropped.saturating_sub(base.ipc_dropped),
+            ring_overflow_samples: self
+                .ring_overflow_samples
+                .saturating_sub(base.ring_overflow_samples),
+            ring_overflow_events: self
+                .ring_overflow_events
+                .saturating_sub(base.ring_overflow_events),
+        }
+    }
+}
+
+/// Deltas over the two health windows (see the module documentation).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowDeltas {
+    /// Change since the previous document.
+    pub last_cycle: HealthCounters,
+    /// Span of `last_cycle` in milliseconds; `None` = since process start.
+    pub last_cycle_ms: Option<u64>,
+    /// Change over the last [`HEALTH_WINDOW_SECS`] seconds.
+    pub last_60s: HealthCounters,
+    /// Span of `last_60s` in milliseconds; `None` = since process start.
+    pub last_60s_ms: Option<u64>,
+}
+
+/// Remembers per-cycle cumulative snapshots for the windowed deltas.
+///
+/// # Description
+/// Keeps, oldest first, the newest snapshot at least one window old (the
+/// baseline of the next window) plus every younger one, at most
+/// [`MAX_WINDOW_SNAPSHOTS`].
+#[derive(Debug, Default)]
+struct WindowTracker {
+    // `(now, cumulative counters)` per recorded cycle, oldest first.
+    history: VecDeque<(Timestamp, HealthCounters)>,
+    // Whether a snapshot was ever discarded, i.e. the process-start baseline
+    // (all zero) is no longer the implicit oldest one.
+    truncated: bool,
+}
+
+impl WindowTracker {
+    /// Records the cumulative counters of the cycle at `now` and returns its
+    /// windowed deltas.
+    fn record(&mut self, now: Timestamp, current: HealthCounters) -> WindowDeltas {
+        let (last_cycle, last_cycle_ms) = match self.history.back() {
+            Some((at, base)) => (current.since(*base), span_ms(now, *at)),
+            None => (current, None),
+        };
+        let window_start = now.checked_sub(HEALTH_WINDOW).ok();
+        let baseline = window_start.and_then(|start| {
+            self.history
+                .iter()
+                .rev()
+                .find(|(at, _)| *at <= start)
+                .copied()
+        });
+        let (last_60s, last_60s_ms) = match (baseline, self.truncated, self.history.front()) {
+            (Some((at, base)), _, _) | (None, true, Some(&(at, base))) => {
+                (current.since(base), span_ms(now, at))
+            }
+            (None, _, _) => (current, None),
+        };
+
+        self.history.push_back((now, current));
+        if let Some(start) = window_start {
+            // Ältere Stände als die jüngste Basis vor dem Fenster werden nie
+            // mehr gebraucht.
+            while self.history.get(1).is_some_and(|(at, _)| *at <= start) {
+                self.history.pop_front();
+                self.truncated = true;
+            }
+        }
+        while self.history.len() > MAX_WINDOW_SNAPSHOTS {
+            self.history.pop_front();
+            self.truncated = true;
+        }
+        WindowDeltas {
+            last_cycle,
+            last_cycle_ms,
+            last_60s,
+            last_60s_ms,
+        }
+    }
+}
+
+/// Milliseconds from `earlier` to `now`; `None` if the clock went backwards.
+fn span_ms(now: Timestamp, earlier: Timestamp) -> Option<u64> {
+    u64::try_from(now.duration_since(earlier).as_millis()).ok()
 }
 
 /// Stable string form of a [`SensorHealth`] state.
@@ -195,6 +361,36 @@ struct SensorLine<'a> {
     errors_total: u64,
 }
 
+/// The `ipc` object: cumulative counters plus their windowed deltas.
+#[derive(Debug, Serialize)]
+struct IpcLine {
+    probes_connected: u64,
+    events_total: u64,
+    dropped_total: u64,
+    events_last_cycle: u64,
+    dropped_last_cycle: u64,
+    events_last_60s: u64,
+    dropped_last_60s: u64,
+}
+
+/// The `ring` object: cumulative overflow counters plus windowed deltas.
+#[derive(Debug, Serialize)]
+struct RingLine {
+    overflow_samples_total: u64,
+    overflow_events_total: u64,
+    overflow_samples_last_cycle: u64,
+    overflow_events_last_cycle: u64,
+    overflow_samples_last_60s: u64,
+    overflow_events_last_60s: u64,
+}
+
+/// The `windows` object: the spans the deltas cover.
+#[derive(Debug, Serialize)]
+struct WindowLine {
+    last_cycle_ms: Option<u64>,
+    last_60s_ms: Option<u64>,
+}
+
 /// The whole document.
 #[derive(Debug, Serialize)]
 struct HealthDocument<'a> {
@@ -203,7 +399,9 @@ struct HealthDocument<'a> {
     config_digest: Option<&'a str>,
     profile: Option<&'a str>,
     sensors: Vec<SensorLine<'a>>,
-    ipc: IpcCounters,
+    ipc: IpcLine,
+    ring: RingLine,
+    windows: WindowLine,
 }
 
 /// Identity of the resolved DoD configuration, as reported in the document.
@@ -219,6 +417,13 @@ pub struct ConfigIdentity {
 
 /// Encodes the health document (pretty-printed, trailing newline).
 ///
+/// # Arguments
+/// - `identity`, `snapshot`, `tracker`: configuration identity, sensor
+///   health and per-sensor counters.
+/// - `ipc`, `ring`: the cumulative counters.
+/// - `windows`: their windowed deltas ([`WindowDeltas`]).
+/// - `now`: reported as `written_at`.
+///
 /// # Errors
 /// `serde_json::Error` if serialization fails (practically unreachable for
 /// these field types, but not treated as a panic).
@@ -227,6 +432,8 @@ pub fn encode_document(
     snapshot: &[(SensorId, SensorHealth)],
     tracker: &SensorTracker,
     ipc: IpcCounters,
+    ring: RingCounters,
+    windows: &WindowDeltas,
     now: Timestamp,
 ) -> Result<String, serde_json::Error> {
     let sensors = snapshot
@@ -254,7 +461,27 @@ pub fn encode_document(
         config_digest: identity.config_digest.as_deref(),
         profile: identity.profile.as_deref(),
         sensors,
-        ipc,
+        ipc: IpcLine {
+            probes_connected: ipc.probes_connected,
+            events_total: ipc.events_total,
+            dropped_total: ipc.dropped_total,
+            events_last_cycle: windows.last_cycle.ipc_events,
+            dropped_last_cycle: windows.last_cycle.ipc_dropped,
+            events_last_60s: windows.last_60s.ipc_events,
+            dropped_last_60s: windows.last_60s.ipc_dropped,
+        },
+        ring: RingLine {
+            overflow_samples_total: ring.overflow_samples_total,
+            overflow_events_total: ring.overflow_events_total,
+            overflow_samples_last_cycle: windows.last_cycle.ring_overflow_samples,
+            overflow_events_last_cycle: windows.last_cycle.ring_overflow_events,
+            overflow_samples_last_60s: windows.last_60s.ring_overflow_samples,
+            overflow_events_last_60s: windows.last_60s.ring_overflow_events,
+        },
+        windows: WindowLine {
+            last_cycle_ms: windows.last_cycle_ms,
+            last_60s_ms: windows.last_60s_ms,
+        },
     };
     let mut encoded = serde_json::to_string_pretty(&document)?;
     encoded.push('\n');
@@ -271,8 +498,9 @@ pub fn default_path_for(findings_export: &Path) -> Option<PathBuf> {
         .map(|parent| parent.join(DEFAULT_HEALTH_FILE_NAME))
 }
 
-/// Temporary sibling `.<name>.tmp` used for the atomic replacement.
-fn temporary_path(path: &Path) -> Option<PathBuf> {
+/// Temporary sibling `.<name>.tmp` used for the atomic replacement (also by
+/// `crate::throttle` for its state file).
+pub(crate) fn temporary_path(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?;
     let mut temporary = OsString::from(".");
     temporary.push(name);
@@ -281,12 +509,25 @@ fn temporary_path(path: &Path) -> Option<PathBuf> {
 }
 
 /// Writes `bytes` to `path` atomically (temporary sibling, flush, rename).
-fn write_atomically(path: &Path, temporary: &Path, bytes: &[u8]) -> io::Result<()> {
+///
+/// # Description
+/// A target that exists but is not a regular file (symlink, directory) is
+/// refused; a leftover temporary is removed (never followed); the new file
+/// is created with `O_EXCL` and `mode`. Shared with `crate::throttle`.
+///
+/// # Errors
+/// Every I/O error of these steps; the temporary is removed on failure.
+pub(crate) fn write_atomically(
+    path: &Path,
+    temporary: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if !meta.file_type().is_file() => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "health export path exists but is not a regular file",
+                "atomic write target exists but is not a regular file",
             ));
         }
         Ok(_) => {}
@@ -305,8 +546,10 @@ fn write_atomically(path: &Path, temporary: &Path, bytes: &[u8]) -> io::Result<(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(HEALTH_FILE_MODE);
+        options.mode(mode);
     }
+    #[cfg(not(unix))]
+    let _ = mode; // Ohne Unix-Modusbits gibt es nichts zu setzen.
     let written = options.open(temporary).and_then(|mut file| {
         file.write_all(bytes)?;
         file.sync_data()
@@ -330,6 +573,8 @@ pub struct HealthExporter {
     path: PathBuf,
     identity: ConfigIdentity,
     tracker: SensorTracker,
+    /// Per-cycle snapshots behind the windowed deltas.
+    windows: WindowTracker,
     written: u64,
     failures: u64,
     /// Whether the previous write failed (rate-limits the warning).
@@ -344,6 +589,7 @@ impl HealthExporter {
             path,
             identity,
             tracker: SensorTracker::default(),
+            windows: WindowTracker::default(),
             written: 0,
             failures: 0,
             failing: false,
@@ -388,22 +634,34 @@ impl HealthExporter {
     ///   [`SensorTracker::observe`]); `after` is also what the document
     ///   reports.
     /// - `ipc`: current receive-path counters.
-    /// - `now`: the cycle's timestamp, reported as `written_at`.
+    /// - `ring`: current evidence-ring overflow counters.
+    /// - `now`: the cycle's timestamp, reported as `written_at`; also the
+    ///   time base of the windowed deltas.
     ///
     /// # Returns
     /// `true` if the document was replaced; `false` after a counted and
-    /// logged failure.
+    /// logged failure. The windowed deltas advance either way.
     pub fn record_cycle(
         &mut self,
         sink: &dyn TelemetrySink,
         before: &[(SensorId, SensorHealth)],
         after: &[(SensorId, SensorHealth)],
         ipc: IpcCounters,
+        ring: RingCounters,
         now: Timestamp,
     ) -> bool {
         self.tracker.observe(before, after, now);
-        let result = encode_document(&self.identity, after, &self.tracker, ipc, now)
-            .map_err(io::Error::other)
+        let windows = self.windows.record(now, HealthCounters::of(ipc, ring));
+        let result = encode_document(
+            &self.identity,
+            after,
+            &self.tracker,
+            ipc,
+            ring,
+            &windows,
+            now,
+        )
+        .map_err(io::Error::other)
             .and_then(|encoded| {
                 let temporary = temporary_path(&self.path).ok_or_else(|| {
                     io::Error::new(
@@ -411,7 +669,7 @@ impl HealthExporter {
                         "health export path has no file name",
                     )
                 })?;
-                write_atomically(&self.path, &temporary, encoded.as_bytes())
+                write_atomically(&self.path, &temporary, encoded.as_bytes(), HEALTH_FILE_MODE)
             });
         match result {
             Ok(()) => {
@@ -469,6 +727,8 @@ mod tests {
         profile: Option<String>,
         sensors: Vec<Sensor>,
         ipc: Ipc,
+        ring: Ring,
+        windows: Windows,
     }
 
     #[derive(Debug, Deserialize)]
@@ -490,6 +750,28 @@ mod tests {
         probes_connected: u64,
         events_total: u64,
         dropped_total: u64,
+        events_last_cycle: u64,
+        dropped_last_cycle: u64,
+        events_last_60s: u64,
+        dropped_last_60s: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Ring {
+        overflow_samples_total: u64,
+        overflow_events_total: u64,
+        overflow_samples_last_cycle: u64,
+        overflow_events_last_cycle: u64,
+        overflow_samples_last_60s: u64,
+        overflow_events_last_60s: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Windows {
+        last_cycle_ms: Option<u64>,
+        last_60s_ms: Option<u64>,
     }
 
     fn at(secs: i64) -> TestResult<Timestamp> {
@@ -536,7 +818,11 @@ mod tests {
             events_total: 40,
             dropped_total: 2,
         };
-        assert!(exporter.record_cycle(&NullSink, &before, &after, ipc, now));
+        let ring = RingCounters {
+            overflow_samples_total: 3,
+            overflow_events_total: 4,
+        };
+        assert!(exporter.record_cycle(&NullSink, &before, &after, ipc, ring, now));
         assert_eq!(exporter.written(), 1);
         assert_eq!(exporter.failures(), 0);
 
@@ -559,6 +845,136 @@ mod tests {
         assert_eq!(document.ipc.probes_connected, 1);
         assert_eq!(document.ipc.events_total, 40);
         assert_eq!(document.ipc.dropped_total, 2);
+        // Erster Zyklus: die Fenster reichen bis zum Prozessstart zurück.
+        assert_eq!(document.ipc.events_last_cycle, 40);
+        assert_eq!(document.ipc.dropped_last_cycle, 2);
+        assert_eq!(document.ipc.events_last_60s, 40);
+        assert_eq!(document.ipc.dropped_last_60s, 2);
+        assert_eq!(document.ring.overflow_samples_total, 3);
+        assert_eq!(document.ring.overflow_events_total, 4);
+        assert_eq!(document.ring.overflow_samples_last_cycle, 3);
+        assert_eq!(document.ring.overflow_events_last_cycle, 4);
+        assert_eq!(document.ring.overflow_samples_last_60s, 3);
+        assert_eq!(document.ring.overflow_events_last_60s, 4);
+        assert_eq!(document.windows.last_cycle_ms, None);
+        assert_eq!(document.windows.last_60s_ms, None);
+        Ok(())
+    }
+
+    fn counters(dropped: u64, overflow_events: u64) -> (IpcCounters, RingCounters) {
+        (
+            IpcCounters {
+                probes_connected: 1,
+                events_total: dropped.saturating_mul(10),
+                dropped_total: dropped,
+            },
+            RingCounters {
+                overflow_samples_total: 0,
+                overflow_events_total: overflow_events,
+            },
+        )
+    }
+
+    /// PL-100 WP0.13: Deltas des letzten Zyklus und der letzten 60 s neben
+    /// den kumulierten Zählern.
+    #[test]
+    fn test_windowed_deltas_cover_the_last_cycle_and_the_last_minute() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join(DEFAULT_HEALTH_FILE_NAME);
+        let mut exporter = HealthExporter::new(path.clone(), ConfigIdentity::default());
+        // (Sekunde, kumuliert verworfen, kumulierter Ring-Überlauf)
+        for (second, dropped, overflow) in [(100, 0, 0), (130, 4, 1), (160, 10, 1), (190, 12, 5)] {
+            let (ipc, ring) = counters(dropped, overflow);
+            assert!(exporter.record_cycle(&NullSink, &[], &[], ipc, ring, at(second)?));
+        }
+        let document = read_document(&path)?;
+        assert_eq!(document.ipc.dropped_total, 12, "cumulative counters stay");
+        assert_eq!(document.ipc.dropped_last_cycle, 2, "190 vs 160");
+        assert_eq!(document.ipc.dropped_last_60s, 8, "190 vs 130");
+        assert_eq!(document.ipc.events_last_cycle, 20);
+        assert_eq!(document.ipc.events_last_60s, 80);
+        assert_eq!(document.ring.overflow_events_total, 5);
+        assert_eq!(document.ring.overflow_events_last_cycle, 4);
+        assert_eq!(document.ring.overflow_events_last_60s, 4);
+        assert_eq!(document.ring.overflow_samples_last_60s, 0);
+        assert_eq!(document.windows.last_cycle_ms, Some(30_000));
+        assert_eq!(document.windows.last_60s_ms, Some(60_000));
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_young_process_reports_the_minute_since_start() -> TestResult {
+        let mut tracker = WindowTracker::default();
+        let first = tracker.record(
+            at(10)?,
+            HealthCounters {
+                ipc_dropped: 2,
+                ..HealthCounters::default()
+            },
+        );
+        assert_eq!(first.last_cycle.ipc_dropped, 2);
+        assert_eq!(first.last_cycle_ms, None);
+        let second = tracker.record(
+            at(15)?,
+            HealthCounters {
+                ipc_dropped: 3,
+                ..HealthCounters::default()
+            },
+        );
+        assert_eq!(second.last_cycle.ipc_dropped, 1);
+        assert_eq!(second.last_cycle_ms, Some(5_000));
+        assert_eq!(
+            second.last_60s.ipc_dropped, 3,
+            "younger than the window: everything since start"
+        );
+        assert_eq!(second.last_60s_ms, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_counters_going_backwards_yield_zero_not_a_wrap() -> TestResult {
+        let mut tracker = WindowTracker::default();
+        tracker.record(
+            at(10)?,
+            HealthCounters {
+                ipc_events: 50,
+                ..HealthCounters::default()
+            },
+        );
+        let after_reset = tracker.record(
+            at(15)?,
+            HealthCounters {
+                ipc_events: 5,
+                ..HealthCounters::default()
+            },
+        );
+        assert_eq!(after_reset.last_cycle.ipc_events, 0);
+        let back = tracker.record(at(1)?, HealthCounters::default());
+        assert_eq!(back.last_cycle_ms, None, "a clock jump back has no span");
+        Ok(())
+    }
+
+    #[test]
+    fn test_window_history_stays_bounded() -> TestResult {
+        let mut tracker = WindowTracker::default();
+        let mut last = WindowDeltas::default();
+        for millis in 0..6_000_i64 {
+            let now = Timestamp::from_millisecond(millis).map_err(ctx("timestamp"))?;
+            let total = u64::try_from(millis).map_err(ctx("non-negative"))?;
+            last = tracker.record(
+                now,
+                HealthCounters {
+                    ipc_events: total,
+                    ..HealthCounters::default()
+                },
+            );
+            assert!(tracker.history.len() <= MAX_WINDOW_SNAPSHOTS);
+        }
+        // Die gekappte Historie reicht nicht mehr eine ganze Minute zurück:
+        // gemeldet wird die tatsächlich abgedeckte Spanne.
+        let covered = u64::try_from(MAX_WINDOW_SNAPSHOTS).map_err(ctx("snapshot bound"))?;
+        assert_eq!(last.last_60s_ms, Some(covered));
+        assert_eq!(last.last_60s.ipc_events, covered);
         Ok(())
     }
 
@@ -569,6 +985,8 @@ mod tests {
             &[],
             &SensorTracker::default(),
             IpcCounters::default(),
+            RingCounters::default(),
+            &WindowDeltas::default(),
             Timestamp::UNIX_EPOCH,
         )
         .map_err(ctx("encode"))?;
@@ -592,6 +1010,7 @@ mod tests {
                 &snapshot,
                 &snapshot,
                 IpcCounters::default(),
+                RingCounters::default(),
                 at(second)?,
             ));
         }
@@ -620,6 +1039,7 @@ mod tests {
             &[],
             &[],
             IpcCounters::default(),
+            RingCounters::default(),
             Timestamp::UNIX_EPOCH
         ));
         let mode = fs::metadata(&path)
@@ -646,6 +1066,7 @@ mod tests {
             &[],
             &[],
             IpcCounters::default(),
+            RingCounters::default(),
             Timestamp::UNIX_EPOCH,
         );
         assert!(!ok);
@@ -675,6 +1096,7 @@ mod tests {
             &[],
             &[],
             IpcCounters::default(),
+            RingCounters::default(),
             Timestamp::UNIX_EPOCH
         ));
         assert_eq!(fs::read(&victim).map_err(ctx("read victim"))?, b"keep");
@@ -694,6 +1116,7 @@ mod tests {
                 &[],
                 &[],
                 IpcCounters::default(),
+                RingCounters::default(),
                 Timestamp::UNIX_EPOCH
             ));
         }
@@ -704,6 +1127,7 @@ mod tests {
             &[],
             &[],
             IpcCounters::default(),
+            RingCounters::default(),
             Timestamp::UNIX_EPOCH
         ));
         assert_eq!(exporter.written(), 1);
@@ -757,6 +1181,8 @@ mod tests {
             &after,
             &tracker,
             IpcCounters::default(),
+            RingCounters::default(),
+            &WindowDeltas::default(),
             now,
         )
         .map_err(ctx("encode"))?;
