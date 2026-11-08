@@ -27,7 +27,14 @@
 //! `/dod` über die Harw-DoD-Suite; `dod.status`/`dod.findings`/`dod.sensors`
 //! sind ihre lesenden Modell-Werkzeuge ohne Freigabe. Keine davon schreibt
 //! DoD-Zustand oder erreicht Warden bzw. Eskalation (Invariante S1); die
-//! Dienststeuerung gibt es nur als root-CLI `harw dod`.
+//! Dienststeuerung gibt es nur als root-CLI `harw dod`. Die lesenden
+//! Triage-Werkzeuge `dod.finding`/`dod.related`/`dod.labels` (PL-100 WP1.2,
+//! `dod::dod_triage_operations`) stehen bewusst **nicht** in
+//! [`register_all`]: eine Root-Session behält genau die drei `dod.*` oben
+//! (PL-100 O8, Werkzeugbudget G1); nur die vier `security-*-triage`-Kinder
+//! bekommen sie (`harw-runtime/src/children.rs`); der Werkzeug-Index
+//! beschreibt sie direkt aus `dod::dod_triage_operations`, ohne sie zu
+//! registrieren (`tool_index_op::known_specs`).
 //! `tool.index` (PL-97 B2, siehe `crate::tool_index_op`) ist das lesende
 //! Modell-Werkzeug über den Werkzeug-Index (Familien, Klassen, verknüpfte
 //! Skills, erste Sätze der echten Beschreibungen) ohne Freigabe.
@@ -1395,6 +1402,61 @@ mod tests {
                 registered_names.contains(name),
                 "operation '{name}' is declared in harw-ops but not registered anywhere",
             );
+        }
+
+        // PL-100 WP1.2: die drei Triage-Werkzeuge sind deklariert, aber
+        // bewusst nicht Teil einer Root-Registry; erreichbar sind sie über
+        // `dod::dod_triage_operations` (Kind-Provider der Triage-Rollen;
+        // der Werkzeug-Index liest ihre Beschreibungen direkt daraus).
+        let triage: Vec<&str> = crate::dod::dod_triage_operations()
+            .iter()
+            .map(|op| op.meta().name)
+            .collect();
+        assert_eq!(triage, crate::dod::DOD_TRIAGE_OP_TOOLS);
+        for name in triage {
+            assert!(
+                !registered_names.contains(name),
+                "{name} must stay out of the root registries"
+            );
+        }
+    }
+
+    /// PL-100 O8/G1 (Plan §7 „Root hat genau 3 Werkzeuge"): eine Root-
+    /// Session mit allen gegateten Flächen trägt genau die drei lesenden
+    /// `dod.*` aus `dod::DOD_MODEL_TOOLS` als Modell-Werkzeuge, keines der
+    /// Triage-Werkzeuge.
+    #[test]
+    fn root_sessions_expose_exactly_the_three_dod_read_tools() {
+        let mut reg = OperationRegistry::new();
+        register_all(&mut reg);
+        super::register_plan_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        super::register_work_driver_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        super::register_intent_cycle_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        // Fehler hier ließen nur Gateway-Werkzeuge fehlen, nie `dod.*` entstehen.
+        let _ = super::gateway_ops::register_gateway(&mut reg);
+        let _ = super::gateway_ops::register_gateway_diagnostics(&mut reg);
+
+        let mut dod_model_tools: Vec<&str> = reg
+            .iter()
+            .map(|op| op.meta())
+            .filter(|meta| {
+                meta.surfaces
+                    .iter()
+                    .any(|surface| matches!(surface, harw_operations::Surface::ModelTool { .. }))
+            })
+            .map(|meta| meta.name)
+            .filter(|name| name.starts_with("dod."))
+            .collect();
+        dod_model_tools.sort_unstable();
+        let mut expected = crate::dod::DOD_MODEL_TOOLS;
+        expected.sort_unstable();
+        assert_eq!(dod_model_tools, expected);
+        assert_eq!(
+            harw_registry_defaults::profile::DOD_READ_TOOLS,
+            crate::dod::DOD_MODEL_TOOLS
+        );
+        for name in harw_registry_defaults::profile::DOD_TRIAGE_TOOLS {
+            assert!(reg.find_by_name(name).is_none(), "{name} reached the root");
         }
     }
 

@@ -66,7 +66,7 @@ use harw_registry_defaults::profile::{
 use harw_registry_defaults::profile::{MATRIX_GAME_MASTER_TOOLS, matrix_tools_for_role};
 // PL-97 D3/D4: die lesenden `dod.*` der Triage-Rollen steuert ebenfalls die
 // Composition-Root bei (rollengebundener Provider in `harw-runtime/src/children.rs`).
-use harw_registry_defaults::profile::{DOD_READ_TOOLS, dod_tools_for_role};
+use harw_registry_defaults::profile::{DOD_READ_TOOLS, DOD_TRIAGE_ROLE_TOOLS, dod_tools_for_role};
 // Plan R9, Teil A: `skills.search`/`skills.load` ebenso.
 use harw_registry_defaults::profile::{
     SKILL_CATALOG_EXCLUDED_ROLES, SKILL_CATALOG_TOOLS, skill_catalog_tools_for_role,
@@ -1071,7 +1071,9 @@ fn security_triage_roles_admit_the_dod_tools_and_bind_the_bundled_harw_dod_skill
         let offered = dod_tools_for_role(role);
         if offered.is_empty() {
             assert!(
-                !admitted.iter().any(|tool| DOD_READ_TOOLS.contains(tool)),
+                !admitted
+                    .iter()
+                    .any(|tool| DOD_TRIAGE_ROLE_TOOLS.contains(tool)),
                 "{role} admittiert dod.* ohne Angebot"
             );
             assert!(
@@ -1081,8 +1083,8 @@ fn security_triage_roles_admit_the_dod_tools_and_bind_the_bundled_harw_dod_skill
             continue;
         }
         triage += 1;
-        assert_eq!(offered, DOD_READ_TOOLS, "{role}");
-        let expected: BTreeSet<&str> = DOD_READ_TOOLS.iter().copied().collect();
+        assert_eq!(offered, DOD_TRIAGE_ROLE_TOOLS, "{role}");
+        let expected: BTreeSet<&str> = DOD_TRIAGE_ROLE_TOOLS.iter().copied().collect();
         assert_eq!(admitted, expected, "{role}: genau die dod.*");
         assert_eq!(ir.skills(), ["harw-dod"], "{role}: skills");
     }

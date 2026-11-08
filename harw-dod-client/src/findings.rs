@@ -217,8 +217,48 @@ pub fn is_uuid_v4(value: &str) -> bool {
         })
 }
 
+/// `true` when `value` is a finding id that some accepted export line may
+/// carry: the v1/v2 rule of the line parser — not blank, at most
+/// [`MAX_ID_BYTES`] bytes, no control, bidi or invisible characters.
+///
+/// Every canonical UUIDv4 ([`is_uuid_v4`], the v3 rule) passes as well, so
+/// a reader that takes a finding id as input to compare against the export
+/// (the `id` filter of `dod.findings`) accepts exactly the ids the parser
+/// lets through, v1/v2 ids such as `f-1` included. Nothing is trimmed.
+///
+/// # Examples
+/// ```
+/// use harw_dod_client::findings::is_finding_id;
+///
+/// assert!(is_finding_id("f-1"));
+/// assert!(is_finding_id("3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b"));
+/// assert!(!is_finding_id("   "));
+/// assert!(!is_finding_id("f\u{7}1"));
+/// assert!(!is_finding_id(&"f".repeat(257)));
+/// ```
+#[must_use]
+pub fn is_finding_id(value: &str) -> bool {
+    is_clean(value, MAX_ID_BYTES)
+}
+
 /// `true` when `value` is exactly `len` lowercase hex characters.
-fn is_lower_hex(value: &str, len: usize) -> bool {
+///
+/// The grammar of the v3 identifiers `record_digest`
+/// ([`RECORD_DIGEST_HEX_LEN`]) and `dedup_key` ([`DEDUP_KEY_HEX_LEN`]);
+/// readers that take such a value as input (the `dod.related` and
+/// `dod.labels` model tools) validate it with the same rule as the line
+/// parser.
+///
+/// # Examples
+/// ```
+/// use harw_dod_client::findings::{DEDUP_KEY_HEX_LEN, is_lower_hex};
+///
+/// assert!(is_lower_hex("0123456789abcdef0123456789abcdef", DEDUP_KEY_HEX_LEN));
+/// assert!(!is_lower_hex("0123456789ABCDEF0123456789ABCDEF", DEDUP_KEY_HEX_LEN));
+/// assert!(!is_lower_hex("0123456789abcdef", DEDUP_KEY_HEX_LEN));
+/// ```
+#[must_use]
+pub fn is_lower_hex(value: &str, len: usize) -> bool {
     value.len() == len
         && value
             .bytes()
@@ -389,8 +429,7 @@ impl TryFrom<RawFindingLine> for FindingLine {
         let lenient = raw
             .schema_version
             .is_some_and(|version| version > EXPORT_SCHEMA_VERSION);
-        if !is_clean(&raw.finding_id, MAX_ID_BYTES) || (strict_ids && !is_uuid_v4(&raw.finding_id))
-        {
+        if !is_finding_id(&raw.finding_id) || (strict_ids && !is_uuid_v4(&raw.finding_id)) {
             return Err(InvalidFindingLine("finding_id"));
         }
         if !is_clean(&raw.host, MAX_ID_BYTES) {
@@ -1694,6 +1733,41 @@ mod tests {
         }
         assert!(is_uuid_v4(FINDING));
         Ok(())
+    }
+
+    /// PL-100 WP1.2: [`is_finding_id`] (the `id` filter of `dod.findings`)
+    /// accepts exactly the ids a v1/v2 line may carry, v3 UUIDv4 ids
+    /// included, and nothing the parser refuses.
+    #[test]
+    fn finding_id_rule_is_the_line_parser_rule() {
+        let longest = "f".repeat(MAX_ID_BYTES);
+        for id in ["f-1", "finding-42", FINDING, longest.as_str()] {
+            assert!(is_finding_id(id), "{id}");
+            let line = with(
+                with(v3_value(), "schema_version", json!(2)),
+                "finding_id",
+                json!(id),
+            );
+            assert!(parse_finding_line(&line.to_string()).is_some(), "{id}");
+        }
+        let overlong = "f".repeat(MAX_ID_BYTES.saturating_add(1));
+        for bad in [
+            "",
+            "   ",
+            "f\u{7}1",
+            "f\n1",
+            "f\u{202E}1",
+            "f\u{200B}1",
+            overlong.as_str(),
+        ] {
+            assert!(!is_finding_id(bad), "{bad:?}");
+            let line = with(
+                with(v3_value(), "schema_version", json!(2)),
+                "finding_id",
+                json!(bad),
+            );
+            assert!(parse_finding_line(&line.to_string()).is_none(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -42,7 +42,10 @@
 //! refused, free text is sanitized. The crate is strictly read-only: it
 //! never writes DoD state, never talks to the Warden or any escalation
 //! path, and runs exactly one external program (`systemctl show`, bounded
-//! in time and output).
+//! in time and output). It has no reader for the sentinel's `FindingSpool`
+//! (the full `SecurityEvidence`): the spool is read only by the escalator
+//! (PL-100 §3, THREAT-MODEL §1); harw sees the bounded export and its
+//! escaped [`EvidenceCard`]s alone.
 #![forbid(unsafe_code)]
 
 pub mod chain;
@@ -72,8 +75,8 @@ pub use error::DodClientError;
 pub use evidence::{EvidenceCard, EvidenceProcess};
 pub use findings::{
     DEFAULT_FINDINGS_WINDOW, FindingHardness, FindingKind, FindingLine, FindingsSummary,
-    FindingsTail, MAX_LINE_BYTES, MAX_TAIL_BYTES, RuleCount, SeverityCounts, is_uuid_v4,
-    parse_finding_line, read_findings_tail, summarize,
+    FindingsTail, MAX_LINE_BYTES, MAX_TAIL_BYTES, RuleCount, SeverityCounts, is_finding_id,
+    is_uuid_v4, parse_finding_line, read_findings_tail, summarize,
 };
 pub use health::{HealthReport, IpcCounters, SensorHealthEntry, SensorHealthState, read_health};
 pub use paths::{

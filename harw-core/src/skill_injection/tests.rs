@@ -1384,7 +1384,10 @@ async fn turn_loop_places_imported_skills_in_the_data_block() -> TestResult {
 // PL-97 D4: the bundled `harw-dod` skill through the turn loop
 // ---------------------------------------------------------------------------
 
-/// The three read-only Harw-DoD model tools.
+/// The three read-only Harw-DoD model tools of a root session — exactly
+/// these three (PL-100 decision O8, tool budget G1); the triage tools
+/// `dod.finding`, `dod.related` and `dod.labels` exist only in the four
+/// `security-*-triage` children, never in the root session modelled here.
 const DOD_TOOLS: [&str; 3] = ["dod.status", "dod.findings", "dod.sensors"];
 
 /// A provider serving the three `dod.*` names with a fixed, harmless status

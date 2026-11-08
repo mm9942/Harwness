@@ -204,8 +204,10 @@ pub mod role_names {
 
     /// Triagiert Netz-Befunde (`EgressFlow`/`ListenerOpened`) der
     /// `EgressFlowRule`; bekommt bereits ausgewertete `Finding`-Batches als
-    /// Parameter und liest Harw-DoD höchstens über die drei lesenden
-    /// `dod.*`-Werkzeuge ([`crate::profile::DOD_READ_TOOLS`], PL-97 D3;
+    /// Parameter und liest Harw-DoD höchstens über die sechs lesenden
+    /// `dod.*`-Werkzeuge ([`crate::profile::DOD_TRIAGE_ROLE_TOOLS`]: die drei
+    /// aus [`crate::profile::DOD_READ_TOOLS`], PL-97 D3, und
+    /// [`crate::profile::DOD_TRIAGE_TOOLS`], PL-100 WP1.2;
     /// `agents/roles/security-egress-triage/security-egress-triage.toml`).
     pub const SECURITY_EGRESS_TRIAGE: &str = "security-egress-triage";
     /// Triagiert Baseline-Abweichungs-Befunde (`HostSample` gegen
@@ -524,7 +526,7 @@ pub const SKILL_CATALOG_TOOLS: &[&str] = &["skills.search", "skills.load"];
 
 /// Die eingebauten Rollen **ohne** Skill-Katalog: die vier
 /// Security-Triage-Rollen (bewusst ohne Werkzeuge außer den lesenden
-/// [`DOD_READ_TOOLS`]) und die vier
+/// [`DOD_TRIAGE_ROLE_TOOLS`]) und die vier
 /// Matrix-Sitze (feste, exakt geprüfte Leseflächen; ihre Anweisungen kommen
 /// vom Matrix-Runner).
 pub const SKILL_CATALOG_EXCLUDED_ROLES: &[&str] = &[
@@ -826,18 +828,49 @@ pub fn matrix_tools_for_role(role: &str) -> &'static [&'static str] {
 /// # Why not part of a [`RegistryProfile`]
 /// They are `harw-ops` operations (`model_tool(readonly, approval =
 /// "none")`), not tools of a tool-provider crate. A root session serves
-/// them through its operation model-tool provider. A child registry serves
-/// them only for the roles of [`dod_tools_for_role`]: the role-bound
-/// provider `RuntimeChildRegistryFactory::dod_read_provider` in
-/// `harw-runtime/src/children.rs` (PL-97 D4) mounts exactly these three
-/// operations, with the bound root space as their `OpContext`; every other
-/// child registers none of them. Each only reads the Harw-DoD
-/// export, the sentinel health report, the system config and `systemctl
-/// show`; none writes DoD state or reaches the Warden or the escalation
-/// ladder (invariant S1). They need no sandbox right
-/// ([`crate::authority::tool_permission`] is `None`, like `ps` and the
-/// `gateway.*` reads) and stand in [`crate::AUTO_APPROVED_TOOLS`].
+/// them through its operation model-tool provider; these three are the
+/// only `dod.*` tools a root session has (PL-100 decision O8, tool budget
+/// G1). A child registry serves them only for the roles of
+/// [`dod_tools_for_role`]: the role-bound provider
+/// `RuntimeChildRegistryFactory::dod_read_provider` in
+/// `harw-runtime/src/children.rs` (PL-97 D4) mounts them together with
+/// [`DOD_TRIAGE_TOOLS`] ([`DOD_TRIAGE_ROLE_TOOLS`]), with the bound root
+/// space as their `OpContext`; every other child registers none of them.
+/// Each only reads the Harw-DoD export, the sentinel health report, the
+/// system config and `systemctl show`; none writes DoD state or reaches the
+/// Warden or the escalation ladder (invariant S1). They need no sandbox
+/// right ([`crate::authority::tool_permission`] is `None`, like `ps` and
+/// the `gateway.*` reads) and stand in [`crate::AUTO_APPROVED_TOOLS`].
 pub const DOD_READ_TOOLS: &[&str] = &["dod.status", "dod.findings", "dod.sensors"];
+
+/// The read-only Harw-DoD triage tools (PL-100 WP1.2, `harw-ops/src/dod.rs`):
+/// `dod.finding` (one finding by its UUIDv4 id with every export-v3 field
+/// and its escaped evidence card), `dod.related` (the findings sharing a
+/// `dedup_key` or a `cgroup_kid` within a window) and `dod.labels` (the
+/// human labels of a `dedup_key`; none until PL-100 phase 2.5).
+///
+/// # Only for the triage roles
+/// Like [`DOD_READ_TOOLS`] they are `harw-ops` operations
+/// (`model_tool(readonly, approval = "none")`, in
+/// [`crate::AUTO_APPROVED_TOOLS`], no sandbox right). Unlike those, no root
+/// session ever registers them (`harw_ops::register_all` leaves them out;
+/// PL-100 decision O8): only the role-bound provider
+/// `RuntimeChildRegistryFactory::dod_read_provider` serves them, for the
+/// roles of [`dod_tools_for_role`].
+pub const DOD_TRIAGE_TOOLS: &[&str] = &["dod.finding", "dod.related", "dod.labels"];
+
+/// Every Harw-DoD tool of a `security-*-triage` role: [`DOD_READ_TOOLS`]
+/// followed by [`DOD_TRIAGE_TOOLS`] (spelled out; a `const` cannot
+/// concatenate slices). What [`dod_tools_for_role`] returns for the four
+/// triage roles and what their definitions admit.
+pub const DOD_TRIAGE_ROLE_TOOLS: &[&str] = &[
+    "dod.status",
+    "dod.findings",
+    "dod.sensors",
+    "dod.finding",
+    "dod.related",
+    "dod.labels",
+];
 
 /// The roles that admit the Harw-DoD tools: the four `security-*-triage`
 /// roles.
@@ -848,15 +881,18 @@ const DOD_TRIAGE_ROLES: &[&str] = &[
     role_names::SECURITY_ENDPOINT_TRIAGE,
 ];
 
-/// Returns [`DOD_READ_TOOLS`] for the four `security-*-triage` roles,
+/// Returns [`DOD_TRIAGE_ROLE_TOOLS`] (the three [`DOD_READ_TOOLS`] and the
+/// three [`DOD_TRIAGE_TOOLS`]) for the four `security-*-triage` roles,
 /// otherwise nothing.
 ///
 /// The triage roles keep [`RegistryProfile::NoTools`] (no workspace, shell
 /// or network tool); the Harw-DoD tools are the only tools they admit. A
 /// triage child is served them by the role-bound provider
 /// `RuntimeChildRegistryFactory::dod_read_provider` in
-/// `harw-runtime/src/children.rs` (PL-97 D4), which the child factory mounts
-/// next to the empty profile for exactly the roles this function names.
+/// `harw-runtime/src/children.rs` (PL-97 D4, PL-100 WP1.2), which the child
+/// factory mounts next to the empty profile for exactly the roles this
+/// function names. A root session is never a triage role: it keeps the
+/// three [`DOD_READ_TOOLS`] (PL-100 decision O8).
 ///
 /// # Examples
 /// ```rust
@@ -864,14 +900,22 @@ const DOD_TRIAGE_ROLES: &[&str] = &[
 ///
 /// assert_eq!(
 ///     dod_tools_for_role(role_names::SECURITY_EGRESS_TRIAGE),
-///     &["dod.status", "dod.findings", "dod.sensors"]
+///     &[
+///         "dod.status",
+///         "dod.findings",
+///         "dod.sensors",
+///         "dod.finding",
+///         "dod.related",
+///         "dod.labels",
+///     ]
 /// );
 /// assert!(dod_tools_for_role(role_names::EXPLORER).is_empty());
+/// assert!(dod_tools_for_role(role_names::ROOT_ORCHESTRATOR).is_empty());
 /// ```
 #[must_use]
 pub fn dod_tools_for_role(role: &str) -> &'static [&'static str] {
     if DOD_TRIAGE_ROLES.contains(&role) {
-        DOD_READ_TOOLS
+        DOD_TRIAGE_ROLE_TOOLS
     } else {
         &[]
     }
@@ -1792,9 +1836,9 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 /// # Warum `NoTools` und nicht `ReadOnlyExplore` für die Triage-Rollen
 /// Die vier `security-*-triage`-Rollen (siehe [`role_names`]) admittieren
 /// kein Profil-Werkzeug: sie bekommen bereits ausgewertete `Finding`-Batches
-/// als Parameter und admittieren nur die drei lesenden `dod.*`-Werkzeuge
-/// ([`dod_tools_for_role`], PL-97 D3). Diese stellt nicht das Profil bereit,
-/// sondern der rollengebundene Provider
+/// als Parameter und admittieren nur die sechs lesenden `dod.*`-Werkzeuge
+/// ([`dod_tools_for_role`], PL-97 D3, PL-100 WP1.2). Diese stellt nicht das
+/// Profil bereit, sondern der rollengebundene Provider
 /// `RuntimeChildRegistryFactory::dod_read_provider` in
 /// `harw-runtime/src/children.rs` (PL-97 D4), den die Kind-Fabrik genau für
 /// diese vier Rollen neben dem leeren Profil montiert. `ReadOnlyExplore`
@@ -5366,13 +5410,14 @@ mod tests {
         assert!(composition_tools_for_role("unbekannt").is_empty());
     }
 
-    /// PL-97 D3: die Harw-DoD-Werkzeuge bekommen genau die vier
-    /// Triage-Rollen; kein Profil registriert sie selbst.
+    /// PL-97 D3, PL-100 WP1.2: die Harw-DoD-Werkzeuge (drei lesende plus
+    /// drei Triage-Werkzeuge) bekommen genau die vier Triage-Rollen; kein
+    /// Profil registriert sie selbst.
     #[test]
     fn test_dod_tools_are_offered_only_to_the_four_triage_roles() {
         for role in role_names::ALL {
             let expected: &[&str] = if DOD_TRIAGE_ROLES.contains(role) {
-                DOD_READ_TOOLS
+                DOD_TRIAGE_ROLE_TOOLS
             } else {
                 &[]
             };
@@ -5380,7 +5425,7 @@ mod tests {
         }
         assert_eq!(DOD_TRIAGE_ROLES.len(), 4);
         for profile in RegistryProfile::ALL {
-            for tool in DOD_READ_TOOLS {
+            for tool in DOD_TRIAGE_ROLE_TOOLS {
                 assert!(
                     !profile.registered_tool_names().contains(tool),
                     "{profile:?} darf {tool} nicht selbst registrieren"
@@ -5390,9 +5435,35 @@ mod tests {
         assert!(dod_tools_for_role("unbekannt").is_empty());
     }
 
-    /// PL-97 D3: jede Triage-Rolle admittiert genau die drei lesenden
-    /// `dod.*`-Werkzeuge und verbietet Schreiben, Exec und Netz weiterhin;
-    /// keine andere eingebaute Rolle admittiert eines davon.
+    /// PL-100 WP1.2: `DOD_TRIAGE_ROLE_TOOLS` ist genau `DOD_READ_TOOLS`
+    /// gefolgt von `DOD_TRIAGE_TOOLS`, ohne Dubletten; die Wurzel-Rollen
+    /// bekommen keines davon über `dod_tools_for_role` (Root behält die drei
+    /// lesenden über die Operations-Registry, O8).
+    #[test]
+    fn test_dod_triage_role_tools_are_the_read_tools_then_the_triage_tools() {
+        let joined: Vec<&str> = DOD_READ_TOOLS
+            .iter()
+            .chain(DOD_TRIAGE_TOOLS)
+            .copied()
+            .collect();
+        assert_eq!(joined, DOD_TRIAGE_ROLE_TOOLS);
+        assert_eq!(DOD_READ_TOOLS.len(), 3);
+        assert_eq!(
+            DOD_TRIAGE_TOOLS,
+            ["dod.finding", "dod.related", "dod.labels"]
+        );
+        let unique: std::collections::BTreeSet<&str> =
+            DOD_TRIAGE_ROLE_TOOLS.iter().copied().collect();
+        assert_eq!(unique.len(), DOD_TRIAGE_ROLE_TOOLS.len());
+        for tool in DOD_TRIAGE_TOOLS {
+            assert!(!DOD_READ_TOOLS.contains(tool), "{tool}");
+        }
+        assert!(dod_tools_for_role(role_names::ROOT_ORCHESTRATOR).is_empty());
+    }
+
+    /// PL-97 D3, PL-100 WP1.2: jede Triage-Rolle admittiert genau die sechs
+    /// lesenden `dod.*`-Werkzeuge und verbietet Schreiben, Exec und Netz
+    /// weiterhin; keine andere eingebaute Rolle admittiert eines davon.
     #[test]
     fn test_triage_roles_admit_exactly_the_dod_tools() -> TestResult {
         let roles =
@@ -5409,7 +5480,7 @@ mod tests {
                 .map(String::as_str)
                 .collect();
             if DOD_TRIAGE_ROLES.contains(role) {
-                assert_eq!(admitted, DOD_READ_TOOLS, "{role}");
+                assert_eq!(admitted, DOD_TRIAGE_ROLE_TOOLS, "{role}");
                 let forbidden = ir.tool_surface().forbidden();
                 for tool in ["fs.write", "fs.edit", "shell.exec", "web.fetch"] {
                     assert!(
@@ -5418,7 +5489,7 @@ mod tests {
                     );
                 }
             } else {
-                for tool in DOD_READ_TOOLS {
+                for tool in DOD_TRIAGE_ROLE_TOOLS {
                     assert!(!admitted.contains(tool), "{role} admittiert {tool}");
                 }
             }

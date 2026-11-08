@@ -1563,17 +1563,23 @@ impl RuntimeChildRegistryFactory {
         )
     }
 
-    /// Die lesenden Harw-DoD-Werkzeuge der Triage-Rollen (PL-97 D4).
+    /// Die lesenden Harw-DoD-Werkzeuge der Triage-Rollen (PL-97 D4,
+    /// PL-100 WP1.2).
     ///
     /// # Description
-    /// Baut einen [`ModelToolProvider`] mit genau den drei Operationen
-    /// `dod.status`, `dod.findings` und `dod.sensors` aus `harw_ops::dod`
+    /// Baut einen [`ModelToolProvider`] mit genau den sechs Operationen aus
+    /// `harw_ops::dod`: den drei lesenden `dod.status`, `dod.findings` und
+    /// `dod.sensors` (wie die Wurzel) und den drei Triage-Werkzeugen
+    /// `dod.finding`, `dod.related` und `dod.labels`
+    /// (`harw_ops::dod::dod_triage_operations`, nie in einer Root-Session)
     /// — montiert nur für die Rollen aus
     /// [`harw_registry_defaults::profile::dod_tools_for_role`] (die vier
-    /// `security-*-triage`-Rollen). Alle drei sind lesend und ohne Freigabe
+    /// `security-*-triage`-Rollen). Alle sechs sind lesend und ohne Freigabe
     /// (`model_tool(readonly, approval = "none")`, in `AUTO_APPROVED_TOOLS`),
     /// tragen kein Sandbox-Recht und erreichen weder Warden noch
-    /// Eskalationsleiter (Invariante S1). Der `OpContext` entsteht je Aufruf
+    /// Eskalationsleiter (Invariante S1). `dod.labels` findet im `OpContext`
+    /// keine Label-Quelle und antwortet deshalb bis PL-100 Phase 2.5 mit
+    /// `source: "unavailable"`. Der `OpContext` entsteht je Aufruf
     /// wie bei [`Self::matrix_game_master_provider`]; seine Dienste
     /// ([`dod_services`]) sind der gebundene Root-Space
     /// ([`Self::with_home_context`]), aus dem `harw_ops::dod::dod_service`
@@ -1583,10 +1589,14 @@ impl RuntimeChildRegistryFactory {
     /// ein Rückfall auf `HARW_HOME`.
     fn dod_read_provider(&self, identity: Arc<CallerIdentity>) -> ModelToolProvider {
         let home_context = self.home_context.clone();
-        let operations: [Arc<dyn Operation>; 3] = [
+        let [finding, related, labels] = harw_ops::dod::dod_triage_operations();
+        let operations: [Arc<dyn Operation>; 6] = [
             Arc::new(harw_ops::dod::DodStatusOperation),
             Arc::new(harw_ops::dod::DodFindingsOperation),
             Arc::new(harw_ops::dod::DodSensorsOperation),
+            finding,
+            related,
+            labels,
         ];
         ModelToolProvider::new(operations, move |execution_context| {
             let services = dod_services(home_context.as_ref(), &identity);
@@ -2253,7 +2263,8 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 self.matrix_game_master_provider(Arc::clone(&identity)),
             ));
         }
-        // PL-97 D4: die lesenden `dod.*` ausschließlich für die vier
+        // PL-97 D4, PL-100 WP1.2: die sechs lesenden `dod.*` (drei wie die
+        // Wurzel plus die drei Triage-Werkzeuge) ausschließlich für die vier
         // Triage-Rollen (rollengebundener `ModelToolProvider`, siehe
         // `dod_read_provider`); die `SessionActivation` schaltet sie nur frei,
         // wenn die Definition sie admittiert.
@@ -4664,22 +4675,38 @@ mod tests {
         Ok(names)
     }
 
-    /// PL-97 D4: ein `security-egress-triage`-Kind bekommt genau
-    /// `dod.status`, `dod.findings` und `dod.sensors` (lesend, ohne Freigabe)
-    /// und den fest gebundenen Skill `harw-dod`; die drei übrigen
-    /// Triage-Rollen ebenso, keine andere eingebaute Rolle bekommt den
-    /// Provider.
+    /// Die sortierten sechs `dod.*` eines Triage-Kindes (PL-100 WP1.2): die
+    /// drei lesenden der Wurzel plus `dod.finding`, `dod.related` und
+    /// `dod.labels`.
+    const TRIAGE_CHILD_DOD_TOOLS: [&str; 6] = [
+        "dod.finding",
+        "dod.findings",
+        "dod.labels",
+        "dod.related",
+        "dod.sensors",
+        "dod.status",
+    ];
+
+    /// PL-97 D4, PL-100 WP1.2: ein `security-egress-triage`-Kind bekommt
+    /// genau die sechs `dod.*` (`DOD_TRIAGE_ROLE_TOOLS`: `dod.status`,
+    /// `dod.findings`, `dod.sensors`, `dod.finding`, `dod.related`,
+    /// `dod.labels`; lesend, ohne Freigabe) und den fest gebundenen Skill
+    /// `harw-dod`; die drei übrigen Triage-Rollen ebenso, keine andere
+    /// eingebaute Rolle bekommt den Provider.
     #[test]
     fn security_egress_triage_child_serves_exactly_the_dod_read_tools() -> TestResult {
         let factory = factory_with_bundled_skills()?;
         assert_eq!(
             served_tools(&factory, role_names::SECURITY_EGRESS_TRIAGE)?,
-            ["dod.findings", "dod.sensors", "dod.status"]
+            TRIAGE_CHILD_DOD_TOOLS
         );
+        let mut offered = harw_registry_defaults::profile::DOD_TRIAGE_ROLE_TOOLS.to_vec();
+        offered.sort_unstable();
+        assert_eq!(offered, TRIAGE_CHILD_DOD_TOOLS, "Angebot = Montage");
 
         let provider = factory
             .dod_read_provider(factory.child_caller_identity(role_names::SECURITY_EGRESS_TRIAGE));
-        for tool in harw_registry_defaults::profile::DOD_READ_TOOLS {
+        for tool in harw_registry_defaults::profile::DOD_TRIAGE_ROLE_TOOLS {
             assert_eq!(
                 provider.approval_policy(&harw_tools::ToolName::new(*tool)),
                 Some(harw_operations::ApprovalPolicy::None),
@@ -4709,7 +4736,7 @@ mod tests {
         ] {
             assert_eq!(
                 served_tools(&factory, role)?,
-                ["dod.findings", "dod.sensors", "dod.status"],
+                TRIAGE_CHILD_DOD_TOOLS,
                 "{role}"
             );
         }
@@ -4721,6 +4748,43 @@ mod tests {
                 "{role}"
             );
         }
+        Ok(())
+    }
+
+    /// PL-100 O8/G1 (Plan §7 „Root hat genau 3 Werkzeuge"): die
+    /// Operations-Registry einer Root-Session (`harw_ops::register_all`, wie
+    /// `build_operations` in `assembly.rs`) trägt als `dod.*`-Modell-Werkzeuge
+    /// genau `DOD_READ_TOOLS`, keines der `DOD_TRIAGE_TOOLS`; die
+    /// Kind-Fabrik bietet `dod.*` nur den vier Triage-Rollen an.
+    #[test]
+    fn root_sessions_expose_exactly_the_three_dod_read_tools() -> TestResult {
+        let mut registry = harw_operations::registry::OperationRegistry::new();
+        harw_ops::register_all(&mut registry);
+        let mut root: Vec<&str> = registry
+            .iter()
+            .map(|operation| operation.meta())
+            .filter(|meta| {
+                meta.surfaces
+                    .iter()
+                    .any(|surface| matches!(surface, harw_operations::Surface::ModelTool { .. }))
+            })
+            .map(|meta| meta.name)
+            .filter(|name| name.starts_with("dod."))
+            .collect();
+        root.sort_unstable();
+        let mut expected = harw_registry_defaults::profile::DOD_READ_TOOLS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(root, expected);
+        for tool in harw_registry_defaults::profile::DOD_TRIAGE_TOOLS {
+            assert!(
+                registry.find_by_name(tool).is_none(),
+                "{tool} in der Wurzel"
+            );
+        }
+        assert!(
+            harw_registry_defaults::profile::dod_tools_for_role(role_names::ROOT_ORCHESTRATOR)
+                .is_empty()
+        );
         Ok(())
     }
 

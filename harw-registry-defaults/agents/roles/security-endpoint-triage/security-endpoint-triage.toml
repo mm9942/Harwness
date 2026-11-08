@@ -122,7 +122,7 @@ may_research_web = false
 
 # Nur die lesenden Harw-DoD-Werkzeuge — siehe Begründung oben.
 [tools]
-admitted = ["dod.status", "dod.findings", "dod.sensors"]
+admitted = ["dod.status", "dod.findings", "dod.sensors", "dod.finding", "dod.related", "dod.labels"]
 forbidden = ["fs.write", "fs.edit", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
 
 # Ein reiner Sichtungs-/Vorschlags-Job braucht keine Kind-Agenten.
