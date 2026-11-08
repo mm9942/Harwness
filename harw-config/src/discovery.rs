@@ -1101,7 +1101,7 @@ fn is_dod_policy_layer(layers: &[PathBuf], base: &Path) -> bool {
     base.parent() == Some(profiles.as_path())
         && base
             .file_name()
-            .and_then(|name| name.to_str())
+            .and_then(std::ffi::OsStr::to_str)
             .is_some_and(valid_profile_name)
 }
 
