@@ -1028,6 +1028,13 @@ docs/
     ├── 97-harw-dod-mission-control-chain/
     │   └── README.md            (Harw-DoD suite, triggers, Mission Control TUI, execution chain)
     │
+    ├── 98-root-orchestrator-stability/
+    │   └── README.md            (continuation/replay fixes, error codes, open decisions)
+    │
+    ├── 99-cloud-hub-mtls-tor/
+    │   ├── README.md            (bottom-up analysis, cloud hub, PQ-mTLS hardening, arti/Tor, phases T0–T7)
+    │   └── THREAT-MODEL.md      (assets, attackers, threats B1–B21, residual risks)
+    │
     └── 90-migration-ledger/
         └── MIGRATION_LEDGER.md
 ```
