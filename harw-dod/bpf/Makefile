@@ -15,7 +15,7 @@ MANIFEST := $(OUT)/manifest.json
 OBJECTS := $(OUT)/exec.bpf.o $(OUT)/exit.bpf.o $(OUT)/tcp_v4_connect.bpf.o $(OUT)/tcp_v6_connect.bpf.o
 CFLAGS := -target bpfel -O2 -g -Wall -Werror -fdebug-prefix-map=$(BPF_DIR)=/usr/src/harw-dod-bpf -I$(OUT)/include -I$(BPF_DIR)/include
 
-.PHONY: all verify-tools verify-objects clean help
+.PHONY: all verify-tools verify-objects check-manifest-writer clean help
 
 all: verify-tools $(VMLINUX_H) $(OBJECTS) verify-objects $(MANIFEST)
 
@@ -23,6 +23,7 @@ help:
 	@echo "Standalone DoD BPF build (never invokes Cargo)."
 	@echo "Required tools and exact versions are in toolchain.lock.toml."
 	@echo "Set OUT=... to stage objects; VMLINUX_BTF=... selects target BTF."
+	@echo "check-manifest-writer: diff write-manifest.sh output against the golden manifest."
 
 verify-tools:
 	@$(BPF_DIR)/scripts/verify-toolchain.sh "$(TOOLCHAIN_LOCK)" "$(CLANG)" "$(BPFTOOL)" "$(LLVM_OBJDUMP)"
@@ -56,6 +57,12 @@ verify-objects: $(OBJECTS) $(BPF_DIR)/scripts/verify-object-contract.sh
 
 $(MANIFEST): verify-objects $(VMLINUX_H) $(BPF_DIR)/scripts/write-manifest.sh $(TOOLCHAIN_LOCK)
 	@$(BPF_DIR)/scripts/write-manifest.sh "$(OUT)" "$(VMLINUX_BTF)" "$(TOOLCHAIN_LOCK)" "$@"
+
+# Needs no BPF toolchain: re-runs write-manifest.sh on fixed dummy inputs and
+# diffs the result against the golden manifest that harw-probe-bpf's parser
+# test reads (crates/harw-probe-bpf/src/testdata/manifest.sample.toml).
+check-manifest-writer:
+	@$(BPF_DIR)/scripts/check-manifest-writer.sh
 
 clean:
 	@case "$(OUT)" in "$(BPF_DIR)"/*) ;; *) echo "refusing to clean OUT outside $(BPF_DIR)" >&2; exit 2;; esac

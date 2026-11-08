@@ -62,11 +62,13 @@
 //! **die eBPF-Objekte der vom Profil gewählten Sensoren auflösen und
 //! einlesen** ([`sensors::resolve_procmon_objects`],
 //! [`sensors::resolve_flow_objects`]: die Bytes liegen danach als
-//! `BpfProgramSource::Embedded` im Speicher) → den Scope des Profils
-//! auflösen ([`profile::resolve_scope`], liest den cgroup-Baum) → Landlock
-//! durchsetzen → laden und anheften. Das Objektverzeichnis
-//! (`--*-program-path`, `$HARW_DOD_BPF_DIR`, `/usr/local/lib/harw-dod/bpf`)
-//! und die Konfigurationsdatei sind damit **nicht** Teil des
+//! `BpfProgramSource::Embedded` im Speicher) → **jedes eingelesene Objekt
+//! gegen das root-eigene SHA-256-Manifest prüfen**
+//! ([`bpf_manifest::verify_resolved_objects`], `--bpf-manifest`) → den Scope
+//! des Profils auflösen ([`profile::resolve_scope`], liest den cgroup-Baum)
+//! → Landlock durchsetzen → laden und anheften. Das Objektverzeichnis
+//! (`--*-program-path`, `$HARW_DOD_BPF_DIR`, `/usr/local/lib/harw-dod/bpf`),
+//! das Manifest und die Konfigurationsdatei sind damit **nicht** Teil des
 //! Landlock-Ausschnitts. Lesbar bleiben nur die Kernel-Schnittstellen, die
 //! der Lade-, Anheft- und Lesepfad selbst braucht
 //! ([`KERNEL_INTERFACE_ROOTS`], siehe [`fs_scope_roots`]), und — nur bei
@@ -174,8 +176,9 @@
 //!   wird.
 //!
 //! Degradierung statt Prozessende, je Sensor unabhängig:
-//! - fehlt ein Objekt oder ist es ungültig, registriert [`run`] einen
-//!   [`sensors::UnavailableSensor`] mit der Mängelliste;
+//! - fehlt ein Objekt oder ist es ungültig (kein ELF, leer, zu groß),
+//!   registriert [`run`] einen [`sensors::UnavailableSensor`] mit der
+//!   Mängelliste;
 //! - scheitert das Laden mit `AttachCapabilitiesUnavailable`,
 //!   `CapabilityUnavailable` oder `InvalidProgramContract` (siehe
 //!   [`degrades_sensor`]), ebenfalls — ein Host ohne die nötigen
@@ -184,6 +187,18 @@
 //!   sieht;
 //! - jeder andere Ladefehler beendet den Prozess; bereits geladene Griffe
 //!   werden vorher entladen.
+//!
+//! Ausdrücklich **keine** Degradierung, sondern Prozessende vor jedem
+//! Ladeschritt: ein vorhandenes Objekt, das die Manifestprüfung nicht
+//! besteht (kein `--bpf-manifest`, Manifest nicht root-eigen, schreibbar,
+//! ungültig oder ohne Eintrag, abweichender SHA-256-Digest;
+//! [`error::ProbeError::BpfObjectIntegrity`], PL-100 Phase 4, THREAT-MODEL
+//! B23). [`run`] meldet vorher jeden gewählten Sensor einmal als
+//! `SensorDegraded` ([`report_integrity_refusal`]); `main` endet mit dem
+//! eigenen Exit-Status [`EXIT_INTEGRITY_REFUSED`] (78, `EX_CONFIG`), den
+//! `deploy/systemd/harw-probe-bpf.service` über `RestartPreventExitStatus=78`
+//! vom Neustart ausnimmt: eine Ablehnung ist dauerhaft, kein vorübergehender
+//! Absturz.
 //!
 //! Endet die Sammelschleife (dauerhafter Fehler, z. B. Sentinel weg), werden
 //! alle geladenen Objekte über [`collect::unload_all`] kontrolliert
@@ -210,6 +225,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bpf_manifest;
 mod cli;
 mod collect;
 mod error;
@@ -259,7 +275,9 @@ use sink::EventSink;
 /// # Returns
 /// `ExitCode::SUCCESS` nur, wenn [`run`] regulär zurückkehrt (heute nur,
 /// wenn kein einziger Sensor registriert wäre — die Sammelschleife endet
-/// sonst nur über einen Fehler). `ExitCode::FAILURE` bei jedem Fehlerpfad —
+/// sonst nur über einen Fehler). [`EXIT_INTEGRITY_REFUSED`] (78), wenn die
+/// Manifestprüfung der eBPF-Objekte den Start ablehnt
+/// ([`exit_status_for`]). `ExitCode::FAILURE` bei jedem anderen Fehlerpfad —
 /// Kommandozeile, Landlock-Schranke, nicht degradierender Ladefehler,
 /// fehlender Sentinel.
 /// Der `completions`-Unterbefehl endet mit `ExitCode::SUCCESS` bzw.
@@ -309,10 +327,43 @@ fn main() -> ExitCode {
     match run(cli, &sentinel_socket) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            tracing::error!(error = %err, "harw-probe-bpf exiting");
+            let status = exit_status_for(&err);
+            tracing::error!(error = %err, exit_status = status, "harw-probe-bpf exiting");
             eprintln!("harw-probe-bpf: {err}");
-            ExitCode::FAILURE
+            ExitCode::from(status)
         }
+    }
+}
+
+/// Exit-Status, wenn die Manifestprüfung der eBPF-Objekte den Start ablehnt:
+/// **78** (`EX_CONFIG` aus `sysexits.h`).
+///
+/// # Description
+/// Eine Ablehnung durch [`bpf_manifest::verify_resolved_objects`]
+/// ([`ProbeError::BpfObjectIntegrity`]) ist dauerhaft: dasselbe Manifest und
+/// dieselben Objekte scheitern beim nächsten Start genauso. Der eigene
+/// Status erlaubt der systemd-Unit `RestartPreventExitStatus=78`, statt den
+/// Start bis `StartLimitBurst` zu wiederholen und dabei jedes Mal erneut
+/// `SensorDegraded` zu senden.
+const EXIT_INTEGRITY_REFUSED: u8 = 78;
+
+/// Exit-Status jedes anderen Fehlers aus [`run`]: **1**, derselbe Wert wie
+/// `ExitCode::FAILURE` unter Linux.
+const EXIT_RUN_FAILED: u8 = 1;
+
+/// Der Exit-Status für einen Fehler aus [`run`].
+///
+/// # Arguments
+/// - `err` (`&ProbeError`): der Fehler, mit dem [`run`] endete.
+///
+/// # Returns
+/// [`EXIT_INTEGRITY_REFUSED`] für [`ProbeError::BpfObjectIntegrity`],
+/// sonst [`EXIT_RUN_FAILED`].
+fn exit_status_for(err: &ProbeError) -> u8 {
+    if matches!(err, ProbeError::BpfObjectIntegrity { .. }) {
+        EXIT_INTEGRITY_REFUSED
+    } else {
+        EXIT_RUN_FAILED
     }
 }
 
@@ -410,18 +461,24 @@ const KERNEL_INTERFACE_ROOTS: [&str; 5] = [
 ///    einlesen ([`sensors::resolve_procmon_objects`],
 ///    [`sensors::resolve_flow_objects`]) — **vor** Landlock, damit das
 ///    Objektverzeichnis nicht im Landlock-Ausschnitt stehen muss.
-/// 4. Den Scope des Profils auflösen ([`resolve_profile_scope`]) — **vor**
+/// 4. Jedes eingelesene Objekt gegen das SHA-256-Manifest prüfen
+///    ([`bpf_manifest::verify_resolved_objects`] mit `--bpf-manifest`) —
+///    ebenfalls vor Landlock und an genau den Bytes, die später geladen
+///    werden. Bei einem Verstoß geht je gewähltem Sensor ein
+///    `SensorDegraded` an den Sentinel ([`report_integrity_refusal`]), und
+///    der Start endet ohne einen einzigen Ladeschritt.
+/// 5. Den Scope des Profils auflösen ([`resolve_profile_scope`]) — **vor**
 ///    Landlock, weil Wurzelauflösung und Nachfahren-Expansion den
 ///    cgroup-Baum lesen.
-/// 5. Landlock durchsetzen (harter Abbruch bei jedem Ausgang außer
+/// 6. Landlock durchsetzen (harter Abbruch bei jedem Ausgang außer
 ///    vollständiger Durchsetzung), mit den Wurzeln aus [`fs_scope_roots`].
-/// 6. Eine gemeinsame reale Ladeschicht bauen und je gewähltem Sensor den
+/// 7. Eine gemeinsame reale Ladeschicht bauen und je gewähltem Sensor den
 ///    Vertragssatz mit dem Profil-Scope laden ([`setup_sensor`]); fehlende
 ///    Objekte oder ein degradierender Ladefehler registrieren einen
 ///    [`sensors::UnavailableSensor`]. War der Scope schon beim Start
 ///    unvollständig, geht genau ein `SensorDegraded` je geladenem Sensor an
 ///    den Sentinel.
-/// 7. Die Sammelschleife betreiben ([`collect_forever`], mit Rescan nur für
+/// 8. Die Sammelschleife betreiben ([`collect_forever`], mit Rescan nur für
 ///    einen Nachfahren-Scope); endet sie, werden alle geladenen Objekte
 ///    entladen.
 ///
@@ -432,6 +489,8 @@ const KERNEL_INTERFACE_ROOTS: [&str; 5] = [
 /// # Errors
 /// [`error::ProbeError::Config`] für jede nicht ladbare, nicht
 /// vertrauenswürdige oder ungültige Konfiguration;
+/// [`error::ProbeError::BpfObjectIntegrity`], wenn ein eingelesenes Objekt
+/// die Manifestprüfung nicht besteht;
 /// [`error::ProbeError::CgroupRootInvalid`],
 /// [`error::ProbeError::CgroupScopeUnresolved`] und
 /// [`error::ProbeError::CgroupScopeRejected`] für einen nicht anheftbaren
@@ -464,6 +523,23 @@ fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
             cli.tcp_v6_program_path.as_deref(),
         )
     });
+
+    // Integrität vor Landlock und vor jedem Ladeschritt (PL-100 Phase 4,
+    // THREAT-MODEL B23): jedes eingelesene Objekt muss zu seinem Eintrag im
+    // root-eigenen SHA-256-Manifest passen, geprüft an genau den Bytes, die
+    // später geladen werden. Ein Verstoß beendet den Start; vorher erfährt
+    // der Sentinel, dass die gewählten Sensoren dieser Sonde blind sind.
+    let to_verify = objects_to_verify(procmon_objects.as_ref(), flow_objects.as_ref());
+    if let Err(err) = bpf_manifest::verify_resolved_objects(cli.bpf_manifest.as_deref(), &to_verify)
+    {
+        let selected = selected_sensor_ids(selection, &cli.sensor_id_procmon, &cli.sensor_id_flow);
+        let reported = report_integrity_refusal(&selected, sink.as_ref(), Timestamp::now());
+        tracing::info!(
+            reported_sensors = reported,
+            "selected bpf sensors reported as degraded before refusing to load"
+        );
+        return Err(err);
+    }
 
     // Scope vor Landlock festlegen: Wurzelauflösung und Nachfahren-Expansion
     // lesen den cgroup-Baum. Kein Rückfall auf den Host-Scope.
@@ -541,6 +617,89 @@ fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
     collect::unload_all(&loader, &sources);
     tracing::info!("bpf objects unloaded after the collect loop ended");
     result
+}
+
+/// Ergebnis der Objektauflösung eines Sensors: beide Objekte oder jeder
+/// Mangel (siehe [`sensors::resolve_procmon_objects`]).
+type SensorObjects = Result<[ResolvedBpfObject; 2], Vec<ObjectUnavailable>>;
+
+/// Die eingelesenen Objekte aller gewählten Sensoren, für die Manifestprüfung.
+///
+/// # Description
+/// Nur Sensoren, deren beide Objekte aufgelöst sind, tragen bei: ein vom
+/// Profil nicht gewählter Sensor (`None`) wird nie geladen, und fehlende
+/// Objekte (`Some(Err(_))`) degradieren ihren Sensor ohne Ladeversuch —
+/// in beiden Fällen gibt es keine Bytes, die geprüft werden müssten.
+///
+/// # Arguments
+/// - `procmon` (`Option<&SensorObjects>`): Auflösung des Prozess-Sensors.
+/// - `flow` (`Option<&SensorObjects>`): Auflösung des Verbindungs-Sensors.
+///
+/// # Returns
+/// Die Objekte in der Reihenfolge exec, exit, tcp_v4, tcp_v6 (soweit
+/// vorhanden).
+fn objects_to_verify<'a>(
+    procmon: Option<&'a SensorObjects>,
+    flow: Option<&'a SensorObjects>,
+) -> Vec<&'a ResolvedBpfObject> {
+    [procmon, flow]
+        .into_iter()
+        .flatten()
+        .filter_map(|objects| objects.as_ref().ok())
+        .flatten()
+        .collect()
+}
+
+/// Die Kennungen der vom Profil gewählten Sensoren.
+///
+/// # Arguments
+/// - `selection` (`SensorSelection`): Sensorwahl des aktiven Profils.
+/// - `procmon` (`&str`): `--sensor-id-procmon`.
+/// - `flow` (`&str`): `--sensor-id-flow`.
+///
+/// # Returns
+/// Prozess-Sensor vor Verbindungs-Sensor, jeweils nur wenn gewählt.
+fn selected_sensor_ids(selection: SensorSelection, procmon: &str, flow: &str) -> Vec<SensorId> {
+    let mut sensors = Vec::with_capacity(2);
+    if selection.exec {
+        sensors.push(SensorId::from_str(procmon));
+    }
+    if selection.tcp_connect {
+        sensors.push(SensorId::from_str(flow));
+    }
+    sensors
+}
+
+/// Meldet die gewählten Sensoren vor dem Abbruch wegen der Manifestprüfung
+/// als degradiert.
+///
+/// # Description
+/// Genau ein `EventKind::SensorDegraded` je verschiedener Kennung
+/// ([`collect::sensor_degraded_events`]). Best effort: der Abbruch selbst
+/// steht fest, ein Sendefehler wird deshalb nur auf `warn` protokolliert
+/// (Kennung und Fehler, kein Pfad) und hält die übrigen Meldungen nicht auf.
+///
+/// # Arguments
+/// - `sensors` (`&[SensorId]`): die gewählten Sensoren.
+/// - `sink` (`&dyn EventSink`): die Senke zum Sentinel.
+/// - `now` (`Timestamp`): `observed_at` der Meldungen.
+///
+/// # Returns
+/// Die Zahl der erfolgreich gesendeten Meldungen.
+fn report_integrity_refusal(sensors: &[SensorId], sink: &dyn EventSink, now: Timestamp) -> usize {
+    let affected: Vec<&SensorId> = sensors.iter().collect();
+    let mut sent = 0_usize;
+    for event in collect::sensor_degraded_events(&affected, now) {
+        match sink.send(&event) {
+            Ok(()) => sent = sent.saturating_add(1),
+            Err(err) => tracing::warn!(
+                sensor = %event.sensor,
+                error = %err,
+                "could not report SensorDegraded before refusing to load bpf objects"
+            ),
+        }
+    }
+    sent
 }
 
 /// Resolves the attach-time scope of the active profile, before Landlock.
@@ -908,26 +1067,33 @@ mod tests {
     // Datei; Objektauflösung (`sensors.rs`), Laden (`real_loader.rs`) und
     // Sammeln (`collect.rs`) haben eigene Tests.
 
+    use std::borrow::Cow;
     use std::cell::Cell;
     use std::path::{Path, PathBuf};
 
     use harw_dod_bpf::cgroup_walk::{HostCgroupFs, WalkLimits};
-    use harw_dod_bpf::{BpfError, RealBpfLoader};
+    use harw_dod_bpf::{BpfError, BpfProgramSource, RealBpfLoader};
     use harw_dod_cap::SensorError;
+    use harw_dod_signals::EventKind;
     use harw_types::SensorId;
     use ipnet::IpNet;
+    use jiff::Timestamp;
     use landlock::{ABI, AccessFs};
 
     use super::{
-        KERNEL_INTERFACE_ROOTS, SensorSetup, degrades_sensor, fs_scope_roots, landlock_roots,
-        network_scope, retry_transient, setup_sensor,
+        EXIT_INTEGRITY_REFUSED, EXIT_RUN_FAILED, KERNEL_INTERFACE_ROOTS, SensorObjects,
+        SensorSetup, degrades_sensor, exit_status_for, fs_scope_roots, landlock_roots,
+        network_scope, objects_to_verify, report_integrity_refusal, retry_transient,
+        selected_sensor_ids, setup_sensor,
     };
+    use crate::bpf_manifest::IntegrityFailure;
     use crate::error::ProbeError;
     use crate::landlock::{FsRoot, RootAccess};
     use crate::profile::test_tree::{FakeTree, cgroup_scope};
-    use crate::profile::{ProbeScope, resolve_scope};
+    use crate::profile::{ProbeScope, SensorSelection, resolve_scope};
     use crate::sensors::{
         BpfObjectKind, DEFAULT_BPF_OBJECT_DIR, ObjectUnavailable, ObjectUnavailableReason,
+        ResolvedBpfObject,
     };
     use crate::test_support::{TestError, TestResult, ctx};
 
@@ -1071,6 +1237,176 @@ mod tests {
             .len();
         assert_eq!(reported, 2);
         Ok(())
+    }
+
+    /// Test-Senke, deren Senden immer scheitert.
+    struct FailingSink;
+
+    impl crate::sink::EventSink for FailingSink {
+        fn send(&self, _event: &harw_dod_signals::SecurityEvent) -> Result<(), ProbeError> {
+            Err(ProbeError::SentinelSendFailed)
+        }
+    }
+
+    /// Ein aufgelöstes Fixture-Objekt (ELF-Kennung, keine Datei).
+    fn resolved(object: BpfObjectKind) -> ResolvedBpfObject {
+        ResolvedBpfObject {
+            object,
+            path: Path::new(DEFAULT_BPF_OBJECT_DIR).join(object.file_name()),
+            source: BpfProgramSource::Embedded(Cow::Owned(vec![0x7f, b'E', b'L', b'F'])),
+        }
+    }
+
+    #[test]
+    fn test_objects_to_verify_takes_only_resolved_sensors() {
+        let procmon: SensorObjects =
+            Ok([resolved(BpfObjectKind::Exec), resolved(BpfObjectKind::Exit)]);
+        let flow_missing: SensorObjects = Err(vec![ObjectUnavailable {
+            object: BpfObjectKind::TcpV4Connect,
+            path: PathBuf::from("/nonexistent/tcp_v4_connect.bpf.o"),
+            reason: ObjectUnavailableReason::Missing,
+        }]);
+        let flow: SensorObjects = Ok([
+            resolved(BpfObjectKind::TcpV4Connect),
+            resolved(BpfObjectKind::TcpV6Connect),
+        ]);
+
+        let kinds = |objects: Vec<&ResolvedBpfObject>| -> Vec<BpfObjectKind> {
+            objects.iter().map(|object| object.object).collect()
+        };
+        assert_eq!(
+            kinds(objects_to_verify(Some(&procmon), Some(&flow))),
+            vec![
+                BpfObjectKind::Exec,
+                BpfObjectKind::Exit,
+                BpfObjectKind::TcpV4Connect,
+                BpfObjectKind::TcpV6Connect,
+            ]
+        );
+        // Fehlende Objekte degradieren ihren Sensor und werden nicht geprüft.
+        assert_eq!(
+            kinds(objects_to_verify(Some(&procmon), Some(&flow_missing))),
+            vec![BpfObjectKind::Exec, BpfObjectKind::Exit]
+        );
+        // Nicht gewählte Sensoren tragen nichts bei.
+        assert!(objects_to_verify(None, Some(&flow_missing)).is_empty());
+        assert!(objects_to_verify(None, None).is_empty());
+    }
+
+    #[test]
+    fn test_selected_sensor_ids_follow_the_profile_selection() {
+        let procmon = SensorId::from_str("probe-bpf-procmon-0");
+        let flow = SensorId::from_str("probe-bpf-flow-0");
+        let select = |exec, tcp_connect| SensorSelection { exec, tcp_connect };
+        assert_eq!(
+            selected_sensor_ids(select(true, true), procmon.as_str(), flow.as_str()),
+            vec![procmon.clone(), flow.clone()]
+        );
+        assert_eq!(
+            selected_sensor_ids(select(true, false), procmon.as_str(), flow.as_str()),
+            vec![procmon.clone()]
+        );
+        assert_eq!(
+            selected_sensor_ids(select(false, true), procmon.as_str(), flow.as_str()),
+            vec![flow.clone()]
+        );
+        assert!(
+            selected_sensor_ids(select(false, false), procmon.as_str(), flow.as_str()).is_empty()
+        );
+    }
+
+    #[test]
+    fn test_integrity_refusal_reports_each_selected_sensor_once() -> TestResult {
+        let sink = RecordingSink::default();
+        let sensors = [
+            "probe-bpf-procmon-0",
+            "probe-bpf-flow-0",
+            "probe-bpf-flow-0",
+        ]
+        .map(SensorId::from_str);
+        assert_eq!(
+            report_integrity_refusal(&sensors, &sink, Timestamp::UNIX_EPOCH),
+            2
+        );
+        let sent = sink
+            .sent
+            .lock()
+            .map_err(|_| TestError::Unexpected("recording sink poisoned".into()))?;
+        assert_eq!(sent.len(), 2);
+        for (event, expected) in sent.iter().zip(["probe-bpf-procmon-0", "probe-bpf-flow-0"]) {
+            let expected = SensorId::from_str(expected);
+            assert_eq!(event.sensor, expected);
+            assert_eq!(event.observed_at, Timestamp::UNIX_EPOCH);
+            assert!(event.actor.is_none());
+            assert!(matches!(
+                &event.kind,
+                EventKind::SensorDegraded { sensor } if sensor == &expected
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_integrity_refusal_survives_a_failing_sink() {
+        let sensors = [SensorId::from_str("probe-bpf-procmon-0")];
+        assert_eq!(
+            report_integrity_refusal(&sensors, &FailingSink, Timestamp::UNIX_EPOCH),
+            0
+        );
+    }
+
+    #[test]
+    fn test_integrity_refusal_exits_with_its_own_status() {
+        // Manifest- und Objektfehler gleichermaßen: 78 (`EX_CONFIG`), den
+        // die Unit über `RestartPreventExitStatus=78` nicht neu startet.
+        for (object, failure) in [
+            (None, IntegrityFailure::ManifestNotConfigured),
+            (None, IntegrityFailure::ManifestUntrusted),
+            (None, IntegrityFailure::ManifestMalformed),
+            (Some(BpfObjectKind::Exec), IntegrityFailure::EntryMissing),
+            (
+                Some(BpfObjectKind::TcpV6Connect),
+                IntegrityFailure::DigestMismatch,
+            ),
+        ] {
+            assert_eq!(
+                exit_status_for(&ProbeError::BpfObjectIntegrity { object, failure }),
+                EXIT_INTEGRITY_REFUSED
+            );
+        }
+        assert_eq!(EXIT_INTEGRITY_REFUSED, 78);
+    }
+
+    #[test]
+    fn test_other_run_errors_exit_with_the_generic_failure_status() {
+        for err in [
+            ProbeError::LandlockUnavailable,
+            ProbeError::SentinelSendFailed,
+            ProbeError::BpfLoad(BpfError::AttachCapabilitiesUnavailable),
+            ProbeError::SentinelConnectFailed {
+                path: "/run/harw/sentinel.sock".to_owned(),
+            },
+        ] {
+            assert_eq!(exit_status_for(&err), EXIT_RUN_FAILED);
+        }
+        // Derselbe Wert wie `ExitCode::FAILURE` unter Linux, und nie der
+        // Status, den die Unit vom Neustart ausnimmt.
+        assert_eq!(EXIT_RUN_FAILED, 1);
+        assert_ne!(EXIT_RUN_FAILED, EXIT_INTEGRITY_REFUSED);
+    }
+
+    #[test]
+    fn test_systemd_unit_does_not_restart_after_an_integrity_refusal() {
+        // Die Unit ist die Gegenseite von `exit_status_for`: sie muss genau
+        // diesen Status vom Neustart ausnehmen und das Manifest übergeben.
+        let unit = include_str!("../../../../deploy/systemd/harw-probe-bpf.service");
+        let directive = format!("RestartPreventExitStatus={EXIT_INTEGRITY_REFUSED}");
+        assert!(unit.lines().any(|line| line == directive), "{directive}");
+        assert!(unit.lines().any(|line| line == "Restart=on-failure"));
+        assert!(unit.lines().any(|line| {
+            line.starts_with("ExecStart=")
+                && line.contains(" --bpf-manifest @BPFDIR@/manifest.json")
+        }));
     }
 
     #[test]

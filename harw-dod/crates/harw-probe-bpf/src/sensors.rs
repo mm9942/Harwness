@@ -72,16 +72,24 @@
 //! Lesezugriff auf das Objektverzeichnis mehr — es ist deshalb nicht Teil
 //! des Landlock-Ausschnitts (siehe [`crate::landlock`]).
 //!
+//! Genau diese eingelesenen Bytes prüft danach [`crate::bpf_manifest`] gegen
+//! den SHA-256-Eintrag im root-eigenen Build-Manifest (`--bpf-manifest`,
+//! `$(BPFDIR)/manifest.json`), bevor irgendein Objekt geladen wird. Diese
+//! Datei selbst prüft nur Pfad, Typ, Größe und ELF-Kennung.
+//!
 //! # Degradierung statt leerem Programm
 //! Fehlt eines der beiden Objekte eines Sensors (oder verletzt es eine der
 //! obigen Prüfungen), wird **kein** leerer Platzhalterrumpf geladen. Der
 //! Sensor wird stattdessen als [`UnavailableSensor`] registriert: er loggt
-//! beim Aufbau jedes fehlende Objekt mit Pfad und Grund, meldet beim ersten
+//! beim Aufbau jedes fehlende Objekt mit Grund (`warn`, ohne Pfad; den
+//! Suchpfad nur auf `info`), meldet beim ersten
 //! `poll` genau ein `EventKind::SensorDegraded { sensor }` an den Sentinel
 //! und liefert danach leere Lesungen (mit [`UNAVAILABLE_IDLE_INTERVAL`]
 //! Wartezeit, damit die Sammelschleife nicht leer dreht). Dasselbe gilt,
 //! wenn das Laden selbst degradierend scheitert (dann mit leerer
-//! Mängelliste, siehe `main::setup_sensor`).
+//! Mängelliste, siehe `main::setup_sensor`). Ein vorhandenes Objekt, das
+//! nicht zum Manifest passt, degradiert dagegen nicht: das beendet den Start
+//! (siehe [`crate::bpf_manifest`], Abschnitt „Fehlerbild").
 //!
 //! # Exportierte Typen
 //! [`UNAVAILABLE_IDLE_INTERVAL`], [`BPF_OBJECT_DIR_ENV`],
@@ -572,12 +580,19 @@ impl UnavailableSensor {
     /// Wie [`Self::new`], mit eigener Wartezeit je leerem `poll`.
     fn with_idle(sensor_id: SensorId, missing: Vec<ObjectUnavailable>, idle: Duration) -> Self {
         for item in &missing {
+            // Ab `warn` keine Pfade (PL-100 0.6): der Suchpfad steht nur auf
+            // `info`, die Warnung trägt Sensor, Objekt und Grund.
             tracing::warn!(
                 sensor = %sensor_id,
                 object = %item.object,
-                path = %item.path.display(),
                 reason = %item.reason,
                 "bpf sensor unavailable: required object missing or invalid"
+            );
+            tracing::info!(
+                sensor = %sensor_id,
+                object = %item.object,
+                path = %item.path.display(),
+                "searched path of the unavailable bpf object"
             );
         }
         let handle = SensorHandle::new(sensor_id, Capability::LoadBpfProgram).bind(empty_scope());

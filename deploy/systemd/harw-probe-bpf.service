@@ -13,6 +13,24 @@
 # Landlock: hard start failure without full enforcement
 # (harw-probe-bpf/src/landlock.rs). The binary connects to the sentinel
 # socket FIRST and only then restricts itself.
+#
+# BPF object integrity (PL-100 Phase 4, THREAT-MODEL B23): before Landlock and
+# before any load, every object is checked against the SHA-256 entries of
+# @BPFDIR@/manifest.json (harw-probe-bpf/src/bpf_manifest.rs). The manifest and
+# every directory above it must be root-owned and not group/world-writable
+# (install.sh installs it 0644 root). A missing --bpf-manifest, an untrusted,
+# unreadable or malformed manifest, a missing entry or a digest mismatch
+# reports SensorDegraded and exits with status 78 (EX_CONFIG). The refusal is
+# permanent, so RestartPreventExitStatus=78 keeps Restart=on-failure from
+# retrying it: the unit fails once and stays failed until an operator fixes
+# the artifacts and restarts it. A MISSING object file still only degrades
+# its sensor.
+#
+# Rollout: manifests written before PL-100 Phase 4 are not valid TOML (the BTF
+# digest line contained a newline), so this unit refuses to start with them.
+# Rebuild and reinstall the BPF artifacts (`make -C harw-dod build-bpf`, then
+# harw-dod/scripts/install.sh) before or together with the new binary and
+# this unit.
 
 [Unit]
 Description=Harw-DoD eBPF observation probe (push-only)
@@ -31,15 +49,17 @@ Type=simple
 User=harw-probe-bpf
 Group=harw-probe-bpf
 SupplementaryGroups=harw-ipc harw-dod-config
-ExecStart=@LIBEXECDIR@/harw-probe-bpf --log info --config @SYSCONFDIR@/config.toml --sentinel-socket /run/harw/sentinel.sock --exec-program-path @BPFDIR@/exec.bpf.o --exit-program-path @BPFDIR@/exit.bpf.o --tcp-v4-program-path @BPFDIR@/tcp_v4_connect.bpf.o --tcp-v6-program-path @BPFDIR@/tcp_v6_connect.bpf.o
+ExecStart=@LIBEXECDIR@/harw-probe-bpf --log info --config @SYSCONFDIR@/config.toml --sentinel-socket /run/harw/sentinel.sock --exec-program-path @BPFDIR@/exec.bpf.o --exit-program-path @BPFDIR@/exit.bpf.o --tcp-v4-program-path @BPFDIR@/tcp_v4_connect.bpf.o --tcp-v6-program-path @BPFDIR@/tcp_v6_connect.bpf.o --bpf-manifest @BPFDIR@/manifest.json
 Restart=on-failure
 RestartSec=5
+# 78 = EX_CONFIG: BPF object manifest refusal (see header), never retried.
+RestartPreventExitStatus=78
 
 # -- Hardening --
 NoNewPrivileges=yes
 ProtectSystem=strict
-# Reads only the config, the BPF objects, BTF and tracefs -- no writes. A
-# connect() to the sentinel socket needs no writable mount.
+# Reads only the config, the BPF objects and their manifest, BTF and tracefs
+# -- no writes. A connect() to the sentinel socket needs no writable mount.
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

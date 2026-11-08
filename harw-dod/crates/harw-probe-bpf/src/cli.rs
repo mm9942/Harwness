@@ -91,6 +91,15 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub tcp_v6_program_path: Option<PathBuf>,
 
+    /// SHA-256 manifest of the BPF build (`manifest.json`, TOML despite the
+    /// extension, written by `harw-dod/bpf/scripts/write-manifest.sh`).
+    /// Required as soon as one object resolves: every object is verified
+    /// against it before loading, and the file plus every directory above it
+    /// must be root-owned and neither group- nor world-writable (see
+    /// `bpf_manifest`). No default and no discovery next to the objects.
+    #[arg(long, value_name = "PATH")]
+    pub bpf_manifest: Option<PathBuf>,
+
     /// Optional subcommand; without it the binary runs normally.
     #[command(subcommand)]
     pub command: Option<harw_completions::CompletionsSubcommand>,
@@ -143,6 +152,8 @@ mod tests {
             "/usr/local/lib/harw-dod/bpf/tcp-v4.bpf.o",
             "--tcp-v6-program-path",
             "/usr/local/lib/harw-dod/bpf/tcp-v6.bpf.o",
+            "--bpf-manifest",
+            "/usr/local/lib/harw-dod/bpf/manifest.json",
         ])
         .map_err(ctx("all explicit runtime paths parse"))?;
         assert_eq!(
@@ -153,6 +164,21 @@ mod tests {
         assert!(cli.exit_program_path.is_some());
         assert!(cli.tcp_v4_program_path.is_some());
         assert!(cli.tcp_v6_program_path.is_some());
+        assert_eq!(
+            cli.bpf_manifest,
+            Some(std::path::PathBuf::from(
+                "/usr/local/lib/harw-dod/bpf/manifest.json"
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bpf_manifest_has_no_default() -> TestResult {
+        // Kein Rückfall auf ein Manifest neben den Objekten: ohne Flag bleibt
+        // es leer, und `run` verweigert dann das Laden aufgelöster Objekte.
+        let cli = Cli::try_parse_from(minimal_args()).map_err(ctx("minimal arguments parse"))?;
+        assert!(cli.bpf_manifest.is_none());
         Ok(())
     }
 

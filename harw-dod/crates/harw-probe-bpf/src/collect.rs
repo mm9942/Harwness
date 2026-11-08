@@ -547,13 +547,18 @@ fn degraded_events(rounds: &[(&SensorId, SensorRound)], now: Timestamp) -> Vec<S
 
 /// Baut genau ein `EventKind::SensorDegraded` je verschiedener `SensorId`.
 ///
+/// # Description
+/// Auch von `main::report_integrity_refusal` genutzt: verweigert die Sonde
+/// das Laden wegen der Manifestprüfung, meldet sie jeden gewählten Sensor
+/// über genau diese Form.
+///
 /// # Arguments
 /// - `sensors` (`&[&SensorId]`): betroffene Sensoren, Dubletten erlaubt.
 /// - `now` (`Timestamp`): `observed_at` der Meldungen.
 ///
 /// # Returns
 /// Die Meldungen in Reihenfolge des ersten Auftretens.
-fn sensor_degraded_events(sensors: &[&SensorId], now: Timestamp) -> Vec<SecurityEvent> {
+pub(crate) fn sensor_degraded_events(sensors: &[&SensorId], now: Timestamp) -> Vec<SecurityEvent> {
     let mut affected: Vec<&SensorId> = Vec::new();
     for sensor in sensors {
         if !affected.contains(sensor) {
