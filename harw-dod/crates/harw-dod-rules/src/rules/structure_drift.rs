@@ -22,14 +22,16 @@
 //!    bekannte Struktur, von der abgewichen werden könnte — sonst löste jeder
 //!    Host-Sensor (CPU, Speicher, …) in einem Kontext ohne Baselines (z. B.
 //!    `harw-sentinel`) in jedem Zyklus einen Befund pro Metrik aus.
-//!    **Abgeleitete und Selbstdiagnose-Metriken zählen nicht** (Name mit
-//!    `.`, siehe `is_derived_metric`): die Raten der Zählerstufe
-//!    (`<metric>.rate`, `harw-sentinel`), die Kürzungsmarker
+//!    **Abgeleitete und Selbstdiagnose-Metriken zählen nicht** (siehe
+//!    `is_derived_metric`), und zwar nur genau diese Formen: die Raten der
+//!    Zählerstufe (`<metric>.rate`, `harw-sentinel`), die Kürzungsmarker
 //!    (`netcounters.truncated`, `cgroup.truncated`, `blockio.truncated`) und
-//!    `scanreport.malformed_reports` (PL-100 WP0.14/WP0.15). Bereinigte
-//!    Sensor-Metriken enthalten nie einen Punkt; eine Rate ist keine neue
-//!    Signalart (ihr Zähler wird selbst geprüft), ein Marker beschreibt den
-//!    Sensor, nicht die beobachtete Struktur.
+//!    `scanreport.malformed_reports` (PL-100 WP0.14/WP0.15). Eine Rate ist
+//!    keine neue Signalart (ihr Zähler wird selbst geprüft), ein Marker
+//!    beschreibt den Sensor, nicht die beobachtete Struktur. Jeder andere
+//!    Name — auch einer mit `.` wie `unexpected.metric` — ist eine rohe
+//!    Metrik und löst Drift aus: `HostSample::metric` ist frei wählbar, ein
+//!    Punkt allein beweist keine Ableitung.
 //!
 //! # Zeitstempel (PL-100 WP0.2)
 //! Ein Ereignis-Befund trägt das `observed_at` seines Ereignisses, ein
@@ -132,11 +134,30 @@ impl Rule for StructureDriftRule {
     }
 }
 
+/// Suffix der Raten aus der Zählerstufe von `harw-sentinel`
+/// (`rates::RATE_SUFFIX`; die Regel-Crate hängt nicht am Sentinel).
+const RATE_SUFFIX: &str = ".rate";
+
+/// Die Selbstdiagnose-Marker der Sensoren, exakt: Kürzungsmarker von
+/// netcounters, cgroup und blockio sowie die verworfenen Reports von
+/// scanreport (je `TRUNCATED_METRIC` bzw. `MALFORMED_REPORTS_METRIC` der
+/// Sensor-Crates).
+const SENSOR_MARKER_METRICS: [&str; 4] = [
+    "netcounters.truncated",
+    "cgroup.truncated",
+    "blockio.truncated",
+    "scanreport.malformed_reports",
+];
+
 /// `true` für eine abgeleitete oder Selbstdiagnose-Metrik, die nie als neue
-/// Signalart gilt: ihr Name enthält einen `.` (`<metric>.rate`,
-/// `<sensor>.truncated`, `scanreport.malformed_reports`) — siehe Moduldoku.
+/// Signalart gilt: genau `<metric>.rate` (mit nicht leerem `<metric>`) oder
+/// einer der [`SENSOR_MARKER_METRICS`]. Jeder andere Name, auch mit `.`,
+/// bleibt eine rohe Metrik — siehe Moduldoku.
 fn is_derived_metric(metric: &str) -> bool {
-    metric.contains('.')
+    SENSOR_MARKER_METRICS.contains(&metric)
+        || metric
+            .strip_suffix(RATE_SUFFIX)
+            .is_some_and(|base| !base.is_empty())
 }
 
 /// Die Härte, die diese Regel selbst beiträgt: ein Drift-Ereignis wird
@@ -284,6 +305,68 @@ mod tests {
                 .all(|finding| finding.summary.contains("disk-queue"))
         );
         Ok(())
+    }
+
+    // Owner-Review 4505120973: nur die ausdrücklichen Ableitungsformen sind
+    // ausgenommen. Eine neue rohe Metrik mit Punkt (`unexpected.metric`), ein
+    // verlängerter Marker und eine "Rate" ohne Basisnamen lösen Drift aus.
+    #[test]
+    fn test_unknown_dotted_raw_metric_still_drifts() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).map_err(ctx("gültige Baseline"))?;
+        let samples = vec![
+            sample("unexpected.metric"),
+            sample("netcounters.truncated.extra"),
+            sample(".rate"),
+            sample("user_jiffies.rate"),
+            sample("cgroup.truncated"),
+        ];
+        let scope = NetworkScope::empty();
+        let baselines = [baseline];
+        let ctx = ctx_with(&samples, &baselines, &scope);
+
+        let findings = StructureDriftRule.evaluate(&ctx);
+        assert_eq!(findings.len(), 3, "three raw metrics drift");
+        for raw in [
+            "unexpected.metric",
+            "netcounters.truncated.extra",
+            "'.rate'",
+        ] {
+            assert!(
+                findings.iter().any(|finding| finding.summary.contains(raw)),
+                "{raw} must drift"
+            );
+        }
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.summary.contains("'user_jiffies.rate'")
+                    && !finding.summary.contains("'cgroup.truncated'"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_derived_metric_accepts_only_the_explicit_forms() {
+        for derived in [
+            "user_jiffies.rate",
+            "netcounters.truncated",
+            "cgroup.truncated",
+            "blockio.truncated",
+            "scanreport.malformed_reports",
+        ] {
+            assert!(is_derived_metric(derived), "{derived}");
+        }
+        for raw in [
+            "unexpected.metric",
+            ".rate",
+            "rate",
+            "gpu.truncated",
+            "scanreport.malformed_reports.x",
+            "disk-queue",
+        ] {
+            assert!(!is_derived_metric(raw), "{raw}");
+        }
     }
 
     #[test]
