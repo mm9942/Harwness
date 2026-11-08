@@ -873,7 +873,7 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
     // PL-100 WP0.4: Wiederholungen werden je `dedup_key` entprellt; der
     // Zustand liegt im Zustandsverzeichnis (`--home`, Landlock-beschreibbar)
     // und übersteht Neustarts.
-    let throttle = throttle::FindingThrottle::open(
+    let finding_throttle = throttle::FindingThrottle::open(
         throttle::ThrottleConfig::with_cooldown_secs(cli.finding_cooldown_secs),
         Some(home.join(throttle::DEFAULT_STATE_FILE_NAME)),
     );
@@ -882,7 +882,7 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         max_keys = throttle::MAX_KEYS,
         "finding throttle enabled"
     );
-    let mut rules = findings::RuleCycle::new(network_scope).with_throttle(throttle);
+    let mut rules = findings::RuleCycle::new(network_scope).with_throttle(finding_throttle);
 
     if cli.once {
         poll_once(
