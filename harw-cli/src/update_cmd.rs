@@ -107,7 +107,8 @@ enum Check {
 /// # Description
 /// Nach einem Lauf ohne `--check`/`--dismiss` — aktuell oder erfolgreich
 /// aktualisiert — ergänzt es über
-/// [`crate::lifecycle::ensure_dod_defaults_for_install`] in einer vorhandenen
+/// [`crate::agent_cmd::ensure_dod_defaults_guarded`] (Symlink- und
+/// Eigentümerprüfung des Homes) in einer vorhandenen
 /// `config.toml` `[dod.approve] tui_tty = true`, falls der Schlüssel fehlt
 /// (PL-100 O12). Ein Fehler dabei ist nur eine Warnung.
 ///
@@ -143,7 +144,8 @@ pub fn run(home_override: Option<PathBuf>, args: UpdateArgs) -> Result<(), Strin
     }
     match outcome {
         Check::UpToDate(_) => {
-            crate::lifecycle::ensure_dod_defaults_for_install(&home);
+            // Nur in einem eigenen, nicht verlinkten Home (Owner-Review 4505015321).
+            crate::agent_cmd::ensure_dod_defaults_guarded(&home);
             Ok(())
         }
         Check::Available(release) => {
@@ -154,7 +156,8 @@ pub fn run(home_override: Option<PathBuf>, args: UpdateArgs) -> Result<(), Strin
                 return Ok(());
             }
             install_release(&home, home_override.as_deref(), &release)?;
-            crate::lifecycle::ensure_dod_defaults_for_install(&home);
+            // Nur in einem eigenen, nicht verlinkten Home (Owner-Review 4505015321).
+            crate::agent_cmd::ensure_dod_defaults_guarded(&home);
             println!("harw {} installiert.", release.version);
             Ok(())
         }
@@ -169,7 +172,8 @@ pub fn run(home_override: Option<PathBuf>, args: UpdateArgs) -> Result<(), Strin
             }
             let bindir = bindir_for(record.as_ref(), std::env::current_exe().ok().as_deref())?;
             run_source_update(&plan, &bindir, &home)?;
-            crate::lifecycle::ensure_dod_defaults_for_install(&home);
+            // Nur in einem eigenen, nicht verlinkten Home (Owner-Review 4505015321).
+            crate::agent_cmd::ensure_dod_defaults_guarded(&home);
             Ok(())
         }
     }

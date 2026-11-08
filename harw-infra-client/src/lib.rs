@@ -75,8 +75,8 @@ pub use key::{
 };
 pub use network::{DEFAULT_NETWORK_SOCKET, NetworkControlClient};
 pub use posture::{
-    DodPosture, DodPostureStatus, Posture, PostureFinding, PostureId, PosturePeer, PostureSeverity,
-    UntrustedText,
+    DisplayId, DodPosture, DodPostureStatus, InstructionId, Posture, PostureFinding, PostureId,
+    PosturePeer, PostureSeverity, UntrustedText,
 };
 pub use security::{
     ContextVerification, DEFAULT_SECURITY_SOCKET, MAX_CONTEXT_ID_LEN, SecurityHubClient,

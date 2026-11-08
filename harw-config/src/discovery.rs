@@ -471,12 +471,20 @@ fn require_reference<T>(
 ///    by a safe `active_profile` pointer
 /// 3. `.harw/` in the current working directory — repo-local override
 ///
-/// Missing directories are silently skipped by [`discover_config`]. If neither
-/// `$HOME` nor the current directory can be determined the returned vector may
-/// be empty.
+/// Missing directories are silently skipped by [`discover_config`].
+///
+/// **Fails closed without a Home layer** (PL-100, threat B15):
+/// [`discover_config`] treats `layers[0]` as the Home layer, the only layer
+/// that (besides the active profile) may set `[dod.triage]` and
+/// `[dod.approve]`. If no Home can be established — `$HOME` is unset, empty
+/// or relative (an empty `$HOME` would resolve `.harw` against the current
+/// directory, i.e. usually the repository itself) — the returned vector is
+/// **empty**: the repo-local `.harw` is dropped as well instead of moving to
+/// position 0 and inheriting the Home rights.
 ///
 /// # Returns
-/// `Vec<PathBuf>` with zero to three entries.
+/// `Vec<PathBuf>` with zero to three entries. A non-empty vector always
+/// starts with the Home layer `<$HOME>/.harw`.
 ///
 /// # Panics
 /// Never.
@@ -489,7 +497,9 @@ fn require_reference<T>(
 /// ```rust,no_run
 /// use harw_config::default_config_layers;
 /// let layers = default_config_layers();
-/// // Layers ascend from ~/.harw through the active profile to ./.harw.
+/// // Layers ascend from ~/.harw through the active profile to ./.harw;
+/// // without an absolute $HOME there is no layer at all.
+/// assert!(layers.is_empty() || layers.first().is_some_and(|home| home.ends_with(".harw")));
 /// ```
 pub fn default_config_layers() -> Vec<PathBuf> {
     default_config_layers_from(
@@ -512,6 +522,12 @@ pub fn default_config_layers() -> Vec<PathBuf> {
 /// bzw. der Root-Space) bleibt unverändert: er ist bereits über
 /// `harw_home::home_dir`/`set_home_override` personalisierbar und wird hier
 /// nur noch für die reine `$HOME`-Auflösung ohne Override verwendet.
+///
+/// Ohne feststellbare Home-Ebene (`$HOME` fehlt, ist leer oder relativ)
+/// liefert die Funktion wie [`default_config_layers`] **keine** Ebene, auch
+/// nicht `<cwd>/<project_dir_name>`: [`discover_config`] liest `layers[0]`
+/// als Home-Ebene, ein Repo-Layer an dieser Stelle bekäme sonst deren Rechte
+/// für `[dod.triage]`/`[dod.approve]` (PL-100, Bedrohung B15).
 ///
 /// # Hinweis
 /// Der eigentliche, überridefähige Pfad läuft nicht über diese Funktion,
@@ -538,30 +554,48 @@ fn default_config_layers_from_named(
     cwd: Option<PathBuf>,
     project_dir_name: &str,
 ) -> Vec<PathBuf> {
+    // Fail closed (PL-100, Bedrohung B15): `discover_config` liest
+    // `layers[0]` als Home-Ebene (`is_dod_policy_layer`). Ohne feststellbares
+    // Home gibt es deshalb gar keine Ebene — sonst rückte der Repo-Layer an
+    // Position 0 und dürfte `[dod.triage]`/`[dod.approve]` setzen.
+    let Some(home) = established_home(home_directory) else {
+        tracing::debug!(
+            reason = "home_not_established",
+            "config: no default layers without an absolute home directory"
+        );
+        return Vec::new();
+    };
     let mut layers = Vec::with_capacity(3);
 
     // Home-Layer: ~/.harw/ — dies ist der Root-Space selbst, nicht das
     // projekt-lokale Verzeichnis; er bleibt `.harw`, da eine personalisierte
     // harw ihn ohnehin über `harw_home::home_dir`/`set_home_override` (bzw.
     // `HARW_HOME`) ersetzt, nicht über diese env-basierte Auflösung.
-    if let Some(home) = home_directory {
-        let harw_home = home.join(".harw");
-        layers.push(harw_home.clone());
+    let harw_home = home.join(".harw");
+    layers.push(harw_home.clone());
 
-        // A malformed, unreadable, or absent pointer deliberately contributes
-        // no layer. Profile names are constrained before path construction so
-        // config discovery cannot traverse outside the profiles directory.
-        if let Some(profile_name) = read_active_profile_name(&harw_home) {
-            layers.push(harw_home.join("profiles").join(profile_name));
-        }
+    // A malformed, unreadable, or absent pointer deliberately contributes
+    // no layer. Profile names are constrained before path construction so
+    // config discovery cannot traverse outside the profiles directory.
+    if let Some(profile_name) = read_active_profile_name(&harw_home) {
+        layers.push(harw_home.join("profiles").join(profile_name));
     }
 
-    // Repo-lokaler Layer: <project_dir_name>/ im aktuellen Arbeitsverzeichnis
+    // Repo-lokaler Layer: <project_dir_name>/ im aktuellen Arbeitsverzeichnis,
+    // immer hinter der Home-Ebene (und dem Profil).
     if let Some(cwd) = cwd {
         layers.push(cwd.join(project_dir_name));
     }
 
     layers
+}
+
+/// Das Home-Verzeichnis, aus dem sich die Home-Ebene feststellen lässt: nur
+/// ein gesetzter, absoluter Pfad. Ein leerer (`""`) oder relativer Wert
+/// (etwa `HOME=.`) würde `.harw` gegen das Arbeitsverzeichnis auflösen, also
+/// in der Regel gegen das Repository selbst, und wird verworfen.
+fn established_home(home_directory: Option<PathBuf>) -> Option<PathBuf> {
+    home_directory.filter(|home| home.is_absolute())
 }
 
 fn read_active_profile_name(harw_home: &Path) -> Option<String> {
@@ -596,6 +630,10 @@ fn valid_profile_name(name: &str) -> bool {
 /// `[dod.approve]` wirkt dort nur die Verengung `tui_tty = false`. `[dod]`
 /// selbst wird schlüsselweise gemergt: die Grundschlüssel gemeinsam, sobald
 /// eine Ebene einen davon setzt, die Untertabellen Schlüssel für Schlüssel.
+/// `layers[0]` ist damit Vertrag mit dem Aufrufer: Wer keine Home-Ebene
+/// feststellen kann, übergibt **keine** Ebene statt einer Liste, die mit
+/// einem Projekt-Layer beginnt — so wie [`default_config_layers`] ohne
+/// absolutes `$HOME` fail-closed eine leere Liste liefert.
 /// Zusätzlich wird
 /// aus jedem Layer-Verzeichnis eine `.env`-Datei in
 /// [`ResolvedConfig::env_layer`] geladen (Profil überschreibt Root).
@@ -1084,12 +1122,20 @@ const DOD_HOME_ONLY_TABLES: [&str; 2] = ["triage", "approve"];
 /// der `[dod.triage]`/`[dod.approve]` gelten.
 ///
 /// Die Home-Ebene ist `layers[0]` (`harw_home::LayerReport::layers`,
-/// [`default_config_layers`]); das Profil ist `<home>/profiles/<name>` mit
-/// gültigem Profilnamen. Jede andere vertraute Ebene — der freigegebene
-/// Repo-Layer `<cwd>/.harw` und die projektbezogenen Einstellungen
-/// `<home>/profiles/<p>/projects/<key>` — ist eine Projektebene. Rein
-/// lexikalisch: `harw-config` darf `harw-home` nicht kennen, und beide
-/// Pfadformen entstehen dort aus demselben `home`.
+/// [`default_config_layers`]). Die Position ist ein Vertrag mit dem
+/// Aufrufer: `harw_home` stellt immer das aufgelöste Home an Position 0,
+/// [`default_config_layers`] liefert ohne absolutes `$HOME` gar keine Ebene
+/// (fail closed), statt `<cwd>/.harw` an Position 0 zu stellen. Zum Vertrag
+/// gehört, dass das Home an Position 0 nicht aus einem leeren oder relativen
+/// `$HOME` stammt: `HOME=.` ergäbe `./.harw`, also meist den Repo-Layer des
+/// Arbeitsverzeichnisses mit Home-Rechten. Lexikalisch ist das hier nicht
+/// von einem bewusst relativen `--home` zu unterscheiden; die Prüfung gehört
+/// deshalb in die Home-Auflösung des Aufrufers. Das Profil
+/// ist `<home>/profiles/<name>` mit gültigem Profilnamen. Jede andere
+/// vertraute Ebene — der freigegebene Repo-Layer `<cwd>/.harw` und die
+/// projektbezogenen Einstellungen `<home>/profiles/<p>/projects/<key>` — ist
+/// eine Projektebene. Rein lexikalisch: `harw-config` darf `harw-home` nicht
+/// kennen, und beide Pfadformen entstehen dort aus demselben `home`.
 fn is_dod_policy_layer(layers: &[PathBuf], base: &Path) -> bool {
     let Some(home) = layers.first() else {
         return false;
@@ -2967,6 +3013,132 @@ pinned_identities = [123456789]
         assert_eq!(
             default_config_layers_from(Some(home_directory), Some(cwd.clone())),
             vec![harw_home, cwd.join(".harw")]
+        );
+
+        std::fs::remove_dir_all(root).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// PL-100 B15 (owner review on PR #168): without an established Home the
+    /// helper returns no layer at all. Before the fix `<cwd>/.harw` became
+    /// `layers[0]` and thereby the Home layer of `discover_config`.
+    #[test]
+    fn default_layers_without_home_fail_closed() -> TestResult {
+        let root = test_directory("no-home-layers")?;
+        let cwd = root.join("workspace");
+        std::fs::create_dir_all(cwd.join(".harw")).map_err(ctx("Repo-Layer anlegen"))?;
+        std::fs::create_dir_all(cwd.join(".mia")).map_err(ctx("benannten Repo-Layer anlegen"))?;
+
+        assert_eq!(
+            default_config_layers_from(None, Some(cwd.clone())),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            default_config_layers_from_named(None, Some(cwd.clone()), ".mia"),
+            Vec::<PathBuf>::new()
+        );
+        assert!(default_config_layers_from(None, None).is_empty());
+
+        // An empty or relative `$HOME` establishes no Home either: `.harw`
+        // would resolve against the process's working directory, usually the
+        // repository itself.
+        for home in [
+            PathBuf::new(),
+            PathBuf::from("."),
+            PathBuf::from("relative/home"),
+        ] {
+            assert!(
+                default_config_layers_from(Some(home.clone()), Some(cwd.clone())).is_empty(),
+                "HOME {home:?} must not establish a Home layer"
+            );
+        }
+
+        // Control: an absolute Home keeps the repository layer, behind Home.
+        let home_directory = root.join("home");
+        assert_eq!(
+            default_config_layers_from(Some(home_directory.clone()), Some(cwd.clone())),
+            vec![home_directory.join(".harw"), cwd.join(".harw")]
+        );
+
+        std::fs::remove_dir_all(root).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// PL-100 B15 regression (owner review on PR #168): the current
+    /// repository's `.harw` must not set the Home/profile-only
+    /// `[dod.triage]`/`[dod.approve]` when no Home can be established. With
+    /// an established Home the same repository still applies, but only as a
+    /// project layer whose policy tables are dropped and reported.
+    #[test]
+    fn no_home_current_repository_cannot_set_dod_policy_tables() -> TestResult {
+        let root = test_directory("no-home-dod-policy")?;
+        let cwd = root.join("workspace");
+        let repo = cwd.join(".harw");
+        write_layer_file(
+            &repo,
+            "config.toml",
+            r#"
+[dod.triage]
+model = "evil/exfil"
+max_parallel = 4
+
+[dod.approve]
+tui_tty = true
+
+[dod.watch]
+mode = "notify"
+"#,
+        )?;
+
+        // No Home: no layer, so nothing from the repository becomes policy.
+        let layers = default_config_layers_from(None, Some(cwd.clone()));
+        assert!(layers.is_empty());
+        let config = discover_config(&layers).map_err(ctx("Konfiguration ohne Home entdecken"))?;
+        assert_eq!(config.dod.triage.model, None);
+        assert_eq!(
+            config.dod.triage.max_parallel,
+            crate::dod_toml::DEFAULT_TRIAGE_MAX_PARALLEL
+        );
+        assert!(config.dod.approve.tui_tty);
+        assert_eq!(config.dod.watch.mode, crate::dod_toml::DodWatchMode::Triage);
+
+        // Control with an established Home: Home keeps the policy, the
+        // repository is a project layer (its `[dod.watch]` applies, its
+        // `[dod.triage]`/`[dod.approve]` are dropped with a diagnostic).
+        let home_directory = root.join("home");
+        write_layer_file(
+            &home_directory.join(".harw"),
+            "config.toml",
+            "[dod.triage]\nmodel = \"local/qwen2.5\"\n\n[dod.approve]\ntui_tty = false\n",
+        )?;
+        let layers = default_config_layers_from(Some(home_directory), Some(cwd.clone()));
+        let config = discover_config(&layers).map_err(ctx("Konfiguration mit Home entdecken"))?;
+        assert_eq!(config.dod.triage.model.as_deref(), Some("local/qwen2.5"));
+        assert_eq!(
+            config.dod.triage.max_parallel,
+            crate::dod_toml::DEFAULT_TRIAGE_MAX_PARALLEL
+        );
+        assert!(!config.dod.approve.tui_tty);
+        assert_eq!(config.dod.watch.mode, crate::dod_toml::DodWatchMode::Notify);
+        let repo_config = repo.join("config.toml").display().to_string();
+        let dod_warnings: Vec<(&str, &str)> = config
+            .scope_warnings
+            .iter()
+            .filter(|warning| warning.field.starts_with("dod."))
+            .map(|warning| (warning.field.as_str(), warning.file.as_str()))
+            .collect();
+        assert_eq!(
+            dod_warnings,
+            [
+                ("dod.triage", repo_config.as_str()),
+                ("dod.approve", repo_config.as_str()),
+            ]
+        );
+        assert!(
+            !config
+                .scope_warnings
+                .iter()
+                .any(|warning| warning.to_string().contains("evil/exfil"))
         );
 
         std::fs::remove_dir_all(root).map_err(ctx("Testverzeichnis entfernen"))?;

@@ -60,7 +60,36 @@
 //! `source` (also jedes lokale Paket, auch eines aus einem `[patch]` in
 //! `.cargo/config.toml`) unter den gelesenen Paketen stehen
 //! ([`lock_coverage`]); sonst ist es ein Verstoß, denn es könnte jede Regel
-//! unbemerkt umgehen.
+//! unbemerkt umgehen. Verglichen wird die Paketidentität, die `Cargo.lock`
+//! für lokale Pakete führt: Name **und** Version, nicht der Name allein
+//! (Owner-Review PR #168, Befund 4). Ein ungelesenes Paket, das nur den
+//! Namen eines gelesenen trägt, ist nicht abgedeckt. Die Version eines
+//! gelesenen Pakets löst das Gate wie Cargo auf (`package_version`:
+//! `version`, `version.workspace = true` aus `[workspace.package]` der
+//! Wurzel, ohne Feld `0.0.0`). Mehrere lokale Einträge desselben Namens sind
+//! immer ein Verstoß, auch wenn jede Version gelesen wurde (fail closed):
+//! lokale Einträge tragen in `Cargo.lock` keinen Pfad, und ein zweites
+//! lokales Paket eines Namens ist genau das Muster eines überschattenden
+//! Overrides; das Gate rät dann nicht, welches Manifest Cargo baut.
+//!
+//! **(h)** Name und Version unterscheiden nicht alles: Ein ungelesenes
+//! Manifest mit Name **und** Version eines gelesenen, das dessen Platz
+//! einnimmt (etwa ein `[patch]` aus `.cargo/config.toml`, der einen
+//! gleichnamigen `[patch]` der Wurzel überschreibt), steht in `Cargo.lock`
+//! genauso wie das gelesene. Statt Manifestpfade über `cargo metadata`
+//! abzugleichen (Subprozess), schlägt das Gate deshalb schon bei jedem
+//! lokalen Override in einer Cargo-Konfigurationsdatei fehl
+//! ([`cargo_config_overrides`]): `[patch.*]`-Einträge mit `path`,
+//! `paths = […]`, `[source.*]` mit `directory` oder `local-registry` und
+//! `include` (weitere, ungelesene Konfigurationsdateien). Gelesen werden
+//! ([`cargo_config_paths`]) `.cargo/config.toml` und `.cargo/config` in der
+//! Wurzel und jedem ihrer Elternverzeichnisse, in jedem Verzeichnis zwischen
+//! der Wurzel und einem gelesenen Paket (Cargo sucht vom Arbeitsverzeichnis
+//! des Aufrufs aus, und `make -C harw-dod …` ruft Cargo in `harw-dod/` auf)
+//! sowie `config.toml` und `config` in `$CARGO_HOME` (sonst `~/.cargo`). Das
+//! ist eine Obermenge dessen, was ein einzelner Lauf anwendet (fail closed).
+//! Lokale Overrides gehören, wenn überhaupt, in die Wurzel-`Cargo.toml`, wo
+//! das Gate ihnen folgt.
 //!
 //! # Verstöße
 //! **(a)** Ein Paket außer `harw-escalator` fordert [`FEATURE`] an, auf
@@ -143,7 +172,7 @@
 //! Bibliothek einbindet, teilt sich sein `harw-dod-rules` samt [`FEATURE`]
 //! und könnte seine `[features]` einschalten.
 //!
-//! **(g)** siehe „Eingabemenge".
+//! **(g)** und **(h)** siehe „Eingabemenge".
 //!
 //! # Grenzen
 //! - Cargo vereinheitlicht Features je Build: Sobald `harw-escalator` das
@@ -165,9 +194,26 @@
 //! - Kommandozeilen-Features (`--features …`) sind kein Manifest. Solange
 //!   Regel (b) gilt, existiert [`FEATURE`] nicht, und Cargo lehnt
 //!   `--features harw-dod-rules/operator-decision` ab.
-//! - `workspace = true` in einem Paket außerhalb des Workspace-Verzeichnisses
-//!   wird gegen **diese** Wurzel aufgelöst; die eigene Workspace-Wurzel eines
-//!   solchen Pakets liest das Gate nicht.
+//! - `workspace = true` (auch `version.workspace = true`) in einem Paket
+//!   außerhalb des Workspace-Verzeichnisses wird gegen **diese** Wurzel
+//!   aufgelöst; die eigene Workspace-Wurzel eines solchen Pakets liest das
+//!   Gate nicht. Eine dadurch falsch aufgelöste Version fällt bei Regel (g)
+//!   als ungelesenes Paket auf (fail closed).
+//! - Lokale Pakete führt `Cargo.lock` ohne Pfad, Regel (g) vergleicht deshalb
+//!   Name und Version. Ein ungelesenes Paket mit demselben Namen **und**
+//!   derselben Version wie ein gelesenes, das selbst nicht in `Cargo.lock`
+//!   steht, ist daraus nicht zu unterscheiden; Regel (h) schließt das für
+//!   Overrides aus Konfigurationsdateien, indem sie jeden lokalen Override
+//!   dort ablehnt. Für Member gilt das ohnehin nicht: Ein Member steht immer
+//!   selbst in `Cargo.lock`, und ein zweites lokales Paket seines Namens ist
+//!   ein Verstoß.
+//! - Regel (h) liest Dateien. Overrides, die in keiner Datei stehen
+//!   (`--config` auf der Kommandozeile, `CARGO_*`-Umgebungsvariablen), sieht
+//!   das Gate so wenig wie Kommandozeilen-Features. Ein Cargo-Aufruf aus
+//!   einem Verzeichnis, das weder Wurzel noch Paket noch Elternverzeichnis
+//!   eines Pakets ist, kann dort liegende `.cargo/`-Dateien zusätzlich
+//!   anwenden; Makefile und Release-Pipeline rufen Cargo aus der Wurzel bzw.
+//!   aus `harw-dod/` auf.
 //! - Dass `OperatorDecision` und `triage_record_operator` außerhalb von
 //!   `cfg(test)` nicht existieren, belegen `compile_fail`-Doctests an
 //!   `harw_dod_rules::TriageError`, nicht dieses Gate.
@@ -182,15 +228,17 @@
 //!
 //! # Fehler
 //! [`run`] meldet unlesbare oder ungültige Manifeste, ein fehlendes Ziel
-//! einer `path`-Abhängigkeit und ein unlesbares `Cargo.lock` als
-//! `Err(String)`; Verstöße stehen im [`GateReport`].
+//! einer `path`-Abhängigkeit, eine nicht auflösbare Paketversion, ein
+//! unlesbares bzw. ungültiges `Cargo.lock` und eine vorhandene, aber
+//! unlesbare bzw. ungültige Cargo-Konfigurationsdatei als `Err(String)`;
+//! Verstöße stehen im [`GateReport`].
 //!
 //! # Examples
 //! ```text
 //! cargo xtask gates operator-decision
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -251,30 +299,61 @@ pub fn run() -> Result<GateReport, String> {
 /// Führt das Gate gegen den Workspace unter `repo_root` aus.
 ///
 /// # Description
-/// Liest Wurzel und Pakete ([`load_manifests`]), prüft sie ([`evaluate`])
-/// und belegt die Vollständigkeit der Eingabemenge gegen
-/// `<repo_root>/Cargo.lock` ([`lock_coverage`], Regel (g)).
+/// Wie [`run_with_cargo_home`] mit dem Cargo-Home des Prozesses
+/// (`$CARGO_HOME`, sonst `~/.cargo`).
 ///
 /// # Arguments
 /// - `repo_root` (`&Path`): Wurzel des Repositorys.
 ///
 /// # Returns
+/// Den [`GateReport`].
+///
+/// # Errors
+/// Wie [`run_with_cargo_home`].
+pub fn run_at(repo_root: &Path) -> Result<GateReport, String> {
+    run_with_cargo_home(repo_root, cargo_home().as_deref())
+}
+
+/// Führt das Gate gegen den Workspace unter `repo_root` aus, mit
+/// `cargo_home` als Cargo-Home.
+///
+/// # Description
+/// Liest Wurzel und Pakete ([`load_manifests`]), prüft sie ([`evaluate`]),
+/// belegt die Vollständigkeit der Eingabemenge gegen
+/// `<repo_root>/Cargo.lock` ([`lock_coverage`], Regel (g)) und lehnt lokale
+/// Overrides in Cargo-Konfigurationsdateien ab ([`cargo_config_paths`],
+/// [`cargo_config_overrides`], Regel (h)). Getrennt von [`run_at`], damit
+/// Tests nicht von der Cargo-Konfiguration des Benutzers abhängen.
+///
+/// # Arguments
+/// - `repo_root` (`&Path`): Wurzel des Repositorys.
+/// - `cargo_home` (`Option<&Path>`): das Cargo-Home, dessen `config.toml`
+///   bzw. `config` mitgelesen wird; `None` liest keines.
+///
+/// # Returns
 /// Den [`GateReport`]; Verstöße aus [`lock_coverage`] stehen hinter denen
-/// aus [`evaluate`].
+/// aus [`evaluate`], die aus Regel (h) zuletzt.
 ///
 /// # Errors
 /// Ein unlesbarer Workspace, ein unlesbares bzw. ungültiges Manifest, ein
-/// fehlendes Ziel einer `path`-Abhängigkeit oder ein unlesbares bzw.
-/// ungültiges `Cargo.lock`.
-pub fn run_at(repo_root: &Path) -> Result<GateReport, String> {
-    let (root, packages) = load_manifests(repo_root)?;
+/// fehlendes Ziel einer `path`-Abhängigkeit, eine nicht auflösbare
+/// Paketversion, ein unlesbares bzw. ungültiges `Cargo.lock` (siehe
+/// [`lock_coverage`]) oder eine vorhandene, aber unlesbare bzw. ungültige
+/// Cargo-Konfigurationsdatei (siehe [`cargo_config_overrides`]).
+pub fn run_with_cargo_home(
+    repo_root: &Path,
+    cargo_home: Option<&Path>,
+) -> Result<GateReport, String> {
+    let loaded = load_workspace(repo_root)?;
     let lock_path = repo_root.join("Cargo.lock");
     let lock = fs::read_to_string(&lock_path)
         .map_err(|error| format!("{}: {error}", lock_path.display()))?;
-    let mut report = evaluate(&root, &packages);
+    let mut report = evaluate(&loaded.root, &loaded.packages);
     report
         .violations
-        .extend(lock_coverage(&lock, &root, &packages)?);
+        .extend(lock_coverage(&lock, &loaded.root, &loaded.packages)?);
+    let configs = cargo_config_paths(&canonical(repo_root)?, &loaded.package_dirs, cargo_home);
+    report.violations.extend(cargo_config_overrides(&configs)?);
     Ok(report)
 }
 
@@ -299,6 +378,27 @@ pub fn run_at(repo_root: &Path) -> Result<GateReport, String> {
 /// fehlendes Ziel einer `path`-Abhängigkeit oder ein Ziel ohne
 /// `[package].name`.
 pub fn load_manifests(repo_root: &Path) -> Result<(toml::Table, Vec<MemberManifest>), String> {
+    load_workspace(repo_root).map(|loaded| (loaded.root, loaded.packages))
+}
+
+/// Was [`load_workspace`] liest: das Ergebnis von [`load_manifests`] plus
+/// die Verzeichnisse der gelesenen Pakete (für Regel (h)).
+struct LoadedWorkspace {
+    /// Die Wurzel-`Cargo.toml`.
+    root: toml::Table,
+    /// Je Paket `(Paketname, Tabelle)`, wie [`load_manifests`] sie liefert.
+    packages: Vec<MemberManifest>,
+    /// Das kanonische Verzeichnis jedes Pakets in `packages`, in derselben
+    /// Reihenfolge.
+    package_dirs: Vec<PathBuf>,
+}
+
+/// Kern von [`load_manifests`]; merkt sich zusätzlich das kanonische
+/// Verzeichnis jedes gelesenen Pakets.
+///
+/// # Errors
+/// Wie [`load_manifests`].
+fn load_workspace(repo_root: &Path) -> Result<LoadedWorkspace, String> {
     let graph = super::load_all_workspaces(repo_root)?;
     let root_path = repo_root.join("Cargo.toml");
     let root = read_manifest(&root_path)?;
@@ -308,9 +408,12 @@ pub fn load_manifests(repo_root: &Path) -> Result<(toml::Table, Vec<MemberManife
     let mut seen: BTreeSet<PathBuf> = BTreeSet::from([canonical(&root_path)?]);
     let mut pending = path_dependency_dirs(repo_root, &root, ManifestRole::Root);
     let mut packages = Vec::with_capacity(graph.crates.len());
+    let mut package_dirs = Vec::with_capacity(graph.crates.len());
     for node in &graph.crates {
         let manifest = read_manifest(&node.manifest_path)?;
-        seen.insert(canonical(&node.manifest_path)?);
+        let manifest_path = canonical(&node.manifest_path)?;
+        package_dirs.push(manifest_dir(&manifest_path));
+        seen.insert(manifest_path);
         pending.extend(path_dependency_dirs(
             &node.dir,
             &manifest,
@@ -322,7 +425,8 @@ pub fn load_manifests(repo_root: &Path) -> Result<(toml::Table, Vec<MemberManife
     // implizit zu Membern, außerhalb baut es sie trotzdem.
     while let Some(dir) = pending.pop() {
         let manifest_path = dir.join("Cargo.toml");
-        if !seen.insert(canonical(&manifest_path)?) {
+        let canonical_path = canonical(&manifest_path)?;
+        if seen.contains(&canonical_path) {
             continue;
         }
         let manifest = read_manifest(&manifest_path)?;
@@ -335,9 +439,24 @@ pub fn load_manifests(repo_root: &Path) -> Result<(toml::Table, Vec<MemberManife
             })?
             .to_owned();
         pending.extend(path_dependency_dirs(&dir, &manifest, ManifestRole::Package));
+        package_dirs.push(manifest_dir(&canonical_path));
+        seen.insert(canonical_path);
         packages.push((name, manifest));
     }
-    Ok((root, packages))
+    Ok(LoadedWorkspace {
+        root,
+        packages,
+        package_dirs,
+    })
+}
+
+/// Das Verzeichnis eines (kanonischen) Manifestpfads; ein Pfad ohne
+/// Elternteil (nur theoretisch) zählt als er selbst.
+fn manifest_dir(manifest_path: &Path) -> PathBuf {
+    manifest_path
+        .parent()
+        .unwrap_or(manifest_path)
+        .to_path_buf()
 }
 
 /// Liest und parst ein Manifest.
@@ -346,8 +465,9 @@ fn read_manifest(path: &Path) -> Result<toml::Table, String> {
     toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// Der kanonische Pfad eines Manifests (Schlüssel gegen doppeltes Lesen);
-/// ein fehlendes Manifest ist ein Fehler.
+/// Der kanonische Pfad eines Manifests (Schlüssel gegen doppeltes Lesen)
+/// bzw. der Wurzel (Ausgangspunkt von Regel (h)); ein fehlender Pfad ist ein
+/// Fehler.
 fn canonical(path: &Path) -> Result<PathBuf, String> {
     fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()))
 }
@@ -395,31 +515,63 @@ fn path_dependency_dirs(base: &Path, manifest: &toml::Table, role: ManifestRole)
 /// # Description
 /// Jedes `[[package]]` ohne `source` ist ein lokales Paket, das Cargo baut
 /// (Member, `path`-Abhängigkeit, lokaler `[patch]`, auch aus
-/// `.cargo/config.toml`). Steht sein Name weder unter `packages` noch ist er
-/// die Wurzel, hat das Gate es nicht geprüft.
+/// `.cargo/config.toml`). Verglichen wird die Paketidentität, die
+/// `Cargo.lock` für lokale Pakete führt: Name **und** Version, nicht der
+/// Name allein (Owner-Review PR #168, Befund 4). Ein lokaler Eintrag ist
+/// abgedeckt, wenn ein gelesenes Paket oder die Wurzel (falls sie ein Paket
+/// ist) denselben Namen mit derselben Version (`package_version`) trägt.
+///
+/// Führt `Cargo.lock` mehrere lokale Pakete desselben Namens, ist das immer
+/// ein Verstoß, auch wenn jede Version gelesen wurde (fail closed): lokale
+/// Einträge tragen dort keinen Pfad, und ein zweites lokales Paket eines
+/// Namens ist das Muster eines überschattenden Overrides (`[patch]` bzw.
+/// `paths` aus `.cargo/config.toml`). Was Name und Version allein nicht
+/// unterscheiden (gleicher Name, gleiche Version, anderer Pfad), schließt
+/// Regel (h) über [`cargo_config_overrides`].
 ///
 /// # Arguments
 /// - `lock` (`&str`): der Inhalt von `Cargo.lock`.
-/// - `root` (`&toml::Table`): die Wurzel-`Cargo.toml`.
+/// - `root` (`&toml::Table`): die Wurzel-`Cargo.toml`; sie liefert
+///   `[workspace.package].version` für `version.workspace = true`.
 /// - `packages` (`&[MemberManifest]`): die gelesenen Pakete.
 ///
 /// # Returns
-/// Je nicht gelesenem lokalem Paket ein Verstoß, nach Name sortiert.
+/// Die Verstöße, nach Name sortiert: je lokalem Namen mit mehreren
+/// Einträgen zuerst ein Verstoß „mehrere lokale Pakete", danach je
+/// nicht gelesenem Name/Version-Paar einer (nach Version sortiert).
 ///
 /// # Errors
-/// Ein ungültiges `Cargo.lock` oder ein lokales `[[package]]` ohne `name`.
+/// Ein ungültiges `Cargo.lock`, ein lokales `[[package]]` ohne `name` oder
+/// ohne `version`, oder ein gelesenes Paket, dessen Version nicht auflösbar
+/// ist (`package_version` liefert `None`; Cargo lehnte ein solches
+/// Manifest ab).
 pub fn lock_coverage(
     lock: &str,
     root: &toml::Table,
     packages: &[MemberManifest],
 ) -> Result<Vec<String>, String> {
     let lock: toml::Table = toml::from_str(lock).map_err(|error| format!("Cargo.lock: {error}"))?;
-    let read: BTreeSet<&str> = packages
+    // Die Identität jedes gelesenen Pakets (Name, Version); die Wurzel zählt
+    // mit, falls sie selbst ein Paket ist.
+    let root_package = package_name(root).map(|name| (name, root));
+    let mut read: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for (name, manifest) in packages
         .iter()
-        .map(|(name, _)| name.as_str())
-        .chain(package_name(root))
-        .collect();
-    let mut unread = BTreeSet::new();
+        .map(|(name, manifest)| (name.as_str(), manifest))
+        .chain(root_package)
+    {
+        let version = package_version(manifest, root).ok_or_else(|| {
+            format!(
+                "{name}: [package].version ist weder eine Zeichenkette noch über \
+                 [workspace.package].version der Wurzel geerbt; der Abgleich mit Cargo.lock \
+                 (Regel (g)) ist so nicht möglich"
+            )
+        })?;
+        read.insert((name, version));
+    }
+    // Die lokalen Einträge je Name mit ihren Versionen; Mehrfachnennungen
+    // bleiben erhalten, sie sind selbst ein Verstoß.
+    let mut local: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for entry in lock
         .get("package")
         .and_then(toml::Value::as_array)
@@ -433,22 +585,256 @@ pub fn lock_coverage(
             .get("name")
             .and_then(toml::Value::as_str)
             .ok_or_else(|| "Cargo.lock: lokales [[package]] ohne 'name'".to_owned())?;
-        if !read.contains(name) {
-            unread.insert(name);
+        let version = entry
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| format!("Cargo.lock: lokales [[package]] '{name}' ohne 'version'"))?;
+        local.entry(name).or_default().push(version);
+    }
+    let mut violations = Vec::new();
+    for (name, mut versions) in local {
+        versions.sort_unstable();
+        if versions.len() > 1 {
+            violations.push(format!(
+                "{name}: mehrere lokale Pakete dieses Namens laut Cargo.lock (Versionen {}); \
+                 lokale Einträge tragen dort keinen Pfad, und ein zweites lokales Paket eines \
+                 Namens ist das Muster eines überschattenden Overrides ([patch] bzw. paths aus \
+                 .cargo/config.toml) — welches Manifest Cargo baut, ist nicht belegbar, das Gate \
+                 schlägt deshalb fehl (PL-100 WP0.11, Regel (g))",
+                versions.join(", ")
+            ));
+        }
+        versions.dedup();
+        for version in versions {
+            if !read.contains(&(name, version)) {
+                violations.push(format!(
+                    "{name}: lokales Paket laut Cargo.lock (Version {version}, ohne source), das \
+                     das Gate nicht gelesen hat — kein gelesenes Manifest trägt diesen Namen mit \
+                     dieser Version, weder Member noch über einen path-Eintrag erreichbar (etwa \
+                     ein [patch] aus .cargo/config.toml); es könnte {FEATURE_CRATE}/{FEATURE} \
+                     oder {FEATURE_CRATE}/{TEST_SUPPORT_FEATURE} unbemerkt anfordern (PL-100 \
+                     WP0.11, Regel (g))"
+                ));
+            }
         }
     }
-    Ok(unread
+    Ok(violations)
+}
+
+/// Die Version, die Cargo für ein Paket ohne Versionsfeld annimmt (seit
+/// Cargo 1.75) und so auch in `Cargo.lock` schreibt.
+const DEFAULT_PACKAGE_VERSION: &str = "0.0.0";
+
+/// Die Version eines gelesenen Pakets, wie Cargo sie in `Cargo.lock`
+/// schreibt (Regel (g) der Moduldoku).
+///
+/// # Description
+/// `[package].version` als Zeichenkette gilt wörtlich;
+/// `version.workspace = true` (TOML-intern `{ workspace = true }`) erbt
+/// `[workspace.package].version` der Wurzel `root`; ein fehlendes Feld ist
+/// [`DEFAULT_PACKAGE_VERSION`]. Ein Manifest ohne `[package]` (nur in Tests,
+/// der Name kommt dann aus [`MemberManifest`]) zählt wie ein fehlendes Feld.
+///
+/// # Arguments
+/// - `manifest` (`&toml::Table`): das Paket-Manifest.
+/// - `root` (`&toml::Table`): die Wurzel-`Cargo.toml`.
+///
+/// # Returns
+/// Die Version, oder `None` für eine Form, die Cargo ablehnt: weder
+/// Zeichenkette noch `{ workspace = true }`, oder Erben ohne
+/// `[workspace.package].version` in der Wurzel.
+fn package_version<'a>(manifest: &'a toml::Table, root: &'a toml::Table) -> Option<&'a str> {
+    let Some(version) = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|package| package.get("version"))
+    else {
+        return Some(DEFAULT_PACKAGE_VERSION);
+    };
+    if inherits_from_workspace(version) {
+        return root
+            .get("workspace")
+            .and_then(toml::Value::as_table)
+            .and_then(|workspace| workspace.get("package"))
+            .and_then(toml::Value::as_table)
+            .and_then(|package| package.get("version"))
+            .and_then(toml::Value::as_str);
+    }
+    version.as_str()
+}
+
+/// Die Dateinamen, unter denen Cargo eine Konfiguration liest (`config` ist
+/// die alte Form ohne Endung, Cargo liest sie weiterhin).
+const CARGO_CONFIG_FILES: [&str; 2] = ["config.toml", "config"];
+
+/// Die Schlüssel einer `[source.*]`-Tabelle, die eine Quelle durch ein
+/// lokales Verzeichnis ersetzen (Regel (h)).
+const LOCAL_SOURCE_KEYS: [&str; 2] = ["directory", "local-registry"];
+
+/// Das Cargo-Home des Prozesses, wie Cargo es bestimmt: `$CARGO_HOME`,
+/// sonst `.cargo` im Home-Verzeichnis (`$HOME`, unter Windows
+/// `%USERPROFILE%`); leere Werte zählen nicht.
+fn cargo_home() -> Option<PathBuf> {
+    let variable = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    variable("CARGO_HOME").or_else(|| {
+        variable("HOME")
+            .or_else(|| variable("USERPROFILE"))
+            .map(|home| home.join(".cargo"))
+    })
+}
+
+/// Die Cargo-Konfigurationsdateien, die ein Lauf im Repository anwenden
+/// kann (Regel (h) der Moduldoku).
+///
+/// # Description
+/// Cargo liest `.cargo/config.toml` und `.cargo/config` im
+/// Arbeitsverzeichnis des Aufrufs und in jedem Elternverzeichnis, danach
+/// `config.toml` und `config` im Cargo-Home. Geliefert wird die Obermenge
+/// für jeden Aufruf aus der Wurzel, aus einem Paketverzeichnis oder aus
+/// einem Verzeichnis dazwischen (`make -C harw-dod …`): die Wurzel samt
+/// Elternverzeichnissen, jedes Verzeichnis von einem Paket in `package_dirs`
+/// aufwärts bis zur Wurzel (Pakete außerhalb der Wurzel tragen nichts bei)
+/// und das Cargo-Home. Rein lexikalisch, ohne Dateizugriff; jeder Pfad
+/// genau einmal.
+///
+/// # Arguments
+/// - `repo_root` (`&Path`): Wurzel des Repositorys, kanonisch (sonst endet
+///   die Kette der Elternverzeichnisse zu früh).
+/// - `package_dirs` (`&[PathBuf]`): die kanonischen Verzeichnisse der
+///   gelesenen Pakete.
+/// - `cargo_home` (`Option<&Path>`): das Cargo-Home, falls bekannt.
+///
+/// # Returns
+/// Die Pfade, nach Verzeichnis sortiert, die des Cargo-Homes zuletzt.
+#[must_use]
+pub fn cargo_config_paths(
+    repo_root: &Path,
+    package_dirs: &[PathBuf],
+    cargo_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs: BTreeSet<&Path> = repo_root.ancestors().collect();
+    for dir in package_dirs {
+        dirs.extend(
+            dir.ancestors()
+                .take_while(|ancestor| ancestor.starts_with(repo_root)),
+        );
+    }
+    let mut paths: Vec<PathBuf> = dirs
         .into_iter()
-        .map(|name| {
-            format!(
-                "{name}: lokales Paket laut Cargo.lock (ohne source), das das Gate nicht gelesen \
-                 hat — weder Member noch über einen path-Eintrag erreichbar (etwa ein [patch] aus \
-                 .cargo/config.toml); es könnte {FEATURE_CRATE}/{FEATURE} oder \
-                 {FEATURE_CRATE}/{TEST_SUPPORT_FEATURE} unbemerkt anfordern (PL-100 WP0.11, \
-                 Regel (g))"
-            )
-        })
-        .collect())
+        .flat_map(|dir| CARGO_CONFIG_FILES.map(|file| dir.join(".cargo").join(file)))
+        .collect();
+    for file in cargo_home
+        .into_iter()
+        .flat_map(|home| CARGO_CONFIG_FILES.map(|file| home.join(file)))
+    {
+        if !paths.contains(&file) {
+            paths.push(file);
+        }
+    }
+    paths
+}
+
+/// Lehnt lokale Overrides in Cargo-Konfigurationsdateien ab (Regel (h) der
+/// Moduldoku).
+///
+/// # Description
+/// Liest jede vorhandene Datei aus `paths` und meldet je Fund
+/// (`config_overrides`: `paths`, `include`, `[patch.*]` mit `path`,
+/// `[source.*]` mit `directory`/`local-registry`) einen Verstoß mit dem
+/// Dateipfad. Eine fehlende
+/// Datei ist der Normalfall und wird übersprungen.
+///
+/// # Arguments
+/// - `paths` (`&[PathBuf]`): die Kandidaten aus [`cargo_config_paths`].
+///
+/// # Returns
+/// Die Verstöße in der Reihenfolge von `paths`.
+///
+/// # Errors
+/// Eine vorhandene, aber unlesbare Datei (jeder Fehler außer „nicht
+/// gefunden", fail closed) oder ungültiges TOML; Cargo lehnte eine solche
+/// Konfiguration ebenfalls ab.
+pub fn cargo_config_overrides(paths: &[PathBuf]) -> Result<Vec<String>, String> {
+    let mut violations = Vec::new();
+    for path in paths {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        let config: toml::Table =
+            toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+        for finding in config_overrides(&config) {
+            violations.push(format!(
+                "{}: {finding} — Cargo wendet diese Konfiguration bei Läufen im Repository an \
+                 und baut dann ein Manifest, das das Gate nicht liest; trägt es Name und \
+                 Version eines gelesenen Pakets, ist es in Cargo.lock nicht davon zu \
+                 unterscheiden, und es könnte {FEATURE_CRATE}/{FEATURE} oder \
+                 {FEATURE_CRATE}/{TEST_SUPPORT_FEATURE} unbemerkt anfordern; lokale Overrides \
+                 gehören in die Wurzel-Cargo.toml, wo das Gate ihnen folgt (PL-100 WP0.11, \
+                 Regel (h))",
+                path.display()
+            ));
+        }
+    }
+    Ok(violations)
+}
+
+/// Die lokalen Overrides einer geparsten Cargo-Konfiguration (Regel (h)).
+///
+/// # Description
+/// Gezählt werden `paths` (Pfad-Overrides, unabhängig vom Wert), `include`
+/// (weitere Konfigurationsdateien, die das Gate nicht liest), jeder Eintrag
+/// unter `[patch.<quelle>]` mit `path` und jede `[source.<name>]`-Tabelle mit
+/// `directory` oder `local-registry` ([`LOCAL_SOURCE_KEYS`]). Ein `[patch]`
+/// mit `git` oder eine Quelle mit `registry` bleibt erlaubt: Solche Pakete
+/// stehen mit `source` in `Cargo.lock`.
+///
+/// # Arguments
+/// - `config` (`&toml::Table`): die geparste Konfigurationsdatei.
+///
+/// # Returns
+/// Je Fund eine Fundstelle, z. B. `[patch.crates-io].foo mit path`.
+fn config_overrides(config: &toml::Table) -> Vec<String> {
+    let mut findings = Vec::new();
+    if config.contains_key("paths") {
+        findings.push("paths (Pfad-Overrides)".to_owned());
+    }
+    if config.contains_key("include") {
+        findings.push("include (weitere Konfigurationsdateien)".to_owned());
+    }
+    let tables = move |key: &str| {
+        config
+            .get(key)
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flatten()
+    };
+    for (registry, entries) in tables("patch") {
+        for (name, entry) in entries.as_table().into_iter().flatten() {
+            if entry
+                .as_table()
+                .is_some_and(|entry| entry.contains_key("path"))
+            {
+                findings.push(format!("[patch.{registry}].{name} mit path"));
+            }
+        }
+    }
+    for (name, source) in tables("source") {
+        for key in LOCAL_SOURCE_KEYS {
+            if source
+                .as_table()
+                .is_some_and(|source| source.contains_key(key))
+            {
+                findings.push(format!("[source.{name}].{key}"));
+            }
+        }
+    }
+    findings
 }
 
 /// Prüft bereits geparste Manifeste.
@@ -2082,29 +2468,34 @@ mod tests {
     fn test_unlisted_path_packages_are_checked() -> TestResult {
         let base = scratch("paths");
         let workspace = base.join("ws");
+        // Versionen wie im echten Workspace: Member erben sie aus
+        // `[workspace.package]`, `bar` (außerhalb) nennt sie wörtlich; Regel (g)
+        // vergleicht Name und Version mit `Cargo.lock`.
         write_manifest(
             &workspace,
             "[workspace]\nmembers = [\"app\", \"harw-dod-rules\"]\n\n\
+             [workspace.package]\nversion = \"0.1.0\"\n\n\
              [workspace.dependencies]\nrules = { package = \"harw-dod-rules\", path = \"harw-dod-rules\" }\n",
         )?;
         write_manifest(
             &workspace.join("harw-dod-rules"),
-            "[package]\nname = \"harw-dod-rules\"\n\n[features]\ntest-support = []\n",
+            "[package]\nname = \"harw-dod-rules\"\nversion.workspace = true\n\n\
+             [features]\ntest-support = []\n",
         )?;
         write_manifest(
             &workspace.join("app"),
-            "[package]\nname = \"app\"\n\n\
+            "[package]\nname = \"app\"\nversion.workspace = true\n\n\
              [dependencies]\nfoo = { path = \"../foo\" }\nrules = { workspace = true }\n",
         )?;
         write_manifest(
             &workspace.join("foo"),
-            "[package]\nname = \"foo\"\n\n\
+            "[package]\nname = \"foo\"\nversion.workspace = true\n\n\
              [dependencies]\nrules = { workspace = true, features = [\"test-support\"] }\n\
              bar = { path = \"../../bar\" }\n",
         )?;
         write_manifest(
             &base.join("bar"),
-            "[package]\nname = \"bar\"\n\n\
+            "[package]\nname = \"bar\"\nversion = \"0.1.0\"\n\n\
              [build-dependencies]\nharw-dod-rules = { path = \"../ws/harw-dod-rules\", features = [\"operator-decision\"] }\n",
         )?;
         fs::write(
@@ -2197,8 +2588,26 @@ mod tests {
         Ok(())
     }
 
+    /// Ein Paket-Manifest mit `[package]`-Name und wörtlicher Version; Regel
+    /// (g) vergleicht Name und Version mit `Cargo.lock`.
+    fn versioned(name: &str, version: &str) -> TestResult<MemberManifest> {
+        member(
+            name,
+            &format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+        )
+    }
+
+    /// Ob ein Verstoß aus Regel (g) ein ungelesenes lokales Paket `name` in
+    /// genau dieser `version` meldet.
+    fn reports_unread(violations: &[String], name: &str, version: &str) -> bool {
+        let prefix = format!("{name}: lokales Paket laut Cargo.lock (Version {version},");
+        violations.iter().any(|v| v.starts_with(&prefix))
+    }
+
     /// Regel (g): jedes lokale Paket aus `Cargo.lock` (ohne `source`) muss
-    /// gelesen worden sein; Registry-Pakete und die Wurzel zählen nicht.
+    /// gelesen worden sein; Registry-Pakete zählen nicht, die Wurzel als
+    /// Paket zählt mit (hier mit einer aus ihrem eigenen
+    /// `[workspace.package]` geerbten Version).
     #[test]
     fn test_lock_coverage_reports_unread_local_packages() -> TestResult {
         let lock = "version = 4\n\n\
@@ -2207,9 +2616,13 @@ mod tests {
                     [[package]]\nname = \"harw-root\"\nversion = \"0.1.0\"\n\n\
                     [[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\
                     source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
-        let root = table("[package]\nname = \"harw-root\"\n")?;
+        let root = table(
+            "[package]\nname = \"harw-root\"\nversion.workspace = true\n\n\
+             [workspace.package]\nversion = \"0.1.0\"\n",
+        )?;
 
-        let violations = lock_coverage(lock, &root, &[owner()?]).map_err(TestError::Unexpected)?;
+        let violations = lock_coverage(lock, &root, &[versioned(FEATURE_CRATE, "0.1.0")?])
+            .map_err(TestError::Unexpected)?;
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(
             violations
@@ -2217,18 +2630,449 @@ mod tests {
                 .all(|v| v.starts_with("ghost: lokales Paket laut Cargo.lock")),
             "{violations:?}"
         );
+        assert!(
+            reports_unread(&violations, "ghost", "0.1.0"),
+            "{violations:?}"
+        );
 
         let complete = lock_coverage(
             lock,
             &root,
-            &[owner()?, member("ghost", "[package]\nname = \"ghost\"\n")?],
+            &[
+                versioned(FEATURE_CRATE, "0.1.0")?,
+                versioned("ghost", "0.1.0")?,
+            ],
         )
         .map_err(TestError::Unexpected)?;
         assert!(complete.is_empty(), "{complete:?}");
 
-        // Ein lokales `[[package]]` ohne Namen ist ein Fehler, kein stilles
-        // Überspringen.
+        // Ein lokales `[[package]]` ohne Namen oder ohne Version ist ein
+        // Fehler, kein stilles Überspringen.
         assert!(lock_coverage("[[package]]\nversion = \"1\"\n", &toml::Table::new(), &[]).is_err());
+        assert!(lock_coverage("[[package]]\nname = \"x\"\n", &toml::Table::new(), &[]).is_err());
+        Ok(())
+    }
+
+    /// Owner-Review PR #168, Befund 4: Ein ungelesenes lokales
+    /// `harw-dod-rules 0.9.0` (etwa aus einem `[patch]` in
+    /// `.cargo/config.toml`) neben dem gelesenen `harw-dod-rules 0.10.0`.
+    const DUPLICATE_NAME_LOCK: &str = "version = 4\n\n\
+         [[package]]\nname = \"harw-dod-rules\"\nversion = \"0.10.0\"\n\n\
+         [[package]]\nname = \"harw-dod-rules\"\nversion = \"0.9.0\"\n";
+
+    /// Owner-Review PR #168, Befund 4: Die Abdeckung folgt der
+    /// Paketidentität, nicht dem Namen. Der gleichnamige Eintrag in anderer
+    /// Version ist nicht abgedeckt, und der doppelte lokale Name schlägt
+    /// fehl — auch dann, wenn beide Versionen gelesen wurden (fail closed).
+    /// Die frühere Fassung (nur Namen) meldete hier nichts.
+    #[test]
+    fn test_lock_coverage_duplicate_name_with_different_version_is_a_violation() -> TestResult {
+        let violations = lock_coverage(
+            DUPLICATE_NAME_LOCK,
+            &toml::Table::new(),
+            &[versioned(FEATURE_CRATE, "0.10.0")?],
+        )
+        .map_err(TestError::Unexpected)?;
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(
+            violations.iter().any(|v| v.starts_with(
+                "harw-dod-rules: mehrere lokale Pakete dieses Namens laut Cargo.lock \
+                 (Versionen 0.10.0, 0.9.0)"
+            )),
+            "{violations:?}"
+        );
+        assert!(
+            reports_unread(&violations, FEATURE_CRATE, "0.9.0"),
+            "{violations:?}"
+        );
+        assert!(
+            !reports_unread(&violations, FEATURE_CRATE, "0.10.0"),
+            "die gelesene Version ist abgedeckt: {violations:?}"
+        );
+
+        let both_read = lock_coverage(
+            DUPLICATE_NAME_LOCK,
+            &toml::Table::new(),
+            &[
+                versioned(FEATURE_CRATE, "0.10.0")?,
+                versioned(FEATURE_CRATE, "0.9.0")?,
+            ],
+        )
+        .map_err(TestError::Unexpected)?;
+        assert_eq!(both_read.len(), 1, "{both_read:?}");
+        assert!(
+            both_read
+                .iter()
+                .all(|v| v.starts_with("harw-dod-rules: mehrere lokale Pakete dieses Namens")),
+            "{both_read:?}"
+        );
+
+        // Derselbe Name, Version für Version doppelt (ein von Hand gebautes
+        // `Cargo.lock`), ist ebenso mehrdeutig.
+        let doubled = "version = 4\n\n\
+                       [[package]]\nname = \"harw-dod-rules\"\nversion = \"0.10.0\"\n\n\
+                       [[package]]\nname = \"harw-dod-rules\"\nversion = \"0.10.0\"\n";
+        let violations = lock_coverage(
+            doubled,
+            &toml::Table::new(),
+            &[versioned(FEATURE_CRATE, "0.10.0")?],
+        )
+        .map_err(TestError::Unexpected)?;
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations.iter().all(|v| v.starts_with(
+                "harw-dod-rules: mehrere lokale Pakete dieses Namens laut Cargo.lock \
+                 (Versionen 0.10.0, 0.10.0)"
+            )),
+            "{violations:?}"
+        );
+        Ok(())
+    }
+
+    /// Owner-Review PR #168, Befund 4, ohne Namensdopplung: Steht in
+    /// `Cargo.lock` nur ein lokales `harw-dod-rules`, aber in einer anderen
+    /// Version als das gelesene (das gelesene kam etwa über einen ungenutzten
+    /// `[patch]` der Wurzel), ist es nicht abgedeckt.
+    #[test]
+    fn test_lock_coverage_compares_the_version_not_only_the_name() -> TestResult {
+        let lock = "version = 4\n\n\
+                    [[package]]\nname = \"harw-dod-rules\"\nversion = \"0.9.0\"\n";
+        let violations = lock_coverage(
+            lock,
+            &toml::Table::new(),
+            &[versioned(FEATURE_CRATE, "0.10.0")?],
+        )
+        .map_err(TestError::Unexpected)?;
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            reports_unread(&violations, FEATURE_CRATE, "0.9.0"),
+            "{violations:?}"
+        );
+
+        let same = lock_coverage(
+            lock,
+            &toml::Table::new(),
+            &[versioned(FEATURE_CRATE, "0.9.0")?],
+        )
+        .map_err(TestError::Unexpected)?;
+        assert!(same.is_empty(), "{same:?}");
+        Ok(())
+    }
+
+    /// Gegenprobe zu Befund 4: Ein gleichnamiges Registry-Paket (mit
+    /// `source`) ist kein lokales Paket und weder ungelesen noch eine
+    /// Namensdopplung.
+    #[test]
+    fn test_lock_coverage_ignores_a_registry_namesake() -> TestResult {
+        let lock = "version = 4\n\n\
+                    [[package]]\nname = \"harw-dod-rules\"\nversion = \"0.10.0\"\n\n\
+                    [[package]]\nname = \"harw-dod-rules\"\nversion = \"0.9.0\"\n\
+                    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+        let violations = lock_coverage(
+            lock,
+            &toml::Table::new(),
+            &[versioned(FEATURE_CRATE, "0.10.0")?],
+        )
+        .map_err(TestError::Unexpected)?;
+        assert!(violations.is_empty(), "{violations:?}");
+        Ok(())
+    }
+
+    /// Die Version eines gelesenen Pakets wird wie von Cargo aufgelöst;
+    /// eine Form, die Cargo ablehnt, deckt nichts ab, sondern ist ein Fehler.
+    #[test]
+    fn test_package_version_resolves_like_cargo() -> TestResult {
+        let root = table("[workspace.package]\nversion = \"0.10.0\"\n")?;
+        for (text, expected) in [
+            (
+                "[package]\nname = \"a\"\nversion = \"1.2.3\"\n",
+                Some("1.2.3"),
+            ),
+            (
+                "[package]\nname = \"a\"\nversion.workspace = true\n",
+                Some("0.10.0"),
+            ),
+            (
+                "[package]\nname = \"a\"\nversion = { workspace = true }\n",
+                Some("0.10.0"),
+            ),
+            ("[package]\nname = \"a\"\n", Some(DEFAULT_PACKAGE_VERSION)),
+            ("[features]\nx = []\n", Some(DEFAULT_PACKAGE_VERSION)),
+            (
+                "[package]\nname = \"a\"\nversion = { workspace = false }\n",
+                None,
+            ),
+            ("[package]\nname = \"a\"\nversion = 1\n", None),
+        ] {
+            let manifest = table(text)?;
+            assert_eq!(package_version(&manifest, &root), expected, "{text}");
+        }
+
+        // Erben ohne `[workspace.package].version` in der Wurzel ist nicht
+        // auflösbar; `lock_coverage` meldet das als Fehler, statt das Paket
+        // still als gelesen zu zählen.
+        let inherited = table("[package]\nname = \"a\"\nversion.workspace = true\n")?;
+        let bare = toml::Table::new();
+        assert_eq!(package_version(&inherited, &bare), None);
+        let lock = "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"0.10.0\"\n";
+        assert!(lock_coverage(lock, &bare, &[("a".to_owned(), inherited)]).is_err());
+
+        // Mit `[workspace.package].version` deckt das erbende Paket den
+        // Eintrag ab.
+        let covered = lock_coverage(
+            lock,
+            &root,
+            &[member(
+                "a",
+                "[package]\nname = \"a\"\nversion.workspace = true\n",
+            )?],
+        )
+        .map_err(TestError::Unexpected)?;
+        assert!(covered.is_empty(), "{covered:?}");
+        Ok(())
+    }
+
+    /// Regel (h): welche Einträge einer Cargo-Konfiguration ein lokaler
+    /// Override sind und welche nicht.
+    #[test]
+    fn test_config_overrides_recognises_local_overrides() -> TestResult {
+        let red = table(
+            "paths = [\"../shadow\"]\n\
+             include = [\"more.toml\"]\n\
+             [patch.crates-io]\nshadow = { path = \"../shadow\" }\nremote = { git = \"https://example.invalid/r\" }\n\
+             [patch.'https://example.invalid/index']\nother = { path = \"../other\" }\n\
+             [source.vendored]\ndirectory = \"vendor\"\n\
+             [source.offline]\nlocal-registry = \"registry\"\n",
+        )?;
+        let mut findings = config_overrides(&red);
+        findings.sort();
+        assert_eq!(
+            findings,
+            vec![
+                "[patch.crates-io].shadow mit path".to_owned(),
+                "[patch.https://example.invalid/index].other mit path".to_owned(),
+                "[source.offline].local-registry".to_owned(),
+                "[source.vendored].directory".to_owned(),
+                "include (weitere Konfigurationsdateien)".to_owned(),
+                "paths (Pfad-Overrides)".to_owned(),
+            ]
+        );
+
+        // Kein lokaler Override: ein `[patch]` mit `git`, eine Spiegel-Quelle
+        // mit `registry`/`replace-with` und gewöhnliche Build-Einstellungen.
+        let green = table(
+            "[build]\njobs = 4\n\
+             [net]\noffline = false\n\
+             [patch.crates-io]\nremote = { git = \"https://example.invalid/r\" }\n\
+             [source.crates-io]\nreplace-with = \"mirror\"\n\
+             [source.mirror]\nregistry = \"sparse+https://example.invalid/index/\"\n",
+        )?;
+        assert!(config_overrides(&green).is_empty());
+        Ok(())
+    }
+
+    /// Regel (h): Wurzel samt Elternverzeichnissen, jedes Verzeichnis
+    /// zwischen Wurzel und Paket (`make -C harw-dod …`), nichts für Pakete
+    /// außerhalb der Wurzel, das Cargo-Home zuletzt und jeder Pfad einmal.
+    #[test]
+    fn test_cargo_config_paths_cover_ancestors_packages_and_cargo_home() {
+        let root = Path::new("/r/ws");
+        let packages = [
+            root.join("harw-dod").join("crates").join("agent"),
+            root.join("app"),
+            PathBuf::from("/r/outside/bar"),
+        ];
+        let paths = cargo_config_paths(root, &packages, Some(Path::new("/c")));
+        for dir in [
+            "/",
+            "/r",
+            "/r/ws",
+            "/r/ws/app",
+            "/r/ws/harw-dod",
+            "/r/ws/harw-dod/crates",
+            "/r/ws/harw-dod/crates/agent",
+        ] {
+            for file in CARGO_CONFIG_FILES {
+                let path = Path::new(dir).join(".cargo").join(file);
+                assert!(paths.contains(&path), "{} fehlt: {paths:?}", path.display());
+            }
+        }
+        assert!(
+            !paths.iter().any(|path| path.starts_with("/r/outside")),
+            "{paths:?}"
+        );
+        assert_eq!(
+            paths
+                .iter()
+                .rev()
+                .take(2)
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>(),
+            vec![Path::new("/c/config"), Path::new("/c/config.toml")]
+        );
+        let unique: BTreeSet<&PathBuf> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "{paths:?}");
+        // 7 Verzeichnisse mit je zwei Dateinamen plus das Cargo-Home.
+        assert_eq!(paths.len(), 16, "{paths:?}");
+
+        // Ist das Cargo-Home ein bereits gelesenes `.cargo`, kommt nichts hinzu.
+        let same = cargo_config_paths(root, &[], Some(Path::new("/r/.cargo")));
+        assert_eq!(same, cargo_config_paths(root, &[], None));
+    }
+
+    /// Owner-Review PR #168, Befund 4 (Restfall „different path"): Ein
+    /// `[patch]` in `.cargo/config.toml` überschreibt den gleichnamigen
+    /// `[patch]` der Wurzel mit einem ungelesenen Manifest **derselben**
+    /// Version, das `harw-dod-rules/test-support` einschaltet. `Cargo.lock`
+    /// sieht für beide Fälle gleich aus, Regel (g) bleibt also stumm; Regel
+    /// (h) schlägt fehl. Dazu dieselbe Lage über `paths` in der alten
+    /// Dateiform `.cargo/config` eines Zwischenverzeichnisses (`dod/`, wie
+    /// `make -C harw-dod`).
+    #[test]
+    fn test_cargo_config_patch_shadowing_a_root_patch_is_a_violation() -> TestResult {
+        let base = scratch("config-shadow");
+        let workspace = base.join("ws");
+        write_manifest(
+            &workspace,
+            "[workspace]\nmembers = [\"app\", \"dod/harw-dod-rules\"]\n\n\
+             [workspace.package]\nversion = \"0.1.0\"\n\n\
+             [patch.crates-io]\nshadow = { path = \"shadow\" }\n",
+        )?;
+        write_manifest(
+            &workspace.join("dod").join("harw-dod-rules"),
+            "[package]\nname = \"harw-dod-rules\"\nversion.workspace = true\n\n\
+             [features]\ntest-support = []\n",
+        )?;
+        write_manifest(
+            &workspace.join("app"),
+            "[package]\nname = \"app\"\nversion.workspace = true\n\n\
+             [dependencies]\nshadow = \"0.1\"\n",
+        )?;
+        // Das gelesene `shadow` (Ziel des Wurzel-`[patch]`) ist sauber.
+        write_manifest(
+            &workspace.join("shadow"),
+            "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\n",
+        )?;
+        // Das ungelesene `shadow` aus der Cargo-Konfiguration: gleicher Name,
+        // gleiche Version, anderer Pfad.
+        write_manifest(
+            &base.join("evil").join("shadow"),
+            "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nharw-dod-rules = { path = \"../../ws/dod/harw-dod-rules\", features = [\"test-support\"] }\n",
+        )?;
+        fs::write(
+            workspace.join("Cargo.lock"),
+            "version = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [[package]]\nname = \"harw-dod-rules\"\nversion = \"0.1.0\"\n\n\
+             [[package]]\nname = \"shadow\"\nversion = \"0.1.0\"\n",
+        )
+        .map_err(ctx("Cargo.lock schreiben"))?;
+        // Ein leeres Cargo-Home: der Test hängt nicht von der Konfiguration
+        // des Benutzers ab.
+        let cargo_home = base.join("cargo-home");
+
+        // Ohne Konfiguration ist der Workspace grün: Regel (g) deckt
+        // `shadow 0.1.0` über das gelesene Ziel des Wurzel-`[patch]` ab.
+        let clean = run_with_cargo_home(&workspace, Some(cargo_home.as_path()))
+            .map_err(TestError::Unexpected)?;
+        assert!(clean.is_green(), "{:?}", clean.violations);
+
+        let config_dir = workspace.join(".cargo");
+        fs::create_dir_all(&config_dir).map_err(ctx(".cargo anlegen"))?;
+        fs::write(
+            config_dir.join("config.toml"),
+            "[patch.crates-io]\nshadow = { path = \"../evil/shadow\" }\n",
+        )
+        .map_err(ctx(".cargo/config.toml schreiben"))?;
+        let shadowed = run_with_cargo_home(&workspace, Some(cargo_home.as_path()))
+            .map_err(TestError::Unexpected)?;
+        let config_path = canonical(&workspace)
+            .map_err(TestError::Unexpected)?
+            .join(".cargo")
+            .join("config.toml");
+        assert_eq!(shadowed.violations.len(), 1, "{:?}", shadowed.violations);
+        assert!(
+            has_violation(
+                &shadowed,
+                &format!(
+                    "{}: [patch.crates-io].shadow mit path — ",
+                    config_path.display()
+                )
+            ),
+            "{:?}",
+            shadowed.violations
+        );
+        // Regel (g) allein meldet hier nichts: Name und Version stimmen.
+        assert!(
+            !reports_unread(&shadowed.violations, "shadow", "0.1.0"),
+            "{:?}",
+            shadowed.violations
+        );
+
+        // Dieselbe Lage über `paths` in `dod/.cargo/config` (alte Form).
+        fs::remove_file(config_dir.join("config.toml"))
+            .map_err(ctx(".cargo/config.toml entfernen"))?;
+        let nested_dir = workspace.join("dod").join(".cargo");
+        fs::create_dir_all(&nested_dir).map_err(ctx("dod/.cargo anlegen"))?;
+        fs::write(nested_dir.join("config"), "paths = [\"../evil/shadow\"]\n")
+            .map_err(ctx("dod/.cargo/config schreiben"))?;
+        let nested = run_with_cargo_home(&workspace, Some(cargo_home.as_path()))
+            .map_err(TestError::Unexpected)?;
+        let nested_path = canonical(&workspace)
+            .map_err(TestError::Unexpected)?
+            .join("dod")
+            .join(".cargo")
+            .join("config");
+        assert_eq!(nested.violations.len(), 1, "{:?}", nested.violations);
+        assert!(
+            has_violation(
+                &nested,
+                &format!("{}: paths (Pfad-Overrides) — ", nested_path.display())
+            ),
+            "{:?}",
+            nested.violations
+        );
+
+        // Aufräumen ist nur Hygiene; ein Rest stört keinen späteren Lauf.
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    /// Regel (h): Das Cargo-Home zählt mit; eine fehlende Datei ist der
+    /// Normalfall, eine ungültige ein Fehler (fail closed).
+    #[test]
+    fn test_cargo_config_overrides_reads_the_cargo_home_and_fails_closed() -> TestResult {
+        let base = scratch("config-home");
+        let cargo_home = base.join("cargo-home");
+        fs::create_dir_all(&cargo_home).map_err(ctx("Cargo-Home anlegen"))?;
+        let paths = cargo_config_paths(&base.join("ws"), &[], Some(cargo_home.as_path()));
+        let home_config = cargo_home.join("config.toml");
+        assert!(paths.contains(&home_config), "{paths:?}");
+
+        assert!(
+            cargo_config_overrides(&[home_config.clone()])
+                .map_err(TestError::Unexpected)?
+                .is_empty()
+        );
+        fs::write(&home_config, "[source.vendored]\ndirectory = \"vendor\"\n")
+            .map_err(ctx("Cargo-Home-Konfiguration schreiben"))?;
+        let violations =
+            cargo_config_overrides(&[home_config.clone()]).map_err(TestError::Unexpected)?;
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations.iter().all(|v| v.starts_with(&format!(
+                "{}: [source.vendored].directory — ",
+                home_config.display()
+            ))),
+            "{violations:?}"
+        );
+
+        fs::write(&home_config, "[patch\n").map_err(ctx("ungültige Konfiguration schreiben"))?;
+        assert!(cargo_config_overrides(&[home_config]).is_err());
+
+        // Aufräumen ist nur Hygiene; ein Rest stört keinen späteren Lauf.
+        let _ = fs::remove_dir_all(&base);
         Ok(())
     }
 }

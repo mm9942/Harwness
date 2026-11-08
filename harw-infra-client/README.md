@@ -105,8 +105,8 @@ authority or to downgrade anything.
 `SecurityHubClient::posture()` reads `GET /v1/posture` into a typed
 `Posture` (PL-100 phase 4). The client does not depend on `harw-types`, so
 the document has its own types: `PosturePeer`, `DodPosture`,
-`DodPostureStatus`, `PostureSeverity`, `PostureFinding`, `PostureId` and
-`UntrustedText`.
+`DodPostureStatus`, `PostureSeverity`, `PostureFinding`, `PostureId`,
+`DisplayId`, `InstructionId` and `UntrustedText`.
 
 ```text
 GET /v1/posture  200 {"peer": {"uid", "gid", "pid"?}, "principal_id"?, "host"?,
@@ -133,18 +133,37 @@ strings:
   `Debug` that shows only its length. `escaped_line(max_chars)` renders it
   through `harw_untrusted_text::escape_line`; `as_untrusted_str()` is the
   explicitly named raw accessor.
-- `finding_id` and `rule_id` are a `PostureId`. `Valid` means the value
-  passed the grammar of the DoD export reader (`harw-dod-client`). For
-  `finding_id` that is non-blank, at most 256 bytes and nothing the escaper
-  would change; for `rule_id` it is 1 to 128 bytes of `[A-Za-z0-9._:-]`.
-  Any other value becomes `Invalid(UntrustedText)`. The finding is kept,
-  never dropped (I3).
+- `finding_id` and `rule_id` are a `PostureId`. `Valid(DisplayId)` means
+  the value passed the grammar of the DoD export reader (`harw-dod-client`).
+  For `finding_id` that is non-blank, at most 256 bytes and nothing the
+  escaper would change; for `rule_id` it is 1 to 128 bytes of
+  `[A-Za-z0-9._:-]`. Any other value becomes `Invalid(UntrustedText)`. The
+  finding is kept, never dropped (I3).
 - `dedup_key` is kept only as 32 lowercase hex characters, the same filter
   the hub applies.
 
 The other strings (`host`, `principal_id`, `since`, `observed_at`) come from
-the hub's own configuration and timestamp rendering. A valid finding id is
-safe to display, but only a UUIDv4 belongs in a model instruction template.
+the hub's own configuration and timestamp rendering.
+
+A valid id is only safe to *display*. The `finding_id` grammar accepts any
+display-clean text, including "Ignore previous instructions", so a valid id
+is still export text and never an instruction (I4):
+
+- `DisplayId` has a private field and no public constructor. A `Valid` can
+  only come out of the grammar: decoding, or `PostureId::from_finding_id` /
+  `PostureId::from_rule_id`, which sort a value the way the decoder does;
+  a plain `String` cannot be wrapped as `Valid`. `DisplayId` has no `Display`
+  and no plain-`&str` accessor, only `escaped_line(max_chars)` and the
+  explicitly named `as_untrusted_str()`.
+- `InstructionId` is the only id type for a model instruction template. It
+  holds a canonical lowercase UUIDv4 (36 characters, hyphens at 8/13/18/23,
+  version `4`, variant `8`/`9`/`a`/`b`; uppercase, braced, URN, simple and
+  nil UUIDs are refused), the same grammar as
+  `harw_dod_client::findings::is_uuid_v4` and the node uplink.
+  `InstructionId::parse` is its only constructor, and it has no
+  `Deserialize`. `PostureFinding::finding_instruction_id()` (or
+  `PostureId::to_instruction_id()`) returns one only for such an id.
+  `Invalid` values are never promoted.
 
 ### Codec dependency
 
