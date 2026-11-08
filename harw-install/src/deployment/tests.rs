@@ -891,10 +891,11 @@ fn test_dod_units_use_the_harw_dod_suite_name() -> TestResult {
 
 /// PL-100 WP1.8: the audit netlink probe unit is embedded and printable like
 /// every other DoD unit, but stays opt-in (`harw-dod.target` does not pull it
-/// in until the sentinel accepts its uid). Whether `install.sh` ships it is
-/// decided by `DOD_PACKAGE_ASSETS`, `harw-dod/packaging/manifest` and
-/// `install.sh` together; the parity tests above keep those three in step,
-/// so this test deliberately makes no claim about it.
+/// in until the sentinel accepts its uid). The DoD package ships it
+/// (`DOD_PACKAGE_ASSETS`, `harw-dod/packaging/manifest`, `install.sh`); the
+/// parity tests above keep those three in step, and
+/// `harw-install/tests/staged_install.rs` checks the binary, the uninstall
+/// path and that no packaging step enables it.
 #[test]
 fn test_netlink_probe_unit_is_embedded_printable_and_opt_in() -> TestResult {
     let path = "deploy/systemd/harw-probe-netlink.service";

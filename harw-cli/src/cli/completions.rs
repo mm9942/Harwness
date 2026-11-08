@@ -13,7 +13,7 @@ pub struct CompletionsCommand {
     #[command(flatten)]
     pub args: harw_completions::CompletionsArgs,
     /// Also run `<bin> completions <shell> --install|--uninstall` for every harw DoD binary found on $PATH
-    /// (harw-sentinel, harw-warden, harw-probe-fs, harw-probe-bpf); missing ones are skipped.
+    /// (harw-sentinel, harw-probe-bpf, harw-probe-fs, harw-probe-netlink, harw-warden); missing ones are skipped.
     #[arg(long, requires = "completions_action")]
     pub all_binaries: bool,
 }

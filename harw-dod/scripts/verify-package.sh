@@ -10,6 +10,8 @@ grep -q '^systemd/harw-dod.target$' "$manifest"
 grep -q '^systemd/harw-sentinel.service$' "$manifest"
 grep -q '^systemd/harw-probe-bpf.service$' "$manifest"
 grep -q '^systemd/harw-probe-fs.service$' "$manifest"
+grep -q '^systemd/harw-probe-netlink.service$' "$manifest"
+grep -q '^libexec/harw-probe-netlink$' "$manifest"
 grep -q '^systemd/harw-warden.service$' "$manifest"
 grep -q '^systemd/harw-warden.socket$' "$manifest"
 grep -q '^sysusers/harw.conf$' "$manifest"
@@ -18,6 +20,12 @@ grep -q '^bpf/manifest.json$' "$manifest"
 
 if grep -Eq '^WantedBy=|^RequiredBy=' "$units/harw-warden.service" "$units/harw-warden.socket"; then
 	printf '%s\n' 'Warden units must not contain an [Install] activation edge' >&2
+	exit 1
+fi
+# PL-100 WP1.8 (O11): the audit-netlink probe is opt-in and must never be
+# pulled in by the observation target.
+if grep -Eq '^(Wants|Requires|BindsTo|Upholds)=.*harw-probe-netlink' "$units/harw-dod.target"; then
+	printf '%s\n' 'Observation target must not pull in the opt-in netlink probe' >&2
 	exit 1
 fi
 if grep -Eq '^(Wants|Requires|After|Before|ExecStart)=.*warden' "$units/harw-dod.target"; then

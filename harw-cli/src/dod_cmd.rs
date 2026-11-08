@@ -76,7 +76,18 @@
 //! | `warden enable` | `install -d -m 0750 /etc/harw-dod` (only when missing), create `/etc/harw-dod/warden.enable`, `systemctl daemon-reload`, `systemctl enable --now harw-warden.socket` |
 //! | `warden disable` | `systemctl disable --now harw-warden.socket harw-warden.service`, remove the flag file |
 //!
-//! `warden disable` has no Makefile target; it undoes `enable-warden`.
+//! `warden disable` has no Makefile target; it undoes `enable-warden`. A
+//! test compares the `systemctl` calls of `enable`, `restart` and `disable`
+//! with the `"$systemctl_bin"` lines of the matching `service.sh` arms.
+//!
+//! `disable` deliberately does not name the opt-in
+//! `harw-probe-netlink.service` (PL-100 WP1.8): its `PartOf=harw-dod.target`
+//! stops it together with the target, and its only `[Install]` edge is
+//! `WantedBy=harw-dod.target`, so nothing starts it at boot while the target
+//! is disabled; an operator's enablement survives for the next `enable`.
+//! Naming it in the first, failure-fatal call would make `disable` fail
+//! (and skip the Warden step) on a host whose installed package predates
+//! the netlink unit file.
 //!
 //! # Exit codes (PL-95 §3.4)
 //! 0 ok, 1 failure, 2 usage (clap), 3 refused: not root, or no valid
@@ -126,7 +137,11 @@ pub(crate) const EXIT_USAGE: i32 = 2;
 /// Exit code: refused (not root, no valid `active_profile`).
 pub(crate) const EXIT_REFUSED: i32 = 3;
 
-/// Units stopped by `disable` (`service.sh disable`, first call).
+/// Units stopped by `disable` (`service.sh disable`, first call; a test
+/// keeps both equal). The opt-in `harw-probe-netlink.service` is
+/// deliberately missing: `PartOf=harw-dod.target` stops it with the target,
+/// and a unit file that an older installed package does not ship would make
+/// this whole failure-fatal call fail (see the module docs).
 const OBSERVATION_UNITS: [&str; 4] = [
     "harw-dod.target",
     "harw-sentinel.service",
@@ -2066,6 +2081,195 @@ mod tests {
         let outcome = execute(DodAction::Disable, &env, &mut system);
         assert_eq!(outcome.code, EXIT_FAILURE, "{}", outcome.text);
         assert_eq!(system.calls.len(), 1, "stops at the first failure");
+
+        // A host whose installed package predates the netlink unit: a
+        // `systemctl` call naming `harw-probe-netlink.service` fails there
+        // ("Unit file … does not exist"). `disable` never names it, so it
+        // still stops and disables everything and reaches the Warden step.
+        let mut system = FakeSystem::new(0);
+        system.fail_when = Some("harw-probe-netlink.service");
+        let outcome = execute(DodAction::Disable, &env, &mut system);
+        assert_eq!(outcome.code, EXIT_OK, "{}", outcome.text);
+        assert_eq!(system.calls.len(), 2, "{:?}", system.calls);
+        let warden = calls(&[&[
+            "disable",
+            "--now",
+            "harw-warden.socket",
+            "harw-warden.service",
+        ]]);
+        assert_eq!(system.calls.last(), warden.first(), "{:?}", system.calls);
+        assert!(outcome.json.pointer("/warden/ran").is_some());
+        assert!(outcome.json.pointer("/warden/ignored_error").is_none());
+        Ok(())
+    }
+
+    /// `disable` stops every unit the DoD package ships (PL-100 WP1.8):
+    /// each unit it names is shipped, and the one shipped unit it does not
+    /// name, the opt-in `harw-probe-netlink.service`, is `PartOf=` the
+    /// target, so stopping `harw-dod.target` stops it too.
+    #[test]
+    fn dod_disable_stops_every_shipped_unit() -> TestResult {
+        let shipped: Vec<&str> = harw_install::DOD_PACKAGE_ASSETS
+            .iter()
+            .filter_map(|path| path.strip_prefix("deploy/systemd/"))
+            .collect();
+        for unit in OBSERVATION_UNITS.iter().chain(WARDEN_UNITS.iter()) {
+            assert!(shipped.contains(unit), "{unit} is disabled but not shipped");
+        }
+        let unnamed: Vec<&str> = shipped
+            .iter()
+            .copied()
+            .filter(|unit| !OBSERVATION_UNITS.contains(unit) && !WARDEN_UNITS.contains(unit))
+            .collect();
+        assert_eq!(
+            unnamed,
+            ["harw-probe-netlink.service"],
+            "a newly shipped unit needs a deliberate place in `disable`"
+        );
+        for unit in unnamed {
+            let asset = harw_install::DEPLOYMENT_ASSETS
+                .iter()
+                .find(|asset| asset.file_name() == unit)
+                .ok_or(TestError::Missing("embedded copy of a shipped unit"))?;
+            let parsed = harw_install::dod_units::parse_unit(asset.contents);
+            let part_of: Vec<&str> = parsed
+                .values("Unit", "PartOf")
+                .into_iter()
+                .flat_map(str::split_whitespace)
+                .collect();
+            assert!(
+                part_of.contains(&"harw-dod.target"),
+                "{unit} is not stopped with harw-dod.target: PartOf={part_of:?}"
+            );
+            // Only the target enables it, so it stays inert while the
+            // target is disabled.
+            let install: Vec<&str> = ["WantedBy", "RequiredBy", "Also"]
+                .into_iter()
+                .flat_map(|key| parsed.values("Install", key))
+                .flat_map(str::split_whitespace)
+                .collect();
+            assert_eq!(install, ["harw-dod.target"], "{unit}: [Install] edges");
+        }
+        Ok(())
+    }
+
+    /// The arguments of every `"$systemctl_bin" …` call in the `arm)` branch
+    /// of `harw-dod/scripts/service.sh`, in order.
+    ///
+    /// Conservative reader: the arm runs from the line `arm)` to the next
+    /// `;;`; a call's arguments end at the first redirection or `||`/`&&`;
+    /// any other line mentioning `systemctl`, and any argument with a quote
+    /// or an expansion, is an error instead of being skipped.
+    fn service_sh_calls(script: &str, arm: &str) -> TestResult<Vec<Vec<String>>> {
+        let head = format!("{arm})");
+        let mut lines = script
+            .lines()
+            .map(str::trim)
+            .skip_while(|line| *line != head.as_str());
+        if lines.next().is_none() {
+            return Err(TestError::Unexpected(format!(
+                "service.sh has no `{head}` arm"
+            )));
+        }
+        let mut found = Vec::new();
+        for line in lines {
+            if line == ";;" {
+                return Ok(found);
+            }
+            if line.starts_with('#') || !line.contains("systemctl") {
+                continue;
+            }
+            let rest = line.strip_prefix("\"$systemctl_bin\" ").ok_or_else(|| {
+                TestError::Unexpected(format!("unparsable systemctl line in `{head}`: {line}"))
+            })?;
+            let mut args = Vec::new();
+            for word in rest.split_whitespace() {
+                if word.starts_with(['>', '|', '&', ';']) || word.starts_with("2>") {
+                    break;
+                }
+                if word.contains(['"', '\'', '$', '`', '\\']) {
+                    return Err(TestError::Unexpected(format!(
+                        "unparsable systemctl argument in `{head}`: {word}"
+                    )));
+                }
+                args.push(word.to_owned());
+            }
+            found.push(args);
+        }
+        Err(TestError::Unexpected(format!(
+            "the `{head}` arm of service.sh is not closed"
+        )))
+    }
+
+    /// `harw dod enable|restart|disable` run exactly the `systemctl` calls of
+    /// `make -C harw-dod enable|restart|disable` (`service.sh`), in order;
+    /// in particular the units of both `disable` calls are
+    /// [`OBSERVATION_UNITS`] and [`WARDEN_UNITS`].
+    #[test]
+    fn dod_service_control_matches_service_sh() -> TestResult {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../harw-dod/scripts/service.sh");
+        let script = fs::read_to_string(path).map_err(ctx("read harw-dod/scripts/service.sh"))?;
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut env = env_in(dir.path());
+        env.read_config = valid_config;
+        for (action, arm) in [
+            (DodAction::Enable, "enable"),
+            (DodAction::Restart, "restart"),
+            (DodAction::Disable, "disable"),
+        ] {
+            let mut system = FakeSystem::new(0);
+            let outcome = execute(action, &env, &mut system);
+            assert_eq!(outcome.code, EXIT_OK, "{arm}: {}", outcome.text);
+            assert_eq!(
+                system.calls,
+                service_sh_calls(&script, arm)?,
+                "`harw dod {arm}` and `service.sh {arm}` differ"
+            );
+        }
+        let mut stop: Vec<&str> = vec!["disable", "--now"];
+        stop.extend(OBSERVATION_UNITS);
+        let mut warden: Vec<&str> = vec!["disable", "--now"];
+        warden.extend(WARDEN_UNITS);
+        assert_eq!(
+            service_sh_calls(&script, "disable")?,
+            calls(&[stop.as_slice(), warden.as_slice()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn service_sh_reader_reads_only_the_named_arm() -> TestResult {
+        // The reader trims every line, so the fixture needs no indentation.
+        let script = "case \"$action\" in\n\
+                      enable)\n\
+                      \"$systemctl_bin\" enable --now a.target\n\
+                      ;;\n\
+                      disable)\n\
+                      require_root\n\
+                      # a comment about systemctl\n\
+                      \"$systemctl_bin\" disable --now a.target b.service\n\
+                      \"$systemctl_bin\" disable --now c.socket 2>/dev/null || true\n\
+                      ;;\n\
+                      esac\n";
+        assert_eq!(
+            service_sh_calls(script, "disable")?,
+            calls(&[
+                &["disable", "--now", "a.target", "b.service"],
+                &["disable", "--now", "c.socket"],
+            ])
+        );
+        assert_eq!(
+            service_sh_calls(script, "enable")?,
+            calls(&[&["enable", "--now", "a.target"]])
+        );
+        assert!(service_sh_calls(script, "restart").is_err(), "missing arm");
+        for bad in [
+            "    disable)\n        systemctl disable --now a.target\n        ;;\n",
+            "    disable)\n        \"$systemctl_bin\" disable --now \"$unit\"\n        ;;\n",
+            "    disable)\n        \"$systemctl_bin\" disable --now a.target\n",
+        ] {
+            assert!(service_sh_calls(bad, "disable").is_err(), "{bad}");
+        }
         Ok(())
     }
 

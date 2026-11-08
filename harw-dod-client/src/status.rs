@@ -30,11 +30,14 @@ pub const LIBEXEC_DIR: &str = "/usr/local/libexec/harw-dod";
 /// The Warden guard file (`ConditionPathExists=` of the Warden units).
 pub const WARDEN_FLAG_PATH: &str = "/etc/harw-dod/warden.enable";
 
-/// The four daemons of the suite.
-pub const DOD_BINARIES: [&str; 4] = [
+/// The five daemons of the suite. `harw-probe-netlink` is installed with the
+/// package but opt-in (PL-100 WP1.8, O11); a host whose package lacks it is
+/// reported as a partial install.
+pub const DOD_BINARIES: [&str; 5] = [
     "harw-sentinel",
     "harw-probe-fs",
     "harw-probe-bpf",
+    "harw-probe-netlink",
     "harw-warden",
 ];
 
@@ -96,7 +99,7 @@ impl DodClientContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum InstallState {
-    /// All four daemons are present.
+    /// All five daemons are present.
     Installed {
         /// The directory that was checked.
         libexec_dir: PathBuf,

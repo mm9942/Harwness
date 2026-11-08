@@ -72,7 +72,7 @@ help:
 		'  restart      validate config and restart observation' \
 		'  status/logs   inspect observation services' \
 		'  smoke        explicit live smoke check (SMOKE_CONFIRM=1)' \
-		'  uninstall    remove only manifest-owned files; preserve data/config' \
+		'  uninstall    stop/disable all DoD units, remove manifest-owned files; preserve data/config' \
 		'  stage-test   static packaging/placeholder checks (no Cargo invocation)' \
 		'  clean-ephemeral  list (default) or delete (APPLY=1) rotated telemetry older than' \
 		'               RETENTION_DAYS (default 7); never touches spool, findings or audit data' \
