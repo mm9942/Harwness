@@ -42,6 +42,24 @@
 //!   mit deutlich mehr Einträgen wird nicht vollständig in den Speicher
 //!   geladen ([`SpoolError::TooManyEntries`]).
 //!
+//! # Beleg-Ausschnitt statt ganzem Ring (PL-100 WP0.12)
+//! Ein Record trägt nicht den ganzen Ereignis-Ring des Sentinels, sondern
+//! einen begrenzten Ausschnitt ([`slice_record`]): die auslösenden
+//! Ereignisse des Befundes und höchstens [`MAX_CONTEXT_EVENTS`] der
+//! jüngsten übrigen Ereignisse als Kontext, keine Samples. Der serialisierte
+//! Record bleibt unter der übergebenen Grenze (im Sentinel
+//! [`MAX_SLICE_RECORD_BYTES`] = 64 KiB): reicht sie nicht, fällt zuerst
+//! Kontext weg, dann ein Teil der auslösenden Ereignisse (die ersten
+//! bleiben), und erst wenn schon eines allein zu groß ist, entsteht kein
+//! Record ([`SpoolError::RecordTooLarge`]).
+//!
+//! # Aufbewahrung (Standard: 14 Tage, PL-100 WP0.12)
+//! [`SpoolLimits::default`] setzt `max_age` auf [`DEFAULT_MAX_AGE`] (14
+//! Tage, gleich der Retention-Klasse `dod_spool` in `harw-retention`) und
+//! `retention_apply` auf `true`. Gelöscht werden damit konsumierte Records,
+//! die älter sind; unkonsumierte nur mit dem eigenen Opt-in
+//! `delete_unconsumed` (siehe [`SpoolLimits`]).
+//!
 //! # Voraussetzungen (nicht durch diesen Code erzwingbar)
 //! - **Ein Schreiber.** Die Folgenummer wird beim Öffnen aus dem Verzeichnis
 //!   bestimmt und danach prozesslokal hochgezählt. Zwei Prozesse, die
@@ -91,11 +109,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harw_dod_rules::finding::FindingRecord;
+use harw_dod_rules::{Finding, RuleChecked};
+use harw_dod_signals::{SecurityEvent, SecurityEvidence, SignalsError};
 use harw_fsutil::{
     AtomicWriteOptions, EntryType, OpenMode, WalkLimits, WalkStop, open_beneath, open_dir_nofollow,
     walk_beneath, write_atomic,
 };
 use harw_types::ContentDigest;
+use jiff::Timestamp;
 
 /// Dateirechte jedes geschriebenen Records (`rw-r-----`).
 pub const RECORD_FILE_MODE: u32 = 0o640;
@@ -105,6 +126,19 @@ pub const SPOOL_DIR_MODE: u32 = 0o750;
 
 /// Voreinstellung für [`SpoolLimits::max_record_bytes`]: 1 MiB.
 pub const DEFAULT_MAX_RECORD_BYTES: u64 = 1024 * 1024;
+
+/// Voreinstellung für [`SpoolLimits::max_age`]: 14 Tage (PL-100 WP0.12),
+/// gleich der Retention-Klasse `dod_spool` in `harw-retention`.
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Höchstzahl der Kontextereignisse eines Beleg-Ausschnitts neben den
+/// auslösenden Ereignissen ([`slice_record`]).
+pub const MAX_CONTEXT_EVENTS: usize = 32;
+
+/// Obergrenze eines serialisierten Records mit Beleg-Ausschnitt (64 KiB),
+/// die der Sentinel an [`slice_record`] und als
+/// [`SpoolLimits::max_record_bytes`] seines Spools übergibt.
+pub const MAX_SLICE_RECORD_BYTES: u64 = 64 * 1024;
 
 /// Voreinstellung für [`SpoolLimits::max_entries`].
 pub const DEFAULT_MAX_ENTRIES: usize = 65_536;
@@ -134,12 +168,14 @@ pub const SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// kann ein übergroßer Record Leser und Triage-Kontext sprengen; ohne
 /// Eintragslimit wächst der Speicherbedarf eines Verzeichnisscans unbegrenzt.
 ///
-/// # Aufbewahrung (Opt-in, Standard: nie löschen)
+/// # Aufbewahrung (Standard: 14 Tage für konsumierte Records)
 /// `max_age` und `max_total_bytes` begrenzen die Platten-Obergrenze (ohne sie
 /// im ungünstigsten Fall `max_entries` x `max_record_bytes` = 64 GiB). Der
 /// Spool enthält sicherheitsrelevante Daten, daher gilt:
-/// - `None` (Standard) = unbegrenzt = bisheriges Verhalten: es wird nie
-///   etwas gelöscht, [`FindingSpool::sweep`] tut nichts.
+/// - Standard (PL-100 WP0.12): `max_age` = [`DEFAULT_MAX_AGE`] (14 Tage),
+///   `retention_apply == true`, kein `max_total_bytes`.
+/// - `None` für beide Grenzen = unbegrenzt: es wird nie etwas gelöscht,
+///   [`FindingSpool::sweep`] tut nichts.
 /// - Auch mit gesetzten Grenzen löscht ein Sweep nur, wenn
 ///   `retention_apply == true`; sonst ist er ein reiner Bericht (Trockenlauf).
 /// - Gelöscht werden nur **konsumierte** Records (Kennung <= Cursor, den der
@@ -160,12 +196,14 @@ pub struct SpoolLimits {
     pub max_record_bytes: u64,
     /// Maximale Anzahl Records im Spool; [`FindingSpool::put`] lehnt darüber ab.
     pub max_entries: usize,
-    /// Records, deren Datei älter ist, sind löschbar (Opt-in, siehe oben).
+    /// Records, deren Datei älter ist, sind löschbar (Standard:
+    /// [`DEFAULT_MAX_AGE`], siehe oben).
     pub max_age: Option<Duration>,
     /// Summe der Record-Bytes, über der die ältesten löschbaren Records
     /// entfernt werden (Opt-in, siehe oben).
     pub max_total_bytes: Option<u64>,
-    /// `false` (Standard): Sweep ist ein Trockenlauf und löscht nie.
+    /// `true` (Standard): ein Sweep löscht; `false` macht ihn zum
+    /// Trockenlauf, der nur berichtet.
     pub retention_apply: bool,
     /// `false` (Standard): unkonsumierte Records werden nie gelöscht.
     pub delete_unconsumed: bool,
@@ -176,9 +214,9 @@ impl Default for SpoolLimits {
         Self {
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
             max_entries: DEFAULT_MAX_ENTRIES,
-            max_age: None,
+            max_age: Some(DEFAULT_MAX_AGE),
             max_total_bytes: None,
-            retention_apply: false,
+            retention_apply: true,
             delete_unconsumed: false,
         }
     }
@@ -444,6 +482,9 @@ pub enum SpoolError {
         /// Die Kennung.
         id: SpoolId,
     },
+    /// Der Beleg-Ausschnitt eines Records ließ sich nicht kodieren
+    /// ([`slice_record`]).
+    Evidence(SignalsError),
 }
 
 /// Ergebnis-Alias dieses Moduls.
@@ -506,6 +547,9 @@ impl fmt::Display for SpoolError {
                 f,
                 "finding spool: record content does not match the digest in its name {id}"
             ),
+            Self::Evidence(_) => {
+                f.write_str("finding spool: the evidence slice of a record could not be encoded")
+            }
         }
     }
 }
@@ -516,6 +560,7 @@ impl std::error::Error for SpoolError {
             Self::Io { source, .. } => Some(source),
             Self::Encode(source) | Self::InvalidRecord(source) => Some(source),
             Self::Decode { source, .. } => Some(source),
+            Self::Evidence(source) => Some(source),
             Self::SymlinkRejected { .. }
             | Self::NotADirectory { .. }
             | Self::InsecurePermissions { .. }
@@ -541,6 +586,87 @@ fn io_err<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> Spo
         op,
         path: path.to_path_buf(),
         source,
+    }
+}
+
+/// Friert einen geprüften Befund mit einem begrenzten Beleg-Ausschnitt ein
+/// (PL-100 WP0.12).
+///
+/// # Description
+/// Statt des ganzen Ereignis-Rings trägt der Record nur die auslösenden
+/// Ereignisse (`triggers`, in dieser Reihenfolge) und dahinter die jüngsten
+/// höchstens [`MAX_CONTEXT_EVENTS`] Ereignisse aus `context` (in ihrer
+/// Reihenfolge); Samples gehen nicht ein. Ist der serialisierte Record
+/// größer als `max_record_bytes`, wird zuerst der Kontext halbiert (die
+/// jüngsten bleiben), bis keiner mehr übrig ist, danach die Zahl der
+/// auslösenden Ereignisse (die ersten bleiben), bis eines übrig ist. Der
+/// Aufrufer übergibt in `context` keine auslösenden Ereignisse; diese
+/// Funktion entfernt keine Dubletten.
+///
+/// # Arguments
+/// - `finding` (`&Finding<RuleChecked>`): der geprüfte Befund.
+/// - `triggers` (`&[SecurityEvent]`): die auslösenden Ereignisse.
+/// - `context` (`&[SecurityEvent]`): Kontextkandidaten, älteste zuerst.
+/// - `captured_at` (`Timestamp`): Erfassungszeit des Ausschnitts.
+/// - `max_record_bytes` (`u64`): Obergrenze des serialisierten Records (im
+///   Sentinel [`MAX_SLICE_RECORD_BYTES`]).
+///
+/// # Returns
+/// Den Record, dessen JSON-Form höchstens `max_record_bytes` Bytes lang ist.
+///
+/// # Errors
+/// - [`SpoolError::RecordTooLarge`]: schon der Record mit höchstens einem
+///   auslösenden Ereignis und ohne Kontext ist zu groß.
+/// - [`SpoolError::Evidence`]: der Ausschnitt ließ sich nicht kodieren.
+/// - [`SpoolError::Encode`]: der Record ließ sich nicht serialisieren.
+///
+/// # Concurrency
+/// Reine Funktion ohne geteilten Zustand. Die Arbeit ist durch höchstens
+/// `log2(MAX_CONTEXT_EVENTS) + log2(triggers.len()) + 2` Serialisierungen
+/// begrenzt.
+///
+/// # Examples
+/// ```rust,ignore
+/// let record = slice_record(&finding, &[trigger], &ring_tail, now, MAX_SLICE_RECORD_BYTES)?;
+/// assert!(serde_json::to_vec(&record)?.len() as u64 <= MAX_SLICE_RECORD_BYTES);
+/// ```
+pub fn slice_record(
+    finding: &Finding<RuleChecked>,
+    triggers: &[SecurityEvent],
+    context: &[SecurityEvent],
+    captured_at: Timestamp,
+    max_record_bytes: u64,
+) -> SpoolResult<FindingRecord> {
+    let newest_start = context.len().saturating_sub(MAX_CONTEXT_EVENTS);
+    let context = context.get(newest_start..).unwrap_or(&[]);
+    let mut trigger_count = triggers.len();
+    let mut context_count = context.len();
+    loop {
+        let kept_triggers = triggers.get(..trigger_count).unwrap_or(&[]);
+        let kept_context = context
+            .get(context.len().saturating_sub(context_count)..)
+            .unwrap_or(&[]);
+        let mut events = Vec::with_capacity(trigger_count.saturating_add(context_count));
+        events.extend_from_slice(kept_triggers);
+        events.extend_from_slice(kept_context);
+        let evidence = SecurityEvidence::capture(Vec::new(), events, captured_at)
+            .map_err(SpoolError::Evidence)?;
+        let record = finding.record(evidence);
+        let encoded = serde_json::to_vec(&record).map_err(SpoolError::Encode)?;
+        let len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+        if len <= max_record_bytes {
+            return Ok(record);
+        }
+        if context_count > 0 {
+            context_count /= 2;
+        } else if trigger_count > 1 {
+            trigger_count /= 2;
+        } else {
+            return Err(SpoolError::RecordTooLarge {
+                len,
+                limit: max_record_bytes,
+            });
+        }
     }
 }
 
@@ -618,7 +744,8 @@ impl FindingSpool {
     /// # Description
     /// Sind `max_age`/`max_total_bytes` gesetzt, läuft direkt nach dem Öffnen
     /// ein [`FindingSpool::sweep`] (Ergebnis: [`FindingSpool::open_report`]).
-    /// Ohne gesetzte Grenzen (Standard) geschieht nichts.
+    /// Ohne gesetzte Grenzen geschieht nichts; mit [`SpoolLimits::default`]
+    /// löscht er konsumierte Records, die älter als [`DEFAULT_MAX_AGE`] sind.
     ///
     /// # Arguments
     /// - `consumed` (`Option<&SpoolCursor>`): alles bis einschließlich dieser
@@ -894,7 +1021,10 @@ impl FindingSpool {
     /// # Description
     /// Serialisiert `record` als JSON, prüft Größe und Selbstkonsistenz
     /// (Rundreise durch die prüfende Deserialisierung), vergibt die nächste
-    /// Folgenummer und schreibt atomar mit [`RECORD_FILE_MODE`].
+    /// Folgenummer und schreibt atomar mit [`RECORD_FILE_MODE`]. Der Sentinel
+    /// übergibt nur Records mit begrenztem Beleg-Ausschnitt
+    /// ([`slice_record`]), nie den ganzen Ring, und ruft `put` auf einem
+    /// eigenen Schreibthread auf (siehe `harw-sentinel`, `spool_writer`).
     ///
     /// # Arguments
     /// - `record` (`&FindingRecord`): der abzulegende Record.
