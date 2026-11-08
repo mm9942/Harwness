@@ -32,12 +32,17 @@
 //!   through `harw_session_store::retention::StoreClass::DodVerdicts`, which
 //!   calls `VerdictStore::apply_retention` (PL-100 WP 2.3). To make that hold
 //!   for every generic sweeper, the class **resolves no directory**:
-//!   [`ResolvedClass::sweep`](crate::ResolvedClass::sweep) (the `harw cleanup`
-//!   job) finds nothing to delete, even opted in, and reports no directory
-//!   for the class. A sweeper that should apply verdict retention routes the
-//!   class to the store sweep instead. Its limits are exactly those the store
-//!   enforces (90 days by age, no byte, count or `keep_newest` limit); the
-//!   store sweep refuses an override instead of ignoring it.
+//!   [`ResolvedClass::sweep`](crate::ResolvedClass::sweep) finds nothing to
+//!   delete, even opted in, and reports no directory for the class. The
+//!   `harw cleanup` job (`harw_ops::retention_job`) therefore never calls
+//!   `ResolvedClass::sweep` for it: like every store-owned class
+//!   (`harw_session_store::retention::StoreClass::from_id`) it routes the
+//!   class to `harw_session_store::retention::retention_sweep`, in dry run
+//!   and apply. A dry run there asks the store for its read-only plan
+//!   (`VerdictStore::plan_retention`) and reports the segments and records
+//!   an apply would remove. Its limits are exactly those the store enforces
+//!   (90 days by age, no byte, count or `keep_newest` limit); the store
+//!   sweep refuses an override instead of ignoring it.
 //! - `dod_labels`: human-signed labels (`<home>/dod/labels`). No age limit —
 //!   a label ends by its own expiry, never by file age — but a bounded count.
 //!   Dropping a label can only re-enable notices, never suppress one.
@@ -200,10 +205,11 @@ harw_macros::retention_classes! {
     /// segments `verdicts-<seq>.jsonl` only; store-owned: no directory for
     /// the generic sweeper, applied only via
     /// `harw_session_store::retention::StoreClass::DodVerdicts`
-    /// (`VerdictStore::apply_retention`), never file by file. The limits are
-    /// the store's own: age only, and once every segment has expired the
-    /// store keeps none (only its chain anchor), hence `keep_newest = 0`. An
-    /// override is refused there.
+    /// (`VerdictStore::apply_retention`; a dry run reports the store's
+    /// read-only `VerdictStore::plan_retention`), never file by file. The
+    /// limits are the store's own: age only, and once every segment has
+    /// expired the store keeps none (only its chain anchor), hence
+    /// `keep_newest = 0`. An override is refused there.
     dod_verdicts: security_relevant {
         dir = dod_verdict_dirs,
         name = prefix_suffix("verdicts-", ".jsonl"),
@@ -318,9 +324,10 @@ mod tests {
         Ok(())
     }
 
-    /// PL-100 WP 2.3: the generic sweeper (`ResolvedClass::sweep`, the
-    /// `harw cleanup` job) never deletes a verdict segment, not even an old
-    /// one with the class opted in: the class resolves no directory.
+    /// PL-100 WP 2.3: the generic sweeper (`ResolvedClass::sweep`; the
+    /// `harw cleanup` job routes this class to the store sweep instead) never
+    /// deletes a verdict segment, not even an old one with the class opted
+    /// in: the class resolves no directory.
     #[test]
     fn test_dod_verdicts_generic_sweep_never_touches_the_chain() -> TestResult {
         let home = tempfile::tempdir().map_err(ctx("tempdir"))?;

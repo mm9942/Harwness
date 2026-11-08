@@ -593,10 +593,12 @@ fn sweep_store_class(
     let cfg = config
         .class_config(id)
         .ok_or_else(|| RetentionError::UnknownClass(id.to_owned()))?;
-    // Der Probelauf von `dod_verdicts` prüft nur Kette und Overrides (der
-    // `VerdictStore` hat keine Plan-API): seine Segmentzahlen sind dann
-    // unbekannt, nicht 0. Alle anderen Store-Klassen planen echt.
-    let segments_planned = store_class != StoreClass::DodVerdicts || mode != SweepMode::DryRun;
+    // Jede Store-Klasse plant echt, auch der Probelauf von `dod_verdicts`:
+    // er fragt `VerdictStore::plan_retention` (nur lesend) und meldet genau
+    // die Segment- und Datensatzzahlen, die `apply` zur selben Zeit melden
+    // würde. `planned` bleibt im Ergebnis (immer `true`), damit dessen Form
+    // stabil bleibt.
+    let segments_planned = true;
     let targets = store_targets(store_class, class, roots);
     let mut dirs = Vec::with_capacity(targets.len());
     for target in targets {
@@ -1033,13 +1035,18 @@ mod tests {
             .map_err(ctx("timestamp arithmetic"))
     }
 
-    // Drei Ein-Datensatz-Segmente, 200 und 198 Tage alt und frisch: ein
-    // Segment endet, sobald der nächste Datensatz einen Tag jünger ist als
-    // sein erster.
+    // Drei Ein-Datensatz-Segmente, 93 und 91 Tage alt (abgelaufen) und 4
+    // Tage alt (frisch), ohne Anker: ein Segment endet, sobald der nächste
+    // Datensatz einen Tag jünger ist als sein erster. Die Daten halten die
+    // Retention, die `append` beim Segmentwechsel selbst ausführt, aus der
+    // Vorlage heraus: beginnt der frische Datensatz Segment 3, sieht sie (mit
+    // seinem `created_at` als Jetzt) nur Segment 1, das dann erst 89 Tage alt
+    // ist. Mit 200/198/0 Tagen hätte sie Segment 1 schon dort entfernt und
+    // einen Anker geschrieben.
     fn verdict_store(home: &Path) -> TestResult<VerdictStore> {
         let store = VerdictStore::new(home);
         let now = Timestamp::now();
-        for (rationale, days) in [("reason-0", 200), ("reason-1", 198), ("reason-2", 0)] {
+        for (rationale, days) in [("reason-0", 93), ("reason-1", 91), ("reason-2", 4)] {
             store
                 .append(&new_verdict(rationale, days_ago(now, days)?)?)
                 .map_err(ctx("append verdict"))?;
@@ -1151,16 +1158,24 @@ mod tests {
         Ok(())
     }
 
-    /// Ein Probelauf über alle Klassen (`harw cleanup` ohne `--class`)
-    /// erreicht den `VerdictStore`, prüft die Kette nur und löscht nichts,
-    /// auch mit Opt-in. Der Store hat keine Plan-API: obwohl zwei Segmente
-    /// fällig sind, meldet der Probelauf ihre Zahl als unbekannt (`null`,
-    /// `planned: false`), nie als 0; andere Store-Klassen planen weiter echt.
+    /// Review 4505256692: ein Probelauf über alle Klassen (`harw cleanup` ohne
+    /// `--class`) erreicht den `VerdictStore` und meldet über dessen
+    /// Plan-API (`plan_retention`, nur lesend) genau, was `apply` ausmustern
+    /// würde: die zwei fälligen Segmente mit ihren zwei Datensätzen
+    /// (`planned: true`). Er löscht nichts und schreibt keinen Anker, auch
+    /// mit Opt-in; danach mustert `apply` genau diese Zahl aus.
     #[test]
     fn dod_verdicts_dry_run_reaches_the_store_and_deletes_nothing() -> TestResult {
         let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
         let store = verdict_store(home.path())?;
         let before = verdict_segments(&store)?;
+        // Voraussetzung, damit eine geänderte Vorlage (oder Retention beim
+        // Anhängen) nicht unbemerkt die Erwartung 2/2 verschiebt: drei
+        // Segmente, noch kein Anker.
+        ensure(
+            before.len() == 3 && !store.root().join("anchor.json").exists(),
+            "verdict fixture: three segments and no anchor",
+        )?;
         let config = RetentionConfig {
             dod_verdicts: verdicts_enabled(),
             ..RetentionConfig::default()
@@ -1169,28 +1184,35 @@ mod tests {
 
         let value = run(&spec)?;
         assert_eq!(text(&value, "/mode")?, "dry_run");
-        assert!(
-            field(&value, "/removed_segments")?.is_null(),
-            "unknown, not 0"
+        assert_eq!(
+            number(&value, "/removed_segments")?,
+            2,
+            "planned, not unknown"
         );
-        assert!(
-            field(&value, "/removed_records")?.is_null(),
-            "unknown, not 0"
-        );
+        assert_eq!(number(&value, "/removed_records")?, 2);
         assert_eq!(number(&value, "/errors")?, 0);
         assert_eq!(number(&value, "/failed_dirs")?, 0);
         let verdicts = class_entry(&value, "dod_verdicts")?;
         assert_eq!(number(verdicts, "/dirs/0/errors")?, 0, "the chain verifies");
-        assert_eq!(field(verdicts, "/dirs/0/planned")?.as_bool(), Some(false));
-        assert!(field(verdicts, "/dirs/0/removed_segments")?.is_null());
-        assert!(field(verdicts, "/dirs/0/removed_records")?.is_null());
+        assert_eq!(field(verdicts, "/dirs/0/planned")?.as_bool(), Some(true));
+        assert_eq!(number(verdicts, "/dirs/0/removed_segments")?, 2);
+        assert_eq!(number(verdicts, "/dirs/0/removed_records")?, 2);
         let freeze = class_entry(&value, "freeze_resolved")?;
         assert_eq!(field(freeze, "/dirs/0/planned")?.as_bool(), Some(true));
         assert_eq!(number(freeze, "/dirs/0/removed_segments")?, 0);
         assert_eq!(verdict_segments(&store)?, before, "nothing was deleted");
-        assert!(!store.root().join("anchor.json").exists());
+        assert!(
+            !store.root().join("anchor.json").exists(),
+            "no anchor written"
+        );
         let summary = store.verify_chain().map_err(ctx("verify chain"))?;
         assert_eq!(summary.records, 3);
+
+        // The plan holds: `apply` retires exactly what the dry run reported.
+        let applied = run(&verdict_spec(home.path(), verdicts_enabled(), true))?;
+        assert_eq!(number(&applied, "/removed_segments")?, 2);
+        assert_eq!(number(&applied, "/removed_records")?, 2);
+        assert_eq!(verdict_segments(&store)?.len(), 1);
         Ok(())
     }
 

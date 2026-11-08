@@ -5,9 +5,11 @@
 //! `retention_sweep` im Job-System ein (`harw_ops::retention_job`) und gibt
 //! sofort die Auftrags-ID aus. Status, Abbruch und Ergebnis laufen über
 //! `harw jobs`. Ohne `--apply` ist es ein Probelauf, der nur meldet;
-//! sicherheitsrelevante Klassen (DoD-Spool, Sentinel-Export, Freeze-Records,
-//! Session-Transkripte) werden auch mit `--apply` nur gelöscht, wenn
-//! `[retention.<klasse>] enabled = true` ausdrücklich gesetzt ist.
+//! sicherheitsrelevante Klassen (DoD-Spool, Sentinel-Export, DoD-Verdicts
+//! `dod_verdicts`, DoD-Labels `dod_labels`, Freeze-Records,
+//! Session-Transkripte und deren Korrupt-Backups) sind Opt-in: sie werden
+//! auch mit `--apply` nur gelöscht, wenn `[retention.<klasse>] enabled =
+//! true` ausdrücklich gesetzt ist.
 
 use crate::cli::GlobalArgs;
 use crate::jobs_cmd::working_dir;

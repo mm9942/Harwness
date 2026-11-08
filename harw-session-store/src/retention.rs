@@ -20,14 +20,21 @@
 //! (an [`ItemError`], nothing deleted) instead of being silently ignored,
 //! so an operator who asked to keep evidence longer never loses it early. A
 //! broken chain is reported as an [`ItemError`] in
-//! [`StoreSweepReport::errors`]. A dry run only checks the override and the
-//! chain (read-only) and deletes nothing; the store has no plan API, so it
-//! cannot say in advance which segments an apply would remove.
+//! [`StoreSweepReport::errors`]. A dry run asks the store for its plan
+//! ([`VerdictStore::plan_retention`](crate::dod_verdict::VerdictStore::plan_retention),
+//! read-only: no lock, no anchor, no delete) and reports exactly the
+//! `removed_segments`/`removed_records` an apply at the same time would
+//! report, plus the same chain-fault [`ItemError`]; with a refused override
+//! it reports `0`, like the apply that would stop there, but still asks the
+//! store for its plan so a broken chain is reported regardless of the
+//! override.
 //!
-//! The generic sweeper of `harw-retention` (`ResolvedClass::sweep`, the
-//! `harw cleanup` job) never sees a verdict segment: the `dod_verdicts` class
-//! resolves no directory there. Verdict retention runs only through
-//! [`retention_sweep`] with [`StoreClass::DodVerdicts`].
+//! The generic sweeper of `harw-retention` (`ResolvedClass::sweep`) never
+//! sees a verdict segment: the `dod_verdicts` class resolves no directory
+//! there. Verdict retention runs only through [`retention_sweep`] with
+//! [`StoreClass::DodVerdicts`]; the `harw cleanup` job
+//! (`harw_ops::retention_job`) routes every store-owned class there via
+//! [`StoreClass::from_id`], in both modes.
 //!
 //! The age/count/bytes/`keep_newest` *selection* is `harw_retention::sweep`
 //! run as a dry plan; this module then adds the store-specific safety checks
@@ -66,7 +73,7 @@ use harw_retention::{
 };
 use harw_types::SessionId;
 
-use crate::dod_verdict::{VERDICT_RETENTION, VerdictStore};
+use crate::dod_verdict::{VERDICT_RETENTION, VerdictRetentionReport, VerdictStore};
 use crate::freeze::{FreezeResolution, FreezeStore};
 use crate::store::{lock_transcript, safe_session_component};
 
@@ -82,7 +89,8 @@ pub enum StoreClass {
     FreezeResolved,
     /// `dod_verdicts`: the chained [`VerdictStore`] below
     /// `<home>/dod/verdicts` (PL-100 WP 2.3). Its apply step always goes
-    /// through [`VerdictStore::apply_retention`], never through a
+    /// through [`VerdictStore::apply_retention`] (its dry run through the
+    /// read-only [`VerdictStore::plan_retention`]), never through a
     /// file-by-file delete (see the module docs); a generic sweeper must
     /// route this class here instead of deleting its files itself.
     DodVerdicts,
@@ -111,9 +119,12 @@ impl StoreClass {
     /// The store class for a `harw-retention` class id, if the session store
     /// owns that class.
     ///
-    /// Meant for a generic sweeper (such as the `harw cleanup` job) that
-    /// routes store-owned classes to [`retention_sweep`] instead of deleting
-    /// their files directly. For [`StoreClass::DodVerdicts`] that routing is
+    /// Meant for a generic sweeper that routes store-owned classes to
+    /// [`retention_sweep`] instead of deleting their files directly. The
+    /// production caller is the `retention_sweep` job behind `harw cleanup`
+    /// (`harw_ops::retention_job`, per class in its handler core), which
+    /// routes every class this returns `Some` for, in dry run and apply.
+    /// For [`StoreClass::DodVerdicts`] that routing is
     /// the only way its retention runs: the class resolves no directory for
     /// `harw_retention::ResolvedClass::sweep`, so a sweeper that does not
     /// route it deletes nothing of it (it never cuts the chain).
@@ -166,11 +177,13 @@ pub struct StoreSweepReport {
     /// The deadline expired; the rest was left untouched.
     pub timed_out: bool,
     /// `dod_verdicts` only: whole verdict segments the [`VerdictStore`]
-    /// removed (expired ones and ones an earlier run had already retired).
-    /// Always `0` for other classes and in a dry run; `removed` stays empty
-    /// for this class.
+    /// removed (expired ones and ones an earlier run had already retired);
+    /// in a dry run the ones an apply at the same time would remove
+    /// ([`VerdictStore::plan_retention`]). Always `0` for other classes;
+    /// `removed` stays empty for this class.
     pub removed_segments: usize,
-    /// `dod_verdicts` only: verdict records in the removed, expired segments.
+    /// `dod_verdicts` only: verdict records in the removed (dry run: to be
+    /// removed), expired segments.
     pub removed_records: u64,
 }
 
@@ -212,7 +225,9 @@ pub fn transcript_class_config(retention_days: u32, base: &ClassConfig) -> Class
 /// I/O; nothing is deleted before its anchor is written). A `dod_verdicts`
 /// limit override and a broken chain are no `Err`: they are
 /// [`StoreSweepReport::errors`] entries (the override stops an apply before
-/// anything is deleted).
+/// anything is deleted; a dry run then reports `0`, but still a broken
+/// chain). In a dry run a refusal of the verdict store is a
+/// [`StoreSweepReport::errors`] entry as well, never an `Err`.
 pub fn retention_sweep(
     root: &Path,
     class: StoreClass,
@@ -342,11 +357,20 @@ pub fn retention_sweep_at(
 /// - Limits: the store enforces its own fixed window
 ///   ([`VERDICT_RETENTION`], age only). If the resolved class limits differ
 ///   (an override of `max_age_secs`, or any `max_bytes`/`max_files`/
-///   `keep_newest`), the difference is an [`ItemError`] naming the key, and
-///   an apply stops there: nothing is deleted (an operator who asked for a
-///   longer window keeps every verdict).
-/// - Dry run: a read-only chain check ([`VerdictStore::verify_chain`]); a
-///   broken or unreadable chain becomes an [`ItemError`]; nothing is deleted.
+///   `keep_newest`), the difference is an [`ItemError`] naming the key. An
+///   apply stops there and deletes nothing (an operator who asked for a
+///   longer window keeps every verdict); a dry run reports `0` like that
+///   apply, but still asks the store for its read-only plan, only to report
+///   a chain fault or a refusal of the store: the tamper signal of a dry run
+///   does not depend on the override.
+/// - Dry run: [`VerdictStore::plan_retention`] with `now` (read-only: no
+///   lock, no anchor, no delete). Its counts land in
+///   `removed_segments`/`removed_records` (not with a refused override, see
+///   above), and a chain fault becomes the same [`ItemError`] an apply
+///   reports, so dry run and apply cannot diverge on an unchanged store. A
+///   refusal of the store (unsafe directory, I/O) is an [`ItemError`] too
+///   (`verdict retention plan failed: …`); a dry run never fails the sweep
+///   for it.
 /// - Apply: [`VerdictStore::apply_retention`] with `now`. Its counts land in
 ///   `removed_segments`/`removed_records`; a chain fault (`fault_segment`)
 ///   becomes an [`ItemError`] on the store directory. A refusal of the store
@@ -371,7 +395,8 @@ fn verdict_sweep(
         report.timed_out = true;
         return Ok(report);
     }
-    if let Some(key) = verdict_limit_override(resolved) {
+    let refused = verdict_limit_override(resolved);
+    if let Some(key) = refused {
         report.errors.push(ItemError {
             path: store.root().to_path_buf(),
             message: format!(
@@ -380,32 +405,65 @@ fn verdict_sweep(
                  override (nothing was deleted)"
             ),
         });
+        // An apply stops here and deletes nothing.
         if apply {
             return Ok(report);
         }
-    }
-    if !apply {
-        if let Err(error) = store.verify_chain() {
-            report.errors.push(ItemError {
-                path: store.root().to_path_buf(),
-                message: format!("verdict chain check failed: {error}"),
-            });
-        }
-        return Ok(report);
     }
     let now = jiff::Timestamp::try_from(now).map_err(|error| RetentionError::Io {
         path: store.root().to_path_buf(),
         source: std::io::Error::other(format!("current time is out of range: {error}")),
     })?;
+    if !apply {
+        // Read-only plan: the same selection `apply_retention` would make at
+        // `now` (one shared computation in the store), nothing written.
+        match store.plan_retention(now) {
+            // A refused override stops the apply before the store: its
+            // counts stay `0`, but a broken chain is still reported.
+            Ok(plan) if refused.is_some() => {
+                record_verdict_fault(&mut report, &store, plan.fault_segment);
+            }
+            Ok(plan) => record_verdict_outcome(&mut report, &store, plan),
+            Err(error) => report.errors.push(ItemError {
+                path: store.root().to_path_buf(),
+                message: format!("verdict retention plan failed: {error}"),
+            }),
+        }
+        return Ok(report);
+    }
     let outcome = store
         .apply_retention(now)
         .map_err(|error| RetentionError::Io {
             path: store.root().to_path_buf(),
             source: std::io::Error::other(format!("verdict store retention refused: {error}")),
         })?;
+    record_verdict_outcome(&mut report, &store, outcome);
+    Ok(report)
+}
+
+/// Copies the counts of a verdict retention report (applied or planned) into
+/// `report` and turns a chain fault (`fault_segment`) into a content-free
+/// [`ItemError`] on the store directory: the same entry for a dry run and an
+/// apply.
+fn record_verdict_outcome(
+    report: &mut StoreSweepReport,
+    store: &VerdictStore,
+    outcome: VerdictRetentionReport,
+) {
     report.removed_segments = outcome.removed_segments;
     report.removed_records = outcome.removed_records;
-    if let Some(segment) = outcome.fault_segment {
+    record_verdict_fault(report, store, outcome.fault_segment);
+}
+
+/// Turns a chain fault (`fault_segment` of a verdict retention report) into
+/// a content-free [`ItemError`] on the store directory (only the segment
+/// number, never a record); nothing for an intact chain.
+fn record_verdict_fault(
+    report: &mut StoreSweepReport,
+    store: &VerdictStore,
+    fault_segment: Option<u64>,
+) {
+    if let Some(segment) = fault_segment {
         report.errors.push(ItemError {
             path: store.root().to_path_buf(),
             message: format!(
@@ -414,7 +472,6 @@ fn verdict_sweep(
             ),
         });
     }
-    Ok(report)
 }
 
 /// Days of [`VERDICT_RETENTION`], for messages.
@@ -1054,15 +1111,29 @@ mod tests {
             .map_err(ctx("timestamp arithmetic"))
     }
 
-    // Three one-record segments, 200 and 198 days old and fresh: a segment
-    // ends once its first record is a day older than the next record.
+    // Three one-record segments, 93 and 91 days old (expired) and 4 days old
+    // (fresh), no anchor: a segment ends once its first record is a day older
+    // than the next record. The dates keep `append`'s own retention out of
+    // the fixture: when the fresh record starts segment 3, that retention
+    // (with the fresh `created_at` as now) only looks at segment 1, which is
+    // then 89 days old, so both expired segments are still there for the
+    // sweep (with 200/198/0 days it would already have removed segment 1 and
+    // written an anchor).
     fn verdict_store(home: &Path) -> TestResult<VerdictStore> {
         let store = VerdictStore::new(home);
         let now = jiff::Timestamp::now();
-        for (rationale, days) in [("reason-0", 200), ("reason-1", 198), ("reason-2", 0)] {
+        for (rationale, days) in [("reason-0", 93), ("reason-1", 91), ("reason-2", 4)] {
             store
                 .append(&new_verdict(rationale, days_ago(now, days)?)?)
                 .map_err(ctx("append"))?;
+        }
+        // The premise of every `dod_verdicts` test below.
+        let count = segments(&store)?.len();
+        let anchored = store.root().join("anchor.json").exists();
+        if count != 3 || anchored {
+            return Err(TestError::Unexpected(format!(
+                "verdict fixture: {count} segments, anchor present: {anchored}"
+            )));
         }
         Ok(store)
     }
@@ -1074,6 +1145,16 @@ mod tests {
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
             .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    // Every entry of `dir` (any kind, dot files such as `.lock` included),
+    // sorted: an unchanged listing means nothing was created or removed.
+    fn listing(dir: &Path) -> TestResult<Vec<PathBuf>> {
+        let mut out = fs::read_dir(dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
         out.sort();
         Ok(out)
     }
@@ -1172,12 +1253,26 @@ mod tests {
         assert_ne!(tampered, text, "the rationale must be found");
         fs::write(&second, tampered)?;
 
-        // Dry run: read-only check; the fault is reported, nothing deleted.
+        // Dry run: read-only plan; the fault is reported once (the same
+        // entry as apply), the verified prefix is planned, nothing deleted.
         let dry = sweep_verdicts(temp.path(), &verdicts_enabled(), SweepMode::DryRun)
             .map_err(ctx("dry run"))?;
         assert!(dry.dry_run);
         assert_eq!(dry.errors.len(), 1, "{:?}", dry.errors);
+        assert_eq!(dry.removed_segments, 1, "the verified prefix only");
+        assert_eq!(dry.removed_records, 1);
+        let dry_fault = dry
+            .errors
+            .first()
+            .ok_or(TestError::Missing("dry-run chain fault"))?;
+        assert!(
+            dry_fault.message.contains("segment 2"),
+            "{}",
+            dry_fault.message
+        );
+        assert!(!dry_fault.message.contains("reason"), "content-free");
         assert_eq!(segments(&store)?.len(), 3);
+        assert!(!store.root().join("anchor.json").exists());
 
         // Apply: only the verified, expired prefix before the break goes.
         let report = sweep_verdicts(temp.path(), &verdicts_enabled(), SweepMode::Apply)
@@ -1191,6 +1286,7 @@ mod tests {
         assert!(fault.message.contains("segment 2"), "{}", fault.message);
         assert!(!fault.message.contains("reason"), "content-free");
         assert_eq!(fault.path, store.root());
+        assert_eq!(dry.errors, report.errors, "dry run and apply agree");
         assert!(second.exists(), "the broken segment stays visible");
         Ok(())
     }
@@ -1200,11 +1296,16 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let store = verdict_store(temp.path())?;
 
+        // A dry run needs no opt-in; it plans the two expired segments but
+        // deletes and anchors nothing.
         let dry = sweep_verdicts(temp.path(), &ClassConfig::default(), SweepMode::DryRun)
             .map_err(ctx("dry run"))?;
         assert!(dry.dry_run);
         assert!(dry.errors.is_empty(), "{:?}", dry.errors);
-        assert_eq!(dry.removed_segments, 0);
+        assert_eq!(dry.removed_segments, 2);
+        assert_eq!(dry.removed_records, 2);
+        assert_eq!(segments(&store)?.len(), 3);
+        assert!(!store.root().join("anchor.json").exists());
 
         let late = retention_sweep_at(
             temp.path(),
@@ -1223,9 +1324,34 @@ mod tests {
         Ok(())
     }
 
+    /// Review 4505256692: the dry run reports exactly what the following
+    /// apply removes (the store's own plan, no `verify_chain` guess), and it
+    /// writes nothing on the way: the directory listing stays as it was.
+    #[test]
+    fn dod_verdicts_dry_run_predicts_the_apply() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = verdict_store(temp.path())?;
+        let before = listing(store.root())?;
+
+        let dry = sweep_verdicts(temp.path(), &verdicts_enabled(), SweepMode::DryRun)
+            .map_err(ctx("dry run"))?;
+        assert!(dry.errors.is_empty(), "{:?}", dry.errors);
+        assert_eq!(listing(store.root())?, before, "the dry run wrote nothing");
+
+        let applied = sweep_verdicts(temp.path(), &verdicts_enabled(), SweepMode::Apply)
+            .map_err(ctx("apply"))?;
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        assert_eq!(dry.removed_segments, applied.removed_segments);
+        assert_eq!(dry.removed_records, applied.removed_records);
+        assert_eq!(applied.removed_segments, 2);
+        assert_eq!(segments(&store)?.len(), 1);
+        Ok(())
+    }
+
     /// PL-100 WP 2.3: an operator who opts in and asks for a longer window
     /// keeps every verdict: the override is refused, not ignored, and the
-    /// apply deletes nothing (dry run: the same error, read-only).
+    /// apply deletes nothing (dry run: the same error and `0`, read-only; on
+    /// an intact chain no further entry).
     #[test]
     fn dod_verdicts_refuse_a_limit_override_and_delete_nothing() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -1239,8 +1365,9 @@ mod tests {
         };
         for mode in [SweepMode::Apply, SweepMode::DryRun] {
             let report = sweep_verdicts(temp.path(), &longer, mode).map_err(ctx("sweep"))?;
-            assert_eq!(report.removed_segments, 0);
-            assert_eq!(report.removed_records, 0);
+            assert_eq!(report.removed_segments, 0, "{mode:?}");
+            assert_eq!(report.removed_records, 0, "{mode:?}");
+            assert_eq!(report.errors.len(), 1, "{mode:?}: {:?}", report.errors);
             let error = report
                 .errors
                 .first()
@@ -1300,6 +1427,109 @@ mod tests {
             sweep_verdicts(temp.path(), &explicit, SweepMode::Apply).map_err(ctx("apply"))?;
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.removed_segments, 2);
+        Ok(())
+    }
+
+    /// A refused override must not hide tampering: the dry run still asks
+    /// the store for its read-only plan and reports the broken chain next to
+    /// the override error, with `0` counts like the apply, which stops at the
+    /// override (one entry) and deletes nothing.
+    #[test]
+    fn dod_verdicts_dry_run_reports_a_broken_chain_despite_an_override() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = verdict_store(temp.path())?;
+        let second = segments(&store)?
+            .get(1)
+            .cloned()
+            .ok_or(TestError::Missing("second segment"))?;
+        let text = fs::read_to_string(&second)?;
+        let tampered = text.replacen("reason-1", "reason-X", 1);
+        assert_ne!(tampered, text, "the rationale must be found");
+        fs::write(&second, tampered)?;
+        let before = listing(store.root())?;
+        let longer = ClassConfig {
+            max_age_secs: Some(365 * 86_400),
+            ..verdicts_enabled()
+        };
+
+        let dry =
+            sweep_verdicts(temp.path(), &longer, SweepMode::DryRun).map_err(ctx("dry run"))?;
+        assert!(dry.dry_run);
+        assert_eq!(dry.removed_segments, 0, "the apply stops at the override");
+        assert_eq!(dry.removed_records, 0);
+        assert_eq!(dry.errors.len(), 2, "{:?}", dry.errors);
+        let refusal = dry
+            .errors
+            .first()
+            .ok_or(TestError::Missing("override error"))?;
+        assert!(
+            refusal.message.contains("max_age_secs"),
+            "{}",
+            refusal.message
+        );
+        let fault = dry.errors.get(1).ok_or(TestError::Missing("chain fault"))?;
+        assert!(fault.message.contains("segment 2"), "{}", fault.message);
+        assert!(!fault.message.contains("reason"), "content-free");
+        assert_eq!(fault.path, store.root());
+        assert_eq!(listing(store.root())?, before, "the dry run wrote nothing");
+
+        let applied =
+            sweep_verdicts(temp.path(), &longer, SweepMode::Apply).map_err(ctx("apply"))?;
+        assert_eq!(applied.errors.len(), 1, "{:?}", applied.errors);
+        assert_eq!(
+            applied.errors.first(),
+            dry.errors.first(),
+            "the same refusal"
+        );
+        assert_eq!(applied.removed_segments, 0);
+        assert_eq!(applied.removed_records, 0);
+        assert_eq!(listing(store.root())?, before, "the apply deleted nothing");
+        Ok(())
+    }
+
+    /// A refusal of the verdict store (here `dod/verdicts` replaced by a
+    /// symlink to a private directory) does not fail a dry run: it is one
+    /// `ItemError` on the store path, the counts stay `0`, and the symlink
+    /// target is never touched. An apply still fails the whole sweep.
+    #[test]
+    fn dod_verdicts_dry_run_reports_a_store_refusal_as_an_item_error() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = verdict_store(temp.path())?;
+        let root = store.root().to_path_buf();
+        let elsewhere = temp.path().join("elsewhere");
+        fs::rename(&root, &elsewhere)?;
+        std::os::unix::fs::symlink(&elsewhere, &root)?;
+        let before = listing(&elsewhere)?;
+
+        let dry = sweep_verdicts(temp.path(), &verdicts_enabled(), SweepMode::DryRun)
+            .map_err(ctx("dry run"))?;
+        assert!(dry.dry_run);
+        assert_eq!(dry.removed_segments, 0);
+        assert_eq!(dry.removed_records, 0);
+        assert_eq!(dry.errors.len(), 1, "{:?}", dry.errors);
+        let refusal = dry
+            .errors
+            .first()
+            .ok_or(TestError::Missing("store refusal"))?;
+        assert!(
+            refusal.message.starts_with("verdict retention plan failed"),
+            "{}",
+            refusal.message
+        );
+        assert!(
+            refusal.message.contains("not a real directory"),
+            "{}",
+            refusal.message
+        );
+        assert_eq!(refusal.path, root);
+        assert_eq!(listing(&elsewhere)?, before, "the dry run touched nothing");
+
+        let applied = sweep_verdicts(temp.path(), &verdicts_enabled(), SweepMode::Apply);
+        assert!(
+            matches!(applied, Err(RetentionError::Io { .. })),
+            "{applied:?}"
+        );
+        assert_eq!(listing(&elsewhere)?, before, "the apply touched nothing");
         Ok(())
     }
 }

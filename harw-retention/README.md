@@ -4,8 +4,14 @@ Retention core for ephemeral data (logs, caches, spools). Layer `I`
 (shared infrastructure); depends only on `harw-macros` and `serde`.
 
 There is no scheduler, CLI or job kind here. Later waves plug into this
-API: the maintenance job calls `ResolvedClass::sweep` per class, the CLI
-and doctor read `CLASSES` / `resolve_all` / `doctor_warning`.
+API: the maintenance job (`harw_ops::retention_job`, behind `harw cleanup`)
+calls `ResolvedClass::sweep` per class, except for the store-owned classes
+(`session_transcripts`, `session_corrupt_backups`, `freeze_resolved`,
+`dod_verdicts`), which it routes to
+`harw_session_store::retention::retention_sweep` so their store safety
+checks apply (for `dod_verdicts` the verdict chain: apply and dry-run plan
+go through the `VerdictStore`, never file by file). The CLI and doctor read
+`CLASSES` / `resolve_all` / `doctor_warning`.
 
 ## Model
 

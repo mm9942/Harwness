@@ -168,7 +168,17 @@
 //! für explizite Läufe, etwa auf einem Host, der nicht mehr anhängt; sie
 //! kennt keine solche Grenze.
 //!
-//! Nur diese API darf Segmente, den Anker oder `.lock` entfernen. Ein
+//! **Probelauf:** [`VerdictStore::plan_retention`] liefert den Bericht, den
+//! [`VerdictStore::apply_retention`] zur selben Jetzt-Zeit liefern würde,
+//! und ändert nichts (keine Sperre, kein Anlegen, kein `fchmod`, kein Anker,
+//! kein Löschen). Beide rechnen die Auswahl mit derselben reinen Funktion
+//! auf einem Durchlauf der Kette; auf einem unveränderten Store stimmen ihre
+//! Berichte deshalb überein. Der Plan ist eine Momentaufnahme ohne Sperre:
+//! ein Schreiber dazwischen kann den Stand eines späteren Laufs ändern.
+//!
+//! Nur die Retention des Stores ([`VerdictStore::apply_retention`] und die
+//! beim Anhängen) darf Segmente, den Anker oder `.lock` entfernen;
+//! [`VerdictStore::plan_retention`] entfernt nichts. Ein
 //! Werkzeug, das das Verzeichnis dateiweise nach Alter oder Größe ausdünnt
 //! (etwa ein generischer Retention-Sweep), löscht Segmente ohne neuen Anker
 //! oder `anchor.json` selbst; das ist von einer Manipulation nicht zu
@@ -987,12 +997,15 @@ pub struct VerdictChainSummary {
     pub last: Option<VerdictRef>,
 }
 
-/// Ergebnis von [`VerdictStore::apply_retention`].
+/// Ergebnis von [`VerdictStore::apply_retention`] bzw., als Vorhersage, von
+/// [`VerdictStore::plan_retention`].
 ///
 /// # Description
 /// Die Retention, die [`VerdictStore::append`] beim Segmentwechsel selbst
 /// ausführt, liefert keinen Bericht; sie meldet entfernte Segmente nur auf
-/// `info`.
+/// `info`. Ein Plan ([`VerdictStore::plan_retention`]) trägt dieselben
+/// Felder im Konjunktiv: was ein Lauf zur selben Jetzt-Zeit entfernen und
+/// verankern würde.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -1456,7 +1469,9 @@ impl VerdictStore {
     /// Wartungsjob oder einen Host, der nicht mehr anhängt, und kennt diese
     /// Grenze nicht. Sie ist der einzige zulässige Weg für ein Werkzeug, das
     /// den Store ausdünnen will (kein dateiweises Löschen, Moduldoku
-    /// „Retention“).
+    /// „Retention“). Was sie entfernen würde, sagt
+    /// [`VerdictStore::plan_retention`] vorher, ohne etwas zu ändern (dieselbe
+    /// Auswahl, dieselbe Berechnung).
     ///
     /// # Arguments
     /// - `now` (`Timestamp`): die Jetzt-Zeit aus der `Clock` des Aufrufers.
@@ -1501,6 +1516,80 @@ impl VerdictStore {
         };
         root.set_permissions(Permissions::from_mode(DIR_MODE))?;
         retention_at(&root, now)
+    }
+
+    /// Sagt vorher, was [`VerdictStore::apply_retention`] zur Jetzt-Zeit
+    /// `now` entfernen würde, ohne etwas zu ändern (Probelauf).
+    ///
+    /// # Description
+    /// Läuft die Kette ab wie ein Leser ([`VerdictStore::verify_chain`]) und
+    /// rechnet auf diesem Durchlauf mit **derselben** reinen Funktion wie
+    /// [`VerdictStore::apply_retention`] aus, was ein Lauf täte: vorher
+    /// ausgemusterte Segmente plus die längste Folge vollständig geprüfter,
+    /// ganz abgelaufener Segmente am Anfang der Kette (nie eines ab einer
+    /// Verletzung), die Datensätze darin, `first_seq` nach dem neuen Anker
+    /// und ein etwaiges [`VerdictRetentionReport::fault_segment`]. Eine
+    /// Verletzung der Kette ist wie dort kein Fehler, sondern begrenzt den
+    /// Plan auf das geprüfte Präfix; anders als dort erscheint sie nicht auf
+    /// `warn` (der Aufrufer zeigt `fault_segment` an, ein Probelauf soll
+    /// keine doppelten Warnungen erzeugen).
+    ///
+    /// Schreibt nichts: keine Sperre (`.lock` wird weder angelegt noch
+    /// gesperrt), kein Anlegen fehlender Verzeichnisse, kein `fchmod`, kein
+    /// Anker, kein Löschen, kein `fsync`. Fehlt der Store (oder ein Glied bis
+    /// `verdicts`), ist der Plan leer, wie der Bericht von
+    /// [`VerdictStore::apply_retention`] dann.
+    ///
+    /// # Arguments
+    /// - `now` (`Timestamp`): die Jetzt-Zeit aus der `Clock` des Aufrufers;
+    ///   für einen Vergleich mit einem späteren Lauf dieselbe wie dort.
+    ///
+    /// # Returns
+    /// Den [`VerdictRetentionReport`], den `apply_retention(now)` auf dem
+    /// gelesenen Stand liefern würde.
+    ///
+    /// # Errors
+    /// [`VerdictStoreError::UnsafeDirectory`],
+    /// [`VerdictStoreError::UnsafeSegment`],
+    /// [`VerdictStoreError::AnchorCorrupt`],
+    /// [`VerdictStoreError::SequenceExhausted`], [`VerdictStoreError::Io`]
+    /// (auch `NotFound`, wenn gleichzeitige Retentionen in drei Durchläufen
+    /// hintereinander ein gelistetes Segment entfernen). Eine Verletzung der
+    /// Kette ist kein Fehler (siehe oben).
+    ///
+    /// # Concurrency
+    /// Nur lesend, ohne Sperre, wie [`VerdictStore::verify_chain`]:
+    /// verschwindet ein gelistetes Segment, läuft die Kette mit neuer Liste
+    /// und neuem Anker noch einmal ab (höchstens drei Durchläufe). Der Plan
+    /// ist eine Momentaufnahme: ein gleichzeitiges Anhängen (samt seiner
+    /// Retention beim Segmentwechsel) oder eine andere Retention kann den
+    /// Stand ändern, bevor ein späteres [`VerdictStore::apply_retention`]
+    /// läuft, dessen Bericht dann abweicht. Auf einem unveränderten Store
+    /// stimmen beide Berichte überein.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// # fn demo(store: &harw_session_store::dod_verdict::VerdictStore, now: jiff::Timestamp)
+    /// #     -> harw_session_store::dod_verdict::VerdictStoreResult<()> {
+    /// let plan = store.plan_retention(now)?;
+    /// let report = store.apply_retention(now)?;
+    /// // Ohne Schreiber dazwischen derselbe Bericht.
+    /// assert_eq!(plan, report);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn plan_retention(&self, now: Timestamp) -> VerdictStoreResult<VerdictRetentionReport> {
+        retry_vanished(|| {
+            let walk = self.walk(|_| {})?;
+            let report = retention_plan(&walk, now, None)?.report;
+            tracing::debug!(
+                removed_segments = report.removed_segments,
+                removed_records = report.removed_records,
+                first_seq = report.first_seq,
+                "verdict retention planned"
+            );
+            Ok(report)
+        })
     }
 
     // Anhängen relativ zum schon geöffneten und geprüften Store-Verzeichnis
@@ -1737,8 +1826,11 @@ fn retention_locked(
 // Segmentwechsel, `append_locked`). Vorbedingung: die Sperre `lock` in `root`
 // ist gehalten, und seit `walk` hat sich höchstens ein Segment ab `before_seq`
 // geändert. `before_seq`: nur Segmente, deren erste `seq` davor liegt, kommen
-// in Frage (`None`: alle in `walk.live`). Anker und Löschen laufen nur relativ
-// zu `root`, und erst nach `ensure_lock_held`.
+// in Frage (`None`: alle in `walk.live`). Was entfernt und verankert wird,
+// rechnet allein `retention_plan` (dieselbe Funktion, die
+// `VerdictStore::plan_retention` für den Probelauf benutzt); hier wird der
+// Plan nur ausgeführt, und der Bericht ist der des Plans. Anker und Löschen
+// laufen nur relativ zu `root`, und erst nach `ensure_lock_held`.
 fn prune_expired(
     root: &File,
     lock: &File,
@@ -1746,15 +1838,85 @@ fn prune_expired(
     now: Timestamp,
     before_seq: Option<u64>,
 ) -> VerdictStoreResult<VerdictRetentionReport> {
-    let fault_segment = walk.fault.as_ref().map(|(segment_seq, _)| *segment_seq);
-    // Kandidaten sind alle Segmente in `live` vor `before_seq`, auch das
-    // letzte (aktive):
-    // ist es ganz abgelaufen, bleibt nur der Anker. Das ist sicher, weil
-    // die Sperre gehalten ist und `append_locked` eine leere `live`-Liste
-    // ab dem Anker fortsetzt (`seq = first_seq`, `prev = prev_hash`, neues
-    // Segment `first_seq`); `walk_listed` prüft eine leere Liste gegen
-    // den Anker. Bei einer Verletzung steht das verletzte Segment (und
-    // alles dahinter) gar nicht in `live`.
+    let plan = retention_plan(walk, now, before_seq)?;
+    if plan.doomed.is_empty() {
+        // Nichts auszumustern, also auch nichts zu verankern (ein neuer Anker
+        // setzt ein abgelaufenes Segment mit Datensätzen voraus).
+        return Ok(plan.report);
+    }
+    ensure_lock_held(root, lock)?;
+
+    if let Some(next) = &plan.anchor {
+        write_anchor(
+            root,
+            &VerdictAnchor {
+                version: ANCHOR_VERSION,
+                first_seq: next.seq,
+                prev_hash: next.prev,
+                anchored_at: now,
+            },
+        )?;
+    }
+
+    // `unlinkat` relativ zu `root`: auch wenn der Pfad des Store-Verzeichnisses
+    // inzwischen auf etwas anderes zeigt, wird nur hier gelöscht. Ein schon
+    // verschwundenes Segment zählt wie im Plan als entfernt.
+    for name in plan.doomed.iter().copied() {
+        match unlink_at(root.as_fd(), Path::new(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(VerdictStoreError::Io(error)),
+        }
+    }
+    root.sync_all()?;
+    tracing::info!(
+        removed_segments = plan.report.removed_segments,
+        removed_records = plan.report.removed_records,
+        first_seq = plan.report.first_seq,
+        "verdict retention applied"
+    );
+    Ok(plan.report)
+}
+
+// Was eine Retention auf einem Durchlauf täte, rein berechnet aus dem
+// Durchlauf, der Jetzt-Zeit und der Grenze (`retention_plan`). `prune_expired`
+// führt genau diesen Plan aus, `VerdictStore::plan_retention` meldet nur
+// seinen Bericht; so können Probelauf und Lauf nicht auseinanderlaufen.
+struct RetentionPlan<'walk> {
+    // Zu löschende Segmente (Dateinamen) in Löschreihenfolge: erst die
+    // ausgemusterten (vor dem Anker, aus einer unterbrochenen Retention),
+    // dann die abgelaufenen am Anfang von `walk.live`.
+    doomed: Vec<&'walk str>,
+    // Der neue Anker: `seq` und `prev_hash` hinter dem letzten Datensatz der
+    // abgelaufenen Segmente; `None`, wenn darin kein Datensatz liegt (der
+    // bisherige Anker bzw. Genesis bleibt).
+    anchor: Option<ChainCursor>,
+    // Der Bericht nach Ausführung des Plans.
+    report: VerdictRetentionReport,
+}
+
+// Berechnet den Plan der Retention auf `walk` zur Jetzt-Zeit `now`; liest und
+// schreibt nichts. `before_seq` wie bei `prune_expired`.
+//
+// Kandidaten sind alle Segmente in `walk.live` vor `before_seq`, auch das
+// letzte (aktive): ist es ganz abgelaufen, bleibt nur der Anker. Das ist
+// sicher, weil ein Lauf die Sperre hält und `append_locked` eine leere
+// `live`-Liste ab dem Anker fortsetzt (`seq = first_seq`, `prev = prev_hash`,
+// neues Segment `first_seq`); `walk_listed` prüft eine leere Liste gegen den
+// Anker. Abgelaufen ist ein Segment, dessen jüngster Datensatz mehr als
+// `VERDICT_RETENTION` vor `now` liegt (ein leeres Segment immer); gezählt wird
+// nur die Folge am Anfang. Bei einer Verletzung steht das verletzte Segment
+// (und alles dahinter) gar nicht in `live`, wird also nie gezählt; es
+// erscheint nur als `fault_segment`. Ausgemusterte Segmente (`walk.retired`)
+// zählen immer mit, auch wenn sie bis zum Löschen schon verschwunden sind.
+//
+// Fehler: `SequenceExhausted`, wenn hinter dem letzten abgelaufenen
+// Datensatz keine `seq` mehr frei ist.
+fn retention_plan(
+    walk: &Walk,
+    now: Timestamp,
+    before_seq: Option<u64>,
+) -> VerdictStoreResult<RetentionPlan<'_>> {
     let removable = walk
         .live
         .iter()
@@ -1765,69 +1927,40 @@ fn prune_expired(
                     .is_none_or(|newest| now.duration_since(newest) > VERDICT_RETENTION)
         })
         .count();
-    let removed_records = walk
-        .live
+    // Die abgelaufenen Segmente; `removable` zählt über `walk.live`, ist also
+    // nie größer als dessen Länge.
+    let expired = walk.live.get(..removable).unwrap_or_default();
+    let removed_records = expired
         .iter()
-        .take(removable)
         .fold(0_u64, |sum, stats| sum.saturating_add(stats.records));
-    if removable > 0 || !walk.retired.is_empty() {
-        ensure_lock_held(root, lock)?;
-    }
-
-    let mut first_seq = walk.summary.first_seq;
-    if let Some(last_removed) = walk
-        .live
+    let anchor = match expired.iter().rev().find_map(|stats| stats.last) {
+        Some(last_removed) => Some(ChainCursor {
+            seq: last_removed
+                .seq
+                .checked_add(1)
+                .ok_or(VerdictStoreError::SequenceExhausted)?,
+            prev: last_removed.verdict_digest,
+        }),
+        None => None,
+    };
+    let doomed: Vec<&str> = walk
+        .retired
         .iter()
-        .take(removable)
-        .rev()
-        .find_map(|stats| stats.last)
-    {
-        let next = last_removed
-            .seq
-            .checked_add(1)
-            .ok_or(VerdictStoreError::SequenceExhausted)?;
-        write_anchor(
-            root,
-            &VerdictAnchor {
-                version: ANCHOR_VERSION,
-                first_seq: next,
-                prev_hash: last_removed.verdict_digest,
-                anchored_at: now,
-            },
-        )?;
-        first_seq = next;
-    }
-
-    // `unlinkat` relativ zu `root`: auch wenn der Pfad des Store-Verzeichnisses
-    // inzwischen auf etwas anderes zeigt, wird nur hier gelöscht.
-    let mut removed_segments = 0_usize;
-    let expired = walk
-        .live
-        .iter()
-        .take(removable)
-        .map(|stats| stats.name.as_str());
-    for name in walk.retired.iter().map(String::as_str).chain(expired) {
-        match unlink_at(root.as_fd(), Path::new(name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(VerdictStoreError::Io(error)),
-        }
-        removed_segments = removed_segments.saturating_add(1);
-    }
-    if removed_segments > 0 {
-        root.sync_all()?;
-        tracing::info!(
-            removed_segments,
-            removed_records,
-            first_seq,
-            "verdict retention applied"
-        );
-    }
-    Ok(VerdictRetentionReport {
-        removed_segments,
+        .map(String::as_str)
+        .chain(expired.iter().map(|stats| stats.name.as_str()))
+        .collect();
+    let report = VerdictRetentionReport {
+        removed_segments: doomed.len(),
         removed_records,
-        first_seq,
-        fault_segment,
+        first_seq: anchor
+            .as_ref()
+            .map_or(walk.summary.first_seq, |next| next.seq),
+        fault_segment: walk.fault.as_ref().map(|(segment_seq, _)| *segment_seq),
+    };
+    Ok(RetentionPlan {
+        doomed,
+        anchor,
+        report,
     })
 }
 
@@ -2815,6 +2948,7 @@ mod tests {
     use crate::test_support::{TestError, TestResult, ctx};
     use std::fs::OpenOptions;
     use std::os::unix::fs::{MetadataExt, symlink};
+    use std::time::SystemTime;
 
     // Feste Basiszeit (2030-03-17), unabhängig von der Wanduhr.
     const BASE_SECOND: i64 = 1_900_000_000;
@@ -2978,6 +3112,40 @@ mod tests {
             .iter()
             .map(|path| std::fs::read(path).map_err(TestError::from))
             .collect()
+    }
+
+    // Name, mtime, Rechte und Inhalt (nur reguläre Dateien) jedes Eintrags
+    // von `dir`, nach Name sortiert, und davor `dir` selbst (leerer Name,
+    // mtime, Rechte). Gleich vor und nach einem Aufruf heißt: er hat in `dir`
+    // nichts angelegt, entfernt, umbenannt, beschrieben oder per `fchmod`
+    // geändert.
+    fn directory_state(dir: &Path) -> TestResult<Vec<(String, SystemTime, u32, Vec<u8>)>> {
+        let own = std::fs::metadata(dir)?;
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let meta = std::fs::symlink_metadata(entry.path())?;
+            let bytes = if meta.is_file() {
+                std::fs::read(entry.path())?
+            } else {
+                Vec::new()
+            };
+            entries.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                meta.modified()?,
+                meta.mode() & 0o7777,
+                bytes,
+            ));
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut state = vec![(
+            String::new(),
+            own.modified()?,
+            own.mode() & 0o7777,
+            Vec::new(),
+        )];
+        state.extend(entries);
+        Ok(state)
     }
 
     // Erwartet `ChainBroken { seq, reason }` aus `verify_chain` oder `append`.
@@ -4240,6 +4408,178 @@ mod tests {
         assert_eq!(report.fault_segment, None);
         assert_eq!(report.removed_segments, 2);
         Ok(())
+    }
+
+    /// Review 4505256692: der Probelauf sagt genau den Bericht voraus, den die
+    /// Retention zur selben Jetzt-Zeit liefert: abgelaufenes Präfix, alles
+    /// abgelaufen (nur der Anker bleibt) und nichts fällig; danach (verankert)
+    /// ebenso.
+    #[test]
+    fn plan_retention_matches_apply_retention() -> TestResult {
+        let now = at(BASE_SECOND)?;
+        // (alte Segmente, Segmente, entfernte Segmente, entfernte Datensätze,
+        // `first_seq` danach)
+        for (old, count, removed_segments, removed_records, first_seq) in [
+            (4_usize, 6_usize, 4_usize, 4_u64, 5_u64),
+            (3, 3, 3, 3, 4),
+            (0, 2, 0, 0, FIRST_VERDICT_SEQ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let store = store_with_segments(temp.path(), old, count, now)?;
+
+            let plan = store.plan_retention(now).map_err(ctx("plan"))?;
+            assert_eq!(plan.removed_segments, removed_segments, "{old}/{count}");
+            assert_eq!(plan.removed_records, removed_records, "{old}/{count}");
+            assert_eq!(plan.first_seq, first_seq, "{old}/{count}");
+            assert_eq!(plan.fault_segment, None, "{old}/{count}");
+            assert_eq!(
+                segment_paths(&store)?.len(),
+                count,
+                "the plan removes nothing"
+            );
+
+            let report = store.apply_retention(now).map_err(ctx("apply"))?;
+            assert_eq!(report, plan, "{old}/{count}: apply does what the plan said");
+            assert_eq!(
+                segment_paths(&store)?.len(),
+                count.saturating_sub(removed_segments)
+            );
+
+            // Danach ist nichts mehr fällig, und auch das sagen beide gleich.
+            let again = store.plan_retention(now).map_err(ctx("plan again"))?;
+            assert_eq!(again.removed_segments, 0, "{old}/{count}");
+            assert_eq!(again.first_seq, first_seq, "{old}/{count}");
+            let applied_again = store.apply_retention(now).map_err(ctx("apply again"))?;
+            assert_eq!(applied_again, again, "{old}/{count}");
+        }
+        Ok(())
+    }
+
+    /// Ausgemusterte Segmente (Absturz zwischen Anker und Löschen) zählt der
+    /// Probelauf wie die Retention mit, ohne sie zu entfernen.
+    #[test]
+    fn plan_retention_counts_retired_segments_like_apply() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let now = at(BASE_SECOND)?;
+        let store = store_with_segments(temp.path(), 2, 3, now)?;
+        let first_path = segment_paths(&store)?
+            .into_iter()
+            .next()
+            .ok_or(TestError::Missing("first segment"))?;
+        let first_bytes = std::fs::read(&first_path)?;
+        store.apply_retention(now).map_err(ctx("retention"))?;
+        // Absturz simulieren: das ausgemusterte Segment liegt wieder da.
+        std::fs::write(&first_path, &first_bytes)?;
+        std::fs::set_permissions(&first_path, Permissions::from_mode(FILE_MODE))?;
+
+        let plan = store.plan_retention(now).map_err(ctx("plan"))?;
+        assert_eq!(plan.removed_segments, 1);
+        assert_eq!(plan.removed_records, 0);
+        assert_eq!(plan.first_seq, 3);
+        assert_eq!(plan.fault_segment, None);
+        assert!(first_path.exists(), "the plan removes nothing");
+
+        let report = store.apply_retention(now).map_err(ctx("retention again"))?;
+        assert_eq!(report, plan);
+        assert!(!first_path.exists());
+        Ok(())
+    }
+
+    /// Der Probelauf schreibt nichts: keine Sperrdatei, kein Anker, keine
+    /// Tempdatei, kein Löschen, kein `fchmod`. Einträge, mtimes, Rechte und
+    /// Inhalte bleiben gleich, obwohl die Retention hier verankern und
+    /// löschen würde (Gegenprobe am Ende).
+    #[test]
+    fn plan_retention_never_writes() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let now = at(BASE_SECOND)?;
+        let store = store_with_segments(temp.path(), 4, 6, now)?;
+        let root = store.root().to_path_buf();
+        // Ohne `.lock` (ein Plan darf sie nicht anlegen) und mit `0750` (ein
+        // Schreiber nähme das per `fchmod` auf `0700` zurück; nicht für
+        // Gruppe/Andere beschreibbar, also weiter eine gültige Grenze).
+        std::fs::remove_file(root.join(LOCK_FILE))?;
+        std::fs::set_permissions(&root, Permissions::from_mode(0o750))?;
+        let before = directory_state(&root)?;
+
+        let plan = store.plan_retention(now).map_err(ctx("plan"))?;
+        assert_eq!(plan.removed_segments, 4);
+        assert_eq!(directory_state(&root)?, before, "the plan wrote nothing");
+        assert!(!root.join(LOCK_FILE).exists(), "no lock file");
+        assert!(!root.join(ANCHOR_FILE).exists(), "no anchor");
+        assert!(!root.join(ANCHOR_TEMP_FILE).exists(), "no anchor temp file");
+        assert_eq!(mode_of(&root)?, 0o750, "no fchmod");
+        assert_eq!(segment_paths(&store)?.len(), 6);
+
+        // Gegenprobe: die Retention schreibt hier tatsächlich, und zwar genau
+        // das Vorhergesagte.
+        let report = store.apply_retention(now).map_err(ctx("apply"))?;
+        assert_eq!(report, plan);
+        assert!(root.join(ANCHOR_FILE).exists());
+        assert_eq!(mode_of(&root)?, 0o700);
+        assert_eq!(segment_paths(&store)?.len(), 2);
+        Ok(())
+    }
+
+    /// Ohne Store ist der Plan leer wie der Bericht der Retention, und es
+    /// entsteht nichts: weder `state_dir` noch `dod/` noch `verdicts/`.
+    #[test]
+    fn plan_retention_on_a_missing_store_is_empty_and_creates_nothing() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let now = at(BASE_SECOND)?;
+        let empty = VerdictRetentionReport {
+            removed_segments: 0,
+            removed_records: 0,
+            first_seq: FIRST_VERDICT_SEQ,
+            fault_segment: None,
+        };
+
+        let absent = temp.path().join("absent");
+        let plan = VerdictStore::new(&absent)
+            .plan_retention(now)
+            .map_err(ctx("plan without state dir"))?;
+        assert_eq!(plan, empty);
+        assert!(!absent.exists(), "no state dir created");
+
+        // `state_dir` vorhanden, `dod/` nicht.
+        let store = VerdictStore::new(temp.path());
+        let plan = store.plan_retention(now).map_err(ctx("plan without dod"))?;
+        assert_eq!(plan, empty);
+        assert_eq!(entry_count(temp.path())?, 0, "no dod/ or verdicts/ created");
+        let report = store
+            .apply_retention(now)
+            .map_err(ctx("apply without dod"))?;
+        assert_eq!(report, plan);
+        Ok(())
+    }
+
+    /// Bei einem Kettenbruch plant der Probelauf wie die Retention nur das
+    /// geprüfte Präfix davor und meldet das verletzte Segment, ohne es oder
+    /// sonst etwas anzufassen.
+    #[test]
+    fn plan_retention_reports_the_fault_segment_like_apply() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let now = at(BASE_SECOND)?;
+        // Drei alte Segmente; das zweite ist manipuliert.
+        let store = store_with_segments(temp.path(), 3, 3, now)?;
+        let paths = segment_paths(&store)?;
+        let second = paths.get(1).ok_or(TestError::Missing("second segment"))?;
+        tamper_segment(second, "Begründung 1", "Begründung X")?;
+        let before = snapshot(&paths)?;
+
+        let plan = store.plan_retention(now).map_err(ctx("plan"))?;
+        assert_eq!(plan.fault_segment, Some(2));
+        assert_eq!(plan.removed_segments, 1, "the verified prefix only");
+        assert_eq!(plan.removed_records, 1);
+        assert_eq!(plan.first_seq, 2);
+        assert_eq!(segment_paths(&store)?, paths, "nothing removed");
+        assert_eq!(snapshot(&paths)?, before, "nothing changed");
+        assert!(!store.root().join(ANCHOR_FILE).exists(), "nothing anchored");
+
+        let report = store.apply_retention(now).map_err(ctx("apply"))?;
+        assert_eq!(report, plan);
+        assert!(second.exists(), "the broken segment stays visible");
+        expect_chain_broken(store.verify_chain(), 2, ChainBreak::RecordHashMismatch)
     }
 
     #[test]
