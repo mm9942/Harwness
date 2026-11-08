@@ -36,7 +36,7 @@
 //!
 //! let card: EvidenceCard = serde_json::from_str(
 //!     r#"{"event_counts":{"tcp_connect":3},"destination":"203.0.113.9:443",
-//!         "process":{"pid":42,"comm":"curl‮"}}"#,
+//!         "process":{"pid":42,"comm":"curl\u202e"}}"#,
 //! )?;
 //! assert_eq!(card.event_counts.get("tcp_connect"), Some(&3));
 //! assert_eq!(card.destination.map(|addr| addr.port()), Some(443));
