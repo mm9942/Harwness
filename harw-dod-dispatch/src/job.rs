@@ -55,7 +55,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::finding::{
     DispatchFinding, Hardness, Severity, is_dedup_key, is_record_digest, is_uuid_v4,
@@ -363,12 +363,24 @@ pub(crate) struct QueuedTriage {
     // Rolle des Vorfalls (schwerster Befund des ganzen Vorfalls); nur bei
     // `incident_id`.
     pub(crate) incident_role: Option<TriageRole>,
-    // Mitglieder; nie leer.
+    // Mitglieder; nie leer. Gelesen mit höchstens `MAX_JOB_MEMBERS`
+    // (`read_members`).
+    #[serde(deserialize_with = "read_members")]
     pub(crate) members: Vec<JobMember>,
     // Mindestens ein Mitglied war neu.
     pub(crate) novel: bool,
     // Mindestens ein Mitglied ist eine erneute Triage.
     pub(crate) retriage: bool,
+}
+
+// Liest die Mitglieder eines Auftrags mit höchstens `MAX_JOB_MEMBERS` (mehr
+// kann die Laufzeit nicht schreiben); das Mitglied darüber bricht das Lesen
+// ab, bevor es gelesen wird.
+fn read_members<'de, D>(deserializer: D) -> Result<Vec<JobMember>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    crate::serde_map::deserialize_vec_at_most(deserializer, MAX_JOB_MEMBERS)
 }
 
 impl QueuedTriage {

@@ -5,7 +5,9 @@
 //! eine Eingabe des Aufrufers ablehnen kann: eine ungültige
 //! [`crate::DispatchConfig`] ([`crate::DispatchConfig::validate`],
 //! [`crate::Dispatcher::new`]) und ein unbrauchbarer, persistierter
-//! [`crate::DispatchState`] ([`crate::Dispatcher::restore`]).
+//! [`crate::DispatchState`] ([`crate::Dispatcher::restore`],
+//! [`crate::DispatchState::from_json_bounded`],
+//! [`crate::DispatchState::to_json`]).
 //!
 //! Befunde selbst erzeugen nie einen Fehler: ein ungültiger Befund wird
 //! verworfen und gezählt ([`crate::DispatchAction::Dropped`]).
@@ -13,7 +15,9 @@
 //! # Inhalt
 //! Inhaltsfrei: keine Variante trägt einen Wert aus Befund oder Zustand,
 //! nur statische Feldnamen und Gründe. So kann ein manipulierter Zustand
-//! nichts über die Fehlermeldung auf ein Terminal schmuggeln.
+//! nichts über die Fehlermeldung auf ein Terminal schmuggeln; auch ein
+//! Fehler von `serde_json` (der Ausschnitte der Eingabe tragen kann) wird
+//! nicht weitergereicht.
 //!
 //! # Nebenläufigkeit
 //! `Send + Sync`, `Clone`; ohne inneren Zustand.
@@ -37,8 +41,9 @@ use std::fmt;
 /// eine kurze englische Meldung.
 ///
 /// # Errors
-/// Entsteht in [`crate::DispatchConfig::validate`], [`crate::Dispatcher::new`]
-/// und [`crate::Dispatcher::restore`].
+/// Entsteht in [`crate::DispatchConfig::validate`], [`crate::Dispatcher::new`],
+/// [`crate::Dispatcher::restore`], [`crate::DispatchState::to_json`] und
+/// [`crate::DispatchState::from_json_bounded`].
 ///
 /// # Examples
 /// ```
@@ -65,9 +70,15 @@ pub enum DispatchError {
         /// Version, die diese Crate liest ([`crate::DispatchState::VERSION`]).
         supported: u32,
     },
-    /// Der Zustand ist inkonsistent oder enthält ungültige Kennungen.
+    /// Der Zustand ist inkonsistent, enthält ungültige Kennungen oder ist
+    /// größer, als irgendeine gültige Konfiguration ihn schreiben kann.
     InvalidState {
-        /// Welcher Teil des Zustands die Prüfung nicht bestanden hat.
+        /// Welcher Teil des Zustands die Prüfung nicht bestanden hat. Eine
+        /// Größengrenze heißt „too many …" (etwa `"too many bytes"` vor dem
+        /// Dekodieren, `"too many table entries"` beim Dekodieren,
+        /// `"too many known keys"` in [`crate::Dispatcher::restore`]), eine
+        /// sonst ungültige Kodierung `"json encoding"`, ein ungültiger
+        /// Eintrag trägt den Namen seiner Tabelle (etwa `"known keys"`).
         what: &'static str,
     },
 }

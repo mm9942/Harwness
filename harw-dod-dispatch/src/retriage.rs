@@ -44,8 +44,9 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::bounds::MAX_KNOWN_KEYS_LIMIT;
 use crate::error::DispatchError;
 use crate::finding::{Hardness, TriageFingerprint, is_dedup_key, is_record_digest};
 use crate::prune::retain_greatest;
@@ -181,8 +182,29 @@ pub(crate) struct KnownKeys {
 // Persistierbarer Inhalt von `KnownKeys`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct KnownKeysState {
-    // Stand je `dedup_key`.
+    // Stand je `dedup_key` (als JSON-Objekt); gelesen mit höchstens
+    // `MAX_KNOWN_KEYS_LIMIT` Einträgen (`read_known_keys`).
+    #[serde(deserialize_with = "read_known_keys")]
     keys: BTreeMap<String, KnownFinding>,
+}
+
+// Liest die bekannten Schlüssel mit höchstens `MAX_KNOWN_KEYS_LIMIT`
+// Einträgen (mehr kann keine gültige Konfiguration schreiben); der Eintrag
+// darüber bricht das Lesen ab, bevor sein Wert gelesen wird. Ein doppelter
+// Schlüssel ist ein Fehler.
+fn read_known_keys<'de, D>(deserializer: D) -> Result<BTreeMap<String, KnownFinding>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    crate::serde_map::deserialize_object_at_most(deserializer, MAX_KNOWN_KEYS_LIMIT)
+}
+
+impl KnownKeysState {
+    // Zahl der Schlüssel in O(1), ohne einen anzusehen (Vorabprüfung in
+    // `Dispatcher::restore` gegen `MAX_KNOWN_KEYS_LIMIT`).
+    pub(crate) fn key_count(&self) -> usize {
+        self.keys.len()
+    }
 }
 
 impl KnownKeys {
@@ -298,7 +320,9 @@ impl KnownKeys {
     // (dieselbe Ordnung wie `make_room`). Ein gefallener Schlüssel gilt wieder
     // als neu, wie nach einer Verdrängung zur Laufzeit: sein nächstes
     // Auftreten wird erneut triagiert (gehört er zu einem wartenden Auftrag
-    // oder einer offenen Rückfrage, auch doppelt), nie unterdrückt.
+    // oder einer offenen Rückfrage, auch doppelt), nie unterdrückt. Mehr als
+    // `MAX_KNOWN_KEYS_LIMIT` Schlüssel lehnt `Dispatcher::restore` vorher ab,
+    // ohne einen anzusehen; Prüfung und Kürzen hier sind also begrenzt.
     pub(crate) fn import(
         ttl_secs: u32,
         max_keys: usize,

@@ -99,18 +99,27 @@
 //!
 //! # Persistenz
 //! [`Dispatcher::snapshot`] liefert einen serialisierbaren
-//! [`DispatchState`], [`Dispatcher::restore`] prüft ihn (Kennungen, Routen,
-//! Rückfragen), berechnet die Dringlichkeit jedes Auftrags neu, löst
-//! Vorfall-Bindungen an Aufträge, die es nicht (mehr) gibt, und stellt
-//! Aufträge, die beim Schnappschuss in Arbeit waren, wieder in die
-//! Warteschlange: ihre Triage-Kinder überleben einen Neustart des Aufrufers
-//! nicht. Es gelten die Grenzen der übergebenen Konfiguration, nicht die des
-//! Schnappschusses: jede Tabelle wird vor dem Bau des Dispatchers
+//! [`DispatchState`]; [`DispatchState::to_json`] kodiert ihn, und
+//! [`DispatchState::from_json_bounded`] liest ihn zurück, der einzige
+//! Leseweg (der Typ hat kein `Deserialize`): es lehnt mehr als
+//! [`crate::MAX_STATE_BYTES`] Bytes und jedes Byte außer druckbarem ASCII
+//! ohne Backslash und JSON-Leerraum ab, bevor serde läuft, und bricht das
+//! Dekodieren ab, sobald eine Tabelle ihren absoluten Höchstwert an
+//! Einträgen überschreitet (so bleibt der Speicher beim Dekodieren
+//! begrenzt, siehe [`crate::MAX_STATE_BYTES`]).
+//! [`Dispatcher::restore`] lehnt zuerst jeden Zustand ab, dessen Tabellen
+//! über ihren absoluten Höchstwerten liegen (reine Längenvergleiche, kein
+//! Eintrag wird angesehen), prüft ihn dann (Kennungen, Routen, Rückfragen),
+//! berechnet die Dringlichkeit jedes Auftrags neu, löst Vorfall-Bindungen an
+//! Aufträge, die es nicht (mehr) gibt, und stellt Aufträge, die beim
+//! Schnappschuss in Arbeit waren, wieder in die Warteschlange: ihre
+//! Triage-Kinder überleben einen Neustart des Aufrufers nicht. Unterhalb der
+//! Höchstwerte gelten die Grenzen der übergebenen Konfiguration, nicht die
+//! des Schnappschusses: jede Tabelle wird vor dem Bau des Dispatchers
 //! deterministisch auf ihre Grenze gekürzt, nach einer festen Regel je
 //! Tabelle (wo die Laufzeit verdrängt, in deren Ordnung; wo sie lebende
-//! Einträge nie verdrängt, fail-closed); ein Zustand über einer konstanten
-//! Grenze wird abgelehnt (Einzelheiten unter [`Dispatcher::restore`],
-//! „Grenzen").
+//! Einträge nie verdrängt, fail-closed). Einzelheiten unter
+//! [`Dispatcher::restore`], „Grenzen".
 //!
 //! # Nebenläufigkeit
 //! `&mut self`, keine inneren Sperren, keine Uhr, kein IO. Genau ein
@@ -162,9 +171,14 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::bounds::{
+    MAX_KNOWN_KEYS_LIMIT, MAX_PARALLEL_LIMIT, MAX_STATE_BYTES, MAX_TRACKED_CGROUPS_LIMIT,
+    QUEUE_CAPACITY_LIMIT, TableSizes, check_state_bytes, check_state_encoding,
+};
 use crate::breaker::{BreakerConfig, BreakerObservation, BreakerSet, BreakerState};
 use crate::budget::{
     BudgetClass, BudgetConfig, BudgetDecision, BudgetScope, BudgetState, PartitionedBudget,
@@ -174,13 +188,16 @@ use crate::finding::{
     DispatchFinding, DropReason, INVALID_FINDING_ID, PartitionKey, Severity, UNKNOWN_RULE,
     is_dedup_key, is_record_digest, is_sensor_id, is_uuid_v4,
 };
-use crate::group::{GroupInput, GrouperState, Grouping, IncidentGrouper, IncidentId};
+use crate::group::{
+    GroupInput, GrouperState, Grouping, IncidentGrouper, IncidentId, MAX_ENTRIES_PER_CGROUP,
+};
 use crate::job::{JobMember, MAX_JOB_MEMBERS, QueuedTriage, TriageJob, TriageJobId, TriageOutcome};
 use crate::queue::{PriorityQueue, PushOutcome, QueueState};
 use crate::retriage::{KnownKeys, KnownKeysState, ReTriagePolicy};
 use crate::route::{
     RULE_EGRESS_FLOW, RULE_SENSOR_DEGRADED, RULE_SPOOL_DEGRADED, Route, RouteTable, TriageRole,
 };
+use crate::serde_map::TOO_MANY_ENTRIES;
 
 /// Höchstzahl offener Rückfragen an den Nutzer ([`Dispatcher::resolve_ask`]).
 ///
@@ -199,16 +216,6 @@ pub const MAX_PENDING_ASKS: usize = 256;
 /// `Starved` als eines je Ursache, uid und Fenster entsteht so nur für einen
 /// Angreifer mit mehr uids, als die Tabelle fasst.
 pub const MAX_STARVED_EPISODES: usize = 256;
-
-// Höchstwert von `DispatchConfig::max_parallel`: mehr vergebene Aufträge
-// kann kein Zustand tragen, den eine gültige Konfiguration geschrieben hat
-// (`Dispatcher::restore` lehnt sie ab).
-pub(crate) const MAX_PARALLEL_LIMIT: usize = 64;
-
-// Höchstwert von `DispatchConfig::queue_capacity`: mehr wartende Aufträge
-// kann kein Zustand tragen, den eine gültige Konfiguration geschrieben hat
-// (`Dispatcher::restore` lehnt sie ab).
-pub(crate) const QUEUE_CAPACITY_LIMIT: usize = 65_536;
 
 /// Einstellungen des Dispatchers.
 ///
@@ -231,18 +238,22 @@ pub(crate) const QUEUE_CAPACITY_LIMIT: usize = 65_536;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DispatchConfig {
-    /// Höchstzahl gleichzeitig vergebener Triage-Aufträge.
+    /// Höchstzahl gleichzeitig vergebener Triage-Aufträge (höchstens
+    /// [`crate::MAX_PARALLEL_LIMIT`]).
     pub max_parallel: usize,
-    /// Kapazität der Warteschlange.
+    /// Kapazität der Warteschlange (höchstens
+    /// [`crate::QUEUE_CAPACITY_LIMIT`]).
     pub queue_capacity: usize,
     /// Gruppierungsfenster in Sekunden Ereigniszeit.
     pub group_window_secs: u32,
-    /// Höchstzahl der Cgroups im [`IncidentGrouper`].
+    /// Höchstzahl der Cgroups im [`IncidentGrouper`] (höchstens
+    /// [`crate::MAX_TRACKED_CGROUPS_LIMIT`]).
     pub max_tracked_cgroups: usize,
     /// Nach so vielen Sekunden ohne Auftreten gilt ein `dedup_key` wieder als
     /// neu.
     pub known_key_ttl_secs: u32,
-    /// Höchstzahl gespeicherter `dedup_key`s.
+    /// Höchstzahl gespeicherter `dedup_key`s (höchstens
+    /// [`crate::MAX_KNOWN_KEYS_LIMIT`]).
     pub max_known_keys: usize,
     /// So viele Sekunden nach dem letzten `sensor-degraded`- oder
     /// `spool-degraded`-Befund tragen vergebene Aufträge die Markierung
@@ -273,33 +284,44 @@ impl Default for DispatchConfig {
 impl DispatchConfig {
     /// Prüft alle Grenzen.
     ///
+    /// # Description
+    /// Die Obergrenzen der Tabellen sind die öffentlichen Konstanten
+    /// ([`crate::MAX_PARALLEL_LIMIT`], [`crate::QUEUE_CAPACITY_LIMIT`],
+    /// [`crate::MAX_TRACKED_CGROUPS_LIMIT`], [`crate::MAX_KNOWN_KEYS_LIMIT`],
+    /// [`crate::BUDGET_MAX_PARTITIONS_LIMIT`],
+    /// [`crate::BREAKER_MAX_PARTITIONS_LIMIT`]); aus ihnen folgen die
+    /// absoluten Grenzen eines persistierten Zustands
+    /// ([`crate::MAX_STATE_BYTES`], [`Dispatcher::restore`]).
+    ///
     /// # Errors
     /// [`DispatchError::InvalidConfig`] mit dem ersten verletzten Feld:
-    /// `max_parallel` 1–64, `queue_capacity` 1–65536, `group_window_secs`
-    /// 1–86400, `max_tracked_cgroups` 1–1048576, `known_key_ttl_secs`
-    /// 1–2592000, `max_known_keys` 1–4194304, `degraded_mark_secs`
+    /// `max_parallel` 1–64, `queue_capacity` 1–4096, `group_window_secs`
+    /// 1–86400, `max_tracked_cgroups` 1–8192, `known_key_ttl_secs`
+    /// 1–2592000, `max_known_keys` 1–131072, `degraded_mark_secs`
     /// 1–604800, dazu die Budget- und Breaker-Grenzen.
     pub fn validate(&self) -> Result<(), DispatchError> {
         let invalid = |field: &'static str, reason: &'static str| {
             Err(DispatchError::InvalidConfig { field, reason })
         };
+        // Die Zahlen in den Gründen nennen die Konstanten; ein Test hält
+        // beide gleich.
         if !(1..=MAX_PARALLEL_LIMIT).contains(&self.max_parallel) {
             return invalid("max_parallel", "must be between 1 and 64");
         }
         if !(1..=QUEUE_CAPACITY_LIMIT).contains(&self.queue_capacity) {
-            return invalid("queue_capacity", "must be between 1 and 65536");
+            return invalid("queue_capacity", "must be between 1 and 4096");
         }
         if !(1..=86_400).contains(&self.group_window_secs) {
             return invalid("group_window_secs", "must be between 1 and 86400");
         }
-        if !(1..=1 << 20).contains(&self.max_tracked_cgroups) {
-            return invalid("max_tracked_cgroups", "must be between 1 and 1048576");
+        if !(1..=MAX_TRACKED_CGROUPS_LIMIT).contains(&self.max_tracked_cgroups) {
+            return invalid("max_tracked_cgroups", "must be between 1 and 8192");
         }
         if !(1..=2_592_000).contains(&self.known_key_ttl_secs) {
             return invalid("known_key_ttl_secs", "must be between 1 and 2592000");
         }
-        if !(1..=1 << 22).contains(&self.max_known_keys) {
-            return invalid("max_known_keys", "must be between 1 and 4194304");
+        if !(1..=MAX_KNOWN_KEYS_LIMIT).contains(&self.max_known_keys) {
+            return invalid("max_known_keys", "must be between 1 and 131072");
         }
         if !(1..=604_800).contains(&self.degraded_mark_secs) {
             return invalid("degraded_mark_secs", "must be between 1 and 604800");
@@ -602,11 +624,25 @@ pub(crate) struct InFlight {
 /// Persistierbarer Zustand eines [`Dispatcher`].
 ///
 /// # Description
-/// Undurchsichtig bis auf Version und Zähler; serialisierbar mit jedem
-/// Serde-Format. [`Dispatcher::restore`] prüft ihn vollständig, ein
+/// Undurchsichtig bis auf Version und Zähler. [`Dispatcher::restore`] lehnt
+/// ihn ab, wenn eine Tabelle über ihrem absoluten Höchstwert liegt (bevor
+/// ein Eintrag angesehen wird), prüft ihn sonst vollständig (ein
 /// manipulierter Zustand kann also keine ungeprüfte Zeichenkette in ein
-/// Template bringen, und kürzt ihn auf die Grenzen der dort übergebenen
+/// Template bringen) und kürzt ihn auf die Grenzen der dort übergebenen
 /// Konfiguration.
+///
+/// # Persistenz
+/// Der Zustand ist untrusted. Persistiert wird mit [`DispatchState::to_json`]
+/// (bzw. jedem Serde-Format über `Serialize`), gelesen **nur** mit
+/// [`DispatchState::from_json_bounded`]. Der Typ implementiert bewusst kein
+/// `Deserialize`: ein `serde_json::from_slice`, `from_reader` oder ein
+/// anderes Format ohne Grenzen kann ihn nicht erzeugen. Der einzige Leseweg
+/// begrenzt den Speicher beim Dekodieren dreifach: höchstens
+/// [`crate::MAX_STATE_BYTES`] Bytes, nur druckbares ASCII ohne Escapes
+/// (beides geprüft, bevor serde läuft) und je Tabelle höchstens ihr
+/// absoluter Höchstwert an Einträgen (geprüft **während** des Dekodierens,
+/// bevor der Eintrag darüber gelesen wird); Einzelheiten in der Herleitung
+/// von [`crate::MAX_STATE_BYTES`].
 ///
 /// # Examples
 /// ```
@@ -618,7 +654,7 @@ pub(crate) struct InFlight {
 /// assert_eq!(restored.queue_len(), 0);
 /// # Ok::<(), harw_dod_dispatch::DispatchError>(())
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DispatchState {
     // Formatversion.
     version: u32,
@@ -639,10 +675,10 @@ pub struct DispatchState {
     // Zähler.
     counters: DispatchCounters,
     // Offene Rückfragen nach Befund-Kennung.
-    #[serde(with = "crate::serde_map")]
+    #[serde(serialize_with = "crate::serde_map::serialize")]
     pending_asks: BTreeMap<String, PendingAsk>,
     // Letzter gemeldeter Trip je Ursache und uid (Starved-Episoden).
-    #[serde(with = "crate::serde_map")]
+    #[serde(serialize_with = "crate::serde_map::serialize")]
     starved_episodes: BTreeMap<StarvedEpisodeKey, i64>,
     // Ende der Markierung „Sensoren degradiert".
     degraded_until_unix: Option<i64>,
@@ -650,6 +686,165 @@ pub struct DispatchState {
 
 // Schlüssel einer Starved-Episode: Ursache und uid der auslösenden Partition.
 type StarvedEpisodeKey = (StarvedCause, Option<u32>);
+
+// Die lesbare Form eines `DispatchState`, nur für `decode_within`: dieselben
+// Felder und Namen, aber jede Tabelle mit Eintragsgrenze beim Dekodieren
+// (hier die vergebenen Aufträge, Rückfragen und Episoden, die übrigen in
+// ihren Modulen). `DispatchState` selbst hat kein `Deserialize`, damit es
+// keinen Leseweg ohne Byte- und Eintragsgrenze gibt.
+#[derive(Deserialize)]
+struct StateRepr {
+    // Formatversion.
+    version: u32,
+    // Nächste Auftragsnummer.
+    next_job: u64,
+    // Warteschlange (höchstens `QUEUE_CAPACITY_LIMIT`, `crate::queue`).
+    queue: QueueState<QueuedTriage>,
+    // Vergebene Aufträge (höchstens `MAX_PARALLEL_LIMIT`).
+    #[serde(deserialize_with = "read_in_flight")]
+    in_flight: Vec<InFlight>,
+    // Bekannte Schlüssel (höchstens `MAX_KNOWN_KEYS_LIMIT`).
+    known: KnownKeysState,
+    // Vorfälle (höchstens `MAX_TRACKED_CGROUPS_LIMIT` Cgroups mit je
+    // `MAX_ENTRIES_PER_CGROUP` wartenden Befunden).
+    grouper: GrouperState,
+    // Budget (je Tabelle höchstens `BUDGET_MAX_PARTITIONS_LIMIT`).
+    budget: BudgetState,
+    // Breaker (höchstens `BREAKER_MAX_PARTITIONS_LIMIT`).
+    breakers: BreakerState,
+    // Zähler.
+    counters: DispatchCounters,
+    // Offene Rückfragen (höchstens `MAX_PENDING_ASKS`).
+    #[serde(deserialize_with = "read_pending_asks")]
+    pending_asks: BTreeMap<String, PendingAsk>,
+    // Starved-Episoden (höchstens `MAX_STARVED_EPISODES`).
+    #[serde(deserialize_with = "read_starved_episodes")]
+    starved_episodes: BTreeMap<StarvedEpisodeKey, i64>,
+    // Ende der Markierung „Sensoren degradiert".
+    degraded_until_unix: Option<i64>,
+}
+
+impl StateRepr {
+    // Feld für Feld; die vollständige Zerlegung ohne `..` hält beide Typen
+    // gleich (ein neues Feld auf einer Seite ist ein Compile-Fehler).
+    fn into_state(self) -> DispatchState {
+        let Self {
+            version,
+            next_job,
+            queue,
+            in_flight,
+            known,
+            grouper,
+            budget,
+            breakers,
+            counters,
+            pending_asks,
+            starved_episodes,
+            degraded_until_unix,
+        } = self;
+        DispatchState {
+            version,
+            next_job,
+            queue,
+            in_flight,
+            known,
+            grouper,
+            budget,
+            breakers,
+            counters,
+            pending_asks,
+            starved_episodes,
+            degraded_until_unix,
+        }
+    }
+}
+
+// Liest die vergebenen Aufträge mit höchstens `MAX_PARALLEL_LIMIT` (mehr
+// kann keine gültige Konfiguration schreiben); der Auftrag darüber bricht
+// das Lesen ab, bevor er gelesen wird.
+fn read_in_flight<'de, D>(deserializer: D) -> Result<Vec<InFlight>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    crate::serde_map::deserialize_vec_at_most(deserializer, MAX_PARALLEL_LIMIT)
+}
+
+// Liest die offenen Rückfragen als Paarliste mit höchstens
+// `MAX_PENDING_ASKS` Einträgen.
+fn read_pending_asks<'de, D>(deserializer: D) -> Result<BTreeMap<String, PendingAsk>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    crate::serde_map::deserialize_pairs_at_most(deserializer, MAX_PENDING_ASKS)
+}
+
+// Liest die Starved-Episoden als Paarliste mit höchstens
+// `MAX_STARVED_EPISODES` Einträgen.
+fn read_starved_episodes<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<StarvedEpisodeKey, i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    crate::serde_map::deserialize_pairs_at_most(deserializer, MAX_STARVED_EPISODES)
+}
+
+// Inhaltsfreie Marke eines Lesefehlers von `serde_json`. Die Eintragsgrenze
+// meldet `crate::serde_map` mit einer festen Meldung, die am Anfang der
+// Fehlermeldung steht (dahinter nur „at line … column …"); jede andere
+// Meldung von serde und `serde_json` beginnt mit eigenen festen Wörtern,
+// nie mit Text aus der Eingabe, kann die Marke also nicht vortäuschen. Der
+// Fehler selbst fällt weg: er kann Ausschnitte der Eingabe tragen, bis zur
+// Länge der Eingabe, und wird deshalb nur verglichen, nie kopiert.
+fn decode_failure(error: &serde_json::Error) -> &'static str {
+    if error.is_data() && starts_with_entry_limit(error) {
+        "too many table entries"
+    } else {
+        "json encoding"
+    }
+}
+
+// Ob die Meldung von `error` mit `TOO_MANY_ENTRIES` beginnt. Vergleicht die
+// Meldung, während `Display` sie schreibt, ohne sie zu speichern, und
+// bricht ab, sobald das Ergebnis feststeht: keine Allokation, gleich wie
+// lang die Meldung ist.
+fn starts_with_entry_limit(error: &serde_json::Error) -> bool {
+    let mut probe = LabelProbe {
+        rest: TOO_MANY_ENTRIES.bytes(),
+        differs: false,
+    };
+    // Bewusst verworfen: ein `Err` heißt hier nur, dass `probe` den
+    // Vergleich entschieden und das Schreiben abgebrochen hat; das Ergebnis
+    // steht in `probe`.
+    let _ = fmt::Write::write_fmt(&mut probe, format_args!("{error}"));
+    !probe.differs && probe.rest.next().is_none()
+}
+
+// Vergleicht geschriebenen Text mit dem Anfang einer festen Marke.
+struct LabelProbe {
+    // Der noch nicht verglichene Rest der Marke.
+    rest: std::str::Bytes<'static>,
+    // Der Text wich von der Marke ab.
+    differs: bool,
+}
+
+impl fmt::Write for LabelProbe {
+    // Vergleicht byteweise; `Err` beendet das Schreiben, sobald der Text
+    // abweicht oder die ganze Marke übereinstimmt (der Rest zählt nicht).
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for byte in text.bytes() {
+            match self.rest.next() {
+                Some(expected) if expected == byte => {}
+                Some(_) => {
+                    self.differs = true;
+                    return Err(fmt::Error);
+                }
+                None => return Err(fmt::Error),
+            }
+        }
+        Ok(())
+    }
+}
 
 impl DispatchState {
     /// Formatversion, die diese Crate schreibt und liest.
@@ -665,6 +860,182 @@ impl DispatchState {
     #[must_use]
     pub fn counters(&self) -> &DispatchCounters {
         &self.counters
+    }
+
+    /// Kodiert den Zustand für die Persistenz (kompaktes JSON).
+    ///
+    /// # Description
+    /// Gegenstück zu [`DispatchState::from_json_bounded`]: was diese Methode
+    /// schreibt, liest jene wieder. Eine Kodierung über
+    /// [`crate::MAX_STATE_BYTES`] schreibt sie nicht (ein gültig
+    /// konfigurierter Dispatcher erreicht sie nie, siehe die Herleitung der
+    /// Grenze), ebenso wenig eine mit einem Byte außer druckbarem ASCII ohne
+    /// Backslash. Auch das kommt nicht vor: jede Zeichenkette eines
+    /// Zustands aus [`Dispatcher::snapshot`] hat eine feste ASCII-Form ohne
+    /// `"` und `\`, ein gelesener Zustand enthält ohnehin nur solche
+    /// Zeichen, und `serde_json` schreibt dann kein Escape. So entsteht keine
+    /// Datei, die sich nicht mehr laden ließe.
+    ///
+    /// # Returns
+    /// Die Bytes; der Aufrufer schreibt sie (Ring A: kein IO hier).
+    ///
+    /// # Errors
+    /// [`DispatchError::InvalidState`] mit `"too many bytes"` über der Grenze
+    /// bzw. `"json encoding"`, falls serde scheitert oder die Kodierung
+    /// außerhalb des Zeichenvorrats von [`DispatchState::from_json_bounded`]
+    /// läge (inhaltsfrei).
+    ///
+    /// # Examples
+    /// ```
+    /// use harw_dod_dispatch::{DispatchConfig, DispatchState, Dispatcher};
+    ///
+    /// let state = Dispatcher::new(DispatchConfig::default())?.snapshot();
+    /// let bytes = state.to_json()?;
+    /// assert_eq!(DispatchState::from_json_bounded(&bytes)?, state);
+    /// # Ok::<(), harw_dod_dispatch::DispatchError>(())
+    /// ```
+    pub fn to_json(&self) -> Result<Vec<u8>, DispatchError> {
+        self.encode_within(MAX_STATE_BYTES)
+    }
+
+    /// Liest einen persistierten Zustand mit Byte- und Eintragsgrenze
+    /// (untrusted Eingabe).
+    ///
+    /// # Description
+    /// Der einzige Leseweg für persistierte Zustände (DodWatch, WP2.2);
+    /// [`DispatchState`] hat kein `Deserialize`. Drei Grenzen, alle vor der
+    /// Prüfung durch [`Dispatcher::restore`]:
+    /// 1. mehr als [`crate::MAX_STATE_BYTES`] Bytes werden abgelehnt, bevor
+    ///    serde ein Byte liest;
+    /// 2. ebenso jede Eingabe mit einem Byte außer druckbarem ASCII ohne
+    ///    Backslash (`0x20` bis `0x7E` außer `\`) und JSON-Leerraum (Tab,
+    ///    LF, CR). [`DispatchState::to_json`] schreibt nie ein anderes Byte
+    ///    (jede Zeichenkette eines gültigen Zustands hat eine feste
+    ///    ASCII-Form ohne `"` und `\`); so kommt beim Dekodieren kein Escape
+    ///    vor, und eine Fehlermeldung von serde, die eine Zeichenkette der
+    ///    Eingabe wiedergibt, ist nur um feste Wörter länger als diese;
+    /// 3. während des Dekodierens nimmt jede Tabelle (und jede innere Liste:
+    ///    wartende Befunde je Cgroup, Mitglieder je Auftrag) höchstens ihren
+    ///    absoluten Höchstwert an Einträgen auf. Paare gehen ohne
+    ///    Zwischenliste direkt in die Tabelle; folgt dem Höchstwert noch ein
+    ///    Eintrag, bricht das Dekodieren ab, bevor serde ein Byte von ihm
+    ///    parst, und der Rest der Eingabe wird nicht mehr geparst.
+    ///
+    /// Den Inhalt prüft erst [`Dispatcher::restore`]; ein hier gelesener
+    /// Zustand ist noch nicht geprüft. Die Bytes selbst liest der Aufrufer:
+    /// er liest höchstens `MAX_STATE_BYTES + 1` davon (etwa mit
+    /// `std::io::Read::take`) und übergibt sie unverändert, sonst hat schon
+    /// das Lesen einer riesigen Datei den Speicher belegt. Wie viel Speicher
+    /// das Dekodieren höchstens kostet, steht bei [`crate::MAX_STATE_BYTES`].
+    ///
+    /// # Arguments
+    /// - `bytes` (`&[u8]`): die Kodierung aus [`DispatchState::to_json`]
+    ///   (untrusted).
+    ///
+    /// # Returns
+    /// Den dekodierten, noch ungeprüften Zustand.
+    ///
+    /// # Errors
+    /// [`DispatchError::InvalidState`] mit
+    /// - `"too many bytes"` über der Bytegrenze (ohne zu dekodieren);
+    /// - `"too many table entries"`, sobald eine Tabelle beim Dekodieren
+    ///   ihren Höchstwert überschreitet;
+    /// - `"json encoding"` für jede andere ungültige Kodierung, auch für ein
+    ///   Byte außerhalb des Zeichenvorrats aus Grenze 2 (ohne zu
+    ///   dekodieren).
+    ///
+    /// Der Fehler von serde fällt weg, ohne kopiert zu werden: er kann
+    /// Ausschnitte der Eingabe tragen, der Fehler dieser Crate bleibt
+    /// inhaltsfrei. Ein Aufrufer behandelt jeden dieser Fehler als
+    /// manipulierten oder beschädigten Zustand, nie still (siehe
+    /// [`Dispatcher::restore`], „Errors").
+    ///
+    /// # Examples
+    /// ```
+    /// use harw_dod_dispatch::{DispatchConfig, DispatchError, DispatchState, Dispatcher};
+    ///
+    /// let bytes = Dispatcher::new(DispatchConfig::default())?.snapshot().to_json()?;
+    /// let state = DispatchState::from_json_bounded(&bytes)?;
+    /// // Erst `restore` prüft den Inhalt.
+    /// let restored = Dispatcher::restore(DispatchConfig::default(), state)?;
+    /// assert_eq!(restored.queue_len(), 0);
+    /// assert_eq!(
+    ///     DispatchState::from_json_bounded(b"{\"version\":").err(),
+    ///     Some(DispatchError::InvalidState { what: "json encoding" })
+    /// );
+    /// # Ok::<(), harw_dod_dispatch::DispatchError>(())
+    /// ```
+    pub fn from_json_bounded(bytes: &[u8]) -> Result<Self, DispatchError> {
+        Self::decode_within(bytes, MAX_STATE_BYTES)
+    }
+
+    // `to_json` mit wählbarer Grenze (die Tests prüfen damit die Kante).
+    fn encode_within(&self, max_bytes: usize) -> Result<Vec<u8>, DispatchError> {
+        // Der serde-Fehler fällt bewusst weg (inhaltsfreier Fehler).
+        let bytes = serde_json::to_vec(self).map_err(|_| DispatchError::InvalidState {
+            what: "json encoding",
+        })?;
+        check_state_bytes(bytes.len(), max_bytes)?;
+        // Dieselbe Prüfung wie beim Lesen: was hier durchkommt, liest
+        // `decode_within` wieder.
+        check_state_encoding(&bytes)?;
+        Ok(bytes)
+    }
+
+    // `from_json_bounded` mit wählbarer Bytegrenze: erst die Länge, dann
+    // der Zeichenvorrat (beides vor serde, `crate::bounds`, Stufe 1), dann
+    // serde mit den Eintragsgrenzen von `StateRepr`.
+    fn decode_within(bytes: &[u8], max_bytes: usize) -> Result<Self, DispatchError> {
+        check_state_bytes(bytes.len(), max_bytes)?;
+        check_state_encoding(bytes)?;
+        serde_json::from_slice::<StateRepr>(bytes)
+            .map(StateRepr::into_state)
+            .map_err(|error| DispatchError::InvalidState {
+                what: decode_failure(&error),
+            })
+    }
+
+    // Die Längen aller Tabellen, je in O(1) und ohne einen Eintrag
+    // anzusehen (Vorabprüfung in `Dispatcher::restore`).
+    fn table_sizes(&self) -> TableSizes {
+        TableSizes {
+            in_flight_jobs: self.in_flight.len(),
+            queued_jobs: self.queue.entries.len(),
+            known_keys: self.known.key_count(),
+            tracked_cgroups: self.grouper.cgroup_count(),
+            budget_partitions: self.budget.partition_count(),
+            budget_uid_reserves: self.budget.uid_reserve_count(),
+            budget_established: self.budget.established_count(),
+            budget_uid_privileges: self.budget.uid_privilege_count(),
+            breakers: self.breakers.partition_count(),
+            pending_asks: self.pending_asks.len(),
+            starved_episodes: self.starved_episodes.len(),
+        }
+    }
+
+    // Die inneren Längen: höchstens `MAX_ENTRIES_PER_CGROUP` wartende
+    // Befunde je Cgroup und `MAX_JOB_MEMBERS` Mitglieder je Auftrag. Ein
+    // Durchlauf über die Cgroups und Aufträge (nach `table_sizes` durch
+    // Konstanten begrenzt), der nur Längen liest, keinen Eintrag.
+    fn check_slot_sizes(&self) -> Result<(), DispatchError> {
+        if !self.grouper.entries_within(MAX_ENTRIES_PER_CGROUP) {
+            return Err(DispatchError::InvalidState {
+                what: "too many cgroup entries",
+            });
+        }
+        let members_ok = self
+            .queue
+            .entries
+            .iter()
+            .map(|entry| &entry.item)
+            .chain(self.in_flight.iter().map(|flight| &flight.job))
+            .all(|job| job.members.len() <= MAX_JOB_MEMBERS);
+        if !members_ok {
+            return Err(DispatchError::InvalidState {
+                what: "too many job members",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1124,75 +1495,100 @@ impl Dispatcher {
     /// gelöst (das nächste Mitglied bekommt einen neuen Auftrag).
     ///
     /// # Grenzen
-    /// Es gelten die Grenzen von `config`, auch wenn der Zustand unter
-    /// größeren geschrieben (oder manipuliert) wurde. Jede Tabelle wird
-    /// **vor** dem Bau des Dispatchers geprüft und dann deterministisch auf
-    /// genau ihre Grenze gekürzt; ein zu großer Zustand ist also nie
-    /// lebendig, und Laufzeit und Speicher danach hängen nur an `config`.
-    /// Je Tabelle gilt eine feste Regel:
-    /// - In der Ordnung ihrer Verdrängung zur Laufzeit, bei Gleichstand
-    ///   bleibt der größere Schlüssel:
-    ///   - bekannte Schlüssel (`max_known_keys`): die zuletzt gesehenen; ein
-    ///     gefallener gilt wieder als neu (höchstens eine erneute Triage, nie
-    ///     eine Unterdrückung);
-    ///   - Cgroups des [`IncidentGrouper`] (`max_tracked_cgroups`): die
-    ///     zuletzt beobachteten; die Vorfall-Kennungen laufen weiter;
-    ///   - Eimer und uid-Eimer des Budgets (`budget.max_partitions`): erst
-    ///     fallen die vollen (gleichwertig zu keinem), dann die am längsten
-    ///     unbenutzten;
-    ///   - Breaker (`breaker.max_partitions`): offene vor geschlossenen, dann
-    ///     die zuletzt benutzten ([`BreakerSet`]).
-    /// - Erstsichtungen und Vorrechte je uid des Budgets
-    ///   (`budget.max_partitions`) verdrängt die Laufzeit nie lebend (eine
-    ///   volle Tabelle nimmt nichts Neues auf). Beim Laden fallen sie
-    ///   fail-closed nach eigener Regel ([`PartitionedBudget`], „Speicher"):
-    ///   Erstsichtungen, die relativ zur jüngsten Sichtung abgelaufen sind,
-    ///   dann die zuletzt aufgenommenen, so dass die am längsten etablierten
-    ///   bleiben; Vorrechte die ältesten. Ein gefallener Eintrag kostet
-    ///   höchstens ein Vorrecht, gibt aber (bei vorwärtslaufender Zeit) keines
-    ///   zusätzlich.
-    /// - Warteschlange (`queue_capacity`) samt der zurückgestellten
-    ///   vergebenen Aufträge: die dringendsten, bei gleicher Dringlichkeit
-    ///   der früher eingereihte (FIFO; zurückgestellte kommen hinter die
-    ///   wartenden). Der Rest zählt als [`DropReason::QueueOverflow`] und
-    ///   seine Schlüssel gelten wieder als neu. Mehr vergebene Aufträge als
-    ///   `max_parallel` sind deshalb kein Fehler: nach dem Neustart ist
-    ///   keiner mehr vergeben.
-    ///
-    /// Abgelehnt ([`DispatchError::InvalidState`]) wird ein Zustand über einer
-    /// Grenze, die keine gültige Konfiguration überschreiten lässt, wenn das
-    /// Kürzen Information verlöre oder Arbeit und Speicher proportional zum
-    /// Zustand kostete:
-    /// - mehr als 64 vergebene Aufträge (Höchstwert von `max_parallel`) oder
-    ///   mehr als 65536 wartende (Höchstwert von `queue_capacity`); damit
-    ///   sind Prüfung, Sortierung und Zurückstellen der Aufträge durch
-    ///   Konstanten begrenzt;
-    /// - mehr als [`MAX_PENDING_ASKS`] Rückfragen (eine zu kürzen hieße, sie
-    ///   ohne [`DispatchAction::AskWithdrawn`] zu verlieren) oder
-    ///   [`MAX_STARVED_EPISODES`] Episoden;
-    /// - mehr als [`MAX_JOB_MEMBERS`] Mitglieder in einem Auftrag oder
-    ///   [`crate::MAX_ENTRIES_PER_CGROUP`] wartende Befunde in einer Cgroup.
-    ///
-    /// Die Schlüssel-, Cgroup-, Budget- und Breaker-Tabellen werden dagegen
-    /// auch über dem Höchstwert ihrer Grenze nur gekürzt: das geschieht an
-    /// Ort und Stelle, mit Zusatzspeicher höchstens in Höhe der aktiven
-    /// Grenze (`crate::prune`), und verliert nichts, was die Laufzeit nicht
-    /// ebenso verlieren dürfte.
+    /// Drei Stufen, jede vollständig vor der nächsten:
+    /// 1. **Absolute Höchstwerte**, bevor ein Eintrag geprüft, gerankt oder
+    ///    gekürzt wird: je Tabelle ein Längenvergleich in O(1) gegen den
+    ///    größten Wert, den irgendeine gültige Konfiguration zulässt, bzw.
+    ///    gegen die Konstante der Crate: höchstens
+    ///    [`crate::MAX_PARALLEL_LIMIT`] vergebene und
+    ///    [`crate::QUEUE_CAPACITY_LIMIT`] wartende Aufträge,
+    ///    [`crate::MAX_KNOWN_KEYS_LIMIT`] bekannte Schlüssel,
+    ///    [`crate::MAX_TRACKED_CGROUPS_LIMIT`] Cgroups, je
+    ///    [`crate::BUDGET_MAX_PARTITIONS_LIMIT`] Eimer, uid-Eimer,
+    ///    Erstsichtungen und Vorrechte je uid,
+    ///    [`crate::BREAKER_MAX_PARTITIONS_LIMIT`] Breaker,
+    ///    [`MAX_PENDING_ASKS`] Rückfragen und [`MAX_STARVED_EPISODES`]
+    ///    Episoden. Danach ein Durchlauf über die so begrenzten Cgroups und
+    ///    Aufträge, der nur deren innere Längen liest: höchstens
+    ///    [`crate::MAX_ENTRIES_PER_CGROUP`] wartende Befunde je Cgroup und
+    ///    [`MAX_JOB_MEMBERS`] Mitglieder je Auftrag. Mehr kann die Laufzeit
+    ///    nicht schreiben; ein solcher Zustand ist manipuliert und wird mit
+    ///    [`DispatchError::InvalidState`] („too many …") abgelehnt, auch wenn
+    ///    seine Einträge zusätzlich ungültig sind. Prüfung, Ranking und
+    ///    Kürzen in den Stufen 2 und 3 kosten damit Zeit und Zusatzspeicher
+    ///    höchstens wie ein Zustand an diesen Höchstwerten.
+    /// 2. **Inhalt:** jeder Auftrag, jeder Schlüssel, jede Rückfrage und jede
+    ///    Partition wird geprüft, auch ein Eintrag, der danach gekürzt würde.
+    /// 3. **Aktive Grenzen:** es gelten die Grenzen von `config`, auch wenn
+    ///    der Zustand unter größeren geschrieben wurde. Jede Tabelle wird
+    ///    **vor** dem Bau des Dispatchers deterministisch auf genau ihre
+    ///    Grenze gekürzt (an Ort und Stelle, mit Zusatzspeicher höchstens in
+    ///    Höhe der aktiven Grenze, `crate::prune`); ein zu großer Zustand ist
+    ///    also nie lebendig, und Laufzeit und Speicher des Dispatchers danach
+    ///    hängen nur an `config`. Je Tabelle gilt eine feste Regel:
+    ///    - In der Ordnung ihrer Verdrängung zur Laufzeit, bei Gleichstand
+    ///      bleibt der größere Schlüssel:
+    ///      - bekannte Schlüssel (`max_known_keys`): die zuletzt gesehenen;
+    ///        ein gefallener gilt wieder als neu (höchstens eine erneute
+    ///        Triage, nie eine Unterdrückung);
+    ///      - Cgroups des [`IncidentGrouper`] (`max_tracked_cgroups`): die
+    ///        zuletzt beobachteten; die Vorfall-Kennungen laufen weiter;
+    ///      - Eimer und uid-Eimer des Budgets (`budget.max_partitions`):
+    ///        erst fallen die vollen (gleichwertig zu keinem), dann die am
+    ///        längsten unbenutzten;
+    ///      - Breaker (`breaker.max_partitions`): offene vor geschlossenen,
+    ///        dann die zuletzt benutzten ([`BreakerSet`]).
+    ///    - Erstsichtungen und Vorrechte je uid des Budgets
+    ///      (`budget.max_partitions`) verdrängt die Laufzeit nie lebend (eine
+    ///      volle Tabelle nimmt nichts Neues auf). Beim Laden fallen sie
+    ///      fail-closed nach eigener Regel ([`PartitionedBudget`],
+    ///      „Speicher"): Erstsichtungen, die relativ zur jüngsten Sichtung
+    ///      abgelaufen sind, dann die zuletzt aufgenommenen, so dass die am
+    ///      längsten etablierten bleiben; Vorrechte die ältesten. Ein
+    ///      gefallener Eintrag kostet höchstens ein Vorrecht, gibt aber (bei
+    ///      vorwärtslaufender Zeit) keines zusätzlich.
+    ///    - Warteschlange (`queue_capacity`) samt der zurückgestellten
+    ///      vergebenen Aufträge: die dringendsten, bei gleicher Dringlichkeit
+    ///      der früher eingereihte (FIFO; zurückgestellte kommen hinter die
+    ///      wartenden). Der Rest zählt als [`DropReason::QueueOverflow`] und
+    ///      seine Schlüssel gelten wieder als neu. Mehr vergebene Aufträge als
+    ///      `max_parallel` (bis [`crate::MAX_PARALLEL_LIMIT`]) sind deshalb
+    ///      kein Fehler: nach dem Neustart ist keiner mehr vergeben.
+    ///    - Rückfragen und Episoden haben keine Grenze aus `config`; über
+    ///      ihrer Konstante lehnt schon Stufe 1 ab (eine Rückfrage zu kürzen
+    ///      hieße, sie ohne [`DispatchAction::AskWithdrawn`] zu verlieren).
     ///
     /// Eine gekürzte Warteschlange kostet je verdrängtem Mitglied nur einen
     /// Zähler und das Vergessen seines Schlüssels; Vorfall-Bindungen an
     /// verdrängte Aufträge löst ein einziger Durchlauf am Ende.
     ///
+    /// **Nicht** hier begrenzt ist der Speicher, den `state` schon belegt:
+    /// den hat das Dekodieren angelegt, bevor `restore` den Zustand sieht.
+    /// Diese Grenze zieht [`DispatchState::from_json_bounded`], der einzige
+    /// Leseweg ([`DispatchState`] hat kein `Deserialize`): höchstens
+    /// [`crate::MAX_STATE_BYTES`] Bytes vor serde und dieselben Höchstwerte
+    /// an Einträgen je Tabelle schon beim Dekodieren. Stufe 1 hier ist
+    /// deshalb für dekodierte Zustände eine zweite Prüfung derselben
+    /// Grenzen, die auch einen in der Crate gebauten Zustand abdeckt.
+    ///
     /// # Arguments
     /// - `config` (`DispatchConfig`): Einstellungen.
-    /// - `state` (`DispatchState`): ein Schnappschuss.
+    /// - `state` (`DispatchState`): ein Schnappschuss (untrusted).
     ///
     /// # Errors
     /// - [`DispatchError::InvalidConfig`] aus [`DispatchConfig::validate`];
     /// - [`DispatchError::UnsupportedStateVersion`] bei fremder Version;
-    /// - [`DispatchError::InvalidState`] bei ungültigem Inhalt, auch wenn
-    ///   der ungültige Eintrag danach gekürzt worden wäre, und bei mehr
-    ///   Einträgen als eine der konstanten Grenzen erlaubt („Grenzen").
+    /// - [`DispatchError::InvalidState`] mit „too many …" bei einer Tabelle
+    ///   über ihrem absoluten Höchstwert (Stufe 1, vor jeder anderen Prüfung
+    ///   des Inhalts), sonst bei ungültigem Inhalt, auch wenn der ungültige
+    ///   Eintrag danach gekürzt worden wäre (Stufe 2).
+    ///
+    /// Ein Fehler hier oder aus [`DispatchState::from_json_bounded`] heißt:
+    /// der persistierte Zustand ist manipuliert oder beschädigt. Der
+    /// Aufrufer (DodWatch) beginnt dann mit [`Dispatcher::new`], meldet das
+    /// aber sichtbar als degradiert (THREAT-MODEL: keine stille Blindheit),
+    /// statt still neu anzufangen; die Marke `what` ist inhaltsfrei und darf
+    /// in Log und Health-Status.
     ///
     /// # Examples
     /// ```
@@ -1207,9 +1603,37 @@ impl Dispatcher {
     /// # Ok::<(), harw_dod_dispatch::DispatchError>(())
     /// ```
     pub fn restore(config: DispatchConfig, state: DispatchState) -> Result<Self, DispatchError> {
+        Self::restore_within(config, state, &TableSizes::LEGAL_MAX)
+    }
+
+    // `restore` mit wählbaren Obergrenzen für Stufe 1 („Grenzen" oben):
+    // `restore` übergibt die absoluten Höchstwerte, die Tests kleinere, um
+    // die Reihenfolge der Stufen ohne riesige Zustände zu prüfen.
+    fn restore_within(
+        config: DispatchConfig,
+        state: DispatchState,
+        bounds: &TableSizes,
+    ) -> Result<Self, DispatchError> {
         config.validate()?;
+        if state.version != DispatchState::VERSION {
+            return Err(DispatchError::UnsupportedStateVersion {
+                found: state.version,
+                supported: DispatchState::VERSION,
+            });
+        }
+        // Stufe 1, vor jeder Prüfung, jedem Ranking und jedem Kürzen: mehr
+        // Einträge, als irgendeine gültige Konfiguration zulässt, kann die
+        // Laufzeit nicht schreiben (manipuliert). Erst die Längen der
+        // Tabellen (je O(1)), dann die inneren Längen in einem Durchlauf über
+        // die damit begrenzten Cgroups und Aufträge. Ein dekodierter Zustand
+        // hält diese Grenzen schon (`from_json_bounded`); hier gelten sie
+        // für jeden Zustand. Ab hier kosten Prüfung, Kennungsliste,
+        // Sortierung, Ranking und Kürzen höchstens so viel wie ein Zustand
+        // an den Höchstwerten.
+        state.table_sizes().check_within(bounds)?;
+        state.check_slot_sizes()?;
         let DispatchState {
-            version,
+            version: _,
             next_job,
             mut queue,
             in_flight,
@@ -1222,23 +1646,8 @@ impl Dispatcher {
             starved_episodes,
             degraded_until_unix,
         } = state;
-        if version != DispatchState::VERSION {
-            return Err(DispatchError::UnsupportedStateVersion {
-                found: version,
-                supported: DispatchState::VERSION,
-            });
-        }
         if next_job < 1 {
             return Err(DispatchError::InvalidState { what: "next job" });
-        }
-        // Mehr Aufträge, als irgendeine gültige Konfiguration zulässt, kann
-        // die Laufzeit nicht schreiben: manipuliert. Ab hier sind Prüfung,
-        // Kennungsliste, Sortierung und Zurückstellen der Aufträge durch
-        // Konstanten begrenzt, nicht durch den Zustand.
-        if in_flight.len() > MAX_PARALLEL_LIMIT || queue.entries.len() > QUEUE_CAPACITY_LIMIT {
-            return Err(DispatchError::InvalidState {
-                what: "triage jobs",
-            });
         }
         let routes = RouteTable::new();
         let grouper = IncidentGrouper::import(
@@ -1281,23 +1690,18 @@ impl Dispatcher {
             })?;
         }
         // Jede Rückfrage trägt einen Befund, der die Prüfung von `offer`
-        // besteht und wirklich gefragt worden wäre (Loopback-Egress).
-        let asks_ok = pending_asks.len() <= MAX_PENDING_ASKS
-            && pending_asks.iter().all(|(finding_id, ask)| {
-                let finding = &ask.finding;
-                *finding_id == finding.finding_id
-                    && finding.loopback
-                    && routes.canonical_rule_id(&finding.rule_id) == Some(RULE_EGRESS_FLOW)
-                    && admit(finding, routes.lookup(&finding.rule_id)).is_ok_and(Route::is_ai)
-            });
+        // besteht und wirklich gefragt worden wäre (Loopback-Egress). Ihre
+        // Zahl hat Stufe 1 begrenzt.
+        let asks_ok = pending_asks.iter().all(|(finding_id, ask)| {
+            let finding = &ask.finding;
+            *finding_id == finding.finding_id
+                && finding.loopback
+                && routes.canonical_rule_id(&finding.rule_id) == Some(RULE_EGRESS_FLOW)
+                && admit(finding, routes.lookup(&finding.rule_id)).is_ok_and(Route::is_ai)
+        });
         if !asks_ok {
             return Err(DispatchError::InvalidState {
                 what: "pending asks",
-            });
-        }
-        if starved_episodes.len() > MAX_STARVED_EPISODES {
-            return Err(DispatchError::InvalidState {
-                what: "starved episodes",
             });
         }
         // Tabellen mit einer Grenze aus `config` werden hier, vor dem Bau
@@ -1932,3 +2336,12 @@ fn admit(finding: &DispatchFinding, route: Option<Route>) -> Result<Route, DropR
 #[cfg(test)]
 #[path = "restore_tests.rs"]
 mod restore_tests;
+
+// Vorabprüfung beim Wiederherstellen und begrenzte Persistenz-Kodierung
+// (PL-100 WP2.1, Review 4505196829): Kindmodul, damit die Tests
+// `restore_within`, `encode_within` und `decode_within` mit kleinen Grenzen
+// aufrufen und Zustände über den Höchstwerten direkt bauen können (das
+// Dekodieren liefert keine).
+#[cfg(test)]
+#[path = "preflight_tests.rs"]
+mod preflight_tests;

@@ -11,16 +11,16 @@ rust-version.workspace = true
 # PL-100 WP2.1: reine Dispatch-Bibliothek (Ring A, Schicht `F` in
 # `xtask/arch-policy.toml`, wie `harw-untrusted-text`). Kein IO, keine
 # Uhr (die Zeit kommt als Unix-Sekunden herein), kein async, keine Threads.
-# Einzige Abhängigkeit ist `serde` (derive über den Workspace), damit der
-# Aufrufer den Zustand persistieren kann.
 [dependencies]
+# Derive über den Workspace: der Zustand ist serialisierbar.
 serde = { workspace = true }
+# Begrenzte Persistenz-Kodierung (`DispatchState::to_json`/
+# `from_json_bounded`, Bytegrenze vor serde; Review 4505196829). Ohne IO.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # `define_test_error!` (TestError/TestResult) für panikfreie Tests.
 harw-test-support = { path = "../harw-test-support" }
-# Rundreise des Dispatch-Zustands in den Tests.
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

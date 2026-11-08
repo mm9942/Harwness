@@ -19,7 +19,10 @@
 //! Schlüssel, danach ein `retain`. Zeit `O(n log k)`; der zusätzliche
 //! Speicher ist höchstens so groß wie die Grenze der aktiven Konfiguration,
 //! nie eine Kopie der Tabelle. Geklont wird nur der eine Grenzschlüssel.
-//! Liegt die Tabelle innerhalb der Grenze, geschieht nichts.
+//! Liegt die Tabelle innerhalb der Grenze, geschieht nichts. `n` selbst
+//! begrenzt nicht diese Funktion, sondern die Vorabprüfung von
+//! [`crate::Dispatcher::restore`]: eine Tabelle über ihrem absoluten
+//! Höchstwert (`crate::bounds`) erreicht sie nie.
 //!
 //! # Nebenläufigkeit und Fehler
 //! Zustandslos; keine Fehler, keine Panik.

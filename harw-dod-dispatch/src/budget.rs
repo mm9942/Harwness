@@ -102,7 +102,10 @@
 //! fail-closed nach eigener Regel: Erstsichtungen, die relativ zur jüngsten
 //! Sichtung der Tabelle abgelaufen sind, dann die zuletzt aufgenommenen (die
 //! am längsten etablierten bleiben); Vorrechte die ältesten (solange die
-//! behaltenen laufen, gibt es kein neues).
+//! behaltenen laufen, gibt es kein neues). Mehr als
+//! [`crate::BUDGET_MAX_PARTITIONS_LIMIT`] Einträge in einer der vier
+//! Tabellen kann keine gültige Konfiguration schreiben: einen solchen
+//! Zustand lehnt `restore` ab, bevor ein Eintrag geprüft oder gekürzt wird.
 //!
 //! # Nebenläufigkeit und Fehler
 //! `&mut self`, deterministisch; Fehler nur beim Laden eines Zustands.
@@ -131,8 +134,9 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::bounds::BUDGET_MAX_PARTITIONS_LIMIT;
 use crate::error::DispatchError;
 use crate::finding::{Hardness, PartitionKey, Severity, is_sensor_id};
 use crate::prune::retain_greatest;
@@ -191,7 +195,8 @@ pub struct BudgetConfig {
     /// Partition **und** je uid in diesem Abstand; `0` schaltet das ab.
     pub established_reserve_interval_secs: u32,
     /// Höchstzahl geführter Partitionen (und ebenso uid-Reserve-Eimer,
-    /// Erstsichtungen und Vorrechte je uid).
+    /// Erstsichtungen und Vorrechte je uid); höchstens
+    /// [`crate::BUDGET_MAX_PARTITIONS_LIMIT`].
     pub max_partitions: usize,
 }
 
@@ -246,8 +251,9 @@ impl BudgetConfig {
                 "must be at most 86400",
             );
         }
-        if self.max_partitions == 0 || self.max_partitions > 1 << 20 {
-            return invalid("budget.max_partitions", "must be between 1 and 1048576");
+        // Die Zahl im Grund nennt die Konstante; ein Test hält beide gleich.
+        if !(1..=BUDGET_MAX_PARTITIONS_LIMIT).contains(&self.max_partitions) {
+            return invalid("budget.max_partitions", "must be between 1 and 32768");
         }
         Ok(())
     }
@@ -604,26 +610,78 @@ fn take_privilege(
 }
 
 // Persistierbarer Inhalt eines `PartitionedBudget` (ohne Konfiguration).
+// Jede der vier Tabellen wird mit höchstens `BUDGET_MAX_PARTITIONS_LIMIT`
+// Einträgen gelesen (`read_budget_table`, Eintragsgrenze beim Dekodieren).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BudgetState {
     // Globaler Eimer.
     global: TokenBucket,
     // Eimer je Partition.
-    #[serde(with = "crate::serde_map")]
+    #[serde(
+        serialize_with = "crate::serde_map::serialize",
+        deserialize_with = "read_budget_table"
+    )]
     partitions: BTreeMap<PartitionKey, TokenBucket>,
     // Reserve-Eimer je uid.
-    #[serde(with = "crate::serde_map")]
+    #[serde(
+        serialize_with = "crate::serde_map::serialize",
+        deserialize_with = "read_budget_table"
+    )]
     uid_reserve: BTreeMap<Option<u32>, TokenBucket>,
     // Seit der letzten Reserve-Erschöpfung noch nicht wieder aufgefüllt.
     reserve_starved: bool,
     // Beginn der laufenden Reserve-Episode.
     reserve_since_unix: Option<i64>,
     // Erstsichtungen je Partition.
-    #[serde(with = "crate::serde_map")]
+    #[serde(
+        serialize_with = "crate::serde_map::serialize",
+        deserialize_with = "read_budget_table"
+    )]
     established: BTreeMap<PartitionKey, EstablishedPartition>,
     // Letztes Reserve-Token außerhalb der Quote je uid.
-    #[serde(with = "crate::serde_map")]
+    #[serde(
+        serialize_with = "crate::serde_map::serialize",
+        deserialize_with = "read_budget_table"
+    )]
     uid_privileged: BTreeMap<Option<u32>, i64>,
+}
+
+// Liest eine Budget-Tabelle als Paarliste mit höchstens
+// `BUDGET_MAX_PARTITIONS_LIMIT` Einträgen (mehr kann keine gültige
+// Konfiguration schreiben); der Eintrag darüber bricht das Lesen ab, bevor
+// er gelesen wird.
+fn read_budget_table<'de, K, V, D>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+where
+    K: Ord + Deserialize<'de>,
+    V: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    crate::serde_map::deserialize_pairs_at_most(deserializer, BUDGET_MAX_PARTITIONS_LIMIT)
+}
+
+// Längen der vier Tabellen in O(1), ohne einen Eintrag anzusehen
+// (Vorabprüfung in `Dispatcher::restore` gegen
+// `BUDGET_MAX_PARTITIONS_LIMIT`).
+impl BudgetState {
+    // Zahl der Partitions-Eimer.
+    pub(crate) fn partition_count(&self) -> usize {
+        self.partitions.len()
+    }
+
+    // Zahl der uid-Eimer.
+    pub(crate) fn uid_reserve_count(&self) -> usize {
+        self.uid_reserve.len()
+    }
+
+    // Zahl der Erstsichtungen.
+    pub(crate) fn established_count(&self) -> usize {
+        self.established.len()
+    }
+
+    // Zahl der Vorrechte je uid.
+    pub(crate) fn uid_privilege_count(&self) -> usize {
+        self.uid_privileged.len()
+    }
 }
 
 /// Partitioniertes Budget (siehe Moduldoku).
@@ -905,6 +963,9 @@ impl PartitionedBudget {
     //   ist die Tabelle voll und `take_privilege` gibt kein Vorrecht
     //   (fail-closed). Nur bei rückwärtslaufender Zeit kann eine gefallene
     //   uid ein Vorrechts-Token früher bekommen.
+    // Mehr als `BUDGET_MAX_PARTITIONS_LIMIT` Einträge in einer Tabelle lehnt
+    // `Dispatcher::restore` vorher ab, ohne einen anzusehen; Prüfung und
+    // Kürzen hier sind also begrenzt.
     pub(crate) fn import(config: BudgetConfig, state: BudgetState) -> Result<Self, DispatchError> {
         let BudgetState {
             global,

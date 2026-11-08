@@ -538,8 +538,8 @@ fn test_state_round_trip_mid_storm_keeps_limits_trips_and_behaviour() -> TestRes
     assert_eq!(original.budget().uid_reserve_tokens(Some(1001)), Some(0));
     assert_eq!(original.in_flight_len(), 0);
 
-    let json = serde_json::to_string(&original.snapshot())?;
-    let mut restored = Dispatcher::restore(config, serde_json::from_str(&json)?)?;
+    let bytes = original.snapshot().to_json()?;
+    let mut restored = Dispatcher::restore(config, DispatchState::from_json_bounded(&bytes)?)?;
     assert_eq!(restored.snapshot(), original.snapshot());
     assert!(restored.breakers().is_tripped(&partition(1001, 66)));
 

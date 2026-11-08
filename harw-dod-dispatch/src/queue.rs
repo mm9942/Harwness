@@ -22,7 +22,8 @@
 //! bleibt das billig und der Zustand ist ein schlichter, serialisierbarer
 //! Vektor. Ein geladener Zustand kann mehr Einträge tragen als die
 //! Kapazität (etwa nach einer Verkleinerung; [`crate::Dispatcher::restore`]
-//! lässt höchstens 65536 wartende plus 64 zurückgestellte zu); er wird beim
+//! lässt höchstens [`crate::QUEUE_CAPACITY_LIMIT`] wartende plus
+//! [`crate::MAX_PARALLEL_LIMIT`] zurückgestellte zu); er wird beim
 //! Laden mit einer Sortierung auf die Kapazität gekürzt, nicht Eintrag für
 //! Eintrag.
 //!
@@ -45,8 +46,9 @@
 
 use std::cmp::Ordering;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::bounds::QUEUE_CAPACITY_LIMIT;
 use crate::finding::{Hardness, Severity};
 
 /// Dringlichkeit eines Eintrags.
@@ -134,8 +136,25 @@ pub(crate) struct QueueState<T> {
     pub(crate) next_seq: u64,
     // Bisherige Verdrängungen.
     pub(crate) evictions: u64,
-    // Einträge in beliebiger Reihenfolge.
+    // Einträge in beliebiger Reihenfolge; gelesen mit höchstens
+    // `QUEUE_CAPACITY_LIMIT` (`read_queue_entries`). Mit `deserialize_with`
+    // leitet serde keine Schranke für `T` ab, daher die explizite.
+    #[serde(
+        deserialize_with = "read_queue_entries",
+        bound(deserialize = "T: Deserialize<'de>")
+    )]
     pub(crate) entries: Vec<QueueEntry<T>>,
+}
+
+// Liest die wartenden Einträge mit höchstens `QUEUE_CAPACITY_LIMIT` (mehr
+// kann keine gültige Konfiguration schreiben); der Eintrag darüber bricht
+// das Lesen ab, bevor er gelesen wird.
+fn read_queue_entries<'de, T, D>(deserializer: D) -> Result<Vec<QueueEntry<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    crate::serde_map::deserialize_vec_at_most(deserializer, QUEUE_CAPACITY_LIMIT)
 }
 
 impl<T> QueueState<T> {

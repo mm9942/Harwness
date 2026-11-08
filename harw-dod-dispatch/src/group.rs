@@ -72,8 +72,9 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::bounds::MAX_TRACKED_CGROUPS_LIMIT;
 use crate::error::DispatchError;
 use crate::finding::{Hardness, Severity, is_uuid_v4};
 use crate::job::TriageJobId;
@@ -235,7 +236,9 @@ pub(crate) struct OpenIncident {
 // Zustand einer Cgroup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CgroupWindow {
-    // Wartende Einzelbefunde (ohne offenen Vorfall).
+    // Wartende Einzelbefunde (ohne offenen Vorfall); gelesen mit höchstens
+    // `MAX_ENTRIES_PER_CGROUP` (`read_group_entries`).
+    #[serde(deserialize_with = "read_group_entries")]
     entries: Vec<GroupEntry>,
     // Offener Vorfall.
     incident: Option<OpenIncident>,
@@ -248,9 +251,59 @@ pub(crate) struct CgroupWindow {
 pub(crate) struct GrouperState {
     // Nächste Vorfall-Nummer.
     next_incident: u64,
-    // Cgroups nach Kernel-ID.
-    #[serde(with = "crate::serde_map")]
+    // Cgroups nach Kernel-ID; gelesen mit höchstens
+    // `MAX_TRACKED_CGROUPS_LIMIT` Einträgen (`read_cgroups`).
+    #[serde(
+        serialize_with = "crate::serde_map::serialize",
+        deserialize_with = "read_cgroups"
+    )]
     cgroups: BTreeMap<u64, CgroupWindow>,
+}
+
+// Liest die wartenden Befunde einer Cgroup mit höchstens
+// `MAX_ENTRIES_PER_CGROUP` Einträgen (mehr kann die Laufzeit nicht
+// schreiben); der Eintrag darüber bricht das Lesen ab, bevor er gelesen
+// wird.
+fn read_group_entries<'de, D>(deserializer: D) -> Result<Vec<GroupEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    crate::serde_map::deserialize_vec_at_most(deserializer, MAX_ENTRIES_PER_CGROUP)
+}
+
+// Liest die Cgroups als Paarliste mit höchstens `MAX_TRACKED_CGROUPS_LIMIT`
+// Einträgen (mehr kann keine gültige Konfiguration schreiben); der Eintrag
+// darüber bricht das Lesen ab, bevor er gelesen wird.
+fn read_cgroups<'de, D>(deserializer: D) -> Result<BTreeMap<u64, CgroupWindow>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    crate::serde_map::deserialize_pairs_at_most(deserializer, MAX_TRACKED_CGROUPS_LIMIT)
+}
+
+impl GrouperState {
+    // Zahl der Cgroups in O(1), ohne eine anzusehen (Vorabprüfung in
+    // `Dispatcher::restore` gegen `MAX_TRACKED_CGROUPS_LIMIT`).
+    pub(crate) fn cgroup_count(&self) -> usize {
+        self.cgroups.len()
+    }
+
+    // Ob jede Cgroup höchstens `max` wartende Befunde hat. Liest nur die
+    // Längen, keinen Befund; ein Durchlauf über die Cgroups, deren Zahl
+    // `Dispatcher::restore` vorher begrenzt hat.
+    pub(crate) fn entries_within(&self, max: usize) -> bool {
+        self.cgroups.values().all(|slot| slot.entries.len() <= max)
+    }
+
+    // Testzugang zu den wartenden Befunden einer Cgroup: so entstehen
+    // Zustände über `MAX_ENTRIES_PER_CGROUP`, die das Dekodieren nie liefert,
+    // um die Vorabprüfung von `Dispatcher::restore` allein zu prüfen.
+    #[cfg(test)]
+    pub(crate) fn entries_mut_for_test(&mut self, cgroup_kid: u64) -> Option<&mut Vec<GroupEntry>> {
+        self.cgroups
+            .get_mut(&cgroup_kid)
+            .map(|slot| &mut slot.entries)
+    }
 }
 
 // Abstand zweier Ereigniszeiten höchstens `window` Sekunden.
@@ -522,7 +575,10 @@ impl IncidentGrouper {
     // Mitglieder mehr auf, schon eingereihte Aufträge behalten ihre
     // Vorfall-Kennung, und `next_incident` bleibt, eine Kennung wird also nie
     // doppelt vergeben. Mehr als `MAX_ENTRIES_PER_CGROUP` wartende Befunde
-    // kann es zur Laufzeit nicht geben; das bleibt eine Ablehnung.
+    // kann es zur Laufzeit nicht geben; das bleibt eine Ablehnung. Mehr als
+    // `MAX_TRACKED_CGROUPS_LIMIT` Cgroups oder `MAX_ENTRIES_PER_CGROUP`
+    // Befunde in einer lehnt `Dispatcher::restore` schon vorher ab, ohne
+    // einen Eintrag anzusehen; Prüfung und Kürzen hier sind also begrenzt.
     pub(crate) fn import(
         window_secs: u32,
         max_cgroups: usize,

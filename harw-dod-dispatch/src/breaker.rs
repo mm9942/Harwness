@@ -36,7 +36,9 @@
 //! Breakern ([`crate::Dispatcher::restore`]) gilt dieselbe Ordnung ohne die
 //! Stufe „ruhend" (ohne Uhr nicht bestimmbar): ein offener Breaker überlebt
 //! einen Neustart mit kleinerer Grenze, solange es nicht mehr offene als die
-//! Grenze gibt.
+//! Grenze gibt. Mehr als [`crate::BREAKER_MAX_PARTITIONS_LIMIT`] Breaker kann
+//! keine gültige Konfiguration schreiben: einen solchen Zustand lehnt
+//! `restore` ab, bevor ein Breaker geprüft oder gekürzt wird.
 //!
 //! # Nebenläufigkeit und Fehler
 //! `&mut self`, deterministisch; Fehler nur beim Laden eines Zustands.
@@ -55,8 +57,9 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::bounds::BREAKER_MAX_PARTITIONS_LIMIT;
 use crate::error::DispatchError;
 use crate::finding::{PartitionKey, is_sensor_id};
 use crate::prune::retain_greatest;
@@ -81,7 +84,8 @@ pub struct BreakerConfig {
     pub quiet_secs: u32,
     /// Höchstzahl der Befunde in einem ruhigen Fenster.
     pub quiet_threshold: u32,
-    /// Höchstzahl geführter Partitionen.
+    /// Höchstzahl geführter Partitionen (höchstens
+    /// [`crate::BREAKER_MAX_PARTITIONS_LIMIT`]).
     pub max_partitions: usize,
 }
 
@@ -118,8 +122,9 @@ impl BreakerConfig {
                 "must be below breaker.trip_threshold",
             );
         }
-        if self.max_partitions == 0 || self.max_partitions > 1 << 20 {
-            return invalid("breaker.max_partitions", "must be between 1 and 1048576");
+        // Die Zahl im Grund nennt die Konstante; ein Test hält beide gleich.
+        if !(1..=BREAKER_MAX_PARTITIONS_LIMIT).contains(&self.max_partitions) {
+            return invalid("breaker.max_partitions", "must be between 1 and 32768");
         }
         Ok(())
     }
@@ -252,9 +257,34 @@ impl BreakerPartition {
 // Persistierbarer Inhalt eines `BreakerSet`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BreakerState {
-    // Breaker je Partition.
-    #[serde(with = "crate::serde_map")]
+    // Breaker je Partition; gelesen mit höchstens
+    // `BREAKER_MAX_PARTITIONS_LIMIT` Einträgen (`read_breakers`).
+    #[serde(
+        serialize_with = "crate::serde_map::serialize",
+        deserialize_with = "read_breakers"
+    )]
     partitions: BTreeMap<PartitionKey, BreakerPartition>,
+}
+
+// Liest die Breaker als Paarliste mit höchstens
+// `BREAKER_MAX_PARTITIONS_LIMIT` Einträgen (mehr kann keine gültige
+// Konfiguration schreiben); der Eintrag darüber bricht das Lesen ab, bevor
+// er gelesen wird.
+fn read_breakers<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<PartitionKey, BreakerPartition>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    crate::serde_map::deserialize_pairs_at_most(deserializer, BREAKER_MAX_PARTITIONS_LIMIT)
+}
+
+impl BreakerState {
+    // Zahl der Breaker in O(1), ohne einen anzusehen (Vorabprüfung in
+    // `Dispatcher::restore` gegen `BREAKER_MAX_PARTITIONS_LIMIT`).
+    pub(crate) fn partition_count(&self) -> usize {
+        self.partitions.len()
+    }
 }
 
 /// Alle Breaker, je Partition einer.
@@ -366,7 +396,10 @@ impl BreakerSet {
     // Ein offener Breaker fällt also erst, wenn mehr offene als die Grenze
     // da sind; sonst würde ein Neustart mit kleinerer Grenze einen Sturm
     // wieder durchlassen (B10). Ohne Uhr lässt sich „ruhend" nicht
-    // bestimmen; diese Stufe aus `make_room` entfällt.
+    // bestimmen; diese Stufe aus `make_room` entfällt. Mehr als
+    // `BREAKER_MAX_PARTITIONS_LIMIT` Breaker lehnt `Dispatcher::restore`
+    // vorher ab, ohne einen anzusehen; Prüfung und Kürzen hier sind also
+    // begrenzt.
     pub(crate) fn import(
         config: BreakerConfig,
         state: BreakerState,

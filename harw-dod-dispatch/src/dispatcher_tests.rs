@@ -19,6 +19,20 @@ use crate::*;
 // Ereigniszeit der Testbefunde.
 pub(crate) const NOW: i64 = 1_700_000_000;
 
+// Liest einen (manipulierten) Zustand als JSON-Wert über den einzigen
+// Leseweg `DispatchState::from_json_bounded` (der Typ hat kein
+// `Deserialize`); das innere Ergebnis ist das der Crate.
+pub(crate) fn decode_result(
+    json: &serde_json::Value,
+) -> TestResult<Result<DispatchState, DispatchError>> {
+    Ok(DispatchState::from_json_bounded(&serde_json::to_vec(json)?))
+}
+
+// Wie `decode_result`, ein Fehler der Crate ist ein Testfehler.
+pub(crate) fn decode(json: &serde_json::Value) -> TestResult<DispatchState> {
+    decode_result(json)?.map_err(TestError::from)
+}
+
 // Eine gültige UUIDv4 je Nummer.
 pub(crate) fn uuid(n: u32) -> String {
     format!("{n:08x}-1a2b-4c3d-8e4f-5a6b7c8d9e0f")
@@ -1220,8 +1234,7 @@ fn test_snapshot_round_trips_through_json_and_requeues_in_flight() -> TestResult
     assert_eq!(dispatcher.queue_len(), 1);
     assert_eq!(dispatcher.in_flight_len(), 1);
     let state = dispatcher.snapshot();
-    let json = serde_json::to_string(&state)?;
-    let back: DispatchState = serde_json::from_str(&json)?;
+    let back = DispatchState::from_json_bounded(&state.to_json()?)?;
     assert_eq!(back, state);
     let mut restored = Dispatcher::restore(config, back)?;
     assert_eq!(restored.in_flight_len(), 0);
@@ -1265,7 +1278,7 @@ fn test_restore_rejects_foreign_version_and_tampered_content() -> TestResult {
             .pointer_mut(pointer)
             .ok_or_else(missing("json pointer"))?;
         *slot = value;
-        Ok(serde_json::from_value(json)?)
+        decode(&json)
     };
     let version = tamper("/version", serde_json::Value::from(2))?;
     assert_eq!(
@@ -1293,13 +1306,27 @@ fn test_restore_rejects_foreign_version_and_tampered_content() -> TestResult {
         Dispatcher::restore(config, in_flight_digest),
         Err(DispatchError::InvalidState { .. })
     ));
+    // Ein ASCII-Sensor außerhalb der Grammatik kommt durch das Dekodieren,
+    // `restore` lehnt ihn ab.
     let sensor = tamper(
         "/budget/partitions/0/0/sensor",
-        serde_json::Value::from("evil sensor\u{202e}"),
+        serde_json::Value::from("evil sensor"),
     )?;
     assert_eq!(
         Dispatcher::restore(config, sensor).err(),
         Some(DispatchError::InvalidState { what: "budget" })
+    );
+    // Nicht-ASCII (hier U+202E, roh kodiert) schreibt `to_json` nie: schon
+    // das Dekodieren lehnt es ab, bevor serde läuft.
+    let mut bidi = serde_json::to_value(&state)?;
+    *bidi
+        .pointer_mut("/budget/partitions/0/0/sensor")
+        .ok_or_else(missing("json pointer"))? = serde_json::Value::from("evil sensor\u{202e}");
+    assert_eq!(
+        decode_result(&bidi)?.err(),
+        Some(DispatchError::InvalidState {
+            what: "json encoding"
+        })
     );
     let next_job = tamper("/next_job", serde_json::Value::from(2))?;
     assert!(Dispatcher::restore(config, next_job).is_err());
@@ -1681,7 +1708,7 @@ fn test_restore_recomputes_priorities_and_clears_foreign_bindings() -> TestResul
     *json
         .pointer_mut("/grouper/cgroups/0/1/incident/job")
         .ok_or_else(missing("binding"))? = serde_json::Value::from(3);
-    let mut restored = Dispatcher::restore(config, serde_json::from_value(json)?)?;
+    let mut restored = Dispatcher::restore(config, decode(&json)?)?;
     let back = serde_json::to_value(restored.snapshot())?;
     assert_eq!(
         back.pointer("/queue/entries/0/priority/severity"),
@@ -1712,7 +1739,7 @@ fn test_pending_asks_survive_restore_and_are_validated() -> TestResult {
         ("/pending_asks/0/1/finding/rule_id", RULE_SENSOR_DEGRADED),
         ("/pending_asks/0/1/finding/rule_id", RULE_LISTENER_NEW),
         ("/pending_asks/0/1/finding/dedup_key", "XYZ"),
-        ("/pending_asks/0/1/finding/sensor", "evil sensor\u{202e}"),
+        ("/pending_asks/0/1/finding/sensor", "evil sensor"),
         ("/pending_asks/0/1/finding/record_digest", "not-a-digest"),
     ] {
         let mut tampered = json.clone();
@@ -1720,14 +1747,14 @@ fn test_pending_asks_survive_restore_and_are_validated() -> TestResult {
             .pointer_mut(pointer)
             .ok_or_else(missing("json pointer"))? = serde_json::Value::from(value);
         assert_eq!(
-            Dispatcher::restore(config, serde_json::from_value(tampered)?).err(),
+            Dispatcher::restore(config, decode(&tampered)?).err(),
             Some(DispatchError::InvalidState {
                 what: "pending asks"
             }),
             "{pointer}"
         );
     }
-    let mut restored = Dispatcher::restore(config, serde_json::from_value(json)?)?;
+    let mut restored = Dispatcher::restore(config, decode(&json)?)?;
     assert_eq!(restored.pending_asks_len(), 1);
     let normal = restored.resolve_ask(&uuid(1), AskAnswer::TreatNormally, NOW);
     assert!(enqueued(&normal).is_some());

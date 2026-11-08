@@ -4,7 +4,7 @@
 //!
 //! Kindmodul von `dispatcher`, damit Zustände über einer konstanten Grenze
 //! direkt über die privaten Felder von [`crate::DispatchState`] entstehen
-//! (ein JSON mit 65537 Aufträgen wäre unnötig teuer).
+//! (ein JSON mit tausenden Aufträgen wäre unnötig teuer).
 //!
 //! Abgedeckt, je Tabelle des [`crate::DispatchState`]:
 //! - bekannte Schlüssel (`max_known_keys`, auch 1000 → 1): genau die
@@ -16,20 +16,24 @@
 //!   etablierten) und Breaker (`breaker.max_partitions`, offene zuerst);
 //! - Warteschlange samt zurückgestellter vergebener Aufträge
 //!   (`queue_capacity`, kleineres `max_parallel`): die dringendsten bleiben;
-//! - konstante Grenzen: genau die Grenze ist gültig, eine mehr wird
-//!   abgelehnt, für [`crate::MAX_PENDING_ASKS`],
-//!   [`crate::MAX_STARVED_EPISODES`], [`crate::MAX_JOB_MEMBERS`] (wartende
-//!   und vergebene Aufträge), [`crate::MAX_ENTRIES_PER_CGROUP`] sowie 64
-//!   vergebene und 65536 wartende Aufträge (Höchstwerte von `max_parallel`
-//!   und `queue_capacity`).
+//! - absolute Grenzen über die echte Fassade: genau die Grenze ist gültig,
+//!   eine mehr wird mit „too many …" abgelehnt, für
+//!   [`crate::MAX_PENDING_ASKS`], [`crate::MAX_STARVED_EPISODES`],
+//!   [`crate::MAX_JOB_MEMBERS`] (wartende und vergebene Aufträge),
+//!   [`crate::MAX_ENTRIES_PER_CGROUP`], [`crate::MAX_PARALLEL_LIMIT`]
+//!   vergebene und [`crate::QUEUE_CAPACITY_LIMIT`] wartende Aufträge. Wo
+//!   der Zustand als JSON entsteht, lehnt schon das Dekodieren eine mehr ab
+//!   („too many table entries"); `restore` selbst prüft dann ein in der
+//!   Crate gebauter Zustand (das Dekodieren liefert keinen über der Grenze).
 //!
 //! Die Kürzung selbst (Gleichstände, beide Suchseiten) prüfen die
 //! Modultests von `prune`, `retriage`, `group`, `budget`, `breaker` und
-//! `queue`; hier geht es um die Wirkung über die Fassade.
+//! `queue`; hier geht es um die Wirkung über die Fassade. Dass die
+//! Vorabprüfung jeder Tabelle vor jeder Eintragsprüfung läuft, und die
+//! Bytegrenze der Persistenz prüft `preflight_tests`.
 
-use super::{MAX_PARALLEL_LIMIT, QUEUE_CAPACITY_LIMIT};
 use crate::dispatcher_tests::{
-    NOW, digest, enqueued, finding, key, loopback, on_cgroup, roomy, uuid,
+    NOW, decode, decode_result, digest, enqueued, finding, key, loopback, on_cgroup, roomy, uuid,
 };
 use crate::job::JobMember;
 use crate::test_support::{TestResult, missing};
@@ -326,8 +330,11 @@ fn test_restore_accepts_constant_bounds_exactly_and_rejects_one_more() -> TestRe
         .pointer("/pending_asks/0")
         .cloned()
         .ok_or_else(missing("pending ask"))?;
-    // `count` gültige Rückfragen mit je eigener Kennung.
-    let with_asks = |count: usize| -> TestResult<DispatchState> {
+    let too_many_entries = Some(DispatchError::InvalidState {
+        what: "too many table entries",
+    });
+    // `count` gültige Rückfragen mit je eigener Kennung, als JSON.
+    let with_asks = |count: usize| -> TestResult<serde_json::Value> {
         let mut pairs = Vec::new();
         for n in (1_u32..).take(count) {
             let mut pair = template.clone();
@@ -342,18 +349,38 @@ fn test_restore_accepts_constant_bounds_exactly_and_rejects_one_more() -> TestRe
         *tampered
             .pointer_mut("/pending_asks")
             .ok_or_else(missing("pending asks"))? = serde_json::Value::Array(pairs);
-        Ok(serde_json::from_value(tampered)?)
+        Ok(tampered)
     };
-    let full = Dispatcher::restore(config, with_asks(MAX_PENDING_ASKS)?)?;
+    // Genau die Grenze wird dekodiert und wiederhergestellt …
+    let full_asks = decode(&with_asks(MAX_PENDING_ASKS)?)?;
+    let full = Dispatcher::restore(config, full_asks.clone())?;
     assert_eq!(full.pending_asks_len(), MAX_PENDING_ASKS);
+    // … eine mehr lehnt schon das Dekodieren ab …
     assert_eq!(
-        Dispatcher::restore(config, with_asks(MAX_PENDING_ASKS.saturating_add(1))?).err(),
+        decode_result(&with_asks(MAX_PENDING_ASKS.saturating_add(1))?)?.err(),
+        too_many_entries
+    );
+    // … und ein in der Crate gebauter Zustand mit einer mehr (das
+    // Dekodieren liefert keinen) scheitert an der Vorabprüfung von
+    // `restore`; dass die neue Rückfrage zudem ungültig ist (Kennung ≠
+    // Kennung ihres Befunds), sieht `restore` nicht mehr.
+    let mut over = full_asks;
+    let ask = over
+        .pending_asks
+        .values()
+        .next()
+        .cloned()
+        .ok_or_else(missing("pending ask"))?;
+    over.pending_asks.insert(uuid(u32::MAX), ask);
+    assert_eq!(over.pending_asks.len(), MAX_PENDING_ASKS.saturating_add(1));
+    assert_eq!(
+        Dispatcher::restore(config, over).err(),
         Some(DispatchError::InvalidState {
-            what: "pending asks"
+            what: "too many pending asks"
         })
     );
-    // `count` Starved-Episoden mit je eigener uid.
-    let with_episodes = |count: usize| -> TestResult<DispatchState> {
+    // `count` Starved-Episoden mit je eigener uid, als JSON.
+    let with_episodes = |count: usize| -> TestResult<serde_json::Value> {
         let episodes: Vec<serde_json::Value> = (0_u32..)
             .take(count)
             .map(|uid| serde_json::json!([["breaker", uid], NOW]))
@@ -362,17 +389,25 @@ fn test_restore_accepts_constant_bounds_exactly_and_rejects_one_more() -> TestRe
         *tampered
             .pointer_mut("/starved_episodes")
             .ok_or_else(missing("starved episodes"))? = serde_json::Value::Array(episodes);
-        Ok(serde_json::from_value(tampered)?)
+        Ok(tampered)
     };
-    assert!(Dispatcher::restore(config, with_episodes(MAX_STARVED_EPISODES)?).is_ok());
+    let full_episodes = decode(&with_episodes(MAX_STARVED_EPISODES)?)?;
+    assert!(Dispatcher::restore(config, full_episodes.clone()).is_ok());
     assert_eq!(
-        Dispatcher::restore(
-            config,
-            with_episodes(MAX_STARVED_EPISODES.saturating_add(1))?
-        )
-        .err(),
+        decode_result(&with_episodes(MAX_STARVED_EPISODES.saturating_add(1))?)?.err(),
+        too_many_entries
+    );
+    let mut over = full_episodes;
+    over.starved_episodes
+        .insert((StarvedCause::Breaker, None), NOW);
+    assert_eq!(
+        over.starved_episodes.len(),
+        MAX_STARVED_EPISODES.saturating_add(1)
+    );
+    assert_eq!(
+        Dispatcher::restore(config, over).err(),
         Some(DispatchError::InvalidState {
-            what: "starved episodes"
+            what: "too many starved episodes"
         })
     );
     Ok(())
@@ -463,7 +498,7 @@ fn test_restore_accepts_the_max_parallel_limit_in_flight_and_rejects_one_more() 
     assert_eq!(
         Dispatcher::restore(config, with_in_flight(MAX_PARALLEL_LIMIT.saturating_add(1))).err(),
         Some(DispatchError::InvalidState {
-            what: "triage jobs"
+            what: "too many in-flight jobs"
         })
     );
     Ok(())
@@ -499,19 +534,20 @@ fn test_restore_accepts_the_queue_capacity_limit_and_rejects_one_more() -> TestR
         tampered
     };
     {
-        // 65536 wartende (Höchstwert von `queue_capacity`) sind gültig; der
-        // zurückgestellte Auftrag 1 passt nicht mehr und zählt als Überlauf.
+        // `QUEUE_CAPACITY_LIMIT` wartende (Höchstwert von `queue_capacity`)
+        // sind gültig; der zurückgestellte Auftrag 1 passt nicht mehr und
+        // zählt als Überlauf.
         let restored = Dispatcher::restore(config, with_queued(QUEUE_CAPACITY_LIMIT))?;
         assert_eq!(restored.queue_len(), QUEUE_CAPACITY_LIMIT);
         assert_eq!(restored.in_flight_len(), 0);
         assert_eq!(restored.counters().dropped.queue_overflow, 1);
     }
-    // 65537 kann keine gültige Konfiguration schreiben; abgelehnt, bevor
-    // ein Auftrag geprüft oder sortiert wird.
+    // Einen mehr kann keine gültige Konfiguration schreiben; abgelehnt,
+    // bevor ein Auftrag geprüft oder sortiert wird.
     assert_eq!(
         Dispatcher::restore(config, with_queued(QUEUE_CAPACITY_LIMIT.saturating_add(1))).err(),
         Some(DispatchError::InvalidState {
-            what: "triage jobs"
+            what: "too many queued jobs"
         })
     );
     Ok(())
@@ -550,7 +586,7 @@ fn test_restore_accepts_max_job_members_and_rejects_one_more() -> TestResult {
         Ok(tampered)
     };
     let invalid = Some(DispatchError::InvalidState {
-        what: "triage jobs",
+        what: "too many job members",
     });
     let one_more = MAX_JOB_MEMBERS.saturating_add(1);
     // Wartend: genau die Grenze ist gültig, eine mehr nicht.
@@ -591,8 +627,8 @@ fn test_restore_accepts_max_entries_per_cgroup_and_rejects_one_more() -> TestRes
         .pointer("/grouper/cgroups/0/1/entries/0")
         .cloned()
         .ok_or_else(missing("waiting entry"))?;
-    // `count` wartende Befunde in Cgroup 7 mit je eigener Kennung.
-    let with_entries = |count: usize| -> TestResult<DispatchState> {
+    // `count` wartende Befunde in Cgroup 7 mit je eigener Kennung, als JSON.
+    let with_entries = |count: usize| -> TestResult<serde_json::Value> {
         let mut entries = Vec::new();
         for n in (100_u32..).take(count) {
             let mut entry = template.clone();
@@ -605,20 +641,34 @@ fn test_restore_accepts_max_entries_per_cgroup_and_rejects_one_more() -> TestRes
         *tampered
             .pointer_mut("/grouper/cgroups/0/1/entries")
             .ok_or_else(missing("waiting entries"))? = serde_json::Value::Array(entries);
-        Ok(serde_json::from_value(tampered)?)
+        Ok(tampered)
     };
     // Genau die Grenze ist gültig und bleibt unverändert …
-    let full = with_entries(MAX_ENTRIES_PER_CGROUP)?;
+    let full = decode(&with_entries(MAX_ENTRIES_PER_CGROUP)?)?;
     assert_eq!(Dispatcher::restore(config, full.clone())?.snapshot(), full);
-    // … eine mehr kann die Laufzeit nicht schreiben.
+    // … eine mehr kann die Laufzeit nicht schreiben: das Dekodieren lehnt
+    // sie ab …
     assert_eq!(
-        Dispatcher::restore(
-            config,
-            with_entries(MAX_ENTRIES_PER_CGROUP.saturating_add(1))?
-        )
-        .err(),
+        decode_result(&with_entries(MAX_ENTRIES_PER_CGROUP.saturating_add(1))?)?.err(),
         Some(DispatchError::InvalidState {
-            what: "incident grouper"
+            what: "too many table entries"
+        })
+    );
+    // … und `restore` einen in der Crate gebauten Zustand ebenso.
+    let mut over = full;
+    let entries = over
+        .grouper
+        .entries_mut_for_test(7)
+        .ok_or_else(missing("cgroup 7"))?;
+    let entry = entries
+        .first()
+        .cloned()
+        .ok_or_else(missing("waiting entry"))?;
+    entries.push(entry);
+    assert_eq!(
+        Dispatcher::restore(config, over).err(),
+        Some(DispatchError::InvalidState {
+            what: "too many cgroup entries"
         })
     );
     Ok(())

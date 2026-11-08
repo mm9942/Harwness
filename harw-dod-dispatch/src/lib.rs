@@ -28,11 +28,35 @@
 //!   [`DispatchAction::Starved`] je Ursache, uid und Fenster, und jede
 //!   weggefallene Rückfrage als [`DispatchAction::AskWithdrawn`].
 //!
+//! # Persistenz (untrusted)
+//! Der Aufrufer schreibt [`DispatchState::to_json`] und liest mit
+//! [`DispatchState::from_json_bounded`], dem einzigen Leseweg
+//! ([`DispatchState`] hat kein `Deserialize`). Es lehnt mehr als
+//! [`MAX_STATE_BYTES`] Bytes und jedes Byte außer druckbarem ASCII ohne
+//! Backslash und JSON-Leerraum ab, bevor serde läuft (`to_json` schreibt
+//! nie ein anderes; so gibt es beim Dekodieren keine Escapes, und keine
+//! Fehlermeldung von serde vervielfacht die Eingabe), und bricht das
+//! Dekodieren ab, bevor eine Tabelle mehr als ihren absoluten Höchstwert an
+//! Einträgen aufnimmt ([`MAX_PARALLEL_LIMIT`],
+//! [`QUEUE_CAPACITY_LIMIT`], [`MAX_KNOWN_KEYS_LIMIT`],
+//! [`MAX_TRACKED_CGROUPS_LIMIT`], [`BUDGET_MAX_PARTITIONS_LIMIT`],
+//! [`BREAKER_MAX_PARTITIONS_LIMIT`], [`MAX_PENDING_ASKS`],
+//! [`MAX_STARVED_EPISODES`], innen [`MAX_ENTRIES_PER_CGROUP`] und
+//! [`MAX_JOB_MEMBERS`]); den Eintrag darüber parst es nicht mehr. Alles
+//! zusammen begrenzt den Speicher beim Dekodieren auf höchstens das
+//! Dreifache von [`MAX_STATE_BYTES`] samt Eingabe plus die Strukturen,
+//! unter 1 GiB (Herleitung bei [`MAX_STATE_BYTES`]).
+//! [`Dispatcher::restore`] prüft dieselben Höchstwerte noch einmal als
+//! reine Längen, bevor ein Eintrag geprüft wird (Arbeitsgrenze), und kürzt
+//! den Rest auf die aktive Konfiguration.
+//!
 //! # Ring A
 //! Rein: kein IO, kein Lesen der Uhr (die Zeit kommt als Unix-Sekunden
-//! herein), kein async, keine Threads, keine Panik. Einzige Abhängigkeit
-//! ist `serde`, damit der Aufrufer den [`DispatchState`] persistieren kann.
-//! Schicht `F` in `xtask/arch-policy.toml`.
+//! herein), kein async, keine Threads, keine Panik. Abhängigkeiten sind
+//! `serde`, damit der [`DispatchState`] serialisierbar ist, und
+//! `serde_json` für die begrenzte Persistenz-Kodierung
+//! ([`DispatchState::to_json`], [`DispatchState::from_json_bounded`]); beide
+//! ohne IO. Schicht `F` in `xtask/arch-policy.toml`.
 //!
 //! # Untrusted Text (I4)
 //! Triage-Templates ([`TriageJob::template`]) und Hinweise enthalten nur
@@ -83,6 +107,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod bounds;
 mod breaker;
 mod budget;
 mod dispatcher;
@@ -96,6 +121,10 @@ mod retriage;
 mod route;
 mod serde_map;
 
+pub use bounds::{
+    BREAKER_MAX_PARTITIONS_LIMIT, BUDGET_MAX_PARTITIONS_LIMIT, MAX_KNOWN_KEYS_LIMIT,
+    MAX_PARALLEL_LIMIT, MAX_STATE_BYTES, MAX_TRACKED_CGROUPS_LIMIT, QUEUE_CAPACITY_LIMIT,
+};
 pub use breaker::{BreakerConfig, BreakerObservation, BreakerPartition, BreakerSet};
 pub use budget::{
     BudgetClass, BudgetConfig, BudgetDecision, BudgetScope, ESTABLISHED_TTL_SECS,
