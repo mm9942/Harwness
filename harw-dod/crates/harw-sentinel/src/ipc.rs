@@ -134,6 +134,10 @@ use crate::peer_allow::PeerAllowlist;
 /// einen einzelnen Audit-Record).
 const RECV_BUFFER_LEN: usize = 16_384;
 
+/// Höchstzahl Zeichen einer von einer Sonde gelieferten Sensor-Kennung im
+/// Journal (nach dem Escapen, Kürzungsmarke eingerechnet).
+const LOGGED_SENSOR_ID_MAX_CHARS: usize = 64;
+
 /// Fehler des IPC-Empfangspfads.
 ///
 /// # Description
@@ -146,6 +150,16 @@ pub enum IpcError {
     #[msg("failed to bind ipc socket at '{path}'")]
     Bind {
         /// Der Pfad, an dem das Binden fehlschlug.
+        path: String,
+    },
+
+    /// Unter `path` liegt schon etwas, das kein Socket ist (Datei,
+    /// Verzeichnis, Symlink, …); es wird nie entfernt (PL-100 Review
+    /// Runde 1: ein `--socket` auf einer Zustandsdatei löschte sie sonst bei
+    /// jedem Start).
+    #[msg("refusing to bind the ipc socket at '{path}': an existing entry there is not a socket")]
+    NotASocket {
+        /// Der belegte Pfad.
         path: String,
     },
 
@@ -216,6 +230,37 @@ pub struct IpcListener {
     path: PathBuf,
 }
 
+/// Entfernt den Socket eines vorherigen Laufs unter `path`.
+///
+/// # Description
+/// Ein fehlender Pfad (`NotFound`) ist der erwartete Regelfall beim ersten
+/// Start. Ein Socket wird entfernt (auch ein gleichzeitig verschwundener ist
+/// in Ordnung); jeder andere Eintrag — reguläre Datei, Verzeichnis, Symlink
+/// — bleibt stehen.
+///
+/// # Errors
+/// [`IpcError::NotASocket`] für einen anderen Eintrag; [`IpcError::Bind`],
+/// wenn die Metadaten nicht lesbar sind oder das Entfernen scheitert.
+fn remove_stale_socket(path: &Path) -> Result<(), IpcError> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let bind_err = || IpcError::Bind {
+        path: path.display().to_string(),
+    };
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(bind_err()),
+        Ok(meta) if meta.file_type().is_socket() => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(bind_err()),
+        },
+        Ok(_) => Err(IpcError::NotASocket {
+            path: path.display().to_string(),
+        }),
+    }
+}
+
 impl IpcListener {
     /// Bindet und öffnet den Empfangssocket unter `path`.
     ///
@@ -224,7 +269,10 @@ impl IpcListener {
     /// Pfads (ein Rest eines vorherigen, nicht sauber beendeten Prozesses —
     /// `bind()` auf einen `AF_UNIX`-Pfad scheitert sonst mit „Adresse
     /// bereits in Verwendung"), baut dann `socket`, `bind`, `listen` in
-    /// dieser Reihenfolge. Kein Schritt hiervon ist `unsafe` (siehe
+    /// dieser Reihenfolge. Entfernt wird nur ein Socket
+    /// (`symlink_metadata`, Symlinks werden nicht verfolgt); jeder andere
+    /// Eintrag unter `path` bleibt unangetastet und das Binden scheitert
+    /// ([`IpcError::NotASocket`]). Kein Schritt hiervon ist `unsafe` (siehe
     /// Moduldoku).
     ///
     /// # Arguments
@@ -235,8 +283,11 @@ impl IpcListener {
     /// Einen lauschenden `IpcListener`, bereit für [`Self::accept`].
     ///
     /// # Errors
-    /// [`IpcError::Bind`], wenn `socket()`, `bind()` oder `listen()`
-    /// scheitert (Verzeichnis fehlt, keine Berechtigung, Pfad zu lang).
+    /// - [`IpcError::NotASocket`], wenn unter `path` schon etwas anderes
+    ///   als ein Socket liegt.
+    /// - [`IpcError::Bind`], wenn der alte Socket nicht entfernt werden
+    ///   kann oder `socket()`, `bind()` oder `listen()` scheitert
+    ///   (Verzeichnis fehlt, keine Berechtigung, Pfad zu lang).
     ///
     /// # Examples
     /// ```rust,no_run
@@ -253,10 +304,7 @@ impl IpcListener {
             path: path.display().to_string(),
         };
 
-        // Rest eines vorherigen Laufs entfernen; ein fehlender Pfad
-        // (`NotFound`) ist der erwartete Regelfall beim ersten Start, kein
-        // Fehler dieser Funktion.
-        let _ = std::fs::remove_file(path);
+        remove_stale_socket(path)?;
 
         let socket = net::socket(AddressFamily::UNIX, SocketType::SEQPACKET, None)
             .map_err(|_| bind_err())?;
@@ -384,7 +432,10 @@ impl IpcConnection {
             return Err(IpcError::Oversized);
         }
 
-        let event: SecurityEvent = serde_json::from_slice(&buffer[..copied])?;
+        // `copied <= buffer.len()` laut `rustix`; `get` statt Slice-Indexing
+        // behandelt den unmöglichen Fall wie ein abgeschnittenes Datagramm.
+        let received = buffer.get(..copied).ok_or(IpcError::Oversized)?;
+        let event: SecurityEvent = serde_json::from_slice(received)?;
         Ok(Some(event))
     }
 }
@@ -426,6 +477,13 @@ pub struct IpcInbox {
     /// [`Self::take_newly_dropped`], damit jede Verdrängung genau einmal
     /// gemeldet wird.
     dropped_reported: u64,
+    /// Nachrichten zugelassener Sonden, die seit dem Start verworfen
+    /// wurden, weil sie nicht dekodierbar ([`IpcError::Malformed`]) oder zu
+    /// groß ([`IpcError::Oversized`]) waren (`sensor_parse_errors_total`).
+    decode_errors: u64,
+    /// Stand von [`Self::decode_errors_total`] beim letzten
+    /// [`Self::take_new_decode_errors`].
+    decode_errors_reported: u64,
 }
 
 impl IpcInbox {
@@ -447,6 +505,8 @@ impl IpcInbox {
             connected: 0,
             rejected: 0,
             dropped_reported: 0,
+            decode_errors: 0,
+            decode_errors_reported: 0,
         }
     }
 
@@ -562,6 +622,43 @@ impl IpcInbox {
     pub fn rejected_total(&self) -> u64 {
         self.rejected
     }
+
+    /// Hält fest, dass eine Nachricht einer zugelassenen Sonde verworfen
+    /// wurde, weil sie nicht dekodierbar oder zu groß war (siehe
+    /// [`IpcConnection::recv_event`]).
+    pub fn note_decode_error(&mut self) {
+        self.decode_errors = self.decode_errors.saturating_add(1);
+    }
+
+    /// Anzahl der seit dem Start verworfenen, nicht dekodierbaren oder zu
+    /// großen Nachrichten.
+    ///
+    /// # Returns
+    /// Eine monoton wachsende Zahl; das Feld `ipc.decode_errors_total` des
+    /// Gesundheitsexports (`crate::health_export`). **Erwartet wird null**.
+    #[must_use]
+    pub fn decode_errors_total(&self) -> u64 {
+        self.decode_errors
+    }
+
+    /// Verworfene Nachrichten seit dem vorigen Aufruf (bzw. seit dem Start)
+    /// und merkt sich den aktuellen Stand.
+    ///
+    /// # Description
+    /// Der Sammelthread meldet den Block einmal je Zyklus
+    /// (`harw_observe::SensorMetrics::sensor_parse_errors`, eine
+    /// zusammengefasste Journalzeile) statt je Nachricht — eine flutende
+    /// Sonde kann so weder das Journal noch die Telemetrie überschwemmen.
+    ///
+    /// # Returns
+    /// `decode_errors_total - <Stand beim vorigen Aufruf>`.
+    pub fn take_new_decode_errors(&mut self) -> u64 {
+        let newly = self
+            .decode_errors
+            .saturating_sub(self.decode_errors_reported);
+        self.decode_errors_reported = self.decode_errors;
+        newly
+    }
 }
 
 /// Prüft eine angenommene Verbindung gegen die Zulassungsliste.
@@ -619,9 +716,14 @@ pub fn admit_connection(
 /// oder scheitert (`Err`, geloggt, dann beendet) — beides beendet nur den
 /// Thread dieser einen Verbindung, nie die Annahmeschleife selbst. Ein
 /// Lesefehler auf einer Nachricht (`IpcError::Malformed`, `IpcError::Oversized`)
-/// verwirft nur diese eine Nachricht und liest weiter; eine fehlerhafte oder
+/// verwirft nur diese eine Nachricht, zählt sie
+/// ([`IpcInbox::note_decode_error`]) und liest weiter; eine fehlerhafte oder
 /// eine einzelne zu große Nachricht einer Sonde soll nicht die ganze
 /// Verbindung abreißen.
+///
+/// Erst **nach** der Landlock-Selbstbeschränkung aufrufen: Landlock wirkt
+/// nur auf Threads, die danach entstehen (`crate::run` erzwingt das über
+/// `crate::sandbox::SandboxApplied`).
 ///
 /// # Arguments
 /// - `listener` (`IpcListener`): der gebundene, lauschende Socket. Wird von
@@ -680,13 +782,32 @@ fn receive_until_closed(connection: IpcConnection, inbox: &Mutex<IpcInbox>) {
     }
 }
 
+/// Zählt eine verworfene Nachricht in der Inbox; eine vergiftete Sperre
+/// wird übernommen (wie in [`admit_connection`]), damit kein Verwurf
+/// ungezählt bleibt.
+fn note_decode_error(inbox: &Mutex<IpcInbox>) {
+    match inbox.lock() {
+        Ok(mut inbox) => inbox.note_decode_error(),
+        Err(poisoned) => poisoned.into_inner().note_decode_error(),
+    }
+}
+
 /// Die eigentliche Empfangsschleife einer Verbindung (siehe
 /// [`receive_until_closed`]).
 fn receive_events(connection: &IpcConnection, peer: PeerCredentials, inbox: &Mutex<IpcInbox>) {
     loop {
         match connection.recv_event() {
             Ok(Some(event)) => {
-                tracing::debug!(?peer, sensor = %event.sensor.as_str(), "ipc event received");
+                // Die Sensor-Kennung stammt aus der Nutzlast der Sonde:
+                // escapt und begrenzt, bevor sie ein Terminal erreicht.
+                tracing::debug!(
+                    ?peer,
+                    sensor = %harw_untrusted_text::escape_line(
+                        event.sensor.as_str(),
+                        LOGGED_SENSOR_ID_MAX_CHARS
+                    ),
+                    "ipc event received"
+                );
                 if let Ok(mut inbox) = inbox.lock() {
                     inbox.push(ReceivedEvent { event, peer });
                 }
@@ -697,23 +818,34 @@ fn receive_events(connection: &IpcConnection, peer: PeerCredentials, inbox: &Mut
             }
             Err(IpcError::Malformed(error)) => {
                 // PL-100 WP0.6: ein Serde-Fehler kann Text der Sonde
-                // wiedergeben (unbekannte Feldnamen, Wertausschnitte) — auf
-                // `warn` nur der Umstand, das Detail auf `debug`.
-                tracing::warn!(
+                // wiedergeben (unbekannte Feldnamen, Wertausschnitte) — er
+                // steht nur auf `debug`. Gezählt wird die Nachricht in der
+                // Inbox; den Block meldet der Sammelthread einmal je Zyklus
+                // (`sensor_parse_errors_total` und eine `warn`-Zeile nur mit
+                // der Anzahl, `crate::report_ipc_parse_errors`), damit eine
+                // flutende Sonde das Journal nicht je Nachricht füllt.
+                // Auch auf `debug` nie der Fehlertext selbst (er kann
+                // Steuer- oder bidi-Zeichen der Sonde tragen), nur Kategorie,
+                // Zeile und Spalte — wie `harw_dod_rules::ListenerHistoryError`.
+                note_decode_error(inbox);
+                tracing::debug!(
                     ?peer,
-                    "ipc peer sent a message that could not be decoded; discarding it and continuing"
+                    category = ?error.classify(),
+                    line = error.line(),
+                    column = error.column(),
+                    "ipc peer sent a message that could not be decoded; discarded and counted"
                 );
-                tracing::debug!(?peer, error = %error, "ipc decode error detail");
             }
             Err(IpcError::Oversized) => {
                 // Nachrichtengrenze bei `SOCK_SEQPACKET`: der Rest dieses
                 // einen Datagramms ist verloren, aber der nächste
                 // `recv_event`-Aufruf liefert bereits die nächste,
                 // unabhängige Nachricht — kein Grund, die Verbindung zu
-                // schließen (siehe `recv_event`-Doku).
-                tracing::warn!(
+                // schließen (siehe `recv_event`-Doku). Gezählt wie oben.
+                note_decode_error(inbox);
+                tracing::debug!(
                     ?peer,
-                    "ipc peer sent a message larger than the receive buffer; discarding it and continuing"
+                    "ipc peer sent a message larger than the receive buffer; discarded and counted"
                 );
             }
             Err(error) => {
@@ -730,7 +862,8 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        IpcConnection, IpcInbox, IpcListener, PeerCredentials, ReceivedEvent, admit_connection,
+        IpcConnection, IpcError, IpcInbox, IpcListener, PeerCredentials, ReceivedEvent,
+        admit_connection, receive_events,
     };
     use crate::peer_allow::PeerAllowlist;
     use crate::test_support::{TestError, TestResult, ctx};
@@ -820,6 +953,104 @@ mod tests {
                 sensor: SensorId::from_str("probe-fs-0"),
             },
         }
+    }
+
+    /// Collects the formatted `tracing` output of a test.
+    #[derive(Debug, Clone, Default)]
+    struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("capture lock poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// PL-100 review round 1: neither a serde error echoing probe text (an
+    /// unknown variant with a bidi override) nor a probe-chosen sensor id
+    /// reaches the journal unescaped, not even at `debug`.
+    #[test]
+    fn test_receive_logs_no_raw_probe_text_at_debug() -> TestResult {
+        let (connection, theirs) = connection_with_peer(1000)?;
+        let valid = serde_json::to_string(&sample_event()).map_err(ctx("encode"))?;
+        let malformed = valid.replace("\"sensor-degraded\"", "\"\u{202E}evil\"");
+        assert_ne!(valid, malformed, "the fixture must change the variant");
+        rustix::net::send(&theirs, malformed.as_bytes(), SendFlags::empty())
+            .map_err(ctx("send malformed"))?;
+        let mut hostile = sample_event();
+        hostile.sensor = SensorId::from_str("probe\u{202E}fs-0");
+        let hostile = serde_json::to_vec(&hostile).map_err(ctx("encode hostile"))?;
+        rustix::net::send(&theirs, &hostile, SendFlags::empty()).map_err(ctx("send hostile"))?;
+        drop(theirs);
+
+        let inbox = Mutex::new(IpcInbox::new(4));
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let peer = connection.peer();
+        tracing::subscriber::with_default(subscriber, || {
+            receive_events(&connection, peer, &inbox);
+        });
+
+        let inbox = inbox.lock().map_err(ctx("inbox lock"))?;
+        assert_eq!(inbox.len(), 1, "only the well-formed event is kept");
+        let bytes = captured
+            .0
+            .lock()
+            .map_err(|_| TestError::Missing("capture lock"))?
+            .clone();
+        let text = String::from_utf8(bytes).map_err(ctx("utf-8 log output"))?;
+        assert!(text.contains("could not be decoded"), "{text}");
+        assert!(text.contains("ipc event received"), "{text}");
+        assert!(
+            !text.contains('\u{202E}'),
+            "raw probe text reached the journal: {text}"
+        );
+        Ok(())
+    }
+
+    /// PL-100 review round 1: a stale socket of a previous run is replaced,
+    /// any other entry under the socket path (here: a state file) is never
+    /// removed and the bind is refused.
+    #[test]
+    fn test_bind_replaces_only_a_stale_socket() -> TestResult {
+        let (dir, first) = bind_in_tempdir()?;
+        let path = first.path().to_path_buf();
+        drop(first);
+        let second = IpcListener::bind(&path).map_err(ctx("rebind over a stale socket"))?;
+        drop(second);
+
+        let state = dir.path().join("listener-history.json");
+        std::fs::write(&state, b"{\"format_version\":1}").map_err(ctx("state file"))?;
+        let refused = IpcListener::bind(&state);
+        assert!(
+            matches!(refused, Err(IpcError::NotASocket { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read(&state).map_err(ctx("state survives"))?,
+            b"{\"format_version\":1}".to_vec()
+        );
+
+        let directory = dir.path().join("d");
+        std::fs::create_dir(&directory).map_err(ctx("directory"))?;
+        assert!(matches!(
+            IpcListener::bind(&directory),
+            Err(IpcError::NotASocket { .. })
+        ));
+        assert!(directory.is_dir());
+        Ok(())
     }
 
     #[test]
@@ -1065,6 +1296,44 @@ mod tests {
         Ok(())
     }
 
+    /// PL-100: eine nicht dekodierbare und eine zu große Nachricht werden
+    /// verworfen und gezählt (`sensor_parse_errors_total`), die Verbindung
+    /// liest weiter, und der Zähler meldet jeden Verwurf genau einmal.
+    #[test]
+    fn test_receive_events_counts_malformed_and_oversized_messages_and_keeps_reading() -> TestResult
+    {
+        let (connection, peer) = connection_with_peer(991)?;
+        let valid = serde_json::to_vec(&sample_event()).map_err(ctx("encode event"))?;
+        let oversized = vec![b'x'; super::RECV_BUFFER_LEN.saturating_add(1)];
+        for payload in [
+            valid.as_slice(),
+            b"{\"not\": \"a security event\"".as_slice(),
+            oversized.as_slice(),
+            valid.as_slice(),
+        ] {
+            rustix::net::send(&peer, payload, SendFlags::empty()).map_err(ctx("send"))?;
+        }
+        // Geordnetes Schließen der Sonde: `recv_event` liefert danach `None`.
+        drop(peer);
+        let inbox = Mutex::new(IpcInbox::new(8));
+
+        super::receive_events(&connection, connection.peer(), &inbox);
+
+        let mut guard = inbox.lock().map_err(ctx("inbox lock"))?;
+        assert_eq!(
+            guard.len(),
+            2,
+            "both valid events arrived around the bad ones"
+        );
+        assert_eq!(guard.decode_errors_total(), 2);
+        assert_eq!(guard.take_new_decode_errors(), 2);
+        assert_eq!(guard.take_new_decode_errors(), 0, "reported once");
+        guard.note_decode_error();
+        assert_eq!(guard.take_new_decode_errors(), 1);
+        assert_eq!(guard.decode_errors_total(), 3, "the total stays monotonic");
+        Ok(())
+    }
+
     /// Kompilierzeit-Beleg für „Push-only": dieser Test benennt genau die
     /// beiden Typen, die laut Moduldoku keine `send`/`write`-Methode
     /// besitzen dürfen. Bekäme `IpcConnection` oder `IpcListener` künftig
@@ -1092,7 +1361,7 @@ mod tests {
     #[test]
     fn test_ipc_error_oversized_message_is_content_free() {
         assert_eq!(
-            super::IpcError::Oversized.to_string(),
+            IpcError::Oversized.to_string(),
             "received an ipc message larger than the receive buffer; it was discarded"
         );
     }

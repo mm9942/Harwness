@@ -930,11 +930,14 @@ fn test_netlink_probe_unit_is_embedded_printable_and_opt_in() -> TestResult {
 fn test_dod_target_pulls_in_observation_only() -> TestResult {
     let target = parsed(embedded_unit("harw-dod.target")?);
     let wants = words(&target.values("Unit", "Wants"));
+    // PL-100 WP1.6: the fanotify probe belongs to the target since its scope
+    // comes from `[probe_fs]` in config.toml (or its built-in defaults).
     assert_eq!(
         wants,
         vec![
             "harw-sentinel.service".to_owned(),
-            "harw-probe-bpf.service".to_owned()
+            "harw-probe-bpf.service".to_owned(),
+            "harw-probe-fs.service".to_owned()
         ]
     );
     for asset in systemd_units() {
@@ -1247,11 +1250,19 @@ fn test_control_plane_delegates_its_cgroup_for_job_cgroups() -> TestResult {
 fn test_every_dod_and_infra_service_sets_the_common_hardening() -> TestResult {
     for asset in systemd_units().filter(|a| a.kind == AssetKind::SystemdService) {
         let unit = parsed(asset);
+        // harw-probe-fs alone keeps the home roots visible, read-only: fanotify
+        // must mark /home, /root and /run/user and the kernel must open event
+        // descriptors below them (see the unit's ProtectHome comment).
+        let protect_home = if asset.file_name() == "harw-probe-fs.service" {
+            "read-only"
+        } else {
+            "yes"
+        };
         for (key, value) in [
             ("NoNewPrivileges", "yes"),
             ("ProtectSystem", "strict"),
             ("PrivateTmp", "yes"),
-            ("ProtectHome", "yes"),
+            ("ProtectHome", protect_home),
         ] {
             assert_eq!(
                 unit.last_value("Service", key),

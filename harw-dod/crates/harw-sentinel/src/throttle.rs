@@ -86,8 +86,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, Read as _};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1010,28 +1009,20 @@ impl FindingThrottle {
 /// Kein reguläres File (etwa ein Symlink), größer als [`MAX_STATE_BYTES`],
 /// I/O- oder JSON-Fehler.
 fn read_state(path: &Path) -> io::Result<Option<StateDocument>> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    // `O_NOFOLLOW`, Typ und Größe am geöffneten Deskriptor (PL-100 Review
+    // Runde 1, wie die Listener-Historie).
+    let bytes = match crate::health_export::read_regular_bounded(path, MAX_STATE_BYTES)? {
+        crate::health_export::RegularRead::Missing => return Ok(None),
+        crate::health_export::RegularRead::NotRegularFile => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "finding throttle state is not a regular file",
+            ));
+        }
+        crate::health_export::RegularRead::TooLarge => return Err(state_too_large()),
+        crate::health_export::RegularRead::Bytes(bytes) => bytes,
     };
-    if !meta.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "finding throttle state is not a regular file",
-        ));
-    }
-    if meta.len() > MAX_STATE_BYTES {
-        return Err(state_too_large());
-    }
-    let mut text = String::new();
-    File::open(path)?
-        .take(MAX_STATE_BYTES.saturating_add(1))
-        .read_to_string(&mut text)?;
-    if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_STATE_BYTES {
-        return Err(state_too_large());
-    }
-    serde_json::from_str(&text)
+    serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
@@ -1057,6 +1048,8 @@ fn write_state(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::SensorId;

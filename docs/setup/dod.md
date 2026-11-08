@@ -172,7 +172,9 @@ names the main ones):
 - `harw-sentinel` — the unprivileged binary: runs the sensors and the
   collection loop.
 - `harw-probe-fs` — the privileged (`CAP_SYS_ADMIN`) fanotify probe binary;
-  push-only, no receive path.
+  push-only, no receive path. Part of `harw-dod.target`; it watches the
+  persistence locations from `[probe_fs]` (see
+  [below](#fanotify-probe-watch-scope-pl-100-wp16)).
 - `harw-probe-bpf` — the privileged (`CAP_BPF`, `CAP_PERFMON`) eBPF probe
   binary; push-only, no receive path.
 - `harw-warden` — the enforcer binary, listening on a systemd-activated
@@ -237,7 +239,7 @@ more.
   for `harw-probe-bpf` (the loader refuses to attach tracepoint/FEntry
   programs without both); `CAP_SYS_ADMIN` for `harw-probe-fs` (the only
   capability that permits `fanotify_mark` with `FAN_MARK_FILESYSTEM` and
-  the `FAN_UNLIMITED_*` flags it needs); `CAP_DAC_OVERRIDE CAP_NET_ADMIN`
+  the `FAN_UNLIMITED_MARKS` flag it needs); `CAP_DAC_OVERRIDE CAP_NET_ADMIN`
   for `harw-warden` (writing the root-owned `cgroup.freeze`/`cgroup.kill`
   files, and running `nft` for network isolation).
 - **Root-owned files and FHS directories** (default prefix `/usr/local`;
@@ -543,7 +545,7 @@ Both are optional sentinel flags; the shipped unit enables both:
 | File | Flag | Written | Content |
 |---|---|---|---|
 | `/var/lib/harw-dod/export/findings.jsonl` | `--findings-export <abs path>` | appended per **reported** finding (repeats inside the dedup cooldown are not written); rotated at 16 MiB (`--findings-export-keep`) | one JSON object per line: `finding_id` (UUIDv4), `host`, `rule_id`, `severity`, `summary` (escaped, ≤ 512 bytes), `observed_at` (time of the triggering observation), `schema_version: 3`, an optional `scope` (cgroup path) plus `scope_obfuscated`, and the v3 fields `instance` (UUIDv4 per sentinel start), `seq` (from 1; a gap means a lost line), `kind`, `hardness`, `dedup_key`, `occurrences`, `first_seen`, `cgroup_kid?`, `record_digest?` (BLAKE3 of the spooled record) and `evidence_card?` (≤ 4 KiB: event counts, agreeing `uid`/`destination`/`path`/`process{pid,comm}`, all escaped) |
-| `/var/lib/harw-dod/export/health.json` | `--health-export <abs path>` (default: `health.json` next to the findings export) | replaced atomically (temporary file + rename) every poll cycle | `schema_version: 1`, `written_at`, `config_digest`, `profile` (both `null` on built-in defaults), `sensors[]` (`id`, `health` = `bound`/`retrying`/`degraded`, `degrade_reason?`, `last_ok_at?`, `readings_total`, `errors_total`), `ipc` (`probes_connected`, `events_total`, `dropped_total`, `peers_rejected_total`, `events_last_cycle`, `dropped_last_cycle`, `events_last_60s`, `dropped_last_60s`), `ring` (ring entries evicted before the rules saw them: `overflow_{samples,events}_{total,last_cycle,last_60s}`), `windows` (`last_cycle_ms`, `last_60s_ms`), `spool` (`null` without a spool; else `state` = `ok`/`degraded`, `degrade_reason`, cumulative and last-60-s counters) |
+| `/var/lib/harw-dod/export/health.json` | `--health-export <abs path>` (default: `health.json` next to the findings export) | replaced atomically (temporary file + rename) every poll cycle | `schema_version: 1`, `written_at`, `config_digest`, `profile` (both `null` on built-in defaults), `sensors[]` (`id`, `health` = `bound`/`retrying`/`degraded`, `degrade_reason?`, `last_ok_at?`, `readings_total`, `errors_total`), `ipc` (`probes_connected`, `events_total`, `dropped_total`, `peers_rejected_total`, `events_last_cycle`, `dropped_last_cycle`, `events_last_60s`, `dropped_last_60s`), `ring` (ring entries evicted before the rules saw them: `overflow_{samples,events}_{total,last_cycle,last_60s}`), `windows` (`last_cycle_ms`, `last_60s_ms`), `spool` (`null` without a spool; else `state` = `ok`/`degraded`, `degrade_reason`, cumulative and last-60-s counters), `landlock` (`outcome` = `fully_enforced`/`partially_enforced`/`not_enforced`/`failed`, `requested_abi`, `effective_abi` — the kernel's level, `null` without Landlock), `listener_history` (`state` = `ok`/`degraded`, `degrade_reason?`, `keys`, `primed`) |
 
 Versions 2 and 3 of the findings line are additive: a line without
 `schema_version` is version 1, and every reader ignores unknown fields, so
@@ -559,15 +561,185 @@ reported finding (triggering events plus up to 32 ring events as context,
 written by a bounded writer thread). The spool keeps 14 days and at most
 1 GiB, including records nobody consumed. `<--home>/finding-throttle.json`
 (`0600`) persists the dedup cooldown per `dedup_key` across restarts.
+`<--home>/listener-history.json` (`0600`, PL-100 WP1.6) persists the
+listeners the `listener-new` rule already knows: on the very first start the
+sentinel learns every open listener silently and reports only listeners that
+appear later. A history that cannot be used (unreadable, larger than 1 MiB,
+corrupt, foreign version) never stops the sentinel, but it is never relearned
+silently either: the first cycle exports a `sensor-degraded` finding for
+`sentinel-listener-history`, `health.json` reports `listener_history` as
+`degraded` (with `state_unreadable`, `state_not_regular_file`,
+`state_too_large` or `state_invalid`) until the next restart, and the journal
+names the reason. Do not create these files by hand or through tmpfiles.
+
+**Startup checks of the sentinel (PL-100 owner review).**
+
+- *Destinations.* Before any writer opens, the sentinel compares every
+  file it writes by resolved identity (canonical directory plus file name):
+  the findings export and its rotations `<name>.N`, the health document
+  and its temporary sibling `.<name>.tmp`, the throttle state
+  `<--home>/finding-throttle.json` with its `.finding-throttle.json.tmp`,
+  the listener history `<--home>/listener-history.json` with its
+  `.listener-history.json.tmp`, and the IPC socket (`--socket`, default
+  `<--home>/sentinel.sock`), which is unlinked and re-bound at every start.
+  `--socket` must be absolute; a socket in a directory that does not exist
+  yet is not compared (binding there fails anyway). Independently, the bind
+  only ever removes an existing *socket*: any other entry at the socket path
+  (a state file, a directory) is left alone and the IPC receive path stays
+  off for that run.
+  If two of them alias each other (also through a symlinked directory), or
+  a directory cannot be resolved, the sentinel refuses to start and exits
+  with "refusing to start: export and state destinations are unsafe". Keep
+  the exports out of `--home` itself; the shipped layout
+  (`--home /var/lib/harw-dod`, exports in `/var/lib/harw-dod/export`)
+  passes.
+- *IPC after Landlock.* The sentinel binds `sentinel.sock` before its
+  Landlock self-restriction but starts the accept and receive threads only
+  afterwards, so every thread that parses probe messages runs inside the
+  sandbox. A probe that connects in between waits in the socket backlog.
+- *Undecodable probe messages.* A message from an admitted probe that is
+  not a valid event or exceeds the receive buffer is discarded and counted:
+  once per poll cycle the sentinel logs one `warn` line with the count
+  (never the payload) and reports the total as the meta-metric
+  `sensor_parse_errors_total` (expected: `0`).
+
+**Non-Linux builds.** The sentinel's IPC path and Landlock are Linux-only;
+on other Unix targets the binary still compiles and runs without them
+(no probe socket, Landlock reported as not enforced). Check that build
+with
+
+```sh
+rustup target add x86_64-unknown-freebsd
+cargo check -p harw-sentinel --target x86_64-unknown-freebsd
+```
+
+Build scripts of dependencies with C or assembly parts may need a C
+compiler for the target (`CC_x86_64_unknown_freebsd`). Non-Unix targets
+(Windows) are out of scope: workspace crates the sentinel depends on
+(`harw-fsutil`, `harw-home`, the spool in `harw-dod-sentinel`) are
+Unix-only.
 
 ### Sentinel flags added by PL-100 Phase 0
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--finding-cooldown-secs <n>` | `600` (0 … 604800) | a repeat of the same `dedup_key` (rule, uid, cgroup, coarse subject such as /24 or /64 plus port) inside this window only raises `occurrences`; stronger hardness, higher severity or a clock jump back report it again |
-| `--probe-peer-user <name\|uid>` | `harw-probe-bpf`, `harw-probe-fs` | accounts whose processes may submit events over the IPC socket (`SO_PEERCRED`; repeatable, replaces the default). uid 0 is always allowed; other peers are closed unread and counted in `ipc.peers_rejected_total` |
+| `--finding-cooldown-secs <n>` | `[sentinel] finding_cooldown_secs`, else `600` (0 … 604800) | a repeat of the same `dedup_key` (rule, uid, cgroup, coarse subject such as /24 or /64 plus port) inside this window only raises `occurrences`; stronger hardness, higher severity or a clock jump back report it again |
+| `--probe-peer-user <name\|uid>` | `[sentinel] probe_peer_users`, else `harw-probe-bpf`, `harw-probe-fs` | accounts whose processes may submit events over the IPC socket (`SO_PEERCRED`; repeatable, replaces the configured list and the default). uid 0 is always allowed; other peers are closed unread and counted in `ipc.peers_rejected_total` |
 | `--workspace-root <abs dir>` | none | the workspace drift sensor and its Landlock read root run only with an explicit absolute directory; `/` and relative roots are refused |
-| `--print-sandbox` | off | prints the effective Landlock read/read-write roots, refused roots with their reason and the admitted IPC peer uids, then exits (run it with the same flags as the unit) |
+| `--container-sensor <auto\|on\|off>` | `[sentinel] container_sensor`, else `auto` | container sensor (PL-100 WP1.8): `auto` and `on` run one sensor per known layout (`libpod-*.scope` below `/sys/fs/cgroup/machine.slice`, `docker-*.scope` below `system.slice`), even when no runtime is detected at start (rootful Podman is daemonless, and the sentinel starts before the first container); `off` runs none. With `auto` on a cgroup v2 root, a cgroup directory that does not exist yet (systemd creates `machine.slice` only with the first container) is an empty reading, never a degraded sensor; without a cgroup v2 root the container sensors report themselves degraded at the first poll. With `on`, a layout whose runtime was detected neither by its socket (`/run/podman/podman.sock`, `/run/docker.sock`) nor by a running scope at start and that has no cgroup directory reports the sensor as degraded. Docker with the `cgroupfs` driver (`/sys/fs/cgroup/docker/<id>`, no `.scope` names) is not supported: with `auto` and `on` the sentinel reports it once per start as `sensor-degraded` (sensor `container-docker-cgroupfs`) instead of staying silently blind. Every container scope is reported only as `container_unowned_<id>` (the sentinel has no list of containers harw started) |
+| `--print-sandbox` | off | prints the effective Landlock read/read-write roots, refused roots with their reason, the state files below `--home` (`state-file`), where the probe accounts come from (`ipc-peer-source`: `command-line`, `dod-config` or `built-in`), the admitted IPC peer uids and the container switch with its source, layouts and their availability rule (`container-sensor`, `container-layout` … `on-demand`/`required`) and unsupported layouts (`container-unsupported`), then exits (run it with the same flags as the unit) |
+
+**Sentinel settings in `config.toml` (PL-100).** The optional table
+`[sentinel]` of `/etc/harw-dod/config.toml` sets the two values above
+without editing the unit; a command-line flag always wins, and without flag
+and key the built-in default applies:
+
+```toml
+[sentinel]
+probe_peer_users = ["harw-probe-bpf", "harw-probe-fs"]   # at most 32; [] admits uid 0 only
+finding_cooldown_secs = 600                              # 0 ... 604800
+container_sensor = "auto"                                # "auto", "on" or "off"
+```
+
+The table is additive (`schema_version` stays `1`), but readers built before
+it refuse a file that contains it — update every DoD component (sentinel,
+probes, harw) before adding the table. The shipped files show it commented
+out.
+
+**Sysfs alias roots (PL-100 WP1.10).** The entries of `/sys/class/thermal`,
+`/sys/block` and `/sys/class/drm` are symlinks into `/sys/devices`. The
+thermal, blockio and GPU sensors therefore read them through alias roots
+(one symlink level per class entry into `/sys/devices`), and the sentinel's
+Landlock ruleset grants `/sys/devices` read-only; `--print-sandbox` lists it
+as `landlock\tread\t"/sys/devices"`. Fixture roots outside `/sys` stay plain
+roots. `/proc` was already a read root; the auid (`/proc/<pid>/loginuid`) is
+read by `harw-probe-fs`, whose Landlock ruleset now includes `/proc`
+read-only.
+
+#### fanotify probe watch scope (PL-100 WP1.6)
+
+`harw-probe-fs` is part of `harw-dod.target`. Its unit passes
+`--config /etc/harw-dod/config.toml` (group `harw-dod-config`; a missing,
+untrusted or invalid file refuses the start) and no placeholder root. The
+watch scope comes from the optional table `[probe_fs]`, per key, else from
+built-in defaults that cover the locations of the `persistence-write` rule:
+
+```toml
+[probe_fs]
+# every write below these directories counts
+scope_roots = ["/etc", "/var/spool/cron", "/var/spool/at", "/usr/lib/systemd",
+               "/usr/local/lib/systemd", "/lib/systemd", "/usr/share/systemd",
+               "/usr/local/share/systemd", "/usr/lib/udev/rules.d",
+               "/usr/local/lib/udev/rules.d", "/lib/udev/rules.d"]
+# directories holding home directories, or home directories themselves
+home_roots = ["/home", "/var/home", "/root", "/var/roothome"]
+# below a home root only paths that start, after at most two components
+# (the user name, or domain and user name), with one of these entries count
+home_entries = [".ssh", ".config/systemd", ".local/share/systemd", ".config/autostart",
+                ".config/environment.d", ".pam_environment", ".bashrc", ".bash_aliases",
+                ".bash_profile", ".bash_login", ".bash_logout", ".profile", ".zshrc",
+                ".zprofile", ".zshenv", ".zlogin"]
+```
+
+No user name appears in the file, and a directory an attacker creates later
+(`~/.config/autostart`) is still covered: Landlock and the fanotify marks
+span the whole home roots, only forwarding is filtered (a browser cache
+write never reaches the sentinel). Roots are absolute, never `/`, at most 64
+per list. `--scope-root`/`--home-root` replace both root lists,
+`--home-entry` the entries; the shipped files show the table commented out
+(reader-first). The unit uses `ProtectHome=read-only` instead of `yes`, so
+the home roots stay visible to the probe. The probe also:
+
+- coalesces repeated writes of one process to one file within 2 s into one
+  event (`FAN_MODIFY` and `FAN_CLOSE_WRITE` give the same `file-write`);
+- keeps the kernel bound on its event queue (`fs.fanotify.max_queued_events`,
+  default 16384; no `FAN_UNLIMITED_QUEUE`), so a writer faster than the probe
+  cannot grow kernel memory without bound, and reports a queue overflow as
+  `SensorDegraded` of its sensor id (`fsmon-0`), which the sentinel exports
+  as a `sensor-degraded` finding;
+- places its fanotify marks before the Landlock self-restriction: a root the
+  probe account cannot read (`/var/spool/cron` and `/var/spool/at` with mode
+  `0700`, `/root`) is marked through its nearest readable ancestor on the
+  same filesystem (`FAN_MARK_FILESYSTEM` marks the whole filesystem anyway).
+  If a root lies on a filesystem without any readable path at or above it
+  (for example a separate `/var` or `/root` with mode `0700`), its writes are
+  not observed: the probe logs a `warn` line with counts only and sends one
+  `SensorDegraded` of its sensor id at start, so the sentinel exports a
+  `sensor-degraded` finding instead of staying silently blind;
+- marks every filesystem mounted below a root at start as well (read from
+  `/proc/self/mountinfo`, at most 4 MiB; `autofs` triggers are not touched):
+  an NFS or autofs home, a systemd-homed or ecryptfs mount below `/home` is
+  marked through its mount point, and one it cannot mark counts as uncovered
+  and leads to the same start-time `SensorDegraded`. Mounts that appear after
+  the start (systemd-homed or autofs at login) and roots that were absent at
+  start (for example `/var/spool/cron` before cronie is installed; their
+  number is logged on `info`) stay unobserved until the probe restarts
+  (`sudo systemctl restart harw-probe-fs.service`). Like a root itself, a
+  hung hard NFS mount below a root stalls the start;
+- opens every event descriptor and every mark target non-blocking
+  (`O_NONBLOCK`), so a FIFO without a writer below a watched root cannot stall
+  the probe;
+- reads `/proc/<pid>/loginuid` for the auid (Landlock read root `/proc`);
+- treats an event the kernel could not open for it (a write on the marked
+  filesystem outside the Landlock read roots, `EACCES`/`EPERM`) as skipped,
+  not as a sensor error.
+
+**Rule configuration of the host (PL-100 WP1.6).** Before its Landlock
+self-restriction the sentinel builds the configuration of the path and
+listener rules: the canonical `--workspace-root` (starts below it are an
+`exec-writable-path` anomaly), every distinct home directory from
+`/etc/passwd` that is not already a fixed location (`/home/<name>`, `/root`,
+`/var/home/<name>`, `/var/roothome`) or a system directory (`/`, `/usr/…`,
+`/bin`, … are skipped; at most 256), and the ephemeral port range from
+`/proc/sys/net/ipv4/ip_local_port_range` (default `32768 60999`). Home
+directories are never canonicalised (that would walk every path component
+and could trigger an automount or hang on a stale NFS server before the
+first poll); only a symlink directly below `/` (for example
+`/home -> var/home`) is read with `readlink` and the home is added in that
+resolved spelling as well. The journal shows only counts (`rule
+configuration resolved`), never a home path. On `warn`, a finding carries only its rule id, severity and
+`occurrences`; summaries (which may contain escaped paths with account
+names), ids, the dedup key and the scope are on `debug` only.
 
 The egress rule uses the active profile's `egress_allow_cidrs` as its
 allowed network scope; with an empty list every egress flow is a High
@@ -722,11 +894,12 @@ target list).
    ```
    Runs the explicit configuration/profile validation first and refuses to
    enable without a chosen `active_profile` (`harw dod enable` exits `3`). This starts and enables
-   `harw-sentinel.service` and `harw-probe-bpf.service` under
-   `harw-dod.target` — observation only, never the Warden.
-   `harw-probe-fs.service` is installed but not part of the target: set its
-   `--scope-root` in a drop-in, then `systemctl enable --now
-   harw-probe-fs.service`.
+   `harw-sentinel.service`, `harw-probe-bpf.service` and
+   `harw-probe-fs.service` under `harw-dod.target` — observation only,
+   never the Warden. The fanotify probe watches the persistence locations
+   from `[probe_fs]` or its built-in defaults (see
+   [above](#fanotify-probe-watch-scope-pl-100-wp16)); a drop-in with
+   `--scope-root`/`--home-root` narrows or widens that.
 
 ### The Warden — shipped but disabled
 
@@ -762,7 +935,9 @@ policy file is **planned (PL-100 Phase 3.1)**.
   configuration explicitly: `harw-sentinel --config
   /etc/harw-dod/config.toml --home /var/lib/harw-dod --socket
   /run/harw/sentinel.sock --findings-export …/export/findings.jsonl
-  --health-export …/export/health.json` and `harw-probe-bpf --config …`.
+  --health-export …/export/health.json`, `harw-probe-bpf --config …` and
+  `harw-probe-fs --config …` (the fanotify probe, too, refuses to start on
+  an unusable explicit configuration).
   With an explicit `--config`, a missing, untrusted (wrong owner,
   group/world writable, symlink) or invalid configuration makes the
   sentinel refuse to start; only when started **without** `--config` (by

@@ -9,7 +9,9 @@
 //! selbst über [Landlock](https://docs.kernel.org/userspace-api/landlock.html)
 //! auf genau die Verzeichnisse, die seine Sensoren tatsächlich lesen
 //! (`--proc-root`, `--thermal-root`, `--blockio-root`, `--gpu-root`,
-//! `--cgroup-root` und, nur wenn ausdrücklich angegeben, `--workspace-root`)
+//! `--cgroup-root` und, nur wenn ausdrücklich angegeben, `--workspace-root`;
+//! dazu das Zielpräfix `/sys/devices` der sysfs-Alias-Wurzeln von Thermal,
+//! Blockio und GPU, PL-100 WP1.10, siehe `crate::sensors::sysfs_alias_prefixes`)
 //! plus lesend-schreibend den Root-Space (Telemetrie-Sink, IPC-Socket) —
 //! eine zweite, vom Sensor-Vertrag unabhängige Schranke, falls eine künftige
 //! Änderung versehentlich einen Lesezugriff außerhalb des vorgesehenen
@@ -97,9 +99,24 @@
 //!
 //! # Nebenläufigkeit
 //! [`restrict_self`] wird genau einmal beim Start aus dem Hauptthread
-//! aufgerufen, bevor irgendein weiterer Thread (IPC-Empfangsschleife,
-//! `Sentinel`-Sammelschleife) startet — eine Prozess-weite Landlock-Regel
-//! gilt für alle Threads, die *danach* entstehen.
+//! aufgerufen, bevor irgendein weiterer Thread (IPC-Annahme- und
+//! Empfangsthreads, Spool-Schreibthread, `Sentinel`-Sammelschleife)
+//! startet — Landlock beschränkt den aufrufenden Thread und jeden Thread,
+//! der *danach* entsteht; ein schon laufender Thread bliebe außerhalb.
+//! [`restrict_self`] liefert deshalb einen [`SandboxApplied`]-Beleg, und
+//! `crate::run` startet die IPC-Empfangsthreads nur mit diesem Beleg (der
+//! Socket selbst wird vorher gebunden, weil `/run/harw` keine
+//! Landlock-Wurzel ist; PL-100 Owner-Review). Den Beleg kann außerhalb
+//! dieses Moduls niemand bauen.
+//!
+//! # Nur Linux
+//! Landlock ist eine Linux-Schnittstelle; die `landlock`-Crate ruft
+//! Linux-Syscalls direkt auf und ist deshalb nur auf Linux eine Abhängigkeit
+//! (`Cargo.toml`, `target.'cfg(target_os = "linux")'`). Auf anderen
+//! Plattformen prüft [`prepare_roots`] dieselben Wurzeln mit gewöhnlichen
+//! Deskriptoren (für `--print-sandbox`), und [`restrict_self`] meldet
+//! [`SandboxOutcome::NotEnforced`] — dieselbe Degradation wie auf einem
+//! Linux-Kernel ohne Landlock.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -115,10 +132,33 @@ use jiff::Timestamp;
 // Trait-Import wäre höchstens eine ungenutzte-Import-Warnung, kein
 // Kompilierfehler — das Gegenteil (ein fehlender Import) wäre einer, daher
 // die bewusst vollständige Liste.
+#[cfg(target_os = "linux")]
 use landlock::{
     ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, RestrictionStatus,
     Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
 };
+
+/// Der geprüfte Deskriptor einer Wurzel: auf Linux der `O_PATH`-Deskriptor,
+/// aus dem die Landlock-Regel entsteht.
+#[cfg(target_os = "linux")]
+type RootFd = PathFd;
+
+/// Siehe die Linux-Fassung: ohne Landlock nur ein gewöhnlich geöffneter
+/// Deskriptor für die Identitätsprüfung von `--print-sandbox`.
+#[cfg(not(target_os = "linux"))]
+type RootFd = std::fs::File;
+
+/// Öffnet den Deskriptor einer Wurzel (`O_PATH` auf Linux).
+#[cfg(target_os = "linux")]
+fn open_root_fd(path: &Path) -> Option<RootFd> {
+    PathFd::new(path).ok()
+}
+
+/// Siehe die Linux-Fassung.
+#[cfg(not(target_os = "linux"))]
+fn open_root_fd(path: &Path) -> Option<RootFd> {
+    std::fs::File::open(path).ok()
+}
 
 /// Kennung, unter der dieses Binary seine eigene Landlock-Selbstbeschränkung
 /// im Ereignisvokabular anspricht (siehe Moduldoku, Abschnitt
@@ -192,6 +232,119 @@ impl SandboxOutcome {
     pub const fn is_degraded(self) -> bool {
         matches!(self, Self::NotEnforced | Self::Failed)
     }
+
+    /// Stabiler Bezeichner für `health.json` (`landlock.outcome`, PL-100
+    /// WP0.7) und das Journal.
+    ///
+    /// Erschöpfendes `match` ohne Wildcard: ein neues Ergebnis bricht den
+    /// Build, statt unter falschem Namen exportiert zu werden.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FullyEnforced => "fully_enforced",
+            Self::PartiallyEnforced => "partially_enforced",
+            Self::NotEnforced => "not_enforced",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Die Landlock-ABI, deren Zugriffsrechte [`restrict_self`] anfordert
+/// (`landlock::ABI::V1`; `--print-sandbox` nennt sie in seiner Kopfzeile).
+pub const REQUESTED_ABI: u8 = 1;
+
+/// Was `health.json` über die Selbstbeschränkung meldet (Objekt
+/// `landlock`, PL-100 WP0.7, Host-Verifikation).
+///
+/// # Description
+/// `outcome` ist das Ergebnis des einen Versuchs, `requested_abi` die
+/// angeforderte ABI-Stufe ([`REQUESTED_ABI`]), `effective_abi` die vom
+/// laufenden Kernel unterstützte und von der `landlock`-Crate genutzte Stufe
+/// (`None`, wenn der Kernel kein Landlock kennt, es abgeschaltet ist oder
+/// der Versuch vor `restrict_self()` scheiterte).
+///
+/// # Concurrency
+/// Reiner Werttyp, `Copy + Send + Sync`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LandlockReport {
+    /// Ergebnis der Selbstbeschränkung.
+    pub outcome: SandboxOutcome,
+    /// Angeforderte ABI-Stufe.
+    pub requested_abi: u8,
+    /// Vom Kernel unterstützte ABI-Stufe, soweit bekannt.
+    pub effective_abi: Option<u8>,
+}
+
+/// Beleg, dass dieser Prozess seine Landlock-Selbstbeschränkung versucht
+/// hat — gleich mit welchem [`SandboxOutcome`].
+///
+/// # Description
+/// Nur [`restrict_self`] baut ihn (das Feld ist privat). Was nach der
+/// Selbstbeschränkung starten muss — die IPC-Annahme- und Empfangsthreads
+/// (`crate::run`, `BoundIpc::start_receiving`) —, verlangt ihn als
+/// Argument; ein Aufruf vor [`restrict_self`] ist damit ein Compile-Fehler,
+/// keine Konvention (PL-100 Owner-Review: Threads, die vor Landlock laufen,
+/// bleiben außerhalb der Schranke). Auch ein degradiertes Ergebnis ergibt
+/// einen Beleg: die Reihenfolge gilt unabhängig davon, ob der Kernel die
+/// Regel durchsetzt.
+///
+/// # Concurrency
+/// Reiner Werttyp, `Send + Sync`; nicht `Clone`, damit es genau einen gibt.
+#[derive(Debug)]
+pub struct SandboxApplied {
+    // Ergebnis des einen Versuchs.
+    outcome: SandboxOutcome,
+    // Vom Kernel unterstützte ABI-Stufe, soweit `restrict_self()` sie
+    // gemeldet hat.
+    effective_abi: Option<u8>,
+}
+
+impl SandboxApplied {
+    /// Das Ergebnis der Selbstbeschränkung.
+    #[must_use]
+    pub const fn outcome(&self) -> SandboxOutcome {
+        self.outcome
+    }
+
+    /// Der Bericht für `health.json` (PL-100 WP0.7).
+    ///
+    /// # Returns
+    /// Ergebnis, angeforderte ([`REQUESTED_ABI`]) und vom laufenden Kernel
+    /// unterstützte ABI-Stufe (`None` ohne Landlock-Unterstützung, außerhalb
+    /// von Linux oder wenn der Versuch vor `restrict_self()` scheiterte).
+    #[must_use]
+    pub const fn report(&self) -> LandlockReport {
+        LandlockReport {
+            outcome: self.outcome,
+            requested_abi: REQUESTED_ABI,
+            effective_abi: self.effective_abi,
+        }
+    }
+
+    /// Ein Beleg ohne echten Landlock-Aufruf — nur für Tests, die die
+    /// Startreihenfolge nachstellen (ein echtes `restrict_self` würde den
+    /// Testprozess beschränken).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn assumed_for_test(outcome: SandboxOutcome) -> Self {
+        Self {
+            outcome,
+            effective_abi: None,
+        }
+    }
+
+    /// Wie [`Self::assumed_for_test`], mit einer gemeldeten ABI-Stufe.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn assumed_with_abi_for_test(
+        outcome: SandboxOutcome,
+        effective_abi: Option<u8>,
+    ) -> Self {
+        Self {
+            outcome,
+            effective_abi,
+        }
+    }
 }
 
 /// Warum [`prepare_roots`] eine Wurzel nicht in die Landlock-Regel aufnimmt.
@@ -233,8 +386,10 @@ impl RootRefusal {
 pub struct PreparedRoot {
     /// Die angeforderte Wurzel.
     pub root: SandboxRoot,
-    /// Der geprüfte Deskriptor (`O_PATH`).
-    fd: PathFd,
+    /// Der geprüfte Deskriptor (`O_PATH` auf Linux). Ohne Landlock wird er
+    /// nur zur Prüfung geöffnet, nie gelesen.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fd: RootFd,
 }
 
 /// Ergebnis von [`prepare_roots`].
@@ -278,16 +433,22 @@ fn filesystem_root_identity() -> Option<FileIdentity> {
 
 /// Identität des bereits geöffneten Deskriptors (`fstat` auf einem Duplikat
 /// des `O_PATH`-Deskriptors; seit Linux 3.6 erlaubt).
-#[cfg(unix)]
-fn fd_identity(fd: &PathFd) -> Option<FileIdentity> {
+#[cfg(target_os = "linux")]
+fn fd_identity(fd: &RootFd) -> Option<FileIdentity> {
     use std::os::fd::AsFd as _;
     let owned = fd.as_fd().try_clone_to_owned().ok()?;
     let file = std::fs::File::from(owned);
     file.metadata().ok().map(|meta| identity_of(&meta))
 }
 
+/// Siehe die Linux-Fassung; hier ist der Deskriptor eine gewöhnliche Datei.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn fd_identity(fd: &RootFd) -> Option<FileIdentity> {
+    fd.metadata().ok().map(|meta| identity_of(&meta))
+}
+
 #[cfg(not(unix))]
-fn fd_identity(_fd: &PathFd) -> Option<FileIdentity> {
+fn fd_identity(_fd: &RootFd) -> Option<FileIdentity> {
     None
 }
 
@@ -303,14 +464,14 @@ fn is_lexical_filesystem_root(path: &Path) -> bool {
 fn prepare_root(
     root: &SandboxRoot,
     filesystem_root: Option<FileIdentity>,
-) -> Result<PathFd, RootRefusal> {
+) -> Result<RootFd, RootRefusal> {
     if !root.path.is_absolute() {
         return Err(RootRefusal::Relative);
     }
     if is_lexical_filesystem_root(&root.path) {
         return Err(RootRefusal::FilesystemRoot);
     }
-    let fd = PathFd::new(&root.path).map_err(|_| RootRefusal::Unavailable)?;
+    let fd = open_root_fd(&root.path).ok_or(RootRefusal::Unavailable)?;
     let Some(filesystem_root) = filesystem_root else {
         // Ohne Vergleichswert (keine Unix-Plattform) bleibt es bei der
         // lexikalischen Prüfung oben.
@@ -373,12 +534,28 @@ pub fn prepare_roots(roots: &[SandboxRoot]) -> PreparedRoots {
     prepared
 }
 
+#[cfg(target_os = "linux")]
 fn classify(status: RestrictionStatus) -> SandboxOutcome {
     match status.ruleset {
         RulesetStatus::FullyEnforced => SandboxOutcome::FullyEnforced,
         RulesetStatus::PartiallyEnforced => SandboxOutcome::PartiallyEnforced,
         RulesetStatus::NotEnforced => SandboxOutcome::NotEnforced,
     }
+}
+
+/// Die Zahl einer Landlock-ABI-Stufe (`None` für `ABI::Unsupported`).
+///
+/// # Description
+/// Über die `Display`-Form der Crate (`"unsupported"` bzw. die Stufe als
+/// Zahl), nicht über einen `as`-Cast oder ein Aufzählen der Varianten:
+/// `landlock::ABI` ist `#[non_exhaustive]`, und eine neuere Crate-Fassung
+/// mit weiteren Stufen meldet so ihre Zahl statt still `None`.
+#[cfg(target_os = "linux")]
+fn abi_number(abi: ABI) -> Option<u8> {
+    abi.to_string()
+        .parse::<u8>()
+        .ok()
+        .filter(|level| *level > 0)
 }
 
 /// Versucht, den aufrufenden Prozess über Landlock auf `roots` zu
@@ -388,34 +565,49 @@ fn classify(status: RestrictionStatus) -> SandboxOutcome {
 /// Baut ein `landlock::Ruleset` mit `CompatLevel::BestEffort` (siehe
 /// Moduldoku für die Begründung, warum dieser Prozess nie hart abbricht),
 /// nimmt für jede von [`prepare_roots`] angenommene Wurzel eine
-/// `PathBeneath`-Regel mit [`AccessFs::from_all`] (`writable`) oder
-/// [`AccessFs::from_read`] (sonst) unter [`landlock::ABI::V1`] auf, und ruft
+/// `PathBeneath`-Regel mit `AccessFs::from_all` (`writable`) oder
+/// `AccessFs::from_read` (sonst) unter `landlock::ABI::V1` auf, und ruft
 /// `restrict_self()` auf dem Ergebnis. Eine abgewiesene Wurzel (relativ,
 /// `/` in irgendeiner Schreibweise, nicht prüfbar oder nicht öffenbar,
 /// z. B. ein noch nicht angelegtes Verzeichnis) wird übersprungen und
 /// geloggt — sie bricht den gesamten Versuch nicht ab und weitet ihn nie.
+/// Außerhalb von Linux ist das Ergebnis immer
+/// [`SandboxOutcome::NotEnforced`] (siehe Moduldoku, „Nur Linux").
 ///
 /// # Arguments
 /// - `roots` (`&[SandboxRoot]`): die zu erlaubenden Pfade.
 ///
 /// # Returns
-/// Das erreichte [`SandboxOutcome`]. Nie ein `Result` — siehe Moduldoku.
+/// Den [`SandboxApplied`]-Beleg mit dem erreichten [`SandboxOutcome`]. Nie
+/// ein `Result` — siehe Moduldoku.
 ///
 /// # Concurrency
-/// Nur vor dem Start weiterer Threads aufrufen (siehe Moduldoku).
+/// Nur vor dem Start weiterer Threads aufrufen (siehe Moduldoku); was
+/// danach starten muss, verlangt den zurückgegebenen Beleg.
 ///
 /// # Examples
 /// ```rust,no_run
-/// use harw_sentinel::sandbox::{restrict_self, SandboxOutcome, SandboxRoot};
+/// use harw_sentinel::sandbox::{restrict_self, SandboxRoot};
 /// use std::path::PathBuf;
 ///
-/// let outcome = restrict_self(&[SandboxRoot::read_only(PathBuf::from("/proc"))]);
-/// if outcome.is_degraded() {
-///     eprintln!("running without landlock sandboxing");
-/// }
+/// let sandbox = restrict_self(&[SandboxRoot::read_only(PathBuf::from("/proc"))]);
+/// let degraded = sandbox.outcome().is_degraded();
+/// # let _ = degraded;
 /// ```
 #[must_use]
-pub fn restrict_self(roots: &[SandboxRoot]) -> SandboxOutcome {
+pub fn restrict_self(roots: &[SandboxRoot]) -> SandboxApplied {
+    let (outcome, effective_abi) = attempt_restriction(roots);
+    SandboxApplied {
+        outcome,
+        effective_abi,
+    }
+}
+
+/// Der eigentliche Landlock-Versuch hinter [`restrict_self`]: Ergebnis und
+/// die vom Kernel unterstützte ABI-Stufe (nur nach `restrict_self()`
+/// bekannt).
+#[cfg(target_os = "linux")]
+fn attempt_restriction(roots: &[SandboxRoot]) -> (SandboxOutcome, Option<u8>) {
     let abi = ABI::V1;
 
     let ruleset = Ruleset::default().set_compatibility(CompatLevel::BestEffort);
@@ -423,7 +615,7 @@ pub fn restrict_self(roots: &[SandboxRoot]) -> SandboxOutcome {
         Ok(ruleset) => ruleset,
         Err(error) => {
             tracing::warn!(error = %error, "landlock handle_access failed; running without filesystem sandboxing");
-            return SandboxOutcome::Failed;
+            return (SandboxOutcome::Failed, None);
         }
     };
 
@@ -431,7 +623,7 @@ pub fn restrict_self(roots: &[SandboxRoot]) -> SandboxOutcome {
         Ok(created) => created.set_compatibility(CompatLevel::BestEffort),
         Err(error) => {
             tracing::warn!(error = %error, "landlock ruleset create failed; running without filesystem sandboxing");
-            return SandboxOutcome::Failed;
+            return (SandboxOutcome::Failed, None);
         }
     };
 
@@ -446,33 +638,52 @@ pub fn restrict_self(roots: &[SandboxRoot]) -> SandboxOutcome {
         Ok(created) => created,
         Err(error) => {
             tracing::warn!(error = %error, "landlock add_rules failed; running without filesystem sandboxing");
-            return SandboxOutcome::Failed;
+            return (SandboxOutcome::Failed, None);
         }
     };
 
     match created.restrict_self() {
         Ok(status) => {
-            // `no_new_privs` zuerst herauskopieren: `classify` nimmt
-            // `status` als Wert entgegen, und ob `RestrictionStatus`
-            // `Copy` ist, ist hier bewusst nicht vorausgesetzt.
+            // `no_new_privs` und die Kernel-Stufe zuerst herauskopieren:
+            // `classify` nimmt `status` als Wert entgegen, und ob
+            // `RestrictionStatus` `Copy` ist, ist hier bewusst nicht
+            // vorausgesetzt (`LandlockStatus` ist `Copy`).
             let no_new_privs = status.no_new_privs;
+            let effective_abi = abi_number(ABI::from(status.landlock));
             let outcome = classify(status);
             tracing::info!(
-                ?outcome,
+                outcome = outcome.label(),
+                requested_abi = REQUESTED_ABI,
+                effective_abi,
                 no_new_privs,
                 "landlock self-restriction attempted"
             );
-            outcome
+            (outcome, effective_abi)
         }
         Err(error) => {
             tracing::warn!(error = %error, "landlock restrict_self failed; running without filesystem sandboxing");
-            SandboxOutcome::Failed
+            (SandboxOutcome::Failed, None)
         }
     }
 }
 
+/// Siehe die Linux-Fassung: ohne Landlock prüft dieser Aufruf die Wurzeln
+/// nur (wie `--print-sandbox`) und meldet [`SandboxOutcome::NotEnforced`]
+/// ohne ABI-Stufe.
+#[cfg(not(target_os = "linux"))]
+fn attempt_restriction(roots: &[SandboxRoot]) -> (SandboxOutcome, Option<u8>) {
+    let prepared = prepare_roots(roots);
+    tracing::info!(
+        accepted = prepared.accepted.len(),
+        refused = prepared.refused.len(),
+        "landlock is linux-only; running without filesystem sandboxing"
+    );
+    (SandboxOutcome::NotEnforced, None)
+}
+
 /// Baut die `PathBeneath`-Regel einer geprüften Wurzel aus genau dem
 /// Deskriptor, den [`prepare_roots`] geprüft hat.
+#[cfg(target_os = "linux")]
 fn rule_for(prepared: PreparedRoot, abi: ABI) -> PathBeneath<PathFd> {
     let access = if prepared.root.writable {
         AccessFs::from_all(abi)
@@ -563,8 +774,9 @@ pub fn default_roots(
 #[cfg(test)]
 mod tests {
     use super::{
-        LANDLOCK_STATUS_SENSOR_ID, RootRefusal, SandboxOutcome, SandboxRoot, default_roots,
-        is_lexical_filesystem_root, landlock_degraded_event, prepare_roots,
+        LANDLOCK_STATUS_SENSOR_ID, LandlockReport, REQUESTED_ABI, RootRefusal, SandboxApplied,
+        SandboxOutcome, SandboxRoot, default_roots, is_lexical_filesystem_root,
+        landlock_degraded_event, prepare_roots,
     };
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_signals::EventKind;
@@ -773,6 +985,61 @@ mod tests {
         assert!(SandboxOutcome::Failed.is_degraded());
         assert!(!SandboxOutcome::FullyEnforced.is_degraded());
         assert!(!SandboxOutcome::PartiallyEnforced.is_degraded());
+    }
+
+    #[test]
+    fn test_sandbox_applied_carries_its_outcome_also_when_degraded() {
+        for outcome in [
+            SandboxOutcome::FullyEnforced,
+            SandboxOutcome::PartiallyEnforced,
+            SandboxOutcome::NotEnforced,
+            SandboxOutcome::Failed,
+        ] {
+            assert_eq!(SandboxApplied::assumed_for_test(outcome).outcome(), outcome);
+        }
+    }
+
+    /// PL-100 WP0.7: die Bezeichner von `health.json` (`landlock.outcome`)
+    /// sind stabil und eindeutig.
+    #[test]
+    fn test_sandbox_outcome_labels_are_stable() {
+        assert_eq!(SandboxOutcome::FullyEnforced.label(), "fully_enforced");
+        assert_eq!(
+            SandboxOutcome::PartiallyEnforced.label(),
+            "partially_enforced"
+        );
+        assert_eq!(SandboxOutcome::NotEnforced.label(), "not_enforced");
+        assert_eq!(SandboxOutcome::Failed.label(), "failed");
+    }
+
+    /// PL-100 WP0.7: der Bericht trägt Ergebnis, angeforderte und
+    /// unterstützte ABI-Stufe.
+    #[test]
+    fn test_sandbox_applied_reports_outcome_and_abi_levels() {
+        let partial =
+            SandboxApplied::assumed_with_abi_for_test(SandboxOutcome::PartiallyEnforced, Some(3));
+        assert_eq!(partial.outcome(), SandboxOutcome::PartiallyEnforced);
+        assert_eq!(
+            partial.report(),
+            LandlockReport {
+                outcome: SandboxOutcome::PartiallyEnforced,
+                requested_abi: REQUESTED_ABI,
+                effective_abi: Some(3),
+            }
+        );
+        let missing = SandboxApplied::assumed_for_test(SandboxOutcome::NotEnforced).report();
+        assert_eq!(missing.effective_abi, None);
+        assert_eq!(missing.requested_abi, 1);
+    }
+
+    /// Die ABI-Stufe kommt aus der `Display`-Form der Crate; `Unsupported`
+    /// ist keine Stufe.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_abi_number_reads_the_level_and_refuses_unsupported() {
+        assert_eq!(super::abi_number(landlock::ABI::V1), Some(1));
+        assert_eq!(super::abi_number(landlock::ABI::V3), Some(3));
+        assert_eq!(super::abi_number(landlock::ABI::Unsupported), None);
     }
 
     // Bewusst kein Test, der `restrict_self` tatsächlich aufruft: das würde

@@ -2,17 +2,35 @@
 //!
 //! # Zweck
 //! Dieses Binary ist die eine privilegierte Dateisystem-Sonde des
-//! Ausbauprogramms: es überwacht die über `--scope-root` konfigurierten
-//! Verzeichnisse auf Schreibzugriffe, formt jedes Ereignis über
-//! `harw_dod_fsmon` und sendet es an `harw-sentinel`. Es hat **keinen**
-//! Empfangspfad — siehe Abschnitt „Push-Only" unten.
+//! Ausbauprogramms: es überwacht die Persistenz-Orte des Hosts auf
+//! Schreibzugriffe, formt jedes Ereignis über `harw_dod_fsmon` und sendet es
+//! an `harw-sentinel`. Es hat **keinen** Empfangspfad — siehe Abschnitt
+//! „Push-Only" unten.
+//!
+//! # Beobachtungsbereich aus `/etc` (PL-100 WP1.6)
+//! Der Bereich kommt aus `[probe_fs]` der DoD-Konfiguration
+//! (`/etc/harw-dod/config.toml` bzw. `--config`), sonst aus den eingebauten
+//! Vorgaben, die die Orte der Regel `persistence-write` abdecken
+//! (`/etc`, cron- und at-Spool, systemd/udev unter `/usr`, und unter
+//! `/home`, `/var/home`, `/root`, `/var/roothome` nur `.ssh`, die
+//! systemd-User-Units, Autostart, `environment.d` und die
+//! Shell-Startdateien); `--scope-root`/`--home-root`/`--home-entry`
+//! überschreiben ihn. Siehe [`watch`]. Damit gehört die Sonde zu
+//! `harw-dod.target`. Wiederholte Schreibzugriffe desselben Prozesses auf
+//! dieselbe Datei fasst `harw_dod_fsmon::coalesce` zusammen, ein Überlauf
+//! der (begrenzten) Kernel-Warteschlange wird ein `SensorDegraded`, und eine
+//! Wurzel oder ein Einhängepunkt unter ihr (Review R3) auf einem
+//! Dateisystem, das die Sonde nicht markieren konnte, meldet sie beim Start
+//! ebenfalls als `SensorDegraded` ([`collect::report_uncovered_scope`]).
+//! Eine beim Start fehlende Wurzel bleibt bis zum nächsten Start
+//! unbeobachtet; ihre Zahl steht auf `info` im Journal.
 //!
 //! # Berechtigungsklasse
 //! `harw_dod_cap::Capability::WatchFilesystem`, Klasse
 //! `harw_dod_cap::CapabilityClass::FileWatch` — die eine Fähigkeit, für die
 //! dieses Binary existiert. Dieser Prozess läuft produktiv mit
 //! `CAP_SYS_ADMIN` — die einzige Capability, die `fanotify_mark` mit
-//! `FAN_MARK_FILESYSTEM` und die beiden `FAN_UNLIMITED_*`-Flags erlaubt
+//! `FAN_MARK_FILESYSTEM` und `FAN_UNLIMITED_MARKS` erlaubt
 //! (siehe unten, Abschnitt „Stand der fanotify-Bindung", und
 //! [`source`]-Moduldoku) — und keine weitere.
 //!
@@ -41,9 +59,14 @@
 //! `ReadScope` gegen das tatsächliche Berechtigungsvermögen des Prozesses
 //! durchsetzt. Ohne sie zu starten hieße, die Verteidigung wegzulassen und
 //! trotzdem das Risiko zu tragen. [`run`] ruft deshalb
-//! [`landlock::enforce_read_scope`] vor jedem weiteren privilegierten
-//! Schritt auf und bricht bei jedem Ausgang außer vollständiger
-//! Durchsetzung hart ab — siehe [`landlock`]-Moduldoku für die Begründung,
+//! [`landlock::enforce_read_scope`] vor dem ersten gelesenen Ereignis auf
+//! und bricht bei jedem Ausgang außer vollständiger Durchsetzung hart ab.
+//! Einzig `fanotify_init`/`fanotify_mark` laufen davor (Review R2): eine
+//! Wurzel wie `/var/spool/cron` (`0700`) wird über ihren nächsten lesbaren
+//! Vorfahren markiert, und der liegt außerhalb der Lesewurzeln. Die
+//! Markierungen überdauern `restrict_self`; die Ereignis-Deskriptoren
+//! öffnet der Kernel erst beim Lesen, also unter Landlock (siehe
+//! [`source`]-Moduldoku). Siehe [`landlock`]-Moduldoku für die Begründung,
 //! warum das (anders als der ursprüngliche Auftrag dieses Knotens vermutet
 //! hatte) heute tatsächlich **gebaut** ist, nicht nur gemeldet.
 //!
@@ -93,8 +116,9 @@
 //! # Examples
 //! ```text
 //! $ harw-probe-fs --log info \
-//!     --scope-root /srv/data \
-//!     --sentinel-socket /run/harw-sentinel.sock
+//!     --config /etc/harw-dod/config.toml \
+//!     --sentinel-socket /run/harw/sentinel.sock
+//! $ harw-probe-fs --scope-root /srv/data --sentinel-socket /run/harw/sentinel.sock
 //! ```
 
 #![forbid(unsafe_code)]
@@ -105,18 +129,21 @@ mod error;
 mod landlock;
 mod sink;
 mod source;
+mod watch;
 
 #[cfg(test)]
 mod push_only_guard;
 
+use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser as _;
 use harw_completions::CompletionsSubcommand;
-use harw_dod_cap::{Capability, ReadScope, SensorHandle};
+use harw_dod_cap::{Capability, SensorHandle};
 use harw_dod_fsmon::FsMonSensor;
 use harw_types::SensorId;
+use jiff::Timestamp;
 
 use cli::{Cli, LogLevel};
 use error::ProbeError;
@@ -146,10 +173,12 @@ fn main() -> ExitCode {
                 err.kind(),
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
             ) {
-                print!("{err}");
+                // Best effort: help/version text is diagnostic output only.
+                let _ = write!(std::io::stdout().lock(), "{err}");
                 return ExitCode::SUCCESS;
             }
-            eprint!("{err}");
+            // Best effort: clap's usage text is diagnostic output only.
+            let _ = write!(std::io::stderr().lock(), "{err}");
             return ExitCode::FAILURE;
         }
     };
@@ -162,7 +191,7 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 tracing::error!(error = %err, "harw-probe-fs completions failed");
-                eprintln!("harw-probe-fs: {err}");
+                report(&err);
                 ExitCode::FAILURE
             }
         };
@@ -176,7 +205,8 @@ fn main() -> ExitCode {
             clap::error::ErrorKind::MissingRequiredArgument,
             "the following required argument was not provided: --sentinel-socket <PATH>",
         );
-        eprint!("{err}");
+        // Best effort: clap's usage text is diagnostic output only.
+        let _ = write!(std::io::stderr().lock(), "{err}");
         return ExitCode::FAILURE;
     };
 
@@ -184,10 +214,18 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(error = %err, "harw-probe-fs exiting");
-            eprintln!("harw-probe-fs: {err}");
+            report(&err);
             ExitCode::FAILURE
         }
     }
+}
+
+/// Writes one `harw-probe-fs:` diagnostic line to stderr, best effort.
+///
+/// Arguments: `err` is the error to print. Returns nothing; a failed stderr
+/// write has no further channel to report on, so it is discarded on purpose.
+fn report(err: &impl std::fmt::Display) {
+    let _ = writeln!(std::io::stderr().lock(), "harw-probe-fs: {err}");
 }
 
 /// Initialisiert den globalen `tracing`-Subscriber.
@@ -246,45 +284,102 @@ fn run_completions(args: &harw_completions::CompletionsArgs) -> Result<(), Probe
 /// Führt den eigentlichen Sondenbetrieb aus.
 ///
 /// # Description
-/// Reihenfolge: den `ReadScope` aus `--scope-root` bauen, sich **zuerst**
-/// mit dem Sentinel verbinden (ein Dateisystempfad-Zugriff, der nach einer
-/// Landlock-Regel scheitern könnte, falls der Socket-Pfad nicht im
-/// gewährten Bereich liegt — Muster: `harw-sentinel::main::run`, das seinen
-/// IPC-Socket ebenfalls vor `restrict_self` bindet), **dann** über Landlock
-/// selbst einschränken (harter Abbruch bei jedem Ausgang außer
-/// vollständiger Durchsetzung, siehe [`landlock`]-Moduldoku), erst danach
-/// die fanotify-Quelle aufbauen und die Sammelschleife starten.
+/// Reihenfolge: die DoD-Konfiguration laden und den Beobachtungsbereich
+/// auflösen ([`watch::load_probe_config`], [`watch::resolve_watch_plan`];
+/// beides vor Landlock, weil `/etc/harw-dod` danach nicht mehr lesbar sein
+/// muss), sich **dann** mit dem Sentinel verbinden (ein
+/// Dateisystempfad-Zugriff, der nach einer Landlock-Regel scheitern könnte,
+/// falls der Socket-Pfad nicht im gewährten Bereich liegt — Muster:
+/// `harw-sentinel::main::run`, das seinen IPC-Socket ebenfalls vor
+/// `restrict_self` bindet), **dann** die fanotify-Quelle aufbauen und ihre
+/// Markierungen setzen (Review R2: eine nicht lesbare Wurzel wird über
+/// ihren nächsten lesbaren Vorfahren außerhalb der Lesewurzeln markiert,
+/// siehe [`source`]-Moduldoku), **dann** über Landlock selbst einschränken —
+/// Lesebereich plus `--proc-root` für die loginuid (harter Abbruch bei jedem
+/// Ausgang außer vollständiger Durchsetzung, siehe [`landlock`]-Moduldoku)
+/// —, eine unvollständige Abdeckung einmal als `SensorDegraded` melden
+/// ([`collect::report_uncovered_scope`]) und erst danach die Sammelschleife
+/// mit dem Bereichsfilter starten. Bis zur Landlock-Schranke wird kein
+/// einziges Ereignis gelesen.
 ///
 /// # Arguments
 /// - `cli` (`cli::Cli`): die geparste Kommandozeile.
 /// - `sentinel_socket` (`&Path`): der bereits entpackte `--sentinel-socket`.
 ///
 /// # Errors
+/// [`error::ProbeError::Config`], wenn die DoD-Konfiguration unbrauchbar
+/// ist; [`error::ProbeError::EmptyWatchScope`] ohne jede Wurzel;
 /// [`error::ProbeError::SentinelConnectFailed`] wenn der Sentinel nicht
 /// erreichbar ist; [`error::ProbeError::LandlockUnavailable`] wenn Landlock
 /// den Bereich nicht vollständig durchsetzt;
 /// [`error::ProbeError::FanotifySourceUnavailable`], wenn sich die
-/// fanotify-Gruppe nicht initialisieren lässt oder keine Wurzel des
+/// fanotify-Gruppe nicht initialisieren lässt oder kein Dateisystem des
 /// `ReadScope` markiert werden konnte (siehe [`source`]-Moduldoku) — z. B.
-/// wenn der Prozess nicht mit `CAP_SYS_ADMIN` läuft.
+/// wenn der Prozess nicht mit `CAP_SYS_ADMIN` läuft;
+/// [`error::ProbeError::SentinelSendFailed`], wenn die Abdeckungsmeldung
+/// den Sentinel nicht erreicht.
 fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
-    let scope = ReadScope::from_roots(cli.scope_roots.iter().cloned());
+    let config = watch::load_probe_config(cli.config.as_deref())?;
+    let plan = watch::resolve_watch_plan(
+        &cli.scope_roots,
+        &cli.home_roots,
+        &cli.home_entries,
+        config.as_ref().map(harw_dod_config::Config::probe_fs),
+    )?;
+    log_watch_plan(&plan, config.as_ref());
+    let scope = plan.filter.read_scope();
 
     let sink = sink::build_sentinel_sink(sentinel_socket)?;
     tracing::info!(path = %sentinel_socket.display(), "connected to sentinel");
 
-    landlock::enforce_read_scope(&scope)?;
+    // Vor Landlock: die Markierung einer nicht lesbaren Wurzel geht über
+    // einen Vorfahren außerhalb der Lesewurzeln (siehe `source`-Moduldoku).
+    let (source, marks) = source::build_fanotify_source(&scope)?;
+    tracing::info!(
+        marked_filesystems = marks.marked_filesystems,
+        uncovered_roots = marks.uncovered_roots,
+        uncovered_mounts = marks.uncovered_mounts,
+        absent_roots = marks.absent_roots,
+        "fanotify marks placed"
+    );
+    if marks.absent_roots > 0 {
+        // Review R3: eine fehlende Wurzel bekommt weder Markierung noch
+        // Landlock-Regel; entsteht sie später, braucht sie einen Neustart.
+        tracing::info!(
+            absent_roots = marks.absent_roots,
+            "scope roots absent at start stay unobserved until the probe restarts"
+        );
+    }
 
-    let source = source::build_fanotify_source(&scope)?;
-    let handle = SensorHandle::new(
-        SensorId::from_str(cli.sensor_id.clone()),
-        Capability::WatchFilesystem,
-    )
-    .bind(scope);
-    let sensor = FsMonSensor::new(handle, source, cli.proc_root.clone());
+    landlock::enforce_read_scope(&scope, std::slice::from_ref(&cli.proc_root))?;
+
+    let sensor_id = SensorId::from_str(cli.sensor_id.clone());
+    collect::report_uncovered_scope(sink.as_ref(), &sensor_id, &marks, Timestamp::now())?;
+    let handle = SensorHandle::new(sensor_id, Capability::WatchFilesystem).bind(scope);
+    let sensor =
+        FsMonSensor::new(handle, source, cli.proc_root.clone()).with_watch_filter(plan.filter);
 
     tracing::info!(sensor_id = %cli.sensor_id, "collection loop starting");
     collect::run_forever(&sensor, sink.as_ref())
+}
+
+/// Protokolliert den aufgelösten Beobachtungsbereich (`info`, eine Zeile).
+///
+/// # Description
+/// Die Wurzeln und Einträge sind administrativ konfigurierte Pfade ohne
+/// Benutzernamen (siehe [`watch`]), dazu Herkunft je Liste und der Digest
+/// der gelesenen Konfiguration (Abgleich mit Sentinel und BPF-Probe).
+fn log_watch_plan(plan: &watch::WatchPlan, config: Option<&harw_dod_config::Config>) {
+    tracing::info!(
+        scope_roots = ?plan.filter.scope_roots(),
+        scope_roots_source = plan.scope_roots_source.label(),
+        home_roots = ?plan.filter.home_roots(),
+        home_roots_source = plan.home_roots_source.label(),
+        home_entries = plan.filter.home_entries().len(),
+        home_entries_source = plan.home_entries_source.label(),
+        config_digest = config.map(|config| config.config_digest().to_string()),
+        "watch scope resolved"
+    );
 }
 
 #[cfg(test)]
@@ -293,13 +388,91 @@ mod tests {
     // einen echten Socket verbinden, ein echtes Landlock-Ruleset binden und
     // eine echte fanotify-Gruppe öffnen — alles drei nach Aufgabenstellung
     // untersagt. Jede darin verkettete Teilfunktion ist einzeln geprüft:
-    // `cli::Cli::try_parse_from` in `cli.rs`, `collect::run_once` in
-    // `collect.rs` (mit `FixtureFsEventSource`), `sink::encode_event` in
-    // `sink.rs`, die reinen Flag- und Pfadbausteine von
-    // `source::build_fanotify_source` in `source.rs`. Zusammen decken sie
-    // jeden Schritt von `run` ab, ohne dass ein Test dieser Crate einen
-    // echten Socket öffnet, ein echtes Landlock bindet oder eine echte
+    // `cli::Cli::try_parse_from` in `cli.rs`, die Bereichsauflösung und das
+    // Laden der Konfiguration in `watch.rs`, `collect::run_once` in
+    // `collect.rs` (mit `FixtureFsEventSource`, auch mit Bereichsfilter),
+    // `sink::encode_event` in `sink.rs`, die reinen Flag-, Pfad- und
+    // Überlaufbausteine von `source::build_fanotify_source` in `source.rs`
+    // (auch die Markierungsplanung und die Abdeckung), die
+    // Abdeckungsmeldung in `collect.rs` und die Rechtewahl der
+    // Landlock-Regel in `landlock.rs`. Zusammen
+    // decken sie jeden Schritt von `run` ab, ohne dass ein Test dieser Crate
+    // einen echten Socket öffnet, ein echtes Landlock bindet oder eine echte
     // fanotify-Gruppe öffnet.
+
+    use clap::Parser as _;
+
+    use crate::cli::Cli;
+    use crate::test_support::{TestError, TestResult, ctx};
+
+    /// Die ausgelieferte Zielunit (kanonische Quelle `deploy/systemd/`).
+    const DOD_TARGET: &str = include_str!("../../../../deploy/systemd/harw-dod.target");
+    /// Die ausgelieferte Unit dieser Sonde.
+    const PROBE_UNIT: &str = include_str!("../../../../deploy/systemd/harw-probe-fs.service");
+
+    /// Alle Werte von `key` (Zeilen `key=…` außerhalb von Kommentaren).
+    fn values<'a>(unit: &'a str, key: &str) -> Vec<&'a str> {
+        unit.lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .filter(|(name, _)| name.trim() == key)
+            .map(|(_, value)| value.trim())
+            .collect()
+    }
+
+    /// PL-100 WP1.6: die Sonde gehört zu `harw-dod.target` — das Ziel zieht
+    /// sie hoch und ordnet sich nach ihr, die Unit hängt sich ein.
+    #[test]
+    fn test_probe_unit_is_a_member_of_the_dod_target() {
+        let wants: Vec<&str> = values(DOD_TARGET, "Wants")
+            .into_iter()
+            .flat_map(str::split_whitespace)
+            .collect();
+        assert!(wants.contains(&"harw-probe-fs.service"), "{wants:?}");
+        let after: Vec<&str> = values(DOD_TARGET, "After")
+            .into_iter()
+            .flat_map(str::split_whitespace)
+            .collect();
+        assert!(after.contains(&"harw-probe-fs.service"), "{after:?}");
+        assert!(
+            !wants.iter().any(|unit| unit.starts_with("harw-warden")),
+            "the target never pulls in the Warden: {wants:?}"
+        );
+        assert_eq!(values(PROBE_UNIT, "WantedBy"), vec!["harw-dod.target"]);
+        assert_eq!(values(PROBE_UNIT, "PartOf"), vec!["harw-dod.target"]);
+    }
+
+    /// PL-100 WP1.6: kein Platzhalter mehr — die Unit nennt die
+    /// Konfiguration, darf sie lesen, sieht die Home-Wurzeln, und ihre
+    /// Kommandozeile parst ohne `--scope-root`.
+    #[test]
+    fn test_probe_unit_reads_its_scope_from_the_config() -> TestResult {
+        let exec = values(PROBE_UNIT, "ExecStart")
+            .into_iter()
+            .next()
+            .ok_or(TestError::Missing("ExecStart"))?;
+        assert!(!exec.contains("--scope-root"), "{exec}");
+        assert!(!exec.contains("/srv/harw/watched"), "{exec}");
+        let rendered = exec
+            .replace("@LIBEXECDIR@/", "")
+            .replace("@SYSCONFDIR@", "/etc/harw-dod");
+        let cli =
+            Cli::try_parse_from(rendered.split_whitespace()).map_err(ctx("unit ExecStart"))?;
+        assert_eq!(
+            cli.config,
+            Some(std::path::PathBuf::from("/etc/harw-dod/config.toml"))
+        );
+        assert!(cli.scope_roots.is_empty() && cli.home_roots.is_empty());
+
+        let groups: Vec<&str> = values(PROBE_UNIT, "SupplementaryGroups")
+            .into_iter()
+            .flat_map(str::split_whitespace)
+            .collect();
+        assert!(groups.contains(&"harw-dod-config"), "{groups:?}");
+        assert_eq!(values(PROBE_UNIT, "ProtectHome"), vec!["read-only"]);
+        Ok(())
+    }
 }
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.

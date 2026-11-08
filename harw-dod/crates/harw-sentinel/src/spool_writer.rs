@@ -28,7 +28,10 @@
 //! oder andere zugänglich ist: Records tragen rohe Belege (Pfade, Ziele,
 //! Prozessnamen) und sind für die Lesergruppe von harw nicht bestimmt. Das
 //! Verzeichnis liegt unter `--home` und damit in der beschreibbaren
-//! Landlock-Wurzel des Sentinels.
+//! Landlock-Wurzel des Sentinels. Die Modusbits sind `cfg(unix)`; ohne Unix
+//! gibt es nichts zu setzen oder zu verengen (dieselbe Regel wie
+//! `crate::export` und `crate::health_export`), damit das Modul auch dort
+//! übersetzt.
 //!
 //! # Aufbewahrung
 //! [`sentinel_limits`]: Records höchstens
@@ -76,7 +79,6 @@
 
 use std::fs::{self, DirBuilder};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -153,10 +155,10 @@ pub fn prepare_spool_dir(dir: &Path) -> SpoolResult<()> {
             path: dir.to_path_buf(),
         }),
         Ok(meta) => {
-            let mode = meta.permissions().mode() & 0o7777;
+            let mode = mode_bits(&meta);
             if mode & !SPOOL_DIR_MODE != 0 {
                 let narrowed = mode & SPOOL_DIR_MODE;
-                fs::set_permissions(dir, fs::Permissions::from_mode(narrowed))
+                set_mode_bits(dir, narrowed)
                     .map_err(io_error("restrict the spool directory mode"))?;
                 tracing::info!(
                     from = %format_args!("{mode:04o}"),
@@ -167,7 +169,7 @@ pub fn prepare_spool_dir(dir: &Path) -> SpoolResult<()> {
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match DirBuilder::new().mode(SPOOL_DIR_MODE).create(dir) {
+            match owner_only_dir_builder().create(dir) {
                 Ok(()) => Ok(()),
                 // Wettlauf mit einem anderen Anleger: `FindingSpool::open`
                 // prüft danach, was tatsächlich dort liegt.
@@ -177,6 +179,50 @@ pub fn prepare_spool_dir(dir: &Path) -> SpoolResult<()> {
         }
         Err(error) => Err(io_error("inspect the spool directory")(error)),
     }
+}
+
+/// Die Modusbits (`0o7777`) eines Verzeichnisses.
+#[cfg(unix)]
+fn mode_bits(meta: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    meta.permissions().mode() & 0o7777
+}
+
+/// Ohne Unix-Modusbits gibt es nichts zu verengen: gemeldet wird genau
+/// [`SPOOL_DIR_MODE`] (PL-100 Owner-Review: der Sentinel baut auch auf
+/// Nicht-Unix-Zielen, soweit seine Abhängigkeiten es tun).
+#[cfg(not(unix))]
+fn mode_bits(_meta: &fs::Metadata) -> u32 {
+    SPOOL_DIR_MODE
+}
+
+/// Setzt die Modusbits von `dir`.
+#[cfg(unix)]
+fn set_mode_bits(dir: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(dir, fs::Permissions::from_mode(mode))
+}
+
+/// Siehe die Unix-Fassung; ohne Unix-Modusbits ein No-Op (unerreichbar,
+/// weil [`mode_bits`] dort nie etwas zu verengen meldet).
+#[cfg(not(unix))]
+fn set_mode_bits(_dir: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+/// Ein `DirBuilder`, der mit [`SPOOL_DIR_MODE`] anlegt.
+#[cfg(unix)]
+fn owner_only_dir_builder() -> DirBuilder {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let mut builder = DirBuilder::new();
+    builder.mode(SPOOL_DIR_MODE);
+    builder
+}
+
+/// Siehe die Unix-Fassung; ohne Unix-Modusbits ein gewöhnlicher Builder.
+#[cfg(not(unix))]
+fn owner_only_dir_builder() -> DirBuilder {
+    DirBuilder::new()
 }
 
 /// Warum ein Record den Spool nicht erreicht hat.
@@ -719,6 +765,8 @@ mod tests {
     use harw_dod_rules::run_rules_checked;
     use harw_dod_signals::{DriftSeverity, EventKind, SecurityEvent, SecurityEvidence};
     use harw_types::SensorId;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
 
     /// `n` unterscheidbare Records aus echten Regelbefunden.
@@ -784,6 +832,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_prepare_creates_an_owner_only_directory() -> TestResult {
         let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
@@ -798,6 +847,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_prepare_narrows_a_group_readable_directory() -> TestResult {
         let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
@@ -814,6 +864,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_prepare_refuses_a_symlink() -> TestResult {
         let root = tempfile::tempdir().map_err(ctx("tempdir"))?;

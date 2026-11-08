@@ -66,15 +66,16 @@
 //! `crate::export`, Schema v3). Unterdrückte Wiederholungen erzeugen weder
 //! Record noch Zeile.
 //!
-//! # Journal-Hygiene (PL-100 WP0.6)
-//! Auf `warn` stehen je gemeldetem Befund nur Kennungen und Aufzählungen:
-//! `finding_id`, `rule_id`, `kind`, `severity`, `hardness`, `dedup_key`,
-//! `occurrences`, `first_seen` und der Meldegrund. Zusammenfassung, Scope
-//! (Pfad), `uid` und `cgroup_kid` — also Pfade, IP-Adressen und anderer
-//! erzeugerbestimmter Text — stehen nur auf `debug`, die Zusammenfassung
-//! dort zusätzlich `Debug`-escapt. Ein Angreifer kann so weder Steuerzeichen
-//! noch Ziele ins Journal schreiben, und das Journal verrät keine
-//! beobachteten Ziele.
+//! # Journal-Hygiene (PL-100 WP0.6, WP1.6)
+//! Auf `warn` stehen je gemeldetem Befund nur `rule_id`, `severity` und der
+//! Zähler `occurrences`. Kennungen (`finding_id`, `dedup_key`), Art, Härte,
+//! `first_seen`, Meldegrund, Zusammenfassung, Scope (Pfad), `uid` und
+//! `cgroup_kid` stehen nur auf `debug`, die Zusammenfassung dort zusätzlich
+//! `Debug`-escapt: Zusammenfassungen der Pfadregeln (`exec-writable-path`,
+//! `persistence-write`) tragen escapte Pfade samt Kontonamen
+//! (`/home/<name>/…`), andere Ziele und erzeugerbestimmten Text. Ein
+//! Angreifer kann so weder Steuerzeichen noch Ziele ins Journal schreiben,
+//! und das Journal verrät weder beobachtete Ziele noch Kontonamen.
 //!
 //! # Warum der Sentinel nichts durchsetzt
 //! Dieses Binary ist die **unprivilegierte** Sammelstelle (siehe
@@ -159,6 +160,18 @@
 //! BPF-Sonde (`EventKind::EgressFlow`) über die IPC-Inbox liefert. `run`
 //! warnt beim Start deutlich, wenn die Liste leer ist.
 //!
+//! # Listener-Historie und Regelkonfiguration (PL-100 WP1.6)
+//! [`RuleCycle::with_listener_state`] gibt `listener-new` die persistierte
+//! [`harw_dod_rules::ListenerHistory`] (`crate::listener_state`),
+//! [`RuleCycle::with_rule_config`] allen Regeln die
+//! [`harw_dod_rules::RuleConfig`] des Hosts (Workspace-Wurzel,
+//! Home-Verzeichnisse aus `/etc/passwd`, flüchtiger Portbereich;
+//! `crate::rule_config`). Beide gehen als [`RuleInputs`] in jeden Lauf von
+//! [`report_findings`] — auch in die Einzel- und Cgroup-Läufe der
+//! Attribution, damit deren Signaturen zu denen des vollen Laufs passen. Die
+//! Regeln sehen die Historie **vor** dem Zyklus; danach lernt sie die
+//! Listener des Deltas mit derselben Konfiguration.
+//!
 //! # Was dieser Kontext (noch) nicht befüllt
 //! [`harw_dod_rules::rule::RuleContext::baselines`] ist ein leerer Schnitt
 //! — dieses Binary hält keine Verbindung zu `harw-knowledge`s Baseline-Palast.
@@ -216,7 +229,7 @@ use std::collections::btree_map::Entry;
 use harw_authority::{EgressTarget, NetworkScope};
 use harw_dod_config::ResolvedObservationProfile;
 use harw_dod_rules::rule::RuleContext;
-use harw_dod_rules::{FindingKind, run_rules, run_rules_checked};
+use harw_dod_rules::{FindingKind, ListenerHistory, RuleConfig, run_rules, run_rules_checked};
 use harw_dod_sentinel::spool::{MAX_CONTEXT_EVENTS, slice_record};
 use harw_dod_sentinel::{BufferMark, EvidenceBuffer};
 use harw_dod_signals::{
@@ -229,6 +242,7 @@ use jiff::Timestamp;
 use crate::cgroup_resolve::CgroupKids;
 use crate::export::{EvidenceCard, FindingsExporter, LineFields};
 use crate::health_export::RingCounters;
+use crate::listener_state::{ListenerHistoryHealth, ListenerState};
 use crate::rates::{RateStage, with_rates};
 use crate::spool_writer::SpoolWriter;
 use crate::throttle::{
@@ -246,14 +260,18 @@ const RULE_LABEL: harw_observe::FieldName = harw_macros::field!("rule_id");
 const KIND_LABEL: harw_observe::FieldName = harw_macros::field!("kind");
 
 harw_macros::metrics! {
-    /// Wie oft eine Regel dieser Crate seit Prozessstart einen Befund
-    /// ausgelöst hat, aufgeschlüsselt nach der auslösenden Regel (`rule_id`
-    /// — drei mögliche Werte: `"egress-flow"`, `"structure-drift"`,
-    /// `"baseline-deviation"`, siehe [`harw_dod_rules::rule::Rule::id`]) und
-    /// nach [`FindingKind`] (`kind` — zwei mögliche Werte: `"rule-triggered"`,
-    /// `"anomaly"`). Kardinalität deshalb `bounded(6)`: drei Regeln mal zwei
-    /// Befundarten, keine weitere Regel dieses Knotens.
-    SECURITY_FINDING_TOTAL: counter, unit = count, labels = ["rule_id", "kind"], cardinality = bounded(6),
+    /// Wie oft eine Regel seit Prozessstart einen Befund ausgelöst hat,
+    /// aufgeschlüsselt nach der auslösenden Regel (`rule_id` — sieben
+    /// mögliche Werte, die Regeln von [`harw_dod_rules::run_rules_checked`],
+    /// siehe [`harw_dod_rules::rule::Rule::id`]: `"baseline-deviation"`,
+    /// `"egress-flow"`, `"exec-writable-path"`, `"listener-new"`,
+    /// `"persistence-write"`, `"sensor-degraded"`, `"structure-drift"`) und
+    /// nach [`FindingKind`] (`kind` — zwei mögliche Werte:
+    /// `"rule-triggered"`, `"anomaly"`). Kardinalität deshalb `bounded(14)`:
+    /// sieben Regeln mal zwei Befundarten (PL-100 WP1.6). Eine weitere Regel
+    /// verlangt eine neue Grenze (der Test
+    /// `test_finding_metric_cardinality_covers_the_seven_rules` prüft sie).
+    SECURITY_FINDING_TOTAL: counter, unit = count, labels = ["rule_id", "kind"], cardinality = bounded(14),
         name = "harw_sentinel_security_finding_total";
     /// Wie oft ein Befund seit Prozessstart innerhalb seiner Abklingzeit nur
     /// gezählt statt gemeldet wurde (PL-100 WP0.4, `crate::throttle`).
@@ -410,6 +428,76 @@ pub struct ReportOutputs<'a> {
     pub context: &'a [&'a SecurityEvent],
 }
 
+/// Was die Regeln eines Zyklus außer den Beobachtungen brauchen (PL-100
+/// WP0.3/WP1.6).
+///
+/// # Description
+/// Der erlaubte Netzbereich, die Listener-Historie **vor** diesem Zyklus
+/// (`listener-new`) und die Regelkonfiguration des Hosts
+/// (`crate::rule_config`). [`report_findings`] gibt dieselben Werte an den
+/// vollen Regellauf **und** an die Einzel- und Cgroup-Läufe der
+/// Attribution, damit deren Signaturen übereinstimmen.
+///
+/// # Concurrency
+/// Geliehene Werte des Sammelthreads, `Copy`.
+///
+/// # Examples
+/// ```rust,ignore
+/// let inputs = RuleInputs {
+///     listener_history: Some(&history),
+///     rule_config: Some(&rule_config),
+///     ..RuleInputs::scope_only(&scope)
+/// };
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct RuleInputs<'a> {
+    /// Erlaubter Netzbereich ([`network_scope_from_profile`]).
+    pub network_scope: &'a NetworkScope,
+    /// Die Listener-Historie; `None` (oder nicht vorbereitet): `listener-new`
+    /// meldet nichts.
+    pub listener_history: Option<&'a ListenerHistory>,
+    /// Die Regelkonfiguration; `None` heißt Vorgaben.
+    pub rule_config: Option<&'a RuleConfig>,
+}
+
+impl<'a> RuleInputs<'a> {
+    /// Nur ein Netzbereich, ohne Listener-Historie und mit
+    /// Vorgabe-Konfiguration.
+    ///
+    /// # Arguments
+    /// - `network_scope` (`&NetworkScope`): der erlaubte Netzbereich.
+    #[must_use]
+    pub const fn scope_only(network_scope: &'a NetworkScope) -> Self {
+        Self {
+            network_scope,
+            listener_history: None,
+            rule_config: None,
+        }
+    }
+
+    /// Der [`RuleContext`] über `samples` und `events` mit diesen Eingaben
+    /// (ohne Baselines, siehe Moduldoku).
+    fn context<'c>(
+        self,
+        now: Timestamp,
+        samples: &'c [HostSample],
+        events: &'c [SecurityEvent],
+    ) -> RuleContext<'c>
+    where
+        'a: 'c,
+    {
+        RuleContext {
+            now,
+            samples,
+            events,
+            baselines: &[],
+            network_scope: self.network_scope,
+            listener_history: self.listener_history,
+            rule_config: self.rule_config,
+        }
+    }
+}
+
 /// Baut den [`NetworkScope`] der Regeln aus dem aktiven DoD-Profil.
 ///
 /// # Description
@@ -485,6 +573,11 @@ pub struct RuleCycle {
     /// Spool-Schreiber für die Records gemeldeter Befunde (WP0.12);
     /// `None` friert nichts ein.
     spool: Option<SpoolWriter>,
+    /// Persistierte Listener-Historie für `listener-new` (WP1.6); `None`:
+    /// die Regel meldet nichts.
+    listener: Option<ListenerState>,
+    /// Regelkonfiguration des Hosts (WP1.6); `None` heißt Vorgaben.
+    rule_config: Option<RuleConfig>,
 }
 
 impl RuleCycle {
@@ -503,6 +596,8 @@ impl RuleCycle {
             overflow: RingCounters::default(),
             rates: RateStage::new(),
             spool: None,
+            listener: None,
+            rule_config: None,
         }
     }
 
@@ -524,11 +619,52 @@ impl RuleCycle {
     ///
     /// # Arguments
     /// - `throttle` (`FindingThrottle`): im Betrieb mit Zustandsdatei unter
-    ///   `--home` geöffnet (`crate::run`).
+    ///   `--home` geöffnet (`crate::build_rule_cycle`).
     #[must_use]
     pub fn with_throttle(mut self, throttle: FindingThrottle) -> Self {
         self.throttle = Some(throttle);
         self
+    }
+
+    /// Wertet ab jetzt `listener-new` gegen `listener` aus und lernt nach
+    /// jedem Zyklus dessen Listener (PL-100 WP1.6).
+    ///
+    /// # Arguments
+    /// - `listener` (`ListenerState`): im Betrieb unter `--home` geöffnet
+    ///   (`crate::build_rule_cycle`).
+    #[must_use]
+    pub fn with_listener_state(mut self, listener: ListenerState) -> Self {
+        self.listener = Some(listener);
+        self
+    }
+
+    /// Gibt den Regeln ab jetzt `rule_config` (Workspace-Wurzeln,
+    /// Home-Verzeichnisse, flüchtiger Portbereich; PL-100 WP1.6) — dieselbe
+    /// Konfiguration lernt auch die Listener-Historie.
+    ///
+    /// # Arguments
+    /// - `rule_config` (`RuleConfig`): im Betrieb aus
+    ///   `crate::rule_config::build`.
+    #[must_use]
+    pub fn with_rule_config(mut self, rule_config: RuleConfig) -> Self {
+        self.rule_config = Some(rule_config);
+        self
+    }
+
+    /// Der Stand der Listener-Historie für `health.json`.
+    ///
+    /// # Returns
+    /// `None` ohne Historie ([`Self::with_listener_state`] nicht gesetzt).
+    #[must_use]
+    pub fn listener_health(&self) -> Option<ListenerHistoryHealth> {
+        self.listener.as_ref().map(ListenerState::health)
+    }
+
+    /// Warum die gespeicherte Listener-Historie beim Start verworfen wurde
+    /// (`crate::run` meldet das als `SensorDegraded`).
+    #[must_use]
+    pub fn listener_load_failure(&self) -> Option<crate::listener_state::LoadFailure> {
+        self.listener.as_ref().and_then(ListenerState::load_failure)
     }
 
     /// Kumulierte Zähler der Einträge, die der Ring verdrängte, bevor die
@@ -552,8 +688,12 @@ impl RuleCycle {
     /// Zähler). Scheitert das Einfrieren (praktisch unerreichbar, siehe
     /// `harw_dod_sentinel::error`), wird das Delta mit einer Warnung
     /// übersprungen und die Marke trotzdem vorgerückt: ein dauerhaft nicht
-    /// kodierbarer Eintrag soll nicht jede spätere Auswertung blockieren. Am
-    /// Ende schreibt ein vorhandener Throttle seinen Zustand, wenn fällig.
+    /// kodierbarer Eintrag soll nicht jede spätere Auswertung blockieren.
+    /// Die Regeln sehen die Listener-Historie **vor** diesem Zyklus; erst
+    /// danach lernt sie die Listener des Deltas
+    /// ([`ListenerState::learn`], mit derselben Regelkonfiguration). Am
+    /// Ende schreiben ein vorhandener Throttle und eine vorhandene
+    /// Listener-Historie ihren Zustand, wenn fällig.
     ///
     /// # Arguments
     /// - `buffer` (`&EvidenceBuffer`): der Puffer des `Sentinel`
@@ -611,12 +751,17 @@ impl RuleCycle {
                     } else {
                         Vec::new()
                     };
-                report_findings(
+                let inputs = RuleInputs {
+                    listener_history: self.listener.as_ref().map(ListenerState::history),
+                    rule_config: self.rule_config.as_ref(),
+                    ..RuleInputs::scope_only(&self.network_scope)
+                };
+                let reported = report_findings(
                     sink,
                     &delta.evidence,
                     &rate_samples,
                     now,
-                    &self.network_scope,
+                    inputs,
                     cgroup_kids,
                     self.throttle.as_mut(),
                     ReportOutputs {
@@ -624,7 +769,13 @@ impl RuleCycle {
                         spool: self.spool.as_ref(),
                         context: &ring,
                     },
-                )
+                );
+                // PL-100 WP1.6: erst ausgewertet, dann gelernt — ein neuer
+                // Listener wird in seinem ersten Zyklus gemeldet.
+                if let Some(listener) = self.listener.as_mut() {
+                    listener.learn(&delta.evidence.events, now, self.rule_config.as_ref());
+                }
+                reported
             }
             Err(error) => {
                 tracing::warn!(
@@ -639,6 +790,9 @@ impl RuleCycle {
         if let Some(throttle) = self.throttle.as_mut() {
             throttle.persist_if_due(now);
         }
+        if let Some(listener) = self.listener.as_mut() {
+            listener.persist_if_due(now);
+        }
         if let Some(spool) = self.spool.as_ref() {
             // Aufbewahrung des Spools (14 Tage), höchstens jede Minute wirksam.
             spool.tick(now);
@@ -647,16 +801,17 @@ impl RuleCycle {
     }
 }
 
-/// Wertet die drei Regeln dieses Knotens gegen ein eingefrorenes
+/// Wertet die Regeln von [`run_rules_checked`] gegen ein eingefrorenes
 /// [`SecurityEvidence`] aus und meldet jeden zertifizierten, nicht
 /// unterdrückten Befund.
 ///
 /// # Description
 /// Baut einen [`RuleContext`] aus `evidence.samples` samt den daraus
 /// abgeleiteten `rate_samples` ([`with_rates`], PL-100 WP0.14),
-/// `evidence.events`, dem übergebenen `network_scope` und einer leeren
-/// Baseline-Liste (siehe Moduldoku, Abschnitte „Der Netzbereich kommt aus
-/// der DoD-Konfiguration" und „Was dieser Kontext (noch) nicht befüllt"), ruft
+/// `evidence.events`, den übergebenen `inputs` (Netzbereich,
+/// Listener-Historie, Regelkonfiguration) und einer leeren Baseline-Liste
+/// (siehe Moduldoku, Abschnitte „Der Netzbereich kommt aus der
+/// DoD-Konfiguration" und „Was dieser Kontext (noch) nicht befüllt"), ruft
 /// [`run_rules_checked`] darauf auf und zählt jeden zurückgelieferten
 /// `Finding<RuleChecked>` in [`SECURITY_FINDING_TOTAL`] auf `sink`
 /// (maschinell auswertbar, ohne Freitext im Label — siehe
@@ -666,8 +821,8 @@ impl RuleCycle {
 /// `throttle`, über [`FindingThrottle::observe`] entschieden, ob er
 /// gemeldet oder nur gezählt wird (siehe Moduldoku, „Entprellung
 /// wiederholter Befunde"). Ein gemeldeter Befund erscheint auf
-/// `tracing::warn!` nur mit Kennungen (siehe Moduldoku,
-/// „Journal-Hygiene"), Details auf `debug`; mit Spool wird er samt
+/// `tracing::warn!` nur mit Regel, Schwere und Zählern (siehe Moduldoku,
+/// „Journal-Hygiene"), Kennungen und Details auf `debug`; mit Spool wird er samt
 /// Beleg-Ausschnitt eingefroren und eingereiht, und er geht als Zeile
 /// (Schema v3) an den Export (siehe Moduldoku, „Spool-Record und Export
 /// v3").
@@ -685,8 +840,10 @@ impl RuleCycle {
 ///   es keine gibt.
 /// - `now` (`jiff::Timestamp`): dieselbe injizierte Zeit, mit der `evidence`
 ///   eingefroren wurde — nie die Systemuhr dieser Funktion selbst.
-/// - `network_scope` (`&NetworkScope`): der erlaubte Netzbereich
-///   ([`network_scope_from_profile`]).
+/// - `inputs` ([`RuleInputs`]): erlaubter Netzbereich
+///   ([`network_scope_from_profile`]), Listener-Historie vor diesem Zyklus
+///   und Regelkonfiguration; dieselben Werte gehen an die Läufe der
+///   Attribution.
 /// - `cgroup_kids` (`&CgroupKids`): Kernel-IDs der in diesem Zyklus
 ///   aufgelösten Cgroup-Pfade, für `cgroup_kid` der Herkunft.
 /// - `throttle` (`Option<&mut FindingThrottle>`): die Entprellung; `None`
@@ -713,19 +870,21 @@ impl RuleCycle {
 /// use harw_observe::NullSink;
 /// use jiff::Timestamp;
 ///
-/// let evidence = SecurityEvidence::capture(vec![], vec![], Timestamp::UNIX_EPOCH)
-///     .expect("empty events always encode");
+/// # fn main() -> Result<(), harw_dod_signals::SignalsError> {
+/// let evidence = SecurityEvidence::capture(vec![], vec![], Timestamp::UNIX_EPOCH)?;
 /// let reported = harw_sentinel::findings::report_findings(
 ///     &NullSink,
 ///     &evidence,
 ///     &[],
 ///     Timestamp::UNIX_EPOCH,
-///     &harw_authority::NetworkScope::empty(),
+///     harw_sentinel::findings::RuleInputs::scope_only(&harw_authority::NetworkScope::empty()),
 ///     &harw_sentinel::cgroup_resolve::CgroupKids::default(),
 ///     None,
 ///     harw_sentinel::findings::ReportOutputs::default(),
 /// );
 /// assert_eq!(reported, 0);
+/// # Ok(())
+/// # }
 /// ```
 // Acht Eingänge eines Zyklus, keiner davon ableitbar; die Ausgabewege sind
 // bereits in `ReportOutputs` gebündelt.
@@ -735,29 +894,20 @@ pub fn report_findings(
     evidence: &SecurityEvidence,
     rate_samples: &[HostSample],
     now: Timestamp,
-    network_scope: &NetworkScope,
+    inputs: RuleInputs<'_>,
     cgroup_kids: &CgroupKids,
     mut throttle: Option<&mut FindingThrottle>,
     mut outputs: ReportOutputs<'_>,
 ) -> usize {
     let samples = with_rates(&evidence.samples, rate_samples);
-    let ctx = RuleContext {
-        now,
-        samples: &samples,
-        events: &evidence.events,
-        baselines: &[],
-        network_scope,
-        listener_history: None,
-        rule_config: None,
-    };
+    let ctx = inputs.context(now, &samples, &evidence.events);
 
     let findings = run_rules_checked(&ctx);
     if findings.is_empty() {
         return 0;
     }
-    let scopes = attribute_scopes(&findings, &evidence.events, now, network_scope);
-    let provenance =
-        attribute_provenance(&findings, &evidence.events, now, network_scope, cgroup_kids);
+    let scopes = attribute_scopes(&findings, &evidence.events, now, inputs);
+    let provenance = attribute_provenance(&findings, &evidence.events, now, inputs, cgroup_kids);
 
     let mut reported = 0_usize;
     for ((finding, finding_scope), Provenance { origin, triggers }) in
@@ -801,21 +951,23 @@ pub fn report_findings(
             );
             continue;
         };
-        // Journal-Hygiene (WP0.6): auf `warn` nur Kennungen und Aufzählungen.
+        // Journal-Hygiene (WP0.6, PL-100 WP1.6): auf `warn` nur Regel,
+        // Schwere und Zähler — Zusammenfassungen tragen escapte Pfade samt
+        // Kontonamen (`/home/<name>/…`), Kennungen gehören zum Detail.
         tracing::warn!(
-            finding_id = finding.id().as_str(),
             rule_id = finding.rule_id(),
-            kind = finding_kind_label(finding.kind()),
             severity = ?finding.severity(),
-            hardness = ?finding.hardness(),
-            dedup_key = %stamp.dedup_key,
             occurrences = stamp.occurrences,
-            first_seen = %stamp.first_seen,
-            reason = reason.label(),
             "security rule finding"
         );
         tracing::debug!(
             finding_id = finding.id().as_str(),
+            rule_id = finding.rule_id(),
+            kind = finding_kind_label(finding.kind()),
+            hardness = ?finding.hardness(),
+            dedup_key = %stamp.dedup_key,
+            first_seen = %stamp.first_seen,
+            reason = reason.label(),
             summary = ?finding.summary(),
             scope = ?finding_scope.as_deref(),
             uid = ?origin.uid,
@@ -964,20 +1116,12 @@ fn attribute_provenance(
     findings: &[harw_dod_rules::Finding<harw_dod_rules::RuleChecked>],
     events: &[SecurityEvent],
     now: Timestamp,
-    network_scope: &NetworkScope,
+    inputs: RuleInputs<'_>,
     cgroup_kids: &CgroupKids,
 ) -> Vec<Provenance> {
     let mut pool: BTreeMap<FindingSignature, (usize, Provenance)> = BTreeMap::new();
     for (index, event) in events.iter().enumerate() {
-        let ctx = RuleContext {
-            now,
-            samples: &[],
-            events: std::slice::from_ref(event),
-            baselines: &[],
-            network_scope,
-            listener_history: None,
-            rule_config: None,
-        };
+        let ctx = inputs.context(now, &[], std::slice::from_ref(event));
         let raws = run_rules(&ctx);
         if raws.is_empty() {
             continue;
@@ -1046,10 +1190,16 @@ fn attribute_origins(
     network_scope: &NetworkScope,
     cgroup_kids: &CgroupKids,
 ) -> Vec<FindingOrigin> {
-    attribute_provenance(findings, events, now, network_scope, cgroup_kids)
-        .into_iter()
-        .map(|provenance| provenance.origin)
-        .collect()
+    attribute_provenance(
+        findings,
+        events,
+        now,
+        RuleInputs::scope_only(network_scope),
+        cgroup_kids,
+    )
+    .into_iter()
+    .map(|provenance| provenance.origin)
+    .collect()
 }
 
 /// Derives the optional cgroup `scope` of each finding (see the module
@@ -1068,7 +1218,7 @@ fn attribute_scopes(
     findings: &[harw_dod_rules::Finding<harw_dod_rules::RuleChecked>],
     events: &[SecurityEvent],
     now: Timestamp,
-    network_scope: &NetworkScope,
+    inputs: RuleInputs<'_>,
 ) -> Vec<Option<String>> {
     let mut groups: std::collections::BTreeMap<&str, Vec<SecurityEvent>> =
         std::collections::BTreeMap::new();
@@ -1089,15 +1239,7 @@ fn attribute_scopes(
 
     let mut pool: Vec<(FindingSignature, &str)> = Vec::new();
     for (path, group_events) in &groups {
-        let ctx = RuleContext {
-            now,
-            samples: &[],
-            events: group_events,
-            baselines: &[],
-            network_scope,
-            listener_history: None,
-            rule_config: None,
-        };
+        let ctx = inputs.context(now, &[], group_events);
         for raw in run_rules(&ctx) {
             pool.push((signature_of!(&raw), path));
         }
@@ -1124,7 +1266,7 @@ fn attribute_scopes(
                 if path != first {
                     return None;
                 }
-                in_pool += 1;
+                in_pool = in_pool.saturating_add(1);
             }
             (in_pool == in_full_run).then(|| first.to_owned())
         })
@@ -1166,7 +1308,7 @@ mod tests {
             &evidence,
             &[],
             Timestamp::UNIX_EPOCH,
-            &NetworkScope::empty(),
+            RuleInputs::scope_only(&NetworkScope::empty()),
             &CgroupKids::default(),
             None,
             ReportOutputs::default(),
@@ -1189,7 +1331,7 @@ mod tests {
             &evidence,
             &[],
             Timestamp::UNIX_EPOCH,
-            &NetworkScope::empty(),
+            RuleInputs::scope_only(&NetworkScope::empty()),
             &CgroupKids::default(),
             None,
             ReportOutputs::default(),
@@ -1217,7 +1359,7 @@ mod tests {
             &evidence,
             &[],
             Timestamp::UNIX_EPOCH,
-            &NetworkScope::empty(),
+            RuleInputs::scope_only(&NetworkScope::empty()),
             &CgroupKids::default(),
             None,
             ReportOutputs {
@@ -1274,7 +1416,7 @@ mod tests {
             &evidence,
             &[],
             Timestamp::UNIX_EPOCH,
-            &NetworkScope::empty(),
+            RuleInputs::scope_only(&NetworkScope::empty()),
             &CgroupKids::default(),
             None,
             ReportOutputs {
@@ -1330,7 +1472,7 @@ mod tests {
             &findings,
             &events,
             Timestamp::UNIX_EPOCH,
-            &scope,
+            RuleInputs::scope_only(&scope),
         ))
     }
 
@@ -1937,7 +2079,7 @@ mod tests {
             &evidence,
             &[rate],
             Timestamp::UNIX_EPOCH,
-            &NetworkScope::empty(),
+            RuleInputs::scope_only(&NetworkScope::empty()),
             &CgroupKids::default(),
             None,
             ReportOutputs::default(),
@@ -2017,7 +2159,7 @@ mod tests {
                 &evidence,
                 &[],
                 Timestamp::UNIX_EPOCH,
-                &NetworkScope::empty(),
+                RuleInputs::scope_only(&NetworkScope::empty()),
                 &CgroupKids::default(),
                 None,
                 ReportOutputs::default(),
@@ -2216,7 +2358,7 @@ mod tests {
             &findings,
             events,
             Timestamp::UNIX_EPOCH,
-            &NetworkScope::empty(),
+            RuleInputs::scope_only(&NetworkScope::empty()),
             &CgroupKids::default(),
         ))
     }
@@ -2249,6 +2391,318 @@ mod tests {
                 .iter()
                 .all(|p| p.triggers.len() == MAX_TRIGGER_EVENTS)
         );
+        Ok(())
+    }
+
+    // --- Listener-Historie, Regelkonfiguration, Kardinalität (WP1.6) ------
+
+    /// Die `rule_id`-Werte von [`SECURITY_FINDING_TOTAL`]: genau die Regeln
+    /// von [`harw_dod_rules::run_rules_checked`] (sortiert).
+    const RULE_IDS: [&str; 7] = [
+        "baseline-deviation",
+        "egress-flow",
+        "exec-writable-path",
+        "listener-new",
+        "persistence-write",
+        "sensor-degraded",
+        "structure-drift",
+    ];
+
+    /// Die deklarierte Kardinalität deckt genau die Regeln des Laufs mal die
+    /// zwei Befundarten ab.
+    #[test]
+    fn test_finding_metric_cardinality_covers_the_seven_rules() -> TestResult {
+        let rules: [&dyn harw_dod_rules::Rule; 7] = [
+            &harw_dod_rules::BaselineDeviationRule,
+            &harw_dod_rules::EgressFlowRule,
+            &harw_dod_rules::ExecWritablePathRule,
+            &harw_dod_rules::ListenerNewRule,
+            &harw_dod_rules::PersistenceWriteRule,
+            &harw_dod_rules::SensorDegradedRule,
+            &harw_dod_rules::StructureDriftRule,
+        ];
+        let mut ids: Vec<&str> = rules.iter().map(|rule| rule.id()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids, RULE_IDS.to_vec());
+        let kinds = [FindingKind::RuleTriggered, FindingKind::Anomaly].map(finding_kind_label);
+        let combinations = RULE_IDS
+            .len()
+            .checked_mul(kinds.len())
+            .ok_or(TestError::Missing("combination count"))?;
+        assert_eq!(
+            SECURITY_FINDING_TOTAL.cardinality,
+            harw_observe::Cardinality::Bounded(
+                u32::try_from(combinations).map_err(ctx("bounded cardinality"))?
+            )
+        );
+        assert_eq!(combinations, 14);
+        Ok(())
+    }
+
+    /// Eine Auswertung mit Listener-Historie im Speicher und
+    /// Vorgabe-Konfiguration, die jeden Befund exportiert.
+    fn listener_cycle() -> RuleCycle {
+        RuleCycle::new(NetworkScope::empty())
+            .with_listener_state(ListenerState::open(None))
+            .with_rule_config(RuleConfig::new())
+    }
+
+    /// Die `rule_id`s der Exportzeilen in `path`.
+    fn exported_rules(path: &std::path::Path) -> TestResult<Vec<String>> {
+        let text = std::fs::read_to_string(path).map_err(ctx("read export"))?;
+        text.lines()
+            .map(|line| {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).map_err(ctx("json line"))?;
+                value
+                    .get("rule_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or(TestError::Missing("rule_id"))
+            })
+            .collect()
+    }
+
+    /// PL-100 WP1.6: der erste Zyklus lernt still (Lernzyklus), danach
+    /// meldet `listener-new` einen neuen Listener genau in seinem ersten
+    /// Zyklus — die Regeln sehen die Historie vor dem Zyklus, gelernt wird
+    /// danach.
+    #[test]
+    fn test_listener_new_reports_a_new_listener_once_after_the_learning_cycle() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        let host = harw_types::HostId::try_from_str("host-a").map_err(ctx("host id"))?;
+        let mut exporter = FindingsExporter::new(path.clone(), host);
+        let mut buffer = EvidenceBuffer::new(64, 64);
+        let mut rules = listener_cycle();
+        let mut cycle = |buffer: &EvidenceBuffer, exporter: &mut FindingsExporter, secs| {
+            at(secs).map(|now| {
+                rules.evaluate(
+                    buffer,
+                    &harw_observe::NullSink,
+                    now,
+                    &CgroupKids::default(),
+                    Some(exporter),
+                )
+            })
+        };
+
+        buffer.push_event(listener_event(22));
+        assert_eq!(cycle(&buffer, &mut exporter, 0)?, 0, "the learning cycle");
+
+        buffer.push_event(listener_event(22));
+        buffer.push_event(listener_event(4444));
+        assert_eq!(cycle(&buffer, &mut exporter, 5)?, 1, "only the new port");
+
+        buffer.push_event(listener_event(22));
+        buffer.push_event(listener_event(4444));
+        assert_eq!(cycle(&buffer, &mut exporter, 10)?, 0, "4444 was learned");
+
+        assert_eq!(exported_rules(&path)?, vec!["listener-new".to_owned()]);
+        let health = rules
+            .listener_health()
+            .ok_or(TestError::Missing("listener health"))?;
+        assert!(health.primed);
+        assert_eq!(health.keys, 2);
+        assert!(!health.is_degraded());
+        Ok(())
+    }
+
+    /// Ohne Listener-Historie bleibt `listener-new` stumm (kein Lernen, kein
+    /// Befund) — so bleiben die übrigen Tests dieses Moduls unverändert.
+    #[test]
+    fn test_without_a_listener_history_listener_new_stays_silent() -> TestResult {
+        let mut buffer = EvidenceBuffer::new(64, 64);
+        let mut rules = RuleCycle::new(NetworkScope::empty());
+        for secs in [0, 5] {
+            buffer.push_event(listener_event(4444));
+            let reported = rules.evaluate(
+                &buffer,
+                &harw_observe::NullSink,
+                at(secs)?,
+                &CgroupKids::default(),
+                None,
+            );
+            assert_eq!(reported, 0);
+        }
+        assert!(rules.listener_health().is_none());
+        Ok(())
+    }
+
+    fn exec_event(path: &str) -> SecurityEvent {
+        SecurityEvent {
+            sensor: SensorId::from_str("probe-bpf-0"),
+            observed_at: Timestamp::UNIX_EPOCH,
+            actor: None,
+            kind: EventKind::ProcessExec {
+                path: path.to_owned(),
+                argv_digest: ContentDigest::of(b"argv"),
+            },
+        }
+    }
+
+    /// PL-100 WP1.6: die Regelkonfiguration erreicht die Pfadregeln — ein
+    /// Start unter der konfigurierten Workspace-Wurzel ist nur mit ihr ein
+    /// Befund, ein Schreiben unter einem konfigurierten Home nur mit ihr.
+    #[test]
+    fn test_rule_config_reaches_the_path_rules() -> TestResult {
+        let config = RuleConfig::new()
+            .with_workspace_root(std::path::Path::new("/srv/agents/ws"))
+            .map_err(ctx("workspace root"))?
+            .with_home_dir(std::path::Path::new("/srv/homes/corp/alice"))
+            .map_err(ctx("home dir"))?;
+        let events = vec![
+            exec_event("/srv/agents/ws/target/debug/tool"),
+            SecurityEvent {
+                sensor: SensorId::from_str("probe-fs-0"),
+                observed_at: Timestamp::UNIX_EPOCH,
+                actor: None,
+                kind: EventKind::FileWrite {
+                    path: "/srv/homes/corp/alice/.bashrc".to_owned(),
+                },
+            },
+        ];
+        let evidence = SecurityEvidence::capture(vec![], events, Timestamp::UNIX_EPOCH)
+            .map_err(ctx("well-formed content always encodes"))?;
+        let scope = NetworkScope::empty();
+
+        let without = report_findings(
+            &harw_observe::NullSink,
+            &evidence,
+            &[],
+            Timestamp::UNIX_EPOCH,
+            RuleInputs::scope_only(&scope),
+            &CgroupKids::default(),
+            None,
+            ReportOutputs::default(),
+        );
+        assert_eq!(without, 0, "neither location is known without the config");
+
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        let host = harw_types::HostId::try_from_str("host-a").map_err(ctx("host id"))?;
+        let mut exporter = FindingsExporter::new(path.clone(), host);
+        let with = report_findings(
+            &harw_observe::NullSink,
+            &evidence,
+            &[],
+            Timestamp::UNIX_EPOCH,
+            RuleInputs {
+                rule_config: Some(&config),
+                ..RuleInputs::scope_only(&scope)
+            },
+            &CgroupKids::default(),
+            None,
+            ReportOutputs {
+                exporter: Some(&mut exporter),
+                ..ReportOutputs::default()
+            },
+        );
+        assert_eq!(with, 2);
+        let mut rules = exported_rules(&path)?;
+        rules.sort_unstable();
+        assert_eq!(
+            rules,
+            vec![
+                "exec-writable-path".to_owned(),
+                "persistence-write".to_owned()
+            ]
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP1.6: der Attributionslauf je Ereignis bekommt dieselbe
+    /// Historie — ein `listener-new`-Befund behält Auslöser und `uid`.
+    #[test]
+    fn test_listener_findings_keep_their_provenance() -> TestResult {
+        let mut history = ListenerHistory::new();
+        history.observe(&[listener_event(22)], Timestamp::UNIX_EPOCH);
+        let mut owned = listener_event(4444);
+        owned.actor = Some(harw_dod_signals::Actor {
+            uid: 1000,
+            auid: None,
+            cgroup: None,
+            process: None,
+        });
+        let events = vec![listener_event(22), owned];
+        let evidence = SecurityEvidence::capture(vec![], events.clone(), Timestamp::UNIX_EPOCH)
+            .map_err(ctx("well-formed content always encodes"))?;
+        let scope = NetworkScope::empty();
+        let inputs = RuleInputs {
+            listener_history: Some(&history),
+            ..RuleInputs::scope_only(&scope)
+        };
+        let ctx_full = inputs.context(Timestamp::UNIX_EPOCH, &evidence.samples, &evidence.events);
+        let findings = run_rules_checked(&ctx_full);
+        assert_eq!(findings.len(), 1, "only the new listener");
+        let provenance = attribute_provenance(
+            &findings,
+            &events,
+            Timestamp::UNIX_EPOCH,
+            inputs,
+            &CgroupKids::default(),
+        );
+        let first = provenance.first().ok_or(TestError::Missing("provenance"))?;
+        assert_eq!(first.triggers, vec![1]);
+        assert_eq!(first.origin.uid, Some(1000));
+        Ok(())
+    }
+
+    /// PL-100 WP1.6: auf `warn` steht je Befund nur Regel, Schwere und
+    /// Zähler — weder ein Kontoname aus einem Home-Pfad noch Kennungen.
+    #[test]
+    fn test_warn_level_carries_only_rule_severity_and_counts() -> TestResult {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let evidence = SecurityEvidence::capture(
+            vec![],
+            vec![SecurityEvent {
+                sensor: SensorId::from_str("probe-fs-0"),
+                observed_at: Timestamp::UNIX_EPOCH,
+                actor: None,
+                kind: EventKind::FileWrite {
+                    path: "/home/alice-example/.bashrc".to_owned(),
+                },
+            }],
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("well-formed content always encodes"))?;
+
+        let reported = tracing::subscriber::with_default(subscriber, || {
+            report_findings(
+                &harw_observe::NullSink,
+                &evidence,
+                &[],
+                Timestamp::UNIX_EPOCH,
+                RuleInputs::scope_only(&NetworkScope::empty()),
+                &CgroupKids::default(),
+                None,
+                ReportOutputs::default(),
+            )
+        });
+
+        assert_eq!(reported, 1);
+        let text = captured.text()?;
+        assert!(text.contains("security rule finding"), "{text}");
+        assert!(text.contains("persistence-write"), "{text}");
+        assert!(text.contains("occurrences=1"), "{text}");
+        for leaked in [
+            "alice-example",
+            ".bashrc",
+            "finding_id",
+            "dedup_key",
+            "first_seen",
+            "hardness",
+            "summary",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} reached warn: {text}");
+        }
         Ok(())
     }
 }

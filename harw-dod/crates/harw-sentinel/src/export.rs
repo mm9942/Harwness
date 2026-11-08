@@ -635,21 +635,24 @@ fn restrict_mode(_file: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// Why an export destination was refused at startup (PL-97, PR #154 P1).
+/// Why an export or state destination was refused at startup (PL-97,
+/// PR #154 P1; the throttle state since the PL-100 owner review).
 ///
 /// # Description
-/// Returned by [`validate_export_path`] and
-/// [`check_distinct_destinations`]; the sentinel refuses to start on any of
-/// these (fail-closed) instead of letting the atomic health rename replace
-/// the visible findings file while [`FindingsExporter`] keeps appending to
-/// the then unlinked inode.
+/// Returned by [`validate_export_path`], [`check_distinct_destinations`]
+/// and [`check_distinct_writers`]; the sentinel refuses to start on any of
+/// these (fail-closed) instead of letting an atomic rename (health document,
+/// throttle state) replace the visible findings file while
+/// [`FindingsExporter`] keeps appending to the then unlinked inode, or
+/// letting two atomic writers overwrite each other every cycle.
 #[derive(Debug)]
 pub enum ExportPathError {
     /// The path is not absolute or carries a non-normal component (`.`,
     /// `..`, an empty component from `//`, or a trailing `/`), or has no
     /// file name.
     NonNormal {
-        /// Which export the path belongs to (`findings` or `health`).
+        /// Which destination the path belongs to (`findings`, `health`,
+        /// `throttle state`, ...).
         role: &'static str,
         /// The refused path as given.
         path: PathBuf,
@@ -662,25 +665,33 @@ pub enum ExportPathError {
         /// The underlying resolution error.
         source: io::Error,
     },
-    /// Both exports resolve to the same file (same canonical parent and
+    /// Two destinations resolve to the same file (same canonical parent and
     /// same file name).
     Collision {
-        /// The findings export path as given.
-        findings: PathBuf,
-        /// The health export path as given.
-        health: PathBuf,
+        /// Role of the first destination (in check order).
+        first_role: &'static str,
+        /// The first destination path as given.
+        first: PathBuf,
+        /// Role of the second destination.
+        second_role: &'static str,
+        /// The second destination path as given.
+        second: PathBuf,
         /// The common resolved destination.
         resolved: PathBuf,
     },
-    /// Both exports live in the same resolved directory and a file the
-    /// health writer touches (its destination or its temporary sibling
-    /// `.<name>.tmp`) is the findings export or one of its rotated
-    /// generations `<findings>.N`.
+    /// Two destinations live in the same resolved directory and a file one
+    /// writer touches (its destination, the temporary sibling
+    /// `.<name>.tmp` of an atomic writer, or a rotated generation
+    /// `<findings>.N`) is also touched by the other.
     SiblingOverlap {
-        /// The findings export path as given.
-        findings: PathBuf,
-        /// The health export path as given.
-        health: PathBuf,
+        /// Role of the first destination (in check order).
+        first_role: &'static str,
+        /// The first destination path as given.
+        first: PathBuf,
+        /// Role of the second destination.
+        second_role: &'static str,
+        /// The second destination path as given.
+        second: PathBuf,
         /// The resolved file both writers would touch.
         resolved: PathBuf,
     },
@@ -691,34 +702,38 @@ impl std::fmt::Display for ExportPathError {
         match self {
             Self::NonNormal { role, path } => write!(
                 f,
-                "{role} export path '{}' must be absolute with only normal components (no '.', '..', '//' or trailing '/')",
+                "{role} path '{}' must be absolute with only normal components (no '.', '..', '//' or trailing '/')",
                 path.display()
             ),
             Self::Unresolved { parent, source } => write!(
                 f,
-                "cannot resolve export directory '{}' to prove the findings and health exports are distinct: {source}",
+                "cannot resolve directory '{}' to prove the sentinel's export and state files are distinct: {source}",
                 parent.display()
             ),
             Self::Collision {
-                findings,
-                health,
+                first_role,
+                first,
+                second_role,
+                second,
                 resolved,
             } => write!(
                 f,
-                "findings export '{}' and health export '{}' resolve to the same file '{}'",
-                findings.display(),
-                health.display(),
+                "{first_role} '{}' and {second_role} '{}' resolve to the same file '{}'",
+                first.display(),
+                second.display(),
                 resolved.display()
             ),
             Self::SiblingOverlap {
-                findings,
-                health,
+                first_role,
+                first,
+                second_role,
+                second,
                 resolved,
             } => write!(
                 f,
-                "health export '{}' (or its temporary sibling) and findings export '{}' (or a rotated generation) would both touch '{}'",
-                health.display(),
-                findings.display(),
+                "{first_role} '{}' and {second_role} '{}' (or their temporary siblings or rotated generations) would both touch '{}'",
+                first.display(),
+                second.display(),
                 resolved.display()
             ),
         }
@@ -767,78 +782,248 @@ pub fn validate_export_path(role: &'static str, path: &Path) -> Result<(), Expor
 /// Refuses a findings and a health export that resolve to the same file.
 ///
 /// # Description
-/// Both paths are first checked by [`validate_export_path`]. Then the
-/// parent directories are compared by resolved identity: equal lexical
-/// parents are the same directory; otherwise both are canonicalised
-/// ([`fs::canonicalize`], which resolves symlinked parent aliases). If the
-/// parents differ lexically and either cannot be resolved (for example it
-/// does not exist yet), distinctness cannot be proven and the check fails
-/// closed. Finally, within one resolved directory, the file names are
-/// compared: an equal name is a collision; a health name or health
-/// temporary sibling (`.<name>.tmp`) that is the findings name or a rotated
-/// generation `<findings>.N` is a sibling overlap. The final component
-/// itself is never followed: both writers already refuse a symlink there.
+/// [`check_distinct_writers`] over exactly these two destinations
+/// ([`Destination::findings`], [`Destination::health`]); see there. The
+/// production start check (`crate::check_export_destinations`) adds the
+/// state files and calls [`check_distinct_writers`] itself; this shorthand
+/// keeps the two-export cases readable in tests.
 ///
 /// # Errors
 /// [`ExportPathError::NonNormal`], [`ExportPathError::Unresolved`],
 /// [`ExportPathError::Collision`] or [`ExportPathError::SiblingOverlap`].
+#[cfg(test)]
 pub fn check_distinct_destinations(findings: &Path, health: &Path) -> Result<(), ExportPathError> {
-    validate_export_path("findings", findings)?;
-    validate_export_path("health", health)?;
-    let (Some(findings_parent), Some(health_parent)) = (findings.parent(), health.parent()) else {
-        // Nach `validate_export_path` hat jeder Pfad einen Elternteil; ohne
-        // ihn lässt sich nichts beweisen — also ablehnen.
-        return Err(ExportPathError::NonNormal {
+    check_distinct_writers(&[Destination::findings(findings), Destination::health(health)])
+}
+
+/// How a writer of the sentinel touches the files next to its destination.
+///
+/// # Concurrency
+/// Plain value type, `Copy + Send + Sync`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterKind {
+    /// Appends to the destination and rotates it to `<name>.N`
+    /// ([`FindingsExporter`]).
+    AppendRotating,
+    /// Replaces the destination atomically through the temporary sibling
+    /// `.<name>.tmp` (`crate::health_export::write_atomically`: health
+    /// document, throttle state).
+    AtomicReplace,
+    /// Unlinks the destination and binds a socket there
+    /// (`crate::ipc::IpcListener::bind`, before Landlock): touches exactly
+    /// its own name, so any other writer's file under that name would be
+    /// deleted at every start.
+    UnlinkBind,
+}
+
+/// One file a writer of the sentinel owns, checked by
+/// [`check_distinct_writers`] before any writer starts.
+///
+/// # Concurrency
+/// Borrowed value type, `Copy + Send + Sync`.
+///
+/// # Examples
+/// ```rust,ignore
+/// let destinations = [
+///     Destination::findings(Path::new("/var/lib/harw-dod/export/findings.jsonl")),
+///     Destination::state("throttle state", &home.join("finding-throttle.json")),
+/// ];
+/// check_distinct_writers(&destinations)?;
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct Destination<'a> {
+    /// Name of the destination in errors (`findings`, `health`, ...).
+    pub role: &'static str,
+    /// The destination path as configured.
+    pub path: &'a Path,
+    /// How its writer touches sibling files.
+    pub kind: WriterKind,
+}
+
+impl<'a> Destination<'a> {
+    /// The findings export (`--findings-export`, append + rotation).
+    #[must_use]
+    pub const fn findings(path: &'a Path) -> Self {
+        Self {
             role: "findings",
-            path: findings.to_path_buf(),
-        });
-    };
-    let (findings_dir, health_dir) = if findings_parent == health_parent {
-        (findings_parent.to_path_buf(), health_parent.to_path_buf())
-    } else {
-        let resolve = |parent: &Path| {
-            fs::canonicalize(parent).map_err(|source| ExportPathError::Unresolved {
-                parent: parent.to_path_buf(),
-                source,
-            })
-        };
-        (resolve(findings_parent)?, resolve(health_parent)?)
-    };
-    if findings_dir != health_dir {
-        return Ok(());
+            path,
+            kind: WriterKind::AppendRotating,
+        }
     }
-    let (Some(findings_name), Some(health_name)) = (findings.file_name(), health.file_name())
-    else {
-        return Err(ExportPathError::NonNormal {
-            role: "findings",
-            path: findings.to_path_buf(),
-        });
-    };
-    let resolved = |name: &OsStr| findings_dir.join(name);
-    if findings_name == health_name {
-        return Err(ExportPathError::Collision {
-            findings: findings.to_path_buf(),
-            health: health.to_path_buf(),
-            resolved: resolved(findings_name),
-        });
+
+    /// The health document (`--health-export`, atomic replacement).
+    #[must_use]
+    pub const fn health(path: &'a Path) -> Self {
+        Self {
+            role: "health",
+            path,
+            kind: WriterKind::AtomicReplace,
+        }
     }
-    // Der Gesundheitsschreiber berührt neben seinem Ziel auch die temporäre
-    // Geschwisterdatei `.<name>.tmp` (entfernen, neu anlegen, umbenennen);
-    // der Befundschreiber neben seinem Ziel die Generationen `<name>.N`.
-    // Keine der Mengen darf die andere schneiden.
-    let mut health_temporary = OsString::from(".");
-    health_temporary.push(health_name);
-    health_temporary.push(".tmp");
-    for touched in [health_name, health_temporary.as_os_str()] {
-        if is_findings_file(findings_name, touched) {
-            return Err(ExportPathError::SiblingOverlap {
-                findings: findings.to_path_buf(),
-                health: health.to_path_buf(),
-                resolved: resolved(touched),
-            });
+
+    /// The IPC receive socket (`--socket`, unlinked and bound at start;
+    /// PL-100 review round 1).
+    ///
+    /// # Arguments
+    /// - `path` (`&Path`): the socket path.
+    #[must_use]
+    pub const fn socket(path: &'a Path) -> Self {
+        Self {
+            role: "ipc socket",
+            path,
+            kind: WriterKind::UnlinkBind,
+        }
+    }
+
+    /// A state file below `--home` that is replaced atomically (for
+    /// example the finding throttle state, `crate::throttle`).
+    ///
+    /// # Arguments
+    /// - `role` (`&'static str`): its name in errors.
+    /// - `path` (`&Path`): the state file.
+    #[must_use]
+    pub const fn state(role: &'static str, path: &'a Path) -> Self {
+        Self {
+            role,
+            path,
+            kind: WriterKind::AtomicReplace,
+        }
+    }
+
+    /// The file names in its directory this writer creates or replaces
+    /// itself: the destination, plus `.<name>.tmp` for an atomic writer.
+    fn touched_names(&self, name: &OsStr) -> Vec<OsString> {
+        match self.kind {
+            WriterKind::AppendRotating | WriterKind::UnlinkBind => vec![name.to_os_string()],
+            WriterKind::AtomicReplace => vec![name.to_os_string(), temporary_name(name)],
+        }
+    }
+
+    /// Whether this writer (destination file name `own`) touches the file
+    /// `name` of the same directory: its destination, its temporary sibling,
+    /// or a rotated generation `<own>.N`.
+    fn covers(&self, own: &OsStr, name: &OsStr) -> bool {
+        match self.kind {
+            WriterKind::AppendRotating => is_findings_file(own, name),
+            WriterKind::AtomicReplace => name == own || name == temporary_name(own).as_os_str(),
+            WriterKind::UnlinkBind => name == own,
+        }
+    }
+}
+
+/// `.<name>.tmp`, the temporary sibling of an atomic writer (the same
+/// spelling as `crate::health_export::temporary_path`).
+fn temporary_name(name: &OsStr) -> OsString {
+    let mut temporary = OsString::from(".");
+    temporary.push(name);
+    temporary.push(".tmp");
+    temporary
+}
+
+/// Resolves the directory `parent` for the identity comparison.
+fn resolve_parent(parent: &Path) -> Result<PathBuf, ExportPathError> {
+    fs::canonicalize(parent).map_err(|source| ExportPathError::Unresolved {
+        parent: parent.to_path_buf(),
+        source,
+    })
+}
+
+/// Refuses any two sentinel writers whose files alias each other.
+///
+/// # Description
+/// Every path is first checked by [`validate_export_path`] (in the given
+/// order). Then every pair is compared, in order: equal lexical parents
+/// are the same directory; otherwise both parents are canonicalised
+/// ([`fs::canonicalize`], which resolves symlinked parent aliases). If the
+/// parents differ lexically and either cannot be resolved (for example it
+/// does not exist yet), distinctness cannot be proven and the check fails
+/// closed. Within one resolved directory, an equal file name is a
+/// [`ExportPathError::Collision`]; a file one writer touches (its
+/// destination, the temporary sibling `.<name>.tmp` of an
+/// [`WriterKind::AtomicReplace`] writer) that the other writer also touches
+/// (including the rotated generations `<name>.N` of the
+/// [`WriterKind::AppendRotating`] findings export) is a
+/// [`ExportPathError::SiblingOverlap`]. The final component itself is never
+/// followed: every writer already refuses a symlink there.
+///
+/// # Arguments
+/// - `destinations` (`&[Destination]`): the configured files, in the order
+///   errors should name them.
+///
+/// # Errors
+/// The first [`ExportPathError::NonNormal`], [`ExportPathError::Unresolved`],
+/// [`ExportPathError::Collision`] or [`ExportPathError::SiblingOverlap`]
+/// found.
+pub fn check_distinct_writers(destinations: &[Destination<'_>]) -> Result<(), ExportPathError> {
+    for destination in destinations {
+        validate_export_path(destination.role, destination.path)?;
+    }
+    for (index, first) in destinations.iter().enumerate() {
+        for second in destinations.iter().skip(index.saturating_add(1)) {
+            check_pair(first, second)?;
         }
     }
     Ok(())
+}
+
+/// Compares two validated destinations (see [`check_distinct_writers`]).
+fn check_pair(first: &Destination<'_>, second: &Destination<'_>) -> Result<(), ExportPathError> {
+    let refuse_first = || ExportPathError::NonNormal {
+        role: first.role,
+        path: first.path.to_path_buf(),
+    };
+    // Nach `validate_export_path` hat jeder Pfad Elternteil und Namen; ohne
+    // sie lässt sich nichts beweisen — also ablehnen.
+    let (Some(first_parent), Some(second_parent)) = (first.path.parent(), second.path.parent())
+    else {
+        return Err(refuse_first());
+    };
+    let (Some(first_name), Some(second_name)) = (first.path.file_name(), second.path.file_name())
+    else {
+        return Err(refuse_first());
+    };
+    let directory = if first_parent == second_parent {
+        first_parent.to_path_buf()
+    } else {
+        let first_dir = resolve_parent(first_parent)?;
+        if first_dir != resolve_parent(second_parent)? {
+            return Ok(());
+        }
+        first_dir
+    };
+    if first_name == second_name {
+        return Err(ExportPathError::Collision {
+            first_role: first.role,
+            first: first.path.to_path_buf(),
+            second_role: second.role,
+            second: second.path.to_path_buf(),
+            resolved: directory.join(first_name),
+        });
+    }
+    // Ein atomarer Schreiber berührt neben seinem Ziel die temporäre
+    // Geschwisterdatei `.<name>.tmp` (entfernen, neu anlegen, umbenennen);
+    // der Befundschreiber neben seinem Ziel die Generationen `<name>.N`.
+    // Keine der Mengen darf die andere schneiden.
+    let overlap = first
+        .touched_names(first_name)
+        .into_iter()
+        .find(|touched| second.covers(second_name, touched.as_os_str()))
+        .or_else(|| {
+            second
+                .touched_names(second_name)
+                .into_iter()
+                .find(|touched| first.covers(first_name, touched.as_os_str()))
+        });
+    match overlap {
+        Some(touched) => Err(ExportPathError::SiblingOverlap {
+            first_role: first.role,
+            first: first.path.to_path_buf(),
+            second_role: second.role,
+            second: second.path.to_path_buf(),
+            resolved: directory.join(touched),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Whether `name` is the findings export `findings_name` itself or one of
@@ -2328,6 +2513,200 @@ mod tests {
         .err()
         .ok_or(TestError::Missing("fail-closed refusal"))?;
         assert!(matches!(error, ExportPathError::Unresolved { .. }));
+        Ok(())
+    }
+
+    /// The three writers of a normal start in one directory, with the
+    /// throttle state as an atomic state file.
+    fn writers<'a>(findings: &'a Path, health: &'a Path, state: &'a Path) -> [Destination<'a>; 3] {
+        [
+            Destination::findings(findings),
+            Destination::health(health),
+            Destination::state("throttle state", state),
+        ]
+    }
+
+    #[test]
+    fn test_distinct_writers_with_a_state_file_pass() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let export = dir.path().join("export");
+        fs::create_dir(&export).map_err(ctx("export dir"))?;
+        check_distinct_writers(&writers(
+            &export.join("findings.jsonl"),
+            &export.join("health.json"),
+            &dir.path().join("finding-throttle.json"),
+        ))
+        .map_err(ctx("distinct writers"))?;
+        Ok(())
+    }
+
+    /// PL-100 owner review: the findings export on the throttle state (or
+    /// its temporary sibling) is refused, naming both roles.
+    #[test]
+    fn test_findings_on_the_state_file_or_its_temporary_sibling_is_refused() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let state = dir.path().join("finding-throttle.json");
+        let health = dir.path().join("health.json");
+        let error = check_distinct_writers(&writers(&state, &health, &state))
+            .err()
+            .ok_or(TestError::Missing("refusal of the state alias"))?;
+        assert!(matches!(
+            error,
+            ExportPathError::Collision {
+                first_role: "findings",
+                second_role: "throttle state",
+                ..
+            }
+        ));
+        let temporary = dir.path().join(".finding-throttle.json.tmp");
+        let error = check_distinct_writers(&writers(&temporary, &health, &state))
+            .err()
+            .ok_or(TestError::Missing("refusal of the temporary alias"))?;
+        assert!(matches!(
+            error,
+            ExportPathError::SiblingOverlap {
+                first_role: "findings",
+                second_role: "throttle state",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains(".finding-throttle.json.tmp"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_health_on_the_state_file_or_its_temporary_sibling_is_refused() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let state = dir.path().join("finding-throttle.json");
+        let findings = dir.path().join("findings.jsonl");
+        assert!(matches!(
+            check_distinct_writers(&writers(&findings, &state, &state)),
+            Err(ExportPathError::Collision {
+                first_role: "health",
+                second_role: "throttle state",
+                ..
+            })
+        ));
+        let temporary = dir.path().join(".finding-throttle.json.tmp");
+        assert!(matches!(
+            check_distinct_writers(&writers(&findings, &temporary, &state)),
+            Err(ExportPathError::SiblingOverlap {
+                first_role: "health",
+                second_role: "throttle state",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    /// A findings generation `<name>.N` that is a state file is refused, a
+    /// state file that only looks similar is not.
+    #[test]
+    fn test_state_file_on_a_rotated_findings_generation_is_refused() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let findings = dir.path().join("state");
+        let health = dir.path().join("health.json");
+        assert!(matches!(
+            check_distinct_writers(&writers(&findings, &health, &dir.path().join("state.3"))),
+            Err(ExportPathError::SiblingOverlap { .. })
+        ));
+        check_distinct_writers(&writers(&findings, &health, &dir.path().join("state.json")))
+            .map_err(ctx("not a rotated generation"))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_parent_alias_of_the_state_file_is_refused() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = dir.path().join("home");
+        fs::create_dir(&home).map_err(ctx("home dir"))?;
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).map_err(ctx("symlink"))?;
+        let export = dir.path().join("export");
+        fs::create_dir(&export).map_err(ctx("export dir"))?;
+        assert!(matches!(
+            check_distinct_writers(&writers(
+                &export.join("findings.jsonl"),
+                &link.join("finding-throttle.json"),
+                &home.join("finding-throttle.json"),
+            )),
+            Err(ExportPathError::Collision { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_writer_kinds_cover_their_own_siblings_only() {
+        let name = OsStr::new("health.json");
+        let atomic = Destination::health(Path::new("/x/health.json"));
+        assert!(atomic.covers(name, OsStr::new("health.json")));
+        assert!(atomic.covers(name, OsStr::new(".health.json.tmp")));
+        assert!(!atomic.covers(name, OsStr::new("health.json.1")));
+        let append = Destination::findings(Path::new("/x/health.json"));
+        assert!(append.covers(name, OsStr::new("health.json.1")));
+        assert!(!append.covers(name, OsStr::new(".health.json.tmp")));
+        assert_eq!(
+            atomic.touched_names(name),
+            vec![
+                OsString::from("health.json"),
+                OsString::from(".health.json.tmp")
+            ]
+        );
+        assert_eq!(
+            append.touched_names(name),
+            vec![OsString::from("health.json")]
+        );
+        let socket = Destination::socket(Path::new("/x/health.json"));
+        assert!(socket.covers(name, OsStr::new("health.json")));
+        assert!(!socket.covers(name, OsStr::new(".health.json.tmp")));
+        assert!(!socket.covers(name, OsStr::new("health.json.1")));
+        assert_eq!(
+            socket.touched_names(name),
+            vec![OsString::from("health.json")]
+        );
+    }
+
+    /// PL-100 review round 1: the IPC socket (unlinked at every start) on a
+    /// state file, its temporary sibling or a rotated findings generation is
+    /// refused; a socket next to them under its own name is not.
+    #[test]
+    fn test_the_socket_on_another_writers_file_is_refused() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let state = dir.path().join("listener-history.json");
+        let findings = dir.path().join("findings.jsonl");
+        let with_socket = |socket: &Path| {
+            check_distinct_writers(&[
+                Destination::findings(&findings),
+                Destination::state("listener history", &state),
+                Destination::socket(socket),
+            ])
+        };
+        assert!(matches!(
+            with_socket(&state),
+            Err(ExportPathError::Collision {
+                first_role: "listener history",
+                second_role: "ipc socket",
+                ..
+            })
+        ));
+        assert!(matches!(
+            with_socket(&dir.path().join(".listener-history.json.tmp")),
+            Err(ExportPathError::SiblingOverlap {
+                first_role: "listener history",
+                second_role: "ipc socket",
+                ..
+            })
+        ));
+        assert!(matches!(
+            with_socket(&dir.path().join("findings.jsonl.2")),
+            Err(ExportPathError::SiblingOverlap {
+                first_role: "findings",
+                second_role: "ipc socket",
+                ..
+            })
+        ));
+        with_socket(&dir.path().join("sentinel.sock")).map_err(ctx("own name"))?;
         Ok(())
     }
 }

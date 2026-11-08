@@ -3851,7 +3851,9 @@ mod tests {
                     events_total: 45,
                     dropped_total: 0,
                     peers_rejected_total: 0,
+                    decode_errors_total: 0,
                 }),
+                landlock: None,
             }),
             health_export: ExportState::Readable,
             findings: summarize(lines, Duration::from_secs(24 * 3600), now()),
@@ -6003,6 +6005,84 @@ mod tests {
             matches!(result, Err(OpError::NotAvailable(_))),
             "{result:?}"
         );
+        Ok(())
+    }
+
+    /// A full v3 export line exactly as the sentinel writes it: the same
+    /// line as `V3_FIXTURE_LINE` in `harw-sentinel/src/export.rs`, which is
+    /// pinned there as byte-for-byte what its `encode_line` writes
+    /// (`test_v3_fixture_line_is_byte_identical_to_encode_line`).
+    const SENTINEL_V3_LINE: &str = r#"{"schema_version":3,"finding_id":"3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b","host":"host-a","rule_id":"egress-flow","severity":"critical","summary":"tcp connect","observed_at":"2026-09-27T11:00:00Z","scope":"/sys/fs/cgroup/harw.slice","instance":"a1b2c3d4-e5f6-4a7b-9c8d-0e1f2a3b4c5d","seq":7,"record_digest":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","dedup_key":"0123456789abcdef0123456789abcdef","occurrences":3,"first_seen":"2026-09-27T10:00:00Z","kind":"rule_triggered","hardness":"observed","cgroup_kid":4242,"scope_obfuscated":false,"evidence_card":{"event_counts":{"tcp_connect":3},"uid":1000,"destination":"203.0.113.9:443","path":"/usr/bin/curl","process":{"pid":4711,"comm":"curl"}}}"#;
+
+    /// PL-100 WP1.2: the triage context a `security-*-triage` child reads
+    /// (`dod.finding` over a sentinel v3 line parsed by `harw-dod-client`)
+    /// carries the exported `record_digest` unchanged, so the
+    /// `bound_evidence` the child copies from it is exactly the digest the
+    /// receiver binds against (`VerdictBinding.record_digest`); `id`,
+    /// `instance` and `seq` keep the line's identity and export position.
+    #[test]
+    fn triage_context_of_a_sentinel_v3_line_binds_bound_evidence_to_its_record_digest() -> TestResult
+    {
+        let line = parse_finding_line(SENTINEL_V3_LINE)
+            .ok_or(TestError::Missing("the sentinel v3 line parses"))?;
+        let exported = line
+            .record_digest
+            .clone()
+            .ok_or(TestError::Missing("record_digest of the v3 line"))?;
+        let mut lines = fixture_lines()?;
+        lines.push(line.clone());
+        let snapshot = DodSnapshot {
+            status: fixture_status(&lines),
+            findings: Some(FindingsTail {
+                lines,
+                truncated: false,
+            }),
+            as_of: now(),
+            notes: Vec::new(),
+        };
+        let found = find_finding(&snapshot, line.finding_id.as_str())
+            .map_err(ctx("the v3 line is in the read tail"))?;
+        let context = finding_lookup_view(&snapshot, found);
+
+        let finding = text_at(&context, "/finding/id")?;
+        assert_eq!(finding, line.finding_id.as_str());
+        assert_eq!(
+            text_at(&context, "/finding/instance")?,
+            "a1b2c3d4-e5f6-4a7b-9c8d-0e1f2a3b4c5d"
+        );
+        assert_eq!(context.pointer("/finding/seq"), Some(&json!(7)));
+        assert_eq!(context.pointer("/finding/schema_version"), Some(&json!(3)));
+        let bound_evidence = text_at(&context, "/finding/record_digest")?;
+        assert_eq!(bound_evidence, exported, "bound_evidence == record_digest");
+
+        // The verdict the child returns with that `bound_evidence` binds to
+        // exactly this exported line, and to no other record digest.
+        let raw = json!({
+            "contract": "harwness.security-verdict/v1",
+            "finding": finding,
+            "bound_evidence": bound_evidence,
+            "classification": "suspicious",
+            "severity": "high",
+            "rationale": "egress to an unknown destination",
+            "suggested_response": "escalate",
+            "issued_by": "security-egress-triage",
+            "issued_at": "2026-09-27T12:00:00Z",
+        })
+        .to_string();
+        let screened = harw_core_bridge::security_verdict::screen_security_verdict(&raw)
+            .map_err(ctx("the verdict is well-formed"))?;
+        let record_digest: harw_types::ContentDigest = exported
+            .parse()
+            .map_err(ctx("record_digest is a content digest"))?;
+        assert_eq!(screened.verdict().bound_evidence(), record_digest);
+        assert!(
+            screened
+                .verdict()
+                .binds(&line.finding_id, record_digest)
+                .is_ok()
+        );
+        let other = harw_types::ContentDigest::of(b"another finding record");
+        assert!(screened.verdict().binds(&line.finding_id, other).is_err());
         Ok(())
     }
 

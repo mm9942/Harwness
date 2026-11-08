@@ -14,3 +14,45 @@ sensors = ["exec", "tcp-connect"]
 # Sentinel warnt beim Start). Installiert nie Firewallregeln.
 # Beispiel: egress_allow_cidrs = ["192.0.2.0/24", "2001:db8::/32"]
 egress_allow_cidrs = []
+
+# Optionale Einstellungen von harw-sentinel (PL-100). Ein angegebenes
+# Kommandozeilenflag gewinnt; ohne Flag und ohne Schluessel gilt die
+# eingebaute Vorgabe (die hier gezeigten Werte). Die Tabelle steht bewusst
+# auskommentiert (Reader-first): Leser vor dieser Fassung lehnen eine Datei
+# mit dieser Tabelle ab.
+# [sentinel]
+# Konten, deren Prozesse Ereignisse ueber den IPC-Socket des Sentinels
+# einreichen duerfen (SO_PEERCRED; Kontoname oder numerische uid, hoechstens
+# 32 Eintraege; uid 0 ist immer zugelassen). Wie --probe-peer-user.
+# probe_peer_users = ["harw-probe-bpf", "harw-probe-fs"]
+# Abklingzeit des Befund-Throttles in Sekunden (0 bis 604800; 0 meldet jede
+# Wiederholung). Wie --finding-cooldown-secs.
+# finding_cooldown_secs = 600
+# Container-Sensor: "auto" (laeuft fuer jede bekannte Anordnung, libpod-Scopes
+# unter machine.slice und docker-Scopes unter system.slice, auch ohne
+# erkannte Laufzeit; ein noch fehlendes machine.slice ist eine leere Messung,
+# ohne cgroup v2 wird der Sensor als beeintraechtigt gemeldet), "on" (wie
+# "auto"; zusaetzlich wird eine Anordnung ohne cgroup-Verzeichnis, deren
+# Laufzeit beim Start weder per Socket noch per laufendem Scope erkannt
+# wurde, als beeintraechtigt gemeldet) oder "off". Docker
+# mit cgroupfs-Treiber (/sys/fs/cgroup/docker) wird bei "auto" und "on" als
+# nicht unterstuetzt gemeldet (sensor-degraded). Wie --container-sensor.
+# container_sensor = "auto"
+
+# Optionaler Beobachtungsbereich von harw-probe-fs (PL-100 WP1.6), ebenfalls
+# auskommentiert (Reader-first). Ein angegebenes --scope-root/--home-root der
+# Sonde ersetzt beide Wurzellisten; ohne Flag und ohne Schluessel gilt die
+# eingebaute Vorgabe (die hier gezeigten Werte). Jede Liste hoechstens 64
+# Eintraege; Wurzeln absolut, nie "/".
+# [probe_fs]
+# Verzeichnisse, unter denen jede Schreibaenderung zaehlt (Persistenz-Orte
+# der Regel persistence-write: /etc mit systemd, cron, ld.so.preload, profile,
+# ssh; Spool von cron und at; systemd- und udev-Verzeichnisse unter /usr).
+# scope_roots = ["/etc", "/var/spool/cron", "/var/spool/at", "/usr/lib/systemd", "/usr/local/lib/systemd", "/lib/systemd", "/usr/share/systemd", "/usr/local/share/systemd", "/usr/lib/udev/rules.d", "/usr/local/lib/udev/rules.d", "/lib/udev/rules.d"]
+# Verzeichnisse mit Home-Verzeichnissen bzw. Home-Verzeichnisse selbst
+# (/var/home und /var/roothome auf ostree-Hosts). Darunter zaehlen nur Pfade,
+# die (nach hoechstens zwei Komponenten, etwa dem Benutzernamen) mit einem
+# Eintrag von home_entries beginnen -- keine Benutzernamen in der Datei.
+# home_roots = ["/home", "/var/home", "/root", "/var/roothome"]
+# Pfade relativ zu einem Home-Verzeichnis.
+# home_entries = [".ssh", ".config/systemd", ".local/share/systemd", ".config/autostart", ".config/environment.d", ".pam_environment", ".bashrc", ".bash_aliases", ".bash_profile", ".bash_login", ".bash_logout", ".profile", ".zshrc", ".zprofile", ".zshenv", ".zlogin"]

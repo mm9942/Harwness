@@ -9,7 +9,8 @@
 //! Pfad des IPC-Empfangssockets, die Poll-Taktung, den expliziten
 //! Konfigurationspfad (`--config`), die beiden optionalen Exporte
 //! (`--findings-export`, `--health-export`), die Sonden-Konten der
-//! `SO_PEERCRED`-Zulassung (`--probe-peer-user`, PL-100 WP0.5) und den
+//! `SO_PEERCRED`-Zulassung (`--probe-peer-user`, PL-100 WP0.5), den
+//! Container-Schalter (`--container-sensor`, PL-100 WP1.8) und den
 //! Diagnosemodus `--print-sandbox` (PL-100 WP0.7). Diese Datei parst
 //! nur — sie kennt weder `Sentinel` noch einen Sensor.
 //!
@@ -33,8 +34,6 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use harw_types::HostId;
-
-use crate::peer_allow::DEFAULT_PROBE_PEER_USERS;
 
 /// Vorgabe: das IPC-Empfangssocket liegt unter `<home>/sentinel.sock`.
 ///
@@ -253,30 +252,44 @@ pub struct Cli {
     /// Abklingzeit des Befund-Throttles in Sekunden (PL-100 WP0.4): ein
     /// Befund mit demselben `dedup_key` (Regel, uid, Cgroup, grobes Subjekt)
     /// wird innerhalb dieser Zeit nur gezählt, nicht erneut gemeldet — außer
-    /// bei stärkerer Härte oder höherer Schwere. Vorgabe 600 (10 min), `0`
-    /// meldet jede Wiederholung, höchstens 604800 (7 Tage). Siehe
-    /// `crate::throttle`.
+    /// bei stärkerer Härte oder höherer Schwere. `0` meldet jede
+    /// Wiederholung, höchstens 604800 (7 Tage). Ohne Angabe gilt
+    /// `[sentinel] finding_cooldown_secs` der DoD-Konfiguration, sonst die
+    /// Vorgabe 600 (10 min; `crate::throttle::DEFAULT_COOLDOWN_SECS`) — das
+    /// Flag gewinnt immer. Siehe `crate::throttle`.
     #[arg(
         long,
         value_name = "SECS",
-        default_value_t = crate::throttle::DEFAULT_COOLDOWN_SECS,
         value_parser = clap::value_parser!(u64).range(0..=crate::throttle::MAX_COOLDOWN_SECS)
     )]
-    pub finding_cooldown_secs: u64,
+    pub finding_cooldown_secs: Option<u64>,
 
     /// Konto, dessen Prozesse Ereignisse über den IPC-Socket einreichen
     /// dürfen (`SO_PEERCRED`, PL-100 WP0.5): ein Kontoname (aufgelöst beim
     /// Start über `/etc/passwd`) oder eine numerische uid. Mehrfach
-    /// angebbar; eine Angabe ersetzt die Vorgabe vollständig. uid `0` ist
-    /// immer zugelassen. Vorgabe: die Sonden-Konten aus
-    /// `deploy/sysusers.d/harw.conf`.
+    /// angebbar; eine Angabe ersetzt die Konfiguration und die Vorgabe
+    /// vollständig. uid `0` ist immer zugelassen. Ohne Angabe gilt
+    /// `[sentinel] probe_peer_users` der DoD-Konfiguration, sonst die
+    /// Sonden-Konten aus `deploy/sysusers.d/harw.conf`
+    /// (`crate::peer_allow::DEFAULT_PROBE_PEER_USERS`).
     #[arg(
         long = "probe-peer-user",
         value_name = "USER|UID",
-        default_values = DEFAULT_PROBE_PEER_USERS,
         value_parser = parse_peer_user
     )]
-    pub probe_peer_users: Vec<String>,
+    pub probe_peer_users: Option<Vec<String>>,
+
+    /// Schalter des Container-Sensors (PL-100 WP1.8): `auto` registriert je
+    /// bekannter Anordnung (`libpod-*.scope` unter `machine.slice`,
+    /// `docker-*.scope` unter `system.slice`) einen Sensor, auch ohne
+    /// erkannte Laufzeit (ein fehlendes Verzeichnis ist auf cgroup v2 eine
+    /// leere Messung), `on` ebenso, meldet aber das fehlende Verzeichnis einer
+    /// beim Start nicht erkannten Laufzeit als beeinträchtigt, `off` keinen.
+    /// Ohne cgroup v2 melden sich die Sensoren als beeinträchtigt. Ohne Angabe
+    /// gilt `[sentinel] container_sensor` der DoD-Konfiguration, sonst `auto`
+    /// — das Flag gewinnt immer. Siehe `crate::container_plan`.
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub container_sensor: Option<ContainerSensorArg>,
 
     /// Gibt die wirksamen Landlock-Lese-/Schreibwurzeln, die abgewiesenen
     /// Wurzeln und die zugelassenen IPC-Peer-uids auf stdout aus und beendet
@@ -284,6 +297,30 @@ pub struct Cli {
     /// PL-100 WP0.7). Wertet dieselben Flags aus wie der normale Start.
     #[arg(long, default_value_t = false)]
     pub print_sandbox: bool,
+}
+
+/// Werte von `--container-sensor` (dieselben wie `[sentinel]
+/// container_sensor`, [`harw_dod_config::ContainerSensorMode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum ContainerSensorArg {
+    /// Je bekannter Anordnung ein Sensor; fehlendes Verzeichnis leer.
+    Auto,
+    /// Je bekannter Anordnung ein Sensor; fehlendes Verzeichnis einer nicht
+    /// erkannten Laufzeit beeinträchtigt.
+    On,
+    /// Kein Container-Sensor.
+    Off,
+}
+
+impl From<ContainerSensorArg> for harw_dod_config::ContainerSensorMode {
+    fn from(arg: ContainerSensorArg) -> Self {
+        match arg {
+            ContainerSensorArg::Auto => Self::Auto,
+            ContainerSensorArg::On => Self::On,
+            ContainerSensorArg::Off => Self::Off,
+        }
+    }
 }
 
 impl Cli {
@@ -393,17 +430,44 @@ mod tests {
         );
     }
 
+    /// Ohne Flag bleibt der Wert offen: `main` nimmt dann die
+    /// DoD-Konfiguration oder die Vorgabe (CLI gewinnt, PL-100).
     #[test]
-    fn test_finding_cooldown_defaults_to_ten_minutes_and_is_bounded() -> TestResult {
+    fn test_finding_cooldown_is_unset_without_the_flag_and_bounded() -> TestResult {
         let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
-        assert_eq!(cli.finding_cooldown_secs, 600);
+        assert_eq!(cli.finding_cooldown_secs, None);
         let zero = Cli::try_parse_from(["harw-sentinel", "--finding-cooldown-secs", "0"])
             .map_err(ctx("zero cooldown"))?;
-        assert_eq!(zero.finding_cooldown_secs, 0);
+        assert_eq!(zero.finding_cooldown_secs, Some(0));
+        let most = Cli::try_parse_from(["harw-sentinel", "--finding-cooldown-secs", "604800"])
+            .map_err(ctx("seven days"))?;
+        assert_eq!(most.finding_cooldown_secs, Some(604_800));
         assert!(
             Cli::try_parse_from(["harw-sentinel", "--finding-cooldown-secs", "604801"]).is_err(),
             "more than seven days is rejected"
         );
+        Ok(())
+    }
+
+    /// PL-100 WP1.8: ohne Flag bleibt der Container-Schalter offen (dann
+    /// Konfiguration bzw. `auto`); jeder der drei Werte wird angenommen.
+    #[test]
+    fn test_container_sensor_is_unset_without_the_flag_and_takes_three_values() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert_eq!(cli.container_sensor, None);
+        for (raw, mode) in [
+            ("auto", harw_dod_config::ContainerSensorMode::Auto),
+            ("on", harw_dod_config::ContainerSensorMode::On),
+            ("off", harw_dod_config::ContainerSensorMode::Off),
+        ] {
+            let cli = Cli::try_parse_from(["harw-sentinel", "--container-sensor", raw])
+                .map_err(ctx("container mode"))?;
+            let arg = cli
+                .container_sensor
+                .ok_or(TestError::Missing("container mode"))?;
+            assert_eq!(harw_dod_config::ContainerSensorMode::from(arg), mode);
+        }
+        assert!(Cli::try_parse_from(["harw-sentinel", "--container-sensor", "yes"]).is_err());
         Ok(())
     }
 
@@ -433,13 +497,12 @@ mod tests {
         Ok(())
     }
 
+    /// Ohne Flag bleibt die Liste offen (Konfiguration oder Vorgabe, siehe
+    /// `main`); die Vorgabe selbst prüft `main`.
     #[test]
-    fn test_probe_peer_users_default_to_the_probe_accounts() -> TestResult {
+    fn test_probe_peer_users_are_unset_without_the_flag() -> TestResult {
         let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
-        assert_eq!(
-            cli.probe_peer_users,
-            vec!["harw-probe-bpf".to_owned(), "harw-probe-fs".to_owned()]
-        );
+        assert_eq!(cli.probe_peer_users, None);
         Ok(())
     }
 
@@ -455,7 +518,7 @@ mod tests {
         .map_err(ctx("explicit peer users"))?;
         assert_eq!(
             cli.probe_peer_users,
-            vec!["harw-probe-netlink".to_owned(), "991".to_owned()]
+            Some(vec!["harw-probe-netlink".to_owned(), "991".to_owned()])
         );
         Ok(())
     }

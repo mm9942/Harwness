@@ -85,6 +85,19 @@ pub enum SentinelBinError {
     #[msg("failed to write the sandbox report: {0}")]
     #[from]
     Report(std::io::Error),
+
+    /// Zwei Schreibziele dieses Prozesses (Befundexport samt Rotationen,
+    /// Gesundheitsdokument, Throttle-Zustand, jeweils samt temporärer
+    /// Geschwisterdatei) fallen zusammen oder lassen sich nicht als
+    /// verschieden belegen; der Start wird verweigert, bevor ein Schreiber
+    /// öffnet (fail-closed, PL-97 PR #154 P1 und PL-100 Owner-Review).
+    ///
+    /// # Arguments
+    /// - `0` (`crate::export::ExportPathError`): welche Ziele kollidieren
+    ///   bzw. welches Verzeichnis nicht auflösbar war.
+    #[msg("refusing to start: export and state destinations are unsafe: {0}")]
+    #[from]
+    Destinations(crate::export::ExportPathError),
 }
 
 #[cfg(test)]

@@ -78,7 +78,10 @@ pub use findings::{
     FindingsTail, MAX_LINE_BYTES, MAX_TAIL_BYTES, RuleCount, SeverityCounts, is_finding_id,
     is_uuid_v4, parse_finding_line, read_findings_tail, summarize,
 };
-pub use health::{HealthReport, IpcCounters, SensorHealthEntry, SensorHealthState, read_health};
+pub use health::{
+    HealthReport, IpcCounters, LandlockHealth, LandlockOutcome, SensorHealthEntry,
+    SensorHealthState, read_health,
+};
 pub use paths::{
     ExportPaths, ExportSource, FINDINGS_FILE, HEALTH_FILE, SYSTEM_EXPORT_DIR, resolve_export_paths,
     resolve_export_paths_with,

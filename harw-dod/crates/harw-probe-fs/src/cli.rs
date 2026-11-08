@@ -4,11 +4,21 @@
 //! # Verantwortungsbereich
 //! [`Cli`] bündelt jeden Startparameter dieser Sonde: das verbindliche
 //! `--log`-Flag (siehe [`LogLevel`]-Moduldoku für die Abweichung von
-//! `harw-cli`s Fehlerverhalten), den `ReadScope` (`--scope-root`,
-//! wiederholbar, Pflicht), die loginuid-Wurzel (`--proc-root`), die
-//! Sensor-Kennung (`--sensor-id`) und den Sentinel-Socket
-//! (`--sentinel-socket`, Pflicht). Diese Datei parst nur — sie kennt weder
-//! `ReadScope` noch `FsMonSensor`.
+//! `harw-cli`s Fehlerverhalten), die DoD-Konfiguration (`--config`), den
+//! Beobachtungsbereich (`--scope-root`, `--home-root`, `--home-entry`, je
+//! wiederholbar und optional, PL-100 WP1.6), die loginuid-Wurzel
+//! (`--proc-root`), die Sensor-Kennung (`--sensor-id`) und den
+//! Sentinel-Socket (`--sentinel-socket`, Pflicht). Diese Datei parst nur —
+//! sie kennt weder `ReadScope` noch `FsMonSensor`; welcher Bereich gilt
+//! (Flag vor `[probe_fs]` vor Vorgabe), entscheidet [`crate::watch`].
+//!
+//! # Pfadgrammatik der Bereichsflags
+//! `--scope-root`/`--home-root` verlangen dieselbe Form wie `[probe_fs]`
+//! (`harw_dod_config::is_valid_probe_fs_root`: absolut, nie `/`, ohne `.`,
+//! `..`, leere Komponente oder Steuerzeichen), `--home-entry` die relative
+//! Form (`harw_dod_config::is_valid_probe_fs_home_entry`). Eine Wurzel `/`
+//! weitete die Landlock-Leseregel dieser privilegierten Sonde auf das ganze
+//! Dateisystem.
 //!
 //! # Unterbefehl `completions`
 //! Optional: `harw-probe-fs completions [SHELL] [--install|--uninstall]`
@@ -50,9 +60,9 @@
 //!     "harw-probe-fs",
 //!     "--scope-root", "/srv/data",
 //!     "--sentinel-socket", "/run/harw-sentinel.sock",
-//! ])
-//! .expect("minimal valid arguments");
+//! ])?;
 //! assert_eq!(cli.log, crate::cli::LogLevel::Info);
+//! # Ok::<(), clap::Error>(())
 //! ```
 
 use std::path::PathBuf;
@@ -128,10 +138,31 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "info")]
     pub log: LogLevel,
 
-    /// Erlaubte Wurzelverzeichnisse für den `ReadScope` dieser Sonde.
-    /// Wiederholbar; mindestens eine Angabe ist Pflicht.
-    #[arg(long = "scope-root", value_name = "DIR", required = true)]
+    /// Expliziter, administrativ vertrauter Pfad der DoD-Konfiguration
+    /// (absolut, root-eigen; fehlt sie, scheitert der Start). Ohne Angabe
+    /// gilt `/etc/harw-dod/config.toml`; fehlt diese Datei, gelten die
+    /// eingebauten Vorgaben (siehe [`crate::watch`]).
+    #[arg(long, value_name = "PATH", value_parser = parse_absolute_path)]
+    pub config: Option<PathBuf>,
+
+    /// Verzeichnis, unter dem jede Schreibänderung gemeldet wird.
+    /// Wiederholbar. Eine Angabe von `--scope-root` oder `--home-root`
+    /// ersetzt **beide** Wurzellisten von `[probe_fs]` und der Vorgabe
+    /// (eine nicht angegebene Liste ist dann leer).
+    #[arg(long = "scope-root", value_name = "DIR", value_parser = parse_watch_root)]
     pub scope_roots: Vec<PathBuf>,
+
+    /// Verzeichnis mit Home-Verzeichnissen (z. B. `/home`) oder selbst ein
+    /// Home-Verzeichnis (z. B. `/root`): darunter werden nur die
+    /// Home-Einträge gemeldet. Wiederholbar; siehe `--scope-root`.
+    #[arg(long = "home-root", value_name = "DIR", value_parser = parse_watch_root)]
+    pub home_roots: Vec<PathBuf>,
+
+    /// Pfad relativ zu einem Home-Verzeichnis, dessen Schreibänderungen
+    /// gemeldet werden (z. B. `.ssh`, `.bashrc`). Wiederholbar; eine Angabe
+    /// ersetzt `[probe_fs] home_entries` und die Vorgabe.
+    #[arg(long = "home-entry", value_name = "PATH", value_parser = parse_home_entry)]
+    pub home_entries: Vec<PathBuf>,
 
     /// Wurzel für die loginuid-Auflösung. Nur zum Testen gegen ein
     /// Fixture-Verzeichnis zu überschreiben — in Produktion bleibt es bei
@@ -155,6 +186,42 @@ pub struct Cli {
     /// Optional subcommand; without it the binary runs normally.
     #[command(subcommand)]
     pub command: Option<harw_completions::CompletionsSubcommand>,
+}
+
+/// `clap`-Wertparser für `--config`: nur absolute Pfade.
+fn parse_absolute_path(raw: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(format!("{raw:?} is not an absolute path"))
+    }
+}
+
+/// `clap`-Wertparser für `--scope-root`/`--home-root` (siehe Moduldoku,
+/// „Pfadgrammatik der Bereichsflags").
+fn parse_watch_root(raw: &str) -> Result<PathBuf, String> {
+    if harw_dod_config::is_valid_probe_fs_root(raw) {
+        Ok(PathBuf::from(raw))
+    } else {
+        Err(format!(
+            "{raw:?} must be an absolute directory other than '/' without '.', '..', empty \
+             components, a trailing '/' or control characters"
+        ))
+    }
+}
+
+/// `clap`-Wertparser für `--home-entry` (siehe Moduldoku, „Pfadgrammatik
+/// der Bereichsflags").
+fn parse_home_entry(raw: &str) -> Result<PathBuf, String> {
+    if harw_dod_config::is_valid_probe_fs_home_entry(raw) {
+        Ok(PathBuf::from(raw))
+    } else {
+        Err(format!(
+            "{raw:?} must be a relative path without '.', '..', empty components, a trailing \
+             '/' or control characters"
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -206,14 +273,85 @@ mod tests {
         );
     }
 
+    /// PL-100 WP1.6: ohne Bereichsflag kommt der Bereich aus `[probe_fs]`
+    /// bzw. der Vorgabe (`crate::watch`), nicht aus einem Platzhalter.
     #[test]
-    fn test_scope_root_is_required() {
-        let result = Cli::try_parse_from([
+    fn test_scope_flags_and_config_are_optional() -> TestResult {
+        let cli = Cli::try_parse_from([
             "harw-probe-fs",
             "--sentinel-socket",
             "/run/harw-sentinel.sock",
-        ]);
-        assert!(result.is_err(), "missing --scope-root must be rejected");
+        ])
+        .map_err(ctx("no scope flag"))?;
+        assert!(cli.scope_roots.is_empty());
+        assert!(cli.home_roots.is_empty());
+        assert!(cli.home_entries.is_empty());
+        assert_eq!(cli.config, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_home_root_entry_and_config_flags_parse() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-probe-fs",
+            "--config",
+            "/etc/harw-dod/config.toml",
+            "--home-root",
+            "/home",
+            "--home-root",
+            "/root",
+            "--home-entry",
+            ".ssh",
+            "--home-entry",
+            ".config/systemd",
+            "--sentinel-socket",
+            "/run/harw-sentinel.sock",
+        ])
+        .map_err(ctx("home flags"))?;
+        assert_eq!(
+            cli.config,
+            Some(std::path::PathBuf::from("/etc/harw-dod/config.toml"))
+        );
+        assert_eq!(
+            cli.home_roots,
+            vec![
+                std::path::PathBuf::from("/home"),
+                std::path::PathBuf::from("/root")
+            ]
+        );
+        assert_eq!(
+            cli.home_entries,
+            vec![
+                std::path::PathBuf::from(".ssh"),
+                std::path::PathBuf::from(".config/systemd")
+            ]
+        );
+        Ok(())
+    }
+
+    /// Eine Wurzel `/`, eine relative Wurzel, ein absoluter Home-Eintrag
+    /// und ein relativer `--config` sind Parsefehler.
+    #[test]
+    fn test_scope_flags_refuse_paths_that_would_widen_the_sandbox() {
+        for args in [
+            ["--scope-root", "/"],
+            ["--scope-root", "srv/data"],
+            ["--home-root", "/home/../etc"],
+            ["--home-entry", "/root/.ssh"],
+            ["--home-entry", "../.ssh"],
+            ["--config", "config.toml"],
+        ] {
+            let mut argv = vec![
+                "harw-probe-fs",
+                "--sentinel-socket",
+                "/run/harw-sentinel.sock",
+            ];
+            argv.extend(args);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{args:?} must be rejected"
+            );
+        }
     }
 
     #[test]

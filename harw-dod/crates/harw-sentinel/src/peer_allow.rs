@@ -217,8 +217,12 @@ fn numeric_uid(entry: &str) -> Option<u32> {
     entry.parse::<u32>().ok().filter(|uid| *uid != INVALID_UID)
 }
 
-/// Liest höchstens [`MAX_PASSWD_BYTES`] von `path` als Text.
-fn read_passwd(path: &Path) -> std::io::Result<String> {
+/// Liest höchstens [`MAX_PASSWD_BYTES`] von `path` als Text (auch für die
+/// Home-Verzeichnisse der Regelkonfiguration, `crate::rule_config`).
+///
+/// # Errors
+/// Jeder Öffnungs- oder Lesefehler (auch kein UTF-8).
+pub(crate) fn read_passwd(path: &Path) -> std::io::Result<String> {
     let file = std::fs::File::open(path)?;
     let mut text = String::new();
     file.take(MAX_PASSWD_BYTES).read_to_string(&mut text)?;

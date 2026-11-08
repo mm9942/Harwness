@@ -19,7 +19,7 @@
  KERNEL/HOST                          PRIVILEGIERTE PROBES (senden nur, handeln nie)
  tp:sched_process_exec/exit ─┐
  fentry:tcp_v4/v6_connect ───┴─► harw-probe-bpf  (CAP_BPF+CAP_PERFMON, in harw-dod.target)
- fanotify FAN_CLASS_NOTIF ─────► harw-probe-fs   (CAP_SYS_ADMIN, installiert, NICHT im Target)
+ fanotify FAN_CLASS_NOTIF ─────► harw-probe-fs   (CAP_SYS_ADMIN, in harw-dod.target; Nachtrag PL-100 WP1.6)
                                      │ ein JSON-SecurityEvent je SEQPACKET-Datagramm (≤16 KiB)
                                      ▼ /run/harw/sentinel.sock (0770, Gruppe harw-ipc; SO_PEERCRED geloggt, nicht geprüft)
  /proc /sys cgroupfs Reports ──► harw-sentinel  (unprivilegiert, leeres CapabilityBoundingSet, Landlock best effort)
@@ -48,7 +48,8 @@
   (`docs/design/harw-dod-charter.md:45-69`).
 - Die TCB sind vier Binaries mit je einer Privilegklasse.
   - ✔ Der Warden läuft mit `CAP_DAC_OVERRIDE CAP_NET_ADMIN` (`deploy/systemd/harw-warden.service:78`).
-  - ✔ `harw-dod.target` zieht nur Sentinel und probe-bpf hoch (`deploy/systemd/harw-dod.target:14`).
+  - ✔ `harw-dod.target` zieht Sentinel, probe-bpf und seit PL-100 WP1.6 auch probe-fs hoch
+    (`deploy/systemd/harw-dod.target:19`; Nachtrag, zum Stand `2c131382` waren es nur Sentinel und probe-bpf).
   - ✔ Warden und sein Socket haben keinen `[Install]`-Abschnitt und hängen an `ConditionPathExists=…/warden.enable`.
 
 **Agenten können heute nur lesen.**
@@ -63,14 +64,14 @@
 | exec (probe-bpf) | tp sched_process_exec | Pfad, uid, Cgroup-ID → `ProcessExec{path}`; pid/ppid/tgid/comm werden verworfen (`collect.rs:325-395`) | CAP_BPF, CAP_PERFMON | W, aber **keine Regel** | neue/seltene Binaries, Exec aus /tmp |
 | exit (probe-bpf) | tp sched_process_exit | nur Header | dito | geladen, nie gemeldet | Prozesslebensdauer |
 | tcp-connect / flow | fentry tcp_v4/v6_connect | ✔ `EgressFlow{dest IP, port}`, Actor{uid}, **ohne pid** (`harw-dod-flow/src/report.rs:157-183`) | dito | W, Regel egress-flow | Exfiltration, C2; ✔ Flut bei `egress_allow_cidrs = []` |
-| fsmon (probe-fs) | fanotify FAN_MODIFY/CLOSE_WRITE | `FileWrite{path}`, uid, auid | CAP_SYS_ADMIN | Binary W, nicht aktiv; Platzhalter-Scope `/srv/harw/watched`; **keine Regel** | Persistenz; auid vermutlich immer None; Overflow wird nicht gemeldet (`source.rs:373-378`) |
+| fsmon (probe-fs) | fanotify FAN_MODIFY/CLOSE_WRITE | `FileWrite{path}`, uid, auid | CAP_SYS_ADMIN | W (Nachtrag PL-100 WP1.6): in `harw-dod.target`; Bereich aus `[probe_fs]` der `config.toml`, sonst die Vorgaben (die Persistenzorte: `/etc`, cron/at-Spool, systemd/udev unter `/usr` und `/lib`, in den Homes nur `.ssh`, User-Units, Autostart, Shell-Startdateien; `harw-probe-fs/src/watch.rs`); Regel `persistence-write` | Persistenz; auid über `/proc/<pid>/loginuid` (`/proc` ist Landlock-Lesewurzel); ein Überlauf der begrenzten Warteschlange (sofort) und nicht markierbare Wurzeln oder Einhängepunkte darunter (beim Start) werden als `SensorDegraded` gemeldet; erst nach dem Start entstehende Wurzeln und Einhängepunkte brauchen einen Neustart der Sonde |
 | listener | /proc/net/{tcp,udp}{,6} + /proc/pid | `ListenerOpened{port}`, voller Schnappschuss je Poll | keins | W, **keine Regel**; auid immer None (`owner.rs:249`) | Backdoor-Listener |
 | cpu, memory, netcounters | /proc/stat, meminfo, net/dev | kumulative Zähler | keins | W | Miner, Leck, Exfiltrationsspitze; **keine Raten, keine Baselines** |
 | thermal, blockio, gpu | /sys/class/*, /sys/block | °C, I/O-Zähler, GPU-Last/VRAM | keins | W, vermutlich blind | ✔ `ReadScope::from_roots` ohne Alias-Root (`sensors.rs:252,279,295`); **Host-Prüfung nötig** |
 | cgroup | direkte Kinder der Cgroup-Root (≤16) | memory.current/max, pids, cpu | keins | W | Fork-Bombe, OOM; `harw-job-*` unsichtbar |
 | workspace-drift | Cargo-Graph und Lockfile | `StructureDrift` | keins | W, unter systemd wirkungslos (siehe H5) | Supply-Chain-Drift |
 | scanreport | `<home>`-Reports *.json/*.sarif | `StructureDrift` (Hardness Observed erzwungen) | keins | W | eine kaputte Datei blendet den ganzen Sensor (`sensor.rs:211-213`) |
-| container | libpod/docker/crio-Scopes | Cap-Bits, privileged, seccomp, NNP | keins | U | privilegierte oder fremde Container |
+| container | libpod/docker/crio-Scopes | Cap-Bits, privileged, seccomp, NNP | keins | W (Nachtrag PL-100 WP1.8): `[sentinel] container_sensor` = `auto` (Vorgabe), `on` oder `off`; bei `auto`/`on` je bekannter Anordnung ein Sensor (`machine.slice`/`libpod-*.scope`, `system.slice`/`docker-*.scope`) | privilegierte oder fremde Container; ohne Erwartungsliste nur als `container_unowned_<id>` gemeldet; rootless Podman und CRI-O/Kubernetes nicht abgedeckt, Docker-`cgroupfs` wird einmal als `SensorDegraded` gemeldet |
 | authlog + netlink audit | NETLINK_AUDIT | `AuthEvent{outcome}`, uid/auid | CAP_AUDIT_READ | U; `harw-probe-netlink` P | Login-Anomalien; der Parser erwartet das auditd-Dateiformat |
 | procmon (alt) | — | — | — | U (durch probe-bpf abgelöst) | — |
 

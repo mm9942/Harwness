@@ -10,12 +10,30 @@
 //! Brücke zwischen dem generischen Sensor-Vokabular
 //! (`harw_dod_signals::Sensor`) und dem fsmon-eigenen Formungsteil.
 //!
+//! # Überlauf, Filter und Zusammenfassen (PL-100 WP1.6)
+//! [`FsMonSensor::poll`] verarbeitet jede Charge in dieser Reihenfolge:
+//! 1. Ein rohes Ereignis mit [`crate::mask::FAN_Q_OVERFLOW`] (die Bindung
+//!    reicht einen Warteschlangen-Überlauf mit dieser Maske weiter) wird zu
+//!    genau einem `EventKind::SensorDegraded { sensor: <eigene Kennung> }`
+//!    je Abruf — ein Überlauf heißt „Ereignisse unbekannter Zahl verloren",
+//!    das ist Blindheit, kein Schreibzugriff.
+//! 2. Jedes andere Ereignis wird geformt ([`crate::shape::shape_event`]).
+//! 3. Ein optionaler [`crate::filter::WatchFilter`]
+//!    ([`FsMonSensor::with_watch_filter`]) lässt unter Home-Wurzeln nur die
+//!    konfigurierten Home-Einträge durch.
+//! 4. Ein [`crate::coalesce::WriteCoalescer`] fasst Wiederholungen je
+//!    (Pfad, pid) innerhalb von [`crate::coalesce::COALESCE_WINDOW`]
+//!    zusammen.
+//!
 //! # Nebenläufigkeit
 //! `Sensor: Send + Sync + std::fmt::Debug`. `Box<dyn FsEventSource>` selbst
 //! trägt kein `Debug` (der Trait aus [`crate::raw`] verlangt es bewusst
 //! nicht — seine Fläche ist wörtlich durch den Vertrag dieses Knotens
 //! festgelegt), deshalb implementiert [`FsMonSensor`] `Debug` von Hand und
-//! zeigt nur Griff und `proc_root`.
+//! zeigt nur Griff, `proc_root` und Filter. Der Zustand des Zusammenfassers
+//! liegt hinter einem `Mutex`; `poll(&self)` hält ihn nur für die Dauer
+//! einer Charge, ein vergifteter `Mutex` wird übernommen (der Zustand ist
+//! nach jedem Einzelschritt gültig).
 //!
 //! # Fehler
 //! [`harw_dod_cap::SensorError`], gebildet aus
@@ -50,13 +68,17 @@
 //! assert_eq!(reading.events.len(), 1);
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use harw_dod_cap::{Bound, SensorError, SensorHandle};
-use harw_dod_signals::{Sensor, SensorReading};
+use harw_dod_signals::{EventKind, SecurityEvent, Sensor, SensorReading};
 use jiff::Timestamp;
 
+use crate::coalesce::WriteCoalescer;
+use crate::filter::WatchFilter;
+use crate::mask::is_queue_overflow;
 use crate::raw::FsEventSource;
 use crate::shape::shape_event;
 
@@ -72,6 +94,10 @@ pub struct FsMonSensor {
     handle: SensorHandle<Bound>,
     source: Box<dyn FsEventSource>,
     proc_root: PathBuf,
+    // Optionaler Filter für Home-Wurzeln (`None`: jeder Pfad im Bereich).
+    filter: Option<WatchFilter>,
+    // Zusammenfassen wiederholter Schreibereignisse je (Pfad, pid).
+    coalescer: Mutex<WriteCoalescer>,
 }
 
 impl std::fmt::Debug for FsMonSensor {
@@ -79,6 +105,7 @@ impl std::fmt::Debug for FsMonSensor {
         f.debug_struct("FsMonSensor")
             .field("handle", &self.handle)
             .field("proc_root", &self.proc_root)
+            .field("filter", &self.filter)
             .finish()
     }
 }
@@ -131,7 +158,93 @@ impl FsMonSensor {
             handle,
             source,
             proc_root,
+            filter: None,
+            coalescer: Mutex::new(WriteCoalescer::new()),
         }
+    }
+
+    /// Setzt den Filter für Home-Wurzeln (PL-100 WP1.6).
+    ///
+    /// # Description
+    /// Ohne Filter reicht [`Sensor::poll`] jeden Pfad im `ReadScope` des
+    /// Griffs weiter; mit Filter nur die Pfade, die
+    /// [`WatchFilter::admits`] annimmt. Der `ReadScope` des Griffs sollte
+    /// [`WatchFilter::read_scope`] sein.
+    ///
+    /// # Arguments
+    /// - `filter` (`WatchFilter`): der Beobachtungsbereich der Sonde.
+    ///
+    /// # Returns
+    /// Den Sensor mit Filter.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use std::path::PathBuf;
+    /// use harw_dod_cap::{Capability, SensorHandle};
+    /// use harw_dod_fsmon::filter::WatchFilter;
+    /// use harw_dod_fsmon::raw::FixtureFsEventSource;
+    /// use harw_dod_fsmon::sensor::FsMonSensor;
+    /// use harw_types::SensorId;
+    ///
+    /// let filter = WatchFilter::new(
+    ///     vec![PathBuf::from("/etc")],
+    ///     vec![PathBuf::from("/home")],
+    ///     vec![PathBuf::from(".ssh")],
+    /// );
+    /// let handle = SensorHandle::new(SensorId::from_str("fsmon-0"), Capability::WatchFilesystem)
+    ///     .bind(filter.read_scope());
+    /// let _sensor = FsMonSensor::new(
+    ///     handle,
+    ///     Box::new(FixtureFsEventSource::new(vec![])),
+    ///     PathBuf::from("/proc"),
+    /// )
+    /// .with_watch_filter(filter);
+    /// ```
+    #[must_use]
+    pub fn with_watch_filter(mut self, filter: WatchFilter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    /// Zahl der seit dem Bau zusammengefassten (verworfenen) Wiederholungen.
+    ///
+    /// # Returns
+    /// Den Zähler des [`WriteCoalescer`].
+    #[must_use]
+    pub fn coalesced_total(&self) -> u64 {
+        self.coalescer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .coalesced_total()
+    }
+
+    // Das `SensorDegraded`-Ereignis dieses Sensors für einen
+    // Warteschlangen-Überlauf.
+    fn overflow_event(&self, now: Timestamp) -> SecurityEvent {
+        SecurityEvent {
+            sensor: self.handle.id().clone(),
+            observed_at: now,
+            actor: None,
+            kind: EventKind::SensorDegraded {
+                sensor: self.handle.id().clone(),
+            },
+        }
+    }
+
+    // Filter und Zusammenfassen für ein geformtes Schreibereignis.
+    fn admits_write(
+        &self,
+        path: &str,
+        pid: u32,
+        now: Timestamp,
+        coalescer: &mut WriteCoalescer,
+    ) -> bool {
+        if let Some(filter) = &self.filter
+            && !filter.admits(Path::new(path))
+        {
+            return false;
+        }
+        coalescer.admit(path, pid, now)
     }
 }
 
@@ -157,6 +270,11 @@ impl Sensor for FsMonSensor {
     /// irgendeines beobachteten Prozesses alle anderen, gültig geformten
     /// Schreibereignisse desselben Abrufs mit verworfen.
     ///
+    /// Vor dem Formen wird ein Warteschlangen-Überlauf erkannt (höchstens ein
+    /// `SensorDegraded` je Abruf, an der Stelle des ersten Überlaufs), nach
+    /// dem Formen filtert ein gesetzter [`WatchFilter`] und fasst der
+    /// [`WriteCoalescer`] Wiederholungen zusammen (siehe Moduldoku).
+    ///
     /// # Errors
     /// [`SensorError`], wenn [`crate::raw::FsEventSource::read_events`]
     /// selbst scheitert. Eine einzelne nicht interpretierbare Ereignisform
@@ -165,7 +283,19 @@ impl Sensor for FsMonSensor {
         let raw_events = self.source.read_events(POLL_TIMEOUT)?;
 
         let mut events = Vec::with_capacity(raw_events.len());
+        let mut overflow_reported = false;
+        let mut coalescer = self
+            .coalescer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         for raw in &raw_events {
+            if is_queue_overflow(raw.mask) {
+                if !overflow_reported {
+                    events.push(self.overflow_event(now));
+                    overflow_reported = true;
+                }
+                continue;
+            }
             match shape_event(
                 raw,
                 self.handle.scope(),
@@ -173,7 +303,16 @@ impl Sensor for FsMonSensor {
                 self.handle.id(),
                 now,
             ) {
-                Ok(Some(event)) => events.push(event),
+                Ok(Some(event)) => {
+                    let admitted = if let EventKind::FileWrite { path } = &event.kind {
+                        self.admits_write(path, raw.pid, now, &mut coalescer)
+                    } else {
+                        true
+                    };
+                    if admitted {
+                        events.push(event);
+                    }
+                }
                 Ok(None) => {}
                 Err(_) => {
                     // Nicht interpretierbare Einzelform (siehe Doku oben) —
@@ -182,6 +321,7 @@ impl Sensor for FsMonSensor {
                 }
             }
         }
+        drop(coalescer);
 
         Ok(SensorReading {
             samples: Vec::new(),
@@ -200,8 +340,156 @@ mod tests {
     use jiff::Timestamp;
 
     use super::FsMonSensor;
+    use crate::filter::WatchFilter;
+    use crate::mask::{FAN_CLOSE_WRITE, FAN_MODIFY, FAN_Q_OVERFLOW};
     use crate::raw::{FixtureFsEventSource, RawFsEvent};
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
+
+    fn raw(mask: u64, pid: u32, path: &str) -> RawFsEvent {
+        RawFsEvent {
+            mask,
+            pid,
+            uid: 1000,
+            fd_target: path.to_owned(),
+        }
+    }
+
+    fn sensor_over(scope: ReadScope, events: Vec<RawFsEvent>) -> FsMonSensor {
+        FsMonSensor::new(
+            handle_for(scope),
+            Box::new(FixtureFsEventSource::new(events)),
+            PathBuf::from("/nonexistent-harw-fsmon-proc"),
+        )
+    }
+
+    fn written_paths(events: &[harw_dod_signals::SecurityEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::FileWrite { path } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // `UNIX_EPOCH + secs`.
+    fn at(secs: i64) -> TestResult<Timestamp> {
+        Timestamp::UNIX_EPOCH
+            .checked_add(jiff::SignedDuration::from_secs(secs))
+            .map_err(ctx("timestamp in range"))
+    }
+
+    /// PL-100 WP1.6: ein Warteschlangen-Überlauf wird genau ein
+    /// `SensorDegraded` mit der eigenen Kennung — nie ein `FileWrite`, auch
+    /// bei mehreren Überlauf-Markern in einer Charge; die übrigen Ereignisse
+    /// derselben Charge kommen trotzdem an.
+    #[test]
+    fn test_poll_reports_a_queue_overflow_once_as_sensor_degraded() -> TestResult {
+        let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
+        let sensor = sensor_over(
+            scope,
+            vec![
+                raw(FAN_Q_OVERFLOW, 0, ""),
+                raw(FAN_CLOSE_WRITE, 2, "/srv/data/report.csv"),
+                raw(FAN_Q_OVERFLOW, 0, ""),
+            ],
+        );
+
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("fixture never fails"))?;
+
+        let degraded: Vec<&str> = reading
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::SensorDegraded { sensor } => Some(sensor.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(degraded, vec!["fsmon-test"]);
+        let first = reading
+            .events
+            .first()
+            .ok_or(TestError::Missing("the degraded event"))?;
+        assert_eq!(first.sensor.as_str(), "fsmon-test");
+        assert!(first.actor.is_none());
+        assert_eq!(written_paths(&reading.events), vec!["/srv/data/report.csv"]);
+        Ok(())
+    }
+
+    /// PL-100 WP1.6: wiederholte `FAN_MODIFY` desselben Prozesses auf
+    /// denselben Pfad werden innerhalb des Fensters zusammengefasst — auch
+    /// über zwei Abrufe; ein anderer Prozess und ein anderer Pfad nie, und
+    /// nach dem Fenster kommt der Pfad wieder durch.
+    #[test]
+    fn test_poll_coalesces_repeated_modify_per_path_and_pid() -> TestResult {
+        let scope = ReadScope::from_roots([Path::new("/etc").to_path_buf()]);
+        let sensor = sensor_over(
+            scope,
+            vec![
+                raw(FAN_MODIFY, 7, "/etc/cron.d/job"),
+                raw(FAN_MODIFY, 7, "/etc/cron.d/job"),
+                raw(FAN_MODIFY | FAN_CLOSE_WRITE, 7, "/etc/cron.d/job"),
+                raw(FAN_MODIFY, 8, "/etc/cron.d/job"),
+                raw(FAN_MODIFY, 7, "/etc/hosts"),
+            ],
+        );
+
+        let first = sensor.poll(at(0)?).map_err(ctx("first poll"))?;
+        assert_eq!(
+            written_paths(&first.events),
+            vec!["/etc/cron.d/job", "/etc/cron.d/job", "/etc/hosts"]
+        );
+        assert_eq!(sensor.coalesced_total(), 2);
+
+        // Dieselbe Charge eine Sekunde später: alles noch im Fenster.
+        let second = sensor.poll(at(1)?).map_err(ctx("second poll"))?;
+        assert!(written_paths(&second.events).is_empty());
+
+        // Nach dem Fenster kommt jeder Schlüssel genau einmal wieder durch.
+        let third = sensor.poll(at(10)?).map_err(ctx("third poll"))?;
+        assert_eq!(
+            written_paths(&third.events),
+            vec!["/etc/cron.d/job", "/etc/cron.d/job", "/etc/hosts"]
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP1.6: unter einer Home-Wurzel kommen nur die Home-Einträge
+    /// durch, unter einer vollständigen Wurzel alles.
+    #[test]
+    fn test_poll_with_watch_filter_forwards_only_home_entries_below_home_roots() -> TestResult {
+        let filter = WatchFilter::new(
+            vec![PathBuf::from("/etc")],
+            vec![PathBuf::from("/home"), PathBuf::from("/root")],
+            vec![PathBuf::from(".ssh"), PathBuf::from(".config/autostart")],
+        );
+        let sensor = sensor_over(
+            filter.read_scope(),
+            vec![
+                raw(FAN_CLOSE_WRITE, 1, "/home/alice/.cache/big.bin"),
+                raw(FAN_CLOSE_WRITE, 2, "/home/alice/.ssh/authorized_keys"),
+                raw(FAN_CLOSE_WRITE, 3, "/root/.config/autostart/x.desktop"),
+                raw(FAN_CLOSE_WRITE, 4, "/etc/ld.so.preload"),
+                raw(FAN_CLOSE_WRITE, 5, "/var/log/syslog"),
+            ],
+        )
+        .with_watch_filter(filter);
+
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("fixture never fails"))?;
+        assert_eq!(
+            written_paths(&reading.events),
+            vec![
+                "/home/alice/.ssh/authorized_keys",
+                "/root/.config/autostart/x.desktop",
+                "/etc/ld.so.preload"
+            ]
+        );
+        Ok(())
+    }
 
     fn handle_for(scope: ReadScope) -> SensorHandle<harw_dod_cap::Bound> {
         SensorHandle::new(

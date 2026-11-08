@@ -82,6 +82,10 @@ harw-dod-netcounters = { path = "../harw-dod-netcounters" }
 harw-dod-gpu = { path = "../harw-dod-gpu" }
 # `CgroupSensor` (`Capability::ReadCgroupV2`, unprivilegiert).
 harw-dod-cgroup = { path = "../harw-dod-cgroup" }
+# `ContainerSensor` (`Capability::ReadContainerScopes`, unprivilegiert;
+# PL-100 WP1.8): je erkannter Container-Laufzeit ein Sensor, siehe
+# `src/container_plan.rs`. Zieht `harw-container-model` (nur `serde`) mit.
+harw-dod-container = { path = "../harw-dod-container" }
 harw-dod-scanreport = { path = "../harw-dod-scanreport" }
 # Bewusst NICHT aufgenommen: `harw-dod-authlog`. Sein einziges produktives
 # Backend (`AuditBackend`) trägt `Capability::ReadAuditNetlink`, Klasse
@@ -101,19 +105,6 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # `--log`-Grammatik; Version identisch zu `harw-cli`.
 clap = { version = "4.6.1", features = ["derive"] }
-# Sicherer `SOCK_SEQPACKET`-Unix-Socket und `SO_PEERCRED` ohne `unsafe`
-# (`net`-Feature; Muster: `harw-dod-netlink/Cargo.toml`, dessen
-# `NetlinkAuditSource` denselben Feature-Zuschnitt für einen anderen
-# Sockettyp verwendet).
-rustix = { workspace = true, features = ["net"] }
-# Sichere Landlock-Bindung. **Nicht** über `[workspace.dependencies]`
-# verfügbar (dort bislang ungenutzt) und diese Crate ist die einzige
-# Konsumentin — direkte Versionsangabe statt Workspace-Umweg, wie es dieser
-# Workspace auch für andere Einzelkonsumenten hält (z. B.
-# `tikv-jemallocator` nur in `harw-cli/Cargo.toml`). Version 0.4.7 über
-# `docs.rs/crate/landlock` nachgeschlagen (Stand dieses Knotens) — `cargo
-# add` konnte hier nicht laufen, siehe `src/sandbox.rs`-Moduldoku.
-landlock = "0.4.7"
 # Wire-Kodierung für `harw_dod_signals::SecurityEvent` über den
 # IPC-Empfangspfad (siehe dortige Moduldoku: „Wire-Stabilität von
 # `EventKind`" — `#[serde(deny_unknown_fields)]`, kebab-case, bereits für
@@ -124,9 +115,32 @@ serde_json = { workspace = true }
 # Baum (u. a. über `harw-types`), keine neue Fremdcrate, keine Netzfähigkeit.
 serde = { workspace = true }
 
+# --- Nur Linux (PL-100 Owner-Review: der Sentinel baut auch auf anderen
+# Unix-Zielen; dort gelten die `cfg(not(target_os = "linux"))`-Fassungen von
+# `src/ipc.rs`-Aufrufern und `src/sandbox.rs`, siehe `src/main.rs`-Moduldoku,
+# Abschnitt „Nicht-Linux-Builds") ---
+[target.'cfg(target_os = "linux")'.dependencies]
+# Sicherer `SOCK_SEQPACKET`-Unix-Socket und `SO_PEERCRED` ohne `unsafe`
+# (`net`-Feature; Muster: `harw-dod-netlink/Cargo.toml`, dessen
+# `NetlinkAuditSource` denselben Feature-Zuschnitt für einen anderen
+# Sockettyp verwendet). `src/ipc.rs` (Linux) benutzt ihn; das Feature `fs`
+# (ohne weitere Abhängigkeit) öffnet die Zustandsdateien mit `O_NOFOLLOW`
+# (`src/health_export.rs`, `read_regular_bounded`; PL-100 Review Runde 1).
+rustix = { workspace = true, features = ["net", "fs"] }
+# Sichere Landlock-Bindung (dieselbe Version wie
+# `[workspace.dependencies]`). Die Crate ruft Linux-Syscalls direkt auf und
+# übersetzt auf anderen Zielen nicht; `src/sandbox.rs` nutzt sie nur unter
+# `cfg(target_os = "linux")`.
+landlock = { workspace = true }
+
 [dev-dependencies]
 harw-test-support = { path = "../../../harw-test-support" }
 tempfile = { workspace = true }
+# PL-100 Owner-Review: der End-to-End-Test liest eine echte Sentinel-Zeile
+# mit dem Leser von harw zurück (`src/main.rs`, Export v3). Keine
+# Zyklusgefahr: `harw-dod-client` hängt nur an `harw-dod-config`,
+# `harw-types` und `harw-untrusted-text`.
+harw-dod-client = { path = "../../../harw-dod-client" }
 
 [lints]
 workspace = true

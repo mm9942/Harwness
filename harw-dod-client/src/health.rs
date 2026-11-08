@@ -11,6 +11,17 @@
 //! The reader is bounded ([`MAX_HEALTH_BYTES`], at most [`MAX_SENSORS`]
 //! sensors), refuses symlinks, tolerates unknown fields and unknown health
 //! states (additive evolution), and sanitizes every string it keeps.
+//!
+//! Since PL-100 WP0.7 the sentinel also reports its Landlock
+//! self-restriction (additive object, schema version unchanged):
+//!
+//! ```json
+//! "landlock": {"outcome": "partially_enforced", "requested_abi": 1, "effective_abi": 3}
+//! ```
+//!
+//! [`HealthReport::landlock`] is `None` for a sentinel that predates the
+//! object (or writes `null`); an outcome this reader does not know reads as
+//! [`LandlockOutcome::Unknown`].
 
 use std::io::Read as _;
 use std::path::Path;
@@ -89,6 +100,74 @@ pub struct IpcCounters {
     /// start (PL-100 WP0.5); `0` for a sentinel that predates the field.
     #[serde(default)]
     pub peers_rejected_total: u64,
+    /// Messages of admitted probes the sentinel discarded since start
+    /// because they were malformed or oversized (PL-100 WP1); `0` for a
+    /// sentinel that predates the field. Expected: `0`.
+    #[serde(default)]
+    pub decode_errors_total: u64,
+}
+
+/// Outcome of the sentinel's Landlock self-restriction (PL-100 WP0.7).
+///
+/// The default is [`Self::Unknown`]: a `landlock` object without an
+/// `outcome` (or with `"outcome": null`) reads as unknown instead of
+/// failing the whole report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandlockOutcome {
+    /// Every requested rule is enforced by the kernel.
+    FullyEnforced,
+    /// Only part of the requested rules is enforced (older kernel ABI).
+    PartiallyEnforced,
+    /// The kernel does not enforce Landlock; the sentinel runs without its
+    /// filesystem sandbox.
+    NotEnforced,
+    /// Building or applying the ruleset failed; the sentinel runs without
+    /// its filesystem sandbox.
+    Failed,
+    /// An outcome this reader does not know (newer sentinel), or none was
+    /// reported.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl LandlockOutcome {
+    /// `true` when the sentinel runs **without** its filesystem sandbox
+    /// ([`Self::NotEnforced`], [`Self::Failed`]). [`Self::Unknown`] is not
+    /// counted as degraded, since its meaning is unknown to this reader.
+    #[must_use]
+    pub const fn is_degraded(self) -> bool {
+        matches!(self, Self::NotEnforced | Self::Failed)
+    }
+}
+
+/// The sentinel's Landlock self-restriction as reported in `health.json`
+/// (`landlock` object, PL-100 WP0.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandlockHealth {
+    /// What the kernel enforced; [`LandlockOutcome::Unknown`] when the
+    /// object lacks the field or carries `null` (additive tolerance: one
+    /// malformed optional object must not cost the sensor rows).
+    #[serde(default, deserialize_with = "outcome_or_unknown")]
+    pub outcome: LandlockOutcome,
+    /// ABI level whose access rights the sentinel requested; `None` if the
+    /// sentinel did not report it.
+    #[serde(default)]
+    pub requested_abi: Option<u32>,
+    /// ABI level the running kernel supports; `None` without Landlock
+    /// support or when the attempt failed early.
+    #[serde(default)]
+    pub effective_abi: Option<u32>,
+}
+
+/// Reads `landlock.outcome`, mapping `null` to [`LandlockOutcome::Unknown`]
+/// (a missing field is handled by `#[serde(default)]`).
+fn outcome_or_unknown<'de, D>(deserializer: D) -> Result<LandlockOutcome, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<LandlockOutcome>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// The parsed, sanitized health report.
@@ -111,6 +190,10 @@ pub struct HealthReport {
     /// IPC counters, if reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipc: Option<IpcCounters>,
+    /// The sentinel's Landlock self-restriction (PL-100 WP0.7); `None` for
+    /// a sentinel that predates the field or did not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landlock: Option<LandlockHealth>,
 }
 
 impl HealthReport {
@@ -268,6 +351,93 @@ mod tests {
         assert_eq!(report.ipc.map(|ipc| ipc.events_total), Some(7));
         let older: HealthReport = serde_json::from_str(SAMPLE)?;
         assert_eq!(older.ipc.map(|ipc| ipc.peers_rejected_total), Some(0));
+        Ok(())
+    }
+
+    /// PL-100 WP1: the sentinel reports discarded probe messages as
+    /// `ipc.decode_errors_total`; older files without the field read as `0`.
+    #[test]
+    fn reads_the_ipc_decode_error_total_and_defaults_it() -> TestResult {
+        let newer = r#"{
+            "schema_version": 1,
+            "written_at": "2026-10-28T10:00:00Z",
+            "ipc": {"probes_connected": 1, "events_total": 9, "dropped_total": 0,
+                    "peers_rejected_total": 0, "decode_errors_total": 4}
+        }"#;
+        let report: HealthReport = serde_json::from_str(newer)?;
+        assert_eq!(report.ipc.map(|ipc| ipc.decode_errors_total), Some(4));
+        let older: HealthReport = serde_json::from_str(SAMPLE)?;
+        assert_eq!(older.ipc.map(|ipc| ipc.decode_errors_total), Some(0));
+        let json = serde_json::to_string(&report)?;
+        let again: HealthReport = serde_json::from_str(&json)?;
+        assert_eq!(again.ipc.map(|ipc| ipc.decode_errors_total), Some(4));
+        Ok(())
+    }
+
+    /// PL-100 WP0.7: the Landlock object is read with its outcome and ABI
+    /// levels; older files without it and unknown outcomes stay readable.
+    #[test]
+    fn reads_the_landlock_outcome_and_tolerates_its_absence() -> TestResult {
+        let newer = r#"{
+            "schema_version": 1,
+            "written_at": "2026-10-28T10:00:00Z",
+            "landlock": {"outcome": "partially_enforced", "requested_abi": 1, "effective_abi": 3}
+        }"#;
+        let report: HealthReport = serde_json::from_str(newer)?;
+        let landlock = report.landlock.ok_or("landlock expected")?;
+        assert_eq!(landlock.outcome, LandlockOutcome::PartiallyEnforced);
+        assert_eq!(landlock.requested_abi, Some(1));
+        assert_eq!(landlock.effective_abi, Some(3));
+        assert!(!landlock.outcome.is_degraded());
+
+        let degraded = r#"{
+            "schema_version": 1,
+            "written_at": "2026-10-28T10:00:00Z",
+            "landlock": {"outcome": "not_enforced", "requested_abi": 1, "effective_abi": null}
+        }"#;
+        let report: HealthReport = serde_json::from_str(degraded)?;
+        let landlock = report.landlock.ok_or("landlock expected")?;
+        assert!(landlock.outcome.is_degraded());
+        assert_eq!(landlock.effective_abi, None);
+
+        let future = r#"{
+            "schema_version": 1,
+            "written_at": "2026-10-28T10:00:00Z",
+            "landlock": {"outcome": "enforced_with_audit"}
+        }"#;
+        let report: HealthReport = serde_json::from_str(future)?;
+        let landlock = report.landlock.ok_or("landlock expected")?;
+        assert_eq!(landlock.outcome, LandlockOutcome::Unknown);
+        assert!(!landlock.outcome.is_degraded());
+        assert_eq!(landlock.requested_abi, None);
+
+        // A `landlock` object without an outcome, or with a null one, reads
+        // as unknown instead of failing the whole report.
+        for partial in [
+            r#"{"schema_version": 1, "written_at": "2026-10-28T10:00:00Z", "landlock": {}}"#,
+            r#"{"schema_version": 1, "written_at": "2026-10-28T10:00:00Z",
+                "landlock": {"outcome": null, "requested_abi": 2}}"#,
+        ] {
+            let report: HealthReport = serde_json::from_str(partial)?;
+            let landlock = report.landlock.ok_or("landlock expected")?;
+            assert_eq!(landlock.outcome, LandlockOutcome::Unknown);
+            assert!(!landlock.outcome.is_degraded());
+        }
+        assert_eq!(LandlockOutcome::default(), LandlockOutcome::Unknown);
+
+        let explicit_null =
+            r#"{"schema_version": 1, "written_at": "2026-10-28T10:00:00Z", "landlock": null}"#;
+        let report: HealthReport = serde_json::from_str(explicit_null)?;
+        assert_eq!(report.landlock, None);
+        let older: HealthReport = serde_json::from_str(SAMPLE)?;
+        assert_eq!(older.landlock, None);
+
+        let json = serde_json::to_string(&serde_json::from_str::<HealthReport>(newer)?)?;
+        let again: HealthReport = serde_json::from_str(&json)?;
+        assert_eq!(
+            again.landlock.map(|landlock| landlock.outcome),
+            Some(LandlockOutcome::PartiallyEnforced)
+        );
         Ok(())
     }
 

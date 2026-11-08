@@ -21,8 +21,17 @@
 //! deshalb bereits heute vollständig geprüft, unabhängig vom Stand der
 //! fanotify-Bindung.
 //!
+//! # Abdeckungsmeldung beim Start (Review R2)
+//! [`report_uncovered_scope`] schickt dem Sentinel einmal beim Start ein
+//! `SensorDegraded` mit der Kennung dieser Sonde, wenn eine Wurzel des
+//! Beobachtungsbereichs oder ein Einhängepunkt unter ihr (Review R3) auf
+//! einem Dateisystem ohne fanotify-Markierung liegt
+//! (`crate::source::MarkReport`) — dieselbe Ereignisform wie ein
+//! Warteschlangen-Überlauf, damit die Regel `sensor-degraded` die Blindheit
+//! meldet.
+//!
 //! # Exportierte Typen
-//! [`run_once`], [`run_forever`].
+//! [`run_once`], [`run_forever`], [`report_uncovered_scope`].
 //!
 //! # Nebenläufigkeit
 //! Beide Funktionen nehmen `&FsMonSensor` und `&dyn EventSink` — keine
@@ -39,11 +48,60 @@
 
 use harw_dod_cap::Permanence;
 use harw_dod_fsmon::FsMonSensor;
-use harw_dod_signals::Sensor;
+use harw_dod_signals::{EventKind, SecurityEvent, Sensor};
+use harw_types::SensorId;
 use jiff::Timestamp;
 
 use crate::error::ProbeError;
 use crate::sink::EventSink;
+use crate::source::MarkReport;
+
+/// Meldet einen unvollständig markierten Beobachtungsbereich einmal beim
+/// Start als `SensorDegraded`.
+///
+/// # Description
+/// Ist `marks` vollständig, geschieht nichts. Sonst steht eine `warn`-Zeile
+/// mit den Zahlen (kein Pfad, Journal-Hygiene) im Journal, und `sink`
+/// bekommt genau ein Ereignis `EventKind::SensorDegraded { sensor }` ohne
+/// Akteur, dessen Quelle und betroffener Sensor `sensor` sind.
+///
+/// # Arguments
+/// - `sink` (`&dyn EventSink`): die Senke zum Sentinel.
+/// - `sensor` (`&SensorId`): die Kennung dieser Sonde (`--sensor-id`).
+/// - `marks` (`&MarkReport`): die Abdeckung der fanotify-Markierungen.
+/// - `now` (`Timestamp`): Zeitstempel des Ereignisses.
+///
+/// # Returns
+/// `true`, wenn ein Ereignis gesendet wurde.
+///
+/// # Errors
+/// Der Fehler von [`EventSink::send`].
+pub fn report_uncovered_scope(
+    sink: &dyn EventSink,
+    sensor: &SensorId,
+    marks: &MarkReport,
+    now: Timestamp,
+) -> Result<bool, ProbeError> {
+    if marks.is_complete() {
+        return Ok(false);
+    }
+    tracing::warn!(
+        uncovered_roots = marks.uncovered_roots,
+        uncovered_mounts = marks.uncovered_mounts,
+        marked_filesystems = marks.marked_filesystems,
+        "scope roots or mounts below them lie on a filesystem without a fanotify mark; their \
+         writes are not observed, reporting the sensor as degraded"
+    );
+    sink.send(&SecurityEvent {
+        sensor: sensor.clone(),
+        observed_at: now,
+        actor: None,
+        kind: EventKind::SensorDegraded {
+            sensor: sensor.clone(),
+        },
+    })?;
+    Ok(true)
+}
 
 /// Führt eine einzelne Erfassungsrunde aus.
 ///
@@ -127,9 +185,10 @@ mod tests {
     use harw_types::SensorId;
     use jiff::Timestamp;
 
-    use super::run_once;
+    use super::{report_uncovered_scope, run_once};
     use crate::error::ProbeError;
     use crate::sink::EventSink;
+    use crate::source::MarkReport;
     use crate::test_support::{TestError, TestResult, ctx};
 
     /// Test-Senke: zeichnet jedes gesendete Ereignis auf, statt es zu
@@ -260,6 +319,149 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         let json = serde_json::to_string(&recorded[0]).map_err(ctx("SecurityEvent serializes"))?;
         assert!(!json.contains("TOP-SECRET-CONTENT-1234"));
+        Ok(())
+    }
+
+    /// PL-100 WP1.6, Kompositionsweg der Sonde: der Bereich aus den
+    /// Vorgaben (`crate::watch`) filtert Home-Pfade, ein Überlauf-Marker der
+    /// Quelle kommt als `SensorDegraded` beim Sentinel an, und eine
+    /// Wiederholung derselben Datei durch denselben Prozess wird
+    /// zusammengefasst.
+    #[test]
+    fn test_run_once_with_the_default_watch_plan_forwards_overflow_and_filtered_writes()
+    -> TestResult {
+        let plan = crate::watch::resolve_watch_plan(&[], &[], &[], None)
+            .map_err(ctx("built-in watch plan"))?;
+        let handle = SensorHandle::new(
+            SensorId::from_str("fsmon-test"),
+            Capability::WatchFilesystem,
+        )
+        .bind(plan.filter.read_scope());
+        let write = |pid: u32, path: &str| RawFsEvent {
+            mask: harw_dod_fsmon::mask::FAN_MODIFY,
+            pid,
+            uid: 1000,
+            fd_target: path.to_owned(),
+        };
+        let sensor = FsMonSensor::new(
+            handle,
+            Box::new(FixtureFsEventSource::new(vec![
+                write(10, "/home/alice/.cache/thumbnails/a.png"),
+                write(11, "/home/alice/.ssh/authorized_keys"),
+                write(11, "/home/alice/.ssh/authorized_keys"),
+                RawFsEvent {
+                    mask: harw_dod_fsmon::mask::FAN_Q_OVERFLOW,
+                    pid: 0,
+                    uid: 0,
+                    fd_target: String::new(),
+                },
+                write(12, "/etc/systemd/system/evil.service"),
+            ])),
+            PathBuf::from("/nonexistent-harw-probe-fs-proc"),
+        )
+        .with_watch_filter(plan.filter);
+        let sink = RecordingSink::default();
+
+        let sent = run_once(&sensor, &sink, Timestamp::UNIX_EPOCH)
+            .map_err(ctx("fixture source never fails"))?;
+
+        assert_eq!(sent, 3);
+        let recorded = sink
+            .sent
+            .lock()
+            .map_err(ctx("test mutex is never poisoned"))?;
+        let kinds: Vec<String> = recorded
+            .iter()
+            .map(|event| match &event.kind {
+                EventKind::FileWrite { path } => format!("write {path}"),
+                EventKind::SensorDegraded { sensor } => format!("degraded {}", sensor.as_str()),
+                other => format!("other {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "write /home/alice/.ssh/authorized_keys".to_owned(),
+                "degraded fsmon-test".to_owned(),
+                "write /etc/systemd/system/evil.service".to_owned(),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Review R2 (B19): eine Wurzel auf einem nicht markierten Dateisystem
+    /// erreicht den Sentinel einmal beim Start als `SensorDegraded` dieser
+    /// Sonde; ein vollständig markierter Bereich sendet nichts.
+    #[test]
+    fn test_an_uncovered_scope_is_reported_once_as_sensor_degraded() -> TestResult {
+        let sink = RecordingSink::default();
+        let probe = SensorId::from_str("probe-fs-0");
+        let complete = MarkReport {
+            marked_filesystems: 2,
+            uncovered_roots: 0,
+            uncovered_mounts: 0,
+            absent_roots: 1,
+        };
+        assert!(
+            !report_uncovered_scope(&sink, &probe, &complete, Timestamp::UNIX_EPOCH)
+                .map_err(ctx("recording sink"))?
+        );
+        assert!(
+            sink.sent
+                .lock()
+                .map_err(ctx("test mutex is never poisoned"))?
+                .is_empty()
+        );
+
+        let separate_var = MarkReport {
+            marked_filesystems: 1,
+            uncovered_roots: 2,
+            uncovered_mounts: 0,
+            absent_roots: 0,
+        };
+        assert!(
+            report_uncovered_scope(&sink, &probe, &separate_var, Timestamp::UNIX_EPOCH)
+                .map_err(ctx("recording sink"))?
+        );
+        let recorded = sink
+            .sent
+            .lock()
+            .map_err(ctx("test mutex is never poisoned"))?;
+        assert_eq!(recorded.len(), 1);
+        let event = recorded
+            .first()
+            .ok_or(TestError::Missing("degraded event"))?;
+        assert_eq!(event.sensor.as_str(), "probe-fs-0");
+        assert!(event.actor.is_none());
+        assert!(matches!(
+            &event.kind,
+            EventKind::SensorDegraded { sensor } if sensor.as_str() == "probe-fs-0"
+        ));
+        Ok(())
+    }
+
+    /// Review R3: ein nicht markierter Einhängepunkt unter einer Wurzel
+    /// (NFS-Home) meldet die Sonde ebenso als degradiert, auch wenn jede
+    /// Wurzel selbst abgedeckt ist.
+    #[test]
+    fn test_an_uncovered_mount_below_a_root_is_reported_as_sensor_degraded() -> TestResult {
+        let sink = RecordingSink::default();
+        let probe = SensorId::from_str("probe-fs-0");
+        let nfs_home = MarkReport {
+            marked_filesystems: 1,
+            uncovered_roots: 0,
+            uncovered_mounts: 1,
+            absent_roots: 0,
+        };
+        assert!(
+            report_uncovered_scope(&sink, &probe, &nfs_home, Timestamp::UNIX_EPOCH)
+                .map_err(ctx("recording sink"))?
+        );
+        let recorded = sink
+            .sent
+            .lock()
+            .map_err(ctx("test mutex is never poisoned"))?;
+        assert_eq!(recorded.len(), 1);
         Ok(())
     }
 

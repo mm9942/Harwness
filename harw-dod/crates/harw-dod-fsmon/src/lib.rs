@@ -74,16 +74,27 @@
 //! - [`sensor`]: [`sensor::FsMonSensor`] — bindet Quelle, Bereich und Formung
 //!   zu einem `harw_dod_signals::Sensor` mit
 //!   [`harw_dod_cap::Capability::WatchFilesystem`] zusammen. Genau diese eine
-//!   Fähigkeit; keine Abhängigkeit auf eine andere Sensor-Crate.
+//!   Fähigkeit; keine Abhängigkeit auf eine andere Sensor-Crate. Meldet
+//!   einen Warteschlangen-Überlauf als `SensorDegraded` (PL-100 WP1.6).
+//! - [`filter`]: [`filter::WatchFilter`] — vollständige Wurzeln und
+//!   Home-Wurzeln mit relativen Home-Einträgen (`.ssh`, `.bashrc`, …), ohne
+//!   Benutzernamen in der Konfiguration (PL-100 WP1.6).
+//! - [`coalesce`]: [`coalesce::WriteCoalescer`] — fasst wiederholte
+//!   Schreibereignisse je (Pfad, pid) innerhalb eines kurzen Fensters
+//!   zusammen (PL-100 WP1.6).
 //! - [`error`]: [`error::FsMonError`], die einzige Fehlermenge dieser Crate.
 //!
 //! # Exportierte Typen
 //! [`raw::RawFsEvent`], [`raw::FsEventSource`], [`raw::FixtureFsEventSource`],
-//! [`sensor::FsMonSensor`], [`error::FsMonError`], [`error::FsMonResult`].
+//! [`sensor::FsMonSensor`], [`filter::WatchFilter`],
+//! [`coalesce::WriteCoalescer`], [`error::FsMonError`],
+//! [`error::FsMonResult`].
 //!
 //! # Nebenläufigkeit
 //! Jede öffentliche Funktion ist zustandslos und `Send + Sync` ohne innere
-//! Veränderlichkeit; siehe die jeweilige Modul-Dokumentation für Details.
+//! Veränderlichkeit; Ausnahme ist der Zusammenfasser in
+//! [`sensor::FsMonSensor`], der hinter einem `Mutex` liegt. Siehe die
+//! jeweilige Modul-Dokumentation für Details.
 //! [`raw::FsEventSource`] verlangt `Send + Sync`, damit eine künftige
 //! Bindung hinter `Arc` gehalten und aus einem Sammelthread aufgerufen
 //! werden kann.
@@ -119,15 +130,19 @@
 //! assert!(matches!(event.kind, harw_dod_signals::EventKind::FileWrite { .. }));
 //! ```
 
+pub mod coalesce;
 pub mod error;
 pub mod fdpath;
+pub mod filter;
 pub mod loginuid;
 pub mod mask;
 pub mod raw;
 pub mod sensor;
 pub mod shape;
 
+pub use coalesce::{COALESCE_WINDOW, WriteCoalescer};
 pub use error::{FsMonError, FsMonResult};
+pub use filter::WatchFilter;
 pub use raw::{FixtureFsEventSource, FsEventSource, RawFsEvent};
 pub use sensor::FsMonSensor;
 pub use shape::shape_event;

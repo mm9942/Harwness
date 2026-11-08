@@ -473,6 +473,12 @@ pub const CRATE_PRIVILEGE: &[(&str, RequiredPrivilege)] = &[
     ("harw-dod-signals", RequiredPrivilege::Unprivileged),
     ("harw-dod-readfs", RequiredPrivilege::Unprivileged),
     ("harw-dod-sentinel", RequiredPrivilege::Unprivileged),
+    // Reines serde-Vokabular der Container-Instanzen (Kennung, Labels,
+    // Image-Digest, Lebenszyklus) ohne E/A und ohne eigene
+    // `Capability`-Deklaration. Liegt seit PL-100 WP1.8 in der
+    // Sentinel-Hülle: `harw-sentinel` → `harw-dod-container` →
+    // `harw-container-model`.
+    ("harw-container-model", RequiredPrivilege::Unprivileged),
     ("harw-dod-netpolicy", RequiredPrivilege::Unprivileged),
     ("harw-dod-warden", RequiredPrivilege::Unprivileged),
     ("harw-dod-warden-proto", RequiredPrivilege::Unprivileged),
