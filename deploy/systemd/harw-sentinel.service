@@ -18,11 +18,16 @@
 # Configuration and exports (PL-97 D1): --config names the system DoD
 # configuration explicitly, so a missing or untrusted config.toml is fail
 # closed (as for harw-probe-bpf). --findings-export appends certified
-# findings as JSON lines (schema version 2) and --health-export rewrites the
-# sentinel's health document atomically every poll cycle; both live in the
-# export directory below the state directory, which tmpfiles.d/harw.conf
-# creates as 2750 harw-sentinel:harw-dod-readers (setgid, so the files are
-# group-readable by harw-dod-readers members). No capability is involved.
+# findings as JSON lines (schema version 3, PL-100 WP0.12) and
+# --health-export rewrites the sentinel's health document atomically every
+# poll cycle; both live in the export directory below the state directory,
+# which tmpfiles.d/harw.conf creates as 2750 harw-sentinel:harw-dod-readers
+# (setgid, so the files are group-readable by harw-dod-readers members).
+# The sentinel keeps its finding dedup state in
+# @STATEDIR@/finding-throttle.json (0600, PL-100 WP0.4) and, with
+# --findings-export, freezes a FindingRecord per reported finding into
+# @STATEDIR@/spool (0700, owner-only); both lie below
+# ReadWritePaths=@STATEDIR@. No capability is involved.
 
 [Unit]
 Description=Harw-DoD sentinel -- unprivileged collection point

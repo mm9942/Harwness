@@ -747,6 +747,23 @@ fn test_sentinel_unit_wires_config_and_both_exports_into_the_export_dir() -> Tes
 }
 
 #[test]
+fn test_sentinel_unit_pins_the_working_directory_and_has_no_workspace_root() -> TestResult {
+    // PL-100 WP0.7: an explicit `/` working directory, and no implicit
+    // workspace root (the sentinel refuses `/` and relative roots anyway).
+    let sentinel = parsed(embedded_unit("harw-sentinel.service")?);
+    assert_eq!(
+        sentinel.last_value("Service", "WorkingDirectory"),
+        Some("/"),
+        "harw-sentinel.service: WorkingDirectory= must be /"
+    );
+    let exec = sentinel
+        .last_value("Service", "ExecStart")
+        .ok_or(TestError::Missing("sentinel ExecStart"))?;
+    assert_eq!(exec_flag(exec, "--workspace-root"), None);
+    Ok(())
+}
+
+#[test]
 fn test_tmpfiles_creates_the_export_dir_for_harw_dod_readers() -> TestResult {
     let tmpfiles = asset("deploy/tmpfiles.d/harw.conf").ok_or(TestError::Missing("tmpfiles"))?;
     let rendered_tmpfiles = rendered(tmpfiles);
