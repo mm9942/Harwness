@@ -31,23 +31,37 @@
 //!
 //! The generic sweeper of `harw-retention` (`ResolvedClass::sweep`) never
 //! sees a verdict segment: the `dod_verdicts` class resolves no directory
-//! there. Verdict retention runs only through [`retention_sweep`] with
-//! [`StoreClass::DodVerdicts`]; the `harw cleanup` job
-//! (`harw_ops::retention_job`) routes every store-owned class there via
-//! [`StoreClass::from_id`], in both modes.
+//! there. Verdict retention runs only through [`retention_sweep_at`] (or its
+//! wrapper [`retention_sweep`]) with [`StoreClass::DodVerdicts`]. The
+//! `harw cleanup` job (`harw_ops::retention_job`) routes every store-owned
+//! class to [`retention_sweep_at`] via [`StoreClass::from_id`], in both
+//! modes, with one exception: `session_transcripts` without an
+//! authoritative attachment source, which the job reports as skipped
+//! ([`NO_ATTACHMENT_SOURCE`]) without calling the store.
 //!
 //! The age/count/bytes/`keep_newest` *selection* is `harw_retention::sweep`
 //! run as a dry plan; this module then adds the store-specific safety checks
 //! and performs each delete itself, independently, failing closed:
 //!
-//! - **Transcripts**: a transcript is never deleted while its session may be
-//!   in use: the `<id>.jsonl.lock` is held by a writer, a caller-supplied
-//!   `is_attached` hook says so, the session has an unresolved approval
+//! - **Transcripts**: never deleted without an authoritative attachment
+//!   source. The `<id>.jsonl.lock` alone cannot tell whether a session is in
+//!   use: `TranscriptStore::append` holds it only for one write, so an
+//!   attached but idle session holds no lock. Without an `is_attached` hook
+//!   ([`SweepOptions`]) every selected transcript is therefore kept and
+//!   reported as protected with [`NO_ATTACHMENT_SOURCE`], in dry run and
+//!   apply alike. With the hook, a transcript is kept when the hook reports
+//!   its session attached (asked per item at sweep time and, in an apply,
+//!   again under the transcript lock right before the unlink), the lock is
+//!   held by a writer, the session has an unresolved approval
 //!   (`approvals/<id>/*.pending.json` without `.resolved.json`), the
 //!   approvals directory cannot be read, or the file changed since planning.
-//!   An apply holds the transcript lock across the unlink, so no append can
-//!   interleave. The `.lock` file itself is left in place (removing a lock
-//!   file others may have opened is racy).
+//!   An apply holds the transcript lock across the second question and the
+//!   unlink, so no append can interleave. Whether an *attach* can interleave
+//!   depends on the source: only one that registers attachments under the
+//!   transcript lock makes the second question race-free (the precise
+//!   guarantee and that rule are on [`SweepOptions::is_attached`]). The
+//!   `.lock` file itself is left in place (removing a lock file others may
+//!   have opened is racy).
 //! - **Corrupt backups** (`<name>.corrupt-<ts>[-<n>]`): immutable quarantine
 //!   files; only regular files that did not change since planning are removed.
 //! - **Freeze records**: only `*.resolved.json` is ever touched, never an
@@ -120,10 +134,14 @@ impl StoreClass {
     /// owns that class.
     ///
     /// Meant for a generic sweeper that routes store-owned classes to
-    /// [`retention_sweep`] instead of deleting their files directly. The
-    /// production caller is the `retention_sweep` job behind `harw cleanup`
-    /// (`harw_ops::retention_job`, per class in its handler core), which
-    /// routes every class this returns `Some` for, in dry run and apply.
+    /// [`retention_sweep_at`] (or its wrapper [`retention_sweep`]) instead of
+    /// deleting their files directly. The production caller is the
+    /// `retention_sweep` job behind `harw cleanup` (`harw_ops::retention_job`,
+    /// per class in its handler core), which routes every class this returns
+    /// `Some` for to [`retention_sweep_at`], in dry run and apply, with one
+    /// exception: [`StoreClass::SessionTranscripts`] without an authoritative
+    /// attachment source, which the job reports as skipped
+    /// ([`NO_ATTACHMENT_SOURCE`]) without calling the store.
     /// For [`StoreClass::DodVerdicts`] that routing is
     /// the only way its retention runs: the class resolves no directory for
     /// `harw_retention::ResolvedClass::sweep`, so a sweeper that does not
@@ -187,11 +205,71 @@ pub struct StoreSweepReport {
     pub removed_records: u64,
 }
 
+/// Protect reason for every selected session transcript when the sweep has
+/// no authoritative attachment source ([`SweepOptions::is_attached`] is
+/// `None`): nothing of [`StoreClass::SessionTranscripts`] is deleted then.
+/// The `harw cleanup` job (`harw_ops::retention_job`) reports the same text
+/// as the skip reason of the whole class.
+pub const NO_ATTACHMENT_SOURCE: &str = "no authoritative attachment source";
+
 /// Optional hooks of a sweep.
+///
+/// # Attachment source (`session_transcripts`)
+/// [`StoreClass::SessionTranscripts`] deletes only with an
+/// [`is_attached`](Self::is_attached) hook. Without one (`None`, also
+/// [`SweepOptions::default`]) every transcript the policy selects is kept
+/// and reported as protected with [`NO_ATTACHMENT_SOURCE`]: the transcript
+/// lock is held only during one write (`TranscriptStore::append`), so an
+/// attached but idle session would otherwise be unprotected. What a hook
+/// guarantees, and what its source must do for that, is on
+/// [`is_attached`](Self::is_attached). The other classes ignore the hook.
+///
+/// # Examples
+/// ```rust
+/// use harw_session_store::retention::SweepOptions;
+///
+/// // An authoritative source that knows no attached session right now.
+/// let nothing_attached = |_session: &str| false;
+/// let options = SweepOptions {
+///     is_attached: Some(&nothing_attached),
+/// };
+/// assert!(options.is_attached.is_some_and(|attached| !attached("s1")));
+/// // Without a source, transcripts are never deleted.
+/// assert!(SweepOptions::default().is_attached.is_none());
+/// ```
 #[derive(Default)]
 pub struct SweepOptions<'a> {
-    /// Returns `true` for a session id (file stem) that a live host has
-    /// attached; such a transcript is never deleted.
+    /// Authoritative, execution-time attachment state: returns `true` for a
+    /// session id (file stem) that a live host or client has attached right
+    /// now. `None` means no such source: no transcript is deleted
+    /// ([`NO_ATTACHMENT_SOURCE`]).
+    ///
+    /// # Guarantee
+    /// An apply deletes a transcript only if the hook answered `false` twice:
+    /// once when the selected item is checked and once more while the sweep
+    /// holds `<id>.jsonl.lock`, which it keeps until the unlink is done (a
+    /// dry run asks once and only lists). A session reported attached at
+    /// either question keeps its transcript. A session that attaches *after* the
+    /// second question is protected only if the source follows the
+    /// registration rule below; otherwise the unlink can still follow, and
+    /// the session's next `TranscriptStore::append` starts a new, empty
+    /// transcript.
+    ///
+    /// # Contract
+    /// - Authoritative and current: every process that attaches a session of
+    ///   the swept directory keeps the source current for the whole
+    ///   attachment (never a snapshot taken when the sweep was queued), and
+    ///   the hook answers `true` when in doubt.
+    /// - Registration under the transcript lock: an attachment is registered
+    ///   while its process briefly holds `<id>.jsonl.lock`, and that process,
+    ///   still under the lock, checks that the transcript still exists (an
+    ///   attach that finds it gone treats the session as missing instead of
+    ///   letting the next append recreate it). The second question then either sees the
+    ///   attachment or the attach comes after the unlink. A source that
+    ///   cannot register this way must instead be a lease the sweep holds
+    ///   across the unlink, which needs a store API beyond this predicate.
+    /// - Non-blocking: the hook must not block and must not take the
+    ///   transcript lock (the sweep already holds it at the second question).
     pub is_attached: Option<&'a dyn Fn(&str) -> bool>,
 }
 
@@ -210,6 +288,11 @@ pub fn transcript_class_config(retention_days: u32, base: &ClassConfig) -> Class
 }
 
 /// Sweeps one store class under `root` with the current time and no hooks.
+///
+/// Without hooks [`StoreClass::SessionTranscripts`] deletes nothing: every
+/// selected transcript is protected with [`NO_ATTACHMENT_SOURCE`] (see
+/// [`SweepOptions`]); pass an authoritative `is_attached` hook through
+/// [`retention_sweep_at`] to sweep transcripts.
 ///
 /// `root` is the directory the owning store is constructed with: the
 /// sessions directory (`TranscriptStore::new`) for the two session classes,
@@ -563,6 +646,9 @@ fn backup_item(path: &Path, apply: bool, snapshot: &HashMap<PathBuf, SystemTime>
     }
 }
 
+/// One selected transcript: kept unless an authoritative attachment source
+/// exists and says the session is detached, it has no unresolved approval,
+/// its lock is free and it did not change since planning (module docs).
 fn transcript_item(
     dir: &Path,
     path: &Path,
@@ -581,7 +667,13 @@ fn transcript_item(
     if safe_session_component(&id).is_err() {
         return Item::Protected("unsafe session id");
     }
-    if options.is_attached.is_some_and(|attached| attached(stem)) {
+    // Fail closed: the transcript lock is held only during one append, so
+    // without an authoritative attachment source an attached but idle
+    // session would look inactive.
+    let Some(attached) = options.is_attached else {
+        return Item::Protected(NO_ATTACHMENT_SOURCE);
+    };
+    if attached(stem) {
         return Item::Protected("session attached");
     }
     match pending_approvals(dir, stem) {
@@ -607,11 +699,21 @@ fn transcript_item(
         }
         Err(_) => return Item::Protected("lock state unknown"),
     };
-    let item = match unchanged(path, true, snapshot) {
-        Err(reason) => Item::Protected(reason),
-        Ok(false) => Item::Removed,
-        Ok(true) => remove_regular(path),
+    // Asked again under the transcript lock, right before the unlink: a
+    // session attached since the first check still keeps its transcript. An
+    // attach after this question is excluded only by a source that registers
+    // attachments under this lock (contract on `SweepOptions::is_attached`).
+    let item = if attached(stem) {
+        Item::Protected("session attached")
+    } else {
+        match unchanged(path, true, snapshot) {
+            Err(reason) => Item::Protected(reason),
+            Ok(false) => Item::Removed,
+            Ok(true) => remove_regular(path),
+        }
     };
+    // Dropping the handle releases the lock as well; a failed explicit
+    // unlock changes nothing about the item's outcome.
     let _ = FileExt::unlock(&lock);
     item
 }
@@ -754,6 +856,33 @@ mod tests {
         .map_err(ctx("sweep"))
     }
 
+    // `sweep_t` with an authoritative attachment source that reports no
+    // attached session.
+    fn sweep_unattached(
+        store: &TranscriptStore,
+        class: StoreClass,
+        cfg: &ClassConfig,
+        mode: SweepMode,
+    ) -> TestResult<StoreSweepReport> {
+        let nothing_attached = |_session: &str| false;
+        sweep_t(
+            store,
+            class,
+            cfg,
+            mode,
+            &SweepOptions {
+                is_attached: Some(&nothing_attached),
+            },
+        )
+    }
+
+    // The sorted protect reasons of `report`.
+    fn reasons(report: &StoreSweepReport) -> Vec<&'static str> {
+        let mut out: Vec<_> = report.protected.iter().map(|p| p.reason).collect();
+        out.sort_unstable();
+        out
+    }
+
     fn names(report: &StoreSweepReport) -> Vec<String> {
         let mut out: Vec<String> = report
             .removed
@@ -809,15 +938,93 @@ mod tests {
             keep_newest: Some(1),
             ..ClassConfig::default()
         };
-        let report = sweep_t(
+        let report = sweep_unattached(
             &store,
             StoreClass::SessionTranscripts,
             &cfg,
             SweepMode::DryRun,
-            &SweepOptions::default(),
         )?;
         assert!(report.dry_run);
         assert_eq!(names(&report), vec!["old-a.jsonl".to_owned()]);
+        assert!(temp.path().join("old-a.jsonl").exists());
+        Ok(())
+    }
+
+    /// Review 4505340178: without an authoritative attachment source no
+    /// transcript is deleted, in dry run and apply, not even an old,
+    /// unlocked one with no approval; each selected transcript is reported
+    /// as protected with the content-free reason.
+    #[test]
+    fn transcripts_without_an_attachment_source_are_never_deleted() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = TranscriptStore::new(temp.path());
+        for id in ["old-a", "old-b", "fresh"] {
+            append(&store, id)?;
+        }
+        for id in ["old-a", "old-b"] {
+            age(&temp.path().join(format!("{id}.jsonl")), 400)?;
+        }
+        for mode in [SweepMode::DryRun, SweepMode::Apply] {
+            let report = sweep_t(
+                &store,
+                StoreClass::SessionTranscripts,
+                &enabled(),
+                mode,
+                &SweepOptions::default(),
+            )?;
+            assert!(report.removed.is_empty(), "{mode:?}");
+            assert_eq!(
+                reasons(&report),
+                vec![NO_ATTACHMENT_SOURCE, NO_ATTACHMENT_SOURCE],
+                "{mode:?}"
+            );
+            assert!(report.errors.is_empty(), "{mode:?}");
+        }
+        // The store method sweeps without hooks: nothing either.
+        let report = store
+            .retention_sweep(
+                StoreClass::SessionTranscripts,
+                &enabled(),
+                SweepMode::Apply,
+                None,
+            )
+            .map_err(ctx("sweep"))?;
+        assert!(report.removed.is_empty());
+        for id in ["old-a", "old-b", "fresh"] {
+            assert!(temp.path().join(format!("{id}.jsonl")).exists(), "{id}");
+        }
+        Ok(())
+    }
+
+    /// The attachment source is asked again under the transcript lock right
+    /// before the unlink: a session that attaches after the first check
+    /// keeps its old, unlocked transcript.
+    #[test]
+    fn an_attachment_after_the_first_check_still_protects_the_transcript() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = TranscriptStore::new(temp.path());
+        append(&store, "old-a")?;
+        append(&store, "fresh")?;
+        age(&temp.path().join("old-a.jsonl"), 400)?;
+        let calls = std::cell::Cell::new(0_u32);
+        // Detached on the first question, attached from the second on.
+        let attaches_late = |_session: &str| {
+            let seen = calls.get();
+            calls.set(seen.saturating_add(1));
+            seen > 0
+        };
+        let report = sweep_t(
+            &store,
+            StoreClass::SessionTranscripts,
+            &enabled(),
+            SweepMode::Apply,
+            &SweepOptions {
+                is_attached: Some(&attaches_late),
+            },
+        )?;
+        assert_eq!(calls.get(), 2, "asked before and under the lock");
+        assert!(report.removed.is_empty());
+        assert_eq!(reasons(&report), vec!["session attached"]);
         assert!(temp.path().join("old-a.jsonl").exists());
         Ok(())
     }
@@ -880,10 +1087,8 @@ mod tests {
             names(&report),
             vec!["old-gone.jsonl".to_owned(), "old-resolved.jsonl".to_owned()]
         );
-        let mut protected: Vec<_> = report.protected.iter().map(|p| p.reason).collect();
-        protected.sort_unstable();
         assert_eq!(
-            protected,
+            reasons(&report),
             vec![
                 "session active (locked)",
                 "session attached",
@@ -896,12 +1101,11 @@ mod tests {
             assert!(temp.path().join(format!("{id}.jsonl")).exists(), "{id}");
         }
         assert!(temp.path().join("notes.txt").exists());
-        let again = sweep_t(
+        let again = sweep_unattached(
             &store,
             StoreClass::SessionTranscripts,
             &enabled(),
             SweepMode::Apply,
-            &SweepOptions::default(),
         )?;
         assert!(names(&again).contains(&"old-locked.jsonl".to_owned()));
         Ok(())
@@ -918,16 +1122,15 @@ mod tests {
             &temp.path().join("old-locked.jsonl"),
             &SessionId::from_str("old-locked"),
         )?;
-        let report = sweep_t(
+        let report = sweep_unattached(
             &store,
             StoreClass::SessionTranscripts,
             &enabled(),
             SweepMode::DryRun,
-            &SweepOptions::default(),
         )?;
         let _ = FileExt::unlock(&held);
         assert!(report.removed.is_empty());
-        assert_eq!(report.protected.len(), 1);
+        assert_eq!(reasons(&report), vec!["session active (locked)"]);
         Ok(())
     }
 
@@ -1042,6 +1245,8 @@ mod tests {
         Ok(())
     }
 
+    /// An expired deadline alone keeps an old transcript: the attachment
+    /// source reports nothing attached, so nothing else protects it.
     #[test]
     fn expired_deadline_leaves_everything_untouched() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -1049,15 +1254,25 @@ mod tests {
         append(&store, "old-a")?;
         append(&store, "fresh")?;
         age(&temp.path().join("old-a.jsonl"), 400)?;
-        let report = store
-            .retention_sweep(
-                StoreClass::SessionTranscripts,
-                &enabled(),
-                SweepMode::Apply,
-                Some(Instant::now()),
-            )
-            .map_err(ctx("sweep"))?;
+        let nothing_attached = |_session: &str| false;
+        let report = retention_sweep_at(
+            store.root(),
+            StoreClass::SessionTranscripts,
+            &enabled(),
+            SweepMode::Apply,
+            Some(Instant::now()),
+            SystemTime::now(),
+            &SweepOptions {
+                is_attached: Some(&nothing_attached),
+            },
+        )
+        .map_err(ctx("sweep"))?;
         assert!(report.timed_out);
+        assert!(report.removed.is_empty());
+        assert!(
+            report.protected.is_empty(),
+            "only the deadline keeps the transcript"
+        );
         assert!(temp.path().join("old-a.jsonl").exists());
         Ok(())
     }

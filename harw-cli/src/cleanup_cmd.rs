@@ -10,6 +10,18 @@
 //! Session-Transkripte und deren Korrupt-Backups) sind Opt-in: sie werden
 //! auch mit `--apply` nur gelöscht, wenn `[retention.<klasse>] enabled =
 //! true` ausdrücklich gesetzt ist.
+//!
+//! Session-Transkripte (`session_transcripts`) brauchen zusätzlich eine
+//! autoritative Anhänge-Quelle, die erst bei der Ausführung je Sitzung sagt,
+//! ob sie gerade angehängt ist: die Sitzungssperre `<id>.jsonl.lock` gilt nur
+//! für einen einzelnen Schreibvorgang (`TranscriptStore::append`) und schützt
+//! eine angehängte, ruhende Sitzung nicht. Eine solche Quelle gibt es noch
+//! nicht. Der Job meldet die Klasse deshalb im Probelauf
+//! wie mit `--apply` als übersprungen (`skipped: "no authoritative attachment
+//! source"` im Job-Ergebnis von `harw jobs show`) und löscht kein Transkript,
+//! auch mit Opt-in; ohne Opt-in nennt `--apply` zuerst das fehlende Opt-in.
+//! Die übrigen Klassen, auch die Korrupt-Backups, laufen unverändert. Wie
+//! sich das später freischalten lässt, beschreibt `harw_ops::retention_job`.
 
 use crate::cli::GlobalArgs;
 use crate::jobs_cmd::working_dir;

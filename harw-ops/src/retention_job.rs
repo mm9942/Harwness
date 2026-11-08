@@ -16,14 +16,16 @@
 //! # Sicherheit
 //! Sicherheitsrelevante Klassen sind Opt-in: ohne `enabled = true` in der
 //! Konfiguration wird bei `apply` nichts gelöscht und die Klasse als
-//! übersprungen gemeldet; der Probelauf meldet immer nur.
+//! übersprungen gemeldet; der Probelauf meldet immer nur. Session-Transkripte
+//! brauchen zusätzlich eine autoritative Anhänge-Quelle (siehe unten); ohne
+//! sie überspringt der Job die Klasse in beiden Modi.
 //!
 //! # Store-eigene Klassen (PL-100 WP 2.3)
 //! Klassen, die der Session-Store besitzt
 //! ([`StoreClass::from_id`]: `session_transcripts`,
 //! `session_corrupt_backups`, `freeze_resolved`, `dod_verdicts`), laufen nie
 //! über den generischen Sweeper (`ResolvedClass::sweep`), sondern über
-//! [`retention_sweep`] des Stores, mit dessen Sicherheitsprüfungen:
+//! [`retention_sweep_at`] des Stores, mit dessen Sicherheitsprüfungen:
 //!
 //! - `dod_verdicts`: [`VerdictStore::apply_retention`] mustert nur ganze,
 //!   abgelaufene Segmente des geprüften Präfixes aus und verankert die Kette
@@ -35,11 +37,46 @@
 //!   würde. Das Ergebnis sagt dann „unbekannt“ statt 0: im Verzeichnis sind
 //!   `removed_segments` und `removed_records` `null` mit `planned: false`,
 //!   oben sind die beiden Summen `null`.
-//! - `session_transcripts`: nie gelöscht, solange die Sitzungssperre gehalten
-//!   wird, eine Freigabe offen ist oder sich die Datei seit der Planung
-//!   geändert hat. Den `is_attached`-Haken des Stores kennt der Job nicht: eine
-//!   angehängte Sitzung schützt hier allein ihre Sperre. Wurzel ist je Profil
-//!   das Sessions-Verzeichnis, das der Klassen-Resolver liefert.
+//! - `session_transcripts` (Review 4505340178): nur mit einer autoritativen,
+//!   erst zur Ausführungszeit befragten Anhänge-Quelle. Die Sitzungssperre
+//!   `<id>.jsonl.lock` hält `TranscriptStore::append` nur für einen
+//!   einzelnen Schreibvorgang; eine angehängte, aber ruhende Sitzung hat also
+//!   weder Sperre noch offene Freigabe und sähe inaktiv aus. Eine solche
+//!   Quelle gibt es heute nicht: welche Sitzungen ein Session-Host angehängt
+//!   hat, weiß nur sein Prozess im Speicher, TUI- und lokale Läufe schreiben
+//!   dasselbe Sessions-Verzeichnis aus eigenen Prozessen, und eine
+//!   Momentaufnahme beim Einreihen wäre bei der Ausführung veraltet. Der Job
+//!   meldet die Klasse deshalb nach der Opt-in-Prüfung als übersprungen
+//!   (`skipped`: [`NO_ATTACHMENT_SOURCE`], im Probelauf wie bei `apply`),
+//!   ruft den Store dafür nicht auf und setzt die übrigen Klassen fort; auch
+//!   der Store selbst löscht ohne `is_attached`-Haken kein Transkript. Mit
+//!   einer Quelle (Naht: der private Kern `execute_until`) gelangt sie als
+//!   [`SweepOptions::is_attached`] in den Store, der sie je Datei vor der
+//!   Sperrprüfung und unter der Sperre unmittelbar vor dem Löschen erneut
+//!   fragt; gelöscht wird nur, wenn beide Antworten „nicht angehängt“
+//!   lauten. Gegen ein Anhängen nach der zweiten Frage schützt das nur eine
+//!   Quelle, die die Registrierungsregel von [`SweepOptions::is_attached`]
+//!   erfüllt (siehe „Freischalten“). Zusätzlich bleibt ein Transkript,
+//!   solange die Sitzungssperre gehalten wird, eine Freigabe offen ist oder
+//!   sich die Datei seit der Planung geändert hat. Wurzel ist je Profil das
+//!   Sessions-Verzeichnis, das der Klassen-Resolver liefert.
+//!
+//!   Freischalten (Folgearbeit): eine Anhänge-Lease, die jeder Prozess, der
+//!   eine Sitzung dieses Sessions-Verzeichnisses anhängt, für die ganze Dauer
+//!   der Anhängung hält (etwa ein `flock` auf `<sessions>/<id>.attach`,
+//!   gehalten von Session-Host und TUI), als Prädikat „Lease belegt =
+//!   angehängt“ im Job-Worker bauen und an den Kern übergeben. Damit die
+//!   zweite Frage unter der Transkript-Sperre verlässlich ist, gilt eine von
+//!   zwei Regeln: (a) der anhängende Prozess nimmt die Lease, während er kurz
+//!   `<id>.jsonl.lock` hält, und prüft dabei, ob das Transkript noch
+//!   existiert (fehlt es, gilt die Sitzung als verschwunden; der nächste
+//!   Schreibvorgang darf sie nicht leer neu anlegen), oder (b) der Sweep hält
+//!   die Lease selbst exklusiv über das Löschen hinweg, was eine Store-API
+//!   über das Ja/Nein-Prädikat hinaus braucht. Ein bloßes Abfragen der Lease
+//!   ohne (a) ließe ein Anhängen zwischen Frage und Löschen zu. Ein nur
+//!   prozesslokaler Zustand (etwa die angehängten Sitzungen des
+//!   `SessionHost` von `harw serve`) genügt nicht: er kennt die Sitzungen
+//!   anderer Prozesse nicht.
 //! - `session_corrupt_backups`: nur reguläre, seit der Planung unveränderte
 //!   Dateien.
 //! - `freeze_resolved`: unter der Freeze-Sperre, nie ein `.active.json` und
@@ -90,7 +127,9 @@ use harw_operations::{OpContext, OpError, OpOutput};
 use harw_retention::{
     Report, ResolvedClass, RetentionConfig, RetentionError, Roots, SweepMode, resolve_all,
 };
-use harw_session_store::retention::{StoreClass, StoreSweepReport, retention_sweep};
+use harw_session_store::retention::{
+    NO_ATTACHMENT_SOURCE, StoreClass, StoreSweepReport, SweepOptions, retention_sweep_at,
+};
 use harw_session_store::{FreezeStore, JobStore, VerdictStore};
 use harw_types::{ApprovalActor, Principal};
 use harw_untrusted_text::escape_line;
@@ -280,12 +319,18 @@ pub fn enqueue_retention_sweep(
 ///
 /// # Description
 /// Store-eigene Klassen ([`StoreClass::from_id`]) laufen über
-/// [`retention_sweep`] des Session-Stores, alle anderen über den generischen
-/// Sweeper von `harw-retention` (siehe Moduldoku). Ergebnis:
+/// [`retention_sweep_at`] des Session-Stores, alle anderen über den
+/// generischen Sweeper von `harw-retention` (siehe Moduldoku). Ergebnis:
 /// `{mode, removed, removed_bytes, removed_segments, removed_records,
 /// errors, failed_dirs, classes: [{id, kind, dirs: [..]} | {id, kind,
 /// skipped}]}`; `removed_segments`/`removed_records` sind `null`, wenn ein
 /// `dod_verdicts`-Probelauf sie nicht vorhersagen kann.
+///
+/// Dieser Einstieg hat keine autoritative Anhänge-Quelle: `session_transcripts`
+/// erscheint deshalb (nach der Opt-in-Prüfung) immer als `{id, kind,
+/// skipped: "no authoritative attachment source"}` ([`NO_ATTACHMENT_SOURCE`]),
+/// ohne dass ein Transkript gelesen oder gelöscht wird; die übrigen Klassen
+/// laufen unverändert.
 ///
 /// # Errors
 /// [`MaintenanceFailure`]: ungültige Payload (`Failed`, auch eine Frist
@@ -311,15 +356,24 @@ pub fn execute_retention_sweep_with_cancel(
                 "deadline_secs liegt außerhalb des darstellbaren Bereichs".to_owned(),
             )
         })?;
-    execute_until(spec, cancel, deadline)
+    // Keine autoritative Anhänge-Quelle (Review 4505340178): Transkripte
+    // werden übersprungen, nie ohne Anhänge-Schutz gelöscht.
+    execute_until(spec, cancel, deadline, None)
 }
 
 // Kern von `execute_retention_sweep_with_cancel` mit fester Frist `deadline`
 // (getrennt, damit Tests eine bereits abgelaufene Frist einsetzen können).
+//
+// `attached` ist die autoritative Anhänge-Quelle für `session_transcripts`
+// (Vertrag: [`SweepOptions::is_attached`]; zur Ausführungszeit je Datei
+// befragt, nie eine Momentaufnahme vom Einreihen). `None` überspringt die
+// Klasse mit [`NO_ATTACHMENT_SOURCE`]; das ist heute der einzige
+// Produktionsfall (siehe Moduldoku, „Freischalten“).
 fn execute_until(
     spec: &RetentionSweepSpec,
     cancel: &SweepCancel,
     deadline: Instant,
+    attached: Option<&dyn Fn(&str) -> bool>,
 ) -> Result<serde_json::Value, MaintenanceFailure> {
     if spec.schema_version != RETENTION_SWEEP_SCHEMA_VERSION {
         return Err(MaintenanceFailure::Failed(format!(
@@ -363,6 +417,11 @@ fn execute_until(
         home: spec.home.clone(),
         project: spec.project.clone(),
     };
+    let run = StoreRun {
+        mode,
+        deadline,
+        attached,
+    };
     let mut classes = Vec::new();
     let mut totals = SweepCounts::default();
     for class in &selected {
@@ -381,20 +440,24 @@ fn execute_until(
         // Sicherheitsprüfungen (für `dod_verdicts` die Kette) gehören dem
         // Session-Store (PL-100 WP 2.3).
         let swept = match StoreClass::from_id(id) {
-            Some(store_class) => sweep_store_class(
-                &spec.config,
-                class,
-                store_class,
-                &roots,
-                mode,
-                deadline,
-                &mut totals,
-            ),
-            None => sweep_generic_class(class, &roots, mode, deadline, &mut totals),
+            Some(store_class) => {
+                sweep_store_class(&spec.config, class, store_class, &roots, run, &mut totals)
+            }
+            None => sweep_generic_class(class, &roots, mode, deadline, &mut totals)
+                .map(ClassSweep::Dirs),
         };
         match swept {
-            Ok(dirs) => {
+            Ok(ClassSweep::Dirs(dirs)) => {
                 classes.push(serde_json::json!({"id": id, "kind": kind, "dirs": dirs}));
+            }
+            // Ohne Store-Aufruf übersprungen (inhaltsfreier, stabiler Grund),
+            // kein Fehler des Jobs; die übrigen Klassen laufen weiter.
+            Ok(ClassSweep::Skipped(reason)) => {
+                classes.push(serde_json::json!({
+                    "id": id,
+                    "kind": kind,
+                    "skipped": reason,
+                }));
             }
             // Opt-in nicht erteilt oder Klasse abgeschaltet: überspringen,
             // nichts löschen — kein Fehler des Jobs.
@@ -532,6 +595,28 @@ impl SweepCounts {
     }
 }
 
+// Ergebnis einer Klasse im Job: ihre Verzeichnis-Einträge oder ein
+// inhaltsfreier Grund, warum sie ohne Store-Aufruf übersprungen wurde.
+enum ClassSweep {
+    // Je Verzeichnis bzw. Store-Wurzel ein Ergebnis-Eintrag.
+    Dirs(Vec<serde_json::Value>),
+    // Übersprungen mit stabilem Kurztext (z. B. [`NO_ATTACHMENT_SOURCE`]).
+    Skipped(&'static str),
+}
+
+// Was jede store-eigene Klasse eines Laufs teilt: Modus, Frist und die
+// Anhänge-Quelle für `session_transcripts`.
+#[derive(Clone, Copy)]
+struct StoreRun<'a> {
+    // Probelauf oder Löschen.
+    mode: SweepMode,
+    // Frist des ganzen Jobs.
+    deadline: Instant,
+    // Autoritative Anhänge-Quelle (Vertrag: `SweepOptions::is_attached`);
+    // `None` überspringt `session_transcripts`.
+    attached: Option<&'a dyn Fn(&str) -> bool>,
+}
+
 // Eine Klasse über den generischen Sweeper von `harw-retention` (Klassen, die
 // kein Store besitzt). `Err` nur für Opt-in bzw. Abschaltung (aus
 // `ResolvedClass::policy`); Verzeichnisfehler werden zu `error`-Einträgen.
@@ -568,26 +653,41 @@ fn sweep_generic_class(
     Ok(dirs)
 }
 
-// Eine store-eigene Klasse über `harw_session_store::retention::retention_sweep`
-// je Store-Wurzel ([`store_targets`]).
+// Eine store-eigene Klasse über
+// `harw_session_store::retention::retention_sweep_at` je Store-Wurzel
+// ([`store_targets`]).
 //
 // Opt-in und Abschaltung werden vorab einmal geprüft, wie in
 // `ResolvedClass::sweep`: auch eine Klasse ohne Wurzel (kein Profil) erscheint
-// dann als übersprungen. Der Fehler einer einzelnen Wurzel (Sperre belegt,
-// Symlink, I/O, Ablehnung durch den `VerdictStore`) wird zu deren
-// `error`-Eintrag und zählt in `failed_dirs`; die übrigen Wurzeln laufen
-// weiter.
+// dann als übersprungen. Danach wird `session_transcripts` ohne
+// Anhänge-Quelle (`run.attached` ist `None`) mit [`NO_ATTACHMENT_SOURCE`]
+// übersprungen, ohne den Store aufzurufen (Review 4505340178). Der Fehler
+// einer einzelnen Wurzel (Sperre belegt, Symlink, I/O, Ablehnung durch den
+// `VerdictStore`) wird zu deren `error`-Eintrag und zählt in `failed_dirs`;
+// die übrigen Wurzeln laufen weiter.
 fn sweep_store_class(
     config: &RetentionConfig,
     class: &ResolvedClass,
     store_class: StoreClass,
     roots: &Roots,
-    mode: SweepMode,
-    deadline: Instant,
+    run: StoreRun<'_>,
     totals: &mut SweepCounts,
-) -> Result<Vec<serde_json::Value>, RetentionError> {
-    class.policy(mode, Some(deadline))?;
+) -> Result<ClassSweep, RetentionError> {
+    class.policy(run.mode, Some(run.deadline))?;
     let id = class.class.id;
+    if store_class == StoreClass::SessionTranscripts && run.attached.is_none() {
+        tracing::debug!(
+            class = id,
+            reason = NO_ATTACHMENT_SOURCE,
+            "store retention class skipped"
+        );
+        return Ok(ClassSweep::Skipped(NO_ATTACHMENT_SOURCE));
+    }
+    // Nur `transcript_item` des Stores fragt den Haken; die übrigen Klassen
+    // ignorieren ihn.
+    let options = SweepOptions {
+        is_attached: run.attached,
+    };
     // `resolve_all` hat die Klasse aus genau dieser Tabelle aufgelöst; fehlt
     // sie, wird nichts angefasst.
     let cfg = config
@@ -602,7 +702,15 @@ fn sweep_store_class(
     let targets = store_targets(store_class, class, roots);
     let mut dirs = Vec::with_capacity(targets.len());
     for target in targets {
-        match retention_sweep(&target.root, store_class, cfg, mode, Some(deadline)) {
+        match retention_sweep_at(
+            &target.root,
+            store_class,
+            cfg,
+            run.mode,
+            Some(run.deadline),
+            SystemTime::now(),
+            &options,
+        ) {
             Ok(report) => {
                 let counts = SweepCounts::of_store(&report, segments_planned);
                 totals.absorb(counts);
@@ -626,10 +734,10 @@ fn sweep_store_class(
             }
         }
     }
-    Ok(dirs)
+    Ok(ClassSweep::Dirs(dirs))
 }
 
-// Eine Wurzel für `retention_sweep` und das Verzeichnis, das das Ergebnis
+// Eine Wurzel für `retention_sweep_at` und das Verzeichnis, das das Ergebnis
 // dafür nennt.
 struct StoreTarget {
     // Wurzel, mit der der besitzende Store gebaut wird.
@@ -638,7 +746,7 @@ struct StoreTarget {
     dir: PathBuf,
 }
 
-// Die Store-Wurzeln einer Klasse (siehe `retention_sweep`): die
+// Die Store-Wurzeln einer Klasse (siehe `retention_sweep_at`): die
 // Sessions-Verzeichnisse aus dem Klassen-Resolver (je Profil) für Transkripte
 // und Backups, die Home für Freeze-Records und den `VerdictStore`.
 fn store_targets(
@@ -796,6 +904,47 @@ mod tests {
             .map_err(|failure| TestError::Unexpected(failure.reason()))
     }
 
+    // Wie `run`, aber über die Naht des Kerns mit der autoritativen
+    // Anhänge-Quelle `attached` (die Produktion hat heute keine).
+    fn run_with_attachments(
+        spec: &RetentionSweepSpec,
+        attached: &dyn Fn(&str) -> bool,
+    ) -> TestResult<serde_json::Value> {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(spec.deadline_secs))
+            .ok_or(TestError::Missing("a representable deadline"))?;
+        execute_until(spec, &SweepCancel::new(), deadline, Some(attached))
+            .map_err(|failure| TestError::Unexpected(failure.reason()))
+    }
+
+    // `<home>/profiles/default/sessions` mit je einem Transkript `<id>.jsonl`
+    // für jede Id aus `ids`; die aus `old` sind 400 Tage alt.
+    fn sessions_with(home: &tempfile::TempDir, ids: &[&str], old: &[&str]) -> TestResult<PathBuf> {
+        let sessions = home
+            .path()
+            .join("profiles")
+            .join("default")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).map_err(ctx("create sessions dir"))?;
+        for id in ids {
+            std::fs::write(sessions.join(format!("{id}.jsonl")), b"{}\n")
+                .map_err(ctx("write transcript"))?;
+        }
+        for id in old {
+            age(&sessions.join(format!("{id}.jsonl")), 400)?;
+        }
+        Ok(sessions)
+    }
+
+    // `session_transcripts` mit Opt-in; die jüngste Datei bleibt immer.
+    fn transcripts_enabled() -> ClassConfig {
+        ClassConfig {
+            enabled: Some(true),
+            keep_newest: Some(1),
+            ..ClassConfig::default()
+        }
+    }
+
     // Der Wert unter dem JSON-Pointer `pointer`.
     fn field<'a>(
         value: &'a serde_json::Value,
@@ -927,19 +1076,35 @@ mod tests {
         ensure(count_logs(&home)? == 4, "nothing touched")
     }
 
+    /// Ohne Opt-in meldet `apply` zuerst das fehlende Opt-in; der Probelauf
+    /// (kein Opt-in nötig) überspringt Transkripte mangels Anhänge-Quelle.
     #[test]
     fn security_classes_are_skipped_without_opt_in() -> TestResult {
         let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let sessions = sessions_with(&home, &["old-a", "fresh"], &["old-a"])?;
         let mut spec =
             RetentionSweepSpec::new(home.path().to_path_buf(), None, RetentionConfig::default());
         spec.apply = true;
         spec.classes = vec!["session_transcripts".to_owned()];
         let value = run(&spec)?;
+        let skipped = text(&value, "/classes/0/skipped")?;
         ensure(
-            field(&value, "/classes/0/skipped")?.is_string(),
-            "security class is reported as skipped",
+            skipped.contains("opt-in"),
+            "the missing opt-in is reported first",
         )?;
-        ensure(number(&value, "/removed")? == 0, "nothing removed")
+        ensure(number(&value, "/removed")? == 0, "nothing removed")?;
+
+        spec.apply = false;
+        let dry = run(&spec)?;
+        ensure(
+            text(&dry, "/classes/0/skipped")? == NO_ATTACHMENT_SOURCE,
+            "a dry run never plans transcripts without an attachment source",
+        )?;
+        ensure(number(&dry, "/removed")? == 0, "nothing would be removed")?;
+        ensure(
+            sessions.join("old-a.jsonl").exists(),
+            "the old transcript stays",
+        )
     }
 
     #[test]
@@ -1170,7 +1335,7 @@ mod tests {
         let store = verdict_store(home.path())?;
         let before = verdict_segments(&store)?;
         // Voraussetzung, damit eine geänderte Vorlage (oder Retention beim
-        // Anhängen) nicht unbemerkt die Erwartung 2/2 verschiebt: drei
+        // Schreiben, `append`) nicht unbemerkt die Erwartung 2/2 verschiebt: drei
         // Segmente, noch kein Anker.
         ensure(
             before.len() == 3 && !store.root().join("anchor.json").exists(),
@@ -1313,40 +1478,30 @@ mod tests {
 
     /// Transkripte laufen über den Store: Wurzel ist das Sessions-Verzeichnis
     /// des Profils (nicht die Home), und eine gesperrte Sitzung bleibt, wo der
-    /// generische Sweeper sie gelöscht hätte.
+    /// generische Sweeper sie gelöscht hätte. Die Anhänge-Quelle kennt hier
+    /// keine angehängte Sitzung, damit allein die Sperre schützt.
     #[test]
     fn session_transcripts_route_through_the_store_and_spare_locked_sessions() -> TestResult {
         let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
-        let sessions = home
-            .path()
-            .join("profiles")
-            .join("default")
-            .join("sessions");
-        std::fs::create_dir_all(&sessions).map_err(ctx("create sessions dir"))?;
-        for id in ["old-gone", "old-locked", "fresh"] {
-            std::fs::write(sessions.join(format!("{id}.jsonl")), b"{}\n")
-                .map_err(ctx("write transcript"))?;
-        }
-        for id in ["old-gone", "old-locked"] {
-            age(&sessions.join(format!("{id}.jsonl")), 400)?;
-        }
+        let sessions = sessions_with(
+            &home,
+            &["old-gone", "old-locked", "fresh"],
+            &["old-gone", "old-locked"],
+        )?;
         let held = std::fs::File::create(sessions.join("old-locked.jsonl.lock"))
             .map_err(ctx("create transcript lock"))?;
         held.try_lock().map_err(ctx("hold transcript lock"))?;
 
         let config = RetentionConfig {
-            session_transcripts: ClassConfig {
-                enabled: Some(true),
-                keep_newest: Some(1),
-                ..ClassConfig::default()
-            },
+            session_transcripts: transcripts_enabled(),
             ..RetentionConfig::default()
         };
         let mut spec = RetentionSweepSpec::new(home.path().to_path_buf(), None, config);
         spec.classes = vec!["session_transcripts".to_owned()];
         spec.apply = true;
-        let value = run(&spec)?;
+        let result = run_with_attachments(&spec, &|_session: &str| false);
         held.unlock().map_err(ctx("release transcript lock"))?;
+        let value = result?;
 
         assert_eq!(
             Some(text(&value, "/classes/0/dirs/0/dir")?),
@@ -1365,6 +1520,97 @@ mod tests {
             "a locked session is never deleted"
         );
         assert!(sessions.join("fresh.jsonl").exists());
+        Ok(())
+    }
+
+    /// Review 4505340178: eine angehängte, aber ruhende Sitzung (keine
+    /// gehaltene Sperre, keine offene Freigabe) mit altem Transkript bleibt
+    /// bei `apply`, sobald die Anhänge-Quelle sie als angehängt meldet; ein
+    /// ebenso altes, nicht angehängtes Transkript fällt. Der Probelauf meldet
+    /// dasselbe und löscht nichts.
+    #[test]
+    fn an_attached_unlocked_old_transcript_survives_apply() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temp home"))?;
+        let sessions = sessions_with(
+            &home,
+            &["old-gone", "old-attached", "fresh"],
+            &["old-gone", "old-attached"],
+        )?;
+        // Keine Sperre gehalten: der Schreiber hat sie nach seinem letzten
+        // Schreibvorgang (`TranscriptStore::append`) wieder freigegeben.
+        let lock = sessions.join("old-attached.jsonl.lock");
+        std::fs::write(&lock, b"").map_err(ctx("create released transcript lock"))?;
+        let config = RetentionConfig {
+            session_transcripts: transcripts_enabled(),
+            ..RetentionConfig::default()
+        };
+        let mut spec = RetentionSweepSpec::new(home.path().to_path_buf(), None, config);
+        spec.classes = vec!["session_transcripts".to_owned()];
+        let attached = |session: &str| session == "old-attached";
+
+        let dry = run_with_attachments(&spec, &attached)?;
+        assert_eq!(text(&dry, "/mode")?, "dry_run");
+        assert_eq!(number(&dry, "/classes/0/dirs/0/removed")?, 1);
+        assert_eq!(number(&dry, "/classes/0/dirs/0/protected")?, 1);
+        assert!(
+            sessions.join("old-gone.jsonl").exists(),
+            "a dry run deletes nothing"
+        );
+
+        spec.apply = true;
+        let value = run_with_attachments(&spec, &attached)?;
+        assert_eq!(text(&value, "/mode")?, "apply");
+        assert!(
+            field(&value, "/classes/0/skipped").is_err(),
+            "with an attachment source the class runs"
+        );
+        assert_eq!(number(&value, "/classes/0/dirs/0/removed")?, 1);
+        assert_eq!(
+            number(&value, "/classes/0/dirs/0/protected")?,
+            1,
+            "the attached session"
+        );
+        assert_eq!(number(&value, "/errors")?, 0);
+        assert_eq!(number(&value, "/failed_dirs")?, 0);
+        assert!(
+            sessions.join("old-attached.jsonl").exists(),
+            "an attached session keeps its transcript"
+        );
+        assert!(!sessions.join("old-gone.jsonl").exists());
+        assert!(sessions.join("fresh.jsonl").exists());
+        Ok(())
+    }
+
+    /// Review 4505340178: ohne autoritative Anhänge-Quelle (der öffentliche
+    /// Einstieg, also jeder `harw cleanup`-Job heute) wird
+    /// `session_transcripts` trotz Opt-in in beiden Modi mit dem
+    /// inhaltsfreien Grund übersprungen, ohne den Store aufzurufen; kein
+    /// Transkript fällt, und die übrigen Klassen laufen weiter.
+    #[test]
+    fn session_transcripts_without_an_attachment_source_are_skipped_in_both_modes() -> TestResult {
+        let (home, mut spec) = setup()?;
+        let sessions = sessions_with(&home, &["old-a", "old-b", "fresh"], &["old-a", "old-b"])?;
+        spec.config.session_transcripts = transcripts_enabled();
+        spec.classes = vec!["tui_log".to_owned(), "session_transcripts".to_owned()];
+        for apply in [false, true] {
+            spec.apply = apply;
+            let value = run(&spec)?;
+            let transcripts = class_entry(&value, "session_transcripts")?;
+            assert_eq!(text(transcripts, "/skipped")?, NO_ATTACHMENT_SOURCE);
+            assert!(
+                field(transcripts, "/dirs").is_err(),
+                "the store is not called for transcripts"
+            );
+            let logs = class_entry(&value, "tui_log")?;
+            assert_eq!(number(logs, "/dirs/0/removed")?, 3, "tui_log still runs");
+            assert_eq!(number(&value, "/removed")?, 3, "only the logs count");
+            assert_eq!(number(&value, "/errors")?, 0, "a skip is no error");
+            assert_eq!(number(&value, "/failed_dirs")?, 0);
+            assert_eq!(count_logs(&home)?, if apply { 1 } else { 4 });
+            for id in ["old-a", "old-b", "fresh"] {
+                assert!(sessions.join(format!("{id}.jsonl")).exists(), "{id}");
+            }
+        }
         Ok(())
     }
 
@@ -1437,7 +1683,7 @@ mod tests {
         let spec = verdict_spec(home.path(), verdicts_enabled(), true);
 
         // Job level: checked before the class starts.
-        let outcome = execute_until(&spec, &SweepCancel::new(), Instant::now());
+        let outcome = execute_until(&spec, &SweepCancel::new(), Instant::now(), None);
         assert!(
             matches!(outcome, Err(MaintenanceFailure::TimedOut(_))),
             "timed out"
@@ -1453,16 +1699,25 @@ mod tests {
             project: None,
         };
         let mut totals = SweepCounts::default();
-        let dirs = sweep_store_class(
+        let run = StoreRun {
+            mode: SweepMode::Apply,
+            deadline: Instant::now(),
+            attached: None,
+        };
+        let swept = sweep_store_class(
             &spec.config,
             &class,
             StoreClass::DodVerdicts,
             &roots,
-            SweepMode::Apply,
-            Instant::now(),
+            run,
             &mut totals,
         )
         .map_err(ctx("sweep the verdict class"))?;
+        let ClassSweep::Dirs(dirs) = swept else {
+            return Err(TestError::Unexpected(
+                "the verdict class is never skipped for a missing attachment source".to_owned(),
+            ));
+        };
         assert!(totals.timed_out, "the job would end as timed_out");
         assert_eq!(totals.removed_segments, 0);
         assert_eq!(totals.failed_dirs, 0);
