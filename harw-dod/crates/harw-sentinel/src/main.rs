@@ -170,6 +170,9 @@
 //! einmal durch die Regeln statt in jedem Zyklus erneut (Befund-Flut). Der
 //! erlaubte Netzbereich der Regeln stammt aus `egress_allow_cidrs` des
 //! aktiven Profils ([`findings::network_scope_from_profile`], WP0.3).
+//! Vor den Regeln leitet [`rates::RateStage`] aus den kumulativen Zählern
+//! des Deltas (cpu, netcounters, blockio) Raten je Sekunde ab
+//! (`"<metric>.rate"`, WP0.14); die Regeln sehen rohe Samples und Raten.
 //! Vorher hing hinter `Sentinel`/
 //! `EvidenceBuffer` kein Regelwerk: `harw_dod_rules::run_rules` hatte
 //! workspace-weit keinen Produktionsaufrufer, jede Fundstelle lag in der
@@ -300,6 +303,7 @@ mod export;
 mod findings;
 mod health_export;
 mod peer_allow;
+mod rates;
 mod sandbox;
 mod sensors;
 mod throttle;

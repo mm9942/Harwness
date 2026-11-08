@@ -491,7 +491,12 @@ mod tests {
     fn test_rate_stays_correct_across_a_counter_wraparound() -> TestResult {
         let near_wrap = f64::from(u32::MAX) - 100.0;
         let mut stage = RateStage::new();
-        stage.derive(&[sample("netcounters-0", "tx_bytes_eth0", 0, near_wrap - 500.0)?]);
+        stage.derive(&[sample(
+            "netcounters-0",
+            "tx_bytes_eth0",
+            0,
+            near_wrap - 500.0,
+        )?]);
         let before = stage.derive(&[sample("netcounters-0", "tx_bytes_eth0", 5, near_wrap)?]);
         let rate = before.first().ok_or_else(missing("rate before the wrap"))?;
         assert_close(rate.value, 100.0);
@@ -510,11 +515,21 @@ mod tests {
     fn test_time_that_does_not_advance_yields_no_rate() -> TestResult {
         let mut stage = RateStage::new();
         stage.derive(&[sample("cpu-0", "idle_jiffies", 5, 100.0)?]);
-        assert!(stage.derive(&[sample("cpu-0", "idle_jiffies", 5, 200.0)?]).is_empty());
-        assert!(stage.derive(&[sample("cpu-0", "idle_jiffies", 0, 300.0)?]).is_empty());
+        assert!(
+            stage
+                .derive(&[sample("cpu-0", "idle_jiffies", 5, 200.0)?])
+                .is_empty()
+        );
+        assert!(
+            stage
+                .derive(&[sample("cpu-0", "idle_jiffies", 0, 300.0)?])
+                .is_empty()
+        );
 
         let rates = stage.derive(&[sample("cpu-0", "idle_jiffies", 2, 310.0)?]);
-        let rate = rates.first().ok_or_else(missing("rate after the clock step"))?;
+        let rate = rates
+            .first()
+            .ok_or_else(missing("rate after the clock step"))?;
         assert_close(rate.value, 5.0);
         Ok(())
     }
@@ -542,10 +557,16 @@ mod tests {
     fn test_non_finite_values_are_ignored() -> TestResult {
         let mut stage = RateStage::new();
         stage.derive(&[sample("cpu-0", "user_jiffies", 0, 100.0)?]);
-        assert!(stage.derive(&[sample("cpu-0", "user_jiffies", 5, f64::NAN)?]).is_empty());
+        assert!(
+            stage
+                .derive(&[sample("cpu-0", "user_jiffies", 5, f64::NAN)?])
+                .is_empty()
+        );
 
         let rates = stage.derive(&[sample("cpu-0", "user_jiffies", 10, 200.0)?]);
-        let rate = rates.first().ok_or_else(missing("rate over the ignored sample"))?;
+        let rate = rates
+            .first()
+            .ok_or_else(missing("rate over the ignored sample"))?;
         assert_close(rate.value, 10.0);
         Ok(())
     }
@@ -568,11 +589,13 @@ mod tests {
             .map(|rate| (rate.sensor.as_str(), rate.metric.as_ref(), rate.value))
             .collect();
         assert_eq!(values.len(), 3);
-        for ((sensor, metric, value), (want_sensor, want_metric, want_value)) in values.iter().zip([
-            ("netcounters-0", "rx_bytes_eth0.rate", 10.0),
-            ("netcounters-1", "rx_bytes_eth0.rate", 200.0),
-            ("netcounters-0", "rx_bytes_eth1.rate", 0.0),
-        ]) {
+        for ((sensor, metric, value), (want_sensor, want_metric, want_value)) in
+            values.iter().zip([
+                ("netcounters-0", "rx_bytes_eth0.rate", 10.0),
+                ("netcounters-1", "rx_bytes_eth0.rate", 200.0),
+                ("netcounters-0", "rx_bytes_eth1.rate", 0.0),
+            ])
+        {
             assert_eq!(*sensor, want_sensor);
             assert_eq!(*metric, want_metric);
             assert_close(*value, want_value);
@@ -711,6 +734,9 @@ mod tests {
         assert!(!is_cumulative("rx_bytes_"), "empty label");
         assert!(!is_cumulative("rx_bytes_eth0.rate"), "a rate is no counter");
         assert!(!is_cumulative("rx_bytesX"), "no separator");
-        assert!(!is_cumulative("user_jiffies_x"), "cpu metrics carry no label");
+        assert!(
+            !is_cumulative("user_jiffies_x"),
+            "cpu metrics carry no label"
+        );
     }
 }

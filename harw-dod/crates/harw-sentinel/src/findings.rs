@@ -395,8 +395,9 @@ pub fn network_scope_from_profile(profile: Option<&ResolvedObservationProfile>) 
 /// # Description
 /// Hält die [`BufferMark`] des zuletzt ausgewerteten Zyklus, den
 /// konfigurierten [`NetworkScope`], den optionalen
-/// [`FindingThrottle`] und die kumulierten Zähler der vor der Auswertung
-/// verdrängten Einträge ([`Self::ring_counters`], `health.json`).
+/// [`FindingThrottle`], die kumulierten Zähler der vor der Auswertung
+/// verdrängten Einträge ([`Self::ring_counters`], `health.json`) und den
+/// vorigen Stand jedes kumulativen Zählers ([`RateStage`], PL-100 WP0.14).
 /// [`Self::evaluate`] wertet die Regeln nur über das seit der Marke
 /// angekommene Delta aus und rückt die Marke danach vor (siehe Moduldoku,
 /// Abschnitt „Delta-Auswertung statt Befund-Flut"). Eine neue Instanz
@@ -424,10 +425,13 @@ pub struct RuleCycle {
     throttle: Option<FindingThrottle>,
     /// Seit Prozessstart vor der Auswertung verdrängte Einträge.
     overflow: RingCounters,
+    /// Voriger Stand der kumulativen Zähler für die Raten (WP0.14).
+    rates: RateStage,
 }
 
 impl RuleCycle {
-    /// Beginnt eine Auswertung bei [`BufferMark::START`], ohne Throttle.
+    /// Beginnt eine Auswertung bei [`BufferMark::START`], ohne Throttle und
+    /// ohne bekannten Zählerstand.
     ///
     /// # Arguments
     /// - `network_scope` (`NetworkScope`): der erlaubte Netzbereich, meist
@@ -439,6 +443,7 @@ impl RuleCycle {
             network_scope,
             throttle: None,
             overflow: RingCounters::default(),
+            rates: RateStage::new(),
         }
     }
 
@@ -466,8 +471,10 @@ impl RuleCycle {
     ///
     /// # Description
     /// Friert über [`EvidenceBuffer::freeze_since`] nur die seit der
-    /// gehaltenen Marke angekommenen Einträge ein, ruft [`report_findings`]
-    /// darauf auf und rückt die Marke auf den Zählerstand des Puffers vor.
+    /// gehaltenen Marke angekommenen Einträge ein, leitet über
+    /// [`RateStage::derive`] die Raten der kumulativen Zähler dieses Deltas
+    /// ab (PL-100 WP0.14), ruft [`report_findings`] mit Delta und Raten auf
+    /// und rückt die Marke auf den Zählerstand des Puffers vor.
     /// Verdrängte, nie ausgewertete Einträge werden kumuliert
     /// ([`Self::ring_counters`]) und per `tracing::warn!` gemeldet (nur
     /// Zähler). Scheitert das Einfrieren (praktisch unerreichbar, siehe
@@ -523,9 +530,11 @@ impl RuleCycle {
                     events = delta.evidence.events.len(),
                     "buffer delta frozen into evidence"
                 );
+                let rate_samples = self.rates.derive(&delta.evidence.samples);
                 report_findings(
                     sink,
                     &delta.evidence,
+                    &rate_samples,
                     now,
                     &self.network_scope,
                     cgroup_kids,
@@ -555,10 +564,11 @@ impl RuleCycle {
 /// unterdrückten Befund.
 ///
 /// # Description
-/// Baut einen [`RuleContext`] aus `evidence.samples`/`evidence.events`, dem
-/// übergebenen `network_scope` und einer leeren Baseline-Liste (siehe
-/// Moduldoku, Abschnitte „Der Netzbereich kommt aus der DoD-Konfiguration"
-/// und „Was dieser Kontext (noch) nicht befüllt"), ruft
+/// Baut einen [`RuleContext`] aus `evidence.samples` samt den daraus
+/// abgeleiteten `rate_samples` ([`with_rates`], PL-100 WP0.14),
+/// `evidence.events`, dem übergebenen `network_scope` und einer leeren
+/// Baseline-Liste (siehe Moduldoku, Abschnitte „Der Netzbereich kommt aus
+/// der DoD-Konfiguration" und „Was dieser Kontext (noch) nicht befüllt"), ruft
 /// [`run_rules_checked`] darauf auf und zählt jeden zurückgelieferten
 /// `Finding<RuleChecked>` in [`SECURITY_FINDING_TOTAL`] auf `sink`
 /// (maschinell auswertbar, ohne Freitext im Label — siehe
@@ -578,6 +588,10 @@ impl RuleCycle {
 /// - `evidence` (`&SecurityEvidence`): der in diesem Zyklus eingefrorene
 ///   Beleg (im Betrieb das Delta aus [`RuleCycle::evaluate`]), dessen
 ///   `samples`/`events` gegen die Regeln laufen.
+/// - `rate_samples` (`&[HostSample]`): die Raten, die
+///   [`crate::rates::RateStage::derive`] aus `evidence.samples` abgeleitet
+///   hat; sie laufen hinter den rohen Samples durch die Regeln. `&[]`, wenn
+///   es keine gibt.
 /// - `now` (`jiff::Timestamp`): dieselbe injizierte Zeit, mit der `evidence`
 ///   eingefroren wurde — nie die Systemuhr dieser Funktion selbst.
 /// - `network_scope` (`&NetworkScope`): der erlaubte Netzbereich
@@ -613,6 +627,7 @@ impl RuleCycle {
 /// let reported = harw_sentinel::findings::report_findings(
 ///     &NullSink,
 ///     &evidence,
+///     &[],
 ///     Timestamp::UNIX_EPOCH,
 ///     &harw_authority::NetworkScope::empty(),
 ///     &harw_sentinel::cgroup_resolve::CgroupKids::default(),
@@ -621,18 +636,23 @@ impl RuleCycle {
 /// );
 /// assert_eq!(reported, 0);
 /// ```
+// Acht Eingänge eines Zyklus, keiner davon ableitbar; ein Bündel-Typ nur
+// für diesen einen Aufrufer brächte nichts (wie `export_fields`).
+#[allow(clippy::too_many_arguments)]
 pub fn report_findings(
     sink: &dyn TelemetrySink,
     evidence: &SecurityEvidence,
+    rate_samples: &[HostSample],
     now: Timestamp,
     network_scope: &NetworkScope,
     cgroup_kids: &CgroupKids,
     mut throttle: Option<&mut FindingThrottle>,
     mut exporter: Option<&mut FindingsExporter>,
 ) -> usize {
+    let samples = with_rates(&evidence.samples, rate_samples);
     let ctx = RuleContext {
         now,
-        samples: &evidence.samples,
+        samples: &samples,
         events: &evidence.events,
         baselines: &[],
         network_scope,
@@ -1622,6 +1642,85 @@ mod tests {
             None,
         );
         assert_eq!(rules.ring_counters().overflow_events_total, 4);
+    }
+
+    fn user_jiffies(secs: i64, value: f64) -> TestResult<HostSample> {
+        Ok(HostSample {
+            sensor: SensorId::from_str("cpu-0"),
+            observed_at: at(secs)?,
+            metric: std::borrow::Cow::Borrowed("user_jiffies"),
+            value,
+        })
+    }
+
+    /// PL-100 WP0.14: `evaluate` gibt jedes Sample des Deltas genau einmal an
+    /// die Ratenstufe; ihr Zustand trägt danach den neuesten Zählerstand.
+    #[test]
+    fn test_evaluate_feeds_each_delta_sample_into_the_rate_stage_once() -> TestResult {
+        let mut buffer = EvidenceBuffer::new(16, 16);
+        let mut rules = RuleCycle::new(NetworkScope::empty());
+        buffer.push_sample(user_jiffies(0, 100.0)?);
+        let first = rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            at(0)?,
+            &CgroupKids::default(),
+            None,
+        );
+        buffer.push_sample(user_jiffies(5, 600.0)?);
+        // Zwei Zyklen über denselben Ring: das Delta des zweiten ist leer.
+        for now in [5, 6] {
+            let reported = rules.evaluate(
+                &buffer,
+                &harw_observe::NullSink,
+                at(now)?,
+                &CgroupKids::default(),
+                None,
+            );
+            assert_eq!(reported, 0, "rates alone trigger no finding");
+        }
+        assert_eq!(first, 0);
+        assert_eq!(rules.rates.tracked(), 1);
+
+        // Bezugspunkt ist das Sample bei t = 5 s (600): (1600 − 600) / 5 s.
+        // Vom Sample bei 0 s aus wären es (1600 − 100) / 10 s = 150.
+        let rates = rules.rates.derive(&[user_jiffies(10, 1_600.0)?]);
+        let rate = rates
+            .first()
+            .ok_or(TestError::Missing("rate from the stage state"))?;
+        assert_eq!(rate.metric, "user_jiffies.rate");
+        assert!((rate.value - 200.0).abs() < 1e-9, "rate {}", rate.value);
+        Ok(())
+    }
+
+    /// Ohne Baselines wertet keine Regel Samples aus: Raten im Kontext
+    /// erzeugen keinen Befund (kein neuer Flutweg, Tor I9).
+    #[test]
+    fn test_rate_samples_in_the_rule_context_trigger_no_finding_without_baselines() -> TestResult {
+        let evidence = SecurityEvidence::capture(
+            vec![user_jiffies(5, 600.0)?],
+            vec![structure_drift_event()],
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("well-formed content always encodes"))?;
+        let rate = HostSample {
+            metric: std::borrow::Cow::Borrowed("user_jiffies.rate"),
+            value: 100.0,
+            ..user_jiffies(5, 0.0)?
+        };
+
+        let reported = report_findings(
+            &harw_observe::NullSink,
+            &evidence,
+            &[rate],
+            Timestamp::UNIX_EPOCH,
+            &NetworkScope::empty(),
+            &CgroupKids::default(),
+            None,
+            None,
+        );
+        assert_eq!(reported, 1, "only the drift event reports");
+        Ok(())
     }
 
     #[test]
