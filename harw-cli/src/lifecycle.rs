@@ -176,7 +176,7 @@ const SERVICE_RESTART_SEC: u32 = 5;
 /// Gemeinsamer, nie fataler Einstieg der Installationspfade (PL-100 WP 1.9,
 /// O12): `harw update` ruft ihn nach jedem Lauf auf; `harw agent
 /// install-record` (den `make install`, `scripts/install.sh` und das neue
-/// Binary eines Updates ausführen) soll ihn ebenfalls aufrufen. Der
+/// Binary eines Updates ausführen) ruft ihn ebenfalls auf (`agent_cmd::run`). Der
 /// Legacy-Alias `harw install` gibt weiterhin nur aus und schreibt nichts.
 /// Ein ausdrückliches `tui_tty = false`, eine fehlende `config.toml` und
 /// eine `config.toml`, die ein Symlink ist, bleiben unangetastet (siehe
