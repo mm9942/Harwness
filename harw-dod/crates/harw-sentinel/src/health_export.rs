@@ -873,6 +873,24 @@ mod tests {
         ipc: Ipc,
         ring: Ring,
         windows: Windows,
+        spool: Option<Spool>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Spool {
+        state: String,
+        #[serde(default)]
+        degrade_reason: Option<String>,
+        enqueued_total: u64,
+        written_total: u64,
+        dropped_total: u64,
+        spool_full_total: u64,
+        too_large_total: u64,
+        failed_total: u64,
+        removed_total: u64,
+        dropped_last_60s: u64,
+        rejected_last_60s: u64,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1005,7 +1023,152 @@ mod tests {
         assert_eq!(document.ring.overflow_events_last_60s, 4);
         assert_eq!(document.windows.last_cycle_ms, None);
         assert_eq!(document.windows.last_60s_ms, None);
+        assert!(document.spool.is_none(), "no spool configured");
         Ok(())
+    }
+
+    /// PL-100 WP0.12: ein nicht geöffneter Spool erscheint als `degraded`.
+    #[test]
+    fn test_an_unavailable_spool_is_reported_degraded() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join(DEFAULT_HEALTH_FILE_NAME);
+        let writer = crate::spool_writer::SpoolWriter::unavailable();
+        let mut exporter = HealthExporter::new(path.clone(), identity()).with_spool(writer.stats());
+        assert!(exporter.record_cycle(
+            &NullSink,
+            &[],
+            &[],
+            IpcCounters::default(),
+            RingCounters::default(),
+            at(0)?,
+        ));
+        let spool = read_document(&path)?
+            .spool
+            .ok_or(TestError::Missing("spool object"))?;
+        assert_eq!(spool.state, "degraded");
+        assert_eq!(spool.degrade_reason.as_deref(), Some("unavailable"));
+        Ok(())
+    }
+
+    /// PL-100 WP0.12: ein abgewiesener Record (`RecordTooLarge`) macht den
+    /// Spool für ein Fenster `degraded`; danach ist er wieder `ok`.
+    #[test]
+    fn test_a_refused_record_degrades_the_spool_for_one_window() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spool_dir = dir.path().join(crate::spool_writer::SPOOL_DIR_NAME);
+        crate::spool_writer::prepare_spool_dir(&spool_dir).map_err(ctx("spool dir"))?;
+        let spool = harw_dod_sentinel::spool::FindingSpool::open_with_limits(
+            &spool_dir,
+            crate::spool_writer::sentinel_limits(),
+        )
+        .map_err(ctx("open spool"))?;
+        let writer = crate::spool_writer::SpoolWriter::spawn(spool, 4).map_err(ctx("spawn"))?;
+        let path = dir.path().join(DEFAULT_HEALTH_FILE_NAME);
+        let mut exporter = HealthExporter::new(path.clone(), identity()).with_spool(writer.stats());
+        writer.note_rejected(&harw_dod_sentinel::spool::SpoolError::RecordTooLarge {
+            len: 70_000,
+            limit: 65_536,
+        });
+
+        assert!(exporter.record_cycle(
+            &NullSink,
+            &[],
+            &[],
+            IpcCounters::default(),
+            RingCounters::default(),
+            at(0)?,
+        ));
+        let spool = read_document(&path)?
+            .spool
+            .ok_or(TestError::Missing("spool object"))?;
+        assert_eq!(spool.state, "degraded");
+        assert_eq!(spool.degrade_reason.as_deref(), Some("record_too_large"));
+        assert_eq!(
+            (
+                spool.enqueued_total,
+                spool.written_total,
+                spool.dropped_total,
+                spool.spool_full_total,
+                spool.too_large_total,
+                spool.failed_total,
+                spool.removed_total,
+            ),
+            (0, 0, 0, 0, 1, 0, 0)
+        );
+        assert_eq!((spool.dropped_last_60s, spool.rejected_last_60s), (0, 1));
+
+        assert!(exporter.record_cycle(
+            &NullSink,
+            &[],
+            &[],
+            IpcCounters::default(),
+            RingCounters::default(),
+            at(120)?,
+        ));
+        let later = read_document(&path)?
+            .spool
+            .ok_or(TestError::Missing("spool object"))?;
+        assert_eq!(later.state, "ok", "the refusal left the window");
+        assert_eq!(later.degrade_reason, None);
+        assert_eq!(later.too_large_total, 1, "cumulative counters stay");
+        assert_eq!(later.rejected_last_60s, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_spool_state_is_degraded_only_for_recent_or_current_failures() {
+        let quiet = WindowDeltas::default();
+        let refused_now = WindowDeltas {
+            last_60s: HealthCounters {
+                spool_rejected: 1,
+                ..HealthCounters::default()
+            },
+            ..WindowDeltas::default()
+        };
+        let dropped_now = WindowDeltas {
+            last_60s: HealthCounters {
+                spool_dropped: 2,
+                ..HealthCounters::default()
+            },
+            ..WindowDeltas::default()
+        };
+        let full = SpoolCounters {
+            spool_full_total: 1,
+            last_failure: Some(SpoolFailure::SpoolFull),
+            ..SpoolCounters::default()
+        };
+        assert_eq!(spool_state(&SpoolCounters::default(), &quiet), ("ok", None));
+        assert_eq!(
+            spool_state(&full, &refused_now),
+            ("degraded", Some("spool_full"))
+        );
+        assert_eq!(spool_state(&full, &quiet), ("ok", None), "aged out");
+        let still_failing = SpoolCounters {
+            last_put_failed: true,
+            ..full
+        };
+        assert_eq!(
+            spool_state(&still_failing, &quiet),
+            ("degraded", Some("spool_full"))
+        );
+        let overflow = SpoolCounters {
+            dropped_total: 2,
+            last_failure: Some(SpoolFailure::QueueOverflow),
+            ..SpoolCounters::default()
+        };
+        assert_eq!(
+            spool_state(&overflow, &dropped_now),
+            ("degraded", Some("queue_overflow"))
+        );
+        let gone = SpoolCounters {
+            unavailable: true,
+            last_failure: Some(SpoolFailure::QueueOverflow),
+            ..SpoolCounters::default()
+        };
+        assert_eq!(
+            spool_state(&gone, &quiet),
+            ("degraded", Some("unavailable"))
+        );
     }
 
     fn counters(dropped: u64, overflow_events: u64) -> (IpcCounters, RingCounters) {
@@ -1142,6 +1305,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&encoded).map_err(ctx("parse"))?;
         assert!(value["config_digest"].is_null());
         assert!(value["profile"].is_null());
+        assert!(value["spool"].is_null(), "no spool is written as null");
         assert_eq!(value["sensors"], serde_json::json!([]));
         assert!(encoded.ends_with('\n'));
         Ok(())

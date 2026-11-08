@@ -50,6 +50,22 @@
 //! [`crate::cgroup_resolve::CgroupKids`] des Zyklus, in dem die Sonde sie
 //! geliefert hat.
 //!
+//! # Spool-Record und Export v3 (PL-100 WP0.12)
+//! Dieselben Einzelläufe liefern je Befund seine **auslösenden Ereignisse**
+//! (Indizes im Delta, höchstens [`MAX_TRIGGER_EVENTS`]): die Ereignisse,
+//! deren Einzellauf die Signatur des Befundes erzeugt. Mit einem
+//! Spool-Schreiber ([`RuleCycle::with_spool`], im Betrieb mit
+//! `--findings-export`) wird jeder **gemeldete** Befund über
+//! [`harw_dod_sentinel::spool::slice_record`] mit diesen Ereignissen plus
+//! höchstens [`harw_dod_sentinel::spool::MAX_CONTEXT_EVENTS`] jüngsten
+//! übrigen Ereignissen des Rings eingefroren (≤ 64 KiB) und an
+//! [`crate::spool_writer::SpoolWriter`] übergeben; nur ein eingereihter
+//! Record bekommt seinen `record_digest` in die Exportzeile. Die Zeile
+//! trägt außerdem den Throttle-Stempel, `cgroup_kid`, Art und Härte und
+//! eine [`crate::export::EvidenceCard`] der auslösenden Ereignisse (siehe
+//! `crate::export`, Schema v3). Unterdrückte Wiederholungen erzeugen weder
+//! Record noch Zeile.
+//!
 //! # Journal-Hygiene (PL-100 WP0.6)
 //! Auf `warn` stehen je gemeldetem Befund nur Kennungen und Aufzählungen:
 //! `finding_id`, `rule_id`, `kind`, `severity`, `hardness`, `dedup_key`,
@@ -197,20 +213,28 @@ use harw_authority::{EgressTarget, NetworkScope};
 use harw_dod_config::ResolvedObservationProfile;
 use harw_dod_rules::rule::RuleContext;
 use harw_dod_rules::{FindingKind, run_rules, run_rules_checked};
+use harw_dod_sentinel::spool::{MAX_CONTEXT_EVENTS, slice_record};
 use harw_dod_sentinel::{BufferMark, EvidenceBuffer};
 use harw_dod_signals::{
     EventKind, Hardness, HostSample, SecurityEvent, SecurityEvidence, Severity,
 };
 use harw_observe::{FieldValue, MetricValue, TelemetrySink};
+use harw_types::ContentDigest;
 use jiff::Timestamp;
 
 use crate::cgroup_resolve::CgroupKids;
-use crate::export::FindingsExporter;
+use crate::export::{EvidenceCard, FindingsExporter, LineFields};
 use crate::health_export::RingCounters;
 use crate::rates::{RateStage, with_rates};
+use crate::spool_writer::SpoolWriter;
 use crate::throttle::{
     CoarseSubject, DedupKey, FindingThrottle, ThrottleDecision, ThrottleVerdict,
 };
+
+/// Höchstzahl gemerkter auslösender Ereignisse je Befund (Spool-Record und
+/// `evidence_card`); weitere gleichartige Ereignisse zählen nur noch in die
+/// Herkunft.
+pub const MAX_TRIGGER_EVENTS: usize = 64;
 
 /// Label-Feldname für die auslösende Regel ([`harw_dod_rules::Rule::id`]).
 const RULE_LABEL: harw_observe::FieldName = harw_macros::field!("rule_id");
@@ -355,6 +379,33 @@ impl FindingOrigin {
     }
 }
 
+/// Wohin [`report_findings`] gemeldete Befunde außer ins Journal gibt.
+///
+/// # Description
+/// `Default` ist „nirgendwohin": kein Export, kein Spool, kein Kontext.
+///
+/// # Concurrency
+/// Geliehene Ausgabewege des Sammelthreads, nur für einen Aufruf.
+///
+/// # Examples
+/// ```rust,ignore
+/// let outputs = ReportOutputs {
+///     exporter: Some(&mut exporter),
+///     ..ReportOutputs::default()
+/// };
+/// ```
+#[derive(Debug, Default)]
+pub struct ReportOutputs<'a> {
+    /// Der optionale JSON-Lines-Export (`--findings-export`).
+    pub exporter: Option<&'a mut FindingsExporter>,
+    /// Der optionale Spool-Schreiber; ohne ihn entsteht kein Record und
+    /// keine Zeile trägt `record_digest`.
+    pub spool: Option<&'a SpoolWriter>,
+    /// Die Ereignisse des Rings (älteste zuerst), aus denen der Kontext
+    /// eines Records stammt; leer ohne Spool.
+    pub context: &'a [&'a SecurityEvent],
+}
+
 /// Baut den [`NetworkScope`] der Regeln aus dem aktiven DoD-Profil.
 ///
 /// # Description
@@ -427,6 +478,9 @@ pub struct RuleCycle {
     overflow: RingCounters,
     /// Voriger Stand der kumulativen Zähler für die Raten (WP0.14).
     rates: RateStage,
+    /// Spool-Schreiber für die Records gemeldeter Befunde (WP0.12);
+    /// `None` friert nichts ein.
+    spool: Option<SpoolWriter>,
 }
 
 impl RuleCycle {
@@ -444,7 +498,21 @@ impl RuleCycle {
             throttle: None,
             overflow: RingCounters::default(),
             rates: RateStage::new(),
+            spool: None,
         }
+    }
+
+    /// Friert ab jetzt jeden gemeldeten Befund mit seinem Beleg-Ausschnitt
+    /// ein und übergibt ihn an `spool` (PL-100 WP0.12); der Schreiber endet
+    /// mit dieser Auswertung (sein Drop schreibt Eingereihtes fertig).
+    ///
+    /// # Arguments
+    /// - `spool` (`SpoolWriter`): im Betrieb aus
+    ///   [`SpoolWriter::open`] (`crate::run`).
+    #[must_use]
+    pub fn with_spool(mut self, spool: SpoolWriter) -> Self {
+        self.spool = Some(spool);
+        self
     }
 
     /// Entprellt ab jetzt wiederholte Befunde über `throttle` (PL-100
@@ -531,6 +599,14 @@ impl RuleCycle {
                     "buffer delta frozen into evidence"
                 );
                 let rate_samples = self.rates.derive(&delta.evidence.samples);
+                // Kontext der Spool-Records: der ganze Ring (Zeiger, keine
+                // Kopien); nur mit verfügbarem Spool.
+                let ring: Vec<&SecurityEvent> =
+                    if self.spool.as_ref().is_some_and(SpoolWriter::is_available) {
+                        buffer.events().collect()
+                    } else {
+                        Vec::new()
+                    };
                 report_findings(
                     sink,
                     &delta.evidence,
@@ -539,7 +615,11 @@ impl RuleCycle {
                     &self.network_scope,
                     cgroup_kids,
                     self.throttle.as_mut(),
-                    exporter,
+                    ReportOutputs {
+                        exporter,
+                        spool: self.spool.as_ref(),
+                        context: &ring,
+                    },
                 )
             }
             Err(error) => {
@@ -554,6 +634,10 @@ impl RuleCycle {
         };
         if let Some(throttle) = self.throttle.as_mut() {
             throttle.persist_if_due(now);
+        }
+        if let Some(spool) = self.spool.as_ref() {
+            // Aufbewahrung des Spools (14 Tage), höchstens jede Minute wirksam.
+            spool.tick(now);
         }
         reported
     }
@@ -579,7 +663,10 @@ impl RuleCycle {
 /// gemeldet oder nur gezählt wird (siehe Moduldoku, „Entprellung
 /// wiederholter Befunde"). Ein gemeldeter Befund erscheint auf
 /// `tracing::warn!` nur mit Kennungen (siehe Moduldoku,
-/// „Journal-Hygiene"), Details auf `debug`, und geht an `exporter`.
+/// „Journal-Hygiene"), Details auf `debug`; mit Spool wird er samt
+/// Beleg-Ausschnitt eingefroren und eingereiht, und er geht als Zeile
+/// (Schema v3) an den Export (siehe Moduldoku, „Spool-Record und Export
+/// v3").
 ///
 /// # Arguments
 /// - `sink` (`&dyn TelemetrySink`): dasselbe Sink-Objekt, über das dieses
@@ -600,10 +687,10 @@ impl RuleCycle {
 ///   aufgelösten Cgroup-Pfade, für `cgroup_kid` der Herkunft.
 /// - `throttle` (`Option<&mut FindingThrottle>`): die Entprellung; `None`
 ///   meldet jeden Befund (mit `occurrences = 1`).
-/// - `exporter` (`Option<&mut crate::export::FindingsExporter>`): der
-///   optionale JSON-Lines-Export (`--findings-export`); `None` schreibt
-///   nichts. Ein Exportfehler wird dort gezählt und geloggt und ändert
-///   weder Rückgabewert noch Meldung.
+/// - `outputs` (`ReportOutputs`): Export, Spool-Schreiber und Ring-Kontext;
+///   [`ReportOutputs::default`] schreibt nirgendwohin. Ein Export- oder
+///   Spoolfehler wird dort gezählt und geloggt und ändert weder
+///   Rückgabewert noch Meldung.
 ///
 /// # Returns
 /// Die Anzahl gemeldeter (nicht unterdrückter) Befunde. `0` ist der
@@ -632,12 +719,12 @@ impl RuleCycle {
 ///     &harw_authority::NetworkScope::empty(),
 ///     &harw_sentinel::cgroup_resolve::CgroupKids::default(),
 ///     None,
-///     None,
+///     harw_sentinel::findings::ReportOutputs::default(),
 /// );
 /// assert_eq!(reported, 0);
 /// ```
-// Acht Eingänge eines Zyklus, keiner davon ableitbar; ein Bündel-Typ nur
-// für diesen einen Aufrufer brächte nichts (wie `export_fields`).
+// Acht Eingänge eines Zyklus, keiner davon ableitbar; die Ausgabewege sind
+// bereits in `ReportOutputs` gebündelt.
 #[allow(clippy::too_many_arguments)]
 pub fn report_findings(
     sink: &dyn TelemetrySink,
@@ -647,7 +734,7 @@ pub fn report_findings(
     network_scope: &NetworkScope,
     cgroup_kids: &CgroupKids,
     mut throttle: Option<&mut FindingThrottle>,
-    mut exporter: Option<&mut FindingsExporter>,
+    mut outputs: ReportOutputs<'_>,
 ) -> usize {
     let samples = with_rates(&evidence.samples, rate_samples);
     let ctx = RuleContext {
@@ -663,10 +750,13 @@ pub fn report_findings(
         return 0;
     }
     let scopes = attribute_scopes(&findings, &evidence.events, now, network_scope);
-    let origins = attribute_origins(&findings, &evidence.events, now, network_scope, cgroup_kids);
+    let provenance =
+        attribute_provenance(&findings, &evidence.events, now, network_scope, cgroup_kids);
 
     let mut reported = 0_usize;
-    for ((finding, finding_scope), origin) in findings.iter().zip(&scopes).zip(&origins) {
+    for ((finding, finding_scope), Provenance { origin, triggers }) in
+        findings.iter().zip(&scopes).zip(&provenance)
+    {
         sink.record(
             &SECURITY_FINDING_TOTAL,
             MetricValue::Count(1),
@@ -726,15 +816,86 @@ pub fn report_findings(
             cgroup_kid = ?origin.cgroup_kid,
             "security rule finding detail"
         );
-        // Export v3 (Gruppe A, Schritt 5) übernimmt hier `stamp`
-        // (`dedup_key`, `occurrences`, `first_seen`) und `origin.cgroup_kid`.
-        if let Some(exporter) = exporter.as_deref_mut() {
-            exporter.export(sink, finding, finding_scope.as_deref());
+        let trigger_events: Vec<&SecurityEvent> = triggers
+            .iter()
+            .filter_map(|index| evidence.events.get(*index))
+            .collect();
+        let record_digest = outputs
+            .spool
+            .and_then(|spool| spool_record(spool, finding, &trigger_events, outputs.context, now));
+        // Export v3 (PL-100 WP0.12): Stempel, Herkunft, Record und Karte.
+        if let Some(exporter) = outputs.exporter.as_deref_mut() {
+            let card = EvidenceCard::from_events(&trigger_events);
+            let fields = LineFields {
+                scope: finding_scope.as_deref(),
+                cgroup_kid: origin.cgroup_kid,
+                record_digest,
+                evidence_card: card.as_ref(),
+                ..LineFields::of(finding, stamp)
+            };
+            exporter.export(sink, &fields);
         }
         reported = reported.saturating_add(1);
     }
 
     reported
+}
+
+/// Friert `finding` mit seinem Beleg-Ausschnitt ein und reiht den Record
+/// beim Spool-Schreiber ein (PL-100 WP0.12).
+///
+/// # Description
+/// Ausschnitt: `triggers` plus die jüngsten höchstens
+/// [`MAX_CONTEXT_EVENTS`] Ereignisse aus `ring`, die kein auslösendes sind
+/// ([`slice_record`], Grenze [`SpoolWriter::max_record_bytes`]). Ein
+/// Record, der schon beim Zuschneiden scheitert, wird beim Schreiber
+/// gezählt (`RecordTooLarge` und andere; `health.json`).
+///
+/// # Returns
+/// Den Record-Digest, wenn der Record eingereiht wurde; sonst `None` (kein
+/// Spool, zu groß, Warteschlange voll).
+fn spool_record(
+    spool: &SpoolWriter,
+    finding: &harw_dod_rules::Finding<harw_dod_rules::RuleChecked>,
+    triggers: &[&SecurityEvent],
+    ring: &[&SecurityEvent],
+    now: Timestamp,
+) -> Option<ContentDigest> {
+    if !spool.is_available() {
+        return None;
+    }
+    let trigger_events: Vec<SecurityEvent> = triggers.iter().copied().cloned().collect();
+    let mut context: Vec<SecurityEvent> = ring
+        .iter()
+        .rev()
+        .copied()
+        .filter(|event| !triggers.contains(event))
+        .take(MAX_CONTEXT_EVENTS)
+        .cloned()
+        .collect();
+    // Jüngste zuerst gesammelt; der Record trägt sie in Ring-Reihenfolge.
+    context.reverse();
+    match slice_record(
+        finding,
+        &trigger_events,
+        &context,
+        now,
+        spool.max_record_bytes(),
+    ) {
+        Ok(record) => {
+            let digest = record.digest();
+            spool.submit(record).then_some(digest)
+        }
+        Err(error) => {
+            spool.note_rejected(&error);
+            tracing::debug!(
+                finding_id = finding.id().as_str(),
+                error = %error,
+                "security finding not spooled; exported without record_digest"
+            );
+            None
+        }
+    }
 }
 
 /// What makes two findings of different rule runs the same finding.
