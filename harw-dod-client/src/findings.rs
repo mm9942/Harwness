@@ -87,9 +87,153 @@ pub const DEFAULT_FINDINGS_WINDOW: Duration = Duration::from_secs(24 * 3600);
 pub const MAX_SUMMARY_RULES: usize = 32;
 
 /// Highest export line schema version this reader knows.
-pub const EXPORT_SCHEMA_VERSION: u32 = 2;
+///
+/// Versions `1..=3` are parsed with every check of this module; a higher
+/// version is still accepted, but unknown enum values and unknown
+/// `evidence_card` keys are then ignored (see the module documentation).
+pub const EXPORT_SCHEMA_VERSION: u32 = 3;
 
-/// One validated export line (v1 or v2).
+/// Length of a v3 `dedup_key`: lowercase hex of the first 16 bytes of a
+/// BLAKE3 digest.
+pub const DEDUP_KEY_HEX_LEN: usize = 32;
+
+/// Length of a v3 `record_digest`: lowercase hex of a 32-byte BLAKE3 digest.
+pub const RECORD_DIGEST_HEX_LEN: usize = 64;
+
+/// v3 `kind`: why the finding exists.
+///
+/// Mirrors `harw_dod_rules::FindingKind`; the export spells it in
+/// snake_case (`"rule_triggered"`, `"anomaly"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    /// A rule fired (may be escalated).
+    RuleTriggered,
+    /// A deviation from a baseline that is not established yet (notice only).
+    Anomaly,
+}
+
+impl FindingKind {
+    /// Parses the export spelling; `None` for anything else.
+    ///
+    /// # Examples
+    /// ```
+    /// use harw_dod_client::findings::FindingKind;
+    ///
+    /// assert_eq!(FindingKind::from_wire("anomaly"), Some(FindingKind::Anomaly));
+    /// assert_eq!(FindingKind::from_wire("Anomaly"), None);
+    /// ```
+    #[must_use]
+    pub fn from_wire(text: &str) -> Option<Self> {
+        match text {
+            "rule_triggered" => Some(Self::RuleTriggered),
+            "anomaly" => Some(Self::Anomaly),
+            _ => None,
+        }
+    }
+
+    /// The export spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RuleTriggered => "rule_triggered",
+            Self::Anomaly => "anomaly",
+        }
+    }
+}
+
+/// v3 `hardness`: how directly the finding is backed by observations.
+///
+/// Ordered like `harw_dod_signals::Hardness`: `Observed < Correlated <
+/// Inferred` (the larger, the more indirect the evidence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingHardness {
+    /// Observed directly, without linking or inference.
+    Observed,
+    /// Linked from several observations.
+    Correlated,
+    /// Concluded beyond the observations.
+    Inferred,
+}
+
+impl FindingHardness {
+    /// Parses the export spelling; `None` for anything else.
+    ///
+    /// # Examples
+    /// ```
+    /// use harw_dod_client::findings::FindingHardness;
+    ///
+    /// assert_eq!(FindingHardness::from_wire("observed"), Some(FindingHardness::Observed));
+    /// assert!(FindingHardness::Observed < FindingHardness::Inferred);
+    /// ```
+    #[must_use]
+    pub fn from_wire(text: &str) -> Option<Self> {
+        match text {
+            "observed" => Some(Self::Observed),
+            "correlated" => Some(Self::Correlated),
+            "inferred" => Some(Self::Inferred),
+            _ => None,
+        }
+    }
+
+    /// The export spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Correlated => "correlated",
+            Self::Inferred => "inferred",
+        }
+    }
+}
+
+/// `true` when `value` is a canonical UUIDv4 as `uuid::Uuid::new_v4()`
+/// renders it (and therefore as `harw_types::FindingId::new` mints it):
+/// 36 characters, lowercase hex, hyphens at 8/13/18/23, version nibble `4`,
+/// RFC 4122 variant (`8`, `9`, `a` or `b`).
+///
+/// Uppercase, braced, URN and simple (hyphenless) spellings are refused, and
+/// so is the nil UUID (its version nibble is `0`).
+///
+/// # Examples
+/// ```
+/// use harw_dod_client::findings::is_uuid_v4;
+///
+/// assert!(is_uuid_v4("3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b"));
+/// assert!(!is_uuid_v4("3F2B8C1E-9D4A-4B7E-8A6F-1C2D3E4F5A6B"));
+/// assert!(!is_uuid_v4("00000000-0000-0000-0000-000000000000"));
+/// assert!(!is_uuid_v4("f-1"));
+/// ```
+#[must_use]
+pub fn is_uuid_v4(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            14 => *byte == b'4',
+            19 => matches!(byte, b'8' | b'9' | b'a' | b'b'),
+            _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+        })
+}
+
+/// `true` when `value` is exactly `len` lowercase hex characters.
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `skip_serializing_if` helper: `scope_obfuscated` is written only when set.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One validated export line (v1, v2 or v3).
+///
+/// Built by [`parse_finding_line`] / deserialization, which validate every
+/// field; the v3 fields are `None` / `false` on v1 and v2 lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawFindingLine")]
 pub struct FindingLine {
