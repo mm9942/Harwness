@@ -87,7 +87,7 @@
 //! [`correlate_advisories`] liefert `Vec<Finding<RuleChecked>>` — geprüfte,
 //! aber noch nicht triagierte Befunde. Was mit ihnen geschieht (eskalieren,
 //! verwerfen, zur Prüfung vormerken), entscheidet ausschließlich
-//! `harw-dod-escalate` über [`crate::triage`]. Dieses Modul trifft diese
+//! `harw-dod-escalate` über [`crate::triage_record`]. Dieses Modul trifft diese
 //! Entscheidung nicht.
 //!
 //! # Nebenläufigkeit

@@ -5,6 +5,11 @@
 //! eine zugehörige [`crate::baseline::Baseline`] verletzt. Im Unterschied zur
 //! `StructureDriftRule` geht es hier **einzelne Werte außerhalb** eines
 //! erwarteten Bereichs.
+//!
+//! # Zeitstempel (PL-100 WP0.2)
+//! Ein Befund trägt das `observed_at` des ersten abweichenden Samples seiner
+//! Metrik, nie [`crate::rule::RuleContext::now`]: eine wiederholte
+//! Auswertung derselben Beobachtung erzeugt denselben Stempel.
 
 use std::collections::BTreeSet;
 
@@ -50,7 +55,8 @@ impl Rule for BaselineDeviationRule {
                             "sample metric '{}' is outside expected baseline",
                             sample.metric
                         ),
-                        ctx.now,
+                        // Samplezeit, nicht `ctx.now` — siehe Moduldoku.
+                        sample.observed_at,
                     ));
                 }
                 Err(BaselineError::MissingBaseline) => continue,
@@ -164,6 +170,35 @@ mod tests {
             BaselineDeviationRule.evaluate(&ctx),
             BaselineDeviationRule.evaluate(&ctx)
         );
+        Ok(())
+    }
+
+    /// PL-100 WP0.2: der Befund trägt die Zeit des abweichenden Samples,
+    /// nicht die Auswertungszeit.
+    #[test]
+    fn test_finding_is_stamped_with_the_sample_time_not_ctx_now() -> TestResult {
+        let sample_time: Timestamp = "2026-11-08T08:00:00Z"
+            .parse()
+            .map_err(ctx("Samplezeit"))?;
+        let now: Timestamp = "2026-11-08T08:10:00Z"
+            .parse()
+            .map_err(ctx("Auswertungszeit"))?;
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).map_err(ctx("gültige Baseline"))?;
+        let mut deviating = sample("cpu-load", 99.9);
+        deviating.observed_at = sample_time;
+        let samples = vec![deviating];
+        let scope = NetworkScope::empty();
+        let baselines = [baseline];
+        let mut rule_ctx = ctx_with(&samples, &baselines, &scope);
+        rule_ctx.now = now;
+
+        let stamps: Vec<Timestamp> = BaselineDeviationRule
+            .evaluate(&rule_ctx)
+            .iter()
+            .map(Finding::observed_at)
+            .collect();
+        assert_eq!(stamps, vec![sample_time]);
         Ok(())
     }
 }

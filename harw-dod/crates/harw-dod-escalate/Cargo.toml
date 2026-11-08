@@ -20,9 +20,12 @@ serde = { workspace = true }
 # diese Crate erzeugt keine Aktionstypen, sie autorisiert nur bereits von
 # `harw-dod-warden-proto` deklarierte.
 harw-macros = { path = "../../../harw-macros" }
-# `Finding<Triaged>`, `Finding<RuleChecked>`, `Verdict`, `triage` — die
+# `Finding<Triaged>`, `Finding<RuleChecked>`, `Verdict`, `triage_record` — die
 # Berechtigung, ein `Finding<Triaged>` zu besitzen, kann ausschließlich diese
-# Crate herstellen (siehe `lib.rs`-Moduldoku).
+# Crate herstellen (siehe `lib.rs`-Moduldoku). Bewusst **ohne** das Feature
+# `operator-decision`: das darf nur `harw-escalator` einschalten (PL-100
+# WP0.11, xtask-Gate `operator-decision`); diese Bibliothek bekommt über
+# `triage_record` nie ein bestätigtes Modell-Urteil.
 harw-dod-rules = { path = "../harw-dod-rules" }
 # `Severity`/`Hardness` — Felder von `Finding<S>`, auf denen `Ladder::stage_for`
 # die Aufstiegsregel auswertet. Keine zusätzliche Gewichtsklasse: `harw-dod-rules`

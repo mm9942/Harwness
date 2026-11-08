@@ -74,8 +74,11 @@
 //! use harw_dod_rules::advisory::{Advisory, correlate_advisories};
 //! use harw_dod_rules::rule::{Rule, RuleContext};
 //! use harw_dod_rules::rules::EgressFlowRule;
-//! use harw_dod_rules::{FindingKind, run_rules, run_rules_checked, triage, Verdict};
-//! use harw_dod_signals::{EventKind, SecurityEvent, Severity};
+//! use harw_dod_rules::{FindingKind, run_rules, run_rules_checked, triage_record, Verdict};
+//! use harw_dod_signals::{
+//!     EventKind, SecurityEvent, SecurityEvidence, SecurityVerdict, Severity,
+//!     VerdictClassification,
+//! };
 //! use harw_types::SensorId;
 //! use semver::VersionReq;
 //!
@@ -109,7 +112,8 @@
 //! let checked = run_rules_checked(&ctx);
 //! assert!(checked.iter().any(|f| f.rule_id() == EgressFlowRule.id()));
 //!
-//! // 3. Einen geprüften Befund triagieren.
+//! // 3. Einen geprüften Befund einfrieren und mit einem an den Record
+//! //    gebundenen Modell-Verdikt triagieren.
 //!
 //! let locked = vec![LockedPackage {
 //!     name: "example-crate".to_owned(),
@@ -130,8 +134,22 @@
 //!     .into_iter()
 //!     .next()
 //!     .expect("Advisory trifft");
-//! let triaged = triage(finding, Verdict::Confirmed);
-//! assert_eq!(*triaged.verdict(), Verdict::Confirmed);
+//! let evidence = SecurityEvidence::capture(vec![], vec![], jiff::Timestamp::UNIX_EPOCH)
+//!     .expect("Beleg kodierbar");
+//! let record = finding.record(evidence);
+//! let verdict = SecurityVerdict::new(
+//!     record.finding_id().clone(),
+//!     record.digest(),
+//!     VerdictClassification::Confirmed,
+//!     Severity::High,
+//!     "verwundbare Version im Lockfile".to_owned(),
+//!     None,
+//!     "security-triage-1".to_owned(),
+//!     jiff::Timestamp::UNIX_EPOCH,
+//! );
+//! let triaged = triage_record(&record, &verdict).expect("Verdikt gebunden");
+//! // Modelle bestätigen nie (PL-100 WP0.11): `Confirmed` wird gedeckelt.
+//! assert_eq!(*triaged.verdict(), Verdict::NeedsReview);
 //! ```
 //!
 //! # Stand
@@ -152,7 +170,19 @@ pub use advisory::{Advisory, correlate_advisories};
 pub use baseline::{Baseline, PalaceStatus, finding_kind_for_status};
 pub use confidence::epistemic_confidence_for;
 pub use engine::{run_rules, run_rules_checked};
-pub use finding::{Finding, FindingKind, Raw, RuleChecked, Triaged, Verdict, triage};
+pub use finding::{
+    Finding, FindingKind, FindingRecord, RecordError, Raw, RuleChecked, TriageError, Triaged,
+    Verdict, triage_record,
+};
+// Die Entscheidung eines Menschen (PL-100 WP0.11): nur mit dem Feature
+// `operator-decision`, das ausschließlich `harw-escalator` einschalten darf
+// (xtask-Gate `operator-decision`).
+#[cfg(any(test, feature = "operator-decision"))]
+pub use finding::{OperatorDecision, triage_record_operator};
+// Ungebundene Triage mit frei wählbarem Urteil — nur für Tests (siehe
+// `finding.rs`-Moduldoku, „Modelle beraten, Menschen bestätigen").
+#[cfg(any(test, feature = "test-support"))]
+pub use finding::triage;
 // Nur für Tests abhängiger Crates (Feature `test-support`, z. B. von
 // `harw-dod-escalate`s `Ladder`-Tests genutzt) — siehe `finding.rs`-Moduldoku
 // zu `triaged_finding_for_test` für die Begründung und die geschützte

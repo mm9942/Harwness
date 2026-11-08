@@ -333,13 +333,13 @@ fn is_format(ch: char) -> bool {
 fn is_bidi_control(ch: char) -> bool {
     matches!(
         ch,
-        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        '\u{061C}' | '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
     )
 }
 
 // `Zl` und `Zp`.
 fn is_separator(ch: char) -> bool {
-    matches!(ch, '\u{2028}' | '\u{2029}')
+    matches!(ch, '\u{2028}'..='\u{2029}')
 }
 
 // Variation Selectors (Block FE00–FE0F und Ergänzung E0100–E01EF).
@@ -371,12 +371,9 @@ fn is_unassigned_approx(ch: char) -> bool {
 }
 
 // Jeder Zeilenumbruch, den ein Terminal oder ein Renderer als neue Zeile
-// darstellen kann.
+// darstellen kann: LF, VT, FF, CR (U+000A–U+000D), NEL, U+2028, U+2029.
 fn is_line_break(ch: char) -> bool {
-    matches!(
-        ch,
-        '\n' | '\u{000B}' | '\u{000C}' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}'
-    )
+    matches!(ch, '\n'..='\r' | '\u{0085}' | '\u{2028}'..='\u{2029}')
 }
 
 #[cfg(test)]
@@ -446,17 +443,16 @@ mod tests {
 
     #[test]
     fn test_every_bidi_control_is_escaped_visibly() -> TestResult {
-        let bidi = ['\u{061C}', '\u{200E}', '\u{200F}']
+        let bidi: Vec<char> = ['\u{061C}', '\u{200E}', '\u{200F}']
             .into_iter()
             .chain('\u{202A}'..='\u{202E}')
-            .chain('\u{2066}'..='\u{2069}');
-        let mut count = 0_usize;
+            .chain('\u{2066}'..='\u{2069}')
+            .collect();
+        assert_eq!(bidi.len(), 12);
         for ch in bidi {
             assert!(needs_escape(ch), "{ch:?}");
             assert_eq!(escape(&ch.to_string(), 64), escape_char(ch));
-            count = count.saturating_add(1);
         }
-        assert_eq!(count, 12);
         assert_eq!(escape("admin\u{202E}gpj.exe", 64), "admin\\u{202e}gpj.exe");
         assert_eq!(escape("\u{2066}x\u{2069}", 64), "\\u{2066}x\\u{2069}");
         Ok(())

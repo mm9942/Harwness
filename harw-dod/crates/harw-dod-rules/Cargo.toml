@@ -68,6 +68,16 @@ harw-knowledge = { path = "../../../harw-knowledge" }
 # Konsumenten. Siehe `src/finding.rs`-Moduldoku, Abschnitt „Der Besitz des
 # Wertes ist die Berechtigung", für die dadurch unangetastete Invariante.
 test-support = []
+# PL-100 WP0.11 (Leitprinzip I1): schaltet `OperatorDecision` und
+# `triage_record_operator` frei — den einzigen produktiven Weg zu einem
+# `Verdict::Confirmed`. Modelle bestätigen nie (`triage_record` deckelt ein
+# Modell-`Confirmed` auf `NeedsReview`); bestätigen kann nur ein Mensch über
+# den Escalator. Deshalb darf **ausschließlich `harw-escalator`** dieses
+# Feature einschalten; das xtask-Gate `operator-decision`
+# (`xtask/src/gate_operator_decision.rs`) lässt jede andere Crate, die es
+# anfordert (direkt, über `[features]` oder über eine Workspace-Abhängigkeit),
+# rot werden. Kein anderes Feature dieser Crate darf es mit einschalten.
+operator-decision = []
 
 [lints]
 workspace = true

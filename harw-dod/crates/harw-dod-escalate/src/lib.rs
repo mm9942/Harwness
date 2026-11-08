@@ -112,7 +112,7 @@ pub use error::{EscalateError, EscalateResult};
 pub use freeze_ops::{
     authorize_freeze, authorize_release, authorize_stage_gated, reconcile_expired_freezes,
 };
-pub use harw_dod_rules::{Finding, RuleChecked, Triaged, Verdict, triage};
+pub use harw_dod_rules::{Finding, RuleChecked, Triaged, Verdict, triage_record};
 pub use ladder::Ladder;
 pub use submission::{
     SubmissionError, SubmissionResult, TRIAGE_SUBMISSION_VERSION, TriageSubmission,
