@@ -1,0 +1,48 @@
+[package]
+name = "harw-probe-netlink"
+description = "Privileged audit netlink probe: forwards login records as AuthEvent to harw-sentinel, push-only"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Der Audit-Netlink-Socket (`socket::NetlinkAuditSource`, nur Linux, braucht
+# CAP_AUDIT_READ), `AuditSource`, `RawRecord` und `NetlinkError`. Das Lesen
+# vom Kernel liegt dort, nicht in dieser Crate (siehe `src/push_only_guard.rs`).
+harw-dod-netlink = { path = "../harw-dod-netlink" }
+# Die eine Umwandlungsregel Record -> AuthRecord -> SecurityEvent
+# (`auth_record_from_raw`, `auth_record_to_event`), statt einer Kopie.
+harw-dod-authlog = { path = "../harw-dod-authlog" }
+# `SensorError` für den Nicht-Linux-Pfad von `main::open_audit_source`.
+harw-dod-cap = { path = "../harw-dod-cap" }
+# Datenvokabular: `SecurityEvent`, `EventKind`.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# Kennungen: `SensorId`.
+harw-types = { path = "../../../harw-types" }
+jiff = { workspace = true }
+tracing = { workspace = true }
+# Version identisch zu `harw-probe-bpf`/`harw-probe-fs` — ein Sink für
+# `tracing`, keine Zweitwahl je Binary.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# `--log`-Grammatik; dieselbe Fassung wie `harw-completions`.
+clap = { version = "4.6.7", features = ["derive"] }
+# `completions`-Unterbefehl (Skriptausgabe und verwaltete Installation),
+# wie bei den anderen Sonden.
+harw-completions = { path = "../../../harw-completions", features = ["clap-args"] }
+# Sicherer `SOCK_SEQPACKET`-Unix-Socket ohne `unsafe` (`net`-Feature) für den
+# Sendeweg zum Sentinel — dieselbe Fassung wie `harw-probe-bpf::sink`.
+rustix = { workspace = true, features = ["net"] }
+# Sichere Landlock-Bindung; dieselbe Fassung wie die übrigen Sonden.
+landlock = { workspace = true }
+# Wire-Kodierung für `harw_dod_signals::SecurityEvent` auf dem Sendeweg zum
+# Sentinel — derselbe Vertrag, den `harw-sentinel::ipc` voraussetzt.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
+
+[lints]
+workspace = true

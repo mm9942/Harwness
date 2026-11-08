@@ -10,8 +10,10 @@
 //! Schritt für einen Konsumenten ist, aus einem `AuthRecord` und einer
 //! `harw_types::SensorId` ein `harw_dod_signals::SecurityEvent` mit
 //! `EventKind::AuthEvent { outcome }` zu bauen — das geschieht bewusst
-//! **nicht** hier, weil diese Crate keine `SensorId` besitzt (sie liegt beim
-//! aufrufenden Sensor/Sentinel, nicht beim Backend).
+//! **nicht** an diesem Typ, weil das Backend keine `SensorId` besitzt (sie
+//! liegt beim aufrufenden Sensor bzw. bei der Sonde). Die Abbildung selbst
+//! ist [`crate::sensor::auth_record_to_event`], die `SensorId` übergibt der
+//! Aufrufer.
 //!
 //! # Nebenläufigkeit
 //! Reiner, unveränderlicher Werttyp: `Send + Sync` automatisch, kein
@@ -35,7 +37,7 @@
 //!     },
 //!     outcome: AuthOutcome::Success,
 //! };
-//! assert_ne!(record.actor.uid, record.actor.auid.unwrap());
+//! assert_ne!(Some(record.actor.uid), record.actor.auid);
 //! ```
 
 use harw_dod_signals::{Actor, AuthOutcome};

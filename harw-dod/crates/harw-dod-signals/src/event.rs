@@ -392,6 +392,15 @@ pub enum EventKind {
         port: u16,
     },
     /// Ein Anmeldeversuch wurde beobachtet.
+    ///
+    /// **Kein Eins-zu-eins mit Versuchen:** ein einzelner Anmeldeversuch
+    /// ergibt je nach Quelle mehrere `AuthEvent`s mit demselben `outcome` —
+    /// bei Audit-Records etwa ein PAM-`USER_AUTH` und ein `USER_LOGIN` des
+    /// Dienstes, bei `sshd` zusätzlich eines je gescheiterter Methode. Der
+    /// `actor` ist der meldende Dienst (bei `sshd` meist `uid` 0), nicht das
+    /// Zielkonto. Eine Regel, die gescheiterte Anmeldungen zählt, muss mit
+    /// dieser Vielfachheit rechnen und darf `uid == 0` nicht als „Anmeldung
+    /// als root" lesen (siehe `harw_dod_authlog::LOGIN_RECORD_TYPES`).
     AuthEvent {
         /// Erfolg oder Fehlschlag der Anmeldung.
         outcome: AuthOutcome,

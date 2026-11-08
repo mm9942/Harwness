@@ -54,10 +54,9 @@
 //! );
 //!
 //! assert_eq!(backend.capability(), Capability::ReadJournal);
-//! let events = backend
-//!     .read_events(jiff::Timestamp::UNIX_EPOCH)
-//!     .expect("Fixture scheitert nie");
+//! let events = backend.read_events(jiff::Timestamp::UNIX_EPOCH)?;
 //! assert_eq!(events.len(), 1);
+//! # Ok::<(), harw_dod_authlog::AuthlogError>(())
 //! ```
 
 use jiff::Timestamp;
@@ -136,7 +135,7 @@ impl AuthBackend for FixtureAuthBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestResult, ctx, missing};
     use harw_dod_signals::{Actor, AuthOutcome};
 
     fn record(
@@ -182,9 +181,8 @@ mod tests {
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
             .map_err(ctx("Fixture scheitert nie"))?;
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].outcome, AuthOutcome::Success);
-        assert_eq!(events[1].outcome, AuthOutcome::Failure);
+        let outcomes: Vec<AuthOutcome> = events.iter().map(|event| event.outcome).collect();
+        assert_eq!(outcomes, vec![AuthOutcome::Success, AuthOutcome::Failure]);
         Ok(())
     }
 
@@ -197,7 +195,8 @@ mod tests {
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
             .map_err(ctx("Fixture scheitert nie"))?;
-        assert_eq!(events[0].actor.auid, None);
+        let event = events.first().ok_or_else(missing("ein Ereignis"))?;
+        assert_eq!(event.actor.auid, None);
         Ok(())
     }
 
@@ -210,7 +209,8 @@ mod tests {
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
             .map_err(ctx("Fixture scheitert nie"))?;
-        assert_eq!(events[0].actor.auid, Some(0));
+        let event = events.first().ok_or_else(missing("ein Ereignis"))?;
+        assert_eq!(event.actor.auid, Some(0));
         Ok(())
     }
 
@@ -223,8 +223,9 @@ mod tests {
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
             .map_err(ctx("Fixture scheitert nie"))?;
-        assert_eq!(events[0].actor.uid, 0);
-        assert_eq!(events[0].actor.auid, Some(1000));
+        let event = events.first().ok_or_else(missing("ein Ereignis"))?;
+        assert_eq!(event.actor.uid, 0);
+        assert_eq!(event.actor.auid, Some(1000));
         Ok(())
     }
 
@@ -242,7 +243,8 @@ mod tests {
             .read_events(since)
             .map_err(ctx("Fixture scheitert nie"))?;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].observed_at.as_second(), 2000);
+        let event = events.first().ok_or_else(missing("ein Ereignis"))?;
+        assert_eq!(event.observed_at.as_second(), 2000);
         Ok(())
     }
 

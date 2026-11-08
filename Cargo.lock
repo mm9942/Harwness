@@ -2714,6 +2714,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-dod-advisory"
+version = "0.10.0"
+dependencies = [
+ "harw-dod-cap",
+ "harw-dod-readfs",
+ "harw-dod-signals",
+ "harw-macros",
+ "harw-test-support",
+ "harw-types",
+ "harw-untrusted-text",
+ "jiff",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
 name = "harw-dod-authlog"
 version = "0.10.0"
 dependencies = [
@@ -4101,6 +4120,26 @@ dependencies = [
  "rustix 1.1.5",
  "serde_json",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "harw-probe-netlink"
+version = "0.10.0"
+dependencies = [
+ "clap",
+ "harw-completions",
+ "harw-dod-authlog",
+ "harw-dod-cap",
+ "harw-dod-netlink",
+ "harw-dod-signals",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "landlock",
+ "rustix 1.1.5",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

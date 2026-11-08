@@ -100,13 +100,25 @@
 //! inhaltlich richtige Ersatz.
 //!
 //! # Der Inhalt bleibt heikel
-//! `SensorReading::samples` bleibt leer — Anmeldungen sind Ereignisse, keine
-//! Messwerte (siehe `harw_dod_signals::sample`-Moduldoku für die Trennung).
-//! Jedes erzeugte `SecurityEvent` trägt `actor: Some(...)`, nie einen
-//! Benutzer-, Host- oder Terminalnamen (siehe Crate-Dokumentation).
+//! Anmeldungen sind Ereignisse, keine Messwerte (siehe
+//! `harw_dod_signals::sample`-Moduldoku für die Trennung).
+//! `SensorReading::samples` bleibt deshalb leer — mit einer Ausnahme: hat
+//! das Backend in diesem Abruf fehlerhafte Records übersprungen
+//! ([`crate::backend::AuthBatch::malformed`]), meldet der Abruf genau ein
+//! Sample [`MALFORMED_RECORDS_METRIC`] mit deren Anzahl, damit ein kaputter
+//! Datenstrom nicht still blind macht. Jedes erzeugte `SecurityEvent` trägt
+//! `actor: Some(...)`, nie einen Benutzer-, Host- oder Terminalnamen (siehe
+//! Crate-Dokumentation).
+//!
+//! # Die Abbildung auf `SecurityEvent`
+//! [`auth_record_to_event`] ist die eine Stelle, an der ein
+//! [`crate::record::AuthRecord`] zu einem `SecurityEvent` mit
+//! `EventKind::AuthEvent { outcome }` wird — öffentlich, weil
+//! `harw-probe-netlink` dieselbe Abbildung für seinen Datenstrom braucht.
 //!
 //! # Exportierte Typen
-//! [`AuthlogSensor`], [`DEFAULT_LOOKBACK`].
+//! [`AuthlogSensor`], [`DEFAULT_LOOKBACK`], [`MALFORMED_RECORDS_METRIC`], die
+//! freie Funktion [`auth_record_to_event`].
 //!
 //! # Nebenläufigkeit
 //! `AuthlogSensor: Send + Sync + Debug` (Anforderung von
@@ -140,19 +152,94 @@
 //! );
 //! let sensor = AuthlogSensor::new(handle, Box::new(backend));
 //!
-//! let reading = sensor.poll(Timestamp::UNIX_EPOCH).expect("Fixture scheitert nie");
+//! let reading = sensor.poll(Timestamp::UNIX_EPOCH)?;
 //! assert!(reading.samples.is_empty());
 //! assert_eq!(reading.events.len(), 1);
+//! # Ok::<(), harw_dod_cap::SensorError>(())
 //! ```
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use harw_dod_cap::{Bound, SensorError, SensorHandle};
-use harw_dod_signals::{EventKind, SecurityEvent, Sensor, SensorReading};
+use harw_dod_signals::{EventKind, HostSample, SecurityEvent, Sensor, SensorReading};
+use harw_types::SensorId;
 use jiff::Timestamp;
 
 use crate::backend::AuthBackend;
 use crate::error::AuthlogError;
+use crate::record::AuthRecord;
+
+/// Metrik-Kürzel für die Zahl übersprungener, fehlerhafter Records eines
+/// Abrufs.
+///
+/// # Description
+/// Nur gemeldet, wenn ein Abruf mindestens einen Record übersprungen hat
+/// (siehe Moduldokumentation, Abschnitt „Der Inhalt bleibt heikel").
+///
+/// # Examples
+/// ```rust
+/// assert_eq!(
+///     harw_dod_authlog::MALFORMED_RECORDS_METRIC,
+///     "authlog.malformed_records"
+/// );
+/// ```
+pub const MALFORMED_RECORDS_METRIC: &str = "authlog.malformed_records";
+
+/// Bildet ein Anmeldeereignis auf ein `SecurityEvent` ab.
+///
+/// # Description
+/// `observed_at` und `actor` werden unverändert übernommen, das Ergebnis
+/// wird zu `EventKind::AuthEvent { outcome }`. Die `SensorId` kommt vom
+/// Aufrufer, weil das Backend keine besitzt (siehe `crate::record`).
+///
+/// Ein Ereignis je Record, nicht je Anmeldeversuch: ein Versuch ergibt
+/// meist mehrere (`USER_AUTH` plus `USER_LOGIN`, bei `sshd` zusätzlich
+/// eines je gescheiterter Methode), und `actor` ist der meldende Dienst,
+/// nicht das Zielkonto — siehe [`crate::LOGIN_RECORD_TYPES`].
+///
+/// # Arguments
+/// - `sensor` (`&harw_types::SensorId`): der meldende Sensor.
+/// - `record` (`AuthRecord`): das Anmeldeereignis.
+///
+/// # Returns
+/// Das `SecurityEvent` mit `actor: Some(record.actor)`.
+///
+/// # Concurrency
+/// Reine Funktion.
+///
+/// # Examples
+/// ```rust
+/// use harw_dod_authlog::{AuthRecord, auth_record_to_event};
+/// use harw_dod_signals::{Actor, AuthOutcome, EventKind};
+/// use harw_types::SensorId;
+///
+/// let event = auth_record_to_event(
+///     &SensorId::from_str("probe-netlink-auth-0"),
+///     AuthRecord {
+///         observed_at: jiff::Timestamp::UNIX_EPOCH,
+///         actor: Actor { uid: 0, auid: Some(1000), cgroup: None, process: None },
+///         outcome: AuthOutcome::Failure,
+///     },
+/// );
+/// assert!(matches!(event.kind, EventKind::AuthEvent { outcome: AuthOutcome::Failure }));
+/// ```
+#[must_use]
+pub fn auth_record_to_event(sensor: &SensorId, record: AuthRecord) -> SecurityEvent {
+    SecurityEvent {
+        sensor: sensor.clone(),
+        observed_at: record.observed_at,
+        actor: Some(record.actor),
+        kind: EventKind::AuthEvent {
+            outcome: record.outcome,
+        },
+    }
+}
+
+/// Wandelt eine Anzahl in einen Messwert, an `u32::MAX` gesättigt.
+fn count_as_value(count: usize) -> f64 {
+    f64::from(u32::try_from(count).unwrap_or(u32::MAX))
+}
 
 /// Vorgabe-Rückschaufenster: **fünf Minuten**.
 ///
@@ -285,12 +372,14 @@ impl Sensor for AuthlogSensor {
     }
 
     /// Fragt das gehaltene Backend über `[now - lookback, ..]` ab und bildet
-    /// jedes [`crate::record::AuthRecord`] auf ein `SecurityEvent` mit
-    /// `EventKind::AuthEvent { outcome }` ab.
+    /// jedes [`crate::record::AuthRecord`] über [`auth_record_to_event`] auf
+    /// ein `SecurityEvent` mit `EventKind::AuthEvent { outcome }` ab. Hat das
+    /// Backend fehlerhafte Records übersprungen, kommt genau ein Sample
+    /// [`MALFORMED_RECORDS_METRIC`] mit `observed_at = now` hinzu.
     ///
     /// # Errors
     /// `harw_dod_cap::SensorError`, entpackt aus [`AuthlogError`], wenn das
-    /// Backend nicht lesbar ist oder eine unerwartete Form liefert.
+    /// Backend als Ganzes nicht lesbar ist.
     fn poll(&self, now: Timestamp) -> Result<SensorReading, SensorError> {
         // `jiff::Timestamp::saturating_sub` liefert entgegen seinem Namen ein
         // `Result`: es scheitert, wenn die Negation der Dauer überläuft
@@ -307,24 +396,25 @@ impl Sensor for AuthlogSensor {
         let since = now
             .saturating_sub(self.lookback)
             .unwrap_or(jiff::Timestamp::MIN);
-        let records = self.backend.read_events(since).map_err(into_sensor_error)?;
+        let batch = self.backend.read_batch(since).map_err(into_sensor_error)?;
 
-        let events = records
-            .into_iter()
-            .map(|record| SecurityEvent {
+        let samples = if batch.malformed > 0 {
+            vec![HostSample {
                 sensor: self.handle.id().clone(),
-                observed_at: record.observed_at,
-                actor: Some(record.actor),
-                kind: EventKind::AuthEvent {
-                    outcome: record.outcome,
-                },
-            })
+                observed_at: now,
+                metric: Cow::Borrowed(MALFORMED_RECORDS_METRIC),
+                value: count_as_value(batch.malformed),
+            }]
+        } else {
+            Vec::new()
+        };
+        let events = batch
+            .records
+            .into_iter()
+            .map(|record| auth_record_to_event(self.handle.id(), record))
             .collect();
 
-        Ok(SensorReading {
-            samples: Vec::new(),
-            events,
-        })
+        Ok(SensorReading { samples, events })
     }
 }
 
@@ -343,12 +433,12 @@ fn into_sensor_error(err: AuthlogError) -> SensorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit_backend::AuditBackend;
     use crate::fixture_backend::FixtureAuthBackend;
-    use crate::record::AuthRecord;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestResult, ctx, missing};
     use harw_dod_cap::{Capability, ReadScope};
+    use harw_dod_netlink::{FixtureAuditSource, RawRecord};
     use harw_dod_signals::{Actor, AuthOutcome};
-    use harw_types::SensorId;
 
     fn handle_with(capability: Capability) -> SensorHandle<Bound> {
         SensorHandle::new(SensorId::from_str("authlog-test"), capability)
@@ -401,7 +491,7 @@ mod tests {
         assert!(reading.samples.is_empty());
         assert_eq!(reading.events.len(), 1);
 
-        let event = &reading.events[0];
+        let event = reading.events.first().ok_or_else(missing("ein Ereignis"))?;
         assert!(matches!(
             event.kind,
             EventKind::AuthEvent {
@@ -411,9 +501,7 @@ mod tests {
         let actor = event
             .actor
             .as_ref()
-            .ok_or(crate::test_support::TestError::Missing(
-                "actor muss gesetzt sein",
-            ))?;
+            .ok_or_else(missing("actor muss gesetzt sein"))?;
         assert_eq!(actor.uid, 0);
         assert_eq!(actor.auid, Some(1000));
         Ok(())
@@ -487,7 +575,78 @@ mod tests {
 
         assert_eq!(first_poll.events.len(), 1);
         assert_eq!(second_poll.events.len(), 1);
-        assert_eq!(first_poll.events[0], second_poll.events[0]);
+        assert_eq!(first_poll.events.first(), second_poll.events.first());
         Ok(())
+    }
+
+    #[test]
+    fn test_auth_record_to_event_keeps_time_actor_and_outcome() -> TestResult {
+        let record = auth_record(1_000, 0, Some(1000), AuthOutcome::Failure)?;
+        let sensor = SensorId::from_str("probe-netlink-auth-0");
+        let event = auth_record_to_event(&sensor, record.clone());
+        assert_eq!(event.sensor, sensor);
+        assert_eq!(event.observed_at, record.observed_at);
+        assert_eq!(event.actor, Some(record.actor));
+        assert_eq!(
+            event.kind,
+            EventKind::AuthEvent {
+                outcome: AuthOutcome::Failure
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_poll_reports_malformed_records_as_one_sample_and_keeps_good_events() -> TestResult {
+        let backend = AuditBackend::new(Box::new(FixtureAuditSource::new([
+            RawRecord::new("type=USER_LOGIN auid=not-a-number"),
+            RawRecord::from_netlink(
+                1112,
+                "audit(1699999999.123:456): pid=4242 uid=0 auid=1000 msg='op=login res=success'",
+            ),
+            RawRecord::from_netlink(1100, "audit(notanumber.1:2): pid=1"),
+        ])));
+        let sensor = AuthlogSensor::with_lookback(
+            handle_with(Capability::ReadAuditNetlink),
+            Box::new(backend),
+            Duration::from_secs(3600),
+        );
+        let now = Timestamp::new(1_700_000_000, 0).map_err(ctx("gültiger Zeitstempel"))?;
+
+        let reading = sensor.poll(now).map_err(ctx("Quelle ist lesbar"))?;
+
+        assert_eq!(reading.events.len(), 1);
+        assert_eq!(reading.samples.len(), 1);
+        let sample = reading.samples.first().ok_or_else(missing("ein Sample"))?;
+        assert_eq!(sample.metric, MALFORMED_RECORDS_METRIC);
+        assert_eq!(sample.observed_at, now);
+        assert!((sample.value - 2.0).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn test_poll_without_malformed_records_has_no_sample() -> TestResult {
+        let backend = AuditBackend::new(Box::new(FixtureAuditSource::new([
+            RawRecord::from_netlink(
+                1112,
+                "audit(1699999999.123:456): pid=4242 uid=0 auid=1000 msg='op=login res=success'",
+            ),
+        ])));
+        let sensor = AuthlogSensor::with_lookback(
+            handle_with(Capability::ReadAuditNetlink),
+            Box::new(backend),
+            Duration::from_secs(3600),
+        );
+        let now = Timestamp::new(1_700_000_000, 0).map_err(ctx("gültiger Zeitstempel"))?;
+        let reading = sensor.poll(now).map_err(ctx("Quelle ist lesbar"))?;
+        assert!(reading.samples.is_empty());
+        assert_eq!(reading.events.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_as_value_saturates() {
+        assert!((count_as_value(3) - 3.0).abs() < f64::EPSILON);
+        assert!((count_as_value(usize::MAX) - f64::from(u32::MAX)).abs() < f64::EPSILON);
     }
 }
