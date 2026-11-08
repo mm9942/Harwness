@@ -79,7 +79,7 @@
 4a. Eine Freigabe gilt nur für den `proposal_digest`, den die vertrauenswürdige Oberfläche angezeigt hat. Ein kompromittierter TUI-Prozess kann weder
     den Vorschlag austauschen noch den Bestätigungstext stellen. Kill/Isolate im Same-TTY-Modus werden abgelehnt (Regressionstest).
 5. Kein untrusted Byte erscheint in Templates, Hinweisen oder auf dem Approver-Bildschirm; DoD-Daten lösen keinen Auto-Turn aus.
-6. Ein Triage-Kind hat genau `DOD_TRIAGE_TOOLS`, Tiefe 0, und steht nicht in `BackgroundChildren`.
+6. Ein Triage-Kind hat genau `DOD_TRIAGE_ROLE_TOOLS` (`DOD_READ_TOOLS` + `DOD_TRIAGE_TOOLS`), Tiefe 0, und steht nicht in `BackgroundChildren`.
 7. Ohne `[dod.triage].model` läuft keine automatische Triage, und es gibt keinen Rückfall auf das Session-Modell.
 8. Ein Sturm mit 10 000 Befunden hält das Budget ein, ohne High+Observed-Befunde anderer Partitionen zu verdrängen.
 9. Unterdrückung gibt es nur durch signierte, ablaufende Labels.

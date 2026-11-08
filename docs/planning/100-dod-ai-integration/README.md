@@ -106,7 +106,7 @@ harw-dod-dispatch (pure, Ring A): RouteTable · PartitionedBudget · PriorityQue
 DodWatch (genau ein Dispatcher je Host; Gateway-Task oder TUI; mode = off | notify | triage)
   ├─ deterministischer Hinweis je High: TUI-Systemzeile, Gateway-Text, Mission Control
   └─ DodTriageSpawner (eigener Spawner, NICHT BackgroundChildren)
-       security-*-triage (NoTools + DOD_TRIAGE_TOOLS, depth 0, Modell = [dod.triage].model)
+       security-*-triage (NoTools + DOD_TRIAGE_ROLE_TOOLS, depth 0, Modell = [dod.triage].model)
        → accept_security_verdict(): parse · cap(2 KiB) · escape · bind(record_digest) → VerdictStore
        → Contain auf zulässiges Ziel → TriageSubmission (IDs, Enums, Verdict-Digest)
                                                          │ Unix-Socket, Peer = harw-uid
@@ -226,8 +226,9 @@ Er darf deshalb weder die Anzeige noch die Bestätigungseingabe stellen.
   - neue Felder `record_digest`, `dedup_key`, `occurrences`, `first_seen`, `kind`, `hardness`, `cgroup_kid`, `scope_obfuscated` sowie die Verdict-Enums;
   - behebt den fehlenden Digest in `harw-ops/src/dod.rs:1263-1275`.
 
-  `DOD_TRIAGE_TOOLS` wird von `dod_tools_for_role` abgetrennt (`harw-registry-defaults/src/profile.rs:872-878`): `dod.finding{id}` (Evidence-Card),
-  `dod.related{dedup_key|cgroup_kid, hours}`, `dod.labels{dedup_key}`. **Root behält 3 Werkzeuge** (G1).
+  Neue Liste `DOD_TRIAGE_TOOLS` in `harw-registry-defaults/src/profile.rs`: `dod.finding{id}` (Evidence-Card),
+  `dod.related{dedup_key|cgroup_kid, hours}`, `dod.labels{dedup_key}`. Triage-Rollen erhalten über `dod_tools_for_role`
+  `DOD_TRIAGE_ROLE_TOOLS` (= `DOD_READ_TOOLS` + `DOD_TRIAGE_TOOLS`, 6 Werkzeuge). **Root behält 3 Werkzeuge** (G1).
 - **1.3** Kontextprogramm `agents/context-programs/security-triage.toml`, gilt für die vier Rollen, Golden-IR wird aktualisiert.
 - **1.4** Skill `harw-dod`: neuer Abschnitt „Verdict zurückgeben" mit Contract und Beispiel. **1.5** SkillInjector für Child-Sessions (PL-97 offen).
 - **1.6** Neue Regeln, `known_rule_id` und Kardinalitätsgrenze werden angepasst (`finding.rs:716-725`):
@@ -273,7 +274,7 @@ Er darf deshalb weder die Anzeige noch die Bestätigungseingabe stellen.
   - Unterdrückung nur mit Ablaufdatum.
   - Labels werden **vom Approver-Weg signiert** (polkit wie in §3.1) bzw. außerhalb des harw-Schreibbereichs gespeichert. So kann ein kompromittierter Job
     keine Befunde unterdrücken.
-- **2.6** `harw-runtime/tests/rights_matrix.rs`: Ein DodWatch-Kind hat genau `DOD_TRIAGE_TOOLS`, Tiefe 0, und steht nicht in `BackgroundChildren`.
+- **2.6** `harw-runtime/tests/rights_matrix.rs`: Ein DodWatch-Kind hat genau `DOD_TRIAGE_ROLE_TOOLS` (`DOD_READ_TOOLS` + `DOD_TRIAGE_TOOLS`), Tiefe 0, und steht nicht in `BackgroundChildren`.
 
 ### Phase 3 – Escalator und Freigabe
 
@@ -376,7 +377,7 @@ Voraussetzung ist PL-96 W01. 3.0 und 3.5 können sofort starten.
    3. Danach: v2-Signatur → Warden friert ein → Ack → Ledger. Der Timer taut auf, sofern du keine Verlängerung freigibst.
 3. **Datenabruf:**
    - Menschen nutzen `harw dod findings|verdicts|proposals`.
-   - Agenten nutzen in Root-Sessions `dod.findings` (3 Werkzeuge) und in Triage-Kindern `DOD_TRIAGE_TOOLS`.
+   - Agenten nutzen in Root-Sessions `dod.findings` (3 Werkzeuge) und in Triage-Kindern `DOD_TRIAGE_ROLE_TOOLS` (die 3 lesenden plus `dod.finding`, `dod.related`, `dod.labels`).
    - Den Spool liest nur der Escalator.
 
 ## 6. Entscheidungen (getroffen am 2026-11-08)
