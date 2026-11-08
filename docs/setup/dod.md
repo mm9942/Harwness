@@ -1,6 +1,6 @@
 # Harw-DoD (Detect · Orient · Defend)
 
-> Status: partially implemented · Last reviewed: 2026-10-29
+> Status: partially implemented · Last reviewed: 2026-11-08
 
 Harw-DoD (short: DoD) is Harwness's on-device observation-and-defense suite: it watches
 what is happening on the host around agent activity (process starts,
@@ -263,23 +263,45 @@ more.
 ## How it integrates with harw
 
 The main Harwness config carries a `[dod]` section
-(`harw-config/src/dod_toml.rs`) that is escalation *policy*, evaluated on
-the agent side — separate from DoD's own `/etc/harw-dod/config.toml`,
+(`harw-config/src/dod_toml.rs`) that holds advisory escalation settings for
+display and the doctor (not binding policy) — separate from DoD's own `/etc/harw-dod/config.toml`,
 which is the system-level sensor/profile configuration DoD itself reads.
+
+> **The escalation keys of `[dod]` are advisory.** `kill_requires_human`,
+> `auto_freeze`, `proof_key_dir` and `allowed_cgroup_prefixes` authorize,
+> enable or disable no action. The binding TCB policy lives only in
+> root-owned files under `/etc/harw-dod/` (see the end of this section).
+> Today only `allowed_cgroup_prefixes` is read outside config loading (by
+> the doctor, for its cgroup-root checks); `kill_requires_human` and
+> `auto_freeze` are validated or merged at load time and used for nothing
+> else (the doctor does not show `auto_freeze` today). `export_dir` is
+> different: harw's read-only posture and display path consumes it
+> (`harw-runtime/src/assembly.rs`, via the security-signals context
+> provider) to locate the sentinel exports. `findings_window_hours` is
+> validated at load time; no consumer outside config loading was found in
+> the code today, so it is configuration for that same display path.
+
+Components that do not exist yet are marked **planned (PL-100 Phase N)**
+(German: "geplant (PL-100 Phase N)"); the plan is in
+[`docs/planning/100-dod-ai-integration/`](../planning/100-dod-ai-integration/README.md).
+
 The `[dod]` section's defaults are deliberately restrictive
 ("secure/off"):
 
-- `kill_requires_human` — must be `true`; not negotiable, rejected in
-  every configuration layer if set to `false` (per the harness's
-  automation decision: freeze/release may be automatic after a signed
-  proof, kill never is without a human).
-- `auto_freeze` — whether freeze/release transitions happen automatically
-  after a signed proof (default `true`).
+- `kill_requires_human` — must be `true`; rejected in every configuration
+  layer if set to `false`. Advisory: it documents that a kill is never
+  taken without a human, but it is not what enforces that.
+- `auto_freeze` — **advisory only; no action depends on it** (default
+  `true`). It does not control automatic freezes: nothing freezes
+  automatically. A repository layer can only keep it at `true`, never
+  turn it off.
 - `proof_key_dir` — where the keys for `SignedAuthorization` verification
-  live; never inherited from an untrusted config layer.
+  live; never inherited from an untrusted config layer. Advisory; the
+  Warden/escalator use their own root-owned policy.
 - `allowed_cgroup_prefixes` — which cgroup path prefixes the escalation
   chain may address at all; an untrusted layer may only narrow this list,
-  never widen it. The one canonical form is an absolute path strictly
+  never widen it. Advisory; only the doctor reads it, the Warden/escalator
+  use their own root-owned policy. The one canonical form is an absolute path strictly
   below the cgroup2 mount (`/sys/fs/cgroup/<…>`, trailing `/` optional);
   a relative entry is rejected. `harw_config::dod_toml::warden_cgroup_id`
   converts an entry to the Warden's relative `CgroupId`
@@ -299,8 +321,110 @@ blank or non-canonical (relative, outside `/sys/fs/cgroup`)
 `findings_window_hours = 0` makes harw's config loading fail with a
 `[dod]: …` error instead of starting with that value.
 
-Enforcement itself lives entirely in the escalation/warden binaries; this
-config section only describes the policy they must honor.
+Enforcement itself lives entirely in the escalation/warden binaries, and
+their binding policy is **not** this section. It comes from root-owned
+files that harw cannot change:
+
+- `/etc/harw-dod/config.toml` — sensor/profile configuration, loaded with
+  `load_system_config` (requires root-trusted ownership of the path).
+- `/etc/harw-dod/warden.toml` — the Warden's own proof policy and deny
+  list; **planned (PL-100 Phase 3.1)**, it does not exist yet and the
+  Warden reads no policy file today.
+
+### Planned keys (PL-100)
+
+None of the following tables exists in the code yet. The `[dod]` table is
+parsed with `deny_unknown_fields`, so **adding `[dod.triage]`,
+`[dod.approve]` or `[dod.watch]` to a config today makes config loading
+fail**. Do not add them until the matching phase has shipped.
+
+`[dod.triage]` — **planned (PL-100 Phase 1.9; the triage run itself Phase
+2)**. The triage model is the owner's explicit choice:
+
+- `model` (`"<provider>/<model>"`), `effort`, `max_tokens`, `max_parallel`.
+- Set via the `/dod model set|show|clear` command or the TUI settings
+  (PL-100 Phase 1.9), or by editing the trusted config file.
+- Read from trusted layers only (home/profile). A repository layer can
+  neither set nor change the model.
+- Without a `model`, no automatic triage runs; the watch mode falls back
+  to `notify` with a clear notice. There is **no silent fallback to the
+  session model**.
+- `harw dod doctor` will show provider, model and locality (loopback or
+  Unix socket is local, anything else is remote). The locality is shown,
+  not enforced; with a remote model the provider sees bounded evidence
+  cards.
+
+`[dod.watch]` — **planned (PL-100 Phase 2.2)**:
+
+- `mode = "off" | "notify" | "triage"` (default `triage`). `notify` shows
+  deterministic notices only; `triage` additionally runs the triage model
+  (needs `[dod.triage].model`).
+- `autoconnect` — the `harw-dod-watch` systemd user unit connects to the
+  gateway on start. Default: on (README O5: the unit connects
+  automatically); the exact default and the behaviour of
+  `autoconnect = false` are not yet fixed (planned, PL-100 Phase 2.2). The
+  unit is planned too.
+- `[dod.dispatch] owner = true` — only one dispatcher per host (host
+  lock); **planned (PL-100 Phase 2.2)**.
+
+`[dod.approve]` — **planned (PL-100 Phase 3.3)**:
+
+- `tui_tty` (default `true`; written to `~/.harw/config.toml` by `install`
+  and `update`) allows an approval via `pkttyagent` in the TUI's own
+  terminal. A compromised harw can alter what that terminal displays, so
+  the binding to the shown proposal is weaker; the mode therefore covers
+  only the reversible actions freeze and thaw. Kill and isolation are
+  refused in this mode. The doctor and Mission Control label it as a
+  weaker binding.
+
+### Approval of interventions (planned, PL-100 Phase 3)
+
+No approval path exists today. Once built, a freeze, thaw, kill or
+isolation takes effect only after a human approval that a compromised harw
+cannot forge, bound to the escalator's proposal digest (action, target
+cgroup, kernel ID, finding ID, rule, severity, hold). Two paths:
+
+1. **Independent (path A, full guarantee).** The operator starts
+   `harw-dod-approve` themselves in a session harw does not control: their
+   own terminal window, another login, or SSH. It fetches proposals from
+   the escalator, shows typed and escaped fields (action, cgroup kid,
+   path, rule, severity, short hash, digest), asks the operator to type the
+   short hash and optionally a hold duration, and then polkit
+   `auth_admin` (no keep) follows. It refuses peers inside a harw agent
+   session or a `harw-job-*` scope. **Planned (PL-100 Phase 3.3).**
+2. **Started from the TUI (path B).** The TUI only sends
+   `RequestApproval{proposal_id}` to the escalator; harw starts no
+   `pkexec` and no dialog. The escalator calls polkit
+   `CheckAuthorization` with details taken from its own proposal (action,
+   cgroup, rule, short hash, digest) and the desktop's graphical polkit
+   agent renders them. A different `proposal_id` shows a different
+   dialog, so harw cannot misrepresent what is approved. This path has no
+   free-text input, so the hold is "until lifted"; set a hold duration via
+   path A. **Planned (PL-100 Phase 3.3).**
+
+**Kill and network isolation** are not part of the ordinary freeze
+approval: they need the separate polkit action
+`org.harw.dod.irreversible` and an explicit "irreversible" confirmation
+(`irreversible_ack`), and are never possible in the same-TTY mode.
+**Planned (PL-100 Phase 3.1 and 3.3).**
+
+Read-only companions: `harw dod proposals` and `harw dod frozen` (active
+freezes and isolations; **planned, PL-100 Phase 3.3**), `harw dod verdicts`
+(**planned, PL-100 Phase 2.4**).
+
+### Planned components at a glance
+
+| Component | State |
+|---|---|
+| `[dod.triage]`, `/dod model` | planned (PL-100 Phase 1.9) |
+| `DodWatch`, dispatch, `[dod.watch]`, `harw-dod-watch` user unit | planned (PL-100 Phase 2.1-2.2) |
+| Verdict store, `harw dod verdicts` | planned (PL-100 Phase 2.3-2.4) |
+| `harw-escalator` (today's crate: `harw-dod-escalate`), proposals | planned (PL-100 Phase 3.2) |
+| `warden.toml`, Warden deny list, kill/isolation with `irreversible_ack` | planned (PL-100 Phase 3.1) |
+| `harw-dod-approve`, `RequestApproval`, polkit actions, `[dod.approve]` | planned (PL-100 Phase 3.3) |
+| `harw dod proposals`, `harw dod frozen` | planned (PL-100 Phase 3.3) |
+| `security-hunter`, `/dod tune` | planned (PL-100 Phase 4) |
+| `harw dod warden enable/disable/status`, `/dod status`, `/dod view` | implemented |
 
 ### Observe harw jobs (PL-97 E3)
 
@@ -593,13 +717,18 @@ sudo harw dod warden enable   # or: sudo make -C harw-dod enable-warden
 ```
 
 This creates `/etc/harw-dod/warden.enable`, reloads systemd, and enables
-the socket. Even then, the actual authorization to freeze/kill/cut network
-still runs through the escalation policy in harw's own `[dod]` config (see
-[above](#how-it-integrates-with-harw)) — `kill_requires_human` cannot be
-turned off.
+the socket. Harw's own `[dod]` config (see
+[above](#how-it-integrates-with-harw)) authorizes nothing: it is advisory.
+The authorization path (independent `harw-dod-approve` or polkit via the
+escalator, see [above](#approval-of-interventions-planned-pl-100-phase-3))
+is **planned (PL-100 Phase 3.3)** and does not exist yet; the Warden's own
+policy file is **planned (PL-100 Phase 3.1)**.
 
 ## Current status and limitations (honest)
 
+- **PL-100 (AI triage, approval) is planned, not implemented.** The
+  `[dod.triage]`, `[dod.watch]` and `[dod.approve]` keys, the escalator
+  submission and the approval paths described above do not exist yet.
 - **The observation half (sentinel + probes) is what's live.** The
   escalation/warden chain is implemented as a library and a socket-
   activated binary, but is disabled by every default install path, as
