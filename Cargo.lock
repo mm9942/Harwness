@@ -2640,6 +2640,7 @@ dependencies = [
  "harw-session-store",
  "harw-tools",
  "harw-types",
+ "harw-untrusted-text",
  "jiff",
  "serde",
  "serde_json",
@@ -2787,6 +2788,7 @@ version = "0.10.0"
 dependencies = [
  "harw-dod-config",
  "harw-types",
+ "harw-untrusted-text",
  "rustix 1.1.5",
  "serde",
  "serde_json",
@@ -3009,6 +3011,7 @@ dependencies = [
  "harw-macros",
  "harw-test-support",
  "harw-types",
+ "harw-untrusted-text",
  "jiff",
  "tempfile",
 ]
@@ -3231,6 +3234,7 @@ dependencies = [
  "crypt_guard",
  "crypt_guard_hyper",
  "harw-secrets",
+ "harw-untrusted-text",
  "http",
  "http-body-util",
  "hyper",
@@ -3438,6 +3442,7 @@ name = "harw-killer"
 version = "0.10.0"
 dependencies = [
  "clap",
+ "harw-untrusted-text",
  "rustix 1.1.5",
  "serde",
  "serde_json",
@@ -3962,6 +3967,7 @@ dependencies = [
  "harw-tool-shell",
  "harw-tools",
  "harw-types",
+ "harw-untrusted-text",
  "harw-web",
  "jiff",
  "secrecy 0.8.0",
@@ -4055,8 +4061,11 @@ dependencies = [
  "jiff",
  "landlock",
  "rustix 1.1.5",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
+ "toml 1.1.6+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4294,6 +4303,7 @@ dependencies = [
  "harw-authority",
  "harw-test-support",
  "harw-types",
+ "rustix 1.1.5",
  "tokio",
  "tracing",
  "url",
@@ -4891,6 +4901,7 @@ dependencies = [
  "harw-tool-fsread",
  "harw-tools",
  "harw-types",
+ "harw-untrusted-text",
  "regex",
  "rustix 1.1.5",
  "serde",
@@ -5015,6 +5026,13 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+]
+
+[[package]]
+name = "harw-untrusted-text"
+version = "0.10.0"
+dependencies = [
+ "harw-test-support",
 ]
 
 [[package]]
