@@ -3381,6 +3381,7 @@ mod tests {
                     probes_connected: 1,
                     events_total: 45,
                     dropped_total: 0,
+                    peers_rejected_total: 0,
                 }),
             }),
             health_export: ExportState::Readable,

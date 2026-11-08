@@ -85,6 +85,10 @@ pub struct IpcCounters {
     /// Events dropped since start.
     #[serde(default)]
     pub dropped_total: u64,
+    /// IPC peers refused by the sentinel's `SO_PEERCRED` allowlist since
+    /// start (PL-100 WP0.5); `0` for a sentinel that predates the field.
+    #[serde(default)]
+    pub peers_rejected_total: u64,
 }
 
 /// The parsed, sanitized health report.
@@ -243,6 +247,27 @@ mod tests {
         let json = serde_json::to_string(&report)?;
         let again: HealthReport = serde_json::from_str(&json)?;
         assert_eq!(again, report);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_rejected_peers_and_ignores_the_windowed_sentinel_objects() -> TestResult {
+        // PL-100 WP0.5/WP0.12/WP0.13: newer sentinels add `peers_rejected_total`
+        // and the `ring`, `windows` and `spool` objects (additive, schema 1).
+        let newer = r#"{
+            "schema_version": 1,
+            "written_at": "2026-10-28T10:00:00Z",
+            "ipc": {"probes_connected": 2, "events_total": 7, "dropped_total": 1,
+                    "peers_rejected_total": 3, "events_last_cycle": 1},
+            "ring": {"overflow_events_total": 4},
+            "windows": {"last_cycle_ms": 5000, "last_60s_ms": null},
+            "spool": {"state": "ok"}
+        }"#;
+        let report: HealthReport = serde_json::from_str(newer)?;
+        assert_eq!(report.ipc.map(|ipc| ipc.peers_rejected_total), Some(3));
+        assert_eq!(report.ipc.map(|ipc| ipc.events_total), Some(7));
+        let older: HealthReport = serde_json::from_str(SAMPLE)?;
+        assert_eq!(older.ipc.map(|ipc| ipc.peers_rejected_total), Some(0));
         Ok(())
     }
 

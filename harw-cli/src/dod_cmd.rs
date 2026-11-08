@@ -63,7 +63,7 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use harw_config::DodSection;
+use harw_config::{DodSection, DodWatchMode};
 use harw_dod_client::{
     ChainBinary, ChainDod, ChainHost, ChainInputs, ChainRoot, ConfigReport, DodClientContext,
     DodClientError, DodStatus, ExecutionChainReport, ExportState, ProfileCoverage, ServeWorkspace,
@@ -185,6 +185,10 @@ pub(crate) struct DodEnv {
     pub(crate) cgroup_root: Result<RootResolution, String>,
     /// `[dod] allowed_cgroup_prefixes` of the harw config.
     pub(crate) allowed_cgroup_prefixes: Vec<String>,
+    /// PL-100 WP0.3: the effective `[dod.watch]` mode of the harw config
+    /// ([`DodSection::effective_watch_mode`]); `doctor` refuses `triage`
+    /// while the active Harw-DoD profile allows no egress CIDR.
+    pub(crate) watch_mode: DodWatchMode,
     /// The cgroups of the harw service units ([`service_root_candidates`])
     /// and whether each exists; shown when no root resolves.
     pub(crate) root_candidates: Vec<(PathBuf, bool)>,
@@ -261,6 +265,7 @@ fn host_env(home_override: Option<PathBuf>) -> DodEnv {
             (path, exists)
         })
         .collect();
+    let watch_mode = section.effective_watch_mode();
     DodEnv {
         client: ops::client_context(&home, &section, OffsetDateTime::now_utc()),
         doctor: ops::DoctorEnv::host(),
@@ -268,6 +273,7 @@ fn host_env(home_override: Option<PathBuf>) -> DodEnv {
         notes,
         cgroup_root,
         allowed_cgroup_prefixes: section.allowed_cgroup_prefixes,
+        watch_mode,
         root_candidates,
         service_root,
         chain: Some(Box::new(move |root| {
@@ -332,6 +338,10 @@ pub(crate) fn execute(action: DodAction, env: &DodEnv, system: &mut dyn System) 
             add_checks(
                 &mut report,
                 cgroup_root_checks(&root, &env.allowed_cgroup_prefixes, &snapshot.status.config),
+            );
+            add_checks(
+                &mut report,
+                egress_allowlist_checks(env.watch_mode, &snapshot.status.config),
             );
             let code = if report.passed() {
                 EXIT_OK
@@ -832,6 +842,49 @@ fn cgroup_root_checks(
         )
     });
     checks
+}
+
+/// The PL-100 WP0.3 `egress-allowlist` doctor check.
+///
+/// # Description
+/// While the effective `[dod.watch]` mode is `triage`, an empty
+/// `egress_allow_cidrs` list in the active Harw-DoD profile is a missing
+/// prerequisite: the sentinel's network scope is then empty, every outgoing
+/// connection is a High finding, and each one would start an automatic
+/// triage run. A configuration without a valid active profile counts as an
+/// empty list. Any other mode adds no check.
+///
+/// # Returns
+/// No check, or exactly one `egress-allowlist` check (`Ok` with the CIDR
+/// count, or `Miss`).
+fn egress_allowlist_checks(mode: DodWatchMode, config: &ConfigReport) -> Vec<ops::DoctorCheck> {
+    use ops::CheckLevel::{Miss, Ok as Pass};
+    if mode != DodWatchMode::Triage {
+        return Vec::new();
+    }
+    let allowed = match config {
+        ConfigReport::Valid {
+            active_profile: Some(profile),
+            ..
+        } => profile.egress_allow_cidrs,
+        _ => 0,
+    };
+    let check = if allowed > 0 {
+        doctor_check(
+            "egress-allowlist",
+            Pass,
+            &format!("{allowed} egress CIDR(s) allowed for [dod.watch] mode = \"triage\""),
+        )
+    } else {
+        doctor_check(
+            "egress-allowlist",
+            Miss,
+            "[dod.watch] mode = \"triage\" needs a non-empty egress_allow_cidrs list in the \
+             active Harw-DoD profile (otherwise every egress flow is a High finding); add the \
+             allowed networks or set [dod.watch] mode = \"notify\"",
+        )
+    };
+    vec![check]
 }
 
 // ── PL-97 E5: execution chain ───────────────────────────────────────────────
@@ -1613,6 +1666,7 @@ mod tests {
                 hint: Some(harw_job_runtime::host::NO_ROOT_HINT.to_owned()),
             }),
             allowed_cgroup_prefixes: Vec::new(),
+            watch_mode: DodWatchMode::Notify,
             root_candidates: Vec::new(),
             service_root: Ok(None),
             chain: None,
@@ -2510,6 +2564,63 @@ egress_allow_cidrs = []
         add_checks(&mut report, checks);
         assert!(report.passed());
         assert_eq!(report.warnings, 1);
+    }
+
+    #[test]
+    fn dod_doctor_refuses_triage_while_the_egress_allowlist_is_empty() {
+        use ops::CheckLevel;
+        let with_cidrs = |count: usize| ConfigReport::Valid {
+            path: PathBuf::from("/etc/harw-dod/config.toml"),
+            config_digest: "ab".to_owned(),
+            active_profile: Some(ActiveProfile {
+                id: "harw-jobs".to_owned(),
+                scope: ProfileScope::Host,
+                sensors: vec!["tcp-connect".to_owned()],
+                egress_allow_cidrs: count,
+            }),
+        };
+        let levels = |checks: &[ops::DoctorCheck]| -> Vec<(String, CheckLevel)> {
+            checks
+                .iter()
+                .map(|check| (check.id.clone(), check.level))
+                .collect()
+        };
+
+        // Triage with an empty allowlist: a missing prerequisite, so the
+        // doctor fails.
+        let empty = egress_allowlist_checks(DodWatchMode::Triage, &with_cidrs(0));
+        assert_eq!(
+            levels(&empty),
+            [("egress-allowlist".to_owned(), CheckLevel::Miss)]
+        );
+        let mut report = ops::DoctorReport {
+            checks: Vec::new(),
+            ok: 0,
+            warnings: 0,
+            missing: 0,
+        };
+        add_checks(&mut report, empty);
+        assert!(!report.passed());
+
+        // No valid config or no active profile counts as empty.
+        let missing = ConfigReport::Missing {
+            path: PathBuf::from("/etc/harw-dod/config.toml"),
+        };
+        assert_eq!(
+            levels(&egress_allowlist_checks(DodWatchMode::Triage, &missing)),
+            [("egress-allowlist".to_owned(), CheckLevel::Miss)]
+        );
+
+        // Triage with allowed networks passes.
+        assert_eq!(
+            levels(&egress_allowlist_checks(DodWatchMode::Triage, &with_cidrs(2))),
+            [("egress-allowlist".to_owned(), CheckLevel::Ok)]
+        );
+
+        // Without triage the allowlist is not a doctor prerequisite.
+        for mode in [DodWatchMode::Off, DodWatchMode::Notify] {
+            assert!(egress_allowlist_checks(mode, &with_cidrs(0)).is_empty());
+        }
     }
 
     // ── PL-97 E5: execution chain ──
