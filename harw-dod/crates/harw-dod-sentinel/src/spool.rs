@@ -628,7 +628,7 @@ fn io_err<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> Spo
 /// # Examples
 /// ```rust,ignore
 /// let record = slice_record(&finding, &[trigger], &ring_tail, now, MAX_SLICE_RECORD_BYTES)?;
-/// assert!(serde_json::to_vec(&record)?.len() as u64 <= MAX_SLICE_RECORD_BYTES);
+/// assert!(u64::try_from(serde_json::to_vec(&record)?.len())? <= MAX_SLICE_RECORD_BYTES);
 /// ```
 pub fn slice_record(
     finding: &Finding<RuleChecked>,
