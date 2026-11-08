@@ -708,7 +708,8 @@ mod tests {
     #[test]
     fn test_actor_legacy_json_without_process_still_deserializes() -> TestResult {
         let legacy = r#"{"uid":0,"auid":1000,"cgroup":null}"#;
-        let actor: Actor = serde_json::from_str(legacy).map_err(ctx("Bestandsform bleibt lesbar"))?;
+        let actor: Actor =
+            serde_json::from_str(legacy).map_err(ctx("Bestandsform bleibt lesbar"))?;
         assert_eq!(actor.process, None);
         assert_eq!(actor.uid, 0);
         Ok(())

@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn test_more_than_max_devices_reports_the_number_of_dropped_devices() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let total = MAX_DEVICES + 2;
+        let total = MAX_DEVICES.saturating_add(2);
         for i in 0..total {
             let device = dir.path().join(format!("vd{i:02}"));
             std::fs::create_dir_all(&device).map_err(ctx("Geräteverzeichnis"))?;
@@ -783,7 +783,11 @@ mod tests {
             .last()
             .ok_or(TestError::Missing("Kürzungsmarke"))?;
         assert_eq!(marker.metric, TRUNCATED_METRIC);
-        assert!((marker.value - 2.0).abs() < f64::EPSILON, "{}", marker.value);
+        assert!(
+            (marker.value - 2.0).abs() < f64::EPSILON,
+            "{}",
+            marker.value
+        );
         // Die alphabetisch letzten Geräte fehlen, die ersten sind da.
         let devices = device_samples(&reading);
         assert!(devices.iter().any(|s| s.metric.ends_with("_vd00")));

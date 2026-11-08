@@ -354,7 +354,10 @@ fn convert_wire_event(
                     // der unprivilegierte Sentinel auf (PL-97 E4).
                     cgroup: Actor::raw_cgroup(exec.task.cgroup_id),
                     // pid/ppid/comm statt Verwerfen (PL-100 WP0.15).
-                    process: harw_dod_procmon::process_context_v1(&exec.task, Some(exec.comm.as_str())),
+                    process: harw_dod_procmon::process_context_v1(
+                        &exec.task,
+                        Some(exec.comm.as_str()),
+                    ),
                 }),
                 kind: EventKind::ProcessExec {
                     path,

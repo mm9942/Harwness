@@ -203,8 +203,8 @@ mod tests {
 
     #[test]
     fn test_display_comm_escapes_terminal_and_bidi_controls() -> TestResult {
-        let escaped = display_comm("a\u{1b}[31m\u{202E}")
-            .ok_or(TestError::Missing("nicht-leerer comm"))?;
+        let escaped =
+            display_comm("a\u{1b}[31m\u{202E}").ok_or(TestError::Missing("nicht-leerer comm"))?;
         assert_eq!(escaped, "a\\u{001b}[31m\\u{202e}");
         assert!(harw_untrusted_text::is_clean(&escaped));
         Ok(())
@@ -228,8 +228,7 @@ mod tests {
     fn test_display_comm_output_never_exceeds_comm_max_chars() -> TestResult {
         // Sechzehn Steuerzeichen ergäben escapt 128 Zeichen.
         let hostile = "\u{1}".repeat(ProcessContext::KERNEL_COMM_BYTES);
-        let escaped =
-            display_comm(&hostile).ok_or(TestError::Missing("nicht-leerer comm"))?;
+        let escaped = display_comm(&hostile).ok_or(TestError::Missing("nicht-leerer comm"))?;
         assert!(escaped.chars().count() <= ProcessContext::COMM_MAX_CHARS);
         assert!(escaped.ends_with('…'));
         assert!(harw_untrusted_text::is_clean(&escaped));

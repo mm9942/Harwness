@@ -802,10 +802,12 @@ mod tests {
             .filter(|s| s.metric == TRUNCATED_METRIC)
             .collect();
         assert_eq!(markers.len(), 1, "genau eine Kürzungsmarke je Poll");
-        let marker = markers
-            .first()
-            .ok_or(TestError::Missing("Kürzungsmarke"))?;
-        assert!((marker.value - 4.0).abs() < f64::EPSILON, "{}", marker.value);
+        let marker = markers.first().ok_or(TestError::Missing("Kürzungsmarke"))?;
+        assert!(
+            (marker.value - 4.0).abs() < f64::EPSILON,
+            "{}",
+            marker.value
+        );
         Ok(())
     }
 

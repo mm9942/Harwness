@@ -302,11 +302,8 @@ impl Sensor for CgroupSensor {
         // gesammelt und nur dann propagiert, wenn am Ende **keine einzige**
         // Probe zustande kam (F-095-Register: „Teilergebnisse statt
         // Totalausfall bei einzelnen Lesefehlern“).
-        let mut samples = Vec::with_capacity(
-            kept.len()
-                .saturating_mul(FIELD_COUNT)
-                .saturating_add(1),
-        );
+        let mut samples =
+            Vec::with_capacity(kept.len().saturating_mul(FIELD_COUNT).saturating_add(1));
         let mut errors: Vec<SensorError> = Vec::new();
 
         for dir in &kept {
@@ -851,7 +848,11 @@ mod tests {
             .last()
             .ok_or(TestError::Missing("Kürzungsmarke"))?;
         assert_eq!(marker.metric, TRUNCATED_METRIC);
-        assert!((marker.value - 4.0).abs() < f64::EPSILON, "{}", marker.value);
+        assert!(
+            (marker.value - 4.0).abs() < f64::EPSILON,
+            "{}",
+            marker.value
+        );
         assert_eq!(
             reading
                 .samples
