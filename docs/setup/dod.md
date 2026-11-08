@@ -542,13 +542,38 @@ Both are optional sentinel flags; the shipped unit enables both:
 
 | File | Flag | Written | Content |
 |---|---|---|---|
-| `/var/lib/harw-dod/export/findings.jsonl` | `--findings-export <abs path>` | appended per certified finding; rotated at 16 MiB (`--findings-export-keep`) | one JSON object per line: `finding_id`, `host`, `rule_id`, `severity`, `summary` (sanitized, ≤ 512 bytes), `observed_at`, plus `schema_version: 2` and an optional `scope` (cgroup path, once findings carry a cgroup attribution) |
-| `/var/lib/harw-dod/export/health.json` | `--health-export <abs path>` (default: `health.json` next to the findings export) | replaced atomically (temporary file + rename) every poll cycle | `schema_version: 1`, `written_at`, `config_digest`, `profile` (both `null` on built-in defaults), `sensors[]` (`id`, `health` = `bound`/`retrying`/`degraded`, `degrade_reason?`, `last_ok_at?`, `readings_total`, `errors_total`), `ipc` (`probes_connected`, `events_total`, `dropped_total`) |
+| `/var/lib/harw-dod/export/findings.jsonl` | `--findings-export <abs path>` | appended per **reported** finding (repeats inside the dedup cooldown are not written); rotated at 16 MiB (`--findings-export-keep`) | one JSON object per line: `finding_id` (UUIDv4), `host`, `rule_id`, `severity`, `summary` (escaped, ≤ 512 bytes), `observed_at` (time of the triggering observation), `schema_version: 3`, an optional `scope` (cgroup path) plus `scope_obfuscated`, and the v3 fields `instance` (UUIDv4 per sentinel start), `seq` (from 1; a gap means a lost line), `kind`, `hardness`, `dedup_key`, `occurrences`, `first_seen`, `cgroup_kid?`, `record_digest?` (BLAKE3 of the spooled record) and `evidence_card?` (≤ 4 KiB: event counts, agreeing `uid`/`destination`/`path`/`process{pid,comm}`, all escaped) |
+| `/var/lib/harw-dod/export/health.json` | `--health-export <abs path>` (default: `health.json` next to the findings export) | replaced atomically (temporary file + rename) every poll cycle | `schema_version: 1`, `written_at`, `config_digest`, `profile` (both `null` on built-in defaults), `sensors[]` (`id`, `health` = `bound`/`retrying`/`degraded`, `degrade_reason?`, `last_ok_at?`, `readings_total`, `errors_total`), `ipc` (`probes_connected`, `events_total`, `dropped_total`, `peers_rejected_total`, `events_last_cycle`, `dropped_last_cycle`, `events_last_60s`, `dropped_last_60s`), `ring` (ring entries evicted before the rules saw them: `overflow_{samples,events}_{total,last_cycle,last_60s}`), `windows` (`last_cycle_ms`, `last_60s_ms`), `spool` (`null` without a spool; else `state` = `ok`/`degraded`, `reason`, cumulative and windowed counters) |
 
-Version 2 of the findings line is additive: a line without `schema_version`
-is version 1, and every reader ignores unknown fields, so old and new lines
-parse alike. Neither file contains evidence, raw events, configuration
-contents or secrets.
+Versions 2 and 3 of the findings line are additive: a line without
+`schema_version` is version 1, and every reader ignores unknown fields, so
+old and new lines parse alike (roll out readers before the sentinel). The
+`health.json` additions keep `schema_version: 1`. Neither file contains raw
+events, configuration contents or secrets; the evidence card carries only
+escaped, bounded summaries.
+
+**Spool and dedup state** (not exports, owner-only, PL-100 WP0.4/WP0.12).
+With `--findings-export` the sentinel freezes one `FindingRecord` per
+reported finding (triggering events plus up to 32 ring events as context,
+≤ 64 KiB) into `<--home>/spool` (`/var/lib/harw-dod/spool`, `0700`,
+written by a bounded writer thread). The spool keeps 14 days and at most
+1 GiB, including records nobody consumed. `<--home>/finding-throttle.json`
+(`0600`) persists the dedup cooldown per `dedup_key` across restarts.
+
+### Sentinel flags added by PL-100 Phase 0
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--finding-cooldown-secs <n>` | `600` (0 … 604800) | a repeat of the same `dedup_key` (rule, uid, cgroup, coarse subject such as /24 or /64 plus port) inside this window only raises `occurrences`; stronger hardness, higher severity or a clock jump back report it again |
+| `--probe-peer-user <name\|uid>` | `harw-probe-bpf`, `harw-probe-fs` | accounts whose processes may submit events over the IPC socket (`SO_PEERCRED`; repeatable, replaces the default). uid 0 is always allowed; other peers are closed unread and counted in `ipc.peers_rejected_total` |
+| `--workspace-root <abs dir>` | none | the workspace drift sensor and its Landlock read root run only with an explicit absolute directory; `/` and relative roots are refused |
+| `--print-sandbox` | off | prints the effective Landlock read/read-write roots, refused roots with their reason and the admitted IPC peer uids, then exits (run it with the same flags as the unit) |
+
+The egress rule uses the active profile's `egress_allow_cidrs` as its
+allowed network scope; with an empty list every egress flow is a High
+finding (a loopback destination is Low). `harw dod doctor` therefore
+reports `egress-allowlist` as missing while `[dod.watch] mode = "triage"`
+is in effect and the list is empty.
 
 **Permissions.** `deploy/tmpfiles.d/harw.conf` creates the export directory
 as `2750 harw-sentinel:harw-dod-readers` (setgid, so the files inherit the

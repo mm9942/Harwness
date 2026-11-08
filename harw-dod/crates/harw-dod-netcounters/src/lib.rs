@@ -156,8 +156,9 @@
 //! Sensor mit Zustand über den Abruf hinaus ist gegen ein solches Fixture
 //! nicht prüfbar. **Diese Crate meldet deshalb die rohen kumulativen
 //! Zähler, unverändert.** Die Bildung einer Rate ist bewusst Sache des
-//! Verbrauchers (z. B. `harw-dod-rules`), der ohnehin schon Zustand über
-//! mehrere Beobachtungen hinweg hält. Wer das hier „verbessert", indem er
+//! Verbrauchers, der ohnehin schon Zustand über mehrere Beobachtungen
+//! hinweg hält — heute die Zähler→Raten-Stufe `RateStage` in
+//! `harw-sentinel` (`src/rates.rs`, PL-100 WP0.14). Wer das hier „verbessert", indem er
 //! zwei interne Polls vergleicht, bricht sowohl die `&self`-Objektsicherheit
 //! als auch die Fixture-Prüfbarkeit.
 //!

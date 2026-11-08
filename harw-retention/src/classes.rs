@@ -19,6 +19,8 @@
 //! # DoD classes (PL-100 WP0.12)
 //! - `dod_spool`: 14 days, aligned with the sentinel spool retention (the
 //!   escalator only needs records of findings that can still be triaged).
+//!   Covers the harw-side copy under `<home>/dod/spool`; the system
+//!   sentinel sweeps its own `@STATEDIR@/spool` with the same limits.
 //! - `sentinel_export`: 90 days, unchanged.
 //! - `dod_verdicts`: triage verdicts of the future `VerdictStore`
 //!   (`<home>/dod/verdicts`), 90 days like the export they annotate.
@@ -47,6 +49,10 @@ fn scan_report_dirs(roots: &Roots) -> Vec<PathBuf> {
     vec![roots.home.join("scan_reports")]
 }
 
+// The harw-side spool copy below the harw home. The system sentinel's own
+// spool (`@STATEDIR@/spool`, e.g. `/var/lib/harw-dod/spool`, 0700
+// harw-sentinel) is outside every harw home: the sentinel sweeps it itself
+// with the same 14-day/1 GiB limits (`harw-sentinel/src/spool_writer.rs`).
 fn dod_spool_dirs(roots: &Roots) -> Vec<PathBuf> {
     vec![roots.home.join("dod").join("spool")]
 }

@@ -19,6 +19,12 @@
 //! anhand von `destination.parse::<IpAddr>()`, welche der beiden Prüfungen
 //! zuständig ist.
 //!
+//! Eine IPv4-gemappte IPv6-Adresse (`::ffff:a.b.c.d`, typisch für Flüsse aus
+//! Dual-Stack-Sockets) gilt als erlaubt, wenn die Adresse selbst **oder**
+//! ihre kanonische IPv4-Form (`IpAddr::to_canonical`) im Bereich liegt —
+//! sonst träfe eine IPv4-`egress_allow_cidrs`-Freigabe (PL-100 WP0.3) solche
+//! Flüsse nie.
+//!
 //! # Zeitstempel: Ereigniszeit, nicht Auswertungszeit (PL-100 WP0.2)
 //! Jeder Befund trägt das `observed_at` **des auslösenden Ereignisses**, nie
 //! [`crate::rule::RuleContext::now`]. Ein Fluss wurde einmal beobachtet; wird
@@ -163,7 +169,7 @@ fn is_loopback_literal(destination: &str) -> bool {
 // Moduldoku, warum beide Methoden gebraucht werden.
 fn destination_allowed(scope: &NetworkScope, destination: &str) -> bool {
     match destination.parse::<IpAddr>() {
-        Ok(addr) => scope.allows_addr(addr),
+        Ok(addr) => scope.allows_addr(addr) || scope.allows_addr(addr.to_canonical()),
         Err(_) => scope.allows(destination),
     }
 }
@@ -236,6 +242,17 @@ mod tests {
         let ctx = ctx_with(&events, &scope);
 
         assert!(EgressFlowRule.evaluate(&ctx).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_ipv4_mapped_address_inside_a_v4_cidr_does_not_trigger() -> TestResult {
+        let scope: NetworkScope = serde_json::from_str(r#"{"allow_hosts":["203.0.113.0/24"]}"#)
+            .map_err(crate::test_support::ctx("NetworkScope liest ein Cidr-Ziel"))?;
+        let inside = vec![event("::ffff:203.0.113.7", 443)];
+        assert!(EgressFlowRule.evaluate(&ctx_with(&inside, &scope)).is_empty());
+        let outside = vec![event("::ffff:198.51.100.5", 443)];
+        assert_eq!(EgressFlowRule.evaluate(&ctx_with(&outside, &scope)).len(), 1);
         Ok(())
     }
 

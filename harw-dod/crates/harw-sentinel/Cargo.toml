@@ -46,9 +46,11 @@ harw-completions = { path = "../../../harw-completions", features = ["clap-args"
 # dieses unprivilegierten Binaries hinzufügt (Abschnitt „Das
 # Privilegienbudget dieser Kante").
 harw-dod-rules = { path = "../harw-dod-rules" }
-# `NetworkScope` für den `network_scope`-Eintrag des `RuleContext`, den
-# `src/findings.rs` baut — siehe dortige Moduldoku, Abschnitt „Was dieser
-# Kontext (noch) nicht befüllt", für die Begründung von `NetworkScope::empty`.
+# Netzbereichs-Vokabular (Vokabularschicht, `RequiredPrivilege::Unprivileged`
+# im Privilegien-Gate). Der `network_scope` des `RuleContext` selbst ist
+# `harw_authority::NetworkScope`, seit PL-100 WP0.3 aus den
+# `egress_allow_cidrs` des aktiven Profils gebaut (`src/findings.rs`,
+# `network_scope_from_profile`); `src/` nennt diese Crate derzeit nicht.
 harw-sandbox = { path = "../../../harw-sandbox" }
 # PL-100 WP0.8/WP0.12: der eine Escaper für untrusted Text (Ring A, ohne
 # Abhängigkeiten) — ersetzt die eigenen Sanitizer von `src/export.rs` und
