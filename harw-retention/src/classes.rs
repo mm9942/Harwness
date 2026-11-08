@@ -11,10 +11,20 @@
 //! touching any consumer. Limits are the *defaults*; config overrides them
 //! per class (`[retention.<id>]`).
 //!
-//! Security-relevant classes (`dod_spool`, `sentinel_export`,
-//! `freeze_resolved`, `session_transcripts`, `session_corrupt_backups`) are
-//! opt-in: never deleted unless config says `enabled = true`. Their limits
-//! below only take effect after that opt-in.
+//! Security-relevant classes (`dod_spool`, `sentinel_export`, `dod_verdicts`,
+//! `dod_labels`, `freeze_resolved`, `session_transcripts`,
+//! `session_corrupt_backups`) are opt-in: never deleted unless config says
+//! `enabled = true`. Their limits below only take effect after that opt-in.
+//!
+//! # DoD classes (PL-100 WP0.12)
+//! - `dod_spool`: 14 days, aligned with the sentinel spool retention (the
+//!   escalator only needs records of findings that can still be triaged).
+//! - `sentinel_export`: 90 days, unchanged.
+//! - `dod_verdicts`: triage verdicts of the future `VerdictStore`
+//!   (`<home>/dod/verdicts`), 90 days like the export they annotate.
+//! - `dod_labels`: human-signed labels (`<home>/dod/labels`). No age limit —
+//!   a label ends by its own expiry, never by file age — but a bounded count.
+//!   Dropping a label can only re-enable notices, never suppress one.
 
 use std::fs;
 use std::path::PathBuf;
@@ -43,6 +53,16 @@ fn dod_spool_dirs(roots: &Roots) -> Vec<PathBuf> {
 
 fn sentinel_export_dirs(roots: &Roots) -> Vec<PathBuf> {
     vec![roots.home.join("dod").join("export")]
+}
+
+// Triage verdicts (`VerdictStore`, PL-100 Phase 2) below the harw home.
+fn dod_verdict_dirs(roots: &Roots) -> Vec<PathBuf> {
+    vec![roots.home.join("dod").join("verdicts")]
+}
+
+// Human-signed DoD labels (PL-100 I3) below the harw home.
+fn dod_label_dirs(roots: &Roots) -> Vec<PathBuf> {
+    vec![roots.home.join("dod").join("labels")]
 }
 
 fn freeze_dirs(roots: &Roots) -> Vec<PathBuf> {
@@ -129,11 +149,12 @@ harw_macros::retention_classes! {
         max_bytes = 256 * 1_048_576,
         max_files = 100,
     }
-    /// DoD sentinel spool (security evidence; opt-in).
+    /// DoD sentinel spool (security evidence; opt-in). 14 days, aligned with
+    /// the sentinel spool retention (PL-100 WP0.12).
     dod_spool: security_relevant {
         dir = dod_spool_dirs,
         name = any,
-        max_age_secs = 30 * 86_400,
+        max_age_secs = 14 * 86_400,
         max_bytes = 1_024 * 1_048_576,
         max_files = 10_000,
     }
@@ -144,6 +165,24 @@ harw_macros::retention_classes! {
         max_age_secs = 90 * 86_400,
         max_bytes = 1_024 * 1_048_576,
         max_files = none,
+    }
+    /// DoD triage verdicts under `<home>/dod/verdicts` (security evidence;
+    /// opt-in). 90 days, like the findings export they annotate.
+    dod_verdicts: security_relevant {
+        dir = dod_verdict_dirs,
+        name = any,
+        max_age_secs = 90 * 86_400,
+        max_bytes = 256 * 1_048_576,
+        max_files = none,
+    }
+    /// Human-signed DoD labels under `<home>/dod/labels` (security evidence;
+    /// opt-in). No age limit (a label ends by its own expiry), bounded count.
+    dod_labels: security_relevant {
+        dir = dod_label_dirs,
+        name = any,
+        max_age_secs = none,
+        max_bytes = none,
+        max_files = 10_000,
     }
     /// Resolved freeze records `*.resolved.json` (security evidence; opt-in).
     freeze_resolved: security_relevant {
@@ -169,5 +208,70 @@ harw_macros::retention_classes! {
         max_age_secs = 30 * 86_400,
         max_bytes = 256 * 1_048_576,
         max_files = 50,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ClassKind, ResolvedClass, SweepMode};
+
+    harw_test_support::define_test_error!(pub(crate));
+
+    const DAY: u64 = 86_400;
+
+    fn class(cfg: &RetentionConfig, id: &'static str) -> TestResult<ResolvedClass> {
+        policy_for(cfg, id).ok_or(TestError::Missing(id))
+    }
+
+    #[test]
+    fn test_dod_spool_keeps_fourteen_days() -> TestResult {
+        let spool = class(&RetentionConfig::default(), "dod_spool")?;
+        assert_eq!(spool.class.kind, ClassKind::SecurityRelevant);
+        assert_eq!(spool.max_age_secs, Some(14 * DAY));
+        assert_eq!(spool.max_files, Some(10_000));
+        Ok(())
+    }
+
+    #[test]
+    fn test_dod_verdicts_and_labels_are_declared_security_relevant() -> TestResult {
+        let cfg = RetentionConfig::default();
+        let verdicts = class(&cfg, "dod_verdicts")?;
+        assert_eq!(verdicts.class.kind, ClassKind::SecurityRelevant);
+        assert_eq!(verdicts.max_age_secs, Some(90 * DAY));
+        assert!(!verdicts.enabled, "opt-in");
+
+        let labels = class(&cfg, "dod_labels")?;
+        assert_eq!(labels.class.kind, ClassKind::SecurityRelevant);
+        assert_eq!(labels.max_age_secs, None, "labels never age out");
+        assert_eq!(labels.max_bytes, None);
+        assert_eq!(labels.max_files, Some(10_000), "but their count is bounded");
+        assert!(!labels.enabled, "opt-in");
+        // Opted in, the label class has a limit, so the doctor stays quiet.
+        let opted: RetentionConfig =
+            toml::from_str("[dod_labels]\nenabled = true\n").map_err(ctx("toml"))?;
+        let labels = class(&opted, "dod_labels")?;
+        assert!(labels.doctor_warning().is_none());
+        assert!(labels.policy(SweepMode::Apply, None).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_dod_classes_resolve_below_the_home_dod_directory() -> TestResult {
+        let roots = Roots {
+            home: std::path::PathBuf::from("/home/u/.harw"),
+            project: None,
+        };
+        let dod = roots.home.join("dod");
+        for (id, sub) in [
+            ("dod_spool", "spool"),
+            ("sentinel_export", "export"),
+            ("dod_verdicts", "verdicts"),
+            ("dod_labels", "labels"),
+        ] {
+            let resolved = class(&RetentionConfig::default(), id)?;
+            assert_eq!((resolved.class.resolve_dirs)(&roots), vec![dod.join(sub)], "{id}");
+        }
+        Ok(())
     }
 }
