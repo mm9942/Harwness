@@ -1410,7 +1410,7 @@ fn invalid_hint(hint: &str, reason: &str) -> OpError {
 /// Additiv, wie die Architektur es für einen vierten Arm vorsieht: die
 /// drei bestehenden Arme (`Text`, `ResearchFinding`, `ReturnEnvelope`) sind
 /// unverändert — kein bestehendes Match wurde umgebaut, nur um einen Fall
-/// erweitert. Zwei Besonderheiten gegenüber den anderen typisierten Armen:
+/// erweitert. Vier Besonderheiten gegenüber den anderen typisierten Armen:
 /// - **Kein `harw-dod-warden-proto`-Import.** Dieser Adapter kennt
 ///   `WardenAction` nicht (siehe `Cargo.toml`) — es gibt keinen Weg, aus
 ///   einem validierten Verdikt eine autorisierte Aktion zu bauen, weder hier
@@ -1421,6 +1421,26 @@ fn invalid_hint(hint: &str, reason: &str) -> OpError {
 ///   Rohtext-Auszug (siehe [`ContractViolation::to_json`]): ein Verdikt kann
 ///   Text tragen, den ein Triage-Agent aus angreiferkontrollierten
 ///   Sensorfeldern abgeleitet hat.
+/// - **Gemeinsame Annahmestelle (PL-100 WP 2.3).** Der Arm läuft über
+///   [`crate::security_verdict::screen_security_verdict`], die erste Stufe
+///   von [`crate::security_verdict::accept_security_verdict`]. Ein Verdikt
+///   wird genau wie zuvor angenommen oder abgelehnt, mit denselben
+///   inhaltsfreien Meldungen.
+/// - **Rückkanal nach I4 (nur für validierte Rückgaben).** Eine
+///   Kind-Antwort, die über diesen Arm validiert, erreicht das Parent nur als
+///   [`crate::security_verdict::ScreenedVerdict::to_parent_value`]: die
+///   Felder des Verdikts **ohne** `rationale` (die Begründung geht nur an
+///   Menschen), dazu `"rationale_withheld": true`, `"model_authored": true`
+///   und `"bound": false`; `finding` nur in der ID-Grammatik (sonst
+///   `"finding_withheld": true`), `issued_by` nur als Rollenname (sonst eine
+///   feste Marke). Gebunden und abgelegt wird hier nichts: der Wave-Pfad hat
+///   keinen erwarteten Befund, keinen exportierten Digest und keine Senke.
+///   Das tut DodWatch über `accept_security_verdict`.
+///   **Noch nicht abgeschirmt** (offene Folgearbeit PL-100 WP 2.3): ein
+///   Budget-Teilergebnis, das verdichtet ist oder nicht validiert
+///   (`budget_exhausted_value` gibt dann `partial_result` als Rohtext
+///   zurück, samt Begründung), und `agent.result`, das dem Parent auf
+///   Anfrage den vollen Rohtext des Kindes gibt.
 ///
 /// # Nebenläufigkeit
 /// `Copy`, ohne inneren Zustand; frei zwischen Threads kopierbar.
@@ -1807,9 +1827,24 @@ fn evaluate_child_return(
             // Vertragsbruch-Report — ein Verdikt kann Text tragen, den ein
             // Triage-Agent aus angreiferkontrollierten Sensorfeldern
             // abgeleitet hat.
-            let verdict = harw_dod_signals::parse_and_validate_verdict(text)
+            //
+            // PL-100 WP 2.3: erste Stufe der gemeinsamen Annahmestelle
+            // (`crate::security_verdict`). Annahme, Ablehnung und Meldungen
+            // sind dieselben wie mit `parse_and_validate_verdict`. Eine hier
+            // validierte Rückgabe erreicht das Parent nur als I4-Sicht
+            // (`to_parent_value`): ohne `rationale` (nur für Menschen), mit
+            // `rationale_withheld`/`model_authored`/`bound: false`, `finding`
+            // nur in der ID-Grammatik, `issued_by` nur als Rollenname. Binden
+            // und Ablegen (`accept_security_verdict`) entfallen hier: dieser
+            // Pfad kennt weder den erwarteten Befund noch den exportierten
+            // Digest noch eine `VerdictSink`; auch ein Budget-Teilergebnis,
+            // das hier validiert, legt nichts ab. Nicht abgeschirmt sind
+            // (offen): ein verdichtetes oder ungültiges Budget-Teilergebnis
+            // (`budget_exhausted_value` gibt `partial_result` als Rohtext
+            // zurück) und `agent.result` (voller Rohtext auf Anfrage).
+            let screened = crate::security_verdict::screen_security_verdict(text)
                 .map_err(|error| ContractViolation::content_free(contract, error.to_string()))?;
-            serde_json::to_value(&verdict).map_err(|_| {
+            screened.to_parent_value().ok_or_else(|| {
                 ContractViolation::content_free(
                     contract,
                     "werkzeugseitig: die kanonische Serialisierung des validierten Verdikts \
