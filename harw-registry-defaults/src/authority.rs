@@ -583,7 +583,12 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 /// - `shell.exec` → `ExecuteProcess` (`harw-tool-shell/src/exec.rs:574`).
 /// - `job.start` → `ExecuteProcess` (derselbe Startweg wie `shell.exec`);
 ///   `job.status/logs/stop/list/wait` → `ReadWorkspace` (Plan R9, Teil F:
-///   kein Prozessstart, nur eigene Jobs bzw. die der Nachfahren).
+///   kein Prozessstart, nur eigene Jobs bzw. die der Nachfahren);
+///   `job.suspend/resume` → `ReadWorkspace` (PL-100 WP 3.5, bewusst
+///   dieselbe Rechteklasse wie `job.stop`: sie starten nichts und frieren
+///   bzw. tauen nur die von der Runtime bewiesene eigene cgroup eines Jobs
+///   des Aufrufers oder seiner Nachfahren; die Nachfrage regelt
+///   `ALWAYS_ASK_TOOLS` der Montage, nicht dieser Rechtefilter).
 /// - `tunnel.start` → `ExecuteProcess` (harw-tool-tunnel-v1, geplant:
 ///   startet einen verwalteten SSH-Prozess über denselben Startweg wie
 ///   `job.start`/`shell.exec`); `tunnel.status/stop/list` →
@@ -727,6 +732,16 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // sie lesen bzw. beenden nur Jobs des Aufrufers und seiner
         // Nachfahren (Besitzprüfung in `harw-tool-job`).
         || listed(&harw_tool_job::JOB_CONTROL_TOOLS)
+        // PL-100 WP 3.5: `job.suspend`/`job.resume` starten nichts; sie
+        // frieren bzw. tauen nur die bewiesene eigene cgroup eines Jobs des
+        // Aufrufers bzw. seiner Nachfahren ein bzw. auf (dieselbe
+        // Besitzprüfung wie `job.stop`, das den Job sogar beendet) und
+        // tragen deshalb bewusst dieselbe Rechteklasse wie `job.stop`. Ohne
+        // diese Zeile fielen sie aus jeder Registry heraus
+        // (`RegistryProfile::tool_names_for`). Die Nachfrage regelt
+        // `ALWAYS_ASK_TOOLS` der Montage, nicht dieser Rechtefilter.
+        || tool == harw_tool_job::JOB_SUSPEND_TOOL
+        || tool == harw_tool_job::JOB_RESUME_TOOL
         // R14: `work_driver.status` liest nur den Job und seine
         // Zustands-Sidecar; `work_driver.stop` beendet nur einen eigenen Job
         // über den Job-Cancel-Pfad — beide starten nichts, wie
@@ -1043,6 +1058,74 @@ mod tests {
         // eigene Hintergrund-Agenten; die Grenze zieht der Spawner.
         assert_eq!(tool_permission("agent.status"), None);
         assert_eq!(tool_permission("agent.cancel"), None);
+    }
+
+    /// PL-100 WP 3.5 (Review 5816599222, Befund C): `job.suspend` und
+    /// `job.resume` tragen bewusst dieselbe Rechteklasse wie `job.stop`
+    /// (`ReadWorkspace`); jedes Job-Werkzeug hat ein Recht, nur `job.start`
+    /// verlangt `ExecuteProcess`.
+    #[test]
+    fn test_tool_permission_maps_suspend_and_resume_like_job_stop() {
+        for tool in [
+            harw_tool_job::JOB_SUSPEND_TOOL,
+            harw_tool_job::JOB_RESUME_TOOL,
+        ] {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ReadWorkspace),
+                "{tool}"
+            );
+            assert_eq!(
+                tool_permission(tool),
+                tool_permission(harw_tool_job::JOB_STOP_TOOL),
+                "{tool} muss wie job.stop abgebildet werden"
+            );
+        }
+        for tool in harw_tool_job::JOB_TOOL_NAMES {
+            let expected = if tool == harw_tool_job::JOB_START_TOOL {
+                Permission::ExecuteProcess
+            } else {
+                Permission::ReadWorkspace
+            };
+            assert_eq!(tool_permission(tool), Some(expected), "{tool}");
+        }
+    }
+
+    /// PL-100 WP 3.5: registry-seitig bewirbt jedes Profil `job.suspend`
+    /// und `job.resume` genau dann, wenn es unter denselben Rechten
+    /// `job.stop` bewirbt — unter seinen eigenen Profilrechten ebenso wie
+    /// unter einem read-only Elternteil (dort nie `job.start`). Vor der
+    /// Zuordnung filterte `tool_names_for` beide aus jeder Registry heraus.
+    #[test]
+    fn test_profiles_offer_suspend_and_resume_wherever_they_offer_job_stop() {
+        let read_only = PermissionSet::from_policy([Permission::ReadWorkspace]);
+        let mut offering = 0_usize;
+        for profile in RegistryProfile::ALL {
+            for granted in [profile.required_permissions(), read_only.clone()] {
+                let tools = profile.tool_names_for(&granted);
+                let stop = tools.contains(&harw_tool_job::JOB_STOP_TOOL);
+                assert_eq!(
+                    tools.contains(&harw_tool_job::JOB_SUSPEND_TOOL),
+                    stop,
+                    "{profile:?} unter {granted:?}: job.suspend"
+                );
+                assert_eq!(
+                    tools.contains(&harw_tool_job::JOB_RESUME_TOOL),
+                    stop,
+                    "{profile:?} unter {granted:?}: job.resume"
+                );
+                if stop {
+                    offering = offering.saturating_add(1);
+                }
+            }
+            assert!(
+                !profile
+                    .tool_names_for(&read_only)
+                    .contains(&harw_tool_job::JOB_START_TOOL),
+                "{profile:?}: job.start ohne ExecuteProcess"
+            );
+        }
+        assert!(offering > 0, "kein Profil bewirbt job.stop");
     }
 
     /// PL-97 D3: die lesenden Harw-DoD-Werkzeuge tragen wie `ps` und die

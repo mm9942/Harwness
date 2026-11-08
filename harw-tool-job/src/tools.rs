@@ -1247,7 +1247,18 @@ impl JobToolExecutor {
     }
 
     /// `job.suspend` bzw. `job.resume` (PL-100 WP 3.5).
-    fn suspend_or_resume(
+    ///
+    /// # Concurrency
+    /// [`JobManager::suspend`] und [`JobManager::resume`] blockieren
+    /// (`fsync` von `meta.json`, bis zu etwa 100 ms Warten auf die Sperre
+    /// des Eindämmungsindex, nacheinander hinter anderen Aufrufen); sie
+    /// laufen deshalb über `spawn_blocking` und halten keinen
+    /// tokio-Worker an.
+    ///
+    /// # Errors
+    /// [`ToolsError`] für ungültige Argumente oder eine nicht zu Ende
+    /// gelaufene Hintergrundaufgabe.
+    async fn suspend_or_resume(
         &self,
         context: &ToolExecutionContext,
         call: &ToolCall,
@@ -1265,13 +1276,19 @@ impl JobToolExecutor {
         // Aufrufers bzw. seiner Nachfahren (Besitzprüfung im Manager); die
         // Nachfrage regelt `ALWAYS_ASK_TOOLS` der Montage. Die `finding_id`
         // wird nur protokolliert und zurückgegeben, nie zur Zielwahl benutzt.
-        let caller = Caller::Agent(context.session_id().as_str());
-        let manager = &self.shared.manager;
-        let result = if resume {
-            manager.resume(&id, caller)
-        } else {
-            manager.suspend(&id, caller)
-        };
+        let session = context.session_id().as_str().to_owned();
+        let manager = Arc::clone(&self.shared.manager);
+        let job = id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let caller = Caller::Agent(&session);
+            if resume {
+                manager.resume(&job, caller)
+            } else {
+                manager.suspend(&job, caller)
+            }
+        })
+        .await
+        .map_err(|err| ToolsError::ExecutionFailed(err.to_string()))?;
         let finding = finding_id.as_deref().unwrap_or("-");
         match result {
             Ok(outcome) => {
@@ -1347,8 +1364,8 @@ impl ToolExecutor for JobToolExecutor {
                 Kind::Logs => self.logs(context, call).await,
                 Kind::Stop => self.stop(context, call).await,
                 Kind::List => self.list(context, call),
-                Kind::Suspend => self.suspend_or_resume(context, call, false),
-                Kind::Resume => self.suspend_or_resume(context, call, true),
+                Kind::Suspend => self.suspend_or_resume(context, call, false).await,
+                Kind::Resume => self.suspend_or_resume(context, call, true).await,
             }
         })
     }

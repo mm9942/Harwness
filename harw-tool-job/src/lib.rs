@@ -17,7 +17,12 @@
 //!   Job-cgroup ein bzw. taut sie auf ([`JobFreezer`]); dieselbe
 //!   Besitzprüfung wie `job.stop`, Nachfrage über `ALWAYS_ASK_TOOLS` der
 //!   Montage; `finding_id` (UUIDv4) nur für Log und Ergebnis. Einen Freeze,
-//!   den harw nicht vermerkt hat, übernimmt und hebt harw nie auf;
+//!   den harw nicht vermerkt hat, übernimmt und hebt harw nie auf, auch
+//!   keine Warden-Eindämmung, die nach harws Anhalten dazukam
+//!   ([`ContainmentHolds`], geprüft vor und nach dem Auftauen, nach
+//!   bestem Bemühen unter der geteilten Sperre [`ContainmentLease`]);
+//!   `job.suspend` friert erst ein, wenn das
+//!   Anhalten dauerhaft (`fsync`) in `meta.json` vermerkt ist;
 //!   `job.stop` beendet einen angehaltenen Job eingefroren (SIGKILL).
 //!   Haltezeit zählt nicht als aktive Laufzeit (Wanduhr-Semantik in
 //!   [`model`]).
@@ -66,8 +71,9 @@
 //!   identität)
 //! - [`launcher`] — [`JobLauncher`], [`ShellJobLauncher`]
 //! - [`manager`] — [`JobManager`]
-//! - [`freeze`] — [`JobFreezer`], [`FreezeError`] (`CgroupFreezer` unter
-//!   Linux) für `job.suspend`/`job.resume`
+//! - [`freeze`] — [`JobFreezer`], [`ContainmentHolds`],
+//!   [`ContainmentLease`], [`FreezeError`] (`CgroupFreezer` und
+//!   `MarkerDirHolds` unter Linux) für `job.suspend`/`job.resume`
 //! - [`tools`] — [`JobToolProvider`]
 //!
 //! Keine `tmux`-Abhängigkeit.
@@ -89,9 +95,12 @@ pub use event::{
     ChannelNotifier, JobEvent, JobNotification, JobNotifier, NoopNotifier, RecordingNotifier,
     format_duration,
 };
+pub use freeze::{
+    CONTAINMENT_HOLDS_DIR, CONTAINMENT_OWNER_EVIDENCE, ContainmentHolds, ContainmentLease,
+    FreezeError, JobFreezer,
+};
 #[cfg(target_os = "linux")]
-pub use freeze::CgroupFreezer;
-pub use freeze::{FreezeError, JobFreezer};
+pub use freeze::{CgroupFreezer, MarkerDirHolds};
 pub use launcher::{JobLauncher, LaunchFuture, PreparedJob, ShellJobLauncher};
 pub use logs::{LogQuery, LogSlice};
 pub use manager::{

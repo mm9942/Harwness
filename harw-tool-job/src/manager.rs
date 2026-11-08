@@ -37,7 +37,11 @@
 //!   `cgroup.freeze`), [`JobManager::resume`] taut sie auf; dieselbe
 //!   Besitzprüfung wie [`JobManager::stop`]. harw übernimmt und hebt nie
 //!   einen Freeze, den es nicht selbst vermerkt hat
-//!   ([`JobError::FrozenElsewhere`]). Ein Stop taut einen angehaltenen Job
+//!   ([`JobError::FrozenElsewhere`]), auch keine Eindämmung des Wardens,
+//!   die nach harws Anhalten auf dieselbe cgroup kam
+//!   ([`JobError::ContainmentHeld`]). Eingefroren wird erst, wenn das
+//!   Anhalten dauerhaft in `meta.json` steht
+//!   ([`JobError::SuspendNotRecorded`]). Ein Stop taut einen angehaltenen Job
 //!   nie auf: er endet eingefroren mit SIGKILL. Haltezeit zählt nicht als
 //!   aktive Laufzeit ([`JobMeta::active_secs_at`], Wanduhr-Semantik in
 //!   [`crate::model`]).
@@ -75,7 +79,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Wie oft `meta.json` während des Laufs höchstens neu geschrieben wird.
 pub const META_PERSIST_INTERVAL: Duration = Duration::from_secs(10);
@@ -367,13 +371,55 @@ pub enum JobError {
     SuspendUnavailable,
     /// `job.suspend`/`job.resume`: die Job-cgroup ist eingefroren (oder
     /// friert gerade ein), ohne dass harw das vermerkt hat — ein Operator,
-    /// der Warden oder eine eingefrorene Vorfahren-cgroup. harw übernimmt
-    /// diesen Freeze nicht und hebt ihn nie auf (A3/O3: gefroren bleibt
-    /// gefroren bis zur Aufhebung durch seinen Urheber).
+    /// der Warden oder eine eingefrorene Vorfahren-cgroup; bei
+    /// `job.suspend` auch, wenn der Eindämmungsindex sie schon als vom
+    /// Warden gehalten zeigt. harw übernimmt diesen Freeze nicht und hebt
+    /// ihn nie auf (A3/O3: gefroren bleibt gefroren bis zur Aufhebung durch
+    /// seinen Urheber).
     #[msg(
         "job `{0}` is frozen by someone other than harw (an operator, the Warden or a parent cgroup); harw neither takes over nor lifts that freeze"
     )]
     FrozenElsewhere(String),
+    /// `job.resume`: harw hat den Job angehalten, aber ein Eigentümer
+    /// außerhalb von harw (der Warden) hält dieselbe cgroup inzwischen
+    /// eingedämmt (Marker im Eindämmungsindex,
+    /// [`crate::JobFreezer::containment_held`]). cgroup v2 hat nur ein
+    /// Freeze-Bit je cgroup; harws Auftauen höbe diese Eindämmung mit auf.
+    /// Nichts wird aufgetaut, der Job bleibt angehalten.
+    #[msg(
+        "job `{0}` is held by a containment outside harw (the Warden); job.resume refused, the job stays suspended"
+    )]
+    ContainmentHeld(String),
+    /// `job.suspend`: das Anhalten ließ sich nicht dauerhaft in `meta.json`
+    /// vermerken (Absicht vor Wirkung); es wurde nichts eingefroren, der
+    /// Job läuft weiter.
+    #[msg(
+        "job `{job}` was not suspended: the suspension could not be recorded ({source}); nothing was frozen"
+    )]
+    SuspendNotRecorded {
+        /// Kennung des Jobs.
+        job: String,
+        /// Ursache des Schreibfehlers.
+        #[source]
+        source: io::Error,
+    },
+    /// `job.suspend`: das Einfrieren schlug fehl, und auch die Rücknahme
+    /// des schon geschriebenen Vermerks ließ sich nicht speichern.
+    /// `meta.json` sagt deshalb weiter „angehalten“, obwohl nichts
+    /// eingefroren ist; im Speicher läuft der Job weiter, der nächste
+    /// erfolgreiche Schreibzugriff berichtigt die Datei.
+    #[msg(
+        "freeze of job `{job}` failed: {source}; the suspension record could not be taken back ({persist})"
+    )]
+    RollbackNotRecorded {
+        /// Kennung des Jobs.
+        job: String,
+        /// Warum das Einfrieren scheiterte.
+        #[source]
+        source: FreezeError,
+        /// Warum die Rücknahme nicht geschrieben wurde.
+        persist: io::Error,
+    },
     /// `job.suspend`: ein Stop des Jobs läuft schon (Gnadenfrist); ihn jetzt
     /// einzufrieren hielte seinen Signal-Handler an.
     #[msg("job `{0}` is being stopped; it cannot be suspended")]
@@ -383,7 +429,10 @@ pub enum JobError {
     Freeze {
         /// Kennung des Jobs.
         job: String,
-        /// `freeze`, `thaw` oder `probe` (Prüfung auf einen fremden Freeze).
+        /// `freeze`, `thaw`, `probe` (Prüfung auf einen fremden Freeze oder
+        /// eine Eindämmung außerhalb von harw) oder `refreeze` (Wieder-
+        /// einfrieren, nachdem während des Auftauens eine Eindämmung
+        /// auftauchte).
         operation: &'static str,
         /// Ursache.
         #[source]
@@ -595,6 +644,16 @@ struct EntryState {
 struct JobEntry {
     dir: PathBuf,
     state: Mutex<EntryState>,
+    // Serialises the `meta.json` writes of this job: the snapshot is taken
+    // and written under it, so writes reach the disk in snapshot order (the
+    // last one carries the newest state) and never share `meta.json.tmp`.
+    // Taken before `state`, never while `state` is held.
+    persist_lock: Mutex<()>,
+    // Test seam: how many of the next durable writes (`try_persist`) fail
+    // before touching the disk (a deferred write error, e.g. ENOSPC at
+    // `fsync`, that no real directory reproduces on demand).
+    #[cfg(test)]
+    fail_durable_writes: AtomicUsize,
     changes: watch::Sender<u64>,
     monitor: Mutex<Option<JoinHandle<()>>>,
     /// Gruppenführer, falls diese Sitzung den Job selbst gestartet hat
@@ -617,6 +676,9 @@ impl JobEntry {
                 milestones: 0,
                 monitored,
             }),
+            persist_lock: Mutex::new(()),
+            #[cfg(test)]
+            fail_durable_writes: AtomicUsize::new(0),
             changes,
             monitor: Mutex::new(None),
         }
@@ -634,10 +696,66 @@ impl JobEntry {
         lock(&self.state).meta.state
     }
 
+    /// Schreibt `meta.json` nach bestem Bemühen; ein Fehler wird nur
+    /// gewarnt (Fortschritt, Ende, Ablösen: der nächste Schreibzugriff holt
+    /// es nach). Wo eine Wirkung vom Vermerk abhängt (`job.suspend`), gilt
+    /// [`JobEntry::try_persist`].
+    ///
+    /// # Concurrency
+    /// Momentaufnahme und Schreiben unter `persist_lock`: ein Schreiber mit
+    /// älterem Stand (die Überwachung) landet nie nach einem neueren.
     fn persist(&self) {
+        let _writing = lock(&self.persist_lock);
         let meta = self.meta();
         if let Err(err) = write_meta(&self.dir, &meta) {
             warn!(job_id = %meta.job_id, error = %err, "job meta.json not written");
+        }
+    }
+
+    /// Schreibt `meta.json` atomar und dauerhaft ([`write_meta_synced`]:
+    /// `fsync` vor dem `rename`, damit auch verzögerte Schreibfehler eines
+    /// vollen oder entfernten Datenträgers hier ankommen) und meldet den
+    /// Fehler. Scheitert es, liegt auf der Platte unverändert der vorige
+    /// Vermerk.
+    ///
+    /// # Errors
+    /// Der Schreib-, Sync- bzw. Umbenennungsfehler.
+    ///
+    /// # Concurrency
+    /// Wie [`JobEntry::persist`] unter `persist_lock`: nach `Ok` kann kein
+    /// älterer Stand den Vermerk mehr überschreiben, jeder spätere
+    /// Schreibzugriff nimmt den Stand von dann.
+    fn try_persist(&self) -> io::Result<()> {
+        let _writing = lock(&self.persist_lock);
+        #[cfg(test)]
+        self.injected_write_failure()?;
+        write_meta_synced(&self.dir, &self.meta())
+    }
+
+    /// Test seam: the next `count` durable writes ([`JobEntry::try_persist`])
+    /// fail without touching the disk.
+    #[cfg(test)]
+    fn fail_next_durable_writes(&self, count: usize) {
+        self.fail_durable_writes.store(count, Ordering::SeqCst);
+    }
+
+    /// Test seam: consumes one armed failure of
+    /// [`JobEntry::fail_next_durable_writes`].
+    ///
+    /// # Errors
+    /// An injected I/O error while a failure is armed.
+    #[cfg(test)]
+    fn injected_write_failure(&self) -> io::Result<()> {
+        let armed = self
+            .fail_durable_writes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if armed {
+            Err(io::Error::other("injected durable write failure"))
+        } else {
+            Ok(())
         }
     }
 
@@ -682,9 +800,28 @@ impl JobEntry {
 
 /// Schreibt `meta.json` atomar (temporäre Datei + `rename`).
 fn write_meta(dir: &Path, meta: &JobMeta) -> io::Result<()> {
+    store_meta(dir, meta, false)
+}
+
+/// Wie [`write_meta`], aber die temporäre Datei wird vor dem `rename` mit
+/// `fsync` geschrieben: Fehler, die erst beim Zurückschreiben auftreten
+/// (voller Datenträger, Kontingent, NFS/FUSE), kommen so beim Aufrufer an,
+/// statt einen nie geschriebenen Vermerk als dauerhaft erscheinen zu
+/// lassen. Für Vermerke, von denen eine Wirkung abhängt (`job.suspend`).
+fn write_meta_synced(dir: &Path, meta: &JobMeta) -> io::Result<()> {
+    store_meta(dir, meta, true)
+}
+
+/// Gemeinsamer Kern von [`write_meta`] und [`write_meta_synced`].
+fn store_meta(dir: &Path, meta: &JobMeta, sync: bool) -> io::Result<()> {
     let text = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
     let tmp = dir.join(format!("{META_FILE}.tmp"));
-    fs::write(&tmp, text)?;
+    let mut file = File::create(&tmp)?;
+    file.write_all(&text)?;
+    if sync {
+        file.sync_all()?;
+    }
+    drop(file);
     fs::rename(&tmp, dir.join(META_FILE))
 }
 
@@ -1522,7 +1659,9 @@ impl JobManager {
     /// # Description
     /// Die Montage übergibt einen `CgroupFreezer` über dieselbe
     /// delegierte cgroup-Wurzel, unter der die Job-Runtime die Job-cgroups
-    /// anlegt (`[jobs] cgroup_root`). Ohne Freezer lehnen
+    /// anlegt (`[jobs] cgroup_root`); er liest den Eindämmungsindex des
+    /// Wardens ([`crate::CONTAINMENT_HOLDS_DIR`]), damit `job.resume` nie
+    /// eine Warden-Eindämmung aufhebt. Ohne Freezer lehnen
     /// [`JobManager::suspend`] und [`JobManager::resume`] mit
     /// [`JobError::SuspendUnavailable`] ab.
     pub fn set_freezer(&self, freezer: Arc<dyn JobFreezer>) {
@@ -1570,12 +1709,25 @@ impl JobManager {
     /// - Fremder Freeze: ist die cgroup schon eingefroren (oder friert
     ///   gerade ein), ohne dass harw das vermerkt hat, wird abgelehnt
     ///   ([`JobError::FrozenElsewhere`]); harw übernimmt ihn nicht und hebt
-    ///   ihn später nie auf.
-    /// - Absicht vor Wirkung: das Anhalten wird in `meta.json` vermerkt,
-    ///   bevor der Kernel einfriert; scheitert das Einfrieren, wird der
-    ///   Vermerk zurückgenommen. Ein Absturz dazwischen hinterlässt so nie
-    ///   einen eingefrorenen Job ohne Vermerk (den `job.resume` nicht
-    ///   auftauen könnte).
+    ///   ihn später nie auf. Ebenso, wenn der Eindämmungsindex die cgroup
+    ///   schon als vom Warden gehalten zeigt (sein Marker kommt vor seinem
+    ///   Freeze, [`JobFreezer::containment_held`]). Ist der Index nicht
+    ///   lesbar, wird trotzdem eingefroren (Warnung im Log): Anhalten ist
+    ///   die sichere Richtung, und [`JobManager::resume`] fragt den Index
+    ///   vor dem Auftauen erneut und taut ohne lesbaren Index nicht auf.
+    /// - Absicht vor Wirkung: das Anhalten wird dauerhaft (`fsync`) in
+    ///   `meta.json` vermerkt, bevor der Kernel einfriert; ein Schreiber mit
+    ///   älterem Stand (die Überwachung) kann den Vermerk danach nicht mehr
+    ///   überschreiben. Lässt sich der Vermerk nicht schreiben (volles oder
+    ///   schreibgeschütztes Zustandsverzeichnis), wird nichts eingefroren
+    ///   ([`JobError::SuspendNotRecorded`]); der zurückgenommene Stand wird
+    ///   nach bestem Bemühen geschrieben (eine nicht synchronisierte
+    ///   Schreibung der Überwachung kann „angehalten“ schon abgelegt haben).
+    ///   Scheitert das Einfrieren, wird der Vermerk zurückgenommen, im
+    ///   Speicher und auf der Platte; lässt sich die Rücknahme nicht
+    ///   schreiben, meldet das [`JobError::RollbackNotRecorded`]. Ein
+    ///   Absturz dazwischen hinterlässt so nie einen eingefrorenen Job ohne
+    ///   Vermerk (den `job.resume` nicht auftauen könnte).
     /// - Idempotent: ein schon angehaltener Job ergibt
     ///   [`SuspendTransition::AlreadySuspended`]; mit bewiesener cgroup wird
     ///   `cgroup.freeze` = 1 erneut geschrieben (ein außerhalb von harw
@@ -1588,15 +1740,21 @@ impl JobManager {
     /// [`JobError::NotFound`], [`JobError::NotSuspendable`],
     /// [`JobError::StopPending`], [`JobError::SuspendUnavailable`],
     /// [`JobError::NoJobCgroup`], [`JobError::FrozenElsewhere`],
+    /// [`JobError::SuspendNotRecorded`], [`JobError::RollbackNotRecorded`],
     /// [`JobError::Freeze`] (auch `probe`, wenn der Kernel-Zustand nicht
     /// lesbar ist: ohne ihn wird nicht eingefroren).
     ///
     /// # Concurrency
-    /// Synchron und kurz (wenige cgroupfs-Zugriffe); Aufrufe von `suspend`
-    /// und `resume` laufen nacheinander, die Sperre des Jobs wird nie über
+    /// Synchron und blockierend (wenige cgroupfs-Zugriffe, ein `fsync` von
+    /// `meta.json`, beim Rücknehmen bis zu etwa 100 ms Warten auf die
+    /// Sperre des Eindämmungsindex): asynchrone Aufrufer nehmen
+    /// `spawn_blocking`. Aufrufe von `suspend` und `resume` laufen
+    /// nacheinander, die Sperre des Jobs wird nie über
     /// einen Kernel-Zugriff gehalten. Endet der Job zwischen Vermerk und
-    /// Einfrieren, wird wieder aufgetaut und [`JobError::NotSuspendable`]
-    /// gemeldet; wird er dazwischen abgelöst, bleibt er angehalten.
+    /// Einfrieren, wird wieder aufgetaut (außer eine Eindämmung außerhalb
+    /// von harw hält die cgroup inzwischen) und
+    /// [`JobError::NotSuspendable`] gemeldet; wird er dazwischen abgelöst,
+    /// bleibt er angehalten.
     pub fn suspend(&self, id: &JobId, caller: Caller<'_>) -> Result<SuspendOutcome, JobError> {
         let entry = self.entry(id, caller)?;
         let _serial = lock(&self.suspend_ops);
@@ -1621,6 +1779,22 @@ impl JobManager {
             warn!(job_id = %id, "job.suspend refused: the job cgroup is frozen outside harw");
             return Err(JobError::FrozenElsewhere(id.to_string()));
         }
+        // Nor a bit the Warden is about to set (its marker comes before its
+        // freeze) or keeps through a stale marker: sharing it would let the
+        // Warden's release silently lift harw's suspension. An unreadable
+        // index does not stop the suspend: freezing is the safe direction,
+        // and job.resume asks the index again and thaws nothing without it.
+        match freezer.containment_held(&leaf) {
+            Ok(false) => {}
+            Ok(true) => {
+                warn!(job_id = %id, "job.suspend refused: a containment outside harw holds the job cgroup");
+                return Err(JobError::FrozenElsewhere(id.to_string()));
+            }
+            Err(err) => {
+                warn!(job_id = %id, "job.suspend: containment index not readable; freezing anyway, job.resume stays refused until it is");
+                debug!(job_id = %id, error = %err, "job.suspend: containment index probe failed");
+            }
+        }
         // Intent before effect: the record says "suspended" before the
         // kernel freezes, so no frozen job is ever left without a record.
         let marked_at = Timestamp::now();
@@ -1635,11 +1809,39 @@ impl JobManager {
             guard.meta.state = JobState::Suspended;
             guard.meta.begin_suspension(marked_at);
         }
-        entry.persist();
-        if let Err(source) = freezer.freeze(&leaf) {
+        // The record must be durable before the kernel freezes: without it a
+        // restart would find a frozen job with no record of harw's
+        // ownership. Nothing is frozen when it fails. The atomic rename
+        // usually leaves the previous record on disk, but a monitor write
+        // (not synced) that ran between the mark and this write may have
+        // stored "suspended" already; so the taken-back state is written
+        // too, best effort (a failure is only logged: nothing is frozen, and
+        // the next write corrects the record).
+        if let Err(source) = entry.try_persist() {
             rollback_suspension(&entry, marked_at);
             entry.persist();
             entry.bump();
+            warn!(job_id = %id, "job.suspend aborted: the suspension could not be recorded; nothing frozen");
+            debug!(job_id = %id, error = %source, "job.suspend: meta.json not written");
+            return Err(JobError::SuspendNotRecorded {
+                job: id.to_string(),
+                source,
+            });
+        }
+        if let Err(source) = freezer.freeze(&leaf) {
+            rollback_suspension(&entry, marked_at);
+            entry.bump();
+            // The durable record says "suspended" while nothing is frozen:
+            // take it back on disk too, and say so when that fails.
+            if let Err(persist) = entry.try_persist() {
+                warn!(job_id = %id, "job.suspend: freeze failed and the suspension record could not be taken back");
+                debug!(job_id = %id, error = %persist, "job.suspend: rollback of meta.json not written");
+                return Err(JobError::RollbackNotRecorded {
+                    job: id.to_string(),
+                    source,
+                    persist,
+                });
+            }
             return Err(JobError::Freeze {
                 job: id.to_string(),
                 operation: "freeze",
@@ -1648,17 +1850,27 @@ impl JobManager {
         }
         // The job may have ended between the record and the freeze (its
         // monitor closed the suspension): thaw again so no frozen cgroup
-        // outlives a refusal. A job detached in between stays suspended.
+        // outlives a refusal, unless a containment outside harw (the
+        // Warden) holds the cgroup by now. A job detached in between stays
+        // suspended.
         let ended = {
             let guard = lock(&entry.state);
             (!guard.meta.is_suspended()).then_some(guard.meta.state)
         };
         if let Some(state) = ended {
-            match freezer.thaw(&leaf) {
-                Ok(()) | Err(FreezeError::Gone) => {}
-                Err(err) => {
-                    warn!(job_id = %id, "job.suspend: job ended while being frozen; undo thaw failed");
-                    debug!(job_id = %id, error = %err, "job.suspend: undo thaw failed");
+            match thaw_unless_held(freezer.as_ref(), &leaf, id) {
+                Ok(())
+                | Err(ThawRefusal::Failed {
+                    source: FreezeError::Gone,
+                    ..
+                }) => {}
+                Err(ThawRefusal::Held) => {
+                    warn!(job_id = %id, "job.suspend: job ended while being frozen; a containment outside harw holds the cgroup, not thawed");
+                }
+                Err(ThawRefusal::Failed { operation, source }) => {
+                    log_lost_refreeze(id, operation);
+                    warn!(job_id = %id, operation, "job.suspend: job ended while being frozen; undo thaw failed");
+                    debug!(job_id = %id, operation, error = %source, "job.suspend: undo thaw failed");
                 }
             }
             return Err(JobError::NotSuspendable {
@@ -1721,18 +1933,42 @@ impl JobManager {
     ///   bewiesene cgroup trotzdem eingefroren (ein Freeze, den harw nicht
     ///   vermerkt hat), wird nichts aufgetaut:
     ///   [`JobError::FrozenElsewhere`].
+    /// - Eindämmung nach dem Anhalten: cgroup v2 hat ein Freeze-Bit je
+    ///   cgroup. Hält der Warden die cgroup inzwischen selbst eingedämmt
+    ///   (Marker im Eindämmungsindex, [`JobFreezer::containment_held`]),
+    ///   wird nicht aufgetaut und der Job bleibt angehalten
+    ///   ([`JobError::ContainmentHeld`]). Gefragt wird unter der geteilten
+    ///   Sperre des Index ([`JobFreezer::containment_lease`]; der Warden
+    ///   legt Marker und Freeze unter der exklusiven an, wenn er sie
+    ///   bekommt) vor dem Auftauen und direkt danach; taucht der Marker
+    ///   dazwischen doch auf, wird sofort wieder eingefroren. Die Sperre ist
+    ///   nach bestem Bemühen: hält ein anderer Prozess sie länger als etwa
+    ///   100 ms, geht es ohne sie weiter (Warnung im Log), dann schützt
+    ///   allein die erneute Prüfung. Ist der Index nicht lesbar oder nicht
+    ///   vertrauenswürdig, wird nicht aufgetaut ([`JobError::Freeze`] mit
+    ///   `probe`). Scheitert das Wiedereinfrieren (`refreeze`), meldet das
+    ///   Log das auf `error`. Ist die cgroup nach dem Auftauen verschwunden
+    ///   (der Job endete), gilt das als fortgesetzt: es bleibt nichts
+    ///   einzudämmen.
     /// - Wanduhr: die Haltezeit wird in `suspended_secs` gebucht; das
     ///   restliche Budget läuft vom Stand vor dem Anhalten weiter.
     ///
     /// # Errors
     /// [`JobError::NotFound`], [`JobError::SuspendUnavailable`],
     /// [`JobError::NoJobCgroup`], [`JobError::FrozenElsewhere`],
-    /// [`JobError::Freeze`].
+    /// [`JobError::ContainmentHeld`], [`JobError::Freeze`] (`probe`,
+    /// `thaw`, `refreeze`).
     ///
     /// # Concurrency
-    /// Wie [`JobManager::suspend`]. Aufgetaut wird vor dem Vermerk: ein
+    /// Wie [`JobManager::suspend`]; zusätzlich wartet `resume` höchstens
+    /// etwa 100 ms blockierend auf die Sperre des Eindämmungsindex, solange
+    /// ein anderer Prozess sie exklusiv hält. Aufgetaut wird vor dem
+    /// Vermerk: ein
     /// Absturz dazwischen lässt den Vermerk stehen, ein weiteres
-    /// `job.resume` taut (wirkungslos) erneut auf und schließt ihn.
+    /// `job.resume` taut (wirkungslos) erneut auf und schließt ihn. Lässt
+    /// sich der Vermerk nach dem Auftauen nicht schreiben, bleibt der Job
+    /// fortgesetzt und `meta.json` sagt bis zum nächsten Schreibzugriff
+    /// „angehalten“ (die sichere Seite; gewarnt wird im Log).
     pub fn resume(&self, id: &JobId, caller: Caller<'_>) -> Result<SuspendOutcome, JobError> {
         let entry = self.entry(id, caller)?;
         let _serial = lock(&self.suspend_ops);
@@ -1765,14 +2001,38 @@ impl JobManager {
             ));
         }
         let (freezer, leaf) = self.freeze_target(&entry)?;
-        freezer.thaw(&leaf).map_err(freeze_error(id, "thaw"))?;
+        // The freeze bit is shared: never lift a containment the Warden put
+        // on the cgroup after harw suspended it (A3/O3).
+        match thaw_unless_held(freezer.as_ref(), &leaf, id) {
+            Ok(()) => {}
+            Err(ThawRefusal::Held) => {
+                warn!(job_id = %id, "job.resume refused: a containment outside harw holds the job cgroup");
+                return Err(JobError::ContainmentHeld(id.to_string()));
+            }
+            Err(ThawRefusal::Failed { operation, source }) => {
+                log_lost_refreeze(id, operation);
+                debug!(job_id = %id, operation, error = %source, "job.resume: not resumed");
+                return Err(JobError::Freeze {
+                    job: id.to_string(),
+                    operation,
+                    source,
+                });
+            }
+        }
         let transition = if close_suspension(&entry) {
             SuspendTransition::Resumed
         } else {
             SuspendTransition::NotSuspended
         };
         if transition.changed() {
-            entry.persist();
+            // Thawed before the record (see Concurrency). A failed write
+            // leaves "suspended" on disk while the job runs: the safe side
+            // (a later job.resume thaws again without effect, a stop kills
+            // instead of terminating), and the next write corrects it.
+            if let Err(err) = entry.try_persist() {
+                warn!(job_id = %id, "job.resume: thawed, but the record still says suspended until the next write");
+                debug!(job_id = %id, error = %err, "job.resume: meta.json not written");
+            }
             entry.bump();
             info!(job_id = %id, "job resumed (cgroup thawed)");
         }
@@ -2178,6 +2438,115 @@ fn check_suspendable(
 /// Der erste Fehler der beiden Prüfungen.
 fn probe_held(freezer: &dyn JobFreezer, leaf: &str) -> Result<bool, FreezeError> {
     Ok(freezer.freeze_requested(leaf)? || freezer.is_frozen(leaf)?)
+}
+
+/// Warum [`thaw_unless_held`] die cgroup nicht aufgetaut gelassen hat.
+#[derive(Debug)]
+enum ThawRefusal {
+    /// Eine Eindämmung außerhalb von harw (der Warden) hält die cgroup:
+    /// nicht aufgetaut bzw. sofort wieder eingefroren.
+    Held,
+    /// Prüfen (`probe`), Auftauen (`thaw`) oder Wiedereinfrieren
+    /// (`refreeze`) schlug fehl. Nach `probe` vor dem Auftauen ist nichts
+    /// geschehen; nach `probe` danach ist wieder eingefroren.
+    Failed {
+        /// `probe`, `thaw` oder `refreeze`.
+        operation: &'static str,
+        /// Ursache.
+        source: FreezeError,
+    },
+}
+
+/// Taut harws eigenen Freeze von `leaf` auf, außer eine Eindämmung
+/// außerhalb von harw (der Warden) hält dieselbe cgroup.
+///
+/// # Description
+/// cgroup v2 hat ein Freeze-Bit je cgroup, das harws Anhalten und eine
+/// Warden-Eindämmung teilen. Deshalb:
+/// 0. Zuerst wird die geteilte Sperre des Eindämmungsindex genommen
+///    ([`JobFreezer::containment_lease`]) und bis zum Ende gehalten. Der
+///    Warden legt Marker und Freeze unter der exklusiven Sperre an, wenn er
+///    sie bekommt; dann kann zwischen Prüfung und Auftauen keine Eindämmung
+///    dazukommen. Die Sperre ist nach bestem Bemühen: jeder lokale Prozess
+///    kann sie halten. Ist sie nicht zu bekommen (umkämpfter Lease), geht
+///    es ohne sie weiter (Warnung mit `job_id`), denn sonst könnte jeder
+///    Nutzer jedes `job.resume` blockieren; es schützt dann allein Schritt 2.
+///    Ist der Index nicht vertrauenswürdig, wird nicht aufgetaut (`probe`).
+/// 1. Vor dem Auftauen wird der Eindämmungsindex gefragt
+///    ([`JobFreezer::containment_held`]); gehalten → nichts geschieht.
+/// 2. Nach dem Auftauen wird erneut gefragt. Der Warden legt seinen Marker
+///    an, *bevor* er einfriert; ein Freeze, der zwischen Prüfung und
+///    Auftauen ohne Sperre kam, zeigt sich also jetzt. Dann wird sofort
+///    wieder eingefroren und [`ThawRefusal::Held`] gemeldet. Kommt der
+///    Marker erst nach der zweiten Prüfung, friert der Warden selbst danach
+///    ein.
+///
+/// Jeder Fehler einer Prüfung zählt als „vielleicht gehalten“ (fail
+/// closed): vorher wird nicht aufgetaut, nachher wieder eingefroren. Nur
+/// [`FreezeError::Gone`] nach dem Auftauen (bei der zweiten Prüfung oder
+/// beim Wiedereinfrieren) zählt als aufgetaut: die cgroup ist mit dem Job
+/// verschwunden, es bleibt nichts einzudämmen und nichts zu melden.
+///
+/// # Errors
+/// [`ThawRefusal::Held`] bzw. [`ThawRefusal::Failed`] mit der
+/// gescheiterten Operation.
+fn thaw_unless_held(freezer: &dyn JobFreezer, leaf: &str, id: &JobId) -> Result<(), ThawRefusal> {
+    // Held until the function returns, after the re-check (and refreeze).
+    let lease = freezer.containment_lease().map_err(thaw_failed("probe"))?;
+    if lease.is_contended() {
+        warn!(job_id = %id, "containment index lock not obtained; thawing with check and re-check only");
+    }
+    if freezer
+        .containment_held(leaf)
+        .map_err(thaw_failed("probe"))?
+    {
+        return Err(ThawRefusal::Held);
+    }
+    freezer.thaw(leaf).map_err(thaw_failed("thaw"))?;
+    let after = freezer.containment_held(leaf);
+    if matches!(after, Ok(false) | Err(FreezeError::Gone)) {
+        // Not held, or the cgroup is gone with the job: nothing to restore.
+        return Ok(());
+    }
+    // Held now, or unknown: restore the freeze before anything else.
+    match freezer.freeze(leaf) {
+        Ok(()) => {}
+        // Removed right after the re-check: no process is left to contain.
+        Err(FreezeError::Gone) => return Ok(()),
+        Err(source) => {
+            return Err(ThawRefusal::Failed {
+                operation: "refreeze",
+                source,
+            });
+        }
+    }
+    match after {
+        Err(source) => Err(ThawRefusal::Failed {
+            operation: "probe",
+            source,
+        }),
+        Ok(_) => Err(ThawRefusal::Held),
+    }
+}
+
+/// Bildet einen [`FreezeError`] von `operation` auf
+/// [`ThawRefusal::Failed`] ab.
+fn thaw_failed(operation: &'static str) -> impl FnOnce(FreezeError) -> ThawRefusal {
+    move |source| ThawRefusal::Failed { operation, source }
+}
+
+/// Meldet auf `error`, wenn [`thaw_unless_held`] aufgetaut hat und danach
+/// nicht wieder einfrieren konnte (`refreeze`): die cgroup läuft, obwohl
+/// eine Eindämmung außerhalb von harw sie halten soll (oder das nicht
+/// auszuschließen ist), und der Vermerk sagt weiter „angehalten“. Ohne
+/// Pfad und Fehlertext; die Einzelheiten stehen auf `debug`.
+fn log_lost_refreeze(id: &JobId, operation: &'static str) {
+    if operation == "refreeze" {
+        error!(
+            job_id = %id,
+            "job cgroup thawed and could not be frozen again; a containment outside harw may be lifted"
+        );
+    }
 }
 
 /// Bildet einen [`FreezeError`] von `operation` auf `job` auf
@@ -2921,6 +3290,33 @@ mod error_display_tests {
         assert_eq!(
             JobError::StopPending("j1".to_owned()).to_string(),
             "job `j1` is being stopped; it cannot be suspended"
+        );
+        assert_eq!(
+            JobError::ContainmentHeld("j1".to_owned()).to_string(),
+            "job `j1` is held by a containment outside harw (the Warden); job.resume refused, the job stays suspended"
+        );
+        let not_recorded = JobError::SuspendNotRecorded {
+            job: "j1".to_owned(),
+            source: std::io::Error::other("disk full"),
+        };
+        assert_eq!(
+            not_recorded.to_string(),
+            "job `j1` was not suspended: the suspension could not be recorded (disk full); nothing was frozen"
+        );
+        assert!(not_recorded.source().is_some());
+        let rollback = JobError::RollbackNotRecorded {
+            job: "j1".to_owned(),
+            source: FreezeError::PermissionDenied,
+            persist: std::io::Error::other("read-only"),
+        };
+        assert_eq!(
+            rollback.to_string(),
+            "freeze of job `j1` failed: permission denied on the job cgroup; the suspension record could not be taken back (read-only)"
+        );
+        // `source()` is the freeze failure; the persist error is in the text.
+        assert_eq!(
+            rollback.source().map(ToString::to_string),
+            Some(FreezeError::PermissionDenied.to_string())
         );
         assert_eq!(
             JobError::Freeze {

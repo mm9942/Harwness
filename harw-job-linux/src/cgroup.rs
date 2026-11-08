@@ -47,6 +47,10 @@ const FROZEN_EVENT: &str = "cgroup.events frozen";
 /// (Linux 5.2+).
 const FREEZE_FILE: &str = "cgroup.freeze";
 
+/// The kernel interface behind [`CgroupBackend::kernel_id`]: on cgroup v2
+/// the id of a cgroup is the inode number of its directory.
+const CGROUP_ID: &str = "cgroup id (directory inode)";
+
 /// What to create for one job attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CgroupSpec {
@@ -197,6 +201,28 @@ pub trait CgroupBackend: Send + Sync {
         Err(CgroupError::Unsupported {
             feature: FREEZE_FILE,
         })
+    }
+
+    /// The kernel id of the cgroup: on cgroup v2 the inode number of its
+    /// directory, the id `bpf_get_current_cgroup_id()`, the DoD probes and
+    /// the sentinel use. The Warden addresses cgroups by path; for a
+    /// containment marker keyed by this id it derives it the same way
+    /// (`st_ino` of `<cgroup root>/<cgroup>`).
+    ///
+    /// # Description
+    /// Callers that coordinate with another owner of the same cgroup (e.g.
+    /// a containment index keyed by kernel id) name the cgroup by this id,
+    /// not by a path. The provided implementation reports
+    /// [`CgroupError::Unsupported`], so existing backends (and test fakes)
+    /// need not implement it, and callers that need the id fail closed;
+    /// [`CgroupV2Fs`] reads it from the opened directory (`fstat`).
+    ///
+    /// # Errors
+    /// [`CgroupError::Unsupported`] for backends without this probe,
+    /// [`CgroupError::NotFound`] if the cgroup is gone,
+    /// [`CgroupError::InvalidName`] for an unsafe name.
+    fn kernel_id(&self, _group: &CgroupHandle) -> Result<u64, CgroupError> {
+        Err(CgroupError::Unsupported { feature: CGROUP_ID })
     }
 
     /// SIGKILLs every member, descendants included (`cgroup.kill`, with a
@@ -719,6 +745,16 @@ impl CgroupBackend for CgroupV2Fs {
         parse_frozen(&events)
     }
 
+    fn kernel_id(&self, group: &CgroupHandle) -> Result<u64, CgroupError> {
+        // `child` validates the name and opens exactly that directory
+        // beneath the delegated root; its inode is the cgroup id.
+        let dir = self.child(group.name())?;
+        let meta = dir
+            .dir_metadata()
+            .map_err(|error| CgroupError::from_io("stat", group.name(), error))?;
+        Ok(cap_std::fs::MetadataExt::ino(&meta))
+    }
+
     fn kill(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
         match self.write(group, "cgroup.kill", "1") {
             Err(CgroupError::Unsupported { .. }) => self.kill_by_freezing(group),
@@ -900,6 +936,56 @@ mod tests {
             Err(CgroupError::Unsupported { feature }) => assert_eq!(feature, FREEZE_FILE),
             other => return Err(TestError::Unexpected(format!("{other:?}"))),
         }
+        // No kernel id either: callers that need it fail closed instead of
+        // guessing one.
+        match backend.kernel_id(&group) {
+            Err(CgroupError::Unsupported { feature }) => assert_eq!(feature, CGROUP_ID),
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        Ok(())
+    }
+
+    /// `CgroupV2Fs::kernel_id` is the inode of the child directory beneath
+    /// the root, and it validates the name before touching the tree (no
+    /// path outside the delegated root is ever stat'ed). The backend is
+    /// built over a plain directory: `kernel_id` needs no cgroupfs.
+    #[test]
+    fn test_kernel_id_is_the_child_directory_inode() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir(temp.path().join("harw-job-a")).map_err(ctx("mkdir"))?;
+        let backend = CgroupV2Fs {
+            root: Dir::open_ambient_dir(temp.path(), cap_std::ambient_authority())
+                .map_err(ctx("open root"))?,
+            root_proc_path: "/harw.slice".to_owned(),
+            enabled: BTreeSet::new(),
+            root_display: temp.path().to_path_buf(),
+        };
+        let group = CgroupHandle::new(
+            "harw-job-a".to_owned(),
+            "/harw.slice/harw-job-a".to_owned(),
+            None,
+        );
+        let inode = std::os::unix::fs::MetadataExt::ino(
+            &std::fs::symlink_metadata(temp.path().join("harw-job-a"))
+                .map_err(ctx("stat child"))?,
+        );
+        assert_eq!(backend.kernel_id(&group).map_err(ctx("kernel id"))?, inode);
+        let gone = CgroupHandle::new(
+            "harw-job-b".to_owned(),
+            "/harw.slice/harw-job-b".to_owned(),
+            None,
+        );
+        match backend.kernel_id(&gone) {
+            Err(CgroupError::NotFound { .. }) => {}
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        for bad in ["..", "a/b", ".hidden"] {
+            let group = CgroupHandle::new(bad.to_owned(), format!("/harw.slice/{bad}"), None);
+            match backend.kernel_id(&group) {
+                Err(CgroupError::InvalidName { .. }) => {}
+                other => return Err(TestError::Unexpected(format!("{bad:?}: {other:?}"))),
+            }
+        }
         Ok(())
     }
 
@@ -1017,6 +1103,13 @@ mod tests {
         assert_eq!(identity.cgroup_v2_path.as_deref(), Some(handle.proc_path()));
         let stats = backend.stats(&handle).map_err(ctx("stats"))?;
         assert_eq!(stats.populated, Some(true));
+        // The kernel id is the inode of the cgroup directory (the id the
+        // BPF probes report; the Warden derives it for its markers).
+        let inode = std::os::unix::fs::MetadataExt::ino(
+            &std::fs::symlink_metadata(backend.root_path().join(handle.name()))
+                .map_err(ctx("stat cgroup dir"))?,
+        );
+        assert_eq!(backend.kernel_id(&handle).map_err(ctx("kernel id"))?, inode);
         assert!(
             !backend
                 .freeze_requested(&handle)
