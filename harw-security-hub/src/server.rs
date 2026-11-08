@@ -595,6 +595,7 @@ async fn posture(peer: PeerIdentity, state: &HubState) -> HubResponse {
                 host: host.clone(),
                 min_severity: wiring.min_severity,
                 since,
+                now,
             };
             let source = Arc::clone(&wiring.source);
             match tokio::task::spawn_blocking(move || source.recent(&filter)).await {

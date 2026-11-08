@@ -43,6 +43,11 @@
 //! - lines longer than [`FindingLimits::max_line_bytes`] are skipped unparsed,
 //! - at most [`FindingLimits::max_records`] matching findings are returned
 //!   (the newest ones),
+//! - lines whose `observed_at` lies more than [`MAX_CLOCK_SKEW`] after the
+//!   evaluation time [`FindingFilter::now`] are counted as malformed and
+//!   dropped (a future-dated line would otherwise stay "recent" indefinitely
+//!   and pin every posture view); the bound mirrors the canonical
+//!   `harw_dod_client::findings::MAX_CLOCK_SKEW` reader,
 //! - summaries are truncated to [`FindingLimits::max_summary_chars`] and
 //!   control characters are replaced.
 //!
@@ -55,10 +60,24 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use harw_types::{FindingId, HostId, ImpactSeverity};
+
+/// How far `observed_at` may lie after the evaluation time
+/// ([`FindingFilter::now`]) before a line is treated as implausible and
+/// counted in [`FindingBatch::skipped_malformed`].
+///
+/// Same value as `harw_dod_client::findings::MAX_CLOCK_SKEW` (5 min). It is
+/// mirrored, not imported, because this module never links a DoD crate (see
+/// the module boundary) and uses `jiff` instead of `time`.
+///
+/// The sync is enforced by the unit test
+/// `test_clock_skew_mirrors_the_dod_client_definition`: it embeds
+/// `harw-dod-client/src/findings.rs` as text (`include_str!`, no Cargo
+/// dependency) and fails as soon as the client's definition changes.
+pub const MAX_CLOCK_SKEW: SignedDuration = SignedDuration::from_mins(5);
 
 /// One DoD finding as read from the export.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,9 +127,27 @@ pub struct FindingFilter {
     pub min_severity: ImpactSeverity,
     /// Only findings observed at or after this time.
     pub since: Timestamp,
+    /// Evaluation time (the caller's injected clock). Lines observed more
+    /// than [`MAX_CLOCK_SKEW`] after it are implausible: they are counted in
+    /// [`FindingBatch::skipped_malformed`] and never returned, whatever
+    /// their host or severity.
+    pub now: Timestamp,
 }
 
 impl FindingFilter {
+    /// Latest plausible `observed_at`: `now + MAX_CLOCK_SKEW` (inclusive).
+    /// Only near [`Timestamp::MAX`] does the addition overflow; the bound is
+    /// then [`Timestamp::MAX`] itself, like the DoD client's reader keeps
+    /// every line when its bound overflows.
+    fn latest_plausible(&self) -> Timestamp {
+        self.now
+            .checked_add(MAX_CLOCK_SKEW)
+            .unwrap_or(Timestamp::MAX)
+    }
+
+    // `true` when the finding belongs to the requested host, severity and
+    // window start; the upper (skew) bound is checked separately so that
+    // violators can be counted.
     fn matches(&self, finding: &DodFinding) -> bool {
         finding.host == self.host
             && finding.severity >= self.min_severity
@@ -147,7 +184,9 @@ impl Default for FindingLimits {
 pub struct FindingBatch {
     /// Matching findings, newest first.
     pub findings: Vec<DodFinding>,
-    /// Lines that were not valid finding records.
+    /// Lines that were not valid finding records, including lines whose
+    /// `observed_at` lies more than [`MAX_CLOCK_SKEW`] after
+    /// [`FindingFilter::now`].
     pub skipped_malformed: usize,
     /// Lines longer than the line limit.
     pub skipped_oversize: usize,
@@ -207,6 +246,10 @@ impl std::error::Error for FindingSourceError {
 /// use. Calls are synchronous; the server runs them on a blocking thread.
 pub trait DodFindingSource: Send + Sync {
     /// Returns recent findings matching `filter`, newest first.
+    ///
+    /// Findings observed more than [`MAX_CLOCK_SKEW`] after
+    /// [`FindingFilter::now`] are never returned; they are counted in
+    /// [`FindingBatch::skipped_malformed`].
     ///
     /// # Errors
     /// A [`FindingSourceError`] if the source cannot be read.
@@ -278,7 +321,9 @@ impl DodFindingSource for JsonlFindingSource {
 /// Parses a JSON Lines buffer into a bounded [`FindingBatch`].
 ///
 /// `started_mid_file` discards everything up to and including the first
-/// newline, because that line is (probably) cut off.
+/// newline, because that line is (probably) cut off. A line observed more
+/// than [`MAX_CLOCK_SKEW`] after `filter.now` counts as malformed, before
+/// the host/severity/window filter applies.
 #[must_use]
 pub fn parse_findings(
     bytes: &[u8],
@@ -298,6 +343,7 @@ pub fn parse_findings(
     let mut batch = FindingBatch::default();
     let mut kept: VecDeque<DodFinding> = VecDeque::new();
     let max_records = limits.max_records.max(1);
+    let latest_plausible = filter.latest_plausible();
     for raw_line in body.split(|&byte| byte == b'\n') {
         let line = raw_line.trim_ascii();
         if line.is_empty() {
@@ -313,6 +359,12 @@ pub fn parse_findings(
         };
         if finding.schema_version == Some(0) {
             batch.skipped_malformed += 1;
+            continue;
+        }
+        // Future-dated beyond the skew: implausible, would stay "recent"
+        // forever otherwise.
+        if finding.observed_at > latest_plausible {
+            batch.skipped_malformed = batch.skipped_malformed.saturating_add(1);
             continue;
         }
         if !filter.matches(&finding) {
@@ -349,11 +401,15 @@ fn sanitize(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         DodFindingSource, FindingFilter, FindingLimits, FindingSourceError, JsonlFindingSource,
-        parse_findings,
+        MAX_CLOCK_SKEW, parse_findings,
     };
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::{HostId, ImpactSeverity};
-    use jiff::Timestamp;
+    use jiff::{SignedDuration, Timestamp};
+
+    // Evaluation time of `filter()`: after every fixture line of the
+    // existing tests (the newest is `V3_FIXTURE_LINE` at 11:00Z).
+    const NOW: &str = "2026-09-27T12:00:00Z";
 
     fn filter() -> TestResult<FindingFilter> {
         Ok(FindingFilter {
@@ -362,6 +418,7 @@ mod tests {
             since: "2026-09-27T00:00:00Z"
                 .parse::<Timestamp>()
                 .map_err(ctx("since"))?,
+            now: NOW.parse::<Timestamp>().map_err(ctx("now"))?,
         })
     }
 
@@ -673,6 +730,144 @@ mod tests {
             Err(FindingSourceError::NotAFile(_) | FindingSourceError::Io { .. }) => {}
             other => return Err(TestError::Unexpected(format!("{other:?}"))),
         }
+        Ok(())
+    }
+
+    /// Source of the canonical reader, embedded as text only: no Cargo
+    /// dependency on and no link of the DoD client (module boundary), the
+    /// same pattern `harw-agent-dsl` uses for `harw-registry-defaults` files.
+    const DOD_CLIENT_FINDINGS_RS: &str = include_str!("../../harw-dod-client/src/findings.rs");
+
+    /// The client's skew definition, exactly as `harw-dod-client` declares it
+    /// (`Duration` is `std::time::Duration` there).
+    const DOD_CLIENT_SKEW_DEFINITION: &str =
+        "pub const MAX_CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);";
+
+    /// Drift guard for [`MAX_CLOCK_SKEW`]: the hub value is 5 min and the
+    /// client source still declares exactly that bound. A change on either
+    /// side fails here until both readers agree again.
+    #[test]
+    fn test_clock_skew_mirrors_the_dod_client_definition() -> TestResult {
+        assert_eq!(MAX_CLOCK_SKEW, SignedDuration::from_secs(5 * 60));
+        assert!(
+            DOD_CLIENT_FINDINGS_RS.contains("use std::time::Duration;"),
+            "harw-dod-client findings.rs no longer uses std::time::Duration"
+        );
+        assert!(
+            DOD_CLIENT_FINDINGS_RS
+                .lines()
+                .any(|line| line.trim() == DOD_CLIENT_SKEW_DEFINITION),
+            "harw_dod_client::findings::MAX_CLOCK_SKEW changed; update MAX_CLOCK_SKEW in harw-security-hub/src/findings.rs to the same bound"
+        );
+        Ok(())
+    }
+
+    /// Owner review PR #168: a line dated beyond `now + MAX_CLOCK_SKEW` is
+    /// counted as malformed and dropped (also for other hosts and years
+    /// ahead), while an in-skew line and a past line stay visible.
+    #[test]
+    fn test_record_beyond_clock_skew_is_counted_malformed_and_dropped() -> TestResult {
+        let text = [
+            line("past", "host-a", "high", "2026-09-27T11:00:00Z"),
+            line("future", "host-a", "critical", "2026-09-27T12:05:01Z"),
+            line("in-skew", "host-a", "high", "2026-09-27T12:02:00Z"),
+            line("years-ahead", "host-a", "critical", "2029-09-27T12:00:00Z"),
+            line(
+                "other-host-future",
+                "host-b",
+                "critical",
+                "2030-01-01T00:00:00Z",
+            ),
+        ]
+        .join("\n");
+        let batch = parse_findings(
+            text.as_bytes(),
+            false,
+            &filter()?,
+            &FindingLimits::default(),
+        );
+        let ids: Vec<&str> = batch
+            .findings
+            .iter()
+            .map(|f| f.finding_id.as_str())
+            .collect();
+        assert_eq!(ids, ["in-skew", "past"]);
+        assert_eq!(batch.skipped_malformed, 3, "three lines beyond the skew");
+        assert_eq!(batch.skipped_oversize, 0);
+        assert!(!batch.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_at_exact_skew_bound_is_kept() -> TestResult {
+        let text = [
+            line("at-bound", "host-a", "high", "2026-09-27T12:05:00Z"),
+            line(
+                "just-beyond",
+                "host-a",
+                "high",
+                "2026-09-27T12:05:00.000000001Z",
+            ),
+        ]
+        .join("\n");
+        let batch = parse_findings(
+            text.as_bytes(),
+            false,
+            &filter()?,
+            &FindingLimits::default(),
+        );
+        let ids: Vec<&str> = batch
+            .findings
+            .iter()
+            .map(|f| f.finding_id.as_str())
+            .collect();
+        assert_eq!(ids, ["at-bound"], "the bound is inclusive");
+        assert_eq!(batch.skipped_malformed, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_source_counts_future_dated_lines_as_malformed() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        let text = format!(
+            "{}\n{}\n",
+            line("in-skew", "host-a", "critical", "2026-09-27T12:04:59Z"),
+            line("future", "host-a", "critical", "2027-09-27T12:00:00Z"),
+        );
+        std::fs::write(&path, text).map_err(ctx("write export"))?;
+        let batch = JsonlFindingSource::new(&path, FindingLimits::default())
+            .recent(&filter()?)
+            .map_err(ctx("recent"))?;
+        assert_eq!(batch.findings.len(), 1);
+        assert_eq!(
+            batch.findings.first().map(|f| f.finding_id.as_str()),
+            Some("in-skew")
+        );
+        assert_eq!(batch.skipped_malformed, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_latest_plausible_is_now_plus_skew_and_saturates() -> TestResult {
+        let normal = filter()?;
+        let expected = "2026-09-27T12:05:00Z"
+            .parse::<Timestamp>()
+            .map_err(ctx("bound"))?;
+        assert_eq!(normal.latest_plausible(), expected);
+
+        // At the end of the representable range the addition overflows;
+        // the bound saturates instead of failing (no line is dropped for
+        // being "too new" then).
+        let at_max = FindingFilter {
+            now: Timestamp::MAX,
+            ..filter()?
+        };
+        assert_eq!(at_max.latest_plausible(), Timestamp::MAX);
+        let text = line("late", "host-a", "high", "2026-09-27T13:00:00Z");
+        let batch = parse_findings(text.as_bytes(), false, &at_max, &FindingLimits::default());
+        assert_eq!(batch.findings.len(), 1);
+        assert_eq!(batch.skipped_malformed, 0);
         Ok(())
     }
 }
