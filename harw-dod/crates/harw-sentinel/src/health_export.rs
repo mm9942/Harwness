@@ -32,7 +32,11 @@
 //!   "ring": {"overflow_samples_total": 0, "overflow_events_total": 0,
 //!            "overflow_samples_last_cycle": 0, "overflow_events_last_cycle": 0,
 //!            "overflow_samples_last_60s": 0, "overflow_events_last_60s": 0},
-//!   "windows": {"last_cycle_ms": 5000, "last_60s_ms": 60000}
+//!   "windows": {"last_cycle_ms": 5000, "last_60s_ms": 60000},
+//!   "spool": {"state": "degraded", "degrade_reason": "spool_full",
+//!             "enqueued_total": 9, "written_total": 8, "dropped_total": 0,
+//!             "spool_full_total": 1, "too_large_total": 0, "failed_total": 0,
+//!             "removed_total": 0, "dropped_last_60s": 0, "rejected_last_60s": 1}
 //! }
 //! ```
 //!
@@ -58,6 +62,17 @@
 //!   the bounded history ([`MAX_WINDOW_SNAPSHOTS`]) no longer reaches back
 //!   a full window, `last_60s_ms` is the shorter span actually covered.
 //!   Counters that go backwards yield `0`, never a wrapped value.
+//! - `spool` (PL-100 WP0.12, additive) reports the finding spool writer
+//!   (`crate::spool_writer`); it is `null` when no spool is configured (no
+//!   `--findings-export`). `state` is `ok` or `degraded`; `degraded` when the
+//!   spool could not be opened (`unavailable`), the most recent write failed,
+//!   or a record was dropped (full writer queue) or refused (`SpoolFull`,
+//!   `RecordTooLarge`, another write failure) within the last
+//!   [`HEALTH_WINDOW_SECS`] seconds. `degrade_reason` (present only when
+//!   degraded) is the most recent cause: `unavailable`, `queue_overflow`,
+//!   `spool_full`, `record_too_large` or `write_failed`. The counters are
+//!   cumulative since process start; `dropped_last_60s` and
+//!   `rejected_last_60s` are windowed like the `ipc`/`ring` deltas.
 //! - The document carries no evidence, no raw events, no paths, no secrets.
 //!
 //! # Atomic replacement
@@ -85,12 +100,15 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use harw_dod_sentinel::{DegradeReason, SensorHealth};
 use harw_observe::{MetricValue, TelemetrySink};
 use harw_types::SensorId;
 use jiff::{SignedDuration, Timestamp};
 use serde::Serialize;
+
+use crate::spool_writer::{SpoolCounters, SpoolFailure, SpoolStats};
 
 /// Schema version of the health document (`schema_version`).
 pub const HEALTH_SCHEMA_VERSION: u32 = 1;
@@ -161,10 +179,16 @@ pub struct HealthCounters {
     pub ring_overflow_samples: u64,
     /// Ring events evicted before evaluation (`ring.overflow_events_*`).
     pub ring_overflow_events: u64,
+    /// Spool records dropped at the full writer queue (`spool.dropped_*`).
+    pub spool_dropped: u64,
+    /// Spool records refused (`spool.rejected_*`: full spool, too large,
+    /// other write failure).
+    pub spool_rejected: u64,
 }
 
 impl HealthCounters {
-    /// The cumulative snapshot of `ipc` and `ring`.
+    /// The cumulative snapshot of `ipc` and `ring` (spool counters `0`, see
+    /// [`Self::with_spool`]).
     #[must_use]
     pub const fn of(ipc: IpcCounters, ring: RingCounters) -> Self {
         Self {
@@ -172,6 +196,19 @@ impl HealthCounters {
             ipc_dropped: ipc.dropped_total,
             ring_overflow_samples: ring.overflow_samples_total,
             ring_overflow_events: ring.overflow_events_total,
+            spool_dropped: 0,
+            spool_rejected: 0,
+        }
+    }
+
+    /// The same snapshot with the cumulative counters of the finding spool
+    /// writer (PL-100 WP0.12).
+    #[must_use]
+    pub const fn with_spool(self, spool: &SpoolCounters) -> Self {
+        Self {
+            spool_dropped: spool.dropped_total,
+            spool_rejected: spool.rejected_total(),
+            ..self
         }
     }
 
@@ -188,6 +225,8 @@ impl HealthCounters {
             ring_overflow_events: self
                 .ring_overflow_events
                 .saturating_sub(base.ring_overflow_events),
+            spool_dropped: self.spool_dropped.saturating_sub(base.spool_dropped),
+            spool_rejected: self.spool_rejected.saturating_sub(base.spool_rejected),
         }
     }
 }
@@ -399,6 +438,69 @@ struct WindowLine {
     last_60s_ms: Option<u64>,
 }
 
+/// The `spool` object (PL-100 WP0.12): state of the finding spool writer.
+#[derive(Debug, Serialize)]
+struct SpoolLine {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degrade_reason: Option<&'static str>,
+    enqueued_total: u64,
+    written_total: u64,
+    dropped_total: u64,
+    spool_full_total: u64,
+    too_large_total: u64,
+    failed_total: u64,
+    removed_total: u64,
+    dropped_last_60s: u64,
+    rejected_last_60s: u64,
+}
+
+impl SpoolLine {
+    /// The line for `spool`, judged against the windowed deltas.
+    fn of(spool: &SpoolCounters, windows: &WindowDeltas) -> Self {
+        let (state, degrade_reason) = spool_state(spool, windows);
+        Self {
+            state,
+            degrade_reason,
+            enqueued_total: spool.enqueued_total,
+            written_total: spool.written_total,
+            dropped_total: spool.dropped_total,
+            spool_full_total: spool.spool_full_total,
+            too_large_total: spool.too_large_total,
+            failed_total: spool.failed_total,
+            removed_total: spool.removed_total,
+            dropped_last_60s: windows.last_60s.spool_dropped,
+            rejected_last_60s: windows.last_60s.spool_rejected,
+        }
+    }
+}
+
+/// `state` and `degrade_reason` of the `spool` object.
+///
+/// # Description
+/// `degraded` when the spool is unavailable, the most recent write failed,
+/// or a record was dropped or refused within the last window (see the
+/// module documentation); the reason is the most recent cause.
+///
+/// # Returns
+/// `("ok", None)` or `("degraded", Some(reason))`.
+#[must_use]
+pub fn spool_state(
+    spool: &SpoolCounters,
+    windows: &WindowDeltas,
+) -> (&'static str, Option<&'static str>) {
+    let recent_loss = windows.last_60s.spool_dropped > 0 || windows.last_60s.spool_rejected > 0;
+    if !(spool.unavailable || spool.last_put_failed || recent_loss) {
+        return ("ok", None);
+    }
+    let reason = if spool.unavailable {
+        SpoolFailure::Unavailable
+    } else {
+        spool.last_failure.unwrap_or(SpoolFailure::WriteFailed)
+    };
+    ("degraded", Some(reason.label()))
+}
+
 /// The whole document.
 #[derive(Debug, Serialize)]
 struct HealthDocument<'a> {
@@ -410,6 +512,7 @@ struct HealthDocument<'a> {
     ipc: IpcLine,
     ring: RingLine,
     windows: WindowLine,
+    spool: Option<SpoolLine>,
 }
 
 /// Identity of the resolved DoD configuration, as reported in the document.
