@@ -353,7 +353,7 @@ Voraussetzung ist PL-96 W01. 3.0 und 3.5 können sofort starten.
   - `process.list` maskiert argv;
   - `SessionLease` mit Ablauf;
   - Cgroup-Filter für `sys.ps`;
-  - **Taint-Regel:** Nach `dod.*` im Turn fragen `process.kill`, `host.sudo_exec` und `job.*` auch unter Full nach (Entscheidung O1).
+  - **Taint-Regel:** Nach `dod.*` im Turn fragen `process.kill`, `host.sudo_exec` und `job.*` nach, außer unter Full Access (Entscheidung O1).
 - **Vernetzung (PL-99):**
   - `UplinkEvent::{FindingSummary, HealthBeat}` mit Verdict-Enums;
   - `/v1/posture` über `harw-infra-client`;

@@ -761,6 +761,9 @@ pub struct TurnControl {
     // Bucht jeden Werkzeugaufruf vor seiner Ausführung (siehe
     // `crate::tool_call_meter`); Klone teilen denselben Meter.
     tool_call_meter: Option<Arc<dyn ToolCallMeter>>,
+    // PL-100 Phase 4 (B22): DoD-Taint dieses Turns (siehe
+    // `crate::dod_taint`); Klone teilen denselben Zustand.
+    dod_taint: crate::dod_taint::DodTaint,
 }
 
 impl std::fmt::Debug for TurnControl {
@@ -770,6 +773,7 @@ impl std::fmt::Debug for TurnControl {
             .field("limits", &self.limits)
             .field("token_budget", &self.token_budget)
             .field("tool_call_meter", &self.tool_call_meter.is_some())
+            .field("dod_taint", &self.dod_taint)
             .finish_non_exhaustive()
     }
 }
@@ -794,7 +798,24 @@ impl TurnControl {
             meter: Arc::new(Mutex::new(TurnMeter::default())),
             token_budget: None,
             tool_call_meter: None,
+            dod_taint: crate::dod_taint::DodTaint::new(),
         }
+    }
+
+    /// Der DoD-Taint dieses Turns (PL-100 Phase 4, Bedrohung B22).
+    ///
+    /// # Beschreibung
+    /// Der Turn-Loop vermerkt darin jeden abgefertigten `dod.*`-Aufruf;
+    /// `check_approval` liest ihn für die
+    /// [`crate::policy::DodTaintPolicy`]. Eine Oberfläche, die den Block
+    /// selbst gebaut hat, kann darüber den Grund einer Rückfrage anzeigen.
+    ///
+    /// # Returns
+    /// Den geteilten [`crate::dod_taint::DodTaint`]; Klone dieses Blocks sehen
+    /// denselben Zustand.
+    #[must_use]
+    pub fn dod_taint(&self) -> &crate::dod_taint::DodTaint {
+        &self.dod_taint
     }
 
     /// Registriert den [`ToolCallMeter`], der jeden Werkzeugaufruf bucht und
@@ -1932,7 +1953,8 @@ fn stream_sink_for_round(
 /// - Sonst gilt das **erste** `AskUser` samt seiner `ItemId`; spätere
 ///   `AskUser`-Anfragen werden verworfen.
 /// - Nur wenn alle `Allow` sagen (oder kein Handler registriert ist), gilt
-///   `Allow`.
+///   `Allow` — außer der DoD-Taint-Fallback greift (siehe Abschnitt
+///   DoD-Taint).
 ///
 /// Früher gewann der erste Nicht-`Allow`: ein vorn registriertes `AskUser`
 /// (etwa `DefaultApprovalPolicy`) überstimmte ein später registriertes `Deny`
@@ -1952,14 +1974,84 @@ fn stream_sink_for_round(
 /// Wer diese Funktion außerhalb des sequenziellen Tool-Loops aufruft (siehe
 /// [`PreparedApprovals`]), muss die Entscheidung deshalb weiterreichen statt
 /// sie später erneut einzuholen.
+///
+/// # DoD-Taint (PL-100 Phase 4, B22/O1)
+/// Die Befragung läuft im Prüfkontext
+/// [`crate::dod_taint::with_review_taint`] mit dem Taint-Stand des laufenden
+/// Turns; die [`crate::policy::DodTaintPolicy`] liest ihn dort. Trägt die
+/// Registry keine solche Politik, fragt der Turn-Loop modusblind nach,
+/// sobald [`crate::policy::DodTaintPolicy::fallback_applies`] zutrifft
+/// (fail-closed; unter Full Access verletzt das O1 — die Produktivketten
+/// müssen die Politik deshalb installieren). Der Taint kann eine
+/// Entscheidung nur verschärfen (`Allow` → `AskUser` bzw. → `Deny`), nie
+/// lockern.
+///
+/// Hat der Taint die Rückfrage verursacht (die Politik lieferte `AskUser`
+/// oder der Fallback griff) und ist das Ergebnis `AskUser`, gilt:
+/// - Kann niemand antworten
+///   ([`crate::policy::DodTaintPolicy::ask_answerable`]: kein
+///   Freigabe-Akteur oder ein nicht interaktiver Einstieg), wird der Aufruf
+///   mit [`crate::dod_taint::unanswerable_reason`] abgelehnt — statt einer
+///   Pause, die niemand auflöst (bzw. statt `MissingApprovalActor`).
+/// - Sonst vermerkt der Turn die Call-Id
+///   ([`crate::dod_taint::DodTaint::note_ask`]); nur dann nennt
+///   [`crate::dod_taint::pending_ask_reason`] der Oberfläche den Grund.
 pub async fn check_approval(session: &AgentSession, call: &ToolCall) -> ApprovalDecision {
+    let tainted = crate::dod_taint::session_turn_tainted(session);
+    let (decision, policy_asked) =
+        crate::dod_taint::with_review_taint(tainted, aggregate_approval(session, call)).await;
+    let handlers = session.registry().approval_handlers();
+    // Genau eine Auswertung des Fallbacks: derselbe Befund ändert die
+    // Entscheidung und schreibt die Rückfrage dem Taint zu.
+    let fallback =
+        crate::policy::DodTaintPolicy::fallback_applies(handlers, call, tainted, &decision);
+    let decision = if fallback {
+        ApprovalDecision::AskUser(harw_types::ItemId::new())
+    } else {
+        decision
+    };
+    let taint_caused_ask =
+        (policy_asked || fallback) && matches!(decision, ApprovalDecision::AskUser(_));
+    if !taint_caused_ask {
+        return decision;
+    }
+    let actor_present = session
+        .spawn_context()
+        .is_some_and(|context| context.approval_actor.is_some());
+    if !crate::policy::DodTaintPolicy::ask_answerable(handlers, actor_present) {
+        tracing::info!(
+            tool = %crate::dod_taint::display_tool_name(call.name.as_str()),
+            actor_present,
+            "dod_taint.ask_unanswerable_denied"
+        );
+        return ApprovalDecision::Deny(crate::dod_taint::unanswerable_reason(call.name.as_str()));
+    }
+    crate::dod_taint::note_session_ask(session, &call.id);
+    tracing::info!(
+        reason = %crate::dod_taint::ask_reason(call.name.as_str()),
+        fallback,
+        "dod_taint.ask"
+    );
+    decision
+}
+
+// Befragt jeden registrierten Handler genau einmal und aggregiert
+// `Deny` > `AskUser` > `Allow` (siehe `check_approval`). Der zweite Wert
+// meldet, ob die `DodTaintPolicy` (Label `DOD_TAINT_POLICY_LABEL`) selbst
+// `AskUser` geliefert hat — so wird die Rückfrage dem Taint nur
+// zugeschrieben, wenn er sie verursacht hat.
+async fn aggregate_approval(session: &AgentSession, call: &ToolCall) -> (ApprovalDecision, bool) {
     let mut first_ask: Option<ApprovalDecision> = None;
     let mut first_deny: Option<ApprovalDecision> = None;
+    let mut taint_policy_asked = false;
     for handler in session.registry().approval_handlers() {
         let decision = handler.review(call).await;
         match decision {
             ApprovalDecision::Allow => {}
             ApprovalDecision::AskUser(_) => {
+                if handler.label() == crate::policy::DOD_TAINT_POLICY_LABEL {
+                    taint_policy_asked = true;
+                }
                 if first_ask.is_none() {
                     first_ask = Some(decision);
                 }
@@ -1971,7 +2063,10 @@ pub async fn check_approval(session: &AgentSession, call: &ToolCall) -> Approval
             }
         }
     }
-    first_deny.or(first_ask).unwrap_or(ApprovalDecision::Allow)
+    (
+        first_deny.or(first_ask).unwrap_or(ApprovalDecision::Allow),
+        taint_policy_asked,
+    )
 }
 
 /// Guardrail-Entscheidungen, die für eine Modellantwort bereits eingeholt
@@ -3258,6 +3353,9 @@ fn notify_tool_outcome(
     arguments: &serde_json::Value,
     result: &ToolCallResult,
 ) {
+    // PL-100 Phase 4 (B22): jeder abgefertigte `dod.*`-Aufruf taintet den
+    // laufenden Turn — auch ein gescheiterter oder abgelehnter.
+    crate::dod_taint::note_session_dispatch(session, tool_name);
     emit_plan_update(session, tool_name, arguments, result);
     // Runde 9, E3: ein Erfolg löst passende Pitfalls (kein veralteter
     // `[harw-Wächter]`-Hinweis an späteren Ergebnissen desselben Werkzeugs).
@@ -7364,8 +7462,9 @@ async fn try_execute_parallel_calls(
 /// Jede eingeholte Entscheidung — auch die abschlägige — wird in `prepared`
 /// hinterlegt, damit der sequenzielle Fallback sie verbrauchen kann statt
 /// denselben Handler erneut zu fragen. Ohne registrierten `ApprovalHandler`
-/// liefert [`check_approval`] `Allow`, ohne dass irgendetwas aufgerufen wird;
-/// die Vorprüfung ist dann ein reiner Durchlauf.
+/// liefert [`check_approval`] `Allow`, ohne dass irgendetwas aufgerufen wird
+/// — außer der DoD-Taint-Fallback greift (siehe Abschnitt DoD-Taint an
+/// [`check_approval`]); sonst ist die Vorprüfung dann ein reiner Durchlauf.
 ///
 /// # Arguments
 /// - `calls` (`&[ToolCall]`): die Calls der Modellantwort in Originalreihenfolge.
@@ -7379,6 +7478,13 @@ async fn preflight_approvals(
     prepared: &mut PreparedApprovals,
 ) -> bool {
     prepared.decisions = Vec::with_capacity(calls.len());
+    // PL-100 Phase 4 (B22): ein `dod.*`-Aufruf taintet erst nach seiner
+    // Abfertigung. Mischt die Antwort ihn mit einem taint-pflichtigen
+    // Aufruf, läuft sie sequenziell (keine Entscheidung vorab), damit der
+    // spätere Aufruf den Taint sieht.
+    if crate::dod_taint::batch_mixes_dod_and_gated(calls) {
+        return false;
+    }
     for call in calls {
         let decision = check_approval(session, call).await;
         let allowed = matches!(decision, ApprovalDecision::Allow);
@@ -10844,6 +10950,687 @@ mod tests {
         assert_eq!(asking.reviews_for(&id), 1);
         assert_eq!(allowing.reviews_for(&id), 1);
         assert_eq!(asking_later.reviews_for(&id), 1);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // PL-100 Phase 4 (B22, O1): DoD-Taint je Turn
+    // ------------------------------------------------------------------
+
+    /// Werkzeuge der Taint-Tests; alle sequenziell (nicht `parallel_safe`).
+    const TAINT_TOOLS: &[&str] = &[
+        "dod.findings",
+        "job.stop",
+        "job.start",
+        "job.logs",
+        "process.kill",
+        "host.sudo_exec",
+    ];
+
+    /// Sitzung mit `allow` (gibt alles frei — steht für Auto-Modus,
+    /// Sitzungsfreigabe oder gemerkte Regel) und, falls `mode` gesetzt ist,
+    /// der `DodTaintPolicy` über einer Zelle in diesem Modus.
+    fn taint_session(
+        allow: Arc<CountingApproval>,
+        mode: Option<harw_extension_api::approval_mode::ApprovalMode>,
+    ) -> TestResult<AgentSession> {
+        let allow: Arc<dyn harw_extension_api::ApprovalHandler> = allow;
+        let mut handlers = vec![allow];
+        if let Some(mode) = mode {
+            handlers.push(taint_policy(mode));
+        }
+        taint_session_with(handlers, true)
+    }
+
+    /// Die `DodTaintPolicy` über einer Zelle im Modus `mode`.
+    fn taint_policy(
+        mode: harw_extension_api::approval_mode::ApprovalMode,
+    ) -> Arc<dyn harw_extension_api::ApprovalHandler> {
+        Arc::new(crate::policy::DodTaintPolicy::new().with_mode(
+            harw_extension_api::approval_mode::ApprovalModeCell::new(mode),
+        ))
+    }
+
+    /// Sitzung mit genau `handlers`; `approval_actor = false` lässt den
+    /// Freigabe-Akteur weg (wie ein Job-Worker ohne Oberfläche).
+    fn taint_session_with(
+        handlers: Vec<Arc<dyn harw_extension_api::ApprovalHandler>>,
+        approval_actor: bool,
+    ) -> TestResult<AgentSession> {
+        taint_session_on(
+            StubToolProvider::with_names(TAINT_TOOLS),
+            handlers,
+            approval_actor,
+        )
+    }
+
+    /// Wie [`taint_session_with`], aber über dem Werkzeuganbieter `provider`.
+    fn taint_session_on(
+        provider: Arc<dyn ToolProvider>,
+        handlers: Vec<Arc<dyn harw_extension_api::ApprovalHandler>>,
+        approval_actor: bool,
+    ) -> TestResult<AgentSession> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut builder = ExtensionRegistryBuilder::default().tool_provider(provider);
+        for handler in handlers {
+            builder = builder.approval_handler(handler);
+        }
+        let mut context = test_spawn_context()?;
+        if !approval_actor {
+            context.approval_actor = None;
+        }
+        Ok(
+            AgentSession::new(AgentRole::Assistant, None, builder.build(), tx)
+                .with_spawn_context(context),
+        )
+    }
+
+    /// Gibt alles frei und meldet `label` — steht für die Ask-Auflösung
+    /// eines nicht interaktiven Einstiegs (`harw-runtime`), die den Taint
+    /// nicht kennt.
+    struct LabelledAllow(&'static str);
+
+    impl harw_extension_api::ApprovalHandler for LabelledAllow {
+        fn review<'a>(
+            &'a self,
+            _call: &'a ToolCall,
+        ) -> harw_extension_api::ExtFuture<'a, ApprovalDecision> {
+            Box::pin(async { ApprovalDecision::Allow })
+        }
+
+        fn label(&self) -> &'static str {
+            self.0
+        }
+    }
+
+    /// Die Antworten „`dod.findings`, dann `gated`, dann Text".
+    fn dod_then(gated: &ToolCallId, tool: &str) -> Vec<crate::model::ModelResponse> {
+        vec![
+            response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+            response_with(vec![call(gated, tool)]),
+            crate::model::ModelResponse::text("erledigt"),
+        ]
+    }
+
+    /// Prüft, dass genau der zweite Aufruf mit dem Taint-Grund abgelehnt
+    /// wurde (der erste war `dod.findings`).
+    fn expect_taint_denial(session: &AgentSession) -> TestResult {
+        let results = tool_results(session);
+        let denied = results
+            .get(1)
+            .ok_or(TestError::Missing("Ergebnis des taint-pflichtigen Aufrufs"))?;
+        match denied {
+            ToolCallResult::Error { message }
+                if message.starts_with("denied: ")
+                    && message.contains(crate::dod_taint::TAINT_REASON) =>
+            {
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "erwartet eine Taint-Ablehnung, bekommen {other:?}"
+            ))),
+        }
+    }
+
+    /// Führt einen Turn mit den vorprogrammierten Antworten `script` aus.
+    async fn run_taint_turn(
+        session: &mut AgentSession,
+        store: &crate::state_store::InMemoryStateStore,
+        script: Vec<crate::model::ModelResponse>,
+        control: TurnControl,
+    ) -> TestResult<TurnOutcome> {
+        let model = ScriptedModel::new(script);
+        Ok(run_turn(
+            session,
+            &model,
+            store,
+            TurnInput::user("taint").with_control(control),
+        )
+        .await?)
+    }
+
+    /// Die Call-Id, auf deren Freigabe der Turn wartet.
+    fn awaited_call(outcome: &TurnOutcome) -> Option<&ToolCallId> {
+        match outcome {
+            TurnOutcome::AwaitingApproval { call_id, .. } => Some(call_id),
+            _ => None,
+        }
+    }
+
+    /// Auto-Modus + `dod.findings`, danach `job.stop` → Rückfrage, obwohl
+    /// ein anderer Handler freigibt; die Oberfläche bekommt den Grund.
+    #[tokio::test]
+    async fn dod_taint_asks_for_job_stop_after_dod_findings_in_auto_mode() -> TestResult {
+        let dod = ToolCallId::new();
+        let stop = ToolCallId::new();
+        let mut session = taint_session(
+            Arc::new(CountingApproval::allow_everything()),
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&dod, "dod.findings")]),
+                response_with(vec![call(&stop, "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert_eq!(awaited_call(&outcome), Some(&stop), "{outcome:?}");
+        let reason = crate::dod_taint::pending_ask_reason(&session)
+            .ok_or(TestError::Missing("Taint-Grund der offenen Rückfrage"))?;
+        assert!(reason.contains(crate::dod_taint::TAINT_REASON), "{reason}");
+        Ok(())
+    }
+
+    /// Entscheidung O1: unter Full Access fragt auch der Taint nicht.
+    #[tokio::test]
+    async fn dod_taint_never_asks_under_full_access() -> TestResult {
+        let mut session = taint_session(
+            Arc::new(CountingApproval::allow_everything()),
+            Some(harw_extension_api::approval_mode::ApprovalMode::FullAccess),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+                response_with(vec![call(&ToolCallId::new(), "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        Ok(())
+    }
+
+    /// Ohne `dod.*`-Aufruf bleibt die Entscheidung unverändert.
+    #[tokio::test]
+    async fn dod_taint_leaves_turns_without_dod_calls_unchanged() -> TestResult {
+        let mut session = taint_session(
+            Arc::new(CountingApproval::allow_everything()),
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        Ok(())
+    }
+
+    /// Der Taint endet mit seinem Turn — auch wenn der Aufrufer denselben
+    /// Steuerblock im nächsten Turn wiederverwendet.
+    #[tokio::test]
+    async fn dod_taint_ends_with_its_turn() -> TestResult {
+        let mut session = taint_session(
+            Arc::new(CountingApproval::allow_everything()),
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let control = TurnControl::new();
+
+        let first = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+                crate::model::ModelResponse::text("Befunde gelesen"),
+            ],
+            control.clone(),
+        )
+        .await?;
+        assert!(matches!(first, TurnOutcome::Completed), "{first:?}");
+
+        let second = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "job.stop")]),
+                crate::model::ModelResponse::text("gestoppt"),
+            ],
+            control,
+        )
+        .await?;
+        assert!(matches!(second, TurnOutcome::Completed), "{second:?}");
+        Ok(())
+    }
+
+    /// Lesende Job-Werkzeuge bleiben nach einer DoD-Abfrage frei.
+    #[tokio::test]
+    async fn dod_taint_leaves_read_only_job_tools_alone() -> TestResult {
+        let mut session = taint_session(
+            Arc::new(CountingApproval::allow_everything()),
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+                response_with(vec![call(&ToolCallId::new(), "job.logs")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        Ok(())
+    }
+
+    /// `process.kill`, `host.sudo_exec` und `job.start` fragen nach einer
+    /// DoD-Abfrage ebenfalls, auch wenn jeder andere Handler freigibt.
+    #[tokio::test]
+    async fn dod_taint_gates_host_tools_and_job_start() -> TestResult {
+        for tool in ["process.kill", "host.sudo_exec", "job.start"] {
+            let gated = ToolCallId::new();
+            let mut session = taint_session(
+                Arc::new(CountingApproval::allow_everything()),
+                Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+            )?;
+            let store = crate::state_store::InMemoryStateStore::new();
+
+            let outcome = run_taint_turn(
+                &mut session,
+                &store,
+                vec![
+                    response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+                    response_with(vec![call(&gated, tool)]),
+                    crate::model::ModelResponse::text("erledigt"),
+                ],
+                TurnControl::new(),
+            )
+            .await?;
+
+            assert_eq!(awaited_call(&outcome), Some(&gated), "{tool}: {outcome:?}");
+        }
+        Ok(())
+    }
+
+    /// Ein abgelehnter (nie ausgeführter) `dod.*`-Aufruf taintet den Turn
+    /// trotzdem (fail-closed).
+    #[tokio::test]
+    async fn dod_taint_counts_a_denied_dod_call() -> TestResult {
+        let dod = ToolCallId::new();
+        let stop = ToolCallId::new();
+        let denying = Arc::new(CountingApproval::new(vec![(
+            dod.clone(),
+            ApprovalDecision::Deny("regel".to_owned()),
+        )]));
+        let mut session = taint_session(
+            denying,
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&dod, "dod.findings")]),
+                response_with(vec![call(&stop, "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert_eq!(awaited_call(&outcome), Some(&stop), "{outcome:?}");
+        Ok(())
+    }
+
+    /// Liefert für `dod.*` ein Werkzeugfehler-Ergebnis, für alles andere
+    /// `ok` — steht für einen DoD-Export, der sich nicht lesen lässt.
+    struct DodFailsExecutor;
+
+    impl ToolExecutor for DodFailsExecutor {
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ToolExecutionContext,
+            call: &'a ToolCall,
+        ) -> ToolExecutorFuture<'a> {
+            let output = if crate::dod_taint::is_dod_tool(call.name.as_str()) {
+                ToolOutput::error("dod export unreadable")
+            } else {
+                ToolOutput::text("ok")
+            };
+            Box::pin(async move { Ok(output) })
+        }
+    }
+
+    /// Bietet [`TAINT_TOOLS`] an; jedes läuft über [`DodFailsExecutor`].
+    struct DodFailsProvider {
+        // Die angebotenen Werkzeuge (wie `StubToolProvider`).
+        inner: Arc<StubToolProvider>,
+    }
+
+    impl ToolProvider for DodFailsProvider {
+        fn tools(&self) -> Vec<ToolSpec> {
+            self.inner.tools()
+        }
+
+        fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+            self.inner
+                .executor(name)
+                .map(|_| Arc::new(DodFailsExecutor) as Arc<dyn ToolExecutor>)
+        }
+    }
+
+    /// Ein abgefertigter `dod.*`-Aufruf, der bei der Ausführung scheitert,
+    /// taintet den Turn ebenfalls — gleich ob der Ausführer einen Fehler
+    /// liefert oder es gar keinen Ausführer gibt (die Sitzung bietet das
+    /// Werkzeug nicht an: „no executor for tool").
+    #[tokio::test]
+    async fn dod_taint_counts_a_dod_call_that_fails_in_execution() -> TestResult {
+        let providers: [(&str, Arc<dyn ToolProvider>); 2] = [
+            (
+                "Ausführer meldet Fehler",
+                Arc::new(DodFailsProvider {
+                    inner: StubToolProvider::with_names(TAINT_TOOLS),
+                }) as Arc<dyn ToolProvider>,
+            ),
+            (
+                "kein Ausführer",
+                StubToolProvider::with_names(&["job.stop"]) as Arc<dyn ToolProvider>,
+            ),
+        ];
+        for (case, provider) in providers {
+            let stop = ToolCallId::new();
+            let allow: Arc<dyn harw_extension_api::ApprovalHandler> =
+                Arc::new(CountingApproval::allow_everything());
+            let mut session = taint_session_on(
+                provider,
+                vec![
+                    allow,
+                    taint_policy(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+                ],
+                true,
+            )?;
+            let store = crate::state_store::InMemoryStateStore::new();
+
+            let outcome = run_taint_turn(
+                &mut session,
+                &store,
+                dod_then(&stop, "job.stop"),
+                TurnControl::new(),
+            )
+            .await?;
+
+            match tool_results(&session).first() {
+                Some(ToolCallResult::Error { .. }) => {}
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "{case}: der DoD-Aufruf muss scheitern, Ergebnis {other:?}"
+                    )));
+                }
+            }
+            assert_eq!(awaited_call(&outcome), Some(&stop), "{case}: {outcome:?}");
+            let reason = crate::dod_taint::pending_ask_reason(&session).ok_or(
+                TestError::Missing("Taint-Grund nach gescheitertem DoD-Aufruf"),
+            )?;
+            assert!(
+                reason.contains(crate::dod_taint::TAINT_REASON),
+                "{case}: {reason}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Der Taint gilt für den **Rest** des Turns und überlebt die
+    /// Rückfrage-Pause: nach Freigabe wie nach Ablehnung des ersten
+    /// `job.stop` fragt ein zweites `job.stop` im selben Turn erneut, mit dem
+    /// Taint-Grund (der Steuerblock des Turns wird beim Fortsetzen
+    /// wiederverwendet).
+    #[tokio::test]
+    async fn dod_taint_survives_the_approval_pause_for_the_rest_of_the_turn() -> TestResult {
+        for resolution in [
+            ApprovalResolution::Approve,
+            ApprovalResolution::Reject {
+                reason: "nicht stoppen".to_owned(),
+            },
+        ] {
+            let first = ToolCallId::new();
+            let second = ToolCallId::new();
+            let mut session = taint_session(
+                Arc::new(CountingApproval::allow_everything()),
+                Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+            )?;
+            let store = crate::state_store::InMemoryStateStore::new();
+
+            let paused = run_taint_turn(
+                &mut session,
+                &store,
+                dod_then(&first, "job.stop"),
+                TurnControl::new(),
+            )
+            .await?;
+            assert_eq!(awaited_call(&paused), Some(&first), "{paused:?}");
+            let turn = session
+                .current_turn()
+                .cloned()
+                .ok_or(TestError::Missing("laufender Turn in der Pause"))?;
+
+            let model = ScriptedModel::new(vec![
+                response_with(vec![call(&second, "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ]);
+            let resumed = resume_after_approval(
+                &mut session,
+                &model,
+                &store,
+                ApprovalActor::Operator {
+                    id: "test-operator".to_owned(),
+                },
+                resolution.clone(),
+            )
+            .await?;
+
+            assert_eq!(
+                awaited_call(&resumed),
+                Some(&second),
+                "{resolution:?}: {resumed:?}"
+            );
+            assert_eq!(
+                session.current_turn(),
+                Some(&turn),
+                "{resolution:?}: derselbe Turn"
+            );
+            let reason = crate::dod_taint::pending_ask_reason(&session)
+                .ok_or(TestError::Missing("Taint-Grund der zweiten Rückfrage"))?;
+            assert!(
+                reason.contains(crate::dod_taint::TAINT_REASON),
+                "{resolution:?}: {reason}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Ohne installierte `DodTaintPolicy` fragt der Turn-Loop selbst
+    /// (modusblind, fail-closed).
+    #[tokio::test]
+    async fn dod_taint_fallback_asks_without_an_installed_policy() -> TestResult {
+        let stop = ToolCallId::new();
+        let mut session = taint_session(Arc::new(CountingApproval::allow_everything()), None)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+                response_with(vec![call(&stop, "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert_eq!(awaited_call(&outcome), Some(&stop), "{outcome:?}");
+        let reason = crate::dod_taint::pending_ask_reason(&session)
+            .ok_or(TestError::Missing("Taint-Grund der Fallback-Rückfrage"))?;
+        assert!(reason.contains(crate::dod_taint::TAINT_REASON), "{reason}");
+        Ok(())
+    }
+
+    /// Ohne Freigabe-Akteur (Job-Worker) lehnt der Fallback ab, statt eine
+    /// Rückfrage zu öffnen, die den Turn mit `MissingApprovalActor`
+    /// scheitern ließe; der Turn läuft weiter.
+    #[tokio::test]
+    async fn dod_taint_denies_instead_of_asking_without_an_approval_actor() -> TestResult {
+        for mode in [
+            None,
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        ] {
+            let allow: Arc<dyn harw_extension_api::ApprovalHandler> =
+                Arc::new(CountingApproval::allow_everything());
+            let mut handlers = vec![allow];
+            if let Some(mode) = mode {
+                handlers.push(taint_policy(mode));
+            }
+            let mut session = taint_session_with(handlers, false)?;
+            let store = crate::state_store::InMemoryStateStore::new();
+
+            let outcome = run_taint_turn(
+                &mut session,
+                &store,
+                dod_then(&ToolCallId::new(), "job.stop"),
+                TurnControl::new(),
+            )
+            .await?;
+
+            assert!(
+                matches!(outcome, TurnOutcome::Completed),
+                "{mode:?}: {outcome:?}"
+            );
+            expect_taint_denial(&session)?;
+        }
+        Ok(())
+    }
+
+    /// Ein nicht interaktiver Einstieg (Ask-Auflösung `ask:*` in der Kette,
+    /// die den Taint nicht kennt) bekommt eine deterministische Ablehnung
+    /// statt einer Pause — mit installierter Politik wie im Fallback.
+    #[tokio::test]
+    async fn dod_taint_denies_in_a_non_interactive_entry() -> TestResult {
+        for label in crate::policy::NON_INTERACTIVE_ASK_LABELS {
+            for mode in [
+                None,
+                Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+            ] {
+                let allow: Arc<dyn harw_extension_api::ApprovalHandler> =
+                    Arc::new(CountingApproval::allow_everything());
+                let mut handlers: Vec<Arc<dyn harw_extension_api::ApprovalHandler>> =
+                    vec![allow, Arc::new(LabelledAllow(*label))];
+                if let Some(mode) = mode {
+                    handlers.push(taint_policy(mode));
+                }
+                let mut session = taint_session_with(handlers, true)?;
+                let store = crate::state_store::InMemoryStateStore::new();
+
+                let outcome = run_taint_turn(
+                    &mut session,
+                    &store,
+                    dod_then(&ToolCallId::new(), "job.stop"),
+                    TurnControl::new(),
+                )
+                .await?;
+
+                assert!(
+                    matches!(outcome, TurnOutcome::Completed),
+                    "{label} {mode:?}: {outcome:?}"
+                );
+                expect_taint_denial(&session)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fragt unter Full Access ein anderer Handler, nennt die Oberfläche den
+    /// Taint-Grund nicht: der Taint hat diese Rückfrage nicht verursacht.
+    #[tokio::test]
+    async fn dod_taint_reason_is_not_claimed_for_an_ask_it_did_not_cause() -> TestResult {
+        let stop = ToolCallId::new();
+        let asking: Arc<dyn harw_extension_api::ApprovalHandler> =
+            Arc::new(CountingApproval::new(vec![(
+                stop.clone(),
+                ApprovalDecision::AskUser(harw_types::ItemId::new()),
+            )]));
+        let mut session = taint_session_with(
+            vec![
+                asking,
+                taint_policy(harw_extension_api::approval_mode::ApprovalMode::FullAccess),
+            ],
+            true,
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            dod_then(&stop, "job.stop"),
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert_eq!(awaited_call(&outcome), Some(&stop), "{outcome:?}");
+        assert_eq!(crate::dod_taint::pending_ask_reason(&session), None);
+        Ok(())
+    }
+
+    /// Stehen `dod.*` und ein taint-pflichtiger Aufruf in derselben Antwort,
+    /// läuft sie sequenziell: die Vorprüfung entscheidet nichts vorab, der
+    /// spätere Aufruf sieht den Taint, und kein Handler wird doppelt gefragt.
+    #[tokio::test]
+    async fn dod_taint_serialises_a_mixed_parallel_response() -> TestResult {
+        let dod = ToolCallId::new();
+        let stop = ToolCallId::new();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let allow = Arc::new(CountingApproval::allow_everything());
+        let provider =
+            StubParallelProvider::instant(&["dod.findings", "job.stop"], Arc::clone(&executions));
+        let mut session = guarded_session(provider, Arc::clone(&allow))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&dod, "dod.findings"), call(&stop, "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert_eq!(awaited_call(&outcome), Some(&stop), "{outcome:?}");
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "nur dod.findings lief"
+        );
+        assert_eq!(allow.reviews_for(&dod), 1);
+        assert_eq!(allow.reviews_for(&stop), 1);
         Ok(())
     }
 

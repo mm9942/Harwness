@@ -35,6 +35,8 @@ pub mod child_lease_heartbeat;
 pub mod compaction;
 pub mod context_budget;
 pub mod delegation_visibility;
+// PL-100 Phase 4 (B22, O1): DoD-Taint je Turn.
+pub mod dod_taint;
 pub mod durable_job_runner;
 pub mod envelope;
 pub mod error;
