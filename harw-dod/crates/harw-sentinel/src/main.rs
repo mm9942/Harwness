@@ -813,8 +813,9 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
     // ebenda).
     let landlock_event = if outcome.is_degraded() {
         let event = sandbox::landlock_degraded_event(Timestamp::now());
+        // Journal-Hygiene (PL-100 WP0.6): nie das ganze Ereignis auf `warn`.
         tracing::warn!(
-            ?event,
+            sensor = event.sensor.as_str(),
             ?outcome,
             "running without landlock self-restriction"
         );
@@ -1723,6 +1724,111 @@ egress_allow_cidrs = []
             }
         }
 
+        /// Ein Mock-Sensor, der bei jedem Abruf dieselben Ereignisse liefert.
+        #[derive(Debug)]
+        struct EventEmittingSensor {
+            handle: SensorHandle<Bound>,
+            events: Vec<SecurityEvent>,
+        }
+
+        impl Sensor for EventEmittingSensor {
+            fn handle(&self) -> &SensorHandle<Bound> {
+                &self.handle
+            }
+
+            fn poll(&self, _now: Timestamp) -> Result<SensorReading, SensorError> {
+                Ok(SensorReading {
+                    samples: Vec::new(),
+                    events: self.events.clone(),
+                })
+            }
+        }
+
+        /// Sammelt die formatierte `tracing`-Ausgabe eines Tests.
+        #[derive(Debug, Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .map_err(|_| std::io::Error::other("capture lock poisoned"))?
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// PL-100 WP0.6: Ereignisinhalte (Pfade, Ziele) erreichen das Journal
+        /// nie auf `warn`; der daraus entstehende Befund steht dort nur mit
+        /// Kennungen.
+        #[test]
+        fn test_poll_once_logs_no_event_content_at_warn() -> TestResult {
+            let id = "mock-events-0";
+            let scope =
+                ReadScope::from_roots([PathBuf::from("/nonexistent-harw-sentinel-mock-root")]);
+            let handle =
+                SensorHandle::new(SensorId::from_str(id), Capability::ReadProcStat).bind(scope);
+            let event = |kind: EventKind| SecurityEvent {
+                sensor: SensorId::from_str(id),
+                observed_at: Timestamp::UNIX_EPOCH,
+                actor: None,
+                kind,
+            };
+            let sensor: Arc<dyn Sensor> = Arc::new(EventEmittingSensor {
+                handle,
+                events: vec![
+                    event(EventKind::FileWrite {
+                        path: "/etc/shadow-secret".to_owned(),
+                    }),
+                    event(EventKind::EgressFlow {
+                        destination: "203.0.113.9".to_owned(),
+                        port: 443,
+                    }),
+                ],
+            });
+            let mut sentinel = Sentinel::new(
+                vec![sensor],
+                Arc::new(harw_observe::NullSink),
+                SentinelConfig::default(),
+            );
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+
+            tracing::subscriber::with_default(subscriber, || {
+                poll_once(
+                    &mut sentinel,
+                    None,
+                    &harw_observe::NullSink,
+                    &mut rule_cycle(),
+                    None,
+                    None,
+                    None,
+                );
+            });
+
+            assert_eq!(sentinel.buffer().event_len(), 2, "the events were recorded");
+            let bytes = captured
+                .0
+                .lock()
+                .map_err(|_| TestError::Missing("capture lock"))?
+                .clone();
+            let text = String::from_utf8(bytes).map_err(ctx("utf-8 log output"))?;
+            assert!(text.contains("security rule finding"), "{text}");
+            for leaked in ["/etc/shadow-secret", "203.0.113.9"] {
+                assert!(!text.contains(leaked), "{leaked} reached warn: {text}");
+            }
+            Ok(())
+        }
+
         fn sample_peer() -> ipc::PeerCredentials {
             ipc::PeerCredentials {
                 pid: 4242,
@@ -1828,6 +1934,45 @@ egress_allow_cidrs = []
                 vec![job.to_str().map(str::to_owned), None],
                 "a resolved id carries its absolute path, an unknown id none"
             );
+            Ok(())
+        }
+
+        #[test]
+        fn test_drain_hands_back_the_kernel_id_of_each_resolved_cgroup() -> TestResult {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let tree = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let job = tree.path().join("harw-job-8");
+            std::fs::create_dir_all(&job).map_err(ctx("fixture cgroup"))?;
+            let job_id = std::fs::symlink_metadata(&job)
+                .map_err(ctx("fixture metadata"))?
+                .ino();
+            let inbox: IpcInboxHandle = Arc::new(Mutex::new(ipc::IpcInbox::new(4)));
+            {
+                let mut guard = inbox.lock().map_err(ctx("uncontended lock"))?;
+                let mut event = sample_probe_event("probe-bpf-0");
+                event.actor = Some(harw_dod_signals::Actor {
+                    uid: 1000,
+                    auid: None,
+                    cgroup: harw_dod_signals::Actor::raw_cgroup(job_id),
+                    process: None,
+                });
+                guard.push(ipc::ReceivedEvent {
+                    event,
+                    peer: sample_peer(),
+                });
+            }
+            let mut resolver = cgroup_resolve::CgroupResolver::new(tree.path().to_path_buf());
+            let mut sentinel = Sentinel::new(
+                Vec::new(),
+                Arc::new(harw_observe::NullSink),
+                SentinelConfig::default(),
+            );
+
+            let kids = drain_external_events(&mut sentinel, Some(&inbox), Some(&mut resolver));
+
+            let path = job.to_str().ok_or(TestError::Missing("utf-8 path"))?;
+            assert_eq!(kids.kid_of(path), Some(job_id));
             Ok(())
         }
 
