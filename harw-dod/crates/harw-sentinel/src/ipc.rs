@@ -33,6 +33,18 @@
 //!   Speicherfehler auf der anderen. Ein Unix-Socket hält die beiden
 //!   Adressräume vollständig getrennt; der Kernel kopiert.
 //!
+//! # Zulassung per `SO_PEERCRED` (PL-100 WP0.5)
+//! Der Socket ist für jedes Mitglied von `harw-ipc` erreichbar; die
+//! Dateirechte allein trennen also nicht zwischen einer Sonde und jedem
+//! anderen Prozess dieser Gruppe. [`spawn_receive_loop`] prüft deshalb jede
+//! angenommene Verbindung gegen eine [`crate::peer_allow::PeerAllowlist`]
+//! (die konfigurierten Sonden-Konten plus uid `0`), **bevor** auch nur eine
+//! Nachricht gelesen wird ([`admit_connection`]). Ein anderer Peer wird
+//! ohne Antwort geschlossen — Push-only gilt auch hier —, in
+//! [`IpcInbox::rejected_total`] gezählt (Gesundheitsexport
+//! `ipc.peers_rejected_total`) und nur auf `debug` geloggt, damit ein
+//! lokaler Angreifer mit Verbindungsversuchen nicht das Journal flutet.
+//!
 //! # Push-Only: kein Rückkanal
 //! Dieser Prozess **empfängt** von den Sonden, **sendet ihnen aber nie
 //! etwas**. Eine Sonde mit `CAP_SYS_ADMIN` oder `CAP_BPF`, die Anweisungen
@@ -113,6 +125,8 @@ use harw_dod_signals::SecurityEvent;
 use harw_macros::HarwError;
 use rustix::fd::OwnedFd;
 
+use crate::peer_allow::PeerAllowlist;
+
 /// Empfangspuffer-Größe je Nachricht.
 ///
 /// Reichlich bemessen für ein einzelnes serialisiertes `SecurityEvent`
@@ -170,10 +184,8 @@ pub enum IpcError {
 /// # Description
 /// Gelesen genau einmal, direkt nach `accept()` — der Kernel füllt diese
 /// Werte aus dem verbindenden Prozess, nicht aus dessen (fälschbaren)
-/// Nutzlast. `harw-sentinel` **prüft** diese Werte heute nicht gegen eine
-/// Zulassungsliste (keine ist Teil dieses Knotens); sie werden geloggt, was
-/// dem Betreiber bereits erlaubt zu erkennen, wenn ein unerwarteter Prozess
-/// eine Verbindung aufbaut.
+/// Nutzlast. [`admit_connection`] prüft `uid` gegen die
+/// [`PeerAllowlist`] (PL-100 WP0.5), bevor eine Nachricht gelesen wird.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerCredentials {
     /// Prozess-ID des Peers zum Zeitpunkt von `connect()`.
@@ -407,6 +419,9 @@ pub struct IpcInbox {
     /// Number of probe connections currently open (accepted and not yet
     /// closed), maintained by the receive loop.
     connected: u64,
+    /// Verbindungen, die seit dem Start wegen einer uid außerhalb der
+    /// [`PeerAllowlist`] geschlossen wurden (PL-100 WP0.5).
+    rejected: u64,
 }
 
 impl IpcInbox {
@@ -426,6 +441,7 @@ impl IpcInbox {
             dropped: 0,
             received: 0,
             connected: 0,
+            rejected: 0,
         }
     }
 
@@ -506,13 +522,76 @@ impl IpcInbox {
     pub fn peer_disconnected(&mut self) {
         self.connected = self.connected.saturating_sub(1);
     }
+
+    /// Hält fest, dass eine Verbindung wegen ihrer uid abgewiesen wurde
+    /// (siehe [`admit_connection`]).
+    pub fn peer_rejected(&mut self) {
+        self.rejected = self.rejected.saturating_add(1);
+    }
+
+    /// Anzahl der seit dem Start abgewiesenen Verbindungen.
+    ///
+    /// # Returns
+    /// Eine monoton wachsende Zahl; das Feld `ipc.peers_rejected_total` des
+    /// Gesundheitsexports (`crate::health_export`). **Erwartet wird null**;
+    /// jeder Wert darüber heißt, dass ein Prozess außerhalb der
+    /// Sonden-Konten Ereignisse einzuspeisen versucht hat.
+    #[must_use]
+    pub fn rejected_total(&self) -> u64 {
+        self.rejected
+    }
+}
+
+/// Prüft eine angenommene Verbindung gegen die Zulassungsliste.
+///
+/// # Description
+/// Läuft direkt nach [`IpcListener::accept`] und **vor** dem ersten
+/// [`IpcConnection::recv_event`]. Ist die `SO_PEERCRED`-uid des Peers nicht
+/// zugelassen, wird die Verbindung geschlossen (Drop des Deskriptors, keine
+/// Antwort an den Peer), [`IpcInbox::peer_rejected`] gezählt und nur auf
+/// `debug` geloggt (uid und pid, kein Inhalt).
+///
+/// # Arguments
+/// - `connection` (`IpcConnection`): die frisch angenommene Verbindung.
+/// - `allowlist` (`&PeerAllowlist`): die beim Start aufgelöste Liste.
+/// - `inbox` (`&std::sync::Mutex<IpcInbox>`): Ziel des Abweisungszählers.
+///
+/// # Returns
+/// `Some(connection)` für einen zugelassenen Peer, sonst `None` (die
+/// Verbindung ist dann bereits geschlossen).
+///
+/// # Concurrency
+/// Sperrt `inbox` nur für das Hochzählen.
+pub fn admit_connection(
+    connection: IpcConnection,
+    allowlist: &PeerAllowlist,
+    inbox: &Mutex<IpcInbox>,
+) -> Option<IpcConnection> {
+    let peer = connection.peer();
+    if allowlist.permits(peer.uid) {
+        return Some(connection);
+    }
+    match inbox.lock() {
+        Ok(mut inbox) => inbox.peer_rejected(),
+        Err(poisoned) => poisoned.into_inner().peer_rejected(),
+    }
+    tracing::debug!(
+        peer_uid = peer.uid,
+        peer_pid = peer.pid,
+        "ipc peer is not on the probe allowlist; connection closed without reading"
+    );
+    drop(connection);
+    None
 }
 
 /// Startet einen Hintergrundthread, der Verbindungen annimmt und ihre
 /// Ereignisse in `inbox` einträgt.
 ///
 /// # Description
-/// Für jede über [`IpcListener::accept`] angenommene Verbindung startet
+/// Jede über [`IpcListener::accept`] angenommene Verbindung läuft zuerst
+/// durch [`admit_connection`]: ein Peer außerhalb von `allowlist` wird
+/// geschlossen und gezählt, ohne dass eine Nachricht gelesen wird, und die
+/// Annahmeschleife läuft weiter. Für jede zugelassene Verbindung startet
 /// diese Schleife einen weiteren Thread, der [`IpcConnection::recv_event`]
 /// wiederholt aufruft, bis die Verbindung geordnet schließt (`Ok(None)`)
 /// oder scheitert (`Err`, geloggt, dann beendet) — beides beendet nur den
@@ -527,6 +606,9 @@ impl IpcInbox {
 ///   diesem Thread übernommen.
 /// - `inbox` (`std::sync::Arc<std::sync::Mutex<IpcInbox>>`): geteiltes Ziel
 ///   jedes empfangenen Ereignisses.
+/// - `allowlist` (`PeerAllowlist`): die beim Start aufgelösten
+///   Sonden-uids plus uid `0` (PL-100 WP0.5). Wird von diesem Thread
+///   übernommen.
 ///
 /// # Returns
 /// Den `JoinHandle` der Annahmeschleife. Läuft, bis `accept()` dauerhaft
@@ -538,11 +620,18 @@ impl IpcInbox {
 /// Startet `std::thread::spawn` je akzeptierter Verbindung (siehe
 /// Moduldoku). `inbox` wird nur über den `Mutex` berührt, nie ohne ihn.
 #[must_use]
-pub fn spawn_receive_loop(listener: IpcListener, inbox: Arc<Mutex<IpcInbox>>) -> JoinHandle<()> {
+pub fn spawn_receive_loop(
+    listener: IpcListener,
+    inbox: Arc<Mutex<IpcInbox>>,
+    allowlist: PeerAllowlist,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
             match listener.accept() {
                 Ok(connection) => {
+                    let Some(connection) = admit_connection(connection, &allowlist, &inbox) else {
+                        continue;
+                    };
                     let inbox = Arc::clone(&inbox);
                     std::thread::spawn(move || receive_until_closed(connection, &inbox));
                 }
@@ -612,10 +701,80 @@ fn receive_events(connection: &IpcConnection, peer: PeerCredentials, inbox: &Mut
 
 #[cfg(test)]
 mod tests {
-    use super::{IpcConnection, IpcInbox, IpcListener, PeerCredentials, ReceivedEvent};
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use super::{
+        IpcConnection, IpcInbox, IpcListener, PeerCredentials, ReceivedEvent, admit_connection,
+    };
+    use crate::peer_allow::PeerAllowlist;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_signals::{EventKind, SecurityEvent};
     use harw_types::SensorId;
+    use rustix::fd::OwnedFd;
+    use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType};
+
+    /// Eine Verbindung über ein `socketpair` mit vorgegebener Peer-uid —
+    /// für die reine Zulassungsentscheidung ohne lauschenden Socket. Die
+    /// zweite Hälfte ist die Seite des (vorgetäuschten) Peers.
+    fn connection_with_peer(uid: u32) -> TestResult<(IpcConnection, OwnedFd)> {
+        let (ours, theirs) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(ctx("socketpair"))?;
+        let connection = IpcConnection {
+            socket: ours,
+            peer: PeerCredentials {
+                pid: 4242,
+                uid,
+                gid: uid,
+            },
+        };
+        Ok((connection, theirs))
+    }
+
+    /// Ob die Peer-Seite ein Schließen ohne jede Nachricht sieht: `recv`
+    /// liefert `0` Bytes oder `ECONNRESET` (so meldet der Kernel das
+    /// Schließen, wenn beim Gegenüber noch ungelesene Daten lagen,
+    /// `unix_release_sock`). Ein noch offener Socket ergäbe `EAGAIN`.
+    fn peer_sees_close_without_reply(peer: &OwnedFd) -> TestResult<bool> {
+        let mut buffer = [0u8; 64];
+        match rustix::net::recv(peer, &mut buffer, RecvFlags::DONTWAIT) {
+            Ok((copied, message_len)) => Ok(copied == 0 && message_len == 0),
+            Err(error) if error == rustix::io::Errno::CONNRESET => Ok(true),
+            Err(error) => Err(TestError::Unexpected(format!(
+                "peer recv after close failed: {error}"
+            ))),
+        }
+    }
+
+    fn rejected(inbox: &Mutex<IpcInbox>) -> TestResult<u64> {
+        Ok(inbox.lock().map_err(ctx("inbox lock"))?.rejected_total())
+    }
+
+    /// Bindet einen echten Empfangssocket unter `/tmp` (kurzer Pfad, weit
+    /// unter der `sun_path`-Grenze von 108 Bytes).
+    fn bind_in_tempdir() -> TestResult<(tempfile::TempDir, IpcListener)> {
+        let dir = tempfile::Builder::new()
+            .prefix("hs-ipc")
+            .tempdir_in("/tmp")
+            .map_err(ctx("tempdir"))?;
+        let listener = IpcListener::bind(&dir.path().join("s.sock")).map_err(ctx("bind"))?;
+        Ok((dir, listener))
+    }
+
+    /// Verbindet sich als Sonde und sendet genau eine Nachricht.
+    fn connect_and_send(path: &Path, payload: &[u8]) -> TestResult<OwnedFd> {
+        let client = rustix::net::socket(AddressFamily::UNIX, SocketType::SEQPACKET, None)
+            .map_err(ctx("client socket"))?;
+        let address = SocketAddrUnix::new(path).map_err(ctx("client address"))?;
+        rustix::net::connect(&client, &address).map_err(ctx("connect"))?;
+        rustix::net::send(&client, payload, SendFlags::empty()).map_err(ctx("send"))?;
+        Ok(client)
+    }
 
     fn sample_peer() -> PeerCredentials {
         PeerCredentials {
@@ -711,6 +870,107 @@ mod tests {
     fn test_ipc_inbox_capacity_zero_is_treated_as_one() {
         let inbox = IpcInbox::new(0);
         assert_eq!(inbox.capacity(), 1);
+    }
+
+    #[test]
+    fn test_ipc_inbox_rejection_counter_starts_at_zero_and_saturates() {
+        let mut inbox = IpcInbox::new(1);
+        assert_eq!(inbox.rejected_total(), 0);
+        inbox.peer_rejected();
+        inbox.peer_rejected();
+        assert_eq!(inbox.rejected_total(), 2);
+        assert_eq!(inbox.connected(), 0, "a rejection is no connection");
+    }
+
+    /// PL-100 WP0.5: ein Peer mit falscher uid wird abgewiesen, gezählt und
+    /// ohne Antwort geschlossen.
+    #[test]
+    fn test_admit_connection_rejects_a_peer_outside_the_allowlist() -> TestResult {
+        let (connection, peer) = connection_with_peer(1000)?;
+        let inbox = Mutex::new(IpcInbox::new(4));
+        let allowlist = PeerAllowlist::with_root([991, 992]);
+
+        let admitted = admit_connection(connection, &allowlist, &inbox);
+
+        assert!(admitted.is_none(), "uid 1000 is no probe account");
+        assert_eq!(rejected(&inbox)?, 1);
+        assert!(
+            peer_sees_close_without_reply(&peer)?,
+            "the rejected peer sees an orderly close, never a reply"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_admit_connection_passes_a_listed_probe_uid_through() -> TestResult {
+        let (connection, _peer) = connection_with_peer(991)?;
+        let inbox = Mutex::new(IpcInbox::new(4));
+        let allowlist = PeerAllowlist::with_root([991, 992]);
+
+        let admitted = admit_connection(connection, &allowlist, &inbox)
+            .ok_or(TestError::Missing("listed probe uid is admitted"))?;
+
+        assert_eq!(admitted.peer().uid, 991);
+        assert_eq!(rejected(&inbox)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_admit_connection_always_admits_root() -> TestResult {
+        let (connection, _peer) = connection_with_peer(0)?;
+        let inbox = Mutex::new(IpcInbox::new(4));
+        let allowlist = PeerAllowlist::with_root(std::iter::empty());
+
+        assert!(admit_connection(connection, &allowlist, &inbox).is_some());
+        assert_eq!(rejected(&inbox)?, 0);
+        Ok(())
+    }
+
+    /// Echter Socket: `bind` → `connect` → `accept` → `SO_PEERCRED` →
+    /// Zulassung → `recv_event`. Die zugelassene uid ist die vom Kernel
+    /// gemeldete des Testprozesses selbst.
+    #[test]
+    fn test_real_socket_admits_a_listed_peer_and_reads_its_event() -> TestResult {
+        let (_dir, listener) = bind_in_tempdir()?;
+        let payload = serde_json::to_vec(&sample_event()).map_err(ctx("encode event"))?;
+        let _client = connect_and_send(listener.path(), &payload)?;
+
+        let connection = listener.accept().map_err(ctx("accept"))?;
+        let own_uid = connection.peer().uid;
+        let inbox = Mutex::new(IpcInbox::new(4));
+        let connection =
+            admit_connection(connection, &PeerAllowlist::with_root([own_uid]), &inbox)
+                .ok_or(TestError::Missing("the listed peer is admitted"))?;
+
+        let event = connection
+            .recv_event()
+            .map_err(ctx("recv event"))?
+            .ok_or(TestError::Missing("one event was sent"))?;
+        assert_eq!(event, sample_event());
+        assert_eq!(rejected(&inbox)?, 0);
+        Ok(())
+    }
+
+    /// Echter Socket: ein Peer außerhalb der Liste wird nach `accept`
+    /// geschlossen, bevor seine bereits gesendete Nachricht gelesen wird.
+    /// `exactly` statt `with_root`, damit der Test auch als root abweist.
+    #[test]
+    fn test_real_socket_rejects_an_unlisted_peer_before_reading() -> TestResult {
+        let (_dir, listener) = bind_in_tempdir()?;
+        let payload = serde_json::to_vec(&sample_event()).map_err(ctx("encode event"))?;
+        let client = connect_and_send(listener.path(), &payload)?;
+
+        let connection = listener.accept().map_err(ctx("accept"))?;
+        let own_uid = connection.peer().uid;
+        let inbox = Mutex::new(IpcInbox::new(4));
+        let allowlist = PeerAllowlist::exactly([own_uid.wrapping_add(1)]);
+
+        assert!(admit_connection(connection, &allowlist, &inbox).is_none());
+        assert_eq!(rejected(&inbox)?, 1);
+        let held = inbox.lock().map_err(ctx("inbox lock"))?.len();
+        assert_eq!(held, 0, "nothing of the rejected peer reaches the inbox");
+        assert!(peer_sees_close_without_reply(&client)?);
+        Ok(())
     }
 
     #[test]
