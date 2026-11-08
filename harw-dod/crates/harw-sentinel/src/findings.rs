@@ -28,6 +28,38 @@
 //! still zu verlieren. Die Attribution (siehe unten) läuft über dasselbe
 //! Delta.
 //!
+//! # Entprellung wiederholter Befunde (PL-100 WP0.4)
+//! Auch über das Delta erzeugt ein lauter Dienst viele gleichartige Befunde.
+//! [`report_findings`] bestimmt deshalb je Befund seine Herkunft
+//! ([`FindingOrigin`]: `uid`, `cgroup_kid`, grobes Subjekt des auslösenden
+//! Ereignisses) und daraus den `dedup_key`
+//! ([`crate::throttle::DedupKey`]). Mit einem
+//! [`crate::throttle::FindingThrottle`] (im Betrieb immer,
+//! [`RuleCycle::with_throttle`]) wird eine Wiederholung innerhalb der
+//! Abklingzeit nur gezählt (`occurrences`, Metrik
+//! [`SECURITY_FINDING_SUPPRESSED_TOTAL`], `debug`) und weder ins Journal
+//! (`warn`) noch in den Export geschrieben; siehe `crate::throttle` für
+//! Abklingzeit, echte Änderungen und den gespeicherten Zustand. Die
+//! Herkunft wird wie die Cgroup-Zuordnung (unten) ohne Eingriff ins
+//! Regelwerk bestimmt: die Regeln laufen zusätzlich je **einzelnem**
+//! Ereignis des Deltas; ein Befund des vollen Laufs übernimmt die Merkmale,
+//! die alle Einzelläufe mit seiner Signatur gemeinsam haben. Stammt nicht
+//! jeder Befund dieser Signatur aus einem Einzelereignis, bleiben `uid` und
+//! `cgroup_kid` leer; ohne jedes Einzelereignis ist das Subjekt der Digest
+//! der Zusammenfassung. Die Kernel-ID einer Cgroup stammt aus der
+//! [`crate::cgroup_resolve::CgroupKids`] des Zyklus, in dem die Sonde sie
+//! geliefert hat.
+//!
+//! # Journal-Hygiene (PL-100 WP0.6)
+//! Auf `warn` stehen je gemeldetem Befund nur Kennungen und Aufzählungen:
+//! `finding_id`, `rule_id`, `kind`, `severity`, `hardness`, `dedup_key`,
+//! `occurrences`, `first_seen` und der Meldegrund. Zusammenfassung, Scope
+//! (Pfad), `uid` und `cgroup_kid` — also Pfade, IP-Adressen und anderer
+//! erzeugerbestimmter Text — stehen nur auf `debug`, die Zusammenfassung
+//! dort zusätzlich `Debug`-escapt. Ein Angreifer kann so weder Steuerzeichen
+//! noch Ziele ins Journal schreiben, und das Journal verrät keine
+//! beobachteten Ziele.
+//!
 //! # Warum der Sentinel nichts durchsetzt
 //! Dieses Binary ist die **unprivilegierte** Sammelstelle (siehe
 //! `crate`-Moduldoku, Abschnitt „Das erste vollständig unprivilegierte
@@ -145,16 +177,22 @@
 //! meldet nur
 //! — sie bricht bei keiner Befundzahl ab.
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+
 use harw_authority::{EgressTarget, NetworkScope};
 use harw_dod_config::ResolvedObservationProfile;
 use harw_dod_rules::rule::RuleContext;
 use harw_dod_rules::{FindingKind, run_rules, run_rules_checked};
 use harw_dod_sentinel::{BufferMark, EvidenceBuffer};
-use harw_dod_signals::{SecurityEvent, SecurityEvidence, Severity};
+use harw_dod_signals::{EventKind, Hardness, SecurityEvent, SecurityEvidence, Severity};
 use harw_observe::{FieldValue, MetricValue, TelemetrySink};
 use jiff::Timestamp;
 
+use crate::cgroup_resolve::CgroupKids;
 use crate::export::FindingsExporter;
+use crate::health_export::RingCounters;
+use crate::throttle::{CoarseSubject, DedupKey, FindingThrottle, ThrottleDecision, ThrottleVerdict};
 
 /// Label-Feldname für die auslösende Regel ([`harw_dod_rules::Rule::id`]).
 const RULE_LABEL: harw_observe::FieldName = harw_macros::field!("rule_id");
@@ -171,6 +209,11 @@ harw_macros::metrics! {
     /// Befundarten, keine weitere Regel dieses Knotens.
     SECURITY_FINDING_TOTAL: counter, unit = count, labels = ["rule_id", "kind"], cardinality = bounded(6),
         name = "harw_sentinel_security_finding_total";
+    /// Wie oft ein Befund seit Prozessstart innerhalb seiner Abklingzeit nur
+    /// gezählt statt gemeldet wurde (PL-100 WP0.4, `crate::throttle`).
+    /// [`SECURITY_FINDING_TOTAL`] zählt jeden Regeltreffer, auch diese.
+    SECURITY_FINDING_SUPPRESSED_TOTAL: counter, unit = count, labels = [], cardinality = single,
+        name = "harw_sentinel_security_finding_suppressed_total";
 }
 
 /// Ordnet einen [`FindingKind`] seinem Label-Wert für
@@ -184,6 +227,113 @@ const fn finding_kind_label(kind: FindingKind) -> &'static str {
     match kind {
         FindingKind::RuleTriggered => "rule-triggered",
         FindingKind::Anomaly => "anomaly",
+    }
+}
+
+/// Stabile Kurzform der Art eines Sicherheitsereignisses — für Zählungen im
+/// Journal statt des Ereignisinhalts (PL-100 WP0.6).
+///
+/// Erschöpfendes `match` ohne Wildcard: eine neue Ereignisart bricht den
+/// Build, statt unter falschem Namen gezählt zu werden.
+#[must_use]
+pub const fn event_kind_label(kind: &EventKind) -> &'static str {
+    match kind {
+        EventKind::ProcessExec { .. } => "process-exec",
+        EventKind::FileWrite { .. } => "file-write",
+        EventKind::EgressFlow { .. } => "egress-flow",
+        EventKind::ListenerOpened { .. } => "listener-opened",
+        EventKind::AuthEvent { .. } => "auth-event",
+        EventKind::StructureDrift { .. } => "structure-drift",
+        EventKind::SensorDegraded { .. } => "sensor-degraded",
+    }
+}
+
+/// Zählt `events` je [`event_kind_label`] — der Journal-Ersatz für den
+/// vollständigen Ereignisinhalt (`crate::poll_once`, `debug`).
+///
+/// # Returns
+/// Höchstens sieben Einträge (eine je Ereignisart), sortiert nach Label.
+#[must_use]
+pub fn event_kind_counts(events: &[SecurityEvent]) -> BTreeMap<&'static str, u64> {
+    let mut counts = BTreeMap::new();
+    for event in events {
+        let count: &mut u64 = counts.entry(event_kind_label(&event.kind)).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+    counts
+}
+
+/// Herkunft eines Befundes im Delta (PL-100 WP0.4): wer ihn ausgelöst hat
+/// und worüber.
+///
+/// # Description
+/// Bestimmt in [`report_findings`] (siehe Moduldoku, Abschnitt
+/// „Entprellung wiederholter Befunde"). Jedes Feld ist nur gesetzt, wenn es
+/// für **alle** Ereignisse mit der Signatur des Befundes gleich ist — nie
+/// geraten.
+///
+/// # Concurrency
+/// Reiner Werttyp, `Send + Sync`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingOrigin {
+    /// `Actor::uid` des auslösenden Ereignisses.
+    pub uid: Option<u32>,
+    /// Kernel-ID der Cgroup des auslösenden Ereignisses (`cgroup_kid`).
+    pub cgroup_kid: Option<u64>,
+    /// Das grobe Subjekt für den `dedup_key`.
+    pub subject: CoarseSubject,
+}
+
+impl FindingOrigin {
+    /// Die Herkunft, die ein einzelnes auslösendes Ereignis beiträgt.
+    ///
+    /// `cgroup_kid` stammt aus `cgroup_kids` (aufgelöster Pfad des Zyklus)
+    /// oder, für einen noch nicht aufgelösten Akteur, aus seiner rohen
+    /// Kernel-ID.
+    fn of_event(event: &SecurityEvent, cgroup_kids: &CgroupKids) -> Self {
+        let actor = event.actor.as_ref();
+        let cgroup_kid = actor.and_then(|actor| {
+            actor
+                .cgroup
+                .as_ref()
+                .and_then(|cgroup| cgroup_kids.kid_of(cgroup.as_str()))
+                .or_else(|| actor.raw_cgroup_id())
+        });
+        Self {
+            uid: actor.map(|actor| actor.uid),
+            cgroup_kid,
+            subject: CoarseSubject::of_event(event),
+        }
+    }
+
+    /// Die Herkunft eines Befundes ohne zuordenbares Einzelereignis.
+    fn unattributed(summary: &str) -> Self {
+        Self {
+            uid: None,
+            cgroup_kid: None,
+            subject: CoarseSubject::of_summary(summary),
+        }
+    }
+
+    /// Behält nur, was `self` und `other` gemeinsam haben; ein
+    /// abweichendes Subjekt fällt auf den Digest von `summary` zurück.
+    fn merge(&mut self, other: &Self, summary: &str) {
+        if self.uid != other.uid {
+            self.uid = None;
+        }
+        if self.cgroup_kid != other.cgroup_kid {
+            self.cgroup_kid = None;
+        }
+        if self.subject != other.subject {
+            self.subject = CoarseSubject::of_summary(summary);
+        }
+    }
+
+    /// Der `dedup_key` eines Befundes der Regel `rule_id` mit dieser
+    /// Herkunft.
+    #[must_use]
+    pub fn dedup_key(&self, rule_id: &str) -> DedupKey {
+        DedupKey::derive(rule_id, self.uid, self.cgroup_kid, &self.subject)
     }
 }
 

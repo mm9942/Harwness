@@ -44,10 +44,21 @@
 //! cgroup outside a narrower root, or one past the bounds) therefore cost
 //! no steady background I/O in later batches.
 //!
+//! # Keeping the kernel id (PL-100 WP0.4/WP0.9)
+//! [`resolve_actor_cgroup`] replaces the raw id with the path, but returns
+//! the id it resolved. The drain loop records it per path in a
+//! [`CgroupKids`] for the same poll cycle, so a finding can still be keyed
+//! on (and exported with) its `cgroup_kid` even though the event in the
+//! ring only carries the path. Kernel ids are reused after a cgroup is
+//! removed; the map therefore lives for one batch only and never outlives
+//! the cycle that resolved it.
+//!
 //! # Concurrency
-//! [`CgroupResolver`] is owned by the collection thread (`&mut self`).
+//! [`CgroupResolver`] and [`CgroupKids`] are owned by the collection thread
+//! (`&mut self`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -56,6 +67,9 @@ use harw_types::CgroupId;
 
 /// Default upper bound of cached cgroup directories.
 pub const DEFAULT_MAX_ENTRIES: usize = 8192;
+
+/// Most distinct cgroup paths a [`CgroupKids`] records per batch.
+pub const MAX_BATCH_KIDS: usize = 4096;
 
 /// Default maximum depth below the root that the walk descends.
 pub const DEFAULT_MAX_DEPTH: usize = 32;
@@ -287,15 +301,75 @@ impl CgroupResolver {
 /// path when `resolver` finds it; every other value — an unresolved id, no
 /// resolver, or a value the probe sent that is not a raw id — becomes
 /// `None`. The sentinel only reports a cgroup path it resolved itself.
-pub fn resolve_actor_cgroup(actor: &mut Actor, resolver: Option<&mut CgroupResolver>) {
+///
+/// # Returns
+/// The kernel cgroup id when `actor.cgroup` now carries its resolved path
+/// (record it with [`CgroupKids::record`]); `None` otherwise.
+pub fn resolve_actor_cgroup(
+    actor: &mut Actor,
+    resolver: Option<&mut CgroupResolver>,
+) -> Option<u64> {
     let Some(raw) = actor.raw_cgroup_id() else {
         actor.cgroup = None;
-        return;
+        return None;
     };
     actor.cgroup = resolver
         .and_then(|resolver| resolver.resolve(raw))
         .and_then(|path| path.to_str().map(str::to_owned))
         .and_then(|path| CgroupId::try_from_str(path).ok());
+    actor.cgroup.is_some().then_some(raw)
+}
+
+/// Kernel cgroup ids of the cgroup paths resolved in one drain batch.
+///
+/// # Description
+/// See the module documentation, "Keeping the kernel id". A path that two
+/// different ids resolved to within one batch (a cgroup removed and
+/// recreated under the same name) is ambiguous and reports no id. At most
+/// [`MAX_BATCH_KIDS`] paths are recorded; further paths report no id.
+///
+/// # Examples
+/// ```rust,ignore
+/// let mut kids = CgroupKids::default();
+/// kids.record("/sys/fs/cgroup/harw.slice/job", 42);
+/// assert_eq!(kids.kid_of("/sys/fs/cgroup/harw.slice/job"), Some(42));
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CgroupKids {
+    // Resolved path -> kernel id, `None` when ambiguous.
+    by_path: BTreeMap<String, Option<u64>>,
+}
+
+impl CgroupKids {
+    /// Remembers that `path` was resolved from kernel id `kid`.
+    ///
+    /// # Arguments
+    /// - `path` (`&str`): the resolved cgroup path (`Actor::cgroup`).
+    /// - `kid` (`u64`): the kernel cgroup id it was resolved from.
+    pub fn record(&mut self, path: &str, kid: u64) {
+        let full = self.by_path.len() >= MAX_BATCH_KIDS;
+        match self.by_path.entry(path.to_owned()) {
+            Entry::Occupied(mut slot) => {
+                if *slot.get() != Some(kid) {
+                    slot.insert(None);
+                }
+            }
+            Entry::Vacant(slot) => {
+                if !full {
+                    slot.insert(Some(kid));
+                }
+            }
+        }
+    }
+
+    /// The kernel id `path` was resolved from in this batch.
+    ///
+    /// # Returns
+    /// `None` for an unknown or ambiguous path.
+    #[must_use]
+    pub fn kid_of(&self, path: &str) -> Option<u64> {
+        self.by_path.get(path).copied().flatten()
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -474,7 +548,12 @@ mod tests {
             cgroup: Actor::raw_cgroup(inode(&job)?),
             process: None,
         };
-        resolve_actor_cgroup(&mut actor, Some(&mut resolver));
+        let job_id = inode(&job)?;
+        assert_eq!(
+            resolve_actor_cgroup(&mut actor, Some(&mut resolver)),
+            Some(job_id),
+            "the resolved kernel id is handed back"
+        );
         assert_eq!(
             actor.cgroup.as_ref().map(CgroupId::as_str),
             job.to_str(),
@@ -487,7 +566,7 @@ mod tests {
             cgroup: Actor::raw_cgroup(u64::MAX),
             process: None,
         };
-        resolve_actor_cgroup(&mut unknown, Some(&mut resolver));
+        assert_eq!(resolve_actor_cgroup(&mut unknown, Some(&mut resolver)), None);
         assert_eq!(unknown.cgroup, None);
 
         let mut claimed = Actor {
@@ -496,7 +575,7 @@ mod tests {
             cgroup: Some(CgroupId::from_str("/claimed/by/probe")),
             process: None,
         };
-        resolve_actor_cgroup(&mut claimed, Some(&mut resolver));
+        assert_eq!(resolve_actor_cgroup(&mut claimed, Some(&mut resolver)), None);
         assert_eq!(claimed.cgroup, None, "a probe-supplied path is not trusted");
 
         let mut no_resolver = Actor {
@@ -505,8 +584,44 @@ mod tests {
             cgroup: Actor::raw_cgroup(inode(&job)?),
             process: None,
         };
-        resolve_actor_cgroup(&mut no_resolver, None);
+        assert_eq!(resolve_actor_cgroup(&mut no_resolver, None), None);
         assert_eq!(no_resolver.cgroup, None);
         Ok(())
+    }
+
+    #[test]
+    fn test_cgroup_kids_report_the_id_of_a_resolved_path() {
+        let mut kids = CgroupKids::default();
+        kids.record("/sys/fs/cgroup/harw-job-1", 42);
+        kids.record("/sys/fs/cgroup/harw-job-1", 42);
+        kids.record("/sys/fs/cgroup/harw-job-2", 43);
+        assert_eq!(kids.kid_of("/sys/fs/cgroup/harw-job-1"), Some(42));
+        assert_eq!(kids.kid_of("/sys/fs/cgroup/harw-job-2"), Some(43));
+        assert_eq!(kids.kid_of("/sys/fs/cgroup/unknown"), None);
+    }
+
+    #[test]
+    fn test_cgroup_kids_mark_a_path_with_two_ids_ambiguous() {
+        let mut kids = CgroupKids::default();
+        kids.record("/sys/fs/cgroup/harw-job-1", 42);
+        kids.record("/sys/fs/cgroup/harw-job-1", 99);
+        assert_eq!(kids.kid_of("/sys/fs/cgroup/harw-job-1"), None);
+        kids.record("/sys/fs/cgroup/harw-job-1", 42);
+        assert_eq!(
+            kids.kid_of("/sys/fs/cgroup/harw-job-1"),
+            None,
+            "ambiguity is sticky for the batch"
+        );
+    }
+
+    #[test]
+    fn test_cgroup_kids_are_bounded() {
+        let mut kids = CgroupKids::default();
+        for id in 0..u64::try_from(MAX_BATCH_KIDS).unwrap_or(u64::MAX) {
+            kids.record(&format!("/sys/fs/cgroup/job-{id}"), id.saturating_add(1));
+        }
+        kids.record("/sys/fs/cgroup/one-too-many", 7);
+        assert_eq!(kids.kid_of("/sys/fs/cgroup/one-too-many"), None);
+        assert_eq!(kids.kid_of("/sys/fs/cgroup/job-0"), Some(1));
     }
 }
