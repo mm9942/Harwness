@@ -34,7 +34,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> TestResult {
         let path = entry.map_err(ctx("Verzeichniseintrag lesen"))?.path();
         if path.is_dir() {
             collect_rs_files(&path, out)?;
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+        } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("rs") {
             out.push(path);
         }
     }
