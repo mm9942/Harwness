@@ -889,7 +889,8 @@ fn attribute_scopes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
+    use crate::throttle::ThrottleConfig;
     use harw_dod_signals::{DriftSeverity, EventKind, SecurityEvent};
     use harw_types::SensorId;
 
@@ -1343,5 +1344,356 @@ mod tests {
             "rule-triggered"
         );
         assert_eq!(finding_kind_label(FindingKind::Anomaly), "anomaly");
+    }
+
+    fn at(secs: i64) -> TestResult<Timestamp> {
+        Timestamp::from_second(secs).map_err(ctx("timestamp"))
+    }
+
+    fn egress_from(uid: Option<u32>, destination: &str, port: u16) -> SecurityEvent {
+        SecurityEvent {
+            actor: uid.map(|uid| harw_dod_signals::Actor {
+                uid,
+                auid: None,
+                cgroup: None,
+                process: None,
+            }),
+            ..egress_event(destination, port)
+        }
+    }
+
+    fn throttled_cycle(cooldown_secs: u64) -> RuleCycle {
+        RuleCycle::new(NetworkScope::empty()).with_throttle(FindingThrottle::open(
+            ThrottleConfig::with_cooldown_secs(cooldown_secs),
+            None,
+        ))
+    }
+
+    /// PL-100 WP0.4: Wiederholungen aus demselben /24 an denselben Port
+    /// werden innerhalb der Abklingzeit nur gezählt, danach erneut gemeldet.
+    #[test]
+    fn test_throttle_reports_a_repeated_egress_once_per_cooldown() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        let host = harw_types::HostId::try_from_str("host-a").map_err(ctx("host id"))?;
+        let mut exporter = FindingsExporter::new(path, host);
+        let mut buffer = EvidenceBuffer::new(64, 64);
+        let mut rules = throttled_cycle(600);
+
+        let mut reported = 0_usize;
+        for (second, destination) in [
+            (0, "198.51.100.5"),
+            (5, "198.51.100.77"),
+            (10, "198.51.100.5"),
+        ] {
+            buffer.push_event(egress_from(Some(1000), destination, 443));
+            let cycle = rules.evaluate(
+                &buffer,
+                &harw_observe::NullSink,
+                at(second)?,
+                &CgroupKids::default(),
+                Some(&mut exporter),
+            );
+            reported = checked_sum(reported, cycle)?;
+        }
+        assert_eq!(reported, 1, "same uid, same /24, same port: one report");
+        assert_eq!(exporter.written(), 1);
+
+        buffer.push_event(egress_from(Some(1000), "198.51.100.9", 443));
+        let late = rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            at(700)?,
+            &CgroupKids::default(),
+            Some(&mut exporter),
+        );
+        assert_eq!(late, 1, "the cooldown elapsed");
+        assert_eq!(exporter.written(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_throttle_keeps_new_ports_and_other_uids_apart() -> TestResult {
+        let mut buffer = EvidenceBuffer::new(64, 64);
+        let mut rules = throttled_cycle(600);
+        buffer.push_event(egress_from(Some(1000), "198.51.100.5", 443));
+        buffer.push_event(egress_from(Some(1000), "198.51.100.5", 8443));
+        buffer.push_event(egress_from(Some(1001), "198.51.100.5", 443));
+        buffer.push_event(egress_from(Some(1000), "198.51.100.6", 443));
+        let reported = rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            at(0)?,
+            &CgroupKids::default(),
+            None,
+        );
+        assert_eq!(
+            reported, 3,
+            "a new port and another uid are new keys; the same /24 is not"
+        );
+        Ok(())
+    }
+
+    /// Zählt nur die Metrik unterdrückter Befunde.
+    #[derive(Debug, Default)]
+    struct SuppressedCounter(std::sync::atomic::AtomicU64);
+
+    impl TelemetrySink for SuppressedCounter {
+        fn record(
+            &self,
+            key: &harw_observe::MetricKey,
+            _value: MetricValue,
+            _labels: &[(harw_observe::FieldName, FieldValue)],
+        ) {
+            if key.name == SECURITY_FINDING_SUPPRESSED_TOTAL.name {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        fn flush(&self) {}
+
+        fn name(&self) -> &'static str {
+            "suppressed-counter"
+        }
+    }
+
+    #[test]
+    fn test_suppressed_repeats_are_counted_in_their_metric() -> TestResult {
+        let sink = SuppressedCounter::default();
+        let mut buffer = EvidenceBuffer::new(64, 64);
+        let mut rules = throttled_cycle(600);
+        for _ in 0..3 {
+            buffer.push_event(egress_from(None, "198.51.100.5", 443));
+        }
+        let reported = rules.evaluate(&buffer, &sink, at(0)?, &CgroupKids::default(), None);
+        assert_eq!(reported, 1);
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+        Ok(())
+    }
+
+    fn checked_findings(
+        events: &[SecurityEvent],
+    ) -> TestResult<Vec<harw_dod_rules::Finding<harw_dod_rules::RuleChecked>>> {
+        let evidence = SecurityEvidence::capture(vec![], events.to_vec(), Timestamp::UNIX_EPOCH)
+            .map_err(ctx("well-formed content always encodes"))?;
+        let scope = NetworkScope::empty();
+        let ctx_full = RuleContext {
+            now: Timestamp::UNIX_EPOCH,
+            samples: &evidence.samples,
+            events: &evidence.events,
+            baselines: &[],
+            network_scope: &scope,
+        };
+        Ok(run_rules_checked(&ctx_full))
+    }
+
+    #[test]
+    fn test_origin_carries_uid_and_the_cgroup_kid_of_the_cycle() -> TestResult {
+        let job = "/sys/fs/cgroup/harw.slice/harw-job-1";
+        let mut kids = CgroupKids::default();
+        kids.record(job, 4_242);
+        let mut raw = drift_in(None, "raw id");
+        if let Some(actor) = raw.actor.as_mut() {
+            actor.cgroup = harw_dod_signals::Actor::raw_cgroup(77);
+        }
+        let events = vec![
+            drift_in(Some(job), "job one"),
+            drift_in(None, "no cgroup"),
+            raw,
+        ];
+        let findings = checked_findings(&events)?;
+        let origins = attribute_origins(
+            &findings,
+            &events,
+            Timestamp::UNIX_EPOCH,
+            &NetworkScope::empty(),
+            &kids,
+        );
+        let ids: Vec<(Option<u32>, Option<u64>)> = origins
+            .iter()
+            .map(|origin| (origin.uid, origin.cgroup_kid))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                (Some(1000), Some(4_242)),
+                (Some(1000), None),
+                (Some(1000), Some(77))
+            ]
+        );
+        let first_event = events.first().ok_or(TestError::Missing("first event"))?;
+        let first_origin = origins.first().ok_or(TestError::Missing("first origin"))?;
+        assert_eq!(first_origin.subject, CoarseSubject::of_event(first_event));
+        Ok(())
+    }
+
+    #[test]
+    fn test_identical_findings_from_two_uids_keep_only_the_shared_subject() -> TestResult {
+        let mut other = drift_in(None, "same");
+        if let Some(actor) = other.actor.as_mut() {
+            actor.uid = 1001;
+        }
+        let events = vec![drift_in(None, "same"), other];
+        let findings = checked_findings(&events)?;
+        let origins = attribute_origins(
+            &findings,
+            &events,
+            Timestamp::UNIX_EPOCH,
+            &NetworkScope::empty(),
+            &CgroupKids::default(),
+        );
+        let first_event = events.first().ok_or(TestError::Missing("first event"))?;
+        let expected = FindingOrigin {
+            uid: None,
+            cgroup_kid: None,
+            subject: CoarseSubject::of_event(first_event),
+        };
+        assert_eq!(origins, vec![expected.clone(), expected]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_finding_without_a_single_event_match_keys_on_its_summary() -> TestResult {
+        let findings = checked_findings(&[structure_drift_event()])?;
+        let origins = attribute_origins(
+            &findings,
+            &[],
+            Timestamp::UNIX_EPOCH,
+            &NetworkScope::empty(),
+            &CgroupKids::default(),
+        );
+        let finding = findings.first().ok_or(TestError::Missing("finding"))?;
+        assert_eq!(
+            origins,
+            vec![FindingOrigin {
+                uid: None,
+                cgroup_kid: None,
+                subject: CoarseSubject::of_summary(finding.summary()),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_ring_counters_accumulate_entries_lost_before_evaluation() {
+        let mut buffer = EvidenceBuffer::new(2, 2);
+        let mut rules = RuleCycle::new(NetworkScope::empty());
+        for port in 1..=5 {
+            buffer.push_event(egress_event("198.51.100.5", port));
+        }
+        rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            Timestamp::UNIX_EPOCH,
+            &CgroupKids::default(),
+            None,
+        );
+        assert_eq!(
+            rules.ring_counters(),
+            RingCounters {
+                overflow_samples_total: 0,
+                overflow_events_total: 3,
+            }
+        );
+        for port in 6..=8 {
+            buffer.push_event(egress_event("198.51.100.5", port));
+        }
+        rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            Timestamp::UNIX_EPOCH,
+            &CgroupKids::default(),
+            None,
+        );
+        assert_eq!(rules.ring_counters().overflow_events_total, 4);
+    }
+
+    #[test]
+    fn test_event_kind_counts_name_kinds_only() {
+        let counts = event_kind_counts(&[
+            egress_event("198.51.100.5", 443),
+            egress_event("198.51.100.6", 80),
+            structure_drift_event(),
+        ]);
+        assert_eq!(counts.get("egress-flow"), Some(&2));
+        assert_eq!(counts.get("structure-drift"), Some(&1));
+        assert_eq!(counts.len(), 2);
+    }
+
+    /// Sammelt die formatierte `tracing`-Ausgabe eines Tests.
+    #[derive(Debug, Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("capture lock poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> TestResult<String> {
+            let bytes = self
+                .0
+                .lock()
+                .map_err(|_| TestError::Missing("capture lock"))?
+                .clone();
+            String::from_utf8(bytes).map_err(ctx("utf-8 log output"))
+        }
+    }
+
+    /// PL-100 WP0.6: auf `warn` stehen keine Ziele, Pfade oder
+    /// Zusammenfassungen, nur Kennungen.
+    #[test]
+    fn test_warn_level_names_no_destination_path_or_summary() -> TestResult {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let evidence = SecurityEvidence::capture(
+            vec![],
+            vec![
+                egress_event("198.51.100.5", 443),
+                drift_in(Some("/sys/fs/cgroup/harw-job-1"), "drift at /etc/secret-file"),
+            ],
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("well-formed content always encodes"))?;
+
+        let reported = tracing::subscriber::with_default(subscriber, || {
+            report_findings(
+                &harw_observe::NullSink,
+                &evidence,
+                Timestamp::UNIX_EPOCH,
+                &NetworkScope::empty(),
+                &CgroupKids::default(),
+                None,
+                None,
+            )
+        });
+
+        assert_eq!(reported, 2);
+        let text = captured.text()?;
+        assert!(text.contains("security rule finding"), "{text}");
+        assert!(text.contains("egress-flow"), "{text}");
+        for leaked in [
+            "198.51.100.5",
+            "/etc/secret-file",
+            "harw-job-1",
+            "outside the allowed",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} reached warn: {text}");
+        }
+        Ok(())
     }
 }
