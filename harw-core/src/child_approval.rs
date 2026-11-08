@@ -19,7 +19,9 @@
 //!    die Nutzerin zu fragen — eine Freigabe erweitert nie Rechte.
 //! 2. Sonst geht die Frage mit Absender ([`ChildApprovalRequest::role`],
 //!    [`ChildApprovalRequest::tree_path`]) an die Oberfläche; das Kind wartet
-//!    höchstens [`CHILD_APPROVAL_TIMEOUT`].
+//!    höchstens [`CHILD_APPROVAL_TIMEOUT`]. Hat der DoD-Taint des Kind-Turns
+//!    die Rückfrage verursacht (PL-100 O1), trägt sie den Grund
+//!    ([`ChildApprovalRequest::reason`]).
 //! 3. Zustimmung → `resume_after_approval` mit `Approve`: das Werkzeug läuft
 //!    in der Registry des Kindes. Ablehnung, Zeitablauf oder eine nicht
 //!    zustellbare Frage → `Reject`: das Kind bekommt einen Werkzeugfehler
@@ -46,6 +48,7 @@ use tokio::sync::oneshot;
 
 use crate::ModelProvider;
 use crate::child_controller::ManagedAgentSpawner;
+use crate::dod_taint::pending_ask_reason;
 use crate::error::CoreResult;
 use crate::session::AgentSession;
 use crate::state_store::StateStore;
@@ -93,6 +96,14 @@ pub struct ChildApprovalRequest {
     pub call: ToolCall,
     /// Wie lange das Kind auf die Antwort wartet.
     pub timeout: Duration,
+    /// Der vom Kern zugeschriebene Grund der Rückfrage, falls es einen gibt.
+    ///
+    /// Heute nur der DoD-Taint des Kind-Turns (PL-100 Entscheidung O1,
+    /// [`crate::dod_taint::pending_ask_reason`]): „'job.stop' braucht eine
+    /// ausdrückliche Freigabe: nach DoD-Abfrage in diesem Turn". Der
+    /// Werkzeugname darin ist bereits escapt. `None`, wenn ein anderer
+    /// Handler gefragt hat oder der Absender keine Kind-Session kennt.
+    pub reason: Option<String>,
 }
 
 impl ChildApprovalRequest {
@@ -377,6 +388,9 @@ pub async fn relay_child_approvals(
                     tree_path: spawner.child_tree_path(child),
                     call: pending.call.clone(),
                     timeout: relay.timeout(),
+                    // PL-100 O1: hat der Taint des Kind-Turns gefragt, sieht
+                    // die Nutzerin den Grund im Dialog.
+                    reason: pending_ask_reason(session),
                 })
                 .await
         } else {

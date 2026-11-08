@@ -413,7 +413,9 @@ pub(crate) fn answer_for(choice: ApprovalChoice) -> ChildApprovalAnswer {
     }
 }
 
-/// Baut den Freigabedialog mit Absender und Countdown.
+/// Baut den Freigabedialog mit Absender, Countdown und — falls der Kern einen
+/// kennt — dem Grund der Rückfrage (PL-100 O1: DoD-Taint des Kind-Turns,
+/// [`ChildApprovalRequest::reason`]).
 fn build_dialog(app: &ChatApp, request: &ChildApprovalRequest) -> ApprovalDialog {
     ApprovalDialog::new(ApprovalDialogRequest {
         call: request.call.clone(),
@@ -422,6 +424,8 @@ fn build_dialog(app: &ChatApp, request: &ChildApprovalRequest) -> ApprovalDialog
         } else {
             Some(app.project_root().to_owned())
         },
+        // Bleibt der Begründung des Agenten vorbehalten; der vom Kern
+        // zugeschriebene Grund hat eine eigene Zeile (`with_core_reason`).
         justification: None,
         risk: crate::app::approval_risk(&request.call),
         origin: Some(request.requester_label()),
@@ -431,6 +435,10 @@ fn build_dialog(app: &ChatApp, request: &ChildApprovalRequest) -> ApprovalDialog
         reason_input_enabled: true,
     })
     .once_only()
+    // PL-100 O1: der Taint-Grund des Kind-Turns (bereits escapt,
+    // `harw_core::dod_taint::ask_reason`) steht unter eigener Beschriftung
+    // vor dem Grund des Auto-Modus; fragen beide, zeigt der Dialog beide.
+    .with_core_reason(request.reason.clone())
     // Runde 6, Teil A: Grund des Auto-Modus (auch ein umgewandeltes deny).
     .with_auto_reason(
         app.runtime()
@@ -443,3 +451,167 @@ fn build_dialog(app: &ChatApp, request: &ChildApprovalRequest) -> ApprovalDialog
 
 #[cfg(test)]
 mod tests;
+
+// PL-100 O1: der vom Kern zugeschriebene Grund (DoD-Taint) erscheint im
+// Freigabedialog, für Kind- und Wurzel-Fragen. Eigenes Testmodul neben
+// `tests`, damit dessen Fixtures unverändert bleiben; `build_approval_dialog`
+// ist als privates Element von `app` hier sichtbar.
+#[cfg(test)]
+mod reason_tests {
+    use std::time::Duration;
+
+    use harw_core::child_approval::ChildApprovalRequest;
+    use harw_core::dod_taint::{TAINT_REASON, ask_reason};
+    use harw_tools::{ToolCall, ToolName};
+    use harw_types::{ItemId, SessionId, ToolCallId};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    use super::super::build_approval_dialog;
+    use super::super::tests::test_chat_app;
+    use super::build_dialog;
+    use crate::approval::{ApprovalPrompt, ApprovalScope, TuiApprovalHandler};
+    use crate::approval_dialog::ApprovalDialog;
+    use crate::test_support::{TestError, TestResult};
+
+    // Beschriftung der Zeile mit dem Kern-Grund (englischer Katalogtext von
+    // `dialogs.core_reason`, wie `info_fields` sie mit „: “ verbindet).
+    const CORE_REASON_LABEL: &str = "Security rule: ";
+
+    // Beschriftung der vom Agenten gelieferten Begründung.
+    const JUSTIFICATION_LABEL: &str = "Justification: ";
+
+    // Ein Grund des Auto-Modus in der Form „<Kategorie> – <Grund>“.
+    const AUTO_REASON: &str = "eingriff – stoppt einen laufenden Job";
+
+    // Wartezeit der Wurzel-Dialoge in diesen Tests.
+    const ROOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+    // Der Aufruf, um den es in allen Fragen geht.
+    fn stop_call() -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("job.stop"),
+            arguments: serde_json::json!({ "id": "job-1" }),
+        }
+    }
+
+    // Eine Kind-Frage für `job.stop` mit dem Grund `reason`.
+    fn request(reason: Option<String>) -> ChildApprovalRequest {
+        ChildApprovalRequest {
+            child: SessionId::new(),
+            role: "egress-triage".to_owned(),
+            tree_path: vec!["egress-triage".to_owned()],
+            call: stop_call(),
+            timeout: Duration::from_secs(600),
+            reason,
+        }
+    }
+
+    // Eine Wurzel-Frage für `job.stop` mit dem Grund `reason`, gestellt über
+    // denselben Weg wie `ApprovalDriver::drive_to_completion`.
+    fn root_prompt(reason: Option<String>) -> TestResult<ApprovalPrompt> {
+        let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
+        if !handler.open_prompt_with_reason(&ItemId::new(), &stop_call(), reason) {
+            return Err(TestError::Unexpected(
+                "the prompt must reach the renderer".to_owned(),
+            ));
+        }
+        prompts
+            .try_recv()
+            .map_err(|_| TestError::Missing("die gestellte Wurzel-Frage"))
+    }
+
+    // Zeichnet den Dialog in voller Höhe und liefert den sichtbaren Text.
+    fn rendered(dialog: &ApprovalDialog) -> String {
+        let area = Rect::new(0, 0, 140, dialog.desired_height(140));
+        let mut buf = Buffer::empty(area);
+        dialog.render(area, &mut buf, &crate::style::Theme::Dark);
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                text.push_str(buf.cell((x, y)).map_or(" ", |cell| cell.symbol()));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    // Byte-Position von `needle` im gezeichneten Text.
+    fn position(text: &str, needle: &str) -> TestResult<usize> {
+        text.find(needle)
+            .ok_or(TestError::Missing("erwartete Zeile im Freigabedialog"))
+    }
+
+    /// Kind-Frage: der Taint-Grund steht unter eigener Beschriftung, nicht
+    /// als Begründung des Agenten; ohne Grund fehlt die Zeile.
+    #[test]
+    fn the_taint_reason_of_a_child_request_is_shown_in_the_dialog() -> TestResult {
+        let app = test_chat_app()?;
+        let reason = ask_reason("job.stop");
+
+        let tainted = rendered(&build_dialog(&app, &request(Some(reason.clone()))));
+        assert!(
+            tainted.contains(&format!("{CORE_REASON_LABEL}{reason}")),
+            "{tainted}"
+        );
+        assert!(!tainted.contains(JUSTIFICATION_LABEL), "{tainted}");
+        assert!(tainted.contains("egress-triage"), "{tainted}");
+
+        let plain = rendered(&build_dialog(&app, &request(None)));
+        assert!(!plain.contains(TAINT_REASON), "{plain}");
+        assert!(!plain.contains(CORE_REASON_LABEL), "{plain}");
+        Ok(())
+    }
+
+    /// Wurzel-Frage: `build_approval_dialog` zeigt den Grund des Prompts
+    /// unter eigener Beschriftung; ohne Grund fehlt die Zeile.
+    #[test]
+    fn the_taint_reason_of_a_root_prompt_is_shown_in_the_dialog() -> TestResult {
+        let app = test_chat_app()?;
+        let reason = ask_reason("job.stop");
+
+        let tainted = rendered(&build_approval_dialog(
+            &root_prompt(Some(reason.clone()))?,
+            &app,
+            ROOT_TIMEOUT,
+        ));
+        assert!(
+            tainted.contains(&format!("{CORE_REASON_LABEL}{reason}")),
+            "{tainted}"
+        );
+        assert!(!tainted.contains(JUSTIFICATION_LABEL), "{tainted}");
+
+        let plain = rendered(&build_approval_dialog(
+            &root_prompt(None)?,
+            &app,
+            ROOT_TIMEOUT,
+        ));
+        assert!(!plain.contains(TAINT_REASON), "{plain}");
+        assert!(!plain.contains(CORE_REASON_LABEL), "{plain}");
+        Ok(())
+    }
+
+    /// Fragen Taint und Auto-Modus, zeigt der Dialog beide Zeilen — den
+    /// Taint-Grund zuerst, im Kind- wie im Wurzel-Dialog.
+    #[test]
+    fn the_taint_reason_comes_before_the_auto_mode_reason() -> TestResult {
+        let app = test_chat_app()?;
+        let reason = ask_reason("job.stop");
+
+        let child = rendered(
+            &build_dialog(&app, &request(Some(reason.clone())))
+                .with_auto_reason(Some(AUTO_REASON.to_owned())),
+        );
+        let root = rendered(
+            &build_approval_dialog(&root_prompt(Some(reason))?, &app, ROOT_TIMEOUT)
+                .with_auto_reason(Some(AUTO_REASON.to_owned())),
+        );
+        for text in [child, root] {
+            let core = position(&text, CORE_REASON_LABEL)?;
+            let auto = position(&text, AUTO_REASON)?;
+            assert!(core < auto, "{text}");
+        }
+        Ok(())
+    }
+}

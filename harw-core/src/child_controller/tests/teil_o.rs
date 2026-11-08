@@ -1,5 +1,6 @@
 //! Tests zu Kind-Freigaben, Lease-Herzschlag und entkoppeltem
-//! Hintergrund-Token (Runde 5, Teil O).
+//! Hintergrund-Token (Runde 5, Teil O), dazu der Taint-Grund einer
+//! Kind-Frage (PL-100 Entscheidung O1).
 //!
 //! Als Untermodul der Controller-Tests, damit die vorhandene
 //! Testinfrastruktur ([`runnable_children`], [`AskUserApproval`]) und die
@@ -20,6 +21,9 @@ use crate::child_approval::{
     ChildApprovalAnswer, ChildApprovalBroker, ChildApprovalRequest, REASON_CHILD_APPROVAL_TIMEOUT,
     REASON_CHILD_APPROVAL_UNDELIVERABLE, REASON_TOOL_OUTSIDE_ROLE,
 };
+use crate::dod_taint::ask_reason;
+use crate::policy::DodTaintPolicy;
+use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
 
 /// Name des schreibenden Test-Werkzeugs der Kind-Rolle.
 const PROBE_TOOL: &str = "probe.write";
@@ -373,6 +377,210 @@ async fn without_a_relay_the_child_still_fails_closed() -> TestResult {
     assert!(
         format!("{result:?}").contains(REASON_CHILD_APPROVAL_UNDELIVERABLE),
         "{result:?}"
+    );
+    Ok(())
+}
+
+// ── PL-100 O1: der Taint-Grund einer Kind-Frage ─────────────────────────────
+
+/// Die DoD-Abfrage, die den Kind-Turn taintet, und der taint-pflichtige
+/// Eingriff danach.
+const DOD_THEN_STOP: &[&str] = &["dod.findings", "job.stop"];
+
+/// Nur der Eingriff, ohne vorherige DoD-Abfrage.
+const STOP_ONLY: &[&str] = &["job.stop"];
+
+/// Modell: ruft nacheinander je eines der Werkzeuge aus `tools` auf — eines
+/// je Antwort, damit der Taint vor der Prüfung von `job.stop` steht — und
+/// antwortet danach mit Text.
+struct ToolSequence {
+    tools: &'static [&'static str],
+    calls: AtomicUsize,
+}
+
+impl ModelProvider for ToolSequence {
+    fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+        let round = self.calls.fetch_add(1, Ordering::SeqCst);
+        let next = self.tools.get(round).copied();
+        Box::pin(async move {
+            match next {
+                Some(tool) => Ok(ModelResponse {
+                    message: None,
+                    tool_calls: vec![ToolCall {
+                        id: ToolCallId::new(),
+                        name: ToolName::new(tool),
+                        arguments: serde_json::json!({ "id": "job-1" }),
+                    }],
+                    usage: TokenUsage::default(),
+                    ..Default::default()
+                }),
+                None => Ok(ModelResponse::text("fertig")),
+            }
+        })
+    }
+}
+
+/// Registry-Factory des Taint-Kindes: liefert das [`ToolSequence`]-Modell.
+struct ToolSequenceRegistry {
+    tools: &'static [&'static str],
+}
+
+impl ChildRegistryFactory for ToolSequenceRegistry {
+    fn build_registry(
+        &self,
+        _role: &str,
+        _input: &SpawnInput,
+        _suggestions: Option<&AgentSuggestions>,
+    ) -> Result<ExtensionRegistry, AgentSpawnError> {
+        Ok(ExtensionRegistryBuilder::default().build())
+    }
+
+    fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+        Ok(Arc::new(ToolSequence {
+            tools: self.tools,
+            calls: AtomicUsize::new(0),
+        }))
+    }
+}
+
+/// Werkzeuge des Taint-Kindes ([`DOD_THEN_STOP`]); zählt die Ausführungen.
+struct TaintTools {
+    runs: Arc<AtomicUsize>,
+}
+
+impl ToolProvider for TaintTools {
+    fn tools(&self) -> Vec<ToolSpec> {
+        DOD_THEN_STOP
+            .iter()
+            .map(|name| {
+                ToolSpec::Function(FunctionToolSpec {
+                    name: ToolName::new(*name),
+                    description: "Taint-Testwerkzeug".to_owned(),
+                    parameters: JsonSchema::default(),
+                    strict: false,
+                })
+            })
+            .collect()
+    }
+
+    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+        DOD_THEN_STOP.contains(&name.as_str()).then(|| {
+            Arc::new(ProbeExecutor {
+                runs: Arc::clone(&self.runs),
+            }) as Arc<dyn ToolExecutor>
+        })
+    }
+}
+
+/// Ein pausierverbotenes Kind, dessen Modell `tools` nacheinander aufruft.
+/// Seine Kette trägt die `DodTaintPolicy` im Auto-Modus (wie
+/// `ApprovalChain::for_child_with_mandate` sie montiert) und, falls
+/// `always_ask`, zusätzlich einen Handler, der immer fragt.
+fn taint_child(
+    tools: &'static [&'static str],
+    runs: &Arc<AtomicUsize>,
+    always_ask: bool,
+) -> TestResult<(ManagedAgentSpawner, SessionId)> {
+    let runs = Arc::clone(runs);
+    let (spawner, children) = runnable_children(
+        Arc::new(ToolSequenceRegistry { tools }),
+        false,
+        1,
+        move || {
+            let builder = ExtensionRegistryBuilder::default()
+                .tool_provider(Arc::new(TaintTools {
+                    runs: Arc::clone(&runs),
+                }))
+                .approval_handler(Arc::new(
+                    DodTaintPolicy::new().with_mode(ApprovalModeCell::new(ApprovalMode::Delegated)),
+                ));
+            if always_ask {
+                builder.approval_handler(Arc::new(AskUserApproval)).build()
+            } else {
+                builder.build()
+            }
+        },
+    )?;
+    let child = children
+        .first()
+        .cloned()
+        .ok_or(TestError::Missing("ein admittiertes Kind"))?;
+    Ok((spawner, child))
+}
+
+/// PL-100 O1: fragt `job.stop` nur, weil `dod.findings` im selben Kind-Turn
+/// lief, trägt die Frage an die Oberfläche den Taint-Grund
+/// (`relay_child_approvals` liest ihn aus der pausierten Kind-Session).
+#[tokio::test]
+async fn a_tainted_child_request_carries_the_taint_reason() -> TestResult {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (spawner, child) = taint_child(DOD_THEN_STOP, &runs, false)?;
+    let broker = ScriptedBroker::answering(Some(ChildApprovalAnswer::Reject {
+        reason: Some("nicht jetzt".to_owned()),
+    }));
+    spawner.attach_child_approval_broker(broker.clone());
+    let store = InMemoryStateStore::new();
+
+    let run = spawner
+        .run_child(&child, &store, TurnInput::user("triage"))
+        .await
+        .map_err(ctx("das Kind endet nach der Ablehnung regulär"))?;
+
+    assert!(
+        matches!(run.outcome, TurnOutcome::Completed),
+        "{:?}",
+        run.outcome
+    );
+    let seen = broker.seen();
+    let [request] = seen.as_slice() else {
+        return Err(TestError::Unexpected(format!(
+            "genau eine Frage erwartet, gesehen {}",
+            seen.len()
+        )));
+    };
+    assert_eq!(request.call.name.as_str(), "job.stop");
+    assert_eq!(request.reason, Some(ask_reason("job.stop")));
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "nur dod.findings lief; das abgelehnte job.stop nicht"
+    );
+    Ok(())
+}
+
+/// Fragt ein anderer Handler ohne Taint (kein `dod.*` im Kind-Turn), bleibt
+/// der Grund der Kind-Frage leer.
+#[tokio::test]
+async fn an_untainted_child_request_has_no_reason() -> TestResult {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (spawner, child) = taint_child(STOP_ONLY, &runs, true)?;
+    let broker = ScriptedBroker::answering(Some(ChildApprovalAnswer::Approve));
+    spawner.attach_child_approval_broker(broker.clone());
+    let store = InMemoryStateStore::new();
+
+    let run = spawner
+        .run_child(&child, &store, TurnInput::user("stopp"))
+        .await
+        .map_err(ctx("das Kind läuft nach der Freigabe zu Ende"))?;
+
+    assert!(
+        matches!(run.outcome, TurnOutcome::Completed),
+        "{:?}",
+        run.outcome
+    );
+    let seen = broker.seen();
+    let [request] = seen.as_slice() else {
+        return Err(TestError::Unexpected(format!(
+            "genau eine Frage erwartet, gesehen {}",
+            seen.len()
+        )));
+    };
+    assert_eq!(request.call.name.as_str(), "job.stop");
+    assert_eq!(request.reason, None);
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "das freigegebene job.stop lief"
     );
     Ok(())
 }

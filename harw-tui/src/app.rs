@@ -9702,6 +9702,8 @@ fn build_approval_dialog(
         } else {
             Some(app.project_root().to_owned())
         },
+        // Bleibt der Begründung des Agenten vorbehalten; der vom Kern
+        // zugeschriebene Grund hat eine eigene Zeile (`with_core_reason`).
         justification: None,
         risk: approval_risk(call),
         origin: None,
@@ -9711,13 +9713,19 @@ fn build_approval_dialog(
     });
     // Runde 6, Teil A: fragt der Auto-Modus (auch statt einer Ablehnung),
     // steht sein Grund als „Auto-Modus: <Kategorie> – <Grund>“ im Dialog.
-    let dialog = dialog.with_auto_reason(
-        app.runtime()
-            .and_then(|rt| rt.auto_mode())
-            .and_then(|auto| auto.log().verdict_for(call.id.as_str()))
-            .as_ref()
-            .and_then(crate::permissions_view::auto_ask_reason_for),
-    );
+    // PL-100 O1: der vom Kern zugeschriebene Grund (DoD-Taint, „nach
+    // DoD-Abfrage in diesem Turn“; bereits escapt) steht unter eigener
+    // Beschriftung davor. Er ersetzt den Grund des Auto-Modus nicht: fragen
+    // beide, zeigt der Dialog beide Zeilen, den Taint-Grund zuerst.
+    let dialog = dialog
+        .with_core_reason(prompt.reason().map(str::to_owned))
+        .with_auto_reason(
+            app.runtime()
+                .and_then(|rt| rt.auto_mode())
+                .and_then(|auto| auto.log().verdict_for(call.id.as_str()))
+                .as_ref()
+                .and_then(crate::permissions_view::auto_ask_reason_for),
+        );
     match learning.flatten() {
         Some(offer) => dialog.with_learning_offer(LearnOfferView::from(&offer)),
         None => dialog,

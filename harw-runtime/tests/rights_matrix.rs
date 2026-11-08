@@ -221,14 +221,19 @@ fn expected(entry: EntryKind) -> Expected {
     const NONE: &[&str] = &[];
     // Ohne `[policy].require_approval_for` entsteht keine Config-Politik
     // (W2B-03: ein Handler, der alles durchwinkt, wäre nur Rauschen); ohne
-    // Responder — den erst `new_root_session` anhängt — bleibt die
-    // Default-Politik allein. Nur `Tui` und `GatewayTelegram` (Freigabe-
+    // Responder — den erst `new_root_session` anhängt — bleiben Default-
+    // und DoD-Taint-Politik. Nur `Tui` und `GatewayTelegram` (Freigabe-
     // Buttons) lösen Rückfragen interaktiv auf; jeder andere Einstieg trägt
     // zusätzlich seine `AskResolutionPolicy` ([`ApprovalHandlerKind::Other`],
-    // Befund Z2c-02).
-    const DEFAULT_ONLY: &[ApprovalHandlerKind] = &[ApprovalHandlerKind::DefaultPolicy];
+    // Befund Z2c-02). Jede Kette endet mit der `DodTaintPolicy`
+    // ([`ApprovalHandlerKind::Other`], PL-100 Phase 4, Entscheidung O1).
+    const DEFAULT_ONLY: &[ApprovalHandlerKind] = &[
+        ApprovalHandlerKind::DefaultPolicy,
+        ApprovalHandlerKind::Other,
+    ];
     const DEFAULT_AND_ASK: &[ApprovalHandlerKind] = &[
         ApprovalHandlerKind::DefaultPolicy,
+        ApprovalHandlerKind::Other,
         ApprovalHandlerKind::Other,
     ];
 

@@ -455,6 +455,18 @@
     "vi": "{cause} — vui lòng tự quyết định",
     "hi": "{cause} — कृपया स्वयं निर्णय लें"
   },
+  "dialogs.core_reason": {
+    "en": "Security rule",
+    "de": "Sicherheitsregel",
+    "es": "Regla de seguridad",
+    "fr": "Règle de sécurité",
+    "pt": "Regra de segurança",
+    "ja": "セキュリティルール",
+    "zh-CN": "安全规则",
+    "ko": "보안 규칙",
+    "vi": "Quy tắc bảo mật",
+    "hi": "सुरक्षा नियम"
+  },
   "dialogs.auto_mode": {
     "en": "Auto mode",
     "de": "Auto-Modus",

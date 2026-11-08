@@ -1168,6 +1168,10 @@ impl crate::child_backend::ChildIo for ControllerChildIo<'_> {
                 tree_path: spawner.child_tree_path(&child),
                 call,
                 timeout: spawner.child_approval_relay().timeout(),
+                // PL-100 O1: ein Kind hinter einem `ChildBackend` meldet nur
+                // Werkzeug und Argument-Zusammenfassung; seine Session (und
+                // damit sein DoD-Taint) ist hier nicht greifbar.
+                reason: None,
             };
             match spawner.child_approval_relay().resolve(request).await {
                 crate::turn_loop::ApprovalResolution::Approve => "approve".to_owned(),
