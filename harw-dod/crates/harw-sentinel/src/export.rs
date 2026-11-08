@@ -1,8 +1,11 @@
 //! Optionaler JSON-Lines-Export zertifizierter Befunde für `harw-security-hub`.
 //!
 //! # Wozu
-//! [`crate::findings::report_findings`] meldet jeden `Finding<RuleChecked>`
-//! über `tracing` und einen Telemetriezähler. `harw-security-hub`
+//! [`crate::findings::report_findings`] meldet jeden `Finding<RuleChecked>`,
+//! den der Befund-Throttle (`crate::throttle`, PL-100 WP0.4) nicht als
+//! Wiederholung innerhalb seiner Abklingzeit zurückhält, über `tracing` und
+//! einen Telemetriezähler; nur diese Befunde erreichen den Export.
+//! `harw-security-hub`
 //! (`harw-security-hub/src/findings.rs`) korreliert DoD-Befunde aber aus einer
 //! append-only JSON-Lines-Datei. Dieses Modul schreibt genau diese Datei —
 //! **nur**, wenn `--findings-export <ABSOLUTER-PFAD>` gesetzt ist. Ohne das
