@@ -301,7 +301,13 @@ pub const WARDEN_ROOT: &str = "harw-warden";
 /// die gemeinsame Auflösung dem Warden neue Knoten untergeschoben hat —
 /// siehe `docs/architecture/dod-workspace-merge-plan.md`, Abschnitt
 /// „TCB-Invarianten".
-pub const MAX_WARDEN_RUNTIME_DEPS: usize = 54;
+///
+/// **PL-100 WP3.1 / O10 (+1 `seccompiler`).** Der Warden installiert nach dem
+/// Setup einen seccomp-Filter (`harw-warden/src/seccomp.rs`). `seccompiler`
+/// ist reines Rust ohne C-Bindung und bringt sonst keinen neuen Knoten mit
+/// (`libc` war schon in der Hülle); aus `cargo metadata` hergeleitet, der
+/// Gate-Lauf bleibt die verbindliche Quelle. 54 + 1 = 55.
+pub const MAX_WARDEN_RUNTIME_DEPS: usize = 55;
 
 /// Crate-Namen, deren Anwesenheit als `[build-dependencies]`-Kante ein
 /// verlässliches Zeichen für einen echten C-Übersetzer-Bauschritt ist —
