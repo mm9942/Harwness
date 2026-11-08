@@ -23,6 +23,19 @@
 //! fields are ignored so a richer exporter stays compatible; missing or
 //! malformed required fields make the line count as malformed.
 //!
+//! ## Export versions
+//! The sentinel export (`harw-dod/crates/harw-sentinel/src/export.rs`) is
+//! read additively: v1 is exactly the six fields above; v2 adds
+//! `schema_version` and `scope`; v3 (PL-100 WP0.12) adds `instance`, `seq`,
+//! `record_digest`, `dedup_key`, `occurrences`, `first_seen`, `kind`,
+//! `hardness`, `cgroup_kid`, `scope_obfuscated` and `evidence_card`. This
+//! reader keeps the six fields plus three of the additions that help a
+//! posture consumer correlate repeats: `schema_version`, `dedup_key` (only a
+//! well-formed 32-char lowercase hex key) and `occurrences` (only `>= 1`).
+//! A malformed optional value is dropped, never the line; only
+//! `schema_version: 0` makes the line malformed. All other v3 fields are
+//! ignored like any unknown field.
+//!
 //! # Limits (the file is attacker-influenced input)
 //! - only the last [`FindingLimits::max_tail_bytes`] of the file are read;
 //!   when reading starts mid-file the first (partial) line is discarded,
@@ -61,6 +74,28 @@ pub struct DodFinding {
     pub summary: String,
     /// Observation time.
     pub observed_at: Timestamp,
+    /// Export schema version (`2`, `3`, ...); absent on v1 lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
+    /// v3: throttling key of the finding (32 lowercase hex chars); lines
+    /// with the same key report repeats of one finding. Dropped when
+    /// malformed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
+    /// v3: how often the `dedup_key` fired (`>= 1`). Dropped when `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrences: Option<u64>,
+}
+
+/// Length of a v3 `dedup_key` (lowercase hex of 16 bytes).
+const DEDUP_KEY_HEX_LEN: usize = 32;
+
+/// `true` for a well-formed v3 `dedup_key`.
+fn is_dedup_key(key: &str) -> bool {
+    key.len() == DEDUP_KEY_HEX_LEN
+        && key
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Which findings a caller wants.
@@ -275,11 +310,17 @@ pub fn parse_findings(
             batch.skipped_malformed += 1;
             continue;
         };
+        if finding.schema_version == Some(0) {
+            batch.skipped_malformed += 1;
+            continue;
+        }
         if !filter.matches(&finding) {
             continue;
         }
         finding.summary = sanitize(&finding.summary, limits.max_summary_chars);
         finding.rule_id = sanitize(&finding.rule_id, limits.max_summary_chars);
+        finding.dedup_key = finding.dedup_key.filter(|key| is_dedup_key(key));
+        finding.occurrences = finding.occurrences.filter(|count| *count >= 1);
         if kept.len() == max_records {
             kept.pop_front();
             batch.truncated = true;
@@ -512,6 +553,99 @@ mod tests {
             batch.findings.first().map(|f| f.summary.as_str()),
             Some("s")
         );
+        Ok(())
+    }
+
+    /// A v3 export line (PL-100 WP0.12) as the sentinel writes it: a strict
+    /// superset of [`V2_FIXTURE_LINE`].
+    const V3_FIXTURE_LINE: &str = r#"{"schema_version":3,"finding_id":"3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b","host":"host-a","rule_id":"egress-flow","severity":"critical","summary":"tcp connect","observed_at":"2026-09-27T11:00:00Z","scope":"/sys/fs/cgroup/harw.slice","instance":"a1b2c3d4-e5f6-4a7b-9c8d-0e1f2a3b4c5d","seq":7,"record_digest":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","dedup_key":"0123456789abcdef0123456789abcdef","occurrences":3,"first_seen":"2026-09-27T10:00:00Z","kind":"rule_triggered","hardness":"observed","cgroup_kid":4242,"scope_obfuscated":false,"evidence_card":{"event_counts":{"tcp_connect":3},"uid":1000,"destination":"203.0.113.9:443","path":"/usr/bin/curl","process":{"pid":4711,"comm":"curl"}}}"#;
+
+    #[test]
+    fn test_v3_fixture_line_parses_additively_through_the_tail_reader() -> TestResult {
+        let finding: super::DodFinding =
+            serde_json::from_str(V3_FIXTURE_LINE).map_err(ctx("v3 line deserializes"))?;
+        assert_eq!(
+            finding.finding_id.as_str(),
+            "3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b"
+        );
+        assert_eq!(finding.severity, ImpactSeverity::Critical);
+        assert_eq!(finding.schema_version, Some(3));
+        assert_eq!(
+            finding.dedup_key.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(finding.occurrences, Some(3));
+
+        // v1, v2 and v3 lines side by side: nothing is malformed.
+        let text = format!(
+            "{}\n{V2_FIXTURE_LINE}\n{V3_FIXTURE_LINE}\n",
+            line("f0", "host-a", "critical", "2026-09-27T09:00:00Z")
+        );
+        let batch = parse_findings(
+            text.as_bytes(),
+            false,
+            &filter()?,
+            &FindingLimits::default(),
+        );
+        assert_eq!(batch.skipped_malformed, 0);
+        let ids: Vec<&str> = batch
+            .findings
+            .iter()
+            .map(|f| f.finding_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b", "f-1", "f0"],
+            "newest first"
+        );
+        let v1 = batch.findings.last().ok_or(TestError::Missing("v1 finding"))?;
+        assert_eq!(v1.schema_version, None);
+        assert_eq!(v1.dedup_key, None);
+
+        // The posture view stays v2-shaped for v1/v2 lines and carries the
+        // three kept v3 fields for v3 lines.
+        let v1_json = serde_json::to_string(v1).map_err(ctx("serialize v1"))?;
+        assert!(!v1_json.contains("dedup_key") && !v1_json.contains("schema_version"));
+        let newest = batch.findings.first().ok_or(TestError::Missing("v3 finding"))?;
+        let v3_json = serde_json::to_value(newest).map_err(ctx("serialize v3"))?;
+        assert_eq!(
+            v3_json.get("occurrences").and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        assert!(v3_json.get("evidence_card").is_none());
+
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        std::fs::write(&path, format!("{V3_FIXTURE_LINE}\n")).map_err(ctx("write export"))?;
+        let batch = JsonlFindingSource::new(&path, FindingLimits::default())
+            .recent(&filter()?)
+            .map_err(ctx("recent"))?;
+        assert_eq!(batch.findings.len(), 1);
+        assert_eq!(batch.skipped_malformed, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_malformed_optional_v3_values_are_dropped_not_the_line() -> TestResult {
+        let text = [
+            line("f1", "host-a", "high", "2026-09-27T01:00:00Z")
+                .replace('}', r#","schema_version":3,"dedup_key":"NOT-HEX","occurrences":0}"#),
+            line("f2", "host-a", "high", "2026-09-27T02:00:00Z")
+                .replace('}', r#","schema_version":0}"#),
+        ]
+        .join("\n");
+        let batch = parse_findings(
+            text.as_bytes(),
+            false,
+            &filter()?,
+            &FindingLimits::default(),
+        );
+        assert_eq!(batch.skipped_malformed, 1, "schema_version 0 is malformed");
+        let finding = batch.findings.first().ok_or(TestError::Missing("f1"))?;
+        assert_eq!(finding.finding_id.as_str(), "f1");
+        assert_eq!(finding.schema_version, Some(3));
+        assert_eq!(finding.dedup_key, None);
+        assert_eq!(finding.occurrences, None);
         Ok(())
     }
 
