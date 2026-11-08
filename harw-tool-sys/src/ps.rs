@@ -11,12 +11,22 @@
 //! - `start`: ISO-8601 UTC, aus Boot-Zeit plus Start-Ticks.
 //!
 //! # Sicherheit
-//! `command` ist über [`crate::mask`] maskiert; `command_contains` filtert den
-//! **maskierten** Text (kein Orakel für Geheimnisse). Verschwindende Prozesse
-//! zählen als `vanished`.
+//! - `command` ist vollständig geschwärzt ([`crate::mask::redacted_command`]):
+//!   escapter Kernel-`comm` plus Argumentanzahl, nie `argv[0]` und nie
+//!   Argumentwerte. `command_contains` filtert diesen **geschwärzten** Text
+//!   (kein Orakel für Geheimnisse). `name` (Kernel-`comm`) ist escaped.
+//! - Umfang ([`crate::scope`]): standardmäßig nur die eigenen Prozesse
+//!   (`scope = "own"`: eigener cgroup-Teilbaum samt Job-cgroups, sonst der
+//!   eigene Prozessbaum). `scope = "all"` gilt nur, wenn die
+//!   [`ScopePolicy`] des Providers es erlaubt (Full Access); sonst ist es ein
+//!   Fehler, nie ein stilles Erweitern. Die Ausgabe nennt den wirksamen
+//!   Umfang in `scope` (`own-cgroup`, `own-process-tree` oder `all`).
+//! - Verschwindende Prozesse zählen als `vanished`.
 
-use crate::mask::masked_command;
+use crate::mask::{NAME_CHARS, redacted_command};
 use crate::procfs::{Clock, ProcFs, ProcInfo};
+pub use crate::scope::PsScope;
+use crate::scope::{ScopeFilter, ScopePolicy};
 use harw_tool_fsread::blocking::run_blocking;
 use harw_tool_fsread::budget::{Collector, choice, fail, flag, limit_or, ok};
 use harw_tool_fsread::meta::iso_utc;
@@ -35,7 +45,8 @@ pub const DEFAULT_LIMIT: usize = 100;
 /// Hartes Limit.
 pub const HARD_LIMIT: usize = 2_000;
 
-/// Zeichen der Kommandozeile in der Ausgabe.
+/// Zeichen der Kommandozeile in der Ausgabe (Obergrenze; die geschwärzte
+/// Form ist ohnehin kürzer).
 pub const COMMAND_CHARS: usize = 512;
 
 /// Alle wählbaren Felder.
@@ -93,9 +104,12 @@ pub struct PsArgs {
     /// Only processes whose command name contains this text (case-insensitive).
     #[serde(default)]
     pub name_contains: Option<String>,
-    /// Only processes whose masked command line contains this text (case-insensitive).
+    /// Only processes whose redacted command line (name and argument count) contains this text (case-insensitive).
     #[serde(default)]
     pub command_contains: Option<String>,
+    /// Which processes: 'own' (default; this session's processes: its cgroup subtree with its job cgroups, else its process tree) or 'all' (every process; only honoured in Full Access approval mode, otherwise an error).
+    #[serde(default)]
+    pub scope: Option<String>,
     /// Only these states, one letter each: R running, S sleeping, D disk wait, Z zombie, T stopped, I idle, X dead.
     #[serde(default)]
     pub states: Option<Vec<String>>,
@@ -140,7 +154,8 @@ pub struct Row {
     pub elapsed_secs: f64,
     /// Verbrauchte CPU-Zeit in Sekunden.
     pub cpu_secs: f64,
-    /// Maskierte, gekürzte Kommandozeile (bei Kernel-Threads `[name]`).
+    /// Geschwärzte Kommandozeile `<name> <redacted: N args>` (bei
+    /// Kernel-Threads `[name]`), siehe [`crate::mask::redacted_command`].
     pub command: String,
 }
 
@@ -166,11 +181,7 @@ pub fn make_row(info: ProcInfo, clock: &Clock, db: &UserDb) -> Row {
     } else {
         0.0
     };
-    let command = if info.cmdline.is_empty() {
-        format!("[{}]", info.stat.comm)
-    } else {
-        masked_command(&info.cmdline, COMMAND_CHARS)
-    };
+    let command = redacted_command(&info.stat.comm, &info.cmdline);
     Row {
         user: db.user_or_id(info.uid),
         cpu_percent: round1(cpu_percent),
@@ -240,7 +251,10 @@ pub fn row_json(row: &Row, fields: &[&str]) -> Value {
             "user" => json!(row.user),
             "uid" => json!(row.info.uid),
             "state" => json!(row.info.stat.state.to_string()),
-            "name" => json!(row.info.stat.comm),
+            "name" => json!(harw_untrusted_text::escape_line(
+                &row.info.stat.comm,
+                NAME_CHARS
+            )),
             "command" => json!(row.command),
             "cpu_percent" => json!(row.cpu_percent),
             "mem_percent" => json!(row.mem_percent),
@@ -259,16 +273,48 @@ pub fn row_json(row: &Row, fields: &[&str]) -> Value {
     Value::Object(map)
 }
 
-/// Führt `sys.ps` gegen `procfs` aus.
+/// Führt `sys.ps` gegen `procfs` mit der Vorgabe-Politik aus: nur `own`,
+/// `scope = "all"` ist ein Fehler.
 #[must_use]
 pub fn run(procfs: &ProcFs, args: &PsArgs) -> ToolOutput {
-    match build(procfs, args) {
+    run_with_policy(procfs, args, &ScopePolicy::own_only())
+}
+
+/// Führt `sys.ps` aus; das Argument `scope` wird gegen `policy` aufgelöst.
+///
+/// # Errors
+/// Als Fehler-`ToolOutput`: ungültiges `scope`, `all` ohne Full Access, oder
+/// bei `own` weder eigener cgroup noch eigene PID lesbar (fail closed).
+#[must_use]
+pub fn run_with_policy(procfs: &ProcFs, args: &PsArgs, policy: &ScopePolicy) -> ToolOutput {
+    let result = policy.resolve(args.scope.as_deref()).and_then(|scope| {
+        let filter = ScopeFilter::resolve(procfs, scope, policy.extra_roots())?;
+        build(procfs, args, &filter)
+    });
+    match result {
         Ok(output) => output,
         Err(message) => fail(TOOL, message),
     }
 }
 
-fn build(procfs: &ProcFs, args: &PsArgs) -> Result<ToolOutput, String> {
+/// Führt `sys.ps` mit einem vom Host-Code (nicht vom Modell) gewählten
+/// Umfang aus; das Argument `scope` wird nur auf Gültigkeit geprüft.
+///
+/// # Errors
+/// Als Fehler-`ToolOutput` wie [`run_with_policy`].
+#[must_use]
+pub fn run_scoped(procfs: &ProcFs, args: &PsArgs, scope: PsScope) -> ToolOutput {
+    let result = PsScope::parse(args.scope.as_deref()).and_then(|_| {
+        let filter = ScopeFilter::resolve(procfs, scope, &[])?;
+        build(procfs, args, &filter)
+    });
+    match result {
+        Ok(output) => output,
+        Err(message) => fail(TOOL, message),
+    }
+}
+
+fn build(procfs: &ProcFs, args: &PsArgs, filter: &ScopeFilter) -> Result<ToolOutput, String> {
     let pids = parse_ids("pids", args.pids.as_ref())?;
     let ppids = parse_ids("ppids", args.ppids.as_ref())?;
     let sort = choice(
@@ -327,6 +373,8 @@ fn build(procfs: &ProcFs, args: &PsArgs) -> Result<ToolOutput, String> {
     let clock = procfs.clock();
     let need_cmdline = true;
     let (all, vanished) = procfs.processes(need_cmdline);
+    // Umfang zuerst: außerhalb davon zählt nichts (auch nicht in `scanned`).
+    let all: Vec<ProcInfo> = filter.retain(procfs, all);
     let scanned = all.len();
     let mut rows: Vec<Row> = all
         .into_iter()
@@ -411,6 +459,7 @@ fn build(procfs: &ProcFs, args: &PsArgs) -> Result<ToolOutput, String> {
             "fields": fields,
             "truncated": truncated,
             "stopped": stopped,
+            "scope": filter.label(),
         }),
     ))
 }
@@ -459,13 +508,22 @@ fn forest(rows: Vec<Row>) -> Vec<(usize, Row)> {
 /// Listet Prozesse wie `ps`.
 #[harw_macros::tool(
     name = "sys.ps",
-    description = "Lists processes like ps from /proc: filter by pids, ppids, user, name, name_contains, masked command text and states; sort by cpu, mem, rss, start, pid or name; choose fields; tree=true for a process tree. Use when you need to find or inspect running processes instead of running ps. Returns JSON {processes:[{pid, ppid, user, state, cpu_percent, mem_percent, rss_kib, start, name, command}], count, matched, truncated}; command lines are masked for secrets, output is bounded (default 100, hard 2000), vanishing processes are tolerated. Read-only, Linux only.",
+    description = "Lists processes like ps from /proc: filter by pids, ppids, user, name, name_contains, redacted command text and states; sort by cpu, mem, rss, start, pid or name; choose fields; tree=true for a process tree. By default (scope='own') only this session's processes are listed: its cgroup subtree including its job cgroups, or its process tree where cgroups are unusable; scope='all' lists every process but only in Full Access approval mode. Use when you need to find or inspect your own running processes instead of running ps. Returns JSON {processes:[{pid, ppid, user, state, cpu_percent, mem_percent, rss_kib, start, name, command}], count, matched, truncated, scope}; command is redacted to the process name plus the argument count (argument values are never shown), output is bounded (default 100, hard 2000), vanishing processes are tolerated. Read-only, Linux only.",
     permission = "execute_process",
     parallel_safe,
-    skill = "sys-tools"
+    skill = "sys-tools",
+    state = ScopePolicy
 )]
-async fn sys_ps(_context: &ToolExecutionContext, args: PsArgs) -> Result<ToolOutput, ToolsError> {
-    run_blocking(TOOL, move || run(&ProcFs::real(), &args)).await
+async fn sys_ps(
+    policy: &ScopePolicy,
+    _context: &ToolExecutionContext,
+    args: PsArgs,
+) -> Result<ToolOutput, ToolsError> {
+    let policy = policy.clone();
+    run_blocking(TOOL, move || {
+        run_with_policy(&ProcFs::real(), &args, &policy)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -474,6 +532,9 @@ mod tests {
     use crate::test_support::{TestError, TestResult, error_of, json_of};
     use std::fs;
     use std::path::Path;
+
+    /// Eigener cgroup der Fixture-Wurzel (`self/cgroup`).
+    const OWN_CGROUP: &str = "/user.slice/s1";
 
     #[allow(clippy::too_many_arguments)]
     fn add(
@@ -504,6 +565,7 @@ mod tests {
             dir.join("cmdline"),
             cmd.iter().map(|c| format!("{c}\0")).collect::<String>(),
         )?;
+        fs::write(dir.join("cgroup"), format!("0::{OWN_CGROUP}/app\n"))?;
         Ok(())
     }
 
@@ -516,6 +578,8 @@ mod tests {
             r.join("stat"),
             "cpu  1 0 1 8 0 0 0 0 0 0\ncpu0 1 0 1 8 0 0 0 0 0 0\nbtime 1700000000\n",
         )?;
+        fs::create_dir_all(r.join("self"))?;
+        fs::write(r.join("self").join("cgroup"), format!("0::{OWN_CGROUP}\n"))?;
         // Startticks relativ zu uptime 1000 s bei 100 Ticks/s ⇒ starttime ≤ 100000.
         add(r, 1, 0, "init", 'S', 0, 100, 256, 100, &["/sbin/init"])?;
         add(
@@ -558,6 +622,199 @@ mod tests {
         json_of(run(&ProcFs::at(root), &serde_json::from_value(args)?))
     }
 
+    fn ps_all(root: &Path, args: Value) -> TestResult<Value> {
+        json_of(run_scoped(
+            &ProcFs::at(root),
+            &serde_json::from_value(args)?,
+            PsScope::All,
+        ))
+    }
+
+    /// Baum mit Prozessen außerhalb des eigenen cgroup-Teilbaums.
+    fn foreign_tree() -> TestResult<tempfile::TempDir> {
+        let dir = proc_tree()?;
+        let r = dir.path();
+        let cases: [(i32, Option<&str>); 4] = [
+            (50, Some("0::/system.slice/sshd.service\n")),
+            // Gleiches Präfix, aber anderer Pfad-Bestandteil: nicht im Teilbaum.
+            (51, Some("0::/user.slice/s10\n")),
+            // Exakt der eigene cgroup: im Teilbaum.
+            (52, Some("0::/user.slice/s1\n")),
+            // Ohne cgroup-Datei: ausgeschlossen.
+            (53, None),
+        ];
+        for (pid, cgroup) in cases {
+            add(r, pid, 1, "other", 'S', 0, 1, 1, 100, &["/bin/other"])?;
+            let file = r.join(pid.to_string()).join("cgroup");
+            match cgroup {
+                Some(text) => fs::write(file, text)?,
+                None => fs::remove_file(file)?,
+            }
+        }
+        Ok(dir)
+    }
+
+    #[test]
+    fn default_scope_lists_only_own_cgroup_subtree() -> TestResult {
+        let dir = foreign_tree()?;
+        let value = ps(dir.path(), json!({}))?;
+        assert_eq!(pids(&value)?, vec![1, 10, 20, 21, 30, 40, 52]);
+        assert_eq!(value["scanned"], 7);
+        assert_eq!(value["scope"], "own-cgroup");
+        let all = ps_all(dir.path(), json!({}))?;
+        assert_eq!(pids(&all)?, vec![1, 10, 20, 21, 30, 40, 50, 51, 52, 53]);
+        assert_eq!(all["scope"], "all");
+        // Ein Filter auf einen fremden PID liefert unter `own` nichts.
+        assert!(pids(&ps(dir.path(), json!({"pids": [50, 51, 53]}))?)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn own_scope_fails_closed_without_own_cgroup_and_pid() -> TestResult {
+        let dir = proc_tree()?;
+        let args: PsArgs = serde_json::from_value(json!({}))?;
+        let own = dir.path().join("self").join("cgroup");
+        for text in ["0::/\n", "12:cpu:/x\n"] {
+            fs::write(&own, text)?;
+            let message = error_of(run(&ProcFs::at(dir.path()), &args))?;
+            assert!(message.contains("own cgroup"), "{message}");
+        }
+        fs::remove_file(&own)?;
+        assert!(error_of(run(&ProcFs::at(dir.path()), &args))?.contains("own cgroup"));
+        // `All` braucht keinen eigenen cgroup.
+        assert_eq!(pids(&ps_all(dir.path(), json!({}))?)?.len(), 6);
+        Ok(())
+    }
+
+    /// `self/stat` mit der PID des „aufrufenden“ Prozesses.
+    fn set_own_pid(root: &Path, pid: i32) -> TestResult {
+        fs::write(
+            root.join("self").join("stat"),
+            format!("{pid} (harw) S 1 1 1 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 1 4096 1 0"),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn unusable_own_cgroup_degrades_to_the_own_process_tree() -> TestResult {
+        let dir = proc_tree()?;
+        set_own_pid(dir.path(), 20)?;
+        // Container mit cgroup-Namespace: der eigene cgroup ist `/`.
+        fs::write(dir.path().join("self").join("cgroup"), "0::/\n")?;
+        let value = ps(dir.path(), json!({}))?;
+        assert_eq!(value["scope"], "own-process-tree");
+        assert_eq!(pids(&value)?, vec![20, 21]);
+        // Mit brauchbarem cgroup: Teilbaum, plus eigene Nachfahren.
+        fs::write(dir.path().join("self").join("cgroup"), "0::/elsewhere\n")?;
+        let value = ps(dir.path(), json!({}))?;
+        assert_eq!(value["scope"], "own-cgroup");
+        assert_eq!(pids(&value)?, vec![20, 21]);
+        Ok(())
+    }
+
+    #[test]
+    fn jobs_next_to_the_delegate_subgroup_are_own() -> TestResult {
+        let dir = proc_tree()?;
+        let r = dir.path();
+        fs::write(r.join("self").join("cgroup"), "0::/x.service/harw-main\n")?;
+        for (pid, cgroup) in [
+            (70, "/x.service/harw-main"),
+            (71, "/x.service/job-1"),
+            (72, "/x.service2/job-1"),
+            (73, "/harw.slice/jobs/j1"),
+        ] {
+            add(
+                r,
+                pid,
+                1,
+                "job",
+                'S',
+                1000,
+                1,
+                1,
+                100,
+                &["job", "--secret", "s"],
+            )?;
+            fs::write(
+                r.join(pid.to_string()).join("cgroup"),
+                format!("0::{cgroup}\n"),
+            )?;
+        }
+        assert_eq!(pids(&ps(r, json!({}))?)?, vec![70, 71]);
+        // Die konfigurierte Job-Wurzel kommt über die Politik hinzu.
+        let policy = ScopePolicy::own_only()
+            .with_extra_root("/sys/fs/cgroup/harw.slice/jobs")
+            .map_err(|e| TestError::Unexpected(e.to_string()))?;
+        let value = json_of(run_with_policy(
+            &ProcFs::at(r),
+            &serde_json::from_value(json!({}))?,
+            &policy,
+        ))?;
+        assert_eq!(pids(&value)?, vec![70, 71, 73]);
+        Ok(())
+    }
+
+    #[test]
+    fn scope_all_is_honoured_only_under_full_access() -> TestResult {
+        use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
+
+        let dir = foreign_tree()?;
+        let procfs = ProcFs::at(dir.path());
+        let all_args: PsArgs = serde_json::from_value(json!({"scope": "all"}))?;
+        // Vorgabe-Politik (auch `run`): `all` ist ein Fehler, nie stilles `own`.
+        let message = error_of(run(&procfs, &all_args))?;
+        assert!(message.contains("Full Access"), "{message}");
+        let mode = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let policy = ScopePolicy::own_only().with_full_access_gate(mode.clone());
+        assert!(error_of(run_with_policy(&procfs, &all_args, &policy))?.contains("Full Access"));
+        mode.set(ApprovalMode::FullAccess);
+        let value = json_of(run_with_policy(&procfs, &all_args, &policy))?;
+        assert_eq!(value["scope"], "all");
+        assert_eq!(pids(&value)?, vec![1, 10, 20, 21, 30, 40, 50, 51, 52, 53]);
+        // `own` bleibt auch unter Full Access die Vorgabe.
+        let own = json_of(run_with_policy(
+            &procfs,
+            &serde_json::from_value(json!({}))?,
+            &policy,
+        ))?;
+        assert_eq!(own["scope"], "own-cgroup");
+        mode.set(ApprovalMode::AlwaysAsk);
+        assert!(error_of(run_with_policy(&procfs, &all_args, &policy))?.contains("Full Access"));
+        // Unbekannte Werte scheitern überall, auch im Host-Pfad.
+        let bad: PsArgs = serde_json::from_value(json!({"scope": "everything"}))?;
+        assert!(error_of(run_with_policy(&procfs, &bad, &policy))?.contains("invalid scope"));
+        assert!(error_of(run_scoped(&procfs, &bad, PsScope::All))?.contains("invalid scope"));
+        Ok(())
+    }
+
+    #[test]
+    fn process_names_are_escaped() -> TestResult {
+        let dir = proc_tree()?;
+        add(
+            dir.path(),
+            60,
+            1,
+            "e\u{1b}vil\u{202e}",
+            'S',
+            0,
+            1,
+            1,
+            100,
+            &[],
+        )?;
+        let value = ps(dir.path(), json!({"pids": [60]}))?;
+        let p = &value["processes"][0];
+        for field in ["name", "command"] {
+            let text = p[field].as_str().unwrap_or("");
+            assert!(
+                text.contains("\\u{001b}") && text.contains("\\u{202e}"),
+                "{text}"
+            );
+            assert!(!text.chars().any(|c| c == '\u{1b}' || c == '\u{202e}'));
+        }
+        Ok(())
+    }
+
     fn pids(value: &Value) -> TestResult<Vec<i64>> {
         Ok(value["processes"]
             .as_array()
@@ -577,7 +834,7 @@ mod tests {
             assert!(first.get(*field).is_some(), "missing {field}: {first}");
         }
         assert_eq!(first["name"], "init");
-        assert_eq!(first["command"], "/sbin/init");
+        assert_eq!(first["command"], "init");
         assert_eq!(value["processes"][4]["command"], "[kworker/0:1]");
         assert_eq!(value["matched"], 6);
         Ok(())
@@ -595,7 +852,10 @@ mod tests {
         assert_eq!(pids(&ps(p, json!({"user": "1000"}))?)?, vec![20, 21, 40]);
         assert_eq!(pids(&ps(p, json!({"states": ["R", "Z"]}))?)?, vec![21, 40]);
         assert_eq!(
-            pids(&ps(p, json!({"command_contains": "sshd -D"}))?)?,
+            pids(&ps(
+                p,
+                json!({"command_contains": "sshd <redacted: 1 args>"})
+            )?)?,
             vec![10]
         );
         Ok(())
@@ -672,7 +932,10 @@ mod tests {
         for leaked in ["SECRETVALUE1", "hunter2", "pw@"] {
             assert!(!command.contains(leaked), "{leaked} leaked: {command}");
         }
-        assert!(command.contains("--token ***") && command.contains("--password=***"));
+        assert_eq!(command, "curl <redacted: 4 args>");
+        for leaked in ["--token", "--password", "example.com", "u:pw"] {
+            assert!(!command.contains(leaked), "{leaked} leaked: {command}");
+        }
         // Das Original darf kein Filtertreffer sein (kein Orakel).
         assert!(pids(&ps(dir.path(), json!({"command_contains": "hunter2"}))?)?.is_empty());
         assert!(
@@ -683,7 +946,10 @@ mod tests {
             .is_empty()
         );
         assert_eq!(
-            pids(&ps(dir.path(), json!({"command_contains": "--token ***"}))?)?,
+            pids(&ps(
+                dir.path(),
+                json!({"command_contains": "redacted: 4 args"})
+            )?)?,
             vec![21]
         );
         Ok(())
@@ -790,11 +1056,12 @@ mod tests {
     #[test]
     fn real_proc_lists_this_process_with_plausible_values() -> TestResult {
         let me = i64::from(std::process::id());
-        let value = json_of(run(
+        let value = json_of(run_scoped(
             &ProcFs::real(),
             &serde_json::from_value(
                 json!({"pids": [me], "fields": ["pid", "ppid", "name", "state", "rss_kib", "threads", "command", "user"]}),
             )?,
+            PsScope::All,
         ))?;
         assert_eq!(value["count"], 1);
         let p = &value["processes"][0];
@@ -802,6 +1069,24 @@ mod tests {
         assert!(p["rss_kib"].as_u64().is_some_and(|r| r > 0));
         assert!(p["threads"].as_u64().is_some_and(|t| t >= 1));
         assert!(p["command"].as_str().is_some_and(|c| !c.is_empty()));
+        Ok(())
+    }
+
+    /// Der eigene Prozess ist unter `own` immer sichtbar: über den eigenen
+    /// cgroup oder, wo der unbrauchbar ist, über den eigenen Prozessbaum.
+    #[test]
+    fn real_proc_own_scope_lists_this_process() -> TestResult {
+        let me = i64::from(std::process::id());
+        let value = json_of(run(
+            &ProcFs::real(),
+            &serde_json::from_value(json!({"pids": [me], "fields": ["pid", "command"]}))?,
+        ))?;
+        assert_eq!(value["count"], 1, "{value}");
+        assert_eq!(value["processes"][0]["pid"], me);
+        assert!(
+            value["scope"] == "own-cgroup" || value["scope"] == "own-process-tree",
+            "{value}"
+        );
         Ok(())
     }
 }

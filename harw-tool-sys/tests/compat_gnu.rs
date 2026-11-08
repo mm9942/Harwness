@@ -87,12 +87,16 @@ fn ps_matches_procps_for_a_real_child() -> TestResult {
     let args = serde_json::from_value(
         json!({"pids": [pid], "fields": ["pid", "ppid", "user", "name", "state", "command", "rss_kib", "threads"]}),
     )?;
-    let got = value(harw_tool_sys::ps::run(&ProcFs::real(), &args))?;
+    let got = value(harw_tool_sys::ps::run_scoped(
+        &ProcFs::real(),
+        &args,
+        harw_tool_sys::ps::PsScope::All,
+    ))?;
     assert_eq!(got["count"], 1, "{got}");
     let p = &got["processes"][0];
     assert_eq!(p["ppid"], i64::from(std::process::id()));
     assert_eq!(p["name"], "sleep");
-    assert_eq!(p["command"], "sleep 31");
+    assert_eq!(p["command"], "sleep <redacted: 1 args>");
     assert_eq!(p["state"], "S");
     let pid_arg = pid.to_string();
     let Some(expected) = gnu(
@@ -135,9 +139,10 @@ fn ps_process_set_matches_procps() -> TestResult {
             .split_whitespace()
             .filter_map(|p| p.parse().ok())
             .collect();
-        let got = value(harw_tool_sys::ps::run(
+        let got = value(harw_tool_sys::ps::run_scoped(
             &ProcFs::real(),
             &serde_json::from_value(json!({"fields": ["pid"], "limit": 2000}))?,
+            harw_tool_sys::ps::PsScope::All,
         ))?;
         let ours: std::collections::BTreeSet<i64> = got["processes"]
             .as_array()
@@ -162,12 +167,25 @@ fn ps_process_set_matches_procps() -> TestResult {
 fn pgrep_matches_procps() -> TestResult {
     let child = Sleeper::start("32")?;
     let pid = i64::from(child.pid());
+    let me = std::process::id();
+    // Das eigene Kind liegt im eigenen Umfang (Standard `own`); `full` sieht
+    // nur die geschwärzte Form `sleep <redacted: 1 args>`.
     let got = value(harw_tool_sys::pgrep::run(
         &ProcFs::real(),
-        i32::try_from(std::process::id()).unwrap_or(0),
-        &serde_json::from_value(json!({"pattern": "sleep 32", "full": true}))?,
+        i32::try_from(me).unwrap_or(0),
+        &serde_json::from_value(json!({
+            "pattern": "sleep <redacted: 1 args>",
+            "full": true,
+            "exact": true,
+            "ppids": [me],
+        }))?,
     ))?;
-    assert_eq!(got["pids"], json!([pid]));
+    // Parallel laufende Tests starten weitere `sleep`-Kinder: enthalten statt gleich.
+    let ours: Vec<i64> = got["pids"]
+        .as_array()
+        .map(|list| list.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
+    assert!(ours.contains(&pid), "{got}");
     let Some(expected) = gnu("pgrep", &["-f", "sleep 32"]) else {
         eprintln!("skipped: pgrep");
         return Ok(());
@@ -178,10 +196,11 @@ fn pgrep_matches_procps() -> TestResult {
     // bis zu fünfmal neu gemessen, bevor eine Abweichung als echter Fehler gilt.
     let mut last = String::new();
     for _ in 0..5 {
-        let by_name = value(harw_tool_sys::pgrep::run(
+        let by_name = value(harw_tool_sys::pgrep::run_scoped(
             &ProcFs::real(),
             0,
             &serde_json::from_value(json!({"pattern": "sleep", "exact": true, "newest": true}))?,
+            harw_tool_sys::ps::PsScope::All,
         ))?;
         let ours = by_name["pids"][0].to_string();
         let theirs = gnu("pgrep", &["-x", "-n", "sleep"]).unwrap_or_default();
@@ -482,9 +501,10 @@ fn now() -> i64 {
 #[test]
 fn top_agrees_with_the_process_count() -> TestResult {
     let _busy = Sleeper::start("33")?;
-    let got = value(harw_tool_sys::top::run(
+    let got = value(harw_tool_sys::top::run_scoped(
         &ProcFs::real(),
         &serde_json::from_value(json!({"interval_ms": 100, "limit": 10}))?,
+        harw_tool_sys::ps::PsScope::All,
         std::thread::sleep,
     ))?;
     let total = got["tasks"]["total"].as_u64().unwrap_or(0);

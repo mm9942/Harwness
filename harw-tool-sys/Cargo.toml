@@ -13,6 +13,7 @@ harw-extension-api = { path = "../harw-extension-api" }
 harw-macros = { path = "../harw-macros" }
 harw-tool-fsread = { path = "../harw-tool-fsread" }
 harw-tools = { path = "../harw-tools" }
+harw-untrusted-text = { path = "../harw-untrusted-text" }
 # Gleiche Fassungen wie im Workspace (Cargo.lock): keine neue Abhängigkeit.
 regex = "1.13.0"
 # `process`: getuid/getgroups, `system`: uname, `param`: Ticks/Seitengröße, `fs`: access(X_OK).

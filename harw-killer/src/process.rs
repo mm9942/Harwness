@@ -158,13 +158,16 @@ pub(crate) fn read(pid: u32) -> Result<Process> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or(comm);
     let command_path = base.join("cmdline");
-    let command = match fs::read(&command_path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes)
-            .trim_end_matches('\0')
-            .replace('\0', " "),
+    let (command, argv) = match fs::read(&command_path) {
+        Ok(bytes) => (
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches('\0')
+                .replace('\0', " "),
+            split_argv(&bytes),
+        ),
         Err(source) if source.kind() == io::ErrorKind::PermissionDenied => {
             tracing::debug!(pid, error = %source, "command line unavailable; full matching disabled for this process");
-            String::new()
+            (String::new(), Vec::new())
         }
         Err(source) => {
             return Err(Error::io(
@@ -182,7 +185,27 @@ pub(crate) fn read(pid: u32) -> Result<Process> {
         name,
         executable,
         command,
+        argv,
     })
+}
+
+/// Split a raw `/proc/<pid>/cmdline` buffer into lossy UTF-8 argv elements.
+/// All trailing NULs are dropped: processes that rewrite their title
+/// (setproctitle: nginx, postgres) NUL-pad the old argv area, and each padding
+/// byte would otherwise count as an empty argument. Empty arguments in the
+/// middle are preserved so that the argument count stays exact. Pure, infallible.
+pub(crate) fn split_argv(bytes: &[u8]) -> Vec<String> {
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |index| index.saturating_add(1));
+    let body = bytes.get(..end).unwrap_or_default();
+    if body.is_empty() {
+        return Vec::new();
+    }
+    body.split(|byte| *byte == 0)
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
 }
 
 /// Protect PID 1, this application and every observable invoking ancestor.
@@ -371,11 +394,12 @@ mod tests {
 
     /// Parentheses and line breaks inside comm are data, not record delimiters.
     #[test]
-    fn test_stat_handles_complex_comm() {
+    fn test_stat_handles_complex_comm() -> std::result::Result<(), Error> {
         for name in ["cargo", "a (b) c)", "one\ntwo", ")((", ""] {
-            let parsed = stat(42, &stat_record(name, "98765")).unwrap();
+            let parsed = stat(42, &stat_record(name, "98765"))?;
             assert_eq!(parsed, (7, 98765, name.to_owned()));
         }
+        Ok(())
     }
 
     /// Required delimiters, fields and numbers cannot silently default.
@@ -414,7 +438,33 @@ mod tests {
             name: "cargo".to_owned(),
             executable: Some("/usr/bin/cargo".to_owned()),
             command: "cargo build --release".to_owned(),
+            argv: vec![
+                "cargo".to_owned(),
+                "build".to_owned(),
+                "--release".to_owned(),
+            ],
         }
+    }
+
+    // argv boundaries survive, including empty middle arguments.
+    #[test]
+    fn test_split_argv_keeps_boundaries() {
+        assert_eq!(split_argv(b"a\0b c\0\0d\0"), ["a", "b c", "", "d"]);
+        assert!(split_argv(b"").is_empty());
+        assert!(split_argv(b"\0").is_empty());
+        assert!(split_argv(b"\0\0\0").is_empty());
+        assert_eq!(split_argv(b"solo"), ["solo"]);
+    }
+
+    // NUL padding of a rewritten process title does not inflate argc.
+    #[test]
+    fn test_split_argv_drops_title_padding() {
+        assert_eq!(split_argv(b"title\0\0\0"), ["title"]);
+        assert_eq!(
+            split_argv(b"nginx: worker process\0\0\0\0\0\0"),
+            ["nginx: worker process"]
+        );
+        assert_eq!(split_argv(b"a\0\0b\0\0\0"), ["a", "", "b"]);
     }
 
     // The union of exact names and IDs is then restricted by effective UID.
