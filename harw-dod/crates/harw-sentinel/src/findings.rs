@@ -2024,4 +2024,217 @@ mod tests {
         }
         Ok(())
     }
+
+    // --- Spool-Record und Export v3 (PL-100 WP0.12) ------------------------
+
+    fn listener_event(port: u16) -> SecurityEvent {
+        SecurityEvent {
+            sensor: SensorId::from_str("listener-0"),
+            observed_at: Timestamp::UNIX_EPOCH,
+            actor: None,
+            kind: EventKind::ListenerOpened { port },
+        }
+    }
+
+    fn egress_by_process(uid: u32) -> SecurityEvent {
+        SecurityEvent {
+            actor: Some(harw_dod_signals::Actor {
+                uid,
+                auid: None,
+                cgroup: None,
+                process: Some(harw_dod_signals::ProcessContext {
+                    pid: 4_711,
+                    ppid: Some(1),
+                    comm: Some("curl".to_owned()),
+                    euid: Some(uid),
+                }),
+            }),
+            ..egress_event("198.51.100.5", 443)
+        }
+    }
+
+    /// Ein Spool-Schreiber über `<dir>/spool` mit den Grenzen des Sentinels.
+    fn spool_writer_in(dir: &std::path::Path) -> TestResult<SpoolWriter> {
+        let spool_dir = dir.join(crate::spool_writer::SPOOL_DIR_NAME);
+        crate::spool_writer::prepare_spool_dir(&spool_dir).map_err(ctx("spool dir"))?;
+        let spool = harw_dod_sentinel::spool::FindingSpool::open_with_limits(
+            &spool_dir,
+            crate::spool_writer::sentinel_limits(),
+        )
+        .map_err(ctx("open spool"))?;
+        SpoolWriter::spawn(spool, crate::spool_writer::QUEUE_CAPACITY).map_err(ctx("spawn"))
+    }
+
+    fn only_line(path: &std::path::Path) -> TestResult<serde_json::Value> {
+        let text = std::fs::read_to_string(path).map_err(ctx("read export"))?;
+        let mut lines = text.lines();
+        let line = lines.next().ok_or(TestError::Missing("export line"))?;
+        if lines.next().is_some() {
+            return Err(TestError::Unexpected("more than one export line".into()));
+        }
+        serde_json::from_str(line).map_err(ctx("json line"))
+    }
+
+    /// PL-100 WP0.12: ein gemeldeter Befund landet mit Beleg-Ausschnitt
+    /// (Auslöser + Kontext des Rings) im Spool, und seine Exportzeile trägt
+    /// den Digest dieses Records samt Stempel und `evidence_card`.
+    #[test]
+    fn test_a_reported_finding_is_spooled_and_its_digest_exported() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        let host = harw_types::HostId::try_from_str("host-a").map_err(ctx("host id"))?;
+        let mut exporter = FindingsExporter::new(path.clone(), host);
+        let writer = spool_writer_in(dir.path())?;
+        let stats = writer.stats();
+        let mut rules = RuleCycle::new(NetworkScope::empty()).with_spool(writer);
+        let mut buffer = EvidenceBuffer::new(16, 16);
+        buffer.push_event(listener_event(8080));
+        buffer.push_event(listener_event(8081));
+        let trigger = egress_by_process(1000);
+        buffer.push_event(trigger.clone());
+
+        let reported = rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            Timestamp::UNIX_EPOCH,
+            &CgroupKids::default(),
+            Some(&mut exporter),
+        );
+        assert_eq!(reported, 1, "only the egress flow is a finding");
+        // Der Drop des Schreibers schreibt alles Eingereihte fertig.
+        drop(rules);
+        let counters = stats.snapshot();
+        assert_eq!((counters.enqueued_total, counters.written_total), (1, 1));
+
+        let spool = harw_dod_sentinel::spool::FindingSpool::open(
+            &dir.path().join(crate::spool_writer::SPOOL_DIR_NAME),
+        )
+        .map_err(ctx("reopen spool"))?;
+        let (entries, _) = spool.page(None, 10).map_err(ctx("page"))?;
+        let entry = entries
+            .first()
+            .ok_or(TestError::Missing("spooled record"))?;
+        let record = entry
+            .record
+            .as_ref()
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        let events = &record.evidence().events;
+        assert_eq!(
+            events.as_slice(),
+            [trigger, listener_event(8080), listener_event(8081)].as_slice(),
+            "trigger first, then the ring context in ring order"
+        );
+
+        let line = only_line(&path)?;
+        assert_eq!(line["schema_version"], 3);
+        assert_eq!(line["record_digest"], record.digest().to_string());
+        assert_eq!(line["finding_id"], record.finding_id().as_str());
+        assert_eq!(line["seq"], 1);
+        assert_eq!(line["kind"], "rule_triggered");
+        assert_eq!(line["hardness"], "observed");
+        assert_eq!(line["occurrences"], 1);
+        assert_eq!(line["scope_obfuscated"], false);
+        assert_eq!(
+            line["dedup_key"].as_str().map(str::len),
+            Some(crate::throttle::DEDUP_KEY_BYTES * 2)
+        );
+        let card = &line["evidence_card"];
+        assert_eq!(card["event_counts"]["egress-flow"], 1);
+        assert_eq!(card["uid"], 1000);
+        assert_eq!(card["destination"], "198.51.100.5:443");
+        assert_eq!(card["process"]["pid"], 4_711);
+        assert_eq!(card["process"]["comm"], "curl");
+        Ok(())
+    }
+
+    #[test]
+    fn test_suppressed_repeats_produce_no_spool_record() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let writer = spool_writer_in(dir.path())?;
+        let stats = writer.stats();
+        let mut rules = throttled_cycle(600).with_spool(writer);
+        let mut buffer = EvidenceBuffer::new(64, 64);
+        for _ in 0..3 {
+            buffer.push_event(egress_by_process(1000));
+        }
+        let reported = rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            at(0)?,
+            &CgroupKids::default(),
+            None,
+        );
+        assert_eq!(reported, 1);
+        drop(rules);
+        assert_eq!(stats.snapshot().written_total, 1, "one record per report");
+        Ok(())
+    }
+
+    #[test]
+    fn test_without_a_usable_spool_the_line_has_no_record_digest() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        let host = harw_types::HostId::try_from_str("host-a").map_err(ctx("host id"))?;
+        let mut exporter = FindingsExporter::new(path.clone(), host);
+        let writer = SpoolWriter::unavailable();
+        let stats = writer.stats();
+        let mut rules = RuleCycle::new(NetworkScope::empty()).with_spool(writer);
+        let mut buffer = EvidenceBuffer::new(16, 16);
+        buffer.push_event(egress_by_process(1000));
+        let reported = rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            Timestamp::UNIX_EPOCH,
+            &CgroupKids::default(),
+            Some(&mut exporter),
+        );
+        assert_eq!(reported, 1, "the finding is reported anyway");
+        let line = only_line(&path)?;
+        assert!(line.get("record_digest").is_none());
+        assert_eq!(line["evidence_card"]["uid"], 1000);
+        assert_eq!(stats.snapshot().enqueued_total, 0);
+        Ok(())
+    }
+
+    fn provenance_of(events: &[SecurityEvent]) -> TestResult<Vec<Provenance>> {
+        let findings = checked_findings(events)?;
+        Ok(attribute_provenance(
+            &findings,
+            events,
+            Timestamp::UNIX_EPOCH,
+            &NetworkScope::empty(),
+            &CgroupKids::default(),
+        ))
+    }
+
+    #[test]
+    fn test_triggers_are_the_single_event_matches_of_each_finding() -> TestResult {
+        let distinct = provenance_of(&[
+            drift_in(None, "first"),
+            listener_event(8080),
+            drift_in(None, "second"),
+        ])?;
+        let triggers: Vec<Vec<usize>> = distinct.into_iter().map(|p| p.triggers).collect();
+        assert_eq!(triggers, vec![vec![0], vec![2]]);
+
+        let identical = provenance_of(&[drift_in(None, "same"), drift_in(None, "same")])?;
+        let triggers: Vec<Vec<usize>> = identical.into_iter().map(|p| p.triggers).collect();
+        assert_eq!(triggers, vec![vec![0, 1], vec![0, 1]]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_triggers_per_finding_are_capped() -> TestResult {
+        let events: Vec<SecurityEvent> = (0..MAX_TRIGGER_EVENTS + 6)
+            .map(|_| drift_in(None, "flood"))
+            .collect();
+        let provenance = provenance_of(&events)?;
+        assert_eq!(provenance.len(), events.len());
+        assert!(
+            provenance
+                .iter()
+                .all(|p| p.triggers.len() == MAX_TRIGGER_EVENTS)
+        );
+        Ok(())
+    }
 }

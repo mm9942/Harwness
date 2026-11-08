@@ -258,7 +258,7 @@
 //! # Exports for harw (PL-97 D1)
 //! Two optional, unprivileged outputs leave this process: the append-only
 //! findings export (`--findings-export`, module [`export`], schema version
-//! 2) and the health document (`--health-export`, module
+//! 3) and the health document (`--health-export`, module
 //! [`health_export`]), which defaults to the sibling `health.json` of the
 //! findings export and is replaced atomically at the end of every
 //! [`poll_once`] cycle. Both directories are added as read-write Landlock
@@ -273,6 +273,20 @@
 //! Without both flags nothing is written and the cycle is unchanged (the
 //! health snapshots around `poll_all` are only taken when the health export
 //! is enabled).
+//!
+//! # Finding spool (PL-100 WP0.12)
+//! With `--findings-export`, [`run`] also opens the finding spool under
+//! `<home>/spool` (module [`spool_writer`], directory `0700`, inside the
+//! read-write Landlock root `--home`) **after** [`sandbox::restrict_self`],
+//! so its dedicated writer thread inherits the self-restriction. Every
+//! reported finding is frozen with a bounded evidence slice (its triggering
+//! events plus at most 32 context events of the ring, at most 64 KiB) and
+//! queued for that thread; the export line carries the record's digest
+//! (`record_digest`). A full queue drops the record (counted); a spool that
+//! cannot be opened leaves the sentinel running without records. Both, like
+//! `SpoolFull` and `RecordTooLarge`, show up as `degraded` in the `spool`
+//! object of `health.json`. Retention: 14 days and 1 GiB, aligned with the
+//! `dod_spool` class of `harw-retention`.
 //!
 //! # Fehler
 //! [`error::SentinelBinError`] — ausschließlich die beiden Startpfade ohne
@@ -306,6 +320,7 @@ mod peer_allow;
 mod rates;
 mod sandbox;
 mod sensors;
+mod spool_writer;
 mod throttle;
 
 #[cfg(target_os = "linux")]
@@ -847,6 +862,17 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         None
     };
 
+    // PL-100 WP0.12: Spool eingefrorener Befunde — nur mit Befundexport,
+    // dessen `record_digest` auf seine Records verweist. Erst nach Landlock
+    // geöffnet, damit der Schreibthread die Selbstbeschränkung erbt; der
+    // Spool liegt unter `--home` (beschreibbare Landlock-Wurzel).
+    let spool = exporter
+        .as_ref()
+        .map(|_| spool_writer::SpoolWriter::open(&home));
+    if let Some(spool) = spool.as_ref() {
+        health = health.map(|health| health.with_spool(spool.stats()));
+    }
+
     let sensor_roots = SensorRoots {
         proc_root: cli.proc_root.clone(),
         thermal_root: cli.thermal_root.clone(),
@@ -906,6 +932,9 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         "finding throttle enabled"
     );
     let mut rules = findings::RuleCycle::new(network_scope).with_throttle(finding_throttle);
+    if let Some(spool) = spool {
+        rules = rules.with_spool(spool);
+    }
 
     if cli.once {
         poll_once(
