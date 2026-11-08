@@ -129,6 +129,16 @@ impl ConfigWriter {
         self.doc.to_string()
     }
 
+    /// Mutable access to the in-memory document for typed editors inside
+    /// this crate (`crate::dod_home`) that need inline-table-aware edits,
+    /// which [`Self::set_value`] does not offer (it replaces a non-table
+    /// value, including an inline table, with an empty table). Changes stay
+    /// in memory until [`Self::save`]; callers validate their own section
+    /// before saving.
+    pub(crate) fn document_mut(&mut self) -> &mut DocumentMut {
+        &mut self.doc
+    }
+
     /// Setzt `[permissions] default_mode`.
     ///
     /// # Arguments

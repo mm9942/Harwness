@@ -288,6 +288,11 @@ pub struct FieldScope {
 /// `crate::discovery`. For `[dod]` that means `proof_key_dir`, `export_dir`
 /// and `findings_window_hours` are profile-scoped and never taken from an
 /// untrusted layer; `config_scope_exhaustive.rs` pins that per field.
+/// `[dod]` merges more finely (PL-100 WP 1.9): its base keys are replaced
+/// as a group, its sub-tables `[dod.triage]`/`[dod.approve]`/`[dod.watch]`
+/// key by key, and `[dod.triage]`/`[dod.approve]` count only from the home
+/// layer and the active profile, except that any layer may narrow
+/// `[dod.approve] tui_tty` to `false` (see `crate::discovery::discover_config`).
 #[rustfmt::skip]
 pub static FIELD_TABLE: &[FieldScope] = &[
     // 1.1 Top-Level (11)

@@ -1077,6 +1077,14 @@ fn test_dod_section_fields_are_exhaustively_classified() {
         export_dir,
         // Repo-Layer: nie übernommen.
         findings_window_hours,
+        // Nur Home-Ebene und aktives Profil; jede andere Ebene (auch eine
+        // vertraute Projektebene) wird mit `ScopeDiagnostic` verworfen.
+        triage,
+        // Nur Home-Ebene und aktives Profil; jede andere Ebene darf nur
+        // verengen (`tui_tty = false`), alles andere wird gemeldet.
+        approve,
+        // Vertraute Ebenen ja; Repo-Layer: nie übernommen (mit Diagnose).
+        watch,
     } = harw_config::DodSection::default();
     assert!(kill_requires_human);
     assert!(auto_freeze);
@@ -1087,6 +1095,73 @@ fn test_dod_section_fields_are_exhaustively_classified() {
         findings_window_hours,
         harw_config::dod_toml::DEFAULT_FINDINGS_WINDOW_HOURS
     );
+    let harw_config::DodTriageSection {
+        model,
+        effort,
+        max_tokens,
+        max_parallel,
+    } = triage;
+    assert_eq!(model, None);
+    assert_eq!(effort, None);
+    assert_eq!(max_tokens, None);
+    assert_eq!(
+        max_parallel,
+        harw_config::dod_toml::DEFAULT_TRIAGE_MAX_PARALLEL
+    );
+    let harw_config::DodApproveSection { tui_tty } = approve;
+    assert!(tui_tty);
+    let harw_config::DodWatchSection { mode, autoconnect } = watch;
+    assert_eq!(mode, harw_config::DodWatchMode::Triage);
+    assert!(autoconnect);
+}
+
+/// PL-100 B15: weder ein nicht vertrauter Repo-Layer noch ein vertrauter
+/// Projekt-Layer setzt `[dod.triage]` oder schaltet `[dod.approve] tui_tty`
+/// ein; Home und Profil schon.
+#[test]
+fn test_dod_triage_and_approve_are_home_or_profile_only() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("Home-Layer anlegen"))?;
+    let profile = home.path().join("profiles").join("default");
+    std::fs::create_dir_all(&profile).map_err(ctx("Profil-Layer anlegen"))?;
+    let project = tempfile::tempdir().map_err(ctx("Projekt-Layer anlegen"))?;
+    let repo = tempfile::tempdir().map_err(ctx("Repo-Layer anlegen"))?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[dod.triage]\nmodel = \"local/qwen2.5\"\n",
+    )
+    .map_err(ctx("Home-config schreiben"))?;
+    std::fs::write(
+        profile.join("config.toml"),
+        "[dod.approve]\ntui_tty = false\n",
+    )
+    .map_err(ctx("Profil-config schreiben"))?;
+    let hostile = "[dod.triage]\nmodel = \"evil/exfil\"\n\n[dod.approve]\ntui_tty = true\n";
+    std::fs::write(project.path().join("config.toml"), hostile)
+        .map_err(ctx("Projekt-config schreiben"))?;
+    std::fs::write(repo.path().join("config.toml"), hostile)
+        .map_err(ctx("Repo-config schreiben"))?;
+
+    let layers = [
+        home.path().to_path_buf(),
+        profile.clone(),
+        project.path().to_path_buf(),
+    ];
+    let resolved = harw_config::discover_config_with_restricted(&layers, Some(repo.path()))
+        .map_err(ctx("Discovery"))?;
+    assert_eq!(resolved.dod.triage.model.as_deref(), Some("local/qwen2.5"));
+    assert!(!resolved.dod.approve.tui_tty);
+    for field in ["dod.triage", "dod.approve"] {
+        assert_eq!(
+            resolved
+                .scope_warnings
+                .iter()
+                .filter(|warning| warning.field == field)
+                .count(),
+            2,
+            "{field}: one diagnostic for the trusted project layer, one for the repository"
+        );
+    }
+    Ok(())
 }
 
 #[test]

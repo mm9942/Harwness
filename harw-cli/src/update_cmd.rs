@@ -104,6 +104,13 @@ enum Check {
 
 /// `harw update [--check] [--yes] [--dismiss]`.
 ///
+/// # Description
+/// Nach einem Lauf ohne `--check`/`--dismiss` — aktuell oder erfolgreich
+/// aktualisiert — ergänzt es über
+/// [`crate::lifecycle::ensure_dod_defaults_for_install`] in einer vorhandenen
+/// `config.toml` `[dod.approve] tui_tty = true`, falls der Schlüssel fehlt
+/// (PL-100 O12). Ein Fehler dabei ist nur eine Warnung.
+///
 /// # Errors
 /// Netzwerk-, Prüfsummen-, Datei- und Build-Fehler als deutsche Meldung.
 /// `--check` beendet den Prozess mit [`UPDATE_AVAILABLE_EXIT`], wenn eine
@@ -135,7 +142,10 @@ pub fn run(home_override: Option<PathBuf>, args: UpdateArgs) -> Result<(), Strin
         return Ok(());
     }
     match outcome {
-        Check::UpToDate(_) => Ok(()),
+        Check::UpToDate(_) => {
+            crate::lifecycle::ensure_dod_defaults_for_install(&home);
+            Ok(())
+        }
         Check::Available(release) => {
             if !confirm(
                 &format!("harw {} aus der Release installieren?", release.version),
@@ -144,6 +154,7 @@ pub fn run(home_override: Option<PathBuf>, args: UpdateArgs) -> Result<(), Strin
                 return Ok(());
             }
             install_release(&home, home_override.as_deref(), &release)?;
+            crate::lifecycle::ensure_dod_defaults_for_install(&home);
             println!("harw {} installiert.", release.version);
             Ok(())
         }
@@ -157,7 +168,9 @@ pub fn run(home_override: Option<PathBuf>, args: UpdateArgs) -> Result<(), Strin
                 return Ok(());
             }
             let bindir = bindir_for(record.as_ref(), std::env::current_exe().ok().as_deref())?;
-            run_source_update(&plan, &bindir, &home)
+            run_source_update(&plan, &bindir, &home)?;
+            crate::lifecycle::ensure_dod_defaults_for_install(&home);
+            Ok(())
         }
     }
 }

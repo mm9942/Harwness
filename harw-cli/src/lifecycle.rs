@@ -169,6 +169,57 @@ pub(crate) const GATEWAY_SERVICE_NAME: &str = "harw-gateway";
 /// neu startet.
 const SERVICE_RESTART_SEC: u32 = 5;
 
+/// Schreibt die DoD-Konfigurationsvorgabe `[dod.approve] tui_tty = true` in
+/// eine vorhandene `<home>/config.toml`, falls der Schlüssel fehlt.
+///
+/// # Description
+/// Gemeinsamer, nie fataler Einstieg der Installationspfade (PL-100 WP 1.9,
+/// O12): `harw update` ruft ihn nach jedem Lauf auf; `harw agent
+/// install-record` (den `make install`, `scripts/install.sh` und das neue
+/// Binary eines Updates ausführen) soll ihn ebenfalls aufrufen. Der
+/// Legacy-Alias `harw install` gibt weiterhin nur aus und schreibt nichts.
+/// Ein ausdrückliches `tui_tty = false`, eine fehlende `config.toml` und
+/// eine `config.toml`, die ein Symlink ist, bleiben unangetastet (siehe
+/// [`harw_config::ensure_dod_defaults`]).
+///
+/// Ein Fehler erzeugt nur eine Warnung ohne Pfad und ohne Fehlertext
+/// (`ConfigError` kann Pfade enthalten); der Text steht auf `debug`.
+/// [`harw_config::ConfigError::CommittedDurabilityUncertain`] heißt, dass
+/// die Datei bereits geschrieben wurde: das zählt als geschrieben, mit einer
+/// eigenen Warnung zur unsicheren Dauerhaftigkeit.
+///
+/// # Arguments
+/// - `home` (`&Path`): Root-Space (`~/.harw`), bereits aufgelöst.
+///
+/// # Returns
+/// `true`, wenn die Datei geschrieben wurde.
+///
+/// # Concurrency
+/// Blockierend (Datei-I/O); parallele Schreiber derselben Datei schützt die
+/// Sperre von `harw_config::ConfigWriter`.
+pub(crate) fn ensure_dod_defaults_for_install(home: &Path) -> bool {
+    match harw_config::ensure_dod_defaults(home) {
+        Ok(written) => {
+            tracing::info!(written, "dod.defaults.ensured");
+            written
+        }
+        Err(harw_config::ConfigError::CommittedDurabilityUncertain(error)) => {
+            tracing::info!(written = true, "dod.defaults.ensured");
+            tracing::warn!(
+                reason = "dod_defaults_durability_uncertain",
+                "dod.defaults.durability_uncertain"
+            );
+            tracing::debug!(error = %error, "dod.defaults.durability_uncertain.detail");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(reason = "dod_defaults_not_written", "dod.defaults.failed");
+            tracing::debug!(error = %error, "dod.defaults.failed.detail");
+            false
+        }
+    }
+}
+
 /// `harw install --print-systemd [UNIT]`: gibt eingebettete systemd-Systemunits aus.
 ///
 /// # Description
@@ -1550,6 +1601,45 @@ mod tests {
 
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+
+    #[test]
+    fn dod_defaults_helper_writes_once_and_keeps_explicit_false() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temporary HARW home"))?;
+        let path = home.path().join("config.toml");
+        std::fs::write(&path, "# scaffolded\n").map_err(ctx("seed config"))?;
+        assert!(ensure_dod_defaults_for_install(home.path()));
+        assert!(!ensure_dod_defaults_for_install(home.path()));
+        let text = std::fs::read_to_string(&path).map_err(ctx("read written config"))?;
+        assert!(text.contains("# scaffolded"), "{text}");
+        assert!(text.contains("tui_tty = true"), "{text}");
+
+        let kept = tempfile::tempdir().map_err(ctx("create second HARW home"))?;
+        let original = "[dod.approve]\ntui_tty = false\n";
+        std::fs::write(kept.path().join("config.toml"), original)
+            .map_err(ctx("write explicit false"))?;
+        assert!(!ensure_dod_defaults_for_install(kept.path()));
+        let after = std::fs::read_to_string(kept.path().join("config.toml"))
+            .map_err(ctx("read kept config"))?;
+        assert_eq!(after, original);
+        Ok(())
+    }
+
+    #[test]
+    fn dod_defaults_helper_never_creates_a_config() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temporary HARW home"))?;
+        assert!(!ensure_dod_defaults_for_install(home.path()));
+        assert!(!home.path().join("config.toml").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn dod_defaults_helper_failure_is_not_fatal() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temporary HARW home"))?;
+        std::fs::write(home.path().join("config.toml"), "dod = 1\n")
+            .map_err(ctx("write non-table dod"))?;
+        assert!(!ensure_dod_defaults_for_install(home.path()));
+        Ok(())
+    }
 
     #[test]
     fn health_evidence_observes_default_cli_composition() -> TestResult {
