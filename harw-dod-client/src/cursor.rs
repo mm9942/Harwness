@@ -151,9 +151,9 @@ pub fn lines_after(tail: FindingsTail, cursor: Option<&FindingsCursor>) -> Findi
         // Lines between the cursor and the oldest line of its instance were
         // rotated away.
         Some((_, oldest)) if cursor.seq.saturating_add(1) < oldest => None,
-        Some((first_index, _)) => Some(
-            resume_after.map_or(first_index, |index| index.saturating_add(1)),
-        ),
+        Some((first_index, _)) => {
+            Some(resume_after.map_or(first_index, |index| index.saturating_add(1)))
+        }
         // The cursor's instance is not in the tail at all.
         None => None,
     };
@@ -275,13 +275,16 @@ mod tests {
 
     #[test]
     fn continuous_cursor_returns_only_later_lines_including_a_new_instance() -> TestResult {
-        let lines = vec![v3(OLD, 4)?, v3(OLD, 5)?, v3(OLD, 6)?, v3(NEW, 1)?, v3(NEW, 2)?];
+        let lines = vec![
+            v3(OLD, 4)?,
+            v3(OLD, 5)?,
+            v3(OLD, 6)?,
+            v3(NEW, 1)?,
+            v3(NEW, 2)?,
+        ];
         let since = lines_after(tail(lines.clone()), Some(&cursor(OLD, 5)));
         assert!(!since.gap);
-        assert_eq!(
-            positions(&since),
-            [pos(OLD, 6), pos(NEW, 1), pos(NEW, 2)]
-        );
+        assert_eq!(positions(&since), [pos(OLD, 6), pos(NEW, 1), pos(NEW, 2)]);
         assert_eq!(since.cursor, Some(cursor(NEW, 2)));
 
         // Caught up: nothing new, the cursor stays.
@@ -375,10 +378,7 @@ mod tests {
         write_lines(&path, &[v3_text(NEW, 2)])?;
         let stale = read_findings_since(&path, Some(&cursor(OLD, 1)), MAX_TAIL_BYTES, now)?;
         assert!(stale.gap);
-        assert_eq!(
-            positions(&stale),
-            [pos(OLD, 3), pos(NEW, 1), pos(NEW, 2)]
-        );
+        assert_eq!(positions(&stale), [pos(OLD, 3), pos(NEW, 1), pos(NEW, 2)]);
 
         let missing = read_findings_since(&dir.path().join("absent"), None, MAX_TAIL_BYTES, now);
         assert!(missing.is_err_and(|error| error.is_not_found()));

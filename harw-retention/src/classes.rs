@@ -270,7 +270,11 @@ mod tests {
             ("dod_labels", "labels"),
         ] {
             let resolved = class(&RetentionConfig::default(), id)?;
-            assert_eq!((resolved.class.resolve_dirs)(&roots), vec![dod.join(sub)], "{id}");
+            assert_eq!(
+                (resolved.class.resolve_dirs)(&roots),
+                vec![dod.join(sub)],
+                "{id}"
+            );
         }
         Ok(())
     }

@@ -284,7 +284,8 @@ mod tests {
             EvidenceCard::from_export_value(json!({"process": {"comm": "sh"}}), false).is_none()
         );
         // Unknown keys: refused up to v3, ignored for a newer writer.
-        let unknown = json!({"uid": 5, "future": true, "process": {"pid": 1, "comm": "x", "tid": 2}});
+        let unknown =
+            json!({"uid": 5, "future": true, "process": {"pid": 1, "comm": "x", "tid": 2}});
         assert!(EvidenceCard::from_export_value(unknown.clone(), false).is_none());
         let lenient = EvidenceCard::from_export_value(unknown, true);
         assert_eq!(lenient.as_ref().and_then(|card| card.uid), Some(5));

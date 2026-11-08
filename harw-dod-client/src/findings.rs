@@ -389,8 +389,7 @@ impl TryFrom<RawFindingLine> for FindingLine {
         let lenient = raw
             .schema_version
             .is_some_and(|version| version > EXPORT_SCHEMA_VERSION);
-        if !is_clean(&raw.finding_id, MAX_ID_BYTES)
-            || (strict_ids && !is_uuid_v4(&raw.finding_id))
+        if !is_clean(&raw.finding_id, MAX_ID_BYTES) || (strict_ids && !is_uuid_v4(&raw.finding_id))
         {
             return Err(InvalidFindingLine("finding_id"));
         }
@@ -1670,7 +1669,11 @@ mod tests {
         );
         let parsed = parse_finding_line(&legacy.to_string()).ok_or("legacy id on v2")?;
         assert!(!parsed.has_uuid_v4_id());
-        let unversioned = with(without(v3_value(), "schema_version"), "finding_id", json!("f-1"));
+        let unversioned = with(
+            without(v3_value(), "schema_version"),
+            "finding_id",
+            json!("f-1"),
+        );
         assert!(parse_finding_line(&unversioned.to_string()).is_some());
 
         // From v3 on only the canonical UUIDv4 the sentinel mints.
@@ -1700,7 +1703,10 @@ mod tests {
             ("instance", json!(INSTANCE.to_uppercase())),
             ("seq", json!(0)),
             ("seq", json!(-1)),
-            ("record_digest", json!("0".repeat(RECORD_DIGEST_HEX_LEN - 1))),
+            (
+                "record_digest",
+                json!("0".repeat(RECORD_DIGEST_HEX_LEN - 1)),
+            ),
             ("record_digest", json!(DIGEST.to_uppercase())),
             ("dedup_key", json!(DIGEST)),
             ("dedup_key", json!("g".repeat(DEDUP_KEY_HEX_LEN))),
@@ -1733,13 +1739,21 @@ mod tests {
         assert_eq!(line.evidence_card.and_then(|card| card.uid), Some(5));
 
         // Up to v3 an unknown card key drops the card, never the line.
-        let strict = with(v3_value(), "evidence_card", json!({"uid": 5, "future": [1]}));
+        let strict = with(
+            v3_value(),
+            "evidence_card",
+            json!({"uid": 5, "future": [1]}),
+        );
         let line = parse_finding_line(&strict.to_string()).ok_or("v3 line keeps parsing")?;
         assert_eq!(line.evidence_card, None);
         assert_eq!(line.seq, Some(7));
 
         // Malformed identifiers stay fatal for newer writers as well.
-        let bad = with(with(v3_value(), "schema_version", json!(4)), "seq", json!(0));
+        let bad = with(
+            with(v3_value(), "schema_version", json!(4)),
+            "seq",
+            json!(0),
+        );
         assert!(parse_finding_line(&bad.to_string()).is_none());
         Ok(())
     }
@@ -1756,7 +1770,11 @@ mod tests {
         assert!(line.scope_obfuscated);
 
         // The writer's own flag is kept.
-        let withheld = with(without(v3_value(), "scope"), "scope_obfuscated", json!(true));
+        let withheld = with(
+            without(v3_value(), "scope"),
+            "scope_obfuscated",
+            json!(true),
+        );
         let line = parse_finding_line(&withheld.to_string()).ok_or("line kept")?;
         assert!(line.scope_obfuscated);
         assert_eq!(line.scope, None);

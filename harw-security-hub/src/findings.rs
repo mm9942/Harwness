@@ -598,7 +598,10 @@ mod tests {
             ["3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b", "f-1", "f0"],
             "newest first"
         );
-        let v1 = batch.findings.last().ok_or(TestError::Missing("v1 finding"))?;
+        let v1 = batch
+            .findings
+            .last()
+            .ok_or(TestError::Missing("v1 finding"))?;
         assert_eq!(v1.schema_version, None);
         assert_eq!(v1.dedup_key, None);
 
@@ -606,10 +609,15 @@ mod tests {
         // three kept v3 fields for v3 lines.
         let v1_json = serde_json::to_string(v1).map_err(ctx("serialize v1"))?;
         assert!(!v1_json.contains("dedup_key") && !v1_json.contains("schema_version"));
-        let newest = batch.findings.first().ok_or(TestError::Missing("v3 finding"))?;
+        let newest = batch
+            .findings
+            .first()
+            .ok_or(TestError::Missing("v3 finding"))?;
         let v3_json = serde_json::to_value(newest).map_err(ctx("serialize v3"))?;
         assert_eq!(
-            v3_json.get("occurrences").and_then(serde_json::Value::as_u64),
+            v3_json
+                .get("occurrences")
+                .and_then(serde_json::Value::as_u64),
             Some(3)
         );
         assert!(v3_json.get("evidence_card").is_none());
@@ -628,8 +636,10 @@ mod tests {
     #[test]
     fn test_malformed_optional_v3_values_are_dropped_not_the_line() -> TestResult {
         let text = [
-            line("f1", "host-a", "high", "2026-09-27T01:00:00Z")
-                .replace('}', r#","schema_version":3,"dedup_key":"NOT-HEX","occurrences":0}"#),
+            line("f1", "host-a", "high", "2026-09-27T01:00:00Z").replace(
+                '}',
+                r#","schema_version":3,"dedup_key":"NOT-HEX","occurrences":0}"#,
+            ),
             line("f2", "host-a", "high", "2026-09-27T02:00:00Z")
                 .replace('}', r#","schema_version":0}"#),
         ]
