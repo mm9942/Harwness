@@ -746,6 +746,12 @@ fn init_tracing(level: cli::LogLevel) {
 /// mehr), Sensoren registrieren, dann entweder eine einzelne Runde
 /// (`--once`) oder die Dauerschleife.
 ///
+/// Unmittelbar vor dem Binden löst [`peer_allow::resolve_probe_peers`] die
+/// Sonden-Konten (`--probe-peer-user`) in die `SO_PEERCRED`-Zulassungsliste
+/// auf (PL-100 WP0.5) — vor Landlock, weil `/etc/passwd` danach nicht mehr
+/// lesbar ist. Die Landlock-Wurzeln baut [`landlock_roots`] (PL-100 WP0.7:
+/// kein Arbeitsverzeichnis, nie `/`).
+///
 /// Der IPC-Empfangssocket wird dabei nicht nur gebunden, sondern sein
 /// Inbox-Handle auch zurückgehalten — [`poll_once`] entleert es jeden
 /// Zyklus in den `Sentinel`-Puffer (siehe Moduldoku, Abschnitt „Externe
