@@ -12,6 +12,15 @@
 //!   nötig: nur eigene Jobs bzw. die der Nachfahren)
 //! - `job.list {kind?}` — ohne `kind` nur die Übersicht je Art mit Zählern
 //!   pro Zustand; mit `kind` die Zeilen dieser Art
+//! - `job.suspend {job_id, finding_id?}` / `job.resume {job_id, finding_id?}`
+//!   (PL-100 WP 3.5) — friert die eigene, von der Runtime bewiesene
+//!   Job-cgroup ein bzw. taut sie auf ([`JobFreezer`]); dieselbe
+//!   Besitzprüfung wie `job.stop`, Nachfrage über `ALWAYS_ASK_TOOLS` der
+//!   Montage; `finding_id` (UUIDv4) nur für Log und Ergebnis. Einen Freeze,
+//!   den harw nicht vermerkt hat, übernimmt und hebt harw nie auf;
+//!   `job.stop` beendet einen angehaltenen Job eingefroren (SIGKILL).
+//!   Haltezeit zählt nicht als aktive Laufzeit (Wanduhr-Semantik in
+//!   [`model`]).
 //!
 //! There is deliberately no blocking wait tool: delegated work runs only in
 //! the background; progress and end arrive as notifications (see "Meldungen")
@@ -57,6 +66,8 @@
 //!   identität)
 //! - [`launcher`] — [`JobLauncher`], [`ShellJobLauncher`]
 //! - [`manager`] — [`JobManager`]
+//! - [`freeze`] — [`JobFreezer`], [`FreezeError`] (`CgroupFreezer` unter
+//!   Linux) für `job.suspend`/`job.resume`
 //! - [`tools`] — [`JobToolProvider`]
 //!
 //! Keine `tmux`-Abhängigkeit.
@@ -64,6 +75,7 @@
 #![forbid(unsafe_code)]
 
 pub mod event;
+pub mod freeze;
 pub mod launcher;
 pub mod logs;
 pub mod manager;
@@ -77,11 +89,14 @@ pub use event::{
     ChannelNotifier, JobEvent, JobNotification, JobNotifier, NoopNotifier, RecordingNotifier,
     format_duration,
 };
+#[cfg(target_os = "linux")]
+pub use freeze::CgroupFreezer;
+pub use freeze::{FreezeError, JobFreezer};
 pub use launcher::{JobLauncher, LaunchFuture, PreparedJob, ShellJobLauncher};
 pub use logs::{LogQuery, LogSlice};
 pub use manager::{
     Caller, DEFAULT_MAX_PIPED_LINE_BYTES, DetachSummary, JobError, JobManager, JobManagerConfig,
-    JobOrigin, PipedJob, PipedLineError, StartRequest,
+    JobOrigin, PipedJob, PipedLineError, StartRequest, SuspendOutcome, SuspendTransition,
 };
 pub use model::{
     JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus, ManagedJobOrigin,
@@ -93,9 +108,9 @@ pub use progress::{
 };
 pub use throttle::{ErrorBatch, NotifyThrottle, ProgressKey, ThrottleConfig};
 pub use tools::{
-    FnLineage, JOB_CONTROL_TOOLS, JOB_LIST_TOOL, JOB_LOGS_TOOL, JOB_READ_TOOLS, JOB_START_TOOL,
-    JOB_STATUS_TOOL, JOB_STOP_TOOL, JOB_TOOL_NAMES, JobLineage, JobToolProvider, NoLineage,
-    job_start_command_text, job_tools, shell_quote,
+    FnLineage, JOB_CONTROL_TOOLS, JOB_LIST_TOOL, JOB_LOGS_TOOL, JOB_READ_TOOLS, JOB_RESUME_TOOL,
+    JOB_START_TOOL, JOB_STATUS_TOOL, JOB_STOP_TOOL, JOB_SUSPEND_TOOL, JOB_TOOL_NAMES, JobLineage,
+    JobToolProvider, NoLineage, job_start_command_text, job_tools, shell_quote,
 };
 
 #[cfg(test)]

@@ -32,6 +32,15 @@
 //!   Warnung an den Besitzer.
 //! - Besitz: nur Erzeuger und Vorfahren ([`JobOwner::may_control`]); die
 //!   Oberfläche handelt als [`Caller::Operator`].
+//! - Anhalten (PL-100 WP 3.5): [`JobManager::suspend`] friert die eigene,
+//!   von der Runtime bewiesene Job-cgroup ein ([`crate::JobFreezer`],
+//!   `cgroup.freeze`), [`JobManager::resume`] taut sie auf; dieselbe
+//!   Besitzprüfung wie [`JobManager::stop`]. harw übernimmt und hebt nie
+//!   einen Freeze, den es nicht selbst vermerkt hat
+//!   ([`JobError::FrozenElsewhere`]). Ein Stop taut einen angehaltenen Job
+//!   nie auf: er endet eingefroren mit SIGKILL. Haltezeit zählt nicht als
+//!   aktive Laufzeit ([`JobMeta::active_secs_at`], Wanduhr-Semantik in
+//!   [`crate::model`]).
 //!
 //! # Nebenläufigkeit
 //! `Send + Sync`; interne `std::sync::Mutex` werden nie über ein `await`
@@ -39,6 +48,7 @@
 //! Warten (`stop`, `wait`) läuft über einen `watch`-Kanal je Job.
 
 use crate::event::{JobEvent, JobNotification, JobNotifier};
+use crate::freeze::{FreezeError, JobFreezer, leaf_beneath};
 use crate::launcher::{PreparedJob, PreparedLaunch};
 use crate::logs::{LogFollower, clip_line, tail_of_file};
 use crate::model::{
@@ -331,7 +341,113 @@ pub enum JobError {
         #[source]
         source: io::Error,
     },
+    /// `job.suspend`: der Job läuft nicht unter Aufsicht dieser Sitzung
+    /// (wartet, abgelöst oder schon beendet) und kann nicht angehalten
+    /// werden.
+    #[msg(
+        "job `{job}` cannot be suspended in state {state}; only running jobs of this session can"
+    )]
+    NotSuspendable {
+        /// Kennung des Jobs.
+        job: String,
+        /// Sein Zustand zum Zeitpunkt der Prüfung.
+        state: JobState,
+    },
+    /// `job.suspend`/`job.resume`: keine von der Runtime bewiesene eigene
+    /// cgroup des Jobs direkt unter der delegierten Wurzel des Freezers;
+    /// es wird nichts eingefroren oder aufgetaut (fail closed).
+    #[msg(
+        "job `{0}` has no own cgroup beneath the delegated cgroup root; it cannot be suspended or resumed"
+    )]
+    NoJobCgroup(String),
+    /// `job.suspend`/`job.resume`: kein Freezer installiert (keine
+    /// delegierte cgroup-v2-Wurzel für Jobs, `[jobs] cgroup_root`, oder kein
+    /// Linux).
+    #[msg("job suspension is not available: jobs have no delegated cgroup v2 root here")]
+    SuspendUnavailable,
+    /// `job.suspend`/`job.resume`: die Job-cgroup ist eingefroren (oder
+    /// friert gerade ein), ohne dass harw das vermerkt hat — ein Operator,
+    /// der Warden oder eine eingefrorene Vorfahren-cgroup. harw übernimmt
+    /// diesen Freeze nicht und hebt ihn nie auf (A3/O3: gefroren bleibt
+    /// gefroren bis zur Aufhebung durch seinen Urheber).
+    #[msg(
+        "job `{0}` is frozen by someone other than harw (an operator, the Warden or a parent cgroup); harw neither takes over nor lifts that freeze"
+    )]
+    FrozenElsewhere(String),
+    /// `job.suspend`: ein Stop des Jobs läuft schon (Gnadenfrist); ihn jetzt
+    /// einzufrieren hielte seinen Signal-Handler an.
+    #[msg("job `{0}` is being stopped; it cannot be suspended")]
+    StopPending(String),
+    /// Einfrieren, Auftauen oder Prüfen der Job-cgroup schlug fehl.
+    #[msg("{operation} of job `{job}` failed: {source}")]
+    Freeze {
+        /// Kennung des Jobs.
+        job: String,
+        /// `freeze`, `thaw` oder `probe` (Prüfung auf einen fremden Freeze).
+        operation: &'static str,
+        /// Ursache.
+        #[source]
+        source: FreezeError,
+    },
 }
+
+/// Was `job.suspend` bzw. `job.resume` bewirkt hat (PL-100 WP 3.5).
+///
+/// # Description
+/// Die beiden `Already…`/`Not…`-Fälle sind keine Fehler: wiederholtes
+/// Anhalten bzw. Fortsetzen ist idempotent und ändert nichts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendTransition {
+    /// `job.suspend` hat die eigene cgroup des Jobs eingefroren.
+    Suspended,
+    /// `job.suspend` auf einen schon angehaltenen Job: nichts geändert.
+    AlreadySuspended,
+    /// `job.resume` hat die eigene cgroup des Jobs aufgetaut.
+    Resumed,
+    /// `job.resume` auf einen nicht angehaltenen Job: nichts geändert.
+    NotSuspended,
+}
+
+impl SuspendTransition {
+    /// Kurzname (`suspended`, `already_suspended`, `resumed`,
+    /// `not_suspended`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Suspended => "suspended",
+            Self::AlreadySuspended => "already_suspended",
+            Self::Resumed => "resumed",
+            Self::NotSuspended => "not_suspended",
+        }
+    }
+
+    /// Ob der Aufruf etwas geändert hat.
+    #[must_use]
+    pub fn changed(self) -> bool {
+        matches!(self, Self::Suspended | Self::Resumed)
+    }
+}
+
+/// Ergebnis von [`JobManager::suspend`] und [`JobManager::resume`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspendOutcome {
+    /// Was geschah.
+    pub transition: SuspendTransition,
+    /// Zustand des Jobs danach.
+    pub status: JobStatus,
+    /// Sicht des Kernels nach dem Aufruf (`cgroup.events` `frozen`, auch
+    /// über eine Vorfahren-cgroup); `None`, wenn sie nicht geprüft wurde
+    /// (kein Freezer, keine bewiesene cgroup, beendeter Job) oder nicht
+    /// lesbar ist. Einfrieren ist asynchron: `Some(false)` direkt nach dem
+    /// Anhalten heißt „hält gerade an“; `Some(true)` nach dem Fortsetzen
+    /// heißt, ein Freeze außerhalb von harw hält den Job weiter.
+    pub frozen: Option<bool>,
+}
+
+/// Hinweis an den Besitzer, wenn ein Job einer früheren Sitzung noch
+/// angehalten ist (B13: kein stilles Einfrieren ohne Ende).
+const SUSPENDED_ON_RELOAD: &str = "was suspended when the previous harw session ended; its \
+     processes stay frozen until job.resume (job.stop kills it without thawing)";
 
 fn io_err(context: &'static str) -> impl FnOnce(io::Error) -> JobError {
     move |source| JobError::Io { context, source }
@@ -377,6 +493,17 @@ impl Waiter {
 
 /// How long a background job may run before the runtime's deadline (jobs have
 /// no wall limit of their own; stop is explicit).
+///
+/// # Description
+/// This is the job runtime's `wall_timeout` for every job of this manager
+/// (`harw-job-runtime`, `coordinator/runner.rs`, `run_attempt`). It is a
+/// ten-year backstop, not a budget: the runtime arms it once when the attempt
+/// starts and knows nothing about `job.suspend`, so it would count suspended
+/// time — which is why it must stay far beyond any real run. The budget
+/// semantics of a suspension (PL-100 WP 3.5: suspended time never counts as
+/// active time, a suspended job never runs out of wall time, `job.resume`
+/// continues the remaining budget) are defined on the job record
+/// ([`JobMeta::active_secs_at`], module docs of [`crate::model`]).
 const JOB_RUNTIME_DEADLINE: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 
 /// Hands a prepared job to `port`: argv, working directory and environment
@@ -585,6 +712,13 @@ pub struct JobManager {
     starting: AtomicUsize,
     // Eigener Kommando-Port; `None`: der installierte (`harw_command::installed`).
     command_port: Option<Arc<dyn harw_command::CommandPort>>,
+    // Freezer für `job.suspend`/`job.resume` (PL-100 WP 3.5); `None`: nicht
+    // verfügbar. Gesetzt von der Montage über `set_freezer`.
+    freezer: Mutex<Option<Arc<dyn JobFreezer>>>,
+    // Serialisiert `suspend`/`resume`: Prüfung, Vermerk und Kernel-Zugriff
+    // eines Aufrufs verschränken sich nie mit denen eines anderen. Nie über
+    // ein `await` gehalten (beide sind synchron).
+    suspend_ops: Mutex<()>,
 }
 
 /// Releases admission on every early return, including cancellation while
@@ -655,6 +789,8 @@ impl JobManager {
             max_running: AtomicUsize::new(config_max_running),
             starting: AtomicUsize::new(0),
             command_port,
+            freezer: Mutex::new(None),
+            suspend_ops: Mutex::new(()),
         });
         manager.reload(&jobs_dir);
         Ok(manager)
@@ -741,6 +877,22 @@ impl JobManager {
                     }
                     _ => {}
                 }
+                if next == JobState::Detached && meta.suspended_at.is_some() {
+                    info!(job_id = %meta.job_id, "previous job is still suspended (cgroup frozen)");
+                    warnings.push(JobNotification {
+                        owner: meta.owner.clone(),
+                        event: JobEvent::Warning {
+                            job_id: meta.job_id.clone(),
+                            name: meta.name.clone(),
+                            message: SUSPENDED_ON_RELOAD.to_owned(),
+                        },
+                    });
+                }
+                if next == JobState::Unknown {
+                    // The process is gone (or not provably ours): an open
+                    // suspension ends here, its time is booked.
+                    meta.end_suspension(Timestamp::now());
+                }
                 if next != meta.state {
                     meta.state = next;
                     if let Err(err) = write_meta(&dir, &meta) {
@@ -785,7 +937,10 @@ impl JobManager {
         max
     }
 
-    /// Zahl der Jobs, die diese Sitzung gerade beaufsichtigt.
+    /// Zahl der Jobs, die diese Sitzung gerade beaufsichtigt; angehaltene
+    /// ([`JobState::Suspended`]) zählen mit, ihr Platz unter
+    /// `max_running` bleibt belegt (ihre Prozesse leben, `job.resume` darf die
+    /// Grenze nicht überschreiten).
     #[must_use]
     pub fn running_count(&self) -> usize {
         Self::count_running(&lock(&self.jobs))
@@ -987,6 +1142,8 @@ impl JobManager {
             origin_tool: origin.tool,
             owner_agent: origin.owner_agent,
             origin: managed_origin,
+            suspended_at: None,
+            suspended_secs: 0,
         };
 
         // The job runtime starts the process (PL-93): session, pidfd, cgroup and
@@ -1193,6 +1350,8 @@ impl JobManager {
             origin_tool: origin.tool,
             owner_agent: origin.owner_agent,
             origin: managed_origin,
+            suspended_at: None,
+            suspended_secs: 0,
         };
 
         // The runtime starts the process and hands over its stdin/stdout pipes;
@@ -1311,7 +1470,10 @@ impl JobManager {
 
     /// Stoppt einen Job: `signal` an die ganze Prozessgruppe, nach der
     /// Gnadenfrist SIGKILL. Bei einem bereits beendeten Job werden nur noch
-    /// verbliebene Gruppenmitglieder beendet.
+    /// verbliebene Gruppenmitglieder beendet. Ein angehaltener Job
+    /// ([`JobMeta::is_suspended`]) wird nie aufgetaut: er bekommt statt
+    /// `signal` sofort SIGKILL und endet eingefroren (PL-100 WP 3.5); für
+    /// ein geordnetes Ende zuerst [`JobManager::resume`].
     ///
     /// # Description
     /// Ein Job einer früheren Sitzung wird nur signalisiert, wenn seine
@@ -1328,12 +1490,323 @@ impl JobManager {
         caller: Caller<'_>,
         signal: JobSignal,
     ) -> Result<JobStatus, JobError> {
-        let entry = self.entry(id, caller)?;
-        self.stop_entry(&entry, signal).await;
-        Ok(entry.status())
+        self.stop_reporting_signal(id, caller, signal)
+            .await
+            .map(|(status, _)| status)
     }
 
-    async fn stop_entry(&self, entry: &Arc<JobEntry>, signal: JobSignal) {
+    /// Wie [`JobManager::stop`]; liefert zusätzlich das Signal, mit dem der
+    /// Stop tatsächlich begann.
+    ///
+    /// # Returns
+    /// Den Status danach und `signal`, für einen angehaltenen Job aber
+    /// [`JobSignal::Kill`] (er wird eingefroren beendet, nie aufgetaut).
+    ///
+    /// # Errors
+    /// [`JobError::NotFound`] für unbekannte oder fremde Jobs.
+    pub async fn stop_reporting_signal(
+        &self,
+        id: &JobId,
+        caller: Caller<'_>,
+        signal: JobSignal,
+    ) -> Result<(JobStatus, JobSignal), JobError> {
+        let entry = self.entry(id, caller)?;
+        let sent = self.stop_entry(&entry, signal).await;
+        Ok((entry.status(), sent))
+    }
+
+    /// Installiert den Freezer für `job.suspend`/`job.resume` (PL-100
+    /// WP 3.5); ein späterer Aufruf ersetzt ihn.
+    ///
+    /// # Description
+    /// Die Montage übergibt einen `CgroupFreezer` über dieselbe
+    /// delegierte cgroup-Wurzel, unter der die Job-Runtime die Job-cgroups
+    /// anlegt (`[jobs] cgroup_root`). Ohne Freezer lehnen
+    /// [`JobManager::suspend`] und [`JobManager::resume`] mit
+    /// [`JobError::SuspendUnavailable`] ab.
+    pub fn set_freezer(&self, freezer: Arc<dyn JobFreezer>) {
+        *lock(&self.freezer) = Some(freezer);
+    }
+
+    /// Der installierte Freezer, falls vorhanden.
+    fn freezer(&self) -> Option<Arc<dyn JobFreezer>> {
+        lock(&self.freezer).as_ref().map(Arc::clone)
+    }
+
+    /// Freezer und Blattname der bewiesenen eigenen cgroup von `entry`.
+    ///
+    /// # Errors
+    /// [`JobError::SuspendUnavailable`] ohne Freezer,
+    /// [`JobError::NoJobCgroup`] ohne bewiesene cgroup
+    /// ([`JobMeta::job_cgroup_path`]) direkt unter der Wurzel des Freezers.
+    fn freeze_target(&self, entry: &JobEntry) -> Result<(Arc<dyn JobFreezer>, String), JobError> {
+        let freezer = self.freezer().ok_or(JobError::SuspendUnavailable)?;
+        let state = lock(&entry.state);
+        let leaf = state
+            .meta
+            .job_cgroup_path()
+            .and_then(|path| leaf_beneath(path, freezer.delegated_root()))
+            .map(str::to_owned)
+            .ok_or_else(|| JobError::NoJobCgroup(state.meta.job_id.to_string()))?;
+        drop(state);
+        Ok((freezer, leaf))
+    }
+
+    /// Hält einen Job an (`job.suspend`, PL-100 WP 3.5): friert seine
+    /// eigene cgroup ein (`cgroup.freeze` = 1). Die Prozesse bleiben am
+    /// Leben und behalten ihren Zustand; [`JobManager::resume`] setzt fort.
+    ///
+    /// # Description
+    /// - Besitz: dieselbe Prüfung wie [`JobManager::stop`] — unbekannte und
+    ///   fremde Jobs bekommen [`JobError::NotFound`].
+    /// - Nur ein [`JobState::Running`]-Job dieser Sitzung ohne laufenden
+    ///   Stop wird angehalten; er wird [`JobState::Suspended`],
+    ///   `suspended_at` beginnt.
+    /// - Ziel ist ausschließlich die von der Runtime bewiesene eigene cgroup
+    ///   ([`JobMeta::job_cgroup_path`]) direkt unter der Wurzel des
+    ///   installierten [`JobFreezer`]; ohne Beweis wird nichts eingefroren.
+    ///   Nie harws eigene oder die Sitzungs-cgroup.
+    /// - Fremder Freeze: ist die cgroup schon eingefroren (oder friert
+    ///   gerade ein), ohne dass harw das vermerkt hat, wird abgelehnt
+    ///   ([`JobError::FrozenElsewhere`]); harw übernimmt ihn nicht und hebt
+    ///   ihn später nie auf.
+    /// - Absicht vor Wirkung: das Anhalten wird in `meta.json` vermerkt,
+    ///   bevor der Kernel einfriert; scheitert das Einfrieren, wird der
+    ///   Vermerk zurückgenommen. Ein Absturz dazwischen hinterlässt so nie
+    ///   einen eingefrorenen Job ohne Vermerk (den `job.resume` nicht
+    ///   auftauen könnte).
+    /// - Idempotent: ein schon angehaltener Job ergibt
+    ///   [`SuspendTransition::AlreadySuspended`]; mit bewiesener cgroup wird
+    ///   `cgroup.freeze` = 1 erneut geschrieben (ein außerhalb von harw
+    ///   aufgehobener Freeze gilt wieder) und die Kernel-Sicht gemeldet.
+    /// - Wanduhr: Haltezeit zählt nicht als aktive Laufzeit
+    ///   ([`JobMeta::active_secs_at`]); eingefrorene Prozesse verbrauchen kein
+    ///   CPU-Budget. Der Platz unter `max_running` bleibt belegt.
+    ///
+    /// # Errors
+    /// [`JobError::NotFound`], [`JobError::NotSuspendable`],
+    /// [`JobError::StopPending`], [`JobError::SuspendUnavailable`],
+    /// [`JobError::NoJobCgroup`], [`JobError::FrozenElsewhere`],
+    /// [`JobError::Freeze`] (auch `probe`, wenn der Kernel-Zustand nicht
+    /// lesbar ist: ohne ihn wird nicht eingefroren).
+    ///
+    /// # Concurrency
+    /// Synchron und kurz (wenige cgroupfs-Zugriffe); Aufrufe von `suspend`
+    /// und `resume` laufen nacheinander, die Sperre des Jobs wird nie über
+    /// einen Kernel-Zugriff gehalten. Endet der Job zwischen Vermerk und
+    /// Einfrieren, wird wieder aufgetaut und [`JobError::NotSuspendable`]
+    /// gemeldet; wird er dazwischen abgelöst, bleibt er angehalten.
+    pub fn suspend(&self, id: &JobId, caller: Caller<'_>) -> Result<SuspendOutcome, JobError> {
+        let entry = self.entry(id, caller)?;
+        let _serial = lock(&self.suspend_ops);
+        refresh_foreign(&entry);
+        let (state, monitored, stop_requested, suspended) = {
+            let guard = lock(&entry.state);
+            (
+                guard.meta.state,
+                guard.monitored,
+                guard.meta.stop_requested,
+                guard.meta.is_suspended(),
+            )
+        };
+        if suspended {
+            return self.reassert_suspension(id, &entry);
+        }
+        check_suspendable(id, state, monitored, stop_requested)?;
+        let (freezer, leaf) = self.freeze_target(&entry)?;
+        // Never take over a freeze harw did not record (A3/O3): a later
+        // job.resume would lift it.
+        if probe_held(freezer.as_ref(), &leaf).map_err(freeze_error(id, "probe"))? {
+            warn!(job_id = %id, "job.suspend refused: the job cgroup is frozen outside harw");
+            return Err(JobError::FrozenElsewhere(id.to_string()));
+        }
+        // Intent before effect: the record says "suspended" before the
+        // kernel freezes, so no frozen job is ever left without a record.
+        let marked_at = Timestamp::now();
+        {
+            let mut guard = lock(&entry.state);
+            check_suspendable(
+                id,
+                guard.meta.state,
+                guard.monitored,
+                guard.meta.stop_requested,
+            )?;
+            guard.meta.state = JobState::Suspended;
+            guard.meta.begin_suspension(marked_at);
+        }
+        entry.persist();
+        if let Err(source) = freezer.freeze(&leaf) {
+            rollback_suspension(&entry, marked_at);
+            entry.persist();
+            entry.bump();
+            return Err(JobError::Freeze {
+                job: id.to_string(),
+                operation: "freeze",
+                source,
+            });
+        }
+        // The job may have ended between the record and the freeze (its
+        // monitor closed the suspension): thaw again so no frozen cgroup
+        // outlives a refusal. A job detached in between stays suspended.
+        let ended = {
+            let guard = lock(&entry.state);
+            (!guard.meta.is_suspended()).then_some(guard.meta.state)
+        };
+        if let Some(state) = ended {
+            match freezer.thaw(&leaf) {
+                Ok(()) | Err(FreezeError::Gone) => {}
+                Err(err) => {
+                    warn!(job_id = %id, "job.suspend: job ended while being frozen; undo thaw failed");
+                    debug!(job_id = %id, error = %err, "job.suspend: undo thaw failed");
+                }
+            }
+            return Err(JobError::NotSuspendable {
+                job: id.to_string(),
+                state,
+            });
+        }
+        entry.bump();
+        info!(job_id = %id, "job suspended (cgroup frozen)");
+        let frozen = freezer.is_frozen(&leaf).ok();
+        Ok(suspend_outcome(
+            &entry,
+            SuspendTransition::Suspended,
+            frozen,
+        ))
+    }
+
+    /// `job.suspend` auf einen schon angehaltenen Job: schreibt
+    /// `cgroup.freeze` = 1 erneut (idempotent; ein außerhalb von harw
+    /// aufgehobener Freeze gilt danach wieder) und meldet die Kernel-Sicht.
+    /// Ohne Freezer oder bewiesene cgroup bleibt nur der Vermerk
+    /// (`frozen` = `None`).
+    ///
+    /// # Errors
+    /// [`JobError::Freeze`], wenn das erneute Einfrieren scheitert.
+    fn reassert_suspension(
+        &self,
+        id: &JobId,
+        entry: &JobEntry,
+    ) -> Result<SuspendOutcome, JobError> {
+        let frozen = match self.freeze_target(entry) {
+            Ok((freezer, leaf)) => {
+                if matches!(freezer.freeze_requested(&leaf), Ok(false)) {
+                    info!(job_id = %id, "job.suspend: freeze was lifted outside harw; frozen again");
+                }
+                freezer.freeze(&leaf).map_err(freeze_error(id, "freeze"))?;
+                freezer.is_frozen(&leaf).ok()
+            }
+            Err(JobError::SuspendUnavailable | JobError::NoJobCgroup(_)) => None,
+            Err(other) => return Err(other),
+        };
+        Ok(suspend_outcome(
+            entry,
+            SuspendTransition::AlreadySuspended,
+            frozen,
+        ))
+    }
+
+    /// Setzt einen angehaltenen Job fort (`job.resume`, PL-100 WP 3.5):
+    /// taut seine eigene cgroup auf (`cgroup.freeze` = 0).
+    ///
+    /// # Description
+    /// - Besitz und Ziel wie [`JobManager::suspend`].
+    /// - Angehalten heißt [`JobState::Suspended`] (wird wieder
+    ///   [`JobState::Running`]) oder ein abgelöster Job mit `suspended_at`
+    ///   (angehalten abgelöst bzw. aus einer früheren Sitzung; bleibt
+    ///   [`JobState::Detached`]).
+    /// - Idempotent: ein nicht angehaltener Job ergibt
+    ///   [`SuspendTransition::NotSuspended`] ohne Schreibzugriff. Ist seine
+    ///   bewiesene cgroup trotzdem eingefroren (ein Freeze, den harw nicht
+    ///   vermerkt hat), wird nichts aufgetaut:
+    ///   [`JobError::FrozenElsewhere`].
+    /// - Wanduhr: die Haltezeit wird in `suspended_secs` gebucht; das
+    ///   restliche Budget läuft vom Stand vor dem Anhalten weiter.
+    ///
+    /// # Errors
+    /// [`JobError::NotFound`], [`JobError::SuspendUnavailable`],
+    /// [`JobError::NoJobCgroup`], [`JobError::FrozenElsewhere`],
+    /// [`JobError::Freeze`].
+    ///
+    /// # Concurrency
+    /// Wie [`JobManager::suspend`]. Aufgetaut wird vor dem Vermerk: ein
+    /// Absturz dazwischen lässt den Vermerk stehen, ein weiteres
+    /// `job.resume` taut (wirkungslos) erneut auf und schließt ihn.
+    pub fn resume(&self, id: &JobId, caller: Caller<'_>) -> Result<SuspendOutcome, JobError> {
+        let entry = self.entry(id, caller)?;
+        let _serial = lock(&self.suspend_ops);
+        refresh_foreign(&entry);
+        let (suspended, terminal) = {
+            let guard = lock(&entry.state);
+            (guard.meta.is_suspended(), guard.meta.state.is_terminal())
+        };
+        if !suspended {
+            // Not harw's suspension: a freeze someone else holds is
+            // reported, never lifted.
+            let target = (!terminal)
+                .then(|| self.freeze_target(&entry).ok())
+                .flatten();
+            let frozen = match target {
+                Some((freezer, leaf)) => match probe_held(freezer.as_ref(), &leaf) {
+                    Ok(true) => {
+                        warn!(job_id = %id, "job.resume refused: the job cgroup is frozen outside harw");
+                        return Err(JobError::FrozenElsewhere(id.to_string()));
+                    }
+                    Ok(false) => Some(false),
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            return Ok(suspend_outcome(
+                &entry,
+                SuspendTransition::NotSuspended,
+                frozen,
+            ));
+        }
+        let (freezer, leaf) = self.freeze_target(&entry)?;
+        freezer.thaw(&leaf).map_err(freeze_error(id, "thaw"))?;
+        let transition = if close_suspension(&entry) {
+            SuspendTransition::Resumed
+        } else {
+            SuspendTransition::NotSuspended
+        };
+        if transition.changed() {
+            entry.persist();
+            entry.bump();
+            info!(job_id = %id, "job resumed (cgroup thawed)");
+        }
+        let frozen = freezer.is_frozen(&leaf).ok();
+        Ok(suspend_outcome(&entry, transition, frozen))
+    }
+
+    /// Stoppt `entry` (siehe [`JobManager::stop`]) und liefert das Signal,
+    /// mit dem der Stop begann: für einen angehaltenen Job SIGKILL statt
+    /// `requested` — er wird nie aufgetaut, damit ein zur Eindämmung
+    /// angehaltener Job (A1) keinen Augenblick mehr läuft; SIGKILL beendet
+    /// auch eingefrorene Prozesse (cgroup v2). Die Job-Runtime räumt die
+    /// cgroup danach ab (`cgroup.kill`, `rmdir`).
+    async fn stop_entry(&self, entry: &Arc<JobEntry>, requested: JobSignal) -> JobSignal {
+        let (signal, job_id) = {
+            let guard = lock(&entry.state);
+            (
+                stop_signal_for(&guard.meta, requested),
+                guard.meta.job_id.clone(),
+            )
+        };
+        if signal != requested {
+            info!(
+                job_id = %job_id,
+                requested = requested.name(),
+                "job stop: suspended job is killed while frozen (no thaw)"
+            );
+        }
+        self.deliver_stop(entry, signal).await;
+        signal
+    }
+
+    /// Sendet `signal` an die Gruppe von `entry`, wartet die Gnadenfrist ab
+    /// und eskaliert zu SIGKILL (Kern von [`JobManager::stop`]).
+    async fn deliver_stop(&self, entry: &Arc<JobEntry>, signal: JobSignal) {
         let (meta, monitored) = {
             let state = lock(&entry.state);
             (state.meta.clone(), state.monitored)
@@ -1396,7 +1869,9 @@ impl JobManager {
                 } else {
                     JobState::Unknown
                 };
-                state.meta.ended_at = Some(Timestamp::now());
+                let ended_at = Timestamp::now();
+                state.meta.ended_at = Some(ended_at);
+                state.meta.end_suspension(ended_at);
                 state.milestones += 1;
             }
             entry.persist();
@@ -1493,7 +1968,10 @@ impl JobManager {
     /// Löst alle laufenden Jobs von dieser Sitzung (harw beendet sich, die
     /// Nutzerin wählte „weiterlaufen lassen"). Host-Jobs laufen weiter und
     /// sind nach dem nächsten Start über `meta.json` sichtbar; Sandbox-Jobs
-    /// enden trotzdem mit harw (`bwrap --die-with-parent`).
+    /// enden trotzdem mit harw (`bwrap --die-with-parent`). Ein angehaltener
+    /// Job bleibt eingefroren (`suspended_at` bleibt stehen, `meta.json`
+    /// sagt `detached`); der nächste Start meldet das dem Besitzer,
+    /// `job.resume` taut ihn auf.
     pub fn detach_all(&self) -> DetachSummary {
         let entries: Vec<Arc<JobEntry>> = lock(&self.jobs).values().cloned().collect();
         let mut summary = DetachSummary::default();
@@ -1550,6 +2028,49 @@ impl JobManager {
         }
         count
     }
+
+    /// Test seam: registers `meta` as a job without a process of this
+    /// session (no pidfd, no monitor task) and writes its `meta.json`.
+    ///
+    /// # Errors
+    /// [`JobError::Io`] if the job directory cannot be created.
+    #[cfg(test)]
+    pub(crate) fn insert_test_job(
+        &self,
+        meta: JobMeta,
+        monitored: bool,
+    ) -> Result<JobId, JobError> {
+        let dir = self.config.jobs_dir().join(meta.job_id.as_str());
+        fs::create_dir_all(&dir).map_err(io_err("create test job directory"))?;
+        let id = meta.job_id.clone();
+        let entry = Arc::new(JobEntry::new(dir, meta, monitored, None));
+        entry.persist();
+        lock(&self.jobs).insert(id.clone(), entry);
+        Ok(id)
+    }
+
+    /// Test seam: like [`JobManager::insert_test_job`], with our own,
+    /// not yet reaped child `leader_pid` adopted as the group leader
+    /// (pidfd), as for a job this session started and then detached.
+    ///
+    /// # Errors
+    /// [`JobError::Io`] if the job directory cannot be created.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn insert_test_job_led(
+        &self,
+        meta: JobMeta,
+        monitored: bool,
+        leader_pid: u32,
+    ) -> Result<JobId, JobError> {
+        let dir = self.config.jobs_dir().join(meta.job_id.as_str());
+        fs::create_dir_all(&dir).map_err(io_err("create test job directory"))?;
+        let id = meta.job_id.clone();
+        let (leader, _identity) = OwnLeader::adopt(leader_pid);
+        let entry = Arc::new(JobEntry::new(dir, meta, monitored, Some(leader)));
+        entry.persist();
+        lock(&self.jobs).insert(id.clone(), entry);
+        Ok(id)
+    }
 }
 
 /// Aktualisiert einen nicht beaufsichtigten, als laufend geführten Job.
@@ -1567,6 +2088,8 @@ fn refresh_foreign(entry: &Arc<JobEntry>) {
             false
         } else {
             state.meta.state = JobState::Unknown;
+            // The process is gone: an open suspension ends here.
+            state.meta.end_suspension(Timestamp::now());
             state.milestones += 1;
             true
         }
@@ -1589,6 +2112,105 @@ async fn wait_terminal(entry: &Arc<JobEntry>, limit: Duration) -> bool {
             Ok(Ok(())) => {}
             Ok(Err(_)) | Err(_) => return entry.state().is_terminal(),
         }
+    }
+}
+
+/// Schließt das Anhalten von `entry` nach dem Auftauen ab: Haltezeit
+/// buchen, [`JobState::Suspended`] wird wieder [`JobState::Running`] (ein
+/// abgelöster Job bleibt [`JobState::Detached`]).
+///
+/// # Returns
+/// Ob der Job angehalten war.
+fn close_suspension(entry: &JobEntry) -> bool {
+    let mut guard = lock(&entry.state);
+    if !guard.meta.is_suspended() {
+        return false;
+    }
+    guard.meta.end_suspension(Timestamp::now());
+    if guard.meta.state == JobState::Suspended {
+        guard.meta.state = JobState::Running;
+    }
+    true
+}
+
+/// Nimmt den Vermerk eines Anhaltens zurück, dessen Einfrieren scheiterte
+/// (nur den bei `marked_at` gesetzten; ein inzwischen beendeter Job hat ihn
+/// schon selbst geschlossen).
+fn rollback_suspension(entry: &JobEntry, marked_at: Timestamp) {
+    let mut guard = lock(&entry.state);
+    if guard.meta.suspended_at == Some(marked_at) {
+        guard.meta.suspended_at = None;
+        if guard.meta.state == JobState::Suspended {
+            guard.meta.state = JobState::Running;
+        }
+    }
+}
+
+/// Ob `job.suspend` einen Job in diesem Zustand anhalten darf: nur einen
+/// laufenden, beaufsichtigten Job ohne laufenden Stop.
+///
+/// # Errors
+/// [`JobError::NotSuspendable`], [`JobError::StopPending`].
+fn check_suspendable(
+    id: &JobId,
+    state: JobState,
+    monitored: bool,
+    stop_requested: bool,
+) -> Result<(), JobError> {
+    if !monitored || state != JobState::Running {
+        return Err(JobError::NotSuspendable {
+            job: id.to_string(),
+            state,
+        });
+    }
+    if stop_requested {
+        return Err(JobError::StopPending(id.to_string()));
+    }
+    Ok(())
+}
+
+/// Ob `leaf` von einem Freeze gehalten wird: angefordert (`cgroup.freeze`,
+/// auch solange er noch einfriert) oder laut Kernel eingefroren (auch über
+/// eine Vorfahren-cgroup).
+///
+/// # Errors
+/// Der erste Fehler der beiden Prüfungen.
+fn probe_held(freezer: &dyn JobFreezer, leaf: &str) -> Result<bool, FreezeError> {
+    Ok(freezer.freeze_requested(leaf)? || freezer.is_frozen(leaf)?)
+}
+
+/// Bildet einen [`FreezeError`] von `operation` auf `job` auf
+/// [`JobError::Freeze`] ab.
+fn freeze_error(id: &JobId, operation: &'static str) -> impl FnOnce(FreezeError) -> JobError {
+    let job = id.to_string();
+    move |source| JobError::Freeze {
+        job,
+        operation,
+        source,
+    }
+}
+
+/// Das Signal, mit dem ein Stop von `meta` beginnt: `requested`, für einen
+/// angehaltenen Job aber SIGKILL (er wird nie aufgetaut, PL-100 WP 3.5).
+fn stop_signal_for(meta: &JobMeta, requested: JobSignal) -> JobSignal {
+    if meta.is_suspended() {
+        JobSignal::Kill
+    } else {
+        requested
+    }
+}
+
+/// Baut das Ergebnis von `job.suspend`/`job.resume` mit dem aktuellen
+/// Zustand von `entry`.
+fn suspend_outcome(
+    entry: &JobEntry,
+    transition: SuspendTransition,
+    frozen: Option<bool>,
+) -> SuspendOutcome {
+    SuspendOutcome {
+        transition,
+        status: entry.status(),
+        frozen,
     }
 }
 
@@ -2188,7 +2810,11 @@ impl Monitor {
             state.meta.state = final_state;
             state.meta.exit_code = exit_code;
             state.meta.signal = signal;
-            state.meta.ended_at = Some(Timestamp::now());
+            let ended_at = Timestamp::now();
+            state.meta.ended_at = Some(ended_at);
+            // A job that ends while suspended (SIGKILL, runtime deadline)
+            // closes its suspension at its end.
+            state.meta.end_suspension(ended_at);
             state.meta.progress = run.tracker.snapshot().cloned();
             state.meta.stragglers_reaped = stragglers_reaped;
             state.milestones += 1;
@@ -2248,10 +2874,82 @@ impl Monitor {
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, target_os = "linux"))]
+mod suspend_tests;
+
 #[cfg(test)]
 mod error_display_tests {
-    use super::{JobError, PipedLineError};
+    use super::{FreezeError, JobError, JobState, PipedLineError, SuspendTransition};
     use std::error::Error as _;
+
+    /// PL-100 WP 3.5: messages and sources of the suspend errors, and the
+    /// names of the transitions.
+    #[test]
+    fn suspend_errors_and_transitions_are_stable() {
+        assert_eq!(
+            JobError::NotSuspendable {
+                job: "j1".to_owned(),
+                state: JobState::Stopped,
+            }
+            .to_string(),
+            "job `j1` cannot be suspended in state stopped; only running jobs of this session can"
+        );
+        assert_eq!(
+            JobError::NoJobCgroup("j1".to_owned()).to_string(),
+            "job `j1` has no own cgroup beneath the delegated cgroup root; it cannot be suspended or resumed"
+        );
+        assert_eq!(
+            JobError::SuspendUnavailable.to_string(),
+            "job suspension is not available: jobs have no delegated cgroup v2 root here"
+        );
+        let freeze = JobError::Freeze {
+            job: "j1".to_owned(),
+            operation: "freeze",
+            source: FreezeError::PermissionDenied,
+        };
+        assert_eq!(
+            freeze.to_string(),
+            "freeze of job `j1` failed: permission denied on the job cgroup"
+        );
+        assert!(freeze.source().is_some());
+        assert!(JobError::SuspendUnavailable.source().is_none());
+        assert_eq!(
+            JobError::FrozenElsewhere("j1".to_owned()).to_string(),
+            "job `j1` is frozen by someone other than harw (an operator, the Warden or a parent cgroup); harw neither takes over nor lifts that freeze"
+        );
+        assert_eq!(
+            JobError::StopPending("j1".to_owned()).to_string(),
+            "job `j1` is being stopped; it cannot be suspended"
+        );
+        assert_eq!(
+            JobError::Freeze {
+                job: "j1".to_owned(),
+                operation: "probe",
+                source: FreezeError::Gone,
+            }
+            .to_string(),
+            "probe of job `j1` failed: the job cgroup does not exist (any more)"
+        );
+
+        let names: Vec<(&str, bool)> = [
+            SuspendTransition::Suspended,
+            SuspendTransition::AlreadySuspended,
+            SuspendTransition::Resumed,
+            SuspendTransition::NotSuspended,
+        ]
+        .into_iter()
+        .map(|transition| (transition.as_str(), transition.changed()))
+        .collect();
+        assert_eq!(
+            names,
+            [
+                ("suspended", true),
+                ("already_suspended", false),
+                ("resumed", true),
+                ("not_suspended", false),
+            ]
+        );
+    }
 
     #[test]
     fn display_and_source_are_stable() {

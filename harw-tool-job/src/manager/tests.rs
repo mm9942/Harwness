@@ -731,6 +731,8 @@ fn previous_meta_with(
         origin_tool: None,
         owner_agent: None,
         origin: None,
+        suspended_at: None,
+        suspended_secs: 0,
     })
 }
 

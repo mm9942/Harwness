@@ -3,6 +3,23 @@
 //! [`JobEndReason`] (Endgrund) und [`JobStatus`] (Sicht für Werkzeuge und
 //! Oberfläche).
 //!
+//! # Anhalten (`job.suspend`, PL-100 WP 3.5)
+//! [`JobState::Suspended`] heißt: die eigene Job-cgroup ist eingefroren
+//! (`cgroup.freeze`), der Prozess lebt. [`JobMeta::suspended_at`] und
+//! [`JobMeta::suspended_secs`] buchen die Haltezeit; [`JobMeta::active_secs_at`]
+//! ist die Laufzeit ohne sie.
+//!
+//! **Wanduhr-Semantik (`wall_timeout`):** Haltezeit zählt nie gegen ein
+//! Wanduhr-Budget. Ein Budget zählt nur aktive Zeit
+//! ([`JobMeta::active_secs_at`]): sie steht still, solange der Job angehalten
+//! ist, ein angehaltener Job läuft also nie wegen der Wanduhr ab, und nach
+//! `job.resume` läuft das restliche Budget weiter. Prozess-Jobs haben selbst
+//! keine Wanduhr-Grenze; ihre einzige Grenze ist das CPU-Budget (rlimit aus
+//! `cpu_budget_secs`, Ende als SIGXCPU/[`JobEndReason::Timeout`]), und
+//! eingefrorene Prozesse verbrauchen keine CPU-Zeit. Die Frist, mit der der
+//! Job an die Job-Runtime geht, ist nur eine Rückfallgrenze von zehn Jahren
+//! (`manager::JOB_RUNTIME_DEADLINE`) und kennt keine Haltezeit.
+//!
 //! # Nebenläufigkeit
 //! Reine Werttypen, `Send + Sync`.
 
@@ -21,10 +38,17 @@ use std::path::PathBuf;
 ///   geschrieben, damit ältere harw-Versionen v2-Dateien lesen können.
 /// - Ohne Versionssprung (serde-Vorgabe) ergänzt:
 ///   [`JobMeta::stragglers_reaped`], [`JobMeta::log_truncated`],
-///   [`JobMeta::launch_warnings`], [`JobMeta::origin`] (W20-A) und
-///   [`JobProcessIdentity::dedicated_cgroup`] (PL-97 E4). Ältere
-///   Dateien laden mit `false` bzw. leer; ältere harw-Versionen ignorieren
-///   die Felder (`JobMeta` hat kein `deny_unknown_fields`).
+///   [`JobMeta::launch_warnings`], [`JobMeta::origin`] (W20-A),
+///   [`JobProcessIdentity::dedicated_cgroup`] (PL-97 E4) sowie
+///   [`JobMeta::suspended_at`] und [`JobMeta::suspended_secs`] (PL-100
+///   WP 3.5). Ältere Dateien laden mit `false` bzw. leer; ältere
+///   harw-Versionen ignorieren die Felder (`JobMeta` hat kein
+///   `deny_unknown_fields`).
+/// - Der Zustand `suspended` ([`JobState::Suspended`], PL-100 WP 3.5) steht
+///   nur in `meta.json`, solange eine Sitzung den Job angehalten hat
+///   (Ablösen schreibt `detached`). Eine ältere harw-Version kann einen
+///   solchen Eintrag nicht lesen und übergeht ihn; ein Versionssprung
+///   änderte daran nichts, weil ältere Versionen die Version nicht prüfen.
 ///
 /// Beide Versionen werden gelesen; [`JobMeta::process_identity`] liefert für
 /// v1 eine Identität ohne Programm und cgroup.
@@ -101,6 +125,10 @@ pub enum JobState {
     Queued,
     /// Läuft unter Aufsicht dieser harw-Sitzung.
     Running,
+    /// Von `job.suspend` angehalten (PL-100 WP 3.5): die eigene Job-cgroup
+    /// ist eingefroren (`cgroup.freeze`), der Prozess lebt weiter und wird
+    /// beaufsichtigt; `job.resume` taut sie wieder auf. Kein Endzustand.
+    Suspended,
     /// Mit Exit-Code 0 beendet.
     Succeeded,
     /// Mit Exit-Code ≠ 0 oder durch ein fremdes Signal beendet, oder der
@@ -127,12 +155,13 @@ impl JobState {
         )
     }
 
-    /// Kurzname (`running`, `succeeded`, …).
+    /// Kurzname (`running`, `suspended`, `succeeded`, …).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Suspended => "suspended",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
@@ -310,6 +339,31 @@ pub struct JobMeta {
         deserialize_with = "deserialize_origin_lenient"
     )]
     pub origin: Option<ManagedJobOrigin>,
+    /// PL-100 WP 3.5: Beginn des laufenden Anhaltens — `job.suspend` hat die
+    /// eigene Job-cgroup eingefroren. `None`, solange nichts eingefroren ist.
+    ///
+    /// Überlebt das Ablösen und einen Neustart von harw (der Prozess bleibt
+    /// im Kernel eingefroren, bis `job.resume` oder `job.stop` ihn auftaut);
+    /// nicht serialisiert, wenn ungesetzt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_at: Option<Timestamp>,
+    /// PL-100 WP 3.5: Summe abgeschlossener Haltezeiten in ganzen Sekunden
+    /// (ohne das laufende Anhalten, siehe [`JobMeta::suspended_secs_at`]).
+    /// Nicht serialisiert, solange `0`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub suspended_secs: u64,
+}
+
+/// `skip_serializing_if` für [`JobMeta::suspended_secs`] (serde übergibt
+/// das Feld per Referenz).
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Ganze Sekunden von `start` bis `end`; `0`, wenn `end` nicht nach `start`
+/// liegt (Uhrsprung).
+fn secs_between(start: Timestamp, end: Timestamp) -> u64 {
+    u64::try_from(end.as_second().saturating_sub(start.as_second())).unwrap_or(0)
 }
 
 /// Typed provenance of a managed job (W20-A): what started it.
@@ -475,6 +529,113 @@ impl JobMeta {
             (None, None) if self.state == JobState::Unknown => Some(JobEndReason::Unknown),
             (None, None) => None,
         }
+    }
+
+    /// Ob der Job gerade angehalten ist (PL-100 WP 3.5): Zustand
+    /// [`JobState::Suspended`] oder ein nicht beendeter Job mit
+    /// [`JobMeta::suspended_at`] (angehalten abgelöst bzw. aus einer früheren
+    /// Sitzung, dann [`JobState::Detached`]).
+    #[must_use]
+    pub fn is_suspended(&self) -> bool {
+        self.state == JobState::Suspended
+            || (self.suspended_at.is_some() && !self.state.is_terminal())
+    }
+
+    /// Haltezeit bis `now` in ganzen Sekunden: [`JobMeta::suspended_secs`]
+    /// plus das laufende Anhalten eines nicht beendeten Jobs.
+    #[must_use]
+    pub fn suspended_secs_at(&self, now: Timestamp) -> u64 {
+        let open = self
+            .suspended_at
+            .filter(|_| !self.state.is_terminal())
+            .map_or(0, |since| secs_between(since, now));
+        self.suspended_secs.saturating_add(open)
+    }
+
+    /// Aktive Laufzeit in ganzen Sekunden: vom Start bis `now` (bzw. bis zum
+    /// Ende) ohne Haltezeit.
+    ///
+    /// # Description
+    /// Das ist die Zeit, die ein Wanduhr-Budget zählt (Modul-Doku,
+    /// „Wanduhr-Semantik“): sie steht still, solange der Job angehalten ist,
+    /// und läuft nach `job.resume` vom alten Stand aus weiter.
+    ///
+    /// # Returns
+    /// `None`, solange der Prozess nicht gestartet ist, und für einen
+    /// [`JobState::Unknown`]-Job ohne bekanntes Ende (wie `runtime_secs` in
+    /// [`JobStatus`]: sein Ende ist nicht beobachtet).
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_tool_job::{JobMeta, JobState};
+    /// use jiff::Timestamp;
+    ///
+    /// # fn main() -> Result<(), String> {
+    /// let mut meta: JobMeta = serde_json::from_str(
+    ///     r#"{"version":2,"job_id":"job-1","name":"n","command":"c","state":"running",
+    ///         "harw_instance":"h","owner":{"session":"s"},
+    ///         "created_at":"2026-01-01T00:00:00Z","started_at":"2026-01-01T00:00:00Z",
+    ///         "notify_every_secs":60}"#,
+    /// )
+    /// .map_err(|err| err.to_string())?;
+    /// let at = |text: &str| text.parse::<Timestamp>().map_err(|err| err.to_string());
+    /// // Suspended after 10 s of work; one minute later still 10 s active.
+    /// meta.state = JobState::Suspended;
+    /// meta.suspended_at = Some(at("2026-01-01T00:00:10Z")?);
+    /// assert_eq!(meta.active_secs_at(at("2026-01-01T00:01:10Z")?), Some(10));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn active_secs_at(&self, now: Timestamp) -> Option<u64> {
+        let start = self.started_at?;
+        if self.state == JobState::Unknown && self.ended_at.is_none() {
+            return None;
+        }
+        let end = self.ended_at.unwrap_or(now);
+        Some(secs_between(start, end).saturating_sub(self.suspended_secs_at(end)))
+    }
+
+    /// Beginnt ein Anhalten bei `at` (ein bereits laufendes bleibt).
+    pub(crate) fn begin_suspension(&mut self, at: Timestamp) {
+        if self.suspended_at.is_none() {
+            self.suspended_at = Some(at);
+        }
+    }
+
+    /// Schließt ein laufendes Anhalten bei `at` ab und bucht es in
+    /// [`JobMeta::suspended_secs`].
+    ///
+    /// # Returns
+    /// Ob ein Anhalten lief.
+    pub(crate) fn end_suspension(&mut self, at: Timestamp) -> bool {
+        match self.suspended_at.take() {
+            Some(since) => {
+                self.suspended_secs = self.suspended_secs.saturating_add(secs_between(since, at));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The job's **dedicated** cgroup, proven by the runtime
+    /// ([`JobStatus::job_cgroup_path`] for the rules); the only cgroup
+    /// `job.suspend`/`job.resume` ever freeze or thaw.
+    ///
+    /// # Returns
+    /// `None` when the path is unknown, no proof is recorded, the proof
+    /// belongs to another job, or it does not match the path.
+    #[must_use]
+    pub fn job_cgroup_path(&self) -> Option<&str> {
+        let identity = self.identity.as_ref()?;
+        let proof = identity
+            .dedicated_cgroup
+            .as_ref()
+            .filter(|proof| proof.job_id.as_ref() == Some(&self.job_id))?;
+        identity
+            .cgroup_path
+            .as_deref()
+            .filter(|path| is_proven_job_cgroup(path, proof))
     }
 
     /// Die persistierte Identität des Gruppenführers: `identity` (v2), sonst
@@ -706,15 +867,7 @@ impl JobStatus {
     /// for another attempt).
     #[must_use]
     pub fn job_cgroup_path(&self) -> Option<&str> {
-        let identity = self.meta.identity.as_ref()?;
-        let proof = identity
-            .dedicated_cgroup
-            .as_ref()
-            .filter(|proof| proof.job_id.as_ref() == Some(&self.meta.job_id))?;
-        identity
-            .cgroup_path
-            .as_deref()
-            .filter(|path| is_proven_job_cgroup(path, proof))
+        self.meta.job_cgroup_path()
     }
 }
 
@@ -1149,6 +1302,7 @@ mod tests {
     fn test_state_terminal_classification() {
         assert!(!JobState::Queued.is_terminal());
         assert!(!JobState::Running.is_terminal());
+        assert!(!JobState::Suspended.is_terminal());
         assert!(!JobState::Detached.is_terminal());
         assert!(JobState::Succeeded.is_terminal());
         assert!(JobState::Failed.is_terminal());
@@ -1202,7 +1356,7 @@ mod tests {
             Option<&'static str>,
             Option<JobEndReason>,
         );
-        let table: [Row; 12] = [
+        let table: [Row; 13] = [
             (
                 JobState::Succeeded,
                 Some(0),
@@ -1269,6 +1423,7 @@ mod tests {
             ),
             (JobState::Failed, None, None, false, None, None),
             (JobState::Running, None, None, false, None, None),
+            (JobState::Suspended, None, None, false, None, None),
             (JobState::Detached, None, None, false, None, None),
             (JobState::Queued, Some(0), None, false, None, None),
         ];
@@ -1306,6 +1461,157 @@ mod tests {
         let json = serde_json::to_string(&JobEndReason::LaunchError).map_err(ctx("serialize"))?;
         assert_eq!(json, "\"launch-error\"");
         Ok(())
+    }
+
+    /// PL-100 WP 3.5: the `suspended` state has its short name, survives the
+    /// `meta.json` round trip and is not terminal.
+    #[test]
+    fn test_suspended_state_name_and_roundtrip() -> TestResult {
+        assert_eq!(JobState::Suspended.as_str(), "suspended");
+        assert_eq!(JobState::Suspended.to_string(), "suspended");
+        let json = serde_json::to_string(&JobState::Suspended).map_err(ctx("serialize"))?;
+        assert_eq!(json, "\"suspended\"");
+        let raw = v1_json("").replace(r#""state":"running""#, r#""state":"suspended""#);
+        let meta: JobMeta = serde_json::from_str(&raw).map_err(ctx("parse suspended"))?;
+        assert_eq!(meta.state, JobState::Suspended);
+        assert!(meta.is_suspended());
+        assert_eq!(meta.end_reason(), None);
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5: the suspension fields are additive — absent in older
+    /// records, not written while unset, and round-trip when set.
+    #[test]
+    fn test_suspension_fields_are_additive() -> TestResult {
+        let mut meta: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        assert_eq!(meta.suspended_at, None);
+        assert_eq!(meta.suspended_secs, 0);
+        assert!(!meta.is_suspended());
+        let plain = serde_json::to_string(&meta).map_err(ctx("serialize plain"))?;
+        assert!(!plain.contains("suspended"), "{plain}");
+
+        meta.state = JobState::Suspended;
+        meta.suspended_at = Some(at("2026-01-01T00:05:00Z")?);
+        meta.suspended_secs = 42;
+        let json = serde_json::to_string(&meta).map_err(ctx("serialize suspended"))?;
+        let back: JobMeta = serde_json::from_str(&json).map_err(ctx("parse back"))?;
+        assert_eq!(back, meta);
+        Ok(())
+    }
+
+    /// A detached job keeps its suspension (the kernel keeps the cgroup
+    /// frozen); a terminal one is never reported as suspended.
+    #[test]
+    fn test_is_suspended_follows_state_and_open_suspension() -> TestResult {
+        let mut meta: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        meta.suspended_at = Some(at("2026-01-01T00:00:00Z")?);
+        for (state, expected) in [
+            (JobState::Running, true),
+            (JobState::Suspended, true),
+            (JobState::Detached, true),
+            (JobState::Stopped, false),
+            (JobState::Unknown, false),
+            (JobState::Failed, false),
+        ] {
+            meta.state = state;
+            assert_eq!(meta.is_suspended(), expected, "{state}");
+        }
+        // The state alone marks a suspension even without a start time.
+        meta.suspended_at = None;
+        meta.state = JobState::Suspended;
+        assert!(meta.is_suspended());
+        Ok(())
+    }
+
+    /// Wall-clock semantics of a suspension (PL-100 WP 3.5): suspended time
+    /// is never active time. While suspended the active time (what a wall
+    /// budget counts) stands still; after the resume it continues from the
+    /// same value, and the end of a job closes an open suspension.
+    #[test]
+    fn test_wall_budget_is_paused_while_suspended() -> TestResult {
+        let mut meta: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        assert_eq!(meta.active_secs_at(at("2026-01-01T00:00:10Z")?), None);
+        meta.started_at = Some(at("2026-01-01T00:00:00Z")?);
+        assert_eq!(meta.active_secs_at(at("2026-01-01T00:00:10Z")?), Some(10));
+
+        // Suspended at 10 s: the active time stays at 10 s for a whole minute.
+        meta.state = JobState::Suspended;
+        meta.begin_suspension(at("2026-01-01T00:00:10Z")?);
+        for now in [
+            "2026-01-01T00:00:10Z",
+            "2026-01-01T00:00:40Z",
+            "2026-01-01T00:01:10Z",
+        ] {
+            assert_eq!(meta.active_secs_at(at(now)?), Some(10), "{now}");
+        }
+        assert_eq!(meta.suspended_secs_at(at("2026-01-01T00:01:10Z")?), 60);
+        // A second `begin` while suspended keeps the original start.
+        meta.begin_suspension(at("2026-01-01T00:00:50Z")?);
+        assert_eq!(meta.suspended_at, Some(at("2026-01-01T00:00:10Z")?));
+
+        // Resumed at 70 s: the remaining budget continues from 10 s.
+        meta.state = JobState::Running;
+        assert!(meta.end_suspension(at("2026-01-01T00:01:10Z")?));
+        assert!(!meta.end_suspension(at("2026-01-01T00:01:10Z")?));
+        assert_eq!(meta.suspended_secs, 60);
+        assert_eq!(meta.active_secs_at(at("2026-01-01T00:01:40Z")?), Some(40));
+
+        // Suspended again at 100 s and the job ends at 130 s while
+        // suspended: 30 more suspended seconds, active time stays 40 s.
+        meta.state = JobState::Suspended;
+        meta.begin_suspension(at("2026-01-01T00:01:40Z")?);
+        meta.state = JobState::Stopped;
+        meta.ended_at = Some(at("2026-01-01T00:02:10Z")?);
+        assert!(meta.end_suspension(at("2026-01-01T00:02:10Z")?));
+        assert_eq!(meta.suspended_secs, 90);
+        assert_eq!(meta.active_secs_at(at("2026-01-01T09:00:00Z")?), Some(40));
+
+        // A clock step backwards never makes time negative.
+        meta.begin_suspension(at("2026-01-01T00:03:00Z")?);
+        assert!(meta.end_suspension(at("2026-01-01T00:02:00Z")?));
+        assert_eq!(meta.suspended_secs, 90);
+        Ok(())
+    }
+
+    /// A job whose process vanished while suspended (`unknown`, no observed
+    /// end) has no active time that keeps growing: the suspension is closed
+    /// and booked, and the active time is unknown like `runtime_secs`.
+    #[test]
+    fn test_unknown_job_closes_its_suspension_and_has_no_active_time() -> TestResult {
+        let mut meta: JobMeta = serde_json::from_str(&v1_json("")).map_err(ctx("parse v1"))?;
+        meta.started_at = Some(at("2026-01-01T00:00:00Z")?);
+        meta.state = JobState::Suspended;
+        meta.begin_suspension(at("2026-01-01T00:00:10Z")?);
+        // What `refresh_foreign` / `reload` do when the process is gone.
+        meta.state = JobState::Unknown;
+        assert!(meta.end_suspension(at("2026-01-01T00:01:10Z")?));
+        assert_eq!(meta.suspended_at, None);
+        assert_eq!(meta.suspended_secs, 60);
+        assert!(!meta.is_suspended());
+        assert_eq!(meta.active_secs_at(at("2026-01-01T09:00:00Z")?), None);
+        assert_eq!(meta.suspended_secs_at(at("2026-01-01T09:00:00Z")?), 60);
+        // With an observed end the active time is known again.
+        meta.ended_at = Some(at("2026-01-01T00:02:10Z")?);
+        assert_eq!(meta.active_secs_at(at("2026-01-01T09:00:00Z")?), Some(70));
+        Ok(())
+    }
+
+    /// `JobMeta::job_cgroup_path` is the same proven value as the status
+    /// view and the only target of a freeze.
+    #[test]
+    fn test_meta_job_cgroup_path_matches_status_view() -> TestResult {
+        let path = "/harw.slice/harw-job-job-1-e1";
+        let proven = status_with_cgroup(path, Some(proof("job-1-e1", "/harw.slice")))?;
+        assert_eq!(proven.meta.job_cgroup_path(), Some(path));
+        assert_eq!(proven.meta.job_cgroup_path(), proven.job_cgroup_path());
+        let unproven = status_with_cgroup(path, None)?;
+        assert_eq!(unproven.meta.job_cgroup_path(), None);
+        Ok(())
+    }
+
+    /// Parses an RFC 3339 test timestamp.
+    fn at(text: &str) -> TestResult<Timestamp> {
+        text.parse().map_err(ctx("timestamp"))
     }
 
     #[test]

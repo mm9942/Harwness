@@ -234,3 +234,217 @@ pub(crate) fn install_host_port() {
         }
     });
 }
+
+/// Fake cgroup backend for `job.suspend` / `job.resume` tests (PL-100
+/// WP 3.5): records every freeze and thaw, keeps the requested
+/// (`cgroup.freeze`) and the kernel (`cgroup.events frozen`) state per
+/// cgroup, can deny both operations, and lets a test change the state
+/// "outside harw" (`FakeCgroup::set_outside`).
+#[cfg(target_os = "linux")]
+pub(crate) mod fake_cgroup {
+    use crate::freeze::{CgroupFreezer, JobFreezer};
+    use harw_job_linux::cgroup::{CgroupBackend, CgroupHandle, CgroupSpec, CgroupStats};
+    use harw_job_linux::{CgroupError, LinuxProcess};
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    /// One recorded call: `(operation, cgroup name)`.
+    pub(crate) type Call = (&'static str, String);
+
+    /// The fake backend.
+    #[derive(Debug, Default)]
+    pub(crate) struct FakeCgroup {
+        calls: Mutex<Vec<Call>>,
+        // Cgroups whose own `cgroup.freeze` is 1.
+        requested: Mutex<BTreeSet<String>>,
+        // Cgroups the kernel reports frozen (own or inherited freeze).
+        frozen: Mutex<BTreeSet<String>>,
+        deny: bool,
+    }
+
+    // Poison-tolerant lock (a failed test must not hide the next failure).
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // Error for every operation the job tool never uses.
+    fn unused(name: &str) -> CgroupError {
+        CgroupError::NotFound {
+            path: name.to_owned(),
+        }
+    }
+
+    impl FakeCgroup {
+        /// A backend whose `freeze` and `thaw` fail with `PermissionDenied`.
+        pub(crate) fn denying() -> Self {
+            Self {
+                deny: true,
+                ..Self::default()
+            }
+        }
+
+        /// All recorded freeze/thaw calls in order.
+        pub(crate) fn calls(&self) -> Vec<Call> {
+            lock(&self.calls).clone()
+        }
+
+        /// Changes the state of `name` as someone other than harw would
+        /// (an operator, the Warden, an ancestor freeze): `requested` is its
+        /// own `cgroup.freeze`, `frozen` the kernel view. Not recorded as a
+        /// call.
+        pub(crate) fn set_outside(&self, name: &str, requested: bool, frozen: bool) {
+            for (set, member) in [(&self.requested, requested), (&self.frozen, frozen)] {
+                let mut set = lock(set);
+                if member {
+                    set.insert(name.to_owned());
+                } else {
+                    set.remove(name);
+                }
+            }
+        }
+
+        // Records `operation` on `group` and applies it to both sets (the
+        // fake freezes at once).
+        fn apply(&self, operation: &'static str, group: &CgroupHandle) -> Result<(), CgroupError> {
+            lock(&self.calls).push((operation, group.name().to_owned()));
+            if self.deny {
+                return Err(CgroupError::PermissionDenied {
+                    path: group.name().to_owned(),
+                });
+            }
+            let freeze = operation == "freeze";
+            self.set_outside(group.name(), freeze, freeze);
+            Ok(())
+        }
+    }
+
+    impl CgroupBackend for FakeCgroup {
+        fn create(&self, spec: &CgroupSpec) -> Result<CgroupHandle, CgroupError> {
+            Err(unused(&spec.name))
+        }
+
+        fn reopen(&self, name: &str) -> Result<CgroupHandle, CgroupError> {
+            Ok(CgroupHandle::new(
+                name.to_owned(),
+                format!("/fake/{name}"),
+                None,
+            ))
+        }
+
+        fn attach(&self, group: &CgroupHandle, _process: &LinuxProcess) -> Result<(), CgroupError> {
+            Err(unused(group.name()))
+        }
+
+        fn attach_self(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(unused(group.name()))
+        }
+
+        fn freeze(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            self.apply("freeze", group)
+        }
+
+        fn thaw(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            self.apply("thaw", group)
+        }
+
+        fn is_frozen(&self, group: &CgroupHandle) -> Result<bool, CgroupError> {
+            Ok(lock(&self.frozen).contains(group.name()))
+        }
+
+        fn freeze_requested(&self, group: &CgroupHandle) -> Result<bool, CgroupError> {
+            Ok(lock(&self.requested).contains(group.name()))
+        }
+
+        fn kill(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(unused(group.name()))
+        }
+
+        fn stats(&self, group: &CgroupHandle) -> Result<CgroupStats, CgroupError> {
+            Err(unused(group.name()))
+        }
+
+        fn remove(&self, group: CgroupHandle) -> Result<(), CgroupError> {
+            Err(unused(group.name()))
+        }
+    }
+
+    /// The delegated root the fake freezer is rooted at.
+    pub(crate) const FAKE_ROOT: &str = "/harw.slice";
+
+    /// A [`CgroupFreezer`] over `fake` rooted at [`FAKE_ROOT`].
+    pub(crate) fn freezer(fake: &Arc<FakeCgroup>) -> Arc<dyn JobFreezer> {
+        Arc::new(CgroupFreezer::new(
+            Arc::clone(fake) as Arc<dyn CgroupBackend>,
+            FAKE_ROOT,
+        ))
+    }
+}
+
+/// Builds the `meta.json` of a stub job for suspend tests (PL-100 WP 3.5):
+/// `state`, owner `session` with `ancestors`, no process (`pid` unset), and
+/// — with `attempt` — a runtime-proven own cgroup
+/// `<FAKE_ROOT>/harw-job-<attempt>`.
+#[cfg(target_os = "linux")]
+pub(crate) fn stub_job_meta(
+    id: &str,
+    state: crate::model::JobState,
+    session: &str,
+    ancestors: &[&str],
+    attempt: Option<&str>,
+) -> TestResult<crate::model::JobMeta> {
+    use crate::model::{DedicatedCgroupProof, JobId, JobMeta, JobProcessIdentity};
+    let job_id = JobId::parse(id).ok_or(TestError::Missing("valid job id"))?;
+    let identity = attempt.map(|attempt| JobProcessIdentity {
+        start_ticks: 1,
+        executable: None,
+        cgroup_path: Some(format!("{}/harw-job-{attempt}", fake_cgroup::FAKE_ROOT)),
+        dedicated_cgroup: Some(DedicatedCgroupProof {
+            job_id: Some(job_id.clone()),
+            attempt_id: attempt.to_owned(),
+            delegated_root: fake_cgroup::FAKE_ROOT.to_owned(),
+        }),
+    });
+    let now = jiff::Timestamp::now();
+    Ok(JobMeta {
+        version: crate::model::META_VERSION,
+        job_id,
+        name: id.to_owned(),
+        command: "sleep 1000".to_owned(),
+        cwd: None,
+        env_keys: Vec::new(),
+        state,
+        pid: None,
+        proc_start_ticks: None,
+        identity,
+        executed_on_host: true,
+        harw_instance: "harw-test".to_owned(),
+        owner: JobOwner::new(
+            session,
+            ancestors
+                .iter()
+                .map(|ancestor| (*ancestor).to_owned())
+                .collect(),
+        ),
+        created_at: now,
+        started_at: Some(now),
+        ended_at: None,
+        exit_code: None,
+        signal: None,
+        stop_requested: false,
+        detached: false,
+        notify_every_secs: 0,
+        progress: None,
+        warnings: 0,
+        errors: 0,
+        launch_error: None,
+        stragglers_reaped: false,
+        log_truncated: false,
+        launch_warnings: Vec::new(),
+        origin_call_id: None,
+        origin_tool: None,
+        owner_agent: None,
+        origin: None,
+        suspended_at: None,
+        suspended_secs: 0,
+    })
+}
