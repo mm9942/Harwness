@@ -158,11 +158,19 @@
 //! ausschließlich von diesem einen Thread angefasst; kein zweiter Thread
 //! hält je eine Referenz darauf.
 //!
-//! # Regelauswertung nach jedem `freeze()` (Behebung von Bruch 1)
-//! [`poll_once`] ruft nach einem erfolgreichen [`Sentinel::freeze`]
-//! zusätzlich [`findings::report_findings`] auf das eingefrorene
-//! [`harw_dod_signals::SecurityEvidence`] auf — dieselbe injizierte `now`,
-//! kein zweiter Systemuhr-Zugriff. Vorher hing hinter `Sentinel`/
+//! # Regelauswertung je Zyklus über das Delta (Behebung von Bruch 1, PL-100 WP0.1)
+//! [`poll_once`] ruft nach `poll_all` und dem Entleeren der IPC-Inbox
+//! [`findings::RuleCycle::evaluate`] auf: das friert über
+//! [`harw_dod_sentinel::EvidenceBuffer::freeze_since`] nur die seit dem
+//! vorigen Zyklus angekommenen Einträge als
+//! [`harw_dod_signals::SecurityEvidence`] ein und übergibt sie an
+//! [`findings::report_findings`] — dieselbe injizierte `now`, kein zweiter
+//! Systemuhr-Zugriff. Der Ring bleibt Kontextspeicher ([`Sentinel::freeze`]
+//! liefert weiterhin seinen vollen Inhalt), aber jedes Ereignis läuft genau
+//! einmal durch die Regeln statt in jedem Zyklus erneut (Befund-Flut). Der
+//! erlaubte Netzbereich der Regeln stammt aus `egress_allow_cidrs` des
+//! aktiven Profils ([`findings::network_scope_from_profile`], WP0.3).
+//! Vorher hing hinter `Sentinel`/
 //! `EvidenceBuffer` kein Regelwerk: `harw_dod_rules::run_rules` hatte
 //! workspace-weit keinen Produktionsaufrufer, jede Fundstelle lag in der
 //! Definition selbst, einem Doctest oder einem `#[cfg(test)]`-Modul. Dieser
@@ -835,11 +843,28 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
 
     let mut resolver = cgroup_resolve::CgroupResolver::new(cli.cgroup_root.clone());
 
+    // PL-100 WP0.3: erlaubte Ziele aus dem aktiven Profil, nicht mehr leer.
+    // Gemeldet wird nur die Anzahl, nie die CIDRs selbst.
+    let network_scope = findings::network_scope_from_profile(settings.profile.as_ref());
+    if network_scope.is_empty() {
+        tracing::warn!(
+            "egress allowlist is empty: every observed egress flow is reported as \
+             outside the allowed network scope"
+        );
+    } else {
+        tracing::info!(
+            egress_allow_cidrs = network_scope.targets().count(),
+            "egress allowlist loaded into the rule network scope"
+        );
+    }
+    let mut rules = findings::RuleCycle::new(network_scope);
+
     if cli.once {
         poll_once(
             &mut sentinel,
             inbox.as_ref(),
             sink.as_ref(),
+            &mut rules,
             exporter.as_mut(),
             health.as_mut(),
             Some(&mut resolver),
@@ -852,6 +877,7 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
             &mut sentinel,
             inbox.as_ref(),
             sink.as_ref(),
+            &mut rules,
             exporter.as_mut(),
             health.as_mut(),
             Some(&mut resolver),
@@ -860,7 +886,7 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
     }
 }
 
-/// Führt genau eine Poll-Runde aus, loggt sie und friert den Puffer ein.
+/// Führt genau eine Poll-Runde aus, loggt sie und wertet ihr Delta aus.
 ///
 /// # Description
 /// `now` wird genau hier gelesen — dies ist der Kompositionswurzel-Ort, der
@@ -871,13 +897,13 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
 /// erreichen jetzt den Ringpuffer"): zuerst [`Sentinel::poll_all`], **dann**
 /// [`drain_external_events`] — ein zum Aufrufzeitpunkt in der Inbox
 /// wartendes Ereignis landet damit nach den Sensormessungen desselben
-/// Zyklus im Puffer, nicht davor. Beide Schritte laufen vor [`Sentinel::freeze`],
-/// sodass ein danach gezogener Beleg immer beide Quellen dieses Zyklus
-/// enthält. Erst nach einem erfolgreichen `freeze()` läuft
-/// [`findings::report_findings`] gegen das eingefrorene
-/// [`harw_dod_signals::SecurityEvidence`] — siehe Moduldoku, Abschnitt
-/// „Regelauswertung nach jedem `freeze()`", und [`findings`]-Moduldoku für
-/// die vollständige Begründung.
+/// Zyklus im Puffer, nicht davor. Beide Schritte laufen vor
+/// [`findings::RuleCycle::evaluate`], sodass das danach eingefrorene Delta
+/// immer beide Quellen dieses Zyklus enthält. `evaluate` friert nur die seit
+/// dem vorigen Zyklus angekommenen Einträge ein und lässt
+/// [`findings::report_findings`] darüber laufen — siehe Moduldoku, Abschnitt
+/// „Regelauswertung je Zyklus über das Delta", und [`findings`]-Moduldoku
+/// für die vollständige Begründung.
 ///
 /// # Arguments
 /// - `sentinel` (`&mut harw_dod_sentinel::Sentinel`): die Sammelstelle.
@@ -888,6 +914,9 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
 /// - `sink` (`&dyn harw_observe::TelemetrySink`): dasselbe Sink-Objekt, das
 ///   [`run`] beim Start geöffnet hat — der Ausgabeweg für gemeldete Befunde
 ///   (siehe [`findings`]-Moduldoku).
+/// - `rules` (`&mut findings::RuleCycle`): die über Zyklen gehaltene Marke
+///   der Delta-Auswertung samt erlaubtem Netzbereich; jeder Aufruf rückt sie
+///   vor.
 /// - `exporter` (`Option<&mut export::FindingsExporter>`): der optionale
 ///   JSON-Lines-Befundexport (`--findings-export`); `None` exportiert nichts.
 /// - `health` (`Option<&mut health_export::HealthExporter>`): the optional
@@ -902,6 +931,7 @@ fn poll_once(
     sentinel: &mut Sentinel,
     inbox: Option<&IpcInboxHandle>,
     sink: &dyn TelemetrySink,
+    rules: &mut findings::RuleCycle,
     exporter: Option<&mut export::FindingsExporter>,
     health: Option<&mut health_export::HealthExporter>,
     resolver: Option<&mut cgroup_resolve::CgroupResolver>,
@@ -923,23 +953,11 @@ fn poll_once(
 
     drain_external_events(sentinel, inbox, resolver);
 
-    match sentinel.freeze(now) {
-        Ok(evidence) => {
-            tracing::debug!(
-                samples = evidence.samples.len(),
-                events = evidence.events.len(),
-                "buffer frozen into evidence"
-            );
-            let reported = findings::report_findings(sink, &evidence, now, exporter);
-            tracing::debug!(
-                reported,
-                "security rules evaluated against this cycle's evidence"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to freeze buffer into evidence this round");
-        }
-    }
+    let reported = rules.evaluate(sentinel.buffer(), sink, now, exporter);
+    tracing::debug!(
+        reported,
+        "security rules evaluated against this cycle's evidence delta"
+    );
 
     if let (Some(health), Some(before)) = (health, before) {
         let after = sentinel.health_snapshot();
@@ -1247,6 +1265,61 @@ mod tests {
     // daraus eine echte Invariante: sie scheitert beim Übersetzen, wenn
     // jemand die Konstante auf null setzt.
     const _: () = assert!(TELEMETRY_MAX_BYTES > 0);
+
+    /// Eine Regelauswertung ab Zählerstand null mit leerem Netzbereich.
+    fn rule_cycle() -> findings::RuleCycle {
+        findings::RuleCycle::new(harw_authority::NetworkScope::empty())
+    }
+
+    /// Flut-Regressionstest über den echten Poll-Zyklus (PL-100 WP0.1): ein
+    /// Ereignis, das über viele Zyklen im Ring liegt, wird genau einmal
+    /// exportiert.
+    #[test]
+    fn test_poll_once_exports_a_ring_event_once_across_many_cycles() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        let host = harw_types::HostId::try_from_str("host-a").map_err(ctx("host id"))?;
+        let mut exporter = export::FindingsExporter::new(path, host);
+        let mut sentinel = Sentinel::new(
+            Vec::new(),
+            Arc::new(harw_observe::NullSink),
+            SentinelConfig::default(),
+        );
+        sentinel.record_external_event(harw_dod_signals::SecurityEvent {
+            sensor: harw_types::SensorId::from_str("probe-bpf-0"),
+            observed_at: Timestamp::UNIX_EPOCH,
+            actor: None,
+            kind: harw_dod_signals::EventKind::EgressFlow {
+                destination: "198.51.100.5".to_owned(),
+                port: 443,
+            },
+        });
+        let mut rules = rule_cycle();
+
+        for _ in 0..12 {
+            poll_once(
+                &mut sentinel,
+                None,
+                &harw_observe::NullSink,
+                &mut rules,
+                Some(&mut exporter),
+                None,
+                None,
+            );
+        }
+
+        assert_eq!(
+            sentinel.buffer().event_len(),
+            1,
+            "the ring keeps the event as context"
+        );
+        assert_eq!(
+            exporter.written(),
+            1,
+            "twelve cycles over the same ring export exactly one finding"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_run_rejects_a_home_override_pointing_at_a_file_not_a_directory() -> TestResult {
@@ -1624,6 +1697,7 @@ egress_allow_cidrs = []
                 &mut sentinel,
                 Some(&inbox),
                 &harw_observe::NullSink,
+                &mut rule_cycle(),
                 None,
                 None,
                 None,
@@ -1660,6 +1734,7 @@ egress_allow_cidrs = []
                         uid: 1000,
                         auid: None,
                         cgroup,
+                        process: None,
                     });
                     guard.push(ipc::ReceivedEvent {
                         event,
@@ -1677,6 +1752,7 @@ egress_allow_cidrs = []
                 &mut sentinel,
                 Some(&inbox),
                 &harw_observe::NullSink,
+                &mut rule_cycle(),
                 None,
                 None,
                 Some(&mut resolver),
@@ -1724,6 +1800,7 @@ egress_allow_cidrs = []
                 &mut sentinel,
                 Some(&inbox),
                 &harw_observe::NullSink,
+                &mut rule_cycle(),
                 None,
                 None,
                 None,
@@ -1780,6 +1857,7 @@ egress_allow_cidrs = []
                     &mut sentinel,
                     Some(&inbox),
                     &harw_observe::NullSink,
+                    &mut rule_cycle(),
                     None,
                     Some(&mut health),
                     None,
@@ -1819,6 +1897,7 @@ egress_allow_cidrs = []
                 &mut sentinel,
                 None,
                 &harw_observe::NullSink,
+                &mut rule_cycle(),
                 None,
                 None,
                 None,

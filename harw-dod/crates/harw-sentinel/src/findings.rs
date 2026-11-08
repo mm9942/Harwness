@@ -3,15 +3,30 @@
 //! AW2-19).
 //!
 //! # Wo im Zyklus die Regeln laufen
-//! [`report_findings`] wird von [`crate::poll_once`] aufgerufen, **nach**
-//! [`harw_dod_sentinel::Sentinel::freeze`] erfolgreich zurückgekehrt ist —
-//! also gegen genau das [`harw_dod_signals::SecurityEvidence`], das dieser
-//! Zyklus tatsächlich eingefroren hat, nicht gegen den noch veränderlichen
-//! Puffer. `now` ist dabei dasselbe `jiff::Timestamp`, das `poll_once` bereits
-//! für `poll_all`/`freeze` gelesen hat (`Timestamp::now()` läuft ausschließlich
-//! dort, an der einen Kompositionswurzel dieses Binaries) —
-//! [`run_rules_checked`] selbst liest nie die Systemuhr, siehe
-//! `harw_dod_rules::rule`-Moduldoku.
+//! [`crate::poll_once`] ruft je Zyklus [`RuleCycle::evaluate`] auf, nachdem
+//! `poll_all` und die IPC-Inbox den Puffer befüllt haben. `evaluate` friert
+//! über [`harw_dod_sentinel::EvidenceBuffer::freeze_since`] nur das **Delta**
+//! seit dem vorigen Zyklus ein und übergibt genau dieses
+//! [`harw_dod_signals::SecurityEvidence`] an [`report_findings`] — nicht den
+//! noch veränderlichen Puffer und nicht den ganzen Ring. `now` ist dabei
+//! dasselbe `jiff::Timestamp`, das `poll_once` bereits für `poll_all` gelesen
+//! hat (`Timestamp::now()` läuft ausschließlich dort, an der einen
+//! Kompositionswurzel dieses Binaries) — [`run_rules_checked`] selbst liest
+//! nie die Systemuhr, siehe `harw_dod_rules::rule`-Moduldoku.
+//!
+//! # Delta-Auswertung statt Befund-Flut (PL-100 WP0.1)
+//! Der Ring ([`harw_dod_sentinel::EvidenceBuffer`]) wird nie geleert; er ist
+//! der Kontextspeicher, dessen vollen Inhalt `freeze()` weiterhin liefert.
+//! Früher lief jeder Zyklus über den ganzen Ring, und jedes Ereignis wurde
+//! so lange in jedem Zyklus erneut zu einem Befund mit neuer `FindingId`,
+//! wie es im Ring lag. [`RuleCycle`] hält stattdessen die
+//! [`harw_dod_sentinel::BufferMark`] des vorigen Zyklus: jedes Ereignis und
+//! jedes Sample läuft genau einmal durch die Regeln, egal wie viele Zyklen
+//! der Ring es noch hält. Verdrängt der Ring Einträge, bevor sie ausgewertet
+//! wurden (mehr Ankünfte in einem Zyklus, als er fasst), meldet `evaluate`
+//! deren Anzahl per `tracing::warn!` (nur Zähler, keine Inhalte), statt sie
+//! still zu verlieren. Die Attribution (siehe unten) läuft über dasselbe
+//! Delta.
 //!
 //! # Warum der Sentinel nichts durchsetzt
 //! Dieses Binary ist die **unprivilegierte** Sammelstelle (siehe
@@ -80,29 +95,33 @@
 //! Degradationsautomat in [`harw_dod_sentinel::Sentinel`] bleibt davon
 //! vollständig unberührt.
 //!
+//! # Der Netzbereich kommt aus der DoD-Konfiguration (PL-100 WP0.3)
+//! [`harw_dod_rules::rule::RuleContext::network_scope`] ist der aus
+//! `egress_allow_cidrs` des aktiven Profils der vertrauten
+//! Systemkonfiguration (`/etc/harw-dod/config.toml`) gebaute
+//! [`harw_authority::NetworkScope`] ([`network_scope_from_profile`]: je CIDR
+//! ein [`harw_authority::EgressTarget::Cidr`]). Nur wenn kein Profil geladen
+//! ist oder die Liste leer ist, bleibt er [`harw_authority::NetworkScope::empty`]
+//! — dann liegt jedes beobachtete Ziel außerhalb des erlaubten Bereichs, und
+//! [`harw_dod_rules::EgressFlowRule`] meldet jeden ausgehenden Fluss, den die
+//! BPF-Sonde (`EventKind::EgressFlow`) über die IPC-Inbox liefert. `run`
+//! warnt beim Start deutlich, wenn die Liste leer ist.
+//!
 //! # Was dieser Kontext (noch) nicht befüllt
-//! [`harw_dod_rules::rule::RuleContext::network_scope`] ist
-//! [`harw_authority::NetworkScope::empty`] — dieses Binary hat heute keine
-//! `--flag`, die einen erlaubten Netzbereich konfiguriert, also gibt es
-//! keinen ehrlichen Wert außer „leer" zu injizieren.
 //! [`harw_dod_rules::rule::RuleContext::baselines`] ist ein leerer Schnitt
 //! — dieses Binary hält keine Verbindung zu `harw-knowledge`s Baseline-Palast.
-//! Beide Lücken bedeuten praktisch: [`harw_dod_rules::EgressFlowRule`] löst
-//! nie aus (jedes Ziel gilt als außerhalb eines leeren Bereichs, aber kein
-//! hier registrierter Sensor emittiert derzeit `EventKind::EgressFlow`, siehe
-//! `sensors`-Moduldoku), [`harw_dod_rules::BaselineDeviationRule`] löst nie
-//! aus (keine Baseline, gegen die abgewichen werden könnte). Nur
-//! [`harw_dod_rules::StructureDriftRule`] arbeitet mit den tatsächlich
-//! registrierten Sensoren (`harw-dod-workspace`, `harw-dod-scanreport`)
-//! produktiv — und zwar ausschließlich über deren
-//! `EventKind::StructureDrift`-Ereignisse; ihr Sample-Zweig („neue Metrik
-//! ohne Baseline") schweigt ohne jede Baseline bewusst. Das ist keine stille Lücke: beide Felder sind oben benannt,
-//! zusammen mit der Konsequenz.
+//! [`harw_dod_rules::BaselineDeviationRule`] löst deshalb nie aus (keine
+//! Baseline, gegen die abgewichen werden könnte), und der Sample-Zweig von
+//! [`harw_dod_rules::StructureDriftRule`] („neue Metrik ohne Baseline")
+//! schweigt bewusst; ihr Ereignis-Zweig arbeitet mit den registrierten
+//! Sensoren (`harw-dod-workspace`, `harw-dod-scanreport`) produktiv. Das ist
+//! keine stille Lücke: das Feld ist hier benannt, zusammen mit der
+//! Konsequenz.
 //!
 //! # Cgroup attribution of a finding (PL-97 E4)
 //! A `Finding<RuleChecked>` does not name the event it came from. The
 //! export's optional `scope` is therefore derived without touching the
-//! rule engine: the rules run once over the whole evidence (these findings
+//! rule engine: the rules run once over the cycle's delta evidence (these findings
 //! are the ones reported, unchanged), and once more per resolved cgroup
 //! over only the events whose actor carries that cgroup path (see
 //! `crate::cgroup_resolve`). A finding of the full run gets a scope only
@@ -126,9 +145,11 @@
 //! meldet nur
 //! — sie bricht bei keiner Befundzahl ab.
 
-use harw_authority::NetworkScope;
+use harw_authority::{EgressTarget, NetworkScope};
+use harw_dod_config::ResolvedObservationProfile;
 use harw_dod_rules::rule::RuleContext;
 use harw_dod_rules::{FindingKind, run_rules, run_rules_checked};
+use harw_dod_sentinel::{BufferMark, EvidenceBuffer};
 use harw_dod_signals::{SecurityEvent, SecurityEvidence, Severity};
 use harw_observe::{FieldValue, MetricValue, TelemetrySink};
 use jiff::Timestamp;
@@ -166,13 +187,155 @@ const fn finding_kind_label(kind: FindingKind) -> &'static str {
     }
 }
 
+/// Baut den [`NetworkScope`] der Regeln aus dem aktiven DoD-Profil.
+///
+/// # Description
+/// Jeder Eintrag von `egress_allow_cidrs` wird ein
+/// [`EgressTarget::Cidr`] (PL-100 WP0.3); die Konfiguration hat die CIDRs
+/// bereits normalisiert und auf Duplikate geprüft. Ohne Profil (eingebaute
+/// Vorgaben, weil keine Systemkonfiguration existiert) oder mit leerer Liste
+/// ist das Ergebnis [`NetworkScope::empty`] — jedes beobachtete Ziel liegt
+/// dann außerhalb des erlaubten Bereichs (siehe Moduldoku).
+///
+/// # Arguments
+/// - `profile` (`Option<&ResolvedObservationProfile>`): das aufgelöste
+///   aktive Profil, falls eine Systemkonfiguration geladen wurde.
+///
+/// # Returns
+/// Den erlaubten Netzbereich für [`RuleContext::network_scope`].
+///
+/// # Examples
+/// ```rust,ignore
+/// let scope = network_scope_from_profile(None);
+/// assert!(scope.is_empty());
+/// ```
+#[must_use]
+pub fn network_scope_from_profile(profile: Option<&ResolvedObservationProfile>) -> NetworkScope {
+    profile.map_or_else(NetworkScope::empty, |profile| {
+        NetworkScope::from_targets(
+            profile
+                .egress_allow_cidrs()
+                .iter()
+                .copied()
+                .map(EgressTarget::Cidr),
+        )
+    })
+}
+
+/// Zustand der Regelauswertung über Poll-Zyklen hinweg.
+///
+/// # Description
+/// Hält die [`BufferMark`] des zuletzt ausgewerteten Zyklus und den
+/// konfigurierten [`NetworkScope`]. [`Self::evaluate`] wertet die Regeln nur
+/// über das seit dieser Marke angekommene Delta aus und rückt die Marke
+/// danach vor (siehe Moduldoku, Abschnitt „Delta-Auswertung statt
+/// Befund-Flut"). Eine neue Instanz beginnt bei [`BufferMark::START`] und
+/// wertet im ersten Zyklus alles aus, was der Ring dann hält (z. B. das vor
+/// dem ersten Zyklus nachgereichte Landlock-Ereignis).
+///
+/// # Concurrency
+/// Lebt ausschließlich im Sammelthread neben dem `Sentinel`; `&mut self`
+/// für jede Auswertung.
+///
+/// # Examples
+/// ```rust,ignore
+/// let mut rules = RuleCycle::new(NetworkScope::empty());
+/// let reported = rules.evaluate(sentinel.buffer(), &NullSink, now, None);
+/// ```
+#[derive(Debug)]
+pub struct RuleCycle {
+    /// Folgemarke des zuletzt ausgewerteten Deltas.
+    since: BufferMark,
+    /// Erlaubter Netzbereich für [`harw_dod_rules::EgressFlowRule`].
+    network_scope: NetworkScope,
+}
+
+impl RuleCycle {
+    /// Beginnt eine Auswertung bei [`BufferMark::START`].
+    ///
+    /// # Arguments
+    /// - `network_scope` (`NetworkScope`): der erlaubte Netzbereich, meist
+    ///   aus [`network_scope_from_profile`].
+    #[must_use]
+    pub fn new(network_scope: NetworkScope) -> Self {
+        Self {
+            since: BufferMark::START,
+            network_scope,
+        }
+    }
+
+    /// Wertet die Regeln über das Delta seit dem vorigen Aufruf aus und
+    /// meldet jeden Befund.
+    ///
+    /// # Description
+    /// Friert über [`EvidenceBuffer::freeze_since`] nur die seit der
+    /// gehaltenen Marke angekommenen Einträge ein, ruft [`report_findings`]
+    /// darauf auf und rückt die Marke auf den Zählerstand des Puffers vor.
+    /// Verdrängte, nie ausgewertete Einträge werden gezählt und per
+    /// `tracing::warn!` gemeldet (nur Zähler). Scheitert das Einfrieren
+    /// (praktisch unerreichbar, siehe `harw_dod_sentinel::error`), wird das
+    /// Delta mit einer Warnung übersprungen und die Marke trotzdem
+    /// vorgerückt: ein dauerhaft nicht kodierbarer Eintrag soll nicht jede
+    /// spätere Auswertung blockieren.
+    ///
+    /// # Arguments
+    /// - `buffer` (`&EvidenceBuffer`): der Puffer des `Sentinel`
+    ///   (`Sentinel::buffer`).
+    /// - `sink` (`&dyn TelemetrySink`): siehe [`report_findings`].
+    /// - `now` (`jiff::Timestamp`): die injizierte Zeit dieses Zyklus.
+    /// - `exporter` (`Option<&mut FindingsExporter>`): siehe
+    ///   [`report_findings`].
+    ///
+    /// # Returns
+    /// Die Anzahl in diesem Zyklus gemeldeter Befunde.
+    ///
+    /// # Concurrency
+    /// Siehe Typ-Doku.
+    pub fn evaluate(
+        &mut self,
+        buffer: &EvidenceBuffer,
+        sink: &dyn TelemetrySink,
+        now: Timestamp,
+        exporter: Option<&mut FindingsExporter>,
+    ) -> usize {
+        let since = self.since;
+        self.since = buffer.mark();
+        let delta = match buffer.freeze_since(since, now) {
+            Ok(delta) => delta,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    samples_skipped = buffer.samples_since(since).count(),
+                    events_skipped = buffer.events_since(since).count(),
+                    "failed to freeze this cycle's buffer delta; skipping it"
+                );
+                return 0;
+            }
+        };
+        if delta.samples_lost > 0 || delta.events_lost > 0 {
+            tracing::warn!(
+                samples_lost = delta.samples_lost,
+                events_lost = delta.events_lost,
+                "evidence ring evicted entries before the rules evaluated them"
+            );
+        }
+        tracing::debug!(
+            samples = delta.evidence.samples.len(),
+            events = delta.evidence.events.len(),
+            "buffer delta frozen into evidence"
+        );
+        report_findings(sink, &delta.evidence, now, &self.network_scope, exporter)
+    }
+}
+
 /// Wertet die drei Regeln dieses Knotens gegen ein eingefrorenes
 /// [`SecurityEvidence`] aus und meldet jeden zertifizierten Befund.
 ///
 /// # Description
-/// Baut einen [`RuleContext`] aus `evidence.samples`/`evidence.events`, einem
-/// leeren [`NetworkScope`] und einer leeren Baseline-Liste (siehe Moduldoku,
-/// Abschnitt „Was dieser Kontext (noch) nicht befüllt"), ruft
+/// Baut einen [`RuleContext`] aus `evidence.samples`/`evidence.events`, dem
+/// übergebenen `network_scope` und einer leeren Baseline-Liste (siehe
+/// Moduldoku, Abschnitte „Der Netzbereich kommt aus der DoD-Konfiguration"
+/// und „Was dieser Kontext (noch) nicht befüllt"), ruft
 /// [`run_rules_checked`] darauf auf und meldet jeden zurückgelieferten
 /// `Finding<RuleChecked>` über `tracing::warn!` (menschenlesbar, mit
 /// Zusammenfassung) und [`SECURITY_FINDING_TOTAL`] auf `sink` (maschinell
@@ -186,9 +349,12 @@ const fn finding_kind_label(kind: FindingKind) -> &'static str {
 ///   Binary bereits Sensor-Metriken schreibt (im Betrieb ein
 ///   [`harw_observe_file::FileSink`]).
 /// - `evidence` (`&SecurityEvidence`): der in diesem Zyklus eingefrorene
-///   Beleg, dessen `samples`/`events` gegen die Regeln laufen.
+///   Beleg (im Betrieb das Delta aus [`RuleCycle::evaluate`]), dessen
+///   `samples`/`events` gegen die Regeln laufen.
 /// - `now` (`jiff::Timestamp`): dieselbe injizierte Zeit, mit der `evidence`
 ///   eingefroren wurde — nie die Systemuhr dieser Funktion selbst.
+/// - `network_scope` (`&NetworkScope`): der erlaubte Netzbereich
+///   ([`network_scope_from_profile`]).
 /// - `exporter` (`Option<&mut crate::export::FindingsExporter>`): der
 ///   optionale JSON-Lines-Export (`--findings-export`); `None` schreibt
 ///   nichts. Ein Exportfehler wird dort gezählt und geloggt und ändert
@@ -213,27 +379,32 @@ const fn finding_kind_label(kind: FindingKind) -> &'static str {
 ///
 /// let evidence = SecurityEvidence::capture(vec![], vec![], Timestamp::UNIX_EPOCH)
 ///     .expect("empty events always encode");
-/// let reported =
-///     harw_sentinel::findings::report_findings(&NullSink, &evidence, Timestamp::UNIX_EPOCH, None);
+/// let reported = harw_sentinel::findings::report_findings(
+///     &NullSink,
+///     &evidence,
+///     Timestamp::UNIX_EPOCH,
+///     &harw_authority::NetworkScope::empty(),
+///     None,
+/// );
 /// assert_eq!(reported, 0);
 /// ```
 pub fn report_findings(
     sink: &dyn TelemetrySink,
     evidence: &SecurityEvidence,
     now: Timestamp,
+    network_scope: &NetworkScope,
     mut exporter: Option<&mut FindingsExporter>,
 ) -> usize {
-    let scope = NetworkScope::empty();
     let ctx = RuleContext {
         now,
         samples: &evidence.samples,
         events: &evidence.events,
         baselines: &[],
-        network_scope: &scope,
+        network_scope,
     };
 
     let findings = run_rules_checked(&ctx);
-    let scopes = attribute_scopes(&findings, &evidence.events, now, &scope);
+    let scopes = attribute_scopes(&findings, &evidence.events, now, network_scope);
 
     for (finding, finding_scope) in findings.iter().zip(&scopes) {
         tracing::warn!(
@@ -400,6 +571,7 @@ mod tests {
             &harw_observe::NullSink,
             &evidence,
             Timestamp::UNIX_EPOCH,
+            &NetworkScope::empty(),
             None,
         );
 
@@ -419,6 +591,7 @@ mod tests {
             &harw_observe::NullSink,
             &evidence,
             Timestamp::UNIX_EPOCH,
+            &NetworkScope::empty(),
             None,
         );
 
@@ -443,6 +616,7 @@ mod tests {
             &harw_observe::NullSink,
             &evidence,
             Timestamp::UNIX_EPOCH,
+            &NetworkScope::empty(),
             Some(&mut exporter),
         );
 
@@ -464,6 +638,7 @@ mod tests {
                 uid: 1000,
                 auid: None,
                 cgroup: cgroup.map(harw_types::CgroupId::from_str),
+                process: None,
             }),
             kind: EventKind::StructureDrift {
                 severity: DriftSeverity::Medium,
@@ -492,6 +667,7 @@ mod tests {
             &harw_observe::NullSink,
             &evidence,
             Timestamp::UNIX_EPOCH,
+            &NetworkScope::empty(),
             Some(&mut exporter),
         );
         assert_eq!(reported, 4);
@@ -581,6 +757,218 @@ mod tests {
             drift_in(Some(job), "same"),
         ])?;
         assert_eq!(scopes, vec![Some(job.to_owned()), Some(job.to_owned())]);
+        Ok(())
+    }
+
+    fn egress_event(destination: &str, port: u16) -> SecurityEvent {
+        SecurityEvent {
+            sensor: SensorId::from_str("probe-bpf-0"),
+            observed_at: Timestamp::UNIX_EPOCH,
+            actor: None,
+            kind: EventKind::EgressFlow {
+                destination: destination.to_owned(),
+                port,
+            },
+        }
+    }
+
+    fn profile_with_cidrs(cidrs: &str) -> TestResult<ResolvedObservationProfile> {
+        let config = harw_dod_config::Config::from_toml(&format!(
+            "schema_version = 1\nmode = \"observe\"\nactive_profile = \"host\"\n\n\
+             [profiles.host]\nscope = \"host\"\nsensors = [\"exec\", \"tcp-connect\"]\n\
+             egress_allow_cidrs = {cidrs}\n"
+        ))
+        .map_err(ctx("valid DoD config"))?;
+        config.resolve_active().map_err(ctx("active profile"))
+    }
+
+    fn checked_sum(total: usize, more: usize) -> TestResult<usize> {
+        total
+            .checked_add(more)
+            .ok_or(crate::test_support::TestError::Missing(
+                "finding count overflow",
+            ))
+    }
+
+    /// Flut-Regressionstest (PL-100 WP0.1, Tor I9): N Zyklen über einen
+    /// unveränderten Ring melden jedes auslösende Ereignis genau einmal.
+    #[test]
+    fn test_n_cycles_over_a_constant_ring_report_each_triggering_event_once() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        let host = harw_types::HostId::try_from_str("host-a").map_err(ctx("host id"))?;
+        let mut exporter = FindingsExporter::new(path.clone(), host);
+        let mut buffer = EvidenceBuffer::new(16, 16);
+        buffer.push_event(structure_drift_event());
+        buffer.push_event(egress_event("198.51.100.5", 443));
+        let mut rules = RuleCycle::new(NetworkScope::empty());
+
+        let mut reported = 0_usize;
+        for _ in 0..25 {
+            let cycle = rules.evaluate(
+                &buffer,
+                &harw_observe::NullSink,
+                Timestamp::UNIX_EPOCH,
+                Some(&mut exporter),
+            );
+            reported = checked_sum(reported, cycle)?;
+        }
+        assert_eq!(
+            reported, 2,
+            "one finding per triggering event, not per cycle"
+        );
+        assert_eq!(exporter.written(), 2);
+        assert_eq!(buffer.event_len(), 2, "the ring stays the context store");
+
+        // Ein neues Ereignis löst genau einen weiteren Befund aus.
+        buffer.push_event(egress_event("198.51.100.6", 8443));
+        for _ in 0..25 {
+            let cycle = rules.evaluate(
+                &buffer,
+                &harw_observe::NullSink,
+                Timestamp::UNIX_EPOCH,
+                Some(&mut exporter),
+            );
+            reported = checked_sum(reported, cycle)?;
+        }
+        assert_eq!(reported, 3);
+        let text = std::fs::read_to_string(&path).map_err(ctx("read export"))?;
+        assert_eq!(text.lines().count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rule_cycle_evaluates_events_evicted_from_view_only_once() {
+        // Mehr Ankünfte als Kapazität: nur die gehaltenen werden ausgewertet,
+        // und auch die nur einmal.
+        let mut buffer = EvidenceBuffer::new(2, 2);
+        let mut rules = RuleCycle::new(NetworkScope::empty());
+        for port in 1..=5 {
+            buffer.push_event(egress_event("198.51.100.5", port));
+        }
+        let first = rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            Timestamp::UNIX_EPOCH,
+            None,
+        );
+        let second = rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            Timestamp::UNIX_EPOCH,
+            None,
+        );
+        assert_eq!(first, 2);
+        assert_eq!(second, 0);
+    }
+
+    #[test]
+    fn test_attribution_runs_over_the_delta_only() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        let host = harw_types::HostId::try_from_str("host-a").map_err(ctx("host id"))?;
+        let mut exporter = FindingsExporter::new(path.clone(), host);
+        let job = "/sys/fs/cgroup/harw-job-1";
+        let mut buffer = EvidenceBuffer::new(16, 16);
+        buffer.push_event(drift_in(Some(job), "same"));
+        let mut rules = RuleCycle::new(NetworkScope::empty());
+        rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            Timestamp::UNIX_EPOCH,
+            Some(&mut exporter),
+        );
+        // Dieselbe Signatur aus einer anderen cgroup im nächsten Zyklus: über
+        // den ganzen Ring wäre sie mehrdeutig, über das Delta ist sie es nicht.
+        buffer.push_event(drift_in(Some("/sys/fs/cgroup/harw-job-2"), "same"));
+        rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            Timestamp::UNIX_EPOCH,
+            Some(&mut exporter),
+        );
+
+        let text = std::fs::read_to_string(&path).map_err(ctx("read export"))?;
+        let mut scopes = Vec::new();
+        for line in text.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).map_err(ctx("json line"))?;
+            scopes.push(
+                value
+                    .get("scope")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_owned),
+            );
+        }
+        assert_eq!(
+            scopes,
+            vec![
+                Some(job.to_owned()),
+                Some("/sys/fs/cgroup/harw-job-2".to_owned())
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_scope_without_profile_is_empty() {
+        assert!(network_scope_from_profile(None).is_empty());
+    }
+
+    #[test]
+    fn test_network_scope_with_an_empty_allowlist_stays_empty() -> TestResult {
+        let profile = profile_with_cidrs("[]")?;
+        assert!(network_scope_from_profile(Some(&profile)).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_scope_is_built_from_the_configured_cidrs() -> TestResult {
+        let profile = profile_with_cidrs(r#"["203.0.113.0/24", "2001:db8::/32"]"#)?;
+        let scope = network_scope_from_profile(Some(&profile));
+        assert_eq!(scope.targets().count(), 2);
+        let inside = "203.0.113.7"
+            .parse::<std::net::IpAddr>()
+            .map_err(ctx("ipv4 literal"))?;
+        let inside_v6 = "2001:db8::1"
+            .parse::<std::net::IpAddr>()
+            .map_err(ctx("ipv6 literal"))?;
+        let outside = "198.51.100.5"
+            .parse::<std::net::IpAddr>()
+            .map_err(ctx("ipv4 literal"))?;
+        assert!(scope.allows_addr(inside));
+        assert!(scope.allows_addr(inside_v6));
+        assert!(!scope.allows_addr(outside));
+        Ok(())
+    }
+
+    /// PL-100 WP0.3: ein Fluss in eine erlaubte CIDR erzeugt keinen Befund,
+    /// einer außerhalb genau einen.
+    #[test]
+    fn test_egress_into_an_allowed_cidr_yields_no_finding() -> TestResult {
+        let profile = profile_with_cidrs(r#"["203.0.113.0/24"]"#)?;
+        let mut buffer = EvidenceBuffer::new(8, 8);
+        buffer.push_event(egress_event("203.0.113.7", 443));
+        buffer.push_event(egress_event("203.0.113.200", 22));
+        let mut rules = RuleCycle::new(network_scope_from_profile(Some(&profile)));
+        let allowed = rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            Timestamp::UNIX_EPOCH,
+            None,
+        );
+        assert_eq!(
+            allowed, 0,
+            "flows into the configured allowlist are not findings"
+        );
+
+        buffer.push_event(egress_event("198.51.100.5", 443));
+        let outside = rules.evaluate(
+            &buffer,
+            &harw_observe::NullSink,
+            Timestamp::UNIX_EPOCH,
+            None,
+        );
+        assert_eq!(outside, 1);
         Ok(())
     }
 

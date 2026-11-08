@@ -108,6 +108,12 @@ layer = "F"
 # Reines Step-/TODO-Datenmodell (nur serde und serde_json), von harw-tui gelesen (h21).
 [packages."harw-step-list"]
 layer = "F"
+# PL-100 WP0.8: der eine Escaper für untrusted Text, ohne Abhängigkeiten.
+# Der Plan nennt ihn „Ring A" im Sinn der Architektur-Doku (§7, „Ring A —
+# foundations"); hier ist das die Schicht F, damit der Sentinel (D), der
+# lesende Client, harw-ops und harw-core (A) ihn nutzen dürfen.
+[packages."harw-untrusted-text"]
+layer = "F"
 
 # --- C: compiler domain ----------------------------------------------------
 [packages."harw-agent-dsl"]

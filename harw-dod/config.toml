@@ -8,4 +8,9 @@ active_profile = "host"
 [profiles.host]
 scope = "host"
 sensors = ["exec", "tcp-connect"]
+# Erlaubte ausgehende TCP-Ziele als CIDR. harw-sentinel bewertet jeden
+# beobachteten Fluss ausserhalb dieser Liste als Befund der Regel
+# `egress-flow`; eine leere Liste meldet jeden ausgehenden Fluss (und der
+# Sentinel warnt beim Start). Installiert nie Firewallregeln.
+# Beispiel: egress_allow_cidrs = ["192.0.2.0/24", "2001:db8::/32"]
 egress_allow_cidrs = []

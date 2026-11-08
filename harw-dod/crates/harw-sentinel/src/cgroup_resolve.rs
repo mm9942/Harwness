@@ -472,6 +472,7 @@ mod tests {
             uid: 1,
             auid: None,
             cgroup: Actor::raw_cgroup(inode(&job)?),
+            process: None,
         };
         resolve_actor_cgroup(&mut actor, Some(&mut resolver));
         assert_eq!(
@@ -484,6 +485,7 @@ mod tests {
             uid: 1,
             auid: None,
             cgroup: Actor::raw_cgroup(u64::MAX),
+            process: None,
         };
         resolve_actor_cgroup(&mut unknown, Some(&mut resolver));
         assert_eq!(unknown.cgroup, None);
@@ -492,6 +494,7 @@ mod tests {
             uid: 1,
             auid: None,
             cgroup: Some(CgroupId::from_str("/claimed/by/probe")),
+            process: None,
         };
         resolve_actor_cgroup(&mut claimed, Some(&mut resolver));
         assert_eq!(claimed.cgroup, None, "a probe-supplied path is not trusted");
@@ -500,6 +503,7 @@ mod tests {
             uid: 1,
             auid: None,
             cgroup: Actor::raw_cgroup(inode(&job)?),
+            process: None,
         };
         resolve_actor_cgroup(&mut no_resolver, None);
         assert_eq!(no_resolver.cgroup, None);

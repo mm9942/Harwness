@@ -382,20 +382,18 @@ async fn fetch(ctx: &OpContext) -> Result<Arc<DodSnapshot>, OpError> {
 
 // ── Bounded text helpers ────────────────────────────────────────────────────
 
-/// `text` without control characters, cut to [`MAX_FIELD_CHARS`] characters
-/// (`…` marks a cut).
+/// `text` made safe for a terminal or a model prompt and cut to at most
+/// [`MAX_FIELD_CHARS`] characters, the `…` that marks a cut included.
+///
+/// The one shared escaper of PL-100 WP0.8
+/// ([`harw_untrusted_text::escape`]): every control character (including
+/// the ESC/BEL of ANSI/OSC sequences and line breaks), bidi and other format
+/// character, separator, private-use character, tag character and variation
+/// selector becomes a visible `\u{xxxx}` escape that is never cut in half.
+/// Quotes and backslashes stay; the JSON encoder handles them.
 #[must_use]
 pub fn bounded(text: &str) -> String {
-    let clean: String = text
-        .chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect();
-    if clean.chars().count() <= MAX_FIELD_CHARS {
-        return clean;
-    }
-    let mut cut: String = clean.chars().take(MAX_FIELD_CHARS - 1).collect();
-    cut.push('…');
-    cut
+    harw_untrusted_text::escape(text, MAX_FIELD_CHARS)
 }
 
 fn bounded_path(path: &Path) -> String {
@@ -3018,11 +3016,35 @@ mod tests {
     }
 
     #[test]
-    fn dod_bounded_cuts_long_text_and_strips_control_characters() {
-        assert_eq!(bounded("a\u{1b}[31mb"), "a?[31mb");
+    fn dod_bounded_cuts_long_text_and_escapes_control_characters() {
+        assert_eq!(bounded("a\u{1b}[31mb"), "a\\u{001b}[31mb");
         let cut = bounded(&"é".repeat(MAX_FIELD_CHARS + 10));
         assert_eq!(cut.chars().count(), MAX_FIELD_CHARS);
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn dod_bounded_escapes_bidi_tags_and_line_breaks_with_the_shared_escaper() -> TestResult {
+        assert_eq!(
+            bounded("x\u{202E}y\u{E0041}z\nw\u{FE0F}"),
+            "x\\u{202e}y\\u{e0041}z\\u{000a}w\\u{fe0f}"
+        );
+        assert_eq!(
+            bounded("x\u{202E}y"),
+            harw_untrusted_text::escape("x\u{202E}y", MAX_FIELD_CHARS)
+        );
+        // Quotes and backslashes are visible and stay for the JSON encoder.
+        assert_eq!(bounded(r#"{"k":"v\\"}"#), r#"{"k":"v\\"}"#);
+        // A run of escapes is cut between escapes, within the cap.
+        let cut = bounded(&"\u{202E}".repeat(MAX_FIELD_CHARS));
+        assert!(cut.chars().count() <= MAX_FIELD_CHARS);
+        assert!(cut.ends_with('…'));
+        assert!(!cut.contains('\u{202E}'));
+        let body = cut
+            .strip_suffix('…')
+            .ok_or(TestError::Missing("cut marker"))?;
+        assert_eq!(body.len().checked_rem("\\u{202e}".len()), Some(0));
+        Ok(())
     }
 
     // ── PL-97 E4: job filter and attention scopes ──────────────────────────

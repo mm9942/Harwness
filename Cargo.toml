@@ -43,6 +43,9 @@ members = [
     "harw-catalog",
     # PL-97 D2: read-only Harw-DoD client (export paths, findings/health, config, units, status).
     "harw-dod-client",
+    # PL-100 WP0.8: the one escaper for untrusted text (Cc/Cf/Zl/Zp/Co, tag block, bidi,
+    # variation selectors); foundation crate without dependencies.
+    "harw-untrusted-text",
     # PL-97 M1: semantic activity vocabulary and deterministic pattern reducer (PL-71).
     "harw-activity",
     "harw-core",
