@@ -422,6 +422,10 @@ pub struct IpcInbox {
     /// Verbindungen, die seit dem Start wegen einer uid außerhalb der
     /// [`PeerAllowlist`] geschlossen wurden (PL-100 WP0.5).
     rejected: u64,
+    /// Stand von [`Self::dropped`] beim letzten
+    /// [`Self::take_newly_dropped`], damit jede Verdrängung genau einmal
+    /// gemeldet wird.
+    dropped_reported: u64,
 }
 
 impl IpcInbox {
@@ -442,6 +446,7 @@ impl IpcInbox {
             received: 0,
             connected: 0,
             rejected: 0,
+            dropped_reported: 0,
         }
     }
 
@@ -490,6 +495,23 @@ impl IpcInbox {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// Verdrängungen seit dem vorigen Aufruf (bzw. seit dem Start) und
+    /// merkt sich den aktuellen Stand.
+    ///
+    /// # Description
+    /// [`Self::dropped`] wächst monoton; der Entleerer meldet eine
+    /// Verdrängung auf `warn` nur einmal statt in jedem folgenden Zyklus
+    /// erneut.
+    ///
+    /// # Returns
+    /// `dropped - <Stand beim vorigen Aufruf>`; `0`, wenn seitdem nichts
+    /// verdrängt wurde.
+    pub fn take_newly_dropped(&mut self) -> u64 {
+        let newly = self.dropped.saturating_sub(self.dropped_reported);
+        self.dropped_reported = self.dropped;
+        newly
     }
 
     /// Total number of events received since start (every [`Self::push`],
@@ -857,6 +879,26 @@ mod tests {
         assert_eq!(inbox.dropped(), 2);
         let _ = inbox.drain();
         assert_eq!(inbox.received_total(), 3, "draining keeps the total");
+    }
+
+    #[test]
+    fn test_ipc_inbox_reports_each_eviction_once() {
+        let mut inbox = IpcInbox::new(1);
+        assert_eq!(inbox.take_newly_dropped(), 0);
+        for _ in 0..3 {
+            inbox.push(ReceivedEvent {
+                event: sample_event(),
+                peer: sample_peer(),
+            });
+        }
+        assert_eq!(inbox.take_newly_dropped(), 2);
+        assert_eq!(inbox.take_newly_dropped(), 0, "already reported");
+        inbox.push(ReceivedEvent {
+            event: sample_event(),
+            peer: sample_peer(),
+        });
+        assert_eq!(inbox.take_newly_dropped(), 1);
+        assert_eq!(inbox.dropped(), 3, "the total stays monotonic");
     }
 
     #[test]

@@ -1400,20 +1400,24 @@ fn drain_external_events(
                 poisoned.into_inner()
             }
         };
+        // Nur Verdrängungen seit dem vorigen Zyklus: `dropped()` wächst
+        // monoton, die Warnung unten soll je Verlust einmal kommen, nicht in
+        // jedem späteren Zyklus erneut.
+        let dropped = guard.take_newly_dropped();
         // Der häufigste Fall: nichts angekommen. Dann gar nicht erst
         // entleeren -- `drain()` legt sonst je Zyklus einen leeren `Vec` an.
-        if guard.is_empty() && guard.dropped() == 0 {
+        if guard.is_empty() && dropped == 0 {
             return cgroup_kids;
         }
-        // Auslastung und Verdrängung ablesen, solange die Sperre noch
-        // gehalten wird -- danach ist die Inbox leer und beides wäre weg.
+        // Auslastung ablesen, solange die Sperre noch gehalten wird --
+        // danach ist die Inbox leer.
         let held = guard.len();
         let capacity = guard.capacity();
-        let dropped = guard.dropped();
+        let dropped_total = guard.dropped();
         let drained = guard.drain();
-        (drained, held, capacity, dropped)
+        (drained, held, capacity, dropped, dropped_total)
     };
-    let (received, held, capacity, dropped) = received;
+    let (received, held, capacity, dropped, dropped_total) = received;
 
     if !received.is_empty() {
         tracing::debug!(
@@ -1428,6 +1432,7 @@ fn drain_external_events(
     if dropped > 0 {
         tracing::warn!(
             dropped,
+            dropped_total,
             capacity,
             "ipc inbox overflowed; observations from a privileged probe were lost"
         );

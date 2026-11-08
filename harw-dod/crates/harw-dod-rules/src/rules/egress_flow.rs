@@ -250,9 +250,16 @@ mod tests {
         let scope: NetworkScope = serde_json::from_str(r#"{"allow_hosts":["203.0.113.0/24"]}"#)
             .map_err(crate::test_support::ctx("NetworkScope liest ein Cidr-Ziel"))?;
         let inside = vec![event("::ffff:203.0.113.7", 443)];
-        assert!(EgressFlowRule.evaluate(&ctx_with(&inside, &scope)).is_empty());
+        assert!(
+            EgressFlowRule
+                .evaluate(&ctx_with(&inside, &scope))
+                .is_empty()
+        );
         let outside = vec![event("::ffff:198.51.100.5", 443)];
-        assert_eq!(EgressFlowRule.evaluate(&ctx_with(&outside, &scope)).len(), 1);
+        assert_eq!(
+            EgressFlowRule.evaluate(&ctx_with(&outside, &scope)).len(),
+            1
+        );
         Ok(())
     }
 
