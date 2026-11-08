@@ -214,6 +214,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
 
+      # PL-100 (Owner-Review 4505015322): Manifest-Schreiber und BTF-Stempel
+      # pruefen, ohne clang/bpftool/Rust (Shell-Fixtures mit Fake-Werkzeugen).
+      - name: BPF manifest writer and BTF stamp checks
+        run: make -C harw-dod/bpf check-manifest-writer check-btf-stamp
+
       # Die vier DoD-Binaries gemeinsam, wie `harw-dod/Makefile` (`build`) sie
       # baut — ohne Produkt-Binaries im selben Feature-Graphen.
       - name: Build DoD binaries (package-scoped)

@@ -63,8 +63,10 @@
 //! einlesen** ([`sensors::resolve_procmon_objects`],
 //! [`sensors::resolve_flow_objects`]: die Bytes liegen danach als
 //! `BpfProgramSource::Embedded` im Speicher) → **jedes eingelesene Objekt
-//! gegen das root-eigene SHA-256-Manifest prüfen**
-//! ([`bpf_manifest::verify_resolved_objects`], `--bpf-manifest`) → den Scope
+//! gegen das root-eigene SHA-256-Manifest prüfen und jedes gewählte, aber
+//! nicht auflösbare Objekt ablehnen**
+//! ([`bpf_manifest::verify_resolved_objects`], `--bpf-manifest`,
+//! [`bpf_manifest::ensure_objects_resolved`]) → den Scope
 //! des Profils auflösen ([`profile::resolve_scope`], liest den cgroup-Baum)
 //! → Landlock durchsetzen → laden und anheften. Das Objektverzeichnis
 //! (`--*-program-path`, `$HARW_DOD_BPF_DIR`, `/usr/local/lib/harw-dod/bpf`),
@@ -176,26 +178,38 @@
 //!   wird.
 //!
 //! Degradierung statt Prozessende, je Sensor unabhängig:
-//! - fehlt ein Objekt oder ist es ungültig (kein ELF, leer, zu groß),
-//!   registriert [`run`] einen [`sensors::UnavailableSensor`] mit der
-//!   Mängelliste;
 //! - scheitert das Laden mit `AttachCapabilitiesUnavailable`,
 //!   `CapabilityUnavailable` oder `InvalidProgramContract` (siehe
-//!   [`degrades_sensor`]), ebenfalls — ein Host ohne die nötigen
-//!   Fähigkeiten oder mit einem nicht vertragsgemäßen Objekt ist ein
-//!   dokumentierter Betriebsfall, den der Sentinel als `SensorDegraded`
-//!   sieht;
+//!   [`degrades_sensor`]), registriert [`run`] einen
+//!   [`sensors::UnavailableSensor`] — ein Host ohne die nötigen Fähigkeiten
+//!   oder mit einem nicht vertragsgemäßen Objekt ist ein dokumentierter
+//!   Betriebsfall, den der Sentinel als `SensorDegraded` sieht;
+//! - **nur im Entwicklungsmodus** `--dev-allow-missing-bpf` (verlangt
+//!   `--bpf-manifest`, steht nie in der systemd-Unit) ebenso ein gewählter
+//!   Sensor, dessen Objekt fehlt oder ungültig ist (kein ELF, leer, zu
+//!   groß), mit der Mängelliste ([`UnresolvedObjects::Degrade`]). Jedes
+//!   aufgelöste Objekt wird auch dann gegen das Manifest geprüft: ein
+//!   Teilbau (z. B. nur `exec.bpf.o`/`exit.bpf.o`) lädt seine vollständigen
+//!   Sensoren, aber nie ungeprüfte Bytes;
 //! - jeder andere Ladefehler beendet den Prozess; bereits geladene Griffe
 //!   werden vorher entladen.
 //!
 //! Ausdrücklich **keine** Degradierung, sondern Prozessende vor jedem
-//! Ladeschritt: ein vorhandenes Objekt, das die Manifestprüfung nicht
-//! besteht (kein `--bpf-manifest`, Manifest nicht root-eigen, schreibbar,
-//! ungültig oder ohne Eintrag, abweichender SHA-256-Digest;
-//! [`error::ProbeError::BpfObjectIntegrity`], PL-100 Phase 4, THREAT-MODEL
-//! B23). [`run`] meldet vorher jeden gewählten Sensor einmal als
-//! `SensorDegraded` ([`report_integrity_refusal`]); `main` endet mit dem
-//! eigenen Exit-Status [`EXIT_INTEGRITY_REFUSED`] (78, `EX_CONFIG`), den
+//! Ladeschritt ([`error::ProbeError::BpfObjectIntegrity`], PL-100 Phase 4,
+//! THREAT-MODEL B23, [`verify_selected_objects`]):
+//! - ein vorhandenes Objekt, das die Manifestprüfung nicht besteht (kein
+//!   `--bpf-manifest`, Manifest nicht root-eigen, schreibbar, ungültig oder
+//!   ohne Eintrag, abweichender SHA-256-Digest);
+//! - ein gesetztes `--bpf-manifest`, das fehlt, nicht vertrauenswürdig oder
+//!   ungültig ist, auch wenn kein einziges Objekt aufgelöst ist;
+//! - außerhalb des Entwicklungsmodus ein gewähltes Objekt, das sich nicht
+//!   auflösen lässt (entfernt, leer, gekürzt, kein ELF, unlesbar): es
+//!   liefert keine prüfbaren Bytes, und ein still degradierter Sensor ließe
+//!   die Unit aktiv, aber diese Erkennung blind (Owner-Review zu PR #168).
+//!
+//! [`run`] meldet vorher jeden gewählten Sensor einmal als `SensorDegraded`
+//! ([`report_integrity_refusal`]); `main` endet mit dem eigenen Exit-Status
+//! [`EXIT_INTEGRITY_REFUSED`] (78, `EX_CONFIG`), den
 //! `deploy/systemd/harw-probe-bpf.service` über `RestartPreventExitStatus=78`
 //! vom Neustart ausnimmt: eine Ablehnung ist dauerhaft, kein vorübergehender
 //! Absturz.
@@ -239,6 +253,7 @@ mod sink;
 #[cfg(test)]
 mod push_only_guard;
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -261,7 +276,7 @@ use collect::WireSource;
 use error::ProbeError;
 use profile::{ProbeScope, SensorSelection};
 use scope_rescan::{SCOPE_RESCAN_INTERVAL, ScopeRescan};
-use sensors::{ObjectUnavailable, ResolvedBpfObject, UnavailableSensor};
+use sensors::{ObjectUnavailable, ResolvedBpfObject, UnavailableSensor, UnresolvedPair};
 use sink::EventSink;
 
 /// Einstiegspunkt.
@@ -293,7 +308,8 @@ fn main() -> ExitCode {
                 print!("{err}");
                 return ExitCode::SUCCESS;
             }
-            eprint!("{err}");
+            // A failed stderr write has no channel left to report it on.
+            let _ = write!(std::io::stderr(), "{err}");
             return ExitCode::FAILURE;
         }
     };
@@ -306,7 +322,8 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 tracing::error!(error = %err, "harw-probe-bpf completions failed");
-                eprintln!("harw-probe-bpf: {err}");
+                // A failed stderr write has no channel left to report it on.
+                let _ = writeln!(std::io::stderr(), "harw-probe-bpf: {err}");
                 ExitCode::FAILURE
             }
         };
@@ -320,7 +337,8 @@ fn main() -> ExitCode {
             clap::error::ErrorKind::MissingRequiredArgument,
             "the following required argument was not provided: --sentinel-socket <PATH>",
         );
-        eprint!("{err}");
+        // A failed stderr write has no channel left to report it on.
+        let _ = write!(std::io::stderr(), "{err}");
         return ExitCode::FAILURE;
     };
 
@@ -329,7 +347,8 @@ fn main() -> ExitCode {
         Err(err) => {
             let status = exit_status_for(&err);
             tracing::error!(error = %err, exit_status = status, "harw-probe-bpf exiting");
-            eprintln!("harw-probe-bpf: {err}");
+            // A failed stderr write has no channel left to report it on.
+            let _ = writeln!(std::io::stderr(), "harw-probe-bpf: {err}");
             ExitCode::from(status)
         }
     }
@@ -339,9 +358,11 @@ fn main() -> ExitCode {
 /// **78** (`EX_CONFIG` aus `sysexits.h`).
 ///
 /// # Description
-/// Eine Ablehnung durch [`bpf_manifest::verify_resolved_objects`]
+/// Eine Ablehnung durch [`bpf_manifest::verify_resolved_objects`] oder
+/// [`bpf_manifest::ensure_objects_resolved`]
 /// ([`ProbeError::BpfObjectIntegrity`]) ist dauerhaft: dasselbe Manifest und
-/// dieselben Objekte scheitern beim nächsten Start genauso. Der eigene
+/// dieselben (bzw. fehlenden) Objekte scheitern beim nächsten Start genauso.
+/// Der eigene
 /// Status erlaubt der systemd-Unit `RestartPreventExitStatus=78`, statt den
 /// Start bis `StartLimitBurst` zu wiederholen und dabei jedes Mal erneut
 /// `SensorDegraded` zu senden.
@@ -464,18 +485,23 @@ const KERNEL_INTERFACE_ROOTS: [&str; 5] = [
 /// 4. Jedes eingelesene Objekt gegen das SHA-256-Manifest prüfen
 ///    ([`bpf_manifest::verify_resolved_objects`] mit `--bpf-manifest`) —
 ///    ebenfalls vor Landlock und an genau den Bytes, die später geladen
-///    werden. Bei einem Verstoß geht je gewähltem Sensor ein
-///    `SensorDegraded` an den Sentinel ([`report_integrity_refusal`]), und
-///    der Start endet ohne einen einzigen Ladeschritt.
+///    werden, auch das verwendbare Geschwister eines nicht aufgelösten
+///    Objekts — und außerhalb von `--dev-allow-missing-bpf` jedes gewählte,
+///    aber nicht aufgelöste Objekt ablehnen ([`verify_selected_objects`];
+///    Schritte 3 und 4 zusammen: [`resolve_and_verify_objects`]). Bei einem
+///    Verstoß geht je gewähltem Sensor ein `SensorDegraded` an den Sentinel
+///    ([`report_integrity_refusal`]), und der Start endet ohne einen
+///    einzigen Ladeschritt.
 /// 5. Den Scope des Profils auflösen ([`resolve_profile_scope`]) — **vor**
 ///    Landlock, weil Wurzelauflösung und Nachfahren-Expansion den
 ///    cgroup-Baum lesen.
 /// 6. Landlock durchsetzen (harter Abbruch bei jedem Ausgang außer
 ///    vollständiger Durchsetzung), mit den Wurzeln aus [`fs_scope_roots`].
 /// 7. Eine gemeinsame reale Ladeschicht bauen und je gewähltem Sensor den
-///    Vertragssatz mit dem Profil-Scope laden ([`setup_sensor`]); fehlende
-///    Objekte oder ein degradierender Ladefehler registrieren einen
-///    [`sensors::UnavailableSensor`]. War der Scope schon beim Start
+///    Vertragssatz mit dem Profil-Scope laden ([`setup_sensor`]); ein
+///    degradierender Ladefehler (und nur im Entwicklungsmodus ein fehlendes
+///    Objekt) registriert einen [`sensors::UnavailableSensor`]. War der
+///    Scope schon beim Start
 ///    unvollständig, geht genau ein `SensorDegraded` je geladenem Sensor an
 ///    den Sentinel.
 /// 8. Die Sammelschleife betreiben ([`collect_forever`], mit Rescan nur für
@@ -490,7 +516,8 @@ const KERNEL_INTERFACE_ROOTS: [&str; 5] = [
 /// [`error::ProbeError::Config`] für jede nicht ladbare, nicht
 /// vertrauenswürdige oder ungültige Konfiguration;
 /// [`error::ProbeError::BpfObjectIntegrity`], wenn ein eingelesenes Objekt
-/// die Manifestprüfung nicht besteht;
+/// oder das konfigurierte Manifest die Prüfung nicht besteht oder (außerhalb
+/// von `--dev-allow-missing-bpf`) ein gewähltes Objekt nicht auflösbar ist;
 /// [`error::ProbeError::CgroupRootInvalid`],
 /// [`error::ProbeError::CgroupScopeUnresolved`] und
 /// [`error::ProbeError::CgroupScopeRejected`] für einen nicht anheftbaren
@@ -508,38 +535,23 @@ fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
     let sink = sink::build_sentinel_sink(sentinel_socket)?;
     tracing::info!(path = %sentinel_socket.display(), "connected to sentinel");
 
-    // Objekte vor Landlock einlesen: danach braucht dieser Prozess keinen
-    // Lesezugriff auf das Objektverzeichnis mehr. Ein vom Profil nicht
-    // gewählter Sensor wird gar nicht erst aufgelöst.
-    let procmon_objects = selection.exec.then(|| {
-        sensors::resolve_procmon_objects(
-            cli.exec_program_path.as_deref(),
-            cli.exit_program_path.as_deref(),
-        )
-    });
-    let flow_objects = selection.tcp_connect.then(|| {
-        sensors::resolve_flow_objects(
-            cli.tcp_v4_program_path.as_deref(),
-            cli.tcp_v6_program_path.as_deref(),
-        )
-    });
-
-    // Integrität vor Landlock und vor jedem Ladeschritt (PL-100 Phase 4,
-    // THREAT-MODEL B23): jedes eingelesene Objekt muss zu seinem Eintrag im
-    // root-eigenen SHA-256-Manifest passen, geprüft an genau den Bytes, die
-    // später geladen werden. Ein Verstoß beendet den Start; vorher erfährt
-    // der Sentinel, dass die gewählten Sensoren dieser Sonde blind sind.
-    let to_verify = objects_to_verify(procmon_objects.as_ref(), flow_objects.as_ref());
-    if let Err(err) = bpf_manifest::verify_resolved_objects(cli.bpf_manifest.as_deref(), &to_verify)
-    {
-        let selected = selected_sensor_ids(selection, &cli.sensor_id_procmon, &cli.sensor_id_flow);
-        let reported = report_integrity_refusal(&selected, sink.as_ref(), Timestamp::now());
-        tracing::info!(
-            reported_sensors = reported,
-            "selected bpf sensors reported as degraded before refusing to load"
-        );
-        return Err(err);
-    }
+    // Objekte vor Landlock einlesen (danach braucht dieser Prozess keinen
+    // Lesezugriff auf das Objektverzeichnis mehr) und vor jedem Ladeschritt
+    // prüfen (PL-100 Phase 4, THREAT-MODEL B23): jedes eingelesene Objekt
+    // muss zu seinem Eintrag im root-eigenen SHA-256-Manifest passen, und
+    // außerhalb des Entwicklungsmodus muss jedes gewählte Objekt auflösbar
+    // sein. Ein Verstoß beendet den Start; vorher erfährt der Sentinel, dass
+    // die gewählten Sensoren dieser Sonde blind sind.
+    let SelectedObjects {
+        procmon: procmon_objects,
+        flow: flow_objects,
+    } = resolve_and_verify_objects(
+        &cli,
+        selection,
+        sink.as_ref(),
+        Timestamp::now(),
+        bpf_manifest::verify_resolved_objects,
+    )?;
 
     // Scope vor Landlock festlegen: Wurzelauflösung und Nachfahren-Expansion
     // lesen den cgroup-Baum. Kein Rückfall auf den Host-Scope.
@@ -620,16 +632,202 @@ fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
 }
 
 /// Ergebnis der Objektauflösung eines Sensors: beide Objekte oder jeder
-/// Mangel (siehe [`sensors::resolve_procmon_objects`]).
-type SensorObjects = Result<[ResolvedBpfObject; 2], Vec<ObjectUnavailable>>;
+/// Mangel samt verwendbarem Geschwisterobjekt (siehe
+/// [`sensors::resolve_procmon_objects`], [`sensors::UnresolvedPair`]).
+type SensorObjects = Result<[ResolvedBpfObject; 2], UnresolvedPair>;
 
-/// Die eingelesenen Objekte aller gewählten Sensoren, für die Manifestprüfung.
+/// Was mit einem gewählten Sensor geschieht, dessen Objekte sich nicht
+/// auflösen lassen (entfernt, leer, gekürzt, kein ELF, unlesbar).
 ///
 /// # Description
-/// Nur Sensoren, deren beide Objekte aufgelöst sind, tragen bei: ein vom
-/// Profil nicht gewählter Sensor (`None`) wird nie geladen, und fehlende
-/// Objekte (`Some(Err(_))`) degradieren ihren Sensor ohne Ladeversuch —
-/// in beiden Fällen gibt es keine Bytes, die geprüft werden müssten.
+/// Owner-Review zu PR #168: ein solches Objekt darf die Integritätsprüfung
+/// nicht umgehen. Produktiv ist es deshalb ein Startabbruch mit Exit-Status
+/// 78; nur der ausdrückliche Entwicklungsmodus `--dev-allow-missing-bpf`
+/// (den `clap` nur zusammen mit `--bpf-manifest` annimmt) behält die frühere
+/// Degradierung des Sensors. Er lockert nur diese eine Regel: jedes
+/// aufgelöste Objekt wird in beiden Fällen gegen das Manifest geprüft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnresolvedObjects {
+    /// Produktion: [`bpf_manifest::ensure_objects_resolved`] lehnt den Start
+    /// ab ([`bpf_manifest::IntegrityFailure::ObjectUnresolved`]).
+    Refuse,
+    /// Nur Entwicklung: der Sensor läuft als [`sensors::UnavailableSensor`]
+    /// weiter ([`setup_sensor`]) und meldet einmal `SensorDegraded`.
+    Degrade,
+}
+
+impl UnresolvedObjects {
+    /// Die Behandlung für `--dev-allow-missing-bpf` und `--bpf-manifest`.
+    ///
+    /// # Description
+    /// `clap` nimmt den Entwicklungsmodus nur zusammen mit `--bpf-manifest`
+    /// an (`requires`); diese Funktion verlangt dasselbe noch einmal, damit
+    /// ein Aufruf an `clap` vorbei nie ohne Manifest degradiert.
+    ///
+    /// # Arguments
+    /// - `dev_allow_missing_bpf` (`bool`): ob der Entwicklungsmodus gesetzt
+    ///   ist.
+    /// - `manifest` (`Option<&Path>`): `--bpf-manifest`.
+    ///
+    /// # Returns
+    /// [`Self::Degrade`] nur mit dem Entwicklungsmodus **und** einem
+    /// Manifest, sonst [`Self::Refuse`].
+    fn for_flags(dev_allow_missing_bpf: bool, manifest: Option<&Path>) -> Self {
+        if dev_allow_missing_bpf && manifest.is_some() {
+            Self::Degrade
+        } else {
+            Self::Refuse
+        }
+    }
+}
+
+/// Die aufgelösten Objekte der gewählten Sensoren nach bestandener
+/// Integritätsprüfung ([`resolve_and_verify_objects`]).
+struct SelectedObjects {
+    /// Prozess-Sensor (`exec.bpf.o`, `exit.bpf.o`); `None`, wenn nicht
+    /// gewählt. `Some(Err(_))` nur im Entwicklungsmodus.
+    procmon: Option<SensorObjects>,
+    /// Verbindungs-Sensor (`tcp_v4_connect.bpf.o`, `tcp_v6_connect.bpf.o`);
+    /// `None`, wenn nicht gewählt. `Some(Err(_))` nur im Entwicklungsmodus.
+    flow: Option<SensorObjects>,
+}
+
+/// Löst die Objekte der gewählten Sensoren auf und prüft sie vor Landlock
+/// und vor jedem Ladeschritt (Schritte 3 und 4 aus [`run`]).
+///
+/// # Description
+/// Je gewähltem Sensor [`sensors::resolve_procmon_objects`] bzw.
+/// [`sensors::resolve_flow_objects`] mit den Pfaden aus `cli` (ein nicht
+/// gewählter Sensor wird gar nicht erst aufgelöst), danach
+/// [`verify_selected_objects`] mit `--bpf-manifest` und
+/// `--dev-allow-missing-bpf`. Scheitert die Prüfung, geht vorher je
+/// gewähltem Sensor genau ein `SensorDegraded` an den Sentinel
+/// ([`report_integrity_refusal`]); [`run`] gibt den Fehler dann unverändert
+/// zurück, `main` endet mit [`EXIT_INTEGRITY_REFUSED`].
+///
+/// # Arguments
+/// - `cli` (`&Cli`): die geparste Kommandozeile.
+/// - `selection` (`SensorSelection`): Sensorwahl des aktiven Profils.
+/// - `sink` (`&dyn EventSink`): die Senke zum Sentinel.
+/// - `now` (`Timestamp`): `observed_at` der Ablehnungsmeldungen.
+/// - `verify`: die Manifestprüfung; produktiv
+///   [`bpf_manifest::verify_resolved_objects`] (Anker `/`, Eigentümer
+///   root), in Tests dieselbe Prüfung gegen ein Fixture-Manifest.
+///
+/// # Returns
+/// Die aufgelösten Objekte beider Sensoren.
+///
+/// # Errors
+/// [`ProbeError::BpfObjectIntegrity`] aus [`verify_selected_objects`].
+///
+/// # Concurrency
+/// Blockierende Dateisystemzugriffe; nur beim Start im Hauptthread.
+fn resolve_and_verify_objects(
+    cli: &Cli,
+    selection: SensorSelection,
+    sink: &dyn EventSink,
+    now: Timestamp,
+    verify: impl FnOnce(Option<&Path>, &[&ResolvedBpfObject]) -> Result<usize, ProbeError>,
+) -> Result<SelectedObjects, ProbeError> {
+    let procmon = selection.exec.then(|| {
+        sensors::resolve_procmon_objects(
+            cli.exec_program_path.as_deref(),
+            cli.exit_program_path.as_deref(),
+        )
+    });
+    let flow = selection.tcp_connect.then(|| {
+        sensors::resolve_flow_objects(
+            cli.tcp_v4_program_path.as_deref(),
+            cli.tcp_v6_program_path.as_deref(),
+        )
+    });
+    let verified = verify_selected_objects(
+        procmon.as_ref(),
+        flow.as_ref(),
+        cli.bpf_manifest.as_deref(),
+        UnresolvedObjects::for_flags(cli.dev_allow_missing_bpf, cli.bpf_manifest.as_deref()),
+        verify,
+    );
+    if let Err(err) = verified {
+        let selected = selected_sensor_ids(selection, &cli.sensor_id_procmon, &cli.sensor_id_flow);
+        let reported = report_integrity_refusal(&selected, sink, now);
+        tracing::info!(
+            reported_sensors = reported,
+            "selected bpf sensors reported as degraded before refusing to load"
+        );
+        return Err(err);
+    }
+    Ok(SelectedObjects { procmon, flow })
+}
+
+/// Die Integritätsschranke über die Auflösung aller gewählten Sensoren.
+///
+/// # Description
+/// Zuerst `verify` ([`bpf_manifest::verify_resolved_objects`]) über jedes
+/// eingelesene Objekt ([`objects_to_verify`]), auch über das verwendbare
+/// Geschwister eines nicht aufgelösten Objekts: ist `manifest` gesetzt, wird
+/// das Manifest dabei immer gelesen und geprüft, auch wenn kein Objekt
+/// aufgelöst ist, und ein manipuliertes Objekt wird immer vor einem
+/// fehlenden gemeldet, über Sensoren hinweg wie innerhalb eines Sensors.
+/// Danach die gewählten, aber nicht aufgelösten Objekte:
+/// - [`UnresolvedObjects::Refuse`] (Produktion):
+///   [`bpf_manifest::ensure_objects_resolved`] lehnt den Start ab;
+/// - [`UnresolvedObjects::Degrade`] (nur `--dev-allow-missing-bpf` mit
+///   `--bpf-manifest`): kein Abbruch, der Sensor degradiert später in
+///   [`setup_sensor`]. Vor der Prüfung meldet genau eine Warnung, dass der
+///   Entwicklungsmodus aktiv ist (mit der Zahl der nicht aufgelösten
+///   Objekte, ohne Pfad). Die Manifestprüfung läuft unverändert: auch der
+///   Entwicklungsmodus lädt nie ungeprüfte Bytes.
+///
+/// # Arguments
+/// - `procmon` (`Option<&SensorObjects>`): Auflösung des Prozess-Sensors,
+///   `None`, wenn nicht gewählt.
+/// - `flow` (`Option<&SensorObjects>`): Auflösung des Verbindungs-Sensors,
+///   `None`, wenn nicht gewählt.
+/// - `manifest` (`Option<&Path>`): `--bpf-manifest`.
+/// - `unresolved` ([`UnresolvedObjects`]): Behandlung nicht aufgelöster
+///   Objekte.
+/// - `verify`: die Manifestprüfung (siehe [`resolve_and_verify_objects`]).
+///
+/// # Returns
+/// Die Zahl der gegen das Manifest geprüften Objekte.
+///
+/// # Errors
+/// [`ProbeError::BpfObjectIntegrity`]: der erste Verstoß.
+fn verify_selected_objects(
+    procmon: Option<&SensorObjects>,
+    flow: Option<&SensorObjects>,
+    manifest: Option<&Path>,
+    unresolved: UnresolvedObjects,
+    verify: impl FnOnce(Option<&Path>, &[&ResolvedBpfObject]) -> Result<usize, ProbeError>,
+) -> Result<usize, ProbeError> {
+    let missing = unresolved_objects(procmon, flow);
+    if unresolved == UnresolvedObjects::Degrade {
+        tracing::warn!(
+            unresolved_objects = missing.len(),
+            "development mode (--dev-allow-missing-bpf) is active: selected bpf sensors with unresolved objects degrade instead of refusing to start; resolved objects are still verified against the manifest; never use this mode in production"
+        );
+    }
+    let resolved = objects_to_verify(procmon, flow);
+    let verified = verify(manifest, resolved.as_slice())?;
+    if unresolved == UnresolvedObjects::Refuse {
+        bpf_manifest::ensure_objects_resolved(missing.as_slice())?;
+    }
+    Ok(verified)
+}
+
+/// Jedes eingelesene Objekt aller gewählten Sensoren, für die
+/// Manifestprüfung.
+///
+/// # Description
+/// Ein vom Profil nicht gewählter Sensor (`None`) trägt nichts bei; er wird
+/// weder aufgelöst noch geladen. Von einem gewählten Sensor zählen beide
+/// Objekte bzw., wenn eines nicht aufgelöst ist, das verwendbare
+/// Geschwister ([`sensors::UnresolvedPair::resolved`]): es wird nie geladen,
+/// aber seine Bytes liegen im Speicher und werden geprüft, damit eine
+/// Manipulation nicht hinter einem fehlenden Objekt verborgen bleibt. Nicht
+/// aufgelöste Objekte selbst liefern keine Bytes; sie prüft
+/// [`verify_selected_objects`] getrennt über [`unresolved_objects`].
 ///
 /// # Arguments
 /// - `procmon` (`Option<&SensorObjects>`): Auflösung des Prozess-Sensors.
@@ -637,16 +835,39 @@ type SensorObjects = Result<[ResolvedBpfObject; 2], Vec<ObjectUnavailable>>;
 ///
 /// # Returns
 /// Die Objekte in der Reihenfolge exec, exit, tcp_v4, tcp_v6 (soweit
-/// vorhanden).
+/// eingelesen).
 fn objects_to_verify<'a>(
     procmon: Option<&'a SensorObjects>,
     flow: Option<&'a SensorObjects>,
 ) -> Vec<&'a ResolvedBpfObject> {
+    let mut objects: Vec<&'a ResolvedBpfObject> = Vec::with_capacity(4);
+    for resolution in [procmon, flow].into_iter().flatten() {
+        match resolution {
+            Ok(pair) => objects.extend(pair.iter()),
+            Err(unresolved) => objects.extend(unresolved.resolved.as_ref()),
+        }
+    }
+    objects
+}
+
+/// Die Mängel aller gewählten Sensoren, deren Objekte nicht aufgelöst sind.
+///
+/// # Arguments
+/// - `procmon` (`Option<&SensorObjects>`): Auflösung des Prozess-Sensors.
+/// - `flow` (`Option<&SensorObjects>`): Auflösung des Verbindungs-Sensors.
+///
+/// # Returns
+/// Jeder Mangel, Prozess- vor Verbindungs-Sensor; leer, wenn jeder gewählte
+/// Sensor vollständig aufgelöst ist.
+fn unresolved_objects<'a>(
+    procmon: Option<&'a SensorObjects>,
+    flow: Option<&'a SensorObjects>,
+) -> Vec<&'a ObjectUnavailable> {
     [procmon, flow]
         .into_iter()
         .flatten()
-        .filter_map(|objects| objects.as_ref().ok())
-        .flatten()
+        .filter_map(|objects| objects.as_ref().err())
+        .flat_map(|unresolved| unresolved.missing.iter())
         .collect()
 }
 
@@ -819,7 +1040,9 @@ impl SensorSetup {
 /// Baut einen Sensor aus seinen aufgelösten Objekten.
 ///
 /// # Description
-/// Fehlen Objekte, entsteht ohne jeden Ladeversuch ein
+/// Fehlen Objekte (erreichbar nur im Entwicklungsmodus
+/// `--dev-allow-missing-bpf`; produktiv hat [`verify_selected_objects`] den
+/// Start dann schon abgelehnt), entsteht ohne jeden Ladeversuch ein
 /// [`sensors::UnavailableSensor`] mit der Mängelliste. Sonst baut `contracts`
 /// den Vertragssatz (Reihenfolge wie die Objekte), und
 /// [`real_loader::load_sensor`] lädt ihn transaktional. Ein Ladefehler, den
@@ -830,8 +1053,11 @@ impl SensorSetup {
 /// # Arguments
 /// - `loader` (`&harw_dod_bpf::RealBpfLoader`): die gemeinsame Ladeschicht.
 /// - `sensor` (`harw_types::SensorId`): die Kennung des Sensors.
-/// - `objects`: das Ergebnis von [`sensors::resolve_procmon_objects`] bzw.
-///   [`sensors::resolve_flow_objects`].
+/// - `objects` ([`SensorObjects`]): das Ergebnis von
+///   [`sensors::resolve_procmon_objects`] bzw.
+///   [`sensors::resolve_flow_objects`]; bei `Err` wird nur
+///   [`sensors::UnresolvedPair::missing`] verwendet, das Geschwister nie
+///   geladen.
 /// - `contracts`: baut aus Kennung und den beiden Objektquellen den
 ///   Vertragssatz, z. B. `harw_dod_procmon::procmon_contracts` mit dem
 ///   `BpfScope` des aktiven Profils.
@@ -848,15 +1074,16 @@ impl SensorSetup {
 fn setup_sensor(
     loader: &RealBpfLoader,
     sensor: SensorId,
-    objects: Result<[ResolvedBpfObject; 2], Vec<ObjectUnavailable>>,
+    objects: SensorObjects,
     contracts: impl FnOnce(SensorId, BpfProgramSource, BpfProgramSource) -> [BpfObjectContract; 2],
     net_scope: Option<NetworkScope>,
 ) -> Result<SensorSetup, ProbeError> {
     let [first, second] = match objects {
         Ok(objects) => objects,
-        Err(missing) => {
+        Err(unresolved) => {
             return Ok(SensorSetup::Degraded(UnavailableSensor::new(
-                sensor, missing,
+                sensor,
+                unresolved.missing,
             )));
         }
     };
@@ -1069,8 +1296,11 @@ mod tests {
 
     use std::borrow::Cow;
     use std::cell::Cell;
+    use std::ffi::OsString;
+    use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
 
+    use clap::Parser as _;
     use harw_dod_bpf::cgroup_walk::{HostCgroupFs, WalkLimits};
     use harw_dod_bpf::{BpfError, BpfProgramSource, RealBpfLoader};
     use harw_dod_cap::SensorError;
@@ -1081,19 +1311,22 @@ mod tests {
     use landlock::{ABI, AccessFs};
 
     use super::{
-        EXIT_INTEGRITY_REFUSED, EXIT_RUN_FAILED, KERNEL_INTERFACE_ROOTS, SensorObjects,
-        SensorSetup, degrades_sensor, exit_status_for, fs_scope_roots, landlock_roots,
-        network_scope, objects_to_verify, report_integrity_refusal, retry_transient,
-        selected_sensor_ids, setup_sensor,
+        EXIT_INTEGRITY_REFUSED, EXIT_RUN_FAILED, KERNEL_INTERFACE_ROOTS, SelectedObjects,
+        SensorObjects, SensorSetup, UnresolvedObjects, degrades_sensor, exit_status_for,
+        fs_scope_roots, landlock_roots, network_scope, objects_to_verify, report_integrity_refusal,
+        resolve_and_verify_objects, retry_transient, selected_sensor_ids, setup_sensor,
+        unresolved_objects, verify_selected_objects,
     };
     use crate::bpf_manifest::IntegrityFailure;
+    use crate::bpf_manifest::test_fixture::{Fixture, object_bytes};
+    use crate::cli::Cli;
     use crate::error::ProbeError;
     use crate::landlock::{FsRoot, RootAccess};
     use crate::profile::test_tree::{FakeTree, cgroup_scope};
     use crate::profile::{ProbeScope, SensorSelection, resolve_scope};
     use crate::sensors::{
         BpfObjectKind, DEFAULT_BPF_OBJECT_DIR, ObjectUnavailable, ObjectUnavailableReason,
-        ResolvedBpfObject,
+        ResolvedBpfObject, UnresolvedPair,
     };
     use crate::test_support::{TestError, TestResult, ctx};
 
@@ -1257,15 +1490,40 @@ mod tests {
         }
     }
 
+    /// Ein nicht aufgelöster Sensor: seine Mängel und, falls vorhanden, das
+    /// verwendbare Geschwisterobjekt.
+    fn unresolved_pair(
+        resolved: Option<ResolvedBpfObject>,
+        missing: Vec<ObjectUnavailable>,
+    ) -> SensorObjects {
+        Err(UnresolvedPair { resolved, missing })
+    }
+
     #[test]
-    fn test_objects_to_verify_takes_only_resolved_sensors() {
+    fn test_objects_to_verify_takes_every_read_object_of_the_selected_sensors() {
         let procmon: SensorObjects =
             Ok([resolved(BpfObjectKind::Exec), resolved(BpfObjectKind::Exit)]);
-        let flow_missing: SensorObjects = Err(vec![ObjectUnavailable {
-            object: BpfObjectKind::TcpV4Connect,
-            path: PathBuf::from("/nonexistent/tcp_v4_connect.bpf.o"),
-            reason: ObjectUnavailableReason::Missing,
-        }]);
+        let flow_missing = unresolved_pair(
+            Some(resolved(BpfObjectKind::TcpV6Connect)),
+            vec![ObjectUnavailable {
+                object: BpfObjectKind::TcpV4Connect,
+                path: PathBuf::from("/nonexistent/tcp_v4_connect.bpf.o"),
+                reason: ObjectUnavailableReason::Missing,
+            }],
+        );
+        let flow_gone = unresolved_pair(
+            None,
+            vec![
+                unavailable(
+                    BpfObjectKind::TcpV4Connect,
+                    ObjectUnavailableReason::Missing,
+                ),
+                unavailable(
+                    BpfObjectKind::TcpV6Connect,
+                    ObjectUnavailableReason::Missing,
+                ),
+            ],
+        );
         let flow: SensorObjects = Ok([
             resolved(BpfObjectKind::TcpV4Connect),
             resolved(BpfObjectKind::TcpV6Connect),
@@ -1283,14 +1541,196 @@ mod tests {
                 BpfObjectKind::TcpV6Connect,
             ]
         );
-        // Fehlende Objekte degradieren ihren Sensor und werden nicht geprüft.
+        // Nicht aufgelöste Objekte liefern keine Bytes (sie prüft
+        // `verify_selected_objects` getrennt über `unresolved_objects`), ihr
+        // eingelesenes Geschwister wird aber mitgeprüft.
         assert_eq!(
             kinds(objects_to_verify(Some(&procmon), Some(&flow_missing))),
+            vec![
+                BpfObjectKind::Exec,
+                BpfObjectKind::Exit,
+                BpfObjectKind::TcpV6Connect,
+            ]
+        );
+        assert_eq!(
+            kinds(objects_to_verify(Some(&procmon), Some(&flow_gone))),
             vec![BpfObjectKind::Exec, BpfObjectKind::Exit]
         );
         // Nicht gewählte Sensoren tragen nichts bei.
-        assert!(objects_to_verify(None, Some(&flow_missing)).is_empty());
+        assert!(objects_to_verify(None, Some(&flow_gone)).is_empty());
         assert!(objects_to_verify(None, None).is_empty());
+    }
+
+    /// Ein nicht aufgelöstes Objekt mit Fixture-Pfad.
+    fn unavailable(object: BpfObjectKind, reason: ObjectUnavailableReason) -> ObjectUnavailable {
+        ObjectUnavailable {
+            object,
+            path: Path::new(DEFAULT_BPF_OBJECT_DIR).join(object.file_name()),
+            reason,
+        }
+    }
+
+    #[test]
+    fn test_unresolved_objects_collects_every_defect_of_the_selected_sensors() {
+        let procmon_missing = unresolved_pair(
+            None,
+            vec![
+                unavailable(BpfObjectKind::Exec, ObjectUnavailableReason::Missing),
+                unavailable(BpfObjectKind::Exit, ObjectUnavailableReason::Empty),
+            ],
+        );
+        let flow_corrupt = unresolved_pair(
+            Some(resolved(BpfObjectKind::TcpV4Connect)),
+            vec![unavailable(
+                BpfObjectKind::TcpV6Connect,
+                ObjectUnavailableReason::NotElf,
+            )],
+        );
+        let flow: SensorObjects = Ok([
+            resolved(BpfObjectKind::TcpV4Connect),
+            resolved(BpfObjectKind::TcpV6Connect),
+        ]);
+
+        let defects =
+            |missing: Vec<&ObjectUnavailable>| -> Vec<(BpfObjectKind, ObjectUnavailableReason)> {
+                missing
+                    .iter()
+                    .map(|item| (item.object, item.reason))
+                    .collect()
+            };
+        assert_eq!(
+            defects(unresolved_objects(
+                Some(&procmon_missing),
+                Some(&flow_corrupt)
+            )),
+            vec![
+                (BpfObjectKind::Exec, ObjectUnavailableReason::Missing),
+                (BpfObjectKind::Exit, ObjectUnavailableReason::Empty),
+                (BpfObjectKind::TcpV6Connect, ObjectUnavailableReason::NotElf),
+            ]
+        );
+        // Vollständig aufgelöste und nicht gewählte Sensoren tragen nichts bei.
+        assert!(unresolved_objects(None, Some(&flow)).is_empty());
+        assert!(unresolved_objects(None, None).is_empty());
+    }
+
+    #[test]
+    fn test_only_the_development_flag_with_a_manifest_degrades_unresolved_objects() {
+        let manifest = Some(Path::new("/usr/local/lib/harw-dod/bpf/manifest.json"));
+        assert_eq!(
+            UnresolvedObjects::for_flags(false, manifest),
+            UnresolvedObjects::Refuse
+        );
+        assert_eq!(
+            UnresolvedObjects::for_flags(false, None),
+            UnresolvedObjects::Refuse
+        );
+        assert_eq!(
+            UnresolvedObjects::for_flags(true, manifest),
+            UnresolvedObjects::Degrade
+        );
+        // An `clap` vorbei (das `requires` erzwingt): ohne Manifest nie
+        // degradieren.
+        assert_eq!(
+            UnresolvedObjects::for_flags(true, None),
+            UnresolvedObjects::Refuse
+        );
+    }
+
+    #[test]
+    fn test_verify_selected_objects_refuses_unresolved_objects_after_verification() -> TestResult {
+        let procmon_missing = unresolved_pair(
+            Some(resolved(BpfObjectKind::Exec)),
+            vec![unavailable(
+                BpfObjectKind::Exit,
+                ObjectUnavailableReason::Missing,
+            )],
+        );
+        let flow: SensorObjects = Ok([
+            resolved(BpfObjectKind::TcpV4Connect),
+            resolved(BpfObjectKind::TcpV6Connect),
+        ]);
+        let manifest = Some(Path::new("/usr/local/lib/harw-dod/bpf/manifest.json"));
+
+        // Die Manifestprüfung sieht jedes eingelesene Objekt (auch das
+        // Geschwister `exec` des fehlenden `exit`) und läuft zuerst; danach
+        // lehnt die Produktion das fehlende Objekt ab.
+        let seen = Cell::new(0_usize);
+        let result = verify_selected_objects(
+            Some(&procmon_missing),
+            Some(&flow),
+            manifest,
+            UnresolvedObjects::Refuse,
+            |manifest, objects| {
+                assert!(manifest.is_some());
+                seen.set(objects.len());
+                Ok(objects.len())
+            },
+        );
+        match result {
+            Err(ProbeError::BpfObjectIntegrity {
+                object: Some(BpfObjectKind::Exit),
+                failure: IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::Missing),
+            }) => {}
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        assert_eq!(seen.get(), 3);
+
+        // Ein Verstoß der Manifestprüfung (manipuliertes Objekt) geht vor.
+        match verify_selected_objects(
+            Some(&procmon_missing),
+            Some(&flow),
+            None,
+            UnresolvedObjects::Refuse,
+            |_, _| {
+                Err(ProbeError::BpfObjectIntegrity {
+                    object: Some(BpfObjectKind::TcpV4Connect),
+                    failure: IntegrityFailure::DigestMismatch,
+                })
+            },
+        ) {
+            Err(ProbeError::BpfObjectIntegrity {
+                object: Some(BpfObjectKind::TcpV4Connect),
+                failure: IntegrityFailure::DigestMismatch,
+            }) => {}
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+
+        // Entwicklungsmodus: das fehlende Objekt degradiert nur, die
+        // Manifestprüfung läuft unverändert mit denselben Objekten.
+        let verified = verify_selected_objects(
+            Some(&procmon_missing),
+            Some(&flow),
+            manifest,
+            UnresolvedObjects::Degrade,
+            |manifest, objects| {
+                assert!(manifest.is_some());
+                Ok(objects.len())
+            },
+        )
+        .map_err(ctx("development mode degrades"))?;
+        assert_eq!(verified, 3);
+
+        // Auch im Entwicklungsmodus beendet ein Verstoß der Manifestprüfung
+        // den Start.
+        match verify_selected_objects(
+            Some(&procmon_missing),
+            Some(&flow),
+            manifest,
+            UnresolvedObjects::Degrade,
+            |_, _| {
+                Err(ProbeError::BpfObjectIntegrity {
+                    object: Some(BpfObjectKind::Exec),
+                    failure: IntegrityFailure::DigestMismatch,
+                })
+            },
+        ) {
+            Err(ProbeError::BpfObjectIntegrity {
+                object: Some(BpfObjectKind::Exec),
+                failure: IntegrityFailure::DigestMismatch,
+            }) => Ok(()),
+            other => Err(TestError::Unexpected(format!("{other:?}"))),
+        }
     }
 
     #[test]
@@ -1368,6 +1808,10 @@ mod tests {
                 Some(BpfObjectKind::TcpV6Connect),
                 IntegrityFailure::DigestMismatch,
             ),
+            (
+                Some(BpfObjectKind::Exit),
+                IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::Missing),
+            ),
         ] {
             assert_eq!(
                 exit_status_for(&ProbeError::BpfObjectIntegrity { object, failure }),
@@ -1407,6 +1851,13 @@ mod tests {
             line.starts_with("ExecStart=")
                 && line.contains(" --bpf-manifest @BPFDIR@/manifest.json")
         }));
+        // Der Entwicklungsmodus steht nie in der Unit: ein entferntes oder
+        // beschädigtes Objekt endet dort immer mit 78.
+        assert!(
+            unit.lines()
+                .filter(|line| line.starts_with("ExecStart"))
+                .all(|line| !line.contains("--dev-allow-missing-bpf"))
+        );
     }
 
     #[test]
@@ -1434,19 +1885,23 @@ mod tests {
 
     #[test]
     fn test_setup_sensor_degrades_without_loading_when_objects_are_missing() -> TestResult {
-        // Kein Kernelzugriff: bei fehlenden Objekten wird der Vertragssatz
-        // gar nicht erst gebaut, `load_sensor` nie aufgerufen.
+        // Nur im Entwicklungsmodus erreichbar. Kein Kernelzugriff: bei
+        // fehlenden Objekten wird der Vertragssatz gar nicht erst gebaut,
+        // `load_sensor` nie aufgerufen.
         let loader = RealBpfLoader::new();
         let contracts_built = Cell::new(false);
-        let missing = vec![ObjectUnavailable {
-            object: BpfObjectKind::Exec,
-            path: PathBuf::from("/nonexistent/exec.bpf.o"),
-            reason: ObjectUnavailableReason::Missing,
-        }];
+        let missing = unresolved_pair(
+            Some(resolved(BpfObjectKind::Exit)),
+            vec![ObjectUnavailable {
+                object: BpfObjectKind::Exec,
+                path: PathBuf::from("/nonexistent/exec.bpf.o"),
+                reason: ObjectUnavailableReason::Missing,
+            }],
+        );
         let setup = setup_sensor(
             &loader,
             SensorId::from_str("probe-bpf-procmon-0"),
-            Err(missing),
+            missing,
             |sensor, exec, exit| {
                 contracts_built.set(true);
                 harw_dod_procmon::procmon_contracts(
@@ -1459,9 +1914,538 @@ mod tests {
             None,
         )
         .map_err(ctx("setup_sensor with missing objects"))?;
+        // Das verwendbare Geschwister wird nie geladen; die Mängelliste
+        // trägt nur das fehlende Objekt.
+        let SensorSetup::Degraded(sensor) = setup else {
+            return Err(TestError::Unexpected(
+                "a sensor with a missing object must degrade".into(),
+            ));
+        };
+        let defects: Vec<BpfObjectKind> = sensor.missing().iter().map(|item| item.object).collect();
+        assert_eq!(defects, vec![BpfObjectKind::Exec]);
+        assert!(!contracts_built.get());
+        Ok(())
+    }
+
+    // Ende-zu-Ende-Tests der Integritätsschranke (Owner-Review zu PR #168):
+    // echte Objektdateien unter einem Temporärverzeichnis, echte
+    // Kommandozeile, echte Auflösung und dieselbe Manifestprüfung wie in der
+    // Produktion — nur mit Anker und Eigentümer der Fixture statt `/` und
+    // root (`Fixture::verify`). `run` selbst bleibt ungetestet (Socket,
+    // Landlock, eBPF); es gibt den Fehler aus `resolve_and_verify_objects`
+    // unverändert zurück, bevor `setup_sensor` einen Vertragssatz baut.
+
+    /// Beide Sensoren gewählt, wie in der ausgelieferten Konfiguration.
+    const BOTH: SensorSelection = SensorSelection {
+        exec: true,
+        tcp_connect: true,
+    };
+
+    /// Nur der Prozess-Sensor gewählt.
+    const EXEC_ONLY: SensorSelection = SensorSelection {
+        exec: true,
+        tcp_connect: false,
+    };
+
+    /// Nur der Verbindungs-Sensor gewählt.
+    const TCP_ONLY: SensorSelection = SensorSelection {
+        exec: false,
+        tcp_connect: true,
+    };
+
+    /// Die vorgegebenen Kennungen beider Sensoren.
+    const BOTH_IDS: [&str; 2] = ["probe-bpf-procmon-0", "probe-bpf-flow-0"];
+
+    /// Eine Kommandozeile wie die der systemd-Unit: explizite Objektpfade
+    /// unter der Fixture, dazu `extra`.
+    fn fixture_cli(fixture: &Fixture, extra: &[OsString]) -> TestResult<Cli> {
+        let mut args = vec![
+            OsString::from("harw-probe-bpf"),
+            OsString::from("--sentinel-socket"),
+            OsString::from("/run/harw/sentinel.sock"),
+        ];
+        for (flag, object) in [
+            ("--exec-program-path", BpfObjectKind::Exec),
+            ("--exit-program-path", BpfObjectKind::Exit),
+            ("--tcp-v4-program-path", BpfObjectKind::TcpV4Connect),
+            ("--tcp-v6-program-path", BpfObjectKind::TcpV6Connect),
+        ] {
+            args.push(OsString::from(flag));
+            args.push(fixture.object_path(object).into_os_string());
+        }
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args).map_err(ctx("fixture command line parses"))
+    }
+
+    /// `--bpf-manifest` mit dem Manifest der Fixture (Produktion).
+    fn with_manifest(fixture: &Fixture) -> [OsString; 2] {
+        [
+            OsString::from("--bpf-manifest"),
+            fixture.manifest_path().into_os_string(),
+        ]
+    }
+
+    /// Der Entwicklungsmodus allein (ohne Manifest lehnt `clap` ihn ab).
+    fn dev_mode() -> [OsString; 1] {
+        [OsString::from("--dev-allow-missing-bpf")]
+    }
+
+    /// Der Entwicklungsmodus mit dem Manifest der Fixture.
+    fn dev_mode_with_manifest(fixture: &Fixture) -> Vec<OsString> {
+        with_manifest(fixture)
+            .into_iter()
+            .chain(dev_mode())
+            .collect()
+    }
+
+    /// Hängt `-tampered` an ein Fixture-Objekt an: weiter ein ELF-Objekt,
+    /// aber mit anderem Digest.
+    fn tamper(fixture: &Fixture, object: BpfObjectKind) -> TestResult {
+        let mut bytes = object_bytes(object);
+        bytes.extend_from_slice(b"-tampered");
+        std::fs::write(fixture.object_path(object), &bytes).map_err(ctx("tamper with an object"))
+    }
+
+    /// Entfernt Fixture-Objekte.
+    fn remove_objects(fixture: &Fixture, objects: &[BpfObjectKind]) -> TestResult {
+        for &object in objects {
+            std::fs::remove_file(fixture.object_path(object)).map_err(ctx("remove an object"))?;
+        }
+        Ok(())
+    }
+
+    /// Schritte 3 und 4 aus `run` gegen die Fixture.
+    fn gate(
+        fixture: &Fixture,
+        cli: &Cli,
+        selection: SensorSelection,
+        sink: &RecordingSink,
+    ) -> Result<SelectedObjects, ProbeError> {
+        resolve_and_verify_objects(
+            cli,
+            selection,
+            sink,
+            Timestamp::UNIX_EPOCH,
+            |manifest, objects| fixture.verify(manifest, objects),
+        )
+    }
+
+    /// Erwartet die Ablehnung `object`/`failure`, den Exit-Status 78 und je
+    /// gewähltem Sensor (`reported`) genau ein `SensorDegraded`.
+    fn expect_integrity_refusal(
+        result: Result<SelectedObjects, ProbeError>,
+        object: Option<BpfObjectKind>,
+        failure: IntegrityFailure,
+        sink: &RecordingSink,
+        reported: &[&str],
+    ) -> TestResult {
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => {
+                return Err(TestError::Unexpected(format!(
+                    "expected refusal {object:?}/{failure:?}, got loadable objects"
+                )));
+            }
+        };
+        match &err {
+            ProbeError::BpfObjectIntegrity {
+                object: actual_object,
+                failure: actual_failure,
+            } if *actual_object == object && *actual_failure == failure => {}
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected refusal {object:?}/{failure:?}, got {other:?}"
+                )));
+            }
+        }
+        assert_eq!(exit_status_for(&err), EXIT_INTEGRITY_REFUSED);
+        // Weder Suchpfad noch Fixture-Verzeichnis in der Meldung.
+        assert!(!err.to_string().contains('/'), "{err}");
+        let sent = sink
+            .sent
+            .lock()
+            .map_err(|_| TestError::Unexpected("recording sink poisoned".into()))?;
+        let sensors: Vec<&str> = sent.iter().map(|event| event.sensor.as_str()).collect();
+        assert_eq!(sensors, reported);
+        assert!(sent.iter().all(|event| matches!(
+            &event.kind,
+            EventKind::SensorDegraded { sensor } if sensor == &event.sensor
+        )));
+        Ok(())
+    }
+
+    /// Wie viele Meldungen die Senke aufgezeichnet hat.
+    fn reported_count(sink: &RecordingSink) -> TestResult<usize> {
+        Ok(sink
+            .sent
+            .lock()
+            .map_err(|_| TestError::Unexpected("recording sink poisoned".into()))?
+            .len())
+    }
+
+    #[test]
+    fn test_gate_passes_objects_that_match_the_manifest() -> TestResult {
+        let fixture = Fixture::trusted()?;
+        let cli = fixture_cli(&fixture, &with_manifest(&fixture))?;
+        assert!(!cli.dev_allow_missing_bpf);
+        let sink = RecordingSink::default();
+        let selected =
+            gate(&fixture, &cli, BOTH, &sink).map_err(ctx("matching objects pass the gate"))?;
+        assert!(matches!(selected.procmon, Some(Ok(_))));
+        assert!(matches!(selected.flow, Some(Ok(_))));
+        assert_eq!(reported_count(&sink)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_removed_selected_object_refuses_to_start_with_status_78() -> TestResult {
+        // Das Objekt wurde nach der Installation entfernt: früher degradierte
+        // nur der Sensor, die Unit blieb aktiv und die Erkennung blind.
+        let fixture = Fixture::trusted()?;
+        std::fs::remove_file(fixture.object_path(BpfObjectKind::Exec))
+            .map_err(ctx("remove the exec object"))?;
+        let cli = fixture_cli(&fixture, &with_manifest(&fixture))?;
+        let sink = RecordingSink::default();
+        expect_integrity_refusal(
+            gate(&fixture, &cli, BOTH, &sink),
+            Some(BpfObjectKind::Exec),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::Missing),
+            &sink,
+            &BOTH_IDS,
+        )
+    }
+
+    #[test]
+    fn test_corrupt_or_truncated_selected_object_refuses_to_start_with_status_78() -> TestResult {
+        let truncated_magic = object_bytes(BpfObjectKind::TcpV6Connect)
+            .get(..2)
+            .ok_or(TestError::Missing("two bytes of the fixture object"))?
+            .to_vec();
+        for (bytes, reason) in [
+            (
+                b"corrupted: no ELF header".to_vec(),
+                ObjectUnavailableReason::NotElf,
+            ),
+            (truncated_magic, ObjectUnavailableReason::NotElf),
+            (Vec::new(), ObjectUnavailableReason::Empty),
+        ] {
+            let fixture = Fixture::trusted()?;
+            std::fs::write(fixture.object_path(BpfObjectKind::TcpV6Connect), &bytes)
+                .map_err(ctx("corrupt the tcp_v6 object"))?;
+            let cli = fixture_cli(&fixture, &with_manifest(&fixture))?;
+            let sink = RecordingSink::default();
+            expect_integrity_refusal(
+                gate(&fixture, &cli, BOTH, &sink),
+                Some(BpfObjectKind::TcpV6Connect),
+                IntegrityFailure::ObjectUnresolved(reason),
+                &sink,
+                &BOTH_IDS,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_selected_object_with_other_elf_bytes_refuses_with_digest_mismatch() -> TestResult {
+        let original = object_bytes(BpfObjectKind::Exit);
+        let mut appended = original.clone();
+        appended.extend_from_slice(b"-tampered");
+        let truncated = original
+            .get(..6)
+            .ok_or(TestError::Missing("six bytes of the fixture object"))?
+            .to_vec();
+        for bytes in [appended, truncated] {
+            let fixture = Fixture::trusted()?;
+            std::fs::write(fixture.object_path(BpfObjectKind::Exit), &bytes)
+                .map_err(ctx("tamper with the exit object"))?;
+            let cli = fixture_cli(&fixture, &with_manifest(&fixture))?;
+            let sink = RecordingSink::default();
+            expect_integrity_refusal(
+                gate(&fixture, &cli, BOTH, &sink),
+                Some(BpfObjectKind::Exit),
+                IntegrityFailure::DigestMismatch,
+                &sink,
+                &BOTH_IDS,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_selected_objects_missing_is_refused_instead_of_verifying_nothing() -> TestResult {
+        // Früher: keine aufgelöste Datei, also `Ok(0)` ohne das Manifest zu
+        // öffnen, und beide Sensoren still degradiert.
+        let fixture = Fixture::trusted()?;
+        for object in [
+            BpfObjectKind::Exec,
+            BpfObjectKind::Exit,
+            BpfObjectKind::TcpV4Connect,
+            BpfObjectKind::TcpV6Connect,
+        ] {
+            std::fs::remove_file(fixture.object_path(object)).map_err(ctx("remove an object"))?;
+        }
+        let cli = fixture_cli(&fixture, &with_manifest(&fixture))?;
+
+        let sink = RecordingSink::default();
+        expect_integrity_refusal(
+            gate(&fixture, &cli, BOTH, &sink),
+            Some(BpfObjectKind::Exec),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::Missing),
+            &sink,
+            &BOTH_IDS,
+        )?;
+
+        // Nur der Prozess-Sensor gewählt: dieselbe Ablehnung, gemeldet wird
+        // nur er.
+        let sink = RecordingSink::default();
+        expect_integrity_refusal(
+            gate(&fixture, &cli, EXEC_ONLY, &sink),
+            Some(BpfObjectKind::Exec),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::Missing),
+            &sink,
+            &["probe-bpf-procmon-0"],
+        )?;
+
+        // Ein konfiguriertes Manifest wird auch ohne aufgelöstes Objekt
+        // gelesen: fehlt es, scheitert schon dessen Prüfung.
+        std::fs::remove_file(fixture.manifest_path()).map_err(ctx("remove the manifest"))?;
+        let sink = RecordingSink::default();
+        expect_integrity_refusal(
+            gate(&fixture, &cli, BOTH, &sink),
+            None,
+            IntegrityFailure::ManifestUnreadable(ErrorKind::NotFound),
+            &sink,
+            &BOTH_IDS,
+        )
+    }
+
+    #[test]
+    fn test_unresolved_object_without_manifest_or_development_mode_is_refused() -> TestResult {
+        // Fail closed auch ohne `--bpf-manifest`: ohne den Entwicklungsmodus
+        // degradiert kein gewählter Sensor still. Das eingelesene
+        // Geschwister `exec.bpf.o` des fehlenden `exit.bpf.o` wird zuerst
+        // geprüft und verlangt ein Manifest.
+        let fixture = Fixture::trusted()?;
+        remove_objects(&fixture, &[BpfObjectKind::Exit])?;
+        let cli = fixture_cli(&fixture, &[])?;
+        let sink = RecordingSink::default();
+        expect_integrity_refusal(
+            gate(&fixture, &cli, EXEC_ONLY, &sink),
+            None,
+            IntegrityFailure::ManifestNotConfigured,
+            &sink,
+            &["probe-bpf-procmon-0"],
+        )?;
+
+        // Ohne ein einziges eingelesenes Objekt bleibt die Ablehnung des
+        // fehlenden Objekts: auch dann kein stiller Start.
+        remove_objects(&fixture, &[BpfObjectKind::Exec])?;
+        let sink = RecordingSink::default();
+        expect_integrity_refusal(
+            gate(&fixture, &cli, EXEC_ONLY, &sink),
+            Some(BpfObjectKind::Exec),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::Missing),
+            &sink,
+            &["probe-bpf-procmon-0"],
+        )
+    }
+
+    #[test]
+    fn test_gate_ignores_missing_objects_of_an_unselected_sensor() -> TestResult {
+        // Ein Profil, das nur `exec` wählt, scheitert nie an fehlenden
+        // tcp-Objekten: ein nicht gewählter Sensor wird gar nicht aufgelöst.
+        let fixture = Fixture::trusted()?;
+        remove_objects(
+            &fixture,
+            &[BpfObjectKind::TcpV4Connect, BpfObjectKind::TcpV6Connect],
+        )?;
+        let cli = fixture_cli(&fixture, &with_manifest(&fixture))?;
+        let sink = RecordingSink::default();
+        let selected = gate(&fixture, &cli, EXEC_ONLY, &sink)
+            .map_err(ctx("an unselected sensor's objects are ignored"))?;
+        assert!(matches!(selected.procmon, Some(Ok(_))));
+        assert!(selected.flow.is_none());
+        assert_eq!(reported_count(&sink)?, 0);
+
+        // Dasselbe umgekehrt: nur `tcp-connect` gewählt, Prozess-Objekte weg.
+        let fixture = Fixture::trusted()?;
+        remove_objects(&fixture, &[BpfObjectKind::Exec, BpfObjectKind::Exit])?;
+        let cli = fixture_cli(&fixture, &with_manifest(&fixture))?;
+        let sink = RecordingSink::default();
+        let selected = gate(&fixture, &cli, TCP_ONLY, &sink)
+            .map_err(ctx("an unselected sensor's objects are ignored"))?;
+        assert!(selected.procmon.is_none());
+        assert!(matches!(selected.flow, Some(Ok(_))));
+        assert_eq!(reported_count(&sink)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tampered_object_is_reported_before_its_missing_sibling() -> TestResult {
+        // Innerhalb eines Sensors: `exec.bpf.o` manipuliert, `exit.bpf.o`
+        // entfernt. Gemeldet wird die Manipulation, nicht erst nach der
+        // Reparatur von `exit.bpf.o` beim nächsten Start; in der Produktion
+        // wie im Entwicklungsmodus.
+        let fixture = Fixture::trusted()?;
+        tamper(&fixture, BpfObjectKind::Exec)?;
+        remove_objects(&fixture, &[BpfObjectKind::Exit])?;
+        for extra in [
+            with_manifest(&fixture).to_vec(),
+            dev_mode_with_manifest(&fixture),
+        ] {
+            let cli = fixture_cli(&fixture, &extra)?;
+            let sink = RecordingSink::default();
+            expect_integrity_refusal(
+                gate(&fixture, &cli, BOTH, &sink),
+                Some(BpfObjectKind::Exec),
+                IntegrityFailure::DigestMismatch,
+                &sink,
+                &BOTH_IDS,
+            )?;
+        }
+
+        // Ohne Manipulation bleibt es bei der Ablehnung des fehlenden Objekts.
+        let fixture = Fixture::trusted()?;
+        remove_objects(&fixture, &[BpfObjectKind::Exit])?;
+        let cli = fixture_cli(&fixture, &with_manifest(&fixture))?;
+        let sink = RecordingSink::default();
+        expect_integrity_refusal(
+            gate(&fixture, &cli, BOTH, &sink),
+            Some(BpfObjectKind::Exit),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::Missing),
+            &sink,
+            &BOTH_IDS,
+        )
+    }
+
+    #[test]
+    fn test_development_mode_requires_the_manifest() -> TestResult {
+        // `clap` verlangt `--bpf-manifest` (`requires`); die Meldung nennt es.
+        let fixture = Fixture::trusted()?;
+        match fixture_cli(&fixture, &dev_mode()) {
+            Err(TestError::Context { source, .. }) if source.contains("--bpf-manifest") => {}
+            Err(other) => return Err(other),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "--dev-allow-missing-bpf parsed without --bpf-manifest".into(),
+                ));
+            }
+        }
+        let cli = fixture_cli(&fixture, &dev_mode_with_manifest(&fixture))?;
+        assert!(cli.dev_allow_missing_bpf);
+        assert_eq!(cli.bpf_manifest, Some(fixture.manifest_path()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_development_mode_loads_a_partial_build_and_degrades_only_the_unresolved_sensor()
+    -> TestResult {
+        // Teilbau: `exec`/`exit` gebaut, beide tcp-Objekte fehlen. Der
+        // Prozess-Sensor passiert die Manifestprüfung, nur der
+        // Verbindungs-Sensor degradiert.
+        let fixture = Fixture::trusted()?;
+        remove_objects(
+            &fixture,
+            &[BpfObjectKind::TcpV4Connect, BpfObjectKind::TcpV6Connect],
+        )?;
+        let cli = fixture_cli(&fixture, &dev_mode_with_manifest(&fixture))?;
+        let sink = RecordingSink::default();
+        let selected =
+            gate(&fixture, &cli, BOTH, &sink).map_err(ctx("development mode degrades"))?;
+        assert!(matches!(selected.procmon, Some(Ok(_))));
+        let flow = selected
+            .flow
+            .ok_or(TestError::Missing("the tcp-connect sensor's resolution"))?;
+        let defects: Vec<(BpfObjectKind, ObjectUnavailableReason)> = match &flow {
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "removed tcp objects must not resolve".into(),
+                ));
+            }
+            Err(unresolved) => unresolved
+                .missing
+                .iter()
+                .map(|item| (item.object, item.reason))
+                .collect(),
+        };
+        assert_eq!(
+            defects,
+            vec![
+                (
+                    BpfObjectKind::TcpV4Connect,
+                    ObjectUnavailableReason::Missing
+                ),
+                (
+                    BpfObjectKind::TcpV6Connect,
+                    ObjectUnavailableReason::Missing
+                ),
+            ]
+        );
+        // Kein Abbruch, also auch keine Ablehnungsmeldung: der degradierte
+        // Sensor meldet sich selbst beim ersten `poll`.
+        assert_eq!(reported_count(&sink)?, 0);
+
+        // `setup_sensor` degradiert dann, ohne einen Vertragssatz zu bauen.
+        let loader = RealBpfLoader::new();
+        let contracts_built = Cell::new(false);
+        let setup = setup_sensor(
+            &loader,
+            SensorId::from_str("probe-bpf-flow-0"),
+            flow,
+            |sensor, tcp_v4, tcp_v6| {
+                contracts_built.set(true);
+                harw_dod_flow::flow_contracts(sensor, tcp_v4, tcp_v6, harw_dod_bpf::BpfScope::Host)
+            },
+            Some(network_scope(&[])),
+        )
+        .map_err(ctx("setup_sensor in development mode"))?;
         assert!(matches!(setup, SensorSetup::Degraded(_)));
         assert!(!contracts_built.get());
         Ok(())
+    }
+
+    #[test]
+    fn test_development_mode_never_skips_the_manifest_check() -> TestResult {
+        // Teilbau mit manipuliertem `exit.bpf.o`: der Entwicklungsmodus
+        // lockert nur die Regel für nicht aufgelöste Objekte.
+        let fixture = Fixture::trusted()?;
+        remove_objects(
+            &fixture,
+            &[BpfObjectKind::TcpV4Connect, BpfObjectKind::TcpV6Connect],
+        )?;
+        tamper(&fixture, BpfObjectKind::Exit)?;
+        let cli = fixture_cli(&fixture, &dev_mode_with_manifest(&fixture))?;
+        let sink = RecordingSink::default();
+        expect_integrity_refusal(
+            gate(&fixture, &cli, BOTH, &sink),
+            Some(BpfObjectKind::Exit),
+            IntegrityFailure::DigestMismatch,
+            &sink,
+            &BOTH_IDS,
+        )?;
+
+        // Ein fehlendes Manifest scheitert auch im Entwicklungsmodus, selbst
+        // wenn kein einziges Objekt aufgelöst ist.
+        let fixture = Fixture::trusted()?;
+        remove_objects(
+            &fixture,
+            &[
+                BpfObjectKind::Exec,
+                BpfObjectKind::Exit,
+                BpfObjectKind::TcpV4Connect,
+                BpfObjectKind::TcpV6Connect,
+            ],
+        )?;
+        let cli = fixture_cli(&fixture, &dev_mode_with_manifest(&fixture))?;
+        std::fs::remove_file(fixture.manifest_path()).map_err(ctx("remove the manifest"))?;
+        let sink = RecordingSink::default();
+        expect_integrity_refusal(
+            gate(&fixture, &cli, BOTH, &sink),
+            None,
+            IntegrityFailure::ManifestUnreadable(ErrorKind::NotFound),
+            &sink,
+            &BOTH_IDS,
+        )
     }
 
     #[test]

@@ -4,7 +4,20 @@
 # (harw-dod/crates/harw-probe-bpf/src/bpf_manifest.rs, PL-100 Phase 4,
 # THREAT-MODEL B23).
 #
-# Usage: write-manifest.sh <object dir> <vmlinux BTF> <toolchain lock> <manifest>
+# Usage: write-manifest.sh <object dir> <vmlinux BTF> <toolchain lock> <manifest> <BTF stamp>
+#
+# The BTF stamp is the content key written by scripts/btf-stamp.sh, which the
+# Makefile puts in front of vmlinux.h and therefore of every object. The
+# manifest attests that the objects were built from the BTF whose digest it
+# records, so this script refuses (and leaves an existing manifest untouched)
+# when the stamp is missing, differs from the digest of <vmlinux BTF>, or is
+# newer than one of the objects: in each case the header and objects in
+# <object dir> may stem from other BTF content. Rebuild through the Makefile.
+# The stamp argument is mandatory: a caller written for the former
+# four-argument form (e.g. an operator BPF_BUILD_COMMAND in
+# harw-dod/scripts/build-bpf.sh that calls this script directly) fails with
+# exit status 2 and a message that names the missing BTF stamp; build through
+# `make -C harw-dod/bpf` instead, which passes it.
 #
 # Every value is emitted on exactly one line. A digest is taken through
 # command substitution, which strips sha256sum's trailing newline; a raw
@@ -18,10 +31,19 @@
 # (scripts/check-manifest-writer.sh) re-runs this script and diffs against it.
 set -eu
 
+if [ "$#" -eq 4 ]; then
+    printf 'write-manifest: missing fifth argument <BTF stamp> (the former four-argument call is no longer accepted); build through `make -C harw-dod/bpf`, which writes the stamp with scripts/btf-stamp.sh and passes it\n' >&2
+fi
+if [ "$#" -ne 5 ]; then
+    printf 'usage: %s <object dir> <vmlinux BTF> <toolchain lock> <manifest> <BTF stamp>\n' "$0" >&2
+    exit 2
+fi
+
 out=$1
 btf=$2
 lock=$3
 manifest=$4
+stamp=$5
 tmp="${manifest}.tmp"
 
 fail() {
@@ -50,6 +72,21 @@ sha256_of() {
 }
 
 btf_hash=$(sha256_of "$btf")
+
+# The objects must have been built for exactly this BTF content: the stamp
+# (written by btf-stamp.sh before vmlinux.h was generated) must name the
+# same digest, and no object may predate it.
+[ -f "$stamp" ] || fail "missing BTF stamp $stamp; build through the Makefile (scripts/btf-stamp.sh)"
+stamp_hash=$(cat -- "$stamp") || fail "unreadable BTF stamp $stamp"
+[ "$stamp_hash" = "$btf_hash" ] \
+    || fail "BTF stamp $stamp does not match $btf: vmlinux.h and the objects were built for other BTF content; rebuild with make"
+for name in exec.bpf.o exit.bpf.o tcp_v4_connect.bpf.o tcp_v6_connect.bpf.o; do
+    [ -f "$out/$name" ] || fail "missing object $out/$name"
+    if [ "$stamp" -nt "$out/$name" ]; then
+        fail "$out/$name is older than the BTF stamp $stamp; rebuild with make"
+    fi
+done
+
 host_arch=$(uname -m)
 clang_version=$(lock_value clang_version)
 bpftool_version=$(lock_value bpftool_version)

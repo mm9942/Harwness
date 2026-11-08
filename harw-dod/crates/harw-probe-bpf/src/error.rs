@@ -23,13 +23,19 @@
 //! 7. den `completions`-Unterbefehl (über
 //!    `harw_completions::CompletionError`).
 //!
-//! **Nicht** hierher gehört ein fehlendes oder ungültiges eBPF-Objekt: die
-//! Objektauflösung ([`crate::sensors::resolve_procmon_objects`],
-//! [`crate::sensors::resolve_flow_objects`]) meldet das als
-//! [`crate::sensors::ObjectUnavailable`], und der betroffene Sensor wird als
+//! Ein fehlendes oder ungültiges eBPF-Objekt meldet die Objektauflösung
+//! ([`crate::sensors::resolve_procmon_objects`],
+//! [`crate::sensors::resolve_flow_objects`]) zunächst als
+//! [`crate::sensors::ObjectUnavailable`]. Für einen gewählten Sensor wird
+//! daraus produktiv [`ProbeError::BpfObjectIntegrity`] mit
+//! [`crate::bpf_manifest::IntegrityFailure::ObjectUnresolved`]: ein Objekt
+//! ohne prüfbare Bytes darf die Manifestprüfung nicht umgehen (Owner-Review
+//! zu PR #168). Nur im Entwicklungsmodus `--dev-allow-missing-bpf` (nur
+//! zusammen mit `--bpf-manifest`) wird der Sensor stattdessen als
 //! [`crate::sensors::UnavailableSensor`] degradiert (`SensorDegraded` an den
-//! Sentinel), statt den Prozess zu beenden. Ein Objekt, das vorhanden und
-//! gültig ist, aber nicht zum Manifest passt, ist dagegen
+//! Sentinel); die Manifestprüfung der aufgelösten Objekte gilt auch dort.
+//! Ein Objekt, das vorhanden und gültig
+//! ist, aber nicht zum Manifest passt, ist ebenfalls
 //! [`ProbeError::BpfObjectIntegrity`]: ein Manipulationsverdacht, kein
 //! Betriebsfall. Auch ein
 //! [`ProbeError::BpfLoad`] ist deshalb nicht automatisch ein Startabbruch —
@@ -148,9 +154,12 @@ pub enum ProbeError {
 
     /// Ein eBPF-Objekt oder das SHA-256-Manifest des BPF-Builds hat die
     /// Integritätsprüfung vor dem Laden nicht bestanden
-    /// ([`crate::bpf_manifest::verify_resolved_objects`]): kein Manifest
+    /// ([`crate::bpf_manifest::verify_resolved_objects`],
+    /// [`crate::bpf_manifest::ensure_objects_resolved`]): kein Manifest
     /// konfiguriert, Manifest nicht vertrauenswürdig, unlesbar oder
-    /// ungültig, kein Eintrag für das Objekt oder ein abweichender Digest.
+    /// ungültig, kein Eintrag für das Objekt, ein abweichender Digest oder
+    /// (außerhalb von `--dev-allow-missing-bpf`) ein gewähltes Objekt, das
+    /// sich nicht auflösen ließ.
     ///
     /// Immer ein harter Startabbruch vor Landlock und vor jedem Lade- oder
     /// Anheftschritt; `main::run` meldet vorher jeden gewählten Sensor einmal
@@ -449,6 +458,22 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "refusing to load bpf object exec.bpf.o: the sha256 digest of the object does not match the manifest"
+        );
+        assert!(!err.to_string().contains('/'));
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_unresolved_selected_object_names_object_and_reason_but_no_path() {
+        let err = ProbeError::BpfObjectIntegrity {
+            object: Some(crate::sensors::BpfObjectKind::Exit),
+            failure: crate::bpf_manifest::IntegrityFailure::ObjectUnresolved(
+                crate::sensors::ObjectUnavailableReason::NotElf,
+            ),
+        };
+        assert_eq!(
+            err.to_string(),
+            "refusing to load bpf object exit.bpf.o: the selected object could not be resolved: file is not an ELF object"
         );
         assert!(!err.to_string().contains('/'));
         assert!(std::error::Error::source(&err).is_none());

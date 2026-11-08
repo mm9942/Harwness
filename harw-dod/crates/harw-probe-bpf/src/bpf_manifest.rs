@@ -87,22 +87,34 @@
 //! Jede Abweichung ist ein harter Startabbruch
 //! (`crate::error::ProbeError::BpfObjectIntegrity`), nie eine Degradierung:
 //! ein Objekt, das vorhanden ist, aber nicht zum Manifest passt, ist ein
-//! Manipulationsverdacht, kein Betriebsfall. Ein **fehlendes** Objekt bleibt
-//! dagegen die dokumentierte Degradierung aus `crate::sensors`; es wird gar
-//! nicht erst geprüft. `main::run` meldet vor dem Abbruch jeden gewählten
-//! Sensor einmal als `SensorDegraded` an den Sentinel; `main` endet mit dem
-//! Exit-Status 78 (`EX_CONFIG`), den die systemd-Unit nicht neu startet.
+//! Manipulationsverdacht, kein Betriebsfall. Dasselbe gilt für ein
+//! **gewähltes** Objekt, das sich nicht auflösen lässt (fehlt, ist leer,
+//! gekürzt, kein ELF oder unlesbar; [`ensure_objects_resolved`],
+//! [`IntegrityFailure::ObjectUnresolved`]): es liefert keine Bytes, die
+//! geprüft werden könnten, und ein still degradierter Sensor ließe die Unit
+//! aktiv, aber diese Erkennung blind (Owner-Review zu PR #168). Nur der
+//! Entwicklungsmodus `--dev-allow-missing-bpf`, der `--bpf-manifest`
+//! verlangt, degradiert einen solchen Sensor stattdessen
+//! (`main::verify_selected_objects`); jedes aufgelöste Objekt, auch das
+//! verwendbare Geschwister eines nicht aufgelösten, wird in beiden Fällen
+//! gegen das Manifest geprüft, eine Manipulation also immer vor einem
+//! fehlenden Objekt gemeldet. Ist `--bpf-manifest`
+//! gesetzt, wird das Manifest immer gelesen und geprüft, auch wenn kein
+//! einziges Objekt aufgelöst ist ([`verify_resolved_objects`]). `main::run`
+//! meldet vor dem Abbruch jeden gewählten Sensor einmal als `SensorDegraded`
+//! an den Sentinel; `main` endet mit dem Exit-Status 78 (`EX_CONFIG`), den
+//! die systemd-Unit nicht neu startet.
 //!
 //! # Protokoll
 //! Fehler tragen nur den Objektnamen und einen festen Grund
 //! ([`IntegrityFailure`]): keinen Pfad, keinen Digest, keinen Dateiinhalt.
-//! Der Manifestpfad erscheint nur auf `info`, die genaue verletzte Regel nur
-//! auf `debug`.
+//! Der Manifestpfad und der Suchpfad eines nicht aufgelösten Objekts
+//! erscheinen nur auf `info`, die genaue verletzte Regel nur auf `debug`.
 //!
 //! # Exportierte Typen
 //! [`MANIFEST_OWNER_UID`], [`MAX_MANIFEST_BYTES`], [`MANIFEST_SCHEMA_VERSION`],
 //! [`IntegrityFailure`], [`BpfManifest`], [`load_manifest`],
-//! [`verify_resolved_objects`].
+//! [`verify_resolved_objects`], [`ensure_objects_resolved`].
 //!
 //! # Nebenläufigkeit
 //! Läuft einmal beim Start im Hauptthread, vor Landlock und vor jedem
@@ -110,21 +122,29 @@
 //!
 //! # Fehler
 //! [`IntegrityFailure`] für die Bausteine, `crate::error::ProbeError` für
-//! [`verify_resolved_objects`].
+//! [`verify_resolved_objects`] und [`ensure_objects_resolved`].
 //!
 //! # Examples
 //! ```rust,ignore
 //! use std::path::Path;
 //!
-//! use crate::bpf_manifest::verify_resolved_objects;
+//! use crate::bpf_manifest::{ensure_objects_resolved, verify_resolved_objects};
 //! use crate::sensors::resolve_procmon_objects;
 //!
-//! let objects = resolve_procmon_objects(None, None)?;
-//! let refs: Vec<_> = objects.iter().collect();
-//! verify_resolved_objects(
-//!     Some(Path::new("/usr/local/lib/harw-dod/bpf/manifest.json")),
-//!     &refs,
-//! )?;
+//! let manifest = Some(Path::new("/usr/local/lib/harw-dod/bpf/manifest.json"));
+//! match resolve_procmon_objects(None, None) {
+//!     Ok(objects) => {
+//!         let refs: Vec<_> = objects.iter().collect();
+//!         verify_resolved_objects(manifest, &refs)?;
+//!     }
+//!     // Ein gewähltes, aber nicht auflösbares Objekt: erst das eingelesene
+//!     // Geschwister prüfen (Manipulation vor Fehlen), dann Startabbruch.
+//!     Err(unresolved) => {
+//!         let refs: Vec<_> = unresolved.resolved.iter().collect();
+//!         verify_resolved_objects(manifest, &refs)?;
+//!         ensure_objects_resolved(&unresolved.missing.iter().collect::<Vec<_>>())?;
+//!     }
+//! }
 //! ```
 
 use std::fmt;
@@ -140,7 +160,9 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::error::ProbeError;
-use crate::sensors::{BpfObjectKind, ResolvedBpfObject};
+use crate::sensors::{
+    BpfObjectKind, ObjectUnavailable, ObjectUnavailableReason, ResolvedBpfObject,
+};
 
 /// Erwarteter Eigentümer des Manifests und jeder Verzeichnisstufe darüber:
 /// **root** (uid 0).
@@ -210,6 +232,11 @@ pub enum IntegrityFailure {
     /// (`BpfProgramSource::Path` statt `Embedded`); ohne die zu ladenden
     /// Bytes ist keine Prüfung möglich.
     SourceNotEmbedded,
+    /// Ein vom Profil gewähltes Objekt ließ sich nicht auflösen oder
+    /// einlesen ([`ensure_objects_resolved`]): es fehlt, ist leer, zu groß,
+    /// kein ELF, keine reguläre Datei, unter einem relativen Pfad oder
+    /// unlesbar. Der Grund stammt aus `crate::sensors` und trägt keinen Pfad.
+    ObjectUnresolved(ObjectUnavailableReason),
 }
 
 impl fmt::Display for IntegrityFailure {
@@ -241,6 +268,9 @@ impl fmt::Display for IntegrityFailure {
             }
             Self::SourceNotEmbedded => {
                 f.write_str("the object bytes were not read before verification")
+            }
+            Self::ObjectUnresolved(reason) => {
+                write!(f, "the selected object could not be resolved: {reason}")
             }
         }
     }
@@ -706,13 +736,18 @@ fn hex_value(digit: u8) -> Option<u8> {
 /// wird.
 ///
 /// # Description
-/// Ohne aufgelöstes Objekt gibt es nichts zu prüfen (fehlende Objekte
-/// degradieren ihren Sensor, siehe `crate::sensors`), und das Manifest wird
-/// nicht gelesen. Sonst muss `manifest_path` gesetzt sein; das Manifest
-/// wird mit [`load_manifest`] gelesen und jedes Objekt mit
-/// [`BpfManifest::verify`] gegen genau die eingelesenen Bytes geprüft. Der
-/// erste Verstoß wird auf `error` protokolliert (Objektname und Grund, kein
-/// Pfad, kein Digest) und zurückgegeben.
+/// Ist `manifest_path` gesetzt, wird das Manifest **immer** mit
+/// [`load_manifest`] gelesen und geprüft, auch wenn kein einziges Objekt
+/// aufgelöst ist: ein konfiguriertes, aber fehlendes, nicht
+/// vertrauenswürdiges oder ungültiges Manifest beendet den Start auch dann
+/// (früher lieferte eine leere Objektliste `Ok(0)`, ohne das Manifest zu
+/// öffnen). Danach wird jedes Objekt mit [`BpfManifest::verify`] gegen genau
+/// die eingelesenen Bytes geprüft. Ohne `manifest_path` ist nur eine leere
+/// Objektliste zulässig; jedes aufgelöste Objekt verlangt ein Manifest.
+/// Gewählte, aber nicht aufgelöste Objekte liefern keine Bytes; sie prüft
+/// [`ensure_objects_resolved`]. Der erste Verstoß wird auf `error`
+/// protokolliert (Objektname und Grund, kein Pfad, kein Digest) und
+/// zurückgegeben.
 ///
 /// # Arguments
 /// - `manifest_path` (`Option<&Path>`): `--bpf-manifest`.
@@ -733,10 +768,26 @@ pub fn verify_resolved_objects(
     manifest_path: Option<&Path>,
     objects: &[&ResolvedBpfObject],
 ) -> Result<usize, ProbeError> {
-    if objects.is_empty() {
-        return Ok(0);
-    }
+    verify_resolved_objects_with(manifest_path, objects, load_manifest)
+}
+
+/// Wie [`verify_resolved_objects`], mit frei gewähltem Manifestlader.
+///
+/// # Description
+/// Die Produktion übergibt [`load_manifest`] (Anker `/`, Eigentümer root);
+/// Tests einen Lader, der dasselbe Manifest unterhalb eines eigenen
+/// Temporärverzeichnisses mit der eigenen uid prüft
+/// ([`load_manifest_below`]). Sonst identisch, damit die Tests genau die
+/// produktive Entscheidungsfolge durchlaufen.
+fn verify_resolved_objects_with(
+    manifest_path: Option<&Path>,
+    objects: &[&ResolvedBpfObject],
+    load: impl FnOnce(&Path) -> Result<BpfManifest, IntegrityFailure>,
+) -> Result<usize, ProbeError> {
     let Some(path) = manifest_path else {
+        if objects.is_empty() {
+            return Ok(0);
+        }
         return Err(refuse(None, IntegrityFailure::ManifestNotConfigured));
     };
     tracing::info!(
@@ -744,8 +795,56 @@ pub fn verify_resolved_objects(
         objects = objects.len(),
         "verifying bpf objects against the sha256 manifest"
     );
-    let manifest = load_manifest(path).map_err(|failure| refuse(None, failure))?;
+    let manifest = load(path).map_err(|failure| refuse(None, failure))?;
     verify_against(&manifest, objects)
+}
+
+/// Lehnt den Start ab, sobald ein gewähltes Objekt nicht aufgelöst ist.
+///
+/// # Description
+/// Ein gewähltes Objekt, das fehlt, leer, gekürzt, kein ELF oder unlesbar
+/// ist, liefert keine Bytes, die [`verify_resolved_objects`] prüfen könnte.
+/// Degradierte es nur seinen Sensor, bliebe die Unit aktiv und diese
+/// Erkennung blind, ohne dass je ein Manifest geprüft worden wäre
+/// (Owner-Review zu PR #168). Außerhalb des Entwicklungsmodus
+/// `--dev-allow-missing-bpf` ist es deshalb ein Integritätsverstoß wie ein
+/// abweichender Digest. Jeder Mangel wird auf `error` protokolliert
+/// (Objektname und Grund, kein Pfad), der Suchpfad nur auf `info`.
+///
+/// # Arguments
+/// - `unresolved` (`&[&ObjectUnavailable]`): die Mängel aller gewählten
+///   Sensoren, Prozess- vor Verbindungs-Sensor.
+///
+/// # Returns
+/// `Ok(())`, wenn die Liste leer ist.
+///
+/// # Errors
+/// [`ProbeError::BpfObjectIntegrity`] mit dem ersten nicht aufgelösten
+/// Objekt und [`IntegrityFailure::ObjectUnresolved`] mit seinem Grund.
+///
+/// # Concurrency
+/// Rein bis auf das Protokoll; nur beim Start im Hauptthread.
+pub fn ensure_objects_resolved(unresolved: &[&ObjectUnavailable]) -> Result<(), ProbeError> {
+    let mut first: Option<ProbeError> = None;
+    for item in unresolved {
+        tracing::info!(
+            object = %item.object,
+            path = %item.path.display(),
+            "searched path of the unresolved bpf object"
+        );
+        // Jeder Mangel wird protokolliert, zurückgegeben wird der erste.
+        let refusal = refuse(
+            Some(item.object),
+            IntegrityFailure::ObjectUnresolved(item.reason),
+        );
+        if first.is_none() {
+            first = Some(refusal);
+        }
+    }
+    match first {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
 }
 
 /// Prüft jedes Objekt gegen ein bereits geladenes Manifest.
@@ -777,7 +876,7 @@ fn refuse(object: Option<BpfObjectKind>, failure: IntegrityFailure) -> ProbeErro
         Some(object) => tracing::error!(
             object = %object,
             failure = %failure,
-            "bpf object failed manifest verification; refusing to load"
+            "bpf object failed the integrity check; refusing to load"
         ),
         None => tracing::error!(
             failure = %failure,
@@ -787,20 +886,21 @@ fn refuse(object: Option<BpfObjectKind>, failure: IntegrityFailure) -> ProbeErro
     ProbeError::BpfObjectIntegrity { object, failure }
 }
 
+/// Gemeinsame Test-Fixture: ein vertrauenswürdiges Manifest und die vier
+/// Objekte unterhalb eines Temporärverzeichnisses. Genutzt von den Tests
+/// dieses Moduls und von den Ende-zu-Ende-Tests der Integritätsschranke in
+/// `main` (dort mit echter Objektauflösung und echter Manifestprüfung, nur
+/// mit dem Eigentümer und Anker der Fixture statt root und `/`).
 #[cfg(test)]
-mod tests {
-    use std::borrow::Cow;
-    use std::io::ErrorKind;
+pub(crate) mod test_fixture {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
 
-    use harw_dod_bpf::BpfProgramSource;
     use sha2::{Digest as _, Sha256};
 
     use super::{
-        BpfManifest, IntegrityFailure, KNOWN_OBJECTS, MANIFEST_OWNER_UID, MAX_MANIFEST_BYTES,
-        contract_names, has_dot_segment, load_manifest, load_manifest_below, verify_against,
-        verify_resolved_objects,
+        BpfManifest, IntegrityFailure, KNOWN_OBJECTS, contract_names, load_manifest_below,
+        verify_resolved_objects_with,
     };
     use crate::error::ProbeError;
     use crate::sensors::{
@@ -809,14 +909,14 @@ mod tests {
     use crate::test_support::{TestError, TestResult, ctx};
 
     /// Relativer Manifestpfad unter dem Testanker.
-    const MANIFEST: &str = "bpf/manifest.json";
+    pub(crate) const MANIFEST: &str = "bpf/manifest.json";
 
     /// Die ersten vier Bytes jeder ELF-Datei (wie `crate::sensors`).
     const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
     /// Fixture-Objektbytes: ELF-Kennung plus objektspezifischer Rest, damit
     /// jedes Objekt einen eigenen Digest hat.
-    fn object_bytes(object: BpfObjectKind) -> Vec<u8> {
+    pub(crate) fn object_bytes(object: BpfObjectKind) -> Vec<u8> {
         let mut bytes = ELF_MAGIC.to_vec();
         bytes.extend_from_slice(b"-fixture-");
         bytes.extend_from_slice(object.file_name().as_bytes());
@@ -824,7 +924,7 @@ mod tests {
     }
 
     /// SHA-256 als 64 kleine Hexziffern, wie `sha256sum` sie schreibt.
-    fn sha256_hex(bytes: &[u8]) -> String {
+    pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         Sha256::digest(bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -833,7 +933,7 @@ mod tests {
 
     /// Kopf eines Schema-1-Manifests mit frei wählbarer Schema-, ABI- und
     /// Zielangabe.
-    fn header(schema: u32, abi: u32, target: &str) -> String {
+    pub(crate) fn header(schema: u32, abi: u32, target: &str) -> String {
         format!(
             "schema_version = {schema}\nwire_abi_version = {abi}\nbpf_target = \"{target}\"\nhost_arch = \"x86_64\"\nclang_version = \"Ubuntu clang version 18.1.3\"\nbpftool_version = \"bpftool v7.4.0\"\nvmlinux_btf_sha256 = \"{}\"\n",
             sha256_hex(b"fixture vmlinux btf")
@@ -841,23 +941,30 @@ mod tests {
     }
 
     /// Ein `[[objects]]`-Eintrag mit frei wählbaren Feldern.
-    fn entry(name: &str, program: &str, attach: &str, sha256: &str, maps: &str) -> String {
+    pub(crate) fn entry(
+        name: &str,
+        program: &str,
+        attach: &str,
+        sha256: &str,
+        maps: &str,
+    ) -> String {
         format!(
             "\n[[objects]]\nname = \"{name}\"\nprogram = \"{program}\"\nattach = \"{attach}\"\nsha256 = \"{sha256}\"\nmaps = {maps}\n"
         )
     }
 
     /// Der Map-Satz, den `write-manifest.sh` schreibt.
-    const MAPS: &str = "[\"EVENTS\", \"SCOPE_CGROUP_IDS\", \"LOSS_COUNTS\", \"SEQUENCE\"]";
+    pub(crate) const MAPS: &str =
+        "[\"EVENTS\", \"SCOPE_CGROUP_IDS\", \"LOSS_COUNTS\", \"SEQUENCE\"]";
 
     /// Ein vertragsgemäßer Eintrag für ein Objekt mit gegebenem Digest.
-    fn contract_entry(object: BpfObjectKind, sha256: &str) -> String {
+    pub(crate) fn contract_entry(object: BpfObjectKind, sha256: &str) -> String {
         let (program, attach) = contract_names(object);
         entry(object.file_name(), program, attach, sha256, MAPS)
     }
 
     /// Ein gültiges Manifest für die übergebenen Objekte (Fixture-Digests).
-    fn manifest_for(objects: &[BpfObjectKind]) -> String {
+    pub(crate) fn manifest_for(objects: &[BpfObjectKind]) -> String {
         let mut text = header(1, 1, "bpfel");
         for &object in objects {
             text.push_str(&contract_entry(object, &sha256_hex(&object_bytes(object))));
@@ -867,23 +974,23 @@ mod tests {
 
     /// Setzt den Modus einer Datei oder eines Verzeichnisses explizit (die
     /// umask des Testlaufs soll das Ergebnis nicht bestimmen).
-    fn chmod(path: &Path, mode: u32) -> TestResult {
+    pub(crate) fn chmod(path: &Path, mode: u32) -> TestResult {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
             .map_err(ctx("set fixture permissions"))
     }
 
     /// Ein Testanker: Temporärverzeichnis mit `bpf/` (0755), den vier
     /// Fixture-Objekten und einem Manifest (0644).
-    struct Fixture {
+    pub(crate) struct Fixture {
         // Hält das Temporärverzeichnis am Leben.
         dir: tempfile::TempDir,
-        // Eigentümer der Fixture-Dateien (die uid des Testlaufs).
-        owner: u32,
+        /// Eigentümer der Fixture-Dateien (die uid des Testlaufs).
+        pub(crate) owner: u32,
     }
 
     impl Fixture {
         /// Legt die Fixture mit dem gegebenen Manifesttext an.
-        fn new(manifest: &str) -> TestResult<Self> {
+        pub(crate) fn new(manifest: &str) -> TestResult<Self> {
             let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
             chmod(dir.path(), 0o700)?;
             let bpf = dir.path().join("bpf");
@@ -903,24 +1010,60 @@ mod tests {
             Ok(Self { dir, owner })
         }
 
+        /// Die Fixture eines vollständigen Builds: alle vier Objekte und ein
+        /// Manifest, das genau sie bindet.
+        pub(crate) fn trusted() -> TestResult<Self> {
+            Self::new(&manifest_for(&KNOWN_OBJECTS))
+        }
+
         /// Der Anker (das Temporärverzeichnis).
-        fn anchor(&self) -> &Path {
+        pub(crate) fn anchor(&self) -> &Path {
             self.dir.path()
         }
 
         /// Absoluter Pfad unterhalb des Ankers.
-        fn path(&self, relative: &str) -> PathBuf {
+        pub(crate) fn path(&self, relative: &str) -> PathBuf {
             self.dir.path().join(relative)
         }
 
+        /// Absoluter Pfad des Manifests (für `--bpf-manifest`).
+        pub(crate) fn manifest_path(&self) -> PathBuf {
+            self.path(MANIFEST)
+        }
+
+        /// Absoluter Pfad eines Fixture-Objekts (für `--*-program-path`).
+        pub(crate) fn object_path(&self, object: BpfObjectKind) -> PathBuf {
+            self.dir.path().join("bpf").join(object.file_name())
+        }
+
         /// Lädt das Manifest mit der uid des Testlaufs als Eigentümer.
-        fn load(&self) -> Result<BpfManifest, IntegrityFailure> {
+        pub(crate) fn load(&self) -> Result<BpfManifest, IntegrityFailure> {
             load_manifest_below(self.anchor(), Path::new(MANIFEST), self.owner)
+        }
+
+        /// Testgegenstück zu `load_manifest`: ein absoluter Pfad unterhalb
+        /// des Ankers, geprüft mit Anker und Eigentümer der Fixture statt mit
+        /// `/` und root. Ein Pfad außerhalb des Ankers gilt als ungültig.
+        pub(crate) fn load_at(&self, path: &Path) -> Result<BpfManifest, IntegrityFailure> {
+            let relative = path
+                .strip_prefix(self.anchor())
+                .map_err(|_| IntegrityFailure::ManifestPathInvalid)?;
+            load_manifest_below(self.anchor(), relative, self.owner)
+        }
+
+        /// `verify_resolved_objects` mit dem Lader dieser Fixture: dieselbe
+        /// Entscheidungsfolge wie in der Produktion.
+        pub(crate) fn verify(
+            &self,
+            manifest_path: Option<&Path>,
+            objects: &[&ResolvedBpfObject],
+        ) -> Result<usize, ProbeError> {
+            verify_resolved_objects_with(manifest_path, objects, |path| self.load_at(path))
         }
 
         /// Löst alle vier Objekte über die produktiven Funktionen auf
         /// (explizite Pfade, die Prozessumgebung bleibt unberührt).
-        fn resolve_all(&self) -> TestResult<Vec<ResolvedBpfObject>> {
+        pub(crate) fn resolve_all(&self) -> TestResult<Vec<ResolvedBpfObject>> {
             let exec = self.path("bpf/exec.bpf.o");
             let exit = self.path("bpf/exit.bpf.o");
             let v4 = self.path("bpf/tcp_v4_connect.bpf.o");
@@ -932,6 +1075,30 @@ mod tests {
             Ok(vec![exec, exit, v4, v6])
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::io::ErrorKind;
+    use std::path::{Path, PathBuf};
+
+    use harw_dod_bpf::BpfProgramSource;
+
+    use super::test_fixture::{
+        Fixture, MANIFEST, MAPS, chmod, contract_entry, entry, header, manifest_for, object_bytes,
+        sha256_hex,
+    };
+    use super::{
+        BpfManifest, IntegrityFailure, KNOWN_OBJECTS, MANIFEST_OWNER_UID, MAX_MANIFEST_BYTES,
+        contract_names, ensure_objects_resolved, has_dot_segment, load_manifest,
+        load_manifest_below, verify_against, verify_resolved_objects,
+    };
+    use crate::error::ProbeError;
+    use crate::sensors::{
+        BpfObjectKind, ObjectUnavailable, ObjectUnavailableReason, ResolvedBpfObject,
+    };
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Erwartet einen bestimmten Fehler beim Laden.
     fn expect_load_failure(
@@ -1490,6 +1657,92 @@ mod tests {
     }
 
     #[test]
+    fn test_configured_manifest_is_read_even_without_a_resolved_object() -> TestResult {
+        // Owner-Review zu PR #168: fehlten alle gewählten Objekte, lieferte
+        // die Prüfung `Ok(0)`, ohne das konfigurierte Manifest zu öffnen.
+        let fixture = Fixture::trusted()?;
+        let manifest = fixture.manifest_path();
+        assert_eq!(
+            fixture
+                .verify(Some(manifest.as_path()), &[])
+                .map_err(ctx("a trusted manifest without objects"))?,
+            0
+        );
+
+        chmod(&manifest, 0o666)?;
+        expect_refusal(
+            fixture.verify(Some(manifest.as_path()), &[]),
+            None,
+            IntegrityFailure::ManifestUntrusted,
+        )?;
+
+        std::fs::write(&manifest, "this is = = not toml").map_err(ctx("corrupt manifest"))?;
+        chmod(&manifest, 0o644)?;
+        expect_refusal(
+            fixture.verify(Some(manifest.as_path()), &[]),
+            None,
+            IntegrityFailure::ManifestMalformed,
+        )?;
+
+        std::fs::remove_file(&manifest).map_err(ctx("remove manifest"))?;
+        expect_refusal(
+            fixture.verify(Some(manifest.as_path()), &[]),
+            None,
+            IntegrityFailure::ManifestUnreadable(ErrorKind::NotFound),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_production_verification_checks_a_configured_manifest_without_objects() -> TestResult {
+        // Der produktive Einstieg (Anker `/`, Eigentümer root) prüft den
+        // konfigurierten Pfad auch ohne ein einziges aufgelöstes Objekt.
+        expect_refusal(
+            verify_resolved_objects(Some(Path::new("relative/manifest.json")), &[]),
+            None,
+            IntegrityFailure::ManifestPathInvalid,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_unresolved_selected_objects_are_refused_with_the_first_defect() -> TestResult {
+        ensure_objects_resolved(&[]).map_err(ctx("nothing unresolved"))?;
+
+        let removed = ObjectUnavailable {
+            object: BpfObjectKind::Exit,
+            path: PathBuf::from("/usr/local/lib/harw-dod/bpf/exit.bpf.o"),
+            reason: ObjectUnavailableReason::Missing,
+        };
+        let corrupt = ObjectUnavailable {
+            object: BpfObjectKind::TcpV6Connect,
+            path: PathBuf::from("/usr/local/lib/harw-dod/bpf/tcp_v6_connect.bpf.o"),
+            reason: ObjectUnavailableReason::NotElf,
+        };
+        let err = match ensure_objects_resolved(&[&removed, &corrupt]) {
+            Err(
+                err @ ProbeError::BpfObjectIntegrity {
+                    object: Some(BpfObjectKind::Exit),
+                    failure: IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::Missing),
+                },
+            ) => err,
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        };
+        // Objekt und Grund, aber kein Suchpfad.
+        let text = err.to_string();
+        assert!(text.contains("exit.bpf.o"), "{text}");
+        assert!(text.contains("could not be resolved"), "{text}");
+        assert!(!text.contains('/'), "{text}");
+
+        expect_refusal(
+            ensure_objects_resolved(&[&corrupt]).map(|()| 0),
+            Some(BpfObjectKind::TcpV6Connect),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::NotElf),
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn test_resolved_objects_without_configured_manifest_are_refused() -> TestResult {
         let object = ResolvedBpfObject {
             object: BpfObjectKind::Exec,
@@ -1549,6 +1802,15 @@ mod tests {
             IntegrityFailure::EntryMissing,
             IntegrityFailure::DigestMismatch,
             IntegrityFailure::SourceNotEmbedded,
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::RelativePath),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::Missing),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::NotRegularFile),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::Empty),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::TooLarge { size: 1 }),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::NotElf),
+            IntegrityFailure::ObjectUnresolved(ObjectUnavailableReason::Unreadable(
+                ErrorKind::PermissionDenied,
+            )),
         ] {
             let text = failure.to_string();
             assert!(!text.is_empty());

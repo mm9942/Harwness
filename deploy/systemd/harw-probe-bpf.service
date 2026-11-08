@@ -20,11 +20,16 @@
 # every directory above it must be root-owned and not group/world-writable
 # (install.sh installs it 0644 root). A missing --bpf-manifest, an untrusted,
 # unreadable or malformed manifest, a missing entry or a digest mismatch
-# reports SensorDegraded and exits with status 78 (EX_CONFIG). The refusal is
-# permanent, so RestartPreventExitStatus=78 keeps Restart=on-failure from
-# retrying it: the unit fails once and stays failed until an operator fixes
-# the artifacts and restarts it. A MISSING object file still only degrades
-# its sensor.
+# reports SensorDegraded and exits with status 78 (EX_CONFIG). So does a
+# selected object that was removed after install or is empty, truncated or
+# not ELF: it has no bytes to verify, and only degrading its sensor would
+# leave this unit active but that detection lane blind. The manifest is read
+# even when no object resolves. The refusal is permanent, so
+# RestartPreventExitStatus=78 keeps Restart=on-failure from retrying it: the
+# unit fails once and stays failed until an operator fixes the artifacts and
+# restarts it. The development-only flag --dev-allow-missing-bpf (degrade
+# instead of refusing; it requires --bpf-manifest and still verifies every
+# object that resolves) is never set here.
 #
 # Rollout: manifests written before PL-100 Phase 4 are not valid TOML (the BTF
 # digest line contained a newline), so this unit refuses to start with them.

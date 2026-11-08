@@ -77,25 +77,37 @@
 //! `$(BPFDIR)/manifest.json`), bevor irgendein Objekt geladen wird. Diese
 //! Datei selbst prüft nur Pfad, Typ, Größe und ELF-Kennung.
 //!
-//! # Degradierung statt leerem Programm
+//! # Kein leeres Programm: Startabbruch, nur in der Entwicklung Degradierung
 //! Fehlt eines der beiden Objekte eines Sensors (oder verletzt es eine der
-//! obigen Prüfungen), wird **kein** leerer Platzhalterrumpf geladen. Der
-//! Sensor wird stattdessen als [`UnavailableSensor`] registriert: er loggt
+//! obigen Prüfungen), wird **kein** leerer Platzhalterrumpf geladen.
+//! Produktiv lehnt `main::verify_selected_objects` den Start dann mit
+//! Exit-Status 78 ab ([`crate::bpf_manifest::ensure_objects_resolved`]): ein
+//! gewähltes Objekt ohne prüfbare Bytes darf die Manifestprüfung nicht
+//! umgehen (Owner-Review zu PR #168). Nur im Entwicklungsmodus
+//! `--dev-allow-missing-bpf` (nur zusammen mit `--bpf-manifest`) wird der
+//! Sensor stattdessen als [`UnavailableSensor`] registriert: er loggt
 //! beim Aufbau jedes fehlende Objekt mit Grund (`warn`, ohne Pfad; den
 //! Suchpfad nur auf `info`), meldet beim ersten
 //! `poll` genau ein `EventKind::SensorDegraded { sensor }` an den Sentinel
 //! und liefert danach leere Lesungen (mit [`UNAVAILABLE_IDLE_INTERVAL`]
-//! Wartezeit, damit die Sammelschleife nicht leer dreht). Dasselbe gilt,
-//! wenn das Laden selbst degradierend scheitert (dann mit leerer
-//! Mängelliste, siehe `main::setup_sensor`). Ein vorhandenes Objekt, das
+//! Wartezeit, damit die Sammelschleife nicht leer dreht). In jedem Modus
+//! entsteht ein [`UnavailableSensor`] außerdem, wenn das Laden selbst
+//! degradierend scheitert (dann mit leerer Mängelliste, siehe
+//! `main::setup_sensor`). Ein vorhandenes Objekt, das
 //! nicht zum Manifest passt, degradiert dagegen nicht: das beendet den Start
 //! (siehe [`crate::bpf_manifest`], Abschnitt „Fehlerbild").
+//!
+//! Ist nur eines der beiden Objekte eines Sensors verwendbar, liefert die
+//! Auflösung es trotzdem mit ([`UnresolvedPair::resolved`]): geladen wird
+//! es nie, aber `main::verify_selected_objects` prüft auch seine Bytes gegen
+//! das Manifest. Ein manipuliertes Objekt wird so immer vor einem fehlenden
+//! gemeldet, auch innerhalb desselben Sensors.
 //!
 //! # Exportierte Typen
 //! [`UNAVAILABLE_IDLE_INTERVAL`], [`BPF_OBJECT_DIR_ENV`],
 //! [`DEFAULT_BPF_OBJECT_DIR`], [`MAX_BPF_OBJECT_BYTES`], [`BpfObjectKind`],
 //! [`ResolvedBpfObject`], [`ObjectUnavailable`], [`ObjectUnavailableReason`],
-//! [`resolve_procmon_objects`], [`resolve_flow_objects`],
+//! [`UnresolvedPair`], [`resolve_procmon_objects`], [`resolve_flow_objects`],
 //! [`UnavailableSensor`].
 //!
 //! # Nebenläufigkeit
@@ -106,11 +118,12 @@
 //! einmalig beim Aufbau, nie während eines `poll`.
 //!
 //! # Fehler
-//! [`ObjectUnavailable`] (je fehlendem oder ungültigem Objekt) aus
+//! [`UnresolvedPair`] (je fehlendem oder ungültigem Objekt ein
+//! [`ObjectUnavailable`], dazu das verwendbare Geschwisterobjekt) aus
 //! [`resolve_procmon_objects`]/[`resolve_flow_objects`] — kein
-//! `crate::error::ProbeError`, weil ein fehlendes Objekt den Sensor
-//! degradiert, nicht den Prozess beendet. [`UnavailableSensor::poll`]
-//! scheitert nie.
+//! `crate::error::ProbeError`: ob ein fehlendes Objekt den Start ablehnt
+//! (Produktion) oder den Sensor degradiert (`--dev-allow-missing-bpf`),
+//! entscheidet `main`. [`UnavailableSensor::poll`] scheitert nie.
 //!
 //! # Examples
 //! ```rust,ignore
@@ -125,8 +138,10 @@
 //!         );
 //!         // → crate::real_loader::load_sensor(&loader, &contracts)
 //!     }
-//!     Err(missing) => {
-//!         let _degraded = UnavailableSensor::new(id, missing);
+//!     // Produktiv: Startabbruch (`main::verify_selected_objects`); nur im
+//!     // Entwicklungsmodus degradiert der Sensor.
+//!     Err(unresolved) => {
+//!         let _degraded = UnavailableSensor::new(id, unresolved.missing);
 //!     }
 //! }
 //! ```
@@ -332,6 +347,27 @@ impl ResolvedBpfObject {
     }
 }
 
+/// Ein Sensor, dessen zwei Objekte nicht beide verwendbar sind: das
+/// Fehlerergebnis von [`resolve_procmon_objects`]/[`resolve_flow_objects`].
+///
+/// # Description
+/// Trägt jeden Mangel und, falls nur eines der beiden Objekte scheiterte, das
+/// verwendbare Geschwisterobjekt. Geladen wird dieses nie (ein Sensor lädt
+/// beide Objekte oder keins), aber `main::verify_selected_objects` prüft
+/// seine Bytes trotzdem gegen das Manifest: ein manipuliertes Objekt wird
+/// damit vor dem fehlenden Geschwister gemeldet, statt erst nach dessen
+/// Reparatur beim nächsten Start (Review zu PR #168).
+///
+/// `Debug` gibt auch die Objektbytes aus; nur für Testmeldungen, nie für
+/// ein Protokoll.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedPair {
+    /// Das verwendbare Geschwisterobjekt; `None`, wenn beide scheiterten.
+    pub resolved: Option<ResolvedBpfObject>,
+    /// Jeder Mangel, mindestens einer, in der Reihenfolge des Paars.
+    pub missing: Vec<ObjectUnavailable>,
+}
+
 /// Bestimmt den Pfad eines Objekts nach der Rangfolge der Moduldoku.
 ///
 /// # Arguments
@@ -455,12 +491,14 @@ fn resolve_bpf_object(
 /// # Description
 /// Ein Sensor mit nur einem seiner zwei Objekte (z. B. Verbindungen nur
 /// über IPv4) wäre eine stille Teilabdeckung; deshalb liefert diese
-/// Funktion nur dann Objekte, wenn **beide** verwendbar sind, und sonst
-/// **jeden** gefundenen Mangel, nicht nur den ersten.
+/// Funktion nur dann ladbare Objekte, wenn **beide** verwendbar sind, und
+/// sonst **jeden** gefundenen Mangel, nicht nur den ersten, zusammen mit dem
+/// verwendbaren Geschwisterobjekt (nur für die Manifestprüfung, siehe
+/// [`UnresolvedPair`]).
 fn resolve_object_pair(
     objects: [(BpfObjectKind, Option<&Path>); 2],
     env_dir: Option<&OsStr>,
-) -> Result<[ResolvedBpfObject; 2], Vec<ObjectUnavailable>> {
+) -> Result<[ResolvedBpfObject; 2], UnresolvedPair> {
     let [(first_kind, first_explicit), (second_kind, second_explicit)] = objects;
     let first = resolve_bpf_object(
         first_kind,
@@ -481,7 +519,14 @@ fn resolve_object_pair(
             }
             Ok([first, second])
         }
-        (first, second) => Err(first.err().into_iter().chain(second.err()).collect()),
+        (Ok(resolved), Err(defect)) | (Err(defect), Ok(resolved)) => Err(UnresolvedPair {
+            resolved: Some(resolved),
+            missing: vec![defect],
+        }),
+        (Err(first), Err(second)) => Err(UnresolvedPair {
+            resolved: None,
+            missing: vec![first, second],
+        }),
     }
 }
 
@@ -496,12 +541,15 @@ fn resolve_object_pair(
 /// `harw_dod_procmon::procmon_contracts(sensor, exec_source, exit_source, scope)`.
 ///
 /// # Errors
-/// Jeder Mangel beider Objekte als [`ObjectUnavailable`]; der Aufrufer
-/// registriert dann [`UnavailableSensor`].
+/// [`UnresolvedPair`]: jeder Mangel beider Objekte als [`ObjectUnavailable`],
+/// dazu das verwendbare Geschwisterobjekt. Der Aufrufer prüft dessen Bytes
+/// gegen das Manifest und lehnt den Start dann ab
+/// (`main::verify_selected_objects`) bzw. registriert im Entwicklungsmodus
+/// [`UnavailableSensor`] mit [`UnresolvedPair::missing`].
 pub fn resolve_procmon_objects(
     exec: Option<&Path>,
     exit: Option<&Path>,
-) -> Result<[ResolvedBpfObject; 2], Vec<ObjectUnavailable>> {
+) -> Result<[ResolvedBpfObject; 2], UnresolvedPair> {
     let env_dir = std::env::var_os(BPF_OBJECT_DIR_ENV);
     resolve_object_pair(
         [(BpfObjectKind::Exec, exec), (BpfObjectKind::Exit, exit)],
@@ -524,7 +572,7 @@ pub fn resolve_procmon_objects(
 pub fn resolve_flow_objects(
     tcp_v4: Option<&Path>,
     tcp_v6: Option<&Path>,
-) -> Result<[ResolvedBpfObject; 2], Vec<ObjectUnavailable>> {
+) -> Result<[ResolvedBpfObject; 2], UnresolvedPair> {
     let env_dir = std::env::var_os(BPF_OBJECT_DIR_ENV);
     resolve_object_pair(
         [
@@ -567,8 +615,8 @@ impl UnavailableSensor {
     /// # Arguments
     /// - `sensor_id` (`harw_types::SensorId`): die Kennung des vertretenen
     ///   Sensors.
-    /// - `missing` (`Vec<ObjectUnavailable>`): die Mängel aus
-    ///   [`resolve_procmon_objects`]/[`resolve_flow_objects`].
+    /// - `missing` (`Vec<ObjectUnavailable>`): [`UnresolvedPair::missing`]
+    ///   aus [`resolve_procmon_objects`]/[`resolve_flow_objects`].
     ///
     /// # Returns
     /// Einen Sensor, der seine Degradierung beim ersten `poll` meldet.
@@ -883,8 +931,8 @@ mod tests {
     #[test]
     fn test_resolve_pair_with_one_missing_object_reports_only_that_one() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        write_elf(dir.path(), "exec.bpf.o")?;
-        let Err(missing) = resolve_object_pair(
+        let exec = write_elf(dir.path(), "exec.bpf.o")?;
+        let Err(unresolved) = resolve_object_pair(
             [(BpfObjectKind::Exec, None), (BpfObjectKind::Exit, None)],
             Some(dir.path().as_os_str()),
         ) else {
@@ -892,16 +940,65 @@ mod tests {
                 "a sensor with one missing object must not resolve".into(),
             ));
         };
-        assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].object, BpfObjectKind::Exit);
-        assert_eq!(missing[0].reason, ObjectUnavailableReason::Missing);
+        assert_eq!(unresolved.missing.len(), 1);
+        let missing = unresolved
+            .missing
+            .first()
+            .ok_or(TestError::Missing("the missing exit object"))?;
+        assert_eq!(missing.object, BpfObjectKind::Exit);
+        assert_eq!(missing.reason, ObjectUnavailableReason::Missing);
+        // Das verwendbare Geschwister kommt mit, damit `main` seine Bytes
+        // gegen das Manifest prüfen kann (manipuliert vor fehlend).
+        let sibling = unresolved
+            .resolved
+            .ok_or(TestError::Missing("the resolved exec sibling"))?;
+        assert_eq!(sibling.object, BpfObjectKind::Exec);
+        assert_eq!(sibling.path, exec);
+        assert!(matches!(
+            &sibling.source,
+            BpfProgramSource::Embedded(bytes) if bytes.starts_with(&ELF_MAGIC)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_pair_returns_the_resolved_sibling_in_either_position() -> TestResult {
+        // Das zweite Objekt verwendbar, das erste kein ELF.
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::write(dir.path().join("tcp_v4_connect.bpf.o"), b"not an object")
+            .map_err(ctx("write non-ELF object"))?;
+        write_elf(dir.path(), "tcp_v6_connect.bpf.o")?;
+        let Err(unresolved) = resolve_object_pair(
+            [
+                (BpfObjectKind::TcpV4Connect, None),
+                (BpfObjectKind::TcpV6Connect, None),
+            ],
+            Some(dir.path().as_os_str()),
+        ) else {
+            return Err(TestError::Unexpected(
+                "a sensor with one non-ELF object must not resolve".into(),
+            ));
+        };
+        let defects: Vec<(BpfObjectKind, ObjectUnavailableReason)> = unresolved
+            .missing
+            .iter()
+            .map(|item| (item.object, item.reason))
+            .collect();
+        assert_eq!(
+            defects,
+            vec![(BpfObjectKind::TcpV4Connect, ObjectUnavailableReason::NotElf)]
+        );
+        assert_eq!(
+            unresolved.resolved.map(|sibling| sibling.object),
+            Some(BpfObjectKind::TcpV6Connect)
+        );
         Ok(())
     }
 
     #[test]
     fn test_resolve_pair_reports_every_missing_object() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let Err(missing) = resolve_object_pair(
+        let Err(unresolved) = resolve_object_pair(
             [(BpfObjectKind::Exec, None), (BpfObjectKind::Exit, None)],
             Some(dir.path().as_os_str()),
         ) else {
@@ -909,8 +1006,13 @@ mod tests {
                 "an empty directory must not resolve".into(),
             ));
         };
-        assert_eq!(missing.len(), 2);
-        let text = missing[1].to_string();
+        assert!(unresolved.resolved.is_none());
+        assert_eq!(unresolved.missing.len(), 2);
+        let text = unresolved
+            .missing
+            .get(1)
+            .ok_or(TestError::Missing("the second defect"))?
+            .to_string();
         assert!(text.contains("exit.bpf.o"));
         assert!(text.contains("make build-bpf"));
         Ok(())
@@ -919,7 +1021,7 @@ mod tests {
     #[test]
     fn test_unavailable_sensor_reports_degradation_once_under_its_own_id() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let Err(missing) = resolve_object_pair(
+        let Err(unresolved) = resolve_object_pair(
             [
                 (BpfObjectKind::TcpV4Connect, None),
                 (BpfObjectKind::TcpV6Connect, None),
@@ -932,7 +1034,7 @@ mod tests {
         };
         let id = SensorId::from_str("probe-bpf-flow-0");
         // Keine Wartezeit, damit der zweite `poll` den Test nicht bremst.
-        let sensor = UnavailableSensor::with_idle(id.clone(), missing, Duration::ZERO);
+        let sensor = UnavailableSensor::with_idle(id.clone(), unresolved.missing, Duration::ZERO);
         assert_eq!(sensor.missing().len(), 2);
         assert_eq!(sensor.handle().id(), &id);
         assert_eq!(sensor.handle().capability(), Capability::LoadBpfProgram);

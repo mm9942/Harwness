@@ -7,8 +7,10 @@
 # Usage: check-manifest-writer.sh          compare, exit 1 on a difference
 #        check-manifest-writer.sh --update rewrite the golden file
 #
-# Needs only sh, sha256sum, awk, sed, grep, diff and mktemp: no clang, no
-# bpftool, no kernel BTF. The dummy object bytes are
+# Needs only sh, sha256sum, awk, sed, grep, cmp, diff and mktemp: no clang,
+# no bpftool, no kernel BTF. The BTF stamp is written with btf-stamp.sh
+# before the dummy objects, as the Makefile orders it (write-manifest.sh
+# refuses objects older than the stamp). The dummy object bytes are
 # "harw-dod manifest writer fixture: <name>\n"; the Rust test rebuilds exactly
 # these bytes to check the digests. `host_arch` comes from `uname -m` and is
 # normalised to "x86_64" so the comparison is host-independent.
@@ -28,10 +30,11 @@ trap 'rm -rf -- "$work"' EXIT
 trap 'exit 130' HUP INT TERM
 
 mkdir -p "$work/out"
+printf 'harw-dod manifest writer fixture: vmlinux BTF\n' >"$work/vmlinux"
+sh "$script_dir/btf-stamp.sh" "$work/vmlinux" "$work/out/vmlinux.btf.sha256"
 for name in exec.bpf.o exit.bpf.o tcp_v4_connect.bpf.o tcp_v6_connect.bpf.o; do
     printf 'harw-dod manifest writer fixture: %s\n' "$name" >"$work/out/$name"
 done
-printf 'harw-dod manifest writer fixture: vmlinux BTF\n' >"$work/vmlinux"
 cat >"$work/toolchain.lock.toml" <<'EOF'
 schema_version = 1
 clang_version = "fixture clang version 18.1.3"
@@ -40,7 +43,8 @@ llvm_objdump_version = "fixture LLVM version 19.1.1"
 EOF
 
 sh "$script_dir/write-manifest.sh" \
-    "$work/out" "$work/vmlinux" "$work/toolchain.lock.toml" "$work/manifest.json"
+    "$work/out" "$work/vmlinux" "$work/toolchain.lock.toml" "$work/manifest.json" \
+    "$work/out/vmlinux.btf.sha256"
 sed 's/^host_arch = ".*"$/host_arch = "x86_64"/' "$work/manifest.json" >"$work/normalised.toml"
 
 if [ "$mode" = --update ]; then
