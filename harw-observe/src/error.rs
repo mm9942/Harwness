@@ -94,6 +94,31 @@ pub enum ObserveError {
         /// Die verletzte Invariante im Klartext.
         invariant: &'static str,
     },
+
+    /// Eine Null-Serien-Deklaration ([`crate::zero_registry::ZeroSeries`])
+    /// verletzt die Regeln der Registry.
+    ///
+    /// # Arguments
+    /// - `name` (`&'static str`): Metrikname der abgelehnten Deklaration.
+    /// - `reason` (`&'static str`): kurzer, fester Grund (kein Laufzeitwert).
+    #[msg("zero series '{name}' is invalid: {reason}")]
+    InvalidZeroSeries {
+        /// Metrikname der abgelehnten Deklaration.
+        name: &'static str,
+        /// Kurzer, fester Grund.
+        reason: &'static str,
+    },
+
+    /// Ein [`crate::routing::ExportApproval`] erfüllt die formalen Vorgaben
+    /// nicht (Namensraum nicht geschützt oder Operator-Bezeichner leer).
+    ///
+    /// # Arguments
+    /// - `reason` (`&'static str`): kurzer, fester Grund.
+    #[msg("export approval rejected: {reason}")]
+    InvalidExportApproval {
+        /// Kurzer, fester Grund.
+        reason: &'static str,
+    },
 }
 
 #[cfg(test)]
@@ -163,5 +188,21 @@ mod tests {
             invariant: "invariant",
         };
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn test_observe_error_display_zero_series_and_approval() {
+        let a = ObserveError::InvalidZeroSeries {
+            name: "x_total",
+            reason: "labels missing",
+        };
+        assert_eq!(
+            a.to_string(),
+            "zero series 'x_total' is invalid: labels missing"
+        );
+        let b = ObserveError::InvalidExportApproval {
+            reason: "actor is empty",
+        };
+        assert_eq!(b.to_string(), "export approval rejected: actor is empty");
     }
 }
