@@ -5,15 +5,23 @@
 //! [`WardenProtoError`] deckt die beiden Fehlerpfade ab, die innerhalb
 //! dieser Crate selbst entstehen können: die kanonische Kodierung einer
 //! [`crate::action::WardenAction`] für die Belegbindung
-//! ([`WardenProtoError::ActionEncoding`], siehe `action.rs`,
-//! `content_digest`), und eine fehlgeschlagene Beleg-/Zulässigkeitsprüfung
-//! ([`WardenProtoError::ProofMismatch`], [`WardenProtoError::NotAdmissibleAtStage`],
-//! siehe `proof.rs`, `authorizes`/`verify`).
+//! ([`WardenProtoError::ActionEncoding`], siehe `proof.rs`,
+//! [`crate::proof::ActionContentDigest`]), und eine fehlgeschlagene
+//! Beleg-/Zulässigkeitsprüfung ([`WardenProtoError::ProofMismatch`],
+//! [`WardenProtoError::NotAdmissibleAtStage`], siehe `proof.rs`,
+//! `authorizes`/`verify`).
 //!
 //! Seit Proof v2 (C-WPROTO, W3) zusätzlich [`ProofError`]: je Prüfschritt von
 //! [`crate::signed::SignedAuthorization::verify`] eine Variante, mit
 //! [`ProofError::as_denial`] als verlustbehafteter Brücke auf
 //! [`crate::denial::Denial`] (siehe `signed.rs`-Moduldoku).
+//!
+//! # Fehler des Typ-Crates (PL-100 WP 3.0)
+//! `harw-dod-warden-types` hat einen eigenen Fehlertyp
+//! ([`WardenTypesError`], heute nur die Kernel-ID `0`). `From<WardenTypesError>
+//! for ProofError` bildet ihn auf [`ProofError::InvalidKernelId`] ab, sodass
+//! jeder Aufrufer, der `CgroupKernelId::new(..)?` in einen `ProofError`
+//! umwandelt, unverändert weiterläuft.
 //!
 //! # Dieser Typ verlässt den Prozess nie
 //! `WardenProtoError` implementiert absichtlich **kein** `Serialize` — er
@@ -58,6 +66,8 @@
 
 use std::fmt;
 
+use harw_dod_warden_types::WardenTypesError;
+
 use crate::denial::Denial;
 
 /// Welcher Teil eines [`crate::proof::AuthorizationProof`] nicht zur
@@ -91,7 +101,8 @@ pub enum MismatchAspect {
 #[derive(harw_macros::HarwError)]
 pub enum WardenProtoError {
     /// Die kanonische JSON-Kodierung einer [`crate::action::WardenAction`]
-    /// für die Digest-Bildung (siehe `action.rs`, `content_digest`) ist
+    /// für die v1-Digest-Bildung (siehe
+    /// [`crate::proof::ActionContentDigest::content_digest`]) ist
     /// fehlgeschlagen.
     #[msg("failed to encode a warden action for content-addressed binding: {0}")]
     #[from]
@@ -151,7 +162,8 @@ pub enum ProofError {
     /// (TTL 1..=120 s, Uhrenversatz ≤ 30 s, wohlgeformte Präfixe).
     #[msg("proof policy is out of bounds")]
     InvalidPolicy,
-    /// Eine cgroup-Kernel-ID ist `0` (siehe [`crate::target::CgroupKernelId`]).
+    /// Eine cgroup-Kernel-ID ist `0` (siehe [`crate::target::CgroupKernelId`]);
+    /// entsteht seit PL-100 WP 3.0 über `From<WardenTypesError>`.
     #[msg("cgroup kernel id must not be zero")]
     InvalidKernelId,
     /// Hülle: die Anfrage ist ein v1-Auftrag (fälschbarer
@@ -232,6 +244,29 @@ pub enum ProofError {
 impl fmt::Debug for ProofError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
+    }
+}
+
+/// Bildet den Konstruktionsfehler des Typ-Crates auf die gleichbedeutende
+/// Proof-Variante ab (PL-100 WP 3.0).
+///
+/// # Description
+/// Erschöpfend: eine neue Variante in `WardenTypesError` macht diese Stelle
+/// zum Compile-Fehler und muss hier bewusst zugeordnet werden.
+///
+/// # Examples
+/// ```rust
+/// use harw_dod_warden_proto::{CgroupKernelId, Denial, ProofError};
+///
+/// let err = CgroupKernelId::new(0).map_err(ProofError::from);
+/// assert!(matches!(err, Err(ProofError::InvalidKernelId)));
+/// assert_eq!(ProofError::InvalidKernelId.as_denial(), Denial::Malformed);
+/// ```
+impl From<WardenTypesError> for ProofError {
+    fn from(err: WardenTypesError) -> Self {
+        match err {
+            WardenTypesError::InvalidKernelId => Self::InvalidKernelId,
+        }
     }
 }
 
@@ -352,7 +387,9 @@ mod tests {
 
     use super::{MismatchAspect, ProofError, WardenProtoError, WardenProtoResult};
     use crate::denial::Denial;
+    use crate::target::CgroupKernelId;
     use crate::test_support::{TestError, TestResult};
+    use harw_dod_warden_types::WardenTypesError;
 
     fn sample_json_error() -> TestResult<serde_json::Error> {
         let Err(source) = serde_json::from_str::<serde_json::Value>("not json") else {
@@ -520,6 +557,26 @@ mod tests {
             format!("{:?}", ProofError::BadMac),
             ProofError::BadMac.to_string()
         );
+    }
+
+    #[test]
+    fn test_types_error_maps_onto_invalid_kernel_id() {
+        // `?` aus `CgroupKernelId::new` in einen `ProofError` bleibt möglich.
+        fn kernel_id(raw: u64) -> Result<CgroupKernelId, ProofError> {
+            let id = CgroupKernelId::new(raw)?;
+            Ok(id)
+        }
+
+        assert!(matches!(
+            ProofError::from(WardenTypesError::InvalidKernelId),
+            ProofError::InvalidKernelId
+        ));
+        assert!(matches!(kernel_id(0), Err(ProofError::InvalidKernelId)));
+        assert!(matches!(
+            kernel_id(0).map_err(|err| err.as_denial()),
+            Err(Denial::Malformed)
+        ));
+        assert!(kernel_id(1).is_ok());
     }
 
     #[test]

@@ -2884,16 +2884,17 @@ name = "harw-dod-escalate"
 version = "0.10.0"
 dependencies = [
  "harw-authority",
+ "harw-dod-ladder",
  "harw-dod-rules",
  "harw-dod-signals",
- "harw-dod-warden-proto",
+ "harw-dod-submit-proto",
+ "harw-dod-warden-types",
  "harw-macros",
  "harw-sandbox",
  "harw-session-store",
  "harw-test-support",
  "harw-types",
  "jiff",
- "serde",
  "serde_json",
  "tempfile",
 ]
@@ -2961,6 +2962,19 @@ dependencies = [
  "harw-types",
  "jiff",
  "tempfile",
+]
+
+[[package]]
+name = "harw-dod-ladder"
+version = "0.10.0"
+dependencies = [
+ "harw-dod-rules",
+ "harw-dod-signals",
+ "harw-dod-warden-types",
+ "harw-macros",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
 ]
 
 [[package]]
@@ -3131,6 +3145,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-dod-submit-proto"
+version = "0.10.0"
+dependencies = [
+ "harw-dod-signals",
+ "harw-macros",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harw-dod-thermal"
 version = "0.10.0"
 dependencies = [
@@ -3166,6 +3193,19 @@ name = "harw-dod-warden-proto"
 version = "0.10.0"
 dependencies = [
  "blake3",
+ "harw-dod-warden-types",
+ "harw-macros",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "harw-dod-warden-types"
+version = "0.10.0"
+dependencies = [
  "harw-macros",
  "harw-test-support",
  "harw-types",
@@ -4048,7 +4088,7 @@ dependencies = [
  "harw-authority",
  "harw-context",
  "harw-core",
- "harw-dod-escalate",
+ "harw-dod-ladder",
  "harw-dod-rules",
  "harw-dod-signals",
  "harw-extension-api",

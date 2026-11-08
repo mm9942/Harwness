@@ -1,15 +1,19 @@
 //! Ziel-Identität einer Warden-Aktion: [`CgroupKernelId`], [`CgroupTarget`]
 //! (PL-100 WP 3.1, Bedrohung B21).
 //!
+//! Seit PL-100 WP 3.0 Teil von `harw-dod-warden-types`; `harw-dod-warden-proto`
+//! re-exportiert beide Typen unter ihren bisherigen Pfaden.
+//!
 //! # Zweck
 //! Der Kernel vergibt cgroup-IDs neu, sobald eine cgroup verschwindet. Eine
 //! Autorisierung, die nur einen Pfad oder nur eine Kernel-ID nennt, könnte
 //! deshalb eine andere cgroup treffen als die, die der Operator freigegeben
 //! hat. Proof v2 bindet daher das Tripel aus Kernel-ID, relativem Pfad und
 //! `first_seen` (wann der Sensor diese cgroup zuerst beobachtet hat) in den MAC
-//! ([`crate::signed::SignedAuthorization`]). Der Warden beobachtet das Ziel
+//! (`harw_dod_warden_proto::SignedAuthorization`, über
+//! [`CgroupTarget::put_canonical`]). Der Warden beobachtet das Ziel
 //! unmittelbar vor dem Eingriff erneut und vergleicht über
-//! [`crate::signed::VerifiedAuthorization::confirm_target`].
+//! `harw_dod_warden_proto::VerifiedAuthorization::confirm_target`.
 //!
 //! # Wichtige Typen
 //! - [`CgroupKernelId`]: Kernel-ID einer cgroup, nie `0` (die Wurzel-cgroup
@@ -21,11 +25,12 @@
 //! Reine Werttypen, `Send + Sync`.
 //!
 //! # Fehler
-//! [`ProofError::InvalidKernelId`] für eine Kernel-ID `0`.
+//! [`WardenTypesError::InvalidKernelId`] für eine Kernel-ID `0`. Der
+//! Signierteil bildet ihn per `From` auf `ProofError::InvalidKernelId` ab.
 //!
 //! # Examples
 //! ```rust
-//! use harw_dod_warden_proto::{CgroupKernelId, CgroupTarget};
+//! use harw_dod_warden_types::{CgroupKernelId, CgroupTarget};
 //! use harw_types::CgroupId;
 //!
 //! let Ok(path) = CgroupId::try_from_str("harw.slice/job-1") else { return };
@@ -43,7 +48,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::canonical::{put_field, put_nested, put_timestamp, put_u64};
-use crate::error::ProofError;
+use crate::error::WardenTypesError;
 
 /// Kernel-ID einer cgroup (Inode-Nummer des cgroup-Verzeichnisses in cgroup v2).
 ///
@@ -53,7 +58,7 @@ use crate::error::ProofError;
 ///
 /// # Examples
 /// ```rust
-/// use harw_dod_warden_proto::CgroupKernelId;
+/// use harw_dod_warden_types::CgroupKernelId;
 ///
 /// assert_eq!(CgroupKernelId::new(7).map(CgroupKernelId::get).ok(), Some(7));
 /// assert!(serde_json::from_str::<CgroupKernelId>("0").is_err());
@@ -68,12 +73,23 @@ impl CgroupKernelId {
     /// # Arguments
     /// - `raw` (`u64`): die Kernel-ID.
     ///
+    /// # Returns
+    /// Die geprüfte Kernel-ID.
+    ///
     /// # Errors
-    /// - [`ProofError::InvalidKernelId`]: `raw == 0`.
-    pub fn new(raw: u64) -> Result<Self, ProofError> {
+    /// - [`WardenTypesError::InvalidKernelId`]: `raw == 0`.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_warden_types::{CgroupKernelId, WardenTypesError};
+    ///
+    /// assert_eq!(CgroupKernelId::new(1).map(CgroupKernelId::get), Ok(1));
+    /// assert_eq!(CgroupKernelId::new(0), Err(WardenTypesError::InvalidKernelId));
+    /// ```
+    pub fn new(raw: u64) -> Result<Self, WardenTypesError> {
         NonZeroU64::new(raw)
             .map(Self)
-            .ok_or(ProofError::InvalidKernelId)
+            .ok_or(WardenTypesError::InvalidKernelId)
     }
 
     /// Returns the raw kernel id (never `0`).
@@ -83,8 +99,9 @@ impl CgroupKernelId {
     }
 }
 
+/// Prüft eine rohe Kernel-ID (auch der serde-Weg, `try_from = "u64"`).
 impl TryFrom<u64> for CgroupKernelId {
-    type Error = ProofError;
+    type Error = WardenTypesError;
 
     fn try_from(value: u64) -> Result<Self, Self::Error> {
         Self::new(value)
@@ -135,8 +152,20 @@ impl CgroupTarget {
         }
     }
 
-    // Kanonische Form als ein zusammengesetztes Feld: Pfad, Kernel-ID, first_seen.
-    pub(crate) fn put_canonical(&self, buf: &mut Vec<u8>) {
+    /// Appends the canonical form of this target as one composite field.
+    ///
+    /// # Description
+    /// Ein zusammengesetztes Feld ([`crate::canonical::put_nested`]) aus Pfad,
+    /// Kernel-ID (`u64` BE) und `first_seen` (Sekunden ‖ Nanosekunden). Der
+    /// Signierteil hängt genau diese Bytes an die MAC-Eingabe von Proof v2;
+    /// sie sind durch die Aufteilung (PL-100 WP 3.0) unverändert.
+    ///
+    /// # Arguments
+    /// - `buf` (`&mut Vec<u8>`): der Zielpuffer.
+    ///
+    /// # Concurrency
+    /// Reine Funktion.
+    pub fn put_canonical(&self, buf: &mut Vec<u8>) {
         put_nested(buf, |inner| {
             put_field(inner, self.path.as_str().as_bytes());
             put_u64(inner, self.kernel_id.get());
@@ -148,7 +177,7 @@ impl CgroupTarget {
 #[cfg(test)]
 mod tests {
     use super::{CgroupKernelId, CgroupTarget};
-    use crate::error::ProofError;
+    use crate::error::WardenTypesError;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::CgroupId;
     use jiff::Timestamp;
@@ -171,11 +200,11 @@ mod tests {
     fn test_kernel_id_rejects_zero() {
         assert!(matches!(
             CgroupKernelId::new(0),
-            Err(ProofError::InvalidKernelId)
+            Err(WardenTypesError::InvalidKernelId)
         ));
         assert!(matches!(
             CgroupKernelId::try_from(0u64),
-            Err(ProofError::InvalidKernelId)
+            Err(WardenTypesError::InvalidKernelId)
         ));
     }
 
@@ -216,6 +245,43 @@ mod tests {
         assert_ne!(base, target("harw.slice/job-2", 4242, 1_800_000_000)?);
         assert_ne!(base, target("harw.slice/job-1", 4243, 1_800_000_000)?);
         assert_ne!(base, target("harw.slice/job-1", 4242, 1_800_000_001)?);
+        Ok(())
+    }
+
+    // Golden-Test: die Bytes sind Teil der MAC-Eingabe von Proof v2 und
+    // dürfen sich durch die Aufteilung (PL-100 WP 3.0) nicht ändern. Erwartet
+    // wird das Layout von Hand, unabhängig von `canonical::put_*`.
+    #[test]
+    fn test_canonical_form_golden_bytes_are_unchanged() -> TestResult {
+        let path = b"harw.slice/job-1";
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 16]);
+        inner.extend_from_slice(path);
+        inner.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 8]);
+        inner.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x10, 0x92]);
+        inner.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 12]);
+        inner.extend_from_slice(&[0, 0, 0, 0, 0x6b, 0x49, 0xd2, 0x00]);
+        inner.extend_from_slice(&[0, 0, 0, 0]);
+        let mut expected = vec![0, 0, 0, 0, 0, 0, 0, 60];
+        expected.extend_from_slice(&inner);
+
+        let actual = canonical(&target("harw.slice/job-1", 4242, 1_800_000_000)?);
+        assert_eq!(inner.len(), 60);
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_kernel_id_serde_rejection_uses_the_types_error_message() -> TestResult {
+        let Err(err) = serde_json::from_str::<CgroupKernelId>("0") else {
+            return Err(TestError::Unexpected(
+                "Kernel-ID 0 darf nicht dekodieren".into(),
+            ));
+        };
+        assert!(
+            err.to_string()
+                .contains(&WardenTypesError::InvalidKernelId.to_string())
+        );
         Ok(())
     }
 

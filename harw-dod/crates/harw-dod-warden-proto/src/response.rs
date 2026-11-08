@@ -1,15 +1,19 @@
-//! Die Wire-Hülle: [`WardenActionRequest`], [`WardenActionAudit`],
-//! [`WardenResponse`].
+//! Die Wire-Hülle: [`WardenRequest`], [`WardenReply`] und die v1-Altlast
+//! [`WardenActionRequest`].
 //!
 //! # Verantwortungsbereich
-//! Drei Typen, die den vollständigen Umlauf einer Aktion über die Leitung
-//! tragen: die Anfrage vom Eskalationsleiter zum Durchsetzer
-//! ([`WardenActionRequest`]), der Audit-Eintrag für eine tatsächlich
-//! ausgeführte Aktion ([`WardenActionAudit`]), und die Antwort vom
-//! Durchsetzer zurück ([`WardenResponse`]) — Erfolg mit Audit-Eintrag oder
-//! Ablehnung mit [`crate::denial::Denial`]. Alle drei tragen
-//! `deny_unknown_fields` (K19): sie nehmen Daten entgegen, die von der
-//! jeweils anderen Seite der Leitung kommen.
+//! Die Typen, die den Umlauf einer Aktion über die Leitung tragen: die
+//! Anfrage vom Eskalationsleiter zum Durchsetzer ([`WardenRequest`], v1:
+//! [`WardenActionRequest`]) und die versionierte Antwort zurück
+//! ([`WardenReply`]). Alle tragen `deny_unknown_fields` (K19): sie nehmen
+//! Daten entgegen, die von der jeweils anderen Seite der Leitung kommen.
+//!
+//! # Aufteilung (PL-100 WP 3.0)
+//! Der Audit-Eintrag ([`WardenActionAudit`]) und die Antwort selbst
+//! ([`WardenResponse`], Erfolg mit Audit-Eintrag oder Ablehnung mit
+//! [`crate::denial::Denial`]) enthalten keinen Signier-Code und liegen seitdem
+//! in `harw_dod_warden_types::outcome`. Dieses Modul re-exportiert beide unter
+//! ihren bisherigen Pfaden (`harw_dod_warden_proto::response::WardenResponse`).
 //!
 //! # Proof v2 (C-WPROTO, F-088)
 //! [`WardenRequest`] ist die v2-Anfragehülle (ersetzt `WardenActionRequest` und
@@ -18,26 +22,27 @@
 //! `finding`-Feld (die v1-Bindung daran war tautologisch). [`WardenReply`]
 //! versioniert die Antwort. [`WardenRequest::peek_version`] liest nur die
 //! Version, damit der Warden auch auf eine unbekannte Fassung mit
-//! [`Denial::UnsupportedVersion`] antworten kann, obwohl die übrigen Felder
-//! `deny_unknown_fields` verletzen würden.
+//! [`crate::denial::Denial::UnsupportedVersion`] antworten kann, obwohl die
+//! übrigen Felder `deny_unknown_fields` verletzen würden.
 //!
-//! `WardenActionRequest` bleibt als `#[deprecated]` v1-Altlast nur bestehen,
-//! bis `harw-dod-escalate` auf Proof v2 umgestellt ist; der Warden akzeptiert
-//! ihn nicht. [`WardenRequest::decode`] ist der einzige Weg, Anfragebytes zu
+//! `WardenActionRequest` bleibt als `#[deprecated]` v1-Altlast nur für die
+//! Tests der v1-Ablehnung bestehen (seit PL-100 WP 3.0 baut
+//! `harw-dod-escalate` ihn nicht mehr); der Warden akzeptiert ihn nicht.
+//! [`WardenRequest::decode`] ist der einzige Weg, Anfragebytes zu
 //! lesen: er erkennt eine v1-Hülle (ohne `version`, mit `request`/`proof`, oder
 //! `version == 1`) und lehnt sie ausdrücklich mit
 //! [`ProofError::LegacyV1Refused`] ab, bevor ein Feld als Autorisierung
 //! gelesen wird (PL-100 WP 3.1, Invariante 3).
 //!
-//! # Warum `WardenResponse` ein eigener Typ ist, kein `Result<T, E>`
-//! `std::result::Result` ist fremd — diese Crate kann ihm kein
-//! `#[serde(deny_unknown_fields)]` mitgeben. `WardenResponse` ist die
-//! eigens deklarierte, geprüfte Entsprechung.
+//! # Nebenläufigkeit
+//! Reine Werttypen, `Send + Sync`; [`WardenRequest::verify`] schreibt nur über
+//! den übergebenen [`NonceLedger`].
 
 use serde::{Deserialize, Serialize};
 
+pub use harw_dod_warden_types::outcome::{WardenActionAudit, WardenResponse};
+
 use crate::action::{ProposedAction, WardenAction};
-use crate::denial::Denial;
 use crate::error::ProofError;
 // Nur für die stillgelegte v1-Hülle `WardenActionRequest`.
 #[allow(deprecated)]
@@ -155,8 +160,9 @@ impl WardenRequest {
     ///
     /// # Errors
     /// `serde_json::Error`, wenn die Bytes kein JSON-Objekt mit numerischem
-    /// `version` (u16) sind — der Warden antwortet dann [`Denial::Malformed`]
-    /// bzw. [`Denial::UnsupportedVersion`] (Entscheidung D-WARDEN).
+    /// `version` (u16) sind — der Warden antwortet dann
+    /// [`crate::denial::Denial::Malformed`] bzw.
+    /// [`crate::denial::Denial::UnsupportedVersion`] (Entscheidung D-WARDEN).
     pub fn peek_version(json: &[u8]) -> Result<u16, serde_json::Error> {
         serde_json::from_slice::<VersionProbe>(json).map(|probe| probe.version)
     }
@@ -184,7 +190,7 @@ impl WardenRequest {
     ///
     /// # Errors
     /// - [`ProofError::LegacyV1Refused`]: v1-Hülle (Ablehnung
-    ///   [`Denial::UnsupportedVersion`]).
+    ///   [`crate::denial::Denial::UnsupportedVersion`]).
     /// - [`ProofError::UnsupportedVersion`]: andere Version.
     /// - [`ProofError::MalformedRequest`]: kein gültiges JSON, `version` fehlt
     ///   ohne v1-Merkmale, falscher Typ oder ein unbekanntes Feld.
@@ -256,8 +262,8 @@ impl WardenReply {
 }
 
 /// **v1-Altlast** (vom Warden ausdrücklich abgelehnt, siehe
-/// [`WardenRequest::decode`]; Entfernung nach der Umstellung von
-/// `harw-dod-escalate`; Nachfolger: [`WardenRequest`]). Die frühere
+/// [`WardenRequest::decode`]; seit PL-100 WP 3.0 ohne produktiven Aufrufer,
+/// Entfernung ausstehend; Nachfolger: [`WardenRequest`]). Die frühere
 /// Wire-Nachricht vom Eskalationsleiter zum Durchsetzer: eine Aktion plus
 /// fälschbarer Autorisierungsbeleg (F-001).
 ///
@@ -297,20 +303,26 @@ impl WardenActionRequest {
     /// ```rust
     /// #![allow(deprecated)]
     /// use harw_dod_warden_proto::{
-    ///     AuthorizationProof, EscalationStage, ProposedAction, WardenAction, WardenActionRequest,
+    ///     ActionContentDigest, AuthorizationProof, EscalationStage, ProposedAction, WardenAction,
+    ///     WardenActionRequest,
     /// };
     /// use harw_types::{ApprovalActor, CgroupId, FindingId};
     ///
-    /// let proposed = ProposedAction::FreezeCgroup {
-    ///     cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+    /// let (Ok(cgroup), Ok(finding)) = (
+    ///     CgroupId::try_from_str("cgroup-1"),
+    ///     FindingId::try_from_str("finding-1"),
+    /// ) else {
+    ///     return;
     /// };
+    /// let proposed = ProposedAction::FreezeCgroup { cgroup };
     /// let action: WardenAction = proposed.clone().into();
+    /// let Ok(bound_action) = action.content_digest() else { return };
     /// let proof = AuthorizationProof::new(
-    ///     FindingId::try_from_str("finding-1").unwrap(),
+    ///     finding,
     ///     EscalationStage::RuleTriggered,
     ///     ApprovalActor::Operator { id: "operator-1".to_string() },
     ///     jiff::Timestamp::UNIX_EPOCH,
-    ///     action.content_digest().unwrap(),
+    ///     bound_action,
     /// );
     /// let request = WardenActionRequest::new(proposed, proof);
     /// assert_eq!(request.action, action);
@@ -324,69 +336,6 @@ impl WardenActionRequest {
     }
 }
 
-/// Der Audit-Eintrag für eine tatsächlich ausgeführte Aktion.
-///
-/// # Wire-Format
-/// `deny_unknown_fields` (K19).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WardenActionAudit {
-    /// Der deklarierte Audit-Name der ausgeführten Aktion (siehe
-    /// [`WardenAction::audit_name`]). Ein fester, zur Compile-Zeit gewählter
-    /// Wert — kein vom Modell beeinflusster `String` (siehe
-    /// `lib.rs`-Moduldoku, Abschnitt „Keine freien Argumente"); er wird hier
-    /// nur zur Laufzeit aus der Aktion abgelesen, nicht von außen entgegengenommen.
-    pub audit_name: String,
-    /// Die ausgeführte Aktion.
-    pub action: WardenAction,
-}
-
-impl WardenActionAudit {
-    /// Baut den Audit-Eintrag für eine bereits ausgeführte Aktion.
-    ///
-    /// # Arguments
-    /// - `action` (`WardenAction`): die ausgeführte Aktion.
-    ///
-    /// # Returns
-    /// Den Audit-Eintrag mit [`WardenAction::audit_name`] als `audit_name`.
-    ///
-    /// # Examples
-    /// ```rust
-    /// use harw_dod_warden_proto::{WardenAction, WardenActionAudit};
-    /// use harw_types::CgroupId;
-    ///
-    /// let audit = WardenActionAudit::for_action(WardenAction::FreezeCgroup {
-    ///     cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
-    /// });
-    /// assert_eq!(audit.audit_name, "warden.freeze_cgroup");
-    /// ```
-    #[must_use]
-    pub fn for_action(action: WardenAction) -> Self {
-        let audit_name = action.audit_name().to_string();
-        Self { audit_name, action }
-    }
-}
-
-/// Die Wire-Nachricht vom Durchsetzer zurück zum Eskalationsleiter: Erfolg
-/// mit Audit-Eintrag, oder inhaltsfreie Ablehnung.
-///
-/// # Wire-Format
-/// Intern getaggt (`"outcome"`), kebab-case, `deny_unknown_fields` (K19).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum WardenResponse {
-    /// Die Aktion wurde ausgeführt.
-    Executed {
-        /// Der Audit-Eintrag der ausgeführten Aktion.
-        audit: WardenActionAudit,
-    },
-    /// Die Aktion wurde abgelehnt.
-    Denied {
-        /// Die inhaltsfreie Ablehnungskategorie.
-        reason: Denial,
-    },
-}
-
 // Die v1-Tests bauen die stillgelegten Typen absichtlich, um ihre Ablehnung zu prüfen.
 #[cfg(test)]
 #[allow(deprecated)]
@@ -397,7 +346,7 @@ mod tests {
     use crate::action::{ProposedAction, WardenAction};
     use crate::denial::Denial;
     use crate::error::ProofError;
-    use crate::proof::AuthorizationProof;
+    use crate::proof::{ActionContentDigest, AuthorizationProof};
     use crate::signed::{
         AuthorizationBody, KeyId, KeyRing, MemoryNonceLedger, ProofKey, ProofPolicy,
         SignedAuthorization,
@@ -476,80 +425,24 @@ mod tests {
         Ok(())
     }
 
-    // -- WardenActionAudit ------------------------------------------------------
+    // -- WardenActionAudit / WardenResponse (seit PL-100 WP 3.0 in
+    // `harw-dod-warden-types`; die eigenen Tests liegen dort) ---------------
 
+    // Der Re-Export ist derselbe Typ, kein Duplikat: ein Wert aus dem
+    // Typ-Crate passt unverändert in die Hülle dieser Crate.
     #[test]
-    fn test_audit_records_declared_name_per_action() -> TestResult {
-        let freeze = WardenActionAudit::for_action(WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1")?,
-        });
-        assert_eq!(freeze.audit_name, "warden.freeze_cgroup");
-
-        let kill = WardenActionAudit::for_action(WardenAction::KillProcessTree {
-            cgroup: cgroup("cgroup-1")?,
-        });
-        assert_eq!(kill.audit_name, "warden.kill_process_tree");
-        Ok(())
-    }
-
-    #[test]
-    fn test_audit_serde_roundtrip() -> TestResult {
-        let audit = WardenActionAudit::for_action(WardenAction::ThawCgroup {
-            cgroup: cgroup("cgroup-1")?,
-        });
-        let json = serde_json::to_string(&audit).map_err(ctx("serializes"))?;
-        let round_tripped: WardenActionAudit =
-            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
-        assert_eq!(round_tripped, audit);
-        Ok(())
-    }
-
-    #[test]
-    fn test_audit_rejects_unknown_field() {
-        let malformed = r#"{"audit_name":"warden.freeze_cgroup","action":{"kind":"freeze-cgroup","cgroup":"cgroup-1"},"extra":1}"#;
-        let result: Result<WardenActionAudit, _> = serde_json::from_str(malformed);
-        assert!(result.is_err());
-    }
-
-    // -- WardenResponse -----------------------------------------------------------
-
-    #[test]
-    fn test_response_executed_serde_roundtrip() -> TestResult {
-        let audit = WardenActionAudit::for_action(WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1")?,
-        });
-        let response = WardenResponse::Executed { audit };
-        let json = serde_json::to_string(&response).map_err(ctx("serializes"))?;
-        assert!(json.contains("\"outcome\":\"executed\""));
-        let round_tripped: WardenResponse =
-            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
-        match round_tripped {
-            WardenResponse::Executed { audit } => {
-                assert_eq!(audit.audit_name, "warden.freeze_cgroup");
-            }
-            WardenResponse::Denied { .. } => {
-                return Err(TestError::Unexpected("expected Executed".into()));
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_response_denied_serde_roundtrip() -> TestResult {
-        let response = WardenResponse::Denied {
-            reason: Denial::NotAdmissibleAtStage,
+    fn test_reexported_outcome_is_the_types_crate_item() -> TestResult {
+        let audit: harw_dod_warden_types::WardenActionAudit =
+            WardenActionAudit::for_action(WardenAction::FreezeCgroup {
+                cgroup: cgroup("cgroup-1")?,
+            });
+        let reply = WardenReply::new(harw_dod_warden_types::WardenResponse::Executed { audit });
+        let json = serde_json::to_string(&reply).map_err(ctx("serializes"))?;
+        let back: WardenReply = serde_json::from_str(&json).map_err(ctx("deserializes"))?;
+        let WardenResponse::Executed { audit } = back.outcome else {
+            return Err(TestError::Unexpected("expected Executed".into()));
         };
-        let json = serde_json::to_string(&response).map_err(ctx("serializes"))?;
-        assert!(json.contains("\"outcome\":\"denied\""));
-        assert!(json.contains("\"not-admissible-at-stage\""));
-        let round_tripped: WardenResponse =
-            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
-        match round_tripped {
-            WardenResponse::Denied { reason } => assert_eq!(reason, Denial::NotAdmissibleAtStage),
-            WardenResponse::Executed { .. } => {
-                return Err(TestError::Unexpected("expected Denied".into()));
-            }
-        }
+        assert_eq!(audit.audit_name, "warden.freeze_cgroup");
         Ok(())
     }
 
@@ -764,12 +657,5 @@ mod tests {
             }
         ));
         Ok(())
-    }
-
-    #[test]
-    fn test_response_rejects_unknown_field() {
-        let malformed = r#"{"outcome":"denied","reason":"proof-mismatch","extra":true}"#;
-        let result: Result<WardenResponse, _> = serde_json::from_str(malformed);
-        assert!(result.is_err());
     }
 }

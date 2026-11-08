@@ -190,6 +190,9 @@ members = [
     "harw-dod/crates/harw-dod-flow",
     "harw-dod/crates/harw-dod-fsmon",
     "harw-dod/crates/harw-dod-gpu",
+    # PL-100 WP 3.0 (I8): Eskalationsleiter ohne Signier-Code, aus
+    # harw-dod-escalate herausgelöst.
+    "harw-dod/crates/harw-dod-ladder",
     "harw-dod/crates/harw-dod-listener",
     "harw-dod/crates/harw-dod-memory",
     "harw-dod/crates/harw-dod-netcounters",
@@ -201,9 +204,15 @@ members = [
     "harw-dod/crates/harw-dod-scanreport",
     "harw-dod/crates/harw-dod-sentinel",
     "harw-dod/crates/harw-dod-signals",
+    # PL-100 WP 3.0 (I8): Triage-Einreichung an den Escalator, aus
+    # harw-dod-escalate herausgelöst.
+    "harw-dod/crates/harw-dod-submit-proto",
     "harw-dod/crates/harw-dod-thermal",
     "harw-dod/crates/harw-dod-warden",
     "harw-dod/crates/harw-dod-warden-proto",
+    # PL-100 WP 3.0 (I8): signierfreies Warden-Vokabular, aus
+    # harw-dod-warden-proto herausgelöst.
+    "harw-dod/crates/harw-dod-warden-types",
     "harw-dod/crates/harw-dod-workspace",
     "harw-dod/crates/harw-probe-bpf",
     "harw-dod/crates/harw-probe-fs",

@@ -1,14 +1,24 @@
 //! Kanonische, längenpräfixierte Bytefolgen für Proof v2 (C-WPROTO, W3).
 //!
 //! # Verantwortungsbereich
-//! Crate-interne Hilfen, aus denen [`crate::signed`] die MAC-Eingabe und
-//! [`crate::action::WardenAction::binding_digest`] die Aktionsbindung baut.
+//! Crate-interne Hilfen, aus denen [`crate::signed`] die MAC-Eingabe baut.
 //! Jedes Feld wird als `u64` Big-Endian-Länge gefolgt von den Rohbytes
 //! geschrieben — dadurch ist die Zerlegung eindeutig (keine zwei
 //! verschiedenen Feldfolgen ergeben dieselben Bytes), unabhängig davon, was
 //! ein Feld enthält. Serde/JSON wird hier bewusst **nicht** verwendet: die
 //! MAC-Eingabe darf nicht davon abhängen, wie eine Serialisierungsbibliothek
 //! Felder anordnet oder Zeichen maskiert.
+//!
+//! # Aufteilung (PL-100 WP 3.0)
+//! Die Grundbausteine (`put_field`, `put_nested`, `put_u64`,
+//! `put_timestamp`) und der Domain-Separator der Aktionsbindung
+//! ([`ACTION_DOMAIN`]) liegen seit der Aufteilung in
+//! `harw_dod_warden_types::canonical`, weil
+//! [`crate::action::WardenAction::binding_digest`] und
+//! [`crate::target::CgroupTarget::put_canonical`] dort mitgewandert sind. Dieses
+//! Modul importiert sie von dort (die Bytes sind unverändert) und behält nur
+//! die signierspezifischen Teile: [`PROOF_DOMAIN`], Wahrheitswerte, die
+//! optionale Haltedauer und die Hex-Kodierung von Nonce und MAC.
 //!
 //! Außerdem die Hex-Kodierung für feste Bytefelder auf der Leitung
 //! (`nonce`, `mac`): nur Kleinbuchstaben, exakt `2 * N` Zeichen — genau eine
@@ -30,27 +40,15 @@
 pub const PROOF_DOMAIN: &[u8] = b"harw:warden-proof:v2\0";
 
 /// Domain-Separator der kanonischen Aktionsbindung (siehe
-/// [`crate::action::WardenAction::binding_digest`]).
-pub const ACTION_DOMAIN: &[u8] = b"harw:warden-action:v2\0";
+/// [`crate::action::WardenAction::binding_digest`]); seit PL-100 WP 3.0 in
+/// `harw_dod_warden_types::canonical` definiert und hier unter dem bisherigen
+/// Pfad re-exportiert.
+pub use harw_dod_warden_types::canonical::ACTION_DOMAIN;
 
-// Hängt ein Feld als `u64`-BE-Länge plus Rohbytes an `buf` an.
-pub(crate) fn put_field(buf: &mut Vec<u8>, bytes: &[u8]) {
-    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    buf.extend_from_slice(&len.to_be_bytes());
-    buf.extend_from_slice(bytes);
-}
-
-// Baut ein zusammengesetztes Feld in einem eigenen Puffer und hängt es als ein Feld an.
-pub(crate) fn put_nested(buf: &mut Vec<u8>, build: impl FnOnce(&mut Vec<u8>)) {
-    let mut inner = Vec::new();
-    build(&mut inner);
-    put_field(buf, &inner);
-}
-
-// Hängt ein `u64` als 8 Bytes Big-Endian an.
-pub(crate) fn put_u64(buf: &mut Vec<u8>, value: u64) {
-    put_field(buf, &value.to_be_bytes());
-}
+// Grundbausteine aus dem Typ-Crate (PL-100 WP 3.0, Bytes unverändert):
+// `put_field` (Länge `u64` BE plus Rohbytes), `put_nested` (zusammengesetztes
+// Feld) und `put_timestamp` (Sekunden ‖ Nanosekunden).
+pub(crate) use harw_dod_warden_types::canonical::{put_field, put_nested, put_timestamp};
 
 // Hängt einen Wahrheitswert als genau ein Byte (`0` oder `1`) an.
 pub(crate) fn put_bool(buf: &mut Vec<u8>, value: bool) {
@@ -68,14 +66,6 @@ pub(crate) fn put_opt_u32(buf: &mut Vec<u8>, value: Option<u32>) {
             put_field(buf, &bytes);
         }
     }
-}
-
-// Hängt einen Zeitpunkt als `i64`-BE-Sekunden ‖ `i32`-BE-Nanosekunden (12 Bytes) an.
-pub(crate) fn put_timestamp(buf: &mut Vec<u8>, value: jiff::Timestamp) {
-    let mut bytes = Vec::with_capacity(12);
-    bytes.extend_from_slice(&value.as_second().to_be_bytes());
-    bytes.extend_from_slice(&value.subsec_nanosecond().to_be_bytes());
-    put_field(buf, &bytes);
 }
 
 // Kodiert `bytes` als Hex in Kleinbuchstaben.
@@ -147,11 +137,7 @@ hex_array_serde!(hex32, 32);
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        decode_hex, encode_hex, put_bool, put_field, put_nested, put_opt_u32, put_timestamp,
-        put_u64,
-    };
-    use crate::test_support::{TestResult, ctx};
+    use super::{ACTION_DOMAIN, PROOF_DOMAIN, decode_hex, encode_hex, put_bool, put_opt_u32};
 
     #[test]
     fn test_put_opt_u32_distinguishes_none_from_some_zero() {
@@ -175,62 +161,12 @@ mod tests {
     }
 
     #[test]
-    fn test_put_u64_writes_eight_big_endian_bytes() {
-        let mut buf = Vec::new();
-        put_u64(&mut buf, 0x0102);
-        assert_eq!(buf, [0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 1, 2]);
-    }
-
-    #[test]
-    fn test_put_timestamp_covers_seconds_and_nanoseconds() -> TestResult {
-        let mut whole = Vec::new();
-        put_timestamp(
-            &mut whole,
-            jiff::Timestamp::new(7, 0).map_err(ctx("timestamp"))?,
-        );
-        let mut fraction = Vec::new();
-        put_timestamp(
-            &mut fraction,
-            jiff::Timestamp::new(7, 1).map_err(ctx("timestamp"))?,
-        );
-        assert_ne!(whole, fraction);
-        assert_eq!(whole.len(), 8 + 12);
-        Ok(())
-    }
-
-    #[test]
-    fn test_put_nested_wraps_subfields_into_one_field() {
-        let mut nested = Vec::new();
-        put_nested(&mut nested, |inner| {
-            put_field(inner, b"a");
-            put_field(inner, b"bc");
-        });
-        let mut flat = Vec::new();
-        put_field(&mut flat, b"a");
-        put_field(&mut flat, b"bc");
-        // Ein Feld: Längenpräfix der inneren Bytes, gefolgt von genau diesen.
-        let mut expected = Vec::new();
-        put_field(&mut expected, &flat);
-        assert_eq!(nested, expected);
-        assert_ne!(nested, flat);
-    }
-
-    #[test]
-    fn test_put_field_prefixes_big_endian_length() {
-        let mut buf = Vec::new();
-        put_field(&mut buf, b"ab");
-        assert_eq!(buf, [0, 0, 0, 0, 0, 0, 0, 2, b'a', b'b']);
-    }
-
-    #[test]
-    fn test_put_field_is_unambiguous_across_field_boundaries() {
-        let mut left = Vec::new();
-        put_field(&mut left, b"ab");
-        put_field(&mut left, b"c");
-        let mut right = Vec::new();
-        put_field(&mut right, b"a");
-        put_field(&mut right, b"bc");
-        assert_ne!(left, right);
+    fn test_domains_are_unchanged_and_distinct() {
+        assert_eq!(PROOF_DOMAIN, b"harw:warden-proof:v2\0");
+        // Re-Export aus `harw-dod-warden-types`: derselbe Wert wie vor der
+        // Aufteilung (PL-100 WP 3.0).
+        assert_eq!(ACTION_DOMAIN, b"harw:warden-action:v2\0");
+        assert_ne!(PROOF_DOMAIN, ACTION_DOMAIN);
     }
 
     #[test]

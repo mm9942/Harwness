@@ -10,15 +10,13 @@ rust-version.workspace = true
 
 [dependencies]
 harw-authority = { path = "../../../harw-authority" }
-# `ApprovalActor` (wer autorisiert hat) — dieselbe Kennung, die
-# `AuthorizationProof::authorized_by` bereits verlangt, statt eine zweite
-# Identitätsdarstellung zu erfinden.
+# `ApprovalActor` (wer autorisiert hat) und `FindingId` — dieselben Kennungen,
+# die der signierte v2-Auftrag (`AuthorizationBody::approver`/`finding_id`)
+# verlangt, statt eine zweite Identitätsdarstellung zu erfinden.
 harw-types = { path = "../../../harw-types" }
-# `TriageSubmission` (W3 C-WPROTO) ist serialisierbar.
-serde = { workspace = true }
 # `#[derive(harw_macros::HarwError)]` für `error.rs`. Kein `warden_actions!` —
 # diese Crate erzeugt keine Aktionstypen, sie autorisiert nur bereits von
-# `harw-dod-warden-proto` deklarierte.
+# `harw-dod-warden-types` deklarierte.
 harw-macros = { path = "../../../harw-macros" }
 # `Finding<Triaged>`, `Finding<RuleChecked>`, `Verdict`, `triage_record` — die
 # Berechtigung, ein `Finding<Triaged>` zu besitzen, kann ausschließlich diese
@@ -31,16 +29,19 @@ harw-macros = { path = "../../../harw-macros" }
 # und darf dann nur dort eingeschaltet werden (xtask-Gate
 # `operator-decision`) — nie hier.
 harw-dod-rules = { path = "../harw-dod-rules" }
-# `Severity`/`Hardness` — Felder von `Finding<S>`, auf denen `Ladder::stage_for`
-# die Aufstiegsregel auswertet. Keine zusätzliche Gewichtsklasse: `harw-dod-rules`
-# hängt bereits auf diese Crate.
-harw-dod-signals = { path = "../harw-dod-signals" }
-# `ProposedAction`/`WardenAction`/`AuthorizationProof`/`EscalationStage`/
-# `WardenActionRequest` — das Wire-Vokabular zum Warden. Von Hand geschrieben
-# dort, nicht über `warden_actions!` (siehe dessen `lib.rs`-Moduldoku,
-# Abschnitt „Prüfung 2: harw-tools") — diese Crate zieht deshalb kein
-# `harw-tools`.
-harw-dod-warden-proto = { path = "../harw-dod-warden-proto" }
+# PL-100 WP 3.0: die Eskalationsleiter (`Ladder`, `LadderError`) — signierfrei
+# herausgelöst, hier unter `harw_dod_escalate::ladder` re-exportiert.
+harw-dod-ladder = { path = "../harw-dod-ladder" }
+# PL-100 WP 3.0: die Triage-Einreichung (`TriageSubmission`) — signierfrei
+# herausgelöst, hier unter `harw_dod_escalate::submission` re-exportiert.
+harw-dod-submit-proto = { path = "../harw-dod-submit-proto" }
+# `ProposedAction`/`WardenAction`/`EscalationStage` — das signierfreie
+# Vokabular zum Warden (PL-100 WP 3.0, Leitprinzip I8). Bewusst NICHT
+# `harw-dod-warden-proto`: diese Crate signiert nichts und baut keinen
+# Wire-Auftrag; den signierten v2-Auftrag (`SignedAuthorization`) stellt erst
+# `harw-escalator` (WP 3.2) aus. Von Hand geschrieben dort, nicht über
+# `warden_actions!` — diese Crate zieht deshalb kein `harw-tools`.
+harw-dod-warden-types = { path = "../harw-dod-warden-types" }
 # `FreezeStore`/`Freeze`/`FreezeResolution` (AW5-05) — diese Crate ist der
 # dokumentierte Aufrufer von `FreezeStore::reconcile_expired` beim Start
 # (siehe `harw-session-store/src/freeze.rs`-Moduldoku, Abschnitt „Expiry").
@@ -49,9 +50,14 @@ jiff = { workspace = true }
 
 [dev-dependencies]
 harw-test-support = { path = "../../../harw-test-support" }
+# Nur für Tests: `Severity`/`Hardness` der `Finding<Triaged>`-Fixtures und
+# `SecurityEvent` für die Regel-Fixtures. Der produktive Code brauchte die
+# Crate nur in `ladder.rs`/`submission.rs`, die seit PL-100 WP 3.0 in
+# `harw-dod-ladder`/`harw-dod-submit-proto` liegen.
+harw-dod-signals = { path = "../harw-dod-signals" }
 # Nur für Tests: baut einen `serde_json::Error`, um den `#[from]`-Pfad von
-# `EscalateError::ActionEncoding` (wrappt `WardenProtoError`) ohne echte
-# Digestbildungspanne auszulösen.
+# `EscalateError::Store` (wrappt `SessionStoreError`) ohne echte
+# Speicherpanne auszulösen.
 serde_json = { workspace = true }
 # Nur für Tests: baut über `EgressFlowRule` ein echtes `Finding<Triaged>`,
 # statt einen privaten Konstruktor zu umgehen — `harw-dod-rules` selbst

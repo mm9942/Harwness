@@ -1,29 +1,32 @@
 //! Die inhaltsfreie Ablehnungskategorie: [`Denial`].
 //!
+//! Seit PL-100 WP 3.0 Teil von `harw-dod-warden-types`; `harw-dod-warden-proto`
+//! re-exportiert diesen Typ unter seinem bisherigen Pfad.
+//!
 //! # Verantwortungsbereich
 //! `Denial` ist der einzige Werttyp, den der Durchsetzer bei einer
 //! Ablehnung über die Leitung zurückgibt (eingebettet in
-//! [`crate::response::WardenResponse::Denied`]). Er ist bewusst **feldlos**:
+//! [`crate::outcome::WardenResponse::Denied`]). Er ist bewusst **feldlos**:
 //! jede Variante trägt null Nutzdaten, sodass eine Ablehnung strukturell —
 //! nicht nur durch Konvention — nichts über den genauen Grund verraten
 //! *kann*. Der Durchsetzer läuft privilegiert; was er meldet, verlässt
-//! seinen Vertrauensbereich (siehe `lib.rs`-Moduldoku). Der feinkörnige
-//! Grund (welches Feld genau nicht passte) bleibt in
-//! [`crate::error::WardenProtoError`] — einem separaten, nie serialisierten
-//! Typ, der das Prozessinnere nie verlässt (siehe dortige Moduldoku).
+//! seinen Vertrauensbereich. Der feinkörnige Grund (welches Feld genau nicht
+//! passte) bleibt in `harw_dod_warden_proto::ProofError` bzw.
+//! `harw_dod_warden_proto::error::WardenProtoError` — separaten, nie
+//! serialisierten Typen des Signierteils, die das Prozessinnere nie
+//! verlassen.
 //!
-//! [`crate::error::WardenProtoError::as_denial`] bildet die interne,
+//! `ProofError::as_denial` (im Signierteil) bildet die interne,
 //! detailreichere Fehlersicht auf genau diese groben Kategorien ab — das ist
 //! die einzige Stelle, an der Detail bewusst fallen gelassen wird, bevor
 //! eine Aussage über die Leitung geht.
 //!
 //! # Warum kein `#[derive(harw_macros::HarwError)]`
-//! `Denial` ist kein `std::error::Error` dieser Crate im Sinne von
-//! Contract-Master §H.1 („ein Fehlertyp je Crate") — dieser Platz ist
-//! [`crate::error::WardenProtoError`] vorbehalten. `Denial` ist ein
-//! Wire-Datentyp wie
-//! [`crate::action::WardenAction`], zufällig mit einer `Display`-Impl für
-//! Logging-Bequemlichkeit auf der vertrauenswürdigen Seite.
+//! `Denial` ist kein `std::error::Error` im Sinne von Contract-Master §H.1
+//! („ein Fehlertyp je Crate") — dieser Platz ist [`crate::error::WardenTypesError`]
+//! bzw. im Signierteil `WardenProtoError` vorbehalten. `Denial` ist ein
+//! Wire-Datentyp wie [`crate::action::WardenAction`], zufällig mit einer
+//! `Display`-Impl für Logging-Bequemlichkeit auf der vertrauenswürdigen Seite.
 //!
 //! # Nebenläufigkeit
 //! `Copy`, keine interne Veränderlichkeit.
@@ -51,7 +54,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Examples
 /// ```rust
-/// use harw_dod_warden_proto::Denial;
+/// use harw_dod_warden_types::Denial;
 ///
 /// let denial = Denial::ProofMismatch;
 /// assert_eq!(
@@ -62,8 +65,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Denial {
-    /// Der Beleg ist nicht an den angeforderten Befund oder die angeforderte
-    /// Aktion gebunden (siehe [`crate::proof::AuthorizationProof::authorizes`]).
+    /// Die Autorisierung ist nicht an den angeforderten Befund oder die
+    /// angeforderte Aktion gebunden, oder ihr MAC prüft nicht (Signierteil:
+    /// `SignedAuthorization::verify`, alle Authentisierungsschritte).
     ProofMismatch,
     /// Die Aktion ist ab der im Beleg genannten Eskalationsstufe nicht
     /// zulässig (siehe [`crate::action::WardenAction::is_admissible_from`]).
@@ -103,7 +107,7 @@ pub enum Denial {
 ///
 /// # Examples
 /// ```rust
-/// use harw_dod_warden_proto::Denial;
+/// use harw_dod_warden_types::Denial;
 ///
 /// assert_eq!(
 ///     Denial::NotAdmissibleAtStage.to_string(),

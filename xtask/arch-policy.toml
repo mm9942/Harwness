@@ -115,7 +115,8 @@ layer = "F"
 [packages."harw-untrusted-text"]
 layer = "F"
 # PL-100 WP2.1: reine Dispatch-Logik (Routing, Budgets, Breaker, Gruppierung)
-# ohne IO, Uhr, Async oder Threads; nur serde. F, damit DodWatch (A) und
+# ohne IO, Uhr, Async oder Threads; serde und serde_json (begrenzte
+# Persistenz-Kodierung, from_json_bounded). F, damit DodWatch (A) und
 # Tests sie nutzen; die Verbots-Zeile unten hält sie frei von Runtime,
 # Netzwerk, Signier- und Daemon-Crates.
 [packages."harw-dod-dispatch"]
@@ -267,6 +268,11 @@ layer = "D"
 layer = "D"
 [packages."harw-dod-gpu"]
 layer = "D"
+# PL-100 WP 3.0 (I8): Eskalationsleiter, aus harw-dod-escalate herausgelöst.
+# Signierfrei: hängt nur an harw-dod-rules, harw-dod-signals,
+# harw-dod-warden-types und harw-macros.
+[packages."harw-dod-ladder"]
+layer = "D"
 [packages."harw-dod-listener"]
 layer = "D"
 [packages."harw-dod-memory"]
@@ -291,12 +297,23 @@ layer = "D"
 [packages."harw-dod-signals"]
 layer = "D"
 tcb = true
+# PL-100 WP 3.0 (I8): Triage-Einreichung an den Escalator, aus
+# harw-dod-escalate herausgelöst; hängt nur an harw-dod-signals, harw-types
+# und harw-macros.
+[packages."harw-dod-submit-proto"]
+layer = "D"
 [packages."harw-dod-thermal"]
 layer = "D"
 [packages."harw-dod-warden"]
 layer = "D"
 tcb = true
 [packages."harw-dod-warden-proto"]
+layer = "D"
+tcb = true
+# PL-100 WP 3.0 (I8): signierfreies Warden-Vokabular, aus
+# harw-dod-warden-proto herausgelöst. TCB, weil der Warden es über
+# harw-dod-warden-proto lädt (Aktions-, Ziel- und Stufen-Dekodierung).
+[packages."harw-dod-warden-types"]
 layer = "D"
 tcb = true
 [packages."harw-dod-workspace"]
@@ -492,6 +509,11 @@ allowed_internal = [
 allowed_internal = ["harw-dod-warden-proto", "harw-macros", "harw-types"]
 
 [tcb."harw-dod-warden-proto"]
+allowed_internal = ["harw-dod-warden-types", "harw-macros", "harw-types"]
+
+# PL-100 WP 3.0: der signierfreie Teil von harw-dod-warden-proto; dieselbe
+# Grundausstattung, keine neue Kante.
+[tcb."harw-dod-warden-types"]
 allowed_internal = ["harw-macros", "harw-types"]
 
 [tcb."harw-dod-readfs"]
@@ -517,9 +539,18 @@ reason = "I → J: harw-session-store::JobStore ist ein Adapter über die generi
 until = "R12"
 
 # ---------------------------------------------------------------------------
-# Verbotene externe Crates (transitiv, über [dependencies] und
-# [build-dependencies] plus Cargo.lock)
+# Verbotene Crates, extern und intern (transitiv, über [dependencies] und
+# [build-dependencies] samt ihren [target.'…']-Varianten plus Cargo.lock;
+# [dev-dependencies] zählen nicht)
 # ---------------------------------------------------------------------------
+# Die Hülle liest die Manifeste selbst (gate_arch.rs, `ManifestEdges`): jeder
+# Eintrag zählt unter seiner Paketidentität (`package = "…"`, auch geerbt per
+# `workspace = true`), nicht unter seinem Tabellenschlüssel. Ein Name in der
+# Hülle, der weder lokales Paket noch in Cargo.lock ist, ist ein Verstoß
+# (fail closed), in jeder Schicht.
+# Ein Paket darf in mehreren Zeilen stehen; verboten ist die Vereinigung.
+# `names` darf angekündigte Pakete nennen (etwa `harw-escalator`, WP 3.2): die
+# Zeile greift, sobald es sie gibt.
 # W00 D10 / ARC-02: Die WebSocket-Bibliothek gehört allein dem Ring-A-Adapter
 # `harw-session-ws`. Jobs (J), DoD (D), die TCB und alles Innere erreichen sie
 # nicht.
@@ -539,15 +570,71 @@ names = ["hyper", "tungstenite", "tokio-tungstenite", "harw-node-transport", "ha
 packages = ["harw-protocol"]
 reason = "W00 §2.1/ARC-01: harw-protocol has no async runtime or network transport dependency"
 
+# Seit PL-100 WP 3.0 liegt die Eskalationsleiter in `harw-dod-ladder` (vorher
+# in `harw-dod-escalate`); der angekündigte `harw-escalator` (WP 3.2) ist ein
+# DoD-Daemon. Beide stehen deshalb hier und in der Dispatch-Zeile darunter.
 [[forbidden_crates]]
-names = ["harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs", "harw-probe-netlink"]
+names = ["harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-dod-ladder", "harw-escalator", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs", "harw-probe-netlink"]
 packages = ["harw-dod-client"]
 reason = "PL-97 §3.1 / S1: the read-only Harw-DoD client never links the Warden, the escalation ladder or a DoD daemon"
 
 [[forbidden_crates]]
-names = ["tokio", "async-std", "mio", "hyper", "reqwest", "tungstenite", "tokio-tungstenite", "harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs", "harw-probe-netlink", "harw-dod-client", "harw-node-transport"]
+names = ["tokio", "async-std", "mio", "hyper", "reqwest", "tungstenite", "tokio-tungstenite", "harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-dod-ladder", "harw-escalator", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs", "harw-probe-netlink", "harw-dod-client", "harw-node-transport"]
 packages = ["harw-dod-dispatch"]
 reason = "PL-100 WP2.1 / I8: the dispatch core is pure (no IO, clock, runtime or network) and never links signing code, the escalation ladder or a DoD daemon"
+
+# PL-100 WP 3.0 / Leitprinzip I8: Prozesse, die mit Modellen sprechen, linken
+# keinen Signier-Code (README §4, 3.0; THREAT-MODEL B16). Verboten sind
+# - der Signierteil des Warden-Protokolls `harw-dod-warden-proto` (MAC,
+#   `KeyRing`, `ProofKey`, Nonce-Ledger),
+# - die Eskalationsleiter `harw-dod-ladder` und `harw-dod-escalate`
+#   (Stufenregel, Autorisierung und FreezeStore-Abgleich auf der
+#   Escalator-Seite) und
+# - der angekündigte `harw-escalator` (WP 3.2; die Zeile greift, sobald es das
+#   Paket gibt).
+# Erlaubt bleibt das signierfreie Vokabular `harw-dod-warden-types`.
+# harw-plan-bridge dockt Befunde ohne die Leiter an: es prüft „gibt es
+# überhaupt eine Stufe" selbst und pinnt die Gleichheit mit
+# `Ladder::stage_for` in einem Test (Leiter nur als Dev-Abhängigkeit, die hier
+# nicht zählt). harw-agent-runner und harwness-sdk betten harw-runtime ein und
+# zählen deshalb mit. harw-dod-dispatch hat seine eigene Zeile oben.
+# Grenze: diese Zeile sieht Kanten, keinen Quelltext. `#[path = "../…"] mod`
+# oder `include!("../…")` könnten Signier-Code ohne Kante einkompilieren;
+# das prüft kein Gate (siehe gate_arch.rs, „Was dieses Gate nicht prüft").
+[[forbidden_crates]]
+names = ["harw-dod-warden-proto", "harw-dod-ladder", "harw-dod-escalate", "harw-escalator"]
+packages = ["harw", "harw-agent-runner", "harw-cli", "harw-core", "harw-core-bridge", "harw-ops", "harw-plan-bridge", "harw-runtime", "harw-tui", "harwness-sdk"]
+reason = "PL-100 WP3.0 / I8: model-facing processes never link the signing part of the warden protocol, the escalation ladder, the escalation authorization or the escalator"
+
+# PL-100 WP 3.0 / I8: Was modellnahe Prozesse linken dürfen, bleibt
+# signierfrei. Leiter, Triage-Einreichung und Warden-Vokabular erreichen den
+# Signierteil nie. harw-dod-escalate signiert nichts: den signierten
+# v2-Auftrag (`SignedAuthorization`) stellt erst harw-escalator aus (WP 3.2).
+[[forbidden_crates]]
+names = ["harw-dod-warden-proto", "harw-escalator"]
+packages = ["harw-dod-escalate", "harw-dod-ladder", "harw-dod-submit-proto", "harw-dod-warden-types"]
+reason = "PL-100 WP3.0 / I8: the signing-free DoD crates (escalation authorization, ladder, triage submission, warden vocabulary) never link the signing part of the warden protocol or the escalator"
+
+# PL-100 WP 3.0 / I8: Die Triage-Einreichung ist das Format, das ein
+# modellnaher Prozess (DodWatch in harw-runtime, WP 2.2) an den Escalator
+# schickt. Sie trägt nur Urteil und Digest; die Eskalationsleiter und die
+# Autorisierung samt FreezeStore entscheidet erst der Escalator. Eine Kante
+# von hier zöge beide in jeden Prozess, der Einreichungen baut.
+[[forbidden_crates]]
+names = ["harw-dod-ladder", "harw-dod-escalate"]
+packages = ["harw-dod-submit-proto"]
+reason = "PL-100 WP3.0 / I8: the model-facing triage submission never links the escalation ladder or the escalation authorization"
+
+# PL-100 WP 3.0 / S1: Sensoren und die Telemetrie (`harw-observe` und seine
+# Sinks `harw-observe-*`) erreichen die Eskalationsleiter nicht, auch nicht
+# transitiv. `gate_edges.rs` verbietet Sensoren und Sinks nur die direkte
+# Kante auf `harw-dod-escalate`; seit WP 3.0 liegt die Leiter in
+# `harw-dod-ladder`, und `harw-escalator` (WP 3.2) kommt hinzu. Die
+# Sensorliste entspricht `SENSOR_CRATES` in gate_edges.rs.
+[[forbidden_crates]]
+names = ["harw-dod-ladder", "harw-dod-escalate", "harw-escalator"]
+packages = ["harw-dod-advisory", "harw-dod-authlog", "harw-dod-blockio", "harw-dod-cgroup", "harw-dod-container", "harw-dod-cpu", "harw-dod-flow", "harw-dod-fsmon", "harw-dod-gpu", "harw-dod-listener", "harw-dod-memory", "harw-dod-netcounters", "harw-dod-procmon", "harw-dod-scanreport", "harw-dod-thermal", "harw-dod-workspace", "harw-observe", "harw-observe-file", "harw-observe-otlp", "harw-observe-prom"]
+reason = "PL-100 WP3.0 / S1: sensors and telemetry sinks never reach the escalation ladder, the escalation authorization or the escalator"
 
 [packages."harw-context-ledger"]
 layer = "I"

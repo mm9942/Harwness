@@ -144,26 +144,31 @@
 //!
 //! 1. **Invariante S1.** `harw_dod_escalate::Action::authorize` ist in
 //!    `harw-dod-escalate` `pub(crate)` — die einzige Stelle im gesamten
-//!    Workspace, die eine `AuthorizationProof` erzeugt (siehe dessen
-//!    `action.rs`-Moduldoku samt eigenem `compile_fail`-Doctest). Das bleibt
-//!    unabhängig davon wahr, ob diese Fassade `Action`/`Authorized`
-//!    re-exportiert — `pub(crate)` überlebt jeden `pub use`, auch einen
+//!    Workspace, die ein `Action<Authorized>` samt seinem unsignierten
+//!    Inhalt `AuthorizedAction` erzeugt (siehe dessen `action.rs`-Moduldoku
+//!    samt eigenem `compile_fail`-Doctest). Signiert wird dort nichts: den
+//!    signierten v2-Auftrag (`harw_dod_warden_proto::SignedAuthorization`),
+//!    den allein der Warden annimmt, stellt künftig nur `harw-escalator`
+//!    (PL-100 WP 3.2) aus (Leitprinzip I8). Das bleibt unabhängig davon
+//!    wahr, ob diese Fassade `Action`/`Authorized` re-exportiert —
+//!    `pub(crate)` überlebt jeden `pub use`, auch einen
 //!    Blanket-Reexport, weil ein nicht-`pub`-Item über `pub use krate::*`
 //!    gar nicht erst sichtbar wird. Diese Fassade re-exportiert dennoch
 //!    **keinen einzigen Namen** aus `harw-dod-escalate` — nicht weil ein
 //!    Reexport `authorize` erreichbar machen würde (das kann er nicht),
 //!    sondern weil `harw-dod-escalate`s öffentliche Funktionen
-//!    (`freeze_ops::authorize_freeze`/`authorize_release`/
+//!    (`freeze_ops::authorize_freeze`/`authorize_thaw`/
 //!    `authorize_stage_gated`) bereits fertige `Action<Authorized>`-Werte
-//!    zurückgeben, die zum Warden weitergereicht werden sollen — sie unter
-//!    „beobachte/bewerte" zu präsentieren verwischte genau die Grenze,
+//!    zurückgeben, die der Escalator in einen signierten Auftrag an den
+//!    Warden umsetzen soll — sie unter „beobachte/bewerte" zu
+//!    präsentieren verwischte genau die Grenze,
 //!    die dieser Abschnitt zieht. Der eigene `compile_fail`-Doctest unten
 //!    belegt das für diese Fassade: es gibt hier **gar keinen** Pfad zu
 //!    `Action`, `Authorized` oder `Action<Authorized>` — stärker als
 //!    „unerreichbar", nämlich „nicht einmal benennbar".
 //! 2. **Eine zweite Abhängigkeit würde durchgereicht.**
-//!    `freeze_ops::authorize_freeze`/`authorize_release`/
-//!    `authorize_stage_gated`/`reconcile_expired_freezes` nehmen alle ein
+//!    `freeze_ops::authorize_freeze`/`authorize_thaw`/
+//!    `reconcile_expired_freezes` nehmen ein
 //!    `&harw_session_store::FreezeStore` entgegen — eine vierte Crate, die
 //!    diese Fassade dann ebenfalls in ihre eigene Fläche hätte aufnehmen
 //!    müssen, nur um `harw-dod-escalate` sinnvoll benutzbar zu machen.

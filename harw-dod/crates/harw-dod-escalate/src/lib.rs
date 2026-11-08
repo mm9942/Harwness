@@ -7,13 +7,16 @@
 //! `harw-dod-rules`, AW4-03, erwerbbar) über [`triage_record`] in ein
 //! `Finding<Triaged>` — beide Typen re-exportiert, nicht neu definiert (siehe
 //! „Der dritte Zustand" unten). Sie definiert selbst [`Action<Proposed>`] und
-//! [`Action<Authorized>`] ([`action`]-Modul) sowie [`Ladder`]
-//! ([`ladder`]-Modul), die entscheidet, welche Aktion ab welcher Stufe
+//! [`Action<Authorized>`] ([`action`]-Modul) und nutzt [`Ladder`]
+//! (seit PL-100 WP 3.0 in `harw-dod-ladder`, hier als [`ladder`]
+//! re-exportiert), die entscheidet, welche Aktion ab welcher Stufe
 //! zulässig ist und welche Stufe ein Befund erreicht hat. Sie verwaltet die
 //! durable `FreezeStore`-Persistenz (AW5-05) über [`freeze_ops`]. Sie führt
-//! selbst **keine** Durchsetzung aus — das ist Sache von `harw-dod-warden`
-//! (AW5-04a), das ein von dieser Crate erzeugtes `WardenActionRequest` über
-//! den Socket empfängt und gegen `AuthorizationProof::verify` prüft.
+//! selbst **keine** Durchsetzung aus und signiert **nichts**: ihr Ergebnis
+//! ist der unsignierte [`AuthorizedAction`]. Den signierten v2-Auftrag
+//! (`harw_dod_warden_proto::SignedAuthorization`) stellt `harw-escalator`
+//! (PL-100 WP 3.2) daraus aus; `harw-dod-warden` (AW5-04a) nimmt nur diesen
+//! an und prüft ihn mit `SignedAuthorization::verify`.
 //!
 //! # Der dritte Zustand: `Finding<Triaged>` lebt in `harw-dod-rules`, nicht
 //! hier
@@ -33,14 +36,13 @@
 //!
 //! # Invariante S1: Autorisierung entsteht an genau einem Ort
 //! [`Action::authorize`] ist `pub(crate)` — **niemand außerhalb dieser Crate
-//! kann ein `Action<Authorized>` herstellen.** Es gibt keinen öffentlichen
-//! Konstruktor, kein `From`, kein `Deserialize` für `Action<S>` selbst, über
-//! den ein Aufrufer den Typestate-Übergang umgehen könnte; ein
-//! `WardenActionRequest`, das `harw-dod-warden` über den Socket empfängt, ist
-//! ein deserialisierter Wire-Wert, kein `Action<Authorized>` — nur die
-//! hiesige Konstruktion durchläuft die Prüfungen (Verdict, Zulässigkeit,
-//! Belegbindung). Siehe [`action`]-Moduldoku für den vollständigen Beleg
-//! einschließlich eines `compile_fail`-Doctests.
+//! kann ein `Action<Authorized>` oder einen [`AuthorizedAction`]
+//! herstellen.** Es gibt keinen öffentlichen Konstruktor, kein `From`, kein
+//! `Deserialize` für `Action<S>` oder [`AuthorizedAction`], über den ein
+//! Aufrufer den Typestate-Übergang umgehen könnte — nur die hiesige
+//! Konstruktion durchläuft die Prüfungen (Verdict, stillgelegte Aktion,
+//! Zulässigkeit). Siehe [`action`]-Moduldoku für den vollständigen Beleg
+//! einschließlich der `compile_fail`-Doctests.
 //!
 //! # Die Aufstiegsregel in einem Absatz
 //! Ein Befund erreicht `EscalationStage::RuleTriggered` nur, wenn er eine
@@ -65,22 +67,39 @@
 //! `[dev-dependencies]`. Bis WP 3.2 erreicht deshalb in einem produktiven
 //! Build (ohne Dev-Ziele) kein Befund eine Stufe der Leiter.
 //!
-//! # Triage-Einreichung und Proof v2 (C-WPROTO, W3)
+//! # Aufteilung (PL-100 WP 3.0, Leitprinzip I8)
+//! [`Ladder`] liegt seit WP 3.0 in `harw-dod-ladder`, [`TriageSubmission`] in
+//! `harw-dod-submit-proto`. Beide hängen nicht am Signierteil
+//! (`harw-dod-warden-proto`), sodass modellnahe Prozesse sie linken können,
+//! ohne diese Crate zu ziehen. Diese Crate re-exportiert beide unter den
+//! bisherigen Pfaden ([`ladder`], [`submission`] sowie die Typen an der
+//! Wurzel); [`LadderError`] faltet sie per `From` in
+//! [`EscalateError::NotEscalatable`].
+//!
+//! # Triage-Einreichung und Proof v2 (C-WPROTO, W3; PL-100 WP 3.0)
 //! [`submission::TriageSubmission`] ist das eingefrorene Format, in dem ein
 //! modellnaher Triage-Prozess nur ein Urteil plus gebundenen Finding-Digest
 //! an den Escalator liefert (F-023); der Escalator liest den Record selbst und
 //! signiert anschließend eine `harw_dod_warden_proto::SignedAuthorization`
-//! (F-001). Die Umstellung von [`action`]/[`freeze_ops`] vom fälschbaren
-//! v1-`AuthorizationProof` auf Proof v2 ist Folgearbeit W5 D-ESC.
+//! (F-001). Seit PL-100 WP 3.0 baut diese Crate keinen fälschbaren
+//! v1-`AuthorizationProof` und keine `WardenActionRequest` mehr und hängt
+//! nicht am Signierteil `harw-dod-warden-proto`; [`action`]/[`freeze_ops`]
+//! liefern nur den unsignierten [`AuthorizedAction`]. Die stillgelegte
+//! Aktion `ReleaseCgroup` lehnt [`Action::authorize`] ab
+//! ([`EscalateError::RetiredAction`]); `freeze_ops::authorize_release` ist
+//! durch [`freeze_ops::authorize_thaw`] ersetzt.
 //!
 //! # Autorisierung vor Zustand
-//! [`freeze_ops::authorize_freeze`] und [`freeze_ops::authorize_release`]
+//! [`freeze_ops::authorize_freeze`] und [`freeze_ops::authorize_thaw`]
 //! werten zuerst die nebenwirkungsfreien Prüfungen aus (`Ladder::stage_for`,
 //! `Action::authorize`); erst danach, noch vor Übergabe der autorisierten
 //! Aktion, schreiben sie ihren `FreezeStore`-Datensatz. Eine abgelehnte
 //! Autorisierung lässt den Store unverändert — kein Phantom-`.active`, kein
 //! `Lifted` für eine noch eingefrorene Cgroup — und wird nur über den
-//! inhaltsfreien [`EscalateError`] gemeldet. Siehe [`freeze_ops`]-Moduldoku.
+//! inhaltsfreien [`EscalateError`] gemeldet. [`freeze_ops::authorize_stage_gated`]
+//! schreibt keinen Datensatz und lehnt `FreezeCgroup`/`ThawCgroup` deshalb ab
+//! ([`EscalateError::NotAStageGatedAction`]): keine Freigabe ohne Datensatz.
+//! Siehe [`freeze_ops`]-Moduldoku.
 //!
 //! # Rekonziliationsdisziplin beim Start
 //! [`freeze_ops::reconcile_expired_freezes`] muss vom Aufrufer einmal, vor
@@ -98,11 +117,15 @@
 //! `Timestamp::now()`.
 //!
 //! # Abhängigkeiten
-//! `harw-types`, `harw-macros`, `harw-dod-rules`, `harw-dod-signals`,
-//! `harw-dod-warden-proto`, `harw-session-store`, `jiff`, `serde` (seit
-//! C-WPROTO, für `TriageSubmission`) — kein `harw-tools`,
-//! kein `harw-core`. Diese Crate liegt auf dem Weg zum Warden; jede
-//! vermeidbare zusätzliche Abhängigkeit wäre ein zu meldender Befund.
+//! `harw-types`, `harw-macros`, `harw-authority`, `harw-dod-rules`,
+//! `harw-dod-ladder`, `harw-dod-submit-proto`, `harw-dod-warden-types`,
+//! `harw-session-store`, `jiff` — kein `harw-tools`, kein `harw-core` und
+//! seit PL-100 WP 3.0 kein Signierteil (`harw-dod-warden-proto`).
+//! `serde` und `harw-dod-signals` brauchte nur der Code, der nach
+//! `harw-dod-submit-proto` bzw. `harw-dod-ladder` gewandert ist (PL-100
+//! WP 3.0); `harw-dod-signals` bleibt Dev-Abhängigkeit der Tests. Diese Crate
+//! liegt auf dem Weg zum Warden; jede vermeidbare zusätzliche Abhängigkeit
+//! wäre ein zu meldender Befund.
 //!
 //! # Nebenläufigkeit
 //! Alle Typen dieser Crate sind reine Werte ohne innere Veränderlichkeit
@@ -117,17 +140,23 @@
 pub mod action;
 pub mod error;
 pub mod freeze_ops;
-pub mod ladder;
-pub mod submission;
 
-pub use action::{Action, ActionState, Authorized, Proposed};
+/// Die Eskalationsleiter, seit PL-100 WP 3.0 die Crate `harw-dod-ladder`;
+/// unter dem bisherigen Modulpfad `harw_dod_escalate::ladder` re-exportiert.
+pub use harw_dod_ladder as ladder;
+/// Die Triage-Einreichung, seit PL-100 WP 3.0 die Crate
+/// `harw-dod-submit-proto`; unter dem bisherigen Modulpfad
+/// `harw_dod_escalate::submission` re-exportiert.
+pub use harw_dod_submit_proto as submission;
+
+pub use action::{Action, ActionState, Authorized, AuthorizedAction, Proposed};
 pub use error::{EscalateError, EscalateResult};
 pub use freeze_ops::{
-    authorize_freeze, authorize_release, authorize_stage_gated, reconcile_expired_freezes,
+    authorize_freeze, authorize_stage_gated, authorize_thaw, reconcile_expired_freezes,
 };
+pub use harw_dod_ladder::{Ladder, LadderError, LadderResult};
 pub use harw_dod_rules::{Finding, RuleChecked, Triaged, Verdict, triage_record};
-pub use ladder::Ladder;
-pub use submission::{
+pub use harw_dod_submit_proto::{
     SubmissionError, SubmissionResult, TRIAGE_SUBMISSION_VERSION, TriageSubmission,
 };
 

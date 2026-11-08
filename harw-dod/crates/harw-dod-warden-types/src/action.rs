@@ -1,10 +1,14 @@
 //! Die Aktionstaxonomie: [`ProposedAction`], [`WardenAction`],
 //! [`Reversibility`].
 //!
+//! Seit PL-100 WP 3.0 Teil von `harw-dod-warden-types`; `harw-dod-warden-proto`
+//! re-exportiert diese Typen unter ihren bisherigen Pfaden.
+//!
 //! # Verantwortungsbereich
 //! Diese Aktionen sind von Hand geschrieben, nicht über
-//! `harw_macros::warden_actions!` erzeugt — siehe `lib.rs`-Moduldoku,
-//! Abschnitt „Prüfung 2: harw-tools" für die Begründung. Beide Formen halten
+//! `harw_macros::warden_actions!` erzeugt — siehe die Moduldoku von
+//! `harw-dod-warden-proto`, Abschnitt „Prüfung 2: harw-tools" für die
+//! Begründung. Beide Formen halten
 //! sich an dieselbe Disziplin, die das Makro erzwingen würde: kein Feld
 //! außerhalb der Positivliste aus `harw-types`-Kennungen, Ganzzahlen, `bool`
 //! oder `Vec<T>` darüber (siehe `lib.rs`-Moduldoku, Abschnitt „Keine freien
@@ -25,7 +29,7 @@
 //! Aufhebung nicht mit einer Stufe binden. Die Variante bleibt nur als
 //! `#[deprecated]`-Altlast für die v1-Aufrufer stehen
 //! ([`WardenAction::is_retired`]); Proof v2 lehnt sie immer ab
-//! ([`crate::error::ProofError::RetiredAction`]).
+//! (`harw_dod_warden_proto::ProofError::RetiredAction`).
 //!
 //! # Die Zulässigkeitsmatrix in Worten
 //! `FreezeCgroup` und `ThawCgroup` sind bereits ab `RuleTriggered`
@@ -61,7 +65,7 @@
 use harw_types::{CgroupId, ContentDigest};
 use serde::{Deserialize, Serialize};
 
-use crate::error::WardenProtoError;
+use crate::canonical::{ACTION_DOMAIN, put_field};
 use crate::stage::EscalationStage;
 
 /// Was ein Agent vorschlagen kann, ohne Autorisierung.
@@ -71,7 +75,7 @@ use crate::stage::EscalationStage;
 /// das eine `ProposedAction` hält, kann sie nicht versehentlich
 /// unautorisiert an den Durchsetzer senden — dafür ist erst die Umwandlung in
 /// eine [`WardenAction`] und eine vom Escalator signierte
-/// [`crate::signed::SignedAuthorization`] nötig (dieselbe Trennung, die
+/// `harw_dod_warden_proto::SignedAuthorization` nötig (dieselbe Trennung, die
 /// `harw_macros::warden_actions!` erzeugen würde, siehe dessen Moduldoku,
 /// Abschnitt „Was pro Deklaration erzeugt wird").
 ///
@@ -119,7 +123,7 @@ pub enum ProposedAction {
 }
 
 /// Wire-Enum: die Aktionstaxonomie, wie sie (eingebettet in
-/// [`crate::response::WardenRequest`]) über den Socket zum Durchsetzer geht.
+/// `harw_dod_warden_proto::WardenRequest`) über den Socket zum Durchsetzer geht.
 ///
 /// # Description
 /// Datenform identisch zu [`ProposedAction`] — siehe dort für die
@@ -209,19 +213,18 @@ impl WardenAction {
     /// Fester, zur Compile-Zeit gewählter Bezeichner je Aktion — kein vom
     /// Modell beeinflusster Wert (siehe `lib.rs`-Moduldoku, Abschnitt „Keine
     /// freien Argumente"). Verwendet von
-    /// [`crate::response::WardenActionAudit::for_action`].
+    /// [`crate::outcome::WardenActionAudit::for_action`].
     ///
     /// # Returns
     /// Einen statischen, punktgetrennten Bezeichner (`"warden.<aktion>"`).
     ///
     /// # Examples
     /// ```rust
-    /// use harw_dod_warden_proto::WardenAction;
+    /// use harw_dod_warden_types::WardenAction;
     /// use harw_types::CgroupId;
     ///
-    /// let action = WardenAction::FreezeCgroup {
-    ///     cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
-    /// };
+    /// let Ok(cgroup) = CgroupId::try_from_str("cgroup-1") else { return };
+    /// let action = WardenAction::FreezeCgroup { cgroup };
     /// assert_eq!(action.audit_name(), "warden.freeze_cgroup");
     /// ```
     #[must_use]
@@ -254,17 +257,14 @@ impl WardenAction {
     ///
     /// # Examples
     /// ```rust
-    /// use harw_dod_warden_proto::{EscalationStage, WardenAction};
+    /// use harw_dod_warden_types::{EscalationStage, WardenAction};
     /// use harw_types::CgroupId;
     ///
-    /// let freeze = WardenAction::FreezeCgroup {
-    ///     cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
-    /// };
+    /// let Ok(cgroup) = CgroupId::try_from_str("cgroup-1") else { return };
+    /// let freeze = WardenAction::FreezeCgroup { cgroup: cgroup.clone() };
     /// assert!(freeze.is_admissible_from(EscalationStage::RuleTriggered));
     ///
-    /// let kill = WardenAction::KillProcessTree {
-    ///     cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
-    /// };
+    /// let kill = WardenAction::KillProcessTree { cgroup };
     /// assert!(!kill.is_admissible_from(EscalationStage::RuleTriggered));
     /// assert!(kill.is_admissible_from(EscalationStage::Escalated));
     /// ```
@@ -295,12 +295,11 @@ impl WardenAction {
     ///
     /// # Examples
     /// ```rust
-    /// use harw_dod_warden_proto::{Reversibility, WardenAction};
+    /// use harw_dod_warden_types::{Reversibility, WardenAction};
     /// use harw_types::CgroupId;
     ///
-    /// let kill = WardenAction::KillProcessTree {
-    ///     cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
-    /// };
+    /// let Ok(cgroup) = CgroupId::try_from_str("cgroup-1") else { return };
+    /// let kill = WardenAction::KillProcessTree { cgroup };
     /// assert_eq!(kill.reversibility(), Reversibility::Irreversible);
     /// ```
     #[must_use]
@@ -324,12 +323,12 @@ impl WardenAction {
     /// Variante muss sich hier entscheiden.
     ///
     /// # Returns
-    /// `true`, wenn [`crate::signed::SignedAuthorization::verify`] ein
+    /// `true`, wenn `harw_dod_warden_proto::SignedAuthorization::verify` ein
     /// signiertes `irreversible_ack == true` verlangt.
     ///
     /// # Examples
     /// ```rust
-    /// use harw_dod_warden_proto::WardenAction;
+    /// use harw_dod_warden_types::WardenAction;
     /// use harw_types::CgroupId;
     ///
     /// let Ok(cgroup) = CgroupId::try_from_str("harw.slice/job-1") else { return };
@@ -357,7 +356,7 @@ impl WardenAction {
     ///
     /// # Examples
     /// ```rust
-    /// use harw_dod_warden_proto::WardenAction;
+    /// use harw_dod_warden_types::WardenAction;
     /// use harw_types::CgroupId;
     ///
     /// let Ok(cgroup) = CgroupId::try_from_str("harw.slice/job-1") else { return };
@@ -375,32 +374,6 @@ impl WardenAction {
         }
     }
 
-    /// Der Inhaltsdigest dieser Aktion — die Grundlage für
-    /// [`crate::proof::AuthorizationProof::bound_action`] (**v1-Altlast**).
-    ///
-    /// # Description
-    /// Kodiert die Aktion kanonisch als JSON (Feldreihenfolge folgt der
-    /// Deklaration, siehe `serde_json`s Verhalten für von `#[derive]`
-    /// erzeugte `Serialize`-Impls) und hasht das Ergebnis mit
-    /// [`ContentDigest::of`]. Zwei Aufrufe mit strukturell identischen
-    /// Aktionen (gleiche Variante, gleiche Feldwerte) ergeben denselben
-    /// Digest; jede Abweichung — auch nur in einem `CgroupId`-Feld — ergibt
-    /// einen anderen. Proof v2 nutzt stattdessen [`Self::binding_digest`]
-    /// (serde-unabhängig, unfehlbar).
-    ///
-    /// # Errors
-    /// - [`WardenProtoError::ActionEncoding`]: die JSON-Kodierung ist
-    ///   fehlgeschlagen. Für die hier definierten Feldtypen (ausschließlich
-    ///   `harw-types`-Kennungen) praktisch unerreichbar — dieselbe
-    ///   Begründung wie bei `harw_dod_signals::SignalsError::DigestEncoding`.
-    #[deprecated(
-        note = "v1 binding for the forgeable AuthorizationProof (F-001); proof v2 binds WardenAction::binding_digest inside SignedAuthorization"
-    )]
-    pub fn content_digest(&self) -> Result<ContentDigest, WardenProtoError> {
-        let bytes = serde_json::to_vec(self)?;
-        Ok(ContentDigest::of(&bytes))
-    }
-
     /// Returns the wire name of this action's variant (`"freeze-cgroup"`, …).
     ///
     /// # Description
@@ -410,12 +383,11 @@ impl WardenAction {
     ///
     /// # Examples
     /// ```rust
-    /// use harw_dod_warden_proto::WardenAction;
+    /// use harw_dod_warden_types::WardenAction;
     /// use harw_types::CgroupId;
     ///
-    /// let action = WardenAction::KillProcessTree {
-    ///     cgroup: CgroupId::try_from_str("harw.slice/job-1").unwrap(),
-    /// };
+    /// let Ok(cgroup) = CgroupId::try_from_str("harw.slice/job-1") else { return };
+    /// let action = WardenAction::KillProcessTree { cgroup };
     /// assert_eq!(action.kind_name(), "kill-process-tree");
     /// ```
     #[must_use]
@@ -435,14 +407,14 @@ impl WardenAction {
     /// # Description
     /// Jede Variante trägt genau eine Ziel-cgroup; Proof v2 bindet sie
     /// zusätzlich als Teil des Ziel-Tripels (siehe
-    /// [`crate::signed::SignedAuthorization::verify`], Schritt „cgroup“).
+    /// `harw_dod_warden_proto::SignedAuthorization::verify`, Schritt „cgroup“).
     ///
     /// # Examples
     /// ```rust
-    /// use harw_dod_warden_proto::WardenAction;
+    /// use harw_dod_warden_types::WardenAction;
     /// use harw_types::CgroupId;
     ///
-    /// let cgroup = CgroupId::try_from_str("harw.slice/job-1").unwrap();
+    /// let Ok(cgroup) = CgroupId::try_from_str("harw.slice/job-1") else { return };
     /// let action = WardenAction::FreezeCgroup { cgroup: cgroup.clone() };
     /// assert_eq!(action.cgroup(), &cgroup);
     /// ```
@@ -464,8 +436,11 @@ impl WardenAction {
     /// BLAKE3 (unkeyed, über [`ContentDigest::of`]) über
     /// [`crate::canonical::ACTION_DOMAIN`] gefolgt von den längenpräfixierten
     /// Feldern `kind_name` und `cgroup` (siehe `canonical.rs`). Anders als
-    /// der v1-Digest `content_digest` (JSON-basiert) hängt dieser Wert nicht
-    /// von einer Serialisierungsbibliothek ab und ist unfehlbar.
+    /// der v1-Digest (`ActionContentDigest::content_digest` im Signierteil,
+    /// JSON-basiert) hängt dieser Wert nicht von einer
+    /// Serialisierungsbibliothek ab und ist unfehlbar. Kein MAC: der Digest
+    /// verleiht keine Berechtigung, er ist nur eine Eingabe der signierten
+    /// Autorisierung.
     ///
     /// # Returns
     /// Den Bindungsdigest; strukturell gleiche Aktionen ergeben denselben Wert,
@@ -476,7 +451,7 @@ impl WardenAction {
     ///
     /// # Examples
     /// ```rust
-    /// use harw_dod_warden_proto::WardenAction;
+    /// use harw_dod_warden_types::WardenAction;
     /// use harw_types::CgroupId;
     ///
     /// let Ok(cgroup) = CgroupId::try_from_str("harw.slice/job-1") else { return };
@@ -489,15 +464,15 @@ impl WardenAction {
         let cgroup = self.cgroup().as_str().as_bytes();
         let kind = self.kind_name().as_bytes();
         let mut buf = Vec::with_capacity(
-            crate::canonical::ACTION_DOMAIN
+            ACTION_DOMAIN
                 .len()
                 .saturating_add(16)
                 .saturating_add(kind.len())
                 .saturating_add(cgroup.len()),
         );
-        buf.extend_from_slice(crate::canonical::ACTION_DOMAIN);
-        crate::canonical::put_field(&mut buf, kind);
-        crate::canonical::put_field(&mut buf, cgroup);
+        buf.extend_from_slice(ACTION_DOMAIN);
+        put_field(&mut buf, kind);
+        put_field(&mut buf, cgroup);
         ContentDigest::of(&buf)
     }
 }
@@ -507,7 +482,7 @@ mod tests {
     use super::{ProposedAction, Reversibility, WardenAction};
     use crate::stage::EscalationStage;
     use crate::test_support::{TestResult, ctx};
-    use harw_types::CgroupId;
+    use harw_types::{CgroupId, ContentDigest};
 
     fn cgroup(id: &str) -> TestResult<CgroupId> {
         CgroupId::try_from_str(id).map_err(ctx("non-empty id"))
@@ -742,53 +717,6 @@ mod tests {
         Ok(())
     }
 
-    // -- content_digest (v1) ----------------------------------------------------
-
-    #[test]
-    fn test_content_digest_is_deterministic_for_identical_actions() -> TestResult {
-        let a = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1")?,
-        };
-        let b = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1")?,
-        };
-        assert_eq!(
-            a.content_digest().map_err(ctx("content_digest"))?,
-            b.content_digest().map_err(ctx("content_digest"))?
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_content_digest_differs_for_different_cgroup() -> TestResult {
-        let a = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1")?,
-        };
-        let b = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-2")?,
-        };
-        assert_ne!(
-            a.content_digest().map_err(ctx("content_digest"))?,
-            b.content_digest().map_err(ctx("content_digest"))?
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_content_digest_differs_for_different_action_kind_with_same_cgroup() -> TestResult {
-        let freeze = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1")?,
-        };
-        let release = WardenAction::ReleaseCgroup {
-            cgroup: cgroup("cgroup-1")?,
-        };
-        assert_ne!(
-            freeze.content_digest().map_err(ctx("content_digest"))?,
-            release.content_digest().map_err(ctx("content_digest"))?
-        );
-        Ok(())
-    }
-
     // -- v2: kind_name / cgroup / binding_digest -----------------------------
 
     #[test]
@@ -829,6 +757,24 @@ mod tests {
         assert_eq!(a.binding_digest(), same.binding_digest());
         assert_ne!(a.binding_digest(), other_cgroup.binding_digest());
         assert_ne!(a.binding_digest(), other_kind.binding_digest());
+        Ok(())
+    }
+
+    // Golden-Test: der Bindungsdigest ist Teil der MAC-Eingabe von Proof v2
+    // und darf sich durch die Aufteilung (PL-100 WP 3.0) nicht ändern. Die
+    // Eingabe wird von Hand gebaut, unabhängig von `canonical::put_field`.
+    #[test]
+    fn test_binding_digest_golden_input_is_unchanged() -> TestResult {
+        let action = WardenAction::FreezeCgroup {
+            cgroup: cgroup("harw.slice/job-1")?,
+        };
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"harw:warden-action:v2\0");
+        expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 13]);
+        expected.extend_from_slice(b"freeze-cgroup");
+        expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 16]);
+        expected.extend_from_slice(b"harw.slice/job-1");
+        assert_eq!(action.binding_digest(), ContentDigest::of(&expected));
         Ok(())
     }
 

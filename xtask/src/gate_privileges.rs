@@ -476,6 +476,13 @@ pub const CRATE_PRIVILEGE: &[(&str, RequiredPrivilege)] = &[
     ("harw-dod-netpolicy", RequiredPrivilege::Unprivileged),
     ("harw-dod-warden", RequiredPrivilege::Unprivileged),
     ("harw-dod-warden-proto", RequiredPrivilege::Unprivileged),
+    // PL-100 WP 3.0 (Leitprinzip I8): das signierfreie Warden-Vokabular
+    // (Aktionen, Stufe, Ablehnung, Ziele, kanonische Kodierung), aus
+    // `harw-dod-warden-proto` herausgelöst und dort re-exportiert. Reine
+    // Werttypen über `harw-types`/`serde`/`jiff`: keine `Capability`, kein
+    // Syscall, kein I/O. `harw-warden` erreicht es über
+    // `harw-dod-warden-proto`.
+    ("harw-dod-warden-types", RequiredPrivilege::Unprivileged),
     ("harw-dod-escalate", RequiredPrivilege::Unprivileged),
     // `harw-sentinel` wertet seit kurzem im Poll-Loop Regeln über
     // `harw_dod_rules::run_rules` aus (vorher lief die Regelauswertung

@@ -126,7 +126,7 @@ Kein Befund verweist auf das auslösende Event. Die Scope-Zuordnung wird nachtr�
 | FreezeCgroup / ReleaseCgroup | Warden `CgroupV2Executor` (`executor.rs:180-253`) | DAC_OVERRIDE (+NET_ADMIN beim Release) | ab `RuleTriggered`; v1-Beleg | **nein**, es gibt keinen Sender |
 | IsolateNetwork | `NftNetworkIsolator` (nft als Subprozess) | NET_ADMIN | nur `Escalated` | nein |
 | KillProcessTree | schreibt `cgroup.kill` | DAC_OVERRIDE | nur `Escalated`; `kill_requires_human` **nicht durchgesetzt** | nein |
-| `authorize_freeze` / `_release` / `_stage_gated` | harw-dod-escalate (`freeze_ops.rs:145,206,252`) | — | die Ladder verlangt `Confirmed`; keine echte Regel erzeugt Critical | nur in Tests aufgerufen |
+| `authorize_freeze` / `_thaw` / `_stage_gated` | harw-dod-escalate (`freeze_ops.rs:165,257,313`); liefert seit WP 3.0 ein unsigniertes `AuthorizedAction`, keinen v1-Beleg (signiert erst `harw-escalator`, WP 3.2) | — | die Ladder (`harw-dod-ladder`) verlangt `Confirmed`; keine echte Regel erzeugt Critical | nur in Tests aufgerufen |
 | `process.kill` | harw-killer (pidfd, SIGKILL) | gleiche euid | `ExecuteProcess` + ALWAYS_ASK, **außer unter FullAccess** | **ja**, nur im Full-Profil |
 | `job.stop` | harw-tool-job | eigene Jobs | Eigentum | ja |
 | `shell.exec` + `request_host` | Host-Eskalation | User | TUI-Permit; `SessionLease` gilt global (`escalation.rs:389-394`) | ja, nur in der TUI |

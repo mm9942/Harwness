@@ -1,15 +1,33 @@
-//! Wire-Protokoll zwischen Eskalationsleiter und Warden (Knoten **AW5-02**).
+//! Wire-Protokoll zwischen Eskalationsleiter und Warden (Knoten **AW5-02**):
+//! der Signierteil.
+//!
+//! # Aufteilung (PL-100 WP 3.0, Leitprinzip I8)
+//! Seit WP 3.0 liegt das signierfreie Vokabular in `harw-dod-warden-types`:
+//! Aktionstaxonomie (`action`), Eskalationsstufen (`stage`), Ziel-Tripel
+//! (`target`), Ablehnungskategorien (`denial`), Ergebnis einer Aktion
+//! (`outcome`) und die kanonischen Kodierungsbausteine. Diese Crate behält
+//! alles, was signiert oder prüft — [`SignedAuthorization`], [`KeyRing`],
+//! [`ProofKey`], die kanonische MAC-Eingabe ([`canonical::PROOF_DOMAIN`]),
+//! [`NonceLedger`], [`ProofPolicy`], die Anfrage- und Antworthüllen
+//! ([`WardenRequest`]/[`WardenReply`]) und die v1-Altlast. Sie re-exportiert
+//! die verschobenen Module und Typen unter ihren bisherigen Pfaden
+//! (`harw_dod_warden_proto::WardenAction`,
+//! `harw_dod_warden_proto::action::WardenAction`, …), damit `harw-dod-warden`
+//! und `harw-warden` unverändert kompilieren. Prozesse, die mit Modellen
+//! sprechen, hängen an `harw-dod-warden-types`, nie an dieser Crate.
 //!
 //! # Zweck
 //! Diese Crate definiert, was über die Leitung zwischen dem
 //! Eskalationsleiter (`harw-dod-escalate`, AW5-03) und dem Durchsetzer
 //! (`harw-dod-warden`, AW5-04a) geht: die Aktionstaxonomie
-//! ([`ProposedAction`]/[`WardenAction`], `action.rs`), die signierte
+//! ([`ProposedAction`]/[`WardenAction`], re-exportiert), die signierte
 //! Autorisierung ([`SignedAuthorization`], `signed.rs`) mit ihrem Ziel-Tripel
-//! ([`CgroupTarget`], `target.rs`), die Anfrage- und Antworthülle
-//! ([`WardenRequest`]/[`WardenReply`]/[`WardenResponse`], `response.rs`), die
-//! inhaltsfreie Ablehnungskategorie ([`Denial`], `denial.rs`) und die
-//! Eskalationsleiter selbst ([`EscalationStage`], `stage.rs`). Sie führt selbst
+//! ([`CgroupTarget`], re-exportiert), die Anfrage- und Antworthülle
+//! ([`WardenRequest`]/[`WardenReply`], `response.rs`; [`WardenResponse`]
+//! re-exportiert), die inhaltsfreie Ablehnungskategorie ([`Denial`],
+//! re-exportiert) und die Eskalationsstufen ([`EscalationStage`],
+//! re-exportiert; „re-exportiert" heißt: definiert in
+//! `harw-dod-warden-types`, siehe oben). Sie führt selbst
 //! keine Durchsetzung aus und trifft keine Autorisierungsentscheidung — beides
 //! ist Sache der beiden Nachbarknoten.
 //!
@@ -32,11 +50,15 @@
 //! [`WardenRequest::decode`] lehnt jeden v1-Auftrag ausdrücklich ab.
 //!
 //! **v1-Altlast:** [`AuthorizationProof`], [`WardenActionRequest`],
-//! `WardenAction::content_digest` und die Variante `ReleaseCgroup` sind
-//! `#[deprecated]` und bleiben nur bestehen, damit `harw-dod-escalate` (und
-//! über ihn `harw-plan-bridge`) bis zur Umstellung auf Proof v2 kompiliert.
-//! Sie sind fälschbar (F-001) und werden von keinem Warden akzeptiert. Die
-//! Abschnitte unten, die „Beleg“ sagen, beschreiben diesen v1-Stand.
+//! [`ActionContentDigest::content_digest`] (bis WP 3.0 die inhärente Methode
+//! `WardenAction::content_digest`) und die Variante `ReleaseCgroup` sind
+//! `#[deprecated]`. Seit PL-100 WP 3.0 (Schritt 2) nennt kein Workspace-Crate
+//! sie mehr außerhalb von Ablehnungstests: `harw-dod-escalate` liefert nur
+//! noch eine unsignierte Freigabe und hängt nicht an dieser Crate. Sie
+//! bleiben bis zu ihrer Entfernung nur für die Tests der v1-Ablehnung
+//! ([`WardenRequest::decode`]) stehen, sind fälschbar (F-001) und werden von
+//! keinem Warden akzeptiert. Die Abschnitte unten, die „Beleg“ sagen,
+//! beschreiben diesen v1-Stand.
 //!
 //! # Zwei Vorprüfungen, bevor hier etwas geschrieben wurde
 //!
@@ -146,10 +168,11 @@
 //! keine Funktion, die eine Autorisierungs*entscheidung* trifft —
 //! [`AuthorizationProof::new`] setzt fünf bereits getroffene Fakten
 //! zusammen, ohne selbst eine Leiter zu befragen oder eine Systemuhr zu
-//! lesen. Ausschließlich `harw_dod_escalate::authorize` (AW5-03, dort
-//! `pub(crate)`) soll ihn aufrufen — siehe `proof.rs`-Moduldoku, Abschnitt
-//! „Wer diesen Typ konstruieren darf", für die Begründung, warum das eine
-//! dokumentierte Konvention ist und keine vom Compiler erzwungene Grenze.
+//! lesen. Bis PL-100 WP 3.0 rief ihn ausschließlich
+//! `harw_dod_escalate::authorize` (AW5-03, dort `pub(crate)`) auf; seitdem
+//! ruft ihn kein produktiver Code mehr auf. Den gültigen v2-Auftrag
+//! ([`SignedAuthorization`]) stellt nur der Halter eines [`ProofKey`] aus
+//! (`harw-escalator`, WP 3.2) — siehe `signed.rs`-Moduldoku.
 //!
 //! # Nebenläufigkeit
 //! Reine, unveränderliche Werttypen. Kein internes Locking, keine geteilten
@@ -160,22 +183,25 @@
 //! # Fehler
 //! [`error::WardenProtoError`] — siehe dessen Moduldoku.
 
-pub mod action;
 pub mod canonical;
-pub mod denial;
 pub mod error;
 pub mod proof;
 pub mod response;
 pub mod signed;
-pub mod stage;
-pub mod target;
 
-pub use action::{ProposedAction, Reversibility, WardenAction};
-pub use denial::Denial;
+// Signierfreie Module aus `harw-dod-warden-types` (PL-100 WP 3.0), unter den
+// bisherigen Modulpfaden re-exportiert; `crate::action::…` usw. lösen
+// innerhalb dieser Crate weiterhin auf.
+pub use harw_dod_warden_types::{action, denial, outcome, stage, target};
+
 pub use error::{ProofError, ProofResult, WardenProtoError, WardenProtoResult};
+pub use harw_dod_warden_types::{
+    CgroupKernelId, CgroupTarget, Denial, EscalationStage, ProposedAction, Reversibility,
+    WardenAction, WardenTypesError,
+};
 // v1-Altlast: bleibt erreichbar, die Warnung trifft jeden Aufrufer.
 #[allow(deprecated)]
-pub use proof::AuthorizationProof;
+pub use proof::{ActionContentDigest, AuthorizationProof};
 // v1-Altlast: bleibt erreichbar, die Warnung trifft jeden Aufrufer.
 #[allow(deprecated)]
 pub use response::WardenActionRequest;
@@ -185,8 +211,6 @@ pub use signed::{
     MemoryNonceLedger, NonceLedger, ProofKey, ProofPolicy, SignedAuthorization,
     VerifiedAuthorization, WARDEN_PROTOCOL_VERSION,
 };
-pub use stage::EscalationStage;
-pub use target::{CgroupKernelId, CgroupTarget};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

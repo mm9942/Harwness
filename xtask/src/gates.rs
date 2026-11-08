@@ -327,6 +327,9 @@ mod tests {
             "harw-dod",
             "harw-dod-warden",
             "harw-dod-warden-proto",
+            // PL-100 WP 3.0: das signierfreie Warden-Vokabular fällt unter
+            // dasselbe Präfix `harw-dod-warden` wie der Signierteil.
+            "harw-dod-warden-types",
             "harw-probe-fs",
             "harw-probe-bpf",
             "harw-probe-netlink",
@@ -412,6 +415,222 @@ mod tests {
         Ok(())
     }
 
+    /// Vereinigt die `names` aller `[[forbidden_crates]]`-Regeln, die
+    /// `package` unter `packages` nennen. Ein Paket darf in mehreren Zeilen
+    /// stehen; was ihm verboten ist, ist die Vereinigung.
+    fn forbidden_names_for(
+        rules: &[toml::Value],
+        package: &str,
+    ) -> std::collections::BTreeSet<String> {
+        rules
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .filter(|rule| {
+                rule.get("packages")
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|p| p.iter().any(|v| v.as_str() == Some(package)))
+            })
+            .filter_map(|rule| rule.get("names").and_then(toml::Value::as_array))
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// PL-100 WP 3.0: die drei aus `harw-dod-warden-proto` und
+    /// `harw-dod-escalate` herausgelösten Crates stehen in Schicht D wie ihre
+    /// Nachbarn. Nur das Warden-Vokabular ist TCB (der Warden lädt es über
+    /// `harw-dod-warden-proto`), und seine Allowlist nennt nie den Signierteil.
+    #[test]
+    fn test_arch_policy_classifies_the_split_warden_crates() -> TestResult {
+        let text = std::fs::read_to_string(repo_root()?.join(super::arch::POLICY_PATH))
+            .map_err(ctx("xtask/arch-policy.toml lesen"))?;
+        super::arch::Policy::parse(&text).map_err(TestError::Unexpected)?;
+        let root: toml::Table = toml::from_str(&text).map_err(ctx("arch-policy parsen"))?;
+        let packages = root
+            .get("packages")
+            .and_then(toml::Value::as_table)
+            .ok_or(TestError::Missing("[packages]"))?;
+        let class = |name: &str| {
+            packages.get(name).and_then(toml::Value::as_table).map(|t| {
+                (
+                    t.get("layer")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
+                    t.get("tcb").and_then(toml::Value::as_bool).unwrap_or(false),
+                )
+            })
+        };
+
+        let escalate = class("harw-dod-escalate").ok_or(TestError::Missing("harw-dod-escalate"))?;
+        for split in ["harw-dod-ladder", "harw-dod-submit-proto"] {
+            let split_class = class(split).ok_or(TestError::Missing("aufgeteilte Crate"))?;
+            assert_eq!(
+                split_class, escalate,
+                "{split} ist eingeordnet wie harw-dod-escalate"
+            );
+        }
+        assert_eq!(escalate, (Some("D".to_owned()), false));
+
+        let proto =
+            class("harw-dod-warden-proto").ok_or(TestError::Missing("harw-dod-warden-proto"))?;
+        let types =
+            class("harw-dod-warden-types").ok_or(TestError::Missing("harw-dod-warden-types"))?;
+        assert_eq!(
+            types, proto,
+            "das Warden-Vokabular ist eingeordnet wie das Warden-Protokoll"
+        );
+        assert_eq!(types, (Some("D".to_owned()), true));
+
+        let allowed = root
+            .get("tcb")
+            .and_then(toml::Value::as_table)
+            .and_then(|tcb| tcb.get("harw-dod-warden-types"))
+            .and_then(toml::Value::as_table)
+            .and_then(|entry| entry.get("allowed_internal"))
+            .and_then(toml::Value::as_array)
+            .ok_or(TestError::Missing("[tcb.\"harw-dod-warden-types\"]"))?;
+        assert!(
+            !allowed
+                .iter()
+                .any(|v| v.as_str() == Some("harw-dod-warden-proto")),
+            "das Warden-Vokabular hängt nie am Signierteil"
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP 3.0 / Leitprinzip I8 (README §4, 3.0; THREAT-MODEL B16):
+    /// Prozesse, die mit Modellen sprechen, linken keinen Signier-Code.
+    ///
+    /// Für jedes modellnahe Paket muss die Vereinigung seiner
+    /// `[[forbidden_crates]]`-Zeilen den Signierteil des Warden-Protokolls,
+    /// die Eskalationsleiter, `harw-dod-escalate` und den angekündigten
+    /// `harw-escalator` nennen. Das signierfreie Vokabular
+    /// `harw-dod-warden-types` bleibt erlaubt. Auch der lesende Client
+    /// erreicht die Leiter nicht. Leiter, Einreichung, Vokabular und escalate
+    /// selbst bleiben signierfrei; die Triage-Einreichung erreicht weder
+    /// Leiter noch escalate. Sensoren (`edges::SENSOR_CRATES`) und die Telemetrie
+    /// (`harw-observe*`) erreichen Leiter, escalate und Escalator nicht (S1).
+    /// Jedes Regel-Subjekt und jeder heute existierende Name steht im echten
+    /// Graphen, sonst prüfte die Zeile still nichts. Ob der echte Graph die
+    /// Zeilen einhält (aufgelöst, mit Target-Tabellen), prüft
+    /// `gate_arch.rs::test_real_repository_is_green`.
+    #[test]
+    fn test_arch_policy_keeps_signing_code_out_of_model_facing_packages() -> TestResult {
+        // Leitprinzip I8 nennt harw-runtime/ops/cli/harw; dazu ihre Bausteine
+        // und Einbetter.
+        const MODEL_FACING: [&str; 11] = [
+            "harw",
+            "harw-agent-runner",
+            "harw-cli",
+            "harw-core",
+            "harw-core-bridge",
+            "harw-dod-dispatch",
+            "harw-ops",
+            "harw-plan-bridge",
+            "harw-runtime",
+            "harw-tui",
+            "harwness-sdk",
+        ];
+        // Signierteil, Leiter, Autorisierung und Escalator (README §4, 3.0).
+        const MODEL_FACING_FORBIDDEN: [&str; 4] = [
+            "harw-dod-warden-proto",
+            "harw-dod-ladder",
+            "harw-dod-escalate",
+            "harw-escalator",
+        ];
+        const NO_LADDER: [&str; 1] = ["harw-dod-client"];
+        const SIGNING_FREE: [&str; 4] = [
+            "harw-dod-escalate",
+            "harw-dod-ladder",
+            "harw-dod-submit-proto",
+            "harw-dod-warden-types",
+        ];
+
+        let text = std::fs::read_to_string(repo_root()?.join(super::arch::POLICY_PATH))
+            .map_err(ctx("xtask/arch-policy.toml lesen"))?;
+        super::arch::Policy::parse(&text).map_err(TestError::Unexpected)?;
+        let root: toml::Table = toml::from_str(&text).map_err(ctx("arch-policy parsen"))?;
+        let rules = root
+            .get("forbidden_crates")
+            .and_then(toml::Value::as_array)
+            .ok_or(TestError::Missing("[[forbidden_crates]]"))?;
+
+        for package in MODEL_FACING {
+            let names = forbidden_names_for(rules, package);
+            for name in MODEL_FACING_FORBIDDEN {
+                assert!(
+                    names.contains(name),
+                    "{package} darf {name} nicht erreichen (I8): {names:?}"
+                );
+            }
+            assert!(
+                !names.contains("harw-dod-warden-types"),
+                "{package}: das signierfreie Vokabular bleibt erlaubt"
+            );
+        }
+        for package in NO_LADDER {
+            assert!(
+                forbidden_names_for(rules, package).contains("harw-dod-ladder"),
+                "{package} darf die Eskalationsleiter nicht erreichen"
+            );
+        }
+        for package in SIGNING_FREE {
+            let names = forbidden_names_for(rules, package);
+            for name in ["harw-dod-warden-proto", "harw-escalator"] {
+                assert!(
+                    names.contains(name),
+                    "{package} bleibt signierfrei: {name} verboten, {names:?}"
+                );
+            }
+        }
+        let submission = forbidden_names_for(rules, "harw-dod-submit-proto");
+        for name in ["harw-dod-ladder", "harw-dod-escalate"] {
+            assert!(
+                submission.contains(name),
+                "die Triage-Einreichung erreicht {name} nicht: {submission:?}"
+            );
+        }
+
+        let graph = super::load_all_workspaces(repo_root()?).map_err(TestError::Unexpected)?;
+        // S1: jeder Sensor und jede Telemetrie-Crate des echten Graphen, auch
+        // ein künftig hinzukommender.
+        let telemetry: Vec<&str> = graph
+            .crates
+            .iter()
+            .map(|node| node.name.as_str())
+            .filter(|name| *name == "harw-observe" || name.starts_with("harw-observe-"))
+            .collect();
+        assert!(
+            !telemetry.is_empty(),
+            "keine harw-observe*-Crate im Graphen"
+        );
+        for package in super::edges::SENSOR_CRATES.iter().copied().chain(telemetry) {
+            let names = forbidden_names_for(rules, package);
+            for name in ["harw-dod-ladder", "harw-dod-escalate", "harw-escalator"] {
+                assert!(
+                    names.contains(name),
+                    "{package} erreicht {name} nicht (S1): {names:?}"
+                );
+            }
+        }
+        for subject in MODEL_FACING
+            .into_iter()
+            .chain(NO_LADDER)
+            .chain(SIGNING_FREE)
+            .chain(super::edges::SENSOR_CRATES.iter().copied())
+            .chain(["harw-dod-warden-proto"])
+        {
+            assert!(
+                graph.get(subject).is_some(),
+                "Regel-Subjekt '{subject}' fehlt im Graphen"
+            );
+        }
+        // `harw-escalator` ist angekündigt (WP 3.2) und darf noch fehlen; die
+        // Zeilen greifen, sobald es das Paket gibt.
+        Ok(())
+    }
+
     #[test]
     fn test_privileges_on_real_graph_checks_all_monitored_binaries() -> TestResult {
         let graph = super::load_all_workspaces(repo_root()?).map_err(TestError::Unexpected)?;
@@ -449,6 +668,25 @@ mod tests {
                 .iter()
                 .any(|name| v.contains(name))
             })
+            .collect();
+        assert!(offending.is_empty(), "{offending:?}");
+        Ok(())
+    }
+
+    /// PL-100 WP 3.0: `harw-warden` erreicht das herausgelöste Vokabular
+    /// `harw-dod-warden-types` über `harw-dod-warden-proto`. Gegen den
+    /// **echten** Graphen ist es in `CRATE_PRIVILEGE` eingetragen und liegt
+    /// im Budget des Warden; die Warden-Hülle hat keinen Verstoß.
+    #[test]
+    fn test_privileges_on_real_graph_classifies_the_warden_vocabulary() -> TestResult {
+        let graph = super::load_all_workspaces(repo_root()?).map_err(TestError::Unexpected)?;
+
+        let report = super::privileges::evaluate(&graph);
+
+        let offending: Vec<&String> = report
+            .violations
+            .iter()
+            .filter(|v| v.starts_with("harw-warden ") || v.contains("harw-dod-warden-types"))
             .collect();
         assert!(offending.is_empty(), "{offending:?}");
         Ok(())

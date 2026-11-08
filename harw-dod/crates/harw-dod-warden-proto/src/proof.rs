@@ -5,9 +5,14 @@
 //! Absender fälschbar (Befund F-001); die unten stehende Aussage, er sei eine
 //! „Schicht, die selbst ein Absender, der den Socket benutzen darf, nicht
 //! umgehen kann“, trifft nicht zu. Nachfolger: [`crate::signed::SignedAuthorization`].
-//! Der Typ ist `#[deprecated]` und bleibt nur, bis `harw-dod-escalate` (und
-//! über ihn `harw-plan-bridge`) auf Proof v2 umgestellt ist; danach wird er
-//! entfernt. Der Warden lehnt einen v1-Auftrag ausdrücklich ab
+//! Der Typ ist `#[deprecated]`; seit PL-100 WP 3.0 (Schritt 2) baut
+//! `harw-dod-escalate` ihn nicht mehr, und er bleibt nur noch für die Tests der
+//! v1-Ablehnung, bis er entfernt wird. Dasselbe gilt für
+//! [`ActionContentDigest`], das Erweiterungs-Trait,
+//! das seit PL-100 WP 3.0 den früheren inhärenten v1-Digest
+//! `WardenAction::content_digest` trägt (`WardenAction` liegt seitdem in
+//! `harw-dod-warden-types`, an das der Signierteil keine inhärente Methode
+//! mehr hängen kann). Der Warden lehnt einen v1-Auftrag ausdrücklich ab
 //! ([`crate::response::WardenRequest::decode`],
 //! [`crate::error::ProofError::LegacyV1Refused`]).
 //!
@@ -46,7 +51,7 @@
 //!   liefert den Zeitpunkt.
 //! - `bound_action` (`harw_types::ContentDigest`): wogegen der Beleg
 //!   gebunden ist — der Inhaltsdigest der exakten Aktion (siehe
-//!   [`crate::action::WardenAction::content_digest`]). Ein Beleg, der nur
+//!   [`ActionContentDigest::content_digest`]). Ein Beleg, der nur
 //!   an eine Aktions*art* gebunden wäre (z. B. „irgendein `FreezeCgroup`"),
 //!   passte auf jede `FreezeCgroup`-Aktion, gleich welche cgroup sie nennt —
 //!   genau das schließt der Brief aus („ein Proof, der auf eine beliebige
@@ -108,12 +113,13 @@ impl AuthorizationProof {
     /// Baut den Datensatz für eine bereits getroffene Autorisierungsentscheidung.
     ///
     /// # Description
-    /// **Nur für `harw_dod_escalate::authorize` (AW5-03) bestimmt** — siehe
+    /// **v1-Altlast:** war nur für `harw_dod_escalate::authorize` (AW5-03)
+    /// bestimmt, das ihn seit PL-100 WP 3.0 nicht mehr aufruft — siehe
     /// Moduldoku, Abschnitt „Wer diesen Typ konstruieren darf". Trifft selbst
     /// keine Entscheidung: jeder Parameter muss vom Aufrufer bereits ermittelt
     /// worden sein (welcher Befund, welche Stufe laut `Ladder::admissible`,
     /// wer laut Identitätsprüfung, wann laut injizierter Zeit, wogegen laut
-    /// [`WardenAction::content_digest`]).
+    /// [`ActionContentDigest::content_digest`]).
     ///
     /// # Arguments
     /// - `finding` (`FindingId`): der auslösende Befund.
@@ -122,7 +128,7 @@ impl AuthorizationProof {
     /// - `authorized_at` (`jiff::Timestamp`): wann — vom Aufrufer geliefert,
     ///   nie von dieser Funktion selbst gelesen.
     /// - `bound_action` (`ContentDigest`): der Inhaltsdigest der exakten
-    ///   autorisierten Aktion (siehe [`WardenAction::content_digest`]).
+    ///   autorisierten Aktion (siehe [`ActionContentDigest::content_digest`]).
     ///
     /// # Returns
     /// Den zusammengesetzten Beleg.
@@ -130,18 +136,25 @@ impl AuthorizationProof {
     /// # Examples
     /// ```rust
     /// #![allow(deprecated)]
-    /// use harw_dod_warden_proto::{AuthorizationProof, EscalationStage, WardenAction};
+    /// use harw_dod_warden_proto::{
+    ///     ActionContentDigest, AuthorizationProof, EscalationStage, WardenAction,
+    /// };
     /// use harw_types::{ApprovalActor, CgroupId, FindingId};
     ///
-    /// let action = WardenAction::FreezeCgroup {
-    ///     cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+    /// let (Ok(cgroup), Ok(finding)) = (
+    ///     CgroupId::try_from_str("cgroup-1"),
+    ///     FindingId::try_from_str("finding-1"),
+    /// ) else {
+    ///     return;
     /// };
+    /// let action = WardenAction::FreezeCgroup { cgroup };
+    /// let Ok(bound_action) = action.content_digest() else { return };
     /// let proof = AuthorizationProof::new(
-    ///     FindingId::try_from_str("finding-1").unwrap(),
+    ///     finding,
     ///     EscalationStage::RuleTriggered,
     ///     ApprovalActor::Operator { id: "operator-1".to_string() },
     ///     jiff::Timestamp::UNIX_EPOCH,
-    ///     action.content_digest().unwrap(),
+    ///     bound_action,
     /// );
     /// assert_eq!(proof.stage(), EscalationStage::RuleTriggered);
     /// ```
@@ -214,30 +227,35 @@ impl AuthorizationProof {
     ///   der Inhaltsdigest von `action` stimmt nicht mit
     ///   [`Self::bound_action`] überein.
     /// - [`WardenProtoError::ActionEncoding`] — siehe
-    ///   [`WardenAction::content_digest`].
+    ///   [`ActionContentDigest::content_digest`].
     ///
     /// # Examples
     /// ```rust
     /// #![allow(deprecated)]
-    /// use harw_dod_warden_proto::{AuthorizationProof, EscalationStage, WardenAction};
+    /// use harw_dod_warden_proto::{
+    ///     ActionContentDigest, AuthorizationProof, EscalationStage, WardenAction,
+    /// };
     /// use harw_types::{ApprovalActor, CgroupId, FindingId};
     ///
-    /// let action = WardenAction::FreezeCgroup {
-    ///     cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+    /// let (Ok(cgroup), Ok(other_cgroup), Ok(finding)) = (
+    ///     CgroupId::try_from_str("cgroup-1"),
+    ///     CgroupId::try_from_str("cgroup-2"),
+    ///     FindingId::try_from_str("finding-1"),
+    /// ) else {
+    ///     return;
     /// };
-    /// let finding = FindingId::try_from_str("finding-1").unwrap();
+    /// let action = WardenAction::FreezeCgroup { cgroup };
+    /// let Ok(bound_action) = action.content_digest() else { return };
     /// let proof = AuthorizationProof::new(
     ///     finding.clone(),
     ///     EscalationStage::RuleTriggered,
     ///     ApprovalActor::Operator { id: "operator-1".to_string() },
     ///     jiff::Timestamp::UNIX_EPOCH,
-    ///     action.content_digest().unwrap(),
+    ///     bound_action,
     /// );
     /// assert!(proof.authorizes(&finding, &action).is_ok());
     ///
-    /// let other_cgroup_action = WardenAction::FreezeCgroup {
-    ///     cgroup: CgroupId::try_from_str("cgroup-2").unwrap(),
-    /// };
+    /// let other_cgroup_action = WardenAction::FreezeCgroup { cgroup: other_cgroup };
     /// assert!(proof.authorizes(&finding, &other_cgroup_action).is_err());
     /// ```
     pub fn authorizes(
@@ -280,19 +298,25 @@ impl AuthorizationProof {
     /// # Examples
     /// ```rust
     /// #![allow(deprecated)]
-    /// use harw_dod_warden_proto::{AuthorizationProof, EscalationStage, WardenAction};
+    /// use harw_dod_warden_proto::{
+    ///     ActionContentDigest, AuthorizationProof, EscalationStage, WardenAction,
+    /// };
     /// use harw_types::{ApprovalActor, CgroupId, FindingId};
     ///
-    /// let action = WardenAction::KillProcessTree {
-    ///     cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+    /// let (Ok(cgroup), Ok(finding)) = (
+    ///     CgroupId::try_from_str("cgroup-1"),
+    ///     FindingId::try_from_str("finding-1"),
+    /// ) else {
+    ///     return;
     /// };
-    /// let finding = FindingId::try_from_str("finding-1").unwrap();
+    /// let action = WardenAction::KillProcessTree { cgroup };
+    /// let Ok(bound_action) = action.content_digest() else { return };
     /// let proof = AuthorizationProof::new(
     ///     finding.clone(),
     ///     EscalationStage::RuleTriggered,
     ///     ApprovalActor::Operator { id: "operator-1".to_string() },
     ///     jiff::Timestamp::UNIX_EPOCH,
-    ///     action.content_digest().unwrap(),
+    ///     bound_action,
     /// );
     /// // Bindung passt, aber `KillProcessTree` ist ab `RuleTriggered` nicht zulässig.
     /// assert!(proof.verify(&finding, &action).is_err());
@@ -310,9 +334,61 @@ impl AuthorizationProof {
     }
 }
 
+/// Der v1-Inhaltsdigest einer [`WardenAction`] — die Grundlage für
+/// [`AuthorizationProof::bound_action`] (**v1-Altlast**).
+///
+/// # Description
+/// Bis PL-100 WP 3.0 die inhärente Methode `WardenAction::content_digest`.
+/// `WardenAction` liegt seitdem im signierfreien `harw-dod-warden-types`;
+/// dieses Erweiterungs-Trait trägt dieselbe Methode mit derselben Signatur
+/// und denselben Bytes weiter, bis der v1-Pfad mit seinen letzten Aufrufern
+/// entfällt. Aufrufer brauchen zusätzlich `use
+/// harw_dod_warden_proto::ActionContentDigest;`.
+///
+/// Kodiert die Aktion als JSON (Feldreihenfolge folgt der Deklaration, siehe
+/// `serde_json`s Verhalten für von `#[derive]` erzeugte `Serialize`-Impls)
+/// und hasht das Ergebnis mit [`ContentDigest::of`]. Zwei strukturell
+/// identische Aktionen ergeben denselben Digest; jede Abweichung — auch nur
+/// in einem `CgroupId`-Feld — einen anderen. Proof v2 nutzt stattdessen
+/// [`WardenAction::binding_digest`] (serde-unabhängig, unfehlbar).
+///
+/// # Examples
+/// ```rust
+/// #![allow(deprecated)]
+/// use harw_dod_warden_proto::{ActionContentDigest, WardenAction};
+/// use harw_types::CgroupId;
+///
+/// let Ok(cgroup) = CgroupId::try_from_str("cgroup-1") else { return };
+/// let action = WardenAction::FreezeCgroup { cgroup };
+/// assert!(action.content_digest().is_ok());
+/// ```
+#[deprecated(
+    note = "v1 binding for the forgeable AuthorizationProof (F-001); proof v2 binds WardenAction::binding_digest inside SignedAuthorization"
+)]
+pub trait ActionContentDigest {
+    /// Computes the v1 JSON content digest of this action.
+    ///
+    /// # Errors
+    /// - [`WardenProtoError::ActionEncoding`]: die JSON-Kodierung ist
+    ///   fehlgeschlagen. Für die Feldtypen von `WardenAction` (ausschließlich
+    ///   `harw-types`-Kennungen) praktisch unerreichbar — dieselbe Begründung
+    ///   wie bei `harw_dod_signals::SignalsError::DigestEncoding`.
+    #[deprecated(
+        note = "v1 binding for the forgeable AuthorizationProof (F-001); proof v2 binds WardenAction::binding_digest inside SignedAuthorization"
+    )]
+    fn content_digest(&self) -> Result<ContentDigest, WardenProtoError>;
+}
+
+impl ActionContentDigest for WardenAction {
+    fn content_digest(&self) -> Result<ContentDigest, WardenProtoError> {
+        let bytes = serde_json::to_vec(self)?;
+        Ok(ContentDigest::of(&bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AuthorizationProof;
+    use super::{ActionContentDigest, AuthorizationProof};
     use crate::action::WardenAction;
     use crate::error::{MismatchAspect, WardenProtoError};
     use crate::stage::EscalationStage;
@@ -485,6 +561,69 @@ mod tests {
             err,
             WardenProtoError::ProofMismatch(MismatchAspect::Action)
         ));
+        Ok(())
+    }
+
+    // -- ActionContentDigest (v1, bis PL-100 WP 3.0 inhärent an WardenAction) --
+
+    #[test]
+    fn test_content_digest_is_deterministic_for_identical_actions() -> TestResult {
+        let a = WardenAction::FreezeCgroup {
+            cgroup: cgroup("cgroup-1")?,
+        };
+        let b = WardenAction::FreezeCgroup {
+            cgroup: cgroup("cgroup-1")?,
+        };
+        assert_eq!(
+            a.content_digest().map_err(ctx("content_digest"))?,
+            b.content_digest().map_err(ctx("content_digest"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_content_digest_differs_for_different_cgroup() -> TestResult {
+        let a = WardenAction::FreezeCgroup {
+            cgroup: cgroup("cgroup-1")?,
+        };
+        let b = WardenAction::FreezeCgroup {
+            cgroup: cgroup("cgroup-2")?,
+        };
+        assert_ne!(
+            a.content_digest().map_err(ctx("content_digest"))?,
+            b.content_digest().map_err(ctx("content_digest"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_content_digest_differs_for_different_action_kind_with_same_cgroup() -> TestResult {
+        let freeze = WardenAction::FreezeCgroup {
+            cgroup: cgroup("cgroup-1")?,
+        };
+        let release = WardenAction::ReleaseCgroup {
+            cgroup: cgroup("cgroup-1")?,
+        };
+        assert_ne!(
+            freeze.content_digest().map_err(ctx("content_digest"))?,
+            release.content_digest().map_err(ctx("content_digest"))?
+        );
+        Ok(())
+    }
+
+    // Die Bytes des v1-Digests sind durch die Aufteilung unverändert: JSON der
+    // Aktion, gehasht mit `ContentDigest::of`.
+    #[test]
+    fn test_content_digest_hashes_the_json_encoding() -> TestResult {
+        let action = WardenAction::KillProcessTree {
+            cgroup: cgroup("cgroup-1")?,
+        };
+        let expected =
+            harw_types::ContentDigest::of(br#"{"kind":"kill-process-tree","cgroup":"cgroup-1"}"#);
+        assert_eq!(
+            action.content_digest().map_err(ctx("content_digest"))?,
+            expected
+        );
         Ok(())
     }
 

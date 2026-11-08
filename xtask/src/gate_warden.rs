@@ -307,7 +307,27 @@ pub const WARDEN_ROOT: &str = "harw-warden";
 /// ist reines Rust ohne C-Bindung und bringt sonst keinen neuen Knoten mit
 /// (`libc` war schon in der Hülle); aus `cargo metadata` hergeleitet, der
 /// Gate-Lauf bleibt die verbindliche Quelle. 54 + 1 = 55.
-pub const MAX_WARDEN_RUNTIME_DEPS: usize = 55;
+///
+/// **PL-100 WP 3.0 / I8 (+1 `harw-dod-warden-types`), neu gemessen: 54.**
+/// Das signierfreie Vokabular (Aktionen, Stufe, Ablehnung, Ziele, kanonische
+/// Kodierung) wurde aus `harw-dod-warden-proto` herausgelöst; der Warden
+/// erreicht es über `harw-dod-warden-proto`. Kein neuer Fremdcode
+/// (`harw-types`, `serde`, `jiff` waren schon in der Hülle, `harw-macros` ist
+/// ein Proc-Macro), nur ein neuer interner Knoten im selben Baum. Die 55
+/// darüber war keine Messung: 54 stammte aus der Zeit vor PL-60
+/// (`dod/Cargo.lock`), und ein dokumentierter Gate-Lauf gegen das
+/// Wurzel-`Cargo.lock` maß 52 (Code-Stand `2c744f3`, siehe
+/// `docs/planning/65-cloud-sessions/CONSOLIDATION.md`). Mit `seccompiler`
+/// war die Hülle also 53, die Klinke hatte zwei Plätze Luft. Neu
+/// nachgerechnet mit einer Nachbildung von [`compute_closure`] über
+/// `Cargo.lock` und die Registry-Manifeste (dieselben Wurzeln, Kantenarten,
+/// Feature-Auflösung und Proc-Macro-Ausschlüsse; sie reproduziert die 52 bei
+/// `2c744f3`): vor der Aufteilung 53, danach 54, intern 6 (`harw-completions`,
+/// `harw-digest`, `harw-dod-warden`, `harw-dod-warden-proto`,
+/// `harw-dod-warden-types`, `harw-types`) und extern 48, unverändert. Die
+/// Klinke steht deshalb auf dem gemessenen Wert 53 + 1 = 54 statt auf
+/// 55 + 1. Der Gate-Lauf bleibt die verbindliche Quelle.
+pub const MAX_WARDEN_RUNTIME_DEPS: usize = 54;
 
 /// Crate-Namen, deren Anwesenheit als `[build-dependencies]`-Kante ein
 /// verlässliches Zeichen für einen echten C-Übersetzer-Bauschritt ist —
