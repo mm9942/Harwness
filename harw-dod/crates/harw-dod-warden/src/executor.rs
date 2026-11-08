@@ -5,8 +5,9 @@
 //!
 //! # Verantwortungsbereich
 //! Jede Aktion, die tatsächlich ins System eingreift, ist hinter einem
-//! eigenen, einmethodigen Trait gekapselt (Brief: „Kapsle jede hinter einen
-//! eigenen Trait"). [`crate::warden::Warden`] hält für jede Aktion genau
+//! eigenen Trait gekapselt (Brief: „Kapsle jede hinter einen eigenen
+//! Trait"; [`CgroupFreezer`] liest zusätzlich das Freeze-Bit).
+//! [`crate::warden::Warden`] hält für jede Aktion genau
 //! eine `Box<dyn Trait>`-Instanz und ruft nie direkt cgroup- oder
 //! Netz-Mechanik auf. Das erlaubt zwei unabhängige Dinge:
 //!
@@ -27,7 +28,9 @@
 //! eines konfigurierbaren Wurzelverzeichnisses (Produktionscode:
 //! `/sys/fs/cgroup`; Tests: ein `tempfile`-Verzeichnis). Kein `unsafe`,
 //! keine eigene cgroup-Crate: die cgroup-v2-Schnittstelle ist selbst schon
-//! eine Textdatei.
+//! eine Textdatei. Gelesen wird nur `cgroup.freeze`
+//! ([`CgroupFreezer::freeze_requested`]): beim Eindämmen hält der Warden
+//! fest, ob das Bit schon gesetzt war (`containment.rs`, Vertrag mit harw).
 //!
 //! # Prüfung und Eingriff über denselben Deskriptor (B21)
 //! Die Ausführungs-Traits bekommen das signierte Ziel-Tripel
@@ -94,7 +97,7 @@
 //! `nft`-Prozess-Handle), genau wie `NetBackend::apply` keines enthält.
 
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -129,6 +132,28 @@ pub trait CgroupFreezer {
     /// - [`WardenError::InvalidCgroupId`] / [`WardenError::Io`]: siehe
     ///   jeweilige Implementierung.
     fn freeze(&self, target: &CgroupTarget) -> WardenResult<()>;
+
+    /// Reads whether the cgroup's own `cgroup.freeze` bit is already set.
+    ///
+    /// # Description
+    /// Der Warden liest das Bit beim Eindämmen nach dem Marker und vor
+    /// [`Self::freeze`] (`containment.rs`, Vertrag mit harw): war es schon
+    /// `1`, gehört der Freeze einem früheren Eigentümer (harw `job.suspend`,
+    /// ein Operator), und das Freigeben lässt es stehen. Gelesen wird nur das
+    /// eigene Bit der cgroup, nicht der wirksame Zustand über Vorfahren. Die
+    /// Implementierung prüft die Kernel-ID wie [`Self::freeze`] am Ziel
+    /// selbst.
+    ///
+    /// # Arguments
+    /// - `target` (`&CgroupTarget`): das signierte Ziel-Tripel.
+    ///
+    /// # Returns
+    /// `true`, wenn `cgroup.freeze` gesetzt ist.
+    ///
+    /// # Errors
+    /// Wie [`Self::freeze`]; dazu [`WardenError::Io`] (`InvalidData`) für
+    /// einen Inhalt außer `0`/`1`.
+    fn freeze_requested(&self, target: &CgroupTarget) -> WardenResult<bool>;
 }
 
 /// Taut eine eingefrorene cgroup auf (Aktion
@@ -342,11 +367,49 @@ impl CgroupV2Executor {
         File::from(control).write_all(value)?;
         Ok(())
     }
+
+    // Öffnet das Ziel wie `write_control_file` und liest `cgroup.freeze` über
+    // denselben Deskriptor. Fehlt die Datei, gilt das Bit als nicht gesetzt:
+    // unter cgroupfs heißt das, die gepinnte cgroup ist inzwischen entfernt,
+    // und das anschließende Schreiben meldet sie als verschwunden; in
+    // Test-Fixtures existiert die Datei erst nach dem ersten Schreiben.
+    fn read_freeze_bit(&self, target: &CgroupTarget) -> WardenResult<bool> {
+        let relative = validate_path_segment(&target.path)?;
+        let dir = open_pinned_cgroup(&self.root.join(relative), target.kernel_id)?;
+        let control = match rustix::fs::openat(
+            &dir,
+            "cgroup.freeze",
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(control) => control,
+            Err(errno) if errno == rustix::io::Errno::NOENT => return Ok(false),
+            Err(errno) => return Err(WardenError::Io(std::io::Error::from(errno))),
+        };
+        let mut contents = Vec::new();
+        File::from(control)
+            .take(FREEZE_BIT_READ_LIMIT)
+            .read_to_end(&mut contents)?;
+        match contents.trim_ascii() {
+            b"0" => Ok(false),
+            b"1" => Ok(true),
+            _ => Err(WardenError::Io(std::io::Error::from(
+                std::io::ErrorKind::InvalidData,
+            ))),
+        }
+    }
 }
+
+// Höchstens so viele Bytes von `cgroup.freeze` lesen (Inhalt: `0\n` oder `1\n`).
+const FREEZE_BIT_READ_LIMIT: u64 = 16;
 
 impl CgroupFreezer for CgroupV2Executor {
     fn freeze(&self, target: &CgroupTarget) -> WardenResult<()> {
         self.write_control_file(target, "cgroup.freeze", b"1")
+    }
+
+    fn freeze_requested(&self, target: &CgroupTarget) -> WardenResult<bool> {
+        self.read_freeze_bit(target)
     }
 }
 
@@ -386,6 +449,10 @@ pub enum RecordedCall {
 /// Warden geben und die Reihenfolge aller Aufrufe an einer Stelle lesen kann.
 /// [`Self::new_failing`] liefert einen Ausführer, der jeden Aufruf
 /// aufzeichnet und danach fehlschlägt (Ausführungsfehler-Pfad).
+/// [`CgroupFreezer::freeze_requested`] ist ein Lesezugriff ohne Wirkung: er
+/// wird nicht aufgezeichnet, scheitert nie und meldet `false`, nach
+/// [`Self::reporting_frozen`] `true` (ein schon gesetztes Bit, etwa von
+/// harws `job.suspend`).
 ///
 /// # Concurrency
 /// Intern `Arc<Mutex<_>>`; `Send + Sync`. Ein vergifteter Mutex wird
@@ -417,6 +484,7 @@ pub enum RecordedCall {
 pub struct RecordingExecutor {
     calls: Arc<Mutex<Vec<RecordedCall>>>,
     fail: bool,
+    reports_frozen: bool,
 }
 
 impl RecordingExecutor {
@@ -435,6 +503,7 @@ impl RecordingExecutor {
         Self {
             calls: Arc::new(Mutex::new(Vec::new())),
             fail: true,
+            reports_frozen: false,
         }
     }
 
@@ -448,6 +517,22 @@ impl RecordingExecutor {
         Self {
             calls: Arc::clone(&self.calls),
             fail: true,
+            reports_frozen: self.reports_frozen,
+        }
+    }
+
+    /// Baut einen Ausführer mit demselben Protokoll, dessen
+    /// [`CgroupFreezer::freeze_requested`] ein schon gesetztes
+    /// `cgroup.freeze` meldet.
+    ///
+    /// # Returns
+    /// Einen Klon mit `reports_frozen = true`.
+    #[must_use]
+    pub fn reporting_frozen(&self) -> Self {
+        Self {
+            calls: Arc::clone(&self.calls),
+            fail: self.fail,
+            reports_frozen: true,
         }
     }
 
@@ -481,6 +566,10 @@ impl RecordingExecutor {
 impl CgroupFreezer for RecordingExecutor {
     fn freeze(&self, target: &CgroupTarget) -> WardenResult<()> {
         self.record(RecordedCall::Freeze(target.path.clone()))
+    }
+
+    fn freeze_requested(&self, _target: &CgroupTarget) -> WardenResult<bool> {
+        Ok(self.reports_frozen)
     }
 }
 
@@ -807,7 +896,82 @@ mod tests {
         Ok(())
     }
 
+    // -- freeze_requested: das eigene Bit über denselben Deskriptor ------------
+
+    #[test]
+    fn test_cgroup_v2_executor_reads_the_freeze_bit() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let job = live_target(dir.path(), "harw.slice/job-1")?;
+        let control = dir
+            .path()
+            .join("harw.slice")
+            .join("job-1")
+            .join("cgroup.freeze");
+        let executor = CgroupV2Executor::new(dir.path());
+
+        // Ohne Datei (Fixture vor dem ersten Schreiben): nicht gesetzt.
+        assert!(!executor.freeze_requested(&job).map_err(ctx("absent"))?);
+        std::fs::write(&control, b"1\n").map_err(ctx("write 1"))?;
+        assert!(executor.freeze_requested(&job).map_err(ctx("set"))?);
+        std::fs::write(&control, b"0\n").map_err(ctx("write 0"))?;
+        assert!(!executor.freeze_requested(&job).map_err(ctx("clear"))?);
+        std::fs::write(&control, b"frozen").map_err(ctx("write garbage"))?;
+        let Err(error) = executor.freeze_requested(&job) else {
+            return Err(TestError::Unexpected(
+                "an unknown freeze value must be an error".into(),
+            ));
+        };
+        assert!(matches!(error, WardenError::Io(_)));
+        assert!(!error.is_target_replaced_or_gone());
+        Ok(())
+    }
+
+    #[test]
+    fn test_cgroup_v2_executor_reads_no_bit_of_a_replaced_target_or_through_a_link() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let live = live_target(dir.path(), "harw.slice/job-1")?;
+        let stale = target(
+            "harw.slice/job-1",
+            live.kernel_id.get().wrapping_add(1).max(1),
+        )?;
+        let executor = CgroupV2Executor::new(dir.path());
+        assert!(matches!(
+            executor.freeze_requested(&stale),
+            Err(WardenError::TargetChanged)
+        ));
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"1").map_err(ctx("write outside"))?;
+        std::os::unix::fs::symlink(
+            &outside,
+            dir.path()
+                .join("harw.slice")
+                .join("job-1")
+                .join("cgroup.freeze"),
+        )
+        .map_err(ctx("symlink control file"))?;
+        let linked = executor.freeze_requested(&live);
+        assert!(linked.is_err(), "a linked control file must not be read");
+        Ok(())
+    }
+
     // -- RecordingExecutor: jede Aktion über ihren Trait, nie echte Wirkung ---
+
+    #[test]
+    fn test_recording_executor_reports_the_freeze_bit_without_recording() -> TestResult {
+        let executor = RecordingExecutor::new();
+        let job = target("cgroup-1", 7)?;
+        assert!(!executor.freeze_requested(&job).map_err(ctx("read"))?);
+        let frozen = executor.reporting_frozen();
+        assert!(frozen.freeze_requested(&job).map_err(ctx("read frozen"))?);
+        assert!(
+            frozen
+                .failing_view()
+                .freeze_requested(&job)
+                .map_err(ctx("failing view reads"))?
+        );
+        assert!(executor.calls().is_empty());
+        Ok(())
+    }
 
     #[test]
     fn test_recording_executor_records_freeze_via_trait() -> TestResult {

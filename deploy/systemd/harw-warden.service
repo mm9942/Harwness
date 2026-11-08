@@ -18,7 +18,8 @@
 #                       0600 proof keys in proof_key_dir (PL-100 WP 3.1).
 #                       Landlock (harw-warden/src/landlock.rs) confines all
 #                       file access to --cgroup-root and the StateDirectory,
-#                       plus read/exec of nft when isolation is allowed.
+#                       marker files in the containment index (below), plus
+#                       read/exec of nft when isolation is allowed.
 #   CAP_NET_ADMIN    -- NOT granted by this unit. The default warden.toml
 #                       allows freeze/thaw only. Network isolation runs
 #                       /usr/sbin/nft as a child (harw-warden/src/
@@ -41,14 +42,29 @@
 #
 # Landlock: hard start failure without full enforcement; the writable roots
 # are --cgroup-root and the StateDirectory (nonce ledger, action ledger, hold
-# timers; PL-100 WP 3.1, threat B24).
+# timers, containment records; PL-100 WP 3.1, threat B24). In the
+# containment index /run/harw-warden/holds the warden may only list, create
+# and remove marker files (no symlinks, no directories).
+#
+# Containment markers (owner review 4505015305): every freeze creates an
+# empty file /run/harw-warden/holds/<kernel id of the cgroup> before it
+# writes cgroup.freeze; harw's job.resume never thaws a marked cgroup. At
+# start, after Landlock and seccomp and before the first request, the warden
+# reconciles markers with its records and the cgroups (stale markers of
+# vanished or thawed cgroups go, a missing marker of a frozen one comes
+# back, records from a previous boot are dropped). While running, the hold
+# timer removes the markers of cgroups that vanished (e.g. after a kill) and
+# retries markers a release could not remove. tmpfiles creates
+# /run/harw-warden (root, 0755) and holds/ (harw-warden, 0755), also while
+# the warden is disabled.
 #
 # seccomp (PL-100 decision O10): after Landlock the warden installs its own
 # allowlist for all threads (harw-warden/src/seccomp.rs). Every call on it is
-# in @system-service; the `seccomp` call itself is not, so it is allowed
-# explicitly below. Process start (execve, ...), AF_NETLINK sockets and
-# kill(SIGKILL) for an nft child that overruns its 10 s limit are on the
-# warden's own list only when isolation is allowed.
+# in @system-service (the marker calls flock, unlinkat without AT_REMOVEDIR,
+# getdents64 and geteuid included); the `seccomp` call itself is not, so it
+# is allowed explicitly below. Process start (execve, ...), AF_NETLINK
+# sockets and kill(SIGKILL) for an nft child that overruns its 10 s limit
+# are on the warden's own list only when isolation is allowed.
 #
 # Keys: `harw-warden keygen --key-id <id>` (run as root, outside this unit)
 # writes a new 0600 key into proof_key_dir; the warden loads keys at start,
@@ -87,16 +103,28 @@ StateDirectoryMode=0700
 # -- Hardening --
 NoNewPrivileges=yes
 ProtectSystem=strict
-# The writable roots: --cgroup-root and the StateDirectory. systemd already
-# adds a StateDirectory= to the writable set under ProtectSystem=strict; it
-# is listed again so the unit states every writable path in one place.
+# The writable roots: --cgroup-root and the StateDirectory, plus the
+# containment index on its own line below. systemd already adds a
+# StateDirectory= to the writable set under ProtectSystem=strict; it is
+# listed again so the unit states every writable path in one place.
 # /sys/fs/cgroup is explicit, although systemd keeps it writable under
 # ProtectKernelTunables= unless ProtectControlGroups= is set.
 ReadWritePaths=/sys/fs/cgroup /var/lib/harw-warden
+# The containment index for harw (see the header). Deliberately NOT
+# RuntimeDirectory=: systemd would remove the markers whenever this service
+# stops, and job.resume could then lift a freeze the warden still holds.
+# Without the "-" prefix: a missing directory (tmpfiles not run) fails the
+# start, as the Landlock rule would.
+ReadWritePaths=/run/harw-warden/holds
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelModules=yes
+# Read-only /proc/sys is fine: the warden only reads
+# /proc/sys/kernel/random/boot_id at startup. Do NOT add ProcSubset=pid: it
+# hides that file, and without a boot id the warden discards every stored
+# containment record at each start (fail closed; markers stay as orphans and
+# hold timers no longer thaw).
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes
 # NOT ProtectControlGroups=yes: it would replace /sys/fs/cgroup with a

@@ -3,9 +3,10 @@
 //! # Zweck
 //! Nach Socket, Policy, Schlüsseln, StateDirectory und Landlock braucht der
 //! Warden nur noch eine kleine, feste Menge an Systemaufrufen: Speicher und
-//! Threads (glibc, Rust-`std`), Dateien im StateDirectory und unter der
-//! cgroup-Wurzel, Annahme und Austausch auf dem geerbten Socket, die Uhr
-//! und das Schreiben ins Journal (stderr). [`install`] bindet genau diese
+//! Threads (glibc, Rust-`std`), Dateien im StateDirectory, unter der
+//! cgroup-Wurzel und im Indexverzeichnis der Eindämmungsmarker, Annahme und
+//! Austausch auf dem geerbten Socket, die Uhr und das Schreiben ins Journal
+//! (stderr). [`install`] bindet genau diese
 //! Menge als seccomp-BPF-Filter für **alle** Threads des Prozesses
 //! (`SECCOMP_FILTER_FLAG_TSYNC`); später gestartete Threads und
 //! Kindprozesse erben ihn. Jeder andere Aufruf scheitert mit `EPERM`
@@ -38,7 +39,11 @@
 //! Die Unit filtert zusätzlich mit `SystemCallFilter=@system-service`; der
 //! Kernel wertet beide Filter aus, der strengere gewinnt. Jeder Aufruf
 //! dieser Liste liegt in `@system-service` (geprüft mit
-//! `systemd-analyze syscall-filter`, systemd 255). Der Aufruf `seccomp`
+//! `systemd-analyze syscall-filter`, systemd 255; die Marker-Aufrufe nach
+//! systemds Gruppenliste: `flock` direkt in `@system-service`, `unlinkat`
+//! und `getdents64` in `@file-system`, `geteuid` in `@default` — auf dem
+//! Zielsystem mit `systemd-analyze syscall-filter @system-service` zu
+//! bestätigen). Der Aufruf `seccomp`
 //! selbst liegt **nicht** darin; die Unit erlaubt ihn ausdrücklich, sonst
 //! scheitert [`install`]. Nach [`install`] ist `seccomp` (wie `prctl` außer
 //! `PR_SET_NAME` und alle `landlock_*`-Aufrufe) nicht mehr erlaubt.
@@ -46,6 +51,19 @@
 //! # Herkunft der Einträge
 //! - `std::fs` und `std::io` über glibc (Zustandsdateien, `cgroup.freeze`,
 //!   `cgroup.kill`, Inode-Prüfung über `statx`/`newfstatat`);
+//! - Eindämmungsmarker für harw (`harw_dod_warden::containment`,
+//!   `harw_dod_warden::reconcile`; rustix 1.1.5 im `linux_raw`-Backend,
+//!   geprüft in `rustix-1.1.5/src/backend/linux_raw/fs/syscalls.rs` und
+//!   `fs/dir.rs`): `openat` mit `O_DIRECTORY | O_NOFOLLOW` bzw.
+//!   `O_CREAT | O_EXCL | O_NOFOLLOW`, `fstat`/`newfstatat` ohne
+//!   Symlink-Folgen, `flock` (ein Versuch `LOCK_EX | LOCK_NB`), `unlinkat`
+//!   nur ohne `AT_REMOVEDIR` (Marker entfernen; ein Verzeichnis, etwa eine
+//!   leere cgroup, entfernt der Warden nie), `getdents64` (Indexverzeichnis beim Abgleich
+//!   auflisten, `rustix::fs::Dir::new` ohne `fcntl`) und `geteuid`
+//!   (Eigentümer des Index und der Marker; ohne ihn lieferte rustix nach dem
+//!   Filter eine falsche uid bzw. bräche im Debug-Build ab). Keiner dieser
+//!   Aufrufe ist architekturabhängig: alle stehen im gemeinsamen Teil der
+//!   Liste (x86_64, aarch64, riscv64);
 //! - atomares Ersetzen der Zustandsdateien: ausdrücklich `renameat2` auf
 //!   jeder Architektur (`harw_dod_warden::STATE_RENAME_SYSCALL`, über
 //!   `rustix::fs::renameat_with`). `std::fs::rename` wäre über glibc je nach
@@ -109,6 +127,10 @@ const PRCTL_SET_NAME: [u64; 1] = [libc::PR_SET_NAME.unsigned_abs() as u64];
 
 /// `socket(AF_NETLINK, …)`: nftables-Netlink des `nft`-Kindprozesses.
 const SOCKET_AF_NETLINK: [u64; 1] = [libc::AF_NETLINK.unsigned_abs() as u64];
+
+/// `unlinkat(dirfd, name, 0)`: nur Dateien entfernen (Eindämmungsmarker), nie
+/// ein Verzeichnis (`AT_REMOVEDIR`, etwa eine leere cgroup unter der Wurzel).
+const UNLINKAT_FILES_ONLY: [u64; 1] = [0];
 
 /// `kill(pid, SIGKILL)`: ein `nft`-Kind, das seine Frist überschreitet,
 /// beenden (`crate::isolation`, `NFT_TIMEOUT`). Kein anderes Signal.
@@ -243,6 +265,17 @@ pub fn base_syscalls() -> Vec<AllowedSyscall> {
         AllowedSyscall::any("ftruncate", libc::SYS_ftruncate),
         // Einziger Umbenennungsaufruf (`harw_dod_warden::STATE_RENAME_SYSCALL`).
         AllowedSyscall::any("renameat2", libc::SYS_renameat2),
+        // Eindämmungsmarker für harw (`harw_dod_warden::containment`): ein
+        // Versuch `flock(LOCK_EX | LOCK_NB)` auf das Indexverzeichnis, Marker
+        // entfernen (nur `unlinkat` ohne `AT_REMOVEDIR`, nie das
+        // x86_64-`unlink`), das Verzeichnis beim Abgleich auflisten
+        // (`rustix::fs::Dir`) und den Eigentümer mit dem effektiven Nutzer
+        // vergleichen. Landlock begrenzt Anlegen und Entfernen auf das
+        // Indexverzeichnis.
+        AllowedSyscall::any("flock", libc::SYS_flock),
+        AllowedSyscall::one_of("unlinkat", libc::SYS_unlinkat, 2, &UNLINKAT_FILES_ONLY),
+        AllowedSyscall::any("getdents64", libc::SYS_getdents64),
+        AllowedSyscall::any("geteuid", libc::SYS_geteuid),
         // IPC auf dem geerbten `SOCK_SEQPACKET`-Socket (rustix `linux_raw`).
         AllowedSyscall::any("accept", libc::SYS_accept),
         AllowedSyscall::any("accept4", libc::SYS_accept4),
@@ -543,7 +576,7 @@ pub fn install(extra: &[AllowedSyscall]) -> Result<SeccompProfile, WardenBinErro
 mod tests {
     use super::{
         AllowedSyscall, DENIED_ACTION, DENIED_ERRNO, SeccompProfile, arch_from_name, base_syscalls,
-        nft_subprocess_syscalls,
+        legacy_base_syscalls, nft_subprocess_syscalls,
     };
     use crate::test_support::{TestError, TestResult, ctx};
     use seccompiler::SeccompAction;
@@ -575,7 +608,13 @@ mod tests {
             "renameat2",
             "statx",
             "newfstatat",
-            "fstat", // Threads und Hold-Timer.
+            "fstat",
+            // Eindämmungsmarker für harw.
+            "flock",
+            "unlinkat",
+            "getdents64",
+            "geteuid",
+            // Threads und Hold-Timer.
             "clone3",
             "clone",
             "futex",
@@ -619,8 +658,13 @@ mod tests {
             ("bpf", libc::SYS_bpf),
             ("seccomp", libc::SYS_seccomp),
             ("landlock_restrict_self", libc::SYS_landlock_restrict_self),
-            ("unlinkat", libc::SYS_unlinkat),
+            // `unlinkat` ist für die Eindämmungsmarker erlaubt (nur ohne
+            // `AT_REMOVEDIR`; Landlock begrenzt es auf das
+            // Indexverzeichnis); Verzeichnisse, Symlinks und Hardlinks
+            // anlegen bleibt verboten.
             ("mkdirat", libc::SYS_mkdirat),
+            ("symlinkat", libc::SYS_symlinkat),
+            ("linkat", libc::SYS_linkat),
             ("fchmodat", libc::SYS_fchmodat),
             ("ioctl", libc::SYS_ioctl),
             ("init_module", libc::SYS_init_module),
@@ -660,6 +704,45 @@ mod tests {
                 .contains(&harw_dod_warden::STATE_RENAME_SYSCALL)
         );
         assert!(profile.allows(libc::SYS_renameat2));
+    }
+
+    // Die Aufrufe des Marker-Protokolls und des Abgleichs: im gemeinsamen,
+    // nicht architekturabhängigen Teil der Liste. Geprüft wird nur diese
+    // Struktur (nicht in `legacy_base_syscalls`, die je Architektur
+    // verschieden ist) und die Nummern des Hosts; die Nummern anderer
+    // Architekturen setzt `libc` beim Übersetzen für das jeweilige Ziel ein
+    // (`flock` 73/32/32, `unlinkat` 263/35/35, `getdents64` 217/61/61,
+    // `geteuid` 107/175/175 auf x86_64/aarch64/riscv64, nachgelesen in
+    // `libc-0.2.190/src/unix/linux_like/linux/gnu/b64/`), ein Lauf dieses
+    // Tests auf dem jeweiligen Ziel prüft sie dort. Fehlte einer, scheiterte
+    // nach `install` jeder Marker (Eindämmung ohne Schutz vor `job.resume`)
+    // bzw. der Start.
+    #[test]
+    fn test_marker_index_calls_are_in_the_arch_independent_allowlist() {
+        let profile = SeccompProfile::with_extra(&[]);
+        let names = profile.names();
+        let legacy: Vec<&str> = legacy_base_syscalls()
+            .iter()
+            .map(|syscall| syscall.name)
+            .collect();
+        for (name, nr) in [
+            ("flock", libc::SYS_flock),
+            ("unlinkat", libc::SYS_unlinkat),
+            ("getdents64", libc::SYS_getdents64),
+            ("geteuid", libc::SYS_geteuid),
+            ("openat", libc::SYS_openat),
+            ("newfstatat", libc::SYS_newfstatat),
+            ("fstat", libc::SYS_fstat),
+        ] {
+            assert!(profile.allows(nr), "{name} must be allowed");
+            assert!(names.contains(&name), "{name} missing in {names:?}");
+            assert!(!legacy.contains(&name), "{name} must not be arch-gated");
+        }
+        // `unlinkat` nur für Dateien: ein Verzeichnis (etwa eine leere
+        // cgroup) entfernt der Warden nie.
+        assert!(profile.allows_with(libc::SYS_unlinkat, 2, 0));
+        assert!(!profile.allows_with(libc::SYS_unlinkat, 2, value(libc::AT_REMOVEDIR)));
+        assert!(!profile.allows(libc::SYS_mkdirat));
     }
 
     #[test]

@@ -8,7 +8,9 @@
 //! `/sys/fs/cgroup`), `--policy`, die Warden-eigene, root-eigene Policy
 //! (Vorgabe `/etc/harw-dod/warden.toml`, PL-100 WP 3.1), und `--state-dir`,
 //! das StateDirectory für Nonce-Ledger, Aktions-Ledger und Hold-Timer
-//! (Vorgabe `/var/lib/harw-warden`, systemd `StateDirectory=harw-warden`).
+//! (Vorgabe `/var/lib/harw-warden`, systemd `StateDirectory=harw-warden`),
+//! und `--holds-dir`, das Indexverzeichnis der Eindämmungsmarker für harw
+//! (Vorgabe `/run/harw-warden/holds`, tmpfiles; Owner-Review 4505015305).
 //! Unterkommandos ([`Command`]): `completions` und `keygen` (neuer
 //! Proof-v2-Schlüssel, [`KeygenArgs`]). Der
 //! Empfangssocket selbst ist **kein** Kommandozeilenparameter — er kommt
@@ -40,6 +42,10 @@ pub const DEFAULT_STATE_DIR: &str = harw_dod_warden::state::DEFAULT_STATE_DIR;
 
 /// Vorgabe-Schlüsselordner für `keygen` (`proof_key_dir` der Vorgabe-Policy).
 pub const DEFAULT_KEY_DIR: &str = harw_dod_warden::config::DEFAULT_PROOF_KEY_DIR;
+
+/// Vorgabepfad des Indexverzeichnisses der Eindämmungsmarker (gleich
+/// `harw_tool_job::CONTAINMENT_HOLDS_DIR`, dem Pfad, den harw liest).
+pub const DEFAULT_HOLDS_DIR: &str = harw_dod_warden::DEFAULT_HOLDS_DIR;
 
 /// Gültige Werte für `--log`, in `tracing_subscriber::EnvFilter`-Syntax.
 ///
@@ -128,6 +134,13 @@ pub struct Cli {
     /// existieren, Modus `0700`).
     #[arg(long, value_name = "DIR", default_value = DEFAULT_STATE_DIR)]
     pub state_dir: PathBuf,
+
+    /// Indexverzeichnis der Eindämmungsmarker für harw (muss existieren,
+    /// dem Warden-Nutzer gehören und darf weder gruppen- noch weltschreibbar
+    /// sein). Nur zum Testen zu überschreiben: harw liest immer
+    /// [`DEFAULT_HOLDS_DIR`].
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_HOLDS_DIR)]
+    pub holds_dir: PathBuf,
 }
 
 /// Unterkommandos von `harw-warden`; ohne Unterkommando läuft der
@@ -162,8 +175,8 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        Cli, Command, DEFAULT_CGROUP_ROOT, DEFAULT_KEY_DIR, DEFAULT_POLICY_PATH, DEFAULT_STATE_DIR,
-        LogLevel,
+        Cli, Command, DEFAULT_CGROUP_ROOT, DEFAULT_HOLDS_DIR, DEFAULT_KEY_DIR, DEFAULT_POLICY_PATH,
+        DEFAULT_STATE_DIR, LogLevel,
     };
     use crate::test_support::{TestResult, ctx};
 
@@ -194,6 +207,23 @@ mod tests {
             std::path::PathBuf::from("/var/lib/harw-warden")
         );
         assert_eq!(cli.state_dir, std::path::PathBuf::from(DEFAULT_STATE_DIR));
+        // Derselbe Pfad, den harw (`harw_tool_job::CONTAINMENT_HOLDS_DIR`) liest.
+        assert_eq!(
+            cli.holds_dir,
+            std::path::PathBuf::from("/run/harw-warden/holds")
+        );
+        assert_eq!(cli.holds_dir, std::path::PathBuf::from(DEFAULT_HOLDS_DIR));
+        Ok(())
+    }
+
+    #[test]
+    fn test_holds_dir_override_is_honoured() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-warden", "--holds-dir", "/tmp/fixture/holds"])
+            .map_err(ctx("valid override"))?;
+        assert_eq!(
+            cli.holds_dir,
+            std::path::PathBuf::from("/tmp/fixture/holds")
+        );
         Ok(())
     }
 

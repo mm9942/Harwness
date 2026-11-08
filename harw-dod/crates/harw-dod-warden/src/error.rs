@@ -13,8 +13,11 @@
 //!    `proof_key_dir` ist syntaktisch falsch, unvollständig oder liegt nicht
 //!    root-eigen und schreibgeschützt vor (PL-100 WP 3.1).
 //! 3. **Zustand** (`nonce_ledger.rs`, `action_ledger.rs`, `holds.rs`,
-//!    `state.rs`): der persistente Zustand im StateDirectory ist beschädigt,
-//!    voll oder nicht schreibbar — der Warden arbeitet dann fail closed.
+//!    `containment.rs`, `state.rs`): der persistente Zustand im
+//!    StateDirectory ist beschädigt, voll oder nicht schreibbar — der Warden
+//!    arbeitet dann fail closed. Das Indexverzeichnis der Eindämmungsmarker
+//!    (`containment.rs`) meldet sich als [`WardenError::UntrustedFile`] bzw.
+//!    [`WardenError::Io`]; dort gilt „Eindämmung geht vor“.
 //!
 //! Die Nachprüfung einer Autorisierung selbst liefert ihre eigenen Fehler
 //! bereits fertig als [`harw_dod_warden_proto::ProofError`] bzw. dessen
@@ -141,7 +144,8 @@ pub enum WardenError {
     /// nicht (fail closed).
     #[msg("Zustandsdatei {ledger} ist beschädigt (Zeile {line})")]
     LedgerCorrupt {
-        /// Welche Datei (fester Name: `"nonce"`, `"action"`, `"holds"`).
+        /// Welche Datei (fester Name: `"nonce"`, `"action"`, `"holds"`,
+        /// `"containment"`).
         ledger: &'static str,
         /// 1-basierte Zeilennummer (`0` für eine Datei ohne Zeilenstruktur).
         line: usize,

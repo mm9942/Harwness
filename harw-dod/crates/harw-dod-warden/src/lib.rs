@@ -21,13 +21,21 @@
 //!   Schlüsseldateien `0600` root.
 //! - Persistenter Zustand im StateDirectory ([`state`]): Nonce-Ledger
 //!   ([`nonce_ledger`]), hash-verkettetes Aktions-Ledger ([`action_ledger`]),
-//!   Hold-Timer ([`holds`]).
+//!   Hold-Timer ([`holds`]), Eindämmungen ([`containment`]).
 //! - Zielprüfung vor jedem Eingriff ([`observe`]): Kernel-ID unter dem
 //!   signierten Pfad; Freeze, Thaw und Kill prüfen sie im Ausführer noch
 //!   einmal am geöffneten Verzeichnis und schreiben über denselben
 //!   Deskriptor ([`executor`], B21).
 //! - Die Deny-Liste schützt auch den User-Manager samt seiner Slices und die
 //!   User-Unit `harw-dod-watch.service` ([`policy`]).
+//! - Eindämmungsmarker für harw ([`containment`], Owner-Review 4505015305):
+//!   je eingefrorener cgroup ein Marker `/run/harw-warden/holds/<Kernel-ID>`,
+//!   den `job.resume` respektiert, und `freeze_was_set` im StateDirectory, damit
+//!   das Freigeben nie einen Freeze von harw oder einem Operator aufhebt.
+//!   Beim Start gleicht [`warden::Warden::reconcile_containments`] Marker,
+//!   Datensätze, Holds und cgroups ab ([`reconcile`]), damit ein Absturz
+//!   keinen Marker hinterlässt, der `job.resume` für immer sperrt; im Betrieb
+//!   räumt der Hold-Timer Eindämmungen verschwundener cgroups ab.
 //! - Jede Anfrage bekommt eine Antwort ([`warden::WardenOutcome::to_wire`]
 //!   ist total).
 //!
@@ -142,6 +150,7 @@
 pub mod action_ledger;
 pub mod audit;
 pub mod config;
+pub mod containment;
 pub mod error;
 pub mod executor;
 mod fsutil;
@@ -151,6 +160,7 @@ pub mod keys;
 pub mod nonce_ledger;
 pub mod observe;
 pub mod policy;
+pub mod reconcile;
 pub mod state;
 pub mod trust;
 pub mod warden;
@@ -158,6 +168,10 @@ pub mod warden;
 pub use action_ledger::{ActionLedger, LedgerEntry, LedgerEvent, LedgerOrigin, LedgerRecord};
 pub use audit::{AuditEvent, AuditSink, RecordingAuditSink};
 pub use config::{EscalatorIdentity, WardenConfig, load_warden_config, parse_warden_config};
+pub use containment::{
+    ContainmentEntry, ContainmentMarkers, ContainmentStore, DEFAULT_HOLDS_DIR, IndexScan,
+    MarkerCreation, MarkerDir,
+};
 pub use error::{WardenError, WardenResult};
 pub use executor::{
     CgroupFreezer, CgroupThawer, CgroupV2Executor, NetworkIsolator, ProcessTreeKiller,
@@ -169,6 +183,7 @@ pub use keys::load_key_ring;
 pub use nonce_ledger::FileNonceLedger;
 pub use observe::{CgroupFsObserver, StaticTargetObserver, TargetObserver};
 pub use policy::{ActionAllowlist, DenyList, DenyPattern, PolicyViolation, WardenPolicy};
+pub use reconcile::ContainmentReconciliation;
 pub use state::WardenState;
 pub use trust::{FileSecrecy, TrustRules};
 pub use warden::{HoldSweep, Warden, WardenOutcome, WardenParts};

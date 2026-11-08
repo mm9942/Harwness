@@ -334,8 +334,8 @@ mod tests {
     use crate::peer::PeerGate;
     use crate::test_support::{TestError, TestResult, ctx, private_tempdir};
     use harw_dod_warden::{
-        ActionAllowlist, DenyList, RecordedCall, RecordingAuditSink, RecordingExecutor,
-        StaticTargetObserver, Warden, WardenParts, WardenPolicy, WardenState,
+        ActionAllowlist, ContainmentMarkers, DenyList, RecordedCall, RecordingAuditSink,
+        RecordingExecutor, StaticTargetObserver, Warden, WardenParts, WardenPolicy, WardenState,
     };
     use harw_dod_warden_proto::{
         AuthorizationBody, CgroupKernelId, CgroupTarget, Denial, EscalationStage, KeyId, KeyRing,
@@ -380,6 +380,9 @@ mod tests {
             keys,
             policy,
             state: WardenState::open(dir, at(0)?).map_err(ctx("state"))?,
+            // Ohne Indexverzeichnis: jeder Freeze meldet den fehlenden Marker
+            // und friert trotzdem (hier nicht Gegenstand der Prüfung).
+            markers: ContainmentMarkers::new(dir.join("holds")),
         }))
     }
 

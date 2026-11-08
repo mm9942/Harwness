@@ -69,7 +69,11 @@ impl AuditSink for TracingAuditSink {
     /// # Description
     /// Stufenwahl: [`AuditEvent::Attempting`]/[`AuditEvent::Executed`]/
     /// [`AuditEvent::HoldArmed`] als `info` (Regelbetrieb, mit cgroup-Pfad),
-    /// [`AuditEvent::Denied`]/[`AuditEvent::HoldDropped`] als `warn`,
+    /// [`AuditEvent::ContainmentCleared`]/[`AuditEvent::ContainmentRestored`]
+    /// als `info` (Kernel-ID und fester Grund; der Pfad auf `debug`),
+    /// [`AuditEvent::Denied`]/[`AuditEvent::HoldDropped`]/
+    /// [`AuditEvent::ContainmentDegraded`]/[`AuditEvent::ContainmentCompleted`]/
+    /// [`AuditEvent::ContainmentUnresolved`] als `warn`,
     /// [`AuditEvent::ExecutionFailed`]/[`AuditEvent::Unavailable`]/
     /// [`AuditEvent::HoldAbandoned`] als `error`. Auf `warn` und höher stehen nur die Aktionsart und feste
     /// Gründe — der cgroup-Pfad folgt in einem eigenen `debug`-Ereignis
@@ -113,7 +117,9 @@ impl AuditSink for TracingAuditSink {
                 tracing::info!(cgroup = %cgroup, thaw_at = %thaw_at, "warden hold armed; expiry only thaws");
             }
             AuditEvent::HoldDropped { cgroup } => {
-                tracing::warn!("warden dropped a due hold: target changed, nothing thawed");
+                tracing::warn!(
+                    "warden dropped a due hold: target changed or not contained by the warden in this boot, nothing thawed"
+                );
                 tracing::debug!(cgroup = ?cgroup, "dropped hold target");
             }
             AuditEvent::HoldAbandoned { cgroup, attempts } => {
@@ -122,6 +128,54 @@ impl AuditSink for TracingAuditSink {
                     "warden gave up thawing a due hold; the cgroup stays frozen until a signed thaw"
                 );
                 tracing::debug!(cgroup = ?cgroup, "abandoned hold target");
+            }
+            AuditEvent::ContainmentDegraded { action, reason } => {
+                // Ob die Aktion selbst gelang, sagen `Executed` bzw.
+                // `ExecutionFailed`; hier nur der Schritt des Protokolls.
+                tracing::warn!(
+                    kind = action.kind_name(),
+                    reason,
+                    "warden containment marker protocol step failed"
+                );
+                tracing::debug!(cgroup = ?action.cgroup(), "degraded containment target");
+            }
+            AuditEvent::ContainmentCleared {
+                cgroup,
+                kernel_id,
+                reason,
+            } => {
+                tracing::info!(
+                    kernel_id = kernel_id.get(),
+                    reason,
+                    "warden cleared a stale containment marker"
+                );
+                tracing::debug!(cgroup = ?cgroup, "cleared containment target");
+            }
+            AuditEvent::ContainmentRestored { cgroup, kernel_id } => {
+                tracing::info!(
+                    kernel_id = kernel_id.get(),
+                    "warden restored the missing containment marker of a cgroup that is still frozen"
+                );
+                tracing::debug!(cgroup = ?cgroup, "restored containment target");
+            }
+            AuditEvent::ContainmentCompleted { cgroup, kernel_id } => {
+                tracing::warn!(
+                    kernel_id = kernel_id.get(),
+                    "warden completed an unfinished containment of a frozen cgroup; its freeze bit belongs to another owner and no warden release lifts it"
+                );
+                tracing::debug!(cgroup = ?cgroup, "completed containment target");
+            }
+            AuditEvent::ContainmentUnresolved {
+                cgroup,
+                kernel_id,
+                reason,
+            } => {
+                tracing::warn!(
+                    kernel_id = kernel_id.get(),
+                    reason,
+                    "warden left a containment unresolved; a leftover marker keeps job.resume refused until a signed thaw clears it"
+                );
+                tracing::debug!(cgroup = ?cgroup, "unresolved containment target");
             }
         }
     }
@@ -237,6 +291,98 @@ mod tests {
             cgroup: action.cgroup().clone(),
             attempts: 8,
         });
+        sink.record(AuditEvent::ContainmentDegraded {
+            action: action.clone(),
+            reason: "containment index lock not obtained; containing without it",
+        });
+        sink.record(AuditEvent::ContainmentCleared {
+            cgroup: action.cgroup().clone(),
+            kernel_id: harw_dod_warden_proto::CgroupKernelId::new(4242).map_err(ctx("kid"))?,
+            reason: "hold of a cgroup that no longer exists dropped",
+        });
+        sink.record(AuditEvent::ContainmentRestored {
+            cgroup: action.cgroup().clone(),
+            kernel_id: harw_dod_warden_proto::CgroupKernelId::new(4242).map_err(ctx("kid"))?,
+        });
+        sink.record(AuditEvent::ContainmentCompleted {
+            cgroup: action.cgroup().clone(),
+            kernel_id: harw_dod_warden_proto::CgroupKernelId::new(4242).map_err(ctx("kid"))?,
+        });
+        sink.record(AuditEvent::ContainmentUnresolved {
+            cgroup: None,
+            kernel_id: harw_dod_warden_proto::CgroupKernelId::new(4242).map_err(ctx("kid"))?,
+            reason: "marker without a containment record kept (fail closed)",
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn test_containment_warnings_name_no_cgroup_path() -> TestResult {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let action = WardenAction::FreezeCgroup {
+            cgroup: cgroup("harw.slice/very-identifiable-job")?,
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            TracingAuditSink::new().record(AuditEvent::ContainmentDegraded {
+                action,
+                reason: "containment marker not created; freezing without it",
+            });
+        });
+        let text = capture.text()?;
+        assert!(text.contains("containment marker not created"), "{text}");
+        // Neutral: die Meldung behauptet nicht, die Aktion sei weitergelaufen.
+        assert!(text.contains("protocol step failed"), "{text}");
+        assert!(!text.contains("went on"), "{text}");
+        assert!(!text.contains("very-identifiable"), "{text}");
+        Ok(())
+    }
+
+    // Auch die Meldungen des Abgleichs beim Start nennen ab `info` nur die
+    // Kernel-ID und den festen Grund, nie den cgroup-Pfad.
+    #[test]
+    fn test_reconciliation_events_name_no_cgroup_path() -> TestResult {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let path = cgroup("harw.slice/very-identifiable-job")?;
+        let kernel_id = harw_dod_warden_proto::CgroupKernelId::new(4242).map_err(ctx("kid"))?;
+        tracing::subscriber::with_default(subscriber, || {
+            let sink = TracingAuditSink::new();
+            sink.record(AuditEvent::ContainmentUnresolved {
+                cgroup: Some(path.clone()),
+                kernel_id,
+                reason: "cgroup.freeze unreadable; containment kept",
+            });
+            sink.record(AuditEvent::ContainmentRestored {
+                cgroup: path.clone(),
+                kernel_id,
+            });
+            sink.record(AuditEvent::ContainmentCompleted {
+                cgroup: path.clone(),
+                kernel_id,
+            });
+            sink.record(AuditEvent::ContainmentCleared {
+                cgroup: path,
+                kernel_id,
+                reason: "startup reconciliation: the cgroup no longer exists or was replaced",
+            });
+        });
+        let text = capture.text()?;
+        assert!(text.contains("cgroup.freeze unreadable"), "{text}");
+        assert!(text.contains("unfinished containment"), "{text}");
+        assert!(text.contains("4242"), "{text}");
+        assert!(text.contains("WARN"), "{text}");
+        assert!(!text.contains("very-identifiable"), "{text}");
         Ok(())
     }
 }

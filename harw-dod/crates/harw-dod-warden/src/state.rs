@@ -2,16 +2,23 @@
 //! (PL-100 WP 3.1, Bedrohung B24).
 //!
 //! # Zweck
-//! Bündelt die drei Zustandsdateien unter `/var/lib/harw-warden`
+//! Bündelt die vier Zustandsdateien unter `/var/lib/harw-warden`
 //! (systemd `StateDirectory=harw-warden`, Modus `0700`):
 //!
 //! - [`FileNonceLedger`] (`nonces.v2.log`): Replay-Schutz über Neustarts;
 //! - [`ActionLedger`] (`actions.v2.log`): hash-verkettetes Aktions-Ledger;
-//! - [`HoldStore`] (`holds.v2.json`): laufende Hold-Timer.
+//! - [`HoldStore`] (`holds.v2.json`): laufende Hold-Timer;
+//! - [`ContainmentStore`] (`containment.v1.json`): Eindämmungen mit ihrem
+//!   Marker für harw und `freeze_was_set` (`containment.rs`); beim Öffnen
+//!   liest er die Boot-ID (`/proc/sys/kernel/random/boot_id`), um Datensätze
+//!   früherer Boots zu erkennen.
 //!
 //! [`WardenState::open`] muss **vor** der Landlock-Beschränkung laufen
 //! oder die Landlock-Regel muss das StateDirectory lesend und schreibend
-//! freigeben (`harw-warden`, `landlock.rs`, tut beides).
+//! freigeben (`harw-warden`, `landlock.rs`, tut beides). Die Boot-ID gibt es
+//! nur vor Landlock (`/proc` liegt nicht im Laufzeitbereich); ohne sie gilt
+//! kein gespeicherter Eindämmungsdatensatz als aus diesem Boot (fail closed,
+//! `containment.rs`).
 //!
 //! # Prüfungen
 //! Das Verzeichnis muss existieren (systemd legt es an; der Warden legt es
@@ -49,6 +56,7 @@ use std::path::Path;
 use jiff::Timestamp;
 
 use crate::action_ledger::ActionLedger;
+use crate::containment::ContainmentStore;
 use crate::error::{WardenError, WardenResult};
 use crate::holds::HoldStore;
 use crate::nonce_ledger::{DEFAULT_NONCE_CAPACITY, FileNonceLedger};
@@ -59,12 +67,13 @@ pub const DEFAULT_STATE_DIR: &str = "/var/lib/harw-warden";
 // Keinerlei Gruppen- oder Weltrechte auf dem StateDirectory.
 const GROUP_OR_WORLD_ANY: u32 = 0o077;
 
-/// Die drei Zustandsdateien des Wardens.
+/// Die vier Zustandsdateien des Wardens.
 #[derive(Debug)]
 pub struct WardenState {
     nonces: FileNonceLedger,
     actions: ActionLedger,
     holds: HoldStore,
+    containment: ContainmentStore,
 }
 
 impl WardenState {
@@ -78,8 +87,8 @@ impl WardenState {
     /// # Errors
     /// - [`WardenError::UntrustedFile`]: kein Verzeichnis, nicht im Besitz
     ///   des effektiven Nutzers oder Gruppen-/Weltrechte gesetzt.
-    /// - alles aus [`FileNonceLedger::open`], [`ActionLedger::open`] und
-    ///   [`HoldStore::open`].
+    /// - alles aus [`FileNonceLedger::open`], [`ActionLedger::open`],
+    ///   [`HoldStore::open`] und [`ContainmentStore::open`].
     pub fn open(dir: &Path, now: Timestamp) -> WardenResult<Self> {
         Self::open_with_capacity(dir, now, DEFAULT_NONCE_CAPACITY)
     }
@@ -116,6 +125,7 @@ impl WardenState {
             nonces: FileNonceLedger::open(dir, now, nonce_capacity)?,
             actions: ActionLedger::open(dir)?,
             holds: HoldStore::open(dir)?,
+            containment: ContainmentStore::open(dir)?,
         })
     }
 
@@ -135,6 +145,12 @@ impl WardenState {
     #[must_use]
     pub fn holds(&self) -> &HoldStore {
         &self.holds
+    }
+
+    /// Returns the containment store (marker bookkeeping, `freeze_was_set`).
+    #[must_use]
+    pub fn containment(&self) -> &ContainmentStore {
+        &self.containment
     }
 }
 

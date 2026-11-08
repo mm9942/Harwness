@@ -4,7 +4,9 @@
 //!
 //! # Zweck
 //! Jeder Eingriff hinterlässt hier einen dauerhaften Eintrag, **bevor** er
-//! wirkt (`attempt`), und danach sein Ergebnis (`executed`/`failed`). Auch
+//! wirkt (`attempt`), und danach sein Ergebnis (`executed`/`failed`; ein
+//! signierter Thaw einer cgroup, die es nicht mehr gibt, endet mit
+//! `stale-containment-cleared`: nur die Eindämmung wurde abgeräumt). Auch
 //! der Hold-Timer schreibt seine Auftau-Versuche, verworfene Holds
 //! (`hold-dropped`) und aufgegebene Holds (`hold-abandoned`) hierher. Das Ledger ist die Grundlage für den Abgleich
 //! mit dem Escalator (FreezeStore) und den späteren S7-Spiegel.
@@ -87,12 +89,21 @@ pub enum LedgerEvent {
     /// Die Ausführung ist fehlgeschlagen.
     Failed,
     /// Ein fälliger Hold wurde verworfen, weil das Ziel nicht mehr dasselbe
-    /// ist (verschwunden oder Kernel-ID geändert); es wurde nichts aufgetaut.
+    /// ist (verschwunden oder Kernel-ID geändert) oder der Warden für die
+    /// cgroup keine nicht freigegebene Eindämmung aus diesem Boot führt; es
+    /// wurde nichts aufgetaut.
     HoldDropped,
     /// Der Hold-Timer hat das Auftauen nach
     /// [`crate::warden::MAX_HOLD_THAW_ATTEMPTS`] Fehlversuchen aufgegeben;
     /// die cgroup bleibt eingefroren, bis ein signierter Thaw sie freigibt.
     HoldAbandoned,
+    /// Ergebnis eines signierten `ThawCgroup`, dessen cgroup es nicht mehr
+    /// gibt (verschwunden oder unter dem Pfad ersetzt): der Warden hat nur
+    /// den liegengebliebenen Eindämmungsmarker und -datensatz abgeräumt,
+    /// `cgroup.freeze` blieb unberührt (Operator-Pfad, `warden.rs`). Die
+    /// Antwort auf dem Socket lautet `executed`; dieser Eintrag ist der
+    /// dauerhafte Hinweis, dass nichts aufgetaut wurde.
+    StaleContainmentCleared,
 }
 
 /// Wodurch ein Eintrag ausgelöst wurde.
@@ -526,6 +537,29 @@ mod tests {
             1
         );
         assert_eq!(read_verified(dir.path()).map_err(ctx("verify"))?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_stale_containment_clear_is_its_own_durable_outcome() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        {
+            let ledger = ActionLedger::open(dir.path()).map_err(ctx("open"))?;
+            ledger
+                .append(at(1)?, &entry(LedgerEvent::Attempt)?)
+                .map_err(ctx("a"))?;
+            ledger
+                .append(at(2)?, &entry(LedgerEvent::StaleContainmentCleared)?)
+                .map_err(ctx("b"))?;
+        }
+        let text =
+            std::fs::read_to_string(dir.path().join(ACTION_LEDGER_FILE)).map_err(ctx("read"))?;
+        assert!(text.contains("\"stale-containment-cleared\""));
+        let records = read_verified(dir.path()).map_err(ctx("verify"))?;
+        assert_eq!(
+            records.iter().map(|r| r.entry.event).collect::<Vec<_>>(),
+            [LedgerEvent::Attempt, LedgerEvent::StaleContainmentCleared]
+        );
         Ok(())
     }
 }

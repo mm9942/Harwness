@@ -35,9 +35,18 @@
 //! fällig: kein wachsender Abstand, keine Obergrenze der Versuche, jede
 //! Sekunde neue Audit- und Ledger-Einträge. Der Speicherstand ist für den
 //! laufenden Prozess maßgeblich; die nächste erfolgreiche Änderung schreibt
-//! ihn vollständig. Nach einem Neustart gilt der zuletzt geschriebene Stand
-//! (ein Hold ist dann früher fällig oder kommt zurück) — unbedenklich, weil
-//! der Hold-Timer nur auftaut und das Ziel vorher erneut prüft.
+//! ihn vollständig. Bis dahin merkt sich der Speicher, dass er ungesichert
+//! ist: dann schreibt auch ein [`HoldStore::cancel`] ohne Hold des Pfads die
+//! Datei neu (scheitert das, scheitert `cancel`, und der Freeze, der damit
+//! einen Hold aufheben wollte, wird nicht ausgeführt), und
+//! [`HoldStore::flush`] schreibt den Stand nach (der Hold-Timer ruft das
+//! regelmäßig auf). Sonst käme ein nur im Speicher entfernter Hold nach einem
+//! Neustart zurück und taute einen späteren Freeze „bis zur Aufhebung“
+//! derselben cgroup auf. Bleibt der Speicher bis zu einem Neustart
+//! unschreibbar, gilt danach der zuletzt geschriebene Stand (ein Hold ist
+//! dann früher fällig oder kommt zurück); der Hold-Timer taut dann nur auf,
+//! wenn der Warden für die cgroup eine nicht freigegebene Eindämmung aus
+//! diesem Boot führt (`warden.rs`, `expire_one`).
 //!
 //! # Examples
 //! ```rust
@@ -104,7 +113,15 @@ struct HoldFile {
 #[derive(Debug)]
 pub struct HoldStore {
     dir: PathBuf,
-    holds: Mutex<Vec<HoldEntry>>,
+    state: Mutex<HoldState>,
+}
+
+// Die laufenden Holds und ob sie vom zuletzt geschriebenen Stand abweichen
+// (ein Schreiben des Hold-Timers scheiterte; siehe Moduldoku).
+#[derive(Debug, Default)]
+struct HoldState {
+    holds: Vec<HoldEntry>,
+    unsaved: bool,
 }
 
 impl HoldStore {
@@ -141,7 +158,10 @@ impl HoldStore {
         };
         Ok(Self {
             dir: dir.to_path_buf(),
-            holds: Mutex::new(holds),
+            state: Mutex::new(HoldState {
+                holds,
+                unsaved: false,
+            }),
         })
     }
 
@@ -154,8 +174,9 @@ impl HoldStore {
     ///   [`WardenError::Io`]: Sperre oder Schreiben scheitert (alter Stand
     ///   bleibt).
     pub fn arm(&self, entry: HoldEntry) -> WardenResult<()> {
-        let mut holds = self.holds.lock().map_err(|_| WardenError::StatePoisoned)?;
-        let mut next: Vec<HoldEntry> = holds
+        let mut state = self.lock()?;
+        let mut next: Vec<HoldEntry> = state
+            .holds
             .iter()
             .filter(|hold| hold.target.path != entry.target.path)
             .cloned()
@@ -168,26 +189,38 @@ impl HoldStore {
         }
         next.push(entry);
         self.persist(&next)?;
-        *holds = next;
+        // Geschrieben ist der ganze Stand, auch ein vorher ungesicherter.
+        state.holds = next;
+        state.unsaved = false;
         Ok(())
     }
 
     /// Removes the hold for `path`; returns whether one existed.
     ///
+    /// # Description
+    /// Gibt es keinen Hold für `path`, schreibt die Methode nur, wenn der
+    /// Stand im Speicher ungesichert ist (siehe Moduldoku): so kommt ein nur
+    /// im Speicher entfernter Hold desselben Pfads nicht zurück.
+    ///
     /// # Errors
     /// Wie [`Self::arm`] (Sperre, Kodierung, Schreiben).
     pub fn cancel(&self, path: &CgroupId) -> WardenResult<bool> {
-        let mut holds = self.holds.lock().map_err(|_| WardenError::StatePoisoned)?;
-        if !holds.iter().any(|hold| hold.target.path == *path) {
+        let mut state = self.lock()?;
+        if !state.holds.iter().any(|hold| hold.target.path == *path) {
+            if state.unsaved {
+                self.sync(&mut state)?;
+            }
             return Ok(false);
         }
-        let next: Vec<HoldEntry> = holds
+        let next: Vec<HoldEntry> = state
+            .holds
             .iter()
             .filter(|hold| hold.target.path != *path)
             .cloned()
             .collect();
         self.persist(&next)?;
-        *holds = next;
+        state.holds = next;
+        state.unsaved = false;
         Ok(true)
     }
 
@@ -207,13 +240,17 @@ impl HoldStore {
     /// - [`WardenError::Encode`] / [`WardenError::Io`]: nur das Schreiben
     ///   scheiterte; der Speicherstand ist bereits geändert.
     pub fn reschedule(&self, path: &CgroupId, thaw_at: Timestamp) -> WardenResult<bool> {
-        let mut holds = self.holds.lock().map_err(|_| WardenError::StatePoisoned)?;
-        let Some(hold) = holds.iter_mut().find(|hold| hold.target.path == *path) else {
+        let mut state = self.lock()?;
+        let Some(hold) = state
+            .holds
+            .iter_mut()
+            .find(|hold| hold.target.path == *path)
+        else {
             return Ok(false);
         };
         hold.thaw_at = thaw_at;
         hold.attempts = hold.attempts.saturating_add(1);
-        self.persist(&holds)?;
+        self.sync(&mut state)?;
         Ok(true)
     }
 
@@ -233,14 +270,32 @@ impl HoldStore {
     /// - [`WardenError::Encode`] / [`WardenError::Io`]: nur das Schreiben
     ///   scheiterte; der Hold ist im Speicher bereits entfernt.
     pub fn forget(&self, path: &CgroupId) -> WardenResult<bool> {
-        let mut holds = self.holds.lock().map_err(|_| WardenError::StatePoisoned)?;
-        let before = holds.len();
-        holds.retain(|hold| hold.target.path != *path);
-        if holds.len() == before {
+        let mut state = self.lock()?;
+        let before = state.holds.len();
+        state.holds.retain(|hold| hold.target.path != *path);
+        if state.holds.len() == before {
             return Ok(false);
         }
-        self.persist(&holds)?;
+        self.sync(&mut state)?;
         Ok(true)
+    }
+
+    /// Writes the in-memory holds if an earlier write of the hold timer failed.
+    ///
+    /// # Description
+    /// Ohne ungesicherten Stand schreibt die Methode nichts (siehe
+    /// Moduldoku, „Buchführung des Hold-Timers auch ohne Schreibzugriff“).
+    ///
+    /// # Errors
+    /// - [`WardenError::StatePoisoned`]: Mutex vergiftet.
+    /// - [`WardenError::Encode`] / [`WardenError::Io`]: das Schreiben
+    ///   scheitert erneut (der Stand bleibt ungesichert).
+    pub fn flush(&self) -> WardenResult<()> {
+        let mut state = self.lock()?;
+        if !state.unsaved {
+            return Ok(());
+        }
+        self.sync(&mut state)
     }
 
     /// Returns the holds due at `now` (`thaw_at <= now`), oldest first.
@@ -248,8 +303,9 @@ impl HoldStore {
     /// # Errors
     /// - [`WardenError::StatePoisoned`]: Mutex vergiftet.
     pub fn due(&self, now: Timestamp) -> WardenResult<Vec<HoldEntry>> {
-        let holds = self.holds.lock().map_err(|_| WardenError::StatePoisoned)?;
-        let mut due: Vec<HoldEntry> = holds
+        let state = self.lock()?;
+        let mut due: Vec<HoldEntry> = state
+            .holds
             .iter()
             .filter(|hold| hold.thaw_at <= now)
             .cloned()
@@ -263,11 +319,19 @@ impl HoldStore {
     /// # Errors
     /// - [`WardenError::StatePoisoned`]: Mutex vergiftet.
     pub fn snapshot(&self) -> WardenResult<Vec<HoldEntry>> {
-        Ok(self
-            .holds
-            .lock()
-            .map_err(|_| WardenError::StatePoisoned)?
-            .clone())
+        Ok(self.lock()?.holds.clone())
+    }
+
+    // Die Sperre um den Stand.
+    fn lock(&self) -> WardenResult<std::sync::MutexGuard<'_, HoldState>> {
+        self.state.lock().map_err(|_| WardenError::StatePoisoned)
+    }
+
+    // Schreibt den Stand im Speicher und merkt sich, ob er damit gesichert ist.
+    fn sync(&self, state: &mut HoldState) -> WardenResult<()> {
+        let written = self.persist(&state.holds);
+        state.unsaved = written.is_err();
+        written
     }
 
     // Schreibt den Schnappschuss atomar.
@@ -405,6 +469,43 @@ mod tests {
             reopened.snapshot().map_err(ctx("snapshot"))?,
             vec![hold("harw.slice/a", 100)?, hold("harw.slice/b", 100)?]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_hold_forgotten_only_in_memory_never_comes_back() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = HoldStore::open(dir.path()).map_err(ctx("open"))?;
+        store.arm(hold("harw.slice/a", 100)?).map_err(ctx("arm"))?;
+        let path = CgroupId::try_from_str("harw.slice/a").map_err(ctx("cgroup"))?;
+        block_writes(dir.path())?;
+        assert!(store.forget(&path).is_err());
+        // Solange der Stand ungesichert ist, scheitert auch ein `cancel` ohne
+        // Hold des Pfads: der Freeze, der damit aufheben wollte, läuft nicht.
+        assert!(store.cancel(&path).is_err());
+        assert!(store.flush().is_err());
+        let tmp = dir.path().join(format!("{HOLDS_FILE}.tmp"));
+        std::fs::remove_file(&tmp).map_err(ctx("unblock writes"))?;
+        // `cancel` schreibt den Stand nach, obwohl im Speicher nichts zu tun ist.
+        assert!(!store.cancel(&path).map_err(ctx("cancel"))?);
+        let reopened = HoldStore::open(dir.path()).map_err(ctx("reopen"))?;
+        assert!(reopened.snapshot().map_err(ctx("snapshot"))?.is_empty());
+        drop(reopened);
+
+        // Ebenso `flush` (Hold-Timer); ein gesicherter Stand schreibt nichts.
+        store
+            .arm(hold("harw.slice/b", 100)?)
+            .map_err(ctx("arm b"))?;
+        let b = CgroupId::try_from_str("harw.slice/b").map_err(ctx("cgroup"))?;
+        block_writes(dir.path())?;
+        assert!(store.forget(&b).is_err());
+        std::fs::remove_file(&tmp).map_err(ctx("unblock again"))?;
+        store.flush().map_err(ctx("flush"))?;
+        let reopened = HoldStore::open(dir.path()).map_err(ctx("reopen b"))?;
+        assert!(reopened.snapshot().map_err(ctx("snapshot b"))?.is_empty());
+        block_writes(dir.path())?;
+        store.flush().map_err(ctx("flush without changes"))?;
+        assert!(!store.cancel(&b).map_err(ctx("cancel saved"))?);
         Ok(())
     }
 

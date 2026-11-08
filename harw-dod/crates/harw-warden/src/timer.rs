@@ -10,7 +10,11 @@
 //! der sofort nach dem Start (überfällige Holds aus der Ausfallzeit) und
 //! danach alle [`HOLD_SWEEP_INTERVAL`] einen Durchlauf startet und die Uhr
 //! liest. Ein blockierter Timer (Sperre oder Hold-Speicher) wird nur beim
-//! Zustandswechsel geloggt, nicht jede Sekunde.
+//! Zustandswechsel geloggt, nicht jede Sekunde. Derselbe Durchlauf räumt
+//! höchstens alle `harw_dod_warden::warden::CONTAINMENT_SWEEP_SECS`
+//! Eindämmungsmarker verschwundener cgroups und liegengebliebene Marker
+//! freigegebener Eindämmungen ab (`HoldSweep::cleared`, Owner-Review
+//! 4505015305).
 //!
 //! # Nebenläufigkeit
 //! Der Thread teilt den `Arc<Warden>` mit den Verbindungs-Threads; der
@@ -75,11 +79,12 @@ fn log_sweep(sweep: HoldSweep, previously_blocked: bool) -> bool {
             "hold timer gave up thawing; the cgroups stay frozen until a signed thaw"
         );
     }
-    if sweep.thawed > 0 || sweep.dropped > 0 || sweep.retried > 0 {
+    if sweep.thawed > 0 || sweep.dropped > 0 || sweep.retried > 0 || sweep.cleared > 0 {
         tracing::info!(
             thawed = sweep.thawed,
             dropped = sweep.dropped,
             retried = sweep.retried,
+            cleared_containments = sweep.cleared,
             "hold timer sweep finished"
         );
     }
@@ -104,6 +109,7 @@ mod tests {
             dropped: 1,
             retried: 1,
             abandoned: 1,
+            cleared: 1,
             blocked: true,
         };
         assert!(log_sweep(busy, false));
@@ -111,5 +117,11 @@ mod tests {
         assert!(log_sweep(busy, true));
         // Wieder frei.
         assert!(!log_sweep(HoldSweep::default(), true));
+        // Nur abgeräumte Eindämmungen: kein blockierter Zustand.
+        let cleared = HoldSweep {
+            cleared: 2,
+            ..HoldSweep::default()
+        };
+        assert!(!log_sweep(cleared, false));
     }
 }

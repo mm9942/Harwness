@@ -27,6 +27,12 @@
 //!   [`harw_dod_warden::CgroupFsObserver`] auf derselben Wurzel; der
 //!   `CgroupV2Executor` prüft die Kernel-ID beim Eingriff noch einmal am
 //!   geöffneten Verzeichnis und schreibt über denselben Deskriptor (B21).
+//! - Die Eindämmungsmarker für harw liegen unter `holds_dir`
+//!   ([`harw_dod_warden::ContainmentMarkers`], Vorgabe
+//!   [`harw_dod_warden::DEFAULT_HOLDS_DIR`], `--holds-dir`); der Zusammenbau
+//!   greift nicht darauf zu, erst der Abgleich beim Start
+//!   ([`harw_dod_warden::Warden::reconcile_containments`]), jeder Freeze und
+//!   jedes Freigeben.
 //! - Das Audit-Ziel ist [`crate::audit::TracingAuditSink`].
 //! - Schlüsselring, Policy und Zustand lädt `main::run` vorher (vor
 //!   Landlock) und reicht sie hier nur durch.
@@ -38,8 +44,8 @@
 use std::path::Path;
 
 use harw_dod_warden::{
-    CgroupFsObserver, CgroupV2Executor, NetworkIsolator, Warden, WardenParts, WardenPolicy,
-    WardenState,
+    CgroupFsObserver, CgroupV2Executor, ContainmentMarkers, NetworkIsolator, Warden, WardenParts,
+    WardenPolicy, WardenState,
 };
 use harw_dod_warden_proto::KeyRing;
 
@@ -64,6 +70,8 @@ pub struct ProductionWarden {
 /// # Arguments
 /// - `cgroup_root` (`&Path`): Wurzelverzeichnis der cgroup-v2-Hierarchie
 ///   (Produktion: `/sys/fs/cgroup`, siehe [`crate::cli::DEFAULT_CGROUP_ROOT`]).
+/// - `holds_dir` (`&Path`): Indexverzeichnis der Eindämmungsmarker für harw
+///   (Produktion: [`harw_dod_warden::DEFAULT_HOLDS_DIR`]).
 /// - `keys` (`KeyRing`): gültige Proof-Schlüssel aus `proof_key_dir`.
 /// - `policy` (`WardenPolicy`): Policy aus `warden.toml`.
 /// - `state` (`WardenState`): geöffnetes StateDirectory.
@@ -73,6 +81,7 @@ pub struct ProductionWarden {
 #[must_use]
 pub fn build_production_warden(
     cgroup_root: &Path,
+    holds_dir: &Path,
     keys: KeyRing,
     policy: WardenPolicy,
     state: WardenState,
@@ -88,6 +97,7 @@ pub fn build_production_warden(
         keys,
         policy,
         state,
+        markers: ContainmentMarkers::new(holds_dir),
     });
     ProductionWarden { warden, sandbox }
 }
@@ -111,7 +121,7 @@ fn network_isolator(
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     use super::build_production_warden;
     use crate::isolation::SandboxNeeds;
@@ -178,19 +188,31 @@ mod tests {
         ))
     }
 
+    // Ein Indexverzeichnis wie `/run/harw-warden/holds` (`0755`, eigener Nutzer).
+    fn holds_dir(run: &tempfile::TempDir) -> TestResult<std::path::PathBuf> {
+        let holds = run.path().join("holds");
+        std::fs::create_dir(&holds).map_err(ctx("holds dir"))?;
+        std::fs::set_permissions(&holds, std::fs::Permissions::from_mode(0o755))
+            .map_err(ctx("chmod holds dir"))?;
+        Ok(holds)
+    }
+
     /// Ende zu Ende über die produktive Verdrahtung, aber gegen ein Tempdir
     /// als cgroup-Wurzel: Zielprüfung über die Inode, echtes Schreiben von
-    /// `cgroup.freeze`, Ledger im StateDirectory.
+    /// `cgroup.freeze`, Ledger im StateDirectory, Marker für harw unter dem
+    /// Indexverzeichnis (benannt nach der Inode der cgroup) bis zum Thaw.
     #[test]
     fn test_production_warden_freezes_a_fixture_cgroup_after_inode_check() -> TestResult {
         let root = tempfile::tempdir().map_err(ctx("cgroup root"))?;
+        let run = tempfile::tempdir().map_err(ctx("run dir"))?;
+        let holds = holds_dir(&run)?;
         let state_dir = private_tempdir()?;
         let job = root.path().join("harw.slice").join("job-1");
         std::fs::create_dir_all(&job).map_err(ctx("mkdir"))?;
         let inode = std::fs::metadata(&job).map_err(ctx("metadata"))?.ino();
         let state =
             WardenState::open(state_dir.path(), at(1_800_000_000)?).map_err(ctx("state"))?;
-        let warden = build_production_warden(root.path(), keys()?, policy()?, state).warden;
+        let warden = build_production_warden(root.path(), &holds, keys()?, policy()?, state).warden;
 
         let action = WardenAction::FreezeCgroup {
             cgroup: CgroupId::try_from_str("harw.slice/job-1").map_err(ctx("cgroup"))?,
@@ -212,6 +234,29 @@ mod tests {
         let written =
             std::fs::read_to_string(job.join("cgroup.freeze")).map_err(ctx("freeze written"))?;
         assert_eq!(written, "1");
+        let marker = holds.join(inode.to_string());
+        assert!(marker.is_file());
+        // Der Abgleich (wie nach einem Neustart) lässt die eingefrorene
+        // Eindämmung samt Marker stehen.
+        let reconciled = warden.reconcile_containments().map_err(ctx("reconcile"))?;
+        assert_eq!(reconciled.kept, 1);
+        assert_eq!(reconciled.vanished, 0);
+        assert_eq!(reconciled.thawed, 0);
+        assert!(marker.is_file());
+
+        let thaw = WardenAction::ThawCgroup {
+            cgroup: CgroupId::try_from_str("harw.slice/job-1").map_err(ctx("cgroup"))?,
+        };
+        let thawed = warden.handle(&request(&thaw, inode, 3)?, at(1_800_000_002)?);
+        if !matches!(thawed, WardenOutcome::Executed(_)) {
+            return Err(TestError::Unexpected(format!(
+                "expected Executed, got {thawed:?}"
+            )));
+        }
+        let written =
+            std::fs::read_to_string(job.join("cgroup.freeze")).map_err(ctx("thaw written"))?;
+        assert_eq!(written, "0");
+        assert!(!marker.exists());
         Ok(())
     }
 
@@ -253,6 +298,7 @@ mod tests {
             WardenState::open(state_dir.path(), at(1_800_000_000)?).map_err(ctx("state"))?;
         let production = build_production_warden(
             std::path::Path::new("/sys/fs/cgroup"),
+            std::path::Path::new(harw_dod_warden::DEFAULT_HOLDS_DIR),
             keys()?,
             policy()?,
             state,
@@ -281,6 +327,7 @@ mod tests {
         );
         let production = build_production_warden(
             std::path::Path::new("/sys/fs/cgroup"),
+            std::path::Path::new(harw_dod_warden::DEFAULT_HOLDS_DIR),
             keys()?,
             policy,
             state,
@@ -310,6 +357,7 @@ mod tests {
             WardenState::open(state_dir.path(), at(1_800_000_000)?).map_err(ctx("state"))?;
         let warden = build_production_warden(
             std::path::Path::new("/nonexistent-harw-warden-mock-root"),
+            std::path::Path::new("/nonexistent-harw-warden-mock-holds"),
             keys()?,
             policy()?,
             state,

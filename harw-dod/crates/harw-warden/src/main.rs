@@ -98,6 +98,24 @@
 //! (dann für das `nft`-Kindprozess-Backend, siehe [`isolation`]). Ein nicht
 //! installierbarer Filter ist ein harter Startfehler wie bei Landlock.
 //!
+//! # Eindämmungsmarker für harw (Owner-Review 4505015305)
+//! Jeder Freeze legt einen Marker `<--holds-dir>/<Kernel-ID>` an (Vorgabe
+//! `/run/harw-warden/holds`, tmpfiles; siehe `harw_dod_warden::containment`),
+//! und harws `job.resume` taut eine markierte cgroup nie auf. Landlock
+//! erlaubt dort nur Marker anlegen, auflisten und entfernen
+//! ([`landlock::holds_index_access`]), seccomp die Aufrufe dafür (`flock`,
+//! `unlinkat` ohne `AT_REMOVEDIR`, `getdents64`, `geteuid`). Nach beiden und
+//! vor dem Hold-Timer und der ersten Anfrage gleicht
+//! [`harw_dod_warden::Warden::reconcile_containments`] Marker, Datensätze,
+//! Holds und cgroups ab (Absturz zwischen zwei Schritten des Protokolls); ein
+//! fehlendes, fremdes oder schreibbares Indexverzeichnis ist ein harter
+//! Startfehler. Die Boot-ID, mit der der Eindämmungsspeicher Datensätze
+//! früherer Boots erkennt (`/proc/sys/kernel/random/boot_id`), liest
+//! `WardenState::open` vor Landlock; ist sie nicht lesbar, gilt kein
+//! gespeicherter Datensatz als aus diesem Boot (fail closed, eine
+//! `warn`-Zeile beim Start). Im Betrieb räumt der Hold-Timer
+//! Eindämmungen verschwundener cgroups ab ([`timer`]).
+//!
 //! # Warum `SO_PEERCRED`, nicht ein Token im Rumpf
 //! Siehe [`ipc`]-Moduldoku, Abschnitt „Warum `SO_PEERCRED`, nicht ein Token
 //! im Rumpf": `harw_dod_warden`s eigene Dokumentation benennt die
@@ -283,14 +301,20 @@ fn init_tracing(level: cli::LogLevel) {
 ///    ([`warden_factory::build_production_warden`], reiner Zusammenbau);
 ///    er liefert auch den Sandbox-Bedarf des Netfilter-Backends (leer ohne
 ///    erlaubte Netzaktion);
-/// 7. **dann** über Landlock auf `cli.cgroup_root`, `cli.state_dir` und
-///    diesen Bedarf einschränken (harter Abbruch bei jedem Ausgang außer
-///    vollständiger Durchsetzung, siehe [`landlock`]-Moduldoku) — Policy,
-///    Schlüssel und `/etc/passwd` sind danach unerreichbar;
+/// 7. **dann** über Landlock auf `cli.cgroup_root`, `cli.state_dir`,
+///    `cli.holds_dir` (nur Marker) und diesen Bedarf einschränken (harter
+///    Abbruch bei jedem Ausgang außer vollständiger Durchsetzung, siehe
+///    [`landlock`]-Moduldoku) — Policy, Schlüssel und `/etc/passwd` sind
+///    danach unerreichbar;
 /// 8. die seccomp-Allowlist für alle Threads binden ([`seccomp::install`],
 ///    PL-100 O10; harter Abbruch, wenn das scheitert);
-/// 9. den Hold-Timer starten ([`timer::spawn_hold_sweeper`]) und die
-///    Annahmeschleife starten ([`ipc::serve_forever`]).
+/// 9. die Eindämmungsmarker abgleichen
+///    ([`harw_dod_warden::Warden::reconcile_containments`]) — erst nach
+///    Landlock und seccomp, damit schon der Start die erlaubten Pfade und
+///    Aufrufe des Marker-Protokolls prüft; ein unbrauchbares
+///    Indexverzeichnis ist ein harter Abbruch;
+/// 10. den Hold-Timer starten ([`timer::spawn_hold_sweeper`]) und die
+///     Annahmeschleife starten ([`ipc::serve_forever`]).
 ///
 /// Der Socket selbst wird
 /// vor Landlock erworben, weil er ein bereits von systemd geöffneter,
@@ -314,7 +338,9 @@ fn init_tracing(level: cli::LogLevel) {
 /// [`WardenBinError::ListenPidForeign`]/[`WardenBinError::ListenFdsMissing`]/
 /// [`WardenBinError::ListenFdsMalformed`]/[`WardenBinError::UnexpectedListenFdCount`]/
 /// [`WardenBinError::ListenFdsAcquisitionFailed`]: siehe [`systemd`].
-/// [`WardenBinError::Setup`]: Policy, Schlüssel oder StateDirectory.
+/// [`WardenBinError::Setup`]: Policy, Schlüssel, StateDirectory oder das
+/// Indexverzeichnis der Eindämmungsmarker (fehlt, Symlink, fremder
+/// Eigentümer, gruppen- oder weltschreibbar).
 /// [`WardenBinError::PasswdUnreadable`]/[`WardenBinError::PasswdTooLarge`]/
 /// [`WardenBinError::EscalatorUserUnknown`]/
 /// [`WardenBinError::EscalatorUserAmbiguous`]/[`WardenBinError::EscalatorUidRoot`]:
@@ -383,16 +409,37 @@ fn run(cli: Cli) -> Result<(), WardenBinError> {
     // Vor Landlock und seccomp (`prctl`): ohne `CAP_NET_ADMIN` in der
     // Ambient-Menge scheiterte jede Isolation erst im Ernstfall.
     require_net_admin(network_actions, net_admin_in_ambient_set)?;
-    let production =
-        warden_factory::build_production_warden(&cli.cgroup_root, keys, config.policy, state);
+    // Eindämmungsmarker für harw (Owner-Review 4505015305) unter
+    // `cli.holds_dir`; der Zusammenbau greift noch nicht darauf zu.
+    let production = warden_factory::build_production_warden(
+        &cli.cgroup_root,
+        &cli.holds_dir,
+        keys,
+        config.policy,
+        state,
+    );
 
-    landlock::enforce_runtime_scope(&cli.cgroup_root, &cli.state_dir, &production.sandbox)?;
+    landlock::enforce_runtime_scope(
+        &cli.cgroup_root,
+        &cli.state_dir,
+        &cli.holds_dir,
+        &production.sandbox,
+    )?;
     let profile = seccomp::install(&production.sandbox.syscalls)?;
     tracing::info!(
         allowed_syscalls = profile.allowed_count(),
         network_actions,
         "seccomp allowlist installed for all threads"
     );
+
+    // Vor dem Hold-Timer und der ersten Anfrage, unter Landlock und seccomp.
+    if production.warden.state().containment().boot_id().is_none() {
+        tracing::warn!(
+            "boot id unreadable; stored containment records are not trusted as from this boot and are discarded (fail closed)"
+        );
+    }
+    let reconciled = production.warden.reconcile_containments()?;
+    log_reconciliation(&reconciled);
 
     let warden = Arc::new(production.warden);
     let gate = Arc::new(peer::PeerGate::new(escalator_uid));
@@ -401,6 +448,50 @@ fn run(cli: Cli) -> Result<(), WardenBinError> {
 
     ipc::serve_forever(listen_fd, warden, gate);
     Err(WardenBinError::IpcAcceptLoopTerminated)
+}
+
+/// Logs the startup reconciliation of the containment markers (counts only, no paths).
+///
+/// # Description
+/// Eine `info`-Zeile mit allen Zählern; `warn`-Zeilen, wenn die Sperre des
+/// Indexverzeichnisses nicht zu bekommen war (jeder lokale Nutzer kann sie
+/// halten; der Abgleich lief trotzdem), wenn Marker oder Eindämmungen
+/// ungeklärt stehen bleiben (sie halten `job.resume` zurück, bis ein
+/// signierter Thaw sie abräumt), und getrennt davon, wenn das
+/// Indexverzeichnis Einträge enthält, die keine Marker sind (sie sperren
+/// kein `job.resume` einer echten Kernel-ID und werden nie entfernt).
+/// Einzelheiten je Kernel-ID stehen im Audit (`ContainmentCleared`,
+/// `ContainmentRestored`, `ContainmentCompleted`, `ContainmentUnresolved`).
+///
+/// # Arguments
+/// - `report` (`&harw_dod_warden::ContainmentReconciliation`): das Ergebnis.
+fn log_reconciliation(report: &harw_dod_warden::ContainmentReconciliation) {
+    if !report.index_locked {
+        tracing::warn!("containment index lock not obtained at startup; reconciled without it");
+    }
+    tracing::info!(
+        kept = report.kept,
+        restored = report.restored,
+        completed = report.completed,
+        vanished = report.vanished,
+        thawed = report.thawed,
+        released = report.released,
+        "containment markers reconciled"
+    );
+    if report.unresolved > 0 || report.orphaned > 0 {
+        tracing::warn!(
+            unresolved = report.unresolved,
+            orphaned = report.orphaned,
+            "containment markers left in place; job.resume stays refused for them until a signed thaw clears them"
+        );
+    }
+    if report.foreign > 0 || report.truncated {
+        tracing::warn!(
+            foreign = report.foreign,
+            truncated = report.truncated,
+            "containment index holds entries that are not markers (or more than were read); they are ignored and never removed"
+        );
+    }
 }
 
 /// Refuses to start when network actions are allowed but an `nft` child would lack `CAP_NET_ADMIN`.
@@ -476,9 +567,11 @@ mod tests {
     }
 
     /// Die Unit muss zur Sandbox im Code passen: StateDirectory für Ledger
-    /// und Holds (`0700`), der Aufruf `seccomp` für [`super::seccomp::install`]
-    /// (nicht in `@system-service`), die Landlock-Aufrufe und eine
-    /// Capability-Menge ohne `CAP_SYS_ADMIN`.
+    /// und Holds (`0700`), das Indexverzeichnis der Eindämmungsmarker als
+    /// eigener schreibbarer Pfad (kein `RuntimeDirectory=`: Marker müssen
+    /// einen Stopp des Wardens überdauern), der Aufruf `seccomp` für
+    /// [`super::seccomp::install`] (nicht in `@system-service`), die
+    /// Landlock-Aufrufe und eine Capability-Menge ohne `CAP_SYS_ADMIN`.
     #[test]
     fn test_systemd_unit_matches_the_sandbox() -> crate::test_support::TestResult {
         use crate::test_support::TestError;
@@ -489,12 +582,25 @@ mod tests {
             "StateDirectory=harw-warden",
             "StateDirectoryMode=0700",
             "ReadWritePaths=/sys/fs/cgroup /var/lib/harw-warden",
+            "ReadWritePaths=/run/harw-warden/holds",
             "SystemCallFilter=@system-service",
             "NoNewPrivileges=yes",
         ] {
             if !lines.contains(&required) {
                 return Err(TestError::Unexpected(format!("unit lacks {required:?}")));
             }
+        }
+        // Gleicher Pfad wie die Vorgabe von `--holds-dir` (und wie harw liest).
+        let holds_line = format!("ReadWritePaths={}", super::cli::DEFAULT_HOLDS_DIR);
+        assert!(lines.contains(&holds_line.as_str()));
+        // systemd entfernte ein `RuntimeDirectory=` samt Markern beim Stopp.
+        if let Some(runtime) = lines
+            .iter()
+            .find(|line| line.starts_with("RuntimeDirectory"))
+        {
+            return Err(TestError::Unexpected(format!(
+                "markers must outlive a warden stop, found {runtime:?}"
+            )));
         }
         let allowed_calls: Vec<&str> = lines
             .iter()
@@ -531,6 +637,106 @@ mod tests {
     }
 
     #[test]
+    fn test_log_reconciliation_accepts_every_shape() {
+        use harw_dod_warden::ContainmentReconciliation;
+
+        super::log_reconciliation(&ContainmentReconciliation::default());
+        super::log_reconciliation(&ContainmentReconciliation {
+            index_locked: true,
+            kept: 2,
+            restored: 1,
+            completed: 1,
+            vanished: 2,
+            thawed: 3,
+            released: 1,
+            unresolved: 1,
+            orphaned: 1,
+            foreign: 1,
+            truncated: true,
+        });
+        // Nur fremde Einträge: eigene Zeile, keine Behauptung über `job.resume`.
+        super::log_reconciliation(&ContainmentReconciliation {
+            index_locked: true,
+            foreign: 2,
+            ..ContainmentReconciliation::default()
+        });
+    }
+
+    // Fängt die formatierte `tracing`-Ausgabe ein (wie in `audit.rs`).
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("capture poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Die Ausgabe von `log_reconciliation` für `report`.
+    fn reconciliation_log(
+        report: &harw_dod_warden::ContainmentReconciliation,
+    ) -> crate::test_support::TestResult<String> {
+        use crate::test_support::{TestError, ctx};
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || super::log_reconciliation(report));
+        let bytes = capture
+            .0
+            .lock()
+            .map_err(|_| TestError::Missing("capture lock"))?
+            .clone();
+        String::from_utf8(bytes).map_err(ctx("utf-8 log output"))
+    }
+
+    // Fremde Einträge sperren kein `job.resume` und werden nie entfernt; nur
+    // ungeklärte und verwaiste Marker bekommen den Hinweis auf `job.resume`.
+    #[test]
+    fn test_log_reconciliation_keeps_foreign_entries_apart_from_left_markers()
+    -> crate::test_support::TestResult {
+        use harw_dod_warden::ContainmentReconciliation;
+
+        let foreign_only = reconciliation_log(&ContainmentReconciliation {
+            index_locked: true,
+            foreign: 2,
+            truncated: true,
+            ..ContainmentReconciliation::default()
+        })?;
+        assert!(foreign_only.contains("never removed"), "{foreign_only}");
+        assert!(!foreign_only.contains("job.resume"), "{foreign_only}");
+
+        let left = reconciliation_log(&ContainmentReconciliation {
+            index_locked: true,
+            unresolved: 1,
+            orphaned: 1,
+            ..ContainmentReconciliation::default()
+        })?;
+        assert!(left.contains("job.resume stays refused"), "{left}");
+        assert!(!left.contains("never removed"), "{left}");
+
+        let clean = reconciliation_log(&ContainmentReconciliation {
+            index_locked: true,
+            kept: 1,
+            ..ContainmentReconciliation::default()
+        })?;
+        assert!(!clean.contains("WARN"), "{clean}");
+        Ok(())
+    }
+
+    #[test]
     fn test_network_actions_require_net_admin_in_the_ambient_set() {
         use super::{WardenBinError, require_net_admin};
 
@@ -559,6 +765,7 @@ mod tests {
     // echten `Warden` in `warden_factory.rs`, das Wire-Format (v1 abgelehnt)
     // in `protocol.rs`, `ipc::respond` (jede Ablehnung hat eine Antwort) in
     // `ipc.rs`, die Peer-Allowlist in `peer.rs`, der Hold-Timer in `timer.rs`,
+    // `Warden::reconcile_containments` in `harw-dod-warden` (`reconcile.rs`),
     // `audit::TracingAuditSink`/`isolation::NftNetworkIsolator` (samt
     // `NetfilterBackend` mit einem aufzeichnenden Backend) in ihren eigenen
     // Modulen, die seccomp-Allowlist als Profil und BPF-Programm in

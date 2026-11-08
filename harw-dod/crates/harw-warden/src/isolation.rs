@@ -1063,9 +1063,9 @@ mod tests {
     };
     use crate::test_support::{TestError, TestResult, ctx, private_tempdir};
     use harw_dod_warden::{
-        ActionAllowlist, DenyList, NetworkIsolator, RecordingAuditSink, RecordingExecutor,
-        StaticTargetObserver, Warden, WardenError, WardenOutcome, WardenParts, WardenPolicy,
-        WardenResult, WardenState,
+        ActionAllowlist, ContainmentMarkers, DenyList, NetworkIsolator, RecordingAuditSink,
+        RecordingExecutor, StaticTargetObserver, Warden, WardenError, WardenOutcome, WardenParts,
+        WardenPolicy, WardenResult, WardenState,
     };
     use harw_dod_warden_proto::{
         AuthorizationBody, CgroupKernelId, CgroupTarget, Denial, EscalationStage, KeyId, KeyRing,
@@ -1594,6 +1594,8 @@ mod tests {
                 DenyList::builtin(),
             ),
             state: WardenState::open(dir, at(0)?).map_err(ctx("state"))?,
+            // Netzaktionen legen keine Eindämmungsmarker an.
+            markers: ContainmentMarkers::new(dir.join("holds")),
         }))
     }
 
