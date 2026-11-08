@@ -984,6 +984,42 @@ mod tests {
         Ok(())
     }
 
+    /// PL-100 WP0.15, Reader-first (I11): ein Sondenereignis mit
+    /// Prozesskontext (`Actor::process`) kommt über den Socket unverändert
+    /// beim Sentinel an.
+    #[test]
+    fn test_recv_event_reads_the_actor_process_context_of_a_probe() -> TestResult {
+        let event = SecurityEvent {
+            actor: Some(harw_dod_signals::Actor {
+                uid: 1000,
+                auid: Some(1000),
+                cgroup: harw_dod_signals::Actor::raw_cgroup(4_242),
+                process: Some(harw_dod_signals::ProcessContext {
+                    pid: 4_711,
+                    ppid: Some(1),
+                    comm: Some("curl\\u{202e}".to_owned()),
+                    euid: Some(0),
+                }),
+            }),
+            ..sample_event()
+        };
+        let (connection, peer) = connection_with_peer(991)?;
+        let payload = serde_json::to_vec(&event).map_err(ctx("encode event"))?;
+        rustix::net::send(&peer, &payload, SendFlags::empty()).map_err(ctx("send"))?;
+
+        let received = connection
+            .recv_event()
+            .map_err(ctx("recv event"))?
+            .ok_or(TestError::Missing("one event was sent"))?;
+        assert_eq!(received, event);
+        let process = received
+            .actor
+            .and_then(|actor| actor.process)
+            .ok_or(TestError::Missing("process context"))?;
+        assert_eq!((process.pid, process.ppid), (4_711, Some(1)));
+        Ok(())
+    }
+
     /// Kompilierzeit-Beleg für „Push-only": dieser Test benennt genau die
     /// beiden Typen, die laut Moduldoku keine `send`/`write`-Methode
     /// besitzen dürfen. Bekäme `IpcConnection` oder `IpcListener` künftig

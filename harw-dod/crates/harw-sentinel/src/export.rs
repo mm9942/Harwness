@@ -1890,7 +1890,7 @@ mod tests {
     #[test]
     fn test_evidence_card_escapes_and_bounds_a_hostile_comm() -> TestResult {
         let hostile = format!("{}\u{202E}gpj", "\u{1}".repeat(40));
-        let event = egress_with_process(Some(process_context(9, Some(&hostile))));
+        let event = egress_with_process(Some(process_context(9, Some(hostile.as_str()))));
         let card =
             EvidenceCard::from_events(&[&event]).ok_or(TestError::Missing("card of a process"))?;
         let process = card.process.ok_or(TestError::Missing("process"))?;
