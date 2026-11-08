@@ -674,8 +674,11 @@ mod tests {
     #[test]
     fn test_prepare_roots_refuses_a_dot_dot_detour_to_the_root() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let mut detour = dir.path().to_path_buf();
-        for _ in dir.path().components().skip(1) {
+        // Kanonisch, damit ein Symlink im Temp-Pfad (`..` folgt dem
+        // physischen Elternverzeichnis) den Umweg nicht verkürzt.
+        let base = std::fs::canonicalize(dir.path()).map_err(ctx("canonical tempdir"))?;
+        let mut detour = base.clone();
+        for _ in base.components().skip(1) {
             detour.push("..");
         }
         assert_eq!(
