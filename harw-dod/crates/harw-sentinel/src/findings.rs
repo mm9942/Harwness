@@ -375,13 +375,16 @@ pub fn network_scope_from_profile(profile: Option<&ResolvedObservationProfile>) 
 /// Zustand der Regelauswertung über Poll-Zyklen hinweg.
 ///
 /// # Description
-/// Hält die [`BufferMark`] des zuletzt ausgewerteten Zyklus und den
-/// konfigurierten [`NetworkScope`]. [`Self::evaluate`] wertet die Regeln nur
-/// über das seit dieser Marke angekommene Delta aus und rückt die Marke
-/// danach vor (siehe Moduldoku, Abschnitt „Delta-Auswertung statt
-/// Befund-Flut"). Eine neue Instanz beginnt bei [`BufferMark::START`] und
-/// wertet im ersten Zyklus alles aus, was der Ring dann hält (z. B. das vor
-/// dem ersten Zyklus nachgereichte Landlock-Ereignis).
+/// Hält die [`BufferMark`] des zuletzt ausgewerteten Zyklus, den
+/// konfigurierten [`NetworkScope`], den optionalen
+/// [`FindingThrottle`] und die kumulierten Zähler der vor der Auswertung
+/// verdrängten Einträge ([`Self::ring_counters`], `health.json`).
+/// [`Self::evaluate`] wertet die Regeln nur über das seit der Marke
+/// angekommene Delta aus und rückt die Marke danach vor (siehe Moduldoku,
+/// Abschnitt „Delta-Auswertung statt Befund-Flut"). Eine neue Instanz
+/// beginnt bei [`BufferMark::START`] und wertet im ersten Zyklus alles aus,
+/// was der Ring dann hält (z. B. das vor dem ersten Zyklus nachgereichte
+/// Landlock-Ereignis).
 ///
 /// # Concurrency
 /// Lebt ausschließlich im Sammelthread neben dem `Sentinel`; `&mut self`
@@ -389,8 +392,9 @@ pub fn network_scope_from_profile(profile: Option<&ResolvedObservationProfile>) 
 ///
 /// # Examples
 /// ```rust,ignore
-/// let mut rules = RuleCycle::new(NetworkScope::empty());
-/// let reported = rules.evaluate(sentinel.buffer(), &NullSink, now, None);
+/// let mut rules = RuleCycle::new(NetworkScope::empty())
+///     .with_throttle(FindingThrottle::open(ThrottleConfig::default(), None));
+/// let reported = rules.evaluate(sentinel.buffer(), &NullSink, now, &CgroupKids::default(), None);
 /// ```
 #[derive(Debug)]
 pub struct RuleCycle {
@@ -398,10 +402,14 @@ pub struct RuleCycle {
     since: BufferMark,
     /// Erlaubter Netzbereich für [`harw_dod_rules::EgressFlowRule`].
     network_scope: NetworkScope,
+    /// Entprellung wiederholter Befunde; `None` meldet jeden Befund.
+    throttle: Option<FindingThrottle>,
+    /// Seit Prozessstart vor der Auswertung verdrängte Einträge.
+    overflow: RingCounters,
 }
 
 impl RuleCycle {
-    /// Beginnt eine Auswertung bei [`BufferMark::START`].
+    /// Beginnt eine Auswertung bei [`BufferMark::START`], ohne Throttle.
     ///
     /// # Arguments
     /// - `network_scope` (`NetworkScope`): der erlaubte Netzbereich, meist
@@ -411,33 +419,57 @@ impl RuleCycle {
         Self {
             since: BufferMark::START,
             network_scope,
+            throttle: None,
+            overflow: RingCounters::default(),
         }
     }
 
+    /// Entprellt ab jetzt wiederholte Befunde über `throttle` (PL-100
+    /// WP0.4).
+    ///
+    /// # Arguments
+    /// - `throttle` (`FindingThrottle`): im Betrieb mit Zustandsdatei unter
+    ///   `--home` geöffnet (`crate::run`).
+    #[must_use]
+    pub fn with_throttle(mut self, throttle: FindingThrottle) -> Self {
+        self.throttle = Some(throttle);
+        self
+    }
+
+    /// Kumulierte Zähler der Einträge, die der Ring verdrängte, bevor die
+    /// Regeln sie sahen (für `health.json`, PL-100 WP0.13).
+    #[must_use]
+    pub const fn ring_counters(&self) -> RingCounters {
+        self.overflow
+    }
+
     /// Wertet die Regeln über das Delta seit dem vorigen Aufruf aus und
-    /// meldet jeden Befund.
+    /// meldet jeden nicht unterdrückten Befund.
     ///
     /// # Description
     /// Friert über [`EvidenceBuffer::freeze_since`] nur die seit der
     /// gehaltenen Marke angekommenen Einträge ein, ruft [`report_findings`]
     /// darauf auf und rückt die Marke auf den Zählerstand des Puffers vor.
-    /// Verdrängte, nie ausgewertete Einträge werden gezählt und per
-    /// `tracing::warn!` gemeldet (nur Zähler). Scheitert das Einfrieren
-    /// (praktisch unerreichbar, siehe `harw_dod_sentinel::error`), wird das
-    /// Delta mit einer Warnung übersprungen und die Marke trotzdem
-    /// vorgerückt: ein dauerhaft nicht kodierbarer Eintrag soll nicht jede
-    /// spätere Auswertung blockieren.
+    /// Verdrängte, nie ausgewertete Einträge werden kumuliert
+    /// ([`Self::ring_counters`]) und per `tracing::warn!` gemeldet (nur
+    /// Zähler). Scheitert das Einfrieren (praktisch unerreichbar, siehe
+    /// `harw_dod_sentinel::error`), wird das Delta mit einer Warnung
+    /// übersprungen und die Marke trotzdem vorgerückt: ein dauerhaft nicht
+    /// kodierbarer Eintrag soll nicht jede spätere Auswertung blockieren. Am
+    /// Ende schreibt ein vorhandener Throttle seinen Zustand, wenn fällig.
     ///
     /// # Arguments
     /// - `buffer` (`&EvidenceBuffer`): der Puffer des `Sentinel`
     ///   (`Sentinel::buffer`).
     /// - `sink` (`&dyn TelemetrySink`): siehe [`report_findings`].
     /// - `now` (`jiff::Timestamp`): die injizierte Zeit dieses Zyklus.
+    /// - `cgroup_kids` (`&CgroupKids`): Kernel-IDs der in diesem Zyklus
+    ///   aufgelösten Cgroups (`crate::drain_external_events`).
     /// - `exporter` (`Option<&mut FindingsExporter>`): siehe
     ///   [`report_findings`].
     ///
     /// # Returns
-    /// Die Anzahl in diesem Zyklus gemeldeter Befunde.
+    /// Die Anzahl in diesem Zyklus gemeldeter (nicht unterdrückter) Befunde.
     ///
     /// # Concurrency
     /// Siehe Typ-Doku.
@@ -446,12 +478,43 @@ impl RuleCycle {
         buffer: &EvidenceBuffer,
         sink: &dyn TelemetrySink,
         now: Timestamp,
+        cgroup_kids: &CgroupKids,
         exporter: Option<&mut FindingsExporter>,
     ) -> usize {
         let since = self.since;
         self.since = buffer.mark();
-        let delta = match buffer.freeze_since(since, now) {
-            Ok(delta) => delta,
+        let reported = match buffer.freeze_since(since, now) {
+            Ok(delta) => {
+                self.overflow.overflow_samples_total = self
+                    .overflow
+                    .overflow_samples_total
+                    .saturating_add(delta.samples_lost);
+                self.overflow.overflow_events_total = self
+                    .overflow
+                    .overflow_events_total
+                    .saturating_add(delta.events_lost);
+                if delta.samples_lost > 0 || delta.events_lost > 0 {
+                    tracing::warn!(
+                        samples_lost = delta.samples_lost,
+                        events_lost = delta.events_lost,
+                        "evidence ring evicted entries before the rules evaluated them"
+                    );
+                }
+                tracing::debug!(
+                    samples = delta.evidence.samples.len(),
+                    events = delta.evidence.events.len(),
+                    "buffer delta frozen into evidence"
+                );
+                report_findings(
+                    sink,
+                    &delta.evidence,
+                    now,
+                    &self.network_scope,
+                    cgroup_kids,
+                    self.throttle.as_mut(),
+                    exporter,
+                )
+            }
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -459,22 +522,13 @@ impl RuleCycle {
                     events_skipped = buffer.events_since(since).count(),
                     "failed to freeze this cycle's buffer delta; skipping it"
                 );
-                return 0;
+                0
             }
         };
-        if delta.samples_lost > 0 || delta.events_lost > 0 {
-            tracing::warn!(
-                samples_lost = delta.samples_lost,
-                events_lost = delta.events_lost,
-                "evidence ring evicted entries before the rules evaluated them"
-            );
+        if let Some(throttle) = self.throttle.as_mut() {
+            throttle.persist_if_due(now);
         }
-        tracing::debug!(
-            samples = delta.evidence.samples.len(),
-            events = delta.evidence.events.len(),
-            "buffer delta frozen into evidence"
-        );
-        report_findings(sink, &delta.evidence, now, &self.network_scope, exporter)
+        reported
     }
 }
 
