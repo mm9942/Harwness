@@ -532,18 +532,24 @@ pub struct ConfigIdentity {
 /// - `identity`, `snapshot`, `tracker`: configuration identity, sensor
 ///   health and per-sensor counters.
 /// - `ipc`, `ring`: the cumulative counters.
+/// - `spool`: the finding spool writer's counters, `None` without a spool
+///   (written as `"spool": null`).
 /// - `windows`: their windowed deltas ([`WindowDeltas`]).
 /// - `now`: reported as `written_at`.
 ///
 /// # Errors
 /// `serde_json::Error` if serialization fails (practically unreachable for
 /// these field types, but not treated as a panic).
+// Acht Eingänge eines Dokuments, keiner davon ableitbar; ein Bündel-Typ nur
+// für diesen einen Aufrufer brächte nichts (wie `report_findings`).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_document(
     identity: &ConfigIdentity,
     snapshot: &[(SensorId, SensorHealth)],
     tracker: &SensorTracker,
     ipc: IpcCounters,
     ring: RingCounters,
+    spool: Option<&SpoolCounters>,
     windows: &WindowDeltas,
     now: Timestamp,
 ) -> Result<String, serde_json::Error> {
@@ -594,6 +600,7 @@ pub fn encode_document(
             last_cycle_ms: windows.last_cycle_ms,
             last_60s_ms: windows.last_60s_ms,
         },
+        spool: spool.map(|spool| SpoolLine::of(spool, windows)),
     };
     let mut encoded = serde_json::to_string_pretty(&document)?;
     encoded.push('\n');
@@ -678,8 +685,9 @@ pub(crate) fn write_atomically(
 ///
 /// # Description
 /// Holds the target path, the configuration identity reported in every
-/// document, the [`SensorTracker`], and counters for written and failed
-/// documents. See the module documentation for format and failure handling.
+/// document, the [`SensorTracker`], the optional counters of the finding
+/// spool writer, and counters for written and failed documents. See the
+/// module documentation for format and failure handling.
 #[derive(Debug)]
 pub struct HealthExporter {
     path: PathBuf,
@@ -687,6 +695,8 @@ pub struct HealthExporter {
     tracker: SensorTracker,
     /// Per-cycle snapshots behind the windowed deltas.
     windows: WindowTracker,
+    /// Counters of the finding spool writer (`spool`), if one runs.
+    spool: Option<Arc<SpoolStats>>,
     written: u64,
     failures: u64,
     /// Whether the previous write failed (rate-limits the warning).
@@ -702,10 +712,23 @@ impl HealthExporter {
             identity,
             tracker: SensorTracker::default(),
             windows: WindowTracker::default(),
+            spool: None,
             written: 0,
             failures: 0,
             failing: false,
         }
+    }
+
+    /// Reports the finding spool writer from now on (`spool` object, PL-100
+    /// WP0.12).
+    ///
+    /// # Arguments
+    /// - `stats` (`Arc<SpoolStats>`): the writer's shared counters
+    ///   (`crate::spool_writer::SpoolWriter::stats`).
+    #[must_use]
+    pub fn with_spool(mut self, stats: Arc<SpoolStats>) -> Self {
+        self.spool = Some(stats);
+        self
     }
 
     /// Target path of the health document.
@@ -750,6 +773,9 @@ impl HealthExporter {
     /// - `now`: the cycle's timestamp, reported as `written_at`; also the
     ///   time base of the windowed deltas.
     ///
+    /// The spool counters, if [`Self::with_spool`] was set, are read here
+    /// once per cycle.
+    ///
     /// # Returns
     /// `true` if the document was replaced; `false` after a counted and
     /// logged failure. The windowed deltas advance either way.
@@ -763,13 +789,19 @@ impl HealthExporter {
         now: Timestamp,
     ) -> bool {
         self.tracker.observe(before, after, now);
-        let windows = self.windows.record(now, HealthCounters::of(ipc, ring));
+        let spool = self.spool.as_ref().map(|stats| stats.snapshot());
+        let mut current = HealthCounters::of(ipc, ring);
+        if let Some(spool) = spool.as_ref() {
+            current = current.with_spool(spool);
+        }
+        let windows = self.windows.record(now, current);
         let result = encode_document(
             &self.identity,
             after,
             &self.tracker,
             ipc,
             ring,
+            spool.as_ref(),
             &windows,
             now,
         )
@@ -1102,6 +1134,7 @@ mod tests {
             &SensorTracker::default(),
             IpcCounters::default(),
             RingCounters::default(),
+            None,
             &WindowDeltas::default(),
             Timestamp::UNIX_EPOCH,
         )
@@ -1298,6 +1331,7 @@ mod tests {
             &tracker,
             IpcCounters::default(),
             RingCounters::default(),
+            None,
             &WindowDeltas::default(),
             now,
         )
