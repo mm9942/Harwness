@@ -1,6 +1,7 @@
-//! Die Ausführungs-Traits: [`CgroupFreezer`], [`CgroupReleaser`],
+//! Die Ausführungs-Traits: [`CgroupFreezer`], [`CgroupThawer`],
 //! [`NetworkIsolator`], [`ProcessTreeKiller`] — je einer pro
-//! [`harw_dod_warden_proto::WardenAction`]-Variante.
+//! Aktionsfamilie von [`harw_dod_warden_proto::WardenAction`]
+//! (`NetworkIsolator` deckt Isolieren und Aufheben der Isolation ab).
 //!
 //! # Verantwortungsbereich
 //! Jede Aktion, die tatsächlich ins System eingreift, ist hinter einem
@@ -12,20 +13,37 @@
 //! - **Tests ohne echte Wirkung**: [`RecordingExecutor`] implementiert alle
 //!   vier Traits, friert nichts ein, tötet nichts, schneidet kein Netz ab —
 //!   sie zeichnet nur auf, welche Methode mit welcher cgroup aufgerufen
-//!   wurde. Kein Test dieser Crate erzeugt ein echtes Einfrieren, Töten oder
-//!   Netzabschneiden (Brief).
+//!   wurde. Klone teilen sich dasselbe Protokoll, sodass ein Test die
+//!   Reihenfolge über alle vier Rollen hinweg prüfen kann (z. B. „der
+//!   Hold-Timer taut auf, hebt aber keine Isolation auf"). Kein Test dieser
+//!   Crate erzeugt ein echtes Einfrieren, Töten oder Netzabschneiden (Brief).
 //! - **Ein Austausch der Netz-Mechanik ohne Umschreibung**: siehe Abschnitt
 //!   „Warum `NetworkIsolator` keine echte Implementierung hat" unten.
 //!
 //! # Was `CgroupV2Executor` wirklich tut
-//! [`CgroupV2Executor`] implementiert [`CgroupFreezer`], [`CgroupReleaser`]
-//! und [`ProcessTreeKiller`] über einfache Dateisystemschreibzugriffe auf
-//! die cgroup-v2-Kontrolldateien (`cgroup.freeze`, `cgroup.kill`) unterhalb
+//! [`CgroupV2Executor`] implementiert [`CgroupFreezer`], [`CgroupThawer`]
+//! und [`ProcessTreeKiller`] über Schreibzugriffe auf die
+//! cgroup-v2-Kontrolldateien (`cgroup.freeze`, `cgroup.kill`) unterhalb
 //! eines konfigurierbaren Wurzelverzeichnisses (Produktionscode:
-//! `/sys/fs/cgroup`; Tests: ein `tempfile`-Verzeichnis). Das ist reiner
-//! `std::fs`-Code ohne zusätzliche Abhängigkeit — kein `unsafe`, kein
-//! externer Crate für cgroup-Zugriff nötig, weil die cgroup-v2-Schnittstelle
-//! selbst schon eine Textdatei ist.
+//! `/sys/fs/cgroup`; Tests: ein `tempfile`-Verzeichnis). Kein `unsafe`,
+//! keine eigene cgroup-Crate: die cgroup-v2-Schnittstelle ist selbst schon
+//! eine Textdatei.
+//!
+//! # Prüfung und Eingriff über denselben Deskriptor (B21)
+//! Die Ausführungs-Traits bekommen das signierte Ziel-Tripel
+//! ([`CgroupTarget`]), nicht nur den Pfad. [`CgroupV2Executor`] öffnet das
+//! cgroup-Verzeichnis **einmal** (`openat` mit `O_DIRECTORY | O_NOFOLLOW |
+//! O_CLOEXEC`, [`open_pinned_cgroup`]), vergleicht die Inode-Nummer des
+//! geöffneten Deskriptors mit der signierten Kernel-ID und schreibt die
+//! Kontrolldatei danach **relativ zu diesem Deskriptor** (`openat(dirfd,
+//! "cgroup.kill")`). Wird die cgroup zwischen der Zielprüfung des Wardens und
+//! dem Schreiben entfernt und unter demselben Pfad neu angelegt (z. B. ein
+//! neu gestarteter Dienst mit gleichnamigem Scope), zeigt der Deskriptor
+//! weiter auf die alte, entfernte cgroup: das Öffnen der Kontrolldatei
+//! scheitert (`ENOENT`), statt die Nachfolgerin einzufrieren oder zu töten.
+//! Eine abweichende Inode ergibt [`WardenError::TargetChanged`], ein
+//! verschwundenes Ziel `Io(NotFound)` bzw. [`WardenError::TargetNotCgroup`];
+//! der Warden meldet beides als `Denial::TargetChanged`.
 //!
 //! **Zusätzliche, selbst auferlegte Prüfung:** Bevor eine `CgroupId` in
 //! einen Pfad eingebettet wird, prüft [`validate_path_segment`] jedes durch
@@ -38,15 +56,13 @@
 //! `harw.slice/job-1` sind erlaubt, weil Job-cgroups unterhalb eines Slice
 //! liegen (siehe `harw_dod_warden_proto::ProofPolicy::allows_cgroup`,
 //! dieselbe Segment-Grammatik). Eine Präfix-Politik erzwingt dieser Typ
-//! nicht. Symlinks kann cgroupfs nicht enthalten, und in Produktion
-//! beschränkt Landlock (`harw-warden`, `landlock.rs`) Schreibzugriffe auf
-//! die cgroup-Wurzel; `openat2` wird bewusst nicht benutzt, weil es
-//! `unsafe` oder eine neue Abhängigkeit bräuchte. `harw-types` garantiert
-//! für `CgroupId` nur „nicht leer" — keine Pfadsicherheit (siehe
-//! `harw-types/src/ids.rs`, `CgroupId`-Moduldoku zu Kernel-ID-Wiederverwendung,
-//! die aber die *Zeichen* der ID nicht einschränkt). Der Warden glaubt der
-//! Gegenseite nichts (Crate-Moduldoku) — das gilt auch für Feldwerte
-//! innerhalb einer bereits nachgeprüften und zulässigen Aktion.
+//! nicht. Symlinks kann cgroupfs nicht enthalten, das Zielverzeichnis selbst
+//! wird trotzdem mit `O_NOFOLLOW` geöffnet; in Produktion beschränkt
+//! Landlock (`harw-warden`, `landlock.rs`) Schreibzugriffe auf die
+//! cgroup-Wurzel. `harw-types` garantiert für `CgroupId` nur „nicht leer"
+//! — keine Pfadsicherheit. Der Warden glaubt der Gegenseite nichts
+//! (Crate-Moduldoku) — das gilt auch für Feldwerte innerhalb einer bereits
+//! nachgeprüften und zulässigen Aktion.
 //!
 //! # Warum `NetworkIsolator` keine echte Implementierung hat
 //! `harw-dod-netpolicy` (AW3-02) hat die Nahtstelle bereits richtig
@@ -66,9 +82,10 @@
 //!   Kette verschärft einen bereits dokumentierten Befund, statt einen neuen
 //!   zu rechtfertigen.
 //!
-//! **Entscheidung: kein echtes Netz-Backend in diesem Knoten.**
-//! [`NetworkIsolator`] besteht nur aus dem Trait plus
-//! [`RecordingExecutor`]. Ein künftiges echtes Backend implementiert
+//! **Entscheidung: kein echtes Netz-Backend in dieser Crate.**
+//! [`NetworkIsolator`] besteht hier nur aus dem Trait plus
+//! [`RecordingExecutor`]; das produktive Backend liefert das Binary
+//! `harw-warden` (`isolation.rs`). Ein echtes Backend implementiert
 //! [`NetworkIsolator`] in einem eigenen Crate (genau wie
 //! `harw_dod_netpolicy::NetBackend` es für `NetPlan` vorsieht) — das ist ein
 //! Austausch der Implementierung, keine Umschreibung dieses Traits: die
@@ -76,7 +93,15 @@
 //! enthält kein backend-spezifisches Detail (kein Netlink-Handle, kein
 //! `nft`-Prozess-Handle), genau wie `NetBackend::apply` keines enthält.
 
+use std::fs::File;
+use std::io::Write as _;
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use harw_dod_warden_proto::{CgroupKernelId, CgroupTarget};
 use harw_types::CgroupId;
+use rustix::fs::{Mode, OFlags};
 
 use crate::error::{WardenError, WardenResult};
 
@@ -86,45 +111,67 @@ pub trait CgroupFreezer {
     ///
     /// # Description
     /// Wird von [`crate::warden::Warden::handle`] ausschließlich nach
-    /// erfolgreicher Beleg-Nachprüfung aufgerufen.
+    /// erfolgreicher Nachprüfung aufgerufen. Die Implementierung muss die
+    /// Kernel-ID von `target` am Ziel selbst prüfen und darf nur dann
+    /// schreiben (siehe Moduldoku, „Prüfung und Eingriff über denselben
+    /// Deskriptor“).
     ///
     /// # Arguments
-    /// - `cgroup` (`&CgroupId`): die einzufrierende cgroup.
+    /// - `target` (`&CgroupTarget`): das signierte Ziel-Tripel.
     ///
     /// # Returns
     /// `Ok(())` bei Erfolg.
     ///
     /// # Errors
+    /// - [`WardenError::TargetChanged`] / [`WardenError::TargetNotCgroup`] /
+    ///   [`WardenError::Io`] (`NotFound`): das Ziel ist nicht mehr die
+    ///   geprüfte cgroup.
     /// - [`WardenError::InvalidCgroupId`] / [`WardenError::Io`]: siehe
     ///   jeweilige Implementierung.
-    fn freeze(&self, cgroup: &CgroupId) -> WardenResult<()>;
+    fn freeze(&self, target: &CgroupTarget) -> WardenResult<()>;
 }
 
-/// Hebt eine bestehende Eindämmung auf (Aktion
-/// [`harw_dod_warden_proto::WardenAction::ReleaseCgroup`]).
-pub trait CgroupReleaser {
-    /// Gibt die angegebene cgroup frei (hebt Freeze oder Netzisolation auf).
+/// Taut eine eingefrorene cgroup auf (Aktion
+/// [`harw_dod_warden_proto::WardenAction::ThawCgroup`] und Ablauf eines
+/// Hold-Timers).
+///
+/// # Description
+/// Hebt **nur** den Freeze auf, nie eine Netz-Isolation — dafür gibt es
+/// [`NetworkIsolator::release_isolation`] (Aktion `LiftIsolation`). Der
+/// Hold-Timer des Wardens ruft ausschließlich diesen Trait auf (PL-100 WP 3.1:
+/// „der optionale Hold-Timer taut nur auf").
+pub trait CgroupThawer {
+    /// Taut die angegebene cgroup auf (idempotent).
     ///
     /// # Arguments
-    /// - `cgroup` (`&CgroupId`): die freizugebende cgroup.
+    /// - `target` (`&CgroupTarget`): das signierte (bzw. beim Hold
+    ///   gespeicherte) Ziel-Tripel.
     ///
     /// # Returns
-    /// `Ok(())` bei Erfolg.
+    /// `Ok(())` bei Erfolg, auch wenn die cgroup nicht eingefroren war.
     ///
     /// # Errors
-    /// - [`WardenError::InvalidCgroupId`] / [`WardenError::Io`]: siehe
-    ///   jeweilige Implementierung.
-    fn release(&self, cgroup: &CgroupId) -> WardenResult<()>;
+    /// Wie [`CgroupFreezer::freeze`].
+    fn thaw(&self, target: &CgroupTarget) -> WardenResult<()>;
 }
 
-/// Schneidet den Netzzugriff einer cgroup ab (Aktion
-/// [`harw_dod_warden_proto::WardenAction::IsolateNetwork`]).
+/// Schneidet den Netzzugriff einer cgroup ab und hebt ihn wieder auf (Aktionen
+/// [`harw_dod_warden_proto::WardenAction::IsolateNetwork`] und
+/// [`harw_dod_warden_proto::WardenAction::LiftIsolation`]).
 ///
 /// # Description
 /// Siehe Moduldoku, Abschnitt „Warum `NetworkIsolator` keine echte
 /// Implementierung hat" — diese Crate liefert nur [`RecordingExecutor`].
+/// Beide Methoden sind Pflicht: seit `LiftIsolation` eine eigene signierte
+/// Aktion ist, darf kein Isolator ein Aufheben melden, das nichts getan hat.
 pub trait NetworkIsolator {
     /// Isoliert die angegebene cgroup vom Netz.
+    ///
+    /// # Description
+    /// Das nftables-Backend löst den Pfad beim Einfügen selbst auf; der
+    /// Warden beobachtet das Ziel deshalb **nach** dieser Methode erneut und
+    /// hebt die Isolation sofort wieder auf, wenn dort nicht mehr die
+    /// signierte cgroup liegt (`warden.rs`).
     ///
     /// # Arguments
     /// - `cgroup` (`&CgroupId`): die zu isolierende cgroup.
@@ -137,13 +184,17 @@ pub trait NetworkIsolator {
     fn isolate(&self, cgroup: &CgroupId) -> WardenResult<()>;
 
     /// Hebt eine zuvor gesetzte Netz-Isolation wieder auf (idempotent).
-    /// Standard: nichts zu tun (Isolatoren ohne dauerhaften Zustand).
+    ///
+    /// # Description
+    /// Muss auch für eine bereits verschwundene cgroup funktionieren: ihre
+    /// Regeln hängen am Pfad, nicht an einer lebenden cgroup.
+    ///
+    /// # Arguments
+    /// - `cgroup` (`&CgroupId`): die cgroup, deren Isolation aufgehoben wird.
     ///
     /// # Errors
     /// Implementierungsabhängig.
-    fn release_isolation(&self, _cgroup: &CgroupId) -> WardenResult<()> {
-        Ok(())
-    }
+    fn release_isolation(&self, cgroup: &CgroupId) -> WardenResult<()>;
 }
 
 /// Beendet den Prozessbaum einer cgroup (Aktion
@@ -153,15 +204,14 @@ pub trait ProcessTreeKiller {
     /// Beendet den Prozessbaum der angegebenen cgroup.
     ///
     /// # Arguments
-    /// - `cgroup` (`&CgroupId`): die cgroup, deren Prozessbaum beendet wird.
+    /// - `target` (`&CgroupTarget`): das signierte Ziel-Tripel.
     ///
     /// # Returns
     /// `Ok(())` bei Erfolg.
     ///
     /// # Errors
-    /// - [`WardenError::InvalidCgroupId`] / [`WardenError::Io`]: siehe
-    ///   jeweilige Implementierung.
-    fn kill(&self, cgroup: &CgroupId) -> WardenResult<()>;
+    /// Wie [`CgroupFreezer::freeze`].
+    fn kill(&self, target: &CgroupTarget) -> WardenResult<()>;
 }
 
 /// Weist eine cgroup-Kennung als sicheren relativen Pfad unterhalb der
@@ -172,12 +222,14 @@ pub trait ProcessTreeKiller {
 /// jedes durch `/` getrennte Segment einzeln und lehnt jede Kennung ab, die
 /// die Wurzel ersetzen oder aus ihr herausführen würde. Mehrstufige Pfade
 /// wie `harw.slice/job-1` sind zulässig; `a..b` ist ein gewöhnlicher Name.
+/// Auch [`crate::observe::CgroupFsObserver`] nutzt diese Prüfung, bevor es
+/// ein Ziel beobachtet.
 ///
 /// # Errors
 /// - [`WardenError::InvalidCgroupId`]: ein Segment ist leer (führender,
 ///   abschließender oder doppelter `/`), ein Segment ist `.` oder `..`,
 ///   oder ein Segment enthält ein Steuerzeichen (einschließlich NUL).
-fn validate_path_segment(cgroup: &CgroupId) -> WardenResult<&str> {
+pub(crate) fn validate_path_segment(cgroup: &CgroupId) -> WardenResult<&str> {
     let value = cgroup.as_str();
     let valid = value.split('/').all(|segment| {
         !segment.is_empty()
@@ -191,16 +243,67 @@ fn validate_path_segment(cgroup: &CgroupId) -> WardenResult<&str> {
     Ok(value)
 }
 
+/// Opens the cgroup directory at `path` once and checks its kernel id on the descriptor.
+///
+/// # Description
+/// `openat(AT_FDCWD, path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`,
+/// dann `fstat` am Deskriptor: die Inode-Nummer muss `expected` sein. Alles,
+/// was danach relativ zu diesem Deskriptor geöffnet wird, gehört zu genau
+/// dieser cgroup — auch wenn unter `path` inzwischen eine andere liegt.
+///
+/// # Arguments
+/// - `path` (`&Path`): absoluter Pfad des cgroup-Verzeichnisses.
+/// - `expected` (`CgroupKernelId`): die signierte Kernel-ID.
+///
+/// # Returns
+/// Den geöffneten Verzeichnis-Deskriptor.
+///
+/// # Errors
+/// - [`WardenError::Io`] (`NotFound`): das Ziel existiert nicht (mehr).
+/// - [`WardenError::TargetNotCgroup`]: kein Verzeichnis oder ein Symlink.
+/// - [`WardenError::TargetChanged`]: andere Kernel-ID.
+/// - [`WardenError::Io`]: jeder andere Öffnungs- oder `fstat`-Fehler.
+pub(crate) fn open_pinned_cgroup(path: &Path, expected: CgroupKernelId) -> WardenResult<File> {
+    let fd = rustix::fs::openat(
+        rustix::fs::CWD,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(pin_error)?;
+    let dir = File::from(fd);
+    let metadata = dir.metadata()?;
+    if !metadata.is_dir() {
+        return Err(WardenError::TargetNotCgroup);
+    }
+    if metadata.ino() != expected.get() {
+        return Err(WardenError::TargetChanged);
+    }
+    Ok(dir)
+}
+
+// `ENOTDIR`/`ELOOP` (kein Verzeichnis bzw. Symlink unter `O_NOFOLLOW`) sind
+// „kein cgroup-Verzeichnis“; alles andere bleibt ein I/O-Fehler (`ENOENT`
+// → `NotFound`, also „verschwunden“).
+fn pin_error(errno: rustix::io::Errno) -> WardenError {
+    if errno == rustix::io::Errno::NOTDIR || errno == rustix::io::Errno::LOOP {
+        WardenError::TargetNotCgroup
+    } else {
+        WardenError::Io(std::io::Error::from(errno))
+    }
+}
+
 /// Echte cgroup-v2-Ausführung über Dateisystemschreibzugriffe.
 ///
 /// # Description
-/// Siehe Moduldoku, Abschnitt „Was `CgroupV2Executor` wirklich tut".
-/// Adressiert cgroups in beliebiger Tiefe unterhalb von `root`, z. B.
-/// `harw.slice/job-1` → `<root>/harw.slice/job-1/cgroup.freeze`. Kein
-/// Test dieser Crate lässt diesen Typ auf ein echtes `/sys/fs/cgroup`
-/// zugreifen — Tests übergeben ein `tempfile`-Verzeichnis als `root`.
+/// Siehe Moduldoku, Abschnitte „Was `CgroupV2Executor` wirklich tut" und
+/// „Prüfung und Eingriff über denselben Deskriptor". Adressiert cgroups in
+/// beliebiger Tiefe unterhalb von `root`, z. B. `harw.slice/job-1` →
+/// `<root>/harw.slice/job-1/cgroup.freeze`. Kein Test dieser Crate lässt
+/// diesen Typ auf ein echtes `/sys/fs/cgroup` zugreifen — Tests übergeben
+/// ein `tempfile`-Verzeichnis als `root`.
 pub struct CgroupV2Executor {
-    root: std::path::PathBuf,
+    root: PathBuf,
 }
 
 impl CgroupV2Executor {
@@ -213,42 +316,49 @@ impl CgroupV2Executor {
     /// # Returns
     /// Einen neuen [`CgroupV2Executor`].
     #[must_use]
-    pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
 
-    fn control_file(&self, cgroup: &CgroupId, file_name: &str) -> WardenResult<std::path::PathBuf> {
-        let relative = validate_path_segment(cgroup)?;
-        Ok(self.root.join(relative).join(file_name))
-    }
-
+    // Öffnet das Ziel, prüft die Kernel-ID am Deskriptor und schreibt
+    // `value` in die Kontrolldatei relativ zu genau diesem Deskriptor.
     fn write_control_file(
         &self,
-        cgroup: &CgroupId,
+        target: &CgroupTarget,
         file_name: &str,
-        value: &str,
+        value: &[u8],
     ) -> WardenResult<()> {
-        let path = self.control_file(cgroup, file_name)?;
-        std::fs::write(path, value)?;
+        let relative = validate_path_segment(&target.path)?;
+        let dir = open_pinned_cgroup(&self.root.join(relative), target.kernel_id)?;
+        let control = rustix::fs::openat(
+            &dir,
+            file_name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            // Nur in Test-Fixtures entsteht die Datei neu; unter cgroupfs
+            // existiert sie immer.
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|errno| WardenError::Io(std::io::Error::from(errno)))?;
+        File::from(control).write_all(value)?;
         Ok(())
     }
 }
 
 impl CgroupFreezer for CgroupV2Executor {
-    fn freeze(&self, cgroup: &CgroupId) -> WardenResult<()> {
-        self.write_control_file(cgroup, "cgroup.freeze", "1")
+    fn freeze(&self, target: &CgroupTarget) -> WardenResult<()> {
+        self.write_control_file(target, "cgroup.freeze", b"1")
     }
 }
 
-impl CgroupReleaser for CgroupV2Executor {
-    fn release(&self, cgroup: &CgroupId) -> WardenResult<()> {
-        self.write_control_file(cgroup, "cgroup.freeze", "0")
+impl CgroupThawer for CgroupV2Executor {
+    fn thaw(&self, target: &CgroupTarget) -> WardenResult<()> {
+        self.write_control_file(target, "cgroup.freeze", b"0")
     }
 }
 
 impl ProcessTreeKiller for CgroupV2Executor {
-    fn kill(&self, cgroup: &CgroupId) -> WardenResult<()> {
-        self.write_control_file(cgroup, "cgroup.kill", "1")
+    fn kill(&self, target: &CgroupTarget) -> WardenResult<()> {
+        self.write_control_file(target, "cgroup.kill", b"1")
     }
 }
 
@@ -257,10 +367,12 @@ impl ProcessTreeKiller for CgroupV2Executor {
 pub enum RecordedCall {
     /// [`CgroupFreezer::freeze`] wurde für diese cgroup aufgerufen.
     Freeze(CgroupId),
-    /// [`CgroupReleaser::release`] wurde für diese cgroup aufgerufen.
-    Release(CgroupId),
+    /// [`CgroupThawer::thaw`] wurde für diese cgroup aufgerufen.
+    Thaw(CgroupId),
     /// [`NetworkIsolator::isolate`] wurde für diese cgroup aufgerufen.
     Isolate(CgroupId),
+    /// [`NetworkIsolator::release_isolation`] wurde für diese cgroup aufgerufen.
+    LiftIsolation(CgroupId),
     /// [`ProcessTreeKiller::kill`] wurde für diese cgroup aufgerufen.
     Kill(CgroupId),
 }
@@ -269,13 +381,41 @@ pub enum RecordedCall {
 ///
 /// # Description
 /// Friert nichts ein, tötet nichts, schneidet kein Netz ab — zeichnet nur
-/// auf, welche Methode mit welcher cgroup aufgerufen wurde. Kann optional
-/// so konfiguriert werden, dass sie fehlschlägt (`with_failure`), um den
-/// Ausführungsfehler-Audit-Pfad zu testen, ohne einen echten Fehler
-/// (z. B. eine gesperrte Datei) herbeiführen zu müssen.
-#[derive(Debug, Default)]
+/// auf, welche Methode mit welcher cgroup aufgerufen wurde. Klone teilen
+/// dasselbe Protokoll (`Arc`), damit ein Test einen Klon je Rolle an den
+/// Warden geben und die Reihenfolge aller Aufrufe an einer Stelle lesen kann.
+/// [`Self::new_failing`] liefert einen Ausführer, der jeden Aufruf
+/// aufzeichnet und danach fehlschlägt (Ausführungsfehler-Pfad).
+///
+/// # Concurrency
+/// Intern `Arc<Mutex<_>>`; `Send + Sync`. Ein vergifteter Mutex wird
+/// übernommen (`into_inner`) — für eine reine Testimplementierung
+/// akzeptabel.
+///
+/// # Examples
+/// ```rust
+/// use harw_dod_warden::{CgroupFreezer, CgroupThawer, RecordedCall, RecordingExecutor};
+/// use harw_dod_warden_proto::{CgroupKernelId, CgroupTarget};
+/// use harw_types::CgroupId;
+///
+/// let (Ok(cgroup), Ok(kernel_id)) =
+///     (CgroupId::try_from_str("harw.slice/job-1"), CgroupKernelId::new(42))
+/// else {
+///     return;
+/// };
+/// let target = CgroupTarget::new(cgroup.clone(), kernel_id, jiff::Timestamp::UNIX_EPOCH);
+/// let log = RecordingExecutor::new();
+/// let freezer = log.clone();
+/// assert!(freezer.freeze(&target).is_ok());
+/// assert!(log.thaw(&target).is_ok());
+/// assert_eq!(
+///     log.calls(),
+///     vec![RecordedCall::Freeze(cgroup.clone()), RecordedCall::Thaw(cgroup)]
+/// );
+/// ```
+#[derive(Debug, Default, Clone)]
 pub struct RecordingExecutor {
-    calls: std::sync::Mutex<Vec<RecordedCall>>,
+    calls: Arc<Mutex<Vec<RecordedCall>>>,
     fail: bool,
 }
 
@@ -293,30 +433,42 @@ impl RecordingExecutor {
     #[must_use]
     pub fn new_failing() -> Self {
         Self {
-            calls: std::sync::Mutex::new(Vec::new()),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: true,
+        }
+    }
+
+    /// Baut einen fehlschlagenden Ausführer, der dasselbe Protokoll wie
+    /// `self` teilt.
+    ///
+    /// # Returns
+    /// Einen Klon mit `fail = true`.
+    #[must_use]
+    pub fn failing_view(&self) -> Self {
+        Self {
+            calls: Arc::clone(&self.calls),
             fail: true,
         }
     }
 
     /// Gibt alle bisher aufgezeichneten Aufrufe zurück, in Aufrufreihenfolge.
     ///
-    /// # Panics
-    /// Wenn der interne Mutex vergiftet ist — für eine reine
-    /// Testimplementierung akzeptabel.
+    /// # Returns
+    /// Eine Kopie des Protokolls (geteilt über alle Klone).
     #[must_use]
     pub fn calls(&self) -> Vec<RecordedCall> {
         self.calls
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
+    // Zeichnet `call` auf und schlägt danach fehl, falls so konfiguriert.
     fn record(&self, call: RecordedCall) -> WardenResult<()> {
-        let mut calls = self
-            .calls
+        self.calls
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        calls.push(call);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(call);
         if self.fail {
             return Err(WardenError::Io(std::io::Error::other(
                 "aufgezeichneter Testfehler",
@@ -327,14 +479,14 @@ impl RecordingExecutor {
 }
 
 impl CgroupFreezer for RecordingExecutor {
-    fn freeze(&self, cgroup: &CgroupId) -> WardenResult<()> {
-        self.record(RecordedCall::Freeze(cgroup.clone()))
+    fn freeze(&self, target: &CgroupTarget) -> WardenResult<()> {
+        self.record(RecordedCall::Freeze(target.path.clone()))
     }
 }
 
-impl CgroupReleaser for RecordingExecutor {
-    fn release(&self, cgroup: &CgroupId) -> WardenResult<()> {
-        self.record(RecordedCall::Release(cgroup.clone()))
+impl CgroupThawer for RecordingExecutor {
+    fn thaw(&self, target: &CgroupTarget) -> WardenResult<()> {
+        self.record(RecordedCall::Thaw(target.path.clone()))
     }
 }
 
@@ -342,26 +494,52 @@ impl NetworkIsolator for RecordingExecutor {
     fn isolate(&self, cgroup: &CgroupId) -> WardenResult<()> {
         self.record(RecordedCall::Isolate(cgroup.clone()))
     }
+
+    fn release_isolation(&self, cgroup: &CgroupId) -> WardenResult<()> {
+        self.record(RecordedCall::LiftIsolation(cgroup.clone()))
+    }
 }
 
 impl ProcessTreeKiller for RecordingExecutor {
-    fn kill(&self, cgroup: &CgroupId) -> WardenResult<()> {
-        self.record(RecordedCall::Kill(cgroup.clone()))
+    fn kill(&self, target: &CgroupTarget) -> WardenResult<()> {
+        self.record(RecordedCall::Kill(target.path.clone()))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt as _;
+
     use super::{
-        CgroupFreezer, CgroupReleaser, CgroupV2Executor, NetworkIsolator, ProcessTreeKiller,
+        CgroupFreezer, CgroupThawer, CgroupV2Executor, NetworkIsolator, ProcessTreeKiller,
         RecordedCall, RecordingExecutor, validate_path_segment,
     };
     use crate::error::WardenError;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_dod_warden_proto::{CgroupKernelId, CgroupTarget};
     use harw_types::CgroupId;
+    use jiff::Timestamp;
 
     fn cgroup(id: &str) -> TestResult<CgroupId> {
         CgroupId::try_from_str(id).map_err(ctx("non-empty id"))
+    }
+
+    // Ziel-Tripel mit beliebiger (nicht null) Kernel-ID, für Pfade ohne
+    // Verzeichnis oder für die aufzeichnende Implementierung.
+    fn target(id: &str, kernel_id: u64) -> TestResult<CgroupTarget> {
+        Ok(CgroupTarget::new(
+            cgroup(id)?,
+            CgroupKernelId::new(kernel_id).map_err(ctx("kernel id"))?,
+            Timestamp::UNIX_EPOCH,
+        ))
+    }
+
+    // Legt `<root>/<id>` an und liefert das Ziel mit dessen echter Inode.
+    fn live_target(root: &std::path::Path, id: &str) -> TestResult<CgroupTarget> {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).map_err(ctx("create cgroup dir"))?;
+        let inode = std::fs::metadata(&dir).map_err(ctx("metadata"))?.ino();
+        target(id, inode)
     }
 
     // -- validate_path_segment -------------------------------------------------
@@ -440,11 +618,10 @@ mod tests {
     #[test]
     fn test_cgroup_v2_executor_freeze_writes_control_file() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        std::fs::create_dir(dir.path().join("cgroup-1")).map_err(ctx("create cgroup dir"))?;
+        let job = live_target(dir.path(), "cgroup-1")?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        let cg = cgroup("cgroup-1")?;
-        executor.freeze(&cg).map_err(ctx("freeze succeeds"))?;
+        executor.freeze(&job).map_err(ctx("freeze succeeds"))?;
 
         let written = std::fs::read_to_string(dir.path().join("cgroup-1").join("cgroup.freeze"))
             .map_err(ctx("control file written"))?;
@@ -453,13 +630,12 @@ mod tests {
     }
 
     #[test]
-    fn test_cgroup_v2_executor_release_writes_zero() -> TestResult {
+    fn test_cgroup_v2_executor_thaw_writes_zero() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        std::fs::create_dir(dir.path().join("cgroup-1")).map_err(ctx("create cgroup dir"))?;
+        let job = live_target(dir.path(), "cgroup-1")?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        let cg = cgroup("cgroup-1")?;
-        executor.release(&cg).map_err(ctx("release succeeds"))?;
+        executor.thaw(&job).map_err(ctx("thaw succeeds"))?;
 
         let written = std::fs::read_to_string(dir.path().join("cgroup-1").join("cgroup.freeze"))
             .map_err(ctx("control file written"))?;
@@ -470,11 +646,10 @@ mod tests {
     #[test]
     fn test_cgroup_v2_executor_kill_writes_control_file() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        std::fs::create_dir(dir.path().join("cgroup-1")).map_err(ctx("create cgroup dir"))?;
+        let job = live_target(dir.path(), "cgroup-1")?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        let cg = cgroup("cgroup-1")?;
-        executor.kill(&cg).map_err(ctx("kill succeeds"))?;
+        executor.kill(&job).map_err(ctx("kill succeeds"))?;
 
         let written = std::fs::read_to_string(dir.path().join("cgroup-1").join("cgroup.kill"))
             .map_err(ctx("control file written"))?;
@@ -487,8 +662,7 @@ mod tests {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        let cg = cgroup("../escape")?;
-        let Err(err) = executor.freeze(&cg) else {
+        let Err(err) = executor.freeze(&target("../escape", 7)?) else {
             return Err(TestError::Unexpected("Err erwartet".into()));
         };
         assert!(matches!(err, WardenError::InvalidCgroupId));
@@ -498,15 +672,13 @@ mod tests {
     #[test]
     fn test_cgroup_v2_executor_freeze_writes_nested_control_file() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let slice = dir.path().join("harw.slice");
-        let job = slice.join("job-1");
-        std::fs::create_dir_all(&job).map_err(ctx("create nested cgroup dir"))?;
+        let job = live_target(dir.path(), "harw.slice/job-1")?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        let cg = cgroup("harw.slice/job-1")?;
-        executor.freeze(&cg).map_err(ctx("freeze succeeds"))?;
+        executor.freeze(&job).map_err(ctx("freeze succeeds"))?;
 
-        let written = std::fs::read_to_string(job.join("cgroup.freeze"))
+        let slice = dir.path().join("harw.slice");
+        let written = std::fs::read_to_string(slice.join("job-1").join("cgroup.freeze"))
             .map_err(ctx("nested control file written"))?;
         assert_eq!(written, "1");
         // Der Eltern-Slice bleibt unberührt.
@@ -517,15 +689,18 @@ mod tests {
     #[test]
     fn test_cgroup_v2_executor_kill_writes_nested_control_file() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
-        let job = dir.path().join("harw.slice").join("job-1");
-        std::fs::create_dir_all(&job).map_err(ctx("create nested cgroup dir"))?;
+        let job = live_target(dir.path(), "harw.slice/job-1")?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        let cg = cgroup("harw.slice/job-1")?;
-        executor.kill(&cg).map_err(ctx("kill succeeds"))?;
+        executor.kill(&job).map_err(ctx("kill succeeds"))?;
 
-        let written = std::fs::read_to_string(job.join("cgroup.kill"))
-            .map_err(ctx("nested control file written"))?;
+        let written = std::fs::read_to_string(
+            dir.path()
+                .join("harw.slice")
+                .join("job-1")
+                .join("cgroup.kill"),
+        )
+        .map_err(ctx("nested control file written"))?;
         assert_eq!(written, "1");
         Ok(())
     }
@@ -537,8 +712,10 @@ mod tests {
         let executor = CgroupV2Executor::new(dir.path());
 
         for id in ["/abs", "harw.slice/../escape"] {
-            let cg = cgroup(id)?;
-            if !matches!(executor.freeze(&cg), Err(WardenError::InvalidCgroupId)) {
+            if !matches!(
+                executor.freeze(&target(id, 7)?),
+                Err(WardenError::InvalidCgroupId)
+            ) {
                 return Err(TestError::Unexpected(format!("{id:?} must be rejected")));
             }
         }
@@ -549,15 +726,84 @@ mod tests {
     }
 
     #[test]
-    fn test_cgroup_v2_executor_reports_io_error_for_missing_directory() -> TestResult {
+    fn test_cgroup_v2_executor_reports_a_missing_directory_as_gone() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        let cg = cgroup("does-not-exist")?;
-        let Err(err) = executor.freeze(&cg) else {
+        let Err(err) = executor.freeze(&target("does-not-exist", 7)?) else {
             return Err(TestError::Unexpected("Err erwartet".into()));
         };
         assert!(matches!(err, WardenError::Io(_)));
+        assert!(err.is_target_gone());
+        Ok(())
+    }
+
+    // -- Prüfung und Eingriff über denselben Deskriptor (B21) -------------------
+
+    #[test]
+    fn test_cgroup_v2_executor_refuses_a_kernel_id_mismatch_without_writing() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let live = live_target(dir.path(), "harw.slice/job-1")?;
+        let stale = target(
+            "harw.slice/job-1",
+            live.kernel_id.get().wrapping_add(1).max(1),
+        )?;
+        let executor = CgroupV2Executor::new(dir.path());
+
+        for result in [
+            executor.freeze(&stale),
+            executor.thaw(&stale),
+            executor.kill(&stale),
+        ] {
+            if !matches!(result, Err(WardenError::TargetChanged)) {
+                return Err(TestError::Unexpected(format!(
+                    "a stale kernel id must be refused, got {result:?}"
+                )));
+            }
+        }
+        let job = dir.path().join("harw.slice").join("job-1");
+        assert!(!job.join("cgroup.freeze").exists());
+        assert!(!job.join("cgroup.kill").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_cgroup_v2_executor_refuses_a_recreated_cgroup_at_the_same_path() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let original = live_target(dir.path(), "harw.slice/job-1")?;
+        let job = dir.path().join("harw.slice").join("job-1");
+        // Ein Platzhalter hält die alte Inode belegt, damit die neu angelegte
+        // cgroup sicher eine andere Inode-Nummer bekommt.
+        let parked = dir.path().join("parked");
+        std::fs::rename(&job, &parked).map_err(ctx("park original"))?;
+        std::fs::create_dir(&job).map_err(ctx("recreate at the same path"))?;
+        let executor = CgroupV2Executor::new(dir.path());
+
+        let result = executor.kill(&original);
+        assert!(matches!(result, Err(WardenError::TargetChanged)));
+        assert!(!job.join("cgroup.kill").exists());
+        assert!(!parked.join("cgroup.kill").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_cgroup_v2_executor_treats_a_file_or_symlink_as_not_a_cgroup() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let real = live_target(dir.path(), "real")?;
+        std::fs::write(dir.path().join("file"), b"x").map_err(ctx("write file"))?;
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link"))
+            .map_err(ctx("symlink"))?;
+        let executor = CgroupV2Executor::new(dir.path());
+
+        for id in ["file", "link"] {
+            let result = executor.freeze(&target(id, real.kernel_id.get())?);
+            if !matches!(result, Err(WardenError::TargetNotCgroup)) {
+                return Err(TestError::Unexpected(format!(
+                    "{id} must not be followed, got {result:?}"
+                )));
+            }
+        }
+        assert!(!dir.path().join("real").join("cgroup.freeze").exists());
         Ok(())
     }
 
@@ -566,48 +812,72 @@ mod tests {
     #[test]
     fn test_recording_executor_records_freeze_via_trait() -> TestResult {
         let executor = RecordingExecutor::new();
-        let cg = cgroup("cgroup-1")?;
-        CgroupFreezer::freeze(&executor, &cg).map_err(ctx("records, does not act"))?;
-        assert_eq!(executor.calls(), vec![RecordedCall::Freeze(cg)]);
+        let job = target("cgroup-1", 7)?;
+        CgroupFreezer::freeze(&executor, &job).map_err(ctx("records, does not act"))?;
+        assert_eq!(executor.calls(), vec![RecordedCall::Freeze(job.path)]);
         Ok(())
     }
 
     #[test]
-    fn test_recording_executor_records_release_via_trait() -> TestResult {
+    fn test_recording_executor_records_thaw_via_trait() -> TestResult {
         let executor = RecordingExecutor::new();
-        let cg = cgroup("cgroup-1")?;
-        CgroupReleaser::release(&executor, &cg).map_err(ctx("records, does not act"))?;
-        assert_eq!(executor.calls(), vec![RecordedCall::Release(cg)]);
+        let job = target("cgroup-1", 7)?;
+        CgroupThawer::thaw(&executor, &job).map_err(ctx("records, does not act"))?;
+        assert_eq!(executor.calls(), vec![RecordedCall::Thaw(job.path)]);
         Ok(())
     }
 
     #[test]
-    fn test_recording_executor_records_isolate_via_trait() -> TestResult {
+    fn test_recording_executor_records_isolate_and_lift_via_trait() -> TestResult {
         let executor = RecordingExecutor::new();
         let cg = cgroup("cgroup-1")?;
         NetworkIsolator::isolate(&executor, &cg).map_err(ctx("records, does not act"))?;
-        assert_eq!(executor.calls(), vec![RecordedCall::Isolate(cg)]);
+        NetworkIsolator::release_isolation(&executor, &cg).map_err(ctx("records, does not act"))?;
+        assert_eq!(
+            executor.calls(),
+            vec![
+                RecordedCall::Isolate(cg.clone()),
+                RecordedCall::LiftIsolation(cg)
+            ]
+        );
         Ok(())
     }
 
     #[test]
     fn test_recording_executor_records_kill_via_trait() -> TestResult {
         let executor = RecordingExecutor::new();
-        let cg = cgroup("cgroup-1")?;
-        ProcessTreeKiller::kill(&executor, &cg).map_err(ctx("records, does not act"))?;
-        assert_eq!(executor.calls(), vec![RecordedCall::Kill(cg)]);
+        let job = target("cgroup-1", 7)?;
+        ProcessTreeKiller::kill(&executor, &job).map_err(ctx("records, does not act"))?;
+        assert_eq!(executor.calls(), vec![RecordedCall::Kill(job.path)]);
         Ok(())
     }
 
     #[test]
     fn test_failing_recording_executor_still_records_before_returning_err() -> TestResult {
         let executor = RecordingExecutor::new_failing();
-        let cg = cgroup("cgroup-1")?;
-        let Err(err) = CgroupFreezer::freeze(&executor, &cg) else {
+        let job = target("cgroup-1", 7)?;
+        let Err(err) = CgroupFreezer::freeze(&executor, &job) else {
             return Err(TestError::Unexpected("Err erwartet".into()));
         };
         assert!(matches!(err, WardenError::Io(_)));
-        assert_eq!(executor.calls(), vec![RecordedCall::Freeze(cg)]);
+        assert_eq!(executor.calls(), vec![RecordedCall::Freeze(job.path)]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_clones_and_failing_view_share_one_call_log() -> TestResult {
+        let log = RecordingExecutor::new();
+        let failing = log.failing_view();
+        let job = target("cgroup-1", 7)?;
+        CgroupFreezer::freeze(&log.clone(), &job).map_err(ctx("clone records"))?;
+        assert!(CgroupThawer::thaw(&failing, &job).is_err());
+        assert_eq!(
+            log.calls(),
+            vec![
+                RecordedCall::Freeze(job.path.clone()),
+                RecordedCall::Thaw(job.path)
+            ]
+        );
         Ok(())
     }
 }

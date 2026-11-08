@@ -40,8 +40,11 @@ use serde::{Deserialize, Serialize};
 /// (C-WPROTO, F-088) zusätzlich Versions-, Dekodier-, Nicht-unterstützt-,
 /// Ausführungs- und Verfügbarkeitskategorien, damit der Warden jede
 /// Ablehnung beantworten kann, statt die Verbindung kommentarlos zu schließen.
-/// Alle Varianten bleiben feldlos — ein zusätzlicher Wert wäre nur über eine
-/// sichtbare Erweiterung dieser Positivliste möglich.
+/// PL-100 WP 3.1 ergänzt die Kategorien für die neuen Prüfungen des Wardens:
+/// fehlende Unumkehrbarkeits-Bestätigung (O4), geändertes Ziel (B21),
+/// Warden-eigene Policy (Deny-Liste, Präfixe, Freigebender) und abgewiesener
+/// Peer. Alle Varianten bleiben feldlos — ein zusätzlicher Wert wäre nur über
+/// eine sichtbare Erweiterung dieser Positivliste möglich.
 ///
 /// # Wire-Format
 /// Kebab-case-String, keine weiteren Felder.
@@ -78,6 +81,18 @@ pub enum Denial {
     /// Der Warden kann gerade nicht sicher prüfen (z. B. Nonce-Ledger nicht
     /// schreibbar) — fail closed.
     Unavailable,
+    /// Kill oder Isolation ohne signierte Bestätigung „nicht umkehrbar“
+    /// (`irreversible_ack`, Entscheidung O4).
+    IrreversibleAckRequired,
+    /// Die beobachtete Ziel-cgroup (Kernel-ID, Pfad, erste Beobachtung) passt
+    /// nicht mehr zum signierten Ziel (Kernel-ID-Wiederverwendung, B21).
+    TargetChanged,
+    /// Aktion oder Ziel ist durch die Warden-eigene Policy ausgeschlossen
+    /// (Deny-Liste, Aktions-Allowlist, Präfix-Allowlist, Freigebender).
+    PolicyDenied,
+    /// Der Socket-Peer ist nicht der Escalator (SO_PEERCRED-Allowlist); die
+    /// Anfrage wurde nicht gelesen.
+    PeerRejected,
 }
 
 /// Formatiert die Ablehnung als feste, inhaltsfreie Meldung.
@@ -107,6 +122,12 @@ impl fmt::Display for Denial {
             Self::Unsupported => "action is not supported by this warden",
             Self::ExecutionFailed => "action could not be executed",
             Self::Unavailable => "warden is temporarily unable to verify requests",
+            Self::IrreversibleAckRequired => {
+                "irreversible action requires the operator's irreversible acknowledgement"
+            }
+            Self::TargetChanged => "target cgroup no longer matches the authorized identity",
+            Self::PolicyDenied => "action or target is denied by warden policy",
+            Self::PeerRejected => "peer is not allowed to submit warden requests",
         };
         f.write_str(text)
     }
@@ -117,7 +138,7 @@ mod tests {
     use super::Denial;
     use crate::test_support::{TestResult, ctx};
 
-    const ALL: [Denial; 7] = [
+    const ALL: [Denial; 11] = [
         Denial::ProofMismatch,
         Denial::NotAdmissibleAtStage,
         Denial::UnsupportedVersion,
@@ -125,6 +146,10 @@ mod tests {
         Denial::Unsupported,
         Denial::ExecutionFailed,
         Denial::Unavailable,
+        Denial::IrreversibleAckRequired,
+        Denial::TargetChanged,
+        Denial::PolicyDenied,
+        Denial::PeerRejected,
     ];
 
     #[test]
@@ -170,6 +195,30 @@ mod tests {
             serde_json::to_string(&Denial::ExecutionFailed).map_err(ctx("serializes"))?,
             "\"execution-failed\""
         );
+        assert_eq!(
+            serde_json::to_string(&Denial::IrreversibleAckRequired).map_err(ctx("serializes"))?,
+            "\"irreversible-ack-required\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Denial::TargetChanged).map_err(ctx("serializes"))?,
+            "\"target-changed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Denial::PolicyDenied).map_err(ctx("serializes"))?,
+            "\"policy-denied\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Denial::PeerRejected).map_err(ctx("serializes"))?,
+            "\"peer-rejected\""
+        );
         Ok(())
+    }
+
+    #[test]
+    fn test_display_is_distinct_per_variant() {
+        let mut texts: Vec<String> = ALL.iter().map(ToString::to_string).collect();
+        texts.sort_unstable();
+        texts.dedup();
+        assert_eq!(texts.len(), ALL.len());
     }
 }

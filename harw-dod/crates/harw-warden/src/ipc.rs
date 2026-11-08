@@ -1,94 +1,82 @@
 //! IPC-Empfangspfad: `SOCK_SEQPACKET` auf dem von systemd bereits gebundenen
-//! und lauschenden Socket. `SO_PEERCRED` ist Pflicht.
+//! und lauschenden Socket. `SO_PEERCRED` ist Pflicht und wird geprüft.
 //!
 //! # Warum `SO_PEERCRED`, nicht ein Token im Rumpf
-//! `harw_dod_warden`s eigene Moduldoku (`lib.rs`, Abschnitt „Warum der Beleg
-//! nachgeprüft wird, statt ihm zu glauben") benennt die eigentliche
-//! Vertrauensgrenze dieses Systems bereits ausdrücklich: „ein
-//! `SOCK_SEQPACKET`-Unix-Socket mit `SO_PEERCRED`, AW5-04b". Ein Feld im
-//! Nachrichtenrumpf, das „ich bin der Eskalationsleiter" behauptet, wäre
-//! eine Behauptung der Gegenseite — genau das, dem der Warden laut seiner
-//! eigenen Dokumentation nirgends glaubt. `SO_PEERCRED` liefert stattdessen
-//! die vom Kernel selbst festgestellte Identität des verbundenen Prozesses
-//! (`pid`/`uid`/`gid`), gefüllt aus dem tatsächlichen Verbindungsaufbau, nie
-//! aus fälschbaren Nutzdaten. Diese Datei liest sie deshalb bei jeder
-//! angenommenen Verbindung, bevor auch nur ein Byte Nutzlast gelesen wird.
+//! `harw_dod_warden`s eigene Moduldoku (`lib.rs`) benennt die eigentliche
+//! Vertrauensgrenze dieses Systems: ein `SOCK_SEQPACKET`-Unix-Socket mit
+//! `SO_PEERCRED`. Ein Feld im Nachrichtenrumpf, das „ich bin der
+//! Escalator" behauptet, wäre eine Behauptung der Gegenseite. `SO_PEERCRED`
+//! liefert stattdessen die vom Kernel selbst festgestellte Identität des
+//! verbundenen Prozesses (`pid`/`uid`/`gid`), gefüllt aus dem tatsächlichen
+//! Verbindungsaufbau, nie aus fälschbaren Nutzdaten.
 //!
-//! # Was mit der Peer-Identität geschieht — und was bewusst nicht
-//! Wie `harw-sentinel::ipc` (dort ausdrücklich dokumentiert: „prüft diese
-//! Werte heute nicht gegen eine Zulassungsliste — keine ist Teil dieses
-//! Knotens; sie werden geloggt") liest und protokolliert diese Datei
-//! [`PeerCredentials`] bei jeder Verbindung, führt aber **keine**
-//! Zulassungsprüfung gegen eine erwartete `uid`/`pid` durch: der Auftrag
-//! dieses Knotens spezifiziert keine solche Liste, und eine hier erfundene
-//! Prüfung wäre eine neue, nicht mandatierte Geschäftsregel (dieselbe
-//! Zurückhaltung, die `harw_dod_warden::warden`-Moduldoku für die
-//! `authorized_by`-Prüfung an anderer Stelle bereits begründet: „ein
-//! zweiter Identitätscheck hier wäre eine Prüfung gegen denselben Wert, den
-//! man prüfen wollte, sobald keine unabhängige Quelle für „wer darf"
-//! existiert"). `SO_PEERCRED` bleibt damit **Pflicht** (gelesen, geloggt,
-//! über [`PeerCredentials`] typisiert — nie eine Behauptung im Rumpf), aber
-//! diese Datei erfindet keine Allowlist, die der Auftrag nicht verlangt —
-//! ein Befund für einen künftigen Knoten, kein stillschweigend getroffener
-//! Entwurf hier.
+//! # Peer-Allowlist (PL-100 WP 3.1, Bedrohung B1)
+//! Nur die uid des Escalators ([`crate::peer::PeerGate`]) darf Anfragen
+//! senden. Die Prüfung läuft in der Annahmeschleife, **bevor** ein Byte
+//! gelesen und bevor ein Verbindungs-Thread gestartet wird: ein fremder
+//! Peer kostet keinen Thread, seine Anfrage wird nie dekodiert. Er bekommt
+//! die feste Antwort `peer-rejected` (nicht blockierend gesendet), der
+//! Ablehnungszähler steigt. Ist `SO_PEERCRED` nicht lesbar, gilt der Peer
+//! als fremd.
+//!
+//! # Immer eine Antwort (PL-100 WP 3.1)
+//! Jede angenommene Verbindung, deren Peer nicht von sich aus ohne Anfrage
+//! schließt, bekommt genau eine [`harw_dod_warden_proto::WardenReply`]:
+//! - Peer abgewiesen → `peer-rejected`;
+//! - Empfang gescheitert, Zeitlimit überschritten oder Nachricht zu groß →
+//!   `malformed`;
+//! - Anfrage nicht als v2 dekodierbar → `malformed` bzw. für jeden v1-Auftrag
+//!   `unsupported-version` ([`crate::protocol::decode_request`]);
+//! - kein Thread für die Verbindung (System lehnt ab) → `unavailable`;
+//! - sonst das Ergebnis von `Warden::handle` — auch `execution-failed` und
+//!   `unavailable` ([`harw_dod_warden::WardenOutcome::to_reply`] ist total).
+//!
+//! Nur ein Peer, der die Verbindung ohne Anfrage schließt (Datagramm der
+//! Länge 0), bekommt nichts — es gibt niemanden mehr, der lesen könnte.
 //!
 //! # Ohne `unsafe`
-//! `rustix::net` deckt `accept`, `sockopt::socket_peercred`, `recv` und
-//! `send` bereits sicher ab. Jeder hier verwendete Aufruf ist gegen die
-//! tatsächlich im Workspace gepinnte Quelle geprüft
-//! (`~/.cargo/registry/src/…/rustix-1.1.4/src/net/`), nicht gegen docs.rs
-//! oder aus dem Gedächtnis — dieselbe Prüfung, die `harw-sentinel::ipc`
-//! bereits einmal die Falle gefunden hat, in die zwei Agenten zuvor beim
-//! bloßen Gegenlesen der Datei getreten waren: `rustix::net::recv` liefert
-//! für einen Array-Puffer `(Buf::Output, usize)`, kein Skalar. Diese Datei
-//! übernimmt exakt dasselbe Musters wie `harw-sentinel::ipc::IpcConnection::recv_event`.
+//! `rustix::net` deckt `accept_with` (`accept4` mit `SOCK_CLOEXEC`),
+//! `sockopt::socket_peercred`,
+//! `sockopt::set_socket_timeout`, `recv` und `send` sicher ab (geprüft gegen
+//! `rustix-1.1.5/src/net/`). `rustix::net::recv` liefert für einen
+//! Array-Puffer `(Buf::Output, usize)`, kein Skalar.
 //!
 //! # Ein Austausch pro Verbindung
-//! Jede angenommene Verbindung trägt genau eine Anfrage und höchstens eine
-//! Antwort — kein dauerhaft offener Kanal, keine Mehrfachnutzung. Das
-//! entspricht dem einfachsten RPC-Muster, das für einen seltenen,
-//! sitzungsgebundenen Eskalationsaufruf ausreicht (kein Hochfrequenz-Feed
-//! wie bei `harw-sentinel`).
-//!
-//! # Inhaltsfreie Antworten
-//! [`harw_dod_warden::warden::WardenOutcome::to_wire`] liefert `None` für
-//! [`harw_dod_warden::warden::WardenOutcome::ExecutionFailed`] und
-//! [`harw_dod_warden::warden::WardenOutcome::VerificationFailed`] — für
-//! beide gibt es keine verlustfreie Wire-Entsprechung (siehe dessen
-//! Moduldoku). [`handle_connection`] sendet in diesem Fall **keine**
-//! Antwort und schließt die Verbindung; der Peer liest eine geordnete
-//! Verbindungsschließung ohne Nutzlast, kein Fehlerdetail. Für
-//! [`harw_dod_warden::warden::WardenOutcome::Executed`]/[`harw_dod_warden::warden::WardenOutcome::Denied`]
-//! wird die von der Bibliothek gelieferte, bereits inhaltsfrei begrenzte
-//! [`harw_dod_warden_proto::WardenResponse`] unverändert gesendet — dieses
-//! Binary fügt kein zusätzliches Feld hinzu und entfernt keines.
+//! Jede angenommene Verbindung trägt genau eine Anfrage und genau eine
+//! Antwort. Ein Peer, der nach dem Verbinden nichts sendet, wird nach
+//! [`RECV_TIMEOUT`] mit `malformed` beantwortet und getrennt.
 //!
 //! # Nebenläufigkeit
-//! [`serve_forever`] startet `std::thread::spawn` je angenommener
-//! Verbindung (Muster: `harw-sentinel::ipc::spawn_receive_loop`). `warden`
-//! wird als `Arc<Warden>` geteilt; `Warden` selbst trägt keinen
-//! veränderlichen inneren Zustand außerhalb seiner Ausführer/seines
-//! Audit-Ziels (siehe `harw_dod_warden::warden`-Moduldoku), die ihrerseits
-//! entweder zustandslos sind (`CgroupV2Executor`,
-//! `crate::isolation::NftNetworkIsolator`,
-//! `crate::audit::TracingAuditSink`) oder — in Produktion nicht verwendet —
-//! ihre eigene Synchronisation mitbringen (`RecordingExecutor`,
-//! `RecordingAuditSink`, nur in Tests der Bibliothek). Gleichzeitige
-//! Anfragen sind deshalb ohne zusätzliches Locking sicher.
+//! [`serve_forever`] startet je zugelassener Verbindung einen Thread über
+//! `std::thread::Builder::spawn` (liefert einen Fehler statt zu panicken).
+//! Lehnt das System den Thread ab, antwortet die Annahmeschleife selbst mit
+//! `unavailable` (nicht blockierend) und nimmt weiter an; die Verbindung
+//! liegt dafür in einem `Arc<OwnedFd>`. `warden` und `gate` werden als
+//! `Arc` geteilt; der `Warden` serialisiert seine Eingriffe selbst über eine
+//! Sperre.
+//!
+//! # Logging
+//! `warn` und höher tragen keine Pfade, uids oder Inhalte; die Peer-Identität
+//! steht nur auf `info`/`debug`.
 
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::time::Duration;
 
 use harw_dod_warden::Warden;
+use harw_dod_warden_proto::{Denial, WardenReply};
 use harw_macros::HarwError;
 
-use crate::protocol::WardenRequestEnvelope;
+use crate::peer::PeerGate;
+use crate::protocol::{decode_request, encode_reply, reply_for_denial};
 
-/// Empfangspuffer-Größe je Nachricht. Reichlich bemessen für ein einzelnes
-/// serialisiertes [`WardenRequestEnvelope`] (Vorbild:
-/// `harw-sentinel::ipc::RECV_BUFFER_LEN`, dort `16_384` für ein einzelnes
-/// `SecurityEvent`).
+/// Empfangspuffer-Größe je Nachricht. Reichlich bemessen für eine einzelne
+/// serialisierte v2-Anfrage (Vorbild: `harw-sentinel::ipc::RECV_BUFFER_LEN`).
 const RECV_BUFFER_LEN: usize = 16_384;
+
+/// Wie lange ein zugelassener Peer nach dem Verbinden Zeit hat, seine Anfrage
+/// zu senden.
+pub const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Fehler des IPC-Empfangspfads — je Verbindung, nicht prozessfatal (siehe
 /// `crate::error`-Moduldoku für die Abgrenzung zu [`crate::error::WardenBinError`]).
@@ -102,33 +90,22 @@ pub enum IpcError {
     /// Eine eingehende Verbindung konnte nicht angenommen werden.
     #[msg("failed to accept an ipc connection")]
     Accept,
-    /// Die Peer-Identität (`SO_PEERCRED`) einer angenommenen Verbindung
-    /// konnte nicht gelesen werden.
-    #[msg("failed to read peer credentials of an ipc connection")]
-    PeerCredentialsUnavailable,
-    /// Ein Lesevorgang auf einer angenommenen Verbindung ist fehlgeschlagen.
+    /// Ein Lesevorgang auf einer angenommenen Verbindung ist fehlgeschlagen
+    /// (auch: Zeitlimit überschritten).
     #[msg("failed to receive a message from an ipc peer")]
     Recv,
     /// Eine empfangene Nachricht war größer als [`RECV_BUFFER_LEN`] und
     /// wurde vom Kernel abgeschnitten.
     #[msg("received an ipc message larger than the receive buffer; it was discarded")]
     Oversized,
-    /// Eine empfangene Nachricht ließ sich nicht als
-    /// [`WardenRequestEnvelope`] dekodieren.
+    /// Eine Antwort ließ sich nicht als JSON kodieren.
     ///
     /// # Arguments
     /// - `0` (`serde_json::Error`): die zugrunde liegende Serde-Ursache.
-    #[msg("received an ipc message that could not be decoded as a WardenRequestEnvelope: {0}")]
-    #[from]
-    Malformed(serde_json::Error),
-    /// Eine `WardenResponse` ließ sich nicht als JSON kodieren.
-    ///
-    /// # Arguments
-    /// - `0` (`serde_json::Error`): die zugrunde liegende Serde-Ursache.
-    #[msg("failed to encode a warden response for the ipc peer: {0}")]
-    ResponseEncode(serde_json::Error),
+    #[msg("failed to encode a warden reply for the ipc peer: {0}")]
+    ReplyEncode(#[source] serde_json::Error),
     /// Das Senden einer Antwort an den Peer ist fehlgeschlagen.
-    #[msg("failed to send a response to an ipc peer")]
+    #[msg("failed to send a reply to an ipc peer")]
     Send,
 }
 
@@ -137,8 +114,7 @@ pub enum IpcError {
 /// # Description
 /// Gelesen genau einmal, direkt nach `accept()` — der Kernel füllt diese
 /// Werte aus dem verbindenden Prozess, nicht aus dessen (fälschbaren)
-/// Nutzlast. Siehe Moduldoku, Abschnitt „Was mit der Peer-Identität
-/// geschieht", für die bewusste Auslassung einer Zulassungsprüfung.
+/// Nutzlast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerCredentials {
     /// Prozess-ID des Peers zum Zeitpunkt von `connect()`.
@@ -150,161 +126,333 @@ pub struct PeerCredentials {
 }
 
 /// Nimmt Verbindungen auf dem von systemd übergebenen, bereits lauschenden
-/// Socket entgegen und bedient jede in einem eigenen Thread.
+/// Socket entgegen, weist fremde Peers sofort ab und bedient jede
+/// zugelassene Verbindung in einem eigenen Thread.
 ///
 /// # Description
-/// Endlosschleife über `accept()`; scheitert `accept()` dauerhaft (z. B.
-/// weil systemd den Socket geschlossen hat), endet diese Funktion — der
-/// Aufrufer (`crate::main::run`) behandelt das als
-/// [`crate::error::WardenBinError::IpcAcceptLoopTerminated`], kein stiller
-/// Rückkehrwert.
+/// Endlosschleife über `accept()`; scheitert `accept()` (z. B. weil systemd
+/// den Socket geschlossen hat), endet diese Funktion — der Aufrufer
+/// (`crate::main::run`) behandelt das als
+/// [`crate::error::WardenBinError::IpcAcceptLoopTerminated`].
 ///
 /// # Arguments
-/// - `listener` (`std::os::fd::OwnedFd`): der von
-///   [`crate::systemd::acquire_listen_socket`] gelieferte, bereits gebundene
-///   und lauschende Socket. Wird von dieser Funktion übernommen.
-/// - `warden` (`std::sync::Arc<harw_dod_warden::Warden>`): der produktive
-///   Warden (siehe `crate::warden_factory::build_production_warden`),
-///   geteilt über jeden Verbindungs-Thread.
+/// - `listener` (`OwnedFd`): der von [`crate::systemd::acquire_listen_socket`]
+///   gelieferte, bereits gebundene und lauschende Socket.
+/// - `warden` (`Arc<Warden>`): der produktive Warden.
+/// - `gate` (`Arc<PeerGate>`): die Peer-Allowlist.
 ///
 /// # Concurrency
-/// Startet `std::thread::spawn` je angenommener Verbindung, siehe
-/// Moduldoku.
-pub fn serve_forever(listener: OwnedFd, warden: Arc<Warden>) {
+/// Startet je zugelassener Verbindung einen Thread
+/// (`std::thread::Builder::spawn`); scheitert das, antwortet die Schleife
+/// selbst mit `unavailable`.
+pub fn serve_forever(listener: OwnedFd, warden: Arc<Warden>, gate: Arc<PeerGate>) {
     loop {
-        match accept_connection(&listener) {
-            Ok((connection, peer)) => {
-                let warden = Arc::clone(&warden);
-                std::thread::spawn(move || handle_connection(connection, peer, &warden));
-            }
-            Err(error) => {
-                tracing::error!(error = %error, "ipc accept failed; ceasing to serve");
+        // `SOCK_CLOEXEC`: ein `nft`-Kindprozess (Netfilter-Backend) erbt
+        // keine Escalator-Verbindung.
+        let connection = match rustix::net::accept_with(
+            &listener,
+            rustix::net::SocketFlags::CLOEXEC,
+        ) {
+            Ok(connection) => connection,
+            Err(_) => {
+                tracing::error!(error = %IpcError::Accept, "ipc accept failed; ceasing to serve");
                 break;
             }
+        };
+        let Some(peer) = peer_credentials(&connection) else {
+            gate.record_rejection();
+            reject_peer(&connection, None, &gate);
+            continue;
+        };
+        if !gate.admits(peer.uid) {
+            reject_peer(&connection, Some(peer), &gate);
+            continue;
         }
+        tracing::info!(
+            pid = peer.pid,
+            uid = peer.uid,
+            gid = peer.gid,
+            "ipc connection from the escalator accepted"
+        );
+        spawn_connection_thread(Arc::new(connection), Arc::clone(&warden));
     }
 }
 
-/// Nimmt genau eine Verbindung an und liest sofort ihre `SO_PEERCRED`-Identität.
-fn accept_connection(listener: &OwnedFd) -> Result<(OwnedFd, PeerCredentials), IpcError> {
-    use rustix::net::sockopt;
-
-    let accepted = rustix::net::accept(listener).map_err(|_| IpcError::Accept)?;
-    let creds =
-        sockopt::socket_peercred(&accepted).map_err(|_| IpcError::PeerCredentialsUnavailable)?;
-    let peer = PeerCredentials {
-        pid: creds.pid.as_raw_pid() as u32,
-        uid: creds.uid.as_raw() as u32,
-        gid: creds.gid.as_raw() as u32,
-    };
-    Ok((accepted, peer))
-}
-
-/// Bedient genau eine angenommene Verbindung: eine Anfrage lesen, an
-/// `Warden::handle` weiterreichen (unverändert, siehe Moduldoku), das
-/// Ergebnis inhaltsfrei beantworten oder — wo keine Wire-Entsprechung
-/// existiert — die Verbindung ohne Antwort schließen.
-fn handle_connection(connection: OwnedFd, peer: PeerCredentials, warden: &Warden) {
-    tracing::info!(?peer, "ipc connection accepted");
-    match recv_envelope(&connection) {
-        Ok(Some(envelope)) => {
-            let outcome = warden.handle(&envelope.finding, &envelope.request);
-            match outcome.to_wire() {
-                Some(response) => {
-                    if let Err(error) = send_response(&connection, &response) {
-                        tracing::warn!(?peer, error = %error, "failed to send warden response to peer");
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        ?peer,
-                        ?outcome,
-                        "no wire representation for this outcome; closing without a reply"
-                    );
-                }
-            }
-        }
-        Ok(None) => {
-            tracing::debug!(
-                ?peer,
-                "ipc peer closed the connection without sending a request"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(?peer, error = %error, "failed to receive a well-formed request from ipc peer");
-        }
+// Startet den Verbindungs-Thread. Lehnt das System einen neuen Thread ab
+// (`TasksMax`, `pids.max`, Speicher), bekommt der zugelassene Peer trotzdem
+// eine Antwort (`unavailable`), und die Annahmeschleife läuft weiter —
+// `std::thread::spawn` würde hier panicken und den Warden beenden.
+fn spawn_connection_thread(connection: Arc<OwnedFd>, warden: Arc<Warden>) {
+    let for_thread = Arc::clone(&connection);
+    let spawned =
+        std::thread::Builder::new().spawn(move || handle_connection(&for_thread, &warden));
+    if spawned.is_err() {
+        tracing::warn!("no thread for an admitted ipc connection; replied unavailable");
+        reply_without_thread(&connection);
     }
 }
 
-/// Empfängt eine Nachricht und dekodiert sie als [`WardenRequestEnvelope`].
+/// Answers an admitted connection that could not get its own thread.
 ///
 /// # Description
-/// `SOCK_SEQPACKET` liefert je `recv()` genau ein Datagramm — ein
-/// Ereignis, keinen Byte-Strom. Ein Datagramm der Länge `0` ist die
-/// geordnete Schließung der Verbindung durch den Peer, kein Fehler.
+/// Antwortet `unavailable`, ohne die Anfrage zu lesen, nicht blockierend
+/// (die Annahmeschleife darf nicht hängen).
+fn reply_without_thread(connection: &OwnedFd) {
+    if let Err(error) = send_reply(connection, &reply_for_denial(Denial::Unavailable), true) {
+        tracing::debug!(error = %error, "could not deliver the unavailable reply");
+    }
+}
+
+// Liest `SO_PEERCRED`; `None`, wenn der Kernel sie nicht liefert.
+fn peer_credentials(connection: &OwnedFd) -> Option<PeerCredentials> {
+    let creds = rustix::net::sockopt::socket_peercred(connection).ok()?;
+    Some(PeerCredentials {
+        pid: u32::try_from(creds.pid.as_raw_pid()).unwrap_or(0),
+        uid: creds.uid.as_raw(),
+        gid: creds.gid.as_raw(),
+    })
+}
+
+// Fremder Peer: feste Antwort ohne Lesen, Zähler steht bereits.
+fn reject_peer(connection: &OwnedFd, peer: Option<PeerCredentials>, gate: &PeerGate) {
+    tracing::warn!(
+        rejected_total = gate.rejected_total(),
+        "ipc peer is not the escalator; request not read"
+    );
+    tracing::debug!(?peer, "rejected ipc peer identity");
+    if let Err(error) = send_reply(connection, &reply_for_denial(Denial::PeerRejected), true) {
+        tracing::debug!(error = %error, "could not deliver the peer-rejected reply");
+    }
+}
+
+/// Bedient genau eine zugelassene Verbindung: eine Anfrage lesen, beantworten.
+fn handle_connection(connection: &OwnedFd, warden: &Warden) {
+    if let Err(error) = rustix::net::sockopt::set_socket_timeout(
+        connection,
+        rustix::net::sockopt::Timeout::Recv,
+        Some(RECV_TIMEOUT),
+    ) {
+        tracing::debug!(error = %error, "could not set the receive timeout");
+    }
+    let mut buffer = [0u8; RECV_BUFFER_LEN];
+    let reply = match recv_datagram(connection, &mut buffer) {
+        Ok(None) => {
+            tracing::debug!("ipc peer closed the connection without sending a request");
+            return;
+        }
+        Ok(Some(request_bytes)) => respond(request_bytes, warden, jiff::Timestamp::now()),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to receive a well-formed request from the escalator");
+            reply_for_denial(Denial::Malformed)
+        }
+    };
+    if let Err(error) = send_reply(connection, &reply, false) {
+        tracing::warn!(error = %error, "failed to send the warden reply to the escalator");
+    }
+}
+
+/// Turns one received request into exactly one reply (no socket involved).
 ///
-/// `rustix::net::recv` liefert für einen `&mut [u8; N]`-Puffer ein Tupel
-/// `(Buf::Output, usize)`, kein Skalar (gegen
-/// `rustix-1.1.4/src/net/send_recv/mod.rs` nachgeschlagen, nicht aus dem
-/// Gedächtnis übernommen — siehe Moduldoku): `copied` ist die Anzahl
-/// tatsächlich in `buffer` geschriebener Bytes, `message_len` die
-/// **ungekürzte** Größe des Datagramms (`RecvFlags::TRUNC`).
+/// # Description
+/// Dekodiert als v2 (v1 wird ausdrücklich abgelehnt) und reicht die Anfrage
+/// unverändert an `Warden::handle`. Jeder Pfad ergibt eine Antwort.
+pub fn respond(request_bytes: &[u8], warden: &Warden, now: jiff::Timestamp) -> WardenReply {
+    match decode_request(request_bytes) {
+        Ok(request) => warden.handle(&request, now).to_reply(),
+        Err(error) => {
+            let reason = error.as_denial();
+            tracing::warn!(reason = %reason, error = %error, "warden request refused while decoding");
+            reply_for_denial(reason)
+        }
+    }
+}
+
+/// Empfängt genau ein Datagramm in `buffer`.
+///
+/// # Description
+/// `SOCK_SEQPACKET` liefert je `recv()` genau ein Datagramm. Ein Datagramm
+/// der Länge `0` ist die geordnete Schließung durch den Peer, kein Fehler.
+/// `copied` ist die Anzahl tatsächlich in `buffer` geschriebener Bytes,
+/// `message_len` die ungekürzte Größe (`RecvFlags::TRUNC`).
 ///
 /// # Returns
-/// - `Some(envelope)`: eine Nachricht wurde empfangen und dekodiert.
+/// - `Some(bytes)`: die empfangene Nachricht (Teilstück von `buffer`).
 /// - `None`: der Peer hat die Verbindung geordnet geschlossen.
 ///
 /// # Errors
-/// - [`IpcError::Recv`]: der zugrunde liegende `recv()`-Aufruf schlägt fehl.
-/// - [`IpcError::Oversized`]: das Datagramm war größer als
-///   [`RECV_BUFFER_LEN`].
-/// - [`IpcError::Malformed`]: die empfangenen Bytes sind kein wohlgeformtes
-///   [`WardenRequestEnvelope`]-JSON.
-fn recv_envelope(connection: &OwnedFd) -> Result<Option<WardenRequestEnvelope>, IpcError> {
+/// - [`IpcError::Recv`]: `recv()` scheitert (auch Zeitlimit).
+/// - [`IpcError::Oversized`]: das Datagramm war größer als `buffer`.
+fn recv_datagram<'a>(
+    connection: &OwnedFd,
+    buffer: &'a mut [u8; RECV_BUFFER_LEN],
+) -> Result<Option<&'a [u8]>, IpcError> {
     use rustix::net::RecvFlags;
 
-    let mut buffer = [0u8; RECV_BUFFER_LEN];
-    let (copied, message_len) =
-        rustix::net::recv(connection, &mut buffer, RecvFlags::TRUNC).map_err(|_| IpcError::Recv)?;
-
+    let (copied, message_len) = rustix::net::recv(connection, &mut *buffer, RecvFlags::TRUNC)
+        .map_err(|_| IpcError::Recv)?;
     if message_len == 0 {
         return Ok(None);
     }
-    if message_len > buffer.len() {
-        // Nachrichtengrenze bei `SOCK_SEQPACKET`: der Rest dieses
-        // Datagramms ist verloren, aber der Peer hat korrekt gesendet, nur
-        // zu groß für diesen Puffer — kein Parse-Fehler.
+    if message_len > RECV_BUFFER_LEN {
         return Err(IpcError::Oversized);
     }
-
-    let envelope: WardenRequestEnvelope = serde_json::from_slice(&buffer[..copied])?;
-    Ok(Some(envelope))
+    let received = buffer.get(..copied).ok_or(IpcError::Recv)?;
+    Ok(Some(received))
 }
 
-/// Sendet eine bereits inhaltsfrei begrenzte [`harw_dod_warden_proto::WardenResponse`]
-/// unverändert an den Peer.
+/// Sendet eine bereits inhaltsfrei begrenzte Antwort an den Peer.
 ///
 /// # Errors
-/// - [`IpcError::ResponseEncode`]: `response` ließ sich nicht als JSON
-///   kodieren (praktisch unerreichbar — die von der Bibliothek gelieferten
-///   Feldtypen sind ausschließlich `harw-types`-Kennungen und feldlose
-///   Enums).
-/// - [`IpcError::Send`]: der zugrunde liegende `send()`-Aufruf schlägt fehl.
-fn send_response(
+/// - [`IpcError::ReplyEncode`]: Kodierung scheitert (praktisch unerreichbar).
+/// - [`IpcError::Send`]: `send()` scheitert (`NOSIGNAL`: kein `SIGPIPE`;
+///   bei `non_blocking` auch, wenn der Puffer voll ist).
+fn send_reply(
     connection: &OwnedFd,
-    response: &harw_dod_warden_proto::WardenResponse,
+    reply: &WardenReply,
+    non_blocking: bool,
 ) -> Result<(), IpcError> {
     use rustix::net::SendFlags;
 
-    let bytes = serde_json::to_vec(response).map_err(IpcError::ResponseEncode)?;
-    rustix::net::send(connection, &bytes, SendFlags::empty()).map_err(|_| IpcError::Send)?;
+    let bytes = encode_reply(reply).map_err(IpcError::ReplyEncode)?;
+    let flags = if non_blocking {
+        SendFlags::NOSIGNAL | SendFlags::DONTWAIT
+    } else {
+        SendFlags::NOSIGNAL
+    };
+    rustix::net::send(connection, &bytes, flags).map_err(|_| IpcError::Send)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::IpcError;
-    use crate::test_support::{TestError, TestResult};
+    use std::os::fd::OwnedFd;
+
+    use super::{
+        IpcError, handle_connection, reject_peer, reply_without_thread, respond,
+        spawn_connection_thread,
+    };
+    use crate::peer::PeerGate;
+    use crate::test_support::{TestError, TestResult, ctx, private_tempdir};
+    use harw_dod_warden::{
+        ActionAllowlist, DenyList, RecordedCall, RecordingAuditSink, RecordingExecutor,
+        StaticTargetObserver, Warden, WardenParts, WardenPolicy, WardenState,
+    };
+    use harw_dod_warden_proto::{
+        AuthorizationBody, CgroupKernelId, CgroupTarget, Denial, EscalationStage, KeyId, KeyRing,
+        ProofKey, ProofPolicy, SignedAuthorization, WardenAction, WardenReply, WardenRequest,
+        WardenResponse,
+    };
+    use harw_types::{ApprovalActor, CgroupId, FindingId};
+    use serde_json::{Value, json};
+
+    const KEY: [u8; 32] = [0x11; 32];
+    const NOW: i64 = 1_800_000_000;
+
+    fn at(offset: i64) -> TestResult<jiff::Timestamp> {
+        jiff::Timestamp::from_second(NOW.saturating_add(offset)).map_err(ctx("timestamp"))
+    }
+
+    fn cgroup() -> TestResult<CgroupId> {
+        CgroupId::try_from_str("harw.slice/job-1").map_err(ctx("cgroup"))
+    }
+
+    fn warden(dir: &std::path::Path, executor: RecordingExecutor) -> TestResult<Warden> {
+        let mut keys = KeyRing::new();
+        keys.insert(
+            KeyId::new("k1").map_err(ctx("key id"))?,
+            ProofKey::from_bytes(KEY),
+        )
+        .map_err(ctx("ring"))?;
+        let observer = StaticTargetObserver::new();
+        observer.set(&cgroup()?, CgroupKernelId::new(4242).map_err(ctx("kid"))?);
+        let policy = WardenPolicy::new(
+            ProofPolicy::new(120, 5, vec!["harw.slice".to_owned()]).map_err(ctx("proof"))?,
+            ActionAllowlist::freeze_and_thaw(),
+            DenyList::builtin(),
+        );
+        Ok(Warden::new(WardenParts {
+            freezer: Box::new(executor.clone()),
+            thawer: Box::new(executor.clone()),
+            isolator: Box::new(executor.clone()),
+            killer: Box::new(executor),
+            observer: Box::new(observer),
+            audit: Box::new(RecordingAuditSink::new()),
+            keys,
+            policy,
+            state: WardenState::open(dir, at(0)?).map_err(ctx("state"))?,
+        }))
+    }
+
+    fn freeze_request(nonce: u8) -> TestResult<WardenRequest> {
+        signed_request(
+            &WardenAction::FreezeCgroup { cgroup: cgroup()? },
+            EscalationStage::RuleTriggered,
+            nonce,
+        )
+    }
+
+    // Gültig signierte Anfrage; `irreversible_ack` folgt der Aktion.
+    fn signed_request(
+        action: &WardenAction,
+        stage: EscalationStage,
+        nonce: u8,
+    ) -> TestResult<WardenRequest> {
+        let body = AuthorizationBody {
+            finding_id: FindingId::try_from_str("finding-1").map_err(ctx("finding"))?,
+            approver: ApprovalActor::Operator {
+                id: "operator-1".to_owned(),
+            },
+            action: action.clone(),
+            stage,
+            target: CgroupTarget::new(
+                cgroup()?,
+                CgroupKernelId::new(4242).map_err(ctx("kid"))?,
+                at(-60)?,
+            ),
+            hold_secs: None,
+            irreversible_ack: action.requires_irreversible_ack(),
+            nonce: [nonce; 16],
+            issued_at: at(0)?,
+            expires_at: at(60)?,
+        };
+        Ok(WardenRequest::new(
+            action.clone(),
+            SignedAuthorization::sign(
+                &ProofKey::from_bytes(KEY),
+                &KeyId::new("k1").map_err(ctx("key id"))?,
+                body,
+            ),
+        ))
+    }
+
+    // Ein lokales `SOCK_SEQPACKET`-Paar (kein Dateisystem, kein Netz).
+    fn seqpacket_pair() -> TestResult<(OwnedFd, OwnedFd)> {
+        rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::SEQPACKET,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(ctx("socketpair"))
+    }
+
+    // Liest genau eine Antwort vom Client-Ende.
+    fn read_reply(client: &OwnedFd) -> TestResult<WardenReply> {
+        let mut buffer = [0u8; 4096];
+        let (copied, _) = rustix::net::recv(client, &mut buffer, rustix::net::RecvFlags::DONTWAIT)
+            .map_err(ctx("reply is waiting"))?;
+        let bytes = buffer
+            .get(..copied)
+            .ok_or(TestError::Missing("reply bytes"))?;
+        serde_json::from_slice(bytes).map_err(ctx("reply decodes"))
+    }
+
+    fn reason(reply: &WardenReply) -> Option<Denial> {
+        match reply.outcome {
+            WardenResponse::Denied { reason } => Some(reason),
+            WardenResponse::Executed { .. } => None,
+        }
+    }
 
     #[test]
     fn test_oversized_message_error_is_content_free() {
@@ -315,25 +463,161 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_error_wraps_and_links_the_inner_serde_error() -> TestResult {
+    fn test_reply_encode_error_links_the_inner_serde_error() -> TestResult {
         use std::error::Error as _;
 
-        let Err(json_err) = serde_json::from_str::<serde_json::Value>("not json") else {
+        let Err(json_err) = serde_json::from_str::<Value>("not json") else {
             return Err(TestError::Unexpected(
                 "expected deliberately malformed JSON to fail parsing".into(),
             ));
         };
-        let err: IpcError = json_err.into();
-        assert!(matches!(err, IpcError::Malformed(_)));
+        let err = IpcError::ReplyEncode(json_err);
         assert!(err.source().is_some());
         Ok(())
     }
 
-    // `serve_forever`/`accept_connection`/`handle_connection` werden hier
-    // bewusst nicht getestet: jede würde einen echten Socket annehmen oder
-    // öffnen — nach Aufgabenstellung ausdrücklich untersagt. Die Anfrage-
-    // Verarbeitung selbst (`Warden::handle` unverändert erreicht, inhalts-
-    // freie Antwort) ist in `crate::warden_factory`s Tests direkt gegen den
-    // produktiven Warden geprüft, ohne einen Socket zu benötigen. Das
-    // Umschlag-Format ist in `crate::protocol`s Tests geprüft.
+    #[test]
+    fn test_valid_request_reaches_the_warden_and_replay_is_refused() -> TestResult {
+        let dir = private_tempdir()?;
+        let executor = RecordingExecutor::new();
+        let warden = warden(dir.path(), executor.clone())?;
+        let bytes = serde_json::to_vec(&freeze_request(1)?).map_err(ctx("encode"))?;
+        let first = respond(&bytes, &warden, at(1)?);
+        assert!(matches!(first.outcome, WardenResponse::Executed { .. }));
+        assert_eq!(executor.calls(), vec![RecordedCall::Freeze(cgroup()?)]);
+        assert_eq!(
+            reason(&respond(&bytes, &warden, at(2)?)),
+            Some(Denial::ProofMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_every_failure_path_produces_a_reply() -> TestResult {
+        let dir = private_tempdir()?;
+        // Dekodieren: kein JSON, v1-Umschlag.
+        let ok_warden = warden(dir.path(), RecordingExecutor::new())?;
+        assert_eq!(
+            reason(&respond(b"garbage", &ok_warden, at(1)?)),
+            Some(Denial::Malformed)
+        );
+        let legacy = json!({ "finding": "finding-1", "request": { "action": {}, "proof": {} } });
+        let legacy_bytes = serde_json::to_vec(&legacy).map_err(ctx("encode"))?;
+        assert_eq!(
+            reason(&respond(&legacy_bytes, &ok_warden, at(1)?)),
+            Some(Denial::UnsupportedVersion)
+        );
+        // Verifikation: abgelaufen.
+        let expired = serde_json::to_vec(&freeze_request(2)?).map_err(ctx("encode"))?;
+        assert_eq!(
+            reason(&respond(&expired, &ok_warden, at(500)?)),
+            Some(Denial::ProofMismatch)
+        );
+        // Bindung: Aktion weicht von der signierten ab.
+        let mut swapped = freeze_request(3)?;
+        swapped.action = WardenAction::ThawCgroup { cgroup: cgroup()? };
+        let swapped_bytes = serde_json::to_vec(&swapped).map_err(ctx("encode"))?;
+        assert_eq!(
+            reason(&respond(&swapped_bytes, &ok_warden, at(1)?)),
+            Some(Denial::ProofMismatch)
+        );
+        // Policy: Kill ist korrekt signiert, aber nicht in der Allowlist.
+        let kill = WardenAction::KillProcessTree { cgroup: cgroup()? };
+        let kill_bytes = serde_json::to_vec(&signed_request(&kill, EscalationStage::Escalated, 5)?)
+            .map_err(ctx("encode"))?;
+        assert_eq!(
+            reason(&respond(&kill_bytes, &ok_warden, at(1)?)),
+            Some(Denial::PolicyDenied)
+        );
+        drop(ok_warden);
+        // Ausführung scheitert: trotzdem eine Antwort.
+        let failing = warden(dir.path(), RecordingExecutor::new_failing())?;
+        let fresh = serde_json::to_vec(&freeze_request(4)?).map_err(ctx("encode"))?;
+        assert_eq!(
+            reason(&respond(&fresh, &failing, at(1)?)),
+            Some(Denial::ExecutionFailed)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rejected_peer_gets_a_reply_and_its_request_stays_unread() -> TestResult {
+        let (server, client) = seqpacket_pair()?;
+        rustix::net::send(&client, b"{\"version\":2}", rustix::net::SendFlags::empty())
+            .map_err(ctx("client sends"))?;
+        let gate = PeerGate::new(4_000_000);
+        assert!(!gate.admits(1000));
+        reject_peer(&server, None, &gate);
+        assert_eq!(reason(&read_reply(&client)?), Some(Denial::PeerRejected));
+        // Der Warden hat nichts gelesen: die Anfrage liegt noch im Socket.
+        let mut pending = [0u8; 64];
+        let (unread, _) =
+            rustix::net::recv(&server, &mut pending, rustix::net::RecvFlags::DONTWAIT)
+                .map_err(ctx("request still queued"))?;
+        assert_eq!(unread, 13);
+        Ok(())
+    }
+
+    #[test]
+    fn test_connection_without_a_thread_gets_an_unavailable_reply() -> TestResult {
+        let (server, client) = seqpacket_pair()?;
+        reply_without_thread(&server);
+        assert_eq!(reason(&read_reply(&client)?), Some(Denial::Unavailable));
+        Ok(())
+    }
+
+    #[test]
+    fn test_spawned_connection_thread_answers_through_the_shared_descriptor() -> TestResult {
+        let dir = private_tempdir()?;
+        let warden = std::sync::Arc::new(warden(dir.path(), RecordingExecutor::new())?);
+        let (server, client) = seqpacket_pair()?;
+        let bytes = serde_json::to_vec(&freeze_request(9)?).map_err(ctx("encode"))?;
+        rustix::net::send(&client, &bytes, rustix::net::SendFlags::empty())
+            .map_err(ctx("client sends"))?;
+        spawn_connection_thread(std::sync::Arc::new(server), warden);
+        // Blockierend lesen (mit Zeitlimit), bis der Thread geantwortet hat.
+        rustix::net::sockopt::set_socket_timeout(
+            &client,
+            rustix::net::sockopt::Timeout::Recv,
+            Some(std::time::Duration::from_secs(10)),
+        )
+        .map_err(ctx("client timeout"))?;
+        let mut buffer = [0u8; 4096];
+        let (copied, _) = rustix::net::recv(&client, &mut buffer, rustix::net::RecvFlags::empty())
+            .map_err(ctx("reply arrives"))?;
+        let reply: WardenReply = serde_json::from_slice(
+            buffer
+                .get(..copied)
+                .ok_or(TestError::Missing("reply bytes"))?,
+        )
+        .map_err(ctx("reply decodes"))?;
+        // Die Anfrage ist mit `now` des Threads verarbeitet worden; ob sie
+        // dabei abgelaufen ist, spielt hier keine Rolle — es kommt genau eine
+        // Antwort.
+        assert!(matches!(
+            reply.outcome,
+            WardenResponse::Executed { .. } | WardenResponse::Denied { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_connection_with_garbage_or_oversized_request_still_gets_a_reply() -> TestResult {
+        let dir = private_tempdir()?;
+        let warden = warden(dir.path(), RecordingExecutor::new())?;
+
+        let (server, client) = seqpacket_pair()?;
+        rustix::net::send(&client, b"garbage", rustix::net::SendFlags::empty())
+            .map_err(ctx("send garbage"))?;
+        handle_connection(&server, &warden);
+        assert_eq!(reason(&read_reply(&client)?), Some(Denial::Malformed));
+
+        let (server, client) = seqpacket_pair()?;
+        let oversized = vec![b' '; 20_000];
+        rustix::net::send(&client, &oversized, rustix::net::SendFlags::empty())
+            .map_err(ctx("send oversized"))?;
+        handle_connection(&server, &warden);
+        assert_eq!(reason(&read_reply(&client)?), Some(Denial::Malformed));
+        Ok(())
+    }
 }

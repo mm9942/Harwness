@@ -1,12 +1,15 @@
 //! Der Autorisierungsbeleg v1: [`AuthorizationProof`] — **Altlast**.
 //!
-//! # v1 ist nicht mehr gültig (C-WPROTO, W3)
+//! # v1 ist nicht mehr gültig (C-WPROTO, W3; PL-100 WP 3.1)
 //! Dieser Beleg hat weder MAC noch Nonce noch Ablauf und ist von jedem
 //! Absender fälschbar (Befund F-001); die unten stehende Aussage, er sei eine
 //! „Schicht, die selbst ein Absender, der den Socket benutzen darf, nicht
 //! umgehen kann“, trifft nicht zu. Nachfolger: [`crate::signed::SignedAuthorization`].
-//! Der Typ bleibt nur, bis `harw-dod-warden`/`harw-warden`/`harw-dod-escalate`
-//! in W5 (D-WARDEN, D-ESC) umgestellt sind, und wird danach entfernt.
+//! Der Typ ist `#[deprecated]` und bleibt nur, bis `harw-dod-escalate` (und
+//! über ihn `harw-plan-bridge`) auf Proof v2 umgestellt ist; danach wird er
+//! entfernt. Der Warden lehnt einen v1-Auftrag ausdrücklich ab
+//! ([`crate::response::WardenRequest::decode`],
+//! [`crate::error::ProofError::LegacyV1Refused`]).
 //!
 //! # Verantwortungsbereich
 //! Der Beleg, dass eine Aktion autorisiert wurde — so beschaffen, dass der
@@ -67,6 +70,10 @@
 //! empfangener Wire-Bytes (über [`crate::response::WardenActionRequest`])
 //! und liest sie nur über die Zugriffsmethoden dieses Moduls.
 
+// Dieses Modul ist vollständig v1-Altlast und nennt deshalb die eigenen
+// stillgelegten Typen; die Warnung gilt weiter für jeden Aufrufer außerhalb.
+#![allow(deprecated)]
+
 use harw_types::{ApprovalActor, ContentDigest, FindingId};
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +91,9 @@ use crate::stage::EscalationStage;
 /// # Wire-Format
 /// `deny_unknown_fields` (K19) — dieser Typ nimmt Daten entgegen, die über
 /// die Leitung vom Eskalationsleiter kommen.
+#[deprecated(
+    note = "forgeable v1 proof (F-001), refused by the warden; sign a SignedAuthorization (proof v2) instead"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationProof {
@@ -119,6 +129,7 @@ impl AuthorizationProof {
     ///
     /// # Examples
     /// ```rust
+    /// #![allow(deprecated)]
     /// use harw_dod_warden_proto::{AuthorizationProof, EscalationStage, WardenAction};
     /// use harw_types::{ApprovalActor, CgroupId, FindingId};
     ///
@@ -207,6 +218,7 @@ impl AuthorizationProof {
     ///
     /// # Examples
     /// ```rust
+    /// #![allow(deprecated)]
     /// use harw_dod_warden_proto::{AuthorizationProof, EscalationStage, WardenAction};
     /// use harw_types::{ApprovalActor, CgroupId, FindingId};
     ///
@@ -267,6 +279,7 @@ impl AuthorizationProof {
     ///
     /// # Examples
     /// ```rust
+    /// #![allow(deprecated)]
     /// use harw_dod_warden_proto::{AuthorizationProof, EscalationStage, WardenAction};
     /// use harw_types::{ApprovalActor, CgroupId, FindingId};
     ///

@@ -12,7 +12,8 @@
 //! Autorisierungsentscheidung, es verdrahtet nur Transport, Startreihenfolge
 //! und die beiden produktiven Implementierungen, die die Bibliothek
 //! bewusst nicht selbst mitbringt ([`audit::TracingAuditSink`],
-//! [`isolation::NftNetworkIsolator`]).
+//! [`isolation::NftNetworkIsolator`]), und legt die Sandbox an (Landlock,
+//! seccomp).
 //!
 //! # Abhängigkeitsbudget (K53)
 //! Das Plan-Dokument setzt für den gesamten Warden-Teilbaum eine Obergrenze
@@ -48,6 +49,19 @@
 //!    laut eigener Beschreibung **keiner einzigen** weiteren Abhängigkeit
 //!    (siehe `src/systemd.rs`-Moduldoku), also dem kleinstmöglichen
 //!    Zuwachs für das eine Problem, das sie löst.
+//! 3. **PL-100 WP 3.1** ergänzt `jiff` als Laufzeit-Eintrag (die Uhr für
+//!    die Proof-Prüfung und den Hold-Timer liest dieses Binary, nicht die
+//!    Bibliothek). `jiff` liegt über `harw-dod-warden-proto` bereits in der
+//!    Hülle — kein neues Paket. Für `warden.toml` wird bewusst keine
+//!    `toml`-Crate gezogen (siehe `harw_dod_warden::config`). Der direkte
+//!    Eintrag `serde` entfällt mit dem eigenen v1-Umschlag
+//!    (`WardenRequestEnvelope`); `serde` bleibt über die Kette in der Hülle.
+//! 4. **PL-100 Entscheidung O10** ergänzt `seccompiler` (seccomp-Filter,
+//!    [`seccomp`]) und `libc` (nur `SYS_*`- und Fehlerkonstanten für dessen
+//!    Allowlist). `libc` liegt über `landlock` bereits in der Hülle;
+//!    `seccompiler` ist **ein** neues Paket ohne weitere eigene
+//!    Abhängigkeit. Eine nftables-Crate kommt nicht hinzu (Bewertung in der
+//!    [`isolation`]-Moduldoku).
 //!
 //! **Befund, nicht Stillschweigen:** Der genannte Ausgangsstand „8 von 12"
 //! lässt sich mit dieser Zählmethode nicht rekonstruieren (die geerbte
@@ -56,8 +70,8 @@
 //! dass das eigentliche Gate (laut `harw-dod-warden-proto`s eigener
 //! Dokumentation zum Zeitpunkt jenes Knotens noch nicht lauffähig) eine
 //! andere, hier nicht bekannte Zählmethode verwendet. Diese Crate vermeidet
-//! trotzdem jede vermeidbare zusätzliche Abhängigkeit (kein `libc`, kein
-//! Mehrzweck-Socket-Framework, keine eigene Zeitzonen- oder
+//! trotzdem jede vermeidbare zusätzliche Abhängigkeit (`libc` nur für
+//! Konstanten, kein Mehrzweck-Socket-Framework, keine eigene Zeitzonen- oder
 //! Netz-Bibliothek) und macht ihre eigene Zählung und Methode hier
 //! nachprüfbar, statt eine Zahl zu behaupten, die diese Crate selbst nicht
 //! herleiten kann.
@@ -76,6 +90,14 @@
 //! hier ein harter Fehlschlag, kein stiller Teilerfolg (es gibt nur ein
 //! Wurzelverzeichnis, nicht mehrere).
 //!
+//! # seccomp nach Landlock (PL-100 Entscheidung O10)
+//! Nach Landlock bindet [`seccomp::install`] eine Allowlist für alle Threads:
+//! Speicher, Threads, Uhr, Zustandsdateien, cgroup-Kontrolldateien und der
+//! Austausch auf dem geerbten Socket. Programme starten und Netlink-Sockets
+//! anlegen darf der Warden nur, wenn die Policy eine Netzaktion erlaubt
+//! (dann für das `nft`-Kindprozess-Backend, siehe [`isolation`]). Ein nicht
+//! installierbarer Filter ist ein harter Startfehler wie bei Landlock.
+//!
 //! # Warum `SO_PEERCRED`, nicht ein Token im Rumpf
 //! Siehe [`ipc`]-Moduldoku, Abschnitt „Warum `SO_PEERCRED`, nicht ein Token
 //! im Rumpf": `harw_dod_warden`s eigene Dokumentation benennt die
@@ -83,6 +105,17 @@
 //! `SOCK_SEQPACKET`-Unix-Socket mit `SO_PEERCRED`, AW5-04b" — diese Crate
 //! liest sie deshalb bei jeder angenommenen Verbindung, bevor irgendeine
 //! Nutzlast gelesen wird, und glaubt keiner Behauptung im Nachrichtenrumpf.
+//! Seit PL-100 WP 3.1 ist die Peer-uid eine Allowlist ([`peer`]): nur die
+//! uid des Escalators wird bedient, jeder andere Peer erhält ungelesen die
+//! Antwort `peer-rejected`.
+//!
+//! # Proof v2 und Warden-eigene Policy (PL-100 WP 3.1)
+//! Akzeptiert wird nur die v2-Anfrage mit `SignedAuthorization`; ein
+//! v1-Auftrag wird beim Dekodieren ausdrücklich abgelehnt ([`protocol`]).
+//! Policy (`--policy`, Vorgabe `/etc/harw-dod/warden.toml`), Proof-Schlüssel
+//! und Escalator-uid lädt dieses Binary vor Landlock selbst; Nonce-Ledger,
+//! Aktions-Ledger und Hold-Timer liegen im StateDirectory (`--state-dir`,
+//! Vorgabe `/var/lib/harw-warden`). Jede Anfrage bekommt eine Antwort.
 //!
 //! # Die `LISTEN_PID`-Prüfung
 //! Systemd übergibt Sockets über geerbte Umgebungsvariablen
@@ -101,16 +134,19 @@
 //!
 //! # Kein Netz
 //! Dieses Binary öffnet keinen TCP-Socket, macht keine DNS-Auflösung und
-//! nimmt keine Netz-Crate auf. [`isolation::NftNetworkIsolator`] isoliert
-//! cgroups ausschließlich über das lokale `nft`-Binary (nftables), ohne
-//! selbst Netzverkehr zu erzeugen.
+//! nimmt keine Netz-Crate auf; der seccomp-Filter erlaubt `socket` gar
+//! nicht bzw. (bei erlaubter Netzaktion) nur für `AF_NETLINK`.
+//! [`isolation::NftNetworkIsolator`] isoliert cgroups über ein
+//! [`isolation::NetfilterBackend`] — heute das lokale `nft`-Binary
+//! (nftables) —, ohne selbst Netzverkehr zu erzeugen.
 //!
 //! # Audit vor jedem Fehlerpfad — auch hier durchgesetzt, nicht umgangen
-//! `Warden::handle` schreibt einen Audit-Eintrag vor jedem Ausführungs-
-//! versuch (siehe `harw_dod_warden::warden`-Moduldoku). Dieses Binary trifft
-//! **keine eigene** Entscheidung vor diesem Aufruf — [`ipc::handle_connection`]
-//! reicht die empfangene Anfrage unverändert an `Warden::handle` weiter,
-//! ohne selbst zu filtern, zu validieren oder vorzuentscheiden.
+//! `Warden::handle` schreibt einen dauerhaften Ledger-Eintrag und einen
+//! Audit-Eintrag vor jedem Ausführungsversuch (siehe
+//! `harw_dod_warden::warden`-Moduldoku). Dieses Binary entscheidet vor
+//! diesem Aufruf nur über den Transport: Peer-Allowlist und Dekodieren
+//! (v2 oder Ablehnung). Eine dekodierte Anfrage geht unverändert an
+//! `Warden::handle` ([`ipc::respond`]).
 //!
 //! # Inhaltsfreie Antworten
 //! Siehe [`ipc`]-Moduldoku, Abschnitt „Inhaltsfreie Antworten": was diesen
@@ -143,9 +179,13 @@ mod cli;
 mod error;
 mod ipc;
 mod isolation;
+mod keygen;
 mod landlock;
+mod peer;
 mod protocol;
+mod seccomp;
 mod systemd;
+mod timer;
 mod warden_factory;
 
 use std::process::ExitCode;
@@ -166,7 +206,7 @@ use error::WardenBinError;
 ///
 /// # Returns
 /// `ExitCode::SUCCESS` nur bei `--help`/`--version` oder nach erfolgreichem
-/// `completions`. Jeder andere Pfad ist
+/// `completions` bzw. `keygen`. Jeder andere Pfad ist
 /// `ExitCode::FAILURE` — `run` selbst kehrt nie mit `Ok` zurück (siehe
 /// dessen Doku): ein Durchsetzer, dessen Annahmeschleife endet, hat seine
 /// eine Aufgabe nicht mehr erfüllen können.
@@ -227,13 +267,32 @@ fn init_tracing(level: cli::LogLevel) {
 /// Führt den eigentlichen Durchsetzerbetrieb aus.
 ///
 /// # Description
-/// Reihenfolge: den systemd-Socket erwerben ([`systemd::acquire_listen_socket`],
-/// harter Fehler ohne ihn — siehe dessen Moduldoku für die `LISTEN_PID`-
-/// Prüfung), **dann** über Landlock selbst auf `cli.cgroup_root`
-/// einschränken (harter Abbruch bei jedem Ausgang außer vollständiger
-/// Durchsetzung, siehe [`landlock`]-Moduldoku), den produktiven Warden
-/// zusammenbauen ([`warden_factory::build_production_warden`]) und die
-/// Annahmeschleife starten ([`ipc::serve_forever`]). Der Socket selbst wird
+/// Reihenfolge (PL-100 WP 3.1):
+/// 1. den systemd-Socket erwerben ([`systemd::acquire_listen_socket`],
+///    harter Fehler ohne ihn — siehe dessen Moduldoku für die
+///    `LISTEN_PID`-Prüfung);
+/// 2. die Warden-eigene Policy laden (`cli.policy`, root-eigen, nicht
+///    gruppen- oder weltschreibbar, [`harw_dod_warden::load_warden_config`]);
+/// 3. den Schlüsselring aus `proof_key_dir` laden (Dateien `0600` root,
+///    [`harw_dod_warden::load_key_ring`]);
+/// 4. die Escalator-uid für die Peer-Allowlist einmal auflösen
+///    ([`peer::resolve_escalator_uid`]);
+/// 5. das StateDirectory öffnen (Nonce-Ledger, Aktions-Ledger, Holds;
+///    [`harw_dod_warden::WardenState::open`]);
+/// 6. den produktiven Warden zusammenbauen
+///    ([`warden_factory::build_production_warden`], reiner Zusammenbau);
+///    er liefert auch den Sandbox-Bedarf des Netfilter-Backends (leer ohne
+///    erlaubte Netzaktion);
+/// 7. **dann** über Landlock auf `cli.cgroup_root`, `cli.state_dir` und
+///    diesen Bedarf einschränken (harter Abbruch bei jedem Ausgang außer
+///    vollständiger Durchsetzung, siehe [`landlock`]-Moduldoku) — Policy,
+///    Schlüssel und `/etc/passwd` sind danach unerreichbar;
+/// 8. die seccomp-Allowlist für alle Threads binden ([`seccomp::install`],
+///    PL-100 O10; harter Abbruch, wenn das scheitert);
+/// 9. den Hold-Timer starten ([`timer::spawn_hold_sweeper`]) und die
+///    Annahmeschleife starten ([`ipc::serve_forever`]).
+///
+/// Der Socket selbst wird
 /// vor Landlock erworben, weil er ein bereits von systemd geöffneter,
 /// geerbter Deskriptor ist — Landlock beschränkt zukünftige
 /// Pfadauflösungen, nicht bereits offene Deskriptoren; die Reihenfolge ist
@@ -245,7 +304,7 @@ fn init_tracing(level: cli::LogLevel) {
 /// - `cli` (`cli::Cli`): die geparste Kommandozeile.
 ///
 /// # Returns
-/// `Ok(())` nur nach dem Unterkommando `completions`. Sonst kehrt diese
+/// `Ok(())` nur nach den Unterkommandos `completions` und `keygen`. Sonst kehrt diese
 /// Funktion nie mit `Ok` zurück — [`ipc::serve_forever`] kehrt nur zurück,
 /// wenn die Annahmeschleife endgültig endet, was diese Funktion als
 /// [`WardenBinError::IpcAcceptLoopTerminated`] meldet.
@@ -255,35 +314,136 @@ fn init_tracing(level: cli::LogLevel) {
 /// [`WardenBinError::ListenPidForeign`]/[`WardenBinError::ListenFdsMissing`]/
 /// [`WardenBinError::ListenFdsMalformed`]/[`WardenBinError::UnexpectedListenFdCount`]/
 /// [`WardenBinError::ListenFdsAcquisitionFailed`]: siehe [`systemd`].
+/// [`WardenBinError::Setup`]: Policy, Schlüssel oder StateDirectory.
+/// [`WardenBinError::PasswdUnreadable`]/[`WardenBinError::PasswdTooLarge`]/
+/// [`WardenBinError::EscalatorUserUnknown`]/
+/// [`WardenBinError::EscalatorUserAmbiguous`]/[`WardenBinError::EscalatorUidRoot`]:
+/// siehe [`peer`].
+/// [`WardenBinError::NetAdminMissing`]: Netzaktionen erlaubt, aber
+/// `CAP_NET_ADMIN` fehlt in der Ambient-Menge (siehe [`require_net_admin`]).
 /// [`WardenBinError::LandlockUnavailable`]: siehe [`landlock`].
+/// [`WardenBinError::SeccompUnavailable`]: siehe [`seccomp`].
+/// [`WardenBinError::HoldTimerSpawn`]: siehe [`timer`].
 /// [`WardenBinError::IpcAcceptLoopTerminated`]: die Annahmeschleife hat sich
 /// endgültig beendet.
 /// [`WardenBinError::Completions`]: das Unterkommando `completions` ist
 /// fehlgeschlagen.
+/// [`WardenBinError::KeyGeneration`]/[`WardenBinError::Setup`]: das
+/// Unterkommando `keygen` ist fehlgeschlagen (siehe [`keygen`]).
 fn run(cli: Cli) -> Result<(), WardenBinError> {
-    // `completions` läuft vor jedem systemd-, Landlock- oder Socket-Schritt:
-    // es schreibt nur ein Skript (bzw. installiert es) und beendet sich.
-    if let Some(harw_completions::CompletionsSubcommand::Completions(args)) = &cli.command {
-        harw_completions::run_completions(
-            &mut <Cli as clap::CommandFactory>::command(),
-            "harw-warden",
-            args,
-            &harw_completions::HomeEnv::from_process(),
-            &mut std::io::stdout().lock(),
-        )?;
-        return Ok(());
+    // `completions` und `keygen` laufen vor jedem systemd-, Landlock- oder
+    // Socket-Schritt: sie schreiben ein Skript bzw. einen Schlüssel und
+    // beenden sich.
+    match &cli.command {
+        Some(cli::Command::Completions(args)) => {
+            harw_completions::run_completions(
+                &mut <Cli as clap::CommandFactory>::command(),
+                "harw-warden",
+                args,
+                &harw_completions::HomeEnv::from_process(),
+                &mut std::io::stdout().lock(),
+            )?;
+            return Ok(());
+        }
+        Some(cli::Command::Keygen(args)) => {
+            return keygen::run(args, &mut std::io::stdout().lock());
+        }
+        None => {}
     }
 
     let listen_fd = systemd::acquire_listen_socket()?;
+    // systemd übergibt den Socket ohne `FD_CLOEXEC`; ein `nft`-Kindprozess
+    // soll ihn nicht erben (angenommene Verbindungen sind ohnehin
+    // `SOCK_CLOEXEC`, siehe `ipc::serve_forever`).
+    if let Err(error) = rustix::io::fcntl_setfd(&listen_fd, rustix::io::FdFlags::CLOEXEC) {
+        tracing::warn!(error = %error, "could not mark the listen socket close-on-exec");
+    }
     tracing::info!("systemd listen socket acquired");
 
-    landlock::enforce_cgroup_root(&cli.cgroup_root)?;
+    let trust = harw_dod_warden::TrustRules::root();
+    let config = harw_dod_warden::load_warden_config(&cli.policy, trust)?;
+    let keys = harw_dod_warden::load_key_ring(&config.proof_key_dir, trust)?;
+    let escalator_uid =
+        peer::resolve_escalator_uid(&config.escalator, std::path::Path::new(peer::PASSWD_PATH))?;
+    let state = harw_dod_warden::WardenState::open(&cli.state_dir, jiff::Timestamp::now())?;
+    let key_ids: Vec<&str> = keys
+        .key_ids()
+        .into_iter()
+        .map(harw_dod_warden_proto::KeyId::as_str)
+        .collect();
+    tracing::info!(
+        policy = %cli.policy.display(),
+        key_ids = ?key_ids,
+        allowed_actions = ?config.policy.actions().kinds(),
+        escalator_uid,
+        "warden policy, proof keys and state loaded"
+    );
 
-    let warden = Arc::new(warden_factory::build_production_warden(&cli.cgroup_root));
+    let network_actions = isolation::network_actions_enabled(config.policy.actions());
+    // Vor Landlock und seccomp (`prctl`): ohne `CAP_NET_ADMIN` in der
+    // Ambient-Menge scheiterte jede Isolation erst im Ernstfall.
+    require_net_admin(network_actions, net_admin_in_ambient_set)?;
+    let production =
+        warden_factory::build_production_warden(&cli.cgroup_root, keys, config.policy, state);
+
+    landlock::enforce_runtime_scope(&cli.cgroup_root, &cli.state_dir, &production.sandbox)?;
+    let profile = seccomp::install(&production.sandbox.syscalls)?;
+    tracing::info!(
+        allowed_syscalls = profile.allowed_count(),
+        network_actions,
+        "seccomp allowlist installed for all threads"
+    );
+
+    let warden = Arc::new(production.warden);
+    let gate = Arc::new(peer::PeerGate::new(escalator_uid));
+    timer::spawn_hold_sweeper(Arc::clone(&warden))?;
     tracing::info!(root = %cli.cgroup_root.display(), "warden ready; serving ipc connections");
 
-    ipc::serve_forever(listen_fd, warden);
+    ipc::serve_forever(listen_fd, warden, gate);
     Err(WardenBinError::IpcAcceptLoopTerminated)
+}
+
+/// Refuses to start when network actions are allowed but an `nft` child would lack `CAP_NET_ADMIN`.
+///
+/// # Description
+/// Die Vorgabe-Unit (`deploy/systemd/harw-warden.service`) gibt nur
+/// `CAP_DAC_OVERRIDE`; `CAP_NET_ADMIN` kommt erst mit dem Isolations-Drop-in,
+/// das der Installer nur anlegt, wenn `warden.toml` `isolate-network` oder
+/// `lift-isolation` erlaubt. Das `nft`-Kind erbt die Capability über die
+/// Ambient-Menge. Fehlt sie trotz erlaubter Netzaktion, ist das eine
+/// Fehlkonfiguration, die sonst erst beim ersten Eingriff auffiele; der
+/// Warden startet dann nicht (wie bei jeder anderen unsicheren Policy).
+///
+/// # Arguments
+/// - `network_actions` (`bool`): ob die Policy eine Netzaktion erlaubt.
+/// - `probe` (`impl FnOnce() -> std::io::Result<bool>`): fragt die
+///   Ambient-Menge ab; wird ohne Netzaktion nicht aufgerufen.
+///
+/// # Errors
+/// [`WardenBinError::NetAdminMissing`]: Netzaktion erlaubt, Capability
+/// fehlt oder lässt sich nicht abfragen (fail closed).
+fn require_net_admin(
+    network_actions: bool,
+    probe: impl FnOnce() -> std::io::Result<bool>,
+) -> Result<(), WardenBinError> {
+    if !network_actions {
+        return Ok(());
+    }
+    match probe() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(WardenBinError::NetAdminMissing),
+        Err(error) => {
+            tracing::debug!(error = %error, "ambient capability probe failed");
+            Err(WardenBinError::NetAdminMissing)
+        }
+    }
+}
+
+// Ob `CAP_NET_ADMIN` in der Ambient-Menge dieses Prozesses liegt (genau das
+// erbt ein `nft`-Kind ohne Datei-Capabilities über `execve`).
+fn net_admin_in_ambient_set() -> std::io::Result<bool> {
+    rustix::thread::capability_is_in_ambient_set(rustix::thread::CapabilitySet::NET_ADMIN)
+        .map_err(std::io::Error::from)
 }
 
 #[cfg(test)]
@@ -315,18 +475,96 @@ mod tests {
         }
     }
 
+    /// Die Unit muss zur Sandbox im Code passen: StateDirectory für Ledger
+    /// und Holds (`0700`), der Aufruf `seccomp` für [`super::seccomp::install`]
+    /// (nicht in `@system-service`), die Landlock-Aufrufe und eine
+    /// Capability-Menge ohne `CAP_SYS_ADMIN`.
+    #[test]
+    fn test_systemd_unit_matches_the_sandbox() -> crate::test_support::TestResult {
+        use crate::test_support::TestError;
+
+        let unit = include_str!("../../../../deploy/systemd/harw-warden.service");
+        let lines: Vec<&str> = unit.lines().map(str::trim).collect();
+        for required in [
+            "StateDirectory=harw-warden",
+            "StateDirectoryMode=0700",
+            "ReadWritePaths=/sys/fs/cgroup /var/lib/harw-warden",
+            "SystemCallFilter=@system-service",
+            "NoNewPrivileges=yes",
+        ] {
+            if !lines.contains(&required) {
+                return Err(TestError::Unexpected(format!("unit lacks {required:?}")));
+            }
+        }
+        let allowed_calls: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("SystemCallFilter="))
+            .filter(|value| !value.starts_with('~'))
+            .flat_map(|value| value.split_whitespace())
+            .collect();
+        for call in [
+            "seccomp",
+            "landlock_create_ruleset",
+            "landlock_add_rule",
+            "landlock_restrict_self",
+        ] {
+            if !allowed_calls.contains(&call) {
+                return Err(TestError::Unexpected(format!(
+                    "SystemCallFilter does not allow {call}"
+                )));
+            }
+        }
+        // Vorgabe: nur Freeze/Thaw, also kein `CAP_NET_ADMIN`; das
+        // Isolations-Drop-in ergänzt es (siehe Kommentar der Unit).
+        let bounding = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("CapabilityBoundingSet="))
+            .ok_or(TestError::Missing("CapabilityBoundingSet"))?;
+        assert_eq!(bounding, "CAP_DAC_OVERRIDE");
+        let ambient = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("AmbientCapabilities="))
+            .ok_or(TestError::Missing("AmbientCapabilities"))?;
+        assert_eq!(ambient, "CAP_DAC_OVERRIDE");
+        assert!(unit.contains("AmbientCapabilities=CAP_NET_ADMIN"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_actions_require_net_admin_in_the_ambient_set() {
+        use super::{WardenBinError, require_net_admin};
+
+        // Ohne Netzaktion wird gar nicht erst gefragt.
+        assert!(require_net_admin(false, || Ok(false)).is_ok());
+        assert!(require_net_admin(true, || Ok(true)).is_ok());
+        assert!(matches!(
+            require_net_admin(true, || Ok(false)),
+            Err(WardenBinError::NetAdminMissing)
+        ));
+        assert!(matches!(
+            require_net_admin(true, || Err(std::io::Error::from(
+                std::io::ErrorKind::Unsupported
+            ))),
+            Err(WardenBinError::NetAdminMissing)
+        ));
+    }
+
     // `main`/`run` selbst werden hier bewusst nicht getestet: `run` würde
     // einen echten systemd-Deskriptor erwerben, eine echte Landlock-Regel
-    // binden und eine echte Annahmeschleife starten — alle drei nach
-    // Aufgabenstellung untersagt. Jede darin verkettete Teilfunktion ist
+    // und einen echten seccomp-Filter binden und eine echte Annahmeschleife
+    // starten — alle nach Aufgabenstellung untersagt. Jede darin verkettete Teilfunktion ist
     // einzeln geprüft: `cli::Cli::try_parse_from` in `cli.rs`,
     // `systemd::verify_listen_pid`/`verify_listen_fds_count` in
     // `systemd.rs`, `warden_factory::build_production_warden` gegen den
-    // echten `Warden` in `warden_factory.rs`, `protocol::WardenRequestEnvelope`
-    // in `protocol.rs`, `audit::TracingAuditSink`/`isolation::NftNetworkIsolator`
-    // in ihren eigenen Modulen. `landlock::enforce_cgroup_root` bleibt wie
-    // bei `harw-sentinel`/`harw-probe-fs` ungetestet (siehe dessen
-    // Moduldoku).
+    // echten `Warden` in `warden_factory.rs`, das Wire-Format (v1 abgelehnt)
+    // in `protocol.rs`, `ipc::respond` (jede Ablehnung hat eine Antwort) in
+    // `ipc.rs`, die Peer-Allowlist in `peer.rs`, der Hold-Timer in `timer.rs`,
+    // `audit::TracingAuditSink`/`isolation::NftNetworkIsolator` (samt
+    // `NetfilterBackend` mit einem aufzeichnenden Backend) in ihren eigenen
+    // Modulen, die seccomp-Allowlist als Profil und BPF-Programm in
+    // `seccomp.rs`. `landlock::enforce_runtime_scope` und `seccomp::install`
+    // bleiben wie bei `harw-sentinel`/`harw-probe-fs` ungetestet (sie würden
+    // den Testprozess selbst einschränken).
 }
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.

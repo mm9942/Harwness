@@ -4,13 +4,14 @@
 //! Diese Crate definiert, was über die Leitung zwischen dem
 //! Eskalationsleiter (`harw-dod-escalate`, AW5-03) und dem Durchsetzer
 //! (`harw-dod-warden`, AW5-04a) geht: die Aktionstaxonomie
-//! ([`ProposedAction`]/[`WardenAction`], `action.rs`), der
-//! Autorisierungsbeleg ([`AuthorizationProof`], `proof.rs`), die Anfrage-
-//! und Antworthülle ([`WardenActionRequest`]/[`WardenResponse`],
-//! `response.rs`), die inhaltsfreie Ablehnungskategorie ([`Denial`],
-//! `denial.rs`) und die Eskalationsleiter selbst ([`EscalationStage`],
-//! `stage.rs`). Sie führt selbst keine Durchsetzung aus und trifft keine
-//! Autorisierungsentscheidung — beides ist Sache der beiden Nachbarknoten.
+//! ([`ProposedAction`]/[`WardenAction`], `action.rs`), die signierte
+//! Autorisierung ([`SignedAuthorization`], `signed.rs`) mit ihrem Ziel-Tripel
+//! ([`CgroupTarget`], `target.rs`), die Anfrage- und Antworthülle
+//! ([`WardenRequest`]/[`WardenReply`]/[`WardenResponse`], `response.rs`), die
+//! inhaltsfreie Ablehnungskategorie ([`Denial`], `denial.rs`) und die
+//! Eskalationsleiter selbst ([`EscalationStage`], `stage.rs`). Sie führt selbst
+//! keine Durchsetzung aus und trifft keine Autorisierungsentscheidung — beides
+//! ist Sache der beiden Nachbarknoten.
 //!
 //! # Proof v2 (C-WPROTO, W3) — maßgeblich
 //! Seit W3 ist die einzige akzeptierte Autorisierung
@@ -21,12 +22,21 @@
 //! [`WardenRequest`], Antworthülle [`WardenReply`] (beide versioniert, F-088).
 //! Prüfreihenfolge und MAC-Eingabe: siehe [`signed`]-Moduldoku.
 //!
-//! **v1-Altlast:** [`AuthorizationProof`] und [`WardenActionRequest`] bleiben
-//! nur bestehen, damit `harw-dod-warden`, `harw-warden` und
-//! `harw-dod-escalate` bis zu ihrer Umstellung in W5 (D-WARDEN, D-ESC)
-//! kompilieren. Sie sind fälschbar (F-001) und dürfen von keinem Warden mehr
-//! akzeptiert werden. Die Abschnitte unten, die „Beleg“ sagen, beschreiben
-//! diesen v1-Stand.
+//! **PL-100 WP 3.1 (W01 erweitert):** Der MAC deckt zusätzlich Befund,
+//! Freigebenden, optionale Haltedauer (`None` = bis zur Aufhebung, O3), die
+//! Bestätigung „nicht umkehrbar“ (`irreversible_ack`, O4), das Ziel-Tripel aus
+//! cgroup-Pfad, Kernel-ID und erster Beobachtung ([`CgroupTarget`], B21) und
+//! den Ablaufzeitpunkt ab ([`AuthorizationBody`]). Die Aktionsmenge trennt
+//! Auftauen ([`WardenAction::ThawCgroup`]) und Aufheben der Isolation
+//! ([`WardenAction::LiftIsolation`]); `ReleaseCgroup` ist stillgelegt.
+//! [`WardenRequest::decode`] lehnt jeden v1-Auftrag ausdrücklich ab.
+//!
+//! **v1-Altlast:** [`AuthorizationProof`], [`WardenActionRequest`],
+//! `WardenAction::content_digest` und die Variante `ReleaseCgroup` sind
+//! `#[deprecated]` und bleiben nur bestehen, damit `harw-dod-escalate` (und
+//! über ihn `harw-plan-bridge`) bis zur Umstellung auf Proof v2 kompiliert.
+//! Sie sind fälschbar (F-001) und werden von keinem Warden akzeptiert. Die
+//! Abschnitte unten, die „Beleg“ sagen, beschreiben diesen v1-Stand.
 //!
 //! # Zwei Vorprüfungen, bevor hier etwas geschrieben wurde
 //!
@@ -110,13 +120,15 @@
 //! (hier: `CgroupId`), nie ein roher `String`/`str`.
 //!
 //! # Die Zulässigkeitsmatrix in Worten
-//! `FreezeCgroup` und `ReleaseCgroup` sind ab [`EscalationStage::RuleTriggered`]
-//! zulässig; `IsolateNetwork` und `KillProcessTree` erst ab
+//! `FreezeCgroup` und `ThawCgroup` sind ab [`EscalationStage::RuleTriggered`]
+//! zulässig; `IsolateNetwork`, `LiftIsolation` und `KillProcessTree` erst ab
 //! [`EscalationStage::Escalated`]. Begründung je Aktion in `action.rs`,
 //! Abschnitt „Die Zulässigkeitsmatrix in Worten". Reversibilität:
-//! `FreezeCgroup`, `ReleaseCgroup` und `IsolateNetwork` sind reversibel
-//! (`ReleaseCgroup` ist ihre gemeinsame Umkehrung); `KillProcessTree` ist es
-//! ausdrücklich nicht (`action.rs`, [`Reversibility`]).
+//! `FreezeCgroup` (über `ThawCgroup`) und `IsolateNetwork` (über
+//! `LiftIsolation`) sind reversibel; `KillProcessTree` ist es ausdrücklich
+//! nicht (`action.rs`, [`Reversibility`]). Kill und Isolation verlangen
+//! trotzdem beide das signierte `irreversible_ack`
+//! ([`WardenAction::requires_irreversible_ack`]).
 //!
 //! # Warum Ablehnungen inhaltsfrei sind
 //! Der Durchsetzer läuft privilegiert; was er meldet, verlässt seinen
@@ -156,19 +168,25 @@ pub mod proof;
 pub mod response;
 pub mod signed;
 pub mod stage;
+pub mod target;
 
 pub use action::{ProposedAction, Reversibility, WardenAction};
 pub use denial::Denial;
 pub use error::{ProofError, ProofResult, WardenProtoError, WardenProtoResult};
+// v1-Altlast: bleibt erreichbar, die Warnung trifft jeden Aufrufer.
+#[allow(deprecated)]
 pub use proof::AuthorizationProof;
-pub use response::{
-    WardenActionAudit, WardenActionRequest, WardenReply, WardenRequest, WardenResponse,
-};
+// v1-Altlast: bleibt erreichbar, die Warnung trifft jeden Aufrufer.
+#[allow(deprecated)]
+pub use response::WardenActionRequest;
+pub use response::{WardenActionAudit, WardenReply, WardenRequest, WardenResponse};
 pub use signed::{
-    KeyId, KeyRing, MAX_CLOCK_SKEW_SECS_CAP, MAX_TTL_SECS_CAP, MemoryNonceLedger, NonceLedger,
-    ProofKey, ProofPolicy, SignedAuthorization, VerifiedAuthorization, WARDEN_PROTOCOL_VERSION,
+    AuthorizationBody, KeyId, KeyRing, MAX_CLOCK_SKEW_SECS_CAP, MAX_TTL_SECS_CAP,
+    MemoryNonceLedger, NonceLedger, ProofKey, ProofPolicy, SignedAuthorization,
+    VerifiedAuthorization, WARDEN_PROTOCOL_VERSION,
 };
 pub use stage::EscalationStage;
+pub use target::{CgroupKernelId, CgroupTarget};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

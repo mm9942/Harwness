@@ -122,15 +122,20 @@ pub enum WardenProtoError {
 /// # Description
 /// Eine Variante je Prüfschritt von
 /// [`crate::signed::SignedAuthorization::verify`] (Reihenfolge: Version →
-/// Key-ID → MAC → Zeitfenster → Action-Digest → Stufe → cgroup → Nonce) plus
-/// die Konstruktionsfehler von [`crate::signed::KeyId`],
-/// [`crate::signed::ProofKey`], [`crate::signed::KeyRing`] und
-/// [`crate::signed::ProofPolicy`]. Kein Text interpoliert Schlüssel, MACs,
-/// Nonces oder cgroup-Namen. Nie serialisiert; über die Leitung geht nur
-/// [`ProofError::as_denial`].
+/// Key-ID → MAC → Zeitfenster → Action-Digest → stillgelegte Aktion → Stufe →
+/// `irreversible_ack` → Hold → Freigebender → cgroup → Nonce), dazu das
+/// Dekodieren der Anfragehülle ([`crate::response::WardenRequest::decode`],
+/// v1-Ablehnung), die Zielprüfung vor dem Eingriff
+/// ([`crate::signed::VerifiedAuthorization::confirm_target`]) und die
+/// Konstruktionsfehler von [`crate::signed::KeyId`],
+/// [`crate::signed::ProofKey`], [`crate::signed::KeyRing`],
+/// [`crate::signed::ProofPolicy`] und [`crate::target::CgroupKernelId`]. Kein
+/// Text interpoliert Schlüssel, MACs, Nonces, Kennungen oder cgroup-Namen.
+/// Nie serialisiert; über die Leitung geht nur [`ProofError::as_denial`].
 ///
 /// # Concurrency
-/// `Send + Sync`; nicht `Clone` (wegen [`std::io::Error`]).
+/// `Send + Sync`; nicht `Clone` (wegen [`std::io::Error`] und
+/// [`serde_json::Error`]).
 #[derive(harw_macros::HarwError)]
 pub enum ProofError {
     /// Eine Key-ID verletzt die Grammatik (1–64 Zeichen aus `[A-Za-z0-9._-]`).
@@ -146,6 +151,19 @@ pub enum ProofError {
     /// (TTL 1..=120 s, Uhrenversatz ≤ 30 s, wohlgeformte Präfixe).
     #[msg("proof policy is out of bounds")]
     InvalidPolicy,
+    /// Eine cgroup-Kernel-ID ist `0` (siehe [`crate::target::CgroupKernelId`]).
+    #[msg("cgroup kernel id must not be zero")]
+    InvalidKernelId,
+    /// Hülle: die Anfrage ist ein v1-Auftrag (fälschbarer
+    /// [`crate::proof::AuthorizationProof`], F-001) und wird ausdrücklich
+    /// abgelehnt, bevor irgendein Feld als Autorisierung gelesen wird.
+    #[msg("legacy v1 warden authorization is refused")]
+    LegacyV1Refused,
+    /// Hülle: die Anfrage ist kein dekodierbares v2-JSON-Objekt (unbekanntes
+    /// Feld, falscher Typ, fehlende Version, kein JSON). Das Detail steht nur
+    /// in `source()`, nie in der Meldung (es kann Bytes des Absenders enthalten).
+    #[msg("warden request could not be decoded")]
+    MalformedRequest(#[source] serde_json::Error),
     /// Schritt 1: Proof-Version ist nicht [`crate::signed::WARDEN_PROTOCOL_VERSION`]
     /// (v1 wird nicht mehr akzeptiert). Der Wert bleibt nur per Match lesbar.
     #[msg("unsupported warden proof version")]
@@ -171,23 +189,43 @@ pub enum ProofError {
     /// Schritt 5: Bindungsdigest der Aktion weicht vom signierten ab.
     #[msg("signed authorization is bound to a different action")]
     ActionMismatch,
+    /// Schritt 5: die Aktion ist stillgelegt (`ReleaseCgroup`, ersetzt durch
+    /// `ThawCgroup` und `LiftIsolation`) und wird von Proof v2 nie akzeptiert.
+    #[msg("action is retired and not accepted by this warden protocol")]
+    RetiredAction,
     /// Schritt 6: Aktion ist ab der signierten Stufe nicht zulässig.
     #[msg("action is not admissible at the signed escalation stage")]
     NotAdmissibleAtStage,
-    /// Schritt 7: signierte cgroup weicht von der cgroup der Aktion ab.
+    /// Schritt 7: Kill oder Isolation ohne signiertes `irreversible_ack`
+    /// (Entscheidung O4).
+    #[msg("irreversible action lacks the operator's irreversible acknowledgement")]
+    IrreversibleAckMissing,
+    /// Schritt 8: `hold_secs` ist `Some(0)` oder an einer Aktion gesetzt, die
+    /// keinen Hold kennt (nur `FreezeCgroup` darf einen Hold tragen).
+    #[msg("signed hold duration is not valid for this action")]
+    InvalidHold,
+    /// Schritt 9: der Freigebende ist kein lokaler Operator mit wohlgeformter
+    /// Kennung (Kanal-Peers dürfen keinen Eingriff freigeben, Leitprinzip I1).
+    #[msg("signed approver is not an acceptable operator")]
+    InvalidApprover,
+    /// Schritt 10: signierte cgroup weicht von der cgroup der Aktion ab.
     #[msg("signed authorization is bound to a different cgroup")]
     CgroupMismatch,
-    /// Schritt 7: cgroup liegt unter keinem erlaubten Präfix (Pfadkomponenten).
+    /// Schritt 10: cgroup liegt unter keinem erlaubten Präfix (Pfadkomponenten).
     #[msg("target cgroup is outside the allowed prefixes")]
     CgroupNotAllowed,
-    /// Schritt 8: Nonce wurde bereits verbraucht (Replay).
+    /// Schritt 11: Nonce wurde bereits verbraucht (Replay).
     #[msg("signed authorization nonce was already used")]
     NonceReplayed,
-    /// Schritt 8: der [`crate::signed::NonceLedger`] konnte nicht dauerhaft
+    /// Schritt 11: der [`crate::signed::NonceLedger`] konnte nicht dauerhaft
     /// prüfen/schreiben — fail closed.
     #[msg("nonce ledger is unavailable")]
     #[from]
     LedgerIo(std::io::Error),
+    /// Zielprüfung vor dem Eingriff: Kernel-ID, Pfad oder `first_seen` der
+    /// beobachteten cgroup weichen vom signierten Ziel ab (B21).
+    #[msg("target cgroup no longer matches the authorized identity")]
+    TargetChanged,
 }
 
 /// Formatiert `ProofError` über seine [`std::fmt::Display`]-Meldung.
@@ -203,13 +241,20 @@ impl ProofError {
     /// # Description
     /// Alle Authentisierungs-/Bindungsfehler werden auf
     /// [`Denial::ProofMismatch`] zusammengefaltet (ein Absender erfährt nicht,
-    /// welcher Schritt scheiterte). Getrennt bleiben nur
-    /// [`Denial::UnsupportedVersion`] (Rollout-Diagnose, vor jeder
-    /// Kryptographie), [`Denial::NotAdmissibleAtStage`] (erst nach gültigem MAC
-    /// erreichbar) und [`Denial::Unavailable`] (Ledger-Ausfall, kein
-    /// Fehler des Absenders). Konstruktionsfehler (Key-ID, Schlüssel, Policy)
-    /// sind lokale Konfigurationsfehler und werden als [`Denial::Unavailable`]
-    /// gemeldet.
+    /// welcher Schritt scheiterte). Getrennt bleiben:
+    /// - [`Denial::UnsupportedVersion`] (Rollout-Diagnose vor jeder
+    ///   Kryptographie, auch für einen abgelehnten v1-Auftrag);
+    /// - [`Denial::Malformed`] (Hülle nicht dekodierbar);
+    /// - Kategorien, die erst **nach** gültigem MAC erreichbar sind und dem
+    ///   echten Escalator sagen, was er ändern muss:
+    ///   [`Denial::NotAdmissibleAtStage`], [`Denial::Unsupported`]
+    ///   (stillgelegte Aktion), [`Denial::IrreversibleAckRequired`],
+    ///   [`Denial::PolicyDenied`] (Präfix-Allowlist, Freigebender) und
+    ///   [`Denial::TargetChanged`] (Zielprüfung);
+    /// - [`Denial::Unavailable`] (Ledger-Ausfall, kein Fehler des Absenders).
+    ///
+    /// Konstruktionsfehler (Key-ID, Schlüssel, Policy) sind lokale
+    /// Konfigurationsfehler und werden als [`Denial::Unavailable`] gemeldet.
     ///
     /// # Returns
     /// Die [`Denial`]-Kategorie.
@@ -220,12 +265,18 @@ impl ProofError {
     ///
     /// assert_eq!(ProofError::BadMac.as_denial(), Denial::ProofMismatch);
     /// assert_eq!(ProofError::Expired.as_denial(), Denial::ProofMismatch);
+    /// assert_eq!(ProofError::LegacyV1Refused.as_denial(), Denial::UnsupportedVersion);
     /// ```
     #[must_use]
     pub fn as_denial(&self) -> Denial {
         match self {
-            Self::UnsupportedVersion(_) => Denial::UnsupportedVersion,
+            Self::UnsupportedVersion(_) | Self::LegacyV1Refused => Denial::UnsupportedVersion,
+            Self::MalformedRequest(_) | Self::InvalidKernelId => Denial::Malformed,
             Self::NotAdmissibleAtStage => Denial::NotAdmissibleAtStage,
+            Self::RetiredAction => Denial::Unsupported,
+            Self::IrreversibleAckMissing => Denial::IrreversibleAckRequired,
+            Self::InvalidApprover | Self::CgroupNotAllowed => Denial::PolicyDenied,
+            Self::TargetChanged => Denial::TargetChanged,
             Self::LedgerIo(_)
             | Self::InvalidKeyId
             | Self::InvalidKeyMaterial
@@ -238,8 +289,8 @@ impl ProofError {
             | Self::Expired
             | Self::TimestampOutOfRange
             | Self::ActionMismatch
+            | Self::InvalidHold
             | Self::CgroupMismatch
-            | Self::CgroupNotAllowed
             | Self::NonceReplayed => Denial::ProofMismatch,
         }
     }
@@ -398,8 +449,8 @@ mod tests {
             ProofError::Expired,
             ProofError::TimestampOutOfRange,
             ProofError::ActionMismatch,
+            ProofError::InvalidHold,
             ProofError::CgroupMismatch,
-            ProofError::CgroupNotAllowed,
             ProofError::NonceReplayed,
         ] {
             assert_eq!(err.as_denial(), Denial::ProofMismatch);
@@ -414,6 +465,46 @@ mod tests {
         );
         let io = ProofError::from(std::io::Error::other("disk full"));
         assert_eq!(io.as_denial(), Denial::Unavailable);
+    }
+
+    #[test]
+    fn test_proof_error_as_denial_keeps_post_mac_categories_apart() -> TestResult {
+        assert_eq!(
+            ProofError::LegacyV1Refused.as_denial(),
+            Denial::UnsupportedVersion
+        );
+        assert_eq!(
+            ProofError::MalformedRequest(sample_json_error()?).as_denial(),
+            Denial::Malformed
+        );
+        assert_eq!(ProofError::InvalidKernelId.as_denial(), Denial::Malformed);
+        assert_eq!(ProofError::RetiredAction.as_denial(), Denial::Unsupported);
+        assert_eq!(
+            ProofError::IrreversibleAckMissing.as_denial(),
+            Denial::IrreversibleAckRequired
+        );
+        assert_eq!(
+            ProofError::InvalidApprover.as_denial(),
+            Denial::PolicyDenied
+        );
+        assert_eq!(
+            ProofError::CgroupNotAllowed.as_denial(),
+            Denial::PolicyDenied
+        );
+        assert_eq!(ProofError::TargetChanged.as_denial(), Denial::TargetChanged);
+        Ok(())
+    }
+
+    #[test]
+    fn test_malformed_request_display_hides_decoder_detail_but_keeps_source() -> TestResult {
+        let Err(source) = serde_json::from_str::<serde_json::Value>("{\"secret-field\":") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        let err = ProofError::MalformedRequest(source);
+        assert_eq!(err.to_string(), "warden request could not be decoded");
+        assert!(!err.to_string().contains("secret-field"));
+        assert!(err.source().is_some());
+        Ok(())
     }
 
     #[test]

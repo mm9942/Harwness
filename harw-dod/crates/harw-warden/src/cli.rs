@@ -1,11 +1,16 @@
 //! Kommandozeilen-Grammatik von `harw-warden`.
 //!
 //! # Verantwortungsbereich
-//! [`Cli`] bündelt die einzigen zwei Startparameter dieses Binaries: das
-//! verbindliche `--log`-Flag (siehe [`LogLevel`]-Moduldoku für die
-//! Begründung — identisch zu `harw-sentinel`/`harw-probe-fs`) und
-//! `--cgroup-root`, das Wurzelverzeichnis für
-//! [`harw_dod_warden::CgroupV2Executor`] (Produktion: `/sys/fs/cgroup`). Der
+//! [`Cli`] bündelt die Startparameter dieses Binaries: das verbindliche
+//! `--log`-Flag (siehe [`LogLevel`]-Moduldoku für die Begründung — identisch
+//! zu `harw-sentinel`/`harw-probe-fs`), `--cgroup-root`, das
+//! Wurzelverzeichnis für [`harw_dod_warden::CgroupV2Executor`] (Produktion:
+//! `/sys/fs/cgroup`), `--policy`, die Warden-eigene, root-eigene Policy
+//! (Vorgabe `/etc/harw-dod/warden.toml`, PL-100 WP 3.1), und `--state-dir`,
+//! das StateDirectory für Nonce-Ledger, Aktions-Ledger und Hold-Timer
+//! (Vorgabe `/var/lib/harw-warden`, systemd `StateDirectory=harw-warden`).
+//! Unterkommandos ([`Command`]): `completions` und `keygen` (neuer
+//! Proof-v2-Schlüssel, [`KeygenArgs`]). Der
 //! Empfangssocket selbst ist **kein** Kommandozeilenparameter — er kommt
 //! ausschließlich über die systemd-Socket-Aktivierung
 //! (`LISTEN_FDS`/`LISTEN_PID`, siehe [`crate::systemd`]), niemals über einen
@@ -25,6 +30,16 @@ use clap::Parser;
 
 /// Vorgabe-Wurzel für [`harw_dod_warden::CgroupV2Executor`] in Produktion.
 pub const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// Vorgabepfad der Warden-Policy (root-eigen, nicht gruppen- oder
+/// weltschreibbar; siehe `harw_dod_warden::config`).
+pub const DEFAULT_POLICY_PATH: &str = harw_dod_warden::config::DEFAULT_POLICY_PATH;
+
+/// Vorgabepfad des StateDirectory (systemd `StateDirectory=harw-warden`).
+pub const DEFAULT_STATE_DIR: &str = harw_dod_warden::state::DEFAULT_STATE_DIR;
+
+/// Vorgabe-Schlüsselordner für `keygen` (`proof_key_dir` der Vorgabe-Policy).
+pub const DEFAULT_KEY_DIR: &str = harw_dod_warden::config::DEFAULT_PROOF_KEY_DIR;
 
 /// Gültige Werte für `--log`, in `tracing_subscriber::EnvFilter`-Syntax.
 ///
@@ -90,7 +105,7 @@ impl LogLevel {
 pub struct Cli {
     /// Optionales Unterkommando; ohne es läuft das Binary normal.
     #[command(subcommand)]
-    pub command: Option<harw_completions::CompletionsSubcommand>,
+    pub command: Option<Command>,
 
     /// Log-Stufe für `tracing`. Siehe [`LogLevel`] für die Begründung, warum
     /// ein ungültiger Wert hier ein Fehler ist statt einer stillen
@@ -103,13 +118,53 @@ pub struct Cli {
     /// bei [`DEFAULT_CGROUP_ROOT`].
     #[arg(long, value_name = "DIR", default_value = DEFAULT_CGROUP_ROOT)]
     pub cgroup_root: PathBuf,
+
+    /// Warden-eigene Policy (`warden.toml`, Schema 1). Muss root gehören und
+    /// darf weder gruppen- noch weltschreibbar sein.
+    #[arg(long, value_name = "FILE", default_value = DEFAULT_POLICY_PATH)]
+    pub policy: PathBuf,
+
+    /// StateDirectory für Nonce-Ledger, Aktions-Ledger und Hold-Timer (muss
+    /// existieren, Modus `0700`).
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_STATE_DIR)]
+    pub state_dir: PathBuf,
+}
+
+/// Unterkommandos von `harw-warden`; ohne Unterkommando läuft der
+/// Durchsetzer am systemd-Socket.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum Command {
+    /// Generate or install shell completions for this binary.
+    #[command(alias = "completion")]
+    Completions(harw_completions::CompletionsArgs),
+    /// Erzeugt einen neuen Proof-v2-Schlüssel `<key-dir>/<key-id>.key`
+    /// (Modus 0600, als root ausführen). Gibt nur die Key-ID aus, nie
+    /// Schlüsselmaterial.
+    Keygen(KeygenArgs),
+}
+
+/// Argumente von `harw-warden keygen` (PL-100 WP 3.1, „Schlüssel“).
+#[derive(Debug, Clone, clap::Args)]
+pub struct KeygenArgs {
+    /// Key-ID des neuen Schlüssels (ASCII-Buchstaben, Ziffern und `._-`;
+    /// zugleich Dateiname `<key-id>.key`).
+    #[arg(long, value_name = "ID")]
+    pub key_id: String,
+
+    /// Schlüsselordner (`proof_key_dir` aus `warden.toml`); muss root
+    /// gehören und darf weder gruppen- noch weltschreibbar sein.
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_KEY_DIR)]
+    pub key_dir: PathBuf,
 }
 
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
 
-    use super::{Cli, DEFAULT_CGROUP_ROOT, LogLevel};
+    use super::{
+        Cli, Command, DEFAULT_CGROUP_ROOT, DEFAULT_KEY_DIR, DEFAULT_POLICY_PATH, DEFAULT_STATE_DIR,
+        LogLevel,
+    };
     use crate::test_support::{TestResult, ctx};
 
     #[test]
@@ -128,6 +183,37 @@ mod tests {
         assert_eq!(
             cli.cgroup_root,
             std::path::PathBuf::from(DEFAULT_CGROUP_ROOT)
+        );
+        assert_eq!(
+            cli.policy,
+            std::path::PathBuf::from("/etc/harw-dod/warden.toml")
+        );
+        assert_eq!(cli.policy, std::path::PathBuf::from(DEFAULT_POLICY_PATH));
+        assert_eq!(
+            cli.state_dir,
+            std::path::PathBuf::from("/var/lib/harw-warden")
+        );
+        assert_eq!(cli.state_dir, std::path::PathBuf::from(DEFAULT_STATE_DIR));
+        Ok(())
+    }
+
+    #[test]
+    fn test_policy_and_state_dir_overrides_are_honoured() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-warden",
+            "--policy",
+            "/tmp/fixture/warden.toml",
+            "--state-dir",
+            "/tmp/fixture/state",
+        ])
+        .map_err(ctx("valid overrides"))?;
+        assert_eq!(
+            cli.policy,
+            std::path::PathBuf::from("/tmp/fixture/warden.toml")
+        );
+        assert_eq!(
+            cli.state_dir,
+            std::path::PathBuf::from("/tmp/fixture/state")
         );
         Ok(())
     }
@@ -149,6 +235,28 @@ mod tests {
             result.is_err(),
             "an unrecognised --log value must be a parse error, not a silent default"
         );
+    }
+
+    #[test]
+    fn test_keygen_subcommand_parses_with_default_key_dir() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-warden", "keygen", "--key-id", "k-2026"])
+            .map_err(ctx("keygen parses"))?;
+        let Some(Command::Keygen(args)) = cli.command else {
+            return Err(crate::test_support::TestError::Unexpected(
+                "expected the keygen subcommand".to_owned(),
+            ));
+        };
+        assert_eq!(args.key_id, "k-2026");
+        assert_eq!(args.key_dir, std::path::PathBuf::from(DEFAULT_KEY_DIR));
+        assert_eq!(
+            args.key_dir,
+            std::path::PathBuf::from("/etc/harw-dod/warden-keys")
+        );
+        assert!(Cli::try_parse_from(["harw-warden", "keygen"]).is_err());
+        let completions = Cli::try_parse_from(["harw-warden", "completions", "bash"])
+            .map_err(ctx("completions parses"))?;
+        assert!(matches!(completions.command, Some(Command::Completions(_))));
+        Ok(())
     }
 
     #[test]

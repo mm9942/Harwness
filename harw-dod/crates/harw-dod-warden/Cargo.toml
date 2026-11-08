@@ -9,13 +9,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Wire-Vokabular und die bereits nachprüfbare Bindungs-/Zulässigkeitslogik
-# (`AuthorizationProof::verify`, `WardenAction::is_admissible_from`) — siehe
+# Wire-Vokabular und die Prüfung von Proof v2 (`WardenRequest::verify`,
+# `SignedAuthorization`, `KeyRing`, `ProofPolicy`, `NonceLedger`) — siehe
 # lib.rs-Moduldoku, Abschnitt „Abhängigkeitsbudget".
 harw-dod-warden-proto = { path = "../harw-dod-warden-proto" }
-# `CgroupId`/`FindingId` direkt: der Warden liest cgroup-Kennungen aus
-# WardenAction-Varianten, um sie an Ausführungs-Traits zu reichen, und nimmt
-# `finding` als unabhängigen Kontextparameter entgegen (siehe warden.rs).
+# `CgroupId`/`FindingId`/`ApprovalActor` direkt: der Warden liest
+# cgroup-Kennungen aus WardenAction-Varianten, um sie an Ausführungs-Traits
+# zu reichen, und schreibt Befund und Freigebenden ins Aktions-Ledger.
 # Bereits vollständig durch `harw-dod-warden-proto` transitiv mitgebracht —
 # kein einziges neues Blatt-Crate.
 harw-types = { path = "../../../harw-types" }
@@ -23,23 +23,31 @@ harw-types = { path = "../../../harw-types" }
 # proto-Crate ausschließlich dafür, nie für `warden_actions!`. Ebenfalls
 # bereits transitiv vorhanden.
 harw-macros = { path = "../../../harw-macros" }
+# PL-100 WP 3.1: Zustandsdateien im StateDirectory (Aktions-Ledger, Holds)
+# als JSON. `serde`/`serde_json` liegen über `harw-dod-warden-proto` bereits
+# in der Warden-Hülle — kein neues Paket.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# PL-100 WP 3.1: Zeitpunkte für Nonce-Aufbewahrung, Hold-Fälligkeit und
+# Ledger-Einträge. Bereits über `harw-dod-warden-proto` in der Hülle.
+jiff = { workspace = true }
+# PL-100 WP 3.1: Hash-Kette des Aktions-Ledgers. Bereits über
+# `harw-dod-warden-proto` (MAC) in der Hülle.
+blake3 = { workspace = true }
+# PL-100 WP 3.1 (B21, Prüfung und Eingriff über denselben Deskriptor):
+# `openat` für das cgroup-Verzeichnis (`O_DIRECTORY | O_NOFOLLOW`) und die
+# Kontrolldatei relativ dazu, `O_NOFOLLOW` für die Zustandsdateien,
+# `geteuid` für den Eigentümer des StateDirectory. Dieselbe gepinnte
+# Fassung, die `harw-warden` bereits (mit `net`) nutzt: kein neues Paket in
+# der Warden-Hülle; die Features `fs` und `process` ziehen keine weitere
+# Abhängigkeit (geprüft gegen `rustix-1.1.5/Cargo.toml`, `[features]`).
+rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
 harw-test-support = { path = "../../../harw-test-support" }
-# Nur für den Test „unbekanntes Feld in der Anfrage -> abgelehnt" (Rundlauf
-# über die tatsächliche Wire-Deserialisierung von
-# `harw_dod_warden_proto::WardenActionRequest`) und für die
-# Antwort-Inhaltsfreiheits-Prüfung (serialisierten Text inspizieren). Reine
-# Dev-Dependency, zählt nicht gegen das Laufzeit-Abhängigkeitsbudget des
-# Warden-Binaries.
-serde_json = { workspace = true }
-# Nur für die Dateisystem-Tests von `CgroupV2Executor` (Tempdir statt
-# echtem `/sys/fs/cgroup`). Reine Dev-Dependency.
+# Nur für die Dateisystem-Tests (Tempdir statt echtem `/sys/fs/cgroup`,
+# `/etc/harw-dod` und StateDirectory). Reine Dev-Dependency.
 tempfile = { workspace = true }
-# Nur für Tests/Doctests, die einen `AuthorizationProof` bauen (verlangt
-# einen `jiff::Timestamp`, siehe `harw-dod-warden-proto`). Reine
-# Dev-Dependency — Laufzeitcode dieser Crate liest ohnehin keine Zeit.
-jiff = { workspace = true }
 
 [lints]
 workspace = true

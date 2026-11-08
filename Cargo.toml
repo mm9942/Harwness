@@ -263,6 +263,11 @@ crypt_guard_service = { version = "3.1.0", features = ["ml-dsa"] }
 crypt_guard_hyper = { version = "3.1.0" }
 procfs = { version = "0.18.0", default-features = false }
 landlock = "0.4.7"
+# seccomp-BPF-Filter des Wardens (PL-100 Entscheidung O10, `harw-warden`):
+# rust-vmm/Firecracker, Apache-2.0 OR BSD-3-Clause, einzige Laufzeit-
+# Abhängigkeit `libc` (ohnehin über `landlock` in der Warden-Hülle). Ohne das
+# optionale Feature `json` (kein `serde` aus dieser Kante).
+seccompiler = { version = "0.5.0", default-features = false }
 cap-std = "4.0.3"
 
 # Verzeichniseinbettung: Registry-Definitionen als Dateien statt als Rust-Liste.
