@@ -32,8 +32,9 @@
 //! reader keeps the six fields plus three of the additions that help a
 //! posture consumer correlate repeats: `schema_version`, `dedup_key` (only a
 //! well-formed 32-char lowercase hex key) and `occurrences` (only `>= 1`).
-//! A malformed optional value is dropped, never the line; only
-//! `schema_version: 0` makes the line malformed. All other v3 fields are
+//! An invalid value of the right JSON type (a non-hex key, `occurrences: 0`)
+//! is dropped, never the line; a value of the wrong JSON type and
+//! `schema_version: 0` make the line malformed. All other v3 fields are
 //! ignored like any unknown field.
 //!
 //! # Limits (the file is attacker-influenced input)
