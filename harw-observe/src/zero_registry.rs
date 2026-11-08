@@ -8,10 +8,11 @@
 //! `unbound_verdict_total`, `breaker_trips_total{partition}`,
 //! `untriaged_backlog` (Gauge), `warden_unaudited_actions` und
 //! `sensor_parse_errors_total`. Die Registry **zählt nichts**: Emittenten
-//! (Dispatcher, Verdict-Bindung, Warden, Sensoren) erhöhen die Werte
-//! selbst über [`crate::sink::TelemetrySink::record`] mit den hier
-//! exportierten Schlüsseln. Die Registry sorgt nur dafür, dass jede
-//! Serie im Export **existiert**, bevor das erste Ereignis eintritt.
+//! (Dispatcher, Verdict-Bindung, Warden, Sensoren) melden ihre Stände über
+//! das Produzenten-Handle [`crate::dod_metrics::DodMetrics`], das die hier
+//! exportierten Schlüssel über [`crate::routing::RoutingSink::record_meta`]
+//! an alle Ziele verteilt. Die Registry sorgt nur dafür, dass jede Serie im
+//! Export **existiert**, bevor das erste Ereignis eintritt.
 //!
 //! # Warum Null-Serien
 //! Die Prometheus- und File-Sinks legen eine Serie erst beim ersten
@@ -20,6 +21,24 @@
 //! unterscheiden. Ein explizit emittierter Nullwert macht die Serie
 //! sichtbar; fehlt sie trotz laufendem Prozess, ist die Verdrahtung kaputt.
 //!
+//! # Je Prozess nur die eigenen Serien ([`DodEmitter`])
+//! Ein Nullwert behauptet „Produzent verdrahtet, bisher kein Ereignis". Die
+//! sieben Metriken entstehen aber in verschiedenen Prozessen (README PL-100
+//! §3 und O5): Dispatch und Verdicts auf der Dispatch-Seite (Gateway mit
+//! dem verbundenen `harw-dod-watch`), Parse-Fehler im Sentinel,
+//! S2-Verstöße im Warden. Emittierte jeder Prozess alle neun Serien, zeigte
+//! etwa das Gateway `warden_unaudited_actions 0`, obwohl es nie einen
+//! Warden-Produzenten hat — genau die Verwechslung, die diese Registry
+//! verhindern soll. Deshalb gehört jede Serie genau einer [`DodEmitter`]-
+//! Rolle, und ein Prozess emittiert über [`dod_zero_registry_for`] nur die
+//! Serien seiner Rolle. Das Produzenten-Handle trägt die Rolle als Typ
+//! ([`crate::DispatchMetrics`], [`crate::SensorMetrics`],
+//! [`crate::WardenMetrics`]) und kann deshalb auch nur die Serien seiner
+//! Rolle melden. Die Vereinigung aller Rollen ist
+//! [`DOD_ZERO_SERIES`] (durch Tests erzwungen). Fehlt eine Serie im Export
+//! ihres Rollenprozesses, ist dessen Verdrahtung kaputt; in einem fremden
+//! Prozess fehlt sie absichtlich.
+//!
 //! # Abgrenzung zu [`crate::null_counter::NullCounter`]
 //! Ein `NullCounter` zählt **Verstöße** gegen eine Invariante, sein
 //! erwarteter Stand ist dauerhaft null, und [`crate::assert_all_zero`]
@@ -27,7 +46,10 @@
 //! Arbeit (Verdicts, Overrides, Parse-Fehler) und dürfen im Betrieb
 //! steigen. Sie sind deshalb **kein** `NullCounter` und werden nie in eine
 //! [`crate::NullCounterRegistry`] aufgenommen; `assert_all_zero` bleibt von
-//! dieser Registry unberührt.
+//! dieser Registry unberührt. Einzige Ausnahme sind die Verstoß-Serien aus
+//! [`DOD_VIOLATION_SERIES`]: zu `warden_unaudited_actions` gehört der
+//! Nullzähler [`crate::dod_metrics::WARDEN_UNAUDITED_VIOLATIONS`], den der
+//! Warden-Prozess registriert.
 //!
 //! # Namensraum und Routing
 //! Alle Namen sind bewusst ungeschützt (kein `security.`/`warden.`-Präfix,
@@ -63,12 +85,20 @@
 //!
 //! # Examples
 //! ```
-//! use harw_observe::{NullSink, ObserveError, zero_registry::dod_zero_registry};
+//! use harw_observe::{
+//!     DodEmitter, NullSink, ObserveError, dod_zero_registry_for,
+//!     zero_registry::dod_zero_registry,
+//! };
 //!
 //! # fn main() -> Result<(), ObserveError> {
 //! let registry = dod_zero_registry()?;
 //! let emitted = registry.emit_zeros(&NullSink);
 //! assert_eq!(emitted, 9);
+//!
+//! // Ein Prozess emittiert nur die Serien seiner Rolle.
+//! assert_eq!(dod_zero_registry_for(DodEmitter::Dispatch)?.series_count(), 7);
+//! assert_eq!(dod_zero_registry_for(DodEmitter::Sensor)?.series_count(), 1);
+//! assert_eq!(dod_zero_registry_for(DodEmitter::Warden)?.series_count(), 1);
 //! # Ok(())
 //! # }
 //! ```
@@ -138,13 +168,14 @@ pub const UNTRIAGED_BACKLOG: MetricKey = MetricKey {
 /// §4.3): Erwarteter Stand im Betrieb ist dauerhaft null, ein Wert über
 /// null ist ein Alarm auf eine gebrochene Invariante, keine Schwelle. Die
 /// Registry deklariert ihn nur als Zählerserie (sichtbar ab Start mit `0`);
-/// die Verstoß-Semantik trägt [`DOD_VIOLATION_SERIES`]. Der Emittent
-/// (Warden) soll zusätzlich einen
-/// [`crate::null_counter::NullCounter`] mit diesem Schlüssel führen und in
-/// seine [`crate::NullCounterRegistry`] aufnehmen, damit
-/// [`crate::assert_all_zero`] anschlägt (REQUIRED-ELSEWHERE, siehe
-/// DEC-Hinweis in der Phase-4-Lieferung). Der Name folgt der Vorgabe aus der
-/// Planung und trägt kein `_total`-Suffix.
+/// die Verstoß-Semantik trägt [`DOD_VIOLATION_SERIES`]. Der zugehörige
+/// [`crate::null_counter::NullCounter`] ist
+/// [`crate::dod_metrics::WARDEN_UNAUDITED_VIOLATIONS`]; der Warden-Prozess
+/// nimmt ihn in seine [`crate::NullCounterRegistry`] auf, damit
+/// [`crate::assert_all_zero`] anschlägt, und meldet Verstöße über
+/// [`crate::dod_metrics::DodMetrics::warden_unaudited_action`] (nur auf
+/// [`crate::WardenMetrics`]). Der Name
+/// folgt der Vorgabe aus der Planung und trägt kein `_total`-Suffix.
 pub const WARDEN_UNAUDITED_ACTIONS: MetricKey = MetricKey {
     name: "warden_unaudited_actions",
     kind: MetricKind::Counter,
@@ -423,12 +454,129 @@ impl ZeroCounterRegistry {
 /// Baut die Registry der sieben DoD-/Dispatch-Metriken aus
 /// [`DOD_ZERO_SERIES`].
 ///
+/// # Description
+/// Die Vereinigung aller [`DodEmitter`]-Rollen, für Prüfungen und
+/// Werkzeuge. Eine Kompositionsstelle emittiert nicht diese Registry,
+/// sondern nur die ihrer Rolle ([`dod_zero_registry_for`] über
+/// [`crate::DodMetrics::install`]).
+///
 /// # Errors
 /// [`ObserveError::InvalidZeroSeries`], falls eine statische Deklaration
 /// ungültig ist (durch Tests ausgeschlossen).
 pub fn dod_zero_registry() -> Result<ZeroCounterRegistry, ObserveError> {
     let mut registry = ZeroCounterRegistry::new();
     for series in DOD_ZERO_SERIES {
+        registry.register(*series)?;
+    }
+    Ok(registry)
+}
+
+/// Die Prozessrolle, deren Produzenten einen Teil der DoD-Serien melden.
+///
+/// # Description
+/// Jede Serie aus [`DOD_ZERO_SERIES`] gehört genau einer Rolle (siehe
+/// Moduldoku, Abschnitt „Je Prozess nur die eigenen Serien"). Je Host
+/// installiert genau ein Prozess eine Rolle; zwei Prozesse mit derselben
+/// Rolle führten getrennte Stände unter demselben Seriennamen.
+///
+/// # Examples
+/// ```
+/// use harw_observe::DodEmitter;
+///
+/// assert_eq!(DodEmitter::Warden.series_names(), &["warden_unaudited_actions"]);
+/// assert_eq!(DodEmitter::Sensor.as_str(), "sensor");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DodEmitter {
+    /// Dispatch- und Verdict-Seite: `dod_triage_verdicts_total`,
+    /// `human_overrides_total`, `unbound_verdict_total`,
+    /// `breaker_trips_total{partition}` und `untriaged_backlog`. Im Betrieb
+    /// das Gateway; `harw-dod-watch` (README O5) meldet über seine
+    /// Gateway-Verbindung, statt selbst diese Rolle zu installieren.
+    Dispatch,
+    /// Sensor-Seite (`harw-sentinel`): `sensor_parse_errors_total`.
+    Sensor,
+    /// Warden (`harw-warden`): `warden_unaudited_actions`.
+    Warden,
+}
+
+impl DodEmitter {
+    /// Alle Rollen; ihre Seriensätze sind disjunkt und decken
+    /// [`DOD_ZERO_SERIES`] vollständig ab.
+    pub const ALL: [Self; 3] = [Self::Dispatch, Self::Sensor, Self::Warden];
+
+    /// Kurzname der Rolle (für Logs und Tests; kein Label-Wert).
+    ///
+    /// # Returns
+    /// `"dispatch"`, `"sensor"` oder `"warden"`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dispatch => "dispatch",
+            Self::Sensor => "sensor",
+            Self::Warden => "warden",
+        }
+    }
+
+    /// Die Metriknamen aus [`DOD_ZERO_SERIES`], die diese Rolle meldet.
+    ///
+    /// # Returns
+    /// Eine feste, nicht leere Namensliste.
+    #[must_use]
+    pub const fn series_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Dispatch => &[
+                "dod_triage_verdicts_total",
+                "human_overrides_total",
+                "unbound_verdict_total",
+                "breaker_trips_total",
+                "untriaged_backlog",
+            ],
+            Self::Sensor => &["sensor_parse_errors_total"],
+            Self::Warden => &["warden_unaudited_actions"],
+        }
+    }
+
+    /// Ob `name` eine Serie dieser Rolle ist.
+    ///
+    /// # Arguments
+    /// - `name` (`&str`): ein Metrikname.
+    #[must_use]
+    pub fn owns(self, name: &str) -> bool {
+        self.series_names().contains(&name)
+    }
+}
+
+/// Baut die Registry der DoD-Serien **einer** Prozessrolle.
+///
+/// # Description
+/// Filtert [`DOD_ZERO_SERIES`] auf [`DodEmitter::series_names`] und behält
+/// deren Reihenfolge. Die Kompositionsstelle eines Prozesses emittiert nur
+/// diese Serien (über [`crate::DodMetrics::install`]).
+///
+/// # Arguments
+/// - `emitter` (`DodEmitter`): die Rolle dieses Prozesses.
+///
+/// # Errors
+/// [`ObserveError::InvalidZeroSeries`], falls eine statische Deklaration
+/// ungültig ist (durch Tests ausgeschlossen).
+///
+/// # Examples
+/// ```
+/// use harw_observe::{DodEmitter, ObserveError, dod_zero_registry_for};
+///
+/// # fn main() -> Result<(), ObserveError> {
+/// let registry = dod_zero_registry_for(DodEmitter::Dispatch)?;
+/// assert_eq!(registry.series_count(), 7);
+/// # Ok(())
+/// # }
+/// ```
+pub fn dod_zero_registry_for(emitter: DodEmitter) -> Result<ZeroCounterRegistry, ObserveError> {
+    let mut registry = ZeroCounterRegistry::new();
+    for series in DOD_ZERO_SERIES
+        .iter()
+        .filter(|series| emitter.owns(series.key().name))
+    {
         registry.register(*series)?;
     }
     Ok(registry)
@@ -734,6 +882,71 @@ mod tests {
     }
 
     #[test]
+    fn test_emitter_roles_partition_the_dod_series() {
+        // Every declared series belongs to exactly one role ...
+        for series in DOD_ZERO_SERIES {
+            let owners = DodEmitter::ALL
+                .iter()
+                .filter(|emitter| emitter.owns(series.key().name))
+                .count();
+            assert_eq!(owners, 1, "{}", series.key().name);
+        }
+        // ... and every role name is a declared series.
+        for emitter in DodEmitter::ALL {
+            assert!(!emitter.series_names().is_empty(), "{}", emitter.as_str());
+            for name in emitter.series_names() {
+                assert!(
+                    DOD_ZERO_SERIES.iter().any(|s| s.key().name == *name),
+                    "{} names undeclared series {name}",
+                    emitter.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_registry_for_each_role_emits_only_its_series() -> TestResult {
+        // Counted by hand: dispatch = 4 unlabelled + 3 partition kinds.
+        let expected = [
+            (DodEmitter::Dispatch, 7usize),
+            (DodEmitter::Sensor, 1),
+            (DodEmitter::Warden, 1),
+        ];
+        let mut total = 0usize;
+        for (emitter, count) in expected {
+            let registry = dod_zero_registry_for(emitter).map_err(ctx("role registry"))?;
+            assert_eq!(registry.series_count(), count, "{}", emitter.as_str());
+            let sink = CaptureSink::default();
+            assert_eq!(registry.emit_zeros(&sink), count);
+            for (name, _, _) in sink.take() {
+                assert!(emitter.owns(name), "{} emitted {name}", emitter.as_str());
+            }
+            total = total.saturating_add(count);
+        }
+        let all = dod_zero_registry().map_err(ctx("dod registry"))?;
+        assert_eq!(total, all.series_count(), "roles cover all nine series");
+        Ok(())
+    }
+
+    #[test]
+    fn test_registry_for_role_keeps_declaration_order() -> TestResult {
+        let registry =
+            dod_zero_registry_for(DodEmitter::Dispatch).map_err(ctx("dispatch registry"))?;
+        let names: Vec<&str> = registry.all().iter().map(|s| s.key().name).collect();
+        assert_eq!(names, DodEmitter::Dispatch.series_names());
+        Ok(())
+    }
+
+    #[test]
+    fn test_violation_series_belong_to_the_warden_role_only() {
+        for name in DOD_VIOLATION_SERIES {
+            assert!(DodEmitter::Warden.owns(name));
+            assert!(!DodEmitter::Dispatch.owns(name));
+            assert!(!DodEmitter::Sensor.owns(name));
+        }
+    }
+
+    #[test]
     fn test_violation_series_are_declared_and_only_warden_unaudited() {
         assert_eq!(DOD_VIOLATION_SERIES, &["warden_unaudited_actions"]);
         for name in DOD_VIOLATION_SERIES {
@@ -744,18 +957,25 @@ mod tests {
     #[test]
     fn test_no_dod_series_name_is_a_null_counter() {
         // Work counters must never be registered as violation counters:
-        // none of the DoD names may collide with a NullCounter key.
+        // a NullCounter may share a DoD series name only if that series is
+        // declared as a violation series.
         let mut registry = NullCounterRegistry::new();
         registry.register(&crate::routing::SECURITY_METRIC_LEAKED);
+        registry.register(&crate::dod_metrics::WARDEN_UNAUDITED_VIOLATIONS);
         for counter in registry.all() {
+            let is_dod_series = DOD_ZERO_SERIES
+                .iter()
+                .any(|series| series.key().name == counter.name());
             assert!(
-                !DOD_ZERO_SERIES
-                    .iter()
-                    .any(|series| series.key().name == counter.name()),
+                !is_dod_series || DOD_VIOLATION_SERIES.contains(&counter.name()),
                 "{}",
                 counter.name()
             );
         }
+        assert_eq!(
+            crate::dod_metrics::WARDEN_UNAUDITED_VIOLATIONS.name(),
+            WARDEN_UNAUDITED_ACTIONS.name
+        );
         // The zero registry itself never exposes a NullCounter.
         assert!(
             DOD_ZERO_SERIES
