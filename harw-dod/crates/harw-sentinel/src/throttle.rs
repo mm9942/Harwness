@@ -628,6 +628,7 @@ impl ThrottleDecision {
     }
 
     /// Ob der Befund gemeldet wird.
+    #[cfg(test)]
     #[must_use]
     pub const fn emits(&self) -> bool {
         matches!(self.verdict, ThrottleVerdict::Emit(_))
@@ -755,7 +756,7 @@ impl FindingThrottle {
     /// Anzahl gehaltener Schlüssel.
     #[cfg(test)]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub fn key_count(&self) -> usize {
         self.entries.len()
     }
 
@@ -1191,7 +1192,7 @@ mod tests {
             ..event.clone()
         };
         assert_ne!(subject, CoarseSubject::of_event(&other_class));
-        assert_eq!(subject, CoarseSubject::of_event(&event.clone()));
+        assert_eq!(subject, CoarseSubject::of_event(&event));
     }
 
     #[test]
@@ -1292,7 +1293,7 @@ mod tests {
         throttle.observe(first, Hardness::Observed, Severity::High, now, now);
         let fourth = *keys.get(3).ok_or(TestError::Missing("key 4"))?;
         throttle.observe(fourth, Hardness::Observed, Severity::High, now, now);
-        assert_eq!(throttle.len(), 3);
+        assert_eq!(throttle.key_count(), 3);
 
         let second = *keys.get(1).ok_or(TestError::Missing("key 2"))?;
         let evicted = throttle.observe(second, Hardness::Observed, Severity::High, now, now);
@@ -1303,7 +1304,7 @@ mod tests {
         );
         let kept = throttle.observe(first, Hardness::Observed, Severity::High, now, now);
         assert_eq!(kept.verdict, ThrottleVerdict::Suppress);
-        assert_eq!(throttle.len(), 3);
+        assert_eq!(throttle.key_count(), 3);
         Ok(())
     }
 
@@ -1319,7 +1320,7 @@ mod tests {
                     .emits()
             );
         }
-        assert_eq!(throttle.len(), 0);
+        assert_eq!(throttle.key_count(), 0);
         Ok(())
     }
 
@@ -1344,7 +1345,7 @@ mod tests {
         assert!(!text.contains("198.51"), "no raw destination in the state");
 
         let mut restarted = FindingThrottle::open(ThrottleConfig::default(), Some(path.clone()));
-        assert_eq!(restarted.len(), 1);
+        assert_eq!(restarted.key_count(), 1);
         let repeat = restarted.observe(key, Hardness::Observed, Severity::High, at(200)?, at(200)?);
         assert_eq!(repeat.verdict, ThrottleVerdict::Suppress);
         assert_eq!(repeat.stamp.occurrences, 3);
@@ -1388,7 +1389,7 @@ mod tests {
         let linked = dir.path().join("linked.json");
         std::os::unix::fs::symlink(&victim, &linked).map_err(ctx("symlink"))?;
         let mut refused = FindingThrottle::open(ThrottleConfig::default(), Some(linked));
-        assert_eq!(refused.len(), 0, "a symlinked state is not read");
+        assert_eq!(refused.key_count(), 0, "a symlinked state is not read");
         refused.observe(key, Hardness::Observed, Severity::High, at(1)?, at(1)?);
         assert!(!refused.persist_if_due(at(1)?), "and not written through");
         assert_eq!(fs::read(&victim).map_err(ctx("read victim"))?, b"keep");
@@ -1401,13 +1402,13 @@ mod tests {
         let path = dir.path().join(DEFAULT_STATE_FILE_NAME);
         fs::write(&path, b"{not json").map_err(ctx("write garbage"))?;
         assert_eq!(
-            FindingThrottle::open(ThrottleConfig::default(), Some(path.clone())).len(),
+            FindingThrottle::open(ThrottleConfig::default(), Some(path.clone())).key_count(),
             0
         );
         fs::write(&path, br#"{"schema_version":99,"entries":[]}"#)
             .map_err(ctx("write foreign"))?;
         assert_eq!(
-            FindingThrottle::open(ThrottleConfig::default(), Some(path.clone())).len(),
+            FindingThrottle::open(ThrottleConfig::default(), Some(path.clone())).key_count(),
             0
         );
         let bad_key = format!(
@@ -1416,7 +1417,7 @@ mod tests {
         );
         fs::write(&path, bad_key.as_bytes()).map_err(ctx("write bad key"))?;
         assert_eq!(
-            FindingThrottle::open(ThrottleConfig::default(), Some(path)).len(),
+            FindingThrottle::open(ThrottleConfig::default(), Some(path)).key_count(),
             0,
             "an invalid key is skipped"
         );
@@ -1453,7 +1454,7 @@ mod tests {
             },
             Some(path),
         );
-        assert_eq!(narrow.len(), 2);
+        assert_eq!(narrow.key_count(), 2);
         let newest = narrow.observe(
             key_for("198.51.100.5", 4, None),
             Hardness::Observed,
