@@ -301,12 +301,14 @@ mod tests {
     }
 
     /// Wie [`triaged_finding`], aber mit injizierbarem `observed_at`
-    /// (`RuleContext::now` — siehe `EgressFlowRule::evaluate`, das den Befund
-    /// exakt darauf datiert). Gebraucht von den Rand-Tests der
+    /// (die Zeit des auslösenden `SecurityEvent` — `EgressFlowRule::evaluate`
+    /// datiert den Befund seit PL-100 WP0.2 exakt darauf, nicht auf
+    /// `RuleContext::now`). Gebraucht von den Rand-Tests der
     /// `offset_from_timestamp`-Umrechnung: `Finding`s Felder sind read-only
     /// (F-023, `harw-dod-rules::finding`-Moduldoku), es gibt also keinen
-    /// nachträglichen Setter — nur der Weg über `RuleContext` erreicht einen
-    /// beliebigen `observed_at`-Wert.
+    /// nachträglichen Setter — nur der Weg über das ausgewertete Ereignis
+    /// erreicht einen beliebigen `observed_at`-Wert. `RuleContext::now` wird
+    /// zur Konsistenz auf denselben Wert gesetzt.
     ///
     /// `severity`/`hardness` bleiben Parameter (statt sie aus dem
     /// `EgressFlowRule`-Ergebnis zu übernehmen), damit jeder Aufrufer explizit
@@ -322,7 +324,7 @@ mod tests {
         let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
         let events = vec![SecurityEvent {
             sensor: SensorId::from_str("net-0"),
-            observed_at: jiff::Timestamp::UNIX_EPOCH,
+            observed_at,
             actor: None,
             kind: EventKind::EgressFlow {
                 destination: "evil.example.com".to_owned(),

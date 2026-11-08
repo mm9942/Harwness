@@ -82,8 +82,10 @@
 //! Binary"). [`run_rules_checked`] liefert
 //! `Finding<`[`harw_dod_rules::RuleChecked`]`>` — zertifiziert (je Befund eine
 //! frische `FindingId`), aber noch nicht triagiert. Der nächste Typestate-Schritt,
-//! [`harw_dod_rules::triage`], entscheidet über [`harw_dod_rules::Verdict`]
-//! (`Confirmed`/`FalsePositive`/`NeedsReview`) und ist eine Bewertung, die
+//! [`harw_dod_rules::triage_record`] über einen eingefrorenen
+//! [`harw_dod_rules::FindingRecord`], entscheidet über
+//! [`harw_dod_rules::Verdict`] (`Confirmed`/`FalsePositive`/`NeedsReview`;
+//! ein Modell-Urteil höchstens `NeedsReview`) und ist eine Bewertung, die
 //! dieses Binary bewusst nicht trifft: eine automatische Triage im
 //! unprivilegierten Sammler wäre der erste Schritt Richtung Durchsetzung,
 //! und Durchsetzung ist nicht seine Aufgabe. Dieses Modul **meldet** jeden
@@ -91,15 +93,16 @@
 //! Ausgabeweg dieses Binaries: denselben `Arc<dyn
 //! harw_observe::TelemetrySink>` (im Betrieb ein
 //! [`harw_observe_file::FileSink`]), über den [`harw_dod_sentinel::metrics`]
-//! bereits Sensor-Zähler schreibt, ergänzt um dieselbe `tracing`-Meldung, mit
-//! der `main.rs` bereits jedes beobachtete `SecurityEvent` begleitet. Kein
-//! zweiter Ausgabeweg entsteht.
+//! bereits Sensor-Zähler schreibt, ergänzt um eine inhaltsarme
+//! `tracing`-Meldung je gemeldetem Befund (PL-100 WP0.6: nur Kennungen,
+//! Schwere, Härte und Dedup-Schlüssel auf `warn`). Der Findings-Export und
+//! der Spool (siehe unten) sind die einzigen weiteren Ausgabewege.
 //!
 //! # Was zwischen einem Befund und einer durchgesetzten Aktion weiterhin fehlt
 //! **Das ist Bruch 2, ausdrücklich benannt, nicht gebaut:** ein
 //! `Finding<RuleChecked>`, wie dieses Modul es erzeugt, ist weder triagiert
 //! noch eskaliert. Bis heute ruft kein Produktionspfad
-//! [`harw_dod_rules::triage`] auf, und `harw-warden` (der fertige Empfänger
+//! [`harw_dod_rules::triage_record`] auf, und `harw-warden` (der fertige Empfänger
 //! eines `WardenActionRequest`, mit `Action::authorize`) hat keinen Sender.
 //! Der fehlende Knoten wäre `harw-dod-escalate` (bereits als Bezeichner in
 //! `harw_dod_rules::engine`-Moduldoku referenziert, Knoten AW5-03): ein
