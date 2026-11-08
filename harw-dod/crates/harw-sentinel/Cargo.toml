@@ -50,6 +50,14 @@ harw-dod-rules = { path = "../harw-dod-rules" }
 # `src/findings.rs` baut — siehe dortige Moduldoku, Abschnitt „Was dieser
 # Kontext (noch) nicht befüllt", für die Begründung von `NetworkScope::empty`.
 harw-sandbox = { path = "../../../harw-sandbox" }
+# PL-100 WP0.8/WP0.12: der eine Escaper für untrusted Text (Ring A, ohne
+# Abhängigkeiten) — ersetzt die eigenen Sanitizer von `src/export.rs` und
+# escapt jede Zeichenkette der `evidence_card` des Exports v3.
+harw-untrusted-text = { path = "../../../harw-untrusted-text" }
+# Export v3 (PL-100 WP0.12): `instance` ist eine UUIDv4 je Prozessstart.
+# Dieselbe Version und dasselbe Feature wie `harw-types` (bereits im Baum,
+# keine neue Fremdcrate).
+uuid = { version = "1.27.0", features = ["v4"] }
 
 # --- Sensor-Crates: nur die tatsächlich gebauten (siehe src/sensors.rs für
 # die vollständige Registrierungs- und Auslassungsbegründung) ---

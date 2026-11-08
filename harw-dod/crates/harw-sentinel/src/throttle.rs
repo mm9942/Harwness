@@ -256,11 +256,13 @@ impl DedupKey {
         Self(key)
     }
 
-    /// Liest die Hex-Form zurück (genau 32 Hex-Zeichen, Kleinbuchstaben).
+    /// Liest die Hex-Form zurück (genau 32 Hex-Zeichen, Kleinbuchstaben);
+    /// auch für die Exporttests (`crate::export`), die eine feste Zeile
+    /// nachbauen.
     ///
     /// # Returns
     /// `None` bei jeder anderen Eingabe.
-    fn parse_hex(text: &str) -> Option<Self> {
+    pub(crate) fn parse_hex(text: &str) -> Option<Self> {
         if text.len() != DEDUP_KEY_HEX_LEN {
             return None;
         }
