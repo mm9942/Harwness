@@ -901,7 +901,7 @@ fn spool_record(
 /// What makes two findings of different rule runs the same finding.
 ///
 /// The kind enters as its [`finding_kind_label`], so the tuple is `Ord` and
-/// can key a `BTreeMap` ([`attribute_origins`]).
+/// can key a `BTreeMap` ([`attribute_provenance`]).
 type FindingSignature = (
     &'static str,
     &'static str,
@@ -926,30 +926,43 @@ macro_rules! signature_of {
     }};
 }
 
-/// Derives the [`FindingOrigin`] of each finding (see the module
-/// documentation, "Entprellung wiederholter Befunde").
+/// Origin of a finding plus the delta indices of its triggering events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Provenance {
+    /// What all triggering events share ([`FindingOrigin`]).
+    origin: FindingOrigin,
+    /// Indices into the delta's events whose single-event run produces the
+    /// finding's signature, in delta order, at most [`MAX_TRIGGER_EVENTS`].
+    triggers: Vec<usize>,
+}
+
+/// Derives the [`Provenance`] of each finding (see the module
+/// documentation, "Entprellung wiederholter Befunde" and "Spool-Record und
+/// Export v3").
 ///
 /// # Description
 /// Runs the rules once per single event of the delta and pools the origin
 /// of every event under each signature it produces, keeping only what all
-/// those events share ([`FindingOrigin::merge`]). A finding of the full run
-/// takes the pooled origin of its signature; when the full run produces
-/// that signature more often or less often than the single-event runs do
-/// (a sample finding, or a rule combining several events), its `uid` and
-/// `cgroup_kid` stay empty. Without any single-event match the subject is
-/// the digest of the summary.
+/// those events share ([`FindingOrigin::merge`]), together with the indices
+/// of those events (the triggering events, at most [`MAX_TRIGGER_EVENTS`]).
+/// A finding of the full run takes the pooled origin and triggers of its
+/// signature; when the full run produces that signature more often or less
+/// often than the single-event runs do (a sample finding, or a rule
+/// combining several events), its `uid` and `cgroup_kid` stay empty.
+/// Without any single-event match the subject is the digest of the summary
+/// and there are no triggering events.
 ///
 /// # Returns
 /// One entry per element of `findings`, in the same order.
-fn attribute_origins(
+fn attribute_provenance(
     findings: &[harw_dod_rules::Finding<harw_dod_rules::RuleChecked>],
     events: &[SecurityEvent],
     now: Timestamp,
     network_scope: &NetworkScope,
     cgroup_kids: &CgroupKids,
-) -> Vec<FindingOrigin> {
-    let mut pool: BTreeMap<FindingSignature, (usize, FindingOrigin)> = BTreeMap::new();
-    for event in events {
+) -> Vec<Provenance> {
+    let mut pool: BTreeMap<FindingSignature, (usize, Provenance)> = BTreeMap::new();
+    for (index, event) in events.iter().enumerate() {
         let ctx = RuleContext {
             now,
             samples: &[],
@@ -967,10 +980,21 @@ fn attribute_origins(
                 Entry::Occupied(mut slot) => {
                     let (count, pooled) = slot.get_mut();
                     *count = count.saturating_add(1);
-                    pooled.merge(&origin, raw.summary());
+                    pooled.origin.merge(&origin, raw.summary());
+                    if pooled.triggers.len() < MAX_TRIGGER_EVENTS
+                        && pooled.triggers.last() != Some(&index)
+                    {
+                        pooled.triggers.push(index);
+                    }
                 }
                 Entry::Vacant(slot) => {
-                    slot.insert((1, origin.clone()));
+                    slot.insert((
+                        1,
+                        Provenance {
+                            origin: origin.clone(),
+                            triggers: vec![index],
+                        },
+                    ));
                 }
             }
         }
@@ -990,15 +1014,33 @@ fn attribute_origins(
         .zip(findings)
         .map(|(signature, finding)| match pool.get(signature) {
             Some((count, pooled)) => {
-                let mut origin = pooled.clone();
+                let mut provenance = pooled.clone();
                 if in_full_run.get(signature) != Some(count) {
-                    origin.uid = None;
-                    origin.cgroup_kid = None;
+                    provenance.origin.uid = None;
+                    provenance.origin.cgroup_kid = None;
                 }
-                origin
+                provenance
             }
-            None => FindingOrigin::unattributed(finding.summary()),
+            None => Provenance {
+                origin: FindingOrigin::unattributed(finding.summary()),
+                triggers: Vec::new(),
+            },
         })
+        .collect()
+}
+
+/// Only the [`FindingOrigin`] of each finding ([`attribute_provenance`]).
+#[cfg(test)]
+fn attribute_origins(
+    findings: &[harw_dod_rules::Finding<harw_dod_rules::RuleChecked>],
+    events: &[SecurityEvent],
+    now: Timestamp,
+    network_scope: &NetworkScope,
+    cgroup_kids: &CgroupKids,
+) -> Vec<FindingOrigin> {
+    attribute_provenance(findings, events, now, network_scope, cgroup_kids)
+        .into_iter()
+        .map(|provenance| provenance.origin)
         .collect()
 }
 
@@ -1117,7 +1159,7 @@ mod tests {
             &NetworkScope::empty(),
             &CgroupKids::default(),
             None,
-            None,
+            ReportOutputs::default(),
         );
 
         assert_eq!(
@@ -1140,7 +1182,7 @@ mod tests {
             &NetworkScope::empty(),
             &CgroupKids::default(),
             None,
-            None,
+            ReportOutputs::default(),
         );
 
         assert_eq!(
@@ -1168,7 +1210,10 @@ mod tests {
             &NetworkScope::empty(),
             &CgroupKids::default(),
             None,
-            Some(&mut exporter),
+            ReportOutputs {
+                exporter: Some(&mut exporter),
+                ..ReportOutputs::default()
+            },
         );
 
         assert_eq!(reported, 1);
@@ -1222,7 +1267,10 @@ mod tests {
             &NetworkScope::empty(),
             &CgroupKids::default(),
             None,
-            Some(&mut exporter),
+            ReportOutputs {
+                exporter: Some(&mut exporter),
+                ..ReportOutputs::default()
+            },
         );
         assert_eq!(reported, 4);
 
@@ -1230,7 +1278,7 @@ mod tests {
         let mut scopes = Vec::new();
         for line in text.lines() {
             let value: serde_json::Value = serde_json::from_str(line).map_err(ctx("json line"))?;
-            assert_eq!(value["schema_version"], 2);
+            assert_eq!(value["schema_version"], 3);
             scopes.push((
                 value["summary"].as_str().map(str::to_owned),
                 value
@@ -1878,7 +1926,7 @@ mod tests {
             &NetworkScope::empty(),
             &CgroupKids::default(),
             None,
-            None,
+            ReportOutputs::default(),
         );
         assert_eq!(reported, 1, "only the drift event reports");
         Ok(())
@@ -1958,7 +2006,7 @@ mod tests {
                 &NetworkScope::empty(),
                 &CgroupKids::default(),
                 None,
-                None,
+                ReportOutputs::default(),
             )
         });
 
