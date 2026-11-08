@@ -1007,6 +1007,34 @@ fn test_control_plane_is_socket_activated_for_harw_control_clients() -> TestResu
 }
 
 #[test]
+fn test_tmpfiles_creates_the_spool_dir_owner_only() -> TestResult {
+    // PL-100 WP0.12: the sentinel spool holds raw evidence; nobody but the
+    // sentinel may traverse it, and it carries no age column.
+    let tmpfiles = asset("deploy/tmpfiles.d/harw.conf").ok_or(TestError::Missing("tmpfiles"))?;
+    let rendered_tmpfiles = rendered(tmpfiles);
+    let spool: Vec<Vec<&str>> = rendered_tmpfiles
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .filter(|f| f.get(1) == Some(&"/var/lib/harw-dod/spool"))
+        .collect();
+    assert_eq!(
+        spool,
+        [[
+            "d",
+            "/var/lib/harw-dod/spool",
+            "0700",
+            "harw-sentinel",
+            "harw-sentinel",
+            "-"
+        ]],
+        "spool dir: owner-only, sentinel-owned, no age-based cleanup"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_run_harw_infra_is_root_owned_because_every_daemon_is_activated() -> TestResult {
     let tmpfiles = asset("deploy/tmpfiles.d/harw.conf").ok_or(TestError::Missing("tmpfiles"))?;
     let infra: Vec<Vec<&str>> = tmpfiles

@@ -481,6 +481,11 @@ pub const CRATE_PRIVILEGE: &[(&str, RequiredPrivilege)] = &[
     // Leaf-Crate für `ContentDigest` (blake3 + serde), aus `harw-types`
     // herausgelöst und dort re-exportiert — reine Berechnung, kein I/O.
     ("harw-digest", RequiredPrivilege::Unprivileged),
+    // Gemeinsamer Escaper für angreiferbeeinflussten Text (PL-100 WP0.8):
+    // reine Zeichenklassifikation und `String`-Aufbau, keine Abhängigkeit,
+    // kein I/O, kein Syscall. Erreicht über `harw-sentinel` (Export) und
+    // `harw-dod-procmon` (`comm`-Escaping in `harw-probe-bpf`).
+    ("harw-untrusted-text", RequiredPrivilege::Unprivileged),
     // --- Erst sichtbar, seit die Gates Produkt- und DoD-Workspace zusammen
     // laden (vorher endete jede Hülle an der Workspace-Grenze). Je Crate den
     // Quelltext auf `Capability::`, Netlink/Socket, fanotify/inotify, BPF,

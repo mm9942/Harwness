@@ -1007,7 +1007,7 @@ fn test_field_table_exhaustive_retention_section() {
     } = harw_config::RetentionClassToml::default();
     let _ = (enabled, max_age_secs, max_bytes, max_files, keep_newest);
     assert_eq!(harw_retention::CLASS_CONFIG_FIELDS.len(), 5);
-    assert_eq!(harw_retention::CLASSES.len(), 10);
+    assert_eq!(harw_retention::CLASSES.len(), 12);
     for class in harw_retention::CLASSES {
         for field in harw_retention::CLASS_CONFIG_FIELDS {
             assert_path_in_field_table_exactly_once(&format!("retention.{}.{field}", class.id));

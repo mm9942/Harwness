@@ -15,8 +15,8 @@
 //!
 //! # Opt-in
 //! Sicherheitsrelevante Klassen (`dod_spool`, `sentinel_export`,
-//! `freeze_resolved`, `session_transcripts`, `session_corrupt_backups`)
-//! sind standardmäßig **aus**: nie gelöscht, im Dry-Run nur berichtet. Nur
+//! `dod_verdicts`, `dod_labels`, `freeze_resolved`, `session_transcripts`,
+//! `session_corrupt_backups`) sind standardmäßig **aus**: nie gelöscht, im Dry-Run nur berichtet. Nur
 //! ein ausdrückliches `enabled = true` aus einem vertrauten Layer schaltet
 //! die Löschung ein.
 //!
