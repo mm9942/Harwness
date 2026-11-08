@@ -2300,8 +2300,9 @@ mod tests {
             if role == role_names::EXECUTOR {
                 // Plan R9, Teil A: plus the read-only skill catalog, which
                 // carries no sandbox permission class.
-                // Plan R9, Teil F: plus the five `job.*` tools that belong to
-                // `shell.exec` (same permission and approval path).
+                // Plan R9, Teil F: plus the seven `job.*` tools that belong to
+                // `shell.exec` (`job.start` like `shell.exec`;
+                // `job.suspend`/`job.resume` always ask, PL-100 WP 3.5).
                 assert_eq!(
                     admitted.iter().map(String::as_str).collect::<Vec<_>>(),
                     vec![
@@ -2310,6 +2311,8 @@ mod tests {
                         "job.status",
                         "job.logs",
                         "job.stop",
+                        "job.suspend",
+                        "job.resume",
                         "job.list",
                         "skills.search",
                         "skills.load",

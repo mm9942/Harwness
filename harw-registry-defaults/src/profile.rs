@@ -1710,8 +1710,10 @@ pub const TUNNEL_TOOLS: &[&str] = &[
     "tunnel.list",
 ];
 
-/// Plan R9, Teil F: die sechs Werkzeuge von `harw-tool-job`
-/// (`job.start/status/logs/stop/list`) in Registrierungsreihenfolge.
+/// Plan R9, Teil F: die sieben Werkzeuge von `harw-tool-job`
+/// (`job.start/status/logs/stop/list/suspend/resume`) in
+/// Registrierungsreihenfolge (`suspend`/`resume`: PL-100 WP 3.5, immer mit
+/// Rückfrage).
 ///
 /// # Beschreibung
 /// Stehen in jedem Profil direkt hinter [`SHELL_TOOLS`]: `job.start` läuft
@@ -3273,7 +3275,7 @@ impl JobWiring {
         self
     }
 
-    /// Die sechs `job.*`-Werkzeuge über einem Klon von `shell`.
+    /// Die sieben `job.*`-Werkzeuge über einem Klon von `shell`.
     ///
     /// # Beschreibung
     /// `job.start` geht durch
@@ -6210,7 +6212,7 @@ mod tests {
     }
 
     /// Plan R9, Teil F: jedes Profil mit `shell.exec` bewirbt direkt dahinter
-    /// die sechs `job.*`-Werkzeuge; kein Profil ohne Shell tut das.
+    /// die sieben `job.*`-Werkzeuge; kein Profil ohne Shell tut das.
     #[test]
     fn test_shell_profiles_carry_job_tools_right_after_shell_exec() {
         for profile in RegistryProfile::ALL {

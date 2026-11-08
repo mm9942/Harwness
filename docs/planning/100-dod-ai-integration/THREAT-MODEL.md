@@ -55,6 +55,7 @@
 | B22 | Agent nutzt Host-Werkzeuge nach einem Befund (kill/sudo) ohne Nachfrage | A3 | **offen** (Full ohne Nachfrage, globale `SessionLease`) | Taint-Regel (O1), `SessionLease` mit Ablauf, `job.*` mit ALWAYS_ASK (Phase 4, 3.5) |
 | B23 | Manipuliertes BPF-Objekt | A6 | **offen** | SHA-256-Prüfung des Manifests zur Laufzeit (Phase 4) |
 | B24 | Ledger-Verlust nach Neustart (Replay) | A2 | — | persistente Nonces, StateDirectory für den Warden (3.1) |
+| B25 | Ein gemeinsames `cgroup.freeze`-Bit: `job.resume` hebt eine Warden-Eindämmung desselben Jobs auf, oder die Freigabe des Wardens hebt harws Anhalten auf | A1/A3/A4 | teilweise (harw-Seite umgesetzt; Warden-Marker, Sperre und `/run/harw-warden` fehlen, `job.resume` bleibt auf Hosts mit Warden fail-closed) | Eindämmungsindex des Wardens (Marker je Kernel-ID unter `/run/harw-warden/holds`), geteilte Sperre nach bestem Bemühen, Prüfen, Auftauen und erneutes Prüfen; `job.resume` fail-closed bei unlesbarem Index oder bei Warden-Spur ohne Index; Freezer nur mit beiden Werkzeugen in `ALWAYS_ASK_TOOLS` und delegierter cgroup-v2-Wurzel, mit Warden-Spur bei der Montage Index für die Sitzung auf „Warden erwartet“ festgelegt; dauerhafte Phase `intent`/`applied`: nach einem Neustart taut `job.resume` nur ein belegtes (`applied`) Anhalten auf, ein ungeklärtes bleibt fail-closed bis zur Klärung von Hand (Kosten: Verfügbarkeit, beschreibbares Zustandsverzeichnis nötig); Restrisiken in §4 (3.5) |
 
 ## 4. Restrisiken
 
@@ -66,6 +67,51 @@
   Damit kann er eine Freigabe für einen untergeschobenen Freeze/Thaw erschleichen (umkehrbar, sichtbar im Menü „Eingriffe"), aber nie für Kill
   oder Isolation.
 - Automatische Playbooks für eigene harw-Jobs (O2, später): ein Fehlalarm kann einen eigenen Job anhalten; begrenzt auf `job.suspend`, umkehrbar.
+- `job.suspend`/`job.resume` (Autonomie-Stufe A2, WP 3.5, B25) teilen das eine `cgroup.freeze`-Bit der Job-cgroup mit einer
+  Warden-Eindämmung. Abgestimmt wird über Marker im Eindämmungsindex des Wardens (`/run/harw-warden/holds/<Kernel-ID>`; Vertrag bei
+  `CONTAINMENT_HOLDS_DIR` in `harw-tool-job/src/freeze.rs`). Es bleiben:
+  - **Freeze ohne Marker:** Friert jemand die Job-cgroup ohne Marker ein, *nachdem* harw sie angehalten hat (ein Warden ohne das
+    Marker-Protokoll, ein Operator mit `cgroup.freeze` = 1), ist das von harws eigenem Freeze nicht zu unterscheiden; `job.resume` hebt ihn mit
+    auf. Ein solcher Freeze *vor* harws Anhalten gilt als fremd: harw übernimmt ihn nicht und hebt ihn nie auf.
+  - **Hosts mit Warden heute ohne Fortsetzen:** In diesem Stand legt `harw-dod-warden` noch keine Marker an und nimmt keine Sperre, und
+    `deploy/tmpfiles.d/harw.conf` kennt `/run/harw-warden` nicht. Auf einem Host mit Spur eines installierten Wardens
+    (`CONTAINMENT_OWNER_EVIDENCE`: `/run/harw/warden.sock`, `/etc/harw-dod/warden.enable`) ist der Index deshalb nicht vertrauenswürdig. Die
+    Montage installiert den Freezer trotzdem (Vertrag von `harw-tool-job/src/freeze.rs`, `with_containment_index` in
+    `harw-runtime/src/assembly.rs`) und meldet den Zustand einmal auf `info` (`runtime.jobs.resume_refused_until_containment_index`, ohne Pfad).
+    `job.suspend` friert ein (die sichere Richtung, Warnung im Log), `job.resume` lehnt jedes Auftauen ab (Fehler `probe`: „the containment index
+    cannot be trusted“), bis der Index vertrauenswürdig ist. Bis dahin beenden nur `job.stop` (SIGKILL) oder ein Operator den Freeze; die
+    Nachfrage zu `job.suspend` weist darauf nicht hin. Zeigt der Host bei der Montage eine Spur, wird der Index für die Sitzung auf „Warden
+    erwartet“ festgelegt (`MarkerDirHolds::owner_expected`); verschwindet die Spur später, bleibt ein fehlendes `/run/harw-warden` trotzdem
+    fail-closed. Dasselbe gilt, wenn der Index erst nach der Montage unlesbar oder nicht vertrauenswürdig wird. Damit A2 auf Hosts mit Warden
+    auch fortsetzen kann, fehlen ein tmpfiles-Eintrag für `/run/harw-warden` und `/run/harw-warden/holds` (root-eigen, nicht für Gruppe oder
+    andere beschreibbar) und das Marker- und Sperrprotokoll in `harw-dod-warden`.
+  - **Sperre nur nach bestem Bemühen:** Der Warden versucht `flock(LOCK_EX|LOCK_NB)` auf das Indexverzeichnis genau einmal und dämmt mit oder
+    ohne Sperre ein. harw versucht `flock(LOCK_SH)` etwa 100 ms lang (20 Versuche im Abstand von 5 ms) und taut danach ohne Sperre auf, nur durch
+    Prüfen, Auftauen und erneutes Prüfen geschützt (Warnung mit `job_id`). Jeder lokale Prozess, auch ein Job unter harws uid, kann die Sperre
+    halten. Er verzögert damit jedes `job.resume` um bis zu etwa 100 ms und zwingt es auf den Weg ohne Sperre, blockiert es aber nicht (bewusst,
+    sonst könnte jeder Nutzer `job.resume` bzw. die Eindämmung sperren). Fail-closed bleibt `job.resume` bei einem unlesbaren oder nicht
+    vertrauenswürdigen Index und bei einem verwaisten Marker, bis der Warden seine Marker beim Start abgleicht oder ein Operator aufräumt.
+  - **Restfenster unter Sperrkonkurrenz:** Ohne Sperre kann eine Eindämmung zwischen Prüfung und Auftauen dazukommen. Weil der Warden den Marker
+    vor dem Freeze anlegt, findet harws zweite Prüfung ihn, und harw friert sofort wieder ein. Zwischen Auftauen und Wiedereinfrieren läuft der
+    Job Mikrosekunden lang weiter. Scheitert das Wiedereinfrieren, meldet harw das auf `error`, und der Vermerk sagt weiter „angehalten".
+  - **Umgekehrte Richtung:** Landet harws Freeze zwischen dem Lesen des Bits durch den Warden und dessen eigenem Freeze (harws Prüfung fand noch
+    keinen Marker), vermerkt der Warden „war nicht eingefroren". Seine Freigabe hebt dann auch harws Anhalten auf. harws Vermerk sagt weiter
+    „angehalten", während der Job läuft. Für die Eindämmung ist das die sichere Seite: `job.stop` beendet einen angehaltenen Job mit SIGKILL.
+  - **Angreifer A4:** Ein kompromittierter harw-Prozess schreibt `cgroup.freeze` in seinem delegierten Teilbaum direkt, ohne Nachfrage, ohne
+    Eindämmungsindex und ohne Vermerk. Er kann eigene Jobs anhalten und fortsetzen und auch eine Warden-Eindämmung eines Job-Blatts unter seiner
+    Wurzel aufheben. Die Nachfrage (`ALWAYS_ASK_TOOLS`, außer unter Full Access) schützt gegen A3, nicht gegen A4. Gegen A4 hält nur ein
+    Freeze einer cgroup, deren `cgroup.freeze` die harw-uid nicht schreiben kann (oberhalb ihres delegierten Teilbaums).
+  - **Full Access fragt nicht:** Unter `ApprovalMode::FullAccess` (`/permissions set full`) gibt `DefaultApprovalPolicy::review`
+    (`harw-registry-defaults/src/lib.rs`) jeden Aufruf frei, auch die aus `ALWAYS_ASK_TOOLS`; Kinder folgen dem Modus der Wurzel ungedeckelt
+    (`harw-runtime/src/approval.rs`). `job.suspend` und `job.resume` laufen dann ohne Rückfrage, Stufe A2 „immer mit Nachfrage“ gilt nur in
+    den Modi „ask“ und „auto“. Das ist die Nutzerentscheidung vom 2026-09-24 (siehe B22); nur eine ausdrückliche `/permissions`-Deny-Regel
+    lehnt dort noch ab. `full_access_lets_suspend_and_resume_through_without_a_question` in `harw-runtime/tests/job_suspend_wiring.rs` hält
+    diesen Stand fest, damit eine Änderung sichtbar wird.
+  - **Nur auf delegierten cgroup-v2-Hosts:** Die Montage installiert den Freezer nur in der TUI-Sitzung, nur unter Linux, nur über der vom
+    Befehls-Port bestätigten delegierten cgroup-v2-Wurzel der Job-cgroups (`[jobs] cgroup_root` → `HARW_CGROUP_ROOT` → eigene delegierte
+    cgroup) und nur, wenn beide Werkzeuge in `ALWAYS_ASK_TOOLS` stehen (`install_job_freezer` in `harw-runtime/src/assembly.rs`). Sonst lehnen
+    beide Werkzeuge typisiert ab (`SuspendUnavailable`, dessen Text heute pauschal „keine delegierte cgroup-v2-Wurzel“ nennt); Stufe A2
+    entfällt dann, es bleibt der Warden-Freeze (Stufe A3).
 - Ein globaler Angreifer mit root bleibt außerhalb des Modells.
 - Bei einem Remote-Triage-Modell sieht der Provider begrenzte Evidence-Cards. Das ist eine bewusste Entscheidung des Owners.
 - Die DoD-Erkennung selbst kann umgangen werden (Kernel-Rootkits, Verkehr ohne TCP-Connect).

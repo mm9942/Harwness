@@ -668,8 +668,10 @@ struct Ceiling<'a> {
 ///
 /// # Beschreibung
 /// `job.start` nur, wenn die (geklemmte) Definition `shell.exec` admittiert;
-/// die lesenden/steuernden Werkzeuge (`job.status/logs/stop/list/wait`)
-/// immer. In jedem Fall nur, was die Basis selbst admittiert.
+/// die lesenden/steuernden Werkzeuge (`job.status/logs/stop/list/suspend/resume`)
+/// immer. Nur `job.start` hängt an `shell.exec`; `job.suspend` und
+/// `job.resume` fragen über `ALWAYS_ASK_TOOLS` nach (PL-100 WP 3.5). In jedem
+/// Fall nur, was die Basis selbst admittiert.
 fn job_companion_tools<'a>(clamped: &AgentIr, ceiling: &'a AgentIr) -> Vec<&'a str> {
     let admits_shell = clamped
         .tools
@@ -1208,6 +1210,26 @@ specialization = "web-scout"
         // Über einer eingebauten Rolle gewinnt deren `[tools]`-Abschnitt; die
         // Definition kann ihn nicht verengen — die Kontrollwerkzeuge bleiben.
         assert!(reader.tools.iter().any(|tool| tool == "job.status"));
+        // PL-100 WP 3.5: `job.suspend`/`job.resume` gehören wie `job.stop` zu
+        // den steuernden Werkzeugen, die ein eigener Agent über `executor`
+        // auch ohne `shell.exec` behält (nicht an `shell.exec` gebunden wie
+        // `job.start`); beide fragen trotzdem immer nach.
+        for tool in [
+            harw_tool_job::JOB_STOP_TOOL,
+            harw_tool_job::JOB_SUSPEND_TOOL,
+            harw_tool_job::JOB_RESUME_TOOL,
+        ] {
+            assert!(
+                reader.tools.iter().any(|admitted| admitted == tool),
+                "log-reader: {tool}"
+            );
+        }
+        for tool in [
+            harw_tool_job::JOB_SUSPEND_TOOL,
+            harw_tool_job::JOB_RESUME_TOOL,
+        ] {
+            assert!(crate::ALWAYS_ASK_TOOLS.contains(&tool), "{tool}");
+        }
         Ok(())
     }
 
