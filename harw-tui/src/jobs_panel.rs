@@ -39,11 +39,19 @@ pub(crate) struct JobRow {
     /// PL-97 C4: typed state of the job; the display label comes from
     /// [`Self::state_label`] (never compare localized labels).
     pub state: JobState,
+    /// PL-100 WP 3.5: the job's cgroup is frozen
+    /// ([`harw_tool_job::JobMeta::is_suspended`]): a `Suspended` job of this
+    /// session **or** a `Detached` one from an earlier session that stayed
+    /// frozen. Only the display label uses it ([`Self::state_label`] shows
+    /// `mission.suspended`); `state` stays the typed manager state, so stop
+    /// and selection logic are unchanged (THREAT-MODEL B13: a freeze stays
+    /// visible).
+    pub suspended: bool,
     /// Erkannter Fortschritt (`ninja 120/900 13%`) oder `—`.
     pub progress: String,
     /// Laufzeit (`1m15s`) oder `—`.
     pub runtime: String,
-    /// Noch nicht beendet (wartet, läuft, abgelöst).
+    /// Noch nicht beendet (wartet, läuft, angehalten, abgelöst).
     pub active: bool,
     /// Fehlgeschlagen oder mit unbekanntem Ausgang.
     pub failed: bool,
@@ -114,6 +122,7 @@ impl JobRow {
             id: status.meta.job_id.to_string(),
             name: sanitize_inline(&status.meta.name),
             state,
+            suspended: status.meta.is_suspended(),
             progress: sanitize_inline(&harw_ops::jobs::progress_label(status)),
             runtime: harw_ops::jobs::runtime_label(status),
             active: !state.is_terminal(),
@@ -127,10 +136,16 @@ impl JobRow {
         }
     }
 
-    /// Kurzer, lokalisierter Zustand (`läuft`, `fertig`, …) zur Anzeige.
+    /// Kurzer, lokalisierter Zustand (`läuft`, `fertig`, …) zur Anzeige; ein
+    /// eingefrorener Job heißt immer `angehalten`/`suspended`, auch wenn er
+    /// abgelöst ist ([`Self::suspended`]).
     #[must_use]
     pub(crate) fn state_label(&self) -> &'static str {
-        job_state_label(self.state)
+        if self.suspended {
+            job_state_label(JobState::Suspended)
+        } else {
+            job_state_label(self.state)
+        }
     }
 
     /// Session id of the child agent run this job backs, if it is a
@@ -202,6 +217,7 @@ pub(crate) fn job_state_label(state: JobState) -> &'static str {
     match state {
         JobState::Queued => crate::i18n::tr("mission.queued", "queued"),
         JobState::Running => crate::i18n::tr("mission.running", "running"),
+        JobState::Suspended => crate::i18n::tr("mission.suspended", "suspended"),
         JobState::Succeeded => crate::i18n::tr("mission.succeeded", "succeeded"),
         JobState::Failed => crate::i18n::tr("agents.failed", "failed"),
         JobState::Stopped => crate::i18n::tr("mission.stopped", "stopped"),
@@ -798,6 +814,7 @@ mod tests {
             id: "job-20260924-101112-001".to_owned(),
             name: name.to_owned(),
             state,
+            suspended: state == JobState::Suspended,
             progress: "ninja 120/900 13%".to_owned(),
             runtime: "12m03s".to_owned(),
             active,
@@ -1101,6 +1118,88 @@ mod tests {
         // oder verloren): der Job bleibt sichtbar.
         row.child_link = ChildRunLink::RunActive;
         assert!(row.is_listed(), "beendeter Job eines aktiven Laufs");
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5: ein angehaltener Job (`suspended`) bleibt eine aktive,
+    /// nicht fehlgeschlagene Zeile und zeigt seinen eigenen, lokalisierten
+    /// Zustand (`angehalten` auf Deutsch, Englisch außerhalb einer Sprache).
+    #[test]
+    fn suspended_job_row_is_active_with_its_own_label() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        assert_eq!(job_state_label(JobState::Suspended), "suspended");
+        assert_eq!(
+            with_language(UiLanguage::German, || job_state_label(JobState::Suspended)),
+            "angehalten"
+        );
+        assert_ne!(
+            job_state_label(JobState::Suspended),
+            job_state_label(JobState::Running)
+        );
+
+        let suspended = status_of(
+            &meta_json(
+                "suspended",
+                r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z","#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        let row = JobRow::from_status(&suspended);
+        assert_eq!(row.state, JobState::Suspended);
+        assert!(row.active && !row.failed, "{row:?}");
+        assert_eq!(row.reason, None);
+        assert!(row.is_listed());
+        let line = job_line(&row, false, 120, Theme::Dark);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("suspended"), "{text}");
+        assert!(text.contains('⚙'), "aktives Symbol: {text}");
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5 (THREAT-MODEL B13): ein abgelöster Job, dessen cgroup
+    /// noch eingefroren ist (`detached` mit `suspended_at`, nach `detach_all`
+    /// bzw. einem Neustart), zeigt `suspended` statt `detached`; sein Zustand
+    /// bleibt typisiert `Detached`. Ohne Vermerk bleibt er `detached`.
+    #[test]
+    fn frozen_detached_job_row_is_labelled_suspended() -> TestResult {
+        let frozen = status_of(
+            &meta_json(
+                "detached",
+                r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z","#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        let row = JobRow::from_status(&frozen);
+        assert_eq!(row.state, JobState::Detached);
+        assert!(row.suspended && row.active && !row.failed, "{row:?}");
+        assert_eq!(row.state_label(), job_state_label(JobState::Suspended));
+        let line = job_line(&row, false, 120, Theme::Dark);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("suspended"), "{text}");
+        assert!(!text.contains("detached"), "{text}");
+
+        let detached = status_of(
+            &meta_json(
+                "detached",
+                r#""started_at":"2026-01-01T00:00:01Z","#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        let row = JobRow::from_status(&detached);
+        assert!(!row.suspended, "{row:?}");
+        assert_eq!(row.state_label(), job_state_label(JobState::Detached));
         Ok(())
     }
 

@@ -251,6 +251,18 @@
     "vi": "đang chạy",
     "hi": "चल रहा है"
   },
+  "mission.suspended": {
+    "en": "suspended",
+    "de": "angehalten",
+    "es": "suspendido",
+    "fr": "suspendu",
+    "pt": "suspenso",
+    "ja": "一時停止中",
+    "zh-CN": "已暂停",
+    "ko": "일시 중지됨",
+    "vi": "đã tạm dừng",
+    "hi": "निलंबित"
+  },
   "mission.succeeded": {
     "en": "succeeded",
     "de": "erfolgreich",

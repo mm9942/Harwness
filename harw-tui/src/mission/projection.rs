@@ -211,13 +211,14 @@ impl TerminalOutcome {
         }
     }
 
-    /// Outcome of a finished job (`None` while it is not terminal).
+    /// Outcome of a finished job (`None` while it is not terminal; a
+    /// suspended job is frozen, not finished -- PL-100 WP 3.5).
     fn of_job(state: JobState) -> Option<Self> {
         match state {
             JobState::Succeeded => Some(Self::Ok),
             JobState::Failed | JobState::Unknown => Some(Self::Failed),
             JobState::Stopped => Some(Self::Cancelled),
-            JobState::Queued | JobState::Running | JobState::Detached => None,
+            JobState::Queued | JobState::Running | JobState::Suspended | JobState::Detached => None,
         }
     }
 
@@ -584,6 +585,7 @@ pub(crate) mod tests {
             id: id.to_owned(),
             name: format!("name-{id}"),
             state,
+            suspended: state == JobState::Suspended,
             progress: "—".to_owned(),
             runtime: "1s".to_owned(),
             active: !state.is_terminal(),
@@ -610,6 +612,7 @@ pub(crate) mod tests {
         let state = [
             JobState::Queued,
             JobState::Running,
+            JobState::Suspended,
             JobState::Succeeded,
             JobState::Failed,
             JobState::Stopped,
@@ -688,6 +691,38 @@ pub(crate) mod tests {
             .map(|row| row.id.as_str())
             .collect();
         assert_eq!(ids, vec!["b", "d", "c", "a"]);
+    }
+
+    /// PL-100 WP 3.5: a suspended job is frozen, not finished -- it stays
+    /// among the running jobs, has no outcome and is never counted as
+    /// finished; its localized label maps back to the typed state.
+    #[test]
+    fn suspended_job_stays_active_and_has_no_outcome() -> TestResult {
+        assert_eq!(TerminalOutcome::of_job(JobState::Suspended), None);
+        let jobs = vec![
+            job_in("done", JobState::Succeeded),
+            job_in("frozen", JobState::Suspended),
+        ];
+        let ids: Vec<&str> = job_window_rows(&jobs)
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["frozen", "done"]);
+        assert_eq!(running_job_count(&jobs), 1);
+
+        let mut monitor = AgentMonitor::default();
+        monitor.set_jobs(jobs);
+        let jobs = monitor.jobs().to_vec();
+        let rows = terminal_aggregate(&monitor, &jobs);
+        assert_eq!(
+            rows.iter().map(|row| row.total).sum::<usize>(),
+            1,
+            "only the succeeded job is finished: {rows:?}"
+        );
+
+        let labelled = job("x", true, false, "angehalten");
+        assert_eq!(labelled.state, JobState::Suspended);
+        Ok(())
     }
 
     /// A job-backed child agent its run represents has no row of its own in

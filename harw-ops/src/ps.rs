@@ -61,6 +61,10 @@ use std::sync::Arc;
 /// abgeschnitten gelesen und scheitern damit am Parsen.
 const MAX_META_BYTES: u64 = 1 << 20;
 
+/// Statusfilter für eingefrorene Hintergrundprozesse (PL-100 WP 3.5): nur
+/// `process`-Zeilen, siehe [`PsArgs`].
+const SUSPENDED_FILTER: &str = "suspended";
+
 /// Argumente für die `/ps`-Operation.
 ///
 /// # Beschreibung
@@ -71,13 +75,20 @@ const MAX_META_BYTES: u64 = 1 << 20;
 /// # Felder
 /// - `status` (`Option<String>`): Filterwert; gültige Werte sind die Zustände
 ///   `pending`, `ready`/`waiting`, `running`, `completed`/`finished`, `blocked`,
-///   `failed` und `cancelled`/`canceled`. `None` bedeutet: alle Jobs.
+///   `failed` und `cancelled`/`canceled`, dazu `timed_out` (nur Arbeit) und
+///   `suspended` (nur Prozesse). `None` bedeutet: alle Jobs.
 ///
 /// Der Filter wird in [`JobListQuery`] als serverseitige Zustandsauswahl an den
 /// durable Store weitergereicht. Für `process`-Zeilen gilt die Zuordnung
-/// `pending`/`ready` → `queued`, `running` → `running`/`detached`,
+/// `pending`/`ready` → `queued`, `running` → `running`/`suspended`/`detached`
+/// (ein angehaltener Prozess lebt eingefroren weiter, PL-100 WP 3.5),
 /// `completed` → `succeeded`, `failed` → `failed`/`unknown`,
 /// `cancelled` → `stopped`; `blocked` trifft keinen Hintergrundprozess.
+/// `suspended` ist ein reiner Prozessfilter (PL-100 WP 3.5): er findet jeden
+/// eingefrorenen Hintergrundprozess ([`JobMeta::is_suspended`]), auch einen
+/// abgelösten, dessen cgroup noch eingefroren ist (Zustand `detached`);
+/// durable Arbeitsaufträge kennen keinen Haltezustand und erscheinen dabei
+/// nie.
 #[derive(Default, serde::Deserialize, harw_macros::FromRawArgs, harw_macros::OpArgs)]
 pub struct PsArgs {
     /// Filtert nach Job-Status, etwa `"running"`, `"waiting"` oder
@@ -206,8 +217,15 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
     let want_timed_out = status
         .as_deref()
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("timed_out"));
+    // PL-100 WP 3.5: `suspended` gibt es nur für Hintergrundprozesse
+    // (eingefroren, auch abgelöst); der durable Store kennt ihn nicht.
+    let want_suspended = status
+        .as_deref()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(SUSPENDED_FILTER));
     let states = if want_timed_out {
         Some(JobState::Failed)
+    } else if want_suspended {
+        None
     } else {
         status.as_deref().map(parse_state).transpose()?
     };
@@ -215,7 +233,7 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
         .service::<Arc<JobStore>>()
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
     // H12: mandantengebundene Aufrufer sehen nur Jobs des eigenen Mandanten.
-    let jobs = if kind == Some(Kind::Process) {
+    let jobs = if kind == Some(Kind::Process) || want_suspended {
         Vec::new()
     } else {
         crate::job_tenant::list_visible_jobs(
@@ -242,6 +260,8 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
     };
     if want_timed_out {
         processes.clear();
+    } else if want_suspended {
+        processes.retain(JobMeta::is_suspended);
     } else if let Some(filter) = states {
         processes.retain(|meta| process_matches(filter, meta.state));
     }
@@ -484,7 +504,10 @@ fn process_end_reason(meta: &JobMeta) -> &'static str {
 fn process_matches(filter: JobState, state: ProcessState) -> bool {
     match filter {
         JobState::Pending | JobState::Ready => state == ProcessState::Queued,
-        JobState::Running => matches!(state, ProcessState::Running | ProcessState::Detached),
+        JobState::Running => matches!(
+            state,
+            ProcessState::Running | ProcessState::Suspended | ProcessState::Detached
+        ),
         JobState::Completed => state == ProcessState::Succeeded,
         JobState::Failed => matches!(state, ProcessState::Failed | ProcessState::Unknown),
         JobState::Cancelled => state == ProcessState::Stopped,
@@ -509,7 +532,9 @@ fn parse_state(value: &str) -> Result<JobState, OpError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PsArgs, process_end_reason, process_profile, ps, read_process_jobs};
+    use super::{
+        PsArgs, process_end_reason, process_matches, process_profile, ps, read_process_jobs,
+    };
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_authority::{
@@ -1017,6 +1042,62 @@ mod tests {
         Ok(())
     }
 
+    /// PL-100 WP 3.5: `suspended` ist ein reiner Prozessfilter. Er findet
+    /// jeden eingefrorenen Hintergrundprozess, auch einen abgelösten, dessen
+    /// cgroup noch eingefroren ist (`detached` mit `suspended_at`), aber
+    /// keinen laufenden oder beendeten; durable Arbeit erscheint nie.
+    #[tokio::test]
+    async fn ps_suspended_filter_lists_frozen_processes_only() -> TestResult {
+        let (_home_dir, home) = home_fixture()?;
+        write_succeeded_process(&home)?;
+        let frozen = serde_json::json!({"suspended_at": "2026-01-01T00:00:03Z"});
+        for (id, state) in [("job-proc-2", "suspended"), ("job-proc-3", "detached")] {
+            write_meta(&home, id, &meta_json(id, state, frozen.clone()))?;
+        }
+        write_meta(
+            &home,
+            "job-proc-4",
+            &meta_json("job-proc-4", "running", serde_json::json!({})),
+        )?;
+        let op_ctx = mixed_context(&home, None)?;
+
+        let args = PsArgs::from_raw_args(&toks(&["process", "suspended"]))
+            .map_err(|error| TestError::Unexpected(format!("{error}")))?;
+        let output = ps(&op_ctx, args).await.map_err(ctx("ps suspended"))?;
+        let ids: Vec<&str> = output
+            .text
+            .lines()
+            .filter_map(|line| line.split('\t').next())
+            .collect();
+        assert_eq!(ids, vec!["job-proc-2", "job-proc-3"], "{}", output.text);
+
+        let overview = ps(
+            &op_ctx,
+            PsArgs {
+                status: Some("Suspended".to_owned()),
+                kind: None,
+            },
+        )
+        .await
+        .map_err(ctx("ps suspended overview"))?;
+        assert_eq!(
+            overview.text,
+            "work: none\nprocess: 1 suspended · 1 detached\nDetails: /ps work|process [status]"
+        );
+
+        let work = ps(
+            &op_ctx,
+            PsArgs {
+                status: Some("suspended".to_owned()),
+                kind: Some("work".to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx("ps suspended work"))?;
+        assert_eq!(work.text, "No jobs.");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn ps_skips_mismatched_or_unreadable_meta() -> TestResult {
         // Fehlendes Job-Verzeichnis: leer, kein Fehler, nichts angelegt.
@@ -1099,6 +1180,45 @@ mod tests {
         ))
         .map_err(ctx("parse host meta"))?;
         assert_eq!(process_profile(&host), "host");
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5: der Statusfilter ordnet jeden Prozesszustand zu; ein
+    /// angehaltener (eingefrorener, weiter lebender) Prozess zählt unter
+    /// `running`, unter keinem anderen Filter.
+    #[test]
+    fn process_filter_maps_every_process_state() -> TestResult {
+        use harw_job_runtime::JobState as Filter;
+        use harw_tool_job::JobState as Process;
+        let processes = [
+            Process::Queued,
+            Process::Running,
+            Process::Suspended,
+            Process::Succeeded,
+            Process::Failed,
+            Process::Stopped,
+            Process::Detached,
+            Process::Unknown,
+        ];
+        let expected: [(Filter, &[Process]); 7] = [
+            (Filter::Pending, &[Process::Queued]),
+            (Filter::Ready, &[Process::Queued]),
+            (
+                Filter::Running,
+                &[Process::Running, Process::Suspended, Process::Detached],
+            ),
+            (Filter::Completed, &[Process::Succeeded]),
+            (Filter::Failed, &[Process::Failed, Process::Unknown]),
+            (Filter::Cancelled, &[Process::Stopped]),
+            (Filter::Blocked, &[]),
+        ];
+        for (filter, want) in expected {
+            let got: Vec<Process> = processes
+                .into_iter()
+                .filter(|state| process_matches(filter, *state))
+                .collect();
+            assert_eq!(got, want, "{filter:?}");
+        }
         Ok(())
     }
 

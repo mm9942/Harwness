@@ -2466,12 +2466,24 @@ impl RuntimeAssemblyBuilder {
         let (session_jobs, job_notifications) = if spec.entry == EntryKind::Tui {
             // `[jobs] max_running` — Höchstzahl laufender Jobs dieser Sitzung.
             // PL-97 E3: `[jobs] cgroup_root`/`trampoline` erreichen den Befehls-Port.
+            let port_options = crate::job_wiring::host_port_options(&config.harness.jobs);
             match crate::job_wiring::SessionJobs::open_with_port(
                 &home_project.state_dir(),
                 config.harness.jobs.effective_max_running(),
-                &crate::job_wiring::host_port_options(&config.harness.jobs),
+                &port_options,
             ) {
-                Ok((jobs, receiver)) => (Some(jobs), Some(receiver)),
+                Ok((jobs, receiver)) => {
+                    // PL-100 WP 3.5: `job.suspend`/`job.resume` über dieselbe
+                    // delegierte Wurzel wie die Job-cgroups, nur wenn beide
+                    // in `ALWAYS_ASK_TOOLS` stehen (A2); nie fatal, ein
+                    // Grund ohne Freezer ist schon geloggt.
+                    install_job_freezer(
+                        &jobs.manager,
+                        &port_options,
+                        harw_registry_defaults::ALWAYS_ASK_TOOLS,
+                    );
+                    (Some(jobs), Some(receiver))
+                }
                 Err(error) => {
                     tracing::warn!(error = %error, "runtime.jobs.open_failed");
                     (None, None)
@@ -3697,6 +3709,275 @@ impl RuntimeAssemblyBuilder {
             // Plan R9, Teil F.
             session_jobs,
         })
+    }
+}
+
+/// PL-100 WP 3.5: Ergebnis von [`install_job_freezer`] — installiert oder
+/// der Grund, warum `job.suspend`/`job.resume` typisiert ablehnen
+/// (`SuspendUnavailable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum JobFreezerSetup {
+    /// Der Freezer ist in der Job-Verwaltung installiert.
+    Installed,
+    /// `job.suspend` oder `job.resume` fehlt in der Nachfrage-Liste
+    /// (`ALWAYS_ASK_TOOLS`): ohne Nachfrage bleibt das Anhalten aus
+    /// (PL-100 §2, Stufe A2 „durch den Menschen, immer mit Nachfrage“).
+    ApprovalGateMissing,
+    /// Keine delegierte cgroup-Wurzel für die Job-cgroups (oder kein Linux).
+    NoDelegatedRoot,
+    /// Der Freezer ließ sich über der delegierten Wurzel nicht öffnen.
+    OpenFailed,
+}
+
+impl JobFreezerSetup {
+    /// Stabiler Grund für das Log-Feld `reason`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::ApprovalGateMissing => "approval_gate_missing",
+            Self::NoDelegatedRoot => "no_delegated_cgroup_root",
+            Self::OpenFailed => "freezer_open_failed",
+        }
+    }
+}
+
+/// PL-100 §2 A2: ob `always_ask` (die Nachfrage-Liste der Montage,
+/// `ALWAYS_ASK_TOOLS`) `job.suspend` **und** `job.resume` enthält.
+fn suspend_tools_always_ask(always_ask: &[&str]) -> bool {
+    [
+        harw_tool_job::JOB_SUSPEND_TOOL,
+        harw_tool_job::JOB_RESUME_TOOL,
+    ]
+    .iter()
+    .all(|tool| always_ask.contains(tool))
+}
+
+/// PL-100 WP 3.5: installiert den Freezer für `job.suspend`/`job.resume`
+/// in der Job-Verwaltung `manager` (nur Linux).
+///
+/// # Beschreibung
+/// - Nachfrage zuerst (fail-closed): nur wenn `always_ask` (in der Montage
+///   `harw_registry_defaults::ALWAYS_ASK_TOOLS`) beide Werkzeuge enthält,
+///   wird überhaupt ein Freezer geöffnet. So schaltet diese Verdrahtung das
+///   Anhalten nie ohne Nachfrage frei, auch nicht vor dem Registry-Eintrag.
+/// - Der Freezer arbeitet unter derselben delegierten cgroup-Wurzel, unter
+///   der der Befehls-Port die Job-cgroups (`harw-job-<attempt>`) anlegt:
+///   `port` sind dieselben `[jobs]`-Optionen, mit denen der Port installiert
+///   wird ([`harw_command::HostPortOptions::delegated_cgroup_root`]:
+///   `[jobs] cgroup_root` → `HARW_CGROUP_ROOT` → eigene delegierte cgroup).
+/// - Nie fatal: ohne Freezer lehnen die Werkzeuge typisiert ab
+///   (`SuspendUnavailable`). Fehlende Nachfrage und ein gescheitertes
+///   Öffnen stehen auf `warn` (ohne Pfad; der Fehler selbst, er kann einen
+///   cgroup-Pfad enthalten, nur auf `debug`), eine fehlende Wurzel auf
+///   `debug` (der Port hat sie schon gemeldet).
+///
+/// # Rückgabe
+/// [`JobFreezerSetup::Installed`] oder der Grund ohne Freezer.
+///
+/// # Nebenläufigkeit
+/// Kurzer, synchroner Zugriff auf `/proc/self/cgroup` und das
+/// cgroup-Dateisystem; einmal je Montage.
+fn install_job_freezer(
+    manager: &harw_tool_job::JobManager,
+    port: &harw_command::HostPortOptions,
+    always_ask: &[&str],
+) -> JobFreezerSetup {
+    let setup = match open_job_freezer(port, always_ask) {
+        Ok(freezer) => {
+            manager.set_freezer(freezer);
+            JobFreezerSetup::Installed
+        }
+        Err(skip) => skip,
+    };
+    match setup {
+        JobFreezerSetup::Installed => tracing::info!("runtime.jobs.freezer_installed"),
+        JobFreezerSetup::ApprovalGateMissing | JobFreezerSetup::OpenFailed => {
+            tracing::warn!(reason = setup.as_str(), "runtime.jobs.suspend_unavailable")
+        }
+        JobFreezerSetup::NoDelegatedRoot => {
+            tracing::debug!(reason = setup.as_str(), "runtime.jobs.suspend_unavailable")
+        }
+    }
+    setup
+}
+
+/// Öffnet den cgroup-Freezer für [`install_job_freezer`]; prüft zuerst die
+/// Nachfrage, dann die delegierte Wurzel.
+///
+/// # Fehler
+/// [`JobFreezerSetup::ApprovalGateMissing`],
+/// [`JobFreezerSetup::NoDelegatedRoot`] oder [`JobFreezerSetup::OpenFailed`].
+#[cfg(target_os = "linux")]
+fn open_job_freezer(
+    port: &harw_command::HostPortOptions,
+    always_ask: &[&str],
+) -> Result<Arc<dyn harw_tool_job::JobFreezer>, JobFreezerSetup> {
+    if !suspend_tools_always_ask(always_ask) {
+        return Err(JobFreezerSetup::ApprovalGateMissing);
+    }
+    let root = port
+        .delegated_cgroup_root()
+        .ok_or(JobFreezerSetup::NoDelegatedRoot)?;
+    match harw_tool_job::CgroupFreezer::open(&root) {
+        Ok(freezer) => Ok(Arc::new(freezer)),
+        Err(error) => {
+            tracing::debug!(error = %error, "runtime.jobs.freezer_open_failed");
+            Err(JobFreezerSetup::OpenFailed)
+        }
+    }
+}
+
+/// Ohne Linux gibt es keinen cgroup-Freezer: nach der Nachfrage-Prüfung
+/// immer [`JobFreezerSetup::NoDelegatedRoot`].
+///
+/// # Fehler
+/// [`JobFreezerSetup::ApprovalGateMissing`] oder
+/// [`JobFreezerSetup::NoDelegatedRoot`].
+#[cfg(not(target_os = "linux"))]
+fn open_job_freezer(
+    _port: &harw_command::HostPortOptions,
+    always_ask: &[&str],
+) -> Result<Arc<dyn harw_tool_job::JobFreezer>, JobFreezerSetup> {
+    if !suspend_tools_always_ask(always_ask) {
+        return Err(JobFreezerSetup::ApprovalGateMissing);
+    }
+    Err(JobFreezerSetup::NoDelegatedRoot)
+}
+
+// PL-100 WP 3.5: Montage des `job.suspend`-Freezers.
+#[cfg(test)]
+mod job_freezer_tests {
+    use super::{JobFreezerSetup, install_job_freezer, suspend_tools_always_ask};
+    use crate::test_support::TestResult;
+    use harw_tool_job::{JOB_RESUME_TOOL, JOB_SUSPEND_TOOL};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// Eine Nachfrage-Liste mit beiden Anhalte-Werkzeugen.
+    const GATED: &[&str] = &["process.kill", JOB_SUSPEND_TOOL, JOB_RESUME_TOOL];
+
+    /// Abgelehnte (relative), fehlende und nicht delegierte Wurzeln.
+    const UNUSABLE_ROOTS: [&str; 3] = [
+        "relative/harw.slice",
+        "/tmp/harw-not-a-cgroup",
+        "/sys/fs/cgroup/harw-wp35-does-not-exist.slice",
+    ];
+
+    /// Eine Job-Verwaltung ohne Montage-Notizen unter `dir`.
+    fn manager(dir: &std::path::Path) -> TestResult<Arc<harw_tool_job::JobManager>> {
+        Ok(harw_tool_job::JobManager::new(
+            harw_tool_job::JobManagerConfig::new(dir),
+            Arc::new(harw_tool_job::NoopNotifier),
+        )?)
+    }
+
+    /// Befehls-Port-Optionen mit `[jobs] cgroup_root = root`.
+    fn port(root: impl Into<PathBuf>) -> harw_command::HostPortOptions {
+        harw_command::HostPortOptions {
+            cgroup_root: Some(root.into()),
+            trampoline: None,
+        }
+    }
+
+    /// PL-100 A2: nur beide Anhalte-Werkzeuge zusammen öffnen die
+    /// Nachfrage-Sperre.
+    #[test]
+    fn suspend_tools_must_both_always_ask() -> TestResult {
+        assert!(suspend_tools_always_ask(GATED));
+        assert!(suspend_tools_always_ask(&[
+            JOB_RESUME_TOOL,
+            JOB_SUSPEND_TOOL
+        ]));
+        let ungated: [&[&str]; 4] = [
+            &[],
+            &[JOB_SUSPEND_TOOL],
+            &[JOB_RESUME_TOOL],
+            &["process.kill", "job.stop"],
+        ];
+        for list in ungated {
+            assert!(!suspend_tools_always_ask(list), "{list:?}");
+        }
+        Ok(())
+    }
+
+    /// PL-100 A2: ohne beide Werkzeuge in der Nachfrage-Liste wird kein
+    /// Freezer geöffnet — geprüft vor der cgroup-Wurzel, also auf jedem
+    /// Host. Mit der Liste der Montage gilt dasselbe, solange
+    /// `ALWAYS_ASK_TOOLS` die beiden Namen nicht führt.
+    #[test]
+    fn missing_approval_gate_installs_no_freezer() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let manager = manager(dir.path())?;
+        let options = port("/sys/fs/cgroup/harw-wp35-does-not-exist.slice");
+        let ungated: [&[&str]; 3] = [&[], &[JOB_SUSPEND_TOOL], &[JOB_RESUME_TOOL]];
+        for list in ungated {
+            assert_eq!(
+                install_job_freezer(&manager, &options, list),
+                JobFreezerSetup::ApprovalGateMissing,
+                "{list:?}"
+            );
+        }
+        let production = harw_registry_defaults::ALWAYS_ASK_TOOLS;
+        let setup = install_job_freezer(&manager, &options, production);
+        if suspend_tools_always_ask(production) {
+            assert_eq!(setup, JobFreezerSetup::NoDelegatedRoot);
+        } else {
+            assert_eq!(setup, JobFreezerSetup::ApprovalGateMissing);
+        }
+        Ok(())
+    }
+
+    /// Mit Nachfrage installiert eine abgelehnte (relative), fehlende oder
+    /// nicht delegierte Wurzel keinen Freezer und lässt die Montage
+    /// weiterlaufen.
+    #[test]
+    fn unusable_cgroup_root_installs_no_freezer() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let manager = manager(dir.path())?;
+        for root in UNUSABLE_ROOTS {
+            assert_eq!(
+                install_job_freezer(&manager, &port(root), GATED),
+                JobFreezerSetup::NoDelegatedRoot,
+                "{root}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Eine delegierte Wurzel aus `[jobs] cgroup_root` installiert den
+    /// Freezer nur mit Nachfrage.
+    ///
+    /// Host-gebunden: `HARW_TEST_CGROUP_ROOT` auf ein delegiertes
+    /// cgroup-v2-Verzeichnis setzen und mit `--ignored` laufen lassen. Ohne
+    /// `--ignored` meldet der Testlauf den Test als ignoriert statt ihn
+    /// still zu bestehen; mit `--ignored` scheitert er ohne delegierte
+    /// Wurzel.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a delegated cgroup v2 root in HARW_TEST_CGROUP_ROOT"]
+    fn delegated_cgroup_root_installs_the_freezer_only_with_approval() -> TestResult {
+        use crate::test_support::TestError;
+        let root = std::env::var_os("HARW_TEST_CGROUP_ROOT")
+            .map(PathBuf::from)
+            .ok_or(TestError::Missing("HARW_TEST_CGROUP_ROOT"))?;
+        let options = port(root);
+        if options.delegated_cgroup_root().is_none() {
+            return Err(TestError::Missing(
+                "HARW_TEST_CGROUP_ROOT as a delegated cgroup v2 root",
+            ));
+        }
+        let dir = tempfile::tempdir()?;
+        let manager = manager(dir.path())?;
+        assert_eq!(
+            install_job_freezer(&manager, &options, &[JOB_SUSPEND_TOOL]),
+            JobFreezerSetup::ApprovalGateMissing
+        );
+        assert_eq!(
+            install_job_freezer(&manager, &options, GATED),
+            JobFreezerSetup::Installed
+        );
+        Ok(())
     }
 }
 
