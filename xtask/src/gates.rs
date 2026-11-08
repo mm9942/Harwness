@@ -51,6 +51,10 @@ pub mod arch;
 // ein (Ratsche: neue Startstellen sind Verstöße, die Liste kann nur schrumpfen).
 #[path = "gate_spawn.rs"]
 pub mod spawn;
+// PL-100 WP0.11 (Leitprinzip I1): nur `harw-escalator` darf das Feature
+// `operator-decision` von `harw-dod-rules` einschalten.
+#[path = "gate_operator_decision.rs"]
+pub mod operator_decision;
 
 /// Lädt den (einen) Wurzel-Workspace samt DoD-Domäne als Graphen.
 ///
@@ -144,7 +148,8 @@ impl GateReport {
 ///
 /// # Arguments
 /// - `args` (`&[String]`): Namen einzelner Gates (`edges`, `privileges`,
-///   `warden-deps`, `warden-cbuild`, `arch`); leer bedeutet alle.
+///   `warden-deps`, `warden-cbuild`, `arch`, `spawn`, `operator-decision`);
+///   leer bedeutet alle.
 ///
 /// # Returns
 /// `Ok(())`, wenn jedes ausgeführte Gate grün ist.
@@ -163,6 +168,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "warden-cbuild",
             "arch",
             "spawn",
+            "operator-decision",
         ]
     } else {
         args.iter().map(String::as_str).collect()
@@ -177,6 +183,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "warden-cbuild" => warden::c_build::run()?,
             "arch" => arch::run()?,
             "spawn" => spawn::run()?,
+            "operator-decision" => operator_decision::run()?,
             other => return Err(format!("unbekanntes Gate '{other}'")),
         };
         println!("{}", report.summary());

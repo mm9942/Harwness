@@ -7,8 +7,9 @@
 //! enthält keine Parselogik. Sie besitzt:
 //! - [`HostSample`] (Modul [`sample`]) — den langweiligen, häufigen
 //!   Messwertstrom.
-//! - [`Actor`], [`AuthOutcome`], [`EventKind`], [`SecurityEvent`] (Modul
-//!   [`event`]) — den seltenen, wichtigen Ereignisstrom.
+//! - [`Actor`], [`ProcessContext`], [`AuthOutcome`], [`EventKind`],
+//!   [`SecurityEvent`] (Modul [`event`]) — den seltenen, wichtigen
+//!   Ereignisstrom.
 //! - [`Hardness`], [`Severity`], [`SecurityEvidence`] (Modul [`evidence`]) —
 //!   den zitierfähigen Beleg über eingefrorene Beobachtungen.
 //! - [`SensorReading`] und `trait` [`Sensor`] (Modul [`sensor`]) — die
@@ -42,7 +43,7 @@
 //! **kein** `Finding`.
 //!
 //! # Exportierte Typen
-//! [`HostSample`], [`Actor`], [`AuthOutcome`], [`EventKind`],
+//! [`HostSample`], [`Actor`], [`ProcessContext`], [`AuthOutcome`], [`EventKind`],
 //! [`SecurityEvent`], [`Hardness`], [`Severity`], [`SecurityEvidence`],
 //! [`SensorReading`], [`Sensor`], [`SecurityVerdict`],
 //! [`VerdictClassification`], [`SuggestedResponse`], [`parse_verdict`],
@@ -93,7 +94,7 @@ pub mod sensor;
 pub mod verdict;
 
 pub use error::{SignalsError, SignalsResult};
-pub use event::{Actor, AuthOutcome, DriftSeverity, EventKind, SecurityEvent};
+pub use event::{Actor, AuthOutcome, DriftSeverity, EventKind, ProcessContext, SecurityEvent};
 pub use evidence::{Hardness, SecurityEvidence, Severity};
 pub use probe::{
     BpfEventMetadata, BpfLossSnapshot, ProbeHeartbeat, ProbeMessage, ProbeStamp,

@@ -135,7 +135,10 @@ pub trait Rule: Send + Sync {
 /// ```
 #[derive(Debug, Clone)]
 pub struct RuleContext<'a> {
-    /// **Injizierte** Zeit. Eine Regel liest nie die Systemuhr.
+    /// **Injizierte** Zeit. Eine Regel liest nie die Systemuhr. Befunde über
+    /// Ereignisse oder Samples tragen **nicht** diese Zeit, sondern das
+    /// `observed_at` der auslösenden Beobachtung (PL-100 WP0.2); `now` ist
+    /// die Auswertungszeit für Befunde ohne einzelne auslösende Beobachtung.
     pub now: Timestamp,
     /// Die zu prüfenden Messwerte.
     pub samples: &'a [HostSample],

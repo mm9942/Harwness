@@ -46,6 +46,7 @@
 //!             uid: 0,
 //!             auid: Some(1000),
 //!             cgroup: None,
+//!             process: None,
 //!         },
 //!         outcome: AuthOutcome::Success,
 //!     }],
@@ -150,6 +151,7 @@ mod tests {
                 uid,
                 auid,
                 cgroup: None,
+                process: None,
             },
             outcome,
         })

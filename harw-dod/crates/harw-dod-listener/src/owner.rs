@@ -80,7 +80,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use harw_dod_cap::ReadScope;
-use harw_dod_signals::Actor;
+use harw_dod_signals::{Actor, ProcessContext};
 use harw_types::CgroupId;
 
 /// Findet für jede gesuchte Inode-Nummer die besitzende Prozess-ID, in genau
@@ -224,8 +224,10 @@ fn parse_socket_inode(target: &Path) -> Option<u64> {
 /// `Some(Actor)` mit der realen UID aus `/proc/<pid>/status` und, falls
 /// auflösbar, der `CgroupId` aus `/proc/<pid>/cgroup`; `auid` ist immer
 /// `None` — dieser Sensor hat keinen Zugriff auf das Audit-Subsystem
-/// (`Capability::ReadAuditNetlink` gehört einer anderen Sensor-Crate). `None`,
-/// wenn nicht einmal die UID lesbar war.
+/// (`Capability::ReadAuditNetlink` gehört einer anderen Sensor-Crate).
+/// `process` trägt `pid` selbst (PL-100 WP0.15, `ProcessContext::from_pid`;
+/// `ppid`, `comm` und `euid` bleiben `None`, dieser Sensor liest sie nicht).
+/// `None`, wenn nicht einmal die UID lesbar war.
 ///
 /// # Concurrency
 /// Zustandslos; von jedem Thread parallel aufrufbar.
@@ -248,6 +250,7 @@ pub fn read_actor(scope: &ReadScope, root: &Path, pid: u32) -> Option<Actor> {
         uid,
         auid: None,
         cgroup,
+        process: ProcessContext::from_pid(pid),
     })
 }
 
@@ -449,6 +452,9 @@ mod tests {
             read_actor(&scope, dir.path(), 1000).ok_or(TestError::Missing("Actor auflösbar"))?;
         assert_eq!(actor.uid, 1000);
         assert_eq!(actor.auid, None);
+        // PL-100 WP0.15: die besitzende pid geht nicht mehr verloren.
+        assert_eq!(actor.process, ProcessContext::from_pid(1000));
+        assert_eq!(actor.process.as_ref().map(|p| p.pid), Some(1000));
         assert_eq!(
             actor.cgroup.map(|c| c.as_str().to_owned()),
             Some("/user.slice/user-1000.slice".to_owned())

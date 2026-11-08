@@ -133,7 +133,7 @@
 //! let backend = FixtureAuthBackend::new(
 //!     [AuthRecord {
 //!         observed_at: Timestamp::UNIX_EPOCH,
-//!         actor: Actor { uid: 0, auid: Some(1000), cgroup: None },
+//!         actor: Actor { uid: 0, auid: Some(1000), cgroup: None, process: None },
 //!         outcome: AuthOutcome::Success,
 //!     }],
 //!     Capability::ReadAuditNetlink,
@@ -367,6 +367,7 @@ mod tests {
                 uid,
                 auid,
                 cgroup: None,
+                process: None,
             },
             outcome,
         })

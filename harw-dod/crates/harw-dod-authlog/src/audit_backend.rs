@@ -195,6 +195,8 @@ impl AuthBackend for AuditBackend {
                     uid,
                     auid: fields.auid,
                     cgroup: None,
+                    // Die Audit-Felder tragen hier keine pid (PL-100 WP0.15).
+                    process: None,
                 },
                 outcome: if success {
                     AuthOutcome::Success

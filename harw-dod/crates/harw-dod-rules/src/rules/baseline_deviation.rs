@@ -177,9 +177,7 @@ mod tests {
     /// nicht die Auswertungszeit.
     #[test]
     fn test_finding_is_stamped_with_the_sample_time_not_ctx_now() -> TestResult {
-        let sample_time: Timestamp = "2026-11-08T08:00:00Z"
-            .parse()
-            .map_err(ctx("Samplezeit"))?;
+        let sample_time: Timestamp = "2026-11-08T08:00:00Z".parse().map_err(ctx("Samplezeit"))?;
         let now: Timestamp = "2026-11-08T08:10:00Z"
             .parse()
             .map_err(ctx("Auswertungszeit"))?;

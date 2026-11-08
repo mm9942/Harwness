@@ -79,7 +79,12 @@
 //!   *verworfen* (fehlerhaft) und degradiert den Sensor für diese Runde.
 //!
 //! Der Akteur entspricht `harw_dod_flow::to_security_event`: `uid` aus dem
-//! Wire-Kopf, `auid` unbekannt (`None`). `cgroup` trägt die **rohe**
+//! Wire-Kopf, `auid` unbekannt (`None`). `process` (PL-100 WP0.15) kommt aus
+//! `harw_dod_procmon::process_context_v1`: `pid` = `tgid` des Wire-Kopfs,
+//! `ppid` = die vom BPF-Programm gelesene `tgid` des `real_parent` (`0` →
+//! `None`), `comm` nur bei Exec (der TCP-Payload trägt keinen), escapt und
+//! begrenzt über `harw_dod_procmon::display_comm`; `euid` bleibt `None`,
+//! weil der v1-Kopf nur die reale UID trägt. `cgroup` trägt die **rohe**
 //! cgroup-ID des Wire-Kopfs als `harw_dod_signals::Actor::raw_cgroup`
 //! (`"cgroup-id:<n>"`, PL-97 E4); eine fehlende ID (`0`) bleibt `None`. Den
 //! Pfad dazu löst erst der unprivilegierte Sentinel unter seiner
@@ -348,6 +353,8 @@ fn convert_wire_event(
                     // Rohe cgroup-ID aus dem Wire-Kopf; den Pfad löst erst
                     // der unprivilegierte Sentinel auf (PL-97 E4).
                     cgroup: Actor::raw_cgroup(exec.task.cgroup_id),
+                    // pid/ppid/comm statt Verwerfen (PL-100 WP0.15).
+                    process: harw_dod_procmon::process_context_v1(&exec.task, Some(exec.comm.as_str())),
                 }),
                 kind: EventKind::ProcessExec {
                     path,
@@ -381,10 +388,12 @@ fn convert_wire_event(
             };
             match harw_dod_flow::to_security_event(&flow, sensor, timed.observed_at, scope) {
                 Some(mut event) => {
-                    // `to_security_event` kennt keine cgroup; die rohe ID
-                    // aus dem Wire-Kopf wird hier nachgetragen (PL-97 E4).
+                    // `to_security_event` kennt weder cgroup noch ppid; beides
+                    // wird aus dem Wire-Kopf nachgetragen (PL-97 E4, PL-100
+                    // WP0.15). Der TCP-Payload trägt keinen `comm`.
                     if let Some(actor) = event.actor.as_mut() {
                         actor.cgroup = Actor::raw_cgroup(connect.task.cgroup_id);
+                        actor.process = harw_dod_procmon::process_context_v1(&connect.task, None);
                     }
                     Conversion::Report(event)
                 }
@@ -1053,7 +1062,7 @@ mod wire_tests {
         BpfLossCounters, TaskIdentity, TimeConfidence, TimedWireEvent, WireEvent, WireEventType,
     };
     use harw_dod_procmon::{EXEC_PATH_TRUNCATED, EXEC_PATH_UNAVAILABLE};
-    use harw_dod_signals::{Actor, EventKind};
+    use harw_dod_signals::{Actor, EventKind, ProcessContext};
     use harw_types::{ContentDigest, SensorId};
     use jiff::Timestamp;
 
@@ -1135,7 +1144,13 @@ mod wire_tests {
             Some(Actor {
                 uid: 1_000,
                 auid: None,
-                cgroup: Actor::raw_cgroup(77)
+                cgroup: Actor::raw_cgroup(77),
+                process: Some(ProcessContext {
+                    pid: 10,
+                    ppid: Some(9),
+                    comm: Some("sshd".to_owned()),
+                    euid: None,
+                }),
             })
         );
         assert_eq!(
@@ -1241,6 +1256,68 @@ mod wire_tests {
             Some(77),
             "the wire header's cgroup id is forwarded"
         );
+        assert_eq!(
+            event.actor.and_then(|actor| actor.process),
+            Some(ProcessContext {
+                pid: 10,
+                ppid: Some(9),
+                comm: None,
+                euid: None,
+            }),
+            "a connect carries tgid and parent tgid, but no comm (PL-100 WP0.15)"
+        );
+        Ok(())
+    }
+
+    /// v1-Exec-Payload mit frei wählbarem `comm` (höchstens 16 Byte).
+    fn exec_payload_with_comm(comm: &[u8], path: &[u8]) -> TestResult<Vec<u8>> {
+        let mut payload = exec_payload(path)?;
+        let comm_field = payload
+            .get_mut(..16)
+            .ok_or(TestError::Missing("16-Byte comm-Feld"))?;
+        comm_field.fill(0);
+        let target = comm_field
+            .get_mut(..comm.len())
+            .ok_or(TestError::Missing("comm passt in 16 Byte"))?;
+        target.copy_from_slice(comm);
+        Ok(payload)
+    }
+
+    #[test]
+    fn test_exec_comm_is_escaped_before_it_reaches_the_actor() -> TestResult {
+        // ESC + CSI „Bildschirm löschen" und ein Bidi-Override im Namen.
+        let record = timed(
+            WireEventType::Exec,
+            0,
+            exec_payload_with_comm("x\u{1b}[2J\u{202e}".as_bytes(), b"/usr/bin/x")?,
+        );
+        let Conversion::Report(event) = convert_wire_event(&record, &sensor(), None) else {
+            return Err(TestError::Unexpected("exec must be reported".into()));
+        };
+        let comm = event
+            .actor
+            .and_then(|actor| actor.process)
+            .and_then(|process| process.comm)
+            .ok_or(TestError::Missing("comm im Prozesskontext"))?;
+        assert_eq!(comm, "x\\u{001b}[2J\\u{202e}");
+        assert!(!comm.contains('\u{1b}'));
+        assert!(!comm.contains('\u{202e}'));
+        Ok(())
+    }
+
+    #[test]
+    fn test_exec_with_unreadable_parent_has_no_ppid() -> TestResult {
+        let mut record = timed(WireEventType::Exec, 0, exec_payload(b"/usr/bin/true")?);
+        record.event.task.ppid = 0;
+        let Conversion::Report(event) = convert_wire_event(&record, &sensor(), None) else {
+            return Err(TestError::Unexpected("exec must be reported".into()));
+        };
+        let process = event
+            .actor
+            .and_then(|actor| actor.process)
+            .ok_or(TestError::Missing("Prozesskontext"))?;
+        assert_eq!(process.pid, 10);
+        assert_eq!(process.ppid, None);
         Ok(())
     }
 

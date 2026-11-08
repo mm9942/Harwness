@@ -146,9 +146,12 @@
 //!    ausgewählt (deterministisch, siehe [`harw_dod_readfs::glob::glob`]s
 //!    eigene Sortierzusage) — analog zu `harw-dod-cpu`s Entscheidung, nur
 //!    die `cpu`-Aggregatzeile zu lesen: eine feste, dokumentierte Obergrenze
-//!    statt einer bloßen Erwartung über „normale" Hosts. Die deklarierte
-//!    [`sensor::MAX_CARDINALITY`] ist entsprechend
-//!    `MAX_DEVICES × FIELD_METRICS.len()`.
+//!    statt einer bloßen Erwartung über „normale" Hosts. Verworfen wird
+//!    nicht still (PL-100 WP0.15): jeder Poll meldet zusätzlich genau ein
+//!    Sample [`sensor::TRUNCATED_METRIC`] (`blockio.truncated`) mit der Zahl
+//!    der über die Grenze hinaus verworfenen Geräte, `0` ohne Kürzung. Die
+//!    deklarierte [`sensor::MAX_CARDINALITY`] ist entsprechend
+//!    `MAX_DEVICES × FIELD_METRICS.len() + 1`.
 //!
 //! # Warum kein `#[derive(harw_macros::SensorSource)]`
 //! `#[derive(harw_macros::SensorSource)]` deckt laut eigener Moduldoku genau

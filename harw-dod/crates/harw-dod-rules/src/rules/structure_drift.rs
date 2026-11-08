@@ -441,9 +441,7 @@ mod tests {
         let event_time: Timestamp = "2026-11-08T09:00:00Z"
             .parse()
             .map_err(ctx("Ereigniszeit"))?;
-        let sample_time: Timestamp = "2026-11-08T09:30:00Z"
-            .parse()
-            .map_err(ctx("Samplezeit"))?;
+        let sample_time: Timestamp = "2026-11-08T09:30:00Z".parse().map_err(ctx("Samplezeit"))?;
         let now: Timestamp = "2026-11-08T12:00:00Z"
             .parse()
             .map_err(ctx("Auswertungszeit"))?;

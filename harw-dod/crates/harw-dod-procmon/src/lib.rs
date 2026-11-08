@@ -23,7 +23,8 @@
 //! Geschwister-Crate von `harw-dod-flow` (AW7-01c): die beiden kennen
 //! einander **nicht** (Invarianz C7, CI-geprüft). Diese Crate hängt
 //! ausschließlich an `harw-dod-bpf`, `harw-dod-cap`, `harw-dod-signals`,
-//! `harw-types`, `harw-macros` und `jiff`.
+//! `harw-types`, `harw-macros`, `harw-untrusted-text` (Escaper für `comm`,
+//! siehe [`process`]) und `jiff`.
 //!
 //! # Genau eine Fähigkeit
 //! [`harw_dod_bpf::REQUIRED_CAPABILITY`]
@@ -74,7 +75,9 @@
 //! [`event::ExecEvent`], [`event::parse_exec_payload`],
 //! [`error::ProcmonError`], [`error::ProcmonResult`], [`sensor::ProcmonSensor`],
 //! [`sensor::DEFAULT_READ_TIMEOUT`], [`PROCMON_TRACEPOINT_ATTACH_POINT`],
-//! [`procmon_program_spec`].
+//! [`procmon_program_spec`], [`process::display_comm`],
+//! [`process::process_context_v1`], [`process::exec_process_context`]
+//! (PL-100 WP0.15: Prozesskontext für `harw_dod_signals::Actor::process`).
 //!
 //! # Nebenläufigkeit
 //! [`event::parse_exec_payload`] ist eine zustandslose, reine Funktion,
@@ -146,6 +149,7 @@
 
 pub mod error;
 pub mod event;
+pub mod process;
 pub mod sensor;
 
 pub use error::{ProcmonError, ProcmonResult};
@@ -154,6 +158,7 @@ pub use event::{
     ExecutablePathCapture, ProcessExitEventV1, parse_exec_payload, parse_exec_v1,
     parse_process_exit_v1,
 };
+pub use process::{display_comm, exec_process_context, process_context_v1};
 pub use sensor::{DEFAULT_READ_TIMEOUT, ProcmonSensor};
 
 /// Der Kernel-Tracepoint, an den das eBPF-Programm dieser Crate angehängt

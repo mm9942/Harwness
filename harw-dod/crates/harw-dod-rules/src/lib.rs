@@ -171,7 +171,7 @@ pub use baseline::{Baseline, PalaceStatus, finding_kind_for_status};
 pub use confidence::epistemic_confidence_for;
 pub use engine::{run_rules, run_rules_checked};
 pub use finding::{
-    Finding, FindingKind, FindingRecord, RecordError, Raw, RuleChecked, TriageError, Triaged,
+    Finding, FindingKind, FindingRecord, Raw, RecordError, RuleChecked, TriageError, Triaged,
     Verdict, triage_record,
 };
 // Die Entscheidung eines Menschen (PL-100 WP0.11): nur mit dem Feature

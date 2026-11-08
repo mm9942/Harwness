@@ -27,6 +27,11 @@ harw-types = { path = "../../../harw-types" }
 harw-macros = { path = "../../../harw-macros" }
 # Zeitachse für `RawBpfEvent::observed_at` / `Sensor::poll`'s injiziertes `now`.
 jiff = { workspace = true }
+# PL-100 WP0.8/WP0.15: der gemeinsame Escaper für untrusted Text. `comm` ist
+# angreiferkontrolliert und wird escapt, bevor er in
+# `harw_dod_signals::ProcessContext::comm` landet (siehe `src/process.rs`).
+# Schicht F, ohne eigene Abhängigkeiten.
+harw-untrusted-text = { path = "../../../harw-untrusted-text" }
 
 [dev-dependencies]
 harw-test-support = { path = "../../../harw-test-support" }
