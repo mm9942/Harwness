@@ -5,8 +5,8 @@
 //! die Regeln. Ein lauter Dienst oder ein Angreifer erzeugt aber viele
 //! **gleichartige** Ereignisse — etwa dieselbe ausgehende Verbindung alle
 //! paar Sekunden. Dieses Modul fasst sie über einen [`DedupKey`] zusammen:
-//! innerhalb der Abklingzeit (`cooldown`, Vorgabe [`DEFAULT_COOLDOWN`] =
-//! 10 min) zählt eine Wiederholung nur `occurrences` hoch und wird weder ins
+//! innerhalb der Abklingzeit (`cooldown`, Vorgabe
+//! [`DEFAULT_COOLDOWN_SECS`] = 10 min) zählt eine Wiederholung nur `occurrences` hoch und wird weder ins
 //! Journal (`warn`) noch in den Befundexport geschrieben. Gemeldet wird sie
 //! erst wieder, wenn die Abklingzeit abgelaufen ist oder sich der Befund
 //! **echt** geändert hat (siehe unten). Der Exporter erhält je gemeldetem
@@ -105,9 +105,6 @@ pub const DEFAULT_COOLDOWN_SECS: u64 = 600;
 /// Größte zulässige Abklingzeit in Sekunden (7 Tage).
 pub const MAX_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// Vorgabe der Abklingzeit als Dauer.
-pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(DEFAULT_COOLDOWN_SECS);
-
 /// Höchstzahl gehaltener (und gespeicherter) Schlüssel.
 pub const MAX_KEYS: usize = 4096;
 
@@ -195,12 +192,9 @@ impl ThrottleConfig {
 }
 
 impl Default for ThrottleConfig {
-    /// [`DEFAULT_COOLDOWN`] und [`MAX_KEYS`].
+    /// [`DEFAULT_COOLDOWN_SECS`] und [`MAX_KEYS`].
     fn default() -> Self {
-        Self {
-            cooldown: DEFAULT_COOLDOWN,
-            max_keys: MAX_KEYS,
-        }
+        Self::with_cooldown_secs(DEFAULT_COOLDOWN_SECS)
     }
 }
 
@@ -1436,7 +1430,7 @@ mod tests {
         let path = dir.path().join(DEFAULT_STATE_FILE_NAME);
         let mut wide = FindingThrottle::open(
             ThrottleConfig {
-                cooldown: DEFAULT_COOLDOWN,
+                cooldown: Duration::from_secs(DEFAULT_COOLDOWN_SECS),
                 max_keys: 8,
             },
             Some(path.clone()),
@@ -1455,7 +1449,7 @@ mod tests {
 
         let mut narrow = FindingThrottle::open(
             ThrottleConfig {
-                cooldown: DEFAULT_COOLDOWN,
+                cooldown: Duration::from_secs(DEFAULT_COOLDOWN_SECS),
                 max_keys: 2,
             },
             Some(path),
