@@ -1,29 +1,32 @@
 //! Die inhaltsfreie Ablehnungskategorie: [`Denial`].
 //!
+//! Seit PL-100 WP 3.0 Teil von `harw-dod-warden-types`; `harw-dod-warden-proto`
+//! re-exportiert diesen Typ unter seinem bisherigen Pfad.
+//!
 //! # Verantwortungsbereich
 //! `Denial` ist der einzige Werttyp, den der Durchsetzer bei einer
 //! Ablehnung über die Leitung zurückgibt (eingebettet in
-//! [`crate::response::WardenResponse::Denied`]). Er ist bewusst **feldlos**:
+//! [`crate::outcome::WardenResponse::Denied`]). Er ist bewusst **feldlos**:
 //! jede Variante trägt null Nutzdaten, sodass eine Ablehnung strukturell —
 //! nicht nur durch Konvention — nichts über den genauen Grund verraten
 //! *kann*. Der Durchsetzer läuft privilegiert; was er meldet, verlässt
-//! seinen Vertrauensbereich (siehe `lib.rs`-Moduldoku). Der feinkörnige
-//! Grund (welches Feld genau nicht passte) bleibt in
-//! [`crate::error::WardenProtoError`] — einem separaten, nie serialisierten
-//! Typ, der das Prozessinnere nie verlässt (siehe dortige Moduldoku).
+//! seinen Vertrauensbereich. Der feinkörnige Grund (welches Feld genau nicht
+//! passte) bleibt in `harw_dod_warden_proto::ProofError` bzw.
+//! `harw_dod_warden_proto::error::WardenProtoError` — separaten, nie
+//! serialisierten Typen des Signierteils, die das Prozessinnere nie
+//! verlassen.
 //!
-//! [`crate::error::WardenProtoError::as_denial`] bildet die interne,
+//! `ProofError::as_denial` (im Signierteil) bildet die interne,
 //! detailreichere Fehlersicht auf genau diese groben Kategorien ab — das ist
 //! die einzige Stelle, an der Detail bewusst fallen gelassen wird, bevor
 //! eine Aussage über die Leitung geht.
 //!
 //! # Warum kein `#[derive(harw_macros::HarwError)]`
-//! `Denial` ist kein `std::error::Error` dieser Crate im Sinne von
-//! Contract-Master §H.1 („ein Fehlertyp je Crate") — dieser Platz ist
-//! [`crate::error::WardenProtoError`] vorbehalten. `Denial` ist ein
-//! Wire-Datentyp wie
-//! [`crate::action::WardenAction`], zufällig mit einer `Display`-Impl für
-//! Logging-Bequemlichkeit auf der vertrauenswürdigen Seite.
+//! `Denial` ist kein `std::error::Error` im Sinne von Contract-Master §H.1
+//! („ein Fehlertyp je Crate") — dieser Platz ist [`crate::error::WardenTypesError`]
+//! bzw. im Signierteil `WardenProtoError` vorbehalten. `Denial` ist ein
+//! Wire-Datentyp wie [`crate::action::WardenAction`], zufällig mit einer
+//! `Display`-Impl für Logging-Bequemlichkeit auf der vertrauenswürdigen Seite.
 //!
 //! # Nebenläufigkeit
 //! `Copy`, keine interne Veränderlichkeit.
@@ -40,15 +43,18 @@ use serde::{Deserialize, Serialize};
 /// (C-WPROTO, F-088) zusätzlich Versions-, Dekodier-, Nicht-unterstützt-,
 /// Ausführungs- und Verfügbarkeitskategorien, damit der Warden jede
 /// Ablehnung beantworten kann, statt die Verbindung kommentarlos zu schließen.
-/// Alle Varianten bleiben feldlos — ein zusätzlicher Wert wäre nur über eine
-/// sichtbare Erweiterung dieser Positivliste möglich.
+/// PL-100 WP 3.1 ergänzt die Kategorien für die neuen Prüfungen des Wardens:
+/// fehlende Unumkehrbarkeits-Bestätigung (O4), geändertes Ziel (B21),
+/// Warden-eigene Policy (Deny-Liste, Präfixe, Freigebender) und abgewiesener
+/// Peer. Alle Varianten bleiben feldlos — ein zusätzlicher Wert wäre nur über
+/// eine sichtbare Erweiterung dieser Positivliste möglich.
 ///
 /// # Wire-Format
 /// Kebab-case-String, keine weiteren Felder.
 ///
 /// # Examples
 /// ```rust
-/// use harw_dod_warden_proto::Denial;
+/// use harw_dod_warden_types::Denial;
 ///
 /// let denial = Denial::ProofMismatch;
 /// assert_eq!(
@@ -59,8 +65,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Denial {
-    /// Der Beleg ist nicht an den angeforderten Befund oder die angeforderte
-    /// Aktion gebunden (siehe [`crate::proof::AuthorizationProof::authorizes`]).
+    /// Die Autorisierung ist nicht an den angeforderten Befund oder die
+    /// angeforderte Aktion gebunden, oder ihr MAC prüft nicht (Signierteil:
+    /// `SignedAuthorization::verify`, alle Authentisierungsschritte).
     ProofMismatch,
     /// Die Aktion ist ab der im Beleg genannten Eskalationsstufe nicht
     /// zulässig (siehe [`crate::action::WardenAction::is_admissible_from`]).
@@ -78,6 +85,18 @@ pub enum Denial {
     /// Der Warden kann gerade nicht sicher prüfen (z. B. Nonce-Ledger nicht
     /// schreibbar) — fail closed.
     Unavailable,
+    /// Kill oder Isolation ohne signierte Bestätigung „nicht umkehrbar“
+    /// (`irreversible_ack`, Entscheidung O4).
+    IrreversibleAckRequired,
+    /// Die beobachtete Ziel-cgroup (Kernel-ID, Pfad, erste Beobachtung) passt
+    /// nicht mehr zum signierten Ziel (Kernel-ID-Wiederverwendung, B21).
+    TargetChanged,
+    /// Aktion oder Ziel ist durch die Warden-eigene Policy ausgeschlossen
+    /// (Deny-Liste, Aktions-Allowlist, Präfix-Allowlist, Freigebender).
+    PolicyDenied,
+    /// Der Socket-Peer ist nicht der Escalator (SO_PEERCRED-Allowlist); die
+    /// Anfrage wurde nicht gelesen.
+    PeerRejected,
 }
 
 /// Formatiert die Ablehnung als feste, inhaltsfreie Meldung.
@@ -88,7 +107,7 @@ pub enum Denial {
 ///
 /// # Examples
 /// ```rust
-/// use harw_dod_warden_proto::Denial;
+/// use harw_dod_warden_types::Denial;
 ///
 /// assert_eq!(
 ///     Denial::NotAdmissibleAtStage.to_string(),
@@ -107,6 +126,12 @@ impl fmt::Display for Denial {
             Self::Unsupported => "action is not supported by this warden",
             Self::ExecutionFailed => "action could not be executed",
             Self::Unavailable => "warden is temporarily unable to verify requests",
+            Self::IrreversibleAckRequired => {
+                "irreversible action requires the operator's irreversible acknowledgement"
+            }
+            Self::TargetChanged => "target cgroup no longer matches the authorized identity",
+            Self::PolicyDenied => "action or target is denied by warden policy",
+            Self::PeerRejected => "peer is not allowed to submit warden requests",
         };
         f.write_str(text)
     }
@@ -117,7 +142,7 @@ mod tests {
     use super::Denial;
     use crate::test_support::{TestResult, ctx};
 
-    const ALL: [Denial; 7] = [
+    const ALL: [Denial; 11] = [
         Denial::ProofMismatch,
         Denial::NotAdmissibleAtStage,
         Denial::UnsupportedVersion,
@@ -125,6 +150,10 @@ mod tests {
         Denial::Unsupported,
         Denial::ExecutionFailed,
         Denial::Unavailable,
+        Denial::IrreversibleAckRequired,
+        Denial::TargetChanged,
+        Denial::PolicyDenied,
+        Denial::PeerRejected,
     ];
 
     #[test]
@@ -170,6 +199,30 @@ mod tests {
             serde_json::to_string(&Denial::ExecutionFailed).map_err(ctx("serializes"))?,
             "\"execution-failed\""
         );
+        assert_eq!(
+            serde_json::to_string(&Denial::IrreversibleAckRequired).map_err(ctx("serializes"))?,
+            "\"irreversible-ack-required\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Denial::TargetChanged).map_err(ctx("serializes"))?,
+            "\"target-changed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Denial::PolicyDenied).map_err(ctx("serializes"))?,
+            "\"policy-denied\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Denial::PeerRejected).map_err(ctx("serializes"))?,
+            "\"peer-rejected\""
+        );
         Ok(())
+    }
+
+    #[test]
+    fn test_display_is_distinct_per_variant() {
+        let mut texts: Vec<String> = ALL.iter().map(ToString::to_string).collect();
+        texts.sort_unstable();
+        texts.dedup();
+        assert_eq!(texts.len(), ALL.len());
     }
 }

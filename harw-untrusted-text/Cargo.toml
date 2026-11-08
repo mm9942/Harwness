@@ -1,0 +1,22 @@
+[package]
+publish.workspace = true
+name = "harw-untrusted-text"
+description = "One escaper for untrusted text: controls, format/bidi characters, separators, private use, tag block and variation selectors become visible \\u{…} escapes, bounded in characters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# PL-100 WP0.8: Fundament-Crate (Ring A, Schicht `F` in
+# `xtask/arch-policy.toml`). Bewusst ohne Abhängigkeiten — reine std-Logik,
+# damit sie in jeder Schicht (DoD-Sentinel, lesender Client, Operationen,
+# Kontext-Renderer) ohne neue Lieferkette nutzbar ist.
+[dependencies]
+
+[dev-dependencies]
+# `define_test_error!` (TestError/TestResult) für panikfreie Tests.
+harw-test-support = { path = "../harw-test-support" }
+
+[lints]
+workspace = true

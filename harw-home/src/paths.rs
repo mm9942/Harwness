@@ -739,17 +739,36 @@ pub fn is_valid_profile_name(name: &str) -> bool {
 ///
 /// Nutzt `$HOME` (Unix) bzw. `%USERPROFILE%`/`%HOMEDRIVE%%HOMEPATH%` (Windows).
 fn user_home_directory() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(home));
+    user_home_directory_from(|name| std::env::var_os(name))
+}
+
+// Die Auflösung über eine austauschbare Umgebungsquelle (Tests). Nur ein
+// absoluter Pfad gilt als Home: ein relativer Wert (`HOME=.`) machte sonst das
+// aktuelle Verzeichnis — etwa ein geklontes Repository — zum Home mit dessen
+// Rechten über `[dod.triage]`/`[dod.approve]` (Owner-Review 4505015314).
+// Ein relativer Wert zählt wie ein fehlender; die nächste Quelle wird geprüft.
+fn user_home_directory_from(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let absolute = |value: std::ffi::OsString| {
+        let path = PathBuf::from(value);
+        path.is_absolute().then_some(path)
+    };
+    if let Some(home) = get("HOME")
+        .filter(|value| !value.is_empty())
+        .and_then(absolute)
+    {
+        return Some(home);
     }
-    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(profile));
+    if let Some(profile) = get("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .and_then(absolute)
+    {
+        return Some(profile);
     }
-    match (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
+    match (get("HOMEDRIVE"), get("HOMEPATH")) {
         (Some(drive), Some(path)) => {
             let mut combined = PathBuf::from(drive);
             combined.push(path);
-            Some(combined)
+            combined.is_absolute().then_some(combined)
         }
         _ => None,
     }
@@ -759,6 +778,42 @@ fn user_home_directory() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_support::TestResult;
+
+    // Owner-Review 4505015314 (Folgepunkt): ein relatives `$HOME` ergibt kein
+    // Home, statt das aktuelle Verzeichnis zum Home zu machen.
+    // Unix-Pfade: auf Windows ist `/home/alice` kein absoluter Pfad.
+    #[cfg(unix)]
+    #[test]
+    fn test_relative_home_is_no_home() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(*value))
+            }
+        };
+        assert_eq!(user_home_directory_from(env(&[("HOME", ".")])), None);
+        assert_eq!(
+            user_home_directory_from(env(&[("HOME", "relative/dir")])),
+            None
+        );
+        assert_eq!(user_home_directory_from(env(&[("HOME", "")])), None);
+        assert_eq!(user_home_directory_from(env(&[])), None);
+        assert_eq!(
+            user_home_directory_from(env(&[("HOME", "/home/alice")])),
+            Some(PathBuf::from("/home/alice"))
+        );
+        // Ein relatives `HOME` fällt auf die nächste (absolute) Quelle zurück.
+        assert_eq!(
+            user_home_directory_from(env(&[("HOME", "."), ("USERPROFILE", "/srv/profile")])),
+            Some(PathBuf::from("/srv/profile"))
+        );
+        assert_eq!(
+            user_home_directory_from(env(&[("HOMEDRIVE", "relative"), ("HOMEPATH", "x")])),
+            None
+        );
+    }
 
     #[test]
     fn test_home_override_is_set_once() {

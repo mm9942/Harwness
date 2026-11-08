@@ -107,6 +107,18 @@
     "vi": "Chế độ host đã kết thúc — cách ly đã bật lại.",
     "hi": "होस्ट मोड समाप्त — अलगाव फिर सक्रिय है।"
   },
+  "app_notices.host_lease_expired": {
+    "en": "Host work phase expired — isolation is active again.",
+    "de": "Host-Arbeitsphase abgelaufen — Isolation wieder aktiv.",
+    "es": "Fase de trabajo en el host caducada — aislamiento activo de nuevo.",
+    "fr": "Phase de travail hôte expirée — isolation de nouveau active.",
+    "pt": "Fase de trabalho no host expirada — isolamento ativo novamente.",
+    "ja": "ホスト作業フェーズの期限切れ — 分離が再び有効です。",
+    "zh-CN": "主机工作阶段已过期——隔离已恢复。",
+    "ko": "호스트 작업 단계 만료 — 격리 다시 활성화됨.",
+    "vi": "Giai đoạn làm việc trên host đã hết hạn — cách ly đã bật lại.",
+    "hi": "होस्ट कार्य चरण की अवधि समाप्त — अलगाव फिर सक्रिय है।"
+  },
   "app_notices.verbosity_verbose": {
     "en": "Detailed tool display: on",
     "de": "Ausführliche Werkzeuganzeige: an",

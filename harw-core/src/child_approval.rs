@@ -19,7 +19,9 @@
 //!    die Nutzerin zu fragen — eine Freigabe erweitert nie Rechte.
 //! 2. Sonst geht die Frage mit Absender ([`ChildApprovalRequest::role`],
 //!    [`ChildApprovalRequest::tree_path`]) an die Oberfläche; das Kind wartet
-//!    höchstens [`CHILD_APPROVAL_TIMEOUT`].
+//!    höchstens [`CHILD_APPROVAL_TIMEOUT`]. Hat der DoD-Taint des Kind-Turns
+//!    die Rückfrage verursacht (PL-100 O1), trägt sie den Grund
+//!    ([`ChildApprovalRequest::reason`]).
 //! 3. Zustimmung → `resume_after_approval` mit `Approve`: das Werkzeug läuft
 //!    in der Registry des Kindes. Ablehnung, Zeitablauf oder eine nicht
 //!    zustellbare Frage → `Reject`: das Kind bekommt einen Werkzeugfehler
@@ -46,6 +48,7 @@ use tokio::sync::oneshot;
 
 use crate::ModelProvider;
 use crate::child_controller::ManagedAgentSpawner;
+use crate::dod_taint::pending_ask_reason;
 use crate::error::CoreResult;
 use crate::session::AgentSession;
 use crate::state_store::StateStore;
@@ -93,6 +96,14 @@ pub struct ChildApprovalRequest {
     pub call: ToolCall,
     /// Wie lange das Kind auf die Antwort wartet.
     pub timeout: Duration,
+    /// Der vom Kern zugeschriebene Grund der Rückfrage, falls es einen gibt.
+    ///
+    /// Heute nur der DoD-Taint des Kind-Turns (PL-100 Entscheidung O1,
+    /// [`crate::dod_taint::pending_ask_reason`]): „'job.stop' braucht eine
+    /// ausdrückliche Freigabe: nach DoD-Abfrage in diesem Turn". Der
+    /// Werkzeugname darin ist bereits escapt. `None`, wenn ein anderer
+    /// Handler gefragt hat oder der Absender keine Kind-Session kennt.
+    pub reason: Option<String>,
 }
 
 impl ChildApprovalRequest {
@@ -301,6 +312,21 @@ impl ManagedAgentSpawner {
     }
 }
 
+/// `true` für die vom Turn-Loop erzeugten Delegationswerkzeuge
+/// (`transfer_to_<rolle>`, `agents.delegate`, `agents.catalog`).
+///
+/// # Description
+/// Sie haben keinen registrierten Ausführer — der Turn-Loop wickelt sie
+/// selbst ab und bietet sie nur an, wenn die Rolle delegieren darf. Früher
+/// lehnte das Relay ihre Freigabe als „außerhalb der Rolle" ab (Feldbericht
+/// F6): ein Root-Orchestrator-Kind mit mehr als acht Zielen sah nur
+/// `agents.delegate` und konnte je nach Freigabemodus nicht delegieren.
+fn is_generated_delegation_tool(name: &harw_tools::ToolName) -> bool {
+    crate::turn_loop::handoff_role(name).is_some()
+        || name.as_str() == crate::turn_loop::AGENTS_DELEGATE_TOOL
+        || name.as_str() == crate::turn_loop::AGENTS_CATALOG_TOOL
+}
+
 /// Beantwortet die Freigabepausen eines pausierverbotenen Kindes über den
 /// Freigabe-Kanal, bis sein Turn terminal endet.
 ///
@@ -341,7 +367,9 @@ pub async fn relay_child_approvals(
         let role = spawner
             .child_record(child)
             .map_or_else(|| "kind".to_owned(), |record| record.role);
-        let resolution = if find_executor(session, &pending.call.name).is_none() {
+        let resolution = if find_executor(session, &pending.call.name).is_none()
+            && !is_generated_delegation_tool(&pending.call.name)
+        {
             // Keine Rechte-Erweiterung: das Werkzeug gehört nicht zur
             // Werkzeugfläche des Kindes — nicht einmal fragen.
             tracing::warn!(
@@ -360,6 +388,9 @@ pub async fn relay_child_approvals(
                     tree_path: spawner.child_tree_path(child),
                     call: pending.call.clone(),
                     timeout: relay.timeout(),
+                    // PL-100 O1: hat der Taint des Kind-Turns gefragt, sieht
+                    // die Nutzerin den Grund im Dialog.
+                    reason: pending_ask_reason(session),
                 })
                 .await
         } else {
@@ -382,4 +413,24 @@ pub async fn relay_child_approvals(
     }
     tracing::warn!(child = %child, "child_approval.round_limit_reached");
     Ok(outcome)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_delegation_tools_are_not_outside_the_role() {
+        for name in ["transfer_to_explorer", "agents.delegate", "agents.catalog"] {
+            assert!(
+                is_generated_delegation_tool(&harw_tools::ToolName::new(name)),
+                "{name}"
+            );
+        }
+        for name in ["transfer_to_", "shell.exec", "agents.unknown"] {
+            assert!(
+                !is_generated_delegation_tool(&harw_tools::ToolName::new(name)),
+                "{name}"
+            );
+        }
+    }
 }

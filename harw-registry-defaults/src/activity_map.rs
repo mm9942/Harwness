@@ -50,6 +50,8 @@ const PROCESS: &str = "process";
 ///   adapter keys it by its provisional call id and rebases it onto the
 ///   `job_id`). `job.status`/`job.logs` observe and `job.stop` controls the
 ///   job named by `job_id`; `job.list` observes without a resource.
+///   `job.suspend`/`job.resume` (PL-100 §3.5) control the job named by
+///   `job_id` exactly like `job.stop`.
 /// - `process.list` observes and `process.kill` controls processes selected
 ///   by a filter, so neither has a resource key.
 /// - `shell.exec` executes a command whose side effects no key describes.
@@ -67,6 +69,10 @@ pub const HAND_WRITTEN_ACTIVITIES: &[(&str, ActivityDescriptor)] = &[
         ActivityDescriptor::new(JOB, "logs", Some("job_id"), Effect::Observe),
     ),
     (
+        "job.resume",
+        ActivityDescriptor::new(JOB, "resume", Some("job_id"), Effect::Control),
+    ),
+    (
         "job.start",
         ActivityDescriptor::new(JOB, "start", None, Effect::Execute),
     ),
@@ -77,6 +83,10 @@ pub const HAND_WRITTEN_ACTIVITIES: &[(&str, ActivityDescriptor)] = &[
     (
         "job.stop",
         ActivityDescriptor::new(JOB, "stop", Some("job_id"), Effect::Control),
+    ),
+    (
+        "job.suspend",
+        ActivityDescriptor::new(JOB, "suspend", Some("job_id"), Effect::Control),
     ),
     (
         "process.kill",
@@ -318,10 +328,16 @@ mod tests {
         for name in ["job.status", "job.logs"] {
             assert_eq!(effect(name)?, (Effect::Observe, Some("job_id".into())));
         }
-        assert_eq!(
-            effect("job.stop")?,
-            (Effect::Control, Some("job_id".into()))
-        );
+        // PL-100 §3.5: Anhalten und Fortsetzen steuern den Job wie `job.stop`.
+        for name in ["job.stop", "job.suspend", "job.resume"] {
+            assert_eq!(effect(name)?, (Effect::Control, Some("job_id".into())));
+        }
+        for (name, verb) in [("job.suspend", "suspend"), ("job.resume", "resume")] {
+            let descriptor =
+                activity_for(name).ok_or_else(|| TestError::Unexpected(format!("{name} fehlt")))?;
+            assert_eq!(descriptor.domain.as_ref(), JOB, "{name}");
+            assert_eq!(descriptor.verb.as_ref(), verb, "{name}");
+        }
         assert_eq!(effect("shell.exec")?, (Effect::Execute, None));
         assert_eq!(
             effect("doc.read_pdf")?,

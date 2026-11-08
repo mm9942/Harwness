@@ -14,6 +14,9 @@ pub mod auth_toml;
 pub mod browser_toml;
 pub mod channel_toml;
 pub mod discovery;
+// PL-100 WP 1.9: `[dod.triage] model` und `[dod.approve] tui_tty` in
+// `<harw_home>/config.toml` schreiben.
+pub mod dod_home;
 pub mod dod_toml;
 pub mod dotenv;
 pub mod error;
@@ -62,7 +65,11 @@ pub use discovery::{
     discover_config_with_override, discover_config_with_restricted,
     discover_config_with_restricted_and_project_settings,
 };
-pub use dod_toml::DodSection;
+pub use dod_home::{ensure_dod_defaults, set_dod_triage_model};
+pub use dod_toml::{
+    DodApproveSection, DodSection, DodTriageSection, DodWatchMode, DodWatchSection,
+    parse_triage_model,
+};
 pub use dotenv::{
     check_dotenv_permissions, load_dotenv, load_env_layer, parse_dotenv_text, resolve_env_ref,
 };
@@ -98,7 +105,9 @@ pub use mcp_toml::{McpServerToml, McpTransportToml};
 pub use memory_toml::MemorySection;
 pub use merge::{LayerRole, ScopeDiagnostic, merge_layer_toml_into};
 pub use mode_toml::ModeSection;
-pub use model_toml::{ChatReasoningReplay, ModelCapabilitiesToml, ModelToml, PromptCachingMode};
+pub use model_toml::{
+    ChatReasoningReplay, ModelCapabilitiesToml, ModelToml, PromptCachingMode, ReasoningReplayPolicy,
+};
 pub use network_toml::{NetworkSection, ResearchWebMode};
 pub use permissions_toml::{PermissionsSection, RuleToml};
 pub use plan_toml::{ContainerToolsSection, DocSection, PlanSection, RemoteOcrMode, ToolsSection};

@@ -113,6 +113,13 @@
 //! [`sensor::map_read_fs_error`] für die vollständige Übersetzungstabelle
 //! aus `harw_dod_readfs::ReadFsError`).
 //!
+//! Seit PL-100 WP0.15 erreicht der Fehler **einer einzelnen** Berichtsdatei
+//! den Aufrufer nicht mehr: [`ScanReportSensor`] überspringt die Datei,
+//! zählt sie im Sample [`MALFORMED_REPORTS_METRIC`] und meldet ein
+//! `EventKind::SensorDegraded` — die übrigen Berichte bleiben sichtbar.
+//! Nur ein Fehler beim Auflisten des Berichtsordners lässt den Abruf noch
+//! scheitern.
+//!
 //! # Examples
 //! ```rust,no_run
 //! use harw_dod_cap::ReadScope;
@@ -139,7 +146,7 @@ mod sensor;
 #[cfg(test)]
 mod invariant_test;
 
-pub use sensor::{REPORT_HARDNESS, ScanReportSensor};
+pub use sensor::{MALFORMED_REPORTS_METRIC, REPORT_HARDNESS, ScanReportSensor};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

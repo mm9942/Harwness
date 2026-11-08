@@ -85,6 +85,10 @@ fn test_tool_specs_and_parallel_safety() -> TestResult {
     assert!(provider.parallel_safe(&ToolName::new(JOB_STATUS_TOOL)));
     assert!(provider.parallel_safe(&ToolName::new(JOB_LOGS_TOOL)));
     assert!(provider.parallel_safe(&ToolName::new(JOB_LIST_TOOL)));
+    // PL-100 WP 3.5: suspend/resume change a job, never parallel-safe.
+    assert!(!provider.parallel_safe(&ToolName::new(JOB_SUSPEND_TOOL)));
+    assert!(!provider.parallel_safe(&ToolName::new(JOB_RESUME_TOOL)));
+    assert_eq!(JOB_TOOL_NAMES.len(), 7);
     Ok(())
 }
 
@@ -452,6 +456,20 @@ async fn test_invalid_arguments_are_rejected() -> TestResult {
             json!({ "job_id": "job-1", "signal": "STOP" }),
         ),
         (JOB_LIST_TOOL, json!({ "all": true })),
+        (JOB_SUSPEND_TOOL, json!({ "job_id": "../../etc" })),
+        (
+            JOB_SUSPEND_TOOL,
+            json!({ "job_id": "job-1", "finding_id": "not-a-uuid" }),
+        ),
+        (
+            JOB_RESUME_TOOL,
+            json!({ "job_id": "job-1", "finding_id": "3f2b8c1e-9d4a-1c2b-8e7f-1a2b3c4d5e6f" }),
+        ),
+        (
+            JOB_RESUME_TOOL,
+            json!({ "job_id": "job-1", "signal": "TERM" }),
+        ),
+        (JOB_SUSPEND_TOOL, json!({})),
     ];
     for (tool, arguments) in cases {
         let result = run(&provider, &worker, tool, arguments.clone()).await;
@@ -548,4 +566,265 @@ fn test_job_start_command_text_matches_allow_rules() {
         rules.evaluate(JOB_START_TOOL, &argv),
         Some(RuleDecision::Allow)
     );
+}
+
+// ── job.suspend / job.resume (PL-100 WP 3.5) ─────────────────────────────────
+
+/// A valid UUIDv4 finding id.
+#[cfg(target_os = "linux")]
+const FINDING: &str = "3f2b8c1e-9d4a-4c2b-8e7f-1a2b3c4d5e6f";
+
+/// `Env` with the fake freezer and a running stub job of `worker` whose own
+/// cgroup is `harw-job-<attempt>`.
+#[cfg(target_os = "linux")]
+fn suspend_env(
+    fake: &Arc<crate::test_support::fake_cgroup::FakeCgroup>,
+    attempt: &str,
+) -> TestResult<(Env, JobId)> {
+    let env = Env::new()?;
+    env.manager
+        .set_freezer(crate::test_support::fake_cgroup::freezer(fake));
+    let meta = crate::test_support::stub_job_meta(
+        "job-tool",
+        JobState::Running,
+        "worker",
+        &[],
+        Some(attempt),
+    )?;
+    let id = env
+        .manager
+        .insert_test_job(meta, true)
+        .map_err(ctx("insert stub job"))?;
+    Ok((env, id))
+}
+
+/// The tools report the typed transition, the kernel view and the checked
+/// `finding_id` (lower case); repeating either call changes nothing.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_suspend_and_resume_tools_report_transition_and_finding_id() -> TestResult {
+    use crate::test_support::fake_cgroup::FakeCgroup;
+    let fake = Arc::new(FakeCgroup::default());
+    let (env, id) = suspend_env(&fake, "t1")?;
+    let provider = provider(&env, Arc::new(NoLineage));
+    let worker = env.exec_context("worker")?;
+
+    let suspended = json_of(
+        run(
+            &provider,
+            &worker,
+            JOB_SUSPEND_TOOL,
+            json!({ "job_id": id.as_str(), "finding_id": FINDING.to_ascii_uppercase() }),
+        )
+        .await
+        .map_err(ctx("suspend"))?,
+    )?;
+    assert_eq!(suspended.get("state"), Some(&json!("suspended")));
+    assert_eq!(suspended.get("transition"), Some(&json!("suspended")));
+    assert_eq!(suspended.get("changed"), Some(&json!(true)));
+    assert_eq!(suspended.get("frozen"), Some(&json!(true)));
+    assert_eq!(suspended.get("suspended"), Some(&json!(true)));
+    // harw's own freeze is recorded: job.resume may thaw it.
+    assert_eq!(suspended.get("suspend_phase"), Some(&json!("applied")));
+    assert_eq!(suspended.get("finding_id"), Some(&json!(FINDING)));
+
+    let again = json_of(
+        run(
+            &provider,
+            &worker,
+            JOB_SUSPEND_TOOL,
+            json!({ "job_id": id.as_str() }),
+        )
+        .await
+        .map_err(ctx("suspend again"))?,
+    )?;
+    assert_eq!(again.get("transition"), Some(&json!("already_suspended")));
+    assert_eq!(again.get("changed"), Some(&json!(false)));
+    // The repeated suspend re-applies the freeze and reports the kernel.
+    assert_eq!(again.get("frozen"), Some(&json!(true)));
+    assert_eq!(again.get("finding_id"), Some(&Value::Null));
+
+    let resumed = json_of(
+        run(
+            &provider,
+            &worker,
+            JOB_RESUME_TOOL,
+            json!({ "job_id": id.as_str(), "finding_id": FINDING }),
+        )
+        .await
+        .map_err(ctx("resume"))?,
+    )?;
+    assert_eq!(resumed.get("state"), Some(&json!("running")));
+    assert_eq!(resumed.get("transition"), Some(&json!("resumed")));
+    assert_eq!(resumed.get("frozen"), Some(&json!(false)));
+    assert_eq!(resumed.get("suspended"), Some(&json!(false)));
+    assert_eq!(resumed.get("suspend_phase"), Some(&Value::Null));
+
+    let idle = json_of(
+        run(
+            &provider,
+            &worker,
+            JOB_RESUME_TOOL,
+            json!({ "job_id": id.as_str() }),
+        )
+        .await
+        .map_err(ctx("resume again"))?,
+    )?;
+    assert_eq!(idle.get("transition"), Some(&json!("not_suspended")));
+    assert_eq!(idle.get("changed"), Some(&json!(false)));
+    assert_eq!(idle.get("frozen"), Some(&json!(false)));
+    assert_eq!(
+        fake.calls(),
+        vec![
+            ("freeze", "harw-job-t1".to_owned()),
+            ("freeze", "harw-job-t1".to_owned()),
+            ("thaw", "harw-job-t1".to_owned()),
+        ]
+    );
+    Ok(())
+}
+
+/// `job.stop` never thaws a suspended job: it reports the SIGKILL that
+/// actually went out and says why; a running job gets the requested signal
+/// and no note.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_stop_tool_kills_a_suspended_job_and_says_so() -> TestResult {
+    use crate::test_support::fake_cgroup::FakeCgroup;
+    let fake = Arc::new(FakeCgroup::default());
+    let (env, id) = suspend_env(&fake, "t4")?;
+    let tools = provider(&env, Arc::new(NoLineage));
+    let worker = env.exec_context("worker")?;
+
+    let plain = json_of(
+        run(
+            &tools,
+            &worker,
+            JOB_STOP_TOOL,
+            json!({ "job_id": id.as_str() }),
+        )
+        .await
+        .map_err(ctx("stop running"))?,
+    )?;
+    assert_eq!(plain.get("signal_sent"), Some(&json!("SIGTERM")));
+    assert_eq!(plain.get("note"), None);
+
+    json_of(
+        run(
+            &tools,
+            &worker,
+            JOB_SUSPEND_TOOL,
+            json!({ "job_id": id.as_str() }),
+        )
+        .await
+        .map_err(ctx("suspend"))?,
+    )?;
+    let stopped = json_of(
+        run(
+            &tools,
+            &worker,
+            JOB_STOP_TOOL,
+            json!({ "job_id": id.as_str(), "signal": "TERM" }),
+        )
+        .await
+        .map_err(ctx("stop suspended"))?,
+    )?;
+    assert_eq!(stopped.get("signal_sent"), Some(&json!("SIGKILL")));
+    assert_eq!(stopped.get("note"), Some(&json!(SUSPENDED_STOP_NOTE)));
+    assert_eq!(stopped.get("suspended"), Some(&json!(true)));
+    assert_eq!(fake.calls(), vec![("freeze", "harw-job-t4".to_owned())]);
+    Ok(())
+}
+
+/// A cgroup frozen outside harw (an operator, the Warden) is a tool error
+/// for both tools, never an argument error, and nothing is written.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_suspend_tools_refuse_a_freeze_set_outside_harw() -> TestResult {
+    use crate::test_support::fake_cgroup::FakeCgroup;
+    let fake = Arc::new(FakeCgroup::default());
+    let (env, id) = suspend_env(&fake, "t5")?;
+    fake.set_outside("harw-job-t5", true, true);
+    let tools = provider(&env, Arc::new(NoLineage));
+    let worker = env.exec_context("worker")?;
+    for tool in [JOB_SUSPEND_TOOL, JOB_RESUME_TOOL] {
+        let refused = error_of(
+            run(&tools, &worker, tool, json!({ "job_id": id.as_str() }))
+                .await
+                .map_err(ctx("refused"))?,
+        )?;
+        assert!(
+            refused.contains("frozen by someone other than harw"),
+            "{refused}"
+        );
+    }
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    Ok(())
+}
+
+/// A stranger gets the message of an unknown job (same as `job.stop`), a
+/// missing freezer is a tool error (not an argument error), and nothing is
+/// frozen in either case.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_suspend_tool_refuses_foreign_jobs_and_missing_freezer() -> TestResult {
+    use crate::test_support::fake_cgroup::FakeCgroup;
+    let fake = Arc::new(FakeCgroup::default());
+    let (env, id) = suspend_env(&fake, "t2")?;
+    let tools = provider(&env, Arc::new(NoLineage));
+    let stranger = env.exec_context("stranger")?;
+    for tool in [JOB_SUSPEND_TOOL, JOB_RESUME_TOOL] {
+        let foreign = error_of(
+            run(
+                &tools,
+                &stranger,
+                tool,
+                json!({ "job_id": id.as_str(), "finding_id": FINDING }),
+            )
+            .await
+            .map_err(ctx("foreign"))?,
+        )?;
+        let unknown = error_of(
+            run(&tools, &stranger, tool, json!({ "job_id": "job-404" }))
+                .await
+                .map_err(ctx("unknown"))?,
+        )?;
+        assert!(foreign.contains("unknown job"), "{foreign}");
+        assert_eq!(foreign.replace(id.as_str(), "job-404"), unknown);
+    }
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+
+    let bare = Env::new()?;
+    let meta = crate::test_support::stub_job_meta(
+        "job-bare",
+        JobState::Running,
+        "worker",
+        &[],
+        Some("t3"),
+    )?;
+    let bare_id = bare
+        .manager
+        .insert_test_job(meta, true)
+        .map_err(ctx("insert bare"))?;
+    let bare_provider = provider(&bare, Arc::new(NoLineage));
+    let worker = bare.exec_context("worker")?;
+    let refused = error_of(
+        run(
+            &bare_provider,
+            &worker,
+            JOB_SUSPEND_TOOL,
+            json!({ "job_id": bare_id.as_str() }),
+        )
+        .await
+        .map_err(ctx("no freezer"))?,
+    )?;
+    assert!(refused.contains("not available"), "{refused}");
+    let state = bare
+        .manager
+        .status(&bare_id, Caller::Operator)
+        .map_err(ctx("status"))?
+        .meta
+        .state;
+    assert_eq!(state, JobState::Running);
+    Ok(())
 }

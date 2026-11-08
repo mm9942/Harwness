@@ -67,6 +67,10 @@
 //! zitierfähigen [`harw_dod_signals::SecurityEvidence`]-Beleg ein — über den
 //! dort bereits gelandeten Konstruktor, der den Digest selbst bildet;
 //! diese Crate berechnet ihn nicht zweitrangig noch einmal selbst.
+//! [`buffer::EvidenceBuffer::freeze_since`] friert dagegen nur das seit einer
+//! [`buffer::BufferMark`] angekommene Delta ein (PL-100 WP0.1): monotone
+//! Zähler je Ring trennen „schon ausgewertet" von „neu", ohne den Ring zu
+//! leeren — siehe `buffer`-Moduldoku, Abschnitt „Delta-Auswertung".
 //!
 //! **Zwei Schreibwege führen in diesen Puffer, nicht einer:**
 //! [`Sentinel::poll_all`] für Ereignisse, die diese Crate selbst aus einem
@@ -87,8 +91,9 @@
 //!   Crate.
 //! - [`health`]: [`health::SensorHealth`], [`health::DegradeReason`],
 //!   [`health::RetryPolicy`] — der Degradationsautomat.
-//! - [`buffer`]: [`buffer::EvidenceBuffer`] — die zwei Ringe und ihr
-//!   `freeze()`.
+//! - [`buffer`]: [`buffer::EvidenceBuffer`] — die zwei Ringe, ihr
+//!   `freeze()` und die Delta-Sicht `freeze_since()` mit
+//!   [`buffer::BufferMark`]/[`buffer::EvidenceDelta`].
 //! - [`metrics`]: die in [`harw_observe`] deklarierten Kennzahlen dieser
 //!   Crate (Abrufe je Sensor, Fehler nach `Permanence`, degradierte
 //!   Sensoren, Pufferauslastung).
@@ -173,7 +178,7 @@ pub mod metrics;
 pub mod sentinel;
 pub mod spool;
 
-pub use buffer::EvidenceBuffer;
+pub use buffer::{BufferMark, EvidenceBuffer, EvidenceDelta};
 pub use error::{SentinelError, SentinelResult};
 pub use health::{DegradeReason, RetryPolicy, SensorHealth};
 pub use sentinel::{Sentinel, SentinelConfig};

@@ -691,7 +691,11 @@ fn test_probes_and_sentinel_agree_on_the_sentinel_socket() -> TestResult {
         .ok_or(TestError::Missing("sentinel ExecStart"))?;
     let socket = exec_flag(exec, "--socket").ok_or(TestError::Missing("sentinel --socket"))?;
     assert_eq!(socket, "/run/harw/sentinel.sock");
-    for probe in ["harw-probe-bpf.service", "harw-probe-fs.service"] {
+    for probe in [
+        "harw-probe-bpf.service",
+        "harw-probe-fs.service",
+        "harw-probe-netlink.service",
+    ] {
         let unit = parsed(embedded_unit(probe)?);
         let exec = unit
             .last_value("Service", "ExecStart")
@@ -743,6 +747,23 @@ fn test_sentinel_unit_wires_config_and_both_exports_into_the_export_dir() -> Tes
             "harw-sentinel.service: {key}= must stay present and empty"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn test_sentinel_unit_pins_the_working_directory_and_has_no_workspace_root() -> TestResult {
+    // PL-100 WP0.7: an explicit `/` working directory, and no implicit
+    // workspace root (the sentinel refuses `/` and relative roots anyway).
+    let sentinel = parsed(embedded_unit("harw-sentinel.service")?);
+    assert_eq!(
+        sentinel.last_value("Service", "WorkingDirectory"),
+        Some("/"),
+        "harw-sentinel.service: WorkingDirectory= must be /"
+    );
+    let exec = sentinel
+        .last_value("Service", "ExecStart")
+        .ok_or(TestError::Missing("sentinel ExecStart"))?;
+    assert_eq!(exec_flag(exec, "--workspace-root"), None);
     Ok(())
 }
 
@@ -852,6 +873,7 @@ fn test_dod_units_use_the_harw_dod_suite_name() -> TestResult {
         "harw-sentinel.service",
         "harw-probe-bpf.service",
         "harw-probe-fs.service",
+        "harw-probe-netlink.service",
         "harw-warden.service",
         "harw-warden.socket",
     ] {
@@ -867,15 +889,56 @@ fn test_dod_units_use_the_harw_dod_suite_name() -> TestResult {
     Ok(())
 }
 
+/// PL-100 WP1.8: the audit netlink probe unit is embedded and printable like
+/// every other DoD unit, but stays opt-in (`harw-dod.target` does not pull it
+/// in until the sentinel accepts its uid). The DoD package ships it
+/// (`DOD_PACKAGE_ASSETS`, `harw-dod/packaging/manifest`, `install.sh`); the
+/// parity tests above keep those three in step, and
+/// `harw-install/tests/staged_install.rs` checks the binary, the uninstall
+/// path and that no packaging step enables it.
+#[test]
+fn test_netlink_probe_unit_is_embedded_printable_and_opt_in() -> TestResult {
+    let path = "deploy/systemd/harw-probe-netlink.service";
+    let unit = asset(path).ok_or(TestError::Missing("embedded netlink probe unit"))?;
+    assert_eq!(unit.kind, AssetKind::SystemdService);
+
+    let printed = print_systemd(Some("harw-probe-netlink"), &RenderPaths::default())
+        .map_err(ctx("print netlink probe"))?;
+    assert_eq!(printed, rendered(unit));
+    assert!(printed.contains("/usr/local/libexec/harw-dod/harw-probe-netlink "));
+
+    let service = parsed(unit);
+    assert_eq!(
+        service.last_value("Service", "User"),
+        Some("harw-probe-netlink")
+    );
+    assert_eq!(
+        service
+            .last_value("Service", "CapabilityBoundingSet")
+            .map(capability_set),
+        Some(capability_set("CAP_AUDIT_READ"))
+    );
+    let target = parsed(embedded_unit("harw-dod.target")?);
+    let wants = words(&target.values("Unit", "Wants"));
+    assert!(
+        !wants.iter().any(|w| w == "harw-probe-netlink.service"),
+        "harw-dod.target must not pull in the netlink probe by default: {wants:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_dod_target_pulls_in_observation_only() -> TestResult {
     let target = parsed(embedded_unit("harw-dod.target")?);
     let wants = words(&target.values("Unit", "Wants"));
+    // PL-100 WP1.6: the fanotify probe belongs to the target since its scope
+    // comes from `[probe_fs]` in config.toml (or its built-in defaults).
     assert_eq!(
         wants,
         vec![
             "harw-sentinel.service".to_owned(),
-            "harw-probe-bpf.service".to_owned()
+            "harw-probe-bpf.service".to_owned(),
+            "harw-probe-fs.service".to_owned()
         ]
     );
     for asset in systemd_units() {
@@ -1003,6 +1066,34 @@ fn test_control_plane_is_socket_activated_for_harw_control_clients() -> TestResu
             "harw-infra.target: {key}= must name the socket, not the service"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn test_tmpfiles_creates_the_spool_dir_owner_only() -> TestResult {
+    // PL-100 WP0.12: the sentinel spool holds raw evidence; nobody but the
+    // sentinel may traverse it, and it carries no age column.
+    let tmpfiles = asset("deploy/tmpfiles.d/harw.conf").ok_or(TestError::Missing("tmpfiles"))?;
+    let rendered_tmpfiles = rendered(tmpfiles);
+    let spool: Vec<Vec<&str>> = rendered_tmpfiles
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .filter(|f| f.get(1) == Some(&"/var/lib/harw-dod/spool"))
+        .collect();
+    assert_eq!(
+        spool,
+        [[
+            "d",
+            "/var/lib/harw-dod/spool",
+            "0700",
+            "harw-sentinel",
+            "harw-sentinel",
+            "-"
+        ]],
+        "spool dir: owner-only, sentinel-owned, no age-based cleanup"
+    );
     Ok(())
 }
 
@@ -1160,11 +1251,19 @@ fn test_control_plane_delegates_its_cgroup_for_job_cgroups() -> TestResult {
 fn test_every_dod_and_infra_service_sets_the_common_hardening() -> TestResult {
     for asset in systemd_units().filter(|a| a.kind == AssetKind::SystemdService) {
         let unit = parsed(asset);
+        // harw-probe-fs alone keeps the home roots visible, read-only: fanotify
+        // must mark /home, /root and /run/user and the kernel must open event
+        // descriptors below them (see the unit's ProtectHome comment).
+        let protect_home = if asset.file_name() == "harw-probe-fs.service" {
+            "read-only"
+        } else {
+            "yes"
+        };
         for (key, value) in [
             ("NoNewPrivileges", "yes"),
             ("ProtectSystem", "strict"),
             ("PrivateTmp", "yes"),
-            ("ProtectHome", "yes"),
+            ("ProtectHome", protect_home),
         ] {
             assert_eq!(
                 unit.last_value("Service", key),

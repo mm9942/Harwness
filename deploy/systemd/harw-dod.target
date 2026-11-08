@@ -4,15 +4,20 @@
 # byte-identically into harw-install (`deployment::DEPLOYMENT_ASSETS`) and
 # installed by harw-dod/scripts/install.sh. There is no second copy.
 #
-# Pulls up only the unprivileged sentinel and the eBPF probe. Deliberately no
-# edge to harw-warden.service/.socket (enforcement is a separate, explicit
-# opt-in: `make -C harw-dod enable-warden`) and none to harw-probe-fs.service (it
-# needs an operator-chosen --scope-root first; enable it explicitly).
+# Pulls up the observation units only: the unprivileged sentinel, the eBPF
+# probe and the fanotify probe. Deliberately no edge to
+# harw-warden.service/.socket (enforcement is a separate, explicit opt-in:
+# `make -C harw-dod enable-warden`).
+#
+# PL-100 WP1.6: harw-probe-fs belongs to the target since its watch scope
+# comes from /etc/harw-dod/config.toml ([probe_fs]) or its built-in defaults
+# (the persistence locations of the persistence-write rule) instead of a
+# placeholder --scope-root.
 
 [Unit]
 Description=Harw-DoD observation
-Wants=harw-sentinel.service harw-probe-bpf.service
-After=harw-sentinel.service harw-probe-bpf.service
+Wants=harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service
+After=harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service
 
 [Install]
 WantedBy=multi-user.target

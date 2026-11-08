@@ -97,6 +97,12 @@
         "observed_at": "1970-01-01T00:00:00Z",
         "metric": "memory_current_bytes_cg15",
         "value": 1015.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "cgroup.truncated",
+        "value": 4.0
       }
     ],
     "events": []

@@ -13,7 +13,6 @@ use harw_protocol::items::TurnItem;
 use harw_types::ContentDigest;
 use serde_json::Value;
 
-const MAX_ROUNDS: usize = 64;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 
 struct Round {
@@ -33,10 +32,40 @@ pub(crate) struct AnthropicReplayCache {
     rounds: Mutex<VecDeque<Round>>,
 }
 
+const FAMILY: &str = "anthropic";
+
 fn unavailable(detail: &str) -> ModelError {
-    ModelError::RequestFailed(format!(
-        "Anthropic thinking continuity unavailable ({detail}); start a fresh conversation or explicitly rebuild its context before retrying"
-    ))
+    crate::replay_bounds::unavailable(FAMILY, detail)
+}
+
+/// Degradiert eine Anfrage mit verlorenen Runden: Steht der Verlauf mitten in
+/// einer Tool-Schleife (letzte Nachricht ist ein Tool-Ergebnis) und ist die
+/// letzte Assistant-Runde nicht nativ wiederhergestellt, verlangt die API
+/// dort einen Thinking-Block. Diese eine Anfrage geht dann ohne Thinking.
+fn degrade_thinking(body: &mut Value, historical: &[ModelMessage], covered: &[bool], model: &str) {
+    if body.get("thinking").is_none()
+        || !matches!(historical.last(), Some(ModelMessage::ToolResult { .. }))
+    {
+        return;
+    }
+    let last_assistant = historical.iter().rposition(|message| {
+        matches!(
+            message,
+            ModelMessage::Assistant { .. } | ModelMessage::ToolCall { .. }
+        )
+    });
+    if let Some(index) = last_assistant
+        && !covered.get(index).copied().unwrap_or(false)
+        && let Some(object) = body.as_object_mut()
+    {
+        object.remove("thinking");
+        tracing::warn!(
+            target: "harw.replay",
+            code = "HARW-REPLAY-004",
+            model,
+            "thinking disabled for one request: the open tool round has no native thinking block"
+        );
+    }
 }
 
 fn digest(items: &[TurnItem]) -> Result<ContentDigest, ModelError> {
@@ -149,18 +178,24 @@ impl AnthropicReplayCache {
                 && old.model == round.model
                 && old.prefix_digest == round.prefix_digest)
         });
-        while rounds.len() >= MAX_ROUNDS
-            || rounds.iter().map(|round| round.bytes).sum::<usize>() + bytes > MAX_BYTES
-        {
-            rounds.pop_front();
-        }
+        crate::replay_bounds::evict_for(
+            &mut rounds,
+            |round| &round.identity,
+            |round| round.bytes,
+            &round.identity,
+            bytes,
+            MAX_BYTES,
+        );
         rounds.push_back(round);
         Ok(())
     }
 
     /// Restore whole content arrays, never independently matched thinking/calls.
-    /// Missing continuity during thinking is an explicit error, including after
-    /// restart, eviction, model/provider switches or transcript compaction.
+    /// Missing continuity (restart, eviction, model/provider switches,
+    /// transcript compaction) is an explicit error under
+    /// [`ReplayPolicy::Strict`](crate::replay_bounds::ReplayPolicy::Strict);
+    /// by default the affected rounds are sent as plain content and, inside
+    /// an open tool loop, this one request goes without thinking.
     pub(crate) fn apply(
         &self,
         provider: &str,
@@ -168,8 +203,12 @@ impl AnthropicReplayCache {
         model: &str,
         request: &ModelRequest,
         body: &mut Value,
+        policy: crate::replay_bounds::ReplayPolicy,
     ) -> Result<(), ModelError> {
-        if body.get("thinking").is_some() && identity(request).is_none() {
+        if policy == crate::replay_bounds::ReplayPolicy::Strict
+            && body.get("thinking").is_some()
+            && identity(request).is_none()
+        {
             return Err(unavailable("request identity is missing or empty"));
         }
         let history = request.history.items();
@@ -193,11 +232,17 @@ impl AnthropicReplayCache {
                 .iter()
                 .any(|message| matches!(message, ModelMessage::ToolCall { .. }));
         let Some(identity) = identity(request) else {
-            return if required {
-                Err(unavailable("request identity is missing or empty"))
-            } else {
-                Ok(())
-            };
+            if required {
+                crate::replay_bounds::on_missing(
+                    policy,
+                    FAMILY,
+                    model,
+                    "request identity is missing or empty",
+                    historical.len(),
+                )?;
+                degrade_thinking(body, &historical, &vec![false; historical.len()], model);
+            }
+            return Ok(());
         };
         let messages = body
             .get_mut("messages")
@@ -240,22 +285,33 @@ impl AnthropicReplayCache {
             ));
             covered[start..end].fill(true);
         }
-        if required
-            && historical.iter().zip(covered).any(|(message, covered)| {
-                !covered
+        drop(rounds);
+        let uncovered = historical
+            .iter()
+            .zip(&covered)
+            .filter(|(message, covered)| {
+                !**covered
                     && matches!(
                         message,
                         ModelMessage::Assistant { .. } | ModelMessage::ToolCall { .. }
                     )
             })
-        {
-            return Err(unavailable(
+            .count();
+        if required && uncovered > 0 {
+            crate::replay_bounds::on_missing(
+                policy,
+                FAMILY,
+                model,
                 "original full round was lost, changed, compacted or belongs to another provider/model/identity",
-            ));
+                uncovered,
+            )?;
         }
         replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
         for (start, end, restored) in replacements {
             messages.splice(start..end, [restored]);
+        }
+        if uncovered > 0 {
+            degrade_thinking(body, &historical, &covered, model);
         }
         Ok(())
     }
@@ -273,6 +329,7 @@ mod tests {
     use harw_types::{ItemId, ReasoningEffort};
     use serde_json::json;
 
+    const STRICT: crate::replay_bounds::ReplayPolicy = crate::replay_bounds::ReplayPolicy::Strict;
     const PROVIDER: &str = "anthropic";
     const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
     const MODEL: &str = "claude-opus-5";
@@ -363,7 +420,7 @@ mod tests {
         second.data_block = Some("new context".into());
         let mut wire = build_messages_body(MODEL, 4096, &second);
         cache
-            .apply(PROVIDER, ENDPOINT, MODEL, &second, &mut wire)
+            .apply(PROVIDER, ENDPOINT, MODEL, &second, &mut wire, STRICT)
             .map_err(ctx("replay first"))?;
         assert_eq!(wire["messages"][1]["content"], raw["content"]);
         assert_eq!(wire["messages"].as_array().map(Vec::len), Some(3));
@@ -393,7 +450,7 @@ mod tests {
         append(&mut third, &parsed_second);
         let mut third_wire = build_messages_body(MODEL, 4096, &third);
         cache
-            .apply(PROVIDER, ENDPOINT, MODEL, &third, &mut third_wire)
+            .apply(PROVIDER, ENDPOINT, MODEL, &third, &mut third_wire, STRICT)
             .map_err(ctx("replay both"))?;
         assert_eq!(third_wire["messages"][1]["content"], raw["content"]);
         assert_eq!(third_wire["messages"][3]["content"], raw_second["content"]);
@@ -423,7 +480,7 @@ mod tests {
             let mut wire = build_messages_body(model, 4096, &followup);
             assert!(
                 cache
-                    .apply(provider, endpoint, model, &followup, &mut wire)
+                    .apply(provider, endpoint, model, &followup, &mut wire, STRICT)
                     .is_err()
             );
         }
@@ -445,7 +502,7 @@ mod tests {
             let mut wire = build_messages_body(MODEL, 4096, &wrong);
             assert!(
                 cache
-                    .apply(PROVIDER, ENDPOINT, MODEL, &wrong, &mut wire)
+                    .apply(PROVIDER, ENDPOINT, MODEL, &wrong, &mut wire, STRICT)
                     .is_err()
             );
         }
@@ -456,14 +513,14 @@ mod tests {
         let mut wire = build_messages_body(MODEL, 4096, &changed);
         assert!(
             cache
-                .apply(PROVIDER, ENDPOINT, MODEL, &changed, &mut wire)
+                .apply(PROVIDER, ENDPOINT, MODEL, &changed, &mut wire, STRICT)
                 .is_err()
         );
         let empty_cache = AnthropicReplayCache::default();
         let mut wire = build_messages_body(MODEL, 4096, &followup);
         assert!(
             empty_cache
-                .apply(PROVIDER, ENDPOINT, MODEL, &followup, &mut wire)
+                .apply(PROVIDER, ENDPOINT, MODEL, &followup, &mut wire, STRICT)
                 .is_err()
         );
         Ok(())
@@ -492,7 +549,7 @@ mod tests {
             let mut wire = build_messages_body(MODEL, 4096, &first);
             assert!(
                 cache
-                    .apply(PROVIDER, ENDPOINT, MODEL, &first, &mut wire)
+                    .apply(PROVIDER, ENDPOINT, MODEL, &first, &mut wire, STRICT)
                     .is_err()
             );
             assert!(
@@ -518,7 +575,14 @@ mod tests {
         let mut wire = build_messages_body(MODEL, 4096, &changed_prefix);
         assert!(
             cache
-                .apply(PROVIDER, ENDPOINT, MODEL, &changed_prefix, &mut wire)
+                .apply(
+                    PROVIDER,
+                    ENDPOINT,
+                    MODEL,
+                    &changed_prefix,
+                    &mut wire,
+                    STRICT
+                )
                 .is_err()
         );
         let mut partial = first.clone();
@@ -528,7 +592,7 @@ mod tests {
         let mut wire = build_messages_body(MODEL, 4096, &partial);
         assert!(
             cache
-                .apply(PROVIDER, ENDPOINT, MODEL, &partial, &mut wire)
+                .apply(PROVIDER, ENDPOINT, MODEL, &partial, &mut wire, STRICT)
                 .is_err()
         );
         Ok(())
@@ -560,13 +624,13 @@ mod tests {
         );
         let mut wire = build_messages_body(MODEL, 4096, &next);
         cache
-            .apply(PROVIDER, ENDPOINT, MODEL, &next, &mut wire)
+            .apply(PROVIDER, ENDPOINT, MODEL, &next, &mut wire, STRICT)
             .map_err(ctx("restore redacted round"))?;
         assert_eq!(wire["messages"][1]["content"], raw["content"]);
         let mut lost_wire = build_messages_body(MODEL, 4096, &next);
         assert!(
             AnthropicReplayCache::default()
-                .apply(PROVIDER, ENDPOINT, MODEL, &next, &mut lost_wire)
+                .apply(PROVIDER, ENDPOINT, MODEL, &next, &mut lost_wire, STRICT)
                 .is_err()
         );
         Ok(())
@@ -581,7 +645,7 @@ mod tests {
         cache
             .remember(PROVIDER, ENDPOINT, MODEL, &first, &parsed, &raw)
             .map_err(ctx("remember oldest"))?;
-        for _ in 0..MAX_ROUNDS {
+        for _ in 0..crate::replay_bounds::MAX_ROUNDS_PER_IDENTITY {
             let another = request();
             cache
                 .remember(PROVIDER, ENDPOINT, MODEL, &another, &parsed, &raw)
@@ -593,14 +657,14 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .len(),
-            MAX_ROUNDS
+            crate::replay_bounds::MAX_ROUNDS_PER_IDENTITY
         );
         let mut next = first.clone();
         append(&mut next, &parsed);
         let mut wire = build_messages_body(MODEL, 4096, &next);
         assert!(
             cache
-                .apply(PROVIDER, ENDPOINT, MODEL, &next, &mut wire)
+                .apply(PROVIDER, ENDPOINT, MODEL, &next, &mut wire, STRICT)
                 .is_err()
         );
         Ok(())
@@ -624,9 +688,41 @@ mod tests {
         next.history.push_user_text("Continue");
         let mut wire = build_messages_body(MODEL, 4096, &next);
         cache
-            .apply(PROVIDER, ENDPOINT, MODEL, &next, &mut wire)
+            .apply(PROVIDER, ENDPOINT, MODEL, &next, &mut wire, STRICT)
             .map_err(ctx("restore final round"))?;
         assert_eq!(wire["messages"][1]["content"], raw["content"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_lost_open_tool_round_drops_thinking_for_one_request_by_default() -> TestResult {
+        let first = request();
+        let raw = native();
+        let parsed = response(&raw)?;
+        let mut next = first.clone();
+        append(&mut next, &parsed);
+        let mut wire = build_messages_body(MODEL, 4096, &next);
+        assert!(
+            wire.get("thinking").is_some(),
+            "the fixture asks for thinking"
+        );
+        // Leerer Cache = Neustart/Kompaktierung: die Runde ist verloren.
+        AnthropicReplayCache::default()
+            .apply(
+                PROVIDER,
+                ENDPOINT,
+                MODEL,
+                &next,
+                &mut wire,
+                crate::replay_bounds::ReplayPolicy::Degrade,
+            )
+            .map_err(ctx("degraded apply"))?;
+        assert!(wire.get("thinking").is_none());
+        let mut strict_wire = build_messages_body(MODEL, 4096, &next);
+        let error = AnthropicReplayCache::default()
+            .apply(PROVIDER, ENDPOINT, MODEL, &next, &mut strict_wire, STRICT)
+            .err();
+        assert!(matches!(error, Some(ModelError::ReplayUnavailable { .. })));
         Ok(())
     }
 }

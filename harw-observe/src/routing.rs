@@ -28,7 +28,8 @@
 //! Voreinstellung ausschließlich in den Sink, der [`RoutingSink::new`] als
 //! `default_sink` übergeben wird (im Betrieb der File-Sink — siehe
 //! [`RoutingSink::new`]-Doku). Ein Export nach außen entsteht nur über
-//! [`RoutingSink::approve_export`] mit einem echten [`ExportApproval`].
+//! [`SecurityExportGate::release`] mit einem [`ExportApproval`] (die
+//! interne Registrierung `approve_export` ist nicht öffentlich).
 //! Entscheidend: **ein gewöhnlicher [`RoutingSink::route`]-Aufruf für einen
 //! geschützten Präfix hat keine Wirkung auf die Zustellung** — die
 //! Voreinstellung entscheidet hier, was in der Praxis passiert, nicht eine
@@ -42,7 +43,7 @@
 //! [`RoutingSink`] wird über `Arc<dyn TelemetrySink>` geteilt und aus
 //! beliebigen Threads gleichzeitig gerufen (Vertrag A.3:
 //! `TelemetrySink::record` bekommt nur `&self`). [`RoutingSink::route`] und
-//! [`RoutingSink::approve_export`] verlangen dagegen `&mut self` — sie sind
+//! `RoutingSink::approve_export` verlangen dagegen `&mut self` — sie sind
 //! nur aufrufbar, solange der Aufrufer eine exklusive Referenz auf den noch
 //! nicht geteilten `RoutingSink` hält, also ausschließlich in der
 //! Aufbauphase, bevor er in ein `Arc<dyn TelemetrySink>` verpackt und
@@ -58,8 +59,8 @@
 //! nur zu versprechen.
 //!
 //! # Wie eine Bestätigung aussieht
-//! [`ExportApproval`] ist nur über [`ExportApproval::granted`]
-//! konstruierbar und trägt den freigegebenen Namensraum sowie den
+//! [`ExportApproval`] ist außerhalb der Crate nur über
+//! [`ExportApproval::try_granted`] konstruierbar und trägt den freigegebenen Namensraum sowie den
 //! Bezeichner des Operators, der freigegeben hat. Diese Crate kann einen
 //! Operator-Beleg **nicht selbst prüfen**: der Baum trägt dafür bereits
 //! `ApprovalActor`/`ApprovalStore` (`harw-session-store`) und
@@ -67,15 +68,59 @@
 //! (transitiv über `harw-session-store`, das `harw-observe` für
 //! `TraceContext` referenziert) von `harw-observe` ab. Eine Kante von hier
 //! auf eine der beiden wäre ein Zyklus (`harw-session-store` →
-//! `harw-observe` → `harw-session-store`). [`ExportApproval::granted`]
-//! prüft deshalb nichts selbst; es verlangt nur, dass der Aufrufer explizit
+//! `harw-observe` → `harw-session-store`). [`ExportApproval::try_granted`]
+//! prüft deshalb nur die Form; es verlangt, dass der Aufrufer explizit
 //! benennt, wer freigegeben hat. Die eigentliche Prüfung — Existenz einer
 //! aufgelösten `ApprovalResolutionRecord` mit `ReviewDecision::Approved`
 //! bzw. `ApprovedOnce`, ausgestellt an einen Akteur mit ausreichender
 //! `PermissionTier` — muss an der Kompositionsstelle passieren, die sowohl
 //! `harw-observe` als auch `harw-session-store`/`harw-operations` sieht
-//! (z. B. `harw-cli`), bevor sie [`ExportApproval::granted`] überhaupt
+//! (z. B. `harw-cli`), bevor sie [`ExportApproval::try_granted`] überhaupt
 //! aufruft. Siehe die Typ-Doku von [`ExportApproval`] für Details.
+//!
+//! # Grenze des Tors (bewusst ehrlich)
+//! Das Tor ist **kein kryptografischer Beweis und keine
+//! Zugriffskontrolle**. Es erzwingt (a) Voreinstellung geschlossen,
+//! (b) dass der einzige öffentliche Weg zu einem Exportziel
+//! [`SecurityExportGate::release`] ist (`approve_export` ist
+//! `pub(crate)`, [`SecurityExportGate`] hat keine öffentliche
+//! `Open`-Variante) und (c) die Form des Belegs. Es prüft **nicht**, ob
+//! ein Operator wirklich zugestimmt hat: [`ExportApproval::try_granted`]
+//! nimmt den Operator-Bezeichner vom Aufrufer. Jeder Code im selben
+//! Prozess, der `try_granted` + [`SecurityExportGate::open`] +
+//! [`SecurityExportGate::release`] aufruft, kann ein Exportziel
+//! anhängen. Die Sicherheit liegt damit bei der Kompositionsstelle
+//! (`harw-cli`): nur sie darf diese drei Aufrufe tätigen, und nur nach
+//! echter Prüfung über `ApprovalStore`/`PermissionTier` (siehe
+//! `docs/planning/100-dod-ai-integration/INVENTORY` H: Freigabe-Schalter
+//! ohne Wirkung, bei denen der Aufrufer den Akteur selbst liefert). Dieses
+//! Crate hat keine `tracing`-Abhängigkeit und schreibt deshalb **kein**
+//! Audit-/Log-Ereignis beim Öffnen; die Kompositionsstelle muss vor
+//! [`SecurityExportGate::release`] ein Audit-Ereignis schreiben
+//! (Namensraum aus [`SecurityExportGate::approval`], Operator nur im
+//! Audit, nie im Log ab `warn`).
+//!
+//! # Das Tor: [`SecurityExportGate`]
+//! Der Export von `security.*`/`warden.*` ist **opt-in, Voreinstellung
+//! geschlossen** (`docs/design/harw-telemetry-integration-plan.md` §2:
+//! „deliberate, operator-confirmed configuration step, never a default").
+//! [`SecurityExportGate::default`] ist geschlossen; nur
+//! [`SecurityExportGate::release`] mit einem formal gültigen
+//! [`ExportApproval`] (siehe [`ExportApproval::try_granted`]) hängt ein
+//! Exportziel an. Die Operator-Prüfung bleibt Aufgabe der
+//! Kompositionsstelle. **Meta-Null-Serien** (Name ohne geschützten Präfix)
+//! gehen dagegen an alle Standardziele ([`RoutingSink::broadcast_meta`],
+//! [`RoutingSink::emit_zero_registry`]), nie an Exportziele.
+//!
+//! # Meta-Metriken: Fan-out muss durchgehalten werden
+//! [`TelemetrySink::record`] stellt einen ungeschützten Namen an **genau
+//! ein** Ziel zu (`best_route`, sonst `default_sink`). Wer die Nullwerte
+//! per [`RoutingSink::emit_zero_registry`] an alle Ziele verteilt und
+//! spätere Werte über `record()` meldet, lässt alle anderen Ziele für
+//! immer auf `0` stehen — „nichts passiert" und „Emittent nicht
+//! verdrahtet" wären wieder nicht unterscheidbar. Emittenten der
+//! DoD-/Dispatch-Meta-Metriken **müssen** deshalb
+//! [`RoutingSink::record_meta`] benutzen (gleicher Fan-out, echte Werte).
 //!
 //! # Warum die Punktgrenzen-Prüfung hier ein zweites Mal steht
 //! `harw-sandbox::EgressTarget::matches_host` löst dasselbe Problem für
@@ -97,7 +142,7 @@
 //! [`RoutingSink::route`]-Eintrag für einen geschützten Namensraum trifft.
 //! Erwarteter Stand im Betrieb: null. Steigt er, hat jemand versucht,
 //! `security.*`/`warden.*` über den gewöhnlichen `route()`-Pfad statt über
-//! [`RoutingSink::approve_export`] zu leiten — der Versuch bleibt wirkungs-
+//! [`SecurityExportGate::release`] zu leiten — der Versuch bleibt wirkungs-
 //! los (die Metrik erreicht weiterhin nur `default_sink`, nie den
 //! fälschlich gebundenen Sink), aber er wird sichtbar statt stillschweigend
 //! ignoriert zu werden.
@@ -110,9 +155,9 @@
 //! innere Veränderlichkeit.
 //!
 //! # Fehler
-//! Keine — `route()`, `approve_export()`, `record()` und `flush()` geben
+//! Keine — `route()`, `record()`, `record_meta()` und `flush()` geben
 //! `()` zurück (Vertrag A.3). Eine Fehlkonfiguration (geschützter Präfix
-//! über `route()` statt `approve_export()`) wird nicht propagiert, sondern
+//! über `route()` statt über das Tor) wird nicht propagiert, sondern
 //! über [`SECURITY_METRIC_LEAKED`] gezählt.
 //!
 //! # Examples
@@ -120,7 +165,7 @@
 //! use std::sync::Arc;
 //! use harw_observe::{
 //!     Cardinality, ExportApproval, MetricKey, MetricKind, MetricValue, NullSink, RoutingSink,
-//!     TelemetrySink, Unit,
+//!     SecurityExportGate, TelemetrySink, Unit,
 //! };
 //!
 //! const FINDING: MetricKey = MetricKey {
@@ -138,16 +183,22 @@
 //! // Ohne Bestätigung geht die geschützte Metrik nur an `default_sink`.
 //! routing.record(&FINDING, MetricValue::Count(1), &[]);
 //!
-//! // Erst mit einem echten Beleg entsteht ein zusätzliches Exportziel.
-//! routing.approve_export(Arc::new(NullSink), ExportApproval::granted("security.", "alice"));
+//! // Erst mit einem Beleg und einem geöffneten Tor entsteht ein zusätzliches
+//! // Exportziel (die Operator-Prüfung ist Sache der Kompositionsstelle).
+//! if let Ok(approval) = ExportApproval::try_granted("security.", "alice") {
+//!     let released = SecurityExportGate::open(approval).release(&mut routing, Arc::new(NullSink));
+//!     assert!(released);
+//! }
 //! ```
 
 use std::sync::Arc;
 
+use crate::error::ObserveError;
 use crate::field::{FieldName, FieldValue};
 use crate::metric::{Cardinality, MetricKey, MetricKind, MetricValue, Unit};
 use crate::null_counter::NullCounter;
 use crate::sink::TelemetrySink;
+use crate::zero_registry::ZeroCounterRegistry;
 
 /// Namensräume, die ohne Bestätigung nur in den `default_sink` (im Betrieb
 /// der File-Sink) gehen.
@@ -224,9 +275,11 @@ pub static SECURITY_METRIC_LEAKED: NullCounter = NullCounter::new(
 /// Konfigurationszeile oder einem Modelltext entstehen könnte. Die
 /// eigentliche Prüfung — dass wirklich ein Operator mit ausreichender
 /// `PermissionTier` über den bestehenden Freigabeweg (`ApprovalStore`)
-/// zugestimmt hat — muss **vor** dem Aufruf von [`ExportApproval::granted`]
-/// an einer Stelle passieren, die beide Seiten sieht (typischerweise
-/// `harw-cli`, beim Aufbau der Telemetrie-Sinks).
+/// zugestimmt hat — muss **vor** dem Aufruf von
+/// [`ExportApproval::try_granted`] an einer Stelle passieren, die beide
+/// Seiten sieht (typischerweise `harw-cli`, beim Aufbau der
+/// Telemetrie-Sinks). Ohne diese Prüfung ist ein Beleg wertlos: der
+/// Operator-Bezeichner ist ein vom Aufrufer gelieferter String.
 #[derive(Debug, Clone)]
 pub struct ExportApproval {
     namespace: &'static str,
@@ -234,49 +287,61 @@ pub struct ExportApproval {
 }
 
 impl ExportApproval {
-    /// Baut einen Export-Beleg für einen geschützten Namensraum.
-    ///
-    /// # Description
-    /// Der einzige Konstruktionsweg für [`ExportApproval`]. Muss erst
-    /// aufgerufen werden, **nachdem** der Aufrufer die eigentliche
-    /// Freigabe über den bestehenden Weg geprüft hat (siehe Typ-Doku) —
-    /// diese Funktion selbst führt keine Prüfung durch, sie bündelt nur,
-    /// was bereits feststeht.
-    ///
-    /// # Arguments
-    /// - `namespace` (`&'static str`): der freigegebene geschützte
-    ///   Namensraum, üblicherweise ein Eintrag aus
-    ///   [`PROTECTED_NAMESPACES`] (z. B. `"security."`).
-    /// - `actor` (`impl Into<String>`): Bezeichner des Operators, der die
-    ///   Freigabe erteilt hat, z. B. die `id` eines
-    ///   `ApprovalActor::Operator` am Aufrufort.
-    ///
-    /// # Returns
-    /// Den fertigen Beleg, bereit für [`RoutingSink::approve_export`].
-    ///
-    /// # Concurrency
-    /// Reine Werterzeugung ohne Nebenläufigkeitsaspekt.
-    ///
-    /// # Examples
-    /// ```
-    /// use harw_observe::ExportApproval;
-    ///
-    /// let approval = ExportApproval::granted("security.", "alice");
-    /// assert_eq!(approval.namespace(), "security.");
-    /// assert_eq!(approval.actor(), "alice");
-    /// ```
-    #[must_use]
-    pub fn granted(namespace: &'static str, actor: impl Into<String>) -> Self {
+    // Baut einen Beleg **ohne** Formprüfung. Nur für Tests: außerhalb der
+    // Crate gibt es bewusst nur `try_granted`, damit kein formal
+    // ungültiger Beleg (leerer Operator, ungeschützter Namensraum) entsteht.
+    #[cfg(test)]
+    pub(crate) fn granted(namespace: &'static str, actor: impl Into<String>) -> Self {
         Self {
             namespace,
             actor: actor.into(),
         }
     }
 
+    /// Baut einen Export-Beleg für einen geschützten Namensraum; lehnt formal
+    /// ungültige Belege ab. Der einzige öffentliche Konstruktionsweg.
+    ///
+    /// # Description
+    /// Prüft **nur Form**, nie den Operator-Beleg selbst (siehe Typ-Doku):
+    /// der Namensraum muss exakt ein Eintrag aus [`PROTECTED_NAMESPACES`]
+    /// sein, und der Operator-Bezeichner darf nicht leer oder nur
+    /// Leerraum sein. Ein Beleg für `"app."` wäre wirkungslos, ein Beleg
+    /// ohne benannten Operator nicht nachvollziehbar.
+    ///
+    /// # Errors
+    /// [`ObserveError::InvalidExportApproval`] bei unbekanntem Namensraum
+    /// oder leerem Operator-Bezeichner.
+    ///
+    /// # Examples
+    /// ```
+    /// use harw_observe::ExportApproval;
+    ///
+    /// assert!(ExportApproval::try_granted("security.", "alice").is_ok());
+    /// assert!(ExportApproval::try_granted("app.", "alice").is_err());
+    /// assert!(ExportApproval::try_granted("security.", "  ").is_err());
+    /// ```
+    pub fn try_granted(
+        namespace: &'static str,
+        actor: impl Into<String>,
+    ) -> Result<Self, ObserveError> {
+        if !PROTECTED_NAMESPACES.contains(&namespace) {
+            return Err(ObserveError::InvalidExportApproval {
+                reason: "namespace is not a protected namespace",
+            });
+        }
+        let actor = actor.into();
+        if actor.trim().is_empty() {
+            return Err(ObserveError::InvalidExportApproval {
+                reason: "operator identifier is empty",
+            });
+        }
+        Ok(Self { namespace, actor })
+    }
+
     /// Der freigegebene Namensraum.
     ///
     /// # Returns
-    /// Den bei [`ExportApproval::granted`] übergebenen `namespace`-Wert.
+    /// Den bei der Konstruktion übergebenen `namespace`-Wert.
     ///
     /// # Concurrency
     /// Liest ein unveränderliches `&'static str`-Feld.
@@ -285,8 +350,9 @@ impl ExportApproval {
     /// ```
     /// use harw_observe::ExportApproval;
     ///
-    /// let approval = ExportApproval::granted("warden.", "bob");
+    /// let approval = ExportApproval::try_granted("warden.", "bob")?;
     /// assert_eq!(approval.namespace(), "warden.");
+    /// # Ok::<(), harw_observe::ObserveError>(())
     /// ```
     #[must_use]
     pub fn namespace(&self) -> &'static str {
@@ -296,7 +362,7 @@ impl ExportApproval {
     /// Der freigebende Operator.
     ///
     /// # Returns
-    /// Den bei [`ExportApproval::granted`] übergebenen `actor`-Wert.
+    /// Den bei der Konstruktion übergebenen `actor`-Wert.
     ///
     /// # Concurrency
     /// Liest ein unveränderliches `String`-Feld.
@@ -305,12 +371,119 @@ impl ExportApproval {
     /// ```
     /// use harw_observe::ExportApproval;
     ///
-    /// let approval = ExportApproval::granted("warden.", "bob");
+    /// let approval = ExportApproval::try_granted("warden.", "bob")?;
     /// assert_eq!(approval.actor(), "bob");
+    /// # Ok::<(), harw_observe::ObserveError>(())
     /// ```
     #[must_use]
     pub fn actor(&self) -> &str {
         &self.actor
+    }
+}
+
+/// Das Tor für den Export von `security.*`/`warden.*` an ein externes Ziel.
+///
+/// # Description
+/// **Voreinstellung: geschlossen** (`Default` = [`SecurityExportGate::closed`]).
+/// Der Export ist nach `docs/design/harw-telemetry-integration-plan.md` §2
+/// ein bewusster, vom Operator bestätigter Konfigurationsschritt, nie ein
+/// Default: ohne Freigabe erreichen geschützte Metriken ausschließlich den
+/// `default_sink` (File-Sink). Das Tor ändert nie, was der `default_sink`
+/// erhält: die durable Kopie bleibt in jedem Zustand erhalten.
+///
+/// Der Zustand ist privat: es gibt keine öffentliche `Open`-Variante, nur
+/// [`SecurityExportGate::open`]; `RoutingSink::approve_export` ist
+/// `pub(crate)`, [`SecurityExportGate::release`] ist damit der einzige
+/// öffentliche Weg zu einem Exportziel.
+///
+/// # Grenze (wichtig)
+/// Das Tor ist **nur eine Form- und Verdrahtungsbarriere**, kein
+/// Echtheitsbeweis. `harw-observe` kann `ApprovalStore`/`PermissionTier`
+/// nicht prüfen (Abhängigkeitszyklus, siehe Moduldoc), und
+/// [`ExportApproval::try_granted`] übernimmt den Operator-Bezeichner
+/// ungeprüft vom Aufrufer. Beliebiger Code im selben Prozess kann
+/// `try_granted` → [`SecurityExportGate::open`] →
+/// [`SecurityExportGate::release`] aufrufen. Die Operator-Prüfung **und**
+/// ein Audit-Ereignis (Namensraum aus [`SecurityExportGate::approval`])
+/// gehören an die Kompositionsstelle (`harw-cli`) und müssen dort vor
+/// `release` stattfinden. Diese Crate loggt nichts (keine
+/// `tracing`-Abhängigkeit).
+///
+/// # Examples
+/// ```
+/// use std::sync::Arc;
+/// use harw_observe::{NullSink, RoutingSink, SecurityExportGate};
+///
+/// let mut routing = RoutingSink::new(Arc::new(NullSink));
+/// let gate = SecurityExportGate::default();
+/// assert!(!gate.is_open());
+/// assert!(!gate.release(&mut routing, Arc::new(NullSink)));
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct SecurityExportGate {
+    approval: Option<ExportApproval>,
+}
+
+impl SecurityExportGate {
+    /// Das geschlossene Tor (Voreinstellung).
+    #[must_use]
+    pub const fn closed() -> Self {
+        Self { approval: None }
+    }
+
+    /// Öffnet das Tor mit einem Beleg. Prüft nichts über den Operator;
+    /// [`Self::release`] verweigert formal ungültige Belege.
+    ///
+    /// # Examples
+    /// ```
+    /// use harw_observe::{ExportApproval, SecurityExportGate};
+    ///
+    /// let approval = ExportApproval::try_granted("security.", "alice")?;
+    /// assert!(SecurityExportGate::open(approval).is_open());
+    /// # Ok::<(), harw_observe::ObserveError>(())
+    /// ```
+    #[must_use]
+    pub fn open(approval: ExportApproval) -> Self {
+        Self {
+            approval: Some(approval),
+        }
+    }
+
+    /// `true`, wenn ein Beleg vorliegt.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.approval.is_some()
+    }
+
+    /// Der Beleg eines geöffneten Tors, z. B. für das Audit-Ereignis der
+    /// Kompositionsstelle vor [`Self::release`].
+    #[must_use]
+    pub fn approval(&self) -> Option<&ExportApproval> {
+        self.approval.as_ref()
+    }
+
+    /// Hängt `sink` als Exportziel an `routing`, falls das Tor offen ist.
+    ///
+    /// # Returns
+    /// `true`, wenn das Exportziel registriert wurde. `false` bei
+    /// geschlossenem Tor und bei formal ungültigem Beleg (Namensraum nicht
+    /// in [`PROTECTED_NAMESPACES`] oder leerer Operator-Bezeichner); in
+    /// beiden Fällen bleibt `routing` unverändert, geschützte Metriken
+    /// erreichen weiter nur den `default_sink`.
+    ///
+    /// # Concurrency
+    /// Verlangt `&mut RoutingSink` und ist damit nur in der Aufbauphase
+    /// aufrufbar (siehe Moduldoc). Schreibt kein Log/Audit (siehe Typ-Doku,
+    /// Abschnitt „Grenze").
+    pub fn release(self, routing: &mut RoutingSink, sink: Arc<dyn TelemetrySink>) -> bool {
+        let Some(approval) = self.approval else {
+            return false;
+        };
+        if ExportApproval::try_granted(approval.namespace(), approval.actor()).is_err() {
+            return false;
+        }
+        routing.approve_export(sink, approval);
+        true
     }
 }
 
@@ -352,7 +525,7 @@ impl RoutingSink {
     /// [`RoutingSink::route`]-Eintrag entspricht — **und** die
     /// Voreinstellung für jede geschützte Metrik
     /// ([`PROTECTED_NAMESPACES`]), solange keine passende
-    /// [`RoutingSink::approve_export`]-Freigabe vorliegt. Damit die Zusage
+    /// `RoutingSink::approve_export`-Freigabe vorliegt. Damit die Zusage
     /// aus dem Moduldoc („`security.*`/`warden.*` gehen ohne Bestätigung
     /// ausschließlich in den File-Sink") in der Praxis gilt, **muss** der
     /// Aufrufer hier den File-Sink übergeben — der Typ selbst kann das
@@ -370,7 +543,7 @@ impl RoutingSink {
     /// # Concurrency
     /// Reine Werterzeugung; der zurückgegebene Wert ist noch nicht geteilt
     /// und darf mit `&mut self`-Methoden ([`RoutingSink::route`],
-    /// [`RoutingSink::approve_export`]) weiter aufgebaut werden, bevor er
+    /// `RoutingSink::approve_export`) weiter aufgebaut werden, bevor er
     /// in ein `Arc<dyn TelemetrySink>` verpackt wird (siehe Moduldoc,
     /// Abschnitt „Warum die Routing-Tabelle unveränderlich ist").
     ///
@@ -453,20 +626,150 @@ impl RoutingSink {
     /// Verlangt `&mut self` — dieselbe Einschränkung wie
     /// [`RoutingSink::route`].
     ///
-    /// # Examples
-    /// ```
-    /// use std::sync::Arc;
-    /// use harw_observe::{ExportApproval, NullSink, RoutingSink};
-    ///
-    /// let mut routing = RoutingSink::new(Arc::new(NullSink));
-    /// routing.approve_export(Arc::new(NullSink), ExportApproval::granted("security.", "alice"));
-    /// ```
-    pub fn approve_export(&mut self, sink: Arc<dyn TelemetrySink>, approval: ExportApproval) {
+    /// Nur `pub(crate)`: der öffentliche Weg ist
+    /// [`SecurityExportGate::release`].
+    pub(crate) fn approve_export(
+        &mut self,
+        sink: Arc<dyn TelemetrySink>,
+        approval: ExportApproval,
+    ) {
         self.protected_exports.push(ProtectedExport {
             prefix: approval.namespace,
             sink,
             approved_by: approval.actor,
         });
+    }
+
+    /// Verteilt eine **Meta-Metrik** an alle Standardziele.
+    ///
+    /// # Description
+    /// Für Null-Serien (`docs/design/harw-telemetry-integration-plan.md` §2:
+    /// „meta zero-counters = all sinks"). Zustellung an den `default_sink`
+    /// und an jedes über [`RoutingSink::route`] gebundene Ziel, je Ziel
+    /// genau einmal (Dedupe über `Arc::ptr_eq`). Genehmigte Exportziele
+    /// und Routen auf geschützte Präfixe werden **nie** bedient.
+    ///
+    /// **Achtung:** Spätere Werte derselben Metrik über
+    /// [`TelemetrySink::record`] erreichen nur **ein** Ziel; die übrigen
+    /// blieben auf `0` stehen. Emittenten müssen deshalb denselben Fan-out
+    /// benutzen ([`RoutingSink::record_meta`]).
+    ///
+    /// # Arguments
+    /// - `key`, `value`, `labels`: wie bei [`TelemetrySink::record`].
+    ///
+    /// # Returns
+    /// `false` und keine Zustellung, wenn `key.name` in einem geschützten
+    /// Namensraum liegt (dafür gilt [`TelemetrySink::record`]); sonst `true`.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::sync::Arc;
+    /// use harw_observe::{
+    ///     Cardinality, MetricKey, MetricKind, MetricValue, NullSink, RoutingSink, Unit,
+    /// };
+    ///
+    /// const OVERRIDES: MetricKey = MetricKey {
+    ///     name: "human_overrides_total",
+    ///     kind: MetricKind::Counter,
+    ///     unit: Unit::Count,
+    ///     labels: &[],
+    ///     cardinality: Cardinality::Single,
+    /// };
+    ///
+    /// let mut routing = RoutingSink::new(Arc::new(NullSink));
+    /// routing.route("app.", Arc::new(NullSink));
+    /// assert!(routing.broadcast_meta(&OVERRIDES, MetricValue::Count(0), &[]));
+    /// ```
+    pub fn broadcast_meta(
+        &self,
+        key: &MetricKey,
+        value: MetricValue,
+        labels: &[(FieldName, FieldValue)],
+    ) -> bool {
+        if protected_namespace_for(key.name).is_some() {
+            return false;
+        }
+        let mut delivered: Vec<&Arc<dyn TelemetrySink>> = Vec::new();
+        let routed = self
+            .routes
+            .iter()
+            .filter(|entry| protected_namespace_for(entry.0).is_none())
+            .map(|entry| &entry.1);
+        for sink in std::iter::once(&self.default_sink).chain(routed) {
+            if delivered.iter().any(|seen| Arc::ptr_eq(seen, sink)) {
+                continue;
+            }
+            sink.record(key, value, labels);
+            delivered.push(sink);
+        }
+        true
+    }
+
+    /// Meldet einen **echten Wert** einer Meta-Metrik an alle
+    /// Standardziele (Emittenten-Pfad der DoD-/Dispatch-Zähler).
+    ///
+    /// # Description
+    /// Gleicher Fan-out wie [`RoutingSink::broadcast_meta`], damit die
+    /// durch [`RoutingSink::emit_zero_registry`] angelegten Serien in
+    /// **jedem** Ziel mitlaufen statt in allen außer einem bei `0` zu
+    /// verharren. Geschützte Namen werden abgelehnt.
+    ///
+    /// # Returns
+    /// `false` und keine Zustellung bei geschütztem Namensraum, sonst
+    /// `true`.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::sync::Arc;
+    /// use harw_observe::{
+    ///     Cardinality, MetricKey, MetricKind, MetricValue, NullSink, RoutingSink, Unit,
+    /// };
+    ///
+    /// const UNBOUND: MetricKey = MetricKey {
+    ///     name: "unbound_verdict_total",
+    ///     kind: MetricKind::Counter,
+    ///     unit: Unit::Count,
+    ///     labels: &[],
+    ///     cardinality: Cardinality::Single,
+    /// };
+    ///
+    /// let routing = RoutingSink::new(Arc::new(NullSink));
+    /// assert!(routing.record_meta(&UNBOUND, MetricValue::Count(1), &[]));
+    /// ```
+    pub fn record_meta(
+        &self,
+        key: &MetricKey,
+        value: MetricValue,
+        labels: &[(FieldName, FieldValue)],
+    ) -> bool {
+        self.broadcast_meta(key, value, labels)
+    }
+
+    /// Emittiert jede Null-Serie der Registry über
+    /// [`RoutingSink::broadcast_meta`].
+    ///
+    /// # Returns
+    /// Die Anzahl der Nullwerte, die verteilt wurden (je Wert einmal,
+    /// unabhängig von der Zahl der Ziele).
+    ///
+    /// # Examples
+    /// ```
+    /// use std::sync::Arc;
+    /// use harw_observe::{NullSink, ObserveError, RoutingSink, dod_zero_registry};
+    ///
+    /// # fn main() -> Result<(), ObserveError> {
+    /// let routing = RoutingSink::new(Arc::new(NullSink));
+    /// let registry = dod_zero_registry()?;
+    /// assert_eq!(routing.emit_zero_registry(&registry), 9);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn emit_zero_registry(&self, registry: &ZeroCounterRegistry) -> usize {
+        registry
+            .records()
+            .iter()
+            .filter(|record| self.broadcast_meta(record.key, record.value, &record.labels))
+            .count()
     }
 }
 
@@ -490,7 +793,11 @@ impl TelemetrySink for RoutingSink {
             self.default_sink.record(key, value, labels);
 
             // Eine passende Freigabe liefert zusätzlich an ihr Exportziel.
-            if let Some(export) = best_protected_export(&self.protected_exports, key.name) {
+            // Ist das Exportziel derselbe `Arc` wie `default_sink`, wäre es
+            // eine Doppelzählung; dann entfällt die zweite Zustellung.
+            let export = best_protected_export(&self.protected_exports, key.name)
+                .filter(|export| !Arc::ptr_eq(&export.sink, &self.default_sink));
+            if let Some(export) = export {
                 export.sink.record(key, value, labels);
             }
 
@@ -1030,5 +1337,254 @@ mod tests {
             1,
             "the same underlying sink registered under multiple roles must flush once"
         );
+    }
+
+    // ── SecurityExportGate und Meta-Fan-out ─────────────────────────────
+
+    #[test]
+    fn test_gate_default_is_closed() {
+        assert!(!SecurityExportGate::default().is_open());
+    }
+
+    #[test]
+    fn test_closed_gate_keeps_protected_metrics_in_default_sink() {
+        let file = sink();
+        let export = sink();
+        let mut routing = RoutingSink::new(as_dyn(&file));
+        assert!(!SecurityExportGate::default().release(&mut routing, as_dyn(&export)));
+
+        routing.record(&key("security.finding_total"), MetricValue::Count(1), &[]);
+        routing.record(&key("warden.action_total"), MetricValue::Count(1), &[]);
+        assert_eq!(file.count(), 2);
+        assert_eq!(export.count(), 0);
+    }
+
+    #[test]
+    fn test_open_gate_adds_export_target_and_keeps_file_copy() -> TestResult {
+        let file = sink();
+        let export = sink();
+        let mut routing = RoutingSink::new(as_dyn(&file));
+        let approval = ExportApproval::try_granted("security.", "alice")
+            .map_err(crate::test_support::ctx("approval"))?;
+        assert!(SecurityExportGate::open(approval).release(&mut routing, as_dyn(&export)));
+
+        routing.record(&key("security.finding_total"), MetricValue::Count(1), &[]);
+        routing.record(&key("warden.action_total"), MetricValue::Count(1), &[]);
+        assert_eq!(file.count(), 2);
+        assert_eq!(export.count(), 1, "only the approved namespace is exported");
+        Ok(())
+    }
+
+    #[test]
+    fn test_gate_refuses_formally_invalid_approval() {
+        let file = sink();
+        let export = sink();
+        let mut routing = RoutingSink::new(as_dyn(&file));
+        for approval in [
+            ExportApproval::granted("security.", "   "),
+            ExportApproval::granted("app.", "alice"),
+        ] {
+            assert!(!SecurityExportGate::open(approval).release(&mut routing, as_dyn(&export)));
+        }
+        routing.record(&key("security.finding_total"), MetricValue::Count(1), &[]);
+        assert_eq!(export.count(), 0);
+    }
+
+    #[test]
+    fn test_try_granted_validates_namespace_and_actor() {
+        assert!(ExportApproval::try_granted("security.", "alice").is_ok());
+        assert!(ExportApproval::try_granted("warden.", "bob").is_ok());
+        assert!(ExportApproval::try_granted("app.", "alice").is_err());
+        assert!(ExportApproval::try_granted("security", "alice").is_err());
+        assert!(ExportApproval::try_granted("security.", "").is_err());
+    }
+
+    #[test]
+    fn test_broadcast_meta_reaches_default_and_routes_once_each() {
+        let file = sink();
+        let app = sink();
+        let mut routing = RoutingSink::new(as_dyn(&file));
+        routing.route("app.", as_dyn(&app));
+        routing.route("app.jobs.", as_dyn(&app));
+        routing.route("file.", as_dyn(&file));
+
+        assert!(routing.broadcast_meta(&key("human_overrides_total"), MetricValue::Count(0), &[]));
+        assert_eq!(file.count(), 1, "default sink receives it once");
+        assert_eq!(app.count(), 1, "shared route sink receives it once");
+    }
+
+    #[test]
+    fn test_broadcast_meta_never_serves_protected_names_or_export_targets() {
+        let file = sink();
+        let app = sink();
+        let export = sink();
+        let mut routing = RoutingSink::new(as_dyn(&file));
+        routing.route("app.", as_dyn(&app));
+        routing.approve_export(
+            as_dyn(&export),
+            ExportApproval::granted("security.", "alice"),
+        );
+
+        assert!(!routing.broadcast_meta(&key("security.zero_total"), MetricValue::Count(0), &[]));
+        assert!(!routing.broadcast_meta(&key("warden.zero_total"), MetricValue::Count(0), &[]));
+        assert_eq!(file.count() + app.count() + export.count(), 0);
+
+        assert!(routing.broadcast_meta(&key("meta_total"), MetricValue::Count(0), &[]));
+        assert_eq!(export.count(), 0, "export targets never see meta series");
+    }
+
+    #[test]
+    fn test_broadcast_meta_skips_routes_bound_to_protected_prefix() {
+        let file = sink();
+        let leaky = sink();
+        let mut routing = RoutingSink::new(as_dyn(&file));
+        routing.route("security.", as_dyn(&leaky));
+        assert!(routing.broadcast_meta(&key("meta_total"), MetricValue::Count(0), &[]));
+        assert_eq!(leaky.count(), 0);
+        assert_eq!(file.count(), 1);
+    }
+
+    #[test]
+    fn test_emit_zero_registry_exports_all_dod_series_to_every_target() -> TestResult {
+        let registry = crate::zero_registry::dod_zero_registry()
+            .map_err(crate::test_support::ctx("dod registry"))?;
+        let file = sink();
+        let app = sink();
+        let export = sink();
+        let mut routing = RoutingSink::new(as_dyn(&file));
+        routing.route("app.", as_dyn(&app));
+        routing.approve_export(
+            as_dyn(&export),
+            ExportApproval::granted("security.", "alice"),
+        );
+
+        assert_eq!(routing.emit_zero_registry(&registry), 9);
+        assert_eq!(file.count(), 9);
+        assert_eq!(app.count(), 9);
+        assert_eq!(export.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gate_closed_constructor_and_approval_accessor() -> TestResult {
+        assert!(!SecurityExportGate::closed().is_open());
+        assert!(SecurityExportGate::closed().approval().is_none());
+        let approval = ExportApproval::try_granted("warden.", "bob")
+            .map_err(crate::test_support::ctx("approval"))?;
+        let gate = SecurityExportGate::open(approval);
+        assert!(gate.is_open());
+        let namespace = gate
+            .approval()
+            .map(ExportApproval::namespace)
+            .ok_or_else(crate::test_support::missing("approval"))?;
+        assert_eq!(namespace, "warden.");
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_meta_nonzero_reaches_every_default_target_not_exports() -> TestResult {
+        let file = sink();
+        let app = sink();
+        let export = sink();
+        let mut routing = RoutingSink::new(as_dyn(&file));
+        routing.route("app.", as_dyn(&app));
+        let approval = ExportApproval::try_granted("security.", "alice")
+            .map_err(crate::test_support::ctx("approval"))?;
+        assert!(SecurityExportGate::open(approval).release(&mut routing, as_dyn(&export)));
+
+        assert!(routing.record_meta(&key("unbound_verdict_total"), MetricValue::Count(5), &[]));
+        for target in [&file, &app] {
+            let seen = target.records.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(seen.len(), 1);
+            assert!(matches!(
+                seen.first().map(|(_, value)| *value),
+                Some(MetricValue::Count(5))
+            ));
+        }
+        assert_eq!(export.count(), 0);
+        assert!(!routing.record_meta(&key("security.x_total"), MetricValue::Count(1), &[]));
+        assert_eq!(file.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_plain_record_of_meta_name_reaches_only_one_target() {
+        // Documents the limit that `record_meta` exists for.
+        let file = sink();
+        let app = sink();
+        let mut routing = RoutingSink::new(as_dyn(&file));
+        routing.route("app.", as_dyn(&app));
+        routing.record(&key("unbound_verdict_total"), MetricValue::Count(1), &[]);
+        assert_eq!(file.count() + app.count(), 1);
+    }
+
+    #[test]
+    fn test_export_sink_identical_to_default_is_not_double_counted() -> TestResult {
+        let file = sink();
+        let mut routing = RoutingSink::new(as_dyn(&file));
+        // Closed gate: nothing registered, protected metric stays single.
+        assert!(!SecurityExportGate::closed().release(&mut routing, as_dyn(&file)));
+        routing.record(&key("security.finding_total"), MetricValue::Count(1), &[]);
+        assert_eq!(file.count(), 1);
+        // Open gate with the very same Arc: still exactly one delivery.
+        let approval = ExportApproval::try_granted("security.", "alice")
+            .map_err(crate::test_support::ctx("approval"))?;
+        assert!(SecurityExportGate::open(approval).release(&mut routing, as_dyn(&file)));
+        routing.record(&key("security.finding_total"), MetricValue::Count(1), &[]);
+        assert_eq!(file.count(), 2);
+        // Meta fan-out with the same Arc as default and as route: once.
+        routing.route("app.", as_dyn(&file));
+        assert!(routing.broadcast_meta(&key("meta_total"), MetricValue::Count(0), &[]));
+        assert_eq!(file.count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_emit_zero_registry_keeps_partition_labels_for_route_sink() -> TestResult {
+        let registry = crate::zero_registry::dod_zero_registry()
+            .map_err(crate::test_support::ctx("dod registry"))?;
+        let labels_seen: Arc<Mutex<Vec<Vec<(FieldName, FieldValue)>>>> = Arc::default();
+
+        #[derive(Debug)]
+        struct LabelSink(Arc<Mutex<Vec<Vec<(FieldName, FieldValue)>>>>);
+        impl TelemetrySink for LabelSink {
+            fn record(&self, key: &MetricKey, _v: MetricValue, labels: &[(FieldName, FieldValue)]) {
+                if key.name == "breaker_trips_total" {
+                    self.0
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(labels.to_vec());
+                }
+            }
+            fn flush(&self) {}
+            fn name(&self) -> &'static str {
+                "label"
+            }
+        }
+
+        let file = sink();
+        let mut routing = RoutingSink::new(as_dyn(&file));
+        // Route bound to a protected prefix must be skipped, "app." must serve.
+        routing.route(
+            "security.",
+            Arc::new(LabelSink(Arc::new(Mutex::new(Vec::new())))),
+        );
+        routing.route("app.", Arc::new(LabelSink(Arc::clone(&labels_seen))));
+        assert_eq!(routing.emit_zero_registry(&registry), 9);
+        let seen = labels_seen.lock().unwrap_or_else(|p| p.into_inner());
+        let values: Vec<&FieldValue> = seen
+            .iter()
+            .filter_map(|labels| labels.first().map(|(_, value)| value))
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                &FieldValue::Str("uid"),
+                &FieldValue::Str("cgroup"),
+                &FieldValue::Str("sensor"),
+            ]
+        );
+        assert!(seen.iter().all(|labels| labels.len() == 1));
+        Ok(())
     }
 }

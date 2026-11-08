@@ -18,6 +18,17 @@
 //! A scope without a readable pid is `container_unverifiable`, never
 //! "fine".
 //!
+//! # Availability (PL-100 WP1.8)
+//! What a missing scope directory (`cgroup_root`) means is the caller's
+//! choice ([`MissingRoot`]): `SensorError::SourceUnavailable` (permanent:
+//! the sentinel reports the sensor as degraded) for a directory that must
+//! exist, or an empty reading for one the runtime creates on demand
+//! (systemd creates `machine.slice` only with the first machine or
+//! container scope). An existing directory without any container scope is
+//! always an empty reading, not an error: a host with a runtime but no
+//! running container is not blind, and a permanent error there would
+//! retire the sensor before the first container starts.
+//!
 //! # Not covered
 //! Whether the container shares the host network namespace needs
 //! `readlink` on `/proc/<pid>/ns/net`, which the read seam does not offer;
@@ -35,7 +46,8 @@
 mod sensor;
 
 pub use sensor::{
-    ContainerSensor, ContainerSensorConfig, MAX_CARDINALITY, MAX_SCOPES, PRIVILEGED_CAP_BITS,
+    ContainerSensor, ContainerSensorConfig, MAX_CARDINALITY, MAX_SCOPES, MissingRoot,
+    PRIVILEGED_CAP_BITS,
 };
 
 #[cfg(test)]

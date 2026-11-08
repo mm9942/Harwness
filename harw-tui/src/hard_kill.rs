@@ -10,9 +10,11 @@
 //!    werden abgebrochen. Den laufenden Turn (samt Token-Baum seiner
 //!    synchronen Kind-Agenten) hat schon der erste Druck in der
 //!    Event-Schleife kooperativ abgebrochen.
-//! 2. **Jobs über den Job-Pfad**: jeder laufende verwaltete Job — auch der
+//! 2. **Jobs über den Job-Pfad**: jeder laufende oder angehaltene
+//!    (`job.suspend`, eingefroren) verwaltete Job — auch der
 //!    Prozess eines job-gebundenen Kind-Agenten — wird mit
-//!    `JobManager::stop(…, JobSignal::Kill)` beendet. Der Job-Pfad kennt
+//!    `JobManager::stop(…, JobSignal::Kill)` beendet; ein angehaltener Job
+//!    endet dabei eingefroren, ohne aufgetaut zu werden. Der Job-Pfad kennt
 //!    Prozessgruppe, pidfd-Identität und cgroup des Jobs (E1-Identitäten);
 //!    der rohe Prozessbaum wird für Jobs **nie** betreten.
 //!    Nach dem ersten Durchgang wird erneut gelistet: ein Job, der während
@@ -39,7 +41,12 @@
 //! # Nur bei laufender Arbeit
 //! Läuft weder ein Turn noch ein verwalteter Job, ist 2× Ctrl+C das normale
 //! Beenden der Event-Schleife (Exit-Code 0, Jobs-Ablösevertrag von
-//! `jobs_glue`) — der Detektor löst dann nicht aus. Maßgeblich ist der Stand
+//! `jobs_glue`) — der Detektor löst dann nicht aus. Ein angehaltener Job
+//! (`job.suspend`, PL-100 WP 3.5) zählt dabei **nicht** als laufende Arbeit:
+//! er ist eingefroren und tut nichts. Ist er die einzige Arbeit, bleibt es
+//! beim normalen Beenden — er wird abgelöst und bleibt eingefroren (der
+//! nächste Start meldet ihn). Löst der Not-Aus wegen anderer Arbeit aus,
+//! stoppt Stufe 2 ihn trotzdem mit (siehe `stops`). Maßgeblich ist der Stand
 //! beim **ersten** Druck oder beim zweiten: der erste Druck bricht den Turn
 //! kooperativ ab, der zweite muss dessen Reste trotzdem erreichen. Den
 //! Turn-Zustand meldet die Fußzeile ([`publish_work_running`]) — dieselbe
@@ -404,14 +411,15 @@ impl HardKill {
     }
 
     /// Ob gerade KI-Arbeit läuft: ein Turn (Fußzeile bzw. Test-Schalter) oder
-    /// ein laufender verwalteter Job.
+    /// ein laufender verwalteter Job (siehe `counts_as_work`; ein nur
+    /// angehaltener Job löst den Not-Aus nicht aus).
     fn work_running(&self, jobs: Option<&Arc<JobManager>>) -> bool {
         let turn = match &self.inner.work {
             WorkSource::Footer => WORK_RUNNING.load(Ordering::SeqCst),
             #[cfg(test)]
             WorkSource::Flag(flag) => flag.load(Ordering::SeqCst),
         };
-        turn || jobs.is_some_and(|jobs| !running_job_ids(jobs).is_empty())
+        turn || jobs.is_some_and(|jobs| jobs_working(jobs))
     }
 
     /// Zweiter Druck: löst den Not-Aus aus, wenn beim ersten oder jetzt
@@ -603,13 +611,35 @@ impl HardKill {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Ob der Not-Aus einen Job in diesem Zustand stoppt: nur die von dieser
-/// Sitzung beaufsichtigten laufenden (`Running`). Abgelöste Jobs früherer
-/// Sitzungen sind keine Arbeit dieses Laufs. `Queued` kommt in
-/// `JobManager::list` nicht vor (ein Eintrag entsteht erst als `Running` oder
-/// `Failed`); ein Start, der beim Listen noch läuft, fängt der nächste
-/// Durchgang ab.
+/// Sitzung beaufsichtigten lebenden (`Running`, `Suspended`). Ein
+/// angehaltener Job (PL-100 WP 3.5, eingefrorene Job-cgroup) gehört weiter
+/// zu diesem Lauf: löst der Not-Aus (wegen anderer Arbeit, siehe
+/// `counts_as_work`) aus, beendet `JobManager::stop` ihn eingefroren mit
+/// SIGKILL, ohne ihn aufzutauen. Abgelöste Jobs früherer Sitzungen sind
+/// keine Arbeit dieses Laufs (auch nicht, wenn sie noch eingefroren sind).
+/// `Queued` kommt in `JobManager::list` nicht vor (ein Eintrag entsteht erst
+/// als `Running` oder `Failed`); ein Start, der beim Listen noch läuft, fängt
+/// der nächste Durchgang ab.
 fn stops(state: JobState) -> bool {
+    matches!(state, JobState::Running | JobState::Suspended)
+}
+
+/// Ob ein Job in diesem Zustand als laufende KI-Arbeit zählt und damit den
+/// Not-Aus auslöst („Nur bei laufender Arbeit“): nur `Running`. Ein
+/// angehaltener Job (`Suspended`) ist eingefroren und tut nichts; allein
+/// macht er aus 2× Ctrl+C kein Not-Aus (sonst endete er per SIGKILL statt
+/// abgelöst und eingefroren zu bleiben). Jeder Zustand, der zählt, wird auch
+/// gestoppt (`stops`).
+fn counts_as_work(state: JobState) -> bool {
     state == JobState::Running
+}
+
+/// Ob `jobs` einen verwalteten Job hat, der als laufende Arbeit zählt
+/// (`counts_as_work`).
+fn jobs_working(jobs: &JobManager) -> bool {
+    jobs.list(Caller::Operator)
+        .into_iter()
+        .any(|status| counts_as_work(status.meta.state))
 }
 
 /// Die laufenden Jobs von `jobs`, die der Not-Aus stoppt.
@@ -779,3 +809,84 @@ fn restore_terminal() {
 
 #[cfg(test)]
 mod tests;
+
+// PL-100 WP 3.5: Zustandsauswahl des Job-Pfads für angehaltene Jobs (die
+// übrigen Fälle prüft `tests`).
+#[cfg(test)]
+mod suspended_stop_tests {
+    use super::*;
+    use crate::test_support::TestResult;
+
+    /// Ein angehaltener Job dieser Sitzung gehört weiter zu diesem Lauf:
+    /// löst der Not-Aus aus, stoppt er ihn wie einen laufenden; abgelöste und
+    /// beendete Jobs bleiben unberührt.
+    #[test]
+    fn suspended_jobs_of_this_session_are_stopped() -> TestResult {
+        assert!(stops(JobState::Suspended));
+        assert!(stops(JobState::Running));
+        for state in [
+            JobState::Queued,
+            JobState::Detached,
+            JobState::Succeeded,
+            JobState::Failed,
+            JobState::Stopped,
+            JobState::Unknown,
+        ] {
+            assert!(!stops(state), "{state:?} gehört nicht zu diesem Lauf");
+        }
+        Ok(())
+    }
+
+    /// Nur ein laufender Job ist Arbeit, die den Not-Aus auslöst: eine
+    /// Sitzung, deren einziger Job angehalten ist, beendet mit 2× Ctrl+C
+    /// normal (der Job wird abgelöst und bleibt eingefroren). Was als Arbeit
+    /// zählt, stoppt der Not-Aus auch.
+    #[test]
+    fn a_suspended_job_alone_is_no_work_that_trips() -> TestResult {
+        assert!(counts_as_work(JobState::Running));
+        assert!(!counts_as_work(JobState::Suspended));
+        for state in [
+            JobState::Queued,
+            JobState::Running,
+            JobState::Suspended,
+            JobState::Detached,
+            JobState::Succeeded,
+            JobState::Failed,
+            JobState::Stopped,
+            JobState::Unknown,
+        ] {
+            assert!(
+                !counts_as_work(state) || stops(state),
+                "{state:?} zählt als Arbeit, wird aber nicht gestoppt"
+            );
+            if state != JobState::Running {
+                assert!(
+                    !counts_as_work(state),
+                    "{state:?} ist keine laufende Arbeit"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Ohne Turn und mit einer gebundenen Job-Verwaltung ohne laufenden Job
+    /// bleibt 2× Ctrl+C das normale Beenden (Job-Teil von `work_running`
+    /// über `jobs_working`).
+    #[test]
+    fn idle_jobs_never_trip() -> TestResult {
+        use crate::test_support::ctx;
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let manager = JobManager::new(
+            harw_tool_job::JobManagerConfig::new(dir.path().join("state")),
+            Arc::new(harw_tool_job::NoopNotifier),
+        )
+        .map_err(ctx("manager"))?;
+        assert!(!jobs_working(&manager));
+        let hard_kill = HardKill::inert();
+        hard_kill.set_work_running_for_test(false);
+        hard_kill.bind_runtime(None, SessionId::new(), Some(Arc::clone(&manager)));
+        assert!(!hard_kill.trip_if_working());
+        assert!(!hard_kill.is_tripped());
+        Ok(())
+    }
+}

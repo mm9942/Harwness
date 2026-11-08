@@ -11,13 +11,35 @@
 //! `scope` (the cgroup path of the observed actor). Unknown fields are
 //! ignored so later additive versions keep parsing.
 //!
+//! v3 (PL-100 WP0.12, `schema_version` `3`) is a strict superset of v2. Every
+//! new field is optional for this reader, so v1 and v2 lines keep parsing:
+//! `instance` (UUIDv4 of the sentinel process, new per start) and `seq`
+//! (monotonic per instance, from 1) position a line for a
+//! [`FindingsCursor`](crate::cursor::FindingsCursor); `record_digest`
+//! (64 lowercase hex chars, the BLAKE3 digest of the `FindingRecord`),
+//! `dedup_key` (32 lowercase hex chars), `occurrences` (≥ 1), `first_seen`
+//! (RFC 3339), `kind` ([`FindingKind`]), `hardness` ([`FindingHardness`]),
+//! `cgroup_kid` (kernel cgroup id), `scope_obfuscated` (the scope was
+//! withheld because it could not be rendered safely) and `evidence_card`
+//! ([`EvidenceCard`], at most 4 KiB). From v3 on `finding_id` must be the
+//! canonical lowercase UUIDv4 the sentinel mints (`FindingId::new`); v1/v2
+//! lines keep the older, looser id rule.
+//!
+//! Lines with a `schema_version` above [`EXPORT_SCHEMA_VERSION`] come from a
+//! newer writer: an enum value or an `evidence_card` key this reader does not
+//! know is then ignored instead of rejecting the line or the card.
+//!
 //! # Untrusted input
 //! The export is written by the unprivileged sentinel from
 //! attacker-influenced observations. The reader is bounded (tail of at most
 //! [`MAX_TAIL_BYTES`], lines longer than [`MAX_LINE_BYTES`] skipped), refuses
 //! symlinks, skips malformed lines instead of failing, sanitizes the free
-//! text and rejects identifiers that violate the contract. A finding is
-//! evidence, never an instruction.
+//! text and rejects identifiers that violate the contract. Identifiers the
+//! sentinel generates itself (`finding_id`, `instance`, `seq`,
+//! `record_digest`, `dedup_key`) reject the line when malformed; values that
+//! come from observations (`scope`, the `evidence_card` strings) are dropped
+//! or escaped instead, so a hostile observation can never hide a finding. A
+//! finding is evidence, never an instruction.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -32,6 +54,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::error::DodClientError;
+use crate::evidence::EvidenceCard;
 use crate::fsio::{OpenedFile, is_clean, is_unsafe_char, open_regular_nofollow, sanitize};
 
 /// Hard ceiling of the findings tail read, in bytes (256 KiB).
@@ -64,9 +87,193 @@ pub const DEFAULT_FINDINGS_WINDOW: Duration = Duration::from_secs(24 * 3600);
 pub const MAX_SUMMARY_RULES: usize = 32;
 
 /// Highest export line schema version this reader knows.
-pub const EXPORT_SCHEMA_VERSION: u32 = 2;
+///
+/// Versions `1..=3` are parsed with every check of this module; a higher
+/// version is still accepted, but unknown enum values and unknown
+/// `evidence_card` keys are then ignored (see the module documentation).
+pub const EXPORT_SCHEMA_VERSION: u32 = 3;
 
-/// One validated export line (v1 or v2).
+/// Length of a v3 `dedup_key`: lowercase hex of the first 16 bytes of a
+/// BLAKE3 digest.
+pub const DEDUP_KEY_HEX_LEN: usize = 32;
+
+/// Length of a v3 `record_digest`: lowercase hex of a 32-byte BLAKE3 digest.
+pub const RECORD_DIGEST_HEX_LEN: usize = 64;
+
+/// v3 `kind`: why the finding exists.
+///
+/// Mirrors `harw_dod_rules::FindingKind`; the export spells it in
+/// snake_case (`"rule_triggered"`, `"anomaly"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    /// A rule fired (may be escalated).
+    RuleTriggered,
+    /// A deviation from a baseline that is not established yet (notice only).
+    Anomaly,
+}
+
+impl FindingKind {
+    /// Parses the export spelling; `None` for anything else.
+    ///
+    /// # Examples
+    /// ```
+    /// use harw_dod_client::findings::FindingKind;
+    ///
+    /// assert_eq!(FindingKind::from_wire("anomaly"), Some(FindingKind::Anomaly));
+    /// assert_eq!(FindingKind::from_wire("Anomaly"), None);
+    /// ```
+    #[must_use]
+    pub fn from_wire(text: &str) -> Option<Self> {
+        match text {
+            "rule_triggered" => Some(Self::RuleTriggered),
+            "anomaly" => Some(Self::Anomaly),
+            _ => None,
+        }
+    }
+
+    /// The export spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RuleTriggered => "rule_triggered",
+            Self::Anomaly => "anomaly",
+        }
+    }
+}
+
+/// v3 `hardness`: how directly the finding is backed by observations.
+///
+/// Ordered like `harw_dod_signals::Hardness`: `Observed < Correlated <
+/// Inferred` (the larger, the more indirect the evidence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingHardness {
+    /// Observed directly, without linking or inference.
+    Observed,
+    /// Linked from several observations.
+    Correlated,
+    /// Concluded beyond the observations.
+    Inferred,
+}
+
+impl FindingHardness {
+    /// Parses the export spelling; `None` for anything else.
+    ///
+    /// # Examples
+    /// ```
+    /// use harw_dod_client::findings::FindingHardness;
+    ///
+    /// assert_eq!(FindingHardness::from_wire("observed"), Some(FindingHardness::Observed));
+    /// assert!(FindingHardness::Observed < FindingHardness::Inferred);
+    /// ```
+    #[must_use]
+    pub fn from_wire(text: &str) -> Option<Self> {
+        match text {
+            "observed" => Some(Self::Observed),
+            "correlated" => Some(Self::Correlated),
+            "inferred" => Some(Self::Inferred),
+            _ => None,
+        }
+    }
+
+    /// The export spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Correlated => "correlated",
+            Self::Inferred => "inferred",
+        }
+    }
+}
+
+/// `true` when `value` is a canonical UUIDv4 as `uuid::Uuid::new_v4()`
+/// renders it (and therefore as `harw_types::FindingId::new` mints it):
+/// 36 characters, lowercase hex, hyphens at 8/13/18/23, version nibble `4`,
+/// RFC 4122 variant (`8`, `9`, `a` or `b`).
+///
+/// Uppercase, braced, URN and simple (hyphenless) spellings are refused, and
+/// so is the nil UUID (its version nibble is `0`).
+///
+/// # Examples
+/// ```
+/// use harw_dod_client::findings::is_uuid_v4;
+///
+/// assert!(is_uuid_v4("3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b"));
+/// assert!(!is_uuid_v4("3F2B8C1E-9D4A-4B7E-8A6F-1C2D3E4F5A6B"));
+/// assert!(!is_uuid_v4("00000000-0000-0000-0000-000000000000"));
+/// assert!(!is_uuid_v4("f-1"));
+/// ```
+#[must_use]
+pub fn is_uuid_v4(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            14 => *byte == b'4',
+            19 => matches!(byte, b'8' | b'9' | b'a' | b'b'),
+            _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+        })
+}
+
+/// `true` when `value` is a finding id that some accepted export line may
+/// carry: the v1/v2 rule of the line parser — not blank, at most
+/// [`MAX_ID_BYTES`] bytes, no control, bidi or invisible characters.
+///
+/// Every canonical UUIDv4 ([`is_uuid_v4`], the v3 rule) passes as well, so
+/// a reader that takes a finding id as input to compare against the export
+/// (the `id` filter of `dod.findings`) accepts exactly the ids the parser
+/// lets through, v1/v2 ids such as `f-1` included. Nothing is trimmed.
+///
+/// # Examples
+/// ```
+/// use harw_dod_client::findings::is_finding_id;
+///
+/// assert!(is_finding_id("f-1"));
+/// assert!(is_finding_id("3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b"));
+/// assert!(!is_finding_id("   "));
+/// assert!(!is_finding_id("f\u{7}1"));
+/// assert!(!is_finding_id(&"f".repeat(257)));
+/// ```
+#[must_use]
+pub fn is_finding_id(value: &str) -> bool {
+    is_clean(value, MAX_ID_BYTES)
+}
+
+/// `true` when `value` is exactly `len` lowercase hex characters.
+///
+/// The grammar of the v3 identifiers `record_digest`
+/// ([`RECORD_DIGEST_HEX_LEN`]) and `dedup_key` ([`DEDUP_KEY_HEX_LEN`]);
+/// readers that take such a value as input (the `dod.related` and
+/// `dod.labels` model tools) validate it with the same rule as the line
+/// parser.
+///
+/// # Examples
+/// ```
+/// use harw_dod_client::findings::{DEDUP_KEY_HEX_LEN, is_lower_hex};
+///
+/// assert!(is_lower_hex("0123456789abcdef0123456789abcdef", DEDUP_KEY_HEX_LEN));
+/// assert!(!is_lower_hex("0123456789ABCDEF0123456789ABCDEF", DEDUP_KEY_HEX_LEN));
+/// assert!(!is_lower_hex("0123456789abcdef", DEDUP_KEY_HEX_LEN));
+/// ```
+#[must_use]
+pub fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `skip_serializing_if` helper: `scope_obfuscated` is written only when set.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One validated export line (v1, v2 or v3).
+///
+/// Built by [`parse_finding_line`] / deserialization, which validate every
+/// field; the v3 fields are `None` / `false` on v1 and v2 lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawFindingLine")]
 pub struct FindingLine {
@@ -91,6 +298,54 @@ pub struct FindingLine {
     /// characters; otherwise the line is kept without `scope`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// v3: UUIDv4 of the sentinel process instance that wrote the line (new
+    /// per start). Validated with [`is_uuid_v4`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// v3: position of the line within [`instance`](Self::instance),
+    /// monotonic, starting at 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// v3: lowercase hex of the 32-byte BLAKE3 digest of the
+    /// `FindingRecord` ([`RECORD_DIGEST_HEX_LEN`] chars); `None` when the
+    /// sentinel produced no record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_digest: Option<String>,
+    /// v3: throttling key over rule, uid, cgroup id and coarse subject
+    /// ([`DEDUP_KEY_HEX_LEN`] lowercase hex chars). Lines with the same key
+    /// report repeats of one finding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
+    /// v3: how often the [`dedup_key`](Self::dedup_key) fired (≥ 1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrences: Option<u64>,
+    /// v3: when the [`dedup_key`](Self::dedup_key) was first seen.
+    #[serde(
+        serialize_with = "time::serde::rfc3339::option::serialize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub first_seen: Option<OffsetDateTime>,
+    /// v3: why the finding exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<FindingKind>,
+    /// v3: how directly the finding is backed by observations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardness: Option<FindingHardness>,
+    /// v3: kernel cgroup id of the observed actor. Kernel ids are reused;
+    /// pair it with [`scope`](Self::scope) and
+    /// [`first_seen`](Self::first_seen).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cgroup_kid: Option<u64>,
+    /// `true` when a scope existed but was withheld because it could not be
+    /// rendered safely: set by the v3 writer, and by this reader whenever it
+    /// drops a non-empty `scope` it does not accept (any version).
+    #[serde(skip_serializing_if = "is_false")]
+    pub scope_obfuscated: bool,
+    /// v3: bounded, escaped evidence summary; `None` when absent, larger than
+    /// [`MAX_EVIDENCE_CARD_BYTES`](crate::evidence::MAX_EVIDENCE_CARD_BYTES)
+    /// or malformed (the line itself is kept).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_card: Option<EvidenceCard>,
 }
 
 impl FindingLine {
@@ -98,6 +353,15 @@ impl FindingLine {
     #[must_use]
     pub fn is_high_or_critical(&self) -> bool {
         self.severity >= ImpactSeverity::High
+    }
+
+    /// `true` when [`finding_id`](Self::finding_id) is a canonical UUIDv4
+    /// ([`is_uuid_v4`]). Always `true` for v3 lines; v1/v2 lines may carry
+    /// older ids. Consumers that bind decisions to an id (dispatch, verdicts)
+    /// skip lines without one.
+    #[must_use]
+    pub fn has_uuid_v4_id(&self) -> bool {
+        is_uuid_v4(self.finding_id.as_str())
     }
 }
 
@@ -114,6 +378,28 @@ struct RawFindingLine {
     observed_at: String,
     #[serde(default)]
     scope: Option<String>,
+    #[serde(default)]
+    instance: Option<String>,
+    #[serde(default)]
+    seq: Option<u64>,
+    #[serde(default)]
+    record_digest: Option<String>,
+    #[serde(default)]
+    dedup_key: Option<String>,
+    #[serde(default)]
+    occurrences: Option<u64>,
+    #[serde(default)]
+    first_seen: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    hardness: Option<String>,
+    #[serde(default)]
+    cgroup_kid: Option<u64>,
+    #[serde(default)]
+    scope_obfuscated: bool,
+    #[serde(default)]
+    evidence_card: Option<serde_json::Value>,
 }
 
 /// Why a raw line was rejected.
@@ -135,7 +421,15 @@ impl TryFrom<RawFindingLine> for FindingLine {
         if raw.schema_version == Some(0) {
             return Err(InvalidFindingLine("schema_version 0"));
         }
-        if !is_clean(&raw.finding_id, MAX_ID_BYTES) {
+        // From v3 on the id is the UUIDv4 `FindingId::new` mints; v1/v2 lines
+        // keep the older rule (non-empty, clean, bounded).
+        let strict_ids = raw.schema_version.is_some_and(|version| version >= 3);
+        // Only a writer newer than this reader may use values it does not
+        // know yet; up to `EXPORT_SCHEMA_VERSION` they are contract violations.
+        let lenient = raw
+            .schema_version
+            .is_some_and(|version| version > EXPORT_SCHEMA_VERSION);
+        if !is_finding_id(&raw.finding_id) || (strict_ids && !is_uuid_v4(&raw.finding_id)) {
             return Err(InvalidFindingLine("finding_id"));
         }
         if !is_clean(&raw.host, MAX_ID_BYTES) {
@@ -155,13 +449,51 @@ impl TryFrom<RawFindingLine> for FindingLine {
         let finding_id = FindingId::try_from_str(raw.finding_id)
             .map_err(|_| InvalidFindingLine("finding_id"))?;
         let host = HostId::try_from_str(raw.host).map_err(|_| InvalidFindingLine("host"))?;
+        // v3 identifiers are generated by the sentinel itself: a malformed
+        // one means the line was not written by it, so the line is refused.
+        let instance = match raw.instance {
+            Some(instance) if !is_uuid_v4(&instance) => {
+                return Err(InvalidFindingLine("instance"));
+            }
+            instance => instance,
+        };
+        if raw.seq == Some(0) {
+            return Err(InvalidFindingLine("seq"));
+        }
+        let record_digest =
+            lower_hex_field(raw.record_digest, RECORD_DIGEST_HEX_LEN, "record_digest")?;
+        let dedup_key = lower_hex_field(raw.dedup_key, DEDUP_KEY_HEX_LEN, "dedup_key")?;
+        if raw.occurrences == Some(0) {
+            return Err(InvalidFindingLine("occurrences"));
+        }
+        let first_seen = raw
+            .first_seen
+            .map(|text| OffsetDateTime::parse(&text, &Rfc3339))
+            .transpose()
+            .map_err(|_| InvalidFindingLine("first_seen"))?;
+        let kind = enum_field(raw.kind.as_deref(), FindingKind::from_wire, lenient, "kind")?;
+        let hardness = enum_field(
+            raw.hardness.as_deref(),
+            FindingHardness::from_wire,
+            lenient,
+            "hardness",
+        )?;
         // Same acceptance rule as the sentinel writer: an unacceptable scope
         // is dropped, never rewritten (a rewritten path names another cgroup).
+        // Dropping a non-empty scope is recorded as `scope_obfuscated`, so the
+        // withheld attribution stays visible instead of silently vanishing.
+        let scope_given = raw.scope.as_deref().is_some_and(|scope| !scope.is_empty());
         let scope = raw.scope.filter(|scope| {
             scope.starts_with('/')
                 && scope.len() <= MAX_SCOPE_BYTES
                 && !scope.chars().any(is_unsafe_char)
         });
+        let scope_obfuscated = raw.scope_obfuscated || (scope_given && scope.is_none());
+        // Observation content: a card that is too large or malformed is
+        // dropped, the finding itself is kept.
+        let evidence_card = raw
+            .evidence_card
+            .and_then(|value| EvidenceCard::from_export_value(value, lenient));
         Ok(Self {
             schema_version: raw.schema_version,
             finding_id,
@@ -171,7 +503,50 @@ impl TryFrom<RawFindingLine> for FindingLine {
             summary: sanitize(&raw.summary, MAX_SUMMARY_BYTES, ' '),
             observed_at,
             scope,
+            instance,
+            seq: raw.seq,
+            record_digest,
+            dedup_key,
+            occurrences: raw.occurrences,
+            first_seen,
+            kind,
+            hardness,
+            cgroup_kid: raw.cgroup_kid,
+            scope_obfuscated,
+            evidence_card,
         })
+    }
+}
+
+/// An optional lowercase-hex identifier of exactly `len` chars; any other
+/// present value rejects the line, naming `field`.
+fn lower_hex_field(
+    value: Option<String>,
+    len: usize,
+    field: &'static str,
+) -> Result<Option<String>, InvalidFindingLine> {
+    match value {
+        Some(text) if !is_lower_hex(&text, len) => Err(InvalidFindingLine(field)),
+        value => Ok(value),
+    }
+}
+
+/// An optional enum spelled as in the export: unknown values reject the line
+/// (naming `field`) unless the line comes from a newer writer (`lenient`),
+/// where they are ignored.
+fn enum_field<T>(
+    value: Option<&str>,
+    parse: fn(&str) -> Option<T>,
+    lenient: bool,
+    field: &'static str,
+) -> Result<Option<T>, InvalidFindingLine> {
+    let Some(text) = value else {
+        return Ok(None);
+    };
+    match parse(text) {
+        Some(parsed) => Ok(Some(parsed)),
+        None if lenient => Ok(None),
+        None => Err(InvalidFindingLine(field)),
     }
 }
 
@@ -618,6 +993,7 @@ pub fn summarize(lines: &[FindingLine], window: Duration, now: OffsetDateTime) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
     use std::fs;
     use std::io::Write as _;
 
@@ -1193,6 +1569,355 @@ mod tests {
         assert_eq!(summary.by_rule.len(), MAX_SUMMARY_RULES);
         assert_eq!(summary.other_rules, 3);
         assert_eq!(summary.total(), u32::try_from(MAX_SUMMARY_RULES + 3)?);
+        Ok(())
+    }
+
+    // ── PL-100 WP0.12: export v3 ────────────────────────────────────────────
+
+    const FINDING: &str = "3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b";
+    const INSTANCE: &str = "a1b2c3d4-e5f6-4a7b-9c8d-0e1f2a3b4c5d";
+    const DEDUP: &str = "0123456789abcdef0123456789abcdef";
+    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// The v3-only keys (all optional for the reader).
+    const V3_KEYS: [&str; 11] = [
+        "instance",
+        "seq",
+        "record_digest",
+        "dedup_key",
+        "occurrences",
+        "first_seen",
+        "kind",
+        "hardness",
+        "cgroup_kid",
+        "scope_obfuscated",
+        "evidence_card",
+    ];
+
+    /// A complete v3 line, as the sentinel writes it.
+    fn v3_value() -> Value {
+        json!({
+            "schema_version": 3,
+            "finding_id": FINDING,
+            "host": "host-a",
+            "rule_id": "egress-flow",
+            "severity": "high",
+            "summary": "tcp connect",
+            "observed_at": "2026-10-02T11:00:00Z",
+            "scope": "/sys/fs/cgroup/harw.slice/harw-job-1.scope",
+            "instance": INSTANCE,
+            "seq": 7,
+            "record_digest": DIGEST,
+            "dedup_key": DEDUP,
+            "occurrences": 3,
+            "first_seen": "2026-10-02T10:00:00Z",
+            "kind": "rule_triggered",
+            "hardness": "observed",
+            "cgroup_kid": 4242,
+            "scope_obfuscated": false,
+            "evidence_card": {
+                "event_counts": {"tcp_connect": 3},
+                "uid": 1000,
+                "destination": "203.0.113.9:443",
+                "path": "/usr/bin/curl",
+                "process": {"pid": 4711, "comm": "curl"}
+            }
+        })
+    }
+
+    /// `value` with `key` set to `field`.
+    fn with(mut value: Value, key: &str, field: Value) -> Value {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(key.to_owned(), field);
+        }
+        value
+    }
+
+    /// `value` without `key`.
+    fn without(mut value: Value, key: &str) -> Value {
+        if let Some(object) = value.as_object_mut() {
+            object.remove(key);
+        }
+        value
+    }
+
+    #[test]
+    fn accepts_a_complete_v3_line_and_round_trips_it() -> TestResult {
+        let line = parse_finding_line(&v3_value().to_string()).ok_or("v3 line must parse")?;
+        assert_eq!(line.schema_version, Some(3));
+        assert!(line.has_uuid_v4_id());
+        assert_eq!(line.finding_id.as_str(), FINDING);
+        assert_eq!(line.instance.as_deref(), Some(INSTANCE));
+        assert_eq!(line.seq, Some(7));
+        assert_eq!(line.record_digest.as_deref(), Some(DIGEST));
+        assert_eq!(line.dedup_key.as_deref(), Some(DEDUP));
+        assert_eq!(line.occurrences, Some(3));
+        assert_eq!(line.first_seen, Some(at("2026-10-02T10:00:00Z")?));
+        assert_eq!(line.kind, Some(FindingKind::RuleTriggered));
+        assert_eq!(line.hardness, Some(FindingHardness::Observed));
+        assert_eq!(line.cgroup_kid, Some(4242));
+        assert!(!line.scope_obfuscated);
+        assert_eq!(
+            line.scope.as_deref(),
+            Some("/sys/fs/cgroup/harw.slice/harw-job-1.scope")
+        );
+        let card = line.evidence_card.as_ref().ok_or("card kept")?;
+        assert_eq!(card.event_counts.get("tcp_connect"), Some(&3));
+        assert_eq!(card.uid, Some(1000));
+        assert_eq!(card.process.as_ref().map(|p| p.pid), Some(4711));
+
+        // Round trip through the serialized form keeps the line identical.
+        let json = serde_json::to_string(&line)?;
+        let again: FindingLine = serde_json::from_str(&json)?;
+        assert_eq!(again, line);
+
+        // Every v3 field is optional: a v3 line with only the v1/v2 fields
+        // parses, and its v3 fields stay empty.
+        let minimal = V3_KEYS
+            .iter()
+            .fold(v3_value(), |value, key| without(value, key));
+        let parsed = parse_finding_line(&minimal.to_string()).ok_or("minimal v3 line")?;
+        assert_eq!(parsed.instance, None);
+        assert_eq!(parsed.seq, None);
+        assert_eq!(parsed.record_digest, None);
+        assert_eq!(parsed.kind, None);
+        assert_eq!(parsed.evidence_card, None);
+        assert!(!parsed.scope_obfuscated);
+        // The v2-shaped serialization of such a line carries no v3 keys.
+        let json = serde_json::to_string(&parsed)?;
+        for key in V3_KEYS {
+            assert!(!json.contains(&format!("\"{key}\"")), "{key} in {json}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schema_versions_one_to_three_parse_and_v3_requires_uuid_v4_ids() -> TestResult {
+        for version in [1_u32, 2, 3] {
+            let line = with(v3_value(), "schema_version", json!(version));
+            assert_eq!(
+                parse_finding_line(&line.to_string()).map(|l| l.schema_version),
+                Some(Some(version))
+            );
+        }
+        // v1/v2 keep the older id rule; such ids are not UUIDv4.
+        let legacy = with(
+            with(v3_value(), "schema_version", json!(2)),
+            "finding_id",
+            json!("f-1"),
+        );
+        let parsed = parse_finding_line(&legacy.to_string()).ok_or("legacy id on v2")?;
+        assert!(!parsed.has_uuid_v4_id());
+        let unversioned = with(
+            without(v3_value(), "schema_version"),
+            "finding_id",
+            json!("f-1"),
+        );
+        assert!(parse_finding_line(&unversioned.to_string()).is_some());
+
+        // From v3 on only the canonical UUIDv4 the sentinel mints.
+        let upper = FINDING.to_uppercase();
+        for bad in [
+            "f-1",
+            upper.as_str(),
+            "{3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b}",
+            "3f2b8c1e9d4a4b7e8a6f1c2d3e4f5a6b",
+            "00000000-0000-0000-0000-000000000000",
+            "3f2b8c1e-9d4a-1b7e-8a6f-1c2d3e4f5a6b",
+            "3f2b8c1e-9d4a-4b7e-7a6f-1c2d3e4f5a6b",
+            "3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6bb",
+        ] {
+            let line = with(v3_value(), "finding_id", json!(bad));
+            assert!(parse_finding_line(&line.to_string()).is_none(), "{bad}");
+            assert!(!is_uuid_v4(bad), "{bad}");
+        }
+        assert!(is_uuid_v4(FINDING));
+        Ok(())
+    }
+
+    /// PL-100 WP1.2: [`is_finding_id`] (the `id` filter of `dod.findings`)
+    /// accepts exactly the ids a v1/v2 line may carry, v3 UUIDv4 ids
+    /// included, and nothing the parser refuses.
+    #[test]
+    fn finding_id_rule_is_the_line_parser_rule() {
+        let longest = "f".repeat(MAX_ID_BYTES);
+        for id in ["f-1", "finding-42", FINDING, longest.as_str()] {
+            assert!(is_finding_id(id), "{id}");
+            let line = with(
+                with(v3_value(), "schema_version", json!(2)),
+                "finding_id",
+                json!(id),
+            );
+            assert!(parse_finding_line(&line.to_string()).is_some(), "{id}");
+        }
+        let overlong = "f".repeat(MAX_ID_BYTES.saturating_add(1));
+        for bad in [
+            "",
+            "   ",
+            "f\u{7}1",
+            "f\n1",
+            "f\u{202E}1",
+            "f\u{200B}1",
+            overlong.as_str(),
+        ] {
+            assert!(!is_finding_id(bad), "{bad:?}");
+            let line = with(
+                with(v3_value(), "schema_version", json!(2)),
+                "finding_id",
+                json!(bad),
+            );
+            assert!(parse_finding_line(&line.to_string()).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_v3_identifiers_reject_the_line() {
+        for (key, value) in [
+            ("instance", json!("not-a-uuid")),
+            ("instance", json!(INSTANCE.to_uppercase())),
+            ("seq", json!(0)),
+            ("seq", json!(-1)),
+            (
+                "record_digest",
+                json!("0".repeat(RECORD_DIGEST_HEX_LEN - 1)),
+            ),
+            ("record_digest", json!(DIGEST.to_uppercase())),
+            ("dedup_key", json!(DIGEST)),
+            ("dedup_key", json!("g".repeat(DEDUP_KEY_HEX_LEN))),
+            ("occurrences", json!(0)),
+            ("first_seen", json!("yesterday")),
+            ("kind", json!("rule-triggered")),
+            ("hardness", json!("certain")),
+            ("cgroup_kid", json!(-5)),
+            ("scope_obfuscated", json!("yes")),
+        ] {
+            let text = with(v3_value(), key, value).to_string();
+            assert!(parse_finding_line(&text).is_none(), "{key}: {text}");
+        }
+    }
+
+    #[test]
+    fn newer_writers_may_add_fields_and_enum_values() -> TestResult {
+        let future = [
+            ("schema_version", json!(4)),
+            ("kind", json!("verdict")),
+            ("hardness", json!("sensed")),
+            ("future_field", json!({"x": 1})),
+            ("evidence_card", json!({"uid": 5, "future": [1]})),
+        ]
+        .into_iter()
+        .fold(v3_value(), |value, (key, field)| with(value, key, field));
+        let line = parse_finding_line(&future.to_string()).ok_or("v4 line must parse")?;
+        assert_eq!(line.kind, None);
+        assert_eq!(line.hardness, None);
+        assert_eq!(line.evidence_card.and_then(|card| card.uid), Some(5));
+
+        // Up to v3 an unknown card key drops the card, never the line.
+        let strict = with(
+            v3_value(),
+            "evidence_card",
+            json!({"uid": 5, "future": [1]}),
+        );
+        let line = parse_finding_line(&strict.to_string()).ok_or("v3 line keeps parsing")?;
+        assert_eq!(line.evidence_card, None);
+        assert_eq!(line.seq, Some(7));
+
+        // Malformed identifiers stay fatal for newer writers as well.
+        let bad = with(
+            with(v3_value(), "schema_version", json!(4)),
+            "seq",
+            json!(0),
+        );
+        assert!(parse_finding_line(&bad.to_string()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_scope_is_marked_obfuscated_not_silently_dropped() -> TestResult {
+        let zero_width = with(
+            v3_value(),
+            "scope",
+            json!("/harw.slice/harw-job\u{200b}-1.scope"),
+        );
+        let line = parse_finding_line(&zero_width.to_string()).ok_or("line kept")?;
+        assert_eq!(line.scope, None);
+        assert!(line.scope_obfuscated);
+
+        // The writer's own flag is kept.
+        let withheld = with(
+            without(v3_value(), "scope"),
+            "scope_obfuscated",
+            json!(true),
+        );
+        let line = parse_finding_line(&withheld.to_string()).ok_or("line kept")?;
+        assert!(line.scope_obfuscated);
+        assert_eq!(line.scope, None);
+
+        // No scope or an empty scope is not an obfuscated one.
+        let empty = with(v3_value(), "scope", json!(""));
+        let line = parse_finding_line(&empty.to_string()).ok_or("line kept")?;
+        assert!(!line.scope_obfuscated);
+        assert_eq!(line.scope, None);
+        let absent = without(v3_value(), "scope");
+        let line = parse_finding_line(&absent.to_string()).ok_or("line kept")?;
+        assert!(!line.scope_obfuscated);
+
+        // The reader marks dropped scopes on v1/v2 lines too.
+        let v2 = with(
+            with(zero_width, "schema_version", json!(2)),
+            "finding_id",
+            json!("f-2"),
+        );
+        assert_eq!(
+            parse_finding_line(&v2.to_string()).map(|l| l.scope_obfuscated),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_card_is_escaped_and_an_oversized_card_is_dropped() -> TestResult {
+        let hostile = with(
+            v3_value(),
+            "evidence_card",
+            json!({
+                "path": "/tmp/\u{202e}fdp.exe",
+                "process": {"pid": 1, "comm": "\u{1b}]0;pwned\u{7}"}
+            }),
+        );
+        let line = parse_finding_line(&hostile.to_string()).ok_or("line kept")?;
+        let card = line.evidence_card.ok_or("card kept")?;
+        assert_eq!(card.path.as_deref(), Some("/tmp/\\u{202e}fdp.exe"));
+        assert!(
+            card.process
+                .is_some_and(|process| harw_untrusted_text::is_clean(&process.comm))
+        );
+
+        let big = with(
+            v3_value(),
+            "evidence_card",
+            json!({"path": "p".repeat(crate::evidence::MAX_EVIDENCE_CARD_BYTES)}),
+        );
+        let line = parse_finding_line(&big.to_string()).ok_or("line kept")?;
+        assert_eq!(line.evidence_card, None);
+        assert_eq!(line.dedup_key.as_deref(), Some(DEDUP));
+        Ok(())
+    }
+
+    #[test]
+    fn future_dated_v3_lines_are_dropped_by_the_line_parser() -> TestResult {
+        let now = at("2026-10-02T12:00:00Z")?;
+        let future = with(v3_value(), "observed_at", json!("2026-10-02T12:30:00Z"));
+        let mut bytes = v3_value().to_string().into_bytes();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(future.to_string().as_bytes());
+        bytes.push(b'\n');
+        let lines = parse_lines(&bytes, now);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines.first().map(|l| l.observed_at),
+            Some(at("2026-10-02T11:00:00Z")?)
+        );
         Ok(())
     }
 }

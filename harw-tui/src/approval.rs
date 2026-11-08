@@ -10,7 +10,8 @@
 //! Store bei jedem Aufruf.
 //!
 //! # Schlüsseltypen
-//! - [`ApprovalPrompt`] — die Frage, die beim Renderer ankommt.
+//! - [`ApprovalPrompt`] — die Frage, die beim Renderer ankommt, samt dem
+//!   vom Kern zugeschriebenen Grund (PL-100 O1: DoD-Taint).
 //! - [`ApprovalPromptReceiver`] — die Empfängerseite, die der Renderer pollt.
 //! - [`TuiApprovalHandler`] — [`ApprovalHandler`]-Implementierung, die Fragen
 //!   ausgibt und Antworten entgegennimmt.
@@ -103,6 +104,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use harw_core::dod_taint::pending_ask_reason;
 use harw_core::{
     AgentSession, ApprovalResolution, CoreError, LiveEmitter, ManagedAgentSpawner, ModelProvider,
     PendingApproval, StateStore, ToolCallResult, TurnInput, TurnOutcome, resume_after_approval,
@@ -178,6 +180,11 @@ pub type ApprovalPromptReceiver = mpsc::UnboundedReceiver<ApprovalPrompt>;
 /// (siehe [`TuiApprovalHandler::await_resolution`]). Das ist der Normalfall,
 /// wenn die TUI beendet wird, während eine Frage offen ist.
 ///
+/// Optional trägt die Frage einen **Grund**, den der Kern der Pause
+/// zuschreibt — heute nur den DoD-Taint (PL-100 O1:
+/// [`harw_core::dod_taint::pending_ask_reason`]). Der Renderer zeigt ihn im
+/// Freigabedialog an ([`ApprovalPrompt::reason`]).
+///
 /// # Concurrency
 /// `Send`; nicht `Sync` (der `oneshot::Sender` ist an einen Besitzer gebunden).
 /// Der Wert wandert vom Turn-Future über einen `mpsc`-Kanal zum Renderer.
@@ -188,6 +195,10 @@ pub struct ApprovalPrompt {
     request: ItemId,
     /// Der exakte, vom Kern festgehaltene Werkzeugaufruf.
     call: ToolCall,
+    /// Vom Kern zugeschriebener Grund der Rückfrage (bereits escapt), etwa
+    /// „nach DoD-Abfrage in diesem Turn"; `None`, wenn der Kern keinen
+    /// eigenen Grund kennt.
+    reason: Option<String>,
     /// Rückkanal für genau eine Entscheidung.
     responder: oneshot::Sender<ApprovalResolution>,
 }
@@ -231,6 +242,32 @@ impl ApprovalPrompt {
     #[must_use]
     pub fn tool_name(&self) -> &str {
         self.call.name.as_str()
+    }
+
+    /// Gibt den vom Kern zugeschriebenen Grund der Rückfrage zurück.
+    ///
+    /// # Description
+    /// Heute nur der DoD-Taint (PL-100 Entscheidung O1): hat ein `dod.*`-
+    /// Werkzeug im selben Turn Sensordaten in den Kontext gebracht und
+    /// fragt deshalb ein Eingriffswerkzeug nach, steht hier der Text aus
+    /// [`harw_core::dod_taint::ask_reason`]. Der Werkzeugname darin ist
+    /// bereits einzeilig escapt; der Renderer zeigt den Text unverändert an.
+    ///
+    /// # Returns
+    /// `Some(&str)` mit dem Grund, `None`, wenn die Rückfrage keinen
+    /// kernseitigen Grund hat (z. B. eine gewöhnliche `fs.write`-Frage).
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// # fn demo(prompt: &harw_tui::approval::ApprovalPrompt) {
+    /// if let Some(reason) = prompt.reason() {
+    ///     assert!(!reason.is_empty());
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 
     /// Rendert die Argumente des Aufrufs als kompaktes JSON.
@@ -326,6 +363,7 @@ impl fmt::Debug for ApprovalPrompt {
             .field("call_id", &self.call.id.as_str())
             .field("tool_name", &self.call.name.as_str())
             .field("argument_bytes", &self.call.arguments.to_string().len())
+            .field("has_reason", &self.reason.is_some())
             .finish()
     }
 }
@@ -570,7 +608,60 @@ impl TuiApprovalHandler {
     ///
     /// # Concurrency
     /// Nimmt kurz den internen Lock und sendet danach ohne Lock.
+    ///
+    /// Die Frage trägt keinen Grund ([`ApprovalPrompt::reason`] ist `None`);
+    /// mit Grund siehe [`Self::open_prompt_with_reason`].
     pub fn open_prompt(&self, request: &ItemId, call: &ToolCall) -> bool {
+        self.open_prompt_with_reason(request, call, None)
+    }
+
+    /// Wie [`Self::open_prompt`], aber mit einem vom Kern zugeschriebenen
+    /// Grund der Rückfrage.
+    ///
+    /// # Description
+    /// [`ApprovalDriver::drive_to_completion`] liest den Grund aus dem
+    /// Pausenzustand ([`harw_core::dod_taint::pending_ask_reason`]) und gibt
+    /// ihn hier mit, damit der Freigabedialog zeigt, **warum** gefragt wird
+    /// (PL-100 O1: „nach DoD-Abfrage in diesem Turn"). Für Freigabe oder
+    /// Ablehnung spielt der Grund keine Rolle; es gilt dieselbe Regel wie
+    /// bei [`Self::open_prompt`]: `false` ist eine Ablehnung.
+    ///
+    /// # Arguments
+    /// - `request` (`&ItemId`): Korrelations-ID aus [`PendingApproval::request`].
+    /// - `call` (`&ToolCall`): der vom Kern festgehaltene Aufruf.
+    /// - `reason` (`Option<String>`): bereits escapter Grund oder `None`.
+    ///
+    /// # Returns
+    /// `true`, wenn die Frage den Renderer erreicht hat. **`false` bedeutet
+    /// Ablehnung.**
+    ///
+    /// # Concurrency
+    /// Nimmt kurz den internen Lock und sendet danach ohne Lock.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_tui::approval::{ApprovalScope, TuiApprovalHandler};
+    /// use harw_extension_api::{ToolCall, ToolName};
+    /// use harw_types::{ItemId, ToolCallId};
+    ///
+    /// let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
+    /// let call = ToolCall {
+    ///     id: ToolCallId::new(),
+    ///     name: ToolName::new("job.stop"),
+    ///     arguments: Default::default(),
+    /// };
+    /// let reason = Some("nach DoD-Abfrage in diesem Turn".to_owned());
+    /// assert!(handler.open_prompt_with_reason(&ItemId::new(), &call, reason));
+    /// let delivered = prompts.try_recv().ok();
+    /// let shown = delivered.as_ref().and_then(|prompt| prompt.reason());
+    /// assert_eq!(shown, Some("nach DoD-Abfrage in diesem Turn"));
+    /// ```
+    pub fn open_prompt_with_reason(
+        &self,
+        request: &ItemId,
+        call: &ToolCall,
+        reason: Option<String>,
+    ) -> bool {
         let (responder, receiver) = oneshot::channel();
         {
             let Ok(mut pending) = self.pending.lock() else {
@@ -580,9 +671,11 @@ impl TuiApprovalHandler {
             pending.insert(request.as_str().to_owned(), receiver);
         }
 
+        let has_reason = reason.is_some();
         let prompt = ApprovalPrompt {
             request: request.clone(),
             call: call.clone(),
+            reason,
             responder,
         };
         if self.prompt_tx.send(prompt).is_err() {
@@ -604,6 +697,7 @@ impl TuiApprovalHandler {
             call_id = %call.id,
             tool = %call.name,
             argument_bytes = call.arguments.to_string().len(),
+            has_reason,
             "tui.approval.prompt_issued"
         );
         true
@@ -1230,7 +1324,12 @@ impl ApprovalDriver {
                         "tui.resume.approval_pause"
                     );
 
-                    let resolution = self.resolve(&pending).await;
+                    // PL-100 O1: hat der DoD-Taint die Rückfrage verursacht,
+                    // zeigt der Dialog den Grund („nach DoD-Abfrage in
+                    // diesem Turn"). Gelesen wird aus dem Pausenzustand,
+                    // solange der Steuerblock des Turns noch hinterlegt ist.
+                    let reason = pending_ask_reason(session);
+                    let resolution = self.resolve(&pending, reason).await;
                     let actor = pending.actor.clone();
                     outcome = resume_after_approval(session, model, store, actor, resolution)
                         .await
@@ -1316,7 +1415,18 @@ impl ApprovalDriver {
     /// anderen [`ApprovalHandler`] stammt (z. B. `DefaultApprovalPolicy`).
     /// Gelingt das nicht, ist das Ergebnis eine Ablehnung — nie eine
     /// Freigabe.
-    async fn resolve(&self, pending: &PendingApproval) -> ApprovalResolution {
+    ///
+    /// `reason` ist der vom Kern zugeschriebene Grund der Rückfrage
+    /// ([`harw_core::dod_taint::pending_ask_reason`]); er reist mit der neu
+    /// gestellten Frage zum Renderer ([`ApprovalPrompt::reason`]). Ist zur
+    /// Anfrage-ID bereits eine Frage offen (Wiedereintritt nach einem
+    /// abgebrochenen Warten), trägt diese schon den Grund ihrer ersten
+    /// Stellung — die Pause und damit der Grund sind dieselben.
+    async fn resolve(
+        &self,
+        pending: &PendingApproval,
+        reason: Option<String>,
+    ) -> ApprovalResolution {
         if pending.is_timed_out(jiff::Timestamp::now()) {
             tracing::warn!(
                 request = %pending.request,
@@ -1326,7 +1436,9 @@ impl ApprovalDriver {
             return ApprovalResolution::timed_out();
         }
         if !self.handler.has_pending(&pending.request)
-            && !self.handler.open_prompt(&pending.request, &pending.call)
+            && !self
+                .handler
+                .open_prompt_with_reason(&pending.request, &pending.call, reason)
         {
             return reject(REASON_PROMPT_UNDELIVERABLE);
         }
@@ -1412,9 +1524,11 @@ mod tests {
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
+    use harw_core::policy::DodTaintPolicy;
     use harw_core::{
         InMemoryStateStore, ModelFuture, ModelRequest, ModelResponse, SpawnContext, run_turn,
     };
+    use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
     use harw_extension_api::{
         ExtensionRegistry, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName,
         ToolOutput, ToolProvider, ToolSpec,
@@ -1527,6 +1641,39 @@ mod tests {
         }
     }
 
+    /// Werkzeugnamen der DoD-Taint-Tests (PL-100 O1): eine DoD-Abfrage, die
+    /// den Turn taintet, und ein taint-pflichtiger Eingriff.
+    const TAINT_TOOLS: &[&str] = &["dod.findings", "job.stop"];
+
+    /// Bietet [`TAINT_TOOLS`] an; jede Ausführung wird gezählt.
+    struct TaintToolProvider {
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl ToolProvider for TaintToolProvider {
+        fn tools(&self) -> Vec<ToolSpec> {
+            TAINT_TOOLS
+                .iter()
+                .map(|name| {
+                    ToolSpec::Function(FunctionToolSpec {
+                        name: ToolName::new(*name),
+                        description: "test-only taint tool".to_owned(),
+                        parameters: JsonSchema::default(),
+                        strict: false,
+                    })
+                })
+                .collect()
+        }
+
+        fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+            TAINT_TOOLS.contains(&name.as_str()).then(|| {
+                Arc::new(CountingTool {
+                    executions: Arc::clone(&self.executions),
+                }) as Arc<dyn ToolExecutor>
+            })
+        }
+    }
+
     // ── Fixtures ─────────────────────────────────────────────────────────────
 
     /// Sandbox auf einem eindeutigen Temp-Verzeichnis (Muster aus `app.rs`).
@@ -1607,6 +1754,64 @@ mod tests {
             AgentSession::new(AgentRole::Assistant, None, registry, event_tx)
                 .with_spawn_context(test_spawn_context()?),
         )
+    }
+
+    /// Baut eine Session wie [`test_session`], aber mit [`TAINT_TOOLS`] und
+    /// der `DodTaintPolicy` im Modus `mode` hinter dem TUI-Handler — so wie
+    /// `ApprovalChain` sie in Produktion montiert (PL-100 O1).
+    fn taint_test_session(
+        handler: &Arc<TuiApprovalHandler>,
+        executions: &Arc<AtomicUsize>,
+        mode: ApprovalMode,
+    ) -> TestResult<AgentSession> {
+        // Methodensyntax statt `Arc::clone`, siehe `test_session`.
+        let registered: Arc<dyn ApprovalHandler> = handler.clone();
+        let taint: Arc<dyn ApprovalHandler> =
+            Arc::new(DodTaintPolicy::new().with_mode(ApprovalModeCell::new(mode)));
+        let registry: ExtensionRegistry = ExtensionRegistry::builder()
+            .tool_provider(Arc::new(TaintToolProvider {
+                executions: Arc::clone(executions),
+            }))
+            .approval_handler(registered)
+            .approval_handler(taint)
+            .build();
+        // Event-Empfänger wird fallengelassen, siehe `test_session`.
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        Ok(
+            AgentSession::new(AgentRole::Assistant, None, registry, event_tx)
+                .with_spawn_context(test_spawn_context()?),
+        )
+    }
+
+    /// Treibt den Turn, merkt sich den Grund jeder eintreffenden Frage und
+    /// beantwortet jede mit `answer`.
+    async fn drive_recording_reasons(
+        driver: &ApprovalDriver,
+        session: &mut AgentSession,
+        model: &dyn ModelProvider,
+        store: &dyn StateStore,
+        prompts: &mut ApprovalPromptReceiver,
+        answer: ApprovalResolution,
+        outcome: TurnOutcome,
+    ) -> (ApprovalDriverResult<TurnOutcome>, Vec<Option<String>>) {
+        let mut reasons = Vec::new();
+        let mut channel_open = true;
+
+        let drive = driver.drive_to_completion(session, model, store, None, outcome);
+        tokio::pin!(drive);
+
+        loop {
+            tokio::select! {
+                result = &mut drive => return (result, reasons),
+                prompt = prompts.recv(), if channel_open => match prompt {
+                    Some(prompt) => {
+                        reasons.push(prompt.reason().map(str::to_owned));
+                        prompt.answer(answer.clone());
+                    }
+                    None => channel_open = false,
+                },
+            }
+        }
     }
 
     fn write_call(path: &str) -> Value {
@@ -1771,7 +1976,7 @@ mod tests {
         // Der erste Poll öffnet die Frage; danach wartet der Treiber auf die
         // Antwort (der Zeitablauf hier ist nur das Poll-Signal, nicht der
         // Freigabe-Timeout des Handlers).
-        let mut resolve = Box::pin(driver.resolve(&pending));
+        let mut resolve = Box::pin(driver.resolve(&pending, None));
         let polled = tokio::time::timeout(Duration::from_millis(50), &mut resolve).await;
         assert!(
             polled.is_err(),
@@ -1785,11 +1990,49 @@ mod tests {
         };
         assert_eq!(prompt.tool_name(), WRITE_TOOL);
         assert!(prompt.arguments_json().contains("a.txt"));
+        assert_eq!(prompt.reason(), None, "ohne Grund bleibt das Feld leer");
         assert!(prompt.approve());
 
         let resolution = resolve.await;
         assert!(matches!(resolution, ApprovalResolution::Approve));
         assert!(prompts.try_recv().is_err(), "genau eine Frage, nicht zwei");
+        Ok(())
+    }
+
+    /// PL-100 O1: ein mitgegebener Grund erreicht den Renderer unverändert;
+    /// `open_prompt` bleibt ohne Grund, und `Debug` nennt nur, dass es einen
+    /// Grund gibt, nicht den Text.
+    #[test]
+    fn test_open_prompt_with_reason_hands_the_reason_to_the_renderer() -> TestResult {
+        let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
+        let call = ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("job.stop"),
+            arguments: Value::Null,
+        };
+        let reason = harw_core::dod_taint::ask_reason("job.stop");
+
+        assert!(handler.open_prompt_with_reason(&ItemId::new(), &call, Some(reason.clone())));
+        let Ok(with_reason) = prompts.try_recv() else {
+            return Err(TestError::Unexpected("the prompt must be queued".into()));
+        };
+        assert_eq!(with_reason.reason(), Some(reason.as_str()));
+        assert!(
+            reason.contains(harw_core::dod_taint::TAINT_REASON),
+            "{reason}"
+        );
+        let rendered = format!("{with_reason:?}");
+        assert!(rendered.contains("has_reason: true"), "{rendered}");
+        assert!(
+            !rendered.contains(harw_core::dod_taint::TAINT_REASON),
+            "{rendered}"
+        );
+
+        assert!(handler.open_prompt(&ItemId::new(), &call));
+        let Ok(without_reason) = prompts.try_recv() else {
+            return Err(TestError::Unexpected("the prompt must be queued".into()));
+        };
+        assert_eq!(without_reason.reason(), None);
         Ok(())
     }
 
@@ -1807,7 +2050,7 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(1))
             .map_err(ctx("one second before requested_at stays in range"))?;
 
-        let resolution = driver.resolve(&pending).await;
+        let resolution = driver.resolve(&pending, None).await;
 
         assert_eq!(resolution, ApprovalResolution::timed_out());
         assert!(
@@ -1961,6 +2204,109 @@ mod tests {
             1,
             "an approved tool must run exactly once"
         );
+        Ok(())
+    }
+
+    /// PL-100 O1: fragt `job.stop` nur, weil `dod.findings` im selben Turn
+    /// lief, zeigt die Frage den Taint-Grund. Der TUI-Handler selbst fragt
+    /// hier nie (`Deferred`); die Rückfrage stammt allein von der
+    /// `DodTaintPolicy` im Auto-Modus.
+    #[tokio::test]
+    async fn test_driver_hands_the_dod_taint_reason_to_the_prompt() -> TestResult {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::Deferred);
+        let mut session = taint_test_session(&handler, &executions, ApprovalMode::Delegated)?;
+        let store = InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            ScriptedModel::tool_response("dod.findings", json!({})),
+            ScriptedModel::tool_response("job.stop", json!({ "id": "job-1" })),
+            ModelResponse::text("done"),
+        ]);
+        let driver = ApprovalDriver::new(Arc::clone(&handler));
+
+        let Ok(outcome) = run_turn(&mut session, &model, &store, TurnInput::user("dod")).await
+        else {
+            return Err(TestError::Unexpected(
+                "the tainted turn must reach the approval pause".into(),
+            ));
+        };
+        assert!(
+            matches!(outcome, TurnOutcome::AwaitingApproval { .. }),
+            "{outcome:?}"
+        );
+
+        let (result, reasons) = drive_recording_reasons(
+            &driver,
+            &mut session,
+            &model,
+            &store,
+            &mut prompts,
+            ApprovalResolution::Reject {
+                reason: "nicht jetzt".to_owned(),
+            },
+            outcome,
+        )
+        .await;
+
+        let Ok(final_outcome) = result else {
+            return Err(TestError::Unexpected("a rejected turn must finish".into()));
+        };
+        assert!(matches!(final_outcome, TurnOutcome::Completed));
+        assert_eq!(
+            reasons,
+            vec![Some(harw_core::dod_taint::ask_reason("job.stop"))],
+            "genau eine Frage, mit dem Taint-Grund"
+        );
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "only dod.findings ran; the rejected job.stop did not"
+        );
+        Ok(())
+    }
+
+    /// Fragt ein anderer Handler ohne Taint (hier der TUI-Handler für
+    /// `job.stop` ohne vorherige DoD-Abfrage), bleibt der Grund leer.
+    #[tokio::test]
+    async fn test_driver_leaves_the_reason_empty_when_the_taint_did_not_ask() -> TestResult {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
+        let mut session = taint_test_session(&handler, &executions, ApprovalMode::Delegated)?;
+        let store = InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            ScriptedModel::tool_response("job.stop", json!({ "id": "job-1" })),
+            ModelResponse::text("done"),
+        ]);
+        let driver = ApprovalDriver::new(Arc::clone(&handler));
+
+        let Ok(outcome) = run_turn(&mut session, &model, &store, TurnInput::user("stop")).await
+        else {
+            return Err(TestError::Unexpected(
+                "the untainted turn must reach the approval pause".into(),
+            ));
+        };
+        assert!(
+            matches!(outcome, TurnOutcome::AwaitingApproval { .. }),
+            "{outcome:?}"
+        );
+
+        let (result, reasons) = drive_recording_reasons(
+            &driver,
+            &mut session,
+            &model,
+            &store,
+            &mut prompts,
+            ApprovalResolution::Approve,
+            outcome,
+        )
+        .await;
+
+        let Ok(final_outcome) = result else {
+            return Err(TestError::Unexpected("an approved turn must finish".into()));
+        };
+        assert!(matches!(final_outcome, TurnOutcome::Completed));
+        assert_eq!(reasons, vec![None], "eine Frage ohne Taint-Grund");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

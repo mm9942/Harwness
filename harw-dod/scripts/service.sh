@@ -38,7 +38,7 @@ case "$action" in
         "$systemctl_bin" --no-pager is-enabled harw-warden.socket harw-warden.service 2>&1 || true
         ;;
     logs)
-        exec journalctl --no-pager -u harw-sentinel.service -u harw-probe-bpf.service -u harw-probe-fs.service -u harw-warden.service
+        exec journalctl --no-pager -u harw-sentinel.service -u harw-probe-bpf.service -u harw-probe-fs.service -u harw-probe-netlink.service -u harw-warden.service
         ;;
     smoke)
         if [ "${SMOKE_CONFIRM:-0}" != 1 ]; then

@@ -15,6 +15,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use harw_core::cancel::{CancelReason, CancelToken};
+use harw_core::dod_taint::pending_ask_reason;
 use harw_core::turn_loop::TurnControl;
 use harw_core::{
     AgentSession, ApprovalResolution, ModelMessage, ToolCallResult, TurnInput, TurnOutcome,
@@ -484,7 +485,9 @@ async fn drive(
 ///
 /// # Beschreibung
 /// Ablehnung bei Zeitablauf (Freigabe-Timeout der Montage) und bei Abbruch
-/// des Turns — eine unbeantwortete Frage ist nie eine Freigabe.
+/// des Turns — eine unbeantwortete Frage ist nie eine Freigabe. Den vom
+/// Kern zugeschriebenen Grund der Rückfrage (PL-100 O1, DoD-Taint) reicht
+/// `ApprovalRequest::reason` an den Handler weiter.
 async fn decide(
     assembly: &RuntimeAssembly,
     session: &AgentSession,
@@ -502,6 +505,9 @@ async fn decide(
         call_id: pending.call.id.as_str().to_owned(),
         tool: pending.call.name.as_str().to_owned(),
         arguments: pending.call.arguments.clone(),
+        // PL-100 O1: hat der DoD-Taint des Turns gefragt, sieht der Host
+        // den Grund („nach DoD-Abfrage in diesem Turn").
+        reason: pending_ask_reason(session),
     };
     let decision = tokio::select! {
         decided = tokio::time::timeout(assembly.approval_timeout(), approvals.decide(&request)) => {

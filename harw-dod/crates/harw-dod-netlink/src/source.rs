@@ -28,8 +28,9 @@
 //! use std::time::Duration;
 //!
 //! let source = FixtureAuditSource::new([RawRecord::new("type=SYSCALL auid=1000")]);
-//! let records = source.read_records(Duration::from_secs(1)).expect("Fixture scheitert nie");
+//! let records = source.read_records(Duration::from_secs(1))?;
 //! assert_eq!(records.len(), 1);
+//! # Ok::<(), harw_dod_netlink::NetlinkError>(())
 //! ```
 
 use std::time::Duration;

@@ -18,11 +18,42 @@
 # Configuration and exports (PL-97 D1): --config names the system DoD
 # configuration explicitly, so a missing or untrusted config.toml is fail
 # closed (as for harw-probe-bpf). --findings-export appends certified
-# findings as JSON lines (schema version 2) and --health-export rewrites the
-# sentinel's health document atomically every poll cycle; both live in the
-# export directory below the state directory, which tmpfiles.d/harw.conf
-# creates as 2750 harw-sentinel:harw-dod-readers (setgid, so the files are
-# group-readable by harw-dod-readers members). No capability is involved.
+# findings as JSON lines (schema version 3, PL-100 WP0.12) and
+# --health-export rewrites the sentinel's health document atomically every
+# poll cycle; both live in the export directory below the state directory,
+# which tmpfiles.d/harw.conf creates as 2750 harw-sentinel:harw-dod-readers
+# (setgid, so the files are group-readable by harw-dod-readers members).
+# The sentinel keeps its finding dedup state in
+# @STATEDIR@/finding-throttle.json (0600, PL-100 WP0.4), the listener
+# history of the listener-new rule in @STATEDIR@/listener-history.json
+# (0600, PL-100 WP1.6; both replaced atomically through a hidden
+# .<name>.tmp sibling, and no export may alias either) and, with
+# --findings-export, freezes a FindingRecord per reported finding into
+# @STATEDIR@/spool (0700, owner-only); all of them lie below
+# ReadWritePaths=@STATEDIR@. No capability is involved.
+#
+# Before its Landlock self-restriction the sentinel reads /etc/passwd
+# (probe accounts and, for the path rules, every home directory) and
+# /proc/sys/net/ipv4/ip_local_port_range. ProtectHome=yes below hides /home
+# and /root, so home directories there enter the rules in their passwd
+# spelling only (they are never canonicalised through a mount). The
+# Landlock outcome and ABI level are reported as "landlock" in health.json.
+# --probe-peer-user, --finding-cooldown-secs and --container-sensor are not
+# passed here: the optional [sentinel] table of config.toml sets them
+# (probe_peer_users, finding_cooldown_secs, container_sensor); a flag added
+# here would win over it.
+#
+# Sensor truthfulness (PL-100 WP1.8/1.10): the thermal, blockio and GPU
+# sensors read /sys/class/thermal, /sys/block and /sys/class/drm through
+# alias roots whose entries are symlinks into /sys/devices; Landlock grants
+# /sys/devices read-only for that (--print-sandbox shows it). Container
+# sensors (container_sensor = "auto" by default, "on" or "off"): with "auto"
+# and "on" one container sensor runs per known layout (machine.slice with
+# libpod-*.scope, system.slice with docker-*.scope) and reads those scopes and
+# /proc/<pid>/status (both already read roots). Under "auto" a missing slice
+# on a cgroup v2 root is an empty reading. Only for "on" does the sentinel
+# check the Podman and Docker sockets below /run, before Landlock. Docker's
+# cgroupfs driver is reported once at start as sensor-degraded.
 
 [Unit]
 Description=Harw-DoD sentinel -- unprivileged collection point
@@ -47,7 +78,16 @@ UMask=0007
 # explicit mode, so the process umask decides. /run/harw is setgid harw-ipc
 # (tmpfiles.d/harw.conf), so the socket is created as
 # harw-sentinel:harw-ipc; UMask=0007 yields 0770 -- the probes (members of
-# harw-ipc) may connect, nobody else may.
+# harw-ipc) may connect, nobody else may. On top of that the sentinel checks
+# SO_PEERCRED (PL-100 WP0.5): only the probe accounts harw-probe-bpf and
+# harw-probe-fs (--probe-peer-user, resolved at startup) and uid 0 may submit
+# events; any other harw-ipc member is closed unread and counted
+# (ipc.peers_rejected_total in health.json).
+# Explicit working directory (PL-100 WP0.7). It is never a Landlock root:
+# --workspace-root has no default any more, and the sentinel refuses relative
+# roots and every spelling of / (`harw-sentinel --print-sandbox <same flags>`
+# prints the effective read/write roots for host verification).
+WorkingDirectory=/
 ExecStart=@LIBEXECDIR@/harw-sentinel --log info --config @SYSCONFDIR@/config.toml --home @STATEDIR@ --socket /run/harw/sentinel.sock --findings-export @STATEDIR@/export/findings.jsonl --health-export @STATEDIR@/export/health.json
 ReadWritePaths=@STATEDIR@ @LOGDIR@ /run/harw
 # ProtectSystem=strict makes /run read-only as well; these three paths are

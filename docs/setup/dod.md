@@ -1,6 +1,6 @@
 # Harw-DoD (Detect · Orient · Defend)
 
-> Status: partially implemented · Last reviewed: 2026-10-29
+> Status: partially implemented · Last reviewed: 2026-11-08
 
 Harw-DoD (short: DoD) is Harwness's on-device observation-and-defense suite: it watches
 what is happening on the host around agent activity (process starts,
@@ -172,7 +172,9 @@ names the main ones):
 - `harw-sentinel` — the unprivileged binary: runs the sensors and the
   collection loop.
 - `harw-probe-fs` — the privileged (`CAP_SYS_ADMIN`) fanotify probe binary;
-  push-only, no receive path.
+  push-only, no receive path. Part of `harw-dod.target`; it watches the
+  persistence locations from `[probe_fs]` (see
+  [below](#fanotify-probe-watch-scope-pl-100-wp16)).
 - `harw-probe-bpf` — the privileged (`CAP_BPF`, `CAP_PERFMON`) eBPF probe
   binary; push-only, no receive path.
 - `harw-warden` — the enforcer binary, listening on a systemd-activated
@@ -237,7 +239,7 @@ more.
   for `harw-probe-bpf` (the loader refuses to attach tracepoint/FEntry
   programs without both); `CAP_SYS_ADMIN` for `harw-probe-fs` (the only
   capability that permits `fanotify_mark` with `FAN_MARK_FILESYSTEM` and
-  the `FAN_UNLIMITED_*` flags it needs); `CAP_DAC_OVERRIDE CAP_NET_ADMIN`
+  the `FAN_UNLIMITED_MARKS` flag it needs); `CAP_DAC_OVERRIDE CAP_NET_ADMIN`
   for `harw-warden` (writing the root-owned `cgroup.freeze`/`cgroup.kill`
   files, and running `nft` for network isolation).
 - **Root-owned files and FHS directories** (default prefix `/usr/local`;
@@ -263,23 +265,45 @@ more.
 ## How it integrates with harw
 
 The main Harwness config carries a `[dod]` section
-(`harw-config/src/dod_toml.rs`) that is escalation *policy*, evaluated on
-the agent side — separate from DoD's own `/etc/harw-dod/config.toml`,
+(`harw-config/src/dod_toml.rs`) that holds advisory escalation settings for
+display and the doctor (not binding policy) — separate from DoD's own `/etc/harw-dod/config.toml`,
 which is the system-level sensor/profile configuration DoD itself reads.
+
+> **The escalation keys of `[dod]` are advisory.** `kill_requires_human`,
+> `auto_freeze`, `proof_key_dir` and `allowed_cgroup_prefixes` authorize,
+> enable or disable no action. The binding TCB policy lives only in
+> root-owned files under `/etc/harw-dod/` (see the end of this section).
+> Today only `allowed_cgroup_prefixes` is read outside config loading (by
+> the doctor, for its cgroup-root checks); `kill_requires_human` and
+> `auto_freeze` are validated or merged at load time and used for nothing
+> else (the doctor does not show `auto_freeze` today). `export_dir` is
+> different: harw's read-only posture and display path consumes it
+> (`harw-runtime/src/assembly.rs`, via the security-signals context
+> provider) to locate the sentinel exports. `findings_window_hours` is
+> validated at load time; no consumer outside config loading was found in
+> the code today, so it is configuration for that same display path.
+
+Components that do not exist yet are marked **planned (PL-100 Phase N)**
+(German: "geplant (PL-100 Phase N)"); the plan is in
+[`docs/planning/100-dod-ai-integration/`](../planning/100-dod-ai-integration/README.md).
+
 The `[dod]` section's defaults are deliberately restrictive
 ("secure/off"):
 
-- `kill_requires_human` — must be `true`; not negotiable, rejected in
-  every configuration layer if set to `false` (per the harness's
-  automation decision: freeze/release may be automatic after a signed
-  proof, kill never is without a human).
-- `auto_freeze` — whether freeze/release transitions happen automatically
-  after a signed proof (default `true`).
+- `kill_requires_human` — must be `true`; rejected in every configuration
+  layer if set to `false`. Advisory: it documents that a kill is never
+  taken without a human, but it is not what enforces that.
+- `auto_freeze` — **advisory only; no action depends on it** (default
+  `true`). It does not control automatic freezes: nothing freezes
+  automatically. A repository layer can only keep it at `true`, never
+  turn it off.
 - `proof_key_dir` — where the keys for `SignedAuthorization` verification
-  live; never inherited from an untrusted config layer.
+  live; never inherited from an untrusted config layer. Advisory; the
+  Warden/escalator use their own root-owned policy.
 - `allowed_cgroup_prefixes` — which cgroup path prefixes the escalation
   chain may address at all; an untrusted layer may only narrow this list,
-  never widen it. The one canonical form is an absolute path strictly
+  never widen it. Advisory; only the doctor reads it, the Warden/escalator
+  use their own root-owned policy. The one canonical form is an absolute path strictly
   below the cgroup2 mount (`/sys/fs/cgroup/<…>`, trailing `/` optional);
   a relative entry is rejected. `harw_config::dod_toml::warden_cgroup_id`
   converts an entry to the Warden's relative `CgroupId`
@@ -299,8 +323,110 @@ blank or non-canonical (relative, outside `/sys/fs/cgroup`)
 `findings_window_hours = 0` makes harw's config loading fail with a
 `[dod]: …` error instead of starting with that value.
 
-Enforcement itself lives entirely in the escalation/warden binaries; this
-config section only describes the policy they must honor.
+Enforcement itself lives entirely in the escalation/warden binaries, and
+their binding policy is **not** this section. It comes from root-owned
+files that harw cannot change:
+
+- `/etc/harw-dod/config.toml` — sensor/profile configuration, loaded with
+  `load_system_config` (requires root-trusted ownership of the path).
+- `/etc/harw-dod/warden.toml` — the Warden's own proof policy and deny
+  list; **planned (PL-100 Phase 3.1)**, it does not exist yet and the
+  Warden reads no policy file today.
+
+### Planned keys (PL-100)
+
+None of the following tables exists in the code yet. The `[dod]` table is
+parsed with `deny_unknown_fields`, so **adding `[dod.triage]`,
+`[dod.approve]` or `[dod.watch]` to a config today makes config loading
+fail**. Do not add them until the matching phase has shipped.
+
+`[dod.triage]` — **planned (PL-100 Phase 1.9; the triage run itself Phase
+2)**. The triage model is the owner's explicit choice:
+
+- `model` (`"<provider>/<model>"`), `effort`, `max_tokens`, `max_parallel`.
+- Set via the `/dod model set|show|clear` command or the TUI settings
+  (PL-100 Phase 1.9), or by editing the trusted config file.
+- Read from trusted layers only (home/profile). A repository layer can
+  neither set nor change the model.
+- Without a `model`, no automatic triage runs; the watch mode falls back
+  to `notify` with a clear notice. There is **no silent fallback to the
+  session model**.
+- `harw dod doctor` will show provider, model and locality (loopback or
+  Unix socket is local, anything else is remote). The locality is shown,
+  not enforced; with a remote model the provider sees bounded evidence
+  cards.
+
+`[dod.watch]` — **planned (PL-100 Phase 2.2)**:
+
+- `mode = "off" | "notify" | "triage"` (default `triage`). `notify` shows
+  deterministic notices only; `triage` additionally runs the triage model
+  (needs `[dod.triage].model`).
+- `autoconnect` — the `harw-dod-watch` systemd user unit connects to the
+  gateway on start. Default: on (README O5: the unit connects
+  automatically); the exact default and the behaviour of
+  `autoconnect = false` are not yet fixed (planned, PL-100 Phase 2.2). The
+  unit is planned too.
+- `[dod.dispatch] owner = true` — only one dispatcher per host (host
+  lock); **planned (PL-100 Phase 2.2)**.
+
+`[dod.approve]` — **planned (PL-100 Phase 3.3)**:
+
+- `tui_tty` (default `true`; written to `~/.harw/config.toml` by `install`
+  and `update`) allows an approval via `pkttyagent` in the TUI's own
+  terminal. A compromised harw can alter what that terminal displays, so
+  the binding to the shown proposal is weaker; the mode therefore covers
+  only the reversible actions freeze and thaw. Kill and isolation are
+  refused in this mode. The doctor and Mission Control label it as a
+  weaker binding.
+
+### Approval of interventions (planned, PL-100 Phase 3)
+
+No approval path exists today. Once built, a freeze, thaw, kill or
+isolation takes effect only after a human approval that a compromised harw
+cannot forge, bound to the escalator's proposal digest (action, target
+cgroup, kernel ID, finding ID, rule, severity, hold). Two paths:
+
+1. **Independent (path A, full guarantee).** The operator starts
+   `harw-dod-approve` themselves in a session harw does not control: their
+   own terminal window, another login, or SSH. It fetches proposals from
+   the escalator, shows typed and escaped fields (action, cgroup kid,
+   path, rule, severity, short hash, digest), asks the operator to type the
+   short hash and optionally a hold duration, and then polkit
+   `auth_admin` (no keep) follows. It refuses peers inside a harw agent
+   session or a `harw-job-*` scope. **Planned (PL-100 Phase 3.3).**
+2. **Started from the TUI (path B).** The TUI only sends
+   `RequestApproval{proposal_id}` to the escalator; harw starts no
+   `pkexec` and no dialog. The escalator calls polkit
+   `CheckAuthorization` with details taken from its own proposal (action,
+   cgroup, rule, short hash, digest) and the desktop's graphical polkit
+   agent renders them. A different `proposal_id` shows a different
+   dialog, so harw cannot misrepresent what is approved. This path has no
+   free-text input, so the hold is "until lifted"; set a hold duration via
+   path A. **Planned (PL-100 Phase 3.3).**
+
+**Kill and network isolation** are not part of the ordinary freeze
+approval: they need the separate polkit action
+`org.harw.dod.irreversible` and an explicit "irreversible" confirmation
+(`irreversible_ack`), and are never possible in the same-TTY mode.
+**Planned (PL-100 Phase 3.1 and 3.3).**
+
+Read-only companions: `harw dod proposals` and `harw dod frozen` (active
+freezes and isolations; **planned, PL-100 Phase 3.3**), `harw dod verdicts`
+(**planned, PL-100 Phase 2.4**).
+
+### Planned components at a glance
+
+| Component | State |
+|---|---|
+| `[dod.triage]`, `/dod model` | planned (PL-100 Phase 1.9) |
+| `DodWatch`, dispatch, `[dod.watch]`, `harw-dod-watch` user unit | planned (PL-100 Phase 2.1-2.2) |
+| Verdict store, `harw dod verdicts` | planned (PL-100 Phase 2.3-2.4) |
+| `harw-escalator` (today's crate: `harw-dod-escalate`), proposals | planned (PL-100 Phase 3.2) |
+| `warden.toml`, Warden deny list, kill/isolation with `irreversible_ack` | planned (PL-100 Phase 3.1) |
+| `harw-dod-approve`, `RequestApproval`, polkit actions, `[dod.approve]` | planned (PL-100 Phase 3.3) |
+| `harw dod proposals`, `harw dod frozen` | planned (PL-100 Phase 3.3) |
+| `security-hunter`, `/dod tune` | planned (PL-100 Phase 4) |
+| `harw dod warden enable/disable/status`, `/dod status`, `/dod view` | implemented |
 
 ### Observe harw jobs (PL-97 E3)
 
@@ -418,13 +544,208 @@ Both are optional sentinel flags; the shipped unit enables both:
 
 | File | Flag | Written | Content |
 |---|---|---|---|
-| `/var/lib/harw-dod/export/findings.jsonl` | `--findings-export <abs path>` | appended per certified finding; rotated at 16 MiB (`--findings-export-keep`) | one JSON object per line: `finding_id`, `host`, `rule_id`, `severity`, `summary` (sanitized, ≤ 512 bytes), `observed_at`, plus `schema_version: 2` and an optional `scope` (cgroup path, once findings carry a cgroup attribution) |
-| `/var/lib/harw-dod/export/health.json` | `--health-export <abs path>` (default: `health.json` next to the findings export) | replaced atomically (temporary file + rename) every poll cycle | `schema_version: 1`, `written_at`, `config_digest`, `profile` (both `null` on built-in defaults), `sensors[]` (`id`, `health` = `bound`/`retrying`/`degraded`, `degrade_reason?`, `last_ok_at?`, `readings_total`, `errors_total`), `ipc` (`probes_connected`, `events_total`, `dropped_total`) |
+| `/var/lib/harw-dod/export/findings.jsonl` | `--findings-export <abs path>` | appended per **reported** finding (repeats inside the dedup cooldown are not written); rotated at 16 MiB (`--findings-export-keep`) | one JSON object per line: `finding_id` (UUIDv4), `host`, `rule_id`, `severity`, `summary` (escaped, ≤ 512 bytes), `observed_at` (time of the triggering observation), `schema_version: 3`, an optional `scope` (cgroup path) plus `scope_obfuscated`, and the v3 fields `instance` (UUIDv4 per sentinel start), `seq` (from 1; a gap means a lost line), `kind`, `hardness`, `dedup_key`, `occurrences`, `first_seen`, `cgroup_kid?`, `record_digest?` (BLAKE3 of the spooled record) and `evidence_card?` (≤ 4 KiB: event counts, agreeing `uid`/`destination`/`path`/`process{pid,comm}`, all escaped) |
+| `/var/lib/harw-dod/export/health.json` | `--health-export <abs path>` (default: `health.json` next to the findings export) | replaced atomically (temporary file + rename) every poll cycle | `schema_version: 1`, `written_at`, `config_digest`, `profile` (both `null` on built-in defaults), `sensors[]` (`id`, `health` = `bound`/`retrying`/`degraded`, `degrade_reason?`, `last_ok_at?`, `readings_total`, `errors_total`), `ipc` (`probes_connected`, `events_total`, `dropped_total`, `peers_rejected_total`, `events_last_cycle`, `dropped_last_cycle`, `events_last_60s`, `dropped_last_60s`), `ring` (ring entries evicted before the rules saw them: `overflow_{samples,events}_{total,last_cycle,last_60s}`), `windows` (`last_cycle_ms`, `last_60s_ms`), `spool` (`null` without a spool; else `state` = `ok`/`degraded`, `degrade_reason`, cumulative and last-60-s counters), `landlock` (`outcome` = `fully_enforced`/`partially_enforced`/`not_enforced`/`failed`, `requested_abi`, `effective_abi` — the kernel's level, `null` without Landlock), `listener_history` (`state` = `ok`/`degraded`, `degrade_reason?`, `keys`, `primed`) |
 
-Version 2 of the findings line is additive: a line without `schema_version`
-is version 1, and every reader ignores unknown fields, so old and new lines
-parse alike. Neither file contains evidence, raw events, configuration
-contents or secrets.
+Versions 2 and 3 of the findings line are additive: a line without
+`schema_version` is version 1, and every reader ignores unknown fields, so
+old and new lines parse alike (roll out readers before the sentinel). The
+`health.json` additions keep `schema_version: 1`. Neither file contains raw
+events, configuration contents or secrets; the evidence card carries only
+escaped, bounded summaries.
+
+**Spool and dedup state** (not exports, owner-only, PL-100 WP0.4/WP0.12).
+With `--findings-export` the sentinel freezes one `FindingRecord` per
+reported finding (triggering events plus up to 32 ring events as context,
+≤ 64 KiB) into `<--home>/spool` (`/var/lib/harw-dod/spool`, `0700`,
+written by a bounded writer thread). The spool keeps 14 days and at most
+1 GiB, including records nobody consumed. `<--home>/finding-throttle.json`
+(`0600`) persists the dedup cooldown per `dedup_key` across restarts.
+`<--home>/listener-history.json` (`0600`, PL-100 WP1.6) persists the
+listeners the `listener-new` rule already knows: on the very first start the
+sentinel learns every open listener silently and reports only listeners that
+appear later. A history that cannot be used (unreadable, larger than 1 MiB,
+corrupt, foreign version) never stops the sentinel, but it is never relearned
+silently either: the first cycle exports a `sensor-degraded` finding for
+`sentinel-listener-history`, `health.json` reports `listener_history` as
+`degraded` (with `state_unreadable`, `state_not_regular_file`,
+`state_too_large` or `state_invalid`) until the next restart, and the journal
+names the reason. Do not create these files by hand or through tmpfiles.
+
+**Startup checks of the sentinel (PL-100 owner review).**
+
+- *Destinations.* Before any writer opens, the sentinel compares every
+  file it writes by resolved identity (canonical directory plus file name):
+  the findings export and its rotations `<name>.N`, the health document
+  and its temporary sibling `.<name>.tmp`, the throttle state
+  `<--home>/finding-throttle.json` with its `.finding-throttle.json.tmp`,
+  the listener history `<--home>/listener-history.json` with its
+  `.listener-history.json.tmp`, and the IPC socket (`--socket`, default
+  `<--home>/sentinel.sock`), which is unlinked and re-bound at every start.
+  `--socket` must be absolute; a socket in a directory that does not exist
+  yet is not compared (binding there fails anyway). Independently, the bind
+  only ever removes an existing *socket*: any other entry at the socket path
+  (a state file, a directory) is left alone and the IPC receive path stays
+  off for that run.
+  If two of them alias each other (also through a symlinked directory), or
+  a directory cannot be resolved, the sentinel refuses to start and exits
+  with "refusing to start: export and state destinations are unsafe". Keep
+  the exports out of `--home` itself; the shipped layout
+  (`--home /var/lib/harw-dod`, exports in `/var/lib/harw-dod/export`)
+  passes.
+- *IPC after Landlock.* The sentinel binds `sentinel.sock` before its
+  Landlock self-restriction but starts the accept and receive threads only
+  afterwards, so every thread that parses probe messages runs inside the
+  sandbox. A probe that connects in between waits in the socket backlog.
+- *Undecodable probe messages.* A message from an admitted probe that is
+  not a valid event or exceeds the receive buffer is discarded and counted:
+  once per poll cycle the sentinel logs one `warn` line with the count
+  (never the payload) and reports the total as the meta-metric
+  `sensor_parse_errors_total` (expected: `0`).
+
+**Non-Linux builds.** The sentinel's IPC path and Landlock are Linux-only;
+on other Unix targets the binary still compiles and runs without them
+(no probe socket, Landlock reported as not enforced). Check that build
+with
+
+```sh
+rustup target add x86_64-unknown-freebsd
+cargo check -p harw-sentinel --target x86_64-unknown-freebsd
+```
+
+Build scripts of dependencies with C or assembly parts may need a C
+compiler for the target (`CC_x86_64_unknown_freebsd`). Non-Unix targets
+(Windows) are out of scope: workspace crates the sentinel depends on
+(`harw-fsutil`, `harw-home`, the spool in `harw-dod-sentinel`) are
+Unix-only.
+
+### Sentinel flags added by PL-100 Phase 0
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--finding-cooldown-secs <n>` | `[sentinel] finding_cooldown_secs`, else `600` (0 … 604800) | a repeat of the same `dedup_key` (rule, uid, cgroup, coarse subject such as /24 or /64 plus port) inside this window only raises `occurrences`; stronger hardness, higher severity or a clock jump back report it again |
+| `--probe-peer-user <name\|uid>` | `[sentinel] probe_peer_users`, else `harw-probe-bpf`, `harw-probe-fs` | accounts whose processes may submit events over the IPC socket (`SO_PEERCRED`; repeatable, replaces the configured list and the default). uid 0 is always allowed; other peers are closed unread and counted in `ipc.peers_rejected_total` |
+| `--workspace-root <abs dir>` | none | the workspace drift sensor and its Landlock read root run only with an explicit absolute directory; `/` and relative roots are refused |
+| `--container-sensor <auto\|on\|off>` | `[sentinel] container_sensor`, else `auto` | container sensor (PL-100 WP1.8): `auto` and `on` run one sensor per known layout (`libpod-*.scope` below `/sys/fs/cgroup/machine.slice`, `docker-*.scope` below `system.slice`), even when no runtime is detected at start (rootful Podman is daemonless, and the sentinel starts before the first container); `off` runs none. With `auto` on a cgroup v2 root, a cgroup directory that does not exist yet (systemd creates `machine.slice` only with the first container) is an empty reading, never a degraded sensor; without a cgroup v2 root the container sensors report themselves degraded at the first poll. With `on`, a layout whose runtime was detected neither by its socket (`/run/podman/podman.sock`, `/run/docker.sock`) nor by a running scope at start and that has no cgroup directory reports the sensor as degraded. Docker with the `cgroupfs` driver (`/sys/fs/cgroup/docker/<id>`, no `.scope` names) is not supported: with `auto` and `on` the sentinel reports it once per start as `sensor-degraded` (sensor `container-docker-cgroupfs`) instead of staying silently blind. Every container scope is reported only as `container_unowned_<id>` (the sentinel has no list of containers harw started) |
+| `--print-sandbox` | off | prints the effective Landlock read/read-write roots, refused roots with their reason, the state files below `--home` (`state-file`), where the probe accounts come from (`ipc-peer-source`: `command-line`, `dod-config` or `built-in`), the admitted IPC peer uids and the container switch with its source, layouts and their availability rule (`container-sensor`, `container-layout` … `on-demand`/`required`) and unsupported layouts (`container-unsupported`), then exits (run it with the same flags as the unit) |
+
+**Sentinel settings in `config.toml` (PL-100).** The optional table
+`[sentinel]` of `/etc/harw-dod/config.toml` sets the two values above
+without editing the unit; a command-line flag always wins, and without flag
+and key the built-in default applies:
+
+```toml
+[sentinel]
+probe_peer_users = ["harw-probe-bpf", "harw-probe-fs"]   # at most 32; [] admits uid 0 only
+finding_cooldown_secs = 600                              # 0 ... 604800
+container_sensor = "auto"                                # "auto", "on" or "off"
+```
+
+The table is additive (`schema_version` stays `1`), but readers built before
+it refuse a file that contains it — update every DoD component (sentinel,
+probes, harw) before adding the table. The shipped files show it commented
+out.
+
+**Sysfs alias roots (PL-100 WP1.10).** The entries of `/sys/class/thermal`,
+`/sys/block` and `/sys/class/drm` are symlinks into `/sys/devices`. The
+thermal, blockio and GPU sensors therefore read them through alias roots
+(one symlink level per class entry into `/sys/devices`), and the sentinel's
+Landlock ruleset grants `/sys/devices` read-only; `--print-sandbox` lists it
+as `landlock\tread\t"/sys/devices"`. Fixture roots outside `/sys` stay plain
+roots. `/proc` was already a read root; the auid (`/proc/<pid>/loginuid`) is
+read by `harw-probe-fs`, whose Landlock ruleset now includes `/proc`
+read-only.
+
+#### fanotify probe watch scope (PL-100 WP1.6)
+
+`harw-probe-fs` is part of `harw-dod.target`. Its unit passes
+`--config /etc/harw-dod/config.toml` (group `harw-dod-config`; a missing,
+untrusted or invalid file refuses the start) and no placeholder root. The
+watch scope comes from the optional table `[probe_fs]`, per key, else from
+built-in defaults that cover the locations of the `persistence-write` rule:
+
+```toml
+[probe_fs]
+# every write below these directories counts
+scope_roots = ["/etc", "/var/spool/cron", "/var/spool/at", "/usr/lib/systemd",
+               "/usr/local/lib/systemd", "/lib/systemd", "/usr/share/systemd",
+               "/usr/local/share/systemd", "/usr/lib/udev/rules.d",
+               "/usr/local/lib/udev/rules.d", "/lib/udev/rules.d"]
+# directories holding home directories, or home directories themselves
+home_roots = ["/home", "/var/home", "/root", "/var/roothome"]
+# below a home root only paths that start, after at most two components
+# (the user name, or domain and user name), with one of these entries count
+home_entries = [".ssh", ".config/systemd", ".local/share/systemd", ".config/autostart",
+                ".config/environment.d", ".pam_environment", ".bashrc", ".bash_aliases",
+                ".bash_profile", ".bash_login", ".bash_logout", ".profile", ".zshrc",
+                ".zprofile", ".zshenv", ".zlogin"]
+```
+
+No user name appears in the file, and a directory an attacker creates later
+(`~/.config/autostart`) is still covered: Landlock and the fanotify marks
+span the whole home roots, only forwarding is filtered (a browser cache
+write never reaches the sentinel). Roots are absolute, never `/`, at most 64
+per list. `--scope-root`/`--home-root` replace both root lists,
+`--home-entry` the entries; the shipped files show the table commented out
+(reader-first). The unit uses `ProtectHome=read-only` instead of `yes`, so
+the home roots stay visible to the probe. The probe also:
+
+- coalesces repeated writes of one process to one file within 2 s into one
+  event (`FAN_MODIFY` and `FAN_CLOSE_WRITE` give the same `file-write`);
+- keeps the kernel bound on its event queue (`fs.fanotify.max_queued_events`,
+  default 16384; no `FAN_UNLIMITED_QUEUE`), so a writer faster than the probe
+  cannot grow kernel memory without bound, and reports a queue overflow as
+  `SensorDegraded` of its sensor id (`fsmon-0`), which the sentinel exports
+  as a `sensor-degraded` finding;
+- places its fanotify marks before the Landlock self-restriction: a root the
+  probe account cannot read (`/var/spool/cron` and `/var/spool/at` with mode
+  `0700`, `/root`) is marked through its nearest readable ancestor on the
+  same filesystem (`FAN_MARK_FILESYSTEM` marks the whole filesystem anyway).
+  If a root lies on a filesystem without any readable path at or above it
+  (for example a separate `/var` or `/root` with mode `0700`), its writes are
+  not observed: the probe logs a `warn` line with counts only and sends one
+  `SensorDegraded` of its sensor id at start, so the sentinel exports a
+  `sensor-degraded` finding instead of staying silently blind;
+- marks every filesystem mounted below a root at start as well (read from
+  `/proc/self/mountinfo`, at most 4 MiB; `autofs` triggers are not touched):
+  an NFS or autofs home, a systemd-homed or ecryptfs mount below `/home` is
+  marked through its mount point, and one it cannot mark counts as uncovered
+  and leads to the same start-time `SensorDegraded`. Mounts that appear after
+  the start (systemd-homed or autofs at login) and roots that were absent at
+  start (for example `/var/spool/cron` before cronie is installed; their
+  number is logged on `info`) stay unobserved until the probe restarts
+  (`sudo systemctl restart harw-probe-fs.service`). Like a root itself, a
+  hung hard NFS mount below a root stalls the start;
+- opens every event descriptor and every mark target non-blocking
+  (`O_NONBLOCK`), so a FIFO without a writer below a watched root cannot stall
+  the probe;
+- reads `/proc/<pid>/loginuid` for the auid (Landlock read root `/proc`);
+- treats an event the kernel could not open for it (a write on the marked
+  filesystem outside the Landlock read roots, `EACCES`/`EPERM`) as skipped,
+  not as a sensor error.
+
+**Rule configuration of the host (PL-100 WP1.6).** Before its Landlock
+self-restriction the sentinel builds the configuration of the path and
+listener rules: the canonical `--workspace-root` (starts below it are an
+`exec-writable-path` anomaly), every distinct home directory from
+`/etc/passwd` that is not already a fixed location (`/home/<name>`, `/root`,
+`/var/home/<name>`, `/var/roothome`) or a system directory (`/`, `/usr/…`,
+`/bin`, … are skipped; at most 256), and the ephemeral port range from
+`/proc/sys/net/ipv4/ip_local_port_range` (default `32768 60999`). Home
+directories are never canonicalised (that would walk every path component
+and could trigger an automount or hang on a stale NFS server before the
+first poll); only a symlink directly below `/` (for example
+`/home -> var/home`) is read with `readlink` and the home is added in that
+resolved spelling as well. The journal shows only counts (`rule
+configuration resolved`), never a home path. On `warn`, a finding carries only its rule id, severity and
+`occurrences`; summaries (which may contain escaped paths with account
+names), ids, the dedup key and the scope are on `debug` only.
+
+The egress rule uses the active profile's `egress_allow_cidrs` as its
+allowed network scope; with an empty list every egress flow is a High
+finding (a loopback destination is Low). `harw dod doctor` therefore
+reports `egress-allowlist` as missing while `[dod.watch] mode = "triage"`
+is in effect and the list is empty.
 
 **Permissions.** `deploy/tmpfiles.d/harw.conf` creates the export directory
 as `2750 harw-sentinel:harw-dod-readers` (setgid, so the files inherit the
@@ -573,11 +894,12 @@ target list).
    ```
    Runs the explicit configuration/profile validation first and refuses to
    enable without a chosen `active_profile` (`harw dod enable` exits `3`). This starts and enables
-   `harw-sentinel.service` and `harw-probe-bpf.service` under
-   `harw-dod.target` — observation only, never the Warden.
-   `harw-probe-fs.service` is installed but not part of the target: set its
-   `--scope-root` in a drop-in, then `systemctl enable --now
-   harw-probe-fs.service`.
+   `harw-sentinel.service`, `harw-probe-bpf.service` and
+   `harw-probe-fs.service` under `harw-dod.target` — observation only,
+   never the Warden. The fanotify probe watches the persistence locations
+   from `[probe_fs]` or its built-in defaults (see
+   [above](#fanotify-probe-watch-scope-pl-100-wp16)); a drop-in with
+   `--scope-root`/`--home-root` narrows or widens that.
 
 ### The Warden — shipped but disabled
 
@@ -593,13 +915,18 @@ sudo harw dod warden enable   # or: sudo make -C harw-dod enable-warden
 ```
 
 This creates `/etc/harw-dod/warden.enable`, reloads systemd, and enables
-the socket. Even then, the actual authorization to freeze/kill/cut network
-still runs through the escalation policy in harw's own `[dod]` config (see
-[above](#how-it-integrates-with-harw)) — `kill_requires_human` cannot be
-turned off.
+the socket. Harw's own `[dod]` config (see
+[above](#how-it-integrates-with-harw)) authorizes nothing: it is advisory.
+The authorization path (independent `harw-dod-approve` or polkit via the
+escalator, see [above](#approval-of-interventions-planned-pl-100-phase-3))
+is **planned (PL-100 Phase 3.3)** and does not exist yet; the Warden's own
+policy file is **planned (PL-100 Phase 3.1)**.
 
 ## Current status and limitations (honest)
 
+- **PL-100 (AI triage, approval) is planned, not implemented.** The
+  `[dod.triage]`, `[dod.watch]` and `[dod.approve]` keys, the escalator
+  submission and the approval paths described above do not exist yet.
 - **The observation half (sentinel + probes) is what's live.** The
   escalation/warden chain is implemented as a library and a socket-
   activated binary, but is disabled by every default install path, as
@@ -608,7 +935,9 @@ turned off.
   configuration explicitly: `harw-sentinel --config
   /etc/harw-dod/config.toml --home /var/lib/harw-dod --socket
   /run/harw/sentinel.sock --findings-export …/export/findings.jsonl
-  --health-export …/export/health.json` and `harw-probe-bpf --config …`.
+  --health-export …/export/health.json`, `harw-probe-bpf --config …` and
+  `harw-probe-fs --config …` (the fanotify probe, too, refuses to start on
+  an unusable explicit configuration).
   With an explicit `--config`, a missing, untrusted (wrong owner,
   group/world writable, symlink) or invalid configuration makes the
   sentinel refuse to start; only when started **without** `--config` (by

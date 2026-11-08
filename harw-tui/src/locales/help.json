@@ -1114,5 +1114,17 @@
     "ko": "향후 사용을 위해 예약됨.",
     "vi": "Dành cho sử dụng sau này.",
     "hi": "भविष्य में उपयोग के लिए आरक्षित।"
+  },
+  "help.dod_model": {
+    "en": "DoD triage model: show, set <provider>/<model>, clear (humans only)",
+    "de": "DoD-Triage-Modell: anzeigen, setzen <provider>/<model>, entfernen (nur Menschen)",
+    "es": "Modelo de triaje DoD: mostrar, fijar <provider>/<model>, borrar (solo personas)",
+    "fr": "Modèle de triage DoD : afficher, définir <provider>/<model>, effacer (humains uniquement)",
+    "pt": "Modelo de triagem DoD: mostrar, definir <provider>/<model>, limpar (somente pessoas)",
+    "ja": "DoD トリアージモデル: 表示、<provider>/<model> を設定、解除（人間のみ）",
+    "zh-CN": "DoD 分诊模型：显示、设置 <provider>/<model>、清除（仅限人工）",
+    "ko": "DoD 분류 모델: 표시, <provider>/<model> 설정, 해제 (사람만)",
+    "vi": "Mô hình phân loại DoD: hiển thị, đặt <provider>/<model>, xóa (chỉ con người)",
+    "hi": "DoD ट्राइएज मॉडल: दिखाएँ, <provider>/<model> सेट करें, हटाएँ (केवल मनुष्य)"
   }
 }

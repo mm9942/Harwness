@@ -467,9 +467,13 @@ here, one line each, purpose from the module doc comment:
   `SessionLease` -> `mark_global_approval` (all `shell.exec` calls of the
   harw process then run on the host); `SingleExecution` ->
   `mark_global_single_use` (only the next call); rejection/timeout return an
-  error text. **A host lease has no expiry and only the user can end it**
-  (user decision 2026-09-24): `Ctrl+H` in the TUI (`end_host_mode`) or the
-  typed command `/sandbox-lease revoke`. The command
+  error text. **A host lease expires after `[sandbox] host_lease_ttl_secs`
+  (default 8 h) and only the user can end it earlier**
+  ([ADR 0002](../adr/0002-session-lease-expiry.md), PL-100 Phase 4, B22;
+  supersedes the "no expiry" part of the user decision 2026-09-24): `Ctrl+H`
+  in the TUI (`end_host_mode`) or the typed command `/sandbox-lease revoke`.
+  After expiry the next host command needs a new approval; under Full
+  Access the TUI grants it without asking. The command
   `/sandbox-lease [status|revoke]` (`busy = "immediate"`) is purely local:
   `status` shows the active grant, `revoke` ends it immediately via
   `revoke_global_approval` + `revoke_session_approval` +
@@ -479,7 +483,7 @@ here, one line each, purpose from the module doc comment:
   `HostLeaseUserControl` marker, which the runtime places exclusively in the
   slash-command `ServiceMap` — it is not an argument, so the model cannot
   forge it. `/status` (`harw-ops/src/status.rs`) additionally shows a
-  "Host-Lease: aktiv (bis Strg+H oder /sandbox-lease revoke) / Einmalfreigabe
+  "Host-Lease: aktiv, noch … (remaining time) / Einmalfreigabe / abgelaufen
   / aus" line. Details of host execution itself live in
   `mediated-process-execution.md`.
 - **`/permissions`** — an overview of workspace identity, sandbox rights,

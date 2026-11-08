@@ -2398,8 +2398,24 @@ impl RuntimeAssemblyBuilder {
         // `SandboxProfile::Host` bleibt beides ungenutzt — `profile_tool_providers`
         // hängt Ledger/Registry nur an einen tatsächlich Host-profilierten
         // `ShellToolProvider`.
-        let host_permit_ledger = Arc::new(ProcessPermitLedger::default());
-        let host_permit_registry = Arc::new(HostPermitSessionRegistry::default());
+        // PL-100 Phase 4 (B22, ADR 0002): jede Host-Arbeitsphase und jeder
+        // ihrer Ledger-Permits gilt höchstens `[sandbox] host_lease_ttl_secs`
+        // (Vorgabe 8 h; der Parser lehnt 0 und mehr als 7 Tage ab).
+        let host_lease_ttl = config.harness.sandbox.effective_host_lease_ttl();
+        let host_permit_ledger = Arc::new(
+            ProcessPermitLedger::with_lease_ttl(host_lease_ttl).map_err(|error| {
+                RuntimeError::Sandbox {
+                    detail: format!("[sandbox] host_lease_ttl_secs: {error}"),
+                }
+            })?,
+        );
+        let host_permit_registry = Arc::new(
+            HostPermitSessionRegistry::with_lease_ttl(host_lease_ttl).map_err(|error| {
+                RuntimeError::Sandbox {
+                    detail: format!("[sandbox] host_lease_ttl_secs: {error}"),
+                }
+            })?,
+        );
         // Runde 6, Teil A2: der Auto-Modus liest den Status der
         // Host-Arbeitsphase aus derselben Registry (Vorfilter und
         // Klassifizierer-Prompt); die Sitzungs-Id setzt die TUI.
@@ -2463,28 +2479,41 @@ impl RuntimeAssemblyBuilder {
         // `shell.exec` (Klon desselben Shell-Providers), Kontrollwerkzeuge
         // für Orchestratoren. Andere Einstiege enden mit ihrem Prozess und
         // bekommen keine Jobs.
-        let (session_jobs, job_notifications) = if spec.entry == EntryKind::Tui {
+        let (session_jobs, job_notifications, job_wiring) = if spec.entry == EntryKind::Tui {
             // `[jobs] max_running` — Höchstzahl laufender Jobs dieser Sitzung.
             // PL-97 E3: `[jobs] cgroup_root`/`trampoline` erreichen den Befehls-Port.
+            let port_options = crate::job_wiring::host_port_options(&config.harness.jobs);
             match crate::job_wiring::SessionJobs::open_with_port(
                 &home_project.state_dir(),
                 config.harness.jobs.effective_max_running(),
-                &crate::job_wiring::host_port_options(&config.harness.jobs),
+                &port_options,
             ) {
-                Ok((jobs, receiver)) => (Some(jobs), Some(receiver)),
+                Ok((jobs, receiver)) => {
+                    // PL-100 WP 3.5: Freezer für `job.suspend`/`job.resume`
+                    // (nur wenn beide in `ALWAYS_ASK_TOOLS` stehen, A2; nie
+                    // fatal, der Grund ohne Freezer ist schon geloggt) und,
+                    // PL-100 (Owner-Befund 4505015316), dieselbe bestätigte
+                    // Wurzel im eigenen Umfang von `sys.ps`/`sys.pgrep`/
+                    // `sys.top` (`JobWiring`).
+                    let (job_wiring, _freezer) = wire_session_jobs(
+                        &jobs,
+                        &port_options,
+                        harw_registry_defaults::ALWAYS_ASK_TOOLS,
+                    );
+                    (Some(jobs), Some(receiver), Some(job_wiring))
+                }
                 Err(error) => {
                     tracing::warn!(error = %error, "runtime.jobs.open_failed");
-                    (None, None)
+                    (None, None, None)
                 }
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
-        let host_permit_wiring = host_permit_wiring.with_jobs(
-            session_jobs
-                .as_ref()
-                .map(crate::job_wiring::SessionJobs::wiring),
-        );
+        // Plan R9, Teil F, und PL-100 (Owner-Befund 4505015316): die
+        // Job-Verdrahtung samt bestätigter Job-Wurzel reist mit der
+        // Host-Permit-Verdrahtung zu Wurzel und Kind-Fabriken.
+        let host_permit_wiring = host_permit_wiring.with_jobs(job_wiring);
         let host_root_label: Option<String> = if uia_ir.is_some() {
             Some(crate::host_escalation_wiring::UIA_ROOT_LABEL.to_owned())
         } else {
@@ -3234,6 +3263,32 @@ impl RuntimeAssemblyBuilder {
             }
             None => registry_builder,
         };
+        // `delegate_wave` an der Wurzel: nur für einen expliziten
+        // Orchestrator-Wurzelagenten (`--agent root-orchestrator` o. ä.),
+        // dessen Definition das Werkzeug admittiert. Vorher bekamen es nur
+        // Kind-Registries — der Wurzel-Orchestrator sah es freigeschaltet,
+        // konnte es aber nicht ausführen.
+        let delegate_wave_root = spawner.as_ref().filter(|_| {
+            profile.operations == OperationSurface::AllWithModelTools
+                && agent_ir.as_ref().is_some_and(|ir| {
+                    matches!(
+                        ir.role(),
+                        AgentRoleId::RootOrchestrator | AgentRoleId::ChildOrchestrator
+                    ) && activation.is_tool_enabled(&ToolName::new(
+                        harw_core_bridge::DELEGATE_WAVE_TOOL.to_owned(),
+                    ))
+                })
+        });
+        let registry_builder = match delegate_wave_root {
+            Some(spawner) => registry_builder.tool_provider(Arc::new(
+                crate::children::root_delegate_wave_provider(
+                    Arc::clone(spawner),
+                    Arc::clone(&stores.state_store),
+                    &agent_roster.custom_wiring(),
+                ),
+            )),
+            None => registry_builder,
+        };
         // Runde 5, Teil K: `agent.status`/`agent.cancel` nur an der
         // TUI-Wurzel (Hintergrund-Agenten gibt es nur dort) — mit Spawner und
         // Modell-Werkzeugfläche; ein expliziter Wurzel-Agent nur, wenn seine
@@ -3671,6 +3726,975 @@ impl RuntimeAssemblyBuilder {
             // Plan R9, Teil F.
             session_jobs,
         })
+    }
+}
+
+/// PL-100 WP 3.5: Ergebnis von [`install_job_freezer`] — installiert oder
+/// der Grund, warum `job.suspend`/`job.resume` typisiert ablehnen
+/// (`SuspendUnavailable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobFreezerSetup {
+    /// Der Freezer ist in der Job-Verwaltung installiert.
+    Installed,
+    /// `job.suspend` oder `job.resume` fehlt in der Nachfrage-Liste
+    /// (`ALWAYS_ASK_TOOLS`): ohne Nachfrage bleibt das Anhalten aus
+    /// (PL-100 §2, Stufe A2 „durch den Menschen, immer mit Nachfrage“).
+    ApprovalGateMissing,
+    /// Keine delegierte cgroup-Wurzel für die Job-cgroups (oder kein Linux).
+    NoDelegatedRoot,
+    /// Der Freezer ließ sich über der delegierten Wurzel nicht öffnen.
+    OpenFailed,
+}
+
+impl JobFreezerSetup {
+    /// Stabiler Grund für das Log-Feld `reason`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::ApprovalGateMissing => "approval_gate_missing",
+            Self::NoDelegatedRoot => "no_delegated_cgroup_root",
+            Self::OpenFailed => "freezer_open_failed",
+        }
+    }
+}
+
+/// PL-100 WP 3.5 und Owner-Befund 4505015316: die Job-Verdrahtung einer
+/// TUI-Sitzung — installiert den Freezer in der Job-Verwaltung von `jobs`
+/// ([`install_job_freezer`]) und hängt die bestätigte Job-Wurzel an die
+/// `JobWiring` für den eigenen Umfang der `sys.*`-Werkzeuge
+/// ([`job_wiring_for_sys_scope`]).
+///
+/// # Beschreibung
+/// Die einzige Stelle, an der die TUI-Montage beides tut; der TUI-Zweig
+/// braucht die zurückgegebene `JobWiring` für Wurzel und Kind-Fabriken.
+/// So prüfen die Tests dieser Funktion auch die Produktionsverdrahtung des
+/// Freezers.
+///
+/// # Arguments
+/// - `jobs`: die Job-Verwaltung der Sitzung.
+/// - `port`: dieselben `[jobs]`-Optionen, mit denen der Befehls-Port
+///   installiert wurde.
+/// - `always_ask`: die Nachfrage-Liste der Montage (`ALWAYS_ASK_TOOLS`).
+///
+/// # Rückgabe
+/// Die `JobWiring` (mit Wurzel, falls bestätigt) und das Ergebnis der
+/// Freezer-Montage (schon geloggt).
+///
+/// # Nebenläufigkeit
+/// Synchron; wie [`install_job_freezer`] und [`delegated_job_root_of`].
+fn wire_session_jobs(
+    jobs: &crate::job_wiring::SessionJobs,
+    port: &harw_command::HostPortOptions,
+    always_ask: &[&str],
+) -> (harw_registry_defaults::JobWiring, JobFreezerSetup) {
+    let freezer = install_job_freezer(&jobs.manager, port, always_ask);
+    (job_wiring_for_sys_scope(jobs.wiring(), port), freezer)
+}
+
+/// PL-100 §2 A2: ob `always_ask` (die Nachfrage-Liste der Montage,
+/// `ALWAYS_ASK_TOOLS`) `job.suspend` **und** `job.resume` enthält.
+fn suspend_tools_always_ask(always_ask: &[&str]) -> bool {
+    [
+        harw_tool_job::JOB_SUSPEND_TOOL,
+        harw_tool_job::JOB_RESUME_TOOL,
+    ]
+    .iter()
+    .all(|tool| always_ask.contains(tool))
+}
+
+/// PL-100 WP 3.5: installiert den Freezer für `job.suspend`/`job.resume`
+/// in der Job-Verwaltung `manager` (Produktion; wirksam nur unter Linux mit
+/// delegierter cgroup-v2-Wurzel).
+///
+/// # Beschreibung
+/// [`install_job_freezer_with`] mit der delegierten Wurzel des Befehls-Ports
+/// ([`delegated_job_root_of`]) und dem cgroup-Freezer
+/// ([`open_cgroup_freezer`]):
+/// - Nachfrage zuerst (fail-closed): nur wenn `always_ask` (in der Montage
+///   `harw_registry_defaults::ALWAYS_ASK_TOOLS`) beide Werkzeuge enthält,
+///   wird überhaupt eine Wurzel gesucht und ein Freezer geöffnet. So
+///   schaltet diese Verdrahtung das Anhalten nie ohne Nachfrage frei, auch
+///   nicht vor dem Registry-Eintrag.
+/// - Der Freezer arbeitet unter derselben delegierten cgroup-Wurzel, unter
+///   der der Befehls-Port die Job-cgroups (`harw-job-<attempt>`) anlegt:
+///   `port` sind dieselben `[jobs]`-Optionen, mit denen der Port installiert
+///   wird ([`harw_command::HostPortOptions::delegated_cgroup_root`]:
+///   `[jobs] cgroup_root` → `HARW_CGROUP_ROOT` → eigene delegierte cgroup).
+/// - Eindämmungsindex des Wardens (`harw_tool_job::MarkerDirHolds` über
+///   `harw_tool_job::CONTAINMENT_HOLDS_DIR`, [`open_cgroup_freezer`]):
+///   zeigt der Host bei der Montage eine Spur eines installierten Wardens
+///   (`harw_tool_job::CONTAINMENT_OWNER_EVIDENCE`), wird der Index für die
+///   Sitzung auf „Warden erwartet“ festgelegt
+///   (`MarkerDirHolds::owner_expected`); verschwindet die Spur später, gilt
+///   ein fehlendes `/run/harw-warden` weiter als fail-closed.
+/// - Ein bei der Montage nicht vertrauenswürdiger Index (etwa Warden-Spur
+///   ohne `/run/harw-warden`, solange der Warden keine Marker schreibt)
+///   verhindert den Freezer nicht (Vertrag von `harw_tool_job::freeze`):
+///   `job.suspend` friert trotzdem ein (die sichere Richtung), `job.resume`
+///   taut ohne vertrauenswürdigen Index nichts auf (fail-closed, Fehler
+///   `probe`); `job.stop` beendet einen angehaltenen Job weiterhin (SIGKILL).
+///   Die Montage meldet das einmal auf `info` ([`with_containment_index`]).
+/// - Nie fatal: ohne Freezer lehnen die Werkzeuge typisiert ab
+///   (`SuspendUnavailable`), die Montage läuft weiter. Nur die fehlende
+///   Nachfrage (eine fehlerhafte `ALWAYS_ASK_TOOLS`) steht auf `warn`; ein
+///   gescheitertes Öffnen über einer bestätigten Wurzel steht auf `info`
+///   (nur mit `reason`, ohne Pfad; der Fehler selbst, er kann einen
+///   cgroup-Pfad enthalten, nur auf `debug`), eine fehlende Wurzel auf
+///   `debug` (der Port hat sie schon gemeldet).
+///
+/// # Rückgabe
+/// [`JobFreezerSetup::Installed`] oder der Grund ohne Freezer.
+///
+/// # Nebenläufigkeit
+/// Kurzer, synchroner Zugriff auf `/proc/self/cgroup`, das
+/// cgroup-Dateisystem und je ein `lstat` der Warden-Spuren und des
+/// Laufzeitverzeichnisses; keine Sperre; einmal je Montage.
+fn install_job_freezer(
+    manager: &harw_tool_job::JobManager,
+    port: &harw_command::HostPortOptions,
+    always_ask: &[&str],
+) -> JobFreezerSetup {
+    install_job_freezer_with(
+        manager,
+        always_ask,
+        || delegated_job_root_of(port),
+        open_cgroup_freezer,
+    )
+}
+
+/// PL-100 WP 3.5: die Naht hinter [`install_job_freezer`] — wählt den
+/// Freezer ([`choose_job_freezer`]), installiert ihn in `manager` und meldet
+/// das Ergebnis.
+///
+/// # Arguments
+/// - `manager`: die Job-Verwaltung der Sitzung.
+/// - `always_ask`: die Nachfrage-Liste der Montage (`ALWAYS_ASK_TOOLS`).
+/// - `root`: liefert die bestätigte delegierte cgroup-Wurzel der Job-cgroups
+///   (`None`: keine); wird erst nach der Nachfrage-Prüfung befragt.
+/// - `open`: öffnet den Freezer über dieser Wurzel; wird nur mit Nachfrage
+///   und Wurzel befragt.
+///
+/// # Rückgabe
+/// [`JobFreezerSetup::Installed`], wenn `manager` den geöffneten Freezer
+/// hält, sonst der Grund ohne Freezer (der Manager bleibt dann unverändert).
+///
+/// # Nebenläufigkeit
+/// Synchron; so lange wie `root` und `open`.
+fn install_job_freezer_with<R, O>(
+    manager: &harw_tool_job::JobManager,
+    always_ask: &[&str],
+    root: R,
+    open: O,
+) -> JobFreezerSetup
+where
+    R: FnOnce() -> Option<PathBuf>,
+    O: FnOnce(&Path) -> Result<Arc<dyn harw_tool_job::JobFreezer>, harw_tool_job::FreezeError>,
+{
+    let setup = match choose_job_freezer(always_ask, root, open) {
+        Ok(freezer) => {
+            manager.set_freezer(freezer);
+            JobFreezerSetup::Installed
+        }
+        Err(skip) => skip,
+    };
+    match setup {
+        JobFreezerSetup::Installed => tracing::info!("runtime.jobs.freezer_installed"),
+        // Eine `ALWAYS_ASK_TOOLS` ohne beide Werkzeuge ist ein Montagefehler.
+        JobFreezerSetup::ApprovalGateMissing => {
+            tracing::warn!(reason = setup.as_str(), "runtime.jobs.suspend_unavailable")
+        }
+        // Eine Host-Eigenschaft (kein nutzbarer Freezer): kein Befund, nur
+        // der Grund (ohne Pfad).
+        JobFreezerSetup::OpenFailed => {
+            tracing::info!(reason = setup.as_str(), "runtime.jobs.suspend_unavailable")
+        }
+        JobFreezerSetup::NoDelegatedRoot => {
+            tracing::debug!(reason = setup.as_str(), "runtime.jobs.suspend_unavailable")
+        }
+    }
+    setup
+}
+
+/// Wählt den Freezer für [`install_job_freezer_with`]: zuerst die
+/// Nachfrage, dann die delegierte Wurzel, dann das Öffnen.
+///
+/// # Fehler
+/// [`JobFreezerSetup::ApprovalGateMissing`] (weder `root` noch `open`
+/// befragt), [`JobFreezerSetup::NoDelegatedRoot`] (`open` nicht befragt)
+/// oder [`JobFreezerSetup::OpenFailed`] (`open` scheitert); der Fehler
+/// selbst steht nur auf `debug`.
+fn choose_job_freezer<R, O>(
+    always_ask: &[&str],
+    root: R,
+    open: O,
+) -> Result<Arc<dyn harw_tool_job::JobFreezer>, JobFreezerSetup>
+where
+    R: FnOnce() -> Option<PathBuf>,
+    O: FnOnce(&Path) -> Result<Arc<dyn harw_tool_job::JobFreezer>, harw_tool_job::FreezeError>,
+{
+    if !suspend_tools_always_ask(always_ask) {
+        return Err(JobFreezerSetup::ApprovalGateMissing);
+    }
+    let root = root().ok_or(JobFreezerSetup::NoDelegatedRoot)?;
+    open(root.as_path()).map_err(|error| {
+        // Der Fehler kann einen cgroup-Pfad enthalten: nur auf `debug`.
+        tracing::debug!(error = %error, "runtime.jobs.freezer_open_failed");
+        JobFreezerSetup::OpenFailed
+    })
+}
+
+/// Der Produktions-Freezer für [`install_job_freezer`]: ein
+/// `harw_tool_job::CgroupFreezer` über der delegierten Wurzel `root`
+/// (absolut, auf dem cgroup-v2-Mount) mit dem Eindämmungsindex des Wardens
+/// ([`with_containment_index`]; „Warden erwartet“, wenn der Host bei der
+/// Montage eine Spur eines installierten Wardens zeigt,
+/// [`warden_evidence_present`]).
+///
+/// # Fehler
+/// [`harw_tool_job::FreezeError`], wenn `root` kein delegiertes,
+/// beschreibbares cgroup-v2-Verzeichnis ist. Der Zustand des
+/// Eindämmungsindex ist kein Fehler beim Öffnen (siehe
+/// [`with_containment_index`]).
+///
+/// # Nebenläufigkeit
+/// Synchron: cgroupfs-Zugriffe und je ein `lstat` der Spuren und des
+/// Laufzeitverzeichnisses; keine Sperre; einmal je Montage.
+#[cfg(target_os = "linux")]
+fn open_cgroup_freezer(
+    root: &Path,
+) -> Result<Arc<dyn harw_tool_job::JobFreezer>, harw_tool_job::FreezeError> {
+    let freezer = harw_tool_job::CgroupFreezer::open(root)?;
+    Ok(with_containment_index(
+        freezer,
+        harw_tool_job::MarkerDirHolds::default(),
+        warden_evidence_present(&harw_tool_job::CONTAINMENT_OWNER_EVIDENCE),
+    ))
+}
+
+/// PL-100 WP 3.5: ob einer der Pfade `evidence` einen installierten Warden
+/// zeigt — er existiert oder seine Abwesenheit ist nicht beweisbar (etwa
+/// fehlende Rechte). Dieselbe Regel wie die Erkennung in
+/// `harw_tool_job::MarkerDirHolds` (`OwnerPresence::Detect`), hier einmal
+/// bei der Montage ausgewertet.
+///
+/// # Arguments
+/// - `evidence`: absolute Pfade (Produktion:
+///   `harw_tool_job::CONTAINMENT_OWNER_EVIDENCE`).
+///
+/// # Nebenläufigkeit
+/// Je Pfad ein `lstat`; folgt keinem symbolischen Link.
+#[cfg(target_os = "linux")]
+fn warden_evidence_present<P: AsRef<Path>>(evidence: &[P]) -> bool {
+    evidence.iter().any(|path| {
+        !matches!(
+            std::fs::symlink_metadata(path.as_ref()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    })
+}
+
+/// PL-100 WP 3.5: legt den Eindämmungsindex des Produktions-Freezers fest.
+///
+/// # Beschreibung
+/// - `warden_expected`: der Index wird für die Sitzung auf „Warden
+///   erwartet“ festgelegt (`MarkerDirHolds::owner_expected`), und
+///   `freezer` wird in [`OwnerExpectedFreezer`] gehüllt. So bleibt ein
+///   fehlendes `/run/harw-warden` fail-closed, auch wenn die Spur des
+///   Wardens nach der Montage verschwindet.
+/// - Sonst bleibt `freezer` unverändert (sein Standardindex erkennt einen
+///   Warden selbst an seinen Spuren).
+/// - Der Freezer wird immer zurückgegeben, auch wenn der Index gerade
+///   nicht vertrauenswürdig ist (Vertrag von `harw_tool_job::freeze`):
+///   `job.suspend` friert dann trotzdem ein, `job.resume` taut nichts auf,
+///   bis der Index vertrauenswürdig ist; der Manager fragt ihn bei jedem
+///   Aufruf neu. Fehlt das Laufzeitverzeichnis eines erwarteten Wardens
+///   schon bei der Montage, meldet das ein `info`-Eintrag (nur `reason`,
+///   kein Pfad), damit ein abgelehntes `job.resume` erklärbar ist.
+///
+/// # Arguments
+/// - `freezer`: der geöffnete Freezer; sein eigener Index muss dasselbe
+///   Verzeichnis lesen wie `index` (Produktion: beide
+///   `harw_tool_job::CONTAINMENT_HOLDS_DIR`).
+/// - `index`: der Eindämmungsindex in Erkennungs-Modus.
+/// - `warden_expected`: Ergebnis von [`warden_evidence_present`].
+///
+/// # Rückgabe
+/// Der Freezer für `JobManager::set_freezer`.
+///
+/// # Nebenläufigkeit
+/// Synchron; höchstens ein `lstat`, keine Sperre.
+#[cfg(target_os = "linux")]
+fn with_containment_index<F>(
+    freezer: F,
+    index: harw_tool_job::MarkerDirHolds,
+    warden_expected: bool,
+) -> Arc<dyn harw_tool_job::JobFreezer>
+where
+    F: harw_tool_job::JobFreezer + 'static,
+{
+    if !warden_expected {
+        return Arc::new(freezer);
+    }
+    let index = index.owner_expected();
+    if expected_runtime_dir_missing(index.dir()) {
+        // Diagnose only: the freezer is still installed (suspend freezes,
+        // resume stays refused until the Warden's index exists).
+        tracing::info!(
+            reason = "containment_index_untrusted",
+            "runtime.jobs.resume_refused_until_containment_index"
+        );
+    }
+    Arc::new(OwnerExpectedFreezer {
+        inner: freezer,
+        index,
+    })
+}
+
+/// PL-100 WP 3.5: ein Freezer, dessen Eindämmungsindex für die Sitzung auf
+/// „Warden erwartet“ festgelegt ist (`MarkerDirHolds::owner_expected`).
+///
+/// # Beschreibung
+/// `harw_tool_job::CgroupFreezer::with_holds` braucht ein
+/// `harw_job_linux`-Backend, das `harw-runtime` nicht kennt; deshalb hüllt
+/// die Montage den geöffneten Freezer:
+/// - `containment_lease` nimmt die Sperre über `index` (dasselbe
+///   Verzeichnis wie der Index von `inner`, aber fail-closed bei fehlendem
+///   Laufzeitverzeichnis des Wardens).
+/// - `containment_held` lehnt bei fehlendem Laufzeitverzeichnis ab
+///   (`ContainmentIndexUnreadable`) und fragt sonst `inner`: mit vorhandenem
+///   Laufzeitverzeichnis prüfen beide Modi von `MarkerDirHolds` gleich.
+/// - Alle anderen Methoden reichen unverändert an `inner` durch.
+///
+/// # Nebenläufigkeit
+/// `Send + Sync` wie `inner`; kurze, synchrone Zugriffe.
+#[cfg(target_os = "linux")]
+struct OwnerExpectedFreezer<F> {
+    // Der geöffnete Freezer (Produktion: `harw_tool_job::CgroupFreezer`).
+    inner: F,
+    // Der festgelegte Index (`owner_expected`).
+    index: harw_tool_job::MarkerDirHolds,
+}
+
+#[cfg(target_os = "linux")]
+impl<F: harw_tool_job::JobFreezer> harw_tool_job::JobFreezer for OwnerExpectedFreezer<F> {
+    fn delegated_root(&self) -> &str {
+        self.inner.delegated_root()
+    }
+
+    fn freeze(&self, leaf: &str) -> Result<(), harw_tool_job::FreezeError> {
+        self.inner.freeze(leaf)
+    }
+
+    fn thaw(&self, leaf: &str) -> Result<(), harw_tool_job::FreezeError> {
+        self.inner.thaw(leaf)
+    }
+
+    fn is_frozen(&self, leaf: &str) -> Result<bool, harw_tool_job::FreezeError> {
+        self.inner.is_frozen(leaf)
+    }
+
+    fn freeze_requested(&self, leaf: &str) -> Result<bool, harw_tool_job::FreezeError> {
+        self.inner.freeze_requested(leaf)
+    }
+
+    fn containment_held(&self, leaf: &str) -> Result<bool, harw_tool_job::FreezeError> {
+        if expected_runtime_dir_missing(self.index.dir()) {
+            return Err(harw_tool_job::FreezeError::ContainmentIndexUnreadable {
+                reason: "the runtime directory of an expected containment owner is missing",
+            });
+        }
+        self.inner.containment_held(leaf)
+    }
+
+    fn containment_lease(
+        &self,
+    ) -> Result<harw_tool_job::ContainmentLease, harw_tool_job::FreezeError> {
+        harw_tool_job::ContainmentHolds::lease(&self.index)
+    }
+}
+
+/// Ob das Laufzeitverzeichnis des Wardens (der Elternordner des
+/// Indexverzeichnisses `index_dir`) fehlt; ohne Elternordner ebenfalls
+/// `true`. Andere Lesefehler meldet der Index selbst.
+#[cfg(target_os = "linux")]
+fn expected_runtime_dir_missing(index_dir: &Path) -> bool {
+    index_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .is_none_or(|parent| {
+            matches!(
+                std::fs::symlink_metadata(parent),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
+}
+
+/// PL-100 (Owner-Befund 4505015316): die bestätigte delegierte
+/// cgroup-Wurzel der Job-cgroups für den eigenen Umfang der auflistenden
+/// `sys.*`-Werkzeuge (`harw_registry_defaults::JobWiring::with_delegated_cgroup_root`).
+///
+/// # Beschreibung
+/// Dieselbe Wurzel wie für den Befehls-Port und den Freezer
+/// ([`harw_command::HostPortOptions::delegated_cgroup_root`]: `[jobs]
+/// cgroup_root` → `HARW_CGROUP_ROOT` → eigene delegierte cgroup, nur vom
+/// Host-Probe bestätigte delegierte cgroup-v2-Wurzeln). Loggt nichts (der
+/// Port hat das Ergebnis schon gemeldet).
+///
+/// # Rückgabe
+/// `None`, wenn keine Wurzel bestätigt ist.
+///
+/// # Nebenläufigkeit
+/// Kurzer, synchroner Zugriff auf Umgebung, `/proc/self/cgroup` und das
+/// cgroup-Dateisystem; einmal je Montage.
+#[cfg(target_os = "linux")]
+fn delegated_job_root_of(port: &harw_command::HostPortOptions) -> Option<PathBuf> {
+    port.delegated_cgroup_root()
+}
+
+/// Ohne Linux gibt es keine delegierte cgroup-Wurzel: immer `None`.
+#[cfg(not(target_os = "linux"))]
+fn delegated_job_root_of(_port: &harw_command::HostPortOptions) -> Option<PathBuf> {
+    None
+}
+
+/// PL-100 (Owner-Befund 4505015316): die Job-Verdrahtung der Sitzung samt
+/// der vom Befehls-Port bestätigten Job-Wurzel ([`delegated_job_root_of`]),
+/// wie sie über die Host-Permit-Verdrahtung zu Wurzel und Kind-Fabriken
+/// reist; das Profil `Full` nimmt die Wurzel in den eigenen Umfang von
+/// `sys.ps`, `sys.pgrep` und `sys.top` auf.
+///
+/// # Rückgabe
+/// `wiring` mit gesetzter Wurzel, oder ohne Wurzel, wenn keine bestätigt ist
+/// (fail-closed: eine unbestätigte Wurzel erreicht den `sys.*`-Umfang nie).
+fn job_wiring_for_sys_scope(
+    wiring: harw_registry_defaults::JobWiring,
+    port: &harw_command::HostPortOptions,
+) -> harw_registry_defaults::JobWiring {
+    wiring.with_delegated_cgroup_root(delegated_job_root_of(port))
+}
+
+/// Ohne Linux gibt es keinen cgroup-Freezer. Erreicht wird das nie:
+/// [`delegated_job_root_of`] liefert dort keine Wurzel, die Montage endet
+/// also nach der Nachfrage-Prüfung mit [`JobFreezerSetup::NoDelegatedRoot`].
+///
+/// # Fehler
+/// Immer [`harw_tool_job::FreezeError::Unsupported`].
+#[cfg(not(target_os = "linux"))]
+fn open_cgroup_freezer(
+    _root: &Path,
+) -> Result<Arc<dyn harw_tool_job::JobFreezer>, harw_tool_job::FreezeError> {
+    Err(harw_tool_job::FreezeError::Unsupported {
+        feature: "cgroup v2 freezer",
+    })
+}
+
+// PL-100 WP 3.5: Montage des `job.suspend`-Freezers.
+#[cfg(test)]
+mod job_freezer_tests {
+    use super::{
+        JobFreezerSetup, install_job_freezer, install_job_freezer_with, suspend_tools_always_ask,
+        wire_session_jobs,
+    };
+    use crate::test_support::TestResult;
+    use harw_tool_job::{
+        ContainmentLease, FreezeError, JOB_RESUME_TOOL, JOB_SUSPEND_TOOL, JobFreezer,
+    };
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// Eine Nachfrage-Liste mit beiden Anhalte-Werkzeugen.
+    const GATED: &[&str] = &["process.kill", JOB_SUSPEND_TOOL, JOB_RESUME_TOOL];
+
+    /// Ein Freezer ohne cgroup für die Naht [`install_job_freezer_with`]:
+    /// jede Operation gelingt, nichts wird berührt. Ob die Job-Verwaltung
+    /// ihn hält, zeigt `Arc::strong_count` (die Verwaltung hat keinen
+    /// lesenden Zugriff auf ihren Freezer).
+    struct FakeFreezer;
+
+    impl JobFreezer for FakeFreezer {
+        fn delegated_root(&self) -> &str {
+            "/harw-wp35-fake.slice"
+        }
+
+        fn freeze(&self, _leaf: &str) -> Result<(), FreezeError> {
+            Ok(())
+        }
+
+        fn thaw(&self, _leaf: &str) -> Result<(), FreezeError> {
+            Ok(())
+        }
+
+        fn is_frozen(&self, _leaf: &str) -> Result<bool, FreezeError> {
+            Ok(false)
+        }
+
+        fn freeze_requested(&self, _leaf: &str) -> Result<bool, FreezeError> {
+            Ok(false)
+        }
+
+        fn containment_held(&self, _leaf: &str) -> Result<bool, FreezeError> {
+            Ok(false)
+        }
+
+        fn containment_lease(&self) -> Result<ContainmentLease, FreezeError> {
+            Ok(ContainmentLease::unlocked())
+        }
+    }
+
+    /// Ein weiterer Griff auf `fake` als `JobFreezer` (wie ihn ein Öffner
+    /// liefert).
+    fn handle(fake: &Arc<FakeFreezer>) -> Arc<dyn JobFreezer> {
+        Arc::clone(fake) as Arc<dyn JobFreezer>
+    }
+
+    /// Abgelehnte (relative), fehlende und nicht delegierte Wurzeln.
+    const UNUSABLE_ROOTS: [&str; 3] = [
+        "relative/harw.slice",
+        "/tmp/harw-not-a-cgroup",
+        "/sys/fs/cgroup/harw-wp35-does-not-exist.slice",
+    ];
+
+    /// Eine Job-Verwaltung ohne Montage-Notizen unter `dir`.
+    fn manager(dir: &std::path::Path) -> TestResult<Arc<harw_tool_job::JobManager>> {
+        Ok(harw_tool_job::JobManager::new(
+            harw_tool_job::JobManagerConfig::new(dir),
+            Arc::new(harw_tool_job::NoopNotifier),
+        )?)
+    }
+
+    /// Befehls-Port-Optionen mit `[jobs] cgroup_root = root`.
+    fn port(root: impl Into<PathBuf>) -> harw_command::HostPortOptions {
+        harw_command::HostPortOptions {
+            cgroup_root: Some(root.into()),
+            trampoline: None,
+        }
+    }
+
+    /// PL-100 A2: nur beide Anhalte-Werkzeuge zusammen öffnen die
+    /// Nachfrage-Sperre.
+    #[test]
+    fn suspend_tools_must_both_always_ask() -> TestResult {
+        assert!(suspend_tools_always_ask(GATED));
+        assert!(suspend_tools_always_ask(&[
+            JOB_RESUME_TOOL,
+            JOB_SUSPEND_TOOL
+        ]));
+        let ungated: [&[&str]; 4] = [
+            &[],
+            &[JOB_SUSPEND_TOOL],
+            &[JOB_RESUME_TOOL],
+            &["process.kill", "job.stop"],
+        ];
+        for list in ungated {
+            assert!(!suspend_tools_always_ask(list), "{list:?}");
+        }
+        Ok(())
+    }
+
+    /// PL-100 A2: ohne beide Werkzeuge in der Nachfrage-Liste wird kein
+    /// Freezer geöffnet — geprüft vor der cgroup-Wurzel, also auf jedem
+    /// Host. Mit der Liste der Montage gilt dasselbe, solange
+    /// `ALWAYS_ASK_TOOLS` die beiden Namen nicht führt.
+    #[test]
+    fn missing_approval_gate_installs_no_freezer() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let manager = manager(dir.path())?;
+        let options = port("/sys/fs/cgroup/harw-wp35-does-not-exist.slice");
+        let ungated: [&[&str]; 3] = [&[], &[JOB_SUSPEND_TOOL], &[JOB_RESUME_TOOL]];
+        for list in ungated {
+            assert_eq!(
+                install_job_freezer(&manager, &options, list),
+                JobFreezerSetup::ApprovalGateMissing,
+                "{list:?}"
+            );
+        }
+        let production = harw_registry_defaults::ALWAYS_ASK_TOOLS;
+        let setup = install_job_freezer(&manager, &options, production);
+        if suspend_tools_always_ask(production) {
+            assert_eq!(setup, JobFreezerSetup::NoDelegatedRoot);
+        } else {
+            assert_eq!(setup, JobFreezerSetup::ApprovalGateMissing);
+        }
+        Ok(())
+    }
+
+    /// Mit Nachfrage installiert eine abgelehnte (relative), fehlende oder
+    /// nicht delegierte Wurzel keinen Freezer und lässt die Montage
+    /// weiterlaufen.
+    #[test]
+    fn unusable_cgroup_root_installs_no_freezer() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let manager = manager(dir.path())?;
+        for root in UNUSABLE_ROOTS {
+            assert_eq!(
+                install_job_freezer(&manager, &port(root), GATED),
+                JobFreezerSetup::NoDelegatedRoot,
+                "{root}"
+            );
+        }
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5 (Owner-Befund „Freezer in Produktion verdrahten“): mit
+    /// Nachfrage und bestätigter Wurzel öffnet die Montage den Freezer genau
+    /// über dieser Wurzel, und die Job-Verwaltung hält ihn — `job.suspend`
+    /// meldet dann nicht mehr `SuspendUnavailable`.
+    #[test]
+    fn a_confirmed_root_installs_the_freezer_opened_over_it() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let manager = manager(dir.path())?;
+        let root = dir.path().join("harw-wp35.slice");
+        let fake = Arc::new(FakeFreezer);
+        let mut opened_over: Option<PathBuf> = None;
+        let setup = install_job_freezer_with(
+            &manager,
+            GATED,
+            || Some(root.clone()),
+            |path| {
+                opened_over = Some(path.to_path_buf());
+                Ok(handle(&fake))
+            },
+        );
+        assert_eq!(setup, JobFreezerSetup::Installed);
+        assert_eq!(opened_over.as_deref(), Some(root.as_path()));
+        // Ein Griff hier, einer in der Job-Verwaltung.
+        assert_eq!(Arc::strong_count(&fake), 2);
+        Ok(())
+    }
+
+    /// Ohne Nachfrage wird weder eine Wurzel gesucht noch ein Freezer
+    /// geöffnet, ohne Wurzel kein Freezer geöffnet; ein gescheitertes Öffnen
+    /// lässt die Job-Verwaltung ohne Freezer und die Montage weiterlaufen.
+    #[test]
+    fn the_freezer_is_opened_only_behind_the_gate_and_a_root() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let manager = manager(dir.path())?;
+        let fake = Arc::new(FakeFreezer);
+
+        let mut root_asked = false;
+        let mut opened_without_gate = false;
+        let setup = install_job_freezer_with(
+            &manager,
+            &[JOB_SUSPEND_TOOL],
+            || {
+                root_asked = true;
+                Some(dir.path().to_path_buf())
+            },
+            |_| {
+                opened_without_gate = true;
+                Ok(handle(&fake))
+            },
+        );
+        assert_eq!(setup, JobFreezerSetup::ApprovalGateMissing);
+        assert!(!root_asked, "no root lookup without the approval gate");
+        assert!(!opened_without_gate, "no freezer without the approval gate");
+
+        let mut opened_without_root = false;
+        let setup = install_job_freezer_with(
+            &manager,
+            GATED,
+            || None,
+            |_| {
+                opened_without_root = true;
+                Ok(handle(&fake))
+            },
+        );
+        assert_eq!(setup, JobFreezerSetup::NoDelegatedRoot);
+        assert!(!opened_without_root, "no freezer without a confirmed root");
+
+        let setup = install_job_freezer_with(
+            &manager,
+            GATED,
+            || Some(dir.path().to_path_buf()),
+            |_| Err(FreezeError::Unavailable),
+        );
+        assert_eq!(setup, JobFreezerSetup::OpenFailed);
+        // Kein Öffner hat einen Griff herausgegeben, die Verwaltung hält keinen.
+        assert_eq!(Arc::strong_count(&fake), 1);
+        Ok(())
+    }
+
+    /// Der Produktions-Öffner lehnt ein gewöhnliches Verzeichnis (kein
+    /// cgroup v2) ab: kein Freezer, die Montage läuft weiter.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_production_opener_refuses_a_plain_directory() -> TestResult {
+        use super::open_cgroup_freezer;
+        let dir = tempfile::tempdir()?;
+        let manager = manager(dir.path())?;
+        assert!(open_cgroup_freezer(dir.path()).is_err());
+        assert_eq!(
+            install_job_freezer_with(
+                &manager,
+                GATED,
+                || Some(dir.path().to_path_buf()),
+                open_cgroup_freezer,
+            ),
+            JobFreezerSetup::OpenFailed
+        );
+        Ok(())
+    }
+
+    /// Owner-Befund „Freezer in Produktion verdrahten“: der TUI-Zweig der
+    /// Montage verdrahtet die Jobs über [`wire_session_jobs`]. Mit der
+    /// Nachfrage-Liste der Montage (`ALWAYS_ASK_TOOLS`, die beide Werkzeuge
+    /// führen muss) versucht sie den Freezer: ohne bestätigte Wurzel endet
+    /// das bei `NoDelegatedRoot`, nicht an der Nachfrage. Eine unbestätigte
+    /// Wurzel erreicht weder Freezer noch `sys.*`-Umfang.
+    #[test]
+    fn session_job_wiring_tries_the_freezer_behind_the_production_gate() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let jobs = crate::job_wiring::SessionJobs {
+            manager: manager(dir.path())?,
+            router: crate::job_wiring::JobEventRouter::new(),
+        };
+        let options = port("/sys/fs/cgroup/harw-wp35-does-not-exist.slice");
+        let production = harw_registry_defaults::ALWAYS_ASK_TOOLS;
+        assert!(
+            suspend_tools_always_ask(production),
+            "ALWAYS_ASK_TOOLS must list job.suspend and job.resume"
+        );
+        let (wiring, setup) = wire_session_jobs(&jobs, &options, production);
+        assert_eq!(setup, JobFreezerSetup::NoDelegatedRoot);
+        assert_eq!(wiring.delegated_cgroup_root, None);
+        // Wurzel und Kinder bekommen dieselbe Job-Verwaltung, in die die
+        // Montage den Freezer installiert.
+        assert!(Arc::ptr_eq(&wiring.manager, &jobs.manager));
+
+        let (_, setup) = wire_session_jobs(&jobs, &options, &[JOB_SUSPEND_TOOL]);
+        assert_eq!(setup, JobFreezerSetup::ApprovalGateMissing);
+        Ok(())
+    }
+
+    /// Spuren eines installierten Wardens: ein vorhandener Pfad zählt, ein
+    /// fehlender nicht.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn warden_evidence_is_an_existing_path() -> TestResult {
+        use super::warden_evidence_present;
+        let dir = tempfile::tempdir()?;
+        let enable = dir.path().join("warden.enable");
+        let socket = dir.path().join("warden.sock");
+        assert!(!warden_evidence_present(&[&enable, &socket]));
+        assert!(!warden_evidence_present::<&std::path::Path>(&[]));
+        std::fs::write(&enable, "")?;
+        assert!(warden_evidence_present(&[&enable, &socket]));
+        Ok(())
+    }
+
+    /// Ein Eindämmungsindex unter `dir` (`<dir>/run/holds`), dessen
+    /// Laufzeitverzeichnis `<dir>/run` noch fehlt; Warden-Spur ist allein
+    /// `<dir>/warden.enable`.
+    #[cfg(target_os = "linux")]
+    fn index_under(dir: &std::path::Path) -> harw_tool_job::MarkerDirHolds {
+        harw_tool_job::MarkerDirHolds::new(dir.join("run").join("holds"))
+            .with_owner_evidence([dir.join("warden.enable")])
+    }
+
+    /// PL-100 WP 3.5 (Vertrag von `harw_tool_job::freeze`, Option A der
+    /// Review-Runde 2): mit Warden-Spur, aber ohne dessen
+    /// Laufzeitverzeichnis (heute jeder Host mit installiertem Warden) wird
+    /// der Freezer trotzdem installiert, mit auf „Warden erwartet“
+    /// festgelegtem Index: Einfrieren reicht durch, die Prüfung vor dem
+    /// Auftauen (`containment_held`, `containment_lease`) lehnt fail-closed
+    /// ab, bis das Laufzeitverzeichnis existiert. Ohne Spur bleibt der
+    /// geöffnete Freezer unverändert.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_untrusted_index_still_gets_the_pinned_freezer() -> TestResult {
+        use super::with_containment_index;
+        let dir = tempfile::tempdir()?;
+        let manager = manager(dir.path())?;
+
+        let pinned = with_containment_index(FakeFreezer, index_under(dir.path()), true);
+        assert!(pinned.freeze("harw-job-a").is_ok(), "suspend still freezes");
+        assert!(matches!(
+            pinned.containment_held("harw-job-a"),
+            Err(FreezeError::ContainmentIndexUnreadable { .. })
+        ));
+        assert!(matches!(
+            pinned.containment_lease(),
+            Err(FreezeError::ContainmentIndexUnreadable { .. })
+        ));
+        let mut handed_out: Option<Arc<dyn JobFreezer>> = None;
+        assert_eq!(
+            install_job_freezer_with(
+                &manager,
+                GATED,
+                || Some(dir.path().to_path_buf()),
+                |_| {
+                    let freezer =
+                        with_containment_index(FakeFreezer, index_under(dir.path()), true);
+                    handed_out = Some(Arc::clone(&freezer));
+                    Ok(freezer)
+                },
+            ),
+            JobFreezerSetup::Installed,
+            "an untrusted index does not withhold the freezer"
+        );
+        // Ein Griff hier, einer in der Job-Verwaltung: sie hält genau den
+        // festgelegten Wrapper.
+        let installed = handed_out.ok_or(crate::test_support::TestError::Missing("freezer"))?;
+        assert_eq!(Arc::strong_count(&installed), 2);
+
+        // Kein Warden erwartet: der geöffnete Freezer bleibt unverändert.
+        let plain = with_containment_index(FakeFreezer, index_under(dir.path()), false);
+        assert_eq!(plain.containment_held("harw-job-a"), Ok(false));
+        assert!(plain.containment_lease().is_ok());
+        Ok(())
+    }
+
+    /// Der festgelegte Index bleibt fail-closed, auch ohne Warden-Spur:
+    /// fehlt das Laufzeitverzeichnis, lehnen `containment_held` und
+    /// `containment_lease` ab; mit Laufzeitverzeichnis entscheidet der
+    /// innere Freezer. Alles andere reicht unverändert durch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_owner_expected_freezer_fails_closed_without_the_runtime_dir() -> TestResult {
+        use super::{OwnerExpectedFreezer, expected_runtime_dir_missing};
+        let dir = tempfile::tempdir()?;
+        let freezer = OwnerExpectedFreezer {
+            inner: FakeFreezer,
+            index: index_under(dir.path()).owner_expected(),
+        };
+        assert_eq!(freezer.delegated_root(), FakeFreezer.delegated_root());
+        assert!(freezer.freeze("harw-job-a").is_ok());
+        assert!(freezer.thaw("harw-job-a").is_ok());
+        assert_eq!(freezer.is_frozen("harw-job-a"), Ok(false));
+        assert_eq!(freezer.freeze_requested("harw-job-a"), Ok(false));
+
+        assert!(matches!(
+            freezer.containment_held("harw-job-a"),
+            Err(FreezeError::ContainmentIndexUnreadable { .. })
+        ));
+        assert!(matches!(
+            freezer.containment_lease(),
+            Err(FreezeError::ContainmentIndexUnreadable { .. })
+        ));
+
+        std::fs::create_dir(dir.path().join("run"))?;
+        assert_eq!(freezer.containment_held("harw-job-a"), Ok(false));
+
+        assert!(expected_runtime_dir_missing(std::path::Path::new("holds")));
+        assert!(!expected_runtime_dir_missing(
+            &dir.path().join("run").join("holds")
+        ));
+        Ok(())
+    }
+
+    /// Eine delegierte Wurzel aus `[jobs] cgroup_root` installiert den
+    /// Freezer nur mit Nachfrage.
+    ///
+    /// Host-gebunden: `HARW_TEST_CGROUP_ROOT` auf ein delegiertes
+    /// cgroup-v2-Verzeichnis setzen und mit `--ignored` laufen lassen. Ohne
+    /// `--ignored` meldet der Testlauf den Test als ignoriert statt ihn
+    /// still zu bestehen; mit `--ignored` scheitert er ohne delegierte
+    /// Wurzel.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a delegated cgroup v2 root in HARW_TEST_CGROUP_ROOT"]
+    fn delegated_cgroup_root_installs_the_freezer_only_with_approval() -> TestResult {
+        use crate::test_support::TestError;
+        let root = std::env::var_os("HARW_TEST_CGROUP_ROOT")
+            .map(PathBuf::from)
+            .ok_or(TestError::Missing("HARW_TEST_CGROUP_ROOT"))?;
+        let options = port(root);
+        if options.delegated_cgroup_root().is_none() {
+            return Err(TestError::Missing(
+                "HARW_TEST_CGROUP_ROOT as a delegated cgroup v2 root",
+            ));
+        }
+        let dir = tempfile::tempdir()?;
+        let manager = manager(dir.path())?;
+        assert_eq!(
+            install_job_freezer(&manager, &options, &[JOB_SUSPEND_TOOL]),
+            JobFreezerSetup::ApprovalGateMissing
+        );
+        // Also on a host with Warden evidence but no trusted containment
+        // index: job.resume then fails closed, the freezer is installed.
+        assert_eq!(
+            install_job_freezer(&manager, &options, GATED),
+            JobFreezerSetup::Installed
+        );
+        Ok(())
+    }
+}
+
+// PL-100 (Owner-Befund 4505015316): die Job-Wurzel für den eigenen Umfang
+// der `sys.*`-Prozesswerkzeuge.
+#[cfg(test)]
+mod sys_scope_job_root_tests {
+    use super::{delegated_job_root_of, job_wiring_for_sys_scope};
+    use crate::test_support::TestResult;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// Befehls-Port-Optionen mit `[jobs] cgroup_root = root`.
+    fn port(root: impl Into<PathBuf>) -> harw_command::HostPortOptions {
+        harw_command::HostPortOptions {
+            cgroup_root: Some(root.into()),
+            trampoline: None,
+        }
+    }
+
+    /// Die Job-Verdrahtung einer Sitzung unter `dir`, noch ohne Wurzel.
+    fn wiring(dir: &std::path::Path) -> TestResult<harw_registry_defaults::JobWiring> {
+        let manager = harw_tool_job::JobManager::new(
+            harw_tool_job::JobManagerConfig::new(dir),
+            Arc::new(harw_tool_job::NoopNotifier),
+        )?;
+        Ok(harw_registry_defaults::JobWiring::new(
+            manager,
+            Arc::new(harw_tool_job::NoLineage),
+        ))
+    }
+
+    /// Eine abgelehnte (relative), fehlende oder nicht delegierte Wurzel
+    /// erreicht den `sys.*`-Umfang nie: an die `JobWiring`, die zu Wurzel
+    /// und Kind-Fabriken reist, wird keine Wurzel gehängt (fail-closed).
+    #[test]
+    fn unconfirmed_cgroup_roots_never_reach_the_sys_scope() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        for root in [
+            "relative/harw.slice",
+            "/tmp/harw-not-a-cgroup",
+            "/sys/fs/cgroup/harw-pl100-does-not-exist.slice",
+        ] {
+            assert_eq!(delegated_job_root_of(&port(root)), None, "{root}");
+            let attached = job_wiring_for_sys_scope(wiring(dir.path())?, &port(root));
+            assert_eq!(attached.delegated_cgroup_root, None, "{root}");
+        }
+        Ok(())
+    }
+
+    /// Review-Befund (Owner-Befund 4505015316): eine vom Host-Probe
+    /// bestätigte Wurzel landet genau so in der `JobWiring`, wie der
+    /// Befehls-Port sie für die Job-cgroups benutzt.
+    ///
+    /// Host-gated: `HARW_TEST_CGROUP_ROOT` muss eine delegierte
+    /// cgroup-v2-Wurzel nennen; mit `--ignored` ausführen. Fehlt sie oder
+    /// ist sie nicht delegiert, scheitert der Test, statt still zu bestehen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a delegated cgroup v2 root in HARW_TEST_CGROUP_ROOT"]
+    fn a_confirmed_cgroup_root_reaches_the_job_wiring() -> TestResult {
+        let root = std::env::var_os("HARW_TEST_CGROUP_ROOT")
+            .map(PathBuf::from)
+            .ok_or(crate::test_support::TestError::Missing(
+                "HARW_TEST_CGROUP_ROOT",
+            ))?;
+        let options = port(root.clone());
+        let confirmed =
+            options
+                .delegated_cgroup_root()
+                .ok_or(crate::test_support::TestError::Missing(
+                    "HARW_TEST_CGROUP_ROOT as a delegated cgroup v2 root",
+                ))?;
+        assert_eq!(confirmed, root);
+        let dir = tempfile::tempdir()?;
+        let attached = job_wiring_for_sys_scope(wiring(dir.path())?, &options);
+        assert_eq!(attached.delegated_cgroup_root, Some(root));
+        Ok(())
     }
 }
 

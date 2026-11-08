@@ -126,6 +126,32 @@ pub trait AgentSpawner: Send + Sync {
         None
     }
 
+    /// Die noch nicht bestätigten, für das Modell formatierten
+    /// Abschlussmeldungen der Hintergrund-Kinder von `parent` — **ohne** sie
+    /// zu verbrauchen. Der Kern legt sie einem Orchestrator-*Kind* in die
+    /// nächste Runde und bestätigt sie erst nach dem dauerhaften Schreiben
+    /// ([`Self::acknowledge_background_notices`]); die UIA-Wurzel holt ihre
+    /// Meldungen weiterhin selbst (TUI). Default: keine.
+    fn pending_background_notices(&self, _parent: &SessionId) -> Vec<PendingBackgroundNotice> {
+        Vec::new()
+    }
+
+    /// Bestätigt (entfernt) die zugestellten Meldungen der Kinder `children`
+    /// von `parent`. Default: nichts.
+    fn acknowledge_background_notices(&self, _parent: &SessionId, _children: &[SessionId]) {}
+
+    /// Zahl der noch laufenden Hintergrund-Kinder von `parent`. Default `0`.
+    fn running_background_children(&self, _parent: &SessionId) -> usize {
+        0
+    }
+
+    /// Bricht alle laufenden Hintergrund-Kinder von `parent` ab (z. B. wenn
+    /// dessen Turn abgebrochen wird oder sein Budget endet, während er auf
+    /// sie wartet). Liefert die Zahl angeforderter Abbrüche. Default `0`.
+    fn cancel_background_children(&self, _parent: &SessionId, _reason: &str) -> usize {
+        0
+    }
+
     /// Plan R9, Teil C/E1: die sichtbaren Delegationsziele von
     /// `parent_session_id` samt Katalogdaten, gefiltert nach Plan-Modus.
     ///
@@ -387,6 +413,16 @@ pub enum SpawnRejectionKind {
     /// Any other failure (configuration, validation, ...).
     #[default]
     Other,
+}
+
+/// Eine noch nicht bestätigte Abschlussmeldung eines Hintergrund-Kindes
+/// ([`AgentSpawner::pending_background_notices`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBackgroundNotice {
+    /// Das beendete Kind (Schlüssel der Bestätigung).
+    pub child: SessionId,
+    /// Die Meldung, wie das Modell des Elternteils sie liest.
+    pub text: String,
 }
 
 #[derive(Debug)]

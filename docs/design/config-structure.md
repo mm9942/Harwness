@@ -130,6 +130,8 @@ per_session_bytes = 16384            # cap until the next compaction (256..=6553
 [sandbox]
 execution = "chain"                  # chain|legacy — how shell.exec, job.start and child agents
                                      # start processes (PL-97 E2); default "chain"
+host_lease_ttl_secs = 28800          # duration of a host work phase in seconds (1..=604800);
+                                     # default 8 h (PL-100 Phase 4, ADR 0002)
 ```
 
 Notes:
@@ -157,6 +159,14 @@ Notes:
   (`SandboxSection::effective_execution`); the consumers switch on it in
   PL-97 E2b. The other `[sandbox]` keys (`cargo`, `tmux`) are home-only
   (`GlobalOnly`, see `config-scopes.md`).
+- `[sandbox] host_lease_ttl_secs` (PL-100 Phase 4, B22,
+  [ADR 0002](../adr/0002-session-lease-expiry.md)) sets how long a host
+  work phase (`SessionLease`) lasts and caps its ledger permits. Default
+  28800 (8 h); `0` or more than 604800 (7 days) is a parse error. It is
+  profile-scoped and security-critical (`ProfileReplaces`): the home layer
+  and the active profile set it, an untrusted project layer never does.
+  The runtime assembly reads it once (`RuntimeAssembly::build`); a running
+  phase is never extended.
 
 ### 2.2 `auth.toml` — credential references
 

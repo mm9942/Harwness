@@ -16,9 +16,11 @@ const EPHEMERAL: [&str; 5] = [
     "bug_reports",
     "scan_reports",
 ];
-const SECURITY: [&str; 5] = [
+const SECURITY: [&str; 7] = [
     "dod_spool",
     "sentinel_export",
+    "dod_verdicts",
+    "dod_labels",
     "freeze_resolved",
     "session_transcripts",
     "session_corrupt_backups",
@@ -26,7 +28,7 @@ const SECURITY: [&str; 5] = [
 
 #[test]
 fn test_table_declares_the_initial_classes_with_the_decided_kinds() {
-    assert_eq!(CLASSES.len(), 10);
+    assert_eq!(CLASSES.len(), 12);
     for id in EPHEMERAL {
         assert!(
             CLASSES
@@ -51,7 +53,7 @@ fn test_defaults_ephemeral_on_security_off_and_apply_refused() -> TestResult {
     assert_eq!(cfg, RetentionConfig::default());
     assert!(cfg.validate().is_ok());
     let all = resolve_all(&cfg);
-    assert_eq!(all.len(), 10);
+    assert_eq!(all.len(), 12);
     for class in &all {
         match class.class.kind {
             ClassKind::Ephemeral => {

@@ -6,6 +6,45 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Root-orchestrator stability** (PL-98, see
+  [docs/planning/98-root-orchestrator-stability](docs/planning/98-root-orchestrator-stability/README.md)):
+  - Lost native reasoning (Responses encrypted reasoning, Chat `reasoning_content`,
+    Anthropic signed thinking) no longer aborts the turn with "continuity
+    unavailable". Replay caches are bounded per agent identity (64 rounds,
+    1024 total) instead of 64 rounds per provider for the whole agent tree,
+    and the default policy degrades (logged as `HARW-REPLAY-002`/`-004`);
+    `[capabilities] reasoning_replay = "strict"` restores the hard error
+    (`ModelError::ReplayUnavailable`, `HARW-REPLAY-001`). A round that cannot
+    be retained no longer discards the paid response (`HARW-REPLAY-003`).
+  - MaxTokens auto-continuations count consecutive truncations only; the
+    continuation instruction no longer sticks to every later round. Tool calls
+    truncated after the retry are dropped and the model is asked to split them
+    instead of ending the turn.
+  - Every rejected delegation admission is a tool error (`HARW-ORCH-001` for
+    unknown kinds) instead of aborting the turn.
+  - `continue_from`: the durable job submitter keeps the predecessor's handoff;
+    the handoff ledger quota is per parent; a continued orchestrator inherits
+    its predecessor's children; unknown predecessor sandboxes are refused before
+    admission; rejections carry `HARW-CONT-001…004`; failed background children
+    tell the parent how to continue them (`HARW-CONT-010`).
+  - Orchestrator children receive the completion notices of their own background
+    children and wait for running ones before finishing.
+  - Child approval relay accepts generated delegation tools (field report F6);
+    interaction modes keep the base network scope (F8); orchestrator read budget
+    12 (warning from 10), orientation (`fs.list`, `explore.tree`) is free (F10).
+
+### Changed
+
+- Default `[agents] max_sub_orchestrators` 2 → 3 (the root orchestrator has
+  three child orchestrators).
+- Model runtime profiles resolve provider-prefixed IDs and newer members of
+  curated families (`glm-5.x`, `gpt-5.x`/`gpt-6.x`, `claude-*-5-x`, …) instead
+  of falling back to the conservative default (`max_child_fanout` 2).
+- An explicit orchestrator root (`--agent root-orchestrator`) mounts
+  `delegate_wave`.
+
 ## [0.10.0] — Upcoming
 
 PRs #154–#157 have merged into `dev`; these notes describe upcoming changes

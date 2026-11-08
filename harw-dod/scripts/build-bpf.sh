@@ -18,6 +18,10 @@ repo_dir=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 # such as bpftool in /usr/sbin is found without a PATH entry), are forwarded
 # as ordinary make variable overrides to the default builder command only.
 # An operator-supplied BPF_BUILD_COMMAND is used exactly as given.
+# Such a command that calls harw-dod/bpf/scripts/write-manifest.sh directly must
+# pass its fifth argument, the BTF stamp <OUT>/vmlinux.btf.sha256, written by
+# harw-dod/bpf/scripts/btf-stamp.sh <vmlinux BTF> <stamp> before vmlinux.h and
+# the objects are built; otherwise it should call `make -C harw-dod/bpf`.
 tool_vars=''
 [ -z "${CLANG:-}" ] || tool_vars="$tool_vars CLANG='$CLANG'"
 [ -z "${BPFTOOL:-}" ] || tool_vars="$tool_vars BPFTOOL='$BPFTOOL'"

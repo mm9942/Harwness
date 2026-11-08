@@ -5,12 +5,29 @@
 //! `harw-operations`, gegen `harw-core` zu linken. Als Extension-Trait auf dem
 //! `harw-operations::OpContext` (der intern nur eine typisierte `ServiceMap`
 //! ist), leben sie hier und lassen die Kern-Abhängigkeit sauber invertieren.
+//!
+//! PL-100 WP 2.3: zusätzlich die optionale Verdict-Senke
+//! ([`OpContextCoreExt::verdict_sink`], registriert über
+//! [`OpContextCoreExt::register_verdict_sink`]). Mit ihr legt der Wave-Pfad
+//! (`delegate_wave`) ein Triage-Verdict gebunden ab, wenn vertrauenswürdiger
+//! Code das Ziel mit einer `VerdictBinding` versehen hat; ohne Senke bleibt
+//! es bei der ungebundenen I4-Sicht. Die Composition Root muss sie in jedem
+//! Kontext registrieren, der `delegate_wave` oder `agent.result` bedient (die
+//! Service-Map entsteht dort je Aufruf neu). Stand dieser Änderung
+//! registriert noch keine Composition Root die Senke (siehe
+//! `ChildReturnContract`, „Voraussetzung im Betrieb“).
+//!
+//! # Nebenläufigkeit
+//! Alle Getter klonen nur `Arc`s aus der `ServiceMap`; frei zwischen Threads
+//! nutzbar.
 
 use std::sync::Arc;
 
 use harw_core::child_controller::ManagedAgentSpawner;
 use harw_core::state_store::StateStore;
 use harw_operations::context::{OpContext, ServiceMap};
+
+use crate::security_verdict::VerdictSink;
 
 /// Erweitert [`OpContext`] um Zugriff auf Core-spezifische Services.
 ///
@@ -44,6 +61,45 @@ pub trait OpContextCoreExt {
         state_store: Arc<dyn StateStore>,
     ) where
         Self: Sized;
+
+    /// Gibt die registrierte Verdict-Senke zurück, falls vorhanden
+    /// (PL-100 WP 2.3).
+    ///
+    /// # Beschreibung
+    /// Die Ablage für gebundene Triage-Verdicts (im Betrieb
+    /// `harw_session_store::VerdictStore`). Der Wave-Pfad nutzt sie nur für ein
+    /// Ziel, das vertrauenswürdiger Code mit einer
+    /// [`crate::security_verdict::VerdictBinding`] versehen hat; sonst bleibt
+    /// sie unbenutzt. `agent.result` liest ihre bloße Anwesenheit als Zeichen,
+    /// dass gebundene Wellen laufen, und gibt dann das Verdict eines
+    /// Triage-Kindes gar nicht mehr heraus (PL-100 I4, `agent_result.rs`).
+    ///
+    /// # Returns
+    /// `Some(sink)` (ein Klon des registrierten `Arc`) oder `None`, wenn die
+    /// Composition-Root keine Senke registriert hat.
+    ///
+    /// # Concurrency
+    /// Nur lesend; die Senke ist `Send + Sync`.
+    fn verdict_sink(&self) -> Option<Arc<dyn VerdictSink>>;
+
+    /// Registriert die Verdict-Senke in einer [`ServiceMap`] (PL-100 WP 2.3).
+    ///
+    /// # Beschreibung
+    /// Die Senke liegt ausschließlich unter ihrem konkreten Typ
+    /// `Arc<dyn VerdictSink>`, wie die Services von
+    /// [`Self::register_agent_tool_services`]; ein zweiter Aufruf ersetzt die
+    /// erste Senke.
+    ///
+    /// # Arguments
+    /// - `services` (`&mut ServiceMap`): die Service-Map der Composition-Root.
+    /// - `sink` (`Arc<dyn VerdictSink>`): die Ablage, im Betrieb
+    ///   `Arc::new(VerdictStore::new(home))`.
+    ///
+    /// # Concurrency
+    /// Läuft unter dem exklusiven `&mut ServiceMap`-Borrow.
+    fn register_verdict_sink(services: &mut ServiceMap, sink: Arc<dyn VerdictSink>)
+    where
+        Self: Sized;
 }
 
 impl OpContextCoreExt for OpContext {
@@ -63,6 +119,14 @@ impl OpContextCoreExt for OpContext {
         services.insert(managed_spawner);
         services.insert(state_store);
     }
+
+    fn verdict_sink(&self) -> Option<Arc<dyn VerdictSink>> {
+        self.service::<Arc<dyn VerdictSink>>().cloned()
+    }
+
+    fn register_verdict_sink(services: &mut ServiceMap, sink: Arc<dyn VerdictSink>) {
+        services.insert(sink);
+    }
 }
 
 #[cfg(test)]
@@ -79,6 +143,7 @@ mod tests {
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
 
     use super::OpContextCoreExt;
+    use crate::security_verdict::VerdictSink;
     use crate::test_support::{TestError, TestResult, ctx};
 
     fn context_with_services(services: ServiceMap) -> TestResult<(OpContext, PathBuf)> {
@@ -203,6 +268,42 @@ mod tests {
 
         assert!(Arc::ptr_eq(&registered_spawner, &managed_spawner));
         assert!(Arc::ptr_eq(&registered_store, &state_store));
+        Ok(())
+    }
+
+    /// PL-100 WP 2.3: die registrierte Verdict-Senke kommt unverändert
+    /// zurück; die Agent-Services bleiben unberührt.
+    #[test]
+    fn verdict_sink_round_trips_the_registered_arc() -> TestResult {
+        // Greift erst beim Anhängen auf das Dateisystem zu; hier nie.
+        let sink: Arc<dyn VerdictSink> = Arc::new(harw_session_store::VerdictStore::new(
+            std::path::Path::new("verdict-sink-test-state"),
+        ));
+        let mut services = ServiceMap::new();
+        services.insert("unrelated service".to_owned());
+        <OpContext as OpContextCoreExt>::register_verdict_sink(&mut services, Arc::clone(&sink));
+        let (context, root) = context_with_services(services)?;
+
+        let registered = context.verdict_sink().ok_or(TestError::Missing(
+            "registered verdict sink must be retrievable",
+        ))?;
+        let unrelated = context.service::<String>().cloned();
+        std::fs::remove_dir_all(root).ok();
+
+        assert!(Arc::ptr_eq(&registered, &sink));
+        assert_eq!(unrelated.as_deref(), Some("unrelated service"));
+        assert!(context.managed_spawner().is_none());
+        Ok(())
+    }
+
+    /// Ohne Registrierung gibt es keine Senke: der Wave-Pfad bleibt bei der
+    /// ungebundenen I4-Sicht.
+    #[test]
+    fn verdict_sink_is_absent_without_registration() -> TestResult {
+        let (context, root) = context_with_services(ServiceMap::new())?;
+        let sink = context.verdict_sink();
+        std::fs::remove_dir_all(root).ok();
+        assert!(sink.is_none());
         Ok(())
     }
 }

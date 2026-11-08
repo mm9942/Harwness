@@ -1,5 +1,15 @@
 //! Die Triage-Einreichung an den Escalator: [`TriageSubmission`] (C-WPROTO, W3; F-023).
 //!
+//! # Herkunft (PL-100 WP 3.0, Leitprinzip I8)
+//! Bis zur Aufteilung lag dieser Typ in `harw-dod-escalate`. Der modellnahe
+//! Triage-Prozess, der ihn baut, darf aber weder Signier-Code noch die
+//! Eskalationsleiter linken; diese Crate hängt deshalb nur an
+//! `harw-dod-signals` (Urteil) und `harw-types` (Kennungen).
+//! `harw-dod-escalate` re-exportiert alle Items unter den bisherigen Pfaden
+//! (`harw_dod_escalate::TriageSubmission`,
+//! `harw_dod_escalate::submission::TriageSubmission`). Wire-Format und
+//! Meldungen sind unverändert.
+//!
 //! # Verantwortungsbereich
 //! Was ein modellnaher Triage-Prozess (W5 D-TRIAGE, `harw-cli/src/triage.rs`)
 //! dem Escalator (W5 D-ESC, `harw-escalator`) über den Submission-Socket
@@ -34,17 +44,17 @@
 //!
 //! # Examples
 //! ```rust
-//! use harw_dod_escalate::submission::TriageSubmission;
 //! use harw_dod_signals::{SecurityVerdict, Severity, VerdictClassification};
+//! use harw_dod_submit_proto::TriageSubmission;
 //! use harw_types::{ContentDigest, FindingId};
 //!
-//! let finding = FindingId::try_from_str("finding-1").unwrap();
+//! let Ok(finding) = FindingId::try_from_str("finding-1") else { return };
 //! let digest = ContentDigest::of(b"record-bytes");
 //! let verdict = SecurityVerdict::new(
 //!     finding.clone(), digest, VerdictClassification::Confirmed, Severity::High,
 //!     "bestätigt".to_owned(), None, "security-triage".to_owned(), jiff::Timestamp::UNIX_EPOCH,
 //! );
-//! let submission = TriageSubmission::new(finding.clone(), digest, verdict).unwrap();
+//! let Ok(submission) = TriageSubmission::new(finding.clone(), digest, verdict) else { return };
 //! assert!(submission.binds(&finding, digest).is_ok());
 //! ```
 
@@ -58,6 +68,11 @@ use serde::{Deserialize, Serialize};
 pub const TRIAGE_SUBMISSION_VERSION: u16 = 1;
 
 /// Fehler beim Bauen oder Prüfen einer [`TriageSubmission`].
+///
+/// # Description
+/// Contract-Master §H.1: der eine Fehlertyp dieser Crate. Feste,
+/// nicht interpolierte Meldungen; der Wert von `UnsupportedVersion` bleibt
+/// nur per Match lesbar.
 #[derive(harw_macros::HarwError)]
 pub enum SubmissionError {
     /// `version` ist nicht [`TRIAGE_SUBMISSION_VERSION`].
@@ -188,6 +203,10 @@ impl TriageSubmission {
     }
 }
 
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;
+
 #[cfg(test)]
 mod tests {
     use super::{SubmissionError, TRIAGE_SUBMISSION_VERSION, TriageSubmission};
@@ -284,7 +303,10 @@ mod tests {
         assert_eq!(back, submission);
 
         let mut wrong_version = json.clone();
-        wrong_version["version"] = serde_json::Value::from(2);
+        wrong_version
+            .as_object_mut()
+            .ok_or(TestError::Missing("json object"))?
+            .insert("version".to_owned(), serde_json::Value::from(2));
         let back: TriageSubmission = serde_json::from_value(wrong_version)
             .map_err(ctx("wrong-version value deserializes"))?;
         assert!(matches!(
@@ -293,7 +315,10 @@ mod tests {
         ));
 
         let mut swapped = json.clone();
-        swapped["finding"] = serde_json::Value::from("f-2");
+        swapped
+            .as_object_mut()
+            .ok_or(TestError::Missing("json object"))?
+            .insert("finding".to_owned(), serde_json::Value::from("f-2"));
         let back: TriageSubmission =
             serde_json::from_value(swapped).map_err(ctx("swapped-finding value deserializes"))?;
         assert!(matches!(
@@ -307,6 +332,26 @@ mod tests {
             .ok_or(TestError::Missing("json object"))?
             .insert("action".to_owned(), serde_json::Value::from("kill"));
         assert!(serde_json::from_value::<TriageSubmission>(extra).is_err());
+        Ok(())
+    }
+
+    // Das Wire-Format ist eingefroren (Moduldoku); die Aufteilung (PL-100
+    // WP 3.0) darf weder Feldnamen noch Version ändern.
+    #[test]
+    fn test_wire_format_keys_and_version_are_frozen() -> TestResult {
+        let digest = ContentDigest::of(b"record");
+        let submission =
+            TriageSubmission::new(finding("f-1")?, digest, verdict_for("f-1", digest, "ok")?)
+                .map_err(ctx("submission builds"))?;
+        let json = serde_json::to_value(&submission).map_err(ctx("submission serializes"))?;
+        let object = json.as_object().ok_or(TestError::Missing("json object"))?;
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["finding", "finding_digest", "verdict", "version"]);
+        assert_eq!(
+            object.get("version").and_then(serde_json::Value::as_u64),
+            Some(u64::from(TRIAGE_SUBMISSION_VERSION))
+        );
         Ok(())
     }
 

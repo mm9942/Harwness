@@ -516,11 +516,11 @@ pub struct GuardsToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_stale_rounds: Option<u32>,
     /// Runde 7, Teil A2: eigene Lesezugriffe eines Orchestrators (über die
-    /// ganze Kind-Sitzung), ab denen gewarnt wird. Vorgabe `4`.
+    /// ganze Kind-Sitzung), ab denen gewarnt wird. Vorgabe `10`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_read_warn: Option<u32>,
     /// Runde 7, Teil A2: höchstens so viele eigene Lesezugriffe eines
-    /// Orchestrators; jeder weitere wird abgelehnt. Vorgabe `5`, `0` schaltet
+    /// Orchestrators; jeder weitere wird abgelehnt. Vorgabe `12`, `0` schaltet
     /// das Lesebudget ab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_read_limit: Option<u32>,
@@ -543,7 +543,33 @@ pub struct SandboxSection {
     /// (`ProfileReplaces`): an untrusted project layer cannot set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<SandboxExecutionToml>,
+    /// `host_lease_ttl_secs` — Dauer einer Host-Arbeitsphase in Sekunden
+    /// (PL-100 Phase 4, Bedrohung B22; `docs/adr/0002-session-lease-expiry.md`).
+    /// `None` → [`DEFAULT_HOST_LEASE_TTL_SECS`] (8 h). Erlaubt ist
+    /// [`HOST_LEASE_TTL_SECS_RANGE`] (1 s bis 7 Tage); `0` oder ein größerer
+    /// Wert ist ein Konfigurationsfehler beim Parsen, kein Klemmen. Die
+    /// Laufzeit-Montage setzt damit die Dauer jeder neuen Phase in der
+    /// `HostPermitSessionRegistry` und die Höchstdauer ihrer Ledger-Permits;
+    /// gelesen über [`SandboxSection::effective_host_lease_ttl`]. Eine
+    /// laufende Phase wird nie verlängert. Profilebene (`ProfileReplaces`,
+    /// sicherheitsrelevant): eine nicht vertraute Projektebene setzt den
+    /// Wert nie.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_host_lease_ttl_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub host_lease_ttl_secs: Option<u64>,
 }
+
+/// Vorgabe für `[sandbox] host_lease_ttl_secs`: 8 h (28 800 s).
+///
+/// Gleich `harw_sandbox::DEFAULT_SESSION_LEASE_TTL` (PL-100 Phase 4, B22);
+/// die Konfigurations-Crate hängt bewusst nicht von `harw-sandbox` ab.
+pub const DEFAULT_HOST_LEASE_TTL_SECS: u64 = 28_800;
+/// Erlaubter Bereich für `[sandbox] host_lease_ttl_secs` in Sekunden
+/// (inklusive): 1 s bis 7 Tage.
+pub const HOST_LEASE_TTL_SECS_RANGE: (u64, u64) = (1, 604_800);
 
 impl SandboxSection {
     /// The configured execution path, [`SandboxExecutionToml::Chain`] when
@@ -552,6 +578,56 @@ impl SandboxSection {
     pub fn effective_execution(&self) -> SandboxExecutionToml {
         self.execution.unwrap_or_default()
     }
+
+    /// Wirksame Dauer einer Host-Arbeitsphase in Sekunden.
+    ///
+    /// # Returns
+    /// `host_lease_ttl_secs` oder [`DEFAULT_HOST_LEASE_TTL_SECS`], defensiv
+    /// auf [`HOST_LEASE_TTL_SECS_RANGE`] geklemmt (falls der Wert nicht aus
+    /// TOML stammt); daher nie `0`.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_config::harness_config::{DEFAULT_HOST_LEASE_TTL_SECS, SandboxSection};
+    ///
+    /// let section = SandboxSection::default();
+    /// assert_eq!(section.effective_host_lease_ttl_secs(), DEFAULT_HOST_LEASE_TTL_SECS);
+    /// ```
+    #[must_use]
+    pub fn effective_host_lease_ttl_secs(&self) -> u64 {
+        self.host_lease_ttl_secs
+            .unwrap_or(DEFAULT_HOST_LEASE_TTL_SECS)
+            .clamp(HOST_LEASE_TTL_SECS_RANGE.0, HOST_LEASE_TTL_SECS_RANGE.1)
+    }
+
+    /// Wirksame Dauer einer Host-Arbeitsphase als [`std::time::Duration`]
+    /// (siehe [`Self::effective_host_lease_ttl_secs`]); nie null.
+    ///
+    /// # Description
+    /// Für `ProcessPermitLedger::with_lease_ttl` und
+    /// `HostPermitSessionRegistry::with_lease_ttl` in der Laufzeit-Montage.
+    #[must_use]
+    pub fn effective_host_lease_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.effective_host_lease_ttl_secs())
+    }
+}
+
+// Lehnt `[sandbox] host_lease_ttl_secs` außerhalb von
+// `HOST_LEASE_TTL_SECS_RANGE` beim Parsen ab (wie
+// `deserialize_jobs_max_running`): der Fehler wird zu
+// `ConfigError::TomlParse`.
+fn deserialize_host_lease_ttl_secs<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if !(HOST_LEASE_TTL_SECS_RANGE.0..=HOST_LEASE_TTL_SECS_RANGE.1).contains(&value) {
+        return Err(serde::de::Error::custom(format!(
+            "[sandbox] host_lease_ttl_secs must be between {} and {}, got {value}",
+            HOST_LEASE_TTL_SECS_RANGE.0, HOST_LEASE_TTL_SECS_RANGE.1
+        )));
+    }
+    Ok(Some(value))
 }
 
 /// `[sandbox] execution` — the execution path of model-driven processes
@@ -1499,6 +1575,89 @@ mod tests {
             execution = "host"
         "#;
         assert!(toml::from_str::<HarnessConfig>(src).is_err());
+    }
+
+    #[test]
+    fn test_sandbox_host_lease_ttl_defaults_to_eight_hours() -> TestResult {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                default_provider = "anthropic"
+            "#,
+        )
+        .map_err(ctx("parse config without host_lease_ttl_secs"))?;
+        assert_eq!(cfg.sandbox.host_lease_ttl_secs, None);
+        assert_eq!(cfg.sandbox.effective_host_lease_ttl_secs(), 28_800);
+        assert_eq!(
+            cfg.sandbox.effective_host_lease_ttl(),
+            std::time::Duration::from_secs(28_800)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_sandbox_host_lease_ttl_parses_values_in_range() -> TestResult {
+        for (src, expected) in [
+            ("[sandbox]\nhost_lease_ttl_secs = 3600\n", 3_600),
+            ("[sandbox]\nhost_lease_ttl_secs = 1\n", 1),
+            ("[sandbox]\nhost_lease_ttl_secs = 604800\n", 604_800),
+        ] {
+            let cfg: HarnessConfig =
+                toml::from_str(src).map_err(ctx("parse host_lease_ttl_secs in range"))?;
+            assert_eq!(cfg.sandbox.host_lease_ttl_secs, Some(expected), "{src}");
+            assert_eq!(cfg.sandbox.effective_host_lease_ttl_secs(), expected);
+            assert_eq!(
+                cfg.sandbox.effective_host_lease_ttl(),
+                std::time::Duration::from_secs(expected)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sandbox_host_lease_ttl_rejects_zero_negative_and_more_than_seven_days() -> TestResult {
+        for src in [
+            "[sandbox]\nhost_lease_ttl_secs = 0\n",
+            "[sandbox]\nhost_lease_ttl_secs = 604801\n",
+            "[sandbox]\nhost_lease_ttl_secs = -5\n",
+            "[sandbox]\nhost_lease_ttl_secs = \"8h\"\n",
+        ] {
+            match toml::from_str::<HarnessConfig>(src) {
+                Ok(_) => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected rejection of {src:?}"
+                    )));
+                }
+                Err(err) => {
+                    // Der Bereichsfehler nennt den Schlüssel; Typfehler
+                    // (negativ, Text) stammen aus serde selbst.
+                    if src.contains(" 0\n") || src.contains("604801") {
+                        assert!(
+                            err.to_string().contains("host_lease_ttl_secs"),
+                            "range error must name the key: {err}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sandbox_effective_host_lease_ttl_clamps_values_not_from_toml() {
+        let mut section = SandboxSection {
+            host_lease_ttl_secs: Some(0),
+            ..SandboxSection::default()
+        };
+        assert_eq!(
+            section.effective_host_lease_ttl_secs(),
+            HOST_LEASE_TTL_SECS_RANGE.0
+        );
+        assert!(!section.effective_host_lease_ttl().is_zero());
+        section.host_lease_ttl_secs = Some(u64::MAX);
+        assert_eq!(
+            section.effective_host_lease_ttl_secs(),
+            HOST_LEASE_TTL_SECS_RANGE.1
+        );
     }
 
     #[test]

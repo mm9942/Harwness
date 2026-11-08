@@ -93,20 +93,39 @@ const NOISE_PREFIXES: [&str; 5] = ["loop", "ram", "zram", "dm-", "sr"];
 /// abgeschnitten — deterministisch, aber mit der dokumentierten
 /// Einschränkung, dass ein Host mit mehr als `MAX_DEVICES` physischen
 /// Datenträgern die alphabetisch spätesten davon nicht gemeldet bekommt.
+/// Wie viele das sind, meldet [`TRUNCATED_METRIC`].
 pub const MAX_DEVICES: usize = 32;
+
+/// Metrikname der Kürzungsmarke: wie viele Geräte dieser Poll über
+/// [`MAX_DEVICES`] hinaus verworfen hat (PL-100 WP0.15).
+///
+/// # Description
+/// Jeder erfolgreiche Poll meldet genau ein `HostSample` mit diesem Namen,
+/// Wert `0` ohne Kürzung — die Kürzung ist sichtbar statt still. Gezählt
+/// werden nur Geräte, die die Rauschfilterung ([`is_noise_device`])
+/// überstanden haben. Der Punkt im Namen ist Absicht: ein sanitisiertes
+/// Gerätelabel enthält nie einen Punkt, die Marke kollidiert also mit
+/// keiner Zählermetrik.
+///
+/// # Examples
+/// ```rust
+/// assert_eq!(harw_dod_blockio::sensor::TRUNCATED_METRIC, "blockio.truncated");
+/// ```
+pub const TRUNCATED_METRIC: &str = "blockio.truncated";
 
 /// Die deklarierte Obergrenze verschiedener Labelkombinationen je Poll.
 ///
 /// # Description
-/// `MAX_DEVICES` Geräte mal [`FIELD_METRICS`]`.len()` Felder je Gerät — der
-/// Fixture-seitige Spiegel, den [`harw_dod_fixtures::sensor_suite!`] als
-/// `max_cardinality` erwartet.
+/// `MAX_DEVICES` Geräte mal [`FIELD_METRICS`]`.len()` Felder je Gerät plus
+/// die eine Kürzungsmarke [`TRUNCATED_METRIC`] — der Fixture-seitige
+/// Spiegel, den [`harw_dod_fixtures::sensor_suite!`] als `max_cardinality`
+/// erwartet.
 ///
 /// # Examples
 /// ```rust
-/// assert_eq!(harw_dod_blockio::sensor::MAX_CARDINALITY, 32 * 17);
+/// assert_eq!(harw_dod_blockio::sensor::MAX_CARDINALITY, 32 * 17 + 1);
 /// ```
-pub const MAX_CARDINALITY: usize = MAX_DEVICES * FIELD_METRICS.len();
+pub const MAX_CARDINALITY: usize = MAX_DEVICES * FIELD_METRICS.len() + 1;
 
 /// Obergrenze der Zeichen, die aus einem Geräte-Verzeichnisnamen in den
 /// Metriknamen übernommen werden — Schutz gegen unbegrenztes Wachstum durch
@@ -252,8 +271,11 @@ impl Sensor for BlockioSensor {
     ///   Systemuhr.
     ///
     /// # Returns
-    /// Ein `SensorReading` mit bis zu `MAX_DEVICES × 17` Samples und keinen
-    /// Events (Blockgeräte-Zähler erzeugen keine Sicherheitsereignisse).
+    /// Ein `SensorReading` mit bis zu `MAX_DEVICES × 17` Gerätesamples plus
+    /// genau einem letzten Sample [`TRUNCATED_METRIC`] (Zahl der über
+    /// [`MAX_DEVICES`] hinaus verworfenen Geräte, `0` ohne Kürzung) und
+    /// keinen Events (Blockgeräte-Zähler erzeugen keine
+    /// Sicherheitsereignisse).
     /// Nie leer bei `Ok` — eine leere Gerätemenge nach Filterung ist
     /// [`SensorError::SourceUnavailable`], kein leeres `Ok` (analog zu
     /// `harw-dod-thermal`s Zonenmenge).
@@ -313,13 +335,20 @@ impl Sensor for BlockioSensor {
         // (z. B. `nvme0n10` fälschlich als „Partition 0" von `nvme0n1`
         // ausgeschlossen) — siehe `lib.rs`-Moduldoku, Entscheidung 2, für die
         // vollständige Herleitung.
+        // PL-100 WP0.15: die Kürzung zählen, bevor sie geschieht.
+        let dropped = named.len().saturating_sub(MAX_DEVICES);
         named.truncate(MAX_DEVICES);
 
         if named.is_empty() {
             return Err(SensorError::SourceUnavailable);
         }
 
-        let mut samples = Vec::with_capacity(named.len() * FIELD_METRICS.len());
+        let mut samples = Vec::with_capacity(
+            named
+                .len()
+                .saturating_mul(FIELD_METRICS.len())
+                .saturating_add(1),
+        );
         for (device, stat_path) in &named {
             let rows =
                 harw_dod_readfs::read_line_fields(scope, stat_path).map_err(map_readfs_err)?;
@@ -335,6 +364,12 @@ impl Sensor for BlockioSensor {
                 });
             }
         }
+        samples.push(HostSample {
+            sensor: self.handle.id().clone(),
+            observed_at: now,
+            metric: Cow::Borrowed(TRUNCATED_METRIC),
+            value: dropped as f64,
+        });
 
         Ok(SensorReading {
             samples,
@@ -686,8 +721,8 @@ mod tests {
 
     #[test]
     fn test_max_cardinality_is_max_devices_times_field_metrics_len() {
-        assert_eq!(MAX_CARDINALITY, MAX_DEVICES * FIELD_METRICS.len());
-        assert_eq!(MAX_CARDINALITY, 32 * 17);
+        assert_eq!(MAX_CARDINALITY, MAX_DEVICES * FIELD_METRICS.len() + 1);
+        assert_eq!(MAX_CARDINALITY, 32 * 17 + 1);
     }
 
     #[test]
@@ -698,14 +733,66 @@ mod tests {
 
     // ---- Fixture-gestützte Verhaltensprüfungen ----
 
+    /// Die Gerätesamples eines Polls, ohne die Kürzungsmarke.
+    fn device_samples(reading: &SensorReading) -> Vec<&HostSample> {
+        reading
+            .samples
+            .iter()
+            .filter(|s| s.metric != TRUNCATED_METRIC)
+            .collect()
+    }
+
     #[test]
     fn test_single_device_fixture_reports_eleven_samples() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("single-device/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
             .map_err(ctx("single-device Fixture muss erfolgreich pollen"))?;
-        assert_eq!(reading.samples.len(), 11);
-        assert!(reading.samples.iter().all(|s| s.metric.ends_with("_sda")));
+        let devices = device_samples(&reading);
+        assert_eq!(devices.len(), 11);
+        assert!(devices.iter().all(|s| s.metric.ends_with("_sda")));
+
+        // Ein Gerät, keine Kürzung: die Marke steht zuletzt und ist 0.
+        let marker = reading
+            .samples
+            .last()
+            .ok_or(TestError::Missing("Kürzungsmarke"))?;
+        assert_eq!(marker.metric, TRUNCATED_METRIC);
+        assert!(marker.value.abs() < f64::EPSILON, "{}", marker.value);
+        Ok(())
+    }
+
+    #[test]
+    fn test_more_than_max_devices_reports_the_number_of_dropped_devices() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let total = MAX_DEVICES.saturating_add(2);
+        for i in 0..total {
+            let device = dir.path().join(format!("vd{i:02}"));
+            std::fs::create_dir_all(&device).map_err(ctx("Geräteverzeichnis"))?;
+            std::fs::write(device.join("stat"), "1 2 3 4 5 6 7 8 9 10 11\n")
+                .map_err(ctx("stat schreiben"))?;
+        }
+
+        let sensor = build_sensor(dir.path().to_path_buf());
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("viele Geräte müssen erfolgreich pollen"))?;
+
+        let marker = reading
+            .samples
+            .last()
+            .ok_or(TestError::Missing("Kürzungsmarke"))?;
+        assert_eq!(marker.metric, TRUNCATED_METRIC);
+        assert!(
+            (marker.value - 2.0).abs() < f64::EPSILON,
+            "{}",
+            marker.value
+        );
+        // Die alphabetisch letzten Geräte fehlen, die ersten sind da.
+        let devices = device_samples(&reading);
+        assert!(devices.iter().any(|s| s.metric.ends_with("_vd00")));
+        assert!(!devices.iter().any(|s| s.metric.ends_with("_vd33")));
+        assert!(reading.samples.len() <= MAX_CARDINALITY);
         Ok(())
     }
 
@@ -715,7 +802,7 @@ mod tests {
         let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
             "eine Zeile mit siebzehn Feldern darf nicht abgewiesen werden",
         ))?;
-        assert_eq!(reading.samples.len(), 17);
+        assert_eq!(device_samples(&reading).len(), 17);
         Ok(())
     }
 
@@ -852,12 +939,10 @@ mod tests {
             "Alias-Scope muss die reale Pi-Capture über den Symlink lesen",
         ))?;
 
-        assert_eq!(reading.samples.len(), FIELD_METRICS.len());
+        let devices = device_samples(&reading);
+        assert_eq!(devices.len(), FIELD_METRICS.len());
         assert!(
-            reading
-                .samples
-                .iter()
-                .all(|s| s.metric.ends_with("_mmcblk0")),
+            devices.iter().all(|s| s.metric.ends_with("_mmcblk0")),
             "alle Samples müssen das Gerätelabel der echten Capture tragen: {:?}",
             reading.samples
         );

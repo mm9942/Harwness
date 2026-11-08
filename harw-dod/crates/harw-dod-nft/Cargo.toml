@@ -1,0 +1,33 @@
+[package]
+publish.workspace = true
+name = "harw-dod-nft"
+description = "In-process nf_tables batch encoding and NETLINK_NETFILTER transport for the warden's network isolation (PL-100 O10)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# PL-100 Entscheidung O10: nftables im eigenen Prozess statt des
+# `nft`-Kindprozesses. Die Bewertung der Rust-nftables-Crates
+# (`harw-dod/crates/harw-warden/src/isolation.rs`, Moduldoku) fand keine
+# tragbare externe Crate; diese Crate ist die dort genannte Alternative,
+# „eine eigene, kleine Kodierung über rustix und NETLINK_NETFILTER“.
+#
+# Einzige Abhängigkeit ist `rustix` (Workspace-Fassung, Feature `net`) für
+# `socket`/`bind`/`setsockopt`/`sendto`/`recvfrom` und die
+# `NETLINK_NETFILTER`-Konstante — dieselbe Fassung, die `harw-warden` schon
+# mit `net` in seiner Hülle hat, also kein neuer Knoten außer dieser Crate.
+# Keine interne Abhängigkeit (der Fehlertyp ist handgeschrieben, kein
+# `harw-macros`), damit die TCB-Allowlist dieser Crate leer bleibt. Kodierer
+# und Antwortleser sind reiner Code ohne Systemabhängigkeit; nur
+# `src/socket.rs` (`#[cfg(target_os = "linux")]`) ruft `rustix::net` auf.
+[dependencies]
+rustix = { workspace = true, features = ["net"] }
+
+[dev-dependencies]
+# `define_test_error!` (TestError/TestResult/ctx/missing) für panikfreie Tests.
+harw-test-support = { path = "../../../harw-test-support" }
+
+[lints]
+workspace = true

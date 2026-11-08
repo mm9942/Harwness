@@ -4,8 +4,14 @@ Retention core for ephemeral data (logs, caches, spools). Layer `I`
 (shared infrastructure); depends only on `harw-macros` and `serde`.
 
 There is no scheduler, CLI or job kind here. Later waves plug into this
-API: the maintenance job calls `ResolvedClass::sweep` per class, the CLI
-and doctor read `CLASSES` / `resolve_all` / `doctor_warning`.
+API: the maintenance job (`harw_ops::retention_job`, behind `harw cleanup`)
+calls `ResolvedClass::sweep` per class, except for the store-owned classes
+(`session_transcripts`, `session_corrupt_backups`, `freeze_resolved`,
+`dod_verdicts`), which it routes to
+`harw_session_store::retention::retention_sweep` so their store safety
+checks apply (for `dod_verdicts` the verdict chain: apply and dry-run plan
+go through the `VerdictStore`, never file by file). The CLI and doctor read
+`CLASSES` / `resolve_all` / `doctor_warning`.
 
 ## Model
 
@@ -28,11 +34,15 @@ and doctor read `CLASSES` / `resolve_all` / `doctor_warning`.
   config says `enabled = true` (`explicit_optin`).
 
 Initial classes. Ephemeral: `tui_log`, `telemetry_rotated`, `job_logs`,
-`bug_reports`, `scan_reports`. Security-relevant: `dod_spool`,
-`sentinel_export`, `freeze_resolved`, `session_transcripts`,
+`bug_reports`, `scan_reports`. Security-relevant: `dod_spool` (14 days,
+aligned with the sentinel's own spool retention, PL-100 WP0.12),
+`sentinel_export` (90 days), `dod_verdicts` (`<home>/dod/verdicts`, 90
+days), `dod_labels` (`<home>/dod/labels`, no age limit, at most 10 000
+files), `freeze_resolved`, `session_transcripts`,
 `session_corrupt_backups`. Adding a class means adding one block to
 `retention_classes!`; the config key, registry row, doctor warning and
-sweep job follow automatically.
+sweep job follow automatically (plus the five `retention.<class>.*` rows in
+`harw-config`'s `FIELD_TABLE`).
 
 ## Config (`[retention]`, in `harw-config`)
 

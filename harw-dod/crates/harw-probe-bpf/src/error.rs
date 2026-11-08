@@ -1,30 +1,43 @@
 //! Fehlertyp der eBPF-Sonde `harw-probe-bpf`.
 //!
 //! # Verantwortungsbereich
-//! [`ProbeError`] ist der eine Fehlertyp dieses Binaries. Er deckt sechs
+//! [`ProbeError`] ist der eine Fehlertyp dieses Binaries. Er deckt sieben
 //! Quellen ab:
 //!
 //! 1. das aktive DoD-Profil und seinen cgroup-Scope ([`crate::profile`]:
 //!    ungültige oder nicht vertrauenswürdige Konfiguration, kein auflösbarer
 //!    cgroup-Wurzelpfad, ungültiges `--cgroup-root`) — immer ein harter
 //!    Startabbruch vor jedem Lade- oder Anheftschritt;
-//! 2. die Landlock-Durchsetzung ([`crate::landlock`]);
-//! 3. das Laden der eBPF-Objekte — den transaktionalen Produktionspfad
+//! 2. die Integritätsprüfung der eBPF-Objekte gegen das SHA-256-Manifest
+//!    des BPF-Builds ([`crate::bpf_manifest`],
+//!    [`ProbeError::BpfObjectIntegrity`]) — ebenfalls immer ein harter
+//!    Startabbruch vor Landlock und vor jedem Lade- oder Anheftschritt;
+//! 3. die Landlock-Durchsetzung ([`crate::landlock`]);
+//! 4. das Laden der eBPF-Objekte — den transaktionalen Produktionspfad
 //!    `RealBpfLoader::load_contracts` ([`crate::real_loader::load_sensor`])
 //!    ebenso wie einen gescheiterten `load()`-Aufruf auf einem echten oder
 //!    Fixture-`harw_dod_bpf::BpfLoader` ([`crate::sensors`]);
-//! 4. den Sendeweg zum Sentinel ([`crate::sink`]);
-//! 5. Sensorfehler aus der Sammelschleife ([`crate::collect`], über
+//! 5. den Sendeweg zum Sentinel ([`crate::sink`]);
+//! 6. Sensorfehler aus der Sammelschleife ([`crate::collect`], über
 //!    `harw_dod_cap::SensorError`);
-//! 6. den `completions`-Unterbefehl (über
+//! 7. den `completions`-Unterbefehl (über
 //!    `harw_completions::CompletionError`).
 //!
-//! **Nicht** hierher gehört ein fehlendes oder ungültiges eBPF-Objekt: die
-//! Objektauflösung ([`crate::sensors::resolve_procmon_objects`],
-//! [`crate::sensors::resolve_flow_objects`]) meldet das als
-//! [`crate::sensors::ObjectUnavailable`], und der betroffene Sensor wird als
+//! Ein fehlendes oder ungültiges eBPF-Objekt meldet die Objektauflösung
+//! ([`crate::sensors::resolve_procmon_objects`],
+//! [`crate::sensors::resolve_flow_objects`]) zunächst als
+//! [`crate::sensors::ObjectUnavailable`]. Für einen gewählten Sensor wird
+//! daraus produktiv [`ProbeError::BpfObjectIntegrity`] mit
+//! [`crate::bpf_manifest::IntegrityFailure::ObjectUnresolved`]: ein Objekt
+//! ohne prüfbare Bytes darf die Manifestprüfung nicht umgehen (Owner-Review
+//! zu PR #168). Nur im Entwicklungsmodus `--dev-allow-missing-bpf` (nur
+//! zusammen mit `--bpf-manifest`) wird der Sensor stattdessen als
 //! [`crate::sensors::UnavailableSensor`] degradiert (`SensorDegraded` an den
-//! Sentinel), statt den Prozess zu beenden. Auch ein
+//! Sentinel); die Manifestprüfung der aufgelösten Objekte gilt auch dort.
+//! Ein Objekt, das vorhanden und gültig
+//! ist, aber nicht zum Manifest passt, ist ebenfalls
+//! [`ProbeError::BpfObjectIntegrity`]: ein Manipulationsverdacht, kein
+//! Betriebsfall. Auch ein
 //! [`ProbeError::BpfLoad`] ist deshalb nicht automatisch ein Startabbruch —
 //! ob ein Ladefehler den Sensor nur degradiert oder den Prozess beendet,
 //! entscheidet der Aufrufer in `main` anhand der inneren
@@ -63,6 +76,9 @@
 //! wie `harw-probe-fs::error::ProbeError::SentinelConnectFailed` (den vom
 //! Betreiber selbst konfigurierten Socket-Pfad) — kein Dateiinhalt, kein vom
 //! Host gelesenes Geheimnis, kein Rohereignisbyte.
+//! [`ProbeError::BpfObjectIntegrity`] trägt nur den Objektnamen und einen
+//! festen Grund — weder Manifest- noch Objektpfad, keinen Digest; `main`
+//! protokolliert die Meldung auf `error`.
 //! [`ProbeError::Completions`] trägt höchstens Pfade der Shell-
 //! Konfiguration des aufrufenden Nutzers (Completion-Datei, rc-Datei).
 //! [`ProbeError::Config`] reicht die Meldung von `harw_dod_config::ConfigError`
@@ -135,6 +151,31 @@ pub enum ProbeError {
     /// - `source` (`harw_dod_bpf::BpfError`): the content-free rejection,
     ///   linked through `std::error::Error::source()`.
     CgroupScopeRejected(harw_dod_bpf::BpfError),
+
+    /// Ein eBPF-Objekt oder das SHA-256-Manifest des BPF-Builds hat die
+    /// Integritätsprüfung vor dem Laden nicht bestanden
+    /// ([`crate::bpf_manifest::verify_resolved_objects`],
+    /// [`crate::bpf_manifest::ensure_objects_resolved`]): kein Manifest
+    /// konfiguriert, Manifest nicht vertrauenswürdig, unlesbar oder
+    /// ungültig, kein Eintrag für das Objekt, ein abweichender Digest oder
+    /// (außerhalb von `--dev-allow-missing-bpf`) ein gewähltes Objekt, das
+    /// sich nicht auflösen ließ.
+    ///
+    /// Immer ein harter Startabbruch vor Landlock und vor jedem Lade- oder
+    /// Anheftschritt; `main::run` meldet vorher jeden gewählten Sensor einmal
+    /// als `SensorDegraded`.
+    ///
+    /// # Arguments
+    /// - `object`: das betroffene Objekt; `None`, wenn das Manifest selbst
+    ///   scheitert.
+    /// - `failure` ([`crate::bpf_manifest::IntegrityFailure`]): der
+    ///   inhaltsfreie Grund.
+    BpfObjectIntegrity {
+        /// Das betroffene Objekt, `None` für einen Manifestfehler.
+        object: Option<crate::sensors::BpfObjectKind>,
+        /// Der Grund, ohne Pfad und ohne Digest.
+        failure: crate::bpf_manifest::IntegrityFailure,
+    },
 
     /// Landlock hat den Dateisystem-Ausschnitt dieser Sonde nicht vollständig
     /// durchgesetzt (jeder Ausgang außer `RulesetStatus::FullyEnforced`).
@@ -220,6 +261,14 @@ impl fmt::Display for ProbeError {
                     "refusing to attach: the resolved cgroup scope is invalid: {source}"
                 )
             }
+            Self::BpfObjectIntegrity {
+                object: Some(object),
+                failure,
+            } => write!(f, "refusing to load bpf object {object}: {failure}"),
+            Self::BpfObjectIntegrity {
+                object: None,
+                failure,
+            } => write!(f, "refusing to load bpf objects: {failure}"),
             Self::LandlockUnavailable => write!(
                 f,
                 "Landlock did not fully enforce the configured filesystem scope; refusing to start"
@@ -398,5 +447,48 @@ mod tests {
     fn test_landlock_unavailable_and_sentinel_send_failed_have_no_source() {
         assert!(std::error::Error::source(&ProbeError::LandlockUnavailable).is_none());
         assert!(std::error::Error::source(&ProbeError::SentinelSendFailed).is_none());
+    }
+
+    #[test]
+    fn test_bpf_object_integrity_names_the_object_but_no_path_or_digest() {
+        let err = ProbeError::BpfObjectIntegrity {
+            object: Some(crate::sensors::BpfObjectKind::Exec),
+            failure: crate::bpf_manifest::IntegrityFailure::DigestMismatch,
+        };
+        assert_eq!(
+            err.to_string(),
+            "refusing to load bpf object exec.bpf.o: the sha256 digest of the object does not match the manifest"
+        );
+        assert!(!err.to_string().contains('/'));
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_unresolved_selected_object_names_object_and_reason_but_no_path() {
+        let err = ProbeError::BpfObjectIntegrity {
+            object: Some(crate::sensors::BpfObjectKind::Exit),
+            failure: crate::bpf_manifest::IntegrityFailure::ObjectUnresolved(
+                crate::sensors::ObjectUnavailableReason::NotElf,
+            ),
+        };
+        assert_eq!(
+            err.to_string(),
+            "refusing to load bpf object exit.bpf.o: the selected object could not be resolved: file is not an ELF object"
+        );
+        assert!(!err.to_string().contains('/'));
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_bpf_manifest_failure_without_object_is_path_free() {
+        let err = ProbeError::BpfObjectIntegrity {
+            object: None,
+            failure: crate::bpf_manifest::IntegrityFailure::ManifestUntrusted,
+        };
+        let text = err.to_string();
+        assert!(text.starts_with("refusing to load bpf objects: "));
+        assert!(text.contains("not owned by root"));
+        assert!(!text.contains('/'));
+        assert!(std::error::Error::source(&err).is_none());
     }
 }

@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -27,7 +28,9 @@ use crate::test_support::{
     TestError, TestResult, TestService, ctx, ensure, pinned, test_node, text_response,
 };
 use crate::uplink::{
-    DodUplink, FindingSeverity, HealthStatus, UPLINK_PATH, UplinkEvent, UplinkLimits, encode_line,
+    DEFAULT_MAX_LINE_BYTES, DodUplink, FindingHardness, FindingKind, FindingSeverity,
+    FindingVerdict, HealthStatus, MAX_EVENT_LINE_BYTES, MAX_RULE_ID_BYTES, UPLINK_PATH,
+    UplinkDedupKey, UplinkEvent, UplinkFindingId, UplinkLimits, UplinkRuleId, encode_line,
     receive_uplink, uplink_channel, uplink_request,
 };
 use crate::{
@@ -639,22 +642,47 @@ mod loopback {
 
 // --- uplink -------------------------------------------------------------------
 
-fn finding(summary: &str) -> UplinkEvent {
-    UplinkEvent::FindingSummary {
-        finding_id: "f-1".into(),
-        rule_id: "dod.proc.unexpected_exec".into(),
+/// A canonical UUIDv4 (version nibble 4, variant `8`), as the Sentinel mints.
+const FINDING_ID: &str = "3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b";
+
+/// A well-formed export v3 `dedup_key`.
+const DEDUP_KEY: &str = "0123456789abcdef0123456789abcdef";
+
+/// A finding summary with the test ids, triaged as `NeedsReview`.
+fn finding() -> TestResult<UplinkEvent> {
+    finding_with(Some(FindingVerdict::NeedsReview))
+}
+
+/// A finding summary with the test ids and `verdict`.
+fn finding_with(verdict: Option<FindingVerdict>) -> TestResult<UplinkEvent> {
+    Ok(UplinkEvent::FindingSummary {
+        finding_id: UplinkFindingId::new(FINDING_ID).map_err(ctx("finding id"))?,
+        rule_id: UplinkRuleId::new("egress-flow").map_err(ctx("rule id"))?,
         severity: FindingSeverity::High,
-        summary: summary.into(),
+        hardness: FindingHardness::Observed,
+        kind: FindingKind::RuleTriggered,
+        dedup_key: UplinkDedupKey::new(DEDUP_KEY).map_err(ctx("dedup key"))?,
+        occurrences: NonZeroU64::new(3).ok_or(TestError::Missing("occurrences"))?,
         observed_at_unix_ms: NOW,
-    }
+        verdict,
+    })
 }
 
 fn beat() -> UplinkEvent {
     UplinkEvent::HealthBeat {
         sequence: 7,
         status: HealthStatus::Degraded,
-        observed_at_unix_ms: NOW + 1,
+        observed_at_unix_ms: NOW.saturating_add(1),
+        sensors_ok: 9,
+        sensors_degraded: 1,
+        untriaged_backlog: 3,
+        breaker_trips: 2,
     }
+}
+
+/// Encoded length of `event`, including the trailing `\n`.
+fn encoded_len(event: &UplinkEvent) -> TestResult<usize> {
+    Ok(encode_line(event, usize::MAX)?.len())
 }
 
 /// In-memory body delivering fixed chunks.
@@ -694,11 +722,13 @@ fn lines(events: &[UplinkEvent]) -> TestResult<Vec<u8>> {
 }
 
 mod uplink_unit {
+    use serde_json::{Value, json};
+
     use super::*;
 
     #[tokio::test]
     async fn test_receiver_reassembles_lines_across_chunks() -> TestResult {
-        let events = vec![finding("exec of /tmp/x"), beat()];
+        let events = vec![finding()?, beat()];
         let raw = lines(&events)?;
         for chunk in [1, 7, raw.len()] {
             let mut got = Vec::new();
@@ -723,7 +753,12 @@ mod uplink_unit {
             max_line_bytes: 64,
             ..UplinkLimits::default()
         };
-        let raw = lines(&[finding(&"x".repeat(200))])?;
+        // Every finding summary is far longer than 64 bytes.
+        let raw = lines(&[finding()?])?;
+        ensure(
+            raw.len() > 64,
+            format!("finding line of {} bytes", raw.len()),
+        )?;
         let mut got = 0;
         let verdict = receive_uplink(ChunkedBody::split(&raw, 16), &limits, |_| got += 1).await;
         ensure(
@@ -771,7 +806,7 @@ mod uplink_unit {
         for (raw, what) in [
             (&b"{\"type\":\"command\",\"run\":\"rm\"}\n"[..], "unknown variant"),
             (
-                &b"{\"type\":\"health_beat\",\"sequence\":1,\"status\":\"ok\",\"observed_at_unix_ms\":1,\"node_id\":\"spoof\"}\n"[..],
+                &b"{\"type\":\"health_beat_v2\",\"sequence\":1,\"status\":\"ok\",\"observed_at_unix_ms\":1,\"sensors_ok\":1,\"sensors_degraded\":0,\"untriaged_backlog\":0,\"breaker_trips\":0,\"node_id\":\"spoof\"}\n"[..],
                 "unknown field",
             ),
             (&b"\n"[..], "blank line"),
@@ -791,14 +826,20 @@ mod uplink_unit {
 
     #[test]
     fn test_sender_refuses_oversize_and_never_blocks() -> TestResult {
+        // The line limit admits the beat but not the (longer) finding.
+        let beat_len = encoded_len(&beat())?;
+        ensure(
+            encoded_len(&finding()?)? > beat_len,
+            "finding must encode longer than the beat",
+        )?;
         let limits = UplinkLimits {
-            max_line_bytes: 128,
+            max_line_bytes: beat_len,
             ..UplinkLimits::default()
         };
         let (sender, body) = uplink_channel(1, &limits);
         ensure(
             matches!(
-                sender.publish(&finding(&"y".repeat(500))),
+                sender.publish(&finding()?),
                 Err(UplinkError::LineTooLong { .. })
             ),
             "oversize event queued",
@@ -815,6 +856,376 @@ mod uplink_unit {
             UplinkError::TooManyEvents { limit: 1 }.http_status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
+        Ok(())
+    }
+
+    /// `event` as a JSON line with `field` set to `value`, or removed for
+    /// `None` (re-encoded from a `serde_json::Map`, so the key order may
+    /// differ from the encoder's).
+    fn line_with(event: &UplinkEvent, field: &str, value: Option<Value>) -> TestResult<Vec<u8>> {
+        let mut object = match serde_json::to_value(event).map_err(ctx("event to json"))? {
+            Value::Object(object) => object,
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "event is not a JSON object: {other}"
+                )));
+            }
+        };
+        match value {
+            Some(value) => {
+                object.insert(field.to_owned(), value);
+            }
+            None => {
+                object.remove(field);
+            }
+        }
+        let mut line = serde_json::to_vec(&Value::Object(object)).map_err(ctx("json to line"))?;
+        line.push(b'\n');
+        Ok(line)
+    }
+
+    #[test]
+    fn test_finding_summary_v2_round_trips_with_ids_and_enums_only() -> TestResult {
+        let event = finding()?;
+        let json = serde_json::to_value(&event).map_err(ctx("finding to json"))?;
+        let object = json.as_object().ok_or(TestError::Missing("json object"))?;
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        // No free-text field (I4) and no node field (identity is the channel).
+        assert_eq!(
+            keys,
+            [
+                "dedup_key",
+                "finding_id",
+                "hardness",
+                "kind",
+                "observed_at_unix_ms",
+                "occurrences",
+                "rule_id",
+                "severity",
+                "type",
+                "verdict",
+            ]
+        );
+        for (key, expected) in [
+            ("type", "finding_summary_v2"),
+            ("finding_id", FINDING_ID),
+            ("rule_id", "egress-flow"),
+            ("severity", "high"),
+            ("hardness", "observed"),
+            ("kind", "rule_triggered"),
+            ("dedup_key", DEDUP_KEY),
+            ("verdict", "needs_review"),
+        ] {
+            assert_eq!(
+                object.get(key).and_then(Value::as_str),
+                Some(expected),
+                "{key}"
+            );
+        }
+        assert_eq!(object.get("occurrences").and_then(Value::as_u64), Some(3));
+        let back: UplinkEvent = serde_json::from_value(json).map_err(ctx("json to finding"))?;
+        assert_eq!(back, event);
+        Ok(())
+    }
+
+    #[test]
+    fn test_finding_summary_without_verdict_omits_the_field() -> TestResult {
+        let event = finding_with(None)?;
+        let text = serde_json::to_string(&event).map_err(ctx("finding to text"))?;
+        ensure(
+            !text.contains("verdict"),
+            format!("verdict written: {text}"),
+        )?;
+        let back: UplinkEvent = serde_json::from_str(&text).map_err(ctx("text to finding"))?;
+        assert_eq!(back, event);
+        // An explicit `null` decodes as "no verdict" too.
+        let explicit = line_with(&finding()?, "verdict", Some(Value::Null))?;
+        let parsed: UplinkEvent = serde_json::from_slice(&explicit).map_err(ctx("null verdict"))?;
+        assert_eq!(parsed, event);
+        Ok(())
+    }
+
+    #[test]
+    fn test_health_beat_v2_round_trips_counters() -> TestResult {
+        let event = beat();
+        let json = serde_json::to_value(&event).map_err(ctx("beat to json"))?;
+        assert_eq!(
+            json.get("type").and_then(Value::as_str),
+            Some("health_beat_v2")
+        );
+        assert_eq!(json.get("status").and_then(Value::as_str), Some("degraded"));
+        for (key, expected) in [
+            ("sequence", 7),
+            ("observed_at_unix_ms", NOW.saturating_add(1)),
+            ("sensors_ok", 9),
+            ("sensors_degraded", 1),
+            ("untriaged_backlog", 3),
+            ("breaker_trips", 2),
+        ] {
+            assert_eq!(
+                json.get(key).and_then(Value::as_u64),
+                Some(expected),
+                "{key}"
+            );
+        }
+        let back: UplinkEvent = serde_json::from_value(json).map_err(ctx("json to beat"))?;
+        assert_eq!(back, event);
+        Ok(())
+    }
+
+    #[test]
+    fn test_largest_events_fit_max_event_line_bytes() -> TestResult {
+        let largest_finding = UplinkEvent::FindingSummary {
+            finding_id: UplinkFindingId::new(FINDING_ID).map_err(ctx("finding id"))?,
+            rule_id: UplinkRuleId::new("r".repeat(MAX_RULE_ID_BYTES)).map_err(ctx("rule id"))?,
+            severity: FindingSeverity::Critical,
+            hardness: FindingHardness::Correlated,
+            kind: FindingKind::RuleTriggered,
+            dedup_key: UplinkDedupKey::new(DEDUP_KEY).map_err(ctx("dedup key"))?,
+            occurrences: NonZeroU64::MAX,
+            observed_at_unix_ms: u64::MAX,
+            verdict: Some(FindingVerdict::FalsePositive),
+        };
+        let largest_beat = UplinkEvent::HealthBeat {
+            sequence: u64::MAX,
+            status: HealthStatus::Degraded,
+            observed_at_unix_ms: u64::MAX,
+            sensors_ok: u32::MAX,
+            sensors_degraded: u32::MAX,
+            untriaged_backlog: u64::MAX,
+            breaker_trips: u64::MAX,
+        };
+        // The sizes `MAX_EVENT_LINE_BYTES` documents.
+        assert_eq!(encoded_len(&largest_finding)?, 445);
+        assert_eq!(encoded_len(&largest_beat)?, 253);
+        for event in [&largest_finding, &largest_beat] {
+            encode_line(event, MAX_EVENT_LINE_BYTES)?;
+        }
+        ensure(
+            MAX_EVENT_LINE_BYTES <= DEFAULT_MAX_LINE_BYTES,
+            "the event bound exceeds the default receiver line limit",
+        )?;
+        assert_eq!(
+            encode_line(&largest_finding, 444),
+            Err(UplinkError::LineTooLong {
+                actual: 445,
+                limit: 444
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_uplink_ids_enforce_their_grammar() -> TestResult {
+        UplinkFindingId::new(FINDING_ID).map_err(ctx("canonical uuid"))?;
+        for bad in [
+            "",
+            "f-1",
+            "00000000-0000-0000-0000-000000000000",
+            "3F2B8C1E-9D4A-4B7E-8A6F-1C2D3E4F5A6B",
+            "{3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b}",
+            "3f2b8c1e9d4a4b7e8a6f1c2d3e4f5a6b",
+            "3f2b8c1e-9d4a-1b7e-8a6f-1c2d3e4f5a6b",
+            "3f2b8c1e-9d4a-4b7e-ca6f-1c2d3e4f5a6b",
+            "3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b ",
+        ] {
+            ensure(
+                UplinkFindingId::new(bad).is_err(),
+                format!("finding id {bad:?} accepted"),
+            )?;
+        }
+
+        let longest = "r".repeat(MAX_RULE_ID_BYTES);
+        for good in [
+            "egress-flow",
+            "advisory-correlate",
+            "dod.proc.unexpected_exec",
+            "ns:rule_1",
+            longest.as_str(),
+        ] {
+            UplinkRuleId::new(good).map_err(ctx("valid rule id"))?;
+        }
+        let too_long = "r".repeat(MAX_RULE_ID_BYTES.saturating_add(1));
+        for bad in [
+            "",
+            "egress flow",
+            "egress-flow\n",
+            "egress\u{202E}wolf",
+            "egress\u{200B}flow",
+            "r\u{e4}te",
+            "a/b",
+            "a\"b",
+            too_long.as_str(),
+        ] {
+            ensure(
+                UplinkRuleId::new(bad).is_err(),
+                format!("rule id {bad:?} accepted"),
+            )?;
+        }
+
+        UplinkDedupKey::new(DEDUP_KEY).map_err(ctx("valid dedup key"))?;
+        let short = "a".repeat(31);
+        let long = "a".repeat(33);
+        for bad in [
+            short.as_str(),
+            long.as_str(),
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdeg0123456789abcdef",
+        ] {
+            ensure(
+                UplinkDedupKey::new(bad).is_err(),
+                format!("dedup key {bad:?} accepted"),
+            )?;
+        }
+
+        // The error names the field and the rule, never the value.
+        let err = match UplinkRuleId::new("evil\u{202E}rule") {
+            Err(err) => err,
+            Ok(id) => return Err(TestError::Unexpected(format!("accepted {id}"))),
+        };
+        assert_eq!(err.field(), "rule_id");
+        let text = err.to_string();
+        ensure(!text.contains("evil"), format!("value echoed: {text:?}"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_receiver_rejects_free_text_and_invalid_v2_fields() -> TestResult {
+        let limits = UplinkLimits::default();
+        let base = finding()?;
+        let mut cases: Vec<(Vec<u8>, &str)> = vec![
+            (
+                b"{\"type\":\"finding_summary\",\"finding_id\":\"f-1\",\"rule_id\":\"r\",\"severity\":\"high\",\"summary\":\"exec of /tmp/x\",\"observed_at_unix_ms\":1}\n".to_vec(),
+                "generation-1 finding with free text",
+            ),
+            (
+                b"{\"type\":\"health_beat\",\"sequence\":1,\"status\":\"ok\",\"observed_at_unix_ms\":1}\n".to_vec(),
+                "generation-1 beat",
+            ),
+        ];
+        let invalid = [
+            (
+                "summary",
+                Some(json!("exec of /tmp/x")),
+                "free-text summary",
+            ),
+            ("finding_id", Some(json!("f-1")), "non-UUID finding id"),
+            (
+                "finding_id",
+                Some(json!(FINDING_ID.to_uppercase())),
+                "uppercase finding id",
+            ),
+            (
+                "rule_id",
+                Some(json!("egress flow")),
+                "rule id with a space",
+            ),
+            (
+                "rule_id",
+                Some(json!("egress\u{202E}wolf")),
+                "rule id with a bidi override",
+            ),
+            (
+                "rule_id",
+                Some(json!("r".repeat(MAX_RULE_ID_BYTES.saturating_add(1)))),
+                "overlong rule id",
+            ),
+            (
+                "dedup_key",
+                Some(json!(DEDUP_KEY.to_uppercase())),
+                "uppercase dedup key",
+            ),
+            ("occurrences", Some(json!(0)), "zero occurrences"),
+            ("occurrences", Some(json!(-1)), "negative occurrences"),
+            ("severity", Some(json!("severe")), "unknown severity"),
+            ("hardness", Some(json!("certain")), "unknown hardness"),
+            ("kind", Some(json!("rule-triggered")), "kebab-case kind"),
+            ("verdict", Some(json!("benign")), "unknown verdict"),
+            ("dedup_key", None, "missing dedup key"),
+            ("hardness", None, "missing hardness"),
+            ("occurrences", None, "missing occurrences"),
+        ];
+        for (field, value, what) in invalid {
+            cases.push((line_with(&base, field, value)?, what));
+        }
+        let invalid_beat = [
+            ("sensors_ok", None, "beat without sensors_ok"),
+            ("sensors_degraded", None, "beat without sensors_degraded"),
+            (
+                "sensors_ok",
+                Some(json!(4_294_967_296_u64)),
+                "beat with sensors_ok above u32",
+            ),
+            (
+                "breaker_trips",
+                Some(json!(-1)),
+                "beat with negative breaker_trips",
+            ),
+            (
+                "untriaged_backlog",
+                Some(json!("3")),
+                "beat with untriaged_backlog as a string",
+            ),
+        ];
+        for (field, value, what) in invalid_beat {
+            cases.push((line_with(&beat(), field, value)?, what));
+        }
+        for (raw, what) in &cases {
+            let mut got = 0;
+            let verdict =
+                receive_uplink(ChunkedBody::split(raw, raw.len()), &limits, |_| got += 1).await;
+            ensure(
+                matches!(verdict, Err(UplinkError::Malformed { line: 1, .. })),
+                format!("{what}: {verdict:?}"),
+            )?;
+            assert_eq!(got, 0, "{what}");
+        }
+
+        // The reason never quotes the input (I4): serde's own message for an
+        // unknown enum value, field or tag would carry it verbatim, bidi
+        // override included (written as escapes, decoded by the JSON parser).
+        let echo_cases = [
+            (
+                line_with(&base, "severity", Some(json!("\u{202E}sev-marker")))?,
+                "bidi severity",
+            ),
+            (
+                line_with(&base, "\u{202E}field-marker", Some(json!(1)))?,
+                "bidi unknown field",
+            ),
+            (
+                b"{\"type\":\"\\u202etag-marker\"}\n".to_vec(),
+                "bidi unknown tag",
+            ),
+        ];
+        for (raw, what) in &echo_cases {
+            let verdict = receive_uplink(ChunkedBody::split(raw, raw.len()), &limits, |_| {}).await;
+            let reason = match verdict {
+                Err(UplinkError::Malformed { line: 1, reason }) => reason,
+                other => return Err(TestError::Unexpected(format!("{what}: {other:?}"))),
+            };
+            ensure(
+                !reason.contains("marker") && !reason.contains('\u{202E}'),
+                format!("{what}: input echoed in {reason:?}"),
+            )?;
+            ensure(
+                reason.contains("column"),
+                format!("{what}: no position in {reason:?}"),
+            )?;
+        }
+
+        // Control: the same line with valid values, re-encoded the same way,
+        // passes.
+        let control = line_with(&base, "verdict", Some(json!("needs_review")))?;
+        let mut got = Vec::new();
+        receive_uplink(
+            ChunkedBody::split(&control, control.len()),
+            &limits,
+            |event| got.push(event),
+        )
+        .await?;
+        assert_eq!(got, vec![base]);
         Ok(())
     }
 }
@@ -867,7 +1278,7 @@ mod uplink_loopback {
                 .await?;
         let (sender, body) = uplink_channel(8, &UplinkLimits::default());
         let request = uplink_request(body)?;
-        let events = vec![finding("exec of /tmp/x"), beat()];
+        let events = vec![finding()?, beat()];
         let publish = {
             let events = events.clone();
             async move {
@@ -898,7 +1309,7 @@ mod uplink_loopback {
         let node = test_node("harw-node-03", 2)?;
         let received: Received = Arc::default();
         let server_limits = UplinkLimits {
-            max_line_bytes: 256,
+            max_line_bytes: 64,
             ..UplinkLimits::default()
         };
         let (addr, server) = spawn_server(
@@ -913,7 +1324,7 @@ mod uplink_loopback {
         // The sender allows larger lines than this receiver: the receiver's
         // own limit must hold.
         let (sender, body) = uplink_channel(4, &UplinkLimits::default());
-        sender.publish(&finding(&"z".repeat(2_000)))?;
+        sender.publish(&finding()?)?;
         drop(sender);
         let response = client.send_request(uplink_request(body)?).await?;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);

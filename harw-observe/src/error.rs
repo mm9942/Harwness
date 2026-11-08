@@ -6,7 +6,9 @@
 //! I/O — die Quellen solcher Fehler sind aktuell die validierenden
 //! Konstruktoren von [`crate::trace::TraceContext`] sowie
 //! [`crate::null_counter::assert_all_zero`] (Knoten AW1-07), wenn ein
-//! Nullzähler über null steht. Konsumenten mit eigenem I/O (z. B.
+//! Nullzähler über null steht, außerdem die Null-Serien-Registry, das
+//! Exporttor und [`crate::dod_metrics::DodMetrics::install`] (PL-100
+//! Phase 4). Konsumenten mit eigenem I/O (z. B.
 //! `harw-observe-file`) definieren ihren eigenen Fehlertyp, statt diesen
 //! hier zu erweitern.
 //!
@@ -94,6 +96,50 @@ pub enum ObserveError {
         /// Die verletzte Invariante im Klartext.
         invariant: &'static str,
     },
+
+    /// Eine Null-Serien-Deklaration ([`crate::zero_registry::ZeroSeries`])
+    /// verletzt die Regeln der Registry.
+    ///
+    /// # Arguments
+    /// - `name` (`&'static str`): Metrikname der abgelehnten Deklaration.
+    /// - `reason` (`&'static str`): kurzer, fester Grund (kein Laufzeitwert).
+    #[msg("zero series '{name}' is invalid: {reason}")]
+    InvalidZeroSeries {
+        /// Metrikname der abgelehnten Deklaration.
+        name: &'static str,
+        /// Kurzer, fester Grund.
+        reason: &'static str,
+    },
+
+    /// [`crate::dod_metrics::DodMetrics::install`] hat nicht jede
+    /// Null-Serie der Prozessrolle an die Standardziele verteilt.
+    ///
+    /// # Description
+    /// Ein Verteilen scheitert nur bei einem geschützten Namen, den
+    /// [`crate::zero_registry::ZeroSeries::validate`] ausschließt; die
+    /// Variante ist die typisierte Absicherung statt einer Panik.
+    ///
+    /// # Arguments
+    /// - `emitted` (`usize`): Anzahl der verteilten Nullwerte.
+    /// - `expected` (`usize`): Anzahl der Serien der Rolle.
+    #[msg("zero series incomplete: {emitted} of {expected} emitted to the default targets")]
+    IncompleteZeroSeries {
+        /// Anzahl der verteilten Nullwerte.
+        emitted: usize,
+        /// Anzahl der Serien der Rolle.
+        expected: usize,
+    },
+
+    /// Ein [`crate::routing::ExportApproval`] erfüllt die formalen Vorgaben
+    /// nicht (Namensraum nicht geschützt oder Operator-Bezeichner leer).
+    ///
+    /// # Arguments
+    /// - `reason` (`&'static str`): kurzer, fester Grund.
+    #[msg("export approval rejected: {reason}")]
+    InvalidExportApproval {
+        /// Kurzer, fester Grund.
+        reason: &'static str,
+    },
 }
 
 #[cfg(test)]
@@ -162,6 +208,36 @@ mod tests {
             count: 1,
             invariant: "invariant",
         };
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn test_observe_error_display_zero_series_and_approval() {
+        let a = ObserveError::InvalidZeroSeries {
+            name: "x_total",
+            reason: "labels missing",
+        };
+        assert_eq!(
+            a.to_string(),
+            "zero series 'x_total' is invalid: labels missing"
+        );
+        let b = ObserveError::InvalidExportApproval {
+            reason: "actor is empty",
+        };
+        assert_eq!(b.to_string(), "export approval rejected: actor is empty");
+    }
+
+    #[test]
+    fn test_observe_error_display_incomplete_zero_series() {
+        use std::error::Error as _;
+        let err = ObserveError::IncompleteZeroSeries {
+            emitted: 6,
+            expected: 7,
+        };
+        assert_eq!(
+            err.to_string(),
+            "zero series incomplete: 6 of 7 emitted to the default targets"
+        );
         assert!(err.source().is_none());
     }
 }

@@ -77,22 +77,40 @@ const FIELD_COUNT: usize = 4;
 /// Schutz gegen die auf einem Host mit vielen Containern unbegrenzte
 /// Zahl an Kind-cgroups (siehe `crate`-Moduldoku, Abschnitt
 /// „Kardinalität"). cgroups über diese Zahl hinaus werden nach Sortierung
-/// nach Namen verworfen (siehe [`cap_and_sort_cgroups`]) — still, ohne
-/// Fehler: das ist eine Schutzmaßnahme, keine fehlerhafte Quelle.
+/// nach Namen verworfen (siehe [`cap_and_sort_cgroups`]) — ohne Fehler: das
+/// ist eine Schutzmaßnahme, keine fehlerhafte Quelle. Die Zahl der
+/// verworfenen cgroups meldet [`TRUNCATED_METRIC`].
 pub const MAX_CGROUPS: usize = 16;
+
+/// Metrikname der Kürzungsmarke: wie viele echte Kind-cgroups dieser Poll
+/// über [`MAX_CGROUPS`] hinaus verworfen hat (PL-100 WP0.15).
+///
+/// # Description
+/// Jeder erfolgreiche Poll meldet genau ein `HostSample` mit diesem Namen,
+/// Wert `0` ohne Kürzung. cgroup-Namen sind angreiferkontrolliert: wer
+/// genug alphabetisch frühe Container startet, verdrängt sonst still jede
+/// spätere cgroup aus der Beobachtung. Der Punkt im Namen ist Absicht: ein
+/// sanitisiertes cgroup-Label enthält nie einen Punkt (siehe
+/// [`sanitize_label`]), die Marke kollidiert also mit keiner Kennzahl.
+///
+/// # Examples
+/// ```rust
+/// assert_eq!(harw_dod_cgroup::sensor::TRUNCATED_METRIC, "cgroup.truncated");
+/// ```
+pub const TRUNCATED_METRIC: &str = "cgroup.truncated";
 
 /// Die deklarierte Obergrenze verschiedener Labelkombinationen je Poll.
 ///
 /// # Description
-/// [`MAX_CGROUPS`] cgroups mit je bis zu [`FIELD_COUNT`] Metriken. Der
-/// Fixture-seitige Spiegel, den `harw_dod_fixtures::sensor_suite!` als
-/// `max_cardinality` erwartet.
+/// [`MAX_CGROUPS`] cgroups mit je bis zu [`FIELD_COUNT`] Metriken plus die
+/// eine Kürzungsmarke [`TRUNCATED_METRIC`]. Der Fixture-seitige Spiegel,
+/// den `harw_dod_fixtures::sensor_suite!` als `max_cardinality` erwartet.
 ///
 /// # Examples
 /// ```rust
-/// assert_eq!(harw_dod_cgroup::sensor::MAX_CARDINALITY, 64);
+/// assert_eq!(harw_dod_cgroup::sensor::MAX_CARDINALITY, 65);
 /// ```
-pub const MAX_CARDINALITY: usize = MAX_CGROUPS * FIELD_COUNT;
+pub const MAX_CARDINALITY: usize = MAX_CGROUPS * FIELD_COUNT + 1;
 
 /// Obergrenze der Zeichen, die aus einem cgroup-Namen in den Metriknamen
 /// übernommen werden — Schutz gegen unbegrenztes Wachstum durch einen
@@ -226,9 +244,12 @@ impl Sensor for CgroupSensor {
     /// # Returns
     /// Ein [`SensorReading`] mit bis zu [`MAX_CARDINALITY`] Samples und
     /// keinen Events (cgroup-v2-Kontrolldateien erzeugen keine
-    /// Sicherheitsereignisse). Kann leer sein, wenn jede gefundene cgroup
-    /// keine der vier Kontrolldateien trägt (Controller nirgends aktiviert)
-    /// — das ist kein Fehler, siehe `crate`-Moduldoku, Entscheidung 3.
+    /// Sicherheitsereignisse). Das letzte Sample ist immer die
+    /// Kürzungsmarke [`TRUNCATED_METRIC`] (Zahl der über [`MAX_CGROUPS`]
+    /// hinaus verworfenen cgroups, `0` ohne Kürzung). Trägt keine gefundene
+    /// cgroup eine der vier Kontrolldateien (Controller nirgends aktiviert),
+    /// bleibt nur diese Marke — das ist kein Fehler, siehe
+    /// `crate`-Moduldoku, Entscheidung 3.
     ///
     /// # Errors
     /// - [`SensorError::SourceUnavailable`]: der Lesebereich hat keine
@@ -271,6 +292,8 @@ impl Sensor for CgroupSensor {
             return Err(SensorError::SourceUnavailable);
         }
 
+        // PL-100 WP0.15: die Kürzung zählen, bevor sie geschieht.
+        let dropped = children.len().saturating_sub(MAX_CGROUPS);
         let kept = cap_and_sort_cgroups(children);
 
         // Teilergebnis statt Totalausfall: ein Lesefehler auf einer
@@ -279,7 +302,8 @@ impl Sensor for CgroupSensor {
         // gesammelt und nur dann propagiert, wenn am Ende **keine einzige**
         // Probe zustande kam (F-095-Register: „Teilergebnisse statt
         // Totalausfall bei einzelnen Lesefehlern“).
-        let mut samples = Vec::with_capacity(kept.len() * FIELD_COUNT);
+        let mut samples =
+            Vec::with_capacity(kept.len().saturating_mul(FIELD_COUNT).saturating_add(1));
         let mut errors: Vec<SensorError> = Vec::new();
 
         for dir in &kept {
@@ -336,6 +360,14 @@ impl Sensor for CgroupSensor {
         {
             return Err(first_error);
         }
+        // Erst nach der Fehlerentscheidung: die Marke ist keine Probe und
+        // darf einen Totalausfall nicht als Teilergebnis tarnen.
+        samples.push(HostSample {
+            sensor: self.handle.id().clone(),
+            observed_at: now,
+            metric: Cow::Borrowed(TRUNCATED_METRIC),
+            value: dropped as f64,
+        });
 
         Ok(SensorReading {
             samples,
@@ -671,8 +703,8 @@ mod tests {
     use jiff::Timestamp;
 
     use super::{
-        CgroupSensor, MAX_CARDINALITY, MAX_CGROUPS, cap_and_sort_cgroups, is_child_cgroup_dir,
-        sanitize_label,
+        CgroupSensor, MAX_CARDINALITY, MAX_CGROUPS, TRUNCATED_METRIC, cap_and_sort_cgroups,
+        is_child_cgroup_dir, sanitize_label,
     };
     use crate::test_support::{TestError, TestResult, ctx};
 
@@ -691,8 +723,8 @@ mod tests {
 
     #[test]
     fn test_max_cardinality_matches_max_cgroups_times_field_count() {
-        assert_eq!(MAX_CARDINALITY, MAX_CGROUPS * 4);
-        assert_eq!(MAX_CARDINALITY, 64);
+        assert_eq!(MAX_CARDINALITY, MAX_CGROUPS * 4 + 1);
+        assert_eq!(MAX_CARDINALITY, 65);
     }
 
     #[test]
@@ -788,14 +820,86 @@ mod tests {
             .poll(Timestamp::UNIX_EPOCH)
             .map_err(ctx("many-cgroups Fixture muss erfolgreich pollen"))?;
 
+        let probes: Vec<_> = reading
+            .samples
+            .iter()
+            .filter(|s| s.metric != TRUNCATED_METRIC)
+            .collect();
         assert!(
-            reading
-                .samples
+            probes
                 .iter()
                 .all(|s| s.metric.starts_with("memory_current_bytes_")),
             "many-cgroups-Fixture trägt nur memory.current je cgroup"
         );
-        assert_eq!(reading.samples.len(), MAX_CGROUPS);
+        assert_eq!(probes.len(), MAX_CGROUPS);
+        Ok(())
+    }
+
+    #[test]
+    fn test_many_cgroups_fixture_reports_the_number_of_dropped_cgroups() -> TestResult {
+        // 20 echte Kind-cgroups, 16 bleiben: die Kürzung ist sichtbar.
+        let sensor = build_sensor(fixtures_root().join("many-cgroups/tree"));
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("many-cgroups Fixture muss erfolgreich pollen"))?;
+
+        let marker = reading
+            .samples
+            .last()
+            .ok_or(TestError::Missing("Kürzungsmarke"))?;
+        assert_eq!(marker.metric, TRUNCATED_METRIC);
+        assert!(
+            (marker.value - 4.0).abs() < f64::EPSILON,
+            "{}",
+            marker.value
+        );
+        assert_eq!(
+            reading
+                .samples
+                .iter()
+                .filter(|s| s.metric == TRUNCATED_METRIC)
+                .count(),
+            1,
+            "genau eine Kürzungsmarke je Poll"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_typical_fixture_reports_zero_dropped_cgroups() -> TestResult {
+        let sensor = build_sensor(fixtures_root().join("typical/tree"));
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("typical Fixture muss erfolgreich pollen"))?;
+
+        let marker = reading
+            .samples
+            .last()
+            .ok_or(TestError::Missing("Kürzungsmarke"))?;
+        assert_eq!(marker.metric, TRUNCATED_METRIC);
+        assert!(marker.value.abs() < f64::EPSILON, "{}", marker.value);
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_probes_failing_still_errors_instead_of_reporting_only_the_marker() -> TestResult {
+        // Teilergebnis-Semantik bleibt: scheitert jede Probe, ist das ein
+        // Fehler — die Marke allein ist kein Teilergebnis.
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let cg = dir.path().join("broken.slice");
+        std::fs::create_dir_all(&cg).map_err(ctx("cgroup-Verzeichnis"))?;
+        std::fs::write(cg.join("cgroup.controllers"), "memory\n")
+            .map_err(ctx("cgroup.controllers schreiben"))?;
+        std::fs::write(cg.join("memory.current"), "keine-zahl\n")
+            .map_err(ctx("memory.current schreiben"))?;
+
+        let sensor = build_sensor(dir.path().to_path_buf());
+        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "nur fehlerhafte Proben dürfen kein Ok liefern".to_owned(),
+            ));
+        };
+        assert!(matches!(err, harw_dod_cap::SensorError::MalformedSource));
         Ok(())
     }
 
@@ -837,7 +941,11 @@ mod tests {
         ))?;
 
         assert_eq!(
-            reading.samples.len(),
+            reading
+                .samples
+                .iter()
+                .filter(|s| s.metric != TRUNCATED_METRIC)
+                .count(),
             2,
             "genau je eine memory_current_bytes-Probe pro echter cgroup: {:?}",
             reading.samples

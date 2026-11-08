@@ -2,16 +2,20 @@
   "has_executor": {
     "job.list": true,
     "job.logs": true,
+    "job.resume": true,
     "job.start": true,
     "job.status": true,
-    "job.stop": true
+    "job.stop": true,
+    "job.suspend": true
   },
   "parallel_safe": {
     "job.list": true,
     "job.logs": true,
+    "job.resume": false,
     "job.start": false,
     "job.status": true,
-    "job.stop": false
+    "job.stop": false,
+    "job.suspend": false
   },
   "permissions": null,
   "tools": [
@@ -61,7 +65,7 @@
       "type": "function"
     },
     {
-      "description": "Status of one of your jobs: state (queued/running/succeeded/failed/stopped/detached/unknown), pid, runtime, exit code, recognised progress, warning/error counts, the last output lines, sandbox profile (host/bwrap), end reason (exited/signal/stopped/timeout/launch-error/unknown), whether leftover processes were reaped, whether a log hit its size budget, launch warnings.",
+      "description": "Status of one of your jobs: state (queued/running/suspended/succeeded/failed/stopped/detached/unknown), pid, runtime, exit code, recognised progress, warning/error counts, the last output lines, sandbox profile (host/bwrap), end reason (exited/signal/stopped/timeout/launch-error/unknown), whether leftover processes were reaped, whether a log hit its size budget, launch warnings.",
       "name": "job.status",
       "parameters": {
         "additionalProperties": false,
@@ -120,7 +124,7 @@
       "type": "function"
     },
     {
-      "description": "Stop one of your jobs: sends `signal` (TERM default; INT, HUP or KILL) to the whole process group, then SIGKILL after a grace period. Also kills processes the job left behind in its process group.",
+      "description": "Stop one of your jobs: sends `signal` (TERM default; INT, HUP or KILL) to the whole process group, then SIGKILL after a grace period. Also kills processes the job left behind in its process group. A suspended job is never resumed by a stop: it gets KILL at once and ends while frozen (`signal_sent` says SIGKILL); for a graceful stop, job.resume it first (refused while its suspension is unresolved, `suspend_phase: \"intent\"`).",
       "name": "job.stop",
       "parameters": {
         "additionalProperties": false,
@@ -164,6 +168,52 @@
           }
         },
         "required": [],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    },
+    {
+      "description": "Suspend (freeze) one of your running jobs: its own cgroup is frozen, so all of its processes stop at once without being killed and keep their state; job.resume continues them. Only for jobs that run in their own cgroup (delegated cgroup root); refused otherwise, and refused when someone else (an operator, the Warden) already froze it. Needs approval unless the session runs with full access. Freezing is asynchronous: `frozen: false` right after a suspend means the processes are still stopping. Suspended time does not count as active runtime and uses no CPU budget; the job keeps its running slot. Suspending an already suspended job only re-applies the freeze. If harw could not record that its freeze took effect (`suspend_phase: \"intent\"`, an unresolved suspension), a new suspend freezes the job again only while its cgroup is not frozen. job.stop kills a suspended job without resuming it.",
+      "name": "job.suspend",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "finding_id": {
+            "description": "Optional id of the DoD finding (UUIDv4) this action responds to. Only recorded in the log and echoed back; it never selects the job.",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "Job id returned by job.start (e.g. job-20260924-101112-001).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    },
+    {
+      "description": "Resume (thaw) one of your jobs suspended by job.suspend: its processes continue where they stopped and the remaining runtime budget continues. Needs approval unless the session runs with full access. Never lifts a freeze someone else set (refused); `frozen: true` after a resume means such a freeze (e.g. of a parent cgroup) still holds the job. Only a suspension recorded as harw's own (`suspend_phase: \"applied\"`) is resumed; an unresolved one (`\"intent\"`) is refused without touching the job (job.stop still kills it). Resuming a job that is not suspended changes nothing.",
+      "name": "job.resume",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "finding_id": {
+            "description": "Optional id of the DoD finding (UUIDv4) this action responds to. Only recorded in the log and echoed back; it never selects the job.",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "Job id returned by job.start (e.g. job-20260924-101112-001).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
         "type": "object"
       },
       "strict": true,

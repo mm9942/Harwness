@@ -3,15 +3,32 @@
 # Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Rendered
 # by harw-dod/scripts/install.sh (LIBEXECDIR).
 #
-# Installed, but NOT pulled in by harw-dod.target: --scope-root is mandatory
-# and site-specific. Set it through a drop-in
-# (/etc/systemd/system/harw-probe-fs.service.d/scope.conf: an empty
-# `ExecStart=` line followed by the full command) and then
-# `systemctl enable --now harw-probe-fs.service`.
+# Pulled in by harw-dod.target (PL-100 WP1.6). The watch scope comes from
+# [probe_fs] in @SYSCONFDIR@/config.toml; without that table the built-in
+# defaults apply: /etc, the cron and at spools, the systemd and udev
+# directories below /usr and /lib, and below /home, /var/home, /root and
+# /var/roothome only .ssh, the systemd user units, autostart, environment.d
+# and the shell start files (harw-probe-fs/src/watch.rs). A missing or
+# untrusted --config refuses the start. --scope-root/--home-root/--home-entry
+# on the command line (drop-in with an empty `ExecStart=` line) replace the
+# configured scope.
 #
 # Landlock: hard start failure without full enforcement
-# (harw-probe-fs/src/landlock.rs::enforce_read_scope). The binary connects to
-# the sentinel socket FIRST and only then restricts itself.
+# (harw-probe-fs/src/landlock.rs::enforce_read_scope). Read access covers the
+# watch scope plus /proc (auid from /proc/<pid>/loginuid). The binary loads
+# the configuration, connects to the sentinel socket and places its fanotify
+# marks FIRST (a 0700 root such as /var/spool/cron is marked through its
+# nearest readable ancestor on the same filesystem) and only then restricts
+# itself; no event is read before that. A scope root, or a filesystem mounted
+# below one (/proc/self/mountinfo at start), that it could not mark is
+# reported once at start as sensor-degraded. Roots and mounts that appear
+# only after the start (cronie installed later, systemd-homed or autofs at
+# login) need a restart of this unit. Event descriptors and mark targets are
+# opened with O_NONBLOCK, so a FIFO below a root cannot stall the probe.
+#
+# The fanotify queue keeps the kernel bound (fs.fanotify.max_queued_events,
+# default 16384; no FAN_UNLIMITED_QUEUE): a backlog becomes a queue overflow,
+# reported as sensor-degraded, instead of unbounded kernel memory.
 
 [Unit]
 Description=Harw-DoD fanotify probe (push-only)
@@ -27,9 +44,11 @@ StartLimitBurst=5
 Type=simple
 User=harw-probe-fs
 Group=harw-probe-fs
-SupplementaryGroups=harw-ipc
-ExecStart=@LIBEXECDIR@/harw-probe-fs --log info --scope-root /srv/harw/watched --sentinel-socket /run/harw/sentinel.sock
-# /srv/harw/watched is a placeholder; replace it via drop-in (see above).
+# harw-dod-config: read access to @SYSCONFDIR@/config.toml ([probe_fs]); the
+# same group the sentinel and the eBPF probe use. CAP_SYS_ADMIN does not
+# bypass file permissions.
+SupplementaryGroups=harw-ipc harw-dod-config
+ExecStart=@LIBEXECDIR@/harw-probe-fs --log info --config @SYSCONFDIR@/config.toml --sentinel-socket /run/harw/sentinel.sock
 Restart=on-failure
 RestartSec=5
 
@@ -37,8 +56,11 @@ RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 # Observes (fanotify) and sends (Unix socket); never writes. The scope roots
-# stay readable under "strict".
-ProtectHome=yes
+# stay readable under "strict". ProtectHome=read-only (not yes): the home
+# roots (/home, /root, /run/user) must stay visible so that fanotify can mark
+# them and the kernel can open event descriptors below them; "yes" would hide
+# every ~/.ssh and ~/.config/autostart write from the probe.
+ProtectHome=read-only
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelModules=yes
@@ -60,7 +82,7 @@ SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=CAP_SYS_ADMIN
 AmbientCapabilities=CAP_SYS_ADMIN
 # The only capability that permits fanotify_mark(FAN_MARK_FILESYSTEM) and the
-# FAN_UNLIMITED_* flags this probe uses.
+# FAN_UNLIMITED_MARKS flag this probe uses.
 
 [Install]
 WantedBy=harw-dod.target

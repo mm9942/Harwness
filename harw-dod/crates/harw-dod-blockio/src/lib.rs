@@ -79,7 +79,10 @@
 //! # Entscheidung 1 — kumulative Zähler, keine Rate
 //! Alle Zähler einer `stat`-Datei wachsen **monoton** seit dem
 //! Geräteanschluss (nicht notwendig seit dem Systemstart — ein Gerät kann
-//! nach dem Boot hinzukommen); sie sind keine Durchsatzangabe. Einen
+//! nach dem Boot hinzukommen); sie sind keine Durchsatzangabe. Einzige
+//! Ausnahme ist `io_in_flight`: die aktuelle Länge der Warteschlange, ein
+//! Momentanwert, der steigen und fallen darf (die Ratenstufe in
+//! `harw-sentinel` behandelt ihn deshalb nicht als Zähler). Einen
 //! Durchsatz (Bytes/Sekunde, IOPS) zu melden würde zwei Abrufe
 //! vergleichen — also Zustand über einen Poll hinaus halten. Das verbietet
 //! sich aus denselben zwei Gründen, die bereits `harw-dod-cpu` für
@@ -98,9 +101,10 @@
 //!
 //! **Diese Crate meldet deshalb die rohen kumulativen Zähler, unverändert,
 //! je gemeldetem Gerät.** Eine Rate zu bilden (Differenz durch Zeitspanne
-//! zwischen zwei Beobachtungen) ist Sache des Verbrauchers (z. B.
-//! `harw-dod-rules`), der ohnehin schon Zustand über mehrere Beobachtungen
-//! hinweg hält.
+//! zwischen zwei Beobachtungen) ist Sache des Verbrauchers, der ohnehin
+//! schon Zustand über mehrere Beobachtungen hinweg hält — heute die
+//! Zähler→Raten-Stufe `RateStage` in `harw-sentinel` (`src/rates.rs`,
+//! PL-100 WP0.14).
 //!
 //! # Entscheidung 2 — welche Geräte: Rauschen ausschließen, Partitionen ausschließen, Anzahl begrenzen
 //! `harw_dod_signals::HostSample` hat kein eigenes Label-Feld — die einzige
@@ -146,9 +150,12 @@
 //!    ausgewählt (deterministisch, siehe [`harw_dod_readfs::glob::glob`]s
 //!    eigene Sortierzusage) — analog zu `harw-dod-cpu`s Entscheidung, nur
 //!    die `cpu`-Aggregatzeile zu lesen: eine feste, dokumentierte Obergrenze
-//!    statt einer bloßen Erwartung über „normale" Hosts. Die deklarierte
-//!    [`sensor::MAX_CARDINALITY`] ist entsprechend
-//!    `MAX_DEVICES × FIELD_METRICS.len()`.
+//!    statt einer bloßen Erwartung über „normale" Hosts. Verworfen wird
+//!    nicht still (PL-100 WP0.15): jeder Poll meldet zusätzlich genau ein
+//!    Sample [`sensor::TRUNCATED_METRIC`] (`blockio.truncated`) mit der Zahl
+//!    der über die Grenze hinaus verworfenen Geräte, `0` ohne Kürzung. Die
+//!    deklarierte [`sensor::MAX_CARDINALITY`] ist entsprechend
+//!    `MAX_DEVICES × FIELD_METRICS.len() + 1`.
 //!
 //! # Warum kein `#[derive(harw_macros::SensorSource)]`
 //! `#[derive(harw_macros::SensorSource)]` deckt laut eigener Moduldoku genau

@@ -3,6 +3,12 @@ mode = "observe"
 
 # Installation never selects a profile implicitly. Add exactly one explicit
 # selection before running `make -C harw-dod enable`.
+#
+# `egress_allow_cidrs` lists the allowed outbound TCP destinations (CIDR).
+# harw-sentinel reports every observed flow outside this list as an
+# `egress-flow` finding; an empty list reports every outbound flow (the
+# sentinel warns at startup). It never installs firewall rules.
+# Example: egress_allow_cidrs = ["192.0.2.0/24", "2001:db8::/32"]
 # active_profile = "selected-services"
 
 [profiles.selected-services]
@@ -26,3 +32,44 @@ egress_allow_cidrs = []
 scope = "host"
 sensors = ["exec", "tcp-connect"]
 egress_allow_cidrs = []
+
+# Optional harw-sentinel settings (PL-100). A command-line flag always wins;
+# without the flag and without the key the built-in default applies (the
+# values shown here). The table is commented out on purpose (reader-first):
+# readers older than this release refuse a file that contains it.
+# [sentinel]
+# Accounts whose processes may submit events over the sentinel's IPC socket
+# (SO_PEERCRED; account name or numeric uid, at most 32 entries; uid 0 is
+# always admitted). Same as --probe-peer-user.
+# probe_peer_users = ["harw-probe-bpf", "harw-probe-fs"]
+# Cooldown of the finding throttle in seconds (0 to 604800; 0 reports every
+# repeat). Same as --finding-cooldown-secs.
+# finding_cooldown_secs = 600
+# Container sensor: "auto" (runs for every known layout, libpod scopes below
+# machine.slice and docker scopes below system.slice, even without a detected
+# runtime; a machine.slice that does not exist yet is an empty reading,
+# without cgroup v2 the sensor is reported as degraded), "on" (like "auto";
+# in addition a layout without a cgroup directory whose runtime was detected
+# neither by its socket nor by a running scope at start is reported as
+# degraded) or "off". Docker with the
+# cgroupfs driver (/sys/fs/cgroup/docker) is reported as unsupported
+# (sensor-degraded) with "auto" and "on". Same as --container-sensor.
+# container_sensor = "auto"
+
+# Optional watch scope of harw-probe-fs (PL-100 WP1.6), also commented out
+# (reader-first). A --scope-root/--home-root flag of the probe replaces both
+# root lists; without the flag and without the key the built-in default
+# applies (the values shown here). At most 64 entries per list; roots are
+# absolute and never "/".
+# [probe_fs]
+# Directories below which every write counts (persistence locations of the
+# persistence-write rule: /etc with systemd, cron, ld.so.preload, profile and
+# ssh; the cron and at spools; systemd and udev directories below /usr).
+# scope_roots = ["/etc", "/var/spool/cron", "/var/spool/at", "/usr/lib/systemd", "/usr/local/lib/systemd", "/lib/systemd", "/usr/share/systemd", "/usr/local/share/systemd", "/usr/lib/udev/rules.d", "/usr/local/lib/udev/rules.d", "/lib/udev/rules.d"]
+# Directories holding home directories, or home directories themselves
+# (/var/home and /var/roothome on ostree hosts). Below them only paths count
+# that start (after at most two components, such as the user name) with an
+# entry of home_entries -- no user names in this file.
+# home_roots = ["/home", "/var/home", "/root", "/var/roothome"]
+# Paths relative to a home directory.
+# home_entries = [".ssh", ".config/systemd", ".local/share/systemd", ".config/autostart", ".config/environment.d", ".pam_environment", ".bashrc", ".bash_aliases", ".bash_profile", ".bash_login", ".bash_logout", ".profile", ".zshrc", ".zprofile", ".zshenv", ".zlogin"]

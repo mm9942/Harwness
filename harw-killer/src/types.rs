@@ -28,6 +28,12 @@ pub(crate) struct Process {
     pub(crate) executable: Option<String>,
     /// Lossy UTF-8 rendering of argv with spaces between arguments.
     pub(crate) command: String,
+    /// Raw argv elements (lossy UTF-8) with argument boundaries preserved.
+    /// Never shown to models; model-facing output uses a redacted rendering.
+    /// Not serialized: the versioned CLI `--json` report (schema 1) keeps its
+    /// field set, and argv values must not leak through it a second time.
+    #[serde(skip)]
+    pub(crate) argv: Vec<String>,
 }
 /// Metadata plus the non-cloneable kernel identity selected for termination.
 pub(crate) struct Target {
@@ -104,7 +110,8 @@ mod tests {
     use super::*;
     // Completion and error classification must agree with the public report schema.
     #[test]
-    fn test_success_distinguishes_survivors_and_errors() {
+    fn test_success_distinguishes_survivors_and_errors()
+    -> std::result::Result<(), crate::error::Error> {
         for (outcome, expected) in [
             (Completion::KilledAfterRetry, true),
             (Completion::Killed, true),
@@ -126,6 +133,7 @@ mod tests {
         let result = Outcome::error(123, &error);
         assert!(!result.success());
         assert_eq!(result.detail, Some(error.to_string()));
-        assert_eq!(serde_json::to_value(result).unwrap()["outcome"], "error");
+        assert_eq!(serde_json::to_value(result)?["outcome"], "error");
+        Ok(())
     }
 }

@@ -208,3 +208,55 @@ fn dod_model_tools_are_read_only_auto_approved_and_the_dod_command_is_no_model_t
         "/dod darf keine ModelTool-Fläche tragen"
     );
 }
+
+#[test]
+fn dod_triage_tools_are_read_only_auto_approved_and_never_reach_the_root() {
+    // PL-100 WP1.2 / O8 (Werkzeugbudget G1): `dod.finding`, `dod.related`
+    // und `dod.labels` lesen nur den Export (bzw. eine Label-Quelle) und
+    // laufen ohne Rückfrage — die Triage-Kinder laufen mit
+    // `allow_pause = false`. Eine Root-Session trägt keines davon: ihre
+    // `dod.*`-Modell-Werkzeuge sind genau `DOD_MODEL_TOOLS`.
+    assert_eq!(
+        harw_ops::dod::DOD_TRIAGE_OP_TOOLS.as_slice(),
+        harw_registry_defaults::profile::DOD_TRIAGE_TOOLS
+    );
+    let triage = harw_ops::dod::dod_triage_operations();
+    for (op, tool) in triage.iter().zip(harw_ops::dod::DOD_TRIAGE_OP_TOOLS) {
+        let meta = op.meta();
+        assert_eq!(meta.name, tool);
+        assert_eq!(
+            meta.surfaces,
+            vec![Surface::ModelTool {
+                readonly: true,
+                approval: ApprovalPolicy::None,
+            }],
+            "{tool} muss genau eine lesende ModelTool-Fläche ohne Freigabe deklarieren"
+        );
+        assert!(AUTO_APPROVED_TOOLS.contains(&tool), "{tool}");
+        assert!(
+            !harw_registry_defaults::ALWAYS_ASK_TOOLS.contains(&tool),
+            "{tool}"
+        );
+        assert!(
+            !DefaultApprovalPolicy::requires_explicit_approval(&model_call(tool)),
+            "{tool} muss ohne Rückfrage laufen"
+        );
+    }
+
+    let registry = full_registry();
+    let mut root_dod: Vec<&str> = model_tool_surfaces(&registry)
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .filter(|name| name.starts_with("dod."))
+        .collect();
+    root_dod.sort_unstable();
+    let mut expected = harw_ops::dod::DOD_MODEL_TOOLS;
+    expected.sort_unstable();
+    assert_eq!(root_dod, expected, "Root behält genau drei dod.*");
+    for tool in harw_ops::dod::DOD_TRIAGE_OP_TOOLS {
+        assert!(
+            registry.find_by_name(tool).is_none(),
+            "{tool} darf keine Root-Operation sein"
+        );
+    }
+}

@@ -1,11 +1,13 @@
 //! Fehlertyp der fanotify-Sonde `harw-probe-fs`.
 //!
 //! # Verantwortungsbereich
-//! [`ProbeError`] ist der eine Fehlertyp dieses Binaries. Er deckt fünf
+//! [`ProbeError`] ist der eine Fehlertyp dieses Binaries. Er deckt sieben
 //! Quellen ab: die Landlock-Durchsetzung ([`crate::landlock`]), die
-//! (weiterhin unfertige) fanotify-Quelle ([`crate::source`]), den Sendeweg
+//! fanotify-Quelle ([`crate::source`]), den Sendeweg
 //! zum Sentinel ([`crate::sink`]), Sensorfehler aus der Sammelschleife
-//! ([`crate::collect`], über `harw_dod_cap::SensorError`) und den
+//! ([`crate::collect`], über `harw_dod_cap::SensorError`), die
+//! DoD-Konfiguration und den daraus aufgelösten Beobachtungsbereich
+//! ([`crate::watch`], PL-100 WP1.6) und den
 //! `completions`-Unterbefehl (über `harw_completions::CompletionError`). Kommandozeilen-
 //! fehler gehören **nicht** hierher — `clap::Error` behandelt `main`
 //! direkt, ohne Umweg über diesen Typ (Muster: `harw-sentinel/src/main.rs`).
@@ -93,6 +95,17 @@ pub enum ProbeError {
     /// - `source` (`harw_completions::CompletionError`): die zugrunde
     ///   liegende Ursache. Über `std::error::Error::source()` verlinkt.
     Completions(harw_completions::CompletionError),
+    /// Die DoD-Konfiguration ist nicht lesbar, nicht vertrauenswürdig oder
+    /// ungültig (PL-100 WP1.6, fail closed; siehe [`crate::watch`]).
+    ///
+    /// # Arguments
+    /// - `source` (`harw_dod_config::ConfigError`): die Ursache; nennt
+    ///   höchstens den administrativ konfigurierten Pfad und escapt einen
+    ///   abgelehnten Eintrag. Über `std::error::Error::source()` verlinkt.
+    Config(harw_dod_config::ConfigError),
+    /// Nach Flag, Konfiguration und Vorgabe bleibt keine einzige Wurzel —
+    /// die Sonde wäre still blind (PL-100 WP1.6).
+    EmptyWatchScope,
 }
 
 impl fmt::Display for ProbeError {
@@ -115,6 +128,11 @@ impl fmt::Display for ProbeError {
             }
             Self::Sensor(source) => write!(f, "sensor error: {source}"),
             Self::Completions(source) => write!(f, "shell completions failed: {source}"),
+            Self::Config(source) => write!(f, "DoD configuration unusable: {source}"),
+            Self::EmptyWatchScope => write!(
+                f,
+                "no scope root and no home root to watch; refusing to start blind"
+            ),
         }
     }
 }
@@ -131,6 +149,7 @@ impl std::error::Error for ProbeError {
             Self::EventEncodeFailed(source) => Some(source),
             Self::Sensor(source) => Some(source),
             Self::Completions(source) => Some(source),
+            Self::Config(source) => Some(source),
             _ => None,
         }
     }
@@ -154,10 +173,32 @@ impl From<harw_completions::CompletionError> for ProbeError {
     }
 }
 
+impl From<harw_dod_config::ConfigError> for ProbeError {
+    fn from(err: harw_dod_config::ConfigError) -> Self {
+        Self::Config(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ProbeError;
     use crate::test_support::{TestError, TestResult};
+
+    #[test]
+    fn test_empty_watch_scope_display_is_exact() {
+        assert_eq!(
+            ProbeError::EmptyWatchScope.to_string(),
+            "no scope root and no home root to watch; refusing to start blind"
+        );
+    }
+
+    #[test]
+    fn test_config_error_is_wrapped_and_linked() {
+        let err: ProbeError = harw_dod_config::ConfigError::MissingActiveProfile.into();
+        assert!(matches!(err, ProbeError::Config(_)));
+        assert!(err.to_string().starts_with("DoD configuration unusable: "));
+        assert!(std::error::Error::source(&err).is_some());
+    }
 
     #[test]
     fn test_landlock_unavailable_display_is_exact() {

@@ -5,7 +5,7 @@ use crate::agent_toml::AgentToml;
 use crate::auth_toml::{AuthConfig, SecretRef};
 use crate::browser_toml::BrowserSection;
 use crate::channel_toml::{ChannelFileToml, ChannelToml, flatten_channel_file};
-use crate::dod_toml::DodSection;
+use crate::dod_toml::{DodApproveSection, DodSection, DodTriageSection, DodWatchSection};
 use crate::dotenv::load_env_layer;
 use crate::error::{ConfigError, ConfigResult};
 use crate::harness_config::HarnessConfig;
@@ -18,9 +18,10 @@ use crate::plugin_toml::PluginToml;
 use crate::provider_toml::ProviderToml;
 use crate::skill_toml::SkillToml;
 use crate::web_toml::WebSection;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 /// Eine nicht-fatale Feststellung aus [`ResolvedConfig::compute_diagnostics`]:
 /// eine hängende Modell-/Provider-Referenz irgendwo im Konfigurations-
@@ -103,7 +104,9 @@ pub struct ResolvedConfig {
     /// (siehe `browser_toml`).
     pub browser: BrowserSection,
     /// `[dod]` — Eskalations-Policy für die DoD-Kette (siehe
-    /// `dod_toml`).
+    /// `dod_toml`). `[dod.triage]`/`[dod.approve]` stammen nur aus Home-Ebene
+    /// oder aktivem Profil; andere Ebenen können nur `[dod.approve] tui_tty`
+    /// auf `false` verengen (siehe [`discover_config`]).
     pub dod: DodSection,
     /// `[web]` — Bind- und Token-Policy für die eingebettete Web-UI
     /// (siehe `web_toml`). Wird von einem nicht vertrauten Repo-Layer
@@ -468,12 +471,20 @@ fn require_reference<T>(
 ///    by a safe `active_profile` pointer
 /// 3. `.harw/` in the current working directory — repo-local override
 ///
-/// Missing directories are silently skipped by [`discover_config`]. If neither
-/// `$HOME` nor the current directory can be determined the returned vector may
-/// be empty.
+/// Missing directories are silently skipped by [`discover_config`].
+///
+/// **Fails closed without a Home layer** (PL-100, threat B15):
+/// [`discover_config`] treats `layers[0]` as the Home layer, the only layer
+/// that (besides the active profile) may set `[dod.triage]` and
+/// `[dod.approve]`. If no Home can be established — `$HOME` is unset, empty
+/// or relative (an empty `$HOME` would resolve `.harw` against the current
+/// directory, i.e. usually the repository itself) — the returned vector is
+/// **empty**: the repo-local `.harw` is dropped as well instead of moving to
+/// position 0 and inheriting the Home rights.
 ///
 /// # Returns
-/// `Vec<PathBuf>` with zero to three entries.
+/// `Vec<PathBuf>` with zero to three entries. A non-empty vector always
+/// starts with the Home layer `<$HOME>/.harw`.
 ///
 /// # Panics
 /// Never.
@@ -486,7 +497,9 @@ fn require_reference<T>(
 /// ```rust,no_run
 /// use harw_config::default_config_layers;
 /// let layers = default_config_layers();
-/// // Layers ascend from ~/.harw through the active profile to ./.harw.
+/// // Layers ascend from ~/.harw through the active profile to ./.harw;
+/// // without an absolute $HOME there is no layer at all.
+/// assert!(layers.is_empty() || layers.first().is_some_and(|home| home.ends_with(".harw")));
 /// ```
 pub fn default_config_layers() -> Vec<PathBuf> {
     default_config_layers_from(
@@ -509,6 +522,12 @@ pub fn default_config_layers() -> Vec<PathBuf> {
 /// bzw. der Root-Space) bleibt unverändert: er ist bereits über
 /// `harw_home::home_dir`/`set_home_override` personalisierbar und wird hier
 /// nur noch für die reine `$HOME`-Auflösung ohne Override verwendet.
+///
+/// Ohne feststellbare Home-Ebene (`$HOME` fehlt, ist leer oder relativ)
+/// liefert die Funktion wie [`default_config_layers`] **keine** Ebene, auch
+/// nicht `<cwd>/<project_dir_name>`: [`discover_config`] liest `layers[0]`
+/// als Home-Ebene, ein Repo-Layer an dieser Stelle bekäme sonst deren Rechte
+/// für `[dod.triage]`/`[dod.approve]` (PL-100, Bedrohung B15).
 ///
 /// # Hinweis
 /// Der eigentliche, überridefähige Pfad läuft nicht über diese Funktion,
@@ -535,30 +554,48 @@ fn default_config_layers_from_named(
     cwd: Option<PathBuf>,
     project_dir_name: &str,
 ) -> Vec<PathBuf> {
+    // Fail closed (PL-100, Bedrohung B15): `discover_config` liest
+    // `layers[0]` als Home-Ebene (`is_dod_policy_layer`). Ohne feststellbares
+    // Home gibt es deshalb gar keine Ebene — sonst rückte der Repo-Layer an
+    // Position 0 und dürfte `[dod.triage]`/`[dod.approve]` setzen.
+    let Some(home) = established_home(home_directory) else {
+        tracing::debug!(
+            reason = "home_not_established",
+            "config: no default layers without an absolute home directory"
+        );
+        return Vec::new();
+    };
     let mut layers = Vec::with_capacity(3);
 
     // Home-Layer: ~/.harw/ — dies ist der Root-Space selbst, nicht das
     // projekt-lokale Verzeichnis; er bleibt `.harw`, da eine personalisierte
     // harw ihn ohnehin über `harw_home::home_dir`/`set_home_override` (bzw.
     // `HARW_HOME`) ersetzt, nicht über diese env-basierte Auflösung.
-    if let Some(home) = home_directory {
-        let harw_home = home.join(".harw");
-        layers.push(harw_home.clone());
+    let harw_home = home.join(".harw");
+    layers.push(harw_home.clone());
 
-        // A malformed, unreadable, or absent pointer deliberately contributes
-        // no layer. Profile names are constrained before path construction so
-        // config discovery cannot traverse outside the profiles directory.
-        if let Some(profile_name) = read_active_profile_name(&harw_home) {
-            layers.push(harw_home.join("profiles").join(profile_name));
-        }
+    // A malformed, unreadable, or absent pointer deliberately contributes
+    // no layer. Profile names are constrained before path construction so
+    // config discovery cannot traverse outside the profiles directory.
+    if let Some(profile_name) = read_active_profile_name(&harw_home) {
+        layers.push(harw_home.join("profiles").join(profile_name));
     }
 
-    // Repo-lokaler Layer: <project_dir_name>/ im aktuellen Arbeitsverzeichnis
+    // Repo-lokaler Layer: <project_dir_name>/ im aktuellen Arbeitsverzeichnis,
+    // immer hinter der Home-Ebene (und dem Profil).
     if let Some(cwd) = cwd {
         layers.push(cwd.join(project_dir_name));
     }
 
     layers
+}
+
+/// Das Home-Verzeichnis, aus dem sich die Home-Ebene feststellen lässt: nur
+/// ein gesetzter, absoluter Pfad. Ein leerer (`""`) oder relativer Wert
+/// (etwa `HOME=.`) würde `.harw` gegen das Arbeitsverzeichnis auflösen, also
+/// in der Regel gegen das Repository selbst, und wird verworfen.
+fn established_home(home_directory: Option<PathBuf>) -> Option<PathBuf> {
+    home_directory.filter(|home| home.is_absolute())
 }
 
 fn read_active_profile_name(harw_home: &Path) -> Option<String> {
@@ -584,7 +621,20 @@ fn valid_profile_name(name: &str) -> bool {
 ///    (`harw_home::config_layers` hängt ihn nur für freigegebene Projekte an)
 /// 5. explizite Overrides
 ///
-/// Alle übergebenen Layer gelten als **vollständig vertraut**. Zusätzlich wird
+/// Alle übergebenen Layer gelten als **vollständig vertraut**. Einzige
+/// Ausnahme (PL-100 WP 1.9, Bedrohung B15): `[dod.triage]` und
+/// `[dod.approve]` gelten nur aus der Home-Ebene (`layers[0]`) und dem
+/// aktiven Profil (`<layers[0]>/profiles/<name>`); setzt eine andere Ebene
+/// (freigegebener Repo-Layer, projektbezogene Einstellungen) sie, werden sie
+/// verworfen und in [`ResolvedConfig::scope_warnings`] gemeldet; aus
+/// `[dod.approve]` wirkt dort nur die Verengung `tui_tty = false`. `[dod]`
+/// selbst wird schlüsselweise gemergt: die Grundschlüssel gemeinsam, sobald
+/// eine Ebene einen davon setzt, die Untertabellen Schlüssel für Schlüssel.
+/// `layers[0]` ist damit Vertrag mit dem Aufrufer: Wer keine Home-Ebene
+/// feststellen kann, übergibt **keine** Ebene statt einer Liste, die mit
+/// einem Projekt-Layer beginnt — so wie [`default_config_layers`] ohne
+/// absolutes `$HOME` fail-closed eine leere Liste liefert.
+/// Zusätzlich wird
 /// aus jedem Layer-Verzeichnis eine `.env`-Datei in
 /// [`ResolvedConfig::env_layer`] geladen (Profil überschreibt Root).
 /// Siehe `crate::dotenv` für die Auflösungs-Semantik.
@@ -620,6 +670,7 @@ pub fn discover_config(layers: &[PathBuf]) -> ConfigResult<ResolvedConfig> {
 /// | `permissions.approval_timeout_secs`, `permissions.auto_classifier_timeout_secs`, `compaction.absolute_ceiling_tokens` | Minimum gegen den vertrauten Wert; ohne einen solchen wird der erste Wert übernommen |
 /// | `host.sudo_session_minutes`, `agents.max_*`, `shell.max_timeout_secs`, `jobs.max_running` | nur Senken, gegen den vertrauten Wert oder die Vorgabe |
 /// | `[network]`, `[browser]`, `[dod]` | nur verengend (`merge_restricted_*`) |
+/// | `[dod.triage]`, `[dod.approve]`, `[dod.watch]` | nie, außer der Verengung `[dod.approve] tui_tty = false`; vor dem Parsen entfernt (ein ungültiger Wert dort bricht die Discovery nicht ab), jede Tabelle, die mehr als diese Verengung setzt, landet als `dod.<name>` in [`ResolvedConfig::scope_warnings`] |
 ///
 /// Nie übernommen werden insbesondere `providers/`, `models/`, `auth.toml`,
 /// `.env`, `mcps/`, `plugins/`, `skills/`, `agents/`, `channels/`,
@@ -751,8 +802,14 @@ fn discover_config_inner(
             if let Some(section) = extract_section::<BrowserSection>(&fields, "browser")? {
                 resolved.browser = section;
             }
-            if let Some(section) = extract_section::<DodSection>(&fields, "dod")? {
-                resolved.dod = section;
+            // [dod] is the exception to the wholesale rule (PL-100 WP 1.9):
+            // the base keys are replaced as a group, the sub-tables
+            // `[dod.triage]`/`[dod.approve]`/`[dod.watch]` key by key, and
+            // `[dod.triage]`/`[dod.approve]` only from the home layer and the
+            // active profile (see `apply_trusted_dod`).
+            if let Some(dod) = fields.get("dod") {
+                let policy_layer = is_dod_policy_layer(layers, base);
+                apply_trusted_dod(&mut resolved, dod, policy_layer, &config_path)?;
             }
             if let Some(section) = extract_section::<WebSection>(&fields, "web")? {
                 resolved.web = section;
@@ -905,7 +962,22 @@ fn apply_restricted_layer(base: &Path, resolved: &mut ResolvedConfig) -> ConfigR
     if let Some(section) = extract_section::<BrowserSection>(&fields, "browser")? {
         merge_restricted_browser(&mut resolved.browser, &section, &fields);
     }
-    if let Some(section) = extract_section::<DodSection>(&fields, "dod")? {
+    if let Some(dod) = fields.get("dod") {
+        // `[dod.triage]`/`[dod.approve]`/`[dod.watch]` are never taken from
+        // an untrusted repository layer, except the narrowing
+        // `[dod.approve] tui_tty = false`. They are removed before parsing,
+        // so an invalid value there cannot break discovery either, and each
+        // one that sets more than that narrowing is reported as a
+        // `ScopeDiagnostic`.
+        let (table, removed) = without_dod_tables(dod, &DOD_SUB_TABLES);
+        apply_removed_dod_tables(
+            resolved,
+            dod,
+            removed,
+            IgnoredDodLayer::UntrustedProject,
+            base,
+        );
+        let section = parse_dod_section(&table)?;
         merge_restricted_dod(&mut resolved.dod, &section, &fields);
     }
     Ok(())
@@ -1021,7 +1093,8 @@ fn merge_restricted_browser(
 /// sichere Voreinstellung, siehe `dod_toml`-Moduldoku), `allowed_cgroup_prefixes`
 /// nur als Schnittmenge. `kill_requires_human` wird nie aus dem Repo-Layer
 /// übernommen (bleibt beim vertrauten, bereits validierten Wert `true`) und
-/// `proof_key_dir` wird nie übernommen.
+/// `proof_key_dir` wird nie übernommen; die Untertabellen
+/// `triage`/`approve`/`watch` entfernt bereits [`apply_restricted_layer`].
 fn merge_restricted_dod(trusted: &mut DodSection, restricted: &DodSection, fields: &toml::Value) {
     if field_present(fields, &["dod", "auto_freeze"]) {
         trusted.auto_freeze |= restricted.auto_freeze;
@@ -1031,6 +1104,317 @@ fn merge_restricted_dod(trusted: &mut DodSection, restricted: &DodSection, field
             .allowed_cgroup_prefixes
             .retain(|prefix| restricted.allowed_cgroup_prefixes.contains(prefix));
     }
+}
+
+/// Untertabellen von `[dod]` (PL-100 WP 1.9). Jeder andere Schlüssel von
+/// `[dod]` ist ein Grundschlüssel (`kill_requires_human` …
+/// `findings_window_hours`).
+const DOD_SUB_TABLES: [&str; 3] = ["triage", "approve", "watch"];
+
+/// Untertabellen von `[dod]`, die nur die Home-Ebene und das aktive Profil
+/// setzen dürfen (Bedrohung B15, O12): ein Projekt kann weder das
+/// Triage-Modell noch die Same-TTY-Freigabe ändern. Einzige Ausnahme ist die
+/// Verengung `[dod.approve] tui_tty = false` (siehe
+/// [`narrow_approve_from_project`]).
+const DOD_HOME_ONLY_TABLES: [&str; 2] = ["triage", "approve"];
+
+/// Ob `base` die Home-Ebene oder das aktive Profil ist, also eine Ebene, aus
+/// der `[dod.triage]`/`[dod.approve]` gelten.
+///
+/// Die Home-Ebene ist `layers[0]` (`harw_home::LayerReport::layers`,
+/// [`default_config_layers`]). Die Position ist ein Vertrag mit dem
+/// Aufrufer: `harw_home` stellt immer das aufgelöste Home an Position 0,
+/// [`default_config_layers`] liefert ohne absolutes `$HOME` gar keine Ebene
+/// (fail closed), statt `<cwd>/.harw` an Position 0 zu stellen. Zum Vertrag
+/// gehört, dass das Home an Position 0 nicht aus einem leeren oder relativen
+/// `$HOME` stammt: `HOME=.` ergäbe `./.harw`, also meist den Repo-Layer des
+/// Arbeitsverzeichnisses mit Home-Rechten. Lexikalisch ist das hier nicht
+/// von einem bewusst relativen `--home` zu unterscheiden; die Prüfung gehört
+/// deshalb in die Home-Auflösung des Aufrufers. Das Profil
+/// ist `<home>/profiles/<name>` mit gültigem Profilnamen. Jede andere
+/// vertraute Ebene — der freigegebene Repo-Layer `<cwd>/.harw` und die
+/// projektbezogenen Einstellungen `<home>/profiles/<p>/projects/<key>` — ist
+/// eine Projektebene. Rein lexikalisch: `harw-config` darf `harw-home` nicht
+/// kennen, und beide Pfadformen entstehen dort aus demselben `home`.
+fn is_dod_policy_layer(layers: &[PathBuf], base: &Path) -> bool {
+    let Some(home) = layers.first() else {
+        return false;
+    };
+    if base == home.as_path() {
+        return true;
+    }
+    let profiles = home.join("profiles");
+    base.parent() == Some(profiles.as_path())
+        && base
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(valid_profile_name)
+}
+
+/// Kopie der `[dod]`-Tabelle ohne die Untertabellen `names`, dazu die Namen
+/// der entfernten Untertabellen (in der Reihenfolge von `names`). Ist `dod`
+/// keine Tabelle, bleibt der Wert unverändert (das Parsen meldet den Fehler).
+fn without_dod_tables(
+    dod: &toml::Value,
+    names: &[&'static str],
+) -> (toml::Value, Vec<&'static str>) {
+    let mut table = dod.clone();
+    let mut removed = Vec::new();
+    if let Some(keys) = table.as_table_mut() {
+        for name in names {
+            if keys.remove(*name).is_some() {
+                removed.push(*name);
+            }
+        }
+    }
+    (table, removed)
+}
+
+/// Parst eine (ggf. um Untertabellen gekürzte) `[dod]`-Tabelle; Fehlerform
+/// wie [`extract_section`].
+///
+/// # Errors
+/// [`ConfigError::TomlParse`], wenn die Tabelle nicht als [`DodSection`]
+/// deserialisierbar ist oder [`DodSection::validate`] verletzt.
+fn parse_dod_section(table: &toml::Value) -> ConfigResult<DodSection> {
+    table
+        .clone()
+        .try_into::<DodSection>()
+        .map_err(|e| ConfigError::TomlParse(format!("[dod]: {e}")))
+}
+
+/// Übernimmt `[dod]` aus einer vertrauten Ebene.
+///
+/// Außerhalb von Home-Ebene und Profil (`policy_layer == false`) werden
+/// `[dod.triage]` und `[dod.approve]` vor dem Parsen entfernt; aus
+/// `[dod.approve]` wirkt nur die Verengung `tui_tty = false`, alles andere
+/// wird als [`ScopeDiagnostic`] gemeldet (siehe
+/// [`apply_removed_dod_tables`]). Der Rest der Tabelle gilt wie gehabt.
+///
+/// # Errors
+/// Wie [`parse_dod_section`].
+fn apply_trusted_dod(
+    resolved: &mut ResolvedConfig,
+    dod: &toml::Value,
+    policy_layer: bool,
+    layer_path: &Path,
+) -> ConfigResult<()> {
+    let home_only: &[&'static str] = if policy_layer {
+        &[]
+    } else {
+        &DOD_HOME_ONLY_TABLES
+    };
+    let (table, removed) = without_dod_tables(dod, home_only);
+    apply_removed_dod_tables(
+        resolved,
+        dod,
+        removed,
+        IgnoredDodLayer::TrustedProject,
+        layer_path,
+    );
+    let section = parse_dod_section(&table)?;
+    merge_trusted_dod(&mut resolved.dod, section, &table);
+    Ok(())
+}
+
+/// Behandelt die vor dem Parsen entfernten `[dod]`-Untertabellen `removed`
+/// einer Ebene außerhalb von Home und Profil.
+///
+/// `[dod.approve]` geht durch [`narrow_approve_from_project`]: die
+/// Verengung `tui_tty = false` wirkt, und gemeldet wird die Tabelle nur,
+/// wenn sie mehr als das enthält. Jede andere entfernte Untertabelle wird
+/// als verworfen gemeldet ([`report_ignored_dod_table`]).
+fn apply_removed_dod_tables(
+    resolved: &mut ResolvedConfig,
+    dod: &toml::Value,
+    removed: Vec<&'static str>,
+    layer: IgnoredDodLayer,
+    layer_path: &Path,
+) {
+    for name in removed {
+        if name == "approve"
+            && let Some(approve) = dod.get(name)
+            && !narrow_approve_from_project(&mut resolved.dod.approve, approve)
+        {
+            continue;
+        }
+        report_ignored_dod_table(&mut resolved.scope_warnings, name, layer, layer_path);
+    }
+}
+
+/// Übernimmt aus der `[dod.approve]`-Tabelle `approve` einer Ebene außerhalb
+/// von Home und Profil nur die Verengung `tui_tty = false`.
+///
+/// # Description
+/// Abschalten des Same-TTY-Modus ist immer die strengere Wahl (Bedrohung
+/// B17): ein Projekt oder ein nicht vertrauter Repo-Layer darf ihn deshalb
+/// abschalten, nie einschalten, wie die übrigen `merge_restricted_*`-Regeln.
+/// Das hält ein `tui_tty = false` auch dann wirksam, wenn eine Policy-Ebene
+/// (etwa ein Profil an einem anderen Ort) lexikalisch nicht als solche
+/// erkannt wird ([`is_dod_policy_layer`]).
+///
+/// # Returns
+/// `true`, wenn die Tabelle mehr als diese Verengung setzt (`tui_tty =
+/// true`, einen Nicht-Bool-Wert, einen unbekannten Schlüssel oder gar keine
+/// Tabelle); der Aufrufer meldet sie dann als verworfen.
+fn narrow_approve_from_project(trusted: &mut DodApproveSection, approve: &toml::Value) -> bool {
+    let Some(keys) = approve.as_table() else {
+        return true;
+    };
+    let mut rejected = false;
+    for (key, value) in keys {
+        if key.as_str() == "tui_tty" && value.as_bool() == Some(false) {
+            trusted.tui_tty = false;
+        } else {
+            rejected = true;
+        }
+    }
+    rejected
+}
+
+/// Präsenz-Merge von `[dod]` für vertraute Ebenen.
+///
+/// Die Grundschlüssel werden wie bisher gemeinsam ersetzt, sobald die Ebene
+/// mindestens einen davon setzt (Serde-Defaults für die übrigen). Die
+/// Untertabellen werden Schlüssel für Schlüssel übernommen: eine spätere
+/// Ebene, die etwa nur `findings_window_hours` oder nur
+/// `[dod.triage] max_parallel` setzt, setzt weder ein `tui_tty = false` noch
+/// ein Triage-Modell einer früheren Ebene auf die Vorgabe zurück. Jeder
+/// Einzelwert ist bereits validiert, die Kombination daher ebenfalls gültig.
+fn merge_trusted_dod(trusted: &mut DodSection, layer: DodSection, table: &toml::Value) {
+    let DodSection {
+        kill_requires_human,
+        auto_freeze,
+        proof_key_dir,
+        allowed_cgroup_prefixes,
+        export_dir,
+        findings_window_hours,
+        triage,
+        approve,
+        watch,
+    } = layer;
+    let sets_base_key = table.as_table().is_some_and(|keys| {
+        keys.keys()
+            .any(|key| !DOD_SUB_TABLES.contains(&key.as_str()))
+    });
+    if sets_base_key {
+        trusted.kill_requires_human = kill_requires_human;
+        trusted.auto_freeze = auto_freeze;
+        trusted.proof_key_dir = proof_key_dir;
+        trusted.allowed_cgroup_prefixes = allowed_cgroup_prefixes;
+        trusted.export_dir = export_dir;
+        trusted.findings_window_hours = findings_window_hours;
+    }
+
+    let DodTriageSection {
+        model,
+        effort,
+        max_tokens,
+        max_parallel,
+    } = triage;
+    if field_present(table, &["triage", "model"]) {
+        trusted.triage.model = model;
+    }
+    if field_present(table, &["triage", "effort"]) {
+        trusted.triage.effort = effort;
+    }
+    if field_present(table, &["triage", "max_tokens"]) {
+        trusted.triage.max_tokens = max_tokens;
+    }
+    if field_present(table, &["triage", "max_parallel"]) {
+        trusted.triage.max_parallel = max_parallel;
+    }
+
+    let DodApproveSection { tui_tty } = approve;
+    if field_present(table, &["approve", "tui_tty"]) {
+        trusted.approve.tui_tty = tui_tty;
+    }
+
+    let DodWatchSection { mode, autoconnect } = watch;
+    if field_present(table, &["watch", "mode"]) {
+        trusted.watch.mode = mode;
+    }
+    if field_present(table, &["watch", "autoconnect"]) {
+        trusted.watch.autoconnect = autoconnect;
+    }
+}
+
+/// Rolle der Ebene, aus der eine `[dod]`-Untertabelle verworfen wird; bestimmt
+/// die strukturierten Log-Felder `layer_role` und `reason`.
+#[derive(Debug, Clone, Copy)]
+enum IgnoredDodLayer {
+    /// Vertraute Ebene außerhalb von Home und Profil (freigegebener
+    /// Repo-Layer, projektbezogene Einstellungen).
+    TrustedProject,
+    /// Nicht vertrauter Repo-Layer (`apply_restricted_layer`).
+    UntrustedProject,
+}
+
+impl IgnoredDodLayer {
+    // Wert des Log-Felds `layer_role`.
+    fn role(self) -> &'static str {
+        match self {
+            Self::TrustedProject => "project",
+            Self::UntrustedProject => "untrusted_project",
+        }
+    }
+
+    // Wert des Log-Felds `reason`.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::TrustedProject => "home_or_profile_only",
+            Self::UntrustedProject => "untrusted_project_layer",
+        }
+    }
+}
+
+/// Bereits per `warn!` gemeldete verworfene `[dod]`-Untertabellen dieses
+/// Prozesses als `(Feld, Ebenenpfad)`. Die Discovery läuft je Prozess oft
+/// mehrfach (harw-runtime zweimal je Start, viele CLI-Befehle erneut);
+/// dieselbe Meldung kommt danach nur noch auf `debug`. Die Menge bleibt
+/// klein: höchstens drei Felder je Konfigurationsebene.
+static REPORTED_DOD_TABLES: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
+
+/// Ob `(field, layer_path)` in diesem Prozess zum ersten Mal gemeldet wird
+/// (und merkt es sich). Eine vergiftete Sperre wird übernommen: es geht nur
+/// um doppelte Logzeilen.
+fn first_dod_report(field: &str, layer_path: &Path) -> bool {
+    let mut reported = REPORTED_DOD_TABLES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    reported.insert((field.to_owned(), layer_path.display().to_string()))
+}
+
+/// Meldet eine verworfene `[dod.<name>]`-Untertabelle: immer eine
+/// [`ScopeDiagnostic`] in `out`, dazu je Prozess und Ebene genau ein
+/// `tracing::warn!` ohne Pfad und ohne Wert (Wiederholungen und der Pfad nur
+/// auf `debug`). `rejected_value` ist bewusst die feste Marke `"present"`,
+/// nie der Inhalt (etwa der Modellname).
+fn report_ignored_dod_table(
+    out: &mut Vec<ScopeDiagnostic>,
+    name: &str,
+    layer: IgnoredDodLayer,
+    layer_path: &Path,
+) {
+    let field = format!("dod.{name}");
+    if first_dod_report(&field, layer_path) {
+        tracing::warn!(
+            field = %field,
+            layer_role = layer.role(),
+            reason = layer.reason(),
+            "config: [dod] sub-table ignored for this layer"
+        );
+    }
+    tracing::debug!(
+        field = %field,
+        layer_path = %layer_path.display(),
+        "config: ignored [dod] table location"
+    );
+    out.push(ScopeDiagnostic {
+        field,
+        file: layer_path.display().to_string(),
+        rejected_value: "present".to_owned(),
+    });
 }
 
 /// Minimum, wobei `0` (von `validate()` als ungültig abgelehnt und von
@@ -2635,6 +3019,132 @@ pinned_identities = [123456789]
         Ok(())
     }
 
+    /// PL-100 B15 (owner review on PR #168): without an established Home the
+    /// helper returns no layer at all. Before the fix `<cwd>/.harw` became
+    /// `layers[0]` and thereby the Home layer of `discover_config`.
+    #[test]
+    fn default_layers_without_home_fail_closed() -> TestResult {
+        let root = test_directory("no-home-layers")?;
+        let cwd = root.join("workspace");
+        std::fs::create_dir_all(cwd.join(".harw")).map_err(ctx("Repo-Layer anlegen"))?;
+        std::fs::create_dir_all(cwd.join(".mia")).map_err(ctx("benannten Repo-Layer anlegen"))?;
+
+        assert_eq!(
+            default_config_layers_from(None, Some(cwd.clone())),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            default_config_layers_from_named(None, Some(cwd.clone()), ".mia"),
+            Vec::<PathBuf>::new()
+        );
+        assert!(default_config_layers_from(None, None).is_empty());
+
+        // An empty or relative `$HOME` establishes no Home either: `.harw`
+        // would resolve against the process's working directory, usually the
+        // repository itself.
+        for home in [
+            PathBuf::new(),
+            PathBuf::from("."),
+            PathBuf::from("relative/home"),
+        ] {
+            assert!(
+                default_config_layers_from(Some(home.clone()), Some(cwd.clone())).is_empty(),
+                "HOME {home:?} must not establish a Home layer"
+            );
+        }
+
+        // Control: an absolute Home keeps the repository layer, behind Home.
+        let home_directory = root.join("home");
+        assert_eq!(
+            default_config_layers_from(Some(home_directory.clone()), Some(cwd.clone())),
+            vec![home_directory.join(".harw"), cwd.join(".harw")]
+        );
+
+        std::fs::remove_dir_all(root).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// PL-100 B15 regression (owner review on PR #168): the current
+    /// repository's `.harw` must not set the Home/profile-only
+    /// `[dod.triage]`/`[dod.approve]` when no Home can be established. With
+    /// an established Home the same repository still applies, but only as a
+    /// project layer whose policy tables are dropped and reported.
+    #[test]
+    fn no_home_current_repository_cannot_set_dod_policy_tables() -> TestResult {
+        let root = test_directory("no-home-dod-policy")?;
+        let cwd = root.join("workspace");
+        let repo = cwd.join(".harw");
+        write_layer_file(
+            &repo,
+            "config.toml",
+            r#"
+[dod.triage]
+model = "evil/exfil"
+max_parallel = 4
+
+[dod.approve]
+tui_tty = true
+
+[dod.watch]
+mode = "notify"
+"#,
+        )?;
+
+        // No Home: no layer, so nothing from the repository becomes policy.
+        let layers = default_config_layers_from(None, Some(cwd.clone()));
+        assert!(layers.is_empty());
+        let config = discover_config(&layers).map_err(ctx("Konfiguration ohne Home entdecken"))?;
+        assert_eq!(config.dod.triage.model, None);
+        assert_eq!(
+            config.dod.triage.max_parallel,
+            crate::dod_toml::DEFAULT_TRIAGE_MAX_PARALLEL
+        );
+        assert!(config.dod.approve.tui_tty);
+        assert_eq!(config.dod.watch.mode, crate::dod_toml::DodWatchMode::Triage);
+
+        // Control with an established Home: Home keeps the policy, the
+        // repository is a project layer (its `[dod.watch]` applies, its
+        // `[dod.triage]`/`[dod.approve]` are dropped with a diagnostic).
+        let home_directory = root.join("home");
+        write_layer_file(
+            &home_directory.join(".harw"),
+            "config.toml",
+            "[dod.triage]\nmodel = \"local/qwen2.5\"\n\n[dod.approve]\ntui_tty = false\n",
+        )?;
+        let layers = default_config_layers_from(Some(home_directory), Some(cwd.clone()));
+        let config = discover_config(&layers).map_err(ctx("Konfiguration mit Home entdecken"))?;
+        assert_eq!(config.dod.triage.model.as_deref(), Some("local/qwen2.5"));
+        assert_eq!(
+            config.dod.triage.max_parallel,
+            crate::dod_toml::DEFAULT_TRIAGE_MAX_PARALLEL
+        );
+        assert!(!config.dod.approve.tui_tty);
+        assert_eq!(config.dod.watch.mode, crate::dod_toml::DodWatchMode::Notify);
+        let repo_config = repo.join("config.toml").display().to_string();
+        let dod_warnings: Vec<(&str, &str)> = config
+            .scope_warnings
+            .iter()
+            .filter(|warning| warning.field.starts_with("dod."))
+            .map(|warning| (warning.field.as_str(), warning.file.as_str()))
+            .collect();
+        assert_eq!(
+            dod_warnings,
+            [
+                ("dod.triage", repo_config.as_str()),
+                ("dod.approve", repo_config.as_str()),
+            ]
+        );
+        assert!(
+            !config
+                .scope_warnings
+                .iter()
+                .any(|warning| warning.to_string().contains("evil/exfil"))
+        );
+
+        std::fs::remove_dir_all(root).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
+    }
+
     #[test]
     fn flat_catalog_entries_merge_in_filename_order() -> TestResult {
         let base = test_directory("flat-catalog-order")?;
@@ -2894,6 +3404,351 @@ allowed_cgroup_prefixes = ["/sys/fs/cgroup/evil.slice/"]
 
         std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
         std::fs::remove_dir_all(repo).map_err(ctx("Repo-Verzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// `<home>` plus `<home>/profiles/default`: the two `[dod]` policy layers
+    /// in the shape `harw_home::LayerReport::layers` produces.
+    fn home_and_profile(label: &str) -> TestResult<(PathBuf, PathBuf)> {
+        let home = test_directory(label)?;
+        let profile = home.join("profiles").join("default");
+        std::fs::create_dir_all(&profile).map_err(ctx("Profilverzeichnis anlegen"))?;
+        Ok((home, profile))
+    }
+
+    #[test]
+    fn dod_policy_layer_is_the_home_layer_or_one_of_its_profiles() -> TestResult {
+        let home = PathBuf::from("/home/user/.harw");
+        let profile = home.join("profiles").join("work-1");
+        let repo = PathBuf::from("/srv/repo/.harw");
+        let settings = profile.join("projects").join("beispiel-0123456789ab");
+        let layers = [
+            home.clone(),
+            profile.clone(),
+            repo.clone(),
+            settings.clone(),
+        ];
+        assert!(is_dod_policy_layer(&layers, &home));
+        assert!(is_dod_policy_layer(&layers, &profile));
+        assert!(!is_dod_policy_layer(&layers, &repo));
+        assert!(!is_dod_policy_layer(&layers, &settings));
+        // Not a valid profile name, even though it sits in `profiles/`.
+        assert!(!is_dod_policy_layer(
+            &layers,
+            &home.join("profiles").join(".harw")
+        ));
+        assert!(!is_dod_policy_layer(&[], &home));
+        Ok(())
+    }
+
+    /// PL-100 B15/O12: `[dod.triage]`/`[dod.approve]` from a trusted
+    /// repository layer or from per-project settings are dropped with a
+    /// diagnostic; home and profile still set them, and `[dod.watch]` plus
+    /// the base keys of a project layer still apply.
+    #[test]
+    fn dod_policy_tables_are_taken_only_from_home_and_profile() -> TestResult {
+        let (home, profile) = home_and_profile("dod-policy-home")?;
+        let repo_root = test_directory("dod-policy-trusted-repo")?;
+        let repo = repo_root.join(".harw");
+        let settings = profile.join("projects").join("beispiel-0123456789ab");
+        write_layer_file(
+            &home,
+            "config.toml",
+            "[dod.triage]\nmodel = \"local/qwen2.5\"\neffort = \"low\"\n",
+        )?;
+        write_layer_file(
+            &profile,
+            "config.toml",
+            "[dod.triage]\nmax_parallel = 4\n\n[dod.approve]\ntui_tty = false\n",
+        )?;
+        write_layer_file(
+            &repo,
+            "config.toml",
+            r#"
+[dod.triage]
+model = "evil/exfil"
+
+[dod.approve]
+tui_tty = true
+
+[dod.watch]
+mode = "notify"
+"#,
+        )?;
+        write_layer_file(
+            &settings,
+            "config.toml",
+            "[dod]\nfindings_window_hours = 6\n\n[dod.triage]\nmax_parallel = 8\n",
+        )?;
+
+        let layers = [
+            home.clone(),
+            profile.clone(),
+            repo.clone(),
+            settings.clone(),
+        ];
+        let config = discover_config(&layers).map_err(ctx("Konfiguration entdecken"))?;
+
+        assert_eq!(config.dod.triage.model.as_deref(), Some("local/qwen2.5"));
+        assert_eq!(config.dod.triage.effort.as_deref(), Some("low"));
+        assert_eq!(config.dod.triage.max_parallel, 4);
+        assert!(!config.dod.approve.tui_tty);
+        assert_eq!(config.dod.watch.mode, crate::dod_toml::DodWatchMode::Notify);
+        assert_eq!(config.dod.findings_window_hours, 6);
+        assert!(config.dod.validate().is_ok());
+
+        let repo_config = repo.join("config.toml").display().to_string();
+        let settings_config = settings.join("config.toml").display().to_string();
+        let dod_warnings: Vec<(String, String)> = config
+            .scope_warnings
+            .iter()
+            .filter(|warning| warning.field.starts_with("dod."))
+            .map(|warning| (warning.field.clone(), warning.file.clone()))
+            .collect();
+        assert_eq!(
+            dod_warnings,
+            vec![
+                ("dod.triage".to_owned(), repo_config.clone()),
+                ("dod.approve".to_owned(), repo_config),
+                ("dod.triage".to_owned(), settings_config),
+            ]
+        );
+        // The diagnostic carries a fixed marker, never the rejected model.
+        assert!(
+            config
+                .scope_warnings
+                .iter()
+                .filter(|warning| warning.field.starts_with("dod."))
+                .all(|warning| warning.rejected_value == "present")
+        );
+        assert!(
+            !config
+                .scope_warnings
+                .iter()
+                .any(|warning| warning.to_string().contains("evil/exfil"))
+        );
+
+        std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
+        std::fs::remove_dir_all(repo_root).map_err(ctx("Repo-Verzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// A later trusted layer that sets only some `[dod]` keys must not reset
+    /// `tui_tty = false` or the triage model of an earlier layer.
+    #[test]
+    fn dod_sub_tables_merge_key_by_key_across_trusted_layers() -> TestResult {
+        let (home, profile) = home_and_profile("dod-merge-home")?;
+        write_layer_file(
+            &home,
+            "config.toml",
+            r#"
+[dod]
+export_dir = "/srv/home/export"
+
+[dod.triage]
+model = "local/qwen2.5"
+max_tokens = 2048
+
+[dod.approve]
+tui_tty = false
+
+[dod.watch]
+autoconnect = false
+"#,
+        )?;
+        write_layer_file(
+            &profile,
+            "config.toml",
+            "[dod]\nfindings_window_hours = 48\n\n[dod.triage]\nmax_parallel = 3\n",
+        )?;
+
+        let config = discover_config(&[home.clone(), profile.clone()])
+            .map_err(ctx("Konfiguration entdecken"))?;
+        // Base keys: still replaced as a group by a layer that sets one.
+        assert_eq!(config.dod.findings_window_hours, 48);
+        assert_eq!(config.dod.export_dir, None);
+        // Sub-tables: key by key.
+        assert_eq!(config.dod.triage.model.as_deref(), Some("local/qwen2.5"));
+        assert_eq!(config.dod.triage.max_tokens, Some(2048));
+        assert_eq!(config.dod.triage.max_parallel, 3);
+        assert!(!config.dod.approve.tui_tty);
+        assert!(!config.dod.watch.autoconnect);
+        assert_eq!(config.dod.watch.mode, crate::dod_toml::DodWatchMode::Triage);
+        assert!(config.scope_warnings.is_empty());
+
+        // A layer that sets only a sub-table leaves the base keys alone.
+        write_layer_file(&profile, "config.toml", "[dod.approve]\ntui_tty = true\n")?;
+        let config = discover_config(&[home.clone(), profile.clone()])
+            .map_err(ctx("Konfiguration erneut entdecken"))?;
+        assert_eq!(
+            config.dod.export_dir.as_deref(),
+            Some(Path::new("/srv/home/export"))
+        );
+        assert_eq!(
+            config.dod.findings_window_hours,
+            crate::dod_toml::DEFAULT_FINDINGS_WINDOW_HOURS
+        );
+        assert!(config.dod.approve.tui_tty);
+        assert_eq!(config.dod.triage.model.as_deref(), Some("local/qwen2.5"));
+
+        std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// An untrusted repository layer never sets `[dod.triage]` or
+    /// `[dod.watch]` and only narrows `[dod.approve] tui_tty` (B17); each
+    /// ignored table is reported, and an invalid value there does not break
+    /// discovery.
+    #[test]
+    fn restricted_repo_never_sets_dod_sub_tables_and_reports_them() -> TestResult {
+        let home = test_directory("dod-restricted-home")?;
+        let repo = test_directory("dod-restricted-repo")?;
+        write_layer_file(
+            &home,
+            "config.toml",
+            "[dod.triage]\nmodel = \"local/qwen2.5\"\n",
+        )?;
+        write_layer_file(
+            &repo,
+            "config.toml",
+            r#"
+[dod]
+auto_freeze = true
+
+[dod.triage]
+model = "evil/exfil"
+max_parallel = 99
+
+[dod.approve]
+tui_tty = false
+
+[dod.watch]
+mode = "off"
+"#,
+        )?;
+
+        let config =
+            discover_config_with_restricted(std::slice::from_ref(&home), Some(repo.as_path()))
+                .map_err(ctx("Eingeschränkte Konfiguration entdecken"))?;
+
+        assert_eq!(config.dod.triage.model.as_deref(), Some("local/qwen2.5"));
+        assert_eq!(
+            config.dod.triage.max_parallel,
+            crate::dod_toml::DEFAULT_TRIAGE_MAX_PARALLEL
+        );
+        // The narrowing `tui_tty = false` applies and is not reported.
+        assert!(!config.dod.approve.tui_tty);
+        assert_eq!(config.dod.watch.mode, crate::dod_toml::DodWatchMode::Triage);
+        assert!(config.dod.auto_freeze);
+        let dod_fields: Vec<&str> = config
+            .scope_warnings
+            .iter()
+            .filter(|warning| warning.field.starts_with("dod."))
+            .map(|warning| warning.field.as_str())
+            .collect();
+        assert_eq!(dod_fields, ["dod.triage", "dod.watch"]);
+        assert!(
+            !config
+                .scope_warnings
+                .iter()
+                .any(|warning| warning.to_string().contains("evil/exfil"))
+        );
+
+        std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
+        std::fs::remove_dir_all(repo).map_err(ctx("Repo-Verzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// B17: outside home and profile, `[dod.approve]` can only narrow. A
+    /// project layer's `tui_tty = false` takes effect without a diagnostic;
+    /// its `tui_tty = true` (or any other key) never widens a stricter value
+    /// and is reported. Holds for trusted project layers and for an
+    /// untrusted repository layer.
+    #[test]
+    fn project_layers_can_only_narrow_dod_approve() -> TestResult {
+        // Trusted project layer narrows: home leaves the default `true`.
+        let (home, profile) = home_and_profile("dod-narrow-home")?;
+        let repo_root = test_directory("dod-narrow-trusted-repo")?;
+        let repo = repo_root.join(".harw");
+        write_layer_file(&home, "config.toml", "[dod]\nauto_freeze = false\n")?;
+        write_layer_file(&repo, "config.toml", "[dod.approve]\ntui_tty = false\n")?;
+        let config = discover_config(&[home.clone(), profile.clone(), repo.clone()])
+            .map_err(ctx("Konfiguration mit verengendem Projekt entdecken"))?;
+        assert!(!config.dod.approve.tui_tty);
+        assert!(
+            !config
+                .scope_warnings
+                .iter()
+                .any(|warning| warning.field.starts_with("dod.")),
+            "a pure narrowing is not reported"
+        );
+
+        // Trusted project layer tries to widen: the profile's `false` stays.
+        write_layer_file(&profile, "config.toml", "[dod.approve]\ntui_tty = false\n")?;
+        write_layer_file(&repo, "config.toml", "[dod.approve]\ntui_tty = true\n")?;
+        let config = discover_config(&[home.clone(), profile.clone(), repo.clone()])
+            .map_err(ctx("Konfiguration mit erweiterndem Projekt entdecken"))?;
+        assert!(!config.dod.approve.tui_tty);
+        let repo_config = repo.join("config.toml").display().to_string();
+        let dod_warnings: Vec<(String, String)> = config
+            .scope_warnings
+            .iter()
+            .filter(|warning| warning.field.starts_with("dod."))
+            .map(|warning| (warning.field.clone(), warning.file.clone()))
+            .collect();
+        assert_eq!(dod_warnings, vec![("dod.approve".to_owned(), repo_config)]);
+
+        // A narrowing plus an unknown key: the narrowing applies, the table
+        // is still reported, and discovery does not fail.
+        write_layer_file(&profile, "config.toml", "")?;
+        write_layer_file(
+            &repo,
+            "config.toml",
+            "[dod.approve]\ntui_tty = false\nunknown = 1\n",
+        )?;
+        let config = discover_config(&[home.clone(), profile.clone(), repo.clone()])
+            .map_err(ctx("Konfiguration mit gemischtem Projekt entdecken"))?;
+        assert!(!config.dod.approve.tui_tty);
+        assert!(
+            config
+                .scope_warnings
+                .iter()
+                .any(|warning| warning.field == "dod.approve")
+        );
+
+        // Untrusted repository layer: `true` never widens a home `false`.
+        let untrusted = test_directory("dod-narrow-untrusted-repo")?;
+        write_layer_file(&home, "config.toml", "[dod.approve]\ntui_tty = false\n")?;
+        write_layer_file(&untrusted, "config.toml", "[dod.approve]\ntui_tty = true\n")?;
+        let config =
+            discover_config_with_restricted(std::slice::from_ref(&home), Some(untrusted.as_path()))
+                .map_err(ctx("Eingeschränkte Konfiguration entdecken"))?;
+        assert!(!config.dod.approve.tui_tty);
+        assert!(
+            config
+                .scope_warnings
+                .iter()
+                .any(|warning| warning.field == "dod.approve")
+        );
+
+        std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
+        std::fs::remove_dir_all(repo_root).map_err(ctx("Repo-Verzeichnis entfernen"))?;
+        std::fs::remove_dir_all(untrusted)
+            .map_err(ctx("Nicht vertrautes Repo-Verzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_dod_triage_in_a_policy_layer_fails_discovery() -> TestResult {
+        let home = test_directory("dod-invalid-triage-home")?;
+        write_layer_file(&home, "config.toml", "[dod.triage]\nmax_parallel = 0\n")?;
+        let Err(error) = discover_config(std::slice::from_ref(&home)) else {
+            return Err(TestError::Unexpected(
+                "[dod.triage] max_parallel = 0 must make discovery fail".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("max_parallel"), "{error}");
+        std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
         Ok(())
     }
 

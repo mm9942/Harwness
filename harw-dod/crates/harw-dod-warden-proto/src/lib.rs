@@ -1,16 +1,35 @@
-//! Wire-Protokoll zwischen Eskalationsleiter und Warden (Knoten **AW5-02**).
+//! Wire-Protokoll zwischen Eskalationsleiter und Warden (Knoten **AW5-02**):
+//! der Signierteil.
+//!
+//! # Aufteilung (PL-100 WP 3.0, Leitprinzip I8)
+//! Seit WP 3.0 liegt das signierfreie Vokabular in `harw-dod-warden-types`:
+//! Aktionstaxonomie (`action`), Eskalationsstufen (`stage`), Ziel-Tripel
+//! (`target`), Ablehnungskategorien (`denial`), Ergebnis einer Aktion
+//! (`outcome`) und die kanonischen Kodierungsbausteine. Diese Crate behält
+//! alles, was signiert oder prüft — [`SignedAuthorization`], [`KeyRing`],
+//! [`ProofKey`], die kanonische MAC-Eingabe ([`canonical::PROOF_DOMAIN`]),
+//! [`NonceLedger`], [`ProofPolicy`], die Anfrage- und Antworthüllen
+//! ([`WardenRequest`]/[`WardenReply`]) und die v1-Altlast. Sie re-exportiert
+//! die verschobenen Module und Typen unter ihren bisherigen Pfaden
+//! (`harw_dod_warden_proto::WardenAction`,
+//! `harw_dod_warden_proto::action::WardenAction`, …), damit `harw-dod-warden`
+//! und `harw-warden` unverändert kompilieren. Prozesse, die mit Modellen
+//! sprechen, hängen an `harw-dod-warden-types`, nie an dieser Crate.
 //!
 //! # Zweck
 //! Diese Crate definiert, was über die Leitung zwischen dem
 //! Eskalationsleiter (`harw-dod-escalate`, AW5-03) und dem Durchsetzer
 //! (`harw-dod-warden`, AW5-04a) geht: die Aktionstaxonomie
-//! ([`ProposedAction`]/[`WardenAction`], `action.rs`), der
-//! Autorisierungsbeleg ([`AuthorizationProof`], `proof.rs`), die Anfrage-
-//! und Antworthülle ([`WardenActionRequest`]/[`WardenResponse`],
-//! `response.rs`), die inhaltsfreie Ablehnungskategorie ([`Denial`],
-//! `denial.rs`) und die Eskalationsleiter selbst ([`EscalationStage`],
-//! `stage.rs`). Sie führt selbst keine Durchsetzung aus und trifft keine
-//! Autorisierungsentscheidung — beides ist Sache der beiden Nachbarknoten.
+//! ([`ProposedAction`]/[`WardenAction`], re-exportiert), die signierte
+//! Autorisierung ([`SignedAuthorization`], `signed.rs`) mit ihrem Ziel-Tripel
+//! ([`CgroupTarget`], re-exportiert), die Anfrage- und Antworthülle
+//! ([`WardenRequest`]/[`WardenReply`], `response.rs`; [`WardenResponse`]
+//! re-exportiert), die inhaltsfreie Ablehnungskategorie ([`Denial`],
+//! re-exportiert) und die Eskalationsstufen ([`EscalationStage`],
+//! re-exportiert; „re-exportiert" heißt: definiert in
+//! `harw-dod-warden-types`, siehe oben). Sie führt selbst
+//! keine Durchsetzung aus und trifft keine Autorisierungsentscheidung — beides
+//! ist Sache der beiden Nachbarknoten.
 //!
 //! # Proof v2 (C-WPROTO, W3) — maßgeblich
 //! Seit W3 ist die einzige akzeptierte Autorisierung
@@ -21,12 +40,25 @@
 //! [`WardenRequest`], Antworthülle [`WardenReply`] (beide versioniert, F-088).
 //! Prüfreihenfolge und MAC-Eingabe: siehe [`signed`]-Moduldoku.
 //!
-//! **v1-Altlast:** [`AuthorizationProof`] und [`WardenActionRequest`] bleiben
-//! nur bestehen, damit `harw-dod-warden`, `harw-warden` und
-//! `harw-dod-escalate` bis zu ihrer Umstellung in W5 (D-WARDEN, D-ESC)
-//! kompilieren. Sie sind fälschbar (F-001) und dürfen von keinem Warden mehr
-//! akzeptiert werden. Die Abschnitte unten, die „Beleg“ sagen, beschreiben
-//! diesen v1-Stand.
+//! **PL-100 WP 3.1 (W01 erweitert):** Der MAC deckt zusätzlich Befund,
+//! Freigebenden, optionale Haltedauer (`None` = bis zur Aufhebung, O3), die
+//! Bestätigung „nicht umkehrbar“ (`irreversible_ack`, O4), das Ziel-Tripel aus
+//! cgroup-Pfad, Kernel-ID und erster Beobachtung ([`CgroupTarget`], B21) und
+//! den Ablaufzeitpunkt ab ([`AuthorizationBody`]). Die Aktionsmenge trennt
+//! Auftauen ([`WardenAction::ThawCgroup`]) und Aufheben der Isolation
+//! ([`WardenAction::LiftIsolation`]); `ReleaseCgroup` ist stillgelegt.
+//! [`WardenRequest::decode`] lehnt jeden v1-Auftrag ausdrücklich ab.
+//!
+//! **v1-Altlast:** [`AuthorizationProof`], [`WardenActionRequest`],
+//! [`ActionContentDigest::content_digest`] (bis WP 3.0 die inhärente Methode
+//! `WardenAction::content_digest`) und die Variante `ReleaseCgroup` sind
+//! `#[deprecated]`. Seit PL-100 WP 3.0 (Schritt 2) nennt kein Workspace-Crate
+//! sie mehr außerhalb von Ablehnungstests: `harw-dod-escalate` liefert nur
+//! noch eine unsignierte Freigabe und hängt nicht an dieser Crate. Sie
+//! bleiben bis zu ihrer Entfernung nur für die Tests der v1-Ablehnung
+//! ([`WardenRequest::decode`]) stehen, sind fälschbar (F-001) und werden von
+//! keinem Warden akzeptiert. Die Abschnitte unten, die „Beleg“ sagen,
+//! beschreiben diesen v1-Stand.
 //!
 //! # Zwei Vorprüfungen, bevor hier etwas geschrieben wurde
 //!
@@ -110,13 +142,15 @@
 //! (hier: `CgroupId`), nie ein roher `String`/`str`.
 //!
 //! # Die Zulässigkeitsmatrix in Worten
-//! `FreezeCgroup` und `ReleaseCgroup` sind ab [`EscalationStage::RuleTriggered`]
-//! zulässig; `IsolateNetwork` und `KillProcessTree` erst ab
+//! `FreezeCgroup` und `ThawCgroup` sind ab [`EscalationStage::RuleTriggered`]
+//! zulässig; `IsolateNetwork`, `LiftIsolation` und `KillProcessTree` erst ab
 //! [`EscalationStage::Escalated`]. Begründung je Aktion in `action.rs`,
 //! Abschnitt „Die Zulässigkeitsmatrix in Worten". Reversibilität:
-//! `FreezeCgroup`, `ReleaseCgroup` und `IsolateNetwork` sind reversibel
-//! (`ReleaseCgroup` ist ihre gemeinsame Umkehrung); `KillProcessTree` ist es
-//! ausdrücklich nicht (`action.rs`, [`Reversibility`]).
+//! `FreezeCgroup` (über `ThawCgroup`) und `IsolateNetwork` (über
+//! `LiftIsolation`) sind reversibel; `KillProcessTree` ist es ausdrücklich
+//! nicht (`action.rs`, [`Reversibility`]). Kill und Isolation verlangen
+//! trotzdem beide das signierte `irreversible_ack`
+//! ([`WardenAction::requires_irreversible_ack`]).
 //!
 //! # Warum Ablehnungen inhaltsfrei sind
 //! Der Durchsetzer läuft privilegiert; was er meldet, verlässt seinen
@@ -134,10 +168,11 @@
 //! keine Funktion, die eine Autorisierungs*entscheidung* trifft —
 //! [`AuthorizationProof::new`] setzt fünf bereits getroffene Fakten
 //! zusammen, ohne selbst eine Leiter zu befragen oder eine Systemuhr zu
-//! lesen. Ausschließlich `harw_dod_escalate::authorize` (AW5-03, dort
-//! `pub(crate)`) soll ihn aufrufen — siehe `proof.rs`-Moduldoku, Abschnitt
-//! „Wer diesen Typ konstruieren darf", für die Begründung, warum das eine
-//! dokumentierte Konvention ist und keine vom Compiler erzwungene Grenze.
+//! lesen. Bis PL-100 WP 3.0 rief ihn ausschließlich
+//! `harw_dod_escalate::authorize` (AW5-03, dort `pub(crate)`) auf; seitdem
+//! ruft ihn kein produktiver Code mehr auf. Den gültigen v2-Auftrag
+//! ([`SignedAuthorization`]) stellt nur der Halter eines [`ProofKey`] aus
+//! (`harw-escalator`, WP 3.2) — siehe `signed.rs`-Moduldoku.
 //!
 //! # Nebenläufigkeit
 //! Reine, unveränderliche Werttypen. Kein internes Locking, keine geteilten
@@ -148,27 +183,34 @@
 //! # Fehler
 //! [`error::WardenProtoError`] — siehe dessen Moduldoku.
 
-pub mod action;
 pub mod canonical;
-pub mod denial;
 pub mod error;
 pub mod proof;
 pub mod response;
 pub mod signed;
-pub mod stage;
 
-pub use action::{ProposedAction, Reversibility, WardenAction};
-pub use denial::Denial;
+// Signierfreie Module aus `harw-dod-warden-types` (PL-100 WP 3.0), unter den
+// bisherigen Modulpfaden re-exportiert; `crate::action::…` usw. lösen
+// innerhalb dieser Crate weiterhin auf.
+pub use harw_dod_warden_types::{action, denial, outcome, stage, target};
+
 pub use error::{ProofError, ProofResult, WardenProtoError, WardenProtoResult};
-pub use proof::AuthorizationProof;
-pub use response::{
-    WardenActionAudit, WardenActionRequest, WardenReply, WardenRequest, WardenResponse,
+pub use harw_dod_warden_types::{
+    CgroupKernelId, CgroupTarget, Denial, EscalationStage, ProposedAction, Reversibility,
+    WardenAction, WardenTypesError,
 };
+// v1-Altlast: bleibt erreichbar, die Warnung trifft jeden Aufrufer.
+#[allow(deprecated)]
+pub use proof::{ActionContentDigest, AuthorizationProof};
+// v1-Altlast: bleibt erreichbar, die Warnung trifft jeden Aufrufer.
+#[allow(deprecated)]
+pub use response::WardenActionRequest;
+pub use response::{WardenActionAudit, WardenReply, WardenRequest, WardenResponse};
 pub use signed::{
-    KeyId, KeyRing, MAX_CLOCK_SKEW_SECS_CAP, MAX_TTL_SECS_CAP, MemoryNonceLedger, NonceLedger,
-    ProofKey, ProofPolicy, SignedAuthorization, VerifiedAuthorization, WARDEN_PROTOCOL_VERSION,
+    AuthorizationBody, KeyId, KeyRing, MAX_CLOCK_SKEW_SECS_CAP, MAX_TTL_SECS_CAP,
+    MemoryNonceLedger, NonceLedger, ProofKey, ProofPolicy, SignedAuthorization,
+    VerifiedAuthorization, WARDEN_PROTOCOL_VERSION,
 };
-pub use stage::EscalationStage;
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

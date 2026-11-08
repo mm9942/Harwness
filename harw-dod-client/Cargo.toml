@@ -11,6 +11,9 @@ rust-version.workspace = true
 [dependencies]
 harw-dod-config = { path = "../harw-dod/crates/harw-dod-config" }
 harw-types = { path = "../harw-types" }
+# PL-100 WP0.8: the one classification of characters that must not reach a
+# terminal or a prompt verbatim (`fsio::is_unsafe_char`, `fsio::is_clean`).
+harw-untrusted-text = { path = "../harw-untrusted-text" }
 # One `open(O_NOFOLLOW | O_NONBLOCK)` per export read (no lstat/open race, a
 # swapped-in FIFO cannot block); already in the tree via harw-dod-config.
 rustix = { workspace = true, features = ["fs"] }

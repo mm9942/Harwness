@@ -1,0 +1,26 @@
+[package]
+publish.workspace = true
+name = "harw-dod-dispatch"
+description = "Pure DoD finding dispatch: route table, partitioned budget, priority queue, breaker, incident grouping and re-triage policy (no IO, no clock, no async)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# PL-100 WP2.1: reine Dispatch-Bibliothek (Ring A, Schicht `F` in
+# `xtask/arch-policy.toml`, wie `harw-untrusted-text`). Kein IO, keine
+# Uhr (die Zeit kommt als Unix-Sekunden herein), kein async, keine Threads.
+[dependencies]
+# Derive über den Workspace: der Zustand ist serialisierbar.
+serde = { workspace = true }
+# Begrenzte Persistenz-Kodierung (`DispatchState::to_json`/
+# `from_json_bounded`, Bytegrenze vor serde; Review 4505196829). Ohne IO.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# `define_test_error!` (TestError/TestResult) für panikfreie Tests.
+harw-test-support = { path = "../harw-test-support" }
+
+[lints]
+workspace = true

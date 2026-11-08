@@ -59,7 +59,8 @@
 //!   verlangt.
 //! - **Datenvokabular** ([`harw_dod_signals`]): [`Sensor`] (der eine Trait,
 //!   den jeder Sensor implementiert), [`SensorReading`], [`SecurityEvent`],
-//!   [`EventKind`], [`Actor`], [`AuthOutcome`], [`DriftSeverity`],
+//!   [`EventKind`], [`Actor`], [`ProcessContext`] (Feldtyp von
+//!   `Actor::process`, PL-100 WP0.15), [`AuthOutcome`], [`DriftSeverity`],
 //!   [`HostSample`], [`Severity`], [`Hardness`], [`SecurityEvidence`] —
 //!   Rückgabe- bzw. Feldtypen von [`Sensor::poll`]/[`Sensor::handle`] und
 //!   von [`RuleContext`] unten.
@@ -103,16 +104,21 @@
 //! [`run_rules`], [`run_rules_checked`], [`Rule`], [`RuleContext`], die drei mitgelieferten Regeln
 //! ([`EgressFlowRule`], [`BaselineDeviationRule`], [`StructureDriftRule`]),
 //! [`Finding`], [`FindingKind`], [`RuleChecked`], [`Triaged`], [`Verdict`],
-//! [`triage`], [`Baseline`], [`PalaceStatus`] — alles direkte Parameter-,
-//! Rückgabe- oder Feldtypen von
-//! `run_rules`/`run_rules_checked`/`triage`/`RuleContext`.
+//! [`FindingRecord`], [`triage_record`], [`TriageError`], [`RecordError`],
+//! [`Baseline`], [`PalaceStatus`] — alles direkte Parameter-, Rückgabe- oder
+//! Feldtypen von `run_rules`/`run_rules_checked`/`Finding::record`/
+//! `triage_record`/`RuleContext`. Das Verdikt selbst
+//! (`harw_dod_signals::SecurityVerdict`) bleibt beim Datenvokabular; seit
+//! PL-100 WP0.11 gibt es das ungebundene `triage` nur noch für Tests
+//! (`harw-dod-rules`-Feature `test-support`), deshalb nicht hier.
 //!
 //! **Nein** — `harw_dod_rules::Raw` (der dritte Zustandsmarker) als Name:
 //! `run_rules` liefert zwar `Finding<Raw>` (rohe, identitätslose Befunde),
 //! aber ein Aufrufer muss den Marker dafür nie ausschreiben (`Vec<_>` genügt),
 //! und nichts in dieser Fassade *nimmt* ein `Finding<Raw>` entgegen. Den
-//! zertifizierten `Finding<RuleChecked>` — die Eingabe von [`triage`] —
-//! liefert [`run_rules_checked`] (`Finding::raw`/`Finding::check` bleiben in
+//! zertifizierten `Finding<RuleChecked>` — die Eingabe von
+//! `Finding::record` und damit von [`triage_record`] — liefert
+//! [`run_rules_checked`] (`Finding::raw`/`Finding::check` bleiben in
 //! `harw-dod-rules` `pub(crate)`, siehe dessen `engine.rs`- und
 //! `finding.rs`-Moduldoku).
 //!
@@ -138,26 +144,31 @@
 //!
 //! 1. **Invariante S1.** `harw_dod_escalate::Action::authorize` ist in
 //!    `harw-dod-escalate` `pub(crate)` — die einzige Stelle im gesamten
-//!    Workspace, die eine `AuthorizationProof` erzeugt (siehe dessen
-//!    `action.rs`-Moduldoku samt eigenem `compile_fail`-Doctest). Das bleibt
-//!    unabhängig davon wahr, ob diese Fassade `Action`/`Authorized`
-//!    re-exportiert — `pub(crate)` überlebt jeden `pub use`, auch einen
+//!    Workspace, die ein `Action<Authorized>` samt seinem unsignierten
+//!    Inhalt `AuthorizedAction` erzeugt (siehe dessen `action.rs`-Moduldoku
+//!    samt eigenem `compile_fail`-Doctest). Signiert wird dort nichts: den
+//!    signierten v2-Auftrag (`harw_dod_warden_proto::SignedAuthorization`),
+//!    den allein der Warden annimmt, stellt künftig nur `harw-escalator`
+//!    (PL-100 WP 3.2) aus (Leitprinzip I8). Das bleibt unabhängig davon
+//!    wahr, ob diese Fassade `Action`/`Authorized` re-exportiert —
+//!    `pub(crate)` überlebt jeden `pub use`, auch einen
 //!    Blanket-Reexport, weil ein nicht-`pub`-Item über `pub use krate::*`
 //!    gar nicht erst sichtbar wird. Diese Fassade re-exportiert dennoch
 //!    **keinen einzigen Namen** aus `harw-dod-escalate` — nicht weil ein
 //!    Reexport `authorize` erreichbar machen würde (das kann er nicht),
 //!    sondern weil `harw-dod-escalate`s öffentliche Funktionen
-//!    (`freeze_ops::authorize_freeze`/`authorize_release`/
+//!    (`freeze_ops::authorize_freeze`/`authorize_thaw`/
 //!    `authorize_stage_gated`) bereits fertige `Action<Authorized>`-Werte
-//!    zurückgeben, die zum Warden weitergereicht werden sollen — sie unter
-//!    „beobachte/bewerte" zu präsentieren verwischte genau die Grenze,
+//!    zurückgeben, die der Escalator in einen signierten Auftrag an den
+//!    Warden umsetzen soll — sie unter „beobachte/bewerte" zu
+//!    präsentieren verwischte genau die Grenze,
 //!    die dieser Abschnitt zieht. Der eigene `compile_fail`-Doctest unten
 //!    belegt das für diese Fassade: es gibt hier **gar keinen** Pfad zu
 //!    `Action`, `Authorized` oder `Action<Authorized>` — stärker als
 //!    „unerreichbar", nämlich „nicht einmal benennbar".
 //! 2. **Eine zweite Abhängigkeit würde durchgereicht.**
-//!    `freeze_ops::authorize_freeze`/`authorize_release`/
-//!    `authorize_stage_gated`/`reconcile_expired_freezes` nehmen alle ein
+//!    `freeze_ops::authorize_freeze`/`authorize_thaw`/
+//!    `reconcile_expired_freezes` nehmen ein
 //!    `&harw_session_store::FreezeStore` entgegen — eine vierte Crate, die
 //!    diese Fassade dann ebenfalls in ihre eigene Fläche hätte aufnehmen
 //!    müssen, nur um `harw-dod-escalate` sinnvoll benutzbar zu machen.
@@ -309,14 +320,18 @@
 //! „Bewerte einen Befund" — die Regeln gegen ein beobachtetes Ereignis
 //! auswerten. `run_rules` liefert rohe `Finding<Raw>`; [`run_rules_checked`]
 //! liefert dieselben Befunde zertifiziert als `Finding<RuleChecked>` (mit
-//! frischer `FindingId`), bereit für [`triage`]:
+//! frischer `FindingId`). `Finding::record` friert einen solchen Befund mit
+//! seinem Beleg ein; [`triage_record`] prüft den Record neu und bindet das
+//! Verdikt an dessen selbst berechneten Digest. Ein Modell-Urteil wird dabei
+//! gedeckelt — `Confirmed` wird zu `NeedsReview` (PL-100 WP0.11):
 //!
 //! ```rust
 //! use harw_dod::{
-//!     Actor, EgressFlowRule, EventKind, Rule, RuleContext, SecurityEvent, Verdict, run_rules,
-//!     run_rules_checked, triage,
+//!     Actor, EgressFlowRule, EventKind, Rule, RuleContext, SecurityEvent, SecurityEvidence,
+//!     Severity, Verdict, run_rules, run_rules_checked, triage_record,
 //! };
 //! use harw_authority::NetworkScope;
+//! use harw_dod_signals::{SecurityVerdict, VerdictClassification};
 //! use harw_types::SensorId;
 //!
 //! let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
@@ -335,6 +350,8 @@
 //!     events: &events,
 //!     baselines: &[],
 //!     network_scope: &scope,
+//!     listener_history: None,
+//!     rule_config: None,
 //! };
 //! let findings = run_rules(&ctx);
 //! assert!(findings.iter().any(|finding| finding.rule_id() == EgressFlowRule.id()));
@@ -343,8 +360,22 @@
 //!     .into_iter()
 //!     .find(|finding| finding.rule_id() == EgressFlowRule.id())
 //!     .expect("EgressFlowRule löst aus");
-//! let triaged = triage(checked, Verdict::Confirmed);
-//! assert_eq!(*triaged.verdict(), Verdict::Confirmed);
+//! let evidence = SecurityEvidence::capture(vec![], events.clone(), jiff::Timestamp::UNIX_EPOCH)
+//!     .expect("Beleg kodierbar");
+//! let record = checked.record(evidence);
+//! let verdict = SecurityVerdict::new(
+//!     record.finding_id().clone(),
+//!     record.digest(),
+//!     VerdictClassification::Confirmed,
+//!     Severity::High,
+//!     "Ziel außerhalb des erlaubten Bereichs".to_owned(),
+//!     None,
+//!     "security-triage-1".to_owned(),
+//!     jiff::Timestamp::UNIX_EPOCH,
+//! );
+//! let triaged = triage_record(&record, &verdict).expect("Verdikt gebunden");
+//! assert_eq!(*triaged.verdict(), Verdict::NeedsReview);
+//! assert_eq!(triaged.record_digest(), Some(record.digest()));
 //! ```
 //!
 //! # Stand
@@ -361,8 +392,8 @@ pub use harw_dod_cap::{
 
 // --- harw-dod-signals: Datenvokabular (siehe Begründung oben) ---
 pub use harw_dod_signals::{
-    Actor, AuthOutcome, DriftSeverity, EventKind, Hardness, HostSample, SecurityEvent,
-    SecurityEvidence, Sensor, SensorReading, Severity,
+    Actor, AuthOutcome, DriftSeverity, EventKind, Hardness, HostSample, ProcessContext,
+    SecurityEvent, SecurityEvidence, Sensor, SensorReading, Severity,
 };
 
 // --- harw-dod-sentinel: der Aggregator (siehe Begründung oben) ---
@@ -373,9 +404,9 @@ pub use harw_dod_sentinel::{
 
 // --- harw-dod-rules: "bewerte einen Befund" (siehe Begründung oben) ---
 pub use harw_dod_rules::{
-    Baseline, BaselineDeviationRule, EgressFlowRule, Finding, FindingKind, PalaceStatus, Rule,
-    RuleChecked, RuleContext, StructureDriftRule, Triaged, Verdict, run_rules, run_rules_checked,
-    triage,
+    Baseline, BaselineDeviationRule, EgressFlowRule, Finding, FindingKind, FindingRecord,
+    PalaceStatus, RecordError, Rule, RuleChecked, RuleContext, StructureDriftRule, TriageError,
+    Triaged, Verdict, run_rules, run_rules_checked, triage_record,
 };
 
 // --- die neun unprivilegierten Instrumente (siehe Begründung oben) ---

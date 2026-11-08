@@ -22,6 +22,12 @@
 //! `resume_after_approval` entry point. That entry point does not record
 //! approvals the resumed turn parks on again; the driver therefore issues the
 //! missing durable record itself whenever a leg parks.
+//!
+//! When the core attributes the ask to the DoD taint of the turn (PL-100
+//! decision O1), the parked request's `summary` carries that reason; the
+//! wire shape of `ApprovalRequest` is unchanged. Surfaces that render
+//! `summary` show the reason; `harw_session_client::ApprovalSummary` does not
+//! carry `summary` yet, so remote SDK hosts miss it.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -30,6 +36,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use harw_core::cancel::{CancelReason, CancelToken};
+use harw_core::dod_taint::pending_ask_reason;
 use harw_core::mode::InteractionMode;
 use harw_core::turn_loop::TurnControl;
 use harw_core::{
@@ -498,6 +505,28 @@ fn forward(sink: &Arc<dyn EventSink>, event: CoreEvent) {
         CoreEvent::Turn(event) => DriverEvent::Turn(event),
         CoreEvent::Session(event) => DriverEvent::Session(event),
     });
+}
+
+/// Human-readable summary of a parked tool approval.
+///
+/// # Description
+/// `reason` is the core's attribution of the ask, today only the DoD taint
+/// (PL-100 decision O1, `harw_core::dod_taint::pending_ask_reason`, already
+/// escaped). It is appended to the summary because the wire
+/// `ApprovalRequest` denies unknown fields: older peers keep parsing the
+/// request and simply show the longer text.
+///
+/// # Arguments
+/// - `tool` (`&str`): the parked tool's name.
+/// - `reason` (`Option<&str>`): the attributed reason, if any.
+///
+/// # Returns
+/// `tool '<tool>' requires approval`, plus `; <reason>` when a reason exists.
+fn approval_summary(tool: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("tool '{tool}' requires approval; {reason}"),
+        None => format!("tool '{tool}' requires approval"),
+    }
 }
 
 fn resolution_of(record: &ApprovalResolutionRecord) -> ApprovalResolution {
@@ -987,6 +1016,11 @@ impl CoreRuntime for HarwCoreRuntime {
             };
             let tool = pending.call.name.as_str().to_owned();
             let turn_id = session.current_turn().cloned().unwrap_or_else(TurnId::new);
+            // PL-100 O1: the reason rides in `summary`; the wire struct stays
+            // unchanged because it denies unknown fields. Only consumers that
+            // render `summary` show it: `harw_session_client::describe` drops
+            // the field today, so remote SDK hosts do not see the reason yet.
+            let reason = pending_ask_reason(session);
             Ok(Some(ParkedApproval {
                 request: ApprovalRequest {
                     id: ApprovalId::from_str(pending.request.as_str()),
@@ -996,7 +1030,7 @@ impl CoreRuntime for HarwCoreRuntime {
                         tool_name: tool.clone(),
                         arguments: pending.call.arguments.clone(),
                     },
-                    summary: format!("tool '{tool}' requires approval"),
+                    summary: approval_summary(&tool, reason.as_deref()),
                     risk: RiskLevel::Medium,
                     requested_at: pending.requested_at,
                     timeout_at: pending.timeout_at,
@@ -1056,6 +1090,26 @@ mod tests {
         let driver = CoreTurnDriver::new(CoreDriverConfig::new(root)).map_err(|e| e.to_string())?;
         assert_eq!(driver.model_name(&SessionId::new()), None);
         Ok(())
+    }
+
+    /// PL-100 O1: the DoD-taint reason rides in the summary; without one
+    /// the summary keeps its previous text.
+    #[test]
+    fn the_summary_carries_the_taint_reason_only_when_there_is_one() {
+        assert_eq!(
+            approval_summary("job.stop", None),
+            "tool 'job.stop' requires approval"
+        );
+        let reason = harw_core::dod_taint::ask_reason("job.stop");
+        let summary = approval_summary("job.stop", Some(&reason));
+        assert!(
+            summary.starts_with("tool 'job.stop' requires approval; "),
+            "{summary}"
+        );
+        assert!(
+            summary.ends_with(harw_core::dod_taint::TAINT_REASON),
+            "{summary}"
+        );
     }
 }
 

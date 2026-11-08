@@ -1,0 +1,42 @@
+[package]
+name = "harw-dod-advisory"
+description = "Offline RustSec advisory sensor: matches Cargo.lock packages against a local advisory-db checkout"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Zugriffsvokabular: Capability, ReadScope, SensorHandle, SensorError (der
+# einzige Fehlertyp, den `Sensor::poll` zurückgibt).
+harw-dod-cap = { path = "../harw-dod-cap" }
+# Datenvokabular: `trait Sensor`, `SensorReading`, `SecurityEvent`,
+# `EventKind::StructureDrift`, `DriftSeverity`, `Hardness`.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# `glob::glob` zum Auffinden der Advisory-Dateien je Crate und
+# `MAX_READ_BYTES` als gemeinsame Größengrenze (siehe `src/read.rs`).
+harw-dod-readfs = { path = "../harw-dod-readfs" }
+# `SensorId`.
+harw-types = { path = "../../../harw-types" }
+# `#[derive(harw_macros::HarwError)]` für den crate-internen `SourceFault`.
+harw-macros = { path = "../../../harw-macros" }
+# Der eine Escaper für untrusted Text (PL-100 WP0.8): Advisory-Titel landen
+# als `detail` bei Menschen und Triage-Modellen.
+harw-untrusted-text = { path = "../../../harw-untrusted-text" }
+# Versionsvergleich nach SemVer-Präzedenz statt Zeichenkettenvergleich.
+semver = { workspace = true }
+# `Cargo.lock` und die TOML-Front-Matter der RustSec-Dateien.
+toml = { workspace = true }
+serde = { workspace = true }
+jiff = { workspace = true }
+
+[dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
+# Prüft, dass serialisierte Ereignisse keine Pfade tragen.
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

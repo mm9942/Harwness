@@ -25,6 +25,7 @@ fn request() -> ChildApprovalRequest {
             arguments: serde_json::json!({ "path": "src/lib.rs", "content": "x" }),
         },
         timeout: Duration::from_secs(600),
+        reason: None,
     }
 }
 

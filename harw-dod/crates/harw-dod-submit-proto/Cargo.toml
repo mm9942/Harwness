@@ -1,0 +1,32 @@
+[package]
+name = "harw-dod-submit-proto"
+description = "Triage submission wire format from a model-facing triage process to the escalator: verdict plus bound finding digest, no signing code"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# PL-100 WP 3.0: aus `harw-dod-escalate` herausgelöst. Der modellnahe
+# Triage-Prozess baut diese Einreichung; er darf deshalb weder Signier-Code
+# (`harw-dod-warden-proto`) noch die Eskalationsleiter linken (Leitprinzip I8).
+# Diese Crate hängt nur am Urteilsvokabular und an den Kennungen.
+[dependencies]
+# `SecurityVerdict`, `validate_verdict` — das Urteil und sein Vertrag.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# `FindingId`, `ContentDigest` — Kennung und Digest des Finding-Records.
+harw-types = { path = "../../../harw-types" }
+# `TriageSubmission` ist das eingefrorene JSON-Format des Submission-Sockets.
+serde = { workspace = true }
+# `#[derive(harw_macros::HarwError)]` für `SubmissionError`.
+harw-macros = { path = "../../../harw-macros" }
+
+[dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
+# Nur für Tests und Doctests: Wire-Rundläufe, Zeitpunkte der Urteile.
+serde_json = { workspace = true }
+jiff = { workspace = true }
+
+[lints]
+workspace = true

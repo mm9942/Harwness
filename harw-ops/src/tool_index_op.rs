@@ -20,9 +20,11 @@
 //!   description ([`known_specs`]: the specs of the profile providers,
 //!   `harw_registry_defaults::profile::known_tool_specs`, the state-free
 //!   composition-root providers, `profile::root_tool_specs`, then the
-//!   operation model tools of the registry at hand). Tools whose specs need
-//!   runtime state (`job.*`, the spawn and delegation tools, `matrix.*`, …)
-//!   have no summary; a test pins that list;
+//!   operation model tools of the registry at hand, then the Harw-DoD
+//!   triage operations, which no root registry holds,
+//!   [`crate::dod::dod_triage_operations`]). Tools whose specs need runtime
+//!   state (`job.*`, the spawn and delegation tools, `matrix.*`, …) have no
+//!   summary; a test pins that list;
 //! - the tool → skill link (`ToolSkillMap::bundled`: the bundled skill
 //!   manifests and the providers' `TOOL_SKILLS`).
 //!
@@ -41,7 +43,7 @@ use harw_macros::operation;
 use harw_operations::adapter::ModelToolAdapter;
 use harw_operations::adapter::model_tool::model_tool_schema_for;
 use harw_operations::registry::OperationRegistry;
-use harw_operations::{OpContext, OpError, OpOutput};
+use harw_operations::{OpContext, OpError, OpOutput, Operation};
 use harw_registry_defaults::tool_index::{ToolIndex, ToolIndexEntry, ToolSkillMap};
 use harw_tools::{FunctionToolSpec, JsonSchema, ToolName, ToolSpec};
 use serde::{Deserialize, Serialize};
@@ -108,8 +110,10 @@ fn registry_specs() -> impl Iterator<Item = &'static ToolSpec> {
 /// The registry specs first (the profile providers,
 /// `harw_registry_defaults::profile::known_tool_specs`, and the state-free
 /// composition-root providers, `profile::root_tool_specs`), then the
-/// operation model tools of `operations` (description = the operation
-/// summary, parameters = the schema the model sees).
+/// operation model tools of `operations`, then the Harw-DoD triage
+/// operations ([`crate::dod::dod_triage_operations`]; no root registry holds
+/// them, PL-100 O8) — description = the operation summary, parameters = the
+/// schema the model sees.
 #[must_use]
 pub fn known_specs(operations: Option<&OperationRegistry>) -> BTreeMap<String, ToolSpec> {
     let mut specs: BTreeMap<String, ToolSpec> = BTreeMap::new();
@@ -119,35 +123,53 @@ pub fn known_specs(operations: Option<&OperationRegistry>) -> BTreeMap<String, T
             .or_insert_with(|| spec.clone());
     }
     for op in operations.into_iter().flat_map(OperationRegistry::iter) {
-        let Some(adapter) = ModelToolAdapter::from_operation(Arc::clone(op)) else {
-            continue;
-        };
-        let name = adapter.tool_name().to_owned();
-        if specs.contains_key(&name) {
-            continue;
-        }
-        // Dasselbe Schema, das `ModelToolProvider::tools` dem Modell zeigt.
-        let derived = op.meta().args_schema.map(|build_schema| build_schema());
-        let spec = ToolSpec::Function(FunctionToolSpec {
-            name: ToolName::new(name.clone()),
-            description: adapter.description().to_owned(),
-            parameters: model_tool_schema_for(&name, derived),
-            strict: false,
-        });
-        specs.insert(name, spec);
+        insert_operation_spec(&mut specs, op);
+    }
+    // PL-100 WP1.2: die Triage-Werkzeuge hält keine Wurzel-Registry.
+    for op in &crate::dod::dod_triage_operations() {
+        insert_operation_spec(&mut specs, op);
     }
     specs
 }
 
+/// Inserts the spec of the model tool of `op` into `specs`, unless `op` has
+/// no model tool or `specs` already holds a spec of that name.
+fn insert_operation_spec(specs: &mut BTreeMap<String, ToolSpec>, op: &Arc<dyn Operation>) {
+    let Some(adapter) = ModelToolAdapter::from_operation(Arc::clone(op)) else {
+        return;
+    };
+    let name = adapter.tool_name().to_owned();
+    if specs.contains_key(&name) {
+        return;
+    }
+    // Dasselbe Schema, das `ModelToolProvider::tools` dem Modell zeigt.
+    let derived = op.meta().args_schema.map(|build_schema| build_schema());
+    let spec = ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new(name.clone()),
+        description: adapter.description().to_owned(),
+        parameters: model_tool_schema_for(&name, derived),
+        strict: false,
+    });
+    specs.insert(name, spec);
+}
+
 /// The description of one tool: its registry spec, otherwise the summary of
-/// an operation model tool in `operations`. Builds no schema.
+/// an operation model tool in `operations`, otherwise the summary of a
+/// Harw-DoD triage operation ([`crate::dod::dod_triage_operations`]: only
+/// the `security-*-triage` children mount them, so no root registry, the
+/// live one of `tool.index` included, holds them). Builds no schema.
 fn description_of(name: &str, operations: Option<&OperationRegistry>) -> Option<String> {
     if let Some(spec) = registry_specs().find(|spec| spec.name() == name) {
         let ToolSpec::Function(function) = spec;
         return Some(function.description.clone());
     }
-    let op = operations?.find_by_name(name)?;
-    ModelToolAdapter::from_operation(Arc::clone(op)).map(|adapter| adapter.description().to_owned())
+    let op = match operations.and_then(|operations| operations.find_by_name(name)) {
+        Some(op) => Arc::clone(op),
+        None => crate::dod::dod_triage_operations()
+            .into_iter()
+            .find(|op| op.meta().name == name)?,
+    };
+    ModelToolAdapter::from_operation(op).map(|adapter| adapter.description().to_owned())
 }
 
 /// The tool index with summaries and skill links (see the module
@@ -161,6 +183,13 @@ pub fn build_index(operations: Option<&OperationRegistry>) -> ToolIndex {
 /// session: the base set (`register_all`) plus the gated planning,
 /// WorkDriver, intent-cycle and gateway surfaces, as a root session with all
 /// of them enabled would carry them.
+///
+/// The three Harw-DoD triage tools (`dod.finding`, `dod.related`,
+/// `dod.labels`) are not among them (PL-100 O8: only the four
+/// `security-*-triage` children mount them); [`build_index`],
+/// [`known_specs`] and [`describe_view`] describe them from
+/// [`crate::dod::dod_triage_operations`] with or without this registry.
+/// This registry is a description source; it grants nothing.
 #[must_use]
 pub fn cli_operations() -> OperationRegistry {
     let config = harw_plan::config::PlanToolConfig::enabled_defaults();
@@ -304,6 +333,9 @@ pub fn describe_view(name: &str, operations: Option<&OperationRegistry>) -> Opti
         let _ = writeln!(text, "  class:     {}", entry.class.as_str());
         let profiles = if entry.always_available {
             "always available".to_owned()
+        } else if harw_registry_defaults::profile::DOD_TRIAGE_TOOLS.contains(&name) {
+            // PL-100 O8: nie in einer Wurzel-Sitzung, nur im Triage-Kind.
+            "none (mounted only for the security-*-triage child roles)".to_owned()
         } else if entry.profiles.is_empty() {
             "none (added by the composition root)".to_owned()
         } else {
@@ -467,51 +499,189 @@ mod tests {
             .await
             .map_err(ctx_err("overview"))?;
         assert!(output.text.starts_with("Tool families"), "{}", output.text);
-        assert!(output.text.contains("\n- dod (3)\n"), "{}", output.text);
+        // PL-100 WP1.2: drei lesende Root-Werkzeuge plus drei Triage-Werkzeuge.
+        assert!(output.text.contains("\n- dod (6)\n"), "{}", output.text);
         assert!(output.text.contains("\n- fs ("), "{}", output.text);
         let data = output.data.ok_or(TestError::Missing("data"))?;
-        let families = data["families"]
-            .as_array()
+        let families = data
+            .get("families")
+            .and_then(Value::as_array)
             .ok_or(TestError::Missing("families"))?;
         assert!(
-            families
-                .iter()
-                .any(|family| family["family"] == "dod" && family["tools"] == 3)
+            families.iter().any(|family| {
+                family.get("family") == Some(&json!("dod"))
+                    && family.get("tools") == Some(&json!(6))
+            }),
+            "{families:?}"
         );
         Ok(())
     }
 
-    /// PL-97 B2 (Plan-Test): `tool.index` für `family = "dod"`.
+    /// PL-97 B2 (Plan-Test): `tool.index` für `family = "dod"`; seit
+    /// PL-100 WP1.2 mit den drei Triage-Werkzeugen, die nur die
+    /// `security-*-triage`-Kinder tragen (der Index listet jedes bekannte
+    /// Werkzeug).
     #[tokio::test]
-    async fn tool_index_for_family_dod_lists_the_three_read_only_tools() -> TestResult {
+    async fn tool_index_for_family_dod_lists_the_read_and_triage_tools() -> TestResult {
         let context = context_with_operations()?;
         let output = call(&context, json!({ "family": "dod" }))
             .await
             .map_err(ctx_err("dod family"))?;
         let lines: Vec<&str> = output.text.lines().collect();
-        assert_eq!(lines.len(), 3, "{}", output.text);
-        for (line, tool) in lines
-            .iter()
-            .zip(["dod.findings", "dod.sensors", "dod.status"])
-        {
+        assert_eq!(lines.len(), 6, "{}", output.text);
+        for (line, (tool, start)) in lines.iter().zip([
+            ("dod.finding", "Returns one Harw-DoD finding"),
+            ("dod.findings", "Lists recent Harw-DoD findings"),
+            ("dod.labels", "Returns the human labels"),
+            ("dod.related", "Lists the Harw-DoD findings"),
+            ("dod.sensors", "Read-only"),
+            ("dod.status", "Read-only"),
+        ]) {
             assert!(
-                line.starts_with(&format!("{tool} [meta] Read-only")),
+                line.starts_with(&format!("{tool} [meta] {start}")),
                 "{line}"
             );
         }
         let data = output.data.ok_or(TestError::Missing("data"))?;
-        assert_eq!(data["family"], "dod");
-        let tools = data["tools"]
-            .as_array()
+        assert_eq!(data.get("family"), Some(&json!("dod")));
+        let tools = data
+            .get("tools")
+            .and_then(Value::as_array)
             .ok_or(TestError::Missing("tools"))?;
-        assert_eq!(tools.len(), 3);
-        assert!(tools.iter().all(|tool| {
-            tool["provider"] == "dod"
-                && tool["class"] == "meta"
-                && tool["summary"]
-                    .as_str()
-                    .is_some_and(|summary| summary.starts_with("Read-only"))
-        }));
+        assert_eq!(tools.len(), 6);
+        assert!(
+            tools.iter().all(|tool| {
+                tool.get("provider") == Some(&json!("dod"))
+                    && tool.get("class") == Some(&json!("meta"))
+                    && tool
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| !summary.is_empty())
+            }),
+            "{tools:?}"
+        );
+        // Kein Registry-Profil registriert ein `dod.*` (Wurzel: Operationen,
+        // Kinder: rollengebundener Provider).
+        assert!(
+            tools.iter().all(|tool| tool
+                .get("profiles")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)),
+            "{tools:?}"
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP1.2: `tool.describe` der Triage-Werkzeuge zeigt ihre echte
+    /// Beschreibung, die Auto-Freigabe und die dokumentierten Argumente.
+    #[test]
+    fn describe_shows_the_triage_tools_with_their_arguments() -> TestResult {
+        let operations = cli_operations();
+        for (tool, argument) in [
+            ("dod.finding", "id (string, required)"),
+            ("dod.related", "dedup_key ("),
+            ("dod.labels", "dedup_key (string, required)"),
+        ] {
+            let view =
+                describe_view(tool, Some(&operations)).ok_or(TestError::Missing("triage tool"))?;
+            assert!(
+                view.text.contains("  approval:  auto-approved"),
+                "{}",
+                view.text
+            );
+            assert!(view.text.contains(argument), "{tool}: {}", view.text);
+            assert!(
+                view.text.contains(
+                    "  profiles:  none (mounted only for the security-*-triage child roles)"
+                ),
+                "{tool}: {}",
+                view.text
+            );
+            assert!(
+                !view.text.contains("added by the composition root"),
+                "{tool}: {}",
+                view.text
+            );
+            assert_eq!(
+                view.json.pointer("/entry/class"),
+                Some(&json!("meta")),
+                "{tool}"
+            );
+        }
+        // Die lesenden `dod.*` stellt dagegen die Wurzel bereit.
+        let status = describe_view("dod.status", Some(&operations))
+            .ok_or(TestError::Missing("dod.status"))?;
+        assert!(
+            status.text.contains("none (added by the composition root)"),
+            "{}",
+            status.text
+        );
+        let related = describe_view("dod.related", Some(&operations))
+            .ok_or(TestError::Missing("dod.related"))?;
+        for argument in ["cgroup_kid (", "hours ("] {
+            assert!(related.text.contains(argument), "{}", related.text);
+        }
+        Ok(())
+    }
+
+    /// PL-100 WP1.2: the `tool.index` of a live root session builds over the
+    /// session's own registry (`register_all`, plus whatever the root adds),
+    /// which never holds the triage tools; their summaries, specs and
+    /// descriptions still come from `dod::dod_triage_operations`.
+    #[tokio::test]
+    async fn tool_index_of_a_root_session_describes_the_triage_tools() -> TestResult {
+        let mut root = OperationRegistry::new();
+        crate::register_all(&mut root);
+        let index = build_index(Some(&root));
+        let bare = build_index(None);
+        let specs = known_specs(Some(&root));
+        for tool in harw_registry_defaults::profile::DOD_TRIAGE_TOOLS {
+            assert!(
+                root.find_by_name(tool).is_none(),
+                "{tool} must not reach a root session"
+            );
+            for (what, index) in [("root", &index), ("bare", &bare)] {
+                assert!(
+                    index.get(tool).is_some_and(|entry| entry
+                        .summary
+                        .as_deref()
+                        .is_some_and(|summary| !summary.is_empty())),
+                    "{what}: {tool} has no summary"
+                );
+            }
+            assert!(specs.contains_key(*tool), "{tool} has no spec");
+            let view = describe_view(tool, Some(&root)).ok_or(TestError::Missing("triage tool"))?;
+            assert!(
+                view.json.get("description").is_some_and(Value::is_string),
+                "{tool}: {}",
+                view.text
+            );
+            assert!(
+                view.text.contains("mounted only for the security-*-triage"),
+                "{tool}: {}",
+                view.text
+            );
+        }
+
+        let mut services = ServiceMap::new();
+        services.insert(root);
+        let context = crate::knowledge_test_support::op_context(services)?;
+        let output = call(&context, json!({ "family": "dod" }))
+            .await
+            .map_err(ctx_err("dod family of a root session"))?;
+        let data = output.data.ok_or(TestError::Missing("data"))?;
+        let tools = data
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or(TestError::Missing("tools"))?;
+        assert_eq!(tools.len(), 6, "{tools:?}");
+        assert!(
+            tools.iter().all(|tool| tool
+                .get("summary")
+                .and_then(Value::as_str)
+                .is_some_and(|summary| !summary.is_empty())),
+            "{tools:?}"
+        );
         Ok(())
     }
 
@@ -578,11 +748,16 @@ mod tests {
                 .is_some_and(|summary| summary.starts_with("Read-only Harw-DoD posture"))
         );
         // Ohne Operations-Registry fehlen nur die Zusammenfassungen der
-        // Operationswerkzeuge.
+        // Operationswerkzeuge — außer den Triage-Werkzeugen, die keine
+        // Wurzel-Registry hält (PL-100 WP1.2).
         let bare = build_index(None);
         assert!(
             bare.get("dod.status")
                 .is_some_and(|entry| entry.summary.is_none())
+        );
+        assert_eq!(
+            bare.get("dod.finding").map(|entry| &entry.summary),
+            index.get("dod.finding").map(|entry| &entry.summary)
         );
         assert_eq!(
             bare.get("fs.read").map(|entry| &entry.summary),
@@ -617,11 +792,6 @@ mod tests {
         ),
         (
             "dod.status",
-            "starts with the qualifier \"Read-only\" (PL-97 D3, harw-ops/src/dod.rs); reword to \
-             a leading verb there",
-        ),
-        (
-            "dod.findings",
             "starts with the qualifier \"Read-only\" (PL-97 D3, harw-ops/src/dod.rs); reword to \
              a leading verb there",
         ),
@@ -729,6 +899,9 @@ mod tests {
         ("job.logs", NEEDS_JOB_MANAGER),
         ("job.stop", NEEDS_JOB_MANAGER),
         ("job.list", NEEDS_JOB_MANAGER),
+        // PL-100 §3.5: Katalogzeilen von `job.suspend`/`job.resume`.
+        ("job.suspend", NEEDS_JOB_MANAGER),
+        ("job.resume", NEEDS_JOB_MANAGER),
         ("cargo.check", UNREGISTERED_CARGO),
         ("cargo.build", UNREGISTERED_CARGO),
         ("cargo.clippy", UNREGISTERED_CARGO),

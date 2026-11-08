@@ -288,6 +288,11 @@ pub struct FieldScope {
 /// `crate::discovery`. For `[dod]` that means `proof_key_dir`, `export_dir`
 /// and `findings_window_hours` are profile-scoped and never taken from an
 /// untrusted layer; `config_scope_exhaustive.rs` pins that per field.
+/// `[dod]` merges more finely (PL-100 WP 1.9): its base keys are replaced
+/// as a group, its sub-tables `[dod.triage]`/`[dod.approve]`/`[dod.watch]`
+/// key by key, and `[dod.triage]`/`[dod.approve]` count only from the home
+/// layer and the active profile, except that any layer may narrow
+/// `[dod.approve] tui_tty` to `false` (see `crate::discovery::discover_config`).
 #[rustfmt::skip]
 pub static FIELD_TABLE: &[FieldScope] = &[
     // 1.1 Top-Level (11)
@@ -384,7 +389,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "permissions.extra_roots", scope: Scope::Global, merge: MergeRule::Intersection, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "RuleToml.tool", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "RuleToml.pattern", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
-    // 1.12 [sandbox] (9)
+    // 1.12 [sandbox] (10)
     FieldScope { path: "sandbox.cargo", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.cargo.mode", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.cargo.cargo_bin", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
@@ -396,6 +401,9 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // PL-97 E2: Ausführungspfad (`chain` | `legacy`); Profil-Ebene, ein nicht
     // vertrautes Projekt darf ihn nie setzen (`merge_sandbox`).
     FieldScope { path: "sandbox.execution", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
+    // PL-100 Phase 4 (B22, ADR 0002): Dauer einer Host-Arbeitsphase; Profil-
+    // Ebene, ein nicht vertrautes Projekt darf sie nie setzen (`merge_sandbox`).
+    FieldScope { path: "sandbox.host_lease_ttl_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
     // 1.13 [internal_models] (13)
     FieldScope { path: "internal_models.use_openrouter_defaults", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.session_title", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -502,7 +510,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "skills.inject_imported", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "skills.per_turn_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "skills.per_session_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
-    // [retention.<klasse>] (10 Klassen x 5 = 50) — Aufbewahrungsgrenzen. enabled/keep_newest:
+    // [retention.<klasse>] (12 Klassen x 5 = 60) — Aufbewahrungsgrenzen. enabled/keep_newest:
     // ein nicht vertrautes Projekt darf sie nicht setzen; max_*: Home/Profil setzen frei,
     // das Projekt darf nur senken (merge_retention). Pfade folgen harw_retention::CLASSES.
     FieldScope { path: "retention.tui_log.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -540,6 +548,16 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "retention.sentinel_export.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "retention.sentinel_export.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "retention.sentinel_export.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_verdicts.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_verdicts.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_verdicts.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_verdicts.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_verdicts.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_labels.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_labels.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_labels.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_labels.max_bytes", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "retention.dod_labels.max_files", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "retention.freeze_resolved.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "retention.freeze_resolved.keep_newest", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "retention.freeze_resolved.max_age_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
@@ -563,7 +581,7 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_206_entries() {
+    fn test_field_table_has_exactly_217_entries() {
         // Runde 5, Teil B: +1 für `host.sudo_session_minutes`.
         // Runde 5, Teil E: +1 für `internal_models.auto_classifier`.
         // Runde 5, Teil G: +5 für `uia_worker_models.*`.
@@ -589,7 +607,10 @@ mod merge_rule_tests {
         // PL-97 R1: +1 für `tui.reasoning`.
         // PL-97 E3: +2 für `jobs.cgroup_root`, `jobs.trampoline`.
         // Interface localization: +1 for `tui.language`.
-        assert_eq!(FIELD_TABLE.len(), 206);
+        // PL-100 Phase 4: +1 für `sandbox.host_lease_ttl_secs`.
+        // PL-100 WP0.12: +10 für `retention.dod_verdicts.*`, `retention.dod_labels.*`
+        // (12 Klassen x 5 Schlüssel).
+        assert_eq!(FIELD_TABLE.len(), 217);
     }
 
     #[test]
@@ -618,7 +639,8 @@ mod merge_rule_tests {
         // PL-97 R1: +1 (`tui.reasoning`).
         // PL-97 E3: +2 (`jobs.cgroup_root`, `jobs.trampoline`).
         // Interface localization: +1 for `tui.language`.
-        assert_eq!(count(MergeRule::ProfileReplaces), 107);
+        // PL-100 Phase 4: +1 (`sandbox.host_lease_ttl_secs`).
+        assert_eq!(count(MergeRule::ProfileReplaces), 108);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

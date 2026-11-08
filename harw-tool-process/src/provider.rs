@@ -411,7 +411,10 @@ mod platform {
                    Select by 'names' (exact process names) and/or 'pids'; at least one of the \
                    two is required. Optional 'uid' only keeps processes of that user. PID 1, \
                    the agent's own process and its ancestors are never selected. Returns JSON \
-                   {targets:[{pid, ppid, uid, name, command}], count, truncated}. Use this \
+                   {targets:[{pid, ppid, uid, name, command, argc}], count, truncated}. 'name' \
+                   is the escaped executable name; 'command' is that name plus \
+                   '<redacted: N args>' (or the name alone without arguments) and never \
+                   contains argument values; 'argc' is the number of arguments. Use this \
                    before process.kill to confirm the targets. Linux only. Read-only.",
     permission = "execute_process",
     parallel_safe
@@ -589,6 +592,31 @@ mod tests {
         let tools = provider.tools();
         let names: Vec<&str> = tools.iter().map(harw_tools::ToolSpec::name).collect();
         assert_eq!(names, PROCESS_TOOL_NAMES.to_vec());
+    }
+
+    // PL-100 Phase 4: die Beschreibung nennt die maskierte Form von
+    // `command` und das Feld `argc` (siehe `harw_killer::TargetInfo`).
+    #[test]
+    fn test_process_list_description_documents_redacted_command_and_argc() -> TestResult {
+        let provider = ProcessToolProvider::new();
+        let tools = provider.tools();
+        let description = tools
+            .iter()
+            .find(|spec| spec.name() == "process.list")
+            .map(|spec| match spec {
+                harw_tools::ToolSpec::Function(function) => function.description.as_str(),
+            })
+            .ok_or(TestError::Missing("process.list spec"))?;
+        assert!(
+            description.contains("{pid, ppid, uid, name, command, argc}"),
+            "{description}"
+        );
+        assert!(description.contains("<redacted: N args>"), "{description}");
+        assert!(
+            description.contains("never contains argument values"),
+            "{description}"
+        );
+        Ok(())
     }
 
     #[test]

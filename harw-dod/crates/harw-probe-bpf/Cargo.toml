@@ -50,8 +50,19 @@ harw-completions = { path = "../../../harw-completions", features = ["clap-args"
 # Sicherer `SOCK_SEQPACKET`-Unix-Socket ohne `unsafe` (`net`-Feature) — dieselbe
 # Fassung, die `harw-sentinel::ipc` für die Empfangsseite dieses exakten
 # Sockets nutzt und `harw-probe-fs::sink` für die Sendeseite ihres eigenen
-# Sockets zum selben Sentinel.
-rustix = { workspace = true, features = ["net"] }
+# Sockets zum selben Sentinel. `fs`: `openat`/`fstat` mit `O_NOFOLLOW` für die
+# Deskriptorkette, über die `src/bpf_manifest.rs` das BPF-Manifest öffnet —
+# dieselbe Bauweise wie `harw-dod-config` für `/etc/harw-dod/config.toml`.
+rustix = { workspace = true, features = ["net", "fs"] }
+# Laufzeitprüfung der BPF-Objekte gegen das Build-Manifest (PL-100 Phase 4,
+# THREAT-MODEL B23). `harw-dod/bpf/scripts/write-manifest.sh` schreibt die
+# Digests mit `sha256sum`, deshalb SHA-256 und nicht BLAKE3. Dieselbe Fassung
+# wie `harw-install`, `harw-secrets` und `harw-oauth` (bereits in Cargo.lock).
+sha2 = "0.11.0"
+# Das Manifest ist trotz der Endung `.json` TOML; `serde` (Derive aus dem
+# Workspace) erzwingt seine Schema-1-Grammatik mit `deny_unknown_fields`.
+toml = { workspace = true }
+serde = { workspace = true }
 # Sichere Landlock-Bindung. **Nicht** über `[workspace.dependencies]`
 # verfügbar (dort bislang ungenutzt); direkte Versionsangabe wie bei den
 # anderen Einzel-/Mehrfachkonsumenten dieser Crate im Workspace (z. B.

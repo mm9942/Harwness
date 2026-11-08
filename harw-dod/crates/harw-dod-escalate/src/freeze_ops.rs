@@ -1,12 +1,22 @@
 //! Verdrahtung zwischen der Eskalationsleiter und der [`FreezeStore`]-
-//! Persistenz: [`authorize_freeze`], [`authorize_release`],
+//! Persistenz: [`authorize_freeze`], [`authorize_thaw`],
 //! [`authorize_stage_gated`], [`reconcile_expired_freezes`].
+//!
+//! # Unsignierte Freigaben (PL-100 WP 3.0)
+//! Jede Funktion hier liefert ein `Action<Authorized>`, also den
+//! **unsignierten** [`crate::action::AuthorizedAction`] — keinen
+//! Wire-Auftrag, keinen Beleg, keinen MAC. Signieren ist Sache von
+//! `harw-escalator` (WP 3.2); siehe `action`-Moduldoku, Abschnitt „Diese
+//! Crate signiert nichts". `authorize_thaw` ersetzt das frühere
+//! `authorize_release`: die stillgelegte Aktion `ReleaseCgroup` hob Freeze
+//! und Isolation gemeinsam auf, `ThawCgroup` hebt nur den Freeze auf — genau
+//! das, was der [`FreezeStore`]-Datensatz festhält.
 //!
 //! # Autorisierung vor Zustand
 //! **[`FreezeStore`] ist Zustand, kein Audit-Log:** er hält fest, ob ein
 //! Freeze noch in Kraft ist (siehe Moduldoku von
 //! `harw-session-store/src/freeze.rs`). [`authorize_freeze`] und
-//! [`authorize_release`] führen deshalb **zuerst** die nebenwirkungsfreien
+//! [`authorize_thaw`] führen deshalb **zuerst** die nebenwirkungsfreien
 //! Prüfungen aus — [`crate::ladder::Ladder::stage_for`], dann
 //! [`crate::action::Action::authorize`]; keine der beiden berührt das
 //! Dateisystem. Erst wenn beide gelingen, wird [`FreezeStore::freeze`] bzw.
@@ -19,15 +29,18 @@
 //! inhaltsfreie `Err` gemeldet; sie durabel zu protokollieren ist Sache des
 //! Aufrufers. Scheitert der Store-Schreibvorgang nach erfolgreicher
 //! Autorisierung, wird die autorisierte Aktion verworfen, nicht
-//! zurückgegeben (fail closed: keine Anforderung ohne Datensatz).
-//! `authorize_stage_gated` (für `IsolateNetwork`/`KillProcessTree`) hat
-//! keinen `FreezeStore`-Bezug.
+//! zurückgegeben (fail closed: keine Freigabe ohne Datensatz).
+//! `authorize_stage_gated` (für `IsolateNetwork`/`LiftIsolation`/
+//! `KillProcessTree`) hat keinen `FreezeStore`-Bezug und lehnt deshalb
+//! `FreezeCgroup` und `ThawCgroup` ab
+//! ([`EscalateError::NotAStageGatedAction`]): eine Freigabe dieser beiden
+//! Aktionen ohne Datensatz ließe Ledger und Warden auseinanderlaufen.
 //!
 //! # Rekonziliationsdisziplin beim Start
 //! [`reconcile_expired_freezes`] ist die von
 //! `harw-session-store/src/freeze.rs`-Moduldoku (Abschnitt „Expiry")
 //! angekündigte freie Funktion: sie wird **nicht** automatisch aus
-//! [`authorize_freeze`]/[`authorize_release`] aufgerufen — genau wie
+//! [`authorize_freeze`]/[`authorize_thaw`] aufgerufen — genau wie
 //! `ChildLeaseStore::claim_expired` ein separater, vom Aufrufer beim Start
 //! auszulösender Schritt ist, nicht ein Hook innerhalb `admit`/`complete`.
 //! **Der Aufrufer dieser Crate muss `reconcile_expired_freezes` einmal, vor
@@ -39,7 +52,7 @@
 //! hebt es auf.
 
 use harw_dod_rules::{Finding, Triaged};
-use harw_dod_warden_proto::ProposedAction;
+use harw_dod_warden_types::ProposedAction;
 use harw_session_store::{Freeze, FreezeResolution, FreezeStore};
 use harw_types::ApprovalActor;
 use jiff::Timestamp;
@@ -74,9 +87,12 @@ use crate::ladder::Ladder;
 /// use harw_session_store::FreezeStore;
 /// use jiff::Timestamp;
 ///
-/// let temp = tempfile::tempdir().unwrap();
+/// let Ok(temp) = tempfile::tempdir() else { return };
 /// let store = FreezeStore::new(temp.path());
-/// let expired = reconcile_expired_freezes(&store, Timestamp::now()).unwrap();
+/// // `now` wird injiziert, nie von der Systemuhr gelesen.
+/// let Ok(expired) = reconcile_expired_freezes(&store, Timestamp::UNIX_EPOCH) else {
+///     return;
+/// };
 /// assert!(expired.is_empty());
 /// ```
 pub fn reconcile_expired_freezes(
@@ -104,10 +120,11 @@ pub fn reconcile_expired_freezes(
 ///   sein.
 /// - `authorized_by` (`ApprovalActor`): wer autorisiert.
 /// - `now` (`jiff::Timestamp`): sowohl `frozen_at` für den Freeze-Datensatz
-///   als auch `authorized_at` für den Beleg — injiziert, nie gelesen.
+///   als auch `authorized_at` der Freigabe — injiziert, nie gelesen.
 ///
 /// # Returns
-/// Das autorisierte, versandbereite `Action<Authorized>`.
+/// Das autorisierte `Action<Authorized>` mit dem unsignierten
+/// [`crate::action::AuthorizedAction`] (signiert wird erst im Escalator).
 ///
 /// # Errors
 /// - [`EscalateError::NotAFreezeAction`]: `proposed` ist keine
@@ -122,24 +139,27 @@ pub fn reconcile_expired_freezes(
 ///
 /// # Examples
 /// ```rust,no_run
-/// use harw_dod_escalate::{authorize_freeze, Action};
+/// use harw_dod_escalate::{authorize_freeze, Action, EscalateResult};
 /// use harw_dod_rules::{Finding, Triaged};
-/// use harw_dod_warden_proto::ProposedAction;
+/// use harw_dod_warden_types::ProposedAction;
 /// use harw_session_store::FreezeStore;
 /// use harw_types::{ApprovalActor, CgroupId};
 /// use jiff::Timestamp;
 ///
-/// fn run(store: &FreezeStore, finding: &Finding<Triaged>) {
-///     let proposed = Action::propose(ProposedAction::FreezeCgroup {
-///         cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
-///     });
-///     let _ = authorize_freeze(
+/// fn run(store: &FreezeStore, finding: &Finding<Triaged>, cgroup: CgroupId) -> EscalateResult<()> {
+///     let proposed = Action::propose(ProposedAction::FreezeCgroup { cgroup });
+///     let authorized = authorize_freeze(
 ///         store,
 ///         finding,
 ///         proposed,
 ///         ApprovalActor::Operator { id: "operator-1".to_string() },
-///         Timestamp::now(),
-///     );
+///         Timestamp::UNIX_EPOCH,
+///     )?;
+///     assert!(matches!(
+///         authorized.body().action(),
+///         harw_dod_warden_types::WardenAction::FreezeCgroup { .. }
+///     ));
+///     Ok(())
 /// }
 /// ```
 pub fn authorize_freeze(
@@ -167,34 +187,36 @@ pub fn authorize_freeze(
     Ok(action)
 }
 
-/// Autorisiert eine `ReleaseCgroup`-Aktion und löst erst danach den
+/// Autorisiert eine `ThawCgroup`-Aktion und löst erst danach den
 /// zugehörigen Freeze durabel auf.
 ///
 /// # Description
-/// Siehe Moduldoku, Abschnitt „Autorisierung vor Zustand":
-/// [`crate::ladder::Ladder::stage_for`], dann
+/// Nachfolger von `authorize_release` (PL-100 WP 3.0; die Aktion
+/// `ReleaseCgroup` ist seit WP 3.1 stillgelegt). Siehe Moduldoku, Abschnitt
+/// „Autorisierung vor Zustand": [`crate::ladder::Ladder::stage_for`], dann
 /// [`crate::action::Action::authorize`], und erst **danach**
-/// [`FreezeStore::resolve`].
+/// [`FreezeStore::resolve`]. Hebt nur den Freeze auf, nie eine
+/// Netzisolation (dafür `LiftIsolation` über [`authorize_stage_gated`]).
 ///
 /// # Arguments
 /// - `freeze_store` (`&FreezeStore`): wo der aufzulösende Freeze liegt.
 /// - `finding` (`&Finding<Triaged>`): der auslösende, bereits triagierte
 ///   Befund.
-/// - `proposed` (`Action<Proposed>`): muss `ProposedAction::ReleaseCgroup`
+/// - `proposed` (`Action<Proposed>`): muss `ProposedAction::ThawCgroup`
 ///   sein.
 /// - `authorized_by` (`ApprovalActor`): wer autorisiert.
 /// - `frozen_at` (`jiff::Timestamp`): der ursprüngliche Freeze-Zeitpunkt —
 ///   Teil des `FreezeStore`-Schlüssels.
 /// - `now` (`jiff::Timestamp`): sowohl `resolved_at` für die Auflösung als
-///   auch `authorized_at` für den Beleg.
+///   auch `authorized_at` der Freigabe.
 ///
 /// # Returns
-/// Das autorisierte `Action<Authorized>` zusammen mit der durabel
-/// geschriebenen [`FreezeResolution`].
+/// Das autorisierte `Action<Authorized>` (unsigniert) zusammen mit der
+/// durabel geschriebenen [`FreezeResolution`].
 ///
 /// # Errors
-/// - [`EscalateError::NotAReleaseAction`]: `proposed` ist keine
-///   `ReleaseCgroup`-Variante.
+/// - [`EscalateError::NotAThawAction`]: `proposed` ist keine
+///   `ThawCgroup`-Variante (auch nicht das stillgelegte `ReleaseCgroup`).
 /// - [`EscalateError::NotEscalatable`]: der Befund rechtfertigt keine Stufe;
 ///   der Freeze bleibt aktiv.
 /// - Alles, was [`crate::action::Action::authorize`] zurückgeben kann; der
@@ -203,7 +225,36 @@ pub fn authorize_freeze(
 ///   (`FreezeNotFound`), der Freeze ist bereits aufgelöst
 ///   (`FreezeAlreadyResolved`), oder der `FreezeStore`-Zugriff ist
 ///   fehlgeschlagen; die bereits autorisierte Aktion wird verworfen.
-pub fn authorize_release(
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_dod_escalate::{authorize_thaw, Action, EscalateResult};
+/// use harw_dod_rules::{Finding, Triaged};
+/// use harw_dod_warden_types::ProposedAction;
+/// use harw_session_store::FreezeStore;
+/// use harw_types::{ApprovalActor, CgroupId};
+/// use jiff::Timestamp;
+///
+/// fn run(
+///     store: &FreezeStore,
+///     finding: &Finding<Triaged>,
+///     cgroup: CgroupId,
+///     frozen_at: Timestamp,
+/// ) -> EscalateResult<()> {
+///     let proposed = Action::propose(ProposedAction::ThawCgroup { cgroup });
+///     let (_authorized, resolution) = authorize_thaw(
+///         store,
+///         finding,
+///         proposed,
+///         ApprovalActor::Operator { id: "operator-1".to_string() },
+///         frozen_at,
+///         Timestamp::UNIX_EPOCH,
+///     )?;
+///     assert_eq!(resolution.freeze.frozen_at, frozen_at);
+///     Ok(())
+/// }
+/// ```
+pub fn authorize_thaw(
     freeze_store: &FreezeStore,
     finding: &Finding<Triaged>,
     proposed: Action<Proposed>,
@@ -212,8 +263,8 @@ pub fn authorize_release(
     now: Timestamp,
 ) -> EscalateResult<(Action<Authorized>, FreezeResolution)> {
     let cgroup = match proposed.proposed() {
-        ProposedAction::ReleaseCgroup { cgroup } => cgroup.clone(),
-        _ => return Err(EscalateError::NotAReleaseAction),
+        ProposedAction::ThawCgroup { cgroup } => cgroup.clone(),
+        _ => return Err(EscalateError::NotAThawAction),
     };
 
     let stage = Ladder::stage_for(finding).ok_or(EscalateError::NotEscalatable)?;
@@ -225,36 +276,53 @@ pub fn authorize_release(
 }
 
 /// Autorisiert eine stufengebundene Aktion ohne `FreezeStore`-Bezug
-/// (`IsolateNetwork`, `KillProcessTree`).
+/// (`IsolateNetwork`, `LiftIsolation`, `KillProcessTree`).
 ///
 /// # Description
-/// Kein Zustand zu schreiben — diese beiden Aktionen haben keinen Bezug zu
+/// Kein Zustand zu schreiben — diese Aktionen haben keinen Bezug zu
 /// [`FreezeStore`] (siehe Moduldoku, Abschnitt „Autorisierung vor
-/// Zustand"). Reiner Aufruf von [`crate::ladder::Ladder::stage_for`]
-/// gefolgt von [`crate::action::Action::authorize`].
+/// Zustand"). `FreezeCgroup` und `ThawCgroup` verändern dagegen den
+/// Freeze-Datensatz: sie werden **vor** jeder Stufenprüfung abgelehnt und
+/// laufen nur über [`authorize_freeze`] bzw. [`authorize_thaw`] („keine
+/// Freigabe ohne Datensatz"). Sonst Aufruf von
+/// [`crate::ladder::Ladder::stage_for`] gefolgt von
+/// [`crate::action::Action::authorize`]. Die Bestätigung „nicht
+/// umkehrbar" (O4) für Kill und Isolation ist nicht Teil dieser unsignierten
+/// Freigabe; sie gehört in den signierten v2-Auftrag des Escalators.
 ///
 /// # Arguments
 /// - `finding` (`&Finding<Triaged>`): der auslösende, bereits triagierte
 ///   Befund.
 /// - `proposed` (`Action<Proposed>`): die vorgeschlagene Aktion.
 /// - `authorized_by` (`ApprovalActor`): wer autorisiert.
-/// - `now` (`jiff::Timestamp`): `authorized_at` für den Beleg.
+/// - `now` (`jiff::Timestamp`): `authorized_at` der Freigabe.
 ///
 /// # Returns
-/// Das autorisierte `Action<Authorized>`.
+/// Das autorisierte `Action<Authorized>` (unsigniert).
 ///
 /// # Errors
+/// - [`EscalateError::NotAStageGatedAction`]: `proposed` ist
+///   `FreezeCgroup` oder `ThawCgroup` (dafür [`authorize_freeze`] bzw.
+///   [`authorize_thaw`]); geprüft vor der Stufe, unabhängig vom Befund.
 /// - [`EscalateError::NotEscalatable`]: der Befund rechtfertigt keine Stufe.
 /// - Alles, was [`crate::action::Action::authorize`] zurückgeben kann —
 ///   insbesondere [`EscalateError::NotAdmissibleAtStage`], wenn `proposed`
-///   `IsolateNetwork`/`KillProcessTree` ist und die ermittelte Stufe nur
-///   `RuleTriggered` erreicht.
+///   `IsolateNetwork`/`LiftIsolation`/`KillProcessTree` ist und die
+///   ermittelte Stufe nur `RuleTriggered` erreicht, und
+///   [`EscalateError::RetiredAction`] für das stillgelegte `ReleaseCgroup`.
 pub fn authorize_stage_gated(
     finding: &Finding<Triaged>,
     proposed: Action<Proposed>,
     authorized_by: ApprovalActor,
     now: Timestamp,
 ) -> EscalateResult<Action<Authorized>> {
+    // Freeze und Thaw nur mit FreezeStore-Datensatz (siehe Moduldoku).
+    if matches!(
+        proposed.proposed(),
+        ProposedAction::FreezeCgroup { .. } | ProposedAction::ThawCgroup { .. }
+    ) {
+        return Err(EscalateError::NotAStageGatedAction);
+    }
     let stage = Ladder::stage_for(finding).ok_or(EscalateError::NotEscalatable)?;
     proposed.authorize(finding, stage, authorized_by, now)
 }
@@ -265,7 +333,7 @@ mod tests {
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_rules::{FindingKind, Verdict, triaged_finding_for_test};
     use harw_dod_signals::{Hardness, Severity};
-    use harw_dod_warden_proto::EscalationStage;
+    use harw_dod_warden_types::{EscalationStage, WardenAction};
     use harw_types::{CgroupId, FindingId};
 
     // `Severity::Critical` wird derzeit von keiner echten Regel erzeugt
@@ -297,12 +365,28 @@ mod tests {
         }
     }
 
+    /// Prüft, dass der unsignierte Freigabeinhalt genau `expected` für genau
+    /// diesen Befund trägt (Ersatz für die frühere v1-Belegprüfung
+    /// `proof.verify(..)`; signiert wird erst im Escalator).
+    fn assert_body_binds(
+        authorized: &Action<Authorized>,
+        finding: &Finding<Triaged>,
+        expected: &WardenAction,
+        stage: EscalationStage,
+    ) {
+        let body = authorized.body();
+        assert_eq!(body.finding_id(), finding.id());
+        assert_eq!(body.action(), expected);
+        assert_eq!(body.stage(), stage);
+        assert_eq!(body.approver(), &actor());
+    }
+
     #[test]
     fn test_authorize_freeze_rejects_non_freeze_action() -> TestResult {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
         let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
-        let proposed = Action::propose(ProposedAction::ReleaseCgroup {
+        let proposed = Action::propose(ProposedAction::ThawCgroup {
             cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
         });
 
@@ -320,8 +404,9 @@ mod tests {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
         let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
         let proposed = Action::propose(ProposedAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
+            cgroup: cgroup.clone(),
         });
 
         let authorized =
@@ -329,12 +414,11 @@ mod tests {
                 .map_err(ctx("confirmed, rule-triggered finding authorizes a freeze"))?;
 
         assert_eq!(store.active().map_err(ctx("active"))?.len(), 1);
-        assert!(
-            authorized
-                .request()
-                .proof
-                .verify(finding.id(), &authorized.request().action)
-                .is_ok()
+        assert_body_binds(
+            &authorized,
+            &finding,
+            &WardenAction::FreezeCgroup { cgroup },
+            EscalationStage::RuleTriggered,
         );
         Ok(())
     }
@@ -379,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn test_authorize_release_rejects_non_release_action() -> TestResult {
+    fn test_authorize_thaw_rejects_non_thaw_action() -> TestResult {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
         let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
@@ -387,7 +471,7 @@ mod tests {
             cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
         });
 
-        let Err(err) = authorize_release(
+        let Err(err) = authorize_thaw(
             &store,
             &finding,
             proposed,
@@ -397,12 +481,47 @@ mod tests {
         ) else {
             return Err(TestError::Unexpected("Err erwartet".to_owned()));
         };
-        assert!(matches!(err, EscalateError::NotAReleaseAction));
+        assert!(matches!(err, EscalateError::NotAThawAction));
+        Ok(())
+    }
+
+    /// Ablehnungstest für die stillgelegte v1-Variante: `ReleaseCgroup` ist
+    /// kein Thaw. Der aktive Freeze bleibt unberührt.
+    #[test]
+    fn test_authorize_thaw_refuses_the_retired_release_action() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = FreezeStore::new(temp.path());
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
+        let finding = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
+        let record = Freeze {
+            cgroup: cgroup.clone(),
+            finding: finding.id().clone(),
+            frozen_at: Timestamp::UNIX_EPOCH,
+            expires_at: None,
+        };
+        store.freeze(&record).map_err(ctx("freeze"))?;
+        // `ReleaseCgroup` ist seit PL-100 WP 3.1 `#[deprecated]`; dieser Test
+        // nennt die Variante nur, um ihre Ablehnung zu prüfen.
+        #[allow(deprecated)]
+        let retired = ProposedAction::ReleaseCgroup { cgroup };
+
+        let Err(err) = authorize_thaw(
+            &store,
+            &finding,
+            Action::propose(retired),
+            actor(),
+            Timestamp::UNIX_EPOCH,
+            Timestamp::UNIX_EPOCH,
+        ) else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
+        assert!(matches!(err, EscalateError::NotAThawAction));
+        assert_eq!(store.active().map_err(ctx("active"))?, vec![record]);
         Ok(())
     }
 
     #[test]
-    fn test_authorize_release_resolves_an_active_freeze_and_authorizes() -> TestResult {
+    fn test_authorize_thaw_resolves_an_active_freeze_and_authorizes() -> TestResult {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
         let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
@@ -416,8 +535,10 @@ mod tests {
             })
             .map_err(ctx("freeze"))?;
 
-        let proposed = Action::propose(ProposedAction::ReleaseCgroup { cgroup });
-        let (authorized, resolution) = authorize_release(
+        let proposed = Action::propose(ProposedAction::ThawCgroup {
+            cgroup: cgroup.clone(),
+        });
+        let (authorized, resolution) = authorize_thaw(
             &store,
             &finding,
             proposed,
@@ -425,25 +546,24 @@ mod tests {
             Timestamp::UNIX_EPOCH,
             Timestamp::UNIX_EPOCH,
         )
-        .map_err(ctx("an active freeze resolves and the release authorizes"))?;
+        .map_err(ctx("an active freeze resolves and the thaw authorizes"))?;
 
         assert!(store.active().map_err(ctx("active"))?.is_empty());
         assert_eq!(resolution.freeze.finding, *finding.id());
-        assert!(
-            authorized
-                .request()
-                .proof
-                .verify(finding.id(), &authorized.request().action)
-                .is_ok()
+        assert_body_binds(
+            &authorized,
+            &finding,
+            &WardenAction::ThawCgroup { cgroup },
+            EscalationStage::RuleTriggered,
         );
         Ok(())
     }
 
-    /// Autorisierung vor Zustand: eine abgelehnte Freigabe schreibt keinen
-    /// `Lifted`-Datensatz — der Freeze bleibt aktiv, und eine bestätigte
-    /// Folgefreigabe für denselben Schlüssel gelingt.
+    /// Autorisierung vor Zustand: ein abgelehnter Thaw schreibt keinen
+    /// `Lifted`-Datensatz — der Freeze bleibt aktiv, und ein bestätigter
+    /// Folge-Thaw für denselben Schlüssel gelingt.
     #[test]
-    fn test_a_refused_release_keeps_the_freeze_active() -> TestResult {
+    fn test_a_refused_thaw_keeps_the_freeze_active() -> TestResult {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
         let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
@@ -460,10 +580,10 @@ mod tests {
         };
         store.freeze(&record).map_err(ctx("freeze"))?;
 
-        let proposed = Action::propose(ProposedAction::ReleaseCgroup {
+        let proposed = Action::propose(ProposedAction::ThawCgroup {
             cgroup: cgroup.clone(),
         });
-        let Err(err) = authorize_release(
+        let Err(err) = authorize_thaw(
             &store,
             &refused,
             proposed,
@@ -479,8 +599,8 @@ mod tests {
         // Gleicher Schlüssel: ein vorzeitig geschriebener `Lifted`-Datensatz
         // ließe diesen Aufruf mit `FreezeAlreadyResolved` scheitern.
         let confirmed = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
-        let proposed = Action::propose(ProposedAction::ReleaseCgroup { cgroup });
-        let _released = authorize_release(
+        let proposed = Action::propose(ProposedAction::ThawCgroup { cgroup });
+        let _thawed = authorize_thaw(
             &store,
             &confirmed,
             proposed,
@@ -488,9 +608,7 @@ mod tests {
             Timestamp::UNIX_EPOCH,
             Timestamp::UNIX_EPOCH,
         )
-        .map_err(ctx(
-            "the still active freeze resolves on a confirmed release",
-        ))?;
+        .map_err(ctx("the still active freeze resolves on a confirmed thaw"))?;
         assert!(store.active().map_err(ctx("active"))?.is_empty());
         Ok(())
     }
@@ -498,7 +616,7 @@ mod tests {
     /// Wie oben, aber mit `NeedsReview`: auch ein Befund, der noch eine
     /// menschliche Prüfung braucht, lässt den Freeze aktiv.
     #[test]
-    fn test_a_release_for_needs_review_keeps_the_freeze_active() -> TestResult {
+    fn test_a_thaw_for_needs_review_keeps_the_freeze_active() -> TestResult {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
         let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
@@ -511,8 +629,8 @@ mod tests {
         };
         store.freeze(&record).map_err(ctx("freeze"))?;
 
-        let proposed = Action::propose(ProposedAction::ReleaseCgroup { cgroup });
-        let Err(err) = authorize_release(
+        let proposed = Action::propose(ProposedAction::ThawCgroup { cgroup });
+        let Err(err) = authorize_thaw(
             &store,
             &refused,
             proposed,
@@ -527,18 +645,18 @@ mod tests {
         Ok(())
     }
 
-    /// Eine bestätigte Freigabe ohne aktiven Freeze scheitert am Store; die
+    /// Ein bestätigter Thaw ohne aktiven Freeze scheitert am Store; die
     /// bereits autorisierte Aktion wird verworfen, nicht zurückgegeben.
     #[test]
-    fn test_authorize_release_without_active_freeze_is_a_store_error() -> TestResult {
+    fn test_authorize_thaw_without_active_freeze_is_a_store_error() -> TestResult {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
         let finding = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
-        let proposed = Action::propose(ProposedAction::ReleaseCgroup {
+        let proposed = Action::propose(ProposedAction::ThawCgroup {
             cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
         });
 
-        let Err(err) = authorize_release(
+        let Err(err) = authorize_thaw(
             &store,
             &finding,
             proposed,
@@ -575,21 +693,211 @@ mod tests {
             Ladder::stage_for(&finding),
             Some(EscalationStage::Escalated)
         );
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
         let proposed = Action::propose(ProposedAction::KillProcessTree {
-            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
+            cgroup: cgroup.clone(),
         });
 
         let authorized = authorize_stage_gated(&finding, proposed, actor(), Timestamp::UNIX_EPOCH)
             .map_err(ctx(
                 "critical + observed reaches Escalated, which admits KillProcessTree",
             ))?;
-        assert!(
-            authorized
-                .request()
-                .proof
-                .verify(finding.id(), &authorized.request().action)
-                .is_ok()
+        assert_body_binds(
+            &authorized,
+            &finding,
+            &WardenAction::KillProcessTree { cgroup },
+            EscalationStage::Escalated,
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_authorize_stage_gated_admits_lift_isolation_only_when_escalated() -> TestResult {
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
+
+        let rule_triggered = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
+        let Err(err) = authorize_stage_gated(
+            &rule_triggered,
+            Action::propose(ProposedAction::LiftIsolation {
+                cgroup: cgroup.clone(),
+            }),
+            actor(),
+            Timestamp::UNIX_EPOCH,
+        ) else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
+        assert!(matches!(err, EscalateError::NotAdmissibleAtStage));
+
+        let escalated = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
+        let authorized = authorize_stage_gated(
+            &escalated,
+            Action::propose(ProposedAction::LiftIsolation {
+                cgroup: cgroup.clone(),
+            }),
+            actor(),
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("critical + observed admits LiftIsolation"))?;
+        assert_body_binds(
+            &authorized,
+            &escalated,
+            &WardenAction::LiftIsolation { cgroup },
+            EscalationStage::Escalated,
+        );
+        Ok(())
+    }
+
+    /// Keine Freigabe ohne Datensatz: der Weg ohne `FreezeStore` lehnt
+    /// `FreezeCgroup` ab, auch für einen bestätigten, eskalierten Befund.
+    /// Derselbe Vorschlag für denselben Befund autorisiert über
+    /// [`authorize_freeze`] und schreibt dort den Datensatz — die Ablehnung
+    /// liegt am Weg, nicht am Befund.
+    #[test]
+    fn test_authorize_stage_gated_refuses_freeze() -> TestResult {
+        let finding = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
+
+        let Err(err) = authorize_stage_gated(
+            &finding,
+            Action::propose(ProposedAction::FreezeCgroup {
+                cgroup: cgroup.clone(),
+            }),
+            actor(),
+            Timestamp::UNIX_EPOCH,
+        ) else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
+        assert!(matches!(err, EscalateError::NotAStageGatedAction));
+
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = FreezeStore::new(temp.path());
+        let authorized = authorize_freeze(
+            &store,
+            &finding,
+            Action::propose(ProposedAction::FreezeCgroup {
+                cgroup: cgroup.clone(),
+            }),
+            actor(),
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("the same proposal authorizes through authorize_freeze"))?;
+        assert_eq!(store.active().map_err(ctx("active"))?.len(), 1);
+        assert_body_binds(
+            &authorized,
+            &finding,
+            &WardenAction::FreezeCgroup { cgroup },
+            EscalationStage::Escalated,
+        );
+        Ok(())
+    }
+
+    /// Keine Freigabe ohne Datensatz: ein Thaw am `FreezeStore` vorbei würde
+    /// den Freeze dort aktiv lassen, während der Warden ihn aufhebt. Der Weg
+    /// ohne Store lehnt `ThawCgroup` deshalb ab; derselbe Vorschlag löst den
+    /// aktiven Datensatz über [`authorize_thaw`] auf und autorisiert dort.
+    #[test]
+    fn test_authorize_stage_gated_refuses_thaw() -> TestResult {
+        let finding = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
+
+        let Err(err) = authorize_stage_gated(
+            &finding,
+            Action::propose(ProposedAction::ThawCgroup {
+                cgroup: cgroup.clone(),
+            }),
+            actor(),
+            Timestamp::UNIX_EPOCH,
+        ) else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
+        assert!(matches!(err, EscalateError::NotAStageGatedAction));
+
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = FreezeStore::new(temp.path());
+        store
+            .freeze(&Freeze {
+                cgroup: cgroup.clone(),
+                finding: finding.id().clone(),
+                frozen_at: Timestamp::UNIX_EPOCH,
+                expires_at: None,
+            })
+            .map_err(ctx("freeze"))?;
+        let (authorized, resolution) = authorize_thaw(
+            &store,
+            &finding,
+            Action::propose(ProposedAction::ThawCgroup {
+                cgroup: cgroup.clone(),
+            }),
+            actor(),
+            Timestamp::UNIX_EPOCH,
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("the same proposal authorizes through authorize_thaw"))?;
+        assert!(store.active().map_err(ctx("active"))?.is_empty());
+        assert_eq!(resolution.freeze.finding, *finding.id());
+        assert_body_binds(
+            &authorized,
+            &finding,
+            &WardenAction::ThawCgroup { cgroup },
+            EscalationStage::Escalated,
+        );
+        Ok(())
+    }
+
+    /// Die Ablehnung von Freeze und Thaw hängt nicht am Befund: auch ein
+    /// Befund ohne Stufe (`FalsePositive`) bekommt für **beide** Varianten
+    /// `NotAStageGatedAction`, nicht `NotEscalatable`.
+    #[test]
+    fn test_authorize_stage_gated_refuses_freeze_and_thaw_before_the_stage_check() -> TestResult {
+        let finding = finding_with(Severity::High, Hardness::Observed, Verdict::FalsePositive)?;
+        assert_eq!(Ladder::stage_for(&finding), None);
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
+
+        for proposed in [
+            ProposedAction::FreezeCgroup {
+                cgroup: cgroup.clone(),
+            },
+            ProposedAction::ThawCgroup {
+                cgroup: cgroup.clone(),
+            },
+        ] {
+            let Err(err) = authorize_stage_gated(
+                &finding,
+                Action::propose(proposed),
+                actor(),
+                Timestamp::UNIX_EPOCH,
+            ) else {
+                return Err(TestError::Unexpected("Err erwartet".to_owned()));
+            };
+            assert!(
+                matches!(err, EscalateError::NotAStageGatedAction),
+                "Freeze/Thaw wird vor der Stufenprüfung abgelehnt"
+            );
+        }
+        Ok(())
+    }
+
+    /// Ablehnungstest für die stillgelegte v1-Variante: auch der Weg ohne
+    /// `FreezeStore` autorisiert `ReleaseCgroup` nie.
+    #[test]
+    fn test_authorize_stage_gated_refuses_the_retired_release_action() -> TestResult {
+        let finding = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
+        // `ReleaseCgroup` ist seit PL-100 WP 3.1 `#[deprecated]`; dieser Test
+        // nennt die Variante nur, um ihre Ablehnung zu prüfen.
+        #[allow(deprecated)]
+        let retired = ProposedAction::ReleaseCgroup {
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
+        };
+
+        let Err(err) = authorize_stage_gated(
+            &finding,
+            Action::propose(retired),
+            actor(),
+            Timestamp::UNIX_EPOCH,
+        ) else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
+        assert!(matches!(err, EscalateError::RetiredAction));
         Ok(())
     }
 

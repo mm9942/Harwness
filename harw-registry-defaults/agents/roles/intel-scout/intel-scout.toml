@@ -53,3 +53,17 @@ max_depth = 0
 max_tokens = 40000
 max_tool_calls = 20
 max_wall_secs = 120
+
+# Rückgabevertrag (PL-100 O11) — selbst deklariert, nicht geerbt: die
+# Familien-`[defaults] return_contract` ist eine Notiz ohne Verbraucher (siehe
+# `agents/families/security/security.toml`). `ChildReturnContract::parse`
+# nimmt jedes Label aus `ir_v2::ReturnContract::ALL` an; gewählt ist der
+# validierte Envelope für read-only Kinder (`ChildReturnContract::ReturnEnvelope`,
+# zusätzlich begrenzt durch `harw_research::sanitize_for_parent`). Das
+# Korrelationsergebnis (betroffene Pakete, Advisory-IDs, `outcome`) speist so
+# die DoD-Triage als geprüfter Envelope. Ein Verdikt gibt diese Rolle NICHT
+# ab: `harwness.security-verdict/v1` bleibt den vier `security-*-triage`-Rollen
+# vorbehalten, und die Mitgliedschaftsdatei verweigert ihr
+# `security.verdict.propose` (`families/security/members/intel-scout.toml`).
+[return]
+contract = "harwness.return.envelope@1"

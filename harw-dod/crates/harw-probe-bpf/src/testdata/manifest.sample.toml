@@ -1,0 +1,35 @@
+schema_version = 1
+wire_abi_version = 1
+bpf_target = "bpfel"
+host_arch = "x86_64"
+clang_version = "fixture clang version 18.1.3"
+bpftool_version = "fixture bpftool v7.4.0"
+vmlinux_btf_sha256 = "58f7f5a62cfd209f930ca374fc847623d0cc1f9dd499b83db4682d42b89ec95a"
+
+[[objects]]
+name = "exec.bpf.o"
+program = "dod_sched_process_exec"
+attach = "sched:sched_process_exec"
+sha256 = "2f5a37f26c75285e65194e4e36f0c5b66a04d61be475468b9c3ffb8ae1b64a6b"
+maps = ["EVENTS", "SCOPE_CGROUP_IDS", "LOSS_COUNTS", "SEQUENCE"]
+
+[[objects]]
+name = "exit.bpf.o"
+program = "dod_sched_process_exit"
+attach = "sched:sched_process_exit"
+sha256 = "6ff73325ad36382da0b8028ef542e67e96140b12489e7f7239ba84cfc8b7ee21"
+maps = ["EVENTS", "SCOPE_CGROUP_IDS", "LOSS_COUNTS", "SEQUENCE"]
+
+[[objects]]
+name = "tcp_v4_connect.bpf.o"
+program = "dod_tcp_v4_connect"
+attach = "tcp_v4_connect"
+sha256 = "5bcdc325d7c4723a08fdaf916d5569287c3c5df02b17dfa09a35fbf5c51ee774"
+maps = ["EVENTS", "SCOPE_CGROUP_IDS", "LOSS_COUNTS", "SEQUENCE"]
+
+[[objects]]
+name = "tcp_v6_connect.bpf.o"
+program = "dod_tcp_v6_connect"
+attach = "tcp_v6_connect"
+sha256 = "e2ccf16d5908bd574bdfd74be3ec9b9257c3c51dea4a56b08909de963322501d"
+maps = ["EVENTS", "SCOPE_CGROUP_IDS", "LOSS_COUNTS", "SEQUENCE"]
