@@ -1114,6 +1114,61 @@ fn read_meta(dir: &Path) -> Option<JobMeta> {
     serde_json::from_slice(&text).ok()
 }
 
+// Warnung beim Neuladen, wenn die Identität eines nicht beendeten Jobs einer
+// früheren Sitzung mit vermerkter PID nicht passt (PID wiederverwendet, keine
+// Startzeit): sie geht an den Besitzer. Eine nicht prüfbare Identität mit PID
+// wird nur geloggt; ohne PID kommt nichts.
+fn reload_identity_warning(meta: &JobMeta, liveness: &Liveness) -> Option<JobNotification> {
+    match (liveness, meta.pid) {
+        (Liveness::Mismatch(reason), Some(pid)) => {
+            // Closures carry no cognitive-complexity increment; the
+            // wording depends on whether an identity was recorded.
+            let message = meta.process_identity().map_or_else(
+                || format!("PID {pid} not controlled: {reason}"),
+                |_| format!("PID {pid} reused, not controlled: {reason}"),
+            );
+            warn!(job_id = %meta.job_id, pid, %reason, "previous job: identity mismatch");
+            Some(owner_warning(meta, message))
+        }
+        (Liveness::Unverifiable(reason), Some(pid)) => {
+            warn!(job_id = %meta.job_id, pid, %reason, "previous job: identity not verifiable");
+            None
+        }
+        _ => None,
+    }
+}
+
+// Hinweis beim Neuladen, wenn ein Job, dessen Prozess noch lebt (`next` ist
+// `Detached`), beim Ende der früheren Sitzung angehalten war; sonst `None`.
+fn reload_suspension_warning(meta: &JobMeta, next: JobState) -> Option<JobNotification> {
+    if next != JobState::Detached || meta.suspended_at.is_none() {
+        return None;
+    }
+    // Only a recorded effect is harw's own freeze; an intent
+    // (or a record without a phase) stays unresolved, and
+    // job.resume refuses it (fail closed).
+    let message = if meta.suspension_phase() == Some(SuspendPhase::Applied) {
+        info!(job_id = %meta.job_id, "previous job is still suspended (cgroup frozen)");
+        SUSPENDED_ON_RELOAD
+    } else {
+        warn!(job_id = %meta.job_id, "previous job has an unresolved suspension; job.resume stays refused");
+        SUSPENSION_UNRESOLVED_ON_RELOAD
+    };
+    Some(owner_warning(meta, message.to_owned()))
+}
+
+// Eine `JobEvent::Warning` zum Job `meta` an dessen Besitzer.
+fn owner_warning(meta: &JobMeta, message: String) -> JobNotification {
+    JobNotification {
+        owner: meta.owner.clone(),
+        event: JobEvent::Warning {
+            job_id: meta.job_id.clone(),
+            name: meta.name.clone(),
+            message,
+        },
+    }
+}
+
 /// Kleinste Obergrenze laufender Prozess-Jobs.
 pub const MIN_RUNNING_JOBS: usize = 1;
 /// Größte Obergrenze laufender Prozess-Jobs (wie `[jobs] max_running`).
@@ -1290,85 +1345,62 @@ impl JobManager {
         let mut warnings = Vec::new();
         for dir_entry in entries.flatten() {
             let dir = dir_entry.path();
-            let Some(mut meta) = read_meta(&dir) else {
+            let Some(meta) = self.reload_entry(&dir, &mut warnings) else {
                 continue;
             };
-            let dir_name = dir.file_name().and_then(|name| name.to_str());
-            if dir_name != Some(meta.job_id.as_str()) {
-                warn!(dir = %dir.display(), "job meta.json does not match its directory; skipped");
-                continue;
-            }
-            if !meta.state.is_terminal() {
-                let liveness = (self.liveness)(&meta);
-                let next = if liveness == Liveness::Alive {
-                    JobState::Detached
-                } else {
-                    JobState::Unknown
-                };
-                match (&liveness, meta.pid) {
-                    (Liveness::Mismatch(reason), Some(pid)) => {
-                        // Closures carry no cognitive-complexity increment; the
-                        // wording depends on whether an identity was recorded.
-                        let message = meta.process_identity().map_or_else(
-                            || format!("PID {pid} not controlled: {reason}"),
-                            |_| format!("PID {pid} reused, not controlled: {reason}"),
-                        );
-                        warn!(job_id = %meta.job_id, pid, %reason, "previous job: identity mismatch");
-                        warnings.push(JobNotification {
-                            owner: meta.owner.clone(),
-                            event: JobEvent::Warning {
-                                job_id: meta.job_id.clone(),
-                                name: meta.name.clone(),
-                                message,
-                            },
-                        });
-                    }
-                    (Liveness::Unverifiable(reason), Some(pid)) => {
-                        warn!(job_id = %meta.job_id, pid, %reason, "previous job: identity not verifiable");
-                    }
-                    _ => {}
-                }
-                if next == JobState::Detached && meta.suspended_at.is_some() {
-                    // Only a recorded effect is harw's own freeze; an intent
-                    // (or a record without a phase) stays unresolved, and
-                    // job.resume refuses it (fail closed).
-                    let message = if meta.suspension_phase() == Some(SuspendPhase::Applied) {
-                        info!(job_id = %meta.job_id, "previous job is still suspended (cgroup frozen)");
-                        SUSPENDED_ON_RELOAD
-                    } else {
-                        warn!(job_id = %meta.job_id, "previous job has an unresolved suspension; job.resume stays refused");
-                        SUSPENSION_UNRESOLVED_ON_RELOAD
-                    };
-                    warnings.push(JobNotification {
-                        owner: meta.owner.clone(),
-                        event: JobEvent::Warning {
-                            job_id: meta.job_id.clone(),
-                            name: meta.name.clone(),
-                            message: message.to_owned(),
-                        },
-                    });
-                }
-                if next == JobState::Unknown {
-                    // The process is gone (or not provably ours): an open
-                    // suspension ends here, its time is booked.
-                    meta.end_suspension(Timestamp::now());
-                }
-                if next != meta.state {
-                    meta.state = next;
-                    if let Err(err) = write_meta(&dir, &meta) {
-                        warn!(job_id = %meta.job_id, error = %err, "job meta.json not updated");
-                    }
-                }
-            }
             let id = meta.job_id.clone();
             lock(&self.jobs).insert(id, Arc::new(JobEntry::new(dir, meta, false, None)));
-            loaded += 1;
+            loaded = loaded.saturating_add(1);
         }
         if loaded > 0 {
             info!(loaded, "jobs from previous sessions loaded");
         }
         for notification in warnings {
             self.notifier.notify(notification);
+        }
+    }
+
+    // Ein Job-Verzeichnis beim Neuladen: liest `meta.json`, prüft den
+    // Verzeichnisnamen und klärt einen nicht beendeten Job
+    // (`reload_liveness`); `None`: übergehen (keine lesbare `meta.json` oder
+    // der Name passt nicht).
+    fn reload_entry(&self, dir: &Path, warnings: &mut Vec<JobNotification>) -> Option<JobMeta> {
+        let mut meta = read_meta(dir)?;
+        let dir_name = dir.file_name().and_then(|name| name.to_str());
+        if dir_name != Some(meta.job_id.as_str()) {
+            warn!(dir = %dir.display(), "job meta.json does not match its directory; skipped");
+            return None;
+        }
+        if !meta.state.is_terminal() {
+            self.reload_liveness(dir, &mut meta, warnings);
+        }
+        Some(meta)
+    }
+
+    // Ein nicht beendeter Job einer früheren Sitzung wird `Detached` (Prozess
+    // lebt, Identität bewiesen) oder `Unknown`; Warnungen an den Besitzer
+    // kommen in dieser Reihenfolge nach `warnings`: erst die Identität, dann
+    // das Anhalten. Ein geänderter Zustand wird nach `meta.json` geschrieben.
+    fn reload_liveness(&self, dir: &Path, meta: &mut JobMeta, warnings: &mut Vec<JobNotification>) {
+        let liveness = (self.liveness)(meta);
+        let next = if liveness == Liveness::Alive {
+            JobState::Detached
+        } else {
+            JobState::Unknown
+        };
+        warnings.extend(reload_identity_warning(meta, &liveness));
+        // Reads `suspended_at`, so it runs before `end_suspension` below.
+        warnings.extend(reload_suspension_warning(meta, next));
+        if next == JobState::Unknown {
+            // The process is gone (or not provably ours): an open
+            // suspension ends here, its time is booked.
+            meta.end_suspension(Timestamp::now());
+        }
+        if next != meta.state {
+            meta.state = next;
+            if let Err(err) = write_meta(dir, meta) {
+                warn!(job_id = %meta.job_id, error = %err, "job meta.json not updated");
+            }
         }
     }
 
@@ -4205,5 +4237,138 @@ mod error_display_tests {
         assert_eq!(io.to_string(), "ctx: boom");
         assert!(io.source().is_some());
         assert!(JobError::Spawn("x".to_owned()).source().is_none());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod reload_tests {
+    //! Neuladen früherer Jobs (`JobManager::reload` und seine Helfer): die
+    //! Warnungen an den Besitzer und das Übergehen eines Verzeichnisses,
+    //! dessen Name nicht zur `meta.json` passt.
+
+    use super::{
+        Caller, JobManager, SUSPENDED_ON_RELOAD, SUSPENSION_UNRESOLVED_ON_RELOAD, read_meta,
+        reload_identity_warning, reload_suspension_warning, write_meta,
+    };
+    use crate::event::{JobEvent, JobNotification};
+    use crate::model::{JobMeta, JobState, SuspendPhase};
+    use crate::procfs::Liveness;
+    use crate::test_support::{Env, TestError, TestResult, ctx, stub_job_meta};
+    use std::fs;
+    use std::sync::Arc;
+
+    // Nicht beendeter Job einer früheren Sitzung mit PID 4242; `attempt`
+    // zeichnet eine Prozess-Identität auf.
+    fn previous(attempt: Option<&str>) -> TestResult<JobMeta> {
+        let mut meta = stub_job_meta(
+            "job-previous",
+            JobState::Running,
+            "old-session",
+            &[],
+            attempt,
+        )?;
+        meta.pid = Some(4242);
+        Ok(meta)
+    }
+
+    // Text einer Besitzer-Warnung zu `meta`; prüft Besitzer, Kennung und Name.
+    fn warning_text(meta: &JobMeta, notification: Option<JobNotification>) -> TestResult<String> {
+        let notification = notification.ok_or(TestError::Missing("owner warning"))?;
+        assert_eq!(notification.owner, meta.owner);
+        match notification.event {
+            JobEvent::Warning {
+                job_id,
+                name,
+                message,
+            } => {
+                assert_eq!(job_id, meta.job_id);
+                assert_eq!(name, meta.name);
+                Ok(message)
+            }
+            other => Err(TestError::Unexpected(format!("not a warning: {other:?}"))),
+        }
+    }
+
+    /// A mismatching identity with a recorded PID warns the owner; the
+    /// wording says whether an identity was recorded (PID reused) or not.
+    #[test]
+    fn identity_mismatch_warns_the_owner() -> TestResult {
+        let mismatch = Liveness::Mismatch("start time differs".to_owned());
+        let unrecorded = previous(None)?;
+        let message = warning_text(&unrecorded, reload_identity_warning(&unrecorded, &mismatch))?;
+        assert_eq!(message, "PID 4242 not controlled: start time differs");
+        let recorded = previous(Some("a1"))?;
+        let message = warning_text(&recorded, reload_identity_warning(&recorded, &mismatch))?;
+        assert_eq!(
+            message,
+            "PID 4242 reused, not controlled: start time differs"
+        );
+        Ok(())
+    }
+
+    /// Only a mismatch with a recorded PID reaches the owner: an
+    /// unverifiable identity is only logged; a live or exited process and a
+    /// record without PID produce nothing.
+    #[test]
+    fn identity_warning_needs_a_mismatch_with_pid() -> TestResult {
+        let meta = previous(Some("a1"))?;
+        for liveness in [
+            Liveness::Alive,
+            Liveness::Exited,
+            Liveness::Unverifiable("no access to /proc".to_owned()),
+        ] {
+            assert!(
+                reload_identity_warning(&meta, &liveness).is_none(),
+                "{liveness:?}"
+            );
+        }
+        let mut without_pid = meta;
+        without_pid.pid = None;
+        let mismatch = Liveness::Mismatch("start time differs".to_owned());
+        assert!(reload_identity_warning(&without_pid, &mismatch).is_none());
+        Ok(())
+    }
+
+    /// Only a suspended job whose process still lives (`Detached`) warns:
+    /// the applied phase is harw's own freeze, an intent or a record without
+    /// a phase stays unresolved.
+    #[test]
+    fn suspension_warning_follows_the_recorded_phase() -> TestResult {
+        let mut meta = previous(Some("a1"))?;
+        assert!(reload_suspension_warning(&meta, JobState::Detached).is_none());
+        meta.suspended_at = Some(jiff::Timestamp::now());
+        for (phase, expected) in [
+            (Some(SuspendPhase::Applied), SUSPENDED_ON_RELOAD),
+            (Some(SuspendPhase::Intent), SUSPENSION_UNRESOLVED_ON_RELOAD),
+            (None, SUSPENSION_UNRESOLVED_ON_RELOAD),
+        ] {
+            meta.suspend_phase = phase;
+            assert!(
+                reload_suspension_warning(&meta, JobState::Unknown).is_none(),
+                "{phase:?}"
+            );
+            let message =
+                warning_text(&meta, reload_suspension_warning(&meta, JobState::Detached))?;
+            assert_eq!(message, expected, "{phase:?}");
+        }
+        Ok(())
+    }
+
+    /// A `meta.json` whose job id does not match its directory name is
+    /// skipped: not loaded, not marked `unknown`, not rewritten.
+    #[test]
+    fn reload_skips_a_meta_in_a_foreign_directory() -> TestResult {
+        let env = Env::new()?;
+        let meta = stub_job_meta("job-misplaced", JobState::Running, "old-session", &[], None)?;
+        let dir = env.state_dir().join("jobs").join("job-elsewhere");
+        fs::create_dir_all(&dir).map_err(ctx("create foreign job dir"))?;
+        write_meta(&dir, &meta).map_err(ctx("write misplaced meta"))?;
+
+        let reloaded = JobManager::new(env.manager.config().clone(), Arc::new(crate::NoopNotifier))
+            .map_err(ctx("reload"))?;
+        assert!(reloaded.list(Caller::Operator).is_empty());
+        let on_disk = read_meta(&dir).ok_or(TestError::Missing("meta.json"))?;
+        assert_eq!(on_disk.state, JobState::Running);
+        Ok(())
     }
 }
