@@ -1802,9 +1802,7 @@ mod tests {
     }
 
     /// Ein Egress-Ereignis von uid 1000 mit dem Prozesskontext `process`.
-    fn egress_with_process(
-        process: Option<harw_dod_signals::ProcessContext>,
-    ) -> SecurityEvent {
+    fn egress_with_process(process: Option<harw_dod_signals::ProcessContext>) -> SecurityEvent {
         SecurityEvent {
             actor: Some(harw_dod_signals::Actor {
                 uid: 1000,
@@ -1900,8 +1898,8 @@ mod tests {
         assert!(is_clean(&process.comm), "{}", process.comm);
 
         let escaped = egress_with_process(Some(process_context(9, Some("curl\\u{202e}"))));
-        let card =
-            EvidenceCard::from_events(&[&escaped]).ok_or(TestError::Missing("card of a process"))?;
+        let card = EvidenceCard::from_events(&[&escaped])
+            .ok_or(TestError::Missing("card of a process"))?;
         assert_eq!(
             card.process.map(|process| process.comm).as_deref(),
             Some("curl\\u{202e}"),
