@@ -92,7 +92,17 @@
 //! # Speicher
 //! Höchstens `max_partitions` Partitions- und ebenso viele uid-Eimer. Ein
 //! voller Eimer ist gleichwertig zu keinem Eimer und fällt zuerst; danach
-//! der am längsten unbenutzte.
+//! der am längsten unbenutzte. Dieselben Grenzen gelten beim Laden eines
+//! Zustands ([`crate::Dispatcher::restore`]) für alle vier Tabellen (Eimer,
+//! uid-Eimer, Erstsichtungen, Vorrechte je uid), auch wenn er unter einer
+//! größeren Grenze geschrieben wurde: was darüber liegt, fällt
+//! deterministisch, bevor das Budget benutzt wird, bei Gleichstand der
+//! kleinere Schlüssel. Eimer wie oben, nur ohne Uhr. Erstsichtungen und
+//! Vorrechte verdrängt die Laufzeit nie lebend; beim Laden fallen sie
+//! fail-closed nach eigener Regel: Erstsichtungen, die relativ zur jüngsten
+//! Sichtung der Tabelle abgelaufen sind, dann die zuletzt aufgenommenen (die
+//! am längsten etablierten bleiben); Vorrechte die ältesten (solange die
+//! behaltenen laufen, gibt es kein neues).
 //!
 //! # Nebenläufigkeit und Fehler
 //! `&mut self`, deterministisch; Fehler nur beim Laden eines Zustands.
@@ -118,12 +128,14 @@
 //! );
 //! ```
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::DispatchError;
 use crate::finding::{Hardness, PartitionKey, Severity, is_sensor_id};
+use crate::prune::retain_greatest;
 
 /// Ein Token in internen Einheiten (durch 3600 teilbar, siehe Moduldoku).
 pub const TOKEN_UNITS: u64 = 3_600_000;
@@ -436,6 +448,13 @@ impl TokenBucket {
         self.units = self.units.min(capacity_units(capacity));
         self
     }
+
+    // Rang beim Kürzen einer Tabelle beim Laden (größer bleibt): ein nicht
+    // voller Eimer vor einem vollen (der gleichwertig zu keinem ist), dann
+    // der zuletzt benutzte (`None` = nie benutzt, zuerst verdrängt).
+    fn retention_rank(&self, capacity: u32) -> (bool, Option<i64>) {
+        (self.units < capacity_units(capacity), self.last_refill_unix)
+    }
 }
 
 // Kapazität in Einheiten.
@@ -518,6 +537,20 @@ impl EstablishedPartition {
         let min_age = i64::from(min_age_secs.max(1));
         now_unix.saturating_sub(self.last_seen_unix) <= ESTABLISHED_TTL_SECS
             && since_unix.saturating_sub(self.first_seen_unix) >= min_age
+    }
+
+    // Rang beim Kürzen der Tabelle beim Laden (größer bleibt). Zur Laufzeit
+    // verdrängt `note_partition` keinen lebenden Eintrag (eine volle Tabelle
+    // nimmt nichts Neues auf, nur abgelaufene fallen); es gilt also die
+    // Reihenfolge der Aufnahme. Ohne Uhr dient `newest_unix`, die jüngste
+    // Sichtung der Tabelle, als Untergrenze der Zeit beim Schnappschuss: ein
+    // relativ zu ihr abgelaufener Eintrag war es sicher schon und fällt
+    // zuerst; unter den übrigen bleibt die frühere Erstsichtung.
+    fn retention_rank(&self, newest_unix: i64) -> (bool, Reverse<i64>) {
+        (
+            newest_unix.saturating_sub(self.last_seen_unix) <= ESTABLISHED_TTL_SECS,
+            Reverse(self.first_seen_unix),
+        )
     }
 }
 
@@ -844,36 +877,84 @@ impl PartitionedBudget {
         }
     }
 
-    // Baut das Budget aus einem Zustand; Inhalte über der Kapazität werden
-    // gekappt, ungültige Sensor-Kennungen abgelehnt.
+    // Baut das Budget aus einem Zustand: ungültige Sensor-Kennungen werden
+    // abgelehnt (auch in Einträgen, die danach fallen), jede der vier
+    // Tabellen wird auf `max_partitions` gekürzt (Grenze der aktiven
+    // Konfiguration, siehe `crate::prune`), Inhalte über der Kapazität werden
+    // gekappt. Was bleibt, je Tabelle (bei Gleichstand der größere
+    // Schlüssel):
+    // - Partitions- und uid-Reserve-Eimer: erst fallen volle Eimer
+    //   (gleichwertig zu keinem, verlustfrei), dann die am längsten
+    //   unbenutzten, wie in `make_room`. Ohne Uhr zählt nur, was schon beim
+    //   Schnappschuss voll war. Ein gefallener Eimer startet beim nächsten
+    //   Aufruf voll; das kostet höchstens dessen Kapazität, der globale Eimer
+    //   und die Reserve bleiben unberührt.
+    // - Erstsichtungen: die Laufzeit verdrängt keine lebende (sie nimmt bei
+    //   voller Tabelle keine neue auf), es gilt die Reihenfolge der
+    //   Aufnahme. Erst fallen Einträge, die relativ zur jüngsten Sichtung der
+    //   Tabelle abgelaufen sind, dann die zuletzt aufgenommenen
+    //   (`EstablishedPartition::retention_rank`). Es bleiben die am längsten
+    //   etablierten; frische Partitionen eines Sturms vor dem Neustart
+    //   verdrängen sie nicht. Ein gefallener Eintrag verliert nur sein
+    //   Vorrecht (fail-closed); die volle Tabelle nimmt neue Partitionen wie
+    //   zur Laufzeit erst nach Ablauf eines Eintrags.
+    // - Vorrechte je uid: die Laufzeit verdrängt keines, dessen Intervall
+    //   läuft (`take_privilege` gibt bei voller Tabelle keines). Es bleiben
+    //   die jüngsten: jeder gefallene ist älter als jeder behaltene, sein
+    //   Intervall endet also nicht später; solange die behaltenen laufen,
+    //   ist die Tabelle voll und `take_privilege` gibt kein Vorrecht
+    //   (fail-closed). Nur bei rückwärtslaufender Zeit kann eine gefallene
+    //   uid ein Vorrechts-Token früher bekommen.
     pub(crate) fn import(config: BudgetConfig, state: BudgetState) -> Result<Self, DispatchError> {
-        let sensors_ok = state
-            .partitions
+        let BudgetState {
+            global,
+            mut partitions,
+            mut uid_reserve,
+            reserve_starved,
+            reserve_since_unix,
+            mut established,
+            mut uid_privileged,
+        } = state;
+        let sensors_ok = partitions
             .keys()
-            .chain(state.established.keys())
+            .chain(established.keys())
             .all(|key| is_sensor_id(&key.sensor));
         if !sensors_ok {
             return Err(DispatchError::InvalidState { what: "budget" });
         }
-        let partitions = state
-            .partitions
-            .into_iter()
-            .map(|(key, bucket)| (key, bucket.clamped(config.partition_capacity)))
-            .collect();
-        let uid_reserve = state
-            .uid_reserve
-            .into_iter()
-            .map(|(uid, bucket)| (uid, bucket.clamped(config.uid_reserve_capacity)))
-            .collect();
+        let limit = config.max_partitions;
+        retain_greatest(&mut partitions, limit, |bucket| {
+            bucket.retention_rank(config.partition_capacity)
+        });
+        for bucket in partitions.values_mut() {
+            *bucket = bucket.clamped(config.partition_capacity);
+        }
+        retain_greatest(&mut uid_reserve, limit, |bucket| {
+            bucket.retention_rank(config.uid_reserve_capacity)
+        });
+        for bucket in uid_reserve.values_mut() {
+            *bucket = bucket.clamped(config.uid_reserve_capacity);
+        }
+        // Ein Durchlauf ohne Speicher; nur bei leerer Tabelle `None`, dann
+        // wird nichts gekürzt und der Rang nie gefragt.
+        let newest_unix = established
+            .values()
+            .map(|entry| entry.last_seen_unix)
+            .max()
+            .unwrap_or(i64::MIN);
+        retain_greatest(&mut established, limit, |entry| {
+            entry.retention_rank(newest_unix)
+        });
+        retain_greatest(&mut uid_privileged, limit, |last| *last);
         Ok(Self {
             config,
-            global: state.global.clamped(config.global_capacity),
+            global: global.clamped(config.global_capacity),
             partitions,
             uid_reserve,
-            reserve_starved: state.reserve_starved,
-            reserve_since_unix: state.reserve_since_unix,
-            established: state.established,
-            uid_privileged: state.uid_privileged,
+            reserve_starved,
+            reserve_since_unix,
+            established,
+            uid_privileged,
         })
     }
 }
@@ -1661,6 +1742,205 @@ mod tests {
             PartitionedBudget::import(small, tampered).err(),
             Some(DispatchError::InvalidState { what: "budget" })
         );
+        Ok(())
+    }
+
+    // Die Schlüssel einer Tabelle in aufsteigender Reihenfolge.
+    fn keys_of<K: Clone, V>(map: &BTreeMap<K, V>) -> Vec<K> {
+        map.keys().cloned().collect()
+    }
+
+    #[test]
+    fn test_import_prunes_every_table_to_the_active_bound() -> TestResult {
+        // Ohne Nachfüllung bleibt jeder benutzte Eimer unvoll.
+        let wide = BudgetConfig {
+            partition_capacity: 3,
+            partition_refill_per_hour: 0,
+            ..BudgetConfig::default()
+        };
+        let mut budget = PartitionedBudget::new(wide);
+        for cgroup in 1..=6_u64 {
+            let now = i64::try_from(cgroup.saturating_mul(10)).unwrap_or(0);
+            assert_eq!(standard(&mut budget, cgroup, now), GRANTED);
+        }
+        let mut state = budget.export();
+        // uid-Eimer und Vorrechte je uid direkt (der Weg in die Reserve ist
+        // oben getestet): uid n zuletzt bei `at`.
+        for (uid, at) in [(1_u32, 40_i64), (2, 10), (3, 30), (4, 20)] {
+            state.uid_reserve.insert(
+                Some(uid),
+                TokenBucket {
+                    units: 0,
+                    last_refill_unix: Some(at),
+                    starved: true,
+                },
+            );
+            state.uid_privileged.insert(Some(uid), at);
+        }
+        // Erstsichtungen: 1 und 2 am längsten etabliert, 5 und 6 zuletzt
+        // gesehen, aber zuletzt aufgenommen (alle leben).
+        let first_sightings = [
+            (1_u64, 1_i64, 15_i64),
+            (2, 2, 25),
+            (5, 50, 90),
+            (6, 60, 100),
+        ];
+        for (cgroup, first, last) in first_sightings {
+            state.established.insert(
+                key(cgroup),
+                EstablishedPartition {
+                    first_seen_unix: first,
+                    last_seen_unix: last,
+                    last_privileged_unix: None,
+                },
+            );
+        }
+        // Unverändert unter derselben Grenze.
+        let same = PartitionedBudget::import(wide, state.clone())?;
+        assert_eq!(same.export(), state);
+        // Konfigurationswechsel 4096 → 2: Eimer und Vorrechte die zuletzt
+        // benutzten, Erstsichtungen die zuerst aufgenommenen (die Laufzeit
+        // verdrängt keine lebende).
+        let narrow = BudgetConfig {
+            max_partitions: 2,
+            ..wide
+        };
+        let restored = PartitionedBudget::import(narrow, state.clone())?;
+        assert_eq!(keys_of(&restored.partitions), [key(5), key(6)]);
+        assert_eq!(keys_of(&restored.established), [key(1), key(2)]);
+        assert_eq!(
+            restored.established.get(&key(1)),
+            state.established.get(&key(1))
+        );
+        assert_eq!(keys_of(&restored.uid_reserve), [Some(1), Some(3)]);
+        assert_eq!(keys_of(&restored.uid_privileged), [Some(1), Some(3)]);
+        assert_eq!(restored.partition_tokens(&key(6)), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_import_keeps_the_earliest_admitted_live_first_sightings() -> TestResult {
+        let wide = BudgetConfig::default();
+        let mut state = PartitionedBudget::new(wide).export();
+        let late = ESTABLISHED_TTL_SECS.saturating_add(1_000);
+        // Partition 1 ist am frühesten gesehen, aber relativ zur jüngsten
+        // Sichtung (`late`) abgelaufen; 2 bis 5 leben, 3 und 5 sind gleich
+        // lange etabliert.
+        let first_sightings = [
+            (1_u64, 0_i64, 5_i64),
+            (2, 100, late),
+            (3, 200, late.saturating_sub(100)),
+            (4, 300, late),
+            (5, 200, late),
+        ];
+        for (cgroup, first, last) in first_sightings {
+            state.established.insert(
+                key(cgroup),
+                EstablishedPartition {
+                    first_seen_unix: first,
+                    last_seen_unix: last,
+                    last_privileged_unix: None,
+                },
+            );
+        }
+        let bounded = |max_partitions: usize| BudgetConfig {
+            max_partitions,
+            ..wide
+        };
+        // Grenze 3: die abgelaufene fällt trotz frühester Sichtung, dann die
+        // zuletzt aufgenommene (4); beim Gleichstand von 3 und 5 bleibt die
+        // größere vor der kleineren.
+        let three = PartitionedBudget::import(bounded(3), state.clone())?;
+        assert_eq!(keys_of(&three.established), [key(2), key(3), key(5)]);
+        let two = PartitionedBudget::import(bounded(2), state.clone())?;
+        assert_eq!(keys_of(&two.established), [key(2), key(5)]);
+        // Grenze 1: die am längsten etablierte; solange sie lebt, nimmt die
+        // volle Tabelle wie zur Laufzeit keine frische Partition auf.
+        let mut one = PartitionedBudget::import(bounded(1), state)?;
+        assert_eq!(keys_of(&one.established), [key(2)]);
+        one.note_partition(&key(9), late);
+        assert_eq!(keys_of(&one.established), [key(2)]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_import_drops_full_buckets_before_used_ones() -> TestResult {
+        let wide = BudgetConfig {
+            partition_capacity: 3,
+            partition_refill_per_hour: 0,
+            ..BudgetConfig::default()
+        };
+        let mut budget = PartitionedBudget::new(wide);
+        assert_eq!(standard(&mut budget, 1, 10), GRANTED);
+        assert_eq!(standard(&mut budget, 2, 20), GRANTED);
+        let mut state = budget.export();
+        // Partition 3: voll (gleichwertig zu keinem Eimer), aber zuletzt
+        // benutzt; Partition 4: unvoll, aber nie benutzt.
+        state.partitions.insert(
+            key(3),
+            TokenBucket {
+                units: capacity_units(3),
+                last_refill_unix: Some(1_000),
+                starved: false,
+            },
+        );
+        state.partitions.insert(
+            key(4),
+            TokenBucket {
+                units: TOKEN_UNITS,
+                last_refill_unix: None,
+                starved: false,
+            },
+        );
+        let three = BudgetConfig {
+            max_partitions: 3,
+            ..wide
+        };
+        let restored = PartitionedBudget::import(three, state.clone())?;
+        assert_eq!(keys_of(&restored.partitions), [key(1), key(2), key(4)]);
+        let two = BudgetConfig {
+            max_partitions: 2,
+            ..wide
+        };
+        let restored = PartitionedBudget::import(two, state)?;
+        assert_eq!(keys_of(&restored.partitions), [key(1), key(2)]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pruned_privileges_stay_fail_closed() -> TestResult {
+        let wide = BudgetConfig {
+            established_reserve_interval_secs: 10,
+            ..BudgetConfig::default()
+        };
+        let mut state = PartitionedBudget::new(wide).export();
+        for (uid, at) in [(1_u32, 20_i64), (2, 21), (3, 22), (4, 23)] {
+            state.uid_privileged.insert(Some(uid), at);
+        }
+        let narrow = BudgetConfig {
+            max_partitions: 2,
+            ..wide
+        };
+        let mut restored = PartitionedBudget::import(narrow, state)?;
+        assert_eq!(keys_of(&restored.uid_privileged), [Some(3), Some(4)]);
+        // uid 1 ist gefallen; ihr Intervall (ab 20) liefe bis 30.
+        let mut established = BTreeMap::from([(key_for(1, 1), EstablishedPartition::seen_at(0))]);
+        let mut take = |now: i64| {
+            take_privilege(
+                &narrow,
+                &mut established,
+                &mut restored.uid_privileged,
+                Some(20),
+                &key_for(1, 1),
+                now,
+            )
+        };
+        // Solange die behaltenen, jüngeren Intervalle laufen, ist die Tabelle
+        // voll: kein Vorrecht.
+        assert!(!take(25));
+        // Ab 32 ist das älteste behaltene (22) abgelaufen, das gefallene (20)
+        // also erst recht.
+        assert!(take(32));
         Ok(())
     }
 }

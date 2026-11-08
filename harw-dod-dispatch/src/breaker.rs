@@ -29,6 +29,15 @@
 //! Unix-Sekunden vom Aufrufer. Läuft die Zeit rückwärts, beginnt das
 //! jeweilige Fenster neu.
 //!
+//! # Speicher
+//! Höchstens `max_partitions` Breaker. Ist die Tabelle voll, fallen zuerst
+//! ruhende (gleichwertig zu neuen), dann geschlossene, zuletzt offene, je
+//! der am längsten unbenutzte zuerst. Beim Laden eines Zustands mit mehr
+//! Breakern ([`crate::Dispatcher::restore`]) gilt dieselbe Ordnung ohne die
+//! Stufe „ruhend" (ohne Uhr nicht bestimmbar): ein offener Breaker überlebt
+//! einen Neustart mit kleinerer Grenze, solange es nicht mehr offene als die
+//! Grenze gibt.
+//!
 //! # Nebenläufigkeit und Fehler
 //! `&mut self`, deterministisch; Fehler nur beim Laden eines Zustands.
 //!
@@ -50,6 +59,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DispatchError;
 use crate::finding::{PartitionKey, is_sensor_id};
+use crate::prune::retain_greatest;
 
 /// Schwellen des Breakers.
 ///
@@ -348,19 +358,27 @@ impl BreakerSet {
         }
     }
 
-    // Baut die Menge aus einem Zustand; ungültige Sensor-Kennungen werden
-    // abgelehnt.
+    // Baut die Menge aus einem Zustand: ungültige Sensor-Kennungen werden
+    // abgelehnt (auch in Breakern, die danach fallen), dann wird auf
+    // `max_partitions` gekürzt (Grenze der aktiven Konfiguration). Wie in
+    // `make_room` fallen geschlossene Breaker vor offenen, innerhalb davon
+    // die am längsten unbenutzten, bei Gleichstand der kleinere Schlüssel.
+    // Ein offener Breaker fällt also erst, wenn mehr offene als die Grenze
+    // da sind; sonst würde ein Neustart mit kleinerer Grenze einen Sturm
+    // wieder durchlassen (B10). Ohne Uhr lässt sich „ruhend" nicht
+    // bestimmen; diese Stufe aus `make_room` entfällt.
     pub(crate) fn import(
         config: BreakerConfig,
         state: BreakerState,
     ) -> Result<Self, DispatchError> {
-        if !state.partitions.keys().all(|key| is_sensor_id(&key.sensor)) {
+        let BreakerState { mut partitions } = state;
+        if !partitions.keys().all(|key| is_sensor_id(&key.sensor)) {
             return Err(DispatchError::InvalidState { what: "breakers" });
         }
-        Ok(Self {
-            config,
-            partitions: state.partitions,
-        })
+        retain_greatest(&mut partitions, config.max_partitions, |breaker| {
+            (breaker.tripped, breaker.last_offer_unix)
+        });
+        Ok(Self { config, partitions })
     }
 }
 
@@ -537,6 +555,82 @@ mod tests {
             BreakerSet::import(config(), tampered).err(),
             Some(DispatchError::InvalidState { what: "breakers" })
         );
+        Ok(())
+    }
+
+    // Die Partitionen einer Menge in aufsteigender Reihenfolge.
+    fn keys_of(set: &BreakerSet) -> Vec<PartitionKey> {
+        set.partitions.keys().cloned().collect()
+    }
+
+    #[test]
+    fn test_import_prunes_to_the_active_bound_keeping_open_breakers() -> TestResult {
+        let partition = |cgroup: u64| PartitionKey {
+            uid: Some(1),
+            cgroup_kid: Some(cgroup),
+            sensor: "probe-bpf-0".to_owned(),
+        };
+        let mut set = BreakerSet::new(config());
+        // Partition 1 löst früh aus (bei 0), danach melden sich 2 bis 5 je
+        // einmal, Partition 5 zuletzt.
+        let observed: Vec<BreakerObservation> =
+            (0..4).map(|_| set.observe(&partition(1), 0)).collect();
+        assert_eq!(observed.last(), Some(&BreakerObservation::Tripped));
+        for cgroup in 2..=5_u64 {
+            let now = i64::try_from(cgroup.saturating_mul(10)).unwrap_or(0);
+            assert_eq!(
+                set.observe(&partition(cgroup), now),
+                BreakerObservation::Closed
+            );
+        }
+        // Unverändert unter derselben Grenze.
+        let same = BreakerSet::import(config(), set.export())?;
+        assert_eq!(same, set);
+        // Grenze 2: der offene Breaker bleibt trotz seines Alters, dazu der
+        // zuletzt benutzte geschlossene.
+        let two = BreakerConfig {
+            max_partitions: 2,
+            ..config()
+        };
+        let mut restored = BreakerSet::import(two, set.export())?;
+        assert_eq!(keys_of(&restored), [partition(1), partition(5)]);
+        // Kein zweiter Trip derselben Auslösung nach dem Neustart.
+        assert_eq!(
+            restored.observe(&partition(1), 60),
+            BreakerObservation::Open
+        );
+        // Grenze 1: nur der offene.
+        let one = BreakerConfig {
+            max_partitions: 1,
+            ..config()
+        };
+        let restored = BreakerSet::import(one, set.export())?;
+        assert_eq!(keys_of(&restored), [partition(1)]);
+        assert!(restored.is_tripped(&partition(1)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_import_breaks_ties_by_the_greater_partition() -> TestResult {
+        let mut set = BreakerSet::new(config());
+        for cgroup in [7_u64, 3, 9, 1] {
+            let key = PartitionKey {
+                uid: Some(1),
+                cgroup_kid: Some(cgroup),
+                sensor: "probe-bpf-0".to_owned(),
+            };
+            assert_eq!(set.observe(&key, 5), BreakerObservation::Closed);
+        }
+        let two = BreakerConfig {
+            max_partitions: 2,
+            ..config()
+        };
+        let restored = BreakerSet::import(two, set.export())?;
+        let kept: Vec<Option<u64>> = keys_of(&restored)
+            .into_iter()
+            .map(|key| key.cgroup_kid)
+            .collect();
+        assert_eq!(kept, [Some(7), Some(9)]);
         Ok(())
     }
 

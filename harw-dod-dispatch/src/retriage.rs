@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DispatchError;
 use crate::finding::{Hardness, TriageFingerprint, is_dedup_key, is_record_digest};
+use crate::prune::retain_greatest;
 
 /// Der gespeicherte Stand eines bekannten `dedup_key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,13 +291,21 @@ impl KnownKeys {
         }
     }
 
-    // Baut die Menge aus einem Zustand und prüft jeden Schlüssel.
+    // Baut die Menge aus einem Zustand: prüft jeden Schlüssel (auch die, die
+    // danach fallen; ein manipulierter Eintrag lehnt den ganzen Zustand ab)
+    // und kürzt dann auf `max_keys` (Grenze der aktiven Konfiguration). Es
+    // bleiben die zuletzt gesehenen, bei Gleichstand der größere Schlüssel
+    // (dieselbe Ordnung wie `make_room`). Ein gefallener Schlüssel gilt wieder
+    // als neu, wie nach einer Verdrängung zur Laufzeit: sein nächstes
+    // Auftreten wird erneut triagiert (gehört er zu einem wartenden Auftrag
+    // oder einer offenen Rückfrage, auch doppelt), nie unterdrückt.
     pub(crate) fn import(
         ttl_secs: u32,
         max_keys: usize,
         state: KnownKeysState,
     ) -> Result<Self, DispatchError> {
-        let valid = state.keys.iter().all(|(key, stored)| {
+        let KnownKeysState { mut keys } = state;
+        let valid = keys.iter().all(|(key, stored)| {
             is_dedup_key(key)
                 && stored
                     .fingerprint
@@ -307,11 +316,12 @@ impl KnownKeys {
         if !valid {
             return Err(DispatchError::InvalidState { what: "known keys" });
         }
+        retain_greatest(&mut keys, max_keys, |stored| stored.last_seen_unix);
         Ok(Self {
             ttl_secs: u64::from(ttl_secs),
             max_keys,
             last_prune_unix: None,
-            keys: state.keys,
+            keys,
         })
     }
 }
@@ -492,6 +502,62 @@ mod tests {
             stored(None, None, None, Hardness::Observed),
         );
         assert!(KnownKeys::import(100, 8, keys.export()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_import_prunes_to_the_active_bound_keeping_the_most_recent() -> TestResult {
+        // Geschrieben mit Grenze 1000: 40 Schlüssel, Schlüssel n zuletzt bei
+        // 100 + n gesehen.
+        let mut keys = KnownKeys::new(100_000, 1_000);
+        for n in 1..=40_u32 {
+            keys.remember(
+                &format!("{n:032x}"),
+                &TriageFingerprint::default(),
+                Hardness::Observed,
+                i64::from(n).saturating_add(100),
+            );
+        }
+        assert_eq!(keys.keys.len(), 40);
+        // Unverändert unter derselben Grenze.
+        let same = KnownKeys::import(100_000, 1_000, keys.export())?;
+        assert_eq!(same.export(), keys.export());
+        // Grenze 5: genau die fünf jüngsten.
+        let five = KnownKeys::import(100_000, 5, keys.export())?;
+        let kept: Vec<&str> = five.keys.keys().map(String::as_str).collect();
+        let expected: Vec<String> = (36..=40_u32).map(|n| format!("{n:032x}")).collect();
+        assert_eq!(kept, expected);
+        // Konfigurationswechsel 1000 → 1: nur der jüngste.
+        let one = KnownKeys::import(100_000, 1, keys.export())?;
+        assert_eq!(one.keys.len(), 1);
+        assert!(one.get(&format!("{:032x}", 40)).is_some());
+        // Ein manipulierter Schlüssel lehnt ab, auch wenn er fallen würde.
+        let mut tampered = keys.export();
+        tampered.keys.insert(
+            "not-a-key".to_owned(),
+            stored(None, None, None, Hardness::Observed),
+        );
+        assert_eq!(
+            KnownKeys::import(100_000, 1, tampered).err(),
+            Some(DispatchError::InvalidState { what: "known keys" })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_import_breaks_ties_by_the_greater_key() -> TestResult {
+        let mut keys = KnownKeys::new(100_000, 1_000);
+        for n in [7_u32, 3, 9, 1] {
+            keys.remember(
+                &format!("{n:032x}"),
+                &TriageFingerprint::default(),
+                Hardness::Observed,
+                500,
+            );
+        }
+        let two = KnownKeys::import(100_000, 2, keys.export())?;
+        let kept: Vec<&str> = two.keys.keys().map(String::as_str).collect();
+        assert_eq!(kept, [format!("{:032x}", 7), format!("{:032x}", 9)]);
         Ok(())
     }
 }

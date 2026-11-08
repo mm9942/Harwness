@@ -27,7 +27,9 @@
 //! - Aufräumen nach **Dispatcher-Zeit** (`now_unix`): eine Cgroup, die zwei
 //!   Fenster lang nichts gemeldet hat, wird vergessen. Höchstens
 //!   `max_cgroups` Cgroups werden geführt (die am längsten ruhige fällt
-//!   zuerst), je Cgroup höchstens [`MAX_ENTRIES_PER_CGROUP`] Einzelbefunde.
+//!   zuerst, bei Gleichstand die kleinere Kernel-ID; ebenso beim Laden
+//!   eines Zustands mit mehr Cgroups), je Cgroup höchstens
+//!   [`MAX_ENTRIES_PER_CGROUP`] Einzelbefunde.
 //!
 //! # Nebenläufigkeit und Fehler
 //! `&mut self`, deterministisch, ohne Uhr; keine Fehler außer beim Laden
@@ -75,6 +77,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::DispatchError;
 use crate::finding::{Hardness, Severity, is_uuid_v4};
 use crate::job::TriageJobId;
+use crate::prune::retain_greatest;
 use crate::route::{Route, RouteTable, TriageRole};
 
 /// Höchstzahl der Einzelbefunde, die je Cgroup auf einen Partner warten.
@@ -511,7 +514,15 @@ impl IncidentGrouper {
         }
     }
 
-    // Baut den Grouper aus einem Zustand und prüft ihn.
+    // Baut den Grouper aus einem Zustand: prüft jede Cgroup (auch die, die
+    // danach fällt) und kürzt dann auf `max_cgroups` (Grenze der aktiven
+    // Konfiguration). Es bleiben die zuletzt beobachteten, bei Gleichstand die
+    // größere Kernel-ID (dieselbe Ordnung wie `make_room`). Eine gefallene
+    // Cgroup ist wie eine verdrängte: ihr offener Vorfall nimmt keine
+    // Mitglieder mehr auf, schon eingereihte Aufträge behalten ihre
+    // Vorfall-Kennung, und `next_incident` bleibt, eine Kennung wird also nie
+    // doppelt vergeben. Mehr als `MAX_ENTRIES_PER_CGROUP` wartende Befunde
+    // kann es zur Laufzeit nicht geben; das bleibt eine Ablehnung.
     pub(crate) fn import(
         window_secs: u32,
         max_cgroups: usize,
@@ -521,10 +532,14 @@ impl IncidentGrouper {
         let invalid = DispatchError::InvalidState {
             what: "incident grouper",
         };
-        if state.next_incident < 1 {
+        let GrouperState {
+            next_incident,
+            mut cgroups,
+        } = state;
+        if next_incident < 1 {
             return Err(invalid);
         }
-        for slot in state.cgroups.values() {
+        for slot in cgroups.values() {
             // Jeder wartende Befund hat eine KI-Route, und seine Rolle ist die
             // seiner Regel.
             let entries_ok = slot.entries.len() <= MAX_ENTRIES_PER_CGROUP
@@ -536,19 +551,19 @@ impl IncidentGrouper {
                         )
                 });
             let incident_ok = slot.incident.as_ref().is_none_or(|incident| {
-                incident.incident_id.as_u64() >= 1
-                    && incident.incident_id.as_u64() < state.next_incident
+                incident.incident_id.as_u64() >= 1 && incident.incident_id.as_u64() < next_incident
             });
             if !entries_ok || !incident_ok {
                 return Err(invalid);
             }
         }
+        retain_greatest(&mut cgroups, max_cgroups, |slot| slot.touched_unix);
         Ok(Self {
             window_secs: u64::from(window_secs),
             max_cgroups,
-            next_incident: state.next_incident,
+            next_incident,
             last_prune_unix: None,
-            cgroups: state.cgroups,
+            cgroups,
         })
     }
 }
@@ -560,7 +575,7 @@ mod tests {
         RULE_BASELINE_DEVIATION, RULE_EGRESS_FLOW, RULE_EXEC_WRITABLE_PATH, RULE_PERSISTENCE_WRITE,
         RULE_STRUCTURE_DRIFT,
     };
-    use crate::test_support::{TestError, TestResult};
+    use crate::test_support::{TestError, TestResult, missing};
 
     fn id(n: u32) -> String {
         format!("{n:08x}-1a2b-4c3d-8e4f-5a6b7c8d9e0f")
@@ -889,6 +904,88 @@ mod tests {
         let late = id(9);
         grouper.observe(input(99, RULE_EGRESS_FLOW, &late, 5_000), 5_000);
         assert_eq!(grouper.tracked_cgroups(), 1);
+        Ok(())
+    }
+
+    // Die geführten Kernel-IDs in aufsteigender Reihenfolge.
+    fn kids(grouper: &IncidentGrouper) -> Vec<u64> {
+        grouper.cgroups.keys().copied().collect()
+    }
+
+    #[test]
+    fn test_import_prunes_to_the_active_bound_keeping_the_most_recent() -> TestResult {
+        let routes = RouteTable::new();
+        let mut grouper = IncidentGrouper::new(600, 64);
+        let ids: Vec<String> = (1..=6).map(id).collect();
+        // Cgroup 10 bildet zuerst einen Vorfall (Zeit 0 und 1) …
+        let first = ids.first().ok_or_else(missing("id 1"))?;
+        let second = ids.get(1).ok_or_else(missing("id 2"))?;
+        grouper.observe(input(10, RULE_EGRESS_FLOW, first, 0), 0);
+        let Grouping::Formed { incident_id, .. } =
+            grouper.observe(input(10, RULE_EXEC_WRITABLE_PATH, second, 1), 1)
+        else {
+            return Err(TestError::Unexpected("no incident".to_owned()));
+        };
+        // … danach melden sich die Cgroups 50, 40, 30, 20 in dieser Reihenfolge.
+        for ((kid, at), finding) in [(50_u64, 10_i64), (40, 20), (30, 30), (20, 40)]
+            .into_iter()
+            .zip(ids.iter().skip(2))
+        {
+            grouper.observe(input(kid, RULE_EGRESS_FLOW, finding, at), at);
+        }
+        assert_eq!(grouper.tracked_cgroups(), 5);
+        // Unverändert unter derselben Grenze.
+        let same = IncidentGrouper::import(600, 64, grouper.export(), &routes)?;
+        assert_eq!(same.export(), grouper.export());
+        // Grenze 2: die zuletzt beobachteten (20 bei 40, 30 bei 30).
+        let two = IncidentGrouper::import(600, 2, grouper.export(), &routes)?;
+        assert_eq!(kids(&two), [20, 30]);
+        // Grenze 1: der Vorfall von Cgroup 10 ist mit ihr gefallen; die
+        // nächste Vorfall-Kennung bleibt, eine Kennung kommt nie doppelt.
+        let mut one = IncidentGrouper::import(600, 1, grouper.export(), &routes)?;
+        assert_eq!(kids(&one), [20]);
+        assert_eq!(one.next_incident(), grouper.next_incident());
+        let (c, d) = (id(7), id(8));
+        assert_eq!(
+            one.observe(input(10, RULE_BASELINE_DEVIATION, &c, 50), 50),
+            Grouping::Standalone
+        );
+        assert!(matches!(
+            one.observe(input(10, RULE_EGRESS_FLOW, &d, 51), 51),
+            Grouping::Formed { incident_id: next, .. } if next != incident_id
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_import_breaks_ties_by_the_greater_kernel_id() -> TestResult {
+        let routes = RouteTable::new();
+        let mut grouper = IncidentGrouper::new(600, 64);
+        let ids: Vec<String> = (1..=4).map(id).collect();
+        for (kid, finding) in [7_u64, 3, 9, 1].into_iter().zip(&ids) {
+            grouper.observe(input(kid, RULE_EGRESS_FLOW, finding, 5), 5);
+        }
+        let two = IncidentGrouper::import(600, 2, grouper.export(), &routes)?;
+        assert_eq!(kids(&two), [7, 9]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_import_rejects_more_waiting_entries_than_the_constant() -> TestResult {
+        let routes = RouteTable::new();
+        let mut grouper = IncidentGrouper::new(600, 64);
+        let first = id(1);
+        grouper.observe(input(4, RULE_EGRESS_FLOW, &first, 0), 0);
+        let mut state = grouper.export();
+        let slot = state.cgroups.get_mut(&4).ok_or_else(missing("slot"))?;
+        let entry = slot.entries.first().cloned().ok_or_else(missing("entry"))?;
+        slot.entries = vec![entry; MAX_ENTRIES_PER_CGROUP.saturating_add(1)];
+        assert_eq!(
+            IncidentGrouper::import(600, 64, state, &routes).err(),
+            Some(DispatchError::InvalidState {
+                what: "incident grouper"
+            })
+        );
         Ok(())
     }
 }

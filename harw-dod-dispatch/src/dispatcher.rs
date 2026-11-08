@@ -104,7 +104,13 @@
 //! Vorfall-Bindungen an Aufträge, die es nicht (mehr) gibt, und stellt
 //! Aufträge, die beim Schnappschuss in Arbeit waren, wieder in die
 //! Warteschlange: ihre Triage-Kinder überleben einen Neustart des Aufrufers
-//! nicht.
+//! nicht. Es gelten die Grenzen der übergebenen Konfiguration, nicht die des
+//! Schnappschusses: jede Tabelle wird vor dem Bau des Dispatchers
+//! deterministisch auf ihre Grenze gekürzt, nach einer festen Regel je
+//! Tabelle (wo die Laufzeit verdrängt, in deren Ordnung; wo sie lebende
+//! Einträge nie verdrängt, fail-closed); ein Zustand über einer konstanten
+//! Grenze wird abgelehnt (Einzelheiten unter [`Dispatcher::restore`],
+//! „Grenzen").
 //!
 //! # Nebenläufigkeit
 //! `&mut self`, keine inneren Sperren, keine Uhr, kein IO. Genau ein
@@ -194,6 +200,16 @@ pub const MAX_PENDING_ASKS: usize = 256;
 /// Angreifer mit mehr uids, als die Tabelle fasst.
 pub const MAX_STARVED_EPISODES: usize = 256;
 
+// Höchstwert von `DispatchConfig::max_parallel`: mehr vergebene Aufträge
+// kann kein Zustand tragen, den eine gültige Konfiguration geschrieben hat
+// (`Dispatcher::restore` lehnt sie ab).
+pub(crate) const MAX_PARALLEL_LIMIT: usize = 64;
+
+// Höchstwert von `DispatchConfig::queue_capacity`: mehr wartende Aufträge
+// kann kein Zustand tragen, den eine gültige Konfiguration geschrieben hat
+// (`Dispatcher::restore` lehnt sie ab).
+pub(crate) const QUEUE_CAPACITY_LIMIT: usize = 65_536;
+
 /// Einstellungen des Dispatchers.
 ///
 /// # Description
@@ -267,10 +283,10 @@ impl DispatchConfig {
         let invalid = |field: &'static str, reason: &'static str| {
             Err(DispatchError::InvalidConfig { field, reason })
         };
-        if !(1..=64).contains(&self.max_parallel) {
+        if !(1..=MAX_PARALLEL_LIMIT).contains(&self.max_parallel) {
             return invalid("max_parallel", "must be between 1 and 64");
         }
-        if !(1..=65_536).contains(&self.queue_capacity) {
+        if !(1..=QUEUE_CAPACITY_LIMIT).contains(&self.queue_capacity) {
             return invalid("queue_capacity", "must be between 1 and 65536");
         }
         if !(1..=86_400).contains(&self.group_window_secs) {
@@ -589,7 +605,8 @@ pub(crate) struct InFlight {
 /// Undurchsichtig bis auf Version und Zähler; serialisierbar mit jedem
 /// Serde-Format. [`Dispatcher::restore`] prüft ihn vollständig, ein
 /// manipulierter Zustand kann also keine ungeprüfte Zeichenkette in ein
-/// Template bringen.
+/// Template bringen, und kürzt ihn auf die Grenzen der dort übergebenen
+/// Konfiguration.
 ///
 /// # Examples
 /// ```
@@ -1106,6 +1123,66 @@ impl Dispatcher {
     /// danach nicht gibt oder der zu einem anderen Vorfall gehört, wird
     /// gelöst (das nächste Mitglied bekommt einen neuen Auftrag).
     ///
+    /// # Grenzen
+    /// Es gelten die Grenzen von `config`, auch wenn der Zustand unter
+    /// größeren geschrieben (oder manipuliert) wurde. Jede Tabelle wird
+    /// **vor** dem Bau des Dispatchers geprüft und dann deterministisch auf
+    /// genau ihre Grenze gekürzt; ein zu großer Zustand ist also nie
+    /// lebendig, und Laufzeit und Speicher danach hängen nur an `config`.
+    /// Je Tabelle gilt eine feste Regel:
+    /// - In der Ordnung ihrer Verdrängung zur Laufzeit, bei Gleichstand
+    ///   bleibt der größere Schlüssel:
+    ///   - bekannte Schlüssel (`max_known_keys`): die zuletzt gesehenen; ein
+    ///     gefallener gilt wieder als neu (höchstens eine erneute Triage, nie
+    ///     eine Unterdrückung);
+    ///   - Cgroups des [`IncidentGrouper`] (`max_tracked_cgroups`): die
+    ///     zuletzt beobachteten; die Vorfall-Kennungen laufen weiter;
+    ///   - Eimer und uid-Eimer des Budgets (`budget.max_partitions`): erst
+    ///     fallen die vollen (gleichwertig zu keinem), dann die am längsten
+    ///     unbenutzten;
+    ///   - Breaker (`breaker.max_partitions`): offene vor geschlossenen, dann
+    ///     die zuletzt benutzten ([`BreakerSet`]).
+    /// - Erstsichtungen und Vorrechte je uid des Budgets
+    ///   (`budget.max_partitions`) verdrängt die Laufzeit nie lebend (eine
+    ///   volle Tabelle nimmt nichts Neues auf). Beim Laden fallen sie
+    ///   fail-closed nach eigener Regel ([`PartitionedBudget`], „Speicher"):
+    ///   Erstsichtungen, die relativ zur jüngsten Sichtung abgelaufen sind,
+    ///   dann die zuletzt aufgenommenen, so dass die am längsten etablierten
+    ///   bleiben; Vorrechte die ältesten. Ein gefallener Eintrag kostet
+    ///   höchstens ein Vorrecht, gibt aber (bei vorwärtslaufender Zeit) keines
+    ///   zusätzlich.
+    /// - Warteschlange (`queue_capacity`) samt der zurückgestellten
+    ///   vergebenen Aufträge: die dringendsten, bei gleicher Dringlichkeit
+    ///   der früher eingereihte (FIFO; zurückgestellte kommen hinter die
+    ///   wartenden). Der Rest zählt als [`DropReason::QueueOverflow`] und
+    ///   seine Schlüssel gelten wieder als neu. Mehr vergebene Aufträge als
+    ///   `max_parallel` sind deshalb kein Fehler: nach dem Neustart ist
+    ///   keiner mehr vergeben.
+    ///
+    /// Abgelehnt ([`DispatchError::InvalidState`]) wird ein Zustand über einer
+    /// Grenze, die keine gültige Konfiguration überschreiten lässt, wenn das
+    /// Kürzen Information verlöre oder Arbeit und Speicher proportional zum
+    /// Zustand kostete:
+    /// - mehr als 64 vergebene Aufträge (Höchstwert von `max_parallel`) oder
+    ///   mehr als 65536 wartende (Höchstwert von `queue_capacity`); damit
+    ///   sind Prüfung, Sortierung und Zurückstellen der Aufträge durch
+    ///   Konstanten begrenzt;
+    /// - mehr als [`MAX_PENDING_ASKS`] Rückfragen (eine zu kürzen hieße, sie
+    ///   ohne [`DispatchAction::AskWithdrawn`] zu verlieren) oder
+    ///   [`MAX_STARVED_EPISODES`] Episoden;
+    /// - mehr als [`MAX_JOB_MEMBERS`] Mitglieder in einem Auftrag oder
+    ///   [`crate::MAX_ENTRIES_PER_CGROUP`] wartende Befunde in einer Cgroup.
+    ///
+    /// Die Schlüssel-, Cgroup-, Budget- und Breaker-Tabellen werden dagegen
+    /// auch über dem Höchstwert ihrer Grenze nur gekürzt: das geschieht an
+    /// Ort und Stelle, mit Zusatzspeicher höchstens in Höhe der aktiven
+    /// Grenze (`crate::prune`), und verliert nichts, was die Laufzeit nicht
+    /// ebenso verlieren dürfte.
+    ///
+    /// Eine gekürzte Warteschlange kostet je verdrängtem Mitglied nur einen
+    /// Zähler und das Vergessen seines Schlüssels; Vorfall-Bindungen an
+    /// verdrängte Aufträge löst ein einziger Durchlauf am Ende.
+    ///
     /// # Arguments
     /// - `config` (`DispatchConfig`): Einstellungen.
     /// - `state` (`DispatchState`): ein Schnappschuss.
@@ -1113,7 +1190,22 @@ impl Dispatcher {
     /// # Errors
     /// - [`DispatchError::InvalidConfig`] aus [`DispatchConfig::validate`];
     /// - [`DispatchError::UnsupportedStateVersion`] bei fremder Version;
-    /// - [`DispatchError::InvalidState`] bei ungültigem Inhalt.
+    /// - [`DispatchError::InvalidState`] bei ungültigem Inhalt, auch wenn
+    ///   der ungültige Eintrag danach gekürzt worden wäre, und bei mehr
+    ///   Einträgen als eine der konstanten Grenzen erlaubt („Grenzen").
+    ///
+    /// # Examples
+    /// ```
+    /// use harw_dod_dispatch::{DispatchConfig, Dispatcher};
+    ///
+    /// let wide = DispatchConfig { max_known_keys: 1_000, ..DispatchConfig::default() };
+    /// let state = Dispatcher::new(wide)?.snapshot();
+    /// // Eine kleinere Grenze beim Neustart gilt sofort.
+    /// let narrow = DispatchConfig { max_known_keys: 1, ..wide };
+    /// let restored = Dispatcher::restore(narrow, state)?;
+    /// assert_eq!(restored.config().max_known_keys, 1);
+    /// # Ok::<(), harw_dod_dispatch::DispatchError>(())
+    /// ```
     pub fn restore(config: DispatchConfig, state: DispatchState) -> Result<Self, DispatchError> {
         config.validate()?;
         let DispatchState {
@@ -1138,6 +1230,15 @@ impl Dispatcher {
         }
         if next_job < 1 {
             return Err(DispatchError::InvalidState { what: "next job" });
+        }
+        // Mehr Aufträge, als irgendeine gültige Konfiguration zulässt, kann
+        // die Laufzeit nicht schreiben: manipuliert. Ab hier sind Prüfung,
+        // Kennungsliste, Sortierung und Zurückstellen der Aufträge durch
+        // Konstanten begrenzt, nicht durch den Zustand.
+        if in_flight.len() > MAX_PARALLEL_LIMIT || queue.entries.len() > QUEUE_CAPACITY_LIMIT {
+            return Err(DispatchError::InvalidState {
+                what: "triage jobs",
+            });
         }
         let routes = RouteTable::new();
         let grouper = IncidentGrouper::import(
@@ -1199,6 +1300,19 @@ impl Dispatcher {
                 what: "starved episodes",
             });
         }
+        // Tabellen mit einer Grenze aus `config` werden hier, vor dem Bau
+        // des Dispatchers, auf die aktive Grenze gekürzt („Grenzen" oben).
+        let known = KnownKeys::import(config.known_key_ttl_secs, config.max_known_keys, known)?;
+        let budget = PartitionedBudget::import(config.budget, budget)?;
+        let breakers = BreakerSet::import(config.breaker, breakers)?;
+        // Vergebene Aufträge kommen hinter die wartenden, als würden sie in
+        // dieser Reihenfolge neu eingereiht; dann wird alles in einem Schritt
+        // auf die Kapazität gekürzt (die dringendsten bleiben).
+        queue.append(in_flight.into_iter().map(|flight| flight.job), |job| {
+            job.priority().ok_or(DispatchError::InvalidState {
+                what: "triage jobs",
+            })
+        })?;
         let (queue, overflow) = PriorityQueue::import(config.queue_capacity, queue);
         let mut dispatcher = Self {
             config,
@@ -1206,35 +1320,34 @@ impl Dispatcher {
             policy: ReTriagePolicy::new(),
             queue,
             in_flight: Vec::new(),
-            known: KnownKeys::import(config.known_key_ttl_secs, config.max_known_keys, known)?,
+            known,
             grouper,
-            budget: PartitionedBudget::import(config.budget, budget)?,
-            breakers: BreakerSet::import(config.breaker, breakers)?,
+            budget,
+            breakers,
             counters,
             next_job,
             pending_asks,
             starved_episodes,
             degraded_until_unix,
         };
-        // Beim Wiederherstellen gibt es keinen Empfänger für Aktionen; die
-        // Zähler laufen trotzdem.
-        let mut unreported = Vec::new();
+        // Eine Verdrängung (auch eines eben noch vergebenen Auftrags) zählt
+        // wie ein Überlauf; ihre Vorfall-Bindung löst `retain_bindings` unten.
         for job in overflow {
-            dispatcher.report_overflow(&mut unreported, &job);
+            dispatcher.drop_restored_overflow(&job);
         }
-        for flight in in_flight {
-            // Eine Verdrängung zählt wie ein Überlauf.
-            dispatcher.push_queued(&mut unreported, flight.job);
-        }
-        // Nach dem Neustart ist jeder lebende Auftrag in der Warteschlange.
-        let live: Vec<(TriageJobId, Option<IncidentId>)> = dispatcher
+        // Nach dem Neustart ist jeder lebende Auftrag in der Warteschlange
+        // (höchstens `queue_capacity`, Kennungen eindeutig, oben geprüft).
+        let mut live: Vec<(TriageJobId, Option<IncidentId>)> = dispatcher
             .queue
             .iter()
             .map(|job| (job.job_id, job.incident_id))
             .collect();
+        live.sort_unstable_by_key(|(id, _)| *id);
         dispatcher.grouper.retain_bindings(|incident, job| {
-            live.iter()
-                .any(|(id, bound)| *id == job && *bound == Some(incident))
+            live.binary_search_by_key(&job, |(id, _)| *id)
+                .ok()
+                .and_then(|index| live.get(index))
+                .is_some_and(|(_, bound)| *bound == Some(incident))
         });
         Ok(dispatcher)
     }
@@ -1604,6 +1717,18 @@ impl Dispatcher {
         self.forget_members(job);
     }
 
+    // Überlauf beim Laden (`restore`): zählt jedes Mitglied wie
+    // `report_overflow` und vergisst seinen Schlüssel, aber ohne Aktionen
+    // (niemand empfängt sie) und ohne `unbind_job`, das je Auftrag alle
+    // Cgroups durchliefe. Die Bindungen an verdrängte Aufträge löst das
+    // `retain_bindings` am Ende von `restore` in einem Durchlauf.
+    fn drop_restored_overflow(&mut self, job: &QueuedTriage) {
+        for member in &job.members {
+            self.counters.dropped.bump(DropReason::QueueOverflow);
+            self.known.forget(&member.dedup_key);
+        }
+    }
+
     // Vergisst die Schlüssel eines Auftrags und löst ihn vom Vorfall.
     fn forget_members(&mut self, job: &QueuedTriage) {
         for member in &job.members {
@@ -1799,3 +1924,11 @@ fn admit(finding: &DispatchFinding, route: Option<Route>) -> Result<Route, DropR
     }
     Ok(route)
 }
+
+// Grenzen beim Wiederherstellen (PL-100 WP2.1, Review 4505196829). Ein
+// Kindmodul, damit die Tests Zustände über einer konstanten Grenze direkt
+// über die privaten Felder von `DispatchState` bauen können, statt sie als
+// riesiges JSON zu serialisieren.
+#[cfg(test)]
+#[path = "restore_tests.rs"]
+mod restore_tests;

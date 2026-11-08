@@ -90,6 +90,7 @@ mod error;
 mod finding;
 mod group;
 mod job;
+mod prune;
 mod queue;
 mod retriage;
 mod route;

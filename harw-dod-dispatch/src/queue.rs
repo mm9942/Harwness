@@ -20,7 +20,11 @@
 //! Linearer Durchlauf je Entnahme und Verdrängung. Die Kapazität ist durch
 //! [`crate::DispatchConfig::validate`] begrenzt (Vorgabe 1024), deshalb
 //! bleibt das billig und der Zustand ist ein schlichter, serialisierbarer
-//! Vektor.
+//! Vektor. Ein geladener Zustand kann mehr Einträge tragen als die
+//! Kapazität (etwa nach einer Verkleinerung; [`crate::Dispatcher::restore`]
+//! lässt höchstens 65536 wartende plus 64 zurückgestellte zu); er wird beim
+//! Laden mit einer Sortierung auf die Kapazität gekürzt, nicht Eintrag für
+//! Eintrag.
 //!
 //! # Nebenläufigkeit und Fehler
 //! `&mut self`, keine inneren Sperren; keine Fehlerfälle.
@@ -132,6 +136,44 @@ pub(crate) struct QueueState<T> {
     pub(crate) evictions: u64,
     // Einträge in beliebiger Reihenfolge.
     pub(crate) entries: Vec<QueueEntry<T>>,
+}
+
+impl<T> QueueState<T> {
+    // Nächste freie Einreihungsnummer: hinter `next_seq` und hinter jeder
+    // vorhandenen (ein Zustand kann eine zu kleine `next_seq` tragen).
+    fn resume_seq(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|entry| entry.seq)
+            .max()
+            .map_or(self.next_seq, |seq| {
+                self.next_seq.max(seq.saturating_add(1))
+            })
+    }
+
+    // Hängt `items` mit neuen Einreihungsnummern hinten an, als würden sie
+    // in dieser Reihenfolge nach allen vorhandenen Einträgen eingereiht
+    // (bei gleicher Dringlichkeit kommen sie also danach). `priority`
+    // liefert die Dringlichkeit; der erste Fehler bricht ab. Gekürzt wird
+    // erst in `PriorityQueue::import`, in einem Schritt für alle Einträge.
+    pub(crate) fn append<I, F, E>(&mut self, items: I, mut priority: F) -> Result<(), E>
+    where
+        I: IntoIterator<Item = T>,
+        F: FnMut(&T) -> Result<TriagePriority, E>,
+    {
+        let mut seq = self.resume_seq();
+        for item in items {
+            let entry = QueueEntry {
+                priority: priority(&item)?,
+                seq,
+                item,
+            };
+            self.entries.push(entry);
+            seq = seq.saturating_add(1);
+        }
+        self.next_seq = seq;
+        Ok(())
+    }
 }
 
 /// Beschränkte Prioritäts-Warteschlange (siehe Moduldoku).
@@ -296,34 +338,40 @@ impl<T> PriorityQueue<T> {
         }
     }
 
-    // Baut die Warteschlange aus einem Zustand; was über `capacity` liegt,
-    // wird nach Dringlichkeit verdrängt und zurückgegeben.
-    pub(crate) fn import(capacity: usize, state: QueueState<T>) -> (Self, Vec<T>) {
-        let max_seq = state.entries.iter().map(|entry| entry.seq).max();
-        let next_seq = match max_seq {
-            Some(seq) => state.next_seq.max(seq.saturating_add(1)),
-            None => state.next_seq,
+    // Baut die Warteschlange aus einem Zustand; was über `capacity` liegt
+    // (Grenze der aktiven Konfiguration), wird nach Dringlichkeit verdrängt,
+    // gezählt und zurückgegeben, der schwächste zuerst. Das ergibt dieselbe
+    // Auswahl wie wiederholtes Verdrängen des schwächsten, aber mit einer
+    // Sortierung an Ort und Stelle (`O(n log n)`) statt eines Durchlaufs je
+    // verdrängtem Eintrag: ein riesiger Zustand kostet nicht quadratisch
+    // Zeit. Neuen Speicher bekommen nur die behaltenen Einträge (höchstens
+    // `capacity`); die verdrängten bleiben im geladenen Vektor, über den der
+    // zurückgegebene Iterator läuft. Passt alles, bleibt die Reihenfolge
+    // unverändert.
+    pub(crate) fn import(capacity: usize, state: QueueState<T>) -> (Self, impl Iterator<Item = T>) {
+        let next_seq = state.resume_seq();
+        let QueueState {
+            mut evictions,
+            mut entries,
+            ..
+        } = state;
+        let surplus = entries.len().saturating_sub(capacity);
+        let overflow = if surplus > 0 {
+            // Aufsteigend nach Dringlichkeit: vorn die schwächsten.
+            entries.sort_unstable_by(entry_cmp);
+            evictions = evictions.saturating_add(u64::try_from(surplus).unwrap_or(u64::MAX));
+            let kept = entries.split_off(surplus);
+            std::mem::replace(&mut entries, kept)
+        } else {
+            Vec::new()
         };
-        let mut queue = Self {
+        let queue = Self {
             capacity,
             next_seq,
-            evictions: state.evictions,
-            entries: state.entries,
+            evictions,
+            entries,
         };
-        let mut overflow = Vec::new();
-        while queue.entries.len() > queue.capacity {
-            let Some(position) = queue.position_of(Ordering::Less) else {
-                break;
-            };
-            match take_at(&mut queue.entries, position) {
-                Some(entry) => {
-                    queue.evictions = queue.evictions.saturating_add(1);
-                    overflow.push(entry.item);
-                }
-                None => break,
-            }
-        }
-        (queue, overflow)
+        (queue, overflow.into_iter().map(|entry| entry.item))
     }
 }
 
@@ -520,10 +568,94 @@ mod tests {
             assert!(matches!(queue.push(prio, item), PushOutcome::Queued));
         }
         let (mut restored, overflow) = PriorityQueue::import(2, queue.export());
-        assert_eq!(overflow, [1]);
+        assert_eq!(overflow.collect::<Vec<_>>(), [1]);
         assert_eq!(restored.evictions(), 1);
         assert_eq!(restored.pop(), Some(2));
         assert_eq!(restored.pop(), Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn test_import_keeps_what_repeated_eviction_would_keep() -> TestResult {
+        // Deterministische Pseudo-Zufallsfolge (kein proptest im Workspace)
+        // mit vielen Gleichständen in der Dringlichkeit.
+        let hardnesses = [Hardness::Observed, Hardness::Correlated, Hardness::Inferred];
+        let mut full = PriorityQueue::new(1_000);
+        let mut state = 0x7f4a_7c15_u32;
+        for item in 0..300_u32 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let pick = |shift: u32, modulus: u32| {
+                state
+                    .checked_shr(shift)
+                    .unwrap_or(0)
+                    .checked_rem(modulus)
+                    .unwrap_or(0)
+            };
+            let hardness = usize::try_from(pick(8, 3))
+                .ok()
+                .and_then(|index| hardnesses.get(index).copied())
+                .unwrap_or(Hardness::Inferred);
+            let prio = priority(
+                pick(4, 2) == 0,
+                hardness,
+                Severity::High,
+                i64::from(pick(20, 4)),
+            );
+            assert!(matches!(full.push(prio, item), PushOutcome::Queued));
+        }
+        // Die Referenz: alle Einträge in Entnahme-Reihenfolge.
+        let mut reference = full.clone();
+        let order: Vec<u32> = std::iter::from_fn(|| reference.pop()).collect();
+        for capacity in [1_usize, 50, 299, 300, 400] {
+            let (mut restored, overflow) = PriorityQueue::import(capacity, full.export());
+            let overflow: Vec<u32> = overflow.collect();
+            let kept = capacity.min(order.len());
+            let popped: Vec<u32> = std::iter::from_fn(|| restored.pop()).collect();
+            let expected: Vec<u32> = order.iter().take(kept).copied().collect();
+            assert_eq!(popped, expected, "capacity {capacity}");
+            // Verdrängt: der schwächste zuerst.
+            let mut weakest_first: Vec<u32> = order.iter().skip(kept).copied().collect();
+            weakest_first.reverse();
+            assert_eq!(overflow, weakest_first, "capacity {capacity}");
+            let surplus = u64::try_from(order.len().saturating_sub(kept)).unwrap_or(u64::MAX);
+            assert_eq!(restored.evictions(), surplus);
+            assert_eq!(restored.next_seq, 300);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_appended_entries_queue_after_the_existing_ones() -> TestResult {
+        let same = priority(true, Hardness::Observed, Severity::High, 7);
+        let mut queue = PriorityQueue::new(8);
+        for item in [1_u8, 2] {
+            assert!(matches!(queue.push(same, item), PushOutcome::Queued));
+        }
+        let mut state = queue.export();
+        // Eine zu kleine `next_seq` (manipuliert) vergibt keine Nummer doppelt.
+        state.next_seq = 0;
+        let appended: Result<(), &str> = state.append([3_u8, 4], |_| Ok(same));
+        assert!(appended.is_ok());
+        assert_eq!(state.next_seq, 4);
+        let (mut roomy, overflow) = PriorityQueue::import(8, state.clone());
+        assert_eq!(overflow.count(), 0);
+        let order: Vec<u8> = std::iter::from_fn(|| roomy.pop()).collect();
+        assert_eq!(order, [1, 2, 3, 4]);
+        // Bei gleicher Dringlichkeit verliert der zuletzt angehängte.
+        let (mut tight, overflow) = PriorityQueue::import(3, state);
+        assert_eq!(overflow.collect::<Vec<_>>(), [4]);
+        let order: Vec<u8> = std::iter::from_fn(|| tight.pop()).collect();
+        assert_eq!(order, [1, 2, 3]);
+        // Der erste Fehler bricht ab.
+        let mut failing = queue.export();
+        let refused: Result<(), &str> = failing.append([5_u8, 6], |item| {
+            if *item == 6 {
+                Err("no priority")
+            } else {
+                Ok(same)
+            }
+        });
+        assert_eq!(refused, Err("no priority"));
         Ok(())
     }
 }

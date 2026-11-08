@@ -11,7 +11,7 @@
 //! `Starved` je Ursache und uid mit Erinnerung je Fenster, Markierung
 //! „Sensoren degradiert", Zustands-Rundreise mit Prüfung und
 //! Konfigurationsprüfung. Die Helfer sind `pub(crate)`, damit `storm_tests`
-//! (Schritt 2) sie mitbenutzt.
+//! (Schritt 2) und `restore_tests` sie mitbenutzen.
 
 use crate::test_support::{TestError, TestResult, missing};
 use crate::*;
@@ -57,7 +57,13 @@ pub(crate) fn finding(n: u32, rule: &str, severity: Severity) -> DispatchFinding
 }
 
 // Ein Befund auf einer Cgroup mit Ereigniszeit `NOW + offset`.
-fn on_cgroup(n: u32, rule: &str, severity: Severity, cgroup: u64, offset: i64) -> DispatchFinding {
+pub(crate) fn on_cgroup(
+    n: u32,
+    rule: &str,
+    severity: Severity,
+    cgroup: u64,
+    offset: i64,
+) -> DispatchFinding {
     DispatchFinding {
         cgroup_kid: Some(cgroup),
         observed_at_unix: NOW.saturating_add(offset),
@@ -66,7 +72,7 @@ fn on_cgroup(n: u32, rule: &str, severity: Severity, cgroup: u64, offset: i64) -
 }
 
 // Großzügiges Budget, damit nur das jeweils getestete Verhalten greift.
-fn roomy() -> DispatchConfig {
+pub(crate) fn roomy() -> DispatchConfig {
     DispatchConfig {
         budget: BudgetConfig {
             partition_capacity: 1_000,
@@ -401,7 +407,7 @@ fn test_loopback_egress_asks_the_user_instead_of_triage() -> TestResult {
 }
 
 // Ein Loopback-Egress-Befund (Rückfrage statt Triage).
-fn loopback(n: u32) -> DispatchFinding {
+pub(crate) fn loopback(n: u32) -> DispatchFinding {
     DispatchFinding {
         loopback: true,
         ..finding(n, RULE_EGRESS_FLOW, Severity::Medium)
