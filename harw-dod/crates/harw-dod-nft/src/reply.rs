@@ -263,7 +263,7 @@ fn parse_error(header: Header, message: &[u8]) -> NftResult<Ack> {
     // `struct nlmsgerr`: `int error`, dann die Kopie von `struct nlmsghdr`.
     let (nlmsgerr, _) = message
         .get(NLMSG_HDRLEN..)
-        .and_then(|payload| payload.split_first_chunk::<NLMSGERR_LEN>())
+        .and_then(<[u8]>::split_first_chunk::<NLMSGERR_LEN>)
         .ok_or(too_short)?;
     let (error, echoed) = nlmsgerr.split_first_chunk::<4>().ok_or(too_short)?;
     let (echoed, _) = echoed
