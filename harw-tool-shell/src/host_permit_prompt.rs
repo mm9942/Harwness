@@ -85,8 +85,10 @@ pub enum HostPermitVariant {
     /// ausgelöst hat; nach einer Ausführung verbraucht.
     #[default]
     SingleExecution,
-    /// Variante 2: genehmigt eine Host-Arbeitsphase für die laufende
-    /// Sitzung, bis der Nutzer sie beendet (kein Zeitablauf).
+    /// Variante 2: genehmigt eine Host-Arbeitsphase (prozessweit, inkl. aller
+    /// Kind-Agenten), bis ihr Fenster abläuft (`[sandbox]
+    /// host_lease_ttl_secs`, Vorgabe 8 h; PL-100 Phase 4, B22, ADR 0002)
+    /// oder der Nutzer sie vorher beendet.
     SessionLease,
 }
 
@@ -96,7 +98,7 @@ impl HostPermitVariant {
     pub fn label(self) -> &'static str {
         match self {
             Self::SingleExecution => "Einmalig für diesen Auftrag",
-            Self::SessionLease => "Host-Arbeitsphase für diese Sitzung (bis Strg+H)",
+            Self::SessionLease => "Host-Arbeitsphase für diese Sitzung (bis Ablauf oder Strg+H)",
         }
     }
 }

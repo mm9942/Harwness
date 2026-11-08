@@ -534,7 +534,7 @@ fn test_field_table_exhaustive_rule_toml() {
 
 // ---------------------------------------------------------------------
 // [sandbox] (Abschnitt 1.12, 2 Container-Felder + Cargo 4 + Tmux 2 +
-// `execution`, PL-97 E2)
+// `execution`, PL-97 E2, + `host_lease_ttl_secs`, PL-100 Phase 4)
 // ---------------------------------------------------------------------
 
 #[test]
@@ -543,9 +543,15 @@ fn test_field_table_exhaustive_sandbox_section() {
         cargo,
         tmux,
         execution,
+        host_lease_ttl_secs,
     } = SandboxSection::default();
-    let _ = (cargo, tmux, execution);
-    for path in ["sandbox.cargo", "sandbox.tmux", "sandbox.execution"] {
+    let _ = (cargo, tmux, execution, host_lease_ttl_secs);
+    for path in [
+        "sandbox.cargo",
+        "sandbox.tmux",
+        "sandbox.execution",
+        "sandbox.host_lease_ttl_secs",
+    ] {
         assert_path_in_field_table_exactly_once(path);
     }
 }
@@ -558,6 +564,21 @@ fn test_sandbox_execution_is_profile_scoped_and_security_critical() -> TestResul
         .iter()
         .find(|f| f.path == "sandbox.execution")
         .ok_or(common::TestError::Missing("sandbox.execution"))?;
+    assert_eq!(entry.scope, harw_config::Scope::Profile);
+    assert_eq!(entry.merge, harw_config::MergeRule::ProfileReplaces);
+    assert!(entry.security_critical);
+    Ok(())
+}
+
+// PL-100 Phase 4 (B22, ADR 0002): `sandbox.host_lease_ttl_secs` ist
+// Profil-Ebene und sicherheitsrelevant; ein nicht vertrautes Projekt darf
+// Host-Arbeitsphasen nicht verlängern (`ProfileReplaces`).
+#[test]
+fn test_sandbox_host_lease_ttl_is_profile_scoped_and_security_critical() -> TestResult {
+    let entry = FIELD_TABLE
+        .iter()
+        .find(|f| f.path == "sandbox.host_lease_ttl_secs")
+        .ok_or(common::TestError::Missing("sandbox.host_lease_ttl_secs"))?;
     assert_eq!(entry.scope, harw_config::Scope::Profile);
     assert_eq!(entry.merge, harw_config::MergeRule::ProfileReplaces);
     assert!(entry.security_critical);

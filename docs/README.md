@@ -36,6 +36,7 @@ Architecture decision records live in [`adr/`](adr/), numbered in order.
 | ADR | Status |
 | --- | --- |
 | [0001 — Agent compiler: IR v2, artifacts and standalone binaries](adr/0001-agent-compiler.md) | accepted, partially implemented |
+| [0002 — Host work phases (session leases) expire](adr/0002-session-lease-expiry.md) | accepted |
 
 ## Architecture
 

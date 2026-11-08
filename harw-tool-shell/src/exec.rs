@@ -81,7 +81,8 @@ use harw_command::{
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_sandbox::{
     BwrapLauncher, HostApprovalScope, HostPathBinding, HostPermitSessionRegistry,
-    ProcessEnvironment, ProcessPermitLedger, ProcessPermitRequest, SandboxProfile,
+    ProcessEnvironment, ProcessPermitError, ProcessPermitId, ProcessPermitLedger,
+    ProcessPermitRequest, SandboxProfile,
 };
 use harw_tools::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
@@ -142,11 +143,20 @@ const HOST_WORKER_DEFINITION: &str = "host-process-worker@1";
 /// [`HostPermitVariant::SingleExecution`]-Frage ausgestellten Permits, bis
 /// der genehmigte Auftrag tatsächlich läuft: eine Einzelfreigabe soll nicht
 /// als lange gültiges „stilles Ja" liegen bleiben. Eine Host-Arbeitsphase
-/// ([`HostPermitVariant::SessionLease`]) hat dagegen **keine** Ablaufzeit —
-/// weder in der [`HostPermitSessionRegistry`] noch für ihre Ledger-Permits
-/// (`ttl = None`): sie endet nur, wenn der Nutzer sie beendet (Strg+H oder
-/// `/sandbox-lease revoke`, Nutzerentscheidung 2026-09-24).
+/// ([`HostPermitVariant::SessionLease`]) endet dagegen mit ihrem
+/// Zeitfenster aus der [`HostPermitSessionRegistry`] (Vorgabe 8 h,
+/// `[sandbox] host_lease_ttl_secs`; PL-100 Phase 4, B22, ersetzt die
+/// Nutzerentscheidung 2026-09-24 „kein Zeitablauf“) oder vorher, wenn der
+/// Nutzer sie beendet (Strg+H oder `/sandbox-lease revoke`). Ihre
+/// Ledger-Permits stellt [`ProcessPermitLedger::issue_for_lease`] aus: sie
+/// enden spätestens mit diesem Fenster.
 const HOST_SINGLE_EXECUTION_TTL: Duration = Duration::from_secs(5 * 60);
+/// Ablehnungsnachricht, wenn nach einer gerade erteilten Zustimmung zur
+/// Host-Arbeitsphase kein aktives Zeitfenster die Sitzung abdeckt (etwa weil
+/// das Fensterende nicht darstellbar war oder die Phase sofort wieder endete):
+/// es wird kein Permit ausgestellt (fail-closed, B22).
+const HOST_LEASE_UNAVAILABLE_MSG: &str = "shell.exec: host execution not authorized: the host \
+     work phase is not active (expired or ended); approve it again";
 /// Vorgabe-Wartezeit auf **eine** Nutzerentscheidung auf eine offene
 /// [`HostPermitPrompt`]. Läuft sie ab, gilt das als Ablehnung
 /// (fail-closed) — deckt sich mit
@@ -536,10 +546,13 @@ impl ShellExecutor {
     /// 1. Für genau diesen Antrag existiert bereits ein gemerkter Permit
     ///    (siehe [`HostPermitSessionRegistry::lookup_permit`]): er wird über
     ///    [`ProcessPermitLedger::authorize`] direkt verwendet.
-    /// 2. Kein gemerkter Permit, aber die Sitzung hat bereits eine laufende
-    ///    Host-Arbeitsphase (siehe [`HostPermitSessionRegistry::is_session_approved`]):
-    ///    ein neuer Permit wird für genau diesen Antrag ausgestellt, gemerkt
-    ///    und sofort autorisiert — ohne erneute Frage.
+    /// 2. Kein gemerkter Permit, aber eine aktive Host-Arbeitsphase deckt die
+    ///    Sitzung ab (siehe [`HostPermitSessionRegistry::covering_lease`]):
+    ///    ein neuer Permit wird für genau diesen Antrag über
+    ///    [`ProcessPermitLedger::issue_for_lease`] ausgestellt (er endet
+    ///    spätestens mit dem Fenster der Phase), gemerkt und sofort
+    ///    autorisiert — ohne erneute Frage. Eine abgelaufene Phase deckt
+    ///    nichts ab (B22): dann geht es mit Fall 3 weiter.
     /// 3. Weder ein gemerkter Permit noch eine Sitzungsphase, aber ein
     ///    Fragekanal ist angehängt ([`Self::host_permit_prompts`]): eine
     ///    [`HostPermitPrompt`] geht an die anzeigende Oberfläche und diese
@@ -547,8 +560,13 @@ impl ShellExecutor {
     ///    [`Self::host_permit_timeout`] lang. Eine Zustimmung stellt einen
     ///    Permit aus (Umfang aus der gewählten [`HostPermitVariant`]) und
     ///    trägt bei [`HostPermitVariant::SessionLease`] zusätzlich die
-    ///    Sitzungsphase ein — danach fragt kein weiterer Auftrag dieser
-    ///    Sitzung erneut.
+    ///    **prozessweite** Phase ein
+    ///    ([`HostPermitSessionRegistry::mark_global_approval`]) — danach
+    ///    fragt kein weiterer Auftrag dieses `harw`-Prozesses erneut, bis die
+    ///    Phase abläuft oder der Nutzer sie beendet. Ein eigenes Fenster der
+    ///    fragenden (Kind-)Sitzung entsteht dabei nicht: Strg+H
+    ///    (`ChatApp::end_host_mode`) räumt nur die Root-Sitzung und die
+    ///    prozessweite Phase ab, ein Kind-Fenster überlebte es (B22).
     /// 4. Jeder andere Ausgang — kein Fragekanal angehängt, der Kanal ist
     ///    geschlossen, die Antwort wurde fallengelassen, die Wartezeit lief
     ///    ab, oder ausdrücklich abgelehnt — ist eine Ablehnung (fail-closed,
@@ -588,17 +606,26 @@ impl ShellExecutor {
             return Ok(());
         }
         // Gemerkter Permit ist abgelaufen oder wurde widerrufen; fällt
-        // unten zur Neubeantragung durch, falls die Sitzung weiterhin
-        // zugestimmt hat oder jetzt gefragt werden kann.
+        // unten zur Neubeantragung durch, falls weiterhin eine aktive
+        // Host-Arbeitsphase die Sitzung abdeckt oder jetzt gefragt werden kann.
 
-        if registry.is_session_approved(session_id) {
-            return Self::issue_and_remember(
-                ledger,
-                registry,
-                request,
-                HostApprovalScope::SessionLease,
-                None,
-            );
+        // Ein einziger Abruf des Fensters (statt `is_session_approved` und
+        // danach `covering_lease`): keine Lücke zwischen Prüfung und Bindung.
+        if let Some(window) = registry.covering_lease(session_id) {
+            match ledger.issue_for_lease(request.clone(), window) {
+                Ok(id) => return Self::remember_and_authorize(ledger, registry, request, id),
+                // Die Phase endete zwischen Abruf und Ausstellung: wie ohne
+                // Phase weiter (neu fragen), nie ein frischer 8-h-Permit.
+                Err(ProcessPermitError::Expired) => {
+                    debug!(
+                        session_id = %session_id,
+                        "shell.exec: host lease ended before issuance; asking again"
+                    );
+                }
+                Err(err) => {
+                    return Err(format!("shell.exec: host execution not authorized: {err}"));
+                }
+            }
         }
 
         self.prompt_for_authorization(ledger, registry, request)
@@ -652,13 +679,21 @@ impl ShellExecutor {
         };
 
         if variant == HostPermitVariant::SessionLease {
-            registry.mark_session_approved(request.session.clone());
             // Eine Host-Arbeitsphase gilt prozessweit — wie `/sandbox-lease`
             // und die Host-Mode-Anfrage (`exec/escalation.rs`). Vorher galt
             // sie nur für die fragende (Kind-)Sitzung: jedes neue
             // `uia-shell-worker`-Kind fragte erneut und die TUI meldete
             // „Host-Arbeitsphase freigegeben“ jedes Mal wieder. Strg+H
             // (`ChatApp::end_host_mode`) widerruft die globale Freigabe.
+            //
+            // Bewusst **kein** zusätzliches `mark_session_approved` für die
+            // fragende Sitzung (PL-100 Phase 4, B22): Strg+H beendet nur die
+            // Root-Sitzung und die globale Phase. Ein Fenster der
+            // Kind-Sitzung hätte das überlebt, und das Kind hätte bis zu
+            // dessen Ablauf ohne Nachfrage weiter auf dem Host gearbeitet,
+            // obwohl die TUI „Isolation wieder aktiv“ meldete. Das globale
+            // Fenster deckt jede Sitzung ab; `issue_and_remember` bindet den
+            // Permit daran.
             registry.mark_global_approval();
         }
         let (scope, ttl) = match variant {
@@ -666,15 +701,34 @@ impl ShellExecutor {
                 HostApprovalScope::SingleExecution,
                 Some(HOST_SINGLE_EXECUTION_TTL),
             ),
-            // Kein Zeitablauf: gilt bis Strg+H / `/sandbox-lease revoke`.
+            // Die Phase endet mit ihrem Zeitfenster (B22) oder vorher über
+            // Strg+H / `/sandbox-lease revoke`; `issue_and_remember` bindet
+            // den Permit an genau dieses Fenster (`ttl` bleibt ungenutzt).
             HostPermitVariant::SessionLease => (HostApprovalScope::SessionLease, None),
         };
         Self::issue_and_remember(ledger, registry, request, scope, ttl)
     }
 
     /// Stellt einen Permit für `request` aus, merkt ihn in `registry` und
-    /// autorisiert ihn sofort für den auslösenden Aufruf. `ttl = None`: der
-    /// Permit gilt bis zum Widerruf (Host-Arbeitsphase).
+    /// autorisiert ihn sofort für den auslösenden Aufruf.
+    ///
+    /// # Description
+    /// - [`HostApprovalScope::SingleExecution`]: über
+    ///   [`ProcessPermitLedger::issue_after_local_approval`] mit `ttl`.
+    /// - [`HostApprovalScope::SessionLease`]: `ttl` wird ignoriert. Der
+    ///   Permit wird über [`ProcessPermitLedger::issue_for_lease`] an das
+    ///   Fenster aus [`HostPermitSessionRegistry::covering_lease`] gebunden
+    ///   und endet spätestens mit der Phase (PL-100 Phase 4, B22). Der
+    ///   Aufrufer muss die Phase vorher eingetragen haben
+    ///   ([`HostPermitSessionRegistry::mark_session_approved`] bzw.
+    ///   [`HostPermitSessionRegistry::mark_global_approval`]). Deckt danach
+    ///   kein aktives Fenster die Sitzung ab, wird nichts ausgestellt
+    ///   (fail-closed, nie ein freistehender 8-h-Permit).
+    ///
+    /// # Errors
+    /// Eine für das Modell lesbare Ablehnungsnachricht, wenn kein aktives
+    /// Fenster vorliegt oder der Ledger Ausstellung bzw. Autorisierung
+    /// ablehnt.
     fn issue_and_remember(
         ledger: &Arc<ProcessPermitLedger>,
         registry: &Arc<HostPermitSessionRegistry>,
@@ -682,9 +736,38 @@ impl ShellExecutor {
         scope: HostApprovalScope,
         ttl: Option<Duration>,
     ) -> Result<(), String> {
-        let id = ledger
-            .issue_after_local_approval(request.clone(), scope, ttl)
-            .map_err(|err| format!("shell.exec: host execution not authorized: {err}"))?;
+        let issued = match scope {
+            HostApprovalScope::SingleExecution => {
+                ledger.issue_after_local_approval(request.clone(), scope, ttl)
+            }
+            HostApprovalScope::SessionLease => {
+                let Some(window) = registry.covering_lease(&request.session) else {
+                    warn!(
+                        session_id = %request.session,
+                        "shell.exec: approved host lease has no active window; no permit issued"
+                    );
+                    return Err(HOST_LEASE_UNAVAILABLE_MSG.to_owned());
+                };
+                ledger.issue_for_lease(request.clone(), window)
+            }
+        };
+        let id =
+            issued.map_err(|err| format!("shell.exec: host execution not authorized: {err}"))?;
+        Self::remember_and_authorize(ledger, registry, request, id)
+    }
+
+    /// Merkt einen frisch ausgestellten Permit `id` für `request` in
+    /// `registry` und autorisiert ihn sofort für den auslösenden Aufruf.
+    ///
+    /// # Errors
+    /// Eine für das Modell lesbare Ablehnungsnachricht, wenn der Ledger die
+    /// Autorisierung ablehnt (etwa weil der Permit inzwischen abgelaufen ist).
+    fn remember_and_authorize(
+        ledger: &Arc<ProcessPermitLedger>,
+        registry: &Arc<HostPermitSessionRegistry>,
+        request: ProcessPermitRequest,
+        id: ProcessPermitId,
+    ) -> Result<(), String> {
         registry.remember_permit(request.clone(), id);
         ledger
             .authorize(id, &request)
@@ -3930,41 +4013,74 @@ mod tests {
         }
     }
 
+    // Antrag, wie `authorize_host_command` ihn für `command` in `session` baut.
+    fn host_request(
+        tmp: &TempDir,
+        session: &str,
+        command: &str,
+    ) -> TestResult<ProcessPermitRequest> {
+        Ok(ProcessPermitRequest {
+            session: session.to_owned(),
+            worker_definition: HOST_WORKER_DEFINITION.to_owned(),
+            command: command.to_owned(),
+            workspace: sandbox_root(tmp)?,
+            environment: ProcessEnvironment::LocalHost,
+        })
+    }
+
     #[tokio::test]
-    async fn test_authorize_host_command_session_lease_does_not_expire_until_user_revokes()
+    async fn test_authorize_host_command_session_lease_ends_with_window_or_user_revoke()
     -> TestResult {
-        // Nutzerentscheidung 2026-09-24: weder die Sitzungszustimmung noch
-        // der dafür ausgestellte `SessionLease`-Permit verfallen mit der Zeit;
-        // erst der Widerruf durch den Nutzer (Strg+H: `forget_session` +
-        // `revoke_session`) beendet die Host-Arbeitsphase.
+        // PL-100 Phase 4, B22 (ersetzt die Nutzerentscheidung 2026-09-24
+        // „kein Zeitablauf“): eine aktive Phase trägt Aufruf und
+        // Wiederholung; der gemerkte Permit gilt höchstens bis zum
+        // Fensterende; Strg+H beendet die Phase vorher, und eine erneute
+        // Zustimmung eröffnet ein neues Fenster. Deterministisch: das
+        // Fensterende wird über die `_at`-Varianten geprüft, nicht abgewartet.
         let tmp = make_temp_workspace()?;
         let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
-        let registry = Arc::new(HostPermitSessionRegistry::default());
-        registry.mark_session_approved("s1");
-
+        let registry = Arc::new(
+            HostPermitSessionRegistry::with_lease_ttl(Duration::from_secs(3600))
+                .map_err(ctx("with_lease_ttl"))?,
+        );
         let executor = host_executor(&ledger, &registry);
         let args = args_for("echo repeat_me");
+        let request = host_request(&tmp, "s1", "echo repeat_me")?;
 
+        registry.mark_session_approved("s1");
+        let window = registry
+            .session_lease("s1")
+            .ok_or(TestError::Missing("session lease window"))?;
         assert!(
             executor
                 .authorize_host_command(&args, &sandbox, "s1")
                 .await
                 .is_ok(),
-            "first call must succeed via a fresh local-approval issuance"
-        );
-
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(
-            registry.is_session_approved("s1"),
-            "the session-level approval must not expire over time"
+            "first call must succeed under the active lease"
         );
         assert!(
             executor
                 .authorize_host_command(&args, &sandbox, "s1")
                 .await
                 .is_ok(),
-            "an identical repeated request must still succeed via the remembered permit"
+            "an identical repeated request must succeed via the remembered permit"
+        );
+
+        // Ab dem Fensterende liefert die Registry den gemerkten Permit nicht
+        // mehr, und der Ledger lehnt ihn ab.
+        let id = registry
+            .lookup_permit(&request)
+            .ok_or(TestError::Missing("permit remembered under the lease"))?;
+        assert_eq!(
+            registry.lookup_permit_at(&request, window.expires_at()),
+            None,
+            "the remembered lease permit must not outlive the lease"
+        );
+        assert_eq!(
+            ledger.authorize_at(id, &request, window.expires_at()),
+            Err(ProcessPermitError::Expired),
+            "the ledger permit must end with the lease window"
         );
 
         // Nutzer beendet die Phase (dasselbe wie `ChatApp::end_host_mode`).
@@ -3974,8 +4090,300 @@ mod tests {
             executor
                 .authorize_host_command(&args, &sandbox, "s1")
                 .await
-                .is_err(),
+                .is_err_and(|message| message.contains("requires local UI approval")),
             "after the user revoked the lease, host execution must need a fresh approval"
+        );
+
+        // Erneute Zustimmung: neues Fenster, Ausführung wieder möglich.
+        registry.mark_session_approved("s1");
+        assert!(
+            registry
+                .session_lease("s1")
+                .is_some_and(|renewed| renewed != window),
+            "a renewed approval must open a new lease window"
+        );
+        assert!(
+            executor
+                .authorize_host_command(&args, &sandbox, "s1")
+                .await
+                .is_ok(),
+            "a renewed approval must allow host execution again"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_authorize_host_command_expired_session_lease_forces_reapproval() -> TestResult {
+        // PL-100 Phase 4, B22: eine Phase, die vor 5 s begann und nach 1 s
+        // endete, trägt weder einen neuen Aufruf noch den damals gemerkten
+        // Permit; ohne Fragekanal endet der Aufruf fail-closed (in der TUI
+        // käme die Frage erneut). Kein `sleep`: das Fenster liegt bereits in
+        // der Vergangenheit.
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(
+            HostPermitSessionRegistry::with_lease_ttl(Duration::from_secs(1))
+                .map_err(ctx("with_lease_ttl"))?,
+        );
+        let past = harw_sandbox::LeaseInstant::now()
+            .checked_sub(Duration::from_secs(5))
+            .ok_or(TestError::Missing("instant five seconds ago"))?;
+        registry.mark_session_approved_at("s1", past);
+        let window = registry
+            .session_lease("s1")
+            .ok_or(TestError::Missing("stored (expired) session lease window"))?;
+        let request = host_request(&tmp, "s1", "echo repeat_me")?;
+        // Damals unter der Phase ausgestellt und gemerkt (wie Fall 2 von
+        // `authorize_host_command`, nur zum Zeitpunkt `past`).
+        let id = ledger
+            .issue_for_lease_at(request.clone(), window, past)
+            .map_err(ctx("issue_for_lease_at"))?;
+        registry.remember_permit_at(request.clone(), id, past);
+        assert_eq!(registry.lookup_permit_at(&request, past), Some(id));
+
+        assert!(
+            !registry.is_session_approved("s1"),
+            "the lease must have expired"
+        );
+        assert_eq!(registry.covering_lease("s1"), None);
+        assert_eq!(
+            registry.lookup_permit(&request),
+            None,
+            "the remembered lease permit must not outlive the lease"
+        );
+        let executor = host_executor(&ledger, &registry);
+        let result = executor
+            .authorize_host_command(&args_for("echo repeat_me"), &sandbox, "s1")
+            .await;
+        assert!(
+            result.is_err_and(|message| message.contains("requires local UI approval")),
+            "an expired lease must lead to a new question (here: no channel, fail-closed)"
+        );
+
+        // Die erneute Zustimmung nach dem Ablauf eröffnet ein neues Fenster
+        // ab „jetzt“ (geprüft über die `_at`-Variante, ohne Zeitdruck).
+        let now = harw_sandbox::LeaseInstant::now();
+        registry.mark_session_approved_at("s1", now);
+        assert!(
+            registry
+                .session_lease("s1")
+                .is_some_and(|renewed| renewed.granted_at() == now),
+            "re-approval after expiry must start a new window"
+        );
+        assert!(registry.covering_lease_at("s1", now).is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompted_session_lease_gives_the_asking_child_no_window_that_survives_ctrl_h()
+    -> TestResult {
+        // PL-100 Phase 4, B22: ein `uia-shell-worker`-Kind beantwortet seine
+        // eigene Frage mit „Host-Arbeitsphase“. Strg+H
+        // (`ChatApp::end_host_mode`: `forget_session(root)`,
+        // `revoke_global_approval`, `revoke_session(root)`) muss auch dem Kind
+        // den Host-Zugang nehmen. Vorher bekam das Kind ein eigenes Fenster
+        // und arbeitete danach bis zu 8 h ohne Nachfrage weiter.
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
+        let mut executor = host_executor(&ledger, &registry);
+        executor.host_permit_prompts = Some(sender);
+        let args = args_for("echo child_lease");
+
+        let responder = tokio::spawn(async move {
+            let prompt = receiver.recv().await.ok_or(TestError::Missing("prompt"))?;
+            assert!(prompt.approve(HostPermitVariant::SessionLease));
+            Ok::<(), TestError>(())
+        });
+        let result = executor
+            .authorize_host_command(&args, &sandbox, "child")
+            .await;
+        responder
+            .await
+            .map_err(ctx("responder task must not panic"))??;
+        assert!(result.is_ok(), "approved lease must authorize: {result:?}");
+        assert!(
+            registry.has_global_approval(),
+            "the approval must open the process-wide phase"
+        );
+        assert!(registry.is_session_approved("child"));
+        assert_eq!(
+            registry.session_lease("child"),
+            None,
+            "the asking child must not get a window of its own"
+        );
+
+        // Strg+H in der TUI (Root-Sitzung „root“).
+        registry.forget_session("root");
+        registry.revoke_global_approval();
+        ledger
+            .revoke_session("root")
+            .map_err(ctx("revoke_session"))?;
+
+        assert!(!registry.is_session_approved("child"));
+        let without_prompt = host_executor(&ledger, &registry);
+        let after = without_prompt
+            .authorize_host_command(&args, &sandbox, "child")
+            .await;
+        assert!(
+            after.is_err_and(|message| message.contains("requires local UI approval")),
+            "after Ctrl+H the child must ask again (here: no channel, fail-closed)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_authorize_host_command_lease_permit_ends_with_the_lease_window() -> TestResult {
+        // Der Ledger erlaubt 8 h, die Phase nur 1 h: ein unter der Phase
+        // ausgestellter Permit muss mit dem Fenster enden, nicht 8 h nach
+        // seiner Ausstellung (vorher: `issue_after_local_approval(.., None)`).
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(
+            HostPermitSessionRegistry::with_lease_ttl(Duration::from_secs(3600))
+                .map_err(ctx("with_lease_ttl"))?,
+        );
+        registry.mark_session_approved("s1");
+        let window = registry
+            .session_lease("s1")
+            .ok_or(TestError::Missing("session lease window"))?;
+
+        let executor = host_executor(&ledger, &registry);
+        assert!(
+            executor
+                .authorize_host_command(&args_for("echo bound"), &sandbox, "s1")
+                .await
+                .is_ok()
+        );
+
+        let request = host_request(&tmp, "s1", "echo bound")?;
+        let id = registry
+            .lookup_permit(&request)
+            .ok_or(TestError::Missing("permit remembered under the lease"))?;
+        let just_before_end = window
+            .expires_at()
+            .checked_sub(Duration::from_nanos(1))
+            .ok_or(TestError::Missing("instant before the lease end"))?;
+        assert!(
+            ledger.authorize_at(id, &request, just_before_end).is_ok(),
+            "the permit must be valid until the lease ends"
+        );
+        assert_eq!(
+            ledger.authorize_at(id, &request, window.expires_at()),
+            Err(ProcessPermitError::Expired),
+            "the permit must end together with the lease window"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_issue_and_remember_session_lease_without_active_window_fails_closed() -> TestResult {
+        // Der gemeinsame Ausstellungsweg (auch für `request_host` in
+        // `exec/escalation.rs`): ohne aktives Fenster kein freistehender
+        // `SessionLease`-Permit.
+        // Kein Befehl läuft hier: ein schlichtes Temp-Verzeichnis genügt.
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        fs::create_dir_all(tmp.path().join("project")).map_err(ctx("project subdir"))?;
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let request = host_request(&tmp, "s1", "echo no_window")?;
+
+        let result = ShellExecutor::issue_and_remember(
+            &ledger,
+            &registry,
+            request.clone(),
+            HostApprovalScope::SessionLease,
+            None,
+        );
+        assert_eq!(result, Err(HOST_LEASE_UNAVAILABLE_MSG.to_owned()));
+        assert_eq!(
+            registry.lookup_permit(&request),
+            None,
+            "nothing may be remembered without a lease"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_issue_and_remember_session_lease_is_bound_to_the_global_window() -> TestResult {
+        // `request_host` (Host-Mode-Anfrage) trägt die prozessweite Phase ein
+        // und stellt dann über `issue_and_remember` aus: der Permit endet mit
+        // dem globalen Fenster, nicht `lease_ttl` des Ledgers nach Ausstellung.
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        fs::create_dir_all(tmp.path().join("project")).map_err(ctx("project subdir"))?;
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(
+            HostPermitSessionRegistry::with_lease_ttl(Duration::from_secs(3600))
+                .map_err(ctx("with_lease_ttl"))?,
+        );
+        registry.mark_global_approval();
+        let window = registry
+            .global_lease()
+            .ok_or(TestError::Missing("global lease window"))?;
+        let request = host_request(&tmp, "child-1", "echo escalated")?;
+
+        let result = ShellExecutor::issue_and_remember(
+            &ledger,
+            &registry,
+            request.clone(),
+            HostApprovalScope::SessionLease,
+            None,
+        );
+        assert_eq!(result, Ok(()));
+        let id = registry.lookup_permit(&request).ok_or(TestError::Missing(
+            "permit remembered under the global lease",
+        ))?;
+        assert_eq!(
+            ledger.authorize_at(id, &request, window.expires_at()),
+            Err(ProcessPermitError::Expired),
+            "the permit must not outlive the global lease window"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompted_session_lease_permit_ends_with_the_covering_window() -> TestResult {
+        // Zustimmung „Host-Arbeitsphase“ im Dialog: der sofort ausgestellte
+        // Permit gehört zum Fenster der gerade eingetragenen Phase.
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(
+            HostPermitSessionRegistry::with_lease_ttl(Duration::from_secs(3600))
+                .map_err(ctx("with_lease_ttl"))?,
+        );
+        let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
+        let mut executor = host_executor(&ledger, &registry);
+        executor.host_permit_prompts = Some(sender);
+
+        let responder = tokio::spawn(async move {
+            let prompt = receiver.recv().await.ok_or(TestError::Missing("prompt"))?;
+            assert!(prompt.approve(HostPermitVariant::SessionLease));
+            Ok::<(), TestError>(())
+        });
+        let result = executor
+            .authorize_host_command(&args_for("echo prompted_lease"), &sandbox, "s1")
+            .await;
+        responder
+            .await
+            .map_err(ctx("responder task must not panic"))??;
+        assert!(result.is_ok(), "approved lease must authorize: {result:?}");
+
+        let window = registry
+            .covering_lease("s1")
+            .ok_or(TestError::Missing("covering lease after approval"))?;
+        let request = host_request(&tmp, "s1", "echo prompted_lease")?;
+        let id = registry
+            .lookup_permit(&request)
+            .ok_or(TestError::Missing("permit remembered after approval"))?;
+        assert_eq!(
+            ledger.authorize_at(id, &request, window.expires_at()),
+            Err(ProcessPermitError::Expired),
+            "the prompted lease permit must end with the lease window"
         );
         Ok(())
     }

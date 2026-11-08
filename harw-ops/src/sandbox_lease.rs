@@ -21,11 +21,18 @@
 //! ausgestellte Ledger-Permits der aufrufenden Sitzung ab
 //! ([`harw_sandbox::ProcessPermitLedger::revoke_session`]).
 //!
-//! # Lebensdauer einer Freigabe (Nutzerentscheidung 2026-09-24)
-//! Eine erteilte Host-Arbeitsphase hat **keinen** Zeitablauf. Sie bleibt
-//! aktiv, bis der **Nutzer** sie beendet — per Strg+H in der TUI
-//! (`ChatApp::end_host_mode`) oder durch das getippte `/sandbox-lease
-//! revoke`. Das Modell kann sie nicht beenden: `revoke` wird nur angenommen,
+//! # Lebensdauer einer Freigabe (PL-100 Phase 4, Bedrohung B22)
+//! Eine erteilte Host-Arbeitsphase läuft nach `[sandbox] host_lease_ttl_secs`
+//! ab (Vorgabe 8 h; `docs/adr/0002-session-lease-expiry.md`, ersetzt die
+//! Nutzerentscheidung 2026-09-24 „kein Zeitablauf“). Danach braucht der
+//! nächste Host-Befehl eine neue Freigabe: außerhalb von Full Access fragt
+//! harw erneut; unter Full Access erteilt die TUI sie ohne Rückfrage
+//! (Nutzerentscheidung 2026-09-24 „Full Access fragt nie“), der Ablauf
+//! begrenzt dort also nicht den Host-Zugang. Vorher beenden kann sie nur der
+//! **Nutzer** —
+//! per Strg+H in der TUI (`ChatApp::end_host_mode`) oder durch das getippte
+//! `/sandbox-lease revoke`. Das Modell kann sie weder verlängern noch
+//! beenden: `revoke` wird nur angenommen,
 //! wenn der [`OpContext`] den Marker [`HostLeaseUserControl`] trägt, den die
 //! Montage ausschließlich in die Slash-`ServiceMap` legt
 //! (`harw-runtime/src/services.rs`). Auf der Model-Tool-Fläche (und Web/Job)
@@ -46,10 +53,12 @@
 //!   angehängt — ist ein Fehler (fail-closed, dieselbe Sicherheitsregel wie
 //!   [`harw_tool_shell::exec`]).
 //! - `status` (Vorgabe auf der Command-Fläche für ein bares
-//!   `/sandbox-lease`) — meldet „aktiv (bis Strg+H oder /sandbox-lease
-//!   revoke)“, „Einmalfreigabe offen“ oder „aus“, rein lesend;
+//!   `/sandbox-lease`) — meldet „aktiv, noch … (Restlaufzeit)“,
+//!   „Einmalfreigabe offen“, „abgelaufen“ oder „aus“, rein lesend;
 //!   berücksichtigt sowohl die prozessweite als auch eine etwaige
-//!   sitzungseigene Freigabe der aufrufenden Sitzung.
+//!   sitzungseigene Freigabe der aufrufenden Sitzung. Die Restlaufzeit ist
+//!   eine Dauer, keine Uhrzeit: die Phase misst monoton und mit Suspend
+//!   (`harw_sandbox::LeaseInstant`), nicht nach der Wanduhr.
 //! - `revoke` (nur Command-Fläche, nur mit [`HostLeaseUserControl`]) —
 //!   entfernt die prozessweite Sitzungs- und Einmalfreigabe
 //!   ([`harw_sandbox::HostPermitSessionRegistry::revoke_global_approval`])
@@ -82,9 +91,11 @@
 //!   Fragekanal ist angehängt.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use harw_macros::operation;
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
+use harw_sandbox::{HostPermitSessionRegistry, LeaseInstant};
 use harw_tool_shell::{
     HOST_PERMIT_PROMPT_TIMEOUT, HostLeaseUserControl, HostPermitHandles, HostPermitPrompt,
     HostPermitVariant, SANDBOX_LEASE_WORKER_DEFINITION,
@@ -106,8 +117,81 @@ const REVOKE_USER_ONLY_MSG: &str = "Nur der Nutzer kann den Host-Modus beenden \
      (Strg+H oder das getippte /sandbox-lease revoke); das Modell kann eine \
      Sandbox-Lease nicht widerrufen.";
 
-/// Statusanzeige einer aktiven Host-Arbeitsphase (kein Zeitablauf).
-const ACTIVE_UNTIL_USER_ENDS: &str = "aktiv (bis Strg+H oder /sandbox-lease revoke)";
+/// Meldung, wenn eine gerade erteilte Host-Arbeitsphase danach nicht aktiv
+/// ist (nicht darstellbares Fensterende oder vergiftete Registry): nichts
+/// läuft auf dem Host (fail-closed).
+const LEASE_NOT_RECORDED_MSG: &str = "Sandbox-Lease konnte nicht eingetragen werden; \
+     shell.exec bleibt in der Sandbox.";
+
+/// Statusanzeige einer abgelaufenen Host-Arbeitsphase (PL-100 Phase 4, B22).
+const EXPIRED_STATUS: &str = "Sandbox-Lease: abgelaufen (der nächste Host-Befehl braucht eine \
+     neue Freigabe; unter Full Access erteilt die TUI sie ohne Rückfrage).";
+
+/// Formatiert eine Restlaufzeit für Menschen, z. B. `7 h 59 min` oder `5 min`.
+///
+/// # Beschreibung
+/// Angefangene Minuten zählen voll (aufgerundet): eine aktive Phase zeigt nie
+/// `0 min`, und eine frisch erteilte 8-h-Phase zeigt `8 h 0 min`.
+///
+/// # Arguments
+/// - `remaining`: die Restlaufzeit.
+///
+/// # Returns
+/// `"{h} h {m} min"` ab einer Stunde, sonst `"{m} min"`.
+fn format_remaining(remaining: Duration) -> String {
+    // Ganze Sekunden, angefangene Sekunde aufgerundet (gesättigt).
+    let secs = remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() > 0));
+    // Division und Rest durch die Konstante 60 können weder überlaufen noch
+    // durch null teilen.
+    let total_minutes = secs.div_ceil(60);
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+    if hours > 0 {
+        format!("{hours} h {minutes} min")
+    } else {
+        format!("{minutes} min")
+    }
+}
+
+/// Beschreibt eine aktive Host-Arbeitsphase mit ihrer Restlaufzeit.
+///
+/// # Beschreibung
+/// Auch für andere Statusanzeigen dieses Crates gedacht (etwa die
+/// `Host-Lease`-Zeile von `/status`), damit alle denselben Wortlaut zeigen.
+///
+/// # Arguments
+/// - `remaining`: Restlaufzeit der Phase.
+///
+/// # Returns
+/// Z. B. `aktiv, noch 7 h 59 min (danach neue Freigabe nötig, unter Full
+/// Access ohne Rückfrage; vorher beenden: Strg+H oder /sandbox-lease
+/// revoke)`.
+pub(crate) fn active_lease_text(remaining: Duration) -> String {
+    format!(
+        "aktiv, noch {} (danach neue Freigabe nötig, unter Full Access ohne Rückfrage; \
+         vorher beenden: Strg+H oder /sandbox-lease revoke)",
+        format_remaining(remaining)
+    )
+}
+
+/// Restlaufzeit der **prozessweiten** Host-Arbeitsphase, falls sie aktiv ist.
+///
+/// # Beschreibung
+/// Liest das Fenster und „jetzt“ genau einmal, damit Aktivitätsprüfung und
+/// Restlaufzeit zum selben Zeitpunkt gehören. Ein abgelaufenes, noch
+/// gespeichertes Fenster zählt nicht.
+///
+/// # Returns
+/// `Some(rest)` mit `rest > 0` für eine aktive prozessweite Phase; sonst `None`.
+fn active_global_remaining(registry: &HostPermitSessionRegistry) -> Option<Duration> {
+    let now = LeaseInstant::now();
+    registry
+        .global_lease()
+        .filter(|window| window.is_active_at(now))
+        .map(|window| window.remaining_at(now))
+}
 
 /// Eingabe-Argumente der `sandbox-lease`-Operation.
 ///
@@ -171,9 +255,10 @@ impl FromRawArgs for SandboxLeaseArgs {
 /// Was passiert: mit `action = "request"` und einem konkreten `reason` zeigt
 /// dieses Werkzeug dem Nutzer einen Bestätigungsdialog (die Zustimmung dort
 /// *ist* die Freigabe, kein weiterer Schritt nötig). Der Nutzer wählt im
-/// Dialog zwischen einer Host-Arbeitsphase, die aktiv bleibt, bis er sie
-/// selbst beendet (Strg+H oder `/sandbox-lease revoke`), und einer
-/// einmaligen Freigabe für genau den nächsten `shell.exec`-Aufruf. Nach
+/// Dialog zwischen einer Host-Arbeitsphase, die nach der eingestellten Dauer
+/// (Vorgabe 8 h) abläuft oder vorher von ihm beendet wird (Strg+H oder
+/// `/sandbox-lease revoke`), und einer einmaligen Freigabe für genau den
+/// nächsten `shell.exec`-Aufruf. Nach
 /// Zustimmung laufen die betroffenen `shell.exec`-Aufrufe dieser harw-Sitzung
 /// **inklusive aller Kind-Agenten** (z. B. `uia-shell-worker`,
 /// `host-process-worker`) auf dem Host mit der Umgebung des Nutzers (PATH,
@@ -182,13 +267,16 @@ impl FromRawArgs for SandboxLeaseArgs {
 /// bevor dieses Werkzeug aufgerufen wird — der Dialog zeigt ihn dem Nutzer.
 /// Eine bereits aktive Freigabe wird ohne erneuten Dialog sofort bestätigt.
 ///
-/// `action = "status"` meldet nur, ob eine Freigabe aktiv ist (rein lesend,
-/// kein Dialog). Beenden kann eine Freigabe nur der Nutzer (Strg+H oder das
+/// `action = "status"` meldet nur, ob eine Freigabe aktiv ist und wie lange
+/// noch (rein lesend, kein Dialog). Nach dem Ablauf braucht der nächste
+/// Host-Befehl eine neue Freigabe (unter Full Access erteilt die TUI sie
+/// ohne Rückfrage);
+/// vorher beenden kann eine Freigabe nur der Nutzer (Strg+H oder das
 /// getippte `/sandbox-lease revoke`); ein `revoke` aus dem Model-Tool wird
 /// abgewiesen.
 #[operation(
     name = "sandbox-lease",
-    summary = "Fordert eine Sandbox-Aufhebung für shell.exec dieser harw-Sitzung inkl. aller Kind-Agenten an — nutzen, wenn eine Aufgabe cargo/rustc, Nutzer-Toolchains, Netzzugriff oder Dateien außerhalb des Workspace braucht; Toolchains nie in der Sandbox nachinstallieren. action=\"request\" (mit Grund) öffnet den Bestätigungsdialog: der Nutzer erteilt oder verweigert die Freigabe und wählt Host-Arbeitsphase (aktiv, bis er sie beendet) oder einmalige Freigabe; danach laufen die shell.exec-Aufrufe auf dem Host. action=\"status\" zeigt die Freigabe (rein lesend). Beenden kann sie nur der Nutzer (Strg+H oder getipptes /sandbox-lease revoke), nicht das Modell.",
+    summary = "Fordert eine Sandbox-Aufhebung für shell.exec dieser harw-Sitzung inkl. aller Kind-Agenten an — nutzen, wenn eine Aufgabe cargo/rustc, Nutzer-Toolchains, Netzzugriff oder Dateien außerhalb des Workspace braucht; Toolchains nie in der Sandbox nachinstallieren. action=\"request\" (mit Grund) öffnet den Bestätigungsdialog: der Nutzer erteilt oder verweigert die Freigabe und wählt Host-Arbeitsphase (läuft nach der eingestellten Dauer ab, Vorgabe 8 h; danach erneut fragen) oder einmalige Freigabe; danach laufen die shell.exec-Aufrufe auf dem Host. action=\"status\" zeigt die Freigabe und ihre Restlaufzeit (rein lesend). Vorher beenden kann sie nur der Nutzer (Strg+H oder getipptes /sandbox-lease revoke), nicht das Modell.",
     domain = "execution",
     permission = "operator",
     command(path = "/sandbox-lease", visibility = "tui_only", busy = "immediate"),
@@ -219,24 +307,80 @@ fn resolve_handles(ctx: &OpContext) -> Result<&Arc<HostPermitHandles>, OpError> 
 /// Implementiert `action = "status"` — rein lesend.
 ///
 /// # Beschreibung
-/// [`harw_sandbox::HostPermitSessionRegistry::is_session_approved`]
-/// und [`harw_sandbox::HostPermitSessionRegistry::has_single_use`]
-/// berücksichtigen sowohl die prozessweite Freigabe (die `request` unten
-/// setzt) als auch eine etwaige sitzungseigene Freigabe der aufrufenden
-/// Sitzung — ein direkter Blick auf `has_global_approval`/
-/// `has_global_single_use` ist hier nicht nötig. Eine Restlaufzeit gibt es
-/// nicht mehr (kein Zeitablauf).
+/// Siehe [`status_text`].
 fn handle_status(ctx: &OpContext) -> Result<OpOutput, OpError> {
     let handles = resolve_handles(ctx)?;
     let session_id = ctx.session_id().as_str();
-    let text = if handles.registry.is_session_approved(session_id) {
-        format!("Sandbox-Lease: {ACTIVE_UNTIL_USER_ENDS}.")
-    } else if handles.registry.has_single_use(session_id) {
-        "Sandbox-Lease: Einmalfreigabe offen.".to_owned()
+    Ok(OpOutput::from(status_text(&handles.registry, session_id)))
+}
+
+/// Zustand der Host-Arbeitsphase einer Sitzung, wie ihn
+/// `/sandbox-lease status` und die `Host-Lease`-Zeile von `/status` zeigen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostLeaseState {
+    /// Eine aktive Phase deckt die Sitzung ab; die Restlaufzeit ist größer
+    /// als null.
+    Active(Duration),
+    /// Keine aktive Phase, aber eine Einmalfreigabe ist offen.
+    SingleUse,
+    /// Weder aktiv noch Einmalfreigabe, aber ein abgelaufenes Fenster ist
+    /// noch gespeichert (B22).
+    Expired,
+    /// Nichts davon.
+    Off,
+}
+
+/// Ermittelt den [`HostLeaseState`] von `session_id`.
+///
+/// # Beschreibung
+/// Reihenfolge der Fälle:
+/// 1. Eine aktive Phase deckt `session_id` ab
+///    ([`HostPermitSessionRegistry::lease_remaining`], prozessweit oder
+///    sitzungseigen): [`HostLeaseState::Active`] mit der Restlaufzeit.
+/// 2. Eine Einmalfreigabe ist offen
+///    ([`HostPermitSessionRegistry::has_single_use`], ebenfalls prozessweit
+///    oder sitzungseigen): [`HostLeaseState::SingleUse`].
+/// 3. Ein Fenster ist noch gespeichert, aber abgelaufen
+///    ([`HostPermitSessionRegistry::session_lease`] bzw.
+///    [`HostPermitSessionRegistry::global_lease`]): [`HostLeaseState::Expired`].
+/// 4. Sonst [`HostLeaseState::Off`].
+///
+/// # Arguments
+/// - `registry`: die Sitzungs-Registry der Montage.
+/// - `session_id`: die aufrufende Sitzung.
+///
+/// # Concurrency
+/// Rein lesend; jede Abfrage sperrt kurz die Registry.
+pub(crate) fn host_lease_state(
+    registry: &HostPermitSessionRegistry,
+    session_id: &str,
+) -> HostLeaseState {
+    if let Some(remaining) = registry.lease_remaining(session_id) {
+        HostLeaseState::Active(remaining)
+    } else if registry.has_single_use(session_id) {
+        HostLeaseState::SingleUse
+    } else if registry.session_lease(session_id).is_some() || registry.global_lease().is_some() {
+        HostLeaseState::Expired
     } else {
-        "Sandbox-Lease: aus.".to_owned()
-    };
-    Ok(OpOutput::from(text))
+        HostLeaseState::Off
+    }
+}
+
+/// Statuszeile für `action = "status"` (Fälle siehe [`host_lease_state`]):
+/// „aktiv, noch …“, „Einmalfreigabe offen“, „abgelaufen“ oder „aus“.
+///
+/// # Arguments
+/// - `registry`: die Sitzungs-Registry der Montage.
+/// - `session_id`: die aufrufende Sitzung.
+fn status_text(registry: &HostPermitSessionRegistry, session_id: &str) -> String {
+    match host_lease_state(registry, session_id) {
+        HostLeaseState::Active(remaining) => {
+            format!("Sandbox-Lease: {}.", active_lease_text(remaining))
+        }
+        HostLeaseState::SingleUse => "Sandbox-Lease: Einmalfreigabe offen.".to_owned(),
+        HostLeaseState::Expired => EXPIRED_STATUS.to_owned(),
+        HostLeaseState::Off => "Sandbox-Lease: aus.".to_owned(),
+    }
 }
 
 /// Implementiert `action = "revoke"` — idempotent, **nur für den Nutzer**.
@@ -298,11 +442,13 @@ async fn handle_request(ctx: &OpContext, reason: Option<&str>) -> Result<OpOutpu
     // erneuter Prompt (siehe Moduldoku). Geprüft wird ausdrücklich die
     // globale Freigabe, nicht `is_session_approved` — dieser Pfad setzt
     // unten selbst nur noch die globale Freigabe, eine rein sitzungseigene
-    // Zustimmung entsteht über `/sandbox-lease` nicht mehr.
-    if handles.registry.has_global_approval() {
+    // Zustimmung entsteht über `/sandbox-lease` nicht mehr. Eine abgelaufene
+    // Phase zählt nicht: dann wird erneut gefragt (B22).
+    if let Some(remaining) = active_global_remaining(&handles.registry) {
         return Ok(OpOutput::from(format!(
-            "Sandbox-Lease bereits {ACTIVE_UNTIL_USER_ENDS}; shell.exec läuft bereits auf dem \
-             Host (für diese harw-Sitzung inkl. aller Kind-Agenten)."
+            "Sandbox-Lease bereits {}; shell.exec läuft bereits auf dem Host (für diese \
+             harw-Sitzung inkl. aller Kind-Agenten).",
+            active_lease_text(remaining)
         )));
     }
 
@@ -341,13 +487,18 @@ async fn handle_request(ctx: &OpContext, reason: Option<&str>) -> Result<OpOutpu
             // Prozessweit statt sitzungseigen (Nutzerwunsch „volle
             // Sandbox-Deaktivierung“, 2026-09-21): gilt damit auch für jede
             // Kind-Session (z. B. `uia-shell-worker`, `host-process-worker`),
-            // nicht nur für `session_id` selbst. Kein Zeitablauf: die Phase
-            // endet nur durch den Nutzer (Strg+H oder `/sandbox-lease revoke`).
+            // nicht nur für `session_id` selbst. Die Phase läuft nach
+            // `lease_ttl` der Registry ab (B22); vorher beenden kann sie nur
+            // der Nutzer (Strg+H oder `/sandbox-lease revoke`).
             handles.registry.mark_global_approval();
+            // Fail-closed: ohne aktives Fenster (nicht darstellbares Ende,
+            // vergiftete Registry) wurde nichts eingetragen.
+            let remaining = active_global_remaining(&handles.registry)
+                .ok_or_else(|| OpError::Execution(LEASE_NOT_RECORDED_MSG.to_owned()))?;
             Ok(OpOutput::from(format!(
-                "Sandbox-Lease erteilt, {ACTIVE_UNTIL_USER_ENDS}; shell.exec läuft jetzt auf \
-                 dem Host (für diese harw-Sitzung inkl. aller Kind-Agenten). Beenden kann sie \
-                 nur der Nutzer."
+                "Sandbox-Lease erteilt, {}; shell.exec läuft jetzt auf dem Host (für diese \
+                 harw-Sitzung inkl. aller Kind-Agenten). Vorher beenden kann sie nur der Nutzer.",
+                active_lease_text(remaining)
             )))
         }
         HostPermitVariant::SingleExecution => {
@@ -367,14 +518,17 @@ async fn handle_request(ctx: &OpContext, reason: Option<&str>) -> Result<OpOutpu
 
 #[cfg(test)]
 mod tests {
-    use super::{REVOKE_USER_ONLY_MSG, SandboxLeaseArgs, sandbox_lease};
+    use super::{
+        EXPIRED_STATUS, HostLeaseState, REVOKE_USER_ONLY_MSG, SandboxLeaseArgs, format_remaining,
+        host_lease_state, sandbox_lease,
+    };
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger};
+    use harw_sandbox::{HostPermitSessionRegistry, LeaseInstant, ProcessPermitLedger};
     use harw_tool_shell::{
         HostLeaseUserControl, HostPermitHandles, HostPermitVariant, host_permit_prompt_channel,
     };
@@ -382,6 +536,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     /// Baut einen `OpContext` mit frischem temporärem Workspace, optional mit
     /// registrierten `Arc<HostPermitHandles>` — **ohne** den Nutzer-Marker
@@ -451,6 +606,28 @@ mod tests {
             registry: Arc::new(HostPermitSessionRegistry::default()),
             prompts,
         })
+    }
+
+    /// Handles mit einer eigenen Registry (z. B. kurze Phasendauer), ohne
+    /// Fragekanal.
+    fn handles_with_registry(registry: HostPermitSessionRegistry) -> Arc<HostPermitHandles> {
+        Arc::new(HostPermitHandles {
+            ledger: Arc::new(ProcessPermitLedger::default()),
+            registry: Arc::new(registry),
+            prompts: None,
+        })
+    }
+
+    /// Registry mit 1 s Phasendauer plus ein Zeitpunkt 5 s in der
+    /// Vergangenheit: eine dort erteilte Phase ist heute schon abgelaufen
+    /// (ohne `sleep`).
+    fn short_registry_and_past() -> TestResult<(HostPermitSessionRegistry, LeaseInstant)> {
+        let registry = HostPermitSessionRegistry::with_lease_ttl(Duration::from_secs(1))
+            .map_err(ctx("with_lease_ttl"))?;
+        let past = LeaseInstant::now()
+            .checked_sub(Duration::from_secs(5))
+            .ok_or(TestError::Missing("instant five seconds ago"))?;
+        Ok((registry, past))
     }
 
     fn args(action: &str, reason: Option<&str>) -> SandboxLeaseArgs {
@@ -529,18 +706,134 @@ mod tests {
             .await
             .map_err(crate::test_support::ctx("status must not fail"))?;
         std::fs::remove_dir_all(&root).ok();
+        // PL-100 Phase 4 (B22): die Phase hat eine Restlaufzeit (Vorgabe
+        // 8 h, aufgerundet auf volle Minuten) statt „bis Strg+H“.
+        assert!(
+            output.text.starts_with("Sandbox-Lease: aktiv, noch "),
+            "{}",
+            output.text
+        );
+        assert!(output.text.contains("8 h 0 min"), "{}", output.text);
         assert!(
             output
                 .text
-                .contains("aktiv (bis Strg+H oder /sandbox-lease revoke)"),
+                .contains("vorher beenden: Strg+H oder /sandbox-lease revoke"),
+            "{}",
+            output.text
+        );
+        // ADR 0002: unter Full Access erteilt die TUI nach dem Ablauf ohne
+        // Rückfrage ein neues Fenster; der Text verspricht kein Nachfragen.
+        assert!(
+            output
+                .text
+                .contains("danach neue Freigabe nötig, unter Full Access ohne Rückfrage"),
             "{}",
             output.text
         );
         assert!(
-            !output.text.contains("min"),
-            "no remaining time any more: {}",
+            !output.text.contains("fragt harw erneut"),
+            "{}",
             output.text
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_remaining_rounds_up_to_whole_minutes() {
+        for (remaining, expected) in [
+            (Duration::from_secs(28_800), "8 h 0 min"),
+            (Duration::from_millis(28_799_500), "8 h 0 min"),
+            (Duration::from_secs(11_100), "3 h 5 min"),
+            (Duration::from_secs(3_599), "1 h 0 min"),
+            (Duration::from_secs(3_540), "59 min"),
+            (Duration::from_secs(61), "2 min"),
+            (Duration::from_secs(60), "1 min"),
+            (Duration::from_nanos(1), "1 min"),
+            (Duration::ZERO, "0 min"),
+            // Gesättigt statt überlaufend.
+            (Duration::MAX, "5124095576030431 h 1 min"),
+        ] {
+            assert_eq!(format_remaining(remaining), expected, "{remaining:?}");
+        }
+    }
+
+    #[test]
+    fn test_host_lease_state_distinguishes_all_four_states() -> TestResult {
+        // Gemeinsame Grundlage von `/sandbox-lease status` und der
+        // `Host-Lease`-Zeile von `/status`.
+        let registry = HostPermitSessionRegistry::default();
+        assert_eq!(host_lease_state(&registry, "s1"), HostLeaseState::Off);
+        registry.mark_single_use("s1".to_owned());
+        assert_eq!(host_lease_state(&registry, "s1"), HostLeaseState::SingleUse);
+        registry.mark_global_approval();
+        assert!(
+            matches!(
+                host_lease_state(&registry, "s1"),
+                HostLeaseState::Active(remaining) if remaining > Duration::ZERO
+            ),
+            "an active lease wins over a pending single use"
+        );
+
+        let (expired, past) = short_registry_and_past()?;
+        expired.mark_global_approval_at(past);
+        assert_eq!(host_lease_state(&expired, "s1"), HostLeaseState::Expired);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sandbox_lease_status_reports_expired_session_lease() -> TestResult {
+        let (registry, past) = short_registry_and_past()?;
+        let handles = handles_with_registry(registry);
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
+        handles
+            .registry
+            .mark_session_approved_at(ctx.session_id().as_str(), past);
+
+        let output = sandbox_lease(&ctx, args("status", None))
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(output.text, EXPIRED_STATUS);
+        assert!(output.text.contains("abgelaufen"), "{}", output.text);
+        assert!(
+            output
+                .text
+                .contains("neue Freigabe; unter Full Access erteilt die TUI sie ohne Rückfrage"),
+            "{}",
+            output.text
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sandbox_lease_status_reports_expired_global_lease_for_any_session() -> TestResult {
+        let (registry, past) = short_registry_and_past()?;
+        let handles = handles_with_registry(registry);
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
+        handles.registry.mark_global_approval_at(past);
+
+        let output = sandbox_lease(&ctx, args("status", None))
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(output.text, EXPIRED_STATUS);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sandbox_lease_status_prefers_a_pending_single_use_over_an_expired_lease() -> TestResult
+    {
+        let (registry, past) = short_registry_and_past()?;
+        let handles = handles_with_registry(registry);
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
+        handles.registry.mark_global_approval_at(past);
+        handles.registry.mark_global_single_use();
+
+        let output = sandbox_lease(&ctx, args("status", None))
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
+        std::fs::remove_dir_all(&root).ok();
+        assert!(output.text.contains("Einmalfreigabe"), "{}", output.text);
         Ok(())
     }
 
@@ -672,15 +965,16 @@ mod tests {
         Ok(())
     }
 
-    /// Das Model-Tool-Summary bietet `revoke` nicht mehr an und nennt keine
-    /// Ablaufzeit.
+    /// Das Model-Tool-Summary bietet `revoke` nicht an und nennt den
+    /// Ablauf der Phase (PL-100 Phase 4, B22: Vorgabe 8 h).
     #[test]
-    fn sandbox_lease_summary_offers_no_model_revoke_and_no_expiry() {
+    fn sandbox_lease_summary_offers_no_model_revoke_and_names_the_expiry() {
         use harw_operations::Operation;
         let summary = super::SandboxLeaseOperation.meta().summary;
         assert!(!summary.contains("action=\"revoke\""), "{summary}");
         assert!(!summary.contains("mehrstündig"), "{summary}");
         assert!(summary.contains("nur der Nutzer"), "{summary}");
+        assert!(summary.contains("Vorgabe 8 h"), "{summary}");
     }
 
     // ── request ────────────────────────────────────────────────────────────
@@ -733,6 +1027,27 @@ mod tests {
             ))?;
         std::fs::remove_dir_all(&root).ok();
         assert!(output.text.contains("bereits aktiv"), "{}", output.text);
+        assert!(output.text.contains("noch 8 h 0 min"), "{}", output.text);
+        Ok(())
+    }
+
+    /// B22: eine abgelaufene, noch gespeicherte prozessweite Phase gilt nicht
+    /// als „bereits aktiv“ — `request` fragt erneut (hier ohne Fragekanal:
+    /// fail-closed).
+    #[tokio::test]
+    async fn sandbox_lease_request_does_not_reuse_an_expired_global_lease() -> TestResult {
+        let (registry, past) = short_registry_and_past()?;
+        let handles = handles_with_registry(registry);
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
+        handles.registry.mark_global_approval_at(past);
+
+        let result = sandbox_lease(&ctx, args("request", Some("brauche cargo"))).await;
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            matches!(result, Err(OpError::Execution(_))),
+            "an expired lease must lead to a new question: {result:?}"
+        );
+        assert!(!handles.registry.has_global_approval());
         Ok(())
     }
 
@@ -781,6 +1096,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
 
         assert!(output.text.contains("erteilt"), "{}", output.text);
+        assert!(output.text.contains("noch 8 h 0 min"), "{}", output.text);
         assert!(
             handles
                 .registry

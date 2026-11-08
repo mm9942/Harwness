@@ -1734,7 +1734,8 @@ fn merge_permissions(
 // unabhaengigen Einzelfeld-Vergleichen, die `FIELD_TABLE` fuer
 // Exhaustivitaets-Zwecke dennoch einzeln auflistet). `execution` (PL-97 E2)
 // ist `ProfileReplaces`: Home und Profil setzen ihn, ein nicht vertrautes
-// Projekt nie.
+// Projekt nie. Ebenso `host_lease_ttl_secs` (PL-100 Phase 4, B22, ADR 0002):
+// ein geklontes Repository kann Host-Arbeitsphasen nicht verlaengern.
 fn merge_sandbox(
     trusted: &mut HarnessConfig,
     incoming: SandboxSection,
@@ -1767,6 +1768,14 @@ fn merge_sandbox(
         field_present(raw, &["sandbox", "execution"]),
         role,
         "sandbox.execution",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.sandbox.host_lease_ttl_secs,
+        incoming.host_lease_ttl_secs,
+        field_present(raw, &["sandbox", "host_lease_ttl_secs"]),
+        role,
+        "sandbox.host_lease_ttl_secs",
         layer_path,
     );
 }
@@ -3635,6 +3644,61 @@ mod tests {
             &layer_path(),
         );
         assert_eq!(trusted.sandbox.execution, Some(SandboxExecutionToml::Chain));
+        Ok(())
+    }
+
+    // PL-100 Phase 4 (B22, ADR 0002): `sandbox.host_lease_ttl_secs` ist
+    // `ProfileReplaces` — Home und Profil setzen die Dauer, ein nicht
+    // vertrautes Projekt verlaengert sie nie; ein Layer ohne den Schluessel
+    // erbt den Wert.
+    #[test]
+    fn test_sandbox_host_lease_ttl_trusted_layers_set_it_untrusted_project_cannot() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.sandbox.host_lease_ttl_secs, None);
+        assert_eq!(trusted.sandbox.effective_host_lease_ttl_secs(), 28_800);
+
+        let home = "[sandbox]\nhost_lease_ttl_secs = 7200";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.host_lease_ttl_secs, Some(7_200));
+
+        let profile = "[sandbox]\nhost_lease_ttl_secs = 3600";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.host_lease_ttl_secs, Some(3_600));
+
+        let untrusted = "[sandbox]\nhost_lease_ttl_secs = 604800";
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(untrusted).map_err(ctx("parse untrusted"))?,
+            &raw_from(untrusted)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.host_lease_ttl_secs, Some(3_600));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        // Ein Layer ohne den Schluessel behaelt den Wert.
+        let other = "[jobs]\nmax_running = 8";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(other).map_err(ctx("parse other"))?,
+            &raw_from(other)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.host_lease_ttl_secs, Some(3_600));
+        assert_eq!(trusted.sandbox.effective_host_lease_ttl_secs(), 3_600);
         Ok(())
     }
 

@@ -35,8 +35,9 @@ pub use extra_roots::{
 
 mod process_permit;
 pub use process_permit::{
-    GrantedProcessPermit, HostApprovalScope, ProcessEnvironment, ProcessPermitError,
-    ProcessPermitId, ProcessPermitLedger, ProcessPermitRequest, request_for_workspace,
+    DEFAULT_SESSION_LEASE_TTL, GrantedProcessPermit, HostApprovalScope, LeaseInstant, LeaseWindow,
+    ProcessEnvironment, ProcessPermitError, ProcessPermitId, ProcessPermitLedger,
+    ProcessPermitRequest, request_for_workspace,
 };
 
 mod host_permit_session;

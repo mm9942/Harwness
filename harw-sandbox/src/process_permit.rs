@@ -83,8 +83,9 @@ use std::time::{Duration, Instant};
 /// # Description
 /// Gilt für [`HostApprovalScope::SessionLease`]-Permits im
 /// [`ProcessPermitLedger`] und für Sitzungs- bzw. prozessweite Freigaben in
-/// [`crate::HostPermitSessionRegistry`] (PL-100 Phase 4, B22). Außerhalb des
-/// Crates ist der Wert als [`ProcessPermitLedger::DEFAULT_LEASE_TTL`] bzw.
+/// [`crate::HostPermitSessionRegistry`] (PL-100 Phase 4, B22). Die Crate-Wurzel
+/// exportiert ihn als `harw_sandbox::DEFAULT_SESSION_LEASE_TTL`; dieselbe
+/// Dauer ist auch als [`ProcessPermitLedger::DEFAULT_LEASE_TTL`] bzw.
 /// [`crate::HostPermitSessionRegistry::DEFAULT_LEASE_TTL`] erreichbar.
 pub const DEFAULT_SESSION_LEASE_TTL: Duration = Duration::from_secs(28_800);
 

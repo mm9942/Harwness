@@ -389,7 +389,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "permissions.extra_roots", scope: Scope::Global, merge: MergeRule::Intersection, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "RuleToml.tool", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "RuleToml.pattern", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
-    // 1.12 [sandbox] (9)
+    // 1.12 [sandbox] (10)
     FieldScope { path: "sandbox.cargo", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.cargo.mode", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.cargo.cargo_bin", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
@@ -401,6 +401,9 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // PL-97 E2: Ausführungspfad (`chain` | `legacy`); Profil-Ebene, ein nicht
     // vertrautes Projekt darf ihn nie setzen (`merge_sandbox`).
     FieldScope { path: "sandbox.execution", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
+    // PL-100 Phase 4 (B22, ADR 0002): Dauer einer Host-Arbeitsphase; Profil-
+    // Ebene, ein nicht vertrautes Projekt darf sie nie setzen (`merge_sandbox`).
+    FieldScope { path: "sandbox.host_lease_ttl_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
     // 1.13 [internal_models] (13)
     FieldScope { path: "internal_models.use_openrouter_defaults", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.session_title", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -568,7 +571,7 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_206_entries() {
+    fn test_field_table_has_exactly_207_entries() {
         // Runde 5, Teil B: +1 für `host.sudo_session_minutes`.
         // Runde 5, Teil E: +1 für `internal_models.auto_classifier`.
         // Runde 5, Teil G: +5 für `uia_worker_models.*`.
@@ -594,7 +597,8 @@ mod merge_rule_tests {
         // PL-97 R1: +1 für `tui.reasoning`.
         // PL-97 E3: +2 für `jobs.cgroup_root`, `jobs.trampoline`.
         // Interface localization: +1 for `tui.language`.
-        assert_eq!(FIELD_TABLE.len(), 206);
+        // PL-100 Phase 4: +1 für `sandbox.host_lease_ttl_secs`.
+        assert_eq!(FIELD_TABLE.len(), 207);
     }
 
     #[test]
@@ -623,7 +627,8 @@ mod merge_rule_tests {
         // PL-97 R1: +1 (`tui.reasoning`).
         // PL-97 E3: +2 (`jobs.cgroup_root`, `jobs.trampoline`).
         // Interface localization: +1 for `tui.language`.
-        assert_eq!(count(MergeRule::ProfileReplaces), 107);
+        // PL-100 Phase 4: +1 (`sandbox.host_lease_ttl_secs`).
+        assert_eq!(count(MergeRule::ProfileReplaces), 108);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

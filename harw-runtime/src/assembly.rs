@@ -2398,8 +2398,24 @@ impl RuntimeAssemblyBuilder {
         // `SandboxProfile::Host` bleibt beides ungenutzt — `profile_tool_providers`
         // hängt Ledger/Registry nur an einen tatsächlich Host-profilierten
         // `ShellToolProvider`.
-        let host_permit_ledger = Arc::new(ProcessPermitLedger::default());
-        let host_permit_registry = Arc::new(HostPermitSessionRegistry::default());
+        // PL-100 Phase 4 (B22, ADR 0002): jede Host-Arbeitsphase und jeder
+        // ihrer Ledger-Permits gilt höchstens `[sandbox] host_lease_ttl_secs`
+        // (Vorgabe 8 h; der Parser lehnt 0 und mehr als 7 Tage ab).
+        let host_lease_ttl = config.harness.sandbox.effective_host_lease_ttl();
+        let host_permit_ledger = Arc::new(
+            ProcessPermitLedger::with_lease_ttl(host_lease_ttl).map_err(|error| {
+                RuntimeError::Sandbox {
+                    detail: format!("[sandbox] host_lease_ttl_secs: {error}"),
+                }
+            })?,
+        );
+        let host_permit_registry = Arc::new(
+            HostPermitSessionRegistry::with_lease_ttl(host_lease_ttl).map_err(|error| {
+                RuntimeError::Sandbox {
+                    detail: format!("[sandbox] host_lease_ttl_secs: {error}"),
+                }
+            })?,
+        );
         // Runde 6, Teil A2: der Auto-Modus liest den Status der
         // Host-Arbeitsphase aus derselben Registry (Vorfilter und
         // Klassifizierer-Prompt); die Sitzungs-Id setzt die TUI.
