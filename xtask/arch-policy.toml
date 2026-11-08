@@ -114,6 +114,12 @@ layer = "F"
 # lesende Client, harw-ops und harw-core (A) ihn nutzen dürfen.
 [packages."harw-untrusted-text"]
 layer = "F"
+# PL-100 WP2.1: reine Dispatch-Logik (Routing, Budgets, Breaker, Gruppierung)
+# ohne IO, Uhr, Async oder Threads; nur serde. F, damit DodWatch (A) und
+# Tests sie nutzen; die Verbots-Zeile unten hält sie frei von Runtime,
+# Netzwerk, Signier- und Daemon-Crates.
+[packages."harw-dod-dispatch"]
+layer = "F"
 
 # --- C: compiler domain ----------------------------------------------------
 [packages."harw-agent-dsl"]
@@ -528,6 +534,11 @@ reason = "W00 §2.1/ARC-01: harw-protocol has no async runtime or network transp
 names = ["harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs"]
 packages = ["harw-dod-client"]
 reason = "PL-97 §3.1 / S1: the read-only Harw-DoD client never links the Warden, the escalation ladder or a DoD daemon"
+
+[[forbidden_crates]]
+names = ["tokio", "async-std", "mio", "hyper", "reqwest", "tungstenite", "tokio-tungstenite", "harw-dod-warden", "harw-dod-warden-proto", "harw-warden", "harw-dod-escalate", "harw-killer", "harw-sentinel", "harw-dod-sentinel", "harw-probe-bpf", "harw-probe-fs", "harw-dod-client", "harw-node-transport"]
+packages = ["harw-dod-dispatch"]
+reason = "PL-100 WP2.1 / I8: the dispatch core is pure (no IO, clock, runtime or network) and never links signing code, the escalation ladder or a DoD daemon"
 
 [packages."harw-context-ledger"]
 layer = "I"
