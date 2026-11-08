@@ -867,8 +867,8 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
     // geöffnet, damit der Schreibthread die Selbstbeschränkung erbt; der
     // Spool liegt unter `--home` (beschreibbare Landlock-Wurzel).
     let spool = exporter
-        .as_ref()
-        .map(|_| spool_writer::SpoolWriter::open(&home));
+        .is_some()
+        .then(|| spool_writer::SpoolWriter::open(&home));
     if let Some(spool) = spool.as_ref() {
         health = health.map(|health| health.with_spool(spool.stats()));
     }
