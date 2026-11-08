@@ -11,9 +11,15 @@
 //!   `<home>/dod/export`).
 //! - [`read_findings_tail`] — bounded tail of the findings export (256 KiB
 //!   in total, continuing into the rotated `<path>.1`; 16 KiB lines;
-//!   symlinks refused); accepts v1 lines and v2 lines with optional
-//!   `schema_version` and `scope`, and reports whether older data was left
-//!   unread ([`FindingsTail::truncated`]).
+//!   symlinks refused); accepts v1 lines, v2 lines with optional
+//!   `schema_version` and `scope`, and v3 lines (PL-100 WP0.12: `instance`,
+//!   `seq`, `record_digest`, `dedup_key`, `occurrences`, `first_seen`,
+//!   `kind`, `hardness`, `cgroup_kid`, `scope_obfuscated`, an escaped
+//!   [`EvidenceCard`]; UUIDv4 `finding_id`), and reports whether older data
+//!   was left unread ([`FindingsTail::truncated`]).
+//! - [`read_findings_since`] / [`lines_after`] — the lines after a
+//!   [`FindingsCursor`] (`instance` + `seq`), with [`FindingsSince::gap`]
+//!   when lines in between were rotated away.
 //! - [`summarize`] / [`FindingsTail::summarize`] — per-rule/per-severity
 //!   counts inside a window ending at an injected `now`;
 //!   [`FindingsSummary::complete`] is `false` when the counts are lower
@@ -42,7 +48,9 @@
 pub mod chain;
 pub mod config;
 pub mod correlate;
+pub mod cursor;
 mod error;
+pub mod evidence;
 pub mod findings;
 mod fsio;
 pub mod health;
@@ -59,10 +67,13 @@ pub use config::{ActiveProfile, ConfigReport, ProfileScope, read_system_config};
 pub use correlate::{
     JobCgroup, JobFindings, JobScope, ScopeCount, correlate, correlate_counts, scope_within,
 };
+pub use cursor::{FindingsCursor, FindingsSince, lines_after, read_findings_since};
 pub use error::DodClientError;
+pub use evidence::{EvidenceCard, EvidenceProcess};
 pub use findings::{
-    DEFAULT_FINDINGS_WINDOW, FindingLine, FindingsSummary, FindingsTail, MAX_LINE_BYTES,
-    MAX_TAIL_BYTES, RuleCount, SeverityCounts, parse_finding_line, read_findings_tail, summarize,
+    DEFAULT_FINDINGS_WINDOW, FindingHardness, FindingKind, FindingLine, FindingsSummary,
+    FindingsTail, MAX_LINE_BYTES, MAX_TAIL_BYTES, RuleCount, SeverityCounts, is_uuid_v4,
+    parse_finding_line, read_findings_tail, summarize,
 };
 pub use health::{HealthReport, IpcCounters, SensorHealthEntry, SensorHealthState, read_health};
 pub use paths::{
