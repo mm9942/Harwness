@@ -1111,7 +1111,16 @@ mod tests {
         );
         let parsed = DedupKey::parse_hex(&text).ok_or(TestError::Missing("parsed key"))?;
         assert_eq!(parsed, key);
-        assert_eq!(DedupKey::parse_hex(&text.to_uppercase()), None);
+        let upper = text.to_uppercase();
+        if upper != text {
+            assert_eq!(DedupKey::parse_hex(&upper), None, "upper case is refused");
+        }
+        let prefix = text.get(..31).ok_or(TestError::Missing("31 hex chars"))?;
+        assert_eq!(
+            DedupKey::parse_hex(&format!("{prefix}g")),
+            None,
+            "a non-hex character is refused"
+        );
         assert_eq!(DedupKey::parse_hex("abc"), None);
         Ok(())
     }
