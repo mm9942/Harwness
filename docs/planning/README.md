@@ -1035,6 +1035,12 @@ docs/
     │   ├── README.md            (bottom-up analysis, cloud hub, PQ-mTLS hardening, arti/Tor, phases T0–T7)
     │   └── THREAT-MODEL.md      (assets, attackers, threats B1–B21, residual risks)
     │
+    ├── 100-dod-ai-integration/
+    │   ├── README.md            (DoD × AI: anomaly routing, triage agents, polkit/TUI approval, phases 0–4)
+    │   ├── INVENTORY.md         (sensors, findings model, actions, agent wiring, plan status, ranked gaps)
+    │   ├── THREAT-MODEL.md      (assets, attackers, threats B1–B24, invariants)
+    │   └── TRACE-MATRIX.md      (every open plan item → work package)
+    │
     └── 90-migration-ledger/
         └── MIGRATION_LEDGER.md
 ```
