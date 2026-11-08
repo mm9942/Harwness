@@ -533,20 +533,25 @@ impl RuleCycle {
 }
 
 /// Wertet die drei Regeln dieses Knotens gegen ein eingefrorenes
-/// [`SecurityEvidence`] aus und meldet jeden zertifizierten Befund.
+/// [`SecurityEvidence`] aus und meldet jeden zertifizierten, nicht
+/// unterdrückten Befund.
 ///
 /// # Description
 /// Baut einen [`RuleContext`] aus `evidence.samples`/`evidence.events`, dem
 /// übergebenen `network_scope` und einer leeren Baseline-Liste (siehe
 /// Moduldoku, Abschnitte „Der Netzbereich kommt aus der DoD-Konfiguration"
 /// und „Was dieser Kontext (noch) nicht befüllt"), ruft
-/// [`run_rules_checked`] darauf auf und meldet jeden zurückgelieferten
-/// `Finding<RuleChecked>` über `tracing::warn!` (menschenlesbar, mit
-/// Zusammenfassung) und [`SECURITY_FINDING_TOTAL`] auf `sink` (maschinell
-/// auswertbar, ohne Freitext im Label — siehe
+/// [`run_rules_checked`] darauf auf und zählt jeden zurückgelieferten
+/// `Finding<RuleChecked>` in [`SECURITY_FINDING_TOTAL`] auf `sink`
+/// (maschinell auswertbar, ohne Freitext im Label — siehe
 /// `harw_dod_sentinel::metrics`-Moduldoku, Abschnitt „Keine Inhalte in
 /// Labels", dessen Auflage dieses Modul für dieselbe Sink-Instanz
-/// übernimmt).
+/// übernimmt). Je Befund werden Herkunft und `dedup_key` bestimmt und, mit
+/// `throttle`, über [`FindingThrottle::observe`] entschieden, ob er
+/// gemeldet oder nur gezählt wird (siehe Moduldoku, „Entprellung
+/// wiederholter Befunde"). Ein gemeldeter Befund erscheint auf
+/// `tracing::warn!` nur mit Kennungen (siehe Moduldoku,
+/// „Journal-Hygiene"), Details auf `debug`, und geht an `exporter`.
 ///
 /// # Arguments
 /// - `sink` (`&dyn TelemetrySink`): dasselbe Sink-Objekt, über das dieses
@@ -559,15 +564,19 @@ impl RuleCycle {
 ///   eingefroren wurde — nie die Systemuhr dieser Funktion selbst.
 /// - `network_scope` (`&NetworkScope`): der erlaubte Netzbereich
 ///   ([`network_scope_from_profile`]).
+/// - `cgroup_kids` (`&CgroupKids`): Kernel-IDs der in diesem Zyklus
+///   aufgelösten Cgroup-Pfade, für `cgroup_kid` der Herkunft.
+/// - `throttle` (`Option<&mut FindingThrottle>`): die Entprellung; `None`
+///   meldet jeden Befund (mit `occurrences = 1`).
 /// - `exporter` (`Option<&mut crate::export::FindingsExporter>`): der
 ///   optionale JSON-Lines-Export (`--findings-export`); `None` schreibt
 ///   nichts. Ein Exportfehler wird dort gezählt und geloggt und ändert
 ///   weder Rückgabewert noch Meldung.
 ///
 /// # Returns
-/// Die Anzahl gemeldeter Befunde. `0` ist der häufigste, unauffällige Fall
-/// (siehe Moduldoku, Abschnitt „Ein leerer Regellauf ist kein Fehler") —
-/// kein Fehler.
+/// Die Anzahl gemeldeter (nicht unterdrückter) Befunde. `0` ist der
+/// häufigste, unauffällige Fall (siehe Moduldoku, Abschnitt „Ein leerer
+/// Regellauf ist kein Fehler") — kein Fehler.
 ///
 /// # Errors
 /// Keine — siehe Moduldoku.
@@ -588,6 +597,8 @@ impl RuleCycle {
 ///     &evidence,
 ///     Timestamp::UNIX_EPOCH,
 ///     &harw_authority::NetworkScope::empty(),
+///     &harw_sentinel::cgroup_resolve::CgroupKids::default(),
+///     None,
 ///     None,
 /// );
 /// assert_eq!(reported, 0);
@@ -597,6 +608,8 @@ pub fn report_findings(
     evidence: &SecurityEvidence,
     now: Timestamp,
     network_scope: &NetworkScope,
+    cgroup_kids: &CgroupKids,
+    mut throttle: Option<&mut FindingThrottle>,
     mut exporter: Option<&mut FindingsExporter>,
 ) -> usize {
     let ctx = RuleContext {
@@ -608,19 +621,20 @@ pub fn report_findings(
     };
 
     let findings = run_rules_checked(&ctx);
+    if findings.is_empty() {
+        return 0;
+    }
     let scopes = attribute_scopes(&findings, &evidence.events, now, network_scope);
+    let origins = attribute_origins(
+        &findings,
+        &evidence.events,
+        now,
+        network_scope,
+        cgroup_kids,
+    );
 
-    for (finding, finding_scope) in findings.iter().zip(&scopes) {
-        tracing::warn!(
-            finding_id = finding.id().as_str(),
-            rule_id = finding.rule_id(),
-            kind = finding_kind_label(finding.kind()),
-            severity = ?finding.severity(),
-            hardness = ?finding.hardness(),
-            summary = %finding.summary(),
-            scope = finding_scope.as_deref().unwrap_or(""),
-            "security rule finding"
-        );
+    let mut reported = 0_usize;
+    for ((finding, finding_scope), origin) in findings.iter().zip(&scopes).zip(&origins) {
         sink.record(
             &SECURITY_FINDING_TOTAL,
             MetricValue::Count(1),
@@ -632,20 +646,74 @@ pub fn report_findings(
                 ),
             ],
         );
+        let dedup_key = origin.dedup_key(finding.rule_id());
+        let decision = match throttle.as_deref_mut() {
+            Some(throttle) => throttle.observe(
+                dedup_key,
+                finding.hardness(),
+                finding.severity(),
+                finding.observed_at(),
+                now,
+            ),
+            None => ThrottleDecision::unthrottled(dedup_key, finding.observed_at()),
+        };
+        let stamp = decision.stamp;
+        let ThrottleVerdict::Emit(reason) = decision.verdict else {
+            sink.record(
+                &SECURITY_FINDING_SUPPRESSED_TOTAL,
+                MetricValue::Count(1),
+                &[],
+            );
+            tracing::debug!(
+                finding_id = finding.id().as_str(),
+                rule_id = finding.rule_id(),
+                dedup_key = %stamp.dedup_key,
+                occurrences = stamp.occurrences,
+                "repeated security finding counted within its cooldown, not reported"
+            );
+            continue;
+        };
+        // Journal-Hygiene (WP0.6): auf `warn` nur Kennungen und Aufzählungen.
+        tracing::warn!(
+            finding_id = finding.id().as_str(),
+            rule_id = finding.rule_id(),
+            kind = finding_kind_label(finding.kind()),
+            severity = ?finding.severity(),
+            hardness = ?finding.hardness(),
+            dedup_key = %stamp.dedup_key,
+            occurrences = stamp.occurrences,
+            first_seen = %stamp.first_seen,
+            reason = reason.label(),
+            "security rule finding"
+        );
+        tracing::debug!(
+            finding_id = finding.id().as_str(),
+            summary = ?finding.summary(),
+            scope = ?finding_scope.as_deref(),
+            uid = ?origin.uid,
+            cgroup_kid = ?origin.cgroup_kid,
+            "security rule finding detail"
+        );
+        // Export v3 (Gruppe A, Schritt 5) übernimmt hier `stamp`
+        // (`dedup_key`, `occurrences`, `first_seen`) und `origin.cgroup_kid`.
         if let Some(exporter) = exporter.as_deref_mut() {
             exporter.export(sink, finding, finding_scope.as_deref());
         }
+        reported = reported.saturating_add(1);
     }
 
-    findings.len()
+    reported
 }
 
 /// What makes two findings of different rule runs the same finding.
+///
+/// The kind enters as its [`finding_kind_label`], so the tuple is `Ord` and
+/// can key a `BTreeMap` ([`attribute_origins`]).
 type FindingSignature = (
     &'static str,
-    FindingKind,
+    &'static str,
     Severity,
-    harw_dod_signals::Hardness,
+    Hardness,
     Timestamp,
     String,
 );
@@ -656,13 +724,89 @@ macro_rules! signature_of {
         let finding = $finding;
         (
             finding.rule_id(),
-            finding.kind(),
+            finding_kind_label(finding.kind()),
             finding.severity(),
             finding.hardness(),
             finding.observed_at(),
             finding.summary().to_owned(),
         )
     }};
+}
+
+/// Derives the [`FindingOrigin`] of each finding (see the module
+/// documentation, "Entprellung wiederholter Befunde").
+///
+/// # Description
+/// Runs the rules once per single event of the delta and pools the origin
+/// of every event under each signature it produces, keeping only what all
+/// those events share ([`FindingOrigin::merge`]). A finding of the full run
+/// takes the pooled origin of its signature; when the full run produces
+/// that signature more often or less often than the single-event runs do
+/// (a sample finding, or a rule combining several events), its `uid` and
+/// `cgroup_kid` stay empty. Without any single-event match the subject is
+/// the digest of the summary.
+///
+/// # Returns
+/// One entry per element of `findings`, in the same order.
+fn attribute_origins(
+    findings: &[harw_dod_rules::Finding<harw_dod_rules::RuleChecked>],
+    events: &[SecurityEvent],
+    now: Timestamp,
+    network_scope: &NetworkScope,
+    cgroup_kids: &CgroupKids,
+) -> Vec<FindingOrigin> {
+    let mut pool: BTreeMap<FindingSignature, (usize, FindingOrigin)> = BTreeMap::new();
+    for event in events {
+        let ctx = RuleContext {
+            now,
+            samples: &[],
+            events: std::slice::from_ref(event),
+            baselines: &[],
+            network_scope,
+        };
+        let raws = run_rules(&ctx);
+        if raws.is_empty() {
+            continue;
+        }
+        let origin = FindingOrigin::of_event(event, cgroup_kids);
+        for raw in &raws {
+            match pool.entry(signature_of!(raw)) {
+                Entry::Occupied(mut slot) => {
+                    let (count, pooled) = slot.get_mut();
+                    *count = count.saturating_add(1);
+                    pooled.merge(&origin, raw.summary());
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert((1, origin.clone()));
+                }
+            }
+        }
+    }
+
+    let signatures: Vec<FindingSignature> = findings
+        .iter()
+        .map(|finding| signature_of!(finding))
+        .collect();
+    let mut in_full_run: BTreeMap<&FindingSignature, usize> = BTreeMap::new();
+    for signature in &signatures {
+        let count = in_full_run.entry(signature).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+    signatures
+        .iter()
+        .zip(findings)
+        .map(|(signature, finding)| match pool.get(signature) {
+            Some((count, pooled)) => {
+                let mut origin = pooled.clone();
+                if in_full_run.get(signature) != Some(count) {
+                    origin.uid = None;
+                    origin.cgroup_kid = None;
+                }
+                origin
+            }
+            None => FindingOrigin::unattributed(finding.summary()),
+        })
+        .collect()
 }
 
 /// Derives the optional cgroup `scope` of each finding (see the module
@@ -776,6 +920,8 @@ mod tests {
             &evidence,
             Timestamp::UNIX_EPOCH,
             &NetworkScope::empty(),
+            &CgroupKids::default(),
+            None,
             None,
         );
 
@@ -796,6 +942,8 @@ mod tests {
             &evidence,
             Timestamp::UNIX_EPOCH,
             &NetworkScope::empty(),
+            &CgroupKids::default(),
+            None,
             None,
         );
 
@@ -821,6 +969,8 @@ mod tests {
             &evidence,
             Timestamp::UNIX_EPOCH,
             &NetworkScope::empty(),
+            &CgroupKids::default(),
+            None,
             Some(&mut exporter),
         );
 
@@ -872,6 +1022,8 @@ mod tests {
             &evidence,
             Timestamp::UNIX_EPOCH,
             &NetworkScope::empty(),
+            &CgroupKids::default(),
+            None,
             Some(&mut exporter),
         );
         assert_eq!(reported, 4);
@@ -1013,6 +1165,7 @@ mod tests {
                 &buffer,
                 &harw_observe::NullSink,
                 Timestamp::UNIX_EPOCH,
+                &CgroupKids::default(),
                 Some(&mut exporter),
             );
             reported = checked_sum(reported, cycle)?;
@@ -1031,6 +1184,7 @@ mod tests {
                 &buffer,
                 &harw_observe::NullSink,
                 Timestamp::UNIX_EPOCH,
+                &CgroupKids::default(),
                 Some(&mut exporter),
             );
             reported = checked_sum(reported, cycle)?;
@@ -1054,12 +1208,14 @@ mod tests {
             &buffer,
             &harw_observe::NullSink,
             Timestamp::UNIX_EPOCH,
+            &CgroupKids::default(),
             None,
         );
         let second = rules.evaluate(
             &buffer,
             &harw_observe::NullSink,
             Timestamp::UNIX_EPOCH,
+            &CgroupKids::default(),
             None,
         );
         assert_eq!(first, 2);
@@ -1080,6 +1236,7 @@ mod tests {
             &buffer,
             &harw_observe::NullSink,
             Timestamp::UNIX_EPOCH,
+            &CgroupKids::default(),
             Some(&mut exporter),
         );
         // Dieselbe Signatur aus einer anderen cgroup im nächsten Zyklus: über
@@ -1089,6 +1246,7 @@ mod tests {
             &buffer,
             &harw_observe::NullSink,
             Timestamp::UNIX_EPOCH,
+            &CgroupKids::default(),
             Some(&mut exporter),
         );
 
@@ -1158,6 +1316,7 @@ mod tests {
             &buffer,
             &harw_observe::NullSink,
             Timestamp::UNIX_EPOCH,
+            &CgroupKids::default(),
             None,
         );
         assert_eq!(
@@ -1170,6 +1329,7 @@ mod tests {
             &buffer,
             &harw_observe::NullSink,
             Timestamp::UNIX_EPOCH,
+            &CgroupKids::default(),
             None,
         );
         assert_eq!(outside, 1);
