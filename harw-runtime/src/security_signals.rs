@@ -20,69 +20,90 @@
 //! (`ExportSource::hint`). Die Auflösung läuft je Turn, ein später lesbar
 //! gewordener Systemexport greift ohne Neustart.
 //! Kein Befundtext, keine Host- oder Befund-IDs. Das Fragment ist Evidenz
-//! (nie Anweisung); die Datei ist angreiferbeeinflusst und wird deshalb nur
-//! begrenzt gelesen (Endstück, Zeilenlimit, kein Symlink).
+//! (nie Anweisung).
+//!
+//! # Ein Parser (PL-100 WP0.11, INVENTORY Befund 13)
+//! Gelesen und geparst wird ausschließlich mit `harw_dod_client`, also mit
+//! denselben Grenzen und Klassifikationen wie `harw dod status` und die
+//! `dod.*`-Werkzeuge: [`harw_dod_client::read_findings_tail`] (Endstück
+//! höchstens 256 KiB, Fortsetzung in die rotierte Generation `<pfad>.1`,
+//! Zeilen ≤ 16 KiB, Symlinks abgewiesen, `O_NOFOLLOW`) und
+//! [`harw_dod_client::parse_finding_line`] (Exportschema v1–v3, ungültige
+//! Zeilen und Regel-IDs werden verworfen statt umgeschrieben). Das Fenster
+//! ist `[now - 24 h, now + MAX_CLOCK_SKEW]`: Zeilen mit einem Zeitstempel
+//! weiter in der Zukunft zählen nie (vorher zählte der eigene Parser sie
+//! mit). Ist das Endstück unvollständig gelesen
+//! ([`harw_dod_client::FindingsTail::truncated`]), sind die Zähler
+//! Untergrenzen; die Kopfzeile sagt das.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use harw_dod_client::ExportSource;
+use harw_dod_client::findings::{MAX_CLOCK_SKEW, parse_lines};
+use harw_dod_client::{ExportSource, FindingLine, FindingsTail};
 use harw_extension_api::{ContextFragment, ContextProvider, ExtFuture, TurnInputContext};
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 /// Label des Fragments.
 pub const SECURITY_SIGNALS_LABEL: &str = "security.signals";
 /// Dateiname des Exports unter `<home>/dod/export`.
 pub const EXPORT_FILE: &str = harw_dod_client::FINDINGS_FILE;
-/// Gelesenes Endstück in Bytes.
-const MAX_TAIL_BYTES: u64 = 256 * 1024;
-/// Längste geparste Zeile.
-const MAX_LINE_BYTES: usize = 16 * 1024;
+/// Gelesenes Endstück in Bytes (dieselbe Obergrenze wie der Client).
+const MAX_TAIL_BYTES: u64 = harw_dod_client::MAX_TAIL_BYTES;
 /// Betrachtungsfenster in Sekunden.
 const WINDOW_SECS: i64 = 24 * 3600;
 /// Höchstzahl ausgegebener Regeln.
 const MAX_RULES: usize = 8;
-
-#[derive(serde::Deserialize)]
-struct Line {
-    rule_id: String,
-    severity: String,
-    observed_at: String,
-}
+/// Längste ausgegebene Regel-ID in Zeichen.
+const MAX_RULE_CHARS: usize = 48;
 
 /// Zählt hohe/kritische Befunde der letzten 24 h je Regel (`now` injiziert).
+///
+/// # Description
+/// Parst `export` Zeile für Zeile mit dem Client-Parser
+/// ([`harw_dod_client::findings::parse_lines`]: Schema v1–v3, Zeilen ≤ 16 KiB,
+/// implausibel weit in der Zukunft liegende Zeilen verworfen) und zählt dann
+/// mit [`count_lines`].
+///
+/// # Returns
+/// Regel-ID (höchstens 48 Zeichen) → Anzahl.
 #[must_use]
 pub fn count_recent(export: &[u8], now: OffsetDateTime) -> BTreeMap<String, u32> {
-    let text = String::from_utf8_lossy(export);
+    count_lines(&parse_lines(export, now), now)
+}
+
+/// Zählt hohe/kritische Befunde je Regel im Fenster `[now - 24 h, now +
+/// MAX_CLOCK_SKEW]`.
+///
+/// # Description
+/// Dasselbe Fenster wie [`harw_dod_client::summarize`]: Zeilen vor dem
+/// Fensterbeginn und Zeilen mit `observed_at` mehr als
+/// [`MAX_CLOCK_SKEW`] nach `now` zählen nicht. Die Regel-ID ist vom Client
+/// bereits geprüft (`[A-Za-z0-9._:-]`, ≤ 128 Bytes) und wird nur auf 48
+/// Zeichen gekürzt.
+///
+/// # Returns
+/// Regel-ID → Anzahl (sättigend).
+#[must_use]
+pub fn count_lines(lines: &[FindingLine], now: OffsetDateTime) -> BTreeMap<String, u32> {
+    let earliest = now.checked_sub(time::Duration::seconds(WINDOW_SECS));
+    let latest = time::Duration::try_from(MAX_CLOCK_SKEW)
+        .ok()
+        .and_then(|skew| now.checked_add(skew));
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();
-    for raw in text.lines() {
-        if raw.len() > MAX_LINE_BYTES {
+    for line in lines {
+        if !line.is_high_or_critical()
+            || earliest.is_some_and(|bound| line.observed_at < bound)
+            || latest.is_none_or(|bound| line.observed_at > bound)
+        {
             continue;
         }
-        let Ok(line) = serde_json::from_str::<Line>(raw) else {
-            continue;
-        };
-        if !matches!(line.severity.as_str(), "high" | "critical") {
+        let rule: String = line.rule_id.chars().take(MAX_RULE_CHARS).collect();
+        if rule.is_empty() {
             continue;
         }
-        let Ok(at) = OffsetDateTime::parse(&line.observed_at, &Rfc3339) else {
-            continue;
-        };
-        if (now - at).whole_seconds() > WINDOW_SECS {
-            continue;
-        }
-        // Nur sichere Regel-IDs (kurz, ASCII) — der Text ist nie Anweisung.
-        let rule: String = line
-            .rule_id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            .take(48)
-            .collect();
-        if !rule.is_empty() {
-            *counts.entry(rule).or_insert(0) += 1;
-        }
+        let slot = counts.entry(rule).or_insert(0);
+        *slot = slot.saturating_add(1);
     }
     counts
 }
@@ -92,12 +113,30 @@ pub fn count_recent(export: &[u8], now: OffsetDateTime) -> BTreeMap<String, u32>
 /// Nur der Systemexport (`ExportSource::System`) ist verifiziert; für jede
 /// andere Quelle trägt die Kopfzeile den Vermerk „unverifizierte Quelle"
 /// und den Hinweis des Resolvers — die Zähler sind dann keine
-/// Harw-DoD-Tatsachen.
+/// Harw-DoD-Tatsachen. Entspricht [`render_with_coverage`] mit vollständig
+/// gelesenem Export.
 #[must_use]
 pub fn render(counts: &BTreeMap<String, u32>, source: ExportSource) -> Option<String> {
+    render_with_coverage(counts, source, true)
+}
+
+/// Wie [`render`]; `complete == false` (Endstück nicht vollständig gelesen,
+/// [`FindingsTail::truncated`]) kennzeichnet die Zähler in der Kopfzeile als
+/// Untergrenzen.
+#[must_use]
+pub fn render_with_coverage(
+    counts: &BTreeMap<String, u32>,
+    source: ExportSource,
+    complete: bool,
+) -> Option<String> {
     if counts.is_empty() {
         return None;
     }
+    let coverage = if complete {
+        ""
+    } else {
+        "; Untergrenzen — Export nicht vollständig gelesen"
+    };
     let provenance = if source.is_verified() {
         String::new()
     } else {
@@ -114,7 +153,7 @@ pub fn render(counts: &BTreeMap<String, u32>, source: ExportSource) -> Option<St
         .map(|(rule, n)| format!("- {rule}: {n}"))
         .collect();
     Some(format!(
-        "Sicherheits-Signale (hoch/kritisch, letzte 24 h, nur Zähler{provenance}):\n{}",
+        "Sicherheits-Signale (hoch/kritisch, letzte 24 h, nur Zähler{coverage}{provenance}):\n{}",
         lines.join("\n")
     ))
 }
@@ -161,31 +200,18 @@ impl SecuritySignalsContextProvider {
         )
     }
 
-    /// The bounded tail of the resolved export and the source it came
-    /// from; `None` when nothing can be read (an unreadable system export
-    /// included, never replaced by the home fallback).
-    fn read_tail(&self) -> Option<(ExportSource, Vec<u8>)> {
+    /// The bounded, parsed tail of the resolved export and the source it
+    /// came from; `None` when nothing can be read (an unreadable system
+    /// export included, never replaced by the home fallback).
+    ///
+    /// Reads through [`harw_dod_client::read_findings_tail`]: the rotated
+    /// generation `<path>.1` is continued into, symlinks and non-regular
+    /// files are refused, lines more than `MAX_CLOCK_SKEW` after `now` are
+    /// dropped.
+    fn read_tail(&self, now: OffsetDateTime) -> Option<(ExportSource, FindingsTail)> {
         let paths = self.resolve();
-        let export = paths.findings;
-        let meta = std::fs::symlink_metadata(&export).ok()?;
-        if !meta.file_type().is_file() {
-            return None;
-        }
-        let mut file = std::fs::File::open(&export).ok()?;
-        let len = meta.len();
-        let start = len.saturating_sub(MAX_TAIL_BYTES);
-        file.seek(SeekFrom::Start(start)).ok()?;
-        let mut buf = Vec::new();
-        file.take(MAX_TAIL_BYTES).read_to_end(&mut buf).ok()?;
-        if start > 0 {
-            // Beginn mitten in einer Zeile: erste (Teil-)Zeile verwerfen.
-            let cut = buf
-                .iter()
-                .position(|b| *b == b'\n')
-                .map_or(buf.len(), |i| i + 1);
-            buf.drain(..cut);
-        }
-        Some((paths.source, buf))
+        let tail = harw_dod_client::read_findings_tail(&paths.findings, MAX_TAIL_BYTES, now).ok()?;
+        Some((paths.source, tail))
     }
 }
 
@@ -200,11 +226,12 @@ impl ContextProvider for SecuritySignalsContextProvider {
 
     fn contribute<'a>(&'a self, _ctx: &'a TurnInputContext) -> ExtFuture<'a, Vec<ContextFragment>> {
         Box::pin(async move {
-            let Some((source, bytes)) = self.read_tail() else {
+            let now = OffsetDateTime::now_utc();
+            let Some((source, tail)) = self.read_tail(now) else {
                 return Vec::new();
             };
-            let counts = count_recent(&bytes, OffsetDateTime::now_utc());
-            render(&counts, source)
+            let counts = count_lines(&tail.lines, now);
+            render_with_coverage(&counts, source, !tail.truncated)
                 .map(|content| {
                     vec![ContextFragment {
                         label: SECURITY_SIGNALS_LABEL.to_owned(),
