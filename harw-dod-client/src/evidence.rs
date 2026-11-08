@@ -192,10 +192,10 @@ impl EvidenceCard {
         if !restrict_keys(&mut card, &CARD_FIELDS, lenient) {
             return None;
         }
-        if let Some(Value::Object(process)) = card.get_mut("process") {
-            if !restrict_keys(process, &PROCESS_FIELDS, lenient) {
-                return None;
-            }
+        if let Some(Value::Object(process)) = card.get_mut("process")
+            && !restrict_keys(process, &PROCESS_FIELDS, lenient)
+        {
+            return None;
         }
         serde_json::from_value(Value::Object(card)).ok()
     }
