@@ -258,6 +258,54 @@ pub struct FindingLine {
     /// characters; otherwise the line is kept without `scope`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// v3: UUIDv4 of the sentinel process instance that wrote the line (new
+    /// per start). Validated with [`is_uuid_v4`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// v3: position of the line within [`instance`](Self::instance),
+    /// monotonic, starting at 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// v3: lowercase hex of the 32-byte BLAKE3 digest of the
+    /// `FindingRecord` ([`RECORD_DIGEST_HEX_LEN`] chars); `None` when the
+    /// sentinel produced no record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_digest: Option<String>,
+    /// v3: throttling key over rule, uid, cgroup id and coarse subject
+    /// ([`DEDUP_KEY_HEX_LEN`] lowercase hex chars). Lines with the same key
+    /// report repeats of one finding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
+    /// v3: how often the [`dedup_key`](Self::dedup_key) fired (≥ 1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrences: Option<u64>,
+    /// v3: when the [`dedup_key`](Self::dedup_key) was first seen.
+    #[serde(
+        serialize_with = "time::serde::rfc3339::option::serialize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub first_seen: Option<OffsetDateTime>,
+    /// v3: why the finding exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<FindingKind>,
+    /// v3: how directly the finding is backed by observations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardness: Option<FindingHardness>,
+    /// v3: kernel cgroup id of the observed actor. Kernel ids are reused;
+    /// pair it with [`scope`](Self::scope) and
+    /// [`first_seen`](Self::first_seen).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cgroup_kid: Option<u64>,
+    /// `true` when a scope existed but was withheld because it could not be
+    /// rendered safely: set by the v3 writer, and by this reader whenever it
+    /// drops a non-empty `scope` it does not accept (any version).
+    #[serde(skip_serializing_if = "is_false")]
+    pub scope_obfuscated: bool,
+    /// v3: bounded, escaped evidence summary; `None` when absent, larger than
+    /// [`MAX_EVIDENCE_CARD_BYTES`](crate::evidence::MAX_EVIDENCE_CARD_BYTES)
+    /// or malformed (the line itself is kept).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_card: Option<EvidenceCard>,
 }
 
 impl FindingLine {
@@ -265,6 +313,15 @@ impl FindingLine {
     #[must_use]
     pub fn is_high_or_critical(&self) -> bool {
         self.severity >= ImpactSeverity::High
+    }
+
+    /// `true` when [`finding_id`](Self::finding_id) is a canonical UUIDv4
+    /// ([`is_uuid_v4`]). Always `true` for v3 lines; v1/v2 lines may carry
+    /// older ids. Consumers that bind decisions to an id (dispatch, verdicts)
+    /// skip lines without one.
+    #[must_use]
+    pub fn has_uuid_v4_id(&self) -> bool {
+        is_uuid_v4(self.finding_id.as_str())
     }
 }
 
@@ -281,6 +338,28 @@ struct RawFindingLine {
     observed_at: String,
     #[serde(default)]
     scope: Option<String>,
+    #[serde(default)]
+    instance: Option<String>,
+    #[serde(default)]
+    seq: Option<u64>,
+    #[serde(default)]
+    record_digest: Option<String>,
+    #[serde(default)]
+    dedup_key: Option<String>,
+    #[serde(default)]
+    occurrences: Option<u64>,
+    #[serde(default)]
+    first_seen: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    hardness: Option<String>,
+    #[serde(default)]
+    cgroup_kid: Option<u64>,
+    #[serde(default)]
+    scope_obfuscated: bool,
+    #[serde(default)]
+    evidence_card: Option<serde_json::Value>,
 }
 
 /// Why a raw line was rejected.
@@ -302,7 +381,17 @@ impl TryFrom<RawFindingLine> for FindingLine {
         if raw.schema_version == Some(0) {
             return Err(InvalidFindingLine("schema_version 0"));
         }
-        if !is_clean(&raw.finding_id, MAX_ID_BYTES) {
+        // From v3 on the id is the UUIDv4 `FindingId::new` mints; v1/v2 lines
+        // keep the older rule (non-empty, clean, bounded).
+        let strict_ids = raw.schema_version.is_some_and(|version| version >= 3);
+        // Only a writer newer than this reader may use values it does not
+        // know yet; up to `EXPORT_SCHEMA_VERSION` they are contract violations.
+        let lenient = raw
+            .schema_version
+            .is_some_and(|version| version > EXPORT_SCHEMA_VERSION);
+        if !is_clean(&raw.finding_id, MAX_ID_BYTES)
+            || (strict_ids && !is_uuid_v4(&raw.finding_id))
+        {
             return Err(InvalidFindingLine("finding_id"));
         }
         if !is_clean(&raw.host, MAX_ID_BYTES) {
@@ -322,13 +411,51 @@ impl TryFrom<RawFindingLine> for FindingLine {
         let finding_id = FindingId::try_from_str(raw.finding_id)
             .map_err(|_| InvalidFindingLine("finding_id"))?;
         let host = HostId::try_from_str(raw.host).map_err(|_| InvalidFindingLine("host"))?;
+        // v3 identifiers are generated by the sentinel itself: a malformed
+        // one means the line was not written by it, so the line is refused.
+        let instance = match raw.instance {
+            Some(instance) if !is_uuid_v4(&instance) => {
+                return Err(InvalidFindingLine("instance"));
+            }
+            instance => instance,
+        };
+        if raw.seq == Some(0) {
+            return Err(InvalidFindingLine("seq"));
+        }
+        let record_digest =
+            lower_hex_field(raw.record_digest, RECORD_DIGEST_HEX_LEN, "record_digest")?;
+        let dedup_key = lower_hex_field(raw.dedup_key, DEDUP_KEY_HEX_LEN, "dedup_key")?;
+        if raw.occurrences == Some(0) {
+            return Err(InvalidFindingLine("occurrences"));
+        }
+        let first_seen = raw
+            .first_seen
+            .map(|text| OffsetDateTime::parse(&text, &Rfc3339))
+            .transpose()
+            .map_err(|_| InvalidFindingLine("first_seen"))?;
+        let kind = enum_field(raw.kind.as_deref(), FindingKind::from_wire, lenient, "kind")?;
+        let hardness = enum_field(
+            raw.hardness.as_deref(),
+            FindingHardness::from_wire,
+            lenient,
+            "hardness",
+        )?;
         // Same acceptance rule as the sentinel writer: an unacceptable scope
         // is dropped, never rewritten (a rewritten path names another cgroup).
+        // Dropping a non-empty scope is recorded as `scope_obfuscated`, so the
+        // withheld attribution stays visible instead of silently vanishing.
+        let scope_given = raw.scope.as_deref().is_some_and(|scope| !scope.is_empty());
         let scope = raw.scope.filter(|scope| {
             scope.starts_with('/')
                 && scope.len() <= MAX_SCOPE_BYTES
                 && !scope.chars().any(is_unsafe_char)
         });
+        let scope_obfuscated = raw.scope_obfuscated || (scope_given && scope.is_none());
+        // Observation content: a card that is too large or malformed is
+        // dropped, the finding itself is kept.
+        let evidence_card = raw
+            .evidence_card
+            .and_then(|value| EvidenceCard::from_export_value(value, lenient));
         Ok(Self {
             schema_version: raw.schema_version,
             finding_id,
@@ -338,7 +465,50 @@ impl TryFrom<RawFindingLine> for FindingLine {
             summary: sanitize(&raw.summary, MAX_SUMMARY_BYTES, ' '),
             observed_at,
             scope,
+            instance,
+            seq: raw.seq,
+            record_digest,
+            dedup_key,
+            occurrences: raw.occurrences,
+            first_seen,
+            kind,
+            hardness,
+            cgroup_kid: raw.cgroup_kid,
+            scope_obfuscated,
+            evidence_card,
         })
+    }
+}
+
+/// An optional lowercase-hex identifier of exactly `len` chars; any other
+/// present value rejects the line, naming `field`.
+fn lower_hex_field(
+    value: Option<String>,
+    len: usize,
+    field: &'static str,
+) -> Result<Option<String>, InvalidFindingLine> {
+    match value {
+        Some(text) if !is_lower_hex(&text, len) => Err(InvalidFindingLine(field)),
+        value => Ok(value),
+    }
+}
+
+/// An optional enum spelled as in the export: unknown values reject the line
+/// (naming `field`) unless the line comes from a newer writer (`lenient`),
+/// where they are ignored.
+fn enum_field<T>(
+    value: Option<&str>,
+    parse: fn(&str) -> Option<T>,
+    lenient: bool,
+    field: &'static str,
+) -> Result<Option<T>, InvalidFindingLine> {
+    let Some(text) = value else {
+        return Ok(None);
+    };
+    match parse(text) {
+        Some(parsed) => Ok(Some(parsed)),
+        None if lenient => Ok(None),
+        None => Err(InvalidFindingLine(field)),
     }
 }
 
