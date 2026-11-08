@@ -86,8 +86,10 @@
 //! (`skill.toml` `tools = [...]`) and the tools its `triggers.toml` fires on
 //! (`[triggers] tools`; `cargo-tools` fires on `cargo.test_one`, which its
 //! manifest does not list). Only declared names the [`ToolAvailability`]
-//! knows as tool names count; abstract capability names (`filesystem.read`)
-//! never filter a skill.
+//! knows count; abstract capability names (`filesystem.read`) filter a skill
+//! only where the availability knows them (PL-100 WP 1.5: a child session
+//! maps them onto its callable tools, and labels that carry write or
+//! execute rights are required all-of, [`ToolAvailability::with_required`]).
 //!
 //! A skipped skill takes no room: it costs no session bytes, and when it
 //! displaced other hits of the same round from the per-round budget the
@@ -394,6 +396,13 @@ pub struct RoundInjection {
 /// `filesystem.read`) say nothing about availability. Descriptive only: an
 /// admitted skill gains no tool and no right.
 ///
+/// PL-100 WP 1.5: names given to [`Self::with_required`] (a child session
+/// passes the abstract capability labels that carry write or execute
+/// rights, such as `filesystem.write`) are judged all-of: a skill declaring
+/// one of them the session does not register is refused, whatever else it
+/// declares. [`Self::narrowed`] cuts the registered names afterwards (the
+/// activation cut of a child admission).
+///
 /// # Examples
 /// ```rust
 /// use harw_core::skill_injection::ToolAvailability;
@@ -403,11 +412,18 @@ pub struct RoundInjection {
 /// assert!(tools.admits(&["sys.ps".to_owned(), "fs.read".to_owned()]));
 /// assert!(tools.admits(&["filesystem.read".to_owned()]));
 /// assert!(tools.admits(&[]));
+///
+/// let read_only = ToolAvailability::new(["fs.read", "filesystem.read"], ["fs.write"])
+///     .with_required(["filesystem.write"]);
+/// assert!(!read_only.admits(&["filesystem.read".to_owned(), "filesystem.write".to_owned()]));
+/// assert!(read_only.admits(&["filesystem.read".to_owned()]));
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolAvailability {
     registered: BTreeSet<String>,
     known: BTreeSet<String>,
+    /// Declared names judged all-of ([`Self::with_required`]); always known.
+    required: BTreeSet<String>,
 }
 
 impl ToolAvailability {
@@ -424,13 +440,78 @@ impl ToolAvailability {
         let registered: BTreeSet<String> = registered.into_iter().map(Into::into).collect();
         let mut known: BTreeSet<String> = known.into_iter().map(Into::into).collect();
         known.extend(registered.iter().cloned());
-        Self { registered, known }
+        Self {
+            registered,
+            known,
+            required: BTreeSet::new(),
+        }
     }
 
-    /// Whether a skill declaring `tools` fits the session: it declares no
-    /// known tool name, or the session registers at least one it declares.
+    /// Marks `names` as required (PL-100 WP 1.5): a skill that declares one
+    /// of them is admitted only when the session registers every such name
+    /// it declares; the any-of rule then applies to the rest. The names
+    /// become known.
+    ///
+    /// # Arguments
+    /// - `names`: declared names (typically abstract capability labels that
+    ///   carry write or execute rights, e.g. `filesystem.write`,
+    ///   `process.execute`).
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_core::skill_injection::ToolAvailability;
+    ///
+    /// let writer = ToolAvailability::new(["fs.write", "filesystem.write"], Vec::<String>::new())
+    ///     .with_required(["filesystem.write", "process.execute"]);
+    /// assert!(writer.admits(&["filesystem.write".to_owned()]));
+    /// assert!(!writer.admits(&["filesystem.write".to_owned(), "process.execute".to_owned()]));
+    /// ```
+    #[must_use]
+    pub fn with_required<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required.extend(names.into_iter().map(Into::into));
+        self.known.extend(self.required.iter().cloned());
+        self
+    }
+
+    /// A copy whose registered names are only those `keep` accepts; known
+    /// and required names stay (PL-100 WP 1.5: the activation cut of a child
+    /// admission, which may disable tools its registry serves).
+    ///
+    /// # Arguments
+    /// - `keep`: called once per registered name. It must keep names that
+    ///   are no tool of the session (abstract capability labels), e.g. by
+    ///   keeping every name the session registry does not serve.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_core::skill_injection::ToolAvailability;
+    ///
+    /// let tools = ToolAvailability::new(["fs.read", "sys.ps"], Vec::<String>::new());
+    /// let narrowed = tools.narrowed(|name| name != "sys.ps");
+    /// assert!(!narrowed.admits(&["sys.ps".to_owned()]));
+    /// assert!(narrowed.admits(&["fs.read".to_owned()]));
+    /// ```
+    #[must_use]
+    pub fn narrowed(&self, keep: impl Fn(&str) -> bool) -> Self {
+        let mut narrowed = self.clone();
+        narrowed.registered.retain(|name| keep(name.as_str()));
+        narrowed
+    }
+
+    /// Whether a skill declaring `tools` fits the session: no declared
+    /// required name ([`Self::with_required`]) is missing, and it declares
+    /// no known tool name or the session registers at least one it declares.
     #[must_use]
     pub fn admits(&self, tools: &[String]) -> bool {
+        if tools.iter().any(|tool| {
+            self.required.contains(tool.as_str()) && !self.registered.contains(tool.as_str())
+        }) {
+            return false;
+        }
         let mut declared = tools
             .iter()
             .filter(|tool| self.known.contains(tool.as_str()))
@@ -450,6 +531,9 @@ pub struct SkillInjector {
     imported: BTreeSet<String>,
     /// The availability filter; `None` admits every triggered skill.
     tools: Option<ToolAvailability>,
+    /// Skills the session already carries in full (PL-100 WP 1.5: the fixed
+    /// skills of a child role); a trigger hit never delivers them.
+    excluded: BTreeSet<String>,
     state: Mutex<InjectorState>,
 }
 
@@ -608,6 +692,7 @@ impl SkillInjector {
             settings,
             imported: BTreeSet::new(),
             tools: None,
+            excluded: BTreeSet::new(),
             state: Mutex::new(InjectorState::default()),
         }
     }
@@ -619,6 +704,49 @@ impl SkillInjector {
     pub fn with_tool_availability(mut self, tools: ToolAvailability) -> Self {
         self.tools = Some(tools);
         self
+    }
+
+    /// A fresh injector over the same index, settings, imported and excluded
+    /// skills whose tool filter keeps only the registered names `keep`
+    /// accepts ([`ToolAvailability::narrowed`]); without a filter there is
+    /// nothing to narrow.
+    ///
+    /// # Description
+    /// PL-100 WP 1.5: for the handover of a child's injector after the
+    /// activation cut of its admission (`narrow_base_activation`), which
+    /// may disable tools the child registry serves. The session state is not
+    /// copied: call it before the first round of the session.
+    ///
+    /// # Arguments
+    /// - `keep`: see [`ToolAvailability::narrowed`]; it must keep names that
+    ///   are no tool of the session (abstract capability labels).
+    ///
+    /// # Examples
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use harw_catalog::SkillIndex;
+    /// use harw_core::skill_injection::{SkillInjectionSettings, SkillInjector, ToolAvailability};
+    ///
+    /// let injector = SkillInjector::new(
+    ///     Arc::new(SkillIndex::build_with_bundle(&[], &[])),
+    ///     SkillInjectionSettings::default(),
+    /// )
+    /// .with_tool_availability(ToolAvailability::new(["fs.read"], ["sys.ps"]))
+    /// .with_excluded_skills(["planning"]);
+    /// let narrowed = injector.narrowed_to_callable(|name| name != "fs.read");
+    /// assert!(narrowed.excludes("planning"));
+    /// assert_eq!(narrowed.session_bytes(), 0);
+    /// ```
+    #[must_use]
+    pub fn narrowed_to_callable(&self, keep: impl Fn(&str) -> bool) -> Self {
+        Self {
+            index: Arc::clone(&self.index),
+            settings: self.settings,
+            imported: self.imported.clone(),
+            tools: self.tools.as_ref().map(|tools| tools.narrowed(&keep)),
+            excluded: self.excluded.clone(),
+            state: Mutex::new(InjectorState::default()),
+        }
     }
 
     /// Whether `skill` fits the session's tools ([`ToolAvailability::admits`]
@@ -639,6 +767,46 @@ impl SkillInjector {
             }
             _ => true,
         }
+    }
+
+    /// Excludes skills the session already carries in full (PL-100 WP 1.5:
+    /// the fixed skills a child role gets as instruction fragments). A
+    /// trigger hit on an excluded skill is skipped like a skill without its
+    /// tools: it stays marked until the next compaction, costs no bytes and
+    /// takes no room of the round, but is not reported as unavailable.
+    ///
+    /// # Arguments
+    /// - `names`: skill names; unknown names are kept and simply never hit.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use harw_catalog::SkillIndex;
+    /// use harw_core::skill_injection::{SkillInjectionSettings, SkillInjector};
+    ///
+    /// let injector = SkillInjector::new(
+    ///     Arc::new(SkillIndex::build_with_bundle(&[], &[])),
+    ///     SkillInjectionSettings::default(),
+    /// )
+    /// .with_excluded_skills(["latex-report"]);
+    /// assert!(injector.excludes("latex-report"));
+    /// assert!(!injector.excludes("planning"));
+    /// ```
+    #[must_use]
+    pub fn with_excluded_skills<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.excluded.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// Whether `skill` is excluded from triggered delivery
+    /// ([`Self::with_excluded_skills`]).
+    #[must_use]
+    pub fn excludes(&self, skill: &str) -> bool {
+        self.excluded.contains(skill)
     }
 
     /// Marks additional skills as imported (trust class `Evidence`; delivered
@@ -963,6 +1131,19 @@ impl SkillInjector {
                     scratch.forget.push(injection.skill);
                     continue;
                 }
+                if self.excluded.contains(&injection.skill) {
+                    // PL-100 WP 1.5: already part of the session's fixed
+                    // context. Stays marked (no re-selection until the next
+                    // compaction), costs no bytes and frees its room like a
+                    // skill skipped for its tools.
+                    tracing::debug!(
+                        skill = %injection.skill,
+                        "skill_injection.fixed_skill_skipped"
+                    );
+                    state.release(injection.bytes);
+                    skipped_for_tools = true;
+                    continue;
+                }
                 if !self.tools_admit(&injection.skill) {
                     // The session has none of the tools the skill explains:
                     // stays marked (no re-selection until the next
@@ -1013,6 +1194,12 @@ impl SkillInjector {
         for dropped in select_drops {
             if dropped.reason == DropReason::AlreadyDelivered {
                 if decided.contains(&dropped.skill) {
+                    continue;
+                }
+                // PL-100 WP 1.5: an excluded skill stays marked after its
+                // first hit but was never delivered; a later hit is no
+                // "already delivered" drop.
+                if self.excluded.contains(&dropped.skill) {
                     continue;
                 }
                 if state.unavailable.contains(&dropped.skill) {

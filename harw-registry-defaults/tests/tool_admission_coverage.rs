@@ -71,6 +71,9 @@ use harw_registry_defaults::profile::{DOD_READ_TOOLS, DOD_TRIAGE_ROLE_TOOLS, dod
 use harw_registry_defaults::profile::{
     SKILL_CATALOG_EXCLUDED_ROLES, SKILL_CATALOG_TOOLS, skill_catalog_tools_for_role,
 };
+// PL-100 O11: `deps.locked` von `intel-scout` ebenso (rollengebundener
+// Provider in `harw-runtime/src/children.rs`).
+use harw_registry_defaults::profile::{LOCKFILE_READ_TOOLS, lockfile_tools_for_role};
 
 mod common;
 use common::{TestError, TestResult, ctx};
@@ -125,6 +128,8 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
             .chain(matrix_tools_for_role(role).iter().copied())
             // PL-97 D4: `dod.*` (nur die vier Triage-Rollen).
             .chain(dod_tools_for_role(role).iter().copied())
+            // PL-100 O11: `deps.locked` (nur `intel-scout`).
+            .chain(lockfile_tools_for_role(role).iter().copied())
             // Plan R9, Teil A: `skills.search`/`skills.load` (Skill-Katalog).
             .chain(skill_catalog_tools_for_role(role).iter().copied())
             // Plan R9, Teil F: Job-Kontrolle der Orchestratoren.
@@ -1089,5 +1094,59 @@ fn security_triage_roles_admit_the_dod_tools_and_bind_the_bundled_harw_dod_skill
         assert_eq!(ir.skills(), ["harw-dod"], "{role}: skills");
     }
     assert_eq!(triage, 4, "vier Triage-Rollen");
+    Ok(())
+}
+
+/// PL-100 O11: `intel-scout` admittiert genau das rollengebundene
+/// `deps.locked` (`LOCKFILE_READ_TOOLS`), `context-steward` gar kein
+/// Werkzeug; beide verbieten Schreiben, Exec und jedes Netzwerkzeug
+/// ausdrücklich, und keine andere eingebaute Rolle bekommt `deps.locked`
+/// rollengebunden angeboten (wer es braucht, bekommt es über sein Profil).
+/// Ihr Profil `NoTools` bewirbt nichts, das sie nicht aufrufen dürften.
+#[test]
+fn o11_roles_admit_exactly_their_role_bound_tools() -> TestResult {
+    let roles = resolved_roles()?;
+    for (role, expected) in [
+        (role_names::INTEL_SCOUT, LOCKFILE_READ_TOOLS),
+        (role_names::CONTEXT_STEWARD, &[] as &[&str]),
+    ] {
+        let ir = roles
+            .get(role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let profile =
+            profile_for_role(role).ok_or(TestError::Unexpected(format!("{role} ohne Profil")))?;
+        assert_eq!(profile, RegistryProfile::NoTools, "{role}");
+        assert!(profile.tool_names().is_empty(), "{role}: {profile:?}");
+        assert_eq!(lockfile_tools_for_role(role), expected, "{role}: Angebot");
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let expected_admitted: BTreeSet<&str> = expected.iter().copied().collect();
+        assert_eq!(admitted, expected_admitted, "{role}: admitted");
+        let forbidden: BTreeSet<&str> = ir
+            .tool_surface()
+            .forbidden()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for tool in [
+            "fs.write",
+            "fs.edit",
+            "shell.exec",
+            "web.fetch",
+            "web.docs_rs",
+            "web.crates_io",
+        ] {
+            assert!(forbidden.contains(tool), "{role} muss {tool} verbieten");
+        }
+    }
+    for role in role_names::ALL {
+        if *role != role_names::INTEL_SCOUT {
+            assert!(lockfile_tools_for_role(role).is_empty(), "{role}");
+        }
+    }
     Ok(())
 }

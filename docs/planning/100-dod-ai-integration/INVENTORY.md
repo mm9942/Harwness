@@ -154,19 +154,19 @@ Kein Befund verweist auf das auslösende Event. Die Scope-Zuordnung wird nachtr�
   - 40k Tokens, 20 Calls, 120 s, `max_depth` 0;
   - Rückgabe `harwness.security-verdict/v1`.
 - Erreichbar nur, wenn ein Modell im `analysis-orchestrator` delegiert.
-- `intel-scout` und `context-steward` sind Sackgassen: nicht in `role_names::ALL`, kein `[return]`.
+- `intel-scout` und `context-steward` sind Sackgassen: nicht in `role_names::ALL`, kein `[return]`. **Behoben (O11):** Beide stehen in `role_names::ALL` (`INTEL_SCOUT`, `CONTEXT_STEWARD`) und deklarieren `[return] contract = "harwness.return.envelope@1"`, nie ein Verdict. Profil `NoTools`, Reducer `ReadOnly`, `max_depth` 0, kein `dod.*`, kein Skill-Katalog. Im System-Prompt tragen sie eine eigene Rollenbeschreibung (`profile::role_description_for_role`), nicht die Triage-Beschreibung von `NoTools`. `intel-scout` bekommt sein einziges Werkzeug `deps.locked` rollengebunden (`profile::lockfile_tools_for_role`, montiert in `harw-runtime/src/children.rs`); `context-steward` hat kein Werkzeug. Delegationsziel eines Orchestrators sind beide noch nicht (`analysis-orchestrator.toml` `[delegation].targets`, Familie `security` `[workers]`).
 
 **Signale im Kontext**
 - `security.signals`: High/Critical je Regel über 24 h, opt-in.
 - ✔ Eigener Parser: Zeilen mit Zeitstempel in der Zukunft werden mitgezählt (`harw-runtime/src/security_signals.rs:73`).
-- Der Skill `harw-dod` wird per Stichwort injiziert. Child-Sessions haben keinen SkillInjector.
+- Der Skill `harw-dod` wird per Stichwort injiziert. Child-Sessions bekommen seit WP 1.5 einen SkillInjector. **Behoben (WP 1.5):** Die Fabrik baut bei jeder Admission eines Kindes, das den Skill-Katalog bekommt, wie für eine Wurzel-Sitzung einen eigenen `SkillInjector` (`RuntimeChildRegistryFactory::child_skill_injector` in `harw-runtime/src/children.rs`). Sein Werkzeug-Filter kennt die Werkzeuge, die das Kind höchstens aufrufen kann: Registry, geschnitten mit `[tools]` der (geklemmten) Definition und mit den Rechten des Elternteils (`ParentGrant::permissions`; die Kind-Sandbox ist nie weiter). Weder der Reducer der Basisrolle noch die Eltern-Registry (`ParentGrant::tools`) schneiden: der `test-engineer` (Basis `analyst`, Reducer ohne `ExecuteProcess`) hält `cargo.test_one` und bekommt `cargo-tools`, auch wenn der Elternteil das Werkzeug nicht registriert. Abstrakte Fähigkeits-Labels der Skills (`filesystem.read`, `filesystem.write`, `process.execute`) gelten als aufrufbar, wenn ein aufrufbares Werkzeug ihr Recht trägt; Labels mit Schreib- oder Ausführungsrecht gelten all-of (`ToolAvailability::with_required`), ein lesendes Kind bekommt also keinen Skill, der `filesystem.write` nennt. Fest gebundene Skills der Rolle spielt er nie ein zweites Mal ein (`SkillInjector::with_excluded_skills`). Benutzerdefinierte Agenten laufen über denselben Weg. Die Triage-Rollen, `intel-scout` und `context-steward` stehen in `SKILL_CATALOG_EXCLUDED_ROLES` und bekommen keinen Injektor, ebenso benutzerdefinierte Agenten über diesen Rollen (geprüft wird die Basisrolle); `harw-dod` bleibt der fest gebundene Skill der Triage-Rollen. `child_session_observers` übergibt ihn in `ChildSessionObservers::skill_injector`; `admit_inner` schneidet ihn nach `narrow_base_activation` mit `SkillInjector::narrowed_to_callable` auf die Kind-Aktivierung (Tests `harw-core/src/child_controller/tests/skill_injector_handover.rs`).
 
 **Trigger:** keine. Es gibt keinen Watcher, keinen Cursor, kein Dedup und keinen Router von Regel zu Rolle.
 
 **Was fehlt**
 1. ✔ `finding_view` hat keinen Digest (`dod.rs:1263-1275`), `binds()` verlangt aber einen.
 2. ✔ Der Skill erwähnt `SecurityVerdict` nicht.
-3. ✔ Die Rollen nutzen `program = "triage"` (Fehler-Triage, `agents/context-programs/triage.toml:1-7`).
+3. ✔ Die Rollen nutzten `program = "triage"` (Fehler-Triage, `agents/context-programs/triage.toml:1-7`). **Behoben (WP 1.3):** Alle vier binden jetzt das Kontextprogramm `security-triage` (`harw-registry-defaults/agents/context-programs/security-triage.toml`; `program = "security-triage"` in `security-egress-triage.toml:139`, `security-baseline-triage.toml:139`, `security-structure-triage.toml:137`, `security-endpoint-triage.toml:155`).
 4. ✔ Keine Verdict-Senke: `TriageSubmission` hat weder Produzent noch Konsument, und `harw-escalator` existiert nicht.
 5. U: Plan-Bridge `security_bridge`, Uplink `FindingSummary`/`HealthBeat`, Hub `/v1/posture`.
 6. Kein `dod.doctor`, `dod.chain`, `dod.metrics` und kein Cursor-Werkzeug.
@@ -178,7 +178,7 @@ Kein Befund verweist auf das auslösende Event. Die Scope-Zuordnung wird nachtr�
 - `sys.*` (12 /proc-Werkzeuge, cmdline/env maskiert, nur im Full-Profil).
 - ✔ `process.list` (argv **unmaskiert**, `harw-killer/src/api.rs:297`).
 - `job.logs` und die drei `dod.*`.
-- Es gibt kein Journal/Syslog-Werkzeug und keinen Cgroup-Filter für `sys.ps`.
+- Es gibt kein Journal/Syslog-Werkzeug und keinen Cgroup-Filter für `sys.ps`. **Teilweise behoben (Owner-Befund 4505015316):** `sys.ps`, `sys.pgrep` und `sys.top` filtern per `ScopePolicy` (`scope = "own"` als Vorgabe). Die Montage baut den `SysToolProvider` aus der geteilten Freigabe-Zelle (`scope = "all"` nur unter Full Access) und nimmt die bestätigte delegierte Job-Wurzel (`JobWiring::delegated_cgroup_root`) in den eigenen Umfang auf (`harw-registry-defaults/src/profile.rs`, `sys_tool_provider`). Ein Journal-Werkzeug fehlt weiter.
 
 **Ändernd:** siehe D. Für Agenten gibt es nur SIGKILL auf Prozesse derselben uid, kein TERM. Es gibt kein renice, kein SIGSTOP und keinen Cgroup-Freeze.
 
@@ -213,7 +213,7 @@ Kein Befund verweist auf das auslösende Event. Die Scope-Zuordnung wird nachtr�
   - statisches `config suggest`;
   - `--grant-read` fehlt;
   - `permission_request!` ohne Konsument;
-  - kein SkillInjector für Children;
+  - SkillInjector für Children: behoben (PL-100 WP 1.5, siehe E);
   - `install` aktiviert automatisch.
 
 **Observability**

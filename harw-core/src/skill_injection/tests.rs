@@ -1874,3 +1874,229 @@ async fn run_turn_alone_restores_the_injector_of_a_resumed_session() -> TestResu
     assert_eq!(store.load_skill_injections(&id).await?.len(), 1);
     Ok(())
 }
+
+/// PL-100 WP 1.5: an excluded skill (a fixed skill of a child role, already
+/// in its instructions) is never delivered by a trigger, in no later round
+/// either; a sibling hit on the same trigger still is.
+#[test]
+fn excluded_skills_are_never_delivered_by_a_trigger() -> TestResult {
+    let index = index_of(&[
+        ("borrow", BORROW_TRIGGERS, BODY),
+        ("lifetimes", LIFETIMES_TRIGGERS, BODY),
+    ]);
+    let injector = SkillInjector::new(Arc::clone(&index), SkillInjectionSettings::default())
+        .with_excluded_skills(["borrow"]);
+    assert!(injector.excludes("borrow"));
+    assert!(!injector.excludes("lifetimes"));
+
+    let mut history = user("the borrow checker complains");
+    let round = injector.prepare_round(&history, 0);
+    let delivered: Vec<&str> = round
+        .delivered
+        .iter()
+        .map(|delivered| delivered.skill.as_str())
+        .collect();
+    assert_eq!(delivered, ["lifetimes"]);
+    assert!(round.unavailable.is_empty(), "{:?}", round.unavailable);
+    let lifetimes_bytes = round
+        .delivered
+        .first()
+        .map(|delivered| delivered.bytes)
+        .ok_or(TestError::Missing("lifetimes delivery"))?;
+    assert_eq!(
+        injector.session_bytes(),
+        lifetimes_bytes,
+        "no bytes charged"
+    );
+
+    history.push_assistant_text("Let me look.", None);
+    history.push_user_text("the borrow checker again, E0505");
+    let later = injector.prepare_round(&history, 0);
+    assert!(
+        !later
+            .delivered
+            .iter()
+            .any(|delivered| delivered.skill == "borrow"),
+        "{:?}",
+        later.delivered
+    );
+    assert!(
+        !later
+            .fragments
+            .iter()
+            .any(|fragment| fragment.body.starts_with("# Skill: borrow ")),
+        "the excluded skill never enters the context"
+    );
+    // Review finding: the later hit is neither "already delivered" (it never
+    // was) nor "unavailable" (its tools are not the reason).
+    assert!(
+        !later
+            .dropped
+            .iter()
+            .any(|dropped| dropped.skill == "borrow"),
+        "{:?}",
+        later.dropped
+    );
+    assert!(
+        !later.unavailable.iter().any(|skill| skill == "borrow"),
+        "{:?}",
+        later.unavailable
+    );
+    Ok(())
+}
+
+/// PL-100 WP 1.5 (review finding): names marked required are judged
+/// all-of. A read-only child that maps `filesystem.read` onto its tools but
+/// registers no write tool gets no skill declaring `filesystem.write`, even
+/// next to `filesystem.read`; a writer does. Plain any-of names keep their
+/// rule, and unknown names still say nothing.
+#[test]
+fn required_names_are_judged_all_of() {
+    let names = |declared: &[&str]| -> Vec<String> {
+        declared.iter().map(|name| (*name).to_owned()).collect()
+    };
+    let required = ["filesystem.write", "process.execute"];
+    let read_only = super::ToolAvailability::new(["fs.read", "filesystem.read"], ["fs.write"])
+        .with_required(required);
+    assert!(!read_only.admits(&names(&["filesystem.read", "filesystem.write"])));
+    assert!(!read_only.admits(&names(&["filesystem.write"])));
+    assert!(!read_only.admits(&names(&["fs.read", "process.execute"])));
+    assert!(read_only.admits(&names(&["filesystem.read"])));
+    assert!(read_only.admits(&names(&["fs.read", "fs.write"])));
+    assert!(read_only.admits(&names(&["web.unknown_label"])));
+
+    let writer = super::ToolAvailability::new(
+        ["fs.read", "fs.write", "filesystem.read", "filesystem.write"],
+        Vec::<String>::new(),
+    )
+    .with_required(required);
+    assert!(writer.admits(&names(&["filesystem.read", "filesystem.write"])));
+    assert!(!writer.admits(&names(&[
+        "filesystem.read",
+        "filesystem.write",
+        "process.execute"
+    ])));
+}
+
+/// PL-100 WP 1.5: the narrowing cut (activation of a child admission)
+/// removes registered names only; known and required names stay, so a
+/// skill for a cut tool becomes unavailable instead of unknown.
+#[test]
+fn narrowing_removes_registered_names_only() {
+    let tools = super::ToolAvailability::new(
+        ["fs.read", "sys.ps", "filesystem.write"],
+        Vec::<String>::new(),
+    )
+    .with_required(["filesystem.write"]);
+    let narrowed = tools.narrowed(|name| name != "sys.ps" && name != "filesystem.write");
+    assert!(narrowed.admits(&["fs.read".to_owned()]));
+    assert!(!narrowed.admits(&["sys.ps".to_owned()]));
+    assert!(!narrowed.admits(&["filesystem.write".to_owned()]));
+    assert!(tools.admits(&["sys.ps".to_owned()]), "the original stays");
+    assert!(tools.admits(&["filesystem.write".to_owned()]));
+}
+
+/// PL-100 WP 1.5: a narrowed injector keeps index, exclusions and the
+/// filter's knowledge, starts with a fresh state and filters by the cut.
+#[test]
+fn a_narrowed_injector_filters_by_the_cut_and_keeps_its_exclusions() -> TestResult {
+    let index = index_of(&[
+        ("borrow", BORROW_TRIGGERS, BODY),
+        ("lifetimes", LIFETIMES_TRIGGERS, BODY),
+    ]);
+    let injector = SkillInjector::new(Arc::clone(&index), SkillInjectionSettings::default())
+        .with_tool_availability(super::ToolAvailability::new(
+            ["process.execute"],
+            ["process.execute"],
+        ))
+        .with_excluded_skills(["lifetimes"]);
+    assert!(injector.tools_admit("borrow"));
+
+    let narrowed = injector.narrowed_to_callable(|name| name != "process.execute");
+    assert!(!narrowed.tools_admit("borrow"));
+    assert!(narrowed.excludes("lifetimes"));
+    assert_eq!(narrowed.session_bytes(), 0);
+    let round = narrowed.prepare_round(&user("the borrow checker complains"), 0);
+    assert!(round.delivered.is_empty(), "{:?}", round.delivered);
+    assert!(
+        round.unavailable.iter().any(|skill| skill == "borrow"),
+        "{:?}",
+        round.unavailable
+    );
+
+    let kept = injector.narrowed_to_callable(|_| true);
+    let round = kept.prepare_round(&user("the borrow checker complains"), 0);
+    let delivered: Vec<&str> = round
+        .delivered
+        .iter()
+        .map(|delivered| delivered.skill.as_str())
+        .collect();
+    assert_eq!(delivered, ["borrow"]);
+    Ok(())
+}
+
+/// PL-100 WP 1.5: an excluded skill takes no room of the round. With a
+/// per-round budget for one excerpt, the higher-priority (excluded) hit
+/// would fill it; excluded, the lower-priority sibling is delivered.
+#[test]
+fn an_excluded_skill_frees_its_room_for_the_next_hit() -> TestResult {
+    let index = index_of(&[
+        ("borrow", BORROW_TRIGGERS, BODY),
+        ("lifetimes", LIFETIMES_TRIGGERS, BODY),
+    ]);
+    let text = user("the borrow checker complains");
+    let bytes_of = |injector: &SkillInjector, skill: &str| -> TestResult<usize> {
+        injector
+            .prepare_round(&text, 0)
+            .delivered
+            .iter()
+            .find(|delivered| delivered.skill == skill)
+            .map(|delivered| delivered.bytes)
+            .ok_or(TestError::Missing("delivery of the measured skill"))
+    };
+    let borrow_bytes = bytes_of(
+        &SkillInjector::new(Arc::clone(&index), SkillInjectionSettings::default()),
+        "borrow",
+    )?;
+    let lifetimes_bytes = bytes_of(
+        &SkillInjector::new(Arc::clone(&index), SkillInjectionSettings::default())
+            .with_excluded_skills(["borrow"]),
+        "lifetimes",
+    )?;
+    let cap = lifetimes_bytes.max(borrow_bytes).saturating_add(1);
+    assert!(
+        borrow_bytes.saturating_add(lifetimes_bytes) > cap,
+        "the budget holds one excerpt"
+    );
+    let tight = SkillInjectionSettings {
+        per_turn_cap_bytes: cap,
+        ..SkillInjectionSettings::default()
+    };
+
+    let without = SkillInjector::new(Arc::clone(&index), tight).prepare_round(&text, 0);
+    let delivered: Vec<&str> = without
+        .delivered
+        .iter()
+        .map(|delivered| delivered.skill.as_str())
+        .collect();
+    assert_eq!(delivered, ["borrow"]);
+
+    let with = SkillInjector::new(Arc::clone(&index), tight)
+        .with_excluded_skills(["borrow"])
+        .prepare_round(&text, 0);
+    let delivered: Vec<&str> = with
+        .delivered
+        .iter()
+        .map(|delivered| delivered.skill.as_str())
+        .collect();
+    assert_eq!(delivered, ["lifetimes"]);
+    assert!(
+        !with
+            .dropped
+            .iter()
+            .any(|dropped| dropped.reason == DropReason::TurnBudget),
+        "{:?}",
+        with.dropped
+    );
+    Ok(())
+}

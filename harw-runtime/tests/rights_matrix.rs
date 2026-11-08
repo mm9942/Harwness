@@ -476,9 +476,9 @@ fn telegram_reads_and_writes_without_shell_network_or_relaxed_approval() -> Test
 }
 
 /// Die Read-only-Rollen (analyst, researcher-deps, planner, die vier
-/// security-*-triage-Rollen) bekommen auch unter einer vernetzten
-/// UIA-Wurzel kein Netz, kein Schreiben und keine Ausführung: ihr Reducer
-/// schneidet die Rechte der Wurzel entsprechend.
+/// security-*-triage-Rollen, intel-scout, context-steward) bekommen auch
+/// unter einer vernetzten UIA-Wurzel kein Netz, kein Schreiben und keine
+/// Ausführung: ihr Reducer schneidet die Rechte der Wurzel entsprechend.
 #[test]
 fn read_only_roles_stay_network_free_under_a_networked_root() -> TestResult {
     use harw_authority::Permission;
@@ -499,6 +499,8 @@ fn read_only_roles_stay_network_free_under_a_networked_root() -> TestResult {
         role_names::SECURITY_BASELINE_TRIAGE,
         role_names::SECURITY_STRUCTURE_TRIAGE,
         role_names::SECURITY_ENDPOINT_TRIAGE,
+        role_names::INTEL_SCOUT,
+        role_names::CONTEXT_STEWARD,
     ] {
         let reducer = authority_reducer_for_role(role).ok_or(TestError::Missing("reducer"))?;
         let child = reducer.reduce(&root);

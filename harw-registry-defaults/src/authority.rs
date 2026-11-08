@@ -323,6 +323,12 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 /// - die vier `security-*-triage`-Rollen → [`AuthorityReducer::ReadOnly`]
 ///   (Profil `NoTools`, sie brauchen gar kein Recht; `ReadOnly` ist die engste
 ///   Kennung des Vokabulars).
+/// - `intel-scout` und `context-steward` (PL-100 O11) →
+///   [`AuthorityReducer::ReadOnly`] (Profil `NoTools`). `context-steward`
+///   braucht kein Recht; das rollengebundene `deps.locked` von `intel-scout`
+///   ([`crate::profile::lockfile_tools_for_role`]) braucht genau
+///   `ReadWorkspace` — die Obergrenze von `ReadOnly`, nie Netz und nie
+///   `ReadCargoRegistry` (kein Registry-Quellpfad).
 /// - die vier Matrix-Game-Sitze `matrix-player`, `matrix-umpire`,
 ///   `matrix-market`, `matrix-redcell` → [`AuthorityReducer::ReadOnly`] (Profil
 ///   `MatrixReader`: lesende `fs.*` plus `doc.read_pdf`, braucht genau
@@ -440,6 +446,10 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         | role_names::SECURITY_STRUCTURE_TRIAGE
         | role_names::SECURITY_ENDPOINT_TRIAGE
         | role_names::EXECUTOR => Some(AuthorityReducer::ReadOnly),
+        // PL-100 O11: parametergetriebene Envelope-Rollen der
+        // Sicherheitsfamilie; `intel-scout` liest über sein rollengebundenes
+        // `deps.locked` höchstens den Workspace (`ReadWorkspace`).
+        role_names::INTEL_SCOUT | role_names::CONTEXT_STEWARD => Some(AuthorityReducer::ReadOnly),
         // Die vier Matrix-Game-Sitze (Profil `MatrixReader`): brauchen genau
         // `ReadWorkspace` für ihre Unterlagen; `ReadOnly` trägt genau das —
         // nie Netz, nie Schreiben, nie Exec.
@@ -1386,6 +1396,9 @@ mod tests {
             role_names::SECURITY_BASELINE_TRIAGE,
             role_names::SECURITY_STRUCTURE_TRIAGE,
             role_names::SECURITY_ENDPOINT_TRIAGE,
+            // PL-100 O11.
+            role_names::INTEL_SCOUT,
+            role_names::CONTEXT_STEWARD,
         ]
         .into_iter()
         .chain(role_names::MATRIX_ROLES)
@@ -1524,11 +1537,19 @@ mod tests {
             let ceiling = reducer.ceiling();
             let web_exempt = profile == RegistryProfile::ReadOnlyExplore
                 && !ceiling.contains(Permission::NetworkAccess);
+            // PL-100 O11: das rollengebundene `deps.locked` von `intel-scout`
+            // kommt nicht aus dem Profil, muss aber ebenso unter die
+            // Obergrenze passen.
             let bounded = PermissionSet::from_policy(
                 profile
                     .registered_tool_names()
                     .into_iter()
                     .filter(|tool| !(web_exempt && EXPLORER_WEB_TOOLS.contains(tool)))
+                    .chain(
+                        crate::profile::lockfile_tools_for_role(role)
+                            .iter()
+                            .copied(),
+                    )
                     .filter_map(tool_permission),
             );
             assert!(

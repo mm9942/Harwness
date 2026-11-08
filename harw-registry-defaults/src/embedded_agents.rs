@@ -2731,16 +2731,17 @@ mod tests {
     /// Kinder (`harwness.return.envelope@1`), nie
     /// `harwness.security-verdict/v1`: beiden verweigert ihre
     /// Mitgliedschaftsdatei `security.verdict.propose`, ein Verdikt kommt nur
-    /// von den vier `security-*-triage`-Rollen. Beide stehen noch nicht in
-    /// `role_names::ALL` und werden von [`builtin_agent_definitions`] daher
-    /// nicht gesenkt; dieser Test senkt sie direkt über dieselbe Pipeline
-    /// (`parse_toml → resolve_definition → lower`). `lower` prüft dabei
-    /// zugleich, dass das Label zum Vokabular gehört
-    /// (`DslError::UnknownReturnContract`). Ein Kontextprogramm binden beide
-    /// nicht, insbesondere weder `triage` noch `security-triage`.
+    /// von den vier `security-*-triage`-Rollen. Der Test senkt beide direkt
+    /// über die Legacy-Pipeline (`parse_toml → resolve_definition → lower`);
+    /// `lower` prüft dabei zugleich, dass das Label zum Vokabular gehört
+    /// (`DslError::UnknownReturnContract`). Seit beide in `role_names::ALL`
+    /// stehen (PL-100 O11), prüft er dasselbe zusätzlich am Produktionspfad
+    /// [`builtin_agent_definitions`], über den ein Kind tatsächlich startet.
+    /// Ein Kontextprogramm binden beide nicht, insbesondere weder `triage`
+    /// noch `security-triage`.
     #[test]
     fn test_intel_scout_and_context_steward_return_an_envelope_never_a_verdict() -> TestResult {
-        const ENVELOPE_ROLES: [&str; 2] = ["intel-scout", "context-steward"];
+        const ENVELOPE_ROLES: [&str; 2] = [role_names::INTEL_SCOUT, role_names::CONTEXT_STEWARD];
         let now = OffsetDateTime::now_utc();
         let mut layers: Vec<(DefinitionLayer, RawAgentDefinition)> = Vec::new();
         let mut targets: Vec<(&str, DefinitionId)> = Vec::new();
@@ -2775,6 +2776,25 @@ mod tests {
                 "{name} darf kein Verdikt zurückgeben"
             );
             assert_eq!(ir.context_program().context_policy(), None, "{name}");
+        }
+
+        // Produktionspfad (PL-100 O11): beide sind startbare Rollen und
+        // tragen dort denselben Envelope-Vertrag, dieselbe Tiefe 0 und kein
+        // Kontextprogramm.
+        let definitions = builtin()?;
+        for name in ENVELOPE_ROLES {
+            assert!(role_names::ALL.contains(&name), "{name} fehlt in ALL");
+            let ir = definitions
+                .get(name)
+                .ok_or_else(|| TestError::Unexpected(format!("{name} wird nicht gesenkt")))?;
+            assert_eq!(
+                ir.return_pipeline().contract(),
+                Some(harw_agent_dsl::ir_v2::ReturnContract::Envelope.as_str()),
+                "{name}: Produktionspfad"
+            );
+            assert_eq!(ir.spawn_contract().max_depth(), Some(0), "{name}");
+            assert_eq!(ir.context_program().context_policy(), None, "{name}");
+            assert!(ir.skills().is_empty(), "{name} bindet keinen Skill");
         }
         Ok(())
     }
@@ -3304,14 +3324,11 @@ mod tests {
     /// organisatorischen Rollen `2` tragen — unabhängig davon, wie viele
     /// Rollen mit Tiefe `0` oder `1` noch dazukommen.
     ///
-    /// `context-steward` und `intel-scout` tragen ebenfalls `max_depth = 0`,
-    /// stehen aber (noch, siehe `role_names::ALL`) nicht im gesenkten
-    /// Inventar. `ZERO_DEPTH_ROLES` führt beide bereits (PL-100 O11), damit
-    /// ihre Aufnahme in `role_names::ALL` diesen Test nicht bricht. Ihren
-    /// `[return].contract` (`harwness.return.envelope@1`) deklarieren beide
-    /// bereits;
-    /// `test_intel_scout_and_context_steward_return_an_envelope_never_a_verdict`
-    /// prüft ihn ohne `role_names::ALL`.
+    /// `context-steward` und `intel-scout` tragen ebenfalls `max_depth = 0`
+    /// und stehen seit PL-100 (Entscheidung O11) in `role_names::ALL`, also
+    /// im gesenkten Inventar. Ihren `[return].contract`
+    /// (`harwness.return.envelope@1`) prüft
+    /// `test_intel_scout_and_context_steward_return_an_envelope_never_a_verdict`.
     ///
     /// `memory-steward` (Memory v3, §5.3) trägt ebenfalls `max_depth = 0`
     /// (`agents/memory-steward.toml`, `[spawn] max_depth = 0`): eine
@@ -3341,10 +3358,8 @@ mod tests {
         // Build-Auftrag ist ein einzelner, in sich geschlossener Lauf — siehe
         // `agents/uia-latex-writer.toml`, `[spawn] max_depth = 0`) plus
         // `intel-scout` und `context-steward` (PL-100 O11: reine, kinderlose
-        // Korrelation bzw. Kuration, jeweils `[spawn] max_depth = 0`). Beide
-        // stehen als Literale hier, weil `role_names` für sie noch keine
-        // Konstante führt; solange sie nicht in `role_names::ALL` stehen,
-        // liefert `builtin()` sie nicht und der Eintrag ist wirkungslos.
+        // Korrelation bzw. Kuration, jeweils `[spawn] max_depth = 0`; seit
+        // O11 in `role_names::ALL` und damit von `builtin()` geliefert).
         const ZERO_DEPTH_ROLES: [&str; 18] = [
             role_names::SECURITY_EGRESS_TRIAGE,
             role_names::SECURITY_BASELINE_TRIAGE,
@@ -3362,8 +3377,8 @@ mod tests {
             role_names::MATRIX_UMPIRE,
             role_names::MATRIX_MARKET,
             role_names::MATRIX_REDCELL,
-            "intel-scout",
-            "context-steward",
+            role_names::INTEL_SCOUT,
+            role_names::CONTEXT_STEWARD,
         ];
 
         let definitions = builtin()?;

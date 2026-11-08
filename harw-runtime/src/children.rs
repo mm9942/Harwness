@@ -28,7 +28,7 @@
 //!    Elternteils erreichte den Fan-out nie. Diese Fabrik installiert
 //!    [`ApprovalChain::for_child`] in **jede** Kind-Registry.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -444,6 +444,50 @@ pub struct RuntimeChildRegistryFactory {
     /// Wiederherstellung ist es die ursprüngliche Kind-ID, die Identität also
     /// dieselbe wie vor dem Neustart. Nie ein Wert aus Modell-JSON.
     announced_child_sessions: Mutex<HashMap<String, harw_types::SessionId>>,
+    /// PL-100 WP 1.5: der beim Registry-Bau einer Admission (mit
+    /// `ParentGrant`) für die gemeldete Kind-Sitzung gebaute Skill-Injektor
+    /// je Rolle, bis [`ChildRegistryFactory::child_session_observers`] ihn
+    /// für genau diese Sitzung entnimmt. Gleiches Muster wie
+    /// [`Self::pending_run_identities`]: der Controller hält zwischen beiden
+    /// Aufrufen den Sitzungs-Lock; ein Rest einer gescheiterten Admission
+    /// passt nicht zur Kind-ID der nächsten und wird verworfen.
+    ///
+    /// `child_session_observers` übergibt den entnommenen Injektor im Feld
+    /// `harw_core::ChildSessionObservers::skill_injector` und die Deckung
+    /// seiner Fähigkeits-Labels in `skill_label_backing`; `admit_inner`
+    /// (`harw-core/src/child_controller.rs`) schneidet ihn dort mit der
+    /// Kind-Aktivierung und hängt ihn per `AgentSession::with_skill_injector`
+    /// an die Kind-Sitzung.
+    pending_skill_injectors: Mutex<HashMap<String, PendingSkillInjector>>,
+}
+
+/// PL-100 WP 1.5: ein für genau eine Kind-Sitzung gebauter Skill-Injektor,
+/// bis der Controller die Beobachter dieser Sitzung abholt.
+struct PendingSkillInjector {
+    /// Die Kind-Sitzung, für die der Injektor gebaut wurde.
+    child: harw_types::SessionId,
+    /// Der Injektor samt Deckung seiner Fähigkeits-Labels.
+    injection: ChildSkillInjection,
+}
+
+/// PL-100 WP 1.5: der Skill-Injektor einer Kind-Sitzung
+/// ([`RuntimeChildRegistryFactory::child_skill_injector`]) und die Werkzeuge,
+/// die jedes seiner aufrufbaren Fähigkeits-Labels decken.
+///
+/// # Description
+/// Beides geht zusammen an den Kern
+/// (`harw_core::ChildSessionObservers::skill_injector` und
+/// `::skill_label_backing`). `admit_inner` lässt ein Label nach dem
+/// Aktivierungsschnitt nur stehen, solange mindestens eines seiner
+/// deckenden Werkzeuge freigeschaltet bleibt (Review-Befund: ein Kind, dem
+/// die Eltern-Aktivierung alle Schreibwerkzeuge sperrt, bekommt keinen
+/// Skill für `filesystem.write`).
+struct ChildSkillInjection {
+    /// Der Injektor mit frischem Sitzungszustand.
+    injector: Arc<harw_core::SkillInjector>,
+    /// Je aufrufbarem Label die aufrufbaren Werkzeuge mit seinem Recht
+    /// ([`CapabilityLabels::backing`]).
+    label_backing: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Wissensquellen der lesenden Kind-Werkzeuge (Plan Teil D).
@@ -464,6 +508,9 @@ struct SkillCatalogWiring {
     /// eingebettetem Bündel — Quelle für `skills.search`/`skills.load` und
     /// Rückfall für fest gebundene Skills, die kein Layer führt.
     index: Arc<SkillIndex>,
+    /// PL-100 WP 1.5: `[skills]` des Elternlaufs für den Skill-Injektor der
+    /// Kinder (dieselben Einstellungen wie der Injektor der Wurzel).
+    injection: harw_core::SkillInjectionSettings,
 }
 
 impl std::fmt::Debug for RuntimeChildRegistryFactory {
@@ -564,6 +611,7 @@ impl RuntimeChildRegistryFactory {
             custom_agents: HashMap::new(),
             pending_run_identities: Mutex::new(HashMap::new()),
             announced_child_sessions: Mutex::new(HashMap::new()),
+            pending_skill_injectors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1033,6 +1081,11 @@ impl RuntimeChildRegistryFactory {
     /// des Kindes; [`ChildRegistryFactory::capability_snapshot`] liefert
     /// denselben Satz als eingefrorenen Spawn-Vertrag.
     ///
+    /// PL-100 WP 1.5: hält außerdem `[skills]` aus `config` fest; für jedes
+    /// admittierte Kind, das den Skill-Katalog bekommt, baut die Fabrik damit
+    /// einen eigenen Skill-Injektor (siehe `Self::child_skill_injector`),
+    /// den `child_session_observers` der Kind-Sitzung übergibt.
+    ///
     /// # Arguments
     /// - `config` (`&ResolvedConfig`): die bereits validierte Konfiguration
     ///   des Elternlaufs.
@@ -1057,6 +1110,7 @@ impl RuntimeChildRegistryFactory {
             catalog,
             roots: skill_roots,
             index,
+            injection: harw_core::SkillInjectionSettings::from_config(&config.harness.skills),
         });
         Ok(self)
     }
@@ -1091,8 +1145,22 @@ impl RuntimeChildRegistryFactory {
 
     /// Der Skill-Index, wenn `role` die Katalog-Werkzeuge bekommt (siehe
     /// [`Self::with_skill_catalog_tools`]).
+    ///
+    /// PL-100 WP 1.5 (Review-Befund): geprüft wird auch die Basisrolle
+    /// ([`Self::lookup_role`]). Ein benutzerdefinierter Agent über einer
+    /// Rolle aus
+    /// [`harw_registry_defaults::profile::SKILL_CATALOG_EXCLUDED_ROLES`]
+    /// (etwa über `security-egress-triage` oder `intel-scout`) bekommt wie
+    /// seine Basis weder Katalog-Werkzeuge noch Katalog-Zeile noch
+    /// Skill-Injektor: Sensortext aus `dod.*` soll ihm keinen Skill zuspielen
+    /// (THREAT-MODEL B3).
     fn skill_catalog_index_for(&self, role: &str) -> Option<Arc<SkillIndex>> {
         let wiring = self.skill_catalog.as_ref()?;
+        if harw_registry_defaults::profile::skill_catalog_tools_for_role(self.lookup_role(role))
+            .is_empty()
+        {
+            return None;
+        }
         let offered = harw_registry_defaults::profile::skill_catalog_tools_for_role(role);
         let forbidden = self.builtin_definitions.get(role).is_some_and(|ir| {
             offered.iter().any(|tool| {
@@ -1115,6 +1183,195 @@ impl RuntimeChildRegistryFactory {
             fragments.push(harw_registry_defaults::skill_catalog_hint(index.len()));
         }
         Ok(fragments)
+    }
+
+    /// PL-100 WP 1.5 (PL-97 §8.1): der Skill-Injektor einer Kind-Sitzung von
+    /// `role` über ihrer fertigen `registry` — wie der Injektor jeder
+    /// Wurzel-Sitzung (`assembly.rs`, `with_skill_injector`), damit getriggerte
+    /// Skill-Auszüge (Werkzeug-Erstnutzung, Befehle, Fehlercodes,
+    /// Stichwörter) auch Kinder erreichen.
+    ///
+    /// # Description
+    /// - Nur mit Skill-Katalog ([`Self::with_skill_catalog`]), nur mit
+    ///   `[skills] triggered_injection` und nur für eine Rolle, die den
+    ///   Skill-Katalog bekommt ([`Self::skill_catalog_index_for`]) — wie an der
+    ///   Wurzel, die den Injektor nur zusammen mit dem L0-Katalog trägt. Die
+    ///   Rollen aus
+    ///   [`harw_registry_defaults::profile::SKILL_CATALOG_EXCLUDED_ROLES`]
+    ///   (Triage, `intel-scout`, `context-steward`, Matrix-Sitze) und
+    ///   benutzerdefinierte Agenten über ihnen bekommen deshalb keinen: ihr
+    ///   Kontext bleibt bei ihren fest gebundenen Skills (etwa `harw-dod` der
+    ///   Triage-Rollen, [`Self::skill_fragments_for_role`]), und Sensor- oder
+    ///   Werkzeugtext kann ihnen keinen weiteren Skill zuspielen.
+    /// - Werkzeug-Filter ([`harw_core::skill_injection::ToolAvailability`]):
+    ///   registriert sind die Werkzeuge, die das Kind höchstens aufrufen kann
+    ///   ([`child_callable_tools`]: Werkzeuge der Registry, geschnitten mit
+    ///   der Werkzeugoberfläche seiner Definition und mit den Rechten des
+    ///   Elternteils, `parent.permissions` — die Kind-Sandbox ist nie weiter,
+    ///   `ensure_child_of`). Ein Skill, der nur Werkzeuge nennt, die das Kind
+    ///   nicht aufrufen kann, wird nie eingespielt. Bekannt
+    ///   ([`ToolAvailability`] `known`) sind der Werkzeugkatalog und alle
+    ///   Werkzeuge der Registry, damit ein weggeschnittenes Werkzeug nie als
+    ///   „unbekannt" durchrutscht.
+    /// - Abstrakte Fähigkeits-Labels der Skills (`filesystem.read`,
+    ///   `filesystem.write`, `process.execute`, …;
+    ///   [`child_capability_labels`]) sind bekannt und gelten als aufrufbar,
+    ///   wenn ein aufrufbares Werkzeug das Recht des Labels trägt. Labels mit
+    ///   Schreib- oder Ausführungsrecht gelten all-of
+    ///   ([`ToolAvailability::with_required`]): ein lesendes Kind bekommt
+    ///   keinen Skill, der `filesystem.write` nennt, auch nicht neben
+    ///   `filesystem.read`. Je aufrufbarem Label gehen die aufrufbaren
+    ///   Werkzeuge mit seinem Recht als Deckung mit
+    ///   ([`ChildSkillInjection::label_backing`]); der Kern lässt das Label
+    ///   nach dem Aktivierungsschnitt nur stehen, solange eines davon
+    ///   freigeschaltet bleibt.
+    /// - Bewusst nicht hier: der Schnitt der Kind-Aktivierung mit der des
+    ///   Elternteils (`narrow_base_activation` in `admit_inner`,
+    ///   `harw-core/src/child_controller.rs`). `parent.tools` ist die
+    ///   Eltern-**Registry** geschnitten mit der Eltern-Aktivierung; ein nur
+    ///   dem Kind registriertes Werkzeug (`cargo.test_one` des
+    ///   `test-engineer`) fehlt darin, bleibt aber aufrufbar. Den exakten
+    ///   Schnitt macht der Kern bei der Übergabe (`admit_inner`, nach
+    ///   `narrow_base_activation`) über
+    ///   [`harw_core::SkillInjector::narrowed_to_callable`].
+    /// - Fest gebundene Skills der Rolle ([`Self::fixed_skill_names`]) stehen
+    ///   schon vollständig in ihren Instruktionen; der Injektor spielt sie
+    ///   nie ein zweites Mal ein
+    ///   ([`harw_core::SkillInjector::with_excluded_skills`]).
+    /// - Ein Injektor je Kind, mit frischem Sitzungszustand über dem
+    ///   gemeinsamen Index der Fabrik (wie je Wurzel-Sitzung).
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): der registrierte Rollenname.
+    /// - `registry` (`&ExtensionRegistry`): die fertige Registry des Kindes.
+    /// - `parent` (`&harw_core::ParentGrant`): die Rechte des unmittelbaren
+    ///   Elternteils (vom Controller geprüft) als Obergrenze der Kind-Rechte.
+    ///
+    /// # Returns
+    /// Den Injektor samt Deckung seiner Labels; `None`, wenn eine der
+    /// Bedingungen fehlt.
+    ///
+    /// [`ToolAvailability`]: harw_core::skill_injection::ToolAvailability
+    /// [`ToolAvailability::with_required`]: harw_core::skill_injection::ToolAvailability::with_required
+    fn child_skill_injector(
+        &self,
+        role: &str,
+        registry: &ExtensionRegistry,
+        parent: &harw_core::ParentGrant,
+    ) -> Option<ChildSkillInjection> {
+        let wiring = self.skill_catalog.as_ref()?;
+        if !wiring.injection.enabled {
+            return None;
+        }
+        let index = self.skill_catalog_index_for(role)?;
+        let registered = child_registry_tool_names(registry);
+        let callable = child_callable_tools(
+            &registered,
+            self.builtin_definitions.get(role),
+            &parent.permissions,
+        );
+        let mut known: BTreeSet<String> = harw_registry_defaults::tool_index::catalog_tool_names()
+            .into_iter()
+            .map(str::to_owned)
+            .chain(registered)
+            .collect();
+        let labels = child_capability_labels(&index, &known, &callable);
+        known.extend(labels.known);
+        let availability = harw_core::skill_injection::ToolAvailability::new(
+            callable.into_iter().chain(labels.callable),
+            known,
+        )
+        .with_required(labels.required);
+        Some(ChildSkillInjection {
+            injector: Arc::new(
+                harw_core::SkillInjector::new(index, wiring.injection)
+                    .with_tool_availability(availability)
+                    .with_excluded_skills(self.fixed_skill_names(role)),
+            ),
+            label_backing: labels.backing,
+        })
+    }
+
+    /// PL-100 WP 1.5: die Namen der fest gebundenen Skills von `role` — die
+    /// direkt konfigurierten des Katalogs vor denen der eingebauten
+    /// Definition, ohne Dubletten (dieselbe Liste, aus der
+    /// [`Self::skill_fragments_for_role`] die Instruktionsfragmente lädt).
+    fn fixed_skill_names(&self, role: &str) -> Vec<String> {
+        let definition: &[String] = self
+            .builtin_definitions
+            .get(role)
+            .map(ExecutableAgentIr::skills)
+            .unwrap_or(&[]);
+        let catalog: &[String] = self
+            .skill_catalog
+            .as_ref()
+            .and_then(|wiring| wiring.catalog.direct_skills_of(role))
+            .unwrap_or(&[]);
+        merge_skill_names(catalog, definition)
+    }
+
+    /// Merkt den Skill-Injektor der gerade gebauten Kind-Registry für die
+    /// gemeldete Kind-Sitzung `child` vor, bis
+    /// [`ChildRegistryFactory::child_session_observers`] ihn entnimmt.
+    ///
+    /// # Description
+    /// Nur eine Admission meldet die Sitzung **und** reicht den `ParentGrant`
+    /// durch (`build_registry_from_capability_snapshot_for_parent`). Ohne
+    /// gemeldete Sitzung (direkter Bau ohne Admission) oder ohne
+    /// Eltern-Grant (ohne ihn ist der Werkzeug-Filter nicht prüfbar,
+    /// fail-closed) wird nichts vorgemerkt und ein Rest derselben Rolle
+    /// verworfen.
+    fn note_child_skill_injector(
+        &self,
+        role: &str,
+        child: Option<&harw_types::SessionId>,
+        registry: &ExtensionRegistry,
+        parent: Option<&harw_core::ParentGrant>,
+    ) {
+        let injector = child.zip(parent).and_then(|(child, parent)| {
+            self.child_skill_injector(role, registry, parent)
+                .map(|injection| PendingSkillInjector {
+                    child: child.clone(),
+                    injection,
+                })
+        });
+        let mut pending = self
+            .pending_skill_injectors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match injector {
+            Some(injector) => {
+                pending.insert(role.to_owned(), injector);
+            }
+            None => {
+                pending.remove(role);
+            }
+        }
+    }
+
+    /// Entnimmt den für `role` vorgemerkten Skill-Injektor, wenn er für die
+    /// Sitzung `child` gebaut wurde; ein Injektor einer anderen Sitzung (Rest
+    /// einer gescheiterten Admission) wird verworfen, nie übergeben.
+    ///
+    /// # Returns
+    /// Den Injektor genau dieser Kind-Sitzung samt Deckung seiner Labels,
+    /// sonst `None`. Der Eintrag der Rolle ist danach in jedem Fall entfernt.
+    fn take_child_skill_injector(
+        &self,
+        role: &str,
+        child: &harw_types::SessionId,
+    ) -> Option<ChildSkillInjection> {
+        let pending = self
+            .pending_skill_injectors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(role)?;
+        if pending.child == *child {
+            Some(pending.injection)
+        } else {
+            tracing::debug!(role, "runtime.child_skill_injector.stale_dropped");
+            None
+        }
     }
 
     /// Hinterlegt den geteilten `StateStore` für die `delegate_wave`-Fläche
@@ -1976,109 +2233,36 @@ fn delegate_wave_services(
     services
 }
 
-impl ChildRegistryFactory for RuntimeChildRegistryFactory {
-    /// Merkt die Kind-Sitzung der gerade beginnenden Admission vor, damit
-    /// `build_registry` die Lauf-Identität daraus ableitet (PL-90 W03d). Bei
-    /// einer durablen Wiederherstellung ist das die ursprüngliche Kind-ID —
-    /// das Kind behält so seine Wissens-Identität (Tagebuch, `SelfOnly`).
-    fn announce_child_session(&self, role: &str, child: &harw_types::SessionId) {
-        self.note_announced_child_session(role, child);
-    }
-
-    /// Runde 5, Teil C: meldet das Kind mit seiner laufgebundenen Agent-Id
-    /// (`<rolle>.<kind-sitzungs-id>`, aus `build_registry`) beim Diary-
-    /// Recorder an und liefert dessen Verdichtungs- und Runden-Beobachter;
-    /// ohne Recorder keine Beobachter.
-    fn child_session_observers(
-        &self,
-        role: &str,
-        child: &harw_types::SessionId,
-    ) -> harw_core::ChildSessionObservers {
-        // Runde 5, Teil N: Kind-ID und Baum-Pfad für Host-Mode-Anfragen.
-        crate::host_escalation_wiring::bind_child(self.host_permit_wiring.as_ref(), role, child);
-        // PL-90 W03d: die in `build_registry` gemintete Lauf-Id dieses Kindes
-        // (immer entnehmen, auch ohne Recorder, damit nichts hängen bleibt).
-        // Ohne vorgemerkte Identität (z. B. die Steward-Sonderregistry, die
-        // `build_registry` nicht durchläuft) wird die Id hier aus der
-        // Kind-Sitzung abgeleitet — nie der bloße Rollenname, den sich
-        // Geschwister teilen würden, und dieselbe nach einer Wiederherstellung.
-        let agent = self.take_run_identity(role).map_or_else(
-            || run_agent_id(role, child),
-            |identity| identity.agent_id.clone(),
-        );
-        let Some(recorder) = &self.diary else {
-            return harw_core::ChildSessionObservers::default();
-        };
-        recorder.session_started(child, Some(agent));
-        harw_core::ChildSessionObservers {
-            compaction: Some(recorder.compaction_observer(None)),
-            tool_outcome: Some(recorder.tool_outcome_observer(None)),
-        }
-    }
-
-    /// Runde 5, Teil C: Sitzungsende-Eintrag des Kindes (höchstens einer je
-    /// Kind-Lauf, keiner ohne beendete Runde — siehe
-    /// [`crate::diary_wiring::DiaryRecorder::session_closed`]).
-    fn child_session_released(&self, _role: &str, child: &harw_types::SessionId) {
-        // Runde 5, Teil N: freigegebene Kinder verlassen das Anfragenden-Buch.
-        crate::host_escalation_wiring::release(self.host_permit_wiring.as_ref(), child);
-        if let Some(recorder) = &self.diary {
-            recorder.session_closed(child);
-        }
-    }
-
-    /// Baut die Registry eines Kindes nach dem Profil seiner Rolle.
+impl RuntimeChildRegistryFactory {
+    /// Der eine Bauweg einer Kind-Registry hinter
+    /// [`ChildRegistryFactory::build_registry`] und — für jede Rolle außer
+    /// [`role_names::AGENT_STEWARD`] —
+    /// [`ChildRegistryFactory::build_registry_from_capability_snapshot_for_parent`].
     ///
-    /// # Argumente
+    /// # Description
+    /// Werkzeuge, Rechte, Identität und Instruktionen hängen allein an `role`
+    /// (siehe die Dokumentation von `build_registry`). `parent` ändert an der
+    /// Registry nichts; es schneidet nur den Werkzeug-Filter des
+    /// Skill-Injektors des Kindes (PL-100 WP 1.5,
+    /// [`Self::child_skill_injector`]): ohne `parent` wird keiner gebaut.
+    ///
+    /// # Arguments
     /// - `role` (`&str`): der registrierte Rollenname.
-    /// - `input` (`&SpawnInput`): die Registry hängt allein an `role`, nie an
-    ///   Modell-JSON; gelesen wird nur die vertrauenswürdige
-    ///   `parent_session_id` (Runde 5, Teil N: Baum-Pfad für Host-Mode).
-    /// - `_suggestions` (`Option<&harw_catalog::AgentSuggestions>`): ungenutzt;
-    ///   ein Vorschlag wird hier nie zu einem registrierten Werkzeug.
+    /// - `input` (`&SpawnInput`): der vertrauenswürdige Spawn-Auftrag (nur
+    ///   `parent_session_id` und der Auftrag für den Klassifizierer).
+    /// - `parent` (`Option<&harw_core::ParentGrant>`): der geprüfte
+    ///   Eltern-Kontext der Admission, `None` bei einem direkten Bau.
     ///
-    /// # Rückgabe
-    /// `Ok(ExtensionRegistry)` mit genau den Tool-Providern des Profils aus
-    /// [`profile_for_role`], erweitert um die Kind-Freigabekette.
+    /// # Returns
+    /// Die fertige Registry des Kindes.
     ///
-    /// # Rechte und Netz
-    /// Die Registry legt nur fest, welche Werkzeuge das Kind **sieht**; was
-    /// es tatsächlich darf, entscheidet die Sandbox, mit der
-    /// [`ManagedAgentSpawner`] das Kind admittiert — über den Handoff die
-    /// Sandbox des Elternteils, geprüft mit `ensure_child_of`, also nie mehr
-    /// Rechte und nie mehr Hosts als der Elternteil. Das gilt insbesondere
-    /// für `uia-worker`/`uia-writer`, deren Profile seit der
-    /// Nutzerentscheidung „kurz online recherchieren, manchmal
-    /// Abhängigkeiten hinzufügen“ `web.fetch`/`web.search` und die lesenden
-    /// `deps.*` registrieren: `NetworkAccess` samt Host-Scope kommt nur vom
-    /// Elternteil (registry-seitiger Reducer `ReadExplore`), und jeder Abruf
-    /// läuft zusätzlich durch die prozessweite Egress-Policy
-    /// (`harw_registry_defaults::install_web_tools`).
-    ///
-    /// # Fehler
-    /// [`AgentSpawnError`], wenn `role` **keine** bekannte Rolle ist
-    /// (fail-closed, kein `unwrap_or_default`) oder die Montage scheitert.
-    ///
-    /// # Identität (PL-90 W03d)
-    /// Die Operations-Werkzeuge des Kindes (`delegate_wave`, Matrix-Werkzeuge)
-    /// bauen ihren `OpContext` aus einer `ServiceMap`, die eine für dieses
-    /// Kind neu erzeugte `Arc<CallerIdentity>` trägt
-    /// ([`Self::child_caller_identity`]); kein Geschwister teilt sie, und ihre
-    /// `agent_id` (`<rolle>.<kind-sitzungs-id>`) ist je Kind verschieden, auch
-    /// bei gleicher Rolle, und über eine durable Wiederherstellung stabil
-    /// (abgeleitet aus der Kind-Sitzung, die der Controller vor dem Bau
-    /// meldet, siehe [`ChildRegistryFactory::announce_child_session`]; ohne
-    /// Meldung, etwa bei einem direkten Aufruf, aus einer frischen Sitzungs-ID).
-    /// Dieselbe Id ist der Autor von `diary.read` und des
-    /// Diary-Recorders. Die übrigen Wissens-Lesewerkzeuge der Kinder
-    /// (`palace.*`, …) laufen nicht über einen `OpContext` und lesen die
-    /// Identität nicht; ihre Sicht bleibt die ihres jeweiligen Providers
-    /// (`with_knowledge_readers`).
-    fn build_registry(
+    /// # Errors
+    /// [`AgentSpawnError`] wie `build_registry`.
+    fn build_child_registry(
         &self,
         role: &str,
         input: &SpawnInput,
-        _suggestions: Option<&harw_catalog::AgentSuggestions>,
+        parent: Option<&harw_core::ParentGrant>,
     ) -> Result<ExtensionRegistry, AgentSpawnError> {
         // Die gemeldete Kind-Sitzung gehört genau diesem Bau: als Erstes
         // entnehmen, auch wenn der Bau gleich scheitert, damit nichts für einen
@@ -2113,10 +2297,19 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // vor dem Neustart; ohne Meldung (direkter Aufruf ohne Admission) aus
         // einer frischen Sitzungs-ID. Eine Elternrolle ist aus `SpawnInput`
         // nicht herleitbar; siehe [`Self::child_caller_identity`].
+        // PL-100 WP 1.5: nur eine gemeldete Sitzung bekommt einen
+        // Skill-Injektor (siehe `note_child_skill_injector` unten).
+        let announced = announced_child.is_some();
         let child_session = announced_child.unwrap_or_default();
         let identity = self.caller_identity_for_child(role, &child_session);
         let overrides = IdentityOverrides {
             agent_name: Some(role.to_owned()),
+            // PL-100 O11: Rollen, deren Profil ein fremdes Rollenbild trägt
+            // (`intel-scout`/`context-steward` laufen mit `NoTools`, dessen
+            // Beschreibung „parameter-only triage agent" ist), bekommen ihre
+            // eigene Beschreibung; sonst gilt die des Profils (`None`).
+            role_description: harw_registry_defaults::profile::role_description_for_role(lookup)
+                .map(str::to_owned),
             // Addendum F+G: die organisatorische Rolle eines Kindes ist die
             // Rolle seiner eingebauten (bereits gesenkten) Agent-IR; eine
             // unbekannte Rolle scheitert oben bereits an `profile_for_role`,
@@ -2157,7 +2350,6 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 }
                 fragments
             },
-            ..IdentityOverrides::default()
         };
         // Eine Kette je Kind: `for_child` legt eine Folgezelle an
         // ([`ApprovalModeCell::follower`], seit 2026-09-24 ungedeckelt —
@@ -2272,6 +2464,16 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             registry_builder = registry_builder
                 .tool_provider(Arc::new(self.dod_read_provider(Arc::clone(&identity))));
         }
+        // PL-100 O11: `deps.locked` ausschließlich für `intel-scout`
+        // (rollengebundener, auf genau dieses Werkzeug gefilterter
+        // Deps-Provider neben dem leeren Profil `NoTools`). Das Recht
+        // `ReadWorkspace` kommt aus der Kind-Sandbox (Reducer `ReadOnly`),
+        // nicht aus dem Profil; die `SessionActivation` schaltet das Werkzeug
+        // nur frei, wenn die Definition es admittiert.
+        if !harw_registry_defaults::profile::lockfile_tools_for_role(lookup).is_empty() {
+            registry_builder = registry_builder
+                .tool_provider(harw_registry_defaults::profile::lockfile_read_provider());
+        }
         // Runde 5, Teil H: `agent.result` für jede Rolle, die Kinder starten
         // darf; der Spawner wird wie bei `delegate_wave` nur schwach gehalten.
         if !harw_registry_defaults::profile::child_result_tools_for_role(lookup).is_empty() {
@@ -2327,7 +2529,167 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // Erst nach erfolgreicher Montage vormerken: ein gescheiterter Bau
         // hinterlässt keine Identität für `child_session_observers`.
         self.note_run_identity(role, identity);
+        // PL-100 WP 1.5: der Skill-Injektor des Kindes über genau dieser
+        // Registry (Werkzeug-Filter samt Schnitt mit den Eltern-Rechten),
+        // entnommen in `child_session_observers`.
+        self.note_child_skill_injector(
+            role,
+            announced.then_some(&child_session),
+            &registry,
+            parent,
+        );
         Ok(registry)
+    }
+}
+
+impl ChildRegistryFactory for RuntimeChildRegistryFactory {
+    /// Merkt die Kind-Sitzung der gerade beginnenden Admission vor, damit
+    /// `build_registry` die Lauf-Identität daraus ableitet (PL-90 W03d). Bei
+    /// einer durablen Wiederherstellung ist das die ursprüngliche Kind-ID —
+    /// das Kind behält so seine Wissens-Identität (Tagebuch, `SelfOnly`).
+    fn announce_child_session(&self, role: &str, child: &harw_types::SessionId) {
+        self.note_announced_child_session(role, child);
+    }
+
+    /// Runde 5, Teil C: meldet das Kind mit seiner laufgebundenen Agent-Id
+    /// (`<rolle>.<kind-sitzungs-id>`, aus `build_registry`) beim Diary-
+    /// Recorder an und liefert dessen Verdichtungs- und Runden-Beobachter;
+    /// ohne Recorder keine Diary-Beobachter.
+    ///
+    /// PL-100 WP 1.5: entnimmt außerdem den Skill-Injektor, den der
+    /// Registry-Bau für genau diese Kind-Sitzung gebaut hat
+    /// (`Self::child_skill_injector`), immer, auch ohne Recorder, damit kein
+    /// Rest für einen späteren Bau hängen bleibt, und übergibt ihn in
+    /// `ChildSessionObservers::skill_injector`. `admit_inner` schneidet ihn
+    /// nach `narrow_base_activation` auf die Kind-Aktivierung
+    /// ([`harw_core::SkillInjector::narrowed_to_callable`]) und hängt ihn per
+    /// `AgentSession::with_skill_injector` an die Kind-Sitzung.
+    ///
+    /// Mit dem Injektor geht die Deckung seiner Fähigkeits-Labels in
+    /// `ChildSessionObservers::skill_label_backing`: der Kern lässt ein
+    /// Label wie `filesystem.write` nach dem Aktivierungsschnitt nur stehen,
+    /// solange eines seiner deckenden Werkzeuge freigeschaltet bleibt.
+    ///
+    /// Benutzerdefinierte Agenten laufen über denselben Weg: ihre geklemmte
+    /// IR liegt in `builtin_definitions`, und `child_skill_injector` prüft
+    /// den Skill-Katalog an ihrer Basisrolle (`lookup_role`). Einen Injektor
+    /// bekommt keine Rolle ohne Skill-Katalog
+    /// ([`harw_registry_defaults::profile::SKILL_CATALOG_EXCLUDED_ROLES`])
+    /// und kein benutzerdefinierter Agent über einer solchen Basisrolle.
+    ///
+    /// Ein Kind, das über einen `harw_core::child_backend::ChildBackend`
+    /// läuft (Job-Lauf statt In-Process-Turn), trägt den Injektor zwar an
+    /// seiner admittierten Sitzung, aber diese Sitzung fährt keine Runde:
+    /// getriggerte Auszüge erreichen es noch nicht.
+    fn child_session_observers(
+        &self,
+        role: &str,
+        child: &harw_types::SessionId,
+    ) -> harw_core::ChildSessionObservers {
+        // Runde 5, Teil N: Kind-ID und Baum-Pfad für Host-Mode-Anfragen.
+        crate::host_escalation_wiring::bind_child(self.host_permit_wiring.as_ref(), role, child);
+        // PL-90 W03d: die in `build_registry` gemintete Lauf-Id dieses Kindes
+        // (immer entnehmen, auch ohne Recorder, damit nichts hängen bleibt).
+        // Ohne vorgemerkte Identität (z. B. die Steward-Sonderregistry, die
+        // `build_registry` nicht durchläuft) wird die Id hier aus der
+        // Kind-Sitzung abgeleitet — nie der bloße Rollenname, den sich
+        // Geschwister teilen würden, und dieselbe nach einer Wiederherstellung.
+        let agent = self.take_run_identity(role).map_or_else(
+            || run_agent_id(role, child),
+            |identity| identity.agent_id.clone(),
+        );
+        // PL-100 WP 1.5: der für genau diese Sitzung gebaute Skill-Injektor
+        // samt Deckung seiner Labels (immer entnehmen, auch ohne Recorder);
+        // `admit_inner` schneidet ihn mit der Kind-Aktivierung und hängt ihn
+        // an die Kind-Sitzung.
+        let (skill_injector, skill_label_backing) =
+            self.take_child_skill_injector(role, child).map_or_else(
+                || (None, BTreeMap::new()),
+                |injection| (Some(injection.injector), injection.label_backing),
+            );
+        let Some(recorder) = &self.diary else {
+            return harw_core::ChildSessionObservers {
+                skill_injector,
+                skill_label_backing,
+                ..harw_core::ChildSessionObservers::default()
+            };
+        };
+        recorder.session_started(child, Some(agent));
+        harw_core::ChildSessionObservers {
+            compaction: Some(recorder.compaction_observer(None)),
+            tool_outcome: Some(recorder.tool_outcome_observer(None)),
+            skill_injector,
+            skill_label_backing,
+        }
+    }
+
+    /// Runde 5, Teil C: Sitzungsende-Eintrag des Kindes (höchstens einer je
+    /// Kind-Lauf, keiner ohne beendete Runde — siehe
+    /// [`crate::diary_wiring::DiaryRecorder::session_closed`]).
+    fn child_session_released(&self, _role: &str, child: &harw_types::SessionId) {
+        // Runde 5, Teil N: freigegebene Kinder verlassen das Anfragenden-Buch.
+        crate::host_escalation_wiring::release(self.host_permit_wiring.as_ref(), child);
+        if let Some(recorder) = &self.diary {
+            recorder.session_closed(child);
+        }
+    }
+
+    /// Baut die Registry eines Kindes nach dem Profil seiner Rolle.
+    ///
+    /// # Argumente
+    /// - `role` (`&str`): der registrierte Rollenname.
+    /// - `input` (`&SpawnInput`): die Registry hängt allein an `role`, nie an
+    ///   Modell-JSON; gelesen wird nur die vertrauenswürdige
+    ///   `parent_session_id` (Runde 5, Teil N: Baum-Pfad für Host-Mode).
+    /// - `_suggestions` (`Option<&harw_catalog::AgentSuggestions>`): ungenutzt;
+    ///   ein Vorschlag wird hier nie zu einem registrierten Werkzeug.
+    ///
+    /// # Rückgabe
+    /// `Ok(ExtensionRegistry)` mit genau den Tool-Providern des Profils aus
+    /// [`profile_for_role`], erweitert um die Kind-Freigabekette.
+    ///
+    /// # Rechte und Netz
+    /// Die Registry legt nur fest, welche Werkzeuge das Kind **sieht**; was
+    /// es tatsächlich darf, entscheidet die Sandbox, mit der
+    /// [`ManagedAgentSpawner`] das Kind admittiert — über den Handoff die
+    /// Sandbox des Elternteils, geprüft mit `ensure_child_of`, also nie mehr
+    /// Rechte und nie mehr Hosts als der Elternteil. Das gilt insbesondere
+    /// für `uia-worker`/`uia-writer`, deren Profile seit der
+    /// Nutzerentscheidung „kurz online recherchieren, manchmal
+    /// Abhängigkeiten hinzufügen“ `web.fetch`/`web.search` und die lesenden
+    /// `deps.*` registrieren: `NetworkAccess` samt Host-Scope kommt nur vom
+    /// Elternteil (registry-seitiger Reducer `ReadExplore`), und jeder Abruf
+    /// läuft zusätzlich durch die prozessweite Egress-Policy
+    /// (`harw_registry_defaults::install_web_tools`).
+    ///
+    /// # Fehler
+    /// [`AgentSpawnError`], wenn `role` **keine** bekannte Rolle ist
+    /// (fail-closed, kein `unwrap_or_default`) oder die Montage scheitert.
+    ///
+    /// # Identität (PL-90 W03d)
+    /// Die Operations-Werkzeuge des Kindes (`delegate_wave`, Matrix-Werkzeuge)
+    /// bauen ihren `OpContext` aus einer `ServiceMap`, die eine für dieses
+    /// Kind neu erzeugte `Arc<CallerIdentity>` trägt
+    /// ([`Self::child_caller_identity`]); kein Geschwister teilt sie, und ihre
+    /// `agent_id` (`<rolle>.<kind-sitzungs-id>`) ist je Kind verschieden, auch
+    /// bei gleicher Rolle, und über eine durable Wiederherstellung stabil
+    /// (abgeleitet aus der Kind-Sitzung, die der Controller vor dem Bau
+    /// meldet, siehe [`ChildRegistryFactory::announce_child_session`]; ohne
+    /// Meldung, etwa bei einem direkten Aufruf, aus einer frischen Sitzungs-ID).
+    /// Dieselbe Id ist der Autor von `diary.read` und des
+    /// Diary-Recorders. Die übrigen Wissens-Lesewerkzeuge der Kinder
+    /// (`palace.*`, …) laufen nicht über einen `OpContext` und lesen die
+    /// Identität nicht; ihre Sicht bleibt die ihres jeweiligen Providers
+    /// (`with_knowledge_readers`).
+    fn build_registry(
+        &self,
+        role: &str,
+        input: &SpawnInput,
+        _suggestions: Option<&harw_catalog::AgentSuggestions>,
+    ) -> Result<ExtensionRegistry, AgentSpawnError> {
+        // PL-100 WP 1.5: ohne `ParentGrant` (kein Admissionspfad) baut die
+        // Fabrik keinen Skill-Injektor (siehe `note_child_skill_injector`).
+        self.build_child_registry(role, input, None)
     }
 
     /// Friert die direkt konfigurierten Skills der Rolle als Spawn-Vertrag
@@ -2564,11 +2926,11 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// K3 "Schärfung der Steward-Prüfung").
     ///
     /// # Description
-    /// Für jede Rolle außer [`role_names::AGENT_STEWARD`] unverändert wie
-    /// bisher — delegiert an [`Self::build_registry`] (`parent` bleibt
-    /// ungenutzt, `harw-core`s Default-Methode täte hier nichts anderes; die
-    /// explizite Delegation vermeidet nur eine zusätzliche Indirektion über
-    /// den `capability_snapshot`-Pfad).
+    /// Für jede Rolle außer [`role_names::AGENT_STEWARD`] dieselbe Registry
+    /// wie [`Self::build_registry`] (über `build_child_registry`; der
+    /// Snapshot bleibt wie bisher für die Registry unbeachtet). `parent`
+    /// schneidet dort nur den Werkzeug-Filter des Skill-Injektors des Kindes
+    /// (PL-100 WP 1.5, `child_skill_injector`), nie die Registry selbst.
     ///
     /// Für `agent-steward` baut diese Fabrik die Registry stattdessen über
     /// [`assemble_registry_for_project_with_definition_access`] mit einer
@@ -2604,17 +2966,22 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         &self,
         role: &str,
         input: &SpawnInput,
-        snapshot: Option<&harw_catalog::SpawnCapabilitySnapshot>,
+        _snapshot: Option<&harw_catalog::SpawnCapabilitySnapshot>,
         parent: &harw_core::ParentGrant,
     ) -> Result<ExtensionRegistry, AgentSpawnError> {
         if role != role_names::AGENT_STEWARD {
-            return self.build_registry_with_capabilities(role, input, snapshot);
+            // Wie bisher `build_registry_with_capabilities` → `build_registry`
+            // (beide lassen Snapshot und Vorschläge für die Registry
+            // unbeachtet); neu reicht der Pfad `parent` für den
+            // Werkzeug-Filter des Skill-Injektors durch (PL-100 WP 1.5).
+            return self.build_child_registry(role, input, Some(parent));
         }
         // Die Steward-Sonderregistry trägt keine laufgebundene Identität (keine
         // Wissens- oder Operations-Werkzeuge); die gemeldete Kind-Sitzung wird
-        // verworfen, damit sie keinen späteren Bau derselben Rolle erreicht.
+        // entnommen, damit sie keinen späteren Bau derselben Rolle erreicht.
         // `child_session_observers` leitet die Id dieses Kindes selbst ab.
-        let _ = self.take_announced_child_session(role);
+        // PL-100 WP 1.5: die Sitzung bindet nur noch den Skill-Injektor.
+        let announced_child = self.take_announced_child_session(role);
 
         let profile = profile_for_role(role).ok_or_else(|| AgentSpawnError {
             kind: Default::default(),
@@ -2684,6 +3051,8 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         let registry = self
             .with_skill_catalog_tools(role, registry_builder)
             .build();
+        // PL-100 WP 1.5: wie in `build_child_registry`.
+        self.note_child_skill_injector(role, announced_child.as_ref(), &registry, Some(parent));
         tracing::debug!(
             role,
             profile = ?profile,
@@ -2693,6 +3062,181 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         );
         Ok(registry)
     }
+}
+
+/// PL-100 WP 1.5: die Namen aller Werkzeuge einer fertigen Kind-Registry
+/// (in Provider-Reihenfolge, mit möglichen Dubletten).
+fn child_registry_tool_names(registry: &ExtensionRegistry) -> Vec<String> {
+    registry
+        .tool_providers()
+        .iter()
+        .flat_map(|provider| provider.tools())
+        .map(|spec| spec.name().to_owned())
+        .collect()
+}
+
+/// PL-100 WP 1.5: die Werkzeuge, die ein Kind höchstens aufrufen kann —
+/// für den Werkzeug-Filter seines Skill-Injektors.
+///
+/// # Description
+/// Aus den Werkzeugen seiner Registry (`registered`) bleibt ein Name nur,
+/// wenn beide Schnitte ihn zulassen:
+/// 1. die Werkzeugoberfläche der Definition `ir` ([`surface_admits`]):
+///    genau die Regel, nach der
+///    `harw_core::session::AgentSession::with_executable_agent_ir` die
+///    Aktivierung des Kindes baut (`admitted` plus
+///    [`harw_core::activation::ALWAYS_AVAILABLE_TOOLS`], `forbidden`
+///    gewinnt); für einen benutzerdefinierten Agenten ist das seine
+///    geklemmte IR; ohne Definition entfällt dieser Schnitt;
+/// 2. die Rechte des Elternteils (`permissions`, `ParentGrant::permissions`):
+///    die Kind-Sandbox ist nie weiter (`SandboxSpec::ensure_child_of` in
+///    `admit_inner`). Ein Werkzeug, dessen Recht
+///    ([`harw_registry_defaults::authority::tool_permission`]) darin fehlt,
+///    fällt weg; ein Werkzeug ohne Sandbox-Recht (`None`, etwa die lesenden
+///    `dod.*`) bleibt.
+///
+/// Review-Befund (PL-100 WP 1.5): weder der Reducer der Basisrolle noch die
+/// Eltern-Registry (`ParentGrant::tools`) schneiden hier. Der Reducer ist
+/// nicht der Weg, auf dem ein direkt gestartetes Kind seine Rechte bekommt
+/// (der `test-engineer` über der Analyst-Basis hält `ExecuteProcess` für
+/// `cargo.test_one`), und der Kern schneidet die Kind-Aktivierung nur mit
+/// der Eltern-**Aktivierung** (`narrow_base_activation`), nicht mit der
+/// Eltern-Registry: ein nur dem Kind registriertes Werkzeug bleibt
+/// aufrufbar. Diesen Aktivierungsschnitt macht der Kern bei der Übergabe
+/// des Injektors (`admit_inner`, nach `narrow_base_activation`, über
+/// [`harw_core::SkillInjector::narrowed_to_callable`]).
+///
+/// # Arguments
+/// - `registered` (`&[String]`): die Werkzeuge der Kind-Registry.
+/// - `ir` (`Option<&ExecutableAgentIr>`): die (geklemmte) Definition.
+/// - `permissions` (`&harw_authority::PermissionSet`): die Rechte des
+///   Elternteils als Obergrenze.
+///
+/// # Returns
+/// Sortiert und dublettenfrei.
+fn child_callable_tools(
+    registered: &[String],
+    ir: Option<&ExecutableAgentIr>,
+    permissions: &harw_authority::PermissionSet,
+) -> Vec<String> {
+    let mut names: Vec<String> = registered
+        .iter()
+        .filter(|name| {
+            ir.is_none_or(|ir| {
+                let surface = ir.tool_surface();
+                surface_admits(name, surface.admitted(), surface.forbidden())
+            })
+        })
+        .filter(|name| {
+            harw_registry_defaults::authority::tool_permission(name)
+                .is_none_or(|permission| permissions.contains(permission))
+        })
+        .cloned()
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// PL-100 WP 1.5 (Review-Befund): die abstrakten Fähigkeits-Labels der
+/// Skills eines Index, aufgeteilt für den Werkzeug-Filter eines Kindes
+/// ([`child_capability_labels`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CapabilityLabels {
+    /// Jedes deklarierte Label mit Rechtebezug
+    /// ([`harw_registry_defaults::authority::capability_permission`]).
+    known: Vec<String>,
+    /// Die Labels, deren Recht ein aufrufbares Werkzeug des Kindes trägt.
+    callable: Vec<String>,
+    /// Die Labels mit Schreib- oder Ausführungsrecht (`WriteWorkspace`,
+    /// `ExecuteProcess`, `ManagePlugins`, `ManageContainers`): all-of.
+    required: Vec<String>,
+    /// Je Label aus `callable` die aufrufbaren Werkzeuge, die sein Recht
+    /// tragen (nie leer): der Kern lässt das Label nach dem
+    /// Aktivierungsschnitt nur stehen, solange eines davon freigeschaltet
+    /// bleibt (`harw_core::ChildSessionObservers::skill_label_backing`).
+    backing: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// PL-100 WP 1.5 (Review-Befund): ordnet die abstrakten Fähigkeits-Labels,
+/// die Skills in `index` deklarieren (`skill.toml` `tools` und
+/// `[triggers] tools`, etwa `filesystem.read`, `filesystem.write`,
+/// `process.execute`), den aufrufbaren Werkzeugen eines Kindes zu.
+///
+/// # Description
+/// Ein Label ist jeder deklarierte Name außerhalb von `tools` (Katalog und
+/// Registry), dessen Recht
+/// [`harw_registry_defaults::authority::capability_permission`] kennt;
+/// fachliche Namen ohne Rechtebezug bleiben unbekannt und filtern nichts.
+/// Aufrufbar ist ein Label, wenn ein Werkzeug aus `callable` dasselbe Recht
+/// trägt ([`harw_registry_defaults::authority::tool_permission`]): ein
+/// lesendes Kind mit `fs.read` deckt `filesystem.read`, nie
+/// `filesystem.write`. Diese Werkzeuge sind die Deckung des Labels
+/// ([`CapabilityLabels::backing`]); sperrt die Eltern-Aktivierung später
+/// alle, nimmt der Kern das Label weg. Labels mit Schreib- oder
+/// Ausführungsrecht werden all-of geprüft, damit
+/// `[filesystem.read, filesystem.write]` ein lesendes Kind nicht über das
+/// Lese-Label erreicht.
+///
+/// # Arguments
+/// - `index` (`&SkillIndex`): der Skill-Index des Kindes.
+/// - `tools` (`&BTreeSet<String>`): die bekannten Werkzeugnamen.
+/// - `callable` (`&[String]`): die aufrufbaren Werkzeuge
+///   ([`child_callable_tools`]).
+///
+/// # Returns
+/// Die Labels je Klasse, sortiert und dublettenfrei.
+fn child_capability_labels(
+    index: &SkillIndex,
+    tools: &BTreeSet<String>,
+    callable: &[String],
+) -> CapabilityLabels {
+    use harw_authority::Permission;
+
+    // Je Recht die aufrufbaren Werkzeuge, die es tragen.
+    let mut held: BTreeMap<Permission, BTreeSet<String>> = BTreeMap::new();
+    for tool in callable {
+        if let Some(permission) = harw_registry_defaults::authority::tool_permission(tool) {
+            held.entry(permission).or_default().insert(tool.to_owned());
+        }
+    }
+    let declared: BTreeSet<&str> = index
+        .entries()
+        .flat_map(|entry| entry.tools.iter().chain(&entry.triggers.tools))
+        .map(String::as_str)
+        .filter(|name| !tools.contains(*name))
+        .collect();
+    let mut labels = CapabilityLabels::default();
+    for label in declared {
+        let Some(permission) = harw_registry_defaults::authority::capability_permission(label)
+        else {
+            continue;
+        };
+        labels.known.push(label.to_owned());
+        if let Some(backing) = held.get(&permission) {
+            labels.callable.push(label.to_owned());
+            labels.backing.insert(label.to_owned(), backing.clone());
+        }
+        if matches!(
+            permission,
+            Permission::WriteWorkspace
+                | Permission::ExecuteProcess
+                | Permission::ManagePlugins
+                | Permission::ManageContainers
+        ) {
+            labels.required.push(label.to_owned());
+        }
+    }
+    labels
+}
+
+/// Ob die Werkzeugoberfläche einer Definition (`admitted`, `forbidden`) das
+/// Werkzeug `name` freischaltet: `forbidden` gewinnt, sonst `admitted` oder
+/// [`harw_core::activation::ALWAYS_AVAILABLE_TOOLS`].
+fn surface_admits(name: &str, admitted: &[String], forbidden: &[String]) -> bool {
+    !forbidden.iter().any(|tool| tool == name)
+        && (admitted.iter().any(|tool| tool == name)
+            || harw_core::activation::ALWAYS_AVAILABLE_TOOLS.contains(&name))
 }
 
 /// #22 Welle 1B: der Auftragsrahmen eines Kindes aus seiner IR —
@@ -4749,6 +5293,1211 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// PL-100 O11: ein `intel-scout`-Kind startet und bekommt genau sein
+    /// rollengebundenes `deps.locked` (lesend, ohne Freigabe), ein
+    /// `context-steward`-Kind gar kein Werkzeug. Keines von beiden bekommt
+    /// `dod.*`, den Skill-Katalog oder einen fest gebundenen Skill.
+    #[test]
+    fn intel_scout_and_context_steward_children_serve_only_their_role_bound_tools() -> TestResult {
+        let factory = factory_with_bundled_skills()?;
+        assert_eq!(
+            served_tools(&factory, role_names::INTEL_SCOUT)?,
+            harw_registry_defaults::profile::LOCKFILE_READ_TOOLS
+        );
+        assert!(
+            served_tools(&factory, role_names::CONTEXT_STEWARD)?.is_empty(),
+            "context-steward ist werkzeuglos"
+        );
+        for tool in harw_registry_defaults::profile::LOCKFILE_READ_TOOLS {
+            assert!(
+                harw_registry_defaults::AUTO_APPROVED_TOOLS.contains(tool),
+                "{tool} ist auto-freigegeben"
+            );
+        }
+        for role in [role_names::INTEL_SCOUT, role_names::CONTEXT_STEWARD] {
+            let fragments = factory
+                .skill_fragments_for_role(role)
+                .map_err(|error| TestError::Unexpected(error.message))?;
+            assert!(fragments.is_empty(), "{role}: {fragments:?}");
+            assert!(
+                harw_registry_defaults::profile::dod_tools_for_role(role).is_empty(),
+                "{role}"
+            );
+        }
+        // Gegenprobe: kein anderes Kind bekommt den Lockfile-Provider
+        // rollengebunden.
+        for role in role_names::ALL {
+            assert_eq!(
+                !harw_registry_defaults::profile::lockfile_tools_for_role(role).is_empty(),
+                *role == role_names::INTEL_SCOUT,
+                "{role}"
+            );
+        }
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // PL-100 WP 1.5 — Skill-Injektor für Kind-Sitzungen.
+    // -------------------------------------------------------------------
+
+    /// Ein Eltern-Grant einer Wurzel mit genau `tools` und allen Rechten.
+    fn parent_grant<I, S>(tools: I) -> harw_core::ParentGrant
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        harw_core::ParentGrant {
+            role: Some(harw_agent_dsl::roles::AgentRoleId::RootOrchestrator),
+            tools: tools.into_iter().map(Into::into).collect(),
+            permissions: harw_authority::PermissionSet::from_policy(
+                harw_authority::Permission::ALL,
+            ),
+            max_depth: 2,
+            budget_tokens: 0,
+            reasoning_effort: None,
+        }
+    }
+
+    /// Ein Eltern-Grant, der jedes Werkzeug des Katalogs und jedes Werkzeug
+    /// der Kind-Registry von `role` hält: schneidet nichts weg.
+    fn wide_parent_grant(
+        factory: &RuntimeChildRegistryFactory,
+        role: &str,
+    ) -> TestResult<harw_core::ParentGrant> {
+        let mut tools = served_tools(factory, role)?;
+        tools.extend(
+            harw_registry_defaults::tool_index::catalog_tool_names()
+                .into_iter()
+                .map(str::to_owned),
+        );
+        Ok(parent_grant(tools))
+    }
+
+    /// Spielt die Admission eines Kindes von `role` in der Reihenfolge des
+    /// Controllers durch (Meldung, Registry-Bau mit Eltern-Grant über
+    /// `build_registry_from_capability_snapshot_for_parent`) und entnimmt
+    /// den Skill-Injektor, den die Fabrik für genau diese Kind-Sitzung
+    /// vorgemerkt hat. Das ist die Fabrik-Seite allein: den Schnitt mit der
+    /// Kind-Aktivierung macht erst `admit_inner` bei der Übergabe (geprüft in
+    /// `harw-core/src/child_controller/tests/skill_injector_handover.rs`).
+    fn admitted_skill_injector(
+        factory: &RuntimeChildRegistryFactory,
+        role: &str,
+        parent: &harw_core::ParentGrant,
+    ) -> TestResult<Option<Arc<harw_core::SkillInjector>>> {
+        let child = harw_types::SessionId::new();
+        factory.announce_child_session(role, &child);
+        factory
+            .build_registry_from_capability_snapshot_for_parent(
+                role,
+                &test_spawn_input(),
+                None,
+                parent,
+            )
+            .map_err(|error| TestError::Unexpected(format!("{role}: {}", error.message)))?;
+        Ok(factory
+            .take_child_skill_injector(role, &child)
+            .map(|injection| injection.injector))
+    }
+
+    /// Prüft, dass `skill` im Index des Injektors steht (sonst wäre
+    /// `tools_admit` für einen unbekannten Namen trivial `true`).
+    fn assert_indexed(injector: &harw_core::SkillInjector, skill: &str) -> TestResult {
+        injector
+            .index()
+            .get(skill)
+            .map(|_| ())
+            .ok_or_else(|| TestError::Unexpected(format!("bundled skill {skill} not indexed")))
+    }
+
+    /// PL-100 WP 1.5: ein Kind mit Skill-Katalog bekommt einen Injektor,
+    /// dessen Werkzeug-Filter genau seine aufrufbaren Werkzeuge kennt: ein
+    /// `explorer`-Kind (lesende `fsread.*`/`git.*`, kein `sys.*`, `dod.*`
+    /// oder `cargo.*`) bekommt nie einen Skill für Werkzeuge, die es nicht
+    /// hat. Ein Skill mit dem Label `filesystem.read` (`planning`) bleibt
+    /// wählbar, weil das Kind lesen kann; einer, der zusätzlich
+    /// `process.execute` nennt (`verification`), nicht.
+    #[test]
+    fn child_skill_injector_admits_only_skills_for_tools_the_child_can_call() -> TestResult {
+        let factory = factory_with_bundled_skills()?;
+        let parent = wide_parent_grant(&factory, role_names::EXPLORER)?;
+        let injector = admitted_skill_injector(&factory, role_names::EXPLORER, &parent)?
+            .ok_or(TestError::Missing("explorer child skill injector"))?;
+        for skill in ["fsread-tools", "git-read-tools", "planning"] {
+            assert_indexed(&injector, skill)?;
+            assert!(injector.tools_admit(skill), "{skill}");
+        }
+        for skill in ["sys-tools", "harw-dod", "cargo-tools", "verification"] {
+            assert_indexed(&injector, skill)?;
+            assert!(!injector.tools_admit(skill), "{skill}");
+        }
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5 (Review-Befund, Runde 2): der Werkzeug-Filter folgt
+    /// den Rechten des Elternteils, nicht seiner Registry. Hält der
+    /// Elternteil kein `fsread.*` in `parent.tools`, bekommt das
+    /// `explorer`-Kind `fsread-tools` trotzdem (der Kern schneidet nur mit
+    /// der Eltern-Aktivierung); fehlt dem Elternteil `ReadWorkspace`, fallen
+    /// alle lesenden Workspace-Werkzeuge und das Label `filesystem.read`
+    /// weg; ohne Rechte bleibt kein werkzeug- oder rechtegebundener Skill.
+    #[test]
+    fn child_skill_injector_follows_the_parent_permission_cut() -> TestResult {
+        let factory = factory_with_bundled_skills()?;
+        let served = served_tools(&factory, role_names::EXPLORER)?;
+        assert!(served.iter().any(|tool| tool.starts_with("fsread.")));
+        assert!(served.iter().any(|tool| tool.starts_with("git.")));
+
+        let without_fsread = parent_grant(
+            served
+                .iter()
+                .filter(|tool| !tool.starts_with("fsread."))
+                .cloned(),
+        );
+        let injector = admitted_skill_injector(&factory, role_names::EXPLORER, &without_fsread)?
+            .ok_or(TestError::Missing("explorer injector without fsread"))?;
+        assert_indexed(&injector, "fsread-tools")?;
+        assert!(injector.tools_admit("fsread-tools"));
+        assert!(injector.tools_admit("git-read-tools"));
+
+        let mut network_only = wide_parent_grant(&factory, role_names::EXPLORER)?;
+        network_only.permissions =
+            harw_authority::PermissionSet::from_policy([harw_authority::Permission::NetworkAccess]);
+        let injector = admitted_skill_injector(&factory, role_names::EXPLORER, &network_only)?
+            .ok_or(TestError::Missing(
+                "explorer injector without ReadWorkspace",
+            ))?;
+        assert_indexed(&injector, "planning")?;
+        for skill in ["fsread-tools", "git-read-tools", "planning"] {
+            assert!(!injector.tools_admit(skill), "{skill}");
+        }
+
+        let mut empty = parent_grant(Vec::<String>::new());
+        empty.permissions = harw_authority::PermissionSet::empty();
+        let injector = admitted_skill_injector(&factory, role_names::EXPLORER, &empty)?.ok_or(
+            TestError::Missing("explorer injector under a parent without rights"),
+        )?;
+        for skill in ["fsread-tools", "git-read-tools", "sys-tools", "planning"] {
+            assert!(!injector.tools_admit(skill), "{skill}");
+        }
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5: der Schnitt als reine Funktion — Definition und
+    /// Rechte des Elternteils; Werkzeuge ohne Sandbox-Recht bleiben. Weder
+    /// ein Reducer noch die Eltern-Registry schneiden (Review-Befund).
+    #[test]
+    fn child_callable_tools_applies_the_surface_and_the_parent_rights() {
+        let registered: Vec<String> = [
+            "fsread.ls",
+            "web.fetch",
+            "dod.status",
+            "sys.ps",
+            "fsread.ls",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let all = harw_authority::PermissionSet::from_policy(harw_authority::Permission::ALL);
+        assert_eq!(
+            child_callable_tools(&registered, None, &all),
+            ["dod.status", "fsread.ls", "sys.ps", "web.fetch"]
+        );
+        let read_only =
+            harw_authority::PermissionSet::from_policy([harw_authority::Permission::ReadWorkspace]);
+        assert_eq!(
+            child_callable_tools(&registered, None, &read_only),
+            ["dod.status", "fsread.ls"]
+        );
+        assert_eq!(
+            child_callable_tools(&registered, None, &harw_authority::PermissionSet::empty()),
+            ["dod.status"]
+        );
+    }
+
+    /// PL-100 WP 1.5: Werkzeug-Erstnutzung wirkt im Kind wie in der Wurzel
+    /// — der erste `fsread.ls`-Aufruf eines `explorer`-Kindes spielt
+    /// `fsread-tools` ein; `ps aux` über eine Shell trifft `sys-tools`, das
+    /// das Kind nicht aufrufen kann, und bleibt draußen.
+    #[test]
+    fn child_skill_injector_injects_on_tool_first_use_and_skips_unavailable_skills() -> TestResult {
+        let factory = factory_with_bundled_skills()?;
+        let parent = wide_parent_grant(&factory, role_names::EXPLORER)?;
+        let injector = admitted_skill_injector(&factory, role_names::EXPLORER, &parent)?
+            .ok_or(TestError::Missing("explorer child skill injector"))?;
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("go");
+        assert!(injector.prepare_round(&history, 0).delivered.is_empty());
+        history.push_tool_call(
+            harw_types::ToolCallId::from_str("c1"),
+            "fsread.ls",
+            serde_json::json!({ "path": "." }),
+        );
+        let round = injector.prepare_round(&history, 0);
+        assert!(
+            round.delivered.iter().any(|delivered| {
+                delivered.skill == "fsread-tools"
+                    && delivered.kind == harw_catalog::TriggerKind::Tool
+            }),
+            "{:?}",
+            round.delivered
+        );
+
+        let other = admitted_skill_injector(&factory, role_names::EXPLORER, &parent)?
+            .ok_or(TestError::Missing("second explorer child skill injector"))?;
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("go");
+        history.push_tool_call(
+            harw_types::ToolCallId::from_str("c2"),
+            "shell.exec",
+            serde_json::json!({ "command": "ps aux" }),
+        );
+        let round = other.prepare_round(&history, 0);
+        assert!(
+            !round
+                .delivered
+                .iter()
+                .any(|delivered| delivered.skill == "sys-tools"),
+            "{:?}",
+            round.delivered
+        );
+        assert!(
+            round.unavailable.iter().any(|skill| skill == "sys-tools"),
+            "{:?}",
+            round.unavailable
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5 (Review-Befund): fest gebundene Skills einer Rolle
+    /// stehen schon vollständig in ihren Instruktionen; ihr Injektor spielt
+    /// sie nie ein zweites Mal ein, ein anderer Skill mit demselben Trigger
+    /// kommt weiter durch.
+    #[test]
+    fn fixed_role_skills_are_never_injected_again() -> TestResult {
+        let layer = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut config = harw_config::ResolvedConfig::default();
+        for name in ["review", "audit"] {
+            let dir = layer.path().join("skills").join(name);
+            std::fs::create_dir_all(&dir).map_err(ctx("mkdir skill"))?;
+            std::fs::write(
+                dir.join("skill.toml"),
+                format!("name = \"{name}\"\ndescription = \"{name} skill\"\n"),
+            )
+            .map_err(ctx("write manifest"))?;
+            std::fs::write(
+                dir.join("instructions.md"),
+                format!("# {name}\n\nCheck the ledger.\n"),
+            )
+            .map_err(ctx("write body"))?;
+            std::fs::write(
+                dir.join("triggers.toml"),
+                "[triggers]\nkeywords = [\"ledger audit\"]\npriority = 50\n",
+            )
+            .map_err(ctx("write triggers"))?;
+        }
+        config.skills.insert(
+            "review".to_owned(),
+            SkillToml {
+                name: "review".to_owned(),
+                enabled: true,
+                description: "review skill".to_owned(),
+                instructions_file: None,
+                tools: Vec::new(),
+                mcps: Vec::new(),
+            },
+        );
+        config.agents.insert(
+            role_names::EXPLORER.to_owned(),
+            harw_config::AgentToml {
+                name: role_names::EXPLORER.to_owned(),
+                role: "worker".to_owned(),
+                description: String::new(),
+                system_file: None,
+                providers: Vec::new(),
+                models: Vec::new(),
+                skills: vec!["review".to_owned()],
+                suggestions: harw_config::AgentSuggestionsToml::default(),
+                primary_provider: None,
+                secondary_providers: Vec::new(),
+                timeout_seconds: 120,
+                max_retries: 2,
+            },
+        );
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_skill_catalog(&config, vec![layer.path().to_path_buf()])
+        .map_err(ctx("skill catalog"))?;
+        assert_eq!(factory.fixed_skill_names(role_names::EXPLORER), ["review"]);
+
+        let parent = wide_parent_grant(&factory, role_names::EXPLORER)?;
+        let injector = admitted_skill_injector(&factory, role_names::EXPLORER, &parent)?
+            .ok_or(TestError::Missing("explorer child skill injector"))?;
+        assert_indexed(&injector, "review")?;
+        assert_indexed(&injector, "audit")?;
+        assert!(injector.excludes("review"));
+        assert!(!injector.excludes("audit"));
+
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("please run the ledger audit now");
+        let round = injector.prepare_round(&history, 0);
+        assert!(
+            round
+                .delivered
+                .iter()
+                .any(|delivered| delivered.skill == "audit"),
+            "{:?}",
+            round.delivered
+        );
+        assert!(
+            !round
+                .delivered
+                .iter()
+                .any(|delivered| delivered.skill == "review"),
+            "{:?}",
+            round.delivered
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5: wie an der Wurzel nur zusammen mit dem Skill-Katalog
+    /// — die Triage-Rollen, `intel-scout`, `context-steward` und die
+    /// Matrix-Sitze bekommen keinen Injektor; der fest gebundene Skill
+    /// `harw-dod` der Triage-Rollen bleibt ihr einziger Skill-Kontext.
+    #[test]
+    fn roles_without_the_skill_catalog_get_no_child_skill_injector() -> TestResult {
+        let factory = factory_with_bundled_skills()?;
+        for role in [
+            role_names::SECURITY_EGRESS_TRIAGE,
+            role_names::SECURITY_BASELINE_TRIAGE,
+            role_names::SECURITY_STRUCTURE_TRIAGE,
+            role_names::SECURITY_ENDPOINT_TRIAGE,
+            role_names::INTEL_SCOUT,
+            role_names::CONTEXT_STEWARD,
+            role_names::MATRIX_PLAYER,
+        ] {
+            assert!(
+                harw_registry_defaults::profile::SKILL_CATALOG_EXCLUDED_ROLES.contains(&role),
+                "{role}"
+            );
+            let parent = wide_parent_grant(&factory, role)?;
+            assert!(
+                admitted_skill_injector(&factory, role, &parent)?.is_none(),
+                "{role} must not get a skill injector"
+            );
+        }
+        let fragments = factory
+            .skill_fragments_for_role(role_names::SECURITY_EGRESS_TRIAGE)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert_eq!(fragments.len(), 1, "{fragments:?}");
+        assert!(
+            fragments
+                .first()
+                .is_some_and(|fragment| fragment.starts_with("# Skill: harw-dod (sha256 ")),
+            "{fragments:?}"
+        );
+        // Gegenprobe: eine Rolle mit Skill-Katalog bekommt einen.
+        let parent = wide_parent_grant(&factory, role_names::EXPLORER)?;
+        assert!(admitted_skill_injector(&factory, role_names::EXPLORER, &parent)?.is_some());
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5: ohne Skill-Katalog oder mit
+    /// `[skills] triggered_injection = false` bekommt kein Kind einen
+    /// Injektor; die Katalog-Werkzeuge bleiben davon unberührt.
+    #[test]
+    fn no_child_skill_injector_without_catalog_or_triggered_injection() -> TestResult {
+        let config = harw_config::ResolvedConfig::default();
+        let without_catalog = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?;
+        let parent = wide_parent_grant(&without_catalog, role_names::EXPLORER)?;
+        assert!(
+            admitted_skill_injector(&without_catalog, role_names::EXPLORER, &parent)?.is_none()
+        );
+
+        let mut off = harw_config::ResolvedConfig::default();
+        off.harness.skills.triggered_injection = false;
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&off),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_skill_catalog(&off, Vec::new())
+        .map_err(ctx("skill catalog"))?;
+        assert!(admitted_skill_injector(&factory, role_names::EXPLORER, &parent)?.is_none());
+        let tools = served_tools(&factory, role_names::EXPLORER)?;
+        for tool in harw_registry_defaults::profile::SKILL_CATALOG_TOOLS {
+            assert!(tools.iter().any(|served| served == tool), "{tool}");
+        }
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5: der Injektor gehört genau der Kind-Sitzung, für die die
+    /// Registry gebaut wurde — jedes Kind bekommt einen eigenen; ein Bau ohne
+    /// Meldung oder ohne Eltern-Grant (`build_registry`, fail-closed) merkt
+    /// keinen vor; ein Rest für eine andere Sitzung wird verworfen statt
+    /// übergeben.
+    #[test]
+    fn child_skill_injector_belongs_to_exactly_one_child_session() -> TestResult {
+        let factory = factory_with_bundled_skills()?;
+        let parent = wide_parent_grant(&factory, role_names::EXPLORER)?;
+        let first = admitted_skill_injector(&factory, role_names::EXPLORER, &parent)?
+            .ok_or(TestError::Missing("first injector"))?;
+        let second = admitted_skill_injector(&factory, role_names::EXPLORER, &parent)?
+            .ok_or(TestError::Missing("second injector"))?;
+        assert!(!Arc::ptr_eq(&first, &second), "a fresh injector per child");
+
+        // Bau mit Eltern-Grant, aber ohne Meldung (keine Admission).
+        factory
+            .build_registry_from_capability_snapshot_for_parent(
+                role_names::EXPLORER,
+                &test_spawn_input(),
+                None,
+                &parent,
+            )
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let unannounced = harw_types::SessionId::new();
+        assert!(
+            factory
+                .take_child_skill_injector(role_names::EXPLORER, &unannounced)
+                .is_none()
+        );
+
+        // Gemeldet, aber ohne Eltern-Grant gebaut: der Werkzeug-Filter ist
+        // nicht prüfbar, also kein Injektor.
+        let without_grant = harw_types::SessionId::new();
+        factory.announce_child_session(role_names::EXPLORER, &without_grant);
+        factory
+            .build_registry(role_names::EXPLORER, &test_spawn_input(), None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert!(
+            factory
+                .take_child_skill_injector(role_names::EXPLORER, &without_grant)
+                .is_none()
+        );
+
+        // Gebaut für `built`, abgeholt für `other`: verworfen, auch für
+        // einen späteren Abruf von `built`.
+        let built = harw_types::SessionId::new();
+        let other = harw_types::SessionId::new();
+        factory.announce_child_session(role_names::EXPLORER, &built);
+        factory
+            .build_registry_from_capability_snapshot_for_parent(
+                role_names::EXPLORER,
+                &test_spawn_input(),
+                None,
+                &parent,
+            )
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert!(
+            factory
+                .take_child_skill_injector(role_names::EXPLORER, &other)
+                .is_none()
+        );
+        assert!(
+            factory
+                .take_child_skill_injector(role_names::EXPLORER, &built)
+                .is_none()
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5: `child_session_observers` entnimmt den vorgemerkten
+    /// Injektor der Sitzung immer (auch ohne Diary-Recorder) und übergibt
+    /// ihn dem Kern in `ChildSessionObservers::skill_injector`; danach bleibt
+    /// nichts für einen späteren Bau hängen.
+    #[test]
+    fn child_session_observers_hand_over_the_pending_skill_injector() -> TestResult {
+        let factory = factory_with_bundled_skills()?;
+        let parent = wide_parent_grant(&factory, role_names::EXPLORER)?;
+        let child = harw_types::SessionId::new();
+        factory.announce_child_session(role_names::EXPLORER, &child);
+        factory
+            .build_registry_from_capability_snapshot_for_parent(
+                role_names::EXPLORER,
+                &test_spawn_input(),
+                None,
+                &parent,
+            )
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let observers = factory.child_session_observers(role_names::EXPLORER, &child);
+        assert!(observers.compaction.is_none() && observers.tool_outcome.is_none());
+        assert!(
+            observers.skill_injector.is_some(),
+            "the pending injector is handed over, not dropped"
+        );
+        // Mit dem Injektor geht die Deckung seiner Labels: `filesystem.read`
+        // (etwa aus `planning`) ist bei einem `explorer` von seinen lesenden
+        // `fsread.*` gedeckt, ein Schreib-Label gar nicht aufrufbar.
+        let read_backing = observers
+            .skill_label_backing
+            .get("filesystem.read")
+            .ok_or(TestError::Missing("backing of filesystem.read"))?;
+        assert!(
+            read_backing.iter().any(|tool| tool.starts_with("fsread.")),
+            "{read_backing:?}"
+        );
+        assert!(
+            !observers
+                .skill_label_backing
+                .contains_key("filesystem.write")
+        );
+        assert!(
+            factory
+                .take_child_skill_injector(role_names::EXPLORER, &child)
+                .is_none(),
+            "the observers call consumed the pending injector"
+        );
+        // Ein zweiter Abruf für dieselbe Sitzung bekommt keinen Injektor mehr.
+        assert!(
+            factory
+                .child_session_observers(role_names::EXPLORER, &child)
+                .skill_injector
+                .is_none()
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5 (Review-Befund): auch die Steward-Sonderregistry
+    /// (`build_registry_from_capability_snapshot_for_parent` für
+    /// `agent-steward`) merkt einen Injektor für die gemeldete Sitzung vor,
+    /// geschnitten mit dem Eltern-Grant wie jedes andere Kind.
+    #[test]
+    fn agent_steward_child_gets_a_skill_injector_through_its_own_registry() -> TestResult {
+        let factory = factory_with_bundled_skills()?;
+        let parent = parent_grant(harw_registry_defaults::tool_index::catalog_tool_names());
+        let injector = admitted_skill_injector(&factory, role_names::AGENT_STEWARD, &parent)?
+            .ok_or(TestError::Missing("agent-steward child skill injector"))?;
+        for skill in ["sys-tools", "cargo-tools", "harw-dod"] {
+            assert_indexed(&injector, skill)?;
+            assert!(!injector.tools_admit(skill), "{skill}");
+        }
+        assert!(injector.tools_admit("planning"));
+
+        // Ohne Meldung merkt auch der Steward-Pfad nichts vor.
+        factory
+            .build_registry_from_capability_snapshot_for_parent(
+                role_names::AGENT_STEWARD,
+                &test_spawn_input(),
+                None,
+                &parent,
+            )
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert!(
+            factory
+                .take_child_skill_injector(role_names::AGENT_STEWARD, &harw_types::SessionId::new())
+                .is_none()
+        );
+        Ok(())
+    }
+
+    /// Eine Fabrik über dem Roster eines Home-Layers unter `dir/home`: die
+    /// mitgelieferten Agenten `bundled_agents` (Dateien aus `harw-home`)
+    /// und die Definitionen `extra` (`(Ordner, definition.toml)`) liegen
+    /// dort; der Skill-Katalog liest zusätzlich die Skills `skills`
+    /// (`(Name, skill.toml, triggers.toml)`) aus dem Layer `dir/skills`.
+    fn factory_with_home_agents(
+        dir: &std::path::Path,
+        bundled_agents: &[&str],
+        extra: &[(&str, &str)],
+        skills: &[(&str, &str, &str)],
+    ) -> TestResult<RuntimeChildRegistryFactory> {
+        let home = dir.join("home");
+        for agent in bundled_agents {
+            let prefix = format!("agents/{agent}/");
+            let mut found = false;
+            for file in harw_home::bundled_files() {
+                let Some(relative) = file.relative_path.strip_prefix(prefix.as_str()) else {
+                    continue;
+                };
+                let path = home.join("agents").join(agent).join(relative);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(ctx("bundled agent dir"))?;
+                }
+                std::fs::write(&path, file.contents).map_err(ctx("bundled agent file"))?;
+                found = true;
+            }
+            if !found {
+                return Err(TestError::Unexpected(format!(
+                    "bundled agent {agent} not found"
+                )));
+            }
+        }
+        for (name, definition) in extra {
+            let path = home.join("agents").join(name);
+            std::fs::create_dir_all(&path).map_err(ctx("agent dir"))?;
+            std::fs::write(path.join("definition.toml"), definition)
+                .map_err(ctx("agent definition"))?;
+        }
+        let layer = dir.join("skills");
+        for (name, manifest, triggers) in skills {
+            let path = layer.join("skills").join(name);
+            std::fs::create_dir_all(&path).map_err(ctx("skill dir"))?;
+            std::fs::write(path.join("skill.toml"), manifest).map_err(ctx("skill manifest"))?;
+            std::fs::write(
+                path.join("instructions.md"),
+                format!("# {name}\n\nFollow the {name} steps.\n"),
+            )
+            .map_err(ctx("skill body"))?;
+            std::fs::write(path.join("triggers.toml"), triggers).map_err(ctx("skill triggers"))?;
+        }
+        std::fs::create_dir_all(&home).map_err(ctx("home dir"))?;
+        let config = harw_config::discover_config(&[home]).map_err(ctx("Discovery"))?;
+        let agents = harw_registry_defaults::ConfigAgents::from_config(&config)
+            .map_err(ctx("Agenten senken"))?;
+        let builtin = builtin_agent_definitions(&HashMap::new()).map_err(ctx("Rollen"))?;
+        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &agents)
+            .map_err(ctx("Roster"))?;
+        RuntimeChildRegistryFactory::with_definitions(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+            roster.definitions().clone(),
+        )
+        .with_custom_agents(roster.custom_wiring())
+        .with_skill_catalog(&config, vec![layer])
+        .map_err(ctx("skill catalog"))
+    }
+
+    /// PL-100 WP 1.5 (Review-Befund, Runde 2): der mitgelieferte
+    /// `test-engineer` hält `cargo.test_one`, obwohl der Reducer seiner
+    /// Basisrolle (`analyst`) kein `ExecuteProcess` trägt. Sein Injektor
+    /// lässt `cargo-tools` zu, auch wenn der Elternteil `cargo.test_one`
+    /// nicht registriert (Wurzel ohne IR, eigener Orchestrator), und spielt
+    /// es beim ersten `cargo.test_one`-Aufruf ein, statt es als nicht
+    /// verfügbar zu melden. Sein fest gebundener Skill `verification` bleibt
+    /// vom Injektor ausgenommen.
+    #[test]
+    fn test_engineer_child_gets_cargo_tools_for_its_own_cargo_test_one() -> TestResult {
+        const ENGINEER: &str = "test-engineer";
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let factory = factory_with_home_agents(dir.path(), &[ENGINEER], &[], &[])?;
+        let base = factory.lookup_role(ENGINEER);
+        assert_eq!(base, role_names::ANALYST);
+        let reducer = harw_registry_defaults::authority_reducer_for_role(base)
+            .ok_or(TestError::Missing("reducer of the analyst base"))?;
+        let all = harw_authority::PermissionSet::from_policy(harw_authority::Permission::ALL);
+        assert!(
+            !reducer
+                .reduce(&all)
+                .contains(harw_authority::Permission::ExecuteProcess),
+            "the base reducer is not where the engineer gets its rights"
+        );
+
+        let served = served_tools(&factory, ENGINEER)?;
+        assert!(
+            served.iter().any(|tool| tool == "cargo.test_one"),
+            "{served:?}"
+        );
+        let parent = parent_grant(
+            served
+                .iter()
+                .filter(|tool| tool.as_str() != "cargo.test_one")
+                .cloned(),
+        );
+        let injector = admitted_skill_injector(&factory, ENGINEER, &parent)?
+            .ok_or(TestError::Missing("test-engineer child skill injector"))?;
+        assert_indexed(&injector, "cargo-tools")?;
+        assert!(injector.tools_admit("cargo-tools"));
+        assert!(injector.excludes("verification"));
+
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("go");
+        let _anchor = injector.prepare_round(&history, 0);
+        history.push_tool_call(
+            harw_types::ToolCallId::from_str("c1"),
+            "cargo.test_one",
+            serde_json::json!({ "test": "parses_route" }),
+        );
+        let round = injector.prepare_round(&history, 0);
+        assert!(
+            !round.unavailable.iter().any(|skill| skill == "cargo-tools"),
+            "{:?}",
+            round.unavailable
+        );
+        assert!(
+            round.delivered.iter().any(|delivered| {
+                delivered.skill == "cargo-tools"
+                    && delivered.kind == harw_catalog::TriggerKind::Tool
+            }),
+            "{:?}",
+            round.delivered
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5 (Review-Befund, Runde 2): ein Skill, der nur abstrakte
+    /// Fähigkeits-Labels nennt, erreicht ein Kind nur, wenn es die Rechte
+    /// dazu über ein aufrufbares Werkzeug hat. `filesystem.write` gilt
+    /// all-of: ein lesendes `explorer`-Kind bekommt `scribble`
+    /// (`filesystem.read` und `filesystem.write`) nicht, auch nicht über das
+    /// Lese-Label, und meldet den Treffer als nicht verfügbar; der
+    /// schreibende `test-engineer` bekommt ihn. `reader` (nur
+    /// `filesystem.read`) erreicht beide.
+    #[test]
+    fn abstract_write_labels_reach_only_children_that_can_write() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let factory = factory_with_home_agents(
+            dir.path(),
+            &["test-engineer"],
+            &[],
+            &[
+                (
+                    "scribble",
+                    "name = \"scribble\"\ndescription = \"Scribble notes into the workspace.\"\n\
+                     tools = [\"filesystem.read\", \"filesystem.write\"]\n",
+                    "[triggers]\nkeywords = [\"scribble notes\"]\npriority = 50\n",
+                ),
+                (
+                    "reader",
+                    "name = \"reader\"\ndescription = \"Read the notes.\"\n\
+                     tools = [\"filesystem.read\"]\n",
+                    "[triggers]\nkeywords = [\"read the notes\"]\npriority = 40\n",
+                ),
+            ],
+        )?;
+
+        let parent = wide_parent_grant(&factory, role_names::EXPLORER)?;
+        let explorer = admitted_skill_injector(&factory, role_names::EXPLORER, &parent)?
+            .ok_or(TestError::Missing("explorer child skill injector"))?;
+        assert_indexed(&explorer, "scribble")?;
+        assert_indexed(&explorer, "reader")?;
+        assert!(!explorer.tools_admit("scribble"));
+        assert!(explorer.tools_admit("reader"));
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("please scribble notes for me");
+        let round = explorer.prepare_round(&history, 0);
+        assert!(
+            !round
+                .delivered
+                .iter()
+                .any(|delivered| delivered.skill == "scribble"),
+            "{:?}",
+            round.delivered
+        );
+        assert!(
+            round.unavailable.iter().any(|skill| skill == "scribble"),
+            "{:?}",
+            round.unavailable
+        );
+
+        let parent = wide_parent_grant(&factory, "test-engineer")?;
+        let engineer = admitted_skill_injector(&factory, "test-engineer", &parent)?
+            .ok_or(TestError::Missing("test-engineer child skill injector"))?;
+        assert!(engineer.tools_admit("scribble"));
+        assert!(engineer.tools_admit("reader"));
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5 (Review-Befund, Runde 2): die Zuordnung der Labels als
+    /// reine Funktion — nur Labels mit Rechtebezug, die kein Werkzeugname
+    /// sind; aufrufbar über ein Werkzeug mit demselben Recht; Schreib- und
+    /// Ausführungsrechte all-of.
+    #[test]
+    fn child_capability_labels_map_labels_onto_callable_tools() {
+        let index = SkillIndex::build_with_bundle(
+            &[],
+            &[
+                (
+                    "skills/mixed/skill.toml",
+                    "name = \"mixed\"\ndescription = \"Mixed labels.\"\n\
+                     tools = [\"filesystem.read\", \"filesystem.write\", \"fs.read\", \
+                     \"process.execute\", \"security.advisory.correlate\"]\n",
+                ),
+                ("skills/mixed/instructions.md", "# Mixed\n\nBody.\n"),
+            ],
+        );
+        let tools: std::collections::BTreeSet<String> = ["fs.read", "fs.write", "shell.exec"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let labels = child_capability_labels(&index, &tools, &["fs.read".to_owned()]);
+        assert_eq!(
+            labels.known,
+            ["filesystem.read", "filesystem.write", "process.execute"]
+        );
+        assert_eq!(labels.callable, ["filesystem.read"]);
+        assert_eq!(labels.required, ["filesystem.write", "process.execute"]);
+        assert_eq!(
+            labels.backing,
+            backing(&[("filesystem.read", &["fs.read"])])
+        );
+
+        let writer = child_capability_labels(
+            &index,
+            &tools,
+            &[
+                "fs.write".to_owned(),
+                "shell.exec".to_owned(),
+                "cargo.test_one".to_owned(),
+            ],
+        );
+        assert_eq!(writer.callable, ["filesystem.write", "process.execute"]);
+        // Review-Befund: die Deckung nennt jedes aufrufbare Werkzeug mit dem
+        // Recht des Labels, damit der Kern das Label erst wegnimmt, wenn
+        // die Eltern-Aktivierung alle sperrt.
+        assert_eq!(
+            writer.backing,
+            backing(&[
+                ("filesystem.write", &["fs.write"]),
+                ("process.execute", &["cargo.test_one", "shell.exec"]),
+            ])
+        );
+
+        let none = child_capability_labels(&index, &tools, &[]);
+        assert!(none.callable.is_empty() && none.backing.is_empty());
+    }
+
+    /// Eine Label-Deckung aus `(Label, Werkzeuge)`.
+    fn backing(entries: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<String>> {
+        entries
+            .iter()
+            .map(|(label, tools)| {
+                (
+                    (*label).to_owned(),
+                    tools.iter().map(|tool| (*tool).to_owned()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// PL-100 WP 1.5 (Review-Befund, Runde 2): ein benutzerdefinierter
+    /// Agent über einer Rolle ohne Skill-Katalog (hier
+    /// `security-egress-triage`) bekommt wie seine Basis weder
+    /// `skills.search`/`skills.load` noch einen Skill-Injektor; Sensortext
+    /// kann ihm keinen Skill zuspielen. Gegenprobe: ein Agent über
+    /// `explorer` bekommt beides.
+    #[test]
+    fn a_custom_agent_over_an_excluded_role_gets_no_skill_catalog_or_injector() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let factory = factory_with_home_agents(
+            dir.path(),
+            &[],
+            &[
+                (
+                    "egress-helper",
+                    r#"schema = "harwness.agent/v1"
+id = "user.agent.egress-helper@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.security-egress-triage@1" }
+role = "worker"
+specialization = "egress-helper"
+"#,
+                ),
+                (
+                    "web-scout",
+                    r#"schema = "harwness.agent/v1"
+id = "user.agent.web-scout@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.explorer@1" }
+role = "worker"
+specialization = "web-scout"
+"#,
+                ),
+            ],
+            &[],
+        )?;
+        assert_eq!(
+            factory.lookup_role("egress-helper"),
+            role_names::SECURITY_EGRESS_TRIAGE
+        );
+        assert_eq!(factory.lookup_role("web-scout"), role_names::EXPLORER);
+        let parent = parent_grant(harw_registry_defaults::tool_index::catalog_tool_names());
+        let empty = ExtensionRegistry::builder().build();
+
+        assert!(factory.skill_catalog_index_for("egress-helper").is_none());
+        assert!(
+            factory
+                .child_skill_injector("egress-helper", &empty, &parent)
+                .is_none()
+        );
+        let catalog_tools = factory
+            .with_skill_catalog_tools(
+                "egress-helper",
+                harw_extension_api::ExtensionRegistryBuilder::default(),
+            )
+            .build();
+        assert!(registry_tool_names(&catalog_tools).is_empty());
+
+        assert!(factory.skill_catalog_index_for("web-scout").is_some());
+        assert!(
+            factory
+                .child_skill_injector("web-scout", &empty, &parent)
+                .is_some()
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5: ein benutzerdefinierter Agent über einer Rolle mit
+    /// Skill-Katalog (`web-scout` über `explorer`) bekommt seinen Injektor
+    /// auf demselben Weg wie eine eingebaute Rolle: die Admission (Meldung,
+    /// Registry-Bau mit Eltern-Grant) merkt ihn für genau diese Sitzung vor,
+    /// und `child_session_observers` übergibt ihn dem Kern.
+    #[test]
+    fn a_custom_agent_child_hands_over_its_skill_injector() -> TestResult {
+        const SCOUT: &str = "web-scout";
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let factory = factory_with_home_agents(
+            dir.path(),
+            &[],
+            &[(
+                SCOUT,
+                r#"schema = "harwness.agent/v1"
+id = "user.agent.web-scout@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.explorer@1" }
+role = "worker"
+specialization = "web-scout"
+"#,
+            )],
+            &[],
+        )?;
+        assert_eq!(factory.lookup_role(SCOUT), role_names::EXPLORER);
+        let parent = wide_parent_grant(&factory, SCOUT)?;
+        let child = harw_types::SessionId::new();
+        factory.announce_child_session(SCOUT, &child);
+        factory
+            .build_registry_from_capability_snapshot_for_parent(
+                SCOUT,
+                &test_spawn_input(),
+                None,
+                &parent,
+            )
+            .map_err(|error| TestError::Unexpected(format!("{SCOUT}: {}", error.message)))?;
+        let observers = factory.child_session_observers(SCOUT, &child);
+        assert!(
+            observers.skill_injector.is_some(),
+            "the custom agent child receives its injector"
+        );
+        Ok(())
+    }
+
+    /// Lässt ein `explorer`-Kind über den echten Admissionsweg zu: die
+    /// Laufzeit-Fabrik mit den mitgelieferten Skills als Rolle eines
+    /// [`ManagedAgentSpawner`], eine externe Wurzel (`root-orchestrator`,
+    /// lokale Wurzeldecke, Sandbox mit `ReadWorkspace`), deren Aktivierung
+    /// genau `disabled` sperrt, und das öffentliche
+    /// [`AgentSpawner::spawn_child`]. Liefert den Skill-Injektor, den die
+    /// Kind-Sitzung danach trägt.
+    async fn spawned_explorer_injector(
+        disabled: &[&str],
+    ) -> TestResult<Arc<harw_core::SkillInjector>> {
+        use harw_agent_dsl::roles::AgentRoleId;
+
+        let factory = Arc::new(factory_with_bundled_skills()?);
+        let organizational_role = factory
+            .executable_agent_ir(role_names::EXPLORER)
+            .map_or(AgentRoleId::Worker, ExecutableAgentIr::role);
+
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).map_err(ctx("workspace dir"))?;
+        let registry = harw_authority::WorkspaceRegistry::build(
+            dir.path(),
+            [harw_authority::WorkspaceRegistration {
+                tenant: harw_types::TenantId::from_str("t"),
+                workspace: harw_types::WorkspaceId::from_str("ws"),
+                root: workspace,
+            }],
+        )
+        .map_err(ctx("workspace registry"))?;
+        let binding = registry
+            .resolve(
+                &harw_types::TenantId::from_str("t"),
+                &harw_types::WorkspaceId::from_str("ws"),
+            )
+            .map_err(ctx("resolve"))?;
+        let sandbox = harw_authority::SandboxSpec::from_resolved(
+            binding,
+            harw_authority::PermissionSet::from_policy([harw_authority::Permission::ReadWorkspace]),
+        );
+
+        let mut root_activation = harw_core::SessionActivation::default();
+        for tool in disabled {
+            root_activation.disable_tool(harw_tools::ToolName::new(*tool));
+        }
+        let root = harw_types::SessionId::new();
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(harw_core::SessionManager::new(events)));
+        let spawner =
+            ManagedAgentSpawner::new(Arc::clone(&manager), harw_core::ChildLimits::conservative())
+                .with_role(
+                    role_names::EXPLORER,
+                    harw_types::AgentRole::Agent {
+                        name: role_names::EXPLORER.to_owned(),
+                    },
+                    organizational_role,
+                    factory,
+                )
+                .with_external_root_parent(
+                    root.clone(),
+                    harw_core::SpawnContext {
+                        sandbox: sandbox.clone(),
+                        suggestions: None,
+                        capability_snapshot: None,
+                        approval_actor: Some(harw_types::ApprovalActor::Operator {
+                            id: "skill-injector-handover-test".to_owned(),
+                        }),
+                        organizational_role: AgentRoleId::RootOrchestrator,
+                        allowed_child_orchestrators: Vec::new(),
+                        trace: None,
+                        ceiling: Some(crate::ceiling::root_ceiling(
+                            crate::spec::CeilingPolicy::LocalRoot,
+                        )),
+                    },
+                    None,
+                    root_activation,
+                )
+                .map_err(|error| TestError::Unexpected(error.message))?;
+        let input = SpawnInput {
+            parent_session_id: root,
+            handoff_call_id: harw_types::ToolCallId::new(),
+            instructions: None,
+            context: serde_json::Value::Null,
+            ceiling: None,
+        };
+        let child = AgentSpawner::spawn_child(&spawner, role_names::EXPLORER, input, sandbox, None)
+            .await
+            .map_err(|error| {
+                TestError::Unexpected(format!("explorer admission: {}", error.message))
+            })?;
+        let guard = manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = guard
+            .get(&child)
+            .map_err(ctx("the explorer child is manager-owned"))?;
+        let injector = session.skill_injector().cloned().ok_or(TestError::Missing(
+            "the admitted explorer child carries a skill injector",
+        ))?;
+        Ok(injector)
+    }
+
+    /// PL-100 WP 1.5 (Review-Befund): Ende-zu-Ende über den echten
+    /// Admissionsweg ([`spawned_explorer_injector`]) statt über die einzeln
+    /// gerufenen Fabrik-Methoden. Die Kind-Sitzung trägt den Injektor der
+    /// Fabrik, geschnitten mit der Kind-Aktivierung, die der Kern mit der
+    /// der Wurzel geschnitten hat:
+    /// - sperrt die Wurzel alle `fsread.*` des Kindes, ist `fsread-tools`
+    ///   nicht mehr wählbar; `git-read-tools` und `planning` (Label
+    ///   `filesystem.read`, weiter von `git.*` gedeckt) bleiben;
+    /// - sperrt sie jedes Werkzeug des Kindes mit `ReadWorkspace`, verliert
+    ///   auch das Label `filesystem.read` seine Deckung, und `planning`
+    ///   fällt weg, obwohl die Sandbox das Leserecht weiter trägt.
+    ///
+    /// Bricht die Verdrahtung (kein `ParentGrant` im Registry-Bau, eine
+    /// andere Reihenfolge von Meldung, Bau und Beobachtern, keine Übergabe
+    /// in `child_session_observers`), fehlt der Injektor oder bleibt
+    /// ungeschnitten.
+    #[tokio::test]
+    async fn an_admitted_explorer_child_carries_the_injector_cut_by_the_root_activation()
+    -> TestResult {
+        let served = served_tools(&factory_with_bundled_skills()?, role_names::EXPLORER)?;
+        let fsread: Vec<&str> = served
+            .iter()
+            .map(String::as_str)
+            .filter(|tool| tool.starts_with("fsread."))
+            .collect();
+        assert!(!fsread.is_empty(), "{served:?}");
+        assert!(
+            served.iter().any(|tool| tool.starts_with("git.")),
+            "{served:?}"
+        );
+
+        let injector = spawned_explorer_injector(&[]).await?;
+        for skill in ["fsread-tools", "git-read-tools", "planning"] {
+            assert_indexed(&injector, skill)?;
+            assert!(injector.tools_admit(skill), "uncut: {skill}");
+        }
+
+        let injector = spawned_explorer_injector(&fsread).await?;
+        assert!(
+            !injector.tools_admit("fsread-tools"),
+            "fsread.* is disabled by the root activation"
+        );
+        for skill in ["git-read-tools", "planning"] {
+            assert!(injector.tools_admit(skill), "{skill}");
+        }
+
+        let readers: Vec<&str> = served
+            .iter()
+            .map(String::as_str)
+            .filter(|tool| {
+                harw_registry_defaults::authority::tool_permission(tool)
+                    == Some(harw_authority::Permission::ReadWorkspace)
+            })
+            .collect();
+        let injector = spawned_explorer_injector(&readers).await?;
+        for skill in ["fsread-tools", "git-read-tools", "planning"] {
+            assert!(!injector.tools_admit(skill), "{skill}");
+        }
+        Ok(())
+    }
+
+    /// PL-100 O11 (Review-Befund): `intel-scout` und `context-steward` laufen
+    /// mit dem Profil `NoTools`, tragen im System-Prompt aber ihre eigene
+    /// Rollenbeschreibung statt „parameter-only triage agent"; eine
+    /// Triage-Rolle behält die des Profils.
+    #[tokio::test]
+    async fn o11_children_carry_their_own_role_description() -> TestResult {
+        use harw_extension_api::InstructionsProvider as _;
+
+        /// Der zusammengesetzte System-Prompt der Kind-Registry von `role`.
+        async fn system_prompt(
+            factory: &RuntimeChildRegistryFactory,
+            role: &str,
+        ) -> TestResult<String> {
+            let registry = factory
+                .build_registry(role, &test_spawn_input(), None)
+                .map_err(|error| TestError::Unexpected(format!("{role}: {}", error.message)))?;
+            let mut prompt = String::new();
+            for provider in registry.instructions_providers() {
+                prompt.push_str(&provider.load().await.system_prompt);
+            }
+            Ok(prompt)
+        }
+
+        let factory = factory_with_bundled_skills()?;
+        let triage = harw_registry_defaults::profile::RegistryProfile::NoTools.role_description();
+        for role in [role_names::INTEL_SCOUT, role_names::CONTEXT_STEWARD] {
+            let description = harw_registry_defaults::profile::role_description_for_role(role)
+                .ok_or(TestError::Missing("role description of an O11 role"))?;
+            let prompt = system_prompt(&factory, role).await?;
+            assert!(
+                prompt.contains(&format!("a {description} operating")),
+                "{role}: {prompt}"
+            );
+            assert!(!prompt.contains(triage), "{role}");
+        }
+        let prompt = system_prompt(&factory, role_names::SECURITY_EGRESS_TRIAGE).await?;
+        assert!(prompt.contains(&format!("a {triage} operating")));
+        Ok(())
+    }
+
+    /// PL-100 WP 1.5: die Werkzeugoberfläche einer Definition schneidet die
+    /// Registry wie `AgentSession::with_executable_agent_ir`: `forbidden`
+    /// gewinnt, sonst `admitted` oder die immer verfügbaren Katalog-Werkzeuge.
+    #[test]
+    fn surface_admits_follows_the_session_activation_rule() {
+        let admitted = vec!["fs.read".to_owned(), "web.fetch".to_owned()];
+        let forbidden = vec!["web.fetch".to_owned(), "skills.load".to_owned()];
+        assert!(surface_admits("fs.read", &admitted, &forbidden));
+        assert!(!surface_admits("web.fetch", &admitted, &forbidden));
+        assert!(!surface_admits("fs.write", &admitted, &forbidden));
+        assert!(surface_admits("skills.search", &admitted, &forbidden));
+        assert!(!surface_admits("skills.load", &admitted, &forbidden));
+        assert!(!surface_admits("sys.ps", &[], &[]));
     }
 
     /// PL-100 O8/G1 (Plan §7 „Root hat genau 3 Werkzeuge"): die

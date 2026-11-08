@@ -230,7 +230,7 @@ Er darf deshalb weder die Anzeige noch die Bestätigungseingabe stellen.
   `dod.related{dedup_key|cgroup_kid, hours}`, `dod.labels{dedup_key}`. Triage-Rollen erhalten über `dod_tools_for_role`
   `DOD_TRIAGE_ROLE_TOOLS` (= `DOD_READ_TOOLS` + `DOD_TRIAGE_TOOLS`, 6 Werkzeuge). **Root behält 3 Werkzeuge** (G1).
 - **1.3** Kontextprogramm `agents/context-programs/security-triage.toml`, gilt für die vier Rollen, Golden-IR wird aktualisiert.
-- **1.4** Skill `harw-dod`: neuer Abschnitt „Verdict zurückgeben" mit Contract und Beispiel. **1.5** SkillInjector für Child-Sessions (PL-97 offen).
+- **1.4** Skill `harw-dod`: neuer Abschnitt „Verdict zurückgeben" mit Contract und Beispiel. **1.5** SkillInjector für Child-Sessions (umgesetzt).
 - **1.6** Neue Regeln, `known_rule_id` und Kardinalitätsgrenze werden angepasst (`finding.rs:716-725`):
   - `listener_new`: persistenter Zustand je Cgroup/uid, Regel für den ersten Start, Bind-Adresse und Protokoll werden mit erfasst (`procnet.rs:136-142`);
   - `exec_writable_path`;

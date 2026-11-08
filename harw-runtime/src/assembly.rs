@@ -2479,7 +2479,7 @@ impl RuntimeAssemblyBuilder {
         // `shell.exec` (Klon desselben Shell-Providers), Kontrollwerkzeuge
         // für Orchestratoren. Andere Einstiege enden mit ihrem Prozess und
         // bekommen keine Jobs.
-        let (session_jobs, job_notifications) = if spec.entry == EntryKind::Tui {
+        let (session_jobs, job_notifications, job_wiring) = if spec.entry == EntryKind::Tui {
             // `[jobs] max_running` — Höchstzahl laufender Jobs dieser Sitzung.
             // PL-97 E3: `[jobs] cgroup_root`/`trampoline` erreichen den Befehls-Port.
             let port_options = crate::job_wiring::host_port_options(&config.harness.jobs);
@@ -2498,21 +2498,24 @@ impl RuntimeAssemblyBuilder {
                         &port_options,
                         harw_registry_defaults::ALWAYS_ASK_TOOLS,
                     );
-                    (Some(jobs), Some(receiver))
+                    // PL-100 (Owner-Befund 4505015316): dieselbe bestätigte
+                    // Wurzel gehört zum eigenen Umfang von `sys.ps`/
+                    // `sys.pgrep`/`sys.top` (`JobWiring`).
+                    let job_wiring = job_wiring_for_sys_scope(jobs.wiring(), &port_options);
+                    (Some(jobs), Some(receiver), Some(job_wiring))
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "runtime.jobs.open_failed");
-                    (None, None)
+                    (None, None, None)
                 }
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
-        let host_permit_wiring = host_permit_wiring.with_jobs(
-            session_jobs
-                .as_ref()
-                .map(crate::job_wiring::SessionJobs::wiring),
-        );
+        // Plan R9, Teil F, und PL-100 (Owner-Befund 4505015316): die
+        // Job-Verdrahtung samt bestätigter Job-Wurzel reist mit der
+        // Host-Permit-Verdrahtung zu Wurzel und Kind-Fabriken.
+        let host_permit_wiring = host_permit_wiring.with_jobs(job_wiring);
         let host_root_label: Option<String> = if uia_ir.is_some() {
             Some(crate::host_escalation_wiring::UIA_ROOT_LABEL.to_owned())
         } else {
@@ -3844,6 +3847,50 @@ fn open_job_freezer(
     }
 }
 
+/// PL-100 (Owner-Befund 4505015316): die bestätigte delegierte
+/// cgroup-Wurzel der Job-cgroups für den eigenen Umfang der auflistenden
+/// `sys.*`-Werkzeuge (`harw_registry_defaults::JobWiring::with_delegated_cgroup_root`).
+///
+/// # Beschreibung
+/// Dieselbe Wurzel wie für den Befehls-Port und den Freezer
+/// ([`harw_command::HostPortOptions::delegated_cgroup_root`]: `[jobs]
+/// cgroup_root` → `HARW_CGROUP_ROOT` → eigene delegierte cgroup, nur vom
+/// Host-Probe bestätigte delegierte cgroup-v2-Wurzeln). Loggt nichts (der
+/// Port hat das Ergebnis schon gemeldet).
+///
+/// # Rückgabe
+/// `None`, wenn keine Wurzel bestätigt ist.
+///
+/// # Nebenläufigkeit
+/// Kurzer, synchroner Zugriff auf Umgebung, `/proc/self/cgroup` und das
+/// cgroup-Dateisystem; einmal je Montage.
+#[cfg(target_os = "linux")]
+fn delegated_job_root_of(port: &harw_command::HostPortOptions) -> Option<PathBuf> {
+    port.delegated_cgroup_root()
+}
+
+/// Ohne Linux gibt es keine delegierte cgroup-Wurzel: immer `None`.
+#[cfg(not(target_os = "linux"))]
+fn delegated_job_root_of(_port: &harw_command::HostPortOptions) -> Option<PathBuf> {
+    None
+}
+
+/// PL-100 (Owner-Befund 4505015316): die Job-Verdrahtung der Sitzung samt
+/// der vom Befehls-Port bestätigten Job-Wurzel ([`delegated_job_root_of`]),
+/// wie sie über die Host-Permit-Verdrahtung zu Wurzel und Kind-Fabriken
+/// reist; das Profil `Full` nimmt die Wurzel in den eigenen Umfang von
+/// `sys.ps`, `sys.pgrep` und `sys.top` auf.
+///
+/// # Rückgabe
+/// `wiring` mit gesetzter Wurzel, oder ohne Wurzel, wenn keine bestätigt ist
+/// (fail-closed: eine unbestätigte Wurzel erreicht den `sys.*`-Umfang nie).
+fn job_wiring_for_sys_scope(
+    wiring: harw_registry_defaults::JobWiring,
+    port: &harw_command::HostPortOptions,
+) -> harw_registry_defaults::JobWiring {
+    wiring.with_delegated_cgroup_root(delegated_job_root_of(port))
+}
+
 /// Ohne Linux gibt es keinen cgroup-Freezer: nach der Nachfrage-Prüfung
 /// immer [`JobFreezerSetup::NoDelegatedRoot`].
 ///
@@ -3993,6 +4040,84 @@ mod job_freezer_tests {
             install_job_freezer(&manager, &options, GATED),
             JobFreezerSetup::Installed
         );
+        Ok(())
+    }
+}
+
+// PL-100 (Owner-Befund 4505015316): die Job-Wurzel für den eigenen Umfang
+// der `sys.*`-Prozesswerkzeuge.
+#[cfg(test)]
+mod sys_scope_job_root_tests {
+    use super::{delegated_job_root_of, job_wiring_for_sys_scope};
+    use crate::test_support::TestResult;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// Befehls-Port-Optionen mit `[jobs] cgroup_root = root`.
+    fn port(root: impl Into<PathBuf>) -> harw_command::HostPortOptions {
+        harw_command::HostPortOptions {
+            cgroup_root: Some(root.into()),
+            trampoline: None,
+        }
+    }
+
+    /// Die Job-Verdrahtung einer Sitzung unter `dir`, noch ohne Wurzel.
+    fn wiring(dir: &std::path::Path) -> TestResult<harw_registry_defaults::JobWiring> {
+        let manager = harw_tool_job::JobManager::new(
+            harw_tool_job::JobManagerConfig::new(dir),
+            Arc::new(harw_tool_job::NoopNotifier),
+        )?;
+        Ok(harw_registry_defaults::JobWiring::new(
+            manager,
+            Arc::new(harw_tool_job::NoLineage),
+        ))
+    }
+
+    /// Eine abgelehnte (relative), fehlende oder nicht delegierte Wurzel
+    /// erreicht den `sys.*`-Umfang nie: an die `JobWiring`, die zu Wurzel
+    /// und Kind-Fabriken reist, wird keine Wurzel gehängt (fail-closed).
+    #[test]
+    fn unconfirmed_cgroup_roots_never_reach_the_sys_scope() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        for root in [
+            "relative/harw.slice",
+            "/tmp/harw-not-a-cgroup",
+            "/sys/fs/cgroup/harw-pl100-does-not-exist.slice",
+        ] {
+            assert_eq!(delegated_job_root_of(&port(root)), None, "{root}");
+            let attached = job_wiring_for_sys_scope(wiring(dir.path())?, &port(root));
+            assert_eq!(attached.delegated_cgroup_root, None, "{root}");
+        }
+        Ok(())
+    }
+
+    /// Review-Befund (Owner-Befund 4505015316): eine vom Host-Probe
+    /// bestätigte Wurzel landet genau so in der `JobWiring`, wie der
+    /// Befehls-Port sie für die Job-cgroups benutzt.
+    ///
+    /// Host-gated: `HARW_TEST_CGROUP_ROOT` muss eine delegierte
+    /// cgroup-v2-Wurzel nennen; mit `--ignored` ausführen. Fehlt sie oder
+    /// ist sie nicht delegiert, scheitert der Test, statt still zu bestehen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a delegated cgroup v2 root in HARW_TEST_CGROUP_ROOT"]
+    fn a_confirmed_cgroup_root_reaches_the_job_wiring() -> TestResult {
+        let root = std::env::var_os("HARW_TEST_CGROUP_ROOT")
+            .map(PathBuf::from)
+            .ok_or(crate::test_support::TestError::Missing(
+                "HARW_TEST_CGROUP_ROOT",
+            ))?;
+        let options = port(root.clone());
+        let confirmed =
+            options
+                .delegated_cgroup_root()
+                .ok_or(crate::test_support::TestError::Missing(
+                    "HARW_TEST_CGROUP_ROOT as a delegated cgroup v2 root",
+                ))?;
+        assert_eq!(confirmed, root);
+        let dir = tempfile::tempdir()?;
+        let attached = job_wiring_for_sys_scope(wiring(dir.path())?, &options);
+        assert_eq!(attached.delegated_cgroup_root, Some(root));
         Ok(())
     }
 }
