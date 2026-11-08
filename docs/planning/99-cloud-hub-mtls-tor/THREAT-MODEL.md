@@ -12,7 +12,7 @@
 | Pairing-Secret | Hub-State (nur Digest) | Vertraulichkeit, Einmaligkeit, kurze TTL |
 | Onion-Identitätsschlüssel | `<profile>/tor/state` (0700) | Vertraulichkeit; daran hängt die stabile Adresse |
 | Restricted-Discovery-Client-Keys | Gerät und Hub | Vertraulichkeit; nur gepairte Geräte finden den Dienst |
-| Session-Frames | Kanal | Vertraulichkeit und Integrität Ende-zu-Ende Gerät ↔ Knoten |
+| Session-Frames (`harw.session.v1`) | innere PQ-TLS-Verbindung Gerät ↔ Zielknoten | Vertraulichkeit und Integrität **Ende-zu-Ende**, auch gegenüber dem Hub. Ohne die innere Verbindung (T5, Schritt 4) gäbe es diesen Schutz nicht: Die Frames sind heute JSON (`harw-session-ws/src/codec.rs:219-227`, `harw-protocol/src/session_wire.rs:494-501`) und nur durch den jeweiligen Kanal geschützt |
 | Verzeichnis `SessionId → (node, generation)` | Hub | Integrität; Fencing gegen doppelte Owner |
 | Metadaten (wer spricht mit wem, wann) | Netz | Vertraulichkeit, soweit Tor genutzt wird |
 
@@ -22,7 +22,8 @@
 - **A2 – aktiver Netzangreifer / MITM:** schiebt sich zwischen Gerät und Knoten.
 - **A3 – fremder Internet-Client:** kennt eine Adresse (IP oder Onion), kennt aber keinen Schlüssel.
 - **A4 – kompromittiertes Gerät:** besitzt einen gültigen, gepairten Schlüssel.
-- **A5 – kompromittierter Hub:** Prozess oder Host des Cloud Hubs.
+- **A5 – kompromittierter Hub:** Prozess oder Host des Cloud Hubs. Er kontrolliert die äußeren Verbindungen,
+  das Relay, das Verzeichnis und die Routenvergabe, aber keine Geräte- oder Knotenschlüssel.
 - **A6 – bösartiger Tor-Relay:** Guard, Middle, HSDir, Exit.
 - **A7 – Agent/Prompt-Injection:** versucht über Werkzeuge Netz-Rechte auszuweiten.
 - **A8 – Lieferkette:** kompromittierte Abhängigkeit (arti-Baum).
@@ -46,7 +47,10 @@
 | B13 | Stiller Fallback von Tor auf direkt | A1 | — | `PolicyDialer` fail-closed, kein Fallback (T2/T3) |
 | B14 | Pairing-Secret erraten oder erneut abspielen | A3 | — | 128 Bit, nur Digest, TTL, Rate-Limit, Burn, Bindung an das Transkript, Freigabe durch den Operator (T4) |
 | B15 | Gerät setzt sein Tier selbst | A4 | **geschützt** (Tier aus dem Register) | beibehalten; Pairing setzt das Tier hostseitig (T4) |
-| B16 | Kompromittierter Hub erweitert Rechte | A5 | — | Der Knoten autorisiert erneut, Hub-Attestation mit `exp`, Rechte nur Schnittmenge; der Hub hält keine Knotenschlüssel (T5) |
+| B16 | Kompromittierter Hub erweitert Rechte | A5 | — | Der Knoten authentisiert das Gerät selbst (eigener Pin) und autorisiert selbst; die Hub-Prüfung ist nur ein Vorfilter (T5) |
+| B22 | Kompromittierter Hub liest oder verändert Session-Frames | A5 | — (bei terminierendem Hub wäre das möglich) | Hub ist reines Relay; innere PQ-TLS + ML-DSA Ende-zu-Ende Gerät ↔ Knoten über die Route, AEAD-Integrität, Transkript gebunden an `(route_id, session_id, placement_generation)` (T5) |
+| B23 | Hub vertauscht Routen, spielt alte Routen oder Generationen erneut ab, verwirft Frames | A5 | — | innerer Handshake bindet Route, Session und Generation; der Knoten prüft die Generation selbst; Replay-Cache und Zeitfenster innen. Verwerfen und Verzögern bleibt möglich (Verfügbarkeit, Restrisiko) |
+| B24 | Hub schiebt eigene Schlüssel als Gerät oder Knoten unter | A5 | — | Pins nur aus Pairing mit Operator-Bestätigung bzw. Operator-Signatur (`PinEndorsement`); Hub darf nur vorschlagen (T4/T5) |
 | B17 | Hub routet an den falschen Owner | A5/Bug | — | `placement_generation` als Fencing-Token, kein Failover in v1 (T5) |
 | B18 | Agent erweitert Netz-Scope über Tor | A7 | — | `[network].tor` nur verengend, Child ⊆ Elternteil, `require_anonymity` je Rolle, Allowlist bleibt (T6) |
 | B19 | Tailnet-Pfad umgeht die Knoten-Identität | A4 (Tailnet) | **offen** (`harw-tailscale`) | Tailnet nur als Underlay unter node-transport, oder Login → Principal mit eigenem Tier (T7) |
@@ -61,6 +65,9 @@
 - arti hat kein Circuit-Padding, und hs-PoW ist experimentell.
 - Ein globaler passiver Angreifer kann Zeitkorrelationen bilden.
 - Die Hub-Verfügbarkeit ist ein Single Point of Failure, solange es in v1 kein Failover gibt.
+- Ein kompromittierter Hub kann Routen verweigern, verzögern oder Verkehr verwerfen, und er sieht Metadaten:
+  welches Gerät wann mit welcher Session spricht, Frame-Größen und Zeiten. Inhalte sieht er nicht und kann sie
+  nicht verändern.
 - Ein kompromittiertes, gepairtes Gerät bleibt bis zum Widerruf im Rahmen seines Tiers handlungsfähig.
 
 ## 5. Prüfbare Invarianten (Tests)
@@ -69,5 +76,8 @@
 2. Bei `require_anonymity` scheitert jeder Dial ohne Tor, bei der Konstruktion und bei jedem Aufruf.
 3. `.onion` erreicht nie einen DNS-Resolver.
 4. Ein entpinnter Peer verliert Live-Verbindungen innerhalb der Poll- bzw. Reload-Frist.
-5. Der Knoten lehnt eine Hub-Weiterleitung ohne gültige, nicht abgelaufene Attestation ab.
-6. Kein Netz-Scope eines Kindes ist breiter als der seines Elternteils, auch nicht mit `[network].tor`.
+5. Ein bösartiges Test-Relay (mitlesen, Bytes kippen, Routen vertauschen, alte Generation wiederholen) sieht nie
+   einen Session-Frame im Klartext, und jede Manipulation lässt die innere Verbindung scheitern oder führt zur
+   Ablehnung durch den Knoten.
+6. Ein vom Hub vorgeschlagener Pin wird ohne Operator-Bestätigung bzw. -Signatur nie übernommen.
+7. Kein Netz-Scope eines Kindes ist breiter als der seines Elternteils, auch nicht mit `[network].tor`.

@@ -153,17 +153,25 @@ Aus `local-own-cloud-websocket.md` §11, PL-65 §4 / DEC-018, `harw-node-transpo
 Gerät (TUI/CLI/Mobile/SDK)
   └─ NodeDialer { Tcp | Host | Onion | Duplex }  ── isoliert je (Gerät × Ziel)
         ▼   PQ-TLS 1.3 (X25519MLKEM768) + ML-DSA-65-Handshake v2 (Client zuerst) — unverändert innen
-Cloud Hub  (Profil CloudHub: Verzeichnis · Routing · Policy · Pairing · Widerruf; keine Ausführung)
+Cloud Hub  (Profil CloudHub: Verzeichnis · Routing · Policy · Widerruf; keine Ausführung)
   Ingress: TCP (privat/tailnet) und/oder Onion (arti in-process, Restricted Discovery, optional PoW)
-  ├─ NodeChannel (Vec<u8>-Frames) ⇄ Uplinks der Knoten
+  ├─ Relay: opake Vec<u8>-Frames je Route zwischen Gerät und Uplink des Zielknotens
   └─ Verzeichnis: SessionId → (node_id, placement_generation)
 Knoten (SessionHost/Worker): wählt sich AUSGEHEND zum Hub (TCP oder Onion) → kein offener Port beim Knoten
+
+Innen, Ende-zu-Ende Gerät ↔ Zielknoten, durch den Hub hindurch:
+  PQ-TLS 1.3 + ML-DSA-65-Handshake v2 (dieselbe harw-node-transport-Logik), Transkript zusätzlich gebunden an
+  (route_id, session_id, placement_generation) → harw.session.v1-Frames sind für den Hub unlesbar und unveränderbar
 Agenten-Egress: harw-egress → TorConnector (Isolation je Agent-Lauf × Ziel), require_anonymity fail-closed
 ```
 
-Der Hub ist ein normaler Knoten mit Verzeichnisrolle. Er leitet Session-Frames weiter, autorisiert vorher und
-gibt eine signierte Attestation des Endgeräts mit. Der Knoten autorisiert jeden Zugriff **noch einmal**, der Hub
-verstärkt keine Rechte.
+Der Hub ist ein normaler Knoten mit Verzeichnisrolle und **kein Daten-Endpunkt**. Er authentisiert die äußeren
+Verbindungen, autorisiert eine *Route* (Gerät × Session × Tier) und leitet danach nur noch opake Bytes weiter.
+Gerät und Zielknoten bauen über diese Route ihre eigene, innere PQ-TLS + ML-DSA-Verbindung auf. Dadurch kann
+selbst ein kompromittierter Hub die `harw.session.v1`-Frames weder lesen noch verändern, er kann sie nur
+verwerfen oder verzögern (Verfügbarkeit, siehe Bedrohungsmodell B22/B23). Der Knoten authentisiert das Gerät
+**selbst** über dessen eigenen Pin und autorisiert jeden Zugriff selbst. Die Hub-Autorisierung ist nur eine
+Vorfilterung und verstärkt keine Rechte.
 
 ---
 
@@ -315,12 +323,29 @@ Port von `comnet-transport`, Feature `arti`, nur in Ring A.
     jetzt über den Uplink, das schließt die netsec-Lücke „no heartbeats“.
 - **Verzeichnis:** `SessionId → (node_id, placement_generation)` dauerhaft im Hub-State. Die Generation ist das
   Fencing-Token. In v1 gibt es kein Failover und keine Live-Migration.
-- **Routing:**
-  1. Ein Gerät verbindet sich mit dem Hub.
-  2. Der Hub autorisiert (Gerät × Session × Tier).
-  3. Er leitet die `harw.session.v1`-Frames als `Vec<u8>` über den Uplink weiter und legt eine signierte
-     Hub-Attestation `(device, tenant, tier, session, exp)` bei.
-  4. Der Knoten prüft die Attestation und autorisiert erneut (Entscheidung D2).
+- **Routing als opakes Relay (Hub ist kein Daten-Endpunkt):**
+  1. Ein Gerät verbindet sich mit dem Hub (äußere node-transport-Verbindung, Gerät ↔ Hub authentisiert).
+  2. Es fordert eine Route an: `RouteRequest{session_id}`. Der Hub prüft (Gerät × Session × Tier) gegen
+     Verzeichnis und Policy, vergibt eine zufällige `route_id` und meldet dem Zielknoten über dessen Uplink
+     `RouteOpen{route_id, device_id, session_id, placement_generation}`.
+  3. Ab jetzt leitet der Hub **nur noch opake `Vec<u8>`-Frames** je `route_id` zwischen dem Gerät und dem Uplink
+     weiter (Multiplexing im `NodeChannel`, Fenster und Größenlimit je Route). Er parst keine Session-Frames.
+  4. **Innere Ende-zu-Ende-Verbindung:** Über diese Route führen Gerät und Zielknoten den vollständigen
+     node-transport-Aufbau aus, also TLS 1.3 mit `X25519MLKEM768` und den ML-DSA-65-Handshake v2. Die Relay-Route
+     ist dafür nur ein weiterer `BoxConn` (T1). Das innere Transkript bindet zusätzlich
+     `(route_id, session_id, placement_generation)` als Kontextfeld (neues Feld im Handshake v2, Domain
+     `harw-node-transport/handshake/v2-routed`). Danach läuft `harw.session.v1` innerhalb dieser inneren TLS-Sitzung.
+  5. Der Knoten authentisiert das Gerät über **seinen eigenen** Pin des Geräteschlüssels, nicht über den Hub.
+     Er prüft, dass `session_id`/`placement_generation` aus `RouteOpen` mit dem inneren Transkript übereinstimmen
+     und bei ihm selbst aktuell sind (Fencing). Danach autorisiert er wie heute über `node-devices.conf`.
+  6. **Schlüsselverteilung ohne Hub-Vertrauen:** Gerätepins auf dem Knoten entstehen nur durch ein vom
+     Operator bestätigtes Pairing (T4), und Knotenpins auf dem Gerät nur aus dem Pairing-String. Der Hub darf
+     Pins höchstens *vorschlagen*. Übernommen werden sie nur mit einer Operator-Signatur (Operator-Schlüssel im
+     AuthHub, Zweck `PinEndorsement`) oder nach lokaler Bestätigung. So kann ein kompromittierter Hub keinen
+     eigenen Schlüssel als Gerät oder Knoten unterschieben.
+  7. Ein **vertrauenswürdiger Hub-Endpunkt** (Hub terminiert die Session) ist ausdrücklich **nicht** vorgesehen.
+     Falls er später für Komfortfunktionen gebraucht wird, nur als eigener, markierter Modus mit eigenem
+     Bedrohungsmodell (Entscheidung D2).
 - `harw-cloud-gateway` ersetzt den 501-Platzhalter durch diesen Router. Gebaut wird er auf node-transport bzw. hyper;
   Pingora nur an der Browser-Kante, nie zwischen Knoten (PL-89).
 - Ein Reconnect-Supervisor nutzt `BackoffPolicy` und `ResumeCursors` (`harw-session-remote/src/reconnect.rs`).
@@ -353,7 +378,7 @@ Port von `comnet-transport`, Feature `arti`, nur in Ring A.
 | ID | Frage | Empfehlung |
 |---|---|---|
 | D1 | Handshake v2: mit Übergangsfenster (v1 abschaltbar) oder sofort strikt? | Übergangsfenster, v1 standardmäßig aus |
-| D2 | Leitet der Hub Frames nur weiter oder terminiert er Sessions? | weiterleiten + erneute Autorisierung am Knoten |
+| D2 | Ist der Hub ein reines Relay oder darf er Sessions terminieren? | reines Relay mit innerer Ende-zu-Ende-Verbindung Gerät ↔ Knoten; kein terminierender Modus in v1 |
 | D3 | Onion- und TCP-Ingress gleichzeitig oder `require_anonymity` je Listener? | je Listener konfigurierbar |
 | D4 | Exit-Verkehr für Agenten (`tor = "all"`) oder nur Onion-Ziele? | zuerst `onion_only`, `all` nur per Rolle |
 | D5 | Arti-Versionspflege | exakter Pin, monatlicher Bump als eigener PR |
@@ -379,6 +404,9 @@ Port von `comnet-transport`, Feature `arti`, nur in Ring A.
   - `PolicyDialer` fail-closed (Mock-Dialer);
   - Pairing-Zustandsautomat;
   - Hub-Routing mit zwei Knoten;
+  - **bösartiger Hub (Test-Relay, das Bytes kippt, mitliest, Routen vertauscht oder alte Generationen
+    wiederholt):** Die innere Verbindung scheitert bzw. der Knoten lehnt ab. Kein Session-Frame erreicht den
+    Hub im Klartext (Assertion auf den vom Relay gesehenen Bytes);
   - Egress: `.onion` wird nie per DNS aufgelöst (Resolver-Spy).
 - **Gates:** `cargo fmt --check`, `cargo clippy -D warnings`, `cargo deny check`, Arch-Gate,
   `cargo tree -i ring --features arti`.
