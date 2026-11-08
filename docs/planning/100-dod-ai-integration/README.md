@@ -56,7 +56,8 @@ Details und Belege stehen in [INVENTORY.md](INVENTORY.md).
 
 - **I1 – Modelle beraten, ein Mensch autorisiert außerhalb von harw, der Escalator signiert, der Warden handelt und prüft erneut.**
   - `triage_record` deckelt ein `Confirmed` vom Modell auf `NeedsReview`.
-  - `triage_record_operator` steht hinter einem Cargo-Feature, das nur `harw-escalator` aktivieren darf (xtask-Gate).
+  - `OperatorDecision`/`triage_record_operator` (an den Record-Digest gebunden) gibt es bis WP 3.2 nur in Tests; das Feature
+    `operator-decision` kehrt mit `harw-escalator` zurück und darf nur dort aktiviert werden (xtask-Gate `operator-decision`).
 - **I2 – Ziele nur aus verifizierten Records.** `SuggestedResponse` hat kein Ziel. Die Cgroup kommt aus dem Spool-Record, den der Escalator selbst prüft:
   Owner, Modus, Digest und beim Signieren erneut die Kernel-ID.
 - **I3 – Verdicts annotieren, sie entscheiden nie.** Jeder High-Befund erzeugt immer einen deterministischen Hinweis. Unterdrücken dürfen nur
@@ -211,7 +212,7 @@ Er darf deshalb weder die Anzeige noch die Bestätigungseingabe stellen.
 | 0.8 | Crate `harw-untrusted-text` (Ring A): ein Escaper für Cc/Cf/Zl/Zp/Co/Cn, Tag-Block U+E0000–E007F, Bidi und Variation Selectors; ersetzt vier Sanitizer | `export.rs:149`, `harw-dod-client/src/fsio.rs:84`, `harw-ops/src/dod.rs:388`, `harw-core/src/context_budget.rs:1382` | Injection-Korpus |
 | 0.9 | `scope_obfuscated` statt Verwerfen; `cgroup_kid` + Pfad + `first_seen` (Kernel-IDs werden wiederverwendet) | `harw-sentinel/src/export.rs:188-193` | Zero-Width → obfuscated |
 | 0.10 | Hardness = `min(rule, event)` | `harw-dod-rules/src/rules/structure_drift.rs:57-63` | — |
-| 0.11 | Typestate: Clamp in `triage_record`, `triage_record_operator` hinter Feature `operator-decision`, `triage()` nur für Tests; `security_signals` nutzt den Client-Parser | `harw-dod-rules/src/finding.rs:1135-1163`, `harw-runtime/src/security_signals.rs:73` | Modell-`Confirmed` → nie eine Ladder-Stufe |
+| 0.11 | Typestate: Clamp in `triage_record`; `OperatorDecision`/`triage_record_operator` nur in Tests; Feature + Gate kommen mit dem Escalator (WP 3.2), Entscheidung an den Record-Digest gebunden; `triage()` nur für Tests, `test-support` nur aus Dev-Abhängigkeiten; `security_signals` nutzt den Client-Parser | `harw-dod-rules/src/finding.rs:1227-1258` (Clamp), `harw-dod-rules/src/finding.rs:1470-1493` (Operator-Pfad, nur Tests), `harw-runtime/src/security_signals.rs:73` | Modell-`Confirmed` → nie eine Ladder-Stufe; Operator-Entscheidung mit fremdem Record-Digest → abgelehnt; `compile_fail`-Doctests: Operator-Pfad außerhalb von `cfg(test)` nicht linkbar; xtask-Gate `operator-decision` (prüft auch nicht gelistete `path`-Pakete, Gegenprobe gegen `Cargo.lock`): Feature ohne `harw-escalator` deklariert oder von einer anderen Crate angefordert (auch umbenannt, per `workspace = true` geerbt oder über `[features]` weitergeleitet) → rot; Escalator reicht es über eigene `[features]` weiter oder eine andere Crate hängt von ihm ab → rot; `harw-dod-rules` deklariert ein Feature außer `default`/`test-support` → rot; `test-support` außerhalb von `[dev-dependencies]` angefordert oder von einem anderen Feature eingeschaltet → rot |
 | 0.12 | Spool + Export v3: Slice ≤64 KiB, Writer-Thread, Retention abgeglichen mit `harw-retention` (`dod_spool`, `sentinel_export`); Reader-first für client, security_signals, security-hub, Uplink | `harw-dod-sentinel/src/spool.rs`, `harw-retention/src/classes.rs:133-147` | Record ≤64 KiB bei vollem Ring |
 | 0.13 | Health mit Fenstern (Drop/Overflow je Fenster) | `health.json` | — |
 | 0.14 | **Zähler → Raten:** zustandsbehaftete Delta-Stufe vor den Regeln | `harw-sentinel` (neu), `harw-dod-cpu/src/lib.rs:49-56` | Rate korrekt bei einem Zählerüberlauf |
@@ -303,6 +304,15 @@ Voraussetzung ist PL-96 W01. 3.0 und 3.5 können sofort starten.
   - Grenze für aktive Freezes (Vorgabe 3, in `/etc`);
   - Kernel-ID beim Signieren erneut prüfen;
   - persistierte `OperatorDecision`, eigenes Ledger, neues xtask-Gate.
+  - **Operator-Feature kehrt in derselben Änderung zurück:** `harw-dod-rules` deklariert `operator-decision` wieder, und nur `harw-escalator`
+    schaltet es ein. `OperatorDecision` ist an den Record-Digest und an den Freigabebeleg (Approver, polkit) gebunden. Das xtask-Gate
+    `operator-decision` wertet die Paketidentität aus (Umbenennung, `workspace = true`, `[features]`-Weiterleitung), nicht den Tabellenschlüssel.
+    Der Escalator fordert das Feature nur im Abhängigkeitseintrag auf `harw-dod-rules` an, nie über eigene `[features]`, und keine andere Crate
+    hängt von `harw-escalator` ab (beides Gate-Regeln).
+    Weil Cargo Features je Build vereinheitlicht, verhindert das Gate nur das Anfordern, nicht das Mitbenutzen im gemeinsamen Build;
+    die Bestätigung braucht deshalb zusätzlich eine nicht fälschbare, Escalator-eigene Berechtigung.
+    Die Gate-Regel für `test-support` (nur aus Dev-Abhängigkeiten, auch für den Escalator) bleibt bestehen. Release-Artefakte entstehen weiterhin je
+    Paket mit `-p` und ohne `--all-features` (`.github/workflows/release.yml:101-108`); sonst wären `test-support` bzw. `operator-decision` im Artefakt.
 - **3.3 Freigabe gemäß §3.1:**
   - `harw-dod-approve` für Weg A;
   - `RequestApproval` und `CheckAuthorization` mit Proposal-Details im Escalator für Weg B;
@@ -398,7 +408,8 @@ Siehe auch die prüfbaren Invarianten in [THREAT-MODEL.md](THREAT-MODEL.md).
   - Spool-Record ≤64 KiB, `SpoolFull` erscheint als degraded;
   - Zero-Width → `scope_obfuscated`;
   - Host-Verifikation von Landlock und `health.json`.
-- **Typestate:** Ein Modell-`Confirmed` ergibt nie eine Ladder-Stufe. Das Feature `operator-decision` lässt sich außerhalb des Escalators nicht linken (xtask).
+- **Typestate:** Ein Modell-`Confirmed` ergibt nie eine Ladder-Stufe. Der Operator-Pfad ist außerhalb von `cfg(test)` nicht linkbar (`compile_fail`-Doctests); ab WP 3.2 darf nur der Escalator das
+  Feature `operator-decision` anfordern (xtask-Gate, Paketidentität).
 - **Dispatch:**
   - `binds()` mit exportiertem Digest;
   - Root hat genau 3 Werkzeuge;

@@ -35,8 +35,8 @@
 //! `Finding<Triaged>` — die Berechtigung *ist*
 //! [`Action::authorize`] verlangt ein `&Finding<Triaged>`. Diesen Typ kann
 //! ausschließlich `harw-dod-rules` herstellen: `Finding::raw` und
-//! `Finding::check` sind dort `pub(crate)`, und `harw_dod_rules::triage`
-//! konsumiert ausschließlich ein bereits zertifiziertes `Finding<RuleChecked>`
+//! `Finding::check` sind dort `pub(crate)`, und `harw_dod_rules::triage_record`
+//! baut es ausschließlich aus einem selbst geprüften `FindingRecord`
 //! (siehe `harw-dod-rules/src/finding.rs`-Moduldoku, Abschnitt „Der Besitz
 //! des Wertes ist die Berechtigung"). Wer hier ein `Finding<Triaged>`
 //! vorweisen kann, hat also zwangsläufig zuerst ein `Finding<RuleChecked>`

@@ -34,7 +34,7 @@
 | B2 | Befund-Flut blendet Menschen und KI | A1 | **offen** | Delta, Event-Zeit, Scope, Throttle, Flood-Test als Tor (0.1–0.4) |
 | B3 | Prompt-Injection über Sensortext (Prozessnamen, Pfade, SARIF, Peers) | A1 | teilweise (Kappen, uneinheitlich) | ein Escaper inkl. Bidi/Tag-Block (0.8); Templates nur aus IDs/Enums; Begründung nie an Eltern; kein Auto-Turn (I4/I5); Injection-Korpus |
 | B4 | Gefälschte Probe-Events über die Sentinel-IPC | A2 | **offen** (SO_PEERCRED nur geloggt) | Peer-Allowlist (0.5) |
-| B5 | Modell-Verdict „Confirmed" löst Eingriff aus | A3 | geschützt (es gibt keinen Pfad) | Clamp auf NeedsReview; Operator-Feature nur im Escalator (0.11, I1) |
+| B5 | Modell-Verdict „Confirmed" löst Eingriff aus | A3 | geschützt (es gibt keinen Pfad) | Clamp auf NeedsReview; Operator-Pfad bis 3.2 nur in Tests, danach Feature nur im Escalator, Entscheidung an den Record-Digest gebunden (0.11, 3.2, I1) |
 | B6 | Agent bestimmt das Ziel eines Eingriffs | A3 | geschützt (kein Pfad) | Ziel nur aus dem verifizierten Spool-Record, Kernel-ID-Prüfung (I2, 3.2) |
 | B7 | Agent gibt sich selbst frei | A3/A4 | — | Entscheidung nur über polkit (vom Escalator angefordert) oder ein unabhängig gestartetes `harw-dod-approve`; Cgroup-Prüfung des Peers; `isatty` kein Beweis (3.3) |
 | B8 | Kompromittierter harw-Prozess liest das polkit-Passwort | A4 | — | Weg B: Authentisierung im grafischen polkit-Agenten der Sitzung; Weg A: eigenes Terminal; Same-TTY nur per Einstellung (§3.1) |

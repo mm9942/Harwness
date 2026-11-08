@@ -67,15 +67,29 @@
 //! `FalsePositive`, `Suspicious` bleibt `NeedsReview`.
 //!
 //! Bestätigen kann nur ein Mensch, über `triage_record_operator` mit einer
-//! `OperatorDecision`. Beide existieren nur hinter dem Cargo-Feature
-//! `operator-decision`, das ausschließlich der Escalator (`harw-escalator`)
-//! aktivieren darf — das xtask-Gate `operator-decision` lässt jede andere
-//! Crate, die das Feature einschaltet, rot werden.
+//! `OperatorDecision`, die an den Digest **genau dieses** Records gebunden
+//! ist (eine Entscheidung über Befund A gilt nie für Befund B). Beide
+//! existieren vorerst **nur in den Tests dieser Crate** (`cfg(test)`), und
+//! es gibt kein Cargo-Feature, das sie freischaltet; `compile_fail`-Doctests
+//! an [`TriageError`] belegen, dass sie außerhalb von `cfg(test)` nicht
+//! erreichbar sind. Das Feature `operator-decision` kehrt erst zusammen mit
+//! dem Escalator (`harw-escalator`, PL-100 WP 3.2) in derselben Änderung
+//! zurück, abgesichert durch das xtask-Gate `operator-decision`, das jede
+//! andere Crate, die das Feature anfordert, rot werden lässt.
 //!
 //! Das alte, ungebundene `triage` mit frei wählbarem [`Verdict`] (F-023)
-//! existiert nur noch für Tests (`cfg(test)` bzw. Feature `test-support`);
-//! im produktiven Build gibt es keinen Weg zu einem `Finding<Triaged>`, der
-//! nicht an einen selbst geprüften [`FindingRecord`] gebunden ist.
+//! existiert nur noch für Tests (`cfg(test)` bzw. Feature `test-support`).
+//! Weil es (wie `triaged_finding_for_test`) auch `Confirmed` annimmt, darf
+//! `test-support` nur aus Dev-Abhängigkeiten angefordert werden: das
+//! xtask-Gate `operator-decision` (Regel (d)) lässt jede andere Anforderung
+//! rot werden, auch umbenannt, per `workspace = true` geerbt oder über
+//! `[features]` weitergeleitet. Damit entsteht in einem produktiven Build
+//! (ohne Dev-Ziele und ohne `--all-features`, siehe Gate-Moduldoku,
+//! „Grenzen") kein `Finding<Triaged>` mit [`Verdict::Confirmed`] — also
+//! keine Stufe der Eskalationsleiter — und keiner, der nicht an einen selbst
+//! geprüften [`FindingRecord`] gebunden ist. Der Wert
+//! [`Verdict::Confirmed`] selbst bleibt öffentlich konstruierbar (etwa über
+//! [`Verdict::from_classification`]); erst [`triage_record`] deckelt ihn.
 //!
 //! # Reinheitsauflage
 //! [`Finding::raw`] führt kein I/O aus, liest keine Systemuhr und ruft
@@ -104,7 +118,8 @@
 //! - [`RecordError`]: ein Record ist inkonsistent (unbekannte Version oder
 //!   Regel, Beleg- oder Record-Digest passt nicht). Entsteht beim
 //!   Deserialisieren eines [`FindingRecord`] und in [`triage_record`].
-//! - [`TriageError`]: [`triage_record`] lehnt Record oder Verdikt ab.
+//! - [`TriageError`]: [`triage_record`] lehnt Record oder Verdikt ab (bzw.,
+//!   nur in Tests, `triage_record_operator` eine Operator-Entscheidung).
 //!
 //! Beide Fehlertypen sind **inhaltsfrei**: keine Meldung interpoliert einen
 //! Wert aus dem Record oder dem Verdikt (angreiferbeeinflusste Sensorfelder).
@@ -232,9 +247,10 @@ pub struct RuleChecked;
 ///
 /// # Description
 /// Entsteht über [`triage_record`] (gebunden an einen selbst geprüften
-/// [`FindingRecord`], Modell-Urteil gedeckelt), über
-/// `triage_record_operator` (Feature `operator-decision`, Urteil eines
-/// Menschen) oder — nur in Tests — über `triage`. Siehe Moduldoku.
+/// [`FindingRecord`], Modell-Urteil gedeckelt) oder — nur in Tests — über
+/// `triage_record_operator` (Urteil eines Menschen, an den Record-Digest
+/// gebunden; kehrt mit `harw-escalator` in PL-100 WP 3.2 zurück) bzw.
+/// `triage`. Siehe Moduldoku.
 ///
 /// # Errors
 /// Keine eigenen Fehler; siehe Moduldoku.
@@ -1078,8 +1094,34 @@ impl std::error::Error for RecordError {
 /// Inhaltsfrei wie [`RecordError`].
 ///
 /// # Errors
-/// Von [`triage_record`] und `triage_record_operator` (Feature
-/// `operator-decision`) erzeugt.
+/// Von [`triage_record`] und `triage_record_operator` (vorerst nur in Tests,
+/// kehrt mit `harw-escalator` in PL-100 WP 3.2 zurück) erzeugt.
+///
+/// # Examples
+/// Der Operator-Pfad ist außerhalb von `cfg(test)` nicht erreichbar
+/// (Owner-Review PR #168, Befund 1): weder über den Re-Export noch über das
+/// Modul `finding`. Doctests linken die Bibliothek ohne `cfg(test)`; unter
+/// `cargo test --workspace` ist dabei in der Regel auch `test-support`
+/// eingeschaltet (Feature-Vereinigung über die Dev-Abhängigkeiten anderer
+/// Crates, `resolver = "2"`), sodass eine Ausweitung auf
+/// `cfg(any(test, feature = "test-support"))` hier ebenfalls rot würde. Ein
+/// Block je Pfad, damit jeder genau an diesem Pfad scheitert:
+///
+/// ```rust,compile_fail
+/// use harw_dod_rules::OperatorDecision;
+/// ```
+///
+/// ```rust,compile_fail
+/// use harw_dod_rules::finding::OperatorDecision;
+/// ```
+///
+/// ```rust,compile_fail
+/// use harw_dod_rules::triage_record_operator;
+/// ```
+///
+/// ```rust,compile_fail
+/// use harw_dod_rules::finding::triage_record_operator;
+/// ```
 #[derive(Debug)]
 pub enum TriageError {
     /// Der Record ist inkonsistent (siehe [`RecordError`]).
@@ -1095,8 +1137,14 @@ pub enum TriageError {
     VerdictUnbound(SignalsError),
     /// Eine Operator-Entscheidung nennt keinen Operator (leere oder nur aus
     /// Leerraum bestehende Kennung). Nur von `triage_record_operator`
-    /// (Feature `operator-decision`) erzeugt.
+    /// (vorerst nur in Tests) erzeugt.
     OperatorUnidentified,
+    /// Eine Operator-Entscheidung ist an einen anderen Record-Digest
+    /// gebunden als den, den `triage_record_operator` für diesen Record
+    /// selbst berechnet hat — sie gilt für einen anderen (oder veränderten)
+    /// Befund. Nur von `triage_record_operator` (vorerst nur in Tests)
+    /// erzeugt. Inhaltsfrei: keiner der beiden Digests wird genannt.
+    OperatorDigestMismatch,
 }
 
 impl fmt::Display for TriageError {
@@ -1111,6 +1159,9 @@ impl fmt::Display for TriageError {
                 f.write_str("security verdict is not bound to this finding record")
             }
             Self::OperatorUnidentified => f.write_str("operator decision names no operator"),
+            Self::OperatorDigestMismatch => {
+                f.write_str("operator decision is not bound to this finding record")
+            }
         }
     }
 }
@@ -1120,7 +1171,9 @@ impl std::error::Error for TriageError {
         match self {
             Self::Record(inner) => Some(inner),
             Self::VerdictInvalid(inner) | Self::VerdictUnbound(inner) => Some(inner),
-            Self::VerdictContract | Self::OperatorUnidentified => None,
+            Self::VerdictContract | Self::OperatorUnidentified | Self::OperatorDigestMismatch => {
+                None
+            }
         }
     }
 }
@@ -1146,7 +1199,8 @@ impl From<RecordError> for TriageError {
 ///    Befund nicht hochstufen). Das Urteil folgt
 ///    [`Verdict::from_classification`], **gedeckelt**: ein `Confirmed` des
 ///    Modells wird zu [`Verdict::NeedsReview`] (Modelle bestätigen nie,
-///    siehe Moduldoku). Bestätigen kann nur `triage_record_operator`.
+///    siehe Moduldoku). Bestätigen kann nur `triage_record_operator`, das es
+///    vorerst nur in Tests gibt.
 ///
 /// # Arguments
 /// - `record` (`&FindingRecord`): der Record, den der Aufrufer **selbst**
@@ -1225,87 +1279,195 @@ fn triaged_from_verified(
     }
 }
 
-/// Die Entscheidung eines Menschen über einen eingefrorenen Befund
-/// (PL-100 WP0.11) — nur mit dem Feature `operator-decision`.
+/// Die Entscheidung eines Menschen über genau einen eingefrorenen Befund
+/// (PL-100 WP0.11) — vorerst **nur in den Tests dieser Crate**
+/// (`cfg(test)`).
 ///
 /// # Description
-/// Bewusst minimal: Urteil, Kennung des Operators und Zeitpunkt. Wer der
-/// Operator ist, stellt **nicht** diese Crate fest, sondern der Escalator
-/// (Peer-Prüfung, polkit; siehe PL-100 §3.1) — er baut diesen Wert erst nach
-/// erfolgreicher Freigabe und auditiert Operator und Zeitpunkt selbst.
-/// [`triage_record_operator`] prüft nur die Form (Operator nicht leer).
+/// Urteil, Kennung des Operators, Zeitpunkt und der Record-Digest, über den
+/// der Mensch entschieden hat. Die Felder sind privat: ein Wert entsteht nur
+/// über [`OperatorDecision::new`] und ist danach unveränderlich — eine
+/// Entscheidung lässt sich nicht nachträglich auf einen anderen Befund
+/// umbiegen. [`triage_record_operator`] nimmt sie nur für den Record an,
+/// dessen **selbst berechneter** Digest `record_digest` entspricht.
+///
+/// Wer der Operator ist, stellt **nicht** diese Crate fest, sondern der
+/// Escalator (Peer-Prüfung, polkit; siehe PL-100 §3.1) — er baut diesen Wert
+/// erst nach erfolgreicher Freigabe und auditiert Operator und Zeitpunkt
+/// selbst. Im produktiven Build gibt es diesen Typ nicht: er kehrt erst mit
+/// `harw-escalator` (PL-100 WP 3.2) hinter dem Feature `operator-decision`
+/// zurück, dann zusätzlich an den Freigabebeleg (Approver, polkit) gebunden
+/// und durch das xtask-Gate `operator-decision` abgesichert.
 ///
 /// # Concurrency
 /// Reiner Wert, `Send + Sync`.
 ///
 /// # Examples
 /// ```rust,ignore
-/// // Nur mit `features = ["operator-decision"]` (ausschließlich `harw-escalator`).
+/// // Nur in den Tests dieser Crate (`cfg(test)`); das Feature
+/// // `operator-decision` kommt erst mit `harw-escalator` (PL-100 WP 3.2).
 /// use harw_dod_rules::{OperatorDecision, Verdict};
 ///
-/// let decision = OperatorDecision {
-///     verdict: Verdict::Confirmed,
-///     operator: "uid:1000".to_owned(),
-///     decided_at: jiff::Timestamp::UNIX_EPOCH,
-/// };
-/// assert_eq!(decision.verdict, Verdict::Confirmed);
+/// // `record`: der Record, den der Escalator selbst aus dem Spool gelesen hat.
+/// let decision = OperatorDecision::new(
+///     Verdict::Confirmed,
+///     "uid:1000",
+///     jiff::Timestamp::UNIX_EPOCH,
+///     record.digest(),
+/// );
+/// assert_eq!(decision.verdict(), Verdict::Confirmed);
+/// assert_eq!(decision.record_digest(), record.digest());
 /// ```
-#[cfg(any(test, feature = "operator-decision"))]
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorDecision {
-    /// Das Urteil des Menschen — als einziges darf es
-    /// [`Verdict::Confirmed`] sein.
-    pub verdict: Verdict,
-    /// Kennung des entscheidenden Operators, wie der Escalator sie aus dem
-    /// geprüften Peer ableitet (z. B. `uid:1000`). Darf nicht leer sein.
-    pub operator: String,
-    /// Injizierter Zeitpunkt der Entscheidung — nie die Systemuhr dieser
-    /// Crate.
-    pub decided_at: Timestamp,
+    // Das Urteil des Menschen — als einziges darf es `Verdict::Confirmed`
+    // sein.
+    verdict: Verdict,
+    // Kennung des entscheidenden Operators, wie der Escalator sie aus dem
+    // geprüften Peer ableitet (z. B. `uid:1000`). `triage_record_operator`
+    // lehnt eine leere Kennung ab.
+    operator: String,
+    // Injizierter Zeitpunkt der Entscheidung — nie die Systemuhr dieser
+    // Crate.
+    decided_at: Timestamp,
+    // Digest des Records, über den der Mensch entschieden hat
+    // (`FindingRecord::digest`); bindet die Entscheidung an genau diesen
+    // Befund.
+    record_digest: ContentDigest,
+}
+
+#[cfg(test)]
+impl OperatorDecision {
+    /// Baut die Entscheidung eines Menschen, gebunden an genau einen Record.
+    ///
+    /// # Description
+    /// Reine Konstruktion ohne Prüfung; die Prüfung (Operator nicht leer,
+    /// Digest passt zum selbst berechneten Record-Digest) übernimmt
+    /// [`triage_record_operator`].
+    ///
+    /// # Arguments
+    /// - `verdict` (`Verdict`): das Urteil des Menschen.
+    /// - `operator` (`&str`): Kennung des Operators, wie der Escalator sie
+    ///   aus dem geprüften Peer ableitet (z. B. `uid:1000`).
+    /// - `decided_at` (`Timestamp`): injizierter Zeitpunkt der Entscheidung.
+    /// - `record_digest` (`ContentDigest`): [`FindingRecord::digest`] des
+    ///   Records, den der Operator gesehen und entschieden hat.
+    ///
+    /// # Returns
+    /// Die unveränderliche Entscheidung.
+    ///
+    /// # Errors
+    /// Keine — totale Konstruktion.
+    ///
+    /// # Examples
+    /// Siehe Typdoku.
+    #[must_use]
+    pub fn new(
+        verdict: Verdict,
+        operator: &str,
+        decided_at: Timestamp,
+        record_digest: ContentDigest,
+    ) -> Self {
+        Self {
+            verdict,
+            operator: operator.to_owned(),
+            decided_at,
+            record_digest,
+        }
+    }
+
+    /// Das Urteil des Menschen.
+    ///
+    /// # Returns
+    /// Das [`Verdict`] dieser Entscheidung.
+    #[must_use]
+    pub fn verdict(&self) -> Verdict {
+        self.verdict
+    }
+
+    /// Kennung des entscheidenden Operators.
+    ///
+    /// # Returns
+    /// Die Kennung, wie sie [`OperatorDecision::new`] übergeben wurde.
+    #[must_use]
+    pub fn operator(&self) -> &str {
+        &self.operator
+    }
+
+    /// Zeitpunkt der Entscheidung.
+    ///
+    /// # Returns
+    /// Den injizierten [`Timestamp`].
+    #[must_use]
+    pub fn decided_at(&self) -> Timestamp {
+        self.decided_at
+    }
+
+    /// Digest des Records, an den die Entscheidung gebunden ist.
+    ///
+    /// # Returns
+    /// Den [`ContentDigest`], wie ihn [`FindingRecord::digest`] lieferte.
+    #[must_use]
+    pub fn record_digest(&self) -> ContentDigest {
+        self.record_digest
+    }
 }
 
 /// Triagiert einen eingefrorenen Befund mit dem Urteil eines **Menschen**
-/// (PL-100 WP0.11) — nur mit dem Feature `operator-decision`.
+/// (PL-100 WP0.11) — vorerst **nur in den Tests dieser Crate**
+/// (`cfg(test)`).
 ///
 /// # Description
-/// Der einzige produktive Weg zu einem `Finding<Triaged>` mit
-/// [`Verdict::Confirmed`]. Prüft den Record genauso vollständig wie
-/// [`triage_record`] (Version, bekannte Regel, Beleg- und Record-Digest
-/// **neu berechnet**) und übernimmt das Urteil unverändert aus `decision`.
-/// Felder des Befundes stammen ausschließlich aus dem Record. Das Feature
-/// darf nur `harw-escalator` einschalten (xtask-Gate `operator-decision`).
+/// Der einzige an einen Record gebundene Weg zu einem `Finding<Triaged>` mit
+/// [`Verdict::Confirmed`] (die ungebundenen Testhilfen hinter
+/// `test-support` gibt es nur in Dev-Builds); im produktiven Build gibt es
+/// ihn nicht, bis er mit `harw-escalator` (PL-100 WP 3.2) hinter dem Feature
+/// `operator-decision` zurückkehrt.
+/// Prüft den Record genauso vollständig wie [`triage_record`] (Version,
+/// bekannte Regel, Beleg- und Record-Digest **neu berechnet**) und nimmt die
+/// Entscheidung nur an, wenn ihr `record_digest` dem **selbst berechneten**
+/// Record-Digest entspricht — eine Entscheidung über einen anderen oder
+/// veränderten Befund wird abgelehnt. Das Urteil wird unverändert aus
+/// `decision` übernommen; alle Felder des Befundes stammen ausschließlich
+/// aus dem Record.
 ///
 /// # Arguments
 /// - `record` (`&FindingRecord`): der Record, den der Escalator **selbst**
 ///   aus dem Spool gelesen hat.
-/// - `decision` (`OperatorDecision`): die Entscheidung des Menschen. Wird
-///   konsumiert.
+/// - `decision` (`OperatorDecision`): die Entscheidung des Menschen,
+///   gebunden an einen Record-Digest. Wird konsumiert.
 ///
 /// # Returns
 /// `Ok(Finding<Triaged>)` mit Identität des Records, dem Urteil aus
 /// `decision` und `record_digest() == Some(record.digest())`.
 ///
 /// # Errors
-/// - [`TriageError::OperatorUnidentified`]: `decision.operator` ist leer.
+/// - [`TriageError::OperatorUnidentified`]: der Operator der Entscheidung
+///   ist leer (wird vor dem Record geprüft).
 /// - [`TriageError::Record`]: der Record ist inkonsistent.
+/// - [`TriageError::OperatorDigestMismatch`]: die Entscheidung ist an einen
+///   anderen Record-Digest gebunden.
 ///
 /// # Concurrency
 /// Reine Funktion; klont den Beleg für die Neuberechnung.
 ///
 /// # Examples
 /// ```rust,ignore
-/// // Nur mit `features = ["operator-decision"]` (ausschließlich `harw-escalator`).
+/// // Nur in den Tests dieser Crate (`cfg(test)`); das Feature
+/// // `operator-decision` kommt erst mit `harw-escalator` (PL-100 WP 3.2).
 /// use harw_dod_rules::{OperatorDecision, Verdict, triage_record_operator};
 ///
-/// let decision = OperatorDecision {
-///     verdict: Verdict::Confirmed,
-///     operator: "uid:1000".to_owned(),
-///     decided_at: jiff::Timestamp::UNIX_EPOCH,
-/// };
+/// let decision = OperatorDecision::new(
+///     Verdict::Confirmed,
+///     "uid:1000",
+///     jiff::Timestamp::UNIX_EPOCH,
+///     record.digest(),
+/// );
 /// let triaged = triage_record_operator(&record, decision)?;
 /// assert_eq!(*triaged.verdict(), Verdict::Confirmed);
 /// ```
-#[cfg(any(test, feature = "operator-decision"))]
+#[cfg(test)]
 pub fn triage_record_operator(
     record: &FindingRecord,
     decision: OperatorDecision,
@@ -1316,6 +1478,12 @@ pub fn triage_record_operator(
     let verified = verify_record(record.clone())?;
     let rule_id = known_rule_id(&verified.rule_id).ok_or(RecordError::UnknownRule)?;
     let self_computed = verified.compute_digest();
+    // Gebunden wird gegen den selbst berechneten Digest, nie gegen einen Wert
+    // aus der Entscheidung oder einem ungeprüften Record-Feld (wie
+    // `triage_record`, K43-Falle).
+    if decision.record_digest != self_computed {
+        return Err(TriageError::OperatorDigestMismatch);
+    }
     Ok(triaged_from_verified(
         verified,
         rule_id,
@@ -1333,8 +1501,12 @@ pub fn triage_record_operator(
 /// `cfg(test)` bzw. mit dem Feature `test-support` (Testfixtures abhängiger
 /// Crates über [`triaged_finding_for_test`]) — im produktiven Build gibt es
 /// keinen ungebundenen Weg zu einem `Finding<Triaged>` (siehe Moduldoku).
-/// Produktiver Code verwendet [`triage_record`] (Modell) bzw.
-/// `triage_record_operator` (Mensch, Feature `operator-decision`).
+/// Weil das Urteil frei wählbar ist (auch [`Verdict::Confirmed`]), darf
+/// `test-support` nur aus Dev-Abhängigkeiten kommen; das xtask-Gate
+/// `operator-decision` (Regel (d)) erzwingt das.
+/// Produktiver Code verwendet [`triage_record`] (Modell); der Weg eines
+/// Menschen (`triage_record_operator`) existiert vorerst nur in Tests und
+/// kehrt mit `harw-escalator` (PL-100 WP 3.2) zurück.
 ///
 /// # Arguments
 /// - `finding` (`Finding<RuleChecked>`): der geprüfte Befund. Wird konsumiert.
@@ -1405,7 +1577,8 @@ pub fn triage(finding: Finding<RuleChecked>, verdict: Verdict) -> Finding<Triage
 /// `Severity`/`Hardness`-Kombination erzeugen können, die derzeit keine
 /// echte Regel liefert (z. B. `Severity::Critical`). Ändert weder das
 /// Datenmodell noch produktives Verhalten: `test-support` steht ausschließlich
-/// in `[dev-dependencies]`-Positionen und ist wegen `resolver = "2"` nie im
+/// in `[dev-dependencies]`-Positionen (erzwungen durch das xtask-Gate
+/// `operator-decision`, Regel (d)) und ist wegen `resolver = "2"` nie im
 /// Build eines produktiven Konsumenten aktiv. Die in der Moduldoku
 /// beschriebene Invariante („Der Besitz des Wertes ist die Berechtigung")
 /// bleibt für jeden produktiven Pfad unangetastet — `Finding::raw` und
@@ -1804,23 +1977,41 @@ mod tests {
         }
     }
 
-    fn operator_decision(verdict: Verdict, operator: &str) -> OperatorDecision {
-        OperatorDecision {
-            verdict,
-            operator: operator.to_owned(),
-            decided_at: Timestamp::UNIX_EPOCH,
-        }
+    // Eine Operator-Entscheidung, gebunden an `record_digest`.
+    fn operator_decision(
+        verdict: Verdict,
+        operator: &str,
+        record_digest: ContentDigest,
+    ) -> OperatorDecision {
+        OperatorDecision::new(verdict, operator, Timestamp::UNIX_EPOCH, record_digest)
+    }
+
+    #[test]
+    fn test_operator_decision_new_keeps_its_fields() {
+        let digest = ContentDigest::of(b"decided record");
+        let decision = OperatorDecision::new(
+            Verdict::Confirmed,
+            "uid:1000",
+            Timestamp::UNIX_EPOCH,
+            digest,
+        );
+        assert_eq!(decision.verdict(), Verdict::Confirmed);
+        assert_eq!(decision.operator(), "uid:1000");
+        assert_eq!(decision.decided_at(), Timestamp::UNIX_EPOCH);
+        assert_eq!(decision.record_digest(), digest);
     }
 
     /// PL-100 WP0.11: nur die Entscheidung eines Menschen
     /// (`triage_record_operator`) kann `Confirmed` setzen — gebunden an den
-    /// selbst geprüften Record.
+    /// selbst geprüften Record und an dessen Digest.
     #[test]
     fn test_triage_record_operator_may_confirm() -> TestResult {
         let record = checked("finding-o1")?.record(evidence()?);
-        let triaged =
-            triage_record_operator(&record, operator_decision(Verdict::Confirmed, "uid:1000"))
-                .map_err(ctx("operator decision accepted"))?;
+        let triaged = triage_record_operator(
+            &record,
+            operator_decision(Verdict::Confirmed, "uid:1000", record.digest()),
+        )
+        .map_err(ctx("operator decision accepted"))?;
         assert_eq!(*triaged.verdict(), Verdict::Confirmed);
         assert_eq!(triaged.id().as_str(), "finding-o1");
         assert_eq!(triaged.record_digest(), Some(record.digest()));
@@ -1834,8 +2025,11 @@ mod tests {
     fn test_triage_record_operator_keeps_non_confirming_verdicts() -> TestResult {
         for verdict in [Verdict::FalsePositive, Verdict::NeedsReview] {
             let record = checked("finding-o2")?.record(evidence()?);
-            let triaged = triage_record_operator(&record, operator_decision(verdict, "uid:0"))
-                .map_err(ctx("operator decision accepted"))?;
+            let triaged = triage_record_operator(
+                &record,
+                operator_decision(verdict, "uid:0", record.digest()),
+            )
+            .map_err(ctx("operator decision accepted"))?;
             assert_eq!(*triaged.verdict(), verdict);
         }
         Ok(())
@@ -1845,9 +2039,10 @@ mod tests {
     fn test_triage_record_operator_rejects_blank_operator() -> TestResult {
         let record = checked("finding-o3")?.record(evidence()?);
         for operator in ["", "   "] {
-            let Err(err) =
-                triage_record_operator(&record, operator_decision(Verdict::Confirmed, operator))
-            else {
+            let Err(err) = triage_record_operator(
+                &record,
+                operator_decision(Verdict::Confirmed, operator, record.digest()),
+            ) else {
                 return Err(TestError::Unexpected(
                     "anonymous operator decision was accepted".to_owned(),
                 ));
@@ -1862,9 +2057,10 @@ mod tests {
         let mut forged = evidence()?;
         forged.digest = ContentDigest::of(b"forged");
         let record = checked("finding-o4")?.record(forged);
-        let Err(err) =
-            triage_record_operator(&record, operator_decision(Verdict::Confirmed, "uid:1000"))
-        else {
+        let Err(err) = triage_record_operator(
+            &record,
+            operator_decision(Verdict::Confirmed, "uid:1000", record.digest()),
+        ) else {
             return Err(TestError::Unexpected(
                 "tampered evidence was accepted".to_owned(),
             ));
@@ -1873,6 +2069,70 @@ mod tests {
             err,
             TriageError::Record(RecordError::EvidenceDigestMismatch)
         ));
+        Ok(())
+    }
+
+    /// Owner-Review PR #168: eine Entscheidung, die an einen fremden Digest
+    /// gebunden ist, bestätigt nichts.
+    #[test]
+    fn test_triage_record_operator_rejects_mismatched_digest() -> TestResult {
+        let record = checked("finding-o5")?.record(evidence()?);
+        let Err(err) = triage_record_operator(
+            &record,
+            operator_decision(
+                Verdict::Confirmed,
+                "uid:1000",
+                ContentDigest::of(b"some other record"),
+            ),
+        ) else {
+            return Err(TestError::Unexpected(
+                "operator decision bound to a foreign digest was accepted".to_owned(),
+            ));
+        };
+        assert!(matches!(err, TriageError::OperatorDigestMismatch));
+        Ok(())
+    }
+
+    /// Eine Entscheidung über Befund A lässt sich nicht auf Befund B
+    /// übertragen, auch nicht bei identischem Beleg; für A selbst gilt sie.
+    #[test]
+    fn test_triage_record_operator_rejects_decision_for_another_record() -> TestResult {
+        let decided = checked("finding-o6a")?.record(evidence()?);
+        let other = checked("finding-o6b")?.record(evidence()?);
+        let decision = operator_decision(Verdict::Confirmed, "uid:1000", decided.digest());
+        let Err(err) = triage_record_operator(&other, decision.clone()) else {
+            return Err(TestError::Unexpected(
+                "operator decision was replayed onto another record".to_owned(),
+            ));
+        };
+        assert!(matches!(err, TriageError::OperatorDigestMismatch));
+        let triaged = triage_record_operator(&decided, decision)
+            .map_err(ctx("operator decision accepted for its own record"))?;
+        assert_eq!(*triaged.verdict(), Verdict::Confirmed);
+        assert_eq!(triaged.id().as_str(), "finding-o6a");
+        Ok(())
+    }
+
+    /// Derselbe Record: ein Modell-`Confirmed` bleibt gedeckelt, nur die
+    /// gebundene Entscheidung eines Menschen bestätigt.
+    #[test]
+    fn test_model_confirmed_is_clamped_while_operator_confirms() -> TestResult {
+        let record = checked("finding-o7")?.record(evidence()?);
+        let verdict = verdict_for(
+            record.finding_id(),
+            record.digest(),
+            VerdictClassification::Confirmed,
+        );
+        let by_model =
+            triage_record(&record, &verdict).map_err(ctx("bound model verdict accepted"))?;
+        assert_eq!(*by_model.verdict(), Verdict::NeedsReview);
+        let by_operator = triage_record_operator(
+            &record,
+            operator_decision(Verdict::Confirmed, "uid:1000", record.digest()),
+        )
+        .map_err(ctx("bound operator decision accepted"))?;
+        assert_eq!(*by_operator.verdict(), Verdict::Confirmed);
+        assert_eq!(by_model.record_digest(), by_operator.record_digest());
         Ok(())
     }
 
@@ -1887,6 +2147,10 @@ mod tests {
         assert_eq!(
             TriageError::OperatorUnidentified.to_string(),
             "operator decision names no operator"
+        );
+        assert_eq!(
+            TriageError::OperatorDigestMismatch.to_string(),
+            "operator decision is not bound to this finding record"
         );
     }
 }

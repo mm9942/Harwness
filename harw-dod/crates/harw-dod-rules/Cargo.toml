@@ -64,22 +64,37 @@ harw-knowledge = { path = "../../../harw-knowledge" }
 # `Ladder`-Tests): schaltet `finding::triaged_finding_for_test` frei, das
 # beliebige `Severity`/`Hardness`-Kombinationen erzeugt, die keine echte Regel
 # liefert, sowie (seit PL-100 WP0.11) das ungebundene `triage`, das es im
-# produktiven Build nicht mehr gibt. Wegen `resolver = "2"` (Workspace-Root)
-# nur aktiv, wenn eine Crate es unter `[dev-dependencies]` anfordert — nie im
-# Build eines produktiven
-# Konsumenten. Siehe `src/finding.rs`-Moduldoku, Abschnitt „Der Besitz des
-# Wertes ist die Berechtigung", für die dadurch unangetastete Invariante.
+# produktiven Build nicht mehr gibt. Beide nehmen ein frei wählbares Urteil
+# an, auch `Verdict::Confirmed`. Deshalb darf eine Crate das Feature **nur
+# unter `[dev-dependencies]`** anfordern; das xtask-Gate `operator-decision`
+# (Regel (d), `xtask/src/gate_operator_decision.rs`) lässt jede andere
+# Anforderung rot werden (normale, Build- oder Target-Abhängigkeit, auch
+# umbenannt oder per `workspace = true` geerbt, `[workspace.dependencies]`,
+# `[features]`-Weiterleitung) und ebenso ein anderes Feature dieser Crate
+# (auch `default`), das es mit einschaltet. Wegen `resolver = "2"`
+# (Workspace-Root) ist es dann nie im Build eines produktiven Konsumenten
+# aktiv. Siehe `src/finding.rs`-Moduldoku, Abschnitt „Der Besitz des Wertes
+# ist die Berechtigung", für die dadurch unangetastete Invariante.
 test-support = []
-# PL-100 WP0.11 (Leitprinzip I1): schaltet `OperatorDecision` und
-# `triage_record_operator` frei — den einzigen produktiven Weg zu einem
-# `Verdict::Confirmed`. Modelle bestätigen nie (`triage_record` deckelt ein
-# Modell-`Confirmed` auf `NeedsReview`); bestätigen kann nur ein Mensch über
-# den Escalator. Deshalb darf **ausschließlich `harw-escalator`** dieses
-# Feature einschalten; das xtask-Gate `operator-decision`
-# (`xtask/src/gate_operator_decision.rs`) lässt jede andere Crate, die es
-# anfordert (direkt, über `[features]` oder über eine Workspace-Abhängigkeit),
-# rot werden. Kein anderes Feature dieser Crate darf es mit einschalten.
-operator-decision = []
+# PL-100 WP0.11 (Leitprinzip I1), nach Owner-Review PR #168: Ein Feature
+# `operator-decision` gibt es vorerst **nicht**. `OperatorDecision` und
+# `triage_record_operator` — der Weg eines Menschen zu einem
+# `Verdict::Confirmed` — existieren nur unter `cfg(test)`; die Tests dieser
+# Crate decken Modell-Clamp und Operator-Pfad ab, `compile_fail`-Doctests an
+# `TriageError` belegen die Unerreichbarkeit außerhalb von `cfg(test)`.
+# Zusammen mit der Dev-only-Regel für `test-support` (oben) erzeugt damit
+# kein produktiver Build irgendeiner Crate einen `Finding<Triaged>` mit
+# `Verdict::Confirmed`, also auch keine Stufe der Eskalationsleiter (der Wert
+# `Verdict::Confirmed` selbst bleibt öffentlich; `triage_record` deckelt ihn).
+# Das Feature kehrt erst zusammen mit `harw-escalator` (PL-100 WP 3.2) in
+# derselben Änderung zurück, abgesichert durch das xtask-Gate
+# `operator-decision`, das Paketidentität statt Tabellenschlüssel auswertet.
+# Bis dahin hier kein Feature dieses Namens deklarieren und kein anderes
+# Feature darauf verweisen lassen. Das Gate lässt außer `default` und
+# `test-support` (und später `operator-decision`) überhaupt kein Feature zu,
+# auch kein implizites einer optionalen Abhängigkeit (Regel (e)): unter einem
+# anderen Namen ließe sich der Operator-Pfad sonst am Gate vorbei
+# freischalten.
 
 [lints]
 workspace = true

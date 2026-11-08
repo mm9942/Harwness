@@ -174,10 +174,18 @@ pub use finding::{
     Finding, FindingKind, FindingRecord, Raw, RecordError, RuleChecked, TriageError, Triaged,
     Verdict, triage_record,
 };
-// Die Entscheidung eines Menschen (PL-100 WP0.11): nur mit dem Feature
-// `operator-decision`, das ausschließlich `harw-escalator` einschalten darf
-// (xtask-Gate `operator-decision`).
-#[cfg(any(test, feature = "operator-decision"))]
+// Die Entscheidung eines Menschen (PL-100 WP0.11, an den Record-Digest
+// gebunden): vorerst nur in den Tests dieser Crate (`compile_fail`-Doctests an
+// `TriageError` belegen das). Das Feature `operator-decision` kehrt erst mit
+// `harw-escalator` (PL-100 WP 3.2) zurück, abgesichert durch das xtask-Gate
+// `operator-decision`. Die übrigen Wege zu einem `Finding<Triaged>` mit
+// `Verdict::Confirmed` (`triage`, `triaged_finding_for_test`) stehen hinter
+// `test-support`, das dasselbe Gate (Regel (d)) nur aus Dev-Abhängigkeiten
+// zulässt. Ein produktiver Build erzeugt deshalb keinen `Finding<Triaged>`
+// mit `Verdict::Confirmed` und erreicht so keine Stufe der
+// Eskalationsleiter; der Wert `Verdict::Confirmed` selbst bleibt öffentlich
+// (z. B. `Verdict::from_classification`), erst `triage_record` deckelt ihn.
+#[cfg(test)]
 pub use finding::{OperatorDecision, triage_record_operator};
 // Ungebundene Triage mit frei wählbarem Urteil — nur für Tests (siehe
 // `finding.rs`-Moduldoku, „Modelle beraten, Menschen bestätigen").

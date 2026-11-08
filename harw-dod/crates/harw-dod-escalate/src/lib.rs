@@ -4,7 +4,7 @@
 //! # Verantwortungsbereich
 //! Diese Crate schließt die Kette zwischen Befund und Durchsetzung: sie
 //! nimmt ein `Finding<RuleChecked>` (Eigentum ausschließlich über
-//! `harw-dod-rules`, AW4-03, erwerbbar) über [`triage`] in ein
+//! `harw-dod-rules`, AW4-03, erwerbbar) über [`triage_record`] in ein
 //! `Finding<Triaged>` — beide Typen re-exportiert, nicht neu definiert (siehe
 //! „Der dritte Zustand" unten). Sie definiert selbst [`Action<Proposed>`] und
 //! [`Action<Authorized>`] ([`action`]-Modul) sowie [`Ladder`]
@@ -18,12 +18,12 @@
 //! # Der dritte Zustand: `Finding<Triaged>` lebt in `harw-dod-rules`, nicht
 //! hier
 //! `Finding<Raw|RuleChecked|Triaged>` und alle drei Typestate-Übergänge
-//! (`Finding::raw`, `Finding::check`, `triage`) sind bereits vollständig in
+//! (`Finding::raw`, `Finding::check`, `triage_record`) sind bereits vollständig in
 //! `harw-dod-rules` (AW4-03) realisiert — siehe dessen `finding.rs`-Moduldoku
 //! für die Begründung, warum Typbesitzer und Übergangsbesitzer dieselbe
 //! Crate sein müssen. Diese Crate definiert `Triaged` **nicht** neu; sie
 //! re-exportiert [`Finding`], [`RuleChecked`], [`Triaged`], [`Verdict`] und
-//! [`triage`] und konsumiert sie. **Die Berechtigung ist der Besitz des
+//! [`triage_record`] und konsumiert sie. **Die Berechtigung ist der Besitz des
 //! Wertes:** an ein `Finding<Triaged>` kommt nur, wer zuerst ein
 //! `Finding<RuleChecked>` **besessen** hat — und das kann ausschließlich
 //! `harw-dod-rules` herstellen (`Finding::raw`/`Finding::check` sind dort
@@ -51,6 +51,19 @@
 //! (`Hardness::Observed`) trägt. Keine Systemuhr, kein Zufall, keine
 //! Historie — reine Funktion der Befundfelder. Siehe [`ladder`]-Moduldoku
 //! für die vollständige Begründung.
+//!
+//! `Verdict::Confirmed` stammt nie aus einem Modell: [`triage_record`]
+//! deckelt ein Modell-`Confirmed` auf `NeedsReview` (PL-100 WP0.11). Den Weg
+//! eines Menschen (`OperatorDecision`, an den Record-Digest gebunden, über
+//! `triage_record_operator`) gibt es in `harw-dod-rules` vorerst nur in
+//! Tests; er kehrt mit `harw-escalator` (PL-100 WP 3.2) hinter dem Feature
+//! `operator-decision` zurück, das diese Crate nie einschaltet. Die
+//! ungebundenen Testhilfen von `harw-dod-rules` (`triage`,
+//! `triaged_finding_for_test`, Feature `test-support`) nehmen zwar jedes
+//! Urteil an, dürfen aber nur aus Dev-Abhängigkeiten angefordert werden
+//! (xtask-Gate `operator-decision`, Regel (d)); diese Crate tut das nur unter
+//! `[dev-dependencies]`. Bis WP 3.2 erreicht deshalb in einem produktiven
+//! Build (ohne Dev-Ziele) kein Befund eine Stufe der Leiter.
 //!
 //! # Triage-Einreichung und Proof v2 (C-WPROTO, W3)
 //! [`submission::TriageSubmission`] ist das eingefrorene Format, in dem ein

@@ -22,10 +22,14 @@ serde = { workspace = true }
 harw-macros = { path = "../../../harw-macros" }
 # `Finding<Triaged>`, `Finding<RuleChecked>`, `Verdict`, `triage_record` — die
 # Berechtigung, ein `Finding<Triaged>` zu besitzen, kann ausschließlich diese
-# Crate herstellen (siehe `lib.rs`-Moduldoku). Bewusst **ohne** das Feature
-# `operator-decision`: das darf nur `harw-escalator` einschalten (PL-100
-# WP0.11, xtask-Gate `operator-decision`); diese Bibliothek bekommt über
-# `triage_record` nie ein bestätigtes Modell-Urteil.
+# Crate herstellen (siehe `lib.rs`-Moduldoku). Über `triage_record` bekommt
+# diese Bibliothek nie ein bestätigtes Urteil: ein Modell-`Confirmed` wird auf
+# `NeedsReview` gedeckelt. Den Weg eines Menschen (`OperatorDecision`,
+# `triage_record_operator`) gibt es in `harw-dod-rules` vorerst nur unter
+# `cfg(test)` (PL-100 WP0.11, Owner-Review PR #168); das Feature
+# `operator-decision` kehrt erst mit `harw-escalator` (PL-100 WP 3.2) zurück
+# und darf dann nur dort eingeschaltet werden (xtask-Gate
+# `operator-decision`) — nie hier.
 harw-dod-rules = { path = "../harw-dod-rules" }
 # `Severity`/`Hardness` — Felder von `Finding<S>`, auf denen `Ladder::stage_for`
 # die Aufstiegsregel auswertet. Keine zusätzliche Gewichtsklasse: `harw-dod-rules`
@@ -58,6 +62,10 @@ harw-sandbox = { path = "../../../harw-sandbox" }
 # `Severity::Critical`), die keine echte Regel erzeugt. Wegen `resolver = "2"`
 # (Workspace-Root) nur für Testziele dieser Crate aktiv, nie im produktiven
 # Build (siehe `harw-dod-rules`' `Cargo.toml` und `src/finding.rs`-Moduldoku).
+# Nur hier, nie unter `[dependencies]`: das xtask-Gate `operator-decision`
+# (Regel (d)) lässt `test-support` außerhalb von Dev-Abhängigkeiten rot
+# werden, weil die Testhilfen auch einen `Finding<Triaged>` mit
+# `Verdict::Confirmed` erzeugen.
 harw-dod-rules = { path = "../harw-dod-rules", features = ["test-support"] }
 # Nur für Tests: ein `FreezeStore` braucht ein Wurzelverzeichnis; `tempfile`
 # ist dieselbe Crate, die `harw-session-store` selbst für seine `FreezeStore`-
