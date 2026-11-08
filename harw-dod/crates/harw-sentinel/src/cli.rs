@@ -303,8 +303,8 @@ impl Cli {
     }
 }
 
-/// `clap`-Wertparser für `--findings-export`/`--health-export`: nur
-/// absolute Pfade.
+/// `clap`-Wertparser für `--findings-export`/`--health-export`/
+/// `--workspace-root`: nur absolute Pfade.
 fn parse_absolute_path(raw: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(raw);
     if path.is_absolute() {

@@ -47,7 +47,16 @@ UMask=0007
 # explicit mode, so the process umask decides. /run/harw is setgid harw-ipc
 # (tmpfiles.d/harw.conf), so the socket is created as
 # harw-sentinel:harw-ipc; UMask=0007 yields 0770 -- the probes (members of
-# harw-ipc) may connect, nobody else may.
+# harw-ipc) may connect, nobody else may. On top of that the sentinel checks
+# SO_PEERCRED (PL-100 WP0.5): only the probe accounts harw-probe-bpf and
+# harw-probe-fs (--probe-peer-user, resolved at startup) and uid 0 may submit
+# events; any other harw-ipc member is closed unread and counted
+# (ipc.peers_rejected_total in health.json).
+# Explicit working directory (PL-100 WP0.7). It is never a Landlock root:
+# --workspace-root has no default any more, and the sentinel refuses relative
+# roots and every spelling of / (`harw-sentinel --print-sandbox <same flags>`
+# prints the effective read/write roots for host verification).
+WorkingDirectory=/
 ExecStart=@LIBEXECDIR@/harw-sentinel --log info --config @SYSCONFDIR@/config.toml --home @STATEDIR@ --socket /run/harw/sentinel.sock --findings-export @STATEDIR@/export/findings.jsonl --health-export @STATEDIR@/export/health.json
 ReadWritePaths=@STATEDIR@ @LOGDIR@ /run/harw
 # ProtectSystem=strict makes /run read-only as well; these three paths are

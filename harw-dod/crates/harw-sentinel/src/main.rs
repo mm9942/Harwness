@@ -193,6 +193,20 @@
 //! neben den kumulierten IPC- und Ringzählern deren Deltas des letzten
 //! Zyklus und der letzten 60 s (siehe [`health_export`]-Moduldoku).
 //!
+//! # Probe-Zulassung und Sandbox-Wurzeln (PL-100 WP0.5/WP0.7)
+//! [`run`] löst vor dem Binden des IPC-Sockets (und damit vor Landlock, das
+//! `/etc` nicht mehr lesen ließe) die Sonden-Konten aus `--probe-peer-user`
+//! in eine [`peer_allow::PeerAllowlist`] auf (Vorgabe `harw-probe-bpf`,
+//! `harw-probe-fs`; uid `0` immer). Die Annahmeschleife schließt jede
+//! Verbindung einer anderen uid, bevor sie liest, und zählt sie
+//! (`ipc.peers_rejected_total` in `health.json`). `--workspace-root` hat
+//! keine Vorgabe mehr; die Landlock-Wurzeln baut [`landlock_roots`], und
+//! [`sandbox::prepare_roots`] weist relative Wurzeln und jede Schreibweise
+//! von `/` ab — das Arbeitsverzeichnis (`WorkingDirectory=/` in der Unit)
+//! geht nie in eine Regel ein. `--print-sandbox` ([`run_print_sandbox`])
+//! gibt genau diese wirksamen Wurzeln samt zugelassenen Peer-uids aus und
+//! beendet sich, ohne Socket, Sink oder Landlock anzufassen.
+//!
 //! # DoD-Systemkonfiguration und Poll-Taktung
 //! [`main`] lädt vor jedem anderen Startschritt (Sink, Socket, Landlock) den
 //! gemeinsamen DoD-Vertrag aus [`harw_dod_config`] — denselben, den auch die
@@ -271,6 +285,8 @@
 //! ```text
 //! $ harw-sentinel --log info --home /var/lib/harwness --interval-secs 5
 //! $ harw-sentinel --once --home /var/lib/harwness
+//! $ harw-sentinel --print-sandbox --home /var/lib/harw-dod \
+//!     --findings-export /var/lib/harw-dod/export/findings.jsonl
 //! $ harw-sentinel --config /etc/harw-dod/config.toml --home /var/lib/harw-dod \
 //!     --findings-export /var/lib/harw-dod/export/findings.jsonl
 //! ```
@@ -283,6 +299,7 @@ mod error;
 mod export;
 mod findings;
 mod health_export;
+mod peer_allow;
 mod sandbox;
 mod sensors;
 mod throttle;
@@ -588,13 +605,15 @@ fn log_dod_settings(settings: &DodSettings, timing: PollTiming) {
 /// Parst die Kommandozeile ohne `clap::Parser::parse` (das bei einem
 /// Fehler oder `--help`/`--version` selbst `std::process::exit` aufriefe
 /// und diese Funktion nie zu ihrem eigenen `ExitCode` zurückkehren ließe),
-/// initialisiert `tracing`, bedient das Unterkommando `completions`, lädt
-/// sonst die DoD-Konfiguration ([`load_dod_settings`], fail closed — siehe
+/// initialisiert `tracing`, bedient das Unterkommando `completions` bzw.
+/// `--print-sandbox` ([`run_print_sandbox`]), lädt sonst die
+/// DoD-Konfiguration ([`load_dod_settings`], fail closed — siehe
 /// Moduldoku) und delegiert an [`run`].
 ///
 /// # Returns
-/// `ExitCode::SUCCESS` bei normalem Ende (nur nach `--once` oder
-/// `completions`; die Dauerschleife endet sonst nur durch ein Signal).
+/// `ExitCode::SUCCESS` bei normalem Ende (nur nach `--once`,
+/// `--print-sandbox` oder `completions`; die Dauerschleife endet sonst nur
+/// durch ein Signal).
 /// `ExitCode::FAILURE` bei einem CLI-Parse-Fehler, einer nicht
 /// vertrauenswürdigen oder ungültigen DoD-Konfiguration oder einem
 /// [`error::SentinelBinError`].
@@ -622,6 +641,11 @@ fn main() -> ExitCode {
     // trotzdem Completions erzeugen können.
     let result = if cli.command.is_some() {
         run_completions_command(&cli)
+    } else if cli.print_sandbox {
+        // Host-Verifikation (PL-100 WP0.7): nur ausgeben, nichts binden,
+        // nichts öffnen außer `O_PATH`-Deskriptoren, kein Landlock. Die
+        // Wurzeln hängen nicht von der DoD-Konfiguration ab.
+        run_print_sandbox(&cli, &mut std::io::stdout().lock())
     } else {
         // `--config` wählt einen expliziten, vertrauten Pfad; ohne ihn gilt
         // ausschließlich der feste Systempfad.
@@ -767,7 +791,12 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         .socket
         .clone()
         .unwrap_or_else(|| home.join(cli::DEFAULT_SOCKET_FILE_NAME));
-    let inbox = spawn_ipc_if_available(&socket_path);
+    // PL-100 WP0.5: Sonden-Konten jetzt auflösen -- nach Landlock ist
+    // `/etc/passwd` nicht mehr lesbar.
+    let peers =
+        peer_allow::resolve_probe_peers(&cli.probe_peer_users, Path::new(peer_allow::PASSWD_PATH));
+    log_peer_resolution(&peers);
+    let inbox = spawn_ipc_if_available(&socket_path, peers.allowlist);
 
     // Optionaler Befund-Export (`--findings-export`): vor Landlock öffnen,
     // damit ein Konfigurationsfehler sofort im Log steht; das Verzeichnis
@@ -777,33 +806,16 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
     // neben dem Befundexport); sein Verzeichnis braucht dieselbe Regel.
     let mut health = build_health_exporter(&cli, &settings);
 
-    let mut roots = sandbox::default_roots(
-        &cli.proc_root,
-        &cli.thermal_root,
-        &cli.workspace_root,
-        &cli.blockio_root,
-        &cli.gpu_root,
-        &cli.cgroup_root,
+    let roots = landlock_roots(
+        &cli,
         &home,
-    );
-    if let Some(dir) = exporter
-        .as_ref()
-        .and_then(export::FindingsExporter::directory)
-    {
-        roots.push(sandbox::SandboxRoot::read_write(dir.to_path_buf()));
-    }
-    if let Some(dir) = health
-        .as_ref()
-        .and_then(health_export::HealthExporter::directory)
-    {
-        let same_dir = exporter
+        exporter
             .as_ref()
-            .and_then(export::FindingsExporter::directory)
-            == Some(dir);
-        if !same_dir {
-            roots.push(sandbox::SandboxRoot::read_write(dir.to_path_buf()));
-        }
-    }
+            .and_then(export::FindingsExporter::directory),
+        health
+            .as_ref()
+            .and_then(health_export::HealthExporter::directory),
+    );
     let outcome = sandbox::restrict_self(&roots);
     // `Sentinel` existiert an dieser Stelle noch nicht (siehe unten) — ein
     // degradiertes Ergebnis wird deshalb zwischengespeichert, statt sofort
@@ -828,6 +840,7 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
     let sensor_roots = SensorRoots {
         proc_root: cli.proc_root.clone(),
         thermal_root: cli.thermal_root.clone(),
+        // PL-100 WP0.7: nur mit ausdrücklichem `--workspace-root`.
         workspace_root: cli.workspace_root.clone(),
         blockio_root: cli.blockio_root.clone(),
         gpu_root: cli.gpu_root.clone(),
@@ -909,6 +922,171 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         );
         std::thread::sleep(timing.interval());
     }
+}
+
+/// Baut die Landlock-Wurzeln dieses Laufs.
+///
+/// # Description
+/// Die Sensor-Lesewurzeln und der Root-Space ([`sandbox::default_roots`];
+/// die Workspace-Wurzel nur mit ausdrücklichem `--workspace-root`), dazu
+/// lesend-schreibend das Verzeichnis des Befundexports und — falls ein
+/// anderes — das des Gesundheitsexports. [`run`] und
+/// [`run_print_sandbox`] teilen sich diese Funktion, damit die
+/// Host-Verifikation genau die Liste zeigt, die durchgesetzt wird.
+///
+/// # Arguments
+/// - `cli` (`&Cli`): die geparste Kommandozeile.
+/// - `home` (`&Path`): der aufgelöste Root-Space.
+/// - `findings_dir`, `health_dir` (`Option<&Path>`): die Exportverzeichnisse
+///   (`None`, wenn der jeweilige Export aus ist).
+///
+/// # Returns
+/// Die angeforderten [`sandbox::SandboxRoot`]s, noch ungeprüft — die
+/// Prüfung (keine relative Wurzel, nie `/`) macht
+/// [`sandbox::prepare_roots`].
+fn landlock_roots(
+    cli: &Cli,
+    home: &Path,
+    findings_dir: Option<&Path>,
+    health_dir: Option<&Path>,
+) -> Vec<sandbox::SandboxRoot> {
+    let mut roots = sandbox::default_roots(
+        &cli.proc_root,
+        &cli.thermal_root,
+        cli.workspace_root.as_deref(),
+        &cli.blockio_root,
+        &cli.gpu_root,
+        &cli.cgroup_root,
+        home,
+    );
+    if let Some(dir) = findings_dir {
+        roots.push(sandbox::SandboxRoot::read_write(dir.to_path_buf()));
+    }
+    if let Some(dir) = health_dir
+        && findings_dir != Some(dir)
+    {
+        roots.push(sandbox::SandboxRoot::read_write(dir.to_path_buf()));
+    }
+    roots
+}
+
+/// Das Verzeichnis einer Exportdatei, wie es
+/// [`export::FindingsExporter::directory`] und
+/// [`health_export::HealthExporter::directory`] bilden (`None` für einen
+/// Pfad ohne Elternteil).
+fn export_parent(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
+/// Protokolliert die Startauflösung der Sonden-Konten (PL-100 WP0.5).
+///
+/// # Description
+/// `info`: die zugelassenen uids (nur Zahlen). `warn` je nicht auflösbarem
+/// Eintrag (der konfigurierte Kontoname, kein Pfad, keine Adresse): diese
+/// Sonde kann ihre Ereignisse in diesem Lauf nicht einreichen.
+fn log_peer_resolution(peers: &peer_allow::PeerResolution) {
+    let admitted: Vec<u32> = peers.allowlist.uids().collect();
+    tracing::info!(
+        admitted_uids = ?admitted,
+        resolved = peers.resolved.len(),
+        unresolved = peers.unresolved.len(),
+        "ipc probe peer allowlist resolved"
+    );
+    for entry in &peers.unresolved {
+        tracing::warn!(
+            probe_peer_user = entry.as_str(),
+            "probe peer user could not be resolved; its connections will be rejected"
+        );
+    }
+}
+
+/// Bedient `--print-sandbox` (PL-100 WP0.7, Host-Verifikation).
+///
+/// # Description
+/// Löst den Root-Space und die Exportverzeichnisse genau wie [`run`] auf
+/// (der Befundexport zählt nur, wenn ein `host` auflösbar ist — sonst bleibt
+/// er auch in [`run`] aus), prüft die Wurzeln mit
+/// [`sandbox::prepare_roots`], löst die Sonden-Konten auf und schreibt
+/// beides über [`write_sandbox_report`] nach `out`. Bindet keinen Socket,
+/// öffnet keinen Sink, legt nichts an und ruft kein Landlock auf.
+///
+/// # Arguments
+/// - `cli` (`&Cli`): die geparste Kommandozeile.
+/// - `out` (`&mut dyn std::io::Write`): Ziel des Berichts (stdout).
+///
+/// # Errors
+/// [`error::SentinelBinError::Home`], wenn der Root-Space nicht auflösbar
+/// ist; [`error::SentinelBinError::Report`] bei einem Schreibfehler.
+fn run_print_sandbox(cli: &Cli, out: &mut dyn std::io::Write) -> SentinelBinResult<()> {
+    let home = match cli.home.clone() {
+        Some(path) => path,
+        None => harw_home::paths::home_dir().map_err(SentinelBinError::from)?,
+    };
+    let findings_dir = cli
+        .findings_export
+        .as_deref()
+        .filter(|_| {
+            export::resolve_host(cli.findings_host.as_ref(), Path::new(export::HOSTNAME_PATH))
+                .is_some()
+        })
+        .and_then(export_parent);
+    let health_path = cli.resolved_health_export();
+    let health_dir = health_path.as_deref().and_then(export_parent);
+    let roots = landlock_roots(cli, &home, findings_dir, health_dir);
+    let prepared = sandbox::prepare_roots(&roots);
+    let peers =
+        peer_allow::resolve_probe_peers(&cli.probe_peer_users, Path::new(peer_allow::PASSWD_PATH));
+    write_sandbox_report(out, &prepared, &peers)?;
+    Ok(())
+}
+
+/// Schreibt den Bericht von `--print-sandbox`.
+///
+/// # Description
+/// Tabulatorgetrennt, eine Zeile je Eintrag; Pfade und Kontonamen in
+/// Rust-`Debug`-Quotierung (Steuerzeichen escaped):
+///
+/// ```text
+/// # harw-sentinel effective sandbox (landlock abi v1, not applied by --print-sandbox)
+/// landlock\tread\t"/proc"
+/// landlock\tread-write\t"/var/lib/harw-dod"
+/// landlock-refused\tfilesystem-root\t"/"
+/// ipc-peer-uid\t0\talways
+/// ipc-peer-uid\t991\t"harw-probe-fs"
+/// ipc-peer-unresolved\t"harw-probe-netlink"
+/// ```
+///
+/// # Errors
+/// Jeder Schreibfehler von `out`.
+fn write_sandbox_report(
+    out: &mut dyn std::io::Write,
+    prepared: &sandbox::PreparedRoots,
+    peers: &peer_allow::PeerResolution,
+) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "# harw-sentinel effective sandbox (landlock abi v1, not applied by --print-sandbox)"
+    )?;
+    for accepted in &prepared.accepted {
+        let access = if accepted.root.writable {
+            "read-write"
+        } else {
+            "read"
+        };
+        writeln!(out, "landlock\t{access}\t{:?}", accepted.root.path)?;
+    }
+    for (root, reason) in &prepared.refused {
+        writeln!(out, "landlock-refused\t{}\t{:?}", reason.label(), root.path)?;
+    }
+    writeln!(out, "ipc-peer-uid\t{}\talways", peer_allow::ROOT_UID)?;
+    for peer in &peers.resolved {
+        writeln!(out, "ipc-peer-uid\t{}\t{:?}", peer.uid, peer.entry)?;
+    }
+    for entry in &peers.unresolved {
+        writeln!(out, "ipc-peer-unresolved\t{entry:?}")?;
+    }
+    out.flush()
 }
 
 /// Führt genau eine Poll-Runde aus, loggt sie und wertet ihr Delta aus.
@@ -1274,7 +1452,10 @@ fn drain_external_events(
 /// einer entsprechenden Logmeldung, weil [`ipc`] dort gar nicht erst
 /// kompiliert wird (siehe [`ipc`]-Moduldoku).
 #[cfg(target_os = "linux")]
-fn spawn_ipc_if_available(socket_path: &std::path::Path) -> Option<IpcInboxHandle> {
+fn spawn_ipc_if_available(
+    socket_path: &std::path::Path,
+    allowlist: peer_allow::PeerAllowlist,
+) -> Option<IpcInboxHandle> {
     match ipc::IpcListener::bind(socket_path) {
         Ok(listener) => {
             let inbox: IpcInboxHandle =
@@ -1284,7 +1465,7 @@ fn spawn_ipc_if_available(socket_path: &std::path::Path) -> Option<IpcInboxHandl
             // angefordert war. Die beiden können auseinandergehen, und dann
             // ist die maßgebliche Angabe die des Listeners.
             tracing::info!(path = %listener.path().display(), "ipc receive socket bound");
-            let _handle = ipc::spawn_receive_loop(listener, Arc::clone(&inbox));
+            let _handle = ipc::spawn_receive_loop(listener, Arc::clone(&inbox), allowlist);
             Some(inbox)
         }
         Err(error) => {
@@ -1303,7 +1484,10 @@ fn spawn_ipc_if_available(socket_path: &std::path::Path) -> Option<IpcInboxHandl
 /// jeder anderen Plattform bleibt der IPC-Empfangspfad ungebunden und diese
 /// Funktion gibt stets `None` zurück.
 #[cfg(not(target_os = "linux"))]
-fn spawn_ipc_if_available(socket_path: &std::path::Path) -> Option<IpcInboxHandle> {
+fn spawn_ipc_if_available(
+    socket_path: &std::path::Path,
+    _allowlist: peer_allow::PeerAllowlist,
+) -> Option<IpcInboxHandle> {
     tracing::warn!(
         path = %socket_path.display(),
         "ipc receive path is only implemented on linux; running without it"
@@ -1673,6 +1857,126 @@ egress_allow_cidrs = []
             result,
             Err(ConfigError::InvalidExplicitPath { .. })
         ));
+    }
+
+    /// Der Bericht von `--print-sandbox` als Zeilen (PL-100 WP0.7).
+    fn sandbox_report(args: &[&str]) -> TestResult<Vec<String>> {
+        let mut argv = vec!["harw-sentinel", "--print-sandbox"];
+        argv.extend_from_slice(args);
+        let cli = Cli::try_parse_from(argv).map_err(ctx("valid cli"))?;
+        let mut out: Vec<u8> = Vec::new();
+        run_print_sandbox(&cli, &mut out).map_err(ctx("print sandbox"))?;
+        let text = String::from_utf8(out).map_err(ctx("utf8 report"))?;
+        Ok(text.lines().map(str::to_owned).collect())
+    }
+
+    /// PL-100 WP0.7, Abnahme „Ruleset ≠ /": selbst ein ausdrückliches
+    /// `--workspace-root /` wird keine Leseregel, sondern abgewiesen.
+    #[test]
+    fn test_print_sandbox_refuses_the_filesystem_root_as_workspace() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home_arg = home
+            .path()
+            .to_str()
+            .ok_or(TestError::Missing("utf8 home"))?;
+        let lines = sandbox_report(&["--home", home_arg, "--workspace-root", "/"])?;
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "landlock-refused\tfilesystem-root\t\"/\""),
+            "the root must be reported as refused: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("landlock\t") && line.ends_with("\t\"/\"")),
+            "no rule may name the filesystem root: {lines:?}"
+        );
+        assert!(
+            lines.contains(&format!("landlock\tread-write\t{:?}", home.path())),
+            "home is the writable root: {lines:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_print_sandbox_without_workspace_root_lists_no_working_directory() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home_arg = home
+            .path()
+            .to_str()
+            .ok_or(TestError::Missing("utf8 home"))?;
+        let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
+        let lines = sandbox_report(&["--home", home_arg])?;
+
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.ends_with(&format!("\t{cwd:?}"))),
+            "the working directory is never a root: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "ipc-peer-uid\t0\talways"),
+            "root is always an admitted peer: {lines:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_print_sandbox_reports_numeric_probe_peers() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home_arg = home
+            .path()
+            .to_str()
+            .ok_or(TestError::Missing("utf8 home"))?;
+        let lines = sandbox_report(&["--home", home_arg, "--probe-peer-user", "4242"])?;
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "ipc-peer-uid\t4242\t\"4242\""),
+            "{lines:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_landlock_roots_add_each_export_directory_once() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("valid cli"))?;
+        let export_dir = Path::new("/var/lib/harw-dod/export");
+        let same = landlock_roots(
+            &cli,
+            Path::new("/var/lib/harw-dod"),
+            Some(export_dir),
+            Some(export_dir),
+        );
+        let other = landlock_roots(
+            &cli,
+            Path::new("/var/lib/harw-dod"),
+            Some(export_dir),
+            Some(Path::new("/run/harw-dod")),
+        );
+        let writable = |roots: &[sandbox::SandboxRoot]| roots.iter().filter(|r| r.writable).count();
+        assert_eq!(writable(same.as_slice()), 2, "home + one export directory");
+        assert_eq!(
+            writable(other.as_slice()),
+            3,
+            "home + two export directories"
+        );
+        assert!(
+            same.iter().all(|root| root.path.is_absolute()),
+            "no default root depends on the working directory"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_export_parent_ignores_a_bare_file_name() {
+        assert_eq!(
+            export_parent(Path::new("/var/lib/harw-dod/export/findings.jsonl")),
+            Some(Path::new("/var/lib/harw-dod/export"))
+        );
+        assert_eq!(export_parent(Path::new("findings.jsonl")), None);
     }
 
     /// Deckt die IPC-Inbox-Entleerung ab — ausschließlich über

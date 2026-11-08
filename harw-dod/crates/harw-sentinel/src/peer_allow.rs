@@ -324,7 +324,10 @@ harw-probe-bpf:x:4000:4000:duplicate, ignored:/:/bin/false
             resolution.allowlist.uids().collect::<Vec<_>>(),
             vec![0, 991, 992]
         );
-        assert!(!resolution.allowlist.permits(990), "the sentinel itself is no probe");
+        assert!(
+            !resolution.allowlist.permits(990),
+            "the sentinel itself is no probe"
+        );
         Ok(())
     }
 

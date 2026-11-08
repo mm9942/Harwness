@@ -712,7 +712,9 @@ mod tests {
     use harw_dod_signals::{EventKind, SecurityEvent};
     use harw_types::SensorId;
     use rustix::fd::OwnedFd;
-    use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType};
+    use rustix::net::{
+        AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
+    };
 
     /// Eine Verbindung über ein `socketpair` mit vorgegebener Peer-uid —
     /// für die reine Zulassungsentscheidung ohne lauschenden Socket. Die
@@ -873,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ipc_inbox_rejection_counter_starts_at_zero_and_saturates() {
+    fn test_ipc_inbox_rejection_counter_starts_at_zero_and_counts_each_rejection() {
         let mut inbox = IpcInbox::new(1);
         assert_eq!(inbox.rejected_total(), 0);
         inbox.peer_rejected();
@@ -938,9 +940,8 @@ mod tests {
         let connection = listener.accept().map_err(ctx("accept"))?;
         let own_uid = connection.peer().uid;
         let inbox = Mutex::new(IpcInbox::new(4));
-        let connection =
-            admit_connection(connection, &PeerAllowlist::with_root([own_uid]), &inbox)
-                .ok_or(TestError::Missing("the listed peer is admitted"))?;
+        let connection = admit_connection(connection, &PeerAllowlist::with_root([own_uid]), &inbox)
+            .ok_or(TestError::Missing("the listed peer is admitted"))?;
 
         let event = connection
             .recv_event()
