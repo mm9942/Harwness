@@ -955,6 +955,7 @@ pub fn summarize(lines: &[FindingLine], window: Duration, now: OffsetDateTime) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
     use std::fs;
     use std::io::Write as _;
 
@@ -1530,6 +1531,301 @@ mod tests {
         assert_eq!(summary.by_rule.len(), MAX_SUMMARY_RULES);
         assert_eq!(summary.other_rules, 3);
         assert_eq!(summary.total(), u32::try_from(MAX_SUMMARY_RULES + 3)?);
+        Ok(())
+    }
+
+    // ── PL-100 WP0.12: export v3 ────────────────────────────────────────────
+
+    const FINDING: &str = "3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b";
+    const INSTANCE: &str = "a1b2c3d4-e5f6-4a7b-9c8d-0e1f2a3b4c5d";
+    const DEDUP: &str = "0123456789abcdef0123456789abcdef";
+    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// The v3-only keys (all optional for the reader).
+    const V3_KEYS: [&str; 11] = [
+        "instance",
+        "seq",
+        "record_digest",
+        "dedup_key",
+        "occurrences",
+        "first_seen",
+        "kind",
+        "hardness",
+        "cgroup_kid",
+        "scope_obfuscated",
+        "evidence_card",
+    ];
+
+    /// A complete v3 line, as the sentinel writes it.
+    fn v3_value() -> Value {
+        json!({
+            "schema_version": 3,
+            "finding_id": FINDING,
+            "host": "host-a",
+            "rule_id": "egress-flow",
+            "severity": "high",
+            "summary": "tcp connect",
+            "observed_at": "2026-10-02T11:00:00Z",
+            "scope": "/sys/fs/cgroup/harw.slice/harw-job-1.scope",
+            "instance": INSTANCE,
+            "seq": 7,
+            "record_digest": DIGEST,
+            "dedup_key": DEDUP,
+            "occurrences": 3,
+            "first_seen": "2026-10-02T10:00:00Z",
+            "kind": "rule_triggered",
+            "hardness": "observed",
+            "cgroup_kid": 4242,
+            "scope_obfuscated": false,
+            "evidence_card": {
+                "event_counts": {"tcp_connect": 3},
+                "uid": 1000,
+                "destination": "203.0.113.9:443",
+                "path": "/usr/bin/curl",
+                "process": {"pid": 4711, "comm": "curl"}
+            }
+        })
+    }
+
+    /// `value` with `key` set to `field`.
+    fn with(mut value: Value, key: &str, field: Value) -> Value {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(key.to_owned(), field);
+        }
+        value
+    }
+
+    /// `value` without `key`.
+    fn without(mut value: Value, key: &str) -> Value {
+        if let Some(object) = value.as_object_mut() {
+            object.remove(key);
+        }
+        value
+    }
+
+    #[test]
+    fn accepts_a_complete_v3_line_and_round_trips_it() -> TestResult {
+        let line = parse_finding_line(&v3_value().to_string()).ok_or("v3 line must parse")?;
+        assert_eq!(line.schema_version, Some(3));
+        assert!(line.has_uuid_v4_id());
+        assert_eq!(line.finding_id.as_str(), FINDING);
+        assert_eq!(line.instance.as_deref(), Some(INSTANCE));
+        assert_eq!(line.seq, Some(7));
+        assert_eq!(line.record_digest.as_deref(), Some(DIGEST));
+        assert_eq!(line.dedup_key.as_deref(), Some(DEDUP));
+        assert_eq!(line.occurrences, Some(3));
+        assert_eq!(line.first_seen, Some(at("2026-10-02T10:00:00Z")?));
+        assert_eq!(line.kind, Some(FindingKind::RuleTriggered));
+        assert_eq!(line.hardness, Some(FindingHardness::Observed));
+        assert_eq!(line.cgroup_kid, Some(4242));
+        assert!(!line.scope_obfuscated);
+        assert_eq!(
+            line.scope.as_deref(),
+            Some("/sys/fs/cgroup/harw.slice/harw-job-1.scope")
+        );
+        let card = line.evidence_card.as_ref().ok_or("card kept")?;
+        assert_eq!(card.event_counts.get("tcp_connect"), Some(&3));
+        assert_eq!(card.uid, Some(1000));
+        assert_eq!(card.process.as_ref().map(|p| p.pid), Some(4711));
+
+        // Round trip through the serialized form keeps the line identical.
+        let json = serde_json::to_string(&line)?;
+        let again: FindingLine = serde_json::from_str(&json)?;
+        assert_eq!(again, line);
+
+        // Every v3 field is optional: a v3 line with only the v1/v2 fields
+        // parses, and its v3 fields stay empty.
+        let minimal = V3_KEYS
+            .iter()
+            .fold(v3_value(), |value, key| without(value, key));
+        let parsed = parse_finding_line(&minimal.to_string()).ok_or("minimal v3 line")?;
+        assert_eq!(parsed.instance, None);
+        assert_eq!(parsed.seq, None);
+        assert_eq!(parsed.record_digest, None);
+        assert_eq!(parsed.kind, None);
+        assert_eq!(parsed.evidence_card, None);
+        assert!(!parsed.scope_obfuscated);
+        // The v2-shaped serialization of such a line carries no v3 keys.
+        let json = serde_json::to_string(&parsed)?;
+        for key in V3_KEYS {
+            assert!(!json.contains(&format!("\"{key}\"")), "{key} in {json}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schema_versions_one_to_three_parse_and_v3_requires_uuid_v4_ids() -> TestResult {
+        for version in [1_u32, 2, 3] {
+            let line = with(v3_value(), "schema_version", json!(version));
+            assert_eq!(
+                parse_finding_line(&line.to_string()).map(|l| l.schema_version),
+                Some(Some(version))
+            );
+        }
+        // v1/v2 keep the older id rule; such ids are not UUIDv4.
+        let legacy = with(
+            with(v3_value(), "schema_version", json!(2)),
+            "finding_id",
+            json!("f-1"),
+        );
+        let parsed = parse_finding_line(&legacy.to_string()).ok_or("legacy id on v2")?;
+        assert!(!parsed.has_uuid_v4_id());
+        let unversioned = with(without(v3_value(), "schema_version"), "finding_id", json!("f-1"));
+        assert!(parse_finding_line(&unversioned.to_string()).is_some());
+
+        // From v3 on only the canonical UUIDv4 the sentinel mints.
+        let upper = FINDING.to_uppercase();
+        for bad in [
+            "f-1",
+            upper.as_str(),
+            "{3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6b}",
+            "3f2b8c1e9d4a4b7e8a6f1c2d3e4f5a6b",
+            "00000000-0000-0000-0000-000000000000",
+            "3f2b8c1e-9d4a-1b7e-8a6f-1c2d3e4f5a6b",
+            "3f2b8c1e-9d4a-4b7e-7a6f-1c2d3e4f5a6b",
+            "3f2b8c1e-9d4a-4b7e-8a6f-1c2d3e4f5a6bb",
+        ] {
+            let line = with(v3_value(), "finding_id", json!(bad));
+            assert!(parse_finding_line(&line.to_string()).is_none(), "{bad}");
+            assert!(!is_uuid_v4(bad), "{bad}");
+        }
+        assert!(is_uuid_v4(FINDING));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_v3_identifiers_reject_the_line() {
+        for (key, value) in [
+            ("instance", json!("not-a-uuid")),
+            ("instance", json!(INSTANCE.to_uppercase())),
+            ("seq", json!(0)),
+            ("seq", json!(-1)),
+            ("record_digest", json!("0".repeat(RECORD_DIGEST_HEX_LEN - 1))),
+            ("record_digest", json!(DIGEST.to_uppercase())),
+            ("dedup_key", json!(DIGEST)),
+            ("dedup_key", json!("g".repeat(DEDUP_KEY_HEX_LEN))),
+            ("occurrences", json!(0)),
+            ("first_seen", json!("yesterday")),
+            ("kind", json!("rule-triggered")),
+            ("hardness", json!("certain")),
+            ("cgroup_kid", json!(-5)),
+            ("scope_obfuscated", json!("yes")),
+        ] {
+            let text = with(v3_value(), key, value).to_string();
+            assert!(parse_finding_line(&text).is_none(), "{key}: {text}");
+        }
+    }
+
+    #[test]
+    fn newer_writers_may_add_fields_and_enum_values() -> TestResult {
+        let future = [
+            ("schema_version", json!(4)),
+            ("kind", json!("verdict")),
+            ("hardness", json!("sensed")),
+            ("future_field", json!({"x": 1})),
+            ("evidence_card", json!({"uid": 5, "future": [1]})),
+        ]
+        .into_iter()
+        .fold(v3_value(), |value, (key, field)| with(value, key, field));
+        let line = parse_finding_line(&future.to_string()).ok_or("v4 line must parse")?;
+        assert_eq!(line.kind, None);
+        assert_eq!(line.hardness, None);
+        assert_eq!(line.evidence_card.and_then(|card| card.uid), Some(5));
+
+        // Up to v3 an unknown card key drops the card, never the line.
+        let strict = with(v3_value(), "evidence_card", json!({"uid": 5, "future": [1]}));
+        let line = parse_finding_line(&strict.to_string()).ok_or("v3 line keeps parsing")?;
+        assert_eq!(line.evidence_card, None);
+        assert_eq!(line.seq, Some(7));
+
+        // Malformed identifiers stay fatal for newer writers as well.
+        let bad = with(with(v3_value(), "schema_version", json!(4)), "seq", json!(0));
+        assert!(parse_finding_line(&bad.to_string()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_scope_is_marked_obfuscated_not_silently_dropped() -> TestResult {
+        let zero_width = with(
+            v3_value(),
+            "scope",
+            json!("/harw.slice/harw-job\u{200b}-1.scope"),
+        );
+        let line = parse_finding_line(&zero_width.to_string()).ok_or("line kept")?;
+        assert_eq!(line.scope, None);
+        assert!(line.scope_obfuscated);
+
+        // The writer's own flag is kept.
+        let withheld = with(without(v3_value(), "scope"), "scope_obfuscated", json!(true));
+        let line = parse_finding_line(&withheld.to_string()).ok_or("line kept")?;
+        assert!(line.scope_obfuscated);
+        assert_eq!(line.scope, None);
+
+        // No scope or an empty scope is not an obfuscated one.
+        let empty = with(v3_value(), "scope", json!(""));
+        let line = parse_finding_line(&empty.to_string()).ok_or("line kept")?;
+        assert!(!line.scope_obfuscated);
+        assert_eq!(line.scope, None);
+        let absent = without(v3_value(), "scope");
+        let line = parse_finding_line(&absent.to_string()).ok_or("line kept")?;
+        assert!(!line.scope_obfuscated);
+
+        // The reader marks dropped scopes on v1/v2 lines too.
+        let v2 = with(
+            with(zero_width, "schema_version", json!(2)),
+            "finding_id",
+            json!("f-2"),
+        );
+        assert_eq!(
+            parse_finding_line(&v2.to_string()).map(|l| l.scope_obfuscated),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_card_is_escaped_and_an_oversized_card_is_dropped() -> TestResult {
+        let hostile = with(
+            v3_value(),
+            "evidence_card",
+            json!({
+                "path": "/tmp/\u{202e}fdp.exe",
+                "process": {"pid": 1, "comm": "\u{1b}]0;pwned\u{7}"}
+            }),
+        );
+        let line = parse_finding_line(&hostile.to_string()).ok_or("line kept")?;
+        let card = line.evidence_card.ok_or("card kept")?;
+        assert_eq!(card.path.as_deref(), Some("/tmp/\\u{202e}fdp.exe"));
+        assert!(
+            card.process
+                .is_some_and(|process| harw_untrusted_text::is_clean(&process.comm))
+        );
+
+        let big = with(
+            v3_value(),
+            "evidence_card",
+            json!({"path": "p".repeat(crate::evidence::MAX_EVIDENCE_CARD_BYTES)}),
+        );
+        let line = parse_finding_line(&big.to_string()).ok_or("line kept")?;
+        assert_eq!(line.evidence_card, None);
+        assert_eq!(line.dedup_key.as_deref(), Some(DEDUP));
+        Ok(())
+    }
+
+    #[test]
+    fn future_dated_v3_lines_are_dropped_by_the_line_parser() -> TestResult {
+        let now = at("2026-10-02T12:00:00Z")?;
+        let future = with(v3_value(), "observed_at", json!("2026-10-02T12:30:00Z"));
+        let mut bytes = v3_value().to_string().into_bytes();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(future.to_string().as_bytes());
+        bytes.push(b'\n');
+        let lines = parse_lines(&bytes, now);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines.first().map(|l| l.observed_at),
+            Some(at("2026-10-02T11:00:00Z")?)
+        );
         Ok(())
     }
 }
