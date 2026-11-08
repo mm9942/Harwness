@@ -94,7 +94,7 @@ pub fn count_lines(lines: &[FindingLine], now: OffsetDateTime) -> BTreeMap<Strin
     for line in lines {
         if !line.is_high_or_critical()
             || earliest.is_some_and(|bound| line.observed_at < bound)
-            || latest.is_none_or(|bound| line.observed_at > bound)
+            || latest.is_some_and(|bound| line.observed_at > bound)
         {
             continue;
         }
