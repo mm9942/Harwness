@@ -344,7 +344,7 @@ fn handle_settings_with_save(
         if args.key.is_some() || args.value.is_some() {
             return Err(usage());
         }
-        return Ok(output(&current(ctx)?, &trusted_providers(ctx)));
+        return Ok(output(current(ctx)?.as_ref(), &trusted_providers(ctx)));
     }
     let setting = Setting::parse(args.key.as_deref())?;
     match action {
