@@ -301,6 +301,21 @@ impl ManagedAgentSpawner {
     }
 }
 
+/// `true` für die vom Turn-Loop erzeugten Delegationswerkzeuge
+/// (`transfer_to_<rolle>`, `agents.delegate`, `agents.catalog`).
+///
+/// # Description
+/// Sie haben keinen registrierten Ausführer — der Turn-Loop wickelt sie
+/// selbst ab und bietet sie nur an, wenn die Rolle delegieren darf. Früher
+/// lehnte das Relay ihre Freigabe als „außerhalb der Rolle" ab (Feldbericht
+/// F6): ein Root-Orchestrator-Kind mit mehr als acht Zielen sah nur
+/// `agents.delegate` und konnte je nach Freigabemodus nicht delegieren.
+fn is_generated_delegation_tool(name: &harw_tools::ToolName) -> bool {
+    crate::turn_loop::handoff_role(name).is_some()
+        || name.as_str() == crate::turn_loop::AGENTS_DELEGATE_TOOL
+        || name.as_str() == crate::turn_loop::AGENTS_CATALOG_TOOL
+}
+
 /// Beantwortet die Freigabepausen eines pausierverbotenen Kindes über den
 /// Freigabe-Kanal, bis sein Turn terminal endet.
 ///
@@ -341,7 +356,9 @@ pub async fn relay_child_approvals(
         let role = spawner
             .child_record(child)
             .map_or_else(|| "kind".to_owned(), |record| record.role);
-        let resolution = if find_executor(session, &pending.call.name).is_none() {
+        let resolution = if find_executor(session, &pending.call.name).is_none()
+            && !is_generated_delegation_tool(&pending.call.name)
+        {
             // Keine Rechte-Erweiterung: das Werkzeug gehört nicht zur
             // Werkzeugfläche des Kindes — nicht einmal fragen.
             tracing::warn!(
@@ -382,4 +399,24 @@ pub async fn relay_child_approvals(
     }
     tracing::warn!(child = %child, "child_approval.round_limit_reached");
     Ok(outcome)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_delegation_tools_are_not_outside_the_role() {
+        for name in ["transfer_to_explorer", "agents.delegate", "agents.catalog"] {
+            assert!(
+                is_generated_delegation_tool(&harw_tools::ToolName::new(name)),
+                "{name}"
+            );
+        }
+        for name in ["transfer_to_", "shell.exec", "agents.unknown"] {
+            assert!(
+                !is_generated_delegation_tool(&harw_tools::ToolName::new(name)),
+                "{name}"
+            );
+        }
+    }
 }

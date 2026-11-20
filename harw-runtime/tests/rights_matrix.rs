@@ -1904,3 +1904,27 @@ async fn uia_worker_and_its_siblings_use_the_uia_provider_not_the_default_provid
     }
     Ok(())
 }
+
+/// Ein Root-Orchestrator als Wurzel (`--agent root-orchestrator`) führt
+/// `delegate_wave` tatsächlich aus — früher bekamen es nur Kind-Registries,
+/// während der Lesewächter genau dorthin verwies. Eine Worker-Wurzel nie.
+#[test]
+fn an_explicit_root_orchestrator_root_can_run_delegate_wave() -> TestResult {
+    for (agent, expected) in [
+        (role_names::ROOT_ORCHESTRATOR, true),
+        (role_names::EXPLORER, false),
+    ] {
+        let fixture = fixture_without_uia()?;
+        let mut spec = spec_for(EntryKind::Tui, &fixture);
+        spec.active_agent = Some(agent.to_owned());
+        let assembly = build_with_spec(spec)
+            .map_err(|error| TestError::Unexpected(format!("--agent {agent}: {error}")))?;
+        let tools = assembly.rights_snapshot().tools;
+        assert_eq!(
+            tools.iter().any(|tool| tool == "delegate_wave"),
+            expected,
+            "--agent {agent}: {tools:?}"
+        );
+    }
+    Ok(())
+}

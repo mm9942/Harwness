@@ -98,7 +98,9 @@ pub use mcp_toml::{McpServerToml, McpTransportToml};
 pub use memory_toml::MemorySection;
 pub use merge::{LayerRole, ScopeDiagnostic, merge_layer_toml_into};
 pub use mode_toml::ModeSection;
-pub use model_toml::{ChatReasoningReplay, ModelCapabilitiesToml, ModelToml, PromptCachingMode};
+pub use model_toml::{
+    ChatReasoningReplay, ModelCapabilitiesToml, ModelToml, PromptCachingMode, ReasoningReplayPolicy,
+};
 pub use network_toml::{NetworkSection, ResearchWebMode};
 pub use permissions_toml::{PermissionsSection, RuleToml};
 pub use plan_toml::{ContainerToolsSection, DocSection, PlanSection, RemoteOcrMode, ToolsSection};

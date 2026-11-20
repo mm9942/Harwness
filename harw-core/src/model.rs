@@ -772,7 +772,25 @@ pub enum ModelError {
     /// W3/C-CANCEL), bevor eine Antwort vorlag.
     #[msg("model request was cancelled")]
     Cancelled,
+
+    /// Die native Reasoning-/Thinking-Kontinuität eines früheren Rundenpaars
+    /// (verschlüsseltes Reasoning, signierte Thinking-Blöcke,
+    /// `reasoning_content`) ist nicht mehr verfügbar und der Provider ist auf
+    /// `strict` konfiguriert (sonst wird ohne natives Reasoning gesendet).
+    ///
+    /// Stabiler Fehlercode: [`REPLAY_UNAVAILABLE_CODE`].
+    #[msg("reasoning replay unavailable [HARW-REPLAY-001] ({provider}): {detail}")]
+    ReplayUnavailable {
+        /// Protokoll-Familie des Caches (`responses`, `chat`, `anthropic`).
+        provider: String,
+        /// Was genau fehlt (z. B. verdrängte oder nach Kompaktierung
+        /// veränderte Runde).
+        detail: String,
+    },
 }
+
+/// Stabiler Fehlercode von [`ModelError::ReplayUnavailable`].
+pub const REPLAY_UNAVAILABLE_CODE: &str = "HARW-REPLAY-001";
 
 impl ModelError {
     /// `true`, wenn ein erneuter Versuch derselben Anfrage sinnvoll erscheint.

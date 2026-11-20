@@ -887,7 +887,15 @@ impl AgentSession {
         if let (Some(context), Some(base)) =
             (self.spawn_context.as_mut(), self.base_sandbox.as_ref())
         {
-            context.sandbox = base.restrict(&PermissionRequest::from_permissions(ceiling.iter()));
+            // Der Modus deckelt Rechte, nicht die Netzziele: ohne die
+            // Netzwerk-Reichweite der Basis wäre `NetworkAccess` zwar erlaubt,
+            // aber jedes Ziel verboten (Feldbericht F8 — jeder `web.*`-Aufruf
+            // von Root und Kindern wurde abgelehnt). Ohne `NetworkAccess` im
+            // Deckel bleibt das Netz trotz Reichweite zu.
+            context.sandbox = base.restrict(
+                &PermissionRequest::from_permissions(ceiling.iter())
+                    .with_network_scope(base.network_scope().clone()),
+            );
         }
     }
 

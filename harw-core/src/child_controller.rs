@@ -2995,6 +2995,24 @@ impl ManagedAgentSpawner {
         }
     }
 
+    /// `true`, solange das Kind einen bei der Admission hinterlegten, noch
+    /// nicht verbrauchten Auftrag hat.
+    ///
+    /// # Description
+    /// Bei einer Fortsetzung (`continue_from`) ist dieser Auftrag
+    /// [`crate::child_handoff::continuation_task`] *samt Übergabe des
+    /// Vorgängers*. Ein Aufrufer, der den ersten Lauf mit eigenem User-Text
+    /// startet, würde ihn verdrängen; der durable Job-Submitter startet in
+    /// diesem Fall deshalb ohne User-Text.
+    #[must_use]
+    pub fn has_pending_task(&self, child: &SessionId) -> bool {
+        self.child_tasks.lock().ok().is_some_and(|tasks| {
+            tasks
+                .get(child.as_str())
+                .is_some_and(|state| state.pending_task.is_some())
+        })
+    }
+
     /// Entnimmt den noch nicht verbrauchten Auftrag eines Kindes (einmalig).
     fn take_pending_task(&self, child: &SessionId) -> Option<String> {
         self.child_tasks
@@ -7444,6 +7462,16 @@ impl ManagedAgentSpawner {
         let seed = ledger
             .prepare(caller, from, role)
             .map_err(|error| Self::reject(error.0))?;
+        // Ohne bekannte Sandbox scheitert die Fortsetzung sicher erst in
+        // `bind_continuation` — nach einer verschwendeten Admission. Deshalb
+        // schon hier ablehnen.
+        if seed.sandbox.is_none() {
+            return Err(Self::reject(format!(
+                "continue_from: [HARW-CONT-004] die Sandbox von {from} ist nicht bekannt; \
+                 keine Fortsetzung möglich. Delegiere den Rest neu (ohne continue_from) und \
+                 gib die Übergabe als Auftrag mit."
+            )));
+        }
         // #22 Welle 1B: erst nach der Eigentumsprüfung (kein Orakel über
         // fremde Kinder) — dann der Lebenszyklus der Rolle.
         if let Some(max_attempts) = self.lifecycle_max_attempts(role)? {
@@ -7524,7 +7552,20 @@ impl ManagedAgentSpawner {
                     &seed.origin,
                 )?;
             }
-            ledger.bind(seed).map_err(|error| Self::reject(error.0))?
+            let link = ledger.bind(seed).map_err(|error| Self::reject(error.0))?;
+            // Wird ein Orchestrator fortgesetzt, übernimmt die Fortsetzung
+            // die Übergaben seiner Kinder (HARW-CONT-001 sonst für jedes
+            // `continue_from` auf ein in der Übergabe genanntes Enkelkind).
+            let inherited = ledger.reparent(&seed.of, child);
+            if inherited > 0 {
+                tracing::info!(
+                    child = %child,
+                    predecessor = %seed.of,
+                    inherited,
+                    "child_handoff.children_inherited"
+                );
+            }
+            link
         };
         match self.child_tasks.lock() {
             Ok(mut tasks) => {
@@ -9421,6 +9462,32 @@ impl AgentSpawner for ManagedAgentSpawner {
 
     fn resumable_child_role(&self, caller: &SessionId, child_id: &str) -> Option<String> {
         ManagedAgentSpawner::resumable_child_role(self, caller, child_id)
+    }
+
+    fn pending_background_notices(
+        &self,
+        parent: &SessionId,
+    ) -> Vec<harw_extension_api::PendingBackgroundNotice> {
+        self.background
+            .peek_notices(parent)
+            .iter()
+            .map(|notice| harw_extension_api::PendingBackgroundNotice {
+                child: notice.child.clone(),
+                text: notice.model_text(),
+            })
+            .collect()
+    }
+
+    fn acknowledge_background_notices(&self, parent: &SessionId, children: &[SessionId]) {
+        self.background.ack_notices(parent, children);
+    }
+
+    fn running_background_children(&self, parent: &SessionId) -> usize {
+        self.background.running_for(parent).len()
+    }
+
+    fn cancel_background_children(&self, parent: &SessionId, reason: &str) -> usize {
+        self.cancel_all_background(parent, reason).len()
     }
 }
 
@@ -13646,6 +13713,9 @@ max_depth = 0
         )?;
         let child = children[0].clone();
         seed_pending_task(&spawner, &child, "Fasse die Datei zusammen");
+        // Der durable Job-Submitter startet genau dann ohne User-Text, damit
+        // eine Fortsetzung samt Übergabe nicht verdrängt wird.
+        assert!(spawner.has_pending_task(&child));
         let store = InMemoryStateStore::new();
 
         let result = spawner
@@ -13666,6 +13736,7 @@ max_depth = 0
             state.pending_task, None,
             "the task is consumed exactly once"
         );
+        assert!(!spawner.has_pending_task(&child));
         assert_eq!(result.full_text.as_deref(), Some("erledigt"));
         assert_eq!(state.outcome_detail.as_deref(), Some("erledigt"));
         Ok(())

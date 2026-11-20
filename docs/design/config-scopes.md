@@ -362,7 +362,7 @@ UIA" with a notice. Details: `tui-roles-models-modes.md` §1.1.
 | TOML path | Type | Default | Allowed | Merge today |
 |---|---|---|---|---|
 | `agents.max_root_orchestrators` | `Option<u32>` | `1` | 1–4 | `MinBound` for the untrusted project (`merge_agent_limits`) — 🔒 |
-| `agents.max_sub_orchestrators` | `Option<u32>` | `2` | 1–6 | as above — 🔒 |
+| `agents.max_sub_orchestrators` | `Option<u32>` | `3` | 1–6 | as above — 🔒 |
 | `agents.max_sub_orchestrator_depth` | `Option<u32>` | `2` | 1–3 | as above — 🔒 |
 | `agents.max_spawn_depth` | `Option<u32>` | `4` | 1–6 | as above — 🔒 |
 
@@ -384,7 +384,7 @@ attempt to raise one is ignored and reported as a `ScopeDiagnostic`.
 ```toml
 [agents]
 max_root_orchestrators = 1
-max_sub_orchestrators = 2
+max_sub_orchestrators = 3
 max_sub_orchestrator_depth = 2
 max_spawn_depth = 4
 ```

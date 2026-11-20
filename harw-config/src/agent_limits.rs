@@ -7,7 +7,7 @@
 //! | Schlüssel | Vorgabe | erlaubt | Bedeutung |
 //! |---|---|---|---|
 //! | `max_root_orchestrators` | 1 | 1–4 | gleichzeitig laufende Orchestratoren **der UIA-Wurzel** (Hintergrund und synchron) |
-//! | `max_sub_orchestrators` | 2 | 1–6 | gleichzeitig laufende Sub-Orchestratoren je Root-Orchestrator-Baum |
+//! | `max_sub_orchestrators` | 3 | 1–6 | gleichzeitig laufende Sub-Orchestratoren je Root-Orchestrator-Baum |
 //! | `max_sub_orchestrator_depth` | 2 | 1–3 | Verschachtelung der Sub-Orchestratoren (direkt unter dem Root-Orchestrator = 1) |
 //! | `max_spawn_depth` | 4 | 1–6 | allgemeine Kind-Tiefe unterhalb der Wurzelsitzung (`ChildLimits::max_depth`) |
 //!
@@ -33,7 +33,7 @@ pub const DEFAULT_MAX_ROOT_ORCHESTRATORS: u32 = 1;
 pub const MAX_ROOT_ORCHESTRATORS_RANGE: (u32, u32) = (1, 4);
 
 /// Vorgabe für `[agents] max_sub_orchestrators`.
-pub const DEFAULT_MAX_SUB_ORCHESTRATORS: u32 = 2;
+pub const DEFAULT_MAX_SUB_ORCHESTRATORS: u32 = 3;
 /// Erlaubter Bereich für `[agents] max_sub_orchestrators`.
 pub const MAX_SUB_ORCHESTRATORS_RANGE: (u32, u32) = (1, 6);
 
@@ -108,7 +108,7 @@ impl AgentLimitsToml {
         )
     }
 
-    /// Wirksame `max_sub_orchestrators` (Vorgabe 2, geklemmt auf 1–6).
+    /// Wirksame `max_sub_orchestrators` (Vorgabe 3, geklemmt auf 1–6).
     #[must_use]
     pub fn effective_max_sub_orchestrators(&self) -> u32 {
         clamp_or_default(
@@ -177,7 +177,7 @@ mod tests {
     fn test_defaults_match_the_previous_behaviour() {
         let limits = AgentLimitsToml::default().effective();
         assert_eq!(limits.max_root_orchestrators, 1);
-        assert_eq!(limits.max_sub_orchestrators, 2);
+        assert_eq!(limits.max_sub_orchestrators, 3);
         assert_eq!(limits.max_sub_orchestrator_depth, 2);
         // Bisher fest: `ChildLimits::conservative().max_depth == 4`.
         assert_eq!(limits.max_spawn_depth, 4);

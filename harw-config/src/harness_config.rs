@@ -516,11 +516,11 @@ pub struct GuardsToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_stale_rounds: Option<u32>,
     /// Runde 7, Teil A2: eigene Lesezugriffe eines Orchestrators (über die
-    /// ganze Kind-Sitzung), ab denen gewarnt wird. Vorgabe `4`.
+    /// ganze Kind-Sitzung), ab denen gewarnt wird. Vorgabe `10`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_read_warn: Option<u32>,
     /// Runde 7, Teil A2: höchstens so viele eigene Lesezugriffe eines
-    /// Orchestrators; jeder weitere wird abgelehnt. Vorgabe `5`, `0` schaltet
+    /// Orchestrators; jeder weitere wird abgelehnt. Vorgabe `12`, `0` schaltet
     /// das Lesebudget ab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_read_limit: Option<u32>,

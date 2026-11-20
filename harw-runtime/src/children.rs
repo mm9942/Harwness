@@ -1465,36 +1465,36 @@ impl RuntimeChildRegistryFactory {
     /// (`Arc<CallerIdentity>`, siehe [`Self::child_caller_identity`]), damit
     /// Wissens-Operationen, die über diesen Kontext laufen, identitätsgebunden
     /// lesen ([`delegate_wave_services`]).
+    /// Gibt der Kind-Registry den durablen Job-Submitter der Wurzel — aber
+    /// nur, wenn die Wurzel einen hat.
+    ///
+    /// # Description
+    /// Früher bekam jede Kind-Registry den aufgeschobenen Submitter, auch
+    /// ohne Job-Store oder Freigabe-Akteur an der Wurzel. Die frühe Ablehnung
+    /// „kein Hintergrund-Ausführer" griff dann nie; ein Kind wurde
+    /// admittiert und scheiterte erst danach mit „durable agent job
+    /// submitter is not available". Ohne Submitter lehnt der Turn-Loop die
+    /// Delegation jetzt *vor* der Admission ab.
+    fn with_deferred_job_submitter(
+        &self,
+        builder: harw_extension_api::ExtensionRegistryBuilder,
+    ) -> harw_extension_api::ExtensionRegistryBuilder {
+        if self
+            .agent_job_submitter_slot
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some()
+        {
+            builder.agent_job_submitter(Arc::new(DeferredAgentJobSubmitter {
+                slot: Arc::clone(&self.agent_job_submitter_slot),
+            }))
+        } else {
+            builder
+        }
+    }
+
     fn delegate_wave_provider(&self, identity: Arc<CallerIdentity>) -> ModelToolProvider {
-        // Plan R9, Teil B: ein benutzerdefinierter Agent (als Ziel oder als
-        // Aufrufer) gilt mit Reducer und Delegationszielen seiner Basisrolle.
-        // Eigene `[delegation].targets` eines benutzerdefinierten Aufrufers
-        // gehen vor (sie filtern nur, was sichtbar und registriert ist).
-        let custom: Arc<HashMap<String, harw_registry_defaults::CustomAgentWiring>> =
-            Arc::new(self.custom_agents.clone());
-        let custom_names: Arc<std::collections::HashSet<String>> =
-            Arc::new(self.custom_agents.keys().cloned().collect());
-        let target_custom = Arc::clone(&custom);
-        let policy = harw_core_bridge::DelegateWavePolicy::new(
-            move |role: &str| {
-                let role = target_custom
-                    .get(role)
-                    .map_or(role, |wiring| wiring.base_role.as_str());
-                harw_registry_defaults::authority_reducer_for_role(role).map(|reducer| reducer.id())
-            },
-            move |role: &str| match custom.get(role) {
-                Some(wiring) => wiring.delegation_targets.clone().or_else(|| {
-                    harw_registry_defaults::authority::delegation_targets_for_role(
-                        &wiring.base_role,
-                    )
-                }),
-                None => harw_registry_defaults::authority::delegation_targets_for_role(role),
-            },
-        );
-        // Plan R9, Teil C: benutzerdefinierte Agenten bleiben sichtbar, wenn
-        // eine eingebaute Deklaration nur eingebaute Rollen nennt.
-        let custom_targets = Arc::clone(&custom_names);
-        let policy = policy.with_custom_targets(move |role: &str| custom_targets.contains(role));
+        let policy = delegate_wave_policy(&self.custom_agents);
         let operation: Arc<dyn Operation> =
             Arc::new(harw_core_bridge::DelegateWaveOperation::new(policy));
         let slot = Arc::clone(&self.spawner_slot);
@@ -1868,6 +1868,75 @@ fn dod_services(
     services
 }
 
+/// Die `delegate_wave`-Policy: Reducer und Delegationsziele je Rolle, mit
+/// benutzerdefinierten Agenten über ihre Basisrolle (Plan R9, Teile B/C).
+fn delegate_wave_policy(
+    custom_agents: &HashMap<String, harw_registry_defaults::CustomAgentWiring>,
+) -> harw_core_bridge::DelegateWavePolicy {
+    // Plan R9, Teil B: ein benutzerdefinierter Agent (als Ziel oder als
+    // Aufrufer) gilt mit Reducer und Delegationszielen seiner Basisrolle.
+    // Eigene `[delegation].targets` eines benutzerdefinierten Aufrufers
+    // gehen vor (sie filtern nur, was sichtbar und registriert ist).
+    let custom: Arc<HashMap<String, harw_registry_defaults::CustomAgentWiring>> =
+        Arc::new(custom_agents.clone());
+    let custom_names: Arc<std::collections::HashSet<String>> =
+        Arc::new(custom_agents.keys().cloned().collect());
+    let target_custom = Arc::clone(&custom);
+    let policy = harw_core_bridge::DelegateWavePolicy::new(
+        move |role: &str| {
+            let role = target_custom
+                .get(role)
+                .map_or(role, |wiring| wiring.base_role.as_str());
+            harw_registry_defaults::authority_reducer_for_role(role).map(|reducer| reducer.id())
+        },
+        move |role: &str| match custom.get(role) {
+            Some(wiring) => wiring.delegation_targets.clone().or_else(|| {
+                harw_registry_defaults::authority::delegation_targets_for_role(&wiring.base_role)
+            }),
+            None => harw_registry_defaults::authority::delegation_targets_for_role(role),
+        },
+    );
+    // Plan R9, Teil C: benutzerdefinierte Agenten bleiben sichtbar, wenn
+    // eine eingebaute Deklaration nur eingebaute Rollen nennt.
+    let custom_targets = Arc::clone(&custom_names);
+    policy.with_custom_targets(move |role: &str| custom_targets.contains(role))
+}
+
+/// `delegate_wave` für einen Orchestrator, der selbst die Wurzelsitzung ist
+/// (`--agent root-orchestrator`).
+///
+/// # Description
+/// Bisher bekamen nur Kind-Registries das Werkzeug; ein Root-Orchestrator
+/// als Wurzel sah es in seiner Aktivierung, konnte es aber nicht ausführen,
+/// während ihn der Lesewächter nach dem Lesebudget genau dorthin schickte.
+/// Die Wurzel hält den Spawner ohnehin stark; eine Lauf-Identität für
+/// Wissens-Operationen hat sie (noch) nicht (PL-90/05), `delegate_wave`
+/// braucht keine.
+pub(crate) fn root_delegate_wave_provider(
+    spawner: Arc<ManagedAgentSpawner>,
+    state_store: Arc<dyn StateStore>,
+    custom_agents: &HashMap<String, harw_registry_defaults::CustomAgentWiring>,
+) -> ModelToolProvider {
+    let policy = delegate_wave_policy(custom_agents);
+    let operation: Arc<dyn Operation> =
+        Arc::new(harw_core_bridge::DelegateWaveOperation::new(policy));
+    ModelToolProvider::new([operation], move |execution_context| {
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(&spawner));
+        services.insert(Arc::clone(&state_store));
+        let ctx = OpContext::new(
+            execution_context.session_id().clone(),
+            execution_context.turn_id().clone(),
+            execution_context.sandbox().clone(),
+            services,
+        );
+        match execution_context.cancel() {
+            Some(cancel) => ctx.with_cancel_token(cancel.clone()),
+            None => ctx,
+        }
+    })
+}
+
 /// Die Dienste des `OpContext` von `delegate_wave` (PL-90 W03d).
 ///
 /// # Description
@@ -2139,13 +2208,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // registriert (harw-registry-defaults/src/profile.rs, `approval_handler`
         // in der letzten Stufe der Delegationskette). Eine zweite wäre
         // wirkungsgleich, aber eine Dublette (Befund Z2c-06).
-        let mut registry_builder = child_chain
-            .install_over_default(assembled.registry)
+        let mut registry_builder = self
+            .with_deferred_job_submitter(child_chain.install_over_default(assembled.registry))
             .spawner(Arc::new(DeferredManagedSpawner {
                 slot: Arc::clone(&self.spawner_slot),
-            }))
-            .agent_job_submitter(Arc::new(DeferredAgentJobSubmitter {
-                slot: Arc::clone(&self.agent_job_submitter_slot),
             }))
             // Plan R9, offenes Recherche-Netz (`[network].research_web =
             // "open"`): erste Anfrage je Domain fragt (unter `full` nicht),
@@ -2598,13 +2664,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 message: format!("could not assemble child registry for role '{role}': {error}"),
             })?;
         // `install_over_default`: siehe Begründung in `build_registry`.
-        let registry_builder = child_chain
-            .install_over_default(assembled.registry)
+        let registry_builder = self
+            .with_deferred_job_submitter(child_chain.install_over_default(assembled.registry))
             .spawner(Arc::new(DeferredManagedSpawner {
                 slot: Arc::clone(&self.spawner_slot),
-            }))
-            .agent_job_submitter(Arc::new(DeferredAgentJobSubmitter {
-                slot: Arc::clone(&self.agent_job_submitter_slot),
             }));
         // Plan R9, Teil A: auch der Steward findet und lädt Skills.
         let registry = self
@@ -2982,6 +3045,45 @@ impl AgentSpawner for DeferredManagedSpawner {
             .get()
             .and_then(Weak::upgrade)
             .and_then(|spawner| spawner.resumable_child_role(caller, child_id))
+    }
+
+    // Abschlussmeldungen der Hintergrund-Kinder eines Orchestrator-Kindes.
+    fn pending_background_notices(
+        &self,
+        parent: &harw_types::SessionId,
+    ) -> Vec<harw_extension_api::PendingBackgroundNotice> {
+        self.slot
+            .get()
+            .and_then(Weak::upgrade)
+            .map_or_else(Vec::new, |spawner| {
+                spawner.pending_background_notices(parent)
+            })
+    }
+
+    fn acknowledge_background_notices(
+        &self,
+        parent: &harw_types::SessionId,
+        children: &[harw_types::SessionId],
+    ) {
+        if let Some(spawner) = self.slot.get().and_then(Weak::upgrade) {
+            spawner.acknowledge_background_notices(parent, children);
+        }
+    }
+
+    fn running_background_children(&self, parent: &harw_types::SessionId) -> usize {
+        self.slot
+            .get()
+            .and_then(Weak::upgrade)
+            .map_or(0, |spawner| spawner.running_background_children(parent))
+    }
+
+    fn cancel_background_children(&self, parent: &harw_types::SessionId, reason: &str) -> usize {
+        self.slot
+            .get()
+            .and_then(Weak::upgrade)
+            .map_or(0, |spawner| {
+                spawner.cancel_background_children(parent, reason)
+            })
     }
 }
 

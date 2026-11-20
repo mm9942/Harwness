@@ -1441,6 +1441,193 @@ fn delegation_targets_fragment(
     })
 }
 
+/// Abstand, in dem ein wartendes Orchestrator-Kind nach Ergebnissen seiner
+/// Hintergrund-Kinder sieht (kein Modellaufruf, keine Tokens).
+const BACKGROUND_RESULT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Legt die Abschlussmeldungen der Hintergrund-Kinder dieser Sitzung als
+/// Nutzer-Nachricht in den Verlauf.
+///
+/// # Description
+/// Nur für Kind-Sitzungen (Orchestratoren unter der UIA): die UIA-Wurzel
+/// holt ihre Meldungen über die TUI (Auto-Turn). Früher blieben die
+/// Meldungen der Enkel im Register liegen — ein Orchestrator-Kind erfuhr nie,
+/// was seine Hintergrund-Kinder geliefert hatten.
+///
+/// Zustellung genau einmal: die Meldungen werden nur gelesen, in den Verlauf
+/// gelegt und erst **nach** erfolgreichem Persistieren bestätigt. Scheitert
+/// das Schreiben, wird der Eintrag aus dem Verlauf zurückgenommen und die
+/// Meldungen bleiben im Register — ein Neuversuch stellt sie zu.
+///
+/// # Returns
+/// `true`, wenn mindestens eine Meldung zugestellt wurde.
+///
+/// # Errors
+/// Fehler des [`StateStore`] (dann ist nichts bestätigt).
+async fn inject_background_notices(
+    session: &mut AgentSession,
+    store: &dyn StateStore,
+) -> CoreResult<bool> {
+    if session.parent_session_id().is_none() {
+        return Ok(false);
+    }
+    let Some(spawner) = session.registry().spawner().cloned() else {
+        return Ok(false);
+    };
+    let notices = spawner.pending_background_notices(session.id());
+    if notices.is_empty() {
+        return Ok(false);
+    }
+    let mark = session.history().len();
+    let text = notices
+        .iter()
+        .map(|notice| notice.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    session.history_mut().push_user_text(text);
+    if let Err(error) = persist_last(session, store).await {
+        session.history_mut().truncate(mark);
+        return Err(error);
+    }
+    let children: Vec<harw_types::SessionId> =
+        notices.into_iter().map(|notice| notice.child).collect();
+    spawner.acknowledge_background_notices(session.id(), &children);
+    tracing::info!(
+        session = %session.id(),
+        notices = children.len(),
+        "turn_loop.background_notices_delivered"
+    );
+    Ok(true)
+}
+
+/// Bricht die noch laufenden Hintergrund-Kinder einer abgebrochenen
+/// Kind-Sitzung ab.
+///
+/// # Description
+/// Zentral in [`cancel_turn`] (auch über `cancel_turn_with_pending_calls`),
+/// damit **jeder** abgebrochene Ausgang eines Orchestrator-Kindes seine
+/// Hintergrund-Kinder mitnimmt — auch wenn der Abbruch erst nach einer
+/// zugestellten Meldung in der nächsten Runde greift. Ihre Ergebnisse
+/// erreichten sonst nie mehr einen Elternteil. Die UIA-Wurzel ist
+/// ausgenommen: dort verwaltet die TUI ihre Hintergrund-Agenten selbst
+/// (`/new`, `/resume`, Beenden), ein abgebrochener UIA-Turn beendet sie nicht.
+fn cancel_owned_background_children(session: &AgentSession, reason: CancelReason) {
+    if session.parent_session_id().is_none() {
+        return;
+    }
+    let Some(spawner) = session.registry().spawner() else {
+        return;
+    };
+    if spawner.running_background_children(session.id()) == 0 {
+        return;
+    }
+    let cancelled = spawner.cancel_background_children(session.id(), "parent turn cancelled");
+    tracing::info!(
+        session = %session.id(),
+        ?reason,
+        cancelled,
+        "turn_loop.background_children_cancelled_with_parent"
+    );
+}
+
+/// Ergebnis des Wartens auf Hintergrund-Kinder am Turn-Ende.
+#[derive(Debug)]
+enum BackgroundWait {
+    /// Mindestens eine Meldung liegt im Verlauf; der Turn läuft weiter.
+    Delivered,
+    /// Kein Kind läuft (mehr) oder keine Kind-Sitzung: der Turn endet normal.
+    Idle,
+    /// Abbruch oder Budget-/Zeitende während des Wartens; bereits
+    /// vorliegende Meldungen sind zugestellt, die laufenden Hintergrund-Kinder
+    /// bricht [`cancel_turn`] ab.
+    Stopped(CancelReason),
+}
+
+/// Wartet am Ende eines Orchestrator-Kind-Turns auf Ergebnisse noch
+/// laufender Hintergrund-Kinder.
+///
+/// # Description
+/// Gewartet wird ohne Modellaufruf ([`BACKGROUND_RESULT_POLL`]). Ein
+/// Abbruch, ein erschöpftes Budget oder die Wanduhr des Turns beenden das
+/// Warten als [`BackgroundWait::Stopped`] — nie als Erfolg. Der Aufrufer
+/// endet dann über [`cancel_turn`], das die noch laufenden Hintergrund-Kinder
+/// dieser Sitzung abbricht ([`cancel_owned_background_children`]).
+///
+/// # Errors
+/// Fehler des [`StateStore`] beim Zustellen.
+async fn await_background_results(
+    session: &mut AgentSession,
+    store: &dyn StateStore,
+    control: &TurnControl,
+) -> CoreResult<BackgroundWait> {
+    if session.parent_session_id().is_none() {
+        return Ok(BackgroundWait::Idle);
+    }
+    let Some(spawner) = session.registry().spawner().cloned() else {
+        return Ok(BackgroundWait::Idle);
+    };
+    loop {
+        // Erst der Stopp-Prüfpunkt, dann die Zustellung. Bei einem Stopp
+        // werden die noch laufenden Geschwister *vor* dem fehlbaren
+        // Schreibversuch abgebrochen — ein Schreibfehler darf sie nicht
+        // weiterlaufen lassen. Eine bereits vorliegende Meldung wird danach
+        // noch geschrieben und bestätigt; scheitert das, bleibt sie
+        // unbestätigt im Register (siehe `inject_background_notices`).
+        if let Some(reason) = control
+            .model_checkpoint()
+            .or_else(|| control.tool_checkpoint(0))
+        {
+            cancel_owned_background_children(session, reason);
+            inject_background_notices(session, store).await?;
+            tracing::info!(
+                session = %session.id(),
+                ?reason,
+                "turn_loop.background_wait_stopped"
+            );
+            return Ok(BackgroundWait::Stopped(reason));
+        }
+        if inject_background_notices(session, store).await? {
+            return Ok(BackgroundWait::Delivered);
+        }
+        if spawner.running_background_children(session.id()) == 0 {
+            return Ok(BackgroundWait::Idle);
+        }
+        tokio::time::sleep(BACKGROUND_RESULT_POLL).await;
+    }
+}
+
+/// Text der Werkzeug-Antwort auf eine abgelehnte Delegation.
+///
+/// # Description
+/// Bekannte Ablehnungen (Orchestrierungsgrenze, abgelehnte Fortsetzung,
+/// Plan-Modus, typisierte Kapazitäts-/Tiefengrenzen) behalten ihren Text.
+/// Alle übrigen (z. B. nicht registrierte Rolle, fehlende Sandbox, ein nach
+/// `prepare` gescheiterter Fortsetzungsschritt) bekommen den stabilen Code
+/// `HARW-ORCH-001` und einen Hinweis — früher brachen sie als
+/// `CoreError::HandoffFailed` den ganzen Turn des Orchestrators ab.
+fn spawn_rejection_text(role: &str, error: &harw_extension_api::AgentSpawnError) -> String {
+    let known = crate::background_children::is_orchestration_limit_rejection(&error.message)
+        || crate::child_handoff::is_continuation_rejection(&error.message)
+        || crate::delegation_visibility::is_plan_mode_refusal(&error.message)
+        || error.kind != harw_extension_api::SpawnRejectionKind::Other;
+    tracing::warn!(
+        code = "HARW-ORCH-001",
+        role,
+        kind = ?error.kind,
+        reason = %error.message,
+        "turn_loop.delegation_rejected"
+    );
+    if known {
+        error.message.clone()
+    } else {
+        format!(
+            "[HARW-ORCH-001] Delegation an '{role}' abgelehnt: {}. Dein Turn läuft weiter: \
+             prüfe Rolle, Sandbox und Grenzen, oder schneide den Auftrag neu zu.",
+            error.message
+        )
+    }
+}
+
 /// Wickelt eine Fortsetzungs-Instruktion nach einem `MaxTokens`-Abbruch in
 /// einen [`harw_context::Fragment`]-Block (Trust-Klasse `Instruction`), damit
 /// sie wie die übrigen Instructions in die Kontextmontage eingeht. Ein
@@ -4117,33 +4304,21 @@ async fn resume_after_approval_with_store(
                         .await
                     {
                         Ok(child) => child,
-                        // Runde 5, Teil K: eine Orchestrierungsgrenze ist eine
-                        // Antwort an das Modell, kein Turn-Abbruch.
-                        // Runde 5, Teil J: ebenso eine abgelehnte Fortsetzung.
-                        Err(error)
-                            if crate::background_children::is_orchestration_limit_rejection(
-                                &error.message,
-                            ) || crate::child_handoff::is_continuation_rejection(
-                                &error.message,
-                            ) || crate::delegation_visibility::is_plan_mode_refusal(
-                                &error.message,
-                            ) =>
-                        {
+                        // Runde 5, Teile J/K: eine Orchestrierungsgrenze oder
+                        // abgelehnte Fortsetzung ist eine Antwort an das Modell,
+                        // kein Turn-Abbruch — ebenso jede andere abgelehnte
+                        // Admission (HARW-ORCH-001), damit ein Orchestrator
+                        // nachsteuern kann statt seinen ganzen Turn zu verlieren.
+                        Err(error) => {
                             drop(permit);
                             session.history_mut().push_tool_result(
                                 pending.call.id,
-                                ToolCallResult::error(error.message),
+                                ToolCallResult::error(spawn_rejection_text(&role, &error)),
                                 0,
                             );
                             persist_last(session, store).await?;
                             return drive_turn(session, model, store, approvals, &ctx, handle, control)
                                 .await;
-                        }
-                        Err(error) => {
-                            return Err(CoreError::HandoffFailed {
-                                role: role.clone(),
-                                reason: error.to_string(),
-                            });
                         }
                     };
                     // Ein genehmigungspflichtiger Handoff wird ausschließlich hier
@@ -4371,9 +4546,17 @@ async fn drive_turn(
     // ehrlichen `Truncated`-Ausgang mitsamt bereits persistiertem Teiltext.
     const MAX_AUTOMATIC_CONTINUATIONS: u32 = 3;
     const CONTINUATION_INSTRUCTION: &str = "Die unmittelbar vorherige Assistant-Antwort wurde wegen eines Ausgabelimits abgeschnitten. Setze exakt an ihrer letzten Stelle fort, ohne Text zu wiederholen oder neu anzufangen. Schließe den ursprünglichen Auftrag eigenständig ab.";
+    const TOOL_CALL_SPLIT_INSTRUCTION: &str = "Deine unmittelbar vorherigen Werkzeugaufrufe wurden wegen des Ausgabelimits abgeschnitten und NICHT ausgeführt. Wiederhole sie kleiner: weniger Aufrufe pro Antwort, weniger Ziele pro delegate_wave, kürzere Aufträge und Argumente.";
 
     let mut total_usage = harw_types::TokenUsage::default();
+    // Zählt *aufeinanderfolgende* Abschneidungen: jede angenommene Runde, die
+    // nicht mit `MaxTokens` endet, setzt Zähler und Anweisung zurück. Früher
+    // galt die Grenze pro Turn und die Fortsetzungsanweisung hing ab der
+    // ersten Abschneidung an *jeder* weiteren Runde — lange
+    // Orchestrator-Turns endeten so grundlos als `Truncated`, und das Modell
+    // las in normalen Tool-Runden „setze exakt an der letzten Stelle fort".
     let mut automatic_continuations = 0u32;
+    let mut continuation_instruction: Option<&'static str> = None;
     // Fortlaufende Modell-Runden-Nummer dieses `drive_turn`-Aufrufs, für
     // `UsageRound::round` — bei jedem Modellaufruf inkrementiert, bevor die
     // Runde persistiert wird.
@@ -4469,7 +4652,10 @@ async fn drive_turn(
         // 1./2./4a. Context + Instructions + Request-Montage (siehe
         // `assemble_round_request`). Eine Wiederholung nach Notfall-
         // Kompaktierung baut den Request über denselben Weg neu.
-        let continuation = (automatic_continuations > 0).then_some(CONTINUATION_INSTRUCTION);
+        // Abschlussmeldungen von Hintergrund-Kindern eines Orchestrator-Kindes
+        // gehen in diese Runde (die UIA-Wurzel bekommt ihre über die TUI).
+        inject_background_notices(session, store).await?;
+        let continuation = continuation_instruction;
         let mut request = assemble_round_request(
             session,
             ctx,
@@ -4753,6 +4939,10 @@ async fn drive_turn(
                 continue;
             }
         }
+        if !matches!(response.stop, crate::model::StopReason::MaxTokens) {
+            automatic_continuations = 0;
+            continuation_instruction = None;
+        }
         // Antwort angenommen: die Einmal-Wiederholungen gelten wieder für
         // den nächsten Request, das angehobene Ausgabelimit nur für die
         // eine wiederholte Runde.
@@ -4839,6 +5029,33 @@ async fn drive_turn(
         // nicht verliert.
         if !response_had_no_tool_calls {
             match response_stop {
+                // Auch nach der Wiederholung mit verdoppeltem Limit zu lang:
+                // die Calls werden verworfen (nie ausgeführt) und das Modell
+                // aufgefordert, sie kleiner zu schneiden — statt den ganzen
+                // (Orchestrator-)Turn als `Truncated` zu beenden.
+                crate::model::StopReason::MaxTokens
+                    if automatic_continuations < MAX_AUTOMATIC_CONTINUATIONS =>
+                {
+                    automatic_continuations += 1;
+                    continuation_instruction = Some(TOOL_CALL_SPLIT_INSTRUCTION);
+                    tracing::info!(
+                        continuation = automatic_continuations,
+                        dropped_tool_calls = response.tool_calls.len(),
+                        "turn_loop.auto_continue_after_truncated_tool_calls"
+                    );
+                    let appended_tokens = appended_tokens_since(session, history_mark);
+                    maybe_compact(
+                        session,
+                        model,
+                        store,
+                        &last_round_usage,
+                        appended_tokens,
+                        false,
+                        &mut last_compaction_tokens_after,
+                    )
+                    .await;
+                    continue;
+                }
                 crate::model::StopReason::MaxTokens
                 | crate::model::StopReason::ContextWindowExceeded => {
                     return finish_model_stop(
@@ -4907,6 +5124,7 @@ async fn drive_turn(
                     if automatic_continuations < MAX_AUTOMATIC_CONTINUATIONS =>
                 {
                     automatic_continuations += 1;
+                    continuation_instruction = Some(CONTINUATION_INSTRUCTION);
                     tracing::info!(
                         continuation = automatic_continuations,
                         "turn_loop.auto_continue_after_max_tokens"
@@ -4955,7 +5173,21 @@ async fn drive_turn(
                     )
                     .await;
                 }
-                _ => break,
+                _ => {
+                    // Ein Orchestrator-Kind endet nicht vor seinen eigenen
+                    // Hintergrund-Kindern: deren Ergebnisse kämen sonst nie an
+                    // (die TUI liefert sie nur der UIA-Wurzel).
+                    match await_background_results(session, store, &control).await? {
+                        BackgroundWait::Delivered => continue,
+                        BackgroundWait::Idle => break,
+                        // Abbruch oder Budget-Ende während des Wartens ist
+                        // kein Erfolg: ehrlich abbrechen (die Kinder wurden
+                        // mit abgebrochen).
+                        BackgroundWait::Stopped(reason) => {
+                            return cancel_turn(session, handle, total_usage, reason).await;
+                        }
+                    }
+                }
             }
         }
 
@@ -5289,15 +5521,11 @@ async fn drive_turn(
                 // Runde 5, Teil K: eine Orchestrierungsgrenze (`[agents]`) ist
                 // eine Antwort an das Modell — Werkzeugfehler statt Turn-Abbruch.
                 // Runde 5, Teil J: ebenso eine abgelehnte Fortsetzung
-                // (`continue_from`), damit das Modell nachsteuern kann.
-                if let Err(error) = &spawned
-                    && (crate::background_children::is_orchestration_limit_rejection(
-                        &error.message,
-                    ) || crate::child_handoff::is_continuation_rejection(&error.message)
-                        || crate::delegation_visibility::is_plan_mode_refusal(&error.message))
-                {
+                // (`continue_from`), damit das Modell nachsteuern kann; und
+                // jede andere abgelehnte Admission (HARW-ORCH-001).
+                if let Err(error) = &spawned {
                     drop(permit);
-                    let mut result = ToolCallResult::error(error.message.clone());
+                    let mut result = ToolCallResult::error(spawn_rejection_text(&role, error));
                     let abort_reason = apply_tool_guard(
                         session,
                         store,
@@ -5329,10 +5557,10 @@ async fn drive_turn(
                     }
                     continue;
                 }
-                let child = spawned.map_err(|e| CoreError::HandoffFailed {
-                    role: role.clone(),
-                    reason: e.to_string(),
-                })?;
+                // Jeder Fehler wurde oben als Werkzeug-Antwort beantwortet.
+                let Ok(child) = spawned else {
+                    continue;
+                };
                 let question = child_question(&handoff_arguments);
                 emit(
                     session,
@@ -6573,6 +6801,7 @@ async fn cancel_turn(
     total_usage: harw_types::TokenUsage,
     reason: CancelReason,
 ) -> CoreResult<TurnOutcome> {
+    cancel_owned_background_children(session, reason);
     emit(
         session,
         TurnEvent::TurnAborted {
@@ -10809,6 +11038,482 @@ mod tests {
         }
     }
 
+    /// Ein Spawner mit genau einem laufenden Hintergrund-Kind, dessen
+    /// Abschlussmeldung ab der `ready_after`-ten Abfrage bereitliegt, bis sie
+    /// bestätigt wird.
+    struct BackgroundResultSpawner {
+        polls: AtomicUsize,
+        ready_after: usize,
+        child: harw_types::SessionId,
+        acknowledged: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    impl BackgroundResultSpawner {
+        fn new(ready_after: usize) -> Arc<Self> {
+            Arc::new(Self {
+                polls: AtomicUsize::new(0),
+                ready_after,
+                child: harw_types::SessionId::new(),
+                acknowledged: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+            })
+        }
+
+        fn done(&self) -> bool {
+            self.acknowledged.load(Ordering::SeqCst) > 0
+                || self.cancelled.load(Ordering::SeqCst) > 0
+        }
+    }
+
+    impl AgentSpawner for BackgroundResultSpawner {
+        fn spawn_child<'a>(
+            &'a self,
+            _role: &'a str,
+            _input: SpawnInput,
+            _sandbox: SandboxSpec,
+            _suggestions: Option<AgentSuggestions>,
+        ) -> SpawnFuture<'a> {
+            Box::pin(async move { Err(harw_extension_api::AgentSpawnError::new("unused")) })
+        }
+
+        fn pending_background_notices(
+            &self,
+            _parent: &harw_types::SessionId,
+        ) -> Vec<harw_extension_api::PendingBackgroundNotice> {
+            let polls = self.polls.fetch_add(1, Ordering::SeqCst);
+            if polls >= self.ready_after && !self.done() {
+                vec![harw_extension_api::PendingBackgroundNotice {
+                    child: self.child.clone(),
+                    text: "[Hintergrund-Agent explorer k1 fertig nach 3 s]\nBefund X".to_owned(),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn acknowledge_background_notices(
+            &self,
+            _parent: &harw_types::SessionId,
+            children: &[harw_types::SessionId],
+        ) {
+            if children.contains(&self.child) {
+                self.acknowledged.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn running_background_children(&self, _parent: &harw_types::SessionId) -> usize {
+            usize::from(!self.done())
+        }
+
+        fn cancel_background_children(
+            &self,
+            _parent: &harw_types::SessionId,
+            _reason: &str,
+        ) -> usize {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+            1
+        }
+    }
+
+    fn orchestrator_child_session(
+        spawner: &Arc<BackgroundResultSpawner>,
+    ) -> TestResult<AgentSession> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::clone(spawner) as Arc<dyn AgentSpawner>)
+            .build();
+        Ok(AgentSession::new(
+            AgentRole::Assistant,
+            Some(harw_types::SessionId::new()),
+            registry,
+            tx,
+        )
+        .with_spawn_context(test_spawn_context()?))
+    }
+
+    fn user_texts_containing(session: &AgentSession, needle: &str) -> usize {
+        session
+            .history()
+            .items()
+            .iter()
+            .filter(|item| match item {
+                TurnItem::UserMessage(message) => format!("{:?}", message.content).contains(needle),
+                _ => false,
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn an_orchestrator_child_waits_for_its_background_children_before_finishing() -> TestResult
+    {
+        // Abfrage 0: Rundenbeginn, 1: Turn-Ende (läuft noch, eine
+        // Warteschleife), 2: Ergebnis da.
+        let spawner = BackgroundResultSpawner::new(2);
+        let mut session = orchestrator_child_session(&spawner)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            crate::model::ModelResponse::text("Welle gestartet, warte auf Ergebnisse."),
+            crate::model::ModelResponse::text("Synthese mit Befund X."),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("auftrag"))
+            .await
+            .map_err(ctx("der Turn läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert_eq!(user_texts_containing(&session, "Befund X"), 1);
+        assert_eq!(spawner.acknowledged.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.cancelled.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_while_waiting_is_a_cancel_not_a_success() -> TestResult {
+        let spawner = BackgroundResultSpawner::new(usize::MAX);
+        let mut session = orchestrator_child_session(&spawner)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("warte")]);
+        let token = crate::cancel::CancelToken::new();
+        let control = TurnControl::new().with_cancel(token.clone());
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            token.cancel(CancelReason::User);
+        });
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("auftrag").with_control(control),
+        )
+        .await
+        .map_err(ctx("der Turn endet mit Abbruch"))?;
+        canceller
+            .await
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            spawner.cancelled.load(Ordering::SeqCst),
+            1,
+            "die wartenden Hintergrund-Kinder werden mit abgebrochen"
+        );
+        Ok(())
+    }
+
+    /// Ein Kind ist fertig (Meldung wartet, sobald `ready`), ein Geschwister
+    /// läuft noch.
+    struct TwoChildrenSpawner {
+        finished: harw_types::SessionId,
+        ready: std::sync::atomic::AtomicBool,
+        acknowledged: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    impl TwoChildrenSpawner {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                finished: harw_types::SessionId::new(),
+                ready: std::sync::atomic::AtomicBool::new(false),
+                acknowledged: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl AgentSpawner for TwoChildrenSpawner {
+        fn spawn_child<'a>(
+            &'a self,
+            _role: &'a str,
+            _input: SpawnInput,
+            _sandbox: SandboxSpec,
+            _suggestions: Option<AgentSuggestions>,
+        ) -> SpawnFuture<'a> {
+            Box::pin(async move { Err(harw_extension_api::AgentSpawnError::new("unused")) })
+        }
+
+        fn pending_background_notices(
+            &self,
+            _parent: &harw_types::SessionId,
+        ) -> Vec<harw_extension_api::PendingBackgroundNotice> {
+            if self.ready.load(Ordering::SeqCst) && self.acknowledged.load(Ordering::SeqCst) == 0 {
+                vec![harw_extension_api::PendingBackgroundNotice {
+                    child: self.finished.clone(),
+                    text: "[Hintergrund-Agent explorer k1 fertig nach 3 s]\nBefund Y".to_owned(),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn acknowledge_background_notices(
+            &self,
+            _parent: &harw_types::SessionId,
+            children: &[harw_types::SessionId],
+        ) {
+            if children.contains(&self.finished) {
+                self.acknowledged.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn running_background_children(&self, _parent: &harw_types::SessionId) -> usize {
+            usize::from(self.cancelled.load(Ordering::SeqCst) == 0)
+        }
+
+        fn cancel_background_children(
+            &self,
+            _parent: &harw_types::SessionId,
+            _reason: &str,
+        ) -> usize {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+            1
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_parent_keeps_a_finished_result_and_cancels_the_running_sibling()
+    -> TestResult {
+        let spawner = TwoChildrenSpawner::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::clone(&spawner) as Arc<dyn AgentSpawner>)
+            .build();
+        let mut session = AgentSession::new(
+            AgentRole::Assistant,
+            Some(harw_types::SessionId::new()),
+            registry,
+            tx,
+        )
+        .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        // Der Token ist schon abgebrochen, wenn das Turn-Ende erreicht wird:
+        // der Abbruch kommt nach der Modellantwort, vor dem Warten.
+        let token = crate::cancel::CancelToken::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("warte auf Kinder")]);
+        let control = TurnControl::new().with_cancel(token.clone());
+        // Während das Turn-Ende wartet: ein Kind wird fertig, dann kommt der
+        // Abbruch — die nächste Prüfung sieht beides zugleich.
+        let _finisher = finish_then_cancel(Arc::clone(&spawner), token);
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("auftrag").with_control(control),
+        )
+        .await
+        .map_err(ctx("der Turn endet mit Abbruch"))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            spawner.acknowledged.load(Ordering::SeqCst),
+            1,
+            "das fertige Ergebnis wird geschrieben und bestätigt"
+        );
+        assert_eq!(user_texts_containing(&session, "Befund Y"), 1);
+        assert_eq!(
+            spawner.cancelled.load(Ordering::SeqCst),
+            1,
+            "das laufende Geschwister wird mit abgebrochen"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_on_cancel_still_cancels_the_sibling_and_keeps_the_notice() -> TestResult
+    {
+        let spawner = TwoChildrenSpawner::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::clone(&spawner) as Arc<dyn AgentSpawner>)
+            .build();
+        let mut session = AgentSession::new(
+            AgentRole::Assistant,
+            Some(harw_types::SessionId::new()),
+            registry,
+            tx,
+        )
+        .with_spawn_context(test_spawn_context()?);
+        let store = FailOnceStore {
+            inner: crate::state_store::InMemoryStateStore::new(),
+            needle: "Befund Y",
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let token = crate::cancel::CancelToken::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("warte auf Kinder")]);
+        let control = TurnControl::new().with_cancel(token.clone());
+        // Während das Turn-Ende wartet: ein Kind wird fertig, dann kommt der
+        // Abbruch — die nächste Prüfung sieht beides zugleich.
+        let _finisher = finish_then_cancel(Arc::clone(&spawner), token);
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("auftrag").with_control(control),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "der Schreibfehler bleibt sichtbar: {outcome:?}"
+        );
+        assert_eq!(
+            spawner.cancelled.load(Ordering::SeqCst),
+            1,
+            "das laufende Geschwister wird trotz Schreibfehler genau einmal abgebrochen"
+        );
+        assert_eq!(
+            spawner.acknowledged.load(Ordering::SeqCst),
+            0,
+            "die nicht geschriebene Meldung bleibt unbestätigt im Register"
+        );
+        assert_eq!(user_texts_containing(&session, "Befund Y"), 0);
+        Ok(())
+    }
+
+    /// Macht nach kurzer Zeit ein Kind fertig und bricht dann den Token ab.
+    fn finish_then_cancel(
+        spawner: Arc<TwoChildrenSpawner>,
+        token: crate::cancel::CancelToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            spawner.ready.store(true, Ordering::SeqCst);
+            token.cancel(CancelReason::User);
+        })
+    }
+
+    #[tokio::test]
+    async fn wall_time_expiry_while_waiting_ends_as_budget() -> TestResult {
+        let spawner = BackgroundResultSpawner::new(usize::MAX);
+        let mut session = orchestrator_child_session(&spawner)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("warte")]);
+        let control = TurnControl::new().with_limits(TurnLimits {
+            wall_time: Duration::from_secs(1),
+            ..TurnLimits::unlimited()
+        });
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("auftrag").with_control(control),
+        )
+        .await
+        .map_err(ctx("der Turn endet mit Budget-Ende"))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::Budget
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(spawner.cancelled.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Scheitert genau einmal beim Schreiben einer Nutzer-Nachricht, die
+    /// `needle` enthält; sonst wie ein `InMemoryStateStore`.
+    struct FailOnceStore {
+        inner: crate::state_store::InMemoryStateStore,
+        needle: &'static str,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl StateStore for FailOnceStore {
+        fn save_turn<'a>(
+            &'a self,
+            sid: &'a SessionId,
+            item: &'a TurnItem,
+        ) -> harw_extension_api::ExtFuture<'a, crate::state_store::StateStoreResult<()>> {
+            let hit = matches!(item, TurnItem::UserMessage(message)
+                if format!("{:?}", message.content).contains(self.needle));
+            if hit && !self.failed.swap(true, Ordering::SeqCst) {
+                return Box::pin(async {
+                    Err(crate::state_store::StateStoreError::PoisonedMutex {
+                        operation: "test_fail_once",
+                    })
+                });
+            }
+            self.inner.save_turn(sid, item)
+        }
+
+        fn load_history<'a>(
+            &'a self,
+            sid: &'a SessionId,
+        ) -> harw_extension_api::ExtFuture<
+            'a,
+            crate::state_store::StateStoreResult<crate::history::ConversationHistory>,
+        > {
+            self.inner.load_history(sid)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_keeps_the_notice_for_exactly_one_later_delivery() -> TestResult {
+        let spawner = BackgroundResultSpawner::new(0);
+        let mut session = orchestrator_child_session(&spawner)?;
+        let store = FailOnceStore {
+            inner: crate::state_store::InMemoryStateStore::new(),
+            needle: "Befund X",
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let first = run_turn(
+            &mut session,
+            &ScriptedModel::new(vec![crate::model::ModelResponse::text("eins")]),
+            &store,
+            TurnInput::user("auftrag"),
+        )
+        .await;
+        assert!(first.is_err(), "der Schreibfehler bricht den Turn ab");
+        assert_eq!(
+            spawner.acknowledged.load(Ordering::SeqCst),
+            0,
+            "nicht geschriebene Meldungen werden nicht bestätigt"
+        );
+        assert_eq!(user_texts_containing(&session, "Befund X"), 0);
+
+        // Der reguläre Weg aus `Failed`: Recovery, dann der Neuversuch.
+        session
+            .recover()
+            .map_err(ctx("die Session lässt sich wiederherstellen"))?;
+        let second = run_turn(
+            &mut session,
+            &ScriptedModel::new(vec![crate::model::ModelResponse::text("Synthese")]),
+            &store,
+            TurnInput::user("weiter"),
+        )
+        .await
+        .map_err(ctx("der Neuversuch läuft durch"))?;
+        assert!(matches!(second, TurnOutcome::Completed), "{second:?}");
+        assert_eq!(user_texts_containing(&session, "Befund X"), 1);
+        assert_eq!(spawner.acknowledged.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
     /// Runde 5, Teil K: eine Orchestrierungsgrenze bricht den Turn nicht ab,
     /// sondern kommt als Werkzeugfehler beim Modell an.
     #[tokio::test]
@@ -13842,6 +14547,8 @@ mod tests {
         >,
         /// Je Turn-Request: geschätzte Bytes und gesetztes Ausgabelimit.
         requests: Mutex<Vec<(u64, Option<u32>)>>,
+        /// Je Turn-Request: die Debug-Darstellung (für Anweisungs-Prüfungen).
+        rendered: Mutex<Vec<String>>,
     }
 
     impl GuardModel {
@@ -13849,7 +14556,15 @@ mod tests {
             Self {
                 script: Mutex::new(script.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
+                rendered: Mutex::new(Vec::new()),
             }
+        }
+
+        fn rendered(&self) -> Vec<String> {
+            self.rendered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         fn requests(&self) -> Vec<(u64, Option<u32>)> {
@@ -13876,6 +14591,10 @@ mod tests {
                     crate::context_budget::estimate_request_bytes(&request),
                     request.max_output_tokens,
                 ));
+            self.rendered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("{request:?}"));
             let next = self
                 .script
                 .lock()
@@ -14094,6 +14813,158 @@ mod tests {
         Ok(())
     }
 
+    /// Ein eindeutiger `lookup`-Aufruf (andere Argumente je `part`), damit
+    /// der Schleifen-Wächter wiederholte Runden nicht als Stillstand wertet.
+    fn distinct_lookup(part: usize) -> crate::model::ModelResponse {
+        response_with(vec![ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("lookup"),
+            arguments: serde_json::json!({"part": part}),
+        }])
+    }
+
+    fn truncated_text(text: &str) -> crate::model::ModelResponse {
+        crate::model::ModelResponse {
+            stop: crate::model::StopReason::MaxTokens,
+            ..crate::model::ModelResponse::text(text)
+        }
+    }
+
+    #[test]
+    fn unknown_spawn_rejections_get_a_stable_code_and_known_ones_keep_their_text() {
+        let unknown =
+            harw_extension_api::AgentSpawnError::new("child role 'ghost' is not registered");
+        let text = spawn_rejection_text("ghost", &unknown);
+        assert!(text.starts_with("[HARW-ORCH-001]"), "{text}");
+        assert!(text.contains("not registered"));
+        let continuation = harw_extension_api::AgentSpawnError::new(
+            "continue_from: kein eigenes, beendetes Kind mit der ID x",
+        );
+        assert_eq!(
+            spawn_rejection_text("explorer", &continuation),
+            continuation.message
+        );
+    }
+
+    const TEXT_CONTINUATION_MARK: &str = "Setze exakt an ihrer letzten Stelle fort";
+    const SPLIT_MARK: &str = "NICHT ausgeführt";
+
+    #[tokio::test]
+    async fn the_continuation_instruction_is_sent_only_right_after_a_truncation() -> TestResult {
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new(vec![
+            Ok(truncated_text("Teil eins")),
+            Ok(distinct_lookup(1)),
+            Ok(distinct_lookup(2)),
+            Ok(crate::model::ModelResponse::text("fertig")),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der Turn läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        let marks: Vec<bool> = model
+            .rendered()
+            .iter()
+            .map(|request| request.contains(TEXT_CONTINUATION_MARK))
+            .collect();
+        assert_eq!(marks, vec![false, true, false, false]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn separate_truncations_in_a_long_turn_do_not_end_it() -> TestResult {
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let mut script = Vec::new();
+        for part in 0..5 {
+            script.push(Ok(truncated_text("Zwischenstand")));
+            script.push(Ok(distinct_lookup(part)));
+        }
+        script.push(Ok(crate::model::ModelResponse::text("fertig")));
+        let model = GuardModel::new(script);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der lange Turn läuft durch"))?;
+
+        assert!(
+            matches!(outcome, TurnOutcome::Completed),
+            "fünf getrennte Abschneidungen sind kein Grund für Truncated: {outcome:?}"
+        );
+        assert_eq!(model.requests().len(), 11);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consecutive_truncations_still_stop_after_the_limit() -> TestResult {
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new((0..6).map(|_| Ok(truncated_text("…"))).collect());
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der Turn endet ehrlich"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Truncated), "{outcome:?}");
+        assert_eq!(model.requests().len(), 4, "1 + 3 Fortsetzungen");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_calls_after_the_retry_ask_for_smaller_calls() -> TestResult {
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000);
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        )
+        .with_auto_compact(Some(policy));
+        session.set_max_output_tokens(Some(1_000));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let truncated = || {
+            Ok(crate::model::ModelResponse {
+                stop: crate::model::StopReason::MaxTokens,
+                ..distinct_lookup(9)
+            })
+        };
+        let model = GuardModel::new(vec![
+            truncated(),
+            truncated(),
+            Ok(distinct_lookup(1)),
+            Ok(crate::model::ModelResponse::text("kleiner erledigt")),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der Turn läuft mit kleineren Aufrufen weiter"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        let rendered = model.rendered();
+        assert_eq!(rendered.len(), 4);
+        assert!(!rendered[1].contains(SPLIT_MARK));
+        assert!(rendered[2].contains(SPLIT_MARK));
+        assert!(!rendered[3].contains(SPLIT_MARK));
+        let executed = session
+            .history()
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TurnItem::ToolCall(_)))
+            .count();
+        assert_eq!(executed, 1, "nur der kleinere Aufruf wird ausgeführt");
+        Ok(())
+    }
+
     #[test]
     fn raised_output_limit_is_capped_by_reserve_and_half_window() {
         let budget = RoundBudget {
@@ -14131,6 +15002,15 @@ mod tests {
         parent: Option<harw_types::SessionId>,
         organizational_role: harw_agent_dsl::roles::AgentRoleId,
     ) -> TestResult<(usize, Vec<ToolCallResult>)> {
+        run_reads(6, parent, organizational_role).await
+    }
+
+    /// Sitzung mit `count` verschiedenen `fs.read`-Aufrufen in einer Antwort.
+    async fn run_reads(
+        count: usize,
+        parent: Option<harw_types::SessionId>,
+        organizational_role: harw_agent_dsl::roles::AgentRoleId,
+    ) -> TestResult<(usize, Vec<ToolCallResult>)> {
         let executions = Arc::new(AtomicUsize::new(0));
         let provider = StubParallelProvider::instant(&["fs.read"], Arc::clone(&executions));
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -14142,7 +15022,7 @@ mod tests {
         let mut session = AgentSession::new(AgentRole::Assistant, parent, registry, tx)
             .with_spawn_context(context);
         let store = crate::state_store::InMemoryStateStore::new();
-        let calls: Vec<ToolCall> = (0..6)
+        let calls: Vec<ToolCall> = (0..count)
             .map(|index| ToolCall {
                 id: ToolCallId::new(),
                 name: ToolName::new("fs.read"),
@@ -14172,27 +15052,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_sixth_read_of_an_orchestrator_child_is_denied() -> TestResult {
-        let (executed, results) = run_six_reads(
+    async fn the_thirteenth_read_of_an_orchestrator_child_is_denied() -> TestResult {
+        let (executed, results) = run_reads(
+            13,
             Some(harw_types::SessionId::new()),
             harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
         )
         .await?;
-        assert_eq!(executed, 5, "only five own reads may run");
-        assert_eq!(results.len(), 6);
+        assert_eq!(executed, 12, "only twelve own reads may run");
+        assert_eq!(results.len(), 13);
         let Some(ToolCallResult::Error { message }) = results.last() else {
             return Err(TestError::Unexpected(format!(
-                "the sixth read must be an error: {results:?}"
+                "the thirteenth read must be an error: {results:?}"
             )));
         };
         assert!(message.contains("Lesebudget erschöpft"), "{message}");
         assert!(message.contains("delegate_wave"), "{message}");
-        let Some(ToolCallResult::Success { value }) = results.get(3) else {
-            return Err(TestError::Unexpected("the fourth read runs".to_owned()));
+        let Some(ToolCallResult::Success { value }) = results.get(9) else {
+            return Err(TestError::Unexpected("the tenth read runs".to_owned()));
         };
         assert!(
-            value.to_string().contains("Lesezugriff 4 von 5"),
-            "the fourth read carries a warning: {value}"
+            value.to_string().contains("Lesezugriff 10 von 12"),
+            "the tenth read carries a warning: {value}"
         );
         Ok(())
     }

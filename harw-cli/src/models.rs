@@ -1038,6 +1038,7 @@ fn write_discovered_model_file(
             // with a visible server error (see `ModelCapabilitiesToml::image_input`).
             image_input: None,
             chat_reasoning_replay: None,
+            reasoning_replay: None,
         },
         default_reasoning_effort: None,
     };

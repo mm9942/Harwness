@@ -142,7 +142,7 @@ harw_types::limits_struct! {
         /// Gleichzeitig laufende Orchestratoren der UIA-Wurzel.
         pub max_root_orchestrators: usize = DEFAULT_MAX_ROOT_ORCHESTRATORS = 1,
         /// Gleichzeitig laufende Sub-Orchestratoren je Root-Orchestrator-Baum.
-        pub max_sub_orchestrators: usize = DEFAULT_MAX_SUB_ORCHESTRATORS = 2,
+        pub max_sub_orchestrators: usize = DEFAULT_MAX_SUB_ORCHESTRATORS = 3,
         /// Höchste Verschachtelung der Sub-Orchestratoren (direkt unter dem
         /// Root-Orchestrator = 1; `0` = keine Sub-Orchestratoren).
         pub max_sub_orchestrator_depth: u32 = DEFAULT_MAX_SUB_ORCHESTRATOR_DEPTH = 2,
@@ -463,6 +463,31 @@ pub struct BackgroundNotice {
     pub model_route: Option<String>,
 }
 
+impl BackgroundNotice {
+    /// Die Abschlussmeldung, wie das Modell des Elternteils sie liest
+    /// (dasselbe Format wie die UIA-Meldungen der TUI).
+    #[must_use]
+    pub fn model_text(&self) -> String {
+        let verb = match self.status {
+            BackgroundStatus::Completed | BackgroundStatus::Running => "fertig",
+            BackgroundStatus::Failed => "fehlgeschlagen",
+            BackgroundStatus::Cancelled => "abgebrochen",
+        };
+        let route = self
+            .model_route
+            .as_deref()
+            .map(|route| format!(" ({route})"))
+            .unwrap_or_default();
+        format!(
+            "[Hintergrund-Agent {} {}{route} {verb} nach {} s]\n{}",
+            self.role,
+            self.child,
+            self.elapsed.as_secs(),
+            self.text
+        )
+    }
+}
+
 #[derive(Debug, Default)]
 struct BackgroundState {
     runs: BTreeMap<String, BackgroundRun>,
@@ -640,6 +665,29 @@ impl BackgroundChildren {
             state.notices = rest;
             mine.into_iter().collect()
         })
+    }
+
+    /// Die wartenden Benachrichtigungen für `parent`, ohne sie zu entnehmen
+    /// (bestätigt werden sie mit [`Self::ack_notices`]).
+    #[must_use]
+    pub fn peek_notices(&self, parent: &SessionId) -> Vec<BackgroundNotice> {
+        self.with_state(|state| {
+            state
+                .notices
+                .iter()
+                .filter(|notice| &notice.parent == parent)
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// Entfernt die Benachrichtigungen der Kinder `children` von `parent`.
+    pub fn ack_notices(&self, parent: &SessionId, children: &[SessionId]) {
+        self.with_state(|state| {
+            state
+                .notices
+                .retain(|notice| !(&notice.parent == parent && children.contains(&notice.child)));
+        });
     }
 
     /// `true`, wenn für `parent` Benachrichtigungen warten.
@@ -1094,8 +1142,29 @@ mod tests {
     }
 
     #[test]
+    fn the_default_admits_all_three_child_orchestrators_of_the_root() -> TestResult {
+        let nodes = [
+            node("root-1", UIA, AgentRoleId::RootOrchestrator),
+            node("coding", "root-1", AgentRoleId::ChildOrchestrator),
+            node("research", "root-1", AgentRoleId::ChildOrchestrator),
+        ];
+        check_orchestration_admission(
+            &nodes,
+            "root-1",
+            AgentRoleId::RootOrchestrator,
+            AgentRoleId::ChildOrchestrator,
+            OrchestrationLimits::default(),
+        )
+        .map_err(|error| TestError::Unexpected(error.message))?;
+        Ok(())
+    }
+
+    #[test]
     fn the_sub_orchestrator_count_is_per_root_tree() -> TestResult {
-        let limits = OrchestrationLimits::default(); // max 2
+        let limits = OrchestrationLimits {
+            max_sub_orchestrators: 2,
+            ..OrchestrationLimits::default()
+        };
         let nodes = [
             node("root-1", UIA, AgentRoleId::RootOrchestrator),
             node("sub-a", "root-1", AgentRoleId::ChildOrchestrator),
