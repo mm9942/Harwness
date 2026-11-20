@@ -58,6 +58,7 @@ Architecture decision records live in [`adr/`](adr/), numbered in order.
 | [Agents as Tools](design/agents-as-tools.md) | implemented |
 | [Build History](design/build-history.md) | implemented |
 | [Channel Ingress Layer — Design, with Telegram as First Binding](design/channel-ingress-telegram.md) | implemented |
+| [comnet als Channel — harw-channel-comnet über comnet-agentd](design/channel-ingress-comnet.md) | proposal |
 | [Config scopes: GLOBAL vs. PROFILE](design/config-scopes.md) | implemented |
 | [Config Structure — the `.harw/` Tree](design/config-structure.md) | implemented |
 | [Harwness Crate Inventory (Procurement List)](design/crates-inventory.md) | partially implemented |
