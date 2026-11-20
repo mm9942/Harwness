@@ -32,9 +32,17 @@ def package_source(tag, dist, root):
     ) as output:
         for member in source:
             parts = archive_member_parts(member, 'source')
-            member.name = '/'.join((source_root, *parts[1:]))
-            member.pax_headers = {}
-            output.addfile(member, source.extractfile(member) if member.isfile() else None)
+            name = '/'.join((source_root, *parts[1:]))
+            if any(part in ('', '.', '..') for part in name.split('/')) or '\\' in name:
+                raise ValueError(f'Unsafe output archive path: {name}')
+            # Construct a fresh header. The input header, including any PAX
+            # fields or link target, never reaches the output archive.
+            entry = tarfile.TarInfo(name)
+            entry.type = member.type
+            entry.mode = member.mode
+            entry.mtime = int(member.mtime)
+            entry.size = member.size
+            output.addfile(entry, source.extractfile(member) if member.isfile() else None)
 
 
 def archive_member_parts(member, root):

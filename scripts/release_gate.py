@@ -55,12 +55,12 @@ def validate_job(job, name, required_steps):
 
 def validate_dependency_pins(manifest, member, version):
     sections = [manifest, *manifest.get('target', {}).values()]
-    for section in sections:
-        for kind in ('dependencies', 'dev-dependencies', 'build-dependencies'):
-            for name, dep in section.get(kind, {}).items():
-                if isinstance(dep, dict) and 'path' in dep and 'version' in dep:
-                    if dep['version'] not in (version, f'={version}'):
-                        raise ValueError(f'Internal version pin mismatch: {member}/{name}')
+    dependency_groups = ('dependencies', 'dev-dependencies', 'build-dependencies')
+    for dependencies in (section.get(kind, {}) for section in sections for kind in dependency_groups):
+        for name, dep in dependencies.items():
+            if isinstance(dep, dict) and 'path' in dep and 'version' in dep:
+                if dep['version'] not in (version, f'={version}'):
+                    raise ValueError(f'Internal version pin mismatch: {member}/{name}')
 
 
 def validate_metadata(tag, root, publishing=False):
