@@ -256,8 +256,11 @@ CLI, Web-UI und MCP sie ohne eigene Pfade bekommen:
      Das läuft im Prozess des Nutzers, wo `/proc/self` sichtbar ist.
      `linkat` ersetzt nie: Existiert das Ziel, schlägt es mit `EEXIST` fehl,
      und die Operation lehnt ab. Danach `fsync` auf den Eltern-fd.
-  5. Bei Fehler oder Absturz verschwindet die unbenannte Inode beim Schließen.
-     Es bleibt kein Klartext-Eintrag zurück, und nichts muss aufgeräumt werden.
+  5. Vor erfolgreichem `linkat` verschwindet die unbenannte Inode bei einem
+     Fehler oder Absturz beim Schließen. Nach erfolgreichem `linkat` ist das
+     zugelassene Ziel bereits sichtbar. Schlägt das Verzeichnis-`fsync` fehl,
+     meldet der Aufrufer den Status der Dauerhaftigkeit als unbekannt und
+     lässt den Zieleintrag bestehen.
   - **Kein `--force`** in Welle K4: Ein bestehendes Ziel löscht der Nutzer
     vorher selbst. Ein atomares Ersetzen bräuchte einen zweiten Pfadnamen
     und damit eine eigene, eng abgeleitete Staging-Autorität. Das ist ein
@@ -350,6 +353,7 @@ ist für Harwness optional und nicht Teil der ersten Wellen.
 - Ausgabe-Symlinks: Elternverzeichnis ist ein Symlink nach außen → abgelehnt; Zieldatei ist ein Symlink → abgelehnt (`linkat` meldet `EEXIST`), nichts außerhalb wird überschrieben; Elternverzeichnis wird zwischen Öffnen und `linkat` gegen einen Symlink getauscht → Datei landet im festgehaltenen Verzeichnis oder der Vorgang schlägt fehl, nie außerhalb; vorhandenes Ziel → abgelehnt.
 - Exakter Scope: Session mit `exact_files(["out/result"])`; während und nach der Operation zeigt das Verzeichnis-Listing keinen weiteren Namen als `out/result`.
 - Absturz beim Entschlüsseln: Prozess wird mitten im Schreiben per `SIGKILL` beendet → kein neuer Verzeichniseintrag, `out/result` existiert nicht, kein Klartext-Rest im Workspace.
+- Fehler beim Verzeichnis-`fsync` nach `linkat` → `out/result` bleibt sichtbar, Dauerhaftigkeit wird als unbekannt gemeldet.
 - Dateisystem ohne `O_TMPFILE` → Operation abgelehnt, keine benannte Temporärdatei angelegt.
 - Modus: Ausgabe hat genau `0600`, sowohl bei umask `000` als auch bei umask `0777`; scheitert `fchmod`, wird abgebrochen, bevor geschrieben oder verlinkt wird.
 - Unit-Integrationstest: Hub läuft mit genau den Sandbox-Einstellungen der ausgelieferten `harw-auth-hub.service`, Peer unter **anderer** uid. Grant mit passender cgroup-Bedingung → zugelassen; andere cgroup → abgelehnt; Peer beendet → abgelehnt. Kein `EPERM`-Pfad führt zur Zulassung.
