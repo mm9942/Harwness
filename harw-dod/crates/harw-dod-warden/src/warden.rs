@@ -116,9 +116,10 @@
 //!   mit eigenem Grund), dann ein Versuch `flock(LOCK_EX | LOCK_NB)` auf das
 //!   Indexverzeichnis, dann der Marker, dann `cgroup.freeze` lesen und
 //!   `freeze_was_set` im Datensatz buchen, dann einfrieren, dann die Sperre
-//!   freigeben. Sperre, Index, Marker oder Lesen scheitern: der
-//!   Freeze läuft trotzdem ([`AuditEvent::ContainmentDegraded`]; ein
-//!   unlesbares Bit gilt als nicht gesetzt). Ein erneuter Freeze einer schon
+//!   freigeben. Ohne vertrauenswürdigen Index und regulären Marker lehnt
+//!   der Warden den Freeze ab. Schlägt die Sperre oder das Lesen fehl,
+//!   meldet er [`AuditEvent::ContainmentDegraded`]; ein unlesbares Bit gilt
+//!   beim ersten Freeze als nicht gesetzt. Ein erneuter Freeze einer schon
 //!   eingedämmten cgroup behält ein `freeze_was_set` = `false` (das Bit ist
 //!   dann sein eigenes); bei `true` liest er das Bit neu: hat der frühere
 //!   Eigentümer seinen Freeze inzwischen aufgehoben, schreibt der Warden es
@@ -226,6 +227,7 @@ const CONTAINMENT_LEDGER: &str = "containment";
 // `freeze_was_set` sich nicht dauerhaft buchen ließ (`execute` antwortet
 // dann `Unavailable`).
 const FREEZE_ATTRIBUTION_NOT_DURABLE: &str = "freeze_was_set not durable";
+const CONTAINMENT_MARKER_UNAVAILABLE: &str = "containment marker unavailable; nothing frozen";
 
 // Grund, mit dem `release_freeze` die Freigabe eines fremden Bits verweigert,
 // deren Buchung sich nicht dauerhaft schreiben ließ (`execute` antwortet
@@ -791,14 +793,21 @@ impl Warden {
             // etwas geschrieben (`contain_and_freeze`, `release_freeze`).
             Err(WardenError::LedgerUnavailable {
                 ledger: CONTAINMENT_LEDGER,
-                reason: FREEZE_ATTRIBUTION_NOT_DURABLE | RELEASE_NOT_DURABLE,
+                reason:
+                    reason @ (FREEZE_ATTRIBUTION_NOT_DURABLE
+                    | RELEASE_NOT_DURABLE
+                    | CONTAINMENT_MARKER_UNAVAILABLE),
             }) => {
                 self.record_outcome(now, verified, LedgerEvent::Failed);
                 self.restore_hold(action, undo);
                 self.restore_containment(action, containment);
                 self.audit.record(AuditEvent::Unavailable {
                     action: action.clone(),
-                    reason: ContainmentRefusal::Unwritable.reason(),
+                    reason: if reason == CONTAINMENT_MARKER_UNAVAILABLE {
+                        reason
+                    } else {
+                        ContainmentRefusal::Unwritable.reason()
+                    },
                 });
                 WardenOutcome::Unavailable
             }
@@ -1228,9 +1237,8 @@ impl Warden {
 
     // Eindämmen (Vertrag mit harw, `containment.rs`): Sperre versuchen,
     // Marker zuerst, Bit lesen, `freeze_was_set` buchen, einfrieren, Sperre
-    // freigeben. Eindämmung geht vor: Sperre, Index, Marker oder Lesen dürfen
-    // scheitern; das dauerhafte Buchen von `freeze_was_set` nicht (dann
-    // `LedgerUnavailable`, nichts eingefroren). Scheitert der Freeze, geht ein
+    // freigeben. Ohne vertrauenswürdigen Marker oder dauerhaft gebuchtes
+    // `freeze_was_set` bleibt die cgroup unberührt. Scheitert der Freeze, geht ein
     // von ihm angelegter Marker wieder weg (außer die cgroup war schon vorher
     // aktiv eingedämmt); den Datensatz stellt `restore_containment` zurück.
     fn contain_and_freeze(
@@ -1240,35 +1248,19 @@ impl Warden {
     ) -> WardenResult<()> {
         let action = verified.action();
         let target = verified.target();
-        let dir = match self.markers.open_locked() {
-            Ok(dir) => {
-                if !dir.is_locked() {
-                    self.degraded(
-                        action,
-                        "containment index lock not obtained; containing without it",
-                    );
-                }
-                Some(dir)
-            }
-            Err(_) => {
-                self.degraded(
-                    action,
-                    "containment index unusable; freezing without a marker",
-                );
-                None
-            }
+        let marker_error = |_| WardenError::LedgerUnavailable {
+            ledger: CONTAINMENT_LEDGER,
+            reason: CONTAINMENT_MARKER_UNAVAILABLE,
         };
-        let created = match dir.as_ref().map(|dir| dir.create(target.kernel_id)) {
-            Some(Ok(creation)) => creation != MarkerCreation::AlreadyPresent,
-            Some(Err(_)) => {
-                self.degraded(
-                    action,
-                    "containment marker not created; freezing without it",
-                );
-                false
-            }
-            None => false,
-        };
+        let dir = self.markers.open_locked().map_err(marker_error)?;
+        if !dir.is_locked() {
+            self.degraded(
+                action,
+                "containment index lock not obtained; containing without it",
+            );
+        }
+        let created =
+            dir.create(target.kernel_id).map_err(marker_error)? != MarkerCreation::AlreadyPresent;
         let remove_on_failure = created && !containment.was_active;
         let freeze_was_set = match containment.known {
             // Das Bit ist seit der ersten Eindämmung das eigene.
@@ -1280,7 +1272,7 @@ impl Warden {
                 Ok(was_set) => was_set,
                 // Das Ziel ist nicht mehr die geprüfte cgroup: nicht einfrieren.
                 Err(error) if error.is_target_replaced_or_gone() => {
-                    self.undo_marker(action, dir.as_ref(), target, remove_on_failure);
+                    self.undo_marker(action, &dir, target, remove_on_failure);
                     return Err(error);
                 }
                 Err(_) if known == Some(true) => {
@@ -1313,7 +1305,7 @@ impl Warden {
                 .is_err()
         {
             self.restore_attribution(action, target, containment);
-            self.undo_marker(action, dir.as_ref(), target, remove_on_failure);
+            self.undo_marker(action, &dir, target, remove_on_failure);
             return Err(WardenError::LedgerUnavailable {
                 ledger: CONTAINMENT_LEDGER,
                 reason: FREEZE_ATTRIBUTION_NOT_DURABLE,
@@ -1332,7 +1324,7 @@ impl Warden {
             {
                 self.restore_attribution(action, target, containment);
             }
-            self.undo_marker(action, dir.as_ref(), target, remove_on_failure);
+            self.undo_marker(action, &dir, target, remove_on_failure);
             return Err(error);
         }
         // Erst jetzt, nach `cgroup.freeze` = 1, gibt das Schließen die Sperre frei.
@@ -1371,14 +1363,11 @@ impl Warden {
     fn undo_marker(
         &self,
         action: &WardenAction,
-        dir: Option<&MarkerDir>,
+        dir: &MarkerDir,
         target: &CgroupTarget,
         undo: bool,
     ) {
-        let Some(dir) = dir.filter(|_| undo) else {
-            return;
-        };
-        if dir.remove(target.kernel_id).is_err() {
+        if undo && dir.remove(target.kernel_id).is_err() {
             self.degraded(action, "containment marker of a failed freeze not removed");
         }
     }
@@ -3268,66 +3257,59 @@ mod tests {
     }
 
     #[test]
-    fn test_symlinked_index_still_freezes_without_a_marker_and_reports_it() -> TestResult {
+    fn test_unwritable_index_refuses_freeze_without_a_marker() -> TestResult {
+        if rustix::process::geteuid().as_raw() == 0 {
+            return Ok(());
+        }
+        let fixture = Fixture::new()?;
+        let warden = fixture.warden()?;
+        std::fs::set_permissions(fixture.holds(), std::fs::Permissions::from_mode(0o555))
+            .map_err(ctx("make index read-only"))?;
+        let outcome = warden.handle(
+            &request(&freeze()?, EscalationStage::RuleTriggered, None, 1)?,
+            at(1)?,
+        );
+        std::fs::set_permissions(fixture.holds(), std::fs::Permissions::from_mode(0o755))
+            .map_err(ctx("restore index permissions"))?;
+        assert!(!executed(&outcome));
+        assert!(fixture.calls.calls().is_empty());
+        assert!(containments(&warden)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_symlinked_index_refuses_freeze() -> TestResult {
         let fixture = Fixture::new()?;
         let real = fixture.run.path().join("real");
         std::fs::rename(fixture.holds(), &real).map_err(ctx("move index"))?;
         std::os::unix::fs::symlink(&real, fixture.holds()).map_err(ctx("symlink index"))?;
         let warden = fixture.warden()?;
-        assert!(executed(&warden.handle(
+        let outcome = warden.handle(
             &request(&freeze()?, EscalationStage::RuleTriggered, None, 1)?,
-            at(1)?
-        )));
-        assert_eq!(
-            fixture.calls.calls(),
-            vec![RecordedCall::Freeze(cgroup(JOB)?)]
+            at(1)?,
         );
+        assert!(matches!(outcome, WardenOutcome::Unavailable));
+        assert!(fixture.calls.calls().is_empty());
+        assert!(containments(&warden)?.is_empty());
         assert_eq!(
             std::fs::read_dir(&real).map_err(ctx("read dir"))?.count(),
             0
         );
-        assert_eq!(
-            degraded_reasons(&fixture),
-            ["containment index unusable; freezing without a marker"]
-        );
-        // `freeze_was_set` ist trotzdem festgehalten (für die Freigabe).
-        let record = warden
-            .state()
-            .containment()
-            .get(kernel_id(KERNEL_ID)?)
-            .map_err(ctx("record"))?
-            .ok_or(TestError::Missing("containment record"))?;
-        assert_eq!(record.freeze_was_set, Some(false));
         Ok(())
     }
 
     #[test]
-    fn test_missing_index_still_freezes_and_the_thaw_releases_the_record() -> TestResult {
+    fn test_missing_index_refuses_freeze() -> TestResult {
         let fixture = Fixture::new()?;
         std::fs::remove_dir(fixture.holds()).map_err(ctx("remove index"))?;
         let warden = fixture.warden()?;
-        assert!(executed(&warden.handle(
+        let outcome = warden.handle(
             &request(&freeze()?, EscalationStage::RuleTriggered, None, 1)?,
-            at(1)?
-        )));
-        assert_eq!(containments(&warden)?.len(), 1);
-        assert!(executed(&warden.handle(
-            &request(&thaw()?, EscalationStage::RuleTriggered, None, 2)?,
-            at(2)?
-        )));
-        assert_eq!(
-            fixture.calls.calls(),
-            vec![
-                RecordedCall::Freeze(cgroup(JOB)?),
-                RecordedCall::Thaw(cgroup(JOB)?)
-            ]
+            at(1)?,
         );
-        // Ohne Index gibt es keinen Marker, der bleiben müsste.
+        assert!(matches!(outcome, WardenOutcome::Unavailable));
+        assert!(fixture.calls.calls().is_empty());
         assert!(containments(&warden)?.is_empty());
-        assert_eq!(
-            degraded_reasons(&fixture),
-            ["containment index unusable; freezing without a marker"]
-        );
         Ok(())
     }
 
@@ -3339,21 +3321,13 @@ mod tests {
         std::os::unix::fs::symlink(&outside, fixture.marker(KERNEL_ID))
             .map_err(ctx("symlink marker"))?;
         let warden = fixture.warden()?;
-        assert!(executed(&warden.handle(
+        let outcome = warden.handle(
             &request(&freeze()?, EscalationStage::RuleTriggered, None, 1)?,
-            at(1)?
-        )));
-        assert!(executed(&warden.handle(
-            &request(&thaw()?, EscalationStage::RuleTriggered, None, 2)?,
-            at(2)?
-        )));
-        assert_eq!(
-            degraded_reasons(&fixture),
-            [
-                "containment marker not created; freezing without it",
-                "containment marker not removed after the release; the hold timer retries, job.resume stays refused until then",
-            ]
+            at(1)?,
         );
+        assert!(matches!(outcome, WardenOutcome::Unavailable));
+        assert!(fixture.calls.calls().is_empty());
+        assert!(containments(&warden)?.is_empty());
         assert_eq!(
             std::fs::read(&outside).map_err(ctx("read outside"))?,
             b"foreign"
@@ -3364,19 +3338,6 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        // Der Datensatz bleibt, solange der Marker nicht entfernt ist, als
-        // freigegeben; der Durchlauf des Hold-Timers folgt dem Symlink nie.
-        let records = containments(&warden)?;
-        assert_eq!(records.len(), 1);
-        assert!(records.iter().all(|entry| entry.released));
-        assert_eq!(warden.expire_holds(at(30)?).cleared, 0);
-        assert!(
-            std::fs::symlink_metadata(fixture.marker(KERNEL_ID))
-                .map_err(ctx("lstat marker again"))?
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(containments(&warden)?.len(), 1);
         Ok(())
     }
 
@@ -3739,7 +3700,9 @@ mod tests {
             );
             paths.push(path);
         }
-        let file = serde_json::json!({ "version": 1, "containments": entries });
+        let boot_id =
+            crate::containment::current_boot_id().ok_or(TestError::Missing("current boot ID"))?;
+        let file = serde_json::json!({ "version": 1, "boot_id": boot_id, "containments": entries });
         std::fs::write(
             fixture.dir.path().join(CONTAINMENT_FILE),
             serde_json::to_vec(&file).map_err(ctx("encode store"))?,

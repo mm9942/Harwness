@@ -43,9 +43,9 @@
 //! 4. **Lebt, `cgroup.freeze` = 0, Hold läuft**: bleibt; der Hold-Timer gibt
 //!    die Eindämmung frei ([`ContainmentReconciliation::kept`]).
 //! 5. **Lebt, `cgroup.freeze` = 1**: bleibt, und ihr Marker muss da sein
-//!    (Eindämmung geht vor). Fehlt er (etwa weil das Indexverzeichnis beim
-//!    Freeze nicht nutzbar war), wird er neu angelegt
-//!    ([`ContainmentReconciliation::restored`]). Ein nicht abgeschlossener
+//!    (Eindämmung geht vor). Fehlt er, wird er neu angelegt
+//!    ([`ContainmentReconciliation::restored`]). Schlägt das Anlegen fehl,
+//!    bricht der Abgleich ab und der Warden startet nicht. Ein nicht abgeschlossener
 //!    Datensatz wird vorher mit `freeze_was_set` = `true` abgeschlossen
 //!    ([`ContainmentReconciliation::completed`]): `freeze_was_set` steht
 //!    dauerhaft fest, bevor der Warden `cgroup.freeze` = 1 schreibt; fehlt
@@ -55,7 +55,7 @@
 //!    Warden gar nicht ein (`Unavailable`); ein nicht abgeschlossener
 //!    Datensatz bei gesetztem Bit stammt also nie von einem eigenen Freeze.
 //! 6. **Nicht entscheidbar** (Beobachtung oder Lesen scheitert anders, oder
-//!    der Marker lässt sich nicht entfernen bzw. nicht anlegen): bleibt
+//!    der Marker lässt sich nicht entfernen oder prüfen): bleibt
 //!    unverändert ([`ContainmentReconciliation::unresolved`]).
 //!
 //! # Marker ohne Datensatz
@@ -214,6 +214,7 @@ enum RecordFate {
     Thawed,
     Released,
     Unresolved,
+    MarkerRestoreFailed(WardenError),
 }
 
 // Die Bausteine des Abgleichs (aus dem Warden geliehen).
@@ -260,6 +261,7 @@ impl Reconciler<'_> {
                 RecordFate::Unresolved => {
                     report.unresolved = report.unresolved.saturating_add(1);
                 }
+                RecordFate::MarkerRestoreFailed(error) => return Err(error),
             }
         }
         let recorded: BTreeSet<CgroupKernelId> =
@@ -477,7 +479,10 @@ impl Reconciler<'_> {
                         completed,
                     }
                 }
-                Err(_) => self.unresolved(target, UNRESOLVED_NOT_RESTORED),
+                Err(error) => {
+                    self.unresolved(target, UNRESOLVED_NOT_RESTORED);
+                    RecordFate::MarkerRestoreFailed(error)
+                }
             },
             // Ein Symlink oder Verzeichnis unter dem Namen: harw verweigert
             // `job.resume` dann ohnehin (fail closed); nichts anfassen.
@@ -945,6 +950,31 @@ mod tests {
             setup.count(|event| matches!(event, AuditEvent::ContainmentUnresolved { .. })),
             2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unwritable_index_fails_reconciliation_when_a_frozen_marker_is_missing() -> TestResult {
+        if rustix::process::geteuid().as_raw() == 0 {
+            return Ok(());
+        }
+        let setup = Setup::new()?;
+        let frozen = setup.cgroup("frozen", b"1\n")?;
+        let warden = setup.warden()?;
+        setup.contain(
+            &warden,
+            &target(&path("frozen"), frozen)?,
+            Some(false),
+            false,
+        )?;
+        std::fs::set_permissions(setup.holds(), std::fs::Permissions::from_mode(0o555))
+            .map_err(ctx("make index read-only"))?;
+        let result = warden.reconcile_containments();
+        std::fs::set_permissions(setup.holds(), std::fs::Permissions::from_mode(0o755))
+            .map_err(ctx("restore index permissions"))?;
+        assert!(result.is_err());
+        assert_eq!(setup.records(&warden)?.len(), 1);
+        assert_eq!(setup.bit("frozen")?, "1\n");
         Ok(())
     }
 
