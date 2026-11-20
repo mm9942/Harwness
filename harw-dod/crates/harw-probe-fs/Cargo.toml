@@ -17,6 +17,12 @@ harw-dod-cap = { path = "../harw-dod-cap" }
 harw-dod-signals = { path = "../harw-dod-signals" }
 # Kennungen: `SensorId`.
 harw-types = { path = "../../../harw-types" }
+# PL-100 WP1.6: der Beobachtungsbereich (`[probe_fs]`) kommt aus derselben
+# vertrauenswürdigen DoD-Konfiguration (`/etc/harw-dod/config.toml`) wie bei
+# Sentinel und BPF-Probe. Unprivilegierte Vokabular-Crate
+# (`RequiredPrivilege::Unprivileged` im Privilegien-Gate), keine Krypto- oder
+# HTTP-Abhängigkeit (blake3, ipnet, rustix, serde, toml).
+harw-dod-config = { path = "../harw-dod-config" }
 jiff = { workspace = true }
 tracing = { workspace = true }
 # Version identisch zu `harw-cli`/`harw-sentinel` — ein Sink für `tracing`,
@@ -29,8 +35,11 @@ harw-completions = { path = "../../../harw-completions", features = ["clap-args"
 # Sicherer `SOCK_SEQPACKET`-Unix-Socket ohne `unsafe` (`net`-Feature). Das
 # `event`-Feature liefert `rustix::event::poll`, mit dem `src/source.rs` den
 # `timeout`-Parameter von `FsEventSource::read_events` gegen den echten
-# fanotify-Deskriptor durchsetzt, statt ihn zu ignorieren.
-rustix = { workspace = true, features = ["net", "event"] }
+# fanotify-Deskriptor durchsetzt, statt ihn zu ignorieren. Das `fs`-Feature
+# (ohne weitere Abhängigkeit) öffnet die Markierungsziele mit
+# `O_NONBLOCK | O_NOCTTY` (`src/source.rs`, `open_for_mark`; Review R3: ein
+# FIFO ohne Schreiber hielte ein blockierendes `open` für immer an).
+rustix = { workspace = true, features = ["net", "event", "fs"] }
 # Liefert `nix::sys::fanotify` — die sichere fanotify-Bindung, die `rustix`
 # 1.1.4 (siehe `[workspace.dependencies]`) nicht hat: dort stehen
 # `fanotify_init`/`fanotify_mark` in `src/not_implemented.rs` (Modul `yet`),

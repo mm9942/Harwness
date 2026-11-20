@@ -100,8 +100,17 @@ pub fn is_continuation_rejection(message: &str) -> bool {
         .starts_with(CONTINUATION_REJECTION_PREFIX)
 }
 
-/// Höchstzahl vorgehaltener Übergaben je Spawner (älteste fallen heraus).
+/// Höchstzahl vorgehaltener Übergaben **je Elternteil** (älteste fallen
+/// heraus, regulär abgeschlossene vor budget-/fehlerbeendeten).
+///
+/// Früher galt die Grenze für den ganzen Spawner-Baum: nach rund 64
+/// Kind-Enden irgendwo im Baum waren die Kinder des Root-Orchestrators
+/// vergessen, und jedes `continue_from` scheiterte mit „kein eigenes,
+/// beendetes Kind" (HARW-CONT-001).
 pub const HANDOFF_LEDGER_MAX_ENTRIES: usize = 64;
+
+/// Höchstzahl vorgehaltener Übergaben je Spawner über alle Elternteile.
+pub const HANDOFF_LEDGER_MAX_TOTAL: usize = 1024;
 
 /// Markierung am Anfang jeder verdichteten Übergabe.
 pub const HANDOFF_MARKER: &str = "[budget_exhausted: true, handoff: compacted]";
@@ -587,12 +596,64 @@ pub struct HandoffLedger {
 
 impl HandoffLedger {
     /// Legt eine Übergabe ab; eine ältere desselben Kindes wird ersetzt.
+    ///
+    /// # Description
+    /// Hat der Elternteil schon [`HANDOFF_LEDGER_MAX_ENTRIES`] Übergaben,
+    /// fällt zuerst seine älteste *regulär abgeschlossene* heraus (die nur
+    /// für `agent.message`-Wiederaufnahmen gebraucht wird), sonst seine
+    /// älteste überhaupt. Andere Elternteile verlieren dadurch nichts; erst
+    /// über [`HANDOFF_LEDGER_MAX_TOTAL`] fällt global die älteste heraus.
     pub fn record(&mut self, record: HandoffRecord) {
         self.records.retain(|entry| entry.child != record.child);
+        let own = self
+            .records
+            .iter()
+            .filter(|entry| entry.parent == record.parent)
+            .count();
+        if own >= HANDOFF_LEDGER_MAX_ENTRIES {
+            let victim = self
+                .records
+                .iter()
+                .position(|entry| {
+                    entry.parent == record.parent && entry.end == PredecessorEnd::Completed
+                })
+                .or_else(|| {
+                    self.records
+                        .iter()
+                        .position(|entry| entry.parent == record.parent)
+                });
+            if let Some(index) = victim {
+                self.records.remove(index);
+            }
+        }
         self.records.push_back(record);
-        while self.records.len() > HANDOFF_LEDGER_MAX_ENTRIES {
+        while self.records.len() > HANDOFF_LEDGER_MAX_TOTAL {
             self.records.pop_front();
         }
+    }
+
+    /// Überträgt die Kinder eines fortgesetzten Elternteils an seine
+    /// Fortsetzung.
+    ///
+    /// # Description
+    /// Wird ein Orchestrator selbst fortgesetzt (neue Session-ID), gehören
+    /// die Übergaben seiner Kinder ab jetzt der Fortsetzung — sonst lehnt
+    /// [`Self::prepare`] jedes `continue_from` der Fortsetzung auf die in
+    /// ihrer Übergabe genannten Kinder als „kein eigenes Kind" ab.
+    ///
+    /// # Returns
+    /// Die Zahl übertragener Übergaben.
+    pub fn reparent(&mut self, from: &SessionId, to: &SessionId) -> usize {
+        let mut moved = 0;
+        for entry in self
+            .records
+            .iter_mut()
+            .filter(|entry| &entry.parent == from)
+        {
+            entry.parent = to.clone();
+            moved += 1;
+        }
+        moved
     }
 
     /// Die Übergabe eines Kindes, falls vorgehalten.
@@ -638,20 +699,20 @@ impl HandoffLedger {
             .filter(|record| &record.parent == caller)
             .ok_or_else(|| {
                 ContinuationError(format!(
-                    "continue_from: kein eigenes, beendetes Kind mit der ID {from} \
+                    "continue_from: [HARW-CONT-001] kein eigenes, beendetes Kind mit der ID {from} \
                      (nur solche Kinder lassen sich fortsetzen)"
                 ))
             })?;
         if record.role != role {
             return Err(ContinuationError(format!(
-                "continue_from: eine Fortsetzung muss dieselbe Rolle tragen wie das \
+                "continue_from: [HARW-CONT-002] eine Fortsetzung muss dieselbe Rolle tragen wie das \
                  fortgesetzte Kind ('{}'), nicht '{role}'",
                 record.role
             )));
         }
         if self.continuations_used(&record.origin) >= MAX_CONTINUATIONS {
             return Err(ContinuationError(format!(
-                "continue_from: Kettengrenze erreicht — höchstens {MAX_CONTINUATIONS} \
+                "continue_from: [HARW-CONT-003] Kettengrenze erreicht — höchstens {MAX_CONTINUATIONS} \
                  Fortsetzungen je ursprünglichem Kind ({}). Führe die Übergaben selbst zusammen \
                  oder schneide den Auftrag neu und kleiner zu.",
                 record.origin
@@ -677,7 +738,7 @@ impl HandoffLedger {
         let used = self.continuations_used(&seed.origin);
         if used >= MAX_CONTINUATIONS {
             return Err(ContinuationError(format!(
-                "continue_from: Kettengrenze erreicht — höchstens {MAX_CONTINUATIONS} \
+                "continue_from: [HARW-CONT-003] Kettengrenze erreicht — höchstens {MAX_CONTINUATIONS} \
                  Fortsetzungen je ursprünglichem Kind ({})",
                 seed.origin
             )));
@@ -1139,5 +1200,67 @@ mod tests {
         let cancelled = continuation_task(&of, &PredecessorEnd::Cancelled, "H", None);
         assert!(cancelled.contains("abgebrochen wurde"), "{cancelled}");
         assert!(!cancelled.contains("Budget"), "{cancelled}");
+    }
+
+    #[test]
+    fn a_busy_sibling_tree_does_not_evict_the_roots_children() {
+        let root = SessionId::new();
+        let worker_parent = SessionId::new();
+        let mut ledger = HandoffLedger::default();
+        let kept = SessionId::new();
+        ledger.record(record(&kept, &root, &kept));
+        for _ in 0..(HANDOFF_LEDGER_MAX_ENTRIES * 3) {
+            let other = SessionId::new();
+            ledger.record(record(&other, &worker_parent, &other));
+        }
+        assert!(ledger.prepare(&root, &kept, "explorer").is_ok());
+        assert_eq!(
+            ledger
+                .records
+                .iter()
+                .filter(|entry| entry.parent == worker_parent)
+                .count(),
+            HANDOFF_LEDGER_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn completed_children_are_evicted_before_budget_ended_ones() {
+        let parent = SessionId::new();
+        let mut ledger = HandoffLedger::default();
+        let budget_ended = SessionId::new();
+        ledger.record(record(&budget_ended, &parent, &budget_ended));
+        for _ in 0..HANDOFF_LEDGER_MAX_ENTRIES {
+            let done = SessionId::new();
+            let mut entry = record(&done, &parent, &done);
+            entry.end = PredecessorEnd::Completed;
+            ledger.record(entry);
+        }
+        assert!(ledger.get(&budget_ended).is_some());
+    }
+
+    #[test]
+    fn a_continued_orchestrator_inherits_its_predecessors_children() {
+        let old_root = SessionId::new();
+        let new_root = SessionId::new();
+        let grandchild = SessionId::new();
+        let mut ledger = HandoffLedger::default();
+        ledger.record(record(&grandchild, &old_root, &grandchild));
+        assert!(ledger.prepare(&new_root, &grandchild, "explorer").is_err());
+        assert_eq!(ledger.reparent(&old_root, &new_root), 1);
+        assert!(ledger.prepare(&new_root, &grandchild, "explorer").is_ok());
+        assert!(ledger.prepare(&old_root, &grandchild, "explorer").is_err());
+    }
+
+    #[test]
+    fn rejections_carry_stable_codes() {
+        let parent = SessionId::new();
+        let child = SessionId::new();
+        let mut ledger = HandoffLedger::default();
+        let unknown = ledger.prepare(&parent, &child, "explorer").err();
+        assert!(unknown.is_some_and(|e| e.0.contains("HARW-CONT-001")));
+        ledger.record(record(&child, &parent, &child));
+        let wrong_role = ledger.prepare(&parent, &child, "worker").err();
+        assert!(wrong_role.is_some_and(|e| e.0.contains("HARW-CONT-002")));
     }
 }

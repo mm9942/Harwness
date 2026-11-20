@@ -140,7 +140,7 @@ mod tests {
         let overview =
             view(&operations, &ToolAction::List { family: None }).map_err(TestError::Unexpected)?;
         assert!(overview.text.contains("\n- fs ("), "{}", overview.text);
-        assert!(overview.text.contains("\n- dod (3)"), "{}", overview.text);
+        assert!(overview.text.contains("\n- dod (6)"), "{}", overview.text);
         assert!(overview.json["families"].is_array());
 
         let dod = view(
@@ -150,8 +150,8 @@ mod tests {
             },
         )
         .map_err(TestError::Unexpected)?;
-        assert_eq!(dod.text.lines().count(), 3, "{}", dod.text);
-        assert!(dod.text.starts_with("dod.findings [meta] "), "{}", dod.text);
+        assert_eq!(dod.text.lines().count(), 6, "{}", dod.text);
+        assert!(dod.text.starts_with("dod.finding [meta] "), "{}", dod.text);
         assert_eq!(dod.json["family"], "dod");
 
         let unknown = view(

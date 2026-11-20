@@ -3,6 +3,24 @@
 //! Alle deklarieren `ExecuteProcess` (Vorbild `process.list`: sie lesen
 //! Host-Zustand außerhalb des Workspace), sind `parallel_safe` und rein
 //! lesend. Keines startet einen Fremdprozess.
+//!
+//! # Umfang der Prozesswerkzeuge
+//! `sys.ps`, `sys.pgrep` und `sys.top` tragen die [`ScopePolicy`] des
+//! Providers. Die Vorgabe ([`SysToolProvider::new`]) erlaubt nur den eigenen
+//! Umfang; erst [`SysToolProvider::with_approval_mode`] lässt `scope = "all"`
+//! unter Full Access zu (PL-100 Phase 4).
+//!
+//! # Examples
+//! ```
+//! use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
+//! use harw_tool_sys::SysToolProvider;
+//!
+//! let own_only = SysToolProvider::new();
+//! assert!(!own_only.scope_policy().allows_all());
+//! let mode = ApprovalModeCell::new(ApprovalMode::FullAccess);
+//! let provider = SysToolProvider::new().with_approval_mode(mode);
+//! assert!(provider.scope_policy().allows_all());
+//! ```
 
 use crate::date::SysDateTool;
 use crate::env::SysEnvTool;
@@ -11,27 +29,135 @@ use crate::lsof::SysLsofTool;
 use crate::net::SysSsTool;
 use crate::pgrep::SysPgrepTool;
 use crate::ps::SysPsTool;
+use crate::scope::ScopePolicy;
 use crate::sysinfo::{SysFreeTool, SysUnameTool, SysUptimeTool};
 use crate::top::SysTopTool;
 use crate::which::SysWhichTool;
+use harw_extension_api::approval_mode::ApprovalModeCell;
+use harw_tools::Permission;
+
+/// Name des gebündelten Skills aller `sys.*`-Werkzeuge.
+const SKILL: &str = "sys-tools";
+
+/// Stellt die lesenden Prozess-/System-Werkzeuge `sys.*` bereit
+/// (`ps`, `pgrep`, `top`, `free`, `uptime`, `uname`, `env`, `id`, `ss`,
+/// `lsof`, `date`, `which`).
+///
+/// # Concurrency
+/// `Clone` teilt die Freigabe-Zelle der [`ScopePolicy`]; jeder
+/// `executor()`-Aufruf baut einen frischen Executor über einem Klon.
+#[derive(Debug, Clone, Default)]
+pub struct SysToolProvider {
+    /// Umfangs-Politik für `sys.ps`, `sys.pgrep` und `sys.top`.
+    scope: ScopePolicy,
+}
+
+impl SysToolProvider {
+    /// Provider mit der Vorgabe-Politik: nur der eigene Umfang.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lässt `scope = "all"` zu, solange `mode` Full Access zeigt.
+    ///
+    /// # Arguments
+    /// - `mode`: die Freigabe-Zelle der Sitzung (dieselbe wie die der
+    ///   Freigabepolitik; ein Klon teilt den Modus).
+    #[must_use]
+    pub fn with_approval_mode(mut self, mode: ApprovalModeCell) -> Self {
+        self.scope = self.scope.with_full_access_gate(mode);
+        self
+    }
+
+    /// Ersetzt die Umfangs-Politik (z. B. mit zusätzlichen Job-Wurzeln).
+    #[must_use]
+    pub fn with_scope_policy(mut self, policy: ScopePolicy) -> Self {
+        self.scope = policy;
+        self
+    }
+
+    /// Die aktuelle Umfangs-Politik.
+    #[must_use]
+    pub fn scope_policy(&self) -> &ScopePolicy {
+        &self.scope
+    }
+}
 
 harw_tools::tool_provider! {
-    /// Stellt die lesenden Prozess-/System-Werkzeuge `sys.*` bereit
-    /// (`ps`, `pgrep`, `top`, `free`, `uptime`, `uname`, `env`, `id`, `ss`,
-    /// `lsof`, `date`, `which`).
-    pub struct SysToolProvider {
-        SysPsTool,
-        SysPgrepTool,
-        SysTopTool,
-        SysFreeTool,
-        SysUptimeTool,
-        SysUnameTool,
-        SysEnvTool,
-        SysIdTool,
-        SysSsTool,
-        SysLsofTool,
-        SysDateTool,
-        SysWhichTool,
+    impl for SysToolProvider as provider, parallel_safe: all {
+        SysPsTool::NAME => {
+            spec: SysPsTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysPsTool::new(provider.scope.clone()),
+        },
+        SysPgrepTool::NAME => {
+            spec: SysPgrepTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysPgrepTool::new(provider.scope.clone()),
+        },
+        SysTopTool::NAME => {
+            spec: SysTopTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysTopTool::new(provider.scope.clone()),
+        },
+        SysFreeTool::NAME => {
+            spec: SysFreeTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysFreeTool,
+        },
+        SysUptimeTool::NAME => {
+            spec: SysUptimeTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysUptimeTool,
+        },
+        SysUnameTool::NAME => {
+            spec: SysUnameTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysUnameTool,
+        },
+        SysEnvTool::NAME => {
+            spec: SysEnvTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysEnvTool,
+        },
+        SysIdTool::NAME => {
+            spec: SysIdTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysIdTool,
+        },
+        SysSsTool::NAME => {
+            spec: SysSsTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysSsTool,
+        },
+        SysLsofTool::NAME => {
+            spec: SysLsofTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysLsofTool,
+        },
+        SysDateTool::NAME => {
+            spec: SysDateTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysDateTool,
+        },
+        SysWhichTool::NAME => {
+            spec: SysWhichTool::spec(),
+            permission: Permission::ExecuteProcess,
+            skill: SKILL,
+            executor: SysWhichTool,
+        },
     }
 }
 
@@ -66,6 +192,148 @@ mod tests {
                 .iter()
                 .all(|p| *p == Some(Permission::ExecuteProcess))
         );
+        Ok(())
+    }
+
+    /// Die handgeschriebene Tabelle stimmt mit den Konstanten überein, die
+    /// `#[harw_macros::tool]` an jedem Werkzeug erzeugt (Name, Berechtigung,
+    /// Skill, Parallelität), in derselben Reihenfolge wie bisher.
+    #[test]
+    fn provider_table_matches_the_tool_attributes() {
+        let declared = [
+            (
+                SysPsTool::NAME,
+                SysPsTool::PERMISSION,
+                SysPsTool::SKILL,
+                SysPsTool::PARALLEL_SAFE,
+            ),
+            (
+                SysPgrepTool::NAME,
+                SysPgrepTool::PERMISSION,
+                SysPgrepTool::SKILL,
+                SysPgrepTool::PARALLEL_SAFE,
+            ),
+            (
+                SysTopTool::NAME,
+                SysTopTool::PERMISSION,
+                SysTopTool::SKILL,
+                SysTopTool::PARALLEL_SAFE,
+            ),
+            (
+                SysFreeTool::NAME,
+                SysFreeTool::PERMISSION,
+                SysFreeTool::SKILL,
+                SysFreeTool::PARALLEL_SAFE,
+            ),
+            (
+                SysUptimeTool::NAME,
+                SysUptimeTool::PERMISSION,
+                SysUptimeTool::SKILL,
+                SysUptimeTool::PARALLEL_SAFE,
+            ),
+            (
+                SysUnameTool::NAME,
+                SysUnameTool::PERMISSION,
+                SysUnameTool::SKILL,
+                SysUnameTool::PARALLEL_SAFE,
+            ),
+            (
+                SysEnvTool::NAME,
+                SysEnvTool::PERMISSION,
+                SysEnvTool::SKILL,
+                SysEnvTool::PARALLEL_SAFE,
+            ),
+            (
+                SysIdTool::NAME,
+                SysIdTool::PERMISSION,
+                SysIdTool::SKILL,
+                SysIdTool::PARALLEL_SAFE,
+            ),
+            (
+                SysSsTool::NAME,
+                SysSsTool::PERMISSION,
+                SysSsTool::SKILL,
+                SysSsTool::PARALLEL_SAFE,
+            ),
+            (
+                SysLsofTool::NAME,
+                SysLsofTool::PERMISSION,
+                SysLsofTool::SKILL,
+                SysLsofTool::PARALLEL_SAFE,
+            ),
+            (
+                SysDateTool::NAME,
+                SysDateTool::PERMISSION,
+                SysDateTool::SKILL,
+                SysDateTool::PARALLEL_SAFE,
+            ),
+            (
+                SysWhichTool::NAME,
+                SysWhichTool::PERMISSION,
+                SysWhichTool::SKILL,
+                SysWhichTool::PARALLEL_SAFE,
+            ),
+        ];
+        assert_eq!(SysToolProvider::TOOL_NAMES.len(), declared.len());
+        for (index, (name, permission, skill, parallel)) in declared.into_iter().enumerate() {
+            assert_eq!(SysToolProvider::TOOL_NAMES.get(index), Some(&name));
+            assert_eq!(
+                SysToolProvider::TOOL_PERMISSIONS.get(index),
+                Some(&permission)
+            );
+            assert_eq!(SysToolProvider::TOOL_SKILLS.get(index), Some(&skill));
+            assert_eq!(SysToolProvider::TOOL_ACTIVITIES.get(index), Some(&None));
+            assert_eq!(
+                SysToolProvider::tool_parallel_safe(name),
+                parallel,
+                "{name}"
+            );
+        }
+    }
+
+    /// `scope = "all"` erreicht die Werkzeuge nur über einen Provider mit
+    /// Freigabe-Zelle im Modus Full Access.
+    #[tokio::test]
+    async fn scope_all_reaches_the_tools_only_under_full_access() -> TestResult {
+        use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
+
+        let fx = Fixture::new()?;
+        let ctx = fx.exec_ctx()?;
+        let mode = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let gated = SysToolProvider::new().with_approval_mode(mode.clone());
+        let plain = SysToolProvider::new();
+        for (name, arguments) in [
+            ("sys.ps", json!({"scope": "all", "limit": 1})),
+            ("sys.pgrep", json!({"pattern": "x", "scope": "all"})),
+        ] {
+            for provider in [&plain, &gated] {
+                let tool = provider
+                    .executor(&ToolName::new(name))
+                    .ok_or(TestError::Missing("executor"))?;
+                let message = error_of(run(tool.as_ref(), &ctx, name, arguments.clone()).await?)?;
+                assert!(message.contains("Full Access"), "{name}: {message}");
+            }
+            mode.set(ApprovalMode::FullAccess);
+            let tool = gated
+                .executor(&ToolName::new(name))
+                .ok_or(TestError::Missing("executor"))?;
+            let value = json_of(run(tool.as_ref(), &ctx, name, arguments.clone()).await?)?;
+            assert_eq!(value["scope"], "all", "{name}");
+            // Der ungegatete Provider bleibt dabei.
+            let tool = plain
+                .executor(&ToolName::new(name))
+                .ok_or(TestError::Missing("executor"))?;
+            assert!(
+                error_of(run(tool.as_ref(), &ctx, name, arguments).await?)?.contains("Full Access")
+            );
+            mode.set(ApprovalMode::Delegated);
+        }
+        // Ohne `scope` bleibt es beim eigenen Umfang.
+        let ps = gated
+            .executor(&ToolName::new("sys.ps"))
+            .ok_or(TestError::Missing("executor"))?;
+        let value = json_of(run(ps.as_ref(), &ctx, "sys.ps", json!({"limit": 1})).await?)?;
+        assert_ne!(value["scope"], "all");
         Ok(())
     }
 

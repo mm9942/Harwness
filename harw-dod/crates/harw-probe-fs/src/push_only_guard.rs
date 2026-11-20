@@ -47,6 +47,7 @@ mod tests {
         ("source.rs", include_str!("source.rs")),
         ("sink.rs", include_str!("sink.rs")),
         ("collect.rs", include_str!("collect.rs")),
+        ("watch.rs", include_str!("watch.rs")),
     ];
 
     /// Die beiden Bezeichner, die zusammen einen Empfangspfad ausmachen

@@ -38,6 +38,26 @@
 //! A peer that is neither a verifier nor the requester of a context gets
 //! `404` for it, so context ids cannot be probed.
 //!
+//! ## Posture document
+//! `GET /v1/posture` answers
+//! `{"peer":{"uid","gid","pid"},"principal_id","host","dod":{…}}`.
+//! `dod.status` is `ok` (then also `min_severity`, `since`, `findings`,
+//! `skipped_malformed`, `skipped_oversize`, `truncated`), `unavailable` or
+//! `not_configured` (both with an empty `findings`). Unknown peers get
+//! `403 {"error":"unknown_peer"}`. The typed reader is
+//! `harw_infra_client::SecurityHubClient::posture`. Within protocol 1 the
+//! document only grows (PL-100 I11, reader-first): fields and status values
+//! may be added — the reader ignores unknown fields and maps unknown status
+//! or severity strings to `Unknown` — but no field is removed, renamed or
+//! retyped.
+//!
+//! A finding's `finding_id`, `rule_id` and `summary` are copied from the
+//! findings export, which is attacker-influenced: [`crate::findings`]
+//! replaces only control characters (`Cc`) in `rule_id` and `summary` and
+//! checks `finding_id` only for being non-blank. They are untrusted text
+//! for every consumer (PL-100 I4); the typed reader exposes them only as
+//! grammar-checked ids or escaped text.
+//!
 //! # Shutdown
 //! [`serve`] stops accepting when its shutdown future resolves, asks every
 //! open connection to finish its in-flight request (`graceful_shutdown`),
@@ -595,6 +615,7 @@ async fn posture(peer: PeerIdentity, state: &HubState) -> HubResponse {
                 host: host.clone(),
                 min_severity: wiring.min_severity,
                 since,
+                now,
             };
             let source = Arc::clone(&wiring.source);
             match tokio::task::spawn_blocking(move || source.recent(&filter)).await {
@@ -980,6 +1001,25 @@ mod tests {
         assert_eq!(field(&posture, "/host")?, "host-a");
         assert_eq!(field(&posture, "/dod/status")?, "ok");
         assert_eq!(field(&posture, "/dod/skipped_malformed")?.as_u64(), Some(1));
+        // The rest of the `ok` shape harw-infra-client's typed reader expects.
+        assert_eq!(
+            field(&posture, "/peer/uid")?.as_u64(),
+            Some(u64::from(own_uid()?))
+        );
+        assert!(field(&posture, "/peer/gid")?.is_u64());
+        assert_eq!(field(&posture, "/dod/min_severity")?, "high");
+        assert!(field(&posture, "/dod/since")?.is_string());
+        assert_eq!(field(&posture, "/dod/skipped_oversize")?.as_u64(), Some(0));
+        assert_eq!(field(&posture, "/dod/truncated")?.as_bool(), Some(false));
+        assert!(posture.pointer("/peer/pid").is_some(), "{posture}");
+        assert_eq!(field(&posture, "/dod/findings/0/host")?, "host-a");
+        assert_eq!(
+            field(&posture, "/dod/findings/0/rule_id")?,
+            "structure-drift"
+        );
+        assert_eq!(field(&posture, "/dod/findings/0/severity")?, "high");
+        assert!(field(&posture, "/dod/findings/0/summary")?.is_string());
+        assert!(field(&posture, "/dod/findings/0/observed_at")?.is_string());
         let findings = field(&posture, "/dod/findings")?
             .as_array()
             .ok_or(TestError::Missing("findings array"))?;
@@ -991,6 +1031,44 @@ mod tests {
         let (status, degraded) = call(&socket, Method::GET, "/v1/posture", "").await?;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(field(&degraded, "/dod/status")?, "unavailable");
+        assert_eq!(
+            field(&degraded, "/dod/findings")?.as_array().map(Vec::len),
+            Some(0)
+        );
+
+        let _ = stop_tx.send(());
+        tokio::time::timeout(DEADLINE, server)
+            .await
+            .map_err(ctx("server stops"))?
+            .map_err(ctx("server task"))?
+            .map_err(ctx("serve result"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_e2e_posture_without_findings_wiring_is_not_configured() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let socket = dir.path().join("security.sock");
+        let uid = own_uid()?;
+        let state = Arc::new(state_for(&peer_policy(uid), start_clock()?)?);
+        let listener = bind_listener(&socket).await.map_err(ctx("bind"))?;
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve(listener, state, async move {
+            let _ = stop_rx.await;
+        }));
+
+        // The `not_configured` shape harw-infra-client's typed reader expects.
+        let (status, posture) = call(&socket, Method::GET, "/v1/posture", "").await?;
+        assert_eq!(status, StatusCode::OK, "{posture}");
+        assert_eq!(field(&posture, "/peer/uid")?.as_u64(), Some(u64::from(uid)));
+        assert_eq!(field(&posture, "/principal_id")?, "alice");
+        assert!(field(&posture, "/host")?.is_null());
+        assert_eq!(field(&posture, "/dod/status")?, "not_configured");
+        assert_eq!(
+            field(&posture, "/dod/findings")?.as_array().map(Vec::len),
+            Some(0)
+        );
+        assert!(posture.pointer("/dod/min_severity").is_none());
 
         let _ = stop_tx.send(());
         tokio::time::timeout(DEADLINE, server)

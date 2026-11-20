@@ -73,10 +73,14 @@ admitted = [
   # Plan R9, Teil F: lang laufende/verfolgbare Prozesse (Builds, Restores,
   # Testläufe, alles über ~2 min) als Job statt tmux; gleicher Rechte- und
   # Freigabeweg wie `shell.exec` (`harw_registry_defaults::profile::JOB_TOOLS`).
+  # Ausnahme PL-100 WP 3.5: `job.suspend`/`job.resume` fragen immer nach
+  # (`ALWAYS_ASK_TOOLS`), auch gegen eine Allow-Regel.
   "job.start",
   "job.status",
   "job.logs",
   "job.stop",
+  "job.suspend",
+  "job.resume",
   "job.list",
   # Plan R9, Teil A: Skills nur über den Katalog finden und laden
   # (`harw_registry_defaults::profile::skill_catalog_tools_for_role`).

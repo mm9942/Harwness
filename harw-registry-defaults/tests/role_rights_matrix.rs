@@ -177,6 +177,20 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
             RegistryProfile::NoTools,
             AuthorityReducer::ReadOnly,
         ),
+        // PL-100 O11: die beiden Envelope-Rollen der Sicherheitsfamilie sind
+        // parametergetrieben (`NoTools`) und read-only ohne Netz. Das eine
+        // rollengebundene Werkzeug von `intel-scout` (`deps.locked`) braucht
+        // genau `ReadWorkspace`, die Obergrenze von `ReadOnly`.
+        (
+            role_names::INTEL_SCOUT,
+            RegistryProfile::NoTools,
+            AuthorityReducer::ReadOnly,
+        ),
+        (
+            role_names::CONTEXT_STEWARD,
+            RegistryProfile::NoTools,
+            AuthorityReducer::ReadOnly,
+        ),
         // Runde 3, Welle E + Matrix-Unterlagen: die vier Matrix-Game-Sitze
         // lesen nur ihre Unterlagen (`MatrixReader`: lesende `fs.*` plus
         // `doc.read_pdf`) — ohne Netz, Schreiben oder Exec.
@@ -1044,6 +1058,56 @@ fn test_game_master_is_read_only_without_network() -> TestResult {
                     "{profile:?} bewirbt {tool}"
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+/// PL-100 O11: `intel-scout` und `context-steward` sehen nach ihrem Reducer
+/// unter keinem der 128 Rechtesätze des Elternteils Netz, Schreiben, Exec,
+/// Secrets oder den Registry-Quellcache. Das rollengebundene `deps.locked`
+/// von `intel-scout` ist genau dann ausführbar, wenn der Elternteil sein
+/// Recht (`ReadWorkspace`) trägt — nie breiter. Beide admittieren höchstens
+/// dieses eine Werkzeug, insbesondere kein `dod.*`.
+#[test]
+fn test_o11_roles_stay_read_only_and_admit_at_most_the_lockfile_tool() -> TestResult {
+    let roles: HashMap<String, harw_agent_dsl::ExecutableAgentIr> =
+        builtin_agent_definitions(&HashMap::new()).map_err(ctx(
+            "eingebaute Rollendefinitionen müssen sich auflösen lassen",
+        ))?;
+    for role in [role_names::INTEL_SCOUT, role_names::CONTEXT_STEWARD] {
+        let reducer = authority_reducer_for_role(role).ok_or(TestError::Missing("Reducer"))?;
+        let bound = harw_registry_defaults::profile::lockfile_tools_for_role(role);
+        for parent in every_permission_subset() {
+            let child = reducer.reduce(&parent);
+            for forbidden in [
+                Permission::NetworkAccess,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+                Permission::ReadSecrets,
+                Permission::ReadCargoRegistry,
+            ] {
+                assert!(!child.contains(forbidden), "{role}: {forbidden:?}");
+            }
+            for tool in bound {
+                let needed = harw_registry_defaults::tool_permission(tool)
+                    .ok_or(TestError::Missing("Recht des Lockfile-Werkzeugs"))?;
+                assert_eq!(
+                    child.contains(needed),
+                    parent.contains(needed),
+                    "{role}: {tool} unter {parent:?}"
+                );
+            }
+        }
+        let ir = roles.get(role).ok_or(TestError::Unexpected(format!(
+            "Rolle {role} fehlt in den aufgelösten Definitionen"
+        )))?;
+        for tool in ir.tool_surface().admitted() {
+            assert!(!tool.starts_with("dod."), "{role} admittiert {tool}");
+            assert!(
+                bound.contains(&tool.as_str()),
+                "{role} admittiert {tool} ohne rollengebundenes Angebot"
+            );
         }
     }
     Ok(())

@@ -1,11 +1,13 @@
 //! [`SecurityHubClient`]: skeleton client of the SecurityHub
 //! (`security.sock`, drift report D2).
 //!
-//! The common surface (health, version, capabilities) plus context
+//! The common surface (health, version, capabilities), context
 //! verification ([`SecurityHubClient::verify_context`], H12): a verifier
 //! peer (e.g. `harw-web`) asks the hub whether a context reference a local
-//! client presented is still active. Incident and policy operations come
-//! with the daemon (H8).
+//! client presented is still active, and the typed posture document
+//! ([`SecurityHubClient::posture`], PL-100 phase 4; wire contract in the
+//! `posture` module). Incident and policy operations come with the daemon
+//! (H8).
 
 use core::fmt;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,7 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{InfraClientError, RemoteErrorKind};
 use crate::info::{self, Capabilities, Health, JSON, VersionInfo};
+use crate::posture::{self, Posture};
 use crate::transport::{ClientOptions, RequestBody, UdsTransport};
 
 /// Longest context id the hub accepts in a path (mirrors
@@ -137,6 +140,31 @@ impl SecurityHubClient {
             return Err(InfraClientError::Protocol("context document is not active"));
         }
         Ok(ContextVerification::Active(wire.context))
+    }
+
+    /// `GET /v1/posture`: the identity the hub attributes to the calling
+    /// process (peer credentials, principal) plus the DoD posture of this
+    /// host (correlation state and recent findings).
+    ///
+    /// The document is read reader-first: unknown fields are ignored and an
+    /// unknown `dod.status` or severity becomes an `Unknown` variant (see
+    /// [`Posture`]). A hub without a readable findings export still answers
+    /// `200`, with [`crate::DodPostureStatus::Unavailable`] or
+    /// [`crate::DodPostureStatus::NotConfigured`]. Export-derived finding
+    /// fields arrive only as grammar-checked [`crate::PostureId`]s and
+    /// [`crate::UntrustedText`] (PL-100 I4); an id outside its grammar keeps
+    /// its finding visible as [`crate::PostureId::Invalid`].
+    ///
+    /// # Errors
+    /// - [`InfraClientError::Forbidden`] when the calling uid is neither a
+    ///   policy peer nor a verifier of the hub (`403 unknown_peer`);
+    /// - [`InfraClientError::Protocol`] for a wrong content type or a
+    ///   malformed document;
+    /// - [`InfraClientError::Unavailable`] / [`InfraClientError::Timeout`]
+    ///   when the hub cannot be reached in time;
+    /// - any other mapped status.
+    pub async fn posture(&self) -> Result<Posture, InfraClientError> {
+        posture::fetch(&self.transport).await
     }
 }
 

@@ -1,10 +1,10 @@
 //! Golden-Test für die Programmbibliothek der Kontextprogramme (AW6-05).
 //!
 //! Spezifikationsquelle: `harw-registry-defaults/agents/context-programs/TESTS.txt`
-//! (Punkt 6) und die neun `golden/*.golden.txt`-Dateien selbst, die laut ihrer
+//! (Punkt 6) und die `golden/*.golden.txt`-Dateien selbst, die laut ihrer
 //! eigenen `STATUS`-Zeile *von Hand aus der Renderlogik abgeleitet, nicht
 //! durch einen tatsächlichen Lauf erzeugt* wurden. Dieser Test schließt genau
-//! diese Lücke: er löst jedes der neun Programme über
+//! diese Lücke: er löst jedes Rollenprogramm aus [`ROLE_PROGRAMS`] über
 //! [`harw_agent_dsl::context_program::resolve_context_program`] auf, rendert
 //! das Ergebnis über [`harw_agent_dsl::context_program::render_context_program`]
 //! und vergleicht es gegen den Abschnitt „Gerenderter Turn-Kontext
@@ -19,12 +19,13 @@
 //! Entstehungsgeschichte). Ein Vergleich der gesamten Datei würde diese
 //! Dokumentation fälschlich als Renderer-Ausgabe behandeln.
 //!
-//! # Herkunft der neun `.toml`-Definitionen
+//! # Herkunft der `.toml`-Definitionen
 //! Wird bewusst nicht über `harw_registry_defaults::embedded_agents` geladen
 //! (das ist der eingebettete Loader für **Rollen**-Definitionen, AW6-00,
 //! `harw-registry-defaults/src/**` — außerhalb des Schreibbereichs dieses
-//! Knotens). Stattdessen liest dieser Test die zehn `.toml`-Dateien unter
-//! `agents/context-programs/` direkt vom Dateisystem — ein reiner
+//! Knotens). Stattdessen liest dieser Test die elf `.toml`-Dateien unter
+//! `agents/context-programs/` (`base.toml` + die zehn Rollenprogramme aus
+//! [`ROLE_PROGRAMS`]) direkt vom Dateisystem — ein reiner
 //! Test-Fixture-Zugriff, keine Verletzung der Reinheitszusage des Renderers
 //! selbst (§ Moduldoku von `context_program.rs`).
 //!
@@ -34,6 +35,14 @@
 //! halten fest, dass die eingebettete Bibliothek exakt die Dateien dieses
 //! Verzeichnisses trägt und dass eine gebundene Rolle das golden-getestete
 //! Programm tatsächlich als `context_policy` führt.
+//!
+//! # Sicherheits-Triage (PL-100 WP 1.3)
+//! Seit PL-100 binden die vier `security-*-triage`-Rollen `security-triage`
+//! statt `triage` (Fehler-Triage). `triage` bleibt Bibliotheksprogramm und
+//! weiter golden-getestet. Die Tests
+//! `security_triage_inherits_only_base_and_excludes_non_dod_sources` und
+//! `security_triage_roles_no_longer_bind_error_triage` halten die Form des
+//! neuen Programms und seine Bindung fest.
 //!
 //! [`ResolvedContextProgramDefinition`]: harw_agent_dsl::context_program::ResolvedContextProgramDefinition
 
@@ -55,10 +64,11 @@ use common::{TestError, TestResult, ctx};
 /// Renderer-Output trägt (§ Moduldoku „Warum nur dieser eine Abschnitt").
 const RENDER_MARKER: &str = "--- Gerenderter Turn-Kontext (Platzhalter-Inhalt) ---";
 
-/// Die neun Rollenprogramme dieser Bibliothek (AW6-05), ohne `base` selbst —
-/// `base` ist die gemeinsame Basis, kein eigenständig golden-getestetes
-/// Programm (§ TESTS.txt Punkt 6: „Ein Golden Render je Programm (neun...)").
-const NINE_PROGRAMS: [&str; 9] = [
+/// Die Rollenprogramme dieser Bibliothek, ohne `base` selbst — `base` ist die
+/// gemeinsame Basis, kein eigenständig golden-getestetes Programm (§ TESTS.txt
+/// Punkt 6: „Ein Golden Render je Programm"). Die neun aus AW6-05 plus
+/// `security-triage` (PL-100 WP 1.3), alphabetisch.
+const ROLE_PROGRAMS: [&str; 10] = [
     "curate",
     "explore",
     "implement",
@@ -67,10 +77,21 @@ const NINE_PROGRAMS: [&str; 9] = [
     "research-deps",
     "research-web",
     "review",
+    "security-triage",
     "triage",
 ];
 
-/// Verzeichnis mit den zehn `.toml`-Quelldefinitionen dieses Knotens.
+/// Die vier Sicherheits-Triage-Rollen, die `security-triage` binden
+/// (PL-100 WP 1.3; README §3.3 Routing-Tabelle).
+const SECURITY_TRIAGE_ROLES: [&str; 4] = [
+    "security-egress-triage",
+    "security-baseline-triage",
+    "security-structure-triage",
+    "security-endpoint-triage",
+];
+
+/// Verzeichnis mit den `.toml`-Quelldefinitionen dieses Knotens (`base.toml`
+/// plus je eine Datei aus [`ROLE_PROGRAMS`]).
 fn context_programs_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("agents/context-programs")
 }
@@ -79,7 +100,7 @@ fn context_programs_dir() -> PathBuf {
 /// rekursiv — `golden/` und `TESTS.txt` liegen daneben, nicht darunter) und
 /// parst sie zu `(DefinitionLayer::BuiltIn, RawContextProgramDefinition)`.
 ///
-/// Alle zehn Layer-Einträge tragen denselben [`DefinitionLayer::BuiltIn`]:
+/// Alle Layer-Einträge tragen denselben [`DefinitionLayer::BuiltIn`]:
 /// dieser Test prüft `extends` zwischen unterschiedlichen `id`s, keine
 /// Overlay-Patches über Layer-Prioritäten hinweg — dafür ist die relative
 /// Layer-Reihenfolge irrelevant (siehe `resolve_context_program`, das nach
@@ -108,10 +129,12 @@ fn load_layers() -> TestResult<Vec<(DefinitionLayer, RawContextProgramDefinition
         })?;
         layers.push((DefinitionLayer::BuiltIn, raw));
     }
+    let expected = ROLE_PROGRAMS.len().saturating_add(1);
     assert_eq!(
         layers.len(),
-        10,
-        "erwartet base.toml + neun Rollenprogramme unter {dir:?}, gefunden: {}",
+        expected,
+        "erwartet base.toml + {} Rollenprogramme unter {dir:?}, gefunden: {}",
+        ROLE_PROGRAMS.len(),
         layers.len()
     );
     Ok(layers)
@@ -182,15 +205,15 @@ fn assert_render_matches(program: &str, actual: &str, expected: &str) -> TestRes
     )))
 }
 
-/// Der wichtigste Test dieses Knotens (§ TESTS.txt Punkt 6): alle neun
-/// Programme werden aufgelöst, gerendert und gegen ihre Golden-Datei
+/// Der wichtigste Test dieses Knotens (§ TESTS.txt Punkt 6): alle
+/// Rollenprogramme werden aufgelöst, gerendert und gegen ihre Golden-Datei
 /// verglichen.
 #[test]
-fn all_nine_programs_render_match_golden() -> TestResult {
+fn all_role_programs_render_match_golden() -> TestResult {
     let layers = load_layers()?;
     let golden_dir = context_programs_dir().join("golden");
 
-    for name in NINE_PROGRAMS {
+    for name in ROLE_PROGRAMS {
         let resolved = resolve(&layers, name)?;
         let actual = render_context_program(&resolved);
         let golden_path = golden_dir.join(format!("{name}.golden.txt"));
@@ -207,7 +230,7 @@ fn all_nine_programs_render_match_golden() -> TestResult {
 #[test]
 fn render_is_byte_identical_across_repeated_calls() -> TestResult {
     let layers = load_layers()?;
-    for name in NINE_PROGRAMS {
+    for name in ROLE_PROGRAMS {
         let resolved = resolve(&layers, name)?;
         let first = render_context_program(&resolved);
         let second = render_context_program(&resolved);
@@ -278,13 +301,13 @@ fn extends_renders_resolved_program_not_raw_declaration() -> TestResult {
     Ok(())
 }
 
-/// Jede der neun `extends`-Auflösungen trägt tatsächlich einen `"base"`-
+/// Jede `extends`-Auflösung der Rollenprogramme trägt tatsächlich einen `"base"`-
 /// Auflösungsschritt, der exakt auf `harwness.context.base@1` zeigt (§
 /// TESTS.txt Punkt 3) — nicht nur irgendeinen `"base"`-Schritt.
 #[test]
 fn every_program_traces_a_base_step_pointing_at_base_definition() -> TestResult {
     let layers = load_layers()?;
-    for name in NINE_PROGRAMS {
+    for name in ROLE_PROGRAMS {
         let resolved = resolve(&layers, name)?;
         let has_base_step = resolved
             .trace
@@ -329,12 +352,13 @@ fn assert_render_matches_names_program_and_line_on_mismatch() -> TestResult {
     Ok(())
 }
 
-/// Keine Namenskollision zwischen den zehn Kontextprogramm-IDs dieses
-/// Knotens (informativ; die vollständige Disjunktheits-Prüfung gegen
-/// Rollennamen aus AW6-00 gehört laut TESTS.txt Punkt 2 einem zentralen
-/// Verzeichnis-Loader, der außerhalb dieses Schreibbereichs liegt).
+/// Keine Namenskollision zwischen den Kontextprogramm-IDs dieses Knotens
+/// (`base` plus [`ROLE_PROGRAMS`]; informativ; die vollständige
+/// Disjunktheits-Prüfung gegen Rollennamen aus AW6-00 gehört laut TESTS.txt
+/// Punkt 2 einem zentralen Verzeichnis-Loader, der außerhalb dieses
+/// Schreibbereichs liegt).
 #[test]
-fn ten_context_program_ids_are_pairwise_distinct() -> TestResult {
+fn all_context_program_ids_are_pairwise_distinct() -> TestResult {
     let layers = load_layers()?;
     let mut seen: HashMap<String, ()> = HashMap::new();
     for (_, def) in &layers {
@@ -344,7 +368,7 @@ fn ten_context_program_ids_are_pairwise_distinct() -> TestResult {
             "doppelte Kontextprogramm-ID: {key}"
         );
     }
-    assert_eq!(seen.len(), 10);
+    assert_eq!(seen.len(), ROLE_PROGRAMS.len().saturating_add(1));
     Ok(())
 }
 
@@ -404,7 +428,10 @@ fn bound_roles_carry_the_golden_tested_program() -> TestResult {
         ("planner", "plan"),
         ("executor", "implement"),
         ("analyst", "review"),
-        ("security-egress-triage", "triage"),
+        ("security-egress-triage", "security-triage"),
+        ("security-baseline-triage", "security-triage"),
+        ("security-structure-triage", "security-triage"),
+        ("security-endpoint-triage", "security-triage"),
         ("root-orchestrator", "orchestrate"),
         ("researcher-deps", "research-deps"),
         ("researcher-web", "research-web"),
@@ -423,6 +450,98 @@ fn bound_roles_carry_the_golden_tested_program() -> TestResult {
             assert!(
                 ir.context_program().exclude().contains(selector),
                 "{role}: Ausschluss {selector} aus {program} fehlt"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// PL-100 WP 1.3: `security-triage` erbt genau die zwei Basissektionen
+/// unverändert (`task.objective` full/instruction, `history.tail`
+/// summary/evidence), deklariert selbst keine Sektion und schließt zusätzlich
+/// zum Basis-Fußboden alle Faktenquellen außerhalb von `dod.*` aus.
+///
+/// Fällt dieser Test, hat jemand dem Kind einen weiteren Kanal geöffnet (z. B.
+/// `error.trace` aus der Fehler-Triage oder Gedächtnisinhalt) — das verletzt
+/// I4 („Fakten nur über `dod.*`", README §2).
+#[test]
+fn security_triage_inherits_only_base_and_excludes_non_dod_sources() -> TestResult {
+    let layers = load_layers()?;
+
+    let raw = layers
+        .iter()
+        .map(|(_, def)| def)
+        .find(|def| def.id.name == "security-triage")
+        .ok_or(TestError::Missing(
+            "security-triage.toml sollte geladen sein",
+        ))?;
+    assert!(
+        raw.sections.is_empty(),
+        "security-triage deklariert keine eigenen Sektionen: {:?}",
+        raw.sections
+    );
+
+    let base = resolve(&layers, "base")?;
+    let resolved = resolve(&layers, "security-triage")?;
+    assert_eq!(
+        resolved.sections, base.sections,
+        "security-triage trägt genau die Basissektionen, unverändert"
+    );
+    let names: Vec<&str> = resolved.sections.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["task.objective", "history.tail"]);
+
+    let mut expected_exclude = base.exclude;
+    for selector in [
+        "plan.*",
+        "diff.*",
+        "error.*",
+        "child.returns",
+        "knowledge.*",
+        "memory.*",
+    ] {
+        expected_exclude.push(selector.to_owned());
+    }
+    assert_eq!(
+        resolved.exclude, expected_exclude,
+        "Ausschluss = Basis-Fußboden, dann die sechs Nicht-DoD-Quellen"
+    );
+    Ok(())
+}
+
+/// PL-100 WP 1.3: keine der vier Sicherheits-Triage-Rollen bindet mehr das
+/// Fehler-Triage-Programm, und keine verlangt `error.trace` oder stellt es
+/// zurück. Die Ausschlüsse `error.*` und `child.returns` stehen in ihrer IR.
+#[test]
+fn security_triage_roles_no_longer_bind_error_triage() -> TestResult {
+    let layers = load_layers()?;
+    let error_triage = resolve(&layers, "triage")?.id.to_string();
+    let security_triage = resolve(&layers, "security-triage")?.id.to_string();
+    let definitions =
+        harw_registry_defaults::embedded_agents::builtin_agent_definitions(&HashMap::new())
+            .map_err(ctx("eingebaute Definitionen müssen lowern"))?;
+    for role in SECURITY_TRIAGE_ROLES {
+        let ir = definitions
+            .get(role)
+            .ok_or_else(|| TestError::Unexpected(format!("Rolle '{role}' fehlt")))?;
+        let program = ir.context_program();
+        assert_eq!(
+            program.context_policy(),
+            Some(security_triage.as_str()),
+            "{role} muss security-triage binden"
+        );
+        assert_ne!(
+            program.context_policy(),
+            Some(error_triage.as_str()),
+            "{role} darf nicht mehr die Fehler-Triage binden"
+        );
+        assert!(
+            !program.must_include().iter().any(|s| s == "error.trace"),
+            "{role}: error.trace gehört nicht in must_include"
+        );
+        for selector in ["error.*", "child.returns", "memory.*", "knowledge.*"] {
+            assert!(
+                program.exclude().iter().any(|s| s == selector),
+                "{role}: Ausschluss {selector} fehlt"
             );
         }
     }

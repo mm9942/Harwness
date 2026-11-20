@@ -1,0 +1,42 @@
+[package]
+name = "harw-dod-ladder"
+description = "Escalation ladder for triaged DoD findings: stage rule and action admissibility, without signing code"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# PL-100 WP 3.0: aus `harw-dod-escalate` herausgelöst. Die Leiter ist eine
+# reine Funktion der Befundfelder; sie signiert nichts und hängt deshalb nur am
+# signierfreien Vokabular (`harw-dod-warden-types`), nie am Signierteil
+# (`harw-dod-warden-proto`) oder am FreezeStore.
+[dependencies]
+# `Finding<Triaged>`, `FindingKind`, `Verdict` — die Felder, auf denen die
+# Aufstiegsregel arbeitet. Ohne Features: das Feature `test-support` darf nur
+# aus Dev-Abhängigkeiten kommen (xtask-Gate `operator-decision`, Regel (d)).
+harw-dod-rules = { path = "../harw-dod-rules" }
+# `Severity`/`Hardness` — die beiden Schwellen der Aufstiegsregel.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# `EscalationStage`/`WardenAction` und die Zulässigkeitsmatrix
+# (`WardenAction::is_admissible_from`) — ohne Signier-Code (Leitprinzip I8).
+harw-dod-warden-types = { path = "../harw-dod-warden-types" }
+# `#[derive(harw_macros::HarwError)]` für `LadderError`.
+harw-macros = { path = "../../../harw-macros" }
+
+[dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
+# Nur für Tests: `CgroupId`/`FindingId` der Fixtures.
+harw-types = { path = "../../../harw-types" }
+jiff = { workspace = true }
+# Nur für Tests: schaltet `triaged_finding_for_test` frei — die Fixtures
+# brauchen `Severity`/`Hardness`-Kombinationen (z. B. `Severity::Critical`),
+# die keine echte Regel erzeugt. Nur hier, nie unter `[dependencies]`: das
+# xtask-Gate `operator-decision` (Regel (d)) lässt `test-support` außerhalb von
+# Dev-Abhängigkeiten rot werden, weil die Testhilfen auch einen
+# `Finding<Triaged>` mit `Verdict::Confirmed` erzeugen.
+harw-dod-rules = { path = "../harw-dod-rules", features = ["test-support"] }
+
+[lints]
+workspace = true

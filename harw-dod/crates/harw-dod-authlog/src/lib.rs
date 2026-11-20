@@ -11,7 +11,11 @@
 //!   gebaut**, siehe Abschnitt „Journal-Backend" unten.
 //! - **Audit-Backend** ([`AuditBackend`],
 //!   `harw_dod_cap::Capability::ReadAuditNetlink`) — liest über die gelandete
-//!   Zugriffsschicht `harw-dod-netlink`.
+//!   Zugriffsschicht `harw-dod-netlink`, in beiden Eingabeformen: der
+//!   auditd-Textform und der Kernel-Netlink-Nutzlast. Die
+//!   Einzelrecord-Umwandlung [`auth_record_from_raw`] und die Abbildung
+//!   [`auth_record_to_event`] sind öffentlich, damit `harw-probe-netlink`
+//!   dieselben Regeln auf seinen Datenstrom anwendet, statt sie zu kopieren.
 //! - [`FixtureAuthBackend`] — eine deterministische Attrappe, Teil der
 //!   normalen API (nicht hinter `#[cfg(test)]`), weil spätere Knoten
 //!   (Regeln, Sentinel) sie für ihre eigenen Tests brauchen.
@@ -103,9 +107,11 @@
 //! den Recordinhalt selbst.
 //!
 //! # Exportierte Typen
-//! [`AuthBackend`], [`AuthRecord`], [`AuditBackend`], [`FixtureAuthBackend`],
-//! [`AuthlogSensor`], [`sensor::DEFAULT_LOOKBACK`], [`AuthlogError`],
-//! [`AuthlogResult`].
+//! [`AuthBackend`], [`AuthBatch`], [`AuthRecord`], [`AuditBackend`],
+//! [`FixtureAuthBackend`], [`AuthlogSensor`], [`sensor::DEFAULT_LOOKBACK`],
+//! [`MALFORMED_RECORDS_METRIC`], [`LOGIN_RECORD_TYPES`], [`AuthlogError`],
+//! [`AuthlogResult`] sowie die freien Funktionen [`auth_record_from_raw`],
+//! [`auth_record_to_event`] und [`is_login_record_type`].
 //!
 //! # Nebenläufigkeit
 //! `AuthBackend: Send + Sync` — ein Sentinel darf ein Backend aus einem
@@ -129,11 +135,11 @@
 //! )]);
 //! let backend = AuditBackend::new(Box::new(source));
 //!
-//! let events = backend
-//!     .read_events(jiff::Timestamp::UNIX_EPOCH)
-//!     .expect("Fixture liefert wohlgeformte Records");
+//! let events = backend.read_events(jiff::Timestamp::UNIX_EPOCH)?;
+//! assert_eq!(events.len(), 1);
 //! // Der Sentinelwert 4294967295 heißt "keine Anmelde-UID gesetzt".
-//! assert_eq!(events[0].actor.auid, None);
+//! assert!(events.iter().all(|event| event.actor.auid.is_none()));
+//! # Ok::<(), harw_dod_authlog::AuthlogError>(())
 //! ```
 
 pub mod audit_backend;
@@ -143,12 +149,14 @@ pub mod fixture_backend;
 pub mod record;
 pub mod sensor;
 
-pub use audit_backend::AuditBackend;
-pub use backend::AuthBackend;
+pub use audit_backend::{
+    AuditBackend, LOGIN_RECORD_TYPES, auth_record_from_raw, is_login_record_type,
+};
+pub use backend::{AuthBackend, AuthBatch};
 pub use error::{AuthlogError, AuthlogResult};
 pub use fixture_backend::FixtureAuthBackend;
 pub use record::AuthRecord;
-pub use sensor::AuthlogSensor;
+pub use sensor::{AuthlogSensor, MALFORMED_RECORDS_METRIC, auth_record_to_event};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

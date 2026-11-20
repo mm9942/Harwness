@@ -354,6 +354,12 @@ pub struct ApprovalDialog {
     /// Runde 5 (Integration O): nur einmalige Zustimmung anbieten — blendet
     /// „Ja, und in den auto-Modus wechseln“ aus (Kind-Freigaben).
     once_only: bool,
+    /// PL-100 Entscheidung O1: der vom Kern zugeschriebene Grund der
+    /// Rückfrage (heute nur der DoD-Taint, „nach DoD-Abfrage in diesem
+    /// Turn“); erscheint als Zeile „Sicherheitsregel: …“ vor dem Grund des
+    /// Auto-Modus. Bewusst getrennt von [`Self::justification`], die der
+    /// Agent liefert.
+    core_reason: Option<String>,
     /// Runde 6, Teil A1: warum der Auto-Modus fragt („<Kategorie> –
     /// <Grund>“); erscheint als Zeile „Auto-Modus: …“.
     auto_reason: Option<String>,
@@ -396,6 +402,7 @@ impl ApprovalDialog {
             remember_rule: request.remember_rule,
             learn_offer: None,
             once_only: false,
+            core_reason: None,
             auto_reason: None,
             deadline: request.deadline,
             reason_input_enabled: request.reason_input_enabled,
@@ -419,6 +426,29 @@ impl ApprovalDialog {
     #[must_use]
     pub fn with_learning_offer(mut self, offer: LearnOfferView) -> Self {
         self.learn_offer = Some(offer);
+        self
+    }
+
+    /// PL-100 Entscheidung O1: hängt den Grund an, den der Kern der
+    /// Rückfrage zuschreibt.
+    ///
+    /// # Beschreibung
+    /// Heute nur der DoD-Taint (`harw_core::dod_taint::pending_ask_reason`).
+    /// Der Text stammt vom Harness, nicht vom Agenten: er steht deshalb unter
+    /// eigener Beschriftung („Sicherheitsregel“) **vor** dem Grund des
+    /// Auto-Modus und nie unter „Begründung“
+    /// ([`ApprovalDialogRequest::justification`]). Fragen Taint und
+    /// Auto-Modus, zeigt das Panel beide Zeilen.
+    ///
+    /// # Argumente
+    /// - `reason` (`Option<String>`): der bereits escapte Grund; `None` oder
+    ///   ein leerer Text lässt das Panel unverändert.
+    ///
+    /// # Rückgabe
+    /// Das Panel mit der Zeile „Sicherheitsregel: …“.
+    #[must_use]
+    pub fn with_core_reason(mut self, reason: Option<String>) -> Self {
+        self.core_reason = reason.filter(|reason| !reason.trim().is_empty());
         self
     }
 
@@ -883,15 +913,20 @@ impl ApprovalDialog {
         DialogContent { body, pinned }
     }
 
-    /// Zusatzfelder (Herkunft, Auto-Modus-Grund, cwd, Risiko, Begründung) in
-    /// Anzeigereihenfolge, jeweils mit Beschriftung; fehlende Felder werden
-    /// ausgelassen.
+    /// Zusatzfelder (Herkunft, Kern-Grund, Auto-Modus-Grund, cwd, Risiko,
+    /// Begründung) in Anzeigereihenfolge, jeweils mit Beschriftung; fehlende
+    /// Felder werden ausgelassen.
     fn info_fields(&self) -> Vec<(&'static str, String)> {
         let mut fields = Vec::new();
         if let Some(origin) = &self.origin {
             // Runde 5, Teil O: Kind-Freigaben nennen ihren Absender als
             // „angefragt von: <rolle> (<pfad im baum>)“.
             fields.push((tr("dialogs.requested_by", "requested by"), origin.clone()));
+        }
+        // PL-100 O1: der vom Kern zugeschriebene Grund (DoD-Taint) steht vor
+        // dem Grund des Auto-Modus, unter eigener Beschriftung.
+        if let Some(reason) = &self.core_reason {
+            fields.push((tr("dialogs.core_reason", "Security rule"), reason.clone()));
         }
         // Runde 6, Teil A1: der Grund des Auto-Modus steht vor cwd/Risiko.
         // R18 F2: fiel der Klassifizierer aus, steht dort in Klartext, dass
@@ -1484,6 +1519,29 @@ mod tests {
         );
         let plain = render_dialog(&shell_dialog(None).with_auto_reason(None), 90, 24);
         assert!(!plain.contains("Auto mode:"), "{plain}");
+    }
+
+    /// PL-100 O1: der Kern-Grund steht unter eigener Beschriftung vor dem
+    /// Grund des Auto-Modus und nie als Begründung des Agenten; ein leerer
+    /// Grund erzeugt keine Zeile.
+    #[test]
+    fn test_core_reason_is_shown_before_the_auto_mode_reason() {
+        let dialog = shell_dialog(None)
+            .with_core_reason(Some(
+                "'shell.exec' braucht eine ausdrückliche Freigabe: nach DoD-Abfrage".to_owned(),
+            ))
+            .with_auto_reason(Some("eingriff – stoppt einen Job".to_owned()));
+        let rendered = render_dialog(&dialog, 120, 30);
+        let core = rendered.find("Security rule: 'shell.exec' braucht");
+        let auto = rendered.find("Auto mode: eingriff – stoppt einen Job");
+        assert!(core.is_some() && auto.is_some(), "{rendered}");
+        assert!(core < auto, "{rendered}");
+        assert!(!rendered.contains("Justification:"), "{rendered}");
+
+        for empty in [None, Some("  ".to_owned())] {
+            let plain = render_dialog(&shell_dialog(None).with_core_reason(empty), 120, 30);
+            assert!(!plain.contains("Security rule:"), "{plain}");
+        }
     }
 
     /// TUI-06 (R18 F2): fiel der Klassifizierer aus, nennt der Dialog das in

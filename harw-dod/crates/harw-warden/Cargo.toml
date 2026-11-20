@@ -10,31 +10,27 @@ rust-version.workspace = true
 
 [dependencies]
 # Der Durchsetzer selbst: `Warden`, `WardenOutcome`, `AuditSink`,
-# `CgroupFreezer`/`CgroupReleaser`/`NetworkIsolator`/`ProcessTreeKiller`,
-# `CgroupV2Executor`. Dieses Binary macht die Bibliothek zu einem laufenden
+# `CgroupFreezer`/`CgroupThawer`/`NetworkIsolator`/`ProcessTreeKiller`,
+# `CgroupV2Executor`, Policy-, Schlüssel- und Zustandslader. Dieses Binary macht die Bibliothek zu einem laufenden
 # Prozess (Knoten AW5-04b) — siehe `src/main.rs`-Moduldoku.
 harw-dod-warden = { path = "../harw-dod-warden" }
-# Wire-Vokabular: `WardenActionRequest`, `WardenResponse`,
-# `AuthorizationProof`. `harw-dod-warden` re-exportiert diese Typen selbst
-# NICHT (siehe dessen `lib.rs`, `pub use`-Liste) — dieses Binary braucht sie
-# direkt, um eine empfangene Wire-Nachricht überhaupt zu deserialisieren und
-# an `Warden::handle` zu übergeben.
+# Wire-Vokabular: `WardenRequest` (v2, `decode` lehnt v1 ab),
+# `WardenReply`/`WardenResponse`, `Denial`, `KeyRing`. `harw-dod-warden`
+# re-exportiert diese Typen selbst NICHT (siehe dessen `lib.rs`,
+# `pub use`-Liste) — dieses Binary braucht sie direkt, um eine empfangene
+# Wire-Nachricht zu dekodieren und zu beantworten.
 harw-dod-warden-proto = { path = "../harw-dod-warden-proto" }
-# `FindingId` für den eigenen Umschlag dieses Binaries (siehe
-# `src/protocol.rs`-Moduldoku): `WardenActionRequest` trägt bewusst kein
-# eigenes `finding`-Feld (siehe `harw_dod_warden::warden`-Moduldoku,
-# Abschnitt „Die K43-Falle") — dieses Binary muss es deshalb selbst
-# transportieren.
+# `CgroupId`/`FindingId`/`ApprovalActor` in den Tests des Wire-Formats; der
+# Befund steht seit Proof v2 in der signierten Autorisierung.
 harw-types = { path = "../../../harw-types" }
 # `#[derive(harw_macros::HarwError)]` für `src/error.rs` und `src/ipc.rs`.
 harw-macros = { path = "../../../harw-macros" }
 # `harw-warden completions <shell> [--install|--uninstall]`.
 harw-completions = { path = "../../../harw-completions", features = ["clap-args"] }
-# Wire-Kodierung des eigenen Umschlags (`src/protocol.rs`) und von
-# `WardenResponse`. Bereits transitiv durch die obige Kette vorhanden
+# Wire-Kodierung von `WardenReply` (`src/protocol.rs`). Bereits transitiv
+# durch die obige Kette vorhanden
 # (`harw-dod-warden-proto` hängt selbst von `serde`/`serde_json` ab) — kein
 # neues Blatt-Crate.
-serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Version identisch zu `harw-sentinel`/`harw-probe-fs` — ein Sink für
@@ -47,8 +43,13 @@ clap = { version = "4.6.1", features = ["derive"] }
 # dieselbe gepinnte Fassung wie `harw-sentinel`/`harw-probe-fs` (`net`-
 # Feature). Jeder hier verwendete Aufruf ist gegen die tatsächlich gepinnte
 # Quelle (`rustix-1.1.4/src/net/`) geprüft, nicht gegen docs.rs oder aus dem
-# Gedächtnis — siehe `src/ipc.rs`-Moduldoku.
-rustix = { workspace = true, features = ["net"] }
+# Gedächtnis — siehe `src/ipc.rs`-Moduldoku. PL-100 WP 3.1: `rand` für
+# `getrandom` in `harw-warden keygen` (`src/keygen.rs`); das Feature zieht
+# keine Abhängigkeit (geprüft gegen `rustix-1.1.5/Cargo.toml`). Ebenso
+# `thread` für `capability_is_in_ambient_set` (Start-Prüfung auf
+# `CAP_NET_ADMIN`, wenn Netzaktionen erlaubt sind, `src/main.rs`): nur das
+# Feature `linux-raw-sys/prctl`, kein neues Paket.
+rustix = { workspace = true, features = ["net", "rand", "thread"] }
 # Sichere Landlock-Bindung, identisch zu `harw-sentinel`/`harw-probe-fs`
 # (Version 0.4.7, dort über docs.rs/crate/landlock nachgeschlagen — `cargo
 # add` konnte auch hier nicht laufen, siehe Wurzel-Anweisung „Führe KEIN
@@ -73,14 +74,30 @@ landlock = "0.4.7"
 # darauf trotzdem nicht allein, sondern führt dieselbe Prüfung zusätzlich
 # selbst, testbar, aus (siehe dortige Moduldoku).
 sd-listen-fds = "0.2.0"
+# PL-100 WP 3.1: dieses Binary liest die Uhr (`Timestamp::now`) für die
+# Proof-Prüfung, das Öffnen des Nonce-Ledgers und den Hold-Timer; die
+# Bibliothek bekommt `now` immer als Parameter. Bereits über
+# `harw-dod-warden-proto` in der Hülle — kein neues Paket.
+jiff = { workspace = true }
+# PL-100 Entscheidung O10: seccomp-Allowlist des Wardens (`src/seccomp.rs`),
+# installiert nach Socket, Policy, Schlüsseln, StateDirectory und Landlock.
+# Sichere API (`SeccompFilter` → `BpfProgram`, `apply_filter_all_threads`);
+# das `unsafe` für `prctl`/`seccomp` liegt in der Crate selbst. Geprüft gegen
+# die Quelle `seccompiler-0.5.0/src/`. Eine einzige neue Laufzeit-Crate: ihre
+# Abhängigkeit `libc` ist bereits über `landlock` in der Hülle.
+seccompiler = { workspace = true }
+# Systemaufrufnummern (`SYS_*`) und Konstanten (`EPERM`, `PR_SET_NAME`,
+# `AF_NETLINK`) für die seccomp-Allowlist — nur Konstanten, kein Aufruf. Dieselbe
+# Fassung wie im Cargo.lock (über `landlock` bereits in der Hülle, kein neues
+# Paket).
+libc = "0.2.190"
 
 [dev-dependencies]
 harw-test-support = { path = "../../../harw-test-support" }
-# Nur für Tests, die einen vollständigen `AuthorizationProof` bauen (verlangt
-# einen `jiff::Timestamp`) — derselbe Grund wie bei `harw-dod-warden`s
-# eigener Testsuite. Reine Dev-Dependency, zählt nicht gegen das
+# Nur für Tests mit Tempdirs (StateDirectory, Fixture-cgroup-Wurzel,
+# passwd-Datei). Reine Dev-Dependency, zählt nicht gegen das
 # Laufzeit-Abhängigkeitsbudget (K53).
-jiff = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

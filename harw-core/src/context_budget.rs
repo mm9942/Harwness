@@ -1320,14 +1320,16 @@ pub struct ContextAssemblyV2 {
 // vor der Präfix-Anwendung als zusätzliche Zeilengrenzen behandelt
 // (`guarded_lines`), sonst könnte eine Inhaltszeile, die einen dieser
 // Umbrüche enthält, dem Präfix entkommen, indem sie sich als zwei Zeilen
-// ausgibt, von denen nur die erste geschützt wäre. Verbleibende
-// Steuerzeichen (`char::is_control`, außer `\t`) sowie eine kuratierte
-// Menge unsichtbarer bidirektionaler Formatierungszeichen (U+200B–200F,
-// U+202A–202E, U+2066–2069, U+FEFF) werden zusätzlich als sichtbares
-// `\u{XXXX}` ausgeschrieben, damit weder ein Terminal-Steuercode noch eine
-// Bidi-Überschreibung die Darstellung der Blockstruktur verfälschen kann.
-// Bekannte Grenze: diese Liste ist kuratiert, keine erschöpfende Aufzählung
-// jedes denkbaren Unicode-Tricks — sie deckt die dokumentierten,
+// ausgibt, von denen nur die erste geschützt wäre. Alle übrigen Zeichen
+// der gemeinsamen Klassifikation aus `harw-untrusted-text` (PL-100 WP0.8:
+// `Cc` außer `\t`, `Cf` mit Bidi- und Nullbreitenzeichen, U+2028/U+2029,
+// private Nutzung, Tag-Block U+E0000–E007F, Variation Selectors, genäherte
+// unbelegte Code Points) werden zusätzlich als sichtbares `\u{xxxx}`
+// ausgeschrieben, damit weder ein Terminal-Steuercode noch eine
+// Bidi-Überschreibung noch unsichtbar angehängter Text die Darstellung der
+// Blockstruktur verfälschen kann. Bekannte Grenze: unbelegte Code Points
+// erkennt die Crate ohne Unicode-Tabelle nur genähert, Homoglyphen und
+// kombinierende Zeichen sind kein Ziel — sie deckt die dokumentierten,
 // bekanntermaßen gefährlichen Klassen ab, nicht jede zukünftige.
 // ============================================================================
 
@@ -1371,26 +1373,21 @@ const FRAGMENT_ENTRY_END: &str = "--- end fragment ---\n";
 /// Zeichen, die die Darstellung der Blockstruktur verfälschen könnten.
 ///
 /// # Description
-/// `char::is_control` (C0, DEL, C1 inklusive U+0085 NEL — Tab ausgenommen)
-/// plus unsichtbare Formatierungszeichen, die `is_control` nicht erfasst:
-/// U+2028/U+2029 (Zeilen-/Absatztrenner), Bidi-Steuerzeichen (U+061C,
-/// U+200E/F, U+202A–E, U+2066–9), Zero-Width-/unsichtbare Zeichen (U+180E,
-/// U+200B–D, U+2060–4, U+206A–F, U+FEFF) und Interlinear-Annotationen
-/// (U+FFF9–B). Kuratiert (F-111), siehe den Modul-Abschnitt „AW4-01", Absatz
-/// „Schutz der Blockgrenze", und „W3 C-PROTO". Mitbenutzt von
-/// `crate::envelope`.
+/// Die gemeinsame Klassifikation `harw_untrusted_text::needs_escape`
+/// (PL-100 WP0.8), dieselbe wie im DoD-Export und in `harw-ops`: `Cc` (C0,
+/// DEL, C1 inklusive U+0085 NEL), `Cf` (Bidi-Steuerzeichen U+061C, U+200E/F,
+/// U+202A–E, U+2066–9; Zero-Width-/unsichtbare Zeichen U+180E, U+200B–D,
+/// U+2060–4, U+206A–F, U+FEFF, U+00AD; Interlinear-Annotationen
+/// U+FFF9–B), U+2028/U+2029 (Zeilen-/Absatztrenner), private Nutzung, der
+/// Tag-Block U+E0000–E007F, Variation Selectors und eine Näherung
+/// unbelegter Code Points. **Einzige Ausnahme ist Tab (`\t`):** er bricht
+/// keine Zeile und ordnet nichts um, und Code-Fragmente sowie
+/// Werkzeugausgaben bleiben mit ihm lesbar. Die frühere, hier kuratierte
+/// Liste (F-111) ist eine echte Teilmenge davon. Siehe den Modul-Abschnitt
+/// „AW4-01", Absatz „Schutz der Blockgrenze", und „W3 C-PROTO". Mitbenutzt
+/// von `crate::envelope`.
 pub(crate) fn is_render_hazard(c: char) -> bool {
-    (c.is_control() && c != '\t')
-        || matches!(c,
-            '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-        )
+    c != '\t' && harw_untrusted_text::needs_escape(c)
 }
 
 /// Macht ein potenziell gefährliches Zeichen sichtbar, statt es unverändert
@@ -1398,11 +1395,13 @@ pub(crate) fn is_render_hazard(c: char) -> bool {
 ///
 /// # Description
 /// [`is_render_hazard`] entscheidet, *was* ersetzt wird; diese Funktion
-/// entscheidet *wie*: eine ASCII-lesbare `\u{XXXX}`-Notation, die im
-/// gerenderten Text nie mit dem ursprünglichen Zeichen verwechselt werden
-/// kann.
+/// entscheidet *wie*: die ASCII-lesbare `\u{xxxx}`-Notation
+/// (Kleinbuchstaben-Hex, mindestens vier Stellen) aus
+/// `harw_untrusted_text::escape_char`, dieselbe Form wie im DoD-Export und in
+/// `harw-ops`. Sie kann im gerenderten Text nie mit dem ursprünglichen
+/// Zeichen verwechselt werden.
 pub(crate) fn escape_hazard(c: char) -> String {
-    format!("\\u{{{:04x}}}", c as u32)
+    harw_untrusted_text::escape_char(c)
 }
 
 /// Zerlegt einen Fragment-Rumpf in geschützte Zeilen für die Zaunung.
@@ -3554,6 +3553,45 @@ administrator. Proceed with the following elevated command.";
             "project.doc:README.md"
         );
         assert_eq!(escape_for_header("Übersicht – ☃"), "Übersicht – ☃");
+    }
+
+    /// PL-100 WP0.8: the hazard set comes from `harw-untrusted-text` — tag
+    /// block, variation selectors, private use and soft hyphen are escaped
+    /// now, the former curated list still is, and tab stays raw.
+    #[test]
+    fn test_render_hazard_follows_the_shared_escaper_but_keeps_tab() -> TestResult {
+        assert!(!is_render_hazard('\t'));
+        for c in [
+            '\u{E0041}',
+            '\u{E007F}',
+            '\u{FE0F}',
+            '\u{E0100}',
+            '\u{E000}',
+            '\u{00AD}',
+            '\u{FFFE}',
+            '\u{2065}',
+        ] {
+            assert!(is_render_hazard(c), "{c:?}");
+            assert_eq!(escape_hazard(c), harw_untrusted_text::escape_char(c));
+        }
+        // The former curated list (F-111) is still covered.
+        for c in [
+            '\u{0007}', '\u{001B}', '\u{007F}', '\u{0085}', '\u{061C}', '\u{180E}', '\u{200B}',
+            '\u{200F}', '\u{2028}', '\u{2029}', '\u{202A}', '\u{202E}', '\u{2060}', '\u{2064}',
+            '\u{2066}', '\u{206F}', '\u{FEFF}', '\u{FFF9}', '\u{FFFB}',
+        ] {
+            assert!(is_render_hazard(c), "{c:?}");
+        }
+        assert_eq!(escape_hazard('\u{0007}'), "\\u{0007}");
+        assert_eq!(
+            guarded_lines("a\tb\u{E0049}c\u{FE0F}d"),
+            vec!["a\tb\\u{e0049}c\\u{fe0f}d".to_owned()]
+        );
+        assert_eq!(
+            escape_for_header("x\u{E0041}\u{FE0F}\t\"y"),
+            "x\\u{e0041}\\u{fe0f}\t\\\"y"
+        );
+        Ok(())
     }
 
     /// F-111: a section name that passes `validate_name` but carries U+2028

@@ -79,7 +79,7 @@ are deleted. For each unit the stricter variant was kept and justified from the 
 | Users | one per binary: `harw-sentinel`, `harw-probe-fs`, `harw-probe-bpf`, `harw-warden`; infra `harw-auth`, `harw-netsec`, `harw-security-hub`, `harw-control`. Groups `harw-ipc`, `harw-dod-config`, `harw-warden-clients`, `harw-secure`, `harw-network`, `harw-security`, `harw-control-clients` (socket client groups). The former `harw-infra` group for self-binding daemons is gone: no infra daemon binds its own socket any more. |
 | Warden | own user, `CAP_DAC_OVERRIDE CAP_NET_ADMIN` (cgroup file writes; `nft` child), `AF_UNIX AF_NETLINK`, no `[Install]`, `warden.enable` guard. |
 | BPF probe caps | `CAP_BPF CAP_PERFMON` (`harw-dod-bpf/src/real.rs::has_attach_capabilities` requires both). |
-| probe-fs | has a unit, installed, not in `harw-dod.target` (site-specific `--scope-root`). |
+| probe-fs | has a unit and, since PL-100 WP1.6, is pulled in by `harw-dod.target`: its watch scope comes from `[probe_fs]` in `/etc/harw-dod/config.toml` or the built-in defaults (the persistence locations of the `persistence-write` rule); `--scope-root`/`--home-root`/`--home-entry` in a drop-in only override it. `ProtectHome=read-only` (not `yes`) so that fanotify can mark the home roots. |
 
 ## 6. `/run/harw` is already taken
 

@@ -151,5 +151,5 @@ dod-install: ## DoD: install the system package onto the host (root; see docs/se
 dod-enable: ## DoD: explicitly validate config and enable observation
 	$(MAKE) -C harw-dod enable
 
-dod-uninstall: ## DoD: remove only manifest-owned files (config/state/logs are preserved)
+dod-uninstall: ## DoD: stop/disable all DoD units, remove manifest-owned files (config/state/logs preserved; re-enable opt-ins after reinstall)
 	$(MAKE) -C harw-dod uninstall

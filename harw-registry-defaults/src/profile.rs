@@ -49,7 +49,7 @@
 //! Alle Typen sind `Send + Sync`. [`assemble_registry`] ist synchron und
 //! zustandslos.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use harw_authority::PermissionSet;
@@ -76,6 +76,7 @@ use harw_tool_shell::{
     HostPermitPromptSender, HostPermitVariant, LatexToolProvider, ShellToolProvider,
 };
 use harw_tool_sys::SysToolProvider;
+use harw_tool_sys::scope::ScopePolicy;
 use harw_tool_web::WebToolProvider;
 
 #[cfg(feature = "browser")]
@@ -145,15 +146,23 @@ use crate::{AssembledRegistry, DefaultApprovalPolicy};
 /// (unten, `#[cfg(test)]`) prüft sie gegen eine **andere** Quelle — den
 /// verzeichnisbasierten Fund von
 /// [`crate::embedded_agents::builtin_agent_toml`] — statt gegen eine daneben
-/// stehende Zahl. `context-steward`, `intel-scout`, `cargo-worker`,
-/// `host-process-worker`, `sandbox-shell-worker` und `tmux-inspector-worker`
-/// (`agents/roles/**`)
-/// werden von derselben Verzeichnis-Sammlung ebenfalls gefunden, sind aber
-/// bewusst nicht in `ALL`: ihre Aufnahme ist ein eigener, noch offener Befund
-/// (siehe Abschlussbericht dieses Knotens) und außerhalb des Auftrags, der
-/// ausschließlich die vier `security-*-triage`-Rollen betrifft. Der Test
-/// führt sie deshalb explizit als bekannte, begründete Ausnahme, nicht als
-/// stillschweigende Lücke.
+/// stehende Zahl. `cargo-worker`, `host-process-worker`,
+/// `sandbox-shell-worker` und `tmux-inspector-worker` werden von derselben
+/// Verzeichnis-Sammlung ebenfalls gefunden, sind aber bewusst nicht in `ALL`:
+/// ihre Aufnahme ist ein eigener, noch offener Befund (siehe Abschlussbericht
+/// dieses Knotens). Der Test führt sie deshalb explizit als bekannte,
+/// begründete Ausnahme, nicht als stillschweigende Lücke.
+///
+/// `intel-scout` und `context-steward` (`agents/roles/**`) standen bis PL-100
+/// (Entscheidung O11) ebenfalls auf dieser Ausnahmeliste. Seit beide ihren
+/// Rückgabevertrag selbst deklarieren (`[return] contract =
+/// "harwness.return.envelope@1"`), sind sie startbare Rollen
+/// ([`crate::profile::role_names::INTEL_SCOUT`],
+/// [`crate::profile::role_names::CONTEXT_STEWARD`]): Profil
+/// [`crate::profile::RegistryProfile::NoTools`], Reducer `ReadOnly`, Tiefe 0,
+/// kein `dod.*`, kein Schreib-, Shell- oder Netzwerkzeug. `intel-scout`
+/// bekommt sein einziges Werkzeug `deps.locked` rollengebunden
+/// ([`crate::profile::lockfile_tools_for_role`]).
 ///
 /// # Beispiele
 /// ```rust
@@ -161,6 +170,8 @@ use crate::{AssembledRegistry, DefaultApprovalPolicy};
 ///
 /// assert!(role_names::ALL.contains(&role_names::EXPLORER));
 /// assert!(role_names::ALL.contains(&role_names::SECURITY_BASELINE_TRIAGE));
+/// assert!(role_names::ALL.contains(&role_names::INTEL_SCOUT));
+/// assert!(role_names::ALL.contains(&role_names::CONTEXT_STEWARD));
 /// // Keine feste Länge hier: `ALL` wächst mit jeder neuen eingebauten Rolle,
 /// // und eine Zahl daneben wäre nur eine Wiederholung der Liste, die sie
 /// // zählt — sie bräche beim nächsten Rollenzuwachs, ohne etwas Inhaltliches
@@ -204,8 +215,10 @@ pub mod role_names {
 
     /// Triagiert Netz-Befunde (`EgressFlow`/`ListenerOpened`) der
     /// `EgressFlowRule`; bekommt bereits ausgewertete `Finding`-Batches als
-    /// Parameter und liest Harw-DoD höchstens über die drei lesenden
-    /// `dod.*`-Werkzeuge ([`crate::profile::DOD_READ_TOOLS`], PL-97 D3;
+    /// Parameter und liest Harw-DoD höchstens über die sechs lesenden
+    /// `dod.*`-Werkzeuge ([`crate::profile::DOD_TRIAGE_ROLE_TOOLS`]: die drei
+    /// aus [`crate::profile::DOD_READ_TOOLS`], PL-97 D3, und
+    /// [`crate::profile::DOD_TRIAGE_TOOLS`], PL-100 WP1.2;
     /// `agents/roles/security-egress-triage/security-egress-triage.toml`).
     pub const SECURITY_EGRESS_TRIAGE: &str = "security-egress-triage";
     /// Triagiert Baseline-Abweichungs-Befunde (`HostSample` gegen
@@ -220,6 +233,26 @@ pub mod role_names {
     /// (`ProcessExec`, `FileWrite`, `AuthEvent`); parametergetrieben,
     /// Werkzeuge nur die lesenden `dod.*`.
     pub const SECURITY_ENDPOINT_TRIAGE: &str = "security-endpoint-triage";
+
+    /// Korreliert hereingereichte Sicherheits-Advisories gegen das tatsächlich
+    /// gebaute `Cargo.lock` (PL-100 Entscheidung O11,
+    /// `agents/roles/intel-scout/intel-scout.toml`). Holt selbst keine
+    /// Advisories (kein Netz), schreibt nichts, startet keine Kinder
+    /// (`max_depth = 0`) und gibt nie ein Verdikt ab: sein Rückgabevertrag ist
+    /// der validierte Envelope `harwness.return.envelope@1`. Profil
+    /// [`crate::profile::RegistryProfile::NoTools`]; sein einziges Werkzeug
+    /// `deps.locked` montiert die Composition-Root rollengebunden
+    /// ([`crate::profile::lockfile_tools_for_role`]).
+    pub const INTEL_SCOUT: &str = "intel-scout";
+    /// Ordnet und fasst bereits abgerufene `ContextProposal`- und
+    /// `ModelBehaviorProposal`-Bestände zusammen, wendet nie an und
+    /// entscheidet nie (PL-100 Entscheidung O11,
+    /// `agents/roles/context-steward/context-steward.toml`). Ohne Werkzeug
+    /// (`[tools].admitted = []`, Profil
+    /// [`crate::profile::RegistryProfile::NoTools`]), ohne Kinder
+    /// (`max_depth = 0`); Rückgabevertrag ist der validierte Envelope
+    /// `harwness.return.envelope@1`, nie ein Verdikt.
+    pub const CONTEXT_STEWARD: &str = "context-steward";
 
     /// Spieler-Sitz des Matrix-Games (Runde 3, Welle E): formuliert aus der
     /// eigenen Sicht einen Zug. Liest nur die eigenen Unterlagen (ohne Netz,
@@ -368,12 +401,13 @@ pub mod role_names {
 
     /// Alle bekannten eingebauten Rollen.
     ///
-    /// Siehe die Moduldokumentation oben: `context-steward`, `intel-scout`,
-    /// `cargo-worker`, `host-process-worker`, `sandbox-shell-worker` und
+    /// Siehe die Moduldokumentation oben: `cargo-worker`,
+    /// `host-process-worker`, `sandbox-shell-worker` und
     /// `tmux-inspector-worker` sind absichtlich nicht enthalten (eigener,
-    /// offener
-    /// Befund), obwohl ihre Rollendateien bereits existieren und von
+    /// offener Befund), obwohl ihre Rollendateien bereits existieren und von
     /// [`crate::embedded_agents::builtin_agent_toml`] bereits gefunden werden.
+    /// [`INTEL_SCOUT`] und [`CONTEXT_STEWARD`] sind seit PL-100 (Entscheidung
+    /// O11) enthalten.
     pub const ALL: &[&str] = &[
         ROOT_ORCHESTRATOR,
         EXPLORER,
@@ -387,6 +421,8 @@ pub mod role_names {
         SECURITY_BASELINE_TRIAGE,
         SECURITY_STRUCTURE_TRIAGE,
         SECURITY_ENDPOINT_TRIAGE,
+        INTEL_SCOUT,
+        CONTEXT_STEWARD,
         MATRIX_PLAYER,
         MATRIX_UMPIRE,
         MATRIX_MARKET,
@@ -524,7 +560,9 @@ pub const SKILL_CATALOG_TOOLS: &[&str] = &["skills.search", "skills.load"];
 
 /// Die eingebauten Rollen **ohne** Skill-Katalog: die vier
 /// Security-Triage-Rollen (bewusst ohne Werkzeuge außer den lesenden
-/// [`DOD_READ_TOOLS`]) und die vier
+/// [`DOD_TRIAGE_ROLE_TOOLS`]), `intel-scout` und `context-steward` (PL-100
+/// O11: parametergetriebene Sicherheitsrollen, deren Definition höchstens
+/// [`LOCKFILE_READ_TOOLS`] bzw. gar kein Werkzeug admittiert) und die vier
 /// Matrix-Sitze (feste, exakt geprüfte Leseflächen; ihre Anweisungen kommen
 /// vom Matrix-Runner).
 pub const SKILL_CATALOG_EXCLUDED_ROLES: &[&str] = &[
@@ -532,6 +570,8 @@ pub const SKILL_CATALOG_EXCLUDED_ROLES: &[&str] = &[
     role_names::SECURITY_BASELINE_TRIAGE,
     role_names::SECURITY_STRUCTURE_TRIAGE,
     role_names::SECURITY_ENDPOINT_TRIAGE,
+    role_names::INTEL_SCOUT,
+    role_names::CONTEXT_STEWARD,
     role_names::MATRIX_PLAYER,
     role_names::MATRIX_UMPIRE,
     role_names::MATRIX_MARKET,
@@ -619,6 +659,9 @@ pub const PARENT_MESSAGE_TOOLS: &[&str] = &["parent.message"];
 /// # Bewusst nicht enthalten
 /// - die vier Security-Triage-Rollen: parametergetrieben, ohne eigene
 ///   Werkzeugoberfläche (`[tools].admitted = []`);
+/// - `intel-scout` und `context-steward` (PL-100 O11): parametergetrieben,
+///   kinderlos, Rückgabe nur als Envelope; ihre Definitionen admittieren
+///   `parent.message` nicht;
 /// - die vier Matrix-Sitze: der Matrix-Runner fährt sie, kein wartender
 ///   Eltern-Turn liest ihre Meldungen;
 /// - `memory-steward`: ein Harness-interner Konsolidierungslauf ohne
@@ -826,18 +869,49 @@ pub fn matrix_tools_for_role(role: &str) -> &'static [&'static str] {
 /// # Why not part of a [`RegistryProfile`]
 /// They are `harw-ops` operations (`model_tool(readonly, approval =
 /// "none")`), not tools of a tool-provider crate. A root session serves
-/// them through its operation model-tool provider. A child registry serves
-/// them only for the roles of [`dod_tools_for_role`]: the role-bound
-/// provider `RuntimeChildRegistryFactory::dod_read_provider` in
-/// `harw-runtime/src/children.rs` (PL-97 D4) mounts exactly these three
-/// operations, with the bound root space as their `OpContext`; every other
-/// child registers none of them. Each only reads the Harw-DoD
-/// export, the sentinel health report, the system config and `systemctl
-/// show`; none writes DoD state or reaches the Warden or the escalation
-/// ladder (invariant S1). They need no sandbox right
-/// ([`crate::authority::tool_permission`] is `None`, like `ps` and the
-/// `gateway.*` reads) and stand in [`crate::AUTO_APPROVED_TOOLS`].
+/// them through its operation model-tool provider; these three are the
+/// only `dod.*` tools a root session has (PL-100 decision O8, tool budget
+/// G1). A child registry serves them only for the roles of
+/// [`dod_tools_for_role`]: the role-bound provider
+/// `RuntimeChildRegistryFactory::dod_read_provider` in
+/// `harw-runtime/src/children.rs` (PL-97 D4) mounts them together with
+/// [`DOD_TRIAGE_TOOLS`] ([`DOD_TRIAGE_ROLE_TOOLS`]), with the bound root
+/// space as their `OpContext`; every other child registers none of them.
+/// Each only reads the Harw-DoD export, the sentinel health report, the
+/// system config and `systemctl show`; none writes DoD state or reaches the
+/// Warden or the escalation ladder (invariant S1). They need no sandbox
+/// right ([`crate::authority::tool_permission`] is `None`, like `ps` and
+/// the `gateway.*` reads) and stand in [`crate::AUTO_APPROVED_TOOLS`].
 pub const DOD_READ_TOOLS: &[&str] = &["dod.status", "dod.findings", "dod.sensors"];
+
+/// The read-only Harw-DoD triage tools (PL-100 WP1.2, `harw-ops/src/dod.rs`):
+/// `dod.finding` (one finding by its UUIDv4 id with every export-v3 field
+/// and its escaped evidence card), `dod.related` (the findings sharing a
+/// `dedup_key` or a `cgroup_kid` within a window) and `dod.labels` (the
+/// human labels of a `dedup_key`; none until PL-100 phase 2.5).
+///
+/// # Only for the triage roles
+/// Like [`DOD_READ_TOOLS`] they are `harw-ops` operations
+/// (`model_tool(readonly, approval = "none")`, in
+/// [`crate::AUTO_APPROVED_TOOLS`], no sandbox right). Unlike those, no root
+/// session ever registers them (`harw_ops::register_all` leaves them out;
+/// PL-100 decision O8): only the role-bound provider
+/// `RuntimeChildRegistryFactory::dod_read_provider` serves them, for the
+/// roles of [`dod_tools_for_role`].
+pub const DOD_TRIAGE_TOOLS: &[&str] = &["dod.finding", "dod.related", "dod.labels"];
+
+/// Every Harw-DoD tool of a `security-*-triage` role: [`DOD_READ_TOOLS`]
+/// followed by [`DOD_TRIAGE_TOOLS`] (spelled out; a `const` cannot
+/// concatenate slices). What [`dod_tools_for_role`] returns for the four
+/// triage roles and what their definitions admit.
+pub const DOD_TRIAGE_ROLE_TOOLS: &[&str] = &[
+    "dod.status",
+    "dod.findings",
+    "dod.sensors",
+    "dod.finding",
+    "dod.related",
+    "dod.labels",
+];
 
 /// The roles that admit the Harw-DoD tools: the four `security-*-triage`
 /// roles.
@@ -848,15 +922,18 @@ const DOD_TRIAGE_ROLES: &[&str] = &[
     role_names::SECURITY_ENDPOINT_TRIAGE,
 ];
 
-/// Returns [`DOD_READ_TOOLS`] for the four `security-*-triage` roles,
+/// Returns [`DOD_TRIAGE_ROLE_TOOLS`] (the three [`DOD_READ_TOOLS`] and the
+/// three [`DOD_TRIAGE_TOOLS`]) for the four `security-*-triage` roles,
 /// otherwise nothing.
 ///
 /// The triage roles keep [`RegistryProfile::NoTools`] (no workspace, shell
 /// or network tool); the Harw-DoD tools are the only tools they admit. A
 /// triage child is served them by the role-bound provider
 /// `RuntimeChildRegistryFactory::dod_read_provider` in
-/// `harw-runtime/src/children.rs` (PL-97 D4), which the child factory mounts
-/// next to the empty profile for exactly the roles this function names.
+/// `harw-runtime/src/children.rs` (PL-97 D4, PL-100 WP1.2), which the child
+/// factory mounts next to the empty profile for exactly the roles this
+/// function names. A root session is never a triage role: it keeps the
+/// three [`DOD_READ_TOOLS`] (PL-100 decision O8).
 ///
 /// # Examples
 /// ```rust
@@ -864,17 +941,131 @@ const DOD_TRIAGE_ROLES: &[&str] = &[
 ///
 /// assert_eq!(
 ///     dod_tools_for_role(role_names::SECURITY_EGRESS_TRIAGE),
-///     &["dod.status", "dod.findings", "dod.sensors"]
+///     &[
+///         "dod.status",
+///         "dod.findings",
+///         "dod.sensors",
+///         "dod.finding",
+///         "dod.related",
+///         "dod.labels",
+///     ]
 /// );
 /// assert!(dod_tools_for_role(role_names::EXPLORER).is_empty());
+/// assert!(dod_tools_for_role(role_names::ROOT_ORCHESTRATOR).is_empty());
 /// ```
 #[must_use]
 pub fn dod_tools_for_role(role: &str) -> &'static [&'static str] {
     if DOD_TRIAGE_ROLES.contains(&role) {
-        DOD_READ_TOOLS
+        DOD_TRIAGE_ROLE_TOOLS
     } else {
         &[]
     }
+}
+
+// ── PL-100 O11: Lockfile-Lesewerkzeug des Intel-Scout ───────────────────────
+
+/// Das eine lesende Lockfile-Werkzeug `deps.locked`
+/// (`harw_tool_deps::DepsToolProvider`), das [`role_names::INTEL_SCOUT`]
+/// für den Join hereingereichter Advisories gegen `Cargo.lock` braucht
+/// (PL-100 Entscheidung O11, `agents/roles/intel-scout/intel-scout.toml`:
+/// `[tools].admitted = ["deps.locked"]`).
+///
+/// # Warum nicht Teil eines [`RegistryProfile`]
+/// Kein bestehendes Profil registriert genau dieses eine Werkzeug:
+/// [`RegistryProfile::ReadOnlyExplore`] brächte den lesenden `fs.*`-Kern,
+/// `explore.*`, `deps.source_*` und `web.fetch`/`web.search` mit, die die
+/// Rolle nicht admittiert — das Inventar enthielte Werkzeuge, die die
+/// Aktivierung nie freischaltet. Ein eigenes Profil bräche jede
+/// erschöpfende `match`-Stelle über `RegistryProfile` außerhalb dieses
+/// Crates (siehe [`ORCHESTRATION_TOOLS`]). Die Rolle behält deshalb
+/// [`RegistryProfile::NoTools`] wie die Triage-Rollen, und die
+/// Composition-Root (`harw-runtime/src/children.rs`) hängt
+/// [`lockfile_read_provider`] rollengebunden an — dasselbe Muster wie
+/// [`dod_tools_for_role`].
+///
+/// # Rechte
+/// `deps.locked` verlangt `ReadWorkspace`
+/// ([`crate::authority::tool_permission`]); das Recht kommt nicht aus dem
+/// Profil, sondern aus der Kind-Sandbox, die der Reducer der Rolle
+/// (`AuthorityReducer::ReadOnly`, Obergrenze genau `ReadWorkspace`) aus der
+/// Sandbox des Elternteils schneidet. Ohne `ReadCargoRegistry` antwortet das
+/// Werkzeug ohne Registry-Quellpfad, ohne Netz nie mit einem Abruf. Es steht
+/// in [`crate::AUTO_APPROVED_TOOLS`] und fragt deshalb nie nach.
+pub const LOCKFILE_READ_TOOLS: &[&str] = &["deps.locked"];
+
+/// Die Rollen, denen die Composition-Root [`LOCKFILE_READ_TOOLS`]
+/// rollengebunden bereitstellt: heute nur [`role_names::INTEL_SCOUT`].
+const LOCKFILE_READER_ROLES: &[&str] = &[role_names::INTEL_SCOUT];
+
+/// Liefert [`LOCKFILE_READ_TOOLS`] für [`role_names::INTEL_SCOUT`], sonst
+/// nichts.
+///
+/// # Beschreibung
+/// Die Kind-Fabrik (`harw-runtime/src/children.rs`) hängt für genau diese
+/// Rollen [`lockfile_read_provider`] neben das leere Profil
+/// [`RegistryProfile::NoTools`]; die `SessionActivation` des Kindes schaltet
+/// das Werkzeug nur frei, wenn seine Definition es admittiert. Rollen, deren
+/// Profil `deps.locked` bereits registriert (`ReadOnlyExplore`, `Planning`,
+/// …), bekommen hier nichts zusätzlich.
+///
+/// # Argumente
+/// - `role` (`&str`): Rollenname, üblicherweise aus [`role_names`].
+///
+/// # Rückgabe
+/// Die rollengebundenen Lockfile-Werkzeuge der Rolle, sonst eine leere Liste.
+///
+/// # Nebenläufigkeit
+/// Rein.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{lockfile_tools_for_role, role_names};
+///
+/// assert_eq!(lockfile_tools_for_role(role_names::INTEL_SCOUT), &["deps.locked"]);
+/// assert!(lockfile_tools_for_role(role_names::CONTEXT_STEWARD).is_empty());
+/// assert!(lockfile_tools_for_role(role_names::EXPLORER).is_empty());
+/// ```
+#[must_use]
+pub fn lockfile_tools_for_role(role: &str) -> &'static [&'static str] {
+    if LOCKFILE_READER_ROLES.contains(&role) {
+        LOCKFILE_READ_TOOLS
+    } else {
+        &[]
+    }
+}
+
+/// Baut den rollengebundenen Provider für [`LOCKFILE_READ_TOOLS`]: einen
+/// `harw_tool_deps::DepsToolProvider`, gefiltert auf genau `deps.locked`.
+///
+/// # Beschreibung
+/// Der Filter ([`RestrictedToolProvider`]) blendet die übrigen `deps.*`
+/// (`deps.graph`, `deps.source_*`) in `tools()` **und** `executor()` aus;
+/// sie sind auch durch Raten des Namens nicht erreichbar.
+///
+/// # Rückgabe
+/// Ein zustandsloser Provider mit genau einem Werkzeug.
+///
+/// # Nebenläufigkeit
+/// `Send + Sync`; kein I/O beim Bau.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_extension_api::ToolProvider as _;
+/// use harw_registry_defaults::profile::{LOCKFILE_READ_TOOLS, lockfile_read_provider};
+///
+/// let names: Vec<String> = lockfile_read_provider()
+///     .tools()
+///     .iter()
+///     .map(|spec| spec.name().to_owned())
+///     .collect();
+/// assert_eq!(names, LOCKFILE_READ_TOOLS);
+/// ```
+#[must_use]
+pub fn lockfile_read_provider() -> Arc<dyn ToolProvider> {
+    Arc::new(RestrictedToolProvider::new(
+        Arc::new(DepsToolProvider::new()),
+        LOCKFILE_READ_TOOLS,
+    ))
 }
 
 // ── PL-97 B2: Werkzeug-Index ────────────────────────────────────────────────
@@ -1519,8 +1710,10 @@ pub const TUNNEL_TOOLS: &[&str] = &[
     "tunnel.list",
 ];
 
-/// Plan R9, Teil F: die sechs Werkzeuge von `harw-tool-job`
-/// (`job.start/status/logs/stop/list`) in Registrierungsreihenfolge.
+/// Plan R9, Teil F: die sieben Werkzeuge von `harw-tool-job`
+/// (`job.start/status/logs/stop/list/suspend/resume`) in
+/// Registrierungsreihenfolge (`suspend`/`resume`: PL-100 WP 3.5, immer mit
+/// Rückfrage).
 ///
 /// # Beschreibung
 /// Stehen in jedem Profil direkt hinter [`SHELL_TOOLS`]: `job.start` läuft
@@ -1792,9 +1985,9 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 /// # Warum `NoTools` und nicht `ReadOnlyExplore` für die Triage-Rollen
 /// Die vier `security-*-triage`-Rollen (siehe [`role_names`]) admittieren
 /// kein Profil-Werkzeug: sie bekommen bereits ausgewertete `Finding`-Batches
-/// als Parameter und admittieren nur die drei lesenden `dod.*`-Werkzeuge
-/// ([`dod_tools_for_role`], PL-97 D3). Diese stellt nicht das Profil bereit,
-/// sondern der rollengebundene Provider
+/// als Parameter und admittieren nur die sechs lesenden `dod.*`-Werkzeuge
+/// ([`dod_tools_for_role`], PL-97 D3, PL-100 WP1.2). Diese stellt nicht das
+/// Profil bereit, sondern der rollengebundene Provider
 /// `RuntimeChildRegistryFactory::dod_read_provider` in
 /// `harw-runtime/src/children.rs` (PL-97 D4), den die Kind-Fabrik genau für
 /// diese vier Rollen neben dem leeren Profil montiert. `ReadOnlyExplore`
@@ -1860,6 +2053,9 @@ pub enum RegistryProfile {
     /// u. a.). Deren einzige Werkzeuge, die lesenden `dod.*`, montiert
     /// nicht dieses Profil, sondern der rollengebundene Provider in
     /// `harw-runtime/src/children.rs` (PL-97 D4, [`dod_tools_for_role`]).
+    /// Ebenso `intel-scout` und `context-steward` (PL-100 O11): der erste
+    /// bekommt sein einziges Werkzeug `deps.locked` rollengebunden
+    /// ([`lockfile_tools_for_role`]), der zweite keines.
     ///
     /// Zugleich die lokale Grundlage eines an ein Gateway angebundenen
     /// Agenten (R18 D-A): dort montiert die Runtime `NoTools` plus
@@ -2560,6 +2756,14 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         | role_names::SECURITY_BASELINE_TRIAGE
         | role_names::SECURITY_STRUCTURE_TRIAGE
         | role_names::SECURITY_ENDPOINT_TRIAGE => Some(RegistryProfile::NoTools),
+        // PL-100 O11: `intel-scout` und `context-steward` sind ebenfalls
+        // parametergetrieben und registrieren über ihr Profil nichts.
+        // `context-steward` admittiert gar kein Werkzeug; das einzige
+        // Werkzeug von `intel-scout` (`deps.locked`) hängt die
+        // Composition-Root rollengebunden an (`lockfile_tools_for_role`,
+        // `lockfile_read_provider`), statt ihm mit `ReadOnlyExplore` den
+        // ganzen lesenden Kern samt Netz zu bewerben.
+        role_names::INTEL_SCOUT | role_names::CONTEXT_STEWARD => Some(RegistryProfile::NoTools),
         // Die vier Matrix-Game-Sitze lesen nur ihre Unterlagen (lesende
         // `fs.*` plus `doc.read_pdf`, ohne Netz, Schreiben oder Exec); der
         // Matrix-Runner übergibt jedem Sitz seine Sicht im Prompt und liest
@@ -2610,6 +2814,51 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         // siehe die Begründung bei `RegistryProfile::AgentStewardship` und
         // `agents/agent-steward.toml`.
         role_names::AGENT_STEWARD => Some(RegistryProfile::AgentStewardship),
+        _ => None,
+    }
+}
+
+/// PL-100 O11: die Rollenbeschreibung des System-Prompts für Rollen, deren
+/// Profil ein fremdes Rollenbild trägt.
+///
+/// # Beschreibung
+/// `intel-scout` und `context-steward` laufen mit
+/// [`RegistryProfile::NoTools`], dessen Beschreibung („parameter-only triage
+/// agent") für die Triage-Rollen geschrieben ist. Als Triage-Agent
+/// angesprochen, neigten sie zu einem Sicherheits-Verdikt, das ihr
+/// Rückgabevertrag (`harwness.return.envelope@1`) gerade ausschließt; die
+/// Rückgabeprüfung schlüge fehl. Die Kind-Fabrik
+/// (`harw-runtime/src/children.rs`) setzt deshalb
+/// [`IdentityOverrides::role_description`] aus dieser Tabelle; jede andere
+/// Rolle behält die Beschreibung ihres Profils.
+///
+/// # Argumente
+/// - `role` (`&str`): Rollenname (bei benutzerdefinierten Agenten die
+///   Basisrolle), üblicherweise aus [`role_names`].
+///
+/// # Rückgabe
+/// `Some(beschreibung)` für [`role_names::INTEL_SCOUT`] und
+/// [`role_names::CONTEXT_STEWARD`], sonst `None` (es gilt
+/// [`RegistryProfile::role_description`]).
+///
+/// # Nebenläufigkeit
+/// Rein.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{role_description_for_role, role_names};
+///
+/// let scout = role_description_for_role(role_names::INTEL_SCOUT).unwrap_or_default();
+/// assert!(!scout.contains("triage"));
+/// assert!(role_description_for_role(role_names::CONTEXT_STEWARD).is_some());
+/// assert_eq!(role_description_for_role(role_names::SECURITY_EGRESS_TRIAGE), None);
+/// assert_eq!(role_description_for_role(role_names::EXPLORER), None);
+/// ```
+#[must_use]
+pub fn role_description_for_role(role: &str) -> Option<&'static str> {
+    match role {
+        role_names::INTEL_SCOUT => Some("read-only advisory correlation agent"),
+        role_names::CONTEXT_STEWARD => Some("read-only context curation agent"),
         _ => None,
     }
 }
@@ -2940,33 +3189,93 @@ pub struct HostPermitWiring {
 /// Kinder teilen sie); die Elternkette ([`harw_tool_job::JobLineage`])
 /// liefert der Agentenbaum der Montage. Besitz eines Jobs: Erzeuger plus
 /// Vorfahren (die aufrufende Sitzung kommt aus dem Ausführungskontext).
+///
+/// PL-100 (Owner-Befund 4505015316): reist zusätzlich mit der geprüften
+/// delegierten cgroup-Wurzel der Job-cgroups
+/// ([`Self::with_delegated_cgroup_root`]); [`profile_tool_providers`] nimmt
+/// sie in den eigenen Umfang (`scope = "own"`) von `sys.ps`, `sys.pgrep`
+/// und `sys.top` auf.
 #[derive(Clone)]
 pub struct JobWiring {
     /// Die Job-Verwaltung der Sitzung.
     pub manager: Arc<harw_tool_job::JobManager>,
     /// Elternkette einer Agenten-Sitzung (Besitz und Weiterleitung).
     pub lineage: Arc<dyn harw_tool_job::JobLineage>,
+    /// Die vom Befehls-Port bestätigte delegierte cgroup-v2-Wurzel, unter
+    /// der die Job-cgroups (`harw-job-<attempt>`) liegen
+    /// (`harw_command::HostPortOptions::delegated_cgroup_root`: `[jobs]
+    /// cgroup_root` → `HARW_CGROUP_ROOT` → eigene delegierte cgroup).
+    /// `None`: keine bestätigte Wurzel; der eigene Umfang der `sys.*`-
+    /// Prozesswerkzeuge bleibt dann beim eigenen cgroup-Teilbaum und
+    /// Prozessbaum.
+    pub delegated_cgroup_root: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for JobWiring {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Nur ob eine Wurzel gesetzt ist, nie der Pfad.
         f.debug_struct("JobWiring")
             .field("manager", &self.manager)
+            .field(
+                "delegated_cgroup_root",
+                &self.delegated_cgroup_root.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl JobWiring {
-    /// Bündelt Verwaltung und Elternkette.
+    /// Bündelt Verwaltung und Elternkette, ohne delegierte cgroup-Wurzel.
     #[must_use]
     pub fn new(
         manager: Arc<harw_tool_job::JobManager>,
         lineage: Arc<dyn harw_tool_job::JobLineage>,
     ) -> Self {
-        Self { manager, lineage }
+        Self {
+            manager,
+            lineage,
+            delegated_cgroup_root: None,
+        }
     }
 
-    /// Die sechs `job.*`-Werkzeuge über einem Klon von `shell`.
+    /// PL-100 (Owner-Befund 4505015316): hängt die bestätigte delegierte
+    /// cgroup-Wurzel der Job-cgroups an.
+    ///
+    /// # Arguments
+    /// - `root` (`Option<PathBuf>`): die Wurzel, wie sie
+    ///   `harw_command::HostPortOptions::delegated_cgroup_root` liefert
+    ///   (nur bestätigte, delegierte cgroup-v2-Wurzeln); `None` lässt den
+    ///   eigenen Umfang ohne Job-Wurzel.
+    ///
+    /// # Returns
+    /// Die Verdrahtung mit gesetzter (oder gelöschter) Wurzel. Wurzel und
+    /// alle Kinder teilen sie über [`HostPermitWiring::jobs`].
+    ///
+    /// # Examples
+    /// ```rust
+    /// use std::path::PathBuf;
+    /// use std::sync::Arc;
+    /// use harw_registry_defaults::JobWiring;
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// let manager = harw_tool_job::JobManager::new(
+    ///     harw_tool_job::JobManagerConfig::new(dir.path()),
+    ///     Arc::new(harw_tool_job::NoopNotifier),
+    /// )?;
+    /// let jobs = JobWiring::new(manager, Arc::new(harw_tool_job::NoLineage))
+    ///     .with_delegated_cgroup_root(Some(PathBuf::from("/sys/fs/cgroup/harw.slice")));
+    /// assert!(jobs.delegated_cgroup_root.is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_delegated_cgroup_root(mut self, root: Option<PathBuf>) -> Self {
+        self.delegated_cgroup_root = root;
+        self
+    }
+
+    /// Die sieben `job.*`-Werkzeuge über einem Klon von `shell`.
     ///
     /// # Beschreibung
     /// `job.start` geht durch
@@ -3105,6 +3414,96 @@ pub fn compiled_agent_sandbox_execution() -> harw_tool_shell::SandboxExecution {
     sandbox_execution(harw_config::SandboxSection::default().effective_execution())
 }
 
+/// PL-100 (Owner-Befund 4505015316): die delegierte cgroup-Wurzel der
+/// Job-cgroups aus der Host-Permit-Verdrahtung, falls Jobs verdrahtet sind
+/// und der Befehls-Port eine Wurzel bestätigt hat
+/// ([`JobWiring::delegated_cgroup_root`]).
+///
+/// # Returns
+/// `None` ohne Verdrahtung, ohne [`JobWiring`] oder ohne bestätigte Wurzel.
+fn delegated_job_root(host_permits: Option<&HostPermitWiring>) -> Option<&Path> {
+    host_permits
+        .and_then(|wiring| wiring.jobs.as_ref())
+        .and_then(|jobs| jobs.delegated_cgroup_root.as_deref())
+}
+
+/// PL-100 (Owner-Befund 4505015316): die Umfangs-Politik der auflistenden
+/// `sys.*`-Werkzeuge ohne Freigabe-Sperre: nur `own`, plus `job_root` als
+/// weitere cgroup-Wurzel des eigenen Umfangs.
+///
+/// # Description
+/// Fail-closed: eine Wurzel, die [`ScopePolicy::with_extra_root`] ablehnt
+/// (nicht absolut, `/`, nicht normalisiert) oder die kein UTF-8 ist, wird
+/// verworfen und auf `warn` gemeldet (nur der Grund, nie der Pfad). Der
+/// eigene Umfang bleibt dann beim eigenen cgroup-Teilbaum und Prozessbaum.
+///
+/// # Returns
+/// [`ScopePolicy::own_only`], gegebenenfalls mit der Job-Wurzel.
+fn own_scope_policy(job_root: Option<&Path>) -> ScopePolicy {
+    let Some(root) = job_root else {
+        return ScopePolicy::own_only();
+    };
+    let Some(root) = root.to_str() else {
+        tracing::warn!(
+            reason = "cgroup root is not valid UTF-8",
+            "registry.sys_scope.job_root_ignored"
+        );
+        return ScopePolicy::own_only();
+    };
+    ScopePolicy::own_only()
+        .with_extra_root(root)
+        .unwrap_or_else(|error| {
+            tracing::warn!(reason = %error, "registry.sys_scope.job_root_ignored");
+            ScopePolicy::own_only()
+        })
+}
+
+/// PL-100 (Owner-Befund 4505015316): baut den `sys.*`-Provider des Profils
+/// [`RegistryProfile::Full`] mit der Umfangs-Politik der Sitzung statt der
+/// Vorgabe [`SysToolProvider::new`] (nur `own`, ohne Job-Wurzel, `all` nie).
+///
+/// # Description
+/// - `scope = "all"` für `sys.ps`, `sys.pgrep` und `sys.top` hängt an
+///   `approval_mode`, derselben geteilten Freigabe-Zelle, die auch die
+///   Shell-Provider und die Freigabepolitik der Montage bekommen: erlaubt
+///   nur, solange sie
+///   [`harw_extension_api::approval_mode::ApprovalMode::FullAccess`] zeigt
+///   (live gelesen; eine Umschaltung per `/permissions` wirkt sofort).
+///   `Full` montiert heute nur die Wurzel: keine Kind-Rolle bekommt
+///   [`RegistryProfile::Full`] ([`profile_for_role`]), `sys.*` erreicht also
+///   kein Kind. Bekäme eines es, wäre `approval_mode` dessen Folgezelle
+///   (`ApprovalModeCell::follower`) — ungedeckelt, und ein `set` im Kind
+///   koppelt sie von der Wurzel ab.
+/// - Die delegierte Job-Wurzel aus `host_permits` ([`delegated_job_root`])
+///   wird Teil des eigenen Umfangs ([`own_scope_policy`]), damit die
+///   Job-cgroups der Sitzung unter `scope = "own"` sichtbar sind.
+///
+/// # Returns
+/// Den Provider mit Full-Access-Sperre und gegebenenfalls Job-Wurzel.
+fn sys_tool_provider(
+    approval_mode: &ApprovalModeCell,
+    host_permits: Option<&HostPermitWiring>,
+) -> SysToolProvider {
+    // `with_approval_mode` nach `with_scope_policy`: es setzt nur die Sperre
+    // und behält die Job-Wurzel.
+    SysToolProvider::new()
+        .with_scope_policy(own_scope_policy(delegated_job_root(host_permits)))
+        .with_approval_mode(approval_mode.clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-Naht (PL-100, Owner-Befund 4505015316, Review-Befund): die
+    /// Umfangs-Politik des `sys.*`-Providers, den der letzte Bau des Profils
+    /// [`RegistryProfile::Full`] in [`profile_tool_providers`] auf diesem
+    /// Thread tatsächlich montiert hat. Die `ToolProvider`-Schnittstelle legt
+    /// sie nicht offen; ohne die Naht bliebe ein Rückschritt des
+    /// `Full`-Zweigs (etwa ein Provider ohne `host_permits`) in den immer
+    /// laufenden Tests unbemerkt.
+    static FULL_SYS_SCOPE: std::cell::Cell<Option<ScopePolicy>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Baut einen `ShellToolProvider` für `sandbox_profile` und hängt, sobald
 /// `host_permits` übergeben wurde, deren Verdrahtung an (siehe
 /// [`profile_tool_providers`]).
@@ -3238,7 +3637,13 @@ fn profile_tool_providers(
             // `SYS_TOOLS` in `registered_tool_names`.
             providers.push(Arc::new(FsreadToolProvider::new()));
             providers.push(Arc::new(GitReadToolProvider::new()));
-            providers.push(Arc::new(SysToolProvider::new()));
+            // PL-100 (Owner-Befund 4505015316): `scope = "all"` nur unter
+            // Full Access derselben Freigabe-Zelle, die Job-cgroups im
+            // eigenen Umfang.
+            let sys = sys_tool_provider(approval_mode, host_permits);
+            #[cfg(test)]
+            FULL_SYS_SCOPE.set(Some(sys.scope_policy().clone()));
+            providers.push(Arc::new(sys));
             providers
         }
         RegistryProfile::ShellExecution => build_shell_providers(sandbox_profile),
@@ -5313,6 +5718,15 @@ mod tests {
                 "Triage-Rolle {role} muss NoTools bekommen"
             );
         }
+        // PL-100 O11: die beiden Envelope-Rollen der Sicherheitsfamilie.
+        for role in [role_names::INTEL_SCOUT, role_names::CONTEXT_STEWARD] {
+            assert!(role_names::ALL.contains(&role), "{role} fehlt in ALL");
+            assert_eq!(
+                profile_for_role(role),
+                Some(RegistryProfile::NoTools),
+                "{role} muss NoTools bekommen"
+            );
+        }
         for role in role_names::MATRIX_ROLES {
             assert!(role_names::ALL.contains(&role), "{role} fehlt in ALL");
             assert_eq!(
@@ -5366,13 +5780,14 @@ mod tests {
         assert!(composition_tools_for_role("unbekannt").is_empty());
     }
 
-    /// PL-97 D3: die Harw-DoD-Werkzeuge bekommen genau die vier
-    /// Triage-Rollen; kein Profil registriert sie selbst.
+    /// PL-97 D3, PL-100 WP1.2: die Harw-DoD-Werkzeuge (drei lesende plus
+    /// drei Triage-Werkzeuge) bekommen genau die vier Triage-Rollen; kein
+    /// Profil registriert sie selbst.
     #[test]
     fn test_dod_tools_are_offered_only_to_the_four_triage_roles() {
         for role in role_names::ALL {
             let expected: &[&str] = if DOD_TRIAGE_ROLES.contains(role) {
-                DOD_READ_TOOLS
+                DOD_TRIAGE_ROLE_TOOLS
             } else {
                 &[]
             };
@@ -5380,7 +5795,7 @@ mod tests {
         }
         assert_eq!(DOD_TRIAGE_ROLES.len(), 4);
         for profile in RegistryProfile::ALL {
-            for tool in DOD_READ_TOOLS {
+            for tool in DOD_TRIAGE_ROLE_TOOLS {
                 assert!(
                     !profile.registered_tool_names().contains(tool),
                     "{profile:?} darf {tool} nicht selbst registrieren"
@@ -5390,9 +5805,178 @@ mod tests {
         assert!(dod_tools_for_role("unbekannt").is_empty());
     }
 
-    /// PL-97 D3: jede Triage-Rolle admittiert genau die drei lesenden
-    /// `dod.*`-Werkzeuge und verbietet Schreiben, Exec und Netz weiterhin;
-    /// keine andere eingebaute Rolle admittiert eines davon.
+    /// PL-100 O11: `deps.locked` bekommt rollengebunden genau `intel-scout`.
+    /// Das Werkzeug liest nur den Workspace (`ReadWorkspace`, innerhalb der
+    /// Obergrenze des Reducers der Rolle), fragt nie nach, und der Provider
+    /// führt genau dieses eine Werkzeug — ein anderes `deps.*` ist auch durch
+    /// Raten seines Namens nicht erreichbar.
+    #[test]
+    fn test_lockfile_tools_are_offered_only_to_intel_scout() -> TestResult {
+        assert_eq!(LOCKFILE_READ_TOOLS, ["deps.locked"]);
+        for role in role_names::ALL {
+            let expected: &[&str] = if *role == role_names::INTEL_SCOUT {
+                LOCKFILE_READ_TOOLS
+            } else {
+                &[]
+            };
+            assert_eq!(lockfile_tools_for_role(role), expected, "{role}");
+        }
+        assert!(lockfile_tools_for_role("unbekannt").is_empty());
+        assert!(RegistryProfile::NoTools.registered_tool_names().is_empty());
+
+        let reducer = crate::authority::authority_reducer_for_role(role_names::INTEL_SCOUT)
+            .ok_or(TestError::Missing("intel-scout braucht einen Reducer"))?;
+        for tool in LOCKFILE_READ_TOOLS {
+            assert_eq!(
+                tool_permission(tool),
+                Some(harw_authority::Permission::ReadWorkspace),
+                "{tool}"
+            );
+            assert!(crate::AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(!crate::ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+        }
+        assert!(
+            permissions_of(LOCKFILE_READ_TOOLS).is_subset_of(&reducer.ceiling()),
+            "deps.locked braucht mehr, als der Reducer von intel-scout trägt"
+        );
+
+        let provider = lockfile_read_provider();
+        let names: Vec<String> = provider
+            .tools()
+            .iter()
+            .map(|spec| spec.name().to_owned())
+            .collect();
+        assert_eq!(names, LOCKFILE_READ_TOOLS);
+        assert!(provider.executor(&ToolName::new("deps.locked")).is_some());
+        for hidden in [
+            "deps.graph",
+            "deps.source_read",
+            "deps.source_search",
+            "deps.source_list",
+        ] {
+            assert!(
+                provider.executor(&ToolName::new(hidden)).is_none(),
+                "{hidden} muss ausgeblendet bleiben"
+            );
+        }
+        Ok(())
+    }
+
+    /// PL-100 O11: `intel-scout` und `context-steward` sind startbare,
+    /// gesenkte Rollen mit dem Envelope als Rückgabevertrag — read-only
+    /// (`NoTools`, Reducer `ReadOnly`, nie Netz, Schreiben oder Exec), ohne
+    /// Kinder, ohne `dod.*`, ohne Skill-Katalog und ohne `parent.message`.
+    /// `intel-scout` admittiert genau seine rollengebundenen
+    /// [`LOCKFILE_READ_TOOLS`], `context-steward` gar kein Werkzeug.
+    #[test]
+    fn test_intel_scout_and_context_steward_are_read_only_envelope_roles() -> TestResult {
+        let roles =
+            crate::embedded_agents::builtin_agent_definitions(&std::collections::HashMap::new())
+                .map_err(ctx("eingebaute Rollen lösen sich auf"))?;
+        for role in [role_names::INTEL_SCOUT, role_names::CONTEXT_STEWARD] {
+            assert!(role_names::ALL.contains(&role), "{role} fehlt in ALL");
+            let ir = roles
+                .get(role)
+                .ok_or_else(|| TestError::Unexpected(format!("{role} wird nicht gesenkt")))?;
+            assert_eq!(profile_for_role(role), Some(RegistryProfile::NoTools));
+            let reducer = crate::authority::authority_reducer_for_role(role)
+                .ok_or_else(|| TestError::Unexpected(format!("{role} ohne Reducer")))?;
+            assert_eq!(
+                reducer,
+                crate::authority::AuthorityReducer::ReadOnly,
+                "{role}"
+            );
+            for forbidden in [
+                harw_authority::Permission::NetworkAccess,
+                harw_authority::Permission::WriteWorkspace,
+                harw_authority::Permission::ExecuteProcess,
+                harw_authority::Permission::ReadSecrets,
+            ] {
+                assert!(
+                    !reducer.ceiling().contains(forbidden),
+                    "{role}: {forbidden:?}"
+                );
+            }
+            let admitted: Vec<&str> = ir
+                .tool_surface()
+                .admitted()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(admitted, lockfile_tools_for_role(role), "{role}: admitted");
+            let forbidden = ir.tool_surface().forbidden();
+            for tool in ["fs.write", "fs.edit", "shell.exec", "web.fetch"] {
+                assert!(
+                    forbidden.iter().any(|name| name == tool),
+                    "{role} muss {tool} verbieten"
+                );
+            }
+            assert!(dod_tools_for_role(role).is_empty(), "{role}: dod.*");
+            assert!(skill_catalog_tools_for_role(role).is_empty(), "{role}");
+            assert!(parent_message_tools_for_role(role).is_empty(), "{role}");
+            assert!(!is_orchestrator_role(role), "{role}");
+            assert_eq!(ir.spawn_contract().max_depth(), Some(0), "{role}");
+            assert_eq!(
+                ir.return_pipeline().contract(),
+                Some(harw_agent_dsl::ir_v2::ReturnContract::Envelope.as_str()),
+                "{role}: Rückgabevertrag"
+            );
+        }
+        Ok(())
+    }
+
+    /// PL-100 O11 (Review-Befund): `intel-scout` und `context-steward`
+    /// bekommen eine eigene Rollenbeschreibung statt der Triage-Beschreibung
+    /// ihres Profils `NoTools`; jede andere eingebaute Rolle behält die ihres
+    /// Profils (`None`).
+    #[test]
+    fn test_o11_roles_carry_their_own_role_description() {
+        let triage = RegistryProfile::NoTools.role_description();
+        for role in [role_names::INTEL_SCOUT, role_names::CONTEXT_STEWARD] {
+            let description = role_description_for_role(role);
+            assert!(
+                description.is_some_and(|text| !text.contains("triage")),
+                "{role}: {description:?}"
+            );
+            assert_ne!(description, Some(triage), "{role}");
+        }
+        for role in role_names::ALL {
+            if *role != role_names::INTEL_SCOUT && *role != role_names::CONTEXT_STEWARD {
+                assert_eq!(role_description_for_role(role), None, "{role}");
+            }
+        }
+        assert_eq!(role_description_for_role("unbekannt"), None);
+    }
+
+    /// PL-100 WP1.2: `DOD_TRIAGE_ROLE_TOOLS` ist genau `DOD_READ_TOOLS`
+    /// gefolgt von `DOD_TRIAGE_TOOLS`, ohne Dubletten; die Wurzel-Rollen
+    /// bekommen keines davon über `dod_tools_for_role` (Root behält die drei
+    /// lesenden über die Operations-Registry, O8).
+    #[test]
+    fn test_dod_triage_role_tools_are_the_read_tools_then_the_triage_tools() {
+        let joined: Vec<&str> = DOD_READ_TOOLS
+            .iter()
+            .chain(DOD_TRIAGE_TOOLS)
+            .copied()
+            .collect();
+        assert_eq!(joined, DOD_TRIAGE_ROLE_TOOLS);
+        assert_eq!(DOD_READ_TOOLS.len(), 3);
+        assert_eq!(
+            DOD_TRIAGE_TOOLS,
+            ["dod.finding", "dod.related", "dod.labels"]
+        );
+        let unique: std::collections::BTreeSet<&str> =
+            DOD_TRIAGE_ROLE_TOOLS.iter().copied().collect();
+        assert_eq!(unique.len(), DOD_TRIAGE_ROLE_TOOLS.len());
+        for tool in DOD_TRIAGE_TOOLS {
+            assert!(!DOD_READ_TOOLS.contains(tool), "{tool}");
+        }
+        assert!(dod_tools_for_role(role_names::ROOT_ORCHESTRATOR).is_empty());
+    }
+
+    /// PL-97 D3, PL-100 WP1.2: jede Triage-Rolle admittiert genau die sechs
+    /// lesenden `dod.*`-Werkzeuge und verbietet Schreiben, Exec und Netz
+    /// weiterhin; keine andere eingebaute Rolle admittiert eines davon.
     #[test]
     fn test_triage_roles_admit_exactly_the_dod_tools() -> TestResult {
         let roles =
@@ -5409,7 +5993,7 @@ mod tests {
                 .map(String::as_str)
                 .collect();
             if DOD_TRIAGE_ROLES.contains(role) {
-                assert_eq!(admitted, DOD_READ_TOOLS, "{role}");
+                assert_eq!(admitted, DOD_TRIAGE_ROLE_TOOLS, "{role}");
                 let forbidden = ir.tool_surface().forbidden();
                 for tool in ["fs.write", "fs.edit", "shell.exec", "web.fetch"] {
                     assert!(
@@ -5418,7 +6002,7 @@ mod tests {
                     );
                 }
             } else {
-                for tool in DOD_READ_TOOLS {
+                for tool in DOD_TRIAGE_ROLE_TOOLS {
                     assert!(!admitted.contains(tool), "{role} admittiert {tool}");
                 }
             }
@@ -5628,7 +6212,7 @@ mod tests {
     }
 
     /// Plan R9, Teil F: jedes Profil mit `shell.exec` bewirbt direkt dahinter
-    /// die sechs `job.*`-Werkzeuge; kein Profil ohne Shell tut das.
+    /// die sieben `job.*`-Werkzeuge; kein Profil ohne Shell tut das.
     #[test]
     fn test_shell_profiles_carry_job_tools_right_after_shell_exec() {
         for profile in RegistryProfile::ALL {
@@ -5934,12 +6518,12 @@ mod tests {
     /// daneben stehenden Zahl (siehe die Kritik an den vier Fundstellen in
     /// `agents/families/security/security.toml`, die genau das getan haben).
     ///
-    /// `context-steward`, `intel-scout`, `cargo-worker`, `host-process-worker`,
-    /// `sandbox-shell-worker` und `tmux-inspector-worker` werden von derselben
-    /// Verzeichnis-Sammlung ebenfalls gefunden, sind aber bewusst nicht in
-    /// `ALL` (siehe Moduldokumentation von [`role_names`]) — eigene, noch
-    /// offene Befunde außerhalb dieses Knotens. Sie sind deshalb dokumentierte,
-    /// keine stillschweigenden Ausnahmen.
+    /// `cargo-worker`, `host-process-worker`, `sandbox-shell-worker` und
+    /// `tmux-inspector-worker` werden von derselben Verzeichnis-Sammlung
+    /// ebenfalls gefunden, sind aber bewusst nicht in `ALL` (siehe
+    /// Moduldokumentation von [`role_names`]) — eigene, noch offene Befunde
+    /// außerhalb dieses Knotens. Sie sind deshalb dokumentierte, keine
+    /// stillschweigenden Ausnahmen.
     #[test]
     fn test_role_names_all_matches_discovered_role_files_minus_pending_exclusions() {
         use std::collections::BTreeSet;
@@ -5951,10 +6535,11 @@ mod tests {
         /// von `RegistryProfile::MemoryStewardship`: die Konsolidierung
         /// braucht genau `fs.*` **ohne** `shell.exec`, und ein solches
         /// Profil gab es vorher nicht. Jetzt hat sie ein Profil und einen
-        /// Eintrag in `role_names::ALL` — keine Ausnahme mehr.
+        /// Eintrag in `role_names::ALL` — keine Ausnahme mehr. Ebenso
+        /// `intel-scout` und `context-steward` seit PL-100 (Entscheidung
+        /// O11): beide deklarieren ihren Envelope-Rückgabevertrag selbst und
+        /// laufen mit `RegistryProfile::NoTools`.
         const PENDING_EXCLUSIONS: &[&str] = &[
-            "context-steward",
-            "intel-scout",
             "cargo-worker",
             "host-process-worker",
             "sandbox-shell-worker",
@@ -6602,6 +7187,525 @@ mod tests {
                 ToolOutput::Json { .. } | ToolOutput::Text { .. } => {}
             }
             Ok(())
+        }
+    }
+
+    /// PL-100 (Owner-Befund 4505015316): der `sys.*`-Provider der Montage
+    /// hängt an der geteilten Freigabe-Zelle (`scope = "all"` nur unter Full
+    /// Access) und trägt die delegierte Job-Wurzel aus der
+    /// [`JobWiring`] im eigenen Umfang.
+    mod sys_scope {
+        use super::*;
+        use harw_authority::{Permission, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+        use harw_extension_api::approval_mode::ApprovalMode;
+        use harw_tool_sys::scope::PsScope;
+        use harw_tools::{ToolCall, ToolExecutionContext, ToolOutput};
+        use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
+
+        /// Eine delegierte Job-Wurzel in Dateisystem-Form.
+        const JOB_ROOT: &str = "/sys/fs/cgroup/harw-pl100-test.slice/jobs";
+        /// [`JOB_ROOT`] in cgroup-v2-Form, wie sie im eigenen Umfang steht.
+        const JOB_ROOT_CGROUP: &str = "/harw-pl100-test.slice/jobs";
+
+        /// Eine Job-Verdrahtung unter `dir`, wahlweise mit delegierter
+        /// Wurzel.
+        fn jobs(dir: &Path, root: Option<&str>) -> TestResult<JobWiring> {
+            let manager = harw_tool_job::JobManager::new(
+                harw_tool_job::JobManagerConfig::new(dir),
+                Arc::new(harw_tool_job::NoopNotifier),
+            )
+            .map_err(ctx("job manager"))?;
+            Ok(JobWiring::new(manager, Arc::new(harw_tool_job::NoLineage))
+                .with_delegated_cgroup_root(root.map(PathBuf::from)))
+        }
+
+        /// Eine Host-Permit-Verdrahtung mit `jobs` (Fragekanal geschlossen;
+        /// `sys.*` fragt nie).
+        fn wiring(jobs: Option<JobWiring>) -> HostPermitWiring {
+            let (sender, _receiver) = harw_tool_shell::host_permit_prompt_channel();
+            HostPermitWiring::new(
+                Arc::new(ProcessPermitLedger::default()),
+                Arc::new(HostPermitSessionRegistry::default()),
+                sender,
+            )
+            .with_jobs(jobs)
+        }
+
+        /// Ein Ausführungskontext mit `ExecuteProcess` (das Recht der
+        /// `sys.*`-Werkzeuge) über einem Workspace unter `dir`.
+        fn exec_context(dir: &Path) -> TestResult<ToolExecutionContext> {
+            let workspace = dir.join("project");
+            std::fs::create_dir_all(&workspace).map_err(ctx("workspace dir"))?;
+            let registry = WorkspaceRegistry::build(
+                dir,
+                [WorkspaceRegistration {
+                    tenant: TenantId::from_str("test-tenant"),
+                    workspace: WorkspaceId::from_str("project"),
+                    root: workspace,
+                }],
+            )
+            .map_err(ctx("workspace registry"))?;
+            let binding = registry
+                .resolve(
+                    &TenantId::from_str("test-tenant"),
+                    &WorkspaceId::from_str("project"),
+                )
+                .map_err(ctx("workspace binding"))?;
+            let sandbox = SandboxSpec::from_resolved(
+                binding,
+                PermissionSet::from_policy([Permission::ExecuteProcess]),
+            );
+            Ok(ToolExecutionContext::new(
+                SessionId::new(),
+                TurnId::new(),
+                sandbox,
+            ))
+        }
+
+        /// Der `sys.ps`-Ausführer der vollständig montierten
+        /// `Full`-Registry (derselbe Weg wie Wurzel und Kinder:
+        /// `assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits`).
+        fn assembled_sys_ps(
+            approval_mode: &ApprovalModeCell,
+            host_permits: Option<HostPermitWiring>,
+            project_root: &Path,
+        ) -> TestResult<Arc<dyn ToolExecutor>> {
+            let project = discover_project(project_root, &DiscoveryConfig::default())
+                .map_err(ctx("discover project"))?;
+            let profile = RegistryProfile::Full;
+            let assembled =
+                assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
+                    profile,
+                    &project,
+                    IdentityOverrides::default(),
+                    approval_mode.clone(),
+                    &profile.required_permissions(),
+                    None,
+                    &SandboxProfile::Strict,
+                    host_permits,
+                )
+                .map_err(ctx("assemble Full"))?;
+            assembled
+                .registry
+                .tool_providers()
+                .iter()
+                .find_map(|provider| provider.executor(&ToolName::new("sys.ps")))
+                .ok_or(TestError::Missing("sys.ps executor in the Full registry"))
+        }
+
+        /// Führt `sys.ps` mit `arguments` aus.
+        async fn run_sys_ps(
+            executor: &dyn ToolExecutor,
+            context: &ToolExecutionContext,
+            arguments: serde_json::Value,
+        ) -> TestResult<ToolOutput> {
+            let call = ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("sys.ps"),
+                arguments,
+            };
+            executor
+                .execute(context, &call)
+                .await
+                .map_err(ctx("sys.ps must not return Err"))
+        }
+
+        /// Der gemeldete Umfang einer erfolgreichen `sys.ps`-Ausgabe.
+        fn scope_of(output: ToolOutput) -> TestResult<String> {
+            match output {
+                ToolOutput::Json { content } => content
+                    .get("scope")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or(TestError::Missing("scope field of sys.ps")),
+                other => Err(TestError::Unexpected(format!(
+                    "sys.ps must succeed, got {other:?}"
+                ))),
+            }
+        }
+
+        /// Die Meldung einer abgelehnten `sys.ps`-Ausgabe.
+        fn refusal_of(output: ToolOutput) -> TestResult<String> {
+            match output {
+                ToolOutput::Error { message } => Ok(message),
+                other => Err(TestError::Unexpected(format!(
+                    "sys.ps must refuse, got {other:?}"
+                ))),
+            }
+        }
+
+        /// Owner-Befund 4505015316, Profil-Komposition: in der montierten
+        /// `Full`-Registry lehnt `sys.ps` `scope = "all"` unter `ask` und
+        /// `auto` ab und lässt es unter `full` zu; der Provider liest dabei
+        /// dieselbe Zelle wie die Montage (eine Umschaltung wirkt sofort),
+        /// auch mit verdrahteter Job-Wurzel. Ohne `scope` bleibt es beim
+        /// eigenen Umfang.
+        #[tokio::test]
+        async fn test_assembled_sys_ps_allows_scope_all_only_under_full_access() -> TestResult {
+            let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let context = exec_context(dir.path())?;
+            let all = serde_json::json!({ "scope": "all", "limit": 1 });
+            let job_dir = tempfile::tempdir().map_err(ctx("job tempdir"))?;
+            let with_jobs = wiring(Some(jobs(job_dir.path(), Some(JOB_ROOT))?));
+            for host_permits in [None, Some(with_jobs)] {
+                for mode in [ApprovalMode::AlwaysAsk, ApprovalMode::Delegated] {
+                    let cell = ApprovalModeCell::new(mode);
+                    let sys_ps = assembled_sys_ps(&cell, host_permits.clone(), dir.path())?;
+                    let message =
+                        refusal_of(run_sys_ps(sys_ps.as_ref(), &context, all.clone()).await?)?;
+                    assert!(message.contains("Full Access"), "{mode:?}: {message}");
+                }
+                let cell = ApprovalModeCell::new(ApprovalMode::FullAccess);
+                let sys_ps = assembled_sys_ps(&cell, host_permits.clone(), dir.path())?;
+                assert_eq!(
+                    scope_of(run_sys_ps(sys_ps.as_ref(), &context, all.clone()).await?)?,
+                    "all"
+                );
+                // Dieselbe Zelle: zurück auf `auto` sperrt sofort wieder.
+                cell.set(ApprovalMode::Delegated);
+                let message =
+                    refusal_of(run_sys_ps(sys_ps.as_ref(), &context, all.clone()).await?)?;
+                assert!(message.contains("Full Access"), "{message}");
+                cell.set(ApprovalMode::FullAccess);
+                assert_eq!(
+                    scope_of(run_sys_ps(sys_ps.as_ref(), &context, all.clone()).await?)?,
+                    "all"
+                );
+                // Ohne `scope` bleibt es auch unter Full Access bei `own`.
+                let own = scope_of(
+                    run_sys_ps(sys_ps.as_ref(), &context, serde_json::json!({ "limit": 1 }))
+                        .await?,
+                )?;
+                assert_ne!(own, "all");
+            }
+            Ok(())
+        }
+
+        /// Die PIDs einer erfolgreichen `sys.ps`-Ausgabe.
+        #[cfg(target_os = "linux")]
+        fn pids_of(output: ToolOutput) -> TestResult<Vec<i64>> {
+            match output {
+                ToolOutput::Json { content } => content
+                    .get("processes")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|processes| {
+                        processes
+                            .iter()
+                            .filter_map(|process| {
+                                process.get("pid").and_then(serde_json::Value::as_i64)
+                            })
+                            .collect()
+                    })
+                    .ok_or(TestError::Missing("processes field of sys.ps")),
+                other => Err(TestError::Unexpected(format!(
+                    "sys.ps must succeed, got {other:?}"
+                ))),
+            }
+        }
+
+        /// Ein verwaister `sleep` in einer eigenen cgroup unter einer
+        /// delegierten Job-Wurzel: kein Nachfahre des Testprozesses, im
+        /// eigenen Umfang also nur über die Job-Wurzel sichtbar.
+        #[cfg(target_os = "linux")]
+        struct HostJobCgroup {
+            /// Die cgroup (Dateisystem-Pfad) unter der Wurzel.
+            dir: PathBuf,
+            /// Die PID des `sleep`.
+            pid: i64,
+        }
+
+        #[cfg(target_os = "linux")]
+        impl HostJobCgroup {
+            /// Legt die cgroup unter `root` an, startet den `sleep` verwaist
+            /// und hängt ihn in die cgroup ein; räumt bei einem Fehler auf.
+            fn start(root: &Path) -> TestResult<Self> {
+                let dir = root.join(format!("harw-pl100-sysps-{}", std::process::id()));
+                std::fs::create_dir(&dir).map_err(ctx("create the job cgroup"))?;
+                let pid = match Self::orphan_sleep() {
+                    Ok(pid) => pid,
+                    Err(error) => {
+                        // Aufräumen nach einem gescheiterten Start; gemeldet
+                        // wird der Startfehler, nicht ein Folgefehler.
+                        let _ = std::fs::remove_dir(&dir);
+                        return Err(error);
+                    }
+                };
+                let job = Self { dir, pid };
+                if let Err(error) = std::fs::write(job.dir.join("cgroup.procs"), pid.to_string()) {
+                    // Wie oben: der Einhängefehler gewinnt über das Aufräumen.
+                    let _ = job.stop();
+                    return Err(TestError::Context {
+                        context: "move the sleep into the job cgroup",
+                        source: error.to_string(),
+                    });
+                }
+                Ok(job)
+            }
+
+            /// Startet `sleep` über eine Shell, die seine PID nennt und
+            /// sofort endet: der `sleep` verwaist und ist danach kein
+            /// Nachfahre dieses Testprozesses mehr.
+            fn orphan_sleep() -> TestResult<i64> {
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("sleep 60 </dev/null >/dev/null 2>&1 & echo $!")
+                    .output()
+                    .map_err(ctx("start the orphaned sleep"))?;
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(ctx("pid of the orphaned sleep"))
+            }
+
+            /// Beendet den `sleep` und entfernt die cgroup.
+            fn stop(self) -> TestResult {
+                // `cgroup.kill` (Linux 5.14+) beendet alles in der cgroup,
+                // sonst gezielt der `sleep`.
+                if std::fs::write(self.dir.join("cgroup.kill"), "1").is_err() {
+                    std::process::Command::new("kill")
+                        .arg("-KILL")
+                        .arg(self.pid.to_string())
+                        .status()
+                        .map_err(ctx("kill the sleep"))?;
+                }
+                // Der Kernel nimmt beendete Prozesse asynchron heraus.
+                for _ in 0..50 {
+                    let procs = std::fs::read_to_string(self.dir.join("cgroup.procs"))
+                        .map_err(ctx("read cgroup.procs"))?;
+                    if procs.trim().is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                std::fs::remove_dir(&self.dir).map_err(ctx("remove the job cgroup"))
+            }
+        }
+
+        /// Owner-Befund 4505015316 (Review-Befund: Komposition gegen einen
+        /// echten Host): die an die [`JobWiring`] gehängte Job-Wurzel macht
+        /// in der vollständig montierten `Full`-Registry einen Prozess einer
+        /// Job-cgroup unter `scope = "own"` sichtbar, auch unter `auto`
+        /// (ohne Full Access); ohne Wurzel bleibt derselbe Prozess draußen.
+        /// Fängt damit auch einen Rückschritt im `Full`-Zweig von
+        /// [`profile_tool_providers`] (etwa ein Provider ohne
+        /// `host_permits`).
+        ///
+        /// Host-gated: `HARW_TEST_CGROUP_ROOT` muss eine delegierte
+        /// cgroup-v2-Wurzel außerhalb des eigenen cgroup-Teilbaums nennen,
+        /// unter der dieser Prozess cgroups anlegen und Prozesse einhängen
+        /// darf; mit `--ignored` ausführen. Fehlt sie oder taugt sie nicht,
+        /// scheitert der Test, statt still zu bestehen.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        #[ignore = "needs a delegated cgroup v2 root in HARW_TEST_CGROUP_ROOT"]
+        async fn test_assembled_sys_ps_lists_a_job_cgroup_process_under_own() -> TestResult {
+            let root = std::env::var_os("HARW_TEST_CGROUP_ROOT")
+                .map(PathBuf::from)
+                .ok_or(TestError::Missing("HARW_TEST_CGROUP_ROOT"))?;
+            let root_text = root
+                .to_str()
+                .ok_or(TestError::Missing("HARW_TEST_CGROUP_ROOT as UTF-8"))?
+                .to_owned();
+            let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let job_dir = tempfile::tempdir().map_err(ctx("job tempdir"))?;
+            let context = exec_context(dir.path())?;
+            let cell = ApprovalModeCell::new(ApprovalMode::Delegated);
+            let with_root = assembled_sys_ps(
+                &cell,
+                Some(wiring(Some(jobs(
+                    job_dir.path(),
+                    Some(root_text.as_str()),
+                )?))),
+                dir.path(),
+            )?;
+            let without_root = assembled_sys_ps(&cell, None, dir.path())?;
+
+            let job = HostJobCgroup::start(&root)?;
+            let pid = job.pid;
+            let arguments = serde_json::json!({ "pids": [pid] });
+            let seen_without = run_sys_ps(without_root.as_ref(), &context, arguments.clone())
+                .await
+                .and_then(pids_of);
+            let seen_with = run_sys_ps(with_root.as_ref(), &context, arguments)
+                .await
+                .and_then(pids_of);
+            job.stop()?;
+
+            if seen_without?.contains(&pid) {
+                return Err(TestError::Unexpected(
+                    "HARW_TEST_CGROUP_ROOT lies inside the own cgroup subtree; \
+                     choose a delegated root outside it"
+                        .to_owned(),
+                ));
+            }
+            assert_eq!(seen_with?, [pid], "the job root is part of the own scope");
+            Ok(())
+        }
+
+        /// Owner-Befund 4505015316: die bestätigte Job-Wurzel der
+        /// [`JobWiring`] (Wurzel und Kinder teilen dieselbe Verdrahtung)
+        /// landet im eigenen Umfang des `sys.*`-Providers, den das Profil
+        /// `Full` baut; `all` bleibt dabei an die Freigabe-Zelle gebunden.
+        #[test]
+        fn test_the_delegated_job_root_is_part_of_the_own_scope() -> TestResult {
+            let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let with_root = wiring(Some(jobs(dir.path(), Some(JOB_ROOT))?));
+            // Die Kind-Fabriken bekommen einen Klon derselben Verdrahtung.
+            let for_children = with_root.clone();
+            for shared in [&with_root, &for_children] {
+                assert_eq!(delegated_job_root(Some(shared)), Some(Path::new(JOB_ROOT)));
+            }
+
+            let cell = ApprovalModeCell::new(ApprovalMode::Delegated);
+            let provider = sys_tool_provider(&cell, Some(&with_root));
+            assert_eq!(provider.scope_policy().extra_roots(), [JOB_ROOT_CGROUP]);
+            assert_eq!(provider.scope_policy().resolve(None), Ok(PsScope::Own));
+            assert_eq!(
+                provider.scope_policy().resolve(Some("own")),
+                Ok(PsScope::Own)
+            );
+            assert!(provider.scope_policy().resolve(Some("all")).is_err());
+            cell.set(ApprovalMode::FullAccess);
+            assert_eq!(
+                provider.scope_policy().resolve(Some("all")),
+                Ok(PsScope::All)
+            );
+            assert_eq!(provider.scope_policy().extra_roots(), [JOB_ROOT_CGROUP]);
+            Ok(())
+        }
+
+        /// Owner-Befund 4505015316 (Review-Befund, Runde 2): Profil-Komposition
+        /// ohne Host-Voraussetzung. Der Bau von [`RegistryProfile::Full`] in
+        /// [`profile_tool_providers`] montiert einen `sys.*`-Provider, dessen
+        /// Umfangs-Politik ([`FULL_SYS_SCOPE`]) die delegierte Job-Wurzel der
+        /// übergebenen Verdrahtung trägt und an derselben Freigabe-Zelle hängt;
+        /// ohne Verdrahtung bleibt sie ohne Wurzel. Fängt einen Rückschritt
+        /// des `Full`-Zweigs (etwa `sys_tool_provider(approval_mode, None)`).
+        #[test]
+        fn test_the_full_profile_mounts_sys_with_the_job_root_and_the_shared_cell() -> TestResult {
+            let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let with_root = wiring(Some(jobs(dir.path(), Some(JOB_ROOT))?));
+            let cell = ApprovalModeCell::new(ApprovalMode::Delegated);
+            let access = || AgentDefinitionAccess {
+                project_agents_dir: None,
+                profile_agents_dir: None,
+                mode: DefinitionWriteMode::ProposalOnly,
+                ceiling: None,
+            };
+
+            FULL_SYS_SCOPE.set(None);
+            let providers = profile_tool_providers(
+                RegistryProfile::Full,
+                access(),
+                &SandboxProfile::Strict,
+                Some(&with_root),
+                &cell,
+            );
+            let scope = FULL_SYS_SCOPE.take().ok_or(TestError::Missing(
+                "scope of the mounted Full sys.* provider",
+            ))?;
+            assert!(
+                providers
+                    .iter()
+                    .any(|provider| provider.executor(&ToolName::new("sys.ps")).is_some()),
+                "the Full profile mounts sys.ps"
+            );
+            assert_eq!(scope.extra_roots(), [JOB_ROOT_CGROUP]);
+            assert_eq!(scope.resolve(None), Ok(PsScope::Own));
+            assert!(!scope.allows_all());
+            cell.set(ApprovalMode::FullAccess);
+            assert!(scope.allows_all(), "the same cell as the assembly");
+            assert_eq!(scope.resolve(Some("all")), Ok(PsScope::All));
+            cell.set(ApprovalMode::AlwaysAsk);
+            assert!(scope.resolve(Some("all")).is_err());
+
+            FULL_SYS_SCOPE.set(None);
+            let _providers = profile_tool_providers(
+                RegistryProfile::Full,
+                access(),
+                &SandboxProfile::Strict,
+                None,
+                &cell,
+            );
+            let scope = FULL_SYS_SCOPE.take().ok_or(TestError::Missing(
+                "scope of the Full sys.* provider without wiring",
+            ))?;
+            assert!(scope.extra_roots().is_empty());
+
+            // Kein anderes Profil montiert `sys.*`.
+            FULL_SYS_SCOPE.set(None);
+            let _providers = profile_tool_providers(
+                RegistryProfile::ReadOnlyExplore,
+                access(),
+                &SandboxProfile::Strict,
+                Some(&with_root),
+                &cell,
+            );
+            assert!(FULL_SYS_SCOPE.take().is_none());
+            Ok(())
+        }
+
+        /// Ohne Verdrahtung, ohne Jobs oder ohne bestätigte Wurzel bleibt der
+        /// eigene Umfang ohne Job-Wurzel; die Sperre gilt trotzdem.
+        #[test]
+        fn test_without_a_job_root_the_own_scope_has_no_extra_root() -> TestResult {
+            let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            let without_root = wiring(Some(jobs(dir.path(), None)?));
+            let without_jobs = wiring(None);
+            assert_eq!(delegated_job_root(None), None);
+            assert_eq!(delegated_job_root(Some(&without_jobs)), None);
+            assert_eq!(delegated_job_root(Some(&without_root)), None);
+            for mode in [
+                ApprovalMode::AlwaysAsk,
+                ApprovalMode::Delegated,
+                ApprovalMode::FullAccess,
+            ] {
+                let cell = ApprovalModeCell::new(mode);
+                for host_permits in [None, Some(&without_jobs), Some(&without_root)] {
+                    let provider = sys_tool_provider(&cell, host_permits);
+                    assert!(provider.scope_policy().extra_roots().is_empty());
+                    assert_eq!(
+                        provider.scope_policy().allows_all(),
+                        mode == ApprovalMode::FullAccess,
+                        "{mode:?}"
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        /// Fail-closed: eine Wurzel, die die Umfangs-Politik ablehnt, wird
+        /// verworfen; es bleibt der eigene cgroup-Teilbaum und Prozessbaum,
+        /// nie „alles".
+        #[test]
+        fn test_a_refused_job_root_falls_back_to_the_own_scope() {
+            for root in [
+                "/",
+                "relative/harw.slice",
+                "/sys/fs/cgroup",
+                "/sys/fs/cgroup/harw.slice/../other.slice",
+            ] {
+                let policy = own_scope_policy(Some(Path::new(root)));
+                assert!(policy.extra_roots().is_empty(), "{root}");
+                assert!(!policy.allows_all(), "{root}");
+                assert_eq!(policy.resolve(None), Ok(PsScope::Own), "{root}");
+            }
+            assert_eq!(
+                own_scope_policy(Some(Path::new(JOB_ROOT))).extra_roots(),
+                [JOB_ROOT_CGROUP]
+            );
+        }
+
+        /// Fail-closed: eine Wurzel, die kein UTF-8 ist, wird verworfen.
+        #[cfg(unix)]
+        #[test]
+        fn test_a_non_utf8_job_root_is_ignored() {
+            use std::os::unix::ffi::OsStrExt;
+
+            let root = Path::new(std::ffi::OsStr::from_bytes(
+                b"/sys/fs/cgroup/harw-\xff.slice",
+            ));
+            assert!(own_scope_policy(Some(root)).extra_roots().is_empty());
         }
     }
 }

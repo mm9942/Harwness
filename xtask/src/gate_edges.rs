@@ -29,13 +29,14 @@
 //!
 //! **Keine Krypto- und HTTP-Stapel in Warden, Probes und Sensoren.**
 //! Crypto Masterplan v2 §20/§21: die TCBs von `harw-warden`,
-//! `harw-dod-warden*`, `harw-probe-fs`, `harw-probe-bpf` und jeder Crate aus
-//! [`SENSOR_CRATES`] dürfen in ihrer **normalen Abhängigkeitshülle** weder
-//! CryptGuard (`crypt_guard`, `crypt_guard_core`, `crypt_guard_service`,
-//! `crypt_guard_hyper`) noch `hyper` oder `tower` noch `harw-dod-encrypt`
-//! erreichen. Der kleine, geschlüsselte Beleg-Pfad des Warden bleibt klein;
-//! neue Kryptographie gehört an die Stelle, an der Sicherheitsinformation
-//! die lokale Grenze verlässt. Diese Regeln stehen in [`FORBIDDEN_REACH`]
+//! `harw-dod-warden*`, `harw-probe-fs`, `harw-probe-bpf`,
+//! `harw-probe-netlink` und jeder Crate aus [`SENSOR_CRATES`] dürfen in
+//! ihrer **normalen Abhängigkeitshülle** weder CryptGuard (`crypt_guard`,
+//! `crypt_guard_core`, `crypt_guard_service`, `crypt_guard_hyper`) noch
+//! `hyper` oder `tower` noch `harw-dod-encrypt` erreichen. Der kleine,
+//! geschlüsselte Beleg-Pfad des Warden bleibt klein; neue Kryptographie
+//! gehört an die Stelle, an der Sicherheitsinformation die lokale Grenze
+//! verlässt. Diese Regeln stehen in [`FORBIDDEN_REACH`]
 //! und nennen **externe** Paketnamen — [`FORBIDDEN`] kennt nur Kanten
 //! zwischen Workspace-Crates. Die Hülle folgt den internen `[dependencies]`
 //! aus dem Graphen und ab der ersten externen Crate den Kanten in
@@ -112,6 +113,8 @@ pub const SENSOR_CRATES: &[&str] = &[
     "harw-dod-fsmon",
     "harw-dod-procmon",
     "harw-dod-flow",
+    // PL-100 WP1.8 (O11): Offline-RustSec-Sensor, unprivilegiert.
+    "harw-dod-advisory",
 ];
 
 /// Eine verbotene Kante samt ihrer Begründung.
@@ -215,6 +218,11 @@ pub const FORBIDDEN_REACH: &[ForbiddenReach] = &[
     },
     ForbiddenReach {
         from: Pattern::Exact("harw-probe-bpf"),
+        names: CRYPTO_AND_HTTP_STACK,
+        rule: TCB_NO_CRYPTO,
+    },
+    ForbiddenReach {
+        from: Pattern::Exact("harw-probe-netlink"),
         names: CRYPTO_AND_HTTP_STACK,
         rule: TCB_NO_CRYPTO,
     },
@@ -674,6 +682,7 @@ version = "1.0.0"
         for root in [
             "harw-probe-bpf",
             "harw-probe-fs",
+            "harw-probe-netlink",
             "harw-dod-warden",
             "harw-warden",
             "harw-dod-thermal",
@@ -815,6 +824,7 @@ version = "1.0.0"
             "harw-dod-warden-proto",
             "harw-probe-fs",
             "harw-probe-bpf",
+            "harw-probe-netlink",
         ]
         .into_iter()
         .chain(SENSOR_CRATES.iter().copied())
@@ -834,5 +844,80 @@ version = "1.0.0"
         assert!(!Pattern::Sensor.matches("harw-dod-cap"));
         assert!(!Pattern::Sensor.matches("harw-dod-signals"));
         assert!(!Pattern::Sensor.matches("harw-dod-readfs"));
+    }
+
+    /// PL-100 WP1.8: `harw-dod-advisory` ist ein Sensor wie die übrigen
+    /// `harw-dod-*` — Zugriffs- und Vokabularschichten sind erlaubt, ein
+    /// Geschwistersensor nicht (C7).
+    #[test]
+    fn test_advisory_is_a_sensor_sibling_and_may_use_access_layers() {
+        assert!(Pattern::Sensor.matches("harw-dod-advisory"));
+        // Die Sonde ist ein Binary, kein Sensor: ihre Krypto-Regel steht
+        // als eigener `Pattern::Exact`-Eintrag.
+        assert!(!Pattern::Sensor.matches("harw-probe-netlink"));
+
+        let allowed = graph(vec![
+            node(
+                "harw-dod-advisory",
+                &[
+                    "harw-dod-cap",
+                    "harw-dod-signals",
+                    "harw-dod-readfs",
+                    "harw-untrusted-text",
+                ],
+                &["semver", "toml"],
+            ),
+            node("harw-dod-cap", &[], &[]),
+            node("harw-dod-signals", &[], &[]),
+            node("harw-dod-readfs", &[], &[]),
+            node("harw-untrusted-text", &[], &[]),
+        ]);
+        let report = evaluate(&allowed);
+        assert!(report.is_green(), "{:?}", report.violations);
+
+        let sibling = graph(vec![
+            node("harw-dod-advisory", &["harw-dod-scanreport"], &[]),
+            node("harw-dod-scanreport", &[], &[]),
+        ]);
+        let report = evaluate(&sibling);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("harw-dod-advisory → harw-dod-scanreport verletzt")),
+            "{:?}",
+            report.violations
+        );
+    }
+
+    /// PL-100 WP1.8: die Audit-Netlink-Sonde trägt dieselbe Krypto-Regel wie
+    /// `harw-probe-bpf`; ihre tatsächliche Form (Netlink, Authlog, Vokabular)
+    /// bleibt grün, `hyper` über ein Lockfile nicht.
+    #[test]
+    fn test_evaluate_netlink_probe_hull_is_checked_like_the_bpf_probe() -> TestResult {
+        let clean = graph(vec![
+            node(
+                "harw-probe-netlink",
+                &["harw-dod-netlink", "harw-dod-authlog", "harw-dod-signals"],
+                &["serde"],
+            ),
+            node("harw-dod-netlink", &[], &[]),
+            node("harw-dod-authlog", &["harw-dod-netlink"], &[]),
+            node("harw-dod-signals", &[], &[]),
+        ]);
+        let report = evaluate_with_lock(&clean, Some(&lock(LOCK_WITH_REQWEST)?));
+        assert!(report.is_green(), "{:?}", report.violations);
+
+        let leaky = graph(vec![node("harw-probe-netlink", &[], &["reqwest"])]);
+        let report = evaluate_with_lock(&leaky, Some(&lock(LOCK_WITH_REQWEST)?));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("harw-probe-netlink → reqwest → hyper")),
+            "{:?}",
+            report.violations
+        );
+        Ok(())
     }
 }

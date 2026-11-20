@@ -25,7 +25,21 @@
 //!     {"id": "gpu-0", "health": "degraded", "degrade_reason": "permanent",
 //!      "readings_total": 0, "errors_total": 1}
 //!   ],
-//!   "ipc": {"probes_connected": 1, "events_total": 40, "dropped_total": 0}
+//!   "ipc": {"probes_connected": 1, "events_total": 40, "dropped_total": 0,
+//!           "peers_rejected_total": 0, "decode_errors_total": 0,
+//!           "events_last_cycle": 3, "dropped_last_cycle": 0,
+//!           "events_last_60s": 12, "dropped_last_60s": 0},
+//!   "ring": {"overflow_samples_total": 0, "overflow_events_total": 0,
+//!            "overflow_samples_last_cycle": 0, "overflow_events_last_cycle": 0,
+//!            "overflow_samples_last_60s": 0, "overflow_events_last_60s": 0},
+//!   "windows": {"last_cycle_ms": 5000, "last_60s_ms": 60000},
+//!   "spool": {"state": "degraded", "degrade_reason": "spool_full",
+//!             "enqueued_total": 9, "written_total": 8, "dropped_total": 0,
+//!             "spool_full_total": 1, "too_large_total": 0, "failed_total": 0,
+//!             "removed_total": 0, "dropped_last_60s": 0, "rejected_last_60s": 1},
+//!   "landlock": {"outcome": "partially_enforced", "requested_abi": 1,
+//!                "effective_abi": 3},
+//!   "listener_history": {"state": "ok", "keys": 12, "primed": true}
 //! }
 //! ```
 //!
@@ -36,6 +50,56 @@
 //!   present only for `degraded`; `last_ok_at` only after a successful poll.
 //! - `readings_total`/`errors_total` count successful and failed polls of
 //!   that sensor since process start ([`SensorTracker`]).
+//! - `ipc.peers_rejected_total` (PL-100 WP0.5, additive) counts probe
+//!   socket connections closed because their `SO_PEERCRED` uid is not on
+//!   the probe allowlist (`crate::peer_allow`). Expected: `0`.
+//! - `ipc.decode_errors_total` (PL-100 WP1, additive) counts messages of
+//!   admitted probes that were discarded because they could not be decoded
+//!   or exceeded the datagram limit (`crate::ipc::IpcInbox::note_decode_error`,
+//!   the same events as the `sensor_parse_errors` metric). Expected: `0`;
+//!   anything else means a probe reported observations the sentinel never
+//!   saw.
+//! - `ring` counts entries the evidence ring evicted **before** the rules
+//!   evaluated them (`crate::findings::RuleCycle`): observations that were
+//!   never checked. Expected: `0`.
+//! - Windowed deltas (PL-100 WP0.13, additive): every cumulative counter of
+//!   `ipc` and `ring` has a `*_last_cycle` delta (since the previous
+//!   document) and a `*_last_60s` delta (since the newest cycle at least
+//!   [`HEALTH_WINDOW_SECS`] seconds ago). `windows` reports the span each
+//!   delta actually covers in milliseconds; `null` means "since process
+//!   start" (the first cycle, or a process younger than the window). When
+//!   the bounded history ([`MAX_WINDOW_SNAPSHOTS`]) no longer reaches back
+//!   a full window, `last_60s_ms` is the shorter span actually covered.
+//!   Counters that go backwards yield `0`, never a wrapped value.
+//! - `spool` (PL-100 WP0.12, additive) reports the finding spool writer
+//!   (`crate::spool_writer`); it is `null` when no spool is configured (no
+//!   `--findings-export`). `state` is `ok` or `degraded`; `degraded` when the
+//!   spool could not be opened (`unavailable`), the most recent write failed,
+//!   or a record was dropped (full writer queue) or refused (`SpoolFull`,
+//!   `RecordTooLarge`, another write failure) within the last
+//!   [`HEALTH_WINDOW_SECS`] seconds. `degrade_reason` (present only when
+//!   degraded) is the most recent cause: `unavailable`, `queue_overflow`,
+//!   `spool_full`, `record_too_large` or `write_failed`. The counters are
+//!   cumulative since process start; `dropped_last_60s` and
+//!   `rejected_last_60s` are windowed like the `ipc`/`ring` deltas.
+//! - `landlock` (PL-100 WP0.7, additive, host verification) reports the
+//!   sentinel's own Landlock self-restriction (`crate::sandbox`): `outcome`
+//!   is `fully_enforced`, `partially_enforced`, `not_enforced` or `failed`
+//!   (the last two mean the process runs without the filesystem sandbox),
+//!   `requested_abi` the ABI level whose access rights the ruleset asks for
+//!   and `effective_abi` the level the running kernel supports (`null`
+//!   without Landlock support or when the attempt failed early). The whole
+//!   object is `null` until the restriction was attempted (only in tests).
+//! - `listener_history` (PL-100 WP1.6, additive) reports the persisted
+//!   listener history of the `listener-new` rule
+//!   (`crate::listener_state`): `state` `ok` or `degraded`, `degrade_reason`
+//!   (only when degraded: `state_unreadable`, `state_not_regular_file`,
+//!   `state_too_large` or `state_invalid` when the stored history was
+//!   discarded at startup, which holds for the rest of the process lifetime
+//!   because the following learning cycle accepted every open listener
+//!   unchecked; otherwise `write_failed`), the number of learned `keys` and
+//!   whether the history is `primed`. `null` when the rules run without a
+//!   history.
 //! - The document carries no evidence, no raw events, no paths, no secrets.
 //!
 //! # Atomic replacement
@@ -58,16 +122,22 @@
 //! Lives exclusively in the collection thread (`&mut self`), like
 //! `crate::export::FindingsExporter`.
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use harw_dod_sentinel::{DegradeReason, SensorHealth};
 use harw_observe::{MetricValue, TelemetrySink};
 use harw_types::SensorId;
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde::Serialize;
+
+use crate::listener_state::ListenerHistoryHealth;
+use crate::sandbox::LandlockReport;
+use crate::spool_writer::{SpoolCounters, SpoolFailure, SpoolStats};
 
 /// Schema version of the health document (`schema_version`).
 pub const HEALTH_SCHEMA_VERSION: u32 = 1;
@@ -78,6 +148,16 @@ pub const DEFAULT_HEALTH_FILE_NAME: &str = "health.json";
 /// Mode of a newly created health document: owner read/write, group read
 /// (readers get access through the export directory's group), nothing else.
 pub const HEALTH_FILE_MODE: u32 = 0o640;
+
+/// Length of the sliding window behind the `*_last_60s` deltas, in seconds.
+pub const HEALTH_WINDOW_SECS: i64 = 60;
+
+/// [`HEALTH_WINDOW_SECS`] as a duration.
+const HEALTH_WINDOW: SignedDuration = SignedDuration::from_secs(HEALTH_WINDOW_SECS);
+
+/// Most per-cycle counter snapshots kept for the sliding window (bounds the
+/// memory even with a very short `--interval-secs`).
+pub const MAX_WINDOW_SNAPSHOTS: usize = 4096;
 
 harw_macros::metrics! {
     /// How often the health document could not be written since process
@@ -95,6 +175,170 @@ pub struct IpcCounters {
     pub events_total: u64,
     /// Events evicted from the full receive inbox since start.
     pub dropped_total: u64,
+    /// Connections closed since start because the peer uid is not on the
+    /// probe allowlist (PL-100 WP0.5).
+    pub peers_rejected_total: u64,
+    /// Messages of admitted probes discarded since start because they were
+    /// malformed or oversized (`crate::ipc::IpcInbox::decode_errors_total`).
+    pub decode_errors_total: u64,
+}
+
+/// Cumulative counters of the evidence ring (`ring` object).
+///
+/// # Description
+/// Entries the ring evicted before the rules evaluated them, since process
+/// start (`crate::findings::RuleCycle::ring_counters`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RingCounters {
+    /// Samples evicted before evaluation.
+    pub overflow_samples_total: u64,
+    /// Events evicted before evaluation.
+    pub overflow_events_total: u64,
+}
+
+/// The counters that get windowed deltas, as one value.
+///
+/// # Description
+/// Used both for a cumulative snapshot and for the difference of two
+/// snapshots ([`Self::since`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealthCounters {
+    /// IPC events received (`ipc.events_*`).
+    pub ipc_events: u64,
+    /// IPC events evicted from the inbox (`ipc.dropped_*`).
+    pub ipc_dropped: u64,
+    /// Ring samples evicted before evaluation (`ring.overflow_samples_*`).
+    pub ring_overflow_samples: u64,
+    /// Ring events evicted before evaluation (`ring.overflow_events_*`).
+    pub ring_overflow_events: u64,
+    /// Spool records dropped at the full writer queue (`spool.dropped_*`).
+    pub spool_dropped: u64,
+    /// Spool records refused (`spool.rejected_*`: full spool, too large,
+    /// other write failure).
+    pub spool_rejected: u64,
+}
+
+impl HealthCounters {
+    /// The cumulative snapshot of `ipc` and `ring` (spool counters `0`, see
+    /// [`Self::with_spool`]).
+    #[must_use]
+    pub const fn of(ipc: IpcCounters, ring: RingCounters) -> Self {
+        Self {
+            ipc_events: ipc.events_total,
+            ipc_dropped: ipc.dropped_total,
+            ring_overflow_samples: ring.overflow_samples_total,
+            ring_overflow_events: ring.overflow_events_total,
+            spool_dropped: 0,
+            spool_rejected: 0,
+        }
+    }
+
+    /// The same snapshot with the cumulative counters of the finding spool
+    /// writer (PL-100 WP0.12).
+    #[must_use]
+    pub const fn with_spool(self, spool: &SpoolCounters) -> Self {
+        Self {
+            spool_dropped: spool.dropped_total,
+            spool_rejected: spool.rejected_total(),
+            ..self
+        }
+    }
+
+    /// The per-counter difference `self - base`, `0` where a counter went
+    /// backwards.
+    #[must_use]
+    pub const fn since(self, base: Self) -> Self {
+        Self {
+            ipc_events: self.ipc_events.saturating_sub(base.ipc_events),
+            ipc_dropped: self.ipc_dropped.saturating_sub(base.ipc_dropped),
+            ring_overflow_samples: self
+                .ring_overflow_samples
+                .saturating_sub(base.ring_overflow_samples),
+            ring_overflow_events: self
+                .ring_overflow_events
+                .saturating_sub(base.ring_overflow_events),
+            spool_dropped: self.spool_dropped.saturating_sub(base.spool_dropped),
+            spool_rejected: self.spool_rejected.saturating_sub(base.spool_rejected),
+        }
+    }
+}
+
+/// Deltas over the two health windows (see the module documentation).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowDeltas {
+    /// Change since the previous document.
+    pub last_cycle: HealthCounters,
+    /// Span of `last_cycle` in milliseconds; `None` = since process start.
+    pub last_cycle_ms: Option<u64>,
+    /// Change over the last [`HEALTH_WINDOW_SECS`] seconds.
+    pub last_60s: HealthCounters,
+    /// Span of `last_60s` in milliseconds; `None` = since process start.
+    pub last_60s_ms: Option<u64>,
+}
+
+/// Remembers per-cycle cumulative snapshots for the windowed deltas.
+///
+/// # Description
+/// Keeps, oldest first, the newest snapshot at least one window old (the
+/// baseline of the next window) plus every younger one, at most
+/// [`MAX_WINDOW_SNAPSHOTS`].
+#[derive(Debug, Default)]
+struct WindowTracker {
+    // `(now, cumulative counters)` per recorded cycle, oldest first.
+    history: VecDeque<(Timestamp, HealthCounters)>,
+    // Whether a snapshot was ever discarded, i.e. the process-start baseline
+    // (all zero) is no longer the implicit oldest one.
+    truncated: bool,
+}
+
+impl WindowTracker {
+    /// Records the cumulative counters of the cycle at `now` and returns its
+    /// windowed deltas.
+    fn record(&mut self, now: Timestamp, current: HealthCounters) -> WindowDeltas {
+        let (last_cycle, last_cycle_ms) = match self.history.back() {
+            Some((at, base)) => (current.since(*base), span_ms(now, *at)),
+            None => (current, None),
+        };
+        let window_start = now.checked_sub(HEALTH_WINDOW).ok();
+        let baseline = window_start.and_then(|start| {
+            self.history
+                .iter()
+                .rev()
+                .find(|(at, _)| *at <= start)
+                .copied()
+        });
+        let (last_60s, last_60s_ms) = match (baseline, self.truncated, self.history.front()) {
+            (Some((at, base)), _, _) | (None, true, Some(&(at, base))) => {
+                (current.since(base), span_ms(now, at))
+            }
+            (None, _, _) => (current, None),
+        };
+
+        self.history.push_back((now, current));
+        if let Some(start) = window_start {
+            // Ältere Stände als die jüngste Basis vor dem Fenster werden nie
+            // mehr gebraucht.
+            while self.history.get(1).is_some_and(|(at, _)| *at <= start) {
+                self.history.pop_front();
+                self.truncated = true;
+            }
+        }
+        while self.history.len() > MAX_WINDOW_SNAPSHOTS {
+            self.history.pop_front();
+            self.truncated = true;
+        }
+        WindowDeltas {
+            last_cycle,
+            last_cycle_ms,
+            last_60s,
+            last_60s_ms,
+        }
+    }
+}
+
+/// Milliseconds from `earlier` to `now`; `None` if the clock went backwards.
+fn span_ms(now: Timestamp, earlier: Timestamp) -> Option<u64> {
+    u64::try_from(now.duration_since(earlier).as_millis()).ok()
 }
 
 /// Stable string form of a [`SensorHealth`] state.
@@ -195,6 +439,147 @@ struct SensorLine<'a> {
     errors_total: u64,
 }
 
+/// The `ipc` object: cumulative counters plus their windowed deltas.
+#[derive(Debug, Serialize)]
+struct IpcLine {
+    probes_connected: u64,
+    events_total: u64,
+    dropped_total: u64,
+    peers_rejected_total: u64,
+    decode_errors_total: u64,
+    events_last_cycle: u64,
+    dropped_last_cycle: u64,
+    events_last_60s: u64,
+    dropped_last_60s: u64,
+}
+
+/// The `ring` object: cumulative overflow counters plus windowed deltas.
+#[derive(Debug, Serialize)]
+struct RingLine {
+    overflow_samples_total: u64,
+    overflow_events_total: u64,
+    overflow_samples_last_cycle: u64,
+    overflow_events_last_cycle: u64,
+    overflow_samples_last_60s: u64,
+    overflow_events_last_60s: u64,
+}
+
+/// The `windows` object: the spans the deltas cover.
+#[derive(Debug, Serialize)]
+struct WindowLine {
+    last_cycle_ms: Option<u64>,
+    last_60s_ms: Option<u64>,
+}
+
+/// The `spool` object (PL-100 WP0.12): state of the finding spool writer.
+#[derive(Debug, Serialize)]
+struct SpoolLine {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degrade_reason: Option<&'static str>,
+    enqueued_total: u64,
+    written_total: u64,
+    dropped_total: u64,
+    spool_full_total: u64,
+    too_large_total: u64,
+    failed_total: u64,
+    removed_total: u64,
+    dropped_last_60s: u64,
+    rejected_last_60s: u64,
+}
+
+impl SpoolLine {
+    /// The line for `spool`, judged against the windowed deltas.
+    fn of(spool: &SpoolCounters, windows: &WindowDeltas) -> Self {
+        let (state, degrade_reason) = spool_state(spool, windows);
+        Self {
+            state,
+            degrade_reason,
+            enqueued_total: spool.enqueued_total,
+            written_total: spool.written_total,
+            dropped_total: spool.dropped_total,
+            spool_full_total: spool.spool_full_total,
+            too_large_total: spool.too_large_total,
+            failed_total: spool.failed_total,
+            removed_total: spool.removed_total,
+            dropped_last_60s: windows.last_60s.spool_dropped,
+            rejected_last_60s: windows.last_60s.spool_rejected,
+        }
+    }
+}
+
+/// `state` and `degrade_reason` of the `spool` object.
+///
+/// # Description
+/// `degraded` when the spool is unavailable, the most recent write failed,
+/// or a record was dropped or refused within the last window (see the
+/// module documentation); the reason is the most recent cause.
+///
+/// # Returns
+/// `("ok", None)` or `("degraded", Some(reason))`.
+#[must_use]
+pub fn spool_state(
+    spool: &SpoolCounters,
+    windows: &WindowDeltas,
+) -> (&'static str, Option<&'static str>) {
+    let recent_loss = windows.last_60s.spool_dropped > 0 || windows.last_60s.spool_rejected > 0;
+    if !(spool.unavailable || spool.last_put_failed || recent_loss) {
+        return ("ok", None);
+    }
+    let reason = if spool.unavailable {
+        SpoolFailure::Unavailable
+    } else {
+        spool.last_failure.unwrap_or(SpoolFailure::WriteFailed)
+    };
+    ("degraded", Some(reason.label()))
+}
+
+/// The `landlock` object (PL-100 WP0.7): outcome and ABI levels of the
+/// self-restriction.
+#[derive(Debug, Serialize)]
+struct LandlockLine {
+    outcome: &'static str,
+    requested_abi: u8,
+    effective_abi: Option<u8>,
+}
+
+impl LandlockLine {
+    /// The line for `report`.
+    const fn of(report: LandlockReport) -> Self {
+        Self {
+            outcome: report.outcome.label(),
+            requested_abi: report.requested_abi,
+            effective_abi: report.effective_abi,
+        }
+    }
+}
+
+/// The `listener_history` object (PL-100 WP1.6).
+#[derive(Debug, Serialize)]
+struct ListenerHistoryLine {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degrade_reason: Option<&'static str>,
+    keys: u64,
+    primed: bool,
+}
+
+impl ListenerHistoryLine {
+    /// The line for `health`.
+    const fn of(health: ListenerHistoryHealth) -> Self {
+        Self {
+            state: if health.is_degraded() {
+                "degraded"
+            } else {
+                "ok"
+            },
+            degrade_reason: health.degrade_reason(),
+            keys: health.keys,
+            primed: health.primed,
+        }
+    }
+}
+
 /// The whole document.
 #[derive(Debug, Serialize)]
 struct HealthDocument<'a> {
@@ -203,7 +588,12 @@ struct HealthDocument<'a> {
     config_digest: Option<&'a str>,
     profile: Option<&'a str>,
     sensors: Vec<SensorLine<'a>>,
-    ipc: IpcCounters,
+    ipc: IpcLine,
+    ring: RingLine,
+    windows: WindowLine,
+    spool: Option<SpoolLine>,
+    landlock: Option<LandlockLine>,
+    listener_history: Option<ListenerHistoryLine>,
 }
 
 /// Identity of the resolved DoD configuration, as reported in the document.
@@ -217,18 +607,96 @@ pub struct ConfigIdentity {
     pub profile: Option<String>,
 }
 
+/// Everything one health document reports ([`encode_document`]).
+///
+/// # Concurrency
+/// Borrowed inputs of the collection thread, for one call.
+#[derive(Debug, Clone, Copy)]
+pub struct DocumentInputs<'a> {
+    /// Configuration identity (`config_digest`, `profile`).
+    pub identity: &'a ConfigIdentity,
+    /// Sensor health after `poll_all` (`sensors`).
+    pub snapshot: &'a [(SensorId, SensorHealth)],
+    /// Per-sensor poll counters.
+    pub tracker: &'a SensorTracker,
+    /// Cumulative receive-path counters (`ipc`).
+    pub ipc: IpcCounters,
+    /// Cumulative ring overflow counters (`ring`).
+    pub ring: RingCounters,
+    /// The finding spool writer's counters; `None` without a spool
+    /// (`"spool": null`).
+    pub spool: Option<&'a SpoolCounters>,
+    /// The windowed deltas ([`WindowDeltas`]).
+    pub windows: &'a WindowDeltas,
+    /// The Landlock self-restriction (`landlock`); `None` before it was
+    /// attempted.
+    pub landlock: Option<LandlockReport>,
+    /// The listener history (`listener_history`); `None` without one.
+    pub listener_history: Option<ListenerHistoryHealth>,
+    /// Reported as `written_at`.
+    pub now: Timestamp,
+}
+
+impl<'a> DocumentInputs<'a> {
+    /// Inputs with everything optional absent (no spool, no Landlock
+    /// report, no listener history) and zero counters.
+    ///
+    /// # Arguments
+    /// - `identity`, `snapshot`, `tracker`, `windows`: see the fields.
+    /// - `now`: reported as `written_at`.
+    #[must_use]
+    pub const fn new(
+        identity: &'a ConfigIdentity,
+        snapshot: &'a [(SensorId, SensorHealth)],
+        tracker: &'a SensorTracker,
+        windows: &'a WindowDeltas,
+        now: Timestamp,
+    ) -> Self {
+        Self {
+            identity,
+            snapshot,
+            tracker,
+            ipc: IpcCounters {
+                probes_connected: 0,
+                events_total: 0,
+                dropped_total: 0,
+                peers_rejected_total: 0,
+                decode_errors_total: 0,
+            },
+            ring: RingCounters {
+                overflow_samples_total: 0,
+                overflow_events_total: 0,
+            },
+            spool: None,
+            windows,
+            landlock: None,
+            listener_history: None,
+            now,
+        }
+    }
+}
+
 /// Encodes the health document (pretty-printed, trailing newline).
+///
+/// # Arguments
+/// - `inputs` ([`DocumentInputs`]): everything the document reports.
 ///
 /// # Errors
 /// `serde_json::Error` if serialization fails (practically unreachable for
 /// these field types, but not treated as a panic).
-pub fn encode_document(
-    identity: &ConfigIdentity,
-    snapshot: &[(SensorId, SensorHealth)],
-    tracker: &SensorTracker,
-    ipc: IpcCounters,
-    now: Timestamp,
-) -> Result<String, serde_json::Error> {
+pub fn encode_document(inputs: &DocumentInputs<'_>) -> Result<String, serde_json::Error> {
+    let DocumentInputs {
+        identity,
+        snapshot,
+        tracker,
+        ipc,
+        ring,
+        spool,
+        windows,
+        landlock,
+        listener_history,
+        now,
+    } = *inputs;
     let sensors = snapshot
         .iter()
         .enumerate()
@@ -254,7 +722,32 @@ pub fn encode_document(
         config_digest: identity.config_digest.as_deref(),
         profile: identity.profile.as_deref(),
         sensors,
-        ipc,
+        ipc: IpcLine {
+            probes_connected: ipc.probes_connected,
+            events_total: ipc.events_total,
+            dropped_total: ipc.dropped_total,
+            peers_rejected_total: ipc.peers_rejected_total,
+            decode_errors_total: ipc.decode_errors_total,
+            events_last_cycle: windows.last_cycle.ipc_events,
+            dropped_last_cycle: windows.last_cycle.ipc_dropped,
+            events_last_60s: windows.last_60s.ipc_events,
+            dropped_last_60s: windows.last_60s.ipc_dropped,
+        },
+        ring: RingLine {
+            overflow_samples_total: ring.overflow_samples_total,
+            overflow_events_total: ring.overflow_events_total,
+            overflow_samples_last_cycle: windows.last_cycle.ring_overflow_samples,
+            overflow_events_last_cycle: windows.last_cycle.ring_overflow_events,
+            overflow_samples_last_60s: windows.last_60s.ring_overflow_samples,
+            overflow_events_last_60s: windows.last_60s.ring_overflow_events,
+        },
+        windows: WindowLine {
+            last_cycle_ms: windows.last_cycle_ms,
+            last_60s_ms: windows.last_60s_ms,
+        },
+        spool: spool.map(|spool| SpoolLine::of(spool, windows)),
+        landlock: landlock.map(LandlockLine::of),
+        listener_history: listener_history.map(ListenerHistoryLine::of),
     };
     let mut encoded = serde_json::to_string_pretty(&document)?;
     encoded.push('\n');
@@ -271,8 +764,9 @@ pub fn default_path_for(findings_export: &Path) -> Option<PathBuf> {
         .map(|parent| parent.join(DEFAULT_HEALTH_FILE_NAME))
 }
 
-/// Temporary sibling `.<name>.tmp` used for the atomic replacement.
-fn temporary_path(path: &Path) -> Option<PathBuf> {
+/// Temporary sibling `.<name>.tmp` used for the atomic replacement (also by
+/// `crate::throttle` for its state file).
+pub(crate) fn temporary_path(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?;
     let mut temporary = OsString::from(".");
     temporary.push(name);
@@ -281,12 +775,25 @@ fn temporary_path(path: &Path) -> Option<PathBuf> {
 }
 
 /// Writes `bytes` to `path` atomically (temporary sibling, flush, rename).
-fn write_atomically(path: &Path, temporary: &Path, bytes: &[u8]) -> io::Result<()> {
+///
+/// # Description
+/// A target that exists but is not a regular file (symlink, directory) is
+/// refused; a leftover temporary is removed (never followed); the new file
+/// is created with `O_EXCL` and `mode`. Shared with `crate::throttle`.
+///
+/// # Errors
+/// Every I/O error of these steps; the temporary is removed on failure.
+pub(crate) fn write_atomically(
+    path: &Path,
+    temporary: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if !meta.file_type().is_file() => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "health export path exists but is not a regular file",
+                "atomic write target exists but is not a regular file",
             ));
         }
         Ok(_) => {}
@@ -305,8 +812,10 @@ fn write_atomically(path: &Path, temporary: &Path, bytes: &[u8]) -> io::Result<(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(HEALTH_FILE_MODE);
+        options.mode(mode);
     }
+    #[cfg(not(unix))]
+    let _ = mode; // Ohne Unix-Modusbits gibt es nichts zu setzen.
     let written = options.open(temporary).and_then(|mut file| {
         file.write_all(bytes)?;
         file.sync_data()
@@ -319,17 +828,122 @@ fn write_atomically(path: &Path, temporary: &Path, bytes: &[u8]) -> io::Result<(
     renamed
 }
 
+/// What [`read_regular_bounded`] found at a state path.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RegularRead {
+    /// Nothing exists at the path.
+    Missing,
+    /// The entry is not a regular file (symlink, directory, FIFO, socket,
+    /// ...); nothing of it was read.
+    NotRegularFile,
+    /// The regular file holds more than the limit (by its size, or by what
+    /// could be read if it grew after the size check).
+    TooLarge,
+    /// The complete content (at most the limit).
+    Bytes(Vec<u8>),
+}
+
+/// The outcome of opening a state path without following a symlink.
+enum Opened {
+    Missing,
+    NotRegularFile,
+    File(File),
+}
+
+/// Reads a state file (throttle state, listener history) of at most
+/// `limit` bytes without ever following a symlink.
+///
+/// # Description
+/// On Linux the path is opened with `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`
+/// (a symlink fails with `ELOOP`, a FIFO never blocks the open), and type
+/// and size are checked on the opened descriptor (`fstat`): an entry
+/// swapped in between a check and the open is never read (PL-100 review
+/// round 1). On other targets (non-Linux builds only) the type is checked
+/// with `symlink_metadata` right before the open, which leaves that
+/// window open. At most `limit + 1` bytes are read.
+///
+/// # Arguments
+/// - `path` (`&Path`): the state file.
+/// - `limit` (`u64`): the largest accepted size in bytes.
+///
+/// # Returns
+/// The [`RegularRead`] outcome.
+///
+/// # Errors
+/// Every other I/O error of the open, `fstat` or read.
+pub(crate) fn read_regular_bounded(path: &Path, limit: u64) -> io::Result<RegularRead> {
+    let file = match open_no_follow(path)? {
+        Opened::Missing => return Ok(RegularRead::Missing),
+        Opened::NotRegularFile => return Ok(RegularRead::NotRegularFile),
+        Opened::File(file) => file,
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Ok(RegularRead::NotRegularFile);
+    }
+    if meta.len() > limit {
+        return Ok(RegularRead::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Ok(RegularRead::TooLarge);
+    }
+    Ok(RegularRead::Bytes(bytes))
+}
+
+/// Opens `path` read-only with `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`.
+#[cfg(target_os = "linux")]
+fn open_no_follow(path: &Path) -> io::Result<Opened> {
+    use rustix::fs::{Mode, OFlags};
+    use rustix::io::Errno;
+
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => Ok(Opened::File(File::from(fd))),
+        Err(errno) if errno == Errno::NOENT => Ok(Opened::Missing),
+        // `ELOOP`: the final component is a symlink; `ENXIO`: a socket.
+        Err(errno) if errno == Errno::LOOP || errno == Errno::NXIO => Ok(Opened::NotRegularFile),
+        Err(errno) => Err(io::Error::from(errno)),
+    }
+}
+
+/// See the Linux version: the type is checked before the open.
+#[cfg(not(target_os = "linux"))]
+fn open_no_follow(path: &Path) -> io::Result<Opened> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => return Ok(Opened::NotRegularFile),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Opened::Missing),
+        Err(error) => return Err(error),
+    }
+    match File::open(path) {
+        Ok(file) => Ok(Opened::File(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Opened::Missing),
+        Err(error) => Err(error),
+    }
+}
+
 /// Atomic writer of the health document.
 ///
 /// # Description
 /// Holds the target path, the configuration identity reported in every
-/// document, the [`SensorTracker`], and counters for written and failed
-/// documents. See the module documentation for format and failure handling.
+/// document, the [`SensorTracker`], the optional counters of the finding
+/// spool writer, and counters for written and failed documents. See the
+/// module documentation for format and failure handling.
 #[derive(Debug)]
 pub struct HealthExporter {
     path: PathBuf,
     identity: ConfigIdentity,
     tracker: SensorTracker,
+    /// Per-cycle snapshots behind the windowed deltas.
+    windows: WindowTracker,
+    /// Counters of the finding spool writer (`spool`), if one runs.
+    spool: Option<Arc<SpoolStats>>,
+    /// The Landlock self-restriction (`landlock`, PL-100 WP0.7).
+    landlock: Option<LandlockReport>,
+    /// The listener history as of the latest cycle (`listener_history`).
+    listener_history: Option<ListenerHistoryHealth>,
     written: u64,
     failures: u64,
     /// Whether the previous write failed (rate-limits the warning).
@@ -344,10 +958,50 @@ impl HealthExporter {
             path,
             identity,
             tracker: SensorTracker::default(),
+            windows: WindowTracker::default(),
+            spool: None,
+            landlock: None,
+            listener_history: None,
             written: 0,
             failures: 0,
             failing: false,
         }
+    }
+
+    /// Reports the finding spool writer from now on (`spool` object, PL-100
+    /// WP0.12).
+    ///
+    /// # Arguments
+    /// - `stats` (`Arc<SpoolStats>`): the writer's shared counters
+    ///   (`crate::spool_writer::SpoolWriter::stats`).
+    #[must_use]
+    pub fn with_spool(mut self, stats: Arc<SpoolStats>) -> Self {
+        self.spool = Some(stats);
+        self
+    }
+
+    /// Reports the Landlock self-restriction from now on (`landlock`
+    /// object, PL-100 WP0.7).
+    ///
+    /// # Arguments
+    /// - `report` (`LandlockReport`): from
+    ///   `crate::sandbox::SandboxApplied::report`, taken once at startup.
+    #[must_use]
+    pub fn with_landlock(mut self, report: LandlockReport) -> Self {
+        self.landlock = Some(report);
+        self
+    }
+
+    /// Sets the listener history state the next document reports
+    /// (`listener_history` object, PL-100 WP1.6); `crate::poll_once` calls
+    /// it every cycle before [`Self::record_cycle`].
+    ///
+    /// # Arguments
+    /// - `health` (`Option<ListenerHistoryHealth>`): from
+    ///   `crate::findings::RuleCycle::listener_health`; `None` writes
+    ///   `"listener_history": null`.
+    pub fn note_listener_history(&mut self, health: Option<ListenerHistoryHealth>) {
+        self.listener_history = health;
     }
 
     /// Target path of the health document.
@@ -388,31 +1042,50 @@ impl HealthExporter {
     ///   [`SensorTracker::observe`]); `after` is also what the document
     ///   reports.
     /// - `ipc`: current receive-path counters.
-    /// - `now`: the cycle's timestamp, reported as `written_at`.
+    /// - `ring`: current evidence-ring overflow counters.
+    /// - `now`: the cycle's timestamp, reported as `written_at`; also the
+    ///   time base of the windowed deltas.
+    ///
+    /// The spool counters, if [`Self::with_spool`] was set, are read here
+    /// once per cycle.
     ///
     /// # Returns
     /// `true` if the document was replaced; `false` after a counted and
-    /// logged failure.
+    /// logged failure. The windowed deltas advance either way.
     pub fn record_cycle(
         &mut self,
         sink: &dyn TelemetrySink,
         before: &[(SensorId, SensorHealth)],
         after: &[(SensorId, SensorHealth)],
         ipc: IpcCounters,
+        ring: RingCounters,
         now: Timestamp,
     ) -> bool {
         self.tracker.observe(before, after, now);
-        let result = encode_document(&self.identity, after, &self.tracker, ipc, now)
-            .map_err(io::Error::other)
-            .and_then(|encoded| {
-                let temporary = temporary_path(&self.path).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "health export path has no file name",
-                    )
-                })?;
-                write_atomically(&self.path, &temporary, encoded.as_bytes())
-            });
+        let spool = self.spool.as_ref().map(|stats| stats.snapshot());
+        let mut current = HealthCounters::of(ipc, ring);
+        if let Some(spool) = spool.as_ref() {
+            current = current.with_spool(spool);
+        }
+        let windows = self.windows.record(now, current);
+        let result = encode_document(&DocumentInputs {
+            ipc,
+            ring,
+            spool: spool.as_ref(),
+            landlock: self.landlock,
+            listener_history: self.listener_history,
+            ..DocumentInputs::new(&self.identity, after, &self.tracker, &windows, now)
+        })
+        .map_err(io::Error::other)
+        .and_then(|encoded| {
+            let temporary = temporary_path(&self.path).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "health export path has no file name",
+                )
+            })?;
+            write_atomically(&self.path, &temporary, encoded.as_bytes(), HEALTH_FILE_MODE)
+        });
         match result {
             Ok(()) => {
                 self.written = self.written.saturating_add(1);
@@ -469,6 +1142,46 @@ mod tests {
         profile: Option<String>,
         sensors: Vec<Sensor>,
         ipc: Ipc,
+        ring: Ring,
+        windows: Windows,
+        spool: Option<Spool>,
+        landlock: Option<Landlock>,
+        listener_history: Option<ListenerHistory>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct Landlock {
+        outcome: String,
+        requested_abi: u8,
+        effective_abi: Option<u8>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct ListenerHistory {
+        state: String,
+        #[serde(default)]
+        degrade_reason: Option<String>,
+        keys: u64,
+        primed: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Spool {
+        state: String,
+        #[serde(default)]
+        degrade_reason: Option<String>,
+        enqueued_total: u64,
+        written_total: u64,
+        dropped_total: u64,
+        spool_full_total: u64,
+        too_large_total: u64,
+        failed_total: u64,
+        removed_total: u64,
+        dropped_last_60s: u64,
+        rejected_last_60s: u64,
     }
 
     #[derive(Debug, Deserialize)]
@@ -490,6 +1203,30 @@ mod tests {
         probes_connected: u64,
         events_total: u64,
         dropped_total: u64,
+        peers_rejected_total: u64,
+        decode_errors_total: u64,
+        events_last_cycle: u64,
+        dropped_last_cycle: u64,
+        events_last_60s: u64,
+        dropped_last_60s: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Ring {
+        overflow_samples_total: u64,
+        overflow_events_total: u64,
+        overflow_samples_last_cycle: u64,
+        overflow_events_last_cycle: u64,
+        overflow_samples_last_60s: u64,
+        overflow_events_last_60s: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Windows {
+        last_cycle_ms: Option<u64>,
+        last_60s_ms: Option<u64>,
     }
 
     fn at(secs: i64) -> TestResult<Timestamp> {
@@ -535,8 +1272,14 @@ mod tests {
             probes_connected: 1,
             events_total: 40,
             dropped_total: 2,
+            peers_rejected_total: 5,
+            decode_errors_total: 6,
         };
-        assert!(exporter.record_cycle(&NullSink, &before, &after, ipc, now));
+        let ring = RingCounters {
+            overflow_samples_total: 3,
+            overflow_events_total: 4,
+        };
+        assert!(exporter.record_cycle(&NullSink, &before, &after, ipc, ring, now));
         assert_eq!(exporter.written(), 1);
         assert_eq!(exporter.failures(), 0);
 
@@ -559,22 +1302,314 @@ mod tests {
         assert_eq!(document.ipc.probes_connected, 1);
         assert_eq!(document.ipc.events_total, 40);
         assert_eq!(document.ipc.dropped_total, 2);
+        assert_eq!(document.ipc.peers_rejected_total, 5);
+        assert_eq!(document.ipc.decode_errors_total, 6);
+        // Erster Zyklus: die Fenster reichen bis zum Prozessstart zurück.
+        assert_eq!(document.ipc.events_last_cycle, 40);
+        assert_eq!(document.ipc.dropped_last_cycle, 2);
+        assert_eq!(document.ipc.events_last_60s, 40);
+        assert_eq!(document.ipc.dropped_last_60s, 2);
+        assert_eq!(document.ring.overflow_samples_total, 3);
+        assert_eq!(document.ring.overflow_events_total, 4);
+        assert_eq!(document.ring.overflow_samples_last_cycle, 3);
+        assert_eq!(document.ring.overflow_events_last_cycle, 4);
+        assert_eq!(document.ring.overflow_samples_last_60s, 3);
+        assert_eq!(document.ring.overflow_events_last_60s, 4);
+        assert_eq!(document.windows.last_cycle_ms, None);
+        assert_eq!(document.windows.last_60s_ms, None);
+        assert!(document.spool.is_none(), "no spool configured");
+        Ok(())
+    }
+
+    /// PL-100 WP0.12: ein nicht geöffneter Spool erscheint als `degraded`.
+    #[test]
+    fn test_an_unavailable_spool_is_reported_degraded() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join(DEFAULT_HEALTH_FILE_NAME);
+        let writer = crate::spool_writer::SpoolWriter::unavailable();
+        let mut exporter = HealthExporter::new(path.clone(), identity()).with_spool(writer.stats());
+        assert!(exporter.record_cycle(
+            &NullSink,
+            &[],
+            &[],
+            IpcCounters::default(),
+            RingCounters::default(),
+            at(0)?,
+        ));
+        let spool = read_document(&path)?
+            .spool
+            .ok_or(TestError::Missing("spool object"))?;
+        assert_eq!(spool.state, "degraded");
+        assert_eq!(spool.degrade_reason.as_deref(), Some("unavailable"));
+        Ok(())
+    }
+
+    /// PL-100 WP0.12: ein abgewiesener Record (`RecordTooLarge`) macht den
+    /// Spool für ein Fenster `degraded`; danach ist er wieder `ok`.
+    #[test]
+    fn test_a_refused_record_degrades_the_spool_for_one_window() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spool_dir = dir.path().join(crate::spool_writer::SPOOL_DIR_NAME);
+        crate::spool_writer::prepare_spool_dir(&spool_dir).map_err(ctx("spool dir"))?;
+        let spool = harw_dod_sentinel::spool::FindingSpool::open_with_limits(
+            &spool_dir,
+            crate::spool_writer::sentinel_limits(),
+        )
+        .map_err(ctx("open spool"))?;
+        let writer = crate::spool_writer::SpoolWriter::spawn(spool, 4).map_err(ctx("spawn"))?;
+        let path = dir.path().join(DEFAULT_HEALTH_FILE_NAME);
+        let mut exporter = HealthExporter::new(path.clone(), identity()).with_spool(writer.stats());
+        writer.note_rejected(&harw_dod_sentinel::spool::SpoolError::RecordTooLarge {
+            len: 70_000,
+            limit: 65_536,
+        });
+
+        assert!(exporter.record_cycle(
+            &NullSink,
+            &[],
+            &[],
+            IpcCounters::default(),
+            RingCounters::default(),
+            at(0)?,
+        ));
+        let spool = read_document(&path)?
+            .spool
+            .ok_or(TestError::Missing("spool object"))?;
+        assert_eq!(spool.state, "degraded");
+        assert_eq!(spool.degrade_reason.as_deref(), Some("record_too_large"));
+        assert_eq!(
+            (
+                spool.enqueued_total,
+                spool.written_total,
+                spool.dropped_total,
+                spool.spool_full_total,
+                spool.too_large_total,
+                spool.failed_total,
+                spool.removed_total,
+            ),
+            (0, 0, 0, 0, 1, 0, 0)
+        );
+        assert_eq!((spool.dropped_last_60s, spool.rejected_last_60s), (0, 1));
+
+        assert!(exporter.record_cycle(
+            &NullSink,
+            &[],
+            &[],
+            IpcCounters::default(),
+            RingCounters::default(),
+            at(120)?,
+        ));
+        let later = read_document(&path)?
+            .spool
+            .ok_or(TestError::Missing("spool object"))?;
+        assert_eq!(later.state, "ok", "the refusal left the window");
+        assert_eq!(later.degrade_reason, None);
+        assert_eq!(later.too_large_total, 1, "cumulative counters stay");
+        assert_eq!(later.rejected_last_60s, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_spool_state_is_degraded_only_for_recent_or_current_failures() {
+        let quiet = WindowDeltas::default();
+        let refused_now = WindowDeltas {
+            last_60s: HealthCounters {
+                spool_rejected: 1,
+                ..HealthCounters::default()
+            },
+            ..WindowDeltas::default()
+        };
+        let dropped_now = WindowDeltas {
+            last_60s: HealthCounters {
+                spool_dropped: 2,
+                ..HealthCounters::default()
+            },
+            ..WindowDeltas::default()
+        };
+        let full = SpoolCounters {
+            spool_full_total: 1,
+            last_failure: Some(SpoolFailure::SpoolFull),
+            ..SpoolCounters::default()
+        };
+        assert_eq!(spool_state(&SpoolCounters::default(), &quiet), ("ok", None));
+        assert_eq!(
+            spool_state(&full, &refused_now),
+            ("degraded", Some("spool_full"))
+        );
+        assert_eq!(spool_state(&full, &quiet), ("ok", None), "aged out");
+        let still_failing = SpoolCounters {
+            last_put_failed: true,
+            ..full
+        };
+        assert_eq!(
+            spool_state(&still_failing, &quiet),
+            ("degraded", Some("spool_full"))
+        );
+        let overflow = SpoolCounters {
+            dropped_total: 2,
+            last_failure: Some(SpoolFailure::QueueOverflow),
+            ..SpoolCounters::default()
+        };
+        assert_eq!(
+            spool_state(&overflow, &dropped_now),
+            ("degraded", Some("queue_overflow"))
+        );
+        let gone = SpoolCounters {
+            unavailable: true,
+            last_failure: Some(SpoolFailure::QueueOverflow),
+            ..SpoolCounters::default()
+        };
+        assert_eq!(
+            spool_state(&gone, &quiet),
+            ("degraded", Some("unavailable"))
+        );
+    }
+
+    fn counters(dropped: u64, overflow_events: u64) -> (IpcCounters, RingCounters) {
+        (
+            IpcCounters {
+                probes_connected: 1,
+                events_total: dropped.saturating_mul(10),
+                dropped_total: dropped,
+                peers_rejected_total: 0,
+                decode_errors_total: 0,
+            },
+            RingCounters {
+                overflow_samples_total: 0,
+                overflow_events_total: overflow_events,
+            },
+        )
+    }
+
+    /// PL-100 WP0.13: Deltas des letzten Zyklus und der letzten 60 s neben
+    /// den kumulierten Zählern.
+    #[test]
+    fn test_windowed_deltas_cover_the_last_cycle_and_the_last_minute() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join(DEFAULT_HEALTH_FILE_NAME);
+        let mut exporter = HealthExporter::new(path.clone(), ConfigIdentity::default());
+        // (Sekunde, kumuliert verworfen, kumulierter Ring-Überlauf)
+        for (second, dropped, overflow) in [(100, 0, 0), (130, 4, 1), (160, 10, 1), (190, 12, 5)] {
+            let (ipc, ring) = counters(dropped, overflow);
+            assert!(exporter.record_cycle(&NullSink, &[], &[], ipc, ring, at(second)?));
+        }
+        let document = read_document(&path)?;
+        assert_eq!(document.ipc.dropped_total, 12, "cumulative counters stay");
+        assert_eq!(document.ipc.dropped_last_cycle, 2, "190 vs 160");
+        assert_eq!(document.ipc.dropped_last_60s, 8, "190 vs 130");
+        assert_eq!(document.ipc.events_last_cycle, 20);
+        assert_eq!(document.ipc.events_last_60s, 80);
+        assert_eq!(document.ring.overflow_events_total, 5);
+        assert_eq!(document.ring.overflow_events_last_cycle, 4);
+        assert_eq!(document.ring.overflow_events_last_60s, 4);
+        assert_eq!(document.ring.overflow_samples_last_60s, 0);
+        assert_eq!(document.windows.last_cycle_ms, Some(30_000));
+        assert_eq!(document.windows.last_60s_ms, Some(60_000));
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_young_process_reports_the_minute_since_start() -> TestResult {
+        let mut tracker = WindowTracker::default();
+        let first = tracker.record(
+            at(10)?,
+            HealthCounters {
+                ipc_dropped: 2,
+                ..HealthCounters::default()
+            },
+        );
+        assert_eq!(first.last_cycle.ipc_dropped, 2);
+        assert_eq!(first.last_cycle_ms, None);
+        let second = tracker.record(
+            at(15)?,
+            HealthCounters {
+                ipc_dropped: 3,
+                ..HealthCounters::default()
+            },
+        );
+        assert_eq!(second.last_cycle.ipc_dropped, 1);
+        assert_eq!(second.last_cycle_ms, Some(5_000));
+        assert_eq!(
+            second.last_60s.ipc_dropped, 3,
+            "younger than the window: everything since start"
+        );
+        assert_eq!(second.last_60s_ms, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_counters_going_backwards_yield_zero_not_a_wrap() -> TestResult {
+        let mut tracker = WindowTracker::default();
+        tracker.record(
+            at(10)?,
+            HealthCounters {
+                ipc_events: 50,
+                ..HealthCounters::default()
+            },
+        );
+        let after_reset = tracker.record(
+            at(15)?,
+            HealthCounters {
+                ipc_events: 5,
+                ..HealthCounters::default()
+            },
+        );
+        assert_eq!(after_reset.last_cycle.ipc_events, 0);
+        let back = tracker.record(at(1)?, HealthCounters::default());
+        assert_eq!(back.last_cycle_ms, None, "a clock jump back has no span");
+        Ok(())
+    }
+
+    #[test]
+    fn test_window_history_stays_bounded() -> TestResult {
+        let mut tracker = WindowTracker::default();
+        let mut last = WindowDeltas::default();
+        for millis in 0..6_000_i64 {
+            let now = Timestamp::from_millisecond(millis).map_err(ctx("timestamp"))?;
+            let total = u64::try_from(millis).map_err(ctx("non-negative"))?;
+            last = tracker.record(
+                now,
+                HealthCounters {
+                    ipc_events: total,
+                    ..HealthCounters::default()
+                },
+            );
+            assert!(tracker.history.len() <= MAX_WINDOW_SNAPSHOTS);
+        }
+        // Die gekappte Historie reicht nicht mehr eine ganze Minute zurück:
+        // gemeldet wird die tatsächlich abgedeckte Spanne.
+        let covered = u64::try_from(MAX_WINDOW_SNAPSHOTS).map_err(ctx("snapshot bound"))?;
+        assert_eq!(last.last_60s_ms, Some(covered));
+        assert_eq!(last.last_60s.ipc_events, covered);
         Ok(())
     }
 
     #[test]
     fn test_builtin_defaults_report_null_profile_and_digest() -> TestResult {
-        let encoded = encode_document(
+        let encoded = encode_document(&DocumentInputs::new(
             &ConfigIdentity::default(),
             &[],
             &SensorTracker::default(),
-            IpcCounters::default(),
+            &WindowDeltas::default(),
             Timestamp::UNIX_EPOCH,
-        )
+        ))
         .map_err(ctx("encode"))?;
         let value: serde_json::Value = serde_json::from_str(&encoded).map_err(ctx("parse"))?;
         assert!(value["config_digest"].is_null());
         assert!(value["profile"].is_null());
+        assert!(value["spool"].is_null(), "no spool is written as null");
+        assert!(
+            value
+                .get("landlock")
+                .is_some_and(serde_json::Value::is_null),
+            "no landlock report yet"
+        );
+        assert!(
+            value
+                .get("listener_history")
+                .is_some_and(serde_json::Value::is_null),
+            "no listener history"
+        );
         assert_eq!(value["sensors"], serde_json::json!([]));
         assert!(encoded.ends_with('\n'));
         Ok(())
@@ -592,6 +1627,7 @@ mod tests {
                 &snapshot,
                 &snapshot,
                 IpcCounters::default(),
+                RingCounters::default(),
                 at(second)?,
             ));
         }
@@ -620,6 +1656,7 @@ mod tests {
             &[],
             &[],
             IpcCounters::default(),
+            RingCounters::default(),
             Timestamp::UNIX_EPOCH
         ));
         let mode = fs::metadata(&path)
@@ -646,6 +1683,7 @@ mod tests {
             &[],
             &[],
             IpcCounters::default(),
+            RingCounters::default(),
             Timestamp::UNIX_EPOCH,
         );
         assert!(!ok);
@@ -675,6 +1713,7 @@ mod tests {
             &[],
             &[],
             IpcCounters::default(),
+            RingCounters::default(),
             Timestamp::UNIX_EPOCH
         ));
         assert_eq!(fs::read(&victim).map_err(ctx("read victim"))?, b"keep");
@@ -694,6 +1733,7 @@ mod tests {
                 &[],
                 &[],
                 IpcCounters::default(),
+                RingCounters::default(),
                 Timestamp::UNIX_EPOCH
             ));
         }
@@ -704,6 +1744,7 @@ mod tests {
             &[],
             &[],
             IpcCounters::default(),
+            RingCounters::default(),
             Timestamp::UNIX_EPOCH
         ));
         assert_eq!(exporter.written(), 1);
@@ -752,19 +1793,167 @@ mod tests {
         let gone = tracker.counters(3);
         assert_eq!((gone.readings_total, gone.errors_total), (0, 0));
 
-        let encoded = encode_document(
+        let encoded = encode_document(&DocumentInputs::new(
             &ConfigIdentity::default(),
             &after,
             &tracker,
-            IpcCounters::default(),
+            &WindowDeltas::default(),
             now,
-        )
+        ))
         .map_err(ctx("encode"))?;
         let value: serde_json::Value = serde_json::from_str(&encoded).map_err(ctx("parse"))?;
         assert_eq!(value["sensors"][0]["health"], "retrying");
         assert_eq!(value["sensors"][2]["degrade_reason"], "retries_exhausted");
         assert!(value["sensors"][0].get("degrade_reason").is_none());
         assert!(value["sensors"][0].get("last_ok_at").is_none());
+        Ok(())
+    }
+
+    /// PL-100 WP0.7: the Landlock outcome and both ABI levels reach the
+    /// document of every cycle (host verification).
+    #[test]
+    fn test_landlock_report_is_written_into_every_document() -> TestResult {
+        use crate::sandbox::{LandlockReport, SandboxOutcome};
+
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join(DEFAULT_HEALTH_FILE_NAME);
+        let mut exporter =
+            HealthExporter::new(path.clone(), identity()).with_landlock(LandlockReport {
+                outcome: SandboxOutcome::PartiallyEnforced,
+                requested_abi: 1,
+                effective_abi: Some(3),
+            });
+        for second in [10, 15] {
+            assert!(exporter.record_cycle(
+                &NullSink,
+                &[],
+                &[],
+                IpcCounters::default(),
+                RingCounters::default(),
+                at(second)?,
+            ));
+            let document = read_document(&path)?;
+            assert_eq!(
+                document.landlock,
+                Some(Landlock {
+                    outcome: "partially_enforced".to_owned(),
+                    requested_abi: 1,
+                    effective_abi: Some(3),
+                })
+            );
+        }
+
+        let mut degraded =
+            HealthExporter::new(path.clone(), identity()).with_landlock(LandlockReport {
+                outcome: SandboxOutcome::NotEnforced,
+                requested_abi: 1,
+                effective_abi: None,
+            });
+        assert!(degraded.record_cycle(
+            &NullSink,
+            &[],
+            &[],
+            IpcCounters::default(),
+            RingCounters::default(),
+            at(20)?,
+        ));
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).map_err(ctx("read health export"))?)
+                .map_err(ctx("parse health export"))?;
+        let landlock = value
+            .get("landlock")
+            .ok_or(TestError::Missing("landlock object"))?;
+        assert_eq!(
+            landlock.get("outcome").and_then(serde_json::Value::as_str),
+            Some("not_enforced")
+        );
+        assert!(
+            landlock
+                .get("effective_abi")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP1.6: the listener history state of the latest cycle is
+    /// reported; a discarded history stays `degraded` with its reason.
+    #[test]
+    fn test_listener_history_state_is_reported() -> TestResult {
+        use crate::listener_state::{ListenerHistoryHealth, LoadFailure};
+
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join(DEFAULT_HEALTH_FILE_NAME);
+        let mut exporter = HealthExporter::new(path.clone(), identity());
+        let mut cycle =
+            |health: Option<ListenerHistoryHealth>, second: i64| -> TestResult<Document> {
+                exporter.note_listener_history(health);
+                assert!(exporter.record_cycle(
+                    &NullSink,
+                    &[],
+                    &[],
+                    IpcCounters::default(),
+                    RingCounters::default(),
+                    at(second)?,
+                ));
+                read_document(&path)
+            };
+
+        let healthy = cycle(
+            Some(ListenerHistoryHealth {
+                load_failure: None,
+                write_failing: false,
+                keys: 12,
+                primed: true,
+            }),
+            10,
+        )?;
+        assert_eq!(
+            healthy.listener_history,
+            Some(ListenerHistory {
+                state: "ok".to_owned(),
+                degrade_reason: None,
+                keys: 12,
+                primed: true,
+            })
+        );
+
+        let discarded = cycle(
+            Some(ListenerHistoryHealth {
+                load_failure: Some(LoadFailure::TooLarge),
+                write_failing: true,
+                keys: 0,
+                primed: false,
+            }),
+            15,
+        )?;
+        assert_eq!(
+            discarded.listener_history,
+            Some(ListenerHistory {
+                state: "degraded".to_owned(),
+                degrade_reason: Some("state_too_large".to_owned()),
+                keys: 0,
+                primed: false,
+            })
+        );
+
+        let failing_write = cycle(
+            Some(ListenerHistoryHealth {
+                load_failure: None,
+                write_failing: true,
+                keys: 3,
+                primed: true,
+            }),
+            20,
+        )?;
+        assert_eq!(
+            failing_write
+                .listener_history
+                .and_then(|history| history.degrade_reason),
+            Some("write_failed".to_owned())
+        );
+
+        let without = cycle(None, 25)?;
+        assert_eq!(without.listener_history, None);
         Ok(())
     }
 
@@ -784,5 +1973,61 @@ mod tests {
             Some(PathBuf::from("/var/lib/harw-dod/export/.health.json.tmp"))
         );
         assert_eq!(temporary_path(Path::new("/")), None);
+    }
+
+    /// PL-100 review round 1: a state file is read only as a regular file
+    /// within the limit; a missing path, a directory, an oversized file and
+    /// a symlink (never followed) are told apart.
+    #[test]
+    fn test_read_regular_bounded_tells_the_outcomes_apart() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let file = dir.path().join("state.json");
+        fs::write(&file, b"{}").map_err(ctx("state"))?;
+        assert_eq!(
+            read_regular_bounded(&file, 2).map_err(ctx("read"))?,
+            RegularRead::Bytes(b"{}".to_vec())
+        );
+        assert_eq!(
+            read_regular_bounded(&file, 1).map_err(ctx("read"))?,
+            RegularRead::TooLarge
+        );
+        assert_eq!(
+            read_regular_bounded(&dir.path().join("missing.json"), 64).map_err(ctx("read"))?,
+            RegularRead::Missing
+        );
+        assert_eq!(
+            read_regular_bounded(dir.path(), 64).map_err(ctx("read"))?,
+            RegularRead::NotRegularFile
+        );
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.json");
+            std::os::unix::fs::symlink(&file, &link).map_err(ctx("symlink"))?;
+            assert_eq!(
+                read_regular_bounded(&link, 64).map_err(ctx("read"))?,
+                RegularRead::NotRegularFile
+            );
+        }
+        Ok(())
+    }
+
+    /// A FIFO at the state path never blocks the open (`O_NONBLOCK`) and is
+    /// refused after `fstat`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_read_regular_bounded_never_blocks_on_a_fifo() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let fifo = dir.path().join("state.json");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map_err(ctx("mkfifo"))?;
+        assert_eq!(
+            read_regular_bounded(&fifo, 64).map_err(ctx("read"))?,
+            RegularRead::NotRegularFile
+        );
+        Ok(())
     }
 }

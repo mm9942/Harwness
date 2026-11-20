@@ -48,6 +48,13 @@ const PAGE: isize = 10;
 /// Hilfetext des TUI-lokalen Unterbefehls `/dod view` (PL-97 D5).
 const DOD_VIEW_SUMMARY: &str = "Harw DoD view: units, sensors, recent findings (local, read-only)";
 
+/// Hilfetext des Unterbefehls `/dod model` (PL-100 WP 1.9).
+const DOD_MODEL_SUMMARY: &str =
+    "DoD triage model: show, set <provider>/<model>, clear (humans only)";
+
+/// Aufrufform von `/dod model` in der Hilfe.
+const DOD_MODEL_ARGS: &str = "[show | set <provider>/<model> | clear]";
+
 /// Fußzeile des Reiters „Befehle“.
 const FOOTER_COMMANDS: &str = "Tab: tab · j/k: select · Enter: prefill · Esc: close";
 
@@ -443,15 +450,24 @@ impl HelpOverlay {
         });
         commands.dedup_by(|left, right| left.name == right.name);
         // PL-97 D5: `/dod view` ist TUI-lokal (Harw-DoD-Ansicht) und steht
-        // deshalb nicht in den Unterbefehlen der `dod`-Operation.
-        if let Some(dod) = commands.iter_mut().find(|entry| entry.name == "dod")
-            && !dod.subcommands.iter().any(|(name, _, _)| name == "view")
-        {
-            dod.subcommands.push((
-                "view".to_owned(),
-                String::new(),
-                tr("help.dod_view", DOD_VIEW_SUMMARY).to_owned(),
-            ));
+        // deshalb nicht in den Unterbefehlen der `dod`-Operation. PL-100
+        // WP 1.9: `/dod model` (Triage-Modell, nur Menschen) wird ebenso
+        // genannt, weil die Operation keine Unterbefehls-Hinweise liefert.
+        if let Some(dod) = commands.iter_mut().find(|entry| entry.name == "dod") {
+            if !dod.subcommands.iter().any(|(name, _, _)| name == "view") {
+                dod.subcommands.push((
+                    "view".to_owned(),
+                    String::new(),
+                    tr("help.dod_view", DOD_VIEW_SUMMARY).to_owned(),
+                ));
+            }
+            if !dod.subcommands.iter().any(|(name, _, _)| name == "model") {
+                dod.subcommands.push((
+                    "model".to_owned(),
+                    DOD_MODEL_ARGS.to_owned(),
+                    tr("help.dod_model", DOD_MODEL_SUMMARY).to_owned(),
+                ));
+            }
         }
 
         let mut keys: Vec<(String, String)> = keys
@@ -875,6 +891,48 @@ mod tests {
                 .subcommands
                 .iter()
                 .any(|(name, _, summary)| name == "view" && summary == DOD_VIEW_SUMMARY)
+        );
+        assert!(entry.subcommands.iter().any(|(name, args, summary)| {
+            name == "model" && args == DOD_MODEL_ARGS && summary == DOD_MODEL_SUMMARY
+        }));
+        Ok(())
+    }
+
+    /// PL-100 WP 1.9: `/dod model` erscheint genau einmal, auch lokalisiert.
+    #[test]
+    fn dod_help_lists_the_model_subcommand_once_and_localized() -> TestResult {
+        let dod = CommandSpec::new(
+            "dod",
+            Vec::<String>::new(),
+            CommandScope::TuiOnly,
+            PermissionTier::Operator,
+            OutputSurface::Inline,
+            CommandDomain::Security,
+        )
+        .map_err(ctx("dod spec"))?
+        .with_help("Harw-DoD", "/dod [status]", &[]);
+        let help = crate::i18n::with_language(harw_config::UiLanguage::German, || {
+            HelpOverlay::new(
+                &CommandRegistry::new(vec![dod]),
+                &KeyBindings::default(),
+                HelpTab::Commands,
+            )
+        });
+        let entry = help
+            .commands
+            .iter()
+            .find(|entry| entry.name == "dod")
+            .ok_or(crate::test_support::TestError::Missing("dod entry"))?;
+        let models: Vec<_> = entry
+            .subcommands
+            .iter()
+            .filter(|(name, _, _)| name == "model")
+            .collect();
+        assert_eq!(models.len(), 1);
+        assert!(
+            models
+                .first()
+                .is_some_and(|(_, _, summary)| summary.contains("nur Menschen"))
         );
         Ok(())
     }

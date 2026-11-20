@@ -55,7 +55,7 @@
 use std::path::Path;
 
 use harw_dod_cap::ReadScope;
-use harw_dod_signals::{Actor, SecurityEvent};
+use harw_dod_signals::{Actor, ProcessContext, SecurityEvent};
 use harw_types::SensorId;
 use jiff::Timestamp;
 
@@ -72,8 +72,9 @@ use crate::raw::RawFsEvent;
 /// Ablauf: (1) das Dateideskriptor-Ziel deuten, (2) gegen `watch_scope`
 /// prüfen — liegt der Pfad außerhalb, wird das Ereignis verworfen
 /// (`Ok(None)`), (3) die Maske deuten, (4) die loginuid des Auslösers
-/// anreichern. Kein Schritt liest oder überträgt Dateiinhalt — nur Pfade und
-/// Zahlen.
+/// anreichern und seine pid als `Actor::process` übernehmen (PL-100
+/// WP0.15; `ProcessContext::from_pid`, eine `0` bleibt „unbekannt"). Kein
+/// Schritt liest oder überträgt Dateiinhalt — nur Pfade und Zahlen.
 ///
 /// # Arguments
 /// - `raw` (`&RawFsEvent`): das rohe Ereignis.
@@ -147,6 +148,7 @@ pub fn shape_event(
         uid: raw.uid,
         auid,
         cgroup: None,
+        process: ProcessContext::from_pid(raw.pid),
     };
 
     Ok(Some(SecurityEvent {
@@ -280,6 +282,31 @@ mod tests {
             .ok_or(TestError::Missing("Actor muss gesetzt sein"))?;
         assert_eq!(actor.uid, 1000);
         assert_eq!(actor.auid, Some(1000));
+        // PL-100 WP0.15: die fanotify-pid erreicht den Akteur.
+        assert_eq!(actor.process.map(|p| p.pid), Some(4242));
+        Ok(())
+    }
+
+    #[test]
+    fn test_shape_event_pid_zero_yields_no_process_context() -> TestResult {
+        let proc_root = tempfile::tempdir().map_err(ctx("proc-tempdir"))?;
+        let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
+        let mut raw = write_event("/srv/data/report.csv", 0x08);
+        raw.pid = 0;
+
+        let event = shape_event(
+            &raw,
+            &scope,
+            proc_root.path(),
+            &sensor(),
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("formbar"))?
+        .ok_or(TestError::Missing("im Bereich"))?;
+
+        let actor = event.actor.ok_or(TestError::Missing("Actor gesetzt"))?;
+        assert_eq!(actor.uid, 1000);
+        assert_eq!(actor.process, None);
         Ok(())
     }
 

@@ -5,10 +5,18 @@
 //! gemessene Wanduhrzeit (100 % = ein voller Kern, wie `top` im Irix-Modus);
 //! die Gesamtauslastung kommt aus der Differenz der `cpu`-Zeile von
 //! `/proc/stat`. Dazu Lastdurchschnitt, Taskzahlen nach Zustand und Speicher.
-//! Kommandozeilen sind maskiert.
+//!
+//! # Sicherheit
+//! - Kommandozeilen sind geschwärzt ([`crate::mask::redacted_command`]: Name
+//!   plus Argumentanzahl, nie `argv[0]` oder Argumentwerte), `name` ist escaped.
+//! - Umfang wie `sys.ps` ([`crate::scope`]): Prozessliste und Taskzahlen
+//!   umfassen standardmäßig nur die eigenen Prozesse; `scope = "all"` nur unter
+//!   Full Access. CPU-, Last- und Speicherwerte bleiben systemweit (wie
+//!   `sys.free`/`sys.uptime`).
 
-use crate::mask::masked_command;
+use crate::mask::{NAME_CHARS, redacted_command};
 use crate::procfs::{Clock, CpuTimes, ProcFs, ProcInfo};
+use crate::scope::{PsScope, ScopeFilter, ScopePolicy};
 use harw_tool_fsread::blocking::run_blocking;
 use harw_tool_fsread::budget::{Collector, choice, fail, limit_or, ok};
 use harw_tool_fsread::users::UserDb;
@@ -55,6 +63,9 @@ pub struct TopArgs {
         deserialize_with = "harw_extension_api::lenient::lenient_opt_u64"
     )]
     pub interval_ms: Option<u64>,
+    /// Which processes are listed and counted: 'own' (default; this session's processes) or 'all' (every process; only honoured in Full Access approval mode, otherwise an error).
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 fn round1(value: f64) -> f64 {
@@ -90,11 +101,52 @@ fn deltas(first: &[ProcInfo], second: Vec<ProcInfo>) -> Vec<Sampled> {
         .collect()
 }
 
-/// Führt `sys.top` gegen `procfs` aus. `sleep` wartet das Intervall ab
-/// (in Tests ersetzbar).
+/// Führt `sys.top` gegen `procfs` mit der Vorgabe-Politik aus (nur `own`).
+/// `sleep` wartet das Intervall ab (in Tests ersetzbar).
 #[must_use]
 pub fn run(procfs: &ProcFs, args: &TopArgs, sleep: impl FnOnce(Duration)) -> ToolOutput {
-    match build(procfs, args, sleep) {
+    run_with_policy(procfs, args, &ScopePolicy::own_only(), sleep)
+}
+
+/// Führt `sys.top` aus; das Argument `scope` wird gegen `policy` aufgelöst.
+///
+/// # Errors
+/// Als Fehler-`ToolOutput`: ungültige Argumente, `all` ohne Full Access oder
+/// ein unbestimmbarer eigener Umfang (fail closed).
+#[must_use]
+pub fn run_with_policy(
+    procfs: &ProcFs,
+    args: &TopArgs,
+    policy: &ScopePolicy,
+    sleep: impl FnOnce(Duration),
+) -> ToolOutput {
+    let result = policy.resolve(args.scope.as_deref()).and_then(|scope| {
+        let filter = ScopeFilter::resolve(procfs, scope, policy.extra_roots())?;
+        build(procfs, args, &filter, sleep)
+    });
+    match result {
+        Ok(output) => output,
+        Err(message) => fail(TOOL, message),
+    }
+}
+
+/// Führt `sys.top` mit einem vom Host-Code gewählten Umfang aus; das
+/// Argument `scope` wird nur auf Gültigkeit geprüft.
+///
+/// # Errors
+/// Als Fehler-`ToolOutput` wie [`run_with_policy`].
+#[must_use]
+pub fn run_scoped(
+    procfs: &ProcFs,
+    args: &TopArgs,
+    scope: PsScope,
+    sleep: impl FnOnce(Duration),
+) -> ToolOutput {
+    let result = PsScope::parse(args.scope.as_deref()).and_then(|_| {
+        let filter = ScopeFilter::resolve(procfs, scope, &[])?;
+        build(procfs, args, &filter, sleep)
+    });
+    match result {
         Ok(output) => output,
         Err(message) => fail(TOOL, message),
     }
@@ -103,6 +155,7 @@ pub fn run(procfs: &ProcFs, args: &TopArgs, sleep: impl FnOnce(Duration)) -> Too
 fn build(
     procfs: &ProcFs,
     args: &TopArgs,
+    filter: &ScopeFilter,
     sleep: impl FnOnce(Duration),
 ) -> Result<ToolOutput, String> {
     let sort = choice("sort", args.sort.as_deref(), &["cpu", "mem"], "cpu")?;
@@ -120,6 +173,8 @@ fn build(
     let cpu_before = procfs.cpu().map(|(times, _, cpus)| (times, cpus));
     sleep(Duration::from_millis(interval_ms));
     let (second, vanished) = procfs.processes(true);
+    // Umfang vor allem anderen: Taskzahlen und Liste nur aus dem Umfang.
+    let second = filter.retain(procfs, second);
     let cpu_after = procfs.cpu();
     let wall = started.elapsed().as_secs_f64().max(0.001);
 
@@ -193,6 +248,7 @@ fn build(
             },
             "truncated": truncated,
             "stopped": stopped,
+            "scope": filter.label(),
         }),
     ))
 }
@@ -205,11 +261,7 @@ fn entry(row: &Sampled, clock: &Clock, db: &UserDb, cpu: f64) -> Value {
     } else {
         0.0
     };
-    let command = if info.cmdline.is_empty() {
-        format!("[{}]", info.stat.comm)
-    } else {
-        masked_command(&info.cmdline, 256)
-    };
+    let command = redacted_command(&info.stat.comm, &info.cmdline);
     json!({
         "pid": info.stat.pid,
         "user": db.user_or_id(info.uid),
@@ -218,7 +270,7 @@ fn entry(row: &Sampled, clock: &Clock, db: &UserDb, cpu: f64) -> Value {
         "mem_percent": round1(mem_percent),
         "rss_kib": rss_kib,
         "threads": info.stat.threads,
-        "name": info.stat.comm,
+        "name": harw_untrusted_text::escape_line(&info.stat.comm, NAME_CHARS),
         "command": command,
     })
 }
@@ -245,14 +297,20 @@ fn cpu_summary(before: CpuTimes, after: CpuTimes, cpus: usize) -> Value {
 /// Zeigt die aktivsten Prozesse wie `top`.
 #[harw_macros::tool(
     name = "sys.top",
-    description = "Takes a top-like snapshot with a real measurement interval: busiest processes by cpu or mem (interval_ms 100-2000), overall CPU split, load average, task counts by state and memory. Use when you need to know what is using CPU or memory right now instead of running top. Returns JSON {processes:[{pid,user,cpu_percent,mem_percent,rss_kib,name,command}], cpu, load_average, tasks, memory}; 100% means one full core, command lines are masked. Read-only, Linux only.",
+    description = "Takes a top-like snapshot with a real measurement interval: busiest processes by cpu or mem (interval_ms 100-2000), overall CPU split, load average, task counts by state and memory. By default (scope='own') the process list and task counts cover only this session's processes; scope='all' covers every process but only in Full Access approval mode; CPU, load and memory figures are system-wide. Use when you need to know what is using CPU or memory right now instead of running top. Returns JSON {processes:[{pid,user,cpu_percent,mem_percent,rss_kib,name,command}], cpu, load_average, tasks, memory, scope}; 100% means one full core, command is redacted to the process name plus the argument count. Read-only, Linux only.",
     permission = "execute_process",
     parallel_safe,
-    skill = "sys-tools"
+    skill = "sys-tools",
+    state = ScopePolicy
 )]
-async fn sys_top(_context: &ToolExecutionContext, args: TopArgs) -> Result<ToolOutput, ToolsError> {
+async fn sys_top(
+    policy: &ScopePolicy,
+    _context: &ToolExecutionContext,
+    args: TopArgs,
+) -> Result<ToolOutput, ToolsError> {
+    let policy = policy.clone();
     run_blocking(TOOL, move || {
-        run(&ProcFs::real(), &args, std::thread::sleep)
+        run_with_policy(&ProcFs::real(), &args, &policy, std::thread::sleep)
     })
     .await
 }
@@ -282,6 +340,7 @@ mod tests {
         )?;
         fs::write(dir.join("status"), "Uid:\t0\t0\t0\t0\n")?;
         fs::write(dir.join("cmdline"), format!("{comm}\0--password=pw\0"))?;
+        fs::write(dir.join("cgroup"), "0::/user.slice/s1/app\n")?;
         Ok(())
     }
 
@@ -296,6 +355,8 @@ mod tests {
             root.join("stat"),
             "cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 100 0 100 800 0 0 0 0 0 0\nbtime 1700000000\n",
         )?;
+        fs::create_dir_all(root.join("self"))?;
+        fs::write(root.join("self").join("cgroup"), "0::/user.slice/s1\n")?;
         write_proc(root, 1, "idle", 'S', 10, 1)?;
         write_proc(root, 2, "busy", 'R', 100, 8)?;
         write_proc(root, 3, "fat", 'S', 10, 100)?;
@@ -364,10 +425,56 @@ mod tests {
         assert_eq!(value["processes"][1]["pid"], 2);
         let text = serde_json::to_string(&value)?;
         assert!(
-            !text.contains("=pw") && text.contains("--password=***"),
+            !text.contains("=pw") && !text.contains("--password"),
             "{text}"
         );
+        assert_eq!(value["processes"][0]["command"], "fat <redacted: 1 args>");
         assert_eq!(value["truncated"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_processes_are_neither_listed_nor_counted_by_default() -> TestResult {
+        use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
+
+        let dir = tempfile::tempdir()?;
+        base(dir.path())?;
+        write_proc(dir.path(), 9, "e\u{1b}vil\u{202e}", 'R', 500, 900)?;
+        fs::write(
+            dir.path().join("9").join("cgroup"),
+            "0::/system.slice/db.service\n",
+        )?;
+        let own = top(dir.path(), json!({"sort": "mem", "limit": 10}), |_| {})?;
+        assert_eq!(own["tasks"]["total"], 4);
+        assert_eq!(own["scope"], "own-cgroup");
+        let listed: Vec<i64> = own["processes"]
+            .as_array()
+            .map(|rows| rows.iter().filter_map(|row| row["pid"].as_i64()).collect())
+            .unwrap_or_default();
+        assert!(!listed.contains(&9), "{listed:?}");
+        // `all` nur unter Full Access.
+        let args: TopArgs =
+            serde_json::from_value(json!({"sort": "mem", "limit": 10, "scope": "all"}))?;
+        let procfs = ProcFs::at(dir.path());
+        assert!(error_of(run(&procfs, &args, |_| {}))?.contains("Full Access"));
+        let mode = ApprovalModeCell::new(ApprovalMode::FullAccess);
+        let policy = ScopePolicy::own_only().with_full_access_gate(mode);
+        let all = json_of(run_with_policy(&procfs, &args, &policy, |_| {}))?;
+        assert_eq!(all["tasks"]["total"], 5);
+        assert_eq!(all["scope"], "all");
+        let first = all["processes"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .ok_or(TestError::Missing("first row"))?;
+        assert_eq!(first["pid"], 9);
+        for field in ["name", "command"] {
+            let text = first[field].as_str().unwrap_or("");
+            assert!(
+                text.contains("\\u{001b}") && text.contains("\\u{202e}"),
+                "{text}"
+            );
+            assert!(!text.chars().any(|c| c == '\u{1b}' || c == '\u{202e}'));
+        }
         Ok(())
     }
 

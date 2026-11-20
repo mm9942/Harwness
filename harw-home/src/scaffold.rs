@@ -235,6 +235,11 @@ level = \"info\"
 provider = false
 model = false
 channel = false
+
+[dod.approve]
+# Freigabe im TTY der TUI: nur Freeze/Thaw, nie Kill/Isolation (PL-100 O12).
+# false verlangt Freigabe A oder B mit vertrauenswürdiger Anzeige.
+tui_tty = true
 ";
 
 /// Profil-`config.toml`: trägt den aktiven Provider/Model und lokale Overrides.
@@ -279,6 +284,41 @@ description = \"Default child-agent role, scaffolded automatically for immediate
 mod tests {
     use super::*;
     use crate::test_support::{TestResult, ctx};
+
+    #[test]
+    fn global_config_template_sets_dod_approve_tui_tty() -> TestResult {
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            dod: harw_config::DodSection,
+        }
+        assert!(GLOBAL_CONFIG_TEMPLATE.contains("[dod.approve]"));
+        let probe: Probe =
+            toml::from_str(GLOBAL_CONFIG_TEMPLATE).map_err(ctx("global template parses"))?;
+        assert!(probe.dod.approve.tui_tty);
+        // Der Serde-Default ist `true`: der Schlüssel muss ausdrücklich im
+        // Template stehen.
+        assert!(GLOBAL_CONFIG_TEMPLATE.contains("\ntui_tty = true\n"));
+        let table: toml::Table = toml::from_str(GLOBAL_CONFIG_TEMPLATE)
+            .map_err(ctx("global template parses as table"))?;
+        let explicit = table
+            .get("dod")
+            .and_then(|dod| dod.get("approve"))
+            .and_then(|approve| approve.get("tui_tty"))
+            .and_then(toml::Value::as_bool);
+        assert_eq!(explicit, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn scaffolded_home_needs_no_dod_backfill() -> TestResult {
+        let home =
+            std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
+        ensure_home_with_profile(&home, "foo").map_err(ctx("scaffold home"))?;
+        let written = harw_config::ensure_dod_defaults(&home).map_err(ctx("ensure dod"));
+        std::fs::remove_dir_all(&home).map_err(ctx("clean up"))?;
+        assert!(!written?);
+        Ok(())
+    }
 
     #[test]
     fn profile_config_template_guides_current_default_model() {

@@ -1524,8 +1524,22 @@ work packages above. Where they disagree with §3 or §4, this section wins.
 - B1 as built: the injected `skills.triggered` fragments and the injector's
   dedupe state live in the per-session turn state and in `injection` records
   of the session store. A durable supervisor (PL-90 §07 W3) that replays a
-  transcript after restart must restore both. Child sessions do not get a
-  `SkillInjector` today. That is a known gap for B2/D4, not a silent default.
+  transcript after restart must restore both. Since PL-100 WP 1.5,
+  in-process child sessions of roles with the skill catalog get a
+  `SkillInjector` too: the runtime child factory builds one per admission
+  (`RuntimeChildRegistryFactory::child_skill_injector`), and `admit_inner`
+  cuts its tool filter to the child's activation
+  (`SkillInjector::narrowed_to_callable` after `narrow_base_activation`)
+  before it attaches it. An abstract label such as `filesystem.write`
+  survives that cut only while one of the tools backing it stays enabled
+  (`ChildSessionObservers::skill_label_backing`). A recovered child is
+  admitted through the same path, and `hydrate_from_store` restores its
+  injector state. Limits: the roles in `SKILL_CATALOG_EXCLUDED_ROLES` (the
+  triage roles, `intel-scout`, `context-steward`, the matrix seats) and
+  custom agents built on them get none by design. A child run through a
+  `ChildBackend` job (`run_child_via_backend`) carries the injector on its
+  admitted session, but that session runs no turn, so the child gets no
+  triggered excerpts yet (§9.2).
 
 ### 8.2 Execution chain (E1, E2, E3, E5)
 - **E1/E2, per-job write scope.** Add an optional, versioned per-job write
@@ -1701,7 +1715,10 @@ carry no content of their own and are not listed.
   conflicts with PR #153's "no silent services" policy and is still open.
 - **M2:** `permission_request!` has no consumption point in the operation
   framework yet ("landed, call site open").
-- **§8.1:** child sessions get no `SkillInjector`.
+- **§8.1, partly closed by PL-100 WP 1.5:** in-process child sessions of
+  roles with the skill catalog get a `SkillInjector` (see §8.1). Still open:
+  a child run through a `ChildBackend` job gets no triggered excerpts. The
+  roles in `SKILL_CATALOG_EXCLUDED_ROLES` get none by design.
 - **§8.3:** the `x` stop dispatches `/jobs stop <id>` for managed jobs; a
   durable-job stop under `JobMutationScope` from the Jobs window is not
   built; whether durable `harw-job-store` jobs get their own origin or

@@ -39,11 +39,25 @@ pub(crate) struct JobRow {
     /// PL-97 C4: typed state of the job; the display label comes from
     /// [`Self::state_label`] (never compare localized labels).
     pub state: JobState,
+    /// PL-100 WP 3.5: the job's cgroup is frozen
+    /// ([`harw_tool_job::JobMeta::is_suspended`]): a `Suspended` job of this
+    /// session **or** a `Detached` one from an earlier session that stayed
+    /// frozen. Only the display label uses it ([`Self::state_label`] shows
+    /// `mission.suspended`); `state` stays the typed manager state, so stop
+    /// and selection logic are unchanged (THREAT-MODEL B13: a freeze stays
+    /// visible).
+    pub suspended: bool,
+    /// PL-100 WP 3.5: the freeze is only recorded as intent
+    /// ([`harw_tool_job::JobMeta::is_suspension_unresolved`]): harw cannot
+    /// prove that the cgroup's freeze is its own, so `job.resume` refuses and
+    /// the operator must resolve it by hand. [`Self::state_label`] shows
+    /// `mission.suspension_unresolved` instead of `mission.suspended`.
+    pub suspension_unresolved: bool,
     /// Erkannter Fortschritt (`ninja 120/900 13%`) oder `—`.
     pub progress: String,
     /// Laufzeit (`1m15s`) oder `—`.
     pub runtime: String,
-    /// Noch nicht beendet (wartet, läuft, abgelöst).
+    /// Noch nicht beendet (wartet, läuft, angehalten, abgelöst).
     pub active: bool,
     /// Fehlgeschlagen oder mit unbekanntem Ausgang.
     pub failed: bool,
@@ -114,6 +128,8 @@ impl JobRow {
             id: status.meta.job_id.to_string(),
             name: sanitize_inline(&status.meta.name),
             state,
+            suspended: status.meta.is_suspended(),
+            suspension_unresolved: status.meta.is_suspension_unresolved(),
             progress: sanitize_inline(&harw_ops::jobs::progress_label(status)),
             runtime: harw_ops::jobs::runtime_label(status),
             active: !state.is_terminal(),
@@ -127,10 +143,18 @@ impl JobRow {
         }
     }
 
-    /// Kurzer, lokalisierter Zustand (`läuft`, `fertig`, …) zur Anzeige.
+    /// Kurzer, lokalisierter Zustand (`läuft`, `fertig`, …) zur Anzeige; ein
+    /// eingefrorener Job heißt immer `angehalten`/`suspended`, auch wenn er
+    /// abgelöst ist ([`Self::suspended`]).
     #[must_use]
     pub(crate) fn state_label(&self) -> &'static str {
-        job_state_label(self.state)
+        if self.suspension_unresolved {
+            crate::i18n::tr("mission.suspension_unresolved", "suspended (unresolved)")
+        } else if self.suspended {
+            job_state_label(JobState::Suspended)
+        } else {
+            job_state_label(self.state)
+        }
     }
 
     /// Session id of the child agent run this job backs, if it is a
@@ -202,6 +226,7 @@ pub(crate) fn job_state_label(state: JobState) -> &'static str {
     match state {
         JobState::Queued => crate::i18n::tr("mission.queued", "queued"),
         JobState::Running => crate::i18n::tr("mission.running", "running"),
+        JobState::Suspended => crate::i18n::tr("mission.suspended", "suspended"),
         JobState::Succeeded => crate::i18n::tr("mission.succeeded", "succeeded"),
         JobState::Failed => crate::i18n::tr("agents.failed", "failed"),
         JobState::Stopped => crate::i18n::tr("mission.stopped", "stopped"),
@@ -334,9 +359,21 @@ impl harw_ops::dod::JobCgroup for JobRow {
     }
 }
 
+/// PL-100 WP 3.5: Symbol einer Zeile mit ungeklärtem Anhalten
+/// ([`JobRow::suspension_unresolved`]); eine Spalte breit (`unicode-width`,
+/// East-Asian-Width `N`), im Warnstil.
+const UNRESOLVED_GLYPH: &str = "⚠";
+
 /// Symbol und Stil eines Jobs.
+///
+/// Ein ungeklärtes Anhalten hat ein eigenes Symbol im Warnstil
+/// ([`UNRESOLVED_GLYPH`]): so trägt schon das Präfix der Zeile den Zustand,
+/// auch wenn rechts kein Platz für ihn bleibt. Alle anderen Jobs behalten
+/// `⚙` (aktiv), `✗` (fehlgeschlagen) bzw. `✓`.
 fn job_glyph(row: &JobRow, theme: Theme) -> (&'static str, Style) {
-    if row.active {
+    if row.suspension_unresolved {
+        (UNRESOLVED_GLYPH, style::warning_style(theme))
+    } else if row.active {
         ("⚙", style::tool_style(theme))
     } else if row.failed {
         ("✗", style::error_style(theme))
@@ -352,6 +389,16 @@ fn job_glyph(row: &JobRow, theme: Theme) -> (&'static str, Style) {
 /// rechtsbündig Zustand und Laufzeit. Reicht der Platz nicht, entfallen
 /// zuerst Fortschritt, dann Laufzeit, dann Zustand; der Name wird zuletzt
 /// mit `…` gekürzt.
+///
+/// Ausnahme (PL-100 WP 3.5): ein ungeklärtes Anhalten
+/// ([`JobRow::suspension_unresolved`]) verschwindet nie. Passt
+/// `mission.suspension_unresolved` nicht, steht rechts die kompakte Marke
+/// `mission.suspension_unresolved_short` (`⏸?`); der Fortschritt entfällt
+/// dann (er weicht vor dem Zustand), und der Name wird für die Marke bis auf
+/// `…` oder nichts gekürzt. Zusätzlich trägt das Präfix das Warnsymbol `⚠`.
+/// Mindestbreiten: das Symbol ab 3 Spalten (Auswahlmarker, Symbol,
+/// Leerzeichen), die kompakte Marke ohne DoD-Marke ab 5 Spalten (Präfix 3 +
+/// Marke 2); mit DoD-Marke kommt deren Breite (`⛨ n `) hinzu.
 #[must_use]
 pub(crate) fn job_line(row: &JobRow, selected: bool, width: usize, theme: Theme) -> Line<'static> {
     job_line_with_badge(row, selected, width, theme, None)
@@ -379,12 +426,17 @@ pub(crate) fn job_line_with_badge(
     let name_width = display_width(&row.name);
     let full_right = format!(" {} {}", row.state_label(), row.runtime);
     let short_right = format!(" {}", row.state_label());
-    let right = if name_width.min(8) + display_width(&full_right) <= available {
-        full_right
-    } else if name_width.min(8) + display_width(&short_right) <= available {
-        short_right
+    let name_reserve = name_width.min(8);
+    // `compact`: statt des Labels steht die kompakte Marke (PL-100 WP 3.5).
+    let (right, compact) = if name_reserve.saturating_add(display_width(&full_right)) <= available {
+        (full_right, false)
+    } else if name_reserve.saturating_add(display_width(&short_right)) <= available {
+        (short_right, false)
+    } else if row.suspension_unresolved {
+        // Die kompakte Marke hat Vorrang vor dem Namen.
+        (unresolved_marker(available), true)
     } else {
-        String::new()
+        (String::new(), false)
     };
     let right_width = display_width(&right);
     let name = fit_width(&row.name, available.saturating_sub(right_width));
@@ -399,7 +451,10 @@ pub(crate) fn job_line_with_badge(
         (Some(reason), true) => (reason.as_str(), style::error_style(theme)),
         _ => (row.progress.as_str(), style::dim_style(theme)),
     };
-    let progress = if detail != "—" && !detail.is_empty() && progress_room >= 6 {
+    // Ist der Zustand schon auf die kompakte Marke gekürzt, entfällt der
+    // Fortschritt ganz: er weicht vor dem Zustand, sein Platz gehört dem
+    // Namen.
+    let progress = if !compact && detail != "—" && !detail.is_empty() && progress_room >= 6 {
         fit_width(&format!(" · {detail}"), progress_room)
     } else {
         String::new()
@@ -421,6 +476,29 @@ pub(crate) fn job_line_with_badge(
         Span::styled(right, glyph_style),
     ]);
     clip(line, width)
+}
+
+/// PL-100 WP 3.5: rechte Seite einer Zeile mit ungeklärtem Anhalten, wenn
+/// `mission.suspension_unresolved` nicht neben den Namen passt.
+///
+/// # Arguments
+/// - `available`: Spalten nach dem Präfix (Auswahlmarker, Symbol, DoD-Marke).
+///
+/// # Returns
+/// Die lokalisierte kompakte Marke `mission.suspension_unresolved_short`
+/// mit führendem Leerzeichen, wenn beides passt; sonst ohne Leerzeichen
+/// (der Name entfällt dann ganz); passt auch das nicht, leer: dann trägt nur
+/// noch das Symbol des Präfixes ([`UNRESOLVED_GLYPH`]) den Zustand.
+fn unresolved_marker(available: usize) -> String {
+    let short = crate::i18n::tr("mission.suspension_unresolved_short", "⏸?");
+    let spaced = format!(" {short}");
+    if display_width(&spaced) <= available {
+        spaced
+    } else if display_width(short) <= available {
+        short.to_owned()
+    } else {
+        String::new()
+    }
 }
 
 /// Sammelzeile beendeter Jobs: `✓ 4 Jobs beendet ▸ · 1 fehlgeschlagen`.
@@ -699,8 +777,120 @@ impl JobDetail {
     }
 }
 
+/// PL-100 WP 3.5: Zustandszeilen der Detailansicht.
+///
+/// # Description
+/// Der Rahmentitel nennt den Zustand erst hinter dem Namen, und schmale
+/// Breiten schneiden ihn dort ab. Darum steht er ausdrücklich in der Ansicht
+/// (`mission.detail_state`, `State: …`): fest über dem scrollenden Körper,
+/// soweit er dort hinpasst ([`pin_detail_state`]), sonst im Körper direkt
+/// unter der fetten Kennungszeile; beides bricht um. Bei einem ungeklärten
+/// Anhalten ([`JobRow::suspension_unresolved`]) stehen Zustand und Hinweis
+/// (`mission.suspension_unresolved_hint`: `job.resume` lehnt ab; von Hand
+/// klären mit `job.stop` oder erneutem `job.suspend`, nur solange die cgroup
+/// nicht eingefroren ist) im Warnstil.
+///
+/// # Returns
+/// Eine Zeile (`State: …`), bei einem ungeklärten Anhalten zwei.
+fn detail_state_lines(row: &JobRow, theme: Theme) -> Vec<Line<'static>> {
+    let state = crate::i18n::tr_args(
+        "mission.detail_state",
+        "State: {p0}",
+        &[("p0", row.state_label())],
+    );
+    if !row.suspension_unresolved {
+        return vec![Line::raw(state)];
+    }
+    let warning = style::warning_style(theme);
+    vec![
+        Line::styled(state, warning.add_modifier(Modifier::BOLD)),
+        Line::styled(
+            crate::i18n::tr(
+                "mission.suspension_unresolved_hint",
+                "job.resume refuses. Resolve by hand: job.stop (kills without thawing), or re-issue job.suspend only while the cgroup is not frozen.",
+            ),
+            warning,
+        ),
+    ]
+}
+
+/// PL-100 WP 3.5: Aufteilung der Zustandszeilen ([`detail_state_lines`])
+/// zwischen festem Kopf und scrollendem Körper der Detailansicht.
+#[derive(Debug)]
+struct PinnedState {
+    /// Zeilen fest über dem Körper; sie scrollen nicht mit.
+    pinned: Vec<Line<'static>>,
+    /// Umgebrochene Höhe von `pinned` (Zeilen).
+    rows: u16,
+    /// Zeilen, die nicht mehr in den Kopf passen; sie stehen im Körper
+    /// direkt unter der fetten Kennungszeile und sind per Scrollen
+    /// erreichbar.
+    rest: Vec<Line<'static>>,
+}
+
+/// PL-100 WP 3.5 (Review 4505485685): hält den Zustand beim Öffnen sichtbar.
+///
+/// # Description
+/// Die Detailansicht öffnet am Log-Ende (sie folgt neuem Inhalt); eine
+/// Zustandszeile im Körper stünde bei schmalen Breiten erst nach `Home`/`g`
+/// im Bild. Darum steht der längste Anfang von `lines`, dessen umgebrochene
+/// Höhe in die obere Hälfte passt (`height - height / 2` Zeilen, also
+/// aufgerundet, höchstens aber `height - 1`), fest über dem Körper. So bleibt
+/// dem scrollenden Körper (Kennung, Kopf, Log) immer mindestens eine Zeile,
+/// auch in der einzeiligen Innenfläche des Agentenbereichs (`AGENTS_MIN_ROWS`
+/// in `panes.rs`). Der Rest folgt im Körper, etwa der lange Hinweis eines
+/// ungeklärten Anhaltens im Hochformat. Passt nicht einmal die erste Zeile,
+/// bleibt alles im Körper; bei einem ungeklärten Anhalten trägt dann der
+/// Rahmentitel vorn das Warnsymbol ([`UNRESOLVED_GLYPH`]), sonst nennt den
+/// Zustand nur der (womöglich hinten abgeschnittene) Titel.
+///
+/// # Arguments
+/// - `lines`: die Zustandszeilen, wichtigste zuerst.
+/// - `width`, `height`: Innenmaße der Ansicht (ohne Rahmen).
+///
+/// # Returns
+/// Feste Zeilen samt umgebrochener Höhe und die Zeilen für den Körper; bei
+/// `height <= 1` steht nichts fest.
+fn pin_detail_state(lines: Vec<Line<'static>>, width: u16, height: u16) -> PinnedState {
+    // Aufgerundete Hälfte, aber eine Zeile bleibt immer dem Körper.
+    let cap = height
+        .saturating_sub(height / 2)
+        .min(height.saturating_sub(1));
+    for count in (1..=lines.len()).rev() {
+        let Some(head) = lines.get(..count) else {
+            continue;
+        };
+        let rows = Paragraph::new(head.to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        if let Some(rows) = u16::try_from(rows).ok().filter(|rows| *rows <= cap) {
+            let mut lines = lines.into_iter();
+            let pinned = lines.by_ref().take(count).collect();
+            return PinnedState {
+                pinned,
+                rows,
+                rest: lines.collect(),
+            };
+        }
+    }
+    PinnedState {
+        pinned: Vec::new(),
+        rows: 0,
+        rest: lines,
+    }
+}
+
 /// Zeichnet die Detailansicht eines Jobs: Kopf, darunter das Log-Ende
 /// (stdout, dann stderr), scrollbar wie die Agenten-Detailansicht.
+///
+/// PL-100 WP 3.5 (Review 4505485685): der Zustand ([`detail_state_lines`])
+/// steht fest über dem scrollenden Körper, soweit er in dessen obere Hälfte
+/// passt und dem Körper eine Zeile lässt ([`pin_detail_state`]); so ist er
+/// schon beim Öffnen (am Log-Ende) zu sehen. Was dort nicht passt, steht im
+/// Körper direkt unter der fetten Kennungszeile und ist per Scrollen
+/// (`Home`/`g`) erreichbar. Bei einem ungeklärten Anhalten beginnt zudem der
+/// Rahmentitel mit dem Warnsymbol [`UNRESOLVED_GLYPH`], denn schmale Breiten
+/// schneiden den Titel hinten ab.
 pub(crate) fn render_job_detail(
     detail: Option<&JobDetail>,
     area: Rect,
@@ -721,22 +911,53 @@ pub(crate) fn render_job_detail(
         .render(area, buf);
         return;
     };
+    let title = crate::i18n::tr_args(
+        "mission.detail_title",
+        " Job · {p0} · {p1} · {p2} · Esc back ",
+        &[
+            ("p0", &(detail.row.name).to_string()),
+            ("p1", detail.row.state_label()),
+            ("p2", &(detail.row.runtime).to_string()),
+        ],
+    );
+    // PL-100 WP 3.5: das Warnsymbol steht vor dem Titel, den schmale
+    // Breiten hinten abschneiden.
+    let title = if detail.row.suspension_unresolved {
+        Line::from(vec![
+            Span::styled(format!(" {UNRESOLVED_GLYPH}"), style::warning_style(theme)),
+            Span::raw(title),
+        ])
+    } else {
+        Line::raw(title)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(crate::i18n::tr_args(
-            "mission.detail_title",
-            " Job · {p0} · {p1} · {p2} · Esc back ",
-            &[
-                ("p0", &(detail.row.name).to_string()),
-                ("p1", detail.row.state_label()),
-                ("p2", &(detail.row.runtime).to_string()),
-            ],
-        ));
+        .title(title);
     let inner = block.inner(area);
     block.render(area, buf);
     if inner.width == 0 || inner.height == 0 {
         return;
+    }
+    // PL-100 WP 3.5: der Zustand steht fest über dem Körper, soweit er passt.
+    let state = pin_detail_state(
+        detail_state_lines(&detail.row, theme),
+        inner.width,
+        inner.height,
+    );
+    let pinned_area = Rect {
+        height: state.rows,
+        ..inner
+    };
+    let body_area = Rect {
+        y: inner.y.saturating_add(state.rows),
+        height: inner.height.saturating_sub(state.rows),
+        ..inner
+    };
+    if state.rows > 0 {
+        Paragraph::new(state.pinned)
+            .wrap(Wrap { trim: false })
+            .render(pinned_area, buf);
     }
     let dim = style::dim_style(theme);
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -751,6 +972,7 @@ pub(crate) fn render_job_detail(
         ),
         Style::default().add_modifier(Modifier::BOLD),
     ));
+    lines.extend(state.rest);
     lines.extend(
         detail
             .header_source
@@ -779,13 +1001,13 @@ pub(crate) fn render_job_detail(
         );
     }
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let total = paragraph.line_count(inner.width);
-    let viewport = usize::from(inner.height);
-    let back = scroll.sync_layout(total, viewport, inner.width);
+    let total = paragraph.line_count(body_area.width);
+    let viewport = usize::from(body_area.height);
+    let back = scroll.sync_layout(total, viewport, body_area.width);
     let top = total.saturating_sub(viewport).saturating_sub(back);
     paragraph
         .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
-        .render(inner, buf);
+        .render(body_area, buf);
 }
 
 #[cfg(test)]
@@ -798,6 +1020,8 @@ mod tests {
             id: "job-20260924-101112-001".to_owned(),
             name: name.to_owned(),
             state,
+            suspended: state == JobState::Suspended,
+            suspension_unresolved: false,
             progress: "ninja 120/900 13%".to_owned(),
             runtime: "12m03s".to_owned(),
             active,
@@ -1104,6 +1328,674 @@ mod tests {
         Ok(())
     }
 
+    /// PL-100 WP 3.5: ein angehaltener Job (`suspended`) bleibt eine aktive,
+    /// nicht fehlgeschlagene Zeile und zeigt seinen eigenen, lokalisierten
+    /// Zustand (`angehalten` auf Deutsch, Englisch außerhalb einer Sprache).
+    #[test]
+    fn suspended_job_row_is_active_with_its_own_label() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        assert_eq!(job_state_label(JobState::Suspended), "suspended");
+        assert_eq!(
+            with_language(UiLanguage::German, || job_state_label(JobState::Suspended)),
+            "angehalten"
+        );
+        assert_ne!(
+            job_state_label(JobState::Suspended),
+            job_state_label(JobState::Running)
+        );
+
+        let suspended = status_of(
+            &meta_json(
+                "suspended",
+                r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z","suspend_phase":"applied","#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        let row = JobRow::from_status(&suspended);
+        assert_eq!(row.state, JobState::Suspended);
+        assert!(row.active && !row.failed, "{row:?}");
+        assert_eq!(row.reason, None);
+        assert!(row.is_listed());
+        let line = job_line(&row, false, 120, Theme::Dark);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("suspended"), "{text}");
+        assert!(text.contains('⚙'), "aktives Symbol: {text}");
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5 (THREAT-MODEL B13): ein abgelöster Job, dessen cgroup
+    /// noch eingefroren ist (`detached` mit `suspended_at`, nach `detach_all`
+    /// bzw. einem Neustart), zeigt `suspended` statt `detached`; sein Zustand
+    /// bleibt typisiert `Detached`. Ohne Vermerk bleibt er `detached`.
+    #[test]
+    fn frozen_detached_job_row_is_labelled_suspended() -> TestResult {
+        let frozen = status_of(
+            &meta_json(
+                "detached",
+                r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z","suspend_phase":"applied","#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        let row = JobRow::from_status(&frozen);
+        assert_eq!(row.state, JobState::Detached);
+        assert!(row.suspended && row.active && !row.failed, "{row:?}");
+        assert!(!row.suspension_unresolved, "{row:?}");
+        assert_eq!(row.state_label(), job_state_label(JobState::Suspended));
+        let line = job_line(&row, false, 120, Theme::Dark);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("suspended"), "{text}");
+        assert!(!text.contains("detached"), "{text}");
+
+        let detached = status_of(
+            &meta_json(
+                "detached",
+                r#""started_at":"2026-01-01T00:00:01Z","#,
+                r#"{"session":"uia"}"#,
+            ),
+            &[],
+        )?;
+        let row = JobRow::from_status(&detached);
+        assert!(!row.suspended, "{row:?}");
+        assert_eq!(row.state_label(), job_state_label(JobState::Detached));
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5: ein Anhalten, von dem nur die Absicht vermerkt ist
+    /// (oder ein alter Datensatz ohne Phase), heißt `suspended (unresolved)`
+    /// und nie schlicht `suspended`: `job.resume` lehnt es ab, bis der
+    /// Operator es von Hand klärt.
+    #[test]
+    fn unresolved_suspension_has_its_own_label() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        for phase in [r#""suspend_phase":"intent","#, ""] {
+            let fields = format!(
+                r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z",{phase}"#
+            );
+            let unresolved = status_of(
+                &meta_json("suspended", &fields, r#"{"session":"uia"}"#),
+                &[],
+            )?;
+            let row = JobRow::from_status(&unresolved);
+            assert!(row.suspended && row.suspension_unresolved, "{row:?}");
+            assert!(row.active && !row.failed, "{row:?}");
+            assert_eq!(row.state_label(), "suspended (unresolved)");
+            assert_ne!(row.state_label(), job_state_label(JobState::Suspended));
+            assert_eq!(
+                with_language(UiLanguage::German, || row.state_label()),
+                "angehalten (ungeklärt)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Felder eines Anhaltens, von dem nur die Absicht vermerkt ist.
+    const INTENT_FIELDS: &str = r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z","suspend_phase":"intent","#;
+
+    /// Felder eines Anhaltens, das harw selbst gesetzt und vermerkt hat.
+    const APPLIED_FIELDS: &str = r#""started_at":"2026-01-01T00:00:01Z","suspended_at":"2026-01-01T00:00:03Z","suspend_phase":"applied","#;
+
+    /// Sichtbarer Text einer Panelzeile.
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Wörter von `text`, mit einfachen Leerzeichen verbunden.
+    fn words(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Zeilen im Inneren eines gezeichneten Puffers (ohne Rahmen und Titel),
+    /// ohne Leerzeichen am Ende.
+    fn inner_rows(buf: &Buffer) -> Vec<String> {
+        let height = usize::from(buf.area().height);
+        crate::test_support::display_buffer_text(buf)
+            .lines()
+            .skip(1)
+            .take(height.saturating_sub(2))
+            .map(|row| row.trim_matches('│').trim_end().to_owned())
+            .collect()
+    }
+
+    /// Wörter im Inneren eines gezeichneten Puffers (ohne Rahmen und
+    /// Titel). Der Wortumbruch trennt nur an Leerzeichen, umbrochene Zeilen
+    /// fügen sich so wieder zum Ausgangstext zusammen.
+    fn inner_words(buf: &Buffer) -> String {
+        words(&inner_rows(buf).join(" "))
+    }
+
+    /// Fette Kennungszeile der Detailansicht (`mission.progress`), wie
+    /// `render_job_detail` sie setzt.
+    fn progress_text(row: &JobRow) -> String {
+        crate::i18n::tr_args(
+            "mission.progress",
+            "{p0} · Progress: {p1}",
+            &[("p0", row.id.as_str()), ("p1", row.progress.as_str())],
+        )
+    }
+
+    /// Zeichnet `detail` in `width`×`height` Zellen, springt wie `Home` an den
+    /// Anfang und liefert die Zeilen im Inneren (fester Kopf und Körper).
+    fn inner_rows_from_top(detail: &JobDetail, width: u16, height: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, width, height);
+        let mut scroll = ChatScroll::new();
+        // Der erste Durchlauf misst die Geometrie, wie beim Zeichnen der App.
+        render_job_detail(
+            Some(detail),
+            area,
+            &mut Buffer::empty(area),
+            &scroll,
+            Theme::Dark,
+        );
+        scroll.jump_to_top_measured();
+        let mut buf = Buffer::empty(area);
+        render_job_detail(Some(detail), area, &mut buf, &scroll, Theme::Dark);
+        inner_rows(&buf)
+    }
+
+    /// Zeichnet `detail` in `width`×`height` Zellen, springt wie `Home` an den
+    /// Anfang und liefert die Wörter im Inneren (fester Kopf und Körper).
+    fn body_words_from_top(detail: &JobDetail, width: u16, height: u16) -> String {
+        words(&inner_rows_from_top(detail, width, height).join(" "))
+    }
+
+    /// Zeichnet `detail` so, wie die Ansicht öffnet: frischer `ChatScroll`,
+    /// der dem Log-Ende folgt (`jobs_glue::open_detail`,
+    /// `open_job_window_detail`), ohne `Home`.
+    fn render_as_opened(detail: &JobDetail, width: u16, height: u16) -> Buffer {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        render_job_detail(
+            Some(detail),
+            area,
+            &mut buf,
+            &ChatScroll::new(),
+            Theme::Dark,
+        );
+        buf
+    }
+
+    /// Erste Zeile (Rahmen mit Titel) eines gezeichneten Puffers und ob dort
+    /// das Warnsymbol im Warnstil steht.
+    fn title_row(buf: &Buffer) -> (String, bool) {
+        let warning = style::warning_style(Theme::Dark);
+        let text = crate::test_support::display_buffer_text(buf)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let area = *buf.area();
+        let styled_glyph = (area.left()..area.right()).any(|x| {
+            buf.cell((x, area.top())).is_some_and(|cell| {
+                cell.symbol() == UNRESOLVED_GLYPH && Some(cell.fg) == warning.fg
+            })
+        });
+        (text, styled_glyph)
+    }
+
+    /// PL-100 WP 3.5 (Review 4505485685): ein ungeklärtes Anhalten
+    /// verschwindet in schmalen Panelzeilen nie. Wo `suspended (unresolved)`
+    /// nicht neben den Namen passt (z. B. 24 Spalten im Hochformat), steht
+    /// rechts die kompakte Marke `⏸?`, und das Präfix trägt das Warnsymbol
+    /// `⚠`; der Name weicht. Ein schlichtes `suspended` bleibt unverändert.
+    #[test]
+    fn unresolved_suspension_stays_visible_in_narrow_rows() -> TestResult {
+        use crate::i18n::{tr, with_language};
+        use harw_config::UiLanguage;
+        assert_eq!(display_width(UNRESOLVED_GLYPH), 1);
+        let owner = r#"{"session":"uia"}"#;
+        let unresolved = JobRow::from_status(&status_of(
+            &meta_json("suspended", INTENT_FIELDS, owner),
+            &[],
+        )?);
+        assert!(unresolved.suspension_unresolved, "{unresolved:?}");
+        let applied = JobRow::from_status(&status_of(
+            &meta_json("suspended", APPLIED_FIELDS, owner),
+            &[],
+        )?);
+        assert!(
+            applied.suspended && !applied.suspension_unresolved,
+            "{applied:?}"
+        );
+        let warning = style::warning_style(Theme::Dark);
+        for language in [UiLanguage::English, UiLanguage::German] {
+            with_language(language, || {
+                let label = unresolved.state_label();
+                let short = tr("mission.suspension_unresolved_short", "⏸?");
+                assert!(display_width(short) <= 3, "{language:?}: {short}");
+                for badge in [None, Some(2)] {
+                    // Präfix: Auswahlmarker, Symbol, Leerzeichen, DoD-Marke;
+                    // ab hier passt die kompakte Marke immer.
+                    let prefix = badge.map_or(3, |count| {
+                        display_width(&format!("⛨ {count} ")).saturating_add(3)
+                    });
+                    let marker_from = prefix.saturating_add(display_width(short));
+                    // 3: ab hier steht das Symbol; 5: ab hier die Marke (ohne
+                    // DoD-Marke), siehe `job_line`.
+                    for width in [3, 4, 5, 6, 8, 12, 16, 24, 40] {
+                        for selected in [false, true] {
+                            let line = job_line_with_badge(
+                                &unresolved,
+                                selected,
+                                width,
+                                Theme::Dark,
+                                badge,
+                            );
+                            let text = line_text(&line);
+                            let context = format!("{language:?} {width} {badge:?}: {text}");
+                            assert!(line.width() <= width, "{context}");
+                            assert!(
+                                line.spans.iter().any(|span| {
+                                    span.content.contains(UNRESOLVED_GLYPH) && span.style == warning
+                                }),
+                                "Warnsymbol im Präfix: {context}"
+                            );
+                            if width >= marker_from {
+                                assert!(
+                                    text.contains(label) || text.contains(short),
+                                    "Zustand oder Marke: {context}"
+                                );
+                            }
+                        }
+                    }
+                }
+                // Der Fall aus dem Review: 24 Spalten, das Label passt nicht.
+                let text = line_text(&job_line(&unresolved, false, 24, Theme::Dark));
+                assert!(
+                    text.contains(short) && !text.contains(label),
+                    "{language:?}: {text}"
+                );
+                // Wo es passt, steht das volle Label (mit Laufzeit).
+                let text = line_text(&job_line(&unresolved, false, 40, Theme::Dark));
+                assert!(
+                    text.contains(&format!("{label} {}", unresolved.runtime)),
+                    "{language:?}: {text}"
+                );
+                // Ein belegtes Anhalten bleibt bei 24 Spalten `suspended`.
+                let line = job_line(&applied, false, 24, Theme::Dark);
+                let text = line_text(&line);
+                assert!(text.contains(applied.state_label()), "{language:?}: {text}");
+                assert!(
+                    text.contains('⚙') && !text.contains(UNRESOLVED_GLYPH),
+                    "{language:?}: {text}"
+                );
+                assert!(!text.contains(short), "{language:?}: {text}");
+            });
+        }
+        let german = with_language(UiLanguage::German, || {
+            line_text(&job_line(&applied, false, 24, Theme::Dark))
+        });
+        assert!(german.contains("angehalten"), "{german}");
+        // Untergrenzen aus der Doku von `job_line` (ohne DoD-Marke) und der
+        // Name, der der Marke weicht: erst ganz, dann bis auf `t…`.
+        for (width, expected) in [(3, " ⚠ "), (5, " ⚠ ⏸?"), (6, " ⚠  ⏸?"), (8, " ⚠ t… ⏸?")]
+        {
+            assert_eq!(
+                line_text(&job_line(&unresolved, false, width, Theme::Dark)),
+                expected,
+                "{width}"
+            );
+        }
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5 (Review 4505485685, Nachprüfung): steht statt des
+    /// Labels die kompakte Marke, entfällt der Fortschritt (er weicht vor
+    /// dem Zustand); sein Platz gehört dem Namen. Wo das Label passt, bleibt
+    /// der Fortschritt wie bisher.
+    #[test]
+    fn compact_unresolved_marker_drops_the_progress_first() -> TestResult {
+        let mut unresolved = row("ladybird build", JobState::Suspended, true, false);
+        unresolved.suspension_unresolved = true;
+        // 30 Spalten: Präfix 3, Name 14; das Label (23) passt nicht neben
+        // die reservierten 8 Spalten des Namens, also steht die Marke.
+        let text = line_text(&job_line(&unresolved, false, 30, Theme::Dark));
+        assert_eq!(text, format!(" ⚠ ladybird build{} ⏸?", " ".repeat(10)));
+        assert!(!text.contains("ninja"), "{text}");
+        // Breit genug: Label und Laufzeit, der Fortschritt wie bisher.
+        let text = line_text(&job_line(&unresolved, false, 80, Theme::Dark));
+        assert!(
+            text.contains("ninja 120/900 13%") && text.contains("suspended (unresolved) 12m03s"),
+            "{text}"
+        );
+        // Ein belegtes Anhalten bleibt bei 30 Spalten unverändert: Name auf
+        // die reservierten Spalten gekürzt, Zustand und Laufzeit, keine Marke.
+        let applied = row("ladybird build", JobState::Suspended, true, false);
+        let text = line_text(&job_line(&applied, false, 30, Theme::Dark));
+        assert_eq!(text, " ⚙ ladybird … suspended 12m03s");
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5 (Review 4505485685): die Detailansicht nennt den
+    /// Zustand ausdrücklich, nicht nur im Rahmentitel; bei einem ungeklärten
+    /// Anhalten folgt der Hinweis zur Klärung im Warnstil. Beides bricht um
+    /// und ist auch bei 24 Spalten (Hochformat) per `Home` vollständig
+    /// erreichbar, auf Englisch und Deutsch.
+    #[test]
+    fn job_detail_body_states_an_unresolved_suspension_at_narrow_widths() -> TestResult {
+        use crate::i18n::{tr_args, with_language};
+        use harw_config::UiLanguage;
+        let owner = r#"{"session":"uia"}"#;
+        let unresolved = JobDetail::from_status(&status_of(
+            &meta_json("suspended", INTENT_FIELDS, owner),
+            &[],
+        )?);
+        let applied = JobDetail::from_status(&status_of(
+            &meta_json("suspended", APPLIED_FIELDS, owner),
+            &[],
+        )?);
+        assert!(unresolved.row.suspension_unresolved, "{:?}", unresolved.row);
+        assert!(!applied.row.suspension_unresolved, "{:?}", applied.row);
+
+        let warning = style::warning_style(Theme::Dark);
+        for language in UiLanguage::ALL {
+            with_language(language, || {
+                let lines = detail_state_lines(&unresolved.row, Theme::Dark);
+                assert_eq!(lines.len(), 2, "{language:?}");
+                let state = tr_args(
+                    "mission.detail_state",
+                    "State: {p0}",
+                    &[("p0", unresolved.row.state_label())],
+                );
+                assert_eq!(
+                    lines.first().map(line_text).as_deref(),
+                    Some(state.as_str()),
+                    "{language:?}"
+                );
+                let hint = lines.get(1).map(line_text).unwrap_or_default();
+                for tool in ["job.resume", "job.stop", "job.suspend"] {
+                    assert!(hint.contains(tool), "{language:?}: {hint}");
+                }
+                assert!(
+                    lines.iter().all(|line| line.style.fg == warning.fg),
+                    "{language:?}: Warnstil"
+                );
+                let plain = detail_state_lines(&applied.row, Theme::Dark);
+                assert_eq!(plain.len(), 1, "{language:?}");
+                assert_eq!(plain.first().map(|line| line.style), Some(Style::default()));
+            });
+        }
+
+        for language in [UiLanguage::English, UiLanguage::German] {
+            with_language(language, || {
+                let lines = detail_state_lines(&unresolved.row, Theme::Dark);
+                let state = lines
+                    .first()
+                    .map(|line| words(&line_text(line)))
+                    .unwrap_or_default();
+                let hint = lines
+                    .get(1)
+                    .map(|line| words(&line_text(line)))
+                    .unwrap_or_default();
+                assert!(!state.is_empty() && !hint.is_empty(), "{language:?}");
+                let label = words(unresolved.row.state_label());
+                for width in [24, 40] {
+                    let body = body_words_from_top(&unresolved, width, 14);
+                    assert!(body.contains(&label), "{language:?} {width}: {body}");
+                    assert!(
+                        body.contains(&state) && body.contains(&hint),
+                        "{language:?} {width}: Zustand und Hinweis: {body}"
+                    );
+                    let body = body_words_from_top(&applied, width, 14);
+                    let state = words(&tr_args(
+                        "mission.detail_state",
+                        "State: {p0}",
+                        &[("p0", applied.row.state_label())],
+                    ));
+                    assert!(body.contains(&state), "{language:?} {width}: {body}");
+                    assert!(!body.contains(&hint), "{language:?} {width}: {body}");
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5 (Review 4505485685, Nachprüfung): die Ansicht öffnet am
+    /// Log-Ende (frischer `ChatScroll`, ohne `Home`). Der Zustand steht
+    /// trotzdem sofort im Bild, fest über dem Körper; der Rahmentitel beginnt
+    /// mit dem Warnsymbol im Warnstil, und das Log-Ende bleibt sichtbar. Bei
+    /// 40 Spalten steht auch der Hinweis fest; bei 24 Spalten (Hochformat)
+    /// folgt er im Körper (per `Home` erreichbar, siehe
+    /// `job_detail_body_states_an_unresolved_suspension_at_narrow_widths`).
+    /// Auf Englisch und Deutsch; ein belegtes Anhalten zeigt seinen Zustand
+    /// ebenso, ohne Warnsymbol.
+    #[test]
+    fn job_detail_shows_an_unresolved_suspension_when_it_opens() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let owner = r#"{"session":"uia"}"#;
+        let log: Vec<String> = (1..=40).map(|n| format!("line {n}")).collect();
+        let mut unresolved = JobDetail::from_status(&status_of(
+            &meta_json("suspended", INTENT_FIELDS, owner),
+            &[],
+        )?);
+        unresolved.stdout = log.clone();
+        let mut applied = JobDetail::from_status(&status_of(
+            &meta_json("suspended", APPLIED_FIELDS, owner),
+            &[],
+        )?);
+        applied.stdout = log;
+        assert!(unresolved.row.suspension_unresolved, "{:?}", unresolved.row);
+        assert!(!applied.row.suspension_unresolved, "{:?}", applied.row);
+
+        for language in [UiLanguage::English, UiLanguage::German] {
+            with_language(language, || {
+                let lines = detail_state_lines(&unresolved.row, Theme::Dark);
+                let state = lines
+                    .first()
+                    .map(|line| words(&line_text(line)))
+                    .unwrap_or_default();
+                let hint = lines
+                    .get(1)
+                    .map(|line| words(&line_text(line)))
+                    .unwrap_or_default();
+                let label = words(unresolved.row.state_label());
+                let applied_state = detail_state_lines(&applied.row, Theme::Dark)
+                    .first()
+                    .map(|line| words(&line_text(line)))
+                    .unwrap_or_default();
+                assert!(
+                    !state.is_empty() && !hint.is_empty() && !applied_state.is_empty(),
+                    "{language:?}"
+                );
+                for width in [24, 40] {
+                    let context = format!("{language:?} {width}");
+                    let buf = render_as_opened(&unresolved, width, 14);
+                    let (title, styled_glyph) = title_row(&buf);
+                    assert!(
+                        title.contains(UNRESOLVED_GLYPH) && styled_glyph,
+                        "Warnsymbol im Titel: {context}: {title}"
+                    );
+                    let shown = inner_words(&buf);
+                    assert!(
+                        shown.contains(&state) && shown.contains(&label),
+                        "Zustand beim Öffnen: {context}: {shown}"
+                    );
+                    assert!(shown.contains("line 40"), "Log-Ende: {context}: {shown}");
+                    if width == 40 {
+                        assert!(shown.contains(&hint), "Hinweis: {context}: {shown}");
+                    }
+
+                    let buf = render_as_opened(&applied, width, 14);
+                    let (title, styled_glyph) = title_row(&buf);
+                    assert!(
+                        !title.contains(UNRESOLVED_GLYPH) && !styled_glyph,
+                        "{context}: {title}"
+                    );
+                    let shown = inner_words(&buf);
+                    assert!(shown.contains(&applied_state), "{context}: {shown}");
+                    assert!(!shown.contains(&hint), "{context}: {shown}");
+                    assert!(shown.contains("line 40"), "Log-Ende: {context}: {shown}");
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5: fest steht der längste Anfang der Zustandszeilen, der
+    /// umgebrochen in die (aufgerundete) obere Hälfte passt und dem Körper
+    /// mindestens eine Zeile lässt; der Rest folgt in seiner Reihenfolge im
+    /// Körper, und passt nicht einmal die erste Zeile, steht nichts fest.
+    #[test]
+    fn detail_state_pins_the_longest_prefix_that_fits() -> TestResult {
+        // Bei 4 Spalten zwei bzw. vier umgebrochene Zeilen.
+        let lines = vec![Line::raw("aaaa bbbb"), Line::raw("cccc dddd eeee ffff")];
+        let split = |height: u16| {
+            let state = pin_detail_state(lines.clone(), 4, height);
+            (state.pinned.len(), state.rows, state.rest.len())
+        };
+        assert_eq!(split(12), (2, 6, 0));
+        assert_eq!(split(11), (2, 6, 0), "aufgerundet: 6 von 11");
+        assert_eq!(split(10), (1, 2, 1));
+        assert_eq!(split(3), (1, 2, 1), "aufgerundet: 2 von 3");
+        assert_eq!(split(2), (0, 0, 2));
+        let state = pin_detail_state(lines.clone(), 4, 8);
+        assert_eq!(
+            state.rest.first().map(line_text).as_deref(),
+            Some("cccc dddd eeee ffff")
+        );
+        let state = pin_detail_state(lines, 4, 1);
+        assert_eq!(
+            state.rest.iter().map(line_text).collect::<Vec<_>>(),
+            ["aaaa bbbb", "cccc dddd eeee ffff"]
+        );
+        // Review: eine Zeile bleibt immer dem Körper. Bei einer Innenhöhe von
+        // 1 (Agentenbereich mit `AGENTS_MIN_ROWS`) steht auch eine einzeilige
+        // Zustandszeile nicht fest; ab 2 Zeilen steht sie fest.
+        let one_row = |height: u16| {
+            let state = pin_detail_state(vec![Line::raw("ab")], 40, height);
+            (state.pinned.len(), state.rows, state.rest.len())
+        };
+        assert_eq!(one_row(1), (0, 0, 1));
+        assert_eq!(one_row(2), (1, 1, 0));
+        assert_eq!(one_row(0), (0, 0, 1));
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5 (Review, Nachprüfung): bei einer Innenhöhe von 1 (der
+    /// Agentenbereich mit `AGENTS_MIN_ROWS = 3`) frisst der feste Zustand den
+    /// Körper nicht: beim Öffnen steht das Log-Ende im Bild, nach `Home` die
+    /// fette Kennungszeile. Ein ungeklärtes Anhalten trägt weiter das
+    /// Warnsymbol vorn im Rahmentitel. Für ein belegtes und ein ungeklärtes
+    /// Anhalten, auf Englisch und Deutsch.
+    #[test]
+    fn job_detail_keeps_a_body_row_in_a_one_row_view() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let owner = r#"{"session":"uia"}"#;
+        // stderr steht im Körper zuletzt, `line 40` ist so die letzte Zeile.
+        let log: Vec<String> = (1..=40).map(|n| format!("line {n}")).collect();
+        let mut unresolved = JobDetail::from_status(&status_of(
+            &meta_json("suspended", INTENT_FIELDS, owner),
+            &[],
+        )?);
+        unresolved.stderr = log.clone();
+        let mut applied = JobDetail::from_status(&status_of(
+            &meta_json("suspended", APPLIED_FIELDS, owner),
+            &[],
+        )?);
+        applied.stderr = log;
+        assert!(unresolved.row.suspension_unresolved, "{:?}", unresolved.row);
+        assert!(!applied.row.suspension_unresolved, "{:?}", applied.row);
+
+        for language in [UiLanguage::English, UiLanguage::German] {
+            with_language(language, || {
+                for detail in [&unresolved, &applied] {
+                    let context = format!("{language:?} {}", detail.row.state_label());
+                    // 40×3: Innenfläche 38×1.
+                    let buf = render_as_opened(detail, 40, 3);
+                    assert_eq!(inner_rows(&buf), ["line 40"], "Log-Ende: {context}");
+                    let (title, styled_glyph) = title_row(&buf);
+                    if detail.row.suspension_unresolved {
+                        assert!(
+                            title.contains(UNRESOLVED_GLYPH) && styled_glyph,
+                            "Warnsymbol im Titel: {context}: {title}"
+                        );
+                    } else {
+                        assert!(
+                            !title.contains(UNRESOLVED_GLYPH) && !styled_glyph,
+                            "{context}: {title}"
+                        );
+                    }
+                    assert_eq!(
+                        inner_rows_from_top(detail, 40, 3),
+                        [progress_text(&detail.row)],
+                        "Kennungszeile nach Home: {context}"
+                    );
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5 (Review, Nachprüfung): passt nicht einmal die
+    /// Zustandszeile in den festen Kopf, steht sie im Körper direkt unter der
+    /// fetten Kennungszeile. 24×4: Innenfläche 22×2, fest höchstens eine
+    /// Zeile; `State: suspended (unresolved)` bzw. `Zustand: angehalten
+    /// (ungeklärt)` braucht dort zwei, also steht nichts fest. Nach `Home`
+    /// zeigt die erste Körperzeile die Kennung, die zweite den Anfang der
+    /// Zustandszeile.
+    #[test]
+    fn job_detail_puts_an_unpinned_state_right_below_the_id_line() -> TestResult {
+        use crate::i18n::with_language;
+        use harw_config::UiLanguage;
+        let owner = r#"{"session":"uia"}"#;
+        let unresolved = JobDetail::from_status(&status_of(
+            &meta_json("suspended", INTENT_FIELDS, owner),
+            &[],
+        )?);
+        assert!(unresolved.row.suspension_unresolved, "{:?}", unresolved.row);
+        for language in [UiLanguage::English, UiLanguage::German] {
+            with_language(language, || {
+                let lines = detail_state_lines(&unresolved.row, Theme::Dark);
+                let state = lines
+                    .first()
+                    .map(|line| words(&line_text(line)))
+                    .unwrap_or_default();
+                let first_word = state.split_whitespace().next().unwrap_or_default();
+                assert!(
+                    first_word == "State:" || first_word == "Zustand:",
+                    "{language:?}: {state}"
+                );
+                // Die Voraussetzung: die Zustandszeile braucht zwei Zeilen.
+                let pinned = pin_detail_state(lines, 22, 2);
+                assert_eq!(
+                    (pinned.pinned.len(), pinned.rows, pinned.rest.len()),
+                    (0, 0, 2),
+                    "{language:?}"
+                );
+
+                let rows = inner_rows_from_top(&unresolved, 24, 4);
+                assert_eq!(rows.len(), 2, "{language:?}: {rows:?}");
+                assert_eq!(
+                    rows.first().map(String::as_str),
+                    Some(progress_text(&unresolved.row).as_str()),
+                    "Kennungszeile: {language:?}: {rows:?}"
+                );
+                let second = rows.get(1).map(|row| words(row)).unwrap_or_default();
+                assert!(
+                    second.starts_with(first_word) && state.starts_with(&second),
+                    "Zustandszeile darunter: {language:?}: {rows:?}"
+                );
+            });
+        }
+        Ok(())
+    }
+
     /// Plan R9, Teil F: jede Zeile der Jobs-Gruppe ist genau `width` breit
     /// (oder schmaler) und bricht nie um — auch bei sehr langen Namen und
     /// sehr schmalen Panels.
@@ -1120,18 +2012,62 @@ mod tests {
             row("tests", JobState::Failed, false, true),
         ];
         let refs: Vec<&JobRow> = finished.iter().collect();
-        for width in [0, 1, 5, 12, 24, 40, 80] {
+        // PL-100 WP 3.5: ein ungeklärtes Anhalten verdrängt den Namen, nie die
+        // Breitengrenze.
+        let mut unresolved = row(
+            &"ladybird build ".repeat(10),
+            JobState::Suspended,
+            true,
+            false,
+        );
+        unresolved.suspension_unresolved = true;
+        let warning = style::warning_style(Theme::Dark);
+        let short = crate::i18n::tr("mission.suspension_unresolved_short", "⏸?");
+        let label = unresolved.state_label();
+        // Ab hier steht die Marke: Präfix (Auswahlmarker, Symbol, Leerzeichen,
+        // DoD-Marke) plus Marke, siehe `job_line`.
+        let marker_from = |badge: Option<u32>| {
+            badge
+                .map_or(0, |count| display_width(&format!("⛨ {count} ")))
+                .saturating_add(3)
+                .saturating_add(display_width(short))
+        };
+        for width in [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 16, 24, 40, 80] {
             for selected in [false, true] {
                 for line in [
                     job_line(&long, selected, width, Theme::Dark),
+                    job_line(&unresolved, selected, width, Theme::Dark),
+                    job_line_with_badge(&unresolved, selected, width, Theme::Dark, Some(12)),
                     job_line(&finished[1], selected, width, Theme::Dark),
                     finished_jobs_line(&refs, false, selected, width, Theme::Dark),
                     group_header_line(1, 3, width, Theme::Dark),
                 ] {
                     assert!(line.width() <= width, "{width}: {line:?}");
                 }
+                // Der lange Name weicht der Marke, nie umgekehrt; das
+                // Warnsymbol steht ab 3 Spalten im Präfix.
+                for badge in [None, Some(12)] {
+                    let line =
+                        job_line_with_badge(&unresolved, selected, width, Theme::Dark, badge);
+                    let text = line_text(&line);
+                    if width >= 3 {
+                        assert!(
+                            line.spans.iter().any(|span| {
+                                span.content.contains(UNRESOLVED_GLYPH) && span.style == warning
+                            }),
+                            "Warnsymbol: {width} {badge:?}: {text}"
+                        );
+                    }
+                    if width >= marker_from(badge) {
+                        assert!(
+                            text.contains(short) || text.contains(label),
+                            "Marke oder Label: {width} {badge:?}: {text}"
+                        );
+                    }
+                }
             }
         }
+        assert_eq!(marker_from(None), 5);
         let wide = job_line(&long, false, 80, Theme::Dark);
         let text: String = wide
             .spans
@@ -1152,7 +2088,7 @@ mod tests {
                 r#""exit_code":101,"origin_call_id":"call-raw","origin_tool":"job.start","#,
                 r#"{"session":"agent-raw"}"#,
             ),
-            &["raw stderr {p0}: विफल 中文 👩🏽‍💻 é"],
+            &["raw stderr {p0}: विफल 中文 👩🏽\u{200D}💻 é"],
         )?;
         let raw = serde_json::to_value(&status.meta).map_err(ctx("meta"))?;
         let detail = with_language(UiLanguage::German, || JobDetail::from_status(&status));
@@ -1174,7 +2110,9 @@ mod tests {
                     "Exit code {p0}",
                     &[("p0", "101")]
                 )));
-                assert!(reason.ends_with(&sanitize_inline("raw stderr {p0}: विफल 中文 👩🏽‍💻 é")));
+                assert!(reason.ends_with(&sanitize_inline(
+                    "raw stderr {p0}: विफल 中文 👩🏽\u{200D}💻 é"
+                )));
                 for width in [0, 1, 8, 20, 40, 160] {
                     assert!(job_line(&detail.row, true, width, Theme::Dark).width() <= width);
                     let area = Rect::new(0, 0, u16::try_from(width).unwrap_or(160), 20);

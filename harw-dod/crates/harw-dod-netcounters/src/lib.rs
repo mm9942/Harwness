@@ -134,10 +134,14 @@
 //! Schnittstellen werden
 //! **nicht** gemeldet und lösen **keinen** Fehler aus: das ist eine
 //! bewusste Schutzmaßnahme gegen eine Zeitreihendatenbank-Explosion, keine
-//! fehlerhafte Quelle. Mit acht Zählern je Schnittstelle ergibt sich die
-//! öffentlich exportierte [`sensor::MAX_CARDINALITY`] `= FIELD_METRICS.len()
-//! * MAX_INTERFACES` — der Fixture-seitige Spiegel, den
-//! `harw_dod_fixtures::sensor_suite!` als `max_cardinality` erwartet.
+//! fehlerhafte Quelle. **Still** ist die Kürzung aber nicht mehr (PL-100
+//! WP0.15): jeder Poll meldet zusätzlich genau ein Sample
+//! [`sensor::TRUNCATED_METRIC`] (`netcounters.truncated`) mit der Zahl der
+//! verworfenen Schnittstellen, `0` ohne Kürzung. Mit acht Zählern je
+//! Schnittstelle plus dieser Marke ergibt sich die öffentlich exportierte
+//! [`sensor::MAX_CARDINALITY`] `= FIELD_METRICS.len() * MAX_INTERFACES + 1`
+//! — der Fixture-seitige Spiegel, den `harw_dod_fixtures::sensor_suite!` als
+//! `max_cardinality` erwartet.
 //!
 //! # Kumulative Zähler, keine Rate
 //! Alle sechzehn Spalten einer `/proc/net/dev`-Zeile wachsen **monoton**
@@ -152,8 +156,9 @@
 //! Sensor mit Zustand über den Abruf hinaus ist gegen ein solches Fixture
 //! nicht prüfbar. **Diese Crate meldet deshalb die rohen kumulativen
 //! Zähler, unverändert.** Die Bildung einer Rate ist bewusst Sache des
-//! Verbrauchers (z. B. `harw-dod-rules`), der ohnehin schon Zustand über
-//! mehrere Beobachtungen hinweg hält. Wer das hier „verbessert", indem er
+//! Verbrauchers, der ohnehin schon Zustand über mehrere Beobachtungen
+//! hinweg hält — heute die Zähler→Raten-Stufe `RateStage` in
+//! `harw-sentinel` (`src/rates.rs`, PL-100 WP0.14). Wer das hier „verbessert", indem er
 //! zwei interne Polls vergleicht, bricht sowohl die `&self`-Objektsicherheit
 //! als auch die Fixture-Prüfbarkeit.
 //!

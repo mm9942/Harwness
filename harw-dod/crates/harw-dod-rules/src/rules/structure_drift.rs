@@ -22,6 +22,41 @@
 //!    bekannte Struktur, von der abgewichen werden könnte — sonst löste jeder
 //!    Host-Sensor (CPU, Speicher, …) in einem Kontext ohne Baselines (z. B.
 //!    `harw-sentinel`) in jedem Zyklus einen Befund pro Metrik aus.
+//!    **Abgeleitete und Selbstdiagnose-Metriken zählen nicht** (siehe
+//!    `is_derived_metric`), und zwar nur genau diese Formen: die Raten der
+//!    Zählerstufe (`<metric>.rate`, `harw-sentinel`), die Kürzungsmarker
+//!    (`netcounters.truncated`, `cgroup.truncated`, `blockio.truncated`) und
+//!    `scanreport.malformed_reports` (PL-100 WP0.14/WP0.15). Eine Rate ist
+//!    keine neue Signalart (ihr Zähler wird selbst geprüft), ein Marker
+//!    beschreibt den Sensor, nicht die beobachtete Struktur. Jeder andere
+//!    Name — auch einer mit `.` wie `unexpected.metric` — ist eine rohe
+//!    Metrik und löst Drift aus: `HostSample::metric` ist frei wählbar, ein
+//!    Punkt allein beweist keine Ableitung.
+//!
+//! # Zeitstempel (PL-100 WP0.2)
+//! Ein Ereignis-Befund trägt das `observed_at` seines Ereignisses, ein
+//! Metrik-Befund das `observed_at` des ersten Samples mit dieser Metrik —
+//! nie [`crate::rule::RuleContext::now`]. Eine wiederholte Auswertung
+//! derselben Beobachtung erzeugt so denselben Stempel.
+//!
+//! # Härte: `min(Regel, Ereignis)` (PL-100 WP0.10)
+//! Die Regel selbst übernimmt ein Drift-Ereignis eins zu eins und trägt
+//! dafür [`Hardness::Observed`] bei. Ein Befund kann aber nie härter sein als
+//! das Ereignis, aus dem er stammt: ein `cargo audit`- oder SARIF-Treffer
+//! (Sensor `harw-dod-scanreport`) ist die Behauptung eines fremden
+//! Werkzeugs, keine eigene Beobachtung (`harw_dod_scanreport::REPORT_HARDNESS`
+//! = `Inferred`). Die Befundhärte ist deshalb die **schwächere** der beiden
+//! Stufen. Da [`Hardness`] nach steigender Indirektheit geordnet ist
+//! (`Observed < Correlated < Inferred`), ist das schwächere Glied das
+//! **größere** im Sinne von `Ord` — `weaker_hardness` nimmt `max`.
+//!
+//! `SecurityEvent` trägt (noch) kein eigenes Härte-Feld; `event_hardness`
+//! leitet die Ereignishärte deshalb aus der Herkunft ab, und zwar
+//! **fail-closed**: nur Ereignisse eines Sensors mit der Kennung
+//! `workspace-drift` bzw. `workspace-drift-<n>` (`harw-dod-workspace`, der
+//! den eigenen Cargo-Graphen direkt vergleicht) gelten als `Observed`; jede
+//! andere oder unbekannte Herkunft — insbesondere `scanreport-*` — gilt als
+//! `Inferred`. Eine unbekannte Herkunft wird damit herab-, nie hochgestuft.
 //!
 //! # Nebenläufigkeit
 //! Zustandsloser Unit-Struct: `Send + Sync`.
@@ -31,7 +66,7 @@
 
 use std::collections::HashSet;
 
-use harw_dod_signals::{DriftSeverity, EventKind, Severity};
+use harw_dod_signals::{DriftSeverity, EventKind, SecurityEvent, Severity};
 
 use crate::baseline::Baseline;
 use crate::finding::{Finding, FindingKind, Hardness, Raw};
@@ -58,9 +93,10 @@ impl Rule for StructureDriftRule {
                     self.id(),
                     FindingKind::RuleTriggered,
                     severity_for_drift(*severity),
-                    Hardness::Observed,
+                    weaker_hardness(RULE_HARDNESS, event_hardness(event)),
                     detail.clone(),
-                    ctx.now,
+                    // Ereigniszeit, nicht `ctx.now` — siehe Moduldoku.
+                    event.observed_at,
                 ))
             })
             .collect();
@@ -74,7 +110,7 @@ impl Rule for StructureDriftRule {
         let mut seen = HashSet::new();
 
         for sample in ctx.samples {
-            if expected.contains(sample.metric.as_ref()) {
+            if expected.contains(sample.metric.as_ref()) || is_derived_metric(&sample.metric) {
                 continue;
             }
             if !seen.insert(sample.metric.clone()) {
@@ -89,11 +125,70 @@ impl Rule for StructureDriftRule {
                     "sample metric '{}' is not defined by any baseline (structure drift)",
                     sample.metric
                 ),
-                ctx.now,
+                // Zeit des ersten Samples mit dieser Metrik — siehe Moduldoku.
+                sample.observed_at,
             ));
         }
 
         findings
+    }
+}
+
+/// Suffix der Raten aus der Zählerstufe von `harw-sentinel`
+/// (`rates::RATE_SUFFIX`; die Regel-Crate hängt nicht am Sentinel).
+const RATE_SUFFIX: &str = ".rate";
+
+/// Die Selbstdiagnose-Marker der Sensoren, exakt: Kürzungsmarker von
+/// netcounters, cgroup und blockio sowie die verworfenen Reports von
+/// scanreport (je `TRUNCATED_METRIC` bzw. `MALFORMED_REPORTS_METRIC` der
+/// Sensor-Crates).
+const SENSOR_MARKER_METRICS: [&str; 4] = [
+    "netcounters.truncated",
+    "cgroup.truncated",
+    "blockio.truncated",
+    "scanreport.malformed_reports",
+];
+
+/// `true` für eine abgeleitete oder Selbstdiagnose-Metrik, die nie als neue
+/// Signalart gilt: genau `<metric>.rate` (mit nicht leerem `<metric>`) oder
+/// einer der [`SENSOR_MARKER_METRICS`]. Jeder andere Name, auch mit `.`,
+/// bleibt eine rohe Metrik — siehe Moduldoku.
+fn is_derived_metric(metric: &str) -> bool {
+    SENSOR_MARKER_METRICS.contains(&metric)
+        || metric
+            .strip_suffix(RATE_SUFFIX)
+            .is_some_and(|base| !base.is_empty())
+}
+
+/// Die Härte, die diese Regel selbst beiträgt: ein Drift-Ereignis wird
+/// unverändert übernommen, ohne Verknüpfung oder Schluss.
+const RULE_HARDNESS: Hardness = Hardness::Observed;
+
+/// Sensor-Kennung (bzw. Präfix vor `-<n>`), deren Drift-Ereignisse als
+/// direkte Beobachtung gelten — siehe Moduldoku, Abschnitt „Härte".
+const OBSERVED_DRIFT_SENSOR: &str = "workspace-drift";
+
+/// Die schwächere zweier Härtestufen (`min` in der Stärke, `max` in der
+/// `Ord`-Ordnung von [`Hardness`]) — siehe Moduldoku.
+fn weaker_hardness(a: Hardness, b: Hardness) -> Hardness {
+    a.max(b)
+}
+
+/// Leitet die Härte eines Ereignisses aus seiner Herkunft ab (fail-closed).
+///
+/// `Observed` nur für den Sensor [`OBSERVED_DRIFT_SENSOR`] (exakt oder mit
+/// Suffix `-<irgendwas>`); jede andere Herkunft ist `Inferred` — siehe
+/// Moduldoku.
+fn event_hardness(event: &SecurityEvent) -> Hardness {
+    let id = event.sensor.as_str();
+    let observed = id == OBSERVED_DRIFT_SENSOR
+        || id
+            .strip_prefix(OBSERVED_DRIFT_SENSOR)
+            .is_some_and(|rest| rest.starts_with('-'));
+    if observed {
+        Hardness::Observed
+    } else {
+        Hardness::Inferred
     }
 }
 
@@ -114,7 +209,7 @@ mod tests {
     use super::*;
     use crate::test_support::{TestResult, ctx};
     use harw_authority::NetworkScope;
-    use harw_dod_signals::{HostSample, SecurityEvent};
+    use harw_dod_signals::HostSample;
     use harw_types::SensorId;
     use jiff::Timestamp;
     use std::borrow::Cow;
@@ -139,6 +234,8 @@ mod tests {
             events: &[],
             baselines,
             network_scope: scope,
+            listener_history: None,
+            rule_config: None,
         }
     }
 
@@ -185,6 +282,94 @@ mod tests {
     }
 
     #[test]
+    fn test_rates_and_sensor_markers_are_no_structure_drift() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).map_err(ctx("gültige Baseline"))?;
+        let samples = vec![
+            sample("user_jiffies.rate"),
+            sample("netcounters.truncated"),
+            sample("cgroup.truncated"),
+            sample("blockio.truncated"),
+            sample("scanreport.malformed_reports"),
+            sample("disk-queue"),
+        ];
+        let scope = NetworkScope::empty();
+        let baselines = [baseline];
+        let ctx = ctx_with(&samples, &baselines, &scope);
+
+        let findings = StructureDriftRule.evaluate(&ctx);
+        assert_eq!(findings.len(), 1, "only the real new metric drifts");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.summary.contains("disk-queue"))
+        );
+        Ok(())
+    }
+
+    // Owner-Review 4505120973: nur die ausdrücklichen Ableitungsformen sind
+    // ausgenommen. Eine neue rohe Metrik mit Punkt (`unexpected.metric`), ein
+    // verlängerter Marker und eine "Rate" ohne Basisnamen lösen Drift aus.
+    #[test]
+    fn test_unknown_dotted_raw_metric_still_drifts() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).map_err(ctx("gültige Baseline"))?;
+        let samples = vec![
+            sample("unexpected.metric"),
+            sample("netcounters.truncated.extra"),
+            sample(".rate"),
+            sample("user_jiffies.rate"),
+            sample("cgroup.truncated"),
+        ];
+        let scope = NetworkScope::empty();
+        let baselines = [baseline];
+        let ctx = ctx_with(&samples, &baselines, &scope);
+
+        let findings = StructureDriftRule.evaluate(&ctx);
+        assert_eq!(findings.len(), 3, "three raw metrics drift");
+        for raw in [
+            "unexpected.metric",
+            "netcounters.truncated.extra",
+            "'.rate'",
+        ] {
+            assert!(
+                findings.iter().any(|finding| finding.summary.contains(raw)),
+                "{raw} must drift"
+            );
+        }
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.summary.contains("'user_jiffies.rate'")
+                    && !finding.summary.contains("'cgroup.truncated'"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_derived_metric_accepts_only_the_explicit_forms() {
+        for derived in [
+            "user_jiffies.rate",
+            "netcounters.truncated",
+            "cgroup.truncated",
+            "blockio.truncated",
+            "scanreport.malformed_reports",
+        ] {
+            assert!(is_derived_metric(derived), "{derived}");
+        }
+        for raw in [
+            "unexpected.metric",
+            ".rate",
+            "rate",
+            "gpu.truncated",
+            "scanreport.malformed_reports.x",
+            "disk-queue",
+        ] {
+            assert!(!is_derived_metric(raw), "{raw}");
+        }
+    }
+
+    #[test]
     fn test_known_and_unknown_metrics_together() -> TestResult {
         let baseline =
             Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).map_err(ctx("gültige Baseline"))?;
@@ -220,6 +405,8 @@ mod tests {
             events,
             baselines: &[],
             network_scope: scope,
+            listener_history: None,
+            rule_config: None,
         }
     }
 
@@ -311,5 +498,112 @@ mod tests {
             StructureDriftRule.evaluate(&ctx),
             StructureDriftRule.evaluate(&ctx)
         );
+    }
+
+    fn drift_event_from(sensor: &str, observed_at: Timestamp) -> SecurityEvent {
+        SecurityEvent {
+            sensor: SensorId::from_str(sensor),
+            observed_at,
+            actor: None,
+            kind: EventKind::StructureDrift {
+                severity: DriftSeverity::High,
+                detail: "irgendeine Beschreibung".to_owned(),
+            },
+        }
+    }
+
+    /// PL-100 WP0.10: die Befundhärte ist die schwächere aus Regel
+    /// (`Observed`) und Ereignis. Ein Scanner-Bericht (`scanreport-*`) und
+    /// eine unbekannte Herkunft werden `Inferred`; nur der eigene
+    /// Workspace-Sensor bleibt `Observed`.
+    #[test]
+    fn test_hardness_is_the_weaker_of_rule_and_event() {
+        let scope = NetworkScope::empty();
+        let events = vec![
+            drift_event_from("workspace-drift", Timestamp::UNIX_EPOCH),
+            drift_event_from("workspace-drift-0", Timestamp::UNIX_EPOCH),
+            drift_event_from("scanreport-0", Timestamp::UNIX_EPOCH),
+            drift_event_from("unknown-sensor", Timestamp::UNIX_EPOCH),
+            drift_event_from("workspace-driftless", Timestamp::UNIX_EPOCH),
+        ];
+        let ctx = event_ctx(&events, &scope);
+
+        let hardness: Vec<Hardness> = StructureDriftRule
+            .evaluate(&ctx)
+            .iter()
+            .map(Finding::hardness)
+            .collect();
+
+        assert_eq!(
+            hardness,
+            vec![
+                Hardness::Observed,
+                Hardness::Observed,
+                Hardness::Inferred,
+                Hardness::Inferred,
+                Hardness::Inferred,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_weaker_hardness_takes_the_more_indirect_stage() {
+        assert_eq!(
+            weaker_hardness(Hardness::Observed, Hardness::Inferred),
+            Hardness::Inferred
+        );
+        assert_eq!(
+            weaker_hardness(Hardness::Correlated, Hardness::Observed),
+            Hardness::Correlated
+        );
+        assert_eq!(
+            weaker_hardness(Hardness::Observed, Hardness::Observed),
+            Hardness::Observed
+        );
+    }
+
+    /// PL-100 WP0.2: Ereignis-Befunde tragen die Ereigniszeit, Metrik-Befunde
+    /// die Zeit des ersten Samples — nie `ctx.now`.
+    #[test]
+    fn test_findings_are_stamped_with_the_observation_time() -> TestResult {
+        let event_time: Timestamp = "2026-11-08T09:00:00Z"
+            .parse()
+            .map_err(ctx("Ereigniszeit"))?;
+        let sample_time: Timestamp = "2026-11-08T09:30:00Z".parse().map_err(ctx("Samplezeit"))?;
+        let now: Timestamp = "2026-11-08T12:00:00Z"
+            .parse()
+            .map_err(ctx("Auswertungszeit"))?;
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).map_err(ctx("gültige Baseline"))?;
+        let baselines = [baseline];
+        let mut new_metric = sample("disk-queue");
+        new_metric.observed_at = sample_time;
+        let samples = vec![new_metric];
+        let events = vec![drift_event_from("workspace-drift-0", event_time)];
+        let scope = NetworkScope::empty();
+        let rule_ctx = RuleContext {
+            now,
+            samples: &samples,
+            events: &events,
+            baselines: &baselines,
+            network_scope: &scope,
+            listener_history: None,
+            rule_config: None,
+        };
+
+        let stamps: Vec<(FindingKind, Timestamp)> = StructureDriftRule
+            .evaluate(&rule_ctx)
+            .iter()
+            .map(|finding| (finding.kind(), finding.observed_at()))
+            .collect();
+
+        assert_eq!(
+            stamps,
+            vec![
+                (FindingKind::RuleTriggered, event_time),
+                (FindingKind::Anomaly, sample_time),
+            ]
+        );
+        Ok(())
     }
 }

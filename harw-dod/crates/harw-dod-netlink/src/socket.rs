@@ -50,8 +50,12 @@
 //! # Fehler
 //! [`crate::error::NetlinkError`] über
 //! [`harw_dod_cap::SensorError::SourceUnavailable`] (Socket nicht zu öffnen
-//! oder zu binden) und [`harw_dod_cap::SensorError::Io`] (Lesefehler nach
-//! erfolgreichem Bind). Ein Timeout ohne neue Daten ist **kein** Fehler —
+//! oder zu binden), [`crate::error::NetlinkError::Overrun`] (der Kernel hat
+//! Records verworfen, weil der Empfangspuffer voll war; der Socket bleibt
+//! benutzbar), [`crate::error::NetlinkError::Truncated`] (ein Datagramm war
+//! größer als der Lesepuffer oder nicht rahmbar; sein Record ist verloren,
+//! der Socket bleibt benutzbar) und [`harw_dod_cap::SensorError::Io`] (jeder
+//! andere Lesefehler nach erfolgreichem Bind). Ein Timeout ohne neue Daten ist **kein** Fehler —
 //! siehe [`NetlinkAuditSource::read_records`].
 //!
 //! # Examples
@@ -74,7 +78,7 @@ use rustix::net::{self, AddressFamily, RecvFlags, SocketType};
 use harw_dod_cap::SensorError;
 
 use crate::error::NetlinkError;
-use crate::frame::split_messages;
+use crate::frame::split_datagram;
 use crate::record::RawRecord;
 use crate::source::AuditSource;
 
@@ -87,10 +91,16 @@ use crate::source::AuditSource;
 /// `AF_NETLINK`/`NETLINK_AUDIT`-Bausteine.
 const AUDIT_NLGRP_READLOG: u32 = 1;
 
-/// Größe des Empfangspuffers. Reichlich bemessen für einen einzelnen
-/// Audit-Record (üblicherweise deutlich unter 1 KiB Text) plus etwaige
-/// vom Kernel gebündelte Folgenachrichten in einem `recv()`.
-const RECV_BUFFER_LEN: usize = 8192;
+/// Größe des Lesepuffers für ein `recv()`: **16 KiB**.
+///
+/// Der größte Audit-Record ist `MAX_AUDIT_MESSAGE_LENGTH` (8970 Byte Text,
+/// `kernel/audit.h`) plus 16 Byte `nlmsghdr`; der Kernel schickt jeden
+/// Record der Multicast-Gruppe als eigenes Datagramm. 16 KiB fassen damit
+/// jeden Record mit Abstand. Ist ein Datagramm trotzdem größer, wird das
+/// über `MSG_TRUNC` erkannt und als [`NetlinkError::Truncated`] gemeldet,
+/// nie still abgeschnitten (siehe [`crate::frame`]). Der Puffer liegt auf dem
+/// Stack des Lesers.
+const RECV_BUFFER_LEN: usize = 16 * 1024;
 
 /// Eine [`AuditSource`], die echte `AUDIT`-Ereignisse vom Kernel liest.
 ///
@@ -142,12 +152,23 @@ impl AuditSource for NetlinkAuditSource {
     /// `timeout`.
     ///
     /// # Description
-    /// Setzt `SO_RCVTIMEO` auf `timeout` und führt genau ein `recv()` aus.
-    /// Das empfangene Datagramm wird über [`crate::frame::split_messages`]
-    /// in einzelne [`RawRecord`]-Werte zerlegt — ein Datagramm kann mehrere
-    /// `nlmsghdr`-gerahmte Nachrichten tragen.
+    /// Setzt `SO_RCVTIMEO` auf `timeout` und führt genau ein `recv()` mit
+    /// `MSG_TRUNC` aus: `recv()` liefert dann die **volle** Länge des
+    /// Datagramms, auch wenn nur [`RECV_BUFFER_LEN`] Bytes in den Puffer
+    /// passten. Das empfangene Datagramm wird über
+    /// [`crate::frame::split_datagram`] in einzelne [`RawRecord`]-Werte
+    /// zerlegt — ein Datagramm kann mehrere `nlmsghdr`-gerahmte Nachrichten
+    /// tragen.
     ///
     /// # Errors
+    /// - [`NetlinkError::Overrun`], wenn `recv()` mit `ENOBUFS` scheitert:
+    ///   der Kernel hat Multicast-Records verworfen, weil dieser Socket nicht
+    ///   schnell genug gelesen wurde. Der Socket bleibt danach benutzbar; der
+    ///   Aufrufer meldet den Verlust und liest weiter.
+    /// - [`NetlinkError::Truncated`], wenn das Datagramm größer als
+    ///   [`RECV_BUFFER_LEN`] war oder seine Rahmung nicht aufgeht: sein Record
+    ///   ist verloren, der Socket bleibt benutzbar; der Aufrufer meldet den
+    ///   Verlust wie einen Überlauf und liest weiter.
     /// - [`SensorError::Io`], wenn `recv()` mit einem anderen Fehler als
     ///   Zeitüberschreitung scheitert.
     ///
@@ -158,13 +179,19 @@ impl AuditSource for NetlinkAuditSource {
             .map_err(|_| SensorError::SourceUnavailable)?;
 
         let mut buf = [0u8; RECV_BUFFER_LEN];
-        match net::recv(&self.socket, &mut buf[..], RecvFlags::empty()) {
-            Ok((received, _)) => Ok(split_messages(&buf[..received])),
+        match net::recv(&self.socket, &mut buf, RecvFlags::TRUNC) {
+            // `received` ist höchstens die Pufferlänge, `datagram_len` mit
+            // `MSG_TRUNC` die volle Länge des Datagramms.
+            Ok((received, datagram_len)) => {
+                let bytes = buf.get(..received).ok_or(NetlinkError::Truncated)?;
+                split_datagram(bytes, datagram_len)
+            }
             Err(errno)
                 if errno == rustix::io::Errno::AGAIN || errno == rustix::io::Errno::WOULDBLOCK =>
             {
                 Ok(Vec::new())
             }
+            Err(errno) if errno == rustix::io::Errno::NOBUFS => Err(NetlinkError::Overrun),
             Err(errno) => Err(NetlinkError::from(SensorError::Io(errno.into()))),
         }
     }

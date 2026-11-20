@@ -88,6 +88,7 @@ pub mod discovery;
 mod error;
 mod images;
 pub mod rate_limiter;
+mod replay_bounds;
 mod responses_reasoning;
 pub mod retry;
 pub mod routing;
@@ -185,7 +186,6 @@ const UNKNOWN_TOOL_NAME: &str = "unknown";
 /// `include`-Wert der Responses-API für zustandslos wiederverwendbares Reasoning.
 const INCLUDE_ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
 /// Höchstzahl gemerkter Reasoning-Runden je Provider (FIFO).
-const MAX_REASONING_REPLAY_ENTRIES: usize = 64;
 /// Obergrenze für provider-gelieferte Grund-Strings in `StopReason::Other`.
 const MAX_STOP_REASON_CHARS: usize = 64;
 
@@ -763,6 +763,7 @@ fn build_named_provider(
         ));
         backend.configure_credential_pool(pool);
         backend.configure_concurrency(provider.max_concurrency);
+        backend.configure_strict_replay_models(strict_replay_models(provider_name, config));
         // Runde 7, Teil L4: Request- und Streaming-Leerlauf-Zeitlimit.
         backend.configure_timeouts(
             Duration::from_secs(provider.effective_request_timeout_secs()),
@@ -1644,6 +1645,10 @@ pub struct OpenAiResponsesProvider {
     reasoning_replay: ReasoningReplay,
     chat_reasoning_cache: chat_reasoning::ChatReasoningCache,
     chat_reasoning_overrides: std::collections::HashMap<String, harw_config::ChatReasoningReplay>,
+    /// Modelle (IDs und Aliase) mit `[capabilities] reasoning_replay =
+    /// "strict"`; alle übrigen degradieren bei verlorener Kontinuität
+    /// (siehe [`replay_bounds`]).
+    strict_replay_models: BTreeSet<String>,
     /// Modell-ID → Prompt-Caching-Override (`ModelToml::prompt_caching`),
     /// befüllt aus `config.models` beim Bau über [`Self::from_named_config`].
     /// Leer, wenn der Provider über [`Self::new`]/[`Self::with_transport`]
@@ -1779,6 +1784,7 @@ impl OpenAiResponsesProvider {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             reasoning_replay: ReasoningReplay::default(),
             chat_reasoning_cache: chat_reasoning::ChatReasoningCache::default(),
+            strict_replay_models: BTreeSet::new(),
             chat_reasoning_overrides: std::collections::HashMap::new(),
             cache_overrides: std::collections::HashMap::new(),
             stream_policy: sse::StreamPolicy::default(),
@@ -2060,6 +2066,7 @@ impl OpenAiResponsesProvider {
             }
         }
         http_provider.toolless_models = toolless_models(provider_name, config);
+        http_provider.strict_replay_models = strict_replay_models(provider_name, config);
         http_provider.imageless_models = imageless_models(provider_name, config);
         Ok(http_provider)
     }
@@ -3481,6 +3488,27 @@ fn toolless_models(provider_name: &str, config: &harw_config::ResolvedConfig) ->
 }
 
 /// Modell-IDs und Aliase von `provider_name`, deren Modelldatei
+/// `[capabilities] reasoning_replay = "strict"` sagt.
+pub(crate) fn strict_replay_models(
+    provider_name: &str,
+    config: &harw_config::ResolvedConfig,
+) -> BTreeSet<String> {
+    let mut models = BTreeSet::new();
+    for model in config
+        .models
+        .values()
+        .filter(|model| model.provider == provider_name)
+        .filter(|model| {
+            model.capabilities.reasoning_replay == Some(harw_config::ReasoningReplayPolicy::Strict)
+        })
+    {
+        models.insert(model.id.clone());
+        models.extend(model.aliases.iter().cloned());
+    }
+    models
+}
+
+/// Modell-IDs und Aliase von `provider_name`, deren Modelldatei
 /// `[capabilities] image_input = false` sagt.
 fn imageless_models(provider_name: &str, config: &harw_config::ResolvedConfig) -> BTreeSet<String> {
     let mut models = BTreeSet::new();
@@ -4150,6 +4178,8 @@ impl OpenAiResponsesProvider {
             model,
             self.chat_reasoning_overrides.get(model).copied(),
         );
+        let replay_policy =
+            replay_bounds::ReplayPolicy::for_model(&self.strict_replay_models, model);
         let (url, mut wire) = match self.transport {
             Transport::Responses => {
                 let replay = self.reasoning_replay.for_request(
@@ -4157,6 +4187,7 @@ impl OpenAiResponsesProvider {
                     model,
                     base_url,
                     &request,
+                    replay_policy,
                 )?;
                 tracing::debug!(
                     model,
@@ -4181,6 +4212,7 @@ impl OpenAiResponsesProvider {
                         model,
                         &request,
                         &mut body,
+                        replay_policy,
                     )?;
                 }
                 cache_strategy::apply_chat_cache_control(&mut body, strategy);
@@ -4373,8 +4405,12 @@ impl OpenAiResponsesProvider {
         }
         budget_permit.reconcile(&response.usage);
         if let Some(replay) = response_replay {
-            self.reasoning_replay
-                .remember(replay, base_url, &request, &response)?;
+            replay_bounds::remember_or_warn(
+                "responses",
+                model,
+                self.reasoning_replay
+                    .remember(replay, base_url, &request, &response),
+            );
         }
         if self.transport == Transport::Chat
             && chat_reasoning_mode == harw_config::ChatReasoningReplay::ReasoningContent
@@ -4385,13 +4421,17 @@ impl OpenAiResponsesProvider {
                     | StopReason::ContextWindowExceeded
             )
         {
-            self.chat_reasoning_cache.remember(
-                &chat_replay_namespace,
+            replay_bounds::remember_or_warn(
+                "chat",
                 model,
-                &request,
-                &response,
-                &value,
-            )?;
+                self.chat_reasoning_cache.remember(
+                    &chat_replay_namespace,
+                    model,
+                    &request,
+                    &response,
+                    &value,
+                ),
+            );
         }
         Ok(response)
     }
@@ -4690,8 +4730,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identityless_responses_tool_results_require_identity_only_for_reasoning() -> TestResult
-    {
+    async fn identityless_responses_tool_results_keep_the_paid_response() -> TestResult {
         for (case, effort, encrypted, identity, succeeds) in [
             ("ordinary tool round", None, false, None, true),
             (
@@ -4699,15 +4738,18 @@ mod tests {
                 Some(harw_types::ReasoningEffort::High),
                 false,
                 None,
-                false,
+                true,
             ),
-            ("encrypted reasoning", None, true, None, false),
+            // Eine nicht merkbare Runde verwirft die bezahlte Antwort nicht
+            // mehr (HARW-REPLAY-003); erst eine `strict`-Folgeanfrage würde
+            // an der fehlenden Kontinuität scheitern.
+            ("encrypted reasoning", None, true, None, true),
             (
                 "invalid provided identity",
                 None,
                 false,
                 Some(test_identity("", "", "reader")),
-                false,
+                true,
             ),
         ] {
             let mut output = Vec::new();
@@ -4750,10 +4792,10 @@ mod tests {
                 assert_eq!(response.tool_calls[0].id.as_str(), "a");
                 assert_eq!(response.tool_calls[0].name.as_str(), "lookup");
                 assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
-                assert!(response.reasoning.is_none());
+                assert_eq!(response.reasoning.is_some(), encrypted, "{case}");
             } else {
                 assert!(
-                    matches!(result, Err(ModelError::RequestFailed(ref detail)) if detail.contains("request identity is missing")),
+                    matches!(result, Err(ModelError::ReplayUnavailable { ref detail, .. }) if detail.contains("request identity is missing")),
                     "{case} must retain its identity requirement: {result:?}"
                 );
             }

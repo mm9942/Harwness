@@ -204,7 +204,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -215,7 +215,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -656,7 +656,7 @@ dependencies = [
  "maybe-owned",
  "rustix 1.1.5",
  "rustix-linux-procfs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "winx",
 ]
 
@@ -1733,7 +1733,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2640,6 +2640,7 @@ dependencies = [
  "harw-session-store",
  "harw-tools",
  "harw-types",
+ "harw-untrusted-text",
  "jiff",
  "serde",
  "serde_json",
@@ -2660,10 +2661,14 @@ dependencies = [
  "harw-dod-signals",
  "harw-extension-api",
  "harw-macros",
+ "harw-observe",
  "harw-operations",
  "harw-research",
+ "harw-session-store",
  "harw-test-support",
  "harw-types",
+ "harw-untrusted-text",
+ "jiff",
  "serde_json",
  "tokio",
  "tracing",
@@ -2706,6 +2711,25 @@ dependencies = [
  "harw-types",
  "jiff",
  "tempfile",
+]
+
+[[package]]
+name = "harw-dod-advisory"
+version = "0.10.0"
+dependencies = [
+ "harw-dod-cap",
+ "harw-dod-readfs",
+ "harw-dod-signals",
+ "harw-macros",
+ "harw-test-support",
+ "harw-types",
+ "harw-untrusted-text",
+ "jiff",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 1.1.6+spec-1.1.0",
 ]
 
 [[package]]
@@ -2787,6 +2811,7 @@ version = "0.10.0"
 dependencies = [
  "harw-dod-config",
  "harw-types",
+ "harw-untrusted-text",
  "rustix 1.1.5",
  "serde",
  "serde_json",
@@ -2837,6 +2862,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-dod-dispatch"
+version = "0.10.0"
+dependencies = [
+ "harw-test-support",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harw-dod-encrypt"
 version = "0.10.0"
 dependencies = [
@@ -2850,16 +2884,17 @@ name = "harw-dod-escalate"
 version = "0.10.0"
 dependencies = [
  "harw-authority",
+ "harw-dod-ladder",
  "harw-dod-rules",
  "harw-dod-signals",
- "harw-dod-warden-proto",
+ "harw-dod-submit-proto",
+ "harw-dod-warden-types",
  "harw-macros",
  "harw-sandbox",
  "harw-session-store",
  "harw-test-support",
  "harw-types",
  "jiff",
- "serde",
  "serde_json",
  "tempfile",
 ]
@@ -2927,6 +2962,19 @@ dependencies = [
  "harw-types",
  "jiff",
  "tempfile",
+]
+
+[[package]]
+name = "harw-dod-ladder"
+version = "0.10.0"
+dependencies = [
+ "harw-dod-rules",
+ "harw-dod-signals",
+ "harw-dod-warden-types",
+ "harw-macros",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
 ]
 
 [[package]]
@@ -3000,6 +3048,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-dod-nft"
+version = "0.10.0"
+dependencies = [
+ "harw-test-support",
+ "rustix 1.1.5",
+]
+
+[[package]]
 name = "harw-dod-procmon"
 version = "0.10.0"
 dependencies = [
@@ -3009,6 +3065,7 @@ dependencies = [
  "harw-macros",
  "harw-test-support",
  "harw-types",
+ "harw-untrusted-text",
  "jiff",
  "tempfile",
 ]
@@ -3034,6 +3091,7 @@ dependencies = [
  "harw-research",
  "harw-test-support",
  "harw-types",
+ "harw-untrusted-text",
  "jiff",
  "rayon",
  "semver",
@@ -3095,6 +3153,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-dod-submit-proto"
+version = "0.10.0"
+dependencies = [
+ "harw-dod-signals",
+ "harw-macros",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harw-dod-thermal"
 version = "0.10.0"
 dependencies = [
@@ -3113,11 +3184,14 @@ dependencies = [
 name = "harw-dod-warden"
 version = "0.10.0"
 dependencies = [
+ "blake3",
  "harw-dod-warden-proto",
  "harw-macros",
  "harw-test-support",
  "harw-types",
  "jiff",
+ "rustix 1.1.5",
+ "serde",
  "serde_json",
  "tempfile",
 ]
@@ -3127,6 +3201,19 @@ name = "harw-dod-warden-proto"
 version = "0.10.0"
 dependencies = [
  "blake3",
+ "harw-dod-warden-types",
+ "harw-macros",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "harw-dod-warden-types"
+version = "0.10.0"
+dependencies = [
  "harw-macros",
  "harw-test-support",
  "harw-types",
@@ -3231,6 +3318,7 @@ dependencies = [
  "crypt_guard",
  "crypt_guard_hyper",
  "harw-secrets",
+ "harw-untrusted-text",
  "http",
  "http-body-util",
  "hyper",
@@ -3438,6 +3526,7 @@ name = "harw-killer"
 version = "0.10.0"
 dependencies = [
  "clap",
+ "harw-untrusted-text",
  "rustix 1.1.5",
  "serde",
  "serde_json",
@@ -3962,6 +4051,7 @@ dependencies = [
  "harw-tool-shell",
  "harw-tools",
  "harw-types",
+ "harw-untrusted-text",
  "harw-web",
  "jiff",
  "secrecy 0.8.0",
@@ -4006,7 +4096,7 @@ dependencies = [
  "harw-authority",
  "harw-context",
  "harw-core",
- "harw-dod-escalate",
+ "harw-dod-ladder",
  "harw-dod-rules",
  "harw-dod-signals",
  "harw-extension-api",
@@ -4055,8 +4145,11 @@ dependencies = [
  "jiff",
  "landlock",
  "rustix 1.1.5",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
+ "toml 1.1.6+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4068,6 +4161,7 @@ dependencies = [
  "clap",
  "harw-completions",
  "harw-dod-cap",
+ "harw-dod-config",
  "harw-dod-fsmon",
  "harw-dod-signals",
  "harw-test-support",
@@ -4078,6 +4172,26 @@ dependencies = [
  "rustix 1.1.5",
  "serde_json",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "harw-probe-netlink"
+version = "0.10.0"
+dependencies = [
+ "clap",
+ "harw-completions",
+ "harw-dod-authlog",
+ "harw-dod-cap",
+ "harw-dod-netlink",
+ "harw-dod-signals",
+ "harw-test-support",
+ "harw-types",
+ "jiff",
+ "landlock",
+ "rustix 1.1.5",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4294,6 +4408,7 @@ dependencies = [
  "harw-authority",
  "harw-test-support",
  "harw-types",
+ "rustix 1.1.5",
  "tokio",
  "tracing",
  "url",
@@ -4352,7 +4467,9 @@ dependencies = [
  "harw-dod-blockio",
  "harw-dod-cap",
  "harw-dod-cgroup",
+ "harw-dod-client",
  "harw-dod-config",
+ "harw-dod-container",
  "harw-dod-cpu",
  "harw-dod-gpu",
  "harw-dod-listener",
@@ -4372,6 +4489,7 @@ dependencies = [
  "harw-sandbox",
  "harw-test-support",
  "harw-types",
+ "harw-untrusted-text",
  "jiff",
  "landlock",
  "rustix 1.1.5",
@@ -4380,6 +4498,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -4514,6 +4633,7 @@ dependencies = [
  "harw-observe",
  "harw-retention",
  "harw-types",
+ "harw-untrusted-text",
  "jiff",
  "serde",
  "serde_json",
@@ -4891,6 +5011,7 @@ dependencies = [
  "harw-tool-fsread",
  "harw-tools",
  "harw-types",
+ "harw-untrusted-text",
  "regex",
  "rustix 1.1.5",
  "serde",
@@ -5018,6 +5139,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-untrusted-text"
+version = "0.10.0"
+dependencies = [
+ "harw-test-support",
+]
+
+[[package]]
 name = "harw-warden"
 version = "0.10.0"
 dependencies = [
@@ -5030,10 +5158,12 @@ dependencies = [
  "harw-types",
  "jiff",
  "landlock",
+ "libc",
  "rustix 1.1.5",
  "sd-listen-fds",
- "serde",
+ "seccompiler",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
@@ -5107,10 +5237,6 @@ name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
-dependencies = [
- "ahash",
- "allocator-api2",
-]
 
 [[package]]
 name = "hashbrown"
@@ -5129,6 +5255,7 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
+ "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
 ]
@@ -6294,7 +6421,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6757,7 +6884,7 @@ dependencies = [
  "arrayvec",
  "async-channel",
  "flurry",
- "hashbrown 0.14.5",
+ "hashbrown 0.17.1",
  "log",
  "parking_lot",
  "rand 0.8.8",
@@ -7103,7 +7230,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7442,7 +7569,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7510,7 +7637,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7599,6 +7726,15 @@ dependencies = [
  "generic-array 0.14.7",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -8026,7 +8162,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8200,10 +8336,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8764,7 +8900,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9087,7 +9223,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
