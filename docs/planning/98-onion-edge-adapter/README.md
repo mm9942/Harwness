@@ -17,7 +17,7 @@ related:
   - 01-recherche-cloudflare-tor-arti.md
 ---
 
-# PL-98 — harw-edge: Onion- und mTLS-Anschluss für Rust-Dienste, ohne Reverse Proxy
+# PL-98-ONION-EDGE-ADAPTER — harw-edge: Onion- und mTLS-Anschluss für Rust-Dienste, ohne Reverse Proxy
 
 > **Status: PROPOSED.** Reiner Plan. Kein Crate, keine Abhängigkeit, keine Unit
 > und kein Gate aus diesem Dokument existiert im Code. Nichts hier gilt als
