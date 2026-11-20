@@ -14,25 +14,35 @@ DOCUMENTS = {'README.md', 'LICENSE-MIT', 'LICENSE-APACHE'}
 
 
 def validate_tag(tag):
-    if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag):
+    if not re.fullmatch(r'v\d+\.\d+\.\d+', tag, re.ASCII):
         raise ValueError('Expected stable vX.Y.Z tag')
 
 
 def package_source(tag, dist, root):
     validate_tag(tag)
+    source_root = f'harwness-{tag[1:]}'
     # git archive uses pax metadata (including a global commit comment).
     # Re-encode as strict ustar to match the release archive contract.
-    data = subprocess.check_output(['git', '-C', str(root), 'archive', '--format=tar',
-                                    f'--prefix=harwness-{tag[1:]}/', 'HEAD'])
+    data = subprocess.check_output(
+        ['git', 'archive', '--format=tar', '--prefix=source/', 'HEAD'], cwd=root
+    )
     dist.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(data)) as source, tarfile.open(
-        dist / f'harwness-{tag[1:]}-source.tar.gz', 'w:gz', format=tarfile.USTAR_FORMAT
+        dist / f'{source_root}-source.tar.gz', 'w:gz', format=tarfile.USTAR_FORMAT
     ) as output:
         for member in source:
-            if not (member.isfile() or member.isdir()):
-                raise ValueError(f'Source contains unsupported entry: {member.name}')
+            parts = archive_member_parts(member, 'source')
+            member.name = '/'.join((source_root, *parts[1:]))
             member.pax_headers = {}
             output.addfile(member, source.extractfile(member) if member.isfile() else None)
+
+
+def archive_member_parts(member, root):
+    parts = member.name.removesuffix('/').split('/')
+    if (parts[0] != root or any(part in ('..', '.', '') for part in parts) or
+            not (member.isfile() or member.isdir())):
+        raise ValueError(f'Unsafe archive member: {member.name}')
+    return parts
 
 
 def validate_archive(path, root, required):
@@ -40,11 +50,7 @@ def validate_archive(path, root, required):
         names = set()
         total = 0
         for member in archive:
-            parts = member.name.removesuffix('/').split('/')
-            if (not parts or parts[0] != root or '..' in parts or
-                    '.' in parts or '' in parts or
-                    not (member.isfile() or member.isdir())):
-                raise ValueError(f'Unsafe archive member: {member.name}')
+            archive_member_parts(member, root)
             if member.name in names:
                 raise ValueError(f'Duplicate archive member: {member.name}')
             names.add(member.name)
@@ -70,7 +76,7 @@ def verify_bundle(tag, dist):
         raise ValueError(f'Incomplete/unverified asset set: expected {sorted(expected)}, got {sorted(actual)}')
     sums = {}
     for line in (dist / 'SHA256SUMS').read_text().splitlines():
-        match = re.fullmatch(r'([0-9a-f]{64})  ([^/\s]+)', line)
+        match = re.fullmatch(r'([0-9a-f]{64}) {2}([^/\s]+)', line)
         if not match or match[2] in sums:
             raise ValueError('Malformed or duplicate SHA256SUMS entry')
         sums[match[2]] = match[1]

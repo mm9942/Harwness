@@ -30,8 +30,8 @@ REQUIRED_JOBS = {
 
 
 def validate_ci(run, jobs, sha, repository):
-    expected = dict(head_sha=sha, path='.github/workflows/ci.yml',
-                    event='workflow_dispatch', status='completed', conclusion='success')
+    expected = {'head_sha': sha, 'path': '.github/workflows/ci.yml',
+                'event': 'workflow_dispatch', 'status': 'completed', 'conclusion': 'success'}
     for key, value in expected.items():
         if run.get(key) != value:
             raise ValueError(f'CI {key}: expected {value!r}, got {run.get(key)!r}')
@@ -41,17 +41,30 @@ def validate_ci(run, jobs, sha, repository):
         matching = [job for job in jobs if job.get('name') == name]
         if len(matching) != 1:
             raise ValueError(f'CI requires exactly one job: {name}')
-        job = matching[0]
-        if job.get('status') != 'completed' or job.get('conclusion') != 'success':
-            raise ValueError(f'CI job did not execute successfully: {name}')
-        for step in required_steps:
-            matches = [s for s in job.get('steps', []) if s.get('name') == step]
-            if len(matches) != 1 or matches[0].get('status') != 'completed' or matches[0].get('conclusion') != 'success':
-                raise ValueError(f'CI step missing, skipped or unsuccessful: {name}: {step}')
+        validate_job(matching[0], name, required_steps)
+
+
+def validate_job(job, name, required_steps):
+    if job.get('status') != 'completed' or job.get('conclusion') != 'success':
+        raise ValueError(f'CI job did not execute successfully: {name}')
+    for step in required_steps:
+        matches = [s for s in job.get('steps', []) if s.get('name') == step]
+        if len(matches) != 1 or matches[0].get('status') != 'completed' or matches[0].get('conclusion') != 'success':
+            raise ValueError(f'CI step missing, skipped or unsuccessful: {name}: {step}')
+
+
+def validate_dependency_pins(manifest, member, version):
+    sections = [manifest, *manifest.get('target', {}).values()]
+    for section in sections:
+        for kind in ('dependencies', 'dev-dependencies', 'build-dependencies'):
+            for name, dep in section.get(kind, {}).items():
+                if isinstance(dep, dict) and 'path' in dep and 'version' in dep:
+                    if dep['version'] not in (version, f'={version}'):
+                        raise ValueError(f'Internal version pin mismatch: {member}/{name}')
 
 
 def validate_metadata(tag, root, publishing=False):
-    if not re.fullmatch(r'v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', tag):
+    if not re.fullmatch(r'v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)', tag, re.ASCII):
         raise ValueError('Only stable vX.Y.Z tags are supported')
     workspace = tomllib.loads((root / 'Cargo.toml').read_text())['workspace']
     version = workspace['package']['version']
@@ -67,13 +80,7 @@ def validate_metadata(tag, root, publishing=False):
             member_version = version
         if member_version != version or local.get(package['name']) != version:
             raise ValueError(f'Workspace/lockfile version mismatch: {member}')
-        sections = [manifest] + list(manifest.get('target', {}).values())
-        for section in sections:
-            for kind in ('dependencies', 'dev-dependencies', 'build-dependencies'):
-                for name, dep in section.get(kind, {}).items():
-                    if isinstance(dep, dict) and 'path' in dep and 'version' in dep:
-                        if dep['version'] not in (version, f'={version}'):
-                            raise ValueError(f'Internal version pin mismatch: {member}/{name}')
+        validate_dependency_pins(manifest, member, version)
     changelog = (root / 'CHANGELOG.md').read_text()
     header = re.search(rf'^## \[{re.escape(version)}\] — (.+)$', changelog, re.M)
     if not header or (publishing and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', header[1])):

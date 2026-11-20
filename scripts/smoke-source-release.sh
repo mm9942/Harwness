@@ -15,6 +15,6 @@ env HOME="$work/home" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
   bash scripts/install.sh
 "$work/bin/harw" --version | grep -F "${tag#v}"
 for binary in harw killer harw-job-exec harw-agent-runner; do
-  test -x "$work/bin/$binary"
+  [[ -x "$work/bin/$binary" ]]
 done
 "$work/bin/harw-agent-runner" --capabilities | python3 -m json.tool >/dev/null
