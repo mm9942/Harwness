@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prepare one immutable GitHub/R2 bundle; never repair received checksums."""
 import argparse
+import gzip
 import hashlib
 import io
 from pathlib import Path
@@ -21,36 +22,26 @@ def validate_tag(tag):
 def package_source(tag, dist, root):
     validate_tag(tag)
     source_root = f'harwness-{tag[1:]}'
-    # git archive uses pax metadata (including a global commit comment).
-    # Re-encode as strict ustar to match the release archive contract.
+    # Archive the tree, since archiving a commit emits a global PAX header.
+    # Publish only when the tree can be represented without PAX extensions.
     data = subprocess.check_output(
-        ['git', 'archive', '--format=tar', '--prefix=source/', 'HEAD'], cwd=root
+        ['git', 'archive', '--format=tar', f'--prefix={source_root}/', 'HEAD^{tree}'], cwd=root
     )
-    dist.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(fileobj=io.BytesIO(data)) as source, tarfile.open(
-        dist / f'{source_root}-source.tar.gz', 'w:gz', format=tarfile.USTAR_FORMAT
-    ) as output:
+    with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as source:
         for member in source:
-            parts = archive_member_parts(member, 'source')
-            name = '/'.join((source_root, *parts[1:]))
-            if any(part in ('', '.', '..') for part in name.split('/')) or '\\' in name:
-                raise ValueError(f'Unsafe output archive path: {name}')
-            # Construct a fresh header. The input header, including any PAX
-            # fields or link target, never reaches the output archive.
-            entry = tarfile.TarInfo(name)
-            entry.type = member.type
-            entry.mode = member.mode
-            entry.mtime = int(member.mtime)
-            entry.size = member.size
-            output.addfile(entry, source.extractfile(member) if member.isfile() else None)
+            archive_member_parts(member, source_root)
+            if member.pax_headers:
+                raise ValueError(f'Source entry requires PAX extensions: {member.name}')
+    dist.mkdir(parents=True, exist_ok=True)
+    (dist / f'{source_root}-source.tar.gz').write_bytes(gzip.compress(data, mtime=0))
 
 
 def archive_member_parts(member, root):
     parts = member.name.removesuffix('/').split('/')
-    if (parts[0] != root or any(part in ('..', '.', '') for part in parts) or
+    if (parts[0] != root or '\\' in member.name or
+            any(part in ('..', '.', '') for part in parts) or
             not (member.isfile() or member.isdir())):
         raise ValueError(f'Unsafe archive member: {member.name}')
-    return parts
 
 
 def validate_archive(path, root, required):
