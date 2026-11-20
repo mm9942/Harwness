@@ -343,10 +343,10 @@ Voraussetzung ist PL-96 W01. 3.0 und 3.5 können sofort starten.
     Anhalten ist von harws eigenem nicht zu unterscheiden. Die Sperre des Eindämmungsindex gilt nur nach bestem Bemühen (etwa 100 ms, danach
     Prüfen, Auftauen und erneutes Prüfen mit einem Restfenster von Mikrosekunden). Die Freigabe des Wardens kann harws Anhalten aufheben.
     Ein kompromittierter harw-Prozess (Angreifer A4 in [THREAT-MODEL.md](THREAT-MODEL.md) §2) schreibt `cgroup.freeze` im eigenen delegierten
-    Teilbaum direkt. Auf Hosts mit Warden-Spur ist der Eindämmungsindex heute nicht vertrauenswürdig (kein `/run/harw-warden`, der Warden legt
-    noch keine Marker an): Die Montage installiert den Freezer trotzdem, `job.suspend` friert ein, `job.resume` lehnt jedes Auftauen ab
-    (fail-closed, Fehler `probe`; dann hilft nur `job.stop`), bis ein tmpfiles-Eintrag für `/run/harw-warden/holds` und das Marker- und
-    Sperrprotokoll im Warden existieren. Mit Warden-Spur wird der Index für die Sitzung auf „Warden erwartet“ festgelegt. Unter Full Access
+    Teilbaum direkt. Das Paket liefert den Eindämmungsindex `/run/harw-warden/holds` über tmpfiles aus. Der Warden gleicht vor dem Start des
+    Hold-Timers Marker, Datensätze und cgroups ab. Mit Warden-Spur wird der Index für die Sitzung auf „Warden erwartet“ festgelegt. Fehlt der
+    Index auf einem älteren oder unvollständig eingerichteten Host oder ist er nicht vertrauenswürdig, lehnt `job.resume` das Auftauen ab
+    (Fehler `probe`). `job.suspend` bleibt verfügbar. Unter Full Access
     (`/permissions set full`) fragt auch `ALWAYS_ASK_TOOLS` nicht: `job.suspend` und `job.resume` laufen dann ohne Rückfrage, „immer mit
     Nachfrage“ (A2) gilt nur in den Modi „ask“ und „auto“ (Nutzerentscheidung vom 2026-09-24, THREAT-MODEL B22).
 - **3.6 `SECURITY.md`:** S1 präzisieren, Invariante „Operator-Ebene außerhalb von harw", Ort der TCB-Policy. `auto_freeze`, `kill_requires_human` und

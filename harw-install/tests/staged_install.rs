@@ -297,9 +297,12 @@ fn systemctl_verbs<'a>(lines: &[&'a str]) -> Vec<&'a str> {
     verbs
 }
 
-/// The guard of the host-only block in `uninstall_package()`: an empty
-/// `DESTDIR` and an available `systemctl`.
-const HOST_GUARD: &str = "if [ -z \"$destdir\" ] && command -v systemctl >/dev/null 2>&1; then";
+/// The guard of the host-only block in `uninstall_package()`.
+const HOST_GUARD: &str = "if [ -z \"$destdir\" ]; then";
+
+/// The host uninstall requires systemctl before removing any file.
+const HOST_SYSTEMCTL: &str =
+    "command -v systemctl >/dev/null 2>&1 || fail 'systemctl is required for host uninstallation'";
 
 /// The word list of the uninstall disable loop: the checked `dod_units`.
 const DOD_UNITS_WORD: &str = "$dod_units";
@@ -308,7 +311,7 @@ const DOD_UNITS_WORD: &str = "$dod_units";
 const DISABLE_LOOP: &str = "for unit in $dod_units; do";
 
 /// The one `systemctl disable` call of `uninstall_package()`, per unit.
-const DISABLE_CALL: &str = "systemctl disable --now \"$unit\" >/dev/null 2>&1 || true";
+const DISABLE_CALL: &str = "if ! systemctl disable --now \"$unit\"; then";
 
 /// The head of the manifest-driven removal loop of `uninstall_package()`.
 const REMOVAL_LOOP: &str = "while IFS= read -r entry";
@@ -341,10 +344,10 @@ fn uninstall_disabled_units(script: &str) -> TestResult<Vec<&str>> {
     }
     let block = code
         .windows(4)
-        .position(|window| *window == [HOST_GUARD, DISABLE_LOOP, DISABLE_CALL, "done"])
+        .position(|window| *window == [HOST_GUARD, HOST_SYSTEMCTL, DISABLE_LOOP, DISABLE_CALL])
         .ok_or_else(|| {
             TestError::Unexpected(format!(
-                "uninstall_package() must stop and disable units as `{HOST_GUARD}` / `{DISABLE_LOOP}` / `{DISABLE_CALL}` / `done`"
+                "uninstall_package() must stop and disable units as `{HOST_GUARD}` / `{HOST_SYSTEMCTL}` / `{DISABLE_LOOP}` / `{DISABLE_CALL}`"
             ))
         })?;
     let removal = code
@@ -903,60 +906,41 @@ fn test_systemctl_readers_find_invocations_only() -> TestResult {
 
 #[test]
 fn test_uninstall_disable_reader_accepts_only_the_guarded_per_unit_loop() -> TestResult {
-    let good = "dod_units='a.target b.service'\n\
-                uninstall_package() {\n\
-                \t# systemctl disable in a comment is not a call\n\
-                \tif [ -z \"$destdir\" ] && command -v systemctl >/dev/null 2>&1; then\n\
-                \t\tfor unit in $dod_units; do\n\
-                \t\t\tsystemctl disable --now \"$unit\" >/dev/null 2>&1 || true\n\
-                \t\tdone\n\
-                \tfi\n\
-                \twhile IFS= read -r entry || [ -n \"$entry\" ]; do\n\
-                \t\trm -f \"$entry\"\n\
-                \tdone < \"$manifest\"\n\
-                }\n";
-    assert_eq!(uninstall_disabled_units(good)?, ["a.target", "b.service"]);
+    let stop = format!(
+        "{HOST_GUARD}\n{HOST_SYSTEMCTL}\n{DISABLE_LOOP}\n{DISABLE_CALL}\n\
+         fail 'unit stop failed'\nfi\ndone\nfi\n"
+    );
+    let remove = "\twhile IFS= read -r entry || [ -n \"$entry\" ]; do\n\
+                  rm -f \"$entry\"\ndone < \"$manifest\"\n";
+    let script = |first: &str, second: &str| {
+        format!("dod_units='a.target b.service'\nuninstall_package() {{\n{first}{second}}}\n")
+    };
+    let good = script(&stop, remove);
+    assert_eq!(uninstall_disabled_units(&good)?, ["a.target", "b.service"]);
 
-    let unguarded = good.replace(
-        "\tif [ -z \"$destdir\" ] && command -v systemctl >/dev/null 2>&1; then\n",
-        "",
-    );
-    let own_list = good.replace(
-        "for unit in $dod_units; do",
-        "for unit in a.target b.service; do",
-    );
+    let unguarded = good.replace(HOST_GUARD, "");
+    let own_list = good.replace(DISABLE_LOOP, "for unit in a.target b.service; do");
     let batch = good.replace(
-        "\t\tfor unit in $dod_units; do\n\
-         \t\t\tsystemctl disable --now \"$unit\" >/dev/null 2>&1 || true\n\
-         \t\tdone\n",
-        "\t\tsystemctl disable --now a.target b.service >/dev/null 2>&1 || true\n",
+        DISABLE_CALL,
+        "if ! systemctl disable --now a.target b.service; then",
     );
-    let twice = good.replace(
-        "\tfi\n",
-        "\tfi\n\tsystemctl disable --now c.service >/dev/null 2>&1 || true\n",
+    let twice = script(
+        &stop,
+        &format!("systemctl disable --now c.service\n{remove}"),
     );
-    let after_removal = "dod_units='a.target'\n\
-                         uninstall_package() {\n\
-                         \twhile IFS= read -r entry || [ -n \"$entry\" ]; do\n\
-                         \t\trm -f \"$entry\"\n\
-                         \tdone < \"$manifest\"\n\
-                         \tif [ -z \"$destdir\" ] && command -v systemctl >/dev/null 2>&1; then\n\
-                         \t\tfor unit in $dod_units; do\n\
-                         \t\t\tsystemctl disable --now \"$unit\" >/dev/null 2>&1 || true\n\
-                         \t\tdone\n\
-                         \tfi\n\
-                         }\n";
+    let after_removal = script(remove, &stop);
     let no_removal = good.replace("\twhile IFS= read -r entry", "\tuntil false");
     for (name, script) in [
         ("unguarded", unguarded.as_str()),
         ("own list", own_list.as_str()),
         ("batch", batch.as_str()),
         ("twice", twice.as_str()),
-        ("after removal", after_removal),
+        ("after removal", after_removal.as_str()),
         ("no removal loop", no_removal.as_str()),
     ] {
         assert_ne!(
-            script, good,
+            script,
+            good.as_str(),
             "{name}: the variant did not change the script"
         );
         assert!(
@@ -1507,6 +1491,16 @@ mod staged {
         }
 
         stage.run("install")?;
+        let installed = stage.files()?;
+        let systemctl = bin.join("systemctl");
+        fs::write(&systemctl, "#!/bin/sh\nexit 1\n").map_err(ctx("write failing systemctl"))?;
+        assert!(stage.run_host_uninstall(&bin, &log, &paths).is_err());
+        assert_eq!(
+            stage.files()?,
+            installed,
+            "a stop failure removed package files"
+        );
+        fs::write(&systemctl, FAKE_SYSTEMCTL).map_err(ctx("restore fake systemctl"))?;
         stage.run_host_uninstall(&bin, &log, &paths)?;
 
         let logged = fs::read_to_string(&log).map_err(ctx("read the fake systemctl log"))?;

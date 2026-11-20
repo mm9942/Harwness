@@ -28,7 +28,7 @@
 //! - [`read_system_config`] — `/etc/harw-dod/config.toml` through
 //!   `harw_dod_config`: valid (profile) / missing / invalid (reason) /
 //!   untrusted / unreadable; symlinks never followed.
-//! - [`unit_states`] — `systemctl show` for the six units; no `systemctl`
+//! - [`unit_states`] — `systemctl show` for the suite's units; no `systemctl`
 //!   ⇒ [`UnitStatus::NotAvailable`].
 //! - [`status()`] — one [`DodStatus`] snapshot from a [`DodClientContext`].
 //! - [`correlate()`] — jobs ↔ findings by cgroup path-component prefix (E4).

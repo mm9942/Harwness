@@ -2646,7 +2646,7 @@ pub fn doctor(env: &DoctorEnv, snapshot: &DodSnapshot) -> DoctorReport {
             "systemd could not be asked about the units",
         )
     } else {
-        check("unit-files", CheckLevel::Ok, "all six units installed")
+        check("unit-files", CheckLevel::Ok, "all DoD units installed")
     });
     let config_level = match &status.config {
         ConfigReport::Valid {

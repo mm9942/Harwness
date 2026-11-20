@@ -181,18 +181,24 @@ uninstall_package() {
 	# the operator may have enabled harw-dod.target, the opt-in probes
 	# (harw-probe-fs, harw-probe-netlink) or the Warden, and a removed unit
 	# file would otherwise leave a dangling .wants symlink and a service
-	# running from a deleted binary. $dod_units is the manifest's systemd/
-	# list (checked by the harw-install staged-install test). One call per
-	# unit: a batch `systemctl disable` stops nothing when one unit file is
-	# missing (a host installed from an older package). Failures are ignored,
-	# so the message below only states the request. This removes the
-	# operator's enablements: after a reinstall, enable, enable-warden and the
-	# opt-in probes must be enabled again.
-	if [ -z "$destdir" ] && command -v systemctl >/dev/null 2>&1; then
+	# running from a deleted binary. Only an explicitly absent, inactive unit
+	# can be skipped, for example when uninstalling an older package.
+	if [ -z "$destdir" ]; then
+		command -v systemctl >/dev/null 2>&1 || fail 'systemctl is required for host uninstallation'
 		for unit in $dod_units; do
-			systemctl disable --now "$unit" >/dev/null 2>&1 || true
+			if ! systemctl disable --now "$unit"; then
+				if [ ! -e "$unitdir/$unit" ] && [ ! -L "$unitdir/$unit" ] &&
+					unit_state=$(systemctl show -p LoadState -p ActiveState "$unit"); then
+					case "$unit_state" in
+						'LoadState=not-found
+ActiveState=inactive'|'ActiveState=inactive
+LoadState=not-found') continue ;;
+					esac
+				fi
+				fail "could not stop and disable $unit; package files were retained"
+			fi
 		done
-		printf '%s\n' 'Requested stop/disable of the DoD units (errors ignored); after a reinstall, enable observation, the Warden and opt-in probes again.'
+		printf '%s\n' 'Stopped and disabled the installed DoD units; after a reinstall, enable observation, the Warden and opt-in probes again.'
 	fi
 
 	while IFS= read -r entry || [ -n "$entry" ]; do

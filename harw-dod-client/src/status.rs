@@ -164,7 +164,7 @@ pub struct DodStatus {
     pub install: InstallState,
     /// System configuration.
     pub config: ConfigReport,
-    /// The six units.
+    /// The suite's systemd units.
     pub units: Vec<UnitState>,
     /// Warden enablement.
     pub warden: WardenState,
@@ -463,7 +463,11 @@ mod tests {
             snapshot.install,
             InstallState::Partial {
                 libexec_dir: libexec,
-                missing: vec!["harw-probe-fs".into(), "harw-warden".into()],
+                missing: vec![
+                    "harw-probe-fs".into(),
+                    "harw-probe-netlink".into(),
+                    "harw-warden".into(),
+                ],
             }
         );
         assert_eq!(snapshot.config, expected_config);
@@ -681,7 +685,10 @@ mod tests {
         let systemctl = bin.join("systemctl");
         fs::write(
             &systemctl,
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 6 ]; do\n  [ $i -eq 4 ] && state=enabled || state=disabled\n  printf 'ActiveState=inactive\\nSubState=dead\\nUnitFileState=%s\\n\\n' \"$state\"\n  i=$((i + 1))\ndone\n",
+            format!(
+                "#!/bin/sh\ni=0\nwhile [ $i -lt {} ]; do\n  [ $i -eq 4 ] && state=enabled || state=disabled\n  printf 'ActiveState=inactive\\nSubState=dead\\nUnitFileState=%s\\n\\n' \"$state\"\n  i=$((i + 1))\ndone\n",
+                DOD_UNITS.len()
+            ),
         )?;
         fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))?;
         let mut ctx = DodClientContext::new(root.path().join("home"), OffsetDateTime::UNIX_EPOCH);
