@@ -777,6 +777,9 @@ fn health_summary_view(snapshot: &DodSnapshot) -> Value {
             "profile": report.profile.as_deref().map(bounded),
             "sensors": report.sensors.len(),
             "degraded": report.degraded_sensors(),
+            "ipc_decode_errors_total": report.ipc.as_ref().map(|ipc| ipc.decode_errors_total),
+            "landlock": report.landlock,
+            "warnings": sentinel_health_warnings(report),
         }),
         None => export_state_view(&snapshot.status.health_export, source),
     };
@@ -972,12 +975,17 @@ fn health_summary_text(snapshot: &DodSnapshot) -> String {
             } else {
                 ""
             };
-            format!(
+            let mut summary = format!(
                 "{} reported, {} degraded (health written {}{stale})",
                 report.sensors.len(),
                 report.degraded_sensors(),
                 rfc3339(report.written_at)
-            )
+            );
+            for warning in sentinel_health_warnings(report) {
+                summary.push_str("; ");
+                summary.push_str(&warning);
+            }
+            summary
         }
         None => format!(
             "health export {} ({})",
@@ -2319,6 +2327,8 @@ fn health_view(report: &HealthReport, now: OffsetDateTime) -> Value {
         "written_at": rfc3339(report.written_at),
         "stale": report.is_stale(now, HEALTH_MAX_AGE),
         "profile": report.profile.as_deref().map(bounded),
+        "landlock": report.landlock,
+        "warnings": sentinel_health_warnings(report),
         "sensors": report
             .sensors
             .iter()
@@ -2338,9 +2348,28 @@ fn health_view(report: &HealthReport, now: OffsetDateTime) -> Value {
                 "probes_connected": ipc.probes_connected,
                 "events_total": ipc.events_total,
                 "dropped_total": ipc.dropped_total,
+                "decode_errors_total": ipc.decode_errors_total,
             })
         }),
     })
+}
+
+fn sentinel_health_warnings(report: &HealthReport) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(ipc) = &report.ipc
+        && ipc.decode_errors_total > 0
+    {
+        warnings.push(format!("{} IPC decode errors", ipc.decode_errors_total));
+    }
+    if let Some(landlock) = report.landlock {
+        use harw_dod_client::LandlockOutcome;
+        match landlock.outcome {
+            LandlockOutcome::NotEnforced => warnings.push("Landlock not enforced".to_owned()),
+            LandlockOutcome::Failed => warnings.push("Landlock setup failed".to_owned()),
+            _ => {}
+        }
+    }
+    warnings
 }
 
 /// Structured sensor health (the `dod.sensors` result).
@@ -2388,6 +2417,7 @@ fn sensors_body_text(snapshot: &DodSnapshot) -> String {
         "Sentinel health written {}{stale}",
         rfc3339(report.written_at)
     )];
+    lines.extend(sentinel_health_warnings(report));
     lines.push(format!(
         "{:<20} {:<9} {:>10} {:>8}  {:<20}  reason",
         "sensor", "health", "readings", "errors", "last ok"
@@ -2716,15 +2746,22 @@ pub fn doctor(env: &DoctorEnv, snapshot: &DodSnapshot) -> DoctorReport {
                 rfc3339(report.written_at)
             ),
         ),
-        (Some(report), _) => check(
-            "health-export",
-            readable_level,
-            format!(
+        (Some(report), _) => {
+            let warnings = sentinel_health_warnings(report);
+            let mut detail = format!(
                 "{unverified}{} sensors, {} degraded",
                 report.sensors.len(),
                 report.degraded_sensors()
-            ),
-        ),
+            );
+            let level = if warnings.is_empty() {
+                readable_level
+            } else {
+                detail.push_str("; ");
+                detail.push_str(&warnings.join("; "));
+                CheckLevel::Warn
+            };
+            check("health-export", level, detail)
+        }
         (None, state) => check(
             "health-export",
             CheckLevel::Warn,
@@ -3935,7 +3972,10 @@ mod tests {
         assert_eq!(view["warden"], json!("disabled"));
         assert_eq!(view["config"]["state"], json!("valid"));
         assert_eq!(view["config"]["active_profile"]["id"], json!("host"));
-        assert_eq!(view["units"].as_array().map(Vec::len), Some(6));
+        assert_eq!(
+            view["units"].as_array().map(Vec::len),
+            Some(harw_dod_client::DOD_UNITS.len())
+        );
         // f-4 liegt außerhalb des 24-h-Fensters.
         assert_eq!(view["findings"]["high"], json!(1));
         assert_eq!(view["findings"]["critical"], json!(1));
@@ -4377,6 +4417,55 @@ mod tests {
         let view = call_tool(&DodSensorsOperation, &context, json!({})).await?;
         assert_eq!(view["state"], json!("missing"));
         assert_eq!(view["path"], json!("/var/lib/harw-dod/export/health.json"));
+        Ok(())
+    }
+
+    #[test]
+    fn sentinel_degradation_reaches_sensors_status_and_doctor() -> TestResult {
+        let mut snapshot = fixture_snapshot()?;
+        let health = snapshot
+            .status
+            .health
+            .as_mut()
+            .ok_or(TestError::Missing("health"))?;
+        health.sensors.clear();
+        health
+            .ipc
+            .as_mut()
+            .ok_or(TestError::Missing("IPC counters"))?
+            .decode_errors_total = 1;
+        health.landlock = Some(harw_dod_client::LandlockHealth {
+            outcome: harw_dod_client::LandlockOutcome::NotEnforced,
+            requested_abi: Some(1),
+            effective_abi: None,
+        });
+
+        let sensors = sensors_view(&snapshot);
+        assert_eq!(sensors["ipc"]["decode_errors_total"], json!(1));
+        assert_eq!(sensors["landlock"]["outcome"], json!("not_enforced"));
+        for rendered in [sensors_text(&snapshot), status_text(&snapshot)] {
+            assert!(rendered.contains("1 IPC decode error"));
+            assert!(rendered.contains("Landlock not enforced"));
+        }
+        let status = status_view(&snapshot);
+        assert_eq!(status["health"]["ipc_decode_errors_total"], json!(1));
+        assert_eq!(
+            status["health"]["landlock"]["outcome"],
+            json!("not_enforced")
+        );
+        let root = tempfile::tempdir().map_err(ctx("doctor root"))?;
+        let env = DoctorEnv {
+            root: root.path().to_path_buf(),
+            search_path: None,
+        };
+        let report = doctor(&env, &snapshot);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "health-export")
+            .ok_or(TestError::Missing("health-export check"))?;
+        assert_eq!(check.level, CheckLevel::Warn);
+        assert!(check.detail.contains("Landlock not enforced"));
         Ok(())
     }
 
