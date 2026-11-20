@@ -12,16 +12,20 @@ import tarfile
 LINUX_TARGETS = ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu')
 BINARIES = {'harw', 'killer', 'harw-job-exec', 'harw-agent-runner'}
 DOCUMENTS = {'README.md', 'LICENSE-MIT', 'LICENSE-APACHE'}
+RELEASE_TAG = re.compile(r'v(\d+)\.(\d+)\.(\d+)', re.ASCII)
 
 
 def validate_tag(tag):
-    if not re.fullmatch(r'v\d+\.\d+\.\d+', tag, re.ASCII):
+    if RELEASE_TAG.fullmatch(tag) is None:
         raise ValueError('Expected stable vX.Y.Z tag')
 
 
 def package_source(tag, dist, root):
-    validate_tag(tag)
-    source_root = f'harwness-{tag[1:]}'
+    version = RELEASE_TAG.fullmatch(tag)
+    if version is None:
+        raise ValueError('Expected stable vX.Y.Z tag')
+    # The Git prefix is constructed from the validated decimal components.
+    source_root = 'harwness-' + '.'.join(version.groups())
     # Archive the tree, since archiving a commit emits a global PAX header.
     # Publish only when the tree can be represented without PAX extensions.
     data = subprocess.check_output(
