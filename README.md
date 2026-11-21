@@ -26,7 +26,7 @@ The workspace also contains Detect · Orient · Defend (DoD), an optional host-s
 
 - **Delegate real work to an agent team.** Describe the goal in the interactive session. The root agent hands it to a background orchestrator that plans, fans out read-only explorers and writing workers, and reports back while you keep talking.
 - **Plan first, then build.** Plan mode (`Shift+Tab` or `/mode`) lets the agent explore and ask structured questions without changing files; you approve the plan before any edit is applied.
-- **Stay in control of side effects.** Edits, shell commands, network access and host operations go through approvals and sandboxing. Shell commands run in a Bubblewrap sandbox on supported Linux systems; privileged host operations use a separate approval boundary and never acquire authority from the model context.
+- **Stay in control of side effects.** Edits, shell commands, network access and host operations go through approvals and sandboxing. Shell commands run in a Bubblewrap sandbox on supported Linux systems; root commands (`host.sudo_exec`) need their own approval window with masked password entry, and the password never reaches the model.
 - **Research and review.** Dependency research against crates.io and docs.rs (`/research-deps`), read-only research with a typed finding contract (`/research`), and bundled Rust skills for ownership, error design, typestate and more.
 - **Run your own commands.** The `!` operator runs a shell command on the host from the interactive prompt, with its output returned to the conversation.
 
