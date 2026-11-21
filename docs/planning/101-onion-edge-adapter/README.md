@@ -1,5 +1,5 @@
 ---
-id: PL-98-ONION-EDGE-ADAPTER
+id: PL-101-ONION-EDGE-ADAPTER
 title: "harw-edge: Rust-Dienste direkt an arti-Onion-Services und mTLS-HTTPS anschließen (ohne Reverse Proxy); CLI für systemd-Units und TOML mit Prüfung und Reparatur"
 status: PROPOSED (Plan, nichts implementiert)
 date: 2026-11-01
@@ -17,7 +17,7 @@ related:
   - 01-recherche-cloudflare-tor-arti.md
 ---
 
-# PL-98-ONION-EDGE-ADAPTER — harw-edge: Onion- und mTLS-Anschluss für Rust-Dienste, ohne Reverse Proxy
+# PL-101-ONION-EDGE-ADAPTER — harw-edge: Onion- und mTLS-Anschluss für Rust-Dienste, ohne Reverse Proxy
 
 > **Status: PROPOSED.** Reiner Plan. Kein Crate, keine Abhängigkeit, keine Unit
 > und kein Gate aus diesem Dokument existiert im Code. Nichts hier gilt als

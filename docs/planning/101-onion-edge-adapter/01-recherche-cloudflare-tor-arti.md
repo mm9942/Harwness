@@ -1,12 +1,12 @@
 ---
-id: PL-98-ONION-EDGE-ADAPTER-RECHERCHE
+id: PL-101-ONION-EDGE-ADAPTER-RECHERCHE
 title: "Recherche: Cloudflare ↔ Tor, Tor Browser, Zertifikate für .onion, arti 0.47 / 2.7.0, systemd-Prüfung, Crate-Stände, MagicDNS"
 status: Befunde mit Quellen (Stand 2026-11-01)
 date: 2026-11-01
 parent: README.md
 ---
 
-# Recherche zu PL-98-ONION-EDGE-ADAPTER (Stand 2026-11-01)
+# Recherche zu PL-101-ONION-EDGE-ADAPTER (Stand 2026-11-01)
 
 Jede Aussage trägt ihre Quelle. Was nicht belegt werden konnte, steht unter
 „Nicht verifiziert“. Belege aus den Repos (comnet, Harwness) stehen im
