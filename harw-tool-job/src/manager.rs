@@ -20,7 +20,10 @@
 //!   [`JobState::Unknown`], ohne Exit-Status, denn der war nicht
 //!   beobachtbar ([`DetachedWatch`]). Dieselbe Meldung entscheidet auch eine
 //!   Abfrage über denselben gesperrten Übergang, wenn sie das Ende zuerst
-//!   sieht — höchstens eine Meldung pro Job.
+//!   sieht — höchstens eine Meldung pro Job. Ein angehaltener
+//!   (eingefrorener) abgelöster Job ist nicht beendet: gemeldet wird erst,
+//!   wenn sein Prozess nachweislich fort ist, eine nicht prüfbare Identität
+//!   genügt nicht (`detached_ended`).
 //! - Stop: Signal an die ganze Prozessgruppe, nach der Gnadenfrist SIGKILL.
 //!   Eigene Kinder werden über einen direkt nach dem Start geöffneten pidfd
 //!   gesteuert ([`crate::procfs`]); Jobs früherer Sitzungen nur nach
@@ -1959,6 +1962,14 @@ impl JobManager {
     /// ([`DetachedWatch`]) und Abfragen entscheiden über denselben gesperrten
     /// Übergang — das Ende wird höchstens einmal gemeldet, ein laufendes
     /// `job.stop` (`stop_requested`) hat Vorrang.
+    ///
+    /// # Description
+    /// Ein angehaltener abgelöster Job (eingefroren, [`JobMeta::is_suspended`])
+    /// ist nicht beendet: er wird nur finalisiert, wenn bewiesen ist, dass
+    /// sein Prozess fort ist ([`detached_ended`]); sonst bleibt er
+    /// [`JobState::Detached`] samt Vermerk des Anhaltens, und nichts wird
+    /// gemeldet. [`JobState::Suspended`] (beaufsichtigt) berührt diese Stelle
+    /// nie: dessen Ende sammelt die Überwachung ein.
     fn finalize_detached(&self, entry: &Arc<JobEntry>) {
         let notification = {
             let mut state = lock(&entry.state);
@@ -1968,7 +1979,7 @@ impl JobManager {
             {
                 return;
             }
-            if !detached_exited(entry, &state.meta, self.liveness) {
+            if !detached_ended(entry, &state.meta, self.liveness) {
                 return;
             }
             state.meta.state = JobState::Unknown;
@@ -2989,7 +3000,9 @@ impl JobManager {
 /// früheren Sitzung): endet der Prozess, meldet
 /// [`JobManager::finalize_detached`] dem Besitzer ehrlich das Ende —
 /// [`JobState::Unknown`], ohne Exit-Status, denn der war nicht beobachtbar.
-/// Pro `DETACHED_POLL` ein Scan aller Einträge; ein
+/// Ein angehaltener (eingefrorener) abgelöster Job gilt dabei nur als
+/// beendet, wenn bewiesen ist, dass sein Prozess fort ist
+/// ([`detached_ended`]). Pro `DETACHED_POLL` ein Scan aller Einträge; ein
 /// einziger Task für alle Jobs statt einer Task je Job. Der Task hält den
 /// Manager nur schwach: ist der Manager fort (oder endet die Runtime), endet
 /// auch der Lauf; Abfrage-Pfade finalisieren weiterhin on demand.
@@ -3569,6 +3582,27 @@ fn detached_exited(entry: &JobEntry, meta: &JobMeta, liveness: LivenessCheck) ->
     match &entry.leader {
         Some(leader) => leader.has_exited(),
         None => liveness(meta) != Liveness::Alive,
+    }
+}
+
+/// Ob ein nicht beaufsichtigter Job als beendet gilt
+/// ([`JobManager::finalize_detached`], also Watch und Abfragen): wie
+/// [`detached_exited`], nur ein angehaltener Job einer früheren Sitzung
+/// ([`JobMeta::is_suspended`], ohne eigenen pidfd) braucht den Beweis, dass
+/// sein Prozess fort ist ([`Liveness::Exited`], oder die PID gehört einem
+/// anderen Prozess, [`Liveness::Mismatch`]). Eingefroren läuft er nicht
+/// weiter, aber er lebt: eine nicht prüfbare Identität
+/// ([`Liveness::Unverifiable`]) ist kein Ende. Sonst schlösse harw den
+/// Vermerk seines Anhaltens und meldete ein Ende, während die cgroup
+/// eingefroren bleibt; `job.resume` sähe dann einen Freeze außerhalb von harw
+/// und taute nie mehr auf. Mit eigenem pidfd ist das Ende ohnehin bewiesen.
+fn detached_ended(entry: &JobEntry, meta: &JobMeta, liveness: LivenessCheck) -> bool {
+    if entry.leader.is_some() || !meta.is_suspended() {
+        return detached_exited(entry, meta, liveness);
+    }
+    match liveness(meta) {
+        Liveness::Exited | Liveness::Mismatch(_) => true,
+        Liveness::Alive | Liveness::Unverifiable(_) => false,
     }
 }
 

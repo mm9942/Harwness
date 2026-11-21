@@ -29,9 +29,9 @@
 //! werden kann, nur die Absicht, die sichere Seite).
 
 use super::{
-    Caller, DirSync, EntryState, JobEntry, JobError, JobManager, SUSPENDED_ON_RELOAD,
-    SUSPENSION_UNRESOLVED_ON_RELOAD, SuspendTransition, SyncDirectory, lock, read_meta,
-    stop_signal_for, write_meta,
+    Caller, DETACHED_POLL, DirSync, EntryState, JobEntry, JobError, JobManager,
+    SUSPENDED_ON_RELOAD, SUSPENSION_UNRESOLVED_ON_RELOAD, SuspendTransition, SyncDirectory, lock,
+    read_meta, stop_signal_for, write_meta,
 };
 use crate::event::RecordingNotifier;
 use crate::event::{JobEvent, JobNotifier};
@@ -42,7 +42,7 @@ use crate::test_support::fake_cgroup::{
     FakeCgroup, FakeHolds, fake_kernel_id, freezer, freezer_over, freezer_with_holds, marker_index,
     write_marker,
 };
-use crate::test_support::{Env, TestError, TestResult, ctx, request, stub_job_meta};
+use crate::test_support::{Env, TestError, TestResult, ctx, eventually, request, stub_job_meta};
 use jiff::Timestamp;
 use std::fs;
 use std::io;
@@ -570,6 +570,22 @@ async fn stopping_a_detached_suspended_job_kills_it_and_closes_the_suspension() 
     assert_eq!(persisted.state, JobState::Stopped);
     assert_eq!(persisted.suspended_at, None);
     assert_eq!(persisted.suspend_phase, None);
+    // B7: the end is reported once, as a stop (never as an unknown end the
+    // detached watch saw first).
+    let finished = finished_reports(&env.recorder, &id);
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert!(
+        matches!(
+            &finished[0],
+            JobEvent::Finished {
+                state: JobState::Stopped,
+                exit_code: None,
+                signal: None,
+                ..
+            }
+        ),
+        "{finished:?}"
+    );
     Ok(())
 }
 
@@ -729,6 +745,21 @@ fn a_vanished_suspended_job_closes_its_suspension() -> TestResult {
     assert_eq!(persisted.state, JobState::Unknown);
     assert_eq!(persisted.suspended_at, None);
     assert_eq!(persisted.suspend_phase, None);
+    // B7: its process is proven gone, so the end is reported, once.
+    let finished = finished_reports(&env.recorder, &id);
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert!(
+        matches!(
+            &finished[0],
+            JobEvent::Finished {
+                state: JobState::Unknown,
+                exit_code: None,
+                signal: None,
+                ..
+            }
+        ),
+        "{finished:?}"
+    );
     Ok(())
 }
 
@@ -767,6 +798,208 @@ fn reload_closes_the_suspension_of_a_vanished_job() -> TestResult {
     assert_eq!(persisted.state, JobState::Unknown);
     assert_eq!(persisted.suspended_at, None);
     assert_eq!(persisted.suspend_phase, None);
+    Ok(())
+}
+
+/// The `Finished` reports `recorder` sent for `id`.
+fn finished_reports(recorder: &RecordingNotifier, id: &JobId) -> Vec<JobEvent> {
+    recorder
+        .notifications()
+        .into_iter()
+        .map(|notification| notification.event)
+        .filter(|event| event.job_id() == id && event.is_finished())
+        .collect()
+}
+
+/// Liveness of [`a_detached_suspended_job_is_never_reported_ended`]: the
+/// identity of a recorded PID cannot be checked (as when `/proc` refuses),
+/// a job without a PID is gone.
+fn unverifiable_unless_gone(meta: &JobMeta) -> Liveness {
+    match meta.pid {
+        Some(_) => Liveness::Unverifiable("test: identity not readable".to_owned()),
+        None => Liveness::Exited,
+    }
+}
+
+/// A detached stub job of `worker` without a monitor; `suspended` since 30 s
+/// (harw's own, `applied`) or not suspended.
+fn unsupervised_job(
+    manager: &JobManager,
+    id: &str,
+    state: JobState,
+    pid: Option<u32>,
+    suspended: bool,
+    leader: bool,
+) -> TestResult<JobId> {
+    let mut meta = stub_job_meta(id, state, "worker", &[], Some(id))?;
+    meta.detached = state == JobState::Detached;
+    meta.pid = pid;
+    meta.started_at = Some(ago(40)?);
+    if suspended {
+        meta.suspended_at = Some(ago(30)?);
+        meta.suspend_phase = Some(SuspendPhase::Applied);
+    }
+    match (leader, pid) {
+        (true, Some(pid)) => manager.insert_test_job_led(meta, false, pid),
+        _ => manager.insert_test_job(meta, false),
+    }
+    .map_err(ctx("insert unsupervised stub job"))
+}
+
+/// B7 (detached end reports) and PL-100 WP 3.5 (`job.suspend`): a detached
+/// job that is suspended (frozen) has not ended. Neither the detached watch
+/// nor a query (`job.status`, `job.list`) reports it `Finished` or makes it
+/// `unknown` while its process may still be there: not when the own pidfd
+/// shows the frozen leader alive, and not when the identity of a previous
+/// session's process is merely unverifiable (a detached job that is not
+/// suspended is finalized on that same reading, which shows the watch ran
+/// over all of them). A `suspended` job without a monitor is never touched
+/// either. Once a suspended process is proven gone, the watch reports its
+/// end exactly once (`unknown`, no exit status) and closes the suspension.
+#[tokio::test]
+async fn a_detached_suspended_job_is_never_reported_ended() -> TestResult {
+    let fake = Arc::new(FakeCgroup::default());
+    let env = env_with_freezer(&fake)?;
+    let recorder = Arc::new(RecordingNotifier::default());
+    let manager = JobManager::with_liveness(
+        env.manager.config().clone(),
+        Arc::clone(&recorder) as Arc<dyn JobNotifier>,
+        unverifiable_unless_gone,
+    )
+    .map_err(ctx("manager"))?;
+    manager.set_freezer(freezer(&fake));
+    let own_leader = Sleeper::spawn()?;
+    let previous = Sleeper::spawn()?;
+    // No await in between: the watch sees all four in the same scan.
+    let own = unsupervised_job(
+        &manager,
+        "job-frozen-own",
+        JobState::Detached,
+        Some(own_leader.pid()),
+        true,
+        true,
+    )?;
+    let old = unsupervised_job(
+        &manager,
+        "job-frozen-old",
+        JobState::Detached,
+        Some(previous.pid()),
+        true,
+        false,
+    )?;
+    let unsupervised = unsupervised_job(
+        &manager,
+        "job-frozen-unsupervised",
+        JobState::Suspended,
+        None,
+        true,
+        false,
+    )?;
+    let control = unsupervised_job(
+        &manager,
+        "job-unverifiable",
+        JobState::Detached,
+        Some(previous.pid()),
+        false,
+        false,
+    )?;
+    let state_of = |id: &JobId| -> TestResult<JobState> {
+        let entry = manager.entry(id, Caller::Operator).map_err(ctx("entry"))?;
+        Ok(lock(&entry.state).meta.state)
+    };
+
+    // The watch (not a query) finalizes the control job ...
+    let watched = eventually(Duration::from_secs(10), || {
+        state_of(&control).is_ok_and(|state| state == JobState::Unknown)
+    })
+    .await;
+    assert!(watched, "the detached watch did not run");
+    let control_end = finished_reports(&recorder, &control);
+    assert_eq!(control_end.len(), 1, "{control_end:?}");
+    // ... and in later scans and queries the suspended jobs stay suspended.
+    tokio::time::sleep(DETACHED_POLL * 3).await;
+    let listed = manager.list(Caller::Operator);
+    for (id, state) in [
+        (&own, JobState::Detached),
+        (&old, JobState::Detached),
+        (&unsupervised, JobState::Suspended),
+    ] {
+        let status = manager
+            .status(id, Caller::Operator)
+            .map_err(ctx("status"))?;
+        let meta = &status.meta;
+        assert_eq!(meta.state, state, "{id}");
+        assert!(meta.is_suspended(), "{id}");
+        assert_eq!(meta.suspend_phase, Some(SuspendPhase::Applied), "{id}");
+        assert!(meta.suspended_at.is_some(), "{id}");
+        assert_eq!(meta.ended_at, None, "{id}");
+        let shown = listed
+            .iter()
+            .find(|status| status.meta.job_id == *id)
+            .ok_or(TestError::Missing("listed job"))?;
+        assert_eq!(shown.meta.state, state, "{id}");
+        let persisted = read_meta(&status.log_dir).ok_or(TestError::Missing("meta.json"))?;
+        assert_eq!(persisted.state, state, "{id}");
+        assert!(persisted.suspended_at.is_some(), "{id}");
+        let reports = finished_reports(&recorder, id);
+        assert!(reports.is_empty(), "{id}: {reports:?}");
+    }
+
+    // The previous session's process is proven gone: reported once.
+    {
+        let entry = manager
+            .entry(&old, Caller::Operator)
+            .map_err(ctx("entry"))?;
+        lock(&entry.state).meta.pid = None;
+    }
+    let ended = eventually(Duration::from_secs(10), || {
+        state_of(&old).is_ok_and(|state| state == JobState::Unknown)
+    })
+    .await;
+    assert!(ended, "the end of the vanished suspended job was not seen");
+    // The own leader ends (killed and reaped): its pidfd proves it.
+    drop(own_leader);
+    let ended = eventually(Duration::from_secs(10), || {
+        state_of(&own).is_ok_and(|state| state == JobState::Unknown)
+    })
+    .await;
+    assert!(ended, "the end of the suspended own job was not seen");
+    for id in [&old, &own] {
+        let status = manager
+            .status(id, Caller::Operator)
+            .map_err(ctx("status"))?;
+        assert_eq!(status.meta.suspended_at, None, "{id}");
+        assert_eq!(status.meta.suspend_phase, None, "{id}");
+        assert!(
+            status.meta.suspended_secs >= 30,
+            "{id}: {}",
+            status.meta.suspended_secs
+        );
+        assert!(!status.meta.is_suspended(), "{id}");
+        let persisted = read_meta(&status.log_dir).ok_or(TestError::Missing("meta.json"))?;
+        assert_eq!(persisted.state, JobState::Unknown, "{id}");
+        assert_eq!(persisted.suspended_at, None, "{id}");
+        let reports = finished_reports(&recorder, id);
+        assert_eq!(reports.len(), 1, "{id}: {reports:?}");
+        assert!(
+            matches!(
+                &reports[0],
+                JobEvent::Finished {
+                    state: JobState::Unknown,
+                    exit_code: None,
+                    signal: None,
+                    ..
+                }
+            ),
+            "{id}: {reports:?}"
+        );
+    }
+    // The unsupervised `suspended` job is still left alone.
+    assert_eq!(state_of(&unsupervised)?, JobState::Suspended);
+    assert!(finished_reports(&recorder, &unsupervised).is_empty());
+    // Not a single cgroup write on the way.
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    drop(previous);
     Ok(())
 }
 
