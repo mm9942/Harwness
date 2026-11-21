@@ -683,14 +683,54 @@ fn attempt_restriction(roots: &[SandboxRoot]) -> (SandboxOutcome, Option<u8>) {
 
 /// Baut die `PathBeneath`-Regel einer geprüften Wurzel aus genau dem
 /// Deskriptor, den [`prepare_roots`] geprüft hat.
+///
+/// # Description
+/// Eine Wurzel, die kein Verzeichnis ist (etwa eine `--advisory-lockfile`),
+/// bekommt nur die für Dateien gültigen Rechte ([`access_for`]); sonst
+/// kürzte die `landlock`-Crate die Verzeichnisrechte selbst und meldete den
+/// ganzen Regelsatz als nur teilweise durchgesetzt.
 #[cfg(target_os = "linux")]
 fn rule_for(prepared: PreparedRoot, abi: ABI) -> PathBeneath<PathFd> {
-    let access = if prepared.root.writable {
-        AccessFs::from_all(abi)
-    } else {
-        AccessFs::from_read(abi)
-    };
-    PathBeneath::new(prepared.fd, access)
+    let is_dir = fd_is_directory(&prepared.fd);
+    PathBeneath::new(prepared.fd, access_for(prepared.root.writable, is_dir, abi))
+}
+
+/// Die Landlock-Rechte einer Wurzel.
+///
+/// # Arguments
+/// - `writable` (`bool`): lesend-schreibend statt nur lesend.
+/// - `is_dir` (`bool`): die Wurzel ist ein Verzeichnis. Unbekannt zählt als
+///   Verzeichnis: die `landlock`-Crate kürzt dann selbst (sicher, nur
+///   „teilweise durchgesetzt").
+/// - `abi` (`ABI`): die angeforderte ABI-Stufe.
+///
+/// # Returns
+/// Für ein Verzeichnis `from_all`/`from_read` der Stufe. Für eine Datei
+/// nur `ReadFile` (nur lesend; kein `Execute`, diese Wurzeln werden nur
+/// gelesen) bzw. `from_file` (lesend-schreibend) — nie mehr Rechte als
+/// für ein Verzeichnis.
+#[cfg(target_os = "linux")]
+fn access_for(writable: bool, is_dir: bool, abi: ABI) -> landlock::BitFlags<AccessFs> {
+    match (writable, is_dir) {
+        (true, true) => AccessFs::from_all(abi),
+        (false, true) => AccessFs::from_read(abi),
+        (true, false) => AccessFs::from_file(abi),
+        (false, false) => AccessFs::from_read(abi) & AccessFs::ReadFile,
+    }
+}
+
+/// Ob der geprüfte `O_PATH`-Deskriptor ein Verzeichnis ist (`fstat` auf
+/// einem Duplikat, wie [`fd_identity`]); nicht feststellbar zählt als
+/// Verzeichnis (siehe [`access_for`]).
+#[cfg(target_os = "linux")]
+fn fd_is_directory(fd: &RootFd) -> bool {
+    use std::os::fd::AsFd as _;
+    fd.as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .map(std::fs::File::from)
+        .and_then(|file| file.metadata().ok())
+        .is_none_or(|meta| meta.is_dir())
 }
 
 /// Baut das `SecurityEvent`, das eine fehlende oder unvollständige
@@ -1040,6 +1080,50 @@ mod tests {
         assert_eq!(super::abi_number(landlock::ABI::V1), Some(1));
         assert_eq!(super::abi_number(landlock::ABI::V3), Some(3));
         assert_eq!(super::abi_number(landlock::ABI::Unsupported), None);
+    }
+
+    /// A file root (an `--advisory-lockfile`) gets file rights only, never
+    /// directory rights; a directory root keeps the full read set.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_access_for_file_roots_drops_directory_rights() {
+        use landlock::{ABI, Access as _, AccessFs};
+        let abi = ABI::V1;
+        let file_read = super::access_for(false, false, abi);
+        assert_eq!(file_read, AccessFs::ReadFile);
+        assert!(!file_read.contains(AccessFs::ReadDir));
+        assert!(!file_read.contains(AccessFs::Execute));
+        assert_eq!(
+            super::access_for(false, true, abi),
+            AccessFs::from_read(abi)
+        );
+        assert_eq!(super::access_for(true, true, abi), AccessFs::from_all(abi));
+        assert_eq!(
+            super::access_for(true, false, abi),
+            AccessFs::from_file(abi)
+        );
+    }
+
+    /// `prepare_roots` accepts a regular file as a root, and its descriptor
+    /// reads as "not a directory" (only `O_PATH` and `fstat`, no Landlock).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_prepared_file_root_is_not_a_directory() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let lockfile = dir.path().join("Cargo.lock");
+        std::fs::write(&lockfile, "version = 4\n").map_err(ctx("write lockfile"))?;
+        let prepared = prepare_roots(&[
+            SandboxRoot::read_only(lockfile),
+            SandboxRoot::read_only(dir.path().to_path_buf()),
+        ]);
+        assert!(prepared.refused.is_empty(), "{:?}", prepared.refused);
+        let kinds: Vec<bool> = prepared
+            .accepted
+            .iter()
+            .map(|root| super::fd_is_directory(&root.fd))
+            .collect();
+        assert_eq!(kinds, [false, true]);
+        Ok(())
     }
 
     // Bewusst kein Test, der `restrict_self` tatsächlich aufruft: das würde

@@ -291,6 +291,35 @@ pub struct Cli {
     #[arg(long, value_enum, value_name = "MODE")]
     pub container_sensor: Option<ContainerSensorArg>,
 
+    /// Lokaler Checkout von `rustsec/advisory-db` für den Offline-Sensor
+    /// [`harw_dod_advisory::AdvisorySensor`] (PL-100 WP1.8, O11-Quelle
+    /// „Advisory"). Muss absolut sein und verlangt mindestens ein
+    /// `--advisory-lockfile`. Ohne Angabe läuft kein Advisory-Sensor und
+    /// keine zusätzliche Leseregel entsteht. Den Checkout aktuell zu halten
+    /// (eigene Kennung, eigener Timer) ist Aufgabe des Betriebs: der Sentinel
+    /// hat kein Netz und meldet einen veralteten Checkout als
+    /// `SensorDegraded`.
+    #[arg(
+        long,
+        value_name = "DIR",
+        value_parser = parse_absolute_path,
+        requires = "advisory_lockfiles"
+    )]
+    pub advisory_db: Option<PathBuf>,
+
+    /// Eine `Cargo.lock`, die der Advisory-Sensor gegen `--advisory-db`
+    /// prüft. Absolut, mehrfach angebbar, höchstens
+    /// [`MAX_ADVISORY_LOCKFILES`] (siehe [`Cli::validate`]); verlangt
+    /// `--advisory-db`. Jede Datei wird eine eigene, nur lesbare
+    /// Landlock-Regel (nie ihr Verzeichnis).
+    #[arg(
+        long = "advisory-lockfile",
+        value_name = "PATH",
+        value_parser = parse_absolute_path,
+        requires = "advisory_db"
+    )]
+    pub advisory_lockfiles: Vec<PathBuf>,
+
     /// Gibt die wirksamen Landlock-Lese-/Schreibwurzeln, die abgewiesenen
     /// Wurzeln und die zugelassenen IPC-Peer-uids auf stdout aus und beendet
     /// sich, ohne Socket, Sink oder Landlock anzufassen (Host-Verifikation,
@@ -323,7 +352,61 @@ impl From<ContainerSensorArg> for harw_dod_config::ContainerSensorMode {
     }
 }
 
+/// Höchstzahl der `--advisory-lockfile`-Angaben.
+///
+/// Jede Lockfile ist eine eigene Landlock-Regel und wird je Prüfung bis zu
+/// 1 MiB gelesen; die Grenze hält Regelsatz und Prüfaufwand endlich.
+pub const MAX_ADVISORY_LOCKFILES: usize = 64;
+
 impl Cli {
+    /// Prüft Grenzen, die `clap` je Angabe nicht ausdrücken kann.
+    ///
+    /// # Description
+    /// Heute nur [`MAX_ADVISORY_LOCKFILES`]. `main` ruft das direkt nach dem
+    /// Parsen auf; ein Verstoß endet wie ein Parse-Fehler.
+    ///
+    /// # Errors
+    /// Ein `clap::Error` (`TooManyValues`) bei mehr als
+    /// [`MAX_ADVISORY_LOCKFILES`] Lockfiles.
+    pub fn validate(self) -> Result<Self, clap::Error> {
+        if self.advisory_lockfiles.len() > MAX_ADVISORY_LOCKFILES {
+            return Err(<Self as clap::CommandFactory>::command().error(
+                clap::error::ErrorKind::TooManyValues,
+                format!(
+                    "--advisory-lockfile is given {} times, at most {MAX_ADVISORY_LOCKFILES} are allowed",
+                    self.advisory_lockfiles.len()
+                ),
+            ));
+        }
+        Ok(self)
+    }
+
+    /// Die Konfiguration des Advisory-Sensors (PL-100 WP1.8).
+    ///
+    /// # Returns
+    /// `Some` mit `--advisory-db`, den `--advisory-lockfile`-Angaben (ohne
+    /// Duplikate, Reihenfolge erhalten) und
+    /// [`harw_dod_advisory::DEFAULT_MAX_ADVISORIES`]; `None` ohne
+    /// `--advisory-db` oder ohne Lockfile (kein Sensor).
+    #[must_use]
+    pub fn advisory_config(&self) -> Option<harw_dod_advisory::AdvisoryConfig> {
+        let db_path = self.advisory_db.clone()?;
+        let mut lockfiles: Vec<PathBuf> = Vec::new();
+        for lockfile in &self.advisory_lockfiles {
+            if !lockfiles.contains(lockfile) {
+                lockfiles.push(lockfile.clone());
+            }
+        }
+        if lockfiles.is_empty() {
+            return None;
+        }
+        Some(harw_dod_advisory::AdvisoryConfig {
+            lockfiles,
+            db_path,
+            max_advisories: harw_dod_advisory::DEFAULT_MAX_ADVISORIES,
+        })
+    }
+
     /// The effective health export path.
     ///
     /// # Returns
@@ -468,6 +551,88 @@ mod tests {
             assert_eq!(harw_dod_config::ContainerSensorMode::from(arg), mode);
         }
         assert!(Cli::try_parse_from(["harw-sentinel", "--container-sensor", "yes"]).is_err());
+        Ok(())
+    }
+
+    /// PR #168 review (`harw-dod-advisory/src/lib.rs:5`): the advisory
+    /// sensor is opt-in, needs both flags, only absolute paths, and at most
+    /// `MAX_ADVISORY_LOCKFILES` lockfiles.
+    #[test]
+    fn test_advisory_flags_are_opt_in_paired_absolute_and_bounded() -> TestResult {
+        let none = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no advisory flags"))?;
+        assert_eq!(none.advisory_config(), None);
+
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--advisory-db",
+            "/var/lib/harw-dod/advisory-db",
+            "--advisory-lockfile",
+            "/srv/a/Cargo.lock",
+            "--advisory-lockfile",
+            "/srv/b/Cargo.lock",
+            "--advisory-lockfile",
+            "/srv/a/Cargo.lock",
+        ])
+        .and_then(Cli::validate)
+        .map_err(ctx("valid advisory flags"))?;
+        let config = cli
+            .advisory_config()
+            .ok_or(TestError::Missing("advisory config"))?;
+        assert_eq!(
+            config.db_path,
+            std::path::PathBuf::from("/var/lib/harw-dod/advisory-db")
+        );
+        assert_eq!(
+            config.lockfiles,
+            [
+                std::path::PathBuf::from("/srv/a/Cargo.lock"),
+                std::path::PathBuf::from("/srv/b/Cargo.lock"),
+            ],
+            "duplicates collapse, order is kept"
+        );
+        assert_eq!(
+            config.max_advisories,
+            harw_dod_advisory::DEFAULT_MAX_ADVISORIES
+        );
+
+        for args in [
+            &["harw-sentinel", "--advisory-db", "/var/lib/db"][..],
+            &["harw-sentinel", "--advisory-lockfile", "/srv/a/Cargo.lock"][..],
+            &[
+                "harw-sentinel",
+                "--advisory-db",
+                "db",
+                "--advisory-lockfile",
+                "/srv/a/Cargo.lock",
+            ][..],
+            &[
+                "harw-sentinel",
+                "--advisory-db",
+                "/var/lib/db",
+                "--advisory-lockfile",
+                "Cargo.lock",
+            ][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "{args:?} must not parse"
+            );
+        }
+
+        let mut too_many = vec![
+            "harw-sentinel".to_owned(),
+            "--advisory-db".to_owned(),
+            "/var/lib/db".to_owned(),
+        ];
+        for index in 0..=super::MAX_ADVISORY_LOCKFILES {
+            too_many.push("--advisory-lockfile".to_owned());
+            too_many.push(format!("/srv/p{index}/Cargo.lock"));
+        }
+        let error = Cli::try_parse_from(&too_many)
+            .and_then(Cli::validate)
+            .err()
+            .ok_or(TestError::Missing("bound violation"))?;
+        assert_eq!(error.kind(), clap::error::ErrorKind::TooManyValues);
         Ok(())
     }
 

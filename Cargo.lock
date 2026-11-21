@@ -4464,6 +4464,7 @@ dependencies = [
  "clap",
  "harw-authority",
  "harw-completions",
+ "harw-dod-advisory",
  "harw-dod-blockio",
  "harw-dod-cap",
  "harw-dod-cgroup",

@@ -32,6 +32,7 @@
 //! | `harw-dod-gpu` | [`harw_dod_gpu::GpuSensor`] | `ReadSysfsDrm` | `gpu_root` | `SensorHandle::new(id, Capability::ReadSysfsDrm).bind(scope).into()` |
 //! | `harw-dod-cgroup` | [`harw_dod_cgroup::CgroupSensor`] | `ReadCgroupV2` | `cgroup_root` | `SensorHandle::new(id, Capability::ReadCgroupV2).bind(scope).into()` |
 //! | `harw-dod-container` | [`harw_dod_container::ContainerSensor`] (je geplanter Anordnung, PL-100 WP1.8) | `ReadContainerScopes` | `cgroup_root/<slice>` und `proc_root` | `ContainerSensor::new(handle, config)` |
+//! | `harw-dod-advisory` | [`harw_dod_advisory::AdvisorySensor`] (PL-100 WP1.8, O11 „Advisory") | `ReadWorkspaceGraph` | jede `--advisory-lockfile` und `--advisory-db` (nur mit beiden Flags) | `AdvisorySensor::new(id, config)` |
 //!
 //! # sysfs-Klassenwurzeln über Alias-Wurzeln (PL-100 WP1.10)
 //! `thermal_root`, `blockio_root` und `gpu_root` sind sysfs-Klassen-
@@ -64,12 +65,21 @@
 //! neuer unprivilegierter Sensor braucht keine zweite Änderung an dieser
 //! Datei.
 //!
-//! Der Workspace-Sensor ist der einzige bedingte Eintrag: er wird nur
+//! Der Workspace-Sensor ist bedingt: er wird nur
 //! gebaut, wenn `--workspace-root` ausdrücklich angegeben ist
 //! ([`SensorRoots::workspace_root`] ist dann `Some`). Ohne das Flag gibt es
 //! weder den Sensor noch seine Landlock-Leseregel (PL-100 WP0.7: früher
 //! stand die Wurzel auf `.` und weitete die Sandbox über das
 //! Arbeitsverzeichnis auf `/`).
+//!
+//! Ebenso bedingt ist der Advisory-Sensor ([`SensorRoots::advisory`], aus
+//! `--advisory-db` und `--advisory-lockfile`): ohne beide Flags gibt es
+//! weder den Sensor noch seine Leseregeln. Mit ihnen liest er nur die
+//! genannten Lockfiles (je eine Datei-Regel, nie ihr Verzeichnis) und den
+//! Datenbank-Checkout. Seine Treffer sind `StructureDrift`-Ereignisse und
+//! laufen durch dieselbe Regelauswertung wie die aller anderen Sensoren
+//! (Regel `structure-drift`). Bis zum PR-#168-Review war die Crate gebaut,
+//! aber nirgends registriert.
 //!
 //! # Warum `harw-dod-authlog` fehlt, obwohl es gebaut ist
 //! `harw-dod-authlog` ist gelandet, taucht hier aber bewusst **nicht** auf.
@@ -141,6 +151,9 @@ use harw_types::SensorId;
 
 use crate::container_plan::PlannedLayout;
 
+/// Kennung des Advisory-Sensors ([`SensorRoots::advisory`]).
+pub const ADVISORY_SENSOR_ID: &str = "advisory-0";
+
 /// Wurzel, unterhalb derer eine Sensorwurzel als sysfs-Klassenverzeichnis
 /// gilt (siehe Moduldoku, „sysfs-Klassenwurzeln über Alias-Wurzeln").
 const SYSFS_ROOT: &str = "/sys";
@@ -193,6 +206,10 @@ pub struct SensorRoots {
     /// samt Bedeutung ihres fehlenden cgroup-Verzeichnisses (PL-100 WP1.8;
     /// [`crate::container_plan::plan`]). Leer: kein Container-Sensor.
     pub containers: Vec<PlannedLayout>,
+    /// Lockfiles und Datenbank des
+    /// [`harw_dod_advisory::AdvisorySensor`] (PL-100 WP1.8,
+    /// [`crate::cli::Cli::advisory_config`]). `None`: kein Advisory-Sensor.
+    pub advisory: Option<harw_dod_advisory::AdvisoryConfig>,
 }
 
 /// Der Lesebereich einer sysfs-Klassenwurzel (thermal, blockio, gpu).
@@ -350,7 +367,8 @@ fn workspace_sensor(root: &Path) -> Arc<dyn Sensor> {
 ///
 /// # Returns
 /// Ein `Vec<Arc<dyn Sensor>>`, bereit für `Sentinel::new`: zehn Sensoren mit
-/// `workspace_root`, neun ohne, dazu je Container-Anordnung einer. Nie leer, solange
+/// `workspace_root`, neun ohne, dazu je Container-Anordnung einer und mit
+/// [`SensorRoots::advisory`] der Advisory-Sensor. Nie leer, solange
 /// mindestens ein Sensorpfad existiert — [`Sentinel::poll_all`] behandelt
 /// einen nicht vorhandenen Quellpfad ohnehin als
 /// `SensorError::SourceUnavailable` je Sensor, nicht als Konstruktionsfehler
@@ -370,6 +388,7 @@ fn workspace_sensor(root: &Path) -> Arc<dyn Sensor> {
 ///     cgroup_root: PathBuf::from("/sys/fs/cgroup"),
 ///     home: PathBuf::from("/tmp/harw-home"),
 ///     containers: Vec::new(),
+///     advisory: None,
 /// };
 /// let sensors = build_sensors(&roots);
 /// assert_eq!(sensors.len(), 9);
@@ -445,6 +464,12 @@ pub fn build_sensors(roots: &SensorRoots) -> Vec<Arc<dyn Sensor>> {
             .iter()
             .map(|planned| container_sensor(*planned, &roots.cgroup_root, &roots.proc_root)),
     );
+    if let Some(config) = &roots.advisory {
+        sensors.push(Arc::new(harw_dod_advisory::AdvisorySensor::new(
+            SensorId::from_str(ADVISORY_SENSOR_ID),
+            config.clone(),
+        )));
+    }
     sensors
 }
 
@@ -493,6 +518,7 @@ mod tests {
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             home: PathBuf::from("/sys/fs/cgroup"),
             containers: Vec::new(),
+            advisory: None,
         }
     }
 
@@ -647,6 +673,7 @@ mod tests {
             cgroup_root: PathBuf::from("/nonexistent-harw-sentinel-cgroup"),
             home: PathBuf::from("/nonexistent-harw-sentinel-cgroup"),
             containers: every_layout(MissingRoot::Unavailable),
+            advisory: None,
         };
         let sensors = build_sensors(&roots);
         assert_eq!(sensors.len(), 12);
@@ -682,6 +709,46 @@ mod tests {
                     .allows(Path::new("/sys/fs/cgroup/user.slice"))
             );
         }
+        Ok(())
+    }
+
+    /// PR #168 review (`harw-dod-advisory/src/lib.rs:5`): with an advisory
+    /// configuration exactly one unprivileged advisory sensor is registered,
+    /// bound to the lockfiles and the database only; without it none.
+    #[test]
+    fn test_build_sensors_registers_the_advisory_sensor_only_when_configured() -> TestResult {
+        assert!(
+            build_sensors(&roots())
+                .iter()
+                .all(|sensor| sensor.handle().id().as_str() != super::ADVISORY_SENSOR_ID),
+            "no advisory sensor without configuration"
+        );
+        let roots = SensorRoots {
+            advisory: Some(harw_dod_advisory::AdvisoryConfig {
+                lockfiles: vec![PathBuf::from("/srv/a/Cargo.lock")],
+                db_path: PathBuf::from("/var/lib/harw-dod/advisory-db"),
+                max_advisories: harw_dod_advisory::DEFAULT_MAX_ADVISORIES,
+            }),
+            ..roots()
+        };
+        let sensors = build_sensors(&roots);
+        assert_eq!(sensors.len(), 11);
+        assert!(all_unprivileged(&sensors));
+        let advisory = sensors
+            .iter()
+            .find(|s| s.handle().id().as_str() == super::ADVISORY_SENSOR_ID)
+            .ok_or(TestError::Missing("advisory sensor is registered"))?;
+        assert_eq!(
+            advisory.handle().capability(),
+            Capability::ReadWorkspaceGraph
+        );
+        let scope = advisory.handle().scope();
+        assert!(scope.allows(Path::new("/srv/a/Cargo.lock")));
+        assert!(scope.allows(Path::new(
+            "/var/lib/harw-dod/advisory-db/crates/tokio/RUSTSEC-2021-0124.md"
+        )));
+        assert!(!scope.allows(Path::new("/srv/a/src/main.rs")));
+        assert!(!scope.allows(Path::new("/srv/a/.env")));
         Ok(())
     }
 
