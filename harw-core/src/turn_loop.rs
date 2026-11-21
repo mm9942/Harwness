@@ -2583,6 +2583,38 @@ fn append_handoff_tools(
     }
 }
 
+/// Ob der Turn-Loop ein erzeugtes Delegationswerkzeug (ohne
+/// Registry-Ausführer) dieser Session gerade anbietet.
+///
+/// # Beschreibung
+/// Welche Namen überhaupt erzeugte Delegationswerkzeuge sind, entscheidet
+/// allein [`crate::child_approval::is_generated_delegation_tool`]; hier kommt
+/// nur die Sichtbarkeit dazu — dieselben Regeln für Modus, Ziele und
+/// Aktivierung wie bei der Modellanfrage ([`append_handoff_tools`]). Eine
+/// Freigabe darf ein inzwischen abgeschaltetes Werkzeug nicht wieder
+/// aufrufbar machen.
+pub(crate) fn generated_delegation_tool_available(session: &AgentSession, name: &ToolName) -> bool {
+    if !crate::child_approval::is_generated_delegation_tool(name) {
+        return false;
+    }
+    // Ein registriertes Werkzeug besitzt seinen Namen, auch ohne Ausführer.
+    if session.registry().tool_providers().iter().any(|provider| {
+        provider
+            .tools()
+            .iter()
+            .any(|spec| spec.name() == name.as_str())
+    }) {
+        return false;
+    }
+    let plan_mode = session.mode() == crate::mode::InteractionMode::Plan;
+    let Some(Ok(targets)) = session_delegation_targets(session, plan_mode) else {
+        return false;
+    };
+    let mut tools = Vec::new();
+    append_handoff_tools(session, &mut tools, &targets.targets);
+    tools.iter().any(|spec| spec.name() == name.as_str())
+}
+
 /// Plan R9, Teil C: schränkt `targets[].role` eines vorhandenen
 /// `delegate_wave`-Werkzeugs auf die sichtbaren Ziele ein (Enum).
 ///
@@ -2792,16 +2824,6 @@ fn delegation_refusal(
     }
 }
 
-/// Plan R9, Teil C: Rolle und Handoff-Argumente eines Delegationsaufrufs —
-/// `transfer_to_<rolle>` (Argumente unverändert) oder ein gültiges
-/// `agents.delegate` (Argumente ohne `agent`).
-fn delegation_call(call: &ToolCall) -> Option<(String, serde_json::Value)> {
-    if let Some(role) = handoff_role(&call.name) {
-        return Some((role, call.arguments.clone()));
-    }
-    delegate_tool_role(call).and_then(Result::ok)
-}
-
 /// Plan R9, Teil C: die Delegationsziele der Session ohne die, deren
 /// `transfer_to_<name>` die Aktivierung ausdrücklich abschaltet (etwa
 /// `forbidden = ["transfer_to_executor"]` des Matrix-Game-Masters).
@@ -2857,7 +2879,12 @@ fn delegation_step(
     let plan_mode = session.mode() == crate::mode::InteractionMode::Plan;
     if call.name.as_str() == AGENTS_CATALOG_TOOL && find_executor(session, &call.name).is_none() {
         let result = match session_delegation_targets(session, plan_mode) {
-            Some(Ok(targets)) => agents_catalog_result(&targets, &call.arguments),
+            Some(Ok(targets)) if generated_delegation_tool_available(session, &call.name) => {
+                agents_catalog_result(&targets, &call.arguments)
+            }
+            Some(Ok(_)) => ToolCallResult::error(
+                "agents.catalog: Werkzeug ist für diese Sitzung nicht verfügbar".to_owned(),
+            ),
             Some(Err(error)) => ToolCallResult::error(error.to_string()),
             None => ToolCallResult::error(
                 "agents.catalog: kein Agent-Spawner in dieser Sitzung".to_owned(),
@@ -4337,27 +4364,49 @@ async fn resume_after_approval_with_store(
                         .await;
                     }
                 };
-                // Plan R9, Teil C: `agents.delegate` wird wie
-                // `transfer_to_<agent>` gespawnt (Argumente ohne `agent`).
-                if let Some((role, handoff_arguments)) = delegation_call(&pending.call) {
-                    // Background-only: refuse before spawning, so no child leaks.
-                    if let Some(result) = background_only_refusal(session, &handoff_arguments) {
-                        // Nichts gespawnt: das Ergebnis steht fest.
-                        drop(permit);
-                        notify_tool_outcome(
-                            session,
-                            pending.call.name.as_str(),
-                            &pending.call.arguments,
-                            &result,
-                        );
-                        notify_tool_progress(session);
-                        session
-                            .history_mut()
-                            .push_tool_result(pending.call.id, result, 0);
-                        persist_last(session, store).await?;
-                        return drive_turn(session, model, store, approvals, &ctx, handle, control)
-                            .await;
-                    }
+                // Wie im normalen Dispatch (`delegation_step`): der Katalog
+                // wird lokal beantwortet, eine Delegation prüft auch nach der
+                // Freigabe Sichtbarkeit, Plan-Modus und Background-only, bevor
+                // ein Kind entsteht. Ein erzeugtes Delegationswerkzeug, das
+                // während der Freigabe abgeschaltet wurde, bleibt
+                // unerreichbar. Andere Operationen (auch `agent.message`)
+                // bleiben auf dem reinen Ausführerpfad.
+                let (handoff, local_result) =
+                    if crate::child_approval::is_generated_delegation_tool(&pending.call.name) {
+                        if find_executor(session, &pending.call.name).is_none()
+                            && !generated_delegation_tool_available(session, &pending.call.name)
+                        {
+                            (
+                                None,
+                                Some(ToolCallResult::error(format!(
+                                    "{}: Werkzeug ist für diese Sitzung nicht verfügbar",
+                                    pending.call.name
+                                ))),
+                            )
+                        } else {
+                            delegation_step(session, &pending.call)
+                        }
+                    } else {
+                        (None, None)
+                    };
+                if let Some(result) = local_result {
+                    // Nichts gespawnt: das Ergebnis steht fest.
+                    drop(permit);
+                    notify_tool_outcome(
+                        session,
+                        pending.call.name.as_str(),
+                        &pending.call.arguments,
+                        &result,
+                    );
+                    notify_tool_progress(session);
+                    session
+                        .history_mut()
+                        .push_tool_result(pending.call.id, result, 0);
+                    persist_last(session, store).await?;
+                    return drive_turn(session, model, store, approvals, &ctx, handle, control)
+                        .await;
+                }
+                if let Some((role, handoff_arguments)) = handoff {
                     let spawner = session.registry().spawner().cloned().ok_or_else(|| {
                         CoreError::HandoffFailed {
                             role: role.clone(),
@@ -14633,15 +14682,211 @@ mod tests {
     }
 
     fn catalog_session(spawner: Arc<CatalogSpawner>) -> TestResult<AgentSession> {
+        catalog_session_with_approval(spawner, None)
+    }
+
+    fn catalog_session_with_approval(
+        spawner: Arc<CatalogSpawner>,
+        approval: Option<Arc<dyn harw_extension_api::ApprovalHandler>>,
+    ) -> TestResult<AgentSession> {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let registry = ExtensionRegistryBuilder::default()
+        let mut registry = ExtensionRegistryBuilder::default()
             .tool_provider(StubToolProvider::with_names(&["fs.read"]))
             .spawner(spawner)
-            .agent_job_submitter(RecordingJobSubmitter::new())
-            .build();
-        Ok(AgentSession::new(AgentRole::Assistant, None, registry, tx)
-            .with_activation(SessionActivation::new(ToolProfile::Minimal))
-            .with_spawn_context(test_spawn_context()?))
+            .agent_job_submitter(RecordingJobSubmitter::new());
+        if let Some(approval) = approval {
+            registry = registry.approval_handler(approval);
+        }
+        Ok(
+            AgentSession::new(AgentRole::Assistant, None, registry.build(), tx)
+                .with_activation(SessionActivation::new(ToolProfile::Minimal))
+                .with_spawn_context(test_spawn_context()?),
+        )
+    }
+
+    #[tokio::test]
+    async fn agents_catalog_runs_after_explicit_approval() -> TestResult {
+        catalog_after_explicit_approval(false).await
+    }
+
+    #[tokio::test]
+    async fn agents_catalog_disabled_during_approval_stays_unavailable() -> TestResult {
+        catalog_after_explicit_approval(true).await
+    }
+
+    async fn catalog_after_explicit_approval(disabled: bool) -> TestResult {
+        let id = ToolCallId::new();
+        let approval = Arc::new(CountingApproval::new(vec![(
+            id.clone(),
+            ApprovalDecision::AskUser(harw_types::ItemId::new()),
+        )]));
+        let mut session =
+            catalog_session_with_approval(CatalogSpawner::new(analysis_catalog()), Some(approval))?;
+        session.set_mode(crate::mode::InteractionMode::Plan);
+        let model = RecordingModel::new(vec![
+            response_with(vec![ToolCall {
+                id,
+                name: ToolName::new(AGENTS_CATALOG_TOOL),
+                arguments: serde_json::json!({}),
+            }]),
+            crate::model::ModelResponse::text("done"),
+        ]);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("research"))
+            .await
+            .map_err(ctx("catalog approval"))?;
+        assert!(matches!(outcome, TurnOutcome::AwaitingApproval { .. }));
+        if disabled {
+            *session.activation_mut() = SessionActivation::new(ToolProfile::Full);
+            session
+                .activation_mut()
+                .disable_tool(ToolName::new(AGENTS_CATALOG_TOOL));
+        }
+        let actor = session
+            .pending_approval()
+            .ok_or(TestError::Missing("pending approval"))?
+            .actor
+            .clone();
+        let outcome = resume_after_approval(
+            &mut session,
+            &model,
+            &store,
+            actor,
+            ApprovalResolution::Approve,
+        )
+        .await
+        .map_err(ctx("approved catalog"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed));
+        let results = tool_results(&session);
+        if disabled {
+            assert!(
+                matches!(results.as_slice(), [ToolCallResult::Error { .. }]),
+                "{results:?}"
+            );
+            return Ok(());
+        }
+        let [ToolCallResult::Success { value }] = results.as_slice() else {
+            return Err(TestError::Unexpected(format!("{results:?}")));
+        };
+        assert_eq!(value["count"], serde_json::json!(2));
+        assert!(!value["agents"].to_string().contains("executor"));
+        Ok(())
+    }
+
+    /// Generated tools have no registry executor, but must survive the child
+    /// approval relay and dispatch through the same path as an ordinary turn.
+    #[tokio::test]
+    async fn generated_delegation_tools_survive_child_approval() -> TestResult {
+        use crate::child_approval::{
+            ChildApprovalAnswer, ChildApprovalBroker, ChildApprovalRequest,
+        };
+        struct Approve;
+        impl ChildApprovalBroker for Approve {
+            fn submit(
+                &self,
+                _request: ChildApprovalRequest,
+            ) -> Option<tokio::sync::oneshot::Receiver<ChildApprovalAnswer>> {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(ChildApprovalAnswer::Approve);
+                Some(rx)
+            }
+        }
+
+        for (name, disabled, allowed) in [
+            (AGENTS_CATALOG_TOOL, false, true),
+            ("transfer_to_explorer", false, true),
+            (AGENTS_DELEGATE_TOOL, false, true),
+            (AGENTS_CATALOG_TOOL, true, false),
+            ("transfer_to_explorer", true, false),
+            (AGENTS_DELEGATE_TOOL, true, false),
+            ("transfer_to_executor", false, false),
+            ("host.sudo_exec", false, false),
+        ] {
+            let mut catalog = analysis_catalog();
+            if name == AGENTS_DELEGATE_TOOL {
+                for n in 0..8 {
+                    catalog.push(catalog_entry(
+                        &format!("reader-{n}"),
+                        "worker",
+                        true,
+                        true,
+                        "read",
+                    ));
+                }
+            }
+            let spawner = CatalogSpawner::new(catalog);
+            let id = ToolCallId::new();
+            let approval = Arc::new(CountingApproval::new(vec![(
+                id.clone(),
+                ApprovalDecision::AskUser(harw_types::ItemId::new()),
+            )]));
+            let mut session = catalog_session_with_approval(Arc::clone(&spawner), Some(approval))?;
+            if name != "host.sudo_exec" {
+                session.set_mode(crate::mode::InteractionMode::Plan);
+            }
+            let model = RecordingModel::new(vec![
+                response_with(vec![ToolCall {
+                    id,
+                    name: ToolName::new(name),
+                    arguments: if name == AGENTS_CATALOG_TOOL {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({"agent": "explorer", "task": "read"})
+                    },
+                }]),
+                crate::model::ModelResponse::text("done"),
+            ]);
+            let store = crate::state_store::InMemoryStateStore::new();
+            let outcome = run_turn(&mut session, &model, &store, TurnInput::user("research"))
+                .await
+                .map_err(ctx("pause for approval"))?;
+            assert!(
+                matches!(outcome, TurnOutcome::AwaitingApproval { .. }),
+                "{outcome:?}"
+            );
+            if disabled {
+                *session.activation_mut() = SessionActivation::new(ToolProfile::Full);
+                session.activation_mut().disable_tool(ToolName::new(name));
+            }
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let controller = crate::child_controller::ManagedAgentSpawner::new(
+                Arc::new(Mutex::new(crate::SessionManager::new(tx))),
+                crate::child_controller::ChildLimits::default(),
+            );
+            controller.attach_child_approval_broker(Arc::new(Approve));
+            let child = session.id().clone();
+            let outcome = crate::child_approval::relay_child_approvals(
+                &controller,
+                &child,
+                &mut session,
+                &model,
+                &store,
+                None,
+                outcome,
+            )
+            .await
+            .map_err(ctx("relay generated tool approval"))?;
+            assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+            let results = tool_results(&session);
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0].is_success(),
+                allowed,
+                "{name}, disabled={disabled}: {results:?}"
+            );
+            if allowed && name == AGENTS_CATALOG_TOOL {
+                let ToolCallResult::Success { value } = &results[0] else {
+                    return Err(TestError::Unexpected(format!("{results:?}")));
+                };
+                assert_eq!(value["count"], serde_json::json!(2));
+                assert!(!value["agents"].to_string().contains("executor"));
+            }
+            assert_eq!(
+                spawner.take().is_some(),
+                allowed && name != AGENTS_CATALOG_TOOL
+            );
+        }
+        Ok(())
     }
 
     fn tool_results(session: &AgentSession) -> Vec<ToolCallResult> {

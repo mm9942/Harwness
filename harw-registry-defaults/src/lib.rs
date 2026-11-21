@@ -331,6 +331,9 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // `profile::skill_catalog_tools_for_role`, nie über ein `RegistryProfile`.
     "skills.search",
     "skills.load",
+    // Turn-loop catalog: reads only the caller's already-visible delegation
+    // targets. Unlike agents.delegate it neither starts nor changes an agent.
+    "agents.catalog",
     // Plan R9, Teil F: die lesenden Job-Werkzeuge (`harw-tool-job`,
     // `JOB_READ_TOOLS`): `job.status`/`job.logs`/`job.list` lesen nur
     // Zustand und Logdateien eigener Jobs bzw. der Jobs von Nachfahren
@@ -1187,6 +1190,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn agents_catalog_is_read_only_but_still_respects_always_ask() {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleScope};
+
+        let catalog = call("agents.catalog");
+        let auto = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::Delegated));
+        assert!(matches!(
+            auto.review(&catalog).await,
+            ApprovalDecision::Allow
+        ));
+        let ask = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::AlwaysAsk));
+        assert!(matches!(
+            ask.review(&catalog).await,
+            ApprovalDecision::AskUser(_)
+        ));
+        // Starting a child is not a catalog read: retain its approval policy.
+        assert!(DefaultApprovalPolicy::requires_explicit_approval(&call(
+            "agents.delegate"
+        )));
+        let rules = AllowRuleSet::from_rules(vec![ApprovalRule {
+            tool: "agents.catalog".to_owned(),
+            pattern: None,
+            decision: RuleDecision::Deny,
+            scope: RuleScope::Session,
+        }]);
+        let restricted = DefaultApprovalPolicy::with_rules(
+            ApprovalModeCell::new(ApprovalMode::Delegated),
+            rules,
+        );
+        assert!(!matches!(
+            restricted.review(&catalog).await,
+            ApprovalDecision::Allow
+        ));
+    }
+
     #[test]
     fn read_only_profile_tools_registered_here_stay_auto_approved() {
         // Fan-out-Schutz: ein Kind mit `allow_pause = false` kann keine
@@ -1223,6 +1261,7 @@ mod tests {
         // muss in die Allowlist“, sondern „jeder Allowlist-Eintrag muss
         // nachweislich read-only sein“.
         let mut read_only_surface: Vec<&str> = READ_ONLY_ROOT_OPERATIONS.to_vec();
+        read_only_surface.push("agents.catalog");
         read_only_surface.extend_from_slice(NON_PAUSING_ORCHESTRATION_OPERATIONS);
         // Lesende Wissenswerkzeuge (Plan Teil D): von der Composition-Root
         // registriert, nicht über ein Profil — die Rechteklasse jedes Namens
