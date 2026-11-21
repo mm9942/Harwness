@@ -31,7 +31,7 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
 .PHONY: help clippy-tests clippy tests fmt check build install uninstall service gates \
-	dod-build dod-install dod-enable dod-uninstall release release-publish
+	dod-build dod-install dod-enable dod-uninstall release release-publish site site-check
 
 .DEFAULT_GOAL := help
 
@@ -152,3 +152,9 @@ dod-enable: ## DoD: explicitly validate config and enable observation
 
 dod-uninstall: ## DoD: stop/disable all DoD units, remove manifest-owned files (config/state/logs preserved; re-enable opt-ins after reinstall)
 	$(MAKE) -C harw-dod uninstall
+
+site: ## Website: build site/dist from site/src
+	python3 -I site/build_content.py
+
+site-check: site ## Website: build and validate site/dist
+	python3 -I site/validate_site.py
