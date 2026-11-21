@@ -843,6 +843,21 @@ mod tests {
                 .iter()
                 .any(|s| s.session_id == second.session_id)
         );
+        assert_eq!(ingress.host.listener_enabled("local"), Some(true));
+        assert_eq!(ingress.host.listener_enabled("node"), Some(true));
+        // Disabling node ingress stops new handshakes. The local recovery path remains available.
+        ingress
+            .host
+            .register_listener(harw_protocol::session_wire::GatewayListenerInfo {
+                name: "node".into(),
+                kind: harw_protocol::session_wire::ListenerKind::Node,
+                address: ingress.addr().to_string(),
+                enabled: false,
+            });
+        assert!(dial(ingress.addr(), &gateway, &phone).await.is_err());
+        let local_reconnect =
+            connect_unix(unix.socket().to_owned(), ConnectOptions::new("desktop")).await?;
+        drop(local_reconnect);
         drop((desktop, mobile));
         unix.shutdown().await;
         ingress.shutdown().await;

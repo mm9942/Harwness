@@ -26,6 +26,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use harw_node_transport::{AuthenticatedPeer, NodeTransportServer, UpgradeError, peer_of};
+use harw_protocol::session_wire::{GatewayListenerInfo, ListenerKind};
 use harw_session_host::{ConnectionId, HostError, SessionHost};
 use harw_session_ws::dispatch::Ports;
 use harw_session_ws::{WsLimits, serve_connection_with, upgrade};
@@ -39,6 +40,8 @@ pub use identity::{
     RejectedLine, TierChange, TierChangeError,
 };
 pub use revoke::{HostRevoker, LiveConnections, RevocationReport, RevocationSink};
+
+const NODE_LISTENER: &str = "node";
 
 /// Failures of the listener.
 #[derive(Debug, thiserror::Error)]
@@ -202,6 +205,11 @@ impl tower_service::Service<Request<Incoming>> for ListenerService {
     }
 
     fn call(&mut self, request: Request<Incoming>) -> Self::Future {
+        if self.handler.host.listener_enabled(NODE_LISTENER) != Some(true) {
+            return Box::pin(async {
+                Ok(status(StatusCode::SERVICE_UNAVAILABLE, "listener disabled"))
+            });
+        }
         let peer = peer_of(&request);
         let handler = Arc::clone(&self.handler);
         if request.uri().path() == "/v1/provider-link/chatgpt" {
@@ -292,6 +300,15 @@ impl NodeListener {
     where
         F: Future<Output = ()>,
     {
+        let addr = listener
+            .local_addr()
+            .map_err(|error| ListenerError::Io(error.to_string()))?;
+        self.handler.host.register_listener(GatewayListenerInfo {
+            name: NODE_LISTENER.to_owned(),
+            kind: ListenerKind::Node,
+            address: addr.to_string(),
+            enabled: true,
+        });
         let live = self.handler.live.clone();
         let shutdown = async move {
             shutdown.await;

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use harw_protocol::session_wire::{GatewayListenerInfo, ListenerKind};
 use harw_session_com::local::peer_identity;
 use harw_session_com::{ComConfig, ComServer, HostBinder, PortOffer};
 use harw_session_host::SessionHost;
@@ -236,6 +237,13 @@ impl UdsServer {
             socket_id,
             _lock,
         } = self;
+        const LOCAL_LISTENER: &str = "local";
+        host.register_listener(GatewayListenerInfo {
+            name: LOCAL_LISTENER.to_owned(),
+            kind: ListenerKind::LocalUds,
+            address: config.socket_path.display().to_string(),
+            enabled: true,
+        });
         let config = Arc::new(config);
         // The per-connection path (peer identity, upgrade, bounded
         // connections, drain) is the Com layer's; this crate keeps the socket
@@ -261,6 +269,9 @@ impl UdsServer {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _)) => {
+                            if host.listener_enabled(LOCAL_LISTENER) != Some(true) {
+                                continue;
+                            }
                             let Some(mut identity) =
                                 peer_identity(&stream, config.allowed_uid, config.tier)
                             else {
