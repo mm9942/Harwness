@@ -1,0 +1,176 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.context-steward@1",
+  "version": "1.0.0",
+  "name": "Context Steward",
+  "description": "Ordnet und fasst bereits abgerufene ContextProposal-/ModelBehaviorProposal-Bestände zusammen; wendet nie an und entscheidet nie.",
+  "role": "worker",
+  "specialization": "context-steward",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "",
+    "source": null,
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+  },
+  "tools": {
+    "admitted": [],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 40000,
+      "max_tool_calls": 20,
+      "max_wall_secs": 120,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.envelope@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "context-curation",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": []
+  },
+  "binary": {
+    "name": "context-steward",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": false,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 40000,
+      "max_tool_calls": 20,
+      "max_wall_secs": 120,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "requirements": {
+    "targets": [],
+    "process_exec": false,
+    "host_access": false,
+    "network": "none",
+    "filesystem_write": false,
+    "sandbox": {
+      "filesystem": "not_needed",
+      "network": "not_needed",
+      "no_new_privs": "not_needed",
+      "capabilities": "not_needed",
+      "resource_limits": "not_needed"
+    },
+    "resources": {
+      "memory_max_bytes": null,
+      "pids_max": null,
+      "wall_timeout_secs": null
+    },
+    "kernel": {
+      "landlock": false,
+      "cgroup_v2": false,
+      "user_namespaces": false
+    },
+    "dod_ebpf": false
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.context-steward@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "15d49880bd7801e2c73474fa12620fe7586e14d6f6ea2d2e1ed6db7cb99a8eaa"
+  }
+}
