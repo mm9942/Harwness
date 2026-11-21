@@ -356,7 +356,23 @@ mod tests {
         CgroupId::try_from_str("harw.slice/job-1").map_err(ctx("cgroup"))
     }
 
+    // Warden mit nutzbarem Markerindex (wie tmpfiles: `holds`, `0755`, dem
+    // Warden-Nutzer). Seit 1396600b friert der Warden nur mit Marker ein.
     fn warden(dir: &std::path::Path, executor: RecordingExecutor) -> TestResult<Warden> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let holds = dir.join("holds");
+        std::fs::create_dir_all(&holds).map_err(ctx("holds dir"))?;
+        std::fs::set_permissions(&holds, std::fs::Permissions::from_mode(0o755))
+            .map_err(ctx("chmod holds dir"))?;
+        warden_with_markers(dir, executor, ContainmentMarkers::new(holds))
+    }
+
+    fn warden_with_markers(
+        dir: &std::path::Path,
+        executor: RecordingExecutor,
+        markers: ContainmentMarkers,
+    ) -> TestResult<Warden> {
         let mut keys = KeyRing::new();
         keys.insert(
             KeyId::new("k1").map_err(ctx("key id"))?,
@@ -380,9 +396,7 @@ mod tests {
             keys,
             policy,
             state: WardenState::open(dir, at(0)?).map_err(ctx("state"))?,
-            // Ohne Indexverzeichnis: jeder Freeze meldet den fehlenden Marker
-            // und friert trotzdem (hier nicht Gegenstand der Prüfung).
-            markers: ContainmentMarkers::new(dir.join("holds")),
+            markers,
         }))
     }
 
@@ -492,6 +506,21 @@ mod tests {
             reason(&respond(&bytes, &warden, at(2)?)),
             Some(Denial::ProofMismatch)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_freeze_without_a_marker_index_is_unavailable_and_never_executes() -> TestResult {
+        let dir = private_tempdir()?;
+        let executor = RecordingExecutor::new();
+        let markers = ContainmentMarkers::new(dir.path().join("missing-holds"));
+        let warden = warden_with_markers(dir.path(), executor.clone(), markers)?;
+        let bytes = serde_json::to_vec(&freeze_request(7)?).map_err(ctx("encode"))?;
+        assert_eq!(
+            reason(&respond(&bytes, &warden, at(1)?)),
+            Some(Denial::Unavailable)
+        );
+        assert!(executor.calls().is_empty());
         Ok(())
     }
 
