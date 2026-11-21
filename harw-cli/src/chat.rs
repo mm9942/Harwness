@@ -2151,7 +2151,15 @@ mod tests {
     /// checking which model windows still carry the root. The 32,768-token
     /// fallback window for unknown models does not carry it any more (see
     /// [`FIXTURE_MODEL_CONTEXT_WINDOW_TOKENS`]).
-    const FULL_ROOT_TOOL_SPEC_BUDGET_BYTES: u64 = 96 * 1024;
+    ///
+    /// Raised from 96 KiB to 100 KiB on purpose (2026-11 consolidation): the
+    /// merged PL-100 work (DoD triage tools), `agents.catalog`, `job.suspend`
+    /// / `job.resume` and larger `sys.*` specs (15,971 bytes) brought the root
+    /// to 101 tool specs in 98,635 bytes, about 32,900 estimated tokens. All
+    /// of that surface is intended; the root already needs a window well above
+    /// the 32k fallback, so 100 KiB keeps about 1.7 KB of headroom without
+    /// changing which model windows carry the root.
+    const FULL_ROOT_TOOL_SPEC_BUDGET_BYTES: u64 = 100 * 1024;
 
     /// Records the name and serialized size of every tool spec of each
     /// request and answers with plain text, so the turn ends after one round.
