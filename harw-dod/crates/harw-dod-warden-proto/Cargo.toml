@@ -1,6 +1,6 @@
 [package]
 name = "harw-dod-warden-proto"
-description = "Wire protocol for escalation manager and warden: actions, authorization, requests, responses, denials, stages"
+description = "Signing part of the escalation manager / warden wire protocol: signed authorization, keys, nonce ledger, request and reply envelopes"
 publish.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -9,6 +9,11 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# PL-100 WP 3.0 (Leitprinzip I8): das signierfreie Vokabular (`WardenAction`,
+# `EscalationStage`, `CgroupTarget`, `Denial`, `WardenResponse`, kanonische
+# Kodierungsbausteine) liegt dort und wird hier unter den bisherigen Pfaden
+# re-exportiert. Diese Crate behält MAC, Schlüssel, Nonce-Ledger und Hüllen.
+harw-dod-warden-types = { path = "../harw-dod-warden-types" }
 # Vokabular-Grundlage: `FindingId`, `CgroupId`, `ApprovalActor`,
 # `ContentDigest` (siehe lib.rs-Moduldoku, Abschnitt „Prüfung 2").
 harw-types = { path = "../../../harw-types" }
@@ -46,7 +51,8 @@ serde = { workspace = true }
 jiff = { workspace = true }
 # Trägt die Bindungsregel für `AuthorizationProof::bound_action`
 # (kanonische Serialisierung von `WardenAction` vor dem Digest, siehe
-# `action.rs`). Deshalb ein regulärer Abhängigkeitseintrag und keine reine
+# `proof.rs`, `ActionContentDigest`) und das Dekodieren der Anfragehülle
+# (`response.rs`). Deshalb ein regulärer Abhängigkeitseintrag und keine reine
 # Dev-Dependency: die Digestbildung läuft zur Laufzeit, nicht nur in Tests.
 # Kein zusätzliches Gewicht für das Warden-Abhängigkeitsbudget (Prüfung 2):
 # `harw-types` zieht `serde_json` bereits ein.

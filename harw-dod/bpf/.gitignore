@@ -4,3 +4,4 @@
 /*.bpf.o
 /manifest.json
 /include/vmlinux.h
+/vmlinux.btf.sha256

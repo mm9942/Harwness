@@ -4672,6 +4672,10 @@ mod tests {
             &["dod", "warden", "enable"],
             &["dod", "warden", "disable"],
             &["dod", "install", "--print-systemd"],
+            &["dod", "model"],
+            &["dod", "model", "show"],
+            &["dod", "model", "set", "local/qwen2.5"],
+            &["dod", "model", "clear"],
         ] {
             for json_first in [false, true] {
                 let mut full = vec!["harw"];

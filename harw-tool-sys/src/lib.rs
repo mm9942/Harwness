@@ -8,9 +8,12 @@
 //! Befehl gestartet.
 //!
 //! # Sicherheit
-//! `unsafe` ist verboten. Kommandozeilen und Umgebungen werden über
-//! [`mask`] maskiert (Name und Wertform); Filter wirken nur auf den
-//! maskierten Text. Alle Werkzeuge verlangen `ExecuteProcess`.
+//! `unsafe` ist verboten. Umgebungen werden über [`mask`] maskiert (Name und
+//! Wertform); Kommandozeilen der Prozesswerkzeuge sind vollständig
+//! geschwärzt ([`mask::redacted_command`]: Name plus Argumentanzahl). Filter
+//! wirken nur auf den maskierten bzw. geschwärzten Text. `sys.ps`,
+//! `sys.pgrep` und `sys.top` listen standardmäßig nur die eigenen Prozesse
+//! ([`scope`]). Alle Werkzeuge verlangen `ExecuteProcess`.
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +27,7 @@ pub mod pgrep;
 pub mod procfs;
 pub mod provider;
 pub mod ps;
+pub mod scope;
 pub mod sysinfo;
 pub mod top;
 pub mod which;

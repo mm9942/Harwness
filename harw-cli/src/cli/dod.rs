@@ -43,6 +43,14 @@ pub enum DodAction {
         #[command(subcommand)]
         action: DodWardenAction,
     },
+    /// Zeigt, setzt oder entfernt das DoD-Triage-Modell im Home
+    /// (`[dod.triage] model`); ohne Aktion `show`. Nur für Menschen, kein
+    /// Modell-Werkzeug (PL-100 WP1.9).
+    Model {
+        /// Auszuführende Modell-Aktion; ohne Angabe `show`.
+        #[command(subcommand)]
+        action: Option<DodModelAction>,
+    },
     /// Gibt die eingebetteten systemd-Units aus `deploy/` aus; installiert,
     /// aktiviert und startet nichts.
     Install {
@@ -112,6 +120,21 @@ pub enum DodConfigAction {
         #[arg(long)]
         drop_in: bool,
     },
+}
+
+/// Aktionen von `harw dod model` (PL-100 WP1.9).
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum DodModelAction {
+    /// Zeigt das wirksame Triage-Modell samt Provider, Lokalität und Modus.
+    Show,
+    /// Setzt `[dod.triage] model` im Home auf `<provider>/<modell>`.
+    Set {
+        /// Modellreferenz `<provider>/<modell>`, z. B. `local/qwen2.5`.
+        #[arg(value_name = "PROVIDER/MODELL", value_hint = ValueHint::Other)]
+        model: String,
+    },
+    /// Entfernt `[dod.triage] model` aus dem Home (danach wirkt `notify`).
+    Clear,
 }
 
 /// Aktionen von `harw dod warden`.

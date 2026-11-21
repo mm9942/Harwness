@@ -100,11 +100,11 @@
 //! kein Messwert. Jedes erzeugte `SecurityEvent` trägt
 //! `kind: EventKind::ProcessExec { path, argv_digest }`, **nie** die rohe
 //! Kommandozeile (siehe [`crate::event`]-Moduldoku für die volle Begründung).
-//! `pid`, `ppid` und `comm` aus [`crate::event::ExecEvent`] haben in der
-//! heutigen `harw_dod_signals::EventKind::ProcessExec`-Form kein eigenes
-//! Feld und gehen an dieser Abbildung bewusst verloren — eine Eigenschaft des
-//! von dieser Crate nicht besessenen Wire-Vokabulars, nicht ein Versehen
-//! dieses Sensors.
+//! `pid`, `ppid`, `comm` und die effektive UID aus
+//! [`crate::event::ExecEvent`] landen seit PL-100 WP0.15 im
+//! `harw_dod_signals::Actor::process`-Kontext
+//! ([`crate::process::exec_process_context`]); `comm` ist dort escapt und
+//! begrenzt (siehe [`crate::process::display_comm`]).
 //!
 //! # Exportierte Typen
 //! [`ProcmonSensor`], [`DEFAULT_READ_TIMEOUT`].
@@ -164,6 +164,7 @@ use jiff::Timestamp;
 
 use crate::error::ProcmonError;
 use crate::event::parse_exec_payload;
+use crate::process::exec_process_context;
 
 /// Voreingestellte Wartezeit für [`ProcmonSensor::new`]: **200 Millisekunden**.
 ///
@@ -332,6 +333,7 @@ impl Sensor for ProcmonSensor {
                     uid: exec.uid,
                     auid: None,
                     cgroup: None,
+                    process: exec_process_context(&exec),
                 }),
                 kind: EventKind::ProcessExec {
                     path: exec.filename,
@@ -531,6 +533,16 @@ mod tests {
             .ok_or(TestError::Missing("ProcessExec trägt einen Actor"))?;
         assert_eq!(actor.uid, 0);
         assert_eq!(actor.auid, None);
+        // PL-100 WP0.15: pid/ppid/comm/euid gehen nicht mehr verloren.
+        assert_eq!(
+            actor.process,
+            Some(harw_dod_signals::ProcessContext {
+                pid: 4_242,
+                ppid: Some(1),
+                comm: Some("sshd".to_owned()),
+                euid: Some(0),
+            })
+        );
 
         match &event.kind {
             EventKind::ProcessExec { path, argv_digest } => {

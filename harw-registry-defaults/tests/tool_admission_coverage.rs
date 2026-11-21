@@ -55,6 +55,8 @@ use harw_registry_defaults::profile::{
 };
 // Runde 5, Teil B: `host.sudo_exec` steuert ebenfalls die Composition-Root bei.
 use harw_registry_defaults::profile::{SUDO_ROLES, SUDO_TOOLS, sudo_tools_for_role};
+// PL-100 WP 3.5: die Job-Werkzeugliste (inkl. `job.suspend`/`job.resume`).
+use harw_registry_defaults::profile::JOB_TOOLS;
 // Runde 5, Teil H: `agent.result` steuert ebenfalls die Composition-Root bei.
 use harw_registry_defaults::profile::{CHILD_RESULT_TOOLS, child_result_tools_for_role};
 // Runde 5, Teil M: `agent.message`/`parent.message` ebenso.
@@ -66,11 +68,14 @@ use harw_registry_defaults::profile::{
 use harw_registry_defaults::profile::{MATRIX_GAME_MASTER_TOOLS, matrix_tools_for_role};
 // PL-97 D3/D4: die lesenden `dod.*` der Triage-Rollen steuert ebenfalls die
 // Composition-Root bei (rollengebundener Provider in `harw-runtime/src/children.rs`).
-use harw_registry_defaults::profile::{DOD_READ_TOOLS, dod_tools_for_role};
+use harw_registry_defaults::profile::{DOD_READ_TOOLS, DOD_TRIAGE_ROLE_TOOLS, dod_tools_for_role};
 // Plan R9, Teil A: `skills.search`/`skills.load` ebenso.
 use harw_registry_defaults::profile::{
     SKILL_CATALOG_EXCLUDED_ROLES, SKILL_CATALOG_TOOLS, skill_catalog_tools_for_role,
 };
+// PL-100 O11: `deps.locked` von `intel-scout` ebenso (rollengebundener
+// Provider in `harw-runtime/src/children.rs`).
+use harw_registry_defaults::profile::{LOCKFILE_READ_TOOLS, lockfile_tools_for_role};
 
 mod common;
 use common::{TestError, TestResult, ctx};
@@ -125,6 +130,8 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
             .chain(matrix_tools_for_role(role).iter().copied())
             // PL-97 D4: `dod.*` (nur die vier Triage-Rollen).
             .chain(dod_tools_for_role(role).iter().copied())
+            // PL-100 O11: `deps.locked` (nur `intel-scout`).
+            .chain(lockfile_tools_for_role(role).iter().copied())
             // Plan R9, Teil A: `skills.search`/`skills.load` (Skill-Katalog).
             .chain(skill_catalog_tools_for_role(role).iter().copied())
             // Plan R9, Teil F: Job-Kontrolle der Orchestratoren.
@@ -1071,7 +1078,9 @@ fn security_triage_roles_admit_the_dod_tools_and_bind_the_bundled_harw_dod_skill
         let offered = dod_tools_for_role(role);
         if offered.is_empty() {
             assert!(
-                !admitted.iter().any(|tool| DOD_READ_TOOLS.contains(tool)),
+                !admitted
+                    .iter()
+                    .any(|tool| DOD_TRIAGE_ROLE_TOOLS.contains(tool)),
                 "{role} admittiert dod.* ohne Angebot"
             );
             assert!(
@@ -1081,11 +1090,123 @@ fn security_triage_roles_admit_the_dod_tools_and_bind_the_bundled_harw_dod_skill
             continue;
         }
         triage += 1;
-        assert_eq!(offered, DOD_READ_TOOLS, "{role}");
-        let expected: BTreeSet<&str> = DOD_READ_TOOLS.iter().copied().collect();
+        assert_eq!(offered, DOD_TRIAGE_ROLE_TOOLS, "{role}");
+        let expected: BTreeSet<&str> = DOD_TRIAGE_ROLE_TOOLS.iter().copied().collect();
         assert_eq!(admitted, expected, "{role}: genau die dod.*");
         assert_eq!(ir.skills(), ["harw-dod"], "{role}: skills");
     }
     assert_eq!(triage, 4, "vier Triage-Rollen");
+    Ok(())
+}
+
+/// PL-100 O11: `intel-scout` admittiert genau das rollengebundene
+/// `deps.locked` (`LOCKFILE_READ_TOOLS`), `context-steward` gar kein
+/// Werkzeug; beide verbieten Schreiben, Exec und jedes Netzwerkzeug
+/// ausdrücklich, und keine andere eingebaute Rolle bekommt `deps.locked`
+/// rollengebunden angeboten (wer es braucht, bekommt es über sein Profil).
+/// Ihr Profil `NoTools` bewirbt nichts, das sie nicht aufrufen dürften.
+#[test]
+fn o11_roles_admit_exactly_their_role_bound_tools() -> TestResult {
+    let roles = resolved_roles()?;
+    for (role, expected) in [
+        (role_names::INTEL_SCOUT, LOCKFILE_READ_TOOLS),
+        (role_names::CONTEXT_STEWARD, &[] as &[&str]),
+    ] {
+        let ir = roles
+            .get(role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let profile =
+            profile_for_role(role).ok_or(TestError::Unexpected(format!("{role} ohne Profil")))?;
+        assert_eq!(profile, RegistryProfile::NoTools, "{role}");
+        assert!(profile.tool_names().is_empty(), "{role}: {profile:?}");
+        assert_eq!(lockfile_tools_for_role(role), expected, "{role}: Angebot");
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let expected_admitted: BTreeSet<&str> = expected.iter().copied().collect();
+        assert_eq!(admitted, expected_admitted, "{role}: admitted");
+        let forbidden: BTreeSet<&str> = ir
+            .tool_surface()
+            .forbidden()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for tool in [
+            "fs.write",
+            "fs.edit",
+            "shell.exec",
+            "web.fetch",
+            "web.docs_rs",
+            "web.crates_io",
+        ] {
+            assert!(forbidden.contains(tool), "{role} muss {tool} verbieten");
+        }
+    }
+    for role in role_names::ALL {
+        if *role != role_names::INTEL_SCOUT {
+            assert!(lockfile_tools_for_role(role).is_empty(), "{role}");
+        }
+    }
+    Ok(())
+}
+
+/// PL-100 WP 3.5: jede Rolle, deren Profil die vollständige Job-Werkzeugliste
+/// (`JOB_TOOLS`) registriert, admittiert `job.suspend` und `job.resume`
+/// unmittelbar hinter `job.stop`, in dieser Reihenfolge (Konvention der
+/// TOMLs; `JOB_TOOLS` selbst führt `job.list` davor). Dass jedes registrierte
+/// Werkzeug überhaupt admittiert ist, prüft schon
+/// `every_profile_registered_tool_is_admitted_by_its_role`; dieser Test pinnt
+/// zusätzlich die Stelle. Orchestratoren führen nur `JOB_CONTROL_TOOLS`
+/// (ohne Anhalten) und sind davon ausgenommen.
+#[test]
+fn every_job_tools_profile_role_admits_suspend_and_resume_right_after_stop() -> TestResult {
+    let roles = resolved_roles()?;
+    let mut checked = 0usize;
+
+    for role in role_names::ALL {
+        let profile = profile_for_role(role).ok_or(TestError::Unexpected(format!(
+            "eingebaute Rolle {role} braucht ein Profil"
+        )))?;
+        let registered: BTreeSet<&str> = profile.tool_names().into_iter().collect();
+        if !JOB_TOOLS.iter().all(|tool| registered.contains(tool)) {
+            continue;
+        }
+        let ir = roles.get(*role).ok_or(TestError::Unexpected(format!(
+            "Rolle {role} fehlt in den aufgelösten Definitionen"
+        )))?;
+        let admitted: Vec<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let Some(stop) = admitted.iter().position(|tool| *tool == "job.stop") else {
+            return Err(TestError::Unexpected(format!(
+                "Rolle {role} registriert JOB_TOOLS über {profile:?}, admittiert job.stop aber nicht"
+            )));
+        };
+        let following: Vec<&str> = admitted
+            .iter()
+            .skip(stop.saturating_add(1))
+            .take(2)
+            .copied()
+            .collect();
+        assert_eq!(
+            following,
+            vec!["job.suspend", "job.resume"],
+            "Rolle {role} ({profile:?}) muss job.suspend und job.resume direkt hinter \
+             job.stop admittieren: {admitted:?}"
+        );
+        checked = checked.saturating_add(1);
+    }
+
+    // executor, uia-worker und uia-shell-worker (mindestens).
+    assert!(
+        checked >= 3,
+        "erwartet mindestens drei Rollen mit JOB_TOOLS-Profil, gefunden {checked}"
+    );
     Ok(())
 }

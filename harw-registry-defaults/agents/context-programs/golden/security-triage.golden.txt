@@ -1,0 +1,26 @@
+GOLDEN RENDER — harwness.context.security-triage@1
+====================================================
+STATUS: von Hand aus der Renderlogik abgeleitet (PL-100 WP 1.3), gegen
+`harw_agent_dsl::context_program::render_context_program` zu prüfen
+(`harw-registry-defaults/tests/context_program_golden.rs`). Siehe
+`explore.golden.txt` für die Methodik. Der gerenderte Abschnitt unten ist
+zeichengleich mit dem von `explore.golden.txt` für dieselben zwei
+Basissektionen, weil `security-triage` keine eigenen Sektionen deklariert
+und `history.tail` nicht überschreibt.
+
+Aufgelöste Sektionsreihenfolge (nur base; security-triage deklariert keine
+eigenen Sektionen):
+  1. task.objective     strength=must-include  detail=full     trust=instruction  [von base]
+  2. history.tail       strength=must-include  detail=summary  trust=evidence     [von base]
+
+Ausschluss (Union, base zuerst): credential.*, secret.*, sibling_transcripts,
+full_parent_transcript (base) + plan.*, diff.*, error.*, child.returns,
+knowledge.*, memory.* (security-triage)
+
+--- Gerenderter Turn-Kontext (Platzhalter-Inhalt) ---
+
+## task.objective [instruction]
+<vollständiger Auftragstext des aktuellen Turns>
+
+## history.tail [evidence]
+<zusammengefasster jüngster Verlauf der letzten Turns, gemäß HISTORY_TAIL_GUARANTEED_GROUPS vollständig, älteres ggf. bereits als [ref] verkürzt>

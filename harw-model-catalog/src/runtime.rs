@@ -407,7 +407,60 @@ pub const DEFAULT_PROFILE: ModelRuntimeProfile = ModelRuntimeProfile {
 /// assert_eq!(profile_for("does-not-exist"), harw_model_catalog::runtime::DEFAULT_PROFILE);
 /// ```
 pub fn profile_for(model: &str) -> ModelRuntimeProfile {
-    match model {
+    if let Some(profile) = curated_profile(model) {
+        return profile;
+    }
+    // Provider-präfixierte IDs (`openai/gpt-5`, `zai/glm-5.3`) und neuere
+    // Modelle bekannter Familien (`gpt-6.1`, `glm-5.3`, `claude-sonnet-5-5`)
+    // fielen früher auf DEFAULT_PROFILE (max_child_fanout 2): jede Welle des
+    // Root-Orchestrators mit mehr als zwei Zielen wurde abgelehnt.
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    if let Some(profile) = curated_profile(bare) {
+        return profile;
+    }
+    family_representative(bare)
+        .and_then(curated_profile)
+        .unwrap_or(DEFAULT_PROFILE)
+}
+
+/// Kuratiertes Familienmitglied, dessen Profil ein neueres oder abgeleitetes
+/// Modell derselben Familie erbt (Präfixvergleich, case-sensitiv).
+///
+/// # Description
+/// Unbekannte Familien bleiben bei [`DEFAULT_PROFILE`] (philosophy.md §12:
+/// unbekannte Eingaben erweitern nie die Autorität). Nur Familien mit
+/// kuratiertem Vertreter erben dessen Profil — bis Beobachtungsdaten
+/// (Layer 4) ein eigenes rechtfertigen.
+#[must_use]
+pub fn family_representative(model: &str) -> Option<&'static str> {
+    const FAMILIES: [(&str, &str); 17] = [
+        ("claude-opus-", "claude-opus-4-8"),
+        ("claude-fable-", "claude-opus-4-8"),
+        ("claude-sonnet-", "claude-sonnet-5"),
+        ("claude-haiku-", "claude-haiku-4-5-20251001"),
+        ("gpt-5", "gpt-5"),
+        ("gpt-6", "gpt-5"),
+        ("gpt-4o", "gpt-4o"),
+        ("o3", "o4-mini"),
+        ("o4", "o4-mini"),
+        ("glm-", "glm-4.6"),
+        ("kimi-k2", "kimi-k2-turbo-preview"),
+        ("qwen3-coder", "qwen3-coder-plus"),
+        ("qwen3", "qwen3-max"),
+        ("mistral-large", "mistral-large-2411"),
+        ("grok-", "grok-4.5"),
+        ("deepseek-reasoner", "deepseek-reasoner"),
+        ("deepseek-", "deepseek-chat"),
+    ];
+    FAMILIES
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map(|(_, representative)| *representative)
+}
+
+/// Das kuratierte Profil genau dieser Modell-ID, sonst `None`.
+fn curated_profile(model: &str) -> Option<ModelRuntimeProfile> {
+    Some(match model {
         // Anthropic — Claude Opus 5.5 (Standardmodell), Fable 5.1, Opus 4.8
         // Balanced: Flagship-Orchestratoren; Opus 5.5 und Fable 5.1 erben das
         // Opus-4.8-Profil, bis Beobachtungsdaten (Layer 4) ein eigenes rechtfertigen.
@@ -683,11 +736,10 @@ pub fn profile_for(model: &str) -> ModelRuntimeProfile {
             max_child_fanout: 2,
         },
 
-        // Fallback für alle unbekannten Modelle.
-        // Gemäß philosophy.md §12: Unbekannte Inputs dürfen Authority niemals erweitern.
-        // Konservative Defaults schützen vor unerwarteten Modellverhalten.
-        _ => DEFAULT_PROFILE,
-    }
+        // Unbekannt: `profile_for` versucht Präfix und Familie, sonst
+        // DEFAULT_PROFILE (philosophy.md §12).
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -737,6 +789,28 @@ mod tests {
                 model
             );
         }
+    }
+
+    /// Neuere Modelle bekannter Familien und Provider-präfixierte IDs
+    /// erben das kuratierte Familienprofil statt DEFAULT_PROFILE.
+    #[test]
+    fn newer_family_members_and_prefixed_ids_inherit_the_family_profile() {
+        for (model, representative) in [
+            ("glm-5.3", "glm-4.6"),
+            ("zai/glm-5.3", "glm-4.6"),
+            ("gpt-6.1", "gpt-5"),
+            ("gpt-5.2-codex", "gpt-5"),
+            ("openai/gpt-5", "gpt-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5"),
+            ("claude-haiku-5-5", "claude-haiku-4-5-20251001"),
+            ("anthropic/claude-opus-5-5", "claude-opus-4-8"),
+            ("deepseek-reasoner-2", "deepseek-reasoner"),
+        ] {
+            assert_eq!(profile_for(model), profile_for(representative), "{model}");
+            assert_ne!(profile_for(model), DEFAULT_PROFILE, "{model}");
+        }
+        assert_eq!(profile_for("my-local-model"), DEFAULT_PROFILE);
+        assert_eq!(profile_for("vendor/unknown"), DEFAULT_PROFILE);
     }
 
     /// Test 2b: Das Anthropic-Standardmodell und Fable 5.1 teilen das

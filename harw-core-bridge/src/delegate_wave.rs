@@ -71,6 +71,18 @@
 //! neue Kind bekommt die Übergabe als ersten Kontext (`task` optional) und
 //! ein frisches Budget; im Agent-Panel heißt es „Fortsetzung von <id>“.
 //!
+//! # Gebundene Triage-Verdicts (PL-100 WP 2.3)
+//! Ein Ziel kann eine [`VerdictBinding`] tragen ([`WaveTarget::verdict_binding`]),
+//! aber nur aus vertrauenswürdigem Code (DodWatch): das Modell kann das Feld
+//! nicht senden, das geschlossene Schema lehnt es ab. Mit Bindung und einer
+//! registrierten [`VerdictSink`] (`OpContextCoreExt::verdict_sink`) wird das
+//! `SecurityVerdict` des Kindes gebunden, abgelegt und nur als
+//! `AcceptedVerdict::to_parent_value` zurückgegeben (I4: IDs, Enums,
+//! `verdict_ref`, `bound: true`); ein ungebundenes Verdict ist ein
+//! inhaltsfreier Vertragsbruch. Ohne Bindung (jeder Modell-Aufruf) bleibt es
+//! bei der ungebundenen I4-Sicht. Eine Bindung an einer Rolle ohne den
+//! Verdict-Vertrag startet nicht.
+//!
 //! # Budget
 //! Jedes Kind bekommt höchstens das Budget des **Aufrufers** (sein eigener
 //! Admission-Record, `ManagedAgentSpawner::child_budget`), verschnitten mit
@@ -114,8 +126,10 @@ use harw_core::child_controller::ManagedAgentSpawner;
 use harw_core::child_handoff::{ContinuationSeed, continuation_task};
 use harw_types::SessionId;
 
-use crate::agent_tool::{ChildReturnContract, fanout_children_with};
+use crate::agent_tool::{ChildReturnContract, VerdictWave, fanout_children_with};
 use crate::context_ext::OpContextCoreExt;
+// PL-100 WP 2.3: Bindung und Ablage eines Triage-Verdicts je Ziel.
+use crate::security_verdict::{VerdictBinding, VerdictSink};
 
 /// Werkzeugname, unter dem die Operation dem Modell erscheint.
 pub const DELEGATE_WAVE_TOOL: &str = "delegate_wave";
@@ -204,6 +218,32 @@ pub struct WaveTarget {
     /// dieses Ziel (mit derselben Rolle) fortsetzt. `task` darf dann leer
     /// sein (Vorgabe: die offenen Punkte der Übergabe abarbeiten).
     pub continue_from: Option<String>,
+    /// PL-100 WP 2.3: Befund und exportierter Digest, an die das
+    /// `SecurityVerdict` dieses Ziels binden muss.
+    ///
+    /// **Nie aus Modell-Argumenten:** [`DelegateWaveRequest::parse`] setzt
+    /// immer `None`, und das Feld steht nicht im geschlossenen Schema
+    /// (`TARGET_FIELDS`). Ein Modell, das `verdict_binding` mitschickt,
+    /// bekommt einen Argumentfehler; es kann die Erwartung, gegen die sein
+    /// eigenes Urteil geprüft wird, weder setzen noch fälschen (K5/G-084).
+    /// Nur vertrauenswürdiger Code (DodWatch) setzt das Feld, aus dem
+    /// Template des Triage-Kindes und dem exportierten Befund.
+    ///
+    /// Wirkung in [`delegate_wave`]:
+    /// - Bindung **und** registrierte Senke
+    ///   ([`OpContextCoreExt::verdict_sink`]): das Verdict wird gebunden und
+    ///   abgelegt; das Parent sieht nur `AcceptedVerdict::to_parent_value`
+    ///   (`bound: true`, mit `verdict_ref`). Ein ungebundenes Verdict ist ein
+    ///   inhaltsfreier Vertragsbruch (nach einem Reparatur-Turn `failed`).
+    ///   Das gilt auch, wenn das Kind am Token-Budget endet: seine letzte
+    ///   Antwort wird ebenso gebunden angenommen (dann mit
+    ///   `budget_exhausted: true`) oder ist ohne Reparatur-Turn `failed`, nie
+    ///   die ungebundene Sicht.
+    /// - Bindung ohne Senke: die ungebundene I4-Sicht (`bound: false`), mit
+    ///   einer Warnung im Log.
+    /// - Bindung an einer Rolle ohne den Vertrag
+    ///   `harwness.security-verdict/v1`: das Ziel startet nicht (`failed`).
+    pub verdict_binding: Option<VerdictBinding>,
 }
 
 impl WaveTarget {
@@ -387,6 +427,8 @@ fn parse_target(raw: &Value, index: usize) -> Result<WaveTarget, OpError> {
         task,
         complexity,
         continue_from,
+        // PL-100 WP 2.3: nie aus Modell-Argumenten (siehe Feld-Doku).
+        verdict_binding: None,
     })
 }
 
@@ -901,6 +943,18 @@ pub async fn delegate_wave(
         .iter()
         .map(|contract| contract.clone().unwrap_or(ChildReturnContract::Text))
         .collect();
+    // PL-100 WP 2.3: je Ziel die Ausstattung zum Binden und Ablegen eines
+    // Triage-Verdicts; nur mit einer Bindung aus vertrauenswürdigem Code
+    // (`WaveTarget::verdict_binding`) und einer Senke im Kontext.
+    let sink = ctx.verdict_sink();
+    let verdict_waves: Vec<Option<VerdictWave>> = request
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(position, target)| {
+            verdict_wave_for(position, target.verdict_binding.as_ref(), sink.as_ref())
+        })
+        .collect();
 
     let mut queue: VecDeque<(usize, &'static str)> = VecDeque::new();
     for (position, reducer) in admission.into_iter().enumerate() {
@@ -910,6 +964,22 @@ pub async fn delegate_wave(
             Ok(_) if contract_results[position].is_err() => {
                 let message = contract_results[position].clone().err().unwrap_or_default();
                 statuses[position] = Some(TargetStatus::Failed(message));
+            }
+            // PL-100 WP 2.3: eine Verdict-Bindung verlangt eine Rolle mit dem
+            // Vertrag `harwness.security-verdict/v1` (fail-closed, statt den
+            // Text einer anderen Rolle ungebunden durchzureichen).
+            Ok(_)
+                if request
+                    .targets
+                    .get(position)
+                    .zip(contracts.get(position))
+                    .is_some_and(|(target, contract)| {
+                        verdict_binding_refused(target, *contract)
+                    }) =>
+            {
+                if let Some(status) = statuses.get_mut(position) {
+                    *status = Some(TargetStatus::Failed(verdict_binding_refusal()));
+                }
             }
             Ok(reducer) => queue.push_back((position, reducer)),
             Err(message) => statuses[position] = Some(TargetStatus::Unavailable(message)),
@@ -962,6 +1032,8 @@ pub async fn delegate_wave(
                 contracts[position],
                 // Runde 5, Teil J: Fortsetzung binden, sonst `None`.
                 seeds[position].as_ref(),
+                // PL-100 WP 2.3: Verdict binden und ablegen, sonst `None`.
+                verdict_waves.get(position).and_then(Option::as_ref),
             ));
             running.push((position, future));
         }
@@ -1025,6 +1097,62 @@ pub async fn delegate_wave(
         "delegate_wave.complete"
     );
     Ok(report)
+}
+
+/// PL-100 WP 2.3: die Ausstattung zum Binden und Ablegen des Verdicts eines
+/// Ziels.
+///
+/// # Beschreibung
+/// Nur mit Bindung (aus vertrauenswürdigem Code, siehe
+/// [`WaveTarget::verdict_binding`]) **und** Senke. Ohne Bindung bleibt der
+/// Wave-Pfad unverändert. Eine Bindung ohne Senke ist ein Fehler der
+/// Composition-Root: das Ziel läuft mit der ungebundenen I4-Sicht weiter,
+/// dazu eine inhaltsfreie Warnung (nur die Position, kein Befund).
+///
+/// # Arguments
+/// - `position` (`usize`): Position des Ziels (nur fürs Log).
+/// - `binding` (`Option<&VerdictBinding>`): die Bindung des Ziels.
+/// - `sink` (`Option<&Arc<dyn VerdictSink>>`): die Senke aus dem Kontext.
+///
+/// # Returns
+/// `Some(wave)` mit Bindung und Senke, sonst `None`.
+fn verdict_wave_for(
+    position: usize,
+    binding: Option<&VerdictBinding>,
+    sink: Option<&Arc<dyn VerdictSink>>,
+) -> Option<VerdictWave> {
+    let binding = binding?;
+    let Some(sink) = sink else {
+        tracing::warn!(
+            position,
+            "delegate_wave.verdict_sink_missing: Ziel mit Verdict-Bindung, aber keine \
+             VerdictSink im Kontext; das Verdict bleibt ungebunden"
+        );
+        return None;
+    };
+    Some(VerdictWave::new(binding.clone(), Arc::clone(sink)))
+}
+
+/// PL-100 WP 2.3: ob ein Ziel wegen seiner Verdict-Bindung nicht startet.
+///
+/// # Returns
+/// `true`, wenn das Ziel eine Bindung trägt, seine Rolle aber nicht den
+/// Vertrag [`ChildReturnContract::SecurityVerdict`] hat (auch ohne
+/// Registry-Factory, dann gilt jede Rolle als `Text`): die Bindung könnte
+/// nicht greifen, und der Freitext einer anderen Rolle soll nicht als
+/// vermeintlich gebundenes Ergebnis zurückgehen.
+fn verdict_binding_refused(target: &WaveTarget, contract: ChildReturnContract) -> bool {
+    target.verdict_binding.is_some() && contract != ChildReturnContract::SecurityVerdict
+}
+
+/// Die Meldung des `failed`-Eintrags für [`verdict_binding_refused`]
+/// (inhaltsfrei: weder Befund noch Digest).
+fn verdict_binding_refusal() -> String {
+    format!(
+        "delegate_wave: eine Verdict-Bindung verlangt eine Zielrolle mit dem Vertrag {}; \
+         das Ziel wurde nicht gestartet",
+        ChildReturnContract::SECURITY_VERDICT_ID
+    )
 }
 
 /// Der Return-Contract einer Zielrolle — dieselbe Auflösung wie
@@ -1226,11 +1354,41 @@ mod tests {
     use super::{
         DeclaredTargets, DelegateWaveOperation, DelegateWavePolicy, DelegateWaveReport,
         DelegateWaveRequest, TargetReport, TargetStatus, WaveComplexity, WaveJoin, admit_targets,
-        delegable_roles, delegate_wave, is_pause_report, wave_budget_cap,
+        delegable_roles, delegate_wave, is_pause_report, verdict_binding_refusal,
+        verdict_binding_refused, verdict_wave_for, wave_budget_cap,
     };
+    use crate::ChildReturnContract;
     use crate::context_ext::OpContextCoreExt;
+    use crate::security_verdict::{VerdictBinding, VerdictSink};
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_types::{ContentDigest, FindingId};
     use std::collections::BTreeSet;
+
+    // PL-100 WP 2.3: exportierte Befund-ID eines Testbefunds (UUIDv4-Form).
+    const BOUND_FINDING: &str = "7f1c2a4e-0b8d-4c55-9a1e-3d2f6b7c8e90";
+
+    fn binding() -> TestResult<VerdictBinding> {
+        Ok(VerdictBinding {
+            finding_id: FindingId::try_from_str(BOUND_FINDING).map_err(ctx("finding id"))?,
+            record_digest: ContentDigest::of(b"exported finding record v3"),
+        })
+    }
+
+    // Eine Senke, die im Test nie schreibt (der Store greift erst beim
+    // Anhängen auf das Dateisystem zu).
+    fn unused_sink() -> Arc<dyn VerdictSink> {
+        Arc::new(harw_session_store::VerdictStore::new(std::path::Path::new(
+            "delegate-wave-unused-verdict-state",
+        )))
+    }
+
+    fn single_target(args: Value) -> TestResult<super::WaveTarget> {
+        parse(args)?
+            .targets
+            .into_iter()
+            .next()
+            .ok_or(TestError::Missing("target"))
+    }
 
     fn policy() -> DelegateWavePolicy {
         DelegateWavePolicy::new(
@@ -1368,6 +1526,85 @@ mod tests {
         )?;
         // Ohne `continue_from` bleibt der Auftrag Pflicht.
         expect_invalid(json!({ "targets": [{ "role": "explorer" }] }), "task")?;
+        Ok(())
+    }
+
+    /// PL-100 WP 2.3: das Modell kann die Erwartung, gegen die sein eigenes
+    /// Verdict geprüft wird, weder setzen noch fälschen.
+    #[test]
+    fn test_parse_never_takes_a_verdict_binding_from_model_arguments() -> TestResult {
+        let target = single_target(json!({ "targets": [{ "role": "explorer", "task": "a" }] }))?;
+        assert!(target.verdict_binding.is_none());
+
+        expect_invalid(
+            json!({ "targets": [{
+                "role": "security-egress-triage",
+                "task": "a",
+                "verdict_binding": {
+                    "finding_id": BOUND_FINDING,
+                    "record_digest": "5f0e8f6c2b2e4f9f8d6a1b3c5e7f9a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9d1e3f",
+                },
+            }] }),
+            "`verdict_binding`",
+        )?;
+        expect_invalid(
+            json!({
+                "targets": [{ "role": "explorer", "task": "a" }],
+                "verdict_binding": { "finding_id": BOUND_FINDING },
+            }),
+            "`verdict_binding`",
+        )?;
+        Ok(())
+    }
+
+    /// PL-100 WP 2.3: gebunden und abgelegt wird nur mit Bindung **und**
+    /// Senke; sonst bleibt der Wave-Pfad bei der ungebundenen Sicht.
+    #[test]
+    fn test_verdict_wave_needs_both_binding_and_sink() -> TestResult {
+        let binding = binding()?;
+        let sink = unused_sink();
+        assert!(
+            verdict_wave_for(0, None, Some(&sink)).is_none(),
+            "ohne Bindung"
+        );
+        assert!(
+            verdict_wave_for(0, Some(&binding), None).is_none(),
+            "ohne Senke"
+        );
+        assert!(verdict_wave_for(0, None, None).is_none());
+        assert!(verdict_wave_for(0, Some(&binding), Some(&sink)).is_some());
+        Ok(())
+    }
+
+    /// PL-100 WP 2.3: eine Bindung an einer Rolle ohne Verdict-Vertrag
+    /// startet nicht (fail-closed); ohne Bindung ändert sich nichts.
+    #[test]
+    fn test_verdict_binding_is_refused_for_a_role_without_the_verdict_contract() -> TestResult {
+        let plain = single_target(json!({ "targets": [{ "role": "explorer", "task": "a" }] }))?;
+        assert!(!verdict_binding_refused(&plain, ChildReturnContract::Text));
+        assert!(!verdict_binding_refused(
+            &plain,
+            ChildReturnContract::SecurityVerdict
+        ));
+
+        let mut bound = plain;
+        bound.verdict_binding = Some(binding()?);
+        assert!(verdict_binding_refused(&bound, ChildReturnContract::Text));
+        assert!(verdict_binding_refused(
+            &bound,
+            ChildReturnContract::ResearchFinding
+        ));
+        assert!(!verdict_binding_refused(
+            &bound,
+            ChildReturnContract::SecurityVerdict
+        ));
+
+        let message = verdict_binding_refusal();
+        assert!(
+            message.contains(ChildReturnContract::SECURITY_VERDICT_ID),
+            "{message}"
+        );
+        assert!(!message.contains(BOUND_FINDING), "inhaltsfrei: {message}");
         Ok(())
     }
 
@@ -1805,5 +2042,465 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(tmp);
         Ok(())
+    }
+
+    // ── PL-100 WP 2.3: gebundene Verdicts durch die ganze Welle ──────────────
+    //
+    // Fährt `delegate_wave` selbst, mit echten Kind-Läufen: Admission,
+    // `fanout_children_with`, `FanoutShared::verdict`, `fanout_child_value`
+    // (`VerdictWave::for_child`) und `evaluate_with_repair`. Der Aufrufer ist
+    // die vertrauenswürdige externe Wurzel mit der Organisationsrolle
+    // Root-Orchestrator; die Worker-Rollen antworten mit festem Text.
+    mod bound_wave {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        use harw_agent_dsl::authority::AuthorityCeiling;
+        use harw_agent_dsl::executable::{ExecutableAgentIr, lower};
+        use harw_agent_dsl::parse::parse_toml;
+        use harw_agent_dsl::resolved::{ResolutionTrace, ResolvedAgentDefinition};
+        use harw_agent_dsl::roles::AgentRoleId;
+        use harw_authority::{
+            Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+        };
+        use harw_catalog::AgentSuggestions;
+        use harw_core::child_controller::{ChildRegistryFactory, ManagedAgentSpawner};
+        use harw_core::{
+            ChildLimits, InMemoryStateStore, ModelFuture, ModelProvider, ModelRequest,
+            ModelResponse, SessionActivation, SessionManager, SpawnContext, StateStore,
+        };
+        use harw_dod_signals::{
+            SecurityVerdict, Severity, SuggestedResponse, VerdictClassification,
+        };
+        use harw_extension_api::{
+            AgentSpawnError, DelegationTargetInfo, ExtensionRegistry, ExtensionRegistryBuilder,
+            SpawnInput,
+        };
+        use harw_operations::context::{OpContext, ServiceMap};
+        use harw_session_store::VerdictStore;
+        use harw_types::{
+            AgentRole, ApprovalActor, ContentDigest, FindingId, SessionId, TenantId, TurnId,
+            WorkspaceId,
+        };
+        use serde_json::{Value, json};
+
+        use super::super::{
+            DelegateWavePolicy, DelegateWaveReport, DelegateWaveRequest, TargetStatus,
+            delegate_wave, verdict_binding_refusal,
+        };
+        use super::{BOUND_FINDING, binding, parse};
+        use crate::ChildReturnContract;
+        use crate::context_ext::OpContextCoreExt;
+        use crate::security_verdict::{BOUND_FIELD, UNBOUND_VERDICT};
+        use crate::test_support::{TestError, TestResult, ctx};
+
+        // Rolle mit dem Vertrag `harwness.security-verdict/v1`.
+        const TRIAGE_ROLE: &str = "security-egress-triage";
+
+        // Rolle ohne Vertrag (Freitext).
+        const TEXT_ROLE: &str = "explorer";
+
+        // Erkennungsmarke der Begründung: sie darf das Parent nie erreichen.
+        const RATIONALE_MARK: &str = "BEGRUENDUNG_NUR_FUER_MENSCHEN";
+
+        // Modell eines Worker-Kindes: antwortet immer mit demselben Text.
+        struct AnswerModel(String);
+
+        impl ModelProvider for AnswerModel {
+            fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+                let answer = self.0.clone();
+                Box::pin(async move { Ok(ModelResponse::text(answer)) })
+            }
+        }
+
+        // Fabrik der Worker-Rollen im Spawner: keine Werkzeuge, festes
+        // Antwortmodell; zählt die gestarteten Kinder.
+        struct WorkerFactory {
+            answer: String,
+            started: Arc<AtomicUsize>,
+        }
+
+        impl ChildRegistryFactory for WorkerFactory {
+            fn build_registry(
+                &self,
+                _role: &str,
+                _input: &SpawnInput,
+                _suggestions: Option<&AgentSuggestions>,
+            ) -> Result<ExtensionRegistry, AgentSpawnError> {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                Ok(ExtensionRegistryBuilder::default().build())
+            }
+
+            fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+                Ok(Arc::new(AnswerModel(self.answer.clone())))
+            }
+        }
+
+        // Quelle der Rückgabeverträge im Kontext (wie im Betrieb die
+        // Registry-Factory): nur die Triage-Rolle trägt eine Agent-IR mit
+        // dem Verdict-Vertrag, jede andere Rolle gilt als Freitext.
+        struct ContractFactory {
+            ir: ExecutableAgentIr,
+        }
+
+        impl ChildRegistryFactory for ContractFactory {
+            fn build_registry(
+                &self,
+                _role: &str,
+                _input: &SpawnInput,
+                _suggestions: Option<&AgentSuggestions>,
+            ) -> Result<ExtensionRegistry, AgentSpawnError> {
+                Err(AgentSpawnError {
+                    kind: Default::default(),
+                    message: "Vertragsquelle startet keine Kinder".to_owned(),
+                })
+            }
+
+            fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+                Err(AgentSpawnError {
+                    kind: Default::default(),
+                    message: "Vertragsquelle hält kein Modell".to_owned(),
+                })
+            }
+
+            fn executable_agent_ir(&self, role: &str) -> Option<&ExecutableAgentIr> {
+                (role == TRIAGE_ROLE).then_some(&self.ir)
+            }
+        }
+
+        // Die Agent-IR der Triage-Rolle (`[return] contract` = Verdict).
+        fn verdict_ir() -> TestResult<ExecutableAgentIr> {
+            let raw = parse_toml(&format!(
+                r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.bridge-contract-test@1"
+version = "1.0.0"
+role = "worker"
+specialization = "bridge-contract-test"
+
+[return]
+contract = "{}"
+"#,
+                ChildReturnContract::SECURITY_VERDICT_ID
+            ))
+            .map_err(ctx("Test-Agent-Definition muss parsen"))?;
+            let resolved = ResolvedAgentDefinition {
+                id: raw.id,
+                version: raw.version,
+                role: raw.role,
+                specialization: raw.specialization,
+                name: raw.name,
+                description: raw.description,
+                authority: AuthorityCeiling::default(),
+                trace: ResolutionTrace { steps: Vec::new() },
+                config: raw.tables,
+                reasoning_effort: raw.reasoning_effort.clone(),
+            };
+            lower(&resolved).map_err(ctx("Test-Agent-Definition muss lowern"))
+        }
+
+        // Die Antwort des Triage-Kindes: ein Verdict über den Testbefund und
+        // `digest`, über den echten Serialisierer.
+        fn verdict_answer(digest: ContentDigest) -> TestResult<String> {
+            let issued_at =
+                jiff::Timestamp::from_second(1_900_000_000).map_err(ctx("timestamp"))?;
+            let verdict = SecurityVerdict::new(
+                FindingId::try_from_str(BOUND_FINDING).map_err(ctx("finding id"))?,
+                digest,
+                VerdictClassification::Suspicious,
+                Severity::High,
+                format!("{RATIONALE_MARK}: Verbindung zu einem unbekannten Ziel"),
+                Some(SuggestedResponse::Contain),
+                TRIAGE_ROLE.to_owned(),
+                issued_at,
+            );
+            serde_json::to_string(&verdict).map_err(ctx("serialize verdict"))
+        }
+
+        // Laufzeit einer Welle mit Verdict-Senke unter `tmp`.
+        struct WaveRuntime {
+            context: OpContext,
+            tmp: PathBuf,
+            started_triage: Arc<AtomicUsize>,
+            started_text: Arc<AtomicUsize>,
+            // Hält den Ereigniskanal des `SessionManager` offen.
+            _events: Box<dyn std::any::Any>,
+        }
+
+        // Baut Spawner, Kontext (Spawner, Store, Vertragsquelle, Senke) und
+        // die externe Wurzel; das Triage-Kind antwortet mit `triage_answer`.
+        fn wave_runtime(tag: &str, triage_answer: String) -> TestResult<WaveRuntime> {
+            let tmp = std::env::temp_dir().join(format!(
+                "harw-delegate-wave-verdict-{tag}-{}-{}",
+                std::process::id(),
+                SessionId::new()
+            ));
+            std::fs::create_dir_all(tmp.join("ws")).map_err(ctx("Test-Workspace anlegen"))?;
+            let registry = WorkspaceRegistry::build(
+                &tmp,
+                [WorkspaceRegistration {
+                    tenant: TenantId::from_str("test-tenant"),
+                    workspace: WorkspaceId::from_str("ws"),
+                    root: PathBuf::from("ws"),
+                }],
+            )
+            .map_err(ctx("Workspace-Registry aufbauen"))?;
+            let workspace = registry
+                .resolve(
+                    &TenantId::from_str("test-tenant"),
+                    &WorkspaceId::from_str("ws"),
+                )
+                .map_err(ctx("Workspace auflösen"))?;
+            let sandbox = SandboxSpec::from_resolved(
+                workspace,
+                PermissionSet::from_policy([
+                    Permission::ReadWorkspace,
+                    Permission::WriteWorkspace,
+                    Permission::ExecuteProcess,
+                ]),
+            );
+            let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+            let started_triage = Arc::new(AtomicUsize::new(0));
+            let started_text = Arc::new(AtomicUsize::new(0));
+            let role = |name: &str| AgentRole::Agent {
+                name: name.to_owned(),
+            };
+            let info = |name: &str| DelegationTargetInfo {
+                name: name.to_owned(),
+                role: "worker".to_owned(),
+                read_only: true,
+                ..DelegationTargetInfo::default()
+            };
+            let root = SessionId::new();
+            let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+                .with_role(
+                    TRIAGE_ROLE,
+                    role(TRIAGE_ROLE),
+                    AgentRoleId::Worker,
+                    Arc::new(WorkerFactory {
+                        answer: triage_answer,
+                        started: Arc::clone(&started_triage),
+                    }),
+                )
+                .with_role(
+                    TEXT_ROLE,
+                    role(TEXT_ROLE),
+                    AgentRoleId::Worker,
+                    Arc::new(WorkerFactory {
+                        answer: "Befund: alles gelesen".to_owned(),
+                        started: Arc::clone(&started_text),
+                    }),
+                )
+                .with_delegation_catalog([info(TRIAGE_ROLE), info(TEXT_ROLE)])
+                .with_external_root_parent(
+                    root.clone(),
+                    SpawnContext {
+                        sandbox: sandbox.clone(),
+                        suggestions: None,
+                        capability_snapshot: None,
+                        approval_actor: Some(ApprovalActor::Operator {
+                            id: "verdict-wave-test-operator".to_owned(),
+                        }),
+                        organizational_role: AgentRoleId::RootOrchestrator,
+                        allowed_child_orchestrators: Vec::new(),
+                        trace: None,
+                        ceiling: None,
+                    },
+                    None,
+                    SessionActivation::default(),
+                )
+                .map_err(ctx("die Wurzel registriert sich"))?;
+            let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+            let mut services = ServiceMap::new();
+            <OpContext as OpContextCoreExt>::register_agent_tool_services(
+                &mut services,
+                Arc::new(spawner),
+                store,
+            );
+            <OpContext as OpContextCoreExt>::register_verdict_sink(
+                &mut services,
+                Arc::new(VerdictStore::new(&tmp)),
+            );
+            let contracts: Arc<dyn ChildRegistryFactory> =
+                Arc::new(ContractFactory { ir: verdict_ir()? });
+            services.insert(contracts);
+            Ok(WaveRuntime {
+                context: OpContext::new(root, TurnId::new(), sandbox, services),
+                tmp,
+                started_triage,
+                started_text,
+                _events: Box::new(receiver),
+            })
+        }
+
+        fn wave_policy() -> DelegateWavePolicy {
+            DelegateWavePolicy::new(
+                |role| match role {
+                    TRIAGE_ROLE | TEXT_ROLE => Some("reduce_to_read_explore"),
+                    _ => None,
+                },
+                // Die Wurzel deklariert nichts: es gilt die sichtbare Menge.
+                |_caller| None,
+            )
+        }
+
+        // Eine Welle mit genau einem Ziel `role`, gebunden an den Testbefund
+        // (wie DodWatch es täte; das Modell kann das Feld nicht senden).
+        fn bound_request(role: &str) -> TestResult<DelegateWaveRequest> {
+            let mut request =
+                parse(json!({ "targets": [{ "role": role, "task": "Befund triagieren" }] }))?;
+            let target = request
+                .targets
+                .first_mut()
+                .ok_or(TestError::Missing("target"))?;
+            target.verdict_binding = Some(binding()?);
+            Ok(request)
+        }
+
+        // Der Status des einzigen Ziels.
+        fn only_status(report: &DelegateWaveReport) -> TestResult<TargetStatus> {
+            match report.targets.as_slice() {
+                [target] => Ok(target.status.clone()),
+                _ => Err(TestError::Unexpected(format!(
+                    "genau ein Zielbericht erwartet, bekommen {}",
+                    report.targets.len()
+                ))),
+            }
+        }
+
+        /// Bindung und Senke durch die ganze Welle: das Verdict liegt in der
+        /// Kette, das Ziel ist `completed` mit der gebundenen Sicht.
+        #[tokio::test]
+        async fn a_bound_triage_target_persists_its_verdict_through_the_wave() -> TestResult {
+            let expected = binding()?;
+            let wave = wave_runtime("bound", verdict_answer(expected.record_digest)?)?;
+            let result =
+                delegate_wave(&wave.context, &bound_request(TRIAGE_ROLE)?, &wave_policy()).await;
+            let verdicts = VerdictStore::new(&wave.tmp);
+            let latest = verdicts.latest_for(&expected.finding_id);
+            let chain = verdicts.verify_chain();
+            let started = wave.started_triage.load(Ordering::SeqCst);
+            std::fs::remove_dir_all(&wave.tmp).ok();
+
+            let report = result.map_err(ctx("die Welle läuft"))?;
+            let value = match only_status(&report)? {
+                TargetStatus::Completed(value) => value,
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "erwartet completed, bekommen {other:?}"
+                    )));
+                }
+            };
+            assert_eq!(started, 1);
+            assert_eq!(value.get(BOUND_FIELD), Some(&Value::Bool(true)));
+            assert_eq!(
+                value.get("finding_id").and_then(Value::as_str),
+                Some(BOUND_FINDING)
+            );
+            assert_eq!(
+                value.get("classification").and_then(Value::as_str),
+                Some("suspicious")
+            );
+            assert!(value.get("rationale").is_none(), "{value}");
+            assert!(!value.to_string().contains(RATIONALE_MARK), "{value}");
+
+            let latest = latest
+                .map_err(ctx("latest_for"))?
+                .ok_or(TestError::Missing("abgelegtes Verdict"))?;
+            assert_eq!(latest.record_digest(), expected.record_digest);
+            assert!(latest.rationale().contains(RATIONALE_MARK), "nur im Store");
+            assert_eq!(
+                value
+                    .get("verdict_ref")
+                    .and_then(|reference| reference.get("seq"))
+                    .and_then(Value::as_u64),
+                Some(latest.reference().seq)
+            );
+            assert_eq!(chain.map_err(ctx("verify chain"))?.records, 1);
+            Ok(())
+        }
+
+        /// Ein Verdict über einen anderen Digest scheitert in der Welle
+        /// inhaltsfrei (nach dem einen Reparatur-Turn), der Nullzähler steigt,
+        /// die Senke bleibt leer.
+        #[tokio::test]
+        async fn a_bound_triage_target_with_a_wrong_digest_fails_without_content() -> TestResult {
+            let forged = ContentDigest::of(b"stale or forged evidence");
+            let wave = wave_runtime("wrong-digest", verdict_answer(forged)?)?;
+            let before = UNBOUND_VERDICT.count();
+            let result =
+                delegate_wave(&wave.context, &bound_request(TRIAGE_ROLE)?, &wave_policy()).await;
+            let persisted = VerdictStore::new(&wave.tmp).records();
+            std::fs::remove_dir_all(&wave.tmp).ok();
+
+            let report = result.map_err(ctx("die Welle läuft"))?;
+            let TargetStatus::Failed(message) = only_status(&report)? else {
+                return Err(TestError::Unexpected(
+                    "ein ungebundenes Verdict darf nicht durchgehen".to_owned(),
+                ));
+            };
+            assert!(UNBOUND_VERDICT.count() > before, "der Nullzähler steigt");
+            assert!(message.contains("nach 1 Reparaturversuch"), "{message}");
+            assert!(!message.contains(RATIONALE_MARK), "{message}");
+            assert!(
+                persisted.map_err(ctx("records"))?.is_empty(),
+                "nichts erreicht die Senke"
+            );
+            Ok(())
+        }
+
+        /// Ohne Bindung bleibt dieselbe Welle bei der ungebundenen Sicht und
+        /// legt nichts ab, auch mit Senke im Kontext.
+        #[tokio::test]
+        async fn an_unbound_triage_target_keeps_the_screened_view() -> TestResult {
+            let wave = wave_runtime("unbound", verdict_answer(binding()?.record_digest)?)?;
+            let request = parse(json!({
+                "targets": [{ "role": TRIAGE_ROLE, "task": "Befund triagieren" }]
+            }))?;
+            let result = delegate_wave(&wave.context, &request, &wave_policy()).await;
+            let persisted = VerdictStore::new(&wave.tmp).records();
+            std::fs::remove_dir_all(&wave.tmp).ok();
+
+            let report = result.map_err(ctx("die Welle läuft"))?;
+            let value = match only_status(&report)? {
+                TargetStatus::Completed(value) => value,
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "erwartet completed, bekommen {other:?}"
+                    )));
+                }
+            };
+            assert_eq!(value.get(BOUND_FIELD), Some(&Value::Bool(false)));
+            assert!(value.get("verdict_ref").is_none(), "{value}");
+            assert!(value.get("rationale").is_none(), "{value}");
+            assert!(
+                persisted.map_err(ctx("records"))?.is_empty(),
+                "ohne Bindung wird nichts abgelegt"
+            );
+            Ok(())
+        }
+
+        /// Eine Bindung an einer Rolle ohne Verdict-Vertrag: `delegate_wave`
+        /// lässt das Ziel nicht zu, das Kind startet nie.
+        #[tokio::test]
+        async fn a_bound_target_on_a_text_role_never_starts() -> TestResult {
+            let wave = wave_runtime("text-role", verdict_answer(binding()?.record_digest)?)?;
+            let result =
+                delegate_wave(&wave.context, &bound_request(TEXT_ROLE)?, &wave_policy()).await;
+            let started = wave.started_text.load(Ordering::SeqCst);
+            let persisted = VerdictStore::new(&wave.tmp).records();
+            std::fs::remove_dir_all(&wave.tmp).ok();
+
+            let report = result.map_err(ctx("die Welle als Ganzes läuft"))?;
+            assert_eq!(
+                only_status(&report)?,
+                TargetStatus::Failed(verdict_binding_refusal())
+            );
+            assert_eq!(started, 0, "das Kind wurde nie gestartet");
+            assert!(persisted.map_err(ctx("records"))?.is_empty());
+            Ok(())
+        }
     }
 }

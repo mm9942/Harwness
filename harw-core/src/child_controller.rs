@@ -1168,6 +1168,10 @@ impl crate::child_backend::ChildIo for ControllerChildIo<'_> {
                 tree_path: spawner.child_tree_path(&child),
                 call,
                 timeout: spawner.child_approval_relay().timeout(),
+                // PL-100 O1: ein Kind hinter einem `ChildBackend` meldet nur
+                // Werkzeug und Argument-Zusammenfassung; seine Session (und
+                // damit sein DoD-Taint) ist hier nicht greifbar.
+                reason: None,
             };
             match spawner.child_approval_relay().resolve(request).await {
                 crate::turn_loop::ApprovalResolution::Approve => "approve".to_owned(),
@@ -1910,12 +1914,31 @@ pub struct ParentGrant {
 ///   [`AgentSession::with_compaction_observer`] im Verdichtungs-Slot.
 /// - `tool_outcome`: landet über
 ///   [`AgentSession::with_tool_outcome_observer`] im Werkzeug-/Runden-Slot.
+/// - `skill_injector` (PL-100 WP 1.5): der Skill-Injektor, den die Fabrik
+///   für genau diese Kind-Sitzung gebaut hat. Der Controller übergibt ihn
+///   nicht unverändert: nach dem Aktivierungsschnitt der Admission
+///   (`narrow_base_activation`) schneidet er dessen Werkzeug-Filter auf die
+///   Werkzeuge, die die Kind-Aktivierung noch zulässt
+///   ([`crate::skill_injection::SkillInjector::narrowed_to_callable`]), und
+///   hängt erst das Ergebnis über [`AgentSession::with_skill_injector`] an.
+/// - `skill_label_backing` (PL-100 WP 1.5, Review-Befund): je abstraktem
+///   Fähigkeits-Label im Werkzeug-Filter von `skill_injector` (etwa
+///   `filesystem.write`) die Werkzeuge der Kind-Registry, deren Recht das
+///   Label aufrufbar macht. Ein hier geführtes Label überlebt den
+///   Aktivierungsschnitt nur, solange mindestens eines dieser Werkzeuge
+///   bedient und freigeschaltet bleibt; sperrt die Eltern-Aktivierung alle,
+///   fällt das Label weg (ein Label mit leerer Menge immer). Ein nicht
+///   geführter Name, den die Kind-Registry nicht bedient, bleibt, wie die
+///   Fabrik ihn gesetzt hat. Ohne `skill_injector` wirkungslos.
 ///
-/// `None` lässt den jeweiligen Slot der Kind-Sitzung unverändert.
+/// `None` (bzw. eine leere Zuordnung) lässt den jeweiligen Slot der
+/// Kind-Sitzung unverändert.
 #[derive(Clone, Default)]
 pub struct ChildSessionObservers {
     pub compaction: Option<Arc<dyn crate::compaction::CompactionObserver>>,
     pub tool_outcome: Option<Arc<dyn crate::capture::ToolOutcomeObserver>>,
+    pub skill_injector: Option<Arc<crate::skill_injection::SkillInjector>>,
+    pub skill_label_backing: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for ChildSessionObservers {
@@ -1923,6 +1946,8 @@ impl std::fmt::Debug for ChildSessionObservers {
         f.debug_struct("ChildSessionObservers")
             .field("compaction", &self.compaction.is_some())
             .field("tool_outcome", &self.tool_outcome.is_some())
+            .field("skill_injector", &self.skill_injector.is_some())
+            .field("skill_label_backing", &self.skill_label_backing.len())
             .finish()
     }
 }
@@ -2993,6 +3018,24 @@ impl ManagedAgentSpawner {
             }
             Err(_) => tracing::warn!(child = %child, "child_task_state.lock_poisoned"),
         }
+    }
+
+    /// `true`, solange das Kind einen bei der Admission hinterlegten, noch
+    /// nicht verbrauchten Auftrag hat.
+    ///
+    /// # Description
+    /// Bei einer Fortsetzung (`continue_from`) ist dieser Auftrag
+    /// [`crate::child_handoff::continuation_task`] *samt Übergabe des
+    /// Vorgängers*. Ein Aufrufer, der den ersten Lauf mit eigenem User-Text
+    /// startet, würde ihn verdrängen; der durable Job-Submitter startet in
+    /// diesem Fall deshalb ohne User-Text.
+    #[must_use]
+    pub fn has_pending_task(&self, child: &SessionId) -> bool {
+        self.child_tasks.lock().ok().is_some_and(|tasks| {
+            tasks
+                .get(child.as_str())
+                .is_some_and(|state| state.pending_task.is_some())
+        })
     }
 
     /// Entnimmt den noch nicht verbrauchten Auftrag eines Kindes (einmalig).
@@ -7444,6 +7487,16 @@ impl ManagedAgentSpawner {
         let seed = ledger
             .prepare(caller, from, role)
             .map_err(|error| Self::reject(error.0))?;
+        // Ohne bekannte Sandbox scheitert die Fortsetzung sicher erst in
+        // `bind_continuation` — nach einer verschwendeten Admission. Deshalb
+        // schon hier ablehnen.
+        if seed.sandbox.is_none() {
+            return Err(Self::reject(format!(
+                "continue_from: [HARW-CONT-004] die Sandbox von {from} ist nicht bekannt; \
+                 keine Fortsetzung möglich. Delegiere den Rest neu (ohne continue_from) und \
+                 gib die Übergabe als Auftrag mit."
+            )));
+        }
         // #22 Welle 1B: erst nach der Eigentumsprüfung (kein Orakel über
         // fremde Kinder) — dann der Lebenszyklus der Rolle.
         if let Some(max_attempts) = self.lifecycle_max_attempts(role)? {
@@ -7524,7 +7577,20 @@ impl ManagedAgentSpawner {
                     &seed.origin,
                 )?;
             }
-            ledger.bind(seed).map_err(|error| Self::reject(error.0))?
+            let link = ledger.bind(seed).map_err(|error| Self::reject(error.0))?;
+            // Wird ein Orchestrator fortgesetzt, übernimmt die Fortsetzung
+            // die Übergaben seiner Kinder (HARW-CONT-001 sonst für jedes
+            // `continue_from` auf ein in der Übergabe genanntes Enkelkind).
+            let inherited = ledger.reparent(&seed.of, child);
+            if inherited > 0 {
+                tracing::info!(
+                    child = %child,
+                    predecessor = %seed.of,
+                    inherited,
+                    "child_handoff.children_inherited"
+                );
+            }
+            link
         };
         match self.child_tasks.lock() {
             Ok(mut tasks) => {
@@ -9132,6 +9198,42 @@ impl ManagedAgentSpawner {
                 Some(observer) => child_session.with_compaction_observer(Some(observer)),
                 None => child_session,
             };
+            // PL-100 WP 1.5: der Skill-Injektor der Fabrik, geschnitten mit
+            // der Kind-Aktivierung. Deren Basis ist hier schon mit der des
+            // Elternteils (und der Agent-IR) geschnitten
+            // (`narrow_base_activation` oben). Ein bedientes Werkzeug bleibt,
+            // wenn die Aktivierung es freischaltet; ein abstraktes
+            // Fähigkeits-Label aus `skill_label_backing` (etwa
+            // `filesystem.write`), wenn mindestens eines seiner Werkzeuge
+            // bedient und freigeschaltet bleibt; jeder andere Name, den die
+            // Kind-Registry nicht bedient, bleibt, wie die Fabrik ihn gesetzt
+            // hat. Die Basis statt des Live-Modus-Werts: der Injektor
+            // überdauert Moduswechsel, und Skill-Text gewährt kein Recht.
+            let skill_label_backing = observers.skill_label_backing;
+            let child_session = match observers.skill_injector {
+                Some(injector) => {
+                    let served: BTreeSet<String> = child_session
+                        .registry()
+                        .tool_providers()
+                        .iter()
+                        .flat_map(|provider| provider.tools())
+                        .map(|spec| spec.name().to_owned())
+                        .collect();
+                    let activation = child_session.base_activation().clone();
+                    // Bedient und von der Kind-Aktivierung freigeschaltet.
+                    let callable = |tool: &str| {
+                        served.contains(tool)
+                            && activation.is_tool_enabled(&harw_tools::ToolName::new(tool))
+                    };
+                    let narrowed =
+                        injector.narrowed_to_callable(|name| match skill_label_backing.get(name) {
+                            Some(tools) => tools.iter().any(|tool| callable(tool.as_str())),
+                            None => !served.contains(name) || callable(name),
+                        });
+                    child_session.with_skill_injector(Some(Arc::new(narrowed)))
+                }
+                None => child_session,
+            };
             // Runde 5, Teil M: jede Kind-Sitzung schreibt ihr
             // Aktivitätsjournal; der Beobachter der Fabrik bleibt dahinter.
             let child_session =
@@ -9422,6 +9524,32 @@ impl AgentSpawner for ManagedAgentSpawner {
     fn resumable_child_role(&self, caller: &SessionId, child_id: &str) -> Option<String> {
         ManagedAgentSpawner::resumable_child_role(self, caller, child_id)
     }
+
+    fn pending_background_notices(
+        &self,
+        parent: &SessionId,
+    ) -> Vec<harw_extension_api::PendingBackgroundNotice> {
+        self.background
+            .peek_notices(parent)
+            .iter()
+            .map(|notice| harw_extension_api::PendingBackgroundNotice {
+                child: notice.child.clone(),
+                text: notice.model_text(),
+            })
+            .collect()
+    }
+
+    fn acknowledge_background_notices(&self, parent: &SessionId, children: &[SessionId]) {
+        self.background.ack_notices(parent, children);
+    }
+
+    fn running_background_children(&self, parent: &SessionId) -> usize {
+        self.background.running_for(parent).len()
+    }
+
+    fn cancel_background_children(&self, parent: &SessionId, reason: &str) -> usize {
+        self.cancel_all_background(parent, reason).len()
+    }
 }
 
 #[cfg(test)]
@@ -9467,6 +9595,11 @@ mod tests {
     // Welle 6: ein über den `ChildBackend` laufendes Kind bekommt seine
     // in-process Rechte (`child_controller/tests/child_backend_run.rs`).
     mod child_backend_run;
+
+    // PL-100 WP 1.5: der Skill-Injektor der Fabrik erreicht die Kind-Sitzung,
+    // geschnitten mit der Kind-Aktivierung
+    // (`child_controller/tests/skill_injector_handover.rs`).
+    mod skill_injector_handover;
 
     // ── cap_child_return_text (Vertrag CHILD_RETURN_MAX_BYTES) ─────────────
 
@@ -10408,6 +10541,8 @@ specialization = "child-controller-test"
             ChildSessionObservers {
                 compaction: Some(Arc::new(NoopChildObserver)),
                 tool_outcome: Some(Arc::new(NoopChildObserver)),
+                skill_injector: None,
+                skill_label_backing: BTreeMap::new(),
             }
         }
 
@@ -10456,6 +10591,8 @@ specialization = "child-controller-test"
             let session = manager.get(&child).map_err(ctx("child is manager-owned"))?;
             assert!(session.compaction_observer().is_some());
             assert!(session.tool_outcome_observer().is_some());
+            // PL-100 WP 1.5: ohne Injektor der Fabrik bleibt der Slot leer.
+            assert!(session.skill_injector().is_none());
         }
         assert_eq!(
             factory
@@ -13646,6 +13783,9 @@ max_depth = 0
         )?;
         let child = children[0].clone();
         seed_pending_task(&spawner, &child, "Fasse die Datei zusammen");
+        // Der durable Job-Submitter startet genau dann ohne User-Text, damit
+        // eine Fortsetzung samt Übergabe nicht verdrängt wird.
+        assert!(spawner.has_pending_task(&child));
         let store = InMemoryStateStore::new();
 
         let result = spawner
@@ -13666,6 +13806,7 @@ max_depth = 0
             state.pending_task, None,
             "the task is consumed exactly once"
         );
+        assert!(!spawner.has_pending_task(&child));
         assert_eq!(result.full_text.as_deref(), Some("erledigt"));
         assert_eq!(state.outcome_detail.as_deref(), Some("erledigt"));
         Ok(())

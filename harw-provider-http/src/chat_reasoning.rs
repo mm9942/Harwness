@@ -16,7 +16,6 @@ use harw_protocol::items::TurnItem;
 use harw_types::ContentDigest;
 use serde_json::Value;
 
-const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) fn resolve_mode(
@@ -52,10 +51,10 @@ pub(crate) struct ChatReasoningCache {
     rounds: Mutex<VecDeque<Round>>,
 }
 
+const FAMILY: &str = "chat";
+
 fn unavailable(detail: &str) -> ModelError {
-    ModelError::RequestFailed(format!(
-        "chat reasoning continuity unavailable ({detail}); start a fresh conversation or explicitly rebuild its context before retrying"
-    ))
+    crate::replay_bounds::unavailable(FAMILY, detail)
 }
 
 fn digest(items: &[TurnItem]) -> Result<ContentDigest, ModelError> {
@@ -161,24 +160,30 @@ impl ChatReasoningCache {
                 && old.model == round.model
                 && old.prefix_digest == round.prefix_digest)
         });
-        while rounds.len() >= MAX_ENTRIES
-            || rounds.iter().map(|round| round.bytes).sum::<usize>() + bytes > MAX_BYTES
-        {
-            rounds.pop_front();
-        }
+        crate::replay_bounds::evict_for(
+            &mut rounds,
+            |round| &round.identity,
+            |round| round.bytes,
+            &round.identity,
+            bytes,
+            MAX_BYTES,
+        );
         rounds.push_back(round);
         Ok(())
     }
 
     /// Restore every historical assistant round, including final answers.
     /// This also reunites assistant content and calls split by generic history
-    /// projection. Missing or mutated rounds fail before the HTTP request.
+    /// projection. Missing or mutated rounds fail before the HTTP request under
+    /// [`ReplayPolicy::Strict`](crate::replay_bounds::ReplayPolicy::Strict);
+    /// by default they are sent without `reasoning_content` and logged.
     pub(crate) fn apply(
         &self,
         provider: &str,
         model: &str,
         request: &ModelRequest,
         body: &mut Value,
+        policy: crate::replay_bounds::ReplayPolicy,
     ) -> Result<(), ModelError> {
         let history = request.history.items();
         let historical = request.history.to_model_messages();
@@ -190,10 +195,18 @@ impl ChatReasoningCache {
         }) {
             return Ok(());
         }
-        let identity = request
+        let Some(identity) = request
             .identity()
             .filter(|identity| !identity.session.is_empty() && !identity.agent.is_empty())
-            .ok_or_else(|| unavailable("request identity is missing"))?;
+        else {
+            return crate::replay_bounds::on_missing(
+                policy,
+                FAMILY,
+                model,
+                "request identity is missing",
+                0,
+            );
+        };
         let messages = body
             .get_mut("messages")
             .and_then(Value::as_array_mut)
@@ -246,16 +259,28 @@ impl ChatReasoningCache {
             replacements.push((start_wire, end_wire, restored));
             covered[offset..end].fill(true);
         }
-        if historical.iter().zip(covered).any(|(message, covered)| {
-            !covered
-                && matches!(
-                    message,
-                    ModelMessage::Assistant { .. } | ModelMessage::ToolCall { .. }
-                )
-        }) {
-            return Err(unavailable(
+        // Typische Auslöser: Kompaktierung, Neustart, eine nach `MaxTokens`
+        // abgeschnittene (nie gemerkte) Antwort vor einer automatischen
+        // Fortsetzung, verdrängte Runden.
+        let uncovered = historical
+            .iter()
+            .zip(covered)
+            .filter(|(message, covered)| {
+                !covered
+                    && matches!(
+                        message,
+                        ModelMessage::Assistant { .. } | ModelMessage::ToolCall { .. }
+                    )
+            })
+            .count();
+        if uncovered > 0 {
+            crate::replay_bounds::on_missing(
+                policy,
+                FAMILY,
+                model,
                 "original assistant round was lost, changed, compacted or belongs to another identity/model",
-            ));
+                uncovered,
+            )?;
         }
         replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
         for (start, end, restored) in replacements {
@@ -331,6 +356,8 @@ mod tests {
         }
     }
 
+    const STRICT: crate::replay_bounds::ReplayPolicy = crate::replay_bounds::ReplayPolicy::Strict;
+
     #[test]
     fn exact_parallel_round_and_final_answer_reasoning_survive_followups() -> TestResult {
         let cache = ChatReasoningCache::default();
@@ -351,7 +378,7 @@ mod tests {
         append(&mut second.history, &response);
         let mut wire = crate::build_chat_body(&second, "thinking-model");
         cache
-            .apply("supported", "thinking-model", &second, &mut wire)
+            .apply("supported", "thinking-model", &second, &mut wire, STRICT)
             .map_err(ctx("restore round"))?;
         assert_eq!(wire["messages"].as_array().map(Vec::len), Some(4));
         assert_eq!(
@@ -389,7 +416,7 @@ mod tests {
         second.history.push_user_text("Explain X");
         let mut wire = crate::build_chat_body(&second, "thinking-model");
         cache
-            .apply("supported", "thinking-model", &second, &mut wire)
+            .apply("supported", "thinking-model", &second, &mut wire, STRICT)
             .map_err(ctx("restore final"))?;
         assert_eq!(wire["messages"].as_array().map(Vec::len), Some(6));
         assert_eq!(
@@ -431,7 +458,7 @@ mod tests {
         append(&mut next.history, &response);
         let mut wire = crate::build_chat_body(&next, "thinking-model");
         cache
-            .apply("supported", "thinking-model", &next, &mut wire)
+            .apply("supported", "thinking-model", &next, &mut wire, STRICT)
             .map_err(ctx("replay"))?;
         assert!(wire["messages"][1]["content"].is_null());
         assert_eq!(
@@ -502,9 +529,9 @@ mod tests {
             }
             let mut wire = crate::build_chat_body(&changed, model);
             let result = if mismatch == "restart" {
-                ChatReasoningCache::default().apply(provider, model, &changed, &mut wire)
+                ChatReasoningCache::default().apply(provider, model, &changed, &mut wire, STRICT)
             } else {
-                cache.apply(provider, model, &changed, &mut wire)
+                cache.apply(provider, model, &changed, &mut wire, STRICT)
             };
             let error = result
                 .err()
@@ -553,7 +580,7 @@ mod tests {
         let response = crate::interpret_chat(&raw, "supported", "thinking-model", &[])
             .map_err(ctx("parse"))?;
         let mut first = None;
-        for index in 0..=MAX_ENTRIES {
+        for index in 0..=crate::replay_bounds::MAX_ROUNDS_PER_IDENTITY {
             let mut history = ConversationHistory::new();
             history.push_user_text(format!("question-{index}"));
             let initial = request(history);
@@ -569,7 +596,7 @@ mod tests {
         let mut wire = crate::build_chat_body(&first, "thinking-model");
         assert!(
             cache
-                .apply("supported", "thinking-model", &first, &mut wire)
+                .apply("supported", "thinking-model", &first, &mut wire, STRICT)
                 .is_err()
         );
         let oversized = native(json!("answer"), &"x".repeat(MAX_BYTES + 1), json!([]));
@@ -586,8 +613,39 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .len()
-                <= MAX_ENTRIES
+                <= crate::replay_bounds::MAX_ROUNDS_PER_IDENTITY
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_lost_round_is_sent_without_reasoning_by_default() -> TestResult {
+        let raw = native(json!("answer"), "exact reasoning", json!([]));
+        let response = crate::interpret_chat(&raw, "supported", "thinking-model", &[])
+            .map_err(ctx("parse"))?;
+        let mut history = ConversationHistory::new();
+        history.push_user_text("question");
+        let mut next = request(history);
+        append(&mut next.history, &response);
+        // Nie gemerkt (Neustart, abgeschnittene Antwort vor einer
+        // automatischen Fortsetzung): Vorgabe sendet ohne reasoning_content.
+        let mut wire = crate::build_chat_body(&next, "thinking-model");
+        let before = wire.clone();
+        ChatReasoningCache::default()
+            .apply(
+                "supported",
+                "thinking-model",
+                &next,
+                &mut wire,
+                crate::replay_bounds::ReplayPolicy::Degrade,
+            )
+            .map_err(ctx("degraded apply"))?;
+        assert_eq!(wire, before);
+        let error = ChatReasoningCache::default()
+            .apply("supported", "thinking-model", &next, &mut wire, STRICT)
+            .err()
+            .ok_or(TestError::Missing("strict refusal"))?;
+        assert!(matches!(error, ModelError::ReplayUnavailable { .. }));
         Ok(())
     }
 }

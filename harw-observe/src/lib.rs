@@ -14,8 +14,15 @@
 //! [`NullSink`], [`TraceContext`], [`Redacted`], [`Redact`],
 //! [`NullCounter`], [`NullCounterRegistry`], [`ObserveError`],
 //! [`ObserveResult`], [`RoutingSink`], [`ExportApproval`],
-//! [`PROTECTED_NAMESPACES`], [`SECURITY_METRIC_LEAKED`]. Dazu das Makro
-//! [`field!`] und die Funktion [`assert_all_zero`].
+//! [`PROTECTED_NAMESPACES`], [`SECURITY_METRIC_LEAKED`],
+//! [`SecurityExportGate`], [`ZeroCounterRegistry`], [`DodMetrics`] mit den
+//! Rollen-Aliassen [`DispatchMetrics`], [`SensorMetrics`] und
+//! [`WardenMetrics`], die Rollenmarker [`DodRole`], [`DispatchRole`],
+//! [`SensorRole`] und [`WardenRole`], [`DodEmitter`],
+//! [`BreakerPartitionKind`] und [`WARDEN_UNAUDITED_VIOLATIONS`]. Dazu das
+//! Makro [`field!`] und die Funktionen [`assert_all_zero`],
+//! [`dod_zero_registry`], [`dod_zero_registry_for`] und
+//! [`dod_null_counters`].
 //!
 //! # Nullzähler (Knoten AW1-07)
 //! Neben Zählern für Arbeit trägt diese Crate die Mechanik für
@@ -79,8 +86,16 @@
 //! Gerüst aus Knoten AW0-00 (Workspace-Fundament). Der Inhalt entstand in
 //! Knoten **AW0-01**; Ebene **L1** im Zielgraphen. Die Nullzähler-Mechanik
 //! ([`null_counter`]) kam in Knoten **AW1-07** hinzu, der routende Sink
-//! ([`routing`]) in Knoten **AW5-06**.
+//! ([`routing`]) in Knoten **AW5-06**. Die Null-Serien-Registry
+//! ([`zero_registry`]) und das `security.*`-Exporttor
+//! ([`routing::SecurityExportGate`], Voreinstellung geschlossen) kamen in
+//! PL-100 Phase 4 hinzu, ebenso das Produzenten-Handle [`dod_metrics`]
+//! ([`DodMetrics`]), über das alle DoD-/Dispatch-Emittenten ihre Stände an
+//! jedes Standardziel melden. Jeder Prozess installiert es mit seiner Rolle
+//! als Typ ([`DispatchMetrics`], [`SensorMetrics`], [`WardenMetrics`]),
+//! emittiert nur deren Null-Serien und kann nur deren Serien melden.
 
+pub mod dod_metrics;
 pub mod error;
 pub mod field;
 pub mod metric;
@@ -89,15 +104,26 @@ pub mod redact;
 pub mod routing;
 pub mod sink;
 pub mod trace;
+pub mod zero_registry;
 
+pub use dod_metrics::{
+    BreakerPartitionKind, DispatchMetrics, DispatchRole, DodMetrics, DodRole, SensorMetrics,
+    SensorRole, WARDEN_UNAUDITED_VIOLATIONS, WardenMetrics, WardenRole, dod_null_counters,
+};
 pub use error::{ObserveError, ObserveResult};
 pub use field::{FieldName, FieldValue};
 pub use metric::{Cardinality, MetricKey, MetricKind, MetricValue, Unit};
 pub use null_counter::{NullCounter, NullCounterRegistry, assert_all_zero};
 pub use redact::{Redact, Redacted};
-pub use routing::{ExportApproval, PROTECTED_NAMESPACES, RoutingSink, SECURITY_METRIC_LEAKED};
+pub use routing::{
+    ExportApproval, PROTECTED_NAMESPACES, RoutingSink, SECURITY_METRIC_LEAKED, SecurityExportGate,
+};
 pub use sink::{NullSink, TelemetrySink};
 pub use trace::TraceContext;
+pub use zero_registry::{
+    DOD_VIOLATION_SERIES, DodEmitter, ZeroCounterRegistry, ZeroRecord, ZeroSeries,
+    dod_zero_registry, dod_zero_registry_for,
+};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

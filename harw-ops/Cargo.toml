@@ -133,6 +133,9 @@ harw-infra-client = { path = "../harw-infra-client" }
 # `systemctl show`). Er zieht weder Warden noch Eskalation noch einen
 # DoD-Daemon (`xtask/arch-policy.toml`, `[[forbidden_crates]]`, S1).
 harw-dod-client = { path = "../harw-dod-client" }
+# PL-100 WP0.8: `dod::bounded` escapes every free-text field with the one
+# shared escaper (visible `\u{…}`, capped in characters).
+harw-untrusted-text = { path = "../harw-untrusted-text" }
 # R18 (D-B): `gateway.*`-Operationen (`src/gateway_ops.rs`) lesen
 # `Arc<dyn harw_protocol::GatewayPort>` aus dem `OpContext` und zeigen die
 # Wire-Typen (`GatewayStatus`, `GatewayConnectionInfo`, …). Kein Zyklus:

@@ -12,7 +12,9 @@ package never installs into a user's HARW home tree.
 
 The package contains root-owned service definitions and program/ELF files,
 one system identity per binary (`harw-sentinel`, `harw-probe-fs`,
-`harw-probe-bpf`, `harw-warden`), and FHS directories:
+`harw-probe-bpf`, `harw-probe-netlink`, `harw-warden`), and FHS directories.
+`harw-probe-netlink` (audit netlink, exactly `CAP_AUDIT_READ`) is installed
+but opt-in: `harw-dod.target` never pulls it in. The FHS directories are:
 
 * programs: `/usr/local/libexec/harw-dod`
 * eBPF objects and manifest: `/usr/local/lib/harw-dod/bpf`
@@ -102,6 +104,8 @@ with the exact command to run by hand. It never checks tool *versions* —
 that stays `bpf/scripts/verify-toolchain.sh`'s fail-closed job against
 `bpf/toolchain.lock.toml`, unchanged.
 
-`make -C harw-dod uninstall` removes only files listed in `packaging/manifest`.
-It leaves `config.toml`, state, logs, runtime data, and system accounts in
+`make -C harw-dod uninstall` first stops and disables every DoD unit (target,
+sentinel, probe-bpf/fs/netlink, Warden), then removes only files listed in
+`packaging/manifest`. After a reinstall the operator repeats `enable`,
+`enable-warden` and any opt-in probe enables. It leaves `config.toml`, state, logs, runtime data, and system accounts in
 place so upgrades and rollbacks cannot silently discard operator evidence.

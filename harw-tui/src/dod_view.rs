@@ -464,6 +464,14 @@ impl DodView {
             "  {prefix}health written {}{stale}",
             field(sensors, "written_at")
         )));
+        if let Some(warnings) = sensors.get("warnings").and_then(Value::as_array) {
+            for warning in warnings.iter().take(2).filter_map(Value::as_str) {
+                lines.push(Line::styled(
+                    format!("  {prefix}{}", clean(warning)),
+                    style::warning_style(theme),
+                ));
+            }
+        }
         let list = sensors
             .get("sensors")
             .and_then(Value::as_array)
@@ -842,6 +850,7 @@ pub(crate) mod tests {
                 {"id": "tcp-connect", "health": "degraded", "degrade_reason": "btf missing", "readings_total": 0, "errors_total": 3},
             ],
             "ipc": {"probes_connected": 1, "events_total": 120, "dropped_total": 0},
+            "warnings": ["1 IPC decode error", "Landlock not enforced"],
             "path": "/var/lib/harw-dod/export/health.json",
             "source": if verified { "system" } else { "home" },
             "verified": verified,
@@ -914,6 +923,8 @@ pub(crate) mod tests {
             "harw-warden.socket",
             "systemd not available",
             "SENSORS",
+            "1 IPC decode error",
+            "Landlock not enforced",
             "tcp-connect",
             "degraded",
             "btf missing",

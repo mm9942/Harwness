@@ -43,6 +43,11 @@ members = [
     "harw-catalog",
     # PL-97 D2: read-only Harw-DoD client (export paths, findings/health, config, units, status).
     "harw-dod-client",
+    # PL-100 WP0.8: the one escaper for untrusted text (Cc/Cf/Zl/Zp/Co, tag block, bidi,
+    # variation selectors); foundation crate without dependencies.
+    "harw-untrusted-text",
+    # PL-100 WP2.1: pure DoD dispatch (route table, budgets, queue, breaker, grouping).
+    "harw-dod-dispatch",
     # PL-97 M1: semantic activity vocabulary and deterministic pattern reducer (PL-71).
     "harw-activity",
     "harw-core",
@@ -169,6 +174,8 @@ members = [
     # aufgezählt, kein Glob (Architektur §19). Siehe
     # `docs/architecture/dod-workspace-merge-plan.md`.
     "harw-dod/crates/harw-dod",
+    # PL-100 WP1.8 (O11): Offline-RustSec-Abgleich gegen lokale advisory-db.
+    "harw-dod/crates/harw-dod-advisory",
     "harw-dod/crates/harw-dod-authlog",
     "harw-dod/crates/harw-dod-blockio",
     "harw-dod/crates/harw-dod-bpf",
@@ -183,23 +190,34 @@ members = [
     "harw-dod/crates/harw-dod-flow",
     "harw-dod/crates/harw-dod-fsmon",
     "harw-dod/crates/harw-dod-gpu",
+    # PL-100 WP 3.0 (I8): Eskalationsleiter ohne Signier-Code, aus
+    # harw-dod-escalate herausgelöst.
+    "harw-dod/crates/harw-dod-ladder",
     "harw-dod/crates/harw-dod-listener",
     "harw-dod/crates/harw-dod-memory",
     "harw-dod/crates/harw-dod-netcounters",
     "harw-dod/crates/harw-dod-netlink",
     "harw-dod/crates/harw-dod-netpolicy",
+    "harw-dod/crates/harw-dod-nft",
     "harw-dod/crates/harw-dod-procmon",
     "harw-dod/crates/harw-dod-readfs",
     "harw-dod/crates/harw-dod-rules",
     "harw-dod/crates/harw-dod-scanreport",
     "harw-dod/crates/harw-dod-sentinel",
     "harw-dod/crates/harw-dod-signals",
+    # PL-100 WP 3.0 (I8): Triage-Einreichung an den Escalator, aus
+    # harw-dod-escalate herausgelöst.
+    "harw-dod/crates/harw-dod-submit-proto",
     "harw-dod/crates/harw-dod-thermal",
     "harw-dod/crates/harw-dod-warden",
     "harw-dod/crates/harw-dod-warden-proto",
+    # PL-100 WP 3.0 (I8): signierfreies Warden-Vokabular, aus
+    # harw-dod-warden-proto herausgelöst.
+    "harw-dod/crates/harw-dod-warden-types",
     "harw-dod/crates/harw-dod-workspace",
     "harw-dod/crates/harw-probe-bpf",
     "harw-dod/crates/harw-probe-fs",
+    "harw-dod/crates/harw-probe-netlink",
     "harw-dod/crates/harw-sentinel",
     "harw-dod/crates/harw-warden",
 ]
@@ -255,6 +273,11 @@ crypt_guard_service = { version = "3.1.0", features = ["ml-dsa"] }
 crypt_guard_hyper = { version = "3.1.0" }
 procfs = { version = "0.18.0", default-features = false }
 landlock = "0.4.7"
+# seccomp-BPF-Filter des Wardens (PL-100 Entscheidung O10, `harw-warden`):
+# rust-vmm/Firecracker, Apache-2.0 OR BSD-3-Clause, einzige Laufzeit-
+# Abhängigkeit `libc` (ohnehin über `landlock` in der Warden-Hülle). Ohne das
+# optionale Feature `json` (kein `serde` aus dieser Kante).
+seccompiler = { version = "0.5.0", default-features = false }
 cap-std = "4.0.3"
 
 # Verzeichniseinbettung: Registry-Definitionen als Dateien statt als Rust-Liste.

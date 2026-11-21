@@ -339,7 +339,8 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // arrives as a notification. Keine
     // Schreibwirkung, kein Prozessstart. `job.start` fragt wie `shell.exec`,
     // `job.stop` wie jedes andere Werkzeug mit Wirkung (nicht in
-    // `ALWAYS_ASK_TOOLS`, eine Allow-Regel greift).
+    // `ALWAYS_ASK_TOOLS`, eine Allow-Regel greift); `job.suspend` und
+    // `job.resume` (PL-100 §3.5) stehen dagegen in `ALWAYS_ASK_TOOLS`.
     "job.status",
     "job.logs",
     "job.list",
@@ -410,6 +411,16 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     "dod.status",
     "dod.findings",
     "dod.sensors",
+    // PL-100 WP1.2: die lesenden Triage-Werkzeuge (`profile::DOD_TRIAGE_TOOLS`,
+    // `model_tool(readonly, approval = "none")`, `harw-ops/src/dod.rs`), nur
+    // für die vier `security-*-triage`-Kinder registriert (nie in einer
+    // Root-Session, O8). `dod.finding`/`dod.related` lesen nur den begrenzten
+    // Export, `dod.labels` nur eine Label-Quelle (bis Phase 2.5 keine). Kein
+    // Sandbox-Recht, nie Warden oder Eskalation (S1); die Kinder laufen mit
+    // `allow_pause = false`.
+    "dod.finding",
+    "dod.related",
+    "dod.labels",
     // PL-97 B2: der Werkzeug-Index (`profile::TOOL_INDEX_TOOLS`,
     // `model_tool(readonly, approval = "none")`, `harw-ops/src/tool_index_op.rs`).
     // Liest nur statische Daten dieses Binaries (Katalog, Profile,
@@ -486,6 +497,15 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
 /// eine Allow-Regel überspringt das nie. Unter `FullAccess` fragt keine der
 /// beiden Stufen; die TUI zeigt dann nur noch das Passwortfeld, wenn `sudo`
 /// selbst ein Passwort verlangt.
+///
+/// # `job.suspend` / `job.resume`
+/// Frieren einen eigenen harw-Job über seine Cgroup ein bzw. tauen ihn auf
+/// (`harw-tool-job`, PL-100 §3.5, Autonomie-Stufe A2: „durch den Menschen,
+/// immer mit Nachfrage“). Ein Triage-Verdict empfiehlt `job.suspend` nur;
+/// angehalten wird erst nach der Rückfrage, und eine sitzungsweite
+/// Allow-Regel darf sie nie überspringen. Anders als `job.stop` (Modus-Logik,
+/// eine Allow-Regel greift) stehen deshalb beide hier. Unter `FullAccess`
+/// fragt — wie bei jedem Werkzeug dieser Liste — nichts.
 pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     "agents.write_uia",
     "agents.commit_proposal",
@@ -514,6 +534,10 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     "gateway.listeners.set",
     "gateway.tools.grant",
     "gateway.tools.narrow",
+    // PL-100 §3.5 (A2): einen eigenen Job anhalten bzw. fortsetzen — immer
+    // mit Nachfrage, auch gegen eine Allow-Regel (`harw-tool-job`).
+    "job.suspend",
+    "job.resume",
 ];
 
 /// Werkzeug, dessen Remote-OCR-Versand eine eigene Freigabe braucht.
@@ -1239,6 +1263,8 @@ mod tests {
         read_only_surface.extend_from_slice(crate::profile::WORK_DRIVER_REPORT_TOOLS);
         // PL-97 D3: die lesenden Harw-DoD-Werkzeuge (nur Lesen des Exports).
         read_only_surface.extend_from_slice(crate::profile::DOD_READ_TOOLS);
+        // PL-100 WP1.2: die lesenden Triage-Werkzeuge (Export bzw. Labels).
+        read_only_surface.extend_from_slice(crate::profile::DOD_TRIAGE_TOOLS);
         // PL-97 B2: der Werkzeug-Index (nur statische Daten).
         read_only_surface.extend_from_slice(crate::profile::TOOL_INDEX_TOOLS);
         // harw-tool-tunnel-v1: die lesenden Tunnel-Werkzeuge stehen in
@@ -1291,6 +1317,59 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    /// PL-100 §3.5 (Autonomie-Stufe A2): `job.suspend` und `job.resume`
+    /// fragen unter `ask` und `auto` immer, auch gegen eine Allow-Regel, und
+    /// sind nie auto-freigegeben; `job.stop` gibt eine Allow-Regel dagegen
+    /// frei. Unter `FullAccess` fragt keines (Nutzerentscheidung 2026-09-24).
+    #[test]
+    fn job_suspend_and_resume_always_ask_unlike_job_stop() -> TestResult {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
+
+        let allow_rule_policy = |tool: &str, mode: ApprovalMode| {
+            let rules = AllowRuleSet::new();
+            rules.add(ApprovalRule {
+                tool: tool.to_owned(),
+                pattern: None,
+                decision: RuleDecision::Allow,
+                scope: RuleScope::Global,
+            });
+            DefaultApprovalPolicy::with_rules(ApprovalModeCell::new(mode), rules)
+        };
+        for tool in ["job.suspend", "job.resume"] {
+            assert!(ALWAYS_ASK_TOOLS.contains(&tool), "{tool}");
+            assert!(!AUTO_APPROVED_TOOLS.contains(&tool), "{tool}");
+            assert!(
+                DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                "{tool}"
+            );
+            for mode in [ApprovalMode::AlwaysAsk, ApprovalMode::Delegated] {
+                let policy = allow_rule_policy(tool, mode);
+                assert!(
+                    matches!(
+                        block_on(policy.review(&call(tool)))?,
+                        ApprovalDecision::AskUser(_)
+                    ),
+                    "{tool} muss unter {mode:?} trotz Allow-Regel nachfragen"
+                );
+            }
+            let full = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::FullAccess));
+            assert!(
+                matches!(block_on(full.review(&call(tool)))?, ApprovalDecision::Allow),
+                "{tool} fragt unter FullAccess nicht"
+            );
+        }
+        let stop = harw_tool_job::JOB_STOP_TOOL;
+        assert!(!ALWAYS_ASK_TOOLS.contains(&stop));
+        assert!(
+            matches!(
+                block_on(allow_rule_policy(stop, ApprovalMode::Delegated).review(&call(stop)))?,
+                ApprovalDecision::Allow
+            ),
+            "job.stop folgt der Allow-Regel"
+        );
+        Ok(())
     }
 
     /// PL-97 B4: `fsread.*`/`git.*` laufen ohne Rückfrage (lesend,
@@ -1544,15 +1623,20 @@ mod tests {
         }
     }
 
-    /// PL-97 D3: die lesenden Harw-DoD-Werkzeuge laufen ohne Rückfrage und
-    /// stehen nie in `ALWAYS_ASK_TOOLS`.
+    /// PL-97 D3, PL-100 WP1.2: die lesenden Harw-DoD-Werkzeuge (Root: drei)
+    /// und die Triage-Werkzeuge laufen ohne Rückfrage und stehen nie in
+    /// `ALWAYS_ASK_TOOLS`.
     #[test]
     fn dod_read_tools_are_auto_approved_and_never_always_ask() {
         assert_eq!(
             crate::profile::DOD_READ_TOOLS,
             ["dod.status", "dod.findings", "dod.sensors"]
         );
-        for tool in crate::profile::DOD_READ_TOOLS {
+        assert_eq!(
+            crate::profile::DOD_TRIAGE_TOOLS,
+            ["dod.finding", "dod.related", "dod.labels"]
+        );
+        for tool in crate::profile::DOD_TRIAGE_ROLE_TOOLS {
             assert!(AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
             assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
             assert!(

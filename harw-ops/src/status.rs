@@ -14,10 +14,12 @@
 //! Verdrahtung voll funktionsfähig. Anpassen lässt sich die Grenze über die
 //! separate Operation `/provider-concurrency` (siehe `crate::provider`).
 //!
-//! Zeigt außerdem (sofern verdrahtet) den Host-Lease-Zustand: „aktiv (bis
-//! Strg+H oder /sandbox-lease revoke)“, „Einmalfreigabe“ oder „aus“. Eine
-//! Host-Arbeitsphase hat keine Restlaufzeit (Nutzerentscheidung 2026-09-24):
-//! sie endet nur durch den Nutzer. Seit der Behebung „volle
+//! Zeigt außerdem (sofern verdrahtet) den Host-Lease-Zustand: „aktiv, noch …“
+//! mit der Restlaufzeit, „Einmalfreigabe“, „abgelaufen“ oder „aus“
+//! (`crate::sandbox_lease::host_lease_state`, derselbe Wortlaut wie
+//! `/sandbox-lease status`). Eine Host-Arbeitsphase läuft nach
+//! `[sandbox] host_lease_ttl_secs` ab (Vorgabe 8 h; PL-100 Phase 4, B22,
+//! `docs/adr/0002-session-lease-expiry.md`). Seit der Behebung „volle
 //! Sandbox-Deaktivierung“ (2026-09-21) meldet diese Zeile sowohl eine
 //! sitzungseigene als auch eine prozessweite Freigabe
 //! ([`harw_sandbox::HostPermitSessionRegistry::mark_global_approval`], über
@@ -60,6 +62,8 @@ use harw_macros::operation;
 use harw_operations::session_control::{ContextUsageSnapshot, SharedSessionController};
 use harw_operations::{OpContext, OpError, OpOutput};
 use harw_tool_shell::HostPermitHandles;
+
+use crate::sandbox_lease::{HostLeaseState, active_lease_text, host_lease_state};
 
 /// Formatiert die Kontextfenster-Auslastung als eine deutschsprachige Zeile
 /// (Welle 3), geteilt von `/status` und `/usage`.
@@ -243,20 +247,16 @@ async fn status(ctx: &OpContext, _args: StatusArgs) -> Result<OpOutput, OpError>
     // `Arc<HostPermitHandles>` in der ServiceMap registriert ist (siehe
     // `crate::sandbox_lease`). Fehlt sie, bleibt `/status` unverändert --
     // dieselbe "fehlt stillschweigend"-Regel wie bei der
-    // Provider-Concurrency-Zeile oben. `is_session_approved`/
-    // `has_single_use` berücksichtigen seit der "volle Sandbox-Deaktivierung"-
-    // Behebung (2026-09-21) bereits sitzungseigene und prozessweite
-    // Freigabe -- kein zusätzlicher Blick auf `has_global_approval` nötig.
-    // Keine Restlaufzeit: eine Phase endet nur durch den Nutzer
-    // (Nutzerentscheidung 2026-09-24).
+    // Provider-Concurrency-Zeile oben. `host_lease_state` berücksichtigt
+    // sitzungseigene und prozessweite Freigabe. PL-100 Phase 4 (B22): eine
+    // aktive Phase zeigt ihre Restlaufzeit, eine abgelaufene „abgelaufen“.
     if let Some(handles) = ctx.service::<Arc<HostPermitHandles>>() {
         let session_id = ctx.session_id().as_str();
-        let label = if handles.registry.is_session_approved(session_id) {
-            "aktiv (bis Strg+H oder /sandbox-lease revoke)".to_owned()
-        } else if handles.registry.has_single_use(session_id) {
-            "Einmalfreigabe".to_owned()
-        } else {
-            "aus".to_owned()
+        let label = match host_lease_state(&handles.registry, session_id) {
+            HostLeaseState::Active(remaining) => active_lease_text(remaining),
+            HostLeaseState::SingleUse => "Einmalfreigabe".to_owned(),
+            HostLeaseState::Expired => "abgelaufen".to_owned(),
+            HostLeaseState::Off => "aus".to_owned(),
         };
         lines.push(format!("Host-Lease: {label}"));
     }
@@ -488,7 +488,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_shows_host_lease_active_until_the_user_ends_it() -> TestResult {
+    async fn status_shows_host_lease_active_with_its_remaining_time() -> TestResult {
+        // PL-100 Phase 4 (B22, ADR 0002): die Phase läuft ab; die Zeile
+        // zeigt die Restlaufzeit (Vorgabe 8 h, aufgerundet auf Minuten).
         let handles = fresh_host_permit_handles();
         let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)))?;
         handles
@@ -499,15 +501,52 @@ mod tests {
             .await
             .map_err(crate::test_support::ctx("status must not fail"))?;
         assert!(
-            output
-                .text
-                .contains("Host-Lease: aktiv (bis Strg+H oder /sandbox-lease revoke)"),
-            "expected an active host-lease line without an expiry: {}",
+            output.text.contains("Host-Lease: aktiv, noch 8 h 0 min"),
+            "expected an active host-lease line with its remaining time: {}",
             output.text
         );
         assert!(
-            !output.text.contains("noch "),
-            "a host lease has no remaining time any more: {}",
+            output
+                .text
+                .contains("vorher beenden: Strg+H oder /sandbox-lease revoke"),
+            "{}",
+            output.text
+        );
+        assert!(
+            !output.text.contains("aktiv (bis Strg+H"),
+            "the old no-expiry wording must be gone: {}",
+            output.text
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_shows_host_lease_expired() -> TestResult {
+        // Eine Phase, die vor 5 s begann und nach 1 s endete: „abgelaufen“.
+        let registry =
+            harw_sandbox::HostPermitSessionRegistry::with_lease_ttl(Duration::from_secs(1))
+                .map_err(ctx("with_lease_ttl"))?;
+        let past = harw_sandbox::LeaseInstant::now()
+            .checked_sub(Duration::from_secs(5))
+            .ok_or(crate::test_support::TestError::Missing(
+                "instant five seconds ago",
+            ))?;
+        let handles = Arc::new(harw_tool_shell::HostPermitHandles {
+            ledger: Arc::new(harw_sandbox::ProcessPermitLedger::default()),
+            registry: Arc::new(registry),
+            prompts: None,
+        });
+        let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)))?;
+        handles
+            .registry
+            .mark_session_approved_at(ctx.session_id().as_str(), past);
+
+        let output = status(&ctx, StatusArgs {})
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
+        assert!(
+            output.text.contains("Host-Lease: abgelaufen"),
+            "expected an expired host-lease line: {}",
             output.text
         );
         Ok(())

@@ -11,6 +11,7 @@
 libexec/harw-sentinel
 libexec/harw-probe-bpf
 libexec/harw-probe-fs
+libexec/harw-probe-netlink
 libexec/harw-warden
 bpf/exec.bpf.o
 bpf/exit.bpf.o
@@ -21,6 +22,7 @@ systemd/harw-dod.target
 systemd/harw-sentinel.service
 systemd/harw-probe-bpf.service
 systemd/harw-probe-fs.service
+systemd/harw-probe-netlink.service
 systemd/harw-warden.service
 systemd/harw-warden.socket
 sysusers/harw.conf

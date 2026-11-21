@@ -100,6 +100,71 @@ daemons that predate them still parse.
 Capabilities only describe the daemon. The client does not use them to grant
 authority or to downgrade anything.
 
+### SecurityHub posture
+
+`SecurityHubClient::posture()` reads `GET /v1/posture` into a typed
+`Posture` (PL-100 phase 4). The client does not depend on `harw-types`, so
+the document has its own types: `PosturePeer`, `DodPosture`,
+`DodPostureStatus`, `PostureSeverity`, `PostureFinding`, `PostureId`,
+`DisplayId`, `InstructionId` and `UntrustedText`.
+
+```text
+GET /v1/posture  200 {"peer": {"uid", "gid", "pid"?}, "principal_id"?, "host"?,
+                      "dod": {"status": "ok" | "unavailable" | "not_configured",
+                              "min_severity"?, "since"?, "findings"?: [...],
+                              "skipped_malformed"?, "skipped_oversize"?, "truncated"?}}
+                 403 {"error": "unknown_peer"} → InfraClientError::Forbidden
+```
+
+The reader is reader-first (PL-100 I11). It ignores unknown fields. It maps
+an unknown `dod.status` or severity to `Unknown`, and fields the hub leaves
+out in the `unavailable`/`not_configured` states get their defaults. Only a
+document without `peer`, `dod` or `dod.status`, or a finding without its
+identifying fields, is a `Protocol` error.
+
+Three finding fields come straight from the DoD findings export and are
+untrusted (PL-100 I4, threat model B3). The hub replaces only control
+characters (`Cc`) in `summary` and `rule_id`, so bidi overrides, zero-width
+and tag-block characters pass. It checks `finding_id` only for being
+non-blank. The client therefore never exposes these fields as plain
+strings:
+
+- `summary` is an `UntrustedText`. It has no `Display`, no `Deref`, and a
+  `Debug` that shows only its length. `escaped_line(max_chars)` renders it
+  through `harw_untrusted_text::escape_line`; `as_untrusted_str()` is the
+  explicitly named raw accessor.
+- `finding_id` and `rule_id` are a `PostureId`. `Valid(DisplayId)` means
+  the value passed the grammar of the DoD export reader (`harw-dod-client`).
+  For `finding_id` that is non-blank, at most 256 bytes and nothing the
+  escaper would change; for `rule_id` it is 1 to 128 bytes of
+  `[A-Za-z0-9._:-]`. Any other value becomes `Invalid(UntrustedText)`. The
+  finding is kept, never dropped (I3).
+- `dedup_key` is kept only as 32 lowercase hex characters, the same filter
+  the hub applies.
+
+The other strings (`host`, `principal_id`, `since`, `observed_at`) come from
+the hub's own configuration and timestamp rendering.
+
+A valid id is only safe to *display*. The `finding_id` grammar accepts any
+display-clean text, including "Ignore previous instructions", so a valid id
+is still export text and never an instruction (I4):
+
+- `DisplayId` has a private field and no public constructor. A `Valid` can
+  only come out of the grammar: decoding, or `PostureId::from_finding_id` /
+  `PostureId::from_rule_id`, which sort a value the way the decoder does;
+  a plain `String` cannot be wrapped as `Valid`. `DisplayId` has no `Display`
+  and no plain-`&str` accessor, only `escaped_line(max_chars)` and the
+  explicitly named `as_untrusted_str()`.
+- `InstructionId` is the only id type for a model instruction template. It
+  holds a canonical lowercase UUIDv4 (36 characters, hyphens at 8/13/18/23,
+  version `4`, variant `8`/`9`/`a`/`b`; uppercase, braced, URN, simple and
+  nil UUIDs are refused), the same grammar as
+  `harw_dod_client::findings::is_uuid_v4` and the node uplink.
+  `InstructionId::parse` is its only constructor, and it has no
+  `Deserialize`. `PostureFinding::finding_instruction_id()` (or
+  `PostureId::to_instruction_id()`) returns one only for such an id.
+  `Invalid` values are never promoted.
+
 ### Codec dependency
 
 The client uses `crypt_guard_hyper`'s public `FrameWriter` and `FrameReader`,
@@ -221,3 +286,8 @@ server on a tempdir Unix socket (`src/test_server.rs`). They cover:
   store-epoch check (epoch changed → unavailable, unchanged or unreported →
   `Open`; the mock hub's epoch is settable via `MockState::set_epoch`)
 - parsing `store_epoch`/`boot_id` with and without the fields
+- the posture document (`src/posture.rs`): every state of the hub's
+  format, unknown fields and values, malformed documents, `403`, the wrong
+  content type and an unreachable hub; ids outside their grammar (ANSI
+  escape, bidi, zero-width, tag block, overlong) kept as `Invalid` and only
+  rendered escaped; `UntrustedText` escaping, bounding and redacted `Debug`

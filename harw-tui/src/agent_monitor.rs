@@ -3804,6 +3804,8 @@ mod tests {
             } else {
                 harw_tool_job::JobState::Succeeded
             },
+            suspended: false,
+            suspension_unresolved: false,
             progress: if active {
                 "ninja 120/900 13%".to_owned()
             } else {

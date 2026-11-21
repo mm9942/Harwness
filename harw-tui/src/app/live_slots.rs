@@ -920,6 +920,7 @@ mod tests {
                     arguments: serde_json::json!({ "path": "src/lib.rs", "content": "x" }),
                 },
                 timeout: Duration::from_secs(600),
+                reason: None,
             })
             .ok_or(TestError::Missing("Frage zugestellt"))?;
         child_approvals::poll(app);

@@ -1,12 +1,16 @@
 //! Die Eskalationsleiter: [`EscalationStage`].
 //!
+//! Seit PL-100 WP 3.0 Teil von `harw-dod-warden-types`; `harw-dod-warden-proto`
+//! re-exportiert diesen Typ unter seinem bisherigen Pfad.
+//!
 //! # Verantwortungsbereich
 //! Genau ein Typ: die geordnete Menge der Stufen, ab denen eine
 //! [`crate::action::WardenAction`] überhaupt durchgesetzt werden darf (siehe
 //! [`crate::action::WardenAction::is_admissible_from`]). Dieses Modul trifft
 //! keine Aussage darüber, WANN eine Stufe erreicht wird — das entscheidet
-//! `harw-dod-escalate` (AW5-03, `Ladder::admissible`) anhand des laufenden
-//! Befundverlaufs. Hier steht nur das Vokabular, das beide Seiten der
+//! `harw-dod-ladder` (`Ladder::stage_for`, bis PL-100 WP 3.0 in
+//! `harw-dod-escalate`) anhand der Befundfelder. Hier steht nur das
+//! Vokabular, das beide Seiten der
 //! Leitung (Eskalationsleiter und Durchsetzer) gemeinsam verwenden müssen,
 //! damit `stage`-Werte auf der Leitung dasselbe bedeuten.
 //!
@@ -44,7 +48,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Examples
 /// ```rust
-/// use harw_dod_warden_proto::EscalationStage;
+/// use harw_dod_warden_types::EscalationStage;
 ///
 /// assert!(EscalationStage::RuleTriggered < EscalationStage::Escalated);
 /// ```
@@ -66,11 +70,12 @@ impl EscalationStage {
     /// # Description
     /// Identisch mit der serde-Form (`"rule-triggered"`, `"escalated"`);
     /// Proof v2 nimmt diesen festen Wert in die kanonische MAC-Eingabe auf
-    /// (siehe `canonical.rs`), statt sich auf eine JSON-Kodierung zu verlassen.
+    /// (`harw-dod-warden-proto`, `signed.rs`), statt sich auf eine
+    /// JSON-Kodierung zu verlassen.
     ///
     /// # Examples
     /// ```rust
-    /// use harw_dod_warden_proto::EscalationStage;
+    /// use harw_dod_warden_types::EscalationStage;
     ///
     /// assert_eq!(EscalationStage::Escalated.wire_name(), "escalated");
     /// ```

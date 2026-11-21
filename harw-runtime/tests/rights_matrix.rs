@@ -221,14 +221,19 @@ fn expected(entry: EntryKind) -> Expected {
     const NONE: &[&str] = &[];
     // Ohne `[policy].require_approval_for` entsteht keine Config-Politik
     // (W2B-03: ein Handler, der alles durchwinkt, wäre nur Rauschen); ohne
-    // Responder — den erst `new_root_session` anhängt — bleibt die
-    // Default-Politik allein. Nur `Tui` und `GatewayTelegram` (Freigabe-
+    // Responder — den erst `new_root_session` anhängt — bleiben Default-
+    // und DoD-Taint-Politik. Nur `Tui` und `GatewayTelegram` (Freigabe-
     // Buttons) lösen Rückfragen interaktiv auf; jeder andere Einstieg trägt
     // zusätzlich seine `AskResolutionPolicy` ([`ApprovalHandlerKind::Other`],
-    // Befund Z2c-02).
-    const DEFAULT_ONLY: &[ApprovalHandlerKind] = &[ApprovalHandlerKind::DefaultPolicy];
+    // Befund Z2c-02). Jede Kette endet mit der `DodTaintPolicy`
+    // ([`ApprovalHandlerKind::Other`], PL-100 Phase 4, Entscheidung O1).
+    const DEFAULT_ONLY: &[ApprovalHandlerKind] = &[
+        ApprovalHandlerKind::DefaultPolicy,
+        ApprovalHandlerKind::Other,
+    ];
     const DEFAULT_AND_ASK: &[ApprovalHandlerKind] = &[
         ApprovalHandlerKind::DefaultPolicy,
+        ApprovalHandlerKind::Other,
         ApprovalHandlerKind::Other,
     ];
 
@@ -471,9 +476,9 @@ fn telegram_reads_and_writes_without_shell_network_or_relaxed_approval() -> Test
 }
 
 /// Die Read-only-Rollen (analyst, researcher-deps, planner, die vier
-/// security-*-triage-Rollen) bekommen auch unter einer vernetzten
-/// UIA-Wurzel kein Netz, kein Schreiben und keine Ausführung: ihr Reducer
-/// schneidet die Rechte der Wurzel entsprechend.
+/// security-*-triage-Rollen, intel-scout, context-steward) bekommen auch
+/// unter einer vernetzten UIA-Wurzel kein Netz, kein Schreiben und keine
+/// Ausführung: ihr Reducer schneidet die Rechte der Wurzel entsprechend.
 #[test]
 fn read_only_roles_stay_network_free_under_a_networked_root() -> TestResult {
     use harw_authority::Permission;
@@ -494,6 +499,8 @@ fn read_only_roles_stay_network_free_under_a_networked_root() -> TestResult {
         role_names::SECURITY_BASELINE_TRIAGE,
         role_names::SECURITY_STRUCTURE_TRIAGE,
         role_names::SECURITY_ENDPOINT_TRIAGE,
+        role_names::INTEL_SCOUT,
+        role_names::CONTEXT_STEWARD,
     ] {
         let reducer = authority_reducer_for_role(role).ok_or(TestError::Missing("reducer"))?;
         let child = reducer.reduce(&root);
@@ -1900,6 +1907,30 @@ async fn uia_worker_and_its_siblings_use_the_uia_provider_not_the_default_provid
             !message.contains("is not configured"),
             "the uia-worker model must accept an explicit 'local-b' request too — 'local-b' is \
              registered in the default router: {message}"
+        );
+    }
+    Ok(())
+}
+
+/// Ein Root-Orchestrator als Wurzel (`--agent root-orchestrator`) führt
+/// `delegate_wave` tatsächlich aus — früher bekamen es nur Kind-Registries,
+/// während der Lesewächter genau dorthin verwies. Eine Worker-Wurzel nie.
+#[test]
+fn an_explicit_root_orchestrator_root_can_run_delegate_wave() -> TestResult {
+    for (agent, expected) in [
+        (role_names::ROOT_ORCHESTRATOR, true),
+        (role_names::EXPLORER, false),
+    ] {
+        let fixture = fixture_without_uia()?;
+        let mut spec = spec_for(EntryKind::Tui, &fixture);
+        spec.active_agent = Some(agent.to_owned());
+        let assembly = build_with_spec(spec)
+            .map_err(|error| TestError::Unexpected(format!("--agent {agent}: {error}")))?;
+        let tools = assembly.rights_snapshot().tools;
+        assert_eq!(
+            tools.iter().any(|tool| tool == "delegate_wave"),
+            expected,
+            "--agent {agent}: {tools:?}"
         );
     }
     Ok(())

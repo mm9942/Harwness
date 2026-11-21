@@ -667,6 +667,9 @@ fn to_sdk_request(
         call_id: summary.call_id,
         tool: summary.tool,
         arguments: summary.arguments,
+        // PL-100 O1: `harw_session_client::ApprovalSummary` trägt den Grund
+        // (bzw. die `summary` der Leitung) nicht; offen.
+        reason: None,
     }
 }
 
@@ -698,6 +701,8 @@ mod tests {
         );
         assert_eq!(asked.tool, "shell");
         assert_eq!(asked.arguments, serde_json::json!({"cmd": "ls"}));
+        // PL-100 O1: über eine Remote-Sitzung kommt (noch) kein Kern-Grund an.
+        assert_eq!(asked.reason, None);
         Ok(())
     }
 

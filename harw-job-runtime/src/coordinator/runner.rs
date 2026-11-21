@@ -46,6 +46,30 @@
 //! written once, by the attempt that decides the outcome. The store-level
 //! attempt counter (`Job::attempts`) is only advanced by the store's own
 //! reclaim path (lease expiry), which the in-lease retries do not replace.
+//!
+//! # Deadline of a frozen attempt (PL-100 WP 3.5)
+//! The wall-clock deadline (`ResourceRequest::wall_timeout`, armed once per
+//! attempt in `supervise`) is **not** paused while the attempt's cgroup is
+//! frozen. The runtime has no notion of a suspend: `job.suspend` /
+//! `job.resume` (`harw-tool-job`) and a Warden freeze write `cgroup.freeze`
+//! of the attempt cgroup directly, and nothing tells the coordinator
+//! (`harw-tool-job` sits above this crate, via `harw-command`, so it cannot
+//! be called from here; the only external input of a running attempt is
+//! its cancel channel). Frozen time therefore counts towards
+//! `wall_timeout`, and a deadline that expires while the attempt is frozen
+//! cancels it as usual (`TimedOut`; a frozen process still dies to
+//! `SIGKILL` / `cgroup.kill`).
+//!
+//! In practice this does not cut a suspended `job.start` job short: its
+//! port request carries a ten-year backstop as `wall_timeout`, and its
+//! active-time accounting, which excludes suspended time, lives in
+//! `harw-tool-job` (`JobMeta::suspended_secs`, `JobMeta::active_secs_at`).
+//! Other attempts with a real `wall_timeout` (e.g. `shell.exec`) that a
+//! Warden freezes keep their deadline. Pausing the deadline for real would
+//! need a per-attempt pause/resume signal from the freezing side into
+//! `supervise` (on pause keep the remaining time, on resume re-arm
+//! `now + remaining`) and a shifted persisted [`AttemptRecord`] deadline
+//! for recovery.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -2083,6 +2107,10 @@ async fn sleep_until(at: Option<Instant>) {
 /// For a recovered attempt, supervision notes of the executor
 /// ([`AttemptEvent::Error`], e.g. a job cgroup that could not be reopened)
 /// are recorded in the attempt's reason.
+///
+/// The deadline is armed once, from the persisted attempt deadline, and
+/// keeps running while the attempt's cgroup is frozen (`job.suspend`,
+/// Warden): see "Deadline of a frozen attempt" in the module docs.
 async fn supervise<S, E>(
     inner: &Arc<Inner<S, E>>,
     claim: &JobClaim,

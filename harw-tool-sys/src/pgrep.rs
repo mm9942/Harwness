@@ -1,12 +1,21 @@
 //! `sys.pgrep` — `pgrep` in reinem Rust.
 //!
 //! Sucht Prozesse per regulärem Ausdruck gegen den Namen (`comm`) oder mit
-//! `full` (`-f`) gegen die **maskierte** Kommandozeile. Der eigene Prozess wird
-//! wie bei `pgrep` ausgeschlossen. Der Ausdruck ist auf 256 Zeichen und
-//! 1 MiB kompiliertes Programm begrenzt (kein Regex-Bombing).
+//! `full` (`-f`) gegen die **geschwärzte** Kommandozeile
+//! ([`crate::mask::redacted_command`]: Name plus Argumentanzahl). Der eigene
+//! Prozess wird wie bei `pgrep` ausgeschlossen. Der Ausdruck ist auf 256
+//! Zeichen und 1 MiB kompiliertes Programm begrenzt (kein Regex-Bombing).
+//!
+//! # Sicherheit
+//! - Argumentwerte und `argv[0]` erreichen weder die Ausgabe noch den
+//!   Ausdruck: ein Muster kann sie also auch nicht Zeichen für Zeichen
+//!   erraten. `name` ist escaped.
+//! - Umfang wie `sys.ps` ([`crate::scope`]): standardmäßig nur die eigenen
+//!   Prozesse, `scope = "all"` nur unter Full Access.
 
-use crate::mask::masked_command;
+use crate::mask::{NAME_CHARS, redacted_command};
 use crate::procfs::{ProcFs, ProcInfo};
+use crate::scope::{PsScope, ScopeFilter, ScopePolicy};
 use harw_tool_fsread::blocking::run_blocking;
 use harw_tool_fsread::budget::{Collector, fail, flag, limit_or, ok};
 use harw_tool_fsread::users::UserDb;
@@ -34,7 +43,7 @@ pub const MAX_PATTERN_CHARS: usize = 256;
 pub struct PgrepArgs {
     /// Regular expression (Rust regex syntax, at most 256 characters) matched against the process name.
     pub pattern: String,
-    /// -f / --full: match against the full (masked) command line instead of the name.
+    /// -f / --full: match against the redacted command line (process name plus argument count, never argument values) instead of the name.
     #[serde(default)]
     pub full: Option<bool>,
     /// -x / --exact: the pattern must match the whole name / command line.
@@ -61,18 +70,63 @@ pub struct PgrepArgs {
         deserialize_with = "harw_extension_api::lenient::lenient_opt_usize"
     )]
     pub limit: Option<usize>,
+    /// Which processes: 'own' (default; this session's processes) or 'all' (every process; only honoured in Full Access approval mode, otherwise an error).
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
-/// Führt `sys.pgrep` aus; `own_pid` wird ausgeschlossen.
+/// Führt `sys.pgrep` mit der Vorgabe-Politik aus (nur `own`); `own_pid` wird
+/// ausgeschlossen.
 #[must_use]
 pub fn run(procfs: &ProcFs, own_pid: i32, args: &PgrepArgs) -> ToolOutput {
-    match build(procfs, own_pid, args) {
+    run_with_policy(procfs, own_pid, args, &ScopePolicy::own_only())
+}
+
+/// Führt `sys.pgrep` aus; das Argument `scope` wird gegen `policy` aufgelöst.
+///
+/// # Errors
+/// Als Fehler-`ToolOutput`: ungültige Argumente, `all` ohne Full Access oder
+/// ein unbestimmbarer eigener Umfang (fail closed).
+#[must_use]
+pub fn run_with_policy(
+    procfs: &ProcFs,
+    own_pid: i32,
+    args: &PgrepArgs,
+    policy: &ScopePolicy,
+) -> ToolOutput {
+    let result = policy.resolve(args.scope.as_deref()).and_then(|scope| {
+        let filter = ScopeFilter::resolve(procfs, scope, policy.extra_roots())?;
+        build(procfs, own_pid, args, &filter)
+    });
+    match result {
         Ok(output) => output,
         Err(message) => fail(TOOL, message),
     }
 }
 
-fn build(procfs: &ProcFs, own_pid: i32, args: &PgrepArgs) -> Result<ToolOutput, String> {
+/// Führt `sys.pgrep` mit einem vom Host-Code gewählten Umfang aus; das
+/// Argument `scope` wird nur auf Gültigkeit geprüft.
+///
+/// # Errors
+/// Als Fehler-`ToolOutput` wie [`run_with_policy`].
+#[must_use]
+pub fn run_scoped(procfs: &ProcFs, own_pid: i32, args: &PgrepArgs, scope: PsScope) -> ToolOutput {
+    let result = PsScope::parse(args.scope.as_deref()).and_then(|_| {
+        let filter = ScopeFilter::resolve(procfs, scope, &[])?;
+        build(procfs, own_pid, args, &filter)
+    });
+    match result {
+        Ok(output) => output,
+        Err(message) => fail(TOOL, message),
+    }
+}
+
+fn build(
+    procfs: &ProcFs,
+    own_pid: i32,
+    args: &PgrepArgs,
+    filter: &ScopeFilter,
+) -> Result<ToolOutput, String> {
     if args.pattern.is_empty()
         || args.pattern.chars().count() > MAX_PATTERN_CHARS
         || args.pattern.contains('\0')
@@ -131,19 +185,16 @@ fn build(procfs: &ProcFs, own_pid: i32, args: &PgrepArgs) -> Result<ToolOutput, 
     let limit = limit_or(args.limit, DEFAULT_LIMIT, HARD_LIMIT);
 
     let (all, vanished) = procfs.processes(full);
-    let mut matches: Vec<ProcInfo> = all
+    let mut matches: Vec<ProcInfo> = filter
+        .retain(procfs, all)
         .into_iter()
         .filter(|info| info.stat.pid != own_pid)
         .filter(|info| parents.is_empty() || parents.contains(&info.stat.ppid))
         .filter(|info| want_uid.is_none_or(|uid| info.uid == uid))
         .filter(|info| {
             if full {
-                let text = if info.cmdline.is_empty() {
-                    info.stat.comm.clone()
-                } else {
-                    masked_command(&info.cmdline, 4096)
-                };
-                regex.is_match(&text)
+                // Nur die geschwärzte Form: kein Orakel für Argumentwerte.
+                regex.is_match(&redacted_command(&info.stat.comm, &info.cmdline))
             } else {
                 regex.is_match(&info.stat.comm)
             }
@@ -161,10 +212,13 @@ fn build(procfs: &ProcFs, own_pid: i32, args: &PgrepArgs) -> Result<ToolOutput, 
     let mut out = Collector::new(limit);
     let mut pids = Vec::new();
     for info in &matches {
-        let mut entry =
-            json!({"pid": info.stat.pid, "name": info.stat.comm, "ppid": info.stat.ppid});
+        let mut entry = json!({
+            "pid": info.stat.pid,
+            "name": harw_untrusted_text::escape_line(&info.stat.comm, NAME_CHARS),
+            "ppid": info.stat.ppid,
+        });
         if full {
-            entry["command"] = json!(masked_command(&info.cmdline, 256));
+            entry["command"] = json!(redacted_command(&info.stat.comm, &info.cmdline));
         }
         if !out.push(entry) {
             break;
@@ -188,6 +242,7 @@ fn build(procfs: &ProcFs, own_pid: i32, args: &PgrepArgs) -> Result<ToolOutput, 
             "vanished": vanished,
             "truncated": truncated,
             "stopped": stopped,
+            "scope": filter.label(),
         }),
     ))
 }
@@ -195,17 +250,23 @@ fn build(procfs: &ProcFs, own_pid: i32, args: &PgrepArgs) -> Result<ToolOutput, 
 /// Sucht Prozesse wie `pgrep`.
 #[harw_macros::tool(
     name = "sys.pgrep",
-    description = "Finds process IDs by regular expression like pgrep: against the name or, with full=true (-f), the masked command line; -x exact, -i ignore_case, -u user, -P ppids, -n newest, -o oldest. Use when you need the PIDs of a program instead of running pgrep. Returns JSON {pids:[...], matches:[{pid,name,ppid}], count, truncated}; the calling process is excluded, patterns are length- and size-limited. Read-only, Linux only.",
+    description = "Finds process IDs by regular expression like pgrep: against the name or, with full=true (-f), the redacted command line (process name plus argument count; argument values are never matched or shown); -x exact, -i ignore_case, -u user, -P ppids, -n newest, -o oldest. By default (scope='own') only this session's processes are searched; scope='all' searches every process but only in Full Access approval mode. Use when you need the PIDs of a program instead of running pgrep. Returns JSON {pids:[...], matches:[{pid,name,ppid}], count, truncated, scope}; the calling process is excluded, patterns are length- and size-limited. Read-only, Linux only.",
     permission = "execute_process",
     parallel_safe,
-    skill = "sys-tools"
+    skill = "sys-tools",
+    state = ScopePolicy
 )]
 async fn sys_pgrep(
+    policy: &ScopePolicy,
     _context: &ToolExecutionContext,
     args: PgrepArgs,
 ) -> Result<ToolOutput, ToolsError> {
     let own = i32::try_from(std::process::id()).unwrap_or(0);
-    run_blocking(TOOL, move || run(&ProcFs::real(), own, &args)).await
+    let policy = policy.clone();
+    run_blocking(TOOL, move || {
+        run_with_policy(&ProcFs::real(), own, &args, &policy)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -239,11 +300,17 @@ mod tests {
             dir.join("cmdline"),
             cmd.iter().map(|c| format!("{c}\0")).collect::<String>(),
         )?;
+        fs::write(dir.join("cgroup"), "0::/user.slice/s1/app\n")?;
         Ok(())
     }
 
     fn tree() -> TestResult<tempfile::TempDir> {
         let dir = tempfile::tempdir()?;
+        fs::create_dir_all(dir.path().join("self"))?;
+        fs::write(
+            dir.path().join("self").join("cgroup"),
+            "0::/user.slice/s1\n",
+        )?;
         add(dir.path(), 1, 0, "init", 0, 10, &["/sbin/init"])?;
         add(
             dir.path(),
@@ -347,9 +414,16 @@ mod tests {
         assert_eq!(
             pids(&pgrep(
                 p,
-                json!({"pattern": "worker process", "full": true})
+                json!({"pattern": "redacted: 1 args", "full": true})
             )?),
-            vec![6, 7]
+            vec![7, 8]
+        );
+        assert_eq!(
+            pids(&pgrep(
+                p,
+                json!({"pattern": "nginx", "full": true, "exact": true})
+            )?),
+            vec![6]
         );
         assert_eq!(
             pids(&pgrep(p, json!({"pattern": "nginx", "user": "33"}))?),
@@ -375,19 +449,85 @@ mod tests {
     }
 
     #[test]
-    fn masked_command_cannot_be_probed() -> TestResult {
+    fn redacted_command_cannot_be_probed() -> TestResult {
         let dir = tree()?;
         let p = dir.path();
-        assert!(pids(&pgrep(p, json!({"pattern": "SECRET-VALUE", "full": true}))?).is_empty());
-        assert_eq!(
-            pids(&pgrep(
-                p,
-                json!({"pattern": "--token=\\*\\*\\*", "full": true})
-            )?),
-            vec![7]
-        );
-        let shown = pgrep(p, json!({"pattern": "worker", "full": true}))?;
-        assert!(!serde_json::to_string(&shown)?.contains("SECRET-VALUE"));
+        // Weder Argumentwerte noch Optionsnamen noch der Titel in argv[0]
+        // sind Treffer: das Muster sieht nur `<name> <redacted: N args>`.
+        for probe in [
+            "SECRET-VALUE",
+            "SECRET-V.*",
+            "--token",
+            "worker process",
+            "nginx.conf",
+        ] {
+            assert!(
+                pids(&pgrep(p, json!({"pattern": probe, "full": true}))?).is_empty(),
+                "{probe}"
+            );
+        }
+        let shown = pgrep(p, json!({"pattern": "nginx", "full": true}))?;
+        let text = serde_json::to_string(&shown)?;
+        for leaked in ["SECRET-VALUE", "--token", "worker process", "nginx.conf"] {
+            assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+        }
+        assert_eq!(shown["matches"][2]["command"], "nginx <redacted: 1 args>");
+        Ok(())
+    }
+
+    #[test]
+    fn names_are_escaped() -> TestResult {
+        let dir = tree()?;
+        add(
+            dir.path(),
+            60,
+            1,
+            "e\u{1b}vil\u{202e}",
+            0,
+            70,
+            &["x", "--password=pw"],
+        )?;
+        let value = pgrep(dir.path(), json!({"pattern": "vil", "full": true}))?;
+        assert_eq!(pids(&value), vec![60]);
+        for field in ["name", "command"] {
+            let text = value["matches"][0][field].as_str().unwrap_or("");
+            assert!(
+                text.contains("\\u{001b}") && text.contains("\\u{202e}"),
+                "{text}"
+            );
+            assert!(!text.chars().any(|c| c == '\u{1b}' || c == '\u{202e}'));
+        }
+        assert!(!serde_json::to_string(&value)?.contains("pw"));
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_processes_need_scope_all_under_full_access() -> TestResult {
+        use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
+
+        let dir = tree()?;
+        add(dir.path(), 50, 1, "nginx", 0, 80, &["nginx", "-pSECRET"])?;
+        fs::write(
+            dir.path().join("50").join("cgroup"),
+            "0::/system.slice/web.service\n",
+        )?;
+        let procfs = ProcFs::at(dir.path());
+        // Vorgabe: nur eigene Prozesse, der fremde bleibt unsichtbar.
+        let own = pgrep(dir.path(), json!({"pattern": "nginx"}))?;
+        assert_eq!(pids(&own), vec![5, 6, 7]);
+        assert_eq!(own["scope"], "own-cgroup");
+        let all: PgrepArgs =
+            serde_json::from_value(json!({"pattern": "nginx", "full": true, "scope": "all"}))?;
+        assert!(error_of(run(&procfs, 99, &all))?.contains("Full Access"));
+        let mode = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let policy = ScopePolicy::own_only().with_full_access_gate(mode.clone());
+        assert!(error_of(run_with_policy(&procfs, 99, &all, &policy))?.contains("Full Access"));
+        mode.set(ApprovalMode::FullAccess);
+        let value = json_of(run_with_policy(&procfs, 99, &all, &policy))?;
+        assert_eq!(pids(&value), vec![5, 6, 7, 50]);
+        assert_eq!(value["scope"], "all");
+        // Auch unter `all` keine Argumentwerte.
+        assert!(!serde_json::to_string(&value)?.contains("SECRET"));
         Ok(())
     }
 

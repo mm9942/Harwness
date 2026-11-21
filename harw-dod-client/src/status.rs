@@ -30,11 +30,14 @@ pub const LIBEXEC_DIR: &str = "/usr/local/libexec/harw-dod";
 /// The Warden guard file (`ConditionPathExists=` of the Warden units).
 pub const WARDEN_FLAG_PATH: &str = "/etc/harw-dod/warden.enable";
 
-/// The four daemons of the suite.
-pub const DOD_BINARIES: [&str; 4] = [
+/// The five daemons of the suite. `harw-probe-netlink` is installed with the
+/// package but opt-in (PL-100 WP1.8, O11); a host whose package lacks it is
+/// reported as a partial install.
+pub const DOD_BINARIES: [&str; 5] = [
     "harw-sentinel",
     "harw-probe-fs",
     "harw-probe-bpf",
+    "harw-probe-netlink",
     "harw-warden",
 ];
 
@@ -96,7 +99,7 @@ impl DodClientContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum InstallState {
-    /// All four daemons are present.
+    /// All five daemons are present.
     Installed {
         /// The directory that was checked.
         libexec_dir: PathBuf,
@@ -161,7 +164,7 @@ pub struct DodStatus {
     pub install: InstallState,
     /// System configuration.
     pub config: ConfigReport,
-    /// The six units.
+    /// The suite's systemd units.
     pub units: Vec<UnitState>,
     /// Warden enablement.
     pub warden: WardenState,
@@ -460,7 +463,11 @@ mod tests {
             snapshot.install,
             InstallState::Partial {
                 libexec_dir: libexec,
-                missing: vec!["harw-probe-fs".into(), "harw-warden".into()],
+                missing: vec![
+                    "harw-probe-fs".into(),
+                    "harw-probe-netlink".into(),
+                    "harw-warden".into(),
+                ],
             }
         );
         assert_eq!(snapshot.config, expected_config);
@@ -678,7 +685,10 @@ mod tests {
         let systemctl = bin.join("systemctl");
         fs::write(
             &systemctl,
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 6 ]; do\n  [ $i -eq 4 ] && state=enabled || state=disabled\n  printf 'ActiveState=inactive\\nSubState=dead\\nUnitFileState=%s\\n\\n' \"$state\"\n  i=$((i + 1))\ndone\n",
+            format!(
+                "#!/bin/sh\ni=0\nwhile [ $i -lt {} ]; do\n  [ $i -eq 4 ] && state=enabled || state=disabled\n  printf 'ActiveState=inactive\\nSubState=dead\\nUnitFileState=%s\\n\\n' \"$state\"\n  i=$((i + 1))\ndone\n",
+                DOD_UNITS.len()
+            ),
         )?;
         fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))?;
         let mut ctx = DodClientContext::new(root.path().join("home"), OffsetDateTime::UNIX_EPOCH);

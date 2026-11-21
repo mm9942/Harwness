@@ -9,6 +9,15 @@
 //! - [`open_dir_nofollow`]: dasselbe für Verzeichnisse (`O_DIRECTORY`).
 //! - [`open_beneath`]: **kein** Pfadglied darf ein Symlink sein, und die
 //!   Auflösung bleibt unterhalb eines Wurzel-Deskriptors.
+//! - Einzelne Einträge relativ zu einem Verzeichnis-Deskriptor, ohne je
+//!   einem Symlink zu folgen: [`open_dir_at`], [`mkdir_at`], [`unlink_at`],
+//!   [`rename_at`], [`entry_type_at`], [`same_file_at`] und [`read_dir_names`].
+//!   Sie nehmen nur **einen** Namen (kein `/`, nicht `.`/`..`), damit kein
+//!   Zwischenglied aufgelöst wird; [`ensure_owned_directory`] prüft einen geöffneten
+//!   Verzeichnis-Deskriptor (Typ, Eigentümer, keine Schreibrechte für Gruppe
+//!   und Andere). Zusammen mit [`open_beneath`] lässt sich so eine
+//!   Verzeichnisgrenze einmal per Deskriptor festlegen und danach ohne
+//!   erneute Pfadauflösung benutzen.
 //!
 //! # FIFOs und Geräte
 //! [`open_nofollow`] und [`open_beneath`] öffnen immer mit `O_NONBLOCK`, damit
@@ -20,22 +29,26 @@
 //! wie ein normal geöffneter Deskriptor. Nur `O_NONBLOCK` zu entfernen, ohne
 //! den Typ zu prüfen, würde den Hänger bloß vom `open` in das erste `read`
 //! verschieben (ein Angreifer hält das FIFO schreibend offen, schreibt aber
-//! nie). [`open_dir_nofollow`] braucht das nicht: mit `O_DIRECTORY` lehnt der
-//! Kernel Nicht-Verzeichnisse mit `ENOTDIR` ab, bevor ein FIFO geöffnet wird.
+//! nie). [`open_dir_nofollow`] und [`open_dir_at`] brauchen das nicht: mit
+//! `O_DIRECTORY` lehnt der Kernel Nicht-Verzeichnisse mit `ENOTDIR` ab, bevor
+//! ein FIFO oder Gerät geöffnet wird.
 //! Das Öffnen selbst kann bei Geräten Seiteneffekte haben (der Deskriptor wird
 //! sofort wieder geschlossen); `O_NONBLOCK` bewirkt zudem, dass eine Datei mit
 //! fremdem Lease (`fcntl(F_SETLEASE)`) mit `EAGAIN` scheitert, statt auf das
 //! Lease-Ende zu warten.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
-use rustix::fs::{CWD, FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags};
 use rustix::io::retry_on_intr;
+
+use crate::walk::EntryType;
 
 /// Zugriffs- und Anlegemodus für die `*_nofollow`/`*_beneath`-Öffner.
 ///
@@ -492,6 +505,391 @@ pub(crate) fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+/// Prüft `name` für die `*_at`-Helfer: genau **ein** Pfadglied.
+///
+/// Abgelehnt (`InvalidInput`): leer, `.`, `..` und alles mit `/`. Ein `/`
+/// hieße, dass `*at(2)` ein Zwischenglied auflöst — und dabei einem Symlink
+/// folgen könnte.
+fn validate_entry_name(name: &Path) -> io::Result<&OsStr> {
+    let bytes = name.as_os_str().as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(invalid_input(
+            "Eintragsname muss genau ein Pfadglied sein (ohne `/`, nicht `.`/`..`)",
+        ));
+    }
+    Ok(name.as_os_str())
+}
+
+/// Öffnet das Verzeichnis `name` direkt in `dir` lesbar, ohne einem Symlink
+/// zu folgen (`openat(2)` mit `O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+/// O_CLOEXEC`).
+///
+/// # Description
+/// Das Gegenstück zu [`open_dir_nofollow`] relativ zu einem Deskriptor, für
+/// einen Abstieg Glied für Glied. Anders als [`open_beneath`] mit
+/// [`OpenMode::read_only`] verlangt der Kernel schon beim Öffnen ein
+/// Verzeichnis: eine reguläre Datei, ein FIFO oder ein Gerät unter `name`
+/// wird nie geöffnet (`ENOTDIR`, ohne Blockieren und ohne Seiteneffekte des
+/// Geräts), ein Symlink nie verfolgt (`ELOOP` bzw. `ENOTDIR`, je nach
+/// Kernel), auch wenn er auf ein Verzeichnis zeigt. Ob das Verzeichnis privat
+/// genug ist, prüft der Aufrufer danach selbst, etwa per
+/// [`ensure_owned_directory`].
+///
+/// # Arguments
+/// - `dir` (`BorrowedFd`): das Elternverzeichnis.
+/// - `name` (`&Path`): genau ein Pfadglied.
+///
+/// # Returns
+/// Das geöffnete Verzeichnis (lesbar; geeignet für `readdir`, `fsync`,
+/// `fchmod` und als `dir` der übrigen `*_at`-Helfer).
+///
+/// # Errors
+/// `InvalidInput` für einen Namen mit `/`, `.`, `..` oder leer; `NotFound`,
+/// wenn kein Eintrag existiert; `ELOOP`/`ENOTDIR` für einen Symlink oder ein
+/// Nicht-Verzeichnis; sonst der `errno` von `openat(2)` (z. B. `EACCES`).
+///
+/// # Concurrency
+/// Zustandslos. Der Deskriptor bleibt an das geöffnete Verzeichnis gebunden,
+/// auch wenn `name` danach umbenannt oder durch etwas anderes ersetzt wird.
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_fsutil::{ensure_owned_directory, open_dir_at, open_dir_nofollow};
+/// use std::os::fd::AsFd;
+/// use std::path::Path;
+///
+/// let parent = open_dir_nofollow(Path::new("/home/user/.harw"))?;
+/// let dod = open_dir_at(parent.as_fd(), Path::new("dod"))?;
+/// ensure_owned_directory(&dod)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn open_dir_at(dir: BorrowedFd<'_>, name: &Path) -> io::Result<File> {
+    let name = validate_entry_name(name)?;
+    let fd = retry_on_intr(|| rustix::fs::openat(dir, name, READABLE_DIR_FLAGS, Mode::empty()))?;
+    Ok(File::from(fd))
+}
+
+/// Legt das Verzeichnis `name` direkt in `dir` an (`mkdirat(2)`).
+///
+/// # Description
+/// `mkdirat` folgt nie einem Symlink als letztem Glied: liegt unter `name`
+/// schon irgendein Eintrag (auch ein Symlink, auch ein ins Leere zeigender),
+/// wird nichts angelegt — weder hier noch am Ziel des Symlinks. Ob der
+/// vorhandene Eintrag ein echtes Verzeichnis ist, prüft der Aufrufer danach
+/// selbst, etwa per [`open_beneath`] und [`ensure_owned_directory`].
+///
+/// # Arguments
+/// - `dir` (`BorrowedFd`): das Elternverzeichnis.
+/// - `name` (`&Path`): genau ein Pfadglied.
+/// - `mode` (`u32`): Rechte-Bits (`& 0o7777`); der `umask` wird noch
+///   abgezogen.
+///
+/// # Returns
+/// `true`, wenn dieser Aufruf das Verzeichnis angelegt hat; `false`, wenn
+/// unter `name` bereits ein Eintrag lag (`EEXIST`).
+///
+/// # Errors
+/// `InvalidInput` für einen Namen mit `/`, `.`, `..` oder leer; sonst der
+/// `errno` von `mkdirat(2)` (z. B. `EACCES`).
+///
+/// # Concurrency
+/// Zustandslos. Legen zwei Aufrufer gleichzeitig an, meldet genau einer
+/// `true`.
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_fsutil::{mkdir_at, open_dir_nofollow};
+/// use std::os::fd::AsFd;
+/// use std::path::Path;
+///
+/// let parent = open_dir_nofollow(Path::new("/home/user/.harw"))?;
+/// if mkdir_at(parent.as_fd(), Path::new("dod"), 0o700)? {
+///     // Neu angelegt: den Eintrag im Elternverzeichnis dauerhaft machen.
+///     std::fs::File::from(parent).sync_all()?;
+/// }
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn mkdir_at(dir: BorrowedFd<'_>, name: &Path, mode: u32) -> io::Result<bool> {
+    let name = validate_entry_name(name)?;
+    match retry_on_intr(|| rustix::fs::mkdirat(dir, name, mode_from_bits(mode))) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::EXIST) => Ok(false),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Entfernt den Eintrag `name` direkt in `dir` (`unlinkat(2)` ohne
+/// `AT_REMOVEDIR`).
+///
+/// # Description
+/// Ein Symlink wird selbst entfernt, nie sein Ziel. Verzeichnisse werden
+/// nicht entfernt (`EISDIR` bzw. `EPERM`).
+///
+/// # Arguments
+/// - `dir` (`BorrowedFd`): das Verzeichnis, aus dem entfernt wird.
+/// - `name` (`&Path`): genau ein Pfadglied.
+///
+/// # Errors
+/// `InvalidInput` für einen ungültigen Namen; sonst der `errno` von
+/// `unlinkat(2)`, insbesondere `NotFound`, wenn der Eintrag fehlt (der
+/// Aufrufer entscheidet, ob das ein Fehler ist).
+///
+/// # Concurrency
+/// Zustandslos.
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_fsutil::{open_dir_nofollow, unlink_at};
+/// use std::os::fd::AsFd;
+/// use std::path::Path;
+///
+/// let dir = open_dir_nofollow(Path::new("/home/user/.harw/dod/verdicts"))?;
+/// unlink_at(dir.as_fd(), Path::new("verdicts-00000000000000000001.jsonl"))?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn unlink_at(dir: BorrowedFd<'_>, name: &Path) -> io::Result<()> {
+    let name = validate_entry_name(name)?;
+    retry_on_intr(|| rustix::fs::unlinkat(dir, name, AtFlags::empty()))?;
+    Ok(())
+}
+
+/// Benennt `from` in `to` um, beide direkt in `dir` (`renameat(2)` mit
+/// demselben Deskriptor auf beiden Seiten).
+///
+/// # Description
+/// Ein vorhandenes `to` wird atomar ersetzt; ist es ein Symlink, wird der
+/// Symlink ersetzt, nie sein Ziel beschrieben. Zusammen mit [`open_beneath`]
+/// (`OpenMode::write_create_new`) ergibt das ein atomares Ersetzen innerhalb
+/// eines per Deskriptor festgelegten Verzeichnisses.
+///
+/// # Arguments
+/// - `dir` (`BorrowedFd`): das Verzeichnis beider Namen.
+/// - `from` (`&Path`), `to` (`&Path`): je genau ein Pfadglied.
+///
+/// # Errors
+/// `InvalidInput` für einen ungültigen Namen; sonst der `errno` von
+/// `renameat(2)`.
+///
+/// # Concurrency
+/// Zustandslos; die Atomizität liefert der Kernel.
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_fsutil::{open_dir_nofollow, rename_at};
+/// use std::os::fd::AsFd;
+/// use std::path::Path;
+///
+/// let dir = open_dir_nofollow(Path::new("/home/user/.harw/dod/verdicts"))?;
+/// rename_at(dir.as_fd(), Path::new("anchor.json.tmp"), Path::new("anchor.json"))?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn rename_at(dir: BorrowedFd<'_>, from: &Path, to: &Path) -> io::Result<()> {
+    let from = validate_entry_name(from)?;
+    let to = validate_entry_name(to)?;
+    retry_on_intr(|| rustix::fs::renameat(dir, from, dir, to))?;
+    Ok(())
+}
+
+/// Der Typ des Eintrags `name` direkt in `dir`, ohne einem Symlink zu folgen
+/// (`fstatat(2)` mit `AT_SYMLINK_NOFOLLOW`).
+///
+/// # Arguments
+/// - `dir` (`BorrowedFd`): das Verzeichnis.
+/// - `name` (`&Path`): genau ein Pfadglied.
+///
+/// # Returns
+/// `Some(typ)` (ein Symlink ist [`EntryType::Symlink`], auch wenn er ins
+/// Leere zeigt) oder `None`, wenn kein Eintrag existiert.
+///
+/// # Errors
+/// `InvalidInput` für einen ungültigen Namen; sonst der `errno` von
+/// `fstatat(2)` außer `ENOENT`.
+///
+/// # Concurrency
+/// Zustandslos; das Ergebnis ist eine Momentaufnahme.
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_fsutil::{EntryType, entry_type_at, open_dir_nofollow};
+/// use std::os::fd::AsFd;
+/// use std::path::Path;
+///
+/// let dir = open_dir_nofollow(Path::new("/home/user/.harw"))?;
+/// let kind = entry_type_at(dir.as_fd(), Path::new("config.toml"))?;
+/// assert_ne!(kind, Some(EntryType::Symlink));
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn entry_type_at(dir: BorrowedFd<'_>, name: &Path) -> io::Result<Option<EntryType>> {
+    let name = validate_entry_name(name)?;
+    match retry_on_intr(|| rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)) {
+        Ok(stat) => Ok(Some(match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => EntryType::File,
+            FileType::Directory => EntryType::Dir,
+            FileType::Symlink => EntryType::Symlink,
+            _ => EntryType::Other,
+        })),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Ob der Eintrag `name` direkt in `dir` genau die geöffnete Datei `file` ist
+/// (gleiches Gerät und gleiche Inode-Nummer), ohne einem Symlink zu folgen.
+///
+/// # Description
+/// Vergleicht `fstat(file)` mit `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)`.
+/// Typischer Einsatz: eine Sperrdatei, die per `flock` gesperrt wurde, ist
+/// nur dann die gültige Sperre, wenn ihr Name danach noch auf dieselbe Inode
+/// zeigt. Wurde der Name inzwischen entfernt oder durch eine andere Datei
+/// (oder einen Symlink) ersetzt, ist die Antwort `false`.
+///
+/// # Arguments
+/// - `dir` (`BorrowedFd`): das Verzeichnis.
+/// - `name` (`&Path`): genau ein Pfadglied.
+/// - `file` (`&File`): die geöffnete Datei.
+///
+/// # Returns
+/// `true`, wenn `name` existiert und dieselbe Inode wie `file` ist; `false`,
+/// wenn kein Eintrag existiert oder er etwas anderes ist.
+///
+/// # Errors
+/// `InvalidInput` für einen ungültigen Namen; sonst der `errno` von
+/// `fstat(2)` bzw. `fstatat(2)` außer `ENOENT`.
+///
+/// # Concurrency
+/// Zustandslos; das Ergebnis ist eine Momentaufnahme.
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_fsutil::{OpenMode, open_beneath, open_dir_nofollow, same_file_at};
+/// use std::os::fd::AsFd;
+/// use std::path::Path;
+///
+/// let dir = open_dir_nofollow(Path::new("/home/user/.harw/dod/verdicts"))?;
+/// let lock = open_beneath(dir.as_fd(), Path::new(".lock"), OpenMode::read_only())?;
+/// assert!(same_file_at(dir.as_fd(), Path::new(".lock"), &lock)?);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn same_file_at(dir: BorrowedFd<'_>, name: &Path, file: &File) -> io::Result<bool> {
+    let name = validate_entry_name(name)?;
+    let opened = retry_on_intr(|| rustix::fs::fstat(file))?;
+    match retry_on_intr(|| rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)) {
+        Ok(entry) => Ok(entry.st_dev == opened.st_dev && entry.st_ino == opened.st_ino),
+        Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Die Namen aller Einträge des Verzeichnisses `dir` (ohne `.`/`..`),
+/// bytewise sortiert.
+///
+/// # Description
+/// Liest per `readdir` auf einem eigenen Duplikat des Deskriptors
+/// (`openat(dir, ".")`, [`rustix::fs::Dir::read_from`]); `dir` selbst und
+/// seine Leseposition bleiben unberührt, und kein Pfad wird aufgelöst. Typen
+/// liefert [`entry_type_at`].
+///
+/// # Arguments
+/// - `dir` (`BorrowedFd`): ein lesbar geöffnetes Verzeichnis.
+///
+/// # Returns
+/// Die Namen, sortiert (unabhängig von der `readdir`-Ordnung).
+///
+/// # Errors
+/// Der `errno` von `fcntl(2)`, `openat(2)` oder `getdents(2)`.
+///
+/// # Concurrency
+/// Zustandslos; ein gleichzeitig angelegter oder entfernter Eintrag kann
+/// fehlen bzw. noch erscheinen.
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_fsutil::{open_dir_nofollow, read_dir_names};
+/// use std::os::fd::AsFd;
+/// use std::path::Path;
+///
+/// let dir = open_dir_nofollow(Path::new("/home/user/.harw"))?;
+/// let names = read_dir_names(dir.as_fd())?;
+/// assert!(names.windows(2).all(|pair| pair.first() <= pair.last()));
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn read_dir_names(dir: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
+    let entries = Dir::read_from(dir)?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        names.push(OsString::from_vec(bytes.to_vec()));
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Prüft, dass `dir` ein Verzeichnis ist, der effektiven UID gehört und
+/// weder für die Gruppe noch für Andere beschreibbar ist
+/// (`mode & 0o022 == 0`).
+///
+/// # Description
+/// Die Prüfung läuft per `fstat` auf dem bereits geöffneten Deskriptor (kein
+/// Pfad, kein Wettlauf zwischen Prüfen und Benutzen). Lesen und Durchsuchen
+/// für Gruppe/Andere ist erlaubt; wer ein privates Verzeichnis will, setzt
+/// danach selbst `0700` per `fchmod`. Ein Verzeichnis, in das Dritte
+/// schreiben dürfen, kann Einträge vertauscht bekommen (z. B. ein eigenes
+/// Verzeichnis gegen ein anderes eigenes); deshalb gilt es nicht als Grenze.
+///
+/// # Arguments
+/// - `dir` (`&File`): der geöffnete Deskriptor.
+///
+/// # Errors
+/// - `NotADirectory` (`ENOTDIR`): kein Verzeichnis.
+/// - `PermissionDenied`: Eigentümer ≠ `geteuid()` oder Gruppe/Andere dürfen
+///   schreiben.
+/// - sonst der `errno` von `fstat`.
+///
+/// # Concurrency
+/// Zustandslos.
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_fsutil::{OpenMode, ensure_owned_directory, open_beneath, open_dir_nofollow};
+/// use std::os::fd::AsFd;
+/// use std::path::Path;
+///
+/// let parent = open_dir_nofollow(Path::new("/home/user/.harw"))?;
+/// let dod = open_beneath(parent.as_fd(), Path::new("dod"), OpenMode::read_only())?;
+/// ensure_owned_directory(&dod)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn ensure_owned_directory(dir: &File) -> io::Result<()> {
+    let meta = dir.metadata()?;
+    if !meta.file_type().is_dir() {
+        return Err(io::Error::from(rustix::io::Errno::NOTDIR));
+    }
+    let euid = rustix::process::geteuid().as_raw();
+    if meta.uid() != euid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "ensure_owned_directory: Eigentümer-UID {} ≠ effektive UID {euid}",
+                meta.uid()
+            ),
+        ));
+    }
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "ensure_owned_directory: Rechte {mode:04o} erlauben Gruppe/Andere zu schreiben"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,13 +1145,12 @@ mod tests {
     /// Legt ein FIFO per `mkfifo(1)` an (rustix bietet `mknodat`, das Crate
     /// braucht es aber sonst nicht). `false`, wenn das Programm fehlt.
     fn make_fifo(path: &Path) -> bool {
-        match std::process::Command::new("mkfifo").arg(path).status() {
-            Ok(status) if status.success() => true,
-            other => {
-                eprintln!("übersprungen: `mkfifo` nicht verfügbar ({other:?})");
-                false
-            }
-        }
+        // Fehlendes Programm oder Fehlschlag: der Aufrufer überspringt den Test
+        // still (kein `eprintln!` in Tests erlaubt).
+        matches!(
+            std::process::Command::new("mkfifo").arg(path).status(),
+            Ok(status) if status.success()
+        )
     }
 
     /// R2-10: Ein FIFO als letztes Glied blockiert nicht und wird abgelehnt.
@@ -808,7 +1205,7 @@ mod tests {
                 .map(|meta| meta.file_type().is_char_device())
                 .unwrap_or(false)
         }) else {
-            eprintln!("übersprungen: kein Zeichengerät verfügbar");
+            // Kein Zeichengerät verfügbar: Test wird still übersprungen.
             return Ok(());
         };
         let Err(err) = open_nofollow(device, OpenMode::read_only()) else {
@@ -864,5 +1261,239 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         assert_eq!(read_all(result.map_err(ctx("O_PATH-Abstieg"))?)?, "inner");
         Ok(())
+    }
+
+    /// Die `*_at`-Helfer nehmen genau ein Pfadglied; alles andere scheitert
+    /// vor jedem Syscall.
+    #[test]
+    fn at_helfer_lehnen_mehr_als_ein_pfadglied_ab() -> TestResult {
+        let tmp = fixture()?;
+        let root = open_dir_nofollow(tmp.path())?;
+        let root = root.as_fd();
+        for bad in [
+            "",
+            ".",
+            "..",
+            "dir/inner.txt",
+            "link_dir/x",
+            "top.txt/",
+            "/etc",
+        ] {
+            let name = Path::new(bad);
+            let results = [
+                open_dir_at(root, name).map(|_| ()),
+                mkdir_at(root, name, 0o700).map(|_| ()),
+                unlink_at(root, name),
+                rename_at(root, name, Path::new("neu")),
+                rename_at(root, Path::new("top.txt"), name),
+                entry_type_at(root, name).map(|_| ()),
+            ];
+            for result in results {
+                let Err(err) = result else {
+                    return Err(TestError::Unexpected(format!("Err erwartet für {bad:?}")));
+                };
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+            }
+        }
+        // Nichts wurde angelegt, entfernt oder umbenannt.
+        assert_eq!(read_dir_names(root)?.len(), 5);
+        assert_eq!(std::fs::read(tmp.path().join("dir/inner.txt"))?, b"inner");
+        assert_eq!(std::fs::read(tmp.path().join("top.txt"))?, b"top");
+        Ok(())
+    }
+
+    #[test]
+    fn open_dir_at_oeffnet_nur_echte_verzeichnisse() -> TestResult {
+        let tmp = fixture()?;
+        let root = open_dir_nofollow(tmp.path())?;
+        let root = root.as_fd();
+        let dir = open_dir_at(root, Path::new("dir")).map_err(ctx("verzeichnis"))?;
+        assert!(dir.metadata()?.is_dir());
+        assert_eq!(read_dir_names(dir.as_fd())?, [OsString::from("inner.txt")]);
+        // Ein Symlink (auf ein Verzeichnis oder ins Leere) wird nie verfolgt,
+        // eine reguläre Datei nie geöffnet.
+        for name in ["link_dir", "dangling"] {
+            let Err(err) = open_dir_at(root, Path::new(name)) else {
+                return Err(TestError::Unexpected(format!("Err erwartet für {name}")));
+            };
+            expect_errno(&err, &[Errno::LOOP, Errno::NOTDIR])?;
+        }
+        let Err(err) = open_dir_at(root, Path::new("top.txt")) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::NOTDIR])?;
+        let Err(err) = open_dir_at(root, Path::new("fehlt")) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        Ok(())
+    }
+
+    /// Ein FIFO unter dem Namen wird mit `ENOTDIR` abgelehnt, ohne geöffnet
+    /// zu werden (kein Blockieren, auch ohne `O_NONBLOCK`).
+    #[test]
+    fn open_dir_at_oeffnet_kein_fifo() -> TestResult {
+        let tmp = fixture()?;
+        let fifo = tmp.path().join("fifo");
+        if !make_fifo(&fifo) {
+            return Ok(());
+        }
+        let root_path = tmp.path().to_path_buf();
+        let errno = within_timeout(move || -> TestResult<Option<i32>> {
+            let root = open_dir_nofollow(&root_path).map_err(ctx("root"))?;
+            Ok(open_dir_at(root.as_fd(), Path::new("fifo"))
+                .err()
+                .and_then(|err| err.raw_os_error()))
+        })??;
+        assert_eq!(errno, Some(Errno::NOTDIR.raw_os_error()));
+        assert!(std::fs::symlink_metadata(&fifo)?.file_type().is_fifo());
+        Ok(())
+    }
+
+    #[test]
+    fn mkdir_at_legt_an_und_folgt_keinem_symlink() -> TestResult {
+        let tmp = fixture()?;
+        let root = open_dir_nofollow(tmp.path())?;
+        let root = root.as_fd();
+        assert!(mkdir_at(root, Path::new("neu"), 0o700).map_err(ctx("anlegen"))?);
+        let meta = std::fs::symlink_metadata(tmp.path().join("neu"))?;
+        assert!(meta.is_dir());
+        assert_eq!(meta.permissions().mode() & 0o077, 0);
+        // Vorhandene Einträge jeder Art, auch Symlinks (ins Leere): `false`,
+        // und am Ziel eines Symlinks entsteht nichts.
+        for existing in ["neu", "top.txt", "link_dir", "dangling"] {
+            assert!(
+                !mkdir_at(root, Path::new(existing), 0o700).map_err(ctx("vorhanden"))?,
+                "{existing}"
+            );
+        }
+        assert!(!tmp.path().join("fehlt").exists());
+        let dir = open_dir_nofollow(&tmp.path().join("dir"))?;
+        assert_eq!(read_dir_names(dir.as_fd())?, [OsString::from("inner.txt")]);
+        Ok(())
+    }
+
+    #[test]
+    fn entry_type_at_meldet_symlinks_statt_ihnen_zu_folgen() -> TestResult {
+        let tmp = fixture()?;
+        let root = open_dir_nofollow(tmp.path())?;
+        let root = root.as_fd();
+        let expected = [
+            ("top.txt", Some(EntryType::File)),
+            ("dir", Some(EntryType::Dir)),
+            ("link_file", Some(EntryType::Symlink)),
+            ("link_dir", Some(EntryType::Symlink)),
+            ("dangling", Some(EntryType::Symlink)),
+            ("fehlt", None),
+        ];
+        for (name, kind) in expected {
+            assert_eq!(entry_type_at(root, Path::new(name))?, kind, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unlink_at_entfernt_nur_den_eintrag() -> TestResult {
+        let tmp = fixture()?;
+        let root = open_dir_nofollow(tmp.path())?;
+        let root = root.as_fd();
+        // Ein Symlink wird selbst entfernt, sein Ziel bleibt.
+        unlink_at(root, Path::new("link_file")).map_err(ctx("datei-symlink"))?;
+        assert_eq!(entry_type_at(root, Path::new("link_file"))?, None);
+        assert_eq!(std::fs::read(tmp.path().join("top.txt"))?, b"top");
+        unlink_at(root, Path::new("link_dir")).map_err(ctx("verzeichnis-symlink"))?;
+        assert_eq!(std::fs::read(tmp.path().join("dir/inner.txt"))?, b"inner");
+        unlink_at(root, Path::new("top.txt")).map_err(ctx("datei"))?;
+        assert_eq!(entry_type_at(root, Path::new("top.txt"))?, None);
+        // Verzeichnisse nie; ein fehlender Eintrag meldet `NotFound`.
+        let Err(err) = unlink_at(root, Path::new("dir")) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::ISDIR, Errno::PERM])?;
+        let Err(err) = unlink_at(root, Path::new("fehlt")) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        Ok(())
+    }
+
+    #[test]
+    fn rename_at_ersetzt_einen_ziel_symlink_ohne_ihm_zu_folgen() -> TestResult {
+        let tmp = fixture()?;
+        let root = open_dir_nofollow(tmp.path())?;
+        let root = root.as_fd();
+        std::fs::write(tmp.path().join("neu.tmp"), b"neu")?;
+        // Das Ziel ist ein Symlink: ersetzt wird der Symlink, nicht `top.txt`.
+        rename_at(root, Path::new("neu.tmp"), Path::new("link_file")).map_err(ctx("rename"))?;
+        assert_eq!(
+            entry_type_at(root, Path::new("link_file"))?,
+            Some(EntryType::File)
+        );
+        assert_eq!(std::fs::read(tmp.path().join("link_file"))?, b"neu");
+        assert_eq!(std::fs::read(tmp.path().join("top.txt"))?, b"top");
+        assert_eq!(entry_type_at(root, Path::new("neu.tmp"))?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn same_file_at_erkennt_entfernte_und_ersetzte_eintraege() -> TestResult {
+        let tmp = fixture()?;
+        let root = open_dir_nofollow(tmp.path())?;
+        let root = root.as_fd();
+        let opened = File::open(tmp.path().join("top.txt"))?;
+        assert!(same_file_at(root, Path::new("top.txt"), &opened)?);
+        // Ein Symlink auf dieselbe Datei ist ein anderer Eintrag.
+        assert!(!same_file_at(root, Path::new("link_file"), &opened)?);
+        // Ersetzt (neue Inode unter demselben Namen) und entfernt: `false`.
+        std::fs::write(tmp.path().join("neu.tmp"), b"neu")?;
+        rename_at(root, Path::new("neu.tmp"), Path::new("top.txt")).map_err(ctx("rename"))?;
+        assert!(!same_file_at(root, Path::new("top.txt"), &opened)?);
+        let current = File::open(tmp.path().join("top.txt"))?;
+        assert!(same_file_at(root, Path::new("top.txt"), &current)?);
+        unlink_at(root, Path::new("top.txt")).map_err(ctx("unlink"))?;
+        assert!(!same_file_at(root, Path::new("top.txt"), &current)?);
+        // Mehr als ein Pfadglied wird abgelehnt.
+        let Err(err) = same_file_at(root, Path::new("dir/inner.txt"), &current) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        Ok(())
+    }
+
+    #[test]
+    fn read_dir_names_liefert_sortierte_namen_ohne_punkte() -> TestResult {
+        let tmp = fixture()?;
+        let root = open_dir_nofollow(tmp.path())?;
+        let expected: Vec<OsString> = ["dangling", "dir", "link_dir", "link_file", "top.txt"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(read_dir_names(root.as_fd())?, expected);
+        // `readdir` läuft auf einer eigenen Kopie: ein zweiter Aufruf auf
+        // demselben Deskriptor sieht wieder alles.
+        assert_eq!(read_dir_names(root.as_fd())?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_owned_directory_prueft_typ_und_schreibrechte() -> TestResult {
+        let tmp = fixture()?;
+        let dir = tmp.path().join("dir");
+        for mode in [0o700, 0o750, 0o755] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))?;
+            ensure_owned_directory(&File::open(&dir)?).map_err(ctx("privat genug"))?;
+        }
+        for mode in [0o770, 0o702, 0o777] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))?;
+            let Err(err) = ensure_owned_directory(&File::open(&dir)?) else {
+                return Err(TestError::Unexpected(format!("Err erwartet für {mode:o}")));
+            };
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{mode:o}");
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        let Err(err) = ensure_owned_directory(&File::open(tmp.path().join("top.txt"))?) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::NOTDIR])
     }
 }

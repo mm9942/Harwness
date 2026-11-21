@@ -4,7 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.harw/bin/harw-sentinel --socket %h/.harw/sentinel.sock
+# PL-100 WP0.5: in this per-user setup the probes run as the same user, not
+# as the system probe accounts, so admit this user's uid (%U) as IPC peer.
+# PL-100 WP0.7: no implicit workspace root any more; add an absolute
+# `--workspace-root <dir>` to enable the workspace sensor.
+ExecStart=%h/.harw/bin/harw-sentinel --socket %h/.harw/sentinel.sock --probe-peer-user %U
 Restart=on-failure
 RestartSec=5
 

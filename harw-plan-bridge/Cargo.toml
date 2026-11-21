@@ -38,13 +38,19 @@ harw-core = { path = "../harw-core" }
 # ab, keines davon kennt harw-plan-bridge.
 harw-context = { path = "../harw-context" }
 harw-lens-types = { path = "../harw-lens-types" }
-# AW6-04: Plan-Andockung für Sicherheitsbefunde. `harw-dod-escalate`
-# re-exportiert `Finding<Triaged>`/`Triaged`/`Ladder` — dieses Crate zieht
-# die Kante zu `harw-dod-escalate`, nie umgekehrt (dessen Moduldoku,
-# Abschnitt „Andockung für harw-plan-bridge"). `harw-dod-signals` liefert
-# `SecurityEvidence`, deren `digest`-Feld strukturell nie fehlt (siehe
-# `security_bridge`-Moduldoku).
-harw-dod-escalate = { path = "../harw-dod/crates/harw-dod-escalate" }
+# AW6-04: Plan-Andockung für Sicherheitsbefunde. Seit PL-100 WP 3.0
+# (Leitprinzip I8) bewusst weder `harw-dod-escalate` noch die
+# Eskalationsleiter `harw-dod-ladder`: dieses Crate liegt in modellnahen
+# Prozessen (harw-runtime, harw-ops, harw-cli, harw), und
+# `xtask/arch-policy.toml` verbietet ihnen beide. Die Andockung braucht nur
+# die Frage „rechtfertigt der Befund überhaupt eine Stufe" und prüft sie
+# selbst über `Finding<Triaged>`/`FindingKind`/`Verdict` aus `harw-dod-rules`
+# (ohne Features: `test-support` darf nur aus Dev-Abhängigkeiten kommen,
+# xtask-Gate `operator-decision`, Regel (d)); ein Test pinnt die Gleichheit
+# mit `Ladder::stage_for` (Leiter nur unter `[dev-dependencies]`, siehe
+# `security_bridge`-Moduldoku). `harw-dod-signals` liefert `SecurityEvidence`,
+# deren `digest`-Feld strukturell nie fehlt (siehe `security_bridge`-Moduldoku).
+harw-dod-rules = { path = "../harw-dod/crates/harw-dod-rules" }
 harw-dod-signals = { path = "../harw-dod/crates/harw-dod-signals" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -64,12 +70,18 @@ tokio = { version = "1.53.0", features = ["rt", "sync", "time", "macros"] }
 [dev-dependencies]
 harw-test-support = { path = "../harw-test-support" }
 tempfile = "3.27.0"
-# Nur für Tests: baut über `EgressFlowRule` ein echtes `Finding<Triaged>`,
-# genau wie `harw-dod-escalate` selbst es in seinen eigenen Tests tut — statt
-# einen privaten Konstruktor zu umgehen. `harw-dod-rules` ist deshalb keine
-# normale Abhängigkeit dieses Crates: der produktive Code nennt nur
-# `Finding<Triaged>`, re-exportiert von `harw-dod-escalate`.
+# Nur für Tests: schaltet `triaged_finding_for_test` frei — die Tests bauen
+# über `EgressFlowRule` ein echtes `Finding<Triaged>`, genau wie
+# `harw-dod-escalate` und `harw-dod-ladder` es in ihren eigenen Tests tun,
+# statt einen privaten Konstruktor zu umgehen. Das Feature `test-support`
+# steht nur hier, nie unter `[dependencies]` (xtask-Gate `operator-decision`,
+# Regel (d)); wegen `resolver = "2"` ist es nur für Testziele aktiv.
 harw-dod-rules = { path = "../harw-dod/crates/harw-dod-rules", features = ["test-support"] }
+# Nur für Tests (PL-100 WP 3.0, I8): der Gleichheitstest der Andockbedingung
+# gegen `Ladder::stage_for`. Nie unter `[dependencies]`: modellnahe Prozesse
+# linken die Leiter nicht (xtask-Gate `arch`, `[[forbidden_crates]]`;
+# Dev-Abhängigkeiten zählen dort nicht).
+harw-dod-ladder = { path = "../harw-dod/crates/harw-dod-ladder" }
 harw-sandbox = { path = "../harw-sandbox" }
 tokio = { version = "1.53.0", features = ["rt", "macros", "sync", "time"] }
 

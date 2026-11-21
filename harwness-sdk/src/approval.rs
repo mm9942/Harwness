@@ -31,6 +31,14 @@ pub struct ApprovalRequest {
     pub tool: String,
     /// Argumente des Aufrufs als JSON.
     pub arguments: serde_json::Value,
+    /// Der vom Kern zugeschriebene Grund der Rückfrage, falls es einen gibt.
+    ///
+    /// Heute nur der DoD-Taint des Turns (PL-100 Entscheidung O1,
+    /// `harw_core::dod_taint::pending_ask_reason`): „'job.stop' braucht eine
+    /// ausdrückliche Freigabe: nach DoD-Abfrage in diesem Turn“. Der
+    /// Werkzeugname darin ist bereits escapt. `None`, wenn ein anderer
+    /// Handler gefragt hat; über eine Remote-Sitzung heute immer `None`.
+    pub reason: Option<String>,
 }
 
 /// Die Entscheidung über eine [`ApprovalRequest`].
@@ -183,6 +191,7 @@ mod tests {
             call_id: "c".into(),
             tool: tool.into(),
             arguments: serde_json::Value::Null,
+            reason: None,
         })
     }
 

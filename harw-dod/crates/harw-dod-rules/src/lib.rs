@@ -12,10 +12,16 @@
 //!   liefert ihre rohen Befunde (`Finding<Raw>`);
 //!   [`engine::run_rules_checked`] zertifiziert sie zusätzlich mit einer
 //!   stabilen Identität (`Finding<RuleChecked>`).
-//! - Drei konkrete Regeln (Modul [`rules`]): [`rules::EgressFlowRule`],
-//!   [`rules::StructureDriftRule`], [`rules::BaselineDeviationRule`] — siehe
-//!   [`rules`]-Moduldoku für die zwei Regeln, die hier absichtlich fehlen,
-//!   und warum.
+//! - Sieben konkrete Regeln (Modul [`rules`]): [`rules::EgressFlowRule`],
+//!   [`rules::StructureDriftRule`], [`rules::BaselineDeviationRule`] und
+//!   (PL-100 WP1.6) [`rules::ListenerNewRule`],
+//!   [`rules::ExecWritablePathRule`], [`rules::SensorDegradedRule`],
+//!   [`rules::PersistenceWriteRule`] — siehe [`rules`]-Moduldoku.
+//! - Den persistierten Zustand der Regel `listener-new`
+//!   ([`listener_history::ListenerHistory`], Modul [`listener_history`]):
+//!   die Regel liest ihn nur, der Aufrufer lädt, lernt und speichert ihn.
+//! - [`rule::RuleConfig`]: Konfiguration der Regeln (Workspace-Wurzeln,
+//!   zusätzliche Home-Verzeichnisse, flüchtiger Portbereich).
 //! - Den Baseline-Zugriff und die Baseline-Gate-Regel (Modul [`baseline`]).
 //! - Die eine echte Konfidenz-Konvertierung im Baum (Modul [`confidence`]).
 //! - [`advisory::correlate_advisories`] (Modul [`advisory`], Knoten AW7-06):
@@ -62,10 +68,16 @@
 //! unveränderlichen [`rule::RuleContext`] laufen lassen könnte, ohne Sperren.
 //!
 //! # Fehler
-//! Diese Crate definiert keinen eigenen Fehlertyp: jede Operation — Regeln,
-//! Typestate-Übergänge, die Konfidenz-Konvertierung, das Baseline-Gate — ist
-//! total. Wo eine Regel nichts findet, liefert sie einen leeren `Vec`, nie
-//! einen Fehler.
+//! Regeln, die Konfidenz-Konvertierung und das Baseline-Gate sind total. Wo
+//! eine Regel nichts findet, liefert sie einen leeren `Vec`, nie einen
+//! Fehler. Fehlertypen gibt es nur an den Rändern: beim Lesen und Triagieren
+//! eines Records ([`RecordError`], [`TriageError`]), beim Lesen des
+//! persistierten Listener-Zustands ([`ListenerHistoryError`]), beim
+//! Konfigurieren der Regeln ([`RuleConfigError`]) und beim Prüfen
+//! eines Baseline-Satzes ([`check_baselines`], [`BaselineError`]; eine
+//! doppelte Metrik ist ein Fehler, kein „die letzte gewinnt", PL-100 WP1.7 —
+//! die Regel selbst meldet einen solchen Satz als Befund, statt zu
+//! schweigen).
 //!
 //! # Examples
 //! ```rust
@@ -74,8 +86,11 @@
 //! use harw_dod_rules::advisory::{Advisory, correlate_advisories};
 //! use harw_dod_rules::rule::{Rule, RuleContext};
 //! use harw_dod_rules::rules::EgressFlowRule;
-//! use harw_dod_rules::{FindingKind, run_rules, run_rules_checked, triage, Verdict};
-//! use harw_dod_signals::{EventKind, SecurityEvent, Severity};
+//! use harw_dod_rules::{FindingKind, run_rules, run_rules_checked, triage_record, Verdict};
+//! use harw_dod_signals::{
+//!     EventKind, SecurityEvent, SecurityEvidence, SecurityVerdict, Severity,
+//!     VerdictClassification,
+//! };
 //! use harw_types::SensorId;
 //! use semver::VersionReq;
 //!
@@ -97,6 +112,8 @@
 //!     events: &events,
 //!     baselines: &[],
 //!     network_scope: &scope,
+//!     listener_history: None,
+//!     rule_config: None,
 //! };
 //! let raw = run_rules(&ctx)
 //!     .into_iter()
@@ -109,7 +126,8 @@
 //! let checked = run_rules_checked(&ctx);
 //! assert!(checked.iter().any(|f| f.rule_id() == EgressFlowRule.id()));
 //!
-//! // 3. Einen geprüften Befund triagieren.
+//! // 3. Einen geprüften Befund einfrieren und mit einem an den Record
+//! //    gebundenen Modell-Verdikt triagieren.
 //!
 //! let locked = vec![LockedPackage {
 //!     name: "example-crate".to_owned(),
@@ -130,8 +148,22 @@
 //!     .into_iter()
 //!     .next()
 //!     .expect("Advisory trifft");
-//! let triaged = triage(finding, Verdict::Confirmed);
-//! assert_eq!(*triaged.verdict(), Verdict::Confirmed);
+//! let evidence = SecurityEvidence::capture(vec![], vec![], jiff::Timestamp::UNIX_EPOCH)
+//!     .expect("Beleg kodierbar");
+//! let record = finding.record(evidence);
+//! let verdict = SecurityVerdict::new(
+//!     record.finding_id().clone(),
+//!     record.digest(),
+//!     VerdictClassification::Confirmed,
+//!     Severity::High,
+//!     "verwundbare Version im Lockfile".to_owned(),
+//!     None,
+//!     "security-triage-1".to_owned(),
+//!     jiff::Timestamp::UNIX_EPOCH,
+//! );
+//! let triaged = triage_record(&record, &verdict).expect("Verdikt gebunden");
+//! // Modelle bestätigen nie (PL-100 WP0.11): `Confirmed` wird gedeckelt.
+//! assert_eq!(*triaged.verdict(), Verdict::NeedsReview);
 //! ```
 //!
 //! # Stand
@@ -145,22 +177,52 @@ pub mod baseline;
 pub mod confidence;
 pub mod engine;
 pub mod finding;
+pub mod listener_history;
 pub mod rule;
 pub mod rules;
 
 pub use advisory::{Advisory, correlate_advisories};
-pub use baseline::{Baseline, PalaceStatus, finding_kind_for_status};
+pub use baseline::{
+    Baseline, BaselineError, PalaceStatus, check_baselines, finding_kind_for_status,
+};
 pub use confidence::epistemic_confidence_for;
 pub use engine::{run_rules, run_rules_checked};
-pub use finding::{Finding, FindingKind, Raw, RuleChecked, Triaged, Verdict, triage};
+pub use finding::{
+    Finding, FindingKind, FindingRecord, Raw, RecordError, RuleChecked, TriageError, Triaged,
+    Verdict, triage_record,
+};
+// Die Entscheidung eines Menschen (PL-100 WP0.11, an den Record-Digest
+// gebunden): vorerst nur in den Tests dieser Crate (`compile_fail`-Doctests an
+// `TriageError` belegen das). Das Feature `operator-decision` kehrt erst mit
+// `harw-escalator` (PL-100 WP 3.2) zurück, abgesichert durch das xtask-Gate
+// `operator-decision`. Die übrigen Wege zu einem `Finding<Triaged>` mit
+// `Verdict::Confirmed` (`triage`, `triaged_finding_for_test`) stehen hinter
+// `test-support`, das dasselbe Gate (Regel (d)) nur aus Dev-Abhängigkeiten
+// zulässt. Ein produktiver Build erzeugt deshalb keinen `Finding<Triaged>`
+// mit `Verdict::Confirmed` und erreicht so keine Stufe der
+// Eskalationsleiter; der Wert `Verdict::Confirmed` selbst bleibt öffentlich
+// (z. B. `Verdict::from_classification`), erst `triage_record` deckelt ihn.
+#[cfg(test)]
+pub use finding::{OperatorDecision, triage_record_operator};
+// Ungebundene Triage mit frei wählbarem Urteil — nur für Tests (siehe
+// `finding.rs`-Moduldoku, „Modelle beraten, Menschen bestätigen").
+#[cfg(any(test, feature = "test-support"))]
+pub use finding::triage;
 // Nur für Tests abhängiger Crates (Feature `test-support`, z. B. von
 // `harw-dod-escalate`s `Ladder`-Tests genutzt) — siehe `finding.rs`-Moduldoku
 // zu `triaged_finding_for_test` für die Begründung und die geschützte
 // Invariante.
 #[cfg(any(test, feature = "test-support"))]
 pub use finding::triaged_finding_for_test;
-pub use rule::{Rule, RuleContext};
-pub use rules::{BaselineDeviationRule, EgressFlowRule, StructureDriftRule};
+pub use listener_history::{
+    BindClass, ListenerHistory, ListenerHistoryError, ListenerKey, ListenerOwner, ListenerPort,
+    ListenerProtocol,
+};
+pub use rule::{Rule, RuleConfig, RuleConfigError, RuleContext};
+pub use rules::{
+    BaselineDeviationRule, EgressFlowRule, ExecWritablePathRule, ListenerNewRule,
+    PersistenceWriteRule, SensorDegradedRule, StructureDriftRule,
+};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

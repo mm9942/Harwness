@@ -104,14 +104,19 @@ separate from the CLI `harw settings` alias for `harw config`.
 | `tui.reasoning` | `message`, `collapsed`, `hidden` |
 | `tui.child_stream` | `orchestrators`, `all`, `none` |
 | `tui.status_expiry` | `consolidate`, `hide` |
+| `dod.watch.mode` | `off`, `notify`, `triage` |
 
 With no configured language the interface defaults to English (`en`); the English
 activation label is exactly **Activated** (German: **Aktiviert**). The language
 picker shows native language names. Language codes are case-sensitive; unsupported
 codes are rejected.
 
-These five interface preferences are operator-only and persist in the active
-profile's `config.toml` under `[tui]`. They do not write the home-global config,
+These six preferences are operator-only and persist in the active profile's
+`config.toml`: the five interface keys under `[tui]` and the DoD watch mode under
+`[dod.watch] mode`. `/settings` also shows read-only DoD rows (same-terminal
+approval with its weaker binding, triage model, effort and `max_tokens`); the
+triage model is changed with `/dod model set <provider>/<model>`, see the DoD
+section. They do not write the home-global config,
 another profile or project settings. Successful changes update the current TUI
 immediately and survive restart in that profile. Reset removes the profile key
 and applies its inherited value or built-in default; it does not always mean
@@ -369,7 +374,7 @@ agree.
 | Action | Effect |
 | --- | --- |
 | `status` | Install state, system config and active profile, the six units, Warden state, sentinel health and the high/critical finding counts of the `[dod] findings_window_hours` window. Counts are prefixed `≥` and marked "partial" when older export data was not read (`lower_bound: true` in `--json`). |
-| `doctor` | Read-only prerequisites: cgroup v2, kernel BTF, tracefs, Landlock, `systemctl`/`systemd-sysusers`/`systemd-tmpfiles`, the daemons, the unit files, the config and both exports, plus three warning-only cgroup-root checks (`cgroup-root`, `profile-root`, `allowed-prefixes`, see [DoD setup](setup/dod.md#observe-harw-jobs-pl-97-e3)) and the execution chain table (below). Exit 1 when a prerequisite is missing. The build toolchain checks stay with `make -C harw-dod doctor`. |
+| `doctor` | Read-only prerequisites: cgroup v2, kernel BTF, tracefs, Landlock, `systemctl`/`systemd-sysusers`/`systemd-tmpfiles`, the daemons, the unit files, the config and both exports, plus three warning-only cgroup-root checks (`cgroup-root`, `profile-root`, `allowed-prefixes`, see [DoD setup](setup/dod.md#observe-harw-jobs-pl-97-e3)), the triage lines (`triage-model`, `triage-provider`, `triage-limits`, `triage-egress`, `watch-mode`, `watch-connect`, `approve-tty`, see [Triage model](#triage-model-harw-dod-model-dod-model)) and the execution chain table (below). Exit 1 when a prerequisite is missing. The build toolchain checks stay with `make -C harw-dod doctor`. |
 | `findings [-n N] [--severity S] [--rule ID] [--since SPAN] [--job ID]` | The newest findings of the bounded export tail (default 50, at most 200), at or above severity `S`, of one rule, observed within `SPAN` (`90m`, `24h`, `7d`). `--job ID` keeps only findings whose `scope` lies within that job's own cgroup (path-component prefix, read from the job records of the project in the working directory); a job without a dedicated cgroup (no delegated cgroup root) gets none. |
 | `sensors` | The sentinel health report (`health.json`): per-sensor state, readings, errors, last success, IPC counters; flagged stale after 2 minutes without an update. |
 | `config check [--config PATH]` | Validates `/etc/harw-dod/config.toml` (or `PATH`) exactly like the daemons do (no symlinks, root-owned, not group/world-writable). Exit 0 only for a valid config that selects an `active_profile`. |
@@ -381,6 +386,9 @@ agree.
 | `warden enable` | Root only. Creates `/etc/harw-dod` (mode `0750`, only when missing) and the guard file `/etc/harw-dod/warden.enable`, then `systemctl daemon-reload` and `systemctl enable --now harw-warden.socket` (`make -C harw-dod enable-warden`). `kill_requires_human` stays true. |
 | `warden disable` | Root only. `systemctl disable --now harw-warden.socket harw-warden.service`, then removes the guard file. |
 | `install --print-systemd [UNIT]` | Prints the embedded units (see above). |
+| `model show` | The DoD triage model `[dod.triage]` (model, provider and its locality, effort, `max_tokens`, `max_parallel`) and the configured and effective `[dod.watch] mode`, see [Triage model](#triage-model-harw-dod-model-dod-model). Exit 1 when the harw home does not exist. |
+| `model set <provider>/<model>` | Writes `[dod.triage] model` into the home config (`<home>/config.toml`). Refused under `sudo` (exit 3). |
+| `model clear` | Removes `[dod.triage] model` from the home config. Refused under `sudo` (exit 3). |
 
 The service actions only call `systemctl` and write (or remove) the one
 guard file; they never run `cargo` or `make`, and harw never talks to the
@@ -399,6 +407,98 @@ model tools); they are not Harw-DoD facts, and `doctor` reports these
 exports as `WARN`. A system export that exists but cannot be read is
 reported as unreadable with the hint to add the user to `harw-dod-readers`;
 it is never replaced by the home fallback.
+
+### Triage model (`harw dod model`, `/dod model`)
+
+The model that receives DoD findings for automatic triage is chosen by a
+human and set only in a trusted layer (PL-100 §3.2): `[dod.triage]` counts
+from the home config and the active profile, never from a project. Every
+triage view (`harw dod model`, `/dod model`, both doctors) reads these two
+layers only, including the `providers/<name>.toml` of the triage provider,
+so a project cannot change the locality shown; these are also the only
+layers a per-host `harw-dod-watch` (phase 2, no project) has. `harw dod
+model` and the chat command `/dod model` (TUI and CLI sessions; remote
+channels cannot reach it) share one implementation:
+
+```text
+harw dod model show
+harw dod model set local/qwen2.5-coder
+harw dod model set openrouter/openai/gpt-4o
+harw dod model clear
+```
+
+A bare `harw dod model` (like `/dod model`) is `show`.
+
+- `set` validates the reference before anything is written: `<provider>/<model>`,
+  printable ASCII without whitespace, at most 256 bytes, no empty, `.` or
+  `..` segment; the model part may contain further `/`. Whether the provider
+  and the model exist is not checked. A rejected value is not echoed back
+  (exit 2).
+- `set` and `clear` edit only `[dod.triage] model` in `<home>/config.toml`,
+  keeping comments and all other keys, and never create the home. A model
+  in the active profile takes precedence; the output says so
+  (`"overridden": true` in `--json`). The session that ran `/dod model`
+  updates its live configuration; other running sessions pick the change up
+  on their next configuration load.
+- `show` (and the output of `set`/`clear`) names the provider and its
+  locality: `lokal` when the provider's `base_url` is loopback (exactly
+  `localhost`, `127.0.0.0/8`, `::1`) or a Unix socket (`unix:`,
+  `http+unix:`, `https+unix:`), `remote` for any other host, including a
+  subdomain such as `foo.localhost` (without an RFC 6761 resolver it may be
+  resolved through DNS to another host), `unbekannt` when the provider is
+  not configured. The locality is shown, not enforced. A provider with
+  `enabled = false` (every catalog-seeded provider starts so) is marked
+  disabled with the hint `harw provider enable <id>`.
+- Without a model there is no automatic triage and no fallback to the
+  session model: with `[dod.watch] mode = "triage"` the watch acts as
+  `notify`, and every view says `kein Triage-Modell gesetzt → notify`. The
+  same holds for a model whose provider has no `[providers]` entry or is
+  disabled: `show` reads `triage (effective notify)` with the note
+  `Triage-Provider nicht konfiguriert → notify` or `Triage-Provider
+  deaktiviert → notify` (`notes` in `--json`).
+- The effective mode in `show` and `/settings` (`watch.effective_config` in
+  `--json`) only applies that rule. Whether `egress_allow_cidrs` in
+  `/etc/harw-dod` blocks triage is checked by the doctor alone; `show` points
+  there (`egress allowlist: see /dod doctor`).
+- `set` and `clear` are refused under `sudo`: the resolved home would be
+  root's, or a user's home would get a root-owned config file. `show` under
+  `sudo` notes that it shows root's home.
+
+`/dod model` is no model tool and is in no tool profile. `/settings` shows
+the session's values read-only (and offers `dod.watch.mode` as a choice); it
+also looks the triage provider up in home and profile only. The TUI
+settings panel and the TUI output of `/settings show` list four read-only
+DoD rows: `[dod.approve] tui_tty`, labelled `schwächere Bindung, nur
+Freeze/Thaw` (it changes only in the config file), the triage model with
+the hint `/dod model set <provider/model>` (no free-text edit), and the
+triage `effort` and `max_tokens` (unset: model or dispatcher default). A
+value that is not valid (no `<provider>/<model>` reference, an unknown
+effort, `max_tokens` outside 1 to 32768) is not echoed; the row reads
+`invalid (see /dod model show)`.
+
+`harw dod doctor` and `/dod doctor` end with the triage lines, read from the
+home and the active profile (PL-100 WP 1.9 and WP 0.3). None of them is ever
+`MISS`, so they never change the exit code:
+
+| Check | Content |
+| --- | --- |
+| `triage-model` | The model. Without one and with `[dod.watch] mode = "triage"`: `WARN kein Triage-Modell gesetzt → notify` (no fallback to the session model). |
+| `triage-provider` | Only with a model: the provider and its locality, `lokal` or `remote` (`OK`, shown, not enforced) or `unbekannt` (`WARN`, no `[providers]` entry or a `base_url` without a host). A disabled provider is `WARN … deaktiviert` with the hint `harw provider enable <id>`. |
+| `triage-limits` | `effort`, `max_tokens`, `max_parallel` (unset values show the model or dispatcher default). |
+| `triage-egress` | The `egress_allow_cidrs` of the active profile in `/etc/harw-dod/config.toml`. Empty, no `active_profile` or no valid system config while triage is requested: `WARN triage blockiert: egress_allow_cidrs leer → effektiv notify`. An unreadable system config (a regular user) is `WARN … nicht prüfbar`; check it as root. |
+| `watch-mode` | The configured mode and what it effectively does, e.g. `triage → effektiv notify (kein Triage-Modell; egress_allow_cidrs leer)`; a provider without a `[providers]` entry adds `Provider nicht konfiguriert`, a disabled provider `Provider deaktiviert` (no fallback to another provider or the session model). |
+| `watch-connect` | `[dod.watch] autoconnect`: whether `harw-dod-watch` connects to the gateway on start. |
+| `approve-tty` | `[dod.approve] tui_tty`; while on it is labelled `schwächere Bindung, nur Freeze/Thaw` (kill and isolation only through approval path A or B). |
+
+When the harw configuration cannot be read, one `WARN triage-config`
+replaces every line except `triage-egress`. The same happens under `sudo
+harw dod doctor`: the home would be root's, so `triage-config` says to run
+`harw dod doctor` without sudo for the triage settings, while `triage-egress`
+(readable only as root) stays. `harw dod doctor` without an existing harw
+home (e.g. a mistyped `--home`) does the same (`harw-Home nicht gefunden`)
+instead of printing the defaults as settings, as `harw dod model show`
+fails in that state. In `--json` the lines are ordinary entries of
+`checks` (`id`, `level`, `detail`); no other key changes.
 
 ### Execution chain (`harw dod doctor`, `harw doctor`)
 

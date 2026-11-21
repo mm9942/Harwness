@@ -300,6 +300,8 @@ mod tests {
             actor.cgroup.as_ref().map(|c| c.as_str()),
             Some("/user.slice/foo.scope")
         );
+        // PL-100 WP0.15: die besitzende pid erreicht den Akteur.
+        assert_eq!(actor.process.as_ref().map(|p| p.pid), Some(1000));
         Ok(())
     }
 

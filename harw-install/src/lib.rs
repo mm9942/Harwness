@@ -10,16 +10,23 @@
 //! `include_str!` im Produktionscode ein — `deploy/` ist die einzige Quelle.
 //! `harw install --print-systemd [UNIT]` gibt die eingebetteten Units aus;
 //! `harw-dod/scripts/install.sh` installiert dieselben Dateien direkt aus
-//! `deploy/`. Paritätstests prüfen `deploy/` ↔ Einbettung ↔ DoD-Manifest.
+//! `deploy/`. Paritätstests prüfen `deploy/` ↔ Einbettung ↔ DoD-Manifest;
+//! `tests/staged_install.rs` installiert das Paket probeweise in ein
+//! `DESTDIR` und prüft, dass jedes `ExecStart=` ein mitgeliefertes Binary
+//! trifft und `uninstall` alles wieder entfernt.
 //!
-//! # Die vier DoD-Systemunits (Knoten AW7-03, abgeglichen in H10)
-//! [`dod_units`] trägt die Rechtematrix der vier Ausbauprogramm-Binaries
-//! (`harw-sentinel`, `harw-probe-fs`, `harw-probe-bpf`, `harw-warden`) und
+//! # Die fünf DoD-Systemunits (Knoten AW7-03, abgeglichen in H10, PL-100 WP1.8)
+//! [`dod_units`] trägt die Rechtematrix der fünf Ausbauprogramm-Binaries
+//! (`harw-sentinel`, `harw-probe-bpf`, `harw-probe-fs`, `harw-probe-netlink`,
+//! `harw-warden`; Liste: [`DOD_PACKAGE_BINARIES`]) und
 //! prüft die eingebetteten Unit-Texte: unprivilegiert für den Sentinel,
 //! `CAP_SYS_ADMIN` für die fanotify-Sonde, `CAP_BPF CAP_PERFMON` für die
-//! eBPF-Sonde, `CAP_DAC_OVERRIDE CAP_NET_ADMIN` unter eigenem Nutzer für den
-//! Warden. Die Landlock-Asymmetrie (Entscheidung Nr. 4) läuft ausschließlich
-//! im jeweiligen Binary. **Wohin die Units gehören:** ausschließlich
+//! eBPF-Sonde, genau `CAP_AUDIT_READ` für die Netlink-Sonde,
+//! `CAP_DAC_OVERRIDE CAP_NET_ADMIN` unter eigenem Nutzer für den Warden.
+//! `harw-probe-netlink` wird mitinstalliert, aber nicht von
+//! `harw-dod.target` hereingezogen (bewusst opt-in, Entscheidung O11). Die
+//! Landlock-Asymmetrie (Entscheidung Nr. 4) läuft ausschließlich im
+//! jeweiligen Binary. **Wohin die Units gehören:** ausschließlich
 //! Systemunits — eine Nutzerinstanz (`~/.config/systemd/user/`, der einzige
 //! Ort, den [`service_systemd::SystemdServiceManager`] kennt) kann keine
 //! Capabilities vergeben. Dieses Crate installiert, aktiviert und startet
@@ -45,8 +52,8 @@ pub mod update;
 
 pub use context::{InstallContext, InstallMethod};
 pub use deployment::{
-    AssetKind, DEPLOYMENT_ASSETS, DOD_PACKAGE_ASSETS, EmbeddedDeploymentAsset, RenderPaths,
-    UnknownUnitError, print_systemd,
+    AssetKind, DEPLOYMENT_ASSETS, DOD_PACKAGE_ASSETS, DOD_PACKAGE_BINARIES,
+    EmbeddedDeploymentAsset, RenderPaths, UnknownUnitError, print_systemd,
 };
 pub use doctor::{
     AuditIntegrityCheck, AuditIntegrityEvidence, CheckOutcome, DoctorCheck, ExecutionChainCheck,

@@ -86,6 +86,72 @@ and should be flagged rather than merged silently — see
   outright; no allow rule or classifier verdict can move them into automatic
   approval. Only choosing Full Access removes the question.
 
+### Harw-DoD (Detect · Orient · Defend) and AI integration
+
+The following invariants belong to the PL-100 integration of Harw-DoD with
+the model-driven runtime. The wording is binding for new code. Where the
+implementation is still being rolled out (PL-100 Phase 3), the item is a
+**target state**: code that contradicts it is a defect, and the statement
+must not be read as a guarantee for builds that lack the component. The
+authoritative plan and threat model are in
+[`docs/planning/100-dod-ai-integration/`](docs/planning/100-dod-ai-integration/README.md)
+(see also its [THREAT-MODEL.md](docs/planning/100-dod-ai-integration/THREAT-MODEL.md)).
+
+- **S1 — harw never calls the escalation ladder or the warden.** The harw
+  runtime, ops and TUI, and every agent or model-driven code path, never
+  reach the escalation ladder (`harw-dod-escalate`, planned name
+  `harw-escalator`), never talk to the Warden and never write Harw-DoD
+  enforcement state. The only exception is the root-only, human-invoked CLI
+  command `harw dod warden enable`, which a model cannot trigger. Enforcement
+  stays on the human path. Today this is documented at `harw-ops/src/dod.rs`
+  (trust boundary S1, covering the read-only ops module).
+- **Model output never authorizes anything; verdicts are advisory and never
+  suppress notices.** A triage verdict annotates a finding; it never decides.
+  A model-asserted `Confirmed` is capped to `NeedsReview` and never yields an
+  escalation stage. Every high-severity finding always produces a
+  deterministic notice; only human-signed labels with an expiry date may
+  suppress. DoD data never starts a model turn by itself, except for the
+  dedicated triage child. Untrusted text (sensor strings, file and process
+  names, model output) reaches terminals and models only through the shared
+  escaper.
+- **Operator authority lies outside harw (target state).** A compromised
+  harw process controls its own terminal, so it can supply neither the
+  displayed proposal nor the confirmation. An approval is therefore valid
+  only through one of two paths: polkit, with the details (action, cgroup,
+  rule, short hash, digest) supplied by the escalator and not by harw, or an
+  independently started `harw-dod-approve` in a session harw does not
+  control. Harw may only ask the escalator to request an approval; it never
+  starts `pkexec` or an approval dialog itself, and `isatty` is not proof of a
+  human. An approval is bound to the proposal digest that the trusted
+  surface displayed. The optional same-TTY mode (`[dod.approve] tui_tty`)
+  has a weaker binding and covers only the reversible actions freeze and
+  thaw. Kill and network isolation need the explicit `irreversible_ack`
+  confirmation and a separate polkit action, and are refused in the same-TTY
+  mode.
+- **The TCB policy lives in root-owned files, not in harw's config.** The
+  policy that governs enforcement is read from `/etc/harw-dod/config.toml`
+  (`load_system_config`, which requires root-trusted ownership of the path)
+  and, once the Warden reads its own policy file, `/etc/harw-dod/warden.toml`
+  (planned; it does not exist yet). The `[dod]` section of harw's own config
+  (`auto_freeze`, `kill_requires_human`, `allowed_cgroup_prefixes`) is
+  advisory only: it never authorizes or enables an action and is used by the
+  doctor and for display. `kill_requires_human` is validated at load and
+  must stay `true`.
+- **The triage model is the owner's explicit choice.** Without a configured
+  `[dod.triage].model`, no automatic triage runs and there is no silent
+  fallback to the session model. The model can only be set from trusted
+  config layers, never by a project. `harw dod doctor` shows provider, model
+  and locality (loopback or Unix socket is local, anything else is remote);
+  the locality is shown, not enforced. With a remote model the provider
+  sees bounded evidence cards, which is the owner's deliberate decision.
+- **The finding spool is read only by the escalator (target state).** Sensor
+  records in the spool are verified by the escalator itself (owner, mode,
+  digest, and the kernel cgroup ID again at signing time). Harw works from
+  the findings export and never from the spool. Until the triage reader is
+  moved off the spool, the module documentation in
+  `harw-dod-sentinel/src/spool.rs` describes the current behaviour.
+
 This list describes the invariants as maintained; it is not an exhaustive
 threat model. See `docs/design/` for the fuller security and runtime
-architecture documentation.
+architecture documentation, and `docs/planning/100-dod-ai-integration/` for
+the Harw-DoD AI-integration plan, principles and threat model.
