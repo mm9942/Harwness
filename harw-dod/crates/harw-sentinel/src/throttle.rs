@@ -266,10 +266,8 @@ impl DedupKey {
             return None;
         }
         let mut key = [0_u8; DEDUP_KEY_BYTES];
-        for (slot, pair) in key.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
-            let &[high, low] = pair else {
-                return None;
-            };
+        let (pairs, _) = text.as_bytes().as_chunks::<2>();
+        for (slot, &[high, low]) in key.iter_mut().zip(pairs) {
             *slot = (lower_hex_value(high)? << 4) | lower_hex_value(low)?;
         }
         Some(Self(key))

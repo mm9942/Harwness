@@ -1581,6 +1581,8 @@ fn run_print_sandbox(
 ///
 /// # Errors
 /// Jeder Schreibfehler von `out`.
+// Die Doku zeigt die Ausgabe wörtlich, und deren Feldtrenner ist ein Tab.
+#[allow(clippy::tabs_in_doc_comments)]
 fn write_container_report(
     out: &mut dyn std::io::Write,
     plan: &container_plan::ContainerPlan,
