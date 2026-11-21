@@ -1609,7 +1609,7 @@ impl ChatApp {
             goal_tracker: crate::goal_marker::GoalTracker::default(),
             dod_mark: crate::dod_view::DodMarkFeed::default(),
             dod_mark_waker: None,
-            tool_verbosity: ToolVerbosity::Compact,
+            tool_verbosity: ToolVerbosity::Activity,
             tool_cells: Vec::new(),
             open_tool_group: None,
             activity: activity_glue::ActivityGlue::default(),
@@ -1836,7 +1836,9 @@ impl ChatApp {
     /// einer öffentlichen Signatur erscheinen. Die CLI (ein anderer Slice)
     /// reicht `--verbose` als `bool` durch; `true` entspricht
     /// `ToolVerbosity::Verbose` (zusätzlich immer ausgeklappt, rohe Argumente
-    /// sichtbar), `false` dem Default `ToolVerbosity::Compact`.
+    /// sichtbar), `false` dem Default `ToolVerbosity::Activity`
+    /// (B8/B11c: einzeilige Aktivitätsdarstellung; `Compact` bleibt nur
+    /// programmatisch).
     ///
     /// # Argumente
     /// - `verbose` (`bool`): `true` aktiviert die ausführliche Darstellung.
@@ -1848,7 +1850,7 @@ impl ChatApp {
         self.tool_verbosity = if verbose {
             ToolVerbosity::Verbose
         } else {
-            ToolVerbosity::Compact
+            ToolVerbosity::Activity
         };
         self
     }
@@ -3938,8 +3940,9 @@ impl ChatApp {
     /// Schaltet die Werkzeuganzeige weiter (`/verbose`).
     ///
     /// # Beschreibung
-    /// PL-97 M3 (aus PR #76): Zyklus `Compact → Verbose → Activity →
-    /// Compact`; `Compact` bleibt der Default. Neue Werkzeugzellen erhalten
+    /// B8/B11c (aus archive/tui-b11c-67adce7a): Zyklus `Activity ↔ Verbose`;
+    /// `Activity` ist der Default, `Compact` bleibt nur programmatisch
+    /// (ein verbleibendes `Compact` wird zu `Verbose`). Neue Werkzeugzellen erhalten
     /// die neue [`ToolVerbosity`]; bestehende Zellen werden bei `Verbose`
     /// aufgeklappt, sonst zugeklappt.
     ///
@@ -3947,9 +3950,8 @@ impl ChatApp {
     /// Die jetzt aktive [`ToolVerbosity`].
     fn toggle_verbose(&mut self) -> ToolVerbosity {
         self.tool_verbosity = match self.tool_verbosity {
-            ToolVerbosity::Compact => ToolVerbosity::Verbose,
+            ToolVerbosity::Compact | ToolVerbosity::Activity => ToolVerbosity::Verbose,
             ToolVerbosity::Verbose => ToolVerbosity::Activity,
-            ToolVerbosity::Activity => ToolVerbosity::Compact,
         };
         let verbose = self.tool_verbosity == ToolVerbosity::Verbose;
         for handle in &self.tool_cells {
@@ -14462,6 +14464,8 @@ forbidden = [{forbidden}]
             event_tx,
         );
         let mut app = test_chat_app()?;
+        // Test prüft die kompakte Darstellung; Default ist seit B8 `Activity`.
+        app.tool_verbosity = ToolVerbosity::Compact;
         install_loaded_history(&mut session, &mut app, history);
 
         let visible = app
@@ -15899,6 +15903,24 @@ forbidden = [{forbidden}]
         let verbose = local_intercept_for(&app, "/verbose").ok_or(TestError::Missing("verbose"))?;
         apply_local_intercept(&mut app, verbose, &bus);
         assert_ne!(app.tool_verbosity, before);
+        Ok(())
+    }
+
+    /// Toggle-Zyklus (B11c): `/verbose` zweimal bringt den Detailgrad vom
+    /// Default `Activity` über `Verbose` zurück zu `Activity`.
+    #[test]
+    fn verbose_toggle_cycles_activity_to_verbose_and_back() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        assert!(matches!(app.tool_verbosity, ToolVerbosity::Activity));
+
+        let first = local_intercept_for(&app, "/verbose").ok_or(TestError::Missing("verbose"))?;
+        apply_local_intercept(&mut app, first, &bus);
+        assert!(matches!(app.tool_verbosity, ToolVerbosity::Verbose));
+
+        let second = local_intercept_for(&app, "/verbose").ok_or(TestError::Missing("verbose"))?;
+        apply_local_intercept(&mut app, second, &bus);
+        assert!(matches!(app.tool_verbosity, ToolVerbosity::Activity));
         Ok(())
     }
 

@@ -985,6 +985,8 @@ mod tests {
     #[test]
     fn a_failed_edit_keeps_the_cross_visible_in_the_loop() -> TestResult {
         let mut app = test_chat_app()?;
+        // Test prüft die kompakte Darstellung; Default ist seit B8 `Activity`.
+        app.tool_verbosity = crate::history_cell::ToolVerbosity::Compact;
         let mut state = TurnEventState::default();
         let turn = TurnId::new();
         run_tool(
@@ -1519,30 +1521,23 @@ mod tests {
         assert_eq!(ToolGroupCell::new().kind, ToolGroupKind::Reads);
     }
 
-    /// PL-97 M3 (aus PR #76 B11c): `Compact` bleibt der Default; `/verbose`
-    /// schaltet `Compact → Verbose → Activity → Compact`, und neue Zellen
-    /// rendern im Aktivitätsmodus einzeilig.
+    /// B8: `Activity` ist der Default; `/verbose` schaltet
+    /// `Activity → Verbose → Activity`, und neue Zellen rendern im
+    /// Aktivitätsmodus einzeilig.
     #[test]
-    fn verbose_cycles_compact_verbose_activity() -> TestResult {
+    fn verbose_cycles_activity_and_verbose() -> TestResult {
         use crate::history_cell::ToolVerbosity;
         let mut app = test_chat_app()?;
         let (bus, _receiver) = crate::events::harw_event_channel();
-        assert_eq!(app.tool_verbosity, ToolVerbosity::Compact);
+        assert_eq!(app.tool_verbosity, ToolVerbosity::Activity);
         let mut seen = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             let intercept = super::super::local_intercept_for(&app, "/verbose")
                 .ok_or(TestError::Missing("verbose"))?;
             super::super::apply_local_intercept(&mut app, intercept, &bus);
             seen.push(app.tool_verbosity);
         }
-        assert_eq!(
-            seen,
-            vec![
-                ToolVerbosity::Verbose,
-                ToolVerbosity::Activity,
-                ToolVerbosity::Compact
-            ]
-        );
+        assert_eq!(seen, vec![ToolVerbosity::Verbose, ToolVerbosity::Activity]);
         assert!(
             rendered(&app)
                 .iter()
@@ -1550,12 +1545,6 @@ mod tests {
         );
 
         // Im Aktivitätsmodus ist eine abgeschlossene Zelle genau eine Zeile.
-        let intercept = super::super::local_intercept_for(&app, "/verbose")
-            .ok_or(TestError::Missing("verbose"))?;
-        super::super::apply_local_intercept(&mut app, intercept, &bus);
-        let intercept = super::super::local_intercept_for(&app, "/verbose")
-            .ok_or(TestError::Missing("verbose"))?;
-        super::super::apply_local_intercept(&mut app, intercept, &bus);
         assert_eq!(app.tool_verbosity, ToolVerbosity::Activity);
         let mut state = TurnEventState::default();
         run_tool(
