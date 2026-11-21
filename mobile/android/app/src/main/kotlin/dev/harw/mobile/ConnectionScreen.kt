@@ -248,7 +248,9 @@ private fun ChatgptAccountCard(
     onManage: () -> Unit,
 ) {
     val profile = state.profile ?: return
-    val target = state.generation?.takeIf { state.online }?.let { ChatgptTarget(profile, it) }
+    val target = remember(profile, state.generation, state.online) {
+        state.generation?.takeIf { state.online }?.let { ChatgptTarget(profile, it) }
+    }
     val account = state.chatgpt
     var consent by remember { mutableStateOf<ChatgptTarget?>(null) }
     var unlink by remember { mutableStateOf<ChatgptTarget?>(null) }
@@ -257,10 +259,10 @@ private fun ChatgptAccountCard(
     consent?.let { selected ->
         AlertDialog(
             onDismissRequest = { consent = null },
-            title = { Text("Link ChatGPT to ${selected.profile.label}?") },
+            title = { Text("Link ChatGPT to ${selected.label}?") },
             text = {
                 Text(
-                    "Continue only if you control ${selected.profile.label} (${selected.profile.endpoint}). " +
+                    "Continue only if you control ${selected.label} (${selected.endpoint}). " +
                         "Harw will send the approved ChatGPT credentials to this verified server so it can run your eligible requests.",
                 )
             },
@@ -276,7 +278,7 @@ private fun ChatgptAccountCard(
     unlink?.let { selected ->
         AlertDialog(
             onDismissRequest = { unlink = null },
-            title = { Text("Unlink ChatGPT from ${selected.profile.label}?") },
+            title = { Text("Unlink ChatGPT from ${selected.label}?") },
             text = { Text("This removes the linked account from the selected Harw server.") },
             dismissButton = { TextButton(onClick = { unlink = null }) { Text("Cancel") } },
             confirmButton = {

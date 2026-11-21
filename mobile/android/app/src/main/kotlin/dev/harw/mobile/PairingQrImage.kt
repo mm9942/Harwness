@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.net.Uri
+import android.util.Log
 import androidx.core.content.FileProvider
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
@@ -26,14 +27,23 @@ internal fun newPairingPhoto(context: Context): PairingPhoto {
     val directory = File(context.cacheDir, "pairing-camera")
     check(directory.isDirectory || directory.mkdirs() || directory.isDirectory) { "The camera cache is unavailable." }
     val cutoff = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(1)
-    directory.listFiles()?.filter { it.lastModified() < cutoff }?.forEach { it.delete() }
+    directory.listFiles()?.filter { it.lastModified() < cutoff }?.forEach(::discardPairingPhoto)
     val file = File.createTempFile("profile-", ".jpg", directory)
     return try {
         PairingPhoto(file.name, FileProvider.getUriForFile(context, "${context.packageName}.pairing-camera", file))
     } catch (error: Exception) {
-        file.delete()
+        discardPairingPhoto(file)
         throw error
     }
+}
+
+internal fun discardPairingPhoto(file: File) {
+    val removed = try {
+        file.delete() || !file.exists()
+    } catch (_: SecurityException) {
+        false
+    }
+    if (!removed) Log.w("HarwPairing", "Temporary camera image cleanup will be retried.")
 }
 
 internal fun pairingPhotoFile(context: Context, name: String): File {

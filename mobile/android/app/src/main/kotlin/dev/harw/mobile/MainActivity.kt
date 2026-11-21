@@ -122,7 +122,7 @@ internal open class MainActivity : ComponentActivity() {
             if (name != null) {
                 val file = pairingPhotoFile(applicationContext, name)
                 if (captured && stillSelected) connection.importProfilePhoto(file)
-                else lifecycleScope.launch(Dispatchers.IO) { file.delete() }
+                else lifecycleScope.launch(Dispatchers.IO) { discardPairingPhoto(file) }
             }
         }
         LaunchedEffect(state.deviceNodeId) {
@@ -182,7 +182,9 @@ internal open class MainActivity : ComponentActivity() {
                                 if (error is CancellationException) throw error
                                 captureName = null
                                 photo?.let {
-                                    withContext(Dispatchers.IO) { pairingPhotoFile(applicationContext, it.name).delete() }
+                                    withContext(Dispatchers.IO) {
+                                        discardPairingPhoto(pairingPhotoFile(applicationContext, it.name))
+                                    }
                                 }
                                 connection.reportCameraUnavailable()
                             } finally {

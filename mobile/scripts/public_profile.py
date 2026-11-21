@@ -34,7 +34,17 @@ def valid_endpoint(endpoint):
 
 def read_profile(path):
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-    with os.fdopen(os.open(path, flags), "rb") as source:
+    directory, filename = os.path.split(path)
+    if filename in ("", ".", ".."):
+        raise ValueError("expected a profile filename")
+    # The operator chooses the directory. Anchor the file open to its descriptor
+    # so subsequent renames cannot redirect it through a different directory.
+    parent = os.open(directory or ".", os.O_DIRECTORY | os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        fd = os.open(filename, flags, dir_fd=parent)
+    finally:
+        os.close(parent)
+    with os.fdopen(fd, "rb") as source:
         metadata = os.fstat(source.fileno())
         if (
             not stat.S_ISREG(metadata.st_mode)

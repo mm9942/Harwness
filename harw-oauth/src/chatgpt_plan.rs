@@ -212,16 +212,30 @@ impl ChatGptPlanStore {
     /// # Errors
     /// Returns an error if local removal could not be completed.
     pub async fn disconnect(&self) -> PlanResult<bool> {
+        // Once sign-out starts, finish removing and revoking the credentials
+        // even if the mobile client disconnects before receiving the result.
+        let store = self.clone();
+        tokio::spawn(async move { store.disconnect_session().await })
+            .await
+            .map_err(storage)?
+    }
+
+    async fn disconnect_session(&self) -> PlanResult<bool> {
         let Some(dir) = self.open_secrets(false)? else {
             return Ok(true);
         };
-        let _lock = self.lock(&dir).await?;
-        let Some(record) = read_credentials(&dir)? else {
-            return Ok(true);
-        };
-        unlink_at(dir.as_fd(), Path::new(CREDENTIAL_FILE)).map_err(storage)?;
-        dir.sync_all().map_err(storage)?;
-        let StoredCredentials::Linked(record) = record else {
+        let lock = self.lock(&dir).await?;
+        let (_lock, record) = tokio::task::spawn_blocking(move || -> PlanResult<_> {
+            let record = read_credentials(&dir)?;
+            if record.is_some() {
+                unlink_at(dir.as_fd(), Path::new(CREDENTIAL_FILE)).map_err(storage)?;
+                dir.sync_all().map_err(storage)?;
+            }
+            Ok((lock, record))
+        })
+        .await
+        .map_err(storage)??;
+        let Some(StoredCredentials::Linked(record)) = record else {
             return Ok(true);
         };
         let Ok(client) = oauth_client() else {
@@ -688,6 +702,25 @@ mod tests {
             Err(ChatGptPlanError::NotLinked)
         ));
         assert!(store.disconnect().await?);
+        std::fs::remove_dir_all(home)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_removes_a_registration_that_needs_reauthorization() -> TestResult {
+        let home = harw_test_support::unique_tmp_created("chatgpt-plan", "unlink")?;
+        let store = ChatGptPlanStore::new(&home);
+        let _dir = store.open_secrets(true)?;
+        store.write_document(&json!({
+            "client_id": "oaiapp_previous",
+            "subject": "previous-subject",
+            "needs_reauthorization": true,
+        }))?;
+
+        assert!(store.disconnect().await?);
+        assert!(!home.join("secrets").join(CREDENTIAL_FILE).exists());
+        store.install(&example()).await?;
+        assert!(store.linked().await?);
         std::fs::remove_dir_all(home)?;
         Ok(())
     }

@@ -118,7 +118,20 @@ internal data class WindowState(
 
 internal data class DraftAttempt(val text: String, val head: SessionCursor, val id: String)
 
-internal data class ChatgptTarget(val profile: ServerProfile, val generation: Long)
+internal data class ChatgptTarget(
+    val version: UInt,
+    val label: String,
+    val endpoint: String,
+    val serverNodeId: String,
+    val serverPublicKeyHex: String,
+    val generation: Long,
+) {
+    constructor(profile: ServerProfile, generation: Long) : this(
+        profile.version, profile.label, profile.endpoint, profile.serverNodeId, profile.serverPublicKeyHex, generation,
+    )
+
+    val profile: ServerProfile get() = ServerProfile(version, label, endpoint, serverNodeId, serverPublicKeyHex)
+}
 internal enum class ChatgptOperation { Checking, Browser, Validating, Linking, Unlinking }
 internal data class ChatgptAccountState(
     val linked: Boolean? = null,
@@ -219,16 +232,17 @@ internal class HarwConnection(private val context: Context) {
             try {
                 decodeProfileQr(readPairingPhoto(file))
             } finally {
-                file.delete()
+                discardPairingPhoto(file)
             }
         }
-        if (!accepted) scope.launch(Dispatchers.IO) { file.delete() }
+        if (!accepted) scope.launch(Dispatchers.IO) { discardPairingPhoto(file) }
     }
 
     fun showEnrollmentQr(onPreview: (Bitmap) -> Unit) = setup("Show enrollment QR") {
         val native = loadCore()
         val image = withContext(Dispatchers.IO) {
             val enrollment = native.enrollment()
+            check(enrollment.version == 1U) { "The enrollment version is not supported by QR setup." }
             pairingQrImage(enrollmentQrText(enrollment.label, enrollment.nodeId, enrollment.publicKeyHex))
         }
         onPreview(image)

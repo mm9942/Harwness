@@ -898,6 +898,7 @@ impl Drop for SmokeServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn enrollment_json(label: &str, key: &str) -> String {
         serde_json::json!({
