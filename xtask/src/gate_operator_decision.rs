@@ -3051,14 +3051,14 @@ mod tests {
         assert!(paths.contains(&home_config), "{paths:?}");
 
         assert!(
-            cargo_config_overrides(&[home_config.clone()])
+            cargo_config_overrides(std::slice::from_ref(&home_config))
                 .map_err(TestError::Unexpected)?
                 .is_empty()
         );
         fs::write(&home_config, "[source.vendored]\ndirectory = \"vendor\"\n")
             .map_err(ctx("Cargo-Home-Konfiguration schreiben"))?;
-        let violations =
-            cargo_config_overrides(&[home_config.clone()]).map_err(TestError::Unexpected)?;
+        let violations = cargo_config_overrides(std::slice::from_ref(&home_config))
+            .map_err(TestError::Unexpected)?;
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(
             violations.iter().all(|v| v.starts_with(&format!(

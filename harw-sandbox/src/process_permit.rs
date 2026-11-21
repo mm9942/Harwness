@@ -539,11 +539,11 @@ impl ProcessPermitLedger {
     ///
     /// # Errors
     /// - [`ProcessPermitError::InvalidRequest`] /
-    ///   [`ProcessPermitError::WorkspaceNotAbsolute`]: ungültiger Antrag.
-    /// - [`ProcessPermitError::ZeroTtl`]: `ttl` ist `Some(0)`.
-    /// - [`ProcessPermitError::SessionLeaseRequiresHost`]: `SessionLease`
+    ///   [`ProcessPermitError::WorkspaceNotAbsolute`] — ungültiger Antrag.
+    /// - [`ProcessPermitError::ZeroTtl`] — `ttl` ist `Some(0)`.
+    /// - [`ProcessPermitError::SessionLeaseRequiresHost`] — `SessionLease`
     ///   ohne `LocalHost`.
-    /// - [`ProcessPermitError::TtlOverflow`]: `now + ttl` ist nicht darstellbar.
+    /// - [`ProcessPermitError::TtlOverflow`] — `now + ttl` ist nicht darstellbar.
     /// - [`ProcessPermitError::IdExhausted`] / [`ProcessPermitError::Poisoned`].
     ///
     /// # Concurrency

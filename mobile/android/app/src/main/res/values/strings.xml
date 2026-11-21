@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Harw</string>
+    <string name="connection_channel">Harw connection</string>
+    <string name="notification_title">Harw workspace</string>
+    <string name="notification_connecting">Connecting to your Harw server</string>
+    <string name="notification_connected">Connection active</string>
+    <string name="notification_reconnecting">Waiting to reconnect</string>
+    <string name="notification_disconnecting">Disconnecting</string>
+    <string name="notification_forgetting">Removing saved phone setup</string>
+    <string name="notification_stop">Disconnect</string>
+</resources>

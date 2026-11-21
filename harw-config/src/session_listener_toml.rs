@@ -54,6 +54,12 @@ pub struct SessionListenerSection {
     /// `None`: approvals park.
     #[serde(default)]
     pub approval_device: Option<String>,
+    /// Enrolled device authorized to manage this gateway’s ChatGPT account.
+    #[serde(default)]
+    pub provider_link_device: Option<String>,
+    /// Bind the requested local session socket to this tenant on the remote host.
+    #[serde(default)]
+    pub shared_socket_tenant: Option<String>,
 }
 
 fn default_listen() -> String {
@@ -73,6 +79,8 @@ impl Default for SessionListenerSection {
             node_id: None,
             tier: default_tier(),
             approval_device: None,
+            provider_link_device: None,
+            shared_socket_tenant: None,
         }
     }
 }

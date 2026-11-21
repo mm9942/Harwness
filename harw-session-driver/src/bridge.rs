@@ -790,15 +790,22 @@ impl HarwCoreRuntime {
             ));
         }
         let wiring = SessionWiring { event_tx, turn_tx };
-        let mut core = match admission
-            .as_ref()
-            .and_then(|state| state.admission.as_ref())
-        {
-            Some(admission) => self
-                .factory
-                .build_with_execution(session_id, title, wiring, admission)?,
-            None => self.factory.build(session_id, title, wiring)?,
-        };
+        let factory = Arc::clone(&self.factory);
+        let id = session_id.clone();
+        let title = title.map(str::to_owned);
+        let execution = admission.as_ref().and_then(|state| state.admission.clone());
+        // Building the runtime reads workspace configuration and trusted policy from disk.
+        // Leave socket handling and heartbeat timers on the async workers.
+        let mut core = tokio::task::spawn_blocking(move || match execution {
+            Some(execution) => {
+                factory.build_with_execution(&id, title.as_deref(), wiring, &execution)
+            }
+            None => factory.build(&id, title.as_deref(), wiring),
+        })
+        .await
+        .map_err(|error| {
+            DriverBridgeError::Runtime(format!("session builder stopped: {error}"))
+        })??;
         core.session
             .hydrate_from_store(core.store.as_ref())
             .await

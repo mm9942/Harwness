@@ -30,7 +30,7 @@ use harw_session_host::{ConnectionId, HostError, SessionHost};
 use harw_session_ws::dispatch::Ports;
 use harw_session_ws::{WsLimits, serve_connection_with, upgrade};
 use http::{Request, Response, StatusCode};
-use http_body_util::{Empty, Full};
+use http_body_util::{BodyExt, Empty, Full, Limited};
 use hyper::body::Incoming;
 use tokio::net::TcpListener;
 
@@ -173,10 +173,22 @@ impl UpgradeHandler {
     }
 }
 
+/// Owner-authorized account operations on the authenticated node listener.
+pub trait ProviderLink: Send + Sync {
+    /// Check the operator's device grant and apply a bounded account request.
+    fn handle<'a>(
+        &'a self,
+        identity: harw_session_host::ClientIdentity,
+        method: http::Method,
+        body: Bytes,
+    ) -> Pin<Box<dyn Future<Output = StatusCode> + Send + 'a>>;
+}
+
 /// Tower service mounted on the node transport: takes the peer the transport
 /// injected and hands it to the [`UpgradeHandler`].
 #[derive(Clone)]
 pub struct ListenerService {
+    provider_link: Option<Arc<dyn ProviderLink>>,
     handler: Arc<UpgradeHandler>,
 }
 
@@ -192,12 +204,43 @@ impl tower_service::Service<Request<Incoming>> for ListenerService {
     fn call(&mut self, request: Request<Incoming>) -> Self::Future {
         let peer = peer_of(&request);
         let handler = Arc::clone(&self.handler);
+        if request.uri().path() == "/v1/provider-link/chatgpt" {
+            let link = self.provider_link.clone();
+            return Box::pin(async move {
+                let (Some(link), Ok(peer)) = (link, peer) else {
+                    return Ok(status(StatusCode::NOT_FOUND, ""));
+                };
+                let (parts, body) = request.into_parts();
+                if !matches!(
+                    parts.method,
+                    http::Method::POST | http::Method::GET | http::Method::DELETE
+                ) {
+                    return Ok(status(StatusCode::METHOD_NOT_ALLOWED, ""));
+                }
+                let collect = Limited::new(body, 64 * 1024).collect();
+                let body =
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), collect).await {
+                        Ok(Ok(collected)) => collected.to_bytes(),
+                        Ok(Err(_)) => return Ok(status(StatusCode::PAYLOAD_TOO_LARGE, "")),
+                        Err(_) => return Ok(status(StatusCode::REQUEST_TIMEOUT, "")),
+                    };
+                let connection = ConnectionId::next();
+                let Ok(identity) = handler.mapper.map(&peer, connection).await else {
+                    return Ok(status(StatusCode::FORBIDDEN, ""));
+                };
+                if identity.connection != connection || identity.device.is_none() {
+                    return Ok(status(StatusCode::FORBIDDEN, ""));
+                }
+                Ok(status(link.handle(identity, parts.method, body).await, ""))
+            });
+        }
         Box::pin(async move { Ok(handler.handle(request, peer).await) })
     }
 }
 
 /// The own-cloud session listener.
 pub struct NodeListener {
+    provider_link: Option<Arc<dyn ProviderLink>>,
     server: NodeTransportServer,
     handler: Arc<UpgradeHandler>,
 }
@@ -214,8 +257,16 @@ impl NodeListener {
     ) -> Self {
         Self {
             server,
+            provider_link: None,
             handler: Arc::new(UpgradeHandler::new(host, mapper, limits)),
         }
+    }
+
+    /// Enable account requests on this listener with a device-specific owner policy.
+    #[must_use]
+    pub fn with_provider_link(mut self, link: Arc<dyn ProviderLink>) -> Self {
+        self.provider_link = Some(link);
+        self
     }
 
     /// The per-request handler.
@@ -247,6 +298,7 @@ impl NodeListener {
             live.close_all();
         };
         let service = ListenerService {
+            provider_link: self.provider_link.clone(),
             handler: Arc::clone(&self.handler),
         };
         self.server

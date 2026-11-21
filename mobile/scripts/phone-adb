@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mobile_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+default_apk="$mobile_root/android/app/build/outputs/apk/debug/app-debug.apk"
+sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
+adb_bin="${ADB:-adb}"
+if [[ -z "${ADB:-}" && -x "$sdk/platform-tools/adb" ]]; then
+    adb_bin="$sdk/platform-tools/adb"
+fi
+
+usage() {
+    cat >&2 <<'USAGE'
+Usage: phone-adb [--serial SERIAL] COMMAND
+  serial                         Print the selected device serial.
+  launch                         Open the installed Harw app.
+  install [APK]                  Install the signed test APK, preserving app data.
+  pull-enrollment PATH           Pull Download/harw-device-enrollment.json to a new file.
+  push-profile PATH              Copy a public profile into the phone's Download folder.
+  reverse [PHONE_PORT [PC_PORT]] Forward phone loopback to this computer (default 7443).
+  remove-reverse [PHONE_PORT]    Remove this phone's reverse mapping (default 7443).
+USAGE
+}
+
+fail() {
+    echo "phone-adb: $*" >&2
+    exit 1
+}
+
+serial="${ANDROID_SERIAL:-}"
+if [[ "${1:-}" == --serial ]]; then
+    [[ $# -ge 2 && -n "$2" ]] || fail "--serial requires a device serial"
+    serial="$2"
+    shift 2
+fi
+if [[ $# == 0 || "${1:-}" == --help || "${1:-}" == -h ]]; then
+    usage
+    exit 0
+fi
+operation="$1"
+shift
+
+if [[ -z "$serial" ]]; then
+    devices=$("$adb_bin" devices)
+    mapfile -t attached < <(awk 'NR > 1 && NF >= 2 {print $1}' <<<"$devices")
+    case ${#attached[@]} in
+        0) fail "connect a phone by USB and authorize debugging" ;;
+        1) serial="${attached[0]}" ;;
+        *) fail "more than one ADB device is visible. Pass --serial SERIAL" ;;
+    esac
+fi
+adb_cmd=("$adb_bin" -s "$serial")
+[[ "$("${adb_cmd[@]}" get-state)" == device ]] || fail "device $serial is offline or unauthorized"
+
+port() {
+    [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 )) || fail "invalid TCP port: $1"
+}
+
+stage_public_profile() {
+    python3 "$mobile_root/scripts/public_profile.py" "$1"
+}
+
+downloads=/sdcard/Download
+case "$operation" in
+    serial)
+        [[ $# == 0 ]] || fail "serial takes no arguments"
+        printf '%s\n' "$serial"
+        ;;
+    launch)
+        [[ $# == 0 ]] || fail "launch takes no arguments"
+        "${adb_cmd[@]}" shell am start -W -n dev.harw.mobile/.MainActivity
+        ;;
+    install)
+        [[ $# -le 1 ]] || fail "install accepts at most one APK path"
+        "${adb_cmd[@]}" install -r "${1:-$default_apk}"
+        ;;
+    pull-enrollment)
+        [[ $# == 1 && ! -e "$1" && ! -L "$1" ]] || fail "supply an unused local filename for the enrollment"
+        staging=$(mktemp "$(dirname -- "$1")/.enrollment.XXXXXXXX")
+        trap 'rm -f -- "$staging"' EXIT
+        "${adb_cmd[@]}" pull "$downloads/harw-device-enrollment.json" "$staging"
+        ln -T -- "$staging" "$1"
+        ;;
+    push-profile)
+        [[ $# == 1 ]] || fail "supply a public server profile JSON file"
+        staging=$(mktemp /tmp/harw-server-profile.XXXXXXXX)
+        trap 'rm -f -- "$staging"' EXIT
+        stage_public_profile "$1" > "$staging"
+        "${adb_cmd[@]}" push "$staging" "$downloads/harw-server-profile.json"
+        ;;
+    reverse)
+        [[ $# -le 2 ]] || fail "reverse accepts at most two ports"
+        phone_port="${1:-7443}"
+        pc_port="${2:-$phone_port}"
+        port "$phone_port"
+        port "$pc_port"
+        "${adb_cmd[@]}" reverse --no-rebind "tcp:$phone_port" "tcp:$pc_port"
+        ;;
+    remove-reverse)
+        [[ $# -le 1 ]] || fail "remove-reverse accepts at most one port"
+        phone_port="${1:-7443}"
+        port "$phone_port"
+        "${adb_cmd[@]}" reverse --remove "tcp:$phone_port"
+        ;;
+    *)
+        usage
+        fail "unknown command $operation"
+        ;;
+esac

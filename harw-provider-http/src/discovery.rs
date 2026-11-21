@@ -227,6 +227,23 @@ pub async fn list_models(
     provider: &harw_config::ProviderToml,
     api_key: Option<&str>,
 ) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    list_models_with_home(provider_name, provider, api_key, None).await
+}
+
+/// Discovers models using the provider's credentials, including a linked ChatGPT plan.
+///
+/// # Errors
+/// Returns a provider, credential, transport, or response decoding error.
+pub async fn list_models_with_home(
+    provider_name: &str,
+    provider: &harw_config::ProviderToml,
+    api_key: Option<&str>,
+    home: Option<&Path>,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let plan =
+        crate::chatgpt_plan::route(provider, home).map_err(|error| DiscoveryError::Decode {
+            detail: error.to_string(),
+        })?;
     let codex_route =
         crate::codex::CodexRoute::from_provider(provider).map_err(|_| DiscoveryError::Decode {
             detail: "Invalid Codex credential route".into(),
@@ -237,7 +254,7 @@ pub async fn list_models(
         provider.base_url.trim_end_matches('/')
     };
     let url = match provider.api.as_str() {
-        "openai-chat" | "openai-responses" => format!("{base}/models"),
+        "openai-chat" | "openai-responses" | crate::chatgpt_plan::API => format!("{base}/models"),
         "ollama" => {
             let normalized = format!("{}/v1", base.trim_end_matches("/v1"));
             format!("{normalized}/models")
@@ -269,7 +286,16 @@ pub async fn list_models(
     }
 
     let mut request = client.get(&url).timeout(DISCOVERY_TIMEOUT);
-    if let Some(route) = &codex_route {
+    if let Some(store) = &plan {
+        let token = store
+            .access_token()
+            .await
+            .map_err(|error| DiscoveryError::Auth {
+                status: 401,
+                detail: error.to_string(),
+            })?;
+        request = request.bearer_auth(token.expose_secret());
+    } else if let Some(route) = &codex_route {
         let codex_headers = route
             .headers(&client)
             .await
@@ -311,6 +337,9 @@ pub async fn list_models(
         .map_err(|_error| DiscoveryError::Decode {
             detail: format!("Antwort von Provider '{provider_name}' ist kein gültiges JSON"),
         })?;
+    if plan.is_some() {
+        return parse_account_models_response(&body, true);
+    }
     if let Some(route) = &codex_route {
         let models = parse_codex_models_response(&body)?;
         if models.is_empty() {
@@ -498,14 +527,24 @@ fn next_anthropic_page_cursor(body: &Value, page_had_entries: bool) -> Option<St
 }
 
 fn parse_codex_models_response(body: &Value) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    parse_account_models_response(body, false)
+}
+
+fn parse_account_models_response(
+    body: &Value,
+    visible_only: bool,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
     let entries = body
         .get("models")
         .and_then(Value::as_array)
         .ok_or_else(|| DiscoveryError::Decode {
-            detail: "Codex model response is missing its models array".into(),
+            detail: "OpenAI account model response is missing its models array".into(),
         })?;
     Ok(entries
         .iter()
+        .filter(|entry| {
+            !visible_only || entry.get("visibility").and_then(Value::as_str) == Some("list")
+        })
         .filter_map(|entry| {
             let id = entry.get("slug")?.as_str()?.trim();
             if id.is_empty() {

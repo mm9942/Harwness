@@ -2389,6 +2389,7 @@ version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "blake3",
+ "bytes",
  "clap",
  "clap_complete",
  "getrandom 0.4.3",
@@ -2453,6 +2454,7 @@ dependencies = [
  "harw-tui",
  "harw-types",
  "harw-web",
+ "http",
  "jiff",
  "keyring",
  "reqwest 0.12.28",
@@ -3930,10 +3932,13 @@ dependencies = [
 name = "harw-oauth"
 version = "0.10.0"
 dependencies = [
+ "aws-lc-rs",
  "base64 0.23.1",
  "fs4",
  "harw-config",
+ "harw-fsutil",
  "harw-test-support",
+ "jiff",
  "rand 0.10.3",
  "reqwest 0.12.28",
  "secrecy 0.10.3",

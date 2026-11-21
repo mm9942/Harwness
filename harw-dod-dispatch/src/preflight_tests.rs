@@ -1426,7 +1426,7 @@ fn test_decoding_accepts_only_bytes_to_json_writes() -> TestResult {
         .collect();
     let mut expected: Vec<u8> = (b' '..=b'~')
         .filter(|byte| *byte != b'\\')
-        .chain([b'\t', b'\n', b'\r'])
+        .chain(*b"\t\n\r")
         .collect();
     expected.sort_unstable();
     assert_eq!(allowed, expected);

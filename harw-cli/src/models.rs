@@ -369,7 +369,12 @@ fn run_scan(
     for (name, provider) in targets {
         let api_key =
             discovery::resolve_provider_api_key(name, provider, &config, Some(home), resolver);
-        match runtime.block_on(discovery::list_models(name, provider, api_key.as_deref())) {
+        match runtime.block_on(discovery::list_models_with_home(
+            name,
+            provider,
+            api_key.as_deref(),
+            Some(home),
+        )) {
             Ok(models) => {
                 let filtered: Vec<DiscoveredModel> = if free_only {
                     models.into_iter().filter(is_free_model).collect()

@@ -2918,7 +2918,7 @@ mod tests {
         );
         let issued_by = field("issued_by")?;
         assert!(
-            TRIAGE_ROLES.iter().any(|role| *role == issued_by),
+            TRIAGE_ROLES.contains(&issued_by),
             "issued_by nennt eine Triage-Rolle"
         );
         let issued_at = field("issued_at")?;

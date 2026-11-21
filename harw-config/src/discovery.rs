@@ -3244,8 +3244,16 @@ token_ttl_secs = 60
         use crate::network_toml::ResearchWebMode;
         let home = test_directory("research-web-sticky-home")?;
         let profile = test_directory("research-web-sticky-profile")?;
-        write_layer_file(&home, "config.toml", "[network]\nresearch_web = \"allowlist\"\n")?;
-        write_layer_file(&profile, "config.toml", "[network]\nallow_hosts = [\"docs.rs\"]\n")?;
+        write_layer_file(
+            &home,
+            "config.toml",
+            "[network]\nresearch_web = \"allowlist\"\n",
+        )?;
+        write_layer_file(
+            &profile,
+            "config.toml",
+            "[network]\nallow_hosts = [\"docs.rs\"]\n",
+        )?;
         let config = discover_config(&[home.clone(), profile.clone()])
             .map_err(ctx("Konfiguration entdecken"))?;
         assert_eq!(config.network.research_web, ResearchWebMode::Allowlist);

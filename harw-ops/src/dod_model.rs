@@ -287,9 +287,7 @@ impl TriageSettings {
     // configured or disabled; `None` without a model or with an enabled
     // provider.
     fn provider_block(&self) -> Option<&'static str> {
-        if self.model.is_none() {
-            return None;
-        }
+        self.model.as_ref()?;
         match self.provider_enabled {
             None => Some(TRIAGE_PROVIDER_MISSING_NOTE),
             Some(false) => Some(TRIAGE_PROVIDER_DISABLED_NOTE),

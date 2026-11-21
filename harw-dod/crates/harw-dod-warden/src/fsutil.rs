@@ -67,7 +67,7 @@ pub(crate) fn replace_file_atomically(
         rustix::fs::CWD,
         &tmp_path,
         rustix::fs::CWD,
-        &dir.join(name),
+        dir.join(name),
         RenameFlags::empty(),
     )?;
     sync_dir(dir)

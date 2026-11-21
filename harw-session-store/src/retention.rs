@@ -1168,7 +1168,7 @@ mod tests {
         })
     }
 
-    fn listing(store: &FreezeStore, suffix: &str) -> TestResult<Vec<String>> {
+    fn freeze_listing(store: &FreezeStore, suffix: &str) -> TestResult<Vec<String>> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(store.root())? {
             let name = entry?.file_name().to_string_lossy().into_owned();
@@ -1211,12 +1211,12 @@ mod tests {
                 age(&path, 400)?;
             }
         }
-        let active_before = listing(&store, ".active.json")?;
+        let active_before = freeze_listing(&store, ".active.json")?;
         assert_eq!(active_before.len(), 2);
 
         let refused = store.retention_sweep(&ClassConfig::default(), SweepMode::Apply, None);
         assert!(matches!(refused, Err(RetentionError::OptInRequired(_))));
-        assert_eq!(listing(&store, ".resolved.json")?.len(), 3);
+        assert_eq!(freeze_listing(&store, ".resolved.json")?.len(), 3);
 
         let dry_cfg = ClassConfig {
             keep_newest: Some(1),
@@ -1226,7 +1226,7 @@ mod tests {
             .retention_sweep(&dry_cfg, SweepMode::DryRun, None)
             .map_err(ctx("dry"))?;
         assert_eq!(dry.removed.len(), 1);
-        assert_eq!(listing(&store, ".resolved.json")?.len(), 3);
+        assert_eq!(freeze_listing(&store, ".resolved.json")?.len(), 3);
 
         let report = store
             .retention_sweep(&enabled(), SweepMode::Apply, None)
@@ -1238,8 +1238,8 @@ mod tests {
                 .iter()
                 .any(|p| p.reason == "active record still present")
         );
-        assert_eq!(listing(&store, ".resolved.json")?.len(), 2);
-        assert_eq!(listing(&store, ".active.json")?, active_before);
+        assert_eq!(freeze_listing(&store, ".resolved.json")?.len(), 2);
+        assert_eq!(freeze_listing(&store, ".active.json")?, active_before);
         assert!(fresh_path.exists());
         assert_eq!(store.active()?.len(), 1, "unresolved freeze stays in force");
         Ok(())

@@ -6451,8 +6451,6 @@ specialization = "web-scout"
     /// Triage-Rolle behält die des Profils.
     #[tokio::test]
     async fn o11_children_carry_their_own_role_description() -> TestResult {
-        use harw_extension_api::InstructionsProvider as _;
-
         /// Der zusammengesetzte System-Prompt der Kind-Registry von `role`.
         async fn system_prompt(
             factory: &RuntimeChildRegistryFactory,

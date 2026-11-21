@@ -316,7 +316,7 @@ struct Attr<'a> {
 }
 
 fn take<const N: usize>(input: &mut &[u8]) -> TestResult<[u8; N]> {
-    let current: &[u8] = *input;
+    let current: &[u8] = input;
     let (head, rest) = current
         .split_first_chunk::<N>()
         .ok_or_else(missing("bytes"))?;

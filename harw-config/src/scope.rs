@@ -373,6 +373,8 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "session_listener.node_id", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "session_listener.tier", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "session_listener.approval_device", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.provider_link_device", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.shared_socket_tenant", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     // 1.9 [mode] (1)
     FieldScope { path: "mode.default", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.10 [research] (5)

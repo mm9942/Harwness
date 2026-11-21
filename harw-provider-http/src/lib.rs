@@ -131,6 +131,7 @@ pub use retry::{
 };
 pub use routing::{RoutingBackends, RoutingModelProvider};
 
+mod chatgpt_plan;
 mod codex;
 mod credential_pool;
 
@@ -1638,6 +1639,7 @@ pub struct OpenAiResponsesProvider {
     model: String,
     api_key: SecretString,
     codex_route: Option<codex::CodexRoute>,
+    chatgpt_plan: Option<harw_oauth::chatgpt_plan::ChatGptPlanStore>,
     auth_header: String,
     headers: reqwest::header::HeaderMap,
     transport: Transport,
@@ -1778,6 +1780,7 @@ impl OpenAiResponsesProvider {
             model: model.into(),
             api_key,
             codex_route: None,
+            chatgpt_plan: None,
             auth_header: "bearer".into(),
             headers: reqwest::header::HeaderMap::new(),
             transport,
@@ -1902,6 +1905,7 @@ impl OpenAiResponsesProvider {
         sources: SecretSources<'_>,
         budgets: &budget::ProviderBudgetRegistry,
     ) -> HttpProviderResult<Self> {
+        let plan = chatgpt_plan::route(provider, sources.home)?;
         let codex_route = codex::CodexRoute::from_provider(provider)?;
         let base_url = if codex_route.is_some() {
             codex::BASE_URL
@@ -1932,31 +1936,34 @@ impl OpenAiResponsesProvider {
         // Credential, übernimmt stattdessen der erste Pool-Eintrag diese
         // Rolle. Codex-Routen haben ihre eigene OAuth-Auflösung
         // (`route.headers()`) und nehmen nie am Pool teil.
-        let primary: Option<SecretString> = if let Some(reference) = &provider.auth {
+        let primary: Option<SecretString> = if plan.is_some() {
+            Some(SecretString::new(String::new().into()))
+        } else if let Some(reference) = &provider.auth {
             Some(resolve_secret(reference, sources)?)
         } else if auth_header == "none" {
             Some(SecretString::new(String::new().into()))
         } else {
             None
         };
-        let pool: Option<credential_pool::CredentialPool<SecretString>> = if codex_route.is_none() {
-            let pool = credential_pool::CredentialPool::from_auth_config(
-                &config.auth,
-                provider_name,
-                sources,
-                Ok,
-            )?;
-            if let Some(pool) = &pool {
-                for index in 0..pool.len() {
-                    if let Some(url) = &pool.entry(index).base_url {
-                        validate_endpoint_with(url, provider.allow_insecure_lan)?;
+        let pool: Option<credential_pool::CredentialPool<SecretString>> =
+            if codex_route.is_none() && plan.is_none() {
+                let pool = credential_pool::CredentialPool::from_auth_config(
+                    &config.auth,
+                    provider_name,
+                    sources,
+                    Ok,
+                )?;
+                if let Some(pool) = &pool {
+                    for index in 0..pool.len() {
+                        if let Some(url) = &pool.entry(index).base_url {
+                            validate_endpoint_with(url, provider.allow_insecure_lan)?;
+                        }
                     }
                 }
-            }
-            pool
-        } else {
-            None
-        };
+                pool
+            } else {
+                None
+            };
         let (api_key, pool) = match (pool, primary) {
             (Some(pool), Some(primary_value)) => {
                 let pool = pool.prepend_primary(primary_value, format!("{provider_name}#primary"));
@@ -1993,10 +2000,11 @@ impl OpenAiResponsesProvider {
         )?;
         http_provider.auth_header = auth_header.to_owned();
         http_provider.codex_route = codex_route;
+        http_provider.chatgpt_plan = plan;
         http_provider.credential_pool = pool.map(std::sync::Arc::new);
         if !matches!(
             provider.api.as_str(),
-            "openai-chat" | "openai-responses" | "ollama"
+            "openai-chat" | "openai-responses" | "ollama" | chatgpt_plan::API
         ) {
             return Err(HttpProviderError::Decode(format!(
                 "unsupported provider API '{}'",
@@ -2342,7 +2350,7 @@ pub(crate) fn parse_retry_after(
 /// (z. B. `"openai-chat"`) ergibt [`Transport::Chat`].
 fn transport_from_api(api: &str) -> Transport {
     match api {
-        "openai-responses" => Transport::Responses,
+        "openai-responses" | chatgpt_plan::API => Transport::Responses,
         _ => Transport::Chat,
     }
 }
@@ -4102,6 +4110,13 @@ impl OpenAiResponsesProvider {
         if let Some(route) = &self.codex_route {
             return Ok(builder.headers(route.headers(&self.client).await?));
         }
+        if let Some(store) = &self.chatgpt_plan {
+            let token = store
+                .access_token()
+                .await
+                .map_err(chatgpt_plan::model_auth_error)?;
+            return Ok(builder.bearer_auth(token.expose_secret()));
+        }
         let mut builder = match self.auth_header.as_str() {
             "none" => builder,
             "api-key" | "x-api-key" => builder.header(
@@ -4224,6 +4239,9 @@ impl OpenAiResponsesProvider {
         if self.codex_route.is_some() {
             codex::prepare_body(&mut wire);
         }
+        if self.chatgpt_plan.is_some() {
+            chatgpt_plan::prepare_body(&mut wire);
+        }
         // Natives SSE-Streaming (Codex streamt ohnehin, siehe oben).
         let stream_sink = request
             .stream
@@ -4306,7 +4324,7 @@ impl OpenAiResponsesProvider {
             let response = send_with_timeout(
                 builder.json(&wire),
                 self.request_timeout,
-                stream_sink.is_some(),
+                stream_sink.is_some() || self.chatgpt_plan.is_some(),
             )
             .await?;
 
@@ -4329,6 +4347,8 @@ impl OpenAiResponsesProvider {
         let request_id = provider_request_id(response.headers());
         let value: Value = if status.is_success() && self.codex_route.is_some() {
             codex::read_response(response, request.stream.as_ref()).await?
+        } else if status.is_success() && self.chatgpt_plan.is_some() {
+            chatgpt_plan::read_response(response, stream_sink, self.stream_idle_timeout).await?
         } else if status.is_success()
             && let Some(sink) = stream_sink
         {
@@ -4340,6 +4360,12 @@ impl OpenAiResponsesProvider {
                 .map_err(|error| model_error_for_transport(error, true))?;
 
             if !status.is_success() {
+                if self.chatgpt_plan.is_some()
+                    && let Ok(value) = serde_json::from_str(&body)
+                    && let Some(error) = chatgpt_plan::response_error(&value)
+                {
+                    return Err(error);
+                }
                 if status.as_u16() == 429 {
                     // W6b — UIA-Sichtbarkeit: zählt jede beobachtete 429-Antwort
                     // dieses Providers, unabhängig davon, ob sie unten als
@@ -4362,8 +4388,17 @@ impl OpenAiResponsesProvider {
                             .note_rate_limit_cooldown(Duration::from_secs(secs));
                     }
                 }
-                let error =
-                    model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);
+                let diagnostic_body = if self.chatgpt_plan.is_some() {
+                    ""
+                } else {
+                    &body
+                };
+                let error = model_error_for_status(
+                    status.as_u16(),
+                    request_id.as_deref(),
+                    hint,
+                    diagnostic_body,
+                );
                 tracing::debug!(
                     status = status.as_u16(),
                     retryable = error.is_retryable(),
@@ -6396,6 +6431,28 @@ mod tests {
     fn test_build_provider_skips_stale_codex_failover_entry() -> TestResult {
         let config = config_with_stale_codex_failover("OPENAI_API_KEY");
         build_provider(&config).map_err(ctx("stale failover must not block startup"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn chatgpt_plan_provider_can_start_before_account_linking() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create Harw home"))?;
+        let mut config = harw_config::ResolvedConfig::default();
+        let mut provider = configured_provider(
+            "chatgpt-plan",
+            "https://api.openai.com/v1".to_owned(),
+            vec!["gpt-test"],
+            "UNUSED",
+        );
+        provider.api = "openai-chatgpt-plan".to_owned();
+        provider.auth = None;
+        provider.headers.clear();
+        config.harness.default_provider = Some(provider.name.clone());
+        config.harness.default_model = Some("gpt-test".to_owned());
+        config.providers.insert(provider.name.clone(), provider);
+
+        build_provider_with_home(&config, home.path(), None)
+            .map_err(ctx("an unlinked ChatGPT plan provider must still start"))?;
         Ok(())
     }
 

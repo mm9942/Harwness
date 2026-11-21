@@ -463,7 +463,7 @@ pub fn run(
         sessions: sessions_root,
     };
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("Runtime-Start fehlgeschlagen: {error}"))?;
@@ -493,6 +493,17 @@ pub fn run(
         )
     });
 
+    let shared_socket_tenant = config
+        .harness
+        .session_listener
+        .shared_socket_tenant
+        .as_deref()
+        .map(harw_types::TenantId::try_from_str)
+        .transpose()
+        .map_err(|e| format!("invalid shared_socket_tenant: {e}"))?;
+    if shared_socket_tenant.is_some() && remote_serve.is_none() && session_serve.is_some() {
+        return Err("shared_socket_tenant requires an enabled session listener".into());
+    }
     let result = runtime.block_on(async {
         let remote = match remote_serve {
             Some((state_dir, model)) => {
@@ -512,7 +523,13 @@ pub fn run(
         };
         let ingress = match session_serve {
             Some((config, model)) => {
-                let ingress = crate::session_serve::start(&config, model).await?;
+                let ingress = match (&remote, shared_socket_tenant) {
+                    (Some(remote), Some(tenant)) => {
+                        crate::session_serve::start_shared(&config, remote.host.clone(), tenant)
+                            .await?
+                    }
+                    _ => crate::session_serve::start(&config, model).await?,
+                };
                 eprintln!("  session socket : {}", ingress.socket().display());
                 Some(ingress)
             }

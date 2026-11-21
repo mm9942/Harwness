@@ -731,7 +731,7 @@ impl ShellExecutor {
     /// autorisiert ihn sofort für den auslösenden Aufruf.
     ///
     /// # Description
-    /// - [`HostApprovalScope::SingleExecution`]: über
+    /// - [`HostApprovalScope::SingleExecution`] — über
     ///   [`ProcessPermitLedger::issue_after_local_approval`] mit `ttl`,
     ///   sofort autorisiert (verbraucht) und danach ohne Phasenbindung
     ///   gemerkt ([`HostPermitSessionRegistry::remember_single_execution_permit`]).

@@ -2913,7 +2913,7 @@ fn repair_torn_tail(file: &mut File, segment_seq: u64) -> VerdictStoreResult<()>
     let Some(last_index) = len.checked_sub(1) else {
         return Ok(());
     };
-    if read_window(file, last_index, 1)? == [b'\n'] {
+    if read_window(file, last_index, 1)? == *b"\n" {
         return Ok(());
     }
     let window = len.min(record_window());

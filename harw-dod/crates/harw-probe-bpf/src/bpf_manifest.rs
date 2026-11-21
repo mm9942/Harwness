@@ -714,10 +714,8 @@ fn decode_sha256(text: &str) -> Option<[u8; SHA256_LEN]> {
         return None;
     }
     let mut digest = [0_u8; SHA256_LEN];
-    for (byte, pair) in digest.iter_mut().zip(digits.chunks_exact(2)) {
-        let &[high, low] = pair else {
-            return None;
-        };
+    for (byte, pair) in digest.iter_mut().zip(digits.as_chunks::<2>().0) {
+        let &[high, low] = pair;
         *byte = hex_value(high)?
             .checked_mul(16)?
             .checked_add(hex_value(low)?)?;

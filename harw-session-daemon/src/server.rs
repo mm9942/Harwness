@@ -80,6 +80,8 @@ pub struct UdsConfig {
     pub socket_path: PathBuf,
     /// The only uid that is served. Everything else is dropped.
     pub allowed_uid: u32,
+    /// Optional tenant for workspace sharing with enrolled remote clients.
+    pub tenant: Option<harw_types::TenantId>,
     /// Permission tier granted to the served uid.
     pub tier: PermissionTier,
     /// Maximum simultaneous connections; excess connections are dropped.
@@ -104,6 +106,7 @@ impl UdsConfig {
         Self {
             socket_path: socket_path.into(),
             allowed_uid,
+            tenant: None,
             tier: PermissionTier::Operator,
             max_connections: 16,
             header_timeout: Duration::from_secs(5),
@@ -258,11 +261,12 @@ impl UdsServer {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _)) => {
-                            let Some(identity) =
+                            let Some(mut identity) =
                                 peer_identity(&stream, config.allowed_uid, config.tier)
                             else {
                                 continue;
                             };
+                            identity.tenant.clone_from(&config.tenant);
                             if let Err(error) = com.serve_io(stream, identity) {
                                 tracing::warn!(%error, "session daemon: connection dropped");
                             }

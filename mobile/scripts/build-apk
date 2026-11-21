@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mobile_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+android_dir="$mobile_root/android"
+
+export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
+gradle_flags=(--no-daemon --max-workers="${MOBILE_BUILD_JOBS:-2}")
+if [[ "${MOBILE_OFFLINE:-0}" == 1 ]]; then
+    gradle_flags+=(--offline)
+fi
+
+"$mobile_root/scripts/build-native"
+cd -- "$android_dir"
+./gradlew "${gradle_flags[@]}" :app:testDebugUnitTest :app:assembleDebug
+apk="$android_dir/app/build/outputs/apk/debug/app-debug.apk"
+"$mobile_root/scripts/verify-apk" "$apk"

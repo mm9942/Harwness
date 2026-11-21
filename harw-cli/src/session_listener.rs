@@ -197,6 +197,8 @@ pub struct ListenerPlan {
     pub tier: PermissionTier,
     /// The approving device, if any.
     pub approval_device: Option<DeviceId>,
+    /// Device permitted to link the gateway provider account.
+    pub provider_link_device: Option<DeviceId>,
 }
 
 /// Validates `[session_listener]`.
@@ -226,6 +228,12 @@ pub fn plan(section: &SessionListenerSection) -> Result<ListenerPlan, String> {
         node,
         tier: parse_tier(&section.tier)?,
         approval_device,
+        provider_link_device: section
+            .provider_link_device
+            .as_deref()
+            .map(DeviceId::try_from_str)
+            .transpose()
+            .map_err(|error| format!("[session_listener] provider_link_device: {error}"))?,
     })
 }
 
@@ -269,6 +277,7 @@ pub async fn start_from_config(
     let mut config = RemoteServeConfig::new(state_dir, home, cwd);
     config.tier = plan.tier;
     config.approval_device = plan.approval_device;
+    config.provider_link_device = plan.provider_link_device;
     let remote_dir = state_dir.join("remote");
     let peers_text = crate::session_serve_remote::read_peer_pins(&remote_dir.join(PEERS_FILE))?;
     config.peer_pins_digest = Some(*blake3::hash(peers_text.as_bytes()).as_bytes());

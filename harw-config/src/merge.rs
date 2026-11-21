@@ -1374,6 +1374,24 @@ fn merge_session_listener(
         layer_path,
         out,
     );
+    global_only(
+        &mut trusted.session_listener.provider_link_device,
+        incoming.provider_link_device,
+        present("provider_link_device"),
+        role,
+        "session_listener.provider_link_device",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.shared_socket_tenant,
+        incoming.shared_socket_tenant,
+        present("shared_socket_tenant"),
+        role,
+        "session_listener.shared_socket_tenant",
+        layer_path,
+        out,
+    );
 }
 
 // `[tools.container]` — alle vier Felder `GlobalOnly` und sicherheitskritisch:
