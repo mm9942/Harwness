@@ -171,6 +171,7 @@ fn test_field_table_exhaustive_tui_section() {
         status_expiry,
         goal_mode,
         reasoning,
+        footer_counts,
     } = TuiSection::default();
     let _ = (
         language,
@@ -180,6 +181,7 @@ fn test_field_table_exhaustive_tui_section() {
         status_expiry,
         goal_mode,
         reasoning,
+        footer_counts,
     );
     for path in [
         "tui.language",
@@ -189,6 +191,7 @@ fn test_field_table_exhaustive_tui_section() {
         "tui.status_expiry",
         "tui.goal_mode",
         "tui.reasoning",
+        "tui.footer_counts",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }

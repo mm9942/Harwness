@@ -1515,6 +1515,21 @@ impl AgentMonitor {
         counts
     }
 
+    /// Kennzahlen unter dem Composer: alle fehlgeschlagenen Agenten, auch gesehene;
+    /// Jobs gehören nicht zu diesen Agentenzahlen.
+    #[must_use]
+    pub(crate) fn footer_counts(&self) -> (usize, usize) {
+        let mut counts = (0, 0);
+        for live in self.agents.values().filter(|live| live.parent.is_some()) {
+            if live.phase.is_active() {
+                counts.0 += 1;
+            } else if live.phase == AgentPhase::Failed {
+                counts.1 += 1;
+            }
+        }
+        counts
+    }
+
     /// `true`, sobald mindestens ein Kind-Agent (mit Elternteil) bekannt ist.
     #[must_use]
     pub(crate) fn has_children(&self) -> bool {
@@ -3940,6 +3955,30 @@ mod tests {
         let seen = panel_screen(&monitor, 60, 20, false)?.join("\n");
         assert!(!seen.contains("Budget erschöpft"), "{seen}");
         assert!(seen.contains("✓ 7 finished"), "{seen}");
+        Ok(())
+    }
+
+    #[test]
+    fn footer_counts_include_seen_failures() -> TestResult {
+        let mut monitor = busy_monitor()?;
+        let (active_before, failed_before) = monitor.footer_counts();
+        assert_eq!(failed_before, 0);
+        monitor.apply(&ev(
+            "f1",
+            Some("root"),
+            "uia-tester",
+            TurnEvent::TurnFailed {
+                turn_id: t1()?,
+                reason: "Budget erschöpft".into(),
+                retryable: false,
+            },
+        )?);
+        let (active, failed) = monitor.footer_counts();
+        assert_eq!(failed, 1);
+        assert!(active <= active_before + 1);
+        // Gesehene Fehler bleiben in der Fußzeile gezählt.
+        monitor.mark_seen("f1");
+        assert_eq!(monitor.footer_counts().1, 1);
         Ok(())
     }
 

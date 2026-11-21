@@ -1253,6 +1253,9 @@ pub struct ChatApp {
     /// Flächen des letzten Frames (Agenten-Panel, Dialog, Plan) für das
     /// Maus-Routing ([`scroll_routing::route_scroll_input`]).
     last_regions: Cell<scroll_routing::FrameRegions>,
+    /// Fußzeile mit Agentenzahlen unter dem Composer. Standardmäßig aus: die
+    /// zusätzliche Zeile verschiebt die zellgenauen Fensteranker (PL-97 C2/C3).
+    footer_counts_enabled: bool,
     /// Nächstes Bild zeichnet den ganzen Bildschirm neu (`Terminal::clear`
     /// vor `draw`): nach einer Größenänderung und auf `Ctrl+L`. ratatui
     /// schreibt sonst nur geänderte Zellen; zählt der Terminal-Emulator eine
@@ -1601,6 +1604,7 @@ impl ChatApp {
             last_history_total_lines: Cell::new(0),
             last_history_visible_rows: Cell::new(20),
             last_regions: Cell::new(scroll_routing::FrameRegions::default()),
+            footer_counts_enabled: false,
             full_redraw: Cell::new(false),
             managed_spawner: None,
             historic_agent_events: Vec::new(),
@@ -1850,6 +1854,14 @@ impl ChatApp {
         } else {
             ToolVerbosity::Compact
         };
+        self
+    }
+
+    /// Schaltet die Agentenzahlen-Fußzeile unter dem Composer ein
+    /// (`[tui] footer_counts`, Vorgabe: aus).
+    #[must_use]
+    pub fn with_footer_counts(mut self, enabled: bool) -> Self {
+        self.footer_counts_enabled = enabled;
         self
     }
 
@@ -11387,6 +11399,22 @@ fn render_viewport_scoped(
     // aufzuzehren. Auf einer Zeile würde `fit_segments` sonst Modus, Modell
     // und Kontext still verwerfen (Befund 2026-09-28, Hochformat-TUI).
     let status_rows = status_rows_for(app, theme, area.width);
+    // Fußzeile mit Agentenzahlen: nur bei ausreichend Platz für Verlauf,
+    // Status und vollständigen Composer eine eigene Zeile unterhalb der
+    // Eingabe reservieren. Dialoge ersetzen den Composer und erhalten keine
+    // Agenten-Fußzeile.
+    let footer_visible = app.footer_counts_enabled
+        && !dialog_open
+        && area.height
+            > input_height
+                .saturating_add(status_rows)
+                .saturating_add(history_min);
+    let footer_area = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(1),
+        area.width,
+        1,
+    );
     // PL-97 C2: Fenster, Warteschlange und Seitenpanels (`app/render.rs`);
     // danach folgen Statuszeile, Verlauf und Composer.
     let body = render::compose_body(
@@ -11398,6 +11426,7 @@ fn render_viewport_scoped(
             input_height,
             history_min,
             dialog_open,
+            footer_rows: u16::from(footer_visible),
         },
     );
     let (history_area, status_area, input_area) = (body.history, body.status, body.input);
@@ -12036,6 +12065,13 @@ fn render_viewport_scoped(
                 .border_style(border_style),
         );
     frame.render_widget(input_widget, input_area);
+    if footer_visible && footer_area.width > 0 && footer_area.height > 0 {
+        let (active, failed) = app.agent_monitor.footer_counts();
+        frame.render_widget(
+            Paragraph::new(format!("Agenten aktiv {active} · fehlgeschlagen {failed}")),
+            footer_area,
+        );
+    }
 
     // Terminal-Cursor auf die Schreibposition setzen. Ohne diesen Aufruf
     // blendet ratatui den Cursor für den Frame aus, und der Schreibende
@@ -17782,6 +17818,24 @@ forbidden = [{forbidden}]
             .collect())
     }
 
+    #[test]
+    fn footer_counts_row_is_opt_in_and_sits_below_the_composer() -> TestResult {
+        let mut app = test_chat_app()?;
+        let off = rendered_rows(&app, 80, 24)?;
+        assert!(
+            off.iter().all(|row| !row.contains("Agenten aktiv")),
+            "Fußzeile ist standardmäßig aus"
+        );
+        app = app.with_footer_counts(true);
+        let on = rendered_rows(&app, 80, 24)?;
+        let last = on.last().map(String::as_str).unwrap_or_default();
+        assert!(
+            last.contains("Agenten aktiv 0 · fehlgeschlagen 0"),
+            "{last}"
+        );
+        Ok(())
+    }
+
     /// PL-94 W02/h7: im Portrait-Dock (46×78) steht zwischen Dock und Chat der
     /// Mini-Live-Streifen mit den zwei letzten Agentenmeldungen — Kopfzeile
     /// plus zwei Körperzeilen, wie `chat_first` sie für diese Höhe vorsieht
@@ -17939,6 +17993,7 @@ forbidden = [{forbidden}]
                         status_rows: 1,
                         input_height: 13,
                         history_min: 1,
+                        footer_rows: 0,
                         dialog_open: true,
                     },
                 );
@@ -18561,6 +18616,7 @@ forbidden = [{forbidden}]
                             status_rows: 1,
                             input_height: 17,
                             history_min: 1,
+                            footer_rows: 0,
                             dialog_open: true,
                         },
                     );

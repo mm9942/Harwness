@@ -18,6 +18,18 @@ MANIFEST = Path(__file__).resolve().parents[1] / "release-manifest.sh"
 
 
 class SourceInstallTests(unittest.TestCase):
+    def test_make_install_uses_native_cargo_only_on_termux(self):
+        installer = INSTALLER.read_text()
+        self.assertIn(
+            'make install CARGO="${PREFIX}/bin/cargo" BINDIR="$install_dir"',
+            installer,
+        )
+        self.assertIn(
+            'make install BINDIR="$install_dir"',
+            installer,
+        )
+        self.assertIn('export PATH="$termux_bin:$HOME/.cargo/bin:$PATH"', installer)
+
     def test_piped_install_downloads_zip_and_keeps_source_for_make(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

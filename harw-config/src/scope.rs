@@ -323,6 +323,8 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "tui.goal_mode", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // PL-97 R1: Darstellung der Reasoning-Zusammenfassungen (rein darstellend).
     FieldScope { path: "tui.reasoning", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // `[tui] footer_counts`: Agentenzahlen-Fußzeile (rein darstellend).
+    FieldScope { path: "tui.footer_counts", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.4 [session] (5)
     FieldScope { path: "session.store_dir", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "session.journal_format", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -605,12 +607,13 @@ mod merge_rule_tests {
         // PL-97 B1: +4 für `skills.*`.
         // PL-97 E2: +1 für `sandbox.execution`.
         // PL-97 R1: +1 für `tui.reasoning`.
+        // +1 für `tui.footer_counts`.
         // PL-97 E3: +2 für `jobs.cgroup_root`, `jobs.trampoline`.
         // Interface localization: +1 for `tui.language`.
         // PL-100 Phase 4: +1 für `sandbox.host_lease_ttl_secs`.
         // PL-100 WP0.12: +10 für `retention.dod_verdicts.*`, `retention.dod_labels.*`
         // (12 Klassen x 5 Schlüssel).
-        assert_eq!(FIELD_TABLE.len(), 217);
+        assert_eq!(FIELD_TABLE.len(), 218);
     }
 
     #[test]
@@ -637,10 +640,11 @@ mod merge_rule_tests {
         // +1 for explicit trusted single-agent task topology.
         // +1 for `internal_models.image_understanding`.
         // PL-97 R1: +1 (`tui.reasoning`).
+        // +1 (`tui.footer_counts`).
         // PL-97 E3: +2 (`jobs.cgroup_root`, `jobs.trampoline`).
         // Interface localization: +1 for `tui.language`.
         // PL-100 Phase 4: +1 (`sandbox.host_lease_ttl_secs`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 108);
+        assert_eq!(count(MergeRule::ProfileReplaces), 109);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

@@ -873,6 +873,10 @@ pub struct TuiSection {
     /// eingeklappt auf eine Zeile (`collapsed`) oder gar nicht (`hidden`).
     #[serde(default)]
     pub reasoning: ReasoningDisplayMode,
+    /// Agentenzahlen-Fußzeile unter dem Composer (`[tui] footer_counts`,
+    /// Vorgabe: aus). Rein darstellend.
+    #[serde(default)]
+    pub footer_counts: bool,
 }
 
 impl Default for TuiSection {
@@ -885,6 +889,7 @@ impl Default for TuiSection {
             status_expiry: StatusExpiryMode::default(),
             goal_mode: false,
             reasoning: ReasoningDisplayMode::default(),
+            footer_counts: false,
         }
     }
 }
@@ -1129,6 +1134,16 @@ mod tests {
             TuiSection::default().status_expiry,
             StatusExpiryMode::Consolidate
         );
+    }
+
+    /// `[tui] footer_counts` ist standardmäßig aus und lässt sich per TOML einschalten.
+    #[test]
+    fn test_tui_footer_counts_defaults_off_and_parses() -> TestResult {
+        assert!(!TuiSection::default().footer_counts);
+        let src = "default_provider = \"anthropic\"\ndefault_model = \"m\"\n[tui]\nfooter_counts = true\n";
+        let cfg: HarnessConfig = toml::from_str(src).map_err(ctx("parse tui.footer_counts"))?;
+        assert!(cfg.tui.footer_counts);
+        Ok(())
     }
 
     /// PL-97 R1: `[tui] reasoning` hat die Vorgabe `message`, parst die

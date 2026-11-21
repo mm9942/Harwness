@@ -1026,6 +1026,15 @@ fn merge_tui(
         "tui.reasoning",
         layer_path,
     );
+    // `[tui] footer_counts` (rein darstellend, `ProfileReplaces`).
+    profile_replaces(
+        &mut trusted.tui.footer_counts,
+        incoming.footer_counts,
+        present("footer_counts"),
+        role,
+        "tui.footer_counts",
+        layer_path,
+    );
 }
 
 // `[session]` (Abschnitt 1.4) — `retention_days` ist `MinBound`
