@@ -26,7 +26,7 @@ required-features = ["bindgen"]
 bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
 bootstrap = [
     "dep:clap", "dep:harw-infra-client", "dep:harw-node-listener", "dep:rustix",
-    "dep:tempfile", "dep:toml", "tokio/process", "tokio/signal", "tokio/io-util",
+    "dep:harw-tailscale", "dep:tempfile", "dep:toml", "tokio/process", "tokio/signal", "tokio/io-util",
 ]
 
 [dependencies]
@@ -40,6 +40,7 @@ harw-node-listener = { path = "../../harw-node-listener", optional = true }
 harw-node-transport = { path = "../../harw-node-transport" }
 harw-protocol = { path = "../../harw-protocol" }
 harw-session-remote = { path = "../../harw-session-remote" }
+harw-tailscale = { path = "../../harw-tailscale", optional = true }
 harw-types = { path = "../../harw-types" }
 hex = "0.4.3"
 http = "1"

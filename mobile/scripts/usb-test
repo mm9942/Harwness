@@ -6,6 +6,9 @@ target_dir="${CARGO_TARGET_DIR:-$root/target}"
 launcher="${HARW_MOBILE_BOOTSTRAP:-$target_dir/debug/mobile-bootstrap}"
 if [[ ! -x "$launcher" && -z "${HARW_MOBILE_BOOTSTRAP:-}" ]]; then
     launcher="$root/mobile/rust/target/debug/mobile-bootstrap"
+    if [[ ! -x "$launcher" ]] && command -v harw-mobile-bootstrap >/dev/null; then
+        launcher=$(command -v harw-mobile-bootstrap)
+    fi
 fi
 hub="${HARW_MOBILE_AUTH_HUB:-$root/target/debug/harw-auth-hub}"
 harw="${HARW_MOBILE_CLI:-harw}"

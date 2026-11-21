@@ -1,6 +1,6 @@
 # Harw Android phone test
 
-The arm64 debug APK uses the same pinned node handshake and hosted-session wire protocol as the Harw gateway. Android Keystore protects the phone identity. The gateway runs with a dedicated home, its own AuthHub, and a TCP listener on `127.0.0.1`. The phone's enrollment and the server profile are public JSON documents. Verify the source of the profile before importing it because it supplies the server identity pin. [Public file formats](INTERFACE.md)
+The arm64 debug APK uses the same pinned node handshake and hosted-session wire protocol as the Harw gateway. Android Keystore protects the phone identity. The gateway runs with a dedicated home and its own AuthHub. It listens on `127.0.0.1` for USB tests or on its assigned Tailscale address when started with `--tailnet`. The phone's enrollment and the server profile are public JSON documents. Verify the source of the profile before importing it because it supplies the server identity pin. [Public file formats](INTERFACE.md)
 
 ## Build and check the APK
 
@@ -112,6 +112,10 @@ To display the public gateway profile on the computer, install the Python packag
 If the computer has a scanner that prints the phone’s enrollment QR as text, pass that text on stdin to `./mobile/scripts/phone-qr enrollment`. Its stdout is the public enrollment JSON used by the launcher. The USB file exchange above also works with a computer that has no camera.
 
 ## Connect from the phone
+
+### Connect over your tailnet
+
+Connect the phone and server to the same Tailscale network, then add `--tailnet` to the server’s `mobile-bootstrap serve` command. The launcher reads this server’s assigned address from the running Tailscale daemon and binds the authenticated gateway there. Its public profile includes that address and the gateway key. Import the profile or scan its QR code on the phone, then tap **Connect**. The phone must be enrolled on the gateway even if it can reach the server over Tailscale. For this mode the USB cable is only needed if you use it to install the APK or transfer the enrollment. Your tailnet policy must allow the phone to reach the selected gateway port.
 
 ### USB with the gateway on the same PC
 

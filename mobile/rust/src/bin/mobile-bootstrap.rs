@@ -68,7 +68,10 @@ struct Serve {
     /// The phone's exported public enrollment JSON.
     #[arg(long)]
     enrollment: PathBuf,
-    /// Port on 127.0.0.1, also used by the phone's ADB reverse.
+    /// Bind the authenticated gateway to this server's active Tailscale IP.
+    #[arg(long)]
+    tailnet: bool,
+    /// Gateway port. USB mode forwards this port to loopback.
     #[arg(long, default_value_t = 7443, value_parser = clap::value_parser!(u16).range(1..))]
     port: u16,
     /// Use a deterministic loopback model fixture instead of a real provider.
@@ -129,6 +132,19 @@ fn run_server(args: Serve) -> Result<()> {
     })
 }
 
+fn tailnet_address(status: &harw_tailscale::Status) -> Result<std::net::IpAddr> {
+    if !status.is_running() {
+        return Err("Tailscale must be connected before starting the tailnet gateway".into());
+    }
+    status
+        .ips
+        .iter()
+        .copied()
+        .filter(|ip| harw_tailscale::is_tailnet_ip(*ip))
+        .min_by_key(|ip| !ip.is_ipv4())
+        .ok_or_else(|| "tailscaled did not report an assigned tailnet address".into())
+}
+
 async fn serve(args: Serve) -> Result<()> {
     let (enrollment, record) =
         enrollment_record(&read_text(&args.enrollment, 8192)?, args.allow_approval)?;
@@ -144,7 +160,13 @@ async fn serve(args: Serve) -> Result<()> {
     };
     let harw = executable(&args.binaries.harw)?;
     let auth_hub = executable(&args.binaries.auth_hub)?;
-    let listen = format!("127.0.0.1:{}", args.port);
+    let listen_ip = if args.tailnet {
+        let status = harw_tailscale::LocalApi::discover()?.status().await?;
+        tailnet_address(&status)?
+    } else {
+        Ipv4Addr::LOCALHOST.into()
+    };
+    let listen = std::net::SocketAddr::new(listen_ip, args.port).to_string();
     // Report an existing listener before creating test state. The gateway's
     // own bind and readiness message also cover races after this check.
     drop(TcpListener::bind(&listen)?);
@@ -260,12 +282,13 @@ async fn serve(args: Serve) -> Result<()> {
             "default_provider = {}\ndefault_model = {}\n\
              [dream]\nenabled = false\n\
              [infrastructure]\nauth_socket = {}\n\
-             [session_listener]\nenabled = true\nlisten = {}\nallow_non_loopback = false\n\
+             [session_listener]\nenabled = true\nlisten = {}\nallow_non_loopback = {}\n\
              node_id = \"{SERVER_NODE}\"\ntier = \"observer\"\nshared_socket_tenant = {}\n{approval}{provider_owner}",
             toml_string(&provider.provider),
             toml_string(&provider.model),
             path_string(&socket),
             toml_string(&listen),
+            args.tailnet,
             toml_string(record.tenant.as_str()),
         ),
     )?;
@@ -1063,6 +1086,29 @@ mod tests {
         assert_eq!(required_string(&provider, "api")?, "openai-chatgpt-plan");
         assert!(files.token.is_none());
         assert!(ProviderFiles::chatgpt_plan("bad\nmodel").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tailnet_profile_uses_an_address_assigned_by_the_running_tailnet() -> TestResult {
+        let mut status = harw_tailscale::Status {
+            backend_state: "Running".into(),
+            dns_name: String::new(),
+            tailnet: None,
+            ips: vec![
+                "192.0.2.1".parse()?,
+                "fd7a:115c:a1e0::12".parse()?,
+                "100.64.0.12".parse()?,
+            ],
+        };
+        assert_eq!(tailnet_address(&status)?.to_string(), "100.64.0.12");
+        status.ips.remove(2);
+        assert!(tailnet_address(&status)?.is_ipv6());
+        status.backend_state = "Stopped".into();
+        assert!(tailnet_address(&status).is_err());
+        status.backend_state = "Running".into();
+        status.ips.truncate(1);
+        assert!(tailnet_address(&status).is_err());
         Ok(())
     }
 
