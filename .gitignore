@@ -86,3 +86,6 @@ __pycache__/
 .terminal-ui/
 .alice/
 harw.env
+
+# Generated website output (build with: make site)
+/site/dist/

@@ -1,0 +1,18 @@
+# Template: copy to ~/.config/systemd/user/harw-website.service and replace
+# the placeholders (<NGINX_BIN>, <STATE_DIR>, <CONFIG_DIR>). Enable lingering
+# (loginctl enable-linger) so the user manager starts at boot.
+[Unit]
+Description=Harw website from MinIO site objects
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=<NGINX_BIN> -p <STATE_DIR>/ -c <CONFIG_DIR>/nginx.conf -g 'daemon off;'
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGQUIT
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
