@@ -127,10 +127,9 @@ release: ## Build and package a release tarball + SHA256SUMS into $(DIST)/ (RELE
 	$(CARGO) build --profile release-runner --locked -p harw-agent-runner --target $(RELEASE_TARGET)
 	scripts/package-release.sh $(RELEASE_TAG) $(RELEASE_TARGET) $(DIST)
 
-release-publish: ## Create the GitHub release $(RELEASE_TAG) from $(DIST)/ (needs the gh CLI, logged in)
-	@ls $(DIST)/*.tar.gz $(DIST)/SHA256SUMS >/dev/null
-	gh release create $(RELEASE_TAG) $(DIST)/*.tar.gz $(DIST)/SHA256SUMS \
-		--title "harw $(RELEASE_TAG)" --notes "See CHANGELOG.md for $(RELEASE_TAG)."
+release-publish: ## Refuse unverified publication; use the guarded Release workflow
+	@echo "Publication disabled here: use Release workflow_dispatch with publish=true and exact-commit CI evidence." >&2
+	@exit 1
 
 uninstall: ## Remove harw, killer, harw-job-exec and the agent runner from BINDIR, plus the regenerable agent-build cache
 	rm -f $(BINDIR)/harw $(BINDIR)/killer $(BINDIR)/harw-job-exec $(BINDIR)/harw-agent-runner
