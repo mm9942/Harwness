@@ -412,6 +412,7 @@ fn without_an_allowlist_the_root_gets_no_hosts() -> TestResult {
     let mut config = harw_config::ResolvedConfig::default();
     config.network.allow_hosts.clear();
     config.network.researcher_web_hosts.clear();
+    config.network.research_web = harw_config::ResearchWebMode::Allowlist;
     config.harness.research.network_allow_hosts.clear();
     let fixture = fixture()?;
     for entry in ALL_ENTRIES {

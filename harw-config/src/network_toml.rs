@@ -41,8 +41,11 @@ use serde::{Deserialize, Serialize};
 
 /// `[network]` — Host-Allowlists und Grundsatzentscheidung zu privaten
 /// Adressbereichen für egress-fähige Werkzeuge. Alle Felder haben
-/// hart-codierte, restriktive Defaults, sodass eine `config.toml` ohne
-/// `[network]` weiterhin gültig ist und keinerlei Netzzugriff freischaltet.
+/// hart-codierte Defaults, sodass eine `config.toml` ohne `[network]` gültig
+/// bleibt. Die Hostlisten sind leer und private Ziele gesperrt; für die
+/// Recherche-Rollen gilt jedoch der Default `research_web = "open"` (nur
+/// öffentliche Hosts, nur lesend, Domain-Freigabe unter `ask`/`auto`).
+/// `research_web = "allowlist"` ist das fail-closed Opt-in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkSection {
