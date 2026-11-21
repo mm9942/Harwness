@@ -1613,7 +1613,7 @@ impl ChatApp {
             goal_tracker: crate::goal_marker::GoalTracker::default(),
             dod_mark: crate::dod_view::DodMarkFeed::default(),
             dod_mark_waker: None,
-            tool_verbosity: ToolVerbosity::Compact,
+            tool_verbosity: ToolVerbosity::Activity,
             tool_cells: Vec::new(),
             open_tool_group: None,
             activity: activity_glue::ActivityGlue::default(),
@@ -1840,7 +1840,9 @@ impl ChatApp {
     /// einer öffentlichen Signatur erscheinen. Die CLI (ein anderer Slice)
     /// reicht `--verbose` als `bool` durch; `true` entspricht
     /// `ToolVerbosity::Verbose` (zusätzlich immer ausgeklappt, rohe Argumente
-    /// sichtbar), `false` dem Default `ToolVerbosity::Compact`.
+    /// sichtbar), `false` dem Default `ToolVerbosity::Activity`
+    /// (B8/B11c: einzeilige Aktivitätsdarstellung; `Compact` bleibt nur
+    /// programmatisch).
     ///
     /// # Argumente
     /// - `verbose` (`bool`): `true` aktiviert die ausführliche Darstellung.
@@ -1852,7 +1854,7 @@ impl ChatApp {
         self.tool_verbosity = if verbose {
             ToolVerbosity::Verbose
         } else {
-            ToolVerbosity::Compact
+            ToolVerbosity::Activity
         };
         self
     }
@@ -3950,8 +3952,9 @@ impl ChatApp {
     /// Schaltet die Werkzeuganzeige weiter (`/verbose`).
     ///
     /// # Beschreibung
-    /// PL-97 M3 (aus PR #76): Zyklus `Compact → Verbose → Activity →
-    /// Compact`; `Compact` bleibt der Default. Neue Werkzeugzellen erhalten
+    /// B8/B11c (aus archive/tui-b11c-67adce7a): Zyklus `Activity ↔ Verbose`;
+    /// `Activity` ist der Default, `Compact` bleibt nur programmatisch
+    /// (ein verbleibendes `Compact` wird zu `Verbose`). Neue Werkzeugzellen erhalten
     /// die neue [`ToolVerbosity`]; bestehende Zellen werden bei `Verbose`
     /// aufgeklappt, sonst zugeklappt.
     ///
@@ -3959,9 +3962,8 @@ impl ChatApp {
     /// Die jetzt aktive [`ToolVerbosity`].
     fn toggle_verbose(&mut self) -> ToolVerbosity {
         self.tool_verbosity = match self.tool_verbosity {
-            ToolVerbosity::Compact => ToolVerbosity::Verbose,
+            ToolVerbosity::Compact | ToolVerbosity::Activity => ToolVerbosity::Verbose,
             ToolVerbosity::Verbose => ToolVerbosity::Activity,
-            ToolVerbosity::Activity => ToolVerbosity::Compact,
         };
         let verbose = self.tool_verbosity == ToolVerbosity::Verbose;
         for handle in &self.tool_cells {
@@ -14498,6 +14500,8 @@ forbidden = [{forbidden}]
             event_tx,
         );
         let mut app = test_chat_app()?;
+        // Test prüft die kompakte Darstellung; Default ist seit B8 `Activity`.
+        app.tool_verbosity = ToolVerbosity::Compact;
         install_loaded_history(&mut session, &mut app, history);
 
         let visible = app
@@ -14536,6 +14540,64 @@ forbidden = [{forbidden}]
             ExportEntry::ToolResult { error: Some(error), .. }
                 if error == "unvollständig (Resume-Abbruch)"
         ));
+        Ok(())
+    }
+
+    /// B8: the production default comes from `with_verbose_tools`, not
+    /// `ChatApp::new`; `/verbose` toggles Activity <-> Verbose.
+    #[test]
+    fn with_verbose_tools_sets_activity_default_and_verbose() -> TestResult {
+        let app = test_chat_app()?.with_verbose_tools(false);
+        assert_eq!(app.tool_verbosity, ToolVerbosity::Activity);
+        let app = test_chat_app()?.with_verbose_tools(true);
+        assert_eq!(app.tool_verbosity, ToolVerbosity::Verbose);
+        Ok(())
+    }
+
+    /// B8: in the default Activity view a resumed orphan error result and an
+    /// interrupted open call are still visibly marked as failed.
+    #[test]
+    fn resume_hydration_marks_failures_in_default_activity_view() -> TestResult {
+        use harw_protocol::items::{ResultTrust, ToolCallItem, ToolCallResult, ToolResultItem};
+        use harw_types::{ItemId, ToolCallId};
+
+        let mut history = ConversationHistory::new();
+        history.push(TurnItem::ToolResult(ToolResultItem {
+            id: ItemId::new(),
+            call_id: ToolCallId::new(),
+            result: ToolCallResult::error("orphan result"),
+            duration_ms: 9,
+            trust: ResultTrust::Runtime,
+        }));
+        history.push(TurnItem::ToolCall(ToolCallItem {
+            id: ItemId::new(),
+            call_id: ToolCallId::new(),
+            tool_name: "shell.exec".to_owned(),
+            arguments: json!({ "command": "echo pending" }),
+        }));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut session = AgentSession::new_with_id(
+            SessionId::from_str("resume-tool-pairs-activity"),
+            AgentRole::Assistant,
+            None,
+            ExtensionRegistry::builder().build(),
+            event_tx,
+        );
+        let mut app = test_chat_app()?.with_verbose_tools(false);
+        install_loaded_history(&mut session, &mut app, history);
+        let lines = app
+            .cells
+            .iter()
+            .flat_map(|cell| cell.display_lines(200, style::Theme::Dark))
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let failed = lines.iter().filter(|line| line.starts_with("✗ ")).count();
+        assert_eq!(failed, 2, "war: {lines:?}");
         Ok(())
     }
 
@@ -15935,6 +15997,24 @@ forbidden = [{forbidden}]
         let verbose = local_intercept_for(&app, "/verbose").ok_or(TestError::Missing("verbose"))?;
         apply_local_intercept(&mut app, verbose, &bus);
         assert_ne!(app.tool_verbosity, before);
+        Ok(())
+    }
+
+    /// Toggle-Zyklus (B11c): `/verbose` zweimal bringt den Detailgrad vom
+    /// Default `Activity` über `Verbose` zurück zu `Activity`.
+    #[test]
+    fn verbose_toggle_cycles_activity_to_verbose_and_back() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        assert!(matches!(app.tool_verbosity, ToolVerbosity::Activity));
+
+        let first = local_intercept_for(&app, "/verbose").ok_or(TestError::Missing("verbose"))?;
+        apply_local_intercept(&mut app, first, &bus);
+        assert!(matches!(app.tool_verbosity, ToolVerbosity::Verbose));
+
+        let second = local_intercept_for(&app, "/verbose").ok_or(TestError::Missing("verbose"))?;
+        apply_local_intercept(&mut app, second, &bus);
+        assert!(matches!(app.tool_verbosity, ToolVerbosity::Activity));
         Ok(())
     }
 
